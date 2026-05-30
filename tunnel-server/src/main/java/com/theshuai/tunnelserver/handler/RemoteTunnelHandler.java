@@ -5,6 +5,7 @@ import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
+import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -15,10 +16,14 @@ public class RemoteTunnelHandler extends NatCommonHandler {
     private NatCommonHandler tunnelHandler;
 
     private int port;
+    private final String clientName;
+    private final TrafficUsageService trafficUsageService;
 
-    public RemoteTunnelHandler(NatServerHandler tunnelHandler, int port) {
+    public RemoteTunnelHandler(NatServerHandler tunnelHandler, int port, String clientName, TrafficUsageService trafficUsageService) {
         this.tunnelHandler = tunnelHandler;
         this.port = port;
+        this.clientName = clientName;
+        this.trafficUsageService = trafficUsageService;
     }
 
     @Override
@@ -47,6 +52,7 @@ public class RemoteTunnelHandler extends NatCommonHandler {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         byte[] data = (byte[]) msg;
+        trafficUsageService.recordDownload(clientName, data.length);
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.DATA);
         Map<String, Object> metaData = new HashMap<>();

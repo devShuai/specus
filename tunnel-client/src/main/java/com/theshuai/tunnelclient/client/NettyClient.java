@@ -20,6 +20,7 @@ import java.util.concurrent.TimeUnit;
 
 public class NettyClient {
     public static String CLIENT_NAME = null;
+    public static String PASSWORD = null;
     public static String HOST = null;
     public static int PORT = -1;
     private TunnelBean TunnelBean;
@@ -28,6 +29,7 @@ public class NettyClient {
     public NettyClient(TunnelBean TunnelBean) {
         this.TunnelBean = TunnelBean;
         NettyClient.CLIENT_NAME = TunnelBean.getClientName();
+        NettyClient.PASSWORD = TunnelBean.getPassword();
         NettyClient.HOST = TunnelBean.getRemoteAddress();
         NettyClient.PORT = TunnelBean.getRemotePort();
     }
@@ -63,7 +65,7 @@ public class NettyClient {
                 Channel channel = listener.channel();
                 LoginRequestPacket loginRequestPacket = new LoginRequestPacket();
                 loginRequestPacket.setClientName(CLIENT_NAME);
-                loginRequestPacket.setPassword("test1234");
+                loginRequestPacket.setPassword(PASSWORD);
                 loginRequestPacket.setTimestamp(String.valueOf(System.currentTimeMillis()));
                 String signString = LoginRequestHandler.md5Salt + loginRequestPacket.getClientName() +
                         loginRequestPacket.getPassword() + loginRequestPacket.getTimestamp();

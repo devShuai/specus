@@ -1,2 +1,27 @@
 server:
   port: 8088
+
+spring:
+  datasource:
+    url: ${TUNNEL_DB_URL:jdbc:sqlite:./shuai-tunnel.db}
+    driver-class-name: ${TUNNEL_DB_DRIVER:org.sqlite.JDBC}
+    username: ${TUNNEL_DB_USERNAME:}
+    password: ${TUNNEL_DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${TUNNEL_DB_POOL_SIZE:1}
+  jpa:
+    database-platform: ${TUNNEL_DB_DIALECT:org.hibernate.community.dialect.SQLiteDialect}
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+
+tunnel:
+  database:
+    seed-demo-client: ${TUNNEL_DB_SEED_DEMO_CLIENT:true}
+  netty:
+    port: ${TUNNEL_NETTY_PORT:7010}
+  management:
+    username: ${TUNNEL_ADMIN_USERNAME:admin}
+    password: ${TUNNEL_ADMIN_PASSWORD:admin}
+  traffic:
+    flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}

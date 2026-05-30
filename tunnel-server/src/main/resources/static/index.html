@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>shuai-tunnel 管理后台</title>
+  <style>
+    :root { color-scheme: light; --bg:#f4f7fb; --panel:#fff; --ink:#1c2533; --muted:#667085; --line:#e3e8ef; --brand:#1769e0; --danger:#c93636; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }
+    header { display:flex; justify-content:space-between; align-items:center; padding:20px 28px; color:#fff; background:#142238; }
+    h1,h2 { margin:0; } h1 { font-size:20px; } h2 { margin-bottom:14px; font-size:17px; }
+    main { max-width:1440px; margin:auto; padding:20px; }
+    .grid { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin-bottom:18px; }
+    .stat,.panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; box-shadow:0 2px 10px #1422380d; }
+    .stat { padding:14px; } .stat span { display:block; color:var(--muted); font-size:12px; } .stat strong { font-size:21px; }
+    .panel { margin-bottom:18px; padding:16px; overflow:auto; }
+    .toolbar,.form { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+    input,button { border:1px solid var(--line); border-radius:6px; padding:8px 10px; background:#fff; }
+    input { min-width:150px; } button { cursor:pointer; color:#fff; border-color:var(--brand); background:var(--brand); }
+    button.secondary { color:var(--ink); border-color:var(--line); background:#fff; } button.danger { border-color:var(--danger); background:var(--danger); }
+    table { width:100%; min-width:920px; border-collapse:collapse; }
+    th,td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-size:12px; font-weight:600; }
+    code { padding:2px 5px; border-radius:4px; background:#eef2f7; }
+    .ok { color:#087443; } .off { color:var(--danger); } .muted { color:var(--muted); }
+    #notice { display:none; margin-bottom:14px; padding:10px 12px; border-radius:6px; background:#e9f4ff; }
+    @media (max-width:900px) { .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>shuai-tunnel 管理后台</h1>
+  <button class="secondary" onclick="initializeDatabase()">初始化数据库</button>
+</header>
+<main>
+  <div id="notice"></div>
+  <section id="overview" class="grid"></section>
+
+  <section class="panel">
+    <h2>客户端管理</h2>
+    <form class="form" onsubmit="createClient(event)">
+      <input id="clientName" required placeholder="客户端名称">
+      <input id="password" placeholder="密码（留空自动生成）">
+      <input id="rateLimit" type="number" min="0" max="10000" value="30" placeholder="每分钟连接次数">
+      <button type="submit">创建客户端</button>
+      <button type="button" class="secondary" onclick="loadAll()">刷新</button>
+    </form>
+    <table>
+      <thead><tr><th>ID</th><th>客户端</th><th>状态</th><th>每分钟连接上限</th><th>上传</th><th>下载</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody id="clients"></tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>连接记录</h2>
+    <table>
+      <thead><tr><th>ID</th><th>客户端</th><th>结果</th><th>远端地址</th><th>连接时间</th><th>断开时间</th><th>原因</th></tr></thead>
+      <tbody id="connections"></tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>流量使用</h2>
+    <table>
+      <thead><tr><th>ID</th><th>客户端</th><th>日期（UTC）</th><th>上传</th><th>下载</th><th>更新时间</th></tr></thead>
+      <tbody id="traffic"></tbody>
+    </table>
+  </section>
+</main>
+<script>
+let clientCache = new Map();
+const api = async (path, options = {}) => {
+  const response = await fetch(`/api/admin${path}`, { headers:{'Content-Type':'application/json'}, ...options });
+  if (!response.ok) throw new Error((await response.json()).error || response.statusText);
+  return response.status === 204 ? null : response.json();
+};
+const formatBytes = value => {
+  const units = ['B','KB','MB','GB','TB']; let index = 0; let size = Number(value || 0);
+  while (size >= 1024 && index < units.length - 1) { size /= 1024; index++; }
+  return `${size.toFixed(index ? 2 : 0)} ${units[index]}`;
+};
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
+const notice = (message, error = false) => {
+  const element = document.querySelector('#notice'); element.style.display = 'block';
+  element.style.background = error ? '#fff0f0' : '#e9f4ff'; element.textContent = message;
+};
+async function loadAll() {
+  try {
+    const [overview, clients, connections, traffic] = await Promise.all([
+      api('/overview'), api('/clients'), api('/connections?limit=100'), api('/traffic?limit=100')
+    ]);
+    clientCache = new Map(clients.map(client => [client.id, client]));
+    document.querySelector('#overview').innerHTML = [
+      ['客户端', overview.clients], ['在线', overview.onlineClients], ['成功连接', overview.successfulConnections],
+      ['失败连接', overview.failedConnections], ['上传', formatBytes(overview.uploadBytes)], ['下载', formatBytes(overview.downloadBytes)]
+    ].map(([label,value]) => `<div class="stat"><span>${label}</span><strong>${value}</strong></div>`).join('');
+    document.querySelector('#clients').innerHTML = clients.map(client => `<tr>
+      <td>${client.id}</td><td><code>${escapeHtml(client.clientName)}</code></td>
+      <td class="${client.online ? 'ok' : 'muted'}">${client.online ? '在线' : '离线'} / ${client.enabled ? '启用' : '停用'}</td>
+      <td>${client.connectionRateLimitPerMinute || '不限'}</td><td>${formatBytes(client.uploadBytes)}</td><td>${formatBytes(client.downloadBytes)}</td>
+      <td>${escapeHtml(client.createdAt)}</td><td>
+        <button class="secondary" onclick="editClient(${client.id})">编辑</button>
+        <button class="danger" onclick="deleteClient(${client.id})">删除</button>
+      </td></tr>`).join('');
+    document.querySelector('#connections').innerHTML = connections.map(item => `<tr>
+      <td>${item.id}</td><td>${escapeHtml(item.clientName)}</td><td class="${item.success ? 'ok' : 'off'}">${item.success ? '成功' : '失败'}</td>
+      <td>${escapeHtml(item.remoteAddress)}</td><td>${escapeHtml(item.connectedAt)}</td><td>${escapeHtml(item.disconnectedAt || '-')}</td><td>${escapeHtml(item.failureReason || '-')}</td></tr>`).join('');
+    document.querySelector('#traffic').innerHTML = traffic.map(item => `<tr>
+      <td>${item.id}</td><td>${escapeHtml(item.clientName)}</td><td>${item.usageDate}</td>
+      <td>${formatBytes(item.uploadBytes)}</td><td>${formatBytes(item.downloadBytes)}</td><td>${escapeHtml(item.updatedAt)}</td></tr>`).join('');
+  } catch (error) { notice(error.message, true); }
+}
+async function createClient(event) {
+  event.preventDefault();
+  try {
+    const result = await api('/clients', {method:'POST', body:JSON.stringify({
+      clientName: document.querySelector('#clientName').value,
+      password: document.querySelector('#password').value || null,
+      connectionRateLimitPerMinute: Number(document.querySelector('#rateLimit').value), enabled:true
+    })});
+    notice(`客户端已创建。请立即保存密码：${result.password}`);
+    event.target.reset(); document.querySelector('#rateLimit').value = 30; await loadAll();
+  } catch (error) { notice(error.message, true); }
+}
+async function editClient(id) {
+  const client = clientCache.get(id); if (!client) return;
+  const name = prompt('客户端名称', client.clientName); if (name === null) return;
+  const password = prompt('新密码（留空表示不修改）', ''); if (password === null) return;
+  const rateLimit = prompt('每分钟允许的控制连接次数，0 表示不限', client.connectionRateLimitPerMinute); if (rateLimit === null) return;
+  const enabled = confirm('点击“确定”启用客户端；点击“取消”停用客户端。');
+  try {
+    const result = await api(`/clients/${client.id}`, {method:'PUT', body:JSON.stringify({clientName:name,password:password || null,enabled,connectionRateLimitPerMinute:Number(rateLimit)})});
+    notice(result.password ? `客户端已更新。请立即保存新密码：${result.password}` : '客户端已更新。'); await loadAll();
+  } catch (error) { notice(error.message, true); }
+}
+async function deleteClient(id) {
+  if (!confirm('确定删除该客户端？历史连接和流量记录会保留。')) return;
+  try { await api(`/clients/${id}`, {method:'DELETE'}); notice('客户端已删除。'); await loadAll(); }
+  catch (error) { notice(error.message, true); }
+}
+async function initializeDatabase() {
+  try { const result = await api('/database/initialize', {method:'POST'}); notice(`数据库初始化完成：${result.dialect}，客户端 ${result.clients} 个。`); await loadAll(); }
+  catch (error) { notice(error.message, true); }
+}
+loadAll();
+</script>
+</body>
+</html>

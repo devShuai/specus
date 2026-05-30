@@ -4,6 +4,9 @@ import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.tunnelserver.server.TcpServer;
+import com.theshuai.tunnelserver.management.service.TrafficUsageService;
+import com.theshuai.common.session.Session;
+import com.theshuai.common.util.SessionUtil;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
@@ -26,6 +29,12 @@ public class NatServerHandler extends NatCommonHandler {
     private static final ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
     private boolean register = false;
+    private final TrafficUsageService trafficUsageService;
+    private String clientName;
+
+    public NatServerHandler(TrafficUsageService trafficUsageService) {
+        this.trafficUsageService = trafficUsageService;
+    }
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
@@ -53,6 +62,7 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     private void processData(NatMessagePacket natMessagePacket) {
+        trafficUsageService.recordUpload(clientName, natMessagePacket.getData().length);
         channelGroup.writeAndFlush(natMessagePacket.getData(), channel -> channel.id().asLongText().equals(natMessagePacket.getMetaData().get("channelId")));
     }
 
@@ -65,7 +75,13 @@ public class NatServerHandler extends NatCommonHandler {
         int port = (int) natMessagePacket.getMetaData().get("port");
         String tunnelAddress = natMessagePacket.getMetaData().get("tunnelAddress").toString();
         int tunnelPort = (int) natMessagePacket.getMetaData().get("tunnelPort");
-        String clientName = natMessagePacket.getMetaData().get("clientName").toString();
+        Session session = SessionUtil.getSession(ctx.channel());
+        String requestedClientName = natMessagePacket.getMetaData().get("clientName").toString();
+        if (session == null || !session.getClientName().equals(requestedClientName)) {
+            ctx.close();
+            return;
+        }
+        clientName = session.getClientName();
         metaData.put("port", port);
         try {
             NatServerHandler thisHandler = this;
@@ -73,7 +89,7 @@ public class NatServerHandler extends NatCommonHandler {
             remoteConnectionServer.bind(port, new ChannelInitializer<SocketChannel>() {
                 @Override
                 protected void initChannel(SocketChannel channel) throws Exception {
-                    channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), new RemoteTunnelHandler(thisHandler, port));
+                    channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), new RemoteTunnelHandler(thisHandler, port, clientName, trafficUsageService));
                     channelGroup.add(channel);
                 }
             });

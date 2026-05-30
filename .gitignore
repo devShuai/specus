@@ -31,3 +31,8 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Local tunnel database ###
+shuai-tunnel.db
+shuai-tunnel.db-shm
+shuai-tunnel.db-wal

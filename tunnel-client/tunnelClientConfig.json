@@ -2,8 +2,10 @@
 
   "clientName": "Demo client",
 
-  "remoteAddress": "121.37.241.204",
+  "password": "test1234",
 
-  "remotePort": 8081
+  "remoteAddress": "127.0.0.1",
+
+  "remotePort": 7010
 
 }
