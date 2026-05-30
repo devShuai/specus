@@ -2,6 +2,7 @@ package com.theshuai.common.serialize;
 
 
 import com.theshuai.common.serialize.impl.FastJsonSerializer;
+import com.theshuai.common.serialize.impl.CompactBinarySerializer;
 import com.theshuai.common.serialize.impl.ProtobufSerializer;
 
 public interface Serializer {
@@ -9,6 +10,8 @@ public interface Serializer {
     Serializer FASTJSON = new FastJsonSerializer();
 
     Serializer JACKSON = new JacksonSerializer();
+
+    Serializer COMPACT_BINARY = new CompactBinarySerializer();
 
     Serializer PROTOBUF = new ProtobufSerializer();
 

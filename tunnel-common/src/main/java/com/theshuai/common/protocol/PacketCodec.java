@@ -5,6 +5,7 @@ import com.theshuai.common.command.Command;
 import com.theshuai.common.protocol.request.*;
 import com.theshuai.common.protocol.response.*;
 import com.theshuai.common.serialize.Serializer;
+import com.theshuai.common.serialize.impl.CompactBinarySerializer;
 import com.theshuai.common.util.JsonUtil;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -61,11 +62,12 @@ public class PacketCodec {
         serializerMap = new HashMap<>();
         serializerMap.put(Serializer.FASTJSON.getSerializerAlgorithm(), Serializer.FASTJSON);
         serializerMap.put(Serializer.JACKSON.getSerializerAlgorithm(), Serializer.JACKSON);
+        serializerMap.put(Serializer.COMPACT_BINARY.getSerializerAlgorithm(), Serializer.COMPACT_BINARY);
         serializerMap.put(Serializer.PROTOBUF.getSerializerAlgorithm(), Serializer.PROTOBUF);
     }
 
     public void encode(ByteBuf byteBuf, Packet packet) throws Exception {
-        encode(byteBuf, packet, Serializer.FASTJSON);
+        encode(byteBuf, packet, Serializer.COMPACT_BINARY);
     }
 
     public void encode(ByteBuf byteBuf, Packet packet, Serializer serializer) throws Exception {
@@ -89,7 +91,7 @@ public class PacketCodec {
             dataOutputStream.write(metaDataBytes);
 
             if (natMessagePacket.getData() != null && natMessagePacket.getData().length > 0) {
-                dataOutputStream.write(natMessagePacket.getData());
+                dataOutputStream.write(CompactBinarySerializer.encodePayload(natMessagePacket.getData()));
             }
             bytes = baos.toByteArray();
         } else {
@@ -127,7 +129,7 @@ public class PacketCodec {
             });
             byte[] data = null;
             if (byteBuf.isReadable()) {
-                data = ByteBufUtil.getBytes(byteBuf);
+                data = CompactBinarySerializer.decodePayload(ByteBufUtil.getBytes(byteBuf));
             }
 
             NatMessagePacket natMessagePacket = new NatMessagePacket();
