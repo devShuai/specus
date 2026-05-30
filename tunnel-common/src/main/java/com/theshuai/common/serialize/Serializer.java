@@ -2,12 +2,15 @@ package com.theshuai.common.serialize;
 
 
 import com.theshuai.common.serialize.impl.FastJsonSerializer;
+import com.theshuai.common.serialize.impl.ProtobufSerializer;
 
 public interface Serializer {
 
     Serializer FASTJSON = new FastJsonSerializer();
 
     Serializer JACKSON = new JacksonSerializer();
+
+    Serializer PROTOBUF = new ProtobufSerializer();
 
     /**
      * 序列化算法

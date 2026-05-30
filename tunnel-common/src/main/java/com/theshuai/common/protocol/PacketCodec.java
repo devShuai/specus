@@ -4,9 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.theshuai.common.command.Command;
 import com.theshuai.common.protocol.request.*;
 import com.theshuai.common.protocol.response.*;
-import com.theshuai.common.serialize.JacksonSerializer;
 import com.theshuai.common.serialize.Serializer;
-import com.theshuai.common.serialize.impl.FastJsonSerializer;
 import com.theshuai.common.util.JsonUtil;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -61,18 +59,23 @@ public class PacketCodec {
         packetTypeMap.put(Command.HTTP_RESPONSE, HttpResponsePacket.class);
 
         serializerMap = new HashMap<>();
-        Serializer fastJsonSerializer = new FastJsonSerializer();
-        Serializer jacksonSerializer = new JacksonSerializer();
-        serializerMap.put(fastJsonSerializer.getSerializerAlgorithm(), fastJsonSerializer);
-        serializerMap.put(jacksonSerializer.getSerializerAlgorithm(), jacksonSerializer);
+        serializerMap.put(Serializer.FASTJSON.getSerializerAlgorithm(), Serializer.FASTJSON);
+        serializerMap.put(Serializer.JACKSON.getSerializerAlgorithm(), Serializer.JACKSON);
+        serializerMap.put(Serializer.PROTOBUF.getSerializerAlgorithm(), Serializer.PROTOBUF);
     }
 
     public void encode(ByteBuf byteBuf, Packet packet) throws Exception {
+        encode(byteBuf, packet, Serializer.FASTJSON);
+    }
+
+    public void encode(ByteBuf byteBuf, Packet packet, Serializer serializer) throws Exception {
         byte[] bytes = null;
+        // NAT metadata keeps its existing JSON format because its body has a custom layout.
+        Serializer bodySerializer = Command.NAT_MESSAGE.equals(packet.getCommand()) ? Serializer.FASTJSON : serializer;
         // 实际编码过程
         byteBuf.writeInt(MAGIC_NUMBER);
         byteBuf.writeByte(packet.getVersion());
-        byteBuf.writeByte(Serializer.FASTJSON.getSerializerAlgorithm());
+        byteBuf.writeByte(bodySerializer.getSerializerAlgorithm());
         byteBuf.writeByte(packet.getCommand());
 
         if (Command.NAT_MESSAGE.equals(packet.getCommand())) {
@@ -90,7 +93,7 @@ public class PacketCodec {
             }
             bytes = baos.toByteArray();
         } else {
-            bytes = Serializer.FASTJSON.serialize(packet);
+            bytes = bodySerializer.serialize(packet);
         }
 
 
