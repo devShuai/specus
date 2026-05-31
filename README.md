@@ -7,7 +7,7 @@
 ## 工作原理
 
 ```mermaid
-flowchart LR
+flowchart TD
     U[公网访问者] -->|访问公网映射端口| P[TcpServer]
     P --> R[RemoteTunnelHandler]
     R <-->|通过 7010 控制连接传输数据| N[NatServerHandler]
