@@ -3,14 +3,17 @@ package com.theshuai.tunnelclient.handler;
 import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
+import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.util.Timeout;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.net.URI;
@@ -20,10 +23,23 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+@Slf4j
 public final class DirectHttpForwarder {
     private static final int MAX_REQUEST_BODY_SIZE = 16 * 1024 * 1024;
     private static final int MAX_RESPONSE_BODY_SIZE = 16 * 1024 * 1024;
-    private static final CloseableHttpClient HTTP_CLIENT = HttpClients.createDefault();
+    private static final Timeout CONNECTION_REQUEST_TIMEOUT = Timeout.ofSeconds(5);
+    private static final Timeout CONNECT_TIMEOUT = Timeout.ofSeconds(5);
+    private static final Timeout RESPONSE_TIMEOUT = Timeout.ofSeconds(20);
+    private static final CloseableHttpClient HTTP_CLIENT = HttpClients.custom()
+            .setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()
+                    .setDefaultConnectionConfig(ConnectionConfig.custom()
+                            .setConnectTimeout(CONNECT_TIMEOUT)
+                            .setSocketTimeout(RESPONSE_TIMEOUT)
+                            .build())
+                    .build())
+            .disableContentCompression()
+            .disableRedirectHandling()
+            .build();
     private static final Set<String> SKIPPED_HEADERS = Set.of(
             "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
             "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
@@ -35,15 +51,20 @@ public final class DirectHttpForwarder {
     public static DirectHttpResponsePacket forward(DirectHttpRequestPacket packet, Map<String, String> routes) {
         DirectHttpResponsePacket response = new DirectHttpResponsePacket();
         response.setRequestId(packet.getRequestId());
+        long startedAt = System.currentTimeMillis();
         try {
             if (packet.getBody() != null && packet.getBody().length > MAX_REQUEST_BODY_SIZE) {
                 throw new IllegalArgumentException("HTTP 请求体超过限制");
             }
             URI target = buildTarget(routes.get(packet.getRoute()), packet.getRelativePath(), packet.getRawQuery());
+            log.info("[http-direct][client->upstream] requestId={} method={} route={} target={} queryPresent={} bodyBytes={} poolTimeoutMs={} connectTimeoutMs={} responseTimeoutMs={}",
+                    packet.getRequestId(), packet.getRequestMethod(), packet.getRoute(), withoutQuery(target),
+                    target.getRawQuery() != null, size(packet.getBody()), CONNECTION_REQUEST_TIMEOUT.toMilliseconds(),
+                    CONNECT_TIMEOUT.toMilliseconds(), RESPONSE_TIMEOUT.toMilliseconds());
             HttpUriRequestBase request = new HttpUriRequestBase(packet.getRequestMethod(), target);
             request.setConfig(RequestConfig.custom()
-                    .setConnectionRequestTimeout(Timeout.ofSeconds(30))
-                    .setResponseTimeout(Timeout.ofSeconds(30))
+                    .setConnectionRequestTimeout(CONNECTION_REQUEST_TIMEOUT)
+                    .setResponseTimeout(RESPONSE_TIMEOUT)
                     .setRedirectsEnabled(false)
                     .build());
             copyHeaders(packet.getHeaders(), request::addHeader);
@@ -55,13 +76,26 @@ public final class DirectHttpForwarder {
                 response.setStatusCode(upstream.getCode());
                 response.setHeaders(toHeaders(upstream.getHeaders()));
                 response.setBody(readBody(upstream.getEntity()));
+                log.info("[http-direct][upstream->client] requestId={} status={} bodyBytes={} elapsedMs={}",
+                        packet.getRequestId(), response.getStatusCode(), size(response.getBody()),
+                        System.currentTimeMillis() - startedAt);
                 return response;
             });
         } catch (Exception e) {
             response.setStatusCode(502);
             response.setError(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            log.warn("[http-direct][upstream->client] requestId={} status=502 error={} elapsedMs={}",
+                    packet.getRequestId(), response.getError(), System.currentTimeMillis() - startedAt, e);
             return response;
         }
+    }
+
+    private static URI withoutQuery(URI target) {
+        return URI.create(target.getScheme() + "://" + target.getRawAuthority() + target.getRawPath());
+    }
+
+    private static int size(byte[] body) {
+        return body == null ? 0 : body.length;
     }
 
     private static byte[] readBody(HttpEntity entity) throws IOException {

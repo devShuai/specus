@@ -36,3 +36,7 @@ build/
 shuai-tunnel.db
 shuai-tunnel.db-shm
 shuai-tunnel.db-wal
+shuai-tunnel.db-journal
+
+### Local client credentials ###
+tunnelClientConfig.json

@@ -6,6 +6,7 @@ import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
@@ -24,6 +25,7 @@ import java.util.Set;
 
 @RestController
 @RequestMapping("/http")
+@Slf4j
 public class HttpTunnelController {
     private static final Set<String> SKIPPED_HEADERS = Set.of(
             "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
@@ -48,7 +50,13 @@ public class HttpTunnelController {
                                           @RequestBody(required = false) byte[] body,
                                           HttpServletRequest request) {
         byte[] requestBody = body == null ? new byte[0] : body;
+        long startedAt = System.currentTimeMillis();
+        log.info("[http-direct][server-ingress] clientName={} method={} route={} path={} queryPresent={} bodyBytes={}",
+                clientName, request.getMethod(), route, relativePath(request),
+                request.getQueryString() != null, requestBody.length);
         if (requestBody.length > maxRequestBodySize) {
+            log.warn("[http-direct][server-ingress] clientName={} method={} route={} rejected=body-too-large bodyBytes={} maxBodyBytes={}",
+                    clientName, request.getMethod(), route, requestBody.length, maxRequestBodySize);
             return error(413, "HTTP 请求体超过限制");
         }
 
@@ -66,13 +74,22 @@ public class HttpTunnelController {
             byte[] responseBody = response.getBody() == null ? new byte[0] : response.getBody();
             trafficUsageService.recordDownload(clientName, responseBody.length);
             if (response.getError() != null) {
+                log.warn("[http-direct][server-egress] requestId={} clientName={} status={} error={} elapsedMs={}",
+                        response.getRequestId(), clientName, response.getStatusCode(), response.getError(),
+                        System.currentTimeMillis() - startedAt);
                 return error(response.getStatusCode() > 0 ? response.getStatusCode() : 502, response.getError());
             }
 
             HttpHeaders headers = new HttpHeaders();
             copyHeaders(response.getHeaders(), headers);
+            log.info("[http-direct][server-egress] requestId={} clientName={} status={} bodyBytes={} elapsedMs={}",
+                    response.getRequestId(), clientName, response.getStatusCode(), responseBody.length,
+                    System.currentTimeMillis() - startedAt);
             return ResponseEntity.status(response.getStatusCode()).headers(headers).body(responseBody);
         } catch (DirectHttpTunnelException e) {
+            log.warn("[http-direct][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
+                    clientName, request.getMethod(), route, e.getStatusCode(), e.getMessage(),
+                    System.currentTimeMillis() - startedAt);
             return error(e.getStatusCode(), e.getMessage());
         }
     }
