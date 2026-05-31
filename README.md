@@ -78,6 +78,8 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。持久化层使用 Spring Data JPA 和 Hibernate，不包含手写 SQL 或 `JdbcTemplate`。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
 
+如需在端口映射日志中显示服务端公网地址，可设置 `TUNNEL_PUBLIC_ADDRESS`。未设置时客户端会回退显示控制连接配置中的 `remoteAddress`。
+
 ### 2. 配置并启动客户端
 
 客户端从当前工作目录读取 `tunnelClientConfig.json`。在 `tunnel-client` 目录中创建或修改该文件：

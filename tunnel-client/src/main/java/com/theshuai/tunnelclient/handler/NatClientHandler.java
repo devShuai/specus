@@ -17,6 +17,7 @@ import io.netty.handler.codec.bytes.ByteArrayDecoder;
 import io.netty.handler.codec.bytes.ByteArrayEncoder;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.util.StringUtils;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -50,6 +51,9 @@ public class NatClientHandler extends NatCommonHandler {
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
         super.handlerAdded(ctx);
         this.ctx = ctx;
+        if (!StringUtils.hasText(remoteHost)) {
+            remoteHost = StringUtils.hasText(NettyClient.HOST) ? NettyClient.HOST : String.valueOf(ctx.channel().remoteAddress());
+        }
         // The control channel is already active when this handler is added after a
         // NAT_CONTROL push, so channelActive will not fire. Register the tunnels here.
         if (ctx.channel().isActive()) {
@@ -82,6 +86,9 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     public synchronized void applyConfig(TunnelBean tunnelBean) {
+        if (StringUtils.hasText(tunnelBean.getRemoteAddress())) {
+            remoteHost = tunnelBean.getRemoteAddress();
+        }
         Map<Integer, TunnelConfig> desired = new HashMap<>();
         if (tunnelBean.getTunnelConfigList() != null) {
             for (TunnelConfig tunnelConfig : tunnelBean.getTunnelConfigList()) {
