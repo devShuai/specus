@@ -40,3 +40,6 @@ shuai-tunnel.db-journal
 
 ### Local client credentials ###
 tunnelClientConfig.json
+
+### Go client binary ###
+/tunnel-client-go/shuai-tunnel-client

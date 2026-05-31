@@ -1,0 +1,58 @@
+package client
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/devShuai/shuai-tunnel/tunnel-client-go/internal/protocol"
+)
+
+func TestBuildTarget(t *testing.T) {
+	target, err := buildTarget("https://example.com:443/base", "/api/hello", "source=tunnel")
+	if err != nil {
+		t.Fatalf("buildTarget() error = %v", err)
+	}
+	if actual := target.String(); actual != "https://example.com:443/base/api/hello?source=tunnel" {
+		t.Fatalf("buildTarget() = %q", actual)
+	}
+}
+
+func TestBuildTargetRejectsTraversal(t *testing.T) {
+	if _, err := buildTarget("https://example.com/base", "/../secret", ""); err == nil {
+		t.Fatal("buildTarget() accepted a traversal path")
+	}
+}
+
+func TestExecuteDirectHTTP(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if actual := request.Header.Get("X-Tunnel-Test"); actual != "demo" {
+			t.Errorf("X-Tunnel-Test = %q", actual)
+		}
+		if actual, _ := io.ReadAll(request.Body); string(actual) != "request" {
+			t.Errorf("body = %q", actual)
+		}
+		response.Header().Set("X-Upstream", "ok")
+		response.WriteHeader(http.StatusCreated)
+		_, _ = response.Write([]byte("response"))
+	}))
+	defer upstream.Close()
+
+	tunnelClient := New(Config{
+		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "web", TargetBaseURL: upstream.URL}},
+	}, nil)
+	response := tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
+		RequestID: "8b284fef-0987-4948-ac66-7f2059336989",
+		Method:    http.MethodPost,
+		Route:     "web",
+		Headers:   []string{"X-Tunnel-Test:demo", "Host:ignored"},
+		Body:      []byte("request"),
+	})
+	if response.Error != "" || response.StatusCode != http.StatusCreated || string(response.Body) != "response" {
+		t.Fatalf("executeDirectHTTP() = %#v", response)
+	}
+	if len(response.Headers) != 3 && len(response.Headers) != 4 {
+		t.Fatalf("response headers = %#v", response.Headers)
+	}
+}

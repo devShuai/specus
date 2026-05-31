@@ -32,18 +32,21 @@ flowchart LR
 | --- | --- |
 | `tunnel-common` | 公共协议、编解码器、登录鉴权、心跳、会话、消息和同步 HTTP 请求能力 |
 | `tunnel-server` | 公网服务端，监听控制连接，并为已注册映射创建公网 TCP 监听端口 |
-| `tunnel-client` | 内网客户端，连接服务端，并将隧道数据转发至目标内网服务 |
+| `tunnel-client` | Java 内网客户端，连接服务端，并将隧道数据转发至目标内网服务 |
+| `tunnel-client-go` | Go 内网客户端，与 Java 客户端使用相同配置和紧凑二进制协议 |
 
 主要入口：
 
 - 服务端：`tunnel-server/src/main/java/com/theshuai/tunnelserver/TunnelServerApplication.java`
 - 客户端：`tunnel-client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`
+- Go 客户端：`tunnel-client-go/cmd/shuai-tunnel-client/main.go`
 - 协议实现：`tunnel-common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
 
 ## 环境要求
 
 - JDK 25
 - Maven 3.x
+- Go 1.26（仅构建 Go 客户端时需要）
 
 根目录 `pom.xml` 将 Java 编译版本设置为 `25`。仓库中的 Maven Wrapper 脚本没有可执行权限，且未提交 `.mvn` 目录，因此建议使用本机安装的 Maven。
 
@@ -100,6 +103,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | --- | --- |
 | `clientName` | 客户端名称，也是服务端会话标识 |
 | `password` | 管理后台分配给客户端的密码 |
+| `tunnelConfigList` | TCP 端口映射列表；Go 客户端会在登录后直接注册，Java 客户端通过 `NAT_CONTROL` 消息动态接收 |
 | `httpTunnelConfigList` | HTTP 直转路由列表；每个 route 映射一个客户端可访问的内网 HTTP 地址 |
 | `remoteAddress` | 公网服务端地址 |
 | `remotePort` | 服务端 Netty 控制连接端口，当前代码固定为 `7010` |
@@ -111,6 +115,21 @@ cd tunnel-client
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
+也可以使用 Go 客户端。它不依赖 Java 运行时，并会在登录成功后直接注册配置文件中的 `tunnelConfigList`：
+
+```bash
+cd tunnel-client-go
+cp tunnelClientConfig.example.json tunnelClientConfig.json
+go run ./cmd/shuai-tunnel-client -config tunnelClientConfig.json
+```
+
+构建单文件客户端：
+
+```bash
+cd tunnel-client-go
+go build -o shuai-tunnel-client ./cmd/shuai-tunnel-client
+```
+
 客户端的 `application.yml` 也将 Spring Boot Web 端口设置为 `8088`。如果服务端和客户端在同一台机器上联调，需要为客户端覆盖该端口：
 
 ```bash
@@ -120,7 +139,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run \
 
 ### 3. 下发端口映射
 
-客户端收到 `NAT_CONTROL` 消息后，才会注册端口映射。消息体应为以下 JSON 结构：
+Java 客户端收到 `NAT_CONTROL` 消息后，才会注册端口映射。Go 客户端既支持相同的动态配置消息，也会在登录后直接注册本地配置文件中的 `tunnelConfigList`。消息体应为以下 JSON 结构：
 
 ```json
 {
@@ -241,10 +260,11 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 - 控制连接断开后的重连逻辑
 - TCP 公网端口监听和双向数据转发
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
+- 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
 
 需要继续完善：
 
-- 仓库中没有 Controller、命令行入口或管理界面用于向客户端发送 `NAT_CONTROL` 消息，因此仅启动服务端和客户端只能完成登录，不能直接创建端口映射。
+- 仓库中没有 Controller、命令行入口或管理界面用于向 Java 客户端发送 `NAT_CONTROL` 消息；Go 客户端可以通过本地配置文件直接注册端口映射。
 - 服务端和客户端的 Spring Boot Web 端口默认均为 `8088`，部署在同一台机器时需要覆盖其中一个端口。
 - UDP 转发尚未实现，`UdpConnection` 当前为空。
 - 登录签名盐值仍写在代码中，MD5 签名仅适合演示。
