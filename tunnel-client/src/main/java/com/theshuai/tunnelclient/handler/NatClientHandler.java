@@ -19,7 +19,9 @@ import io.netty.util.concurrent.GlobalEventExecutor;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -33,18 +35,21 @@ public class NatClientHandler extends NatCommonHandler {
     private ConcurrentHashMap<String, NatCommonHandler> channelHandlerMap = new ConcurrentHashMap<>();
     private ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
-    private boolean registered = false;
+    private final Set<Integer> registeredPorts = new HashSet<>();
 
     public NatClientHandler(TunnelBean tunnelBean) {
         this.remoteHost = tunnelBean.getRemoteAddress();
-        for (TunnelConfig tunnelConfig : tunnelBean.getTunnelConfigList()) {
-            tunnelConfigMap.put(tunnelConfig.getPort(), tunnelConfig);
+        if (tunnelBean.getTunnelConfigList() != null) {
+            for (TunnelConfig tunnelConfig : tunnelBean.getTunnelConfigList()) {
+                tunnelConfigMap.put(tunnelConfig.getPort(), tunnelConfig);
+            }
         }
     }
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
         super.handlerAdded(ctx);
+        this.ctx = ctx;
         // The control channel is already active when this handler is added after a
         // NAT_CONTROL push, so channelActive will not fire. Register the tunnels here.
         if (ctx.channel().isActive()) {
@@ -59,12 +64,11 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     private synchronized void registerTunnels(ChannelHandlerContext ctx) {
-        if (registered) {
-            return;
-        }
-        registered = true;
         for (Map.Entry<Integer, TunnelConfig> tunnelConfigEntry : tunnelConfigMap.entrySet()) {
             Integer port = tunnelConfigEntry.getKey();
+            if (!registeredPorts.add(port)) {
+                continue;
+            }
             NatMessagePacket message = new NatMessagePacket();
             message.setNatMessageType(NatMessageType.REGISTER);
             Map<String, Object> metaData = new HashMap<>();
@@ -75,6 +79,28 @@ public class NatClientHandler extends NatCommonHandler {
             message.setMetaData(metaData);
             ctx.writeAndFlush(message);
         }
+    }
+
+    public synchronized void applyConfig(TunnelBean tunnelBean) {
+        Map<Integer, TunnelConfig> desired = new HashMap<>();
+        if (tunnelBean.getTunnelConfigList() != null) {
+            for (TunnelConfig tunnelConfig : tunnelBean.getTunnelConfigList()) {
+                desired.put(tunnelConfig.getPort(), tunnelConfig);
+            }
+        }
+        for (Integer port : new HashSet<>(registeredPorts)) {
+            if (!desired.containsKey(port)) {
+                NatMessagePacket message = new NatMessagePacket();
+                message.setNatMessageType(NatMessageType.UNREGISTER);
+                Map<String, Object> metaData = new HashMap<>();
+                metaData.put("port", port);
+                message.setMetaData(metaData);
+                ctx.writeAndFlush(message);
+                registeredPorts.remove(port);
+            }
+        }
+        tunnelConfigMap = desired;
+        registerTunnels(ctx);
     }
 
     @Override
@@ -155,7 +181,11 @@ public class NatClientHandler extends NatCommonHandler {
         if (((Boolean) natMessagePacket.getMetaData().get("success"))) {
             int port = (int) natMessagePacket.getMetaData().get("port");
             TunnelConfig tunnelConfig = tunnelConfigMap.get(port);
-            log.info("Register to Nat server, {}:{}-->{}:{}", remoteHost, port, tunnelConfig.getTunnelAddress(), tunnelConfig.getTunnelPort());
+            if (tunnelConfig == null) {
+                log.info("Register result arrived after NAT port {} was removed", port);
+            } else {
+                log.info("Register to Nat server, {}:{}-->{}:{}", remoteHost, port, tunnelConfig.getTunnelAddress(), tunnelConfig.getTunnelPort());
+            }
         } else {
             log.info("Register fail: " + natMessagePacket.getMetaData().get("reason"));
             ctx.close();

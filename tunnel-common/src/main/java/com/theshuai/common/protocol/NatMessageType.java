@@ -6,7 +6,8 @@ public enum NatMessageType {
     CONNECTED(3),
     DISCONNECTED(4),
     DATA(5),
-    KEEPALIVE(6);
+    KEEPALIVE(6),
+    UNREGISTER(7);
 
     private int code;
 

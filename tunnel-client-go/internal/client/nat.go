@@ -10,11 +10,40 @@ import (
 	"github.com/devShuai/shuai-tunnel/tunnel-client-go/internal/protocol"
 )
 
-func (client *Client) applyTunnelConfigs(configs []TunnelConfig) {
-	client.tunnelsMu.Lock()
-	defer client.tunnelsMu.Unlock()
+func (client *Client) syncTunnelConfigs(connection net.Conn, configs []TunnelConfig) {
+	desired := make(map[int]TunnelConfig, len(configs))
 	for _, config := range configs {
-		client.tunnels[config.Port] = config
+		desired[config.Port] = config
+	}
+	client.tunnelsMu.Lock()
+	client.tunnels = desired
+	client.tunnelsMu.Unlock()
+
+	client.registeredMu.Lock()
+	var removedPorts []int
+	for port := range client.registered {
+		if _, exists := desired[port]; !exists {
+			delete(client.registered, port)
+			removedPorts = append(removedPorts, port)
+		}
+	}
+	client.registeredMu.Unlock()
+	for _, port := range removedPorts {
+		client.unregisterTunnel(connection, port)
+	}
+	client.registerConfiguredTunnels(connection)
+}
+
+func (client *Client) unregisterTunnel(connection net.Conn, port int) {
+	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
+		Type:     protocol.NatUnregister,
+		Metadata: map[string]any{"port": port},
+	})
+	if err == nil {
+		err = client.send(connection, protocol.CommandNatMessage, body)
+	}
+	if err != nil {
+		client.logger.Printf("unregister NAT port %d failed: %v", port, err)
 	}
 }
 

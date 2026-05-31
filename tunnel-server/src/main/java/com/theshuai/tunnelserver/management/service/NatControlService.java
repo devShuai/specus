@@ -68,7 +68,9 @@ public class NatControlService {
         mapping.setEnabled(request.enabled() == null || request.enabled());
         mapping.setCreatedAt(now);
         mapping.setUpdatedAt(now);
-        return toView(tunnelMappingRepository.save(mapping));
+        TunnelMapping saved = tunnelMappingRepository.saveAndFlush(mapping);
+        pushSnapshotIfOnline(account);
+        return toView(saved);
     }
 
     @Transactional
@@ -76,18 +78,20 @@ public class NatControlService {
         TunnelMapping mapping = tunnelMappingRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
         tunnelMappingRepository.delete(mapping);
+        tunnelMappingRepository.flush();
+        ClientAccount account = clientAccountRepository.findById(mapping.getClientId()).orElse(null);
+        if (account != null) {
+            pushSnapshotIfOnline(account);
+        }
     }
 
     /**
-     * 向在线客户端下发当前启用的端口映射（NAT_CONTROL）。客户端离线或无启用映射时抛出异常。
+     * 向在线客户端下发当前启用的端口映射快照（NAT_CONTROL）。客户端离线时抛出异常。
      */
     @Transactional(readOnly = true)
     public int pushToClient(long clientId) {
         ClientAccount account = findClient(clientId);
         List<TunnelMapping> mappings = tunnelMappingRepository.findByClientIdAndEnabledTrueOrderByIdAsc(account.getId());
-        if (mappings.isEmpty()) {
-            throw new IllegalArgumentException("该客户端没有启用的端口映射");
-        }
         if (!sendNatControl(account.getClientName(), mappings)) {
             throw new IllegalStateException("客户端不在线，无法下发映射");
         }
@@ -140,6 +144,13 @@ public class NatControlService {
         channel.writeAndFlush(packet);
         log.info("[nat-control] pushed {} mapping(s) to {}", mappings.size(), clientName);
         return true;
+    }
+
+    private void pushSnapshotIfOnline(ClientAccount account) {
+        List<TunnelMapping> mappings = tunnelMappingRepository.findByClientIdAndEnabledTrueOrderByIdAsc(account.getId());
+        if (sendNatControl(account.getClientName(), mappings)) {
+            log.info("[nat-control] automatically synchronized {} mapping(s) to {}", mappings.size(), account.getClientName());
+        }
     }
 
     private ClientAccount findClient(long clientId) {

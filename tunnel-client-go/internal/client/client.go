@@ -179,8 +179,7 @@ func (client *Client) handleMessageResponse(connection net.Conn, body []byte) er
 	if err := json.Unmarshal([]byte(response.Message), &config); err != nil {
 		return fmt.Errorf("decode NAT control config: %w", err)
 	}
-	client.applyTunnelConfigs(config.TunnelConfigList)
-	client.registerConfiguredTunnels(connection)
+	client.syncTunnelConfigs(connection, config.TunnelConfigList)
 	return nil
 }
 

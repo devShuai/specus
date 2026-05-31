@@ -42,6 +42,8 @@ public class NatServerHandler extends NatCommonHandler {
             NatMessagePacket natMessagePacket = (NatMessagePacket) msg;
             if (natMessagePacket.getNatMessageType() == NatMessageType.REGISTER) {
                 processRegister(natMessagePacket);
+            } else if (natMessagePacket.getNatMessageType() == NatMessageType.UNREGISTER) {
+                processUnregister(natMessagePacket);
             } else if (register) {
                 switch (natMessagePacket.getNatMessageType()) {
                     case DISCONNECTED:
@@ -70,6 +72,15 @@ public class NatServerHandler extends NatCommonHandler {
         channelGroup.close(channel -> channel.id().asLongText().equals(natMessagePacket.getMetaData().get("channelId")));
     }
 
+    private void processUnregister(NatMessagePacket natMessagePacket) {
+        int port = (int) natMessagePacket.getMetaData().get("port");
+        TcpServer server = remoteConnectionServerMap.remove(port);
+        if (server != null) {
+            server.close();
+            log.info("Stop server on port: {} [{}]", port, clientName);
+        }
+    }
+
     private void processRegister(NatMessagePacket natMessagePacket) {
         Map<String, Object> metaData = new HashMap<>();
         int port = (int) natMessagePacket.getMetaData().get("port");
@@ -83,6 +94,11 @@ public class NatServerHandler extends NatCommonHandler {
         }
         clientName = session.getClientName();
         metaData.put("port", port);
+        if (remoteConnectionServerMap.containsKey(port)) {
+            metaData.put("success", true);
+            writeRegisterResult(metaData);
+            return;
+        }
         try {
             NatServerHandler thisHandler = this;
             final TcpServer remoteConnectionServer = new TcpServer();
@@ -104,15 +120,19 @@ public class NatServerHandler extends NatCommonHandler {
             e.printStackTrace();
         }
 
-        NatMessagePacket message = new NatMessagePacket();
-        message.setNatMessageType(NatMessageType.REGISTER_RESULT);
-        message.setMetaData(metaData);
-        ctx.writeAndFlush(message);
+        writeRegisterResult(metaData);
 
         if (!register) {
             log.info("Client register error: " + metaData.get("reason"));
             ctx.close();
         }
+    }
+
+    private void writeRegisterResult(Map<String, Object> metaData) {
+        NatMessagePacket message = new NatMessagePacket();
+        message.setNatMessageType(NatMessageType.REGISTER_RESULT);
+        message.setMetaData(metaData);
+        ctx.writeAndFlush(message);
     }
 
     @Override

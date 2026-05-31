@@ -38,6 +38,7 @@ const (
 	NatDisconnected   = 4
 	NatData           = 5
 	NatKeepalive      = 6
+	NatUnregister     = 7
 
 	MessageTypeNatControl = 3
 

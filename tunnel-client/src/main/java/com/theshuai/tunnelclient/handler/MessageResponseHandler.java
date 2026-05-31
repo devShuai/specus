@@ -31,7 +31,7 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
                 if (natClientHandler == null) {
                     ctx.pipeline().addLast(new NatClientHandler(tunnelBean));
                 } else {
-                    System.out.println("已存在 NAT 隧道，忽略本次下发；如需更新映射请重连客户端");
+                    natClientHandler.applyConfig(tunnelBean);
                 }
                 break;
             }
