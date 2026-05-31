@@ -14,6 +14,8 @@ flowchart LR
     N <-->|Netty 自定义协议| C[NatClientHandler]
     C --> L[LocalTunnelHandler]
     L -->|访问内网地址和端口| S[本地 TCP 服务]
+    H[HTTP 访问者] -->|访问 /http/client/route/path| W[HttpTunnelController]
+    W <-->|通过 7010 控制连接直转 HTTP| C
 ```
 
 核心流程：
@@ -81,6 +83,12 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 {
   "clientName": "Demo client",
   "password": "test1234",
+  "httpTunnelConfigList": [
+    {
+      "route": "web",
+      "targetBaseUrl": "http://127.0.0.1:8080"
+    }
+  ],
   "remoteAddress": "127.0.0.1",
   "remotePort": 7010
 }
@@ -92,6 +100,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | --- | --- |
 | `clientName` | 客户端名称，也是服务端会话标识 |
 | `password` | 管理后台分配给客户端的密码 |
+| `httpTunnelConfigList` | HTTP 直转路由列表；每个 route 映射一个客户端可访问的内网 HTTP 地址 |
 | `remoteAddress` | 公网服务端地址 |
 | `remotePort` | 服务端 Netty 控制连接端口，当前代码固定为 `7010` |
 
@@ -160,6 +169,31 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run \
 
 密码在数据库中保存为 SHA-256 摘要。创建或重置密码时，管理页面仅显示一次明文密码。
 
+## HTTP 直转通道
+
+HTTP 直转通道与 TCP 端口映射并行工作。服务端收到请求后，通过客户端控制连接转发 HTTP 方法、路径、查询参数、请求头和二进制请求体；客户端请求本地配置的目标服务，再将状态码、响应头和二进制响应体返回。
+
+客户端配置中的 `route` 决定可访问的内网目标。例如：
+
+```json
+{
+  "httpTunnelConfigList": [
+    {
+      "route": "web",
+      "targetBaseUrl": "http://127.0.0.1:8080"
+    }
+  ]
+}
+```
+
+客户端登录后，可通过服务端直接访问：
+
+```bash
+curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
+```
+
+该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=tunnel`。`/http/**` 默认作为公开流量入口，不使用管理后台的 Basic Auth；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `TUNNEL_HTTP_TIMEOUT_MS` 调整。
+
 ### 数据库切换
 
 默认配置使用 SQLite：
@@ -203,6 +237,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
 - 客户端账号分配、连接记录、连接频率限制和流量统计
 - 内置管理 API 和管理页面
+- 基于客户端 route 白名单的 HTTP 请求直接转发
 - 控制连接断开后的重连逻辑
 - TCP 公网端口监听和双向数据转发
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应

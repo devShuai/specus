@@ -58,6 +58,8 @@ public class PacketCodec {
 
         packetTypeMap.put(Command.HTTP_REQUEST, HttpRequestPacket.class);
         packetTypeMap.put(Command.HTTP_RESPONSE, HttpResponsePacket.class);
+        packetTypeMap.put(Command.DIRECT_HTTP_REQUEST, DirectHttpRequestPacket.class);
+        packetTypeMap.put(Command.DIRECT_HTTP_RESPONSE, DirectHttpResponsePacket.class);
 
         serializerMap = new HashMap<>();
         serializerMap.put(Serializer.FASTJSON.getSerializerAlgorithm(), Serializer.FASTJSON);

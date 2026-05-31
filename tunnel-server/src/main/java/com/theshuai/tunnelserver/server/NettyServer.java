@@ -68,6 +68,7 @@ public class NettyServer implements ApplicationRunner {
                         ch.pipeline().addLast(HeartbeatRequestHandler.INSTANCE);
                         ch.pipeline().addLast(new NatServerHandler(trafficUsageService));
                         ch.pipeline().addLast(CustomHttpResponseHandler.INSTANCE);
+                        ch.pipeline().addLast(DirectHttpResponseHandler.INSTANCE);
                         ch.pipeline().addLast(ServerMessageHandler.INSTANCE);
                         ch.pipeline().addLast(LogoutRequestHandler.INSTANCE);
                     }

@@ -4,6 +4,13 @@
 
   "password": "test1234",
 
+  "httpTunnelConfigList": [
+    {
+      "route": "web",
+      "targetBaseUrl": "https://www.baidu.com:443"
+    }
+  ],
+
   "remoteAddress": "127.0.0.1",
 
   "remotePort": 7010

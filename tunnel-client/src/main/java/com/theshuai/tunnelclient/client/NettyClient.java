@@ -48,6 +48,7 @@ public class NettyClient {
                         ch.pipeline().addLast(new PacketDecoder());
                         ch.pipeline().addLast(new LoginResponseHandler());
                         ch.pipeline().addLast(new MessageResponseHandler());
+                        ch.pipeline().addLast(new DirectHttpRequestHandler(TunnelBean.getHttpTunnelConfigList()));
                         ch.pipeline().addLast(new CustomHttpRequestHandler());
                         ch.pipeline().addLast(new LogoutResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());

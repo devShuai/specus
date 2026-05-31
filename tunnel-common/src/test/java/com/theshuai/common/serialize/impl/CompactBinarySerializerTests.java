@@ -5,6 +5,8 @@ import com.theshuai.common.protocol.PacketCodec;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.protocol.request.HttpRequestPacket;
+import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
+import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.serialize.Serializer;
 import io.netty.buffer.ByteBuf;
@@ -13,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -96,6 +99,52 @@ class CompactBinarySerializerTests {
             assertEquals(expected.getNatMessageType(), result.getNatMessageType());
             assertEquals(expected.getMetaData(), result.getMetaData());
             assertArrayEquals(expected.getData(), result.getData());
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    void shouldRoundTripDirectHttpPacketsWithBinaryBodies() {
+        DirectHttpRequestPacket request = new DirectHttpRequestPacket();
+        request.setRequestId(UUID.randomUUID().toString());
+        request.setRequestMethod("PATCH");
+        request.setRoute("web");
+        request.setRelativePath("/api/files/demo.bin");
+        request.setRawQuery("download=true");
+        request.setHeaders(List.of("Content-Type:application/octet-stream", "X-Demo:first", "X-Demo:second"));
+        request.setBody(new byte[]{0, 1, 2, 3, -1});
+
+        DirectHttpResponsePacket response = new DirectHttpResponsePacket();
+        response.setRequestId(request.getRequestId());
+        response.setStatusCode(206);
+        response.setHeaders(List.of("Content-Type:application/octet-stream", "Set-Cookie:a=1", "Set-Cookie:b=2"));
+        response.setBody(new byte[]{9, 8, 7, 6});
+
+        assertEquals(request, Serializer.COMPACT_BINARY.deserialize(
+                DirectHttpRequestPacket.class,
+                Serializer.COMPACT_BINARY.serialize(request)
+        ));
+        assertEquals(response, Serializer.COMPACT_BINARY.deserialize(
+                DirectHttpResponsePacket.class,
+                Serializer.COMPACT_BINARY.serialize(response)
+        ));
+    }
+
+    @Test
+    void shouldEncodeAndDecodeDirectHttpPacket() throws Exception {
+        DirectHttpRequestPacket expected = new DirectHttpRequestPacket();
+        expected.setRequestId(UUID.randomUUID().toString());
+        expected.setRequestMethod("POST");
+        expected.setRoute("web");
+        expected.setRelativePath("/api/upload");
+        expected.setHeaders(List.of("Content-Type:application/octet-stream"));
+        expected.setBody(new byte[]{1, 2, 3});
+
+        ByteBuf byteBuf = Unpooled.buffer();
+        try {
+            PacketCodec.INSTANCE.encode(byteBuf, expected);
+            assertEquals(expected, assertInstanceOf(DirectHttpRequestPacket.class, PacketCodec.INSTANCE.decode(byteBuf)));
         } finally {
             byteBuf.release();
         }

@@ -2,11 +2,13 @@ package com.theshuai.common.serialize.impl;
 
 import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.protocol.request.HeartBeatRequestPacket;
+import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.request.HttpRequestPacket;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.request.LogoutRequestPacket;
 import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.common.protocol.response.HeartBeatResponsePacket;
+import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import com.theshuai.common.protocol.response.HttpResponsePacket;
 import com.theshuai.common.protocol.response.LoginResponsePacket;
 import com.theshuai.common.protocol.response.LogoutResponsePacket;
@@ -36,12 +38,15 @@ public class CompactBinarySerializer implements Serializer {
 
     private static final ValueCodec STRING = new StringCodec();
     private static final ValueCodec BOOLEAN = new BooleanCodec();
+    private static final ValueCodec INTEGER = new IntegerCodec();
+    private static final ValueCodec BYTE_ARRAY = new ByteArrayCodec();
     private static final ValueCodec NUMERIC_STRING = new NumericStringCodec();
     private static final ValueCodec MD5_STRING = new FixedHexStringCodec(16);
     private static final ValueCodec UUID_STRING = new UuidStringCodec();
     private static final ValueCodec HTTP_METHOD = new HttpMethodCodec();
     private static final ValueCodec MESSAGE_TYPE = new EnumCodec<>(MessageType.class);
     private static final ValueCodec STRING_MAP = new StringMapCodec();
+    private static final ValueCodec STRING_LIST = new StringListCodec();
 
     private static final Map<Class<?>, ObjectSchema<?>> SCHEMAS = createSchemas();
 
@@ -137,6 +142,20 @@ public class CompactBinarySerializer implements Serializer {
                 field("toClientName", STRING),
                 field("requestId", UUID_STRING),
                 field("response", STRING)));
+        register(schemas, schema(DirectHttpRequestPacket.class,
+                field("requestId", UUID_STRING),
+                field("requestMethod", HTTP_METHOD),
+                field("route", STRING),
+                field("relativePath", STRING),
+                field("rawQuery", STRING),
+                field("headers", STRING_LIST),
+                field("body", BYTE_ARRAY)));
+        register(schemas, schema(DirectHttpResponsePacket.class,
+                field("requestId", UUID_STRING),
+                field("statusCode", INTEGER),
+                field("headers", STRING_LIST),
+                field("body", BYTE_ARRAY),
+                field("error", STRING)));
         return schemas;
     }
 
@@ -317,6 +336,30 @@ public class CompactBinarySerializer implements Serializer {
                 throw new IllegalArgumentException("invalid boolean value: " + value);
             }
             return value == 1;
+        }
+    }
+
+    private static class IntegerCodec implements ValueCodec {
+        @Override
+        public void write(CompactOutput output, Object value) {
+            output.writeVarInt((Integer) value);
+        }
+
+        @Override
+        public Object read(CompactInput input) {
+            return input.readVarInt();
+        }
+    }
+
+    private static class ByteArrayCodec implements ValueCodec {
+        @Override
+        public void write(CompactOutput output, Object value) {
+            output.writeByteArray((byte[]) value);
+        }
+
+        @Override
+        public Object read(CompactInput input) {
+            return input.readByteArray();
         }
     }
 
@@ -522,6 +565,33 @@ public class CompactBinarySerializer implements Serializer {
         }
     }
 
+    private static class StringListCodec implements ValueCodec {
+        @Override
+        public void write(CompactOutput output, Object value) {
+            if (value == null) {
+                output.writeVarInt(0);
+                return;
+            }
+            @SuppressWarnings("unchecked")
+            List<String> list = (List<String>) value;
+            output.writeVarInt(list.size() + 1);
+            list.forEach(output::writeString);
+        }
+
+        @Override
+        public Object read(CompactInput input) {
+            int sizeMarker = input.readVarInt();
+            if (sizeMarker == 0) {
+                return null;
+            }
+            java.util.ArrayList<String> list = new java.util.ArrayList<>(sizeMarker - 1);
+            for (int i = 0; i < sizeMarker - 1; i++) {
+                list.add(input.readString());
+            }
+            return list;
+        }
+    }
+
     private static class CompactOutput {
         private final ByteArrayOutputStream output = new ByteArrayOutputStream();
 
@@ -541,6 +611,15 @@ public class CompactBinarySerializer implements Serializer {
             byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
             writeVarInt(bytes.length + 1);
             writeBytes(bytes);
+        }
+
+        private void writeByteArray(byte[] value) {
+            if (value == null) {
+                writeVarInt(0);
+                return;
+            }
+            writeVarInt(value.length + 1);
+            writeBytes(value);
         }
 
         private void writeVarInt(int value) {
@@ -603,6 +682,11 @@ public class CompactBinarySerializer implements Serializer {
                 return null;
             }
             return new String(readBytes(lengthMarker - 1), StandardCharsets.UTF_8);
+        }
+
+        private byte[] readByteArray() {
+            int lengthMarker = readVarInt();
+            return lengthMarker == 0 ? null : readBytes(lengthMarker - 1);
         }
 
         private int readVarInt() {

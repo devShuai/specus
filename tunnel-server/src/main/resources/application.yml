@@ -25,3 +25,6 @@ tunnel:
     password: ${TUNNEL_ADMIN_PASSWORD:admin}
   traffic:
     flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}
+  http:
+    timeout-ms: ${TUNNEL_HTTP_TIMEOUT_MS:30000}
+    max-request-body-size: ${TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE:16777216}
