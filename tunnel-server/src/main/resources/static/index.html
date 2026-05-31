@@ -53,6 +53,22 @@
   </section>
 
   <section class="panel">
+    <h2>端口映射（NAT）</h2>
+    <form class="form" onsubmit="createTunnel(event)">
+      <select id="tunnelClientId" required></select>
+      <input id="listenPort" type="number" min="1" max="65535" required placeholder="公网端口">
+      <input id="targetAddress" required placeholder="内网地址，如 127.0.0.1">
+      <input id="targetPort" type="number" min="1" max="65535" required placeholder="内网端口">
+      <button type="submit">新增映射</button>
+    </form>
+    <table>
+      <thead><tr><th>ID</th><th>客户端</th><th>公网端口</th><th>内网目标</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody id="tunnels"></tbody>
+    </table>
+    <p class="muted">提示：客户端登录后会自动下发已启用的映射；如需立即下发，可在“客户端管理”中点击“下发映射”。客户端在线期间已注册的隧道需重连后才会应用新映射。</p>
+  </section>
+
+  <section class="panel">
     <h2>连接记录</h2>
     <table>
       <thead><tr><th>ID</th><th>客户端</th><th>结果</th><th>远端地址</th><th>连接时间</th><th>断开时间</th><th>原因</th></tr></thead>
@@ -87,8 +103,8 @@ const notice = (message, error = false) => {
 };
 async function loadAll() {
   try {
-    const [overview, clients, connections, traffic] = await Promise.all([
-      api('/overview'), api('/clients'), api('/connections?limit=100'), api('/traffic?limit=100')
+    const [overview, clients, tunnels, connections, traffic] = await Promise.all([
+      api('/overview'), api('/clients'), api('/tunnels'), api('/connections?limit=100'), api('/traffic?limit=100')
     ]);
     clientCache = new Map(clients.map(client => [client.id, client]));
     document.querySelector('#overview').innerHTML = [
@@ -101,8 +117,17 @@ async function loadAll() {
       <td>${client.connectionRateLimitPerMinute || '不限'}</td><td>${formatBytes(client.uploadBytes)}</td><td>${formatBytes(client.downloadBytes)}</td>
       <td>${escapeHtml(client.createdAt)}</td><td>
         <button class="secondary" onclick="editClient(${client.id})">编辑</button>
+        <button class="secondary" onclick="pushNatControl(${client.id})">下发映射</button>
         <button class="danger" onclick="deleteClient(${client.id})">删除</button>
       </td></tr>`).join('');
+    document.querySelector('#tunnelClientId').innerHTML = clients.map(client =>
+      `<option value="${client.id}">${escapeHtml(client.clientName)}</option>`).join('');
+    document.querySelector('#tunnels').innerHTML = tunnels.map(item => `<tr>
+      <td>${item.id}</td><td>${escapeHtml(item.clientName)}</td><td><code>${item.listenPort}</code></td>
+      <td><code>${escapeHtml(item.targetAddress)}:${item.targetPort}</code></td>
+      <td class="${item.enabled ? 'ok' : 'muted'}">${item.enabled ? '启用' : '停用'}</td>
+      <td>${escapeHtml(item.createdAt)}</td>
+      <td><button class="danger" onclick="deleteTunnel(${item.id})">删除</button></td></tr>`).join('');
     document.querySelector('#connections').innerHTML = connections.map(item => `<tr>
       <td>${item.id}</td><td>${escapeHtml(item.clientName)}</td><td class="${item.success ? 'ok' : 'off'}">${item.success ? '成功' : '失败'}</td>
       <td>${escapeHtml(item.remoteAddress)}</td><td>${escapeHtml(item.connectedAt)}</td><td>${escapeHtml(item.disconnectedAt || '-')}</td><td>${escapeHtml(item.failureReason || '-')}</td></tr>`).join('');
@@ -137,6 +162,27 @@ async function editClient(id) {
 async function deleteClient(id) {
   if (!confirm('确定删除该客户端？历史连接和流量记录会保留。')) return;
   try { await api(`/clients/${id}`, {method:'DELETE'}); notice('客户端已删除。'); await loadAll(); }
+  catch (error) { notice(error.message, true); }
+}
+async function createTunnel(event) {
+  event.preventDefault();
+  try {
+    const clientId = document.querySelector('#tunnelClientId').value;
+    await api(`/clients/${clientId}/tunnels`, {method:'POST', body:JSON.stringify({
+      listenPort: Number(document.querySelector('#listenPort').value),
+      targetAddress: document.querySelector('#targetAddress').value,
+      targetPort: Number(document.querySelector('#targetPort').value), enabled:true
+    })});
+    notice('端口映射已新增。'); event.target.reset(); await loadAll();
+  } catch (error) { notice(error.message, true); }
+}
+async function deleteTunnel(id) {
+  if (!confirm('确定删除该端口映射？')) return;
+  try { await api(`/tunnels/${id}`, {method:'DELETE'}); notice('端口映射已删除。'); await loadAll(); }
+  catch (error) { notice(error.message, true); }
+}
+async function pushNatControl(id) {
+  try { const result = await api(`/clients/${id}/nat-control`, {method:'POST'}); notice(`已向客户端下发 ${result.pushed} 条映射。`); }
   catch (error) { notice(error.message, true); }
 }
 async function initializeDatabase() {

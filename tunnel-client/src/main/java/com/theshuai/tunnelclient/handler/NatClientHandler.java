@@ -33,6 +33,8 @@ public class NatClientHandler extends NatCommonHandler {
     private ConcurrentHashMap<String, NatCommonHandler> channelHandlerMap = new ConcurrentHashMap<>();
     private ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
+    private boolean registered = false;
+
     public NatClientHandler(TunnelBean tunnelBean) {
         this.remoteHost = tunnelBean.getRemoteAddress();
         for (TunnelConfig tunnelConfig : tunnelBean.getTunnelConfigList()) {
@@ -41,7 +43,26 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     @Override
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+        super.handlerAdded(ctx);
+        // The control channel is already active when this handler is added after a
+        // NAT_CONTROL push, so channelActive will not fire. Register the tunnels here.
+        if (ctx.channel().isActive()) {
+            registerTunnels(ctx);
+        }
+    }
+
+    @Override
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        registerTunnels(ctx);
+        super.channelActive(ctx);
+    }
+
+    private synchronized void registerTunnels(ChannelHandlerContext ctx) {
+        if (registered) {
+            return;
+        }
+        registered = true;
         for (Map.Entry<Integer, TunnelConfig> tunnelConfigEntry : tunnelConfigMap.entrySet()) {
             Integer port = tunnelConfigEntry.getKey();
             NatMessagePacket message = new NatMessagePacket();
@@ -54,7 +75,6 @@ public class NatClientHandler extends NatCommonHandler {
             message.setMetaData(metaData);
             ctx.writeAndFlush(message);
         }
-        super.channelActive(ctx);
     }
 
     @Override

@@ -7,7 +7,9 @@ import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.protocol.request.HttpRequestPacket;
 import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
+import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
+import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.serialize.Serializer;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -145,6 +147,27 @@ class CompactBinarySerializerTests {
         try {
             PacketCodec.INSTANCE.encode(byteBuf, expected);
             assertEquals(expected, assertInstanceOf(DirectHttpRequestPacket.class, PacketCodec.INSTANCE.decode(byteBuf)));
+        } finally {
+            byteBuf.release();
+        }
+    }
+
+    @Test
+    void shouldEncodeAndDecodeNatControlMessage() throws Exception {
+        MessageResponsePacket expected = new MessageResponsePacket();
+        expected.setClientName("Demo client");
+        expected.setMessageType(MessageType.NAT_CONTROL);
+        expected.setMessage("{\"clientName\":\"Demo client\",\"remotePort\":7010,"
+                + "\"tunnelConfigList\":[{\"port\":9000,\"tunnelAddress\":\"127.0.0.1\",\"tunnelPort\":8080}]}");
+
+        ByteBuf byteBuf = Unpooled.buffer();
+        try {
+            PacketCodec.INSTANCE.encode(byteBuf, expected);
+            MessageResponsePacket result = assertInstanceOf(MessageResponsePacket.class, PacketCodec.INSTANCE.decode(byteBuf));
+
+            assertEquals(MessageType.NAT_CONTROL, result.getMessageType());
+            assertEquals(expected.getClientName(), result.getClientName());
+            assertEquals(expected.getMessage(), result.getMessage());
         } finally {
             byteBuf.release();
         }

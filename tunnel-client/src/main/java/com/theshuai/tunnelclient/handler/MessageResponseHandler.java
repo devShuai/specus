@@ -26,12 +26,14 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
             }
 
             case NAT_CONTROL: {
-                TunnelBean TunnelBean = JsonUtil.stringToObject(messageResponsePacket.getMessage(), TunnelBean.class);
+                TunnelBean tunnelBean = JsonUtil.stringToObject(messageResponsePacket.getMessage(), TunnelBean.class);
                 NatClientHandler natClientHandler = ctx.pipeline().get(NatClientHandler.class);
                 if (natClientHandler == null) {
-                    NatClientHandler clientHandler = new NatClientHandler(TunnelBean);
-                    ctx.pipeline().addLast(clientHandler);
+                    ctx.pipeline().addLast(new NatClientHandler(tunnelBean));
+                } else {
+                    System.out.println("已存在 NAT 隧道，忽略本次下发；如需更新映射请重连客户端");
                 }
+                break;
             }
 
             default:

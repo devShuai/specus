@@ -20,6 +20,7 @@ tunnel:
     seed-demo-client: ${TUNNEL_DB_SEED_DEMO_CLIENT:true}
   netty:
     port: ${TUNNEL_NETTY_PORT:7010}
+  public-address: ${TUNNEL_PUBLIC_ADDRESS:}
   management:
     username: ${TUNNEL_ADMIN_USERNAME:admin}
     password: ${TUNNEL_ADMIN_PASSWORD:admin}

@@ -103,7 +103,6 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | --- | --- |
 | `clientName` | 客户端名称，也是服务端会话标识 |
 | `password` | 管理后台分配给客户端的密码 |
-| `tunnelConfigList` | TCP 端口映射列表；Go 客户端会在登录后直接注册，Java 客户端通过 `NAT_CONTROL` 消息动态接收 |
 | `httpTunnelConfigList` | HTTP 直转路由列表；每个 route 映射一个客户端可访问的内网 HTTP 地址 |
 | `remoteAddress` | 公网服务端地址 |
 | `remotePort` | 服务端 Netty 控制连接端口，需与服务端 `TUNNEL_NETTY_PORT`（默认 `7010`）一致 |
@@ -115,21 +114,6 @@ cd tunnel-client
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
-也可以使用 Go 客户端。它不依赖 Java 运行时，并会在登录成功后直接注册配置文件中的 `tunnelConfigList`：
-
-```bash
-cd tunnel-client-go
-cp tunnelClientConfig.example.json tunnelClientConfig.json
-go run ./cmd/shuai-tunnel-client -config tunnelClientConfig.json
-```
-
-构建单文件客户端：
-
-```bash
-cd tunnel-client-go
-go build -o shuai-tunnel-client ./cmd/shuai-tunnel-client
-```
-
 客户端的 `application.yml` 也将 Spring Boot Web 端口设置为 `8088`。如果服务端和客户端在同一台机器上联调，需要为客户端覆盖该端口：
 
 ```bash
@@ -139,24 +123,27 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run \
 
 ### 3. 下发端口映射
 
+端口映射在管理后台维护，并通过 `NAT_CONTROL` 消息下发给在线客户端。客户端收到后会向服务端注册映射，服务端随即在对应公网端口上开始监听。
+
+在管理后台的「端口映射（NAT）」面板中：
+
+1. 选择目标客户端，填写公网端口、内网目标地址和内网端口，新增一条映射。
+2. 客户端**下次登录时会自动收到并注册已启用的映射**；如果客户端已在线，可在「客户端管理」中点击「下发映射」立即下发。
+
+也可以直接调用管理 API（需 Basic Auth）：
 Java 客户端收到 `NAT_CONTROL` 消息后，才会注册端口映射。Go 客户端既支持相同的动态配置消息，也会在登录后直接注册本地配置文件中的 `tunnelConfigList`。消息体应为以下 JSON 结构：
 
-```json
-{
-  "clientName": "Demo client",
-  "remoteAddress": "127.0.0.1",
-  "remotePort": 7010,
-  "tunnelConfigList": [
-    {
-      "port": 9000,
-      "tunnelAddress": "127.0.0.1",
-      "tunnelPort": 8080
-    }
-  ]
-}
+```bash
+# 为客户端 ID=123 新增映射：公网 9000 -> 内网 127.0.0.1:8080
+curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/tunnels \
+  -H 'Content-Type: application/json' \
+  -d '{"listenPort":9000,"targetAddress":"127.0.0.1","targetPort":8080}'
+
+# 立即向在线客户端下发该客户端启用的全部映射
+curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/nat-control
 ```
 
-该示例表示：访问服务端 `9000` 端口的 TCP 流量，将被转发到客户端网络中的 `127.0.0.1:8080`。
+上面的示例表示：访问服务端 `9000` 端口的 TCP 流量，将被转发到客户端网络中的 `127.0.0.1:8080`。客户端离线时下发接口返回 `409`；客户端在线期间已注册的隧道需重连后才会应用新映射。
 
 ## 协议概览
 
@@ -181,6 +168,7 @@ Java 客户端收到 `NAT_CONTROL` 消息后，才会注册端口映射。Go 客
 
 - 创建、编辑、停用和删除客户端
 - 自动生成客户端密码，或在管理页面中重置密码
+- 维护每个客户端的 TCP 端口映射，并向在线客户端下发 `NAT_CONTROL` 配置
 - 查看控制连接成功和失败记录
 - 按客户端和 UTC 日期汇总上下行流量
 - 配置每个客户端每分钟允许的控制连接次数；设置为 `0` 表示不限
@@ -256,6 +244,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
 - 客户端账号分配、连接记录、连接频率限制和流量统计
 - 内置管理 API 和管理页面
+- 端口映射的持久化管理，以及通过管理 API/页面向在线客户端下发 `NAT_CONTROL`，客户端登录时自动下发已启用映射
 - 基于客户端 route 白名单的 HTTP 请求直接转发
 - 控制连接断开后的重连逻辑
 - TCP 公网端口监听和双向数据转发
@@ -264,7 +253,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 需要继续完善：
 
-- 仓库中没有 Controller、命令行入口或管理界面用于向 Java 客户端发送 `NAT_CONTROL` 消息；Go 客户端可以通过本地配置文件直接注册端口映射。
+- 客户端在线期间已注册的隧道需要重连后才会应用新下发的映射，暂不支持在线热更新。
 - 服务端和客户端的 Spring Boot Web 端口默认均为 `8088`，部署在同一台机器时需要覆盖其中一个端口。
 - UDP 转发尚未实现，`UdpConnection` 当前为空。
 - 登录签名盐值仍写在代码中，MD5 签名仅适合演示。
@@ -272,4 +261,4 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 ## 开发建议
 
-下一步可以优先增加一个服务端管理接口，用于选择在线客户端并下发 `NAT_CONTROL` 配置；随后将签名升级为更安全的方案，并补充端到端测试。
+服务端下发 `NAT_CONTROL` 的管理接口已经实现（见[下发端口映射](#3-下发端口映射)）。后续可以优先将登录签名从写死盐值的 MD5 升级为更安全的方案（例如基于每客户端密钥的 HMAC），并补充覆盖真实数据库与端到端隧道的自动化测试；端口映射的在线热更新也值得跟进。

@@ -4,9 +4,12 @@ import com.theshuai.tunnelserver.database.DatabaseInitializer;
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.model.ConnectionRecordView;
 import com.theshuai.tunnelserver.management.model.TrafficUsageView;
+import com.theshuai.tunnelserver.management.model.TunnelMappingView;
 import com.theshuai.tunnelserver.management.service.ClientManagementService;
 import com.theshuai.tunnelserver.management.service.ClientManagementService.ClientMutation;
 import com.theshuai.tunnelserver.management.service.ClientManagementService.CredentialResult;
+import com.theshuai.tunnelserver.management.service.NatControlService;
+import com.theshuai.tunnelserver.management.service.NatControlService.MappingMutation;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -30,13 +33,16 @@ import java.util.Map;
 public class AdminController {
     private final ClientManagementService clientManagementService;
     private final TrafficUsageService trafficUsageService;
+    private final NatControlService natControlService;
     private final DatabaseInitializer databaseInitializer;
 
     public AdminController(ClientManagementService clientManagementService,
                            TrafficUsageService trafficUsageService,
+                           NatControlService natControlService,
                            DatabaseInitializer databaseInitializer) {
         this.clientManagementService = clientManagementService;
         this.trafficUsageService = trafficUsageService;
+        this.natControlService = natControlService;
         this.databaseInitializer = databaseInitializer;
     }
 
@@ -81,6 +87,28 @@ public class AdminController {
         return clientManagementService.listTraffic(clientId, limit);
     }
 
+    @GetMapping("/tunnels")
+    public List<TunnelMappingView> listTunnels(@RequestParam(required = false) Long clientId) {
+        return natControlService.listMappings(clientId);
+    }
+
+    @PostMapping("/clients/{id}/tunnels")
+    public ResponseEntity<TunnelMappingView> createTunnel(@PathVariable long id, @RequestBody MappingMutation request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(natControlService.createMapping(id, request));
+    }
+
+    @DeleteMapping("/tunnels/{tunnelId}")
+    public ResponseEntity<Void> deleteTunnel(@PathVariable long tunnelId) {
+        natControlService.deleteMapping(tunnelId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/clients/{id}/nat-control")
+    public Map<String, Object> pushNatControl(@PathVariable long id) {
+        int count = natControlService.pushToClient(id);
+        return Map.of("pushed", count);
+    }
+
     @PostMapping("/database/initialize")
     public Map<String, Object> initializeDatabase() {
         return databaseInitializer.initialize();
@@ -89,6 +117,11 @@ public class AdminController {
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> handleIllegalArgument(IllegalArgumentException exception) {
         return ResponseEntity.badRequest().body(Map.of("error", exception.getMessage()));
+    }
+
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<Map<String, String>> handleIllegalState(IllegalStateException exception) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", exception.getMessage()));
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)

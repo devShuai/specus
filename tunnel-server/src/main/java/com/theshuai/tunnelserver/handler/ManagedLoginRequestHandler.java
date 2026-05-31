@@ -6,6 +6,7 @@ import com.theshuai.common.session.Session;
 import com.theshuai.common.util.SessionUtil;
 import com.theshuai.tunnelserver.management.service.ClientManagementService;
 import com.theshuai.tunnelserver.management.service.ClientManagementService.AuthenticationResult;
+import com.theshuai.tunnelserver.management.service.NatControlService;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -18,9 +19,12 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
     private static final AttributeKey<Long> CONNECTION_RECORD_ID = AttributeKey.valueOf("connectionRecordId");
 
     private final ClientManagementService clientManagementService;
+    private final NatControlService natControlService;
 
-    public ManagedLoginRequestHandler(ClientManagementService clientManagementService) {
+    public ManagedLoginRequestHandler(ClientManagementService clientManagementService,
+                                      NatControlService natControlService) {
         this.clientManagementService = clientManagementService;
+        this.natControlService = natControlService;
     }
 
     @Override
@@ -44,6 +48,10 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             SessionUtil.bindSession(new Session(packet.getClientName()), ctx.channel());
         }
         ctx.writeAndFlush(response);
+
+        if (authentication.success()) {
+            natControlService.pushOnLogin(packet.getClientName());
+        }
     }
 
     @Override
