@@ -68,12 +68,12 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 | 端口 | 用途 |
 | --- | --- |
-| `7010` | Netty 控制连接端口，定义在 `NettyServer` 中 |
+| `7010` | Netty 控制连接端口，默认值定义在 `application.yml` 中，可通过 `TUNNEL_NETTY_PORT` 覆盖 |
 | `8088` | Spring Boot Web 和管理后台端口，定义在 `application.yml` 中 |
 
 启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。默认管理账号为 `admin / admin`，部署前应通过 `TUNNEL_ADMIN_USERNAME` 和 `TUNNEL_ADMIN_PASSWORD` 修改。
 
-服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。持久化层使用 Spring Data JPA 和 Hibernate，不包含手写 SQL 或 `JdbcTemplate`。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
+服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。持久化层使用 Spring Data JPA 和 Hibernate，不包含手写 SQL 或 `JdbcTemplate`。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
 
 ### 2. 配置并启动客户端
 
@@ -102,7 +102,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | `password` | 管理后台分配给客户端的密码 |
 | `httpTunnelConfigList` | HTTP 直转路由列表；每个 route 映射一个客户端可访问的内网 HTTP 地址 |
 | `remoteAddress` | 公网服务端地址 |
-| `remotePort` | 服务端 Netty 控制连接端口，当前代码固定为 `7010` |
+| `remotePort` | 服务端 Netty 控制连接端口，需与服务端 `TUNNEL_NETTY_PORT`（默认 `7010`）一致 |
 
 启动客户端：
 
@@ -194,7 +194,7 @@ curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 
 该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=tunnel`。`/http/**` 默认作为公开流量入口，不使用管理后台的 Basic Auth；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `TUNNEL_HTTP_TIMEOUT_MS` 调整。
 
-### 数据库切换
+## 数据库切换
 
 默认配置使用 SQLite：
 
