@@ -10,8 +10,10 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import org.springframework.util.DigestUtils;
 
 import java.util.Date;
+import lombok.extern.slf4j.Slf4j;
 
 @ChannelHandler.Sharable
+@Slf4j
 public class LoginRequestHandler extends SimpleChannelInboundHandler<LoginRequestPacket> {
 
     public static final LoginRequestHandler INSTANCE = new LoginRequestHandler();
@@ -29,12 +31,12 @@ public class LoginRequestHandler extends SimpleChannelInboundHandler<LoginReques
 
         if (valid(loginRequestPacket)) {
             loginResponsePacket.setSuccess(true);
-            System.out.println("[" + loginRequestPacket.getClientName() + "]登录成功");
+            log.info("[" + loginRequestPacket.getClientName() + "]登录成功");
             SessionUtil.bindSession(new Session(loginRequestPacket.getClientName()), ctx.channel());
         } else {
             loginResponsePacket.setReason("账号密码检验失败");
             loginResponsePacket.setSuccess(false);
-            System.out.println(new Date() + ": 登录失败！");
+            log.info(new Date() + ": 登录失败！");
         }
 
         ctx.writeAndFlush(loginResponsePacket);

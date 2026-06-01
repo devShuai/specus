@@ -117,7 +117,7 @@ public class NatServerHandler extends NatCommonHandler {
         } catch (Exception e) {
             metaData.put("success", false);
             metaData.put("reason", e.getMessage());
-            e.printStackTrace();
+            log.error("处理失败", e);
         }
 
         writeRegisterResult(metaData);

@@ -7,7 +7,9 @@ import io.netty.util.AsciiString;
 
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicLong;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class IDUtils {
 
     private static AtomicLong startValue = new AtomicLong(System.currentTimeMillis());
@@ -28,7 +30,7 @@ public class IDUtils {
             buf.writeBytes("0000001".getBytes());
         buf.writeByte('|');
 
-        System.out.println(ByteBufUtil.prettyHexDump(buf));
+        log.info(ByteBufUtil.prettyHexDump(buf));
 
     }
 }

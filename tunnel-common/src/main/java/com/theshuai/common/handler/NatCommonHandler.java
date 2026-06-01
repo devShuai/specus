@@ -6,7 +6,9 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class NatCommonHandler extends ChannelInboundHandlerAdapter {
 
     protected ChannelHandlerContext ctx;
@@ -22,8 +24,8 @@ public class NatCommonHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        System.out.println("Exception caught ... ");
-        cause.printStackTrace();
+        log.info("Exception caught ... ");
+        log.error("Exception caught", cause);
     }
 
     @Override
@@ -31,7 +33,7 @@ public class NatCommonHandler extends ChannelInboundHandlerAdapter {
         if (evt instanceof IdleStateEvent) {
             IdleStateEvent e = (IdleStateEvent) evt;
             if (e.state() == IdleState.READER_IDLE) {
-                System.out.println("Read idle loss connection.");
+                log.info("Read idle loss connection.");
                 ctx.close();
             } else if (e.state() == IdleState.WRITER_IDLE) {
                 NatMessagePacket natMessage = new NatMessagePacket();

@@ -7,7 +7,9 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 
 import java.util.concurrent.TimeUnit;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class HeartBeatTimerHandler extends ChannelInboundHandlerAdapter {
     private static final int HEARTBEAT_INTERVAL = 5;
     private NettyClient nettyClient;
@@ -33,13 +35,13 @@ public class HeartBeatTimerHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        System.out.println("HeartBeatTimerHandler 检测到断开重连中...");
+        log.info("HeartBeatTimerHandler 检测到断开重连中...");
         nettyClient.connect();
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        cause.printStackTrace();
+        log.error("Exception caught", cause);
         ctx.close();
     }
 }

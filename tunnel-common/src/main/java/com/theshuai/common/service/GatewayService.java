@@ -64,7 +64,7 @@ public class GatewayService {
                 });
                 result = syncFuture.get(8, TimeUnit.SECONDS);
             } catch (Exception e) {
-                e.printStackTrace();
+                log.error("处理失败", e);
             }
         } else {
             syncFuture.setResponse(result);

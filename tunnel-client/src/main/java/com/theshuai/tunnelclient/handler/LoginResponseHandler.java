@@ -14,10 +14,10 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
     protected void channelRead0(ChannelHandlerContext ctx, LoginResponsePacket loginResponsePacket) throws Exception {
         String clientName = loginResponsePacket.getClientName();
         if (loginResponsePacket.isSuccess()) {
-            System.out.println("[" + clientName + "]登录成功");
+            log.info("[" + clientName + "]登录成功");
             SessionUtil.bindSession(new Session(clientName), ctx.channel());
         } else {
-            System.out.println("[" + clientName + "]登录失败,原因:" + loginResponsePacket.getReason());
+            log.info("[" + clientName + "]登录失败,原因:" + loginResponsePacket.getReason());
         }
     }
 

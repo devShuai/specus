@@ -8,7 +8,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Base64;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class ImageUtil {
 
     public static String imageToBase64(InputStream inputStream) {
@@ -20,7 +22,7 @@ public class ImageUtil {
             BufferedImage bufferedImage = ImageIO.read(inputStream);
             return Base64.getEncoder().encodeToString(imageToBytes(scale(bufferedImage, 960, 960)));
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         }
     }

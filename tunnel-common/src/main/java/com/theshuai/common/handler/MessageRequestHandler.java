@@ -8,8 +8,10 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import lombok.extern.slf4j.Slf4j;
 
 @ChannelHandler.Sharable
+@Slf4j
 public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRequestPacket> {
     public static final MessageRequestHandler INSTANCE = new MessageRequestHandler();
 
@@ -33,7 +35,7 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
                 serverToClient(messageRequestPacket, session);
                 break;
             default:
-                System.out.println("未知消息类型");
+                log.info("未知消息类型");
         }
     }
 
@@ -48,19 +50,19 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
         if (toClientChannel != null && SessionUtil.hasLogin(toClientChannel)) {
             toClientChannel.writeAndFlush(messageResponsePacket).addListener(future -> {
                 if (future.isDone()) {
-                    System.out.println("发送结束");
+                    log.info("发送结束");
                 }
             });
         } else {
-            System.out.println("[" + session.getClientName() + "] 不在线，发送失败!");
+            log.info("[" + session.getClientName() + "] 不在线，发送失败!");
         }
     }
 
     private void serverToClient(MessageRequestPacket messageRequestPacket, Session session) {
-        System.out.println("server->client: " + messageRequestPacket);
+        log.info("server->client: " + messageRequestPacket);
     }
 
     private void clientToServer(MessageRequestPacket messageRequestPacket, Session session) {
-        System.out.println("client->server: " + messageRequestPacket.getMessage());
+        log.info("client->server: " + messageRequestPacket.getMessage());
     }
 }

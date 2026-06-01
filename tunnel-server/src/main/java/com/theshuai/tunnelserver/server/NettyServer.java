@@ -23,8 +23,10 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.stereotype.Component;
 
 import java.util.Date;
+import lombok.extern.slf4j.Slf4j;
 
 @Component
+@Slf4j
 public class NettyServer implements ApplicationRunner {
     private final int port;
     private final ManagedLoginRequestHandler managedLoginRequestHandler;
@@ -80,9 +82,9 @@ public class NettyServer implements ApplicationRunner {
         serverBootstrap.bind(port).addListener(future -> {
             if (future.isSuccess()) {
                 channel = ((io.netty.channel.ChannelFuture) future).channel();
-                System.out.println(new Date() + ": 端口[" + port + "] 绑定成功!");
+                log.info(new Date() + ": 端口[" + port + "] 绑定成功!");
             } else {
-                System.out.println("端口[" + port + "]绑定失败!");
+                log.info("端口[" + port + "]绑定失败!");
             }
         });
     }

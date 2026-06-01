@@ -3,7 +3,9 @@ package com.theshuai.common.util;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class DateUtil {
 
     private static final DateFormat yyyyMMddFormat = new SimpleDateFormat("yyyyMMdd");
@@ -19,6 +21,6 @@ public class DateUtil {
     }
 
     public static void main(String[] args) {
-        System.out.println(getFullTimeStr());
+        log.info(getFullTimeStr());
     }
 }

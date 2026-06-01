@@ -28,7 +28,7 @@ public class CustomHttpRequestHandler extends SimpleChannelInboundHandler<HttpRe
                 }
             });
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             log.info("send request exception");
         }
     }

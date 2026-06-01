@@ -2,7 +2,9 @@ package com.theshuai.common.serialize;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class JacksonSerializer implements Serializer {
     private static final ObjectMapper objectMapper;
 
@@ -21,7 +23,7 @@ public class JacksonSerializer implements Serializer {
         try {
             return objectMapper.writeValueAsBytes(object);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         }
     }
@@ -31,7 +33,7 @@ public class JacksonSerializer implements Serializer {
         try {
             return objectMapper.readValue(bytes, clazz);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         }
     }

@@ -12,14 +12,16 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import lombok.extern.slf4j.Slf4j;
 
 @SpringBootApplication
+@Slf4j
 public class TunnelClientApplication {
 
     public static void main(String[] args) throws InterruptedException {
         TunnelBean tunnelBean = loadTunnelClientConfig();
         if (tunnelBean == null) {
-            System.out.println("未找到配置");
+            log.info("未找到配置");
             return;
         }
         SpringApplication.run(TunnelClientApplication.class, args);
@@ -47,14 +49,14 @@ public class TunnelClientApplication {
                 }
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         } finally {
             if (fileInputStream != null) {
                 try {
                     fileInputStream.close();
                 } catch (IOException e) {
-                    e.printStackTrace();
+                    log.error("处理失败", e);
                 }
             }
         }

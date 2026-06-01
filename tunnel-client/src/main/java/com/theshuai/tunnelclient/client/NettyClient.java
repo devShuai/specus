@@ -17,7 +17,9 @@ import org.springframework.util.DigestUtils;
 
 import java.util.Date;
 import java.util.concurrent.TimeUnit;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class NettyClient {
     public static String CLIENT_NAME = null;
     public static String PASSWORD = null;
@@ -72,14 +74,14 @@ public class NettyClient {
                         loginRequestPacket.getPassword() + loginRequestPacket.getTimestamp();
                 loginRequestPacket.setCheckSign(DigestUtils.md5DigestAsHex(signString.getBytes()));
                 channel.writeAndFlush(loginRequestPacket);
-                System.out.println(new Date() + "连接成功...");
+                log.info(new Date() + "连接成功...");
             } else {
                 (listener).channel().eventLoop().schedule(() -> {
-                    System.out.println("Failed to connect to server, try connect ...");
+                    log.info("Failed to connect to server, try connect ...");
                     try {
                         connect();
                     } catch (Exception e) {
-                        e.printStackTrace();
+                        log.error("处理失败", e);
                     }
                 }, 10, TimeUnit.SECONDS);
             }

@@ -5,7 +5,9 @@ import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageResponsePacket> {
 
     @Override
@@ -16,12 +18,12 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
             case CLIENT_TO_CLIENT: {
                 String clientName = messageResponsePacket.getClientName();
                 String toClientName = messageResponsePacket.getToClientName();
-                System.out.println("clientName:" + clientName + " -> " + "toClientName:" + toClientName +
+                log.info("clientName:" + clientName + " -> " + "toClientName:" + toClientName +
                         " message: " + messageResponsePacket.getMessage());
                 break;
             }
             case SERVER_TO_CLIENT: {
-                System.out.println("server->client: " + messageResponsePacket.getMessage());
+                log.info("server->client: " + messageResponsePacket.getMessage());
                 break;
             }
 
@@ -37,7 +39,7 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
             }
 
             default:
-                System.out.println("客户端接收到未知消息类型");
+                log.info("客户端接收到未知消息类型");
         }
 
 

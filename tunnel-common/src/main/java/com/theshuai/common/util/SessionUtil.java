@@ -8,7 +8,9 @@ import io.netty.channel.group.ChannelGroup;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class SessionUtil {
 
     private static final Map<String, Channel> clientChannelMap = new ConcurrentHashMap<>();
@@ -20,7 +22,7 @@ public class SessionUtil {
         if (oldChannel != null && oldChannel != channel) {
             oldChannel.attr(Attributes.SESSION).set(null);
             oldChannel.close();
-            System.out.println(session.getClientName() + " 旧连接已替换");
+            log.info(session.getClientName() + " 旧连接已替换");
         }
         channel.attr(Attributes.SESSION).set(session);
         channel.closeFuture().addListener(future -> {
@@ -33,7 +35,7 @@ public class SessionUtil {
             Session session = getSession(channel);
             clientChannelMap.remove(session.getClientName(), channel);
             channel.attr(Attributes.SESSION).set(null);
-            System.out.println(session + "退出登录！");
+            log.info(session + "退出登录！");
         }
     }
 

@@ -7,7 +7,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.commons.lang3.StringUtils;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class JsonUtil {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
@@ -20,7 +22,7 @@ public class JsonUtil {
         try {
             return objectMapper.readTree(jsonString);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         }
     }
@@ -29,7 +31,7 @@ public class JsonUtil {
         try {
             return objectMapper.writeValueAsString(object);
         } catch (JsonProcessingException e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         }
     }
@@ -38,7 +40,7 @@ public class JsonUtil {
         try {
             return objectMapper.readValue(bytes, typeReference);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
         }
         return null;
     }
@@ -47,7 +49,7 @@ public class JsonUtil {
         try {
             return objectMapper.readValue(message, clazz);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         }
     }
@@ -56,7 +58,7 @@ public class JsonUtil {
         try {
             return objectMapper.readValue(message, typeReference);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
         }
         return null;
     }
@@ -69,7 +71,7 @@ public class JsonUtil {
         try {
             return objectMapper.readTree(message).toPrettyString();
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return "";
         }
     }
@@ -81,7 +83,7 @@ public class JsonUtil {
         try {
             return objectMapper.readValue(result, clazz);
         } catch (JsonProcessingException e) {
-            e.printStackTrace();
+            log.error("处理失败", e);
             return null;
         }
     }
