@@ -13,11 +13,15 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslHandler;
 
+import java.io.File;
 import java.security.SecureRandom;
 import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.net.ssl.SSLException;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -30,6 +34,8 @@ public class NettyClient {
     private final Bootstrap bootstrap = new Bootstrap();
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
     private final SecureRandom secureRandom = new SecureRandom();
+    private volatile EventLoopGroup workerGroup;
+    private final SslContext sslContext;
 
     // Cap backoff so a long outage doesn't park the client forever.
     private static final int MAX_RECONNECT_DELAY_SECONDS = 60;
@@ -38,6 +44,10 @@ public class NettyClient {
     private static final int NONCE_BYTES = 16;
 
     public NettyClient(TunnelBean tunnelBean) {
+        this(tunnelBean, null);
+    }
+
+    public NettyClient(TunnelBean tunnelBean, SslContext sslContext) {
         this.tunnelBean = tunnelBean;
         this.clientName = tunnelBean.getClientName();
         // Hash the password once at construction so we never keep the plaintext
@@ -45,6 +55,7 @@ public class NettyClient {
         this.passwordHash = HmacSigner.sha256(tunnelBean.getPassword());
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
+        this.sslContext = sslContext;
     }
 
     public String getClientName() {
@@ -52,7 +63,9 @@ public class NettyClient {
     }
 
     public void start() throws InterruptedException {
-        EventLoopGroup workerGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        if (workerGroup == null) {
+            workerGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        }
         bootstrap.group(workerGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
@@ -60,6 +73,10 @@ public class NettyClient {
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     public void initChannel(SocketChannel ch) {
+                        if (sslContext != null) {
+                            SslHandler sslHandler = sslContext.newHandler(ch.alloc(), host, port);
+                            ch.pipeline().addFirst(sslHandler);
+                        }
                         ch.pipeline().addLast(new ClientSocketIdleStateHandler(NettyClient.this));
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
@@ -73,6 +90,35 @@ public class NettyClient {
                     }
                 });
         connect();
+    }
+
+    /**
+     * Build a client-side {@link SslContext} that trusts the server certificate
+     * stored in {@code truststorePath}. Pass the result to
+     * {@link #NettyClient(TunnelBean, SslContext)} to enable TLS.
+     */
+    public static SslContext buildClientSslContext(String truststorePath, String truststorePassword) {
+        try {
+            return io.netty.handler.ssl.SslContextBuilder.forClient()
+                    .trustManager(new File(truststorePath))
+                    .build();
+        } catch (SSLException e) {
+            throw new IllegalStateException("Failed to build client SslContext: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Build a client-side {@link SslContext} that accepts every server
+     * certificate. Dev/test use only.
+     */
+    public static SslContext buildInsecureClientSslContext() {
+        try {
+            return io.netty.handler.ssl.SslContextBuilder.forClient()
+                    .trustManager(io.netty.handler.ssl.util.InsecureTrustManagerFactory.INSTANCE)
+                    .build();
+        } catch (SSLException e) {
+            throw new IllegalStateException("Failed to build insecure client SslContext: " + e.getMessage(), e);
+        }
     }
 
     public void connect() throws InterruptedException {
@@ -100,6 +146,14 @@ public class NettyClient {
         byte[] nonceBytes = new byte[NONCE_BYTES];
         secureRandom.nextBytes(nonceBytes);
         return HexFormat.of().formatHex(nonceBytes);
+    }
+
+    public void shutdown() {
+        if (workerGroup != null) {
+            EventLoopGroup toShutdown = workerGroup;
+            workerGroup = null;
+            toShutdown.shutdownGracefully();
+        }
     }
 
     private void scheduleReconnect(EventLoop loop) {

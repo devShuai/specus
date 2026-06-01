@@ -2,8 +2,6 @@ package com.theshuai.tunnelserver.management.model;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
@@ -18,7 +16,6 @@ import jakarta.persistence.UniqueConstraint;
         indexes = @Index(name = "idx_tunnel_mapping_client", columnList = "client_id"))
 public class TunnelMapping {
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
     @Column(name = "client_id", nullable = false)
@@ -47,6 +44,10 @@ public class TunnelMapping {
 
     public Long getId() {
         return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
     }
 
     public Long getClientId() {

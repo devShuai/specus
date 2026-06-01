@@ -60,6 +60,7 @@ public class NatControlService {
 
         String now = Instant.now().toString();
         TunnelMapping mapping = new TunnelMapping();
+        mapping.setId(ClientIdGenerator.newId());
         mapping.setClientId(account.getId());
         mapping.setClientName(account.getClientName());
         mapping.setListenPort(listenPort);

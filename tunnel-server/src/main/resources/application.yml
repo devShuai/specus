@@ -29,3 +29,11 @@ tunnel:
   http:
     timeout-ms: ${TUNNEL_HTTP_TIMEOUT_MS:30000}
     max-request-body-size: ${TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE:16777216}
+  tls:
+    # disabled: control channel is plain TCP (legacy)
+    # file: load keystore/truststore from disk (production)
+    # self-signed: generate a transient self-signed cert (dev/test)
+    mode: ${TUNNEL_TLS_MODE:disabled}
+    keystore: ${TUNNEL_TLS_KEYSTORE:}
+    keystore-password: ${TUNNEL_TLS_KEYSTORE_PASSWORD:}
+    key-password: ${TUNNEL_TLS_KEY_PASSWORD:}
