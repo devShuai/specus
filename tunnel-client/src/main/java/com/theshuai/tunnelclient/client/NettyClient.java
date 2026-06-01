@@ -4,8 +4,8 @@ import com.theshuai.common.codec.PacketDecoder;
 import com.theshuai.common.codec.PacketEncoder;
 import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.handler.CustomHttpRequestHandler;
-import com.theshuai.common.handler.LoginRequestHandler;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
+import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.handler.*;
 import io.netty.bootstrap.Bootstrap;
@@ -13,27 +13,42 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import org.springframework.util.DigestUtils;
 
-import java.util.Date;
+import java.security.SecureRandom;
+import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class NettyClient {
-    public static String CLIENT_NAME = null;
-    public static String PASSWORD = null;
-    public static String HOST = null;
-    public static int PORT = -1;
-    private TunnelBean TunnelBean;
-    private static final Bootstrap bootstrap = new Bootstrap();
+    private final String clientName;
+    private final byte[] passwordHash;
+    private final String host;
+    private final int port;
+    private final TunnelBean tunnelBean;
+    private final Bootstrap bootstrap = new Bootstrap();
+    private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
+    private final SecureRandom secureRandom = new SecureRandom();
 
-    public NettyClient(TunnelBean TunnelBean) {
-        this.TunnelBean = TunnelBean;
-        NettyClient.CLIENT_NAME = TunnelBean.getClientName();
-        NettyClient.PASSWORD = TunnelBean.getPassword();
-        NettyClient.HOST = TunnelBean.getRemoteAddress();
-        NettyClient.PORT = TunnelBean.getRemotePort();
+    // Cap backoff so a long outage doesn't park the client forever.
+    private static final int MAX_RECONNECT_DELAY_SECONDS = 60;
+    private static final int MAX_RECONNECT_ATTEMPTS = 30;
+    private static final long BASE_RECONNECT_DELAY_SECONDS = 2L;
+    private static final int NONCE_BYTES = 16;
+
+    public NettyClient(TunnelBean tunnelBean) {
+        this.tunnelBean = tunnelBean;
+        this.clientName = tunnelBean.getClientName();
+        // Hash the password once at construction so we never keep the plaintext
+        // around and never send it over the wire.
+        this.passwordHash = HmacSigner.sha256(tunnelBean.getPassword());
+        this.host = tunnelBean.getRemoteAddress();
+        this.port = tunnelBean.getRemotePort();
+    }
+
+    public String getClientName() {
+        return clientName;
     }
 
     public void start() throws InterruptedException {
@@ -50,7 +65,7 @@ public class NettyClient {
                         ch.pipeline().addLast(new PacketDecoder());
                         ch.pipeline().addLast(new LoginResponseHandler());
                         ch.pipeline().addLast(new MessageResponseHandler());
-                        ch.pipeline().addLast(new DirectHttpRequestHandler(TunnelBean.getHttpTunnelConfigList()));
+                        ch.pipeline().addLast(new DirectHttpRequestHandler(tunnelBean.getHttpTunnelConfigList()));
                         ch.pipeline().addLast(new CustomHttpRequestHandler());
                         ch.pipeline().addLast(new LogoutResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());
@@ -61,30 +76,49 @@ public class NettyClient {
     }
 
     public void connect() throws InterruptedException {
-        ChannelFuture connect = bootstrap.connect(HOST, PORT);
-
-        connect.addListener((ChannelFutureListener) listener -> {
+        bootstrap.connect(host, port).addListener((ChannelFutureListener) listener -> {
             if (listener.isSuccess()) {
+                reconnectAttempts.set(0);
                 Channel channel = listener.channel();
                 LoginRequestPacket loginRequestPacket = new LoginRequestPacket();
-                loginRequestPacket.setClientName(CLIENT_NAME);
-                loginRequestPacket.setPassword(PASSWORD);
-                loginRequestPacket.setTimestamp(String.valueOf(System.currentTimeMillis()));
-                String signString = LoginRequestHandler.md5Salt + loginRequestPacket.getClientName() +
-                        loginRequestPacket.getPassword() + loginRequestPacket.getTimestamp();
-                loginRequestPacket.setCheckSign(DigestUtils.md5DigestAsHex(signString.getBytes()));
+                loginRequestPacket.setClientName(clientName);
+                String timestamp = String.valueOf(System.currentTimeMillis());
+                String nonce = generateNonce();
+                loginRequestPacket.setTimestamp(timestamp);
+                loginRequestPacket.setNonce(nonce);
+                String message = clientName + "\n" + timestamp + "\n" + nonce;
+                loginRequestPacket.setCheckSign(HmacSigner.hmacSha256(passwordHash, message));
                 channel.writeAndFlush(loginRequestPacket);
-                log.info(new Date() + "连接成功...");
+                log.info("Connected to {}:{}", host, port);
             } else {
-                (listener).channel().eventLoop().schedule(() -> {
-                    log.info("Failed to connect to server, try connect ...");
-                    try {
-                        connect();
-                    } catch (Exception e) {
-                        log.error("处理失败", e);
-                    }
-                }, 10, TimeUnit.SECONDS);
+                scheduleReconnect(listener.channel().eventLoop());
             }
         });
+    }
+
+    private String generateNonce() {
+        byte[] nonceBytes = new byte[NONCE_BYTES];
+        secureRandom.nextBytes(nonceBytes);
+        return HexFormat.of().formatHex(nonceBytes);
+    }
+
+    private void scheduleReconnect(EventLoop loop) {
+        int attempt = reconnectAttempts.incrementAndGet();
+        if (attempt > MAX_RECONNECT_ATTEMPTS) {
+            log.error("Giving up reconnect after {} attempts to {}:{}", attempt - 1, host, port);
+            return;
+        }
+        // Exponential backoff with cap: 2s, 4s, 8s, 16s, 32s, then capped at 60s.
+        long delay = Math.min(
+                BASE_RECONNECT_DELAY_SECONDS * (1L << Math.min(attempt - 1, 5)),
+                MAX_RECONNECT_DELAY_SECONDS);
+        log.info("Reconnect attempt {} to {}:{} in {}s", attempt, host, port, delay);
+        loop.schedule(() -> {
+            try {
+                connect();
+            } catch (Exception e) {
+                log.error("Reconnect attempt {} failed", attempt, e);
+            }
+        }, delay, TimeUnit.SECONDS);
     }
 }

@@ -18,7 +18,6 @@ class NatClientHandlerTests {
 
     @Test
     void shouldSynchronizeTunnelSnapshotAfterHandlerWasAdded() {
-        NettyClient.CLIENT_NAME = "Demo client";
         NatClientHandler handler = new NatClientHandler(tunnelBean(tunnel(9000, 8080)));
         EmbeddedChannel channel = new EmbeddedChannel(handler);
         try {

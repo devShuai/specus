@@ -5,7 +5,6 @@ import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.bean.TunnelConfig;
-import com.theshuai.tunnelclient.client.NettyClient;
 import com.theshuai.tunnelclient.client.TcpConnection;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -37,9 +36,11 @@ public class NatClientHandler extends NatCommonHandler {
     private ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
     private final Set<Integer> registeredPorts = new HashSet<>();
+    private final String clientName;
 
     public NatClientHandler(TunnelBean tunnelBean) {
         this.remoteHost = tunnelBean.getRemoteAddress();
+        this.clientName = tunnelBean.getClientName();
         if (tunnelBean.getTunnelConfigList() != null) {
             for (TunnelConfig tunnelConfig : tunnelBean.getTunnelConfigList()) {
                 tunnelConfigMap.put(tunnelConfig.getPort(), tunnelConfig);
@@ -52,7 +53,7 @@ public class NatClientHandler extends NatCommonHandler {
         super.handlerAdded(ctx);
         this.ctx = ctx;
         if (!StringUtils.hasText(remoteHost)) {
-            remoteHost = StringUtils.hasText(NettyClient.HOST) ? NettyClient.HOST : String.valueOf(ctx.channel().remoteAddress());
+            remoteHost = String.valueOf(ctx.channel().remoteAddress());
         }
         // The control channel is already active when this handler is added after a
         // NAT_CONTROL push, so channelActive will not fire. Register the tunnels here.
@@ -79,7 +80,7 @@ public class NatClientHandler extends NatCommonHandler {
             metaData.put("port", port);
             metaData.put("tunnelAddress", tunnelConfigEntry.getValue().getTunnelAddress());
             metaData.put("tunnelPort", tunnelConfigEntry.getValue().getTunnelPort());
-            metaData.put("clientName", NettyClient.CLIENT_NAME);
+            metaData.put("clientName", clientName);
             message.setMetaData(metaData);
             ctx.writeAndFlush(message);
         }
@@ -140,7 +141,11 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     private void processData(NatMessagePacket natMessagePacket) {
-        String channelId = natMessagePacket.getMetaData().get("channelId").toString();
+        String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+        if (channelId == null) {
+            log.warn("DATA frame missing channelId from {}", clientName);
+            return;
+        }
         NatCommonHandler handler = channelHandlerMap.get(channelId);
         if (handler != null) {
             ChannelHandlerContext ctx = handler.getCtx();
@@ -149,7 +154,10 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     private void processDisconnected(NatMessagePacket natMessagePacket) {
-        String channelId = natMessagePacket.getMetaData().get("channelId").toString();
+        String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+        if (channelId == null) {
+            return;
+        }
         NatCommonHandler handler = channelHandlerMap.get(channelId);
         if (handler != null) {
             handler.getCtx().close();
@@ -161,14 +169,27 @@ public class NatClientHandler extends NatCommonHandler {
         try {
             NatClientHandler thisHandler = this;
             TcpConnection localConnection = new TcpConnection();
-            Integer port = (Integer) natMessagePacket.getMetaData().get("port");
+            Integer port = asInt(natMessagePacket.getMetaData(), "port");
+            if (port == null) {
+                log.warn("CONNECTED frame missing port from {}", clientName);
+                return;
+            }
+            String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+            if (channelId == null) {
+                log.warn("CONNECTED frame missing channelId from {}", clientName);
+                return;
+            }
             TunnelConfig tunnelConfig = tunnelConfigMap.get(port);
+            if (tunnelConfig == null) {
+                log.warn("CONNECTED for unknown port {} from {}", port, clientName);
+                return;
+            }
             localConnection.connect(tunnelConfig.getTunnelAddress(), tunnelConfig.getTunnelPort(), new ChannelInitializer<SocketChannel>() {
                 @Override
                 protected void initChannel(SocketChannel channel) throws Exception {
-                    LocalTunnelHandler localTunnelHandler = new LocalTunnelHandler(thisHandler, natMessagePacket.getMetaData().get("channelId").toString());
+                    LocalTunnelHandler localTunnelHandler = new LocalTunnelHandler(thisHandler, channelId);
                     channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), localTunnelHandler);
-                    channelHandlerMap.put(natMessagePacket.getMetaData().get("channelId").toString(), localTunnelHandler);
+                    channelHandlerMap.put(channelId, localTunnelHandler);
                     channelGroup.add(channel);
                 }
             });
@@ -179,14 +200,24 @@ public class NatClientHandler extends NatCommonHandler {
             metaData.put("channelId", natMessagePacket.getMetaData().get("channelId"));
             message.setMetaData(metaData);
             ctx.writeAndFlush(message);
-            channelHandlerMap.remove(natMessagePacket.getMetaData().get("channelId").toString());
+            String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+            if (channelId != null) {
+                channelHandlerMap.remove(channelId);
+            }
             throw e;
         }
     }
 
     private void processRegisterResult(NatMessagePacket natMessagePacket) {
-        if (((Boolean) natMessagePacket.getMetaData().get("success"))) {
-            int port = (int) natMessagePacket.getMetaData().get("port");
+        Map<String, Object> meta = natMessagePacket.getMetaData();
+        Object successObj = meta == null ? null : meta.get("success");
+        boolean success = successObj instanceof Boolean b && b;
+        if (success) {
+            Integer port = asInt(meta, "port");
+            if (port == null) {
+                log.info("Register result missing port [{}]", clientName);
+                return;
+            }
             TunnelConfig tunnelConfig = tunnelConfigMap.get(port);
             if (tunnelConfig == null) {
                 log.info("Register result arrived after NAT port {} was removed", port);
@@ -194,8 +225,34 @@ public class NatClientHandler extends NatCommonHandler {
                 log.info("Register to Nat server, {}:{}-->{}:{}", remoteHost, port, tunnelConfig.getTunnelAddress(), tunnelConfig.getTunnelPort());
             }
         } else {
-            log.info("Register fail: " + natMessagePacket.getMetaData().get("reason"));
+            log.info("Register fail: {}", meta == null ? "(no metadata)" : meta.get("reason"));
             ctx.close();
         }
+    }
+
+    private static String asString(Map<String, Object> meta, String key) {
+        if (meta == null) {
+            return null;
+        }
+        Object v = meta.get(key);
+        return v == null ? null : v.toString();
+    }
+
+    private static Integer asInt(Map<String, Object> meta, String key) {
+        if (meta == null) {
+            return null;
+        }
+        Object v = meta.get(key);
+        if (v instanceof Number n) {
+            return n.intValue();
+        }
+        if (v instanceof String s) {
+            try {
+                return Integer.parseInt(s);
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 }
