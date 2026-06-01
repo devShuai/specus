@@ -5,13 +5,18 @@ import com.theshuai.common.protocol.Packet;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 
+/**
+ * Login request: clientName + timestamp + nonce + HMAC-SHA256 signature.
+ * The plaintext password is never sent. The signature key is
+ * {@code SHA-256(password)} on both sides — see {@link com.theshuai.common.security.HmacSigner}.
+ */
 @EqualsAndHashCode(callSuper = true)
 @Data
 public class LoginRequestPacket extends Packet {
     private String clientName;
-    private String password;
     private String timestamp;
-    private String checkSign;
+    private String nonce;
+    private byte[] checkSign;
 
     @Override
     public Byte getCommand() {

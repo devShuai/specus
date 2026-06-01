@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 class ProtobufSerializerTests {
 
@@ -40,16 +41,17 @@ class ProtobufSerializerTests {
     private LoginRequestPacket createPacket() {
         LoginRequestPacket packet = new LoginRequestPacket();
         packet.setClientName("Demo client");
-        packet.setPassword("test1234");
         packet.setTimestamp("1234567890");
-        packet.setCheckSign("sign");
+        packet.setNonce("0123456789abcdef");
+        packet.setCheckSign(new byte[32]);
         return packet;
     }
 
     private void assertLoginPacket(LoginRequestPacket packet) {
         assertEquals("Demo client", packet.getClientName());
-        assertEquals("test1234", packet.getPassword());
         assertEquals("1234567890", packet.getTimestamp());
-        assertEquals("sign", packet.getCheckSign());
+        assertEquals("0123456789abcdef", packet.getNonce());
+        assertNotNull(packet.getCheckSign());
+        assertEquals(32, packet.getCheckSign().length);
     }
 }

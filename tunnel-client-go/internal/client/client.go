@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -97,7 +99,12 @@ func (client *Client) runOnce(ctx context.Context) error {
 	go client.heartbeatLoop(connectionContext, connection)
 
 	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	body, err := protocol.EncodeLoginRequest(client.config.ClientName, client.config.Password, timestamp)
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return fmt.Errorf("generate nonce: %w", err)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	body, err := protocol.EncodeLoginRequest(client.config.ClientName, client.config.Password, timestamp, nonce)
 	if err != nil {
 		return err
 	}

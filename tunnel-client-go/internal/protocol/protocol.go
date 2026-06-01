@@ -3,7 +3,8 @@ package protocol
 import (
 	"bytes"
 	"compress/flate"
-	"crypto/md5"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -144,17 +145,23 @@ func WritePacket(writer io.Writer, command int8, body []byte) error {
 	return writeAll(writer, body)
 }
 
-func EncodeLoginRequest(clientName, password, timestamp string) ([]byte, error) {
-	sign := fmt.Sprintf("%x", md5.Sum([]byte("May the Force be with you"+clientName+password+timestamp)))
+func EncodeLoginRequest(clientName, password, timestamp, nonce string) ([]byte, error) {
+	key := sha256.Sum256([]byte(password))
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write([]byte(clientName))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(timestamp))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(nonce))
+	sign := mac.Sum(nil)
+
 	output := newCompactOutput()
 	output.writeString(clientName)
-	output.writeString(password)
 	if err := output.writeNumericString(timestamp); err != nil {
 		return nil, err
 	}
-	if err := output.writeFixedHexString(sign, 16); err != nil {
-		return nil, err
-	}
+	output.writeString(nonce)
+	output.writeByteArray(sign)
 	return encodePayload(output.Bytes()), nil
 }
 

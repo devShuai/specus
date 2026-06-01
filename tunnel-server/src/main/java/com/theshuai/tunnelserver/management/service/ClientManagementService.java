@@ -1,7 +1,7 @@
 package com.theshuai.tunnelserver.management.service;
 
-import com.theshuai.common.handler.LoginRequestHandler;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
+import com.theshuai.common.security.HmacSigner;
 import com.theshuai.common.util.SessionUtil;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
@@ -17,7 +17,6 @@ import io.netty.channel.Channel;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.util.DigestUtils;
 import org.springframework.util.StringUtils;
 
 import java.nio.charset.StandardCharsets;
@@ -26,6 +25,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 @Service
@@ -112,10 +112,7 @@ public class ClientManagementService {
         if (hasExceededRateLimit(account)) {
             return AuthenticationResult.failure(account, "连接频率超过限制");
         }
-        if (!PasswordService.matches(packet.getPassword(), account.getPasswordHash())) {
-            return AuthenticationResult.failure(account, "客户端名称或密码错误");
-        }
-        if (!hasValidSignature(packet)) {
+        if (!hasValidSignature(packet, account)) {
             return AuthenticationResult.failure(account, "签名无效或已过期");
         }
         return AuthenticationResult.success(account);
@@ -239,18 +236,33 @@ public class ClientManagementService {
         ) >= account.getConnectionRateLimitPerMinute();
     }
 
-    private boolean hasValidSignature(LoginRequestPacket packet) {
-        try {
-            if (Math.abs(Long.parseLong(packet.getTimestamp()) - System.currentTimeMillis()) > 30 * 1000) {
-                return false;
-            }
-            String signString = LoginRequestHandler.md5Salt + packet.getClientName()
-                    + packet.getPassword() + packet.getTimestamp();
-            return DigestUtils.md5DigestAsHex(signString.getBytes(StandardCharsets.UTF_8))
-                    .equals(packet.getCheckSign());
-        } catch (RuntimeException e) {
+    private boolean hasValidSignature(LoginRequestPacket packet, ClientAccount account) {
+        if (packet.getClientName() == null || packet.getTimestamp() == null
+                || packet.getNonce() == null || packet.getCheckSign() == null) {
             return false;
         }
+        if (packet.getCheckSign().length != HmacSigner.signatureLength()) {
+            return false;
+        }
+        long ts;
+        try {
+            ts = Long.parseLong(packet.getTimestamp());
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (Math.abs(ts - System.currentTimeMillis()) > 30_000L) {
+            return false;
+        }
+        byte[] key;
+        try {
+            key = HmacSigner.decodeHex(account.getPasswordHash());
+        } catch (IllegalArgumentException e) {
+            // Stored hash is corrupt — fail closed.
+            return false;
+        }
+        String message = packet.getClientName() + "\n" + packet.getTimestamp() + "\n" + packet.getNonce();
+        byte[] expected = HmacSigner.hmacSha256(key, message);
+        return java.security.MessageDigest.isEqual(expected, packet.getCheckSign());
     }
 
     private void closeOnlineChannel(String clientName) {

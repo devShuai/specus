@@ -105,9 +105,9 @@ public class CompactBinarySerializer implements Serializer {
         Map<Class<?>, ObjectSchema<?>> schemas = new ConcurrentHashMap<>();
         register(schemas, schema(LoginRequestPacket.class,
                 field("clientName", STRING),
-                field("password", STRING),
                 field("timestamp", NUMERIC_STRING),
-                field("checkSign", MD5_STRING)));
+                field("nonce", STRING),
+                field("checkSign", BYTE_ARRAY)));
         register(schemas, schema(LoginResponsePacket.class,
                 field("clientName", STRING),
                 field("success", BOOLEAN),
