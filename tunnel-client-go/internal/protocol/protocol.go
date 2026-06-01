@@ -155,7 +155,7 @@ func EncodeLoginRequest(clientName, password, timestamp string) ([]byte, error) 
 	if err := output.writeFixedHexString(sign, 16); err != nil {
 		return nil, err
 	}
-	return encodePayload(output.bytes()), nil
+	return encodePayload(output.Bytes()), nil
 }
 
 func DecodeLoginResponse(body []byte) (LoginResponse, error) {
@@ -270,7 +270,7 @@ func EncodeDirectHTTPResponse(response DirectHTTPResponse) ([]byte, error) {
 	output.writeStringList(response.Headers)
 	output.writeByteArray(response.Body)
 	output.writeOptionalString(response.Error)
-	return encodePayload(output.bytes()), nil
+	return encodePayload(output.Bytes()), nil
 }
 
 func DecodeDirectHTTPResponse(body []byte) (DirectHTTPResponse, error) {
@@ -364,7 +364,7 @@ func EncodeLegacyHTTPResponse(response LegacyHTTPResponse) ([]byte, error) {
 		return nil, err
 	}
 	output.writeString(response.Response)
-	return encodePayload(output.bytes()), nil
+	return encodePayload(output.Bytes()), nil
 }
 
 func EncodeNatMessage(message NatMessage) ([]byte, error) {
