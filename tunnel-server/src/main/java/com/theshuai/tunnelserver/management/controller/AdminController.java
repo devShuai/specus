@@ -3,11 +3,13 @@ package com.theshuai.tunnelserver.management.controller;
 import com.theshuai.tunnelserver.database.DatabaseInitializer;
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.model.ConnectionRecordView;
+import com.theshuai.tunnelserver.management.model.ConnectionStatView;
 import com.theshuai.tunnelserver.management.model.TrafficUsageView;
 import com.theshuai.tunnelserver.management.model.TunnelMappingView;
 import com.theshuai.tunnelserver.management.service.ClientManagementService;
 import com.theshuai.tunnelserver.management.service.ClientManagementService.ClientMutation;
 import com.theshuai.tunnelserver.management.service.ClientManagementService.CredentialResult;
+import com.theshuai.tunnelserver.management.service.ConnectionArchiveService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import com.theshuai.tunnelserver.management.service.NatControlService.MappingMutation;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
@@ -34,15 +36,18 @@ public class AdminController {
     private final ClientManagementService clientManagementService;
     private final TrafficUsageService trafficUsageService;
     private final NatControlService natControlService;
+    private final ConnectionArchiveService connectionArchiveService;
     private final DatabaseInitializer databaseInitializer;
 
     public AdminController(ClientManagementService clientManagementService,
                            TrafficUsageService trafficUsageService,
                            NatControlService natControlService,
+                           ConnectionArchiveService connectionArchiveService,
                            DatabaseInitializer databaseInitializer) {
         this.clientManagementService = clientManagementService;
         this.trafficUsageService = trafficUsageService;
         this.natControlService = natControlService;
+        this.connectionArchiveService = connectionArchiveService;
         this.databaseInitializer = databaseInitializer;
     }
 
@@ -78,6 +83,12 @@ public class AdminController {
     public List<ConnectionRecordView> listConnections(@RequestParam(required = false) Long clientId,
                                                       @RequestParam(defaultValue = "100") int limit) {
         return clientManagementService.listConnections(clientId, limit);
+    }
+
+    @GetMapping("/connection-stats")
+    public List<ConnectionStatView> listConnectionStats(@RequestParam(required = false) String clientName,
+                                                        @RequestParam(defaultValue = "100") int limit) {
+        return connectionArchiveService.listStats(clientName, limit);
     }
 
     @GetMapping("/traffic")

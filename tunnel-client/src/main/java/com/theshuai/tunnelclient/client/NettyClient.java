@@ -22,10 +22,13 @@ import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLException;
+
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class NettyClient {
+    @Getter
     private final String clientName;
     private final byte[] passwordHash;
     private final String host;
@@ -56,10 +59,6 @@ public class NettyClient {
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
         this.sslContext = sslContext;
-    }
-
-    public String getClientName() {
-        return clientName;
     }
 
     public void start() throws InterruptedException {

@@ -2,7 +2,7 @@
 
 `shuai-tunnel` 是一个基于 Spring Boot 和 Netty 的 Java 内网穿透实验项目。它在公网服务端和内网客户端之间维护一条控制连接，并在收到映射配置后，将公网 TCP 端口上的流量转发到客户端可访问的本地服务。
 
-> 当前仓库适合用于学习和继续开发，不建议直接用于生产环境。端到端隧道映射还缺少一个服务端配置下发入口，详见[当前状态](#当前状态)。
+> 当前仓库适合用于学习和继续开发，不建议直接用于生产环境。现有功能和待完善项详见[当前状态](#当前状态)。
 
 ## 工作原理
 
@@ -74,7 +74,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | `7010` | Netty 控制连接端口，默认值定义在 `application.yml` 中，可通过 `TUNNEL_NETTY_PORT` 覆盖 |
 | `8088` | Spring Boot Web 和管理后台端口，定义在 `application.yml` 中 |
 
-启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。默认管理账号为 `admin / admin`，部署前应通过 `TUNNEL_ADMIN_USERNAME` 和 `TUNNEL_ADMIN_PASSWORD` 修改。
+启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。管理后台通过 OIDC 登录，管理 API 校验 OIDC 颁发的 JWT，详见[管理后台登录（OIDC）](#管理后台登录oidc)。
 
 服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。持久化层使用 Spring Data JPA 和 Hibernate，不包含手写 SQL 或 `JdbcTemplate`。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
 
@@ -179,6 +179,28 @@ curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/nat-cont
 
 密码在数据库中保存为 SHA-256 摘要。创建或重置密码时，管理页面仅显示一次明文密码。
 
+## 管理后台登录（OIDC）
+
+管理页面通过 OIDC 的授权码 + PKCE 流程登录，管理 API（`/api/admin/**`）改为校验 OIDC 颁发的 JWT（Spring Security OAuth2 Resource Server，按 JWKS 验签并校验 issuer/过期，可选校验 audience），原先的 Basic Auth 已移除。流程如下：
+
+1. 浏览器从 `GET /oidc-config` 读取登录参数，跳转到网关的授权端点（带 `code_challenge`）。
+2. 授权完成后带 `code` 回到管理页；页面把 `code` 发给同源的 `POST /oidc/token`，由服务端代理换取令牌（避免浏览器直接调用网关令牌端点的 CORS 问题，也让可选的 client-secret 留在服务端）。
+3. 页面用拿到的 access token 作为 `Authorization: Bearer` 调用管理 API；返回 `401` 时回到登录页。
+
+默认配置指向项目网关 `https://gateway.toys.theshuai.com/auth`，发现到的端点已写入默认值。**每个部署必须设置 `TUNNEL_OIDC_CLIENT_ID`，并在网关为该客户端注册回调地址 `TUNNEL_OIDC_REDIRECT_URI`（默认 `http://127.0.0.1:8088/`）。** 公共 PKCE 客户端无需 secret；若是机密客户端，再设置 `TUNNEL_OIDC_CLIENT_SECRET`。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TUNNEL_OIDC_CLIENT_ID` | （空） | OIDC 客户端 ID，**必填**；未设置时登录页会提示未配置 |
+| `TUNNEL_OIDC_REDIRECT_URI` | `http://127.0.0.1:8088/` | 回调地址，需与网关注册的一致，并指向管理页地址 |
+| `TUNNEL_OIDC_CLIENT_SECRET` | （空） | 机密客户端的密钥；公共 PKCE 客户端留空 |
+| `TUNNEL_OIDC_SCOPE` | `openid` | 授权请求的 scope |
+| `TUNNEL_OIDC_AUDIENCE` | （空） | 设置后额外校验 JWT 的 audience |
+| `TUNNEL_OIDC_ISSUER` / `TUNNEL_OIDC_JWK_SET_URI` | 指向网关 | JWT 验签与 issuer 校验；JWKS 在首次校验令牌时按需拉取，不在启动时联网 |
+| `TUNNEL_OIDC_AUTHORIZATION_ENDPOINT` / `TUNNEL_OIDC_TOKEN_ENDPOINT` / `TUNNEL_OIDC_END_SESSION_ENDPOINT` | 指向网关 | 授权 / 令牌 / 登出端点 |
+
+> 当前任意来自该网关的有效令牌即可访问管理 API（仅做认证，未做用户/角色白名单）。需要限制具体用户时可在此基础上加 `sub`/邮箱白名单或 scope 校验。
+
 ## HTTP 直转通道
 
 HTTP 直转通道与 TCP 端口映射并行工作。服务端收到请求后，通过客户端控制连接转发 HTTP 方法、路径、查询参数、请求头和二进制请求体；客户端请求本地配置的目标服务，再将状态码、响应头和二进制响应体返回。
@@ -239,6 +261,25 @@ TUNNEL_DB_POOL_SIZE=8 \
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
+### 连接池、批量写入与连接记录归档
+
+面向大量客户端的场景，服务端做了以下数据库工程化处理：
+
+- **连接池**：HikariCP 连接池大小由 `TUNNEL_DB_POOL_SIZE` 控制。默认 `1` 适配单写者的 SQLite；切换到 MySQL/PostgreSQL 时应调大（建议 `16`–`32`）。
+- **批量写入**：Hibernate 启用 `batch_size`（默认 `50`，由 `TUNNEL_DB_BATCH_SIZE` 调整），合并流量聚合的更新与归档时的批量删除。
+- **登录链路**：鉴权、连接记录写入和 `NAT_CONTROL` 下发都在独立的有界线程池中执行，不占用 Netty I/O 事件循环（见 `tunnel.login.executor.*`）。
+- **流量聚合**：上下行字节先在内存中按客户端累加，每 `TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS` 毫秒按「客户端 + UTC 日期」批量 upsert 一行，而非每个数据包写库。
+- **索引**：连接记录表对 `(client_id, connected_at)` 建复合索引（服务每次登录的频率限制查询），并对 `connected_at` 建索引（服务归档扫描）。
+- **连接记录归档**：连接记录是逐次登录追加的日志，会无限增长。后台定时任务把**早于保留窗口的明细按自然月汇总成总量**（连接数 / 成功数 / 失败数，保存在 `tunnel_connection_stat` 表，长期保留），**汇总完成后**才删除原始明细——数据不会丢失。明细默认保留**最近 60 天（滚动窗口）**。跨越截止点的月份会随天数滚出窗口而逐步汇总，计数采用累加且在同一事务内删除已汇总明细，因此不会重复计数。归档后的月度总量可通过 `GET /api/admin/connection-stats?clientName=...` 查询。
+
+| 配置 | 环境变量 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `tunnel.connection-record.detail-retention-days` | `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` | `60` | 保留最近多少天的连接明细（滚动窗口）；更早的明细按自然月汇总后删除。`0` 关闭归档 |
+| `tunnel.connection-record.archive-interval-ms` | `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` | `3600000` | 归档任务执行间隔（毫秒） |
+| `spring.jpa.properties.hibernate.jdbc.batch_size` | `TUNNEL_DB_BATCH_SIZE` | `50` | Hibernate JDBC 批量大小 |
+
+> 月度归档总量（`tunnel_connection_stat`）与每日流量（`tunnel_traffic_usage`）都长期保留，只有连接明细会被汇总后清理。对于超大规模部署，建议进一步在数据库层对明细表按 `connected_at` 做时间分区（如 PostgreSQL 声明式分区）；JPA 的 `ddl-auto` 不会自动建立分区，需要在数据库侧维护。首次归档历史积压较大时，单次事务会汇总并删除全部过期明细，必要时可分批执行。
+
 ## 当前状态
 
 已实现：
@@ -246,13 +287,14 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 - 客户端登录、时间戳校验和心跳保活
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
 - 客户端账号分配、连接记录、连接频率限制和流量统计
-- 内置管理 API 和管理页面
+- 内置管理 API 和管理页面，并通过 OIDC（授权码 + PKCE）登录、后端校验 JWT
 - 端口映射的持久化管理，以及通过 `NAT_CONTROL` 完成登录自动下发和在线快照同步
 - 基于客户端 route 白名单的 HTTP 请求直接转发
 - 控制连接断开后的重连逻辑
 - TCP 公网端口监听和双向数据转发
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
 - 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
+- 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 需要继续完善：
 

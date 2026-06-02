@@ -13,9 +13,9 @@ import java.util.Map;
 @ChannelHandler.Sharable
 public class RemoteTunnelHandler extends NatCommonHandler {
 
-    private NatCommonHandler tunnelHandler;
+    private final NatCommonHandler tunnelHandler;
 
-    private int port;
+    private final int port;
     private final String clientName;
     private final TrafficUsageService trafficUsageService;
 

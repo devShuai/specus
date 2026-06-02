@@ -3,21 +3,17 @@ package com.theshuai.tunnelserver.handler;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
-import com.theshuai.tunnelserver.server.TcpServer;
-import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.common.session.Session;
 import com.theshuai.common.util.SessionUtil;
+import com.theshuai.tunnelserver.management.service.TrafficUsageService;
+import com.theshuai.tunnelserver.server.TcpServer;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
-import io.netty.channel.group.ChannelGroup;
-import io.netty.channel.group.ChannelMatcher;
-import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.bytes.ByteArrayDecoder;
 import io.netty.handler.codec.bytes.ByteArrayEncoder;
-import io.netty.util.concurrent.GlobalEventExecutor;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Map;
@@ -30,9 +26,11 @@ public class NatServerHandler extends NatCommonHandler {
     // Concurrent because the channel pipeline reads from arbitrary event loops.
     private final Map<Integer, TcpServer> remoteConnectionServerMap = new ConcurrentHashMap<>();
 
-    // Public-internet channels attached to a TcpServer for this client, keyed by channelId.
-    // We need a snapshot to find the right channel for DATA / DISCONNECTED frames.
-    private static final ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
+    // Public-internet channels for THIS client's tunnels, keyed by channelId.
+    // Per-connection (not static) so DATA/DISCONNECTED routing is O(1) and a client can only
+    // ever reach its own external channels. Concurrent because the accepted channels live on
+    // their TcpServer's event loops while routing happens on the control connection's loop.
+    private final Map<String, Channel> externalChannels = new ConcurrentHashMap<>();
 
     private final TrafficUsageService trafficUsageService;
     // Set during processRegister; null means the client has not registered any tunnel yet.
@@ -47,11 +45,10 @@ public class NatServerHandler extends NatCommonHandler {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        if (!(msg instanceof NatMessagePacket)) {
+        if (!(msg instanceof NatMessagePacket natMessagePacket)) {
             super.channelRead(ctx, msg);
             return;
         }
-        NatMessagePacket natMessagePacket = (NatMessagePacket) msg;
         NatMessageType type = natMessagePacket.getNatMessageType();
         if (type == NatMessageType.REGISTER) {
             processRegister(natMessagePacket);
@@ -81,8 +78,12 @@ public class NatServerHandler extends NatCommonHandler {
             log.warn("DATA frame missing channelId from {}", clientName);
             return;
         }
+        Channel target = externalChannels.get(channelId);
+        if (target == null) {
+            return;
+        }
         trafficUsageService.recordUpload(clientName, data.length);
-        channelGroup.writeAndFlush(data, filterByChannelId(channelId));
+        target.writeAndFlush(data);
     }
 
     private void processDisconnected(NatMessagePacket natMessagePacket) {
@@ -90,7 +91,10 @@ public class NatServerHandler extends NatCommonHandler {
         if (channelId == null) {
             return;
         }
-        channelGroup.close(filterByChannelId(channelId));
+        Channel target = externalChannels.remove(channelId);
+        if (target != null) {
+            target.close();
+        }
     }
 
     private void processUnregister(NatMessagePacket natMessagePacket) {
@@ -147,9 +151,11 @@ public class NatServerHandler extends NatCommonHandler {
             remoteConnectionServer.bind(port, new ChannelInitializer<SocketChannel>() {
                 @Override
                 protected void initChannel(SocketChannel channel) {
+                    String channelId = channel.id().asLongText();
                     channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(),
                             new RemoteTunnelHandler(thisHandler, port, clientName, trafficUsageService));
-                    channelGroup.add(channel);
+                    externalChannels.put(channelId, channel);
+                    channel.closeFuture().addListener(future -> externalChannels.remove(channelId));
                 }
             });
 
@@ -187,6 +193,8 @@ public class NatServerHandler extends NatCommonHandler {
             }
         }
         remoteConnectionServerMap.clear();
+        externalChannels.values().forEach(Channel::close);
+        externalChannels.clear();
     }
 
     @Override
@@ -225,9 +233,5 @@ public class NatServerHandler extends NatCommonHandler {
             }
         }
         return null;
-    }
-
-    private static ChannelMatcher filterByChannelId(String channelId) {
-        return channel -> channelId.equals(channel.id().asLongText());
     }
 }

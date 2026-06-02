@@ -10,7 +10,10 @@ import jakarta.persistence.Table;
 
 @Entity
 @Table(name = "tunnel_connection_record", indexes = {
-        @Index(name = "idx_tunnel_connection_client", columnList = "client_id"),
+        // Composite serves the per-login rate-limit COUNT (client_id = ? AND connected_at >= ?)
+        // and per-client history listings ordered by time.
+        @Index(name = "idx_tunnel_connection_client_time", columnList = "client_id, connected_at"),
+        // Serves the retention purge (connected_at < cutoff).
         @Index(name = "idx_tunnel_connection_connected_at", columnList = "connected_at")
 })
 public class ConnectionRecord {

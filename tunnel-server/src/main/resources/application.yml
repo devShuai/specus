@@ -8,12 +8,18 @@ spring:
     username: ${TUNNEL_DB_USERNAME:}
     password: ${TUNNEL_DB_PASSWORD:}
     hikari:
+      # Default 1 keeps the single-writer SQLite default safe. Raise it (e.g. 16-32) for MySQL/PostgreSQL.
       maximum-pool-size: ${TUNNEL_DB_POOL_SIZE:1}
   jpa:
     database-platform: ${TUNNEL_DB_DIALECT:org.hibernate.community.dialect.SQLiteDialect}
     hibernate:
       ddl-auto: update
     open-in-view: false
+    properties:
+      # Batch the traffic-flush updates and the retention bulk deletes.
+      hibernate.jdbc.batch_size: ${TUNNEL_DB_BATCH_SIZE:50}
+      hibernate.order_inserts: true
+      hibernate.order_updates: true
 
 tunnel:
   database:
@@ -21,14 +27,35 @@ tunnel:
   netty:
     port: ${TUNNEL_NETTY_PORT:7010}
   public-address: ${TUNNEL_PUBLIC_ADDRESS:}
-  management:
-    username: ${TUNNEL_ADMIN_USERNAME:admin}
-    password: ${TUNNEL_ADMIN_PASSWORD:admin}
+  oidc:
+    # The management UI logs in via OIDC (Authorization Code + PKCE) and the admin API validates
+    # the resulting JWT. Defaults target the project gateway; set client-id (and register the
+    # redirect-uri at the provider) per deployment. Leave client-secret blank for a public PKCE client.
+    issuer: ${TUNNEL_OIDC_ISSUER:https://gateway.toys.theshuai.com/auth}
+    jwk-set-uri: ${TUNNEL_OIDC_JWK_SET_URI:https://gateway.toys.theshuai.com/auth/oauth2/jwks}
+    authorization-endpoint: ${TUNNEL_OIDC_AUTHORIZATION_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/authorize}
+    token-endpoint: ${TUNNEL_OIDC_TOKEN_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/token}
+    end-session-endpoint: ${TUNNEL_OIDC_END_SESSION_ENDPOINT:https://gateway.toys.theshuai.com/auth/connect/logout}
+    client-id: ${TUNNEL_OIDC_CLIENT_ID:}
+    client-secret: ${TUNNEL_OIDC_CLIENT_SECRET:}
+    redirect-uri: ${TUNNEL_OIDC_REDIRECT_URI:http://127.0.0.1:8088/}
+    scope: ${TUNNEL_OIDC_SCOPE:openid}
+    audience: ${TUNNEL_OIDC_AUDIENCE:}
   traffic:
     flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}
+  connection-record:
+    # Rolling days of raw login detail to keep. Older detail is rolled up into per-natural-month
+    # totals (kept indefinitely) and then deleted. 0 disables archiving.
+    detail-retention-days: ${TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS:60}
+    archive-interval-ms: ${TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS:3600000}
   http:
     timeout-ms: ${TUNNEL_HTTP_TIMEOUT_MS:30000}
     max-request-body-size: ${TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE:16777216}
+  login:
+    executor:
+      core-size: ${TUNNEL_LOGIN_EXECUTOR_CORE:8}
+      max-size: ${TUNNEL_LOGIN_EXECUTOR_MAX:32}
+      queue-capacity: ${TUNNEL_LOGIN_EXECUTOR_QUEUE:20000}
   tls:
     # disabled: control channel is plain TCP (legacy)
     # file: load keystore/truststore from disk (production)

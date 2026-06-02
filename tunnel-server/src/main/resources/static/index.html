@@ -25,15 +25,31 @@
     code { padding:2px 5px; border-radius:4px; background:#eef2f7; }
     .ok { color:#087443; } .off { color:var(--danger); } .muted { color:var(--muted); }
     #notice { display:none; margin-bottom:14px; padding:10px 12px; border-radius:6px; background:#e9f4ff; }
+    [hidden] { display:none !important; }
+    .login-overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:var(--bg); z-index:100; }
+    .login-card { width:min(380px,92vw); padding:32px 28px; text-align:center; background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 18px 50px #1422381f; }
+    .login-card h1 { font-size:20px; margin-bottom:6px; }
+    .login-card p { color:var(--muted); margin:0 0 20px; }
+    .login-card button { width:100%; padding:11px; font-size:15px; }
     @media (max-width:900px) { .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   </style>
 </head>
 <body>
-<header>
+<div id="login" class="login-overlay" hidden>
+  <div class="login-card">
+    <h1>shuai-tunnel 管理后台</h1>
+    <p id="loginHint">请使用 OIDC 账号登录</p>
+    <button id="loginButton" onclick="login()">使用 OIDC 登录</button>
+  </div>
+</div>
+<header id="appHeader" hidden>
   <h1>shuai-tunnel 管理后台</h1>
-  <button class="secondary" onclick="initializeDatabase()">初始化数据库</button>
+  <div style="display:flex;gap:8px;align-items:center">
+    <button class="secondary" onclick="initializeDatabase()">初始化数据库</button>
+    <button class="secondary" onclick="logout()">退出登录</button>
+  </div>
 </header>
-<main>
+<main id="appMain" hidden>
   <div id="notice"></div>
   <section id="overview" class="grid"></section>
 
@@ -86,9 +102,14 @@
 </main>
 <script>
 let clientCache = new Map();
+const safeJson = async response => { try { return await response.json(); } catch { return {}; } };
 const api = async (path, options = {}) => {
-  const response = await fetch(`/api/admin${path}`, { headers:{'Content-Type':'application/json'}, ...options });
-  if (!response.ok) throw new Error((await response.json()).error || response.statusText);
+  const headers = { 'Content-Type':'application/json', ...(options.headers || {}) };
+  const token = sessionStorage.getItem('access_token');
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const response = await fetch(`/api/admin${path}`, { ...options, headers });
+  if (response.status === 401) { handleUnauthorized(); throw new Error('登录已过期，请重新登录'); }
+  if (!response.ok) throw new Error((await safeJson(response)).error || response.statusText);
   return response.status === 204 ? null : response.json();
 };
 const formatBytes = value => {
@@ -189,7 +210,93 @@ async function initializeDatabase() {
   try { const result = await api('/database/initialize', {method:'POST'}); notice(`数据库初始化完成：${result.dialect}，客户端 ${result.clients} 个。`); await loadAll(); }
   catch (error) { notice(error.message, true); }
 }
-loadAll();
+
+// --- OIDC (Authorization Code + PKCE) ---
+let oidcConfig = null;
+const b64url = bytes => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const randomToken = () => { const bytes = new Uint8Array(32); crypto.getRandomValues(bytes); return b64url(bytes); };
+async function sha256b64url(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return b64url(new Uint8Array(digest));
+}
+function cleanUrl() { history.replaceState({}, document.title, location.pathname); }
+function tokenValid() {
+  if (!sessionStorage.getItem('access_token')) return false;
+  const expiry = Number(sessionStorage.getItem('token_expiry') || 0);
+  return !expiry || Date.now() < expiry - 5000;
+}
+function showApp() {
+  document.querySelector('#login').hidden = true;
+  document.querySelector('#appHeader').hidden = false;
+  document.querySelector('#appMain').hidden = false;
+}
+function showLogin(message) {
+  document.querySelector('#appHeader').hidden = true;
+  document.querySelector('#appMain').hidden = true;
+  document.querySelector('#login').hidden = false;
+  if (oidcConfig && !oidcConfig.configured) {
+    document.querySelector('#loginHint').textContent = 'OIDC 未配置：请设置 TUNNEL_OIDC_CLIENT_ID 并在网关注册回调地址';
+    document.querySelector('#loginButton').disabled = true;
+  } else if (message) {
+    document.querySelector('#loginHint').textContent = message;
+  }
+}
+function handleUnauthorized() {
+  sessionStorage.removeItem('access_token');
+  sessionStorage.removeItem('token_expiry');
+  showLogin('登录已过期，请重新登录');
+}
+async function login() {
+  if (!oidcConfig || !oidcConfig.configured) return;
+  const verifier = randomToken();
+  const state = randomToken();
+  sessionStorage.setItem('pkce_verifier', verifier);
+  sessionStorage.setItem('oidc_state', state);
+  const challenge = await sha256b64url(verifier);
+  const url = new URL(oidcConfig.authorizationEndpoint);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', oidcConfig.clientId);
+  url.searchParams.set('redirect_uri', oidcConfig.redirectUri);
+  url.searchParams.set('scope', oidcConfig.scope);
+  url.searchParams.set('code_challenge', challenge);
+  url.searchParams.set('code_challenge_method', 'S256');
+  url.searchParams.set('state', state);
+  location.assign(url.toString());
+}
+function logout() {
+  sessionStorage.removeItem('access_token');
+  sessionStorage.removeItem('token_expiry');
+  if (oidcConfig && oidcConfig.endSessionEndpoint) { location.assign(oidcConfig.endSessionEndpoint); }
+  else { showLogin('已退出登录'); }
+}
+async function completeLoginFromRedirect() {
+  const params = new URLSearchParams(location.search);
+  if (params.has('error')) { cleanUrl(); showLogin(params.get('error_description') || params.get('error')); return false; }
+  if (!params.has('code')) return false;
+  const expectedState = sessionStorage.getItem('oidc_state');
+  if (!expectedState || params.get('state') !== expectedState) { cleanUrl(); showLogin('登录状态校验失败，请重试'); return false; }
+  try {
+    const response = await fetch('/oidc/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: params.get('code'), codeVerifier: sessionStorage.getItem('pkce_verifier') })
+    });
+    const data = await safeJson(response);
+    if (!response.ok || !data.accessToken) { cleanUrl(); showLogin(data.error_description || data.error || '令牌交换失败'); return false; }
+    sessionStorage.setItem('access_token', data.accessToken);
+    if (data.expiresIn) sessionStorage.setItem('token_expiry', String(Date.now() + data.expiresIn * 1000));
+    sessionStorage.removeItem('pkce_verifier');
+    sessionStorage.removeItem('oidc_state');
+    cleanUrl();
+    return true;
+  } catch (error) { cleanUrl(); showLogin('令牌交换失败：' + error.message); return false; }
+}
+async function init() {
+  try { oidcConfig = await fetch('/oidc-config').then(response => response.json()); } catch { oidcConfig = null; }
+  const justLoggedIn = await completeLoginFromRedirect();
+  if (justLoggedIn || tokenValid()) { showApp(); await loadAll(); }
+  else { showLogin(); }
+}
+init();
 </script>
 </body>
 </html>

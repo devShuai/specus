@@ -3,12 +3,7 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.common.util.SessionUtil;
-import com.theshuai.tunnelserver.management.model.ClientAccount;
-import com.theshuai.tunnelserver.management.model.ClientAccountView;
-import com.theshuai.tunnelserver.management.model.ConnectionRecord;
-import com.theshuai.tunnelserver.management.model.ConnectionRecordView;
-import com.theshuai.tunnelserver.management.model.TrafficUsage;
-import com.theshuai.tunnelserver.management.model.TrafficUsageView;
+import com.theshuai.tunnelserver.management.model.*;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
@@ -19,13 +14,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 
 @Service
@@ -292,7 +285,7 @@ public class ClientManagementService {
     }
 
     private int normalizeListLimit(int limit) {
-        return Math.max(1, Math.min(limit, 500));
+        return Math.clamp(limit, 1, 500);
     }
 
     public record ClientMutation(
