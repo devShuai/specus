@@ -74,7 +74,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | `7010` | Netty 控制连接端口，默认值定义在 `application.yml` 中，可通过 `TUNNEL_NETTY_PORT` 覆盖 |
 | `8088` | Spring Boot Web 和管理后台端口，定义在 `application.yml` 中 |
 
-启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。管理后台通过 OIDC 登录，管理 API 校验 OIDC 颁发的 JWT，详见[管理后台登录（OIDC）](#管理后台登录oidc)。
+启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。管理后台支持用户名/密码与 OIDC 登录，管理 API 校验 Bearer JWT，详见[管理后台登录](#管理后台登录)。
 
 服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。持久化层使用 Spring Data JPA 和 Hibernate，不包含手写 SQL 或 `JdbcTemplate`。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
 
@@ -179,9 +179,23 @@ curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/nat-cont
 
 密码在数据库中保存为 SHA-256 摘要。创建或重置密码时，管理页面仅显示一次明文密码。
 
-## 管理后台登录（OIDC）
+## 管理后台登录
 
-管理页面通过 OIDC 的授权码 + PKCE 流程登录，管理 API（`/api/admin/**`）改为校验 OIDC 颁发的 JWT（Spring Security OAuth2 Resource Server，按 JWKS 验签并校验 issuer/过期，可选校验 audience），原先的 Basic Auth 已移除。流程如下：
+管理页面支持两种登录方式，**用户名/密码**与 **OIDC** 可同时启用；管理 API（`/api/admin/**`）统一校验 Bearer JWT（Spring Security OAuth2 Resource Server）。两类令牌按 JWT 头部的 `alg` 路由：本地密码登录签发 HS256（用本地密钥校验），OIDC 网关签发 RS256（按 JWKS 验签）。原先的 Basic Auth 已移除。
+
+### 用户名/密码登录
+
+页面提交用户名和密码到 `POST /auth/login`，校验通过后服务端用 HS256 密钥签发一个短期 JWT，页面像 OIDC 令牌一样作为 `Authorization: Bearer` 使用。默认 `admin / admin`，**暴露前务必修改**；把密码设为空即可关闭该登录方式。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TUNNEL_AUTH_USERNAME` | `admin` | 管理用户名 |
+| `TUNNEL_AUTH_PASSWORD` | `admin` | 管理密码；留空则禁用密码登录 |
+| `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | 是否启用密码登录 |
+| `TUNNEL_AUTH_JWT_SECRET` | （空） | HS256 签名密钥；留空则启动时随机生成（重启后旧令牌失效，需重新登录） |
+| `TUNNEL_AUTH_TOKEN_TTL_SECONDS` | `28800` | 密码登录令牌有效期（秒），默认 8 小时 |
+
+### OIDC 登录（授权码 + PKCE）
 
 1. 浏览器从 `GET /oidc-config` 读取登录参数，跳转到网关的授权端点（带 `code_challenge`）。
 2. 授权完成后带 `code` 回到管理页；页面把 `code` 发给同源的 `POST /oidc/token`，由服务端代理换取令牌（避免浏览器直接调用网关令牌端点的 CORS 问题，也让可选的 client-secret 留在服务端）。
@@ -287,7 +301,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 - 客户端登录、时间戳校验和心跳保活
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
 - 客户端账号分配、连接记录、连接频率限制和流量统计
-- 内置管理 API 和管理页面，并通过 OIDC（授权码 + PKCE）登录、后端校验 JWT
+- 内置管理 API 和管理页面，支持用户名/密码与 OIDC（授权码 + PKCE）两种登录，后端统一校验 Bearer JWT
 - 端口映射的持久化管理，以及通过 `NAT_CONTROL` 完成登录自动下发和在线快照同步
 - 基于客户端 route 白名单的 HTTP 请求直接转发
 - 控制连接断开后的重连逻辑

@@ -1,5 +1,7 @@
 package com.theshuai.tunnelserver.security;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.theshuai.common.util.JsonUtil;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -18,7 +20,9 @@ import static org.assertj.core.api.Assertions.assertThat;
                 "spring.jpa.database-platform=org.hibernate.community.dialect.SQLiteDialect",
                 "spring.jpa.hibernate.ddl-auto=create-drop",
                 "tunnel.netty.port=0",
-                "tunnel.database.seed-demo-client=false"
+                "tunnel.database.seed-demo-client=false",
+                "tunnel.auth.username=admin",
+                "tunnel.auth.password=admin"
         }
 )
 class SecurityRulesTests {
@@ -30,16 +34,44 @@ class SecurityRulesTests {
 
     @Test
     void adminApiRequiresAuthentication() throws Exception {
-        assertThat(status("/api/admin/overview")).isEqualTo(401);
+        assertThat(get("/api/admin/overview", null).statusCode()).isEqualTo(401);
     }
 
     @Test
     void oidcConfigIsPublic() throws Exception {
-        assertThat(status("/oidc-config")).isEqualTo(200);
+        assertThat(get("/oidc-config", null).statusCode()).isEqualTo(200);
     }
 
-    private int status(String path) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).GET().build();
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString()).statusCode();
+    @Test
+    void passwordLoginIssuesTokenThatAccessesAdminApi() throws Exception {
+        HttpResponse<String> login = postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"admin\"}");
+        assertThat(login.statusCode()).isEqualTo(200);
+
+        JsonNode body = JsonUtil.readString(login.body());
+        String token = body.path("accessToken").asText(null);
+        assertThat(token).isNotBlank();
+
+        assertThat(get("/api/admin/overview", token).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void wrongPasswordIsRejected() throws Exception {
+        assertThat(postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"nope\"}").statusCode()).isEqualTo(401);
+    }
+
+    private HttpResponse<String> get(String path, String bearer) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).GET();
+        if (bearer != null) {
+            builder.header("Authorization", "Bearer " + bearer);
+        }
+        return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> postJson(String path, String json) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .build();
+        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
     }
 }

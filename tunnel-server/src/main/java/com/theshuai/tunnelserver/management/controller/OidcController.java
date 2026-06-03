@@ -3,6 +3,7 @@ package com.theshuai.tunnelserver.management.controller;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelserver.config.OidcProperties;
+import com.theshuai.tunnelserver.security.LocalTokenService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -36,12 +37,14 @@ import java.util.Map;
 @Slf4j
 public class OidcController {
     private final OidcProperties properties;
+    private final LocalTokenService localTokenService;
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    public OidcController(OidcProperties properties) {
+    public OidcController(OidcProperties properties, LocalTokenService localTokenService) {
         this.properties = properties;
+        this.localTokenService = localTokenService;
     }
 
     @GetMapping("/oidc-config")
@@ -53,6 +56,7 @@ public class OidcController {
         config.put("clientId", properties.getClientId());
         config.put("redirectUri", properties.getRedirectUri());
         config.put("scope", properties.getScope());
+        config.put("passwordLoginEnabled", localTokenService.isPasswordLoginEnabled());
         return config;
     }
 

@@ -31,6 +31,9 @@
     .login-card h1 { font-size:20px; margin-bottom:6px; }
     .login-card p { color:var(--muted); margin:0 0 20px; }
     .login-card button { width:100%; padding:11px; font-size:15px; }
+    .login-form { display:flex; flex-direction:column; gap:10px; margin-bottom:6px; }
+    .login-form input { width:100%; min-width:0; }
+    .login-divider { color:var(--muted); font-size:12px; margin:12px 0; }
     @media (max-width:900px) { .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   </style>
 </head>
@@ -38,8 +41,14 @@
 <div id="login" class="login-overlay" hidden>
   <div class="login-card">
     <h1>shuai-tunnel 管理后台</h1>
-    <p id="loginHint">请使用 OIDC 账号登录</p>
-    <button id="loginButton" onclick="login()">使用 OIDC 登录</button>
+    <p id="loginHint">请登录</p>
+    <form id="pwForm" class="login-form" onsubmit="passwordLogin(event)" hidden>
+      <input id="pwUser" placeholder="用户名" autocomplete="username">
+      <input id="pwPass" type="password" placeholder="密码" autocomplete="current-password">
+      <button type="submit">登录</button>
+    </form>
+    <div id="loginDivider" class="login-divider" hidden>或</div>
+    <button id="loginButton" class="secondary" onclick="login()" hidden>使用 OIDC 登录</button>
   </div>
 </div>
 <header id="appHeader" hidden>
@@ -234,12 +243,30 @@ function showLogin(message) {
   document.querySelector('#appHeader').hidden = true;
   document.querySelector('#appMain').hidden = true;
   document.querySelector('#login').hidden = false;
-  if (oidcConfig && !oidcConfig.configured) {
-    document.querySelector('#loginHint').textContent = 'OIDC 未配置：请设置 TUNNEL_OIDC_CLIENT_ID 并在网关注册回调地址';
-    document.querySelector('#loginButton').disabled = true;
-  } else if (message) {
-    document.querySelector('#loginHint').textContent = message;
-  }
+  const passwordEnabled = !!(oidcConfig && oidcConfig.passwordLoginEnabled);
+  const oidcEnabled = !!(oidcConfig && oidcConfig.configured);
+  document.querySelector('#pwForm').hidden = !passwordEnabled;
+  document.querySelector('#loginButton').hidden = !oidcEnabled;
+  document.querySelector('#loginDivider').hidden = !(passwordEnabled && oidcEnabled);
+  const hint = document.querySelector('#loginHint');
+  if (message) hint.textContent = message;
+  else if (!passwordEnabled && !oidcEnabled) hint.textContent = '未配置任何登录方式：请设置用户名/密码或 OIDC';
+  else hint.textContent = '请登录';
+}
+async function passwordLogin(event) {
+  event.preventDefault();
+  try {
+    const response = await fetch('/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: document.querySelector('#pwUser').value, password: document.querySelector('#pwPass').value })
+    });
+    const data = await safeJson(response);
+    if (!response.ok || !data.accessToken) { showLogin(data.error || '登录失败'); return; }
+    sessionStorage.setItem('access_token', data.accessToken);
+    if (data.expiresIn) sessionStorage.setItem('token_expiry', String(Date.now() + data.expiresIn * 1000));
+    showApp();
+    await loadAll();
+  } catch (error) { showLogin('登录失败：' + error.message); }
 }
 function handleUnauthorized() {
   sessionStorage.removeItem('access_token');

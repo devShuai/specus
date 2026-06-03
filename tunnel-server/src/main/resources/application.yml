@@ -27,6 +27,15 @@ tunnel:
   netty:
     port: ${TUNNEL_NETTY_PORT:7010}
   public-address: ${TUNNEL_PUBLIC_ADDRESS:}
+  auth:
+    # Local username/password login for the management UI (alternative to OIDC). A successful login
+    # mints a short-lived HS256 JWT the admin API accepts alongside the OIDC tokens. Change the
+    # default admin/admin before exposing the server. Set password to blank to disable this login.
+    password-login-enabled: ${TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED:true}
+    username: ${TUNNEL_AUTH_USERNAME:admin}
+    password: ${TUNNEL_AUTH_PASSWORD:admin}
+    jwt-secret: ${TUNNEL_AUTH_JWT_SECRET:}
+    token-ttl-seconds: ${TUNNEL_AUTH_TOKEN_TTL_SECONDS:28800}
   oidc:
     # The management UI logs in via OIDC (Authorization Code + PKCE) and the admin API validates
     # the resulting JWT. Defaults target the project gateway; set client-id (and register the
