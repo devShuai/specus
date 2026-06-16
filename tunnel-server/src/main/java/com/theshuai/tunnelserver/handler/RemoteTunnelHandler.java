@@ -1,19 +1,18 @@
 package com.theshuai.tunnelserver.handler;
 
+import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
-import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 
 import java.util.HashMap;
 import java.util.Map;
 
-@ChannelHandler.Sharable
 public class RemoteTunnelHandler extends NatCommonHandler {
 
-    private final NatCommonHandler tunnelHandler;
+    private final NatServerHandler tunnelHandler;
 
     private final int port;
     private final String clientName;
@@ -28,13 +27,18 @@ public class RemoteTunnelHandler extends NatCommonHandler {
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
+        if (controlCtx == null || !controlCtx.channel().isActive()) {
+            ctx.close();
+            return;
+        }
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.CONNECTED);
         Map<String, Object> metaData = new HashMap<>();
         metaData.put("channelId", ctx.channel().id().asLongText());
         metaData.put("port", port);
         message.setMetaData(metaData);
-        tunnelHandler.getCtx().writeAndFlush(message);
+        controlCtx.writeAndFlush(message);
     }
 
     @Override
@@ -44,14 +48,20 @@ public class RemoteTunnelHandler extends NatCommonHandler {
         Map<String, Object> metaData = new HashMap<>();
         metaData.put("channelId", ctx.channel().id().asLongText());
         message.setMetaData(metaData);
-        tunnelHandler.getCtx().writeAndFlush(message);
-
-
+        ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
+        if (controlCtx != null && controlCtx.channel().isActive()) {
+            controlCtx.writeAndFlush(message);
+        }
     }
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         byte[] data = (byte[]) msg;
+        ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
+        if (controlCtx == null || !controlCtx.channel().isActive()) {
+            ctx.close();
+            return;
+        }
         trafficUsageService.recordDownload(clientName, data.length);
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.DATA);
@@ -59,6 +69,19 @@ public class RemoteTunnelHandler extends NatCommonHandler {
         metaData.put("channelId", ctx.channel().id().asLongText());
         message.setMetaData(metaData);
         message.setData(data);
-        tunnelHandler.getCtx().writeAndFlush(message);
+        controlCtx.writeAndFlush(message).addListener(future -> {
+            if (!future.isSuccess()) {
+                ctx.close();
+            }
+        });
+        if (!controlCtx.channel().isWritable()) {
+            ChannelBackpressure.setAutoRead(ctx.channel(), false);
+        }
+    }
+
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+        tunnelHandler.updateControlAutoReadForExternalWritability();
+        super.channelWritabilityChanged(ctx);
     }
 }

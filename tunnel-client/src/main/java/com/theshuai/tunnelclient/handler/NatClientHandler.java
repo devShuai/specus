@@ -1,12 +1,13 @@
 package com.theshuai.tunnelclient.handler;
 
+import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.bean.TunnelConfig;
 import com.theshuai.tunnelclient.client.TcpConnection;
-import io.netty.channel.ChannelHandler;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.group.ChannelGroup;
@@ -25,22 +26,27 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
-@ChannelHandler.Sharable
 public class NatClientHandler extends NatCommonHandler {
 
     private String remoteHost;
 
     private Map<Integer, TunnelConfig> tunnelConfigMap = new HashMap<>();
 
-    private ConcurrentHashMap<String, NatCommonHandler> channelHandlerMap = new ConcurrentHashMap<>();
+    private ConcurrentHashMap<String, LocalTunnelHandler> channelHandlerMap = new ConcurrentHashMap<>();
     private ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
     private final Set<Integer> registeredPorts = new HashSet<>();
     private final String clientName;
+    private final TcpConnection localConnection;
 
     public NatClientHandler(TunnelBean tunnelBean) {
+        this(tunnelBean, new TcpConnection());
+    }
+
+    public NatClientHandler(TunnelBean tunnelBean, TcpConnection localConnection) {
         this.remoteHost = tunnelBean.getRemoteAddress();
         this.clientName = tunnelBean.getClientName();
+        this.localConnection = localConnection;
         if (tunnelBean.getTunnelConfigList() != null) {
             for (TunnelConfig tunnelConfig : tunnelBean.getTunnelConfigList()) {
                 tunnelConfigMap.put(tunnelConfig.getPort(), tunnelConfig);
@@ -114,6 +120,8 @@ public class NatClientHandler extends NatCommonHandler {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         channelGroup.close();
+        channelHandlerMap.clear();
+        localConnection.close();
         log.info("Loss connection to Nat server... Please restart!");
     }
 
@@ -141,15 +149,30 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     private void processData(NatMessagePacket natMessagePacket) {
+        byte[] data = natMessagePacket.getData();
+        if (data == null) {
+            log.warn("DATA frame with no payload from {}", clientName);
+            return;
+        }
         String channelId = asString(natMessagePacket.getMetaData(), "channelId");
         if (channelId == null) {
             log.warn("DATA frame missing channelId from {}", clientName);
             return;
         }
-        NatCommonHandler handler = channelHandlerMap.get(channelId);
+        LocalTunnelHandler handler = channelHandlerMap.get(channelId);
         if (handler != null) {
-            ChannelHandlerContext ctx = handler.getCtx();
-            ctx.writeAndFlush(natMessagePacket.getData());
+            ChannelHandlerContext localCtx = handler.getCtx();
+            if (localCtx == null) {
+                return;
+            }
+            localCtx.writeAndFlush(data).addListener(future -> {
+                if (!future.isSuccess()) {
+                    localCtx.close();
+                }
+            });
+            if (!localCtx.channel().isWritable()) {
+                pauseControlReads();
+            }
         }
     }
 
@@ -158,17 +181,18 @@ public class NatClientHandler extends NatCommonHandler {
         if (channelId == null) {
             return;
         }
-        NatCommonHandler handler = channelHandlerMap.get(channelId);
+        LocalTunnelHandler handler = channelHandlerMap.remove(channelId);
         if (handler != null) {
-            handler.getCtx().close();
-            channelHandlerMap.remove(channelId);
+            ChannelHandlerContext localCtx = handler.getCtx();
+            if (localCtx != null) {
+                localCtx.close();
+            }
         }
     }
 
     private void processConnected(NatMessagePacket natMessagePacket) throws Exception {
         try {
             NatClientHandler thisHandler = this;
-            TcpConnection localConnection = new TcpConnection();
             Integer port = asInt(natMessagePacket.getMetaData(), "port");
             if (port == null) {
                 log.warn("CONNECTED frame missing port from {}", clientName);
@@ -191,6 +215,10 @@ public class NatClientHandler extends NatCommonHandler {
                     channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(), localTunnelHandler);
                     channelHandlerMap.put(channelId, localTunnelHandler);
                     channelGroup.add(channel);
+                    syncLocalReadWithControl(channel);
+                    channel.closeFuture().addListener(future -> {
+                        removeLocalHandler(channelId, localTunnelHandler);
+                    });
                 }
             });
         } catch (Exception e) {
@@ -206,6 +234,49 @@ public class NatClientHandler extends NatCommonHandler {
             }
             throw e;
         }
+    }
+
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+        updateLocalAutoReadForControlWritability();
+        updateControlAutoReadForLocalWritability();
+        super.channelWritabilityChanged(ctx);
+    }
+
+    void updateControlAutoReadForLocalWritability() {
+        if (ctx != null) {
+            ChannelBackpressure.setAutoRead(ctx.channel(), ctx.channel().isWritable() && localChannelsWritable());
+        }
+    }
+
+    void removeLocalHandler(String channelId, LocalTunnelHandler handler) {
+        if (channelHandlerMap.remove(channelId, handler)) {
+            updateControlAutoReadForLocalWritability();
+        }
+    }
+
+    private void pauseControlReads() {
+        if (ctx != null) {
+            ChannelBackpressure.setAutoRead(ctx.channel(), false);
+        }
+    }
+
+    private void updateLocalAutoReadForControlWritability() {
+        if (ctx == null) {
+            return;
+        }
+        boolean controlWritable = ctx.channel().isWritable();
+        channelGroup.forEach(channel -> ChannelBackpressure.setAutoRead(channel, controlWritable));
+    }
+
+    private void syncLocalReadWithControl(Channel channel) {
+        if (ctx != null) {
+            ChannelBackpressure.setAutoRead(channel, ctx.channel().isWritable());
+        }
+    }
+
+    private boolean localChannelsWritable() {
+        return ChannelBackpressure.allWritable(channelGroup);
     }
 
     private void processRegisterResult(NatMessagePacket natMessagePacket) {

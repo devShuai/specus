@@ -9,6 +9,7 @@ import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.handler.*;
 import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
@@ -38,6 +39,8 @@ public class NettyClient {
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
     private final SecureRandom secureRandom = new SecureRandom();
     private volatile EventLoopGroup workerGroup;
+    private volatile EventLoopGroup localWorkerGroup;
+    private volatile TcpConnection localConnection;
     private final SslContext sslContext;
 
     // Cap backoff so a long outage doesn't park the client forever.
@@ -65,10 +68,20 @@ public class NettyClient {
         if (workerGroup == null) {
             workerGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         }
+        if (localWorkerGroup == null) {
+            localWorkerGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        }
+        if (localConnection == null) {
+            localConnection = new TcpConnection(localWorkerGroup);
+        }
+        TcpConnection sharedLocalConnection = localConnection;
         bootstrap.group(workerGroup)
                 .channel(NioSocketChannel.class)
+                .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
                 .option(ChannelOption.SO_KEEPALIVE, true)
+                .option(ChannelOption.TCP_NODELAY, true)
+                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(32 * 1024, 64 * 1024))
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     public void initChannel(SocketChannel ch) {
@@ -80,7 +93,7 @@ public class NettyClient {
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
                         ch.pipeline().addLast(new LoginResponseHandler());
-                        ch.pipeline().addLast(new MessageResponseHandler());
+                        ch.pipeline().addLast(new MessageResponseHandler(sharedLocalConnection));
                         ch.pipeline().addLast(new DirectHttpRequestHandler(tunnelBean.getHttpTunnelConfigList()));
                         ch.pipeline().addLast(new CustomHttpRequestHandler());
                         ch.pipeline().addLast(new LogoutResponseHandler());
@@ -148,6 +161,15 @@ public class NettyClient {
     }
 
     public void shutdown() {
+        if (localConnection != null) {
+            localConnection.close();
+            localConnection = null;
+        }
+        if (localWorkerGroup != null) {
+            EventLoopGroup toShutdown = localWorkerGroup;
+            localWorkerGroup = null;
+            toShutdown.shutdownGracefully();
+        }
         if (workerGroup != null) {
             EventLoopGroup toShutdown = workerGroup;
             workerGroup = null;

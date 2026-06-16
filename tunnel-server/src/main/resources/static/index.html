@@ -139,7 +139,8 @@ async function loadAll() {
     clientCache = new Map(clients.map(client => [client.id, client]));
     document.querySelector('#overview').innerHTML = [
       ['客户端', overview.clients], ['在线', overview.onlineClients], ['成功连接', overview.successfulConnections],
-      ['失败连接', overview.failedConnections], ['上传', formatBytes(overview.uploadBytes)], ['下载', formatBytes(overview.downloadBytes)]
+      ['失败连接', overview.failedConnections], ['代理连接', overview.externalConnections],
+      ['拒绝连接', overview.rejectedExternalConnections], ['上传', formatBytes(overview.uploadBytes)], ['下载', formatBytes(overview.downloadBytes)]
     ].map(([label,value]) => `<div class="stat"><span>${label}</span><strong>${value}</strong></div>`).join('');
     document.querySelector('#clients').innerHTML = clients.map(client => `<tr>
       <td>${client.id}</td><td><code>${escapeHtml(client.clientName)}</code></td>

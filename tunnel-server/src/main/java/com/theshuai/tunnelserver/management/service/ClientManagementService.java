@@ -8,6 +8,7 @@ import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
 import com.theshuai.tunnelserver.security.PasswordService;
+import com.theshuai.tunnelserver.server.RemotePortServerManager;
 import io.netty.channel.Channel;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -26,13 +27,16 @@ public class ClientManagementService {
     private final ClientAccountRepository clientAccountRepository;
     private final ConnectionRecordRepository connectionRecordRepository;
     private final TrafficUsageRepository trafficUsageRepository;
+    private final RemotePortServerManager remotePortServerManager;
 
     public ClientManagementService(ClientAccountRepository clientAccountRepository,
                                    ConnectionRecordRepository connectionRecordRepository,
-                                   TrafficUsageRepository trafficUsageRepository) {
+                                   TrafficUsageRepository trafficUsageRepository,
+                                   RemotePortServerManager remotePortServerManager) {
         this.clientAccountRepository = clientAccountRepository;
         this.connectionRecordRepository = connectionRecordRepository;
         this.trafficUsageRepository = trafficUsageRepository;
+        this.remotePortServerManager = remotePortServerManager;
     }
 
     @Transactional(readOnly = true)
@@ -167,6 +171,8 @@ public class ClientManagementService {
         overview.put("failedConnections", connectionRecordRepository.countBySuccess(false));
         overview.put("uploadBytes", clients.stream().mapToLong(ClientAccountView::uploadBytes).sum());
         overview.put("downloadBytes", clients.stream().mapToLong(ClientAccountView::downloadBytes).sum());
+        overview.put("externalConnections", remotePortServerManager.activeExternalConnections());
+        overview.put("rejectedExternalConnections", remotePortServerManager.rejectedExternalConnections());
         return overview;
     }
 

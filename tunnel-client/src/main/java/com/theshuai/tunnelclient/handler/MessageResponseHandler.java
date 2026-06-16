@@ -3,12 +3,22 @@ package com.theshuai.tunnelclient.handler;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelclient.bean.TunnelBean;
+import com.theshuai.tunnelclient.client.TcpConnection;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageResponsePacket> {
+    private final TcpConnection localConnection;
+
+    public MessageResponseHandler() {
+        this(new TcpConnection());
+    }
+
+    public MessageResponseHandler(TcpConnection localConnection) {
+        this.localConnection = localConnection;
+    }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, MessageResponsePacket messageResponsePacket) throws Exception {
@@ -31,7 +41,7 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
                 TunnelBean tunnelBean = JsonUtil.stringToObject(messageResponsePacket.getMessage(), TunnelBean.class);
                 NatClientHandler natClientHandler = ctx.pipeline().get(NatClientHandler.class);
                 if (natClientHandler == null) {
-                    ctx.pipeline().addLast(new NatClientHandler(tunnelBean));
+                    ctx.pipeline().addLast(new NatClientHandler(tunnelBean, localConnection));
                 } else {
                     natClientHandler.applyConfig(tunnelBean);
                 }

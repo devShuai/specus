@@ -26,6 +26,20 @@ tunnel:
     seed-demo-client: ${TUNNEL_DB_SEED_DEMO_CLIENT:true}
   netty:
     port: ${TUNNEL_NETTY_PORT:7010}
+    boss-threads: ${TUNNEL_NETTY_BOSS_THREADS:1}
+    worker-threads: ${TUNNEL_NETTY_WORKER_THREADS:0}
+    remote-boss-threads: ${TUNNEL_NETTY_REMOTE_BOSS_THREADS:1}
+    remote-worker-threads: ${TUNNEL_NETTY_REMOTE_WORKER_THREADS:0}
+    so-backlog: ${TUNNEL_NETTY_SO_BACKLOG:8192}
+    reuse-address: ${TUNNEL_NETTY_REUSE_ADDRESS:true}
+    keep-alive: ${TUNNEL_NETTY_KEEP_ALIVE:true}
+    tcp-no-delay: ${TUNNEL_NETTY_TCP_NO_DELAY:true}
+    write-buffer-low-water-mark: ${TUNNEL_NETTY_WRITE_BUFFER_LOW_WATER_MARK:32768}
+    write-buffer-high-water-mark: ${TUNNEL_NETTY_WRITE_BUFFER_HIGH_WATER_MARK:65536}
+    max-frame-size: ${TUNNEL_NETTY_MAX_FRAME_SIZE:33554432}
+    max-external-connections: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS:10000}
+    max-external-connections-per-client: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT:10000}
+    max-external-connections-per-port: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT:10000}
   public-address: ${TUNNEL_PUBLIC_ADDRESS:}
   auth:
     # Local username/password login for the management UI (alternative to OIDC). A successful login
