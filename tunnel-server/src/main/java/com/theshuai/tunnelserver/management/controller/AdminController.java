@@ -8,11 +8,15 @@ import com.theshuai.tunnelserver.management.model.TrafficUsageView;
 import com.theshuai.tunnelserver.management.model.TunnelMappingView;
 import com.theshuai.tunnelserver.management.service.ClientManagementService;
 import com.theshuai.tunnelserver.management.service.ClientManagementService.ClientMutation;
+import com.theshuai.tunnelserver.management.service.ClientManagementService.ConnectionFilter;
 import com.theshuai.tunnelserver.management.service.ClientManagementService.CredentialResult;
 import com.theshuai.tunnelserver.management.service.ConnectionArchiveService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import com.theshuai.tunnelserver.management.service.NatControlService.MappingMutation;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -27,6 +31,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -80,9 +85,24 @@ public class AdminController {
     }
 
     @GetMapping("/connections")
-    public List<ConnectionRecordView> listConnections(@RequestParam(required = false) Long clientId,
-                                                      @RequestParam(defaultValue = "100") int limit) {
-        return clientManagementService.listConnections(clientId, limit);
+    public Map<String, Object> listConnections(@RequestParam(required = false) Long clientId,
+                                               @RequestParam(required = false) Boolean success,
+                                               @RequestParam(required = false) String from,
+                                               @RequestParam(required = false) String to,
+                                               @RequestParam(defaultValue = "0") int page,
+                                               @RequestParam(defaultValue = "100") int size) {
+        int normalizedSize = Math.clamp(size, 1, 500);
+        int normalizedPage = Math.max(0, page);
+        Page<ConnectionRecordView> result = clientManagementService.listConnections(
+                new ConnectionFilter(clientId, success, from, to),
+                PageRequest.of(normalizedPage, normalizedSize, Sort.by(Sort.Direction.DESC, "id")));
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("items", result.getContent());
+        response.put("total", result.getTotalElements());
+        response.put("page", result.getNumber());
+        response.put("size", result.getSize());
+        response.put("totalPages", result.getTotalPages());
+        return response;
     }
 
     @GetMapping("/connection-stats")
@@ -106,6 +126,11 @@ public class AdminController {
     @PostMapping("/clients/{id}/tunnels")
     public ResponseEntity<TunnelMappingView> createTunnel(@PathVariable long id, @RequestBody MappingMutation request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(natControlService.createMapping(id, request));
+    }
+
+    @PutMapping("/tunnels/{tunnelId}")
+    public TunnelMappingView updateTunnel(@PathVariable long tunnelId, @RequestBody MappingMutation request) {
+        return natControlService.updateMapping(tunnelId, request);
     }
 
     @DeleteMapping("/tunnels/{tunnelId}")

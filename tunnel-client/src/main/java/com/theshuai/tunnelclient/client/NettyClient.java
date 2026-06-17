@@ -21,12 +21,26 @@ import java.io.File;
 import java.security.SecureRandom;
 import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLException;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
+/**
+ * 控制连接的 Netty 客户端：负责建立 TCP 连接、签名登录、断线后指数退避重连。
+ *
+ * <p>重连状态机要点：
+ * <ul>
+ *   <li>{@link #reconnectAttempts} 仅在 <b>登录成功</b>后重置为 0；TCP 三次握手成功不算数，
+ *       避免凭证错误等场景导致退避失效。</li>
+ *   <li>{@link #reconnectScheduled} 互斥多路径同时调度（{@code channelInactive} 与延时任务），
+ *       保证任意时刻最多一次在飞的重连。</li>
+ *   <li>{@link #shuttingDown} 一旦置位，任何重连都被吞掉，避免 {@code shutdown()} 后日志/异常噪声。</li>
+ *   <li>没有重连次数上限——隧道客户端语义就是"一直尝试自愈"，退避封顶 60s。</li>
+ * </ul>
+ */
 @Slf4j
 public class NettyClient {
     @Getter
@@ -37,15 +51,16 @@ public class NettyClient {
     private final TunnelBean tunnelBean;
     private final Bootstrap bootstrap = new Bootstrap();
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
+    private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
     private final SecureRandom secureRandom = new SecureRandom();
     private volatile EventLoopGroup workerGroup;
     private volatile EventLoopGroup localWorkerGroup;
     private volatile TcpConnection localConnection;
     private final SslContext sslContext;
 
-    // Cap backoff so a long outage doesn't park the client forever.
+    /** 退避上限：连续 5 次失败后稳定到一分钟一次，长期网络故障可自愈。 */
     private static final int MAX_RECONNECT_DELAY_SECONDS = 60;
-    private static final int MAX_RECONNECT_ATTEMPTS = 30;
     private static final long BASE_RECONNECT_DELAY_SECONDS = 2L;
     private static final int NONCE_BYTES = 16;
 
@@ -64,7 +79,7 @@ public class NettyClient {
         this.sslContext = sslContext;
     }
 
-    public void start() throws InterruptedException {
+    public void start() {
         if (workerGroup == null) {
             workerGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         }
@@ -92,13 +107,13 @@ public class NettyClient {
                         ch.pipeline().addLast(new ClientSocketIdleStateHandler(NettyClient.this));
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
-                        ch.pipeline().addLast(new LoginResponseHandler());
+                        ch.pipeline().addLast(new LoginResponseHandler(NettyClient.this));
                         ch.pipeline().addLast(new MessageResponseHandler(sharedLocalConnection));
                         ch.pipeline().addLast(new DirectHttpRequestHandler(tunnelBean.getHttpTunnelConfigList()));
                         ch.pipeline().addLast(new CustomHttpRequestHandler());
                         ch.pipeline().addLast(new LogoutResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());
-                        ch.pipeline().addLast(new HeartBeatTimerHandler(NettyClient.this));
+                        // 心跳由 ClientSocketIdleStateHandler 在 5 秒写空闲时触发，不再需要单独的定时器。
                     }
                 });
         connect();
@@ -133,25 +148,51 @@ public class NettyClient {
         }
     }
 
-    public void connect() throws InterruptedException {
-        bootstrap.connect(host, port).addListener((ChannelFutureListener) listener -> {
-            if (listener.isSuccess()) {
-                reconnectAttempts.set(0);
-                Channel channel = listener.channel();
-                LoginRequestPacket loginRequestPacket = new LoginRequestPacket();
-                loginRequestPacket.setClientName(clientName);
-                String timestamp = String.valueOf(System.currentTimeMillis());
-                String nonce = generateNonce();
-                loginRequestPacket.setTimestamp(timestamp);
-                loginRequestPacket.setNonce(nonce);
-                String message = clientName + "\n" + timestamp + "\n" + nonce;
-                loginRequestPacket.setCheckSign(HmacSigner.hmacSha256(passwordHash, message));
-                channel.writeAndFlush(loginRequestPacket);
-                log.info("Connected to {}:{}", host, port);
+    /**
+     * 发起一次连接尝试。可由 {@link #start()}、{@link ClientSocketIdleStateHandler#channelInactive}
+     * 或 {@link #scheduleReconnect()} 的延时任务调用；调用方不需要互斥，本方法自身是幂等的：
+     * <ul>
+     *   <li>{@link #shuttingDown} 置位时直接返回。</li>
+     *   <li>TCP 失败则进入退避；TCP 成功只发送登录请求，<b>不重置</b>退避计数。</li>
+     * </ul>
+     */
+    public void connect() {
+        if (shuttingDown.get()) return;
+        bootstrap.connect(host, port).addListener((ChannelFutureListener) future -> {
+            if (shuttingDown.get()) {
+                if (future.isSuccess()) future.channel().close();
+                return;
+            }
+            if (future.isSuccess()) {
+                Channel channel = future.channel();
+                log.info("Connected to {}:{} (awaiting login response)", host, port);
+                sendLoginRequest(channel);
             } else {
-                scheduleReconnect(listener.channel().eventLoop());
+                log.warn("Connect to {}:{} failed: {}", host, port,
+                        future.cause() == null ? "unknown" : future.cause().getMessage());
+                scheduleReconnect();
             }
         });
+    }
+
+    private void sendLoginRequest(Channel channel) {
+        LoginRequestPacket loginRequestPacket = new LoginRequestPacket();
+        loginRequestPacket.setClientName(clientName);
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String nonce = generateNonce();
+        loginRequestPacket.setTimestamp(timestamp);
+        loginRequestPacket.setNonce(nonce);
+        String message = clientName + "\n" + timestamp + "\n" + nonce;
+        loginRequestPacket.setCheckSign(HmacSigner.hmacSha256(passwordHash, message));
+        channel.writeAndFlush(loginRequestPacket);
+    }
+
+    /** 由 {@link LoginResponseHandler} 在收到 success=true 时回调，重置退避计数。 */
+    public void onLoginSuccess() {
+        int prior = reconnectAttempts.getAndSet(0);
+        if (prior > 0) {
+            log.info("Login succeeded, reconnect backoff reset (was attempt #{})", prior);
+        }
     }
 
     private String generateNonce() {
@@ -161,6 +202,7 @@ public class NettyClient {
     }
 
     public void shutdown() {
+        if (!shuttingDown.compareAndSet(false, true)) return;
         if (localConnection != null) {
             localConnection.close();
             localConnection = null;
@@ -177,22 +219,35 @@ public class NettyClient {
         }
     }
 
-    private void scheduleReconnect(EventLoop loop) {
-        int attempt = reconnectAttempts.incrementAndGet();
-        if (attempt > MAX_RECONNECT_ATTEMPTS) {
-            log.error("Giving up reconnect after {} attempts to {}:{}", attempt - 1, host, port);
+    /**
+     * 安排下一次重连。无论 {@code channelInactive} 与连接失败回调的并发情况如何，
+     * 同一时刻最多只有一个延时任务在飞。
+     */
+    public void scheduleReconnect() {
+        if (shuttingDown.get()) return;
+        if (!reconnectScheduled.compareAndSet(false, true)) {
+            // 已经有挂起的重连任务，无需再排一次。
             return;
         }
+        EventLoopGroup group = workerGroup;
+        if (group == null || group.isShuttingDown() || group.isShutdown()) {
+            reconnectScheduled.set(false);
+            return;
+        }
+        int attempt = reconnectAttempts.incrementAndGet();
         // Exponential backoff with cap: 2s, 4s, 8s, 16s, 32s, then capped at 60s.
         long delay = Math.min(
                 BASE_RECONNECT_DELAY_SECONDS * (1L << Math.min(attempt - 1, 5)),
                 MAX_RECONNECT_DELAY_SECONDS);
         log.info("Reconnect attempt {} to {}:{} in {}s", attempt, host, port, delay);
-        loop.schedule(() -> {
+        group.next().schedule(() -> {
+            reconnectScheduled.set(false);
+            if (shuttingDown.get()) return;
             try {
                 connect();
-            } catch (Exception e) {
-                log.error("Reconnect attempt {} failed", attempt, e);
+            } catch (Throwable t) {
+                log.error("Reconnect attempt {} threw", attempt, t);
+                scheduleReconnect();
             }
         }, delay, TimeUnit.SECONDS);
     }

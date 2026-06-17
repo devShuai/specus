@@ -75,6 +75,36 @@ public class NatControlService {
     }
 
     @Transactional
+    public TunnelMappingView updateMapping(long id, MappingMutation request) {
+        TunnelMapping mapping = tunnelMappingRepository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
+        int listenPort = requirePort(request.listenPort(), "listenPort");
+        int targetPort = requirePort(request.targetPort(), "targetPort");
+        String targetAddress = requireTargetAddress(request.targetAddress());
+
+        if (listenPort != mapping.getListenPort()) {
+            tunnelMappingRepository.findByListenPort(listenPort).ifPresent(existing -> {
+                if (!existing.getId().equals(mapping.getId())) {
+                    throw new IllegalArgumentException("公网端口 " + listenPort + " 已被占用");
+                }
+            });
+        }
+
+        mapping.setListenPort(listenPort);
+        mapping.setTargetAddress(targetAddress);
+        mapping.setTargetPort(targetPort);
+        mapping.setEnabled(request.enabled() == null || request.enabled());
+        mapping.setUpdatedAt(Instant.now().toString());
+        TunnelMapping saved = tunnelMappingRepository.saveAndFlush(mapping);
+
+        ClientAccount account = clientAccountRepository.findById(saved.getClientId()).orElse(null);
+        if (account != null) {
+            pushSnapshotIfOnline(account);
+        }
+        return toView(saved);
+    }
+
+    @Transactional
     public void deleteMapping(long id) {
         TunnelMapping mapping = tunnelMappingRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));

@@ -24,7 +24,9 @@ public class SocketIdleStateHandler extends IdleStateHandler {
             log.info(READER_IDLE_TIME + "秒内未读到数据，关闭连接");
             ctx.channel().close();
         } else if (evt.state() == IdleState.WRITER_IDLE) {
-            log.info("{}秒内未写数据, 发送一个心跳", WRITE_IDLE_TIME);
+            // 写空闲发一帧保活是协议正常运行的一部分，安静连接每 30 秒会触发一次。
+            // INFO 级别会刷日志，降到 DEBUG。
+            log.debug("{}秒内未写数据, 发送一个心跳", WRITE_IDLE_TIME);
             HeartBeatResponsePacket heartBeatResponsePacket = new HeartBeatResponsePacket();
             ctx.writeAndFlush(heartBeatResponsePacket);
         }

@@ -10,13 +10,18 @@ import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
 import com.theshuai.tunnelserver.security.PasswordService;
 import com.theshuai.tunnelserver.server.RemotePortServerManager;
 import io.netty.channel.Channel;
+import jakarta.persistence.criteria.Predicate;
+import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -144,12 +149,24 @@ public class ClientManagementService {
     }
 
     @Transactional(readOnly = true)
-    public List<ConnectionRecordView> listConnections(Long clientId, int limit) {
-        PageRequest pageRequest = PageRequest.of(0, normalizeListLimit(limit));
-        List<ConnectionRecord> records = clientId == null
-                ? connectionRecordRepository.findAllByOrderByIdDesc(pageRequest)
-                : connectionRecordRepository.findByClientIdOrderByIdDesc(clientId, pageRequest);
-        return records.stream().map(this::toView).toList();
+    public Page<ConnectionRecordView> listConnections(ConnectionFilter filter, Pageable pageable) {
+        Specification<ConnectionRecord> spec = (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            if (filter.clientId() != null) {
+                predicates.add(cb.equal(root.get("clientId"), filter.clientId()));
+            }
+            if (filter.success() != null) {
+                predicates.add(cb.equal(root.get("success"), filter.success()));
+            }
+            if (StringUtils.hasText(filter.from())) {
+                predicates.add(cb.greaterThanOrEqualTo(root.get("connectedAt"), filter.from()));
+            }
+            if (StringUtils.hasText(filter.to())) {
+                predicates.add(cb.lessThanOrEqualTo(root.get("connectedAt"), filter.to()));
+            }
+            return predicates.isEmpty() ? cb.conjunction() : cb.and(predicates.toArray(new Predicate[0]));
+        };
+        return connectionRecordRepository.findAll(spec, pageable).map(this::toView);
     }
 
     @Transactional(readOnly = true)
@@ -188,12 +205,18 @@ public class ClientManagementService {
 
     private ClientAccountView toView(ClientAccount account) {
         List<TrafficUsage> usages = trafficUsageRepository.findByClientId(account.getId());
+        Channel channel = SessionUtil.getChannel(account.getClientName());
+        boolean online = channel != null;
+        Long connectedSinceMs = online
+                ? channel.attr(com.theshuai.common.attribute.Attributes.LOGIN_TIME_MS).get()
+                : null;
         return new ClientAccountView(
                 account.getId(),
                 account.getClientName(),
                 account.isEnabled(),
                 account.getConnectionRateLimitPerMinute(),
-                SessionUtil.getChannel(account.getClientName()) != null,
+                online,
+                connectedSinceMs,
                 usages.stream().mapToLong(TrafficUsage::getUploadBytes).sum(),
                 usages.stream().mapToLong(TrafficUsage::getDownloadBytes).sum(),
                 account.getCreatedAt(),
@@ -303,6 +326,9 @@ public class ClientManagementService {
     }
 
     public record CredentialResult(ClientAccountView client, String password) {
+    }
+
+    public record ConnectionFilter(Long clientId, Boolean success, String from, String to) {
     }
 
     public record AuthenticationResult(boolean success, ClientAccount account, String reason) {

@@ -88,6 +88,13 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 {
   "clientName": "Demo client",
   "password": "test1234",
+  "tunnelConfigList": [
+    {
+      "port": 9000,
+      "tunnelAddress": "127.0.0.1",
+      "tunnelPort": 8080
+    }
+  ],
   "httpTunnelConfigList": [
     {
       "route": "web",
@@ -105,9 +112,17 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | --- | --- |
 | `clientName` | 客户端名称，也是服务端会话标识 |
 | `password` | 管理后台分配给客户端的密码 |
+| `tunnelConfigList` | 本地 TCP 映射（Go 客户端在登录后会注册这些映射；Java 客户端以服务端下发的 `NAT_CONTROL` 为准，该项可不填） |
+| `tunnelConfigList[].port` | 公网映射端口（对应服务端 `listenPort`） |
+| `tunnelConfigList[].tunnelAddress` | 内网目标地址（对应服务端 `targetAddress`） |
+| `tunnelConfigList[].tunnelPort` | 内网目标端口（对应服务端 `targetPort`） |
 | `httpTunnelConfigList` | HTTP 直转路由列表；每个 route 映射一个客户端可访问的内网 HTTP 地址 |
+| `httpTunnelConfigList[].route` | 访问 `/http/{clientName}/{route}/...` 时使用的路由名 |
+| `httpTunnelConfigList[].targetBaseUrl` | 客户端可访问的内网目标服务基地址 |
 | `remoteAddress` | 公网服务端地址 |
 | `remotePort` | 服务端 Netty 控制连接端口，需与服务端 `TUNNEL_NETTY_PORT`（默认 `7010`）一致 |
+
+> 完整示例见 `tunnel-client-go/tunnelClientConfig.example.json`。
 
 启动客户端：
 
@@ -134,16 +149,23 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run \
 
 Java 客户端收到 `NAT_CONTROL` 消息后注册端口映射。Go 客户端既支持相同的动态配置消息，也会在登录后直接注册本地配置文件中的 `tunnelConfigList`。后台新增或删除映射时会向在线客户端自动同步完整映射快照。
 
-也可以直接调用管理 API（需 Basic Auth）：
+也可以直接调用管理 API（`/api/admin/**` 需携带 Bearer JWT，详见[管理后台登录](#管理后台登录)）。先换取一个令牌：
+
+```bash
+# 用户名/密码登录换取 HS256 JWT（默认 admin / admin，请务必修改）
+TOKEN=$(curl -s -X POST http://127.0.0.1:8088/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin"}' | jq -r .token)
+```
 
 ```bash
 # 为客户端 ID=123 新增映射：公网 9000 -> 内网 127.0.0.1:8080
-curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/tunnels \
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/clients/123/tunnels \
   -H 'Content-Type: application/json' \
   -d '{"listenPort":9000,"targetAddress":"127.0.0.1","targetPort":8080}'
 
 # 立即向在线客户端下发该客户端启用的全部映射
-curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/nat-control
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/clients/123/nat-control
 ```
 
 上面的示例表示：访问服务端 `9000` 端口的 TCP 流量，将被转发到客户端网络中的 `127.0.0.1:8080`。客户端离线时手动下发接口返回 `409`。
@@ -161,9 +183,9 @@ curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/nat-cont
 | `length` | 4 字节 | 消息体长度 |
 | `body` | N 字节 | 消息体 |
 
-当前已定义登录、退出、心跳、普通消息、同步 HTTP 请求和 NAT 隧道消息。NAT 隧道消息支持注册、解除注册、连接建立、断开、数据转发和保活。
+当前已定义的指令（`Command`）：登录、退出、心跳、普通消息（含 `NAT_CONTROL` 下发）、同步 HTTP 请求/响应、HTTP 直转请求/响应（`DIRECT_HTTP_*`），以及 NAT 隧道消息。NAT 隧道消息支持注册、注册结果、连接建立、断开、数据转发、保活和解除注册。
 
-普通控制消息默认使用紧凑二进制序列化：省略字段名，使用变长整数、短类型标记，并在消息体较大且压缩后更小时启用 Deflate。NAT 数据帧保留已有的专用布局，但隧道字节流也会在确实能够缩小时启用 Deflate。由于默认序列化算法和 NAT 数据封装已经变更，服务端和客户端需要同步升级。
+序列化默认使用紧凑二进制（`CompactBinarySerializer`）：省略字段名，使用变长整数与短类型标记，并在消息体 ≥ 阈值且压缩后更小时启用 Deflate（带 1 字节 payload 类型标记，解压有 `16 MiB` 上限）。普通控制消息按此编码；**NAT 消息例外**——其元数据（`NatMessagePacket`）因采用自定义布局仍固定使用 JSON 序列化，仅其中的隧道字节流载荷套用紧凑二进制的 payload 编码（同样可触发 Deflate）。由于默认序列化算法和 NAT 数据封装已经变更，服务端和客户端需要同步升级。
 
 ## 管理后台
 
@@ -174,10 +196,10 @@ curl -u admin:admin -X POST http://127.0.0.1:8088/api/admin/clients/123/nat-cont
 - 维护每个客户端的 TCP 端口映射，并向在线客户端下发 `NAT_CONTROL` 配置
 - 查看控制连接成功和失败记录
 - 按客户端和 UTC 日期汇总上下行流量
-- 配置每个客户端每分钟允许的控制连接次数；设置为 `0` 表示不限
+- 配置每个客户端每分钟允许的控制连接次数（新建客户端默认 `30`）；设置为 `0` 表示不限
 - 手动执行幂等数据库初始化
 
-密码在数据库中保存为 SHA-256 摘要。创建或重置密码时，管理页面仅显示一次明文密码。
+密码在数据库中以 SHA-256 摘要（十六进制）保存，该摘要同时作为登录 HMAC-SHA256 的密钥，因此明文密码本身从不上线。创建或重置密码时，管理页面仅显示一次明文密码。
 
 ## 管理后台登录
 
@@ -238,7 +260,41 @@ HTTP 直转通道与 TCP 端口映射并行工作。服务端收到请求后，�
 curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 ```
 
-该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=tunnel`。`/http/**` 默认作为公开流量入口，不使用管理后台的 Basic Auth；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `TUNNEL_HTTP_TIMEOUT_MS` 调整。
+该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=tunnel`。`/http/**` 默认作为公开流量入口，不需要管理令牌；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `TUNNEL_HTTP_TIMEOUT_MS` 调整。
+
+## 控制连接 TLS
+
+服务端控制连接默认为明文 TCP（`TUNNEL_TLS_MODE=disabled`，向后兼容）。需要加密时，服务端通过 `tunnel.tls.mode` 选择启用方式，客户端在控制连接上叠加一层 TLS：
+
+| `TUNNEL_TLS_MODE` | 说明 |
+| --- | --- |
+| `disabled` | 默认。控制连接为明文 TCP，与旧部署兼容 |
+| `file` | 生产环境。从磁盘加载真实的 keystore（JKS / PKCS12）签发服务端证书 |
+| `self-signed` | 仅开发/测试。启动时生成一次性自签名证书，控制连接已加密但不校验 CA |
+
+服务端：
+
+```bash
+# 生产：使用磁盘上的 keystore
+TUNNEL_TLS_MODE=file \
+TUNNEL_TLS_KEYSTORE=/path/to/server.p12 \
+TUNNEL_TLS_KEYSTORE_PASSWORD=changeit \
+TUNNEL_TLS_KEY_PASSWORD=changeit \
+mvn org.springframework.boot:spring-boot-maven-plugin:run
+
+# 开发/测试：一次性自签名证书
+TUNNEL_TLS_MODE=self-signed \
+mvn org.springframework.boot:spring-boot-maven-plugin:run
+```
+
+> 服务端开启 TLS 后，**客户端必须同步开启 TLS**，否则握手失败。当前 Java 客户端入口（`TunnelClientApplication`）默认按明文连接；如需启用 TLS，请使用 `NettyClient.buildClientSslContext(truststorePath, truststorePassword)` 构造信任服务端证书的 `SslContext`，并以 `new NettyClient(tunnelBean, sslContext)` 启动；与自签名服务端联调时可用 `NettyClient.buildInsecureClientSslContext()`（仅限测试）。Go 客户端同样需要在控制连接上启用 TLS。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TUNNEL_TLS_MODE` | `disabled` | TLS 模式：`disabled` / `file` / `self-signed` |
+| `TUNNEL_TLS_KEYSTORE` | （空） | 服务端 keystore 路径，仅 `mode=file` 时使用 |
+| `TUNNEL_TLS_KEYSTORE_PASSWORD` | （空） | keystore 密码 |
+| `TUNNEL_TLS_KEY_PASSWORD` | （空） | key 密码，留空时回退到 keystore 密码 |
 
 ## 数据库切换
 
@@ -298,15 +354,16 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 已实现：
 
-- 客户端登录、时间戳校验和心跳保活
+- 客户端登录（基于每客户端密码派生密钥的 **HMAC-SHA256** 签名 + 时间戳/nonce 防重放）、心跳保活
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
-- 客户端账号分配、连接记录、连接频率限制和流量统计
+- 客户端账号分配、连接记录、连接频率限制（默认每分钟 `30` 次，`0` 表示不限）和流量统计
 - 内置管理 API 和管理页面，支持用户名/密码与 OIDC（授权码 + PKCE）两种登录，后端统一校验 Bearer JWT
 - 端口映射的持久化管理，以及通过 `NAT_CONTROL` 完成登录自动下发和在线快照同步
 - 基于客户端 route 白名单的 HTTP 请求直接转发
-- 控制连接断开后的重连逻辑
+- 控制连接断开后的指数退避重连
 - TCP 公网端口监听和双向数据转发
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
+- 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
 - 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
@@ -314,9 +371,9 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 - 服务端和客户端的 Spring Boot Web 端口默认均为 `8088`，部署在同一台机器时需要覆盖其中一个端口。
 - UDP 转发尚未实现，`UdpConnection` 当前为空。
-- 登录签名盐值仍写在代码中，MD5 签名仅适合演示。
+- Java 客户端入口尚未默认开启控制连接 TLS，启用需自行调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
 
 ## 开发建议
 
-服务端下发 `NAT_CONTROL` 的管理接口已经实现（见[下发端口映射](#3-下发端口映射)）。后续可以优先将登录签名从写死盐值的 MD5 升级为更安全的方案（例如基于每客户端密钥的 HMAC），并补充覆盖真实数据库与端到端隧道的自动化测试。
+服务端下发 `NAT_CONTROL` 的管理接口已实现（见[下发端口映射](#3-下发端口映射)），登录签名也已升级为基于每客户端密码派生密钥的 HMAC-SHA256（密码本身不上线）。后续可优先：让 Java/Go 客户端默认支持控制连接 TLS 并提供配置开关，补齐真实 MySQL/PostgreSQL 与端到端隧道的自动化测试，并实现 UDP 转发。

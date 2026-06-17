@@ -6,6 +6,7 @@ public record ClientAccountView(
         boolean enabled,
         int connectionRateLimitPerMinute,
         boolean online,
+        Long connectedSinceMs,
         long uploadBytes,
         long downloadBytes,
         String createdAt,

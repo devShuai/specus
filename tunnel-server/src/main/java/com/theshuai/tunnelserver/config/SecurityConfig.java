@@ -20,6 +20,7 @@ import org.springframework.security.oauth2.jwt.JwtIssuerValidator;
 import org.springframework.security.oauth2.jwt.JwtTimestampValidator;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
 import org.springframework.util.StringUtils;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -42,13 +43,34 @@ public class SecurityConfig {
     public SecurityFilterChain securityFilterChain(HttpSecurity http, JwtDecoder jwtDecoder) throws Exception {
         http
                 .authorizeHttpRequests(authorize -> authorize
-                        .requestMatchers("/api/admin/**").authenticated()
+                        .requestMatchers("/api/admin/**", "/auth/refresh").authenticated()
                         .anyRequest().permitAll())
                 .oauth2ResourceServer(oauth2 -> oauth2.jwt(jwt -> jwt.decoder(jwtDecoder)))
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .csrf(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
-                .formLogin(AbstractHttpConfigurer::disable);
+                .formLogin(AbstractHttpConfigurer::disable)
+                /*
+                 * 严格 CSP：管理后台已无内联 JS / 样式 / onclick，所有脚本与样式都来自同源 /app.js + /app.css。
+                 * - script-src / style-src / default-src 全部限定 'self'
+                 * - img-src 同时允许 data: 以兼容浏览器内置控件（日期选择等）
+                 * - form-action 'self' 阻止跨站表单提交（OIDC 登录是 location.assign 跳转，不走 form 提交）
+                 * - frame-ancestors 'none' 等价于 X-Frame-Options: DENY，阻止被嵌入 iframe 进行 clickjacking
+                 *
+                 * 同时加 Referrer-Policy: no-referrer 与 X-Frame-Options: DENY，给老浏览器兜底。
+                 */
+                .headers(headers -> headers
+                        .contentSecurityPolicy(csp -> csp.policyDirectives(
+                                "default-src 'self'; "
+                                + "script-src 'self'; "
+                                + "style-src 'self'; "
+                                + "img-src 'self' data:; "
+                                + "connect-src 'self'; "
+                                + "form-action 'self'; "
+                                + "frame-ancestors 'none'; "
+                                + "base-uri 'self'"))
+                        .referrerPolicy(rp -> rp.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.NO_REFERRER))
+                        .frameOptions(frame -> frame.deny()));
         return http.build();
     }
 
