@@ -22,6 +22,7 @@ import java.util.HexFormat;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLException;
 
 import lombok.Getter;
@@ -57,6 +58,7 @@ public class NettyClient {
     private volatile EventLoopGroup localWorkerGroup;
     private volatile TcpConnection localConnection;
     private final SslContext sslContext;
+    private final AtomicReference<Channel> controlChannel = new AtomicReference<>();
 
     /** 退避上限：连续 5 次失败后稳定到一分钟一次，长期网络故障可自愈。 */
     private static final int MAX_RECONNECT_DELAY_SECONDS = 60;
@@ -163,6 +165,11 @@ public class NettyClient {
             }
             if (future.isSuccess()) {
                 Channel channel = future.channel();
+                Channel previous = controlChannel.getAndSet(channel);
+                if (previous != null && previous != channel && previous.isOpen()) {
+                    previous.close();
+                }
+                channel.closeFuture().addListener(closeFuture -> controlChannel.compareAndSet(channel, null));
                 log.info("Connected to {}:{} (awaiting login response)", host, port);
                 sendLoginRequest(channel);
             } else {
@@ -201,6 +208,10 @@ public class NettyClient {
 
     public void shutdown() {
         if (!shuttingDown.compareAndSet(false, true)) return;
+        Channel channel = controlChannel.getAndSet(null);
+        if (channel != null) {
+            channel.close().awaitUninterruptibly(5, TimeUnit.SECONDS);
+        }
         if (localConnection != null) {
             localConnection.close();
             localConnection = null;
@@ -208,13 +219,22 @@ public class NettyClient {
         if (localWorkerGroup != null) {
             EventLoopGroup toShutdown = localWorkerGroup;
             localWorkerGroup = null;
-            toShutdown.shutdownGracefully();
+            shutdownGroup(toShutdown);
         }
         if (workerGroup != null) {
             EventLoopGroup toShutdown = workerGroup;
             workerGroup = null;
-            toShutdown.shutdownGracefully();
+            shutdownGroup(toShutdown);
         }
+    }
+
+    private void shutdownGroup(EventLoopGroup group) {
+        group.shutdownGracefully(0, 5, TimeUnit.SECONDS)
+                .awaitUninterruptibly(5, TimeUnit.SECONDS);
+    }
+
+    public boolean isShuttingDown() {
+        return shuttingDown.get();
     }
 
     /**

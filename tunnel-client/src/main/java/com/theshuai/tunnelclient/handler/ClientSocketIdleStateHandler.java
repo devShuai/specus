@@ -32,6 +32,10 @@ public class ClientSocketIdleStateHandler extends AbstractIdleHeartbeatHandler {
 
     @Override
     protected void onChannelInactive(ChannelHandlerContext ctx) {
+        if (nettyClient.isShuttingDown()) {
+            log.debug("控制连接因客户端关闭而断开, 不安排重连");
+            return;
+        }
         log.info("控制连接断开, 安排重连...");
         nettyClient.scheduleReconnect();
     }

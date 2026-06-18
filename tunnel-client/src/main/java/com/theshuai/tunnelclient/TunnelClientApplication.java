@@ -2,7 +2,6 @@ package com.theshuai.tunnelclient;
 
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelclient.bean.TunnelBean;
-import com.theshuai.tunnelclient.client.NettyClient;
 import org.apache.commons.io.IOUtils;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -24,9 +23,10 @@ public class TunnelClientApplication {
             log.info("未找到配置");
             return;
         }
-        SpringApplication.run(TunnelClientApplication.class, args);
-        NettyClient nettyClient = new NettyClient(tunnelBean);
-        nettyClient.start();
+        SpringApplication application = new SpringApplication(TunnelClientApplication.class);
+        application.addInitializers(context ->
+                context.getBeanFactory().registerSingleton("tunnelBean", tunnelBean));
+        application.run(args);
     }
 
     private static TunnelBean loadTunnelClientConfig() {
