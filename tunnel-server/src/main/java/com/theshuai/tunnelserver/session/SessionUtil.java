@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.session;
 
 import com.theshuai.common.session.Session;
 import com.theshuai.tunnelserver.attribute.ServerAttributes;
+import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
 
@@ -29,6 +30,8 @@ public final class SessionUtil {
         Channel oldChannel = clientChannelMap.put(session.getClientName(), channel);
         if (oldChannel != null && oldChannel != channel) {
             oldChannel.attr(ServerAttributes.SESSION).set(null);
+            // 让 channelInactive 能识别本次关闭是"被新登录替换"，而不是默认的 CLIENT_CLOSED。
+            DisconnectReason.markIfAbsent(oldChannel, DisconnectReason.REPLACED_BY_NEW_LOGIN);
             oldChannel.close();
             log.info("{} 旧连接已替换", session.getClientName());
         }

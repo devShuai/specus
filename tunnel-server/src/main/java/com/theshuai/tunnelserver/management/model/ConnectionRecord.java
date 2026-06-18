@@ -48,4 +48,11 @@ public class ConnectionRecord {
 
     @Column(name = "failure_reason", length = 255)
     private String failureReason;
+
+    /**
+     * 断开原因机器码（{@link DisconnectReason#name()}）。登录失败时也会写一份 {@link DisconnectReason#LOGIN_FAILURE}，
+     * 但失败细节仍保留在 {@link #failureReason}。
+     */
+    @Column(name = "disconnect_reason", length = 40)
+    private String disconnectReason;
 }

@@ -1,0 +1,55 @@
+[Unit]
+Description=Shuai Tunnel Server
+Documentation=https://github.com/devShuai/shuai-tunnel
+After=network-online.target
+Wants=network-online.target
+# 如果 MySQL 与 tunnel-server 部署在同一台机器，取消下面这行的注释，
+# 让 systemd 在数据库启动后再拉起 tunnel-server。
+#After=mysqld.service
+
+[Service]
+Type=simple
+
+# 运行账号 —— 推荐使用 install.sh 自动创建的 tunnel 系统账号
+User=tunnel
+Group=tunnel
+
+# 工作目录用于存放运行时产物（如 fallback 的 SQLite 文件、临时文件等）
+WorkingDirectory=/var/lib/tunnel-server
+
+# 环境变量文件（前导的 - 表示文件不存在时不报错；建议把所有数据库 / 密钥配置写到这里）
+EnvironmentFile=-/etc/tunnel-server/tunnel-server.env
+
+# 启动命令
+#   --enable-native-access=ALL-UNNAMED 与 spring-boot-maven-plugin 中的 jvmArguments 保持一致，
+#   消除 Java 21 关于 native access 的告警。
+#   通过环境变量 JAVA_OPTS 追加额外 JVM 参数（如 -Xmx512m）。
+ExecStart=/usr/bin/java $JAVA_OPTS --enable-native-access=ALL-UNNAMED -jar /opt/tunnel-server/tunnel-server.jar
+
+# 优雅停机：Spring Boot 默认监听 SIGTERM，给 30 秒处理在途连接
+KillSignal=SIGTERM
+TimeoutStopSec=30
+SuccessExitStatus=143
+
+# 失败自动重启
+Restart=on-failure
+RestartSec=5s
+
+# 日志直接进 journald，使用 journalctl -u tunnel-server -f 查看
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnel-server
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+# 仅允许写入工作目录与日志目录
+ReadWritePaths=/var/lib/tunnel-server /var/log/tunnel-server
+
+# 文件描述符上限：tunnel-server 会维护大量并发隧道连接，建议放宽
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

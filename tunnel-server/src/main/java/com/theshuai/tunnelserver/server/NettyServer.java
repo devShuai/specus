@@ -11,6 +11,7 @@ import com.theshuai.tunnelserver.handler.ServerMessageHandler;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
 import com.theshuai.tunnelserver.handler.ManagedLoginRequestHandler;
 import com.theshuai.tunnelserver.handler.NatServerHandler;
+import com.theshuai.tunnelserver.management.service.HttpRouteRegistry;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.security.TlsContextFactory;
 import com.theshuai.tunnelserver.security.TlsProperties;
@@ -43,6 +44,7 @@ public class NettyServer implements ApplicationRunner {
     private final TrafficUsageService trafficUsageService;
     private final RemotePortServerManager remotePortServerManager;
     private final TlsProperties tlsProperties;
+    private final HttpRouteRegistry httpRouteRegistry;
     private final com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
@@ -53,12 +55,14 @@ public class NettyServer implements ApplicationRunner {
                        TrafficUsageService trafficUsageService,
                        RemotePortServerManager remotePortServerManager,
                        TlsProperties tlsProperties,
+                       HttpRouteRegistry httpRouteRegistry,
                        com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler) {
         this.nettyProperties = nettyProperties;
         this.managedLoginRequestHandler = managedLoginRequestHandler;
         this.trafficUsageService = trafficUsageService;
         this.remotePortServerManager = remotePortServerManager;
         this.tlsProperties = tlsProperties;
+        this.httpRouteRegistry = httpRouteRegistry;
         this.directHttpResponseHandler = directHttpResponseHandler;
     }
 
@@ -116,7 +120,8 @@ public class NettyServer implements ApplicationRunner {
                         ch.pipeline().addLast(new NatServerHandler(
                                 trafficUsageService,
                                 remotePortServerManager,
-                                nettyProperties
+                                nettyProperties,
+                                httpRouteRegistry
                         ));
                         ch.pipeline().addLast(directHttpResponseHandler);
                         ch.pipeline().addLast(ServerMessageHandler.INSTANCE);

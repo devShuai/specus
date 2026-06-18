@@ -23,12 +23,16 @@ class NatClientHandlerTests {
         try {
             assertNotNull(handler.getCtx());
             assertNatMessage(channel.readOutbound(), NatMessageType.REGISTER, 9000);
+            // 新增：handlerAdded 后客户端会再发一条 HTTP_ROUTES_REPORT 给服务端做面板展示，
+            // 本用例没配 httpTunnelConfigList，routes 为空，但帧仍会发以区分"老客户端没上报"。
+            assertHttpRoutesReport(channel.readOutbound());
             assertNull(channel.readOutbound());
 
             handler.applyConfig(tunnelBean(tunnel(9001, 8081)));
 
             assertNatMessage(channel.readOutbound(), NatMessageType.UNREGISTER, 9000);
             assertNatMessage(channel.readOutbound(), NatMessageType.REGISTER, 9001);
+            // applyConfig 不会再次上报路由——同一 channel 复用、httpRoutesReported 已置位
             assertNull(channel.readOutbound());
         } finally {
             channel.finishAndReleaseAll();
@@ -54,5 +58,10 @@ class NatClientHandlerTests {
         assertNotNull(message);
         assertEquals(type, message.getNatMessageType());
         assertEquals(port, message.getMetaData().get("port"));
+    }
+
+    private void assertHttpRoutesReport(NatMessagePacket message) {
+        assertNotNull(message);
+        assertEquals(NatMessageType.HTTP_ROUTES_REPORT, message.getNatMessageType());
     }
 }

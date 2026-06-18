@@ -43,6 +43,10 @@ public class SecurityConfig {
     public SecurityFilterChain securityFilterChain(HttpSecurity http, JwtDecoder jwtDecoder) throws Exception {
         http
                 .authorizeHttpRequests(authorize -> authorize
+                        // /ws/** 由 JwtHandshakeInterceptor 在握手阶段单独鉴权，
+                        // 这里放行避免被 Spring Security 当 REST 一样要求 Authorization 头（浏览器
+                        // 原生 WebSocket 无法塞自定义 header，token 走 query 串）。
+                        .requestMatchers("/ws/**").permitAll()
                         .requestMatchers("/api/admin/**", "/auth/refresh").authenticated()
                         .anyRequest().permitAll())
                 .oauth2ResourceServer(oauth2 -> oauth2.jwt(jwt -> jwt.decoder(jwtDecoder)))

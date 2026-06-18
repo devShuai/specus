@@ -5,6 +5,7 @@ import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelserver.attribute.ServerAttributes;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
+import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficTotal;
@@ -104,7 +105,11 @@ public class ClientAccountService {
         account.setUpdatedAt(Instant.now().toString());
         clientAccountRepository.save(account);
         if (!account.isEnabled() || !account.getClientName().equals(originalClientName)) {
-            closeOnlineChannel(originalClientName);
+            // 优先用"停用"作为原因（更直接），若只是改名则用 ADMIN_RENAMED。
+            DisconnectReason reason = !account.isEnabled()
+                    ? DisconnectReason.ADMIN_DISABLED
+                    : DisconnectReason.ADMIN_RENAMED;
+            closeOnlineChannel(originalClientName, reason);
         }
         TrafficTotal total = trafficUsageRepository.sumBytesByClientId(account.getId()).orElse(null);
         return new CredentialResult(toView(account, total), request.password());
@@ -113,7 +118,7 @@ public class ClientAccountService {
     @Transactional
     public void deleteClient(long id) {
         ClientAccount account = findClientById(id);
-        closeOnlineChannel(account.getClientName());
+        closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
         clientAccountRepository.delete(account);
     }
 
@@ -203,9 +208,10 @@ public class ClientAccountService {
         return java.security.MessageDigest.isEqual(expected, packet.getCheckSign());
     }
 
-    private void closeOnlineChannel(String clientName) {
+    private void closeOnlineChannel(String clientName, DisconnectReason reason) {
         Channel channel = SessionUtil.getChannel(clientName);
         if (channel != null) {
+            DisconnectReason.markIfAbsent(channel, reason);
             channel.close();
         }
     }

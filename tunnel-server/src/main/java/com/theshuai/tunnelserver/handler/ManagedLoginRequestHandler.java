@@ -4,6 +4,7 @@ import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.response.LoginResponsePacket;
 import com.theshuai.common.session.Session;
 import com.theshuai.tunnelserver.session.SessionUtil;
+import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.service.AuthenticationResult;
 import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.ConnectionRecordService;
@@ -49,6 +50,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
         } catch (RejectedExecutionException e) {
             log.warn("login rejected, server busy: client={}", packet.getClientName());
             // 同样：拒绝服务的回执发出后立即关闭，避免僵尸连接。
+            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.SERVER_BUSY);
             ctx.writeAndFlush(busyResponse(packet))
                     .addListener(io.netty.channel.ChannelFutureListener.CLOSE);
         }
@@ -85,11 +87,15 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                 } else {
                     // 登录失败必须主动关连接，否则客户端心跳会让 server 端 reader idle 一直不超时，
                     // 形成"无 session 但保活"的僵尸连接，浪费资源也阻塞合法重连。
+                    // 这条登录失败的 DB 行 disconnectedAt 在 recordConnection 里已经写过，
+                    // 这里关 channel 也无需再调 recordDisconnect（CONNECTION_RECORD_ID 没 set）。
+                    DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.LOGIN_FAILURE);
                     writeFuture.addListener(io.netty.channel.ChannelFutureListener.CLOSE);
                 }
             });
         } catch (Exception e) {
             log.error("login handling failed for client={}", packet.getClientName(), e);
+            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.IO_ERROR);
             ctx.close();
         }
     }
@@ -99,10 +105,23 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
         Long connectionRecordId = ctx.channel().attr(CONNECTION_RECORD_ID).getAndSet(null);
         if (connectionRecordId != null) {
             long recordId = connectionRecordId;
-            submit(() -> connectionRecordService.recordDisconnect(recordId));
+            // 读通道属性还原 reason；缺省视为客户端主动 FIN。
+            DisconnectReason marked = DisconnectReason.readFrom(ctx.channel());
+            DisconnectReason reason = marked == null ? DisconnectReason.CLIENT_CLOSED : marked;
+            submit(() -> connectionRecordService.recordDisconnect(recordId, reason));
         }
         SessionUtil.unBindSession(ctx.channel());
         super.channelInactive(ctx);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        // IO / 解码 / TLS 异常 —— 在 channelInactive 之前打标；不再 fire 给后续 handler，
+        // 让 Netty 默认行为关 channel。
+        DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.IO_ERROR);
+        log.debug("exceptionCaught on channel {}: {}", ctx.channel().id().asLongText(),
+                cause == null ? "null" : cause.toString());
+        super.exceptionCaught(ctx, cause);
     }
 
     private void submit(Runnable task) {

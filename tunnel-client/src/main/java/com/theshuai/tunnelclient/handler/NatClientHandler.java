@@ -4,6 +4,7 @@ import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
+import com.theshuai.tunnelclient.bean.HttpTunnelConfig;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.bean.TunnelConfig;
 import com.theshuai.tunnelclient.client.TcpConnection;
@@ -19,8 +20,10 @@ import io.netty.util.concurrent.GlobalEventExecutor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.StringUtils;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,6 +41,12 @@ public class NatClientHandler extends NatCommonHandler {
     private final Set<Integer> registeredPorts = new HashSet<>();
     private final String clientName;
     private final TcpConnection localConnection;
+    /**
+     * 仅用于上报给服务端做管理 UI 展示。每个新建 channel 由 {@link #handlerAdded} / {@link #channelActive}
+     * 触发一次上报，{@code channelInactive} 重置以便重连后再发。
+     */
+    private final List<HttpTunnelConfig> httpTunnelConfigList;
+    private boolean httpRoutesReported;
 
     public NatClientHandler(TunnelBean tunnelBean) {
         this(tunnelBean, new TcpConnection());
@@ -52,6 +61,9 @@ public class NatClientHandler extends NatCommonHandler {
                 tunnelConfigMap.put(tunnelConfig.getPort(), tunnelConfig);
             }
         }
+        this.httpTunnelConfigList = tunnelBean.getHttpTunnelConfigList() == null
+                ? List.of()
+                : List.copyOf(tunnelBean.getHttpTunnelConfigList());
     }
 
     @Override
@@ -65,12 +77,14 @@ public class NatClientHandler extends NatCommonHandler {
         // NAT_CONTROL push, so channelActive will not fire. Register the tunnels here.
         if (ctx.channel().isActive()) {
             registerTunnels(ctx);
+            reportHttpRoutes(ctx);
         }
     }
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
         registerTunnels(ctx);
+        reportHttpRoutes(ctx);
         super.channelActive(ctx);
     }
 
@@ -90,6 +104,35 @@ public class NatClientHandler extends NatCommonHandler {
             message.setMetaData(metaData);
             ctx.writeAndFlush(message);
         }
+    }
+
+    /**
+     * 把当前生效的 HTTP 路由列表上报给服务端，仅用于管理 UI 展示。每次新 channel 只发一次；
+     * channelInactive 时复位标志位，重连后会再次上报。空列表也发，让服务端能区分"没配置"
+     * 与"老客户端未上报"。
+     */
+    private synchronized void reportHttpRoutes(ChannelHandlerContext ctx) {
+        if (httpRoutesReported) {
+            return;
+        }
+        httpRoutesReported = true;
+        List<Map<String, String>> routes = new ArrayList<>(httpTunnelConfigList.size());
+        for (HttpTunnelConfig cfg : httpTunnelConfigList) {
+            if (cfg == null || !StringUtils.hasText(cfg.getRoute())) {
+                continue;
+            }
+            Map<String, String> entry = new HashMap<>(2);
+            entry.put("route", cfg.getRoute());
+            entry.put("targetBaseUrl", cfg.getTargetBaseUrl() == null ? "" : cfg.getTargetBaseUrl());
+            routes.add(entry);
+        }
+        NatMessagePacket message = new NatMessagePacket();
+        message.setNatMessageType(NatMessageType.HTTP_ROUTES_REPORT);
+        Map<String, Object> metaData = new HashMap<>();
+        metaData.put("clientName", clientName);
+        metaData.put("routes", routes);
+        message.setMetaData(metaData);
+        ctx.writeAndFlush(message);
     }
 
     public synchronized void applyConfig(TunnelBean tunnelBean) {
@@ -122,6 +165,8 @@ public class NatClientHandler extends NatCommonHandler {
         channelGroup.close();
         channelHandlerMap.clear();
         localConnection.close();
+        // 重连时新 handler 实例会重置；同一实例（NAT_CONTROL 复用）也允许再次上报
+        httpRoutesReported = false;
         log.info("Loss connection to Nat server... Please restart!");
     }
 

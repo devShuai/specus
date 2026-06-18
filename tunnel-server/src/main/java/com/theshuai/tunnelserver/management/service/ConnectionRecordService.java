@@ -3,8 +3,16 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.tunnelserver.management.model.ConnectionRecord;
 import com.theshuai.tunnelserver.management.model.ConnectionRecordView;
+import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
+import com.theshuai.tunnelserver.websocket.ConnectionEvent;
 import jakarta.persistence.criteria.Predicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.domain.Specification;
@@ -22,10 +30,15 @@ import java.util.List;
  */
 @Service
 public class ConnectionRecordService {
-    private final ConnectionRecordRepository connectionRecordRepository;
+    private static final Logger log = LoggerFactory.getLogger(ConnectionRecordService.class);
 
-    public ConnectionRecordService(ConnectionRecordRepository connectionRecordRepository) {
+    private final ConnectionRecordRepository connectionRecordRepository;
+    private final ApplicationEventPublisher events;
+
+    public ConnectionRecordService(ConnectionRecordRepository connectionRecordRepository,
+                                   ApplicationEventPublisher events) {
         this.connectionRecordRepository = connectionRecordRepository;
+        this.events = events;
     }
 
     /** 写一条连接记录，登录失败时 {@code disconnectedAt} 与 {@code connectedAt} 同时间戳。 */
@@ -42,20 +55,72 @@ public class ConnectionRecordService {
         record.setDisconnectedAt(result.success() ? null : now);
         record.setSuccess(result.success());
         record.setFailureReason(result.reason());
-        return connectionRecordRepository.save(record).getId();
+        // 登录失败直接落 LOGIN_FAILURE；成功的行等 channelInactive 再写。
+        if (!result.success()) {
+            record.setDisconnectReason(DisconnectReason.LOGIN_FAILURE.name());
+        }
+        ConnectionRecord saved = connectionRecordRepository.save(record);
+        // AFTER_COMMIT 才真正推 WebSocket（见 ConnectionEventBroadcaster），这里只是发布事务事件。
+        events.publishEvent(ConnectionEvent.created(toView(saved)));
+        return saved.getId();
     }
 
     @Transactional
-    public void recordDisconnect(long connectionRecordId) {
+    public void recordDisconnect(long connectionRecordId, DisconnectReason reason) {
         if (connectionRecordId <= 0) {
             return;
         }
+        DisconnectReason effective = reason == null ? DisconnectReason.UNKNOWN : reason;
         connectionRecordRepository.findById(connectionRecordId).ifPresent(record -> {
+            boolean dirty = false;
             if (record.getDisconnectedAt() == null) {
                 record.setDisconnectedAt(Instant.now().toString());
-                connectionRecordRepository.save(record);
+                dirty = true;
+            }
+            if (record.getDisconnectReason() == null) {
+                record.setDisconnectReason(effective.name());
+                dirty = true;
+            }
+            if (dirty) {
+                ConnectionRecord saved = connectionRecordRepository.save(record);
+                events.publishEvent(ConnectionEvent.updated(toView(saved)));
             }
         });
+    }
+
+    /**
+     * 服务端进程被 kill / 重启时，Netty 的 {@code channelInactive} 不会执行，那些登录成功的
+     * 连接记录会停在 {@code disconnectedAt = null}，前端按"未断开"持续累计在线时长。
+     * <p>启动后立即把启动前还没收尾的记录全部关掉，cutoff 用 {@link Instant#now()}，
+     * 避免误伤启动过程中刚进来的新连接（它们的 connectedAt &gt;= cutoff）。
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    @Transactional
+    public void closeStaleOpenRecordsOnStartup() {
+        String cutoff = Instant.now().toString();
+        int closed = connectionRecordRepository.closeOpenRecordsBefore(
+                cutoff, DisconnectReason.SERVER_RESTARTED.name());
+        if (closed > 0) {
+            log.info("closed {} stale open connection record(s) at startup (cutoff={}, reason={})",
+                    closed, cutoff, DisconnectReason.SERVER_RESTARTED);
+        }
+    }
+
+    /**
+     * Spring 容器关闭时（systemctl stop / kill -TERM 经过 graceful shutdown）触发。
+     * 此刻 {@code loginExecutor} 已经在 shutdown，channelInactive 派发的 recordDisconnect 任务
+     * 大概率会被拒掉。这里直接在调用线程里做一次 bulk update，把所有仍在线的记录收尾。
+     */
+    @EventListener(ContextClosedEvent.class)
+    @Transactional
+    public void markAllOpenAsShutdownOnContextClose() {
+        String now = Instant.now().toString();
+        int closed = connectionRecordRepository.markAllOpenAsClosed(
+                now, DisconnectReason.SERVER_SHUTDOWN.name());
+        if (closed > 0) {
+            log.info("marked {} open connection record(s) as {} during graceful shutdown",
+                    closed, DisconnectReason.SERVER_SHUTDOWN);
+        }
     }
 
     @Transactional(readOnly = true)
@@ -80,6 +145,7 @@ public class ConnectionRecordService {
     }
 
     private ConnectionRecordView toView(ConnectionRecord record) {
+        DisconnectReason reason = DisconnectReason.parse(record.getDisconnectReason());
         return new ConnectionRecordView(
                 record.getId(),
                 record.getClientId(),
@@ -89,7 +155,9 @@ public class ConnectionRecordService {
                 record.getConnectedAt(),
                 record.getDisconnectedAt(),
                 record.isSuccess(),
-                record.getFailureReason()
+                record.getFailureReason(),
+                reason == null ? null : reason.name(),
+                reason == null ? null : reason.label()
         );
     }
 
