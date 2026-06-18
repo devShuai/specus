@@ -53,7 +53,13 @@ public class TunnelResource {
 
     @PostMapping("/clients/{id}/nat-control")
     public Map<String, Object> pushNatControl(@PathVariable long id) {
-        int count = natControlService.pushToClient(id);
-        return Map.of("pushed", count);
+        NatControlService.PushResult result = natControlService.pushToClient(id);
+        // 兼容老前端：保留 "pushed" 字段（仅 TCP 项数），新前端读 tunnels/httpRoutes。
+        // httpRoutes == -1 时代表"未在后台接管 HTTP 路由"，前端按"-"渲染。
+        return Map.of(
+                "pushed", result.tunnels(),
+                "tunnels", result.tunnels(),
+                "httpRoutes", result.httpRoutes()
+        );
     }
 }

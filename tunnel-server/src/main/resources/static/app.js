@@ -9,11 +9,13 @@
 
 let clientCache = new Map();
 let tunnelCache = new Map();
+let httpRouteCache = new Map();
 let editTarget = null;
 let editTunnelTarget = null;
+let editHttpRouteTarget = null;
 let oidcConfig = null;
 const connectionsState = { clientId: null, success: null, from: null, to: null, page: 0, size: 50, totalPages: 0, total: 0 };
-/* HTTP 路由面板状态。clientId=null 表示展示全部在线客户端。 */
+/* HTTP 路由面板过滤态。clientId=null 表示展示全部客户端的路由（包含离线，因为后台是权威）。 */
 const httpRoutesState = { clientId: null };
 
 const $ = sel => document.querySelector(sel);
@@ -167,6 +169,14 @@ function syncClientSelectors(clients) {
       : '<option value="" disabled>无客户端</option>';
     if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
   }
+  const httpCreate = $('#httpRouteCreateClientId');
+  if (httpCreate) {
+    const prevCreate = httpCreate.value;
+    httpCreate.innerHTML = clients.length
+      ? clients.map(c => `<option value="${c.id}">${escapeHtml(c.clientName)}</option>`).join('')
+      : '<option value="" disabled>无客户端</option>';
+    if (prevCreate && [...httpCreate.options].some(o => o.value === prevCreate)) httpCreate.value = prevCreate;
+  }
   const filt = $('#connClientFilter');
   if (filt) {
     const prevFilt = filt.value;
@@ -214,13 +224,24 @@ function renderTunnels(tunnels) {
 }
 
 function renderHttpRoutes(items) {
+  httpRouteCache = new Map(items.map(r => [r.id, r]));
   $('#httpRoutes').innerHTML = items.length
     ? items.map(r => `<tr>
+      <td>${r.id}</td>
       <td>${escapeHtml(r.clientName)}</td>
       <td><code>${escapeHtml(r.route)}</code></td>
       <td>${r.targetBaseUrl ? `<code>${escapeHtml(r.targetBaseUrl)}</code>` : '<span class="muted">-</span>'}</td>
-      ${tdTime(r.reportedAt)}</tr>`).join('')
-    : emptyRow(4, '暂无在线客户端上报 HTTP 路由');
+      <td><span class="status-toggle ${r.enabled ? 'status-on' : 'status-off'}" role="button"
+               aria-pressed="${r.enabled ? 'true' : 'false'}" tabindex="0"
+               title="点击切换状态" data-action="toggleHttpRoute" data-id="${r.id}">${r.enabled ? '启用' : '停用'}</span></td>
+      ${tdTime(r.updatedAt || r.createdAt)}
+      <td>
+        <div class="actions">
+          <button class="secondary" data-action="editHttpRoute" data-id="${r.id}">编辑</button>
+          <button class="danger" data-action="deleteHttpRoute" data-id="${r.id}">删除</button>
+        </div>
+      </td></tr>`).join('')
+    : emptyRow(7, '后台尚未维护 HTTP 路由');
 }
 
 function renderTraffic(items) {
@@ -521,8 +542,89 @@ async function deleteTunnel(id) {
   } catch (error) { toast(error.message, 'error'); }
 }
 
+/* ---------- HTTP routes CRUD ----------
+ * 服务端是权威，每次写入后会自动通过 NAT_CONTROL 把 TCP+HTTP 全集下发给在线客户端，
+ * 由 DirectHttpRequestHandler.applyRoutes 热替换路由表。本前端只负责面板上的增删改查。
+ */
+async function createHttpRoute(_event, _form) {
+  try {
+    const clientId = $('#httpRouteCreateClientId').value;
+    if (!clientId) { toast('请先选择客户端', 'error'); return; }
+    await api(`/clients/${clientId}/http-routes`, { method:'POST', body:JSON.stringify({
+      route: $('#httpRouteCreateRoute').value.trim(),
+      targetBaseUrl: $('#httpRouteCreateTargetBaseUrl').value.trim(),
+      enabled: true
+    })});
+    toast('HTTP 路由已新增');
+    /* 仅清空 route / target，保留客户端选择以便连续添加 */
+    $('#httpRouteCreateRoute').value = '';
+    $('#httpRouteCreateTargetBaseUrl').value = '';
+    await loadHttpRoutes();
+  } catch (error) { toast(error.message, 'error'); }
+}
+
+function editHttpRoute(id) {
+  const route = httpRouteCache.get(id);
+  if (!route) return;
+  editHttpRouteTarget = route;
+  $('#er-title').textContent = `编辑 HTTP 路由 #${route.id}`;
+  $('#er-route').value = route.route;
+  $('#er-targetBaseUrl').value = route.targetBaseUrl;
+  $('#er-enabled').checked = !!route.enabled;
+  openDialog('editHttpRouteDialog');
+  setTimeout(() => $('#er-route').focus(), 50);
+}
+
+async function submitEditHttpRoute() {
+  if (!editHttpRouteTarget) return;
+  const id = editHttpRouteTarget.id;
+  const body = {
+    route: $('#er-route').value.trim(),
+    targetBaseUrl: $('#er-targetBaseUrl').value.trim(),
+    enabled: $('#er-enabled').checked
+  };
+  try {
+    await api(`/http-routes/${id}`, { method:'PUT', body:JSON.stringify(body) });
+    closeDialog('editHttpRouteDialog');
+    editHttpRouteTarget = null;
+    toast('HTTP 路由已更新');
+    await loadHttpRoutes();
+  } catch (error) { toast(error.message, 'error'); }
+}
+
+async function toggleHttpRoute(id) {
+  const route = httpRouteCache.get(id);
+  if (!route) return;
+  const next = !route.enabled;
+  try {
+    await api(`/http-routes/${id}`, { method:'PUT', body:JSON.stringify({
+      route: route.route,
+      targetBaseUrl: route.targetBaseUrl,
+      enabled: next
+    })});
+    toast(`HTTP 路由已${next ? '启用' : '停用'}`);
+    await loadHttpRoutes();
+  } catch (error) { toast(error.message, 'error'); }
+}
+
+async function deleteHttpRoute(id) {
+  if (!confirm('确定删除该 HTTP 路由？')) return;
+  try {
+    await api(`/http-routes/${id}`, { method:'DELETE' });
+    toast('HTTP 路由已删除');
+    await loadHttpRoutes();
+  } catch (error) { toast(error.message, 'error'); }
+}
+
 async function pushNatControl(id) {
-  try { const result = await api(`/clients/${id}/nat-control`, { method:'POST' }); toast(`已向客户端下发 ${result.pushed} 条映射`); }
+  try {
+    const result = await api(`/clients/${id}/nat-control`, { method:'POST' });
+    /* httpRoutes == -1 代表"未在后台接管 HTTP 路由"，此时按"-"展示，避免误读为 0 */
+    const httpText = (result.httpRoutes === undefined || result.httpRoutes < 0)
+      ? '-'
+      : String(result.httpRoutes);
+    toast(`已下发：TCP ${result.tunnels ?? result.pushed ?? 0} 条 / HTTP ${httpText} 条`);
+  }
   catch (error) { toast(error.message, 'error'); }
 }
 
@@ -582,12 +684,16 @@ const ACTIONS = {
   editTunnel: (id) => editTunnel(id),
   toggleTunnel: (id) => toggleTunnel(id),
   deleteTunnel: (id) => deleteTunnel(id),
+  editHttpRoute: (id) => editHttpRoute(id),
+  toggleHttpRoute: (id) => toggleHttpRoute(id),
+  deleteHttpRoute: (id) => deleteHttpRoute(id),
   resetConnFilters: () => resetConnFilters(),
   prevConnPage: () => prevConnPage(),
   nextConnPage: () => nextConnPage(),
   refreshHttpRoutes: () => loadHttpRoutes().catch(error => toast(error.message, 'error')),
   closeEditClient: () => { closeDialog('editClientDialog'); editTarget = null; },
   closeEditTunnel: () => { closeDialog('editTunnelDialog'); editTunnelTarget = null; },
+  closeEditHttpRoute: () => { closeDialog('editHttpRouteDialog'); editHttpRouteTarget = null; },
   closePw: () => closeDialog('passwordDialog'),
   copyPw: () => copyPassword(),
   toggleEcPw: () => {
@@ -601,8 +707,10 @@ const ACTIONS = {
 const FORMS = {
   createClient,
   createTunnel,
+  createHttpRoute,
   editClient: () => submitEditClient(),
   editTunnel: () => submitEditTunnel(),
+  editHttpRoute: () => submitEditHttpRoute(),
   passwordLogin,
 };
 
@@ -638,6 +746,7 @@ function setupDelegation() {
   });
   $('#editClientDialog').addEventListener('close', () => { editTarget = null; });
   $('#editTunnelDialog').addEventListener('close', () => { editTunnelTarget = null; });
+  $('#editHttpRouteDialog').addEventListener('close', () => { editHttpRouteTarget = null; });
 }
 
 /* ================================================================== *

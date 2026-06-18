@@ -38,6 +38,13 @@ class SecurityRulesTests {
     }
 
     @Test
+    void httpRouteApiRequiresAuthentication() throws Exception {
+        // /api/admin/http-routes 走同一套 Spring Security 规则——确保新加的 HttpRouteResource
+        // 没有被意外标记为 permitAll
+        assertThat(get("/api/admin/http-routes", null).statusCode()).isEqualTo(401);
+    }
+
+    @Test
     void oidcConfigIsPublic() throws Exception {
         assertThat(get("/oidc-config", null).statusCode()).isEqualTo(200);
     }

@@ -8,7 +8,6 @@ import com.theshuai.common.session.Session;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
-import com.theshuai.tunnelserver.management.service.HttpRouteRegistry;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.server.RemotePortServerManager;
 import com.theshuai.tunnelserver.server.TcpServer;
@@ -39,7 +38,6 @@ public class NatServerHandler extends NatCommonHandler {
     private final TrafficUsageService trafficUsageService;
     private final RemotePortServerManager remotePortServerManager;
     private final NettyServerProperties nettyProperties;
-    private final HttpRouteRegistry httpRouteRegistry;
     private final AtomicInteger activeClientExternalChannels = new AtomicInteger();
     private final Map<Integer, AtomicInteger> portExternalChannelCounts = new ConcurrentHashMap<>();
     // Set during processRegister; null means the client has not registered any tunnel yet.
@@ -50,12 +48,10 @@ public class NatServerHandler extends NatCommonHandler {
 
     public NatServerHandler(TrafficUsageService trafficUsageService,
                             RemotePortServerManager remotePortServerManager,
-                            NettyServerProperties nettyProperties,
-                            HttpRouteRegistry httpRouteRegistry) {
+                            NettyServerProperties nettyProperties) {
         this.trafficUsageService = trafficUsageService;
         this.remotePortServerManager = remotePortServerManager;
         this.nettyProperties = nettyProperties;
-        this.httpRouteRegistry = httpRouteRegistry;
     }
 
     @Override
@@ -70,9 +66,10 @@ public class NatServerHandler extends NatCommonHandler {
         } else if (type == NatMessageType.UNREGISTER) {
             processUnregister(natMessagePacket);
         } else if (type == NatMessageType.HTTP_ROUTES_REPORT) {
-            // 与 REGISTER 一样允许在未触发 REGISTER 之前到达：纯 HTTP 路由的客户端没有 TCP 端口
-            // 也应能上报；登录态由 SessionUtil.getSession 保证。
-            processHttpRoutesReport(natMessagePacket);
+            // 历史协议：HTTP 路由从客户端上报到服务端做面板展示。现已改为后台持久化 + 服务端
+            // 主动下发，路由表的权威方向反过来了——这里保留枚举位号兼容旧客户端，但不再读取。
+            log.debug("HTTP_ROUTES_REPORT ignored on channel {} (server is now authoritative)",
+                    ctx.channel().id().asLongText());
         } else if (register) {
             switch (type) {
                 case DISCONNECTED -> processDisconnected(natMessagePacket);
@@ -124,47 +121,6 @@ public class NatServerHandler extends NatCommonHandler {
         if (target != null) {
             target.close();
         }
-    }
-
-    /**
-     * 接收客户端 {@code HTTP_ROUTES_REPORT}，覆盖式写入 {@link HttpRouteRegistry}。
-     *
-     * <p>校验：必须已登录（{@link SessionUtil#getSession} 非空），上报的 clientName 必须等于 session 中的，
-     * 防止登录 A 的连接帮 B 上报。校验失败只丢弃这条包，不关闭连接——它只是展示用数据，
-     * 不值得为它升级到 PROTOCOL_VIOLATION。
-     */
-    @SuppressWarnings("unchecked")
-    private void processHttpRoutesReport(NatMessagePacket natMessagePacket) {
-        Map<String, Object> metaData = natMessagePacket.getMetaData();
-        String requestedClientName = asString(metaData, "clientName");
-        Session session = SessionUtil.getSession(ctx.channel());
-        if (session == null) {
-            log.warn("HTTP_ROUTES_REPORT before login on channel {}", ctx.channel().id().asLongText());
-            return;
-        }
-        if (requestedClientName == null || !session.getClientName().equals(requestedClientName)) {
-            log.warn("HTTP_ROUTES_REPORT clientName mismatch: session={}, claimed={}",
-                    session.getClientName(), requestedClientName);
-            return;
-        }
-        // 记录 clientName 方便 channelInactive 时定向清理（即使该连接从未发过 REGISTER）。
-        if (clientName == null) {
-            clientName = session.getClientName();
-        }
-        Object routesObj = metaData == null ? null : metaData.get("routes");
-        java.util.List<Map<String, Object>> routes;
-        if (routesObj instanceof java.util.List<?> rawList) {
-            routes = new java.util.ArrayList<>(rawList.size());
-            for (Object item : rawList) {
-                if (item instanceof Map<?, ?> m) {
-                    routes.add((Map<String, Object>) m);
-                }
-            }
-        } else {
-            routes = java.util.Collections.emptyList();
-        }
-        httpRouteRegistry.report(session.getClientName(), routes);
-        log.debug("HTTP_ROUTES_REPORT accepted [{}], {} route(s)", session.getClientName(), routes.size());
     }
 
     private void processUnregister(NatMessagePacket natMessagePacket) {
@@ -284,14 +240,6 @@ public class NatServerHandler extends NatCommonHandler {
         }
         remoteConnectionServerMap.clear();
         externalChannels.values().forEach(Channel::close);
-        // 只在 SessionUtil 中的最新 channel 还是自己时清理，避免"被新登录顶掉"的旧连接 inactive
-        // 时误删新连接刚上报的快照（新连接的 handlerAdded 可能先于旧连接 inactive 触发）。
-        if (clientName != null && SessionUtil.getChannel(clientName) != ctx.channel()
-                && SessionUtil.getChannel(clientName) != null) {
-            // 已被新连接替换，新连接会自己 report，这里跳过
-        } else if (clientName != null) {
-            httpRouteRegistry.clear(clientName);
-        }
     }
 
     @Override

@@ -3,12 +3,15 @@ package com.theshuai.tunnelserver.integration;
 import com.sun.net.httpserver.HttpServer;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.client.NettyClient;
+import com.theshuai.tunnelclient.handler.DirectHttpRequestHandler;
 import com.theshuai.tunnelserver.TunnelServerApplication;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.service.ClientAccountService;
+import com.theshuai.tunnelserver.management.service.HttpRouteService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import com.theshuai.tunnelserver.server.NettyServer;
+import io.netty.channel.Channel;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -22,12 +25,15 @@ import org.springframework.data.domain.PageRequest;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -72,6 +78,7 @@ class EndToEndTunnelIT {
 
     @Autowired private ClientAccountService clientAccountService;
     @Autowired private NatControlService natControlService;
+    @Autowired private HttpRouteService httpRouteService;
     @Autowired private NettyServer nettyServer;
     @Autowired private ConnectionRecordRepository connectionRecordRepository;
     @Autowired private ClientAccountRepository clientAccountRepository;
@@ -147,6 +154,32 @@ class EndToEndTunnelIT {
                 .pollInterval(500, MILLISECONDS)
                 .ignoreExceptions()
                 .until(this::proxiesThroughToBackend);
+
+        // —— HTTP 路由热下发 ——
+        // 客户端启动时 httpTunnelConfigList 为空；服务端通过 HttpRouteService 写入第一条
+        // 后会触发 NatControlService.pushSnapshotIfOnline，沿 NAT_CONTROL 推到客户端的
+        // DirectHttpRequestHandler.applyRoutes，整个链路在线热替换。
+        httpRouteService.createRoute(clientId, new HttpRouteService.RouteMutation(
+                "web", "http://127.0.0.1:" + backendPort, true
+        ));
+
+        await().atMost(10, SECONDS)
+                .pollInterval(200, MILLISECONDS)
+                .until(() -> {
+                    Map<String, String> routes = readClientRoutes(tunnelClient);
+                    return routes != null && ("http://127.0.0.1:" + backendPort).equals(routes.get("web"));
+                });
+
+        // 再追加一条 + 删除第一条，验证整体替换语义（不是增量补丁）
+        httpRouteService.createRoute(clientId, new HttpRouteService.RouteMutation(
+                "api", "http://127.0.0.1:" + backendPort, true
+        ));
+        await().atMost(10, SECONDS)
+                .pollInterval(200, MILLISECONDS)
+                .until(() -> {
+                    Map<String, String> routes = readClientRoutes(tunnelClient);
+                    return routes != null && routes.size() == 2 && routes.containsKey("api");
+                });
     }
 
     private boolean hasSuccessfulConnectionRecord(String clientName) {
@@ -174,6 +207,37 @@ class EndToEndTunnelIT {
     private static int findFreePort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
+        }
+    }
+
+    /**
+     * 反射读取 NettyClient.controlChannel 当前 pipeline 中
+     * {@link DirectHttpRequestHandler#getCurrentRoutes()}。返回 null 表示客户端
+     * 还没建立连接 / 已断开。
+     *
+     * <p>用反射是因为 {@code controlChannel} 是私有字段——为测试新增 getter 会污染
+     * 生产代码 API；E2E 仅在测试代码里这一处反射，权衡之后选择不动 production。
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> readClientRoutes(NettyClient client) {
+        try {
+            Field field = NettyClient.class.getDeclaredField("controlChannel");
+            field.setAccessible(true);
+            Object value = field.get(client);
+            if (!(value instanceof AtomicReference<?> ref)) {
+                return null;
+            }
+            Object channel = ref.get();
+            if (!(channel instanceof Channel ch)) {
+                return null;
+            }
+            DirectHttpRequestHandler handler = ch.pipeline().get(DirectHttpRequestHandler.class);
+            if (handler == null) {
+                return null;
+            }
+            return handler.getCurrentRoutes();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to read client routes via reflection", e);
         }
     }
 }

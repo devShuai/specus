@@ -43,6 +43,19 @@
   </form>
 </dialog>
 
+<dialog id="editHttpRouteDialog" class="dialog" aria-labelledby="er-title">
+  <form id="editHttpRouteForm" data-form="editHttpRoute" class="dialog-form" autocomplete="off">
+    <h3 id="er-title">编辑 HTTP 路由</h3>
+    <label>路由名 <input id="er-route" required maxlength="60" placeholder="如 web"></label>
+    <label>目标地址 <input id="er-targetBaseUrl" required maxlength="512" placeholder="如 http://127.0.0.1:8080"></label>
+    <label class="row"><input id="er-enabled" type="checkbox"> 启用路由</label>
+    <div class="dialog-actions">
+      <button type="button" class="secondary" data-action="closeEditHttpRoute">取消</button>
+      <button type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="passwordDialog" class="dialog" aria-labelledby="pw-title">
   <div class="dialog-form">
     <h3 id="pw-title">客户端密码</h3>
@@ -119,17 +132,23 @@
 
   <section class="panel">
     <h2>HTTP 路由</h2>
+    <form class="form" data-form="createHttpRoute" autocomplete="off">
+      <select id="httpRouteCreateClientId" required aria-label="客户端"></select>
+      <input id="httpRouteCreateRoute" required maxlength="60" placeholder="路由名，如 web" aria-label="路由名">
+      <input id="httpRouteCreateTargetBaseUrl" required maxlength="512" placeholder="目标地址，如 http://127.0.0.1:8080" aria-label="目标地址">
+      <button type="submit">新增路由</button>
+    </form>
     <div class="filters">
       <label>客户端<select id="httpRouteClientFilter" data-onchange="httpRoutesFilter" aria-label="客户端筛选"></select></label>
       <button type="button" class="secondary" data-action="refreshHttpRoutes">刷新</button>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>客户端</th><th>路由前缀</th><th>目标地址</th><th>上报时间</th></tr></thead>
+        <thead><tr><th>ID</th><th>客户端</th><th>路由名</th><th>目标地址</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
         <tbody id="httpRoutes"></tbody>
       </table>
     </div>
-    <p class="muted small">提示：HTTP 路由由客户端 <code>tunnelClientConfig.json</code> 配置，在登录时自动上报。该面板仅展示当前在线客户端的有效路由，不可在线修改；离线后会自动从列表中消失。</p>
+    <p class="muted small">提示：HTTP 路由由服务端管理后台维护，客户端登录或修改时自动通过 NAT_CONTROL 下发并热更新生效，无需重启客户端。点击状态徽章可快速启停；客户端首次接入若后台为空，则继续使用其本地 <code>tunnelClientConfig.json</code> 作为 fallback。</p>
   </section>
 
   <section class="panel panel-scroll">
