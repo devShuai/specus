@@ -4,7 +4,6 @@ import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
-import com.theshuai.tunnelclient.bean.HttpTunnelConfig;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.bean.TunnelConfig;
 import com.theshuai.tunnelclient.client.TcpConnection;
@@ -42,10 +41,12 @@ public class NatClientHandler extends NatCommonHandler {
     private final String clientName;
     private final TcpConnection localConnection;
     /**
-     * 仅用于上报给服务端做管理 UI 展示。每个新建 channel 由 {@link #handlerAdded} / {@link #channelActive}
-     * 触发一次上报，{@code channelInactive} 重置以便重连后再发。
+     * 仅用于上报给服务端做诊断（"客户端实际生效的 HTTP 路由"）。每个新建 channel 由
+     * {@link #handlerAdded} / {@link #channelActive} 触发一次上报，{@code channelInactive}
+     * 重置以便重连后再发。**路由数据本身**不持有在这里——上报时去 pipeline 中的
+     * {@code DirectHttpRequestHandler.getCurrentRoutes()} 取，保证服务端 push 热更新后
+     * 的最新值能反映在下次上报里。
      */
-    private final List<HttpTunnelConfig> httpTunnelConfigList;
     private boolean httpRoutesReported;
 
     public NatClientHandler(TunnelBean tunnelBean) {
@@ -61,9 +62,6 @@ public class NatClientHandler extends NatCommonHandler {
                 tunnelConfigMap.put(tunnelConfig.getPort(), tunnelConfig);
             }
         }
-        this.httpTunnelConfigList = tunnelBean.getHttpTunnelConfigList() == null
-                ? List.of()
-                : List.copyOf(tunnelBean.getHttpTunnelConfigList());
     }
 
     @Override
@@ -107,24 +105,34 @@ public class NatClientHandler extends NatCommonHandler {
     }
 
     /**
-     * 把当前生效的 HTTP 路由列表上报给服务端，仅用于管理 UI 展示。每次新 channel 只发一次；
-     * channelInactive 时复位标志位，重连后会再次上报。空列表也发，让服务端能区分"没配置"
+     * 把"客户端当前实际生效"的 HTTP 路由列表上报给服务端做诊断。每次新 channel 只发一次；
+     * channelInactive 时复位标志位，重连后会再次上报。空列表也发，让服务端能区分"未配置"
      * 与"老客户端未上报"。
+     *
+     * <p>历史背景：早期版本服务端会读这条上报来填面板（{@code HttpRouteRegistry}）。改为
+     * 服务端持久化模型后，这条消息变成纯诊断（服务端目前 log 即丢），保留是为了让旧版
+     * 服务端仍能正常显示客户端连进来的路由信息。
      */
     private synchronized void reportHttpRoutes(ChannelHandlerContext ctx) {
         if (httpRoutesReported) {
             return;
         }
         httpRoutesReported = true;
-        List<Map<String, String>> routes = new ArrayList<>(httpTunnelConfigList.size());
-        for (HttpTunnelConfig cfg : httpTunnelConfigList) {
-            if (cfg == null || !StringUtils.hasText(cfg.getRoute())) {
+        // 从 pipeline 中拿"当前生效"的 routes，而不是构造期那份——保证服务端 push 热更新后
+        // 下次上报反映的是最新值。pipeline 顺序保证 DirectHttpRequestHandler 先于 NatClientHandler
+        // 加入（NettyClient.start 的 initChannel）。
+        DirectHttpRequestHandler directHttp = ctx.pipeline().get(DirectHttpRequestHandler.class);
+        Map<String, String> liveRoutes = directHttp == null ? Map.of() : directHttp.getCurrentRoutes();
+        List<Map<String, String>> routes = new ArrayList<>(liveRoutes.size());
+        for (Map.Entry<String, String> entry : liveRoutes.entrySet()) {
+            String route = entry.getKey();
+            if (!StringUtils.hasText(route)) {
                 continue;
             }
-            Map<String, String> entry = new HashMap<>(2);
-            entry.put("route", cfg.getRoute());
-            entry.put("targetBaseUrl", cfg.getTargetBaseUrl() == null ? "" : cfg.getTargetBaseUrl());
-            routes.add(entry);
+            Map<String, String> item = new HashMap<>(2);
+            item.put("route", route);
+            item.put("targetBaseUrl", entry.getValue() == null ? "" : entry.getValue());
+            routes.add(item);
         }
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.HTTP_ROUTES_REPORT);
