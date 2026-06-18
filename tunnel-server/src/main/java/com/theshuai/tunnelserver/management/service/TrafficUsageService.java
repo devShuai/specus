@@ -17,13 +17,13 @@ import java.util.concurrent.atomic.LongAdder;
 
 @Service
 public class TrafficUsageService {
-    private final ClientManagementService clientManagementService;
+    private final ClientAccountService clientAccountService;
     private final TrafficUsageRepository trafficUsageRepository;
     private final Map<String, TrafficCounter> counters = new ConcurrentHashMap<>();
 
-    public TrafficUsageService(ClientManagementService clientManagementService,
+    public TrafficUsageService(ClientAccountService clientAccountService,
                                TrafficUsageRepository trafficUsageRepository) {
-        this.clientManagementService = clientManagementService;
+        this.clientAccountService = clientAccountService;
         this.trafficUsageRepository = trafficUsageRepository;
     }
 
@@ -58,7 +58,7 @@ public class TrafficUsageService {
         }
 
         try {
-            ClientAccount account = clientManagementService.findClientByName(clientName).orElse(null);
+            ClientAccount account = clientAccountService.findClientByName(clientName).orElse(null);
             if (account == null) {
                 return;
             }

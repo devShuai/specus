@@ -8,6 +8,8 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
+import lombok.Getter;
+import lombok.Setter;
 
 /**
  * Per-natural-month connection totals kept after the raw {@code tunnel_connection_record} detail is
@@ -20,6 +22,8 @@ import jakarta.persistence.UniqueConstraint;
                 columnNames = {"client_name", "stat_month"}
         ),
         indexes = @Index(name = "idx_tunnel_connection_stat_client", columnList = "client_name"))
+@Getter
+@Setter
 public class ConnectionStat {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -45,64 +49,4 @@ public class ConnectionStat {
 
     @Column(name = "updated_at", nullable = false, length = 40)
     private String updatedAt;
-
-    public Long getId() {
-        return id;
-    }
-
-    public Long getClientId() {
-        return clientId;
-    }
-
-    public void setClientId(Long clientId) {
-        this.clientId = clientId;
-    }
-
-    public String getClientName() {
-        return clientName;
-    }
-
-    public void setClientName(String clientName) {
-        this.clientName = clientName;
-    }
-
-    public String getStatMonth() {
-        return statMonth;
-    }
-
-    public void setStatMonth(String statMonth) {
-        this.statMonth = statMonth;
-    }
-
-    public long getTotalCount() {
-        return totalCount;
-    }
-
-    public void setTotalCount(long totalCount) {
-        this.totalCount = totalCount;
-    }
-
-    public long getSuccessCount() {
-        return successCount;
-    }
-
-    public void setSuccessCount(long successCount) {
-        this.successCount = successCount;
-    }
-
-    public long getFailureCount() {
-        return failureCount;
-    }
-
-    public void setFailureCount(long failureCount) {
-        this.failureCount = failureCount;
-    }
-
-    public String getUpdatedAt() {
-        return updatedAt;
-    }
-
-    public void setUpdatedAt(String updatedAt) {
-        this.updatedAt = updatedAt;
-    }
 }

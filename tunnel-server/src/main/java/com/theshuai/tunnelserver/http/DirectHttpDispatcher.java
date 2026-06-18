@@ -1,27 +1,36 @@
-package com.theshuai.common.manager;
+package com.theshuai.tunnelserver.http;
 
 import com.theshuai.common.future.SyncFuture;
 import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
-import com.theshuai.common.util.SessionUtil;
+import com.theshuai.tunnelserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
 
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * HTTP 直转编排器：管理面板请求 → 写到客户端控制连接 → 等待响应。
+ *
+ * <p>从原 {@code tunnel-common.manager.DirectHttpFutureManager} 迁来：
+ * <ul>
+ *   <li>语义本就是服务端 only（依赖 {@link SessionUtil} 路由表，客户端用不到）。</li>
+ *   <li>改成 {@link Service @Service} 让 Spring 接管生命周期，单元测试和注入都更直接。</li>
+ *   <li>{@link DirectHttpResponseHandler} 把客户端回包转给本类的 {@link #ack(DirectHttpResponsePacket)}。</li>
+ * </ul>
+ */
+@Service
 @Slf4j
-public final class DirectHttpFutureManager {
-    private static final ConcurrentMap<String, SyncFuture<DirectHttpResponsePacket>> FUTURES = new ConcurrentHashMap<>();
+public class DirectHttpDispatcher {
+    private final ConcurrentMap<String, SyncFuture<DirectHttpResponsePacket>> futures = new ConcurrentHashMap<>();
 
-    private DirectHttpFutureManager() {
-    }
-
-    public static DirectHttpResponsePacket forward(String clientName,
-                                                   DirectHttpRequestPacket packet,
-                                                   long timeoutMillis) {
+    public DirectHttpResponsePacket forward(String clientName,
+                                            DirectHttpRequestPacket packet,
+                                            long timeoutMillis) {
         Channel channel = SessionUtil.getChannel(clientName);
         if (channel == null || !channel.isActive()) {
             log.warn("[http-direct][server-dispatch] clientName={} rejected=client-offline", clientName);
@@ -32,7 +41,7 @@ public final class DirectHttpFutureManager {
         packet.setRequestId(requestId);
         long startedAt = System.currentTimeMillis();
         SyncFuture<DirectHttpResponsePacket> future = new SyncFuture<>();
-        FUTURES.put(requestId, future);
+        futures.put(requestId, future);
         try {
             log.info("[http-direct][server->client] requestId={} clientName={} method={} route={} path={} queryPresent={} bodyBytes={} timeoutMs={}",
                     requestId, clientName, packet.getRequestMethod(), packet.getRoute(), packet.getRelativePath(),
@@ -63,12 +72,13 @@ public final class DirectHttpFutureManager {
                     requestId, clientName, errorMessage(e), System.currentTimeMillis() - startedAt, e);
             throw new DirectHttpTunnelException(502, "HTTP 转发请求失败", e);
         } finally {
-            FUTURES.remove(requestId);
+            futures.remove(requestId);
         }
     }
 
-    public static void ack(DirectHttpResponsePacket packet) {
-        SyncFuture<DirectHttpResponsePacket> future = FUTURES.get(packet.getRequestId());
+    /** 由 {@link DirectHttpResponseHandler} 在收到客户端响应时回调。 */
+    public void ack(DirectHttpResponsePacket packet) {
+        SyncFuture<DirectHttpResponsePacket> future = futures.get(packet.getRequestId());
         if (future != null) {
             log.info("[http-direct][client->server] requestId={} status={} errorPresent={} bodyBytes={}",
                     packet.getRequestId(), packet.getStatusCode(), packet.getError() != null, size(packet.getBody()));

@@ -12,7 +12,7 @@
     <name>tunnel-server</name>
     <description>tunnel-server</description>
     <properties>
-        <java.version>25</java.version>
+        <java.version>21</java.version>
     </properties>
     <build>
         <plugins>
@@ -21,6 +21,8 @@
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
                     <jvmArguments>--enable-native-access=ALL-UNNAMED</jvmArguments>
+                    <!-- 显式指定 main class，repackage 不再依赖类路径自动探测 -->
+                    <mainClass>com.theshuai.tunnelserver.TunnelServerApplication</mainClass>
                 </configuration>
             </plugin>
         </plugins>

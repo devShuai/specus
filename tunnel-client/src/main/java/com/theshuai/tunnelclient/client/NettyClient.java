@@ -3,7 +3,6 @@ package com.theshuai.tunnelclient.client;
 import com.theshuai.common.codec.PacketDecoder;
 import com.theshuai.common.codec.PacketEncoder;
 import com.theshuai.common.codec.Spliter;
-import com.theshuai.common.handler.CustomHttpRequestHandler;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelclient.bean.TunnelBean;
@@ -110,7 +109,6 @@ public class NettyClient {
                         ch.pipeline().addLast(new LoginResponseHandler(NettyClient.this));
                         ch.pipeline().addLast(new MessageResponseHandler(sharedLocalConnection));
                         ch.pipeline().addLast(new DirectHttpRequestHandler(tunnelBean.getHttpTunnelConfigList()));
-                        ch.pipeline().addLast(new CustomHttpRequestHandler());
                         ch.pipeline().addLast(new LogoutResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());
                         // 心跳由 ClientSocketIdleStateHandler 在 5 秒写空闲时触发，不再需要单独的定时器。

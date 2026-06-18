@@ -2,60 +2,75 @@ package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.security.HmacSigner;
-import com.theshuai.common.util.SessionUtil;
-import com.theshuai.tunnelserver.management.model.*;
+import com.theshuai.tunnelserver.attribute.ServerAttributes;
+import com.theshuai.tunnelserver.management.model.ClientAccount;
+import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
+import com.theshuai.tunnelserver.management.repository.TrafficTotal;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
 import com.theshuai.tunnelserver.security.PasswordService;
-import com.theshuai.tunnelserver.server.RemotePortServerManager;
+import com.theshuai.tunnelserver.session.SessionUtil;
 import io.netty.channel.Channel;
-import jakarta.persistence.criteria.Predicate;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
+/**
+ * 客户端账号生命周期管理 + 登录鉴权。
+ *
+ * <p>这个类原本叫 {@code ClientManagementService}，承担了 5 个领域；按职责拆分后留下的就是
+ * "客户端账号"这一个领域：
+ * <ul>
+ *   <li>账号 CRUD（{@link #createClient}, {@link #updateClient}, {@link #deleteClient}, {@link #listClients}）</li>
+ *   <li>登录鉴权（{@link #authenticate}）——产出 {@link AuthenticationResult}，
+ *       由调用方决定是否绑定会话/记录连接，本类自身不写连接表</li>
+ * </ul>
+ *
+ * <p>已搬走的功能：
+ * <ul>
+ *   <li>连接记录（recordConnection / listConnections）→ {@link ConnectionRecordService}</li>
+ *   <li>流量列表 → {@link TrafficViewService}</li>
+ *   <li>Overview 卡片 → {@link OverviewService}</li>
+ * </ul>
+ */
 @Service
-public class ClientManagementService {
+public class ClientAccountService {
     private final ClientAccountRepository clientAccountRepository;
     private final ConnectionRecordRepository connectionRecordRepository;
     private final TrafficUsageRepository trafficUsageRepository;
-    private final RemotePortServerManager remotePortServerManager;
 
-    public ClientManagementService(ClientAccountRepository clientAccountRepository,
-                                   ConnectionRecordRepository connectionRecordRepository,
-                                   TrafficUsageRepository trafficUsageRepository,
-                                   RemotePortServerManager remotePortServerManager) {
+    public ClientAccountService(ClientAccountRepository clientAccountRepository,
+                                ConnectionRecordRepository connectionRecordRepository,
+                                TrafficUsageRepository trafficUsageRepository) {
         this.clientAccountRepository = clientAccountRepository;
         this.connectionRecordRepository = connectionRecordRepository;
         this.trafficUsageRepository = trafficUsageRepository;
-        this.remotePortServerManager = remotePortServerManager;
     }
 
     @Transactional(readOnly = true)
     public List<ClientAccountView> listClients() {
+        // 一次性聚合所有客户端的上下行总量，避免 N+1（每客户端一条 findByClientId 查询）。
+        Map<Long, TrafficTotal> totals = trafficUsageRepository.sumBytesByClientId().stream()
+                .collect(Collectors.toMap(TrafficTotal::getClientId, t -> t));
         return clientAccountRepository.findAll().stream()
                 .sorted((left, right) -> Long.compare(right.getId(), left.getId()))
-                .map(this::toView)
+                .map(account -> toView(account, totals.get(account.getId())))
                 .toList();
     }
 
     @Transactional
     public CredentialResult createClient(ClientMutation request) {
         String clientName = requireClientName(request.clientName());
-        String password = StringUtils.hasText(request.password()) ? request.password() : PasswordService.generatePassword();
+        String password = StringUtils.hasText(request.password())
+                ? request.password() : PasswordService.generatePassword();
         String now = Instant.now().toString();
 
         ClientAccount account = new ClientAccount();
@@ -66,7 +81,7 @@ public class ClientManagementService {
         account.setConnectionRateLimitPerMinute(normalizeRateLimit(request.connectionRateLimitPerMinute(), 30));
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
-        return new CredentialResult(toView(clientAccountRepository.save(account)), password);
+        return new CredentialResult(toView(clientAccountRepository.save(account), null), password);
     }
 
     @Transactional
@@ -91,7 +106,8 @@ public class ClientManagementService {
         if (!account.isEnabled() || !account.getClientName().equals(originalClientName)) {
             closeOnlineChannel(originalClientName);
         }
-        return new CredentialResult(toView(account), request.password());
+        TrafficTotal total = trafficUsageRepository.sumBytesByClientId(account.getId()).orElse(null);
+        return new CredentialResult(toView(account, total), request.password());
     }
 
     @Transactional
@@ -120,79 +136,6 @@ public class ClientManagementService {
         return AuthenticationResult.success(account);
     }
 
-    @Transactional
-    public long recordConnection(AuthenticationResult result, LoginRequestPacket packet, String channelId, String remoteAddress) {
-        String now = Instant.now().toString();
-        ConnectionRecord record = new ConnectionRecord();
-        record.setClientId(result.account() == null ? null : result.account().getId());
-        record.setClientName(packet.getClientName());
-        record.setChannelId(channelId);
-        record.setRemoteAddress(remoteAddress);
-        record.setConnectedAt(now);
-        record.setDisconnectedAt(result.success() ? null : now);
-        record.setSuccess(result.success());
-        record.setFailureReason(result.reason());
-        return connectionRecordRepository.save(record).getId();
-    }
-
-    @Transactional
-    public void recordDisconnect(long connectionRecordId) {
-        if (connectionRecordId <= 0) {
-            return;
-        }
-        connectionRecordRepository.findById(connectionRecordId).ifPresent(record -> {
-            if (record.getDisconnectedAt() == null) {
-                record.setDisconnectedAt(Instant.now().toString());
-                connectionRecordRepository.save(record);
-            }
-        });
-    }
-
-    @Transactional(readOnly = true)
-    public Page<ConnectionRecordView> listConnections(ConnectionFilter filter, Pageable pageable) {
-        Specification<ConnectionRecord> spec = (root, query, cb) -> {
-            List<Predicate> predicates = new ArrayList<>();
-            if (filter.clientId() != null) {
-                predicates.add(cb.equal(root.get("clientId"), filter.clientId()));
-            }
-            if (filter.success() != null) {
-                predicates.add(cb.equal(root.get("success"), filter.success()));
-            }
-            if (StringUtils.hasText(filter.from())) {
-                predicates.add(cb.greaterThanOrEqualTo(root.get("connectedAt"), filter.from()));
-            }
-            if (StringUtils.hasText(filter.to())) {
-                predicates.add(cb.lessThanOrEqualTo(root.get("connectedAt"), filter.to()));
-            }
-            return predicates.isEmpty() ? cb.conjunction() : cb.and(predicates.toArray(new Predicate[0]));
-        };
-        return connectionRecordRepository.findAll(spec, pageable).map(this::toView);
-    }
-
-    @Transactional(readOnly = true)
-    public List<TrafficUsageView> listTraffic(Long clientId, int limit) {
-        PageRequest pageRequest = PageRequest.of(0, normalizeListLimit(limit));
-        List<TrafficUsage> usages = clientId == null
-                ? trafficUsageRepository.findAllByOrderByUsageDateDescIdDesc(pageRequest)
-                : trafficUsageRepository.findByClientIdOrderByUsageDateDescIdDesc(clientId, pageRequest);
-        return usages.stream().map(this::toView).toList();
-    }
-
-    @Transactional(readOnly = true)
-    public Map<String, Object> overview() {
-        List<ClientAccountView> clients = listClients();
-        Map<String, Object> overview = new LinkedHashMap<>();
-        overview.put("clients", clients.size());
-        overview.put("onlineClients", clients.stream().filter(ClientAccountView::online).count());
-        overview.put("successfulConnections", connectionRecordRepository.countBySuccess(true));
-        overview.put("failedConnections", connectionRecordRepository.countBySuccess(false));
-        overview.put("uploadBytes", clients.stream().mapToLong(ClientAccountView::uploadBytes).sum());
-        overview.put("downloadBytes", clients.stream().mapToLong(ClientAccountView::downloadBytes).sum());
-        overview.put("externalConnections", remotePortServerManager.activeExternalConnections());
-        overview.put("rejectedExternalConnections", remotePortServerManager.rejectedExternalConnections());
-        return overview;
-    }
-
     @Transactional(readOnly = true)
     public Optional<ClientAccount> findClientByName(String clientName) {
         return clientAccountRepository.findByClientName(clientName);
@@ -203,13 +146,12 @@ public class ClientManagementService {
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
     }
 
-    private ClientAccountView toView(ClientAccount account) {
-        List<TrafficUsage> usages = trafficUsageRepository.findByClientId(account.getId());
+    private ClientAccountView toView(ClientAccount account, TrafficTotal total) {
         Channel channel = SessionUtil.getChannel(account.getClientName());
         boolean online = channel != null;
-        Long connectedSinceMs = online
-                ? channel.attr(com.theshuai.common.attribute.Attributes.LOGIN_TIME_MS).get()
-                : null;
+        Long connectedSinceMs = online ? channel.attr(ServerAttributes.LOGIN_TIME_MS).get() : null;
+        long uploadBytes = total == null ? 0L : total.getUploadBytes();
+        long downloadBytes = total == null ? 0L : total.getDownloadBytes();
         return new ClientAccountView(
                 account.getId(),
                 account.getClientName(),
@@ -217,36 +159,10 @@ public class ClientManagementService {
                 account.getConnectionRateLimitPerMinute(),
                 online,
                 connectedSinceMs,
-                usages.stream().mapToLong(TrafficUsage::getUploadBytes).sum(),
-                usages.stream().mapToLong(TrafficUsage::getDownloadBytes).sum(),
+                uploadBytes,
+                downloadBytes,
                 account.getCreatedAt(),
                 account.getUpdatedAt()
-        );
-    }
-
-    private ConnectionRecordView toView(ConnectionRecord record) {
-        return new ConnectionRecordView(
-                record.getId(),
-                record.getClientId(),
-                record.getClientName(),
-                record.getChannelId(),
-                record.getRemoteAddress(),
-                record.getConnectedAt(),
-                record.getDisconnectedAt(),
-                record.isSuccess(),
-                record.getFailureReason()
-        );
-    }
-
-    private TrafficUsageView toView(TrafficUsage usage) {
-        return new TrafficUsageView(
-                usage.getId(),
-                usage.getClientId(),
-                usage.getClientName(),
-                usage.getUsageDate(),
-                usage.getUploadBytes(),
-                usage.getDownloadBytes(),
-                usage.getUpdatedAt()
         );
     }
 
@@ -313,10 +229,6 @@ public class ClientManagementService {
         return normalized;
     }
 
-    private int normalizeListLimit(int limit) {
-        return Math.clamp(limit, 1, 500);
-    }
-
     public record ClientMutation(
             String clientName,
             String password,
@@ -326,18 +238,5 @@ public class ClientManagementService {
     }
 
     public record CredentialResult(ClientAccountView client, String password) {
-    }
-
-    public record ConnectionFilter(Long clientId, Boolean success, String from, String to) {
-    }
-
-    public record AuthenticationResult(boolean success, ClientAccount account, String reason) {
-        public static AuthenticationResult success(ClientAccount account) {
-            return new AuthenticationResult(true, account, null);
-        }
-
-        public static AuthenticationResult failure(ClientAccount account, String reason) {
-            return new AuthenticationResult(false, account, reason);
-        }
     }
 }

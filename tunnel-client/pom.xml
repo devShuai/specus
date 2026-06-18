@@ -12,7 +12,7 @@
     <name>tunnel-client</name>
     <description>tunnel-client</description>
     <properties>
-        <java.version>25</java.version>
+        <java.version>21</java.version>
     </properties>
     <dependencies>
         <dependency>
@@ -45,6 +45,13 @@
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
                     <jvmArguments>--enable-native-access=ALL-UNNAMED</jvmArguments>
+                    <!--
+                        repackage 默认会把 thin-jar 替换为 fat-jar，导致下游 test-scope 依赖
+                        （如 tunnel-server 的 EndToEndTunnelIT）拿到 fat-jar，类路径污染、
+                        编译期 import 也找不到。给 repackage 一个 classifier，让 fat-jar 以
+                        tunnel-client-*-exec.jar 形式存在，原始 thin-jar 仍然以普通 jar 安装到本地仓库。
+                    -->
+                    <classifier>exec</classifier>
                     <excludes>
                         <exclude>
                             <groupId>org.projectlombok</groupId>

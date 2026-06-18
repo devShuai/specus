@@ -7,6 +7,8 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
 
 @Entity
 @Table(name = "tunnel_connection_record", indexes = {
@@ -16,6 +18,8 @@ import jakarta.persistence.Table;
         // Serves the retention purge (connected_at < cutoff).
         @Index(name = "idx_tunnel_connection_connected_at", columnList = "connected_at")
 })
+@Getter
+@Setter
 public class ConnectionRecord {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -44,72 +48,4 @@ public class ConnectionRecord {
 
     @Column(name = "failure_reason", length = 255)
     private String failureReason;
-
-    public Long getId() {
-        return id;
-    }
-
-    public Long getClientId() {
-        return clientId;
-    }
-
-    public void setClientId(Long clientId) {
-        this.clientId = clientId;
-    }
-
-    public String getClientName() {
-        return clientName;
-    }
-
-    public void setClientName(String clientName) {
-        this.clientName = clientName;
-    }
-
-    public String getChannelId() {
-        return channelId;
-    }
-
-    public void setChannelId(String channelId) {
-        this.channelId = channelId;
-    }
-
-    public String getRemoteAddress() {
-        return remoteAddress;
-    }
-
-    public void setRemoteAddress(String remoteAddress) {
-        this.remoteAddress = remoteAddress;
-    }
-
-    public String getConnectedAt() {
-        return connectedAt;
-    }
-
-    public void setConnectedAt(String connectedAt) {
-        this.connectedAt = connectedAt;
-    }
-
-    public String getDisconnectedAt() {
-        return disconnectedAt;
-    }
-
-    public void setDisconnectedAt(String disconnectedAt) {
-        this.disconnectedAt = disconnectedAt;
-    }
-
-    public boolean isSuccess() {
-        return success;
-    }
-
-    public void setSuccess(boolean success) {
-        this.success = success;
-    }
-
-    public String getFailureReason() {
-        return failureReason;
-    }
-
-    public void setFailureReason(String failureReason) {
-        this.failureReason = failureReason;
-    }
 }

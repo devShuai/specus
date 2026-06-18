@@ -1,9 +1,8 @@
 package com.theshuai.tunnelserver.http;
 
-import com.theshuai.common.manager.DirectHttpFutureManager;
-import com.theshuai.common.manager.DirectHttpFutureManager.DirectHttpTunnelException;
 import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
+import com.theshuai.tunnelserver.http.DirectHttpDispatcher.DirectHttpTunnelException;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
@@ -32,13 +31,16 @@ public class HttpTunnelController {
             "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
     );
 
+    private final DirectHttpDispatcher dispatcher;
     private final TrafficUsageService trafficUsageService;
     private final long timeoutMillis;
     private final int maxRequestBodySize;
 
-    public HttpTunnelController(TrafficUsageService trafficUsageService,
+    public HttpTunnelController(DirectHttpDispatcher dispatcher,
+                                TrafficUsageService trafficUsageService,
                                 @Value("${tunnel.http.timeout-ms:30000}") long timeoutMillis,
                                 @Value("${tunnel.http.max-request-body-size:16777216}") int maxRequestBodySize) {
+        this.dispatcher = dispatcher;
         this.trafficUsageService = trafficUsageService;
         this.timeoutMillis = timeoutMillis;
         this.maxRequestBodySize = maxRequestBodySize;
@@ -69,7 +71,7 @@ public class HttpTunnelController {
         packet.setBody(requestBody);
 
         try {
-            DirectHttpResponsePacket response = DirectHttpFutureManager.forward(clientName, packet, timeoutMillis);
+            DirectHttpResponsePacket response = dispatcher.forward(clientName, packet, timeoutMillis);
             trafficUsageService.recordUpload(clientName, requestBody.length);
             byte[] responseBody = response.getBody() == null ? new byte[0] : response.getBody();
             trafficUsageService.recordDownload(clientName, responseBody.length);

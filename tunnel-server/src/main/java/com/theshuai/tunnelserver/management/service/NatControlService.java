@@ -3,7 +3,7 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.util.JsonUtil;
-import com.theshuai.common.util.SessionUtil;
+import com.theshuai.tunnelserver.session.SessionUtil;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.TunnelMapping;
 import com.theshuai.tunnelserver.management.model.TunnelMappingView;

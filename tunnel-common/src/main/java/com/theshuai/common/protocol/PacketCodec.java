@@ -10,8 +10,6 @@ import com.theshuai.common.util.JsonUtil;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -73,36 +71,37 @@ public class PacketCodec {
     }
 
     public void encode(ByteBuf byteBuf, Packet packet, Serializer serializer) throws Exception {
-        byte[] bytes = null;
         // NAT metadata keeps its existing JSON format because its body has a custom layout.
         Serializer bodySerializer = Command.NAT_MESSAGE.equals(packet.getCommand()) ? Serializer.FASTJSON : serializer;
-        // 实际编码过程
         byteBuf.writeInt(MAGIC_NUMBER);
         byteBuf.writeByte(packet.getVersion());
         byteBuf.writeByte(bodySerializer.getSerializerAlgorithm());
         byteBuf.writeByte(packet.getCommand());
 
         if (Command.NAT_MESSAGE.equals(packet.getCommand())) {
+            // 直写 ByteBuf 路径：先占 4 字节长度位，写完 body 后回填，避开 ByteArrayOutputStream 中转拷贝。
+            // NAT 数据帧是热路径，每个公网入站字节包都过这里。
             NatMessagePacket natMessagePacket = (NatMessagePacket) packet;
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            DataOutputStream dataOutputStream = new DataOutputStream(baos);
-            dataOutputStream.writeInt(natMessagePacket.getNatMessageType().getCode());
+            int lengthIndex = byteBuf.writerIndex();
+            byteBuf.writeInt(0);
+            int bodyStart = byteBuf.writerIndex();
+
+            byteBuf.writeInt(natMessagePacket.getNatMessageType().getCode());
 
             byte[] metaDataBytes = Serializer.FASTJSON.serialize(natMessagePacket.getMetaData());
-            dataOutputStream.writeInt(metaDataBytes.length);
-            dataOutputStream.write(metaDataBytes);
+            byteBuf.writeInt(metaDataBytes.length);
+            byteBuf.writeBytes(metaDataBytes);
 
             if (natMessagePacket.getData() != null && natMessagePacket.getData().length > 0) {
-                dataOutputStream.write(CompactBinarySerializer.encodePayload(natMessagePacket.getData()));
+                byteBuf.writeBytes(CompactBinarySerializer.encodePayload(natMessagePacket.getData()));
             }
-            bytes = baos.toByteArray();
+
+            byteBuf.setInt(lengthIndex, byteBuf.writerIndex() - bodyStart);
         } else {
-            bytes = bodySerializer.serialize(packet);
+            byte[] bytes = bodySerializer.serialize(packet);
+            byteBuf.writeInt(bytes.length);
+            byteBuf.writeBytes(bytes);
         }
-
-
-        byteBuf.writeInt(bytes.length);
-        byteBuf.writeBytes(bytes);
     }
 
     public Packet decode(ByteBuf byteBuf) throws Exception {

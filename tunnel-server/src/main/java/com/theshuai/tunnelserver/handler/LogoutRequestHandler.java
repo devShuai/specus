@@ -1,8 +1,8 @@
-package com.theshuai.common.handler;
+package com.theshuai.tunnelserver.handler;
 
 import com.theshuai.common.protocol.Packet;
 import com.theshuai.common.protocol.response.LogoutResponsePacket;
-import com.theshuai.common.util.SessionUtil;
+import com.theshuai.tunnelserver.session.SessionUtil;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -12,7 +12,6 @@ public class LogoutRequestHandler extends SimpleChannelInboundHandler<Packet> {
     public static final LogoutRequestHandler INSTANCE = new LogoutRequestHandler();
 
     private LogoutRequestHandler() {
-
     }
 
     @Override

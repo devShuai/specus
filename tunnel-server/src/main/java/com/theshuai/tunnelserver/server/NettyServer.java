@@ -3,7 +3,11 @@ package com.theshuai.tunnelserver.server;
 
 import com.theshuai.common.codec.PacketCodecHandler;
 import com.theshuai.common.codec.Spliter;
-import com.theshuai.common.handler.*;
+import com.theshuai.common.handler.HeartbeatRequestHandler;
+import com.theshuai.common.handler.SocketIdleStateHandler;
+import com.theshuai.tunnelserver.handler.AuthHandler;
+import com.theshuai.tunnelserver.handler.LogoutRequestHandler;
+import com.theshuai.tunnelserver.handler.ServerMessageHandler;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
 import com.theshuai.tunnelserver.handler.ManagedLoginRequestHandler;
 import com.theshuai.tunnelserver.handler.NatServerHandler;
@@ -39,6 +43,7 @@ public class NettyServer implements ApplicationRunner {
     private final TrafficUsageService trafficUsageService;
     private final RemotePortServerManager remotePortServerManager;
     private final TlsProperties tlsProperties;
+    private final com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel channel;
@@ -47,12 +52,14 @@ public class NettyServer implements ApplicationRunner {
                        ManagedLoginRequestHandler managedLoginRequestHandler,
                        TrafficUsageService trafficUsageService,
                        RemotePortServerManager remotePortServerManager,
-                       TlsProperties tlsProperties) {
+                       TlsProperties tlsProperties,
+                       com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler) {
         this.nettyProperties = nettyProperties;
         this.managedLoginRequestHandler = managedLoginRequestHandler;
         this.trafficUsageService = trafficUsageService;
         this.remotePortServerManager = remotePortServerManager;
         this.tlsProperties = tlsProperties;
+        this.directHttpResponseHandler = directHttpResponseHandler;
     }
 
     @Override
@@ -111,8 +118,7 @@ public class NettyServer implements ApplicationRunner {
                                 remotePortServerManager,
                                 nettyProperties
                         ));
-                        ch.pipeline().addLast(CustomHttpResponseHandler.INSTANCE);
-                        ch.pipeline().addLast(DirectHttpResponseHandler.INSTANCE);
+                        ch.pipeline().addLast(directHttpResponseHandler);
                         ch.pipeline().addLast(ServerMessageHandler.INSTANCE);
                         ch.pipeline().addLast(LogoutRequestHandler.INSTANCE);
                     }

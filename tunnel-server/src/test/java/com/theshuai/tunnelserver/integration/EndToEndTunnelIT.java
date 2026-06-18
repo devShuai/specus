@@ -6,7 +6,7 @@ import com.theshuai.tunnelclient.client.NettyClient;
 import com.theshuai.tunnelserver.TunnelServerApplication;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
-import com.theshuai.tunnelserver.management.service.ClientManagementService;
+import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import com.theshuai.tunnelserver.server.NettyServer;
 import org.junit.jupiter.api.AfterAll;
@@ -70,7 +70,7 @@ class EndToEndTunnelIT {
     private static final String CLIENT_PASSWORD = "e2e-secret";
     private static final int TUNNEL_LISTEN_PORT = 19_000;
 
-    @Autowired private ClientManagementService clientManagementService;
+    @Autowired private ClientAccountService clientAccountService;
     @Autowired private NatControlService natControlService;
     @Autowired private NettyServer nettyServer;
     @Autowired private ConnectionRecordRepository connectionRecordRepository;
@@ -116,7 +116,7 @@ class EndToEndTunnelIT {
                 .as("Netty server should have bound a real port")
                 .isGreaterThan(0);
 
-        clientManagementService.createClient(new ClientManagementService.ClientMutation(
+        clientAccountService.createClient(new ClientAccountService.ClientMutation(
                 CLIENT_NAME, CLIENT_PASSWORD, true, 0
         ));
         Long clientId = clientAccountRepository.findByClientName(CLIENT_NAME)

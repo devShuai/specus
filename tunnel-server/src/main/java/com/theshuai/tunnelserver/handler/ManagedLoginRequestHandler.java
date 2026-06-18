@@ -3,9 +3,10 @@ package com.theshuai.tunnelserver.handler;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.response.LoginResponsePacket;
 import com.theshuai.common.session.Session;
-import com.theshuai.common.util.SessionUtil;
-import com.theshuai.tunnelserver.management.service.ClientManagementService;
-import com.theshuai.tunnelserver.management.service.ClientManagementService.AuthenticationResult;
+import com.theshuai.tunnelserver.session.SessionUtil;
+import com.theshuai.tunnelserver.management.service.AuthenticationResult;
+import com.theshuai.tunnelserver.management.service.ClientAccountService;
+import com.theshuai.tunnelserver.management.service.ConnectionRecordService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -24,14 +25,17 @@ import java.util.concurrent.RejectedExecutionException;
 public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<LoginRequestPacket> {
     private static final AttributeKey<Long> CONNECTION_RECORD_ID = AttributeKey.valueOf("connectionRecordId");
 
-    private final ClientManagementService clientManagementService;
+    private final ClientAccountService clientAccountService;
+    private final ConnectionRecordService connectionRecordService;
     private final NatControlService natControlService;
     private final ExecutorService loginExecutor;
 
-    public ManagedLoginRequestHandler(ClientManagementService clientManagementService,
+    public ManagedLoginRequestHandler(ClientAccountService clientAccountService,
+                                      ConnectionRecordService connectionRecordService,
                                       NatControlService natControlService,
                                       @Qualifier("loginExecutor") ExecutorService loginExecutor) {
-        this.clientManagementService = clientManagementService;
+        this.clientAccountService = clientAccountService;
+        this.connectionRecordService = connectionRecordService;
         this.natControlService = natControlService;
         this.loginExecutor = loginExecutor;
     }
@@ -52,8 +56,8 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
 
     private void handleLogin(ChannelHandlerContext ctx, LoginRequestPacket packet) {
         try {
-            AuthenticationResult authentication = clientManagementService.authenticate(packet);
-            long connectionRecordId = clientManagementService.recordConnection(
+            AuthenticationResult authentication = clientAccountService.authenticate(packet);
+            long connectionRecordId = connectionRecordService.recordConnection(
                     authentication,
                     packet,
                     ctx.channel().id().asLongText(),
@@ -71,7 +75,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             ctx.channel().eventLoop().execute(() -> {
                 if (authentication.success()) {
                     ctx.channel().attr(CONNECTION_RECORD_ID).set(connectionRecordId);
-                    ctx.channel().attr(com.theshuai.common.attribute.Attributes.LOGIN_TIME_MS).set(System.currentTimeMillis());
+                    ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.LOGIN_TIME_MS).set(System.currentTimeMillis());
                     SessionUtil.bindSession(new Session(packet.getClientName()), ctx.channel());
                 }
                 io.netty.channel.ChannelFuture writeFuture = ctx.writeAndFlush(response);
@@ -95,7 +99,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
         Long connectionRecordId = ctx.channel().attr(CONNECTION_RECORD_ID).getAndSet(null);
         if (connectionRecordId != null) {
             long recordId = connectionRecordId;
-            submit(() -> clientManagementService.recordDisconnect(recordId));
+            submit(() -> connectionRecordService.recordDisconnect(recordId));
         }
         SessionUtil.unBindSession(ctx.channel());
         super.channelInactive(ctx);

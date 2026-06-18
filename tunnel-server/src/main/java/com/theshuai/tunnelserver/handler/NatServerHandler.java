@@ -5,7 +5,7 @@ import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.session.Session;
-import com.theshuai.common.util.SessionUtil;
+import com.theshuai.tunnelserver.session.SessionUtil;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.server.RemotePortServerManager;

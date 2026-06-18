@@ -6,6 +6,8 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
+import lombok.Getter;
+import lombok.Setter;
 
 @Entity
 @Table(name = "tunnel_mapping",
@@ -14,6 +16,8 @@ import jakarta.persistence.UniqueConstraint;
                 columnNames = "listen_port"
         ),
         indexes = @Index(name = "idx_tunnel_mapping_client", columnList = "client_id"))
+@Getter
+@Setter
 public class TunnelMapping {
     @Id
     private Long id;
@@ -41,76 +45,4 @@ public class TunnelMapping {
 
     @Column(name = "updated_at", nullable = false, length = 40)
     private String updatedAt;
-
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
-
-    public Long getClientId() {
-        return clientId;
-    }
-
-    public void setClientId(Long clientId) {
-        this.clientId = clientId;
-    }
-
-    public String getClientName() {
-        return clientName;
-    }
-
-    public void setClientName(String clientName) {
-        this.clientName = clientName;
-    }
-
-    public int getListenPort() {
-        return listenPort;
-    }
-
-    public void setListenPort(int listenPort) {
-        this.listenPort = listenPort;
-    }
-
-    public String getTargetAddress() {
-        return targetAddress;
-    }
-
-    public void setTargetAddress(String targetAddress) {
-        this.targetAddress = targetAddress;
-    }
-
-    public int getTargetPort() {
-        return targetPort;
-    }
-
-    public void setTargetPort(int targetPort) {
-        this.targetPort = targetPort;
-    }
-
-    public boolean isEnabled() {
-        return enabled;
-    }
-
-    public void setEnabled(boolean enabled) {
-        this.enabled = enabled;
-    }
-
-    public String getCreatedAt() {
-        return createdAt;
-    }
-
-    public void setCreatedAt(String createdAt) {
-        this.createdAt = createdAt;
-    }
-
-    public String getUpdatedAt() {
-        return updatedAt;
-    }
-
-    public void setUpdatedAt(String updatedAt) {
-        this.updatedAt = updatedAt;
-    }
 }

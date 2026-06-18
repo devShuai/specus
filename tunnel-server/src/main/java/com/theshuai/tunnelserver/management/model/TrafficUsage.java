@@ -8,6 +8,8 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
+import lombok.Getter;
+import lombok.Setter;
 
 @Entity
 @Table(name = "tunnel_traffic_usage",
@@ -16,6 +18,8 @@ import jakarta.persistence.UniqueConstraint;
                 columnNames = {"client_id", "usage_date"}
         ),
         indexes = @Index(name = "idx_tunnel_traffic_client", columnList = "client_id"))
+@Getter
+@Setter
 public class TrafficUsage {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -38,56 +42,4 @@ public class TrafficUsage {
 
     @Column(name = "updated_at", nullable = false, length = 40)
     private String updatedAt;
-
-    public Long getId() {
-        return id;
-    }
-
-    public Long getClientId() {
-        return clientId;
-    }
-
-    public void setClientId(Long clientId) {
-        this.clientId = clientId;
-    }
-
-    public String getClientName() {
-        return clientName;
-    }
-
-    public void setClientName(String clientName) {
-        this.clientName = clientName;
-    }
-
-    public String getUsageDate() {
-        return usageDate;
-    }
-
-    public void setUsageDate(String usageDate) {
-        this.usageDate = usageDate;
-    }
-
-    public long getUploadBytes() {
-        return uploadBytes;
-    }
-
-    public void setUploadBytes(long uploadBytes) {
-        this.uploadBytes = uploadBytes;
-    }
-
-    public long getDownloadBytes() {
-        return downloadBytes;
-    }
-
-    public void setDownloadBytes(long downloadBytes) {
-        this.downloadBytes = downloadBytes;
-    }
-
-    public String getUpdatedAt() {
-        return updatedAt;
-    }
-
-    public void setUpdatedAt(String updatedAt) {
-        this.updatedAt = updatedAt;
-    }
 }
