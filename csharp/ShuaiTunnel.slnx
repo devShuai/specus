@@ -1,8 +1,11 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/ShuaiTunnel.Protocol/ShuaiTunnel.Protocol.csproj" />
+    <Project Path="src/ShuaiTunnel.Server.Data/ShuaiTunnel.Server.Data.csproj" />
+    <Project Path="src/ShuaiTunnel.Server/ShuaiTunnel.Server.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/ShuaiTunnel.IntegrationTests/ShuaiTunnel.IntegrationTests.csproj" />
     <Project Path="tests/ShuaiTunnel.Protocol.Tests/ShuaiTunnel.Protocol.Tests.csproj" />
   </Folder>
 </Solution>
