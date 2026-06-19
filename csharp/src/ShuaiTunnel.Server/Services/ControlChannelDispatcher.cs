@@ -4,6 +4,7 @@ using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.Nat;
 using ShuaiTunnel.Server.Sessions;
 
 namespace ShuaiTunnel.Server.Services;
@@ -23,14 +24,16 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
     private readonly IServiceProvider _services;
     private readonly LoginExecutor _loginExecutor;
     private readonly SessionRegistry _sessions;
+    private readonly NatServerHandler _nat;
     private readonly ILogger<ControlChannelDispatcher> _logger;
 
     public ControlChannelDispatcher(IServiceProvider services, LoginExecutor loginExecutor,
-        SessionRegistry sessions, ILogger<ControlChannelDispatcher> logger)
+        SessionRegistry sessions, NatServerHandler nat, ILogger<ControlChannelDispatcher> logger)
     {
         _services = services;
         _loginExecutor = loginExecutor;
         _sessions = sessions;
+        _nat = nat;
         _logger = logger;
     }
 
@@ -57,7 +60,7 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         switch (packet)
         {
             case LoginRequestPacket login:
-                HandleLogin(context, login);
+                await HandleLoginAsync(context, login).ConfigureAwait(false);
                 return;
             case HeartbeatRequestPacket:
                 // Java's HeartbeatRequestHandler — answer with a fresh response packet. The
@@ -68,8 +71,11 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             case LogoutRequestPacket:
                 HandleLogout(context);
                 return;
+            case NatMessagePacket nat:
+                await _nat.HandleAsync(context, nat).ConfigureAwait(false);
+                return;
             default:
-                // Phase 3+ packets (NAT_MESSAGE, DIRECT_HTTP_*, MESSAGE_*) — known on the wire
+                // Phase 4+ packets (DIRECT_HTTP_*, MESSAGE_*) — known on the wire
                 // but not yet wired up. Logging at debug avoids alarming nooses on benign
                 // forward-compat client builds.
                 _logger.LogDebug("[{ChannelId}] dropped unhandled packet: {Cmd}",
@@ -80,6 +86,8 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
 
     public async Task OnConnectionClosedAsync(TunnelConnectionContext context)
     {
+        await _nat.OnConnectionClosedAsync(context).ConfigureAwait(false);
+
         if (context.ClientName is { } name)
         {
             _sessions.Unbind(name, context);
@@ -106,17 +114,14 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         }
     }
 
-    private void HandleLogin(TunnelConnectionContext context, LoginRequestPacket packet)
+    private async Task HandleLoginAsync(TunnelConnectionContext context, LoginRequestPacket packet)
     {
         if (!_loginExecutor.TryEnqueue(() => ProcessLoginAsync(context, packet)))
         {
             _logger.LogWarning("[{ChannelId}] login executor full — rejecting client={ClientName}",
                 context.ChannelId, packet.ClientName);
             context.MarkDisconnectIfAbsent(DisconnectReason.ServerBusy);
-            // Best effort: send the busy response, then close. We fire-and-forget because the
-            // read loop is about to exit through the throw below.
-            _ = SendThenCloseAsync(context, busyResponse(packet));
-            throw new InvalidOperationException("login rejected, server busy");
+            await SendThenCloseAsync(context, busyResponse(packet)).ConfigureAwait(false);
         }
 
         static LoginResponsePacket busyResponse(LoginRequestPacket request) => new()
@@ -195,6 +200,23 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             // takes its place. Mirrors Java's <c>SessionUtil.bindSession</c>.
             var displaced = _sessions.Replace(packet.ClientName!, context);
             displaced?.CloseAsync();
+
+            try
+            {
+                var natControl = scope.ServiceProvider.GetRequiredService<NatControlService>();
+                await natControl.PushOnLoginAsync(packet.ClientName!, context.Lifetime)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[{ChannelId}] NAT_CONTROL push failed", context.ChannelId);
+                context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
+                context.CloseAsync();
+            }
         }
         else
         {

@@ -112,7 +112,7 @@ public sealed class ControlChannelListener : IHostedService
             var connection = new TunnelConnection(
                 socket, _dispatcher,
                 _loggerFactory.CreateLogger<TunnelConnection>(),
-                _options.Value.MaxFrameSize,
+                _options.Value,
                 token);
 
             // Fire-and-forget — the connection handles its own lifecycle and disposal. The

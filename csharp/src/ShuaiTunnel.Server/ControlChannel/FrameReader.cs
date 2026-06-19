@@ -1,6 +1,6 @@
+using System.IO.Pipelines;
 using System.Buffers;
 using System.Buffers.Binary;
-using System.IO.Pipelines;
 using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
 

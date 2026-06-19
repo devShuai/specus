@@ -4,7 +4,9 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
+using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.Networking;
 
 namespace ShuaiTunnel.Server.ControlChannel;
 
@@ -16,7 +18,9 @@ namespace ShuaiTunnel.Server.ControlChannel;
 /// awaits <see cref="RunAsync"/>.</item>
 /// <item>Read loop pulls packets via <see cref="FrameReader"/> and dispatches through
 /// <see cref="IControlChannelDispatcher"/>. An idle watchdog runs in parallel and stamps
-/// <c>IDLE_TIMEOUT</c> after 60s with no read or sends a heartbeat after 30s of write quiet.</item>
+/// <c>IDLE_TIMEOUT</c> after 60s with no read or sends a heartbeat after 30s of write quiet.
+/// Reads honor <see cref="TunnelConnectionContext.ReadGate"/> — when the downstream sink is
+/// over capacity, the loop suspends <c>ReadAsync</c> calls until something Resumes.</item>
 /// <item>Any error or peer FIN drains the loop → calls <see cref="IControlChannelDispatcher.OnConnectionClosed"/>
 /// once → disposes the socket.</item>
 /// </list>
@@ -46,20 +50,26 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
     public TunnelConnectionContext Context { get; }
 
     public TunnelConnection(Socket socket, IControlChannelDispatcher dispatcher,
-        ILogger logger, int maxFrameSize, CancellationToken hostStopping)
+        ILogger logger, NettyServerOptions options, CancellationToken hostStopping)
     {
         _socket = socket;
         _stream = new NetworkStream(socket, ownsSocket: false);
         _reader = PipeReader.Create(_stream);
         _dispatcher = dispatcher;
         _logger = logger;
-        _maxFrameSize = maxFrameSize;
+        _maxFrameSize = options.MaxFrameSize;
         _lifetimeCts = CancellationTokenSource.CreateLinkedTokenSource(hostStopping);
 
         var channelId = Guid.NewGuid().ToString("N");
         var remote = socket.RemoteEndPoint?.ToString();
+
+        var readGate = new ReadGate(_lifetimeCts.Token);
+        var writeBackpressure = new WriteBackpressureGate(
+            options.WriteBufferLowWaterMark, options.WriteBufferHighWaterMark);
         Context = new TunnelConnectionContext(channelId, remote, this, _lifetimeCts.Token,
-            closeCallback: () => _lifetimeCts.Cancel());
+            closeCallback: () => _lifetimeCts.Cancel(),
+            readGate: readGate,
+            writeBackpressure: writeBackpressure);
 
         var now = Environment.TickCount64;
         _lastReadTicks = now;
@@ -76,6 +86,15 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
 
             while (!_lifetimeCts.IsCancellationRequested)
             {
+                try
+                {
+                    await Context.ReadGate.WaitIfPausedAsync(_lifetimeCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+                {
+                    break;
+                }
+
                 Packet? packet;
                 try
                 {
@@ -187,18 +206,25 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
     public async ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
     {
         var bytes = PacketCodec.Encode(packet);
+        var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
+        var lockTaken = false;
         // Synchronize per-connection — multiple producers (read loop + idle timer + dispatcher
         // callbacks) can race here. The encode is cheap so we hold the lock through it too.
-        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            lockTaken = true;
             await _stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
             await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             Volatile.Write(ref _lastWriteTicks, Environment.TickCount64);
         }
         finally
         {
-            _writeLock.Release();
+            if (lockTaken)
+            {
+                _writeLock.Release();
+            }
+            Context.WriteBackpressure.ReleasePending(trackedBytes);
         }
     }
 

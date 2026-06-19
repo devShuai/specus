@@ -2,8 +2,8 @@ namespace ShuaiTunnel.Server.Configuration;
 
 /// <summary>
 /// Mirrors a strict subset of <c>tunnel.netty.*</c> from the Java <c>NettyServerProperties</c>.
-/// Phase 2 only needs <see cref="Port"/> and <see cref="MaxFrameSize"/> — the per-tunnel listener,
-/// backpressure thresholds, and connection caps land in Phase 3.
+/// Phase 2 only needs <see cref="Port"/> and <see cref="MaxFrameSize"/>. Phase 3 adds per-tunnel
+/// listeners, write-buffer watermarks, and connection caps.
 /// </summary>
 public sealed class NettyServerOptions
 {
@@ -17,6 +17,16 @@ public sealed class NettyServerOptions
     /// peer.
     /// </summary>
     public int MaxFrameSize { get; set; } = 32 * 1024 * 1024;
+
+    public int WriteBufferLowWaterMark { get; set; } = 32 * 1024;
+
+    public int WriteBufferHighWaterMark { get; set; } = 64 * 1024;
+
+    public int MaxExternalConnections { get; set; } = 10_000;
+
+    public int MaxExternalConnectionsPerClient { get; set; } = 10_000;
+
+    public int MaxExternalConnectionsPerPort { get; set; } = 10_000;
 }
 
 /// <summary>Login pipeline thresholds. The defaults mirror Java's bounded executor.</summary>
@@ -34,4 +44,18 @@ public sealed class DatabaseOptions
     public const string SectionName = "Tunnel:Database";
 
     public bool SeedDemoClient { get; set; } = true;
+}
+
+public sealed class TunnelOptions
+{
+    public const string SectionName = "Tunnel";
+
+    public string? PublicAddress { get; set; }
+}
+
+public sealed class TrafficOptions
+{
+    public const string SectionName = "Tunnel:Traffic";
+
+    public int FlushIntervalMs { get; set; } = 5_000;
 }

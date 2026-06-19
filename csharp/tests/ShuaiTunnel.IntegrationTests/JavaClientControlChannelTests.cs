@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -6,9 +7,12 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data;
+using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Hosting;
+using ShuaiTunnel.Server.Nat;
 
 namespace ShuaiTunnel.IntegrationTests;
 
@@ -23,12 +27,12 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
     private static readonly string RepoRoot = LocateRepoRoot();
     private static readonly string ClientJar = Path.Combine(RepoRoot,
         "tunnel-client", "target", "tunnel-client-0.0.1-SNAPSHOT-exec.jar");
-    private static readonly string Java21Home =
-        "/Users/shaoshuai/Library/Java/JavaVirtualMachines/temurin-21.0.10/Contents/Home";
 
     private TestServerFixture? _server;
     private string? _clientWorkDir;
     private Process? _clientProcess;
+    private string? _javaExecutable;
+    private string? _javaHome;
 
     public async Task InitializeAsync()
     {
@@ -37,8 +41,15 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         // .NET tests so this branch only triggers in local dev where someone forgot.
         if (!File.Exists(ClientJar))
         {
-            throw new SkipException(
+            throw Xunit.Sdk.SkipException.ForSkip(
                 $"client jar missing at {ClientJar}; run `mvn -pl tunnel-client -am package -DskipTests`");
+        }
+
+        (_javaExecutable, _javaHome) = ResolveJava();
+        if (_javaExecutable is null)
+        {
+            throw Xunit.Sdk.SkipException.ForSkip(
+                "java executable not found; set JAVA_HOME or put java on PATH");
         }
 
         _server = await TestServerFixture.StartAsync();
@@ -113,18 +124,46 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         Assert.NotNull(closed.DisconnectReason);
     }
 
+    [Fact(Timeout = 120_000)]
+    public async Task JavaClient_RegistersTcpTunnelAndEchoesTraffic()
+    {
+        Assert.NotNull(_server);
+        Assert.NotNull(_clientWorkDir);
+
+        await using var echo = await EchoServer.StartAsync();
+        var remotePort = GetFreeTcpPort();
+        await SeedTunnelMappingAsync(remotePort, echo.Port);
+
+        _clientProcess = StartClient();
+
+        var record = await WaitForRecordAsync(success: true, TimeSpan.FromSeconds(30));
+        Assert.True(record.Success);
+
+        var payload = Encoding.UTF8.GetBytes("phase3-echo-through-java-client");
+        var echoed = await SendAndReceiveAsync(remotePort, payload, TimeSpan.FromSeconds(30));
+        Assert.Equal(payload, echoed);
+        await FlushTrafficAndAssertAsync(payload.Length);
+    }
+
     private Process StartClient()
     {
         var psi = new ProcessStartInfo
         {
-            FileName = Path.Combine(Java21Home, "bin", "java"),
+            FileName = _javaExecutable!,
             WorkingDirectory = _clientWorkDir!,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        psi.Environment["JAVA_HOME"] = Java21Home;
+        if (_javaHome is not null)
+        {
+            psi.Environment["JAVA_HOME"] = _javaHome;
+        }
         psi.ArgumentList.Add("-Dlogging.level.com.theshuai=info");
+        // The Java tunnel-client embeds a Spring Boot Tomcat fixed at 8087. Two integration
+        // tests running in parallel both try to bind that port and the loser dies with
+        // "APPLICATION FAILED TO START". Pin to ephemeral so any number of jars coexist.
+        psi.ArgumentList.Add("-Dserver.port=0");
         psi.ArgumentList.Add("-jar");
         psi.ArgumentList.Add(ClientJar);
 
@@ -185,6 +224,92 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
                 row.DisconnectedAt, row.DisconnectReason);
     }
 
+    private async Task SeedTunnelMappingAsync(int listenPort, int targetPort)
+    {
+        using var scope = _server!.HostServices.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<TunnelDbContext>();
+        var account = await db.ClientAccounts.SingleAsync(a => a.ClientName == DatabaseInitializer.DemoClientName);
+        var now = DateTimeOffset.UtcNow;
+        db.TunnelMappings.Add(new TunnelMapping
+        {
+            Id = ClientIdGenerator.NewId(),
+            ClientId = account.Id,
+            ClientName = account.ClientName,
+            ListenPort = listenPort,
+            TargetAddress = "127.0.0.1",
+            TargetPort = targetPort,
+            Enabled = true,
+            CreatedAt = now,
+            UpdatedAt = now,
+        });
+        await db.SaveChangesAsync();
+    }
+
+    private async Task FlushTrafficAndAssertAsync(int minimumBytes)
+    {
+        using var scope = _server!.HostServices.CreateScope();
+        var traffic = scope.ServiceProvider.GetRequiredService<TrafficUsageService>();
+        await traffic.FlushAsync(CancellationToken.None);
+
+        var db = scope.ServiceProvider.GetRequiredService<TunnelDbContext>();
+        var row = await db.TrafficUsages.AsNoTracking().SingleOrDefaultAsync();
+        Assert.NotNull(row);
+        Assert.True(row!.UploadBytes >= minimumBytes);
+        Assert.True(row.DownloadBytes >= minimumBytes);
+    }
+
+    private static int GetFreeTcpPort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            return ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static async Task<byte[]> SendAndReceiveAsync(int port, byte[] payload, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        Exception? lastError = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var client = new TcpClient();
+                using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await client.ConnectAsync(IPAddress.Loopback, port, connectCts.Token);
+                using var stream = client.GetStream();
+                await stream.WriteAsync(payload);
+                await stream.FlushAsync();
+
+                var response = new byte[payload.Length];
+                var offset = 0;
+                using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                while (offset < response.Length)
+                {
+                    var read = await stream.ReadAsync(response.AsMemory(offset), readCts.Token);
+                    if (read == 0)
+                    {
+                        throw new IOException("remote tunnel closed before echo completed");
+                    }
+                    offset += read;
+                }
+                return response;
+            }
+            catch (Exception ex) when (ex is SocketException or IOException or OperationCanceledException)
+            {
+                lastError = ex;
+                await Task.Delay(250);
+            }
+        }
+        throw new TimeoutException($"remote tunnel on port {port} did not echo within {timeout}", lastError);
+    }
+
     private static string LocateRepoRoot()
     {
         var dir = AppContext.BaseDirectory;
@@ -199,15 +324,104 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         throw new InvalidOperationException("could not locate repo root from " + AppContext.BaseDirectory);
     }
 
+    private static (string? Executable, string? JavaHome) ResolveJava()
+    {
+        var command = OperatingSystem.IsWindows() ? "java.exe" : "java";
+        var javaHome = Environment.GetEnvironmentVariable("JAVA_HOME");
+        if (!string.IsNullOrWhiteSpace(javaHome))
+        {
+            var candidate = Path.Combine(javaHome, "bin", command);
+            if (File.Exists(candidate))
+            {
+                return (candidate, javaHome);
+            }
+        }
+
+        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        foreach (var entry in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(entry, command);
+            if (File.Exists(candidate))
+            {
+                return (candidate, null);
+            }
+        }
+
+        return (null, null);
+    }
+
     private sealed record ConnectionRecordView(long Id, string ClientName, bool Success,
         DateTimeOffset? DisconnectedAt, string? DisconnectReason);
-}
 
-/// <summary>
-/// Minimal "skip this fact" exception. xUnit v2 reports the test as Skipped when this is
-/// thrown — handier than annotating with a Trait + filter at the runner level.
-/// </summary>
-internal sealed class SkipException : Exception
-{
-    public SkipException(string reason) : base(reason) { }
+    private sealed class EchoServer : IAsyncDisposable
+    {
+        private readonly TcpListener _listener;
+        private readonly CancellationTokenSource _shutdown = new();
+        private readonly Task _acceptLoop;
+
+        private EchoServer(TcpListener listener)
+        {
+            _listener = listener;
+            Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+            _acceptLoop = Task.Run(AcceptLoopAsync);
+        }
+
+        public int Port { get; }
+
+        public static Task<EchoServer> StartAsync()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            return Task.FromResult(new EchoServer(listener));
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _shutdown.Cancel();
+            try { _listener.Stop(); } catch { /* already stopped */ }
+            try { await _acceptLoop; } catch { /* shutdown path */ }
+            _shutdown.Dispose();
+        }
+
+        private async Task AcceptLoopAsync()
+        {
+            while (!_shutdown.IsCancellationRequested)
+            {
+                TcpClient client;
+                try
+                {
+                    client = await _listener.AcceptTcpClientAsync(_shutdown.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+
+                _ = Task.Run(() => EchoAsync(client, _shutdown.Token));
+            }
+        }
+
+        private static async Task EchoAsync(TcpClient client, CancellationToken cancellationToken)
+        {
+            using (client)
+            {
+                using var stream = client.GetStream();
+                var buffer = new byte[8192];
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var read = await stream.ReadAsync(buffer, cancellationToken);
+                    if (read == 0)
+                    {
+                        return;
+                    }
+                    await stream.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    await stream.FlushAsync(cancellationToken);
+                }
+            }
+        }
+    }
 }

@@ -29,7 +29,9 @@ public sealed class LoginExecutor : BackgroundService
         _logger = logger;
         _queue = Channel.CreateBounded<Func<Task>>(new BoundedChannelOptions(_options.ExecutorQueueCapacity)
         {
-            FullMode = BoundedChannelFullMode.DropWrite,
+            // TryEnqueue relies on TryWrite returning false when the queue is full so the
+            // caller can send SERVER_BUSY. DropWrite would silently discard the login task.
+            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = false,
             SingleWriter = false,
         });

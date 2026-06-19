@@ -5,6 +5,9 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data;
+using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.Hosting;
+using ShuaiTunnel.Server.Nat;
 
 namespace ShuaiTunnel.IntegrationTests;
 
@@ -12,7 +15,8 @@ namespace ShuaiTunnel.IntegrationTests;
 /// Boots the C# server in-process for an integration test. Hands out:
 /// <list type="bullet">
 /// <item><see cref="ControlPort"/> — the kernel-assigned control TCP port (we ask for 0).</item>
-/// <item><see cref="Services"/> — the DI root so tests can read the live <see cref="TunnelDbContext"/>.</item>
+/// <item><see cref="HostServices"/> — the DI root so tests can read the live <see cref="TunnelDbContext"/>
+/// and pull <see cref="TrafficUsageService"/>.</item>
 /// </list>
 ///
 /// <para>The fixture wires Kestrel to a random http port too (0), so multiple parallel test
@@ -46,6 +50,66 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
             throw new InvalidOperationException("control listener never bound");
         }
         return fixture;
+    }
+
+    /// <summary>
+    /// Inserts a <see cref="TunnelMapping"/> row tied to the seeded Demo client. Tests use this
+    /// to make the Java client's REGISTER succeed — the client registers whatever is in its
+    /// <c>tunnelConfigList</c>, and the server binds a listener on that port, pointing at the
+    /// given <paramref name="tunnelAddress"/>:<paramref name="tunnelPort"/>.
+    /// </summary>
+    public async Task<long> SeedTunnelMappingAsync(int listenPort, string tunnelAddress, int tunnelPort,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TunnelDbContext>();
+
+        var demoAccount = await db.ClientAccounts.AsNoTracking()
+            .FirstAsync(c => c.ClientName == DatabaseInitializer.DemoClientName, cancellationToken);
+        var now = DateTimeOffset.UtcNow;
+        var existing = await db.TunnelMappings.AsNoTracking()
+            .FirstOrDefaultAsync(m => m.ListenPort == listenPort, cancellationToken);
+        if (existing is not null)
+        {
+            db.TunnelMappings.Remove(existing);
+        }
+        var mapping = new TunnelMapping
+        {
+            Id = ShuaiTunnel.Server.Authentication.ClientIdGenerator.NewId(),
+            ClientId = demoAccount.Id,
+            ClientName = demoAccount.ClientName,
+            ListenPort = listenPort,
+            TargetAddress = tunnelAddress,
+            TargetPort = tunnelPort,
+            Enabled = true,
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        db.TunnelMappings.Add(mapping);
+        await db.SaveChangesAsync(cancellationToken);
+        return mapping.Id;
+    }
+
+    /// <summary>
+    /// Force-flushes the traffic counter buckets so a test can observe upload/download bytes
+    /// without waiting for the 5-second background flush.
+    /// </summary>
+    public async Task FlushTrafficAsync(CancellationToken cancellationToken = default)
+    {
+        var service = HostServices.GetRequiredService<TrafficUsageService>();
+        await service.FlushAsync(cancellationToken);
+    }
+
+    /// <summary>Read current upload/download byte totals for a client name.</summary>
+    public async Task<(long Upload, long Download)> ReadTrafficTotalsAsync(string clientName,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = HostServices.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TunnelDbContext>();
+        var rows = await db.TrafficUsages.AsNoTracking()
+            .Where(t => t.ClientName == clientName)
+            .ToListAsync(cancellationToken);
+        return (rows.Sum(r => r.UploadBytes), rows.Sum(r => r.DownloadBytes));
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)

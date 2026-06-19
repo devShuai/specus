@@ -1,4 +1,5 @@
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.Networking;
 
 namespace ShuaiTunnel.Server.ControlChannel;
 
@@ -33,6 +34,18 @@ public sealed class TunnelConnectionContext
     /// Equivalent to Java's <c>ChannelFutureListener.CLOSE</c>.</summary>
     public Action CloseAsync { get; }
 
+    /// <summary>
+    /// Backpressure for inbound frames. NAT consumers flip this when the downstream sink can't
+    /// keep up, matching Java's <c>setAutoRead(channel, false)</c> on the control channel.
+    /// </summary>
+    public ReadGate ReadGate { get; }
+
+    /// <summary>
+    /// Backpressure for outbound frames written to the Java control connection. NAT mirrors
+    /// this into external-channel auto-read, matching Netty's channel writability signal.
+    /// </summary>
+    public WriteBackpressureGate WriteBackpressure { get; }
+
     /// <summary>Set after a successful HMAC login. Null while the connection is still anonymous.</summary>
     public string? ClientName { get; private set; }
 
@@ -43,13 +56,16 @@ public sealed class TunnelConnectionContext
     public long? ConnectionRecordId { get; set; }
 
     public TunnelConnectionContext(string channelId, string? remoteAddress,
-        IFrameWriter writer, CancellationToken lifetime, Action closeCallback)
+        IFrameWriter writer, CancellationToken lifetime, Action closeCallback,
+        ReadGate readGate, WriteBackpressureGate writeBackpressure)
     {
         ChannelId = channelId;
         RemoteAddress = remoteAddress;
         Writer = writer;
         Lifetime = lifetime;
         CloseAsync = closeCallback;
+        ReadGate = readGate;
+        WriteBackpressure = writeBackpressure;
     }
 
     public void OnLoginSuccess(string clientName, long loginTimeMs)
