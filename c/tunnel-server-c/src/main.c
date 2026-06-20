@@ -40,6 +40,7 @@ typedef struct {
     int max_client_external_connections;
     int max_port_external_connections;
     int admin_port;
+    char static_root[512];
     tcp_mapping mappings[ST_MAX_TCP_MAPPINGS];
     size_t mapping_count;
     char *nat_control_json;
@@ -393,6 +394,7 @@ static int load_config(server_config *config)
     const char *password_hash = getenv("TUNNEL_CLIENT_PASSWORD_HASH");
     const char *public_address = getenv("TUNNEL_PUBLIC_ADDRESS");
     const char *database_path = getenv("TUNNEL_DATABASE_PATH");
+    const char *static_root = getenv("TUNNEL_STATIC_ROOT");
 
     memset(config, 0, sizeof(*config));
     if (copy_config_string(config->client_name, sizeof(config->client_name),
@@ -413,6 +415,13 @@ static int load_config(server_config *config)
         || env_int_range("TUNNEL_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
                          &config->max_port_external_connections) != 0
         || env_int_range("TUNNEL_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0) {
+        return -1;
+    }
+    if (copy_config_string(config->static_root, sizeof(config->static_root),
+                           "TUNNEL_STATIC_ROOT",
+                           (static_root != NULL && *static_root != '\0')
+                               ? static_root
+                               : "tunnel-server/src/main/resources/static") != 0) {
         return -1;
     }
 
@@ -1309,7 +1318,8 @@ int main(void)
            config.port, config.client_name, config.mapping_count);
 
     st_admin_server admin_server;
-    if (config.admin_port > 0 && st_admin_server_start(&admin_server, config.admin_port) != 0) {
+    if (config.admin_port > 0
+        && st_admin_server_start(&admin_server, config.admin_port, config.static_root) != 0) {
         close(listener);
         free(config.nat_control_json);
         return 1;

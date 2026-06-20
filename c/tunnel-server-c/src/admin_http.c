@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -56,6 +57,41 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
     return write_response(out, out_len, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
+int st_admin_resolve_static_path(const char *static_root,
+                                 const char *request_path,
+                                 char *file_path,
+                                 size_t file_path_len,
+                                 const char **content_type)
+{
+    if (static_root == NULL || *static_root == '\0'
+        || request_path == NULL || request_path[0] != '/'
+        || strstr(request_path, "..") != NULL) {
+        return -1;
+    }
+    const char *relative = request_path[1] == '\0' ? "index.html" : request_path + 1;
+    const char *query = strchr(relative, '?');
+    size_t relative_len = query == NULL ? strlen(relative) : (size_t)(query - relative);
+    if (relative_len == 0) {
+        relative = "index.html";
+        relative_len = strlen(relative);
+    }
+    int written = snprintf(file_path, file_path_len, "%s/%.*s", static_root, (int)relative_len, relative);
+    if (written < 0 || (size_t)written >= file_path_len) {
+        return -1;
+    }
+    const char *dot = strrchr(file_path, '.');
+    if (dot != NULL && strcmp(dot, ".html") == 0) {
+        *content_type = "text/html; charset=utf-8";
+    } else if (dot != NULL && strcmp(dot, ".js") == 0) {
+        *content_type = "application/javascript; charset=utf-8";
+    } else if (dot != NULL && strcmp(dot, ".css") == 0) {
+        *content_type = "text/css; charset=utf-8";
+    } else {
+        *content_type = "application/octet-stream";
+    }
+    return 0;
+}
+
 static int send_all(int fd, const char *buffer, size_t len)
 {
     size_t offset = 0;
@@ -72,7 +108,54 @@ static int send_all(int fd, const char *buffer, size_t len)
     return 0;
 }
 
-static void handle_client(int fd)
+static int send_static_file(int fd, const char *method, const char *path, const char *static_root)
+{
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+        return 0;
+    }
+    char file_path[1024];
+    const char *content_type = NULL;
+    if (st_admin_resolve_static_path(static_root, path, file_path, sizeof(file_path), &content_type) != 0) {
+        return 0;
+    }
+    struct stat st;
+    if (stat(file_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return 0;
+    }
+    FILE *file = fopen(file_path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+    char header[512];
+    int header_len = snprintf(header,
+                              sizeof(header),
+                              "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: %s\r\n"
+                              "Cache-Control: no-cache\r\n"
+                              "X-Content-Type-Options: nosniff\r\n"
+                              "Content-Length: %lld\r\n"
+                              "\r\n",
+                              content_type,
+                              (long long)st.st_size);
+    if (header_len <= 0 || (size_t)header_len >= sizeof(header)
+        || send_all(fd, header, (size_t)header_len) != 0) {
+        fclose(file);
+        return 1;
+    }
+    if (strcmp(method, "HEAD") != 0) {
+        char buffer[8192];
+        size_t read_len;
+        while ((read_len = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+            if (send_all(fd, buffer, read_len) != 0) {
+                break;
+            }
+        }
+    }
+    fclose(file);
+    return 1;
+}
+
+static void handle_client(st_admin_server *server, int fd)
 {
     char request[8192];
     ssize_t len = recv(fd, request, sizeof(request) - 1U, 0);
@@ -86,6 +169,10 @@ static void handle_client(int fd)
     if (sscanf(request, "%15s %1023s", method, path) != 2) {
         strcpy(method, "");
         strcpy(path, "");
+    }
+    if (send_static_file(fd, method, path, server->static_root)) {
+        close(fd);
+        return;
     }
     char response[4096];
     int response_len = st_admin_build_response(method, path, response, sizeof(response));
@@ -107,15 +194,16 @@ static void *admin_thread(void *arg)
             }
             break;
         }
-        handle_client(fd);
+        handle_client(server, fd);
     }
     return NULL;
 }
 
-int st_admin_server_start(st_admin_server *server, int port)
+int st_admin_server_start(st_admin_server *server, int port, const char *static_root)
 {
     memset(server, 0, sizeof(*server));
     server->port = port;
+    snprintf(server->static_root, sizeof(server->static_root), "%s", static_root == NULL ? "" : static_root);
     server->fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server->fd < 0) {
         perror("admin socket");

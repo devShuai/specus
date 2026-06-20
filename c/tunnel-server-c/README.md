@@ -52,6 +52,7 @@ Additional runtime knobs:
 | `TUNNEL_DATABASE_PATH` | unset | Optional SQLite database path for clients and mappings. |
 | `TUNNEL_DB_SEED_DEMO_CLIENT` | `true` | Seed `Demo client / test1234` when initializing SQLite. |
 | `TUNNEL_ADMIN_PORT` | `0` | Optional lightweight management API listener; `0` disables it. |
+| `TUNNEL_STATIC_ROOT` | `tunnel-server/src/main/resources/static` | Static SPA root used by the management listener. |
 
 `TUNNEL_TCP_MAPPINGS` is a comma-separated list of server listen ports mapped to client-side targets:
 
@@ -69,7 +70,8 @@ initial `NAT_CONTROL` TCP mappings. `TUNNEL_TCP_MAPPINGS` can still be used to a
 development mappings.
 
 The management API skeleton is enabled by setting `TUNNEL_ADMIN_PORT`. It currently exposes
-`GET /health`, `POST /auth/login`, and `GET /api/admin/overview`.
+`GET /health`, `POST /auth/login`, and `GET /api/admin/overview`. The same listener also serves
+`index.html`, `app.js`, and `app.css` from `TUNNEL_STATIC_ROOT`.
 
 ## Smoke Test
 

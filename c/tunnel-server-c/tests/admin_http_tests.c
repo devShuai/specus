@@ -34,5 +34,36 @@ int main(void)
         fprintf(stderr, "404 response mismatch\n");
         return 1;
     }
+
+    char path[512];
+    const char *content_type = NULL;
+    if (st_admin_resolve_static_path("../../tunnel-server/src/main/resources/static",
+                                     "/",
+                                     path,
+                                     sizeof(path),
+                                     &content_type) != 0
+        || !contains(path, "index.html")
+        || strcmp(content_type, "text/html; charset=utf-8") != 0) {
+        fprintf(stderr, "static index path mismatch\n");
+        return 1;
+    }
+    if (st_admin_resolve_static_path("../../tunnel-server/src/main/resources/static",
+                                     "/app.js?cache=1",
+                                     path,
+                                     sizeof(path),
+                                     &content_type) != 0
+        || !contains(path, "app.js")
+        || strcmp(content_type, "application/javascript; charset=utf-8") != 0) {
+        fprintf(stderr, "static js path mismatch\n");
+        return 1;
+    }
+    if (st_admin_resolve_static_path("../../tunnel-server/src/main/resources/static",
+                                     "/../application.yml",
+                                     path,
+                                     sizeof(path),
+                                     &content_type) == 0) {
+        fprintf(stderr, "static traversal was allowed\n");
+        return 1;
+    }
     return 0;
 }
