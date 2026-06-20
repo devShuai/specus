@@ -70,6 +70,61 @@ public sealed class NatControlService
         }
     }
 
+    public async Task<PushResult> PushToClientAsync(long clientId, CancellationToken cancellationToken)
+    {
+        var account = await _db.ClientAccounts.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == clientId, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException($"client not found: {clientId}");
+        var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
+        if (!await SendNatControlAsync(account.ClientName, mappings, httpRoutes, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            throw new InvalidOperationException("客户端不在线，无法下发映射");
+        }
+        return new PushResult(mappings.Count, httpRoutes is null ? -1 : httpRoutes.Count);
+    }
+
+    public async Task PushSnapshotIfOnlineAsync(long clientId, CancellationToken cancellationToken)
+    {
+        var account = await _db.ClientAccounts.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == clientId, cancellationToken)
+            .ConfigureAwait(false);
+        if (account is null)
+        {
+            return;
+        }
+
+        var (mappings, httpRoutes) = await LoadSnapshotAsync(account.Id, cancellationToken).ConfigureAwait(false);
+        if (await SendNatControlAsync(account.ClientName, mappings, httpRoutes, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            _logger.LogInformation("[nat-control] synchronized {TcpCount} tcp + {HttpCount} http route(s) to {Client}",
+                mappings.Count, httpRoutes is null ? "-" : httpRoutes.Count.ToString(), account.ClientName);
+        }
+    }
+
+    private async Task<(IReadOnlyList<TunnelMapping> Mappings, IReadOnlyList<HttpRouteMapping>? HttpRoutes)>
+        LoadSnapshotAsync(long clientId, CancellationToken cancellationToken)
+    {
+        var mappings = await _db.TunnelMappings.AsNoTracking()
+            .Where(m => m.ClientId == clientId && m.Enabled)
+            .OrderBy(m => m.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var httpRoutesManaged = await _db.HttpRouteMappings.AsNoTracking()
+            .AnyAsync(r => r.ClientId == clientId, cancellationToken)
+            .ConfigureAwait(false);
+        var httpRoutes = httpRoutesManaged
+            ? await _db.HttpRouteMappings.AsNoTracking()
+                .Where(r => r.ClientId == clientId && r.Enabled)
+                .OrderBy(r => r.Id)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false)
+            : null;
+        return (mappings, httpRoutes);
+    }
+
     private async Task<bool> SendNatControlAsync(string clientName,
         IReadOnlyList<TunnelMapping> mappings,
         IReadOnlyList<HttpRouteMapping>? httpRoutes,
@@ -127,3 +182,5 @@ public sealed class NatControlService
         return true;
     }
 }
+
+public sealed record PushResult(int Tunnels, int HttpRoutes);

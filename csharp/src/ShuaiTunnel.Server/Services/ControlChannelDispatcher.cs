@@ -4,6 +4,7 @@ using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.Http;
 using ShuaiTunnel.Server.Nat;
 using ShuaiTunnel.Server.Sessions;
 
@@ -25,15 +26,18 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
     private readonly LoginExecutor _loginExecutor;
     private readonly SessionRegistry _sessions;
     private readonly NatServerHandler _nat;
+    private readonly DirectHttpDispatcher _directHttp;
     private readonly ILogger<ControlChannelDispatcher> _logger;
 
     public ControlChannelDispatcher(IServiceProvider services, LoginExecutor loginExecutor,
-        SessionRegistry sessions, NatServerHandler nat, ILogger<ControlChannelDispatcher> logger)
+        SessionRegistry sessions, NatServerHandler nat, DirectHttpDispatcher directHttp,
+        ILogger<ControlChannelDispatcher> logger)
     {
         _services = services;
         _loginExecutor = loginExecutor;
         _sessions = sessions;
         _nat = nat;
+        _directHttp = directHttp;
         _logger = logger;
     }
 
@@ -73,6 +77,9 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 return;
             case NatMessagePacket nat:
                 await _nat.HandleAsync(context, nat).ConfigureAwait(false);
+                return;
+            case DirectHttpResponsePacket response:
+                _directHttp.Ack(response);
                 return;
             default:
                 // Phase 4+ packets (DIRECT_HTTP_*, MESSAGE_*) — known on the wire

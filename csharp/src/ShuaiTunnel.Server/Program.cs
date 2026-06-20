@@ -4,9 +4,13 @@ using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Hosting;
+using ShuaiTunnel.Server.Http;
+using ShuaiTunnel.Server.Management;
 using ShuaiTunnel.Server.Nat;
+using ShuaiTunnel.Server.Security;
 using ShuaiTunnel.Server.Services;
 using ShuaiTunnel.Server.Sessions;
+using ShuaiTunnel.Server.WebSockets;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -23,8 +27,12 @@ builder.Services.Configure<LoginExecutorOptions>(
     builder.Configuration.GetSection(LoginExecutorOptions.SectionName));
 builder.Services.Configure<DatabaseOptions>(
     builder.Configuration.GetSection(DatabaseOptions.SectionName));
+builder.Services.Configure<AuthOptions>(
+    builder.Configuration.GetSection(AuthOptions.SectionName));
 builder.Services.Configure<TrafficOptions>(
     builder.Configuration.GetSection(TrafficOptions.SectionName));
+builder.Services.Configure<DirectHttpOptions>(
+    builder.Configuration.GetSection(DirectHttpOptions.SectionName));
 
 // Persistence ---------------------------------------------------------------------------------
 
@@ -38,7 +46,10 @@ builder.Services.AddDbContext<TunnelDbContext>(options =>
 builder.Services.AddScoped<ClientAccountService>();
 builder.Services.AddScoped<ConnectionRecordService>();
 builder.Services.AddScoped<NatControlService>();
+builder.Services.AddScoped<ManagementQueryService>();
+builder.Services.AddScoped<ManagementMutationService>();
 
+builder.Services.AddSingleton<LocalTokenService>();
 builder.Services.AddSingleton<DatabaseInitializer>();
 
 // Control-channel pipeline --------------------------------------------------------------------
@@ -51,6 +62,8 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<RemotePortServerMa
 builder.Services.AddSingleton<TrafficUsageService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficUsageService>());
 builder.Services.AddSingleton<NatServerHandler>();
+builder.Services.AddSingleton<DirectHttpDispatcher>();
+builder.Services.AddSingleton<ConnectionEventsHub>();
 builder.Services.AddSingleton<IControlChannelDispatcher, ControlChannelDispatcher>();
 builder.Services.AddSingleton<ControlChannelListener>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ControlChannelListener>());
@@ -64,8 +77,12 @@ using (var scope = app.Services.CreateScope())
     await initializer.InitializeAsync(app.Lifetime.ApplicationStopping);
 }
 
-// Phase 2: minimal HTTP surface — a single liveness check is enough for tests / orchestration
-// to know the host is up. The full management API lands in Phase 4.
+app.UseAdminApiExceptionHandling();
+app.UseAdminApiAuthentication();
+app.MapAdminApi();
+app.MapDirectHttpTunnel();
+app.MapConnectionEventsWebSocket();
+
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 app.Run();

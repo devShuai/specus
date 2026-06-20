@@ -53,9 +53,28 @@ public sealed class TunnelOptions
     public string? PublicAddress { get; set; }
 }
 
+public sealed class AuthOptions
+{
+    public const string SectionName = "Tunnel:Auth";
+
+    public bool PasswordLoginEnabled { get; set; } = true;
+    public string Username { get; set; } = "admin";
+    public string Password { get; set; } = "admin";
+    public string? JwtSecret { get; set; }
+    public int TokenTtlSeconds { get; set; } = 8 * 60 * 60;
+}
+
 public sealed class TrafficOptions
 {
     public const string SectionName = "Tunnel:Traffic";
 
     public int FlushIntervalMs { get; set; } = 5_000;
+}
+
+public sealed class DirectHttpOptions
+{
+    public const string SectionName = "Tunnel:Http";
+
+    public int TimeoutMs { get; set; } = 30_000;
+    public int MaxRequestBodySize { get; set; } = 16 * 1024 * 1024;
 }

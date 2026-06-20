@@ -1,6 +1,8 @@
 using Microsoft.EntityFrameworkCore;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.Management;
+using ShuaiTunnel.Server.WebSockets;
 
 namespace ShuaiTunnel.Server.Authentication;
 
@@ -12,10 +14,12 @@ namespace ShuaiTunnel.Server.Authentication;
 public sealed class ConnectionRecordService
 {
     private readonly TunnelDbContext _db;
+    private readonly ConnectionEventsHub _events;
 
-    public ConnectionRecordService(TunnelDbContext db)
+    public ConnectionRecordService(TunnelDbContext db, ConnectionEventsHub events)
     {
         _db = db;
+        _events = events;
     }
 
     /// <summary>
@@ -41,6 +45,7 @@ public sealed class ConnectionRecordService
         };
         _db.ConnectionRecords.Add(record);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await _events.BroadcastAsync(new ConnectionEvent("created", ToView(record))).ConfigureAwait(false);
         return record.Id;
     }
 
@@ -72,6 +77,44 @@ public sealed class ConnectionRecordService
         if (dirty)
         {
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await _events.BroadcastAsync(new ConnectionEvent("updated", ToView(record))).ConfigureAwait(false);
         }
     }
+
+    private static ConnectionRecordView ToView(ConnectionRecord record)
+    {
+        var reason = DisconnectReasonExtensions.Parse(record.DisconnectReason);
+        return new ConnectionRecordView(
+            record.Id,
+            record.ClientId,
+            record.ClientName,
+            record.ChannelId,
+            record.RemoteAddress,
+            record.ConnectedAt.ToString("O"),
+            record.DisconnectedAt?.ToString("O"),
+            record.Success,
+            record.FailureReason,
+            reason?.ToWireString(),
+            reason is null ? null : ReasonText(reason.Value));
+    }
+
+    private static string ReasonText(DisconnectReason reason) => reason switch
+    {
+        DisconnectReason.LoginFailure => "登录失败",
+        DisconnectReason.ClientClosed => "客户端正常断开",
+        DisconnectReason.IoError => "传输异常",
+        DisconnectReason.IdleTimeout => "读空闲超时(60s)",
+        DisconnectReason.HeartbeatWriteFailed => "心跳发送失败",
+        DisconnectReason.ProtocolViolation => "协议违规",
+        DisconnectReason.RegisterFailed => "注册失败",
+        DisconnectReason.ReplacedByNewLogin => "被新登录替换",
+        DisconnectReason.AdminDisabled => "管理员停用账号",
+        DisconnectReason.AdminRenamed => "管理员修改账号名",
+        DisconnectReason.AdminDeleted => "管理员删除账号",
+        DisconnectReason.ServerBusy => "服务端繁忙拒绝",
+        DisconnectReason.ServerShutdown => "服务端优雅停机",
+        DisconnectReason.ServerRestarted => "服务端重启时清理",
+        DisconnectReason.Unknown => "未知",
+        _ => "未知",
+    };
 }

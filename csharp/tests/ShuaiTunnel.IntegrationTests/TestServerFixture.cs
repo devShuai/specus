@@ -124,6 +124,8 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
             {
                 // Listen on an ephemeral TCP control port so we can run in parallel.
                 ["Tunnel:Netty:Port"] = "0",
+                ["Tunnel:Auth:JwtSecret"] = "integration-test-secret",
+                ["Tunnel:Http:MaxRequestBodySize"] = "64",
                 ["ConnectionStrings:Tunnel"] = $"Data Source={_dbPath}",
                 // HTTP surface unused at this phase, but we still bind to ephemeral so we don't
                 // collide with anything. WebApplicationFactory uses an in-memory test server by
