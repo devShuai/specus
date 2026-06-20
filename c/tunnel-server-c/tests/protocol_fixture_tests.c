@@ -141,6 +141,65 @@ static int test_nat_decode(void)
     return 0;
 }
 
+static int test_direct_http_decode(void)
+{
+    uint8_t *bytes = NULL;
+    st_frame_header header;
+    if (st_test_decode_fixture_header("direct_http_request.bin", &bytes, &header) != 0) {
+        return 1;
+    }
+    st_direct_http_request request;
+    int ok = header.command == ST_CMD_DIRECT_HTTP_REQUEST
+        && st_protocol_decode_direct_http_request(bytes + ST_HEADER_SIZE, header.length, &request) == 0;
+    if (!ok) {
+        fprintf(stderr, "direct HTTP request decode failed\n");
+        free(bytes);
+        return 1;
+    }
+    ok = strcmp(request.request_id, "11111111-2222-3333-4444-555555555555") == 0
+        && strcmp(request.request_method, "GET") == 0
+        && strcmp(request.route, "api") == 0
+        && strcmp(request.relative_path, "/v1/items") == 0
+        && strcmp(request.raw_query, "limit=10&page=1") == 0
+        && request.headers_len == 2U
+        && strcmp(request.headers[0], "accept: application/json") == 0
+        && strcmp(request.headers[1], "x-fixture: 1") == 0
+        && request.body_len == 0U;
+    if (!ok) {
+        fprintf(stderr, "direct HTTP request content mismatch\n");
+    }
+    st_direct_http_request_free(&request);
+    free(bytes);
+    if (!ok) {
+        return 1;
+    }
+
+    if (st_test_decode_fixture_header("direct_http_response.bin", &bytes, &header) != 0) {
+        return 1;
+    }
+    st_direct_http_response response;
+    ok = header.command == ST_CMD_DIRECT_HTTP_RESPONSE
+        && st_protocol_decode_direct_http_response(bytes + ST_HEADER_SIZE, header.length, &response) == 0;
+    if (!ok) {
+        fprintf(stderr, "direct HTTP response decode failed\n");
+        free(bytes);
+        return 1;
+    }
+    ok = strcmp(response.request_id, "11111111-2222-3333-4444-555555555555") == 0
+        && response.status_code == 200
+        && response.headers_len == 1U
+        && strcmp(response.headers[0], "content-type: application/json") == 0
+        && response.body_len == strlen("{\"ok\":true}")
+        && memcmp(response.body, "{\"ok\":true}", response.body_len) == 0
+        && response.error == NULL;
+    if (!ok) {
+        fprintf(stderr, "direct HTTP response content mismatch\n");
+    }
+    st_direct_http_response_free(&response);
+    free(bytes);
+    return ok ? 0 : 1;
+}
+
 static int test_java_encode_fixtures(void)
 {
     st_buffer login = st_protocol_encode_login_response("Demo client", 1, NULL);
@@ -226,5 +285,6 @@ int main(void)
         || test_message_response_decode() != 0
         || test_empty_packets() != 0
         || test_nat_decode() != 0
+        || test_direct_http_decode() != 0
         || test_java_encode_fixtures() != 0;
 }

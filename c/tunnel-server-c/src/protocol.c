@@ -132,6 +132,16 @@ static int reader_byte_array(compact_reader *reader, uint8_t **value, size_t *le
     return 0;
 }
 
+static int reader_integer(compact_reader *reader, int *value)
+{
+    uint32_t raw;
+    if (reader_varint(reader, &raw) != 0 || raw > (uint32_t)INT_MAX) {
+        return -1;
+    }
+    *value = (int)raw;
+    return 0;
+}
+
 static int reader_enum(compact_reader *reader, int *value)
 {
     uint32_t marker;
@@ -140,6 +150,101 @@ static int reader_enum(compact_reader *reader, int *value)
     }
     *value = (int)marker - 1;
     return 0;
+}
+
+static int reader_uuid_string(compact_reader *reader, char **value)
+{
+    uint8_t marker;
+    if (reader_u8(reader, &marker) != 0) {
+        return -1;
+    }
+    if (marker == 0) {
+        *value = NULL;
+        return 0;
+    }
+    if (marker == 2) {
+        return reader_string(reader, value);
+    }
+    if (marker != 1 || reader->len - reader->pos < 16U) {
+        return -1;
+    }
+    const uint8_t *b = reader->data + reader->pos;
+    reader->pos += 16U;
+    char *out = (char *)malloc(37U);
+    if (out == NULL) {
+        return -1;
+    }
+    snprintf(out, 37U,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    *value = out;
+    return 0;
+}
+
+static int reader_http_method(compact_reader *reader, char **value)
+{
+    static const char *methods[] = {"GET", "POST", "PUT", "DELETE"};
+    uint8_t marker;
+    if (reader_u8(reader, &marker) != 0) {
+        return -1;
+    }
+    if (marker == 0) {
+        *value = NULL;
+        return 0;
+    }
+    if (marker >= 1U && marker <= 4U) {
+        const char *method = methods[marker - 1U];
+        char *out = (char *)malloc(strlen(method) + 1U);
+        if (out == NULL) {
+            return -1;
+        }
+        strcpy(out, method);
+        *value = out;
+        return 0;
+    }
+    if (marker == 5U) {
+        return reader_string(reader, value);
+    }
+    return -1;
+}
+
+static int reader_string_list(compact_reader *reader, char ***values, size_t *len)
+{
+    uint32_t marker;
+    if (reader_varint(reader, &marker) != 0) {
+        return -1;
+    }
+    if (marker == 0) {
+        *values = NULL;
+        *len = 0;
+        return 0;
+    }
+    size_t count = (size_t)marker - 1U;
+    char **items = (char **)calloc(count == 0 ? 1U : count, sizeof(*items));
+    if (items == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (reader_string(reader, &items[i]) != 0) {
+            for (size_t j = 0; j < i; ++j) {
+                free(items[j]);
+            }
+            free(items);
+            return -1;
+        }
+    }
+    *values = items;
+    *len = count;
+    return 0;
+}
+
+static void free_string_list(char **values, size_t len)
+{
+    for (size_t i = 0; i < len; ++i) {
+        free(values[i]);
+    }
+    free(values);
 }
 
 static int64_t zigzag_decode(uint64_t value)
@@ -484,6 +589,62 @@ int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st
     return 0;
 }
 
+int st_protocol_decode_direct_http_request(const uint8_t *body, size_t body_len, st_direct_http_request *request)
+{
+    memset(request, 0, sizeof(*request));
+    uint8_t *payload = NULL;
+    size_t payload_len = 0;
+    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    compact_reader reader = {
+        .data = payload,
+        .len = payload_len,
+        .pos = 0
+    };
+    if (reader_uuid_string(&reader, &request->request_id) != 0
+        || reader_http_method(&reader, &request->request_method) != 0
+        || reader_string(&reader, &request->route) != 0
+        || reader_string(&reader, &request->relative_path) != 0
+        || reader_string(&reader, &request->raw_query) != 0
+        || reader_string_list(&reader, &request->headers, &request->headers_len) != 0
+        || reader_byte_array(&reader, &request->body, &request->body_len) != 0
+        || reader.pos != reader.len) {
+        free(payload);
+        st_direct_http_request_free(request);
+        return -1;
+    }
+    free(payload);
+    return 0;
+}
+
+int st_protocol_decode_direct_http_response(const uint8_t *body, size_t body_len, st_direct_http_response *response)
+{
+    memset(response, 0, sizeof(*response));
+    uint8_t *payload = NULL;
+    size_t payload_len = 0;
+    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    compact_reader reader = {
+        .data = payload,
+        .len = payload_len,
+        .pos = 0
+    };
+    if (reader_uuid_string(&reader, &response->request_id) != 0
+        || reader_integer(&reader, &response->status_code) != 0
+        || reader_string_list(&reader, &response->headers, &response->headers_len) != 0
+        || reader_byte_array(&reader, &response->body, &response->body_len) != 0
+        || reader_string(&reader, &response->error) != 0
+        || reader.pos != reader.len) {
+        free(payload);
+        st_direct_http_response_free(response);
+        return -1;
+    }
+    free(payload);
+    return 0;
+}
+
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message)
 {
     memset(message, 0, sizeof(*message));
@@ -605,6 +766,33 @@ void st_message_response_free(st_message_response *response)
     free(response->client_name);
     free(response->to_client_name);
     free(response->message);
+    memset(response, 0, sizeof(*response));
+}
+
+void st_direct_http_request_free(st_direct_http_request *request)
+{
+    if (request == NULL) {
+        return;
+    }
+    free(request->request_id);
+    free(request->request_method);
+    free(request->route);
+    free(request->relative_path);
+    free(request->raw_query);
+    free_string_list(request->headers, request->headers_len);
+    free(request->body);
+    memset(request, 0, sizeof(*request));
+}
+
+void st_direct_http_response_free(st_direct_http_response *response)
+{
+    if (response == NULL) {
+        return;
+    }
+    free(response->request_id);
+    free_string_list(response->headers, response->headers_len);
+    free(response->body);
+    free(response->error);
     memset(response, 0, sizeof(*response));
 }
 

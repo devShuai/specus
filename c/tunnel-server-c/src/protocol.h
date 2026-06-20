@@ -20,6 +20,7 @@
 #define ST_CMD_HEARTBEAT_REQUEST 4
 #define ST_CMD_HEARTBEAT_RESPONSE -4
 #define ST_CMD_NAT_MESSAGE 6
+#define ST_CMD_DIRECT_HTTP_REQUEST 7
 #define ST_CMD_DIRECT_HTTP_RESPONSE -7
 
 #define ST_NAT_REGISTER 1
@@ -54,6 +55,28 @@ typedef struct {
 } st_message_response;
 
 typedef struct {
+    char *request_id;
+    char *request_method;
+    char *route;
+    char *relative_path;
+    char *raw_query;
+    char **headers;
+    size_t headers_len;
+    uint8_t *body;
+    size_t body_len;
+} st_direct_http_request;
+
+typedef struct {
+    char *request_id;
+    int status_code;
+    char **headers;
+    size_t headers_len;
+    uint8_t *body;
+    size_t body_len;
+    char *error;
+} st_direct_http_response;
+
+typedef struct {
     uint8_t *data;
     size_t len;
 } st_buffer;
@@ -69,6 +92,8 @@ int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *
 int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len);
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request);
 int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st_message_response *response);
+int st_protocol_decode_direct_http_request(const uint8_t *body, size_t body_len, st_direct_http_request *request);
+int st_protocol_decode_direct_http_response(const uint8_t *body, size_t body_len, st_direct_http_response *response);
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message);
 st_buffer st_protocol_encode_login_response(const char *client_name, int success, const char *reason);
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json);
@@ -76,6 +101,8 @@ st_buffer st_protocol_encode_nat_message(int type, const char *meta_json, const 
 st_buffer st_protocol_encode_empty_packet(int8_t command);
 void st_login_request_free(st_login_request *request);
 void st_message_response_free(st_message_response *response);
+void st_direct_http_request_free(st_direct_http_request *request);
+void st_direct_http_response_free(st_direct_http_response *response);
 void st_nat_message_free(st_nat_message *message);
 void st_buffer_free(st_buffer *buffer);
 
