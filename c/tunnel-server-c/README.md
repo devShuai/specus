@@ -79,6 +79,14 @@ until the Direct HTTP dispatcher is connected to the control channel.
 `GET /ws/connections` is reserved for the management WebSocket event stream and currently returns
 `426 Upgrade Required` until the broadcaster is wired.
 
+Security skeleton endpoints:
+
+- `GET /oidc-config` returns OIDC configuration derived from `TUNNEL_OIDC_*` variables.
+- `POST /oidc/token` is reserved for token exchange and currently returns `501`.
+
+TLS configuration is parsed through `TUNNEL_TLS_MODE`-style values in the security module, but TLS
+handshake wiring is not enabled yet.
+
 ## Smoke Test
 
 When local port binding is available, run:

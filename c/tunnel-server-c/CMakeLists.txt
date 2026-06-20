@@ -13,6 +13,7 @@ add_library(shuai_tunnel_c_core
     src/crypto.c
     src/json.c
     src/protocol.c
+    src/security.c
     src/storage.c
 )
 target_include_directories(shuai_tunnel_c_core PUBLIC src)
@@ -43,6 +44,11 @@ add_executable(shuai_tunnel_c_protocol_fixture_tests tests/protocol_fixture_test
 target_link_libraries(shuai_tunnel_c_protocol_fixture_tests PRIVATE shuai_tunnel_c_core)
 target_compile_options(shuai_tunnel_c_protocol_fixture_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME protocol_fixture_tests COMMAND shuai_tunnel_c_protocol_fixture_tests)
+
+add_executable(shuai_tunnel_c_security_tests tests/security_tests.c)
+target_link_libraries(shuai_tunnel_c_security_tests PRIVATE shuai_tunnel_c_core)
+target_compile_options(shuai_tunnel_c_security_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME security_tests COMMAND shuai_tunnel_c_security_tests)
 
 add_executable(shuai_tunnel_c_storage_tests tests/storage_tests.c)
 target_link_libraries(shuai_tunnel_c_storage_tests PRIVATE shuai_tunnel_c_core)

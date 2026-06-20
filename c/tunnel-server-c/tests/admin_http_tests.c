@@ -43,6 +43,18 @@ int main(void)
         return 1;
     }
 
+    len = st_admin_build_response("GET", "/oidc-config", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"configured\":false")) {
+        fprintf(stderr, "oidc config response mismatch\n");
+        return 1;
+    }
+    len = st_admin_build_response("POST", "/oidc/token", response, sizeof(response));
+    if (len <= 0 || !contains(response, "501 Not Implemented")
+        || !contains(response, "oidc token exchange")) {
+        fprintf(stderr, "oidc token response mismatch\n");
+        return 1;
+    }
+
     len = st_admin_build_response("GET", "/missing", response, sizeof(response));
     if (len <= 0 || !contains(response, "404 Not Found")) {
         fprintf(stderr, "404 response mismatch\n");

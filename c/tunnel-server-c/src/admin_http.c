@@ -1,5 +1,7 @@
 #include "admin_http.h"
 
+#include "security.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -67,6 +69,25 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
                               426,
                               "Upgrade Required",
                               "{\"error\":\"websocket connection events are not wired yet\"}");
+    }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/oidc-config") == 0) {
+        char body[1024];
+        if (st_security_build_oidc_config(getenv("TUNNEL_OIDC_CLIENT_ID"),
+                                          getenv("TUNNEL_OIDC_AUTHORIZATION_ENDPOINT"),
+                                          getenv("TUNNEL_OIDC_TOKEN_ENDPOINT"),
+                                          getenv("TUNNEL_OIDC_ISSUER"),
+                                          body,
+                                          sizeof(body)) < 0) {
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"oidc config failed\"}");
+        }
+        return write_response(out, out_len, 200, "OK", body);
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/oidc/token") == 0) {
+        return write_response(out,
+                              out_len,
+                              501,
+                              "Not Implemented",
+                              "{\"error\":\"oidc token exchange is not wired yet\"}");
     }
     return write_response(out, out_len, 404, "Not Found", "{\"error\":\"not found\"}");
 }
