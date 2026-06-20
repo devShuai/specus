@@ -97,8 +97,15 @@ using (var scope = app.Services.CreateScope())
     await initializer.InitializeAsync(app.Lifetime.ApplicationStopping);
 }
 
+app.UseManagementSecurityHeaders();
 app.UseAdminApiExceptionHandling();
 app.UseAdminApiAuthentication();
+
+// Management SPA: same static contract as Java's resources/static. Root redirects to the real
+// static asset so ASP.NET Core can still apply generated ETag/compression/fingerprint metadata.
+app.MapGet("/", () => Results.LocalRedirect("/index.html"));
+app.MapStaticAssets();
+
 app.MapAdminApi();
 app.MapDirectHttpTunnel();
 app.MapConnectionEventsWebSocket();

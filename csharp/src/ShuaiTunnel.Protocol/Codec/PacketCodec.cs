@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
@@ -23,7 +24,8 @@ public static class PacketCodec
     public const int MagicNumber = 0x14353565;
     public const int HeaderSize = 11;
 
-    private static readonly Dictionary<sbyte, Func<byte[], Packet>> CommandToDecoder = new()
+    private static readonly FrozenDictionary<sbyte, Func<byte[], Packet>> CommandToDecoder =
+        new Dictionary<sbyte, Func<byte[], Packet>>
     {
         [Command.LoginRequest] = bytes => CompactBinarySerializer.Deserialize<LoginRequestPacket>(bytes),
         [Command.LoginResponse] = bytes => CompactBinarySerializer.Deserialize<LoginResponsePacket>(bytes),
@@ -37,7 +39,7 @@ public static class PacketCodec
         [Command.HttpResponse] = bytes => CompactBinarySerializer.Deserialize<HttpResponsePacket>(bytes),
         [Command.DirectHttpRequest] = bytes => CompactBinarySerializer.Deserialize<DirectHttpRequestPacket>(bytes),
         [Command.DirectHttpResponse] = bytes => CompactBinarySerializer.Deserialize<DirectHttpResponsePacket>(bytes),
-    };
+    }.ToFrozenDictionary();
 
     /// <summary>
     /// Encodes a single packet into a fresh byte array suitable for direct writing to a stream.

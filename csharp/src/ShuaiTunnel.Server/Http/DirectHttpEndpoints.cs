@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Collections.Frozen;
 using System.Text;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Protocol.Packets;
@@ -6,9 +8,15 @@ using ShuaiTunnel.Server.Nat;
 
 namespace ShuaiTunnel.Server.Http;
 
+/// <summary>
+/// Public HTTP ingress for browser/API traffic that should be carried through a connected tunnel
+/// client. This is the ASP.NET endpoint counterpart to Java's <c>HttpTunnelController</c>; it
+/// strips hop-by-hop headers, bounds request bodies, and delegates the control-channel round trip
+/// to <see cref="DirectHttpDispatcher"/>.
+/// </summary>
 public static class DirectHttpEndpoints
 {
-    private static readonly HashSet<string> SkippedHeaders = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly FrozenSet<string> SkippedHeaders = new[]
     {
         "connection",
         "content-length",
@@ -20,13 +28,14 @@ public static class DirectHttpEndpoints
         "trailer",
         "transfer-encoding",
         "upgrade",
-    };
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly string[] Methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
     public static void MapDirectHttpTunnel(this WebApplication app)
     {
-        var methods = new[] { "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS" };
-        app.MapMethods("/http/{clientName}/{route}/{**rest}", methods, ForwardAsync);
-        app.MapMethods("/http/{clientName}/{route}", methods, ForwardAsync);
+        app.MapMethods("/http/{clientName}/{route}/{**rest}", Methods, ForwardAsync);
+        app.MapMethods("/http/{clientName}/{route}", Methods, ForwardAsync);
     }
 
     private static async Task ForwardAsync(HttpContext context, string clientName, string route,
@@ -83,18 +92,33 @@ public static class DirectHttpEndpoints
 
     private static async Task<byte[]?> ReadBodyAsync(HttpRequest request, int maxBytes)
     {
-        using var buffer = new MemoryStream();
-        var chunk = new byte[16 * 1024];
-        int read;
-        while ((read = await request.Body.ReadAsync(chunk).ConfigureAwait(false)) > 0)
+        if (request.ContentLength > maxBytes)
         {
-            if (buffer.Length + read > maxBytes)
-            {
-                return null;
-            }
-            buffer.Write(chunk, 0, read);
+            return null;
         }
-        return buffer.ToArray();
+
+        var initialCapacity = request.ContentLength is > 0 and <= int.MaxValue
+            ? (int)request.ContentLength.Value
+            : 0;
+        using var buffer = initialCapacity > 0 ? new MemoryStream(initialCapacity) : new MemoryStream();
+        var chunk = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        try
+        {
+            int read;
+            while ((read = await request.Body.ReadAsync(chunk).ConfigureAwait(false)) > 0)
+            {
+                if (buffer.Length + read > maxBytes)
+                {
+                    return null;
+                }
+                buffer.Write(chunk, 0, read);
+            }
+            return buffer.ToArray();
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(chunk);
+        }
     }
 
     private static List<string> RequestHeaders(HttpRequest request)

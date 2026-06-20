@@ -9,12 +9,9 @@ using ShuaiTunnel.Server.Data.Entities;
 namespace ShuaiTunnel.Server.Hosting;
 
 /// <summary>
-/// Mirrors Java's <c>DatabaseInitializer</c>: applies pending migrations on boot and (optionally)
-/// inserts a <c>Demo client</c> account so dev / E2E tests have a working credential without
-/// extra setup.
-///
-/// <para>The seed runs only when (a) the option is enabled and (b) no row matches by name.
-/// Production deployments turn <c>Tunnel:Database:SeedDemoClient</c> off explicitly.</para>
+/// Database bootstrapper for both process startup and the management UI's idempotent
+/// "initialize database" action. It mirrors Java's <c>DatabaseInitializer</c> while using
+/// EF Core migrations as the schema authority.
 /// </summary>
 public sealed class DatabaseInitializer
 {
@@ -33,21 +30,32 @@ public sealed class DatabaseInitializer
         _logger = logger;
     }
 
-    public async Task InitializeAsync(CancellationToken cancellationToken)
+    public async Task<DatabaseInitializeResult> InitializeAsync(CancellationToken cancellationToken)
     {
         await using var scope = _services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<TunnelDbContext>();
         await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
 
-        if (!_options.Value.SeedDemoClient)
+        if (_options.Value.SeedDemoClient)
         {
-            return;
+            await SeedDemoClientAsync(db, cancellationToken).ConfigureAwait(false);
         }
-        var existing = await db.ClientAccounts
+
+        var clients = await db.ClientAccounts.LongCountAsync(cancellationToken).ConfigureAwait(false);
+        return new DatabaseInitializeResult(
+            Initialized: true,
+            Orm: "entity-framework-core",
+            Dialect: DatabaseDialect(db.Database.ProviderName),
+            Clients: clients);
+    }
+
+    private async Task SeedDemoClientAsync(TunnelDbContext db, CancellationToken cancellationToken)
+    {
+        var exists = await db.ClientAccounts
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.ClientName == DemoClientName, cancellationToken)
+            .AnyAsync(a => a.ClientName == DemoClientName, cancellationToken)
             .ConfigureAwait(false);
-        if (existing is not null)
+        if (exists)
         {
             return;
         }
@@ -66,4 +74,16 @@ public sealed class DatabaseInitializer
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         _logger.LogInformation("seeded {ClientName}", DemoClientName);
     }
+
+    private static string DatabaseDialect(string? providerName)
+    {
+        if (providerName?.Contains("Sqlite", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            return "sqlite";
+        }
+
+        return providerName ?? "unknown";
+    }
 }
+
+public sealed record DatabaseInitializeResult(bool Initialized, string Orm, string Dialect, long Clients);

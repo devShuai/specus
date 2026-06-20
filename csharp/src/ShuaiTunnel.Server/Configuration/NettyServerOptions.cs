@@ -1,9 +1,9 @@
 namespace ShuaiTunnel.Server.Configuration;
 
 /// <summary>
-/// Mirrors a strict subset of <c>tunnel.netty.*</c> from the Java <c>NettyServerProperties</c>.
-/// Phase 2 only needs <see cref="Port"/> and <see cref="MaxFrameSize"/>. Phase 3 adds per-tunnel
-/// listeners, write-buffer watermarks, and connection caps.
+/// Control-channel and NAT listener limits. The names mirror Java's <c>tunnel.netty.*</c>
+/// properties so existing deployment variables keep working, while the values drive .NET socket
+/// binding, frame-size protection, and backpressure thresholds.
 /// </summary>
 public sealed class NettyServerOptions
 {
@@ -29,7 +29,10 @@ public sealed class NettyServerOptions
     public int MaxExternalConnectionsPerPort { get; set; } = 10_000;
 }
 
-/// <summary>Login pipeline thresholds. The defaults mirror Java's bounded executor.</summary>
+/// <summary>
+/// Login worker-pool thresholds. The defaults mirror Java's bounded executor and keep HMAC/DB
+/// login work off the control-channel read loops.
+/// </summary>
 public sealed class LoginExecutorOptions
 {
     public const string SectionName = "Tunnel:Login";
@@ -95,6 +98,10 @@ public sealed class OidcOptions
     public string Audience { get; set; } = string.Empty;
 }
 
+/// <summary>
+/// Optional TLS settings shared by Kestrel and the raw TCP control channel. Mode names mirror the
+/// Java config, but file mode intentionally supports the C# Phase 5 contract: PKCS12/PFX and PEM.
+/// </summary>
 public sealed class TlsOptions
 {
     public const string SectionName = "Tunnel:Tls";

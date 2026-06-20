@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Configuration;
+using ShuaiTunnel.Server.Hosting;
 using ShuaiTunnel.Server.Security;
 
 namespace ShuaiTunnel.Server.Management;
@@ -113,6 +114,10 @@ public static class AdminApiEndpoints
         app.MapGet("/api/admin/overview",
             (ManagementQueryService service, CancellationToken cancellationToken) =>
                 service.GetOverviewAsync(cancellationToken));
+
+        app.MapPost("/api/admin/database/initialize",
+            (DatabaseInitializer initializer, CancellationToken cancellationToken) =>
+                initializer.InitializeAsync(cancellationToken));
 
         app.MapGet("/api/admin/clients",
             (ManagementQueryService service, CancellationToken cancellationToken) =>

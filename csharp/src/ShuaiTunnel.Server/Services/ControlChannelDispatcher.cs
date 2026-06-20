@@ -11,10 +11,10 @@ using ShuaiTunnel.Server.Sessions;
 namespace ShuaiTunnel.Server.Services;
 
 /// <summary>
-/// Routes inbound packets on a control connection to the right handler. Mirrors what Netty
-/// pipelines do in Java — auth gate, login, heartbeat reply, logout — but expressed as plain
-/// async dispatch in one place because we have far fewer handlers than the Java version (no
-/// Phase 3+ NAT/HTTP yet).
+/// Routes inbound packets on one control connection: login, heartbeat, logout, NAT data, and
+/// Direct HTTP responses. This mirrors Java's Netty pipeline ordering, but keeps the handlers as
+/// one explicit async switch because the .NET port has a single framed stream abstraction instead
+/// of mutable Netty pipeline stages.
 ///
 /// <para>Threading: <see cref="DispatchAsync"/> runs on the connection's read loop. Login work
 /// is offloaded to <see cref="LoginExecutor"/> so the read loop stays responsive — same shape
@@ -82,9 +82,9 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 _directHttp.Ack(response);
                 return;
             default:
-                // Phase 4+ packets (DIRECT_HTTP_*, MESSAGE_*) — known on the wire
-                // but not yet wired up. Logging at debug avoids alarming nooses on benign
-                // forward-compat client builds.
+                // MESSAGE_* and future packet types are known on the wire but not meaningful to
+                // the server dispatch path yet. Debug logging avoids alarming noise from benign
+                // forward-compatible client builds.
                 _logger.LogDebug("[{ChannelId}] dropped unhandled packet: {Cmd}",
                     context.ChannelId, packet.Command);
                 return;
