@@ -20,6 +20,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\ShuaiTunnel.Server\ShuaiTunnel.Server.csproj" />
     <ProjectReference Include="..\..\src\ShuaiTunnel.Server.Data\ShuaiTunnel.Server.Data.csproj" />
+    <!-- Referenced so MultiProviderModelTests can construct the Npgsql/MySQL contexts and load
+         their migration snapshots for offline DDL + model-drift checks. -->
+    <ProjectReference Include="..\..\src\ShuaiTunnel.Server.Data.Postgres\ShuaiTunnel.Server.Data.Postgres.csproj" />
+    <ProjectReference Include="..\..\src\ShuaiTunnel.Server.Data.MySql\ShuaiTunnel.Server.Data.MySql.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -12,6 +12,10 @@
   <ItemGroup>
     <ProjectReference Include="..\ShuaiTunnel.Protocol\ShuaiTunnel.Protocol.csproj" />
     <ProjectReference Include="..\ShuaiTunnel.Server.Data\ShuaiTunnel.Server.Data.csproj" />
+    <!-- Provider migration assemblies must be referenced so MigrationsAssembly(...) can load
+         them at runtime. Only the one matching Tunnel:Database:Provider is actually used. -->
+    <ProjectReference Include="..\ShuaiTunnel.Server.Data.Postgres\ShuaiTunnel.Server.Data.Postgres.csproj" />
+    <ProjectReference Include="..\ShuaiTunnel.Server.Data.MySql\ShuaiTunnel.Server.Data.MySql.csproj" />
   </ItemGroup>
 
 </Project>

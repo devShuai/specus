@@ -77,12 +77,29 @@ public sealed class DatabaseInitializer
 
     private static string DatabaseDialect(string? providerName)
     {
-        if (providerName?.Contains("Sqlite", StringComparison.OrdinalIgnoreCase) == true)
+        if (providerName is null)
+        {
+            return "unknown";
+        }
+
+        if (providerName.Contains("Sqlite", StringComparison.OrdinalIgnoreCase))
         {
             return "sqlite";
         }
 
-        return providerName ?? "unknown";
+        if (providerName.Contains("Npgsql", StringComparison.OrdinalIgnoreCase)
+            || providerName.Contains("PostgreSQL", StringComparison.OrdinalIgnoreCase))
+        {
+            return "postgresql";
+        }
+
+        if (providerName.Contains("MySql", StringComparison.OrdinalIgnoreCase)
+            || providerName.Contains("MySQL", StringComparison.OrdinalIgnoreCase))
+        {
+            return "mysql";
+        }
+
+        return providerName;
     }
 }
 

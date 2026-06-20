@@ -54,7 +54,27 @@ builder.Services.AddDbContext<TunnelDbContext>(options =>
 {
     var cs = builder.Configuration.GetConnectionString("Tunnel")
         ?? "Data Source=./shuai-tunnel.db";
-    options.UseSqlite(cs);
+    var provider = builder.Configuration[$"{DatabaseOptions.SectionName}:Provider"] ?? "sqlite";
+    switch (provider.Trim().ToLowerInvariant())
+    {
+        case "postgres":
+        case "postgresql":
+        case "npgsql":
+            options.UseNpgsql(cs, o => o.MigrationsAssembly("ShuaiTunnel.Server.Data.Postgres"));
+            break;
+        case "mysql":
+        case "mariadb":
+            options.UseMySQL(cs, o => o.MigrationsAssembly("ShuaiTunnel.Server.Data.MySql"));
+            break;
+        case "sqlite":
+            // Migrations for SQLite live in the Data project itself.
+            options.UseSqlite(cs, o => o.MigrationsAssembly("ShuaiTunnel.Server.Data"));
+            break;
+        default:
+            throw new InvalidOperationException(
+                $"Unknown {DatabaseOptions.SectionName}:Provider '{provider}'. " +
+                "Use 'sqlite', 'postgres', or 'mysql'.");
+    }
 });
 
 builder.Services.AddScoped<ClientAccountService>();

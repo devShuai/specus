@@ -46,6 +46,14 @@ public sealed class DatabaseOptions
 {
     public const string SectionName = "Tunnel:Database";
 
+    /// <summary>
+    /// Selects the EF Core provider: <c>sqlite</c> (default), <c>postgres</c>/<c>postgresql</c>/<c>npgsql</c>,
+    /// or <c>mysql</c>/<c>mariadb</c>. Override via <c>Tunnel:Database:Provider</c> or the Java-style
+    /// <c>TUNNEL_DB_PROVIDER</c> env var; pair it with <c>ConnectionStrings:Tunnel</c>
+    /// (<c>TUNNEL_CONNECTIONSTRINGS_TUNNEL</c>).
+    /// </summary>
+    public string Provider { get; set; } = "sqlite";
+
     public bool SeedDemoClient { get; set; } = true;
 }
 
