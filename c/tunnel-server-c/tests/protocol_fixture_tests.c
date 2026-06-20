@@ -200,6 +200,54 @@ static int test_direct_http_decode(void)
     return ok ? 0 : 1;
 }
 
+static int test_direct_http_encode_round_trip(void)
+{
+    char *headers[] = {"accept: application/json", "x-test: 1"};
+    const uint8_t body[] = "{\"hello\":\"world\"}";
+    st_direct_http_request request = {
+        .request_id = "22222222-3333-4444-5555-666666666666",
+        .request_method = "POST",
+        .route = "api",
+        .relative_path = "/v1/create",
+        .raw_query = "debug=true",
+        .headers = headers,
+        .headers_len = 2,
+        .body = (uint8_t *)body,
+        .body_len = sizeof(body) - 1U
+    };
+    st_buffer packet = st_protocol_encode_direct_http_request(&request);
+    if (packet.data == NULL) {
+        fprintf(stderr, "direct HTTP request encode failed\n");
+        return 1;
+    }
+    st_frame_header header;
+    st_direct_http_request decoded;
+    int ok = st_protocol_read_header(packet.data, &header) == 0
+        && header.command == ST_CMD_DIRECT_HTTP_REQUEST
+        && st_protocol_decode_direct_http_request(packet.data + ST_HEADER_SIZE, header.length, &decoded) == 0;
+    if (!ok) {
+        fprintf(stderr, "direct HTTP request round-trip decode failed\n");
+        st_buffer_free(&packet);
+        return 1;
+    }
+    ok = strcmp(decoded.request_id, request.request_id) == 0
+        && strcmp(decoded.request_method, request.request_method) == 0
+        && strcmp(decoded.route, request.route) == 0
+        && strcmp(decoded.relative_path, request.relative_path) == 0
+        && strcmp(decoded.raw_query, request.raw_query) == 0
+        && decoded.headers_len == request.headers_len
+        && strcmp(decoded.headers[0], request.headers[0]) == 0
+        && strcmp(decoded.headers[1], request.headers[1]) == 0
+        && decoded.body_len == request.body_len
+        && memcmp(decoded.body, request.body, request.body_len) == 0;
+    if (!ok) {
+        fprintf(stderr, "direct HTTP request round-trip content mismatch\n");
+    }
+    st_direct_http_request_free(&decoded);
+    st_buffer_free(&packet);
+    return ok ? 0 : 1;
+}
+
 static int test_java_encode_fixtures(void)
 {
     st_buffer login = st_protocol_encode_login_response("Demo client", 1, NULL);
@@ -286,5 +334,6 @@ int main(void)
         || test_empty_packets() != 0
         || test_nat_decode() != 0
         || test_direct_http_decode() != 0
+        || test_direct_http_encode_round_trip() != 0
         || test_java_encode_fixtures() != 0;
 }

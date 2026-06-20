@@ -352,6 +352,67 @@ static int writer_string(compact_writer *writer, const char *value)
     return writer_bytes(writer, (const uint8_t *)value, len);
 }
 
+static int writer_byte_array(compact_writer *writer, const uint8_t *value, size_t len)
+{
+    if (value == NULL) {
+        return writer_varint(writer, 0);
+    }
+    if (len >= UINT32_MAX) {
+        return -1;
+    }
+    if (writer_varint(writer, (uint32_t)len + 1U) != 0) {
+        return -1;
+    }
+    return writer_bytes(writer, value, len);
+}
+
+static int writer_uuid_string(compact_writer *writer, const char *value)
+{
+    if (value == NULL) {
+        return writer_u8(writer, 0);
+    }
+    if (writer_u8(writer, 2) != 0) {
+        return -1;
+    }
+    return writer_string(writer, value);
+}
+
+static int writer_http_method(compact_writer *writer, const char *method)
+{
+    static const char *methods[] = {"GET", "POST", "PUT", "DELETE"};
+    if (method == NULL) {
+        return writer_u8(writer, 0);
+    }
+    for (uint8_t i = 0; i < 4U; ++i) {
+        if (strcmp(method, methods[i]) == 0) {
+            return writer_u8(writer, (uint8_t)(i + 1U));
+        }
+    }
+    if (writer_u8(writer, 5) != 0) {
+        return -1;
+    }
+    return writer_string(writer, method);
+}
+
+static int writer_string_list(compact_writer *writer, char **values, size_t len)
+{
+    if (values == NULL) {
+        return writer_varint(writer, 0);
+    }
+    if (len >= UINT32_MAX) {
+        return -1;
+    }
+    if (writer_varint(writer, (uint32_t)len + 1U) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        if (writer_string(writer, values[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static st_buffer encode_raw_frame(uint8_t serializer, int8_t command, const uint8_t *body, size_t body_len)
 {
     st_buffer buffer = {0};
@@ -701,6 +762,26 @@ st_buffer st_protocol_encode_nat_control(const char *client_name, const char *na
         return buffer;
     }
     buffer = encode_compact_frame(ST_CMD_MESSAGE_RESPONSE, &payload);
+    free(payload.data);
+    return buffer;
+}
+
+st_buffer st_protocol_encode_direct_http_request(const st_direct_http_request *request)
+{
+    compact_writer payload = {0};
+    st_buffer buffer = {0};
+    if (request == NULL
+        || writer_uuid_string(&payload, request->request_id) != 0
+        || writer_http_method(&payload, request->request_method) != 0
+        || writer_string(&payload, request->route) != 0
+        || writer_string(&payload, request->relative_path) != 0
+        || writer_string(&payload, request->raw_query) != 0
+        || writer_string_list(&payload, request->headers, request->headers_len) != 0
+        || writer_byte_array(&payload, request->body, request->body_len) != 0) {
+        free(payload.data);
+        return buffer;
+    }
+    buffer = encode_compact_frame(ST_CMD_DIRECT_HTTP_REQUEST, &payload);
     free(payload.data);
     return buffer;
 }

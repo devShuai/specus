@@ -54,6 +54,13 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
                               "OK",
                               "{\"token\":\"local-dev-token\",\"tokenType\":\"Bearer\",\"expiresIn\":28800}");
     }
+    if (strncmp(path, "/http/", 6) == 0) {
+        return write_response(out,
+                              out_len,
+                              501,
+                              "Not Implemented",
+                              "{\"error\":\"direct http dispatch is not wired yet\"}");
+    }
     return write_response(out, out_len, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 

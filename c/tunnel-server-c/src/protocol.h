@@ -97,6 +97,7 @@ int st_protocol_decode_direct_http_response(const uint8_t *body, size_t body_len
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message);
 st_buffer st_protocol_encode_login_response(const char *client_name, int success, const char *reason);
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json);
+st_buffer st_protocol_encode_direct_http_request(const st_direct_http_request *request);
 st_buffer st_protocol_encode_nat_message(int type, const char *meta_json, const uint8_t *data, size_t data_len);
 st_buffer st_protocol_encode_empty_packet(int8_t command);
 void st_login_request_free(st_login_request *request);

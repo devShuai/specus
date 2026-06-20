@@ -73,6 +73,9 @@ The management API skeleton is enabled by setting `TUNNEL_ADMIN_PORT`. It curren
 `GET /health`, `POST /auth/login`, and `GET /api/admin/overview`. The same listener also serves
 `index.html`, `app.js`, and `app.css` from `TUNNEL_STATIC_ROOT`.
 
+Requests under `/http/...` are recognized by the management listener and currently return `501`
+until the Direct HTTP dispatcher is connected to the control channel.
+
 ## Smoke Test
 
 When local port binding is available, run:
