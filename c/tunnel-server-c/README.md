@@ -51,6 +51,7 @@ Additional runtime knobs:
 | `TUNNEL_MAX_PORT_EXTERNAL_CONNECTIONS` | `512` | Per-public-port external TCP connection cap. |
 | `TUNNEL_DATABASE_PATH` | unset | Optional SQLite database path for clients and mappings. |
 | `TUNNEL_DB_SEED_DEMO_CLIENT` | `true` | Seed `Demo client / test1234` when initializing SQLite. |
+| `TUNNEL_ADMIN_PORT` | `0` | Optional lightweight management API listener; `0` disables it. |
 
 `TUNNEL_TCP_MAPPINGS` is a comma-separated list of server listen ports mapped to client-side targets:
 
@@ -66,6 +67,9 @@ When `TUNNEL_DATABASE_PATH` is set, the server initializes a small SQLite schema
 selected `TUNNEL_CLIENT_NAME` from `client_account`; enabled rows in `tunnel_mapping` become the
 initial `NAT_CONTROL` TCP mappings. `TUNNEL_TCP_MAPPINGS` can still be used to append local
 development mappings.
+
+The management API skeleton is enabled by setting `TUNNEL_ADMIN_PORT`. It currently exposes
+`GET /health`, `POST /auth/login`, and `GET /api/admin/overview`.
 
 ## Smoke Test
 

@@ -1,3 +1,4 @@
+#include "admin_http.h"
 #include "crypto.h"
 #include "json.h"
 #include "protocol.h"
@@ -38,6 +39,7 @@ typedef struct {
     int max_global_external_connections;
     int max_client_external_connections;
     int max_port_external_connections;
+    int admin_port;
     tcp_mapping mappings[ST_MAX_TCP_MAPPINGS];
     size_t mapping_count;
     char *nat_control_json;
@@ -409,7 +411,8 @@ static int load_config(server_config *config)
         || env_int_range("TUNNEL_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
                          &config->max_client_external_connections) != 0
         || env_int_range("TUNNEL_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
-                         &config->max_port_external_connections) != 0) {
+                         &config->max_port_external_connections) != 0
+        || env_int_range("TUNNEL_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0) {
         return -1;
     }
 
@@ -1304,6 +1307,13 @@ int main(void)
     }
     printf("shuai-tunnel-server-c listening on 0.0.0.0:%d for client \"%s\" (%zu tcp route(s))\n",
            config.port, config.client_name, config.mapping_count);
+
+    st_admin_server admin_server;
+    if (config.admin_port > 0 && st_admin_server_start(&admin_server, config.admin_port) != 0) {
+        close(listener);
+        free(config.nat_control_json);
+        return 1;
+    }
 
     for (;;) {
         client_args *args = (client_args *)calloc(1, sizeof(*args));

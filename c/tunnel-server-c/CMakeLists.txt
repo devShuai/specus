@@ -9,6 +9,7 @@ find_package(ZLIB REQUIRED)
 find_package(SQLite3 REQUIRED)
 
 add_library(shuai_tunnel_c_core
+    src/admin_http.c
     src/crypto.c
     src/json.c
     src/protocol.c
@@ -23,6 +24,11 @@ target_link_libraries(shuai-tunnel-server-c PRIVATE shuai_tunnel_c_core)
 target_compile_options(shuai-tunnel-server-c PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
+add_executable(shuai_tunnel_c_admin_http_tests tests/admin_http_tests.c)
+target_link_libraries(shuai_tunnel_c_admin_http_tests PRIVATE shuai_tunnel_c_core)
+target_compile_options(shuai_tunnel_c_admin_http_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME admin_http_tests COMMAND shuai_tunnel_c_admin_http_tests)
+
 add_executable(shuai_tunnel_c_crypto_tests tests/crypto_tests.c)
 target_link_libraries(shuai_tunnel_c_crypto_tests PRIVATE shuai_tunnel_c_core)
 target_compile_options(shuai_tunnel_c_crypto_tests PRIVATE -Wall -Wextra -Wpedantic)
