@@ -76,6 +76,9 @@ The management API skeleton is enabled by setting `TUNNEL_ADMIN_PORT`. It curren
 Requests under `/http/...` are recognized by the management listener and currently return `501`
 until the Direct HTTP dispatcher is connected to the control channel.
 
+`GET /ws/connections` is reserved for the management WebSocket event stream and currently returns
+`426 Upgrade Required` until the broadcaster is wired.
+
 ## Smoke Test
 
 When local port binding is available, run:

@@ -45,6 +45,23 @@ int main(void)
         return 1;
     }
 
+    if (st_storage_record_connection(path, "Demo client", 1, NULL, "2026-06-20T00:00:00Z") != 0
+        || st_storage_record_connection(path, "Demo client", 0, "LOGIN_FAILURE", "2026-06-20T01:00:00Z") != 0
+        || st_storage_archive_connections(path, "2026-06-21T00:00:00Z") != 0) {
+        fprintf(stderr, "connection archive setup failed\n");
+        unlink(path);
+        return 1;
+    }
+    int successes = 0;
+    int failures = 0;
+    if (st_storage_load_connection_stat(path, "Demo client", "2026-06-20", &successes, &failures) != 0
+        || successes != 1
+        || failures != 1) {
+        fprintf(stderr, "connection archive mismatch\n");
+        unlink(path);
+        return 1;
+    }
+
     unlink(path);
     return 0;
 }

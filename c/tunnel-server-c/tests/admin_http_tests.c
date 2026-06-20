@@ -36,6 +36,13 @@ int main(void)
         return 1;
     }
 
+    len = st_admin_build_response("GET", "/ws/connections", response, sizeof(response));
+    if (len <= 0 || !contains(response, "426 Upgrade Required")
+        || !contains(response, "websocket connection events")) {
+        fprintf(stderr, "websocket skeleton response mismatch\n");
+        return 1;
+    }
+
     len = st_admin_build_response("GET", "/missing", response, sizeof(response));
     if (len <= 0 || !contains(response, "404 Not Found")) {
         fprintf(stderr, "404 response mismatch\n");

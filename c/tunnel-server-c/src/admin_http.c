@@ -61,6 +61,13 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
                               "Not Implemented",
                               "{\"error\":\"direct http dispatch is not wired yet\"}");
     }
+    if (strcmp(path, "/ws/connections") == 0) {
+        return write_response(out,
+                              out_len,
+                              426,
+                              "Upgrade Required",
+                              "{\"error\":\"websocket connection events are not wired yet\"}");
+    }
     return write_response(out, out_len, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 

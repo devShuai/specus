@@ -219,3 +219,120 @@ int st_storage_upsert_mapping(const char *path,
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
 }
+
+int st_storage_record_connection(const char *path,
+                                 const char *client_name,
+                                 int success,
+                                 const char *reason,
+                                 const char *connected_at)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO connection_record(client_name, success, reason, connected_at, disconnected_at) "
+        "VALUES(?,?,?,?,?)",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 2, success ? 1 : 0);
+        if (reason == NULL) {
+            sqlite3_bind_null(stmt, 3);
+        } else {
+            sqlite3_bind_text(stmt, 3, reason, -1, SQLITE_TRANSIENT);
+        }
+        sqlite3_bind_text(stmt, 4, connected_at, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, connected_at, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+int st_storage_archive_connections(const char *path, const char *before_timestamp)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO connection_stat(client_name, stat_date, success_count, failure_count) "
+        "SELECT client_name, substr(connected_at, 1, 10), "
+        "SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) "
+        "FROM connection_record WHERE connected_at < ? "
+        "GROUP BY client_name, substr(connected_at, 1, 10) "
+        "ON CONFLICT(client_name, stat_date) DO UPDATE SET "
+        "success_count = success_count + excluded.success_count, "
+        "failure_count = failure_count + excluded.failure_count",
+        -1,
+        &stmt,
+        NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, before_timestamp, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+    } else {
+        rc = -1;
+    }
+    sqlite3_finalize(stmt);
+    if (rc == 0) {
+        rc = sqlite3_prepare_v2(db,
+            "DELETE FROM connection_record WHERE connected_at < ?",
+            -1,
+            &stmt,
+            NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, before_timestamp, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
+        } else {
+            rc = -1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    return rc == 0 ? 0 : -1;
+}
+
+int st_storage_load_connection_stat(const char *path,
+                                    const char *client_name,
+                                    const char *stat_date,
+                                    int *success_count,
+                                    int *failure_count)
+{
+    sqlite3 *db = NULL;
+    if (open_db(path, &db) != 0) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT success_count, failure_count FROM connection_stat "
+        "WHERE client_name = ? AND stat_date = ?",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, stat_date, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    *success_count = sqlite3_column_int(stmt, 0);
+    *failure_count = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return 0;
+}
