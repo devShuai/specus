@@ -49,6 +49,14 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
                               "OK",
                               "{\"server\":\"c\",\"status\":\"ok\",\"onlineClients\":0,\"tcpMappings\":0}");
     }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/admin/metrics") == 0) {
+        return write_response(out,
+                              out_len,
+                              200,
+                              "OK",
+                              "{\"server\":\"c\",\"metricsWired\":false,"
+                              "\"onlineClients\":0,\"listeners\":0,\"externalConnections\":0}");
+    }
     if (strcmp(method, "POST") == 0 && strcmp(path, "/auth/login") == 0) {
         return write_response(out,
                               out_len,

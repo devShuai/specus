@@ -97,3 +97,12 @@ bash c/tunnel-server-c/scripts/nat_e2e_smoke.sh
 
 The script starts a local echo server, this C server, and the existing Java client, then verifies a
 payload through the mapped public port.
+
+## Release Build
+
+```bash
+make -C c/tunnel-server-c release
+```
+
+The release target rebuilds the server with `-O3 -DNDEBUG` and strips the binary when `strip` is
+available. Example systemd files live under `c/tunnel-server-c/deploy/systemd/`.

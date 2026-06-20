@@ -29,6 +29,12 @@ int main(void)
         return 1;
     }
 
+    len = st_admin_build_response("GET", "/api/admin/metrics", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"metricsWired\":false")) {
+        fprintf(stderr, "metrics response mismatch\n");
+        return 1;
+    }
+
     len = st_admin_build_response("GET", "/http/Demo%20client/api/v1/items", response, sizeof(response));
     if (len <= 0 || !contains(response, "501 Not Implemented")
         || !contains(response, "direct http dispatch")) {

@@ -14,7 +14,7 @@ SECURITY_TESTS := $(BUILD_DIR)/shuai_tunnel_c_security_tests
 STORAGE_TESTS := $(BUILD_DIR)/shuai_tunnel_c_storage_tests
 TESTS := $(ADMIN_TESTS) $(CRYPTO_TESTS) $(JSON_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(STORAGE_TESTS)
 
-.PHONY: all test clean
+.PHONY: all test release clean
 
 all: $(SERVER) $(TESTS)
 
@@ -47,6 +47,10 @@ $(STORAGE_TESTS): $(CORE_OBJS) tests/storage_tests.c | $(BUILD_DIR)
 
 test: all
 	@for test in $(TESTS); do $$test || exit 1; done
+
+release: CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O3 -DNDEBUG
+release: clean $(SERVER)
+	strip $(SERVER) 2>/dev/null || true
 
 clean:
 	rm -rf $(BUILD_DIR)
