@@ -1,6 +1,7 @@
 #include "crypto.h"
 #include "json.h"
 #include "protocol.h"
+#include "storage.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -204,6 +205,19 @@ static int copy_config_string(char *dest, size_t dest_len, const char *name, con
     return 0;
 }
 
+static int env_bool(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        return default_value;
+    }
+    return strcmp(value, "0") != 0
+        && strcmp(value, "false") != 0
+        && strcmp(value, "FALSE") != 0
+        && strcmp(value, "no") != 0
+        && strcmp(value, "NO") != 0;
+}
+
 static char *trim(char *value)
 {
     while (*value != '\0' && isspace((unsigned char)*value)) {
@@ -291,6 +305,35 @@ static int parse_tcp_mappings(server_config *config)
     return 0;
 }
 
+static int load_database_config(server_config *config, const char *database_path)
+{
+    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        return -1;
+    }
+    if (st_storage_load_client_hash(database_path, config->client_name, config->password_hash) != 0) {
+        fprintf(stderr, "client not found or disabled in database: %s\n", config->client_name);
+        return -1;
+    }
+
+    st_storage_mapping mappings[ST_MAX_TCP_MAPPINGS];
+    size_t mapping_count = 0;
+    if (st_storage_load_mappings(database_path,
+                                 config->client_name,
+                                 mappings,
+                                 ST_MAX_TCP_MAPPINGS,
+                                 &mapping_count) != 0) {
+        fprintf(stderr, "failed to load tunnel mappings from database\n");
+        return -1;
+    }
+    for (size_t i = 0; i < mapping_count; ++i) {
+        tcp_mapping *mapping = &config->mappings[config->mapping_count++];
+        mapping->port = mappings[i].listen_port;
+        strcpy(mapping->tunnel_address, mappings[i].target_address);
+        mapping->tunnel_port = mappings[i].target_port;
+    }
+    return 0;
+}
+
 static int build_nat_control_json(server_config *config)
 {
     char *client_name = st_json_escape(config->client_name);
@@ -347,6 +390,7 @@ static int load_config(server_config *config)
     const char *password = getenv("TUNNEL_CLIENT_PASSWORD");
     const char *password_hash = getenv("TUNNEL_CLIENT_PASSWORD_HASH");
     const char *public_address = getenv("TUNNEL_PUBLIC_ADDRESS");
+    const char *database_path = getenv("TUNNEL_DATABASE_PATH");
 
     memset(config, 0, sizeof(*config));
     if (copy_config_string(config->client_name, sizeof(config->client_name),
@@ -369,7 +413,11 @@ static int load_config(server_config *config)
         return -1;
     }
 
-    if (password_hash != NULL && *password_hash != '\0') {
+    if (database_path != NULL && *database_path != '\0') {
+        if (load_database_config(config, database_path) != 0) {
+            return -1;
+        }
+    } else if (password_hash != NULL && *password_hash != '\0') {
         if (st_hex_decode_32(password_hash, config->password_hash) != 0) {
             fprintf(stderr, "invalid TUNNEL_CLIENT_PASSWORD_HASH; expected 64 hex chars\n");
             return -1;

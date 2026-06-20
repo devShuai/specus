@@ -49,6 +49,8 @@ Additional runtime knobs:
 | `TUNNEL_MAX_GLOBAL_EXTERNAL_CONNECTIONS` | `4096` | Global external TCP connection cap. |
 | `TUNNEL_MAX_CLIENT_EXTERNAL_CONNECTIONS` | `1024` | Per-control-session external TCP connection cap. |
 | `TUNNEL_MAX_PORT_EXTERNAL_CONNECTIONS` | `512` | Per-public-port external TCP connection cap. |
+| `TUNNEL_DATABASE_PATH` | unset | Optional SQLite database path for clients and mappings. |
+| `TUNNEL_DB_SEED_DEMO_CLIENT` | `true` | Seed `Demo client / test1234` when initializing SQLite. |
 
 `TUNNEL_TCP_MAPPINGS` is a comma-separated list of server listen ports mapped to client-side targets:
 
@@ -59,6 +61,11 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 The C server sends those mappings to the Java client via `NAT_CONTROL`; the client then registers
 each port back to the server, and external connections on the public port are bridged over the
 control channel.
+
+When `TUNNEL_DATABASE_PATH` is set, the server initializes a small SQLite schema and reads the
+selected `TUNNEL_CLIENT_NAME` from `client_account`; enabled rows in `tunnel_mapping` become the
+initial `NAT_CONTROL` TCP mappings. `TUNNEL_TCP_MAPPINGS` can still be used to append local
+development mappings.
 
 ## Smoke Test
 
