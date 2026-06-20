@@ -34,6 +34,9 @@ typedef struct {
     char public_address[256];
     int login_time_window_ms;
     int control_read_idle_seconds;
+    int max_global_external_connections;
+    int max_client_external_connections;
+    int max_port_external_connections;
     tcp_mapping mappings[ST_MAX_TCP_MAPPINGS];
     size_t mapping_count;
     char *nat_control_json;
@@ -48,6 +51,7 @@ typedef struct external_conn {
     pthread_t thread;
     int thread_started;
     int done;
+    int counted;
     tunnel_session *session;
     struct external_conn *next;
 } external_conn;
@@ -86,6 +90,9 @@ typedef struct {
     size_t len;
     size_t cap;
 } string_builder;
+
+static pthread_mutex_t global_external_lock = PTHREAD_MUTEX_INITIALIZER;
+static int global_external_connections = 0;
 
 static char *dup_string(const char *value)
 {
@@ -352,7 +359,13 @@ static int load_config(server_config *config)
         || env_int_range("TUNNEL_LOGIN_TIME_WINDOW_MS", 30000, 1000, 300000,
                          &config->login_time_window_ms) != 0
         || env_int_range("TUNNEL_CONTROL_READ_IDLE_SECONDS", 60, 5, 3600,
-                         &config->control_read_idle_seconds) != 0) {
+                         &config->control_read_idle_seconds) != 0
+        || env_int_range("TUNNEL_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
+                         &config->max_global_external_connections) != 0
+        || env_int_range("TUNNEL_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
+                         &config->max_client_external_connections) != 0
+        || env_int_range("TUNNEL_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
+                         &config->max_port_external_connections) != 0) {
         return -1;
     }
 
@@ -683,6 +696,19 @@ static external_conn *find_conn_locked(tunnel_session *session, const char *chan
     return NULL;
 }
 
+static void release_external_count(external_conn *conn)
+{
+    if (!conn->counted) {
+        return;
+    }
+    pthread_mutex_lock(&global_external_lock);
+    if (global_external_connections > 0) {
+        --global_external_connections;
+    }
+    conn->counted = 0;
+    pthread_mutex_unlock(&global_external_lock);
+}
+
 static void close_conn_locked(external_conn *conn)
 {
     if (conn->fd >= 0) {
@@ -690,7 +716,47 @@ static void close_conn_locked(external_conn *conn)
         close(conn->fd);
         conn->fd = -1;
     }
+    release_external_count(conn);
     conn->done = 1;
+}
+
+static int count_external_locked(tunnel_session *session, int port, int *client_count, int *port_count)
+{
+    int total = 0;
+    int on_port = 0;
+    for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
+        if (!conn->done) {
+            ++total;
+            if (conn->port == port) {
+                ++on_port;
+            }
+        }
+    }
+    *client_count = total;
+    *port_count = on_port;
+    return 0;
+}
+
+static int try_count_external_connection(external_conn *conn)
+{
+    tunnel_session *session = conn->session;
+    int client_count = 0;
+    int port_count = 0;
+    count_external_locked(session, conn->port, &client_count, &port_count);
+    if (client_count >= session->config.max_client_external_connections
+        || port_count >= session->config.max_port_external_connections) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&global_external_lock);
+    if (global_external_connections >= session->config.max_global_external_connections) {
+        pthread_mutex_unlock(&global_external_lock);
+        return -1;
+    }
+    ++global_external_connections;
+    conn->counted = 1;
+    pthread_mutex_unlock(&global_external_lock);
+    return 0;
 }
 
 static void mark_conn_done(external_conn *conn)
@@ -754,6 +820,14 @@ static int start_external_conn(tunnel_session *session, int fd, int port)
     conn->session = session;
 
     pthread_mutex_lock(&session->map_lock);
+    if (try_count_external_connection(conn) != 0) {
+        pthread_mutex_unlock(&session->map_lock);
+        fprintf(stderr, "[nat] reject external connection on port=%d client=%s: limit reached\n",
+                port, session->config.client_name);
+        close(fd);
+        free(conn);
+        return -1;
+    }
     snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%llu",
              (unsigned long long)session->next_channel_id++);
     conn->next = session->conns;

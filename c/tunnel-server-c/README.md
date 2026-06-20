@@ -46,6 +46,9 @@ Additional runtime knobs:
 | `TUNNEL_PUBLIC_ADDRESS` | `127.0.0.1` | Public address included in `NAT_CONTROL`. |
 | `TUNNEL_LOGIN_TIME_WINDOW_MS` | `30000` | Allowed login timestamp skew in milliseconds. |
 | `TUNNEL_CONTROL_READ_IDLE_SECONDS` | `60` | Control-channel read idle timeout. |
+| `TUNNEL_MAX_GLOBAL_EXTERNAL_CONNECTIONS` | `4096` | Global external TCP connection cap. |
+| `TUNNEL_MAX_CLIENT_EXTERNAL_CONNECTIONS` | `1024` | Per-control-session external TCP connection cap. |
+| `TUNNEL_MAX_PORT_EXTERNAL_CONNECTIONS` | `512` | Per-public-port external TCP connection cap. |
 
 `TUNNEL_TCP_MAPPINGS` is a comma-separated list of server listen ports mapped to client-side targets:
 
@@ -56,3 +59,14 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 The C server sends those mappings to the Java client via `NAT_CONTROL`; the client then registers
 each port back to the server, and external connections on the public port are bridged over the
 control channel.
+
+## Smoke Test
+
+When local port binding is available, run:
+
+```bash
+bash c/tunnel-server-c/scripts/nat_e2e_smoke.sh
+```
+
+The script starts a local echo server, this C server, and the existing Java client, then verifies a
+payload through the mapped public port.
