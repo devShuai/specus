@@ -32,6 +32,8 @@ typedef struct {
     uint8_t password_hash[ST_SHA256_LEN];
     int port;
     char public_address[256];
+    int login_time_window_ms;
+    int control_read_idle_seconds;
     tcp_mapping mappings[ST_MAX_TCP_MAPPINGS];
     size_t mapping_count;
     char *nat_control_json;
@@ -163,18 +165,36 @@ static char *sb_finish(string_builder *builder)
     return out;
 }
 
-static int env_int(const char *name, int default_value)
+static int env_int_range(const char *name, int default_value, int min_value, int max_value, int *out)
 {
     const char *value = getenv(name);
     if (value == NULL || *value == '\0') {
-        return default_value;
+        *out = default_value;
+        return 0;
     }
     char *end = NULL;
     long parsed = strtol(value, &end, 10);
-    if (end == value || *end != '\0' || parsed <= 0 || parsed > 65535) {
-        return default_value;
+    if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+        fprintf(stderr, "invalid %s; expected integer in [%d,%d]\n", name, min_value, max_value);
+        return -1;
     }
-    return (int)parsed;
+    *out = (int)parsed;
+    return 0;
+}
+
+static int copy_config_string(char *dest, size_t dest_len, const char *name, const char *value)
+{
+    if (value == NULL || *value == '\0') {
+        fprintf(stderr, "%s cannot be empty\n", name);
+        return -1;
+    }
+    size_t len = strlen(value);
+    if (len >= dest_len) {
+        fprintf(stderr, "%s is too long; max %zu bytes\n", name, dest_len - 1U);
+        return -1;
+    }
+    memcpy(dest, value, len + 1U);
+    return 0;
 }
 
 static char *trim(char *value)
@@ -242,6 +262,11 @@ static int parse_tcp_mappings(server_config *config)
             free(copy);
             return -1;
         }
+        if (strlen(target_host) >= sizeof(config->mappings[0].tunnel_address)) {
+            fprintf(stderr, "mapping target host is too long\n");
+            free(copy);
+            return -1;
+        }
 
         tcp_mapping *mapping = &config->mappings[config->mapping_count];
         if (parse_port_text(public_port_text, &mapping->port) != 0
@@ -251,7 +276,7 @@ static int parse_tcp_mappings(server_config *config)
             free(copy);
             return -1;
         }
-        snprintf(mapping->tunnel_address, sizeof(mapping->tunnel_address), "%s", target_host);
+        strcpy(mapping->tunnel_address, target_host);
         ++config->mapping_count;
         token = strtok(NULL, ",");
     }
@@ -317,11 +342,19 @@ static int load_config(server_config *config)
     const char *public_address = getenv("TUNNEL_PUBLIC_ADDRESS");
 
     memset(config, 0, sizeof(*config));
-    snprintf(config->client_name, sizeof(config->client_name), "%s",
-             (name != NULL && *name != '\0') ? name : "Demo client");
-    snprintf(config->public_address, sizeof(config->public_address), "%s",
-             (public_address != NULL && *public_address != '\0') ? public_address : "127.0.0.1");
-    config->port = env_int("TUNNEL_NETTY_PORT", 7010);
+    if (copy_config_string(config->client_name, sizeof(config->client_name),
+                           "TUNNEL_CLIENT_NAME",
+                           (name != NULL && *name != '\0') ? name : "Demo client") != 0
+        || copy_config_string(config->public_address, sizeof(config->public_address),
+                              "TUNNEL_PUBLIC_ADDRESS",
+                              (public_address != NULL && *public_address != '\0') ? public_address : "127.0.0.1") != 0
+        || env_int_range("TUNNEL_NETTY_PORT", 7010, 1, 65535, &config->port) != 0
+        || env_int_range("TUNNEL_LOGIN_TIME_WINDOW_MS", 30000, 1000, 300000,
+                         &config->login_time_window_ms) != 0
+        || env_int_range("TUNNEL_CONTROL_READ_IDLE_SECONDS", 60, 5, 3600,
+                         &config->control_read_idle_seconds) != 0) {
+        return -1;
+    }
 
     if (password_hash != NULL && *password_hash != '\0') {
         if (st_hex_decode_32(password_hash, config->password_hash) != 0) {
@@ -363,6 +396,9 @@ static int recv_all(int fd, uint8_t *buffer, size_t len)
         if (read_len < 0) {
             if (errno == EINTR) {
                 continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return -2;
             }
             return -1;
         }
@@ -454,7 +490,8 @@ static int verify_login(const server_config *config, const st_login_request *req
         return 0;
     }
     int64_t delta = now_ms() - (int64_t)timestamp;
-    if (delta < -30000LL || delta > 30000LL) {
+    int64_t window = (int64_t)config->login_time_window_ms;
+    if (delta < -window || delta > window) {
         *reason = "签名无效或已过期";
         return 0;
     }
@@ -531,6 +568,14 @@ static int create_listener(int port)
         return -1;
     }
     return fd;
+}
+
+static void configure_control_socket(int fd, const server_config *config)
+{
+    struct timeval timeout;
+    timeout.tv_sec = config->control_read_idle_seconds;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 }
 
 static int mapping_allowed(const server_config *config, int port, const char *address, int tunnel_port)
@@ -1025,6 +1070,10 @@ static void *client_thread(void *arg)
             printf("[control] closed %s\n", session->remote);
             break;
         }
+        if (rc == -2) {
+            fprintf(stderr, "[control] read idle timeout from %s\n", session->remote);
+            break;
+        }
         if (rc < 0) {
             fprintf(stderr, "[control] bad frame from %s\n", session->remote);
             break;
@@ -1153,6 +1202,7 @@ int main(void)
         args->config = config;
         int one = 1;
         setsockopt(args->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        configure_control_socket(args->fd, &config);
 
         pthread_t thread;
         if (pthread_create(&thread, NULL, client_thread, args) != 0) {

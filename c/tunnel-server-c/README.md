@@ -39,6 +39,14 @@ c/tunnel-server-c/build/shuai-tunnel-server-c
 Instead of `TUNNEL_CLIENT_PASSWORD`, you may set `TUNNEL_CLIENT_PASSWORD_HASH` to the 64-character
 lowercase SHA-256 hex hash stored by the Java management database.
 
+Additional runtime knobs:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TUNNEL_PUBLIC_ADDRESS` | `127.0.0.1` | Public address included in `NAT_CONTROL`. |
+| `TUNNEL_LOGIN_TIME_WINDOW_MS` | `30000` | Allowed login timestamp skew in milliseconds. |
+| `TUNNEL_CONTROL_READ_IDLE_SECONDS` | `60` | Control-channel read idle timeout. |
+
 `TUNNEL_TCP_MAPPINGS` is a comma-separated list of server listen ports mapped to client-side targets:
 
 ```text
