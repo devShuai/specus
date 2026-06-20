@@ -33,6 +33,20 @@ builder.Services.Configure<TrafficOptions>(
     builder.Configuration.GetSection(TrafficOptions.SectionName));
 builder.Services.Configure<DirectHttpOptions>(
     builder.Configuration.GetSection(DirectHttpOptions.SectionName));
+builder.Services.Configure<OidcOptions>(
+    builder.Configuration.GetSection(OidcOptions.SectionName));
+builder.Services.Configure<TlsOptions>(
+    builder.Configuration.GetSection(TlsOptions.SectionName));
+
+builder.WebHost.ConfigureKestrel((context, kestrel) =>
+{
+    var tls = context.Configuration.GetSection(TlsOptions.SectionName).Get<TlsOptions>() ?? new TlsOptions();
+    var certificate = TlsCertificateLoader.LoadServerCertificate(tls);
+    if (certificate is not null)
+    {
+        kestrel.ConfigureEndpointDefaults(endpoint => endpoint.UseHttps(certificate));
+    }
+});
 
 // Persistence ---------------------------------------------------------------------------------
 
@@ -50,6 +64,11 @@ builder.Services.AddScoped<ManagementQueryService>();
 builder.Services.AddScoped<ManagementMutationService>();
 
 builder.Services.AddSingleton<LocalTokenService>();
+builder.Services.AddSingleton<AdminBearerTokenValidator>();
+builder.Services.AddSingleton<OidcTokenValidator>();
+builder.Services.AddSingleton<IOidcJwkProvider, HttpOidcJwkProvider>();
+builder.Services.AddSingleton<OidcTokenExchangeService>();
+builder.Services.AddSingleton<IOidcTokenEndpointClient, HttpOidcTokenEndpointClient>();
 builder.Services.AddSingleton<DatabaseInitializer>();
 
 // Control-channel pipeline --------------------------------------------------------------------
@@ -64,6 +83,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficUsageServic
 builder.Services.AddSingleton<NatServerHandler>();
 builder.Services.AddSingleton<DirectHttpDispatcher>();
 builder.Services.AddSingleton<ConnectionEventsHub>();
+builder.Services.AddSingleton<ControlChannelTlsProvider>();
 builder.Services.AddSingleton<IControlChannelDispatcher, ControlChannelDispatcher>();
 builder.Services.AddSingleton<ControlChannelListener>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ControlChannelListener>());

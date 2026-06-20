@@ -36,7 +36,7 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
     private static readonly TimeSpan IdleTickInterval = TimeSpan.FromSeconds(1);
 
     private readonly Socket _socket;
-    private readonly NetworkStream _stream;
+    private readonly Stream _stream;
     private readonly PipeReader _reader;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly CancellationTokenSource _lifetimeCts;
@@ -49,11 +49,11 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
 
     public TunnelConnectionContext Context { get; }
 
-    public TunnelConnection(Socket socket, IControlChannelDispatcher dispatcher,
+    public TunnelConnection(Socket socket, Stream stream, IControlChannelDispatcher dispatcher,
         ILogger logger, NettyServerOptions options, CancellationToken hostStopping)
     {
         _socket = socket;
-        _stream = new NetworkStream(socket, ownsSocket: false);
+        _stream = stream;
         _reader = PipeReader.Create(_stream);
         _dispatcher = dispatcher;
         _logger = logger;

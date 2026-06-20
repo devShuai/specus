@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -25,15 +26,26 @@ namespace ShuaiTunnel.IntegrationTests;
 /// </summary>
 internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsyncDisposable
 {
+    private readonly IReadOnlyDictionary<string, string?> _configurationOverrides;
+    private readonly Action<IServiceCollection>? _configureServices;
     private string? _dbPath;
 
     public int ControlPort { get; private set; }
 
     public IServiceProvider HostServices => Server.Services;
 
-    public static async Task<TestServerFixture> StartAsync()
+    private TestServerFixture(IReadOnlyDictionary<string, string?>? configurationOverrides = null,
+        Action<IServiceCollection>? configureServices = null)
     {
-        var fixture = new TestServerFixture();
+        _configurationOverrides = configurationOverrides ?? new Dictionary<string, string?>();
+        _configureServices = configureServices;
+    }
+
+    public static async Task<TestServerFixture> StartAsync(
+        IReadOnlyDictionary<string, string?>? configurationOverrides = null,
+        Action<IServiceCollection>? configureServices = null)
+    {
+        var fixture = new TestServerFixture(configurationOverrides, configureServices);
         // Starts the host eagerly so ControlChannelListener has bound by the time we read its port.
         _ = fixture.Server;
         var listener = fixture.Server.Services.GetRequiredService<ControlChannelListener>();
@@ -132,7 +144,16 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
                 // default, so this is mostly defense-in-depth.
                 ["Kestrel:Endpoints:Http:Url"] = "http://127.0.0.1:0",
             });
+            if (_configurationOverrides.Count > 0)
+            {
+                config.AddInMemoryCollection(_configurationOverrides);
+            }
         });
+
+        if (_configureServices is not null)
+        {
+            builder.ConfigureTestServices(_configureServices);
+        }
     }
 
     public new async ValueTask DisposeAsync()

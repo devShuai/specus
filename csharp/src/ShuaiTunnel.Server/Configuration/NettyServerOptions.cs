@@ -78,3 +78,43 @@ public sealed class DirectHttpOptions
     public int TimeoutMs { get; set; } = 30_000;
     public int MaxRequestBodySize { get; set; } = 16 * 1024 * 1024;
 }
+
+public sealed class OidcOptions
+{
+    public const string SectionName = "Tunnel:Oidc";
+
+    public string Issuer { get; set; } = "https://gateway.toys.theshuai.com/auth";
+    public string JwkSetUri { get; set; } = "https://gateway.toys.theshuai.com/auth/oauth2/jwks";
+    public string AuthorizationEndpoint { get; set; } = "https://gateway.toys.theshuai.com/auth/oauth2/authorize";
+    public string TokenEndpoint { get; set; } = "https://gateway.toys.theshuai.com/auth/oauth2/token";
+    public string EndSessionEndpoint { get; set; } = "https://gateway.toys.theshuai.com/auth/connect/logout";
+    public string ClientId { get; set; } = string.Empty;
+    public string ClientSecret { get; set; } = string.Empty;
+    public string RedirectUri { get; set; } = "http://127.0.0.1:8088/";
+    public string Scope { get; set; } = "openid";
+    public string Audience { get; set; } = string.Empty;
+}
+
+public sealed class TlsOptions
+{
+    public const string SectionName = "Tunnel:Tls";
+
+    public string Mode { get; set; } = "disabled";
+    public string? Keystore { get; set; }
+    public string? KeystorePassword { get; set; }
+    public string? KeyPassword { get; set; }
+
+    public TlsMode ResolveMode() => Mode?.Trim().ToLowerInvariant() switch
+    {
+        "file" => TlsMode.File,
+        "self-signed" or "selfsigned" or "self_signed" => TlsMode.SelfSigned,
+        _ => TlsMode.Disabled,
+    };
+}
+
+public enum TlsMode
+{
+    Disabled,
+    File,
+    SelfSigned,
+}

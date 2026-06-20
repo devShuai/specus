@@ -1,9 +1,13 @@
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Configuration;
+using ShuaiTunnel.Server.Security;
 
 namespace ShuaiTunnel.Server.ControlChannel;
 
@@ -20,23 +24,27 @@ public sealed class ControlChannelListener : IHostedService
 {
     private readonly ILogger<ControlChannelListener> _logger;
     private readonly IOptions<NettyServerOptions> _options;
+    private readonly ControlChannelTlsProvider _tlsProvider;
     private readonly IControlChannelDispatcher _dispatcher;
     private readonly ILoggerFactory _loggerFactory;
     private readonly CancellationTokenSource _shutdownCts = new();
 
     private TcpListener? _listener;
     private Task? _acceptLoop;
+    private X509Certificate2? _serverCertificate;
 
     /// <summary>Available after <see cref="StartAsync"/>. Returns -1 before bind succeeds.</summary>
     public int BoundPort { get; private set; } = -1;
 
     public ControlChannelListener(ILogger<ControlChannelListener> logger,
         IOptions<NettyServerOptions> options,
+        ControlChannelTlsProvider tlsProvider,
         IControlChannelDispatcher dispatcher,
         ILoggerFactory loggerFactory)
     {
         _logger = logger;
         _options = options;
+        _tlsProvider = tlsProvider;
         _dispatcher = dispatcher;
         _loggerFactory = loggerFactory;
     }
@@ -47,6 +55,11 @@ public sealed class ControlChannelListener : IHostedService
         _listener = new TcpListener(IPAddress.Any, configured);
         _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _listener.Start(backlog: 8192);
+        _serverCertificate = _tlsProvider.GetServerCertificate();
+        if (_serverCertificate is null)
+        {
+            _logger.LogInformation("[tls] control channel is PLAIN (TLS disabled)");
+        }
         BoundPort = ((IPEndPoint)_listener.LocalEndpoint).Port;
         _logger.LogInformation("control channel bound on port {Port}", BoundPort);
 
@@ -109,15 +122,45 @@ public sealed class ControlChannelListener : IHostedService
                 // Best effort — older kernels may reject the setsockopt; not worth aborting.
             }
 
+            // Fire-and-forget — the connection handles its own lifecycle and disposal. The
+            // listener never awaits this task because there's no useful place to surface errors.
+            _ = Task.Run(() => RunAcceptedConnectionAsync(socket, token), token);
+        }
+    }
+
+    private async Task RunAcceptedConnectionAsync(Socket socket, CancellationToken token)
+    {
+        Stream stream = new NetworkStream(socket, ownsSocket: false);
+        try
+        {
+            if (_serverCertificate is not null)
+            {
+                var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+                stream = sslStream;
+                await sslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = _serverCertificate,
+                    ClientCertificateRequired = false,
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                }, token).ConfigureAwait(false);
+            }
+
             var connection = new TunnelConnection(
-                socket, _dispatcher,
+                socket,
+                stream,
+                _dispatcher,
                 _loggerFactory.CreateLogger<TunnelConnection>(),
                 _options.Value,
                 token);
-
-            // Fire-and-forget — the connection handles its own lifecycle and disposal. The
-            // listener never awaits this task because there's no useful place to surface errors.
-            _ = Task.Run(connection.RunAsync, token);
+            await connection.RunAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is AuthenticationException or IOException or SocketException
+            or ObjectDisposedException or OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "control channel handshake failed");
+            try { stream.Dispose(); } catch { /* already gone */ }
+            try { socket.Close(); } catch { /* already gone */ }
         }
     }
 }

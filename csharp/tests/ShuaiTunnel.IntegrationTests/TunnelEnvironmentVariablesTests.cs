@@ -14,6 +14,8 @@ public sealed class TunnelEnvironmentVariablesTests
             ["TUNNEL_NETTY_WRITE_BUFFER_HIGH_WATER_MARK"] = "2048",
             ["TUNNEL_DB_SEED_DEMO_CLIENT"] = "false",
             ["TUNNEL_LOGIN_EXECUTOR_QUEUE_CAPACITY"] = "7",
+            ["TUNNEL_OIDC_JWK_SET_URI"] = "https://issuer.example/jwks",
+            ["TUNNEL_TLS_KEYSTORE_PASSWORD"] = "changeit",
         };
 
         var mapped = TunnelEnvironmentVariables.BuildConfigurationMap(variables);
@@ -23,6 +25,8 @@ public sealed class TunnelEnvironmentVariablesTests
         Assert.Equal("2048", mapped["Tunnel:Netty:WriteBufferHighWaterMark"]);
         Assert.Equal("false", mapped["Tunnel:Database:SeedDemoClient"]);
         Assert.Equal("7", mapped["Tunnel:Login:ExecutorQueueCapacity"]);
+        Assert.Equal("https://issuer.example/jwks", mapped["Tunnel:Oidc:JwkSetUri"]);
+        Assert.Equal("changeit", mapped["Tunnel:Tls:KeystorePassword"]);
     }
 
     [Fact]

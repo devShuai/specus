@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Options;
+using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Security;
 
 namespace ShuaiTunnel.Server.Management;
@@ -41,8 +43,8 @@ public static class AdminApiEndpoints
             var token = header.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
                 ? header[prefix.Length..].Trim()
                 : null;
-            var tokens = context.RequestServices.GetRequiredService<LocalTokenService>();
-            var principal = tokens.Validate(token);
+            var tokens = context.RequestServices.GetRequiredService<AdminBearerTokenValidator>();
+            var principal = await tokens.ValidateAsync(token, context.RequestAborted).ConfigureAwait(false);
             if (principal is null)
             {
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -71,6 +73,13 @@ public static class AdminApiEndpoints
 
         app.MapPost("/auth/refresh", (HttpContext context, LocalTokenService tokens) =>
         {
+            if (!string.Equals(context.User.FindFirst("iss")?.Value, LocalTokenService.Issuer,
+                    StringComparison.Ordinal))
+            {
+                return Results.Json(new { error = "OIDC 令牌不能通过该端点续期" },
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
             var username = context.User.Identity?.Name;
             if (string.IsNullOrWhiteSpace(username))
             {
@@ -80,6 +89,26 @@ public static class AdminApiEndpoints
 
             return Results.Ok(tokens.IssueTokenBody(username));
         });
+
+        app.MapGet("/oidc-config", (IOptions<OidcOptions> options, LocalTokenService tokens) =>
+        {
+            var oidc = options.Value;
+            return Results.Ok(new
+            {
+                configured = !string.IsNullOrWhiteSpace(oidc.ClientId),
+                authorizationEndpoint = oidc.AuthorizationEndpoint,
+                endSessionEndpoint = oidc.EndSessionEndpoint,
+                clientId = oidc.ClientId,
+                redirectUri = oidc.RedirectUri,
+                scope = oidc.Scope,
+                passwordLoginEnabled = tokens.IsPasswordLoginEnabled,
+            });
+        });
+
+        app.MapPost("/oidc/token",
+            (OidcTokenExchangeRequest? request, OidcTokenExchangeService exchange,
+                CancellationToken cancellationToken) =>
+                exchange.ExchangeAsync(request, cancellationToken));
 
         app.MapGet("/api/admin/overview",
             (ManagementQueryService service, CancellationToken cancellationToken) =>

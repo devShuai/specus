@@ -18,7 +18,7 @@ public sealed class ConnectionEventsHub
         _logger = logger;
     }
 
-    public async Task AcceptAsync(HttpContext context, LocalTokenService tokens)
+    public async Task AcceptAsync(HttpContext context, AdminBearerTokenValidator tokens)
     {
         if (!context.WebSockets.IsWebSocketRequest)
         {
@@ -26,7 +26,9 @@ public sealed class ConnectionEventsHub
             return;
         }
 
-        var principal = tokens.Validate(context.Request.Query["token"].ToString());
+        var principal = await tokens.ValidateAsync(
+            context.Request.Query["token"].ToString(),
+            context.RequestAborted).ConfigureAwait(false);
         if (principal is null)
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -109,6 +111,6 @@ public static class ConnectionEventsWebSocketEndpoint
     {
         app.UseWebSockets();
         app.Map("/ws/connections", (HttpContext context, ConnectionEventsHub hub,
-            LocalTokenService tokens) => hub.AcceptAsync(context, tokens));
+            AdminBearerTokenValidator tokens) => hub.AcceptAsync(context, tokens));
     }
 }
