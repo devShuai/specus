@@ -21,7 +21,7 @@ persistence, dynamic listeners, SPA hosting, JWT/OIDC, and TLS in one service.
 ## Build
 
 ```bash
-make -C c/tunnel-server-c test
+make -C tunnel-server-c test
 ```
 
 The C build uses pthreads and zlib.
@@ -33,7 +33,7 @@ TUNNEL_NETTY_PORT=7010 \
 TUNNEL_CLIENT_NAME="Demo client" \
 TUNNEL_CLIENT_PASSWORD="test1234" \
 TUNNEL_TCP_MAPPINGS="18080=127.0.0.1:8080" \
-c/tunnel-server-c/build/shuai-tunnel-server-c
+tunnel-server-c/build/shuai-tunnel-server-c
 ```
 
 Instead of `TUNNEL_CLIENT_PASSWORD`, you may set `TUNNEL_CLIENT_PASSWORD_HASH` to the 64-character
@@ -92,7 +92,7 @@ handshake wiring is not enabled yet.
 When local port binding is available, run:
 
 ```bash
-bash c/tunnel-server-c/scripts/nat_e2e_smoke.sh
+bash tunnel-server-c/scripts/nat_e2e_smoke.sh
 ```
 
 The script starts a local echo server, this C server, and the existing Java client, then verifies a
@@ -101,8 +101,8 @@ payload through the mapped public port.
 ## Release Build
 
 ```bash
-make -C c/tunnel-server-c release
+make -C tunnel-server-c release
 ```
 
 The release target rebuilds the server with `-O3 -DNDEBUG` and strips the binary when `strip` is
-available. Example systemd files live under `c/tunnel-server-c/deploy/systemd/`.
+available. Example systemd files live under `tunnel-server-c/deploy/systemd/`.

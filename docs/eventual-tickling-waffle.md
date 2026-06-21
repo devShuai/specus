@@ -23,7 +23,7 @@
 新建并行目录,Java 模块原地保留:
 
 ```
-csharp/
+tunnel-server-csharp/
 ├── ShuaiTunnel.sln
 ├── src/
 │   ├── ShuaiTunnel.Protocol/          # tunnel-common 等价物 (codec + packets)
@@ -126,7 +126,7 @@ csharp/
 - `ConnectionEventBroadcaster`:用 EF Core `ISaveChangesInterceptor.SavedChangesAsync` hook,只在 commit 后把事件写进 `Channel<ConnectionEvent>`
 - `/ws/connections`:`app.UseWebSockets()`,握手时从 query 读 `?token=`,用同一个 JwtBearer 校验,失败返回 403 + `X-Auth-Reason`
 - Direct HTTP:`HttpTunnelController` 路由 `/http/{client}/{route}/{**rest}`,用 `ConcurrentDictionary<Guid, TaskCompletionSource<DirectHttpResponsePacket>>` + `WaitAsync(timeout)` 替代 [SyncFuture](tunnel-common/src/main/java/com/theshuai/common/future/SyncFuture.java)
-- 静态资源:从 Java 项目复制 `static/index.html`、`app.js`、`app.css` 到 `csharp/src/ShuaiTunnel.Server/wwwroot/`,`UseStaticFiles` + `UseDefaultFiles`
+- 静态资源:从 Java 项目复制 `static/index.html`、`app.js`、`app.css` 到 `tunnel-server-csharp/src/ShuaiTunnel.Server/wwwroot/`,`UseStaticFiles` + `UseDefaultFiles`
 - CSP / 安全头:中间件等价 [SecurityConfig.java](tunnel-server/src/main/java/com/theshuai/tunnelserver/config/SecurityConfig.java)
 - `ConnectionArchiveService`:每小时 `BackgroundService`,把 60 天前的 `ConnectionRecord` 聚合到 `ConnectionStat` 后删除,参考 [ConnectionArchiveService.java](tunnel-server/src/main/java/com/theshuai/tunnelserver/management/service/ConnectionArchiveService.java)
 - `NatControlService` push:管理 CRUD 后下发 MESSAGE_RESPONSE/NAT_CONTROL 热更新(登录后初始 push 已在 Phase 3 完成)
@@ -172,10 +172,10 @@ csharp/
 
 每个 PR 都跑:
 
-1. `dotnet build csharp/ShuaiTunnel.sln` — 无 warning/error
+1. `dotnet build tunnel-server-csharp/ShuaiTunnel.sln` — 无 warning/error
 2. `dotnet test` — protocol fixture + 单测 + 集成测试全绿
 3. 当前阶段对应的 Java client × C# server 集成测试场景跑通
-4. Phase 4 起,启动 server (`dotnet run --project csharp/src/ShuaiTunnel.Server`),浏览器手动验:登录 → 列表 → 创建/编辑 tunnel → 看到 WS 事件
+4. Phase 4 起,启动 server (`dotnet run --project tunnel-server-csharp/src/ShuaiTunnel.Server`),浏览器手动验:登录 → 列表 → 创建/编辑 tunnel → 看到 WS 事件
 5. Phase 5 起,加测 self-signed TLS 与 OIDC mock
 
 最终验收:Java tunnel-server 与 C# 版本可以互换部署,跑同一份 SPA、同一批 Java tunnel-client,行为等价。

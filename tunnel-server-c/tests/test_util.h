@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ST_FIXTURE_DIR "../../csharp/tests/fixtures/"
+#define ST_FIXTURE_DIR "../tunnel-server-csharp/tests/fixtures/"
 
 static int st_test_read_file(const char *path, uint8_t **out, size_t *out_len)
 {

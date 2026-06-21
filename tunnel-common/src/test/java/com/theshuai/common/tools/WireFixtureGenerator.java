@@ -36,11 +36,11 @@ import java.util.Map;
  *   mvn -pl tunnel-common test-compile exec:java \
  *       -Dexec.mainClass=com.theshuai.common.tools.WireFixtureGenerator \
  *       -Dexec.classpathScope=test \
- *       -Dexec.args="../csharp/tests/fixtures"
+ *       -Dexec.args="../tunnel-server-tunnel-server-csharp/tests/fixtures"
  * </pre>
  *
  * <p>The C# tests load these as expected-bytes fixtures — see
- * <c>csharp/tests/ShuaiTunnel.Protocol.Tests/PacketCodecFixtureTests.cs</c>.
+ * <c>tunnel-server-csharp/tests/ShuaiTunnel.Protocol.Tests/PacketCodecFixtureTests.cs</c>.
  *
  * <p>Each fixture is named after the packet kind (e.g. <c>login_request.bin</c>) plus optional
  * variant suffixes. Update {@link Fixtures#emit(Path)} when adding new fixtures and re-run.
@@ -48,7 +48,7 @@ import java.util.Map;
 public final class WireFixtureGenerator {
 
     public static void main(String[] args) throws IOException {
-        Path outputDir = Paths.get(args.length > 0 ? args[0] : "csharp/tests/fixtures").toAbsolutePath();
+        Path outputDir = Paths.get(args.length > 0 ? args[0] : "tunnel-server-csharp/tests/fixtures").toAbsolutePath();
         Files.createDirectories(outputDir);
         new Fixtures(outputDir).emit();
         System.out.println("wrote fixtures to " + outputDir);

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-C_DIR="$ROOT_DIR/c/tunnel-server-c"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+C_DIR="$ROOT_DIR/tunnel-server-c"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shuai-tunnel-c-smoke.XXXXXX")"
 CONTROL_PORT="${CONTROL_PORT:-17010}"
 PUBLIC_PORT="${PUBLIC_PORT:-18080}"
