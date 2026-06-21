@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>shuai-tunnel 管理后台</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="toasts" aria-live="polite"></div>
+
+<dialog id="editClientDialog" class="dialog" aria-labelledby="ec-title">
+  <form id="editClientForm" data-form="editClient" class="dialog-form" autocomplete="off">
+    <h3 id="ec-title">编辑客户端</h3>
+    <label>客户端名称<input id="ec-name" required maxlength="64"></label>
+    <label>新密码（留空表示不修改）
+      <span class="input-pw">
+        <input id="ec-password" type="password" autocomplete="new-password" placeholder="留空保留原密码">
+        <button type="button" class="ghost" data-action="toggleEcPw">显示</button>
+      </span>
+    </label>
+    <label>每分钟连接次数（0 = 不限）<input id="ec-rate" type="number" min="0" max="10000" required></label>
+    <label class="row"><input id="ec-enabled" type="checkbox"> 启用客户端</label>
+    <div class="dialog-actions">
+      <button type="button" class="secondary" data-action="closeEditClient">取消</button>
+      <button type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="editTunnelDialog" class="dialog" aria-labelledby="et-title">
+  <form id="editTunnelForm" data-form="editTunnel" class="dialog-form" autocomplete="off">
+    <h3 id="et-title">编辑端口映射</h3>
+    <label>公网端口<input id="et-listenPort" type="number" min="1" max="65535" required></label>
+    <label>内网目标地址<input id="et-targetAddress" required maxlength="255"></label>
+    <label>内网目标端口<input id="et-targetPort" type="number" min="1" max="65535" required></label>
+    <label class="row"><input id="et-enabled" type="checkbox"> 启用映射</label>
+    <div class="dialog-actions">
+      <button type="button" class="secondary" data-action="closeEditTunnel">取消</button>
+      <button type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="editHttpRouteDialog" class="dialog" aria-labelledby="er-title">
+  <form id="editHttpRouteForm" data-form="editHttpRoute" class="dialog-form" autocomplete="off">
+    <h3 id="er-title">编辑 HTTP 路由</h3>
+    <label>路由名 <input id="er-route" required maxlength="60" placeholder="如 web"></label>
+    <label>目标地址 <input id="er-targetBaseUrl" required maxlength="512" placeholder="如 http://127.0.0.1:8080"></label>
+    <label class="row"><input id="er-enabled" type="checkbox"> 启用路由</label>
+    <div class="dialog-actions">
+      <button type="button" class="secondary" data-action="closeEditHttpRoute">取消</button>
+      <button type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="passwordDialog" class="dialog" aria-labelledby="pw-title">
+  <div class="dialog-form">
+    <h3 id="pw-title">客户端密码</h3>
+    <p class="muted small" id="pw-note">这是新生成的密码，仅显示一次。请立即复制并妥善保存。</p>
+    <div class="input-pw">
+      <input id="pw-value" readonly aria-label="生成的密码">
+      <button type="button" class="ghost" data-action="copyPw">复制</button>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" data-action="closePw">我已保存</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="login" class="login-overlay" hidden>
+  <div class="login-card">
+    <h1>shuai-tunnel 管理后台</h1>
+    <p id="loginHint">请登录</p>
+    <form id="pwForm" data-form="passwordLogin" class="login-form" hidden>
+      <input id="pwUser" placeholder="用户名" autocomplete="username" aria-label="用户名">
+      <input id="pwPass" type="password" placeholder="密码" autocomplete="current-password" aria-label="密码">
+      <button type="submit">登录</button>
+    </form>
+    <div id="loginDivider" class="login-divider" hidden>或</div>
+    <button id="loginButton" class="secondary" data-action="oidcLogin" hidden>使用 OIDC 登录</button>
+  </div>
+</div>
+
+<header id="appHeader" hidden>
+  <h1>shuai-tunnel 管理后台</h1>
+  <div class="header-actions">
+    <button class="secondary" data-action="initDb">初始化数据库</button>
+    <button class="secondary" data-action="logout">退出登录</button>
+  </div>
+</header>
+
+<main id="appMain" hidden>
+  <section id="overview" class="grid"></section>
+
+  <section class="panel">
+    <h2>客户端管理</h2>
+    <form class="form" data-form="createClient" autocomplete="off">
+      <input id="clientName" required placeholder="客户端名称" aria-label="客户端名称">
+      <input id="password" placeholder="密码（留空自动生成）" aria-label="密码">
+      <input id="rateLimit" type="number" min="0" max="10000" value="30" placeholder="每分钟连接次数" aria-label="每分钟连接次数">
+      <button type="submit">创建客户端</button>
+      <button type="button" class="secondary" data-action="refresh">刷新</button>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>客户端</th><th>状态</th><th>每分钟连接上限</th><th>上传</th><th>下载</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody id="clients"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>端口映射（NAT）</h2>
+    <form class="form" data-form="createTunnel" autocomplete="off">
+      <select id="tunnelClientId" required aria-label="客户端"></select>
+      <input id="listenPort" type="number" min="1" max="65535" required placeholder="公网端口" aria-label="公网端口">
+      <input id="targetAddress" required placeholder="内网地址，如 127.0.0.1" aria-label="内网地址">
+      <input id="targetPort" type="number" min="1" max="65535" required placeholder="内网端口" aria-label="内网端口">
+      <button type="submit">新增映射</button>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>客户端</th><th>公网端口</th><th>内网目标</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+        <tbody id="tunnels"></tbody>
+      </table>
+    </div>
+    <p class="muted small">提示：客户端登录、新增/编辑/删除映射时都会自动同步当前启用的映射；也可以在“客户端管理”中点击“下发映射”手动同步。点击状态徽章可快速启停。</p>
+  </section>
+
+  <section class="panel">
+    <h2>HTTP 路由</h2>
+    <form class="form" data-form="createHttpRoute" autocomplete="off">
+      <select id="httpRouteCreateClientId" required aria-label="客户端"></select>
+      <input id="httpRouteCreateRoute" required maxlength="60" placeholder="路由名，如 web" aria-label="路由名">
+      <input id="httpRouteCreateTargetBaseUrl" required maxlength="512" placeholder="目标地址，如 http://127.0.0.1:8080" aria-label="目标地址">
+      <button type="submit">新增路由</button>
+    </form>
+    <div class="filters">
+      <label>客户端<select id="httpRouteClientFilter" data-onchange="httpRoutesFilter" aria-label="客户端筛选"></select></label>
+      <button type="button" class="secondary" data-action="refreshHttpRoutes">刷新</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>客户端</th><th>路由名</th><th>目标地址</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+        <tbody id="httpRoutes"></tbody>
+      </table>
+    </div>
+    <p class="muted small">提示：HTTP 路由由服务端管理后台维护，客户端登录或修改时自动通过 NAT_CONTROL 下发并热更新生效，无需重启客户端。点击状态徽章可快速启停；客户端首次接入若后台为空，则继续使用其本地 <code>tunnelClientConfig.json</code> 作为 fallback。</p>
+  </section>
+
+  <section class="panel panel-scroll">
+    <h2>连接记录</h2>
+    <div class="filters">
+      <label>客户端<select id="connClientFilter" data-onchange="connectionsFilter" aria-label="客户端筛选"></select></label>
+      <label>结果<select id="connResultFilter" data-onchange="connectionsFilter" aria-label="结果筛选">
+        <option value="">全部</option><option value="true">成功</option><option value="false">失败</option>
+      </select></label>
+      <label>开始日期（UTC）<input id="connFromDate" type="date" data-onchange="connectionsFilter" aria-label="开始日期"></label>
+      <label>结束日期（UTC）<input id="connToDate" type="date" data-onchange="connectionsFilter" aria-label="结束日期"></label>
+      <button type="button" data-action="resetConnFilters" class="secondary">重置</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>客户端</th><th>结果</th><th>远端地址</th><th>连接时间</th><th>断开时间</th><th>持续时长</th><th>原因</th></tr></thead>
+        <tbody id="connections"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span class="pager-info" id="connPagerInfo"></span>
+      <div class="pager-buttons">
+        <button type="button" class="secondary" data-action="prevConnPage" id="connPrev">上一页</button>
+        <span class="small muted" id="connPageLabel"></span>
+        <button type="button" class="secondary" data-action="nextConnPage" id="connNext">下一页</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>流量使用</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>客户端</th><th>日期（UTC）</th><th>上传</th><th>下载</th><th>更新时间</th></tr></thead>
+        <tbody id="traffic"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
