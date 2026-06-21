@@ -30,17 +30,17 @@ public sealed class ManagementPageTests : IAsyncLifetime
         using var client = _server!.CreateClient();
 
         var index = await client.GetAsync("/");
-        var js = await client.GetAsync("/app.js");
-        var css = await client.GetAsync("/app.css");
-
         index.EnsureSuccessStatusCode();
-        js.EnsureSuccessStatusCode();
-        css.EnsureSuccessStatusCode();
-        Assert.Contains("shuai-tunnel 管理后台", await index.Content.ReadAsStringAsync());
-        Assert.Contains("管理后台前端", await js.Content.ReadAsStringAsync());
-        Assert.Contains("--brand", await css.Content.ReadAsStringAsync());
+        var html = await index.Content.ReadAsStringAsync();
+        Assert.Contains("shuai-tunnel 管理后台", html);
         Assert.Equal("nosniff", index.Headers.GetValues("X-Content-Type-Options").Single());
         Assert.Contains("script-src 'self'", index.Headers.GetValues("Content-Security-Policy").Single());
+
+        // The React build references hashed bundles under /assets/; fetch the JS bundle.
+        var match = System.Text.RegularExpressions.Regex.Match(html, "/assets/[^\"']+\\.js");
+        Assert.True(match.Success, "index.html should reference a /assets/*.js bundle");
+        var js = await client.GetAsync(match.Value);
+        js.EnsureSuccessStatusCode();
     }
 
     [Fact]

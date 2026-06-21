@@ -55,21 +55,22 @@ public class SecurityConfig {
                 .httpBasic(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 /*
-                 * 严格 CSP：管理后台已无内联 JS / 样式 / onclick，所有脚本与样式都来自同源 /app.js + /app.css。
-                 * - script-src / style-src / default-src 全部限定 'self'
-                 * - img-src 同时允许 data: 以兼容浏览器内置控件（日期选择等）
-                 * - form-action 'self' 阻止跨站表单提交（OIDC 登录是 location.assign 跳转，不走 form 提交）
-                 * - frame-ancestors 'none' 等价于 X-Frame-Options: DENY，阻止被嵌入 iframe 进行 clickjacking
+                 * CSP：管理后台为 React + HeroUI 构建产物,脚本是同源外部 bundle(/assets/*.js)。
+                 * - script-src 'self':外部模块脚本同源
+                 * - style-src 'self' 'unsafe-inline':HeroUI/framer-motion 会写内联 style 属性
+                 * - img-src / font-src 允许 data:;connect-src 允许 ws:/wss: 供 /ws/connections
+                 * - form-action 'self' 阻止跨站表单提交;frame-ancestors 'none' 防 clickjacking
                  *
-                 * 同时加 Referrer-Policy: no-referrer 与 X-Frame-Options: DENY，给老浏览器兜底。
+                 * 同时加 Referrer-Policy: no-referrer 与 X-Frame-Options: DENY,给老浏览器兜底。
                  */
                 .headers(headers -> headers
                         .contentSecurityPolicy(csp -> csp.policyDirectives(
                                 "default-src 'self'; "
                                 + "script-src 'self'; "
-                                + "style-src 'self'; "
+                                + "style-src 'self' 'unsafe-inline'; "
                                 + "img-src 'self' data:; "
-                                + "connect-src 'self'; "
+                                + "font-src 'self' data:; "
+                                + "connect-src 'self' ws: wss:; "
                                 + "form-action 'self'; "
                                 + "frame-ancestors 'none'; "
                                 + "base-uri 'self'"))
