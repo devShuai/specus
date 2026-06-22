@@ -33,6 +33,7 @@ export function HttpRoutesPanel() {
   const [createClientId, setCreateClientId] = useState("");
   const [route, setRoute] = useState("");
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
+  const [lastCreatedAccessUrl, setLastCreatedAccessUrl] = useState("");
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<HttpRoute | null>(null);
   const editModal = useDisclosure();
@@ -60,13 +61,14 @@ export function HttpRoutesPanel() {
     }
     setCreating(true);
     try {
-      await adminApi.createHttpRoute(Number(createClientId), {
+      const created = await adminApi.createHttpRoute(Number(createClientId), {
         route: route.trim(),
         targetBaseUrl: targetBaseUrl.trim(),
         enabled: true,
       });
       setRoute("");
       setTargetBaseUrl("");
+      setLastCreatedAccessUrl(httpRouteAccessUrl(created));
       notify("HTTP 路由已创建");
       await load();
     } catch (error) {
@@ -123,6 +125,23 @@ export function HttpRoutesPanel() {
         </Button>
       </form>
 
+      {lastCreatedAccessUrl && (
+        <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-small border border-success-200 bg-success-50 p-3 text-small">
+          <span className="shrink-0 font-semibold text-success">访问链接</span>
+          <a
+            className="min-w-0 flex-1 break-all font-mono text-primary underline-offset-2 hover:underline"
+            href={lastCreatedAccessUrl}
+            rel="noreferrer"
+            target="_blank"
+          >
+            {lastCreatedAccessUrl}
+          </a>
+          <Button size="sm" variant="flat" onPress={() => void copyAccessUrl(lastCreatedAccessUrl)}>
+            复制
+          </Button>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-end gap-3">
         <Select
           className="w-48"
@@ -144,6 +163,7 @@ export function HttpRoutesPanel() {
           <TableColumn>客户端</TableColumn>
           <TableColumn>路由名</TableColumn>
           <TableColumn>目标地址</TableColumn>
+          <TableColumn>访问链接</TableColumn>
           <TableColumn>状态</TableColumn>
           <TableColumn>更新时间</TableColumn>
           <TableColumn>操作</TableColumn>
@@ -158,6 +178,9 @@ export function HttpRoutesPanel() {
               </TableCell>
               <TableCell>
                 <code>{item.targetBaseUrl || "-"}</code>
+              </TableCell>
+              <TableCell>
+                <HttpRouteAccessLink route={item} />
               </TableCell>
               <TableCell>
                 <Chip
@@ -189,6 +212,47 @@ export function HttpRoutesPanel() {
       <EditHttpRouteModal disclosure={editModal} route={editing} onSaved={() => void load()} />
     </div>
   );
+}
+
+function HttpRouteAccessLink({ route }: { route: HttpRoute }) {
+  const accessUrl = httpRouteAccessUrl(route);
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <a
+        className="max-w-80 truncate font-mono text-tiny text-primary underline-offset-2 hover:underline"
+        href={accessUrl}
+        rel="noreferrer"
+        target="_blank"
+        title={accessUrl}
+      >
+        {accessUrl}
+      </a>
+      <div>
+        <Button size="sm" variant="light" onPress={() => void copyAccessUrl(accessUrl)}>
+          复制
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function httpRouteAccessUrl(route: Pick<HttpRoute, "clientName" | "route">): string {
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  return `${origin}/http/${encodeRouteSegment(route.clientName)}/${encodeRouteSegment(route.route)}/`;
+}
+
+function encodeRouteSegment(value: string): string {
+  return encodeURIComponent(value.trim());
+}
+
+async function copyAccessUrl(url: string): Promise<void> {
+  try {
+    await navigator.clipboard?.writeText(url);
+    notify("访问链接已复制");
+  } catch {
+    notify("复制失败", "error");
+  }
 }
 
 interface EditHttpRouteModalProps {

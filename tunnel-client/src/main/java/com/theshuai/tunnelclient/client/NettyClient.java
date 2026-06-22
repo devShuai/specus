@@ -27,6 +27,7 @@ import javax.net.ssl.SSLException;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.util.StringUtils;
 
 /**
  * 控制连接的 Netty 客户端：负责建立 TCP 连接、签名登录、断线后指数退避重连。
@@ -46,6 +47,8 @@ public class NettyClient {
     @Getter
     private final String clientName;
     private final byte[] passwordHash;
+    private final String accessToken;
+    private final Long clientSessionId;
     private final String host;
     private final int port;
     private final TunnelBean tunnelBean;
@@ -72,9 +75,11 @@ public class NettyClient {
     public NettyClient(TunnelBean tunnelBean, SslContext sslContext) {
         this.tunnelBean = tunnelBean;
         this.clientName = tunnelBean.getClientName();
+        this.accessToken = tunnelBean.getAccessToken();
+        this.clientSessionId = tunnelBean.getClientSessionId();
         // Hash the password once at construction so we never keep the plaintext
         // around and never send it over the wire.
-        this.passwordHash = HmacSigner.sha256(tunnelBean.getPassword());
+        this.passwordHash = StringUtils.hasText(accessToken) ? null : HmacSigner.sha256(tunnelBean.getPassword());
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
         this.sslContext = sslContext;
@@ -183,6 +188,12 @@ public class NettyClient {
     private void sendLoginRequest(Channel channel) {
         LoginRequestPacket loginRequestPacket = new LoginRequestPacket();
         loginRequestPacket.setClientName(clientName);
+        if (StringUtils.hasText(accessToken)) {
+            loginRequestPacket.setClientSessionId(clientSessionId);
+            loginRequestPacket.setAccessToken(accessToken);
+            channel.writeAndFlush(loginRequestPacket);
+            return;
+        }
         String timestamp = String.valueOf(System.currentTimeMillis());
         String nonce = generateNonce();
         loginRequestPacket.setTimestamp(timestamp);

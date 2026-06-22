@@ -96,7 +96,8 @@ public class HttpTrafficExchange {
     @Column(name = "response_preview_hex", length = 4096)
     private String responsePreviewHex;
 
-    @Column(name = "response_preview_text", length = 4096)
+    @Lob
+    @Column(name = "response_preview_text")
     private String responsePreviewText;
 
     @Column(name = "request_truncated", nullable = false)

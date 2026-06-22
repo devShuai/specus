@@ -18,6 +18,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -86,8 +87,10 @@ public class TrafficInspectionService {
             return;
         }
 
-        Preview requestPreview = fullText(requestBody);
-        Preview responsePreview = textPreview(responseBody);
+        String requestContentType = contentType(requestHeaders);
+        String responseContentType = contentType(responseHeaders);
+        Preview requestPreview = bodyText(requestBody, requestContentType);
+        Preview responsePreview = bodyText(responseBody, responseContentType);
         pendingHttpExchanges.add(new PendingHttpExchange(
                 clientName,
                 blankToEmpty(route),
@@ -101,8 +104,8 @@ public class TrafficInspectionService {
                 length(requestBody),
                 length(responseBody),
                 Math.max(0, System.currentTimeMillis() - startedAtMillis),
-                contentType(requestHeaders),
-                contentType(responseHeaders),
+                requestContentType,
+                responseContentType,
                 cap(joinHeaders(requestHeaders), headerChars),
                 cap(joinHeaders(responseHeaders), headerChars),
                 requestPreview.hex(),
@@ -305,21 +308,53 @@ public class TrafficInspectionService {
         return new Preview(hex.toString(), text, totalLength > previewLength);
     }
 
-    private Preview textPreview(byte[] data) {
-        int totalLength = length(data);
-        int previewLength = Math.min(totalLength, previewBytes);
-        if (data == null || previewLength == 0) {
-            return new Preview("", "", totalLength > previewLength);
-        }
-        String text = sanitizeText(new String(data, 0, previewLength, StandardCharsets.UTF_8));
-        return new Preview("", text, totalLength > previewLength);
-    }
-
-    private Preview fullText(byte[] data) {
+    private Preview bodyText(byte[] data, String contentType) {
         if (data == null || data.length == 0) {
             return new Preview("", "", false);
         }
+        if (!isTextBody(contentType) && !looksLikeText(data)) {
+            String mediaType = mediaType(contentType);
+            return new Preview("", "data:" + mediaType + ";base64," + Base64.getEncoder().encodeToString(data), false);
+        }
         return new Preview("", sanitizeText(new String(data, StandardCharsets.UTF_8)), false);
+    }
+
+    private boolean isTextBody(String contentType) {
+        String mediaType = mediaType(contentType);
+        return mediaType.startsWith("text/")
+                || mediaType.equals("application/json")
+                || mediaType.endsWith("+json")
+                || mediaType.equals("application/xml")
+                || mediaType.endsWith("+xml")
+                || mediaType.equals("application/x-www-form-urlencoded")
+                || mediaType.equals("application/graphql")
+                || mediaType.equals("application/javascript")
+                || mediaType.equals("application/ecmascript")
+                || mediaType.equals("application/x-yaml")
+                || mediaType.equals("application/yaml");
+    }
+
+    private boolean looksLikeText(byte[] data) {
+        int inspected = Math.min(data.length, 512);
+        int controls = 0;
+        for (int i = 0; i < inspected; i++) {
+            int value = data[i] & 0xff;
+            if (value == 0) {
+                return false;
+            }
+            if (value < 0x20 && value != '\r' && value != '\n' && value != '\t') {
+                controls++;
+            }
+        }
+        return inspected == 0 || controls * 10 <= inspected;
+    }
+
+    private String mediaType(String contentType) {
+        if (contentType == null || contentType.isBlank()) {
+            return "application/octet-stream";
+        }
+        String mediaType = contentType.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
+        return mediaType.matches("[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+") ? mediaType : "application/octet-stream";
     }
 
     private String sanitizeText(String text) {

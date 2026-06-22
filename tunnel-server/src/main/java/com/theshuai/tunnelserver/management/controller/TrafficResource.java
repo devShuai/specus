@@ -8,11 +8,16 @@ import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.management.service.TrafficViewService;
 import com.theshuai.tunnelserver.management.tenant.TenantResolver;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 流量使用查询。GET 时主动 flush 一次，使返回值反映最新计数器累计；写入累计本身在
@@ -54,12 +59,28 @@ public class TrafficResource {
     }
 
     @GetMapping("/http-exchanges")
-    public List<HttpTrafficExchangeView> listHttpExchanges(@AuthenticationPrincipal Jwt jwt,
-                                                           @RequestParam(required = false) Long clientId,
-                                                           @RequestParam(required = false) String route,
-                                                           @RequestParam(defaultValue = "100") int limit) {
+    public Map<String, Object> listHttpExchanges(@AuthenticationPrincipal Jwt jwt,
+                                                 @RequestParam(required = false) Long clientId,
+                                                 @RequestParam(required = false) String route,
+                                                 @RequestParam(required = false) String q,
+                                                 @RequestParam(defaultValue = "0") int page,
+                                                 @RequestParam(defaultValue = "50") int size) {
         trafficInspectionService.flush();
-        return trafficViewService.listHttpExchanges(tenantResolver.resolve(jwt), clientId, route, limit);
+        int normalizedSize = Math.clamp(size, 1, 500);
+        int normalizedPage = Math.max(0, page);
+        Page<HttpTrafficExchangeView> result = trafficViewService.listHttpExchanges(
+                tenantResolver.resolve(jwt),
+                clientId,
+                route,
+                q,
+                PageRequest.of(normalizedPage, normalizedSize, Sort.by(Sort.Direction.DESC, "id")));
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("items", result.getContent());
+        response.put("total", result.getTotalElements());
+        response.put("page", result.getNumber());
+        response.put("size", result.getSize());
+        response.put("totalPages", result.getTotalPages());
+        return response;
     }
 
     @GetMapping("/tcp-frames")

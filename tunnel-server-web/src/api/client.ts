@@ -1,5 +1,8 @@
 import type {
   Client,
+  ClientCredential,
+  ClientCredentialMutation,
+  ClientCredentialResult,
   ClientMutation,
   ConnectionPage,
   CredentialView,
@@ -7,6 +10,7 @@ import type {
   HttpRoute,
   HttpRouteMutation,
   HttpTrafficExchange,
+  HttpTrafficExchangePage,
   NatControlResult,
   OidcConfig,
   Overview,
@@ -165,6 +169,14 @@ export interface ConnectionQuery {
   to?: string;
 }
 
+export interface HttpTrafficExchangeQuery {
+  page: number;
+  size: number;
+  clientId?: number;
+  route?: string;
+  q?: string;
+}
+
 export const adminApi = {
   overview: () => request<Overview>("/overview"),
   initializeDatabase: () => request<DatabaseInitResult>("/database/initialize", { method: "POST" }),
@@ -176,6 +188,13 @@ export const adminApi = {
     request<CredentialView>(`/clients/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteClient: (id: number) => request<null>(`/clients/${id}`, { method: "DELETE" }),
   pushNatControl: (id: number) => request<NatControlResult>(`/clients/${id}/nat-control`, { method: "POST" }),
+
+  listClientCredentials: () => request<ClientCredential[]>("/client-credentials"),
+  createClientCredential: (body: ClientCredentialMutation) =>
+    request<ClientCredentialResult>("/client-credentials", { method: "POST", body: JSON.stringify(body) }),
+  updateClientCredential: (id: number, body: ClientCredentialMutation) =>
+    request<ClientCredentialResult>(`/client-credentials/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteClientCredential: (id: number) => request<null>(`/client-credentials/${id}`, { method: "DELETE" }),
 
   listTunnels: (clientId?: number) =>
     request<Tunnel[]>(`/tunnels${clientId ? `?clientId=${clientId}` : ""}`),
@@ -221,7 +240,32 @@ export const adminApi = {
     }
     return request<ResourceTrafficUsage[]>(`/traffic/resources?${params.toString()}`);
   },
-  listHttpTrafficExchanges: (limit = 100) =>
-    request<HttpTrafficExchange[]>(`/traffic/http-exchanges?limit=${limit}`),
+  listHttpTrafficExchanges: async (query: HttpTrafficExchangeQuery) => {
+    const params = new URLSearchParams();
+    params.set("page", String(query.page));
+    params.set("size", String(query.size));
+    if (query.clientId) {
+      params.set("clientId", String(query.clientId));
+    }
+    if (query.route) {
+      params.set("route", query.route);
+    }
+    if (query.q) {
+      params.set("q", query.q);
+    }
+    const data = await request<HttpTrafficExchangePage | HttpTrafficExchange[]>(
+      `/traffic/http-exchanges?${params.toString()}`,
+    );
+    if (Array.isArray(data)) {
+      return {
+        items: data,
+        total: data.length,
+        page: 0,
+        size: data.length,
+        totalPages: 1,
+      } satisfies HttpTrafficExchangePage;
+    }
+    return data;
+  },
   listTcpTrafficFrames: (limit = 200) => request<TcpTrafficFrame[]>(`/traffic/tcp-frames?limit=${limit}`),
 };

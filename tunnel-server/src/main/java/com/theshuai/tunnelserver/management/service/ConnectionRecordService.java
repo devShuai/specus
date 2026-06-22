@@ -53,7 +53,8 @@ public class ConnectionRecordService {
                 : TenantContext.normalize(result.account().getTenantId());
         record.setTenantId(tenantId);
         record.setClientId(result.account() == null ? null : result.account().getId());
-        record.setClientName(packet.getClientName());
+        String clientName = result.account() == null ? packet.getClientName() : result.account().getClientName();
+        record.setClientName(StringUtils.hasText(clientName) ? clientName : "unknown-client");
         record.setChannelId(channelId);
         record.setRemoteAddress(remoteAddress);
         record.setConnectedAt(now);

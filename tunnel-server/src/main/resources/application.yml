@@ -41,6 +41,10 @@ tunnel:
     max-external-connections-per-client: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT:10000}
     max-external-connections-per-port: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT:10000}
   public-address: ${TUNNEL_PUBLIC_ADDRESS:}
+  client-auth:
+    default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
+    per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}
+    token-ttl-seconds: ${TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS:28800}
   auth:
     # Local username/password login for the management UI (alternative to OIDC). A successful login
     # mints a short-lived HS256 JWT the admin API accepts alongside the OIDC tokens. Change the
@@ -69,6 +73,7 @@ tunnel:
   traffic:
     flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}
     capture-detail-enabled: ${TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED:true}
+    # TCP payloads keep using previews; HTTP request/response body text is stored in full.
     capture-preview-bytes: ${TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES:256}
     capture-header-chars: ${TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS:8192}
     capture-max-pending: ${TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING:20000}

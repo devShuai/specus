@@ -12,6 +12,7 @@ import { adminApi } from "../api/client";
 import { notify, notifyError } from "../components/toast";
 import { OverviewPanel } from "./panels/OverviewPanel";
 import { ClientsPanel } from "./panels/ClientsPanel";
+import { ClientCredentialsPanel } from "./panels/ClientCredentialsPanel";
 import { TunnelsPanel } from "./panels/TunnelsPanel";
 import { HttpRoutesPanel } from "./panels/HttpRoutesPanel";
 import { ConnectionsPanel } from "./panels/ConnectionsPanel";
@@ -59,6 +60,9 @@ export function Dashboard() {
           </Tab>
           <Tab key="clients" title="客户端">
             <ClientsPanel />
+          </Tab>
+          <Tab key="client-credentials" title="客户端凭证">
+            <ClientCredentialsPanel />
           </Tab>
           <Tab key="tunnels" title="端口映射">
             <TunnelsPanel />

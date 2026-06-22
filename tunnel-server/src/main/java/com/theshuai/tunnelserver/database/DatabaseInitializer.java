@@ -1,7 +1,10 @@
 package com.theshuai.tunnelserver.database;
 
+import com.theshuai.tunnelserver.config.ClientAuthProperties;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
+import com.theshuai.tunnelserver.management.model.ClientCredential;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
+import com.theshuai.tunnelserver.management.repository.ClientCredentialRepository;
 import com.theshuai.tunnelserver.management.service.ClientIdGenerator;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.security.PasswordService;
@@ -22,17 +25,23 @@ import java.util.Map;
 @Slf4j
 public class DatabaseInitializer {
     private final ClientAccountRepository clientAccountRepository;
+    private final ClientCredentialRepository clientCredentialRepository;
+    private final ClientAuthProperties clientAuthProperties;
     private final JdbcTemplate jdbcTemplate;
     private final boolean seedDemoClient;
     private final String databasePlatform;
     private final String defaultTenantId;
 
     public DatabaseInitializer(ClientAccountRepository clientAccountRepository,
+                               ClientCredentialRepository clientCredentialRepository,
+                               ClientAuthProperties clientAuthProperties,
                                JdbcTemplate jdbcTemplate,
                                @Value("${tunnel.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
                                @Value("${tunnel.auth.tenant-id:default}") String defaultTenantId) {
         this.clientAccountRepository = clientAccountRepository;
+        this.clientCredentialRepository = clientCredentialRepository;
+        this.clientAuthProperties = clientAuthProperties;
         this.jdbcTemplate = jdbcTemplate;
         this.seedDemoClient = seedDemoClient;
         this.databasePlatform = databasePlatform;
@@ -51,7 +60,7 @@ public class DatabaseInitializer {
 
     @Transactional
     public synchronized Map<String, Object> initialize(TenantContext tenant) {
-        widenHttpRequestPreviewText();
+        widenHttpBodyTextColumns();
         backfillDefaultTenant();
         if (seedDemoClient && clientAccountRepository
                 .findByTenantIdAndClientName(tenant.tenantId(), "Demo client").isEmpty()) {
@@ -67,6 +76,19 @@ public class DatabaseInitializer {
             client.setUpdatedAt(now);
             clientAccountRepository.save(client);
         }
+        if (seedDemoClient && clientCredentialRepository.findByApiKey("demo-client").isEmpty()) {
+            String now = Instant.now().toString();
+            ClientCredential credential = new ClientCredential();
+            credential.setId(ClientIdGenerator.newId());
+            credential.setTenantId(tenant.tenantId());
+            credential.setApiKey("demo-client");
+            credential.setSecretHash(PasswordService.hash("test1234"));
+            credential.setEnabled(true);
+            credential.setMaxOnlineInstances(clientAuthProperties.getDefaultMaxOnlineInstances());
+            credential.setCreatedAt(now);
+            credential.setUpdatedAt(now);
+            clientCredentialRepository.save(credential);
+        }
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("initialized", true);
@@ -80,6 +102,9 @@ public class DatabaseInitializer {
     private void backfillDefaultTenant() {
         for (String table : List.of(
                 "tunnel_client_account",
+                "tunnel_client_credential",
+                "tunnel_client_identity",
+                "tunnel_client_session",
                 "tunnel_mapping",
                 "http_route_mapping",
                 "tunnel_connection_record",
@@ -98,21 +123,26 @@ public class DatabaseInitializer {
         }
     }
 
-    private void widenHttpRequestPreviewText() {
+    private void widenHttpBodyTextColumns() {
         String normalizedPlatform = databasePlatform == null ? "" : databasePlatform.toLowerCase();
-        String sql = null;
+        List<String> sql = List.of();
         if (normalizedPlatform.contains("mysql") || normalizedPlatform.contains("mariadb")) {
-            sql = "alter table tunnel_http_traffic_exchange modify column request_preview_text longtext";
+            sql = List.of(
+                    "alter table tunnel_http_traffic_exchange modify column request_preview_text longtext",
+                    "alter table tunnel_http_traffic_exchange modify column response_preview_text longtext"
+            );
         } else if (normalizedPlatform.contains("postgres")) {
-            sql = "alter table tunnel_http_traffic_exchange alter column request_preview_text type text";
+            sql = List.of(
+                    "alter table tunnel_http_traffic_exchange alter column request_preview_text type text",
+                    "alter table tunnel_http_traffic_exchange alter column response_preview_text type text"
+            );
         }
-        if (sql == null) {
-            return;
-        }
-        try {
-            jdbcTemplate.execute(sql);
-        } catch (DataAccessException e) {
-            log.debug("[schema] skip widening tunnel_http_traffic_exchange.request_preview_text: {}", e.getMessage());
+        for (String statement : sql) {
+            try {
+                jdbcTemplate.execute(statement);
+            } catch (DataAccessException e) {
+                log.debug("[schema] skip widening HTTP body text column with '{}': {}", statement, e.getMessage());
+            }
         }
     }
 

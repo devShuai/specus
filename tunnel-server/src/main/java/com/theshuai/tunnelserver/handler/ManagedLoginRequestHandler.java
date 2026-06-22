@@ -7,6 +7,7 @@ import com.theshuai.tunnelserver.session.SessionUtil;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.service.AuthenticationResult;
 import com.theshuai.tunnelserver.management.service.ClientAccountService;
+import com.theshuai.tunnelserver.management.service.ClientAuthService;
 import com.theshuai.tunnelserver.management.service.ConnectionRecordService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import io.netty.channel.ChannelHandler;
@@ -16,6 +17,7 @@ import io.netty.util.AttributeKey;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
@@ -27,15 +29,18 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
     private static final AttributeKey<Long> CONNECTION_RECORD_ID = AttributeKey.valueOf("connectionRecordId");
 
     private final ClientAccountService clientAccountService;
+    private final ClientAuthService clientAuthService;
     private final ConnectionRecordService connectionRecordService;
     private final NatControlService natControlService;
     private final ExecutorService loginExecutor;
 
     public ManagedLoginRequestHandler(ClientAccountService clientAccountService,
+                                      ClientAuthService clientAuthService,
                                       ConnectionRecordService connectionRecordService,
                                       NatControlService natControlService,
                                       @Qualifier("loginExecutor") ExecutorService loginExecutor) {
         this.clientAccountService = clientAccountService;
+        this.clientAuthService = clientAuthService;
         this.connectionRecordService = connectionRecordService;
         this.natControlService = natControlService;
         this.loginExecutor = loginExecutor;
@@ -58,7 +63,12 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
 
     private void handleLogin(ChannelHandlerContext ctx, LoginRequestPacket packet) {
         try {
-            AuthenticationResult authentication = clientAccountService.authenticate(packet);
+            AuthenticationResult authentication = StringUtils.hasText(packet.getAccessToken())
+                    ? clientAuthService.authenticateNetty(
+                    packet,
+                    ctx.channel().id().asLongText(),
+                    String.valueOf(ctx.channel().remoteAddress()))
+                    : clientAccountService.authenticate(packet);
             long connectionRecordId = connectionRecordService.recordConnection(
                     authentication,
                     packet,
@@ -80,6 +90,10 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                     ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.LOGIN_TIME_MS).set(System.currentTimeMillis());
                     ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.TENANT_ID).set(
                             authentication.account().getTenantId());
+                    if (authentication.clientSessionId() != null) {
+                        ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.CLIENT_SESSION_ID).set(
+                                authentication.clientSessionId());
+                    }
                     SessionUtil.bindSession(new Session(packet.getClientName()), ctx.channel());
                 }
                 io.netty.channel.ChannelFuture writeFuture = ctx.writeAndFlush(response);
@@ -105,12 +119,17 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         Long connectionRecordId = ctx.channel().attr(CONNECTION_RECORD_ID).getAndSet(null);
+        Long clientSessionId = ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.CLIENT_SESSION_ID)
+                .getAndSet(null);
         if (connectionRecordId != null) {
             long recordId = connectionRecordId;
             // 读通道属性还原 reason；缺省视为客户端主动 FIN。
             DisconnectReason marked = DisconnectReason.readFrom(ctx.channel());
             DisconnectReason reason = marked == null ? DisconnectReason.CLIENT_CLOSED : marked;
             submit(() -> connectionRecordService.recordDisconnect(recordId, reason));
+        }
+        if (clientSessionId != null) {
+            submit(() -> clientAuthService.markNettyDisconnected(clientSessionId));
         }
         SessionUtil.unBindSession(ctx.channel());
         super.channelInactive(ctx);

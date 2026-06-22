@@ -3,10 +3,12 @@ package com.theshuai.tunnelserver.management.repository;
 import com.theshuai.tunnelserver.management.model.HttpTrafficExchange;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 
 import java.util.List;
 
-public interface HttpTrafficExchangeRepository extends JpaRepository<HttpTrafficExchange, Long> {
+public interface HttpTrafficExchangeRepository
+        extends JpaRepository<HttpTrafficExchange, Long>, JpaSpecificationExecutor<HttpTrafficExchange> {
     List<HttpTrafficExchange> findByTenantIdOrderByIdDesc(String tenantId, Pageable pageable);
 
     List<HttpTrafficExchange> findByTenantIdAndClientIdOrderByIdDesc(

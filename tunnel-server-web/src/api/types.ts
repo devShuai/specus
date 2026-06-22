@@ -47,6 +47,20 @@ export interface CredentialView {
   password?: string;
 }
 
+export interface ClientCredential {
+  id: number;
+  apiKey: string;
+  enabled: boolean;
+  maxOnlineInstances: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClientCredentialResult {
+  credential: ClientCredential;
+  secret?: string;
+}
+
 export interface Tunnel {
   id: number;
   clientId: number;
@@ -148,6 +162,14 @@ export interface HttpTrafficExchange {
   capturedAt: string;
 }
 
+export interface HttpTrafficExchangePage {
+  items: HttpTrafficExchange[];
+  total: number;
+  page: number;
+  size: number;
+  totalPages: number;
+}
+
 export interface TcpTrafficFrame {
   id: number;
   clientId: number;
@@ -182,6 +204,13 @@ export interface ClientMutation {
   password?: string | null;
   enabled?: boolean;
   connectionRateLimitPerMinute?: number;
+}
+
+export interface ClientCredentialMutation {
+  apiKey?: string;
+  secret?: string | null;
+  enabled?: boolean;
+  maxOnlineInstances?: number;
 }
 
 export interface TunnelMutation {

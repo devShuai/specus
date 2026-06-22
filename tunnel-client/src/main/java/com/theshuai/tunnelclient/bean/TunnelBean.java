@@ -8,6 +8,9 @@ import java.util.List;
 public class TunnelBean {
     private String clientName;
     private String password;
+    private Long clientSessionId;
+    private String accessToken;
+    private int maxOnlineInstances = 2;
     private List<TunnelConfig> tunnelConfigList;
     private List<HttpTunnelConfig> httpTunnelConfigList;
     private String remoteAddress;

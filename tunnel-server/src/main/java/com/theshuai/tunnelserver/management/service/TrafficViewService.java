@@ -13,11 +13,18 @@ import com.theshuai.tunnelserver.management.repository.ResourceTrafficUsageRepos
 import com.theshuai.tunnelserver.management.repository.TcpTrafficFrameRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
+import jakarta.persistence.criteria.Path;
+import jakarta.persistence.criteria.Predicate;
+import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * 流量记录的只读视图查询。和 {@link TrafficUsageService}（写入累计 + 周期 flush）解耦——
@@ -80,26 +87,16 @@ public class TrafficViewService {
     }
 
     @Transactional(readOnly = true)
-    public List<HttpTrafficExchangeView> listHttpExchanges(TenantContext tenant,
+    public Page<HttpTrafficExchangeView> listHttpExchanges(TenantContext tenant,
                                                            Long clientId,
                                                            String route,
-                                                           int limit) {
-        PageRequest pageRequest = PageRequest.of(0, Math.clamp(limit, 1, 500));
+                                                           String keyword,
+                                                           Pageable pageable) {
         String normalizedRoute = normalizeRoute(route);
-        List<HttpTrafficExchange> exchanges;
-        if (clientId == null && normalizedRoute == null) {
-            exchanges = httpTrafficExchangeRepository.findByTenantIdOrderByIdDesc(tenant.tenantId(), pageRequest);
-        } else if (clientId == null) {
-            exchanges = httpTrafficExchangeRepository.findByTenantIdAndRouteOrderByIdDesc(
-                    tenant.tenantId(), normalizedRoute, pageRequest);
-        } else if (normalizedRoute == null) {
-            exchanges = httpTrafficExchangeRepository.findByTenantIdAndClientIdOrderByIdDesc(
-                    tenant.tenantId(), clientId, pageRequest);
-        } else {
-            exchanges = httpTrafficExchangeRepository.findByTenantIdAndClientIdAndRouteOrderByIdDesc(
-                    tenant.tenantId(), clientId, normalizedRoute, pageRequest);
-        }
-        return exchanges.stream().map(this::toHttpExchangeView).toList();
+        String normalizedKeyword = normalizeKeyword(keyword);
+        return httpTrafficExchangeRepository
+                .findAll(httpExchangeSpec(tenant, clientId, normalizedRoute, normalizedKeyword), pageable)
+                .map(this::toHttpExchangeView);
     }
 
     @Transactional(readOnly = true)
@@ -215,5 +212,82 @@ public class TrafficViewService {
             return null;
         }
         return route.trim();
+    }
+
+    private String normalizeKeyword(String keyword) {
+        if (keyword == null || keyword.isBlank()) {
+            return null;
+        }
+        return keyword.trim();
+    }
+
+    private Specification<HttpTrafficExchange> httpExchangeSpec(TenantContext tenant,
+                                                                Long clientId,
+                                                                String route,
+                                                                String keyword) {
+        return (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            predicates.add(cb.equal(root.get("tenantId"), tenant.tenantId()));
+            if (clientId != null) {
+                predicates.add(cb.equal(root.get("clientId"), clientId));
+            }
+            if (route != null) {
+                predicates.add(cb.equal(root.get("route"), route));
+            }
+            if (keyword != null) {
+                List<Predicate> keywordPredicates = new ArrayList<>();
+                String pattern = likePattern(keyword);
+                for (String field : List.of(
+                        "clientName",
+                        "route",
+                        "resourceName",
+                        "method",
+                        "relativePath",
+                        "rawQuery",
+                        "error",
+                        "remoteAddress",
+                        "requestContentType",
+                        "responseContentType",
+                        "requestHeaders",
+                        "responseHeaders",
+                        "requestPreviewText",
+                        "responsePreviewText",
+                        "capturedAt")) {
+                    keywordPredicates.add(cb.like(cb.lower(stringPath(root.get(field))), pattern, '\\'));
+                }
+                Long number = parseLong(keyword);
+                if (number != null) {
+                    keywordPredicates.add(cb.equal(root.get("id"), number));
+                    keywordPredicates.add(cb.equal(root.get("clientId"), number));
+                    if (number >= Integer.MIN_VALUE && number <= Integer.MAX_VALUE) {
+                        keywordPredicates.add(cb.equal(root.get("statusCode"), number.intValue()));
+                    }
+                }
+                predicates.add(cb.or(keywordPredicates.toArray(Predicate[]::new)));
+            }
+            return cb.and(predicates.toArray(Predicate[]::new));
+        };
+    }
+
+    private Path<String> stringPath(Path<?> path) {
+        @SuppressWarnings("unchecked")
+        Path<String> stringPath = (Path<String>) path;
+        return stringPath;
+    }
+
+    private String likePattern(String keyword) {
+        String escaped = keyword.toLowerCase(Locale.ROOT)
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_");
+        return "%" + escaped + "%";
+    }
+
+    private Long parseLong(String value) {
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 }

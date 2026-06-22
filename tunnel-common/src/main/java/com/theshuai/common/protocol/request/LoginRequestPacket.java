@@ -14,6 +14,8 @@ import lombok.EqualsAndHashCode;
 @Data
 public class LoginRequestPacket extends Packet {
     private String clientName;
+    private Long clientSessionId;
+    private String accessToken;
     private String timestamp;
     private String nonce;
     private byte[] checkSign;
