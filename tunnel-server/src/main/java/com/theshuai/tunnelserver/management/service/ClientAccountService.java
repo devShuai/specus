@@ -10,6 +10,7 @@ import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficTotal;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.security.PasswordService;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import io.netty.channel.Channel;
@@ -58,24 +59,37 @@ public class ClientAccountService {
 
     @Transactional(readOnly = true)
     public List<ClientAccountView> listClients() {
+        return listClients(TenantContext.defaultTenant());
+    }
+
+    @Transactional(readOnly = true)
+    public List<ClientAccountView> listClients(TenantContext tenant) {
         // 一次性聚合所有客户端的上下行总量，避免 N+1（每客户端一条 findByClientId 查询）。
-        Map<Long, TrafficTotal> totals = trafficUsageRepository.sumBytesByClientId().stream()
+        Map<Long, TrafficTotal> totals = trafficUsageRepository.sumBytesByTenantId(tenant.tenantId()).stream()
                 .collect(Collectors.toMap(TrafficTotal::getClientId, t -> t));
-        return clientAccountRepository.findAll().stream()
-                .sorted((left, right) -> Long.compare(right.getId(), left.getId()))
+        return clientAccountRepository.findByTenantIdOrderByIdDesc(tenant.tenantId()).stream()
                 .map(account -> toView(account, totals.get(account.getId())))
                 .toList();
     }
 
     @Transactional
     public CredentialResult createClient(ClientMutation request) {
+        return createClient(TenantContext.defaultTenant(), request);
+    }
+
+    @Transactional
+    public CredentialResult createClient(TenantContext tenant, ClientMutation request) {
         String clientName = requireClientName(request.clientName());
+        clientAccountRepository.findByClientName(clientName).ifPresent(existing -> {
+            throw new IllegalArgumentException("clientName " + clientName + " 已存在");
+        });
         String password = StringUtils.hasText(request.password())
                 ? request.password() : PasswordService.generatePassword();
         String now = Instant.now().toString();
 
         ClientAccount account = new ClientAccount();
         account.setId(ClientIdGenerator.newId());
+        account.setTenantId(tenant.tenantId());
         account.setClientName(clientName);
         account.setPasswordHash(PasswordService.hash(password));
         account.setEnabled(request.enabled() == null || request.enabled());
@@ -87,11 +101,22 @@ public class ClientAccountService {
 
     @Transactional
     public CredentialResult updateClient(long id, ClientMutation request) {
-        ClientAccount account = findClientById(id);
+        return updateClient(TenantContext.defaultTenant(), id, request);
+    }
+
+    @Transactional
+    public CredentialResult updateClient(TenantContext tenant, long id, ClientMutation request) {
+        ClientAccount account = findClientById(tenant, id);
         String originalClientName = account.getClientName();
-        account.setClientName(StringUtils.hasText(request.clientName())
+        String newClientName = StringUtils.hasText(request.clientName())
                 ? requireClientName(request.clientName())
-                : originalClientName);
+                : originalClientName;
+        if (!newClientName.equals(originalClientName)) {
+            clientAccountRepository.findByClientName(newClientName).ifPresent(existing -> {
+                throw new IllegalArgumentException("clientName " + newClientName + " 已存在");
+            });
+        }
+        account.setClientName(newClientName);
         if (StringUtils.hasText(request.password())) {
             account.setPasswordHash(PasswordService.hash(request.password()));
         }
@@ -111,13 +136,20 @@ public class ClientAccountService {
                     : DisconnectReason.ADMIN_RENAMED;
             closeOnlineChannel(originalClientName, reason);
         }
-        TrafficTotal total = trafficUsageRepository.sumBytesByClientId(account.getId()).orElse(null);
+        TrafficTotal total = trafficUsageRepository
+                .sumBytesByTenantIdAndClientId(tenant.tenantId(), account.getId())
+                .orElse(null);
         return new CredentialResult(toView(account, total), request.password());
     }
 
     @Transactional
     public void deleteClient(long id) {
-        ClientAccount account = findClientById(id);
+        deleteClient(TenantContext.defaultTenant(), id);
+    }
+
+    @Transactional
+    public void deleteClient(TenantContext tenant, long id) {
+        ClientAccount account = findClientById(tenant, id);
         closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
         clientAccountRepository.delete(account);
     }
@@ -151,6 +183,11 @@ public class ClientAccountService {
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
     }
 
+    public ClientAccount findClientById(TenantContext tenant, long id) {
+        return clientAccountRepository.findByIdAndTenantId(id, tenant.tenantId())
+                .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
+    }
+
     private ClientAccountView toView(ClientAccount account, TrafficTotal total) {
         Channel channel = SessionUtil.getChannel(account.getClientName());
         boolean online = channel != null;
@@ -173,7 +210,8 @@ public class ClientAccountService {
 
     private boolean hasExceededRateLimit(ClientAccount account) {
         return account.getConnectionRateLimitPerMinute() > 0
-                && connectionRecordRepository.countByClientIdAndConnectedAtGreaterThanEqual(
+                && connectionRecordRepository.countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(
+                account.getTenantId(),
                 account.getId(),
                 Instant.now().minus(1, ChronoUnit.MINUTES).toString()
         ) >= account.getConnectionRateLimitPerMinute();

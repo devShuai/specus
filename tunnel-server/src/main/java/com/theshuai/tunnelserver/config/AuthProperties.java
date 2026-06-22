@@ -14,6 +14,8 @@ public class AuthProperties {
     private boolean passwordLoginEnabled = true;
     private String username = "admin";
     private String password = "admin";
+    /** Default tenant used by local password-login and legacy data. */
+    private String tenantId = "default";
     /** HS256 signing secret; when blank a random key is generated at startup (tokens reset on restart). */
     private String jwtSecret = "";
     private long tokenTtlSeconds = 28800;
@@ -40,6 +42,14 @@ public class AuthProperties {
 
     public void setPassword(String password) {
         this.password = password;
+    }
+
+    public String getTenantId() {
+        return tenantId;
+    }
+
+    public void setTenantId(String tenantId) {
+        this.tenantId = tenantId;
     }
 
     public String getJwtSecret() {

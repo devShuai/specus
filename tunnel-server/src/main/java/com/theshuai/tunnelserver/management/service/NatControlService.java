@@ -11,6 +11,7 @@ import com.theshuai.tunnelserver.management.model.TunnelMappingView;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.tunnelserver.management.repository.TunnelMappingRepository;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -63,15 +64,25 @@ public class NatControlService {
 
     @Transactional(readOnly = true)
     public List<TunnelMappingView> listMappings(Long clientId) {
+        return listMappings(TenantContext.defaultTenant(), clientId);
+    }
+
+    @Transactional(readOnly = true)
+    public List<TunnelMappingView> listMappings(TenantContext tenant, Long clientId) {
         List<TunnelMapping> mappings = clientId == null
-                ? tunnelMappingRepository.findAllByOrderByIdDesc()
-                : tunnelMappingRepository.findByClientIdOrderByIdDesc(clientId);
+                ? tunnelMappingRepository.findByTenantIdOrderByIdDesc(tenant.tenantId())
+                : tunnelMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(tenant.tenantId(), clientId);
         return mappings.stream().map(this::toView).toList();
     }
 
     @Transactional
     public TunnelMappingView createMapping(long clientId, MappingMutation request) {
-        ClientAccount account = findClient(clientId);
+        return createMapping(TenantContext.defaultTenant(), clientId, request);
+    }
+
+    @Transactional
+    public TunnelMappingView createMapping(TenantContext tenant, long clientId, MappingMutation request) {
+        ClientAccount account = findClient(tenant, clientId);
         int listenPort = requirePort(request.listenPort(), "listenPort");
         int targetPort = requirePort(request.targetPort(), "targetPort");
         String targetAddress = requireTargetAddress(request.targetAddress());
@@ -82,6 +93,7 @@ public class NatControlService {
         String now = Instant.now().toString();
         TunnelMapping mapping = new TunnelMapping();
         mapping.setId(ClientIdGenerator.newId());
+        mapping.setTenantId(tenant.tenantId());
         mapping.setClientId(account.getId());
         mapping.setClientName(account.getClientName());
         mapping.setListenPort(listenPort);
@@ -97,7 +109,12 @@ public class NatControlService {
 
     @Transactional
     public TunnelMappingView updateMapping(long id, MappingMutation request) {
-        TunnelMapping mapping = tunnelMappingRepository.findById(id)
+        return updateMapping(TenantContext.defaultTenant(), id, request);
+    }
+
+    @Transactional
+    public TunnelMappingView updateMapping(TenantContext tenant, long id, MappingMutation request) {
+        TunnelMapping mapping = tunnelMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
         int listenPort = requirePort(request.listenPort(), "listenPort");
         int targetPort = requirePort(request.targetPort(), "targetPort");
@@ -118,7 +135,7 @@ public class NatControlService {
         mapping.setUpdatedAt(Instant.now().toString());
         TunnelMapping saved = tunnelMappingRepository.saveAndFlush(mapping);
 
-        ClientAccount account = clientAccountRepository.findById(saved.getClientId()).orElse(null);
+        ClientAccount account = clientAccountRepository.findByIdAndTenantId(saved.getClientId(), tenant.tenantId()).orElse(null);
         if (account != null) {
             pushSnapshotIfOnline(account);
         }
@@ -127,11 +144,16 @@ public class NatControlService {
 
     @Transactional
     public void deleteMapping(long id) {
-        TunnelMapping mapping = tunnelMappingRepository.findById(id)
+        deleteMapping(TenantContext.defaultTenant(), id);
+    }
+
+    @Transactional
+    public void deleteMapping(TenantContext tenant, long id) {
+        TunnelMapping mapping = tunnelMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
         tunnelMappingRepository.delete(mapping);
         tunnelMappingRepository.flush();
-        ClientAccount account = clientAccountRepository.findById(mapping.getClientId()).orElse(null);
+        ClientAccount account = clientAccountRepository.findByIdAndTenantId(mapping.getClientId(), tenant.tenantId()).orElse(null);
         if (account != null) {
             pushSnapshotIfOnline(account);
         }
@@ -144,8 +166,14 @@ public class NatControlService {
      */
     @Transactional(readOnly = true)
     public PushResult pushToClient(long clientId) {
-        ClientAccount account = findClient(clientId);
-        List<TunnelMapping> mappings = tunnelMappingRepository.findByClientIdAndEnabledTrueOrderByIdAsc(account.getId());
+        return pushToClient(TenantContext.defaultTenant(), clientId);
+    }
+
+    @Transactional(readOnly = true)
+    public PushResult pushToClient(TenantContext tenant, long clientId) {
+        ClientAccount account = findClient(tenant, clientId);
+        List<TunnelMapping> mappings = tunnelMappingRepository
+                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(tenant.tenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = assembleHttpRoutesIfManaged(account.getId());
         if (!sendNatControl(account.getClientName(), mappings, httpRoutes)) {
             throw new IllegalStateException("客户端不在线，无法下发映射");
@@ -163,7 +191,8 @@ public class NatControlService {
         if (account == null) {
             return;
         }
-        List<TunnelMapping> mappings = tunnelMappingRepository.findByClientIdAndEnabledTrueOrderByIdAsc(account.getId());
+        List<TunnelMapping> mappings = tunnelMappingRepository
+                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = assembleHttpRoutesIfManaged(account.getId());
         if (mappings.isEmpty() && httpRoutes == null) {
             return;
@@ -179,7 +208,8 @@ public class NatControlService {
      * 客户端不在线时静默返回。
      */
     public void pushSnapshotIfOnline(ClientAccount account) {
-        List<TunnelMapping> mappings = tunnelMappingRepository.findByClientIdAndEnabledTrueOrderByIdAsc(account.getId());
+        List<TunnelMapping> mappings = tunnelMappingRepository
+                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = assembleHttpRoutesIfManaged(account.getId());
         if (sendNatControl(account.getClientName(), mappings, httpRoutes)) {
             log.info("[nat-control] auto-synchronized {} tcp + {} http route(s) to {}",
@@ -194,10 +224,12 @@ public class NatControlService {
      * {@code httpTunnelConfigList} 字段。详见类级 javadoc。
      */
     private List<HttpRouteMapping> assembleHttpRoutesIfManaged(long clientId) {
-        if (!httpRouteMappingRepository.existsByClientId(clientId)) {
+        ClientAccount account = clientAccountRepository.findById(clientId).orElse(null);
+        if (account == null || !httpRouteMappingRepository.existsByTenantIdAndClientId(account.getTenantId(), clientId)) {
             return null;
         }
-        return httpRouteMappingRepository.findByClientIdAndEnabledTrueOrderByIdAsc(clientId);
+        return httpRouteMappingRepository
+                .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(account.getTenantId(), clientId);
     }
 
     private boolean sendNatControl(String clientName,
@@ -246,6 +278,11 @@ public class NatControlService {
 
     private ClientAccount findClient(long clientId) {
         return clientAccountRepository.findById(clientId)
+                .orElseThrow(() -> new IllegalArgumentException("client not found: " + clientId));
+    }
+
+    private ClientAccount findClient(TenantContext tenant, long clientId) {
+        return clientAccountRepository.findByIdAndTenantId(clientId, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + clientId));
     }
 

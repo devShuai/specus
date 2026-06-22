@@ -58,7 +58,10 @@ class SecurityRulesTests {
         String token = body.path("accessToken").asText(null);
         assertThat(token).isNotBlank();
 
-        assertThat(get("/api/admin/overview", token).statusCode()).isEqualTo(200);
+        HttpResponse<String> overview = get("/api/admin/overview", token);
+        assertThat(overview.statusCode())
+                .as("overview response body: %s", overview.body())
+                .isEqualTo(200);
     }
 
     @Test

@@ -6,9 +6,13 @@ import type {
   DatabaseInitResult,
   HttpRoute,
   HttpRouteMutation,
+  HttpTrafficExchange,
   NatControlResult,
   OidcConfig,
   Overview,
+  ResourceTrafficType,
+  ResourceTrafficUsage,
+  TcpTrafficFrame,
   TokenResponse,
   TrafficUsage,
   Tunnel,
@@ -20,6 +24,7 @@ const ADMIN_PREFIX = "/api/admin";
 const TOKEN_KEY = "access_token";
 const EXPIRY_KEY = "token_expiry";
 const LOGIN_TYPE_KEY = "login_type";
+let unauthorizedHandled = false;
 
 export type LoginType = "password" | "oidc";
 
@@ -41,6 +46,7 @@ export const tokenStore = {
     if (expiresIn) {
       sessionStorage.setItem(EXPIRY_KEY, String(Date.now() + expiresIn * 1000));
     }
+    unauthorizedHandled = false;
   },
   clear(): void {
     sessionStorage.removeItem(TOKEN_KEY);
@@ -61,6 +67,7 @@ let unauthorizedHandler: (() => void) | null = null;
 // setUnauthorizedHandler registers the callback invoked on any 401 from the admin API.
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
+  unauthorizedHandled = false;
 }
 
 class ApiError extends Error {}
@@ -74,7 +81,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   const response = await fetch(`${ADMIN_PREFIX}${path}`, { ...init, headers });
   if (response.status === 401) {
-    unauthorizedHandler?.();
+    if (!unauthorizedHandled) {
+      unauthorizedHandled = true;
+      unauthorizedHandler?.();
+    }
     throw new ApiError("登录已过期");
   }
   if (response.status === 204) {
@@ -203,4 +213,15 @@ export const adminApi = {
   },
 
   listTraffic: (limit = 100) => request<TrafficUsage[]>(`/traffic?limit=${limit}`),
+  listResourceTraffic: (type?: ResourceTrafficType, limit = 200) => {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (type) {
+      params.set("type", type);
+    }
+    return request<ResourceTrafficUsage[]>(`/traffic/resources?${params.toString()}`);
+  },
+  listHttpTrafficExchanges: (limit = 100) =>
+    request<HttpTrafficExchange[]>(`/traffic/http-exchanges?limit=${limit}`),
+  listTcpTrafficFrames: (limit = 200) => request<TcpTrafficFrame[]>(`/traffic/tcp-frames?limit=${limit}`),
 };

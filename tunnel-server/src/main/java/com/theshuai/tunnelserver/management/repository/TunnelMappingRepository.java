@@ -9,9 +9,17 @@ import java.util.Optional;
 public interface TunnelMappingRepository extends JpaRepository<TunnelMapping, Long> {
     List<TunnelMapping> findAllByOrderByIdDesc();
 
+    List<TunnelMapping> findByTenantIdOrderByIdDesc(String tenantId);
+
     List<TunnelMapping> findByClientIdOrderByIdDesc(Long clientId);
+
+    List<TunnelMapping> findByTenantIdAndClientIdOrderByIdDesc(String tenantId, Long clientId);
 
     List<TunnelMapping> findByClientIdAndEnabledTrueOrderByIdAsc(Long clientId);
 
+    List<TunnelMapping> findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(String tenantId, Long clientId);
+
     Optional<TunnelMapping> findByListenPort(int listenPort);
+
+    Optional<TunnelMapping> findByIdAndTenantId(Long id, String tenantId);
 }

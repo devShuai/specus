@@ -1,10 +1,12 @@
 package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.tunnelserver.management.model.HttpRouteView;
+import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.tunnelserver.management.service.ClientAccountService.ClientMutation;
 import com.theshuai.tunnelserver.management.service.HttpRouteService.RouteMutation;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -168,6 +170,30 @@ class HttpRouteServiceTests {
         List<HttpRouteView> only = httpRouteService.listRoutes(clientIdB);
         assertThat(only).hasSize(1);
         assertThat(only.get(0).route()).isEqualTo("api");
+    }
+
+    @Test
+    void tenantScopedQueriesDoNotLeakClientsOrRoutes() {
+        TenantContext tenantB = new TenantContext("tenant-b");
+        clientAccountService.createClient(tenantB, new ClientMutation("RouteClientTenantB", "pwc", true, 0));
+        long clientIdTenantB = clientAccountRepository.findByClientName("RouteClientTenantB").orElseThrow().getId();
+
+        httpRouteService.createRoute(clientIdA, new RouteMutation("web", "http://127.0.0.1:8080", true));
+        httpRouteService.createRoute(tenantB, clientIdTenantB,
+                new RouteMutation("api", "http://127.0.0.1:9090", true));
+
+        assertThat(clientAccountService.listClients())
+                .extracting(ClientAccountView::clientName)
+                .containsExactlyInAnyOrder(CLIENT_A, CLIENT_B);
+        assertThat(clientAccountService.listClients(tenantB))
+                .extracting(ClientAccountView::clientName)
+                .containsExactly("RouteClientTenantB");
+        assertThat(httpRouteService.listRoutes(null))
+                .extracting(HttpRouteView::route)
+                .containsExactly("web");
+        assertThat(httpRouteService.listRoutes(tenantB, null))
+                .extracting(HttpRouteView::route)
+                .containsExactly("api");
     }
 
     @Test

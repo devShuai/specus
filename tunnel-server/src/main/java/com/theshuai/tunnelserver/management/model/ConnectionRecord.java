@@ -12,6 +12,7 @@ import lombok.Setter;
 
 @Entity
 @Table(name = "tunnel_connection_record", indexes = {
+        @Index(name = "idx_tunnel_connection_tenant", columnList = "tenant_id"),
         // Composite serves the per-login rate-limit COUNT (client_id = ? AND connected_at >= ?)
         // and per-client history listings ordered by time.
         @Index(name = "idx_tunnel_connection_client_time", columnList = "client_id, connected_at"),
@@ -24,6 +25,9 @@ public class ConnectionRecord {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Column(name = "tenant_id", length = 80)
+    private String tenantId;
 
     @Column(name = "client_id")
     private Long clientId;

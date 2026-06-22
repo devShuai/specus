@@ -9,14 +9,24 @@ import java.util.Optional;
 public interface HttpRouteMappingRepository extends JpaRepository<HttpRouteMapping, Long> {
     List<HttpRouteMapping> findAllByOrderByIdDesc();
 
+    List<HttpRouteMapping> findByTenantIdOrderByIdDesc(String tenantId);
+
     List<HttpRouteMapping> findByClientIdOrderByIdDesc(Long clientId);
+
+    List<HttpRouteMapping> findByTenantIdAndClientIdOrderByIdDesc(String tenantId, Long clientId);
 
     /**
      * 用于下发：仅取启用项，按 id 升序保证客户端面板呈现稳定。
      */
     List<HttpRouteMapping> findByClientIdAndEnabledTrueOrderByIdAsc(Long clientId);
 
+    List<HttpRouteMapping> findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(String tenantId, Long clientId);
+
     Optional<HttpRouteMapping> findByClientIdAndRoute(Long clientId, String route);
+
+    Optional<HttpRouteMapping> findByTenantIdAndClientIdAndRoute(String tenantId, Long clientId, String route);
+
+    Optional<HttpRouteMapping> findByIdAndTenantId(Long id, String tenantId);
 
     /**
      * 区分"该客户端从未在后台管理过 HTTP 路由"和"管理过但当前都禁用/删除"。前一种情况下
@@ -24,4 +34,6 @@ public interface HttpRouteMappingRepository extends JpaRepository<HttpRouteMappi
      * {@code tunnelClientConfig.json} —— 避免升级时误清除遗留配置。
      */
     boolean existsByClientId(Long clientId);
+
+    boolean existsByTenantIdAndClientId(String tenantId, Long clientId);
 }

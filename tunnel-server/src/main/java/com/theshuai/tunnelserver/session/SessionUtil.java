@@ -46,6 +46,7 @@ public final class SessionUtil {
         }
         clientChannelMap.remove(session.getClientName(), channel);
         channel.attr(ServerAttributes.SESSION).set(null);
+        channel.attr(ServerAttributes.TENANT_ID).set(null);
         log.info("{} 退出登录", session.getClientName());
     }
 

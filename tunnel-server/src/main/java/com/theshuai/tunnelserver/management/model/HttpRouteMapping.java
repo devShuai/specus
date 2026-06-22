@@ -27,12 +27,18 @@ import lombok.Setter;
                 name = "uk_http_route_client_route",
                 columnNames = {"client_id", "route"}
         ),
-        indexes = @Index(name = "idx_http_route_client", columnList = "client_id"))
+        indexes = {
+                @Index(name = "idx_http_route_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_http_route_client", columnList = "client_id")
+        })
 @Getter
 @Setter
 public class HttpRouteMapping {
     @Id
     private Long id;
+
+    @Column(name = "tenant_id", length = 80)
+    private String tenantId;
 
     @Column(name = "client_id", nullable = false)
     private Long clientId;

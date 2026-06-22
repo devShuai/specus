@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.management.model.ConnectionRecord;
 import com.theshuai.tunnelserver.management.model.ConnectionRecordView;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.websocket.ConnectionEvent;
 import jakarta.persistence.criteria.Predicate;
 import org.slf4j.Logger;
@@ -47,6 +48,10 @@ public class ConnectionRecordService {
                                  String channelId, String remoteAddress) {
         String now = Instant.now().toString();
         ConnectionRecord record = new ConnectionRecord();
+        String tenantId = result.account() == null
+                ? TenantContext.DEFAULT_TENANT_ID
+                : TenantContext.normalize(result.account().getTenantId());
+        record.setTenantId(tenantId);
         record.setClientId(result.account() == null ? null : result.account().getId());
         record.setClientName(packet.getClientName());
         record.setChannelId(channelId);
@@ -61,7 +66,7 @@ public class ConnectionRecordService {
         }
         ConnectionRecord saved = connectionRecordRepository.save(record);
         // AFTER_COMMIT 才真正推 WebSocket（见 ConnectionEventBroadcaster），这里只是发布事务事件。
-        events.publishEvent(ConnectionEvent.created(toView(saved)));
+        events.publishEvent(ConnectionEvent.created(tenantId, toView(saved)));
         return saved.getId();
     }
 
@@ -83,7 +88,8 @@ public class ConnectionRecordService {
             }
             if (dirty) {
                 ConnectionRecord saved = connectionRecordRepository.save(record);
-                events.publishEvent(ConnectionEvent.updated(toView(saved)));
+                events.publishEvent(ConnectionEvent.updated(
+                        TenantContext.normalize(saved.getTenantId()), toView(saved)));
             }
         });
     }
@@ -125,8 +131,14 @@ public class ConnectionRecordService {
 
     @Transactional(readOnly = true)
     public Page<ConnectionRecordView> listConnections(ConnectionFilter filter, Pageable pageable) {
+        return listConnections(TenantContext.defaultTenant(), filter, pageable);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<ConnectionRecordView> listConnections(TenantContext tenant, ConnectionFilter filter, Pageable pageable) {
         Specification<ConnectionRecord> spec = (root, query, cb) -> {
             List<Predicate> predicates = new ArrayList<>();
+            predicates.add(cb.equal(root.get("tenantId"), tenant.tenantId()));
             if (filter.clientId() != null) {
                 predicates.add(cb.equal(root.get("clientId"), filter.clientId()));
             }

@@ -17,13 +17,19 @@ import lombok.Setter;
                 name = "uk_tunnel_traffic_client_date",
                 columnNames = {"client_id", "usage_date"}
         ),
-        indexes = @Index(name = "idx_tunnel_traffic_client", columnList = "client_id"))
+        indexes = {
+                @Index(name = "idx_tunnel_traffic_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_tunnel_traffic_client", columnList = "client_id")
+        })
 @Getter
 @Setter
 public class TrafficUsage {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Column(name = "tenant_id", length = 80)
+    private String tenantId;
 
     @Column(name = "client_id", nullable = false)
     private Long clientId;

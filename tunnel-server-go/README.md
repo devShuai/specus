@@ -6,6 +6,7 @@ Go 实现的 shuai-tunnel 服务端,与 Java client / C# server **线协议字�
 
 ```bash
 cd tunnel-server-go
+go generate ./web                    # 只同步 Go server 的内嵌管理后台静态资源
 go build ./cmd/shuai-tunnel-server
 ./shuai-tunnel-server                 # 默认 SQLite + 控制端口 7010 + 管理端口 8088
 ./shuai-tunnel-server -config cfg.json

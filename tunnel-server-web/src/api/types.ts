@@ -102,6 +102,69 @@ export interface TrafficUsage {
   updatedAt: string;
 }
 
+export type ResourceTrafficType = "TCP_TUNNEL" | "HTTP_ROUTE";
+
+export interface ResourceTrafficUsage {
+  id: number;
+  clientId: number;
+  clientName: string;
+  resourceType: ResourceTrafficType;
+  resourceKey: string;
+  resourceId: number | null;
+  resourceName: string;
+  usageDate: string;
+  uploadBytes: number;
+  downloadBytes: number;
+  updatedAt: string;
+}
+
+export interface HttpTrafficExchange {
+  id: number;
+  clientId: number;
+  clientName: string;
+  route: string;
+  resourceId: number | null;
+  resourceName: string;
+  method: string;
+  relativePath: string;
+  rawQuery: string | null;
+  statusCode: number;
+  success: boolean;
+  error: string | null;
+  remoteAddress: string | null;
+  requestBytes: number;
+  responseBytes: number;
+  elapsedMs: number;
+  requestContentType: string | null;
+  responseContentType: string | null;
+  requestHeaders: string;
+  responseHeaders: string;
+  requestPreviewHex: string;
+  requestPreviewText: string;
+  responsePreviewHex: string;
+  responsePreviewText: string;
+  requestTruncated: boolean;
+  responseTruncated: boolean;
+  capturedAt: string;
+}
+
+export interface TcpTrafficFrame {
+  id: number;
+  clientId: number;
+  clientName: string;
+  listenPort: number;
+  resourceId: number | null;
+  resourceName: string;
+  channelId: string;
+  direction: "PUBLIC_TO_CLIENT" | "CLIENT_TO_PUBLIC" | string;
+  remoteAddress: string | null;
+  payloadBytes: number;
+  payloadPreviewHex: string;
+  payloadPreviewText: string;
+  truncated: boolean;
+  frameTime: string;
+}
+
 export interface NatControlResult {
   tunnels: number;
   httpRoutes: number;
@@ -136,6 +199,7 @@ export interface HttpRouteMutation {
 
 // LiveConnectionEvent is the JSON pushed over /ws/connections.
 export interface LiveConnectionEvent {
+  tenantId?: string;
   type: "created" | "updated";
   connection: ConnectionRecord;
 }

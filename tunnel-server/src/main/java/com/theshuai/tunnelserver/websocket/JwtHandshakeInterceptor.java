@@ -1,5 +1,6 @@
 package com.theshuai.tunnelserver.websocket;
 
+import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,11 +31,14 @@ public class JwtHandshakeInterceptor implements HandshakeInterceptor {
 
     /** 握手成功后塞进 WebSocketSession attributes 的 key，handler 内可读取调试用。 */
     public static final String ATTR_USER = "wsUser";
+    public static final String ATTR_TENANT_ID = "tenantId";
 
     private final JwtDecoder jwtDecoder;
+    private final TenantResolver tenantResolver;
 
-    public JwtHandshakeInterceptor(JwtDecoder jwtDecoder) {
+    public JwtHandshakeInterceptor(JwtDecoder jwtDecoder, TenantResolver tenantResolver) {
         this.jwtDecoder = jwtDecoder;
+        this.tenantResolver = tenantResolver;
     }
 
     @Override
@@ -47,6 +51,7 @@ public class JwtHandshakeInterceptor implements HandshakeInterceptor {
         try {
             Jwt jwt = jwtDecoder.decode(token);
             attributes.put(ATTR_USER, jwt.getSubject());
+            attributes.put(ATTR_TENANT_ID, tenantResolver.resolve(jwt).tenantId());
             return true;
         } catch (JwtException e) {
             log.debug("ws handshake JWT rejected: {}", e.getMessage());

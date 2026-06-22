@@ -78,6 +78,8 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                 if (authentication.success()) {
                     ctx.channel().attr(CONNECTION_RECORD_ID).set(connectionRecordId);
                     ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.LOGIN_TIME_MS).set(System.currentTimeMillis());
+                    ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.TENANT_ID).set(
+                            authentication.account().getTenantId());
                     SessionUtil.bindSession(new Session(packet.getClientName()), ctx.channel());
                 }
                 io.netty.channel.ChannelFuture writeFuture = ctx.writeAndFlush(response);

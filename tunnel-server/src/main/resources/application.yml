@@ -48,6 +48,7 @@ tunnel:
     password-login-enabled: ${TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED:true}
     username: ${TUNNEL_AUTH_USERNAME:admin}
     password: ${TUNNEL_AUTH_PASSWORD:admin}
+    tenant-id: ${TUNNEL_AUTH_TENANT_ID:default}
     jwt-secret: ${TUNNEL_AUTH_JWT_SECRET:}
     token-ttl-seconds: ${TUNNEL_AUTH_TOKEN_TTL_SECONDS:28800}
   oidc:
@@ -64,8 +65,15 @@ tunnel:
     redirect-uri: ${TUNNEL_OIDC_REDIRECT_URI:http://127.0.0.1:8088/}
     scope: ${TUNNEL_OIDC_SCOPE:openid}
     audience: ${TUNNEL_OIDC_AUDIENCE:}
+    tenant-claim: ${TUNNEL_OIDC_TENANT_CLAIM:tenant_id}
   traffic:
     flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}
+    capture-detail-enabled: ${TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED:true}
+    capture-preview-bytes: ${TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES:256}
+    capture-header-chars: ${TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS:8192}
+    capture-max-pending: ${TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING:20000}
+    capture-flush-batch-size: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE:1000}
+    capture-flush-interval-ms: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS:2000}
   connection-record:
     # Rolling days of raw login detail to keep. Older detail is rolled up into per-natural-month
     # totals (kept indefinitely) and then deleted. 0 disables archiving.

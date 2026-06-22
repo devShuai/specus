@@ -3,17 +3,22 @@ package com.theshuai.tunnelserver.management.model;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
 
 @Entity
-@Table(name = "tunnel_client_account")
+@Table(name = "tunnel_client_account",
+        indexes = @Index(name = "idx_tunnel_client_tenant", columnList = "tenant_id"))
 @Getter
 @Setter
 public class ClientAccount {
     @Id
     private Long id;
+
+    @Column(name = "tenant_id", length = 80)
+    private String tenantId;
 
     @Column(name = "client_name", nullable = false, unique = true, length = 120)
     private String clientName;

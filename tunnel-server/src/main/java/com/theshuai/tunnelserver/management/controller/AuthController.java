@@ -38,7 +38,7 @@ public class AuthController {
      */
     @PostMapping("/auth/refresh")
     public ResponseEntity<?> refresh(@AuthenticationPrincipal Jwt jwt) {
-        if (jwt == null || jwt.getIssuer() == null || !LocalTokenService.ISSUER.equals(jwt.getIssuer().toString())) {
+        if (jwt == null || !LocalTokenService.ISSUER.equals(claimAsString(jwt, "iss"))) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body(Map.of("error", "OIDC 令牌不能通过该端点续期"));
         }
@@ -54,5 +54,10 @@ public class AuthController {
     }
 
     public record LoginRequest(String username, String password) {
+    }
+
+    private static String claimAsString(Jwt jwt, String claimName) {
+        Object value = jwt.getClaims().get(claimName);
+        return value == null ? null : value.toString();
     }
 }

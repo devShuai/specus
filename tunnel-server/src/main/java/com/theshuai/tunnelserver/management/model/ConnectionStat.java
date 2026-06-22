@@ -19,15 +19,21 @@ import lombok.Setter;
 @Table(name = "tunnel_connection_stat",
         uniqueConstraints = @UniqueConstraint(
                 name = "uk_tunnel_connection_stat",
-                columnNames = {"client_name", "stat_month"}
+                columnNames = {"tenant_id", "client_name", "stat_month"}
         ),
-        indexes = @Index(name = "idx_tunnel_connection_stat_client", columnList = "client_name"))
+        indexes = {
+                @Index(name = "idx_tunnel_connection_stat_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_tunnel_connection_stat_client", columnList = "client_name")
+        })
 @Getter
 @Setter
 public class ConnectionStat {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
+
+    @Column(name = "tenant_id", length = 80)
+    private String tenantId;
 
     @Column(name = "client_id")
     private Long clientId;

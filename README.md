@@ -48,16 +48,17 @@ flowchart TD
 - 客户端(Java)：`tunnel-client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`
 - 客户端(Go)：`tunnel-client-go/cmd/shuai-tunnel-client/main.go`
 - 客户端(.NET)：`tunnel-client-csharp/src/ShuaiTunnel.Client/Program.cs`
-- 管理后台前端：`tunnel-server-web/`(`npm run dev` / `npm run deploy`)
+- 管理后台前端：`tunnel-server-web/`(`npm run dev` / `npm run deploy:java|go|csharp`)
 - 协议实现：`tunnel-common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
 
 ## 环境要求
 
-- JDK 25
+- JDK 21
 - Maven 3.x
-- Go 1.26（仅构建 Go 客户端时需要）
+- Node.js / npm（构建服务端管理后台静态资源时需要）
+- Go 1.26（仅构建 Go 实现时需要）
 
-根目录 `pom.xml` 将 Java 编译版本设置为 `25`。仓库中的 Maven Wrapper 脚本没有可执行权限，且未提交 `.mvn` 目录，因此建议使用本机安装的 Maven。
+根目录 `pom.xml` 将 Java 编译版本设置为 `21`。仓库中的 Maven Wrapper 脚本没有可执行权限，且未提交 `.mvn` 目录，因此建议使用本机安装的 Maven。
 
 ## 构建
 
@@ -66,6 +67,16 @@ flowchart TD
 ```bash
 mvn clean install
 ```
+
+`tunnel-server` 的 Maven 构建会在 `generate-resources` 阶段执行 `tunnel-server-web` 的 `npm run deploy:java`：先构建 React 管理后台，再把 `dist/` 只同步到 Java server 的 `src/main/resources/static/`。首次构建前请在 `tunnel-server-web` 下执行一次 `npm ci` 安装依赖。
+
+如只想构建后端、跳过前端打包与产物同步：
+
+```bash
+mvn clean install "-Dtunnel.server.web.skip=true"
+```
+
+Go / C# server 构建各自处理自己的前端产物：C# 项目构建时执行 `npm run deploy:csharp`；Go server 使用 `go generate ./web` 执行 `npm run deploy:go` 后再 `go build`，这样不会改动其它 server 的静态目录。
 
 ## 启动
 
@@ -85,9 +96,15 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。管理后台支持用户名/密码与 OIDC 登录，管理 API 校验 Bearer JWT，详见[管理后台登录](#管理后台登录)。
 
-服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。持久化层使用 Spring Data JPA 和 Hibernate，不包含手写 SQL 或 `JdbcTemplate`。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
+服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。业务持久化层使用 Spring Data JPA 和 Hibernate；初始化阶段会用少量 `JdbcTemplate` 做旧库字段回填。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
 
 如需在端口映射日志中显示服务端公网地址，可设置 `TUNNEL_PUBLIC_ADDRESS`。未设置时客户端会回退显示控制连接配置中的 `remoteAddress`。
+
+### 多租户
+
+Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP 映射、HTTP 路由、连接记录、连接归档和流量统计都会绑定 `tenant_id`；本地密码登录签发的 JWT 会写入 `tenant_id` claim，默认来自 `TUNNEL_AUTH_TENANT_ID=default`。OIDC 登录可通过 `TUNNEL_OIDC_TENANT_CLAIM` 指定租户 claim，默认读取 `tenant_id`；缺失时回退到默认租户。
+
+旧库升级时，启动初始化会把历史数据的空 `tenant_id` 回填为默认租户。需要注意的是，公网 TCP `listen_port` 仍是整台 server 的全局资源，不能被不同租户重复绑定。
 
 ### 2. 配置并启动客户端
 

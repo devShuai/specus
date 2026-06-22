@@ -6,8 +6,10 @@ import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.session.Session;
 import com.theshuai.tunnelserver.session.SessionUtil;
+import com.theshuai.tunnelserver.attribute.ServerAttributes;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
+import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.server.RemotePortServerManager;
 import com.theshuai.tunnelserver.server.TcpServer;
@@ -34,22 +36,27 @@ public class NatServerHandler extends NatCommonHandler {
     // ever reach its own external channels. Concurrent because the accepted channels live on
     // their TcpServer's event loops while routing happens on the control connection's loop.
     private final Map<String, Channel> externalChannels = new ConcurrentHashMap<>();
+    private final Map<String, Integer> externalChannelPorts = new ConcurrentHashMap<>();
 
     private final TrafficUsageService trafficUsageService;
+    private final TrafficInspectionService trafficInspectionService;
     private final RemotePortServerManager remotePortServerManager;
     private final NettyServerProperties nettyProperties;
     private final AtomicInteger activeClientExternalChannels = new AtomicInteger();
     private final Map<Integer, AtomicInteger> portExternalChannelCounts = new ConcurrentHashMap<>();
     // Set during processRegister; null means the client has not registered any tunnel yet.
     private volatile String clientName;
+    private volatile String tenantId = "default";
     // Per-connection flag. Each control connection gets its own handler instance, but we still
     // gate DATA/DISCONNECTED on successful REGISTER to reject out-of-order messages.
     private volatile boolean register = false;
 
     public NatServerHandler(TrafficUsageService trafficUsageService,
+                            TrafficInspectionService trafficInspectionService,
                             RemotePortServerManager remotePortServerManager,
                             NettyServerProperties nettyProperties) {
         this.trafficUsageService = trafficUsageService;
+        this.trafficInspectionService = trafficInspectionService;
         this.remotePortServerManager = remotePortServerManager;
         this.nettyProperties = nettyProperties;
     }
@@ -99,7 +106,10 @@ public class NatServerHandler extends NatCommonHandler {
         if (target == null) {
             return;
         }
-        trafficUsageService.recordUpload(clientName, data.length);
+        int listenPort = externalChannelPorts.getOrDefault(channelId, 0);
+        trafficUsageService.recordTcpUpload(clientName, listenPort, data.length);
+        trafficInspectionService.recordTcpFrame(clientName, listenPort, channelId,
+                TrafficInspectionService.DIRECTION_CLIENT_TO_PUBLIC, remoteAddress(target), data);
         target.writeAndFlush(data).addListener(future -> {
             if (!future.isSuccess()) {
                 log.warn("write DATA to external channel {} failed [{}]",
@@ -163,6 +173,8 @@ public class NatServerHandler extends NatCommonHandler {
             return;
         }
         clientName = session.getClientName();
+        String boundTenantId = ctx.channel().attr(ServerAttributes.TENANT_ID).get();
+        tenantId = boundTenantId == null || boundTenantId.isBlank() ? "default" : boundTenantId;
 
         if (remoteConnectionServerMap.containsKey(port)) {
             // Port already in use on this server. Reject instead of silently reporting success.
@@ -185,19 +197,24 @@ public class NatServerHandler extends NatCommonHandler {
                         channel.close();
                         return;
                     }
+                    String channelId = channel.id().asLongText();
                     try {
-                        String channelId = channel.id().asLongText();
                         channel.pipeline().addLast(new ByteArrayDecoder(), new ByteArrayEncoder(),
-                                new RemoteTunnelHandler(thisHandler, port, clientName, trafficUsageService));
+                                new RemoteTunnelHandler(thisHandler, port, clientName, trafficUsageService,
+                                        trafficInspectionService));
                         externalChannels.put(channelId, channel);
+                        externalChannelPorts.put(channelId, port);
                         syncExternalReadWithControl(channel);
                         channel.closeFuture().addListener(future -> {
                             if (externalChannels.remove(channelId) != null) {
+                                externalChannelPorts.remove(channelId);
                                 releaseExternalChannel(port);
                                 updateControlAutoReadForExternalWritability();
                             }
                         });
                     } catch (RuntimeException e) {
+                        externalChannels.remove(channelId);
+                        externalChannelPorts.remove(channelId);
                         releaseExternalChannel(port);
                         throw e;
                     }
@@ -240,6 +257,7 @@ public class NatServerHandler extends NatCommonHandler {
         }
         remoteConnectionServerMap.clear();
         externalChannels.values().forEach(Channel::close);
+        externalChannelPorts.clear();
     }
 
     @Override
@@ -292,19 +310,19 @@ public class NatServerHandler extends NatCommonHandler {
     }
 
     private boolean tryAcquireExternalChannel(int port) {
-        if (!remotePortServerManager.tryAcquireExternalConnection()) {
+        if (!remotePortServerManager.tryAcquireExternalConnection(tenantId)) {
             return false;
         }
         if (!tryIncrement(activeClientExternalChannels, nettyProperties.getMaxExternalConnectionsPerClient())) {
-            remotePortServerManager.releaseExternalConnection();
-            remotePortServerManager.recordRejectedExternalConnection();
+            remotePortServerManager.releaseExternalConnection(tenantId);
+            remotePortServerManager.recordRejectedExternalConnection(tenantId);
             return false;
         }
         AtomicInteger portCounter = portExternalChannelCounts.computeIfAbsent(port, key -> new AtomicInteger());
         if (!tryIncrement(portCounter, nettyProperties.getMaxExternalConnectionsPerPort())) {
             decrement(activeClientExternalChannels);
-            remotePortServerManager.releaseExternalConnection();
-            remotePortServerManager.recordRejectedExternalConnection();
+            remotePortServerManager.releaseExternalConnection(tenantId);
+            remotePortServerManager.recordRejectedExternalConnection(tenantId);
             return false;
         }
         return true;
@@ -316,7 +334,7 @@ public class NatServerHandler extends NatCommonHandler {
             portExternalChannelCounts.remove(port, portCounter);
         }
         decrement(activeClientExternalChannels);
-        remotePortServerManager.releaseExternalConnection();
+        remotePortServerManager.releaseExternalConnection(tenantId);
     }
 
     private static boolean tryIncrement(AtomicInteger counter, int max) {
@@ -363,5 +381,9 @@ public class NatServerHandler extends NatCommonHandler {
             }
         }
         return null;
+    }
+
+    private static String remoteAddress(Channel channel) {
+        return channel.remoteAddress() == null ? null : channel.remoteAddress().toString();
     }
 }

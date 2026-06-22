@@ -1,11 +1,12 @@
-// Package web embeds the management SPA static assets (copied verbatim from the Java/C#
-// server's static resources).
+// Package web embeds the management SPA static assets.
 package web
 
 import (
 	"embed"
 	"io/fs"
 )
+
+//go:generate npm --prefix ../../tunnel-server-web run deploy:go
 
 //go:embed static
 var staticFS embed.FS

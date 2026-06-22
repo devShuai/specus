@@ -11,6 +11,7 @@ import com.theshuai.tunnelserver.handler.ServerMessageHandler;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
 import com.theshuai.tunnelserver.handler.ManagedLoginRequestHandler;
 import com.theshuai.tunnelserver.handler.NatServerHandler;
+import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.security.TlsContextFactory;
 import com.theshuai.tunnelserver.security.TlsProperties;
@@ -41,6 +42,7 @@ public class NettyServer implements ApplicationRunner {
     private final NettyServerProperties nettyProperties;
     private final ManagedLoginRequestHandler managedLoginRequestHandler;
     private final TrafficUsageService trafficUsageService;
+    private final TrafficInspectionService trafficInspectionService;
     private final RemotePortServerManager remotePortServerManager;
     private final TlsProperties tlsProperties;
     private final com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler;
@@ -51,12 +53,14 @@ public class NettyServer implements ApplicationRunner {
     public NettyServer(NettyServerProperties nettyProperties,
                        ManagedLoginRequestHandler managedLoginRequestHandler,
                        TrafficUsageService trafficUsageService,
+                       TrafficInspectionService trafficInspectionService,
                        RemotePortServerManager remotePortServerManager,
                        TlsProperties tlsProperties,
                        com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler) {
         this.nettyProperties = nettyProperties;
         this.managedLoginRequestHandler = managedLoginRequestHandler;
         this.trafficUsageService = trafficUsageService;
+        this.trafficInspectionService = trafficInspectionService;
         this.remotePortServerManager = remotePortServerManager;
         this.tlsProperties = tlsProperties;
         this.directHttpResponseHandler = directHttpResponseHandler;
@@ -115,6 +119,7 @@ public class NettyServer implements ApplicationRunner {
                         ch.pipeline().addLast(HeartbeatRequestHandler.INSTANCE);
                         ch.pipeline().addLast(new NatServerHandler(
                                 trafficUsageService,
+                                trafficInspectionService,
                                 remotePortServerManager,
                                 nettyProperties
                         ));

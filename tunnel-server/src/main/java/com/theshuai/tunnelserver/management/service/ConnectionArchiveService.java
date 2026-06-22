@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.management.model.ConnectionStatView;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionStatRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionStatRow;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
@@ -63,7 +64,7 @@ public class ConnectionArchiveService {
         for (ConnectionStatRow row : monthlyRows) {
             long total = row.total() == null ? 0L : row.total();
             long success = row.success() == null ? 0L : row.success();
-            upsert(row.clientId(), row.clientName(), row.month(), total, success, now);
+            upsert(row.tenantId(), row.clientId(), row.clientName(), row.month(), total, success, now);
         }
 
         int purged = connectionRecordRepository.deleteByConnectedAtBefore(cutoff);
@@ -73,18 +74,25 @@ public class ConnectionArchiveService {
 
     @Transactional(readOnly = true)
     public List<ConnectionStatView> listStats(String clientName, int limit) {
+        return listStats(TenantContext.defaultTenant(), clientName, limit);
+    }
+
+    @Transactional(readOnly = true)
+    public List<ConnectionStatView> listStats(TenantContext tenant, String clientName, int limit) {
         Pageable pageable = PageRequest.of(0, Math.max(1, Math.min(limit, 500)));
         List<ConnectionStat> stats = StringUtils.hasText(clientName)
-                ? connectionStatRepository.findByClientNameOrderByStatMonthDesc(clientName.trim(), pageable)
-                : connectionStatRepository.findAllByOrderByStatMonthDescClientNameAsc(pageable);
+                ? connectionStatRepository.findByTenantIdAndClientNameOrderByStatMonthDesc(
+                        tenant.tenantId(), clientName.trim(), pageable)
+                : connectionStatRepository.findByTenantIdOrderByStatMonthDescClientNameAsc(tenant.tenantId(), pageable);
         return stats.stream().map(this::toView).toList();
     }
 
-    private void upsert(Long clientId, String clientName, String month, long total, long success, String now) {
+    private void upsert(String tenantId, Long clientId, String clientName, String month, long total, long success, String now) {
         ConnectionStat stat = connectionStatRepository
-                .findByClientNameAndStatMonth(clientName, month)
+                .findByTenantIdAndClientNameAndStatMonth(tenantId, clientName, month)
                 .orElseGet(ConnectionStat::new);
         if (stat.getId() == null) {
+            stat.setTenantId(tenantId);
             stat.setClientName(clientName);
             stat.setStatMonth(month);
         }

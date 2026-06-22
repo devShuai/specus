@@ -18,17 +18,21 @@ public interface ConnectionRecordRepository extends JpaRepository<ConnectionReco
 
     long countBySuccess(boolean success);
 
+    long countByTenantIdAndSuccess(String tenantId, boolean success);
+
     long countByClientIdAndConnectedAtGreaterThanEqual(Long clientId, String connectedAt);
+
+    long countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(String tenantId, Long clientId, String connectedAt);
 
     // Roll detail rows older than the cutoff into per-natural-month totals (month = yyyy-MM from
     // the ISO connectedAt).
     @Query("""
             select new com.theshuai.tunnelserver.management.repository.ConnectionStatRow(
-                max(r.clientId), r.clientName, substring(r.connectedAt, 1, 7),
+                coalesce(r.tenantId, 'default'), max(r.clientId), r.clientName, substring(r.connectedAt, 1, 7),
                 count(r), sum(case when r.success = true then 1L else 0L end))
             from ConnectionRecord r
             where r.connectedAt < :cutoff
-            group by r.clientName, substring(r.connectedAt, 1, 7)
+            group by coalesce(r.tenantId, 'default'), r.clientName, substring(r.connectedAt, 1, 7)
             """)
     List<ConnectionStatRow> aggregateMonthlyBefore(@Param("cutoff") String cutoff);
 

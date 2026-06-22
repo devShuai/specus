@@ -24,7 +24,7 @@ import { useAuth } from "../../auth/AuthContext";
 const PAGE_SIZE = 50;
 
 export function ConnectionsPanel() {
-  const { logout } = useAuth();
+  const { expireSession } = useAuth();
   const [clients, setClients] = useState<{ id: number; clientName: string }[]>([]);
   const [items, setItems] = useState<ConnectionRecord[]>([]);
   const [total, setTotal] = useState(0);
@@ -119,7 +119,7 @@ export function ConnectionsPanel() {
     [matchesFilter],
   );
 
-  useConnectionsFeed({ enabled: true, onEvent: onLiveEvent, onAuthError: logout });
+  useConnectionsFeed({ enabled: true, onEvent: onLiveEvent, onAuthError: expireSession });
 
   const reset = () => {
     setClientId("");

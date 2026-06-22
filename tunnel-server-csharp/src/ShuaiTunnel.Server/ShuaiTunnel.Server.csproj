@@ -7,7 +7,19 @@
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <RootNamespace>ShuaiTunnel.Server</RootNamespace>
+    <TunnelServerWebSkip>false</TunnelServerWebSkip>
   </PropertyGroup>
+
+  <Target Name="BuildAndSyncAdminWeb"
+          BeforeTargets="AssignTargetPaths"
+          Condition="'$(TunnelServerWebSkip)' != 'true' and '$(DesignTimeBuild)' != 'true'">
+    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)..\..\..\tunnel-server-web"
+          Command="npm run deploy:csharp" />
+    <ItemGroup>
+      <Content Remove="wwwroot\**\*" />
+      <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\tunnel-protocol-csharp\src\ShuaiTunnel.Protocol\ShuaiTunnel.Protocol.csproj" />

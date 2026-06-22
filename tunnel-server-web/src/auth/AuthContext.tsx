@@ -28,6 +28,7 @@ interface AuthState {
   authed: boolean;
   oidcConfig: OidcConfig | null;
   loginHint: string;
+  expireSession: () => void;
   passwordLogin: (username: string, password: string) => Promise<void>;
   startOidcLogin: () => Promise<void>;
   logout: () => void;
@@ -42,6 +43,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loginHint, setLoginHint] = useState("请登录");
   const refreshTimer = useRef<number | null>(null);
   const initialized = useRef(false);
+  const sessionExpired = useRef(false);
 
   const stopRefresh = useCallback(() => {
     if (refreshTimer.current !== null) {
@@ -72,6 +74,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [stopRefresh]);
 
   const handleUnauthorized = useCallback(() => {
+    if (sessionExpired.current) {
+      return;
+    }
+    sessionExpired.current = true;
     tokenStore.clear();
     stopRefresh();
     setAuthed(false);
@@ -94,6 +100,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (username: string, password: string) => {
       const data = await apiPasswordLogin(username, password);
       tokenStore.save(data.accessToken, data.expiresIn, "password");
+      sessionExpired.current = false;
       setAuthed(true);
       startRefresh();
     },
@@ -137,6 +144,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         cleanUrl();
       } else if (params.get("code")) {
         await completeOidcRedirect(params, setLoginHint, () => {
+          sessionExpired.current = false;
           setAuthed(true);
         });
       } else if (tokenStore.valid()) {
@@ -157,6 +165,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     authed,
     oidcConfig,
     loginHint,
+    expireSession: handleUnauthorized,
     passwordLogin,
     startOidcLogin,
     logout,

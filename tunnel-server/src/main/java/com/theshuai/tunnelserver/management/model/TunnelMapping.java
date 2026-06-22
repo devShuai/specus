@@ -15,12 +15,18 @@ import lombok.Setter;
                 name = "uk_tunnel_mapping_listen_port",
                 columnNames = "listen_port"
         ),
-        indexes = @Index(name = "idx_tunnel_mapping_client", columnList = "client_id"))
+        indexes = {
+                @Index(name = "idx_tunnel_mapping_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_tunnel_mapping_client", columnList = "client_id")
+        })
 @Getter
 @Setter
 public class TunnelMapping {
     @Id
     private Long id;
+
+    @Column(name = "tenant_id", length = 80)
+    private String tenantId;
 
     @Column(name = "client_id", nullable = false)
     private Long clientId;

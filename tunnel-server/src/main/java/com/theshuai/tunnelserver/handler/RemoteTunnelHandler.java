@@ -5,6 +5,7 @@ import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import io.netty.channel.ChannelHandlerContext;
+import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 
 import java.util.HashMap;
@@ -17,12 +18,18 @@ public class RemoteTunnelHandler extends NatCommonHandler {
     private final int port;
     private final String clientName;
     private final TrafficUsageService trafficUsageService;
+    private final TrafficInspectionService trafficInspectionService;
 
-    public RemoteTunnelHandler(NatServerHandler tunnelHandler, int port, String clientName, TrafficUsageService trafficUsageService) {
+    public RemoteTunnelHandler(NatServerHandler tunnelHandler,
+                               int port,
+                               String clientName,
+                               TrafficUsageService trafficUsageService,
+                               TrafficInspectionService trafficInspectionService) {
         this.tunnelHandler = tunnelHandler;
         this.port = port;
         this.clientName = clientName;
         this.trafficUsageService = trafficUsageService;
+        this.trafficInspectionService = trafficInspectionService;
     }
 
     @Override
@@ -62,7 +69,9 @@ public class RemoteTunnelHandler extends NatCommonHandler {
             ctx.close();
             return;
         }
-        trafficUsageService.recordDownload(clientName, data.length);
+        trafficUsageService.recordTcpDownload(clientName, port, data.length);
+        trafficInspectionService.recordTcpFrame(clientName, port, ctx.channel().id().asLongText(),
+                TrafficInspectionService.DIRECTION_PUBLIC_TO_CLIENT, remoteAddress(ctx), data);
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.DATA);
         Map<String, Object> metaData = new HashMap<>();
@@ -83,5 +92,9 @@ public class RemoteTunnelHandler extends NatCommonHandler {
     public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
         tunnelHandler.updateControlAutoReadForExternalWritability();
         super.channelWritabilityChanged(ctx);
+    }
+
+    private String remoteAddress(ChannelHandlerContext ctx) {
+        return ctx.channel().remoteAddress() == null ? null : ctx.channel().remoteAddress().toString();
     }
 }

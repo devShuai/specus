@@ -16,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * {@code /ws/connections} 的服务端 handler：管理所有在线管理浏览器的 WebSocket session，
- * 提供 {@link #broadcast(Object)} 把对象序列化为 JSON 推给所有 session。
+ * 提供 {@link #broadcast(String, Object)} 把对象序列化为 JSON 推给同租户 session。
  *
  * <p>设计要点：
  * <ul>
@@ -59,8 +59,8 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
         // session 会被框架进一步关闭并触发 afterConnectionClosed
     }
 
-    /** 把 {@code payload} 序列化为 JSON，推给当前所有在线 session。 */
-    public void broadcast(Object payload) {
+    /** 把 {@code payload} 序列化为 JSON，推给当前租户所有在线 session。 */
+    public void broadcast(String tenantId, Object payload) {
         if (sessions.isEmpty()) {
             return;
         }
@@ -73,6 +73,10 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
         }
         TextMessage message = new TextMessage(json);
         for (WebSocketSession session : sessions) {
+            Object sessionTenantId = session.getAttributes().get(JwtHandshakeInterceptor.ATTR_TENANT_ID);
+            if (!tenantId.equals(sessionTenantId)) {
+                continue;
+            }
             if (!session.isOpen()) {
                 sessions.remove(session);
                 continue;

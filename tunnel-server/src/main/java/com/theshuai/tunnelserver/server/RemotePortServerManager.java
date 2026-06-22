@@ -12,6 +12,8 @@ import org.springframework.stereotype.Component;
 
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 @Component
 @Slf4j
@@ -21,6 +23,8 @@ public class RemotePortServerManager {
     private final EventLoopGroup workerGroup;
     private final AtomicInteger activeExternalConnections = new AtomicInteger();
     private final LongAdder rejectedExternalConnections = new LongAdder();
+    private final ConcurrentMap<String, AtomicInteger> activeExternalConnectionsByTenant = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, LongAdder> rejectedExternalConnectionsByTenant = new ConcurrentHashMap<>();
 
     public RemotePortServerManager(NettyServerProperties properties) {
         this.properties = properties;
@@ -35,29 +39,48 @@ public class RemotePortServerManager {
     }
 
     public boolean tryAcquireExternalConnection() {
+        return tryAcquireExternalConnection("default");
+    }
+
+    public boolean tryAcquireExternalConnection(String tenantId) {
         int max = properties.getMaxExternalConnections();
         if (max <= 0) {
             activeExternalConnections.incrementAndGet();
+            incrementTenantActive(tenantId);
             return true;
         }
         while (true) {
             int current = activeExternalConnections.get();
             if (current >= max) {
-                recordRejectedExternalConnection();
+                recordRejectedExternalConnection(tenantId);
                 return false;
             }
             if (activeExternalConnections.compareAndSet(current, current + 1)) {
+                incrementTenantActive(tenantId);
                 return true;
             }
         }
     }
 
     public void releaseExternalConnection() {
+        releaseExternalConnection("default");
+    }
+
+    public void releaseExternalConnection(String tenantId) {
         activeExternalConnections.updateAndGet(current -> current > 0 ? current - 1 : 0);
+        AtomicInteger tenantCounter = activeExternalConnectionsByTenant.get(tenantId);
+        if (tenantCounter != null && decrement(tenantCounter) == 0) {
+            activeExternalConnectionsByTenant.remove(tenantId, tenantCounter);
+        }
     }
 
     public void recordRejectedExternalConnection() {
+        recordRejectedExternalConnection("default");
+    }
+
+    public void recordRejectedExternalConnection(String tenantId) {
         rejectedExternalConnections.increment();
+        rejectedExternalConnectionsByTenant.computeIfAbsent(tenantId, key -> new LongAdder()).increment();
     }
 
     public int activeExternalConnections() {
@@ -66,6 +89,16 @@ public class RemotePortServerManager {
 
     public long rejectedExternalConnections() {
         return rejectedExternalConnections.sum();
+    }
+
+    public int activeExternalConnections(String tenantId) {
+        AtomicInteger counter = activeExternalConnectionsByTenant.get(tenantId);
+        return counter == null ? 0 : counter.get();
+    }
+
+    public long rejectedExternalConnections(String tenantId) {
+        LongAdder counter = rejectedExternalConnectionsByTenant.get(tenantId);
+        return counter == null ? 0 : counter.sum();
     }
 
     @PreDestroy
@@ -79,5 +112,15 @@ public class RemotePortServerManager {
             return new MultiThreadIoEventLoopGroup(threads, NioIoHandler.newFactory());
         }
         return new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+    }
+
+    private void incrementTenantActive(String tenantId) {
+        activeExternalConnectionsByTenant
+                .computeIfAbsent(tenantId, key -> new AtomicInteger())
+                .incrementAndGet();
+    }
+
+    private static int decrement(AtomicInteger counter) {
+        return counter.updateAndGet(current -> current > 0 ? current - 1 : 0);
     }
 }

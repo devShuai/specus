@@ -24,10 +24,21 @@ VITE_API_TARGET=http://127.0.0.1:8088 npm run dev
 
 ```bash
 npm run build        # 类型检查 + 产出 dist/(index.html + assets/)
-npm run deploy       # build 后把 dist 拷入三端静态目录
+npm run deploy:java  # build 后只写 tunnel-server/src/main/resources/static/
+npm run deploy:go    # build 后只写 tunnel-server-go/web/static/
+npm run deploy:csharp # build 后只写 tunnel-server-csharp/src/ShuaiTunnel.Server/wwwroot/
+npm run deploy:all   # build 后写入三端静态目录（手动同步用）
 ```
 
-`scripts/deploy.mjs` 会清空并写入:
+Java `tunnel-server` 的 Maven 构建已经接入该流程：执行 `mvn package` / `mvn install`
+时，会在 `generate-resources` 阶段调用这里的 `npm run deploy:java`，让 Spring 资源复制前拿到
+最新管理后台产物，且不会改动 Go/C# 静态目录。需要纯后端构建时可加 `"-Dtunnel.server.web.skip=true"` 跳过。
+
+C# `ShuaiTunnel.Server` 的 MSBuild 构建会调用 `npm run deploy:csharp`，可用
+`/p:TunnelServerWebSkip=true` 跳过。Go server 没有 `go build` 前置生命周期，使用
+`go generate ./web` 调用 `npm run deploy:go` 后再构建。
+
+`scripts/deploy.mjs` 会按 `--target` 清空并写入目标目录，只有 `deploy:all` 才会写入三端:
 - `tunnel-server-go/web/static/`(go:embed —— 之后需 `go build` 重新嵌入)
 - `tunnel-server-csharp/src/ShuaiTunnel.Server/wwwroot/`(下次 `dotnet build`/运行生效)
 - `tunnel-server/src/main/resources/static/`(Spring 静态,下次构建/运行生效)

@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.server.RemotePortServerManager;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -30,16 +31,21 @@ public class OverviewService {
 
     @Transactional(readOnly = true)
     public Map<String, Object> overview() {
-        List<ClientAccountView> clients = clientAccountService.listClients();
+        return overview(TenantContext.defaultTenant());
+    }
+
+    @Transactional(readOnly = true)
+    public Map<String, Object> overview(TenantContext tenant) {
+        List<ClientAccountView> clients = clientAccountService.listClients(tenant);
         Map<String, Object> overview = new LinkedHashMap<>();
         overview.put("clients", clients.size());
         overview.put("onlineClients", clients.stream().filter(ClientAccountView::online).count());
-        overview.put("successfulConnections", connectionRecordRepository.countBySuccess(true));
-        overview.put("failedConnections", connectionRecordRepository.countBySuccess(false));
+        overview.put("successfulConnections", connectionRecordRepository.countByTenantIdAndSuccess(tenant.tenantId(), true));
+        overview.put("failedConnections", connectionRecordRepository.countByTenantIdAndSuccess(tenant.tenantId(), false));
         overview.put("uploadBytes", clients.stream().mapToLong(ClientAccountView::uploadBytes).sum());
         overview.put("downloadBytes", clients.stream().mapToLong(ClientAccountView::downloadBytes).sum());
-        overview.put("externalConnections", remotePortServerManager.activeExternalConnections());
-        overview.put("rejectedExternalConnections", remotePortServerManager.rejectedExternalConnections());
+        overview.put("externalConnections", remotePortServerManager.activeExternalConnections(tenant.tenantId()));
+        overview.put("rejectedExternalConnections", remotePortServerManager.rejectedExternalConnections(tenant.tenantId()));
         return overview;
     }
 }

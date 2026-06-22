@@ -22,6 +22,8 @@ public class OidcProperties {
     private String scope = "openid";
     /** Optional expected audience; when blank, audience is not enforced. */
     private String audience = "";
+    /** Claim name used to scope admin API data per tenant. Blank falls back to the default tenant. */
+    private String tenantClaim = "tenant_id";
 
     public String getIssuer() {
         return issuer;
@@ -101,5 +103,13 @@ public class OidcProperties {
 
     public void setAudience(String audience) {
         this.audience = audience;
+    }
+
+    public String getTenantClaim() {
+        return tenantClaim;
+    }
+
+    public void setTenantClaim(String tenantClaim) {
+        this.tenantClaim = tenantClaim;
     }
 }

@@ -3,6 +3,7 @@ package com.theshuai.tunnelserver.http;
 import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import com.theshuai.tunnelserver.http.DirectHttpDispatcher.DirectHttpTunnelException;
+import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
@@ -33,15 +34,18 @@ public class HttpTunnelController {
 
     private final DirectHttpDispatcher dispatcher;
     private final TrafficUsageService trafficUsageService;
+    private final TrafficInspectionService trafficInspectionService;
     private final long timeoutMillis;
     private final int maxRequestBodySize;
 
     public HttpTunnelController(DirectHttpDispatcher dispatcher,
                                 TrafficUsageService trafficUsageService,
+                                TrafficInspectionService trafficInspectionService,
                                 @Value("${tunnel.http.timeout-ms:30000}") long timeoutMillis,
                                 @Value("${tunnel.http.max-request-body-size:16777216}") int maxRequestBodySize) {
         this.dispatcher = dispatcher;
         this.trafficUsageService = trafficUsageService;
+        this.trafficInspectionService = trafficInspectionService;
         this.timeoutMillis = timeoutMillis;
         this.maxRequestBodySize = maxRequestBodySize;
     }
@@ -53,33 +57,44 @@ public class HttpTunnelController {
                                           HttpServletRequest request) {
         byte[] requestBody = body == null ? new byte[0] : body;
         long startedAt = System.currentTimeMillis();
+        String relativePath = relativePath(request);
+        List<String> forwardedHeaders = requestHeaders(request);
         log.info("[http-direct][server-ingress] clientName={} method={} route={} path={} queryPresent={} bodyBytes={}",
-                clientName, request.getMethod(), route, relativePath(request),
+                clientName, request.getMethod(), route, relativePath,
                 request.getQueryString() != null, requestBody.length);
         if (requestBody.length > maxRequestBodySize) {
             log.warn("[http-direct][server-ingress] clientName={} method={} route={} rejected=body-too-large bodyBytes={} maxBodyBytes={}",
                     clientName, request.getMethod(), route, requestBody.length, maxRequestBodySize);
-            return error(413, "HTTP 请求体超过限制");
+            ResponseEntity<byte[]> errorResponse = error(413, "HTTP 请求体超过限制");
+            trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
+                    request.getQueryString(), forwardedHeaders, requestBody, 413, plainErrorHeaders(),
+                    errorResponse.getBody(), startedAt, remoteAddress(request), "HTTP 请求体超过限制");
+            return errorResponse;
         }
 
         DirectHttpRequestPacket packet = new DirectHttpRequestPacket();
         packet.setRequestMethod(request.getMethod());
         packet.setRoute(route);
-        packet.setRelativePath(relativePath(request));
+        packet.setRelativePath(relativePath);
         packet.setRawQuery(request.getQueryString());
-        packet.setHeaders(requestHeaders(request));
+        packet.setHeaders(forwardedHeaders);
         packet.setBody(requestBody);
 
         try {
             DirectHttpResponsePacket response = dispatcher.forward(clientName, packet, timeoutMillis);
-            trafficUsageService.recordUpload(clientName, requestBody.length);
+            trafficUsageService.recordHttpUpload(clientName, route, requestBody.length);
             byte[] responseBody = response.getBody() == null ? new byte[0] : response.getBody();
-            trafficUsageService.recordDownload(clientName, responseBody.length);
+            trafficUsageService.recordHttpDownload(clientName, route, responseBody.length);
             if (response.getError() != null) {
                 log.warn("[http-direct][server-egress] requestId={} clientName={} status={} error={} elapsedMs={}",
                         response.getRequestId(), clientName, response.getStatusCode(), response.getError(),
                         System.currentTimeMillis() - startedAt);
-                return error(response.getStatusCode() > 0 ? response.getStatusCode() : 502, response.getError());
+                int statusCode = response.getStatusCode() > 0 ? response.getStatusCode() : 502;
+                ResponseEntity<byte[]> errorResponse = error(statusCode, response.getError());
+                trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
+                        request.getQueryString(), forwardedHeaders, requestBody, statusCode, plainErrorHeaders(),
+                        errorResponse.getBody(), startedAt, remoteAddress(request), response.getError());
+                return errorResponse;
             }
 
             HttpHeaders headers = new HttpHeaders();
@@ -87,12 +102,20 @@ public class HttpTunnelController {
             log.info("[http-direct][server-egress] requestId={} clientName={} status={} bodyBytes={} elapsedMs={}",
                     response.getRequestId(), clientName, response.getStatusCode(), responseBody.length,
                     System.currentTimeMillis() - startedAt);
+            trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
+                    request.getQueryString(), forwardedHeaders, requestBody, response.getStatusCode(),
+                    response.getHeaders(), responseBody, startedAt, remoteAddress(request), null);
             return ResponseEntity.status(response.getStatusCode()).headers(headers).body(responseBody);
         } catch (DirectHttpTunnelException e) {
             log.warn("[http-direct][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
                     clientName, request.getMethod(), route, e.getStatusCode(), e.getMessage(),
                     System.currentTimeMillis() - startedAt);
-            return error(e.getStatusCode(), e.getMessage());
+            int statusCode = e.getStatusCode() > 0 ? e.getStatusCode() : 502;
+            ResponseEntity<byte[]> errorResponse = error(statusCode, e.getMessage());
+            trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
+                    request.getQueryString(), forwardedHeaders, requestBody, statusCode, plainErrorHeaders(),
+                    errorResponse.getBody(), startedAt, remoteAddress(request), e.getMessage());
+            return errorResponse;
         }
     }
 
@@ -136,6 +159,14 @@ public class HttpTunnelController {
 
     private boolean shouldForward(String name) {
         return name != null && !SKIPPED_HEADERS.contains(name.toLowerCase(Locale.ROOT));
+    }
+
+    private List<String> plainErrorHeaders() {
+        return List.of(HttpHeaders.CONTENT_TYPE + ":text/plain;charset=UTF-8");
+    }
+
+    private String remoteAddress(HttpServletRequest request) {
+        return request.getRemoteAddr() + ":" + request.getRemotePort();
     }
 
     private ResponseEntity<byte[]> error(int statusCode, String message) {

@@ -2,6 +2,8 @@ package com.theshuai.tunnelserver.security;
 
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
 import com.theshuai.tunnelserver.config.AuthProperties;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
+import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jwt.JwsHeader;
 import org.springframework.security.oauth2.jwt.JwtClaimsSet;
@@ -63,6 +65,7 @@ public class LocalTokenService {
         JwtClaimsSet claims = JwtClaimsSet.builder()
                 .issuer(ISSUER)
                 .subject(username)
+                .claim(TenantResolver.LOCAL_TENANT_CLAIM, TenantContext.normalize(properties.getTenantId()))
                 .issuedAt(now)
                 .expiresAt(now.plusSeconds(properties.getTokenTtlSeconds()))
                 .build();
