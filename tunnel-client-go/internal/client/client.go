@@ -22,7 +22,8 @@ type Client struct {
 	config Config
 	logger *log.Logger
 
-	routes map[string]string
+	routesMu sync.RWMutex
+	routes   map[string]string
 
 	writeMu sync.Mutex
 
@@ -32,17 +33,21 @@ type Client struct {
 	registeredMu sync.Mutex
 	registered   map[int]struct{}
 
+	httpRoutesReportedMu sync.Mutex
+	httpRoutesReported   bool
+
 	localsMu sync.Mutex
 	locals   map[string]net.Conn
+}
+
+type natControlConfig struct {
+	TunnelConfigList     []TunnelConfig      `json:"tunnelConfigList"`
+	HTTPTunnelConfigList *[]HTTPTunnelConfig `json:"httpTunnelConfigList"`
 }
 
 func New(config Config, logger *log.Logger) *Client {
 	if logger == nil {
 		logger = log.Default()
-	}
-	routes := make(map[string]string, len(config.HTTPTunnelConfigList))
-	for _, tunnel := range config.HTTPTunnelConfigList {
-		routes[tunnel.Route] = tunnel.TargetBaseURL
 	}
 	tunnels := make(map[int]TunnelConfig, len(config.TunnelConfigList))
 	for _, tunnel := range config.TunnelConfigList {
@@ -51,7 +56,7 @@ func New(config Config, logger *log.Logger) *Client {
 	return &Client{
 		config:     config,
 		logger:     logger,
-		routes:     routes,
+		routes:     buildHTTPRouteMap(config.HTTPTunnelConfigList),
 		tunnels:    tunnels,
 		registered: make(map[int]struct{}),
 		locals:     make(map[string]net.Conn),
@@ -155,6 +160,7 @@ func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet) 
 		}
 		client.logger.Printf("login succeeded as %q", response.ClientName)
 		client.registerConfiguredTunnels(connection)
+		client.reportHTTPRoutes(connection)
 	case protocol.CommandHeartbeatRequest:
 		return client.send(connection, protocol.CommandHeartbeatResponse, protocol.EncodeHeartbeat())
 	case protocol.CommandHeartbeatResponse:
@@ -182,11 +188,14 @@ func (client *Client) handleMessageResponse(connection net.Conn, body []byte) er
 		client.logger.Printf("received message type=%d from=%q: %s", response.MessageType, response.ClientName, response.Message)
 		return nil
 	}
-	var config Config
+	var config natControlConfig
 	if err := json.Unmarshal([]byte(response.Message), &config); err != nil {
 		return fmt.Errorf("decode NAT control config: %w", err)
 	}
 	client.syncTunnelConfigs(connection, config.TunnelConfigList)
+	if config.HTTPTunnelConfigList != nil {
+		client.syncHTTPTunnelConfigs(*config.HTTPTunnelConfigList)
+	}
 	return nil
 }
 
@@ -200,4 +209,7 @@ func (client *Client) resetConnectionState() {
 	client.registeredMu.Lock()
 	defer client.registeredMu.Unlock()
 	client.registered = make(map[int]struct{})
+	client.httpRoutesReportedMu.Lock()
+	client.httpRoutesReported = false
+	client.httpRoutesReportedMu.Unlock()
 }

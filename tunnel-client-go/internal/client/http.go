@@ -71,7 +71,7 @@ func (client *Client) forwardDirectHTTP(connection net.Conn, body []byte) {
 
 func (client *Client) executeDirectHTTP(packet protocol.DirectHTTPRequest) protocol.DirectHTTPResponse {
 	response := protocol.DirectHTTPResponse{RequestID: packet.RequestID}
-	target, err := buildTarget(client.routes[packet.Route], packet.RelativePath, packet.RawQuery)
+	target, err := buildTarget(client.routeTarget(packet.Route), packet.RelativePath, packet.RawQuery)
 	if err != nil {
 		response.StatusCode = http.StatusBadGateway
 		response.Error = err.Error()
@@ -103,6 +103,77 @@ func (client *Client) executeDirectHTTP(packet protocol.DirectHTTPRequest) proto
 		response.Error = err.Error()
 	}
 	return response
+}
+
+func buildHTTPRouteMap(configs []HTTPTunnelConfig) map[string]string {
+	routes := make(map[string]string, len(configs))
+	for _, config := range configs {
+		if strings.TrimSpace(config.Route) == "" {
+			continue
+		}
+		routes[config.Route] = config.TargetBaseURL
+	}
+	return routes
+}
+
+func (client *Client) syncHTTPTunnelConfigs(configs []HTTPTunnelConfig) {
+	next := buildHTTPRouteMap(configs)
+	client.routesMu.Lock()
+	previous := len(client.routes)
+	client.routes = next
+	client.routesMu.Unlock()
+	client.logger.Printf("[http-direct] routes updated: %d -> %d entries", previous, len(next))
+}
+
+func (client *Client) routeTarget(route string) string {
+	client.routesMu.RLock()
+	defer client.routesMu.RUnlock()
+	return client.routes[route]
+}
+
+func (client *Client) snapshotHTTPRoutes() map[string]string {
+	client.routesMu.RLock()
+	defer client.routesMu.RUnlock()
+	snapshot := make(map[string]string, len(client.routes))
+	for route, target := range client.routes {
+		snapshot[route] = target
+	}
+	return snapshot
+}
+
+func (client *Client) reportHTTPRoutes(connection net.Conn) {
+	client.httpRoutesReportedMu.Lock()
+	if client.httpRoutesReported {
+		client.httpRoutesReportedMu.Unlock()
+		return
+	}
+	client.httpRoutesReported = true
+	client.httpRoutesReportedMu.Unlock()
+
+	snapshot := client.snapshotHTTPRoutes()
+	routes := make([]map[string]string, 0, len(snapshot))
+	for route, target := range snapshot {
+		if strings.TrimSpace(route) == "" {
+			continue
+		}
+		routes = append(routes, map[string]string{
+			"route":         route,
+			"targetBaseUrl": target,
+		})
+	}
+	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
+		Type: protocol.NatHTTPRoutesReport,
+		Metadata: map[string]any{
+			"clientName": client.config.ClientName,
+			"routes":     routes,
+		},
+	})
+	if err == nil {
+		err = client.send(connection, protocol.CommandNatMessage, body)
+	}
+	if err != nil {
+		client.logger.Printf("report HTTP routes failed: %v", err)
+	}
 }
 
 func (client *Client) forwardLegacyHTTP(connection net.Conn, body []byte) {

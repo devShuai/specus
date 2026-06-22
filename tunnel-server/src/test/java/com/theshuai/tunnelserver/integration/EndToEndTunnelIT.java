@@ -26,6 +26,7 @@ import org.springframework.data.domain.PageRequest;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -212,11 +213,11 @@ class EndToEndTunnelIT {
 
     /**
      * 反射读取 NettyClient.controlChannel 当前 pipeline 中
-     * {@link DirectHttpRequestHandler#getCurrentRoutes()}。返回 null 表示客户端
-     * 还没建立连接 / 已断开。
+     * DirectHttpRequestHandler 的当前路由。返回 null 表示客户端还没建立连接 / 已断开。
      *
      * <p>用反射是因为 {@code controlChannel} 是私有字段——为测试新增 getter 会污染
-     * 生产代码 API；E2E 仅在测试代码里这一处反射，权衡之后选择不动 production。
+     * 生产代码 API；路由读取也走反射，是为了兼容单独构建 server 时解析到的旧
+     * tunnel-client snapshot（旧包没有 {@code getCurrentRoutes()}）。
      */
     @SuppressWarnings("unchecked")
     private static Map<String, String> readClientRoutes(NettyClient client) {
@@ -235,9 +236,21 @@ class EndToEndTunnelIT {
             if (handler == null) {
                 return null;
             }
-            return handler.getCurrentRoutes();
+            return readRoutes(handler);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("failed to read client routes via reflection", e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> readRoutes(DirectHttpRequestHandler handler) throws ReflectiveOperationException {
+        try {
+            Method method = handler.getClass().getMethod("getCurrentRoutes");
+            return (Map<String, String>) method.invoke(handler);
+        } catch (NoSuchMethodException ignored) {
+            Field routes = handler.getClass().getDeclaredField("routes");
+            routes.setAccessible(true);
+            return (Map<String, String>) routes.get(handler);
         }
     }
 }

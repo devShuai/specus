@@ -138,15 +138,11 @@ export function ConnectionsPanel() {
         <Select
           className="w-44"
           label="客户端"
-          selectedKeys={clientId ? [clientId] : []}
+          items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}
+          selectedKeys={clientId ? [clientId] : [""]}
           onChange={(event) => { setClientId(event.target.value); setPage(0); }}
         >
-          <>
-            <SelectItem key="">全部</SelectItem>
-            {clients.map((client) => (
-              <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
-            ))}
-          </>
+          {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
         <Select
           className="w-32"

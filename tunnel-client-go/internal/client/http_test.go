@@ -2,6 +2,7 @@ package client
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -54,5 +55,91 @@ func TestExecuteDirectHTTP(t *testing.T) {
 	}
 	if len(response.Headers) != 3 && len(response.Headers) != 4 {
 		t.Fatalf("response headers = %#v", response.Headers)
+	}
+}
+
+func TestSyncHTTPTunnelConfigsUpdatesDirectHTTPRoutes(t *testing.T) {
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte("a"))
+	}))
+	defer upstreamA.Close()
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte("b"))
+	}))
+	defer upstreamB.Close()
+
+	tunnelClient := New(Config{
+		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "web", TargetBaseURL: upstreamA.URL}},
+	}, nil)
+	response := tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
+		RequestID: "8b284fef-0987-4948-ac66-7f2059336989",
+		Method:    http.MethodGet,
+		Route:     "web",
+	})
+	if string(response.Body) != "a" {
+		t.Fatalf("initial response = %#v", response)
+	}
+
+	tunnelClient.syncHTTPTunnelConfigs([]HTTPTunnelConfig{{Route: "web", TargetBaseURL: upstreamB.URL}})
+	response = tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
+		RequestID: "8b284fef-0987-4948-ac66-7f2059336990",
+		Method:    http.MethodGet,
+		Route:     "web",
+	})
+	if string(response.Body) != "b" {
+		t.Fatalf("updated response = %#v", response)
+	}
+
+	tunnelClient.syncHTTPTunnelConfigs([]HTTPTunnelConfig{})
+	response = tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
+		RequestID: "8b284fef-0987-4948-ac66-7f2059336991",
+		Method:    http.MethodGet,
+		Route:     "web",
+	})
+	if response.StatusCode != http.StatusBadGateway || response.Error == "" {
+		t.Fatalf("cleared response = %#v", response)
+	}
+}
+
+func TestReportHTTPRoutesSendsNatReport(t *testing.T) {
+	reader, writer := net.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+
+	tunnelClient := New(Config{
+		ClientName:           "Demo client",
+		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "web", TargetBaseURL: "http://127.0.0.1:8080"}},
+	}, nil)
+	done := make(chan struct{})
+	go func() {
+		tunnelClient.reportHTTPRoutes(writer)
+		close(done)
+	}()
+
+	packet, err := protocol.ReadPacket(reader)
+	if err != nil {
+		t.Fatalf("read packet: %v", err)
+	}
+	<-done
+	if packet.Command != protocol.CommandNatMessage {
+		t.Fatalf("command = %d", packet.Command)
+	}
+	message, err := protocol.DecodeNatMessage(packet.Body)
+	if err != nil {
+		t.Fatalf("decode NAT message: %v", err)
+	}
+	if message.Type != protocol.NatHTTPRoutesReport {
+		t.Fatalf("message type = %d", message.Type)
+	}
+	if message.Metadata["clientName"] != "Demo client" {
+		t.Fatalf("clientName metadata = %#v", message.Metadata["clientName"])
+	}
+	routes, ok := message.Metadata["routes"].([]any)
+	if !ok || len(routes) != 1 {
+		t.Fatalf("routes metadata = %#v", message.Metadata["routes"])
+	}
+	route, ok := routes[0].(map[string]any)
+	if !ok || route["route"] != "web" || route["targetBaseUrl"] != "http://127.0.0.1:8080" {
+		t.Fatalf("route metadata = %#v", routes[0])
 	}
 }

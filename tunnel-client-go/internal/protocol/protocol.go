@@ -33,13 +33,14 @@ const (
 	CommandDirectHTTPRequest  int8 = 7
 	CommandDirectHTTPResponse int8 = -7
 
-	NatRegister       = 1
-	NatRegisterResult = 2
-	NatConnected      = 3
-	NatDisconnected   = 4
-	NatData           = 5
-	NatKeepalive      = 6
-	NatUnregister     = 7
+	NatRegister         = 1
+	NatRegisterResult   = 2
+	NatConnected        = 3
+	NatDisconnected     = 4
+	NatData             = 5
+	NatKeepalive        = 6
+	NatUnregister       = 7
+	NatHTTPRoutesReport = 8
 
 	MessageTypeNatControl = 3
 

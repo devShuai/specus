@@ -127,15 +127,11 @@ export function HttpRoutesPanel() {
         <Select
           className="w-48"
           label="筛选客户端"
-          selectedKeys={filterClientId ? [filterClientId] : []}
+          items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}
+          selectedKeys={filterClientId ? [filterClientId] : [""]}
           onChange={(event) => setFilterClientId(event.target.value)}
         >
-          <>
-            <SelectItem key="">全部</SelectItem>
-            {clients.map((client) => (
-              <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
-            ))}
-          </>
+          {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
         <Button variant="flat" onPress={() => void load()}>
           刷新

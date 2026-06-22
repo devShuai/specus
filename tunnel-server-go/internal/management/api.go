@@ -447,7 +447,11 @@ func (a *API) handleNatControl(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, conflict("客户端不在线，无法下发映射"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tunnels": result.Tunnels, "httpRoutes": result.HTTPRoutes})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pushed":     result.Tunnels,
+		"tunnels":    result.Tunnels,
+		"httpRoutes": result.HTTPRoutes,
+	})
 }
 
 // ---- http routes ---------------------------------------------------------------------
