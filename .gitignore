@@ -43,3 +43,7 @@ tunnelClientConfig.json
 
 ### Go client binary ###
 /tunnel-client-go/shuai-tunnel-client
+
+### Node modules ###
+node_modules/
+
