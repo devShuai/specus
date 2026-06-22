@@ -36,7 +36,7 @@ import java.util.Map;
  *   mvn -pl tunnel-common test-compile exec:java \
  *       -Dexec.mainClass=com.theshuai.common.tools.WireFixtureGenerator \
  *       -Dexec.classpathScope=test \
- *       -Dexec.args="../tunnel-server-tunnel-server-csharp/tests/fixtures"
+ *       -Dexec.args="../tunnel-server-tunnel-protocol-csharp/tests/fixtures"
  * </pre>
  *
  * <p>The C# tests load these as expected-bytes fixtures — see
@@ -48,7 +48,7 @@ import java.util.Map;
 public final class WireFixtureGenerator {
 
     public static void main(String[] args) throws IOException {
-        Path outputDir = Paths.get(args.length > 0 ? args[0] : "tunnel-server-csharp/tests/fixtures").toAbsolutePath();
+        Path outputDir = Paths.get(args.length > 0 ? args[0] : "tunnel-protocol-csharp/tests/fixtures").toAbsolutePath();
         Files.createDirectories(outputDir);
         new Fixtures(outputDir).emit();
         System.out.println("wrote fixtures to " + outputDir);

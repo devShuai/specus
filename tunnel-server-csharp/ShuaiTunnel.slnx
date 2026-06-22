@@ -1,6 +1,6 @@
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/ShuaiTunnel.Protocol/ShuaiTunnel.Protocol.csproj" />
+    <Project Path="../tunnel-protocol-csharp/src/ShuaiTunnel.Protocol/ShuaiTunnel.Protocol.csproj" />
     <Project Path="src/ShuaiTunnel.Server.Data/ShuaiTunnel.Server.Data.csproj" />
     <Project Path="src/ShuaiTunnel.Server.Data.Postgres/ShuaiTunnel.Server.Data.Postgres.csproj" />
     <Project Path="src/ShuaiTunnel.Server.Data.MySql/ShuaiTunnel.Server.Data.MySql.csproj" />
@@ -8,6 +8,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/ShuaiTunnel.IntegrationTests/ShuaiTunnel.IntegrationTests.csproj" />
-    <Project Path="tests/ShuaiTunnel.Protocol.Tests/ShuaiTunnel.Protocol.Tests.csproj" />
+    <Project Path="../tunnel-protocol-csharp/tests/ShuaiTunnel.Protocol.Tests/ShuaiTunnel.Protocol.Tests.csproj" />
   </Folder>
 </Solution>

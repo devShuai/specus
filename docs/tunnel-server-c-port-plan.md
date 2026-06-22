@@ -68,7 +68,7 @@ tunnel-server-c/
 
 **任务**：
 
-- 固定 Java wire fixtures 来源，继续复用 `tunnel-server-csharp/tests/fixtures/*.bin`。
+- 固定 Java wire fixtures 来源，继续复用 `tunnel-protocol-csharp/tests/fixtures/*.bin`。
 - 把 C 测试拆出协议测试文件，避免所有测试堆在 `crypto_tests.c`。
 - 补齐以下 fixture 覆盖：
   - `login_request.bin` decode

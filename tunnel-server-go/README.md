@@ -67,7 +67,7 @@ go test ./...    # 协议 fixtures、登录/心跳、NAT 回环、admin API、OI
 go vet ./...
 ```
 
-协议层用仓库内 `tunnel-server-csharp/tests/fixtures/*.bin`(已复制进 `internal/protocol/testdata`)做 golden 交叉校验:非压缩帧字节级一致,deflate 帧因 Go `compress/flate` 与 Java/.NET zlib 输出不同改为语义自洽校验(可互相解压,完全互通)。
+协议层用仓库内 `tunnel-protocol-csharp/tests/fixtures/*.bin`(已复制进 `internal/protocol/testdata`)做 golden 交叉校验:非压缩帧字节级一致,deflate 帧因 Go `compress/flate` 与 Java/.NET zlib 输出不同改为语义自洽校验(可互相解压,完全互通)。
 
 ## 包结构
 

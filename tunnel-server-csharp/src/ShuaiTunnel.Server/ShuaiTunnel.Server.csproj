@@ -10,7 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\ShuaiTunnel.Protocol\ShuaiTunnel.Protocol.csproj" />
+    <ProjectReference Include="..\..\..\tunnel-protocol-csharp\src\ShuaiTunnel.Protocol\ShuaiTunnel.Protocol.csproj" />
     <ProjectReference Include="..\ShuaiTunnel.Server.Data\ShuaiTunnel.Server.Data.csproj" />
     <!-- Provider migration assemblies must be referenced so MigrationsAssembly(...) can load
          them at runtime. Only the one matching Tunnel:Database:Provider is actually used. -->

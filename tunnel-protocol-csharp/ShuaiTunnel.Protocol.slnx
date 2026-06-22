@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ShuaiTunnel.Protocol/ShuaiTunnel.Protocol.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ShuaiTunnel.Protocol.Tests/ShuaiTunnel.Protocol.Tests.csproj" />
+  </Folder>
+</Solution>
