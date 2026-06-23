@@ -21,18 +21,17 @@ public sealed class ManagementMutationService
         _natControl = natControl;
     }
 
-    public async Task<CredentialResult> CreateClientAsync(ClientMutation request, CancellationToken cancellationToken)
+    public async Task<ClientResult> CreateClientAsync(ClientMutation request, CancellationToken cancellationToken)
     {
         var clientName = RequireClientName(request.ClientName);
-        var password = string.IsNullOrWhiteSpace(request.Password)
-            ? PasswordHasher.GeneratePassword()
-            : request.Password;
         var now = DateTimeOffset.UtcNow;
         var account = new ClientAccount
         {
             Id = ClientIdGenerator.NewId(),
+            TenantId = "default",
+            OwnerUsername = "admin",
             ClientName = clientName,
-            PasswordHash = PasswordHasher.Hash(password),
+            PasswordHash = PasswordHasher.Hash(Guid.NewGuid().ToString("N")),
             Enabled = request.Enabled ?? true,
             ConnectionRateLimitPerMinute = NormalizeRateLimit(request.ConnectionRateLimitPerMinute, 30),
             CreatedAt = now,
@@ -41,10 +40,10 @@ public sealed class ManagementMutationService
 
         _db.ClientAccounts.Add(account);
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
-        return new CredentialResult(ToClientView(account, upload: 0, download: 0), password);
+        return new ClientResult(ToClientView(account, upload: 0, download: 0));
     }
 
-    public async Task<CredentialResult> UpdateClientAsync(long id, ClientMutation request,
+    public async Task<ClientResult> UpdateClientAsync(long id, ClientMutation request,
         CancellationToken cancellationToken)
     {
         var account = await FindClientAsync(id, cancellationToken).ConfigureAwait(false);
@@ -53,10 +52,6 @@ public sealed class ManagementMutationService
         if (!string.IsNullOrWhiteSpace(request.ClientName))
         {
             account.ClientName = RequireClientName(request.ClientName);
-        }
-        if (!string.IsNullOrWhiteSpace(request.Password))
-        {
-            account.PasswordHash = PasswordHasher.Hash(request.Password);
         }
         if (request.Enabled is not null)
         {
@@ -73,7 +68,7 @@ public sealed class ManagementMutationService
         }
 
         var totals = await ReadTrafficTotalsAsync(account.Id, cancellationToken).ConfigureAwait(false);
-        return new CredentialResult(ToClientView(account, totals.Upload, totals.Download), request.Password);
+        return new ClientResult(ToClientView(account, totals.Upload, totals.Download));
     }
 
     public async Task DeleteClientAsync(long id, CancellationToken cancellationToken)
@@ -81,6 +76,96 @@ public sealed class ManagementMutationService
         var account = await FindClientAsync(id, cancellationToken).ConfigureAwait(false);
         CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
         _db.ClientAccounts.Remove(account);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<ClientCredentialView>> ListCredentialsAsync(CancellationToken cancellationToken)
+    {
+        var rows = await _db.ClientCredentials.AsNoTracking()
+            .OrderByDescending(c => c.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return rows.Select(ToCredentialView).ToList();
+    }
+
+    public async Task<CredentialResult> CreateCredentialAsync(CredentialMutation request,
+        CancellationToken cancellationToken)
+    {
+        var apiKey = string.IsNullOrWhiteSpace(request.ApiKey)
+            ? "ck_" + Guid.NewGuid().ToString("N")
+            : NormalizeApiKey(request.ApiKey);
+        if (await _db.ClientCredentials.AsNoTracking()
+                .AnyAsync(c => c.ApiKey == apiKey, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            throw new ArgumentException("apiKey already exists");
+        }
+
+        var secret = string.IsNullOrWhiteSpace(request.Secret)
+            ? PasswordHasher.GeneratePassword()
+            : request.Secret.Trim();
+        var now = DateTimeOffset.UtcNow;
+        var credential = new ClientCredential
+        {
+            Id = ClientIdGenerator.NewId(),
+            TenantId = "default",
+            OwnerUsername = "admin",
+            ApiKey = apiKey,
+            SecretHash = PasswordHasher.Hash(secret),
+            Enabled = request.Enabled ?? true,
+            MaxOnlineInstances = NormalizeMaxOnline(request.MaxOnlineInstances),
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        _db.ClientCredentials.Add(credential);
+        await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        return new CredentialResult(ToCredentialView(credential), secret);
+    }
+
+    public async Task<CredentialResult> UpdateCredentialAsync(long id, CredentialMutation request,
+        CancellationToken cancellationToken)
+    {
+        var credential = await _db.ClientCredentials.FirstOrDefaultAsync(c => c.Id == id, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException($"credential not found: {id}");
+        if (!string.IsNullOrWhiteSpace(request.ApiKey))
+        {
+            var apiKey = NormalizeApiKey(request.ApiKey);
+            if (!string.Equals(apiKey, credential.ApiKey, StringComparison.Ordinal))
+            {
+                if (await _db.ClientCredentials.AsNoTracking()
+                        .AnyAsync(c => c.ApiKey == apiKey, cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    throw new ArgumentException("apiKey already exists");
+                }
+                credential.ApiKey = apiKey;
+            }
+        }
+
+        string? revealedSecret = null;
+        if (!string.IsNullOrWhiteSpace(request.Secret))
+        {
+            revealedSecret = request.Secret.Trim();
+            credential.SecretHash = PasswordHasher.Hash(revealedSecret);
+        }
+        if (request.Enabled is not null)
+        {
+            credential.Enabled = request.Enabled.Value;
+        }
+        if (request.MaxOnlineInstances is not null)
+        {
+            credential.MaxOnlineInstances = NormalizeMaxOnline(request.MaxOnlineInstances);
+        }
+        credential.UpdatedAt = DateTimeOffset.UtcNow;
+        await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
+        return new CredentialResult(ToCredentialView(credential), revealedSecret);
+    }
+
+    public async Task DeleteCredentialAsync(long id, CancellationToken cancellationToken)
+    {
+        var credential = await _db.ClientCredentials.FirstOrDefaultAsync(c => c.Id == id, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException($"credential not found: {id}");
+        _db.ClientCredentials.Remove(credential);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -256,6 +341,7 @@ public sealed class ManagementMutationService
     private static ClientAccountView ToClientView(ClientAccount account, long upload, long download) => new(
         account.Id,
         account.ClientName,
+        account.OwnerUsername,
         account.Enabled,
         account.ConnectionRateLimitPerMinute,
         Online: false,
@@ -264,6 +350,15 @@ public sealed class ManagementMutationService
         download,
         account.CreatedAt.ToString("O"),
         account.UpdatedAt.ToString("O"));
+
+    private static ClientCredentialView ToCredentialView(ClientCredential credential) => new(
+        credential.Id,
+        credential.ApiKey,
+        credential.OwnerUsername,
+        credential.Enabled,
+        credential.MaxOnlineInstances,
+        credential.CreatedAt.ToString("O"),
+        credential.UpdatedAt.ToString("O"));
 
     private static TunnelMappingView ToTunnelView(TunnelMapping mapping) => new(
         mapping.Id,
@@ -342,6 +437,30 @@ public sealed class ManagementMutationService
         if (normalized is < 0 or > 10_000)
         {
             throw new ArgumentException("connectionRateLimitPerMinute must be between 0 and 10000");
+        }
+        return normalized;
+    }
+
+    private static int NormalizeMaxOnline(int? maxOnlineInstances)
+    {
+        var normalized = maxOnlineInstances ?? 2;
+        if (normalized is < 1 or > 10_000)
+        {
+            throw new ArgumentException("maxOnlineInstances must be between 1 and 10000");
+        }
+        return normalized;
+    }
+
+    private static string NormalizeApiKey(string? apiKey)
+    {
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            throw new ArgumentException("apiKey cannot be blank");
+        }
+        var normalized = apiKey.Trim();
+        if (normalized.Length is < 3 or > 120)
+        {
+            throw new ArgumentException("apiKey length must be between 3 and 120");
         }
         return normalized;
     }

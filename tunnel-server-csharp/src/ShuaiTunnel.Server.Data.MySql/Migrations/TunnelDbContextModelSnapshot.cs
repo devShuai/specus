@@ -43,11 +43,22 @@ namespace ShuaiTunnel.Server.Data.MySql.Migrations
                         .HasColumnType("tinyint(1)")
                         .HasColumnName("enabled");
 
+                    b.Property<string>("OwnerUsername")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("owner_username");
+
                     b.Property<string>("PasswordHash")
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("varchar(64)")
                         .HasColumnName("password_hash");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("tenant_id");
 
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
@@ -60,7 +71,279 @@ namespace ShuaiTunnel.Server.Data.MySql.Migrations
                     b.HasIndex("ClientName")
                         .IsUnique();
 
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_tunnel_client_tenant");
+
+                    b.HasIndex("TenantId", "OwnerUsername")
+                        .HasDatabaseName("idx_tunnel_client_owner");
+
                     b.ToTable("tunnel_client_account", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ClientCredential", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("ApiKey")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("api_key");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("tinyint(1)")
+                        .HasColumnName("enabled");
+
+                    b.Property<int>("MaxOnlineInstances")
+                        .HasColumnType("int")
+                        .HasColumnName("max_online_instances");
+
+                    b.Property<string>("OwnerUsername")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("owner_username");
+
+                    b.Property<string>("SecretHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)")
+                        .HasColumnName("secret_hash");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ApiKey")
+                        .IsUnique()
+                        .HasDatabaseName("uk_client_credential_api_key");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_client_credential_tenant");
+
+                    b.HasIndex("TenantId", "OwnerUsername")
+                        .HasDatabaseName("idx_client_credential_owner");
+
+                    b.ToTable("tunnel_client_credential", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ClientIdentity", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("client_name");
+
+                    b.Property<long>("CredentialId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("credential_id");
+
+                    b.Property<string>("FirstSeenAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("first_seen_at");
+
+                    b.Property<string>("Hostname")
+                        .HasMaxLength(160)
+                        .HasColumnType("varchar(160)")
+                        .HasColumnName("hostname");
+
+                    b.Property<string>("LastSeenAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("last_seen_at");
+
+                    b.Property<string>("MachineFingerprint")
+                        .IsRequired()
+                        .HasMaxLength(160)
+                        .HasColumnType("varchar(160)")
+                        .HasColumnName("machine_fingerprint");
+
+                    b.Property<string>("OsUser")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("os_user");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ClientId")
+                        .HasDatabaseName("idx_client_identity_client");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_client_identity_tenant");
+
+                    b.HasIndex("CredentialId", "MachineFingerprint", "OsUser")
+                        .IsUnique()
+                        .HasDatabaseName("uk_client_identity_machine_user");
+
+                    b.ToTable("tunnel_client_identity", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ClientSession", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("ChannelId")
+                        .HasMaxLength(160)
+                        .HasColumnType("varchar(160)")
+                        .HasColumnName("channel_id");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("client_name");
+
+                    b.Property<string>("ClientVersion")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("client_version");
+
+                    b.Property<long>("CredentialId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("credential_id");
+
+                    b.Property<string>("DisconnectedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("disconnected_at");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("Hostname")
+                        .HasMaxLength(160)
+                        .HasColumnType("varchar(160)")
+                        .HasColumnName("hostname");
+
+                    b.Property<string>("HttpLoginAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("http_login_at");
+
+                    b.Property<long>("IdentityId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("identity_id");
+
+                    b.Property<string>("JavaVersion")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("java_version");
+
+                    b.Property<string>("LocalAddresses")
+                        .HasMaxLength(2000)
+                        .HasColumnType("varchar(2000)")
+                        .HasColumnName("local_addresses");
+
+                    b.Property<string>("MachineFingerprint")
+                        .IsRequired()
+                        .HasMaxLength(160)
+                        .HasColumnType("varchar(160)")
+                        .HasColumnName("machine_fingerprint");
+
+                    b.Property<string>("NettyConnectedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("netty_connected_at");
+
+                    b.Property<string>("OsArch")
+                        .HasMaxLength(60)
+                        .HasColumnType("varchar(60)")
+                        .HasColumnName("os_arch");
+
+                    b.Property<string>("OsName")
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("os_name");
+
+                    b.Property<string>("OsUser")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("os_user");
+
+                    b.Property<string>("OsVersion")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("os_version");
+
+                    b.Property<string>("RemoteAddress")
+                        .HasMaxLength(255)
+                        .HasColumnType("varchar(255)")
+                        .HasColumnName("remote_address");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("status");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("TokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)")
+                        .HasColumnName("token_hash");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TokenHash")
+                        .HasDatabaseName("idx_client_session_token");
+
+                    b.HasIndex("CredentialId", "Status")
+                        .HasDatabaseName("idx_client_session_credential_status");
+
+                    b.HasIndex("CredentialId", "MachineFingerprint", "OsUser", "Status")
+                        .HasDatabaseName("idx_client_session_machine_status");
+
+                    b.ToTable("tunnel_client_session", (string)null);
                 });
 
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ConnectionRecord", b =>

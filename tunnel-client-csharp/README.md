@@ -25,31 +25,25 @@ dotnet publish src/ShuaiTunnel.Client -c Release -o out
 
 ```json
 {
-  "clientName": "Demo client",
-  "password": "test1234",
-  "remoteAddress": "127.0.0.1",
-  "remotePort": 7010,
-  "tunnelConfigList": [
-    { "port": 18080, "tunnelAddress": "127.0.0.1", "tunnelPort": 8080 }
-  ],
-  "httpTunnelConfigList": [
-    { "route": "web", "targetBaseUrl": "http://127.0.0.1:8080" }
-  ]
+  "serverBaseUrl": "http://127.0.0.1:8088",
+  "apiKey": "demo-client",
+  "secret": "test1234"
 }
 ```
 
-`httpTunnelConfigList` 为本地后备:
-- `null` (或缺失):服务端未接管 HTTP 路由,使用本地配置
-- `[]`:服务端接管,但暂无路由
-- 非空数组:本地后备 + 服务端 `NAT_CONTROL` 推送时整体替换
+客户端启动时先调用 `serverBaseUrl + /api/client/auth/login`,使用 `apiKey + secret`
+签名登录。登录成功后服务端返回运行时 `clientName/clientSessionId/accessToken`、控制通道地址、TCP
+映射和 HTTP 路由快照；客户端再发起控制通道长连接。
 
 配置文件加载顺序与 Java 客户端一致:`{cwd}/tunnelClientConfig.json` → `./tunnelClientConfig.json` →
 失败抛 `FileNotFoundException`。
 
 ## 行为对齐(与 Java 严格一致)
 
-- **登录**:`HMAC-SHA256(SHA256(password), clientName\ntimestamp\nnonce)`,32B 原始字节(非 hex);
-  nonce 为 16 字节随机的 32 字符小写 hex;timestamp 为毫秒。
+- **启动登录**:`HMAC-SHA256(SHA256(secret), apiKey\ntimestamp\nnonce\nmachineFingerprint\nosUser)`,
+  十六进制小写字符串；timestamp 为毫秒。
+- **控制通道登录**:使用 HTTP 登录返回的 `clientName/clientSessionId/accessToken`,不再支持旧
+  `clientName/password` 启动配置。
 - **退避重连**:基础 2s,`min(2 × (1 << min(attempt-1, 5)), 60)` → 2/4/8/16/32/60;**仅在
   `LOGIN_RESPONSE.success=true` 时**重置计数(错密码不会清退避)。
 - **空闲**:读 60s 关连接 + 标记 `IDLE_TIMEOUT`;写 5s 发 `HeartbeatRequest`(写失败 ->

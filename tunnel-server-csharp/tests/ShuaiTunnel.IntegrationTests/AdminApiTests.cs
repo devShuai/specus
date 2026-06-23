@@ -93,7 +93,7 @@ public sealed class AdminApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ClientCrudReturnsCredentialAndUpdatesList()
+    public async Task ClientCrudAndCredentialCrudMatchJavaApi()
     {
         using var client = await AuthenticatedClientAsync();
 
@@ -104,27 +104,60 @@ public sealed class AdminApiTests : IAsyncLifetime
             connectionRateLimitPerMinute = 12,
         });
         Assert.Equal(HttpStatusCode.Created, create.StatusCode);
-        var created = await create.Content.ReadFromJsonAsync<CredentialBody>(JsonOptions);
+        var created = await create.Content.ReadFromJsonAsync<ClientResultBody>(JsonOptions);
         Assert.NotNull(created);
         Assert.Equal("Phase4 CRUD", created!.Client.ClientName);
-        Assert.False(string.IsNullOrWhiteSpace(created.Password));
+        Assert.Equal("admin", created.Client.OwnerUsername);
 
         var update = await client.PutAsJsonAsync($"/api/admin/clients/{created.Client.Id}", new
         {
             clientName = "Phase4 CRUD renamed",
-            password = "new-secret",
             enabled = false,
             connectionRateLimitPerMinute = 0,
         });
         update.EnsureSuccessStatusCode();
-        var updated = await update.Content.ReadFromJsonAsync<CredentialBody>(JsonOptions);
+        var updated = await update.Content.ReadFromJsonAsync<ClientResultBody>(JsonOptions);
         Assert.NotNull(updated);
         Assert.Equal("Phase4 CRUD renamed", updated!.Client.ClientName);
         Assert.False(updated.Client.Enabled);
-        Assert.Equal("new-secret", updated.Password);
 
         var delete = await client.DeleteAsync($"/api/admin/clients/{created.Client.Id}");
         Assert.Equal(HttpStatusCode.NoContent, delete.StatusCode);
+
+        var createCredential = await client.PostAsJsonAsync("/api/admin/client-credentials", new
+        {
+            apiKey = "ck_phase4",
+            secret = "new-secret",
+            enabled = true,
+            maxOnlineInstances = 3,
+        });
+        Assert.Equal(HttpStatusCode.Created, createCredential.StatusCode);
+        var credential = await createCredential.Content.ReadFromJsonAsync<CredentialBody>(JsonOptions);
+        Assert.NotNull(credential);
+        Assert.Equal("ck_phase4", credential!.Credential.ApiKey);
+        Assert.Equal("new-secret", credential.Secret);
+        Assert.Equal(3, credential.Credential.MaxOnlineInstances);
+
+        var credentials = await client.GetFromJsonAsync<List<CredentialViewBody>>(
+            "/api/admin/client-credentials", JsonOptions);
+        Assert.Contains(credentials!, row => row.ApiKey == "ck_phase4");
+
+        var updateCredential = await client.PutAsJsonAsync(
+            $"/api/admin/client-credentials/{credential.Credential.Id}", new
+            {
+                enabled = false,
+                maxOnlineInstances = 4,
+            });
+        updateCredential.EnsureSuccessStatusCode();
+        var updatedCredential = await updateCredential.Content.ReadFromJsonAsync<CredentialBody>(JsonOptions);
+        Assert.NotNull(updatedCredential);
+        Assert.False(updatedCredential!.Credential.Enabled);
+        Assert.Equal(4, updatedCredential.Credential.MaxOnlineInstances);
+        Assert.Null(updatedCredential.Secret);
+
+        var deleteCredential = await client.DeleteAsync(
+            $"/api/admin/client-credentials/{credential.Credential.Id}");
+        Assert.Equal(HttpStatusCode.NoContent, deleteCredential.StatusCode);
     }
 
     [Fact]
@@ -357,7 +390,18 @@ public sealed class AdminApiTests : IAsyncLifetime
 
     private sealed record TokenBody(string AccessToken, string TokenType, long ExpiresIn);
 
-    private sealed record CredentialBody(ClientBody Client, string? Password);
+    private sealed record ClientResultBody(ClientBody Client);
+
+    private sealed record CredentialBody(CredentialViewBody Credential, string? Secret);
+
+    private sealed record CredentialViewBody(
+        long Id,
+        string ApiKey,
+        string? OwnerUsername,
+        bool Enabled,
+        int MaxOnlineInstances,
+        string CreatedAt,
+        string UpdatedAt);
 
     private sealed record OverviewBody(
         int Clients,
@@ -372,6 +416,7 @@ public sealed class AdminApiTests : IAsyncLifetime
     private sealed record ClientBody(
         long Id,
         string ClientName,
+        string? OwnerUsername,
         bool Enabled,
         int ConnectionRateLimitPerMinute,
         bool Online,

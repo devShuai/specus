@@ -1,5 +1,7 @@
 CREATE TABLE IF NOT EXISTS tunnel_client_account (
   id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  owner_username TEXT,
   client_name TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   enabled INTEGER NOT NULL,
@@ -7,6 +9,41 @@ CREATE TABLE IF NOT EXISTS tunnel_client_account (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_tunnel_client_tenant ON tunnel_client_account (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_tunnel_client_owner ON tunnel_client_account (tenant_id, owner_username);
+
+CREATE TABLE IF NOT EXISTS tunnel_client_credential (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  owner_username TEXT,
+  api_key TEXT NOT NULL UNIQUE,
+  secret_hash TEXT NOT NULL,
+  enabled INTEGER NOT NULL,
+  max_online_instances INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_credential_tenant ON tunnel_client_credential (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_client_credential_owner ON tunnel_client_credential (tenant_id, owner_username);
+
+CREATE TABLE IF NOT EXISTS tunnel_client_identity (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  credential_id INTEGER NOT NULL,
+  client_id INTEGER NOT NULL,
+  client_name TEXT NOT NULL,
+  machine_fingerprint TEXT NOT NULL,
+  os_user TEXT NOT NULL,
+  hostname TEXT,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE (credential_id, machine_fingerprint, os_user)
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_identity_tenant ON tunnel_client_identity (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_client_identity_client ON tunnel_client_identity (client_id);
 
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

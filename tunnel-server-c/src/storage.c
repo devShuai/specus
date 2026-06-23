@@ -39,7 +39,6 @@ int st_storage_init(const char *path, int seed_demo_client)
     int rc = exec_sql(db,
         "CREATE TABLE IF NOT EXISTS client_account ("
         "client_name TEXT PRIMARY KEY,"
-        "password_hash TEXT NOT NULL,"
         "enabled INTEGER NOT NULL DEFAULT 1,"
         "connection_limit_per_minute INTEGER NOT NULL DEFAULT 30,"
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
@@ -81,20 +80,14 @@ int st_storage_init(const char *path, int seed_demo_client)
         "UNIQUE(client_name, stat_date)"
         ");");
     if (rc == 0 && seed_demo_client) {
-        uint8_t hash[ST_SHA256_LEN];
-        char hex[ST_SHA256_LEN * 2U + 1U];
-        st_sha256((const uint8_t *)"test1234", strlen("test1234"), hash);
-        st_hex_encode(hash, sizeof(hash), hex);
-
         sqlite3_stmt *stmt = NULL;
         rc = sqlite3_prepare_v2(db,
-            "INSERT OR IGNORE INTO client_account(client_name, password_hash, enabled) VALUES(?,?,1)",
+            "INSERT OR IGNORE INTO client_account(client_name, enabled) VALUES(?,1)",
             -1,
             &stmt,
             NULL);
         if (rc == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, "Demo client", -1, SQLITE_STATIC);
-            sqlite3_bind_text(stmt, 2, hex, -1, SQLITE_TRANSIENT);
             rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
         } else {
             rc = -1;
@@ -106,7 +99,7 @@ int st_storage_init(const char *path, int seed_demo_client)
     return rc == 0 ? 0 : -1;
 }
 
-int st_storage_load_client_hash(const char *path, const char *client_name, uint8_t hash[ST_SHA256_LEN])
+int st_storage_client_enabled(const char *path, const char *client_name)
 {
     sqlite3 *db = NULL;
     if (open_db(path, &db) != 0) {
@@ -114,7 +107,7 @@ int st_storage_load_client_hash(const char *path, const char *client_name, uint8
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "SELECT password_hash FROM client_account WHERE client_name = ? AND enabled = 1",
+        "SELECT 1 FROM client_account WHERE client_name = ? AND enabled = 1",
         -1,
         &stmt,
         NULL);
@@ -124,16 +117,9 @@ int st_storage_load_client_hash(const char *path, const char *client_name, uint8
     }
     sqlite3_bind_text(stmt, 1, client_name, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        sqlite3_close(db);
-        return -1;
-    }
-    const unsigned char *hex = sqlite3_column_text(stmt, 0);
-    int ok = hex != NULL && st_hex_decode_32((const char *)hex, hash) == 0;
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return ok ? 0 : -1;
+    return rc == SQLITE_ROW ? 0 : -1;
 }
 
 int st_storage_load_mappings(const char *path,

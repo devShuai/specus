@@ -96,9 +96,8 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
             JsonSerializer.Serialize(new
             {
                 serverBaseUrl = _authStub.ServerBaseUrl,
-                authType = "apiKey",
-                apiKey = DatabaseInitializer.DemoClientName,
-                secret = DatabaseInitializer.DemoClientPassword,
+                apiKey = DatabaseInitializer.DemoCredentialApiKey,
+                secret = DatabaseInitializer.DemoCredentialSecret,
             }));
 
         _clientProcess = StartClient();

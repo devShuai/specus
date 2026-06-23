@@ -1,6 +1,5 @@
 {
   "serverBaseUrl": "http://127.0.0.1:8088",
-  "authType": "apiKey",
   "apiKey": "replace-with-client-api-key",
   "secret": "replace-with-client-secret"
 }

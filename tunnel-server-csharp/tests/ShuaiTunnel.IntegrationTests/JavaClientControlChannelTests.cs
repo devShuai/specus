@@ -61,9 +61,8 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         File.WriteAllText(configPath, JsonSerializer.Serialize(new
         {
             serverBaseUrl = _authStub.ServerBaseUrl,
-            authType = "apiKey",
-            apiKey = DatabaseInitializer.DemoClientName,
-            secret = DatabaseInitializer.DemoClientPassword,
+            apiKey = DatabaseInitializer.DemoCredentialApiKey,
+            secret = DatabaseInitializer.DemoCredentialSecret,
         }));
     }
 

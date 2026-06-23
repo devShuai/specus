@@ -40,7 +40,6 @@ public class TunnelControlClientReconnectTests
         var config = new TunnelClientConfig
         {
             ServerBaseUrl = $"http://127.0.0.1:{authPort}",
-            AuthType = "apiKey",
             ApiKey = "ak_test",
             Secret = "sk_test",
         };

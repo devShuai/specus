@@ -104,13 +104,31 @@ func TestClientAndTunnelCrud(t *testing.T) {
 		t.Fatalf("create client status %d", resp.StatusCode)
 	}
 	var created struct {
-		Client   management_ClientView `json:"client"`
-		Password string                `json:"password"`
+		Client management_ClientView `json:"client"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&created)
 	resp.Body.Close()
-	if created.Client.ClientName != "go-crud" || created.Password == "" {
+	if created.Client.ClientName != "go-crud" {
 		t.Fatalf("unexpected create result: %+v", created)
+	}
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/client-credentials", token,
+		`{"apiKey":"ck_go_crud","secret":"secret","enabled":true,"maxOnlineInstances":3}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create credential status %d", resp.StatusCode)
+	}
+	var credential struct {
+		Credential struct {
+			APIKey             string `json:"apiKey"`
+			MaxOnlineInstances int    `json:"maxOnlineInstances"`
+		} `json:"credential"`
+		Secret string `json:"secret"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&credential)
+	resp.Body.Close()
+	if credential.Credential.APIKey != "ck_go_crud" || credential.Secret != "secret" ||
+		credential.Credential.MaxOnlineInstances != 3 {
+		t.Fatalf("unexpected credential result: %+v", credential)
 	}
 
 	// Create a tunnel for the client.

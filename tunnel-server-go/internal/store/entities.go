@@ -60,12 +60,41 @@ func ReasonText(reason string) string {
 // ClientAccount mirrors tunnel_client_account.
 type ClientAccount struct {
 	ID                           int64
+	TenantID                     string
+	OwnerUsername                string
 	ClientName                   string
 	PasswordHash                 string
 	Enabled                      bool
 	ConnectionRateLimitPerMinute int
 	CreatedAt                    time.Time
 	UpdatedAt                    time.Time
+}
+
+// ClientCredential mirrors tunnel_client_credential.
+type ClientCredential struct {
+	ID                 int64
+	TenantID           string
+	OwnerUsername      string
+	APIKey             string
+	SecretHash         string
+	Enabled            bool
+	MaxOnlineInstances int
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// ClientIdentity mirrors tunnel_client_identity.
+type ClientIdentity struct {
+	ID                 int64
+	TenantID           string
+	CredentialID       int64
+	ClientID           int64
+	ClientName         string
+	MachineFingerprint string
+	OSUser             string
+	Hostname           string
+	FirstSeenAt        time.Time
+	LastSeenAt         time.Time
 }
 
 // ConnectionRecord mirrors tunnel_connection_record.

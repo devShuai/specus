@@ -4,15 +4,32 @@ public sealed record AdminLoginRequest(string? Username, string? Password);
 
 public sealed record ClientMutation(
     string? ClientName,
-    string? Password,
     bool? Enabled,
     int? ConnectionRateLimitPerMinute);
 
-public sealed record CredentialResult(ClientAccountView Client, string? Password);
+public sealed record ClientResult(ClientAccountView Client);
+
+public sealed record CredentialMutation(
+    string? ApiKey,
+    string? Secret,
+    bool? Enabled,
+    int? MaxOnlineInstances);
+
+public sealed record CredentialResult(ClientCredentialView Credential, string? Secret);
+
+public sealed record ClientCredentialView(
+    long Id,
+    string ApiKey,
+    string? OwnerUsername,
+    bool Enabled,
+    int MaxOnlineInstances,
+    string CreatedAt,
+    string UpdatedAt);
 
 public sealed record ClientAccountView(
     long Id,
     string ClientName,
+    string? OwnerUsername,
     bool Enabled,
     int ConnectionRateLimitPerMinute,
     bool Online,

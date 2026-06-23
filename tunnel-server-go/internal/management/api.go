@@ -52,6 +52,11 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/admin/clients/{id}", a.requireAuth(a.handleUpdateClient))
 	mux.HandleFunc("DELETE /api/admin/clients/{id}", a.requireAuth(a.handleDeleteClient))
 
+	mux.HandleFunc("GET /api/admin/client-credentials", a.requireAuth(a.handleListCredentials))
+	mux.HandleFunc("POST /api/admin/client-credentials", a.requireAuth(a.handleCreateCredential))
+	mux.HandleFunc("PUT /api/admin/client-credentials/{id}", a.requireAuth(a.handleUpdateCredential))
+	mux.HandleFunc("DELETE /api/admin/client-credentials/{id}", a.requireAuth(a.handleDeleteCredential))
+
 	mux.HandleFunc("GET /api/admin/tunnels", a.requireAuth(a.handleListTunnels))
 	mux.HandleFunc("POST /api/admin/clients/{id}/tunnels", a.requireAuth(a.handleCreateTunnel))
 	mux.HandleFunc("PUT /api/admin/tunnels/{tunnelId}", a.requireAuth(a.handleUpdateTunnel))
@@ -216,15 +221,13 @@ func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, conflict("客户端名称已存在"))
 		return
 	}
-	password := strings.TrimSpace(req.Password)
-	if password == "" {
-		password = auth.GeneratePassword()
-	}
 	now := time.Now()
 	account := store.ClientAccount{
 		ID:                           auth.NewClientID(),
+		TenantID:                     "default",
+		OwnerUsername:                "admin",
 		ClientName:                   name,
-		PasswordHash:                 auth.HashPassword(password),
+		PasswordHash:                 auth.HashPassword(strconv.FormatInt(auth.NewClientID(), 10)),
 		Enabled:                      boolOr(req.Enabled, true),
 		ConnectionRateLimitPerMinute: intOr(req.ConnectionRateLimitPerMinute, 30),
 		CreatedAt:                    now,
@@ -234,7 +237,7 @@ func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, CredentialView{Client: a.clientView(r.Context(), account), Password: password})
+	writeJSON(w, http.StatusCreated, ClientResult{Client: a.clientView(r.Context(), account)})
 }
 
 func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
@@ -256,13 +259,8 @@ func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 
 	oldName := account.ClientName
 	wasEnabled := account.Enabled
-	var plaintext string
 	if name := strings.TrimSpace(req.ClientName); name != "" {
 		account.ClientName = name
-	}
-	if password := strings.TrimSpace(req.Password); password != "" {
-		plaintext = password
-		account.PasswordHash = auth.HashPassword(password)
 	}
 	if req.Enabled != nil {
 		account.Enabled = *req.Enabled
@@ -283,7 +281,7 @@ func (a *API) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 		a.kick(account.ClientName, store.ReasonAdminDisabled)
 	}
 
-	writeJSON(w, http.StatusOK, CredentialView{Client: a.clientView(r.Context(), *account), Password: plaintext})
+	writeJSON(w, http.StatusOK, ClientResult{Client: a.clientView(r.Context(), *account)})
 }
 
 func (a *API) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
@@ -302,6 +300,117 @@ func (a *API) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.kick(account.ClientName, store.ReasonAdminDeleted)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) handleListCredentials(w http.ResponseWriter, r *http.Request) {
+	credentials, err := a.db.ListCredentials(r.Context())
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	views := make([]CredentialView, 0, len(credentials))
+	for _, credential := range credentials {
+		views = append(views, credentialView(credential))
+	}
+	writeJSON(w, http.StatusOK, views)
+}
+
+func (a *API) handleCreateCredential(w http.ResponseWriter, r *http.Request) {
+	var req credentialMutation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	apiKey := strings.TrimSpace(req.APIKey)
+	if apiKey == "" {
+		apiKey = "ck_" + strconv.FormatInt(auth.NewClientID(), 10)
+	}
+	if existing, err := a.db.FindCredentialByAPIKey(r.Context(), apiKey); err != nil {
+		a.fail(w, err)
+		return
+	} else if existing != nil {
+		a.fail(w, conflict("apiKey already exists"))
+		return
+	}
+	secret := strings.TrimSpace(req.Secret)
+	if secret == "" {
+		secret = auth.GeneratePassword()
+	}
+	now := time.Now()
+	credential := store.ClientCredential{
+		ID:                 auth.NewClientID(),
+		TenantID:           "default",
+		OwnerUsername:      "admin",
+		APIKey:             apiKey,
+		SecretHash:         auth.HashPassword(secret),
+		Enabled:            boolOr(req.Enabled, true),
+		MaxOnlineInstances: intOr(req.MaxOnlineInstances, 2),
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if err := a.db.InsertCredential(r.Context(), credential); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, CredentialResult{Credential: credentialView(credential), Secret: secret})
+}
+
+func (a *API) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt(r, "id")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	var req credentialMutation
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	credential, err := a.db.GetCredential(r.Context(), id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if apiKey := strings.TrimSpace(req.APIKey); apiKey != "" && apiKey != credential.APIKey {
+		if existing, err := a.db.FindCredentialByAPIKey(r.Context(), apiKey); err != nil {
+			a.fail(w, err)
+			return
+		} else if existing != nil {
+			a.fail(w, conflict("apiKey already exists"))
+			return
+		}
+		credential.APIKey = apiKey
+	}
+	var revealed string
+	if secret := strings.TrimSpace(req.Secret); secret != "" {
+		revealed = secret
+		credential.SecretHash = auth.HashPassword(secret)
+	}
+	if req.Enabled != nil {
+		credential.Enabled = *req.Enabled
+	}
+	if req.MaxOnlineInstances != nil {
+		credential.MaxOnlineInstances = *req.MaxOnlineInstances
+	}
+	credential.UpdatedAt = time.Now()
+	if err := a.db.UpdateCredential(r.Context(), *credential); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, CredentialResult{Credential: credentialView(*credential), Secret: revealed})
+}
+
+func (a *API) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
+	id, err := pathInt(r, "id")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err := a.db.DeleteCredential(r.Context(), id); err != nil {
+		a.fail(w, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -658,6 +767,7 @@ func (a *API) clientView(ctx context.Context, account store.ClientAccount) Clien
 	view := ClientView{
 		ID:                           account.ID,
 		ClientName:                   account.ClientName,
+		OwnerUsername:                account.OwnerUsername,
 		Enabled:                      account.Enabled,
 		ConnectionRateLimitPerMinute: account.ConnectionRateLimitPerMinute,
 		CreatedAt:                    account.CreatedAt.Format(time.RFC3339Nano),
@@ -673,6 +783,18 @@ func (a *API) clientView(ctx context.Context, account store.ClientAccount) Clien
 		view.DownloadBytes = down
 	}
 	return view
+}
+
+func credentialView(credential store.ClientCredential) CredentialView {
+	return CredentialView{
+		ID:                 credential.ID,
+		APIKey:             credential.APIKey,
+		OwnerUsername:      credential.OwnerUsername,
+		Enabled:            credential.Enabled,
+		MaxOnlineInstances: credential.MaxOnlineInstances,
+		CreatedAt:          credential.CreatedAt.Format(time.RFC3339Nano),
+		UpdatedAt:          credential.UpdatedAt.Format(time.RFC3339Nano),
+	}
 }
 
 func (a *API) fail(w http.ResponseWriter, err error) {

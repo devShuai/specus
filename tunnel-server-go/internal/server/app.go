@@ -25,8 +25,9 @@ import (
 
 // Demo client seed credentials (match the C# server).
 const (
-	DemoClientName     = "Demo client"
-	DemoClientPassword = "test1234"
+	DemoClientName            = "Demo client"
+	DemoCredentialAPIKey      = "demo-client"
+	DemoCredentialPlainSecret = "test1234"
 )
 
 var errUnauthenticated = errors.New("packet on unauthenticated channel")
@@ -267,8 +268,10 @@ func seedDemoClient(ctx context.Context, db *store.DB, logger *slog.Logger) erro
 	now := time.Now()
 	inserted, err := db.InsertClientIfAbsent(ctx, store.ClientAccount{
 		ID:                           auth.NewClientID(),
+		TenantID:                     "default",
+		OwnerUsername:                "admin",
 		ClientName:                   DemoClientName,
-		PasswordHash:                 auth.HashPassword(DemoClientPassword),
+		PasswordHash:                 auth.HashPassword(DemoCredentialPlainSecret),
 		Enabled:                      true,
 		ConnectionRateLimitPerMinute: 30,
 		CreatedAt:                    now,
@@ -279,6 +282,19 @@ func seedDemoClient(ctx context.Context, db *store.DB, logger *slog.Logger) erro
 	}
 	if inserted {
 		logger.Info("seeded demo client", "client", DemoClientName)
+	}
+	if _, err := db.InsertCredentialIfAbsent(ctx, store.ClientCredential{
+		ID:                 auth.NewClientID(),
+		TenantID:           "default",
+		OwnerUsername:      "admin",
+		APIKey:             DemoCredentialAPIKey,
+		SecretHash:         auth.HashPassword(DemoCredentialPlainSecret),
+		Enabled:            true,
+		MaxOnlineInstances: 2,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		return fmt.Errorf("seed demo credential: %w", err)
 	}
 	return nil
 }

@@ -1,5 +1,7 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Protocol.Packets;
@@ -19,6 +21,12 @@ namespace ShuaiTunnel.Server.Authentication;
 /// </summary>
 public sealed class ClientAccountService
 {
+    public const string StatusHttpAuthenticated = "HTTP_AUTHENTICATED";
+    public const string StatusNettyOnline = "NETTY_ONLINE";
+    public const string StatusDisconnected = "DISCONNECTED";
+    private const string DefaultTenantId = "default";
+    private const int PerMachineUserMaxInstances = 1;
+
     private readonly TunnelDbContext _db;
     private readonly ClientAuthSessionStore _sessionStore;
     private readonly NettyServerOptions _netty;
@@ -39,17 +47,33 @@ public sealed class ClientAccountService
         ClientAuthLoginRequest request, string? requestServerName, CancellationToken cancellationToken)
     {
         var environment = RequireEnvironment(request.Environment);
-        var account = await AuthenticateStartupCredentialAsync(request, cancellationToken).ConfigureAwait(false);
+        var credential = await AuthenticateCredentialAsync(request, cancellationToken).ConfigureAwait(false);
+        if (!credential.Enabled)
+        {
+            throw new ArgumentException("客户端凭证已停用");
+        }
+
+        var identity = await FindOrCreateIdentityAsync(credential, environment, cancellationToken)
+            .ConfigureAwait(false);
+        var account = await _db.ClientAccounts
+            .FirstOrDefaultAsync(a => a.Id == identity.ClientId && a.TenantId == credential.TenantId,
+                cancellationToken)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"client account missing: {identity.ClientId}");
         if (!account.Enabled)
         {
             throw new ArgumentException("客户端已停用");
         }
 
-        var ttlSeconds = Math.Max(60, _auth.TokenTtlSeconds);
-        var session = _sessionStore.Create(account, TimeSpan.FromSeconds(ttlSeconds), environment);
+        await CloseStaleHttpAuthenticatedSessionsAsync(credential, environment, cancellationToken)
+            .ConfigureAwait(false);
+        var ttlSeconds = _auth.TokenTtlSeconds <= 0 ? 8 * 60 * 60 : _auth.TokenTtlSeconds;
+        var session = _sessionStore.Create(credential, identity, account, TimeSpan.FromSeconds(ttlSeconds), environment);
+        _db.ClientSessions.Add(ToSessionEntity(session, environment));
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return new ClientAuthLoginResponse
         {
-            TenantId = "default",
+            TenantId = credential.TenantId,
             ClientId = account.Id,
             ClientName = account.ClientName,
             ClientSessionId = session.Id,
@@ -57,7 +81,7 @@ public sealed class ClientAccountService
             TokenTtlSeconds = ttlSeconds,
             NettyHost = ResolveNettyHost(requestServerName),
             NettyPort = _netty.Port,
-            MaxOnlineInstances = 2,
+            MaxOnlineInstances = credential.MaxOnlineInstances,
             TunnelConfigList = await _db.TunnelMappings
                 .AsNoTracking()
                 .Where(m => m.ClientId == account.Id && m.Enabled)
@@ -95,18 +119,24 @@ public sealed class ClientAccountService
         if (session.ExpiresAt <= DateTimeOffset.UtcNow)
         {
             _sessionStore.MarkDisconnected(session.Id);
+            await MarkSessionDisconnectedAsync(session.Id, cancellationToken).ConfigureAwait(false);
             return AuthenticationResult.Fail(null, "客户端访问令牌已过期");
         }
 
         var account = await _db.ClientAccounts
-            .FirstOrDefaultAsync(a => a.Id == session.ClientId, cancellationToken)
+            .FirstOrDefaultAsync(a => a.Id == session.ClientId && a.TenantId == session.TenantId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var credential = await _db.ClientCredentials
+            .FirstOrDefaultAsync(c => c.Id == session.CredentialId && c.TenantId == session.TenantId,
+                cancellationToken)
             .ConfigureAwait(false);
 
-        if (account is null)
+        if (account is null || credential is null)
         {
             return AuthenticationResult.Fail(null, "客户端不存在");
         }
-        if (!account.Enabled)
+        if (!account.Enabled || !credential.Enabled)
         {
             return AuthenticationResult.Fail(account, "客户端已停用");
         }
@@ -114,9 +144,21 @@ public sealed class ClientAccountService
         {
             return AuthenticationResult.Fail(account, "连接频率超过限制");
         }
+        if (_sessionStore.CountOnlineByMachineUser(
+                session.CredentialId, session.MachineFingerprint, session.OsUser) >= PerMachineUserMaxInstances)
+        {
+            return AuthenticationResult.Fail(account, "同一台机器和用户已经有在线实例");
+        }
+        if (_sessionStore.CountOnlineByCredential(session.CredentialId) >= credential.MaxOnlineInstances)
+        {
+            return AuthenticationResult.Fail(account, "在线实例数已达上限");
+        }
 
         packet.ClientName = account.ClientName;
+        packet.ClientSessionId = session.Id;
         _sessionStore.MarkOnline(session, channelId, remoteAddress);
+        await MarkSessionOnlineAsync(session, channelId, remoteAddress, cancellationToken)
+            .ConfigureAwait(false);
         return AuthenticationResult.Pass(account);
     }
 
@@ -134,41 +176,38 @@ public sealed class ClientAccountService
         return count >= limit;
     }
 
-    public void MarkNettyDisconnected(long? sessionId) => _sessionStore.MarkDisconnected(sessionId);
+    public void MarkNettyDisconnected(long? sessionId)
+    {
+        _sessionStore.MarkDisconnected(sessionId);
+        if (sessionId is null or <= 0)
+        {
+            return;
+        }
 
-    private async Task<ClientAccount> AuthenticateStartupCredentialAsync(
+        var row = _db.ClientSessions.FirstOrDefault(s => s.Id == sessionId.Value);
+        if (row is null || row.Status != StatusNettyOnline)
+        {
+            return;
+        }
+        row.Status = StatusDisconnected;
+        row.DisconnectedAt = DateTimeOffset.UtcNow;
+        _db.SaveChanges();
+    }
+
+    private async Task<ClientCredential> AuthenticateCredentialAsync(
         ClientAuthLoginRequest request, CancellationToken cancellationToken)
     {
-        var authType = string.IsNullOrWhiteSpace(request.AuthType) ? "apiKey" : request.AuthType.Trim();
-        if (authType.Equals("password", StringComparison.OrdinalIgnoreCase))
-        {
-            var username = RequireText(request.Username, "username");
-            var password = RequireText(request.Password, "password");
-            var account = await _db.ClientAccounts
-                .AsNoTracking()
-                .FirstOrDefaultAsync(a => a.ClientName == username, cancellationToken)
-                .ConfigureAwait(false)
-                ?? throw new ArgumentException("客户端凭证不存在");
-            if (!PasswordHasher.Matches(password, account.PasswordHash))
-            {
-                throw new ArgumentException("客户端凭证无效");
-            }
-            return account;
-        }
-
         var apiKey = RequireText(request.ApiKey, "apiKey");
-        var apiSecret = RequireText(request.Secret, "secret");
-        var apiAccount = await _db.ClientAccounts
+        var credential = await _db.ClientCredentials
             .AsNoTracking()
-            .FirstOrDefaultAsync(a => a.ClientName == apiKey, cancellationToken)
+            .FirstOrDefaultAsync(c => c.ApiKey == apiKey, cancellationToken)
             .ConfigureAwait(false)
             ?? throw new ArgumentException("客户端凭证不存在");
-        if (!PasswordHasher.Matches(apiSecret, apiAccount.PasswordHash)
-            && !HasValidApiKeySignature(request, apiAccount.PasswordHash))
+        if (!HasValidApiKeySignature(request, credential.SecretHash))
         {
-            throw new ArgumentException("客户端凭证无效");
+            throw new ArgumentException("客户端签名无效或已过期");
         }
-        return apiAccount;
+        return credential;
     }
 
     private static bool HasValidApiKeySignature(ClientAuthLoginRequest request, string secretHashHex)
@@ -218,6 +257,157 @@ public sealed class ClientAccountService
             Encoding.ASCII.GetBytes(request.Signature.ToLowerInvariant()));
     }
 
+    private async Task<ClientIdentity> FindOrCreateIdentityAsync(
+        ClientCredential credential, ClientEnvironmentInfo environment, CancellationToken cancellationToken)
+    {
+        var identity = await _db.ClientIdentities
+            .FirstOrDefaultAsync(i => i.CredentialId == credential.Id
+                && i.MachineFingerprint == environment.MachineFingerprint
+                && i.OsUser == environment.OsUser, cancellationToken)
+            .ConfigureAwait(false);
+        if (identity is not null)
+        {
+            identity.Hostname = Limit(environment.Hostname, 160);
+            identity.LastSeenAt = DateTimeOffset.UtcNow;
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return identity;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var account = new ClientAccount
+        {
+            Id = ClientIdGenerator.NewId(),
+            TenantId = credential.TenantId,
+            OwnerUsername = credential.OwnerUsername,
+            ClientName = await GenerateClientNameAsync(credential, environment, cancellationToken)
+                .ConfigureAwait(false),
+            PasswordHash = PasswordHasher.Hash(Guid.NewGuid().ToString("N")),
+            Enabled = true,
+            ConnectionRateLimitPerMinute = 30,
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        _db.ClientAccounts.Add(account);
+
+        identity = new ClientIdentity
+        {
+            Id = ClientIdGenerator.NewId(),
+            TenantId = credential.TenantId,
+            CredentialId = credential.Id,
+            ClientId = account.Id,
+            ClientName = account.ClientName,
+            MachineFingerprint = environment.MachineFingerprint!,
+            OsUser = environment.OsUser!,
+            Hostname = Limit(environment.Hostname, 160),
+            FirstSeenAt = now,
+            LastSeenAt = now,
+        };
+        _db.ClientIdentities.Add(identity);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return identity;
+    }
+
+    private async Task<string> GenerateClientNameAsync(ClientCredential credential,
+        ClientEnvironmentInfo environment, CancellationToken cancellationToken)
+    {
+        var host = Slug(environment.Hostname, "client");
+        var user = Slug(environment.OsUser, "user");
+        var suffixInput = $"{credential.Id}\n{environment.MachineFingerprint}\n{environment.OsUser}";
+        var suffix = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(suffixInput)))
+            .ToLowerInvariant()[..8];
+        var baseName = Limit($"{host}-{user}-{suffix}", 120)!;
+        var candidate = baseName;
+        var i = 2;
+        while (await _db.ClientAccounts.AsNoTracking()
+                   .AnyAsync(a => a.ClientName == candidate, cancellationToken)
+                   .ConfigureAwait(false))
+        {
+            var extra = "-" + i++;
+            candidate = Limit(baseName, 120 - extra.Length) + extra;
+        }
+        return candidate;
+    }
+
+    private async Task CloseStaleHttpAuthenticatedSessionsAsync(ClientCredential credential,
+        ClientEnvironmentInfo environment, CancellationToken cancellationToken)
+    {
+        var rows = await _db.ClientSessions
+            .Where(s => s.CredentialId == credential.Id
+                && s.MachineFingerprint == environment.MachineFingerprint
+                && s.OsUser == environment.OsUser
+                && s.Status == StatusHttpAuthenticated)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (rows.Count == 0)
+        {
+            return;
+        }
+        var now = DateTimeOffset.UtcNow;
+        foreach (var row in rows)
+        {
+            row.Status = StatusDisconnected;
+            row.DisconnectedAt = now;
+        }
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static ClientSession ToSessionEntity(ClientAuthSession session, ClientEnvironmentInfo environment)
+    {
+        var localAddresses = environment.LocalAddresses ?? new List<string>();
+        return new ClientSession
+        {
+            Id = session.Id,
+            TenantId = session.TenantId,
+            CredentialId = session.CredentialId,
+            IdentityId = session.IdentityId,
+            ClientId = session.ClientId,
+            ClientName = session.ClientName,
+            TokenHash = session.TokenHash,
+            Status = StatusHttpAuthenticated,
+            MachineFingerprint = session.MachineFingerprint,
+            OsUser = session.OsUser,
+            Hostname = Limit(environment.Hostname, 160),
+            OsName = Limit(environment.OsName, 120),
+            OsVersion = Limit(environment.OsVersion, 80),
+            OsArch = Limit(environment.OsArch, 60),
+            ClientVersion = Limit(environment.ClientVersion, 80),
+            JavaVersion = Limit(environment.JavaVersion, 80),
+            LocalAddresses = Limit(string.Join(",", localAddresses.Where(a => a is not null)), 2000),
+            HttpLoginAt = DateTimeOffset.UtcNow,
+            ExpiresAt = session.ExpiresAt,
+        };
+    }
+
+    private async Task MarkSessionOnlineAsync(ClientAuthSession session, string channelId, string? remoteAddress,
+        CancellationToken cancellationToken)
+    {
+        var row = await _db.ClientSessions.FirstOrDefaultAsync(s => s.Id == session.Id, cancellationToken)
+            .ConfigureAwait(false);
+        if (row is null)
+        {
+            return;
+        }
+        row.Status = StatusNettyOnline;
+        row.NettyConnectedAt = DateTimeOffset.UtcNow;
+        row.DisconnectedAt = null;
+        row.ChannelId = channelId;
+        row.RemoteAddress = remoteAddress;
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task MarkSessionDisconnectedAsync(long sessionId, CancellationToken cancellationToken)
+    {
+        var row = await _db.ClientSessions.FirstOrDefaultAsync(s => s.Id == sessionId, cancellationToken)
+            .ConfigureAwait(false);
+        if (row is null)
+        {
+            return;
+        }
+        row.Status = StatusDisconnected;
+        row.DisconnectedAt = DateTimeOffset.UtcNow;
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private static ClientEnvironmentInfo RequireEnvironment(ClientEnvironmentInfo? environment)
     {
         if (environment is null)
@@ -232,6 +422,10 @@ public sealed class ClientAccountService
         {
             throw new ArgumentException("osUser 不能为空");
         }
+        environment.MachineFingerprint = Limit(environment.MachineFingerprint.Trim(), 160);
+        environment.OsUser = Limit(environment.OsUser.Trim(), 120);
+        environment.Hostname = Limit(
+            string.IsNullOrWhiteSpace(environment.Hostname) ? "unknown-host" : environment.Hostname.Trim(), 160);
         return environment;
     }
 
@@ -251,5 +445,24 @@ public sealed class ClientAccountService
             throw new ArgumentException($"{field} cannot be blank");
         }
         return value.Trim();
+    }
+
+    private static string Slug(string? value, string fallback)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value)
+            ? fallback
+            : value.Trim().ToLowerInvariant();
+        normalized = Regex.Replace(normalized, "[^a-z0-9._-]+", "-");
+        normalized = Regex.Replace(normalized, "^-+|-+$", "");
+        return string.IsNullOrWhiteSpace(normalized) ? fallback : Limit(normalized, 50)!;
+    }
+
+    private static string? Limit(string? value, int maxLength)
+    {
+        if (value is null || value.Length <= maxLength)
+        {
+            return value;
+        }
+        return value[..maxLength];
     }
 }

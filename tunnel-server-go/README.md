@@ -1,6 +1,6 @@
 # tunnel-server-go
 
-Go 实现的 shuai-tunnel 服务端,与 Java client / C# server **线协议字节兼容**(11 字节帧头 + CompactBinary + NAT_MESSAGE + HMAC 登录)。纯 Go 实现,依赖仅限数据库驱动与 WebSocket 库。
+Go 实现的 shuai-tunnel 服务端,与 Java client / C# server **线协议字节兼容**(11 字节帧头 + CompactBinary + NAT_MESSAGE + runtime token 登录)。纯 Go 实现,依赖仅限数据库驱动与 WebSocket 库。
 
 ## 运行
 
@@ -14,7 +14,7 @@ go build ./cmd/shuai-tunnel-server
 
 - 控制通道(Netty 等价)默认监听 `7010`,Java/Go client 连这里。
 - 管理后台 + Direct HTTP + WebSocket 默认监听 `:8088`,浏览器访问 `http://127.0.0.1:8088/`。
-- 默认 seed 演示客户端 `Demo client / test1234`(可关)。
+- 默认 seed 演示客户端账号 `Demo client` 和启动凭证 `apiKey=demo-client / secret=test1234`(可关)。
 - 管理后台默认账号 `admin / admin`。
 
 ## 配置
@@ -50,7 +50,7 @@ TUNNEL_CONNECTIONSTRINGS_TUNNEL="user:pass@tcp(localhost:3306)/shuai?parseTime=t
 ./shuai-tunnel-server
 ```
 
-启动时按 dialect 用 `CREATE TABLE IF NOT EXISTS` 幂等建表(`internal/store/schema/*.sql`),六张表与 C#/Java 对齐;时间戳统一存 ISO-8601 字符串以保证字典序=时序。
+启动时按 dialect 用 `CREATE TABLE IF NOT EXISTS` 幂等建表(`internal/store/schema/*.sql`),客户端账号、启动凭证、机器身份、运行时会话、映射和统计表与 C#/Java 对齐;时间戳统一存 ISO-8601 字符串以保证字典序=时序。
 
 ### TLS
 
@@ -64,7 +64,7 @@ TLS 同时作用于控制通道与管理 HTTP。当前仅支持 PEM / 自签(PKC
 ## 测试
 
 ```bash
-go test ./...    # 协议 fixtures、登录/心跳、NAT 回环、admin API、OIDC、TLS
+go test ./...    # 协议 fixtures、HTTP 启动登录、控制通道登录/心跳、NAT 回环、admin API、OIDC、TLS
 go vet ./...
 ```
 
@@ -75,7 +75,7 @@ go vet ./...
 - `internal/protocol` — 双向编解码(帧 + CompactBinary + NAT + HMAC)
 - `internal/config` — 配置 + `TUNNEL_*` 映射
 - `internal/store` — 多库抽象 + schema + 查询/CRUD/归档
-- `internal/auth` — HMAC 登录校验、密码 hash、限流、id 生成
+- `internal/auth` — apiKey 签名校验、运行时 token、密码 hash、限流、id 生成
 - `internal/session` — 会话注册表(同名登录顶替)
 - `internal/control` — 监听器、连接、帧读写、空闲/心跳看门狗、登录线程池
 - `internal/nat` — 远端端口管理、外部连接桥接、NAT_CONTROL 下发、流量统计

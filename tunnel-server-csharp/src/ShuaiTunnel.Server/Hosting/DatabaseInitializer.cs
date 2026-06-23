@@ -16,7 +16,8 @@ namespace ShuaiTunnel.Server.Hosting;
 public sealed class DatabaseInitializer
 {
     public const string DemoClientName = "Demo client";
-    public const string DemoClientPassword = "test1234";
+    public const string DemoCredentialApiKey = "demo-client";
+    public const string DemoCredentialSecret = "test1234";
 
     private readonly IServiceProvider _services;
     private readonly IOptions<DatabaseOptions> _options;
@@ -51,28 +52,48 @@ public sealed class DatabaseInitializer
 
     private async Task SeedDemoClientAsync(TunnelDbContext db, CancellationToken cancellationToken)
     {
-        var exists = await db.ClientAccounts
+        var accountExists = await db.ClientAccounts
             .AsNoTracking()
             .AnyAsync(a => a.ClientName == DemoClientName, cancellationToken)
             .ConfigureAwait(false);
-        if (exists)
-        {
-            return;
-        }
-
         var now = DateTimeOffset.UtcNow;
-        db.ClientAccounts.Add(new ClientAccount
+        if (!accountExists)
         {
-            Id = ClientIdGenerator.NewId(),
-            ClientName = DemoClientName,
-            PasswordHash = PasswordHasher.Hash(DemoClientPassword),
-            Enabled = true,
-            ConnectionRateLimitPerMinute = 30,
-            CreatedAt = now,
-            UpdatedAt = now,
-        });
+            db.ClientAccounts.Add(new ClientAccount
+            {
+                Id = ClientIdGenerator.NewId(),
+                TenantId = "default",
+                OwnerUsername = "admin",
+                ClientName = DemoClientName,
+                PasswordHash = PasswordHasher.Hash(DemoCredentialSecret),
+                Enabled = true,
+                ConnectionRateLimitPerMinute = 30,
+                CreatedAt = now,
+                UpdatedAt = now,
+            });
+        }
+        if (!await db.ClientCredentials.AsNoTracking()
+                .AnyAsync(c => c.ApiKey == DemoCredentialApiKey, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            db.ClientCredentials.Add(new ClientCredential
+            {
+                Id = ClientIdGenerator.NewId(),
+                TenantId = "default",
+                OwnerUsername = "admin",
+                ApiKey = DemoCredentialApiKey,
+                SecretHash = PasswordHasher.Hash(DemoCredentialSecret),
+                Enabled = true,
+                MaxOnlineInstances = 2,
+                CreatedAt = now,
+                UpdatedAt = now,
+            });
+        }
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        _logger.LogInformation("seeded {ClientName}", DemoClientName);
+        if (!accountExists)
+        {
+            _logger.LogInformation("seeded {ClientName}", DemoClientName);
+        }
     }
 
     private static string DatabaseDialect(string? providerName)

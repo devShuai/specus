@@ -14,7 +14,8 @@ var ErrNotFound = errors.New("not found")
 
 // ListClients returns all client accounts ordered by id.
 func (db *DB) ListClients(ctx context.Context) ([]ClientAccount, error) {
-	rows, err := db.sql.QueryContext(ctx, `SELECT id, client_name, password_hash, enabled,
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, COALESCE(tenant_id, 'default'), COALESCE(owner_username, ''),
+		client_name, password_hash, enabled,
 		connection_rate_limit_per_minute, created_at, updated_at FROM tunnel_client_account ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -27,7 +28,8 @@ func (db *DB) ListClients(ctx context.Context) ([]ClientAccount, error) {
 			enabled            int
 			createdAt, updated string
 		)
-		if err := rows.Scan(&account.ID, &account.ClientName, &account.PasswordHash, &enabled,
+		if err := rows.Scan(&account.ID, &account.TenantID, &account.OwnerUsername,
+			&account.ClientName, &account.PasswordHash, &enabled,
 			&account.ConnectionRateLimitPerMinute, &createdAt, &updated); err != nil {
 			return nil, err
 		}
@@ -41,15 +43,17 @@ func (db *DB) ListClients(ctx context.Context) ([]ClientAccount, error) {
 
 // GetClient returns the client account by id, or ErrNotFound.
 func (db *DB) GetClient(ctx context.Context, id int64) (*ClientAccount, error) {
-	query := db.rebind(`SELECT id, client_name, password_hash, enabled,
+	query := db.rebind(`SELECT id, COALESCE(tenant_id, 'default'), COALESCE(owner_username, ''),
+		client_name, password_hash, enabled,
 		connection_rate_limit_per_minute, created_at, updated_at FROM tunnel_client_account WHERE id = ?`)
 	var (
 		account            ClientAccount
 		enabled            int
 		createdAt, updated string
 	)
-	err := db.sql.QueryRowContext(ctx, query, id).Scan(&account.ID, &account.ClientName,
-		&account.PasswordHash, &enabled, &account.ConnectionRateLimitPerMinute, &createdAt, &updated)
+	err := db.sql.QueryRowContext(ctx, query, id).Scan(&account.ID, &account.TenantID,
+		&account.OwnerUsername, &account.ClientName, &account.PasswordHash, &enabled,
+		&account.ConnectionRateLimitPerMinute, &createdAt, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -65,9 +69,11 @@ func (db *DB) GetClient(ctx context.Context, id int64) (*ClientAccount, error) {
 // InsertClient persists a new client account (id is caller-assigned).
 func (db *DB) InsertClient(ctx context.Context, account ClientAccount) error {
 	query := db.rebind(`INSERT INTO tunnel_client_account
-		(id, client_name, password_hash, enabled, connection_rate_limit_per_minute, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, account.ID, account.ClientName, account.PasswordHash,
+		(id, tenant_id, owner_username, client_name, password_hash, enabled,
+		 connection_rate_limit_per_minute, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := db.sql.ExecContext(ctx, query, account.ID, defaultTenant(account.TenantID),
+		defaultOwner(account.OwnerUsername), account.ClientName, account.PasswordHash,
 		boolToInt(account.Enabled), account.ConnectionRateLimitPerMinute,
 		formatTime(account.CreatedAt), formatTime(account.UpdatedAt))
 	return err
@@ -75,9 +81,9 @@ func (db *DB) InsertClient(ctx context.Context, account ClientAccount) error {
 
 // UpdateClient updates a client account's mutable fields.
 func (db *DB) UpdateClient(ctx context.Context, account ClientAccount) error {
-	query := db.rebind(`UPDATE tunnel_client_account SET client_name = ?, password_hash = ?,
+	query := db.rebind(`UPDATE tunnel_client_account SET owner_username = ?, client_name = ?, password_hash = ?,
 		enabled = ?, connection_rate_limit_per_minute = ?, updated_at = ? WHERE id = ?`)
-	_, err := db.sql.ExecContext(ctx, query, account.ClientName, account.PasswordHash,
+	_, err := db.sql.ExecContext(ctx, query, defaultOwner(account.OwnerUsername), account.ClientName, account.PasswordHash,
 		boolToInt(account.Enabled), account.ConnectionRateLimitPerMinute,
 		formatTime(account.UpdatedAt), account.ID)
 	return err
@@ -92,6 +98,90 @@ func (db *DB) DeleteClient(ctx context.Context, id int64) error {
 	}
 	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_client_account WHERE id = ?`), id)
 	return err
+}
+
+// ---- client credentials --------------------------------------------------------------
+
+func (db *DB) ListCredentials(ctx context.Context) ([]ClientCredential, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, tenant_id, COALESCE(owner_username, ''),
+		api_key, secret_hash, enabled, max_online_instances, created_at, updated_at
+		FROM tunnel_client_credential ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var credentials []ClientCredential
+	for rows.Next() {
+		credential, err := scanCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		credentials = append(credentials, credential)
+	}
+	return credentials, rows.Err()
+}
+
+func (db *DB) GetCredential(ctx context.Context, id int64) (*ClientCredential, error) {
+	query := db.rebind(`SELECT id, tenant_id, COALESCE(owner_username, ''),
+		api_key, secret_hash, enabled, max_online_instances, created_at, updated_at
+		FROM tunnel_client_credential WHERE id = ?`)
+	row := db.sql.QueryRowContext(ctx, query, id)
+	credential, err := scanCredential(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &credential, nil
+}
+
+func (db *DB) InsertCredential(ctx context.Context, credential ClientCredential) error {
+	query := db.rebind(`INSERT INTO tunnel_client_credential
+		(id, tenant_id, owner_username, api_key, secret_hash, enabled,
+		 max_online_instances, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := db.sql.ExecContext(ctx, query, credential.ID, defaultTenant(credential.TenantID),
+		defaultOwner(credential.OwnerUsername), credential.APIKey, credential.SecretHash,
+		boolToInt(credential.Enabled), credential.MaxOnlineInstances,
+		formatTime(credential.CreatedAt), formatTime(credential.UpdatedAt))
+	return err
+}
+
+func (db *DB) UpdateCredential(ctx context.Context, credential ClientCredential) error {
+	query := db.rebind(`UPDATE tunnel_client_credential SET owner_username = ?, api_key = ?,
+		secret_hash = ?, enabled = ?, max_online_instances = ?, updated_at = ? WHERE id = ?`)
+	_, err := db.sql.ExecContext(ctx, query, defaultOwner(credential.OwnerUsername),
+		credential.APIKey, credential.SecretHash, boolToInt(credential.Enabled),
+		credential.MaxOnlineInstances, formatTime(credential.UpdatedAt), credential.ID)
+	return err
+}
+
+func (db *DB) DeleteCredential(ctx context.Context, id int64) error {
+	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_client_credential WHERE id = ?`), id)
+	return err
+}
+
+type credentialScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanCredential(scanner credentialScanner) (ClientCredential, error) {
+	var (
+		credential         ClientCredential
+		enabled            int
+		createdAt, updated string
+	)
+	err := scanner.Scan(&credential.ID, &credential.TenantID, &credential.OwnerUsername,
+		&credential.APIKey, &credential.SecretHash, &enabled, &credential.MaxOnlineInstances,
+		&createdAt, &updated)
+	if err != nil {
+		return ClientCredential{}, err
+	}
+	credential.Enabled = enabled != 0
+	credential.CreatedAt = parseTime(createdAt)
+	credential.UpdatedAt = parseTime(updated)
+	return credential, nil
 }
 
 // ---- tunnels -------------------------------------------------------------------------

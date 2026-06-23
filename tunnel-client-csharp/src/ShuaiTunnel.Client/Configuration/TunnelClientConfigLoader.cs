@@ -66,31 +66,13 @@ public static class TunnelClientConfigLoader
             throw new InvalidDataException($"{path}: serverBaseUrl 必须是 http/https 绝对地址");
         }
 
-        var authType = string.IsNullOrWhiteSpace(config.AuthType) ? "apiKey" : config.AuthType.Trim();
-        if (authType.Equals("password", StringComparison.OrdinalIgnoreCase))
-        {
-            if (string.IsNullOrWhiteSpace(config.Username))
-            {
-                throw new InvalidDataException($"{path}: password 模式必须配置 username");
-            }
-            if (string.IsNullOrWhiteSpace(config.Password))
-            {
-                throw new InvalidDataException($"{path}: password 模式必须配置 password");
-            }
-            return;
-        }
-
-        if (!authType.Equals("apiKey", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidDataException($"{path}: authType 仅支持 apiKey/password");
-        }
         if (string.IsNullOrWhiteSpace(config.ApiKey))
         {
-            throw new InvalidDataException($"{path}: apiKey 模式必须配置 apiKey");
+            throw new InvalidDataException($"{path}: 必须配置 apiKey");
         }
         if (string.IsNullOrWhiteSpace(config.Secret))
         {
-            throw new InvalidDataException($"{path}: apiKey 模式必须配置 secret");
+            throw new InvalidDataException($"{path}: 必须配置 secret");
         }
     }
 }

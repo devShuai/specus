@@ -14,6 +14,7 @@ var (
 type ClientView struct {
 	ID                           int64  `json:"id"`
 	ClientName                   string `json:"clientName"`
+	OwnerUsername                string `json:"ownerUsername,omitempty"`
 	Enabled                      bool   `json:"enabled"`
 	ConnectionRateLimitPerMinute int    `json:"connectionRateLimitPerMinute"`
 	Online                       bool   `json:"online"`
@@ -24,10 +25,25 @@ type ClientView struct {
 	UpdatedAt                    string `json:"updatedAt"`
 }
 
-// CredentialView wraps a client with a one-time plaintext password (create/update with password).
+// ClientResult wraps a client mutation result.
+type ClientResult struct {
+	Client ClientView `json:"client"`
+}
+
+// CredentialView is the JSON representation of a startup credential.
 type CredentialView struct {
-	Client   ClientView `json:"client"`
-	Password string     `json:"password,omitempty"`
+	ID                 int64  `json:"id"`
+	APIKey             string `json:"apiKey"`
+	OwnerUsername      string `json:"ownerUsername,omitempty"`
+	Enabled            bool   `json:"enabled"`
+	MaxOnlineInstances int    `json:"maxOnlineInstances"`
+	CreatedAt          string `json:"createdAt"`
+	UpdatedAt          string `json:"updatedAt"`
+}
+
+type CredentialResult struct {
+	Credential CredentialView `json:"credential"`
+	Secret     string         `json:"secret,omitempty"`
 }
 
 // TunnelView is the JSON representation of a tunnel mapping.
@@ -117,9 +133,15 @@ type OverviewView struct {
 // clientMutation is the create/update client request body.
 type clientMutation struct {
 	ClientName                   string `json:"clientName"`
-	Password                     string `json:"password"`
 	Enabled                      *bool  `json:"enabled"`
 	ConnectionRateLimitPerMinute *int   `json:"connectionRateLimitPerMinute"`
+}
+
+type credentialMutation struct {
+	APIKey             string `json:"apiKey"`
+	Secret             string `json:"secret"`
+	Enabled            *bool  `json:"enabled"`
+	MaxOnlineInstances *int   `json:"maxOnlineInstances"`
 }
 
 // tunnelMutation is the create/update tunnel request body.

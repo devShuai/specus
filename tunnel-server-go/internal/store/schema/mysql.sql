@@ -1,12 +1,47 @@
 CREATE TABLE IF NOT EXISTS tunnel_client_account (
   id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL DEFAULT 'default',
+  owner_username VARCHAR(80),
   client_name VARCHAR(120) NOT NULL,
   password_hash VARCHAR(64) NOT NULL,
   enabled TINYINT(1) NOT NULL,
   connection_rate_limit_per_minute INT NOT NULL,
   created_at VARCHAR(40) NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
-  UNIQUE KEY uq_client_account_name (client_name)
+  UNIQUE KEY uq_client_account_name (client_name),
+  KEY idx_tunnel_client_tenant (tenant_id),
+  KEY idx_tunnel_client_owner (tenant_id, owner_username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS tunnel_client_credential (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  owner_username VARCHAR(80),
+  api_key VARCHAR(120) NOT NULL,
+  secret_hash VARCHAR(64) NOT NULL,
+  enabled TINYINT(1) NOT NULL,
+  max_online_instances INT NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uk_client_credential_api_key (api_key),
+  KEY idx_client_credential_tenant (tenant_id),
+  KEY idx_client_credential_owner (tenant_id, owner_username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS tunnel_client_identity (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  credential_id BIGINT NOT NULL,
+  client_id BIGINT NOT NULL,
+  client_name VARCHAR(120) NOT NULL,
+  machine_fingerprint VARCHAR(160) NOT NULL,
+  os_user VARCHAR(120) NOT NULL,
+  hostname VARCHAR(160),
+  first_seen_at VARCHAR(40) NOT NULL,
+  last_seen_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uk_client_identity_machine_user (credential_id, machine_fingerprint, os_user),
+  KEY idx_client_identity_tenant (tenant_id),
+  KEY idx_client_identity_client (client_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (

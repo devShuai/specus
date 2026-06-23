@@ -13,20 +13,11 @@ public sealed class TunnelClientConfig
     [JsonPropertyName("serverBaseUrl")]
     public string ServerBaseUrl { get; set; } = "";
 
-    [JsonPropertyName("authType")]
-    public string AuthType { get; set; } = "apiKey";
-
     [JsonPropertyName("apiKey")]
     public string? ApiKey { get; set; }
 
     [JsonPropertyName("secret")]
     public string? Secret { get; set; }
-
-    [JsonPropertyName("username")]
-    public string? Username { get; set; }
-
-    [JsonPropertyName("password")]
-    public string? Password { get; set; }
 }
 
 public sealed class TunnelRuntimeState

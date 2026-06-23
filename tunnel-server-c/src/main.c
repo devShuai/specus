@@ -31,10 +31,10 @@ typedef struct {
 
 typedef struct {
     char client_name[128];
-    uint8_t password_hash[ST_SHA256_LEN];
+    int64_t client_session_id;
+    uint8_t access_token_hash[ST_SHA256_LEN];
     int port;
     char public_address[256];
-    int login_time_window_ms;
     int control_read_idle_seconds;
     int max_global_external_connections;
     int max_client_external_connections;
@@ -193,6 +193,24 @@ static int env_int_range(const char *name, int default_value, int min_value, int
     return 0;
 }
 
+static int env_i64_range(const char *name, int64_t default_value, int64_t min_value, int64_t max_value, int64_t *out)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        *out = default_value;
+        return 0;
+    }
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+        fprintf(stderr, "invalid %s; expected integer in [%lld,%lld]\n",
+                name, (long long)min_value, (long long)max_value);
+        return -1;
+    }
+    *out = (int64_t)parsed;
+    return 0;
+}
+
 static int copy_config_string(char *dest, size_t dest_len, const char *name, const char *value)
 {
     if (value == NULL || *value == '\0') {
@@ -313,7 +331,7 @@ static int load_database_config(server_config *config, const char *database_path
     if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return -1;
     }
-    if (st_storage_load_client_hash(database_path, config->client_name, config->password_hash) != 0) {
+    if (st_storage_client_enabled(database_path, config->client_name) != 0) {
         fprintf(stderr, "client not found or disabled in database: %s\n", config->client_name);
         return -1;
     }
@@ -390,8 +408,8 @@ static int build_nat_control_json(server_config *config)
 static int load_config(server_config *config)
 {
     const char *name = getenv("TUNNEL_CLIENT_NAME");
-    const char *password = getenv("TUNNEL_CLIENT_PASSWORD");
-    const char *password_hash = getenv("TUNNEL_CLIENT_PASSWORD_HASH");
+    const char *access_token = getenv("TUNNEL_CLIENT_ACCESS_TOKEN");
+    const char *access_token_hash = getenv("TUNNEL_CLIENT_ACCESS_TOKEN_HASH");
     const char *public_address = getenv("TUNNEL_PUBLIC_ADDRESS");
     const char *database_path = getenv("TUNNEL_DATABASE_PATH");
     const char *static_root = getenv("TUNNEL_STATIC_ROOT");
@@ -404,8 +422,7 @@ static int load_config(server_config *config)
                               "TUNNEL_PUBLIC_ADDRESS",
                               (public_address != NULL && *public_address != '\0') ? public_address : "127.0.0.1") != 0
         || env_int_range("TUNNEL_NETTY_PORT", 7010, 1, 65535, &config->port) != 0
-        || env_int_range("TUNNEL_LOGIN_TIME_WINDOW_MS", 30000, 1000, 300000,
-                         &config->login_time_window_ms) != 0
+        || env_i64_range("TUNNEL_CLIENT_SESSION_ID", 1, 1, INT64_MAX, &config->client_session_id) != 0
         || env_int_range("TUNNEL_CONTROL_READ_IDLE_SECONDS", 60, 5, 3600,
                          &config->control_read_idle_seconds) != 0
         || env_int_range("TUNNEL_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
@@ -429,16 +446,18 @@ static int load_config(server_config *config)
         if (load_database_config(config, database_path) != 0) {
             return -1;
         }
-    } else if (password_hash != NULL && *password_hash != '\0') {
-        if (st_hex_decode_32(password_hash, config->password_hash) != 0) {
-            fprintf(stderr, "invalid TUNNEL_CLIENT_PASSWORD_HASH; expected 64 hex chars\n");
+    }
+    if (access_token_hash != NULL && *access_token_hash != '\0') {
+        if (st_hex_decode_32(access_token_hash, config->access_token_hash) != 0) {
+            fprintf(stderr, "invalid TUNNEL_CLIENT_ACCESS_TOKEN_HASH; expected 64 hex chars\n");
             return -1;
         }
     } else {
-        if (password == NULL || *password == '\0') {
-            password = "test1234";
+        if (access_token == NULL || *access_token == '\0') {
+            fprintf(stderr, "TUNNEL_CLIENT_ACCESS_TOKEN is required when TUNNEL_CLIENT_ACCESS_TOKEN_HASH is unset\n");
+            return -1;
         }
-        st_sha256((const uint8_t *)password, strlen(password), config->password_hash);
+        st_sha256((const uint8_t *)access_token, strlen(access_token), config->access_token_hash);
     }
 
     if (parse_tcp_mappings(config) != 0) {
@@ -554,8 +573,17 @@ static int verify_login(const server_config *config, const st_login_request *req
         *reason = "客户端不存在或未启用";
         return 0;
     }
+    if (request->client_session_id != config->client_session_id) {
+        *reason = "客户端访问令牌无效";
+        return 0;
+    }
+    uint8_t actual_hash[ST_SHA256_LEN];
+    st_sha256((const uint8_t *)request->access_token, strlen(request->access_token), actual_hash);
+    if (!st_constant_time_eq(actual_hash, config->access_token_hash, sizeof(actual_hash))) {
+        *reason = "客户端访问令牌无效";
+        return 0;
+    }
 
-    (void)config;
     *reason = NULL;
     return 1;
 }

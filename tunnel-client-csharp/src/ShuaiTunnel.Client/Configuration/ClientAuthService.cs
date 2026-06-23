@@ -36,29 +36,18 @@ public sealed class ClientAuthService
         var environment = ClientEnvironmentInfo.Collect(_logger);
         var request = new ClientAuthLoginRequest
         {
-            AuthType = string.IsNullOrWhiteSpace(_config.AuthType) ? "apiKey" : _config.AuthType.Trim(),
             Environment = environment,
+            ApiKey = _config.ApiKey?.Trim(),
+            Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            Nonce = Guid.NewGuid().ToString("N"),
         };
-
-        if (request.AuthType.Equals("password", StringComparison.OrdinalIgnoreCase))
-        {
-            request.Username = _config.Username;
-            request.Password = _config.Password;
-        }
-        else
-        {
-            request.AuthType = "apiKey";
-            request.ApiKey = _config.ApiKey;
-            request.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(
-                System.Globalization.CultureInfo.InvariantCulture);
-            request.Nonce = Guid.NewGuid().ToString("N");
-            request.Signature = SignApiKey(
-                _config.ApiKey,
-                request.Timestamp,
-                request.Nonce,
-                environment,
-                _config.Secret);
-        }
+        request.Signature = SignApiKey(
+            request.ApiKey,
+            request.Timestamp,
+            request.Nonce,
+            environment,
+            _config.Secret?.Trim());
 
         var url = $"{TrimTrailingSlash(_config.ServerBaseUrl)}/api/client/auth/login";
         using var response = await _http.PostAsJsonAsync(url, request, JsonOptions, cancellationToken)
@@ -127,20 +116,8 @@ public sealed class ClientAuthService
 
 public sealed class ClientAuthLoginRequest
 {
-    [JsonPropertyName("authType")]
-    public string? AuthType { get; set; }
-
     [JsonPropertyName("apiKey")]
     public string? ApiKey { get; set; }
-
-    [JsonPropertyName("secret")]
-    public string? Secret { get; set; }
-
-    [JsonPropertyName("username")]
-    public string? Username { get; set; }
-
-    [JsonPropertyName("password")]
-    public string? Password { get; set; }
 
     [JsonPropertyName("timestamp")]
     public string? Timestamp { get; set; }

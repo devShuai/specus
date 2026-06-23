@@ -1,5 +1,6 @@
 #include "admin_http.h"
 
+#include "json.h"
 #include "security.h"
 
 #include <arpa/inet.h>
@@ -34,6 +35,72 @@ static int write_response(char *out, size_t out_len, int status, const char *rea
     return written < 0 || (size_t)written >= out_len ? -1 : written;
 }
 
+static const char *env_text(const char *name, const char *fallback)
+{
+    const char *value = getenv(name);
+    return value != NULL && *value != '\0' ? value : fallback;
+}
+
+static long long env_i64(const char *name, long long fallback)
+{
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        return fallback;
+    }
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 ? parsed : fallback;
+}
+
+static int env_int(const char *name, int fallback)
+{
+    long long parsed = env_i64(name, fallback);
+    return parsed > 0 && parsed <= 65535 ? (int)parsed : fallback;
+}
+
+static int build_client_auth_login_response(char *out, size_t out_len)
+{
+    const char *access_token = getenv("TUNNEL_CLIENT_ACCESS_TOKEN");
+    if (access_token == NULL || *access_token == '\0') {
+        return write_response(out,
+                              out_len,
+                              503,
+                              "Service Unavailable",
+                              "{\"error\":\"TUNNEL_CLIENT_ACCESS_TOKEN is required for the C auth-login stub\"}");
+    }
+
+    char *client_name = st_json_escape(env_text("TUNNEL_CLIENT_NAME", "Demo client"));
+    char *netty_host = st_json_escape(env_text("TUNNEL_PUBLIC_ADDRESS", "127.0.0.1"));
+    char *token = st_json_escape(access_token);
+    if (client_name == NULL || netty_host == NULL || token == NULL) {
+        free(client_name);
+        free(netty_host);
+        free(token);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response build failed\"}");
+    }
+
+    char body[2048];
+    int written = snprintf(body,
+                           sizeof(body),
+                           "{\"tenantId\":\"default\",\"clientId\":1,\"clientName\":\"%s\","
+                           "\"clientSessionId\":%lld,\"accessToken\":\"%s\",\"tokenTtlSeconds\":28800,"
+                           "\"nettyHost\":\"%s\",\"nettyPort\":%d,\"maxOnlineInstances\":1,"
+                           "\"policy\":{\"enabled\":true,\"billingStatus\":\"ACTIVE\",\"retryAfterSeconds\":0},"
+                           "\"tunnelConfigList\":[],\"httpTunnelConfigList\":[]}",
+                           client_name,
+                           env_i64("TUNNEL_CLIENT_SESSION_ID", 1),
+                           token,
+                           netty_host,
+                           env_int("TUNNEL_NETTY_PORT", 7010));
+    free(client_name);
+    free(netty_host);
+    free(token);
+    if (written < 0 || (size_t)written >= sizeof(body)) {
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response too large\"}");
+    }
+    return write_response(out, out_len, 200, "OK", body);
+}
+
 int st_admin_build_response(const char *method, const char *path, char *out, size_t out_len)
 {
     if (method == NULL || path == NULL) {
@@ -63,6 +130,9 @@ int st_admin_build_response(const char *method, const char *path, char *out, siz
                               200,
                               "OK",
                               "{\"token\":\"local-dev-token\",\"tokenType\":\"Bearer\",\"expiresIn\":28800}");
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/client/auth/login") == 0) {
+        return build_client_auth_login_response(out, out_len);
     }
     if (strncmp(path, "/http/", 6) == 0) {
         return write_response(out,

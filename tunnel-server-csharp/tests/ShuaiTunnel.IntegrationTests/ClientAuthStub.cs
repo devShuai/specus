@@ -95,7 +95,22 @@ internal sealed class ClientAuthStub : IAsyncDisposable
         var sessionStore = scope.ServiceProvider.GetRequiredService<ClientAuthSessionStore>();
         var account = await db.ClientAccounts.AsNoTracking()
             .SingleAsync(c => c.ClientName == DatabaseInitializer.DemoClientName, cancellationToken);
-        var session = sessionStore.Create(account, TimeSpan.FromHours(1), new ClientEnvironmentInfo
+        var credential = await db.ClientCredentials.AsNoTracking()
+            .SingleAsync(c => c.ApiKey == DatabaseInitializer.DemoCredentialApiKey, cancellationToken);
+        var identity = new ClientIdentity
+        {
+            Id = ShuaiTunnel.Server.Authentication.ClientIdGenerator.NewId(),
+            TenantId = credential.TenantId,
+            CredentialId = credential.Id,
+            ClientId = account.Id,
+            ClientName = account.ClientName,
+            MachineFingerprint = "it-machine",
+            OsUser = Environment.UserName,
+            Hostname = "integration-test",
+            FirstSeenAt = DateTimeOffset.UtcNow,
+            LastSeenAt = DateTimeOffset.UtcNow,
+        };
+        var session = sessionStore.Create(credential, identity, account, TimeSpan.FromHours(1), new ClientEnvironmentInfo
         {
             MachineFingerprint = "it-machine",
             Hostname = "integration-test",

@@ -4,20 +4,8 @@ namespace ShuaiTunnel.Server.Authentication;
 
 public sealed class ClientAuthLoginRequest
 {
-    [JsonPropertyName("authType")]
-    public string? AuthType { get; set; }
-
     [JsonPropertyName("apiKey")]
     public string? ApiKey { get; set; }
-
-    [JsonPropertyName("secret")]
-    public string? Secret { get; set; }
-
-    [JsonPropertyName("username")]
-    public string? Username { get; set; }
-
-    [JsonPropertyName("password")]
-    public string? Password { get; set; }
 
     [JsonPropertyName("timestamp")]
     public string? Timestamp { get; set; }

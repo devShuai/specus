@@ -20,11 +20,7 @@ import (
 )
 
 type authLoginRequest struct {
-	AuthType    string                `json:"authType"`
 	APIKey      string                `json:"apiKey,omitempty"`
-	Secret      string                `json:"secret,omitempty"`
-	Username    string                `json:"username,omitempty"`
-	Password    string                `json:"password,omitempty"`
 	Timestamp   string                `json:"timestamp,omitempty"`
 	Nonce       string                `json:"nonce,omitempty"`
 	Signature   string                `json:"signature,omitempty"`
@@ -49,22 +45,12 @@ var authHTTPClient = &http.Client{Timeout: 20 * time.Second}
 func (client *Client) login(ctx context.Context) (RuntimeConfig, error) {
 	environment := collectEnvironment()
 	request := authLoginRequest{
-		AuthType:    strings.TrimSpace(client.config.AuthType),
 		Environment: environment,
+		APIKey:      strings.TrimSpace(client.config.APIKey),
+		Timestamp:   fmt.Sprintf("%d", time.Now().UnixMilli()),
+		Nonce:       randomHex(16),
 	}
-	if request.AuthType == "" {
-		request.AuthType = "apiKey"
-	}
-	if strings.EqualFold(request.AuthType, "password") {
-		request.Username = client.config.Username
-		request.Password = client.config.Password
-	} else {
-		request.AuthType = "apiKey"
-		request.APIKey = client.config.APIKey
-		request.Timestamp = fmt.Sprintf("%d", time.Now().UnixMilli())
-		request.Nonce = randomHex(16)
-		request.Signature = signAPIKey(client.config.APIKey, request.Timestamp, request.Nonce, environment, client.config.Secret)
-	}
+	request.Signature = signAPIKey(request.APIKey, request.Timestamp, request.Nonce, environment, strings.TrimSpace(client.config.Secret))
 
 	body, err := json.Marshal(request)
 	if err != nil {

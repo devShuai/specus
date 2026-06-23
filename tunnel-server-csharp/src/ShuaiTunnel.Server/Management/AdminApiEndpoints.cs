@@ -141,6 +141,30 @@ public static class AdminApiEndpoints
                 return Results.NoContent();
             });
 
+        app.MapGet("/api/admin/client-credentials",
+            (ManagementMutationService service, CancellationToken cancellationToken) =>
+                service.ListCredentialsAsync(cancellationToken));
+
+        app.MapPost("/api/admin/client-credentials",
+            async (CredentialMutation request, ManagementMutationService service,
+                CancellationToken cancellationToken) =>
+            {
+                var created = await service.CreateCredentialAsync(request, cancellationToken).ConfigureAwait(false);
+                return Results.Json(created, statusCode: StatusCodes.Status201Created);
+            });
+
+        app.MapPut("/api/admin/client-credentials/{id:long}",
+            (long id, CredentialMutation request, ManagementMutationService service,
+                CancellationToken cancellationToken) =>
+                service.UpdateCredentialAsync(id, request, cancellationToken));
+
+        app.MapDelete("/api/admin/client-credentials/{id:long}",
+            async (long id, ManagementMutationService service, CancellationToken cancellationToken) =>
+            {
+                await service.DeleteCredentialAsync(id, cancellationToken).ConfigureAwait(false);
+                return Results.NoContent();
+            });
+
         app.MapGet("/api/admin/tunnels",
             (long? clientId, ManagementMutationService service, CancellationToken cancellationToken) =>
                 service.ListTunnelsAsync(clientId, cancellationToken));

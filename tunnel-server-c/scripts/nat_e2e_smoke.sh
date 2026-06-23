@@ -5,9 +5,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 C_DIR="$ROOT_DIR/tunnel-server-c"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shuai-tunnel-c-smoke.XXXXXX")"
 CONTROL_PORT="${CONTROL_PORT:-17010}"
+ADMIN_PORT="${ADMIN_PORT:-17011}"
 PUBLIC_PORT="${PUBLIC_PORT:-18080}"
 ECHO_PORT="${ECHO_PORT:-19090}"
 JAVA_CLIENT_JAR="$ROOT_DIR/tunnel-client/target/tunnel-client-0.0.1-SNAPSHOT-exec.jar"
+ACCESS_TOKEN="${ACCESS_TOKEN:-c-smoke-access-token}"
 
 cleanup() {
   set +e
@@ -47,19 +49,18 @@ ECHO_PID=$!
 
 TUNNEL_NETTY_PORT="$CONTROL_PORT" \
 TUNNEL_CLIENT_NAME="Demo client" \
-TUNNEL_CLIENT_PASSWORD="test1234" \
+TUNNEL_CLIENT_SESSION_ID="1" \
+TUNNEL_CLIENT_ACCESS_TOKEN="$ACCESS_TOKEN" \
+TUNNEL_ADMIN_PORT="$ADMIN_PORT" \
 TUNNEL_TCP_MAPPINGS="$PUBLIC_PORT=127.0.0.1:$ECHO_PORT" \
 "$C_DIR/build/shuai-tunnel-server-c" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 cat >"$TMP_DIR/tunnelClientConfig.json" <<JSON
 {
-  "clientName": "Demo client",
-  "password": "test1234",
-  "tunnelConfigList": [],
-  "httpTunnelConfigList": [],
-  "remoteAddress": "127.0.0.1",
-  "remotePort": $CONTROL_PORT
+  "serverBaseUrl": "http://127.0.0.1:$ADMIN_PORT",
+  "apiKey": "c-smoke",
+  "secret": "not-used-by-c-auth-stub"
 }
 JSON
 

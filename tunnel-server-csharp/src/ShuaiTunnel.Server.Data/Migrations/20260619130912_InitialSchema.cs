@@ -33,6 +33,8 @@ namespace ShuaiTunnel.Server.Data.Migrations
                 columns: table => new
                 {
                     Id = table.Column<long>(type: "INTEGER", nullable: false),
+                    tenant_id = table.Column<string>(type: "TEXT", maxLength: 80, nullable: false),
+                    owner_username = table.Column<string>(type: "TEXT", maxLength: 80, nullable: true),
                     client_name = table.Column<string>(type: "TEXT", maxLength: 120, nullable: false),
                     password_hash = table.Column<string>(type: "TEXT", maxLength: 64, nullable: false),
                     enabled = table.Column<bool>(type: "INTEGER", nullable: false),
@@ -43,6 +45,78 @@ namespace ShuaiTunnel.Server.Data.Migrations
                 constraints: table =>
                 {
                     table.PrimaryKey("PK_tunnel_client_account", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "tunnel_client_credential",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "INTEGER", nullable: false),
+                    tenant_id = table.Column<string>(type: "TEXT", maxLength: 80, nullable: false),
+                    owner_username = table.Column<string>(type: "TEXT", maxLength: 80, nullable: true),
+                    api_key = table.Column<string>(type: "TEXT", maxLength: 120, nullable: false),
+                    secret_hash = table.Column<string>(type: "TEXT", maxLength: 64, nullable: false),
+                    enabled = table.Column<bool>(type: "INTEGER", nullable: false),
+                    max_online_instances = table.Column<int>(type: "INTEGER", nullable: false),
+                    created_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: false),
+                    updated_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_tunnel_client_credential", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "tunnel_client_identity",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "INTEGER", nullable: false),
+                    tenant_id = table.Column<string>(type: "TEXT", maxLength: 80, nullable: false),
+                    credential_id = table.Column<long>(type: "INTEGER", nullable: false),
+                    client_id = table.Column<long>(type: "INTEGER", nullable: false),
+                    client_name = table.Column<string>(type: "TEXT", maxLength: 120, nullable: false),
+                    machine_fingerprint = table.Column<string>(type: "TEXT", maxLength: 160, nullable: false),
+                    os_user = table.Column<string>(type: "TEXT", maxLength: 120, nullable: false),
+                    hostname = table.Column<string>(type: "TEXT", maxLength: 160, nullable: true),
+                    first_seen_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: false),
+                    last_seen_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_tunnel_client_identity", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "tunnel_client_session",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "INTEGER", nullable: false),
+                    tenant_id = table.Column<string>(type: "TEXT", maxLength: 80, nullable: false),
+                    credential_id = table.Column<long>(type: "INTEGER", nullable: false),
+                    identity_id = table.Column<long>(type: "INTEGER", nullable: false),
+                    client_id = table.Column<long>(type: "INTEGER", nullable: false),
+                    client_name = table.Column<string>(type: "TEXT", maxLength: 120, nullable: false),
+                    token_hash = table.Column<string>(type: "TEXT", maxLength: 64, nullable: false),
+                    status = table.Column<string>(type: "TEXT", maxLength: 40, nullable: false),
+                    machine_fingerprint = table.Column<string>(type: "TEXT", maxLength: 160, nullable: false),
+                    os_user = table.Column<string>(type: "TEXT", maxLength: 120, nullable: false),
+                    hostname = table.Column<string>(type: "TEXT", maxLength: 160, nullable: true),
+                    os_name = table.Column<string>(type: "TEXT", maxLength: 120, nullable: true),
+                    os_version = table.Column<string>(type: "TEXT", maxLength: 80, nullable: true),
+                    os_arch = table.Column<string>(type: "TEXT", maxLength: 60, nullable: true),
+                    client_version = table.Column<string>(type: "TEXT", maxLength: 80, nullable: true),
+                    java_version = table.Column<string>(type: "TEXT", maxLength: 80, nullable: true),
+                    local_addresses = table.Column<string>(type: "TEXT", maxLength: 2000, nullable: true),
+                    http_login_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: false),
+                    netty_connected_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: true),
+                    disconnected_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: true),
+                    expires_at = table.Column<string>(type: "TEXT", maxLength: 40, nullable: false),
+                    channel_id = table.Column<string>(type: "TEXT", maxLength: 160, nullable: true),
+                    remote_address = table.Column<string>(type: "TEXT", maxLength: 255, nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_tunnel_client_session", x => x.Id);
                 });
 
             migrationBuilder.CreateTable(
@@ -140,6 +214,63 @@ namespace ShuaiTunnel.Server.Data.Migrations
                 unique: true);
 
             migrationBuilder.CreateIndex(
+                name: "idx_tunnel_client_owner",
+                table: "tunnel_client_account",
+                columns: new[] { "tenant_id", "owner_username" });
+
+            migrationBuilder.CreateIndex(
+                name: "idx_tunnel_client_tenant",
+                table: "tunnel_client_account",
+                column: "tenant_id");
+
+            migrationBuilder.CreateIndex(
+                name: "idx_client_credential_owner",
+                table: "tunnel_client_credential",
+                columns: new[] { "tenant_id", "owner_username" });
+
+            migrationBuilder.CreateIndex(
+                name: "idx_client_credential_tenant",
+                table: "tunnel_client_credential",
+                column: "tenant_id");
+
+            migrationBuilder.CreateIndex(
+                name: "uk_client_credential_api_key",
+                table: "tunnel_client_credential",
+                column: "api_key",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "idx_client_identity_client",
+                table: "tunnel_client_identity",
+                column: "client_id");
+
+            migrationBuilder.CreateIndex(
+                name: "idx_client_identity_tenant",
+                table: "tunnel_client_identity",
+                column: "tenant_id");
+
+            migrationBuilder.CreateIndex(
+                name: "uk_client_identity_machine_user",
+                table: "tunnel_client_identity",
+                columns: new[] { "credential_id", "machine_fingerprint", "os_user" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "idx_client_session_credential_status",
+                table: "tunnel_client_session",
+                columns: new[] { "credential_id", "status" });
+
+            migrationBuilder.CreateIndex(
+                name: "idx_client_session_machine_status",
+                table: "tunnel_client_session",
+                columns: new[] { "credential_id", "machine_fingerprint", "os_user", "status" });
+
+            migrationBuilder.CreateIndex(
+                name: "idx_client_session_token",
+                table: "tunnel_client_session",
+                column: "token_hash");
+
+            migrationBuilder.CreateIndex(
                 name: "idx_tunnel_connection_client_time",
                 table: "tunnel_connection_record",
                 columns: new[] { "client_id", "connected_at" });
@@ -191,6 +322,15 @@ namespace ShuaiTunnel.Server.Data.Migrations
 
             migrationBuilder.DropTable(
                 name: "tunnel_client_account");
+
+            migrationBuilder.DropTable(
+                name: "tunnel_client_credential");
+
+            migrationBuilder.DropTable(
+                name: "tunnel_client_identity");
+
+            migrationBuilder.DropTable(
+                name: "tunnel_client_session");
 
             migrationBuilder.DropTable(
                 name: "tunnel_connection_record");

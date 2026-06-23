@@ -49,6 +49,7 @@ public sealed class ManagementQueryService
             return new ClientAccountView(
                 account.Id,
                 account.ClientName,
+                account.OwnerUsername,
                 account.Enabled,
                 account.ConnectionRateLimitPerMinute,
                 session is not null,

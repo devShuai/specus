@@ -10,11 +10,8 @@ import (
 
 type Config struct {
 	ServerBaseURL string `json:"serverBaseUrl"`
-	AuthType      string `json:"authType"`
 	APIKey        string `json:"apiKey"`
 	Secret        string `json:"secret"`
-	Username      string `json:"username"`
-	Password      string `json:"password"`
 }
 
 type TunnelConfig struct {
@@ -68,24 +65,11 @@ func (config Config) Validate() error {
 	if strings.TrimSpace(config.ServerBaseURL) == "" {
 		return errors.New("serverBaseUrl is required")
 	}
-	authType := strings.TrimSpace(config.AuthType)
-	if authType == "" || strings.EqualFold(authType, "apiKey") {
-		if strings.TrimSpace(config.APIKey) == "" {
-			return errors.New("apiKey is required")
-		}
-		if config.Secret == "" {
-			return errors.New("secret is required")
-		}
-		return nil
+	if strings.TrimSpace(config.APIKey) == "" {
+		return errors.New("apiKey is required")
 	}
-	if strings.EqualFold(authType, "password") {
-		if strings.TrimSpace(config.Username) == "" {
-			return errors.New("username is required")
-		}
-		if config.Password == "" {
-			return errors.New("password is required")
-		}
-		return nil
+	if config.Secret == "" {
+		return errors.New("secret is required")
 	}
-	return errors.New("authType must be apiKey or password")
+	return nil
 }

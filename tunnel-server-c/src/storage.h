@@ -4,8 +4,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "crypto.h"
-
 typedef struct {
     int listen_port;
     char target_address[256];
@@ -13,7 +11,7 @@ typedef struct {
 } st_storage_mapping;
 
 int st_storage_init(const char *path, int seed_demo_client);
-int st_storage_load_client_hash(const char *path, const char *client_name, uint8_t hash[ST_SHA256_LEN]);
+int st_storage_client_enabled(const char *path, const char *client_name);
 int st_storage_load_mappings(const char *path,
                              const char *client_name,
                              st_storage_mapping *mappings,

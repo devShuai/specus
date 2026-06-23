@@ -10,13 +10,16 @@ public sealed class ClientAuthSessionStore
     private readonly ConcurrentDictionary<string, ClientAuthSession> _byTokenHash = new();
     private readonly ConcurrentDictionary<long, string> _tokenHashBySessionId = new();
 
-    public ClientAuthSession Create(ClientAccount account, TimeSpan ttl, ClientEnvironmentInfo environment)
+    public ClientAuthSession Create(ClientCredential credential, ClientIdentity identity,
+        ClientAccount account, TimeSpan ttl, ClientEnvironmentInfo environment)
     {
         var accessToken = "cs_" + Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
         var session = new ClientAuthSession
         {
             Id = ClientIdGenerator.NewId(),
-            TenantId = "default",
+            TenantId = credential.TenantId,
+            CredentialId = credential.Id,
+            IdentityId = identity.Id,
             ClientId = account.Id,
             ClientName = account.ClientName,
             AccessToken = accessToken,
@@ -48,6 +51,16 @@ public sealed class ClientAuthSessionStore
         return _byTokenHash.TryGetValue(hash, out var session) ? session : null;
     }
 
+    public int CountOnlineByCredential(long credentialId) =>
+        _byTokenHash.Values.Count(s => s.CredentialId == credentialId
+            && s.Status == ClientAuthSessionStatus.NettyOnline);
+
+    public int CountOnlineByMachineUser(long credentialId, string machineFingerprint, string osUser) =>
+        _byTokenHash.Values.Count(s => s.CredentialId == credentialId
+            && s.Status == ClientAuthSessionStatus.NettyOnline
+            && string.Equals(s.MachineFingerprint, machineFingerprint, StringComparison.Ordinal)
+            && string.Equals(s.OsUser, osUser, StringComparison.Ordinal));
+
     public void MarkOnline(ClientAuthSession session, string channelId, string? remoteAddress)
     {
         session.Status = ClientAuthSessionStatus.NettyOnline;
@@ -77,6 +90,8 @@ public sealed class ClientAuthSession
 {
     public long Id { get; init; }
     public string TenantId { get; init; } = "default";
+    public long CredentialId { get; init; }
+    public long IdentityId { get; init; }
     public long ClientId { get; init; }
     public string ClientName { get; init; } = "";
     public string AccessToken { get; init; } = "";

@@ -1,4 +1,3 @@
-#include "crypto.h"
 #include "storage.h"
 
 #include <stdio.h>
@@ -18,12 +17,8 @@ int main(void)
         return 1;
     }
 
-    uint8_t expected[ST_SHA256_LEN];
-    uint8_t actual[ST_SHA256_LEN];
-    st_sha256((const uint8_t *)"test1234", strlen("test1234"), expected);
-    if (st_storage_load_client_hash(path, "Demo client", actual) != 0
-        || !st_constant_time_eq(expected, actual, sizeof(expected))) {
-        fprintf(stderr, "seeded client hash mismatch\n");
+    if (st_storage_client_enabled(path, "Demo client") != 0) {
+        fprintf(stderr, "seeded client enabled check failed\n");
         unlink(path);
         return 1;
     }
