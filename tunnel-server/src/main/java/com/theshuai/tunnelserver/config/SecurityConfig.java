@@ -64,25 +64,27 @@ public class SecurityConfig {
                 .formLogin(AbstractHttpConfigurer::disable)
                 /*
                  * CSP：管理后台为 React + HeroUI 构建产物,脚本是同源外部 bundle(/assets/*.js)。
-                 * - script-src 'self':外部模块脚本同源
+                 * - script-src 'self' + googletagmanager.com:外部模块脚本同源 + GA 主 loader
                  * - style-src 'self' 'unsafe-inline':HeroUI/framer-motion 会写内联 style 属性
-                 * - img-src / font-src 允许 data:;connect-src 允许 ws:/wss: 供 /ws/connections
+                 * - img-src / font-src 允许 data:;额外允许 GA pixel beacon 域
+                 * - connect-src 允许 ws:/wss: 供 /ws/connections,以及 GA4 /g/collect 上报域
                  * - form-action 'self' 阻止跨站表单提交;frame-ancestors 'none' 防 clickjacking
                  *
-                 * 同时加 Referrer-Policy: no-referrer 与 X-Frame-Options: DENY,给老浏览器兜底。
+                 * 同时加 Referrer-Policy: strict-origin-when-cross-origin（同源带完整 referrer
+                 * 让 GA 能识别站内跳转，跨域只发 origin 不泄露路径）与 X-Frame-Options: DENY。
                  */
                 .headers(headers -> headers
                         .contentSecurityPolicy(csp -> csp.policyDirectives(
                                 "default-src 'self'; "
-                                + "script-src 'self'; "
+                                + "script-src 'self' https://www.googletagmanager.com; "
                                 + "style-src 'self' 'unsafe-inline'; "
-                                + "img-src 'self' data:; "
+                                + "img-src 'self' data: https://www.google-analytics.com https://*.googletagmanager.com; "
                                 + "font-src 'self' data:; "
-                                + "connect-src 'self' ws: wss:; "
+                                + "connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com; "
                                 + "form-action 'self'; "
                                 + "frame-ancestors 'none'; "
                                 + "base-uri 'self'"))
-                        .referrerPolicy(rp -> rp.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.NO_REFERRER))
+                        .referrerPolicy(rp -> rp.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
                         .frameOptions(frame -> frame.deny()));
         return http.build();
     }
