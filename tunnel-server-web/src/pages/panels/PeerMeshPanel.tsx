@@ -17,7 +17,7 @@ import {
 import { adminApi } from "../../api/client";
 import type { PeerMeshAcl, PeerMeshDevice, PeerMeshSession, PeerMeshStatus } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
-import { formatDateTime } from "../../lib/format";
+import { formatBytes, formatDateTime } from "../../lib/format";
 
 export function PeerMeshPanel() {
   const [status, setStatus] = useState<PeerMeshStatus | null>(null);
@@ -55,6 +55,11 @@ export function PeerMeshPanel() {
   const enabledDevices = useMemo(() => devices.filter((device) => device.enabled), [devices]);
   const onlineDevices = useMemo(() => devices.filter((device) => device.online), [devices]);
   const directSessions = useMemo(() => sessions.filter((session) => session.pathType === "DIRECT"), [sessions]);
+  const relaySessions = useMemo(() => sessions.filter((session) => session.pathType === "RELAY"), [sessions]);
+  const peerTrafficBytes = useMemo(
+    () => sessions.reduce((total, session) => total + (session.directBytes || 0) + (session.relayBytes || 0), 0),
+    [sessions],
+  );
 
   const updateDevice = async (device: PeerMeshDevice, enabled: boolean) => {
     try {
@@ -95,6 +100,19 @@ export function PeerMeshPanel() {
     }
   };
 
+  const closeSession = async (session: PeerMeshSession) => {
+    if (!window.confirm(`确定断开 ${session.sourceClientName} -> ${session.targetClientName} 的 peer session 吗？`)) {
+      return;
+    }
+    try {
+      const closed = await adminApi.closePeerMeshSession(session.id);
+      setSessions((items) => items.map((item) => (item.id === closed.id ? closed : item)));
+      notify("Peer session 已断开");
+    } catch (error) {
+      notifyError(error, "断开 peer session 失败");
+    }
+  };
+
   return (
     <div className="mt-3 flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -107,11 +125,12 @@ export function PeerMeshPanel() {
         </Button>
       </div>
 
-      <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
         <MetricCard label="全局开关" value={status?.enabled ? "已开启" : "默认关闭"} tone={status?.enabled ? "success" : "default"} />
         <MetricCard label="已启用设备" value={`${enabledDevices.length} / ${devices.length}`} />
         <MetricCard label="在线设备" value={String(onlineDevices.length)} tone={onlineDevices.length > 0 ? "success" : "default"} />
-        <MetricCard label="Direct 会话" value={String(directSessions.length)} />
+        <MetricCard label="Direct / Relay" value={`${directSessions.length} / ${relaySessions.length}`} />
+        <MetricCard label="Peer 流量" value={formatBytes(peerTrafficBytes)} tone={peerTrafficBytes > 0 ? "success" : "default"} />
       </div>
 
       {!status?.enabled && (
@@ -250,8 +269,10 @@ export function PeerMeshPanel() {
                 <TableColumn>Peer</TableColumn>
                 <TableColumn>路径</TableColumn>
                 <TableColumn>RTT</TableColumn>
+                <TableColumn>流量</TableColumn>
                 <TableColumn>Endpoint</TableColumn>
                 <TableColumn>过期</TableColumn>
+                <TableColumn>操作</TableColumn>
               </TableHeader>
               <TableBody items={sessions} isLoading={loading} emptyContent="暂无 peer session">
                 {(session) => (
@@ -272,6 +293,13 @@ export function PeerMeshPanel() {
                     </TableCell>
                     <TableCell>{session.rttMillis == null ? "-" : `${session.rttMillis} ms`}</TableCell>
                     <TableCell>
+                      <div className="flex flex-col text-tiny">
+                        <span>direct {formatBytes(session.directBytes)}</span>
+                        <span className="text-default-400">relay {formatBytes(session.relayBytes)}</span>
+                        <span className="text-default-400">最后 {formatDateTime(session.lastTrafficAt)}</span>
+                      </div>
+                    </TableCell>
+                    <TableCell>
                       <div className="flex max-w-56 flex-col break-all text-tiny">
                         <span>local: {session.localEndpoint || "-"}</span>
                         <span className="text-default-400">remote: {session.remoteEndpoint || "-"}</span>
@@ -282,6 +310,17 @@ export function PeerMeshPanel() {
                         <span>{formatDateTime(session.expiresAt)}</span>
                         <span className="text-default-400">更新 {formatDateTime(session.updatedAt)}</span>
                       </div>
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        size="sm"
+                        color="danger"
+                        variant="flat"
+                        isDisabled={session.status === "CLOSED"}
+                        onPress={() => void closeSession(session)}
+                      >
+                        断开
+                      </Button>
                     </TableCell>
                   </TableRow>
                 )}

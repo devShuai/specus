@@ -11,6 +11,7 @@ public class PeerControlMessage {
     public static final String TYPE_SESSION_GRANT = "session-grant";
     public static final String TYPE_CANDIDATES = "candidates";
     public static final String TYPE_PATH_REPORT = "path-report";
+    public static final String TYPE_TRAFFIC_REPORT = "traffic-report";
     public static final String TYPE_CLOSE = "close";
 
     private String type;
@@ -24,6 +25,8 @@ public class PeerControlMessage {
     private String pathType;
     private String status;
     private Long rttMillis;
+    private long directBytes;
+    private long relayBytes;
     private String localEndpoint;
     private String remoteEndpoint;
     private String reason;

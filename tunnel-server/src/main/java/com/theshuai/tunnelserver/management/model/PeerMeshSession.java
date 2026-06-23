@@ -66,4 +66,13 @@ public class PeerMeshSession {
 
     @Column(name = "remote_endpoint", length = 255)
     private String remoteEndpoint;
+
+    @Column(name = "direct_bytes")
+    private long directBytes;
+
+    @Column(name = "relay_bytes")
+    private long relayBytes;
+
+    @Column(name = "last_traffic_at", length = 40)
+    private String lastTrafficAt;
 }

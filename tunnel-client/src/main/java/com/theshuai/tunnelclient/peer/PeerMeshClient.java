@@ -20,6 +20,7 @@ import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -53,6 +54,7 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile long relayAllocationExpiresAtMillis;
     private volatile long lastRelayCandidateRequestMillis;
     private volatile ScheduledExecutorService maintenanceExecutor;
+    private static final long SESSION_REFRESH_WINDOW_MILLIS = 120_000;
 
     public PeerMeshClient(ClientAuthLoginResponse.PeerMeshConfig config, ControlSender controlSender) {
         this.controlSender = controlSender;
@@ -205,6 +207,7 @@ public class PeerMeshClient implements AutoCloseable {
             next.remoteEndpoint = previous.remoteEndpoint;
             next.lastInboundSequence = previous.lastInboundSequence;
             next.relayTargetAllocationId = previous.relayTargetAllocationId;
+            next.directBytesSinceReport.addAndGet(previous.drainDirectBytes());
         }
         log.debug("Peer mesh session 已授权: session={}, peer={}", control.getSessionId(), peerId);
     }
@@ -217,6 +220,10 @@ public class PeerMeshClient implements AutoCloseable {
             }
             PeerInfo peer = peers.get(entry.getKey());
             if (peer == null || !StringUtils.hasText(peer.publicKey())) {
+                continue;
+            }
+            if (session.isExpired(System.currentTimeMillis())) {
+                sessions.remove(entry.getKey(), session);
                 continue;
             }
             PeerControlMessage control = new PeerControlMessage();
@@ -253,16 +260,38 @@ public class PeerMeshClient implements AutoCloseable {
             if (!peer.online() || !StringUtils.hasText(peer.clientName())) {
                 continue;
             }
+            PeerSession session = reusableSession(peer.clientId());
             PeerControlMessage message = new PeerControlMessage();
             message.setType(PeerControlMessage.TYPE_CANDIDATES);
             message.setSourceClientId(config.getClientId());
             message.setSourceClientName(config.getClientName());
             message.setTargetClientId(peer.clientId());
             message.setTargetClientName(peer.clientName());
+            if (session != null) {
+                message.setSessionId(session.sessionId());
+                message.setToken(session.token());
+                message.setExpiresAt(session.expiresAt());
+            }
             message.setCreatedAtMillis(System.currentTimeMillis());
             message.setCandidates(candidates);
             controlSender.send(peer.clientName(), JsonUtil.objectToString(message));
         }
+    }
+
+    private PeerSession reusableSession(long peerId) {
+        PeerSession session = sessions.get(peerId);
+        if (session == null) {
+            return null;
+        }
+        long now = System.currentTimeMillis();
+        if (session.isExpired(now)) {
+            sessions.remove(peerId, session);
+            return null;
+        }
+        if (session.isExpiringWithin(now, SESSION_REFRESH_WINDOW_MILLIS)) {
+            return null;
+        }
+        return session;
     }
 
     private void requestPeerServerCandidates() {
@@ -461,6 +490,8 @@ public class PeerMeshClient implements AutoCloseable {
         next.scheduleWithFixedDelay(() -> {
             try {
                 if (running) {
+                    reportTrafficDeltas();
+                    removeExpiredSessions();
                     requestPeerServerCandidates();
                     announceCandidatesToOnlinePeers();
                 }
@@ -580,6 +611,10 @@ public class PeerMeshClient implements AutoCloseable {
             if (session.aesKey() == null) {
                 continue;
             }
+            if (session.isExpired(System.currentTimeMillis())) {
+                sessions.remove(session.peerId(), session);
+                continue;
+            }
             PeerDataFrame frame = PeerDataFrameCodec.decode(
                     session.aesKey(),
                     raw,
@@ -592,6 +627,8 @@ public class PeerMeshClient implements AutoCloseable {
             session.remoteEndpoint = observedRemote;
             if (StringUtils.hasText(relayFromAllocationId)) {
                 session.relayTargetAllocationId = relayFromAllocationId;
+            } else {
+                session.addDirectBytes(raw.length);
             }
             log.debug("Peer mesh encrypted frame 收到: session={}, from={}, bytes={}",
                     frame.sessionId(), frame.fromClientId(), frame.plaintext().length);
@@ -632,6 +669,11 @@ public class PeerMeshClient implements AutoCloseable {
         } catch (Exception e) {
             log.debug("Peer mesh UDP check-response 发送失败: {}", e.getMessage());
         }
+    }
+
+    private void removeExpiredSessions() {
+        long now = System.currentTimeMillis();
+        sessions.entrySet().removeIf(entry -> entry.getValue().isExpired(now));
     }
 
     private void completeUdpProbe(PeerUdpProbe probe, InetSocketAddress observedRemote, String relayFromAllocationId) {
@@ -677,6 +719,29 @@ public class PeerMeshClient implements AutoCloseable {
         controlSender.send("", JsonUtil.objectToString(report));
     }
 
+    private void reportTrafficDeltas() {
+        if (controlSender == null || config == null) {
+            return;
+        }
+        for (PeerSession session : sessions.values()) {
+            long directBytes = session.drainDirectBytes();
+            if (directBytes <= 0) {
+                continue;
+            }
+            PeerControlMessage report = new PeerControlMessage();
+            report.setType(PeerControlMessage.TYPE_TRAFFIC_REPORT);
+            report.setSessionId(session.sessionId());
+            report.setSourceClientId(config.getClientId());
+            report.setSourceClientName(config.getClientName());
+            report.setTargetClientId(session.peerId());
+            PeerInfo peer = peers.get(session.peerId());
+            report.setTargetClientName(peer == null ? "" : peer.clientName());
+            report.setDirectBytes(directBytes);
+            report.setCreatedAtMillis(System.currentTimeMillis());
+            controlSender.send("", JsonUtil.objectToString(report));
+        }
+    }
+
     public boolean sendEncryptedPayload(String targetVirtualIp, byte[] payload) {
         if (!running || !StringUtils.hasText(targetVirtualIp) || payload == null) {
             return false;
@@ -710,6 +775,7 @@ public class PeerMeshClient implements AutoCloseable {
                 return sendRelayPayload(session.relayTargetAllocationId, frame);
             }
             socket.send(new DatagramPacket(frame, frame.length, session.remoteEndpoint));
+            session.addDirectBytes(frame.length);
             return true;
         } catch (Exception e) {
             log.debug("Peer mesh encrypted frame 发送失败: peer={}, reason={}", peer.clientName(), e.getMessage());
@@ -847,6 +913,7 @@ public class PeerMeshClient implements AutoCloseable {
         private final String expiresAt;
         private final byte[] aesKey;
         private final AtomicLong outboundSequence = new AtomicLong();
+        private final AtomicLong directBytesSinceReport = new AtomicLong();
         private volatile long lastInboundSequence = -1;
         private volatile InetSocketAddress remoteEndpoint;
         private volatile String relayTargetAllocationId;
@@ -862,6 +929,7 @@ public class PeerMeshClient implements AutoCloseable {
         PeerSession withAesKey(byte[] nextKey) {
             PeerSession next = new PeerSession(sessionId, peerId, token, expiresAt, nextKey);
             next.outboundSequence.set(outboundSequence.get());
+            next.directBytesSinceReport.set(directBytesSinceReport.get());
             next.remoteEndpoint = remoteEndpoint;
             next.lastInboundSequence = lastInboundSequence;
             next.relayTargetAllocationId = relayTargetAllocationId;
@@ -880,12 +948,16 @@ public class PeerMeshClient implements AutoCloseable {
             return token;
         }
 
+        String expiresAt() {
+            return expiresAt;
+        }
+
         byte[] aesKey() {
             return aesKey;
         }
 
         boolean canSend() {
-            return aesKey != null && remoteEndpoint != null;
+            return aesKey != null && remoteEndpoint != null && !isExpired(System.currentTimeMillis());
         }
 
         long nextOutboundSequence() {
@@ -898,6 +970,37 @@ public class PeerMeshClient implements AutoCloseable {
             }
             lastInboundSequence = sequence;
             return true;
+        }
+
+        void addDirectBytes(long bytes) {
+            if (bytes > 0) {
+                directBytesSinceReport.addAndGet(bytes);
+            }
+        }
+
+        long drainDirectBytes() {
+            return directBytesSinceReport.getAndSet(0);
+        }
+
+        boolean isExpired(long nowMillis) {
+            long expiresAtMillis = expiresAtMillis();
+            return expiresAtMillis != Long.MAX_VALUE && expiresAtMillis <= nowMillis;
+        }
+
+        boolean isExpiringWithin(long nowMillis, long windowMillis) {
+            long expiresAtMillis = expiresAtMillis();
+            return expiresAtMillis != Long.MAX_VALUE && expiresAtMillis - nowMillis <= windowMillis;
+        }
+
+        private long expiresAtMillis() {
+            if (!StringUtils.hasText(expiresAt)) {
+                return Long.MAX_VALUE;
+            }
+            try {
+                return Instant.parse(expiresAt).toEpochMilli();
+            } catch (Exception ignored) {
+                return Long.MAX_VALUE;
+            }
         }
     }
 

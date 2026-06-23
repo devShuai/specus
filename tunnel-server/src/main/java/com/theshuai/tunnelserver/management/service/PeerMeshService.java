@@ -20,6 +20,7 @@ import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.security.PasswordService;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -213,15 +214,11 @@ public class PeerMeshService {
         if (report.getSessionId() == null || report.getSessionId() <= 0) {
             throw new IllegalArgumentException("sessionId is required");
         }
-        PeerMeshSession session = sessionRepository.findById(report.getSessionId())
-                .filter(row -> row.getTenantId().equals(reporter.getTenantId()))
-                .orElseThrow(() -> new IllegalArgumentException("peer session not found: " + report.getSessionId()));
-        boolean reporterInSession = reporter.getId().equals(session.getSourceClientId())
-                || reporter.getId().equals(session.getTargetClientId());
-        if (!reporterInSession) {
-            throw new IllegalArgumentException("peer session report source mismatch");
-        }
+        PeerMeshSession session = findReportableSession(reporter, report.getSessionId());
         Instant now = Instant.now();
+        if (closeIfExpired(session, now)) {
+            return toSessionView(sessionRepository.save(session));
+        }
         if (StringUtils.hasText(report.getPathType())) {
             session.setPathType(limit(report.getPathType(), 40));
         }
@@ -235,8 +232,53 @@ public class PeerMeshService {
         return toSessionView(sessionRepository.save(session));
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
+    public PeerMeshSessionView reportTraffic(ClientAccount reporter, PeerControlMessage report) {
+        if (report.getSessionId() == null || report.getSessionId() <= 0) {
+            throw new IllegalArgumentException("sessionId is required");
+        }
+        PeerMeshSession session = findReportableSession(reporter, report.getSessionId());
+        Instant now = Instant.now();
+        if (!closeIfExpired(session, now)) {
+            applyTraffic(session, Math.max(0, report.getDirectBytes()), Math.max(0, report.getRelayBytes()), now);
+        }
+        return toSessionView(sessionRepository.save(session));
+    }
+
+    @Transactional
+    public void recordRelayTraffic(long sessionId, long bytes) {
+        if (sessionId <= 0 || bytes <= 0) {
+            return;
+        }
+        sessionRepository.findById(sessionId).ifPresent(session -> {
+            Instant now = Instant.now();
+            if (!closeIfExpired(session, now)) {
+                applyTraffic(session, 0, bytes, now);
+            }
+            sessionRepository.save(session);
+        });
+    }
+
+    @Transactional
+    public PeerMeshSessionView closeSession(ClientAccount reporter, PeerControlMessage close) {
+        if (close.getSessionId() == null || close.getSessionId() <= 0) {
+            throw new IllegalArgumentException("sessionId is required");
+        }
+        PeerMeshSession session = findReportableSession(reporter, close.getSessionId());
+        markClosed(session, Instant.now());
+        return toSessionView(sessionRepository.save(session));
+    }
+
+    @Transactional
+    public PeerMeshSessionView closeSession(ManagementContext context, long sessionId) {
+        PeerMeshSession session = findAccessibleSession(context, sessionId);
+        markClosed(session, Instant.now());
+        return toSessionView(sessionRepository.save(session));
+    }
+
+    @Transactional
     public List<PeerMeshSessionView> listSessions(ManagementContext context, int limit) {
+        expireStaleSessionsBatch(Instant.now(), 500);
         int pageSize = Math.clamp(limit, 1, 200);
         List<PeerMeshSession> sessions;
         if (context.isAdmin()) {
@@ -255,6 +297,12 @@ public class PeerMeshService {
                     context.tenant().tenantId(), visible, PageRequest.of(0, pageSize));
         }
         return sessions.stream().map(this::toSessionView).toList();
+    }
+
+    @Scheduled(fixedDelayString = "${tunnel.peer-mesh.session-cleanup-interval-ms:60000}")
+    @Transactional
+    public void expireStaleSessions() {
+        expireStaleSessionsBatch(Instant.now(), 500);
     }
 
     @Transactional(readOnly = true)
@@ -379,6 +427,9 @@ public class PeerMeshService {
                 session.getRttMillis(),
                 session.getLocalEndpoint(),
                 session.getRemoteEndpoint(),
+                session.getDirectBytes(),
+                session.getRelayBytes(),
+                session.getLastTrafficAt(),
                 session.getStartedAt(),
                 session.getUpdatedAt(),
                 session.getExpiresAt(),
@@ -391,6 +442,102 @@ public class PeerMeshService {
             return properties.getPublicAddress().trim();
         }
         return StringUtils.hasText(requestServerName) ? requestServerName.trim() : "";
+    }
+
+    private PeerMeshSession findReportableSession(ClientAccount reporter, long sessionId) {
+        PeerMeshSession session = sessionRepository.findById(sessionId)
+                .filter(row -> row.getTenantId().equals(reporter.getTenantId()))
+                .orElseThrow(() -> new IllegalArgumentException("peer session not found: " + sessionId));
+        boolean reporterInSession = reporter.getId().equals(session.getSourceClientId())
+                || reporter.getId().equals(session.getTargetClientId());
+        if (!reporterInSession) {
+            throw new IllegalArgumentException("peer session report source mismatch");
+        }
+        return session;
+    }
+
+    private PeerMeshSession findAccessibleSession(ManagementContext context, long sessionId) {
+        PeerMeshSession session = sessionRepository.findById(sessionId)
+                .filter(row -> row.getTenantId().equals(context.tenant().tenantId()))
+                .orElseThrow(() -> new IllegalArgumentException("peer session not found: " + sessionId));
+        if (context.isAdmin() || ownsClient(context, session.getSourceClientId()) || ownsClient(context, session.getTargetClientId())) {
+            return session;
+        }
+        throw new IllegalArgumentException("peer session not found: " + sessionId);
+    }
+
+    private boolean ownsClient(ManagementContext context, Long clientId) {
+        if (clientId == null) {
+            return false;
+        }
+        return clientAccountRepository
+                .findByIdAndTenantIdAndOwnerUsername(clientId, context.tenant().tenantId(), context.username())
+                .isPresent();
+    }
+
+    private void applyTraffic(PeerMeshSession session, long directBytes, long relayBytes, Instant now) {
+        if (directBytes <= 0 && relayBytes <= 0) {
+            return;
+        }
+        session.setDirectBytes(saturatedAdd(session.getDirectBytes(), directBytes));
+        session.setRelayBytes(saturatedAdd(session.getRelayBytes(), relayBytes));
+        session.setLastTrafficAt(now.toString());
+        session.setUpdatedAt(now.toString());
+    }
+
+    private int expireStaleSessionsBatch(Instant now, int limit) {
+        List<PeerMeshSession> expired = sessionRepository
+                .findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(
+                        STATUS_CLOSED,
+                        now.toString(),
+                        PageRequest.of(0, Math.clamp(limit, 1, 1000)));
+        for (PeerMeshSession session : expired) {
+            markClosed(session, now);
+        }
+        if (!expired.isEmpty()) {
+            sessionRepository.saveAll(expired);
+        }
+        return expired.size();
+    }
+
+    private boolean closeIfExpired(PeerMeshSession session, Instant now) {
+        if (STATUS_CLOSED.equals(session.getStatus())) {
+            return true;
+        }
+        if (!isExpired(session, now)) {
+            return false;
+        }
+        markClosed(session, now);
+        return true;
+    }
+
+    private boolean isExpired(PeerMeshSession session, Instant now) {
+        if (!StringUtils.hasText(session.getExpiresAt())) {
+            return false;
+        }
+        try {
+            return !Instant.parse(session.getExpiresAt()).isAfter(now);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void markClosed(PeerMeshSession session, Instant now) {
+        if (!STATUS_CLOSED.equals(session.getStatus())) {
+            session.setStatus(STATUS_CLOSED);
+        }
+        if (!StringUtils.hasText(session.getClosedAt())) {
+            session.setClosedAt(now.toString());
+        }
+        session.setUpdatedAt(now.toString());
+    }
+
+    private long saturatedAdd(long current, long delta) {
+        if (delta <= 0) {
+            return current;
+        }
+        long next = current + delta;
+        return next < 0 ? Long.MAX_VALUE : next;
     }
 
     private String serverPublicKey() {

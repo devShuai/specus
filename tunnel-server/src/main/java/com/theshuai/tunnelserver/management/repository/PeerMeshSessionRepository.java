@@ -10,6 +10,11 @@ import java.util.List;
 public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession, Long> {
     List<PeerMeshSession> findByTenantIdOrderByUpdatedAtDesc(String tenantId, Pageable pageable);
 
+    List<PeerMeshSession> findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(
+            String status,
+            String expiresAt,
+            Pageable pageable);
+
     @Query("""
             select s from PeerMeshSession s
             where s.tenantId = :tenantId

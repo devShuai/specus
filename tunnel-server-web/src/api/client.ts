@@ -341,6 +341,7 @@ export const adminApi = {
     request<PeerMeshAcl>("/peer-mesh/acls", { method: "POST", body: JSON.stringify(body) }),
   deletePeerMeshAcl: (id: number) => request<null>(`/peer-mesh/acls/${id}`, { method: "DELETE" }),
   listPeerMeshSessions: (limit = 100) => request<PeerMeshSession[]>(`/peer-mesh/sessions?limit=${limit}`),
+  closePeerMeshSession: (id: number) => request<PeerMeshSession>(`/peer-mesh/sessions/${id}`, { method: "DELETE" }),
 
   listClientDownloads: () => request<ClientDownloadLink[]>(`/client-downloads`),
   createClientDownload: (body: ClientDownloadLinkMutation) =>

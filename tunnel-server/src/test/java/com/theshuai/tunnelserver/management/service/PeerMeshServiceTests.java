@@ -2,16 +2,19 @@ package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
+import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.PeerMeshAcl;
 import com.theshuai.tunnelserver.management.model.PeerMeshDevice;
+import com.theshuai.tunnelserver.management.model.PeerMeshSession;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshSessionRepository;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -75,6 +78,58 @@ class PeerMeshServiceTests {
         assertThat(config.getStunPort()).isEqualTo(3478);
     }
 
+    @Test
+    void trafficReportAccumulatesDirectAndRelayBytes() {
+        PeerMeshSession session = activeSession();
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PeerControlMessage report = new PeerControlMessage();
+        report.setSessionId(100L);
+        report.setDirectBytes(120);
+        report.setRelayBytes(30);
+
+        var view = service.reportTraffic(client(1, "alice", "a"), report);
+
+        assertThat(view.directBytes()).isEqualTo(120);
+        assertThat(view.relayBytes()).isEqualTo(30);
+        assertThat(view.lastTrafficAt()).isNotBlank();
+        assertThat(view.status()).isEqualTo(PeerMeshService.STATUS_ACTIVE);
+    }
+
+    @Test
+    void expiredTrafficReportClosesSessionWithoutAddingBytes() {
+        PeerMeshSession session = activeSession();
+        session.setExpiresAt(Instant.now().minusSeconds(5).toString());
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PeerControlMessage report = new PeerControlMessage();
+        report.setSessionId(100L);
+        report.setDirectBytes(120);
+
+        var view = service.reportTraffic(client(1, "alice", "a"), report);
+
+        assertThat(view.status()).isEqualTo(PeerMeshService.STATUS_CLOSED);
+        assertThat(view.directBytes()).isZero();
+        assertThat(view.closedAt()).isNotBlank();
+    }
+
+    @Test
+    void closeSessionMarksSessionClosed() {
+        PeerMeshSession session = activeSession();
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PeerControlMessage close = new PeerControlMessage();
+        close.setSessionId(100L);
+
+        var view = service.closeSession(client(2, "alice", "b"), close);
+
+        assertThat(view.status()).isEqualTo(PeerMeshService.STATUS_CLOSED);
+        assertThat(view.closedAt()).isNotBlank();
+    }
+
     private ClientAccount client(long id, String owner, String name) {
         ClientAccount account = new ClientAccount();
         account.setId(id);
@@ -83,5 +138,22 @@ class PeerMeshServiceTests {
         account.setClientName(name);
         account.setEnabled(true);
         return account;
+    }
+
+    private PeerMeshSession activeSession() {
+        Instant now = Instant.now();
+        PeerMeshSession session = new PeerMeshSession();
+        session.setId(100L);
+        session.setTenantId("tenant-a");
+        session.setSourceClientId(1L);
+        session.setSourceClientName("a");
+        session.setTargetClientId(2L);
+        session.setTargetClientName("b");
+        session.setPathType(PeerMeshService.PATH_DIRECT);
+        session.setStatus(PeerMeshService.STATUS_ACTIVE);
+        session.setStartedAt(now.toString());
+        session.setUpdatedAt(now.toString());
+        session.setExpiresAt(now.plusSeconds(60).toString());
+        return session;
     }
 }

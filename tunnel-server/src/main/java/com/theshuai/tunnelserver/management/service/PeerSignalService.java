@@ -7,6 +7,8 @@ import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.session.Session;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
+import com.theshuai.tunnelserver.management.model.PeerMeshSessionView;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
@@ -44,6 +46,16 @@ public class PeerSignalService {
         if (PeerControlMessage.TYPE_PATH_REPORT.equals(signal.getType())) {
             peerMeshService.reportPath(source, signal);
             return;
+        }
+        if (PeerControlMessage.TYPE_TRAFFIC_REPORT.equals(signal.getType())) {
+            peerMeshService.reportTraffic(source, signal);
+            return;
+        }
+        if (PeerControlMessage.TYPE_CLOSE.equals(signal.getType())) {
+            peerMeshService.closeSession(source, signal);
+            if (!StringUtils.hasText(request.getToClientName())) {
+                return;
+            }
         }
 
         if (!StringUtils.hasText(request.getToClientName())) {
@@ -91,6 +103,23 @@ public class PeerSignalService {
         packet.setMessageType(MessageType.PEER_CONTROL);
         packet.setMessage(JsonUtil.objectToString(message));
         channel.writeAndFlush(packet);
+    }
+
+    public PeerMeshSessionView forceClose(ManagementContext context, long sessionId) {
+        PeerMeshSessionView closed = peerMeshService.closeSession(context, sessionId);
+        PeerControlMessage close = new PeerControlMessage();
+        close.setType(PeerControlMessage.TYPE_CLOSE);
+        close.setSessionId(closed.id());
+        close.setSourceClientId(closed.sourceClientId());
+        close.setSourceClientName(closed.sourceClientName());
+        close.setTargetClientId(closed.targetClientId());
+        close.setTargetClientName(closed.targetClientName());
+        close.setStatus(closed.status());
+        close.setReason("admin-force-close");
+        close.setCreatedAtMillis(System.currentTimeMillis());
+        sendCloseIfOnline(closed.sourceClientName(), close);
+        sendCloseIfOnline(closed.targetClientName(), close);
+        return closed;
     }
 
     private PeerControlMessage parseSignal(String raw) {
@@ -152,5 +181,16 @@ public class PeerSignalService {
                         sourceClientName, targetClientName, future.cause());
             }
         });
+    }
+
+    private void sendCloseIfOnline(String clientName, PeerControlMessage signal) {
+        if (!StringUtils.hasText(clientName)) {
+            return;
+        }
+        Channel channel = SessionUtil.getChannel(clientName);
+        if (channel == null || !SessionUtil.hasLogin(channel)) {
+            return;
+        }
+        sendSignal(channel, "server", clientName, signal);
     }
 }

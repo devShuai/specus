@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.management.model.PeerMeshDeviceView;
 import com.theshuai.tunnelserver.management.model.PeerMeshSessionView;
 import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import com.theshuai.tunnelserver.management.service.PeerMeshService;
+import com.theshuai.tunnelserver.management.service.PeerSignalService;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -25,10 +26,14 @@ import java.util.Map;
 @RequestMapping("/api/admin/peer-mesh")
 public class PeerMeshResource {
     private final PeerMeshService peerMeshService;
+    private final PeerSignalService peerSignalService;
     private final ManagementContextResolver contextResolver;
 
-    public PeerMeshResource(PeerMeshService peerMeshService, ManagementContextResolver contextResolver) {
+    public PeerMeshResource(PeerMeshService peerMeshService,
+                            PeerSignalService peerSignalService,
+                            ManagementContextResolver contextResolver) {
         this.peerMeshService = peerMeshService;
+        this.peerSignalService = peerSignalService;
         this.contextResolver = contextResolver;
     }
 
@@ -71,5 +76,10 @@ public class PeerMeshResource {
     public List<PeerMeshSessionView> sessions(@AuthenticationPrincipal Jwt jwt,
                                               @RequestParam(defaultValue = "100") int limit) {
         return peerMeshService.listSessions(contextResolver.resolve(jwt), limit);
+    }
+
+    @DeleteMapping("/sessions/{id}")
+    public PeerMeshSessionView closeSession(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
+        return peerSignalService.forceClose(contextResolver.resolve(jwt), id);
     }
 }

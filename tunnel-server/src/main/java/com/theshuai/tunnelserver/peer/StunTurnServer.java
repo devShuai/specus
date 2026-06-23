@@ -1,8 +1,10 @@
 package com.theshuai.tunnelserver.peer;
 
+import com.theshuai.common.peermesh.PeerDataFrameHeader;
 import com.theshuai.common.peermesh.PeerRelayMessage;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
+import com.theshuai.tunnelserver.management.service.PeerMeshService;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.ApplicationArguments;
@@ -15,6 +17,7 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -24,14 +27,16 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 public class StunTurnServer implements ApplicationRunner {
     private final PeerMeshProperties properties;
+    private final PeerMeshService peerMeshService;
     private final Map<String, Allocation> allocations = new ConcurrentHashMap<>();
     private final Map<String, String> allocationByEndpoint = new ConcurrentHashMap<>();
     private DatagramSocket socket;
     private Thread thread;
     private volatile boolean running;
 
-    public StunTurnServer(PeerMeshProperties properties) {
+    public StunTurnServer(PeerMeshProperties properties, PeerMeshService peerMeshService) {
         this.properties = properties;
+        this.peerMeshService = peerMeshService;
     }
 
     @Override
@@ -155,6 +160,17 @@ public class StunTurnServer implements ApplicationRunner {
         if (target == null) {
             sendRelayResponse(remote, error(request, "target-allocation-not-found"));
             return;
+        }
+        byte[] payload;
+        try {
+            payload = Base64.getDecoder().decode(request.getPayloadBase64());
+        } catch (Exception e) {
+            sendRelayResponse(remote, error(request, "invalid-payload"));
+            return;
+        }
+        PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
+        if (header != null) {
+            peerMeshService.recordRelayTraffic(header.sessionId(), payload.length);
         }
         PeerRelayMessage data = new PeerRelayMessage();
         data.setType(PeerRelayMessage.TYPE_DATA);
