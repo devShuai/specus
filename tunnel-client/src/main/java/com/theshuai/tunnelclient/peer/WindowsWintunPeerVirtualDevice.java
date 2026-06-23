@@ -11,9 +11,13 @@ import org.springframework.util.StringUtils;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -139,12 +143,73 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
     }
 
     private Wintun loadWintun() {
-        String library = System.getProperty("shuai.peerMesh.wintunDll", "wintun");
-        try {
-            return Native.load(library, Wintun.class, W32APIOptions.UNICODE_OPTIONS);
-        } catch (UnsatisfiedLinkError e) {
-            throw new IllegalStateException("加载 wintun.dll 失败，可将 wintun.dll 放到工作目录/PATH，或设置 -Dshuai.peerMesh.wintunDll=完整路径", e);
+        String configuredLibrary = System.getProperty("shuai.peerMesh.wintunDll");
+        if (StringUtils.hasText(configuredLibrary)) {
+            try {
+                return Native.load(configuredLibrary, Wintun.class, W32APIOptions.UNICODE_OPTIONS);
+            } catch (UnsatisfiedLinkError e) {
+                throw new IllegalStateException("加载指定的 wintun.dll 失败: " + configuredLibrary, e);
+            }
         }
+        Path bundled = extractBundledWintun();
+        if (bundled != null) {
+            try {
+                return Native.load(bundled.toAbsolutePath().toString(), Wintun.class, W32APIOptions.UNICODE_OPTIONS);
+            } catch (UnsatisfiedLinkError e) {
+                throw new IllegalStateException("加载随包 wintun.dll 失败: " + bundled, e);
+            }
+        }
+        try {
+            return Native.load("wintun", Wintun.class, W32APIOptions.UNICODE_OPTIONS);
+        } catch (UnsatisfiedLinkError e) {
+            throw new IllegalStateException("加载 wintun.dll 失败，客户端包内没有对应架构的 native/windows/*/wintun.dll；"
+                    + "可将 wintun.dll 放到工作目录/PATH，或设置 -Dshuai.peerMesh.wintunDll=完整路径", e);
+        }
+    }
+
+    private Path extractBundledWintun() {
+        String arch = nativeArch();
+        if (!StringUtils.hasText(arch)) {
+            return null;
+        }
+        String resource = "native/windows/" + arch + "/wintun.dll";
+        try (InputStream input = WindowsWintunPeerVirtualDevice.class.getClassLoader().getResourceAsStream(resource)) {
+            if (input == null) {
+                return null;
+            }
+            Path targetDir = nativeCacheDir().resolve("windows").resolve(arch);
+            Files.createDirectories(targetDir);
+            Path target = targetDir.resolve("wintun.dll");
+            if (Files.exists(target)) {
+                return target;
+            }
+            Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING);
+            return target;
+        } catch (Exception e) {
+            throw new IllegalStateException("解压随包 wintun.dll 失败: " + resource, e);
+        }
+    }
+
+    private Path nativeCacheDir() {
+        String localAppData = System.getenv("LOCALAPPDATA");
+        if (StringUtils.hasText(localAppData)) {
+            return Path.of(localAppData, "shuai-tunnel", "native");
+        }
+        return Path.of(System.getProperty("java.io.tmpdir"), "shuai-tunnel", "native");
+    }
+
+    private String nativeArch() {
+        String osArch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        if (osArch.equals("amd64") || osArch.equals("x86_64")) {
+            return "x86_64";
+        }
+        if (osArch.equals("aarch64") || osArch.equals("arm64")) {
+            return "aarch64";
+        }
+        if (osArch.equals("x86") || osArch.equals("i386") || osArch.equals("i686")) {
+            return "x86";
+        }
+        return "";
     }
 
     private void configureInterface(String name, String virtualIp, String cidr, int mtu) {
