@@ -217,7 +217,7 @@ public class PeerMeshClient implements AutoCloseable {
         PeerSession previous = sessions.put(peerId, next);
         if (previous != null) {
             next.remoteEndpoint = previous.remoteEndpoint;
-            next.lastInboundSequence = previous.lastInboundSequence;
+            next.inboundReplayWindow = previous.inboundReplayWindow.copy();
             next.relayTargetAllocationId = previous.relayTargetAllocationId;
             next.directBytesSinceReport.addAndGet(previous.drainDirectBytes());
         }
@@ -244,8 +244,6 @@ public class PeerMeshClient implements AutoCloseable {
             byte[] aesKey = deriveSessionKey(control, session.peerId(), peer.publicKey());
             if (aesKey != null) {
                 PeerSession next = session.withAesKey(aesKey);
-                next.remoteEndpoint = session.remoteEndpoint;
-                next.lastInboundSequence = session.lastInboundSequence;
                 sessions.put(entry.getKey(), next);
             }
         }
@@ -1001,7 +999,7 @@ public class PeerMeshClient implements AutoCloseable {
         private final byte[] aesKey;
         private final AtomicLong outboundSequence = new AtomicLong();
         private final AtomicLong directBytesSinceReport = new AtomicLong();
-        private volatile long lastInboundSequence = -1;
+        private volatile PeerReplayWindow inboundReplayWindow = new PeerReplayWindow();
         private volatile long lastDirectSuccessMillis;
         private volatile long lastRelaySuccessMillis;
         private volatile String currentPathType = "";
@@ -1021,7 +1019,7 @@ public class PeerMeshClient implements AutoCloseable {
             next.outboundSequence.set(outboundSequence.get());
             next.directBytesSinceReport.set(directBytesSinceReport.get());
             next.remoteEndpoint = remoteEndpoint;
-            next.lastInboundSequence = lastInboundSequence;
+            next.inboundReplayWindow = inboundReplayWindow.copy();
             next.relayTargetAllocationId = relayTargetAllocationId;
             next.lastDirectSuccessMillis = lastDirectSuccessMillis;
             next.lastRelaySuccessMillis = lastRelaySuccessMillis;
@@ -1058,11 +1056,7 @@ public class PeerMeshClient implements AutoCloseable {
         }
 
         boolean acceptInboundSequence(long sequence) {
-            if (sequence <= lastInboundSequence) {
-                return false;
-            }
-            lastInboundSequence = sequence;
-            return true;
+            return inboundReplayWindow.accept(sequence);
         }
 
         void addDirectBytes(long bytes) {
