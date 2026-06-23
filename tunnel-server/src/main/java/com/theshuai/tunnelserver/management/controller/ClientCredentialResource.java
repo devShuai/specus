@@ -4,7 +4,7 @@ import com.theshuai.tunnelserver.management.service.ClientCredentialService;
 import com.theshuai.tunnelserver.management.service.ClientCredentialService.ClientCredentialView;
 import com.theshuai.tunnelserver.management.service.ClientCredentialService.CredentialMutation;
 import com.theshuai.tunnelserver.management.service.ClientCredentialService.CredentialResult;
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -24,36 +24,36 @@ import java.util.List;
 @RequestMapping("/api/admin/client-credentials")
 public class ClientCredentialResource {
     private final ClientCredentialService credentialService;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
     public ClientCredentialResource(ClientCredentialService credentialService,
-                                    TenantResolver tenantResolver) {
+                                    ManagementContextResolver contextResolver) {
         this.credentialService = credentialService;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @GetMapping
     public List<ClientCredentialView> list(@AuthenticationPrincipal Jwt jwt) {
-        return credentialService.list(tenantResolver.resolve(jwt));
+        return credentialService.list(contextResolver.resolve(jwt));
     }
 
     @PostMapping
     public ResponseEntity<CredentialResult> create(@AuthenticationPrincipal Jwt jwt,
                                                    @RequestBody CredentialMutation request) {
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(credentialService.create(tenantResolver.resolve(jwt), request));
+                .body(credentialService.create(contextResolver.resolve(jwt), request));
     }
 
     @PutMapping("/{id}")
     public CredentialResult update(@AuthenticationPrincipal Jwt jwt,
                                    @PathVariable long id,
                                    @RequestBody CredentialMutation request) {
-        return credentialService.update(tenantResolver.resolve(jwt), id, request);
+        return credentialService.update(contextResolver.resolve(jwt), id, request);
     }
 
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> delete(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
-        credentialService.delete(tenantResolver.resolve(jwt), id);
+        credentialService.delete(contextResolver.resolve(jwt), id);
         return ResponseEntity.noContent().build();
     }
 }

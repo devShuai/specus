@@ -1,5 +1,9 @@
 package com.theshuai.tunnelserver.management.controller;
 
+import com.theshuai.tunnelserver.management.model.ManagementRole;
+import com.theshuai.tunnelserver.management.service.ManagementUserService;
+import com.theshuai.tunnelserver.management.service.ManagementUserService.LoginUser;
+import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import com.theshuai.tunnelserver.security.LocalTokenService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -19,17 +23,23 @@ import java.util.Map;
 @RestController
 public class AuthController {
     private final LocalTokenService localTokenService;
+    private final ManagementUserService managementUserService;
 
-    public AuthController(LocalTokenService localTokenService) {
+    public AuthController(LocalTokenService localTokenService,
+                          ManagementUserService managementUserService) {
         this.localTokenService = localTokenService;
+        this.managementUserService = managementUserService;
     }
 
     @PostMapping("/auth/login")
     public ResponseEntity<?> login(@RequestBody(required = false) LoginRequest request) {
-        if (request == null || !localTokenService.authenticate(request.username(), request.password())) {
+        if (request == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "用户名或密码错误"));
         }
-        return ResponseEntity.ok(buildTokenBody(request.username()));
+        return managementUserService.authenticate(request.username(), request.password())
+                .<ResponseEntity<?>>map(user -> ResponseEntity.ok(buildTokenBody(user)))
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(Map.of("error", "用户名或密码错误")));
     }
 
     /**
@@ -42,12 +52,17 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                     .body(Map.of("error", "OIDC 令牌不能通过该端点续期"));
         }
-        return ResponseEntity.ok(buildTokenBody(jwt.getSubject()));
+        LoginUser user = new LoginUser(
+                jwt.getSubject(),
+                claimAsString(jwt, TenantResolver.LOCAL_TENANT_CLAIM),
+                ManagementRole.parse(claimAsString(jwt, "role")),
+                "ADMIN".equalsIgnoreCase(claimAsString(jwt, "role")));
+        return ResponseEntity.ok(buildTokenBody(user));
     }
 
-    private Map<String, Object> buildTokenBody(String username) {
+    private Map<String, Object> buildTokenBody(LoginUser user) {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("accessToken", localTokenService.issueToken(username));
+        body.put("accessToken", localTokenService.issueToken(user.username(), user.tenantId(), user.role()));
         body.put("tokenType", "Bearer");
         body.put("expiresIn", localTokenService.getTtlSeconds());
         return body;

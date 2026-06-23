@@ -31,6 +31,7 @@ public class DatabaseInitializer {
     private final boolean seedDemoClient;
     private final String databasePlatform;
     private final String defaultTenantId;
+    private final String adminUsername;
 
     public DatabaseInitializer(ClientAccountRepository clientAccountRepository,
                                ClientCredentialRepository clientCredentialRepository,
@@ -38,7 +39,8 @@ public class DatabaseInitializer {
                                JdbcTemplate jdbcTemplate,
                                @Value("${tunnel.database.seed-demo-client:true}") boolean seedDemoClient,
                                @Value("${spring.jpa.database-platform:auto}") String databasePlatform,
-                               @Value("${tunnel.auth.tenant-id:default}") String defaultTenantId) {
+                               @Value("${tunnel.auth.tenant-id:default}") String defaultTenantId,
+                               @Value("${tunnel.auth.username:admin}") String adminUsername) {
         this.clientAccountRepository = clientAccountRepository;
         this.clientCredentialRepository = clientCredentialRepository;
         this.clientAuthProperties = clientAuthProperties;
@@ -46,6 +48,7 @@ public class DatabaseInitializer {
         this.seedDemoClient = seedDemoClient;
         this.databasePlatform = databasePlatform;
         this.defaultTenantId = TenantContext.normalize(defaultTenantId);
+        this.adminUsername = normalizeAdminUsername(adminUsername);
     }
 
     @PostConstruct
@@ -62,12 +65,14 @@ public class DatabaseInitializer {
     public synchronized Map<String, Object> initialize(TenantContext tenant) {
         widenHttpBodyTextColumns();
         backfillDefaultTenant();
+        backfillDefaultOwner();
         if (seedDemoClient && clientAccountRepository
                 .findByTenantIdAndClientName(tenant.tenantId(), "Demo client").isEmpty()) {
             String now = Instant.now().toString();
             ClientAccount client = new ClientAccount();
             client.setId(ClientIdGenerator.newId());
             client.setTenantId(tenant.tenantId());
+            client.setOwnerUsername(adminUsername);
             client.setClientName("Demo client");
             client.setPasswordHash(PasswordService.hash("test1234"));
             client.setEnabled(true);
@@ -81,6 +86,7 @@ public class DatabaseInitializer {
             ClientCredential credential = new ClientCredential();
             credential.setId(ClientIdGenerator.newId());
             credential.setTenantId(tenant.tenantId());
+            credential.setOwnerUsername(adminUsername);
             credential.setApiKey("demo-client");
             credential.setSecretHash(PasswordService.hash("test1234"));
             credential.setEnabled(true);
@@ -123,6 +129,21 @@ public class DatabaseInitializer {
         }
     }
 
+    private void backfillDefaultOwner() {
+        for (String table : List.of("tunnel_client_account", "tunnel_client_credential")) {
+            try {
+                int rows = jdbcTemplate.update(
+                        "update " + table + " set owner_username = ? where owner_username is null or owner_username = ''",
+                        adminUsername);
+                if (rows > 0) {
+                    log.info("[tenant] backfilled {} row(s) in {} to owner '{}'", rows, table, adminUsername);
+                }
+            } catch (DataAccessException e) {
+                log.debug("[tenant] skip owner backfill for {}: {}", table, e.getMessage());
+            }
+        }
+    }
+
     private void widenHttpBodyTextColumns() {
         String normalizedPlatform = databasePlatform == null ? "" : databasePlatform.toLowerCase();
         List<String> sql = List.of();
@@ -144,6 +165,13 @@ public class DatabaseInitializer {
                 log.debug("[schema] skip widening HTTP body text column with '{}': {}", statement, e.getMessage());
             }
         }
+    }
+
+    private String normalizeAdminUsername(String username) {
+        if (username == null || username.isBlank()) {
+            return "admin";
+        }
+        return username.trim();
     }
 
 }

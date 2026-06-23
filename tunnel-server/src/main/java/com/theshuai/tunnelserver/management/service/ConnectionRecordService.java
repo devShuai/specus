@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.management.model.ConnectionRecord;
 import com.theshuai.tunnelserver.management.model.ConnectionRecordView;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.websocket.ConnectionEvent;
 import jakarta.persistence.criteria.Predicate;
@@ -34,11 +35,14 @@ public class ConnectionRecordService {
     private static final Logger log = LoggerFactory.getLogger(ConnectionRecordService.class);
 
     private final ConnectionRecordRepository connectionRecordRepository;
+    private final ClientAccountService clientAccountService;
     private final ApplicationEventPublisher events;
 
     public ConnectionRecordService(ConnectionRecordRepository connectionRecordRepository,
+                                   ClientAccountService clientAccountService,
                                    ApplicationEventPublisher events) {
         this.connectionRecordRepository = connectionRecordRepository;
+        this.clientAccountService = clientAccountService;
         this.events = events;
     }
 
@@ -137,11 +141,29 @@ public class ConnectionRecordService {
 
     @Transactional(readOnly = true)
     public Page<ConnectionRecordView> listConnections(TenantContext tenant, ConnectionFilter filter, Pageable pageable) {
+        return listConnections(tenant, filter, null, pageable);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<ConnectionRecordView> listConnections(ManagementContext context, ConnectionFilter filter, Pageable pageable) {
+        List<Long> visibleClientIds = context.isAdmin() ? null : clientAccountService.visibleClientIds(context);
+        if (isDenied(visibleClientIds, filter.clientId())) {
+            return Page.empty(pageable);
+        }
+        return listConnections(context.tenant(), filter, visibleClientIds, pageable);
+    }
+
+    private Page<ConnectionRecordView> listConnections(TenantContext tenant,
+                                                       ConnectionFilter filter,
+                                                       List<Long> visibleClientIds,
+                                                       Pageable pageable) {
         Specification<ConnectionRecord> spec = (root, query, cb) -> {
             List<Predicate> predicates = new ArrayList<>();
             predicates.add(cb.equal(root.get("tenantId"), tenant.tenantId()));
             if (filter.clientId() != null) {
                 predicates.add(cb.equal(root.get("clientId"), filter.clientId()));
+            } else if (visibleClientIds != null) {
+                predicates.add(root.get("clientId").in(visibleClientIds));
             }
             if (filter.success() != null) {
                 predicates.add(cb.equal(root.get("success"), filter.success()));
@@ -155,6 +177,13 @@ public class ConnectionRecordService {
             return predicates.isEmpty() ? cb.conjunction() : cb.and(predicates.toArray(new Predicate[0]));
         };
         return connectionRecordRepository.findAll(spec, pageable).map(this::toView);
+    }
+
+    private boolean isDenied(List<Long> visibleClientIds, Long clientId) {
+        if (visibleClientIds == null) {
+            return false;
+        }
+        return visibleClientIds.isEmpty() || (clientId != null && !visibleClientIds.contains(clientId));
     }
 
     private ConnectionRecordView toView(ConnectionRecord record) {

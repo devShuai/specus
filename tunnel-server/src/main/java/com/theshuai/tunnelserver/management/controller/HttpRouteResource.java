@@ -1,9 +1,9 @@
 package com.theshuai.tunnelserver.management.controller;
 
 import com.theshuai.tunnelserver.management.model.HttpRouteView;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import com.theshuai.tunnelserver.management.service.HttpRouteService;
 import com.theshuai.tunnelserver.management.service.HttpRouteService.RouteMutation;
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -32,17 +32,17 @@ import java.util.List;
 public class HttpRouteResource {
 
     private final HttpRouteService httpRouteService;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
-    public HttpRouteResource(HttpRouteService httpRouteService, TenantResolver tenantResolver) {
+    public HttpRouteResource(HttpRouteService httpRouteService, ManagementContextResolver contextResolver) {
         this.httpRouteService = httpRouteService;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @GetMapping("/http-routes")
     public List<HttpRouteView> listHttpRoutes(@AuthenticationPrincipal Jwt jwt,
                                               @RequestParam(required = false) Long clientId) {
-        return httpRouteService.listRoutes(tenantResolver.resolve(jwt), clientId);
+        return httpRouteService.listRoutes(contextResolver.resolve(jwt), clientId);
     }
 
     @PostMapping("/clients/{id}/http-routes")
@@ -50,19 +50,19 @@ public class HttpRouteResource {
                                                          @PathVariable long id,
                                                          @RequestBody RouteMutation request) {
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(httpRouteService.createRoute(tenantResolver.resolve(jwt), id, request));
+                .body(httpRouteService.createRoute(contextResolver.resolve(jwt), id, request));
     }
 
     @PutMapping("/http-routes/{routeId}")
     public HttpRouteView updateHttpRoute(@AuthenticationPrincipal Jwt jwt,
                                          @PathVariable long routeId,
                                          @RequestBody RouteMutation request) {
-        return httpRouteService.updateRoute(tenantResolver.resolve(jwt), routeId, request);
+        return httpRouteService.updateRoute(contextResolver.resolve(jwt), routeId, request);
     }
 
     @DeleteMapping("/http-routes/{routeId}")
     public ResponseEntity<Void> deleteHttpRoute(@AuthenticationPrincipal Jwt jwt, @PathVariable long routeId) {
-        httpRouteService.deleteRoute(tenantResolver.resolve(jwt), routeId);
+        httpRouteService.deleteRoute(contextResolver.resolve(jwt), routeId);
         return ResponseEntity.noContent().build();
     }
 }

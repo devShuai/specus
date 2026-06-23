@@ -50,8 +50,8 @@ class HttpRouteServiceTests {
     void setUp() {
         httpRouteMappingRepository.deleteAll();
         clientAccountRepository.deleteAll();
-        clientAccountService.createClient(new ClientMutation(CLIENT_A, "pwa", true, 0));
-        clientAccountService.createClient(new ClientMutation(CLIENT_B, "pwb", true, 0));
+        clientAccountService.createClient(new ClientMutation(CLIENT_A, true, 0));
+        clientAccountService.createClient(new ClientMutation(CLIENT_B, true, 0));
         clientIdA = clientAccountRepository.findByClientName(CLIENT_A).orElseThrow().getId();
         clientIdB = clientAccountRepository.findByClientName(CLIENT_B).orElseThrow().getId();
     }
@@ -175,7 +175,7 @@ class HttpRouteServiceTests {
     @Test
     void tenantScopedQueriesDoNotLeakClientsOrRoutes() {
         TenantContext tenantB = new TenantContext("tenant-b");
-        clientAccountService.createClient(tenantB, new ClientMutation("RouteClientTenantB", "pwc", true, 0));
+        clientAccountService.createClient(tenantB, new ClientMutation("RouteClientTenantB", true, 0));
         long clientIdTenantB = clientAccountRepository.findByClientName("RouteClientTenantB").orElseThrow().getId();
 
         httpRouteService.createRoute(clientIdA, new RouteMutation("web", "http://127.0.0.1:8080", true));

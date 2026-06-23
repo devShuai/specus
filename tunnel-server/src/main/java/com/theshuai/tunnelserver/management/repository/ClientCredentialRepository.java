@@ -11,7 +11,11 @@ public interface ClientCredentialRepository extends JpaRepository<ClientCredenti
 
     Optional<ClientCredential> findByIdAndTenantId(Long id, String tenantId);
 
+    Optional<ClientCredential> findByIdAndTenantIdAndOwnerUsername(Long id, String tenantId, String ownerUsername);
+
     List<ClientCredential> findByTenantIdOrderByIdDesc(String tenantId);
+
+    List<ClientCredential> findByTenantIdAndOwnerUsernameOrderByIdDesc(String tenantId, String ownerUsername);
 
     long countByTenantId(String tenantId);
 }

@@ -10,6 +10,7 @@ import org.springframework.data.domain.Pageable;
 import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 public class JpaTcpTrafficFrameStore implements TcpTrafficFrameStore {
     private final TcpTrafficFrameRepository repository;
@@ -24,9 +25,18 @@ public class JpaTcpTrafficFrameStore implements TcpTrafficFrameStore {
     }
 
     @Override
-    public Page<TcpTrafficFrameView> search(TenantContext tenant, Long clientId, Integer listenPort, Pageable pageable) {
+    public Page<TcpTrafficFrameView> search(TenantContext tenant, Long clientId, Set<Long> visibleClientIds,
+                                            Integer listenPort, Pageable pageable) {
+        if (isDenied(clientId, visibleClientIds)) {
+            return Page.empty(pageable);
+        }
         Page<TcpTrafficFrame> frames;
-        if (clientId == null && listenPort == null) {
+        if (visibleClientIds != null && clientId == null && listenPort == null) {
+            frames = repository.findByTenantIdAndClientIdInOrderByIdDesc(tenant.tenantId(), List.copyOf(visibleClientIds), pageable);
+        } else if (visibleClientIds != null && clientId == null) {
+            frames = repository.findByTenantIdAndClientIdInAndListenPortOrderByIdDesc(
+                    tenant.tenantId(), List.copyOf(visibleClientIds), listenPort, pageable);
+        } else if (clientId == null && listenPort == null) {
             frames = repository.findByTenantIdOrderByIdDesc(tenant.tenantId(), pageable);
         } else if (clientId == null) {
             frames = repository.findByTenantIdAndListenPortOrderByIdDesc(tenant.tenantId(), listenPort, pageable);
@@ -40,20 +50,44 @@ public class JpaTcpTrafficFrameStore implements TcpTrafficFrameStore {
     }
 
     @Override
-    public Optional<TcpTrafficFrameView> findById(TenantContext tenant, long id) {
-        return repository.findByTenantIdAndId(tenant.tenantId(), id)
+    public Optional<TcpTrafficFrameView> findById(TenantContext tenant, long id, Set<Long> visibleClientIds) {
+        if (visibleClientIds != null && visibleClientIds.isEmpty()) {
+            return Optional.empty();
+        }
+        Optional<TcpTrafficFrame> found = visibleClientIds == null
+                ? repository.findByTenantIdAndId(tenant.tenantId(), id)
+                : repository.findByTenantIdAndIdAndClientIdIn(tenant.tenantId(), id, List.copyOf(visibleClientIds));
+        return found
                 .map(frame -> toView(frame, true));
     }
 
     @Override
-    public List<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Pageable pageable) {
+    public List<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
+                                                Pageable pageable) {
         if (channelId == null || channelId.isBlank()) {
             return List.of();
         }
-        return repository.findByTenantIdAndChannelIdOrderByIdAsc(tenant.tenantId(), channelId.trim(), pageable)
+        if (visibleClientIds != null && visibleClientIds.isEmpty()) {
+            return List.of();
+        }
+        List<TcpTrafficFrame> frames = visibleClientIds == null
+                ? repository.findByTenantIdAndChannelIdOrderByIdAsc(tenant.tenantId(), channelId.trim(), pageable)
+                : repository.findByTenantIdAndChannelIdAndClientIdInOrderByIdAsc(
+                        tenant.tenantId(), channelId.trim(), List.copyOf(visibleClientIds), pageable);
+        return frames
                 .stream()
                 .map(frame -> toView(frame, true))
                 .toList();
+    }
+
+    private static boolean isDenied(Long clientId, Set<Long> visibleClientIds) {
+        if (visibleClientIds == null) {
+            return false;
+        }
+        if (visibleClientIds.isEmpty()) {
+            return true;
+        }
+        return clientId != null && !visibleClientIds.contains(clientId);
     }
 
     @Override

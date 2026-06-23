@@ -10,7 +10,10 @@ import lombok.Setter;
 
 @Entity
 @Table(name = "tunnel_client_account",
-        indexes = @Index(name = "idx_tunnel_client_tenant", columnList = "tenant_id"))
+        indexes = {
+                @Index(name = "idx_tunnel_client_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_tunnel_client_owner", columnList = "tenant_id, owner_username")
+        })
 @Getter
 @Setter
 public class ClientAccount {
@@ -19,6 +22,9 @@ public class ClientAccount {
 
     @Column(name = "tenant_id", length = 80)
     private String tenantId;
+
+    @Column(name = "owner_username", length = 80)
+    private String ownerUsername;
 
     @Column(name = "client_name", nullable = false, unique = true, length = 120)
     private String clientName;

@@ -31,6 +31,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
@@ -71,14 +72,18 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
     @Override
     public Page<HttpTrafficExchangeView> search(TenantContext tenant,
                                                 Long clientId,
+                                                Set<Long> visibleClientIds,
                                                 String route,
                                                 String responseBodyType,
                                                 HttpTrafficSearchField searchField,
                                                 String keyword,
                                                 Pageable pageable) {
+        if (isDenied(clientId, visibleClientIds)) {
+            return Page.empty(pageable);
+        }
         ensureIndex();
         NativeQuery query = NativeQuery.builder()
-                .withQuery(buildQuery(tenant, clientId, normalizeRoute(route),
+                .withQuery(buildQuery(tenant, clientId, visibleClientIds, normalizeRoute(route),
                         HttpBodyTypeClassifier.normalize(responseBodyType), searchField, normalizeKeyword(keyword)))
                 .withPageable(pageable)
                 .withSort(sort -> sort.field(sortField -> sortField.field("id").order(SortOrder.Desc)))
@@ -117,6 +122,7 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
 
     private Query buildQuery(TenantContext tenant,
                              Long clientId,
+                             Set<Long> visibleClientIds,
                              String route,
                              String responseBodyType,
                              HttpTrafficSearchField field,
@@ -126,6 +132,8 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
                 .filter(term("tenantId", tenant.tenantId()));
         if (clientId != null) {
             bool.filter(term("clientId", clientId));
+        } else if (visibleClientIds != null) {
+            bool.filter(terms("clientId", visibleClientIds));
         }
         if (route != null) {
             bool.filter(term("route", route));
@@ -137,6 +145,16 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
             bool.must(keywordTokenQuery(searchField, token));
         }
         return bool.build()._toQuery();
+    }
+
+    private boolean isDenied(Long clientId, Set<Long> visibleClientIds) {
+        if (visibleClientIds == null) {
+            return false;
+        }
+        if (visibleClientIds.isEmpty()) {
+            return true;
+        }
+        return clientId != null && !visibleClientIds.contains(clientId);
     }
 
     private Query responseBodyTypeQuery(String responseBodyType) {
@@ -222,6 +240,12 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
 
     private Query term(String field, long value) {
         return Query.of(q -> q.term(term -> term.field(field).value(FieldValue.of(value))));
+    }
+
+    private Query terms(String field, Set<Long> values) {
+        return Query.of(q -> q.terms(terms -> terms
+                .field(field)
+                .terms(v -> v.value(values.stream().map(FieldValue::of).toList()))));
     }
 
     private Query wildcard(String field, String value) {

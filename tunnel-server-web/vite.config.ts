@@ -23,6 +23,47 @@ export default defineConfig(({ mode }) => {
       outDir: "dist",
       // Keep asset paths stable under /assets so any static file server can serve the SPA.
       assetsDir: "assets",
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            const normalized = id.replace(/\\/g, "/");
+            if (!normalized.includes("/node_modules/")) {
+              return undefined;
+            }
+
+            if (
+              normalized.includes("/node_modules/react/") ||
+              normalized.includes("/node_modules/react-dom/") ||
+              normalized.includes("/node_modules/scheduler/") ||
+              normalized.includes("/node_modules/use-sync-external-store/")
+            ) {
+              return "react-vendor";
+            }
+            if (normalized.includes("/node_modules/framer-motion/")) {
+              return "motion-vendor";
+            }
+            if (normalized.includes("/node_modules/@heroui/")) {
+              return "heroui-vendor";
+            }
+            if (normalized.includes("/node_modules/@react-aria/")) {
+              return "react-aria";
+            }
+            if (normalized.includes("/node_modules/@react-stately/")) {
+              return "react-stately";
+            }
+            if (normalized.includes("/node_modules/@react-types/")) {
+              return "react-types";
+            }
+            if (normalized.includes("/node_modules/@internationalized/")) {
+              return "intl-vendor";
+            }
+            if (normalized.includes("/node_modules/@floating-ui/")) {
+              return "floating-ui";
+            }
+            return "vendor";
+          },
+        },
+      },
     },
   };
 });

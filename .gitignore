@@ -43,6 +43,10 @@ shuai-tunnel.db-journal
 
 ### Local client credentials ###
 tunnelClientConfig.json
+tunnelClientConfig*.json
+
+### Local agent settings ###
+.claude/
 
 ### Go client binary ###
 /tunnel-client-go/shuai-tunnel-client

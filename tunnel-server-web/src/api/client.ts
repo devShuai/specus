@@ -5,7 +5,7 @@ import type {
   ClientCredentialResult,
   ClientMutation,
   ConnectionPage,
-  CredentialView,
+  ClientResult,
   DatabaseInitResult,
   HttpRoute,
   HttpRouteMutation,
@@ -13,6 +13,8 @@ import type {
   HttpTrafficExchangePage,
   HttpResponseBodyType,
   HttpTrafficSearchField,
+  ManagementUser,
+  ManagementUserMutation,
   NatControlResult,
   OidcConfig,
   Overview,
@@ -191,14 +193,21 @@ export interface TcpTrafficFrameQuery {
 }
 
 export const adminApi = {
+  me: () => request<ManagementUser>("/me"),
   overview: () => request<Overview>("/overview"),
   initializeDatabase: () => request<DatabaseInitResult>("/database/initialize", { method: "POST" }),
+  listUsers: () => request<ManagementUser[]>("/users"),
+  createUser: (body: ManagementUserMutation) =>
+    request<ManagementUser>("/users", { method: "POST", body: JSON.stringify(body) }),
+  updateUser: (username: string, body: ManagementUserMutation) =>
+    request<ManagementUser>(`/users/${encodeURIComponent(username)}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteUser: (username: string) => request<null>(`/users/${encodeURIComponent(username)}`, { method: "DELETE" }),
 
   listClients: () => request<Client[]>("/clients"),
   createClient: (body: ClientMutation) =>
-    request<CredentialView>("/clients", { method: "POST", body: JSON.stringify(body) }),
+    request<ClientResult>("/clients", { method: "POST", body: JSON.stringify(body) }),
   updateClient: (id: number, body: ClientMutation) =>
-    request<CredentialView>(`/clients/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+    request<ClientResult>(`/clients/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteClient: (id: number) => request<null>(`/clients/${id}`, { method: "DELETE" }),
   pushNatControl: (id: number) => request<NatControlResult>(`/clients/${id}/nat-control`, { method: "POST" }),
 

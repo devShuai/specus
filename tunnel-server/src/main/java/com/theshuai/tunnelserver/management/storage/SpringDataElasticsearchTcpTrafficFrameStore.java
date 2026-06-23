@@ -30,6 +30,7 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFrameStore {
@@ -68,10 +69,14 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
     }
 
     @Override
-    public Page<TcpTrafficFrameView> search(TenantContext tenant, Long clientId, Integer listenPort, Pageable pageable) {
+    public Page<TcpTrafficFrameView> search(TenantContext tenant, Long clientId, Set<Long> visibleClientIds,
+                                            Integer listenPort, Pageable pageable) {
+        if (isDenied(clientId, visibleClientIds)) {
+            return Page.empty(pageable);
+        }
         ensureIndex();
         NativeQuery query = NativeQuery.builder()
-                .withQuery(buildQuery(tenant, clientId, listenPort))
+                .withQuery(buildQuery(tenant, clientId, visibleClientIds, listenPort))
                 .withPageable(pageable)
                 .withSort(sort -> sort.field(field -> field.field("id").order(SortOrder.Desc)))
                 .build();
@@ -84,14 +89,19 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
     }
 
     @Override
-    public Optional<TcpTrafficFrameView> findById(TenantContext tenant, long id) {
+    public Optional<TcpTrafficFrameView> findById(TenantContext tenant, long id, Set<Long> visibleClientIds) {
+        if (visibleClientIds != null && visibleClientIds.isEmpty()) {
+            return Optional.empty();
+        }
         ensureIndex();
-        BoolQuery query = new BoolQuery.Builder()
+        BoolQuery.Builder bool = new BoolQuery.Builder()
                 .filter(term("tenantId", tenant.tenantId()))
-                .filter(term("id", id))
-                .build();
+                .filter(term("id", id));
+        if (visibleClientIds != null) {
+            bool.filter(terms("clientId", visibleClientIds));
+        }
         NativeQuery nativeQuery = NativeQuery.builder()
-                .withQuery(query._toQuery())
+                .withQuery(bool.build()._toQuery())
                 .withPageable(PageRequest.of(0, 1))
                 .build();
         SearchHits<TcpTrafficFrameDocument> hits = operations.search(nativeQuery, TcpTrafficFrameDocument.class);
@@ -102,18 +112,24 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
     }
 
     @Override
-    public List<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Pageable pageable) {
+    public List<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
+                                                Pageable pageable) {
         if (channelId == null || channelId.isBlank()) {
+            return List.of();
+        }
+        if (visibleClientIds != null && visibleClientIds.isEmpty()) {
             return List.of();
         }
         ensureIndex();
         String normalizedChannelId = channelId.trim();
-        BoolQuery query = new BoolQuery.Builder()
+        BoolQuery.Builder bool = new BoolQuery.Builder()
                 .filter(term("tenantId", tenant.tenantId()))
-                .filter(exactText("channelId", normalizedChannelId))
-                .build();
+                .filter(exactText("channelId", normalizedChannelId));
+        if (visibleClientIds != null) {
+            bool.filter(terms("clientId", visibleClientIds));
+        }
         NativeQuery nativeQuery = NativeQuery.builder()
-                .withQuery(query._toQuery())
+                .withQuery(bool.build()._toQuery())
                 .withPageable(pageable)
                 .withSort(sort -> sort.field(field -> field.field("id").order(SortOrder.Asc)))
                 .build();
@@ -148,16 +164,28 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
         }
     }
 
-    private Query buildQuery(TenantContext tenant, Long clientId, Integer listenPort) {
+    private Query buildQuery(TenantContext tenant, Long clientId, Set<Long> visibleClientIds, Integer listenPort) {
         BoolQuery.Builder bool = new BoolQuery.Builder()
                 .filter(term("tenantId", tenant.tenantId()));
         if (clientId != null) {
             bool.filter(term("clientId", clientId));
+        } else if (visibleClientIds != null) {
+            bool.filter(terms("clientId", visibleClientIds));
         }
         if (listenPort != null) {
             bool.filter(term("listenPort", listenPort));
         }
         return bool.build()._toQuery();
+    }
+
+    private boolean isDenied(Long clientId, Set<Long> visibleClientIds) {
+        if (visibleClientIds == null) {
+            return false;
+        }
+        if (visibleClientIds.isEmpty()) {
+            return true;
+        }
+        return clientId != null && !visibleClientIds.contains(clientId);
     }
 
     private Query term(String field, String value) {
@@ -178,6 +206,12 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
 
     private Query term(String field, long value) {
         return Query.of(q -> q.term(term -> term.field(field).value(FieldValue.of(value))));
+    }
+
+    private Query terms(String field, Set<Long> values) {
+        return Query.of(q -> q.terms(terms -> terms
+                .field(field)
+                .terms(v -> v.value(values.stream().map(FieldValue::of).toList()))));
     }
 
     private TcpTrafficFrameDocument toDocument(TcpTrafficFrame frame) {

@@ -32,6 +32,7 @@ export interface Overview {
 export interface Client {
   id: number;
   clientName: string;
+  ownerUsername?: string | null;
   enabled: boolean;
   online: boolean;
   connectedSinceMs: number | null;
@@ -42,14 +43,14 @@ export interface Client {
   updatedAt: string;
 }
 
-export interface CredentialView {
+export interface ClientResult {
   client: Client;
-  password?: string;
 }
 
 export interface ClientCredential {
   id: number;
   apiKey: string;
+  ownerUsername?: string | null;
   enabled: boolean;
   maxOnlineInstances: number;
   createdAt: string;
@@ -258,9 +259,28 @@ export interface DatabaseInitResult {
   clients: number;
 }
 
+export type ManagementRole = "ADMIN" | "USER";
+
+export interface ManagementUser {
+  username: string;
+  tenantId: string;
+  role: ManagementRole;
+  admin: boolean;
+  builtIn: boolean;
+  enabled: boolean;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface ManagementUserMutation {
+  username?: string;
+  password?: string | null;
+  role?: ManagementRole;
+  enabled?: boolean;
+}
+
 export interface ClientMutation {
   clientName?: string;
-  password?: string | null;
   enabled?: boolean;
   connectionRateLimitPerMinute?: number;
 }

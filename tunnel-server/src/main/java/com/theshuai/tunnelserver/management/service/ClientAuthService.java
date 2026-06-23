@@ -210,18 +210,6 @@ public class ClientAuthService {
         if (request == null) {
             throw new IllegalArgumentException("登录请求不能为空");
         }
-        String authType = StringUtils.hasText(request.getAuthType()) ? request.getAuthType().trim() : "";
-        if ("password".equalsIgnoreCase(authType)) {
-            String username = requireText(request.getUsername(), "username");
-            String password = requireText(request.getPassword(), "password");
-            ClientCredential credential = credentialRepository.findByApiKey(username)
-                    .orElseThrow(() -> new IllegalArgumentException("客户端凭证不存在"));
-            if (!PasswordService.matches(password, credential.getSecretHash())) {
-                throw new IllegalArgumentException("客户端凭证无效");
-            }
-            return credential;
-        }
-
         String apiKey = requireText(request.getApiKey(), "apiKey");
         ClientCredential credential = credentialRepository.findByApiKey(apiKey)
                 .orElseThrow(() -> new IllegalArgumentException("客户端凭证不存在"));
@@ -283,6 +271,7 @@ public class ClientAuthService {
         ClientAccount account = new ClientAccount();
         account.setId(ClientIdGenerator.newId());
         account.setTenantId(credential.getTenantId());
+        account.setOwnerUsername(credential.getOwnerUsername());
         account.setClientName(generateClientName(credential, environment));
         account.setPasswordHash(PasswordService.hash(UUID.randomUUID().toString()));
         account.setEnabled(true);

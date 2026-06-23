@@ -15,7 +15,10 @@ import lombok.Setter;
                 name = "uk_client_credential_api_key",
                 columnNames = "api_key"
         ),
-        indexes = @Index(name = "idx_client_credential_tenant", columnList = "tenant_id"))
+        indexes = {
+                @Index(name = "idx_client_credential_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_client_credential_owner", columnList = "tenant_id, owner_username")
+        })
 @Getter
 @Setter
 public class ClientCredential {
@@ -24,6 +27,9 @@ public class ClientCredential {
 
     @Column(name = "tenant_id", length = 80, nullable = false)
     private String tenantId;
+
+    @Column(name = "owner_username", length = 80)
+    private String ownerUsername;
 
     @Column(name = "api_key", length = 120, nullable = false)
     private String apiKey;

@@ -13,7 +13,11 @@ public interface ClientAccountRepository extends JpaRepository<ClientAccount, Lo
 
     Optional<ClientAccount> findByIdAndTenantId(Long id, String tenantId);
 
+    Optional<ClientAccount> findByIdAndTenantIdAndOwnerUsername(Long id, String tenantId, String ownerUsername);
+
     List<ClientAccount> findByTenantIdOrderByIdDesc(String tenantId);
+
+    List<ClientAccount> findByTenantIdAndOwnerUsernameOrderByIdDesc(String tenantId, String ownerUsername);
 
     long countByTenantId(String tenantId);
 }

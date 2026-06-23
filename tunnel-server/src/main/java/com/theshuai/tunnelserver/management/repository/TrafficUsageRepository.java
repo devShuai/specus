@@ -24,6 +24,9 @@ public interface TrafficUsageRepository extends JpaRepository<TrafficUsage, Long
 
     List<TrafficUsage> findByTenantIdAndClientIdOrderByUsageDateDescIdDesc(String tenantId, Long clientId, Pageable pageable);
 
+    List<TrafficUsage> findByTenantIdAndClientIdInOrderByUsageDateDescIdDesc(
+            String tenantId, List<Long> clientIds, Pageable pageable);
+
     /**
      * 按 clientId 聚合所有日子的上下行字节总量。用于客户端列表 / overview 的总览统计，
      * 避免 N+1（每个客户端一条 {@link #findByClientId(Long)} 查询）。

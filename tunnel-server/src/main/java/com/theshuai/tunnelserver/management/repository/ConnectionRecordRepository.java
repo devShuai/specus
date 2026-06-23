@@ -20,6 +20,8 @@ public interface ConnectionRecordRepository extends JpaRepository<ConnectionReco
 
     long countByTenantIdAndSuccess(String tenantId, boolean success);
 
+    long countByTenantIdAndClientIdInAndSuccess(String tenantId, List<Long> clientIds, boolean success);
+
     long countByClientIdAndConnectedAtGreaterThanEqual(Long clientId, String connectedAt);
 
     long countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(String tenantId, Long clientId, String connectedAt);

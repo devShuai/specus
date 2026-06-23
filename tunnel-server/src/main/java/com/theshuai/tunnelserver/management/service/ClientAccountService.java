@@ -7,6 +7,7 @@ import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficTotal;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.security.PasswordService;
 import com.theshuai.tunnelserver.session.SessionUtil;
@@ -63,41 +64,79 @@ public class ClientAccountService {
                 .toList();
     }
 
+    @Transactional(readOnly = true)
+    public List<ClientAccountView> listClients(ManagementContext context) {
+        Map<Long, TrafficTotal> totals = trafficUsageRepository.sumBytesByTenantId(context.tenant().tenantId()).stream()
+                .collect(Collectors.toMap(TrafficTotal::getClientId, t -> t));
+        return visibleAccounts(context).stream()
+                .map(account -> toView(account, totals.get(account.getId())))
+                .toList();
+    }
+
     @Transactional
-    public CredentialResult createClient(ClientMutation request) {
+    public ClientResult createClient(ClientMutation request) {
         return createClient(TenantContext.defaultTenant(), request);
     }
 
     @Transactional
-    public CredentialResult createClient(TenantContext tenant, ClientMutation request) {
+    public ClientResult createClient(TenantContext tenant, ClientMutation request) {
         String clientName = requireClientName(request.clientName());
         clientAccountRepository.findByClientName(clientName).ifPresent(existing -> {
             throw new IllegalArgumentException("clientName " + clientName + " 已存在");
         });
-        String password = StringUtils.hasText(request.password())
-                ? request.password() : PasswordService.generatePassword();
         String now = Instant.now().toString();
 
         ClientAccount account = new ClientAccount();
         account.setId(ClientIdGenerator.newId());
         account.setTenantId(tenant.tenantId());
         account.setClientName(clientName);
-        account.setPasswordHash(PasswordService.hash(password));
+        account.setPasswordHash(PasswordService.hash(PasswordService.generatePassword()));
         account.setEnabled(request.enabled() == null || request.enabled());
         account.setConnectionRateLimitPerMinute(normalizeRateLimit(request.connectionRateLimitPerMinute(), 30));
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
-        return new CredentialResult(toView(clientAccountRepository.save(account), null), password);
+        return new ClientResult(toView(clientAccountRepository.save(account), null));
     }
 
     @Transactional
-    public CredentialResult updateClient(long id, ClientMutation request) {
+    public ClientResult createClient(ManagementContext context, ClientMutation request) {
+        String clientName = requireClientName(request.clientName());
+        clientAccountRepository.findByClientName(clientName).ifPresent(existing -> {
+            throw new IllegalArgumentException("clientName " + clientName + " 已存在");
+        });
+        String now = Instant.now().toString();
+
+        ClientAccount account = new ClientAccount();
+        account.setId(ClientIdGenerator.newId());
+        account.setTenantId(context.tenant().tenantId());
+        account.setOwnerUsername(context.username());
+        account.setClientName(clientName);
+        account.setPasswordHash(PasswordService.hash(PasswordService.generatePassword()));
+        account.setEnabled(request.enabled() == null || request.enabled());
+        account.setConnectionRateLimitPerMinute(normalizeRateLimit(request.connectionRateLimitPerMinute(), 30));
+        account.setCreatedAt(now);
+        account.setUpdatedAt(now);
+        return new ClientResult(toView(clientAccountRepository.save(account), null));
+    }
+
+    @Transactional
+    public ClientResult updateClient(long id, ClientMutation request) {
         return updateClient(TenantContext.defaultTenant(), id, request);
     }
 
     @Transactional
-    public CredentialResult updateClient(TenantContext tenant, long id, ClientMutation request) {
+    public ClientResult updateClient(TenantContext tenant, long id, ClientMutation request) {
         ClientAccount account = findClientById(tenant, id);
+        return updateClient(tenant, account, request);
+    }
+
+    @Transactional
+    public ClientResult updateClient(ManagementContext context, long id, ClientMutation request) {
+        ClientAccount account = findClientById(context, id);
+        return updateClient(context.tenant(), account, request);
+    }
+
+    private ClientResult updateClient(TenantContext tenant, ClientAccount account, ClientMutation request) {
         String originalClientName = account.getClientName();
         String newClientName = StringUtils.hasText(request.clientName())
                 ? requireClientName(request.clientName())
@@ -108,9 +147,6 @@ public class ClientAccountService {
             });
         }
         account.setClientName(newClientName);
-        if (StringUtils.hasText(request.password())) {
-            account.setPasswordHash(PasswordService.hash(request.password()));
-        }
         if (request.enabled() != null) {
             account.setEnabled(request.enabled());
         }
@@ -130,7 +166,7 @@ public class ClientAccountService {
         TrafficTotal total = trafficUsageRepository
                 .sumBytesByTenantIdAndClientId(tenant.tenantId(), account.getId())
                 .orElse(null);
-        return new CredentialResult(toView(account, total), request.password());
+        return new ClientResult(toView(account, total));
     }
 
     @Transactional
@@ -141,6 +177,13 @@ public class ClientAccountService {
     @Transactional
     public void deleteClient(TenantContext tenant, long id) {
         ClientAccount account = findClientById(tenant, id);
+        closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
+        clientAccountRepository.delete(account);
+    }
+
+    @Transactional
+    public void deleteClient(ManagementContext context, long id) {
+        ClientAccount account = findClientById(context, id);
         closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
         clientAccountRepository.delete(account);
     }
@@ -160,6 +203,38 @@ public class ClientAccountService {
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
     }
 
+    public ClientAccount findClientById(ManagementContext context, long id) {
+        Optional<ClientAccount> account = context.isAdmin()
+                ? clientAccountRepository.findByIdAndTenantId(id, context.tenant().tenantId())
+                : clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
+                        id, context.tenant().tenantId(), context.username());
+        return account.orElseThrow(() -> new IllegalArgumentException("client not found: " + id));
+    }
+
+    @Transactional(readOnly = true)
+    public List<Long> visibleClientIds(ManagementContext context) {
+        return visibleAccounts(context).stream().map(ClientAccount::getId).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public boolean canAccessClient(ManagementContext context, Long clientId) {
+        if (clientId == null) {
+            return true;
+        }
+        if (context.isAdmin()) {
+            return clientAccountRepository.findByIdAndTenantId(clientId, context.tenant().tenantId()).isPresent();
+        }
+        return clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
+                clientId, context.tenant().tenantId(), context.username()).isPresent();
+    }
+
+    private List<ClientAccount> visibleAccounts(ManagementContext context) {
+        return context.isAdmin()
+                ? clientAccountRepository.findByTenantIdOrderByIdDesc(context.tenant().tenantId())
+                : clientAccountRepository.findByTenantIdAndOwnerUsernameOrderByIdDesc(
+                        context.tenant().tenantId(), context.username());
+    }
+
     private ClientAccountView toView(ClientAccount account, TrafficTotal total) {
         Channel channel = SessionUtil.getChannel(account.getClientName());
         boolean online = channel != null;
@@ -169,6 +244,7 @@ public class ClientAccountService {
         return new ClientAccountView(
                 account.getId(),
                 account.getClientName(),
+                account.getOwnerUsername(),
                 account.isEnabled(),
                 account.getConnectionRateLimitPerMinute(),
                 online,
@@ -209,12 +285,11 @@ public class ClientAccountService {
 
     public record ClientMutation(
             String clientName,
-            String password,
             Boolean enabled,
             Integer connectionRateLimitPerMinute
     ) {
     }
 
-    public record CredentialResult(ClientAccountView client, String password) {
+    public record ClientResult(ClientAccountView client) {
     }
 }

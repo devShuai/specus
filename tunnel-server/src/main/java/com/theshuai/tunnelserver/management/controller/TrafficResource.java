@@ -4,11 +4,12 @@ import com.theshuai.tunnelserver.management.model.HttpTrafficExchangeView;
 import com.theshuai.tunnelserver.management.model.ResourceTrafficUsageView;
 import com.theshuai.tunnelserver.management.model.TcpTrafficFrameView;
 import com.theshuai.tunnelserver.management.model.TrafficUsageView;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.management.service.TrafficViewService;
 import com.theshuai.tunnelserver.management.storage.HttpTrafficSearchField;
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -32,16 +33,16 @@ public class TrafficResource {
     private final TrafficViewService trafficViewService;
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
     public TrafficResource(TrafficViewService trafficViewService,
                            TrafficUsageService trafficUsageService,
                            TrafficInspectionService trafficInspectionService,
-                           TenantResolver tenantResolver) {
+                           ManagementContextResolver contextResolver) {
         this.trafficViewService = trafficViewService;
         this.trafficUsageService = trafficUsageService;
         this.trafficInspectionService = trafficInspectionService;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @GetMapping
@@ -49,7 +50,7 @@ public class TrafficResource {
                                               @RequestParam(required = false) Long clientId,
                                               @RequestParam(defaultValue = "100") int limit) {
         trafficUsageService.flush();
-        return trafficViewService.listTraffic(tenantResolver.resolve(jwt), clientId, limit);
+        return trafficViewService.listTraffic(contextResolver.resolve(jwt), clientId, limit);
     }
 
     @GetMapping("/resources")
@@ -58,7 +59,7 @@ public class TrafficResource {
                                                              @RequestParam(required = false) Long clientId,
                                                              @RequestParam(defaultValue = "200") int limit) {
         trafficUsageService.flush();
-        return trafficViewService.listResourceTraffic(tenantResolver.resolve(jwt), type, clientId, limit);
+        return trafficViewService.listResourceTraffic(contextResolver.resolve(jwt), type, clientId, limit);
     }
 
     @GetMapping("/http-exchanges")
@@ -74,8 +75,9 @@ public class TrafficResource {
         trafficInspectionService.flush();
         int normalizedSize = Math.clamp(size, 1, 500);
         int normalizedPage = Math.max(0, page);
+        ManagementContext context = contextResolver.resolve(jwt);
         Page<HttpTrafficExchangeView> result = trafficViewService.listHttpExchanges(
-                tenantResolver.resolve(jwt),
+                context,
                 clientId,
                 route,
                 firstText(responseBodyType, responseDataType),
@@ -103,7 +105,7 @@ public class TrafficResource {
         int normalizedSize = Math.clamp(requestedSize, 1, 500);
         int normalizedPage = Math.max(0, page);
         Page<TcpTrafficFrameView> result = trafficViewService.listTcpFrames(
-                tenantResolver.resolve(jwt),
+                contextResolver.resolve(jwt),
                 clientId,
                 listenPort,
                 PageRequest.of(normalizedPage, normalizedSize, Sort.by(Sort.Direction.DESC, "id")));
@@ -120,7 +122,7 @@ public class TrafficResource {
     public TcpTrafficFrameView getTcpFrame(@AuthenticationPrincipal Jwt jwt,
                                            @PathVariable long id) {
         trafficInspectionService.flush();
-        return trafficViewService.getTcpFrame(tenantResolver.resolve(jwt), id)
+        return trafficViewService.getTcpFrame(contextResolver.resolve(jwt), id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "TCP frame not found"));
     }
 
@@ -131,7 +133,7 @@ public class TrafficResource {
         trafficInspectionService.flush();
         int normalizedLimit = Math.clamp(limit, 1, 1000);
         List<TcpTrafficFrameView> items = trafficViewService.listTcpStream(
-                tenantResolver.resolve(jwt), channelId, normalizedLimit);
+                contextResolver.resolve(jwt), channelId, normalizedLimit);
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("channelId", channelId);
         response.put("items", items);

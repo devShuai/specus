@@ -115,8 +115,12 @@ public class HttpTunnelController {
             // 路径改写：仅当路由开启时生效。改写成功后需要剥离 Content-Encoding/Content-Length，
             // 让 Spring/Tomcat 按实际字节重新计算 Content-Length（Tomcat 不会主动重压缩）。
             List<String> responseHeaders = response.getHeaders();
+            boolean rewriteEnabled = isPathRewriteEnabled(clientName, route);
             boolean rewritten = false;
-            if (isPathRewriteEnabled(clientName, route)) {
+            log.info("[http-direct][rewrite-check] requestId={} clientName={} route={} pathRewriteEnabled={} contentType={}",
+                    response.getRequestId(), clientName, route, rewriteEnabled,
+                    findHeaderValue(responseHeaders, "content-type"));
+            if (rewriteEnabled) {
                 Optional<byte[]> maybeRewritten = responseRewriter.rewrite(responseBody, clientName, route, responseHeaders);
                 if (maybeRewritten.isPresent()) {
                     responseBody = maybeRewritten.get();
@@ -209,16 +213,41 @@ public class HttpTunnelController {
         try {
             Optional<ClientAccount> account = clientAccountService.findClientByName(clientName);
             if (account.isEmpty()) {
+                log.warn("[http-direct][rewrite-lookup] clientName={} route={} result=client-not-found",
+                        clientName, route);
                 return false;
             }
             Optional<HttpRouteMapping> mapping = httpRouteMappingRepository
                     .findByClientIdAndRoute(account.get().getId(), route);
-            return mapping.map(m -> Boolean.TRUE.equals(m.getPathRewriteEnabled())).orElse(false);
+            if (mapping.isEmpty()) {
+                log.warn("[http-direct][rewrite-lookup] clientName={} route={} clientId={} result=route-not-found",
+                        clientName, route, account.get().getId());
+                return false;
+            }
+            boolean enabled = Boolean.TRUE.equals(mapping.get().getPathRewriteEnabled());
+            log.debug("[http-direct][rewrite-lookup] clientName={} route={} pathRewriteEnabled={}",
+                    clientName, route, enabled);
+            return enabled;
         } catch (RuntimeException e) {
-            log.debug("[http-direct] isPathRewriteEnabled lookup failed clientName={} route={} error={}",
-                    clientName, route, e.toString());
+            log.warn("[http-direct][rewrite-lookup] clientName={} route={} error={}",
+                    clientName, route, e.toString(), e);
             return false;
         }
+    }
+
+    private static String findHeaderValue(List<String> headers, String name) {
+        if (headers == null) {
+            return null;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        for (String header : headers) {
+            if (header == null) continue;
+            int sep = header.indexOf(':');
+            if (sep > 0 && lower.equals(header.substring(0, sep).trim().toLowerCase(Locale.ROOT))) {
+                return header.substring(sep + 1).trim();
+            }
+        }
+        return null;
     }
 
     /** 改写后剥离 Content-Encoding / Content-Length，让框架按实际字节重新计算并以明文回写。 */

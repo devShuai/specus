@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.server.RemotePortServerManager;
 import org.springframework.stereotype.Service;
@@ -37,15 +38,45 @@ public class OverviewService {
     @Transactional(readOnly = true)
     public Map<String, Object> overview(TenantContext tenant) {
         List<ClientAccountView> clients = clientAccountService.listClients(tenant);
+        return overviewForClients(tenant, clients, true, null);
+    }
+
+    @Transactional(readOnly = true)
+    public Map<String, Object> overview(ManagementContext context) {
+        List<ClientAccountView> clients = clientAccountService.listClients(context);
+        List<Long> visibleClientIds = context.isAdmin()
+                ? null
+                : clients.stream().map(ClientAccountView::id).toList();
+        return overviewForClients(context.tenant(), clients, context.isAdmin(), visibleClientIds);
+    }
+
+    private Map<String, Object> overviewForClients(TenantContext tenant,
+                                                   List<ClientAccountView> clients,
+                                                   boolean admin,
+                                                   List<Long> visibleClientIds) {
+        long successfulConnections;
+        long failedConnections;
+        if (admin) {
+            successfulConnections = connectionRecordRepository.countByTenantIdAndSuccess(tenant.tenantId(), true);
+            failedConnections = connectionRecordRepository.countByTenantIdAndSuccess(tenant.tenantId(), false);
+        } else if (visibleClientIds == null || visibleClientIds.isEmpty()) {
+            successfulConnections = 0;
+            failedConnections = 0;
+        } else {
+            successfulConnections = connectionRecordRepository.countByTenantIdAndClientIdInAndSuccess(
+                    tenant.tenantId(), visibleClientIds, true);
+            failedConnections = connectionRecordRepository.countByTenantIdAndClientIdInAndSuccess(
+                    tenant.tenantId(), visibleClientIds, false);
+        }
         Map<String, Object> overview = new LinkedHashMap<>();
         overview.put("clients", clients.size());
         overview.put("onlineClients", clients.stream().filter(ClientAccountView::online).count());
-        overview.put("successfulConnections", connectionRecordRepository.countByTenantIdAndSuccess(tenant.tenantId(), true));
-        overview.put("failedConnections", connectionRecordRepository.countByTenantIdAndSuccess(tenant.tenantId(), false));
+        overview.put("successfulConnections", successfulConnections);
+        overview.put("failedConnections", failedConnections);
         overview.put("uploadBytes", clients.stream().mapToLong(ClientAccountView::uploadBytes).sum());
         overview.put("downloadBytes", clients.stream().mapToLong(ClientAccountView::downloadBytes).sum());
-        overview.put("externalConnections", remotePortServerManager.activeExternalConnections(tenant.tenantId()));
-        overview.put("rejectedExternalConnections", remotePortServerManager.rejectedExternalConnections(tenant.tenantId()));
+        overview.put("externalConnections", admin ? remotePortServerManager.activeExternalConnections(tenant.tenantId()) : 0);
+        overview.put("rejectedExternalConnections", admin ? remotePortServerManager.rejectedExternalConnections(tenant.tenantId()) : 0);
         return overview;
     }
 }

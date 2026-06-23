@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -33,12 +34,17 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(ConnectionEventsWebSocketHandler.class);
 
+    private final ClientAccountRepository clientAccountRepository;
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final ObjectMapper objectMapper = new ObjectMapper()
             // null 字段省略，前端不需要看到全是 null 的列；体积也更小
             .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
             // 默认 false，但显式声明：未知字段不抛异常（防御性，目前 DTO 都是 record）
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
+
+    public ConnectionEventsWebSocketHandler(ClientAccountRepository clientAccountRepository) {
+        this.clientAccountRepository = clientAccountRepository;
+    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
@@ -77,6 +83,9 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
             if (!tenantId.equals(sessionTenantId)) {
                 continue;
             }
+            if (!canReceive(session, tenantId, payload)) {
+                continue;
+            }
             if (!session.isOpen()) {
                 sessions.remove(session);
                 continue;
@@ -100,5 +109,21 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
 
     int activeSessionCount() {
         return sessions.size();
+    }
+
+    private boolean canReceive(WebSocketSession session, String tenantId, Object payload) {
+        if (Boolean.TRUE.equals(session.getAttributes().get(JwtHandshakeInterceptor.ATTR_ADMIN))) {
+            return true;
+        }
+        if (!(payload instanceof ConnectionEvent event) || event.connection() == null) {
+            return false;
+        }
+        Long clientId = event.connection().clientId();
+        Object username = session.getAttributes().get(JwtHandshakeInterceptor.ATTR_USER);
+        return clientId != null
+                && username instanceof String owner
+                && clientAccountRepository
+                        .findByIdAndTenantIdAndOwnerUsername(clientId, tenantId, owner)
+                        .isPresent();
     }
 }

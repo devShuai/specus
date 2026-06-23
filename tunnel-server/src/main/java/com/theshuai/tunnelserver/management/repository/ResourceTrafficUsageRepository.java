@@ -19,6 +19,12 @@ public interface ResourceTrafficUsageRepository extends JpaRepository<ResourceTr
     List<ResourceTrafficUsage> findByTenantIdAndClientIdOrderByUsageDateDescIdDesc(
             String tenantId, Long clientId, Pageable pageable);
 
+    List<ResourceTrafficUsage> findByTenantIdAndClientIdInOrderByUsageDateDescIdDesc(
+            String tenantId, List<Long> clientIds, Pageable pageable);
+
     List<ResourceTrafficUsage> findByTenantIdAndClientIdAndResourceTypeOrderByUsageDateDescIdDesc(
             String tenantId, Long clientId, String resourceType, Pageable pageable);
+
+    List<ResourceTrafficUsage> findByTenantIdAndClientIdInAndResourceTypeOrderByUsageDateDescIdDesc(
+            String tenantId, List<Long> clientIds, String resourceType, Pageable pageable);
 }

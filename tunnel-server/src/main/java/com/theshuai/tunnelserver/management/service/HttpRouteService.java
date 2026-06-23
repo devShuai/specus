@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.management.model.HttpRouteMapping;
 import com.theshuai.tunnelserver.management.model.HttpRouteView;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -57,6 +58,17 @@ public class HttpRouteService {
         return rows.stream().map(this::toView).toList();
     }
 
+    @Transactional(readOnly = true)
+    public List<HttpRouteView> listRoutes(ManagementContext context, Long clientId) {
+        List<HttpRouteMapping> rows = clientId == null
+                ? httpRouteMappingRepository.findByTenantIdOrderByIdDesc(context.tenant().tenantId())
+                : httpRouteMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(context.tenant().tenantId(), clientId);
+        return rows.stream()
+                .filter(row -> canAccessClient(context, row.getClientId()))
+                .map(this::toView)
+                .toList();
+    }
+
     @Transactional
     public HttpRouteView createRoute(long clientId, RouteMutation request) {
         return createRoute(TenantContext.defaultTenant(), clientId, request);
@@ -65,6 +77,16 @@ public class HttpRouteService {
     @Transactional
     public HttpRouteView createRoute(TenantContext tenant, long clientId, RouteMutation request) {
         ClientAccount account = findClient(tenant, clientId);
+        return createRoute(tenant, account, request);
+    }
+
+    @Transactional
+    public HttpRouteView createRoute(ManagementContext context, long clientId, RouteMutation request) {
+        ClientAccount account = findClient(context, clientId);
+        return createRoute(context.tenant(), account, request);
+    }
+
+    private HttpRouteView createRoute(TenantContext tenant, ClientAccount account, RouteMutation request) {
         String route = requireRoute(request.route());
         String targetBaseUrl = requireTargetBaseUrl(request.targetBaseUrl());
         httpRouteMappingRepository.findByTenantIdAndClientIdAndRoute(tenant.tenantId(), account.getId(), route).ifPresent(existing -> {
@@ -98,6 +120,18 @@ public class HttpRouteService {
     public HttpRouteView updateRoute(TenantContext tenant, long id, RouteMutation request) {
         HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
+        return updateRoute(tenant, row, request);
+    }
+
+    @Transactional
+    public HttpRouteView updateRoute(ManagementContext context, long id, RouteMutation request) {
+        HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, context.tenant().tenantId())
+                .filter(route -> canAccessClient(context, route.getClientId()))
+                .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
+        return updateRoute(context.tenant(), row, request);
+    }
+
+    private HttpRouteView updateRoute(TenantContext tenant, HttpRouteMapping row, RouteMutation request) {
         String route = requireRoute(request.route());
         String targetBaseUrl = requireTargetBaseUrl(request.targetBaseUrl());
 
@@ -137,6 +171,18 @@ public class HttpRouteService {
     public void deleteRoute(TenantContext tenant, long id) {
         HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
+        deleteRoute(tenant, row);
+    }
+
+    @Transactional
+    public void deleteRoute(ManagementContext context, long id) {
+        HttpRouteMapping row = httpRouteMappingRepository.findByIdAndTenantId(id, context.tenant().tenantId())
+                .filter(route -> canAccessClient(context, route.getClientId()))
+                .orElseThrow(() -> new IllegalArgumentException("http route not found: " + id));
+        deleteRoute(context.tenant(), row);
+    }
+
+    private void deleteRoute(TenantContext tenant, HttpRouteMapping row) {
         httpRouteMappingRepository.delete(row);
         httpRouteMappingRepository.flush();
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(row.getClientId(), tenant.tenantId()).orElse(null);
@@ -153,6 +199,25 @@ public class HttpRouteService {
     private ClientAccount findClient(TenantContext tenant, long clientId) {
         return clientAccountRepository.findByIdAndTenantId(clientId, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + clientId));
+    }
+
+    private ClientAccount findClient(ManagementContext context, long clientId) {
+        return (context.isAdmin()
+                ? clientAccountRepository.findByIdAndTenantId(clientId, context.tenant().tenantId())
+                : clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
+                        clientId, context.tenant().tenantId(), context.username()))
+                .orElseThrow(() -> new IllegalArgumentException("client not found: " + clientId));
+    }
+
+    private boolean canAccessClient(ManagementContext context, Long clientId) {
+        if (clientId == null) {
+            return false;
+        }
+        if (context.isAdmin()) {
+            return true;
+        }
+        return clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
+                clientId, context.tenant().tenantId(), context.username()).isPresent();
     }
 
     private String requireRoute(String route) {

@@ -1,9 +1,9 @@
 package com.theshuai.tunnelserver.management.controller;
 
 import com.theshuai.tunnelserver.management.model.TunnelMappingView;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import com.theshuai.tunnelserver.management.service.NatControlService.MappingMutation;
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -28,17 +28,17 @@ import java.util.Map;
 @RequestMapping("/api/admin")
 public class TunnelResource {
     private final NatControlService natControlService;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
-    public TunnelResource(NatControlService natControlService, TenantResolver tenantResolver) {
+    public TunnelResource(NatControlService natControlService, ManagementContextResolver contextResolver) {
         this.natControlService = natControlService;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @GetMapping("/tunnels")
     public List<TunnelMappingView> listTunnels(@AuthenticationPrincipal Jwt jwt,
                                                @RequestParam(required = false) Long clientId) {
-        return natControlService.listMappings(tenantResolver.resolve(jwt), clientId);
+        return natControlService.listMappings(contextResolver.resolve(jwt), clientId);
     }
 
     @PostMapping("/clients/{id}/tunnels")
@@ -46,25 +46,25 @@ public class TunnelResource {
                                                           @PathVariable long id,
                                                           @RequestBody MappingMutation request) {
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(natControlService.createMapping(tenantResolver.resolve(jwt), id, request));
+                .body(natControlService.createMapping(contextResolver.resolve(jwt), id, request));
     }
 
     @PutMapping("/tunnels/{tunnelId}")
     public TunnelMappingView updateTunnel(@AuthenticationPrincipal Jwt jwt,
                                           @PathVariable long tunnelId,
                                           @RequestBody MappingMutation request) {
-        return natControlService.updateMapping(tenantResolver.resolve(jwt), tunnelId, request);
+        return natControlService.updateMapping(contextResolver.resolve(jwt), tunnelId, request);
     }
 
     @DeleteMapping("/tunnels/{tunnelId}")
     public ResponseEntity<Void> deleteTunnel(@AuthenticationPrincipal Jwt jwt, @PathVariable long tunnelId) {
-        natControlService.deleteMapping(tenantResolver.resolve(jwt), tunnelId);
+        natControlService.deleteMapping(contextResolver.resolve(jwt), tunnelId);
         return ResponseEntity.noContent().build();
     }
 
     @PostMapping("/clients/{id}/nat-control")
     public Map<String, Object> pushNatControl(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
-        NatControlService.PushResult result = natControlService.pushToClient(tenantResolver.resolve(jwt), id);
+        NatControlService.PushResult result = natControlService.pushToClient(contextResolver.resolve(jwt), id);
         // 兼容老前端：保留 "pushed" 字段（仅 TCP 项数），新前端读 tunnels/httpRoutes。
         // httpRoutes == -1 时代表"未在后台接管 HTTP 路由"，前端按"-"渲染。
         return Map.of(

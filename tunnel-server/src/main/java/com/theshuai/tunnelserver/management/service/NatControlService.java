@@ -11,6 +11,7 @@ import com.theshuai.tunnelserver.management.model.TunnelMappingView;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.tunnelserver.management.repository.TunnelMappingRepository;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
@@ -74,6 +75,17 @@ public class NatControlService {
         return mappings.stream().map(this::toView).toList();
     }
 
+    @Transactional(readOnly = true)
+    public List<TunnelMappingView> listMappings(ManagementContext context, Long clientId) {
+        List<TunnelMapping> mappings = clientId == null
+                ? tunnelMappingRepository.findByTenantIdOrderByIdDesc(context.tenant().tenantId())
+                : tunnelMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(context.tenant().tenantId(), clientId);
+        return mappings.stream()
+                .filter(mapping -> canAccessClient(context, mapping.getClientId()))
+                .map(this::toView)
+                .toList();
+    }
+
     @Transactional
     public TunnelMappingView createMapping(long clientId, MappingMutation request) {
         return createMapping(TenantContext.defaultTenant(), clientId, request);
@@ -82,6 +94,16 @@ public class NatControlService {
     @Transactional
     public TunnelMappingView createMapping(TenantContext tenant, long clientId, MappingMutation request) {
         ClientAccount account = findClient(tenant, clientId);
+        return createMapping(tenant, account, request);
+    }
+
+    @Transactional
+    public TunnelMappingView createMapping(ManagementContext context, long clientId, MappingMutation request) {
+        ClientAccount account = findClient(context, clientId);
+        return createMapping(context.tenant(), account, request);
+    }
+
+    private TunnelMappingView createMapping(TenantContext tenant, ClientAccount account, MappingMutation request) {
         int listenPort = requirePort(request.listenPort(), "listenPort");
         int targetPort = requirePort(request.targetPort(), "targetPort");
         String targetAddress = requireTargetAddress(request.targetAddress());
@@ -116,6 +138,18 @@ public class NatControlService {
     public TunnelMappingView updateMapping(TenantContext tenant, long id, MappingMutation request) {
         TunnelMapping mapping = tunnelMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
+        return updateMapping(tenant, mapping, request);
+    }
+
+    @Transactional
+    public TunnelMappingView updateMapping(ManagementContext context, long id, MappingMutation request) {
+        TunnelMapping mapping = tunnelMappingRepository.findByIdAndTenantId(id, context.tenant().tenantId())
+                .filter(row -> canAccessClient(context, row.getClientId()))
+                .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
+        return updateMapping(context.tenant(), mapping, request);
+    }
+
+    private TunnelMappingView updateMapping(TenantContext tenant, TunnelMapping mapping, MappingMutation request) {
         int listenPort = requirePort(request.listenPort(), "listenPort");
         int targetPort = requirePort(request.targetPort(), "targetPort");
         String targetAddress = requireTargetAddress(request.targetAddress());
@@ -154,6 +188,18 @@ public class NatControlService {
     public void deleteMapping(TenantContext tenant, long id) {
         TunnelMapping mapping = tunnelMappingRepository.findByIdAndTenantId(id, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
+        deleteMapping(tenant, mapping);
+    }
+
+    @Transactional
+    public void deleteMapping(ManagementContext context, long id) {
+        TunnelMapping mapping = tunnelMappingRepository.findByIdAndTenantId(id, context.tenant().tenantId())
+                .filter(row -> canAccessClient(context, row.getClientId()))
+                .orElseThrow(() -> new IllegalArgumentException("mapping not found: " + id));
+        deleteMapping(context.tenant(), mapping);
+    }
+
+    private void deleteMapping(TenantContext tenant, TunnelMapping mapping) {
         tunnelMappingRepository.delete(mapping);
         tunnelMappingRepository.flush();
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(mapping.getClientId(), tenant.tenantId()).orElse(null);
@@ -175,6 +221,16 @@ public class NatControlService {
     @Transactional(readOnly = true)
     public PushResult pushToClient(TenantContext tenant, long clientId) {
         ClientAccount account = findClient(tenant, clientId);
+        return pushToClient(tenant, account);
+    }
+
+    @Transactional(readOnly = true)
+    public PushResult pushToClient(ManagementContext context, long clientId) {
+        ClientAccount account = findClient(context, clientId);
+        return pushToClient(context.tenant(), account);
+    }
+
+    private PushResult pushToClient(TenantContext tenant, ClientAccount account) {
         List<TunnelMapping> mappings = tunnelMappingRepository
                 .findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(tenant.tenantId(), account.getId());
         List<HttpRouteMapping> httpRoutes = assembleHttpRoutesIfManaged(account.getId());
@@ -287,6 +343,25 @@ public class NatControlService {
     private ClientAccount findClient(TenantContext tenant, long clientId) {
         return clientAccountRepository.findByIdAndTenantId(clientId, tenant.tenantId())
                 .orElseThrow(() -> new IllegalArgumentException("client not found: " + clientId));
+    }
+
+    private ClientAccount findClient(ManagementContext context, long clientId) {
+        return (context.isAdmin()
+                ? clientAccountRepository.findByIdAndTenantId(clientId, context.tenant().tenantId())
+                : clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
+                        clientId, context.tenant().tenantId(), context.username()))
+                .orElseThrow(() -> new IllegalArgumentException("client not found: " + clientId));
+    }
+
+    private boolean canAccessClient(ManagementContext context, Long clientId) {
+        if (clientId == null) {
+            return false;
+        }
+        if (context.isAdmin()) {
+            return true;
+        }
+        return clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
+                clientId, context.tenant().tenantId(), context.username()).isPresent();
     }
 
     private int requirePort(Integer port, String field) {

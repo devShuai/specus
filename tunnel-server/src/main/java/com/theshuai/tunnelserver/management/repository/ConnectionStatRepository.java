@@ -19,4 +19,10 @@ public interface ConnectionStatRepository extends JpaRepository<ConnectionStat, 
     List<ConnectionStat> findByClientNameOrderByStatMonthDesc(String clientName, Pageable pageable);
 
     List<ConnectionStat> findByTenantIdAndClientNameOrderByStatMonthDesc(String tenantId, String clientName, Pageable pageable);
+
+    List<ConnectionStat> findByTenantIdAndClientIdInOrderByStatMonthDescClientNameAsc(
+            String tenantId, List<Long> clientIds, Pageable pageable);
+
+    List<ConnectionStat> findByTenantIdAndClientIdInAndClientNameOrderByStatMonthDesc(
+            String tenantId, List<Long> clientIds, String clientName, Pageable pageable);
 }

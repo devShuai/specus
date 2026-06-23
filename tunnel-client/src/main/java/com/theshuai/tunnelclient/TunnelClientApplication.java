@@ -11,6 +11,7 @@ import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.bean.TunnelConfig;
 import org.apache.commons.io.IOUtils;
 import org.springframework.boot.SpringApplication;
+import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.util.StringUtils;
@@ -43,7 +44,9 @@ public class TunnelClientApplication {
     private static final String CONFIG_FILE = "tunnelClientConfig.json";
 
     public static void main(String[] args) {
-        SpringApplication.run(TunnelClientApplication.class, args);
+        SpringApplication application = new SpringApplication(TunnelClientApplication.class);
+        application.setWebApplicationType(WebApplicationType.NONE);
+        application.run(args);
     }
 
     @Bean
@@ -63,25 +66,21 @@ public class TunnelClientApplication {
         ClientEnvironmentInfo environment = collectEnvironment();
         ClientAuthLoginRequest loginRequest = new ClientAuthLoginRequest();
         loginRequest.setEnvironment(environment);
-        String authType = StringUtils.hasText(startupConfig.getAuthType()) ? startupConfig.getAuthType() : "apiKey";
-        loginRequest.setAuthType(authType);
-        if ("password".equalsIgnoreCase(authType)) {
-            loginRequest.setUsername(startupConfig.getUsername());
-            loginRequest.setPassword(startupConfig.getPassword());
-        } else {
-            loginRequest.setApiKey(startupConfig.getApiKey());
-            String timestamp = String.valueOf(System.currentTimeMillis());
-            String nonce = UUID.randomUUID().toString().replace("-", "");
-            loginRequest.setTimestamp(timestamp);
-            loginRequest.setNonce(nonce);
-            loginRequest.setSignature(ClientAuthSigner.signApiKey(
-                    startupConfig.getApiKey(),
-                    timestamp,
-                    nonce,
-                    environment,
-                    startupConfig.getSecret()
-            ));
+        if (!StringUtils.hasText(startupConfig.getApiKey()) || !StringUtils.hasText(startupConfig.getSecret())) {
+            throw new IllegalStateException(CONFIG_FILE + " 必须包含 apiKey 和 secret");
         }
+        loginRequest.setApiKey(startupConfig.getApiKey().trim());
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String nonce = UUID.randomUUID().toString().replace("-", "");
+        loginRequest.setTimestamp(timestamp);
+        loginRequest.setNonce(nonce);
+        loginRequest.setSignature(ClientAuthSigner.signApiKey(
+                loginRequest.getApiKey(),
+                timestamp,
+                nonce,
+                environment,
+                startupConfig.getSecret().trim()
+        ));
 
         ClientAuthLoginResponse response = postLogin(startupConfig, loginRequest);
         TunnelBean tunnelBean = new TunnelBean();

@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import {
+  adminApi,
   fetchOidcConfig,
   oidcExchange,
   passwordLogin as apiPasswordLogin,
@@ -15,7 +16,7 @@ import {
   setUnauthorizedHandler,
   tokenStore,
 } from "../api/client";
-import type { OidcConfig } from "../api/types";
+import type { ManagementUser, OidcConfig } from "../api/types";
 import { codeChallenge, randomToken } from "../lib/pkce";
 
 const PKCE_VERIFIER_KEY = "pkce_verifier";
@@ -26,9 +27,11 @@ const REFRESH_WINDOW_MS = 5 * 60_000;
 interface AuthState {
   ready: boolean;
   authed: boolean;
+  profile: ManagementUser | null;
   oidcConfig: OidcConfig | null;
   loginHint: string;
   expireSession: () => void;
+  reloadProfile: () => Promise<ManagementUser>;
   passwordLogin: (username: string, password: string) => Promise<void>;
   startOidcLogin: () => Promise<void>;
   logout: () => void;
@@ -39,6 +42,7 @@ const AuthContext = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const [authed, setAuthed] = useState(false);
+  const [profile, setProfile] = useState<ManagementUser | null>(null);
   const [oidcConfig, setOidcConfig] = useState<OidcConfig | null>(null);
   const [loginHint, setLoginHint] = useState("请登录");
   const refreshTimer = useRef<number | null>(null);
@@ -73,6 +77,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     refreshTimer.current = window.setInterval(tick, REFRESH_INTERVAL_MS);
   }, [stopRefresh]);
 
+  const reloadProfile = useCallback(async () => {
+    const nextProfile = await adminApi.me();
+    setProfile(nextProfile);
+    return nextProfile;
+  }, []);
+
   const handleUnauthorized = useCallback(() => {
     if (sessionExpired.current) {
       return;
@@ -80,6 +90,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     sessionExpired.current = true;
     tokenStore.clear();
     stopRefresh();
+    setProfile(null);
     setAuthed(false);
     setLoginHint("登录已过期，请重新登录");
   }, [stopRefresh]);
@@ -88,6 +99,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const loginType = tokenStore.loginType();
     tokenStore.clear();
     stopRefresh();
+    setProfile(null);
     if (loginType === "oidc" && oidcConfig?.endSessionEndpoint) {
       window.location.href = oidcConfig.endSessionEndpoint;
       return;
@@ -98,13 +110,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const passwordLogin = useCallback(
     async (username: string, password: string) => {
-      const data = await apiPasswordLogin(username, password);
-      tokenStore.save(data.accessToken, data.expiresIn, "password");
-      sessionExpired.current = false;
-      setAuthed(true);
-      startRefresh();
+      try {
+        const data = await apiPasswordLogin(username, password);
+        tokenStore.save(data.accessToken, data.expiresIn, "password");
+        await reloadProfile();
+        sessionExpired.current = false;
+        setAuthed(true);
+        startRefresh();
+      } catch (error) {
+        tokenStore.clear();
+        setProfile(null);
+        throw error;
+      }
     },
-    [startRefresh],
+    [reloadProfile, startRefresh],
   );
 
   const startOidcLogin = useCallback(async () => {
@@ -143,13 +162,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setLoginHint(params.get("error_description") || params.get("error") || "登录失败");
         cleanUrl();
       } else if (params.get("code")) {
-        await completeOidcRedirect(params, setLoginHint, () => {
+        await completeOidcRedirect(params, setLoginHint, async () => {
+          await reloadProfile();
           sessionExpired.current = false;
           setAuthed(true);
+          startRefresh();
         });
       } else if (tokenStore.valid()) {
-        setAuthed(true);
-        startRefresh();
+        try {
+          await reloadProfile();
+          setAuthed(true);
+          startRefresh();
+        } catch (error) {
+          tokenStore.clear();
+          setProfile(null);
+          setLoginHint(error instanceof Error ? error.message : "登录已过期，请重新登录");
+        }
       } else if (config && !config.passwordLoginEnabled && !config.configured) {
         setLoginHint("未配置任何登录方式：请设置用户名/密码或 OIDC");
       }
@@ -158,14 +186,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void init();
 
     return () => setUnauthorizedHandler(null);
-  }, [handleUnauthorized, startRefresh]);
+  }, [handleUnauthorized, reloadProfile, startRefresh]);
 
   const value: AuthState = {
     ready,
     authed,
+    profile,
     oidcConfig,
     loginHint,
     expireSession: handleUnauthorized,
+    reloadProfile,
     passwordLogin,
     startOidcLogin,
     logout,
@@ -176,7 +206,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 async function completeOidcRedirect(
   params: URLSearchParams,
   setHint: (hint: string) => void,
-  onSuccess: () => void,
+  onSuccess: () => Promise<void>,
 ): Promise<void> {
   const expectedState = sessionStorage.getItem(OIDC_STATE_KEY);
   if (!expectedState || params.get("state") !== expectedState) {
@@ -188,7 +218,7 @@ async function completeOidcRedirect(
     const verifier = sessionStorage.getItem(PKCE_VERIFIER_KEY) || "";
     const data = await oidcExchange(params.get("code") as string, verifier);
     tokenStore.save(data.accessToken, data.expiresIn, "oidc");
-    onSuccess();
+    await onSuccess();
   } catch (error) {
     setHint(error instanceof Error ? error.message : "登录失败");
   } finally {

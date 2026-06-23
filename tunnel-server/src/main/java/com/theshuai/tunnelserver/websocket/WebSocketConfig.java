@@ -1,6 +1,6 @@
 package com.theshuai.tunnelserver.websocket;
 
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
@@ -32,20 +32,20 @@ public class WebSocketConfig implements WebSocketConfigurer {
 
     private final ConnectionEventsWebSocketHandler connectionEventsHandler;
     private final JwtDecoder jwtDecoder;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
     public WebSocketConfig(ConnectionEventsWebSocketHandler connectionEventsHandler,
                            JwtDecoder jwtDecoder,
-                           TenantResolver tenantResolver) {
+                           ManagementContextResolver contextResolver) {
         this.connectionEventsHandler = connectionEventsHandler;
         this.jwtDecoder = jwtDecoder;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(connectionEventsHandler, "/ws/connections")
-                .addInterceptors(new JwtHandshakeInterceptor(jwtDecoder, tenantResolver))
+                .addInterceptors(new JwtHandshakeInterceptor(jwtDecoder, contextResolver))
                 // 默认 '*' 同源；显式写出来以示意，不引入 CORS 漏洞
                 .setAllowedOriginPatterns("*");
     }

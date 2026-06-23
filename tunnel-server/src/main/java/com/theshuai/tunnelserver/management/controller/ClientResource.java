@@ -3,9 +3,9 @@ package com.theshuai.tunnelserver.management.controller;
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.ClientAccountService.ClientMutation;
-import com.theshuai.tunnelserver.management.service.ClientAccountService.CredentialResult;
+import com.theshuai.tunnelserver.management.service.ClientAccountService.ClientResult;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -22,39 +22,39 @@ import java.util.List;
 public class ClientResource {
     private final ClientAccountService clientAccountService;
     private final TrafficUsageService trafficUsageService;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
     public ClientResource(ClientAccountService clientAccountService,
                           TrafficUsageService trafficUsageService,
-                          TenantResolver tenantResolver) {
+                          ManagementContextResolver contextResolver) {
         this.clientAccountService = clientAccountService;
         this.trafficUsageService = trafficUsageService;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @GetMapping
     public List<ClientAccountView> listClients(@AuthenticationPrincipal Jwt jwt) {
         trafficUsageService.flush();
-        return clientAccountService.listClients(tenantResolver.resolve(jwt));
+        return clientAccountService.listClients(contextResolver.resolve(jwt));
     }
 
     @PostMapping
-    public ResponseEntity<CredentialResult> createClient(@AuthenticationPrincipal Jwt jwt,
-                                                         @RequestBody ClientMutation request) {
+    public ResponseEntity<ClientResult> createClient(@AuthenticationPrincipal Jwt jwt,
+                                                     @RequestBody ClientMutation request) {
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(clientAccountService.createClient(tenantResolver.resolve(jwt), request));
+                .body(clientAccountService.createClient(contextResolver.resolve(jwt), request));
     }
 
     @PutMapping("/{id}")
-    public CredentialResult updateClient(@AuthenticationPrincipal Jwt jwt,
-                                         @PathVariable long id,
-                                         @RequestBody ClientMutation request) {
-        return clientAccountService.updateClient(tenantResolver.resolve(jwt), id, request);
+    public ClientResult updateClient(@AuthenticationPrincipal Jwt jwt,
+                                     @PathVariable long id,
+                                     @RequestBody ClientMutation request) {
+        return clientAccountService.updateClient(contextResolver.resolve(jwt), id, request);
     }
 
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deleteClient(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
-        clientAccountService.deleteClient(tenantResolver.resolve(jwt), id);
+        clientAccountService.deleteClient(contextResolver.resolve(jwt), id);
         return ResponseEntity.noContent().build();
     }
 }

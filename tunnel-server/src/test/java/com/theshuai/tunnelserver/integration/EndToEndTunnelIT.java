@@ -255,7 +255,6 @@ class EndToEndTunnelIT {
         String timestamp = String.valueOf(System.currentTimeMillis());
         String nonce = UUID.randomUUID().toString().replace("-", "");
         ClientAuthLoginRequest request = new ClientAuthLoginRequest();
-        request.setAuthType("apiKey");
         request.setApiKey(API_KEY);
         request.setTimestamp(timestamp);
         request.setNonce(nonce);

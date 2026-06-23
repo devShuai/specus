@@ -1,6 +1,7 @@
 package com.theshuai.tunnelserver.websocket;
 
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,13 +33,14 @@ public class JwtHandshakeInterceptor implements HandshakeInterceptor {
     /** 握手成功后塞进 WebSocketSession attributes 的 key，handler 内可读取调试用。 */
     public static final String ATTR_USER = "wsUser";
     public static final String ATTR_TENANT_ID = "tenantId";
+    public static final String ATTR_ADMIN = "admin";
 
     private final JwtDecoder jwtDecoder;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
-    public JwtHandshakeInterceptor(JwtDecoder jwtDecoder, TenantResolver tenantResolver) {
+    public JwtHandshakeInterceptor(JwtDecoder jwtDecoder, ManagementContextResolver contextResolver) {
         this.jwtDecoder = jwtDecoder;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @Override
@@ -50,8 +52,10 @@ public class JwtHandshakeInterceptor implements HandshakeInterceptor {
         }
         try {
             Jwt jwt = jwtDecoder.decode(token);
-            attributes.put(ATTR_USER, jwt.getSubject());
-            attributes.put(ATTR_TENANT_ID, tenantResolver.resolve(jwt).tenantId());
+            ManagementContext context = contextResolver.resolve(jwt);
+            attributes.put(ATTR_USER, context.username());
+            attributes.put(ATTR_TENANT_ID, context.tenant().tenantId());
+            attributes.put(ATTR_ADMIN, context.isAdmin());
             return true;
         } catch (JwtException e) {
             log.debug("ws handshake JWT rejected: {}", e.getMessage());

@@ -43,7 +43,12 @@ body {
 .dark [data-slot="input-wrapper"][data-focus="true"],
 .dark [data-slot="input-wrapper"]:focus-within,
 .dark [data-slot="input-wrapper"][data-focus-visible="true"],
-.dark [data-slot="input-wrapper"][data-hover="true"] {
+.dark [data-slot="input-wrapper"][data-hover="true"],
+.dark [data-slot="inner-wrapper"],
+.dark [data-slot="inner-wrapper"]:focus-within,
+.dark [data-slot="inner-wrapper"] input,
+.dark [data-slot="inner-wrapper"] input:focus,
+.dark [data-slot="inner-wrapper"] input:focus-visible {
   border-color: transparent !important;
   outline: none !important;
   box-shadow: none !important;
@@ -66,6 +71,24 @@ body {
 .dark [data-slot="input"],
 .dark [data-slot="inner-wrapper"] input {
   color: #fafafa;
+  border-color: transparent !important;
+  outline: none !important;
+  box-shadow: none !important;
+  --tw-ring-color: transparent !important;
+  --tw-ring-offset-color: transparent !important;
+  --tw-ring-offset-width: 0 !important;
+  --tw-ring-shadow: 0 0 #0000 !important;
+  --tw-ring-offset-shadow: 0 0 #0000 !important;
+}
+
+.dark .landing-input-wrapper,
+.dark .landing-input-wrapper:focus-within,
+.dark .landing-input-wrapper input,
+.dark .landing-input-wrapper input:focus,
+.dark .landing-input-wrapper input:focus-visible {
+  border-color: transparent !important;
+  outline: none !important;
+  box-shadow: none !important;
 }
 
 .landing-shell {

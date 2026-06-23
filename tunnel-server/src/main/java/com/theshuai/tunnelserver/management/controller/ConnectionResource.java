@@ -2,10 +2,11 @@ package com.theshuai.tunnelserver.management.controller;
 
 import com.theshuai.tunnelserver.management.model.ConnectionRecordView;
 import com.theshuai.tunnelserver.management.model.ConnectionStatView;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import com.theshuai.tunnelserver.management.service.ConnectionArchiveService;
 import com.theshuai.tunnelserver.management.service.ConnectionRecordService;
 import com.theshuai.tunnelserver.management.service.ConnectionRecordService.ConnectionFilter;
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -25,14 +26,14 @@ import java.util.Map;
 public class ConnectionResource {
     private final ConnectionRecordService connectionRecordService;
     private final ConnectionArchiveService connectionArchiveService;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
 
     public ConnectionResource(ConnectionRecordService connectionRecordService,
                               ConnectionArchiveService connectionArchiveService,
-                              TenantResolver tenantResolver) {
+                              ManagementContextResolver contextResolver) {
         this.connectionRecordService = connectionRecordService;
         this.connectionArchiveService = connectionArchiveService;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
     }
 
     @GetMapping("/connections")
@@ -45,8 +46,9 @@ public class ConnectionResource {
                                                @RequestParam(defaultValue = "100") int size) {
         int normalizedSize = Math.clamp(size, 1, 500);
         int normalizedPage = Math.max(0, page);
+        ManagementContext context = contextResolver.resolve(jwt);
         Page<ConnectionRecordView> result = connectionRecordService.listConnections(
-                tenantResolver.resolve(jwt),
+                context,
                 new ConnectionFilter(clientId, success, from, to),
                 PageRequest.of(normalizedPage, normalizedSize, Sort.by(Sort.Direction.DESC, "id")));
         Map<String, Object> response = new LinkedHashMap<>();
@@ -62,6 +64,6 @@ public class ConnectionResource {
     public List<ConnectionStatView> listConnectionStats(@AuthenticationPrincipal Jwt jwt,
                                                         @RequestParam(required = false) String clientName,
                                                         @RequestParam(defaultValue = "100") int limit) {
-        return connectionArchiveService.listStats(tenantResolver.resolve(jwt), clientName, limit);
+        return connectionArchiveService.listStats(contextResolver.resolve(jwt), clientName, limit);
     }
 }

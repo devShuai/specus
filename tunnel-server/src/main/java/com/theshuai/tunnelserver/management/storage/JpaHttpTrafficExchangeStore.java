@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
     private final HttpTrafficExchangeRepository repository;
@@ -31,13 +32,17 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
     @Override
     public Page<HttpTrafficExchangeView> search(TenantContext tenant,
                                                 Long clientId,
+                                                Set<Long> visibleClientIds,
                                                 String route,
                                                 String responseBodyType,
                                                 HttpTrafficSearchField field,
                                                 String keyword,
                                                 Pageable pageable) {
+        if (isDenied(clientId, visibleClientIds)) {
+            return Page.empty(pageable);
+        }
         return repository
-                .findAll(httpExchangeSpec(tenant, clientId, normalizeRoute(route),
+                .findAll(httpExchangeSpec(tenant, clientId, visibleClientIds, normalizeRoute(route),
                         HttpBodyTypeClassifier.normalize(responseBodyType), field, normalizeKeyword(keyword)), pageable)
                 .map(JpaHttpTrafficExchangeStore::toView);
     }
@@ -97,6 +102,7 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
 
     private static Specification<HttpTrafficExchange> httpExchangeSpec(TenantContext tenant,
                                                                        Long clientId,
+                                                                       Set<Long> visibleClientIds,
                                                                        String route,
                                                                        String responseBodyType,
                                                                        HttpTrafficSearchField field,
@@ -107,6 +113,8 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
             predicates.add(cb.equal(root.get("tenantId"), tenant.tenantId()));
             if (clientId != null) {
                 predicates.add(cb.equal(root.get("clientId"), clientId));
+            } else if (visibleClientIds != null) {
+                predicates.add(root.get("clientId").in(visibleClientIds));
             }
             if (route != null) {
                 predicates.add(cb.equal(root.get("route"), route));
@@ -154,6 +162,16 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
             }
             return cb.and(predicates.toArray(Predicate[]::new));
         };
+    }
+
+    private static boolean isDenied(Long clientId, Set<Long> visibleClientIds) {
+        if (visibleClientIds == null) {
+            return false;
+        }
+        if (visibleClientIds.isEmpty()) {
+            return true;
+        }
+        return clientId != null && !visibleClientIds.contains(clientId);
     }
 
     private static Predicate responseBodyTypePredicate(jakarta.persistence.criteria.Root<HttpTrafficExchange> root,

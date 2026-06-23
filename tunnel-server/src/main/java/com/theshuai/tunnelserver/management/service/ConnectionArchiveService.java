@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.management.model.ConnectionStatView;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionStatRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionStatRow;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -32,13 +33,16 @@ import java.util.List;
 public class ConnectionArchiveService {
     private final ConnectionRecordRepository connectionRecordRepository;
     private final ConnectionStatRepository connectionStatRepository;
+    private final ClientAccountService clientAccountService;
     private final int detailRetentionDays;
 
     public ConnectionArchiveService(ConnectionRecordRepository connectionRecordRepository,
                                     ConnectionStatRepository connectionStatRepository,
+                                    ClientAccountService clientAccountService,
                                     @Value("${tunnel.connection-record.detail-retention-days:60}") int detailRetentionDays) {
         this.connectionRecordRepository = connectionRecordRepository;
         this.connectionStatRepository = connectionStatRepository;
+        this.clientAccountService = clientAccountService;
         this.detailRetentionDays = detailRetentionDays;
     }
 
@@ -84,6 +88,24 @@ public class ConnectionArchiveService {
                 ? connectionStatRepository.findByTenantIdAndClientNameOrderByStatMonthDesc(
                         tenant.tenantId(), clientName.trim(), pageable)
                 : connectionStatRepository.findByTenantIdOrderByStatMonthDescClientNameAsc(tenant.tenantId(), pageable);
+        return stats.stream().map(this::toView).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<ConnectionStatView> listStats(ManagementContext context, String clientName, int limit) {
+        if (context.isAdmin()) {
+            return listStats(context.tenant(), clientName, limit);
+        }
+        List<Long> visibleClientIds = clientAccountService.visibleClientIds(context);
+        if (visibleClientIds.isEmpty()) {
+            return List.of();
+        }
+        Pageable pageable = PageRequest.of(0, Math.max(1, Math.min(limit, 500)));
+        List<ConnectionStat> stats = StringUtils.hasText(clientName)
+                ? connectionStatRepository.findByTenantIdAndClientIdInAndClientNameOrderByStatMonthDesc(
+                        context.tenant().tenantId(), visibleClientIds, clientName.trim(), pageable)
+                : connectionStatRepository.findByTenantIdAndClientIdInOrderByStatMonthDescClientNameAsc(
+                        context.tenant().tenantId(), visibleClientIds, pageable);
         return stats.stream().map(this::toView).toList();
     }
 

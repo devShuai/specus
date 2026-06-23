@@ -1,9 +1,11 @@
 package com.theshuai.tunnelserver.management.controller;
 
 import com.theshuai.tunnelserver.database.DatabaseInitializer;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
+import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
+import com.theshuai.tunnelserver.management.service.ManagementUserService;
 import com.theshuai.tunnelserver.management.service.OverviewService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
-import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -22,26 +24,31 @@ public class OverviewResource {
     private final OverviewService overviewService;
     private final TrafficUsageService trafficUsageService;
     private final DatabaseInitializer databaseInitializer;
-    private final TenantResolver tenantResolver;
+    private final ManagementContextResolver contextResolver;
+    private final ManagementUserService managementUserService;
 
     public OverviewResource(OverviewService overviewService,
                             TrafficUsageService trafficUsageService,
                             DatabaseInitializer databaseInitializer,
-                            TenantResolver tenantResolver) {
+                            ManagementContextResolver contextResolver,
+                            ManagementUserService managementUserService) {
         this.overviewService = overviewService;
         this.trafficUsageService = trafficUsageService;
         this.databaseInitializer = databaseInitializer;
-        this.tenantResolver = tenantResolver;
+        this.contextResolver = contextResolver;
+        this.managementUserService = managementUserService;
     }
 
     @GetMapping("/overview")
     public Map<String, Object> overview(@AuthenticationPrincipal Jwt jwt) {
         trafficUsageService.flush();
-        return overviewService.overview(tenantResolver.resolve(jwt));
+        return overviewService.overview(contextResolver.resolve(jwt));
     }
 
     @PostMapping("/database/initialize")
     public Map<String, Object> initializeDatabase(@AuthenticationPrincipal Jwt jwt) {
-        return databaseInitializer.initialize(tenantResolver.resolve(jwt));
+        ManagementContext context = contextResolver.resolve(jwt);
+        managementUserService.requireAdmin(context);
+        return databaseInitializer.initialize(context.tenant());
     }
 }
