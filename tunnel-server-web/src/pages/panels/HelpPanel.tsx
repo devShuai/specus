@@ -29,6 +29,9 @@ export function HelpPanel() {
         <Tab key="csharp" title=".NET 客户端">
           <CsharpSection />
         </Tab>
+        <Tab key="peer-mesh" title="私有组网">
+          <PeerMeshSection />
+        </Tab>
         <Tab key="protocol" title="协议与端口">
           <ProtocolSection />
         </Tab>
@@ -52,8 +55,8 @@ function QuickStartSection() {
 
       <DocCard title="2. 创建客户端账号">
         <p>
-          进入「客户端」面板「新建客户端」，系统会自动生成一个客户端 ID。然后到「客户端凭证」面板为该客户端
-          签发 API Key + Secret。Secret 仅展示一次，复制保存到客户端配置文件。
+          进入「客户端」面板「新建客户端」，系统会自动生成客户端和启动凭证。API Key + Secret 用于客户端启动时
+          调用 HTTP 登录接口。Secret 仅展示一次，复制保存到客户端配置文件。
         </p>
       </DocCard>
 
@@ -72,6 +75,7 @@ function QuickStartSection() {
       <DocCard title="4. 下载并启动客户端">
         <p>
           打开「客户端下载」面板获取对应实现的客户端，按下面各 Tab 的说明启动。所有实现共享同一份 JSON 配置格式。
+          端口映射、HTTP 路由和私有组网配置都由服务端登录响应下发。
         </p>
       </DocCard>
     </div>
@@ -98,12 +102,11 @@ function JavaSection() {
 mvn org.springframework.boot:spring-boot-maven-plugin:run`} />
       </DocCard>
 
-      <DocCard title="端口冲突">
+      <DocCard title="配置来源">
         <p>
-          客户端自带 Spring Boot Web 默认占用 <Inline>8088</Inline>，与服务端管理端口相同。
-          单机联调时需要覆盖：
+          Java 客户端当前不启动 Web 服务，本地配置只保存启动登录信息。客户端启动后会先调用
+          <Inline>/api/client/auth/login</Inline> 获取控制连接地址、访问令牌、端口映射、HTTP 路由和 peer mesh 配置。
         </p>
-        <CodeBlock language="bash" code={`java -jar tunnel-client.jar --server.port=8089`} />
       </DocCard>
     </div>
   );
@@ -119,6 +122,9 @@ function GoSection() {
       <DocCard title="配置文件">
         <p className="mb-2 text-small">放在二进制同目录或工作目录下：</p>
         <CodeBlock language="json" code={SAMPLE_CONFIG} />
+        <p className="mt-2 text-small text-default-500">
+          非 Java 客户端需要与当前 Java 协议保持一致：启动配置只包含 HTTP 登录凭证，端口映射和 HTTP 路由由服务端下发。
+        </p>
       </DocCard>
 
       <DocCard title="启动命令">
@@ -149,6 +155,9 @@ function CsharpSection() {
       <DocCard title="配置文件">
         <p className="mb-2 text-small">放在程序集所在目录或工作目录下：</p>
         <CodeBlock language="json" code={SAMPLE_CONFIG} />
+        <p className="mt-2 text-small text-default-500">
+          非 Java 客户端需要与当前 Java 协议保持一致：启动配置只包含 HTTP 登录凭证，端口映射和 HTTP 路由由服务端下发。
+        </p>
       </DocCard>
 
       <DocCard title="启动命令">
@@ -159,6 +168,71 @@ function CsharpSection() {
         <p className="mb-2 mt-3 text-small">从源码运行：</p>
         <CodeBlock language="bash" code={`cd tunnel-client-csharp
 dotnet run --project src/ShuaiTunnel.Client`} />
+      </DocCard>
+    </div>
+  );
+}
+
+function PeerMeshSection() {
+  return (
+    <div className="mt-4 flex flex-col gap-4">
+      <DocCard title="启用条件">
+        <ul className="ml-5 list-disc space-y-1 text-small">
+          <li>
+            服务端设置 <Inline>TUNNEL_PEER_MESH_ENABLED=true</Inline>。
+          </li>
+          <li>
+            在「私有组网」页面启用对应客户端。默认同一租户 / 同一用户下客户端可互访；跨用户需要显式 ACL。
+          </li>
+          <li>
+            客户端启动配置可选择 <Inline>peerMeshDevice</Inline>：默认 <Inline>noop</Inline> 只做探测和加密 UDP 数据面，
+            <Inline>auto</Inline>、<Inline>linux-tun</Inline>、<Inline>windows-wintun</Inline> 会尝试创建虚拟网卡。
+          </li>
+        </ul>
+      </DocCard>
+
+      <DocCard title="客户端配置示例">
+        <CodeBlock language="json" code={PEER_MESH_CONFIG} />
+      </DocCard>
+
+      <DocCard title="UDP 端口">
+        <ul className="ml-5 list-disc space-y-1 text-small">
+          <li>
+            <Inline>3478/udp</Inline>：内置 STUN/TURN-lite 主端口，承载 binding、relay allocation 和 relay 数据。
+          </li>
+          <li>
+            <Inline>3479/udp</Inline>：NAT 类型辅助探测端口。默认由
+            <Inline>TUNNEL_PEER_MESH_STUN_TURN_PORT + 1</Inline> 得到，可用
+            <Inline>TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT</Inline> 显式覆盖。
+          </li>
+        </ul>
+        <CodeBlock language="bash" code={`sudo firewall-cmd --add-port=3478/udp --permanent
+sudo firewall-cmd --add-port=3479/udp --permanent
+sudo firewall-cmd --reload`} />
+      </DocCard>
+
+      <DocCard title="NAT 类型探测">
+        <p className="mb-2 text-small">
+          客户端会向主端口发送 binding；服务端从主端口返回映射地址，同时从备用端口主动回包；
+          客户端还会主动向备用端口再发送一次 binding。三类观测组合后展示 NAT 类型：
+        </p>
+        <ul className="ml-5 list-disc space-y-1 text-small">
+          <li><Inline>无 NAT</Inline>：公网映射地址就是客户端本机地址，端口也保持一致。</li>
+          <li><Inline>Symmetric NAT</Inline>：主端口和备用端口看到的映射端点不同，直连成功率最低。</li>
+          <li><Inline>Port Restricted NAT</Inline>：映射端点稳定，但收不到服务端备用端口主动回包。</li>
+          <li><Inline>Full cone / Restricted NAT</Inline>：映射端点稳定，且能收到备用端口主动回包。</li>
+        </ul>
+        <p className="mt-2 text-small text-default-500">
+          只有一个公网 IP 时，不能严格拆分 Full Cone 与 Address-Restricted NAT，所以页面合并展示。
+        </p>
+      </DocCard>
+
+      <DocCard title="虚拟网卡要求">
+        <ul className="ml-5 list-disc space-y-1 text-small">
+          <li>Linux：需要 root 或 <Inline>CAP_NET_ADMIN</Inline>，系统需要 <Inline>/dev/net/tun</Inline>。</li>
+          <li>Windows：需要管理员权限。客户端已内置 Wintun DLL，会优先从程序资源释放到本地后加载。</li>
+          <li>失败时客户端会回退 <Inline>noop</Inline> 并把虚拟网卡状态上报到「私有组网」页面。</li>
+        </ul>
       </DocCard>
     </div>
   );
@@ -178,6 +252,14 @@ function ProtocolSection() {
             <Inline>/http/&#123;client&#125;/&#123;route&#125;/...</Inline> 为公开流量入口。
           </li>
           <li>各「端口映射」自定义的公网监听端口（如 9000）。</li>
+          <li>
+            <Inline>3478/udp</Inline> — peer mesh STUN/TURN-lite 主端口。
+            通过环境变量 <Inline>TUNNEL_PEER_MESH_STUN_TURN_PORT</Inline> 覆盖。
+          </li>
+          <li>
+            <Inline>3479/udp</Inline> — peer mesh NAT 类型辅助探测端口，默认是主端口 + 1。
+            通过环境变量 <Inline>TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT</Inline> 覆盖。
+          </li>
         </ul>
       </DocCard>
 
@@ -185,6 +267,7 @@ function ProtocolSection() {
         <p className="text-small">
           控制连接走自定义二进制协议，默认 11 字节头（magic / version / serializer / command / length），
           消息体采用紧凑二进制序列化，必要时启用 deflate 压缩。客户端实现之间字节级兼容。
+          Peer mesh 信令复用控制连接的 <Inline>PEER_CONTROL</Inline>，数据面优先 UDP 直连，失败后走内置 TURN-lite relay。
         </p>
       </DocCard>
 
@@ -211,7 +294,8 @@ function FaqSection() {
     <div className="mt-4 flex flex-col gap-4">
       <DocCard title="客户端显示「客户端不在线」">
         <ul className="ml-5 list-disc space-y-1 text-small">
-          <li>检查 <Inline>remoteAddress</Inline> 和 <Inline>remotePort</Inline> 与服务端控制端口 7010 一致</li>
+          <li>检查 <Inline>serverBaseUrl</Inline> 是否能访问服务端管理 HTTP 地址</li>
+          <li>检查服务端登录响应里的控制连接地址和端口是否可达，默认控制端口为 7010</li>
           <li>检查防火墙是否放行 7010</li>
           <li>检查客户端日志：登录失败一般是 API Key / Secret 不对，或 Secret 包含尾随空白字符</li>
           <li>服务端 TLS 启用后，客户端必须同步启用 TLS 才能握手</li>
@@ -243,9 +327,18 @@ function FaqSection() {
 
       <DocCard title="一台机器多个客户端实例">
         <p className="text-small">
-          客户端凭证可以配置 <Inline>maxOnlineInstances</Inline>（默认 2）允许同一凭证同时多实例在线。
-          每个实例需要不同 <Inline>clientSessionId</Inline>（登录时自动协商）。
+          服务端会按用户和机器限制同一台机器上的实例数量，默认同一用户最多 2 个在线实例。
+          同一机器重复启动时，服务端会拒绝超过限制的连接；停止旧实例后可重新登录。
         </p>
+      </DocCard>
+
+      <DocCard title="私有组网一直显示 NAT 未知">
+        <ul className="ml-5 list-disc space-y-1 text-small">
+          <li>确认服务端已启用 <Inline>TUNNEL_PEER_MESH_ENABLED=true</Inline>，并且客户端在「私有组网」页面已启用。</li>
+          <li>确认 UDP <Inline>3478</Inline> 可达；如果要更细分类 NAT，还需要放行备用 UDP 端口，默认 <Inline>3479</Inline>。</li>
+          <li>如果服务器在 NAT 后面，设置 <Inline>TUNNEL_PEER_MESH_PUBLIC_ADDRESS</Inline> 为公网域名或 IP。</li>
+          <li>客户端需要升级到支持 <Inline>probeRole</Inline> 和备用端口探测的版本。</li>
+        </ul>
       </DocCard>
     </div>
   );
@@ -299,22 +392,16 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
 
 // 共享配置示例（与 README.md "tunnelClientConfig.json" 样例保持一致）
 const SAMPLE_CONFIG = `{
-  "clientName": "Demo client",
-  "apiKey": "ck_xxxxxxxxxxxxxxxx",
+  "serverBaseUrl": "https://tunnel.example.com",
+  "apiKey": "demo-client",
+  "secret": "your-client-secret"
+}`;
+
+const PEER_MESH_CONFIG = `{
+  "serverBaseUrl": "https://tunnel.example.com",
+  "apiKey": "demo-client",
   "secret": "your-client-secret",
-  "remoteAddress": "your.server.example.com",
-  "remotePort": 7010,
-  "tunnelConfigList": [
-    {
-      "port": 9000,
-      "tunnelAddress": "127.0.0.1",
-      "tunnelPort": 8080
-    }
-  ],
-  "httpTunnelConfigList": [
-    {
-      "route": "web",
-      "targetBaseUrl": "http://127.0.0.1:8080"
-    }
-  ]
+  "peerMeshDevice": "auto",
+  "peerMeshTunName": "shuai0",
+  "peerMeshMtu": 1400
 }`;

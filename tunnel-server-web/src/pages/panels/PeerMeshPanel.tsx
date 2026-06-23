@@ -25,6 +25,7 @@ export function PeerMeshPanel() {
   const [acls, setAcls] = useState<PeerMeshAcl[]>([]);
   const [sessions, setSessions] = useState<PeerMeshSession[]>([]);
   const [loading, setLoading] = useState(true);
+  const [clearingSessions, setClearingSessions] = useState(false);
   const [sourceClientId, setSourceClientId] = useState("");
   const [targetClientId, setTargetClientId] = useState("");
 
@@ -54,9 +55,9 @@ export function PeerMeshPanel() {
 
   const enabledDevices = useMemo(() => devices.filter((device) => device.enabled), [devices]);
   const onlineDevices = useMemo(() => devices.filter((device) => device.online), [devices]);
-  const directSessions = useMemo(() => sessions.filter((session) => session.pathType === "DIRECT"), [sessions]);
-  const relaySessions = useMemo(() => sessions.filter((session) => session.pathType === "RELAY"), [sessions]);
   const activeSessions = useMemo(() => sessions.filter((session) => session.status !== "CLOSED"), [sessions]);
+  const directSessions = useMemo(() => activeSessions.filter((session) => session.pathType === "DIRECT"), [activeSessions]);
+  const relaySessions = useMemo(() => activeSessions.filter((session) => session.pathType === "RELAY"), [activeSessions]);
   const peerTrafficBytes = useMemo(
     () => sessions.reduce((total, session) => total + (session.directBytes || 0) + (session.relayBytes || 0), 0),
     [sessions],
@@ -114,6 +115,28 @@ export function PeerMeshPanel() {
     }
   };
 
+  const closeOpenSessions = async () => {
+    if (activeSessions.length === 0) {
+      notify("当前没有活跃 peer 链路");
+      return;
+    }
+    if (!window.confirm(`确定清理当前权限范围内的活跃 peer 链路吗？页面当前显示 ${activeSessions.length} 条。`)) {
+      return;
+    }
+    setClearingSessions(true);
+    try {
+      const closedSessions = await adminApi.closeOpenPeerMeshSessions();
+      const closedById = new Map(closedSessions.map((session) => [session.id, session]));
+      setSessions((items) => items.map((item) => closedById.get(item.id) ?? item));
+      notify(`已清理 ${closedSessions.length} 条活跃 peer 链路`);
+      await load();
+    } catch (error) {
+      notifyError(error, "清理活跃 peer 链路失败");
+    } finally {
+      setClearingSessions(false);
+    }
+  };
+
   return (
     <div className="mt-3 flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -121,9 +144,20 @@ export function PeerMeshPanel() {
           <h2 className="text-lg font-semibold text-foreground">私有组网</h2>
           <p className="text-small text-default-500">同一用户下客户端分配虚拟 IP，优先直连，失败后切到内置 relay。</p>
         </div>
-        <Button variant="flat" onPress={() => void load()}>
-          刷新
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            color="danger"
+            variant="flat"
+            isDisabled={activeSessions.length === 0}
+            isLoading={clearingSessions}
+            onPress={() => void closeOpenSessions()}
+          >
+            清理活跃链路
+          </Button>
+          <Button variant="flat" onPress={() => void load()}>
+            刷新
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
@@ -152,6 +186,7 @@ export function PeerMeshPanel() {
             <TableColumn>归属</TableColumn>
             <TableColumn>虚拟 IP</TableColumn>
             <TableColumn>状态</TableColumn>
+            <TableColumn>虚拟网卡</TableColumn>
             <TableColumn>NAT / Endpoint</TableColumn>
             <TableColumn>最后上线</TableColumn>
             <TableColumn>启用</TableColumn>
@@ -183,8 +218,26 @@ export function PeerMeshPanel() {
                   </div>
                 </TableCell>
                 <TableCell>
+                  <div className="flex max-w-64 flex-col gap-1 text-small">
+                    <div className="flex flex-wrap items-center gap-1">
+                      <Chip size="sm" color={virtualDeviceColor(device.virtualDeviceStatus)} variant="flat">
+                        {virtualDeviceLabel(device.virtualDeviceStatus)}
+                      </Chip>
+                      <span className="font-mono text-tiny text-default-500">
+                        {device.virtualDeviceName || device.virtualDeviceMode || "-"}
+                      </span>
+                    </div>
+                    {device.virtualDeviceError && (
+                      <span className="line-clamp-2 text-tiny text-danger">{device.virtualDeviceError}</span>
+                    )}
+                    {device.virtualDeviceUpdatedAt && (
+                      <span className="text-tiny text-default-400">上报 {formatDateTime(device.virtualDeviceUpdatedAt)}</span>
+                    )}
+                  </div>
+                </TableCell>
+                <TableCell>
                   <div className="flex max-w-72 flex-col break-all text-small">
-                    <span>{device.natType || "-"}</span>
+                    <span>{natTypeLabel(device.natType)}</span>
                     <span className="text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
                   </div>
                 </TableCell>
@@ -265,7 +318,7 @@ export function PeerMeshPanel() {
           <CardBody className="gap-3 p-3">
             <div>
               <h3 className="text-base font-semibold">活跃会话</h3>
-              <p className="text-small text-default-500">记录 ICE 协商、direct/relay 路径和授权过期时间。</p>
+              <p className="text-small text-default-500">只展示未关闭的 ICE 会话；清理后会同步断开拓扑链路。</p>
             </div>
             <Table aria-label="Peer mesh 会话" removeWrapper>
               <TableHeader>
@@ -277,7 +330,7 @@ export function PeerMeshPanel() {
                 <TableColumn>过期</TableColumn>
                 <TableColumn>操作</TableColumn>
               </TableHeader>
-              <TableBody items={sessions} isLoading={loading} emptyContent="暂无 peer session">
+              <TableBody items={activeSessions} isLoading={loading} emptyContent="暂无活跃 peer session">
                 {(session) => (
                   <TableRow key={session.id}>
                     <TableCell>
@@ -367,7 +420,7 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
               </div>
               <div className="mt-2 flex flex-wrap gap-1 text-tiny text-default-500">
                 <span>{device.ownerUsername || "-"}</span>
-                <span>{device.natType || "NAT 未知"}</span>
+                <span>{natTypeLabel(device.natType)}</span>
               </div>
             </div>
           ))}
@@ -420,6 +473,57 @@ function pathColor(pathType: string, status: string): "default" | "success" | "w
     return "default";
   }
   return pathType === "DIRECT" ? "success" : "warning";
+}
+
+function virtualDeviceColor(status?: string | null): "default" | "success" | "warning" | "danger" {
+  if (!status) {
+    return "default";
+  }
+  if (status === "ACTIVE") {
+    return "success";
+  }
+  if (status === "NOOP") {
+    return "warning";
+  }
+  if (status.includes("FAILED")) {
+    return "danger";
+  }
+  return "default";
+}
+
+function virtualDeviceLabel(status?: string | null) {
+  if (!status) {
+    return "未上报";
+  }
+  if (status === "ACTIVE") {
+    return "已创建";
+  }
+  if (status === "NOOP") {
+    return "未接管";
+  }
+  if (status === "FAILED_FALLBACK_NOOP") {
+    return "失败回退";
+  }
+  return status;
+}
+
+function natTypeLabel(natType?: string | null) {
+  switch (natType) {
+    case "NO_NAT":
+      return "无 NAT";
+    case "PORT_PRESERVED_NAT":
+      return "端口保持 NAT";
+    case "FULL_CONE_OR_RESTRICTED_NAT":
+      return "Full cone / Restricted NAT";
+    case "PORT_RESTRICTED_NAT":
+      return "Port Restricted NAT";
+    case "SYMMETRIC_NAT":
+      return "Symmetric NAT";
+    case "NAT":
+      return "NAT";
+    default:
+      return "NAT 未知";
+  }
 }
 
 function MetricCard({

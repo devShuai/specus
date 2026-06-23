@@ -268,6 +268,11 @@ export interface PeerMeshDevice {
   publicKey: string | null;
   natType: string | null;
   lastEndpoint: string | null;
+  virtualDeviceMode: string | null;
+  virtualDeviceName: string | null;
+  virtualDeviceStatus: string | null;
+  virtualDeviceError: string | null;
+  virtualDeviceUpdatedAt: string | null;
   lastSeenAt: string | null;
   updatedAt: string | null;
 }
