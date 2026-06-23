@@ -8,6 +8,9 @@ import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.ssl.DefaultClientTlsStrategy;
+import org.apache.hc.client5.http.ssl.HostnameVerificationPolicy;
+import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
@@ -15,8 +18,14 @@ import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.util.Timeout;
 import lombok.extern.slf4j.Slf4j;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.net.URI;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -31,16 +40,44 @@ public final class DirectHttpForwarder {
     private static final Timeout CONNECTION_REQUEST_TIMEOUT = Timeout.ofSeconds(5);
     private static final Timeout CONNECT_TIMEOUT = Timeout.ofSeconds(5);
     private static final Timeout RESPONSE_TIMEOUT = Timeout.ofSeconds(20);
+
+    /** 信任所有证书的 SSLContext —— 内网穿透场景下客户端→本地目标通常是同一内网，无需校验。 */
+    private static final SSLContext TRUST_ALL_SSL;
+    static {
+        try {
+            TRUST_ALL_SSL = SSLContext.getInstance("TLS");
+            TRUST_ALL_SSL.init(null, new TrustManager[]{new TrustAllX509TrustManager()}, null);
+        } catch (NoSuchAlgorithmException | KeyManagementException e) {
+            throw new RuntimeException("Failed to initialize trust-all SSLContext", e);
+        }
+    }
+
     private static final CloseableHttpClient HTTP_CLIENT = HttpClients.custom()
             .setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()
                     .setDefaultConnectionConfig(ConnectionConfig.custom()
                             .setConnectTimeout(CONNECT_TIMEOUT)
                             .setSocketTimeout(RESPONSE_TIMEOUT)
                             .build())
+                    .setTlsSocketStrategy(new DefaultClientTlsStrategy(TRUST_ALL_SSL, null, null,
+                            null, HostnameVerificationPolicy.CLIENT, NoopHostnameVerifier.INSTANCE))
                     .build())
             .disableContentCompression()
             .disableRedirectHandling()
             .build();
+
+    /** 不做任何证书校验的 TrustManager。 */
+    private static final class TrustAllX509TrustManager implements X509TrustManager {
+        @Override
+        public void checkClientTrusted(X509Certificate[] chain, String authType) {
+        }
+        @Override
+        public void checkServerTrusted(X509Certificate[] chain, String authType) {
+        }
+        @Override
+        public X509Certificate[] getAcceptedIssuers() {
+            return new X509Certificate[0];
+        }
+    }
     private static final Set<String> SKIPPED_HEADERS = Set.of(
             "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
             "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"

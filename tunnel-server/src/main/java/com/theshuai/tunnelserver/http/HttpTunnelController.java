@@ -3,6 +3,10 @@ package com.theshuai.tunnelserver.http;
 import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
 import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import com.theshuai.tunnelserver.http.DirectHttpDispatcher.DirectHttpTunnelException;
+import com.theshuai.tunnelserver.management.model.ClientAccount;
+import com.theshuai.tunnelserver.management.model.HttpRouteMapping;
+import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
+import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -21,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 
 @RestController
@@ -35,17 +40,26 @@ public class HttpTunnelController {
     private final DirectHttpDispatcher dispatcher;
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
+    private final ResponseRewriter responseRewriter;
+    private final ClientAccountService clientAccountService;
+    private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final long timeoutMillis;
     private final int maxRequestBodySize;
 
     public HttpTunnelController(DirectHttpDispatcher dispatcher,
                                 TrafficUsageService trafficUsageService,
                                 TrafficInspectionService trafficInspectionService,
+                                ResponseRewriter responseRewriter,
+                                ClientAccountService clientAccountService,
+                                HttpRouteMappingRepository httpRouteMappingRepository,
                                 @Value("${tunnel.http.timeout-ms:30000}") long timeoutMillis,
                                 @Value("${tunnel.http.max-request-body-size:16777216}") int maxRequestBodySize) {
         this.dispatcher = dispatcher;
         this.trafficUsageService = trafficUsageService;
         this.trafficInspectionService = trafficInspectionService;
+        this.responseRewriter = responseRewriter;
+        this.clientAccountService = clientAccountService;
+        this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.timeoutMillis = timeoutMillis;
         this.maxRequestBodySize = maxRequestBodySize;
     }
@@ -98,9 +112,21 @@ public class HttpTunnelController {
             }
 
             HttpHeaders headers = new HttpHeaders();
-            copyHeaders(response.getHeaders(), headers);
-            log.info("[http-direct][server-egress] requestId={} clientName={} status={} bodyBytes={} elapsedMs={}",
-                    response.getRequestId(), clientName, response.getStatusCode(), responseBody.length,
+            // 路径改写：仅当路由开启时生效。改写成功后需要剥离 Content-Encoding/Content-Length，
+            // 让 Spring/Tomcat 按实际字节重新计算 Content-Length（Tomcat 不会主动重压缩）。
+            List<String> responseHeaders = response.getHeaders();
+            boolean rewritten = false;
+            if (isPathRewriteEnabled(clientName, route)) {
+                Optional<byte[]> maybeRewritten = responseRewriter.rewrite(responseBody, clientName, route, responseHeaders);
+                if (maybeRewritten.isPresent()) {
+                    responseBody = maybeRewritten.get();
+                    responseHeaders = stripEncodingHeaders(responseHeaders);
+                    rewritten = true;
+                }
+            }
+            copyHeaders(responseHeaders, headers);
+            log.info("[http-direct][server-egress] requestId={} clientName={} status={} bodyBytes={} rewritten={} elapsedMs={}",
+                    response.getRequestId(), clientName, response.getStatusCode(), responseBody.length, rewritten,
                     System.currentTimeMillis() - startedAt);
             trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
                     request.getQueryString(), forwardedHeaders, requestBody, response.getStatusCode(),
@@ -173,5 +199,47 @@ public class HttpTunnelController {
         return ResponseEntity.status(HttpStatusCode.valueOf(statusCode))
                 .header(HttpHeaders.CONTENT_TYPE, "text/plain;charset=UTF-8")
                 .body(message.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * 查路由配置，判断该路由是否开启了响应体路径改写。查询走 JPA cache，开销可控；
+     * 任意查询异常一律视为"未开启"，避免改写故障影响主链路。
+     */
+    private boolean isPathRewriteEnabled(String clientName, String route) {
+        try {
+            Optional<ClientAccount> account = clientAccountService.findClientByName(clientName);
+            if (account.isEmpty()) {
+                return false;
+            }
+            Optional<HttpRouteMapping> mapping = httpRouteMappingRepository
+                    .findByClientIdAndRoute(account.get().getId(), route);
+            return mapping.map(m -> Boolean.TRUE.equals(m.getPathRewriteEnabled())).orElse(false);
+        } catch (RuntimeException e) {
+            log.debug("[http-direct] isPathRewriteEnabled lookup failed clientName={} route={} error={}",
+                    clientName, route, e.toString());
+            return false;
+        }
+    }
+
+    /** 改写后剥离 Content-Encoding / Content-Length，让框架按实际字节重新计算并以明文回写。 */
+    private List<String> stripEncodingHeaders(List<String> source) {
+        if (source == null) {
+            return null;
+        }
+        List<String> result = new ArrayList<>(source.size());
+        for (String header : source) {
+            if (header == null) {
+                continue;
+            }
+            int separator = header.indexOf(':');
+            if (separator > 0) {
+                String name = header.substring(0, separator).trim().toLowerCase(Locale.ROOT);
+                if (name.equals("content-encoding") || name.equals("content-length")) {
+                    continue;
+                }
+            }
+            result.add(header);
+        }
+        return result;
     }
 }

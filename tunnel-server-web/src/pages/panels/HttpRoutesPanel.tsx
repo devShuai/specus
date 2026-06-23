@@ -66,6 +66,7 @@ export function HttpRoutesPanel() {
         targetBaseUrl: targetBaseUrl.trim(),
         enabled: true,
         detailCaptureEnabled: false,
+        pathRewriteEnabled: false,
       });
       setRoute("");
       setTargetBaseUrl("");
@@ -86,6 +87,7 @@ export function HttpRoutesPanel() {
         targetBaseUrl: item.targetBaseUrl,
         enabled: !item.enabled,
         detailCaptureEnabled: Boolean(item.detailCaptureEnabled),
+        pathRewriteEnabled: Boolean(item.pathRewriteEnabled),
       });
       await load();
     } catch (error) {
@@ -100,10 +102,26 @@ export function HttpRoutesPanel() {
         targetBaseUrl: item.targetBaseUrl,
         enabled: item.enabled,
         detailCaptureEnabled: !Boolean(item.detailCaptureEnabled),
+        pathRewriteEnabled: Boolean(item.pathRewriteEnabled),
       });
       await load();
     } catch (error) {
       notifyError(error, "切换明细采集失败");
+    }
+  };
+
+  const togglePathRewrite = async (item: HttpRoute) => {
+    try {
+      await adminApi.updateHttpRoute(item.id, {
+        route: item.route,
+        targetBaseUrl: item.targetBaseUrl,
+        enabled: item.enabled,
+        detailCaptureEnabled: Boolean(item.detailCaptureEnabled),
+        pathRewriteEnabled: !Boolean(item.pathRewriteEnabled),
+      });
+      await load();
+    } catch (error) {
+      notifyError(error, "切换路径改写失败");
     }
   };
 
@@ -182,6 +200,7 @@ export function HttpRoutesPanel() {
           <TableColumn>访问链接</TableColumn>
           <TableColumn>状态</TableColumn>
           <TableColumn>明细采集</TableColumn>
+          <TableColumn>路径改写</TableColumn>
           <TableColumn>更新时间</TableColumn>
           <TableColumn>操作</TableColumn>
         </TableHeader>
@@ -219,6 +238,18 @@ export function HttpRoutesPanel() {
                   onClick={() => void toggleDetailCapture(item)}
                 >
                   {item.detailCaptureEnabled ? "采集" : "关闭"}
+                </Chip>
+              </TableCell>
+              <TableCell>
+                <Chip
+                  size="sm"
+                  variant="flat"
+                  color={item.pathRewriteEnabled ? "secondary" : "default"}
+                  className="cursor-pointer"
+                  onClick={() => void togglePathRewrite(item)}
+                  title="开启后改写 HTML/CSS/JS 中的绝对路径，使内网应用的资源也能经过隧道"
+                >
+                  {item.pathRewriteEnabled ? "开启" : "关闭"}
                 </Chip>
               </TableCell>
               <TableCell>{formatDateTime(item.updatedAt || item.createdAt)}</TableCell>
@@ -294,6 +325,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [detailCaptureEnabled, setDetailCaptureEnabled] = useState(false);
+  const [pathRewriteEnabled, setPathRewriteEnabled] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -302,6 +334,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
       setTargetBaseUrl(route.targetBaseUrl);
       setEnabled(route.enabled);
       setDetailCaptureEnabled(Boolean(route.detailCaptureEnabled));
+      setPathRewriteEnabled(Boolean(route.pathRewriteEnabled));
     }
   }, [route]);
 
@@ -316,6 +349,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
         targetBaseUrl: targetBaseUrl.trim(),
         enabled,
         detailCaptureEnabled,
+        pathRewriteEnabled,
       });
       notify("HTTP 路由已更新");
       disclosure.onClose();
@@ -341,6 +375,9 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
               </Switch>
               <Switch isSelected={detailCaptureEnabled} onValueChange={setDetailCaptureEnabled}>
                 明细采集
+              </Switch>
+              <Switch isSelected={pathRewriteEnabled} onValueChange={setPathRewriteEnabled}>
+                路径改写
               </Switch>
             </ModalBody>
             <ModalFooter>

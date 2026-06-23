@@ -82,6 +82,7 @@ export interface HttpRoute {
   targetBaseUrl: string;
   enabled: boolean;
   detailCaptureEnabled: boolean;
+  pathRewriteEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -284,6 +285,7 @@ export interface HttpRouteMutation {
   targetBaseUrl: string;
   enabled?: boolean;
   detailCaptureEnabled?: boolean;
+  pathRewriteEnabled?: boolean;
 }
 
 // LiveConnectionEvent is the JSON pushed over /ws/connections.

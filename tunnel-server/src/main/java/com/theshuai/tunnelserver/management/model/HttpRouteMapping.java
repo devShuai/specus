@@ -67,6 +67,15 @@ public class HttpRouteMapping {
     @Column(name = "detail_capture_enabled")
     private Boolean detailCaptureEnabled = false;
 
+    /**
+     * 是否开启响应体路径改写。开启后，{@code HttpTunnelController} 在把上游响应回写浏览器之前，
+     * 会对 {@code text/html} / {@code text/css} / {@code application/javascript} 等正文做正则改写：
+     * 把绝对路径 {@code /foo} 改成 {@code /http/{clientName}/{route}/foo}，让内网应用里硬编码的
+     * 绝对路径资源也能经过隧道访问。默认关闭，避免对正常 API 路由产生意外影响。
+     */
+    @Column(name = "path_rewrite_enabled")
+    private Boolean pathRewriteEnabled = false;
+
     @Column(name = "created_at", nullable = false, length = 40)
     private String createdAt;
 
