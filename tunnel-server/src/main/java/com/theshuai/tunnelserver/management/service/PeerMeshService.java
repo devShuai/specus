@@ -3,6 +3,7 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peermesh.PeerControlMessage;
+import com.theshuai.common.peermesh.PeerDataFrameHeader;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
@@ -260,6 +261,16 @@ public class PeerMeshService {
     }
 
     @Transactional
+    public boolean authorizeRelayFrame(PeerDataFrameHeader header, long bytes) {
+        if (header == null || bytes <= 0) {
+            return false;
+        }
+        return sessionRepository.findById(header.sessionId())
+                .map(session -> authorizeRelayFrame(session, header, bytes, Instant.now()))
+                .orElse(false);
+    }
+
+    @Transactional
     public PeerMeshSessionView closeSession(ClientAccount reporter, PeerControlMessage close) {
         if (close.getSessionId() == null || close.getSessionId() <= 0) {
             throw new IllegalArgumentException("sessionId is required");
@@ -483,6 +494,26 @@ public class PeerMeshService {
         session.setRelayBytes(saturatedAdd(session.getRelayBytes(), relayBytes));
         session.setLastTrafficAt(now.toString());
         session.setUpdatedAt(now.toString());
+    }
+
+    private boolean authorizeRelayFrame(PeerMeshSession session, PeerDataFrameHeader header, long bytes, Instant now) {
+        if (closeIfExpired(session, now)) {
+            sessionRepository.save(session);
+            return false;
+        }
+        if (!STATUS_ACTIVE.equals(session.getStatus())) {
+            return false;
+        }
+        boolean forward = header.fromClientId() == session.getSourceClientId()
+                && header.toClientId() == session.getTargetClientId();
+        boolean reverse = header.fromClientId() == session.getTargetClientId()
+                && header.toClientId() == session.getSourceClientId();
+        if (!forward && !reverse) {
+            return false;
+        }
+        applyTraffic(session, 0, bytes, now);
+        sessionRepository.save(session);
+        return true;
     }
 
     private int expireStaleSessionsBatch(Instant now, int limit) {

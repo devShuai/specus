@@ -169,8 +169,9 @@ public class StunTurnServer implements ApplicationRunner {
             return;
         }
         PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
-        if (header != null) {
-            peerMeshService.recordRelayTraffic(header.sessionId(), payload.length);
+        if (header != null && !peerMeshService.authorizeRelayFrame(header, payload.length)) {
+            sendRelayResponse(remote, error(request, "relay-session-denied"));
+            return;
         }
         PeerRelayMessage data = new PeerRelayMessage();
         data.setType(PeerRelayMessage.TYPE_DATA);

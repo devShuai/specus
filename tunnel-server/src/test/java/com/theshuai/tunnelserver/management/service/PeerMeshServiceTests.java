@@ -3,6 +3,7 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peermesh.PeerControlMessage;
+import com.theshuai.common.peermesh.PeerDataFrameHeader;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.PeerMeshAcl;
@@ -128,6 +129,55 @@ class PeerMeshServiceTests {
 
         assertThat(view.status()).isEqualTo(PeerMeshService.STATUS_CLOSED);
         assertThat(view.closedAt()).isNotBlank();
+    }
+
+    @Test
+    void relayFrameRequiresActiveMatchingSession() {
+        PeerMeshSession session = activeSession();
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 2L, 7L), 512);
+
+        assertThat(allowed).isTrue();
+        assertThat(session.getRelayBytes()).isEqualTo(512);
+    }
+
+    @Test
+    void relayFrameRejectsWrongPeerPair() {
+        PeerMeshSession session = activeSession();
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+
+        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 99L, 7L), 512);
+
+        assertThat(allowed).isFalse();
+        assertThat(session.getRelayBytes()).isZero();
+    }
+
+    @Test
+    void relayFrameRejectsExpiredSessionAndClosesIt() {
+        PeerMeshSession session = activeSession();
+        session.setExpiresAt(Instant.now().minusSeconds(5).toString());
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 2L, 7L), 512);
+
+        assertThat(allowed).isFalse();
+        assertThat(session.getStatus()).isEqualTo(PeerMeshService.STATUS_CLOSED);
+        assertThat(session.getRelayBytes()).isZero();
+    }
+
+    @Test
+    void relayFrameRejectsNegotiatingSession() {
+        PeerMeshSession session = activeSession();
+        session.setStatus(PeerMeshService.STATUS_NEGOTIATING);
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+
+        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 2L, 7L), 512);
+
+        assertThat(allowed).isFalse();
+        assertThat(session.getRelayBytes()).isZero();
     }
 
     private ClientAccount client(long id, String owner, String name) {
