@@ -17,6 +17,9 @@ public class TunnelBean {
     private List<TunnelConfig> tunnelConfigList;
     private List<HttpTunnelConfig> httpTunnelConfigList;
     private ClientAuthLoginResponse.PeerMeshConfig peerMesh;
+    private String peerMeshDevice = "noop";
+    private String peerMeshTunName = "shuai0";
+    private int peerMeshMtu = 1400;
     private String remoteAddress;
     private int remotePort;
     private transient ClientAuthRefresher authRefresher;

@@ -98,8 +98,11 @@ public class TunnelClientApplication {
         tunnelBean.setTunnelConfigList(toTunnelConfigs(response.getTunnelConfigList()));
         tunnelBean.setHttpTunnelConfigList(toHttpTunnelConfigs(response.getHttpTunnelConfigList()));
         tunnelBean.setPeerMesh(response.getPeerMesh());
+        tunnelBean.setPeerMeshDevice(startupConfig.getPeerMeshDevice());
+        tunnelBean.setPeerMeshTunName(startupConfig.getPeerMeshTunName());
+        tunnelBean.setPeerMeshMtu(startupConfig.getPeerMeshMtu());
         tunnelBean.setAuthRefresher(() -> loginAndBuildTunnel(startupConfig));
-        log.info("客户端 HTTP 登录成功: clientName={}, session={}, tunnel={}:{}, tcp={}, http={}, peerMesh={}, maxOnlineInstances={}",
+        log.info("客户端 HTTP 登录成功: clientName={}, session={}, tunnel={}:{}, tcp={}, http={}, peerMesh={}, peerMeshDevice={}, maxOnlineInstances={}",
                 tunnelBean.getClientName(),
                 tunnelBean.getClientSessionId(),
                 tunnelBean.getRemoteAddress(),
@@ -107,6 +110,7 @@ public class TunnelClientApplication {
                 tunnelBean.getTunnelConfigList().size(),
                 tunnelBean.getHttpTunnelConfigList().size(),
                 response.getPeerMesh() != null && response.getPeerMesh().isEnabled(),
+                tunnelBean.getPeerMeshDevice(),
                 tunnelBean.getMaxOnlineInstances());
         return tunnelBean;
     }

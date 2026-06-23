@@ -9,6 +9,7 @@ import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.handler.*;
 import com.theshuai.tunnelclient.peer.PeerMeshClient;
+import com.theshuai.tunnelclient.peer.PeerVirtualDeviceOptions;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.*;
@@ -95,7 +96,13 @@ public class NettyClient {
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
         this.sslContext = sslContext;
-        this.peerMeshClient = new PeerMeshClient(tunnelBean.getPeerMesh(), this::sendPeerControl);
+        this.peerMeshClient = new PeerMeshClient(
+                tunnelBean.getPeerMesh(),
+                this::sendPeerControl,
+                new PeerVirtualDeviceOptions(
+                        tunnelBean.getPeerMeshDevice(),
+                        tunnelBean.getPeerMeshTunName(),
+                        tunnelBean.getPeerMeshMtu()));
     }
 
     public void start() {

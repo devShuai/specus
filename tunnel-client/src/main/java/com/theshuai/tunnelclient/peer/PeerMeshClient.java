@@ -43,11 +43,13 @@ public class PeerMeshClient implements AutoCloseable {
     private final SecureRandom secureRandom = new SecureRandom();
     private final ControlSender controlSender;
     private final PeerKeyStore.KeyMaterial keyMaterial;
-    private final PeerVirtualDevice virtualDevice;
+    private final PeerVirtualDeviceOptions virtualDeviceOptions;
     private volatile ClientAuthLoginResponse.PeerMeshConfig config;
     private volatile boolean running;
     private volatile DatagramSocket udpSocket;
     private volatile Thread receiverThread;
+    private volatile PeerVirtualDevice virtualDevice = new NoopPeerVirtualDevice();
+    private volatile String virtualDeviceKey = "noop";
     private volatile PeerCandidate serverReflexiveCandidate;
     private volatile PeerCandidate relayCandidate;
     private volatile String relayAllocationId;
@@ -57,9 +59,17 @@ public class PeerMeshClient implements AutoCloseable {
     private static final long SESSION_REFRESH_WINDOW_MILLIS = 120_000;
 
     public PeerMeshClient(ClientAuthLoginResponse.PeerMeshConfig config, ControlSender controlSender) {
+        this(config, controlSender, new PeerVirtualDeviceOptions("noop", "shuai0", 1400));
+    }
+
+    public PeerMeshClient(ClientAuthLoginResponse.PeerMeshConfig config,
+                          ControlSender controlSender,
+                          PeerVirtualDeviceOptions virtualDeviceOptions) {
         this.controlSender = controlSender;
         this.keyMaterial = PeerKeyStore.keyMaterial();
-        this.virtualDevice = new NoopPeerVirtualDevice();
+        this.virtualDeviceOptions = virtualDeviceOptions == null
+                ? new PeerVirtualDeviceOptions("noop", "shuai0", 1400)
+                : virtualDeviceOptions;
         startOrUpdate(config);
     }
 
@@ -80,14 +90,14 @@ public class PeerMeshClient implements AutoCloseable {
             lastRelayCandidateRequestMillis = 0;
             stopMaintenance();
             stopUdpSocket();
-            virtualDevice.close();
+            closeVirtualDevice();
             return;
         }
         running = true;
         startUdpSocket();
         startMaintenance();
         requestPeerServerCandidates();
-        virtualDevice.start(this::sendVirtualPacket);
+        ensureVirtualDevice(nextConfig).start(this::sendVirtualPacket);
         log.info("Peer mesh 已启用: client={}, virtualIp={}, cidr={}, stun={}:{}, turn={}:{}",
                 nextConfig.getClientName(),
                 nextConfig.getVirtualIp(),
@@ -162,7 +172,7 @@ public class PeerMeshClient implements AutoCloseable {
         pendingProbes.clear();
         stopMaintenance();
         stopUdpSocket();
-        virtualDevice.close();
+        closeVirtualDevice();
     }
 
     private void handleCandidates(PeerControlMessage control) {
@@ -509,6 +519,39 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
+    private synchronized PeerVirtualDevice ensureVirtualDevice(ClientAuthLoginResponse.PeerMeshConfig nextConfig) {
+        String desiredKey = PeerVirtualDevices.key(virtualDeviceOptions, nextConfig);
+        if (virtualDevice != null && desiredKey.equals(virtualDeviceKey)) {
+            return virtualDevice;
+        }
+        closeVirtualDevice();
+        try {
+            PeerVirtualDevice next = PeerVirtualDevices.create(virtualDeviceOptions, nextConfig);
+            virtualDevice = next;
+            virtualDeviceKey = desiredKey;
+            return next;
+        } catch (Exception e) {
+            log.warn("Peer mesh 虚拟网卡初始化失败，回退 noop: {}", e.getMessage());
+            PeerVirtualDevice fallback = new NoopPeerVirtualDevice();
+            virtualDevice = fallback;
+            virtualDeviceKey = "fallback|" + desiredKey;
+            return fallback;
+        }
+    }
+
+    private synchronized void closeVirtualDevice() {
+        PeerVirtualDevice current = virtualDevice;
+        virtualDevice = null;
+        virtualDeviceKey = "";
+        if (current != null) {
+            try {
+                current.close();
+            } catch (Exception e) {
+                log.debug("Peer mesh 虚拟网卡关闭失败: {}", e.getMessage());
+            }
+        }
+    }
+
     private void receiveLoop() {
         byte[] buffer = new byte[65_507];
         while (running) {
@@ -639,7 +682,10 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private void handlePlainPacket(PeerDataFrame frame) {
-        virtualDevice.writePacket(frame.plaintext());
+        PeerVirtualDevice device = virtualDevice;
+        if (device != null) {
+            device.writePacket(frame.plaintext());
+        }
     }
 
     private void replyUdpProbe(PeerUdpProbe probe, InetSocketAddress observedRemote, String relayFromAllocationId) {
