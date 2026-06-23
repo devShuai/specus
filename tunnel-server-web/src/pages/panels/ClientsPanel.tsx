@@ -164,27 +164,28 @@ export function ClientsPanel() {
   };
 
   return (
-    <div className="mt-3 flex flex-col gap-5">
-      <section className="space-y-3">
+    <div className="mt-3 flex min-w-0 flex-col gap-5">
+      <section className="min-w-0 space-y-3">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
             <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret，clientName 由服务端按机器自动分配。</p>
           </div>
-          <Button variant="flat" onPress={() => void load()}>
+          <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
             刷新
           </Button>
         </div>
 
         <form className="flex flex-wrap items-end gap-3" onSubmit={createCredential}>
-          <Input className="w-64" label="apiKey" placeholder="留空自动生成" value={apiKey} onValueChange={setApiKey} />
-          <Input className="w-56" label="secret" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
-          <Input className="w-44" type="number" label="在线实例上限" min={1} max={10000} value={maxOnline} onValueChange={setMaxOnline} />
-          <Button type="submit" color="primary" isLoading={creating}>
+          <Input className="w-full sm:w-64" label="apiKey" placeholder="留空自动生成" value={apiKey} onValueChange={setApiKey} />
+          <Input className="w-full sm:w-56" label="secret" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
+          <Input className="w-full sm:w-44" type="number" label="在线实例上限" min={1} max={10000} value={maxOnline} onValueChange={setMaxOnline} />
+          <Button className="w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
             新建接入凭证
           </Button>
         </form>
 
+        <div className="min-w-0 overflow-x-auto">
         <Table aria-label="接入凭证列表" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>ID</TableColumn>
@@ -222,14 +223,16 @@ export function ClientsPanel() {
             )}
           </TableBody>
         </Table>
+        </div>
       </section>
 
-      <section className="space-y-3">
+      <section className="min-w-0 space-y-3">
         <div>
           <h2 className="text-lg font-semibold text-foreground">客户端实例</h2>
           <p className="text-small text-default-500">实例由客户端首次登录后注册，名称由机器指纹和系统用户生成。</p>
         </div>
 
+        <div className="min-w-0 overflow-x-auto">
         <Table key={`clients-${durationTick}`} aria-label="客户端实例列表" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>ID</TableColumn>
@@ -270,6 +273,7 @@ export function ClientsPanel() {
             )}
           </TableBody>
         </Table>
+        </div>
       </section>
 
       <EditCredentialModal disclosure={credentialModal} credential={editingCredential} onSaved={(value) => {

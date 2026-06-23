@@ -286,8 +286,9 @@ export function ConnectionsPanel() {
           )}
         </TableBody>
       </Table>
+      </div>
 
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-small text-default-500">
           {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
         </span>
