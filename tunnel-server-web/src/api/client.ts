@@ -11,12 +11,16 @@ import type {
   HttpRouteMutation,
   HttpTrafficExchange,
   HttpTrafficExchangePage,
+  HttpResponseBodyType,
+  HttpTrafficSearchField,
   NatControlResult,
   OidcConfig,
   Overview,
   ResourceTrafficType,
   ResourceTrafficUsage,
   TcpTrafficFrame,
+  TcpTrafficFramePage,
+  TcpTrafficStream,
   TokenResponse,
   TrafficUsage,
   Tunnel,
@@ -174,7 +178,16 @@ export interface HttpTrafficExchangeQuery {
   size: number;
   clientId?: number;
   route?: string;
+  responseBodyType?: HttpResponseBodyType | string;
+  field?: HttpTrafficSearchField;
   q?: string;
+}
+
+export interface TcpTrafficFrameQuery {
+  page: number;
+  size: number;
+  clientId?: number;
+  listenPort?: number;
 }
 
 export const adminApi = {
@@ -250,6 +263,12 @@ export const adminApi = {
     if (query.route) {
       params.set("route", query.route);
     }
+    if (query.responseBodyType) {
+      params.set("responseBodyType", query.responseBodyType);
+    }
+    if (query.field) {
+      params.set("field", query.field);
+    }
     if (query.q) {
       params.set("q", query.q);
     }
@@ -267,5 +286,33 @@ export const adminApi = {
     }
     return data;
   },
-  listTcpTrafficFrames: (limit = 200) => request<TcpTrafficFrame[]>(`/traffic/tcp-frames?limit=${limit}`),
+  listTcpTrafficFrames: async (query: TcpTrafficFrameQuery) => {
+    const params = new URLSearchParams();
+    params.set("page", String(query.page));
+    params.set("size", String(query.size));
+    if (query.clientId) {
+      params.set("clientId", String(query.clientId));
+    }
+    if (query.listenPort) {
+      params.set("listenPort", String(query.listenPort));
+    }
+    const data = await request<TcpTrafficFramePage | TcpTrafficFrame[]>(`/traffic/tcp-frames?${params.toString()}`);
+    if (Array.isArray(data)) {
+      return {
+        items: data,
+        total: data.length,
+        page: 0,
+        size: data.length,
+        totalPages: 1,
+      } satisfies TcpTrafficFramePage;
+    }
+    return data;
+  },
+  getTcpTrafficFrame: (id: string) => request<TcpTrafficFrame>(`/traffic/tcp-frames/${id}`),
+  getTcpTrafficStream: (channelId: string, limit = 500) => {
+    const params = new URLSearchParams();
+    params.set("channelId", channelId);
+    params.set("limit", String(limit));
+    return request<TcpTrafficStream>(`/traffic/tcp-streams?${params.toString()}`);
+  },
 };

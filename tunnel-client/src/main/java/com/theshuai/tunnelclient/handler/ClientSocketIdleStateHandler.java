@@ -36,6 +36,14 @@ public class ClientSocketIdleStateHandler extends AbstractIdleHeartbeatHandler {
             log.debug("控制连接因客户端关闭而断开, 不安排重连");
             return;
         }
+        if (nettyClient.isReconnectSuppressed()) {
+            log.debug("控制连接因登录策略拒绝而断开, 不安排重连");
+            return;
+        }
+        if (nettyClient.isAuthRefreshInProgress()) {
+            log.debug("控制连接因令牌刷新而断开, 等待刷新完成后重连");
+            return;
+        }
         log.info("控制连接断开, 安排重连...");
         nettyClient.scheduleReconnect();
     }

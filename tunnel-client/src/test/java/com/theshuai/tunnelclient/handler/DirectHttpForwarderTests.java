@@ -10,9 +10,11 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DirectHttpForwarderTests {
@@ -116,5 +118,47 @@ class DirectHttpForwarderTests {
         );
 
         assertEquals(302, response.getStatusCode());
+    }
+
+    @Test
+    void shouldBoundOpenEndedRangeForVideoPlayback() throws Exception {
+        AtomicReference<String> upstreamRange = new AtomicReference<>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/video", exchange -> {
+            upstreamRange.set(exchange.getRequestHeaders().getFirst("Range"));
+            byte[] response = "chunk".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Accept-Ranges", "bytes");
+            exchange.getResponseHeaders().add("Content-Range", "bytes 100-8388707/99999999");
+            exchange.sendResponseHeaders(206, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.close();
+        });
+        server.start();
+
+        DirectHttpRequestPacket request = new DirectHttpRequestPacket();
+        request.setRequestId("request-id");
+        request.setRequestMethod("GET");
+        request.setRoute("jellyfin");
+        request.setRelativePath("/video");
+        request.setHeaders(List.of("Range: bytes=100-"));
+
+        DirectHttpResponsePacket response = DirectHttpForwarder.forward(
+                request,
+                Map.of("jellyfin", "http://127.0.0.1:" + server.getAddress().getPort())
+        );
+
+        assertEquals(206, response.getStatusCode());
+        assertEquals("bytes=100-8388707", upstreamRange.get());
+        assertTrue(response.getHeaders().contains("Content-range:bytes 100-8388707/99999999"));
+    }
+
+    @Test
+    void shouldNormalizeOversizedRangeHeaders() {
+        assertEquals("bytes=0-8388607", DirectHttpForwarder.boundedRange("bytes=0-999999999"));
+        assertEquals("bytes=100-8388707", DirectHttpForwarder.boundedRange("bytes=100-"));
+        assertEquals("bytes=-8388608", DirectHttpForwarder.boundedRange("bytes=-999999999"));
+        assertEquals("bytes=0-1023", DirectHttpForwarder.boundedRange("bytes=0-1023"));
+        assertNull(DirectHttpForwarder.boundedRange("bytes=0-1023,2048-4095"));
+        assertNull(DirectHttpForwarder.boundedRange("items=0-1023"));
     }
 }

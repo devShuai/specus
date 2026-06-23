@@ -176,9 +176,8 @@ class CompactBinarySerializerTests {
     private LoginRequestPacket createLoginPacket() {
         LoginRequestPacket packet = new LoginRequestPacket();
         packet.setClientName("Demo client");
-        packet.setTimestamp("1748620800000");
-        packet.setNonce("0123456789abcdef0123456789abcdef");
-        packet.setCheckSign(new byte[32]);
+        packet.setClientSessionId(1748620800000L);
+        packet.setAccessToken("cs_compact_binary_fixture_token");
         return packet;
     }
 }

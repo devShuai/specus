@@ -13,10 +13,82 @@ body {
   overflow-x: hidden;
 }
 
+.light,
+.dark {
+  min-height: 100%;
+}
+
+.light {
+  color-scheme: light;
+}
+
+.dark {
+  color-scheme: dark;
+}
+
+.light [data-slot="input-wrapper"][data-focus="true"],
+.light [data-slot="input-wrapper"]:focus-within {
+  color: #09090b;
+}
+
+.dark [data-slot="input-wrapper"][data-focus="true"],
+.dark [data-slot="input-wrapper"]:focus-within {
+  color: #fafafa;
+}
+
+.dark [data-slot="input-wrapper"] {
+  border-color: transparent !important;
+}
+
+.dark [data-slot="input-wrapper"][data-focus="true"],
+.dark [data-slot="input-wrapper"]:focus-within,
+.dark [data-slot="input-wrapper"][data-focus-visible="true"],
+.dark [data-slot="input-wrapper"][data-hover="true"] {
+  border-color: transparent !important;
+  outline: none !important;
+  box-shadow: none !important;
+  --tw-ring-color: transparent !important;
+  --tw-ring-offset-color: transparent !important;
+  --tw-ring-offset-width: 0 !important;
+  --tw-ring-shadow: 0 0 #0000 !important;
+  --tw-ring-offset-shadow: 0 0 #0000 !important;
+}
+
+.dark [data-slot="input-wrapper"]::after {
+  background: transparent !important;
+}
+
+.light [data-slot="input"],
+.light [data-slot="inner-wrapper"] input {
+  color: #09090b;
+}
+
+.dark [data-slot="input"],
+.dark [data-slot="inner-wrapper"] input {
+  color: #fafafa;
+}
+
 .landing-shell {
+  --landing-bg: #eff8ff;
+  --landing-overlay:
+    linear-gradient(180deg, rgba(239, 248, 255, 0.18) 0%, rgba(239, 248, 255, 0.78) 72%, #f8fbff 100%),
+    linear-gradient(135deg, rgba(8, 145, 178, 0.18) 0%, transparent 34%, rgba(16, 185, 129, 0.12) 62%, rgba(251, 191, 36, 0.12) 100%);
+  --landing-grid-line: rgba(8, 145, 178, 0.12);
+  --landing-grid-line-2: rgba(14, 165, 233, 0.11);
+  --landing-scanline: rgba(8, 145, 178, 0.12);
   position: relative;
   isolation: isolate;
-  background: #030509;
+  background: var(--landing-bg);
+}
+
+.dark .landing-shell {
+  --landing-bg: #030509;
+  --landing-overlay:
+    linear-gradient(180deg, rgba(3, 5, 9, 0.2) 0%, rgba(3, 5, 9, 0.82) 72%, #030509 100%),
+    linear-gradient(135deg, rgba(8, 145, 178, 0.16) 0%, transparent 34%, rgba(16, 185, 129, 0.1) 62%, rgba(251, 191, 36, 0.08) 100%);
+  --landing-grid-line: rgba(94, 234, 212, 0.08);
+  --landing-grid-line-2: rgba(14, 165, 233, 0.08);
+  --landing-scanline: rgba(94, 234, 212, 0.12);
 }
 
 .landing-shell::after {
@@ -25,9 +97,7 @@ body {
   z-index: 0;
   content: "";
   pointer-events: none;
-  background:
-    linear-gradient(180deg, rgba(3, 5, 9, 0.2) 0%, rgba(3, 5, 9, 0.82) 72%, #030509 100%),
-    linear-gradient(135deg, rgba(8, 145, 178, 0.16) 0%, transparent 34%, rgba(16, 185, 129, 0.1) 62%, rgba(251, 191, 36, 0.08) 100%);
+  background: var(--landing-overlay);
 }
 
 .landing-canvas {
@@ -36,6 +106,10 @@ body {
   z-index: 0;
   width: 100%;
   height: 100%;
+  opacity: 0.52;
+}
+
+.dark .landing-canvas {
   opacity: 0.72;
 }
 
@@ -45,8 +119,8 @@ body {
   z-index: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(rgba(94, 234, 212, 0.08) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(14, 165, 233, 0.08) 1px, transparent 1px);
+    linear-gradient(var(--landing-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--landing-grid-line-2) 1px, transparent 1px);
   background-size: 48px 48px;
   mask-image: linear-gradient(to bottom, black 0%, black 58%, transparent 100%);
   opacity: 0.5;
@@ -57,7 +131,7 @@ body {
   inset: 0;
   z-index: 0;
   pointer-events: none;
-  background: linear-gradient(90deg, transparent 0%, rgba(94, 234, 212, 0.12) 50%, transparent 100%);
+  background: linear-gradient(90deg, transparent 0%, var(--landing-scanline) 50%, transparent 100%);
   opacity: 0.6;
   transform: translateX(-100%);
   animation: landing-scan 8s linear infinite;
@@ -65,12 +139,22 @@ body {
 
 .landing-card {
   box-shadow:
+    0 28px 90px rgba(8, 47, 73, 0.16),
+    0 0 0 1px rgba(255, 255, 255, 0.38) inset;
+}
+
+.dark .landing-card {
+  box-shadow:
     0 28px 90px rgba(0, 0, 0, 0.42),
     0 0 0 1px rgba(255, 255, 255, 0.03) inset;
 }
 
 .landing-route-line {
   position: relative;
+  background: rgba(8, 145, 178, 0.22);
+}
+
+.dark .landing-route-line {
   background: rgba(255, 255, 255, 0.14);
 }
 
@@ -103,10 +187,18 @@ body {
 }
 
 .principle-card-cyan {
-  --principle-accent: 34, 211, 238;
+  --principle-accent: 6, 182, 212;
 }
 
 .principle-card-amber {
+  --principle-accent: 217, 119, 6;
+}
+
+.dark .principle-card-cyan {
+  --principle-accent: 34, 211, 238;
+}
+
+.dark .principle-card-amber {
   --principle-accent: 251, 191, 36;
 }
 
@@ -119,6 +211,12 @@ body {
 .principle-flowgrid {
   --flow-cycle: 6.9s;
   --principle-node-height: 150px;
+  --principle-panel-bg: rgba(255, 255, 255, 0.72);
+  --principle-grid-line: rgba(8, 47, 73, 0.1);
+  --principle-node-bg: rgba(255, 255, 255, 0.86);
+  --principle-node-title: #18181b;
+  --principle-node-muted: #3f3f46;
+  --principle-node-index: rgba(24, 24, 27, 0.68);
   position: relative;
   display: grid;
   grid-template-columns:
@@ -133,8 +231,17 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
   background:
-    linear-gradient(135deg, rgba(var(--principle-accent), 0.08), transparent 42%),
-    rgba(0, 0, 0, 0.24);
+    linear-gradient(135deg, rgba(var(--principle-accent), 0.2), transparent 42%),
+    var(--principle-panel-bg);
+}
+
+.dark .principle-flowgrid {
+  --principle-panel-bg: rgba(0, 0, 0, 0.24);
+  --principle-grid-line: rgba(255, 255, 255, 0.055);
+  --principle-node-bg: rgba(3, 5, 9, 0.74);
+  --principle-node-title: #fff;
+  --principle-node-muted: #a1a1aa;
+  --principle-node-index: rgba(255, 255, 255, 0.72);
 }
 
 .principle-flowgrid::before {
@@ -143,8 +250,8 @@ body {
   content: "";
   pointer-events: none;
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.055) 1px, transparent 1px);
+    linear-gradient(var(--principle-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--principle-grid-line) 1px, transparent 1px);
   background-size: 28px 28px;
   opacity: 0.42;
 }
@@ -166,11 +273,11 @@ body {
   border: 1px solid rgba(var(--principle-accent), 0.22);
   border-radius: 6px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.035)),
-    rgba(3, 5, 9, 0.74);
+    linear-gradient(180deg, rgba(var(--principle-accent), 0.14), rgba(255, 255, 255, 0.2)),
+    var(--principle-node-bg);
   box-shadow:
-    0 0 24px rgba(var(--principle-accent), 0.08),
-    0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+    0 0 24px rgba(var(--principle-accent), 0.12),
+    0 0 0 1px rgba(var(--principle-accent), 0.08) inset;
   animation: principle-node-sequence var(--flow-cycle) ease-in-out infinite;
   animation-delay: var(--node-delay);
 }
@@ -192,7 +299,7 @@ body {
   display: flex;
   min-height: 2.7em;
   align-items: center;
-  color: #fff;
+  color: var(--principle-node-title);
   font-size: 0.98rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
@@ -221,7 +328,7 @@ body {
   justify-content: center;
   border: 1px solid rgba(var(--principle-accent), 0.26);
   border-radius: 4px;
-  color: rgba(255, 255, 255, 0.72);
+  color: var(--principle-node-index);
   font-size: 0.72rem;
   background: rgba(var(--principle-accent), 0.08);
 }
@@ -230,7 +337,7 @@ body {
   display: flex;
   min-height: 2.2em;
   align-items: flex-start;
-  color: rgb(161, 161, 170);
+  color: var(--principle-node-muted);
   font-size: 0.75rem;
   line-height: 1.45;
   overflow-wrap: anywhere;
@@ -243,7 +350,7 @@ body {
   height: 2px;
   margin: 0 6px;
   overflow: visible;
-  background: rgba(var(--principle-accent), 0.26);
+  background: rgba(var(--principle-accent), 0.42);
 }
 
 .principle-edge::before {
@@ -255,7 +362,7 @@ body {
   content: "";
   border-radius: 999px;
   background: rgb(var(--principle-accent));
-  box-shadow: 0 0 18px rgba(var(--principle-accent), 0.72);
+  box-shadow: 0 0 18px rgba(var(--principle-accent), 0.86);
   opacity: 0;
   animation: principle-packet-x var(--flow-cycle) linear infinite;
   animation-delay: var(--edge-delay);
@@ -268,7 +375,7 @@ body {
   width: 42%;
   height: 4px;
   content: "";
-  background: linear-gradient(90deg, transparent, rgba(var(--principle-accent), 0.86), transparent);
+  background: linear-gradient(90deg, transparent, rgba(var(--principle-accent), 0.96), transparent);
   filter: blur(1px);
   opacity: 0;
   animation: principle-beam-x var(--flow-cycle) linear infinite;
@@ -282,11 +389,17 @@ body {
 }
 
 .principle-note span {
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(8, 47, 73, 0.1);
   border-radius: 4px;
   padding: 7px 9px;
-  color: rgb(212, 212, 216);
+  color: rgb(63, 63, 70);
   font-size: 0.75rem;
+  background: rgba(255, 255, 255, 0.52);
+}
+
+.dark .principle-note span {
+  border-color: rgba(255, 255, 255, 0.1);
+  color: rgb(212, 212, 216);
   background: rgba(255, 255, 255, 0.045);
 }
 
@@ -437,8 +550,8 @@ body {
   14% {
     border-color: rgba(var(--principle-accent), 0.72);
     background:
-      linear-gradient(180deg, rgba(var(--principle-accent), 0.18), rgba(255, 255, 255, 0.045)),
-      rgba(3, 5, 9, 0.82);
+      linear-gradient(180deg, rgba(var(--principle-accent), 0.18), rgba(255, 255, 255, 0.16)),
+      var(--principle-node-bg);
     box-shadow:
       0 0 34px rgba(var(--principle-accent), 0.28),
       0 0 0 1px rgba(var(--principle-accent), 0.2) inset;
@@ -448,8 +561,8 @@ body {
   100% {
     border-color: rgba(var(--principle-accent), 0.22);
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.035)),
-      rgba(3, 5, 9, 0.74);
+      linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.09)),
+      var(--principle-node-bg);
     box-shadow:
       0 0 24px rgba(var(--principle-accent), 0.08),
       0 0 0 1px rgba(255, 255, 255, 0.03) inset;

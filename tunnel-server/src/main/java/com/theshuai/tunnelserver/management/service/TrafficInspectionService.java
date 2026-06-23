@@ -1,23 +1,29 @@
 package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.tunnelserver.management.model.ClientAccount;
+import com.theshuai.tunnelserver.management.model.HttpBodyTypeClassifier;
 import com.theshuai.tunnelserver.management.model.HttpRouteMapping;
 import com.theshuai.tunnelserver.management.model.HttpTrafficExchange;
 import com.theshuai.tunnelserver.management.model.TcpTrafficFrame;
 import com.theshuai.tunnelserver.management.model.TunnelMapping;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
-import com.theshuai.tunnelserver.management.repository.HttpTrafficExchangeRepository;
-import com.theshuai.tunnelserver.management.repository.TcpTrafficFrameRepository;
 import com.theshuai.tunnelserver.management.repository.TunnelMappingRepository;
+import com.theshuai.tunnelserver.management.storage.HttpTrafficExchangeStore;
+import com.theshuai.tunnelserver.management.storage.TcpTrafficFrameStore;
 import jakarta.annotation.PreDestroy;
+import org.brotli.dec.BrotliInputStream;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
@@ -25,21 +31,30 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.Inflater;
+import java.util.zip.InflaterInputStream;
 
 @Service
 public class TrafficInspectionService {
     public static final String DIRECTION_PUBLIC_TO_CLIENT = "PUBLIC_TO_CLIENT";
     public static final String DIRECTION_CLIENT_TO_PUBLIC = "CLIENT_TO_PUBLIC";
+    private static final long CAPTURE_DECISION_TTL_NANOS = TimeUnit.SECONDS.toNanos(2);
 
     private final ClientAccountService clientAccountService;
     private final TunnelMappingRepository tunnelMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
-    private final HttpTrafficExchangeRepository httpTrafficExchangeRepository;
-    private final TcpTrafficFrameRepository tcpTrafficFrameRepository;
+    private final HttpTrafficExchangeStore httpTrafficExchangeStore;
+    private final TcpTrafficFrameStore tcpTrafficFrameStore;
     private final Queue<PendingHttpExchange> pendingHttpExchanges = new ConcurrentLinkedQueue<>();
     private final Queue<PendingTcpFrame> pendingTcpFrames = new ConcurrentLinkedQueue<>();
+    private final Map<String, CaptureDecision> detailCaptureDecisionCache = new ConcurrentHashMap<>();
+    private final Map<String, StreamCursor> tcpStreamCursors = new ConcurrentHashMap<>();
     private final AtomicInteger pendingHttpCount = new AtomicInteger();
     private final AtomicInteger pendingTcpCount = new AtomicInteger();
     private final boolean captureEnabled;
@@ -51,8 +66,8 @@ public class TrafficInspectionService {
     public TrafficInspectionService(ClientAccountService clientAccountService,
                                     TunnelMappingRepository tunnelMappingRepository,
                                     HttpRouteMappingRepository httpRouteMappingRepository,
-                                    HttpTrafficExchangeRepository httpTrafficExchangeRepository,
-                                    TcpTrafficFrameRepository tcpTrafficFrameRepository,
+                                    HttpTrafficExchangeStore httpTrafficExchangeStore,
+                                    TcpTrafficFrameStore tcpTrafficFrameStore,
                                     @Value("${tunnel.traffic.capture-detail-enabled:true}") boolean captureEnabled,
                                     @Value("${tunnel.traffic.capture-preview-bytes:256}") int previewBytes,
                                     @Value("${tunnel.traffic.capture-header-chars:8192}") int headerChars,
@@ -61,8 +76,8 @@ public class TrafficInspectionService {
         this.clientAccountService = clientAccountService;
         this.tunnelMappingRepository = tunnelMappingRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
-        this.httpTrafficExchangeRepository = httpTrafficExchangeRepository;
-        this.tcpTrafficFrameRepository = tcpTrafficFrameRepository;
+        this.httpTrafficExchangeStore = httpTrafficExchangeStore;
+        this.tcpTrafficFrameStore = tcpTrafficFrameStore;
         this.captureEnabled = captureEnabled;
         this.previewBytes = Math.max(0, previewBytes);
         this.headerChars = Math.max(0, headerChars);
@@ -83,14 +98,17 @@ public class TrafficInspectionService {
                                    long startedAtMillis,
                                    String remoteAddress,
                                    String error) {
-        if (!captureEnabled || clientName == null || !acquireSlot(pendingHttpCount)) {
+        if (!captureEnabled || clientName == null || !shouldCaptureHttpDetail(clientName, route) || !acquireSlot(pendingHttpCount)) {
             return;
         }
 
         String requestContentType = contentType(requestHeaders);
         String responseContentType = contentType(responseHeaders);
-        Preview requestPreview = bodyText(requestBody, requestContentType);
-        Preview responsePreview = bodyText(responseBody, responseContentType);
+        String responseBodyType = HttpBodyTypeClassifier.classify(responseContentType, length(responseBody));
+        String requestContentEncoding = contentEncoding(requestHeaders);
+        String responseContentEncoding = contentEncoding(responseHeaders);
+        Preview requestPreview = bodyText(requestBody, requestContentType, requestContentEncoding);
+        Preview responsePreview = bodyText(responseBody, responseContentType, responseContentEncoding);
         pendingHttpExchanges.add(new PendingHttpExchange(
                 clientName,
                 blankToEmpty(route),
@@ -106,6 +124,7 @@ public class TrafficInspectionService {
                 Math.max(0, System.currentTimeMillis() - startedAtMillis),
                 requestContentType,
                 responseContentType,
+                responseBodyType,
                 cap(joinHeaders(requestHeaders), headerChars),
                 cap(joinHeaders(responseHeaders), headerChars),
                 requestPreview.hex(),
@@ -124,23 +143,71 @@ public class TrafficInspectionService {
                                String direction,
                                String remoteAddress,
                                byte[] payload) {
-        if (!captureEnabled || clientName == null || listenPort <= 0 || !acquireSlot(pendingTcpCount)) {
+        recordTcpFrame(clientName, listenPort, channelId, direction, remoteAddress,
+                null, null, null, null, payload);
+    }
+
+    public void recordTcpFrame(String clientName,
+                               int listenPort,
+                               String channelId,
+                               String direction,
+                               String sourceAddress,
+                               Integer sourcePort,
+                               String destinationAddress,
+                               Integer destinationPort,
+                               byte[] payload) {
+        recordTcpFrame(clientName, listenPort, channelId, direction,
+                peerAddress(direction, sourceAddress, sourcePort, destinationAddress, destinationPort),
+                sourceAddress, sourcePort, destinationAddress, destinationPort, payload);
+    }
+
+    private void recordTcpFrame(String clientName,
+                                int listenPort,
+                                String channelId,
+                                String direction,
+                                String remoteAddress,
+                                String sourceAddress,
+                                Integer sourcePort,
+                                String destinationAddress,
+                                Integer destinationPort,
+                                byte[] payload) {
+        if (!captureEnabled || clientName == null || listenPort <= 0 || !shouldCaptureTcpDetail(clientName, listenPort)
+                || !acquireSlot(pendingTcpCount)) {
             return;
         }
 
         Preview preview = preview(payload);
+        long payloadBytes = length(payload);
+        FramePosition framePosition = nextFramePosition(clientName, listenPort, channelId, direction, payloadBytes);
+        byte[] payloadData = payload == null || payload.length == 0 ? new byte[0] : Arrays.copyOf(payload, payload.length);
         pendingTcpFrames.add(new PendingTcpFrame(
                 clientName,
                 listenPort,
                 cap(blankToEmpty(channelId), 120),
                 cap(blankToEmpty(direction), 32),
                 cap(remoteAddress, 255),
-                length(payload),
+                cap(sourceAddress, 255),
+                sourcePort,
+                cap(destinationAddress, 255),
+                destinationPort,
+                framePosition.streamOffset(),
+                framePosition.streamEndOffset(),
+                framePosition.frameIndex(),
+                payloadBytes,
+                payloadData,
                 preview.hex(),
                 preview.text(),
-                preview.truncated(),
+                false,
                 Instant.now().toString()
         ));
+    }
+
+    public void releaseTcpStream(String channelId) {
+        if (channelId == null || channelId.isBlank()) {
+            return;
+        }
+        String token = "|" + channelId + "|";
+        tcpStreamCursors.keySet().removeIf(key -> key.contains(token));
     }
 
     @Scheduled(fixedDelayString = "${tunnel.traffic.capture-flush-interval-ms:2000}")
@@ -189,6 +256,7 @@ public class TrafficInspectionService {
             exchange.setElapsedMs(item.elapsedMs());
             exchange.setRequestContentType(item.requestContentType());
             exchange.setResponseContentType(item.responseContentType());
+            exchange.setResponseBodyType(item.responseBodyType());
             exchange.setRequestHeaders(item.requestHeaders());
             exchange.setResponseHeaders(item.responseHeaders());
             exchange.setRequestPreviewHex(item.requestPreviewHex());
@@ -200,7 +268,7 @@ public class TrafficInspectionService {
             exchange.setCapturedAt(item.capturedAt());
             entities.add(exchange);
         }
-        httpTrafficExchangeRepository.saveAll(entities);
+        httpTrafficExchangeStore.saveAll(entities);
     }
 
     private void flushTcp() {
@@ -228,14 +296,22 @@ public class TrafficInspectionService {
             frame.setChannelId(item.channelId());
             frame.setDirection(item.direction());
             frame.setRemoteAddress(item.remoteAddress());
+            frame.setSourceAddress(item.sourceAddress());
+            frame.setSourcePort(item.sourcePort());
+            frame.setDestinationAddress(item.destinationAddress());
+            frame.setDestinationPort(item.destinationPort());
+            frame.setStreamOffset(item.streamOffset());
+            frame.setStreamEndOffset(item.streamEndOffset());
+            frame.setFrameIndex(item.frameIndex());
             frame.setPayloadBytes(item.payloadBytes());
+            frame.setPayloadData(item.payloadData());
             frame.setPayloadPreviewHex(item.payloadPreviewHex());
             frame.setPayloadPreviewText(item.payloadPreviewText());
             frame.setTruncated(item.truncated());
             frame.setFrameTime(item.frameTime());
             entities.add(frame);
         }
-        tcpTrafficFrameRepository.saveAll(entities);
+        tcpTrafficFrameStore.saveAll(entities);
     }
 
     private ResourceDescriptor resolveTcpResource(ClientAccount account, int listenPort) {
@@ -285,6 +361,75 @@ public class TrafficInspectionService {
         return true;
     }
 
+    private boolean shouldCaptureHttpDetail(String clientName, String route) {
+        String normalizedRoute = blankToEmpty(route);
+        return cachedCaptureDecision("http:" + clientName + ":" + normalizedRoute, () -> {
+            ClientAccount account = clientAccountService.findClientByName(clientName).orElse(null);
+            if (account == null) {
+                return false;
+            }
+            return httpRouteMappingRepository
+                    .findByTenantIdAndClientIdAndRoute(account.getTenantId(), account.getId(), normalizedRoute)
+                    .map(row -> Boolean.TRUE.equals(row.getDetailCaptureEnabled()))
+                    .orElse(false);
+        });
+    }
+
+    private boolean shouldCaptureTcpDetail(String clientName, int listenPort) {
+        return cachedCaptureDecision("tcp:" + clientName + ":" + listenPort, () -> tunnelMappingRepository
+                .findByListenPort(listenPort)
+                .filter(row -> Objects.equals(row.getClientName(), clientName))
+                .map(row -> Boolean.TRUE.equals(row.getDetailCaptureEnabled()))
+                .orElse(false));
+    }
+
+    private boolean cachedCaptureDecision(String key, java.util.function.BooleanSupplier loader) {
+        long now = System.nanoTime();
+        CaptureDecision cached = detailCaptureDecisionCache.get(key);
+        if (cached != null && cached.expiresAtNanos() > now) {
+            return cached.enabled();
+        }
+        boolean enabled = loader.getAsBoolean();
+        detailCaptureDecisionCache.put(key, new CaptureDecision(enabled, now + CAPTURE_DECISION_TTL_NANOS));
+        return enabled;
+    }
+
+    private FramePosition nextFramePosition(String clientName,
+                                            int listenPort,
+                                            String channelId,
+                                            String direction,
+                                            long payloadBytes) {
+        String key = streamKey(clientName, listenPort, channelId, direction);
+        return tcpStreamCursors.computeIfAbsent(key, ignored -> new StreamCursor())
+                .next(Math.max(0, payloadBytes));
+    }
+
+    private String streamKey(String clientName, int listenPort, String channelId, String direction) {
+        return blankToEmpty(clientName) + "|" + listenPort + "|" + blankToEmpty(channelId) + "|" + blankToEmpty(direction);
+    }
+
+    private static String peerAddress(String direction,
+                                      String sourceAddress,
+                                      Integer sourcePort,
+                                      String destinationAddress,
+                                      Integer destinationPort) {
+        if (DIRECTION_PUBLIC_TO_CLIENT.equals(direction)) {
+            return endpoint(sourceAddress, sourcePort);
+        }
+        if (DIRECTION_CLIENT_TO_PUBLIC.equals(direction)) {
+            return endpoint(destinationAddress, destinationPort);
+        }
+        String source = endpoint(sourceAddress, sourcePort);
+        return source == null ? endpoint(destinationAddress, destinationPort) : source;
+    }
+
+    private static String endpoint(String address, Integer port) {
+        if (address == null || address.isBlank()) {
+            return port == null ? null : ":" + port;
+        }
+        return port == null ? address : address + ":" + port;
+    }
+
     private Preview preview(byte[] data) {
         int totalLength = length(data);
         int previewLength = Math.min(totalLength, previewBytes);
@@ -308,15 +453,99 @@ public class TrafficInspectionService {
         return new Preview(hex.toString(), text, totalLength > previewLength);
     }
 
-    private Preview bodyText(byte[] data, String contentType) {
+    private Preview bodyText(byte[] data, String contentType, String contentEncoding) {
         if (data == null || data.length == 0) {
             return new Preview("", "", false);
         }
-        if (!isTextBody(contentType) && !looksLikeText(data)) {
-            String mediaType = mediaType(contentType);
-            return new Preview("", "data:" + mediaType + ";base64," + Base64.getEncoder().encodeToString(data), false);
+        DecodedBody decoded = decodeContentEncoding(data, contentEncoding);
+        byte[] displayData = decoded.data();
+        if (!decoded.decoded() && hasEncodedBody(contentEncoding) && !looksLikeText(displayData)) {
+            return new Preview("", "data:application/octet-stream;base64," + Base64.getEncoder().encodeToString(displayData), false);
         }
-        return new Preview("", sanitizeText(new String(data, StandardCharsets.UTF_8)), false);
+        if (!isTextBody(contentType) && !looksLikeText(displayData)) {
+            String mediaType = mediaType(contentType);
+            return new Preview("", "data:" + mediaType + ";base64," + Base64.getEncoder().encodeToString(displayData), false);
+        }
+        return new Preview("", sanitizeText(new String(displayData, StandardCharsets.UTF_8)), false);
+    }
+
+    private DecodedBody decodeContentEncoding(byte[] data, String contentEncoding) {
+        if (!hasEncodedBody(contentEncoding)) {
+            return new DecodedBody(data, false);
+        }
+        String[] tokens = contentEncoding.split(",");
+        byte[] current = data;
+        boolean decoded = false;
+        try {
+            for (int i = tokens.length - 1; i >= 0; i--) {
+                String token = tokens[i].trim().toLowerCase(Locale.ROOT);
+                if (token.isBlank() || token.equals("identity")) {
+                    continue;
+                }
+                if (token.equals("gzip") || token.equals("x-gzip")) {
+                    current = gunzip(current);
+                    decoded = true;
+                    continue;
+                }
+                if (token.equals("deflate") || token.equals("x-deflate")) {
+                    current = inflate(current);
+                    decoded = true;
+                    continue;
+                }
+                if (token.equals("br")) {
+                    current = brotli(current);
+                    decoded = true;
+                    continue;
+                }
+                return new DecodedBody(data, false);
+            }
+            return new DecodedBody(current, decoded);
+        } catch (IOException | IllegalArgumentException ignored) {
+            return new DecodedBody(data, false);
+        }
+    }
+
+    private byte[] gunzip(byte[] data) throws IOException {
+        try (GZIPInputStream input = new GZIPInputStream(new ByteArrayInputStream(data))) {
+            return readAll(input);
+        }
+    }
+
+    private byte[] inflate(byte[] data) throws IOException {
+        try {
+            try (InflaterInputStream input = new InflaterInputStream(new ByteArrayInputStream(data))) {
+                return readAll(input);
+            }
+        } catch (IOException first) {
+            try (InflaterInputStream input = new InflaterInputStream(new ByteArrayInputStream(data), new Inflater(true))) {
+                return readAll(input);
+            }
+        }
+    }
+
+    private byte[] brotli(byte[] data) throws IOException {
+        try (BrotliInputStream input = new BrotliInputStream(new ByteArrayInputStream(data))) {
+            return readAll(input);
+        }
+    }
+
+    private byte[] readAll(java.io.InputStream input) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        input.transferTo(output);
+        return output.toByteArray();
+    }
+
+    private boolean hasEncodedBody(String contentEncoding) {
+        if (contentEncoding == null || contentEncoding.isBlank()) {
+            return false;
+        }
+        for (String token : contentEncoding.split(",")) {
+            String normalized = token.trim().toLowerCase(Locale.ROOT);
+            if (!normalized.isBlank() && !normalized.equals("identity")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean isTextBody(String contentType) {
@@ -414,6 +643,14 @@ public class TrafficInspectionService {
     }
 
     private String contentType(List<String> headers) {
+        return headerValue(headers, "content-type");
+    }
+
+    private String contentEncoding(List<String> headers) {
+        return headerValue(headers, "content-encoding");
+    }
+
+    private String headerValue(List<String> headers, String name) {
         if (headers == null) {
             return null;
         }
@@ -422,7 +659,7 @@ public class TrafficInspectionService {
                 continue;
             }
             int separator = header.indexOf(':');
-            if (separator > 0 && "content-type".equals(header.substring(0, separator).trim().toLowerCase(Locale.ROOT))) {
+            if (separator > 0 && name.equals(header.substring(0, separator).trim().toLowerCase(Locale.ROOT))) {
                 return cap(header.substring(separator + 1).trim(), 255);
             }
         }
@@ -454,6 +691,12 @@ public class TrafficInspectionService {
     private record Preview(String hex, String text, boolean truncated) {
     }
 
+    private record DecodedBody(byte[] data, boolean decoded) {
+    }
+
+    private record CaptureDecision(boolean enabled, long expiresAtNanos) {
+    }
+
     private record ResourceDescriptor(Long resourceId, String resourceName) {
     }
 
@@ -472,6 +715,7 @@ public class TrafficInspectionService {
             long elapsedMs,
             String requestContentType,
             String responseContentType,
+            String responseBodyType,
             String requestHeaders,
             String responseHeaders,
             String requestPreviewHex,
@@ -490,11 +734,33 @@ public class TrafficInspectionService {
             String channelId,
             String direction,
             String remoteAddress,
+            String sourceAddress,
+            Integer sourcePort,
+            String destinationAddress,
+            Integer destinationPort,
+            long streamOffset,
+            long streamEndOffset,
+            long frameIndex,
             long payloadBytes,
+            byte[] payloadData,
             String payloadPreviewHex,
             String payloadPreviewText,
             boolean truncated,
             String frameTime
     ) {
+    }
+
+    private static final class StreamCursor {
+        private final AtomicLong offset = new AtomicLong();
+        private final AtomicLong index = new AtomicLong();
+
+        private FramePosition next(long payloadBytes) {
+            long start = offset.getAndAdd(payloadBytes);
+            long frameIndex = index.getAndIncrement();
+            return new FramePosition(start, start + payloadBytes, frameIndex);
+        }
+    }
+
+    private record FramePosition(long streamOffset, long streamEndOffset, long frameIndex) {
     }
 }

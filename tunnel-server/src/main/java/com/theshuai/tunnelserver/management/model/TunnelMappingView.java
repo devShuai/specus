@@ -8,6 +8,7 @@ public record TunnelMappingView(
         String targetAddress,
         int targetPort,
         boolean enabled,
+        boolean detailCaptureEnabled,
         String createdAt,
         String updatedAt
 ) {

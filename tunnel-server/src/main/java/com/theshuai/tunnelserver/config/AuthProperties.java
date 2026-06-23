@@ -14,7 +14,7 @@ public class AuthProperties {
     private boolean passwordLoginEnabled = true;
     private String username = "admin";
     private String password = "admin";
-    /** Default tenant used by local password-login and legacy data. */
+    /** Default tenant used by local password-login and existing default-tenant data. */
     private String tenantId = "default";
     /** HS256 signing secret; when blank a random key is generated at startup (tokens reset on restart). */
     private String jwtSecret = "";

@@ -6,7 +6,6 @@ import com.theshuai.common.session.Session;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.service.AuthenticationResult;
-import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.ClientAuthService;
 import com.theshuai.tunnelserver.management.service.ConnectionRecordService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
@@ -28,18 +27,15 @@ import java.util.concurrent.RejectedExecutionException;
 public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<LoginRequestPacket> {
     private static final AttributeKey<Long> CONNECTION_RECORD_ID = AttributeKey.valueOf("connectionRecordId");
 
-    private final ClientAccountService clientAccountService;
     private final ClientAuthService clientAuthService;
     private final ConnectionRecordService connectionRecordService;
     private final NatControlService natControlService;
     private final ExecutorService loginExecutor;
 
-    public ManagedLoginRequestHandler(ClientAccountService clientAccountService,
-                                      ClientAuthService clientAuthService,
+    public ManagedLoginRequestHandler(ClientAuthService clientAuthService,
                                       ConnectionRecordService connectionRecordService,
                                       NatControlService natControlService,
                                       @Qualifier("loginExecutor") ExecutorService loginExecutor) {
-        this.clientAccountService = clientAccountService;
         this.clientAuthService = clientAuthService;
         this.connectionRecordService = connectionRecordService;
         this.natControlService = natControlService;
@@ -68,7 +64,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                     packet,
                     ctx.channel().id().asLongText(),
                     String.valueOf(ctx.channel().remoteAddress()))
-                    : clientAccountService.authenticate(packet);
+                    : AuthenticationResult.failure(null, "客户端必须先通过 HTTP 登录获取访问令牌");
             long connectionRecordId = connectionRecordService.recordConnection(
                     authentication,
                     packet,

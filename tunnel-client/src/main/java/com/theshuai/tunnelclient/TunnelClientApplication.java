@@ -34,6 +34,7 @@ import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 
 @SpringBootApplication
@@ -52,15 +53,10 @@ public class TunnelClientApplication {
             throw new IllegalStateException("未找到 " + CONFIG_FILE + " 配置，无法启动 tunnel client");
         }
         ClientStartupConfig startupConfig = JsonUtil.stringToObject(configString, ClientStartupConfig.class);
-        if (startupConfig != null && StringUtils.hasText(startupConfig.getServerBaseUrl())) {
-            return loginAndBuildTunnel(startupConfig);
+        if (startupConfig == null || !StringUtils.hasText(startupConfig.getServerBaseUrl())) {
+            throw new IllegalStateException(CONFIG_FILE + " 必须使用 HTTP 登录配置，至少包含 serverBaseUrl");
         }
-        log.warn("检测到旧版 tunnelClientConfig.json，继续使用本地 clientName/password 直连配置");
-        TunnelBean tunnelBean = JsonUtil.stringToObject(configString, TunnelBean.class);
-        if (tunnelBean == null) {
-            throw new IllegalStateException(CONFIG_FILE + " 配置无效");
-        }
-        return tunnelBean;
+        return loginAndBuildTunnel(startupConfig);
     }
 
     private static TunnelBean loginAndBuildTunnel(ClientStartupConfig startupConfig) {
@@ -92,11 +88,16 @@ public class TunnelClientApplication {
         tunnelBean.setClientName(response.getClientName());
         tunnelBean.setClientSessionId(response.getClientSessionId());
         tunnelBean.setAccessToken(response.getAccessToken());
+        tunnelBean.setTokenTtlSeconds(response.getTokenTtlSeconds());
+        if (response.getTokenTtlSeconds() > 0) {
+            tunnelBean.setTokenExpiresAtMillis(System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(response.getTokenTtlSeconds()));
+        }
         tunnelBean.setRemoteAddress(response.getNettyHost());
         tunnelBean.setRemotePort(response.getNettyPort());
         tunnelBean.setMaxOnlineInstances(response.getMaxOnlineInstances());
         tunnelBean.setTunnelConfigList(toTunnelConfigs(response.getTunnelConfigList()));
         tunnelBean.setHttpTunnelConfigList(toHttpTunnelConfigs(response.getHttpTunnelConfigList()));
+        tunnelBean.setAuthRefresher(() -> loginAndBuildTunnel(startupConfig));
         log.info("客户端 HTTP 登录成功: clientName={}, session={}, tunnel={}:{}, tcp={}, http={}, maxOnlineInstances={}",
                 tunnelBean.getClientName(),
                 tunnelBean.getClientSessionId(),
@@ -204,19 +205,14 @@ public class TunnelClientApplication {
     }
 
     private static String loadConfigString() {
-        File primaryFile = new File(System.getProperty("user.dir") + File.separator + CONFIG_FILE);
-        File fallbackFile = new File(CONFIG_FILE);
+        File configFile = new File(System.getProperty("user.dir") + File.separator + CONFIG_FILE);
 
         try {
-            if (primaryFile.exists()) {
-                log.info("加载 tunnel client 配置: {}", primaryFile.getAbsolutePath());
-                return readFile(primaryFile);
+            if (configFile.exists()) {
+                log.info("加载 tunnel client 配置: {}", configFile.getAbsolutePath());
+                return readFile(configFile);
             }
-            if (fallbackFile.exists()) {
-                log.info("加载 tunnel client 配置: {}", fallbackFile.getAbsolutePath());
-                return readFile(fallbackFile);
-            }
-            log.warn("未找到 {}。已检查路径: [{}], [{}]", CONFIG_FILE, primaryFile.getAbsolutePath(), fallbackFile.getAbsolutePath());
+            log.warn("未找到 {}。已检查路径: [{}]", CONFIG_FILE, configFile.getAbsolutePath());
             return "";
         } catch (Exception e) {
             log.error("处理 tunnel client 配置失败", e);

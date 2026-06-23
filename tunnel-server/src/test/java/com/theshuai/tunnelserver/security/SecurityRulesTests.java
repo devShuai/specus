@@ -45,6 +45,16 @@ class SecurityRulesTests {
     }
 
     @Test
+    void publicHttpProxyIgnoresForeignBearerToken() throws Exception {
+        HttpResponse<String> response = get("/http/missing-client/nacos/", "nacos-owned-token");
+
+        assertThat(response.statusCode())
+                .as("foreign upstream bearer token must reach HTTP proxy instead of resource-server validation")
+                .isEqualTo(503);
+        assertThat(response.body()).contains("客户端不在线");
+    }
+
+    @Test
     void oidcConfigIsPublic() throws Exception {
         assertThat(get("/oidc-config", null).statusCode()).isEqualTo(200);
     }

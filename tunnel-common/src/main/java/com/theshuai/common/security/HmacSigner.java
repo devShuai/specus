@@ -8,23 +8,11 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Objects;
 
 /**
- * Helpers for the HMAC-SHA256 login signature shared by Java and Go clients.
- *
- * <p>Wire format (login packet):
- * <pre>
- *   key   = SHA-256(password)               // 32 raw bytes
- *   msg   = clientName + "\n" + timestamp + "\n" + nonce
- *   sign  = HMAC-SHA256(key, msg)            // 32 raw bytes
- * </pre>
- * Both sides derive the same {@code key} from the password (Java hashes the
- * plaintext locally, the server hashes the stored password at account create
- * time) so the password itself never crosses the wire.
+ * Shared HMAC-SHA256 helpers used by client HTTP authentication.
  */
 public final class HmacSigner {
     private static final String HMAC_ALGORITHM = "HmacSHA256";
     private static final String SHA_256 = "SHA-256";
-    private static final char DELIMITER = '\n';
-    private static final int SIGNATURE_LENGTH = 32;
 
     private HmacSigner() {
     }
@@ -50,12 +38,6 @@ public final class HmacSigner {
         }
     }
 
-    public static String signMessage(String clientName, String timestamp, String nonce, byte[] key) {
-        String message = clientName + DELIMITER + timestamp + DELIMITER + nonce;
-        byte[] raw = hmacSha256(key, message);
-        return java.util.HexFormat.of().formatHex(raw);
-    }
-
     public static byte[] decodeHex(String hex) {
         if (hex == null || (hex.length() & 1) != 0) {
             throw new IllegalArgumentException("hex string must be non-null and even length");
@@ -73,7 +55,4 @@ public final class HmacSigner {
         return out;
     }
 
-    public static int signatureLength() {
-        return SIGNATURE_LENGTH;
-    }
 }

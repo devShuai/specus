@@ -38,6 +38,9 @@ shuai-tunnel.db-shm
 shuai-tunnel.db-wal
 shuai-tunnel.db-journal
 
+### Local server config ###
+/tunnel-server/config/
+
 ### Local client credentials ###
 tunnelClientConfig.json
 

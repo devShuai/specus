@@ -29,12 +29,29 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
             // non-null old channel, closes it, and tears down the connection
             // we are literally trying to use.
         } else {
-            log.warn("[{}]登录失败,原因:{} —— 主动关闭连接进入重连退避",
-                    clientName, loginResponsePacket.getReason());
-            // 关闭 channel 触发 channelInactive → scheduleReconnect。
-            // 这里不直接 connect()，让退避计时器把节奏控制住，避免错密码场景蜂拥重连。
+            String reason = loginResponsePacket.getReason();
+            if (isTokenExpired(reason)) {
+                log.warn("[{}]登录失败,原因:{} —— 访问令牌过期，刷新后重连", clientName, reason);
+                nettyClient.refreshCredentialsAndReconnect(reason);
+            } else if (isRetryable(reason)) {
+                log.warn("[{}]登录失败,原因:{} —— 主动关闭连接进入重连退避", clientName, reason);
+            } else {
+                log.warn("[{}]登录失败,原因:{} —— 认证/策略拒绝，停止重连", clientName, reason);
+                nettyClient.stopReconnecting(reason);
+            }
             ctx.close();
         }
+    }
+
+    private boolean isTokenExpired(String reason) {
+        return reason != null && reason.contains("访问令牌已过期");
+    }
+
+    private boolean isRetryable(String reason) {
+        if (reason == null || reason.isBlank()) {
+            return false;
+        }
+        return reason.contains("服务器繁忙") || reason.contains("连接频率超过限制");
     }
 
     @Override

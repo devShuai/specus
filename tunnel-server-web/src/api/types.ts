@@ -69,6 +69,7 @@ export interface Tunnel {
   targetAddress: string;
   targetPort: number;
   enabled: boolean;
+  detailCaptureEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -80,6 +81,7 @@ export interface HttpRoute {
   route: string;
   targetBaseUrl: string;
   enabled: boolean;
+  detailCaptureEnabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -151,6 +153,7 @@ export interface HttpTrafficExchange {
   elapsedMs: number;
   requestContentType: string | null;
   responseContentType: string | null;
+  responseBodyType: HttpResponseBodyType | string | null;
   requestHeaders: string;
   responseHeaders: string;
   requestPreviewHex: string;
@@ -170,8 +173,39 @@ export interface HttpTrafficExchangePage {
   totalPages: number;
 }
 
+export type HttpResponseBodyType =
+  | "empty"
+  | "json"
+  | "html"
+  | "xml"
+  | "image"
+  | "video"
+  | "audio"
+  | "form"
+  | "script"
+  | "text"
+  | "binary";
+
+export type HttpTrafficSearchField =
+  | "summary"
+  | "all"
+  | "id"
+  | "method"
+  | "status"
+  | "path"
+  | "route"
+  | "client"
+  | "resource"
+  | "remote"
+  | "contentType"
+  | "error"
+  | "requestHeaders"
+  | "responseHeaders"
+  | "requestBody"
+  | "responseBody";
+
 export interface TcpTrafficFrame {
-  id: number;
+  id: string;
   clientId: number;
   clientName: string;
   listenPort: number;
@@ -180,11 +214,35 @@ export interface TcpTrafficFrame {
   channelId: string;
   direction: "PUBLIC_TO_CLIENT" | "CLIENT_TO_PUBLIC" | string;
   remoteAddress: string | null;
+  sourceAddress: string | null;
+  sourcePort: number | null;
+  destinationAddress: string | null;
+  destinationPort: number | null;
+  streamOffset: number;
+  streamEndOffset: number;
+  frameIndex: number;
   payloadBytes: number;
+  payloadBase64: string;
   payloadPreviewHex: string;
   payloadPreviewText: string;
   truncated: boolean;
   frameTime: string;
+}
+
+export interface TcpTrafficFramePage {
+  items: TcpTrafficFrame[];
+  total: number;
+  page: number;
+  size: number;
+  totalPages: number;
+}
+
+export interface TcpTrafficStream {
+  channelId: string;
+  items: TcpTrafficFrame[];
+  total: number;
+  limit: number;
+  truncated: boolean;
 }
 
 export interface NatControlResult {
@@ -218,12 +276,14 @@ export interface TunnelMutation {
   targetAddress: string;
   targetPort: number;
   enabled?: boolean;
+  detailCaptureEnabled?: boolean;
 }
 
 export interface HttpRouteMutation {
   route: string;
   targetBaseUrl: string;
   enabled?: boolean;
+  detailCaptureEnabled?: boolean;
 }
 
 // LiveConnectionEvent is the JSON pushed over /ws/connections.

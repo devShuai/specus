@@ -56,8 +56,11 @@ npm run typecheck    # tsc --noEmit
 - 登录:用户名/密码 + OIDC(PKCE S256);token 存 `sessionStorage`,密码登录自动续期,401 统一登出。
 - 概览、客户端(增改删 + 下发映射 + 一次性密码)、端口映射(增改删 + 状态切换)、HTTP 路由(增改删 + 筛选 + 切换)。
 - 连接记录:筛选 + 分页 + WebSocket 实时(created/updated)+ 活动连接 1Hz 时长刷新。
-- 流量使用、数据库初始化。
-- 全中文、HeroUI 暗色主题跟随系统。
+- 流量观测:客户端 / TCP 映射 / HTTP 路由聚合，HTTP 协议记录和 TCP 数据帧分页查看。
+- HTTP 协议详情:请求/响应两列展示，Header 支持表单与 Raw 切换，常见 Header 带中文说明和规范链接。
+- Body 预览:JSON 高亮、表单、Multipart、HTML、XML、图片和文本预览；`Content-Encoding: gzip` / `deflate` 会在旧记录展示时尝试浏览器侧解压，新记录由服务端入库前解压，`br` 新记录由服务端处理。
+- TCP 详情:保留完整二进制 payload，前端按 HTTP、JSON、图片、文本或 hexdump 做 best-effort 解析。
+- 全中文、HeroUI 深浅主题，落地页与后台均支持主题切换。
 
 ## 结构
 

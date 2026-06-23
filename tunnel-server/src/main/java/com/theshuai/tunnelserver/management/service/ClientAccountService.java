@@ -1,13 +1,10 @@
 package com.theshuai.tunnelserver.management.service;
 
-import com.theshuai.common.protocol.request.LoginRequestPacket;
-import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelserver.attribute.ServerAttributes;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
-import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficTotal;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
@@ -19,21 +16,18 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
- * 客户端账号生命周期管理 + 登录鉴权。
+ * 客户端账号生命周期管理。
  *
  * <p>这个类原本叫 {@code ClientManagementService}，承担了 5 个领域；按职责拆分后留下的就是
  * "客户端账号"这一个领域：
  * <ul>
  *   <li>账号 CRUD（{@link #createClient}, {@link #updateClient}, {@link #deleteClient}, {@link #listClients}）</li>
- *   <li>登录鉴权（{@link #authenticate}）——产出 {@link AuthenticationResult}，
- *       由调用方决定是否绑定会话/记录连接，本类自身不写连接表</li>
  * </ul>
  *
  * <p>已搬走的功能：
@@ -46,14 +40,11 @@ import java.util.stream.Collectors;
 @Service
 public class ClientAccountService {
     private final ClientAccountRepository clientAccountRepository;
-    private final ConnectionRecordRepository connectionRecordRepository;
     private final TrafficUsageRepository trafficUsageRepository;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
-                                ConnectionRecordRepository connectionRecordRepository,
                                 TrafficUsageRepository trafficUsageRepository) {
         this.clientAccountRepository = clientAccountRepository;
-        this.connectionRecordRepository = connectionRecordRepository;
         this.trafficUsageRepository = trafficUsageRepository;
     }
 
@@ -155,25 +146,6 @@ public class ClientAccountService {
     }
 
     @Transactional(readOnly = true)
-    public AuthenticationResult authenticate(LoginRequestPacket packet) {
-        Optional<ClientAccount> optionalAccount = findClientByName(packet.getClientName());
-        if (optionalAccount.isEmpty()) {
-            return AuthenticationResult.failure(null, "客户端不存在");
-        }
-        ClientAccount account = optionalAccount.get();
-        if (!account.isEnabled()) {
-            return AuthenticationResult.failure(account, "客户端已停用");
-        }
-        if (hasExceededRateLimit(account)) {
-            return AuthenticationResult.failure(account, "连接频率超过限制");
-        }
-        if (!hasValidSignature(packet, account)) {
-            return AuthenticationResult.failure(account, "签名无效或已过期");
-        }
-        return AuthenticationResult.success(account);
-    }
-
-    @Transactional(readOnly = true)
     public Optional<ClientAccount> findClientByName(String clientName) {
         return clientAccountRepository.findByClientName(clientName);
     }
@@ -206,44 +178,6 @@ public class ClientAccountService {
                 account.getCreatedAt(),
                 account.getUpdatedAt()
         );
-    }
-
-    private boolean hasExceededRateLimit(ClientAccount account) {
-        return account.getConnectionRateLimitPerMinute() > 0
-                && connectionRecordRepository.countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(
-                account.getTenantId(),
-                account.getId(),
-                Instant.now().minus(1, ChronoUnit.MINUTES).toString()
-        ) >= account.getConnectionRateLimitPerMinute();
-    }
-
-    private boolean hasValidSignature(LoginRequestPacket packet, ClientAccount account) {
-        if (packet.getClientName() == null || packet.getTimestamp() == null
-                || packet.getNonce() == null || packet.getCheckSign() == null) {
-            return false;
-        }
-        if (packet.getCheckSign().length != HmacSigner.signatureLength()) {
-            return false;
-        }
-        long ts;
-        try {
-            ts = Long.parseLong(packet.getTimestamp());
-        } catch (NumberFormatException e) {
-            return false;
-        }
-        if (Math.abs(ts - System.currentTimeMillis()) > 30_000L) {
-            return false;
-        }
-        byte[] key;
-        try {
-            key = HmacSigner.decodeHex(account.getPasswordHash());
-        } catch (IllegalArgumentException e) {
-            // Stored hash is corrupt — fail closed.
-            return false;
-        }
-        String message = packet.getClientName() + "\n" + packet.getTimestamp() + "\n" + packet.getNonce();
-        byte[] expected = HmacSigner.hmacSha256(key, message);
-        return java.security.MessageDigest.isEqual(expected, packet.getCheckSign());
     }
 
     private void closeOnlineChannel(String clientName, DisconnectReason reason) {

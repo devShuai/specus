@@ -64,6 +64,9 @@ public class HttpRouteMapping {
     @Column(nullable = false)
     private boolean enabled = true;
 
+    @Column(name = "detail_capture_enabled")
+    private Boolean detailCaptureEnabled = false;
+
     @Column(name = "created_at", nullable = false, length = 40)
     private String createdAt;
 

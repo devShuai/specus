@@ -65,6 +65,7 @@ export function TunnelsPanel() {
         targetAddress: targetAddress.trim(),
         targetPort: Number(targetPort),
         enabled: true,
+        detailCaptureEnabled: false,
       });
       setListenPort("");
       setTargetAddress("");
@@ -85,10 +86,26 @@ export function TunnelsPanel() {
         targetAddress: tunnel.targetAddress,
         targetPort: tunnel.targetPort,
         enabled: !tunnel.enabled,
+        detailCaptureEnabled: Boolean(tunnel.detailCaptureEnabled),
       });
       await load();
     } catch (error) {
       notifyError(error, "切换状态失败");
+    }
+  };
+
+  const toggleDetailCapture = async (tunnel: Tunnel) => {
+    try {
+      await adminApi.updateTunnel(tunnel.id, {
+        listenPort: tunnel.listenPort,
+        targetAddress: tunnel.targetAddress,
+        targetPort: tunnel.targetPort,
+        enabled: tunnel.enabled,
+        detailCaptureEnabled: !Boolean(tunnel.detailCaptureEnabled),
+      });
+      await load();
+    } catch (error) {
+      notifyError(error, "切换明细采集失败");
     }
   };
 
@@ -137,6 +154,7 @@ export function TunnelsPanel() {
           <TableColumn>公网端口</TableColumn>
           <TableColumn>内网目标</TableColumn>
           <TableColumn>状态</TableColumn>
+          <TableColumn>明细采集</TableColumn>
           <TableColumn>更新时间</TableColumn>
           <TableColumn>操作</TableColumn>
         </TableHeader>
@@ -158,6 +176,17 @@ export function TunnelsPanel() {
                   onClick={() => void toggle(tunnel)}
                 >
                   {tunnel.enabled ? "启用" : "停用"}
+                </Chip>
+              </TableCell>
+              <TableCell>
+                <Chip
+                  size="sm"
+                  variant="flat"
+                  color={tunnel.detailCaptureEnabled ? "primary" : "default"}
+                  className="cursor-pointer"
+                  onClick={() => void toggleDetailCapture(tunnel)}
+                >
+                  {tunnel.detailCaptureEnabled ? "采集" : "关闭"}
                 </Chip>
               </TableCell>
               <TableCell>{formatDateTime(tunnel.updatedAt || tunnel.createdAt)}</TableCell>
@@ -192,6 +221,7 @@ function EditTunnelModal({ disclosure, tunnel, onSaved }: EditTunnelModalProps) 
   const [targetAddress, setTargetAddress] = useState("");
   const [targetPort, setTargetPort] = useState("");
   const [enabled, setEnabled] = useState(true);
+  const [detailCaptureEnabled, setDetailCaptureEnabled] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -200,6 +230,7 @@ function EditTunnelModal({ disclosure, tunnel, onSaved }: EditTunnelModalProps) 
       setTargetAddress(tunnel.targetAddress);
       setTargetPort(String(tunnel.targetPort));
       setEnabled(tunnel.enabled);
+      setDetailCaptureEnabled(Boolean(tunnel.detailCaptureEnabled));
     }
   }, [tunnel]);
 
@@ -214,6 +245,7 @@ function EditTunnelModal({ disclosure, tunnel, onSaved }: EditTunnelModalProps) 
         targetAddress: targetAddress.trim(),
         targetPort: Number(targetPort),
         enabled,
+        detailCaptureEnabled,
       });
       notify("端口映射已更新");
       disclosure.onClose();
@@ -237,6 +269,9 @@ function EditTunnelModal({ disclosure, tunnel, onSaved }: EditTunnelModalProps) 
               <Input type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
               <Switch isSelected={enabled} onValueChange={setEnabled}>
                 启用
+              </Switch>
+              <Switch isSelected={detailCaptureEnabled} onValueChange={setDetailCaptureEnabled}>
+                明细采集
               </Switch>
             </ModalBody>
             <ModalFooter>

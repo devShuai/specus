@@ -18,9 +18,12 @@ import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ClientCredentialRepository;
 import com.theshuai.tunnelserver.management.repository.ClientIdentityRepository;
 import com.theshuai.tunnelserver.management.repository.ClientSessionRepository;
+import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.tunnelserver.management.repository.TunnelMappingRepository;
 import com.theshuai.tunnelserver.security.PasswordService;
+import com.theshuai.tunnelserver.session.SessionUtil;
+import io.netty.channel.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.event.EventListener;
@@ -31,6 +34,7 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 
 import java.security.MessageDigest;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
@@ -48,6 +52,7 @@ public class ClientAuthService {
     private final ClientIdentityRepository identityRepository;
     private final ClientSessionRepository sessionRepository;
     private final ClientAccountRepository clientAccountRepository;
+    private final ConnectionRecordRepository connectionRecordRepository;
     private final TunnelMappingRepository tunnelMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final ClientAuthProperties properties;
@@ -58,6 +63,7 @@ public class ClientAuthService {
                              ClientIdentityRepository identityRepository,
                              ClientSessionRepository sessionRepository,
                              ClientAccountRepository clientAccountRepository,
+                             ConnectionRecordRepository connectionRecordRepository,
                              TunnelMappingRepository tunnelMappingRepository,
                              HttpRouteMappingRepository httpRouteMappingRepository,
                              ClientAuthProperties properties,
@@ -67,6 +73,7 @@ public class ClientAuthService {
         this.identityRepository = identityRepository;
         this.sessionRepository = sessionRepository;
         this.clientAccountRepository = clientAccountRepository;
+        this.connectionRecordRepository = connectionRecordRepository;
         this.tunnelMappingRepository = tunnelMappingRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.properties = properties;
@@ -101,6 +108,7 @@ public class ClientAuthService {
         if (!account.isEnabled()) {
             throw new IllegalArgumentException("客户端已停用");
         }
+        closeStaleHttpAuthenticatedSessions(credential, environment);
 
         String accessToken = "cs_" + UUID.randomUUID().toString().replace("-", "")
                 + UUID.randomUUID().toString().replace("-", "");
@@ -161,6 +169,10 @@ public class ClientAuthService {
         if (!credential.isEnabled() || !account.isEnabled()) {
             return AuthenticationResult.failure(account, "客户端已停用");
         }
+        if (hasExceededRateLimit(account)) {
+            return AuthenticationResult.failure(account, "连接频率超过限制");
+        }
+        closeStaleOnlineSessions(session);
         if (isAnotherOnlineSessionForMachine(session)) {
             return AuthenticationResult.failure(account, "同一台机器和用户已经有在线实例");
         }
@@ -325,6 +337,62 @@ public class ClientAuthService {
                 STATUS_NETTY_ONLINE
         );
         return online >= credential.getMaxOnlineInstances();
+    }
+
+    private void closeStaleOnlineSessions(ClientSession currentSession) {
+        closeStaleOnlineSessions(sessionRepository.findByCredentialIdAndMachineFingerprintAndOsUserAndStatus(
+                currentSession.getCredentialId(),
+                currentSession.getMachineFingerprint(),
+                currentSession.getOsUser(),
+                STATUS_NETTY_ONLINE
+        ));
+        closeStaleOnlineSessions(sessionRepository.findByCredentialIdAndStatus(
+                currentSession.getCredentialId(),
+                STATUS_NETTY_ONLINE
+        ));
+    }
+
+    private void closeStaleOnlineSessions(List<ClientSession> sessions) {
+        if (sessions == null || sessions.isEmpty()) {
+            return;
+        }
+        String now = Instant.now().toString();
+        int closed = 0;
+        for (ClientSession onlineSession : sessions) {
+            Channel channel = SessionUtil.getChannel(onlineSession.getClientName());
+            if (channel != null && channel.isActive() && SessionUtil.hasLogin(channel)) {
+                continue;
+            }
+            onlineSession.setStatus(STATUS_DISCONNECTED);
+            onlineSession.setDisconnectedAt(now);
+            closed++;
+        }
+        if (closed > 0) {
+            log.info("closed {} stale online client session(s) before netty authentication", closed);
+        }
+    }
+
+    private void closeStaleHttpAuthenticatedSessions(ClientCredential credential, ClientEnvironmentInfo environment) {
+        int closed = sessionRepository.closeHttpAuthenticatedSessions(
+                credential.getId(),
+                environment.getMachineFingerprint(),
+                environment.getOsUser(),
+                STATUS_HTTP_AUTHENTICATED,
+                STATUS_DISCONNECTED,
+                Instant.now().toString()
+        );
+        if (closed > 0) {
+            log.debug("closed {} stale HTTP-authenticated client session(s) before issuing refreshed token", closed);
+        }
+    }
+
+    private boolean hasExceededRateLimit(ClientAccount account) {
+        return account.getConnectionRateLimitPerMinute() > 0
+                && connectionRecordRepository.countByTenantIdAndClientIdAndConnectedAtGreaterThanEqual(
+                account.getTenantId(),
+                account.getId(),
+                Instant.now().minus(1, ChronoUnit.MINUTES).toString()
+        ) >= account.getConnectionRateLimitPerMinute();
     }
 
     private ClientEnvironmentInfo requireEnvironment(ClientEnvironmentInfo environment) {

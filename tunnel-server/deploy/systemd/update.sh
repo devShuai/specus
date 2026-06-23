@@ -7,14 +7,15 @@
 #
 # 流程：
 #   1) 校验前置条件（root / jar 存在 / 服务已通过 install.sh 安装过）
-#   2) 备份当前 jar 为 tunnel-server.jar.bak.<timestamp>，保留最近 5 份
-#   3) systemctl stop tunnel-server（等优雅停机；超时后 SIGKILL）
-#   4) 拷新 jar
-#   5) systemctl start tunnel-server
-#   6) 健康检查：
+#   2) 同步最新 systemd unit 与 env.example（不覆盖真实 env）
+#   3) 备份当前 jar 为 tunnel-server.jar.bak.<timestamp>，保留最近 5 份
+#   4) systemctl stop tunnel-server（等优雅停机；超时后 SIGKILL）
+#   5) 拷新 jar
+#   6) systemctl start tunnel-server
+#   7) 健康检查：
 #        - 等服务 active（最多 60s）
 #        - actuator /health 状态 UP（最多 60s）
-#   7) 任一步失败 → 回滚到上一份 bak 并重启
+#   8) 任一步失败 → 回滚到上一份 bak 并重启
 #
 # 退出码：
 #   0 = 升级成功；1 = 前置失败；2 = 升级失败但回滚成功；3 = 回滚也失败（需人工介入）
@@ -25,13 +26,40 @@ JAR_SRC="${1:-}"
 SERVICE="tunnel-server"
 INSTALL_DIR="/opt/tunnel-server"
 JAR_DEST="$INSTALL_DIR/tunnel-server.jar"
+CONFIG_DIR="${TUNNEL_CONFIG_DIR:-/etc/tunnel-server}"
+ENV_FILE="$CONFIG_DIR/tunnel-server.env"
+ENV_EXAMPLE_FILE="$CONFIG_DIR/tunnel-server.env.example"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_KEEP=5
-HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:8088/actuator/health}"
 ACTIVE_TIMEOUT_SEC=60
 HEALTH_TIMEOUT_SEC=60
 
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 fail() { printf '[%s] [ERR] %s\n' "$(date '+%F %T')" "$*" >&2; }
+
+read_env_value() {
+  local key="$1"
+  local fallback="$2"
+  local value=""
+  if [[ -f "$ENV_FILE" ]]; then
+    value="$(awk -F= -v key="$key" '
+      $0 !~ /^[[:space:]]*#/ && $1 == key {
+        sub(/^[^=]*=/, "")
+        print
+        exit
+      }
+    ' "$ENV_FILE" 2>/dev/null || true)"
+  fi
+  value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+HEALTH_PORT="${TUNNEL_HEALTH_PORT:-$(read_env_value SERVER_PORT 8088)}"
+HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:${HEALTH_PORT}/actuator/health}"
 
 # ---------- 0. 前置检查 ----------
 if [[ $EUID -ne 0 ]]; then
@@ -54,6 +82,34 @@ fi
 if [[ "$(readlink -f "$JAR_SRC")" == "$(readlink -f "$JAR_DEST")" ]]; then
   fail "源 jar 与目标 jar 是同一文件，无需更新"; exit 1
 fi
+
+sync_deploy_files() {
+  local unit_src="$SCRIPT_DIR/tunnel-server.service"
+  local env_example_src="$SCRIPT_DIR/tunnel-server.env.example"
+  local env_group="root"
+
+  if getent group tunnel >/dev/null; then
+    env_group="tunnel"
+  fi
+
+  if [[ -f "$unit_src" ]]; then
+    install -m 0644 -o root -g root "$unit_src" /etc/systemd/system/tunnel-server.service
+    log "已同步 systemd unit -> /etc/systemd/system/tunnel-server.service"
+  fi
+
+  if [[ -f "$env_example_src" ]]; then
+    install -d -m 0750 -o root -g "$env_group" "$CONFIG_DIR"
+    install -m 0640 -o root -g "$env_group" "$env_example_src" "$ENV_EXAMPLE_FILE"
+    log "已同步最新环境变量模板 -> $ENV_EXAMPLE_FILE"
+    if [[ -f "$ENV_FILE" ]]; then
+      log "真实环境变量文件 $ENV_FILE 不会被覆盖；如需合并新增变量，请手动 diff 模板"
+    fi
+  fi
+
+  systemctl daemon-reload
+}
+
+sync_deploy_files
 
 NEW_SIZE=$(stat -c %s "$JAR_SRC")
 OLD_SIZE=$(stat -c %s "$JAR_DEST")

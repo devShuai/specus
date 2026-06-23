@@ -17,6 +17,7 @@ import lombok.Setter;
                 @Index(name = "idx_http_exchange_tenant", columnList = "tenant_id"),
                 @Index(name = "idx_http_exchange_client", columnList = "client_id"),
                 @Index(name = "idx_http_exchange_route", columnList = "route"),
+                @Index(name = "idx_http_exchange_response_body_type", columnList = "response_body_type"),
                 @Index(name = "idx_http_exchange_captured_at", columnList = "captured_at")
         })
 @Getter
@@ -79,6 +80,9 @@ public class HttpTrafficExchange {
 
     @Column(name = "response_content_type", length = 255)
     private String responseContentType;
+
+    @Column(name = "response_body_type", length = 32)
+    private String responseBodyType;
 
     @Column(name = "request_headers", length = 8192)
     private String requestHeaders;

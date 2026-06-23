@@ -7,13 +7,16 @@ import com.theshuai.tunnelserver.management.model.TrafficUsageView;
 import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.management.service.TrafficViewService;
+import com.theshuai.tunnelserver.management.storage.HttpTrafficSearchField;
 import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -62,6 +65,9 @@ public class TrafficResource {
     public Map<String, Object> listHttpExchanges(@AuthenticationPrincipal Jwt jwt,
                                                  @RequestParam(required = false) Long clientId,
                                                  @RequestParam(required = false) String route,
+                                                 @RequestParam(required = false) String responseBodyType,
+                                                 @RequestParam(required = false) String responseDataType,
+                                                 @RequestParam(required = false) String field,
                                                  @RequestParam(required = false) String q,
                                                  @RequestParam(defaultValue = "0") int page,
                                                  @RequestParam(defaultValue = "50") int size) {
@@ -72,6 +78,8 @@ public class TrafficResource {
                 tenantResolver.resolve(jwt),
                 clientId,
                 route,
+                firstText(responseBodyType, responseDataType),
+                HttpTrafficSearchField.fromCode(field),
                 q,
                 PageRequest.of(normalizedPage, normalizedSize, Sort.by(Sort.Direction.DESC, "id")));
         Map<String, Object> response = new LinkedHashMap<>();
@@ -84,11 +92,59 @@ public class TrafficResource {
     }
 
     @GetMapping("/tcp-frames")
-    public List<TcpTrafficFrameView> listTcpFrames(@AuthenticationPrincipal Jwt jwt,
-                                                   @RequestParam(required = false) Long clientId,
-                                                   @RequestParam(required = false) Integer listenPort,
-                                                   @RequestParam(defaultValue = "200") int limit) {
+    public Map<String, Object> listTcpFrames(@AuthenticationPrincipal Jwt jwt,
+                                             @RequestParam(required = false) Long clientId,
+                                             @RequestParam(required = false) Integer listenPort,
+                                             @RequestParam(defaultValue = "0") int page,
+                                             @RequestParam(required = false) Integer size,
+                                             @RequestParam(required = false) Integer limit) {
         trafficInspectionService.flush();
-        return trafficViewService.listTcpFrames(tenantResolver.resolve(jwt), clientId, listenPort, limit);
+        int requestedSize = size == null ? (limit == null ? 50 : limit) : size;
+        int normalizedSize = Math.clamp(requestedSize, 1, 500);
+        int normalizedPage = Math.max(0, page);
+        Page<TcpTrafficFrameView> result = trafficViewService.listTcpFrames(
+                tenantResolver.resolve(jwt),
+                clientId,
+                listenPort,
+                PageRequest.of(normalizedPage, normalizedSize, Sort.by(Sort.Direction.DESC, "id")));
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("items", result.getContent());
+        response.put("total", result.getTotalElements());
+        response.put("page", result.getNumber());
+        response.put("size", result.getSize());
+        response.put("totalPages", result.getTotalPages());
+        return response;
+    }
+
+    @GetMapping("/tcp-frames/{id}")
+    public TcpTrafficFrameView getTcpFrame(@AuthenticationPrincipal Jwt jwt,
+                                           @PathVariable long id) {
+        trafficInspectionService.flush();
+        return trafficViewService.getTcpFrame(tenantResolver.resolve(jwt), id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "TCP frame not found"));
+    }
+
+    @GetMapping("/tcp-streams")
+    public Map<String, Object> getTcpStream(@AuthenticationPrincipal Jwt jwt,
+                                            @RequestParam String channelId,
+                                            @RequestParam(defaultValue = "500") int limit) {
+        trafficInspectionService.flush();
+        int normalizedLimit = Math.clamp(limit, 1, 1000);
+        List<TcpTrafficFrameView> items = trafficViewService.listTcpStream(
+                tenantResolver.resolve(jwt), channelId, normalizedLimit);
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("channelId", channelId);
+        response.put("items", items);
+        response.put("total", items.size());
+        response.put("limit", normalizedLimit);
+        response.put("truncated", items.size() >= normalizedLimit);
+        return response;
+    }
+
+    private String firstText(String first, String second) {
+        if (first != null && !first.isBlank()) {
+            return first;
+        }
+        return second;
     }
 }

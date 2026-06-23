@@ -8,6 +8,7 @@
 | `tunnel-server.service` | systemd unit 定义，启动 / 停止 / 自动重启 / 日志接 journald |
 | `tunnel-server.env.example` | 环境变量模板（**MySQL 连接、管理员密码、JWT 密钥都在这里**） |
 | `install.sh` | 一键安装：建用户、建目录、拷 jar、注册服务 |
+| `update.sh` | 滚动升级：备份 / 替换 jar / 健康检查 / 失败回滚，并同步最新 unit 与 env.example |
 
 ---
 
@@ -55,7 +56,7 @@ sudo bash /tmp/systemd/install.sh /tmp/tunnel-server-1.0-SNAPSHOT.jar
    * `/var/lib/tunnel-server` —— 工作目录（fallback SQLite 文件、临时数据）
    * `/var/log/tunnel-server` —— 预留日志目录（默认日志走 journald）
 3. 把 `tunnel-server.service` 安装到 `/etc/systemd/system/`
-4. 把 `tunnel-server.env.example` 拷贝为 `/etc/tunnel-server/tunnel-server.env`（已存在则不覆盖）
+4. 把 `tunnel-server.env.example` 拷贝为 `/etc/tunnel-server/tunnel-server.env`（已存在则不覆盖），并始终同步一份最新模板到 `/etc/tunnel-server/tunnel-server.env.example`
 5. `systemctl daemon-reload && systemctl enable tunnel-server`
 
 ## 4. 配置环境变量
@@ -92,13 +93,57 @@ TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED=true
 TUNNEL_AUTH_USERNAME=admin
 TUNNEL_AUTH_PASSWORD=YourStrongAdminPassword
 TUNNEL_AUTH_JWT_SECRET=$(openssl rand -base64 48)   # 用命令生成后填入
+TUNNEL_AUTH_TENANT_ID=default
 ```
 
-### 4.3 对外地址（可选，部署在反代 / NAT 后必填）
+### 4.3 客户端在线限制（可选）
+
+```env
+TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES=1
+TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES=2
+TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS=28800
+```
+
+默认策略是同一用户 + 同一机器只允许 1 个客户端进程在线，每个客户端账号最多同时在线 2 个实例。客户端访问令牌过期前会主动刷新，避免隧道因为令牌到期中断。
+
+### 4.4 对外地址（可选，部署在反代 / NAT 后必填）
 
 ```env
 TUNNEL_PUBLIC_ADDRESS=tunnel.example.com
 ```
+
+### 4.5 HTTP 直转与流量明细（可选）
+
+```env
+TUNNEL_HTTP_TIMEOUT_MS=30000
+TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE=16777216
+
+TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED=true
+TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES=256
+TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS=8192
+TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING=20000
+TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE=1000
+TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS=2000
+```
+
+HTTP / TCP 明细默认写入业务数据库；管理页会分页读取 HTTP 请求/响应和 TCP payload。`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` 是总开关，每条 HTTP 路由 / TCP 映射仍需在管理页单独开启明细采集，新建通道默认关闭。HTTP Body 入库前会按 `Content-Encoding` 解压 `gzip`、`deflate`、`br`，前端也会对旧记录做 best-effort 兜底。
+
+### 4.6 Elasticsearch 流量明细存储（可选）
+
+配置 `TUNNEL_ELASTICSEARCH_URIS` 后，HTTP / TCP 明细会从业务数据库切换到 Elasticsearch，聚合流量和管理业务数据仍在 MySQL。
+
+```env
+TUNNEL_ELASTICSEARCH_URIS=http://127.0.0.1:9200
+TUNNEL_ELASTICSEARCH_USERNAME=elastic
+TUNNEL_ELASTICSEARCH_PASSWORD=CHANGE_ME_ES_PASSWORD
+#TUNNEL_ELASTICSEARCH_API_KEY=
+TUNNEL_ELASTICSEARCH_HTTP_INDEX=shuai-tunnel-http-traffic
+TUNNEL_ELASTICSEARCH_TCP_INDEX=shuai-tunnel-tcp-traffic
+TUNNEL_ELASTICSEARCH_HTTP_MAX_STORE_SIZE=100GB
+TUNNEL_ELASTICSEARCH_TCP_MAX_STORE_SIZE=10GB
+```
+
+> 多 ES 节点可用逗号分隔。`TUNNEL_ELASTICSEARCH_HTTP_MAX_STORE_SIZE` 默认限制 HTTP 明细索引到 100GB，`TUNNEL_ELASTICSEARCH_TCP_MAX_STORE_SIZE` 默认限制 TCP payload 索引到 10GB；超过后服务端会定期删除最旧记录。若单节点部署出现 `yellow`，通常是副本分片无法分配，不影响单副本读写。
 
 环境变量文件中**不需要也不能用 shell 展开**，必须填字面量。
 
@@ -130,18 +175,29 @@ sudo bash deploy/systemd/update.sh /tmp/tunnel-server-NEW.jar
 ```
 
 `update.sh` 自动完成：
-1. 备份当前 jar → `/opt/tunnel-server/tunnel-server.jar.bak.<时间戳>`（保留最近 5 份）
-2. `systemctl stop` → 替换 jar → `systemctl start`
-3. 等服务进入 `active`（最多 60s）
-4. 轮询 `http://127.0.0.1:8088/actuator/health` 直到返回 `UP`（最多 60s）
-5. 任一步失败 → 自动回滚到刚刚备份的旧 jar 并重启
+1. 同步当前目录里的 `tunnel-server.service` 到 systemd，并同步最新 `tunnel-server.env.example` 到 `/etc/tunnel-server/tunnel-server.env.example`
+2. 备份当前 jar → `/opt/tunnel-server/tunnel-server.jar.bak.<时间戳>`（保留最近 5 份）
+3. `systemctl stop` → 替换 jar → `systemctl start`
+4. 等服务进入 `active`（最多 60s）
+5. 轮询 actuator health 直到返回 `UP`（最多 60s）
+6. 任一步失败 → 自动回滚到刚刚备份的旧 jar 并重启
 
 退出码：`0` 成功 / `2` 升级失败但已回滚 / `3` 回滚失败需人工介入。
 
-健康检查地址可用环境变量覆盖（例如端口不是 8088）：
+健康检查地址默认会从 `/etc/tunnel-server/tunnel-server.env` 的 `SERVER_PORT` 推导；也可用环境变量覆盖：
 ```bash
+sudo TUNNEL_HEALTH_PORT=9090 \
+     bash deploy/systemd/update.sh /tmp/tunnel-server-NEW.jar
+
 sudo TUNNEL_HEALTH_URL=http://127.0.0.1:9090/actuator/health \
      bash deploy/systemd/update.sh /tmp/tunnel-server-NEW.jar
+```
+
+真实环境变量文件不会被脚本覆盖。升级后如需合并新增配置：
+
+```bash
+sudo diff -u /etc/tunnel-server/tunnel-server.env \
+             /etc/tunnel-server/tunnel-server.env.example
 ```
 
 ### 手动升级（不要回滚 / 不要健康检查时）
@@ -187,6 +243,8 @@ sudo groupdel tunnel
 | `The server time zone value 'CST' is unrecognized` | URL 缺少 `serverTimezone=Asia/Shanghai` |
 | 启动报 `Access denied for user` | env 文件中 `TUNNEL_DB_USERNAME` / `TUNNEL_DB_PASSWORD` 与 MySQL 不一致；密码若含 `#`、空格等特殊字符，请用双引号包裹：`TUNNEL_DB_PASSWORD="my pa#ss"` |
 | 启动看到 `Cache provider classpath warning` 之类 | 与本部署无关，可忽略 |
+| 配置了 ES 但管理页无 HTTP/TCP 明细 | 确认 `TUNNEL_ELASTICSEARCH_URIS` 是复数变量名；重启后查看日志是否启用了 Elasticsearch store，并确认索引名与管理 API 使用一致 |
+| ES 索引 health 是 `yellow` | 单节点 ES 默认副本无法分配会显示 `yellow`，一般不影响读写；生产可增加节点或把副本数调为 0 |
 | 客户端连不上 7010 端口 | 检查防火墙：`sudo firewall-cmd --add-port=7010/tcp --permanent && sudo firewall-cmd --reload` |
 | 想绑定 80/443 等特权端口 | 在 `tunnel-server.service` 的 `[Service]` 中追加 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 与 `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` |
 

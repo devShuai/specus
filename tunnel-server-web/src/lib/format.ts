@@ -29,7 +29,11 @@ export function formatDateTime(value: string | null | undefined): string {
 
 // formatDuration renders the gap between two timestamps. When `to` is null the connection is
 // still active, so the result is prefixed with "~" and computed against now.
-export function formatDuration(from: string | null | undefined, to: string | null | undefined): string {
+export function formatDuration(
+  from: string | null | undefined,
+  to: string | null | undefined,
+  nowMillis = Date.now(),
+): string {
   if (!from) {
     return "-";
   }
@@ -38,7 +42,7 @@ export function formatDuration(from: string | null | undefined, to: string | nul
     return "-";
   }
   const active = !to;
-  const end = active ? Date.now() : new Date(to as string).getTime();
+  const end = active ? nowMillis : new Date(to as string).getTime();
   if (Number.isNaN(end)) {
     return "-";
   }
@@ -61,10 +65,10 @@ function humanizeSeconds(seconds: number): string {
 }
 
 // formatSince renders an online client's elapsed time from its login epoch-ms.
-export function formatSince(loginTimeMs: number | null | undefined): string {
+export function formatSince(loginTimeMs: number | null | undefined, nowMillis = Date.now()): string {
   if (!loginTimeMs || loginTimeMs <= 0) {
     return "";
   }
-  const seconds = Math.max(0, Math.floor((Date.now() - loginTimeMs) / 1000));
+  const seconds = Math.max(0, Math.floor((nowMillis - loginTimeMs) / 1000));
   return humanizeSeconds(seconds);
 }

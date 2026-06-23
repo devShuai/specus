@@ -8,6 +8,10 @@ import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.IOException;
+import java.net.SocketException;
+import java.util.Locale;
+
 @Slf4j
 public class NatCommonHandler extends ChannelInboundHandlerAdapter {
 
@@ -24,8 +28,12 @@ public class NatCommonHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        log.info("Exception caught ... ");
-        log.error("Exception caught", cause);
+        if (isPeerDisconnect(cause)) {
+            log.info("Peer closed connection: {}", exceptionSummary(cause));
+        } else {
+            log.error("Exception caught", cause);
+        }
+        ctx.close();
     }
 
     @Override
@@ -41,5 +49,34 @@ public class NatCommonHandler extends ChannelInboundHandlerAdapter {
                 ctx.writeAndFlush(natMessage);
             }
         }
+    }
+
+    private boolean isPeerDisconnect(Throwable cause) {
+        for (Throwable current = cause; current != null; current = current.getCause()) {
+            if (!(current instanceof SocketException) && !(current instanceof IOException)) {
+                continue;
+            }
+            String message = current.getMessage();
+            if (message == null) {
+                continue;
+            }
+            String normalized = message.toLowerCase(Locale.ROOT);
+            if (normalized.contains("connection reset")
+                    || normalized.contains("broken pipe")
+                    || normalized.contains("forcibly closed")
+                    || normalized.contains("远程主机强迫关闭")
+                    || normalized.contains("你的主机中的软件中止")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String exceptionSummary(Throwable cause) {
+        if (cause == null) {
+            return "unknown";
+        }
+        String message = cause.getMessage();
+        return cause.getClass().getSimpleName() + (message == null || message.isBlank() ? "" : ": " + message);
     }
 }

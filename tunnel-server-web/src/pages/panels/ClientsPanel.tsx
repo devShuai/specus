@@ -37,7 +37,8 @@ export function ClientsPanel() {
   const [revealed, setRevealed] = useState<string | null>(null);
   const passwordModal = useDisclosure();
 
-  useNowTick(1000); // refresh online durations once per second
+  const now = useNowTick(1000); // refresh online durations once per second
+  const durationTick = Math.floor(now / 1000);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -118,7 +119,7 @@ export function ClientsPanel() {
 
   const statusChip = (client: Client) => {
     const online = client.online;
-    const since = online && client.connectedSinceMs ? formatSince(client.connectedSinceMs) : "";
+    const since = online && client.connectedSinceMs ? formatSince(client.connectedSinceMs, now) : "";
     const text = `${online ? "在线" : "离线"} / ${client.enabled ? "启用" : "停用"}${since ? ` · ${since}` : ""}`;
     const tooltip = online && client.connectedSinceMs ? `登录于 ${formatDateTime(new Date(client.connectedSinceMs).toISOString())}` : undefined;
     const chip = (
@@ -157,7 +158,7 @@ export function ClientsPanel() {
         </Button>
       </form>
 
-      <Table aria-label="客户端列表" isHeaderSticky removeWrapper>
+      <Table key={`clients-${durationTick}`} aria-label="客户端列表" isHeaderSticky removeWrapper>
         <TableHeader>
           <TableColumn>ID</TableColumn>
           <TableColumn>客户端</TableColumn>

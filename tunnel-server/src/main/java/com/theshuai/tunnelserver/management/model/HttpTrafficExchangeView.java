@@ -19,6 +19,7 @@ public record HttpTrafficExchangeView(
         long elapsedMs,
         String requestContentType,
         String responseContentType,
+        String responseBodyType,
         String requestHeaders,
         String responseHeaders,
         String requestPreviewHex,

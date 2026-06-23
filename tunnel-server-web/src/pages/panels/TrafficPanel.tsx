@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   Card,
@@ -23,15 +23,66 @@ import {
 import { adminApi } from "../../api/client";
 import type {
   HttpTrafficExchange,
+  HttpResponseBodyType,
+  HttpTrafficSearchField,
   ResourceTrafficType,
   ResourceTrafficUsage,
   TcpTrafficFrame,
+  TcpTrafficStream,
   TrafficUsage,
 } from "../../api/types";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { notifyError } from "../../components/toast";
 
 const HTTP_EXCHANGE_PAGE_SIZE = 20;
+const TCP_FRAME_PAGE_SIZE = 20;
+type TrafficViewKey = "client" | "tcp" | "http";
+const TRAFFIC_VIEW_TABS: Array<{ key: TrafficViewKey; label: string }> = [
+  { key: "client", label: "客户端汇总" },
+  { key: "tcp", label: "TCP 映射" },
+  { key: "http", label: "HTTP 路由" },
+];
+const TRAFFIC_MODAL_CLASS_NAMES = {
+  wrapper: "overflow-hidden p-2 sm:p-4",
+  base: "my-0 max-h-[calc(100dvh-2rem)]",
+  header: "px-4 py-3 sm:px-5",
+  body: "px-4 py-2 sm:px-5",
+  footer: "px-4 py-3 sm:px-5",
+} as const;
+
+const HTTP_SEARCH_FIELDS: Array<{ value: HttpTrafficSearchField; label: string; placeholder: string }> = [
+  { value: "summary", label: "常用字段", placeholder: "method / 状态 / 路径 / 客户端 / route" },
+  { value: "method", label: "请求方法", placeholder: "GET / POST / PUT" },
+  { value: "status", label: "状态码", placeholder: "200 / 404 / 500" },
+  { value: "path", label: "路径与查询", placeholder: "/api/user 或 keyword" },
+  { value: "route", label: "HTTP 路由", placeholder: "route 名称" },
+  { value: "client", label: "客户端", placeholder: "客户端名称或 ID" },
+  { value: "resource", label: "资源", placeholder: "资源名称或 ID" },
+  { value: "remote", label: "远端地址", placeholder: "IP / 端口" },
+  { value: "contentType", label: "Content-Type", placeholder: "application/json" },
+  { value: "error", label: "错误信息", placeholder: "异常 / timeout / refused" },
+  { value: "requestHeaders", label: "请求 Header", placeholder: "Header 名称或值" },
+  { value: "responseHeaders", label: "响应 Header", placeholder: "Header 名称或值" },
+  { value: "requestBody", label: "请求 Body", placeholder: "请求体内容" },
+  { value: "responseBody", label: "响应 Body", placeholder: "响应体内容" },
+  { value: "id", label: "记录 ID", placeholder: "记录 ID" },
+  { value: "all", label: "全部字段", placeholder: "跨所有字段搜索" },
+];
+
+const HTTP_RESPONSE_BODY_TYPES: Array<{ value: "" | HttpResponseBodyType; label: string }> = [
+  { value: "", label: "全部类型" },
+  { value: "empty", label: "空响应" },
+  { value: "json", label: "JSON" },
+  { value: "html", label: "HTML" },
+  { value: "xml", label: "XML" },
+  { value: "image", label: "图片" },
+  { value: "video", label: "视频" },
+  { value: "audio", label: "音频" },
+  { value: "form", label: "表单" },
+  { value: "script", label: "脚本" },
+  { value: "text", label: "文本" },
+  { value: "binary", label: "二进制" },
+];
 
 interface TrafficSummary {
   resources: number;
@@ -53,16 +104,25 @@ interface ResourceTotal {
 interface BodyPreviewTarget {
   title: string;
   contentType: string | null;
+  contentEncoding: string | null;
   content: string | null;
   bytes: number;
   truncated: boolean;
+  decodeMessage: string | null;
+  decodeStatus: HttpBodyDecodeStatus;
 }
+
+type HttpBodyDecodeStatus = "plain" | "pending" | "decoded" | "stored-decoded" | "unsupported" | "failed";
 
 export function TrafficPanel() {
   const [clientRows, setClientRows] = useState<TrafficUsage[]>([]);
   const [tcpRows, setTcpRows] = useState<ResourceTrafficUsage[]>([]);
   const [httpRows, setHttpRows] = useState<ResourceTrafficUsage[]>([]);
   const [tcpFrameRows, setTcpFrameRows] = useState<TcpTrafficFrame[]>([]);
+  const [tcpFramePage, setTcpFramePage] = useState(0);
+  const [tcpFrameTotal, setTcpFrameTotal] = useState(0);
+  const [tcpFrameTotalPages, setTcpFrameTotalPages] = useState(1);
+  const [tcpFrameLoading, setTcpFrameLoading] = useState(true);
   const [httpExchangeRows, setHttpExchangeRows] = useState<HttpTrafficExchange[]>([]);
   const [httpExchangePage, setHttpExchangePage] = useState(0);
   const [httpExchangeTotal, setHttpExchangeTotal] = useState(0);
@@ -70,22 +130,32 @@ export function TrafficPanel() {
   const [httpExchangeLoading, setHttpExchangeLoading] = useState(true);
   const [httpSearchDraft, setHttpSearchDraft] = useState("");
   const [httpSearch, setHttpSearch] = useState("");
+  const [httpSearchFieldDraft, setHttpSearchFieldDraft] = useState<HttpTrafficSearchField>("summary");
+  const [httpSearchField, setHttpSearchField] = useState<HttpTrafficSearchField>("summary");
+  const [httpResponseTypeDraft, setHttpResponseTypeDraft] = useState<"" | HttpResponseBodyType>("");
+  const [httpResponseType, setHttpResponseType] = useState<"" | HttpResponseBodyType>("");
+  const [httpSearchVersion, setHttpSearchVersion] = useState(0);
   const [selectedHttpExchange, setSelectedHttpExchange] = useState<HttpTrafficExchange | null>(null);
+  const [selectedTcpFrame, setSelectedTcpFrame] = useState<TcpTrafficFrame | null>(null);
+  const [selectedTcpStream, setSelectedTcpStream] = useState<TcpTrafficStream | null>(null);
+  const [tcpFrameDetailLoadingId, setTcpFrameDetailLoadingId] = useState<string | null>(null);
+  const [tcpStreamLoadingChannel, setTcpStreamLoadingChannel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [trafficView, setTrafficView] = useState<TrafficViewKey>("client");
+  const httpExchangeRequestId = useRef(0);
+  const tcpFrameRequestId = useRef(0);
 
   const loadTraffic = useCallback(async () => {
     setLoading(true);
     try {
-      const [clients, tcp, http, tcpFrames] = await Promise.all([
+      const [clients, tcp, http] = await Promise.all([
         adminApi.listTraffic(150),
         adminApi.listResourceTraffic("TCP_TUNNEL", 200),
         adminApi.listResourceTraffic("HTTP_ROUTE", 200),
-        adminApi.listTcpTrafficFrames(200),
       ]);
       setClientRows(clients);
       setTcpRows(tcp);
       setHttpRows(http);
-      setTcpFrameRows(tcpFrames);
     } catch (error) {
       notifyError(error, "加载流量失败");
     } finally {
@@ -93,98 +163,245 @@ export function TrafficPanel() {
     }
   }, []);
 
+  const loadTcpFrames = useCallback(async () => {
+    const requestId = tcpFrameRequestId.current + 1;
+    tcpFrameRequestId.current = requestId;
+    setTcpFrameLoading(true);
+    try {
+      const data = await adminApi.listTcpTrafficFrames({
+        page: tcpFramePage,
+        size: TCP_FRAME_PAGE_SIZE,
+      });
+      if (requestId !== tcpFrameRequestId.current) {
+        return;
+      }
+      setTcpFrameRows(data.items ?? []);
+      setTcpFrameTotal(data.total);
+      setTcpFrameTotalPages(Math.max(1, data.totalPages));
+    } catch (error) {
+      if (requestId === tcpFrameRequestId.current) {
+        notifyError(error, "加载 TCP 数据帧失败");
+      }
+    } finally {
+      if (requestId === tcpFrameRequestId.current) {
+        setTcpFrameLoading(false);
+      }
+    }
+  }, [tcpFramePage]);
+
   const loadHttpExchanges = useCallback(async () => {
+    const requestId = httpExchangeRequestId.current + 1;
+    httpExchangeRequestId.current = requestId;
     setHttpExchangeLoading(true);
     try {
       const data = await adminApi.listHttpTrafficExchanges({
         page: httpExchangePage,
         size: HTTP_EXCHANGE_PAGE_SIZE,
+        responseBodyType: httpResponseType || undefined,
+        field: httpSearchField,
         q: httpSearch || undefined,
       });
+      if (requestId !== httpExchangeRequestId.current) {
+        return;
+      }
       setHttpExchangeRows(data.items ?? []);
       setHttpExchangeTotal(data.total);
       setHttpExchangeTotalPages(Math.max(1, data.totalPages));
     } catch (error) {
-      notifyError(error, "加载 HTTP 记录失败");
+      if (requestId === httpExchangeRequestId.current) {
+        notifyError(error, "加载 HTTP 记录失败");
+      }
     } finally {
-      setHttpExchangeLoading(false);
+      if (requestId === httpExchangeRequestId.current) {
+        setHttpExchangeLoading(false);
+      }
     }
-  }, [httpExchangePage, httpSearch]);
+  }, [httpExchangePage, httpResponseType, httpSearch, httpSearchField, httpSearchVersion]);
 
   const refresh = useCallback(() => {
     void loadTraffic();
+    void loadTcpFrames();
     void loadHttpExchanges();
-  }, [loadTraffic, loadHttpExchanges]);
+  }, [loadTraffic, loadTcpFrames, loadHttpExchanges]);
 
   useEffect(() => {
     void loadTraffic();
   }, [loadTraffic]);
 
   useEffect(() => {
+    void loadTcpFrames();
+  }, [loadTcpFrames]);
+
+  useEffect(() => {
     void loadHttpExchanges();
   }, [loadHttpExchanges]);
 
   const applyHttpSearch = useCallback(() => {
+    httpExchangeRequestId.current += 1;
+    setHttpExchangeRows([]);
+    setHttpExchangeTotal(0);
+    setHttpExchangeTotalPages(1);
+    setHttpExchangeLoading(true);
     setHttpSearch(httpSearchDraft.trim());
+    setHttpSearchField(httpSearchFieldDraft);
+    setHttpResponseType(httpResponseTypeDraft);
     setHttpExchangePage(0);
-  }, [httpSearchDraft]);
+    setHttpSearchVersion((version) => version + 1);
+  }, [httpResponseTypeDraft, httpSearchDraft, httpSearchFieldDraft]);
 
   const resetHttpSearch = useCallback(() => {
+    httpExchangeRequestId.current += 1;
+    setHttpExchangeRows([]);
+    setHttpExchangeTotal(0);
+    setHttpExchangeTotalPages(1);
+    setHttpExchangeLoading(true);
     setHttpSearchDraft("");
     setHttpSearch("");
+    setHttpSearchFieldDraft("summary");
+    setHttpSearchField("summary");
+    setHttpResponseTypeDraft("");
+    setHttpResponseType("");
     setHttpExchangePage(0);
+    setHttpSearchVersion((version) => version + 1);
+  }, []);
+
+  const changeHttpExchangePage = useCallback(
+    (nextPage: number) => {
+      if (nextPage === httpExchangePage) {
+        return;
+      }
+      httpExchangeRequestId.current += 1;
+      setHttpExchangeRows([]);
+      setHttpExchangeLoading(true);
+      setHttpExchangePage(nextPage);
+    },
+    [httpExchangePage],
+  );
+
+  const changeTcpFramePage = useCallback(
+    (nextPage: number) => {
+      if (nextPage === tcpFramePage) {
+        return;
+      }
+      tcpFrameRequestId.current += 1;
+      setTcpFrameRows([]);
+      setTcpFrameLoading(true);
+      setTcpFramePage(nextPage);
+    },
+    [tcpFramePage],
+  );
+
+  const changeHttpSearchField = useCallback((field: HttpTrafficSearchField) => {
+    setHttpSearchFieldDraft(field);
+  }, []);
+
+  const changeHttpResponseType = useCallback((type: "" | HttpResponseBodyType) => {
+    setHttpResponseTypeDraft(type);
+  }, []);
+
+  const openTcpFrameDetails = useCallback(async (row: TcpTrafficFrame) => {
+    setTcpFrameDetailLoadingId(row.id);
+    try {
+      const detail = await adminApi.getTcpTrafficFrame(row.id);
+      setSelectedTcpFrame(detail);
+    } catch (error) {
+      notifyError(error, "加载 TCP 数据帧详情失败");
+    } finally {
+      setTcpFrameDetailLoadingId(null);
+    }
+  }, []);
+
+  const openTcpStream = useCallback(async (row: TcpTrafficFrame) => {
+    setTcpStreamLoadingChannel(row.channelId);
+    try {
+      const stream = await adminApi.getTcpTrafficStream(row.channelId, 500);
+      setSelectedTcpStream(stream);
+    } catch (error) {
+      notifyError(error, "加载 TCP 数据流失败");
+    } finally {
+      setTcpStreamLoadingChannel(null);
+    }
   }, []);
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
-      <div className="flex justify-end">
-        <Button size="sm" variant="flat" onPress={refresh}>
+    <div className="mt-2 flex flex-col gap-2">
+      <div className="flex min-h-10 items-center justify-between gap-3">
+        <div aria-label="流量观测维度" className="flex min-w-0 items-center gap-6" role="tablist">
+          {TRAFFIC_VIEW_TABS.map((item) => (
+            <TrafficViewTab
+              key={item.key}
+              active={trafficView === item.key}
+              onPress={() => setTrafficView(item.key)}
+            >
+              {item.label}
+            </TrafficViewTab>
+          ))}
+        </div>
+        <Button className="shrink-0" size="sm" variant="flat" onPress={refresh}>
           刷新
         </Button>
       </div>
 
-      <Tabs aria-label="流量观测维度" variant="underlined" destroyInactiveTabPanel={false}>
-        <Tab key="client" title="客户端汇总">
-          <ClientTrafficTable rows={clientRows} loading={loading} />
-        </Tab>
-        <Tab key="tcp" title="TCP 映射">
-          <div className="flex flex-col gap-4">
-            <ResourceTrafficSection
-              rows={tcpRows}
-              loading={loading}
-              emptyContent="暂无 TCP 映射流量"
-              type="TCP_TUNNEL"
-            />
-            <TcpFrameTable rows={tcpFrameRows} loading={loading} />
-          </div>
-        </Tab>
-        <Tab key="http" title="HTTP 路由">
-          <div className="flex flex-col gap-4">
-            <ResourceTrafficSection
-              rows={httpRows}
-              loading={loading}
-              emptyContent="暂无 HTTP 路由流量"
-              type="HTTP_ROUTE"
-            />
-            <HttpExchangeTable
-              rows={httpExchangeRows}
-              loading={httpExchangeLoading}
-              page={httpExchangePage}
-              pageSize={HTTP_EXCHANGE_PAGE_SIZE}
-              total={httpExchangeTotal}
-              totalPages={httpExchangeTotalPages}
-              searchDraft={httpSearchDraft}
-              activeSearch={httpSearch}
-              onPageChange={setHttpExchangePage}
-              onSearchDraftChange={setHttpSearchDraft}
-              onSearch={applyHttpSearch}
-              onResetSearch={resetHttpSearch}
-              onOpenDetails={setSelectedHttpExchange}
-            />
-          </div>
-        </Tab>
-      </Tabs>
+      {trafficView === "client" && <ClientTrafficTable rows={clientRows} loading={loading} />}
+
+      {trafficView === "tcp" && (
+        <div className="flex flex-col gap-2">
+          <ResourceTrafficSection
+            rows={tcpRows}
+            loading={loading}
+            emptyContent="暂无 TCP 映射流量"
+            type="TCP_TUNNEL"
+          />
+          <TcpFrameTable
+            rows={tcpFrameRows}
+            loading={tcpFrameLoading}
+            page={tcpFramePage}
+            pageSize={TCP_FRAME_PAGE_SIZE}
+            total={tcpFrameTotal}
+            totalPages={tcpFrameTotalPages}
+            detailLoadingId={tcpFrameDetailLoadingId}
+            streamLoadingChannel={tcpStreamLoadingChannel}
+            onPageChange={changeTcpFramePage}
+            onOpenDetails={openTcpFrameDetails}
+            onOpenStream={openTcpStream}
+          />
+        </div>
+      )}
+
+      {trafficView === "http" && (
+        <div className="flex flex-col gap-2">
+          <ResourceTrafficSection
+            rows={httpRows}
+            loading={loading}
+            emptyContent="暂无 HTTP 路由流量"
+            type="HTTP_ROUTE"
+          />
+          <HttpExchangeTable
+            rows={httpExchangeRows}
+            loading={httpExchangeLoading}
+            page={httpExchangePage}
+            pageSize={HTTP_EXCHANGE_PAGE_SIZE}
+            total={httpExchangeTotal}
+            totalPages={httpExchangeTotalPages}
+            searchDraft={httpSearchDraft}
+            searchField={httpSearchFieldDraft}
+            responseType={httpResponseTypeDraft}
+            activeSearchField={httpSearchField}
+            activeSearch={httpSearch}
+            activeResponseType={httpResponseType}
+            onPageChange={changeHttpExchangePage}
+            onSearchDraftChange={setHttpSearchDraft}
+            onSearchFieldChange={changeHttpSearchField}
+            onResponseTypeChange={changeHttpResponseType}
+            onSearch={applyHttpSearch}
+            onResetSearch={resetHttpSearch}
+            onOpenDetails={setSelectedHttpExchange}
+          />
+        </div>
+      )}
       <HttpExchangeModal row={selectedHttpExchange} onClose={() => setSelectedHttpExchange(null)} />
+      <TcpFrameModal row={selectedTcpFrame} onClose={() => setSelectedTcpFrame(null)} />
+      <TcpStreamModal stream={selectedTcpStream} onClose={() => setSelectedTcpStream(null)} />
     </div>
   );
 }
@@ -201,7 +418,7 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
   );
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
+    <div className="mt-3 flex flex-col gap-3">
       <MetricCards summary={summary} resourceLabel="客户端" />
       <Table aria-label="客户端流量使用" isHeaderSticky removeWrapper>
         <TableHeader>
@@ -229,6 +446,30 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
   );
 }
 
+function TrafficViewTab({
+  active,
+  children,
+  onPress,
+}: {
+  active: boolean;
+  children: ReactNode;
+  onPress: () => void;
+}) {
+  return (
+    <button
+      aria-selected={active}
+      className={`relative h-10 shrink-0 px-0 text-small font-medium transition-colors focus-visible:outline-none ${
+        active ? "text-foreground after:absolute after:bottom-0 after:left-0 after:h-0.5 after:w-full after:bg-foreground" : "text-default-500 hover:text-foreground"
+      }`}
+      role="tab"
+      type="button"
+      onClick={onPress}
+    >
+      {children}
+    </button>
+  );
+}
+
 function ResourceTrafficSection({
   emptyContent,
   loading,
@@ -252,11 +493,11 @@ function ResourceTrafficSection({
   );
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
+    <div className="flex flex-col gap-2">
       <MetricCards summary={summary} resourceLabel={type === "TCP_TUNNEL" ? "映射" : "路由"} />
 
       <Card shadow="none" className="rounded-md border border-default-200">
-        <CardBody className="gap-4 p-4">
+        <CardBody className="gap-2 p-2.5">
           <div>
             <h3 className="text-small font-semibold">资源流量排行</h3>
             <p className="text-tiny text-default-500">
@@ -305,50 +546,116 @@ function ResourceTrafficSection({
 }
 
 function HttpExchangeTable({
+  activeSearchField,
   activeSearch,
+  activeResponseType,
   loading,
   onPageChange,
   onOpenDetails,
   onResetSearch,
   onSearch,
   onSearchDraftChange,
+  onSearchFieldChange,
+  onResponseTypeChange,
   page,
   pageSize,
+  responseType,
   rows,
   searchDraft,
+  searchField,
   total,
   totalPages,
 }: {
+  activeSearchField: HttpTrafficSearchField;
   activeSearch: string;
+  activeResponseType: "" | HttpResponseBodyType;
   loading: boolean;
   onPageChange: (page: number) => void;
   onOpenDetails: (row: HttpTrafficExchange) => void;
   onResetSearch: () => void;
   onSearch: () => void;
   onSearchDraftChange: (value: string) => void;
+  onSearchFieldChange: (field: HttpTrafficSearchField) => void;
+  onResponseTypeChange: (type: "" | HttpResponseBodyType) => void;
   page: number;
   pageSize: number;
+  responseType: "" | HttpResponseBodyType;
   rows: HttpTrafficExchange[];
   searchDraft: string;
+  searchField: HttpTrafficSearchField;
   total: number;
   totalPages: number;
 }) {
   const rangeStart = total === 0 ? 0 : page * pageSize + 1;
   const rangeEnd = Math.min(total, (page + 1) * pageSize);
+  const searchFieldOption = httpSearchFieldOption(searchField);
+  const activeSearchFieldOption = httpSearchFieldOption(activeSearchField);
+  const activeResponseTypeOption = httpResponseTypeOption(activeResponseType);
+  const tableScopeKey = useMemo(
+    () => `${page}:${pageSize}:${activeSearchField}:${activeSearch}:${activeResponseType}`,
+    [activeResponseType, activeSearch, activeSearchField, page, pageSize],
+  );
+  const tableRows = useMemo(
+    () =>
+      rows.map((row, index) => ({
+        ...row,
+        tableKey: `${tableScopeKey}:${index}:${row.id}:${row.capturedAt}:${row.method}:${row.relativePath}`,
+      })),
+    [rows, tableScopeKey],
+  );
+  const tableCollectionKey = useMemo(() => {
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+    return [
+      tableScopeKey,
+      rows.length,
+      first ? `${first.id}:${first.capturedAt}` : "empty",
+      last ? `${last.id}:${last.capturedAt}` : "empty",
+    ].join("|");
+  }, [rows, tableScopeKey]);
 
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-4 p-4">
-        <div className="flex flex-wrap items-end justify-between gap-3">
+      <CardBody className="gap-3 p-3">
+        <div className="flex flex-wrap items-end justify-between gap-2">
           <div>
             <h3 className="text-small font-semibold">HTTP 协议记录</h3>
             <p className="text-tiny text-default-500">请求行、响应状态、headers 与 body 预览</p>
           </div>
           <div className="flex min-w-0 flex-1 flex-wrap items-end justify-end gap-2">
+            <label className="flex w-full flex-col gap-1 sm:w-40">
+              <span className="text-tiny text-default-500">搜索字段</span>
+              <select
+                className="h-10 rounded-medium border border-default-200 bg-default-50 px-3 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+                value={searchField}
+                onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
+              >
+                {HTTP_SEARCH_FIELDS.map((field) => (
+                  <option key={field.value} value={field.value}>
+                    {field.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex w-full flex-col gap-1 sm:w-32">
+              <span className="text-tiny text-default-500">返回类型</span>
+              <select
+                className="h-10 rounded-medium border border-default-200 bg-default-50 px-3 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+                value={responseType}
+                onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
+              >
+                {HTTP_RESPONSE_BODY_TYPES.map((type) => (
+                  <option key={type.value || "all"} value={type.value}>
+                    {type.label}
+                  </option>
+                ))}
+              </select>
+            </label>
             <Input
               className="w-full sm:w-80"
               label="搜索"
-              placeholder="路径 / 客户端 / route / 状态 / body"
+              placeholder={searchFieldOption.placeholder}
+              size="sm"
               value={searchDraft}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
@@ -357,35 +664,46 @@ function HttpExchangeTable({
               }}
               onValueChange={onSearchDraftChange}
             />
-            <Button variant="flat" onPress={onSearch}>
+            <Button size="sm" variant="flat" onPress={onSearch}>
               搜索
             </Button>
-            <Button variant="flat" onPress={onResetSearch}>
+            <Button size="sm" variant="flat" onPress={onResetSearch}>
               重置
             </Button>
           </div>
         </div>
-        {activeSearch && (
+        {(activeSearch || activeSearchField !== "summary" || activeResponseType) && (
           <div className="flex flex-wrap items-center gap-2 text-tiny text-default-500">
             <span>当前搜索</span>
             <Chip size="sm" variant="flat">
-              {activeSearch}
+              {activeSearchFieldOption.label}
             </Chip>
+            {activeSearch && (
+              <Chip size="sm" variant="flat">
+                {activeSearch}
+              </Chip>
+            )}
+            {activeResponseType && (
+              <Chip color="secondary" size="sm" variant="flat">
+                {activeResponseTypeOption.label}
+              </Chip>
+            )}
           </div>
         )}
-        <Table aria-label="HTTP 协议记录" isHeaderSticky removeWrapper>
+        <Table key={tableCollectionKey} aria-label="HTTP 协议记录" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>时间</TableColumn>
             <TableColumn>请求</TableColumn>
             <TableColumn>状态</TableColumn>
+            <TableColumn>返回类型</TableColumn>
             <TableColumn>资源</TableColumn>
             <TableColumn>流量</TableColumn>
             <TableColumn>耗时</TableColumn>
             <TableColumn>协议详情</TableColumn>
           </TableHeader>
-          <TableBody items={rows} isLoading={loading} emptyContent="暂无 HTTP 协议记录">
+          <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent="暂无 HTTP 协议记录">
             {(row) => (
-              <TableRow key={row.id}>
+              <TableRow key={row.tableKey}>
                 <TableCell>{formatDateTime(row.capturedAt)}</TableCell>
                 <TableCell>
                   <div className="flex min-w-0 flex-col">
@@ -397,6 +715,15 @@ function HttpExchangeTable({
                 <TableCell>
                   <Chip color={httpStatusColor(row)} size="sm" variant="flat">
                     {row.statusCode}
+                  </Chip>
+                </TableCell>
+                <TableCell>
+                  <Chip
+                    color={httpResponseTypeColor(row.responseBodyType, row.responseContentType, row.responseBytes)}
+                    size="sm"
+                    variant="flat"
+                  >
+                    {httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
                   </Chip>
                 </TableCell>
                 <TableCell>
@@ -450,11 +777,11 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
 
   return (
     <>
-      <Modal isOpen={Boolean(row)} onClose={onClose} size="5xl" scrollBehavior="inside">
-        <ModalContent>
+      <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={Boolean(row)} onClose={onClose} size="5xl" scrollBehavior="inside">
+        <ModalContent className="max-w-[min(96vw,1180px)]">
           {row && (
             <>
-              <ModalHeader className="flex flex-col gap-3">
+              <ModalHeader className="flex flex-col gap-2">
                 <div className="flex flex-wrap items-center gap-2">
                   <Chip color="primary" size="sm" variant="flat">
                     {row.method}
@@ -471,10 +798,14 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
                   {row.remoteAddress && <span>{row.remoteAddress}</span>}
                 </div>
               </ModalHeader>
-              <ModalBody className="gap-4">
-                <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <ModalBody className="gap-3 overflow-y-auto">
+                <div className="grid grid-cols-2 gap-2 lg:grid-cols-5">
                   <HttpSummaryTile label="请求大小" value={formatBytes(row.requestBytes)} />
                   <HttpSummaryTile label="响应大小" value={formatBytes(row.responseBytes)} />
+                  <HttpSummaryTile
+                    label="返回类型"
+                    value={httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
+                  />
                   <HttpSummaryTile label="耗时" value={`${row.elapsedMs} ms`} />
                   <HttpSummaryTile label="资源" value={row.resourceName} wrapValue />
                 </div>
@@ -485,27 +816,33 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
                   </div>
                 )}
 
-                <div className="grid items-stretch gap-4 xl:grid-cols-2">
+                <div className="grid items-stretch gap-3 xl:grid-cols-2">
                   <HttpMessagePanel
                     title="Request"
                     meta={[row.requestContentType, `${row.method} ${httpPath(row)}`]}
                     bytes={row.requestBytes}
                     headers={row.requestHeaders}
+                    previewHex={row.requestPreviewHex}
                     previewText={row.requestPreviewText}
                     truncated={row.requestTruncated}
                     contentType={row.requestContentType}
-                    bodyMaxHeightClass="max-h-[60vh]"
+                    bodyMaxHeightClass="max-h-[38dvh]"
                     onPreview={setBodyPreview}
                   />
                   <HttpMessagePanel
                     title="Response"
-                    meta={[row.responseContentType, `HTTP ${row.statusCode}`]}
+                    meta={[
+                      row.responseContentType,
+                      httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes),
+                      `HTTP ${row.statusCode}`,
+                    ]}
                     bytes={row.responseBytes}
                     headers={row.responseHeaders}
+                    previewHex={row.responsePreviewHex}
                     previewText={row.responsePreviewText}
                     truncated={row.responseTruncated}
                     contentType={row.responseContentType}
-                    bodyMaxHeightClass="max-h-80"
+                    bodyMaxHeightClass="max-h-[38dvh]"
                     onPreview={setBodyPreview}
                   />
                 </div>
@@ -526,7 +863,7 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
 
 function HttpSummaryTile({ label, value, wrapValue = false }: { label: string; value: string; wrapValue?: boolean }) {
   return (
-    <div className="min-w-0 rounded-small border border-default-200 bg-default-50 p-3">
+    <div className="min-w-0 rounded-small border border-default-200 bg-default-50 p-2">
       <div className="text-tiny text-default-500">{label}</div>
       <div className={`mt-1 text-small font-semibold ${wrapValue ? "break-all leading-relaxed" : "truncate"}`} title={value}>
         {value}
@@ -542,6 +879,7 @@ function HttpMessagePanel({
   headers,
   meta,
   onPreview,
+  previewHex,
   previewText,
   title,
   truncated,
@@ -552,15 +890,23 @@ function HttpMessagePanel({
   headers: string | null;
   meta: Array<string | null>;
   onPreview: (target: BodyPreviewTarget) => void;
+  previewHex: string | null;
   previewText: string | null;
   title: string;
   truncated: boolean;
 }) {
-  const hasBody = previewText != null && previewText.length > 0;
-  const previewKind = detectBodyPreviewKind(contentType, previewText);
+  const contentEncoding = normalizedContentEncoding(headerValue(headers, "content-encoding"));
+  const bodyDisplay = useHttpBodyDisplay({
+    content: previewText,
+    contentEncoding,
+    contentType,
+    previewHex,
+  });
+  const hasBody = bodyDisplay.content != null && bodyDisplay.content.length > 0;
+  const previewKind = detectBodyPreviewKind(contentType, bodyDisplay.content);
 
   return (
-    <div className="flex h-full min-w-0 flex-col gap-3 overflow-hidden rounded-small border border-default-200 p-3">
+    <div className="flex h-full min-w-0 flex-col gap-2 overflow-hidden rounded-small border border-default-200 p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h4 className="text-small font-semibold">{title}</h4>
@@ -577,29 +923,51 @@ function HttpMessagePanel({
         </Chip>
       </div>
       <HeaderBlock content={headers} />
+      {bodyDisplay.message && (
+        <div
+          className={`rounded-small border p-2 text-tiny leading-relaxed ${
+            bodyDisplay.status === "failed" || bodyDisplay.status === "unsupported"
+              ? "border-warning-200 bg-warning-50 text-warning-700"
+              : "border-primary-100 bg-primary-50 text-primary-700"
+          }`}
+        >
+          {bodyDisplay.message}
+        </div>
+      )}
       <ProtocolBlock
         title={truncated ? "Body Preview / truncated" : "Body"}
-        content={previewText}
+        content={bodyDisplay.content}
         className="min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)]"
         maxHeightClass={`h-full ${bodyMaxHeightClass}`}
-        contentClassName="min-h-40"
+        contentClassName="min-h-28"
         action={
-          <Button
-            isDisabled={!hasBody}
-            size="sm"
-            variant="flat"
-            onPress={() =>
-              onPreview({
-                title: `${title} Body`,
-                contentType,
-                content: previewText,
-                bytes,
-                truncated,
-              })
-            }
-          >
-            {previewButtonText(previewKind)}
-          </Button>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {contentEncoding && (
+              <Chip color="secondary" size="sm" variant="flat">
+                Content-Encoding {contentEncoding}
+              </Chip>
+            )}
+            <Button
+              isDisabled={!hasBody || bodyDisplay.status === "pending"}
+              isLoading={bodyDisplay.status === "pending"}
+              size="sm"
+              variant="flat"
+              onPress={() =>
+                onPreview({
+                  title: `${title} Body`,
+                  contentType,
+                  contentEncoding,
+                  content: bodyDisplay.content,
+                  bytes,
+                  truncated,
+                  decodeMessage: bodyDisplay.message,
+                  decodeStatus: bodyDisplay.status,
+                })
+              }
+            >
+              {previewButtonText(previewKind)}
+            </Button>
+          </div>
         }
       />
     </div>
@@ -612,11 +980,11 @@ function BodyPreviewModal({ target, onClose }: { target: BodyPreviewTarget | nul
   const label = previewKindLabel(kind);
 
   return (
-    <Modal isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
-      <ModalContent>
+    <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
+      <ModalContent className="max-w-[min(96vw,1180px)]">
         {target && (
           <>
-            <ModalHeader className="flex flex-col gap-3">
+            <ModalHeader className="flex flex-col gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-semibold">{target.title}</span>
                 <Chip color="primary" size="sm" variant="flat">
@@ -625,6 +993,11 @@ function BodyPreviewModal({ target, onClose }: { target: BodyPreviewTarget | nul
                 <Chip size="sm" variant="flat">
                   {formatBytes(target.bytes)}
                 </Chip>
+                {target.contentEncoding && (
+                  <Chip color="secondary" size="sm" variant="flat">
+                    Content-Encoding {target.contentEncoding}
+                  </Chip>
+                )}
                 {target.truncated && (
                   <Chip color="warning" size="sm" variant="flat">
                     已截断
@@ -636,8 +1009,19 @@ function BodyPreviewModal({ target, onClose }: { target: BodyPreviewTarget | nul
                   {target.contentType}
                 </span>
               )}
+              {target.decodeMessage && (
+                <div
+                  className={`rounded-small border p-2 text-tiny font-normal leading-relaxed ${
+                    target.decodeStatus === "failed" || target.decodeStatus === "unsupported"
+                      ? "border-warning-200 bg-warning-50 text-warning-700"
+                      : "border-primary-100 bg-primary-50 text-primary-700"
+                  }`}
+                >
+                  {target.decodeMessage}
+                </div>
+              )}
             </ModalHeader>
-            <ModalBody>
+            <ModalBody className="overflow-y-auto">
               <BodyPreviewContent kind={kind} content={content} contentType={target.contentType} />
             </ModalBody>
             <ModalFooter>
@@ -679,7 +1063,262 @@ function BodyPreviewContent({
   if (kind === "image") {
     return <ImageBodyPreview content={content} contentType={contentType} />;
   }
-  return <TextPreview content={content} maxHeightClass="max-h-[70vh]" />;
+  return <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />;
+}
+
+interface HttpBodyDisplay {
+  content: string | null;
+  message: string | null;
+  status: HttpBodyDecodeStatus;
+}
+
+function useHttpBodyDisplay({
+  content,
+  contentEncoding,
+  contentType,
+  previewHex,
+}: {
+  content: string | null;
+  contentEncoding: string | null;
+  contentType: string | null;
+  previewHex: string | null;
+}): HttpBodyDisplay {
+  const [display, setDisplay] = useState<HttpBodyDisplay>(() => plainHttpBodyDisplay(content));
+
+  useEffect(() => {
+    let canceled = false;
+    if (!content || !isCompressedContentEncoding(contentEncoding)) {
+      setDisplay(plainHttpBodyDisplay(content));
+      return () => {
+        canceled = true;
+      };
+    }
+
+    const bodyBytes = extractStoredBodyBytes(content, previewHex);
+    if (!bodyBytes) {
+      setDisplay({
+        content,
+        status: looksUnreadableCompressedText(content) ? "failed" : "stored-decoded",
+        message: looksUnreadableCompressedText(content)
+          ? `这条旧记录的 Body 声明了 Content-Encoding: ${contentEncoding}，但没有保留可解压的原始压缩字节，无法可靠还原，已展示当前保存内容。`
+          : `Content-Encoding: ${contentEncoding}。新记录会在服务端入库前解压；当前内容看起来已经是可读正文，按可读内容展示。`,
+      });
+      return () => {
+        canceled = true;
+      };
+    }
+
+    const unsupported = unsupportedContentEncodings(contentEncoding);
+    if (unsupported.length > 0) {
+      setDisplay({
+        content,
+        status: "unsupported",
+        message: `该 Body 声明了 Content-Encoding: ${contentEncoding}，当前浏览器预览暂不支持 ${unsupported.join(
+          "、",
+        )} 解压，先展示保存的原始内容。`,
+      });
+      return () => {
+        canceled = true;
+      };
+    }
+
+    if (encodingIncludesGzip(contentEncoding) && !hasGzipMagic(bodyBytes)) {
+      setDisplay({
+        content,
+        status: "stored-decoded",
+        message: `Content-Encoding: ${contentEncoding}。当前保存内容不像原始 gzip 字节，按服务端已解码内容展示。`,
+      });
+      return () => {
+        canceled = true;
+      };
+    }
+
+    setDisplay({
+      content,
+      status: "pending",
+      message: `正在按 Content-Encoding: ${contentEncoding} 解压预览...`,
+    });
+
+    decodeHttpBodyBytes(bodyBytes, contentEncoding)
+      .then((decodedBytes) => {
+        if (canceled) {
+          return;
+        }
+        setDisplay({
+          content: bodyContentFromBytes(decodedBytes, contentType),
+          status: "decoded",
+          message: `已按 Content-Encoding: ${contentEncoding} 解压后展示。`,
+        });
+      })
+      .catch(() => {
+        if (canceled) {
+          return;
+        }
+        setDisplay({
+          content,
+          status: looksUnreadableCompressedText(content) ? "failed" : "stored-decoded",
+          message: looksUnreadableCompressedText(content)
+            ? `这条旧记录的 Body 声明了 Content-Encoding: ${contentEncoding}，但浏览器无法从已保存内容中完成解压，已展示当前保存内容。`
+            : `Content-Encoding: ${contentEncoding}。解压尝试未成功，当前内容看起来已经可读，按已保存内容展示。`,
+        });
+      });
+
+    return () => {
+      canceled = true;
+    };
+  }, [content, contentEncoding, contentType, previewHex]);
+
+  return display;
+}
+
+function plainHttpBodyDisplay(content: string | null): HttpBodyDisplay {
+  return { content, message: null, status: "plain" };
+}
+
+function headerValue(headers: string | null, name: string): string | null {
+  if (!headers) {
+    return null;
+  }
+  return parseHeaderLines(headers)[name.toLowerCase()] ?? null;
+}
+
+function normalizedContentEncoding(value: string | null): string | null {
+  const tokens = contentEncodingTokens(value);
+  return tokens.length > 0 ? tokens.join(", ") : null;
+}
+
+function contentEncodingTokens(value: string | null): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function isCompressedContentEncoding(value: string | null): boolean {
+  return contentEncodingTokens(value).some((token) => token !== "identity");
+}
+
+function unsupportedContentEncodings(value: string | null): string[] {
+  const supported = new Set(["gzip", "x-gzip", "deflate", "x-deflate", "identity"]);
+  return contentEncodingTokens(value).filter((token) => !supported.has(token));
+}
+
+function encodingIncludesGzip(value: string | null): boolean {
+  return contentEncodingTokens(value).some((token) => token === "gzip" || token === "x-gzip");
+}
+
+function hasGzipMagic(bytes: Uint8Array): boolean {
+  return bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+}
+
+function extractStoredBodyBytes(content: string, previewHex: string | null): Uint8Array | null {
+  const dataUrlBytes = decodeDataUrlBytes(content);
+  if (dataUrlBytes) {
+    return dataUrlBytes;
+  }
+  const hexBytes = decodeHexPreview(previewHex);
+  return hexBytes.length > 0 ? hexBytes : null;
+}
+
+function decodeDataUrlBytes(content: string): Uint8Array | null {
+  const match = content.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/is);
+  if (!match) {
+    return null;
+  }
+  return decodeBase64Bytes(match[2].replace(/\s/g, ""));
+}
+
+async function decodeHttpBodyBytes(bytes: Uint8Array, contentEncoding: string | null): Promise<Uint8Array> {
+  let current = bytes;
+  const tokens = contentEncodingTokens(contentEncoding).reverse();
+  for (const token of tokens) {
+    if (token === "identity") {
+      continue;
+    }
+    if (token === "gzip" || token === "x-gzip") {
+      current = await decompressBytes(current, "gzip");
+      continue;
+    }
+    if (token === "deflate" || token === "x-deflate") {
+      try {
+        current = await decompressBytes(current, "deflate");
+      } catch {
+        current = await decompressBytes(current, "deflate-raw");
+      }
+      continue;
+    }
+    throw new Error(`Unsupported content encoding: ${token}`);
+  }
+  return current;
+}
+
+async function decompressBytes(bytes: Uint8Array, format: "gzip" | "deflate" | "deflate-raw"): Promise<Uint8Array> {
+  const DecompressionStreamCtor = (
+    globalThis as unknown as {
+      DecompressionStream?: new (format: "gzip" | "deflate" | "deflate-raw") => TransformStream<Uint8Array, Uint8Array>;
+    }
+  ).DecompressionStream;
+  if (!DecompressionStreamCtor) {
+    throw new Error("DecompressionStream is not available");
+  }
+  const blobBytes = new Uint8Array(bytes.length);
+  blobBytes.set(bytes);
+  const stream = new Blob([blobBytes.buffer]).stream().pipeThrough(new DecompressionStreamCtor(format));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function bodyContentFromBytes(bytes: Uint8Array, contentType: string | null): string {
+  const detectedImageMime = detectImageMime(bytes);
+  const mediaType = mediaTypeFromContentType(contentType);
+  if (detectedImageMime || mediaType.startsWith("image/")) {
+    return `data:${detectedImageMime ?? mediaType};base64,${bytesToBase64(bytes)}`;
+  }
+  if (isTextContentType(mediaType) || looksLikeTextPayload(bytes)) {
+    return decodeUtf8(bytes);
+  }
+  return `data:${mediaType};base64,${bytesToBase64(bytes)}`;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function mediaTypeFromContentType(contentType: string | null): string {
+  const mediaType = contentType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mediaType) ? mediaType : "application/octet-stream";
+}
+
+function isTextContentType(mediaType: string): boolean {
+  return (
+    mediaType.startsWith("text/") ||
+    mediaType === "application/json" ||
+    mediaType.endsWith("+json") ||
+    mediaType === "application/xml" ||
+    mediaType.endsWith("+xml") ||
+    mediaType === "application/x-www-form-urlencoded" ||
+    mediaType === "application/graphql" ||
+    mediaType === "application/javascript" ||
+    mediaType === "application/ecmascript" ||
+    mediaType === "application/x-yaml" ||
+    mediaType === "application/yaml"
+  );
+}
+
+function looksUnreadableCompressedText(content: string): boolean {
+  const sample = content.slice(0, 2048);
+  if (!sample) {
+    return false;
+  }
+  const replacementChars = sample.match(/\uFFFD/g)?.length ?? 0;
+  const controls = Array.from(sample).filter((char) => {
+    const code = char.charCodeAt(0);
+    return code < 0x20 && char !== "\r" && char !== "\n" && char !== "\t";
+  }).length;
+  return replacementChars >= 2 || (replacementChars + controls) / sample.length > 0.02;
 }
 
 function JsonBodyPreview({ content }: { content: string }) {
@@ -690,7 +1329,7 @@ function JsonBodyPreview({ content }: { content: string }) {
         <Chip color="warning" size="sm" variant="flat">
           JSON 解析失败
         </Chip>
-        <TextPreview content={content} maxHeightClass="max-h-[70vh]" />
+        <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
       </div>
     );
   }
@@ -703,7 +1342,7 @@ function JsonBodyPreview({ content }: { content: string }) {
         <HttpSummaryTile label="字符" value={String(content.length)} />
         <HttpSummaryTile label="格式" value="JSON" />
       </div>
-      <TextPreview content={JSON.stringify(parsed.value, null, 2)} maxHeightClass="max-h-[70vh]" />
+      <JsonHighlightedPreview content={JSON.stringify(parsed.value, null, 2)} maxHeightClass="max-h-[52dvh]" />
     </div>
   );
 }
@@ -711,7 +1350,7 @@ function JsonBodyPreview({ content }: { content: string }) {
 function FormBodyPreview({ content }: { content: string }) {
   const rows = parseUrlEncodedForm(content);
   if (rows.length === 0) {
-    return <TextPreview content={content} maxHeightClass="max-h-[70vh]" />;
+    return <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />;
   }
 
   return (
@@ -729,7 +1368,7 @@ function FormBodyPreview({ content }: { content: string }) {
 function MultipartBodyPreview({ content, contentType }: { content: string; contentType: string | null }) {
   const parts = parseMultipartBody(content, contentType);
   if (parts.length === 0) {
-    return <TextPreview content={content} maxHeightClass="max-h-[70vh]" />;
+    return <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />;
   }
 
   return (
@@ -761,12 +1400,12 @@ function HtmlBodyPreview({ content }: { content: string }) {
     <Tabs aria-label="HTML body preview" destroyInactiveTabPanel={false} variant="underlined">
       <Tab key="rendered" title="渲染">
         <div className="mt-3 overflow-hidden rounded-small border border-default-200 bg-white">
-          <iframe className="h-[70vh] w-full bg-white" sandbox="" srcDoc={content} title="HTML body preview" />
+          <iframe className="h-[52dvh] w-full bg-white" sandbox="" srcDoc={content} title="HTML body preview" />
         </div>
       </Tab>
       <Tab key="source" title="源码">
         <div className="mt-3">
-          <TextPreview content={content} maxHeightClass="max-h-[70vh]" />
+          <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
         </div>
       </Tab>
     </Tabs>
@@ -774,15 +1413,15 @@ function HtmlBodyPreview({ content }: { content: string }) {
 }
 
 function XmlBodyPreview({ content }: { content: string }) {
-  return <TextPreview content={formatXml(content)} maxHeightClass="max-h-[70vh]" />;
+  return <TextPreview content={formatXml(content)} maxHeightClass="max-h-[52dvh]" />;
 }
 
 function ImageBodyPreview({ content, contentType }: { content: string; contentType: string | null }) {
   const trimmed = content.trim();
   if (trimmed.startsWith("data:image/")) {
     return (
-      <div className="flex min-h-80 items-center justify-center rounded-small border border-default-200 bg-default-50 p-4">
-        <img alt="HTTP body preview" className="max-h-[70vh] max-w-full object-contain" src={trimmed} />
+      <div className="flex min-h-52 items-center justify-center rounded-small border border-default-200 bg-default-50 p-3">
+        <img alt="HTTP body preview" className="max-h-[52dvh] max-w-full object-contain" src={trimmed} />
       </div>
     );
   }
@@ -794,7 +1433,7 @@ function ImageBodyPreview({ content, contentType }: { content: string; contentTy
       <Chip color="warning" size="sm" variant="flat">
         图片二进制无法直接渲染
       </Chip>
-      <TextPreview content={content} maxHeightClass="max-h-[70vh]" />
+      <TextPreview content={content} maxHeightClass="max-h-[52dvh]" />
     </div>
   );
 }
@@ -805,7 +1444,7 @@ function KeyValuePreviewTable({
   rows: Array<{ id: string; name: string; meta: string; value: string }>;
 }) {
   return (
-    <div className="max-h-[70vh] overflow-auto rounded-small border border-default-200">
+    <div className="max-h-[52dvh] overflow-auto rounded-small border border-default-200">
       <table className="w-full min-w-[680px] border-collapse text-left text-small">
         <thead className="sticky top-0 bg-default-100 text-tiny uppercase text-default-500">
           <tr>
@@ -836,27 +1475,153 @@ function TextPreview({ content, maxHeightClass }: { content: string; maxHeightCl
   );
 }
 
-function TcpFrameTable({ rows, loading }: { rows: TcpTrafficFrame[]; loading: boolean }) {
+function JsonHighlightedPreview({ content, maxHeightClass }: { content: string; maxHeightClass: string }) {
+  return (
+    <pre
+      className={`${maxHeightClass} overflow-auto rounded-small border border-default-200 bg-default-50 p-3 font-mono text-tiny leading-relaxed`}
+    >
+      <code className="block min-w-max">{highlightJson(content)}</code>
+    </pre>
+  );
+}
+
+const JSON_TOKEN_PATTERN =
+  /("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"\s*:)|("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|\b(true|false)\b|\bnull\b|[{}\[\],:]/g;
+
+function highlightJson(content: string): ReactNode[] {
+  if (content.length === 0) {
+    return ["-"];
+  }
+  JSON_TOKEN_PATTERN.lastIndex = 0;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let index = 0;
+  let match: RegExpExecArray | null;
+  while ((match = JSON_TOKEN_PATTERN.exec(content)) !== null) {
+    if (match.index > cursor) {
+      nodes.push(content.slice(cursor, match.index));
+    }
+    nodes.push(jsonTokenNode(match[0], index++));
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < content.length) {
+    nodes.push(content.slice(cursor));
+  }
+  return nodes;
+}
+
+function jsonTokenNode(token: string, index: number): ReactNode {
+  if (token.startsWith("\"") && token.trimEnd().endsWith(":")) {
+    return (
+      <span key={index} className="font-semibold text-primary">
+        {token}
+      </span>
+    );
+  }
+  if (token.startsWith("\"")) {
+    return (
+      <span key={index} className="text-success-600">
+        {token}
+      </span>
+    );
+  }
+  if (/^-?\d/.test(token)) {
+    return (
+      <span key={index} className="text-warning-600">
+        {token}
+      </span>
+    );
+  }
+  if (token === "true" || token === "false") {
+    return (
+      <span key={index} className="text-secondary-600">
+        {token}
+      </span>
+    );
+  }
+  if (token === "null") {
+    return (
+      <span key={index} className="italic text-default-400">
+        {token}
+      </span>
+    );
+  }
+  return (
+    <span key={index} className="text-default-500">
+      {token}
+    </span>
+  );
+}
+
+function TcpFrameTable({
+  rows,
+  loading,
+  page,
+  pageSize,
+  total,
+  totalPages,
+  detailLoadingId,
+  streamLoadingChannel,
+  onPageChange,
+  onOpenDetails,
+  onOpenStream,
+}: {
+  rows: TcpTrafficFrame[];
+  loading: boolean;
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  detailLoadingId: string | null;
+  streamLoadingChannel: string | null;
+  onPageChange: (page: number) => void;
+  onOpenDetails: (row: TcpTrafficFrame) => void;
+  onOpenStream: (row: TcpTrafficFrame) => void;
+}) {
+  const rangeStart = total === 0 ? 0 : page * pageSize + 1;
+  const rangeEnd = Math.min(total, (page + 1) * pageSize);
+  const tableScopeKey = useMemo(() => `${page}:${pageSize}`, [page, pageSize]);
+  const tableRows = useMemo(
+    () =>
+      rows.map((row, index) => ({
+        ...row,
+        tableKey: `${tableScopeKey}:${index}:${row.id}:${row.frameTime}:${row.direction}:${row.channelId}`,
+      })),
+    [rows, tableScopeKey],
+  );
+  const tableCollectionKey = useMemo(() => {
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+    return [
+      tableScopeKey,
+      rows.length,
+      first ? `${first.id}:${first.frameTime}` : "empty",
+      last ? `${last.id}:${last.frameTime}` : "empty",
+    ].join("|");
+  }, [rows, tableScopeKey]);
+
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
-      <CardBody className="gap-4 p-4">
+      <CardBody className="gap-3 p-3">
         <div>
           <h3 className="text-small font-semibold">TCP 数据帧</h3>
           <p className="text-tiny text-default-500">按公网连接 channelId 展示双向 payload 预览</p>
         </div>
-        <Table aria-label="TCP 数据帧" isHeaderSticky removeWrapper>
+        <Table key={tableCollectionKey} aria-label="TCP 数据帧" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>时间</TableColumn>
             <TableColumn>方向</TableColumn>
             <TableColumn>端口</TableColumn>
             <TableColumn>连接</TableColumn>
+            <TableColumn>流位置</TableColumn>
             <TableColumn>长度</TableColumn>
             <TableColumn>ASCII / 文本</TableColumn>
             <TableColumn>HEX</TableColumn>
+            <TableColumn>解析</TableColumn>
           </TableHeader>
-          <TableBody items={rows} isLoading={loading} emptyContent="暂无 TCP 数据帧">
+          <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent="暂无 TCP 数据帧">
             {(row) => (
-              <TableRow key={row.id}>
+              <TableRow key={row.tableKey}>
                 <TableCell>{formatDateTime(row.frameTime)}</TableCell>
                 <TableCell>
                   <Chip
@@ -878,13 +1643,22 @@ function TcpFrameTable({ rows, loading }: { rows: TcpTrafficFrame[]; loading: bo
                 <TableCell>
                   <div className="flex min-w-0 flex-col">
                     <span className="max-w-48 truncate font-mono text-tiny">{shortChannel(row.channelId)}</span>
-                    {row.remoteAddress && <span className="max-w-48 truncate text-tiny text-default-400">{row.remoteAddress}</span>}
+                    <span className="max-w-72 whitespace-normal break-all text-tiny text-default-500" title={tcpFlowLabel(row)}>
+                      {tcpFlowLabel(row)}
+                    </span>
+                    {row.remoteAddress && <span className="max-w-48 truncate text-tiny text-default-400">peer {row.remoteAddress}</span>}
                     <span className="text-tiny text-default-400">{row.clientName}</span>
                   </div>
                 </TableCell>
                 <TableCell>
+                  <div className="flex min-w-0 flex-col font-mono text-tiny">
+                    <span>#{row.frameIndex ?? 0}</span>
+                    <span className="text-default-400">{tcpStreamRange(row)}</span>
+                  </div>
+                </TableCell>
+                <TableCell>
                   {formatBytes(row.payloadBytes)}
-                  {row.truncated && <span className="ml-1 text-tiny text-warning">截断</span>}
+                  {row.truncated && !row.payloadBase64 && <span className="ml-1 text-tiny text-warning">仅预览</span>}
                 </TableCell>
                 <TableCell>
                   <pre className="max-h-24 max-w-80 overflow-auto whitespace-pre-wrap break-all rounded-small bg-default-50 p-2 font-mono text-tiny">
@@ -896,12 +1670,360 @@ function TcpFrameTable({ rows, loading }: { rows: TcpTrafficFrame[]; loading: bo
                     {row.payloadPreviewHex || "-"}
                   </pre>
                 </TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      isLoading={detailLoadingId === row.id}
+                      size="sm"
+                      variant="flat"
+                      onPress={() => onOpenDetails(row)}
+                    >
+                      详情
+                    </Button>
+                    <Button
+                      isLoading={streamLoadingChannel === row.channelId}
+                      size="sm"
+                      variant="flat"
+                      onPress={() => onOpenStream(row)}
+                    >
+                      串流
+                    </Button>
+                  </div>
+                </TableCell>
               </TableRow>
             )}
           </TableBody>
         </Table>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <span className="text-small text-default-500">
+            {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
+          </span>
+          <Pagination
+            showControls
+            page={page + 1}
+            total={Math.max(1, totalPages)}
+            onChange={(value) => onPageChange(value - 1)}
+          />
+        </div>
       </CardBody>
     </Card>
+  );
+}
+
+function TcpFrameModal({ row, onClose }: { row: TcpTrafficFrame | null; onClose: () => void }) {
+  const analysis = useMemo(() => (row ? analyzeTcpPayload(row) : null), [row]);
+
+  return (
+    <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={row != null} size="5xl" scrollBehavior="inside" onOpenChange={(open) => !open && onClose()}>
+      <ModalContent className="max-w-[min(96vw,1180px)]">
+        {(close) =>
+          row && analysis ? (
+            <>
+              <ModalHeader className="flex flex-col gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Chip color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "warning"} size="sm" variant="flat">
+                    {directionLabel(row.direction)}
+                  </Chip>
+                  <span className="font-semibold">TCP 数据帧 #{row.id}</span>
+                </div>
+                <div className="flex flex-wrap gap-4 text-small font-normal text-default-500">
+                  <span>{formatDateTime(row.frameTime)}</span>
+                  <span>{row.listenPort}</span>
+                  <span>{row.clientName}</span>
+                  <span>{tcpFlowLabel(row)}</span>
+                </div>
+              </ModalHeader>
+              <ModalBody className="gap-3 overflow-y-auto">
+                <div className="grid gap-2 md:grid-cols-4 xl:grid-cols-6">
+                  <HttpSummaryTile label="长度" value={formatBytes(row.payloadBytes)} />
+                  <HttpSummaryTile label="解析类型" value={tcpPayloadKindLabel(analysis.kind)} />
+                  <HttpSummaryTile label="资源" value={row.resourceName || "-"} />
+                  <HttpSummaryTile label="Channel" value={shortChannel(row.channelId)} />
+                  <HttpSummaryTile label="Frame" value={`#${row.frameIndex ?? 0}`} />
+                  <HttpSummaryTile label="Offset" value={tcpStreamRange(row)} />
+                </div>
+                {!analysis.fullAvailable && (
+                  <div className="rounded-small border border-warning-200 bg-warning-50 px-3 py-2 text-small text-warning-700">
+                    这条历史记录没有完整二进制字段，只能展示旧版保存的 payload 预览。
+                  </div>
+                )}
+                <Tabs aria-label="TCP payload 预览" destroyInactiveTabPanel={false} variant="underlined">
+                  <Tab key="parsed" title="解析">
+                    <TcpParsedPayload analysis={analysis} />
+                  </Tab>
+                  <Tab key="text" title="文本">
+                    <TextPreview content={analysis.text || row.payloadPreviewText || ""} maxHeightClass="max-h-[52dvh]" />
+                  </Tab>
+                  <Tab key="hex" title="Hexdump">
+                    <TextPreview content={analysis.hexDump || row.payloadPreviewHex || ""} maxHeightClass="max-h-[52dvh]" />
+                  </Tab>
+                </Tabs>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="flat" onPress={close}>
+                  关闭
+                </Button>
+              </ModalFooter>
+            </>
+          ) : null
+        }
+      </ModalContent>
+    </Modal>
+  );
+}
+
+function TcpStreamModal({ stream, onClose }: { stream: TcpTrafficStream | null; onClose: () => void }) {
+  const frames = useMemo(
+    () => [...(stream?.items ?? [])].sort((left, right) => Number(left.id) - Number(right.id)),
+    [stream],
+  );
+  const publicFrames = useMemo(
+    () =>
+      frames
+        .filter((frame) => frame.direction === "PUBLIC_TO_CLIENT")
+        .sort((left, right) => (left.streamOffset ?? 0) - (right.streamOffset ?? 0)),
+    [frames],
+  );
+  const clientFrames = useMemo(
+    () =>
+      frames
+        .filter((frame) => frame.direction === "CLIENT_TO_PUBLIC")
+        .sort((left, right) => (left.streamOffset ?? 0) - (right.streamOffset ?? 0)),
+    [frames],
+  );
+  const totalBytes = frames.reduce((sum, frame) => sum + frame.payloadBytes, 0);
+
+  return (
+    <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={stream != null} size="5xl" scrollBehavior="inside" onOpenChange={(open) => !open && onClose()}>
+      <ModalContent className="max-w-[min(96vw,1180px)]">
+        {(close) =>
+          stream ? (
+            <>
+              <ModalHeader className="flex flex-col gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-semibold">TCP 数据流</span>
+                  <Chip color="primary" size="sm" variant="flat">
+                    {shortChannel(stream.channelId)}
+                  </Chip>
+                  {stream.truncated && (
+                    <Chip color="warning" size="sm" variant="flat">
+                      已达加载上限
+                    </Chip>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-small font-normal text-default-500">
+                  <span>{frames.length} 帧</span>
+                  <span>{formatBytes(totalBytes)}</span>
+                  {frames[0] && <span>{frames[0].resourceName}</span>}
+                </div>
+              </ModalHeader>
+              <ModalBody className="gap-3 overflow-y-auto">
+                <div className="grid gap-2 md:grid-cols-4">
+                  <HttpSummaryTile label="总帧数" value={`${frames.length}`} />
+                  <HttpSummaryTile label="总流量" value={formatBytes(totalBytes)} />
+                  <HttpSummaryTile label="公网 -> 内网" value={`${publicFrames.length} 帧`} />
+                  <HttpSummaryTile label="内网 -> 公网" value={`${clientFrames.length} 帧`} />
+                </div>
+                <Tabs aria-label="TCP 数据流视图" destroyInactiveTabPanel={false} variant="underlined">
+                  <Tab key="timeline" title="时间线">
+                    <TcpStreamTimeline frames={frames} />
+                  </Tab>
+                  <Tab key="public" title="公网 -> 内网">
+                    <TcpStreamPayload frames={publicFrames} />
+                  </Tab>
+                  <Tab key="client" title="内网 -> 公网">
+                    <TcpStreamPayload frames={clientFrames} />
+                  </Tab>
+                </Tabs>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="flat" onPress={close}>
+                  关闭
+                </Button>
+              </ModalFooter>
+            </>
+          ) : null
+        }
+      </ModalContent>
+    </Modal>
+  );
+}
+
+function TcpStreamTimeline({ frames }: { frames: TcpTrafficFrame[] }) {
+  if (frames.length === 0) {
+    return <TextPreview content="" maxHeightClass="max-h-40" />;
+  }
+  return (
+    <div className="max-h-[52dvh] overflow-auto rounded-small border border-default-200">
+      <table className="w-full min-w-[900px] border-collapse text-left text-small">
+        <thead className="sticky top-0 bg-default-100 text-tiny uppercase text-default-500">
+          <tr>
+            <th className="border-b border-default-200 px-3 py-2 font-semibold">时间</th>
+            <th className="border-b border-default-200 px-3 py-2 font-semibold">方向</th>
+            <th className="border-b border-default-200 px-3 py-2 font-semibold">端点</th>
+            <th className="border-b border-default-200 px-3 py-2 font-semibold">Frame / Offset</th>
+            <th className="border-b border-default-200 px-3 py-2 font-semibold">长度</th>
+            <th className="border-b border-default-200 px-3 py-2 font-semibold">文本预览</th>
+          </tr>
+        </thead>
+        <tbody>
+          {frames.map((frame) => (
+            <tr key={frame.id} className="border-b border-default-100 last:border-b-0">
+              <td className="whitespace-nowrap px-3 py-2 text-tiny">{formatDateTime(frame.frameTime)}</td>
+              <td className="px-3 py-2">
+                <Chip color={frame.direction === "PUBLIC_TO_CLIENT" ? "primary" : "warning"} size="sm" variant="flat">
+                  {directionLabel(frame.direction)}
+                </Chip>
+              </td>
+              <td className="max-w-96 break-all px-3 py-2 font-mono text-tiny">{tcpFlowLabel(frame)}</td>
+              <td className="px-3 py-2 font-mono text-tiny">
+                #{frame.frameIndex ?? 0} / {tcpStreamRange(frame)}
+              </td>
+              <td className="whitespace-nowrap px-3 py-2">{formatBytes(frame.payloadBytes)}</td>
+              <td className="max-w-96 break-all px-3 py-2 font-mono text-tiny">{frame.payloadPreviewText || "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TcpStreamPayload({ frames }: { frames: TcpTrafficFrame[] }) {
+  const bytes = useMemo(() => concatTcpPayloads(frames), [frames]);
+  const text = useMemo(() => decodeUtf8(bytes), [bytes]);
+  const hexDump = useMemo(() => bytesToHexDump(bytes), [bytes]);
+  const http = useMemo(() => parseTcpHttpMessage(text), [text]);
+  const jsonPretty = useMemo(() => parseTcpJson(text), [text]);
+  const fullAvailable = frames.every((frame) => Boolean(frame.payloadBase64));
+
+  if (frames.length === 0) {
+    return <TextPreview content="" maxHeightClass="max-h-40" />;
+  }
+
+  return (
+    <div className="grid gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Chip color="primary" size="sm" variant="flat">
+          {frames.length} 帧
+        </Chip>
+        <Chip size="sm" variant="flat">
+          {formatBytes(bytes.length)}
+        </Chip>
+        {!fullAvailable && (
+          <Chip color="warning" size="sm" variant="flat">
+            含旧版预览数据
+          </Chip>
+        )}
+      </div>
+      <Tabs aria-label="TCP 拼接 payload 预览" destroyInactiveTabPanel={false} variant="underlined">
+        <Tab key="parsed" title="解析">
+          {http ? (
+            <TcpParsedPayload
+              analysis={tcpAnalysis("http", bytes, text, hexDump, fullAvailable, http, null, null, null, "HTTP")}
+            />
+          ) : jsonPretty ? (
+            <JsonHighlightedPreview content={jsonPretty} maxHeightClass="max-h-[52dvh]" />
+          ) : looksLikeTextPayload(bytes) ? (
+            <TextPreview content={text} maxHeightClass="max-h-[52dvh]" />
+          ) : (
+            <TextPreview content={hexDump} maxHeightClass="max-h-[52dvh]" />
+          )}
+        </Tab>
+        <Tab key="text" title="文本">
+          <TextPreview content={text} maxHeightClass="max-h-[52dvh]" />
+        </Tab>
+        <Tab key="hex" title="Hexdump">
+          <TextPreview content={hexDump} maxHeightClass="max-h-[52dvh]" />
+        </Tab>
+      </Tabs>
+    </div>
+  );
+}
+
+function TcpParsedPayload({ analysis }: { analysis: TcpPayloadAnalysis }) {
+  if (analysis.http) {
+    const contentType = tcpHeaderValue(analysis.http.headers, "content-type");
+    const bodyKind = detectBodyPreviewKind(contentType, analysis.http.body);
+    return (
+      <div className="grid gap-4">
+        <div className="rounded-small border border-default-200 bg-default-50 p-3">
+          <div className="text-tiny font-semibold uppercase text-default-500">Start line</div>
+          <div className="mt-1 break-all font-mono text-small">{analysis.http.startLine}</div>
+        </div>
+        <TcpHeaderPreview headers={analysis.http.headers} />
+        <div className="grid gap-2">
+          <div className="text-small font-semibold">Body</div>
+          {analysis.http.body ? (
+            <BodyPreviewContent kind={bodyKind} content={analysis.http.body} contentType={contentType} />
+          ) : (
+            <TextPreview content="" maxHeightClass="max-h-[52dvh]" />
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (analysis.kind === "json" && analysis.jsonPretty) {
+    return <JsonHighlightedPreview content={analysis.jsonPretty} maxHeightClass="max-h-[52dvh]" />;
+  }
+
+  if (analysis.kind === "image" && analysis.imageDataUrl) {
+    return (
+      <div className="grid gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Chip color="primary" size="sm" variant="flat">
+            {analysis.imageMime}
+          </Chip>
+          <span className="text-small text-default-500">已按图片魔数识别并渲染</span>
+        </div>
+        <div className="flex max-h-[52dvh] items-center justify-center overflow-auto rounded-small border border-default-200 bg-default-50 p-3">
+          <img alt="TCP payload preview" className="max-h-[48dvh] max-w-full object-contain" src={analysis.imageDataUrl} />
+        </div>
+      </div>
+    );
+  }
+
+  if (analysis.kind === "text") {
+    return <TextPreview content={analysis.text} maxHeightClass="max-h-[52dvh]" />;
+  }
+
+  return (
+    <div className="grid gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Chip color="default" size="sm" variant="flat">
+          {analysis.binaryLabel}
+        </Chip>
+        <span className="text-small text-default-500">无法可靠解析为文本协议，展示二进制 hexdump。</span>
+      </div>
+      <TextPreview content={analysis.hexDump} maxHeightClass="max-h-[52dvh]" />
+    </div>
+  );
+}
+
+function TcpHeaderPreview({ headers }: { headers: TcpHeaderPair[] }) {
+  if (headers.length === 0) {
+    return <TextPreview content="" maxHeightClass="max-h-40" />;
+  }
+  return (
+    <div className="max-h-52 overflow-auto rounded-small border border-default-200">
+      <table className="w-full min-w-[560px] border-collapse text-left text-small">
+        <thead className="sticky top-0 bg-default-100 text-tiny uppercase text-default-500">
+          <tr>
+            <th className="w-56 border-b border-default-200 px-3 py-2 font-semibold">Header</th>
+            <th className="border-b border-default-200 px-3 py-2 font-semibold">Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {headers.map((header, index) => (
+            <tr key={`${header.name}-${index}`} className="border-b border-default-100 last:border-b-0">
+              <td className="break-all px-3 py-2 font-mono text-tiny">{header.name}</td>
+              <td className="whitespace-pre-wrap break-all px-3 py-2 font-mono text-tiny">{header.value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -937,7 +2059,7 @@ function HeaderBlock({ content }: { content: string | null }) {
       </div>
       <Tabs aria-label="Header 展示方式" size="sm" variant="underlined" destroyInactiveTabPanel={false}>
         <Tab key="form" title="表单">
-          <div className="mt-2 grid h-72 min-w-0 gap-2 overflow-y-auto rounded-small border border-default-200 bg-default-50 p-2">
+          <div className="mt-2 grid h-48 min-w-0 gap-2 overflow-y-auto rounded-small border border-default-200 bg-default-50 p-2">
             {rows.length === 0 ? (
               <div className="rounded-small bg-background p-3 text-tiny text-default-400">暂无 Header</div>
             ) : (
@@ -975,7 +2097,7 @@ function HeaderBlock({ content }: { content: string | null }) {
         </Tab>
         <Tab key="raw" title="Raw">
           <div className="mt-2">
-            <ProtocolBlock content={value} maxHeightClass="max-h-56" title="Raw Headers" />
+            <ProtocolBlock content={value} maxHeightClass="max-h-40" title="Raw Headers" />
           </div>
         </Tab>
       </Tabs>
@@ -1452,6 +2574,252 @@ function previewKindLabel(kind: BodyPreviewKind): string {
   return "文本";
 }
 
+type TcpPayloadKind = "http" | "json" | "image" | "text" | "binary";
+
+interface TcpPayloadAnalysis {
+  binaryLabel: string;
+  bytes: Uint8Array;
+  fullAvailable: boolean;
+  hexDump: string;
+  http: TcpHttpMessage | null;
+  imageDataUrl: string | null;
+  imageMime: string | null;
+  jsonPretty: string | null;
+  kind: TcpPayloadKind;
+  text: string;
+}
+
+interface TcpHttpMessage {
+  body: string;
+  headers: TcpHeaderPair[];
+  startLine: string;
+}
+
+interface TcpHeaderPair {
+  name: string;
+  value: string;
+}
+
+function analyzeTcpPayload(row: TcpTrafficFrame): TcpPayloadAnalysis {
+  const fullAvailable = Boolean(row.payloadBase64);
+  const bytes = fullAvailable ? decodeBase64Bytes(row.payloadBase64) : decodeHexPreview(row.payloadPreviewHex);
+  const text = decodeUtf8(bytes);
+  const hexDump = bytesToHexDump(bytes);
+  const imageMime = detectImageMime(bytes);
+  const http = parseTcpHttpMessage(text);
+  const jsonPretty = parseTcpJson(text);
+
+  if (http) {
+    return tcpAnalysis("http", bytes, text, hexDump, fullAvailable, http, null, null, null, "HTTP");
+  }
+  if (jsonPretty) {
+    return tcpAnalysis("json", bytes, text, hexDump, fullAvailable, null, null, null, jsonPretty, "JSON");
+  }
+  if (imageMime && fullAvailable) {
+    return tcpAnalysis(
+      "image",
+      bytes,
+      text,
+      hexDump,
+      fullAvailable,
+      null,
+      imageMime,
+      `data:${imageMime};base64,${row.payloadBase64}`,
+      null,
+      imageMime,
+    );
+  }
+  if (looksLikeTextPayload(bytes)) {
+    return tcpAnalysis("text", bytes, text, hexDump, fullAvailable, null, null, null, null, "文本");
+  }
+  return tcpAnalysis("binary", bytes, text, hexDump, fullAvailable, null, null, null, null, detectBinaryLabel(bytes));
+}
+
+function tcpAnalysis(
+  kind: TcpPayloadKind,
+  bytes: Uint8Array,
+  text: string,
+  hexDump: string,
+  fullAvailable: boolean,
+  http: TcpHttpMessage | null,
+  imageMime: string | null,
+  imageDataUrl: string | null,
+  jsonPretty: string | null,
+  binaryLabel: string,
+): TcpPayloadAnalysis {
+  return { binaryLabel, bytes, fullAvailable, hexDump, http, imageDataUrl, imageMime, jsonPretty, kind, text };
+}
+
+function tcpPayloadKindLabel(kind: TcpPayloadKind): string {
+  if (kind === "http") {
+    return "HTTP";
+  }
+  if (kind === "json") {
+    return "JSON";
+  }
+  if (kind === "image") {
+    return "图片";
+  }
+  if (kind === "text") {
+    return "文本";
+  }
+  return "二进制";
+}
+
+function decodeBase64Bytes(base64: string): Uint8Array {
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  } catch {
+    return new Uint8Array();
+  }
+}
+
+function decodeHexPreview(hex: string | null | undefined): Uint8Array {
+  const pairs = hex?.match(/[0-9a-fA-F]{2}/g) ?? [];
+  const bytes = new Uint8Array(pairs.length);
+  pairs.forEach((pair, index) => {
+    bytes[index] = Number.parseInt(pair, 16);
+  });
+  return bytes;
+}
+
+function decodeUtf8(bytes: Uint8Array): string {
+  if (bytes.length === 0) {
+    return "";
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+function parseTcpHttpMessage(text: string): TcpHttpMessage | null {
+  const startLineMatch = text.match(/^([A-Z]{3,12}\s+\S+\s+HTTP\/\d(?:\.\d)?|HTTP\/\d(?:\.\d)?\s+\d{3}.*)(?:\r?\n|$)/);
+  if (!startLineMatch) {
+    return null;
+  }
+  const separatorMatch = /\r?\n\r?\n/.exec(text);
+  const headerBlock = separatorMatch ? text.slice(0, separatorMatch.index) : text;
+  const body = separatorMatch ? text.slice(separatorMatch.index + separatorMatch[0].length) : "";
+  const [startLine, ...headerLines] = headerBlock.split(/\r?\n/);
+  const headers = headerLines
+    .map((line) => {
+      const splitAt = line.indexOf(":");
+      if (splitAt <= 0) {
+        return null;
+      }
+      return { name: line.slice(0, splitAt).trim(), value: line.slice(splitAt + 1).trim() };
+    })
+    .filter((header): header is TcpHeaderPair => header != null);
+  return { body, headers, startLine };
+}
+
+function parseTcpJson(text: string): string | null {
+  const trimmed = text.trim();
+  if (!/^[\[{]/.test(trimmed)) {
+    return null;
+  }
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function tcpHeaderValue(headers: TcpHeaderPair[], name: string): string | null {
+  const target = name.toLowerCase();
+  return headers.find((header) => header.name.toLowerCase() === target)?.value ?? null;
+}
+
+function detectImageMime(bytes: Uint8Array): string | null {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "image/png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (bytes.length >= 6) {
+    const signature = String.fromCharCode(...bytes.slice(0, 6));
+    if (signature === "GIF87a" || signature === "GIF89a") {
+      return "image/gif";
+    }
+  }
+  if (bytes.length >= 12) {
+    const riff = String.fromCharCode(...bytes.slice(0, 4));
+    const webp = String.fromCharCode(...bytes.slice(8, 12));
+    if (riff === "RIFF" && webp === "WEBP") {
+      return "image/webp";
+    }
+  }
+  return null;
+}
+
+function looksLikeTextPayload(bytes: Uint8Array): boolean {
+  if (bytes.length === 0) {
+    return true;
+  }
+  const sampleLength = Math.min(bytes.length, 4096);
+  let control = 0;
+  for (let i = 0; i < sampleLength; i += 1) {
+    const value = bytes[i];
+    const allowedWhitespace = value === 0x09 || value === 0x0a || value === 0x0d;
+    if ((value < 0x20 && !allowedWhitespace) || value === 0x7f) {
+      control += 1;
+    }
+  }
+  return control / sampleLength < 0.08;
+}
+
+function detectBinaryLabel(bytes: Uint8Array): string {
+  if (bytes.length >= 3 && bytes[0] === 0x16 && bytes[1] === 0x03) {
+    return "TLS Handshake";
+  }
+  if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+    return "Gzip";
+  }
+  if (bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b) {
+    return "ZIP";
+  }
+  return "Binary";
+}
+
+function bytesToHexDump(bytes: Uint8Array): string {
+  if (bytes.length === 0) {
+    return "";
+  }
+  const lines: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 16) {
+    const slice = bytes.slice(offset, offset + 16);
+    let hex = "";
+    let ascii = "";
+    for (let i = 0; i < 16; i += 1) {
+      if (i < slice.length) {
+        const value = slice[i];
+        hex += `${value.toString(16).padStart(2, "0").toUpperCase()} `;
+        ascii += value >= 0x20 && value <= 0x7e ? String.fromCharCode(value) : ".";
+      } else {
+        hex += "   ";
+        ascii += " ";
+      }
+      if (i === 7) {
+        hex += " ";
+      }
+    }
+    lines.push(`${offset.toString(16).padStart(8, "0").toUpperCase()}  ${hex} |${ascii}|`);
+  }
+  return lines.join("\n");
+}
+
+function normalizeHttpSearchField(value: string): HttpTrafficSearchField {
+  return HTTP_SEARCH_FIELDS.some((field) => field.value === value) ? (value as HttpTrafficSearchField) : "summary";
+}
+
+function httpSearchFieldOption(value: HttpTrafficSearchField) {
+  return HTTP_SEARCH_FIELDS.find((field) => field.value === value) ?? HTTP_SEARCH_FIELDS[0];
+}
+
 function parseJsonPreview(content: string): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(content) };
@@ -1587,12 +2955,12 @@ function MetricCards({ resourceLabel, summary }: { resourceLabel: string; summar
   ];
 
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
       {cards.map((card) => (
         <Card key={card.label} shadow="none" className="rounded-md border border-default-200">
-          <CardBody className="gap-1 p-4">
+          <CardBody className="gap-0.5 p-2.5">
             <span className="text-small text-default-500">{card.label}</span>
-            <span className="text-xl font-semibold">{card.value}</span>
+            <span className="text-lg font-semibold">{card.value}</span>
             <span className="text-tiny text-default-400">{card.hint}</span>
           </CardBody>
         </Card>
@@ -1612,18 +2980,18 @@ function ResourceBars({ items }: { items: ResourceTotal[] }) {
   }
 
   return (
-    <div className="grid gap-3">
+    <div className="grid gap-1.5">
       {items.map((item) => {
         const width = `${Math.max(3, Math.round((item.totalBytes / Math.max(max, 1)) * 100))}%`;
         return (
-          <div key={item.key} className="grid gap-1">
+          <div key={item.key} className="grid gap-0.5">
             <div className="flex items-center justify-between gap-3 text-small">
               <span className="min-w-0 break-all font-medium" title={item.name}>
                 {item.name}
               </span>
               <span className="shrink-0 text-default-500">{formatBytes(item.totalBytes)}</span>
             </div>
-            <div className="h-2 overflow-hidden rounded-small bg-default-100">
+            <div className="h-1.5 overflow-hidden rounded-small bg-default-100">
               <div className="h-full rounded-small bg-primary" style={{ width }} />
             </div>
             <div className="flex flex-wrap items-center gap-2 text-tiny text-default-400">
@@ -1665,6 +3033,82 @@ function aggregateResources(rows: ResourceTrafficUsage[]): ResourceTotal[] {
   return Array.from(byResource.values()).sort((a, b) => b.totalBytes - a.totalBytes);
 }
 
+function normalizeHttpResponseType(value: string): "" | HttpResponseBodyType {
+  return HTTP_RESPONSE_BODY_TYPES.some((type) => type.value === value) ? (value as "" | HttpResponseBodyType) : "";
+}
+
+function httpResponseTypeOption(value: "" | HttpResponseBodyType) {
+  return HTTP_RESPONSE_BODY_TYPES.find((type) => type.value === value) ?? HTTP_RESPONSE_BODY_TYPES[0];
+}
+
+function httpResponseTypeLabel(
+  value: string | null | undefined,
+  contentType: string | null | undefined,
+  bytes: number,
+): string {
+  const normalized = normalizeHttpResponseType(value ?? "") || inferHttpResponseType(contentType, bytes);
+  return httpResponseTypeOption(normalized).label;
+}
+
+function httpResponseTypeColor(
+  value: string | null | undefined,
+  contentType: string | null | undefined,
+  bytes: number,
+): "default" | "primary" | "secondary" | "success" | "warning" {
+  const normalized = normalizeHttpResponseType(value ?? "") || inferHttpResponseType(contentType, bytes);
+  if (normalized === "json" || normalized === "html" || normalized === "xml") {
+    return "primary";
+  }
+  if (normalized === "image" || normalized === "video" || normalized === "audio") {
+    return "secondary";
+  }
+  if (normalized === "empty") {
+    return "success";
+  }
+  if (normalized === "binary") {
+    return "warning";
+  }
+  return "default";
+}
+
+function inferHttpResponseType(contentType: string | null | undefined, bytes: number): "" | HttpResponseBodyType {
+  if (bytes <= 0) {
+    return "empty";
+  }
+  const mediaType = (contentType ?? "").split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  if (!mediaType) {
+    return "binary";
+  }
+  if (mediaType === "application/json" || mediaType.endsWith("+json")) {
+    return "json";
+  }
+  if (mediaType === "text/html") {
+    return "html";
+  }
+  if (mediaType === "application/xml" || mediaType === "text/xml" || mediaType.endsWith("+xml")) {
+    return "xml";
+  }
+  if (mediaType.startsWith("image/")) {
+    return "image";
+  }
+  if (mediaType.startsWith("video/")) {
+    return "video";
+  }
+  if (mediaType.startsWith("audio/")) {
+    return "audio";
+  }
+  if (mediaType === "application/x-www-form-urlencoded" || mediaType === "multipart/form-data") {
+    return "form";
+  }
+  if (mediaType.includes("javascript") || mediaType.includes("ecmascript")) {
+    return "script";
+  }
+  if (mediaType.startsWith("text/")) {
+    return "text";
+  }
+  return "binary";
+}
+
 function httpPath(row: HttpTrafficExchange): string {
   return `${row.relativePath || "/"}${row.rawQuery ? `?${row.rawQuery}` : ""}`;
 }
@@ -1694,6 +3138,45 @@ function shortChannel(channelId: string): string {
     return channelId;
   }
   return `${channelId.slice(0, 8)}...${channelId.slice(-8)}`;
+}
+
+function tcpEndpoint(address: string | null | undefined, port: number | null | undefined): string {
+  if (!address && port == null) {
+    return "-";
+  }
+  if (!address) {
+    return `:${port}`;
+  }
+  return port == null ? address : `${address}:${port}`;
+}
+
+function tcpFlowLabel(row: TcpTrafficFrame): string {
+  const source = tcpEndpoint(row.sourceAddress, row.sourcePort);
+  const destination = tcpEndpoint(row.destinationAddress, row.destinationPort);
+  if (source === "-" && destination === "-") {
+    return row.remoteAddress || "-";
+  }
+  return `${source} -> ${destination}`;
+}
+
+function tcpStreamRange(row: TcpTrafficFrame): string {
+  const start = row.streamOffset ?? 0;
+  const end = row.streamEndOffset ?? start + row.payloadBytes;
+  return `${start}-${end}`;
+}
+
+function concatTcpPayloads(frames: TcpTrafficFrame[]): Uint8Array {
+  const chunks = frames.map((frame) =>
+    frame.payloadBase64 ? decodeBase64Bytes(frame.payloadBase64) : decodeHexPreview(frame.payloadPreviewHex),
+  );
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
 }
 
 function latestUpdatedAt(rows: Array<{ updatedAt: string }>): string | null {

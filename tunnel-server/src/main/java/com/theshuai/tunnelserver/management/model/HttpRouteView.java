@@ -14,6 +14,7 @@ public record HttpRouteView(
         String route,
         String targetBaseUrl,
         boolean enabled,
+        boolean detailCaptureEnabled,
         String createdAt,
         String updatedAt
 ) {

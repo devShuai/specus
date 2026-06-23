@@ -4,10 +4,12 @@ import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
-import io.netty.channel.ChannelHandlerContext;
 import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
+import io.netty.channel.ChannelHandlerContext;
 
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -50,6 +52,7 @@ public class RemoteTunnelHandler extends NatCommonHandler {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        trafficInspectionService.releaseTcpStream(ctx.channel().id().asLongText());
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.DISCONNECTED);
         Map<String, Object> metaData = new HashMap<>();
@@ -71,7 +74,12 @@ public class RemoteTunnelHandler extends NatCommonHandler {
         }
         trafficUsageService.recordTcpDownload(clientName, port, data.length);
         trafficInspectionService.recordTcpFrame(clientName, port, ctx.channel().id().asLongText(),
-                TrafficInspectionService.DIRECTION_PUBLIC_TO_CLIENT, remoteAddress(ctx), data);
+                TrafficInspectionService.DIRECTION_PUBLIC_TO_CLIENT,
+                endpointAddress(ctx.channel().remoteAddress()),
+                endpointPort(ctx.channel().remoteAddress()),
+                endpointAddress(ctx.channel().localAddress()),
+                endpointPort(ctx.channel().localAddress()),
+                data);
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.DATA);
         Map<String, Object> metaData = new HashMap<>();
@@ -94,7 +102,16 @@ public class RemoteTunnelHandler extends NatCommonHandler {
         super.channelWritabilityChanged(ctx);
     }
 
-    private String remoteAddress(ChannelHandlerContext ctx) {
-        return ctx.channel().remoteAddress() == null ? null : ctx.channel().remoteAddress().toString();
+    private String endpointAddress(SocketAddress address) {
+        if (address instanceof InetSocketAddress socketAddress) {
+            return socketAddress.getAddress() == null
+                    ? socketAddress.getHostString()
+                    : socketAddress.getAddress().getHostAddress();
+        }
+        return address == null ? null : address.toString();
+    }
+
+    private Integer endpointPort(SocketAddress address) {
+        return address instanceof InetSocketAddress socketAddress ? socketAddress.getPort() : null;
     }
 }

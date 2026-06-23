@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type R
 import { Button, Card, CardBody, CardHeader, Chip, Divider, Input } from "@heroui/react";
 import { useAuth } from "../auth/AuthContext";
 import { notifyError } from "../components/toast";
+import { ThemeToggleButton } from "../components/ThemeToggleButton";
+import { AppLogo } from "../components/AppLogo";
 
 const metrics = [
   { value: "TCP", label: "公网端口映射" },
@@ -51,9 +53,10 @@ const portMappingNodes = [
 
 const inputClassNames = {
   inputWrapper:
-    "border-white/15 bg-white/[0.06] text-white hover:bg-white/[0.08] data-[hover=true]:border-cyan-300/50 group-data-[focus=true]:border-cyan-300",
-  label: "text-zinc-300",
-  input: "text-white placeholder:text-zinc-500",
+    "landing-input-wrapper border-white/15 bg-white/[0.72] !text-zinc-950 shadow-sm hover:bg-white/[0.84] data-[hover=true]:border-cyan-500/60 group-data-[focus=true]:!border-cyan-500 group-data-[focus=true]:bg-white dark:!border-transparent dark:bg-white/[0.08] dark:!text-white dark:hover:bg-white/[0.12] dark:group-data-[focus=true]:bg-zinc-950/85 dark:group-data-[focus=true]:!border-transparent",
+  label:
+    "!text-zinc-700 group-data-[focus=true]:!text-cyan-700 dark:!text-zinc-300 dark:group-data-[focus=true]:!text-cyan-200",
+  input: "!text-zinc-950 placeholder:text-zinc-500 dark:!text-white dark:placeholder:text-zinc-500",
 } as const;
 
 export function LoginPage() {
@@ -83,31 +86,26 @@ export function LoginPage() {
   };
 
   return (
-    <main className="landing-shell min-h-screen overflow-hidden text-white">
+    <main className="landing-shell min-h-screen overflow-hidden text-zinc-950 dark:text-white">
       <SignalField />
       <div className="landing-grid" aria-hidden="true" />
       <div className="landing-scanline" aria-hidden="true" />
 
       <section className="relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
         <header className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-md border border-cyan-300/35 bg-cyan-300/10 text-small font-semibold text-cyan-200">
-              ST
-            </div>
-            <div>
-              <p className="text-small font-semibold text-white">shuai-tunnel</p>
-              <p className="text-tiny text-zinc-400">内网服务接入控制面</p>
-            </div>
+          <AppLogo label="shuai-tunnel" subtitle="内网服务接入控制面" />
+          <div className="flex items-center gap-2">
+            <ThemeToggleButton className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" />
+            <Button radius="sm" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" variant="flat" onPress={focusLogin}>
+              进入控制台
+            </Button>
           </div>
-          <Button radius="sm" className="bg-white/10 text-white" variant="flat" onPress={focusLogin}>
-            进入控制台
-          </Button>
         </header>
 
         <div className="grid flex-1 items-center gap-8 py-10 lg:grid-cols-[minmax(0,1fr)_420px]">
           <div className="flex min-w-0 flex-col gap-7">
             <Chip
-              className="w-fit border border-emerald-300/35 bg-emerald-300/10 px-2 text-emerald-100"
+              className="w-fit border border-emerald-500/35 bg-emerald-300/15 px-2 text-emerald-700 dark:border-emerald-300/35 dark:bg-emerald-300/10 dark:text-emerald-100"
               radius="sm"
               variant="flat"
             >
@@ -115,28 +113,28 @@ export function LoginPage() {
             </Chip>
 
             <div className="max-w-3xl">
-              <h1 className="text-5xl font-semibold leading-tight text-white">shuai-tunnel</h1>
-              <p className="mt-5 max-w-2xl text-lg leading-8 text-zinc-300">
+              <h1 className="text-5xl font-semibold leading-tight text-zinc-950 dark:text-white">shuai-tunnel</h1>
+              <p className="mt-5 max-w-2xl text-lg leading-8 text-zinc-700 dark:text-zinc-300">
                 把内网服务发布、客户端治理、多租户隔离和实时观测收束到一个控制面，让公网入口更可控，团队协作更清晰。
               </p>
             </div>
 
             <div className="grid max-w-3xl grid-cols-2 gap-3 sm:grid-cols-4">
               {metrics.map((item) => (
-                <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.055] p-3">
-                  <p className="text-xl font-semibold text-cyan-100">{item.value}</p>
-                  <p className="mt-1 text-tiny text-zinc-400">{item.label}</p>
+                <div key={item.label} className="rounded-md border border-black/10 bg-white/65 p-3 shadow-sm dark:border-white/10 dark:bg-white/[0.055] dark:shadow-none">
+                  <p className="text-xl font-semibold text-cyan-700 dark:text-cyan-100">{item.value}</p>
+                  <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{item.label}</p>
                 </div>
               ))}
             </div>
 
-            <div className="flex max-w-3xl flex-col gap-3 rounded-md border border-white/10 bg-black/30 p-4 backdrop-blur-md sm:flex-row sm:items-center">
+            <div className="flex max-w-3xl flex-col gap-3 rounded-md border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-black/30 dark:shadow-none sm:flex-row sm:items-center">
               {flowNodes.map((node, index) => (
                 <div key={node} className="flex min-w-0 flex-1 items-center gap-3">
-                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-amber-300/30 bg-amber-300/10 text-small text-amber-100">
+                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-amber-500/35 bg-amber-300/20 text-small text-amber-800 dark:border-amber-300/30 dark:bg-amber-300/10 dark:text-amber-100">
                     {index + 1}
                   </span>
-                  <span className="truncate text-small text-zinc-200">{node}</span>
+                  <span className="truncate text-small text-zinc-700 dark:text-zinc-200">{node}</span>
                   {index < flowNodes.length - 1 && <span className="landing-route-line hidden h-px flex-1 sm:block" />}
                 </div>
               ))}
@@ -144,14 +142,14 @@ export function LoginPage() {
           </div>
 
           <div ref={loginPanelRef} id="login-panel">
-            <Card shadow="none" className="landing-card rounded-md border border-white/15 bg-white/[0.08] text-white backdrop-blur-xl">
+            <Card shadow="none" className="landing-card rounded-md border border-black/10 bg-white/80 text-zinc-950 backdrop-blur-xl dark:border-white/15 dark:bg-white/[0.08] dark:text-white">
               <CardHeader className="flex flex-col items-start gap-2 px-5 pb-2 pt-5">
-                <Chip radius="sm" className="bg-cyan-300/15 text-cyan-100" variant="flat">
+                <Chip radius="sm" className="bg-cyan-300/25 text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100" variant="flat">
                   管理台登录
                 </Chip>
                 <div>
-                  <h2 className="text-2xl font-semibold text-white">进入控制台</h2>
-                  <p className="mt-1 text-small text-zinc-400">{loginHint}</p>
+                  <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">进入控制台</h2>
+                  <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">{loginHint}</p>
                 </div>
               </CardHeader>
               <CardBody className="gap-4 px-5 pb-5">
@@ -191,10 +189,10 @@ export function LoginPage() {
                 )}
 
                 {passwordEnabled && oidcEnabled && (
-                  <div className="flex items-center gap-3 text-tiny text-zinc-500">
-                    <Divider className="flex-1 bg-white/10" />
+                  <div className="flex items-center gap-3 text-tiny text-zinc-500 dark:text-zinc-500">
+                    <Divider className="flex-1 bg-black/10 dark:bg-white/10" />
                     <span>或</span>
-                    <Divider className="flex-1 bg-white/10" />
+                    <Divider className="flex-1 bg-black/10 dark:bg-white/10" />
                   </div>
                 )}
 
@@ -202,7 +200,7 @@ export function LoginPage() {
                   <Button
                     radius="sm"
                     variant="bordered"
-                    className="border-white/20 text-white"
+                    className="border-black/20 text-zinc-950 dark:border-white/20 dark:text-white"
                     onPress={() => void startOidcLogin()}
                   >
                     使用 OIDC 登录
@@ -220,11 +218,11 @@ export function LoginPage() {
         </div>
       </section>
 
-      <section className="relative z-10 border-t border-white/10 bg-black/50 px-5 py-10 sm:px-8">
+      <section className="relative z-10 border-t border-black/10 bg-white/65 px-5 py-10 backdrop-blur-md dark:border-white/10 dark:bg-black/50 sm:px-8">
         <div className="mx-auto max-w-[1440px]">
           <div className="mb-6 max-w-2xl">
-            <h2 className="text-2xl font-semibold text-white">转发原理</h2>
-            <p className="mt-2 text-small leading-6 text-zinc-400">
+            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">转发原理</h2>
+            <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
               同一个 Server 控制面承接两类入口：HTTP 根据域名和路径选路，TCP 根据公网端口找到对应的客户端隧道。
             </p>
           </div>
@@ -258,8 +256,8 @@ export function LoginPage() {
           </div>
 
           <div className="mb-6 max-w-2xl">
-            <h2 className="text-2xl font-semibold text-white">功能矩阵</h2>
-            <p className="mt-2 text-small leading-6 text-zinc-400">
+            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">功能矩阵</h2>
+            <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
               从客户端接入到连接观测，管理端提供一套面向团队协作的隧道运维入口。
             </p>
           </div>
@@ -268,14 +266,14 @@ export function LoginPage() {
               <Card
                 key={feature.title}
                 shadow="none"
-                className="rounded-md border border-white/10 bg-white/[0.055] text-white backdrop-blur-md"
+                className="rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none"
               >
                 <CardBody className="gap-3 p-4">
-                  <span className="w-fit rounded-md border border-cyan-300/25 bg-cyan-300/10 px-2 py-1 text-tiny text-cyan-100">
+                  <span className="w-fit rounded-md border border-cyan-500/25 bg-cyan-300/15 px-2 py-1 text-tiny text-cyan-700 dark:border-cyan-300/25 dark:bg-cyan-300/10 dark:text-cyan-100">
                     {feature.label}
                   </span>
-                  <h3 className="text-base font-semibold text-white">{feature.title}</h3>
-                  <p className="text-small leading-6 text-zinc-400">{feature.description}</p>
+                  <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{feature.title}</h3>
+                  <p className="text-small leading-6 text-zinc-600 dark:text-zinc-400">{feature.description}</p>
                 </CardBody>
               </Card>
             ))}
@@ -302,13 +300,13 @@ function PrincipleCard({
   return (
     <Card
       shadow="none"
-      className={`principle-card principle-card-${accent} rounded-md border border-white/10 bg-white/[0.055] text-white backdrop-blur-md`}
+      className={`principle-card principle-card-${accent} rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none`}
     >
       <CardBody className="gap-5 p-5">
         <div className="flex flex-col gap-2">
           <span className="principle-badge w-fit rounded-md px-2 py-1 text-tiny">{badge}</span>
-          <h3 className="text-lg font-semibold text-white">{title}</h3>
-          <p className="text-small leading-6 text-zinc-400">{description}</p>
+          <h3 className="text-lg font-semibold text-zinc-950 dark:text-white">{title}</h3>
+          <p className="text-small leading-6 text-zinc-600 dark:text-zinc-400">{description}</p>
         </div>
         {children}
       </CardBody>

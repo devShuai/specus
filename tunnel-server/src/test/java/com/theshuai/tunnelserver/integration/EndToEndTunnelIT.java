@@ -1,15 +1,20 @@
 package com.theshuai.tunnelserver.integration;
 
 import com.sun.net.httpserver.HttpServer;
+import com.theshuai.common.clientauth.ClientAuthLoginRequest;
+import com.theshuai.common.clientauth.ClientAuthLoginResponse;
+import com.theshuai.common.clientauth.ClientAuthSigner;
+import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.client.NettyClient;
 import com.theshuai.tunnelclient.handler.DirectHttpRequestHandler;
 import com.theshuai.tunnelserver.TunnelServerApplication;
-import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
-import com.theshuai.tunnelserver.management.service.ClientAccountService;
+import com.theshuai.tunnelserver.management.service.ClientAuthService;
+import com.theshuai.tunnelserver.management.service.ClientCredentialService;
 import com.theshuai.tunnelserver.management.service.HttpRouteService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.server.NettyServer;
 import io.netty.channel.Channel;
 import org.junit.jupiter.api.AfterAll;
@@ -26,7 +31,6 @@ import org.springframework.data.domain.PageRequest;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -34,6 +38,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -45,7 +50,7 @@ import static org.awaitility.Awaitility.await;
  * Full-stack end-to-end test:
  *   Spring Boot server (in-memory SQLite, random netty port)
  *     + an in-process mock HTTP backend
- *     + a real NettyClient connecting with HMAC-SHA256 login
+ *     + a real NettyClient connecting with HTTP-issued access token
  *     + a tunnel mapping registered via NatControlService
  *   then verify that an HTTP request to the server's public port is tunneled
  *   all the way through to the mock backend and the body comes back intact.
@@ -64,25 +69,22 @@ import static org.awaitility.Awaitility.await;
                 "tunnel.netty.port=0",
                 "tunnel.public-address=127.0.0.1",
                 "tunnel.database.seed-demo-client=false",
-                // Encrypt the control channel end-to-end. self-signed mode is
-                // fine for an in-process test: the client uses an insecure
-                // trust manager to accept the cert.
-                "tunnel.tls.mode=self-signed"
+                "tunnel.tls.mode=disabled"
         }
 )
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class EndToEndTunnelIT {
 
-    private static final String CLIENT_NAME = "E2EClient";
-    private static final String CLIENT_PASSWORD = "e2e-secret";
+    private static final String API_KEY = "e2e-client";
+    private static final String API_SECRET = "e2e-secret";
     private static final int TUNNEL_LISTEN_PORT = 19_000;
 
-    @Autowired private ClientAccountService clientAccountService;
+    @Autowired private ClientCredentialService clientCredentialService;
+    @Autowired private ClientAuthService clientAuthService;
     @Autowired private NatControlService natControlService;
     @Autowired private HttpRouteService httpRouteService;
     @Autowired private NettyServer nettyServer;
     @Autowired private ConnectionRecordRepository connectionRecordRepository;
-    @Autowired private ClientAccountRepository clientAccountRepository;
 
     private static HttpServer mockBackend;
     private static int backendPort;
@@ -124,32 +126,31 @@ class EndToEndTunnelIT {
                 .as("Netty server should have bound a real port")
                 .isGreaterThan(0);
 
-        clientAccountService.createClient(new ClientAccountService.ClientMutation(
-                CLIENT_NAME, CLIENT_PASSWORD, true, 0
+        clientCredentialService.create(TenantContext.defaultTenant(), new ClientCredentialService.CredentialMutation(
+                API_KEY, API_SECRET, true, 2
         ));
-        Long clientId = clientAccountRepository.findByClientName(CLIENT_NAME)
-                .orElseThrow()
-                .getId();
+        ClientAuthLoginResponse login = clientAuthService.login(apiKeyLoginRequest(), "127.0.0.1");
+        Long clientId = login.getClientId();
+        String clientName = login.getClientName();
 
         natControlService.createMapping(clientId, new NatControlService.MappingMutation(
                 TUNNEL_LISTEN_PORT, "127.0.0.1", backendPort, true
         ));
 
         TunnelBean tunnelBean = new TunnelBean();
-        tunnelBean.setClientName(CLIENT_NAME);
-        tunnelBean.setPassword(CLIENT_PASSWORD);
+        tunnelBean.setClientName(clientName);
+        tunnelBean.setClientSessionId(login.getClientSessionId());
+        tunnelBean.setAccessToken(login.getAccessToken());
         tunnelBean.setRemoteAddress("127.0.0.1");
         tunnelBean.setRemotePort(nettyPort);
         tunnelBean.setTunnelConfigList(List.of());
         tunnelBean.setHttpTunnelConfigList(List.of());
-        // tunnel.tls.mode=self-signed in @SpringBootTest; the client must
-        // accept the server's self-signed cert to make the handshake succeed.
-        tunnelClient = new NettyClient(tunnelBean, NettyClient.buildInsecureClientSslContext());
+        tunnelClient = new NettyClient(tunnelBean);
         tunnelClient.start();
 
         await().atMost(10, SECONDS)
                 .pollInterval(100, MILLISECONDS)
-                .until(() -> hasSuccessfulConnectionRecord(CLIENT_NAME));
+                .until(() -> hasSuccessfulConnectionRecord(clientName));
 
         await().atMost(15, SECONDS)
                 .pollInterval(500, MILLISECONDS)
@@ -216,10 +217,8 @@ class EndToEndTunnelIT {
      * DirectHttpRequestHandler 的当前路由。返回 null 表示客户端还没建立连接 / 已断开。
      *
      * <p>用反射是因为 {@code controlChannel} 是私有字段——为测试新增 getter 会污染
-     * 生产代码 API；路由读取也走反射，是为了兼容单独构建 server 时解析到的旧
-     * tunnel-client snapshot（旧包没有 {@code getCurrentRoutes()}）。
+     * 生产代码 API。
      */
-    @SuppressWarnings("unchecked")
     private static Map<String, String> readClientRoutes(NettyClient client) {
         try {
             Field field = NettyClient.class.getDeclaredField("controlChannel");
@@ -236,21 +235,33 @@ class EndToEndTunnelIT {
             if (handler == null) {
                 return null;
             }
-            return readRoutes(handler);
+            return handler.getCurrentRoutes();
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("failed to read client routes via reflection", e);
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private static Map<String, String> readRoutes(DirectHttpRequestHandler handler) throws ReflectiveOperationException {
-        try {
-            Method method = handler.getClass().getMethod("getCurrentRoutes");
-            return (Map<String, String>) method.invoke(handler);
-        } catch (NoSuchMethodException ignored) {
-            Field routes = handler.getClass().getDeclaredField("routes");
-            routes.setAccessible(true);
-            return (Map<String, String>) routes.get(handler);
-        }
+    private static ClientAuthLoginRequest apiKeyLoginRequest() {
+        ClientEnvironmentInfo environment = new ClientEnvironmentInfo();
+        environment.setMachineFingerprint("e2e-machine-" + UUID.randomUUID());
+        environment.setHostname("e2e-host");
+        environment.setOsUser("e2e-user");
+        environment.setOsName("JUnit");
+        environment.setOsVersion("1");
+        environment.setOsArch("test");
+        environment.setJavaVersion(System.getProperty("java.version", ""));
+        environment.setStartedAt("2026-06-22T00:00:00Z");
+
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        String nonce = UUID.randomUUID().toString().replace("-", "");
+        ClientAuthLoginRequest request = new ClientAuthLoginRequest();
+        request.setAuthType("apiKey");
+        request.setApiKey(API_KEY);
+        request.setTimestamp(timestamp);
+        request.setNonce(nonce);
+        request.setEnvironment(environment);
+        request.setSignature(ClientAuthSigner.signApiKey(API_KEY, timestamp, nonce, environment, API_SECRET));
+        return request;
     }
+
 }

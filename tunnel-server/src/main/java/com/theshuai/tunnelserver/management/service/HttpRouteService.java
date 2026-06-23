@@ -80,6 +80,7 @@ public class HttpRouteService {
         row.setRoute(route);
         row.setTargetBaseUrl(targetBaseUrl);
         row.setEnabled(request.enabled() == null || request.enabled());
+        row.setDetailCaptureEnabled(Boolean.TRUE.equals(request.detailCaptureEnabled()));
         row.setCreatedAt(now);
         row.setUpdatedAt(now);
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
@@ -110,6 +111,9 @@ public class HttpRouteService {
         row.setRoute(route);
         row.setTargetBaseUrl(targetBaseUrl);
         row.setEnabled(request.enabled() == null || request.enabled());
+        if (request.detailCaptureEnabled() != null) {
+            row.setDetailCaptureEnabled(request.detailCaptureEnabled());
+        }
         row.setUpdatedAt(Instant.now().toString());
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
 
@@ -193,6 +197,7 @@ public class HttpRouteService {
                 row.getRoute(),
                 row.getTargetBaseUrl(),
                 row.isEnabled(),
+                Boolean.TRUE.equals(row.getDetailCaptureEnabled()),
                 row.getCreatedAt(),
                 row.getUpdatedAt()
         );
@@ -201,7 +206,11 @@ public class HttpRouteService {
     public record RouteMutation(
             String route,
             String targetBaseUrl,
-            Boolean enabled
+            Boolean enabled,
+            Boolean detailCaptureEnabled
     ) {
+        public RouteMutation(String route, String targetBaseUrl, Boolean enabled) {
+            this(route, targetBaseUrl, enabled, false);
+        }
     }
 }

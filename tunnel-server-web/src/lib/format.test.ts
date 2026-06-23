@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, formatDuration } from "./format";
+import { formatBytes, formatDuration, formatSince } from "./format";
 
 describe("formatBytes", () => {
   it("renders zero and units", () => {
@@ -24,11 +24,20 @@ describe("formatDuration", () => {
   });
 
   it("prefixes active connections with ~", () => {
-    const from = new Date(Date.now() - 5000).toISOString();
-    expect(formatDuration(from, null).startsWith("~")).toBe(true);
+    const from = "2026-01-01T00:00:00Z";
+    const now = new Date("2026-01-01T00:00:05Z").getTime();
+    expect(formatDuration(from, null, now)).toBe("~5s");
   });
 
   it("returns - for missing start", () => {
     expect(formatDuration(null, null)).toBe("-");
+  });
+});
+
+describe("formatSince", () => {
+  it("uses the supplied browser time", () => {
+    const loginAt = new Date("2026-01-01T00:00:00Z").getTime();
+    const now = new Date("2026-01-01T00:02:10Z").getTime();
+    expect(formatSince(loginAt, now)).toBe("2m");
   });
 });

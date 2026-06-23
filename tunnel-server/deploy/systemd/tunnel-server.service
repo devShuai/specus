@@ -17,6 +17,9 @@ Group=tunnel
 # 工作目录用于存放运行时产物（如 fallback 的 SQLite 文件、临时文件等）
 WorkingDirectory=/var/lib/tunnel-server
 
+# 默认 JVM 参数为空；真实部署建议在 EnvironmentFile 里设置 JAVA_OPTS
+Environment=JAVA_OPTS=
+
 # 环境变量文件（前导的 - 表示文件不存在时不报错；建议把所有数据库 / 密钥配置写到这里）
 EnvironmentFile=-/etc/tunnel-server/tunnel-server.env
 
@@ -45,6 +48,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
+UMask=0027
 # 仅允许写入工作目录与日志目录
 ReadWritePaths=/var/lib/tunnel-server /var/log/tunnel-server
 

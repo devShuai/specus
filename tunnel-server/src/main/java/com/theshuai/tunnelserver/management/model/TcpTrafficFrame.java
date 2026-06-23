@@ -6,6 +6,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
+import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.Setter;
@@ -17,6 +18,7 @@ import lombok.Setter;
                 @Index(name = "idx_tcp_frame_client", columnList = "client_id"),
                 @Index(name = "idx_tcp_frame_port", columnList = "listen_port"),
                 @Index(name = "idx_tcp_frame_channel", columnList = "channel_id"),
+                @Index(name = "idx_tcp_frame_stream", columnList = "tenant_id, channel_id, frame_direction, stream_offset"),
                 @Index(name = "idx_tcp_frame_time", columnList = "frame_time")
         })
 @Getter
@@ -53,8 +55,33 @@ public class TcpTrafficFrame {
     @Column(name = "remote_address", length = 255)
     private String remoteAddress;
 
+    @Column(name = "source_address", length = 255)
+    private String sourceAddress;
+
+    @Column(name = "source_port")
+    private Integer sourcePort;
+
+    @Column(name = "destination_address", length = 255)
+    private String destinationAddress;
+
+    @Column(name = "destination_port")
+    private Integer destinationPort;
+
+    @Column(name = "stream_offset")
+    private Long streamOffset;
+
+    @Column(name = "stream_end_offset")
+    private Long streamEndOffset;
+
+    @Column(name = "frame_index")
+    private Long frameIndex;
+
     @Column(name = "payload_bytes", nullable = false)
     private long payloadBytes;
+
+    @Lob
+    @Column(name = "payload_data")
+    private byte[] payloadData;
 
     @Column(name = "payload_preview_hex", length = 4096)
     private String payloadPreviewHex;

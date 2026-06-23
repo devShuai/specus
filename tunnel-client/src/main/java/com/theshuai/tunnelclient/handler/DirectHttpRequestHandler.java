@@ -19,8 +19,7 @@ import java.util.stream.Collectors;
  *
  * <p>路由表生命周期：
  * <ul>
- *   <li>构造期：从客户端本地 {@code tunnelClientConfig.json:httpTunnelConfigList} 读出，
- *       仅作为启动 fallback。</li>
+ *   <li>构造期：使用客户端 HTTP 登录响应里的 {@code httpTunnelConfigList} 作为初始快照。</li>
  *   <li>运行期：服务端通过 {@code NAT_CONTROL} 的 {@code httpTunnelConfigList} 字段下发
  *       新版本，{@link MessageResponseHandler} 调用 {@link #applyRoutes} 整体替换。
  *       由于 {@link #routes} 用 {@code volatile} 持有不可变 Map，channelRead0 在
@@ -43,8 +42,8 @@ public class DirectHttpRequestHandler extends SimpleChannelInboundHandler<Direct
 
     /**
      * 用服务端权威全集替换内存路由表。{@code next == null} 也按"清空"处理（与
-     * {@code NAT_CONTROL.httpTunnelConfigList = []} 一致）；调用方在"未接管态"应直接
-     * 不调本方法，让客户端继续使用 boot 时的 fallback 表。
+     * {@code NAT_CONTROL.httpTunnelConfigList = []} 一致）；调用方不下发 HTTP 路由字段时
+     * 应直接不调本方法，让客户端继续使用 HTTP 登录时拿到的初始快照。
      */
     public void applyRoutes(List<HttpTunnelConfig> next) {
         Map<String, String> previous = this.routes;

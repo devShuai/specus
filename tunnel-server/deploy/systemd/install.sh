@@ -17,7 +17,7 @@
 #   5) systemctl daemon-reload + enable
 #
 # 不会自动启动服务 —— 需要先编辑 /etc/tunnel-server/tunnel-server.env
-# 填好 MySQL 连接信息和管理员密码后再执行：
+# 填好 MySQL 连接信息、管理员密码、JWT 密钥和可选 ES 配置后再执行：
 #   systemctl start tunnel-server
 #   systemctl status tunnel-server
 #   journalctl -u tunnel-server -f
@@ -88,13 +88,19 @@ echo "[OK] systemd unit 已部署"
 
 # ---------- 5. 拷贝环境变量模板（仅当目标不存在时） ----------
 ENV_FILE="$CONFIG_DIR/tunnel-server.env"
+ENV_EXAMPLE_FILE="$CONFIG_DIR/tunnel-server.env.example"
+install -m 0640 -o root -g "$APP_GROUP" \
+        "$SCRIPT_DIR/tunnel-server.env.example" "$ENV_EXAMPLE_FILE"
+echo "[OK] 最新环境变量模板已部署到 $ENV_EXAMPLE_FILE"
+
 if [[ ! -f "$ENV_FILE" ]]; then
   install -m 0640 -o root -g "$APP_GROUP" \
           "$SCRIPT_DIR/tunnel-server.env.example" "$ENV_FILE"
   echo "[OK] 环境变量模板已部署到 $ENV_FILE"
-  echo "     ⚠️  请编辑该文件，填好 MySQL 连接信息和管理员密码后再启动服务"
+  echo "     ⚠️  请编辑该文件，填好 MySQL 连接信息、管理员密码、JWT 密钥后再启动服务"
 else
   echo "[--] 已存在 $ENV_FILE，不覆盖"
+  echo "     可用 diff 对比新增变量：diff -u $ENV_FILE $ENV_EXAMPLE_FILE"
 fi
 
 # ---------- 6. 注册 systemd 服务 ----------
@@ -113,6 +119,10 @@ cat <<EOF
        TUNNEL_DB_URL / TUNNEL_DB_USERNAME / TUNNEL_DB_PASSWORD
        TUNNEL_AUTH_PASSWORD
        TUNNEL_AUTH_JWT_SECRET   (openssl rand -base64 48)
+     可选修改：
+       TUNNEL_PUBLIC_ADDRESS
+       TUNNEL_ELASTICSEARCH_URIS / TUNNEL_ELASTICSEARCH_USERNAME / TUNNEL_ELASTICSEARCH_PASSWORD
+       TUNNEL_AUTH_TENANT_ID / TUNNEL_OIDC_TENANT_CLAIM
 
   2. 启动服务：
        sudo systemctl start tunnel-server

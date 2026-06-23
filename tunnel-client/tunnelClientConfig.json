@@ -1,18 +1,6 @@
 {
-
-  "clientName": "Demo client",
-
-  "password": "test1234",
-
-  "httpTunnelConfigList": [
-    {
-      "route": "web",
-      "targetBaseUrl": "https://www.baidu.com:443"
-    }
-  ],
-
-  "remoteAddress": "101.133.236.111",
-
-  "remotePort": 7010
-
+  "serverBaseUrl": "http://127.0.0.1:8088",
+  "authType": "apiKey",
+  "apiKey": "demo-client",
+  "secret": "test1234"
 }

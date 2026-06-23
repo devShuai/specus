@@ -49,11 +49,11 @@ class DirectHttpRequestHandlerTests {
 
     @Test
     void applyRoutesReplacesEntireRoutingTable() {
-        // 启动时使用本地 fallback 表
+        // 启动时使用 HTTP 登录响应里的初始快照
         DirectHttpRequestHandler handler = new DirectHttpRequestHandler(List.of(
-                routeConfig("legacy", "http://127.0.0.1:9999")
+                routeConfig("initial", "http://127.0.0.1:9999")
         ));
-        assertEquals(Map.of("legacy", "http://127.0.0.1:9999"), handler.getCurrentRoutes());
+        assertEquals(Map.of("initial", "http://127.0.0.1:9999"), handler.getCurrentRoutes());
 
         // 服务端权威下发：整体替换 —— 老 route 必须消失
         handler.applyRoutes(List.of(

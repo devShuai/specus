@@ -62,13 +62,10 @@ public final class WireFixtureGenerator {
         }
 
         void emit() throws IOException {
-            // Login request: HMAC sign field is a deterministic 32-byte sequence so the wire
-            // bytes are stable across runs. Real signatures come from HmacSigner.
             LoginRequestPacket login = new LoginRequestPacket();
             login.setClientName("Demo client");
-            login.setTimestamp("1700000000000");
-            login.setNonce("nonce-fixture");
-            login.setCheckSign(deterministicSign());
+            login.setClientSessionId(1700000000000L);
+            login.setAccessToken("cs_fixture_access_token");
             write("login_request.bin", login);
 
             LoginResponsePacket loginResp = new LoginResponsePacket();
@@ -216,13 +213,6 @@ public final class WireFixtureGenerator {
             return map;
         }
 
-        private static byte[] deterministicSign() {
-            byte[] sign = new byte[32];
-            for (int i = 0; i < 32; i++) {
-                sign[i] = (byte) (i + 1);
-            }
-            return sign;
-        }
     }
 
     private WireFixtureGenerator() {

@@ -65,6 +65,7 @@ export function HttpRoutesPanel() {
         route: route.trim(),
         targetBaseUrl: targetBaseUrl.trim(),
         enabled: true,
+        detailCaptureEnabled: false,
       });
       setRoute("");
       setTargetBaseUrl("");
@@ -84,10 +85,25 @@ export function HttpRoutesPanel() {
         route: item.route,
         targetBaseUrl: item.targetBaseUrl,
         enabled: !item.enabled,
+        detailCaptureEnabled: Boolean(item.detailCaptureEnabled),
       });
       await load();
     } catch (error) {
       notifyError(error, "切换状态失败");
+    }
+  };
+
+  const toggleDetailCapture = async (item: HttpRoute) => {
+    try {
+      await adminApi.updateHttpRoute(item.id, {
+        route: item.route,
+        targetBaseUrl: item.targetBaseUrl,
+        enabled: item.enabled,
+        detailCaptureEnabled: !Boolean(item.detailCaptureEnabled),
+      });
+      await load();
+    } catch (error) {
+      notifyError(error, "切换明细采集失败");
     }
   };
 
@@ -165,6 +181,7 @@ export function HttpRoutesPanel() {
           <TableColumn>目标地址</TableColumn>
           <TableColumn>访问链接</TableColumn>
           <TableColumn>状态</TableColumn>
+          <TableColumn>明细采集</TableColumn>
           <TableColumn>更新时间</TableColumn>
           <TableColumn>操作</TableColumn>
         </TableHeader>
@@ -191,6 +208,17 @@ export function HttpRoutesPanel() {
                   onClick={() => void toggle(item)}
                 >
                   {item.enabled ? "启用" : "停用"}
+                </Chip>
+              </TableCell>
+              <TableCell>
+                <Chip
+                  size="sm"
+                  variant="flat"
+                  color={item.detailCaptureEnabled ? "primary" : "default"}
+                  className="cursor-pointer"
+                  onClick={() => void toggleDetailCapture(item)}
+                >
+                  {item.detailCaptureEnabled ? "采集" : "关闭"}
                 </Chip>
               </TableCell>
               <TableCell>{formatDateTime(item.updatedAt || item.createdAt)}</TableCell>
@@ -265,6 +293,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
   const [name, setName] = useState("");
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
   const [enabled, setEnabled] = useState(true);
+  const [detailCaptureEnabled, setDetailCaptureEnabled] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -272,6 +301,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
       setName(route.route);
       setTargetBaseUrl(route.targetBaseUrl);
       setEnabled(route.enabled);
+      setDetailCaptureEnabled(Boolean(route.detailCaptureEnabled));
     }
   }, [route]);
 
@@ -285,6 +315,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
         route: name.trim(),
         targetBaseUrl: targetBaseUrl.trim(),
         enabled,
+        detailCaptureEnabled,
       });
       notify("HTTP 路由已更新");
       disclosure.onClose();
@@ -307,6 +338,9 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
               <Input label="目标地址" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
               <Switch isSelected={enabled} onValueChange={setEnabled}>
                 启用
+              </Switch>
+              <Switch isSelected={detailCaptureEnabled} onValueChange={setDetailCaptureEnabled}>
+                明细采集
               </Switch>
             </ModalBody>
             <ModalFooter>

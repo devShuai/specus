@@ -4,7 +4,6 @@ import com.theshuai.common.codec.PacketDecoder;
 import com.theshuai.common.codec.PacketEncoder;
 import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
-import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.handler.*;
 import io.netty.bootstrap.Bootstrap;
@@ -15,10 +14,11 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.ScheduledFuture;
 
 import java.io.File;
-import java.security.SecureRandom;
-import java.util.HexFormat;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -30,7 +30,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.StringUtils;
 
 /**
- * 控制连接的 Netty 客户端：负责建立 TCP 连接、签名登录、断线后指数退避重连。
+ * 控制连接的 Netty 客户端：负责建立 TCP 连接、token 登录、断线后指数退避重连。
  *
  * <p>重连状态机要点：
  * <ul>
@@ -45,18 +45,21 @@ import org.springframework.util.StringUtils;
 @Slf4j
 public class NettyClient {
     @Getter
-    private final String clientName;
-    private final byte[] passwordHash;
-    private final String accessToken;
-    private final Long clientSessionId;
-    private final String host;
-    private final int port;
+    private volatile String clientName;
+    private volatile String accessToken;
+    private volatile Long clientSessionId;
+    private volatile long tokenTtlSeconds;
+    private volatile long tokenExpiresAtMillis;
+    private volatile String host;
+    private volatile int port;
     private final TunnelBean tunnelBean;
     private final Bootstrap bootstrap = new Bootstrap();
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
     private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
-    private final SecureRandom secureRandom = new SecureRandom();
+    private final AtomicBoolean reconnectSuppressed = new AtomicBoolean(false);
+    private final AtomicBoolean authRefreshInProgress = new AtomicBoolean(false);
+    private final AtomicReference<ScheduledFuture<?>> proactiveRefreshFuture = new AtomicReference<>();
     private volatile EventLoopGroup workerGroup;
     private volatile EventLoopGroup localWorkerGroup;
     private volatile TcpConnection localConnection;
@@ -66,7 +69,10 @@ public class NettyClient {
     /** 退避上限：连续 5 次失败后稳定到一分钟一次，长期网络故障可自愈。 */
     private static final int MAX_RECONNECT_DELAY_SECONDS = 60;
     private static final long BASE_RECONNECT_DELAY_SECONDS = 2L;
-    private static final int NONCE_BYTES = 16;
+    private static final long PROACTIVE_REFRESH_MAX_LEAD_SECONDS = 300L;
+    private static final long PROACTIVE_REFRESH_MIN_LEAD_SECONDS = 30L;
+    private static final long PROACTIVE_REFRESH_MIN_DELAY_SECONDS = 5L;
+    private static final long PROACTIVE_REFRESH_RETRY_DELAY_SECONDS = 60L;
 
     public NettyClient(TunnelBean tunnelBean) {
         this(tunnelBean, null);
@@ -77,9 +83,11 @@ public class NettyClient {
         this.clientName = tunnelBean.getClientName();
         this.accessToken = tunnelBean.getAccessToken();
         this.clientSessionId = tunnelBean.getClientSessionId();
-        // Hash the password once at construction so we never keep the plaintext
-        // around and never send it over the wire.
-        this.passwordHash = StringUtils.hasText(accessToken) ? null : HmacSigner.sha256(tunnelBean.getPassword());
+        this.tokenTtlSeconds = tunnelBean.getTokenTtlSeconds();
+        this.tokenExpiresAtMillis = tunnelBean.getTokenExpiresAtMillis();
+        if (!StringUtils.hasText(accessToken) || clientSessionId == null || clientSessionId <= 0) {
+            throw new IllegalStateException("Tunnel client must login through HTTP first and receive accessToken/clientSessionId");
+        }
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
         this.sslContext = sslContext;
@@ -95,6 +103,7 @@ public class NettyClient {
         if (localConnection == null) {
             localConnection = new TcpConnection(localWorkerGroup);
         }
+        scheduleProactiveRefresh();
         TcpConnection sharedLocalConnection = localConnection;
         bootstrap.group(workerGroup)
                 .channel(NioSocketChannel.class)
@@ -162,9 +171,11 @@ public class NettyClient {
      * </ul>
      */
     public void connect() {
-        if (shuttingDown.get()) return;
-        bootstrap.connect(host, port).addListener((ChannelFutureListener) future -> {
-            if (shuttingDown.get()) {
+        if (shouldStopConnecting()) return;
+        String connectHost = host;
+        int connectPort = port;
+        bootstrap.connect(connectHost, connectPort).addListener((ChannelFutureListener) future -> {
+            if (shouldStopConnecting()) {
                 if (future.isSuccess()) future.channel().close();
                 return;
             }
@@ -175,10 +186,10 @@ public class NettyClient {
                     previous.close();
                 }
                 channel.closeFuture().addListener(closeFuture -> controlChannel.compareAndSet(channel, null));
-                log.info("Connected to {}:{} (awaiting login response)", host, port);
+                log.info("Connected to {}:{} (awaiting login response)", connectHost, connectPort);
                 sendLoginRequest(channel);
             } else {
-                log.warn("Connect to {}:{} failed: {}", host, port,
+                log.warn("Connect to {}:{} failed: {}", connectHost, connectPort,
                         future.cause() == null ? "unknown" : future.cause().getMessage());
                 scheduleReconnect();
             }
@@ -188,18 +199,8 @@ public class NettyClient {
     private void sendLoginRequest(Channel channel) {
         LoginRequestPacket loginRequestPacket = new LoginRequestPacket();
         loginRequestPacket.setClientName(clientName);
-        if (StringUtils.hasText(accessToken)) {
-            loginRequestPacket.setClientSessionId(clientSessionId);
-            loginRequestPacket.setAccessToken(accessToken);
-            channel.writeAndFlush(loginRequestPacket);
-            return;
-        }
-        String timestamp = String.valueOf(System.currentTimeMillis());
-        String nonce = generateNonce();
-        loginRequestPacket.setTimestamp(timestamp);
-        loginRequestPacket.setNonce(nonce);
-        String message = clientName + "\n" + timestamp + "\n" + nonce;
-        loginRequestPacket.setCheckSign(HmacSigner.hmacSha256(passwordHash, message));
+        loginRequestPacket.setClientSessionId(clientSessionId);
+        loginRequestPacket.setAccessToken(accessToken);
         channel.writeAndFlush(loginRequestPacket);
     }
 
@@ -211,14 +212,119 @@ public class NettyClient {
         }
     }
 
-    private String generateNonce() {
-        byte[] nonceBytes = new byte[NONCE_BYTES];
-        secureRandom.nextBytes(nonceBytes);
-        return HexFormat.of().formatHex(nonceBytes);
+    public void stopReconnecting(String reason) {
+        reconnectSuppressed.set(true);
+        reconnectScheduled.set(false);
+        log.warn("Stop reconnecting to {}:{}: {}", host, port,
+                StringUtils.hasText(reason) ? reason : "login rejected");
+    }
+
+    public void refreshCredentialsAndReconnect(String reason) {
+        refreshCredentials(reason, true);
+    }
+
+    private void refreshCredentialsWithoutReconnect(String reason) {
+        refreshCredentials(reason, false);
+    }
+
+    private void refreshCredentials(String reason, boolean reconnectAfterSuccess) {
+        if (shouldStopConnecting()) {
+            return;
+        }
+        ClientAuthRefresher refresher = tunnelBean.getAuthRefresher();
+        if (refresher == null) {
+            log.warn("Cannot refresh client access token: no HTTP login refresher is configured");
+            if (reconnectAfterSuccess) {
+                stopReconnecting(reason);
+            }
+            return;
+        }
+        if (!authRefreshInProgress.compareAndSet(false, true)) {
+            log.debug("Client access token refresh is already in progress");
+            return;
+        }
+        reconnectScheduled.set(false);
+        CompletableFuture
+                .supplyAsync(refresher::refresh)
+                .whenComplete((refreshed, error) -> {
+                    boolean refreshSucceeded = false;
+                    try {
+                        if (shuttingDown.get()) {
+                            return;
+                        }
+                        if (error != null) {
+                            log.warn("客户端访问令牌刷新失败: {}，稍后重试",
+                                    error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
+                            return;
+                        }
+                        applyRefreshedTunnelBean(refreshed);
+                        refreshSucceeded = true;
+                        reconnectAttempts.set(0);
+                        log.info("客户端访问令牌刷新成功: clientName={}, session={}, mode={}",
+                                clientName, clientSessionId, reconnectAfterSuccess ? "reconnect" : "proactive");
+                    } catch (Throwable t) {
+                        log.warn("客户端访问令牌刷新结果无效: {}，稍后重试",
+                                t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+                    } finally {
+                        authRefreshInProgress.set(false);
+                        if (!shouldStopConnecting()) {
+                            if (refreshSucceeded) {
+                                scheduleProactiveRefresh();
+                            }
+                            if (refreshSucceeded && reconnectAfterSuccess) {
+                                connect();
+                            } else if (!refreshSucceeded && reconnectAfterSuccess) {
+                                scheduleReconnect();
+                            } else if (!refreshSucceeded) {
+                                scheduleProactiveRefreshRetry();
+                            }
+                        }
+                    }
+                });
+    }
+
+    private void applyRefreshedTunnelBean(TunnelBean refreshed) {
+        if (refreshed == null
+                || !StringUtils.hasText(refreshed.getAccessToken())
+                || refreshed.getClientSessionId() == null
+                || refreshed.getClientSessionId() <= 0
+                || !StringUtils.hasText(refreshed.getClientName())) {
+            throw new IllegalStateException("HTTP login response missing access token/session/clientName");
+        }
+        if (StringUtils.hasText(refreshed.getRemoteAddress()) && refreshed.getRemotePort() > 0
+                && (!refreshed.getRemoteAddress().equals(host) || refreshed.getRemotePort() != port)) {
+            log.info("HTTP login returned updated tunnel endpoint {}:{} -> {}:{}",
+                    host, port, refreshed.getRemoteAddress(), refreshed.getRemotePort());
+            this.host = refreshed.getRemoteAddress();
+            this.port = refreshed.getRemotePort();
+        }
+        this.clientName = refreshed.getClientName();
+        this.clientSessionId = refreshed.getClientSessionId();
+        this.accessToken = refreshed.getAccessToken();
+        this.tokenTtlSeconds = refreshed.getTokenTtlSeconds();
+        this.tokenExpiresAtMillis = refreshed.getTokenExpiresAtMillis();
+        tunnelBean.setClientName(refreshed.getClientName());
+        tunnelBean.setClientSessionId(refreshed.getClientSessionId());
+        tunnelBean.setAccessToken(refreshed.getAccessToken());
+        tunnelBean.setTokenTtlSeconds(refreshed.getTokenTtlSeconds());
+        tunnelBean.setTokenExpiresAtMillis(refreshed.getTokenExpiresAtMillis());
+        tunnelBean.setMaxOnlineInstances(refreshed.getMaxOnlineInstances());
+        tunnelBean.setRemoteAddress(host);
+        tunnelBean.setRemotePort(port);
+        tunnelBean.setTunnelConfigList(nonNullList(refreshed.getTunnelConfigList()));
+        tunnelBean.setHttpTunnelConfigList(nonNullList(refreshed.getHttpTunnelConfigList()));
+        if (refreshed.getAuthRefresher() != null) {
+            tunnelBean.setAuthRefresher(refreshed.getAuthRefresher());
+        }
+    }
+
+    private static <T> List<T> nonNullList(List<T> value) {
+        return value == null ? List.of() : value;
     }
 
     public void shutdown() {
         if (!shuttingDown.compareAndSet(false, true)) return;
+        cancelProactiveRefresh();
         Channel channel = controlChannel.getAndSet(null);
         if (channel != null) {
             channel.close().awaitUninterruptibly(5, TimeUnit.SECONDS);
@@ -248,12 +354,21 @@ public class NettyClient {
         return shuttingDown.get();
     }
 
+    public boolean isReconnectSuppressed() {
+        return reconnectSuppressed.get();
+    }
+
+    public boolean isAuthRefreshInProgress() {
+        return authRefreshInProgress.get();
+    }
+
     /**
      * 安排下一次重连。无论 {@code channelInactive} 与连接失败回调的并发情况如何，
      * 同一时刻最多只有一个延时任务在飞。
      */
     public void scheduleReconnect() {
-        if (shuttingDown.get()) return;
+        if (shouldStopConnecting()) return;
+        if (authRefreshInProgress.get()) return;
         if (!reconnectScheduled.compareAndSet(false, true)) {
             // 已经有挂起的重连任务，无需再排一次。
             return;
@@ -271,7 +386,7 @@ public class NettyClient {
         log.info("Reconnect attempt {} to {}:{} in {}s", attempt, host, port, delay);
         group.next().schedule(() -> {
             reconnectScheduled.set(false);
-            if (shuttingDown.get()) return;
+            if (shouldStopConnecting()) return;
             try {
                 connect();
             } catch (Throwable t) {
@@ -279,5 +394,90 @@ public class NettyClient {
                 scheduleReconnect();
             }
         }, delay, TimeUnit.SECONDS);
+    }
+
+    private boolean shouldStopConnecting() {
+        return shuttingDown.get() || reconnectSuppressed.get();
+    }
+
+    private void scheduleProactiveRefresh() {
+        if (shouldStopConnecting()) {
+            return;
+        }
+        if (tunnelBean.getAuthRefresher() == null || tokenExpiresAtMillis <= 0) {
+            return;
+        }
+        EventLoopGroup group = workerGroup;
+        if (group == null || group.isShuttingDown() || group.isShutdown()) {
+            return;
+        }
+        long delayMillis = proactiveRefreshDelayMillis(System.currentTimeMillis());
+        scheduleProactiveRefreshTask(delayMillis);
+        log.info("客户端访问令牌将在约 {} 秒后主动刷新", TimeUnit.MILLISECONDS.toSeconds(delayMillis));
+    }
+
+    private void scheduleProactiveRefreshRetry() {
+        if (shouldStopConnecting()) {
+            return;
+        }
+        EventLoopGroup group = workerGroup;
+        if (group == null || group.isShuttingDown() || group.isShutdown()) {
+            return;
+        }
+        long delayMillis = TimeUnit.SECONDS.toMillis(PROACTIVE_REFRESH_RETRY_DELAY_SECONDS);
+        scheduleProactiveRefreshTask(delayMillis);
+        log.info("客户端访问令牌主动刷新失败, {} 秒后重试", PROACTIVE_REFRESH_RETRY_DELAY_SECONDS);
+    }
+
+    private void scheduleProactiveRefreshTask(long delayMillis) {
+        EventLoopGroup group = workerGroup;
+        if (group == null || group.isShuttingDown() || group.isShutdown()) {
+            return;
+        }
+        EventLoop eventLoop = group.next();
+        AtomicReference<ScheduledFuture<?>> holder = new AtomicReference<>();
+        ScheduledFuture<?> future = eventLoop.schedule(() -> {
+            proactiveRefreshFuture.compareAndSet(holder.get(), null);
+            if (shouldStopConnecting()) {
+                return;
+            }
+            if (authRefreshInProgress.get()) {
+                scheduleProactiveRefreshRetry();
+                return;
+            }
+            refreshCredentialsWithoutReconnect("客户端访问令牌即将过期");
+        }, Math.max(delayMillis, TimeUnit.SECONDS.toMillis(PROACTIVE_REFRESH_MIN_DELAY_SECONDS)), TimeUnit.MILLISECONDS);
+        holder.set(future);
+        ScheduledFuture<?> previous = proactiveRefreshFuture.getAndSet(future);
+        if (previous != null && previous != future) {
+            previous.cancel(false);
+        }
+    }
+
+    private long proactiveRefreshDelayMillis(long nowMillis) {
+        long remainingMillis = tokenExpiresAtMillis - nowMillis;
+        if (remainingMillis <= 0) {
+            return TimeUnit.SECONDS.toMillis(PROACTIVE_REFRESH_MIN_DELAY_SECONDS);
+        }
+        long leadMillis = proactiveRefreshLeadMillis(remainingMillis);
+        long delayMillis = remainingMillis - leadMillis;
+        return Math.max(delayMillis, TimeUnit.SECONDS.toMillis(PROACTIVE_REFRESH_MIN_DELAY_SECONDS));
+    }
+
+    private long proactiveRefreshLeadMillis(long remainingMillis) {
+        long minLeadMillis = TimeUnit.SECONDS.toMillis(PROACTIVE_REFRESH_MIN_LEAD_SECONDS);
+        long maxLeadMillis = TimeUnit.SECONDS.toMillis(PROACTIVE_REFRESH_MAX_LEAD_SECONDS);
+        if (remainingMillis <= minLeadMillis * 2) {
+            return Math.max(TimeUnit.SECONDS.toMillis(PROACTIVE_REFRESH_MIN_DELAY_SECONDS), remainingMillis / 2);
+        }
+        long tenth = remainingMillis / 10;
+        return Math.min(maxLeadMillis, Math.max(minLeadMillis, tenth));
+    }
+
+    private void cancelProactiveRefresh() {
+        ScheduledFuture<?> future = proactiveRefreshFuture.getAndSet(null);
+        if (future != null) {
+            future.cancel(false);
+        }
     }
 }

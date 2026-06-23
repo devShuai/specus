@@ -15,6 +15,8 @@ import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.security.TlsContextFactory;
 import com.theshuai.tunnelserver.security.TlsProperties;
+import com.theshuai.tunnelserver.http.WebSocketStreamRegistry;
+import com.theshuai.tunnelserver.http.WebSocketTunnelHandler;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
@@ -46,6 +48,8 @@ public class NettyServer implements ApplicationRunner {
     private final RemotePortServerManager remotePortServerManager;
     private final TlsProperties tlsProperties;
     private final com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler;
+    private final WebSocketStreamRegistry webSocketStreamRegistry;
+    private final WebSocketTunnelHandler webSocketTunnelHandler;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel channel;
@@ -56,7 +60,9 @@ public class NettyServer implements ApplicationRunner {
                        TrafficInspectionService trafficInspectionService,
                        RemotePortServerManager remotePortServerManager,
                        TlsProperties tlsProperties,
-                       com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler) {
+                       com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler,
+                       WebSocketStreamRegistry webSocketStreamRegistry,
+                       WebSocketTunnelHandler webSocketTunnelHandler) {
         this.nettyProperties = nettyProperties;
         this.managedLoginRequestHandler = managedLoginRequestHandler;
         this.trafficUsageService = trafficUsageService;
@@ -64,6 +70,8 @@ public class NettyServer implements ApplicationRunner {
         this.remotePortServerManager = remotePortServerManager;
         this.tlsProperties = tlsProperties;
         this.directHttpResponseHandler = directHttpResponseHandler;
+        this.webSocketStreamRegistry = webSocketStreamRegistry;
+        this.webSocketTunnelHandler = webSocketTunnelHandler;
     }
 
     @Override
@@ -121,7 +129,9 @@ public class NettyServer implements ApplicationRunner {
                                 trafficUsageService,
                                 trafficInspectionService,
                                 remotePortServerManager,
-                                nettyProperties
+                                nettyProperties,
+                                webSocketStreamRegistry,
+                                webSocketTunnelHandler
                         ));
                         ch.pipeline().addLast(directHttpResponseHandler);
                         ch.pipeline().addLast(ServerMessageHandler.INSTANCE);

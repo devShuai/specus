@@ -31,10 +31,9 @@ import java.util.Map;
  * <p>下发协议（{@code NAT_CONTROL}）的 JSON 体一直承载 TCP 端口映射 {@code tunnelConfigList}；
  * 自从 HTTP 路由也由后台管理后，本服务在每次下发时**额外查询** {@link HttpRouteMappingRepository}
  * 把启用项装到同一条消息的 {@code httpTunnelConfigList} 字段。语义约定见
- * {@link #appendHttpRoutesIfManaged}：
+ * {@link #assembleHttpRoutesIfManaged}：
  * <ul>
- *   <li>该客户端从未在后台创建过任何 HTTP 路由 → 字段缺省 → 客户端继续用本地
- *       {@code tunnelClientConfig.json} 兜底（避免升级老部署时误清空）</li>
+ *   <li>该客户端从未在后台创建过任何 HTTP 路由 → 字段缺省 → 客户端继续使用 HTTP 登录响应里的初始快照</li>
  *   <li>创建过至少一条（即便全部禁用/删除）→ 字段为数组（可能为空）→ 客户端整体替换</li>
  * </ul>
  *
@@ -100,6 +99,7 @@ public class NatControlService {
         mapping.setTargetAddress(targetAddress);
         mapping.setTargetPort(targetPort);
         mapping.setEnabled(request.enabled() == null || request.enabled());
+        mapping.setDetailCaptureEnabled(Boolean.TRUE.equals(request.detailCaptureEnabled()));
         mapping.setCreatedAt(now);
         mapping.setUpdatedAt(now);
         TunnelMapping saved = tunnelMappingRepository.saveAndFlush(mapping);
@@ -132,6 +132,9 @@ public class NatControlService {
         mapping.setTargetAddress(targetAddress);
         mapping.setTargetPort(targetPort);
         mapping.setEnabled(request.enabled() == null || request.enabled());
+        if (request.detailCaptureEnabled() != null) {
+            mapping.setDetailCaptureEnabled(request.detailCaptureEnabled());
+        }
         mapping.setUpdatedAt(Instant.now().toString());
         TunnelMapping saved = tunnelMappingRepository.saveAndFlush(mapping);
 
@@ -313,6 +316,7 @@ public class NatControlService {
                 mapping.getTargetAddress(),
                 mapping.getTargetPort(),
                 mapping.isEnabled(),
+                Boolean.TRUE.equals(mapping.getDetailCaptureEnabled()),
                 mapping.getCreatedAt(),
                 mapping.getUpdatedAt()
         );
@@ -322,8 +326,12 @@ public class NatControlService {
             Integer listenPort,
             String targetAddress,
             Integer targetPort,
-            Boolean enabled
+            Boolean enabled,
+            Boolean detailCaptureEnabled
     ) {
+        public MappingMutation(Integer listenPort, String targetAddress, Integer targetPort, Boolean enabled) {
+            this(listenPort, targetAddress, targetPort, enabled, false);
+        }
     }
 
     /** 手动下发 endpoint 的返回值。{@code httpRoutes == -1} 表示客户端未接管态。 */

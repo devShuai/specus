@@ -1,15 +1,15 @@
 import { useEffect, useState } from "react";
 
-// useNowTick returns a counter that increments every `intervalMs`, used to re-render live
-// duration cells once per second without storing per-row timers.
+// useNowTick returns the current browser time and updates it on an interval, used to
+// render live durations without asking the server for fresh values.
 export function useNowTick(intervalMs: number, enabled = true): number {
-  const [tick, setTick] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!enabled) {
       return;
     }
-    const timer = window.setInterval(() => setTick((value) => value + 1), intervalMs);
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
     return () => window.clearInterval(timer);
   }, [intervalMs, enabled]);
-  return tick;
+  return now;
 }

@@ -20,6 +20,15 @@ spring:
       hibernate.jdbc.batch_size: ${TUNNEL_DB_BATCH_SIZE:50}
       hibernate.order_inserts: true
       hibernate.order_updates: true
+  elasticsearch:
+    uris: ${TUNNEL_ELASTICSEARCH_URIS:http://localhost:9200}
+    username: ${TUNNEL_ELASTICSEARCH_USERNAME:}
+    password: ${TUNNEL_ELASTICSEARCH_PASSWORD:}
+    api-key: ${TUNNEL_ELASTICSEARCH_API_KEY:}
+  data:
+    elasticsearch:
+      repositories:
+        enabled: false
 
 tunnel:
   database:
@@ -73,12 +82,23 @@ tunnel:
   traffic:
     flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}
     capture-detail-enabled: ${TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED:true}
-    # TCP payloads keep using previews; HTTP request/response body text is stored in full.
+    # TCP keeps a short preview for list rendering and stores the full payload separately.
     capture-preview-bytes: ${TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES:256}
     capture-header-chars: ${TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS:8192}
     capture-max-pending: ${TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING:20000}
     capture-flush-batch-size: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE:1000}
     capture-flush-interval-ms: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS:2000}
+  elasticsearch:
+    # When blank, HTTP exchange detail uses the database. When set, HTTP exchange detail writes
+    # and reads through Spring Data Elasticsearch instead.
+    uris: ${TUNNEL_ELASTICSEARCH_URIS:}
+    username: ${TUNNEL_ELASTICSEARCH_USERNAME:}
+    password: ${TUNNEL_ELASTICSEARCH_PASSWORD:}
+    api-key: ${TUNNEL_ELASTICSEARCH_API_KEY:}
+    index: ${TUNNEL_ELASTICSEARCH_HTTP_INDEX:shuai-tunnel-http-traffic}
+    tcp-index: ${TUNNEL_ELASTICSEARCH_TCP_INDEX:shuai-tunnel-tcp-traffic}
+    http-max-store-size: ${TUNNEL_ELASTICSEARCH_HTTP_MAX_STORE_SIZE:100GB}
+    tcp-max-store-size: ${TUNNEL_ELASTICSEARCH_TCP_MAX_STORE_SIZE:10GB}
   connection-record:
     # Rolling days of raw login detail to keep. Older detail is rolled up into per-natural-month
     # totals (kept indefinitely) and then deleted. 0 disables archiving.

@@ -39,6 +39,7 @@ public class CompactBinarySerializer implements Serializer {
     private static final ValueCodec STRING = new StringCodec();
     private static final ValueCodec BOOLEAN = new BooleanCodec();
     private static final ValueCodec INTEGER = new IntegerCodec();
+    private static final ValueCodec LONG = new LongCodec();
     private static final ValueCodec BYTE_ARRAY = new ByteArrayCodec();
     private static final ValueCodec NUMERIC_STRING = new NumericStringCodec();
     private static final ValueCodec MD5_STRING = new FixedHexStringCodec(16);
@@ -105,9 +106,8 @@ public class CompactBinarySerializer implements Serializer {
         Map<Class<?>, ObjectSchema<?>> schemas = new ConcurrentHashMap<>();
         register(schemas, schema(LoginRequestPacket.class,
                 field("clientName", STRING),
-                field("timestamp", NUMERIC_STRING),
-                field("nonce", STRING),
-                field("checkSign", BYTE_ARRAY)));
+                field("clientSessionId", LONG),
+                field("accessToken", STRING)));
         register(schemas, schema(LoginResponsePacket.class,
                 field("clientName", STRING),
                 field("success", BOOLEAN),
@@ -348,6 +348,28 @@ public class CompactBinarySerializer implements Serializer {
         @Override
         public Object read(CompactInput input) {
             return input.readVarInt();
+        }
+    }
+
+    private static class LongCodec implements ValueCodec {
+        @Override
+        public void write(CompactOutput output, Object value) {
+            Long longValue = (Long) value;
+            if (longValue == null) {
+                output.writeByte(0);
+                return;
+            }
+            output.writeByte(1);
+            output.writeVarLong(zigZagEncode(longValue));
+        }
+
+        @Override
+        public Object read(CompactInput input) {
+            return switch (input.readUnsignedByte()) {
+                case 0 -> null;
+                case 1 -> zigZagDecode(input.readVarLong());
+                default -> throw new IllegalArgumentException("invalid long type");
+            };
         }
     }
 

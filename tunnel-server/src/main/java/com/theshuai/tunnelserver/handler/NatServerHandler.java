@@ -5,6 +5,8 @@ import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.session.Session;
+import com.theshuai.tunnelserver.http.WebSocketStreamRegistry;
+import com.theshuai.tunnelserver.http.WebSocketTunnelHandler;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import com.theshuai.tunnelserver.attribute.ServerAttributes;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
@@ -21,6 +23,8 @@ import io.netty.handler.codec.bytes.ByteArrayDecoder;
 import io.netty.handler.codec.bytes.ByteArrayEncoder;
 import lombok.extern.slf4j.Slf4j;
 
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -42,6 +46,10 @@ public class NatServerHandler extends NatCommonHandler {
     private final TrafficInspectionService trafficInspectionService;
     private final RemotePortServerManager remotePortServerManager;
     private final NettyServerProperties nettyProperties;
+    // WebSocket 隧道复用 NAT_MESSAGE 帧的 DATA/DISCONNECTED 路由：source="ws" 的流不进入
+    // externalChannels，而是由 WebSocketStreamRegistry / WebSocketTunnelHandler 处理浏览器侧会话。
+    private final WebSocketStreamRegistry webSocketStreamRegistry;
+    private final WebSocketTunnelHandler webSocketTunnelHandler;
     private final AtomicInteger activeClientExternalChannels = new AtomicInteger();
     private final Map<Integer, AtomicInteger> portExternalChannelCounts = new ConcurrentHashMap<>();
     // Set during processRegister; null means the client has not registered any tunnel yet.
@@ -54,11 +62,15 @@ public class NatServerHandler extends NatCommonHandler {
     public NatServerHandler(TrafficUsageService trafficUsageService,
                             TrafficInspectionService trafficInspectionService,
                             RemotePortServerManager remotePortServerManager,
-                            NettyServerProperties nettyProperties) {
+                            NettyServerProperties nettyProperties,
+                            WebSocketStreamRegistry webSocketStreamRegistry,
+                            WebSocketTunnelHandler webSocketTunnelHandler) {
         this.trafficUsageService = trafficUsageService;
         this.trafficInspectionService = trafficInspectionService;
         this.remotePortServerManager = remotePortServerManager;
         this.nettyProperties = nettyProperties;
+        this.webSocketStreamRegistry = webSocketStreamRegistry;
+        this.webSocketTunnelHandler = webSocketTunnelHandler;
     }
 
     @Override
@@ -77,18 +89,57 @@ public class NatServerHandler extends NatCommonHandler {
             // 主动下发，路由表的权威方向反过来了——这里保留枚举位号兼容旧客户端，但不再读取。
             log.debug("HTTP_ROUTES_REPORT ignored on channel {} (server is now authoritative)",
                     ctx.channel().id().asLongText());
-        } else if (register) {
-            switch (type) {
-                case DISCONNECTED -> processDisconnected(natMessagePacket);
-                case DATA -> processData(natMessagePacket);
-                default -> log.info("unknown type : {}", type);
+        } else if (type == NatMessageType.DATA) {
+            // WebSocket 流（source="ws" 或 channelId 命中 WS 注册表）不依赖 TCP REGISTER，
+            // 单独放行；否则要求客户端已 REGISTER 至少一条 TCP 隧道。
+            String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+            if (channelId != null && webSocketStreamRegistry.get(channelId) != null) {
+                processWsData(natMessagePacket);
+            } else if (register) {
+                processData(natMessagePacket);
+            } else {
+                log.warn("Dropping DATA before REGISTER on channel {}", ctx.channel().id().asLongText());
+                DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
+                ctx.close();
+            }
+        } else if (type == NatMessageType.DISCONNECTED) {
+            String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+            if (channelId != null && webSocketStreamRegistry.get(channelId) != null) {
+                processWsDisconnected(natMessagePacket);
+            } else if (register) {
+                processDisconnected(natMessagePacket);
+            } else {
+                log.warn("Dropping DISCONNECTED before REGISTER on channel {}", ctx.channel().id().asLongText());
+                DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
+                ctx.close();
             }
         } else {
-            // DATA / DISCONNECTED before any REGISTER — close to drop a misbehaving client.
-            log.warn("Dropping {} before REGISTER on channel {}", type, ctx.channel().id().asLongText());
-            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
-            ctx.close();
+            log.info("unknown type : {}", type);
         }
+    }
+
+    private void processWsData(NatMessagePacket natMessagePacket) {
+        byte[] data = natMessagePacket.getData();
+        if (data == null || data.length == 0) {
+            log.warn("WS DATA frame with no payload from {}", clientName);
+            return;
+        }
+        String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+        if (channelId == null) {
+            return;
+        }
+        // 流量记账：WS 流没有 listenPort，沿用 HTTP 直转的 route 维度，按 0 端口计入 TCP 计量。
+        // 后续若要单独 WS 计量，可在这里扩展。
+        trafficUsageService.recordTcpUpload(clientName, 0, data.length);
+        webSocketTunnelHandler.writeFrame(channelId, data);
+    }
+
+    private void processWsDisconnected(NatMessagePacket natMessagePacket) {
+        String channelId = asString(natMessagePacket.getMetaData(), "channelId");
+        if (channelId == null) {
+            return;
+        }
+        webSocketTunnelHandler.closeFromClient(channelId);
     }
 
     private void processData(NatMessagePacket natMessagePacket) {
@@ -109,7 +160,12 @@ public class NatServerHandler extends NatCommonHandler {
         int listenPort = externalChannelPorts.getOrDefault(channelId, 0);
         trafficUsageService.recordTcpUpload(clientName, listenPort, data.length);
         trafficInspectionService.recordTcpFrame(clientName, listenPort, channelId,
-                TrafficInspectionService.DIRECTION_CLIENT_TO_PUBLIC, remoteAddress(target), data);
+                TrafficInspectionService.DIRECTION_CLIENT_TO_PUBLIC,
+                endpointAddress(target.localAddress()),
+                endpointPort(target.localAddress()),
+                endpointAddress(target.remoteAddress()),
+                endpointPort(target.remoteAddress()),
+                data);
         target.writeAndFlush(data).addListener(future -> {
             if (!future.isSuccess()) {
                 log.warn("write DATA to external channel {} failed [{}]",
@@ -258,6 +314,10 @@ public class NatServerHandler extends NatCommonHandler {
         remoteConnectionServerMap.clear();
         externalChannels.values().forEach(Channel::close);
         externalChannelPorts.clear();
+        // 客户端控制连接断开：关闭所有挂起的浏览器 WS 会话，避免浏览器侧永久挂起
+        if (clientName != null) {
+            webSocketTunnelHandler.onControlChannelInactive(clientName);
+        }
     }
 
     @Override
@@ -383,7 +443,16 @@ public class NatServerHandler extends NatCommonHandler {
         return null;
     }
 
-    private static String remoteAddress(Channel channel) {
-        return channel.remoteAddress() == null ? null : channel.remoteAddress().toString();
+    private static String endpointAddress(SocketAddress address) {
+        if (address instanceof InetSocketAddress socketAddress) {
+            return socketAddress.getAddress() == null
+                    ? socketAddress.getHostString()
+                    : socketAddress.getAddress().getHostAddress();
+        }
+        return address == null ? null : address.toString();
+    }
+
+    private static Integer endpointPort(SocketAddress address) {
+        return address instanceof InetSocketAddress socketAddress ? socketAddress.getPort() : null;
     }
 }

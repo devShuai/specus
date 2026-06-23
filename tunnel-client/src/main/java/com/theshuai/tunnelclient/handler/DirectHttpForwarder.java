@@ -26,7 +26,8 @@ import java.util.Set;
 @Slf4j
 public final class DirectHttpForwarder {
     private static final int MAX_REQUEST_BODY_SIZE = 16 * 1024 * 1024;
-    private static final int MAX_RESPONSE_BODY_SIZE = 16 * 1024 * 1024;
+    private static final int MAX_RESPONSE_BODY_SIZE = 64 * 1024 * 1024;
+    private static final long MAX_RANGE_BYTES = 8L * 1024 * 1024;
     private static final Timeout CONNECTION_REQUEST_TIMEOUT = Timeout.ofSeconds(5);
     private static final Timeout CONNECT_TIMEOUT = Timeout.ofSeconds(5);
     private static final Timeout RESPONSE_TIMEOUT = Timeout.ofSeconds(20);
@@ -67,7 +68,21 @@ public final class DirectHttpForwarder {
                     .setResponseTimeout(RESPONSE_TIMEOUT)
                     .setRedirectsEnabled(false)
                     .build());
-            copyHeaders(packet.getHeaders(), request::addHeader);
+            String originalRange = firstHeader(packet.getHeaders(), "range");
+            String boundedRange = boundedRange(originalRange);
+            copyHeaders(packet.getHeaders(), (name, value) -> {
+                if (boundedRange != null && "range".equalsIgnoreCase(name)) {
+                    return;
+                }
+                request.addHeader(name, value);
+            });
+            if (boundedRange != null) {
+                request.setHeader("Range", boundedRange);
+                if (originalRange != null && !originalRange.trim().equalsIgnoreCase(boundedRange)) {
+                    log.info("[http-direct][client->upstream] requestId={} range bounded: {} -> {}",
+                            packet.getRequestId(), originalRange.trim(), boundedRange);
+                }
+            }
             if (packet.getBody() != null && packet.getBody().length > 0) {
                 request.setEntity(new ByteArrayEntity(packet.getBody(), null));
             }
@@ -178,6 +193,76 @@ public final class DirectHttpForwarder {
                 }
             }
         }
+    }
+
+    private static String firstHeader(List<String> headers, String headerName) {
+        if (headers == null || headerName == null) {
+            return null;
+        }
+        for (String header : headers) {
+            int separator = header.indexOf(':');
+            if (separator > 0 && headerName.equalsIgnoreCase(header.substring(0, separator))) {
+                return header.substring(separator + 1);
+            }
+        }
+        return null;
+    }
+
+    static String boundedRange(String rangeHeader) {
+        if (rangeHeader == null) {
+            return null;
+        }
+        String value = rangeHeader.trim();
+        if (!value.regionMatches(true, 0, "bytes=", 0, "bytes=".length())) {
+            return null;
+        }
+        String spec = value.substring("bytes=".length()).trim();
+        if (spec.isEmpty() || spec.contains(",")) {
+            return null;
+        }
+        int dash = spec.indexOf('-');
+        if (dash < 0) {
+            return null;
+        }
+
+        String startPart = spec.substring(0, dash).trim();
+        String endPart = spec.substring(dash + 1).trim();
+        try {
+            if (startPart.isEmpty()) {
+                if (endPart.isEmpty()) {
+                    return null;
+                }
+                long suffixLength = Long.parseLong(endPart);
+                if (suffixLength <= 0) {
+                    return null;
+                }
+                return "bytes=-" + Math.min(suffixLength, MAX_RANGE_BYTES);
+            }
+
+            long start = Long.parseLong(startPart);
+            if (start < 0) {
+                return null;
+            }
+            long maxEnd = boundedEnd(start);
+            if (endPart.isEmpty()) {
+                return "bytes=" + start + "-" + maxEnd;
+            }
+            long end = Long.parseLong(endPart);
+            if (end < start) {
+                return null;
+            }
+            return "bytes=" + start + "-" + Math.min(end, maxEnd);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static long boundedEnd(long start) {
+        long delta = MAX_RANGE_BYTES - 1;
+        if (Long.MAX_VALUE - start < delta) {
+            return Long.MAX_VALUE;
+        }
+        return start + delta;
     }
 
     private static boolean shouldForward(String name) {

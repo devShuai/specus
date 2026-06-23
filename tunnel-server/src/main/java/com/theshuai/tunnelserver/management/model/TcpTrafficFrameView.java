@@ -1,7 +1,7 @@
 package com.theshuai.tunnelserver.management.model;
 
 public record TcpTrafficFrameView(
-        long id,
+        String id,
         long clientId,
         String clientName,
         int listenPort,
@@ -10,7 +10,15 @@ public record TcpTrafficFrameView(
         String channelId,
         String direction,
         String remoteAddress,
+        String sourceAddress,
+        Integer sourcePort,
+        String destinationAddress,
+        Integer destinationPort,
+        long streamOffset,
+        long streamEndOffset,
+        long frameIndex,
         long payloadBytes,
+        String payloadBase64,
         String payloadPreviewHex,
         String payloadPreviewText,
         boolean truncated,
