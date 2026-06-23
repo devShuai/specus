@@ -1,0 +1,8 @@
+{
+  "serverBaseUrl": "http://127.0.0.1:8088",
+  "apiKey": "YOUR_CLIENT_API_KEY",
+  "secret": "YOUR_CLIENT_SECRET",
+  "peerMeshDevice": "noop",
+  "peerMeshTunName": "shuai0",
+  "peerMeshMtu": 1400
+}

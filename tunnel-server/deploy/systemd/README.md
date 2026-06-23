@@ -112,7 +112,34 @@ TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS=28800
 TUNNEL_PUBLIC_ADDRESS=tunnel.example.com
 ```
 
-### 4.5 HTTP 直转与流量明细（可选）
+### 4.5 私有组网 / Peer Mesh（可选，默认关闭）
+
+Peer Mesh 用于让同一租户 / 同一用户下多个客户端组成私有组网。开启后，server 仍只负责身份、ACL、虚拟 IP、信令和 relay；客户端优先走 LAN / UDP 直连，失败时自动走 server 内置 relay。
+
+```env
+TUNNEL_PEER_MESH_ENABLED=false
+TUNNEL_PEER_MESH_CIDR=100.96.0.0/11
+TUNNEL_PEER_MESH_PUBLIC_ADDRESS=tunnel.example.com
+TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
+TUNNEL_PEER_MESH_SESSION_TTL_SECONDS=3600
+TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
+```
+
+启用后需要额外放行 UDP：
+
+```bash
+sudo firewall-cmd --add-port=3478/udp --permanent
+sudo firewall-cmd --reload
+```
+
+客户端侧默认 `peerMeshDevice=noop`，只运行控制面、候选交换、探测和加密 UDP 数据面；要真正接管虚拟 IP 流量，需要启用虚拟网卡：
+
+* Linux：`peerMeshDevice=linux-tun` 或 `auto`，进程需要 root 或 `CAP_NET_ADMIN`，系统需要 `/dev/net/tun` 和 `ip` 命令。
+* Windows：`peerMeshDevice=windows-wintun` 或 `auto`，需要管理员权限，并把 `wintun.dll` 放在工作目录 / PATH，或通过 `-Dshuai.peerMesh.wintunDll=完整路径` 指定。
+
+更多验证步骤见仓库内 `docs/peer-mesh-implementation.md`。
+
+### 4.6 HTTP 直转与流量明细（可选）
 
 ```env
 TUNNEL_HTTP_TIMEOUT_MS=30000
@@ -128,7 +155,7 @@ TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS=2000
 
 HTTP / TCP 明细默认写入业务数据库；管理页会分页读取 HTTP 请求/响应和 TCP payload。`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` 是总开关，每条 HTTP 路由 / TCP 映射仍需在管理页单独开启明细采集，新建通道默认关闭。HTTP Body 入库前会按 `Content-Encoding` 解压 `gzip`、`deflate`、`br`，前端也会对旧记录做 best-effort 兜底。
 
-### 4.6 Elasticsearch 流量明细存储（可选）
+### 4.7 Elasticsearch 流量明细存储（可选）
 
 配置 `TUNNEL_ELASTICSEARCH_URIS` 后，HTTP / TCP 明细会从业务数据库切换到 Elasticsearch，聚合流量和管理业务数据仍在 MySQL。
 
