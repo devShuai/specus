@@ -17,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 @Service
@@ -49,6 +50,10 @@ public class PeerSignalService {
         }
         if (PeerControlMessage.TYPE_TRAFFIC_REPORT.equals(signal.getType())) {
             peerMeshService.reportTraffic(source, signal);
+            return;
+        }
+        if (PeerControlMessage.TYPE_DEVICE_REPORT.equals(signal.getType())) {
+            peerMeshService.reportDevice(source, signal);
             return;
         }
         if (PeerControlMessage.TYPE_CLOSE.equals(signal.getType())) {
@@ -107,6 +112,19 @@ public class PeerSignalService {
 
     public PeerMeshSessionView forceClose(ManagementContext context, long sessionId) {
         PeerMeshSessionView closed = peerMeshService.closeSession(context, sessionId);
+        sendClose(closed);
+        return closed;
+    }
+
+    public List<PeerMeshSessionView> forceCloseOpenSessions(ManagementContext context) {
+        List<PeerMeshSessionView> closedSessions = peerMeshService.closeOpenSessions(context);
+        for (PeerMeshSessionView closed : closedSessions) {
+            sendClose(closed);
+        }
+        return closedSessions;
+    }
+
+    private void sendClose(PeerMeshSessionView closed) {
         PeerControlMessage close = new PeerControlMessage();
         close.setType(PeerControlMessage.TYPE_CLOSE);
         close.setSessionId(closed.id());
@@ -119,7 +137,6 @@ public class PeerSignalService {
         close.setCreatedAtMillis(System.currentTimeMillis());
         sendCloseIfOnline(closed.sourceClientName(), close);
         sendCloseIfOnline(closed.targetClientName(), close);
-        return closed;
     }
 
     private PeerControlMessage parseSignal(String raw) {

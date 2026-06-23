@@ -12,6 +12,7 @@ public class PeerControlMessage {
     public static final String TYPE_CANDIDATES = "candidates";
     public static final String TYPE_PATH_REPORT = "path-report";
     public static final String TYPE_TRAFFIC_REPORT = "traffic-report";
+    public static final String TYPE_DEVICE_REPORT = "device-report";
     public static final String TYPE_CLOSE = "close";
 
     private String type;
@@ -30,6 +31,12 @@ public class PeerControlMessage {
     private String localEndpoint;
     private String remoteEndpoint;
     private String reason;
+    private String virtualDeviceMode;
+    private String virtualDeviceName;
+    private String virtualDeviceStatus;
+    private String virtualDeviceError;
+    private String natType;
+    private String lastEndpoint;
     private long createdAtMillis;
     private List<PeerCandidate> candidates = new ArrayList<>();
     private List<?> peers = new ArrayList<>();

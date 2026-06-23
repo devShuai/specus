@@ -247,6 +247,46 @@ public class PeerMeshService {
     }
 
     @Transactional
+    public PeerMeshDeviceView reportDevice(ClientAccount reporter, PeerControlMessage report) {
+        PeerMeshDevice device = deviceRepository.findByTenantIdAndClientId(reporter.getTenantId(), reporter.getId())
+                .orElseGet(() -> createDevice(reporter));
+        Instant now = Instant.now();
+        device.setClientName(reporter.getClientName());
+        device.setOwnerUsername(normalizeOwner(reporter.getOwnerUsername()));
+        if (hasVirtualDeviceReport(report)) {
+            if (report.getVirtualDeviceMode() != null) {
+                device.setVirtualDeviceMode(limit(report.getVirtualDeviceMode(), 80));
+            }
+            if (report.getVirtualDeviceName() != null) {
+                device.setVirtualDeviceName(limit(report.getVirtualDeviceName(), 80));
+            }
+            if (report.getVirtualDeviceStatus() != null) {
+                device.setVirtualDeviceStatus(limit(report.getVirtualDeviceStatus(), 80));
+            }
+            if (report.getVirtualDeviceError() != null) {
+                device.setVirtualDeviceError(limit(report.getVirtualDeviceError(), 512));
+            }
+            device.setVirtualDeviceUpdatedAt(now.toString());
+        }
+        if (report.getNatType() != null) {
+            device.setNatType(limit(report.getNatType(), 80));
+        }
+        if (report.getLastEndpoint() != null) {
+            device.setLastEndpoint(limit(report.getLastEndpoint(), 255));
+        }
+        device.setLastSeenAt(now.toString());
+        device.setUpdatedAt(now.toString());
+        return toDeviceView(deviceRepository.save(device));
+    }
+
+    private boolean hasVirtualDeviceReport(PeerControlMessage report) {
+        return report.getVirtualDeviceMode() != null
+                || report.getVirtualDeviceName() != null
+                || report.getVirtualDeviceStatus() != null
+                || report.getVirtualDeviceError() != null;
+    }
+
+    @Transactional
     public void recordRelayTraffic(long sessionId, long bytes) {
         if (sessionId <= 0 || bytes <= 0) {
             return;
@@ -288,6 +328,30 @@ public class PeerMeshService {
     }
 
     @Transactional
+    public List<PeerMeshSessionView> closeOpenSessions(ManagementContext context) {
+        Instant now = Instant.now();
+        List<PeerMeshSession> sessions;
+        if (context.isAdmin()) {
+            sessions = sessionRepository.findByTenantIdAndStatusNotOrderByUpdatedAtDesc(
+                    context.tenant().tenantId(), STATUS_CLOSED);
+        } else {
+            List<Long> visible = visibleClientIds(context);
+            if (visible.isEmpty()) {
+                return List.of();
+            }
+            sessions = sessionRepository.findVisibleOpen(
+                    context.tenant().tenantId(), visible, STATUS_CLOSED);
+        }
+        for (PeerMeshSession session : sessions) {
+            markClosed(session, now);
+        }
+        if (!sessions.isEmpty()) {
+            sessionRepository.saveAll(sessions);
+        }
+        return sessions.stream().map(this::toSessionView).toList();
+    }
+
+    @Transactional
     public List<PeerMeshSessionView> listSessions(ManagementContext context, int limit) {
         expireStaleSessionsBatch(Instant.now(), 500);
         int pageSize = Math.clamp(limit, 1, 200);
@@ -296,11 +360,7 @@ public class PeerMeshService {
             sessions = sessionRepository.findByTenantIdOrderByUpdatedAtDesc(
                     context.tenant().tenantId(), PageRequest.of(0, pageSize));
         } else {
-            List<Long> visible = clientAccountRepository
-                    .findByTenantIdAndOwnerUsernameOrderByIdDesc(context.tenant().tenantId(), context.username())
-                    .stream()
-                    .map(ClientAccount::getId)
-                    .toList();
+            List<Long> visible = visibleClientIds(context);
             if (visible.isEmpty()) {
                 return List.of();
             }
@@ -308,6 +368,14 @@ public class PeerMeshService {
                     context.tenant().tenantId(), visible, PageRequest.of(0, pageSize));
         }
         return sessions.stream().map(this::toSessionView).toList();
+    }
+
+    private List<Long> visibleClientIds(ManagementContext context) {
+        return clientAccountRepository
+                .findByTenantIdAndOwnerUsernameOrderByIdDesc(context.tenant().tenantId(), context.username())
+                .stream()
+                .map(ClientAccount::getId)
+                .toList();
     }
 
     @Scheduled(fixedDelayString = "${tunnel.peer-mesh.session-cleanup-interval-ms:60000}")
@@ -408,6 +476,11 @@ public class PeerMeshService {
                 device.getPublicKey(),
                 device.getNatType(),
                 device.getLastEndpoint(),
+                device.getVirtualDeviceMode(),
+                device.getVirtualDeviceName(),
+                device.getVirtualDeviceStatus(),
+                device.getVirtualDeviceError(),
+                device.getVirtualDeviceUpdatedAt(),
                 device.getLastSeenAt(),
                 device.getUpdatedAt()
         );

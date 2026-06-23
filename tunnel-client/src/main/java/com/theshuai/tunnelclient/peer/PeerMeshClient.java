@@ -28,6 +28,7 @@ import java.util.Enumeration;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -40,6 +41,7 @@ public class PeerMeshClient implements AutoCloseable {
     private final Map<Long, PeerInfo> peers = new ConcurrentHashMap<>();
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, PendingProbe> pendingProbes = new ConcurrentHashMap<>();
+    private final Map<String, NatProbeObservation> natProbeObservations = new ConcurrentHashMap<>();
     private final SecureRandom secureRandom = new SecureRandom();
     private final ControlSender controlSender;
     private final PeerKeyStore.KeyMaterial keyMaterial;
@@ -52,13 +54,18 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile String virtualDeviceKey = "noop";
     private volatile PeerCandidate serverReflexiveCandidate;
     private volatile PeerCandidate relayCandidate;
+    private volatile String natType = "";
+    private volatile String lastEndpoint = "";
     private volatile String relayAllocationId;
     private volatile long relayAllocationExpiresAtMillis;
     private volatile long lastRelayCandidateRequestMillis;
+    private volatile long lastAlternateNatProbeRequestMillis;
     private volatile ScheduledExecutorService maintenanceExecutor;
     private static final long SESSION_REFRESH_WINDOW_MILLIS = 120_000;
     private static final long DIRECT_STALE_MILLIS = 45_000;
     private static final long PENDING_PROBE_TTL_MILLIS = 15_000;
+    private static final long NAT_PROBE_STALE_MILLIS = 120_000;
+    private static final long ALTERNATE_NAT_PROBE_MIN_INTERVAL_MILLIS = 15_000;
 
     public PeerMeshClient(ClientAuthLoginResponse.PeerMeshConfig config, ControlSender controlSender) {
         this(config, controlSender, new PeerVirtualDeviceOptions("noop", "shuai0", 1400));
@@ -85,11 +92,15 @@ public class PeerMeshClient implements AutoCloseable {
             peers.clear();
             sessions.clear();
             pendingProbes.clear();
+            natProbeObservations.clear();
             serverReflexiveCandidate = null;
             relayCandidate = null;
+            natType = "";
+            lastEndpoint = "";
             relayAllocationId = null;
             relayAllocationExpiresAtMillis = 0;
             lastRelayCandidateRequestMillis = 0;
+            lastAlternateNatProbeRequestMillis = 0;
             stopMaintenance();
             stopUdpSocket();
             closeVirtualDevice();
@@ -99,7 +110,7 @@ public class PeerMeshClient implements AutoCloseable {
         startUdpSocket();
         startMaintenance();
         requestPeerServerCandidates();
-        ensureVirtualDevice(nextConfig).start(this::sendVirtualPacket);
+        PeerVirtualDevice activeDevice = startVirtualDevice(nextConfig);
         log.info("Peer mesh 已启用: client={}, virtualIp={}, cidr={}, stun={}:{}, turn={}:{}",
                 nextConfig.getClientName(),
                 nextConfig.getVirtualIp(),
@@ -108,8 +119,9 @@ public class PeerMeshClient implements AutoCloseable {
                 nextConfig.getStunPort(),
                 nextConfig.getTurnHost(),
                 nextConfig.getTurnPort());
-        log.info("Peer mesh UDP 探测端口: {}，加密 frame 数据面已就绪，等待 TUN/Wintun 适配接入",
-                udpSocket == null ? "-" : udpSocket.getLocalPort());
+        log.info("Peer mesh UDP 探测端口: {}，虚拟网卡适配: {}",
+                udpSocket == null ? "-" : udpSocket.getLocalPort(),
+                activeDevice.name());
         announceCandidatesToOnlinePeers();
     }
 
@@ -172,6 +184,7 @@ public class PeerMeshClient implements AutoCloseable {
         peers.clear();
         sessions.clear();
         pendingProbes.clear();
+        natProbeObservations.clear();
         stopMaintenance();
         stopUdpSocket();
         closeVirtualDevice();
@@ -323,6 +336,7 @@ public class PeerMeshClient implements AutoCloseable {
         lastRelayCandidateRequestMillis = now;
         PeerRelayMessage binding = new PeerRelayMessage();
         binding.setType(PeerRelayMessage.TYPE_BINDING);
+        binding.setProbeRole(PeerRelayMessage.PROBE_PRIMARY);
         binding.setTransactionId(UUID.randomUUID().toString());
         sendRelayControl(binding, relayEndpoint);
 
@@ -541,6 +555,183 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
+    private synchronized PeerVirtualDevice startVirtualDevice(ClientAuthLoginResponse.PeerMeshConfig nextConfig) {
+        String desiredKey = PeerVirtualDevices.key(virtualDeviceOptions, nextConfig);
+        PeerVirtualDevice next = ensureVirtualDevice(nextConfig);
+        try {
+            next.start(this::sendVirtualPacket);
+            reportVirtualDevice(next, deviceStatus(next), null);
+            return next;
+        } catch (Exception e) {
+            log.warn("Peer mesh 虚拟网卡启动失败，回退 noop: {}", e.getMessage());
+            closeVirtualDevice();
+            PeerVirtualDevice fallback = new NoopPeerVirtualDevice();
+            virtualDevice = fallback;
+            virtualDeviceKey = "fallback|" + desiredKey;
+            fallback.start(this::sendVirtualPacket);
+            reportVirtualDevice(fallback, "FAILED_FALLBACK_NOOP", e.getMessage());
+            return fallback;
+        }
+    }
+
+    private void reportVirtualDevice(PeerVirtualDevice device, String status, String error) {
+        if (!running || controlSender == null) {
+            return;
+        }
+        PeerControlMessage report = new PeerControlMessage();
+        report.setType(PeerControlMessage.TYPE_DEVICE_REPORT);
+        report.setVirtualDeviceMode(virtualDeviceOptions.mode());
+        report.setVirtualDeviceName(device == null ? "" : device.name());
+        report.setVirtualDeviceStatus(status);
+        report.setVirtualDeviceError(limit(error, 512));
+        report.setNatType(natType);
+        report.setLastEndpoint(lastEndpoint);
+        report.setCreatedAtMillis(System.currentTimeMillis());
+        try {
+            controlSender.send(null, JsonUtil.objectToString(report));
+        } catch (Exception e) {
+            log.debug("Peer mesh 虚拟网卡状态上报失败: {}", e.getMessage());
+        }
+    }
+
+    private void recordNatObservation(PeerRelayMessage message, InetSocketAddress observedRemote) {
+        if (message == null || !StringUtils.hasText(message.getMappedAddress()) || message.getMappedPort() <= 0) {
+            return;
+        }
+        String role = normalizeProbeRole(message.getProbeRole());
+        NatProbeObservation observation = new NatProbeObservation(
+                role,
+                message.getMappedAddress(),
+                message.getMappedPort(),
+                observedRemote == null || observedRemote.getAddress() == null
+                        ? ""
+                        : observedRemote.getAddress().getHostAddress() + ":" + observedRemote.getPort(),
+                System.currentTimeMillis()
+        );
+        natProbeObservations.put(role, observation);
+        NatProbeResult result = classifyNat();
+        reportNatObservation(result.natType(), result.endpoint());
+    }
+
+    private void reportNatObservation(String observedNatType, String endpoint) {
+        if (!StringUtils.hasText(observedNatType) || !StringUtils.hasText(endpoint)) {
+            return;
+        }
+        if (observedNatType.equals(natType) && endpoint.equals(lastEndpoint)) {
+            return;
+        }
+        natType = observedNatType;
+        lastEndpoint = endpoint;
+        log.info("Peer mesh NAT 探测结果: type={}, mapped={}", observedNatType, endpoint);
+        if (!running || controlSender == null) {
+            return;
+        }
+        PeerControlMessage report = new PeerControlMessage();
+        report.setType(PeerControlMessage.TYPE_DEVICE_REPORT);
+        report.setNatType(observedNatType);
+        report.setLastEndpoint(endpoint);
+        report.setCreatedAtMillis(System.currentTimeMillis());
+        try {
+            controlSender.send(null, JsonUtil.objectToString(report));
+        } catch (Exception e) {
+            log.debug("Peer mesh NAT 状态上报失败: {}", e.getMessage());
+        }
+    }
+
+    private NatProbeResult classifyNat() {
+        long now = System.currentTimeMillis();
+        NatProbeObservation primary = freshObservation(PeerRelayMessage.PROBE_PRIMARY, now);
+        NatProbeObservation alternate = freshObservation(PeerRelayMessage.PROBE_ALTERNATE, now);
+        NatProbeObservation changedPort = freshObservation(PeerRelayMessage.PROBE_CHANGED_PORT, now);
+        NatProbeObservation base = primary == null
+                ? (alternate == null ? changedPort : alternate)
+                : primary;
+        if (base == null) {
+            return new NatProbeResult("", "");
+        }
+        if (isNoNat(base)) {
+            return new NatProbeResult("NO_NAT", base.mappedEndpoint());
+        }
+        if (primary != null && alternate != null) {
+            if (!primary.sameMappedEndpoint(alternate)) {
+                return new NatProbeResult("SYMMETRIC_NAT", primary.mappedEndpoint());
+            }
+            if (changedPort != null) {
+                return new NatProbeResult("FULL_CONE_OR_RESTRICTED_NAT", primary.mappedEndpoint());
+            }
+            return new NatProbeResult("PORT_RESTRICTED_NAT", primary.mappedEndpoint());
+        }
+        if (primary != null && changedPort != null) {
+            return new NatProbeResult("FULL_CONE_OR_RESTRICTED_NAT", primary.mappedEndpoint());
+        }
+        return new NatProbeResult(isPortPreserved(base) ? "PORT_PRESERVED_NAT" : "NAT", base.mappedEndpoint());
+    }
+
+    private NatProbeObservation freshObservation(String role, long now) {
+        NatProbeObservation observation = natProbeObservations.get(role);
+        if (observation == null || now - observation.observedAtMillis() > NAT_PROBE_STALE_MILLIS) {
+            return null;
+        }
+        return observation;
+    }
+
+    private boolean isNoNat(NatProbeObservation observation) {
+        return isPortPreserved(observation) && isLocalAddress(observation.mappedAddress());
+    }
+
+    private boolean isPortPreserved(NatProbeObservation observation) {
+        DatagramSocket socket = udpSocket;
+        int localPort = socket == null || socket.isClosed() ? -1 : socket.getLocalPort();
+        return localPort > 0 && observation.mappedPort() == localPort;
+    }
+
+    private String normalizeProbeRole(String role) {
+        if (PeerRelayMessage.PROBE_ALTERNATE.equals(role)
+                || PeerRelayMessage.PROBE_CHANGED_PORT.equals(role)) {
+            return role;
+        }
+        return PeerRelayMessage.PROBE_PRIMARY;
+    }
+
+    private boolean isLocalAddress(String mappedAddress) {
+        if (!StringUtils.hasText(mappedAddress)) {
+            return false;
+        }
+        try {
+            InetAddress mapped = InetAddress.getByName(mappedAddress);
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface networkInterface = interfaces.nextElement();
+                if (!networkInterface.isUp()) {
+                    continue;
+                }
+                Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    if (mapped.equals(addresses.nextElement())) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Peer mesh NAT 本地地址匹配失败: {}", e.getMessage());
+        }
+        return false;
+    }
+
+    private String deviceStatus(PeerVirtualDevice device) {
+        if (device instanceof NoopPeerVirtualDevice) {
+            return "NOOP";
+        }
+        return "ACTIVE";
+    }
+
+    private String limit(String value, int max) {
+        if (!StringUtils.hasText(value)) {
+            return "";
+        }
+        return value.length() <= max ? value : value.substring(0, max);
+    }
+
     private synchronized void closeVirtualDevice() {
         PeerVirtualDevice current = virtualDevice;
         virtualDevice = null;
@@ -591,6 +782,8 @@ public class PeerMeshClient implements AutoCloseable {
         switch (message.getType()) {
             case PeerRelayMessage.TYPE_BINDING_RESPONSE -> {
                 if (StringUtils.hasText(message.getMappedAddress()) && message.getMappedPort() > 0) {
+                    recordNatObservation(message, observedRemote);
+                    requestAlternateNatProbe(message, observedRemote);
                     PeerCandidate candidate = new PeerCandidate();
                     candidate.setType("srflx");
                     candidate.setTransport("udp");
@@ -628,6 +821,38 @@ public class PeerMeshClient implements AutoCloseable {
             case PeerRelayMessage.TYPE_ERROR -> log.debug("Peer mesh relay error: {}", message.getError());
             default -> log.trace("Peer mesh relay message ignored: type={}", message.getType());
         }
+    }
+
+    private void requestAlternateNatProbe(PeerRelayMessage response, InetSocketAddress observedRemote) {
+        if (!PeerRelayMessage.PROBE_PRIMARY.equals(normalizeProbeRole(response.getProbeRole()))
+                || response.getAlternatePort() <= 0
+                || observedRemote == null
+                || observedRemote.getAddress() == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastAlternateNatProbeRequestMillis < ALTERNATE_NAT_PROBE_MIN_INTERVAL_MILLIS) {
+            return;
+        }
+        String alternateAddress = response.getAlternateAddress();
+        if (!StringUtils.hasText(alternateAddress) || isUnspecifiedAddress(alternateAddress)) {
+            alternateAddress = observedRemote.getAddress().getHostAddress();
+        }
+        if (!StringUtils.hasText(alternateAddress) || response.getAlternatePort() == observedRemote.getPort()) {
+            return;
+        }
+        lastAlternateNatProbeRequestMillis = now;
+        PeerRelayMessage binding = new PeerRelayMessage();
+        binding.setType(PeerRelayMessage.TYPE_BINDING);
+        binding.setProbeRole(PeerRelayMessage.PROBE_ALTERNATE);
+        binding.setTransactionId(UUID.randomUUID().toString());
+        sendRelayControl(binding, new InetSocketAddress(alternateAddress, response.getAlternatePort()));
+    }
+
+    private boolean isUnspecifiedAddress(String address) {
+        return "0.0.0.0".equals(address)
+                || "::".equals(address)
+                || "0:0:0:0:0:0:0:0".equals(address);
     }
 
     private void handleUdpPayload(byte[] payload, InetSocketAddress observedRemote, String relayFromAllocationId) {
@@ -1112,5 +1337,24 @@ public class PeerMeshClient implements AutoCloseable {
                                 InetSocketAddress remote,
                                 boolean relay,
                                 String relayId) {
+    }
+
+    private record NatProbeObservation(String role,
+                                       String mappedAddress,
+                                       int mappedPort,
+                                       String serverEndpoint,
+                                       long observedAtMillis) {
+        String mappedEndpoint() {
+            return mappedAddress + ":" + mappedPort;
+        }
+
+        boolean sameMappedEndpoint(NatProbeObservation other) {
+            return other != null
+                    && mappedPort == other.mappedPort
+                    && Objects.equals(mappedAddress, other.mappedAddress);
+        }
+    }
+
+    private record NatProbeResult(String natType, String endpoint) {
     }
 }

@@ -82,4 +82,9 @@ public class PeerMeshResource {
     public PeerMeshSessionView closeSession(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
         return peerSignalService.forceClose(contextResolver.resolve(jwt), id);
     }
+
+    @DeleteMapping("/sessions")
+    public List<PeerMeshSessionView> closeOpenSessions(@AuthenticationPrincipal Jwt jwt) {
+        return peerSignalService.forceCloseOpenSessions(contextResolver.resolve(jwt));
+    }
 }

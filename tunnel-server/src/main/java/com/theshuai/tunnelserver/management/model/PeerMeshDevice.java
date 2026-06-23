@@ -52,6 +52,21 @@ public class PeerMeshDevice {
     @Column(name = "last_endpoint", length = 255)
     private String lastEndpoint;
 
+    @Column(name = "virtual_device_mode", length = 80)
+    private String virtualDeviceMode;
+
+    @Column(name = "virtual_device_name", length = 80)
+    private String virtualDeviceName;
+
+    @Column(name = "virtual_device_status", length = 80)
+    private String virtualDeviceStatus;
+
+    @Column(name = "virtual_device_error", length = 512)
+    private String virtualDeviceError;
+
+    @Column(name = "virtual_device_updated_at", length = 40)
+    private String virtualDeviceUpdatedAt;
+
     @Column(nullable = false)
     private boolean enabled = false;
 

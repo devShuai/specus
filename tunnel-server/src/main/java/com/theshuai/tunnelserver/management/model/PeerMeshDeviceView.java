@@ -12,6 +12,11 @@ public record PeerMeshDeviceView(
         String publicKey,
         String natType,
         String lastEndpoint,
+        String virtualDeviceMode,
+        String virtualDeviceName,
+        String virtualDeviceStatus,
+        String virtualDeviceError,
+        String virtualDeviceUpdatedAt,
         String lastSeenAt,
         String updatedAt
 ) {
