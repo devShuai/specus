@@ -4,7 +4,8 @@ public enum MessageType {
     SERVER_TO_CLIENT(0),
     CLIENT_TO_SERVER(1),
     CLIENT_TO_CLIENT(2),
-    NAT_CONTROL(3);
+    NAT_CONTROL(3),
+    PEER_CONTROL(4);
 
     private int value;
 

@@ -5,6 +5,7 @@ import com.theshuai.common.protocol.Packet;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -17,14 +18,13 @@ import static com.theshuai.common.command.Command.MESSAGE_REQUEST;
  * {@link LogoutRequestHandler}。NAT 消息由独立的 {@code NatServerHandler} 处理，这里直接放过。
  */
 @ChannelHandler.Sharable
+@Component
 public class ServerMessageHandler extends SimpleChannelInboundHandler<Packet> {
-    public static final ServerMessageHandler INSTANCE = new ServerMessageHandler();
-
     private final Map<Byte, SimpleChannelInboundHandler<? extends Packet>> handlerMap;
 
-    private ServerMessageHandler() {
+    public ServerMessageHandler(MessageRequestHandler messageRequestHandler) {
         handlerMap = new HashMap<>();
-        handlerMap.put(MESSAGE_REQUEST, MessageRequestHandler.INSTANCE);
+        handlerMap.put(MESSAGE_REQUEST, messageRequestHandler);
         handlerMap.put(LOGOUT_REQUEST, LogoutRequestHandler.INSTANCE);
     }
 

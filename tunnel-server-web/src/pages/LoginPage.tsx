@@ -4,6 +4,8 @@ import { useAuth } from "../auth/AuthContext";
 import { notifyError } from "../components/toast";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { AppLogo } from "../components/AppLogo";
+import { fetchPublicClientDownloads } from "../api/client";
+import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 
 const metrics = [
   { value: "TCP", label: "公网端口映射" },
@@ -278,10 +280,116 @@ export function LoginPage() {
               </Card>
             ))}
           </div>
+
+          <ClientDownloadsSection />
         </div>
       </section>
     </main>
   );
+}
+
+const IMPL_LABELS: Record<ClientImplementation, string> = {
+  java: "Java 客户端",
+  go: "Go 客户端",
+  csharp: ".NET 客户端",
+};
+
+const IMPL_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
+
+function ClientDownloadsSection() {
+  const [links, setLinks] = useState<ClientDownloadLink[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const data = await fetchPublicClientDownloads();
+      if (!cancelled) {
+        setLinks(data);
+        setLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 未加载完不渲染；加载完无数据也不渲染，避免空白 section 干扰未登录用户
+  if (!loaded || links.length === 0) {
+    return null;
+  }
+
+  const grouped = IMPL_ORDER
+    .map((impl) => ({ implementation: impl, items: links.filter((l) => l.implementation === impl) }))
+    .filter((g) => g.items.length > 0);
+
+  return (
+    <div className="mt-10">
+      <div className="mb-6 max-w-2xl">
+        <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">获取客户端</h2>
+        <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+          选择对应的实现下载，所有客户端共享同一份 JSON 配置格式。详细启动方法见登录后的「帮助文档」。
+        </p>
+      </div>
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        {grouped.map(({ implementation, items }) => (
+          <Card
+            key={implementation}
+            shadow="none"
+            className="rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none"
+          >
+            <CardBody className="gap-3 p-4">
+              <Chip className="w-fit bg-cyan-300/25 text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100" radius="sm" variant="flat">
+                {IMPL_LABELS[implementation]}
+              </Chip>
+              <div className="flex flex-col gap-2">
+                {items.map((link) => (
+                  <a
+                    key={link.id}
+                    className="group flex items-start justify-between gap-2 rounded-md border border-black/10 bg-white/65 p-2.5 transition hover:border-cyan-500/40 hover:bg-white/85 dark:border-white/10 dark:bg-white/[0.04] dark:hover:bg-white/[0.08]"
+                    href={link.downloadUrl}
+                    rel="noopener noreferrer"
+                    target="_blank"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-small font-medium text-zinc-950 group-hover:text-cyan-700 dark:text-white dark:group-hover:text-cyan-200">
+                        {link.displayName}
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-1 text-tiny text-zinc-600 dark:text-zinc-400">
+                        <span>{shortPlatform(link.platform)}</span>
+                        <span>·</span>
+                        <span>{shortArch(link.arch)}</span>
+                      </div>
+                    </div>
+                    <span className="shrink-0 text-tiny text-zinc-500 group-hover:text-cyan-700 dark:group-hover:text-cyan-200">↗</span>
+                  </a>
+                ))}
+              </div>
+            </CardBody>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function shortPlatform(platform: string): string {
+  switch (platform) {
+    case "windows": return "Windows";
+    case "linux": return "Linux";
+    case "macos": return "macOS";
+    case "any": return "跨平台";
+    default: return platform;
+  }
+}
+
+function shortArch(arch: string): string {
+  switch (arch) {
+    case "x64": return "x86_64";
+    case "arm64": return "ARM64";
+    case "any": return "跨架构";
+    default: return arch;
+  }
 }
 
 function PrincipleCard({

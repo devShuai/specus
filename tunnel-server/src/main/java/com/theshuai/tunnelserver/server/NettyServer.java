@@ -50,6 +50,7 @@ public class NettyServer implements ApplicationRunner {
     private final com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler;
     private final WebSocketStreamRegistry webSocketStreamRegistry;
     private final WebSocketTunnelHandler webSocketTunnelHandler;
+    private final ServerMessageHandler serverMessageHandler;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel channel;
@@ -62,7 +63,8 @@ public class NettyServer implements ApplicationRunner {
                        TlsProperties tlsProperties,
                        com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler,
                        WebSocketStreamRegistry webSocketStreamRegistry,
-                       WebSocketTunnelHandler webSocketTunnelHandler) {
+                       WebSocketTunnelHandler webSocketTunnelHandler,
+                       ServerMessageHandler serverMessageHandler) {
         this.nettyProperties = nettyProperties;
         this.managedLoginRequestHandler = managedLoginRequestHandler;
         this.trafficUsageService = trafficUsageService;
@@ -72,6 +74,7 @@ public class NettyServer implements ApplicationRunner {
         this.directHttpResponseHandler = directHttpResponseHandler;
         this.webSocketStreamRegistry = webSocketStreamRegistry;
         this.webSocketTunnelHandler = webSocketTunnelHandler;
+        this.serverMessageHandler = serverMessageHandler;
     }
 
     @Override
@@ -134,7 +137,7 @@ public class NettyServer implements ApplicationRunner {
                                 webSocketTunnelHandler
                         ));
                         ch.pipeline().addLast(directHttpResponseHandler);
-                        ch.pipeline().addLast(ServerMessageHandler.INSTANCE);
+                        ch.pipeline().addLast(serverMessageHandler);
                         ch.pipeline().addLast(LogoutRequestHandler.INSTANCE);
                     }
                 });

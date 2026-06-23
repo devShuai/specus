@@ -9,6 +9,7 @@ import com.theshuai.tunnelclient.bean.ClientStartupConfig;
 import com.theshuai.tunnelclient.bean.HttpTunnelConfig;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.bean.TunnelConfig;
+import com.theshuai.tunnelclient.peer.PeerKeyStore;
 import org.apache.commons.io.IOUtils;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
@@ -96,14 +97,16 @@ public class TunnelClientApplication {
         tunnelBean.setMaxOnlineInstances(response.getMaxOnlineInstances());
         tunnelBean.setTunnelConfigList(toTunnelConfigs(response.getTunnelConfigList()));
         tunnelBean.setHttpTunnelConfigList(toHttpTunnelConfigs(response.getHttpTunnelConfigList()));
+        tunnelBean.setPeerMesh(response.getPeerMesh());
         tunnelBean.setAuthRefresher(() -> loginAndBuildTunnel(startupConfig));
-        log.info("客户端 HTTP 登录成功: clientName={}, session={}, tunnel={}:{}, tcp={}, http={}, maxOnlineInstances={}",
+        log.info("客户端 HTTP 登录成功: clientName={}, session={}, tunnel={}:{}, tcp={}, http={}, peerMesh={}, maxOnlineInstances={}",
                 tunnelBean.getClientName(),
                 tunnelBean.getClientSessionId(),
                 tunnelBean.getRemoteAddress(),
                 tunnelBean.getRemotePort(),
                 tunnelBean.getTunnelConfigList().size(),
                 tunnelBean.getHttpTunnelConfigList().size(),
+                response.getPeerMesh() != null && response.getPeerMesh().isEnabled(),
                 tunnelBean.getMaxOnlineInstances());
         return tunnelBean;
     }
@@ -151,6 +154,7 @@ public class TunnelClientApplication {
         info.setJavaVersion(System.getProperty("java.version", ""));
         info.setClientVersion(TunnelClientApplication.class.getPackage().getImplementationVersion());
         info.setLocalAddresses(localAddresses());
+        info.setPeerPublicKey(PeerKeyStore.publicKeyBase64());
         info.setStartedAt(Instant.now().toString());
         return info;
     }

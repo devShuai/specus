@@ -50,6 +50,9 @@ public class SecurityConfig {
                         // 这里放行避免被 Spring Security 当 REST 一样要求 Authorization 头（浏览器
                         // 原生 WebSocket 无法塞自定义 header，token 走 query 串）。
                         .requestMatchers("/ws/**").permitAll()
+                        // 公开 API：无需 JWT，登录页和未登录用户也能读取。当前用于
+                        // 客户端下载链接展示（GET /api/public/client-downloads）。
+                        .requestMatchers("/api/public/**").permitAll()
                         .requestMatchers("/api/admin/**", "/auth/refresh").authenticated()
                         .anyRequest().permitAll())
                 .oauth2ResourceServer(oauth2 -> oauth2

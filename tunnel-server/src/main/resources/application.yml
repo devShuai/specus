@@ -50,6 +50,13 @@ tunnel:
     max-external-connections-per-client: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT:10000}
     max-external-connections-per-port: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT:10000}
   public-address: ${TUNNEL_PUBLIC_ADDRESS:}
+  peer-mesh:
+    enabled: ${TUNNEL_PEER_MESH_ENABLED:false}
+    cidr: ${TUNNEL_PEER_MESH_CIDR:100.96.0.0/11}
+    public-address: ${TUNNEL_PEER_MESH_PUBLIC_ADDRESS:}
+    stun-turn-port: ${TUNNEL_PEER_MESH_STUN_TURN_PORT:3478}
+    session-ttl-seconds: ${TUNNEL_PEER_MESH_SESSION_TTL_SECONDS:3600}
+    allocation-ttl-seconds: ${TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS:300}
   client-auth:
     default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
     per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}

@@ -6,6 +6,7 @@ import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.handler.*;
+import com.theshuai.tunnelclient.peer.PeerMeshClient;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.*;
@@ -65,6 +66,7 @@ public class NettyClient {
     private volatile TcpConnection localConnection;
     private final SslContext sslContext;
     private final AtomicReference<Channel> controlChannel = new AtomicReference<>();
+    private final PeerMeshClient peerMeshClient;
 
     /** 退避上限：连续 5 次失败后稳定到一分钟一次，长期网络故障可自愈。 */
     private static final int MAX_RECONNECT_DELAY_SECONDS = 60;
@@ -91,6 +93,7 @@ public class NettyClient {
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
         this.sslContext = sslContext;
+        this.peerMeshClient = new PeerMeshClient(tunnelBean.getPeerMesh());
     }
 
     public void start() {
@@ -123,7 +126,7 @@ public class NettyClient {
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
                         ch.pipeline().addLast(new LoginResponseHandler(NettyClient.this));
-                        ch.pipeline().addLast(new MessageResponseHandler(sharedLocalConnection));
+                        ch.pipeline().addLast(new MessageResponseHandler(sharedLocalConnection, peerMeshClient));
                         ch.pipeline().addLast(new DirectHttpRequestHandler(tunnelBean.getHttpTunnelConfigList()));
                         ch.pipeline().addLast(new LogoutResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());
@@ -210,6 +213,7 @@ public class NettyClient {
         if (prior > 0) {
             log.info("Login succeeded, reconnect backoff reset (was attempt #{})", prior);
         }
+        peerMeshClient.startOrUpdate(tunnelBean.getPeerMesh());
     }
 
     public void stopReconnecting(String reason) {
@@ -313,6 +317,8 @@ public class NettyClient {
         tunnelBean.setRemotePort(port);
         tunnelBean.setTunnelConfigList(nonNullList(refreshed.getTunnelConfigList()));
         tunnelBean.setHttpTunnelConfigList(nonNullList(refreshed.getHttpTunnelConfigList()));
+        tunnelBean.setPeerMesh(refreshed.getPeerMesh());
+        peerMeshClient.startOrUpdate(refreshed.getPeerMesh());
         if (refreshed.getAuthRefresher() != null) {
             tunnelBean.setAuthRefresher(refreshed.getAuthRefresher());
         }
@@ -325,6 +331,7 @@ public class NettyClient {
     public void shutdown() {
         if (!shuttingDown.compareAndSet(false, true)) return;
         cancelProactiveRefresh();
+        peerMeshClient.close();
         Channel channel = controlChannel.getAndSet(null);
         if (channel != null) {
             channel.close().awaitUninterruptibly(5, TimeUnit.SECONDS);

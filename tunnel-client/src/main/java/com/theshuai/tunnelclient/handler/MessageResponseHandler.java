@@ -4,6 +4,7 @@ import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.client.TcpConnection;
+import com.theshuai.tunnelclient.peer.PeerMeshClient;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import lombok.extern.slf4j.Slf4j;
@@ -11,13 +12,19 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageResponsePacket> {
     private final TcpConnection localConnection;
+    private final PeerMeshClient peerMeshClient;
 
     public MessageResponseHandler() {
         this(new TcpConnection());
     }
 
     public MessageResponseHandler(TcpConnection localConnection) {
+        this(localConnection, null);
+    }
+
+    public MessageResponseHandler(TcpConnection localConnection, PeerMeshClient peerMeshClient) {
         this.localConnection = localConnection;
+        this.peerMeshClient = peerMeshClient;
     }
 
     @Override
@@ -59,6 +66,15 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
                     if (nat != null) {
                         nat.applyHttpRoutes(tunnelBean.getHttpTunnelConfigList());
                     }
+                }
+                break;
+            }
+
+            case PEER_CONTROL: {
+                if (peerMeshClient != null) {
+                    peerMeshClient.handleControlMessage(messageResponsePacket.getMessage());
+                } else {
+                    log.debug("收到 peer mesh 信令但客户端未启用 peer mesh");
                 }
                 break;
             }

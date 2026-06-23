@@ -20,6 +20,9 @@ const LazyTunnelsPanel = lazy(() => import("./panels/TunnelsPanel").then((module
 const LazyHttpRoutesPanel = lazy(() => import("./panels/HttpRoutesPanel").then((module) => ({ default: module.HttpRoutesPanel })));
 const LazyConnectionsPanel = lazy(() => import("./panels/ConnectionsPanel").then((module) => ({ default: module.ConnectionsPanel })));
 const LazyTrafficPanel = lazy(() => import("./panels/TrafficPanel").then((module) => ({ default: module.TrafficPanel })));
+const LazyPeerMeshPanel = lazy(() => import("./panels/PeerMeshPanel").then((module) => ({ default: module.PeerMeshPanel })));
+const LazyClientDownloadsPanel = lazy(() => import("./panels/ClientDownloadsPanel").then((module) => ({ default: module.ClientDownloadsPanel })));
+const LazyHelpPanel = lazy(() => import("./panels/HelpPanel").then((module) => ({ default: module.HelpPanel })));
 const LazySystemPanel = lazy(() => import("./panels/SystemPanel").then((module) => ({ default: module.SystemPanel })));
 
 const panels = [
@@ -27,8 +30,11 @@ const panels = [
   { key: "clients", title: "客户端" },
   { key: "tunnels", title: "端口映射" },
   { key: "http-routes", title: "HTTP 路由" },
+  { key: "peer-mesh", title: "私有组网" },
   { key: "connections", title: "连接记录" },
   { key: "traffic", title: "流量使用" },
+  { key: "downloads", title: "客户端下载" },
+  { key: "help", title: "帮助文档" },
   { key: "system", title: "系统管理" },
 ] as const;
 
@@ -230,10 +236,16 @@ function ActivePanel({
       return <LazyTunnelsPanel />;
     case "http-routes":
       return <LazyHttpRoutesPanel />;
+    case "peer-mesh":
+      return <LazyPeerMeshPanel />;
     case "connections":
       return <LazyConnectionsPanel />;
     case "traffic":
       return <LazyTrafficPanel />;
+    case "downloads":
+      return <LazyClientDownloadsPanel />;
+    case "help":
+      return <LazyHelpPanel />;
     case "system":
       return <LazySystemPanel initializing={initializing} onInitializeDatabase={onInitializeDatabase} />;
     case "overview":

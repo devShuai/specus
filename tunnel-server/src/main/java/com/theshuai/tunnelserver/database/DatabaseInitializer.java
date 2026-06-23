@@ -115,7 +115,10 @@ public class DatabaseInitializer {
                 "http_route_mapping",
                 "tunnel_connection_record",
                 "tunnel_connection_stat",
-                "tunnel_traffic_usage")) {
+                "tunnel_traffic_usage",
+                "peer_mesh_device",
+                "peer_mesh_acl",
+                "peer_mesh_session")) {
             try {
                 int rows = jdbcTemplate.update(
                         "update " + table + " set tenant_id = ? where tenant_id is null or tenant_id = ''",
@@ -130,7 +133,11 @@ public class DatabaseInitializer {
     }
 
     private void backfillDefaultOwner() {
-        for (String table : List.of("tunnel_client_account", "tunnel_client_credential")) {
+        for (String table : List.of(
+                "tunnel_client_account",
+                "tunnel_client_credential",
+                "peer_mesh_device",
+                "peer_mesh_acl")) {
             try {
                 int rows = jdbcTemplate.update(
                         "update " + table + " set owner_username = ? where owner_username is null or owner_username = ''",

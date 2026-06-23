@@ -55,6 +55,7 @@ public class ClientAuthService {
     private final ConnectionRecordRepository connectionRecordRepository;
     private final TunnelMappingRepository tunnelMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
+    private final PeerMeshService peerMeshService;
     private final ClientAuthProperties properties;
     private final NettyServerProperties nettyProperties;
     private final String publicAddress;
@@ -66,6 +67,7 @@ public class ClientAuthService {
                              ConnectionRecordRepository connectionRecordRepository,
                              TunnelMappingRepository tunnelMappingRepository,
                              HttpRouteMappingRepository httpRouteMappingRepository,
+                             PeerMeshService peerMeshService,
                              ClientAuthProperties properties,
                              NettyServerProperties nettyProperties,
                              @Value("${tunnel.public-address:}") String publicAddress) {
@@ -76,6 +78,7 @@ public class ClientAuthService {
         this.connectionRecordRepository = connectionRecordRepository;
         this.tunnelMappingRepository = tunnelMappingRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
+        this.peerMeshService = peerMeshService;
         this.properties = properties;
         this.nettyProperties = nettyProperties;
         this.publicAddress = StringUtils.hasText(publicAddress) ? publicAddress.trim() : "";
@@ -139,6 +142,7 @@ public class ClientAuthService {
         response.setMaxOnlineInstances(credential.getMaxOnlineInstances());
         response.setTunnelConfigList(loadTcpMappings(account));
         response.setHttpTunnelConfigList(loadHttpRoutes(account));
+        response.setPeerMesh(peerMeshService.buildLoginConfig(account, environment, requestServerName));
         response.getPolicy().setEnabled(true);
         return response;
     }
@@ -391,6 +395,7 @@ public class ClientAuthService {
         environment.setMachineFingerprint(limit(requireText(environment.getMachineFingerprint(), "machineFingerprint"), 160));
         environment.setOsUser(limit(requireText(environment.getOsUser(), "osUser"), 120));
         environment.setHostname(limit(firstText(environment.getHostname(), "unknown-host"), 160));
+        environment.setPeerPublicKey(limit(environment.getPeerPublicKey(), 256));
         return environment;
     }
 

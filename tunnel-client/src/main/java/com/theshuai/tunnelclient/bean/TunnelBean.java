@@ -1,5 +1,6 @@
 package com.theshuai.tunnelclient.bean;
 
+import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.tunnelclient.client.ClientAuthRefresher;
 import lombok.Data;
 
@@ -15,6 +16,7 @@ public class TunnelBean {
     private int maxOnlineInstances = 2;
     private List<TunnelConfig> tunnelConfigList;
     private List<HttpTunnelConfig> httpTunnelConfigList;
+    private ClientAuthLoginResponse.PeerMeshConfig peerMesh;
     private String remoteAddress;
     private int remotePort;
     private transient ClientAuthRefresher authRefresher;

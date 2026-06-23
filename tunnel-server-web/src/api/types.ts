@@ -252,6 +252,61 @@ export interface NatControlResult {
   httpRoutes: number;
 }
 
+export interface PeerMeshStatus {
+  enabled: boolean;
+}
+
+export interface PeerMeshDevice {
+  id: number;
+  clientId: number;
+  clientName: string;
+  ownerUsername: string;
+  enabled: boolean;
+  online: boolean;
+  virtualIp: string;
+  cidr: string;
+  publicKey: string | null;
+  natType: string | null;
+  lastEndpoint: string | null;
+  lastSeenAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface PeerMeshDeviceMutation {
+  enabled?: boolean;
+}
+
+export interface PeerMeshAcl {
+  id: number;
+  sourceClientId: number;
+  sourceClientName: string;
+  targetClientId: number;
+  targetClientName: string;
+  allowed: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PeerMeshAclMutation {
+  sourceClientId: number;
+  targetClientId: number;
+  allowed?: boolean;
+}
+
+export interface PeerMeshSession {
+  id: number;
+  sourceClientId: number;
+  sourceClientName: string;
+  targetClientId: number;
+  targetClientName: string;
+  pathType: "DIRECT" | "RELAY" | string;
+  status: "NEGOTIATING" | "ACTIVE" | "CLOSED" | string;
+  startedAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  closedAt: string | null;
+}
+
 export interface DatabaseInitResult {
   initialized: boolean;
   orm: string;
@@ -306,6 +361,36 @@ export interface HttpRouteMutation {
   enabled?: boolean;
   detailCaptureEnabled?: boolean;
   pathRewriteEnabled?: boolean;
+}
+
+// 客户端下载链接 —— 管理员维护、登录页/Dashboard 展示。仅存 URL 字符串，不托管二进制。
+export type ClientImplementation = "java" | "go" | "csharp";
+export type ClientPlatform = "windows" | "linux" | "macos" | "any";
+export type ClientArch = "x64" | "arm64" | "any";
+
+export interface ClientDownloadLink {
+  id: number;
+  implementation: ClientImplementation;
+  platform: ClientPlatform;
+  arch: ClientArch;
+  displayName: string;
+  downloadUrl: string;
+  description?: string | null;
+  displayOrder: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClientDownloadLinkMutation {
+  implementation: ClientImplementation;
+  platform: ClientPlatform;
+  arch: ClientArch;
+  displayName: string;
+  downloadUrl: string;
+  description?: string | null;
+  displayOrder?: number;
+  enabled?: boolean;
 }
 
 // LiveConnectionEvent is the JSON pushed over /ws/connections.

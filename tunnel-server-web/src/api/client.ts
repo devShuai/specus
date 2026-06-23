@@ -3,6 +3,8 @@ import type {
   ClientCredential,
   ClientCredentialMutation,
   ClientCredentialResult,
+  ClientDownloadLink,
+  ClientDownloadLinkMutation,
   ClientMutation,
   ConnectionPage,
   ClientResult,
@@ -18,6 +20,12 @@ import type {
   NatControlResult,
   OidcConfig,
   Overview,
+  PeerMeshAcl,
+  PeerMeshAclMutation,
+  PeerMeshDevice,
+  PeerMeshDeviceMutation,
+  PeerMeshSession,
+  PeerMeshStatus,
   ResourceTrafficType,
   ResourceTrafficUsage,
   TcpTrafficFrame,
@@ -324,4 +332,38 @@ export const adminApi = {
     params.set("limit", String(limit));
     return request<TcpTrafficStream>(`/traffic/tcp-streams?${params.toString()}`);
   },
+  peerMeshStatus: () => request<PeerMeshStatus>("/peer-mesh/status"),
+  listPeerMeshDevices: () => request<PeerMeshDevice[]>("/peer-mesh/devices"),
+  updatePeerMeshDevice: (clientId: number, body: PeerMeshDeviceMutation) =>
+    request<PeerMeshDevice>(`/peer-mesh/devices/${clientId}`, { method: "PUT", body: JSON.stringify(body) }),
+  listPeerMeshAcls: () => request<PeerMeshAcl[]>("/peer-mesh/acls"),
+  createPeerMeshAcl: (body: PeerMeshAclMutation) =>
+    request<PeerMeshAcl>("/peer-mesh/acls", { method: "POST", body: JSON.stringify(body) }),
+  deletePeerMeshAcl: (id: number) => request<null>(`/peer-mesh/acls/${id}`, { method: "DELETE" }),
+  listPeerMeshSessions: (limit = 100) => request<PeerMeshSession[]>(`/peer-mesh/sessions?limit=${limit}`),
+
+  listClientDownloads: () => request<ClientDownloadLink[]>(`/client-downloads`),
+  createClientDownload: (body: ClientDownloadLinkMutation) =>
+    request<ClientDownloadLink>(`/client-downloads`, { method: "POST", body: JSON.stringify(body) }),
+  updateClientDownload: (id: number, body: ClientDownloadLinkMutation) =>
+    request<ClientDownloadLink>(`/client-downloads/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteClientDownload: (id: number) => request<null>(`/client-downloads/${id}`, { method: "DELETE" }),
 };
+
+// ---- public API（无需 Bearer，登录页和未登录上下文可用）-------------------------------
+
+/**
+ * 公开下载列表。任何端点失败/异常都返回空数组（登录页应静默降级，不打扰未登录用户）。
+ */
+export async function fetchPublicClientDownloads(): Promise<ClientDownloadLink[]> {
+  try {
+    const response = await fetch(`/api/public/client-downloads`);
+    if (!response.ok) {
+      return [];
+    }
+    const body = (await response.json()) as ClientDownloadLink[];
+    return Array.isArray(body) ? body : [];
+  } catch {
+    return [];
+  }
+}

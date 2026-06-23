@@ -15,6 +15,7 @@ public class ClientEnvironmentInfo {
     private String osArch;
     private String clientVersion;
     private String javaVersion;
+    private String peerPublicKey;
     private List<String> localAddresses = new ArrayList<>();
     private String startedAt;
 }
