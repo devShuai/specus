@@ -10,4 +10,5 @@ public class PeerCandidate {
     private int port;
     private long priority;
     private String foundation;
+    private String relayId;
 }
