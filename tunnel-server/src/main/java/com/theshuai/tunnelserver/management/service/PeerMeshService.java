@@ -187,6 +187,16 @@ public class PeerMeshService {
                 .orElse(false);
     }
 
+    @Transactional(readOnly = true)
+    public PeerIdentity peerIdentity(ClientAccount account) {
+        if (account == null) {
+            return new PeerIdentity("", "");
+        }
+        return deviceRepository.findByTenantIdAndClientId(account.getTenantId(), account.getId())
+                .map(device -> new PeerIdentity(device.getVirtualIp(), device.getPublicKey()))
+                .orElseGet(() -> new PeerIdentity("", ""));
+    }
+
     @Transactional
     public PeerSessionGrant createSession(ClientAccount source, ClientAccount target, String pathType) {
         if (!canPeer(source, target)) {
@@ -699,5 +709,8 @@ public class PeerMeshService {
     }
 
     public record PeerSessionGrant(PeerMeshSessionView session, String token) {
+    }
+
+    public record PeerIdentity(String virtualIp, String publicKey) {
     }
 }

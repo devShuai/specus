@@ -13,6 +13,8 @@
 4. **安全升级路径清晰**：HMAC 登录、Bearer JWT 鉴权、可选 TLS 控制通道，留出生产化空间。
 5. **不追求极致性能**：当前默认是单服务端节点；针对单机 1 万连接的优化方案见 `docs/single-node-10k-connections-optimization-plan.md`。
 
+当前版本仍以单体 `tunnel-server` 部署为主。后续若要把控制端和连接端拆分、让连接端做高可用和滚动 drain，方案见 `docs/server-control-edge-ha-plan.md`。
+
 非目标：不提供 P2P 打洞（相关研究见 `docs/direct-connect-hole-punching-research.md`）、不实现 UDP 穿透（`UdpConnection` 留空占位）、不做多区域调度。
 
 ## 2. 顶层架构

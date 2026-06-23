@@ -220,10 +220,10 @@ export function ConnectionsPanel() {
   }, [items, tableScopeKey]);
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
+    <div className="mt-4 flex min-w-0 flex-col gap-4">
       <div className="flex flex-wrap items-end gap-3">
         <Select
-          className="w-44"
+          className="w-full sm:w-44"
           label="客户端"
           items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}
           selectedKeys={clientId ? [clientId] : [""]}
@@ -232,7 +232,7 @@ export function ConnectionsPanel() {
           {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
         <Select
-          className="w-32"
+          className="w-full sm:w-32"
           label="结果"
           selectedKeys={result ? [result] : [""]}
           onChange={(event) => changeResult(event.target.value)}
@@ -241,16 +241,17 @@ export function ConnectionsPanel() {
           <SelectItem key="true">成功</SelectItem>
           <SelectItem key="false">失败</SelectItem>
         </Select>
-        <Input className="w-44" type="date" label="开始日期（UTC）" value={fromDate} onValueChange={changeFromDate} />
-        <Input className="w-44" type="date" label="结束日期（UTC）" value={toDate} onValueChange={changeToDate} />
-        <Button variant="flat" onPress={reset}>
+        <Input className="w-full sm:w-44" type="date" label="开始日期（UTC）" value={fromDate} onValueChange={changeFromDate} />
+        <Input className="w-full sm:w-44" type="date" label="结束日期（UTC）" value={toDate} onValueChange={changeToDate} />
+        <Button className="w-full sm:w-auto" variant="flat" onPress={reset}>
           重置
         </Button>
-        <Button variant="flat" onPress={() => void load()}>
+        <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
           刷新
         </Button>
       </div>
 
+      <div className="min-w-0 overflow-x-auto">
       <Table key={tableCollectionKey} aria-label="连接记录" isHeaderSticky removeWrapper>
         <TableHeader>
           <TableColumn>ID</TableColumn>

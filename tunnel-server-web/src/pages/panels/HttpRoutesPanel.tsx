@@ -24,6 +24,7 @@ import type { HttpRoute } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
 import { useClients } from "../../hooks/useClients";
+import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 
 export function HttpRoutesPanel() {
   const { clients } = useClients();
@@ -139,10 +140,10 @@ export function HttpRoutesPanel() {
   };
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
+    <div className="mt-4 flex min-w-0 flex-col gap-4">
       <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
         <Select
-          className="w-48"
+          className="w-full sm:w-48"
           label="客户端"
           selectedKeys={createClientId ? [createClientId] : []}
           onChange={(event) => setCreateClientId(event.target.value)}
@@ -152,9 +153,9 @@ export function HttpRoutesPanel() {
             <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
           ))}
         </Select>
-        <Input className="w-40" label="路由名" placeholder="web" value={route} onValueChange={setRoute} maxLength={60} isRequired />
-        <Input className="w-64" label="目标地址" placeholder="http://127.0.0.1:8080" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
-        <Button type="submit" color="primary" isLoading={creating}>
+        <Input className="w-full sm:w-40" label="路由名" placeholder="web" value={route} onValueChange={setRoute} maxLength={60} isRequired />
+        <Input className="w-full sm:w-64" label="目标地址" placeholder="http://127.0.0.1:8080" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
+        <Button className="w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建路由
         </Button>
       </form>
@@ -178,7 +179,7 @@ export function HttpRoutesPanel() {
 
       <div className="flex flex-wrap items-end gap-3">
         <Select
-          className="w-48"
+          className="w-full sm:w-48"
           label="筛选客户端"
           items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]}
           selectedKeys={filterClientId ? [filterClientId] : [""]}
@@ -186,12 +187,111 @@ export function HttpRoutesPanel() {
         >
           {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
-        <Button variant="flat" onPress={() => void load()}>
+        <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
           刷新
         </Button>
       </div>
 
-      <Table aria-label="HTTP 路由列表" isHeaderSticky removeWrapper>
+      {/* mobile: 卡片堆叠 */}
+      <div className="lg:hidden">
+        <MobileListCardList
+          items={routes}
+          isLoading={loading}
+          emptyContent="后台尚未维护 HTTP 路由"
+          renderCard={(raw) => {
+            const item = raw as HttpRoute;
+            const accessUrl = httpRouteAccessUrl(item);
+            return (
+              <MobileListCard
+                key={item.id}
+                title={
+                  <div className="flex items-center gap-2">
+                    <code className="break-all">{item.route}</code>
+                    <span className="text-tiny font-normal text-default-400">#{item.id}</span>
+                  </div>
+                }
+                subtitle={
+                  <div className="flex flex-col gap-0.5">
+                    <span>{item.clientName}</span>
+                    <code className="break-all">{item.targetBaseUrl || "-"}</code>
+                  </div>
+                }
+                badges={
+                  <>
+                    <Chip
+                      size="sm"
+                      variant="flat"
+                      color={item.enabled ? "success" : "warning"}
+                      className="cursor-pointer"
+                      onClick={() => void toggle(item)}
+                    >
+                      {item.enabled ? "启用" : "停用"}
+                    </Chip>
+                    <Chip
+                      size="sm"
+                      variant="flat"
+                      color={item.detailCaptureEnabled ? "primary" : "default"}
+                      className="cursor-pointer"
+                      onClick={() => void toggleDetailCapture(item)}
+                    >
+                      {item.detailCaptureEnabled ? "采集" : "采集关"}
+                    </Chip>
+                    <Chip
+                      size="sm"
+                      variant="flat"
+                      color={item.pathRewriteEnabled ? "secondary" : "default"}
+                      className="cursor-pointer"
+                      onClick={() => void togglePathRewrite(item)}
+                    >
+                      {item.pathRewriteEnabled ? "改写开" : "改写关"}
+                    </Chip>
+                  </>
+                }
+                fields={[
+                  {
+                    label: "访问链接",
+                    value: (
+                      <div className="flex flex-col gap-1">
+                        <a
+                          className="break-all font-mono text-primary underline-offset-2 hover:underline"
+                          href={accessUrl}
+                          rel="noreferrer"
+                          target="_blank"
+                        >
+                          {accessUrl}
+                        </a>
+                        <Button
+                          size="sm"
+                          className="w-fit"
+                          variant="light"
+                          onPress={() => void copyAccessUrl(accessUrl)}
+                        >
+                          复制
+                        </Button>
+                      </div>
+                    ),
+                  },
+                  { label: "更新时间", value: formatDateTime(item.updatedAt || item.createdAt) },
+                ]}
+                actions={
+                  <>
+                    <Button size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
+                      编辑
+                    </Button>
+                    <Button size="sm" color="danger" variant="flat" onPress={() => void remove(item)}>
+                      删除
+                    </Button>
+                  </>
+                }
+              />
+            );
+          }}
+        />
+      </div>
+
+      {/* desktop: 表格 + 横向溢出滚动兜底 */}
+      <div className="hidden min-w-0 overflow-x-auto lg:block">
+        <Table aria-label="HTTP 路由列表" isHeaderSticky removeWrapper>
         <TableHeader>
           <TableColumn>ID</TableColumn>
           <TableColumn>客户端</TableColumn>
@@ -267,6 +367,7 @@ export function HttpRoutesPanel() {
           )}
         </TableBody>
       </Table>
+      </div>
 
       <EditHttpRouteModal disclosure={editModal} route={editing} onSaved={() => void load()} />
     </div>

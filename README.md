@@ -96,7 +96,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 启动后访问 [http://127.0.0.1:8088](http://127.0.0.1:8088) 可进入管理后台。管理后台支持用户名/密码与 OIDC 登录，管理 API 校验 Bearer JWT，详见[管理后台登录](#管理后台登录)。
 
-服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。业务持久化层使用 Spring Data JPA 和 Hibernate；初始化阶段会用少量 `JdbcTemplate` 做旧库字段回填。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client / test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
+服务端默认使用当前工作目录下的 SQLite 数据库 `shuai-tunnel.db`。业务持久化层使用 Spring Data JPA 和 Hibernate；初始化阶段会用少量 `JdbcTemplate` 做旧库字段回填。首次启动时 Hibernate 会自动维护表结构，并创建演示客户端 `Demo client` 与启动凭证 `apiKey=demo-client / secret=test1234`（可通过 `TUNNEL_DB_SEED_DEMO_CLIENT=false` 关闭种子数据）。管理后台提供幂等的初始化按钮，用于补齐种子数据，不会清空已有数据。
 
 如需在端口映射日志中显示服务端公网地址，可设置 `TUNNEL_PUBLIC_ADDRESS`。未设置时客户端会回退显示控制连接配置中的 `remoteAddress`。
 
@@ -112,23 +112,9 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 
 ```json
 {
-  "clientName": "Demo client",
-  "password": "test1234",
-  "tunnelConfigList": [
-    {
-      "port": 9000,
-      "tunnelAddress": "127.0.0.1",
-      "tunnelPort": 8080
-    }
-  ],
-  "httpTunnelConfigList": [
-    {
-      "route": "web",
-      "targetBaseUrl": "http://127.0.0.1:8080"
-    }
-  ],
-  "remoteAddress": "127.0.0.1",
-  "remotePort": 7010
+  "serverBaseUrl": "http://127.0.0.1:8088",
+  "apiKey": "demo-client",
+  "secret": "test1234"
 }
 ```
 
@@ -136,17 +122,9 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 
 | 字段 | 说明 |
 | --- | --- |
-| `clientName` | 客户端名称，也是服务端会话标识 |
-| `password` | 管理后台分配给客户端的密码 |
-| `tunnelConfigList` | 本地 TCP 映射（Go 客户端在登录后会注册这些映射；Java 客户端以服务端下发的 `NAT_CONTROL` 为准，该项可不填） |
-| `tunnelConfigList[].port` | 公网映射端口（对应服务端 `listenPort`） |
-| `tunnelConfigList[].tunnelAddress` | 内网目标地址（对应服务端 `targetAddress`） |
-| `tunnelConfigList[].tunnelPort` | 内网目标端口（对应服务端 `targetPort`） |
-| `httpTunnelConfigList` | HTTP 直转路由列表；每个 route 映射一个客户端可访问的内网 HTTP 地址 |
-| `httpTunnelConfigList[].route` | 访问 `/http/{clientName}/{route}/...` 时使用的路由名 |
-| `httpTunnelConfigList[].targetBaseUrl` | 客户端可访问的内网目标服务基地址 |
-| `remoteAddress` | 公网服务端地址 |
-| `remotePort` | 服务端 Netty 控制连接端口，需与服务端 `TUNNEL_NETTY_PORT`（默认 `7010`）一致 |
+| `serverBaseUrl` | 服务端管理 HTTP 地址，客户端会调用 `/api/client/auth/login` 获取运行时连接信息 |
+| `apiKey` | 管理后台创建的客户端启动凭证 key |
+| `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求 |
 
 > 完整示例见 `tunnel-client-go/tunnelClientConfig.example.json`。
 
@@ -173,7 +151,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run \
 1. 选择目标客户端，填写公网端口、内网目标地址和内网端口，新增一条映射。
 2. 在线客户端会立即收到完整映射快照；离线客户端会在下次登录时自动收到并注册已启用的映射。
 
-Java 客户端收到 `NAT_CONTROL` 消息后注册端口映射。Go 客户端既支持相同的动态配置消息，也会在登录后直接注册本地配置文件中的 `tunnelConfigList`。后台新增或删除映射时会向在线客户端自动同步完整映射快照。
+Java/Go/C# 客户端登录成功后收到服务端返回的初始映射快照，并在后续收到 `NAT_CONTROL` 消息时同步注册端口映射。后台新增或删除映射时会向在线客户端自动同步完整映射快照。
 
 也可以直接调用管理 API（`/api/admin/**` 需携带 Bearer JWT，详见[管理后台登录](#管理后台登录)）。先换取一个令牌：
 
@@ -217,8 +195,8 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 
 内置管理后台支持：
 
-- 创建、编辑、停用和删除客户端
-- 自动生成客户端密码，或在管理页面中重置密码
+- 查看、编辑、停用和删除客户端
+- 创建和管理客户端启动凭证（apiKey/secret），并限制同一凭证的在线实例数
 - 维护每个客户端的 TCP 端口映射，并向在线客户端下发 `NAT_CONTROL` 配置
 - 查看控制连接成功和失败记录
 - 按客户端和 UTC 日期汇总上下行流量，并查看 HTTP 请求/响应详情与 TCP payload 记录
@@ -227,7 +205,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 - 配置每个客户端每分钟允许的控制连接次数（新建客户端默认 `30`）；设置为 `0` 表示不限
 - 手动执行幂等数据库初始化
 
-密码在数据库中以 SHA-256 摘要（十六进制）保存，该摘要同时作为登录 HMAC-SHA256 的密钥，因此明文密码本身从不上线。创建或重置密码时，管理页面仅显示一次明文密码。
+客户端启动凭证的 secret 在数据库中以 SHA-256 摘要（十六进制）保存；客户端启动时使用该摘要派生 HMAC-SHA256 签名密钥。secret 明文只在创建或重置凭证时显示一次。
 
 ## 管理后台登录
 
@@ -399,7 +377,7 @@ HTTP 流量入库前会根据 `Content-Encoding` 对 `gzip`、`deflate`、`br` �
 
 已实现：
 
-- 客户端登录（基于每客户端密码派生密钥的 **HMAC-SHA256** 签名 + 时间戳/nonce 防重放）、心跳保活
+- 客户端启动登录（基于 apiKey/secret 的 **HMAC-SHA256** 签名 + 时间戳/nonce/机器信息防重放）、运行时 token 控制通道登录、心跳保活
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
 - 客户端账号分配、连接记录、连接频率限制（默认每分钟 `30` 次，`0` 表示不限）和流量统计
 - 内置管理 API 和管理页面，支持用户名/密码与 OIDC（授权码 + PKCE）两种登录，后端统一校验 Bearer JWT
@@ -422,4 +400,4 @@ HTTP 流量入库前会根据 `Content-Encoding` 对 `gzip`、`deflate`、`br` �
 
 ## 开发建议
 
-服务端下发 `NAT_CONTROL` 的管理接口已实现（见[下发端口映射](#3-下发端口映射)），登录签名也已升级为基于每客户端密码派生密钥的 HMAC-SHA256（密码本身不上线）。后续可优先：让 Java/Go 客户端默认支持控制连接 TLS 并提供配置开关，补齐真实 MySQL/PostgreSQL 与端到端隧道的自动化测试，并实现 UDP 转发。
+服务端下发 `NAT_CONTROL` 的管理接口已实现（见[下发端口映射](#3-下发端口映射)），客户端启动登录已升级为基于 apiKey/secret 的 HMAC-SHA256（secret 明文不上线）。后续可优先：让 Java/Go 客户端默认支持控制连接 TLS 并提供配置开关，补齐真实 MySQL/PostgreSQL 与端到端隧道的自动化测试，并实现 UDP 转发。

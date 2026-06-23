@@ -19,8 +19,12 @@ public class PeerControlMessage {
     private Long sessionId;
     private Long sourceClientId;
     private String sourceClientName;
+    private String sourceVirtualIp;
+    private String sourcePublicKey;
     private Long targetClientId;
     private String targetClientName;
+    private String targetVirtualIp;
+    private String targetPublicKey;
     private String token;
     private String expiresAt;
     private String pathType;

@@ -51,6 +51,15 @@ tunnelClientConfig*.json
 ### Go client binary ###
 /tunnel-client-go/shuai-tunnel-client
 
+### Local build caches ###
+.appdata/
+.dotnet/
+.nuget/
+.gocache/
+.gomodcache/
+**/.gocache/
+**/.gomodcache/
+
 ### Node modules ###
 node_modules/
 

@@ -150,6 +150,9 @@ public class PeerSignalService {
     private void fillSource(PeerControlMessage signal, ClientAccount source) {
         signal.setSourceClientId(source.getId());
         signal.setSourceClientName(source.getClientName());
+        PeerMeshService.PeerIdentity identity = peerMeshService.peerIdentity(source);
+        signal.setSourceVirtualIp(identity.virtualIp());
+        signal.setSourcePublicKey(identity.publicKey());
         if (signal.getCreatedAtMillis() <= 0) {
             signal.setCreatedAtMillis(System.currentTimeMillis());
         }
@@ -158,6 +161,9 @@ public class PeerSignalService {
     private void enrichTarget(PeerControlMessage signal, ClientAccount target) {
         signal.setTargetClientId(target.getId());
         signal.setTargetClientName(target.getClientName());
+        PeerMeshService.PeerIdentity identity = peerMeshService.peerIdentity(target);
+        signal.setTargetVirtualIp(identity.virtualIp());
+        signal.setTargetPublicKey(identity.publicKey());
     }
 
     private boolean shouldOpenSession(PeerControlMessage signal) {
@@ -178,6 +184,12 @@ public class PeerSignalService {
         grantMessage.setSourceClientName(source.getClientName());
         grantMessage.setTargetClientId(target.getId());
         grantMessage.setTargetClientName(target.getClientName());
+        PeerMeshService.PeerIdentity sourceIdentity = peerMeshService.peerIdentity(source);
+        PeerMeshService.PeerIdentity targetIdentity = peerMeshService.peerIdentity(target);
+        grantMessage.setSourceVirtualIp(sourceIdentity.virtualIp());
+        grantMessage.setSourcePublicKey(sourceIdentity.publicKey());
+        grantMessage.setTargetVirtualIp(targetIdentity.virtualIp());
+        grantMessage.setTargetPublicKey(targetIdentity.publicKey());
         grantMessage.setToken(grant.token());
         grantMessage.setExpiresAt(grant.session().expiresAt());
         grantMessage.setPathType(grant.session().pathType());

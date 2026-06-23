@@ -23,6 +23,7 @@ import { adminApi } from "../../api/client";
 import type { Tunnel } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
+import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { useClients } from "../../hooks/useClients";
 
 export function TunnelsPanel() {
@@ -123,10 +124,10 @@ export function TunnelsPanel() {
   };
 
   return (
-    <div className="mt-4 flex flex-col gap-4">
+    <div className="mt-4 flex min-w-0 flex-col gap-4">
       <form className="flex flex-wrap items-end gap-3" onSubmit={onCreate}>
         <Select
-          className="w-48"
+          className="w-full sm:w-48"
           label="客户端"
           selectedKeys={clientId ? [clientId] : []}
           onChange={(event) => setClientId(event.target.value)}
@@ -136,17 +137,77 @@ export function TunnelsPanel() {
             <SelectItem key={String(client.id)}>{client.clientName}</SelectItem>
           ))}
         </Select>
-        <Input className="w-32" type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
-        <Input className="w-44" label="内网目标地址" placeholder="127.0.0.1" value={targetAddress} onValueChange={setTargetAddress} isRequired />
-        <Input className="w-32" type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
-        <Button type="submit" color="primary" isLoading={creating}>
+        <Input className="w-full sm:w-32" type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
+        <Input className="w-full sm:w-44" label="内网目标地址" placeholder="127.0.0.1" value={targetAddress} onValueChange={setTargetAddress} isRequired />
+        <Input className="w-full sm:w-32" type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
+        <Button className="w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建映射
         </Button>
-        <Button variant="flat" onPress={() => void load()}>
+        <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
           刷新
         </Button>
       </form>
 
+      {/* mobile: 卡片 */}
+      <div className="lg:hidden">
+        <MobileListCardList
+          items={tunnels}
+          isLoading={loading}
+          emptyContent="暂无数据"
+          renderCard={(raw) => {
+            const tunnel = raw as Tunnel;
+            return (
+              <MobileListCard
+                key={tunnel.id}
+                title={
+                  <div className="flex items-center gap-2">
+                    <code className="break-all">:{tunnel.listenPort} → {tunnel.targetAddress}:{tunnel.targetPort}</code>
+                  </div>
+                }
+                subtitle={`${tunnel.clientName} · #${tunnel.id}`}
+                badges={
+                  <>
+                    <Chip
+                      size="sm"
+                      variant="flat"
+                      color={tunnel.enabled ? "success" : "warning"}
+                      className="cursor-pointer"
+                      onClick={() => void toggle(tunnel)}
+                    >
+                      {tunnel.enabled ? "启用" : "停用"}
+                    </Chip>
+                    <Chip
+                      size="sm"
+                      variant="flat"
+                      color={tunnel.detailCaptureEnabled ? "primary" : "default"}
+                      className="cursor-pointer"
+                      onClick={() => void toggleDetailCapture(tunnel)}
+                    >
+                      {tunnel.detailCaptureEnabled ? "采集" : "采集关"}
+                    </Chip>
+                  </>
+                }
+                fields={[
+                  { label: "更新时间", value: formatDateTime(tunnel.updatedAt || tunnel.createdAt) },
+                ]}
+                actions={
+                  <>
+                    <Button size="sm" variant="flat" onPress={() => { setEditing(tunnel); editModal.onOpen(); }}>
+                      编辑
+                    </Button>
+                    <Button size="sm" color="danger" variant="flat" onPress={() => void remove(tunnel)}>
+                      删除
+                    </Button>
+                  </>
+                }
+              />
+            );
+          }}
+        />
+      </div>
+
+      {/* desktop: 表格 */}
+      <div className="hidden min-w-0 overflow-x-auto lg:block">
       <Table aria-label="端口映射列表" isHeaderSticky removeWrapper>
         <TableHeader>
           <TableColumn>ID</TableColumn>
@@ -204,6 +265,7 @@ export function TunnelsPanel() {
           )}
         </TableBody>
       </Table>
+      </div>
 
       <EditTunnelModal disclosure={editModal} tunnel={editing} onSaved={() => void load()} />
     </div>

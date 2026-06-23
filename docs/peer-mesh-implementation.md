@@ -36,6 +36,7 @@ TUNNEL_PEER_MESH_ENABLED=false
 TUNNEL_PEER_MESH_CIDR=100.96.0.0/11
 TUNNEL_PEER_MESH_PUBLIC_ADDRESS=tunnel.example.com
 TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
+TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT=0
 TUNNEL_PEER_MESH_SESSION_TTL_SECONDS=3600
 TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 ```
@@ -46,6 +47,7 @@ TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 * `TUNNEL_PEER_MESH_CIDR`：mesh 虚拟网段，默认 `100.96.0.0/11`。
 * `TUNNEL_PEER_MESH_PUBLIC_ADDRESS`：UDP 探测和 relay 对外地址。服务器在 NAT 后面时必须显式配置。
 * `TUNNEL_PEER_MESH_STUN_TURN_PORT`：内置 STUN/TURN-lite UDP 端口，默认 `3478`。
+* `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：NAT 类型辅助探测 UDP 端口。默认 `0` 表示使用 `STUN/TURN-lite 端口 + 1`，即 `3479`。备用端口只用于探测，不承载 relay allocation。
 * `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS`：peer session 授权有效期。
 * `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS`：relay allocation 有效期，客户端会提前 refresh。
 
@@ -53,8 +55,17 @@ TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 
 ```bash
 sudo firewall-cmd --add-port=3478/udp --permanent
+sudo firewall-cmd --add-port=3479/udp --permanent
 sudo firewall-cmd --reload
 ```
+
+NAT 类型探测说明：
+
+* 客户端先向主端口发送 binding，服务端返回映射地址和备用探测端口。
+* 服务端会从备用端口向同一个客户端映射主动回包，客户端也会主动向备用端口再发送一次 binding。
+* 如果主端口和备用端口看到的映射端点不同，页面展示为 `Symmetric NAT`。
+* 如果映射端点相同且能收到备用端口主动回包，页面展示为 `Full cone / Restricted NAT`。在只有一个公网 IP 的部署里，无法严格拆分 Full Cone 与 Address-Restricted NAT。
+* 如果映射端点相同但收不到备用端口主动回包，页面展示为 `Port Restricted NAT` 或更保守的 `NAT`。
 
 ## 客户端配置
 

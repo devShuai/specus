@@ -129,8 +129,13 @@ TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 
 ```bash
 sudo firewall-cmd --add-port=3478/udp --permanent
+sudo firewall-cmd --add-port=3479/udp --permanent
 sudo firewall-cmd --reload
 ```
+
+默认 `3478/udp` 承载 STUN/TURN-lite 与 relay，`3479/udp` 是 NAT 类型辅助探测端口。可通过
+`TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` 调整备用端口；只有一个公网 IP 时，Full Cone 与
+Address-Restricted NAT 仍会合并展示为 `Full cone / Restricted NAT`。
 
 客户端侧默认 `peerMeshDevice=noop`，只运行控制面、候选交换、探测和加密 UDP 数据面；要真正接管虚拟 IP 流量，需要启用虚拟网卡：
 
