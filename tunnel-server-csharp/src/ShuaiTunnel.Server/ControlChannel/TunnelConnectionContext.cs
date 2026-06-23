@@ -52,6 +52,8 @@ public sealed class TunnelConnectionContext
     /// <summary>UTC ms snapshot when login succeeded — used by overview/online metrics.</summary>
     public long? LoginTimeMs { get; private set; }
 
+    public long? ClientSessionId { get; private set; }
+
     /// <summary>Audit row id populated only on a successful login. Null → close path skips DB write.</summary>
     public long? ConnectionRecordId { get; set; }
 
@@ -68,10 +70,11 @@ public sealed class TunnelConnectionContext
         WriteBackpressure = writeBackpressure;
     }
 
-    public void OnLoginSuccess(string clientName, long loginTimeMs)
+    public void OnLoginSuccess(string clientName, long loginTimeMs, long? clientSessionId = null)
     {
         ClientName = clientName;
         LoginTimeMs = loginTimeMs;
+        ClientSessionId = clientSessionId;
     }
 
     /// <summary>Returns true on the FIRST stamp; subsequent attempts are silently ignored so

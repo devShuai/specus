@@ -29,6 +29,7 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
     private static readonly string ClientJar = Path.Combine(RepoRoot,
         "tunnel-client", "target", "tunnel-client-0.0.1-SNAPSHOT-exec.jar");
     private TestServerFixture? _server;
+    private ClientAuthStub? _authStub;
     private string? _clientWorkDir;
     private EchoUpstreamServer? _echo;
     private int _remoteListenPort;
@@ -55,6 +56,10 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         {
             try { Directory.Delete(_clientWorkDir, recursive: true); } catch { /* ignore */ }
         }
+        if (_authStub is not null)
+        {
+            await _authStub.DisposeAsync();
+        }
         if (_server is not null)
         {
             await _server.DisposeAsync();
@@ -77,6 +82,7 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         }
 
         _server = await TestServerFixture.StartAsync();
+        _authStub = ClientAuthStub.Start(_server);
         _echo = new EchoUpstreamServer();
 
         // Pick an external listen port that's free. We let the kernel assign one by binding to 0
@@ -89,20 +95,10 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         File.WriteAllText(Path.Combine(_clientWorkDir, "tunnelClientConfig.json"),
             JsonSerializer.Serialize(new
             {
-                clientName = DatabaseInitializer.DemoClientName,
-                password = DatabaseInitializer.DemoClientPassword,
-                httpTunnelConfigList = Array.Empty<object>(),
-                tunnelConfigList = new[]
-                {
-                    new
-                    {
-                        port = _remoteListenPort,
-                        tunnelAddress = "127.0.0.1",
-                        tunnelPort = _echo.BoundPort,
-                    },
-                },
-                remoteAddress = "127.0.0.1",
-                remotePort = _server.ControlPort,
+                serverBaseUrl = _authStub.ServerBaseUrl,
+                authType = "apiKey",
+                apiKey = DatabaseInitializer.DemoClientName,
+                secret = DatabaseInitializer.DemoClientPassword,
             }));
 
         _clientProcess = StartClient();

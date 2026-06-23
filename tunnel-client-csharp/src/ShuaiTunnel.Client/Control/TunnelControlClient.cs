@@ -1,6 +1,5 @@
 using System.IO.Pipelines;
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Client.Configuration;
@@ -9,7 +8,6 @@ using ShuaiTunnel.Client.Nat;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
-using ShuaiTunnel.Protocol.Security;
 
 namespace ShuaiTunnel.Client.Control;
 
@@ -25,21 +23,21 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private const int ConnectTimeoutMs = 5000;
     private const int BaseBackoffSeconds = 2;
     private const int MaxBackoffSeconds = 60;
-    private const int NonceBytes = 16;
 
-    private readonly TunnelClientConfig _config;
+    private readonly ClientAuthService _auth;
     private readonly DirectHttpForwarder _httpForwarder;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TunnelControlClient> _logger;
     private int _backoffAttempts;
     private CancellationTokenSource? _sessionCts;
+    private TunnelRuntimeState? _runtime;
 
     public TunnelControlClient(
-        TunnelClientConfig config,
+        ClientAuthService auth,
         DirectHttpForwarder httpForwarder,
         ILoggerFactory loggerFactory)
     {
-        _config = config;
+        _auth = auth;
         _httpForwarder = httpForwarder;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<TunnelControlClient>();
@@ -90,21 +88,24 @@ public sealed class TunnelControlClient : IAsyncDisposable
 
     private async Task RunOnceAsync(CancellationToken cancellationToken)
     {
+        var runtime = await _auth.LoginAsync(cancellationToken).ConfigureAwait(false);
+        _runtime = runtime;
+
         using var tcp = new TcpClient { NoDelay = true };
         tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connectCts.CancelAfter(ConnectTimeoutMs);
         try
         {
-            await tcp.ConnectAsync(_config.RemoteAddress, _config.RemotePort, connectCts.Token)
+            await tcp.ConnectAsync(runtime.NettyHost, runtime.NettyPort, connectCts.Token)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             throw new TimeoutException(
-                $"connect to {_config.RemoteAddress}:{_config.RemotePort} timed out after {ConnectTimeoutMs} ms");
+                $"connect to {runtime.NettyHost}:{runtime.NettyPort} timed out after {ConnectTimeoutMs} ms");
         }
-        _logger.LogInformation("connected to {addr}:{port}", _config.RemoteAddress, _config.RemotePort);
+        _logger.LogInformation("connected to {addr}:{port}", runtime.NettyHost, runtime.NettyPort);
 
         await using var stream = tcp.GetStream();
         await using var writer = new FrameWriter(stream);
@@ -112,9 +113,9 @@ public sealed class TunnelControlClient : IAsyncDisposable
         var session = _sessionCts.Token;
 
         var directHttp = new DirectHttpHandler(
-            _config.HttpTunnelConfigList, writer, _httpForwarder, _loggerFactory.CreateLogger<DirectHttpHandler>());
+            runtime.HttpTunnelConfigList, writer, _httpForwarder, _loggerFactory.CreateLogger<DirectHttpHandler>());
         var nat = new NatClientHandler(
-            _config.TunnelConfigList, _config.ClientName,
+            runtime.TunnelConfigList, runtime.ClientName,
             writer, directHttp, _loggerFactory.CreateLogger<NatClientHandler>());
         nat.Bind(session);
         writer.WritabilityChanged += writable => nat.SetControlWritable(writable);
@@ -155,20 +156,16 @@ public sealed class TunnelControlClient : IAsyncDisposable
 
     private async Task SendLoginAsync(FrameWriter writer, CancellationToken cancellationToken)
     {
-        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
-        var nonceBytes = RandomNumberGenerator.GetBytes(NonceBytes);
-        var nonce = Convert.ToHexString(nonceBytes).ToLowerInvariant();
-        var key = HmacSigner.Sha256(_config.Password);
-        var checkSign = HmacSigner.HmacSha256(key, $"{_config.ClientName}\n{timestamp}\n{nonce}");
+        var runtime = _runtime ?? throw new InvalidOperationException("client runtime is not initialized");
         var packet = new LoginRequestPacket
         {
-            ClientName = _config.ClientName,
-            Timestamp = timestamp,
-            Nonce = nonce,
-            CheckSign = checkSign,
+            ClientName = runtime.ClientName,
+            ClientSessionId = runtime.ClientSessionId,
+            AccessToken = runtime.AccessToken,
         };
         await writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
-        _logger.LogDebug("sent login request for {client}", _config.ClientName);
+        _logger.LogDebug("sent login request for {client}, session={session}",
+            runtime.ClientName, runtime.ClientSessionId);
     }
 
     private async Task DispatchAsync(
@@ -230,10 +227,10 @@ public sealed class TunnelControlClient : IAsyncDisposable
         {
             return;
         }
-        TunnelClientConfig? snapshot;
+        TunnelConfigSnapshot? snapshot;
         try
         {
-            snapshot = JsonSerializer.Deserialize<TunnelClientConfig>(payload, TunnelClientConfigLoader.JsonOptions);
+            snapshot = JsonSerializer.Deserialize<TunnelConfigSnapshot>(payload, TunnelClientConfigLoader.JsonOptions);
         }
         catch (JsonException ex)
         {

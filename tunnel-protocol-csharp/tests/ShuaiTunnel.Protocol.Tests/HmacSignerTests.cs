@@ -25,18 +25,21 @@ public class HmacSignerTests
     }
 
     [Fact]
-    public void SignMessage_DerivesKeyFromPassword_AndProducesStableHex()
+    public void SignClientStartup_DerivesKeyFromSecret_AndProducesStableHex()
     {
-        // Verifies the canonical login-signature recipe from HmacSigner.java.
-        var password = "test1234";
-        var key = HmacSigner.Sha256(password);
-        var sig = HmacSigner.SignMessage("Demo client", "1700000000000", "fixture-nonce", key);
+        var secret = "test1234";
+        var key = HmacSigner.Sha256(secret);
+        var sig = HmacSigner.SignClientStartup(
+            "Demo client",
+            "1700000000000",
+            "fixture-nonce",
+            "m_fixture",
+            "tester",
+            key);
         Assert.Equal(64, sig.Length);
-        // Stable byte recipe → stable hex; if the message format ever drifts this regenerates.
         Assert.Matches("^[0-9a-f]{64}$", sig);
 
-        // Recompute via primitives and compare — independent verification of the recipe.
-        var msg = $"Demo client\n1700000000000\nfixture-nonce";
+        var msg = $"Demo client\n1700000000000\nfixture-nonce\nm_fixture\ntester";
         var raw = HmacSigner.HmacSha256(key, msg);
         Assert.Equal(Convert.ToHexString(raw).ToLowerInvariant(), sig);
     }

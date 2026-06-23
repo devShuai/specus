@@ -83,6 +83,7 @@ builder.Services.AddScoped<NatControlService>();
 builder.Services.AddScoped<ManagementQueryService>();
 builder.Services.AddScoped<ManagementMutationService>();
 
+builder.Services.AddSingleton<ClientAuthSessionStore>();
 builder.Services.AddSingleton<LocalTokenService>();
 builder.Services.AddSingleton<AdminBearerTokenValidator>();
 builder.Services.AddSingleton<OidcTokenValidator>();
@@ -127,6 +128,7 @@ app.MapGet("/", () => Results.LocalRedirect("/index.html"));
 app.MapStaticAssets();
 
 app.MapAdminApi();
+app.MapClientAuthApi();
 app.MapDirectHttpTunnel();
 app.MapConnectionEventsWebSocket();
 

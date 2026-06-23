@@ -3,8 +3,6 @@ package server
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/auth"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
 )
@@ -47,7 +46,21 @@ func startTestApp(t *testing.T) (*App, int) {
 	return app, port
 }
 
-func dialAndLogin(t *testing.T, port int, clientName, password string) (net.Conn, *bufio.Reader) {
+func issueClientSession(t *testing.T, app *App, clientName string) auth.Session {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	account, err := app.DB().FindClientByName(ctx, clientName)
+	if err != nil {
+		t.Fatalf("find client: %v", err)
+	}
+	if account == nil {
+		t.Fatalf("client %q not found", clientName)
+	}
+	return app.clientAuth.Create(*account, time.Hour)
+}
+
+func dialAndLogin(t *testing.T, app *App, port int, clientName string) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
@@ -55,15 +68,11 @@ func dialAndLogin(t *testing.T, port int, clientName, password string) (net.Conn
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	var nonceRaw [8]byte
-	_, _ = rand.Read(nonceRaw[:])
-	nonce := hex.EncodeToString(nonceRaw[:])
+	session := issueClientSession(t, app, clientName)
 	login := protocol.LoginRequest{
-		ClientName: clientName,
-		Timestamp:  timestamp,
-		Nonce:      nonce,
-		CheckSign:  protocol.SignLogin(clientName, password, timestamp, nonce),
+		ClientName:      clientName,
+		ClientSessionID: session.ID,
+		AccessToken:     session.AccessToken,
 	}
 	if err := protocol.WritePacket(conn, login); err != nil {
 		t.Fatalf("write login: %v", err)
@@ -86,7 +95,7 @@ func readPacket(t *testing.T, reader *bufio.Reader) protocol.Packet {
 
 func TestLoginSuccessAndHeartbeat(t *testing.T) {
 	app, port := startTestApp(t)
-	conn, reader := dialAndLogin(t, port, DemoClientName, DemoClientPassword)
+	conn, reader := dialAndLogin(t, app, port, DemoClientName)
 
 	resp, ok := readPacket(t, reader).(protocol.LoginResponse)
 	if !ok {
@@ -116,18 +125,31 @@ func TestLoginSuccessAndHeartbeat(t *testing.T) {
 	}
 }
 
-func TestLoginRejectsBadSignature(t *testing.T) {
+func TestLoginRejectsBadAccessToken(t *testing.T) {
 	_, port := startTestApp(t)
-	conn, reader := dialAndLogin(t, port, DemoClientName, "wrong-password")
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	login := protocol.LoginRequest{
+		ClientName:      DemoClientName,
+		ClientSessionID: 12345,
+		AccessToken:     "invalid",
+	}
+	if err := protocol.WritePacket(conn, login); err != nil {
+		t.Fatalf("write login: %v", err)
+	}
+	reader := bufio.NewReader(conn)
 
 	resp, ok := readPacket(t, reader).(protocol.LoginResponse)
 	if !ok {
 		t.Fatalf("expected LoginResponse, got %T", resp)
 	}
 	if resp.Success {
-		t.Fatal("login should have failed with a bad password")
+		t.Fatal("login should have failed with a bad access token")
 	}
-	if resp.Reason == nil || *resp.Reason != "签名无效或已过期" {
+	if resp.Reason == nil || *resp.Reason != "客户端访问令牌无效" {
 		t.Fatalf("unexpected reason: %v", resp.Reason)
 	}
 	_ = conn

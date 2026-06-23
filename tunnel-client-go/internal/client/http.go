@@ -164,7 +164,7 @@ func (client *Client) reportHTTPRoutes(connection net.Conn) {
 	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
 		Type: protocol.NatHTTPRoutesReport,
 		Metadata: map[string]any{
-			"clientName": client.config.ClientName,
+			"clientName": client.currentClientName(),
 			"routes":     routes,
 		},
 	})

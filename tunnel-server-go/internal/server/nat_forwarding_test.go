@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"net"
 	"strconv"
 	"testing"
@@ -27,7 +26,7 @@ func freeTCPPort(t *testing.T) int {
 
 // natTestClient logs in, registers a tunnel on listenPort, and echoes any DATA it receives
 // straight back to the server (acting as a loopback upstream). It runs until ctx is done.
-func natTestClient(t *testing.T, ctx context.Context, port, listenPort int, registered chan<- bool) {
+func natTestClient(t *testing.T, ctx context.Context, app *App, port, listenPort int, registered chan<- bool) {
 	t.Helper()
 	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
@@ -37,15 +36,11 @@ func natTestClient(t *testing.T, ctx context.Context, port, listenPort int, regi
 	}
 	go func() { <-ctx.Done(); conn.Close() }()
 
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	var nonceRaw [8]byte
-	_, _ = rand.Read(nonceRaw[:])
-	nonce := hex.EncodeToString(nonceRaw[:])
+	session := issueClientSession(t, app, DemoClientName)
 	login := protocol.LoginRequest{
-		ClientName: DemoClientName,
-		Timestamp:  timestamp,
-		Nonce:      nonce,
-		CheckSign:  protocol.SignLogin(DemoClientName, DemoClientPassword, timestamp, nonce),
+		ClientName:      DemoClientName,
+		ClientSessionID: session.ID,
+		AccessToken:     session.AccessToken,
 	}
 	if err := protocol.WritePacket(conn, login); err != nil {
 		t.Errorf("client login: %v", err)
@@ -105,7 +100,7 @@ func TestNatRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	registered := make(chan bool, 1)
-	go natTestClient(t, ctx, port, listenPort, registered)
+	go natTestClient(t, ctx, app, port, listenPort, registered)
 
 	select {
 	case ok := <-registered:

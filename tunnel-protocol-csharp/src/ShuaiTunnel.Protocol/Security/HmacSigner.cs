@@ -4,14 +4,12 @@ using System.Text;
 namespace ShuaiTunnel.Protocol.Security;
 
 /// <summary>
-/// Mirrors <c>com.theshuai.common.security.HmacSigner</c>. The login flow:
+/// Mirrors the Java client startup API-key signature flow:
 /// <code>
-/// key  = SHA-256(password)              // 32 raw bytes
-/// msg  = clientName + "\n" + timestamp + "\n" + nonce
-/// sign = HMAC-SHA256(key, msg)          // 32 raw bytes
+/// key  = SHA-256(secret) // 32 raw bytes
+/// msg  = apiKey + "\n" + timestamp + "\n" + nonce + "\n" + machineFingerprint + "\n" + osUser
+/// sign = hex(HMAC-SHA256(key, msg))
 /// </code>
-/// The plaintext password never crosses the wire — server stores hex(SHA-256(password))
-/// and decodes the hex back to 32 raw bytes when verifying.
 /// </summary>
 public static class HmacSigner
 {
@@ -40,9 +38,20 @@ public static class HmacSigner
         return HMACSHA256.HashData(key, Encoding.UTF8.GetBytes(message));
     }
 
-    public static string SignMessage(string clientName, string timestamp, string nonce, byte[] key)
+    public static string SignClientStartup(
+        string? apiKey,
+        string? timestamp,
+        string? nonce,
+        string? machineFingerprint,
+        string? osUser,
+        byte[] key)
     {
-        var msg = $"{clientName}{Delimiter}{timestamp}{Delimiter}{nonce}";
+        var msg = string.Join(Delimiter,
+            apiKey ?? "",
+            timestamp ?? "",
+            nonce ?? "",
+            machineFingerprint ?? "",
+            osUser ?? "");
         return Convert.ToHexString(HmacSha256(key, msg)).ToLowerInvariant();
     }
 

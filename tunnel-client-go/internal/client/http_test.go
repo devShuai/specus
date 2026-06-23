@@ -40,9 +40,11 @@ func TestExecuteDirectHTTP(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	tunnelClient := New(Config{
+	tunnelClient := New(Config{}, nil)
+	tunnelClient.applyRuntime(RuntimeConfig{
+		ClientName:           "Demo client",
 		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "web", TargetBaseURL: upstream.URL}},
-	}, nil)
+	})
 	response := tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
 		RequestID: "8b284fef-0987-4948-ac66-7f2059336989",
 		Method:    http.MethodPost,
@@ -68,9 +70,11 @@ func TestSyncHTTPTunnelConfigsUpdatesDirectHTTPRoutes(t *testing.T) {
 	}))
 	defer upstreamB.Close()
 
-	tunnelClient := New(Config{
+	tunnelClient := New(Config{}, nil)
+	tunnelClient.applyRuntime(RuntimeConfig{
+		ClientName:           "Demo client",
 		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "web", TargetBaseURL: upstreamA.URL}},
-	}, nil)
+	})
 	response := tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
 		RequestID: "8b284fef-0987-4948-ac66-7f2059336989",
 		Method:    http.MethodGet,
@@ -106,10 +110,11 @@ func TestReportHTTPRoutesSendsNatReport(t *testing.T) {
 	defer reader.Close()
 	defer writer.Close()
 
-	tunnelClient := New(Config{
+	tunnelClient := New(Config{}, nil)
+	tunnelClient.applyRuntime(RuntimeConfig{
 		ClientName:           "Demo client",
 		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "web", TargetBaseURL: "http://127.0.0.1:8080"}},
-	}, nil)
+	})
 	done := make(chan struct{})
 	go func() {
 		tunnelClient.reportHTTPRoutes(writer)

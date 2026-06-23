@@ -48,6 +48,7 @@ type App struct {
 	wsHub       *wsevents.Hub
 	api         *management.API
 	tlsConfig   *tls.Config
+	clientAuth  *auth.SessionStore
 }
 
 // New opens the database, applies the schema, seeds the demo client, and builds the app.
@@ -68,8 +69,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 
 	sessions := session.NewRegistry()
+	clientSessions := auth.NewSessionStore()
 	executor := control.NewLoginExecutor(cfg.Login.ExecutorMaxSize, cfg.Login.ExecutorQueueCapacity)
-	authenticator := auth.NewAuthenticator(db)
+	authenticator := auth.NewAuthenticator(db, clientSessions)
 	dispatcher := NewDispatcher(db, authenticator, sessions, executor, logger)
 	listener := control.NewListener(cfg.Netty.MaxFrameSize, dispatcher)
 
@@ -130,6 +132,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		wsHub:       wsHub,
 		api:         api,
 		tlsConfig:   tlsConfig,
+		clientAuth:  clientSessions,
 	}, nil
 }
 
@@ -207,6 +210,7 @@ func (a *App) managementHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	a.api.Register(mux)
+	mux.HandleFunc("POST /api/client/auth/login", a.handleClientAuthLogin)
 
 	mux.Handle("/http/{clientName}/{route}/{rest...}", a.directHTTP)
 	mux.Handle("/http/{clientName}/{route}", a.directHTTP)

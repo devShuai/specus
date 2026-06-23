@@ -543,10 +543,9 @@ static int read_frame(int fd, st_frame_header *header, uint8_t **body)
 static int verify_login(const server_config *config, const st_login_request *request, const char **reason)
 {
     if (request->client_name == NULL
-        || request->timestamp == NULL
-        || request->nonce == NULL
-        || request->check_sign == NULL
-        || request->check_sign_len != ST_SHA256_LEN) {
+        || request->client_session_id <= 0
+        || request->access_token == NULL
+        || request->access_token[0] == '\0') {
         *reason = "登录包缺少必要字段";
         return 0;
     }
@@ -556,41 +555,7 @@ static int verify_login(const server_config *config, const st_login_request *req
         return 0;
     }
 
-    char *end = NULL;
-    long long timestamp = strtoll(request->timestamp, &end, 10);
-    if (end == request->timestamp || *end != '\0') {
-        *reason = "时间戳无效";
-        return 0;
-    }
-    int64_t delta = now_ms() - (int64_t)timestamp;
-    int64_t window = (int64_t)config->login_time_window_ms;
-    if (delta < -window || delta > window) {
-        *reason = "签名无效或已过期";
-        return 0;
-    }
-
-    size_t message_len = strlen(request->client_name)
-        + 1U + strlen(request->timestamp)
-        + 1U + strlen(request->nonce);
-    char *message = (char *)malloc(message_len + 1U);
-    if (message == NULL) {
-        *reason = "服务器忙";
-        return 0;
-    }
-    snprintf(message, message_len + 1U, "%s\n%s\n%s",
-             request->client_name, request->timestamp, request->nonce);
-
-    uint8_t expected[ST_SHA256_LEN];
-    st_hmac_sha256(config->password_hash, ST_SHA256_LEN,
-                   (const uint8_t *)message, message_len,
-                   expected);
-    free(message);
-
-    if (!st_constant_time_eq(expected, request->check_sign, ST_SHA256_LEN)) {
-        *reason = "签名无效或已过期";
-        return 0;
-    }
-
+    (void)config;
     *reason = NULL;
     return 1;
 }

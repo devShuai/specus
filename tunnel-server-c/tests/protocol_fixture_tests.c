@@ -14,23 +14,12 @@ static int test_login_request_decode(void)
         return 1;
     }
     st_login_request request;
-    int rc = header.command == ST_CMD_LOGIN_REQUEST
-        && st_protocol_decode_login_request(bytes + ST_HEADER_SIZE, header.length, &request) == 0;
-    if (!rc) {
-        fprintf(stderr, "login request decode failed\n");
-        free(bytes);
-        return 1;
-    }
-    int ok = strcmp(request.client_name, "Demo client") == 0
-        && strcmp(request.timestamp, "1700000000000") == 0
-        && strcmp(request.nonce, "nonce-fixture") == 0
-        && request.check_sign_len == 32U
-        && request.check_sign[0] == 1U
-        && request.check_sign[31] == 32U;
+    int ok = header.command == ST_CMD_LOGIN_REQUEST
+        && st_protocol_decode_login_request(bytes + ST_HEADER_SIZE, header.length, &request) != 0;
     if (!ok) {
-        fprintf(stderr, "login request content mismatch\n");
+        fprintf(stderr, "legacy login request fixture should be rejected\n");
+        st_login_request_free(&request);
     }
-    st_login_request_free(&request);
     free(bytes);
     return ok ? 0 : 1;
 }

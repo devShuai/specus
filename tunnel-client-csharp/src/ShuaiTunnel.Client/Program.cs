@@ -28,9 +28,10 @@ builder.Logging.AddSimpleConsole(options =>
 });
 builder.Services.AddSingleton(config);
 builder.Services.AddSingleton(_ => DirectHttpForwarder.BuildDefaultClient());
+builder.Services.AddSingleton<ClientAuthService>();
 builder.Services.AddSingleton(sp => new DirectHttpForwarder(sp.GetRequiredService<HttpClient>()));
 builder.Services.AddSingleton(sp => new TunnelControlClient(
-    sp.GetRequiredService<TunnelClientConfig>(),
+    sp.GetRequiredService<ClientAuthService>(),
     sp.GetRequiredService<DirectHttpForwarder>(),
     sp.GetRequiredService<ILoggerFactory>()));
 builder.Services.AddHostedService<TunnelClientHostedService>();

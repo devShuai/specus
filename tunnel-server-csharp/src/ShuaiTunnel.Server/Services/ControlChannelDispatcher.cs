@@ -100,10 +100,6 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             _sessions.Unbind(name, context);
         }
 
-        if (context.ConnectionRecordId is not { } recordId)
-        {
-            return;
-        }
         var reason = context.ReadDisconnectReason() ?? DisconnectReason.ClientClosed;
 
         // The connection is gone, but we want the row stamped. Run on a fresh DI scope so the
@@ -111,6 +107,12 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         try
         {
             await using var scope = _services.CreateAsyncScope();
+            var clientService = scope.ServiceProvider.GetRequiredService<ClientAccountService>();
+            clientService.MarkNettyDisconnected(context.ClientSessionId);
+            if (context.ConnectionRecordId is not { } recordId)
+            {
+                return;
+            }
             var records = scope.ServiceProvider.GetRequiredService<ConnectionRecordService>();
             await records.RecordDisconnectAsync(recordId, reason, CancellationToken.None)
                 .ConfigureAwait(false);
@@ -148,7 +150,9 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         AuthenticationResult result;
         try
         {
-            result = await clientService.AuthenticateAsync(packet, context.Lifetime).ConfigureAwait(false);
+            result = await clientService.AuthenticateAsync(
+                    packet, context.ChannelId, context.RemoteAddress, context.Lifetime)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -201,7 +205,8 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         if (result.Success)
         {
             context.ConnectionRecordId = recordId;
-            context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                packet.ClientSessionId);
 
             // Active replacement: if a prior session exists, close its socket so the new login
             // takes its place. Mirrors Java's <c>SessionUtil.bindSession</c>.

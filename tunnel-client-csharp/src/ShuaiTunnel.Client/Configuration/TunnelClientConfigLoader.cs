@@ -56,21 +56,41 @@ public static class TunnelClientConfigLoader
 
     private static void Validate(TunnelClientConfig config, string path)
     {
-        if (string.IsNullOrWhiteSpace(config.ClientName))
+        if (string.IsNullOrWhiteSpace(config.ServerBaseUrl))
         {
-            throw new InvalidDataException($"{path}: clientName 不能为空");
+            throw new InvalidDataException($"{path}: serverBaseUrl 不能为空");
         }
-        if (string.IsNullOrWhiteSpace(config.Password))
+        if (!Uri.TryCreate(config.ServerBaseUrl, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
         {
-            throw new InvalidDataException($"{path}: password 不能为空");
+            throw new InvalidDataException($"{path}: serverBaseUrl 必须是 http/https 绝对地址");
         }
-        if (string.IsNullOrWhiteSpace(config.RemoteAddress))
+
+        var authType = string.IsNullOrWhiteSpace(config.AuthType) ? "apiKey" : config.AuthType.Trim();
+        if (authType.Equals("password", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidDataException($"{path}: remoteAddress 不能为空");
+            if (string.IsNullOrWhiteSpace(config.Username))
+            {
+                throw new InvalidDataException($"{path}: password 模式必须配置 username");
+            }
+            if (string.IsNullOrWhiteSpace(config.Password))
+            {
+                throw new InvalidDataException($"{path}: password 模式必须配置 password");
+            }
+            return;
         }
-        if (config.RemotePort <= 0 || config.RemotePort > 65535)
+
+        if (!authType.Equals("apiKey", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidDataException($"{path}: remotePort 无效");
+            throw new InvalidDataException($"{path}: authType 仅支持 apiKey/password");
+        }
+        if (string.IsNullOrWhiteSpace(config.ApiKey))
+        {
+            throw new InvalidDataException($"{path}: apiKey 模式必须配置 apiKey");
+        }
+        if (string.IsNullOrWhiteSpace(config.Secret))
+        {
+            throw new InvalidDataException($"{path}: apiKey 模式必须配置 secret");
         }
     }
 }

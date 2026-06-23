@@ -29,6 +29,7 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         "tunnel-client", "target", "tunnel-client-0.0.1-SNAPSHOT-exec.jar");
 
     private TestServerFixture? _server;
+    private ClientAuthStub? _authStub;
     private string? _clientWorkDir;
     private Process? _clientProcess;
     private string? _javaExecutable;
@@ -53,16 +54,16 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         }
 
         _server = await TestServerFixture.StartAsync();
+        _authStub = ClientAuthStub.Start(_server);
 
         _clientWorkDir = Directory.CreateTempSubdirectory("tunnel-client-it-").FullName;
         var configPath = Path.Combine(_clientWorkDir, "tunnelClientConfig.json");
         File.WriteAllText(configPath, JsonSerializer.Serialize(new
         {
-            clientName = DatabaseInitializer.DemoClientName,
-            password = DatabaseInitializer.DemoClientPassword,
-            httpTunnelConfigList = Array.Empty<object>(),
-            remoteAddress = "127.0.0.1",
-            remotePort = _server.ControlPort,
+            serverBaseUrl = _authStub.ServerBaseUrl,
+            authType = "apiKey",
+            apiKey = DatabaseInitializer.DemoClientName,
+            secret = DatabaseInitializer.DemoClientPassword,
         }));
     }
 
@@ -78,6 +79,10 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         if (_clientWorkDir is not null && Directory.Exists(_clientWorkDir))
         {
             try { Directory.Delete(_clientWorkDir, recursive: true); } catch { /* ignore */ }
+        }
+        if (_authStub is not null)
+        {
+            await _authStub.DisposeAsync();
         }
         if (_server is not null)
         {

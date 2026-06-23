@@ -56,17 +56,24 @@ func decodeFixture(t *testing.T, name string, byteExact bool) Packet {
 }
 
 func TestLoginRequestFixture(t *testing.T) {
-	packet := decodeFixture(t, "login_request.bin", true).(LoginRequest)
-	if packet.ClientName != "Demo client" || packet.Timestamp != "1700000000000" || packet.Nonce != "nonce-fixture" {
-		t.Fatalf("unexpected login request: %+v", packet)
+	if _, _, err := DecodeFrame(readFixture(t, "login_request.bin")); err == nil {
+		t.Fatal("legacy signed login fixture should be rejected")
 	}
-	if len(packet.CheckSign) != 32 {
-		t.Fatalf("checkSign length = %d, want 32", len(packet.CheckSign))
+	packet := LoginRequest{ClientName: "Demo client", ClientSessionID: 42, AccessToken: "token"}
+	encoded, err := EncodeFrame(packet)
+	if err != nil {
+		t.Fatalf("encode current login: %v", err)
 	}
-	for i := range 32 {
-		if packet.CheckSign[i] != byte(i+1) {
-			t.Fatalf("checkSign[%d] = %d, want %d", i, packet.CheckSign[i], i+1)
-		}
+	decoded, consumed, err := DecodeFrame(encoded)
+	if err != nil {
+		t.Fatalf("decode current login: %v", err)
+	}
+	if consumed != len(encoded) {
+		t.Fatalf("consumed %d of %d bytes", consumed, len(encoded))
+	}
+	got := decoded.(LoginRequest)
+	if got != packet {
+		t.Fatalf("current login roundtrip = %+v, want %+v", got, packet)
 	}
 }
 
@@ -225,16 +232,5 @@ func TestLargeDataSelfRoundtrip(t *testing.T) {
 	}
 	if !bytes.Equal(got.Data, payload) {
 		t.Fatalf("data round-trip mismatch")
-	}
-}
-
-func TestSignLoginMatchesFixture(t *testing.T) {
-	// Sanity: signing is deterministic and 32 bytes.
-	sign := SignLogin("Demo client", "secret", "1700000000000", "nonce-fixture")
-	if len(sign) != SignatureLength {
-		t.Fatalf("signature length = %d", len(sign))
-	}
-	if !bytes.Equal(sign, SignLogin("Demo client", "secret", "1700000000000", "nonce-fixture")) {
-		t.Fatalf("signing not deterministic")
 	}
 }

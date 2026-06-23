@@ -10,15 +10,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"math/big"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
 )
-
-// timestampWindowMs is the allowed clock skew for a login timestamp (±30s).
-const timestampWindowMs = 30_000
 
 // passwordAlphabet excludes visually ambiguous characters (matches the C# generator).
 const passwordAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
@@ -28,6 +25,61 @@ type Result struct {
 	Success bool
 	Reason  string
 	Account *store.ClientAccount
+}
+
+type Session struct {
+	ID          int64
+	ClientID    int64
+	ClientName  string
+	AccessToken string
+	TokenHash   string
+	ExpiresAt   time.Time
+}
+
+type SessionStore struct {
+	mu                   sync.RWMutex
+	byTokenHash          map[string]Session
+	tokenHashBySessionID map[int64]string
+}
+
+func NewSessionStore() *SessionStore {
+	return &SessionStore{
+		byTokenHash:          make(map[string]Session),
+		tokenHashBySessionID: make(map[int64]string),
+	}
+}
+
+func (s *SessionStore) Create(account store.ClientAccount, ttl time.Duration) Session {
+	token := "cs_" + randomHex(32) + randomHex(32)
+	session := Session{
+		ID:          NewClientID(),
+		ClientID:    account.ID,
+		ClientName:  account.ClientName,
+		AccessToken: token,
+		TokenHash:   HashPassword(token),
+		ExpiresAt:   time.Now().Add(ttl),
+	}
+	s.mu.Lock()
+	s.byTokenHash[session.TokenHash] = session
+	s.tokenHashBySessionID[session.ID] = session.TokenHash
+	s.mu.Unlock()
+	return session
+}
+
+func (s *SessionStore) Find(sessionID int64, accessToken string) (Session, bool) {
+	if sessionID <= 0 || accessToken == "" {
+		return Session{}, false
+	}
+	hash := HashPassword(accessToken)
+	s.mu.RLock()
+	storedHash, ok := s.tokenHashBySessionID[sessionID]
+	if !ok || !hmac.Equal([]byte(storedHash), []byte(hash)) {
+		s.mu.RUnlock()
+		return Session{}, false
+	}
+	session, ok := s.byTokenHash[hash]
+	s.mu.RUnlock()
+	return session, ok
 }
 
 // HashPassword returns the lowercase hex SHA-256 of the plaintext password (no salt),
@@ -69,22 +121,27 @@ func NewClientID() int64 {
 
 // Authenticator verifies login requests against the store.
 type Authenticator struct {
-	db  *store.DB
-	now func() time.Time
+	db       *store.DB
+	sessions *SessionStore
+	now      func() time.Time
 }
 
 // NewAuthenticator builds an Authenticator backed by db.
-func NewAuthenticator(db *store.DB) *Authenticator {
-	return &Authenticator{db: db, now: time.Now}
+func NewAuthenticator(db *store.DB, sessions *SessionStore) *Authenticator {
+	return &Authenticator{db: db, sessions: sessions, now: time.Now}
 }
 
 // Authenticate runs the full login check sequence and returns the result. The error is
 // non-nil only on infrastructure failures (e.g. database errors), not auth rejections.
 func (a *Authenticator) Authenticate(ctx context.Context, request protocol.LoginRequest) (Result, error) {
-	if request.ClientName == "" {
-		return Result{Reason: "缺少 clientName"}, nil
+	session, ok := a.sessions.Find(request.ClientSessionID, request.AccessToken)
+	if !ok {
+		return Result{Reason: "客户端访问令牌无效"}, nil
 	}
-	account, err := a.db.FindClientByName(ctx, request.ClientName)
+	if session.ExpiresAt.Before(a.now()) {
+		return Result{Reason: "客户端访问令牌已过期"}, nil
+	}
+	account, err := a.db.FindClientByName(ctx, session.ClientName)
 	if err != nil {
 		return Result{}, err
 	}
@@ -104,32 +161,14 @@ func (a *Authenticator) Authenticate(ctx context.Context, request protocol.Login
 			return Result{Reason: "连接频率超过限制", Account: account}, nil
 		}
 	}
-	if !a.validSignature(account, request) {
-		return Result{Reason: "签名无效或已过期", Account: account}, nil
-	}
 	return Result{Success: true, Account: account}, nil
 }
 
-func (a *Authenticator) validSignature(account *store.ClientAccount, request protocol.LoginRequest) bool {
-	if request.Timestamp == "" || request.Nonce == "" || len(request.CheckSign) != protocol.SignatureLength {
-		return false
+func randomHex(size int) string {
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		sum := sha256.Sum256([]byte(time.Now().String()))
+		return hex.EncodeToString(sum[:])
 	}
-	timestampMs, err := strconv.ParseInt(request.Timestamp, 10, 64)
-	if err != nil {
-		return false
-	}
-	nowMs := a.now().UnixMilli()
-	delta := nowMs - timestampMs
-	if delta < 0 {
-		delta = -delta
-	}
-	if delta > timestampWindowMs {
-		return false
-	}
-	key, err := hex.DecodeString(account.PasswordHash)
-	if err != nil || len(key) != protocol.SignatureLength {
-		return false
-	}
-	expected := protocol.SignLoginWithKey(key, request.ClientName, request.Timestamp, request.Nonce)
-	return hmac.Equal(expected, request.CheckSign)
+	return hex.EncodeToString(data)
 }

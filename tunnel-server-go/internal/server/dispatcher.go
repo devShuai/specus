@@ -155,8 +155,12 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		return
 	}
 
+	clientName := request.ClientName
+	if result.Account != nil {
+		clientName = result.Account.ClientName
+	}
 	record := store.ConnectionRecord{
-		ClientName:  request.ClientName,
+		ClientName:  clientName,
 		ConnectedAt: time.Now(),
 		Success:     result.Success,
 	}
@@ -190,7 +194,7 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		d.onConnectionEvent("created", record)
 	}
 
-	response := protocol.LoginResponse{ClientName: request.ClientName, Success: result.Success}
+	response := protocol.LoginResponse{ClientName: clientName, Success: result.Success}
 	if result.Reason != "" {
 		reason := result.Reason
 		response.Reason = &reason
@@ -207,7 +211,7 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 	}
 
 	conn.SetConnectionRecordID(recordID)
-	conn.OnLoginSuccess(request.ClientName, time.Now().UnixMilli())
+	conn.OnLoginSuccess(clientName, time.Now().UnixMilli())
 
 	if displaced := d.sessions.Replace(conn); displaced != nil {
 		displaced.Close(store.ReasonReplacedByNewLogin)

@@ -19,6 +19,7 @@ public static class CompactBinarySerializer
     private static readonly IValueCodec StringCodec = new StringValueCodec();
     private static readonly IValueCodec BooleanCodec = new BooleanValueCodec();
     private static readonly IValueCodec IntegerCodec = new IntegerValueCodec();
+    private static readonly IValueCodec LongCodec = new LongValueCodec();
     private static readonly IValueCodec ByteArrayCodec = new ByteArrayValueCodec();
     private static readonly IValueCodec NumericStringCodec = new NumericStringValueCodec();
     private static readonly IValueCodec UuidStringCodec = new UuidStringValueCodec();
@@ -143,9 +144,8 @@ public static class CompactBinarySerializer
         var schemas = new Dictionary<Type, ObjectSchema>();
         Register(schemas, ObjectSchema.Build<LoginRequestPacket>(
             Field<LoginRequestPacket>(nameof(LoginRequestPacket.ClientName), StringCodec),
-            Field<LoginRequestPacket>(nameof(LoginRequestPacket.Timestamp), NumericStringCodec),
-            Field<LoginRequestPacket>(nameof(LoginRequestPacket.Nonce), StringCodec),
-            Field<LoginRequestPacket>(nameof(LoginRequestPacket.CheckSign), ByteArrayCodec)));
+            Field<LoginRequestPacket>(nameof(LoginRequestPacket.ClientSessionId), LongCodec),
+            Field<LoginRequestPacket>(nameof(LoginRequestPacket.AccessToken), StringCodec)));
         Register(schemas, ObjectSchema.Build<LoginResponsePacket>(
             Field<LoginResponsePacket>(nameof(LoginResponsePacket.ClientName), StringCodec),
             Field<LoginResponsePacket>(nameof(LoginResponsePacket.Success), BooleanCodec),

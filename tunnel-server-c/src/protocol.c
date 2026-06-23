@@ -286,6 +286,27 @@ static int reader_numeric_string(compact_reader *reader, char **value)
     return -1;
 }
 
+static int reader_nullable_long(compact_reader *reader, int64_t *value)
+{
+    uint8_t marker;
+    if (reader_u8(reader, &marker) != 0) {
+        return -1;
+    }
+    if (marker == 0) {
+        *value = 0;
+        return 0;
+    }
+    if (marker != 1) {
+        return -1;
+    }
+    uint64_t raw;
+    if (reader_varlong(reader, &raw) != 0) {
+        return -1;
+    }
+    *value = zigzag_decode(raw);
+    return 0;
+}
+
 static int writer_reserve(compact_writer *writer, size_t more)
 {
     if (writer->len + more <= writer->cap) {
@@ -602,25 +623,29 @@ int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len)
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request)
 {
     memset(request, 0, sizeof(*request));
-    if (body == NULL || body_len < 1U || body[0] != 0) {
+    uint8_t *payload = NULL;
+    size_t payload_len = 0;
+    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
         return -1;
     }
     compact_reader reader = {
-        .data = body + 1U,
-        .len = body_len - 1U,
+        .data = payload,
+        .len = payload_len,
         .pos = 0
     };
     if (reader_string(&reader, &request->client_name) != 0
-        || reader_numeric_string(&reader, &request->timestamp) != 0
-        || reader_string(&reader, &request->nonce) != 0
-        || reader_byte_array(&reader, &request->check_sign, &request->check_sign_len) != 0) {
+        || reader_nullable_long(&reader, &request->client_session_id) != 0
+        || reader_string(&reader, &request->access_token) != 0) {
+        free(payload);
         st_login_request_free(request);
         return -1;
     }
     if (reader.pos != reader.len) {
+        free(payload);
         st_login_request_free(request);
         return -1;
     }
+    free(payload);
     return 0;
 }
 
@@ -833,9 +858,7 @@ void st_login_request_free(st_login_request *request)
         return;
     }
     free(request->client_name);
-    free(request->timestamp);
-    free(request->nonce);
-    free(request->check_sign);
+    free(request->access_token);
     memset(request, 0, sizeof(*request));
 }
 

@@ -1,4 +1,5 @@
 using ShuaiTunnel.Protocol;
+using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
 
 namespace ShuaiTunnel.Protocol.Tests;
@@ -8,18 +9,22 @@ public class PacketCodecFixtureTests
     [Fact]
     public void LoginRequest_Roundtrips()
     {
-        Fixtures.DecodeAndAssertRoundtrip<LoginRequestPacket>("login_request.bin", p =>
+        var packet = new LoginRequestPacket
         {
-            Assert.Equal("Demo client", p.ClientName);
-            Assert.Equal("1700000000000", p.Timestamp);
-            Assert.Equal("nonce-fixture", p.Nonce);
-            Assert.NotNull(p.CheckSign);
-            Assert.Equal(32, p.CheckSign!.Length);
-            for (var i = 0; i < 32; i++)
-            {
-                Assert.Equal((byte)(i + 1), p.CheckSign[i]);
-            }
-        });
+            ClientName = "Demo client",
+            ClientSessionId = 123456789L,
+            AccessToken = "cs_fixture_token",
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
+        Assert.Equal(encoded.Length, consumed);
+        var decoded = decodedPacket as LoginRequestPacket;
+
+        Assert.NotNull(decoded);
+        Assert.Equal(packet.ClientName, decoded!.ClientName);
+        Assert.Equal(packet.ClientSessionId, decoded.ClientSessionId);
+        Assert.Equal(packet.AccessToken, decoded.AccessToken);
     }
 
     [Fact]

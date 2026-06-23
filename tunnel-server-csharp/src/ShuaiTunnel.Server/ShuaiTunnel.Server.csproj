@@ -8,10 +8,11 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <RootNamespace>ShuaiTunnel.Server</RootNamespace>
     <TunnelServerWebSkip>false</TunnelServerWebSkip>
+    <DefaultItemExcludes>$(DefaultItemExcludes);wwwroot\**\*</DefaultItemExcludes>
   </PropertyGroup>
 
   <Target Name="BuildAndSyncAdminWeb"
-          BeforeTargets="AssignTargetPaths"
+          BeforeTargets="ResolveStaticWebAssetsInputs;AssignTargetPaths"
           Condition="'$(TunnelServerWebSkip)' != 'true' and '$(DesignTimeBuild)' != 'true'">
     <Exec WorkingDirectory="$(MSBuildThisFileDirectory)..\..\..\tunnel-server-web"
           Command="npm run deploy:csharp" />

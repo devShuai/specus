@@ -74,7 +74,7 @@ func (client *Client) registerTunnel(connection net.Conn, config TunnelConfig) {
 			"port":          config.Port,
 			"tunnelAddress": config.TunnelAddress,
 			"tunnelPort":    config.TunnelPort,
-			"clientName":    client.config.ClientName,
+			"clientName":    client.currentClientName(),
 		},
 	})
 	if err == nil {

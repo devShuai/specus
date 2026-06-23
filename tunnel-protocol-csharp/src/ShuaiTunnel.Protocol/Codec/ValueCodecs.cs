@@ -36,6 +36,39 @@ internal sealed class IntegerValueCodec : IValueCodec
     public object? Read(CompactReader reader) => reader.ReadVarInt();
 }
 
+internal sealed class LongValueCodec : IValueCodec
+{
+    public void Write(CompactWriter writer, object? value)
+    {
+        if (value is null)
+        {
+            writer.WriteByte(0);
+            return;
+        }
+        writer.WriteByte(1);
+        writer.WriteVarLong(ZigZagEncode((long)value));
+    }
+
+    public object? Read(CompactReader reader)
+    {
+        var marker = reader.ReadUnsignedByte();
+        return marker switch
+        {
+            0 => null,
+            1 => ZigZagDecode(reader.ReadVarLong()),
+            _ => throw new InvalidDataException("invalid long type"),
+        };
+    }
+
+    private static long ZigZagEncode(long value) => (value << 1) ^ (value >> 63);
+
+    private static long ZigZagDecode(long value)
+    {
+        var unsigned = (long)((ulong)value >> 1);
+        return unsigned ^ -(value & 1L);
+    }
+}
+
 internal sealed class ByteArrayValueCodec : IValueCodec
 {
     public void Write(CompactWriter writer, object? value) => writer.WriteByteArray((byte[]?)value);

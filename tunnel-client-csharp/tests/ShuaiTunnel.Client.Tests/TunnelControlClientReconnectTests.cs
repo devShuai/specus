@@ -1,6 +1,7 @@
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using Microsoft.Extensions.Logging.Abstractions;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.Control;
@@ -25,26 +26,28 @@ public class TunnelControlClientReconnectTests
         listener.Start();
         var controlPort = ((IPEndPoint)listener.LocalEndpoint).Port;
 
+        using var authListener = new TcpListener(IPAddress.Loopback, 0);
+        authListener.Start();
+        var authPort = ((IPEndPoint)authListener.LocalEndpoint).Port;
+
         using var upstream = new TcpListener(IPAddress.Loopback, 0);
         upstream.Start();
         var upstreamPort = ((IPEndPoint)upstream.LocalEndpoint).Port;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         var upstreamTask = AcceptAndEchoAsync(upstream);
+        var authTask = RunAuthServerAsync(authListener, controlPort, upstreamPort, cts.Token);
 
         var config = new TunnelClientConfig
         {
-            ClientName = "csharp-tester",
-            Password = "test-secret",
-            RemoteAddress = "127.0.0.1",
-            RemotePort = controlPort,
-            TunnelConfigList = new List<TunnelConfigEntry>
-            {
-                new() { Port = 9999, TunnelAddress = "127.0.0.1", TunnelPort = upstreamPort },
-            },
+            ServerBaseUrl = $"http://127.0.0.1:{authPort}",
+            AuthType = "apiKey",
+            ApiKey = "ak_test",
+            Secret = "sk_test",
         };
 
         using var http = new HttpClient();
-        var client = new TunnelControlClient(config, new DirectHttpForwarder(http), NullLoggerFactory.Instance);
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var auth = new ClientAuthService(config, http, NullLogger<ClientAuthService>.Instance);
+        var client = new TunnelControlClient(auth, new DirectHttpForwarder(http), NullLoggerFactory.Instance);
         var clientTask = Task.Run(() => client.RunAsync(cts.Token), cts.Token);
 
         try
@@ -54,6 +57,8 @@ public class TunnelControlClientReconnectTests
             {
                 var login = (LoginRequestPacket)await session.ReadAsync(cts.Token);
                 Assert.Equal("csharp-tester", login.ClientName);
+                Assert.True(login.ClientSessionId > 0);
+                Assert.Equal("cs-test-token", login.AccessToken);
                 await session.WriteAsync(new LoginResponsePacket
                 {
                     ClientName = login.ClientName, Success = true, Reason = null,
@@ -104,6 +109,8 @@ public class TunnelControlClientReconnectTests
             {
                 var login = (LoginRequestPacket)await session.ReadAsync(cts.Token);
                 Assert.Equal("csharp-tester", login.ClientName);
+                Assert.True(login.ClientSessionId > 0);
+                Assert.Equal("cs-test-token", login.AccessToken);
                 await session.WriteAsync(new LoginResponsePacket
                 {
                     ClientName = login.ClientName, Success = true,
@@ -120,8 +127,48 @@ public class TunnelControlClientReconnectTests
             catch (OperationCanceledException) { }
             catch (TimeoutException) { }
             listener.Stop();
+            authListener.Stop();
             upstream.Stop();
             try { await upstreamTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+            try { await authTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+        }
+    }
+
+    private static async Task RunAuthServerAsync(
+        TcpListener listener, int controlPort, int upstreamPort, CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var tcp = await listener.AcceptTcpClientAsync(ct);
+                _ = Task.Run(async () =>
+                {
+                    using (tcp)
+                    using (var stream = tcp.GetStream())
+                    {
+                        var buffer = new byte[8192];
+                        var read = await stream.ReadAsync(buffer, ct);
+                        Assert.True(read > 0);
+                        var body = $$"""
+                        {"tenantId":"default","clientId":1,"clientName":"csharp-tester","clientSessionId":1001,"accessToken":"cs-test-token","tokenTtlSeconds":3600,"nettyHost":"127.0.0.1","nettyPort":{{controlPort}},"maxOnlineInstances":2,"policy":{"enabled":true,"billingStatus":"ACTIVE","retryAfterSeconds":0},"tunnelConfigList":[{"port":9999,"tunnelAddress":"127.0.0.1","tunnelPort":{{upstreamPort}}}],"httpTunnelConfigList":[]}
+                        """;
+                        var payload = Encoding.UTF8.GetBytes(body);
+                        var header = Encoding.ASCII.GetBytes(
+                            $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\nConnection: close\r\n\r\n");
+                        await stream.WriteAsync(header, ct);
+                        await stream.WriteAsync(payload, ct);
+                        await stream.FlushAsync(ct);
+                    }
+                }, ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+            // listener stopped
         }
     }
 

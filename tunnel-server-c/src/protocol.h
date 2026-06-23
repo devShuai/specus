@@ -41,10 +41,8 @@ typedef struct {
 
 typedef struct {
     char *client_name;
-    char *timestamp;
-    char *nonce;
-    uint8_t *check_sign;
-    size_t check_sign_len;
+    int64_t client_session_id;
+    char *access_token;
 } st_login_request;
 
 typedef struct {

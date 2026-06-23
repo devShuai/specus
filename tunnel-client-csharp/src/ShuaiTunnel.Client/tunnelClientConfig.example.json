@@ -1,19 +1,6 @@
 {
-  "clientName": "Demo client",
-  "password": "test1234",
-  "remoteAddress": "127.0.0.1",
-  "remotePort": 7010,
-  "tunnelConfigList": [
-    {
-      "port": 18080,
-      "tunnelAddress": "127.0.0.1",
-      "tunnelPort": 8080
-    }
-  ],
-  "httpTunnelConfigList": [
-    {
-      "route": "web",
-      "targetBaseUrl": "http://127.0.0.1:8080"
-    }
-  ]
+  "serverBaseUrl": "http://127.0.0.1:8088",
+  "authType": "apiKey",
+  "apiKey": "replace-with-client-api-key",
+  "secret": "replace-with-client-secret"
 }

@@ -2,8 +2,6 @@ package client
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +27,8 @@ type Client struct {
 
 	tunnelsMu sync.RWMutex
 	tunnels   map[int]TunnelConfig
+	runtimeMu sync.RWMutex
+	runtime   RuntimeConfig
 
 	registeredMu sync.Mutex
 	registered   map[int]struct{}
@@ -49,15 +49,11 @@ func New(config Config, logger *log.Logger) *Client {
 	if logger == nil {
 		logger = log.Default()
 	}
-	tunnels := make(map[int]TunnelConfig, len(config.TunnelConfigList))
-	for _, tunnel := range config.TunnelConfigList {
-		tunnels[tunnel.Port] = tunnel
-	}
 	return &Client{
 		config:     config,
 		logger:     logger,
-		routes:     buildHTTPRouteMap(config.HTTPTunnelConfigList),
-		tunnels:    tunnels,
+		routes:     make(map[string]string),
+		tunnels:    make(map[int]TunnelConfig),
 		registered: make(map[int]struct{}),
 		locals:     make(map[string]net.Conn),
 	}
@@ -83,7 +79,12 @@ func (client *Client) Run(ctx context.Context) error {
 }
 
 func (client *Client) runOnce(ctx context.Context) error {
-	address := net.JoinHostPort(client.config.RemoteAddress, strconv.Itoa(client.config.RemotePort))
+	runtime, err := client.login(ctx)
+	if err != nil {
+		return err
+	}
+	client.applyRuntime(runtime)
+	address := net.JoinHostPort(runtime.NettyHost, strconv.Itoa(runtime.NettyPort))
 	connection, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("connect %s: %w", address, err)
@@ -103,13 +104,7 @@ func (client *Client) runOnce(ctx context.Context) error {
 	}()
 	go client.heartbeatLoop(connectionContext, connection)
 
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	nonceBytes := make([]byte, 16)
-	if _, err := rand.Read(nonceBytes); err != nil {
-		return fmt.Errorf("generate nonce: %w", err)
-	}
-	nonce := hex.EncodeToString(nonceBytes)
-	body, err := protocol.EncodeLoginRequest(client.config.ClientName, client.config.Password, timestamp, nonce)
+	body, err := protocol.EncodeLoginRequest(runtime.ClientName, runtime.ClientSessionID, runtime.AccessToken)
 	if err != nil {
 		return err
 	}
@@ -129,6 +124,25 @@ func (client *Client) runOnce(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+func (client *Client) applyRuntime(runtime RuntimeConfig) {
+	client.runtimeMu.Lock()
+	client.runtime = runtime
+	client.runtimeMu.Unlock()
+	client.syncHTTPTunnelConfigs(runtime.HTTPTunnelConfigList)
+	client.tunnelsMu.Lock()
+	client.tunnels = make(map[int]TunnelConfig, len(runtime.TunnelConfigList))
+	for _, tunnel := range runtime.TunnelConfigList {
+		client.tunnels[tunnel.Port] = tunnel
+	}
+	client.tunnelsMu.Unlock()
+}
+
+func (client *Client) currentClientName() string {
+	client.runtimeMu.RLock()
+	defer client.runtimeMu.RUnlock()
+	return client.runtime.ClientName
 }
 
 func (client *Client) heartbeatLoop(ctx context.Context, connection net.Conn) {

@@ -5,9 +5,8 @@ public sealed class LoginRequestPacket : Packet
     public override sbyte Command => Protocol.Command.LoginRequest;
 
     public string? ClientName { get; set; }
-    public string? Timestamp { get; set; }
-    public string? Nonce { get; set; }
-    public byte[]? CheckSign { get; set; }
+    public long? ClientSessionId { get; set; }
+    public string? AccessToken { get; set; }
 }
 
 public sealed class LoginResponsePacket : Packet

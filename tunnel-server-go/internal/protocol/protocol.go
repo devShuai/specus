@@ -227,6 +227,15 @@ func (output *compactOutput) writeVarLong(value uint64) {
 	output.WriteByte(byte(value))
 }
 
+func (output *compactOutput) writeNullableLong(value int64) {
+	if value == 0 {
+		output.WriteByte(0)
+		return
+	}
+	output.WriteByte(1)
+	output.writeVarLong(uint64(value<<1) ^ uint64(value>>63))
+}
+
 func (output *compactOutput) writeNumericString(value string) {
 	number, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
@@ -413,6 +422,25 @@ func (input *compactInput) readVarLong() (uint64, error) {
 		}
 	}
 	return 0, errors.New("variable-length integer is too long")
+}
+
+func (input *compactInput) readNullableLong() (int64, error) {
+	marker, err := input.readByte()
+	if err != nil {
+		return 0, err
+	}
+	switch marker {
+	case 0:
+		return 0, nil
+	case 1:
+		zigzag, err := input.readVarLong()
+		if err != nil {
+			return 0, err
+		}
+		return int64(zigzag>>1) ^ -int64(zigzag&1), nil
+	default:
+		return 0, fmt.Errorf("invalid long marker: %d", marker)
+	}
 }
 
 func (input *compactInput) readEnum() (int, error) {

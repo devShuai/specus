@@ -1,20 +1,11 @@
 using System.Text.Json.Serialization;
 
-namespace ShuaiTunnel.Client.Configuration;
+namespace ShuaiTunnel.Server.Authentication;
 
-// JSON shape mirrors the Java ClientStartupConfig. Runtime tunnel mappings are delivered by
-// /api/client/auth/login and NAT_CONTROL, not by the local startup file.
-
-/// <summary>
-/// Root configuration for the tunnel client, loaded from <c>tunnelClientConfig.json</c>.
-/// </summary>
-public sealed class TunnelClientConfig
+public sealed class ClientAuthLoginRequest
 {
-    [JsonPropertyName("serverBaseUrl")]
-    public string ServerBaseUrl { get; set; } = "";
-
     [JsonPropertyName("authType")]
-    public string AuthType { get; set; } = "apiKey";
+    public string? AuthType { get; set; }
 
     [JsonPropertyName("apiKey")]
     public string? ApiKey { get; set; }
@@ -27,12 +18,57 @@ public sealed class TunnelClientConfig
 
     [JsonPropertyName("password")]
     public string? Password { get; set; }
+
+    [JsonPropertyName("timestamp")]
+    public string? Timestamp { get; set; }
+
+    [JsonPropertyName("nonce")]
+    public string? Nonce { get; set; }
+
+    [JsonPropertyName("signature")]
+    public string? Signature { get; set; }
+
+    [JsonPropertyName("environment")]
+    public ClientEnvironmentInfo? Environment { get; set; }
 }
 
-public sealed class TunnelRuntimeState
+public sealed class ClientEnvironmentInfo
+{
+    [JsonPropertyName("machineFingerprint")]
+    public string? MachineFingerprint { get; set; }
+
+    [JsonPropertyName("hostname")]
+    public string? Hostname { get; set; }
+
+    [JsonPropertyName("osUser")]
+    public string? OsUser { get; set; }
+
+    [JsonPropertyName("osName")]
+    public string? OsName { get; set; }
+
+    [JsonPropertyName("osVersion")]
+    public string? OsVersion { get; set; }
+
+    [JsonPropertyName("osArch")]
+    public string? OsArch { get; set; }
+
+    [JsonPropertyName("clientVersion")]
+    public string? ClientVersion { get; set; }
+
+    [JsonPropertyName("javaVersion")]
+    public string? JavaVersion { get; set; }
+
+    [JsonPropertyName("localAddresses")]
+    public List<string> LocalAddresses { get; set; } = new();
+
+    [JsonPropertyName("startedAt")]
+    public string? StartedAt { get; set; }
+}
+
+public sealed class ClientAuthLoginResponse
 {
     [JsonPropertyName("tenantId")]
-    public string? TenantId { get; set; }
+    public string TenantId { get; set; } = "default";
 
     [JsonPropertyName("clientId")]
     public long ClientId { get; set; }
@@ -62,13 +98,10 @@ public sealed class TunnelRuntimeState
     public ClientPolicy Policy { get; set; } = new();
 
     [JsonPropertyName("tunnelConfigList")]
-    public List<TunnelConfigEntry> TunnelConfigList { get; set; } = new();
+    public List<TunnelEndpoint> TunnelConfigList { get; set; } = new();
 
     [JsonPropertyName("httpTunnelConfigList")]
-    public List<HttpTunnelConfigEntry> HttpTunnelConfigList { get; set; } = new();
-
-    [JsonIgnore]
-    public DateTimeOffset TokenExpiresAt { get; set; }
+    public List<HttpRouteEndpoint> HttpTunnelConfigList { get; set; } = new();
 }
 
 public sealed class ClientPolicy
@@ -83,20 +116,7 @@ public sealed class ClientPolicy
     public long RetryAfterSeconds { get; set; }
 }
 
-public sealed class TunnelConfigSnapshot
-{
-    [JsonPropertyName("tunnelConfigList")]
-    public List<TunnelConfigEntry> TunnelConfigList { get; set; } = new();
-
-    /// <summary>
-    /// Null means the server did not take over HTTP routes. Empty list means clear routes.
-    /// </summary>
-    [JsonPropertyName("httpTunnelConfigList")]
-    public List<HttpTunnelConfigEntry>? HttpTunnelConfigList { get; set; }
-}
-
-/// <summary>A single TCP NAT tunnel registration entry.</summary>
-public sealed class TunnelConfigEntry
+public sealed class TunnelEndpoint
 {
     [JsonPropertyName("port")]
     public int Port { get; set; }
@@ -108,8 +128,7 @@ public sealed class TunnelConfigEntry
     public int TunnelPort { get; set; }
 }
 
-/// <summary>A single direct-HTTP route mapping (route -&gt; targetBaseUrl).</summary>
-public sealed class HttpTunnelConfigEntry
+public sealed class HttpRouteEndpoint
 {
     [JsonPropertyName("route")]
     public string Route { get; set; } = "";

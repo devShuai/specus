@@ -1,8 +1,6 @@
 package protocol
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -17,12 +15,11 @@ type Packet interface {
 	Command() int8
 }
 
-// LoginRequest (command 1) — client authenticates with an HMAC over name/timestamp/nonce.
+// LoginRequest (command 1) — client authenticates with an access token obtained via HTTP login.
 type LoginRequest struct {
-	ClientName string
-	Timestamp  string
-	Nonce      string
-	CheckSign  []byte
+	ClientName      string
+	ClientSessionID int64
+	AccessToken     string
 }
 
 // LoginResponse (command -1).
@@ -246,36 +243,13 @@ func DecodeFrame(data []byte) (Packet, int, error) {
 	return packet, FrameHeaderSize + length, nil
 }
 
-// ---- HMAC login signing --------------------------------------------------------------
-
-// SignatureLength is the fixed byte length of a login HMAC.
-const SignatureLength = 32
-
-// SignLogin computes HMAC-SHA256(SHA256(password), clientName \n timestamp \n nonce).
-func SignLogin(clientName, password, timestamp, nonce string) []byte {
-	key := sha256.Sum256([]byte(password))
-	return SignLoginWithKey(key[:], clientName, timestamp, nonce)
-}
-
-// SignLoginWithKey is SignLogin when the 32-byte key (SHA256 of the password) is already known.
-func SignLoginWithKey(key []byte, clientName, timestamp, nonce string) []byte {
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(clientName))
-	mac.Write([]byte("\n"))
-	mac.Write([]byte(timestamp))
-	mac.Write([]byte("\n"))
-	mac.Write([]byte(nonce))
-	return mac.Sum(nil)
-}
-
 // ---- per-packet codecs ---------------------------------------------------------------
 
 func encodeLoginRequest(p LoginRequest) []byte {
 	output := newCompactOutput()
 	output.writeString(p.ClientName)
-	output.writeNumericString(p.Timestamp)
-	output.writeString(p.Nonce)
-	output.writeByteArray(p.CheckSign)
+	output.writeNullableLong(p.ClientSessionID)
+	output.writeString(p.AccessToken)
 	return output.payload()
 }
 
@@ -288,22 +262,18 @@ func decodeLoginRequest(body []byte) (LoginRequest, error) {
 	if err != nil {
 		return LoginRequest{}, err
 	}
-	timestamp, err := input.readNumericString()
+	sessionID, err := input.readNullableLong()
 	if err != nil {
 		return LoginRequest{}, err
 	}
-	nonce, err := input.readString()
-	if err != nil {
-		return LoginRequest{}, err
-	}
-	checkSign, err := input.readByteArray()
+	accessToken, err := input.readString()
 	if err != nil {
 		return LoginRequest{}, err
 	}
 	if err := input.finish(); err != nil {
 		return LoginRequest{}, err
 	}
-	return LoginRequest{ClientName: clientName, Timestamp: timestamp, Nonce: nonce, CheckSign: checkSign}, nil
+	return LoginRequest{ClientName: clientName, ClientSessionID: sessionID, AccessToken: accessToken}, nil
 }
 
 func encodeLoginResponse(p LoginResponse) []byte {

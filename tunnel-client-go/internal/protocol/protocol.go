@@ -3,8 +3,6 @@ package protocol
 import (
 	"bytes"
 	"compress/flate"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -146,23 +144,11 @@ func WritePacket(writer io.Writer, command int8, body []byte) error {
 	return writeAll(writer, body)
 }
 
-func EncodeLoginRequest(clientName, password, timestamp, nonce string) ([]byte, error) {
-	key := sha256.Sum256([]byte(password))
-	mac := hmac.New(sha256.New, key[:])
-	mac.Write([]byte(clientName))
-	mac.Write([]byte("\n"))
-	mac.Write([]byte(timestamp))
-	mac.Write([]byte("\n"))
-	mac.Write([]byte(nonce))
-	sign := mac.Sum(nil)
-
+func EncodeLoginRequest(clientName string, clientSessionID int64, accessToken string) ([]byte, error) {
 	output := newCompactOutput()
 	output.writeString(clientName)
-	if err := output.writeNumericString(timestamp); err != nil {
-		return nil, err
-	}
-	output.writeString(nonce)
-	output.writeByteArray(sign)
+	output.writeNullableLong(clientSessionID)
+	output.writeString(accessToken)
 	return encodePayload(output.Bytes()), nil
 }
 
@@ -525,6 +511,15 @@ func (output *compactOutput) writeVarLong(value uint64) {
 		value >>= 7
 	}
 	output.WriteByte(byte(value))
+}
+
+func (output *compactOutput) writeNullableLong(value int64) {
+	if value == 0 {
+		output.WriteByte(0)
+		return
+	}
+	output.WriteByte(1)
+	output.writeVarLong(uint64(value<<1) ^ uint64(value>>63))
 }
 
 func (output *compactOutput) writeNumericString(value string) error {
