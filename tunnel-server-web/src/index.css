@@ -271,7 +271,42 @@ body {
 .topology-svg {
   width: 100%;
   height: auto;
-  max-height: 360px;
+  max-height: 480px;
+}
+
+/* 节点框（公网用户 / 客户端 A）：浅色半透明白；暗色半透明深 + 浅色边 */
+.topo-card {
+  fill: rgba(255, 255, 255, 0.55);
+  stroke: rgba(8, 47, 73, 0.18);
+  stroke-width: 1;
+}
+
+.dark .topo-card {
+  fill: rgba(255, 255, 255, 0.04);
+  stroke: rgba(255, 255, 255, 0.16);
+}
+
+/* 客户端 B（Peer 节点）：emerald 强调边 */
+.topo-card-peer {
+  fill: rgba(16, 185, 129, 0.06);
+  stroke: rgba(16, 185, 129, 0.42);
+  stroke-width: 1.2;
+}
+
+.dark .topo-card-peer {
+  fill: rgba(52, 211, 153, 0.08);
+  stroke: rgba(52, 211, 153, 0.55);
+}
+
+/* 中央 Server：浅色保留 url() 渐变；暗色加微发光让它从深底浮出来 */
+.topo-server {
+  stroke: rgba(8, 47, 73, 0.22);
+  stroke-width: 1;
+}
+
+.dark .topo-server {
+  stroke: rgba(34, 211, 238, 0.35);
+  filter: drop-shadow(0 0 18px rgba(34, 211, 238, 0.18));
 }
 
 .topology-relay-flow {

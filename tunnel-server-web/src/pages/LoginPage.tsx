@@ -10,7 +10,7 @@ import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 const metrics = [
   { value: "TCP", label: "公网端口映射" },
   { value: "HTTP", label: "域名路由转发" },
-  { value: "Peer", label: "客户端互联（预览）" },
+  { value: "Peer", label: "客户端互联" },
   { value: "观测", label: "连接与流量审计" },
 ];
 
@@ -67,7 +67,7 @@ const peerNodes = [
   { eyebrow: "发起方", title: "客户端 A", meta: "X25519 公钥已登记" },
   { eyebrow: "控制面", title: "PEER_CONTROL 通道", meta: "ACL 校验 + 信令转发" },
   { eyebrow: "协商", title: "设备清单 + 会话凭证", meta: "iceUsername / iceCredential" },
-  { eyebrow: "对端", title: "客户端 B", meta: "按 virtualIp 路由 · 数据面预览" },
+  { eyebrow: "对端", title: "客户端 B", meta: "按 virtualIp 路由 · 加密 frame 直达" },
 ];
 
 const implementationChips = [
@@ -257,7 +257,7 @@ export function LoginPage() {
           <div className="mb-6 mt-12 max-w-2xl">
             <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">三类接入能力</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-              HTTP 路由和端口映射是当前主路径；客户端互联（Peer）已开通控制面信令，数据面正在按路线图推进。
+              HTTP 路由与端口映射承担反向中继；客户端互联（Peer）通过控制面信令撮合，加密 frame 走 UDP 直连或 TURN 回退。
             </p>
           </div>
 
@@ -293,7 +293,6 @@ export function LoginPage() {
               title="客户端互联：受控对端之间的直连通道"
               description="客户端登录时上报 X25519 公钥并接收 roster；控制面校验 ACL 后撮合两端通过 PEER_CONTROL 通道协商身份与会话凭证。"
               accent="emerald"
-              preview
             >
               <FlowDiagram nodes={peerNodes} variant="peer" />
               <div className="principle-note">
@@ -360,23 +359,30 @@ export function LoginPage() {
 }
 
 /**
- * 拓扑总览图：左侧公网用户、中部 Server 控制面、右侧两个客户端。
- * 中继实线（cyan）= 当前主路径；对端直连虚线（emerald）= Preview。
+ * 拓扑总览图：左 公网用户 / 中 Server 控制面 / 右上 客户端 A / 右下 客户端 B。
+ *
+ * 视觉约定：
+ *  - cyan 实线：经 Server 中继的反向隧道（HTTP/TCP 主路径）。
+ *  - emerald 虚线：客户端互联（信令 + 加密 frame 直连 / TURN 回退）。
+ *
+ * 暗色协调：节点 fill/stroke 走 CSS class `.topo-card-fill / .topo-card-stroke`，
+ * 由 index.css 通过 .light/.dark 切换，避免硬编码白底在暗色下扎眼。
+ * 文字一律 fill="currentColor" 跟随主题。
  */
 function TopologyDiagram() {
   return (
     <div className="rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
       <svg
         className="topology-svg"
-        viewBox="0 0 920 320"
+        viewBox="0 0 1080 440"
         xmlns="http://www.w3.org/2000/svg"
         role="img"
         aria-label="组网形态：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连通道"
       >
         <defs>
-          <linearGradient id="topo-relay-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
-            <stop offset="0%" stopColor="rgb(6,182,212)" stopOpacity="0.9" />
-            <stop offset="100%" stopColor="rgb(34,211,238)" stopOpacity="0.7" />
+          <linearGradient id="topo-relay-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stopColor="rgb(6,182,212)" stopOpacity="0.92" />
+            <stop offset="100%" stopColor="rgb(20,184,166)" stopOpacity="0.82" />
           </linearGradient>
           <marker id="topo-arrow-cyan" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
             <path d="M0,0 L12,6 L0,12 z" fill="rgb(6,182,212)" />
@@ -386,74 +392,92 @@ function TopologyDiagram() {
           </marker>
         </defs>
 
-        {/* 左节点：公网用户 */}
+        {/* 左节点：公网用户 (x: 30-230, y 居中于 220 附近) */}
         <g>
-          <rect x="20" y="115" width="180" height="90" rx="8" fill="rgba(255,255,255,0.55)" stroke="rgba(8,47,73,0.18)" />
-          <text x="110" y="148" textAnchor="middle" fontSize="13" fill="currentColor" fontWeight="600">公网用户 / API</text>
-          <text x="110" y="170" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.7">浏览器 · curl · SSH 等</text>
-          <text x="110" y="188" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.55">无须感知隧道存在</text>
+          <rect className="topo-card" x="30" y="170" width="200" height="100" rx="10" />
+          <text x="130" y="208" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="600">公网用户 / API</text>
+          <text x="130" y="232" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.72">浏览器 · curl · SSH 等</text>
+          <text x="130" y="252" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.55">无须感知隧道存在</text>
         </g>
 
-        {/* 中节点：Server 控制面 */}
+        {/* 中节点：Server 控制面 (x: 420-660, y: 80-360, 宽 240, 高 280) */}
         <g>
-          <rect x="370" y="80" width="180" height="160" rx="8" fill="url(#topo-relay-gradient)" stroke="rgba(8,47,73,0.18)" opacity="0.95" />
-          <text x="460" y="118" textAnchor="middle" fontSize="13" fill="#ffffff" fontWeight="700">Server 控制面</text>
-          <text x="460" y="142" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.9">7010 控制连接 · 8088 管理</text>
-          <text x="460" y="164" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.85">HTTP 网关 · TCP 监听</text>
-          <text x="460" y="186" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.85">租户 / ACL / 路由</text>
-          <text x="460" y="208" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.85">PEER_CONTROL 信令</text>
-          <text x="460" y="228" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.78">实时观测 + 流量审计</text>
+          <rect className="topo-server" x="420" y="80" width="240" height="280" rx="12" fill="url(#topo-relay-gradient)" />
+          <text x="540" y="122" textAnchor="middle" fontSize="15" fill="#ffffff" fontWeight="700">Server 控制面</text>
+          <line x1="450" y1="138" x2="630" y2="138" stroke="rgba(255,255,255,0.35)" strokeWidth="1" />
+          <text x="540" y="166" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">7010 控制连接</text>
+          <text x="540" y="186" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">8088 管理 / HTTP 网关</text>
+          <line x1="450" y1="206" x2="630" y2="206" stroke="rgba(255,255,255,0.22)" strokeWidth="1" />
+          <text x="540" y="232" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">TCP 端口映射</text>
+          <text x="540" y="252" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">租户 · ACL · 路由</text>
+          <text x="540" y="272" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">PEER_CONTROL 信令</text>
+          <line x1="450" y1="292" x2="630" y2="292" stroke="rgba(255,255,255,0.22)" strokeWidth="1" />
+          <text x="540" y="318" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.86">STUN / TURN</text>
+          <text x="540" y="338" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.86">实时观测 · 流量审计</text>
         </g>
 
-        {/* 右上节点：客户端 A */}
+        {/* 右上节点：客户端 A (x: 850-1050, y: 90-200) */}
         <g>
-          <rect x="720" y="60" width="180" height="100" rx="8" fill="rgba(255,255,255,0.55)" stroke="rgba(8,47,73,0.18)" />
-          <text x="810" y="95" textAnchor="middle" fontSize="13" fill="currentColor" fontWeight="600">客户端 A</text>
-          <text x="810" y="117" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.7">内网服务 · 主路径</text>
-          <text x="810" y="137" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.55">127.0.0.1:8080 等</text>
+          <rect className="topo-card" x="850" y="90" width="200" height="110" rx="10" />
+          <text x="950" y="128" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="600">客户端 A</text>
+          <text x="950" y="152" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.72">内网服务 · 反向隧道</text>
+          <text x="950" y="172" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.55">127.0.0.1:8080 等</text>
         </g>
 
-        {/* 右下节点：客户端 B */}
+        {/* 右下节点：客户端 B (x: 850-1050, y: 240-360) */}
         <g>
-          <rect x="720" y="200" width="180" height="100" rx="8" fill="rgba(255,255,255,0.55)" stroke="rgba(16,185,129,0.4)" strokeDasharray="6 4" />
-          <text x="810" y="235" textAnchor="middle" fontSize="13" fill="currentColor" fontWeight="600">客户端 B</text>
-          <text x="810" y="257" textAnchor="middle" fontSize="11" fill="rgb(5,150,105)" opacity="0.95">对端服务 · Preview</text>
-          <text x="810" y="277" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.55">virtualIp 在 100.96.0.0/11</text>
+          <rect className="topo-card-peer" x="850" y="240" width="200" height="120" rx="10" />
+          <text x="950" y="278" textAnchor="middle" fontSize="14" fill="currentColor" fontWeight="600">客户端 B</text>
+          <text x="950" y="302" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="600" className="dark:opacity-[0.95]" opacity="0.95">对端互联</text>
+          <text x="950" y="322" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.62">virtualIp 100.96.0.0/11</text>
+          <text x="950" y="342" textAnchor="middle" fontSize="11.5" fill="currentColor" opacity="0.5">UDP 直连 / TURN 回退</text>
         </g>
 
-        {/* 中继路径：公网用户 → Server */}
-        <line x1="205" y1="155" x2="365" y2="135" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
-        <text x="285" y="125" textAnchor="middle" fontSize="11" fill="rgb(6,182,212)" fontWeight="600">公网请求</text>
+        {/* === 中继路径：公网用户 ↔ Server （上下分开，避免重合） === */}
+        {/* 公网请求：左下 → Server 左上 */}
+        <line x1="232" y1="205" x2="418" y2="170" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
+        <text x="320" y="178" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" fontWeight="600">公网请求</text>
+        {/* 响应：Server 左下 → 公网用户右下 */}
+        <line x1="418" y1="270" x2="232" y2="240" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.6" />
+        <text x="320" y="270" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" opacity="0.78" fontWeight="600">响应</text>
 
-        {/* 中继路径：Server → 客户端 A */}
-        <line x1="555" y1="120" x2="715" y2="100" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
-        <text x="635" y="90" textAnchor="middle" fontSize="11" fill="rgb(6,182,212)" fontWeight="600">隧道回传</text>
+        {/* === 中继路径：Server ↔ 客户端 A === */}
+        <line x1="662" y1="160" x2="848" y2="130" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
+        <text x="755" y="135" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" fontWeight="600">下发 / 转发</text>
+        <line x1="848" y1="180" x2="662" y2="195" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.6" />
+        <text x="755" y="205" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" opacity="0.78" fontWeight="600">上行字节</text>
 
-        {/* 返回路径：Server → 公网用户 */}
-        <line x1="365" y1="185" x2="205" y2="185" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.55" />
-        <text x="285" y="200" textAnchor="middle" fontSize="11" fill="rgb(6,182,212)" opacity="0.7">响应</text>
+        {/* === 信令路径：Server ↔ 客户端 B（emerald 虚线，label 放线上方留白处） === */}
+        <line x1="662" y1="290" x2="848" y2="280" stroke="rgb(16,185,129)" strokeWidth="2" strokeDasharray="6 5" markerEnd="url(#topo-arrow-emerald)" className="topology-peer-flow" />
+        <text x="755" y="270" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="700">信令 · ACL</text>
+        <line x1="848" y1="320" x2="662" y2="330" stroke="rgb(16,185,129)" strokeWidth="2" strokeDasharray="6 5" markerEnd="url(#topo-arrow-emerald)" className="topology-peer-flow" opacity="0.6" />
+        <text x="755" y="350" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" opacity="0.78" fontWeight="600">心跳 · 设备上报</text>
 
-        {/* 返回路径：客户端 A → Server */}
-        <line x1="715" y1="140" x2="555" y2="150" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.55" />
-
-        {/* 信令路径：Server ↔ 客户端 B */}
-        <line x1="555" y1="220" x2="715" y2="240" stroke="rgb(16,185,129)" strokeWidth="2" strokeDasharray="4 4" markerEnd="url(#topo-arrow-emerald)" className="topology-peer-flow" />
-        <text x="635" y="232" textAnchor="middle" fontSize="11" fill="rgb(5,150,105)" fontWeight="600">信令 + ACL</text>
-
-        {/* Peer 直连：客户端 A ↔ 客户端 B */}
+        {/* === Peer 直连：客户端 A ↔ 客户端 B（垂直方向，靠右走，远离 Server 边） === */}
         <path
-          d="M 810 160 C 870 180, 870 200, 810 200"
+          d="M 1010 200 C 1080 215, 1080 235, 1010 250"
           fill="none"
           stroke="rgb(16,185,129)"
           strokeWidth="2"
-          strokeDasharray="4 6"
+          strokeDasharray="5 6"
           markerEnd="url(#topo-arrow-emerald)"
           className="topology-peer-flow"
         />
-        <text x="900" y="183" textAnchor="end" fontSize="11" fill="rgb(5,150,105)" fontWeight="600">Peer 直连</text>
+        <path
+          d="M 890 200 C 870 215, 870 235, 890 250"
+          fill="none"
+          stroke="rgb(16,185,129)"
+          strokeWidth="2"
+          strokeDasharray="5 6"
+          markerEnd="url(#topo-arrow-emerald)"
+          className="topology-peer-flow"
+          opacity="0.7"
+        />
+        <text x="950" y="226" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="700">Peer 直连</text>
       </svg>
       <p className="mt-3 text-tiny leading-5 text-zinc-600 dark:text-zinc-400">
-        实线（cyan）= 当前可用的中继主路径；虚线（emerald）= 受控客户端之间的对端互联，控制面信令已就绪、数据面预览中。
+        实线（青）= 经 Server 中继的反向隧道，HTTP 路由与 TCP 端口映射走这条主路径；
+        虚线（绿）= 客户端互联，控制面下发设备清单与会话凭证后，两端在 UDP 直连或 TURN 回退上跑加密 frame 数据面。
       </p>
     </div>
   );
