@@ -57,6 +57,8 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile long lastRelayCandidateRequestMillis;
     private volatile ScheduledExecutorService maintenanceExecutor;
     private static final long SESSION_REFRESH_WINDOW_MILLIS = 120_000;
+    private static final long DIRECT_STALE_MILLIS = 45_000;
+    private static final long PENDING_PROBE_TTL_MILLIS = 15_000;
 
     public PeerMeshClient(ClientAuthLoginResponse.PeerMeshConfig config, ControlSender controlSender) {
         this(config, controlSender, new PeerVirtualDeviceOptions("noop", "shuai0", 1400));
@@ -502,8 +504,10 @@ public class PeerMeshClient implements AutoCloseable {
                 if (running) {
                     reportTrafficDeltas();
                     removeExpiredSessions();
+                    cleanupPendingProbes();
                     requestPeerServerCandidates();
                     announceCandidatesToOnlinePeers();
+                    probeKnownCandidates();
                 }
             } catch (Exception e) {
                 log.debug("Peer mesh maintenance failed: {}", e.getMessage());
@@ -722,6 +726,36 @@ public class PeerMeshClient implements AutoCloseable {
         sessions.entrySet().removeIf(entry -> entry.getValue().isExpired(now));
     }
 
+    private void cleanupPendingProbes() {
+        long now = System.currentTimeMillis();
+        pendingProbes.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
+    }
+
+    private void probeKnownCandidates() {
+        if (!running || config == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (PeerInfo peer : peers.values()) {
+            if (!peer.online() || peer.candidates().isEmpty()) {
+                continue;
+            }
+            PeerSession session = sessions.get(peer.clientId());
+            if (session == null || session.isExpired(now)) {
+                continue;
+            }
+            PeerControlMessage control = new PeerControlMessage();
+            control.setSourceClientId(config.getClientId());
+            control.setSourceClientName(config.getClientName());
+            control.setTargetClientId(peer.clientId());
+            control.setTargetClientName(peer.clientName());
+            control.setSessionId(session.sessionId());
+            control.setToken(session.token());
+            control.setCandidates(peer.candidates());
+            sendConnectivityChecks(control);
+        }
+    }
+
     private void completeUdpProbe(PeerUdpProbe probe, InetSocketAddress observedRemote, String relayFromAllocationId) {
         PendingProbe pending = pendingProbes.remove(probe.getNonce());
         if (pending == null || !pending.sessionId().equals(probe.getSessionId())) {
@@ -731,7 +765,13 @@ public class PeerMeshClient implements AutoCloseable {
         if (session == null || !session.token().equals(probe.getToken())) {
             return;
         }
-        long rttMillis = Math.max(0, System.currentTimeMillis() - pending.sentAtMillis());
+        long now = System.currentTimeMillis();
+        if (pending.relay() && session.hasHealthyDirect(now)) {
+            log.debug("Peer mesh relay UDP path ignored because direct path is healthy: session={}, peer={}",
+                    session.sessionId(), session.peerId());
+            return;
+        }
+        long rttMillis = Math.max(0, now - pending.sentAtMillis());
         String remote = pending.relay()
                 ? "relay:" + (StringUtils.hasText(relayFromAllocationId) ? relayFromAllocationId : pending.relayId())
                 : observedRemote.getAddress().getHostAddress() + ":" + observedRemote.getPort();
@@ -739,6 +779,7 @@ public class PeerMeshClient implements AutoCloseable {
         session.remoteEndpoint = pending.relay() ? relayEndpoint() : observedRemote;
         session.relayTargetAllocationId = pending.relay() ? pending.relayId() : null;
         String pathType = pending.relay() ? "RELAY" : "DIRECT";
+        session.markPath(pathType, now);
         log.info("Peer mesh {} UDP path active: session={}, peer={}, remote={}, rtt={}ms",
                 pathType.toLowerCase(), session.sessionId(), session.peerId(), remote, rttMillis);
         reportPath(session, pathType, local, remote, rttMillis);
@@ -961,6 +1002,9 @@ public class PeerMeshClient implements AutoCloseable {
         private final AtomicLong outboundSequence = new AtomicLong();
         private final AtomicLong directBytesSinceReport = new AtomicLong();
         private volatile long lastInboundSequence = -1;
+        private volatile long lastDirectSuccessMillis;
+        private volatile long lastRelaySuccessMillis;
+        private volatile String currentPathType = "";
         private volatile InetSocketAddress remoteEndpoint;
         private volatile String relayTargetAllocationId;
 
@@ -979,6 +1023,9 @@ public class PeerMeshClient implements AutoCloseable {
             next.remoteEndpoint = remoteEndpoint;
             next.lastInboundSequence = lastInboundSequence;
             next.relayTargetAllocationId = relayTargetAllocationId;
+            next.lastDirectSuccessMillis = lastDirectSuccessMillis;
+            next.lastRelaySuccessMillis = lastRelaySuccessMillis;
+            next.currentPathType = currentPathType;
             return next;
         }
 
@@ -1026,6 +1073,21 @@ public class PeerMeshClient implements AutoCloseable {
 
         long drainDirectBytes() {
             return directBytesSinceReport.getAndSet(0);
+        }
+
+        void markPath(String pathType, long nowMillis) {
+            if ("DIRECT".equals(pathType)) {
+                lastDirectSuccessMillis = nowMillis;
+            } else if ("RELAY".equals(pathType)) {
+                lastRelaySuccessMillis = nowMillis;
+            }
+            currentPathType = pathType;
+        }
+
+        boolean hasHealthyDirect(long nowMillis) {
+            return "DIRECT".equals(currentPathType)
+                    && lastDirectSuccessMillis > 0
+                    && nowMillis - lastDirectSuccessMillis <= DIRECT_STALE_MILLIS;
         }
 
         boolean isExpired(long nowMillis) {
