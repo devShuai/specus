@@ -217,12 +217,88 @@ body {
   --principle-accent: 217, 119, 6;
 }
 
+.principle-card-emerald {
+  --principle-accent: 16, 185, 129;
+}
+
 .dark .principle-card-cyan {
   --principle-accent: 34, 211, 238;
 }
 
 .dark .principle-card-amber {
   --principle-accent: 251, 191, 36;
+}
+
+.dark .principle-card-emerald {
+  --principle-accent: 52, 211, 153;
+}
+
+/* Preview 角标：用于「客户端互联」这种数据面尚在路线图上的能力卡片 */
+.preview-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px dashed rgba(16, 185, 129, 0.5);
+  border-radius: 4px;
+  background: rgba(16, 185, 129, 0.08);
+  color: rgb(5, 150, 105);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+}
+
+.preview-badge::before {
+  width: 6px;
+  height: 6px;
+  content: "";
+  border-radius: 999px;
+  background: rgb(16, 185, 129);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+}
+
+.dark .preview-badge {
+  border-color: rgba(52, 211, 153, 0.55);
+  background: rgba(52, 211, 153, 0.1);
+  color: rgb(110, 231, 183);
+}
+
+.dark .preview-badge::before {
+  background: rgb(52, 211, 153);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.7);
+}
+
+/* 拓扑总览图：纯 SVG，三个 column 节点，中继实线 + 直连虚线动画 */
+.topology-svg {
+  width: 100%;
+  height: auto;
+  max-height: 360px;
+}
+
+.topology-relay-flow {
+  stroke-dasharray: 6 6;
+  animation: topology-relay-march 1.8s linear infinite;
+}
+
+.topology-peer-flow {
+  stroke-dasharray: 4 6;
+  animation: topology-peer-march 2.6s linear infinite;
+}
+
+@keyframes topology-relay-march {
+  from { stroke-dashoffset: 24; }
+  to { stroke-dashoffset: 0; }
+}
+
+@keyframes topology-peer-march {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: 30; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .topology-relay-flow,
+  .topology-peer-flow {
+    animation: none;
+  }
 }
 
 .principle-badge {

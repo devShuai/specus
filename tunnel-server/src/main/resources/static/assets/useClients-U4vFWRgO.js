@@ -1,0 +1,1 @@
+import{r}from"./react-vendor-Cxj4_JbA.js";import{a as o,n as i}from"./index-ElBiYV_C.js";function l(){const[s,e]=r.useState([]),t=r.useCallback(async()=>{try{e(await o.listClients())}catch(a){i(a,"加载客户端失败")}},[]);return r.useEffect(()=>{t()},[t]),{clients:s,reload:t}}export{l as u};

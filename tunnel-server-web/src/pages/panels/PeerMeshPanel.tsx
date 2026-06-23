@@ -249,8 +249,9 @@ export function PeerMeshPanel() {
               <TableHeader>
                 <TableColumn>Peer</TableColumn>
                 <TableColumn>路径</TableColumn>
-                <TableColumn>状态</TableColumn>
-                <TableColumn>更新时间</TableColumn>
+                <TableColumn>RTT</TableColumn>
+                <TableColumn>Endpoint</TableColumn>
+                <TableColumn>过期</TableColumn>
               </TableHeader>
               <TableBody items={sessions} isLoading={loading} emptyContent="暂无 peer session">
                 {(session) => (
@@ -261,13 +262,27 @@ export function PeerMeshPanel() {
                         <span className="text-tiny text-default-400">{"-> "}{session.targetClientName}</span>
                       </div>
                     </TableCell>
-                    <TableCell>{session.pathType}</TableCell>
                     <TableCell>
-                      <Chip size="sm" color={session.status === "ACTIVE" ? "success" : "default"} variant="flat">
-                        {session.status}
-                      </Chip>
+                      <div className="flex flex-col gap-1">
+                        <Chip size="sm" color={session.status === "ACTIVE" ? "success" : "default"} variant="flat">
+                          {session.pathType}
+                        </Chip>
+                        <span className="text-tiny text-default-400">{session.status}</span>
+                      </div>
                     </TableCell>
-                    <TableCell>{formatDateTime(session.updatedAt)}</TableCell>
+                    <TableCell>{session.rttMillis == null ? "-" : `${session.rttMillis} ms`}</TableCell>
+                    <TableCell>
+                      <div className="flex max-w-56 flex-col break-all text-tiny">
+                        <span>local: {session.localEndpoint || "-"}</span>
+                        <span className="text-default-400">remote: {session.remoteEndpoint || "-"}</span>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-col text-tiny">
+                        <span>{formatDateTime(session.expiresAt)}</span>
+                        <span className="text-default-400">更新 {formatDateTime(session.updatedAt)}</span>
+                      </div>
+                    </TableCell>
                   </TableRow>
                 )}
               </TableBody>

@@ -301,6 +301,9 @@ export interface PeerMeshSession {
   targetClientName: string;
   pathType: "DIRECT" | "RELAY" | string;
   status: "NEGOTIATING" | "ACTIVE" | "CLOSED" | string;
+  rttMillis: number | null;
+  localEndpoint: string | null;
+  remoteEndpoint: string | null;
   startedAt: string;
   updatedAt: string;
   expiresAt: string;

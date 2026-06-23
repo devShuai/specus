@@ -10,34 +10,44 @@ import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 const metrics = [
   { value: "TCP", label: "公网端口映射" },
   { value: "HTTP", label: "域名路由转发" },
-  { value: "OIDC", label: "统一身份接入" },
-  { value: "实时", label: "连接与流量观测" },
+  { value: "Peer", label: "客户端互联（预览）" },
+  { value: "观测", label: "连接与流量审计" },
 ];
 
 const featureCards = [
   {
-    label: "服务发布",
-    title: "TCP 与 HTTP 统一暴露",
-    description: "公网端口映射、HTTP 路由和内网目标地址集中编排，适合开发联调、私有 API 和内部工具访问。",
+    label: "多语言",
+    title: "跨实现客户端",
+    description: "Java / Go / .NET / C 四种实现共享同一份二进制协议，字节级兼容，可按团队技术栈与部署形态任意选型混搭。",
   },
   {
-    label: "租户隔离",
-    title: "一套 Server 承载多组团队",
-    description: "管理数据按租户边界隔离，配合本地 JWT 或 OIDC claim，让不同团队看到自己的客户端、映射和连接记录。",
+    label: "身份",
+    title: "OIDC + 本地账号双登录",
+    description: "本地用户名密码与 OIDC 单点登录可同时开启。PKCE、JWT 与 OIDC claim 一同驱动多租户权限隔离。",
   },
   {
-    label: "实时观测",
-    title: "连接质量和流量趋势可视化",
-    description: "在线连接、成功率、拒绝连接、客户端流量排行和历史统计在管理台内直接查看。",
+    label: "隔离",
+    title: "多租户与路由级 ACL",
+    description: "一套 Server 承载多组团队。客户端、HTTP 路由、端口映射、连接记录全部按租户隔离展示。",
   },
   {
-    label: "集中治理",
-    title: "客户端、密钥和映射策略统一维护",
-    description: "客户端注册、密钥轮换、映射启停和路由推送都通过管理面完成，减少分散配置带来的运维成本。",
+    label: "改写",
+    title: "HTTP 路径与流量自适应",
+    description: "内网 SPA 的绝对路径自动加前缀，运行时拦截 fetch / XHR / WebSocket，让既有应用不改一行代码即可走隧道。",
+  },
+  {
+    label: "观测",
+    title: "实时连接与流量审计",
+    description: "在线连接、HTTP 协议记录、TCP 帧追踪、流量趋势与 WebSocket 推送，运维问题在管理台内一站式定位。",
+  },
+  {
+    label: "自托管",
+    title: "TLS / 数据库 / 部署可选",
+    description: "TLS 三模式（明文 / 文件 / 自签）、SQLite / MySQL / PostgreSQL 任选其一、systemd 滚动升级与失败自动回滚。",
   },
 ];
 
-const flowNodes = ["公网入口", "租户鉴权", "策略编排", "内网服务"];
+const flowNodes = ["公网入口", "控制面鉴权", "策略编排", "内网服务 · 对端客户端"];
 
 const httpRouteNodes = [
   { eyebrow: "公网用户", title: "app.example.com", meta: "GET /api/orders" },
@@ -51,6 +61,20 @@ const portMappingNodes = [
   { eyebrow: "Server", title: "监听 9000", meta: "端口规则匹配" },
   { eyebrow: "隧道连接", title: "Demo client", meta: "复用已登录长连接" },
   { eyebrow: "内网目标", title: "127.0.0.1:22", meta: "转发到真实服务" },
+];
+
+const peerNodes = [
+  { eyebrow: "发起方", title: "客户端 A", meta: "X25519 公钥已登记" },
+  { eyebrow: "控制面", title: "PEER_CONTROL 通道", meta: "ACL 校验 + 信令转发" },
+  { eyebrow: "协商", title: "设备清单 + 会话凭证", meta: "iceUsername / iceCredential" },
+  { eyebrow: "对端", title: "客户端 B", meta: "按 virtualIp 路由 · 数据面预览" },
+];
+
+const implementationChips = [
+  { name: "Java", note: "Spring Boot · 跨平台 jar" },
+  { name: "Go", note: "单二进制 · 各 OS/架构" },
+  { name: ".NET", note: "自包含或运行时" },
+  { name: "C", note: "实验性 · 资源最小" },
 ];
 
 const inputClassNames = {
@@ -117,7 +141,7 @@ export function LoginPage() {
             <div className="max-w-3xl">
               <h1 className="text-5xl font-semibold leading-tight text-zinc-950 dark:text-white">shuai-tunnel</h1>
               <p className="mt-5 max-w-2xl text-lg leading-8 text-zinc-700 dark:text-zinc-300">
-                把内网服务发布、客户端治理、多租户隔离和实时观测收束到一个控制面，让公网入口更可控，团队协作更清晰。
+                把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测、TLS 自带电池。
               </p>
             </div>
 
@@ -223,16 +247,24 @@ export function LoginPage() {
       <section className="relative z-10 border-t border-black/10 bg-white/65 px-5 py-10 backdrop-blur-md dark:border-white/10 dark:bg-black/50 sm:px-8">
         <div className="mx-auto max-w-[1440px]">
           <div className="mb-6 max-w-2xl">
-            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">转发原理</h2>
+            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">组网形态</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-              同一个 Server 控制面承接两类入口：HTTP 根据域名和路径选路，TCP 根据公网端口找到对应的客户端隧道。
+              一套控制面承担两类流量：公网用户经 Server 中继访问内网服务，受控客户端之间在控制面协调下走对端互联通道。
+            </p>
+          </div>
+          <TopologyDiagram />
+
+          <div className="mb-6 mt-12 max-w-2xl">
+            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">三类接入能力</h2>
+            <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+              HTTP 路由和端口映射是当前主路径；客户端互联（Peer）已开通控制面信令，数据面正在按路线图推进。
             </p>
           </div>
 
-          <div className="mb-10 grid gap-4 2xl:grid-cols-2">
+          <div className="mb-10 grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
             <PrincipleCard
               badge="HTTP route"
-              title="HTTP 路由：按 Host 和 Path 进入内网 Web 服务"
+              title="HTTP 路由：按 Host 与 Path 进入内网 Web 服务"
               description="请求先进 Server 的 HTTP 网关，管理端配置决定命中哪个租户、客户端和目标地址，再把请求沿客户端长连接送回内网。"
               accent="cyan"
             >
@@ -255,15 +287,29 @@ export function LoginPage() {
                 <span>Target: Demo → 127.0.0.1:22</span>
               </div>
             </PrincipleCard>
+
+            <PrincipleCard
+              badge="Peer mesh"
+              title="客户端互联：受控对端之间的直连通道"
+              description="客户端登录时上报 X25519 公钥并接收 roster；控制面校验 ACL 后撮合两端通过 PEER_CONTROL 通道协商身份与会话凭证。"
+              accent="emerald"
+              preview
+            >
+              <FlowDiagram nodes={peerNodes} variant="peer" />
+              <div className="principle-note">
+                <span>Tunnel CIDR: 100.96.0.0/11</span>
+                <span>Identity: X25519 公钥 + iceCredential</span>
+              </div>
+            </PrincipleCard>
           </div>
 
-          <div className="mb-6 max-w-2xl">
-            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">功能矩阵</h2>
+          <div className="mb-6 mt-12 max-w-2xl">
+            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">平台特性</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-              从客户端接入到连接观测，管理端提供一套面向团队协作的隧道运维入口。
+              从协议字节级兼容到部署形态，shuai-tunnel 把传统反向隧道工具缺失的工程化关切补齐。
             </p>
           </div>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {featureCards.map((feature) => (
               <Card
                 key={feature.title}
@@ -281,10 +327,135 @@ export function LoginPage() {
             ))}
           </div>
 
+          <div className="mt-12 flex flex-col gap-3 rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-base font-semibold text-zinc-950 dark:text-white">四种实现 · 一份协议</span>
+              <span className="rounded-md border border-emerald-500/25 bg-emerald-300/15 px-2 py-0.5 text-tiny text-emerald-700 dark:border-emerald-300/25 dark:bg-emerald-300/10 dark:text-emerald-100">
+                字节级兼容
+              </span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {implementationChips.map((chip) => (
+                <span
+                  key={chip.name}
+                  className="inline-flex items-baseline gap-1.5 rounded-md border border-black/10 bg-white/65 px-3 py-1.5 text-tiny text-zinc-700 dark:border-white/10 dark:bg-white/[0.04] dark:text-zinc-300"
+                >
+                  <span className="font-semibold text-cyan-700 dark:text-cyan-200">{chip.name}</span>
+                  <span className="text-zinc-500 dark:text-zinc-500">·</span>
+                  <span>{chip.note}</span>
+                </span>
+              ))}
+            </div>
+            <p className="text-tiny leading-5 text-zinc-600 dark:text-zinc-400">
+              控制连接 11 字节定长包头（magic / version / serializer / command / length）+ 紧凑二进制载荷。
+              不同语言客户端登录到同一台 Server，无须任何字段适配。
+            </p>
+          </div>
+
           <ClientDownloadsSection />
         </div>
       </section>
     </main>
+  );
+}
+
+/**
+ * 拓扑总览图：左侧公网用户、中部 Server 控制面、右侧两个客户端。
+ * 中继实线（cyan）= 当前主路径；对端直连虚线（emerald）= Preview。
+ */
+function TopologyDiagram() {
+  return (
+    <div className="rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
+      <svg
+        className="topology-svg"
+        viewBox="0 0 920 320"
+        xmlns="http://www.w3.org/2000/svg"
+        role="img"
+        aria-label="组网形态：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连通道"
+      >
+        <defs>
+          <linearGradient id="topo-relay-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stopColor="rgb(6,182,212)" stopOpacity="0.9" />
+            <stop offset="100%" stopColor="rgb(34,211,238)" stopOpacity="0.7" />
+          </linearGradient>
+          <marker id="topo-arrow-cyan" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L12,6 L0,12 z" fill="rgb(6,182,212)" />
+          </marker>
+          <marker id="topo-arrow-emerald" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L12,6 L0,12 z" fill="rgb(16,185,129)" />
+          </marker>
+        </defs>
+
+        {/* 左节点：公网用户 */}
+        <g>
+          <rect x="20" y="115" width="180" height="90" rx="8" fill="rgba(255,255,255,0.55)" stroke="rgba(8,47,73,0.18)" />
+          <text x="110" y="148" textAnchor="middle" fontSize="13" fill="currentColor" fontWeight="600">公网用户 / API</text>
+          <text x="110" y="170" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.7">浏览器 · curl · SSH 等</text>
+          <text x="110" y="188" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.55">无须感知隧道存在</text>
+        </g>
+
+        {/* 中节点：Server 控制面 */}
+        <g>
+          <rect x="370" y="80" width="180" height="160" rx="8" fill="url(#topo-relay-gradient)" stroke="rgba(8,47,73,0.18)" opacity="0.95" />
+          <text x="460" y="118" textAnchor="middle" fontSize="13" fill="#ffffff" fontWeight="700">Server 控制面</text>
+          <text x="460" y="142" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.9">7010 控制连接 · 8088 管理</text>
+          <text x="460" y="164" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.85">HTTP 网关 · TCP 监听</text>
+          <text x="460" y="186" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.85">租户 / ACL / 路由</text>
+          <text x="460" y="208" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.85">PEER_CONTROL 信令</text>
+          <text x="460" y="228" textAnchor="middle" fontSize="11" fill="#ffffff" opacity="0.78">实时观测 + 流量审计</text>
+        </g>
+
+        {/* 右上节点：客户端 A */}
+        <g>
+          <rect x="720" y="60" width="180" height="100" rx="8" fill="rgba(255,255,255,0.55)" stroke="rgba(8,47,73,0.18)" />
+          <text x="810" y="95" textAnchor="middle" fontSize="13" fill="currentColor" fontWeight="600">客户端 A</text>
+          <text x="810" y="117" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.7">内网服务 · 主路径</text>
+          <text x="810" y="137" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.55">127.0.0.1:8080 等</text>
+        </g>
+
+        {/* 右下节点：客户端 B */}
+        <g>
+          <rect x="720" y="200" width="180" height="100" rx="8" fill="rgba(255,255,255,0.55)" stroke="rgba(16,185,129,0.4)" strokeDasharray="6 4" />
+          <text x="810" y="235" textAnchor="middle" fontSize="13" fill="currentColor" fontWeight="600">客户端 B</text>
+          <text x="810" y="257" textAnchor="middle" fontSize="11" fill="rgb(5,150,105)" opacity="0.95">对端服务 · Preview</text>
+          <text x="810" y="277" textAnchor="middle" fontSize="11" fill="currentColor" opacity="0.55">virtualIp 在 100.96.0.0/11</text>
+        </g>
+
+        {/* 中继路径：公网用户 → Server */}
+        <line x1="205" y1="155" x2="365" y2="135" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
+        <text x="285" y="125" textAnchor="middle" fontSize="11" fill="rgb(6,182,212)" fontWeight="600">公网请求</text>
+
+        {/* 中继路径：Server → 客户端 A */}
+        <line x1="555" y1="120" x2="715" y2="100" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
+        <text x="635" y="90" textAnchor="middle" fontSize="11" fill="rgb(6,182,212)" fontWeight="600">隧道回传</text>
+
+        {/* 返回路径：Server → 公网用户 */}
+        <line x1="365" y1="185" x2="205" y2="185" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.55" />
+        <text x="285" y="200" textAnchor="middle" fontSize="11" fill="rgb(6,182,212)" opacity="0.7">响应</text>
+
+        {/* 返回路径：客户端 A → Server */}
+        <line x1="715" y1="140" x2="555" y2="150" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.55" />
+
+        {/* 信令路径：Server ↔ 客户端 B */}
+        <line x1="555" y1="220" x2="715" y2="240" stroke="rgb(16,185,129)" strokeWidth="2" strokeDasharray="4 4" markerEnd="url(#topo-arrow-emerald)" className="topology-peer-flow" />
+        <text x="635" y="232" textAnchor="middle" fontSize="11" fill="rgb(5,150,105)" fontWeight="600">信令 + ACL</text>
+
+        {/* Peer 直连：客户端 A ↔ 客户端 B */}
+        <path
+          d="M 810 160 C 870 180, 870 200, 810 200"
+          fill="none"
+          stroke="rgb(16,185,129)"
+          strokeWidth="2"
+          strokeDasharray="4 6"
+          markerEnd="url(#topo-arrow-emerald)"
+          className="topology-peer-flow"
+        />
+        <text x="900" y="183" textAnchor="end" fontSize="11" fill="rgb(5,150,105)" fontWeight="600">Peer 直连</text>
+      </svg>
+      <p className="mt-3 text-tiny leading-5 text-zinc-600 dark:text-zinc-400">
+        实线（cyan）= 当前可用的中继主路径；虚线（emerald）= 受控客户端之间的对端互联，控制面信令已就绪、数据面预览中。
+      </p>
+    </div>
   );
 }
 
@@ -397,12 +568,14 @@ function PrincipleCard({
   badge,
   children,
   description,
+  preview,
   title,
 }: {
-  accent: "amber" | "cyan";
+  accent: "amber" | "cyan" | "emerald";
   badge: string;
   children: ReactNode;
   description: string;
+  preview?: boolean;
   title: string;
 }) {
   return (
@@ -412,7 +585,10 @@ function PrincipleCard({
     >
       <CardBody className="gap-5 p-5">
         <div className="flex flex-col gap-2">
-          <span className="principle-badge w-fit rounded-md px-2 py-1 text-tiny">{badge}</span>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="principle-badge w-fit rounded-md px-2 py-1 text-tiny">{badge}</span>
+            {preview && <span className="preview-badge">Preview</span>}
+          </div>
           <h3 className="text-lg font-semibold text-zinc-950 dark:text-white">{title}</h3>
           <p className="text-small leading-6 text-zinc-600 dark:text-zinc-400">{description}</p>
         </div>
@@ -427,7 +603,7 @@ function FlowDiagram({
   variant,
 }: {
   nodes: Array<{ eyebrow: string; title: string; meta: string }>;
-  variant: "http" | "port";
+  variant: "http" | "port" | "peer";
 }) {
   return (
     <div className={`principle-flowgrid principle-flowgrid-${variant}`} aria-label={`${variant} 转发流程`}>

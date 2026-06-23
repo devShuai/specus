@@ -20,13 +20,23 @@ public final class PeerKeyStore {
     }
 
     public static String publicKeyBase64() {
+        return keyMaterial().publicKeyBase64();
+    }
+
+    public static String privateKeyBase64() {
+        return keyMaterial().privateKeyBase64();
+    }
+
+    public static synchronized KeyMaterial keyMaterial() {
         try {
             Path directory = Path.of(System.getProperty("user.home"), DIRECTORY);
             Path publicKey = directory.resolve(PUBLIC_KEY_FILE);
-            if (Files.exists(publicKey)) {
-                String existing = Files.readString(publicKey, StandardCharsets.UTF_8).trim();
-                if (StringUtils.hasText(existing)) {
-                    return existing;
+            Path privateKey = directory.resolve(PRIVATE_KEY_FILE);
+            if (Files.exists(publicKey) && Files.exists(privateKey)) {
+                String existingPublic = Files.readString(publicKey, StandardCharsets.UTF_8).trim();
+                String existingPrivate = Files.readString(privateKey, StandardCharsets.UTF_8).trim();
+                if (StringUtils.hasText(existingPublic) && StringUtils.hasText(existingPrivate)) {
+                    return new KeyMaterial(existingPublic, existingPrivate);
                 }
             }
             Files.createDirectories(directory);
@@ -35,11 +45,14 @@ public final class PeerKeyStore {
             String encodedPublic = Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded());
             String encodedPrivate = Base64.getEncoder().encodeToString(keyPair.getPrivate().getEncoded());
             Files.writeString(publicKey, encodedPublic, StandardCharsets.UTF_8);
-            Files.writeString(directory.resolve(PRIVATE_KEY_FILE), encodedPrivate, StandardCharsets.UTF_8);
-            return encodedPublic;
+            Files.writeString(privateKey, encodedPrivate, StandardCharsets.UTF_8);
+            return new KeyMaterial(encodedPublic, encodedPrivate);
         } catch (Exception e) {
             log.warn("生成 peer mesh X25519 公钥失败: {}", e.getMessage());
-            return "";
+            return new KeyMaterial("", "");
         }
+    }
+
+    public record KeyMaterial(String publicKeyBase64, String privateKeyBase64) {
     }
 }

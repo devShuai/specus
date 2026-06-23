@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
+import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
@@ -185,7 +186,7 @@ public class PeerMeshService {
     }
 
     @Transactional
-    public PeerMeshSessionView createSession(ClientAccount source, ClientAccount target, String pathType) {
+    public PeerSessionGrant createSession(ClientAccount source, ClientAccount target, String pathType) {
         if (!canPeer(source, target)) {
             throw new IllegalArgumentException("peer access denied");
         }
@@ -204,6 +205,33 @@ public class PeerMeshService {
         session.setStartedAt(now.toString());
         session.setUpdatedAt(now.toString());
         session.setExpiresAt(now.plusSeconds(properties.getSessionTtlSeconds()).toString());
+        return new PeerSessionGrant(toSessionView(sessionRepository.save(session)), token);
+    }
+
+    @Transactional
+    public PeerMeshSessionView reportPath(ClientAccount reporter, PeerControlMessage report) {
+        if (report.getSessionId() == null || report.getSessionId() <= 0) {
+            throw new IllegalArgumentException("sessionId is required");
+        }
+        PeerMeshSession session = sessionRepository.findById(report.getSessionId())
+                .filter(row -> row.getTenantId().equals(reporter.getTenantId()))
+                .orElseThrow(() -> new IllegalArgumentException("peer session not found: " + report.getSessionId()));
+        boolean reporterInSession = reporter.getId().equals(session.getSourceClientId())
+                || reporter.getId().equals(session.getTargetClientId());
+        if (!reporterInSession) {
+            throw new IllegalArgumentException("peer session report source mismatch");
+        }
+        Instant now = Instant.now();
+        if (StringUtils.hasText(report.getPathType())) {
+            session.setPathType(limit(report.getPathType(), 40));
+        }
+        session.setStatus(StringUtils.hasText(report.getStatus())
+                ? limit(report.getStatus(), 40)
+                : STATUS_ACTIVE);
+        session.setRttMillis(report.getRttMillis());
+        session.setLocalEndpoint(limit(report.getLocalEndpoint(), 255));
+        session.setRemoteEndpoint(limit(report.getRemoteEndpoint(), 255));
+        session.setUpdatedAt(now.toString());
         return toSessionView(sessionRepository.save(session));
     }
 
@@ -223,7 +251,7 @@ public class PeerMeshService {
             if (visible.isEmpty()) {
                 return List.of();
             }
-            sessions = sessionRepository.findByTenantIdAndSourceClientIdInOrderByUpdatedAtDesc(
+            sessions = sessionRepository.findVisible(
                     context.tenant().tenantId(), visible, PageRequest.of(0, pageSize));
         }
         return sessions.stream().map(this::toSessionView).toList();
@@ -348,6 +376,9 @@ public class PeerMeshService {
                 session.getTargetClientName(),
                 session.getPathType(),
                 session.getStatus(),
+                session.getRttMillis(),
+                session.getLocalEndpoint(),
+                session.getRemoteEndpoint(),
                 session.getStartedAt(),
                 session.getUpdatedAt(),
                 session.getExpiresAt(),
@@ -414,5 +445,8 @@ public class PeerMeshService {
     }
 
     public record PeerRosterItem(long clientId, String clientName, String virtualIp, String publicKey, boolean online) {
+    }
+
+    public record PeerSessionGrant(PeerMeshSessionView session, String token) {
     }
 }

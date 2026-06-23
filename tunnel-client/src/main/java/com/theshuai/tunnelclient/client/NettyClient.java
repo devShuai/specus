@@ -3,7 +3,9 @@ package com.theshuai.tunnelclient.client;
 import com.theshuai.common.codec.PacketDecoder;
 import com.theshuai.common.codec.PacketEncoder;
 import com.theshuai.common.codec.Spliter;
+import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
+import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.handler.*;
 import com.theshuai.tunnelclient.peer.PeerMeshClient;
@@ -93,7 +95,7 @@ public class NettyClient {
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
         this.sslContext = sslContext;
-        this.peerMeshClient = new PeerMeshClient(tunnelBean.getPeerMesh());
+        this.peerMeshClient = new PeerMeshClient(tunnelBean.getPeerMesh(), this::sendPeerControl);
     }
 
     public void start() {
@@ -205,6 +207,26 @@ public class NettyClient {
         loginRequestPacket.setClientSessionId(clientSessionId);
         loginRequestPacket.setAccessToken(accessToken);
         channel.writeAndFlush(loginRequestPacket);
+    }
+
+    private void sendPeerControl(String toClientName, String message) {
+        Channel channel = controlChannel.get();
+        if (channel == null || !channel.isActive()) {
+            log.debug("Peer mesh 信令暂无法发送: control channel inactive");
+            return;
+        }
+        MessageRequestPacket packet = new MessageRequestPacket();
+        packet.setClientName(clientName);
+        packet.setToClientName(toClientName);
+        packet.setMessageType(MessageType.PEER_CONTROL);
+        packet.setMessage(message);
+        channel.writeAndFlush(packet).addListener(future -> {
+            if (!future.isSuccess()) {
+                log.warn("Peer mesh 信令发送失败: {}", future.cause() == null
+                        ? "unknown"
+                        : future.cause().getMessage());
+            }
+        });
     }
 
     /** 由 {@link LoginResponseHandler} 在收到 success=true 时回调，重置退避计数。 */

@@ -57,4 +57,13 @@ public class PeerMeshSession {
 
     @Column(name = "closed_at", length = 40)
     private String closedAt;
+
+    @Column(name = "rtt_millis")
+    private Long rttMillis;
+
+    @Column(name = "local_endpoint", length = 255)
+    private String localEndpoint;
+
+    @Column(name = "remote_endpoint", length = 255)
+    private String remoteEndpoint;
 }

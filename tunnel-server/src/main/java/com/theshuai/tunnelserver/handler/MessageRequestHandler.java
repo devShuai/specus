@@ -41,7 +41,7 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
 
     private void peerControl(MessageRequestPacket messageRequestPacket, Session session) {
         try {
-            peerSignalService.forward(messageRequestPacket, session);
+            peerSignalService.handle(messageRequestPacket, session);
         } catch (Exception e) {
             log.warn("[peer-mesh] signal rejected from {} to {}: {}",
                     session == null ? "?" : session.getClientName(),
