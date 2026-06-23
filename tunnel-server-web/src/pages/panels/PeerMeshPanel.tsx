@@ -56,6 +56,7 @@ export function PeerMeshPanel() {
   const onlineDevices = useMemo(() => devices.filter((device) => device.online), [devices]);
   const directSessions = useMemo(() => sessions.filter((session) => session.pathType === "DIRECT"), [sessions]);
   const relaySessions = useMemo(() => sessions.filter((session) => session.pathType === "RELAY"), [sessions]);
+  const activeSessions = useMemo(() => sessions.filter((session) => session.status !== "CLOSED"), [sessions]);
   const peerTrafficBytes = useMemo(
     () => sessions.reduce((total, session) => total + (session.directBytes || 0) + (session.relayBytes || 0), 0),
     [sessions],
@@ -140,6 +141,8 @@ export function PeerMeshPanel() {
           </CardBody>
         </Card>
       )}
+
+      <TopologyView devices={devices} sessions={activeSessions} />
 
       <section className="space-y-2">
         <h3 className="text-base font-semibold">设备与虚拟 IP</h3>
@@ -331,6 +334,92 @@ export function PeerMeshPanel() {
       </section>
     </div>
   );
+}
+
+function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessions: PeerMeshSession[] }) {
+  const deviceById = useMemo(() => new Map(devices.map((device) => [device.clientId, device])), [devices]);
+  const enabledDevices = devices.filter((device) => device.enabled);
+
+  return (
+    <Card shadow="none" className="rounded-md border border-default-200">
+      <CardBody className="gap-3 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 className="text-base font-semibold">组网拓扑</h3>
+            <p className="text-small text-default-500">按虚拟 IP、在线状态和当前 direct/relay 会话聚合展示。</p>
+          </div>
+          <Chip size="sm" variant="flat">
+            {sessions.length} 条链路
+          </Chip>
+        </div>
+
+        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+          {(enabledDevices.length > 0 ? enabledDevices : devices).slice(0, 8).map((device) => (
+            <div key={device.clientId} className="rounded-md border border-default-200 bg-content1 p-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="truncate font-semibold">{device.clientName}</div>
+                  <div className="font-mono text-small text-default-500">{device.virtualIp || "-"}</div>
+                </div>
+                <Chip size="sm" color={device.online ? "success" : "default"} variant="flat">
+                  {device.online ? "online" : "offline"}
+                </Chip>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1 text-tiny text-default-500">
+                <span>{device.ownerUsername || "-"}</span>
+                <span>{device.natType || "NAT 未知"}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="grid gap-2 lg:grid-cols-2">
+          {sessions.length === 0 ? (
+            <div className="rounded-md border border-dashed border-default-200 p-4 text-small text-default-500">
+              暂无活跃 peer 链路。
+            </div>
+          ) : (
+            sessions.slice(0, 12).map((session) => {
+              const source = deviceById.get(session.sourceClientId);
+              const target = deviceById.get(session.targetClientId);
+              const traffic = (session.directBytes || 0) + (session.relayBytes || 0);
+              return (
+                <div key={session.id} className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0 text-small font-semibold">
+                      <span>{session.sourceClientName}</span>
+                      <span className="px-2 text-default-400">{"->"}</span>
+                      <span>{session.targetClientName}</span>
+                    </div>
+                    <Chip size="sm" color={pathColor(session.pathType, session.status)} variant="flat">
+                      {session.pathType} · {session.status}
+                    </Chip>
+                  </div>
+                  <div className="mt-2 grid gap-1 text-tiny text-default-500 sm:grid-cols-2">
+                    <span>
+                      {source?.virtualIp || "-"} {"->"} {target?.virtualIp || "-"}
+                    </span>
+                    <span>RTT {session.rttMillis == null ? "-" : `${session.rttMillis} ms`}</span>
+                    <span>direct {formatBytes(session.directBytes)}</span>
+                    <span>relay {formatBytes(session.relayBytes)}</span>
+                    <span>总流量 {formatBytes(traffic)}</span>
+                    <span>最后 {formatDateTime(session.lastTrafficAt || session.updatedAt)}</span>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function pathColor(pathType: string, status: string): "default" | "success" | "warning" {
+  if (status !== "ACTIVE") {
+    return "default";
+  }
+  return pathType === "DIRECT" ? "success" : "warning";
 }
 
 function MetricCard({
