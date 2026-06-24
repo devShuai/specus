@@ -122,6 +122,9 @@ export function LoginPage() {
           <AppLogo label="shuai-tunnel" subtitle="内网服务接入控制面" />
           <div className="flex items-center gap-2">
             <ThemeToggleButton className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" />
+            <Button as="a" href="#/nat-detect" radius="sm" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" variant="flat">
+              NAT 检测
+            </Button>
             <Button radius="sm" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" variant="flat" onPress={focusLogin}>
               进入控制台
             </Button>

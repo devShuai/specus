@@ -21,6 +21,7 @@ const LazyHttpRoutesPanel = lazy(() => import("./panels/HttpRoutesPanel").then((
 const LazyConnectionsPanel = lazy(() => import("./panels/ConnectionsPanel").then((module) => ({ default: module.ConnectionsPanel })));
 const LazyTrafficPanel = lazy(() => import("./panels/TrafficPanel").then((module) => ({ default: module.TrafficPanel })));
 const LazyPeerMeshPanel = lazy(() => import("./panels/PeerMeshPanel").then((module) => ({ default: module.PeerMeshPanel })));
+const LazyNatDetectionPanel = lazy(() => import("./panels/NatDetectionPanel").then((module) => ({ default: module.NatDetectionPanel })));
 const LazyClientDownloadsPanel = lazy(() => import("./panels/ClientDownloadsPanel").then((module) => ({ default: module.ClientDownloadsPanel })));
 const LazyHelpPanel = lazy(() => import("./panels/HelpPanel").then((module) => ({ default: module.HelpPanel })));
 const LazySystemPanel = lazy(() => import("./panels/SystemPanel").then((module) => ({ default: module.SystemPanel })));
@@ -31,6 +32,7 @@ const panels = [
   { key: "tunnels", title: "端口映射" },
   { key: "http-routes", title: "HTTP 路由" },
   { key: "peer-mesh", title: "私有组网" },
+  { key: "nat-detect", title: "NAT 检测" },
   { key: "connections", title: "连接记录" },
   { key: "traffic", title: "流量使用" },
   { key: "downloads", title: "客户端下载" },
@@ -365,6 +367,8 @@ function ActivePanel({
       return <LazyHttpRoutesPanel />;
     case "peer-mesh":
       return <LazyPeerMeshPanel />;
+    case "nat-detect":
+      return <LazyNatDetectionPanel />;
     case "connections":
       return <LazyConnectionsPanel />;
     case "traffic":
