@@ -29,7 +29,7 @@
 
 ## 服务端配置
 
-systemd 环境变量示例已在 `tunnel-server/deploy/systemd/tunnel-server.env.example` 中维护。核心配置如下：
+systemd 环境变量示例已在 `deploy/java-server/systemd/tunnel-server.env.example` 中维护。核心配置如下：
 
 ```env
 TUNNEL_PEER_MESH_ENABLED=false

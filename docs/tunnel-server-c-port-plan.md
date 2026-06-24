@@ -12,7 +12,7 @@
 当前工程位置：
 
 ```text
-tunnel-server-c/
+implementations/c/server/
 ```
 
 ## 当前状态
@@ -40,7 +40,7 @@ tunnel-server-c/
 ## 项目布局
 
 ```text
-tunnel-server-c/
+implementations/c/server/
 ├── CMakeLists.txt
 ├── Makefile
 ├── README.md
@@ -68,7 +68,7 @@ tunnel-server-c/
 
 **任务**：
 
-- 固定 Java wire fixtures 来源，继续复用 `tunnel-protocol-csharp/tests/fixtures/*.bin`。
+- 固定 Java wire fixtures 来源，继续复用 `implementations/csharp/protocol/tests/fixtures/*.bin`。
 - 把 C 测试拆出协议测试文件，避免所有测试堆在 `crypto_tests.c`。
 - 补齐以下 fixture 覆盖：
   - `login_request.bin` decode
@@ -88,7 +88,7 @@ tunnel-server-c/
 **验收**：
 
 ```bash
-make -C tunnel-server-c test
+make -C implementations/c/server test
 ```
 
 协议 fixture 测试全绿。
@@ -129,7 +129,7 @@ make -C tunnel-server-c test
 
 **验收**：
 
-- `make -C tunnel-server-c test` 全绿。
+- `make -C implementations/c/server test` 全绿。
 - Java fixtures 覆盖的包可以全部 decode。
 - C 编码出的非压缩 fixture 与 Java 字节一致；压缩 fixture 在相同 zlib 输出下保持一致，否则至少 decode payload 一致。
 
@@ -159,12 +159,12 @@ make -C tunnel-server-c test
 **验收**：
 
 ```bash
-make -C tunnel-server-c test
+make -C implementations/c/server test
 
 TUNNEL_NETTY_PORT=17010 \
 TUNNEL_CLIENT_NAME="Demo client" \
 TUNNEL_CLIENT_PASSWORD="test1234" \
-tunnel-server-c/build/shuai-tunnel-server-c
+implementations/c/server/build/shuai-tunnel-server-c
 ```
 
 Java client 连接后日志出现登录成功，C server 日志出现 `login ok`，心跳不断开。
@@ -468,22 +468,22 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 
 ```bash
 # 构建并测试
-make -C tunnel-server-c test
+make -C implementations/c/server test
 
 # 清理构建产物
-make -C tunnel-server-c clean
+make -C implementations/c/server clean
 
 # 单客户端控制通道
 TUNNEL_NETTY_PORT=7010 \
 TUNNEL_CLIENT_NAME="Demo client" \
 TUNNEL_CLIENT_PASSWORD="test1234" \
-tunnel-server-c/build/shuai-tunnel-server-c
+implementations/c/server/build/shuai-tunnel-server-c
 
 # 单客户端 + TCP NAT
 TUNNEL_NETTY_PORT=7010 \
 TUNNEL_CLIENT_NAME="Demo client" \
 TUNNEL_CLIENT_PASSWORD="test1234" \
 TUNNEL_TCP_MAPPINGS="18080=127.0.0.1:8080" \
-tunnel-server-c/build/shuai-tunnel-server-c
+implementations/c/server/build/shuai-tunnel-server-c
 ```
 

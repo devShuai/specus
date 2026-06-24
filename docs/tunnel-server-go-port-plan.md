@@ -1,11 +1,11 @@
 # tunnel-server Go 移植计划与状态
 
-Go 实现的 shuai-tunnel 服务端(`tunnel-server-go/`),module `github.com/devShuai/shuai-tunnel/tunnel-server-go`,Go 1.26。与 Java client / C# server 线协议字节兼容。分 5 个阶段交付,每阶段 `go build ./... && go test ./... && go vet ./...` 全绿。
+Go 实现的 shuai-tunnel 服务端(`implementations/go/server/`),module 仍为 `github.com/devShuai/shuai-tunnel/tunnel-server-go`,Go 1.26。与 Java client / C# server 线协议字节兼容。分 5 个阶段交付,每阶段 `go build ./... && go test ./... && go vet ./...` 全绿。
 
 ## 项目布局
 
 ```
-tunnel-server-go/
+implementations/go/server/
 ├── cmd/shuai-tunnel-server/main.go
 ├── web/static/{index.html,app.js,app.css}   # 内嵌 SPA(同 Java/C#)
 └── internal/{protocol,config,store,auth,session,control,nat,directhttp,management,security,wsevents}
@@ -58,7 +58,7 @@ tunnel-server-go/
 ## 常用命令
 
 ```bash
-cd tunnel-server-go
+cd implementations/go/server
 go build ./...
 go test ./...
 go vet ./...

@@ -17,9 +17,9 @@
 
 现状：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
   - `processRegister` 每注册一个端口都会 new 一个 `TcpServer`。
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
   - 每个 `TcpServer.bind` 都创建新的 boss/worker `MultiThreadIoEventLoopGroup`。
 
 风险：
@@ -38,9 +38,9 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `tunnel-server/src/main/resources/application.yml`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P0。
 
@@ -48,9 +48,9 @@
 
 现状：
 
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/client/TcpConnection.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/TcpConnection.java`
   - 每次连接本地服务都创建新的 `MultiThreadIoEventLoopGroup`。
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
   - 每个远端 CONNECTED 都 new 一个 `TcpConnection`。
 
 风险：
@@ -65,9 +65,9 @@
 
 涉及文件：
 
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/client/TcpConnection.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/client/NettyClient.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/TcpConnection.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/NettyClient.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
 
 优先级：P0。
 
@@ -94,9 +94,9 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
-- `tunnel-server/src/main/resources/application.yml`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
+- `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P0。
 
@@ -123,12 +123,12 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
 
 优先级：P0。
 
@@ -138,7 +138,7 @@
 
 现状：
 
-- `tunnel-common/src/main/java/com/theshuai/common/codec/Spliter.java`
+- `implementations/java/common/src/main/java/com/theshuai/common/codec/Spliter.java`
   - `LengthFieldBasedFrameDecoder` 的最大帧是 `Integer.MAX_VALUE`。
 
 风险：
@@ -149,15 +149,15 @@
 建议：
 
 - 增加 `tunnel.netty.max-frame-size`，默认先按 16MB 或 32MB。
-- 与 Go 客户端 `tunnel-client-go/internal/protocol/protocol.go` 中的 `maxFrameSize` 对齐。
+- 与 Go 客户端 `implementations/go/client/internal/protocol/protocol.go` 中的 `maxFrameSize` 对齐。
 - 对 NAT 数据帧和 HTTP 直连帧分别设上限。
 
 涉及文件：
 
-- `tunnel-common/src/main/java/com/theshuai/common/codec/Spliter.java`
-- `tunnel-common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
-- `tunnel-client-go/internal/protocol/protocol.go`
-- `tunnel-server/src/main/resources/application.yml`
+- `implementations/java/common/src/main/java/com/theshuai/common/codec/Spliter.java`
+- `implementations/java/common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
+- `implementations/go/client/internal/protocol/protocol.go`
+- `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P0。
 
@@ -183,14 +183,14 @@
 
 涉及文件：
 
-- `tunnel-common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
-- `tunnel-common/src/main/java/com/theshuai/common/protocol/NatMessagePacket.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
-- `tunnel-client-go/internal/protocol/protocol.go`
-- `tunnel-client-go/internal/client/nat.go`
+- `implementations/java/common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
+- `implementations/java/common/src/main/java/com/theshuai/common/protocol/NatMessagePacket.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/go/client/internal/protocol/protocol.go`
+- `implementations/go/client/internal/client/nat.go`
 
 优先级：P1。
 
@@ -214,13 +214,13 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/ManagedLoginRequestHandler.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/client/NettyClient.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
-- `tunnel-client-go/internal/client/client.go`
-- `tunnel-client-go/internal/client/nat.go`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/ManagedLoginRequestHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/NettyClient.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/go/client/internal/client/client.go`
+- `implementations/go/client/internal/client/nat.go`
 
 优先级：P1。若 10k 多为空闲连接，可排在背压之后；若 10k 都活跃传输，应提前。
 
@@ -247,10 +247,10 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
-- `tunnel-server/pom.xml`
-- `tunnel-server/src/main/resources/application.yml`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
+- `implementations/java/server/pom.xml`
+- `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P0/P1。
 
@@ -269,9 +269,9 @@
 
 涉及文件：
 
-- `tunnel-common/src/main/java/com/theshuai/common/handler/SocketIdleStateHandler.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
+- `implementations/java/common/src/main/java/com/theshuai/common/handler/SocketIdleStateHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
 
 优先级：P1。
 
@@ -299,10 +299,10 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/management/service/ClientManagementService.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/handler/ManagedLoginRequestHandler.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/config/ServerExecutorConfig.java`
-- `tunnel-server/src/main/resources/application.yml`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/ClientManagementService.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/ManagedLoginRequestHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/config/ServerExecutorConfig.java`
+- `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P1。
 
@@ -321,8 +321,8 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/management/service/TrafficUsageService.java`
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/management/repository/TrafficUsageRepository.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/TrafficUsageService.java`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/repository/TrafficUsageRepository.java`
 
 优先级：P2。
 
@@ -346,11 +346,11 @@
 
 涉及文件：
 
-- `tunnel-server/src/main/java/com/theshuai/tunnelserver/http/HttpTunnelController.java`
-- `tunnel-common/src/main/java/com/theshuai/common/manager/DirectHttpFutureManager.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/DirectHttpRequestHandler.java`
-- `tunnel-client/src/main/java/com/theshuai/tunnelclient/handler/DirectHttpForwarder.java`
-- `tunnel-client-go/internal/client/http.go`
+- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/http/HttpTunnelController.java`
+- `implementations/java/common/src/main/java/com/theshuai/common/manager/DirectHttpFutureManager.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/DirectHttpRequestHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/DirectHttpForwarder.java`
+- `implementations/go/client/internal/client/http.go`
 
 优先级：P2，除非 10k 目标就是 HTTP 并发。
 
@@ -358,8 +358,8 @@
 
 现状：
 
-- `tunnel-client-go/internal/client/client.go` 中所有写控制连接都走 `writeMu`。
-- `tunnel-client-go/internal/client/nat.go` 每个本地连接一个 goroutine 读本地，再串行写同一控制连接。
+- `implementations/go/client/internal/client/client.go` 中所有写控制连接都走 `writeMu`。
+- `implementations/go/client/internal/client/nat.go` 每个本地连接一个 goroutine 读本地，再串行写同一控制连接。
 - 协议层 `protocol.go` 会对 payload 做压缩尝试。
 
 建议：
@@ -371,9 +371,9 @@
 
 涉及文件：
 
-- `tunnel-client-go/internal/client/client.go`
-- `tunnel-client-go/internal/client/nat.go`
-- `tunnel-client-go/internal/protocol/protocol.go`
+- `implementations/go/client/internal/client/client.go`
+- `implementations/go/client/internal/client/nat.go`
+- `implementations/go/client/internal/protocol/protocol.go`
 
 优先级：P1。
 
@@ -425,7 +425,7 @@ TLS：
 
 建议新增或扩展：
 
-- `tunnel-server/src/test/java/com/theshuai/tunnelserver/integration/EndToEndTunnelIT.java`
+- `implementations/java/server/src/test/java/com/theshuai/tunnelserver/integration/EndToEndTunnelIT.java`
 - 新增独立压测工具目录，例如 `tools/loadtest/`，优先 Go 实现 raw TCP 压测。
 
 优先级：P0。

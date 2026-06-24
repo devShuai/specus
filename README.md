@@ -1,6 +1,6 @@
 # shuai-tunnel
 
-`shuai-tunnel` 是一个基于 Spring Boot 和 Netty 的 Java 内网穿透实验项目。它在公网服务端和内网客户端之间维护一条控制连接，并在收到映射配置后，将公网 TCP 端口上的流量转发到客户端可访问的本地服务。
+`shuai-tunnel` 是一个以内网服务接入为核心的多语言实验项目。Java 版本是当前参考实现；Go、C#、C 版本按同一协议逐步对齐。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务。
 
 > 当前仓库适合用于学习和继续开发，不建议直接用于生产环境。现有功能和待完善项详见[当前状态](#当前状态)。
 
@@ -30,26 +30,28 @@ flowchart TD
 
 | 模块 | 说明 |
 | --- | --- |
-| `tunnel-common` | 公共协议、编解码器、登录鉴权、心跳、会话、消息和同步 HTTP 请求能力 |
-| `tunnel-protocol-csharp` | .NET 协议库(独立模块),server/client 共同 ProjectReference 复用 |
-| `tunnel-server` | 公网服务端（Java 参考实现），监听控制连接，并为已注册映射创建公网 TCP 监听端口 |
-| `tunnel-server-go` | Go 服务端移植，与 Java 服务端线协议字节兼容，支持多库(sqlite/pg/mysql) |
-| `tunnel-server-csharp` | .NET 服务端移植(EF Core,多库) |
-| `tunnel-server-c` | C 服务端移植(实验性) |
-| `tunnel-server-web` | 管理后台前端(React + HeroUI),构建产物供各服务端静态托管 |
-| `tunnel-client` | Java 内网客户端，连接服务端，并将隧道数据转发至目标内网服务 |
-| `tunnel-client-go` | Go 内网客户端，与 Java 客户端使用相同配置和紧凑二进制协议 |
-| `tunnel-client-csharp` | .NET 内网客户端,与 Java/Go 客户端字节兼容 |
+| `implementations/java/common` | Java 公共协议、编解码器、登录鉴权、心跳、会话、消息和同步 HTTP 请求能力，Maven artifact 为 `tunnel-common` |
+| `implementations/java/server` | 公网服务端（Java 参考实现），监听控制连接，并为已注册映射创建公网 TCP 监听端口，Maven artifact 为 `tunnel-server` |
+| `implementations/java/client` | Java 内网客户端，连接服务端，并将隧道数据转发至目标内网服务，Maven artifact 为 `tunnel-client` |
+| `apps/admin-web` | 管理后台前端(React + HeroUI)，构建产物供各服务端静态托管 |
+| `deploy/java-server` | Java server 的 systemd 安装、更新脚本和环境变量模板 |
+| `protocol/spec` | 跨语言协议说明、数据面/控制面规范入口 |
+| `implementations/go/server` | Go 服务端移植，与 Java 服务端线协议字节兼容，支持多库(sqlite/pg/mysql) |
+| `implementations/go/client` | Go 内网客户端，与 Java 客户端使用相同配置和紧凑二进制协议 |
+| `implementations/csharp/protocol` | .NET 协议库，server/client 共同 ProjectReference 复用 |
+| `implementations/csharp/server` | .NET 服务端移植(EF Core,多库) |
+| `implementations/csharp/client` | .NET 内网客户端，与 Java/Go 客户端字节兼容 |
+| `implementations/c/server` | C 服务端移植(实验性) |
 
 主要入口：
 
-- 服务端(Java)：`tunnel-server/src/main/java/com/theshuai/tunnelserver/TunnelServerApplication.java`
-- 服务端(Go)：`tunnel-server-go/cmd/shuai-tunnel-server/main.go`
-- 客户端(Java)：`tunnel-client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`
-- 客户端(Go)：`tunnel-client-go/cmd/shuai-tunnel-client/main.go`
-- 客户端(.NET)：`tunnel-client-csharp/src/ShuaiTunnel.Client/Program.cs`
-- 管理后台前端：`tunnel-server-web/`(`npm run dev` / `npm run deploy:java|go|csharp`)
-- 协议实现：`tunnel-common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
+- 服务端(Java)：`implementations/java/server/src/main/java/com/theshuai/tunnelserver/TunnelServerApplication.java`
+- 服务端(Go)：`implementations/go/server/cmd/shuai-tunnel-server/main.go`
+- 客户端(Java)：`implementations/java/client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`
+- 客户端(Go)：`implementations/go/client/cmd/shuai-tunnel-client/main.go`
+- 客户端(.NET)：`implementations/csharp/client/src/ShuaiTunnel.Client/Program.cs`
+- 管理后台前端：`apps/admin-web/`(`npm run dev` / `npm run deploy:java|go|csharp`)
+- 协议实现：`implementations/java/common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
 
 ## 环境要求
 
@@ -68,7 +70,7 @@ flowchart TD
 mvn clean install
 ```
 
-`tunnel-server` 的 Maven 构建会在 `generate-resources` 阶段执行 `tunnel-server-web` 的 `npm run deploy:java`：先构建 React 管理后台，再把 `dist/` 只同步到 Java server 的 `src/main/resources/static/`。首次构建前请在 `tunnel-server-web` 下执行一次 `npm ci` 安装依赖。
+`tunnel-server` 的 Maven 构建会在 `generate-resources` 阶段执行 `apps/admin-web` 的 `npm run deploy:java`：先构建 React 管理后台，再把 `dist/` 只同步到 Java server 的 `src/main/resources/static/`。首次构建前请在 `apps/admin-web` 下执行一次 `npm ci` 安装依赖。
 
 如只想构建后端、跳过前端打包与产物同步：
 
@@ -83,7 +85,7 @@ Go / C# server 构建各自处理自己的前端产物：C# 项目构建时执�
 ### 1. 启动服务端
 
 ```bash
-cd tunnel-server
+cd implementations/java/server
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
@@ -108,7 +110,7 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 
 ### 2. 配置并启动客户端
 
-客户端从当前工作目录读取 `tunnelClientConfig.json`。在 `tunnel-client` 目录中创建或修改该文件：
+客户端从当前工作目录读取 `tunnelClientConfig.json`。在 `implementations/java/client` 目录中创建或修改该文件：
 
 ```json
 {
@@ -126,12 +128,12 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `apiKey` | 管理后台创建的客户端启动凭证 key |
 | `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求 |
 
-> 完整示例见 `tunnel-client-go/tunnelClientConfig.example.json`。
+> 完整示例见 `implementations/go/client/tunnelClientConfig.example.json`。
 
 启动客户端：
 
 ```bash
-cd tunnel-client
+cd implementations/java/client
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 

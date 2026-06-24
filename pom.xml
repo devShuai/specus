@@ -14,9 +14,9 @@
     <packaging>pom</packaging>
     <version>1.0-SNAPSHOT</version>
     <modules>
-        <module>tunnel-common</module>
-        <module>tunnel-client</module>
-        <module>tunnel-server</module>
+        <module>implementations/java/common</module>
+        <module>implementations/java/client</module>
+        <module>implementations/java/server</module>
     </modules>
 
     <properties>

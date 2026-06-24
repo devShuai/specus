@@ -45,10 +45,10 @@
 
 | 模块 | 路径 | 职责 |
 | --- | --- | --- |
-| `tunnel-common` | `tunnel-common/src/main/java/com/theshuai/common` | 协议、编解码、命令、序列化、HMAC、通用 Handler、`Session`/`SyncFuture` |
-| `tunnel-server` | `tunnel-server/src/main/java/com/theshuai/tunnelserver` | Netty 服务端、管理 REST、登录鉴权、HTTP 直转入口、TLS、持久化、归档 |
-| `tunnel-client` | `tunnel-client/src/main/java/com/theshuai/tunnelclient` | Java 客户端：启动、读取本地配置、控制连接重连、本地连接池 |
-| `tunnel-client-go` | `tunnel-client-go` | Go 客户端：与 Java 客户端协议对等，登录后还会注册本地 `tunnelConfigList` |
+| `tunnel-common` | `implementations/java/common/src/main/java/com/theshuai/common` | 协议、编解码、命令、序列化、HMAC、通用 Handler、`Session`/`SyncFuture` |
+| `tunnel-server` | `implementations/java/server/src/main/java/com/theshuai/tunnelserver` | Netty 服务端、管理 REST、登录鉴权、HTTP 直转入口、TLS、持久化、归档 |
+| `tunnel-client` | `implementations/java/client/src/main/java/com/theshuai/tunnelclient` | Java 客户端：启动、读取本地配置、控制连接重连、本地连接池 |
+| `implementations/go/client` | `implementations/go/client` | Go 客户端：与 Java 客户端协议对等，登录后还会注册本地 `tunnelConfigList` |
 | `tools/` | `tools/` | 负载测试与运维辅助脚本 |
 
 模块之间**只有 Java 三模块互相依赖**，Go 客户端独立维护协议实现，因此协议变更需要同步两套实现。
@@ -424,21 +424,21 @@ Admin UI               AdminController        ClientManagementService    NatCont
 
 | 主题 | 入口 |
 | --- | --- |
-| 服务端启动 | `tunnel-server/.../TunnelServerApplication.java` |
-| Netty 服务 | `tunnel-server/.../server/NettyServer.java`、`server/TcpServer.java`、`server/RemotePortServerManager.java` |
-| 公网入站 | `tunnel-server/.../handler/RemoteTunnelHandler.java` |
-| 控制连接 | `tunnel-server/.../handler/NatServerHandler.java`、`handler/ManagedLoginRequestHandler.java` |
-| 管理 REST | `tunnel-server/.../management/controller/{Admin,Auth,Oidc}Controller.java` |
-| 管理服务 | `tunnel-server/.../management/service/{ClientManagement,NatControl,TrafficUsage,ConnectionArchive}Service.java` |
-| 安全 | `tunnel-server/.../security/{LocalTokenService,PasswordService,TlsContextFactory,TlsProperties}.java` |
-| HTTP 直转 | `tunnel-server/.../http/HttpTunnelController.java` |
-| 协议核心 | `tunnel-common/.../protocol/{PacketCodec,Packet,NatMessagePacket,NatMessageType,MessageType}.java` |
-| 编解码 | `tunnel-common/.../codec/{Spliter,PacketDecoder,PacketEncoder,PacketCodecHandler}.java` |
-| 命令枚举 | `tunnel-common/.../command/Command.java` |
-| 序列化 | `tunnel-common/.../serialize/**` |
-| HMAC | `tunnel-common/.../security/HmacSigner.java` |
-| Java 客户端 | `tunnel-client/.../client/{NettyClient,LocalTunnelHandler,UdpConnection}.java` |
-| Go 客户端 | `tunnel-client-go/internal/client/{client,nat,http,config}.go`、`internal/protocol/protocol.go` |
+| 服务端启动 | `implementations/java/server/.../TunnelServerApplication.java` |
+| Netty 服务 | `implementations/java/server/.../server/NettyServer.java`、`server/TcpServer.java`、`server/RemotePortServerManager.java` |
+| 公网入站 | `implementations/java/server/.../handler/RemoteTunnelHandler.java` |
+| 控制连接 | `implementations/java/server/.../handler/NatServerHandler.java`、`handler/ManagedLoginRequestHandler.java` |
+| 管理 REST | `implementations/java/server/.../management/controller/{Admin,Auth,Oidc}Controller.java` |
+| 管理服务 | `implementations/java/server/.../management/service/{ClientManagement,NatControl,TrafficUsage,ConnectionArchive}Service.java` |
+| 安全 | `implementations/java/server/.../security/{LocalTokenService,PasswordService,TlsContextFactory,TlsProperties}.java` |
+| HTTP 直转 | `implementations/java/server/.../http/HttpTunnelController.java` |
+| 协议核心 | `implementations/java/common/.../protocol/{PacketCodec,Packet,NatMessagePacket,NatMessageType,MessageType}.java` |
+| 编解码 | `implementations/java/common/.../codec/{Spliter,PacketDecoder,PacketEncoder,PacketCodecHandler}.java` |
+| 命令枚举 | `implementations/java/common/.../command/Command.java` |
+| 序列化 | `implementations/java/common/.../serialize/**` |
+| HMAC | `implementations/java/common/.../security/HmacSigner.java` |
+| Java 客户端 | `implementations/java/client/.../client/{NettyClient,LocalTunnelHandler,UdpConnection}.java` |
+| Go 客户端 | `implementations/go/client/internal/client/{client,nat,http,config}.go`、`internal/protocol/protocol.go` |
 
 ---
 
