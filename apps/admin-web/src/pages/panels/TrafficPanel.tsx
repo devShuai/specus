@@ -678,16 +678,16 @@ function HttpExchangeTable({
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
       <CardBody className="gap-3 p-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between">
           <div>
             <h3 className="text-small font-semibold">HTTP 协议记录</h3>
             <p className="text-tiny text-default-500">请求行、响应状态、headers 与 body 预览</p>
           </div>
-          <div className="flex min-w-0 flex-1 flex-wrap items-end justify-end gap-2">
-            <label className="flex w-full flex-col gap-1 sm:w-40">
+          <div className="flex flex-wrap items-end gap-2 lg:flex-1 lg:justify-end">
+            <label className="flex min-w-[6.5rem] flex-1 flex-col gap-1 sm:flex-none sm:w-32">
               <span className="text-tiny text-default-500">搜索字段</span>
               <select
-                className="h-10 rounded-medium border border-default-200 bg-default-50 px-3 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+                className="h-9 rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
                 value={searchField}
                 onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
               >
@@ -698,10 +698,10 @@ function HttpExchangeTable({
                 ))}
               </select>
             </label>
-            <label className="flex w-full flex-col gap-1 sm:w-32">
+            <label className="flex min-w-[6rem] flex-1 flex-col gap-1 sm:flex-none sm:w-28">
               <span className="text-tiny text-default-500">返回类型</span>
               <select
-                className="h-10 rounded-medium border border-default-200 bg-default-50 px-3 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+                className="h-9 rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
                 value={responseType}
                 onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
               >
@@ -713,7 +713,8 @@ function HttpExchangeTable({
               </select>
             </label>
             <Input
-              className="w-full sm:w-80"
+              classNames={{ inputWrapper: "h-9 min-h-9" }}
+              className="w-full sm:w-64 lg:w-72"
               label="搜索"
               placeholder={searchFieldOption.placeholder}
               size="sm"
@@ -725,12 +726,14 @@ function HttpExchangeTable({
               }}
               onValueChange={onSearchDraftChange}
             />
-            <Button size="sm" variant="flat" onPress={onSearch}>
-              搜索
-            </Button>
-            <Button size="sm" variant="flat" onPress={onResetSearch}>
-              重置
-            </Button>
+            <div className="flex gap-2">
+              <Button className="h-9" size="sm" variant="flat" onPress={onSearch}>
+                搜索
+              </Button>
+              <Button className="h-9" size="sm" variant="flat" onPress={onResetSearch}>
+                重置
+              </Button>
+            </div>
           </div>
         </div>
         {(activeSearch || activeSearchField !== "summary" || activeResponseType) && (
