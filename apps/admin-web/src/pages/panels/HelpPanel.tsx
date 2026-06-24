@@ -98,7 +98,7 @@ function JavaSection() {
         <p className="mb-2 text-small">从可执行 jar 启动：</p>
         <CodeBlock language="bash" code={`java -jar tunnel-client.jar`} />
         <p className="mb-2 mt-3 text-small">从源码启动：</p>
-        <CodeBlock language="bash" code={`cd tunnel-client
+        <CodeBlock language="bash" code={`cd implementations/java/client
 mvn org.springframework.boot:spring-boot-maven-plugin:run`} />
       </DocCard>
 
@@ -166,7 +166,7 @@ function CsharpSection() {
         <p className="mb-2 mt-3 text-small">自包含可执行包：</p>
         <CodeBlock language="bash" code={`./ShuaiTunnel.Client`} />
         <p className="mb-2 mt-3 text-small">从源码运行：</p>
-        <CodeBlock language="bash" code={`cd tunnel-client-csharp
+        <CodeBlock language="bash" code={`cd implementations/csharp/client
 dotnet run --project src/ShuaiTunnel.Client`} />
       </DocCard>
     </div>

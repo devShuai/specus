@@ -33,6 +33,7 @@ import type {
 } from "../../api/types";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { notifyError } from "../../components/toast";
+import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 
 const HTTP_EXCHANGE_PAGE_SIZE = 20;
 const TCP_FRAME_PAGE_SIZE = 20;
@@ -324,9 +325,9 @@ export function TrafficPanel() {
   }, []);
 
   return (
-    <div className="mt-2 flex flex-col gap-2">
+    <div className="mt-2 flex min-w-0 flex-col gap-2">
       <div className="flex min-h-10 items-center justify-between gap-3">
-        <div aria-label="流量观测维度" className="flex min-w-0 items-center gap-6" role="tablist">
+        <div aria-label="流量观测维度" className="flex min-w-0 items-center gap-4 overflow-x-auto sm:gap-6" role="tablist">
           {TRAFFIC_VIEW_TABS.map((item) => (
             <TrafficViewTab
               key={item.key}
@@ -418,8 +419,35 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
   );
 
   return (
-    <div className="mt-3 flex flex-col gap-3">
+    <div className="mt-3 flex min-w-0 flex-col gap-3">
       <MetricCards summary={summary} resourceLabel="客户端" />
+
+      {/* mobile: 卡片 */}
+      <div className="lg:hidden">
+        <MobileListCardList
+          items={rows}
+          isLoading={loading}
+          emptyContent="暂无数据"
+          renderCard={(raw) => {
+            const row = raw as TrafficUsage;
+            return (
+              <MobileListCard
+                key={row.id}
+                title={<span className="break-all">{row.clientName}</span>}
+                subtitle={`${row.usageDate} · #${row.id}`}
+                fields={[
+                  { label: "上传", value: formatBytes(row.uploadBytes) },
+                  { label: "下载", value: formatBytes(row.downloadBytes) },
+                  { label: "更新时间", value: formatDateTime(row.updatedAt) },
+                ]}
+              />
+            );
+          }}
+        />
+      </div>
+
+      {/* desktop: 表格 */}
+      <div className="hidden min-w-0 overflow-x-auto lg:block">
       <Table aria-label="客户端流量使用" isHeaderSticky removeWrapper>
         <TableHeader>
           <TableColumn>ID</TableColumn>
@@ -442,6 +470,7 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
           )}
         </TableBody>
       </Table>
+      </div>
     </div>
   );
 }
@@ -508,6 +537,37 @@ function ResourceTrafficSection({
         </CardBody>
       </Card>
 
+      {/* mobile: 卡片 */}
+      <div className="lg:hidden">
+        <MobileListCardList
+          items={rows}
+          isLoading={loading}
+          emptyContent={emptyContent}
+          renderCard={(raw) => {
+            const row = raw as ResourceTrafficUsage;
+            return (
+              <MobileListCard
+                key={row.id}
+                title={<span className="break-all">{row.resourceName}</span>}
+                subtitle={
+                  <div className="flex flex-col gap-0.5 break-all">
+                    <span>{row.clientName} · {row.usageDate}</span>
+                    <span className="text-tiny text-default-400">{row.resourceKey}</span>
+                  </div>
+                }
+                fields={[
+                  { label: "上传", value: formatBytes(row.uploadBytes) },
+                  { label: "下载", value: formatBytes(row.downloadBytes) },
+                  { label: "更新时间", value: formatDateTime(row.updatedAt) },
+                ]}
+              />
+            );
+          }}
+        />
+      </div>
+
+      {/* desktop: 表格 */}
+      <div className="hidden min-w-0 overflow-x-auto lg:block">
       <Table aria-label={`${type} 流量明细`} isHeaderSticky removeWrapper>
         <TableHeader>
           <TableColumn>ID</TableColumn>
@@ -541,6 +601,7 @@ function ResourceTrafficSection({
           )}
         </TableBody>
       </Table>
+      </div>
     </div>
   );
 }
@@ -690,6 +751,74 @@ function HttpExchangeTable({
             )}
           </div>
         )}
+
+        {/* mobile: HTTP 协议记录卡片 */}
+        <div className="lg:hidden">
+          <MobileListCardList
+            items={tableRows}
+            isLoading={loading}
+            emptyContent="暂无 HTTP 协议记录"
+            renderCard={(raw) => {
+              const row = raw as (typeof tableRows)[number];
+              return (
+                <MobileListCard
+                  key={row.tableKey}
+                  title={
+                    <div className="flex items-baseline gap-2 break-all">
+                      <span className="font-mono">{row.method}</span>
+                      <span className="font-mono text-tiny text-default-500">{httpPath(row)}</span>
+                    </div>
+                  }
+                  subtitle={
+                    <div className="flex flex-col gap-0.5 break-all">
+                      <span>{row.clientName} · {formatDateTime(row.capturedAt)}</span>
+                      {row.remoteAddress ? (
+                        <span className="text-tiny text-default-400">{row.remoteAddress}</span>
+                      ) : null}
+                    </div>
+                  }
+                  badges={
+                    <>
+                      <Chip color={httpStatusColor(row)} size="sm" variant="flat">
+                        {row.statusCode}
+                      </Chip>
+                      <Chip
+                        color={httpResponseTypeColor(row.responseBodyType, row.responseContentType, row.responseBytes)}
+                        size="sm"
+                        variant="flat"
+                      >
+                        {httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
+                      </Chip>
+                    </>
+                  }
+                  fields={[
+                    {
+                      label: "资源",
+                      value: <span className="break-all">{row.resourceName}</span>,
+                    },
+                    {
+                      label: "流量",
+                      value: (
+                        <div className="flex flex-col">
+                          <span>请求 {formatBytes(row.requestBytes)}</span>
+                          <span>响应 {formatBytes(row.responseBytes)}</span>
+                        </div>
+                      ),
+                    },
+                    { label: "耗时", value: `${row.elapsedMs} ms` },
+                  ]}
+                  actions={
+                    <Button size="sm" variant="flat" onPress={() => onOpenDetails(row)}>
+                      协议详情
+                    </Button>
+                  }
+                />
+              );
+            }}
+          />
+        </div>
+
+        <div className="hidden min-w-0 overflow-x-auto lg:block">
         <Table key={tableCollectionKey} aria-label="HTTP 协议记录" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>时间</TableColumn>
@@ -750,6 +879,7 @@ function HttpExchangeTable({
             )}
           </TableBody>
         </Table>
+        </div>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <span className="text-small text-default-500">
             {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
@@ -1607,6 +1737,111 @@ function TcpFrameTable({
           <h3 className="text-small font-semibold">TCP 数据帧</h3>
           <p className="text-tiny text-default-500">按公网连接 channelId 展示双向 payload 预览</p>
         </div>
+
+        {/* mobile: 卡片 */}
+        <div className="lg:hidden">
+          <MobileListCardList
+            items={tableRows}
+            isLoading={loading}
+            emptyContent="暂无 TCP 数据帧"
+            renderCard={(raw) => {
+              const row = raw as (typeof tableRows)[number];
+              return (
+                <MobileListCard
+                  key={row.tableKey}
+                  title={
+                    <div className="flex items-baseline gap-2">
+                      <span>{formatDateTime(row.frameTime)}</span>
+                      <span className="text-tiny font-normal text-default-400">#{row.frameIndex ?? 0}</span>
+                    </div>
+                  }
+                  subtitle={
+                    <div className="flex flex-col gap-0.5 break-all">
+                      <span>{row.clientName} · :{row.listenPort}</span>
+                      <span className="text-tiny text-default-400" title={row.resourceName}>{row.resourceName}</span>
+                    </div>
+                  }
+                  badges={
+                    <Chip
+                      color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "warning"}
+                      size="sm"
+                      variant="flat"
+                    >
+                      {directionLabel(row.direction)}
+                    </Chip>
+                  }
+                  fields={[
+                    {
+                      label: "连接",
+                      value: (
+                        <div className="flex flex-col gap-0.5 break-all font-mono text-tiny">
+                          <span>{shortChannel(row.channelId)}</span>
+                          <span className="text-default-500">{tcpFlowLabel(row)}</span>
+                          {row.remoteAddress ? <span className="text-default-400">peer {row.remoteAddress}</span> : null}
+                        </div>
+                      ),
+                    },
+                    {
+                      label: "流位置",
+                      value: <span className="font-mono text-tiny">{tcpStreamRange(row)}</span>,
+                    },
+                    {
+                      label: "长度",
+                      value: (
+                        <span>
+                          {formatBytes(row.payloadBytes)}
+                          {row.truncated && !row.payloadBase64 ? <span className="ml-1 text-tiny text-warning">仅预览</span> : null}
+                        </span>
+                      ),
+                    },
+                  ]}
+                  extra={
+                    <details className="rounded-small border border-default-200 bg-default-50">
+                      <summary className="cursor-pointer px-2 py-1 text-tiny text-default-500">展开 ASCII / HEX</summary>
+                      <div className="flex flex-col gap-2 p-2">
+                        <div>
+                          <div className="text-tiny text-default-500">ASCII / 文本</div>
+                          <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all rounded-small bg-content1 p-2 font-mono text-tiny">
+                            {row.payloadPreviewText || "-"}
+                          </pre>
+                        </div>
+                        <div>
+                          <div className="text-tiny text-default-500">HEX</div>
+                          <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-all rounded-small bg-content1 p-2 font-mono text-tiny">
+                            {row.payloadPreviewHex || "-"}
+                          </pre>
+                        </div>
+                      </div>
+                    </details>
+                  }
+                  actions={
+                    <>
+                      <Button
+                        isLoading={detailLoadingId === row.id}
+                        size="sm"
+                        variant="flat"
+                        onPress={() => onOpenDetails(row)}
+                      >
+                        详情
+                      </Button>
+                      <Button
+                        isLoading={streamLoadingChannel === row.channelId}
+                        size="sm"
+                        variant="flat"
+                        onPress={() => onOpenStream(row)}
+                      >
+                        串流
+                      </Button>
+                    </>
+                  }
+                />
+              );
+            }}
+          />
+        </div>
+
+        {/* desktop: 表格 */}
+        <div className="hidden min-w-0 overflow-x-auto lg:block">
         <Table key={tableCollectionKey} aria-label="TCP 数据帧" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>时间</TableColumn>
@@ -1694,6 +1929,7 @@ function TcpFrameTable({
             )}
           </TableBody>
         </Table>
+        </div>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <span className="text-small text-default-500">
             {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}

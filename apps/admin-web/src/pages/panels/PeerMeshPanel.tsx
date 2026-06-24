@@ -18,6 +18,7 @@ import { adminApi } from "../../api/client";
 import type { PeerMeshAcl, PeerMeshDevice, PeerMeshSession, PeerMeshStatus } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
 import { formatBytes, formatDateTime } from "../../lib/format";
+import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 
 export function PeerMeshPanel() {
   const [status, setStatus] = useState<PeerMeshStatus | null>(null);
@@ -68,6 +69,7 @@ export function PeerMeshPanel() {
       const updated = await adminApi.updatePeerMeshDevice(device.clientId, { enabled });
       setDevices((items) => items.map((item) => (item.clientId === updated.clientId ? updated : item)));
       notify(enabled ? "已启用私有组网设备" : "已停用私有组网设备");
+      await load();
     } catch (error) {
       notifyError(error, "更新设备失败");
     }
@@ -138,7 +140,7 @@ export function PeerMeshPanel() {
   };
 
   return (
-    <div className="mt-3 flex flex-col gap-3">
+    <div className="mt-3 flex min-w-0 flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-foreground">私有组网</h2>
@@ -178,8 +180,92 @@ export function PeerMeshPanel() {
 
       <TopologyView devices={devices} sessions={activeSessions} />
 
-      <section className="space-y-2">
+      <section className="min-w-0 space-y-2">
         <h3 className="text-base font-semibold">设备与虚拟 IP</h3>
+
+        {/* mobile: 卡片 */}
+        <div className="lg:hidden">
+          <MobileListCardList
+            items={devices}
+            isLoading={loading}
+            emptyContent="暂无 peer mesh 设备"
+            renderCard={(raw) => {
+              const device = raw as PeerMeshDevice;
+              return (
+                <MobileListCard
+                  key={device.clientId}
+                  title={
+                    <div className="flex flex-col gap-0.5">
+                      <span className="break-all">{device.clientName}</span>
+                      <span className="text-tiny font-normal text-default-400">{device.clientId}</span>
+                    </div>
+                  }
+                  subtitle={device.ownerUsername || "-"}
+                  badges={
+                    <>
+                      <Chip size="sm" color={device.online ? "success" : "default"} variant="flat">
+                        {device.online ? "在线" : "离线"}
+                      </Chip>
+                      <Chip size="sm" color={device.enabled ? "primary" : "default"} variant="flat">
+                        {device.enabled ? "组网启用" : "未启用"}
+                      </Chip>
+                      <Chip size="sm" color={virtualDeviceColor(device.virtualDeviceStatus)} variant="flat">
+                        {virtualDeviceLabel(device.virtualDeviceStatus)}
+                      </Chip>
+                    </>
+                  }
+                  fields={[
+                    {
+                      label: "虚拟 IP",
+                      value: (
+                        <div className="flex flex-col">
+                          <span className="font-mono">{device.virtualIp || "-"}</span>
+                          <span className="text-tiny text-default-400">{device.cidr}</span>
+                        </div>
+                      ),
+                    },
+                    {
+                      label: "虚拟网卡",
+                      value: (
+                        <div className="flex flex-col gap-0.5">
+                          <span className="font-mono text-tiny">
+                            {device.virtualDeviceName || device.virtualDeviceMode || "-"}
+                          </span>
+                          {device.virtualDeviceError ? (
+                            <span className="text-tiny text-danger">{device.virtualDeviceError}</span>
+                          ) : null}
+                        </div>
+                      ),
+                    },
+                    {
+                      label: "NAT",
+                      value: (
+                        <div className="flex flex-col">
+                          <span>{natTypeLabel(device.natType)}</span>
+                          <span className="break-all text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
+                        </div>
+                      ),
+                    },
+                    { label: "最后上线", value: formatDateTime(device.lastSeenAt) },
+                  ]}
+                  actions={
+                    <div className="flex w-full items-center justify-between">
+                      <span className="text-tiny text-default-500">私有组网</span>
+                      <Switch
+                        aria-label={`启用 ${device.clientName} 私有组网`}
+                        isSelected={device.enabled}
+                        onValueChange={(enabled) => void updateDevice(device, enabled)}
+                      />
+                    </div>
+                  }
+                />
+              );
+            }}
+          />
+        </div>
+
+        {/* desktop: 表格 */}
+        <div className="hidden min-w-0 overflow-x-auto lg:block">
         <Table aria-label="Peer mesh 设备" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>客户端</TableColumn>
@@ -253,6 +339,7 @@ export function PeerMeshPanel() {
             )}
           </TableBody>
         </Table>
+        </div>
       </section>
 
       <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]">
@@ -285,6 +372,41 @@ export function PeerMeshPanel() {
                 放行
               </Button>
             </div>
+
+            {/* mobile: ACL 卡片 */}
+            <div className="lg:hidden">
+              <MobileListCardList
+                items={acls}
+                isLoading={loading}
+                emptyContent="暂无显式 ACL"
+                renderCard={(raw) => {
+                  const acl = raw as PeerMeshAcl;
+                  return (
+                    <MobileListCard
+                      key={acl.id}
+                      title={
+                        <span className="break-all">
+                          {acl.sourceClientName} → {acl.targetClientName}
+                        </span>
+                      }
+                      badges={
+                        <Chip size="sm" color={acl.allowed ? "success" : "danger"} variant="flat">
+                          {acl.allowed ? "允许" : "拒绝"}
+                        </Chip>
+                      }
+                      actions={
+                        <Button size="sm" color="danger" variant="flat" onPress={() => void deleteAcl(acl)}>
+                          删除
+                        </Button>
+                      }
+                    />
+                  );
+                }}
+              />
+            </div>
+
+            {/* desktop: ACL 表格 */}
+            <div className="hidden min-w-0 overflow-x-auto lg:block">
             <Table aria-label="Peer ACL" removeWrapper>
               <TableHeader>
                 <TableColumn>源</TableColumn>
@@ -311,6 +433,7 @@ export function PeerMeshPanel() {
                 )}
               </TableBody>
             </Table>
+            </div>
           </CardBody>
         </Card>
 
@@ -320,6 +443,81 @@ export function PeerMeshPanel() {
               <h3 className="text-base font-semibold">活跃会话</h3>
               <p className="text-small text-default-500">只展示未关闭的 ICE 会话；清理后会同步断开拓扑链路。</p>
             </div>
+
+            {/* mobile: 会话卡片 */}
+            <div className="lg:hidden">
+              <MobileListCardList
+                items={activeSessions}
+                isLoading={loading}
+                emptyContent="暂无活跃 peer session"
+                renderCard={(raw) => {
+                  const session = raw as PeerMeshSession;
+                  return (
+                    <MobileListCard
+                      key={session.id}
+                      title={
+                        <span className="break-all">
+                          {session.sourceClientName} → {session.targetClientName}
+                        </span>
+                      }
+                      badges={
+                        <>
+                          <Chip size="sm" color={session.status === "ACTIVE" ? "success" : "default"} variant="flat">
+                            {session.pathType}
+                          </Chip>
+                          <Chip size="sm" variant="flat">{session.status}</Chip>
+                        </>
+                      }
+                      fields={[
+                        { label: "RTT", value: session.rttMillis == null ? "-" : `${session.rttMillis} ms` },
+                        {
+                          label: "流量",
+                          value: (
+                            <div className="flex flex-col gap-0.5">
+                              <span>direct {formatBytes(session.directBytes)}</span>
+                              <span className="text-default-400">relay {formatBytes(session.relayBytes)}</span>
+                              <span className="text-tiny text-default-400">最后 {formatDateTime(session.lastTrafficAt)}</span>
+                            </div>
+                          ),
+                        },
+                        {
+                          label: "Endpoint",
+                          value: (
+                            <div className="flex flex-col gap-0.5 break-all">
+                              <span>local: {session.localEndpoint || "-"}</span>
+                              <span className="text-default-400">remote: {session.remoteEndpoint || "-"}</span>
+                            </div>
+                          ),
+                        },
+                        {
+                          label: "过期",
+                          value: (
+                            <div className="flex flex-col gap-0.5">
+                              <span>{formatDateTime(session.expiresAt)}</span>
+                              <span className="text-tiny text-default-400">更新 {formatDateTime(session.updatedAt)}</span>
+                            </div>
+                          ),
+                        },
+                      ]}
+                      actions={
+                        <Button
+                          size="sm"
+                          color="danger"
+                          variant="flat"
+                          isDisabled={session.status === "CLOSED"}
+                          onPress={() => void closeSession(session)}
+                        >
+                          断开
+                        </Button>
+                      }
+                    />
+                  );
+                }}
+              />
+            </div>
+
+            {/* desktop: 会话表格 */}
+            <div className="hidden min-w-0 overflow-x-auto lg:block">
             <Table aria-label="Peer mesh 会话" removeWrapper>
               <TableHeader>
                 <TableColumn>Peer</TableColumn>
@@ -382,6 +580,7 @@ export function PeerMeshPanel() {
                 )}
               </TableBody>
             </Table>
+            </div>
           </CardBody>
         </Card>
       </section>
@@ -390,8 +589,8 @@ export function PeerMeshPanel() {
 }
 
 function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessions: PeerMeshSession[] }) {
-  const deviceById = useMemo(() => new Map(devices.map((device) => [device.clientId, device])), [devices]);
   const enabledDevices = devices.filter((device) => device.enabled);
+  const topologyLinks = useMemo(() => buildTopologyLinks(devices, sessions), [devices, sessions]);
 
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
@@ -399,11 +598,18 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h3 className="text-base font-semibold">组网拓扑</h3>
-            <p className="text-small text-default-500">按虚拟 IP、在线状态和当前 direct/relay 会话聚合展示。</p>
+            <p className="text-small text-default-500">
+              拓扑按客户端对聚合展示；下方活跃会话保留 ICE/direct/relay 明细。
+            </p>
           </div>
-          <Chip size="sm" variant="flat">
-            {sessions.length} 条链路
-          </Chip>
+          <div className="flex flex-wrap gap-1">
+            <Chip size="sm" variant="flat">
+              {topologyLinks.length} 条逻辑链路
+            </Chip>
+            <Chip size="sm" variant="flat">
+              {sessions.length} 个会话
+            </Chip>
+          </div>
         </div>
 
         <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
@@ -427,22 +633,20 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
         </div>
 
         <div className="grid gap-2 lg:grid-cols-2">
-          {sessions.length === 0 ? (
+          {topologyLinks.length === 0 ? (
             <div className="rounded-md border border-dashed border-default-200 p-4 text-small text-default-500">
               暂无活跃 peer 链路。
             </div>
           ) : (
-            sessions.slice(0, 12).map((session) => {
-              const source = deviceById.get(session.sourceClientId);
-              const target = deviceById.get(session.targetClientId);
-              const traffic = (session.directBytes || 0) + (session.relayBytes || 0);
+            topologyLinks.slice(0, 12).map((link) => {
+              const session = link.representative;
               return (
-                <div key={session.id} className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10">
+                <div key={link.key} className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="min-w-0 text-small font-semibold">
-                      <span>{session.sourceClientName}</span>
-                      <span className="px-2 text-default-400">{"->"}</span>
-                      <span>{session.targetClientName}</span>
+                      <span>{link.firstName}</span>
+                      <span className="px-2 text-default-400">{"<->"}</span>
+                      <span>{link.secondName}</span>
                     </div>
                     <Chip size="sm" color={pathColor(session.pathType, session.status)} variant="flat">
                       {session.pathType} · {session.status}
@@ -450,13 +654,17 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
                   </div>
                   <div className="mt-2 grid gap-1 text-tiny text-default-500 sm:grid-cols-2">
                     <span>
-                      {source?.virtualIp || "-"} {"->"} {target?.virtualIp || "-"}
+                      {link.firstIp} {"<->"} {link.secondIp}
                     </span>
-                    <span>RTT {session.rttMillis == null ? "-" : `${session.rttMillis} ms`}</span>
-                    <span>direct {formatBytes(session.directBytes)}</span>
-                    <span>relay {formatBytes(session.relayBytes)}</span>
-                    <span>总流量 {formatBytes(traffic)}</span>
-                    <span>最后 {formatDateTime(session.lastTrafficAt || session.updatedAt)}</span>
+                    <span>会话 {link.sessions.length} 个，活跃 {link.activeSessions} 个</span>
+                    <span>RTT {link.rttMillis == null ? "-" : `${link.rttMillis} ms`}</span>
+                    <span>direct {link.directSessions} 个 / {formatBytes(link.directBytes)}</span>
+                    <span>relay {link.relaySessions} 个 / {formatBytes(link.relayBytes)}</span>
+                    <span>总流量 {formatBytes(link.totalBytes)}</span>
+                    <span>最后 {formatDateTime(link.lastActivityAt)}</span>
+                    <span>
+                      在线 {link.firstOnline ? "是" : "否"} / {link.secondOnline ? "是" : "否"}
+                    </span>
                   </div>
                 </div>
               );
@@ -466,6 +674,110 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
       </CardBody>
     </Card>
   );
+}
+
+type TopologyLink = {
+  key: string;
+  firstName: string;
+  secondName: string;
+  firstIp: string;
+  secondIp: string;
+  firstOnline: boolean;
+  secondOnline: boolean;
+  representative: PeerMeshSession;
+  sessions: PeerMeshSession[];
+  activeSessions: number;
+  directSessions: number;
+  relaySessions: number;
+  directBytes: number;
+  relayBytes: number;
+  totalBytes: number;
+  rttMillis: number | null;
+  lastActivityAt: string | null;
+};
+
+function buildTopologyLinks(devices: PeerMeshDevice[], sessions: PeerMeshSession[]): TopologyLink[] {
+  const deviceById = new Map(devices.map((device) => [device.clientId, device]));
+  const grouped = new Map<string, PeerMeshSession[]>();
+
+  for (const session of sessions) {
+    const [firstClientId, secondClientId] = orderedClientIds(session);
+    const key = `${firstClientId}:${secondClientId}`;
+    grouped.set(key, [...(grouped.get(key) ?? []), session]);
+  }
+
+  return Array.from(grouped.entries())
+    .map(([key, items]) => {
+      const representative = [...items].sort(compareRepresentativeSession)[0];
+      const [firstClientId, secondClientId] = orderedClientIds(representative);
+      const first = deviceById.get(firstClientId);
+      const second = deviceById.get(secondClientId);
+      const directBytes = items.reduce((total, item) => total + (item.directBytes || 0), 0);
+      const relayBytes = items.reduce((total, item) => total + (item.relayBytes || 0), 0);
+      const activeItems = items.filter((item) => item.status !== "CLOSED");
+      const rttValues = activeItems
+        .map((item) => item.rttMillis)
+        .filter((value): value is number => value != null);
+
+      return {
+        key,
+        firstName: first?.clientName || sessionClientName(representative, firstClientId),
+        secondName: second?.clientName || sessionClientName(representative, secondClientId),
+        firstIp: first?.virtualIp || "-",
+        secondIp: second?.virtualIp || "-",
+        firstOnline: Boolean(first?.online),
+        secondOnline: Boolean(second?.online),
+        representative,
+        sessions: items,
+        activeSessions: activeItems.length,
+        directSessions: activeItems.filter((item) => item.pathType === "DIRECT").length,
+        relaySessions: activeItems.filter((item) => item.pathType === "RELAY").length,
+        directBytes,
+        relayBytes,
+        totalBytes: directBytes + relayBytes,
+        rttMillis: rttValues.length > 0 ? Math.min(...rttValues) : null,
+        lastActivityAt: latestSessionTime(items),
+      };
+    })
+    .sort((left, right) => sessionTimeMillis(right.representative) - sessionTimeMillis(left.representative));
+}
+
+function orderedClientIds(session: PeerMeshSession): [number, number] {
+  return session.sourceClientId <= session.targetClientId
+    ? [session.sourceClientId, session.targetClientId]
+    : [session.targetClientId, session.sourceClientId];
+}
+
+function sessionClientName(session: PeerMeshSession, clientId: number) {
+  if (session.sourceClientId === clientId) {
+    return session.sourceClientName;
+  }
+  if (session.targetClientId === clientId) {
+    return session.targetClientName;
+  }
+  return String(clientId);
+}
+
+function latestSessionTime(sessions: PeerMeshSession[]) {
+  return sessions
+    .map((session) => session.lastTrafficAt || session.updatedAt || session.startedAt || null)
+    .filter((value): value is string => Boolean(value))
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0] ?? null;
+}
+
+function compareRepresentativeSession(left: PeerMeshSession, right: PeerMeshSession) {
+  const statusScore = (session: PeerMeshSession) => (session.status === "ACTIVE" ? 2 : session.status === "NEGOTIATING" ? 1 : 0);
+  const pathScore = (session: PeerMeshSession) => (session.pathType === "DIRECT" ? 2 : session.pathType === "RELAY" ? 1 : 0);
+  return (
+    statusScore(right) - statusScore(left) ||
+    pathScore(right) - pathScore(left) ||
+    sessionTimeMillis(right) - sessionTimeMillis(left)
+  );
+}
+
+function sessionTimeMillis(session: PeerMeshSession) {
+  const time = Date.parse(session.lastTrafficAt || session.updatedAt || session.startedAt || "");
+  return Number.isFinite(time) ? time : 0;
 }
 
 function pathColor(pathType: string, status: string): "default" | "success" | "warning" {

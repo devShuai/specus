@@ -20,6 +20,7 @@ import { notifyError } from "../../components/toast";
 import { useConnectionsFeed } from "../../hooks/useConnectionsFeed";
 import { useNowTick } from "../../hooks/useNowTick";
 import { useAuth } from "../../auth/AuthContext";
+import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 
 const PAGE_SIZE = 50;
 
@@ -251,7 +252,46 @@ export function ConnectionsPanel() {
         </Button>
       </div>
 
-      <div className="min-w-0 overflow-x-auto">
+      {/* mobile: 卡片堆叠 */}
+      <div className="lg:hidden">
+        <MobileListCardList
+          items={tableRows}
+          isLoading={loading}
+          emptyContent="暂无数据"
+          renderCard={(raw) => {
+            const record = raw as (typeof tableRows)[number];
+            const reason = record.success
+              ? record.disconnectReasonText || "-"
+              : record.failureReason || record.disconnectReasonText || "登录失败";
+            return (
+              <MobileListCard
+                key={record.tableKey}
+                title={
+                  <div className="flex items-center gap-2">
+                    <span className="break-all">{record.clientName}</span>
+                    <span className="text-tiny font-normal text-default-400">#{record.id}</span>
+                  </div>
+                }
+                badges={
+                  <Chip size="sm" variant="flat" color={record.success ? "success" : "danger"}>
+                    {record.success ? "成功" : "失败"}
+                  </Chip>
+                }
+                fields={[
+                  { label: "远端地址", value: record.remoteAddress || "-" },
+                  { label: "连接时间", value: formatDateTime(record.connectedAt) },
+                  { label: "断开时间", value: record.disconnectedAt ? formatDateTime(record.disconnectedAt) : "-" },
+                  { label: "持续时长", value: formatDuration(record.connectedAt, record.disconnectedAt, now) },
+                  { label: "原因", value: reason },
+                ]}
+              />
+            );
+          }}
+        />
+      </div>
+
+      {/* desktop: 表格 */}
+      <div className="hidden min-w-0 overflow-x-auto lg:block">
       <Table key={tableCollectionKey} aria-label="连接记录" isHeaderSticky removeWrapper>
         <TableHeader>
           <TableColumn>ID</TableColumn>

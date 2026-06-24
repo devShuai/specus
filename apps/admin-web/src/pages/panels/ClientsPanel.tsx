@@ -23,6 +23,7 @@ import type { Client, ClientCredential } from "../../api/types";
 import { formatBytes, formatDateTime, formatSince } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
 import { useNowTick } from "../../hooks/useNowTick";
+import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 
 export function ClientsPanel() {
   const [clients, setClients] = useState<Client[]>([]);
@@ -185,7 +186,46 @@ export function ClientsPanel() {
           </Button>
         </form>
 
-        <div className="min-w-0 overflow-x-auto">
+        {/* mobile: 卡片 */}
+        <div className="lg:hidden">
+          <MobileListCardList
+            items={credentials}
+            isLoading={loadingCredentials}
+            emptyContent="暂无接入凭证"
+            renderCard={(raw) => {
+              const credential = raw as ClientCredential;
+              return (
+                <MobileListCard
+                  key={credential.id}
+                  title={<span className="break-all font-mono">{credential.apiKey}</span>}
+                  subtitle={`${credential.ownerUsername || "-"} · #${credential.id}`}
+                  badges={
+                    <Chip size="sm" variant="flat" color={credential.enabled ? "success" : "default"}>
+                      {credential.enabled ? "启用" : "停用"}
+                    </Chip>
+                  }
+                  fields={[
+                    { label: "实例上限", value: credential.maxOnlineInstances },
+                    { label: "创建时间", value: formatDateTime(credential.createdAt) },
+                  ]}
+                  actions={
+                    <>
+                      <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
+                        编辑
+                      </Button>
+                      <Button size="sm" color="danger" variant="flat" onPress={() => void removeCredential(credential)}>
+                        删除
+                      </Button>
+                    </>
+                  }
+                />
+              );
+            }}
+          />
+        </div>
+
+        {/* desktop: 表格 */}
+        <div className="hidden min-w-0 overflow-x-auto lg:block">
         <Table aria-label="接入凭证列表" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>ID</TableColumn>
@@ -232,7 +272,47 @@ export function ClientsPanel() {
           <p className="text-small text-default-500">实例由客户端首次登录后注册，名称由机器指纹和系统用户生成。</p>
         </div>
 
-        <div className="min-w-0 overflow-x-auto">
+        {/* mobile: 卡片 */}
+        <div className="lg:hidden">
+          <MobileListCardList
+            items={clients}
+            isLoading={loadingClients}
+            emptyContent="暂无客户端实例"
+            renderCard={(raw) => {
+              const client = raw as Client;
+              return (
+                <MobileListCard
+                  key={client.id}
+                  title={<span className="break-all">{client.clientName}</span>}
+                  subtitle={`${client.ownerUsername || "-"} · #${client.id}`}
+                  badges={statusChip(client)}
+                  fields={[
+                    { label: "每分钟上限", value: client.connectionRateLimitPerMinute || "不限" },
+                    { label: "上传", value: formatBytes(client.uploadBytes) },
+                    { label: "下载", value: formatBytes(client.downloadBytes) },
+                    { label: "创建时间", value: formatDateTime(client.createdAt) },
+                  ]}
+                  actions={
+                    <>
+                      <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
+                        编辑
+                      </Button>
+                      <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
+                        下发映射
+                      </Button>
+                      <Button size="sm" color="danger" variant="flat" onPress={() => void removeClient(client)}>
+                        删除
+                      </Button>
+                    </>
+                  }
+                />
+              );
+            }}
+          />
+        </div>
+
+        {/* desktop: 表格 */}
+        <div className="hidden min-w-0 overflow-x-auto lg:block">
         <Table key={`clients-${durationTick}`} aria-label="客户端实例列表" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>ID</TableColumn>

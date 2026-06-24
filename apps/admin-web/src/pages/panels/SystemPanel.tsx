@@ -35,6 +35,7 @@ import type {
   ManagementUserMutation,
 } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
+import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { archLabel, platformLabel } from "./ClientDownloadsPanel";
 
 type SystemPanelProps = {
@@ -365,7 +366,77 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
         </div>
       </CardHeader>
       <CardBody className="gap-4 px-5 pb-5 pt-2">
-        <div className="overflow-x-auto">
+        {/* mobile: 下载链接卡片 */}
+        <div className="lg:hidden">
+          <MobileListCardList
+            items={downloadLinks}
+            isLoading={loadingDownloads}
+            emptyContent="暂无下载链接"
+            renderCard={(raw) => {
+              const link = raw as ClientDownloadLink;
+              return (
+                <MobileListCard
+                  key={link.id}
+                  title={<span className="break-all">{link.displayName}</span>}
+                  subtitle={link.description || undefined}
+                  badges={
+                    <>
+                      <Chip size="sm" variant="flat" color="primary">
+                        {implementationLabel(link.implementation)}
+                      </Chip>
+                      <Chip size="sm" variant="flat">{platformLabel(link.platform)}</Chip>
+                      <Chip size="sm" variant="flat">{archLabel(link.arch)}</Chip>
+                      <Chip
+                        size="sm"
+                        variant="flat"
+                        color={link.enabled ? "success" : "warning"}
+                        className="cursor-pointer"
+                        onClick={() => void toggleLinkEnabled(link)}
+                      >
+                        {link.enabled ? "启用" : "停用"}
+                      </Chip>
+                    </>
+                  }
+                  fields={[
+                    {
+                      label: "URL",
+                      value: (
+                        <a
+                          className="break-all font-mono text-tiny text-primary hover:underline"
+                          href={link.downloadUrl}
+                          rel="noopener noreferrer"
+                          target="_blank"
+                        >
+                          {link.downloadUrl}
+                        </a>
+                      ),
+                    },
+                    { label: "排序", value: link.displayOrder },
+                  ]}
+                  actions={
+                    <>
+                      <Button size="sm" radius="sm" variant="flat" onPress={() => openEditLink(link)}>
+                        编辑
+                      </Button>
+                      <Button
+                        size="sm"
+                        radius="sm"
+                        color="danger"
+                        variant="flat"
+                        onPress={() => void deleteLink(link)}
+                      >
+                        删除
+                      </Button>
+                    </>
+                  }
+                />
+              );
+            }}
+          />
+        </div>
+
+        {/* desktop: 表格 */}
+        <div className="hidden overflow-x-auto lg:block">
           <Table
             aria-label="客户端下载链接"
             isHeaderSticky
