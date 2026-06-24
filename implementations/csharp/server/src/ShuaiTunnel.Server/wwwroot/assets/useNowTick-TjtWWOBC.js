@@ -1,1 +1,0 @@
-import{r}from"./react-vendor-Cxj4_JbA.js";function w(t,e=!0){const[o,n]=r.useState(()=>Date.now());return r.useEffect(()=>{if(!e)return;const s=window.setInterval(()=>n(Date.now()),t);return()=>window.clearInterval(s)},[t,e]),o}export{w as u};

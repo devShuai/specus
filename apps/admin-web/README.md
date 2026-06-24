@@ -30,6 +30,8 @@ npm run deploy:csharp # build 后只写 implementations/csharp/server/src/ShuaiT
 npm run deploy:all   # build 后写入三端静态目录（手动同步用）
 ```
 
+`dist/` 和三端静态同步目录都是构建产物,已被 `.gitignore` 忽略,只在本地构建/打包时生成,不要提交。
+
 Java `tunnel-server` 的 Maven 构建已经接入该流程：执行 `mvn package` / `mvn install`
 时，会在 `generate-resources` 阶段调用这里的 `npm run deploy:java`，让 Spring 资源复制前拿到
 最新管理后台产物，且不会改动 Go/C# 静态目录。需要纯后端构建时可加 `"-Dtunnel.server.web.skip=true"` 跳过。

@@ -62,8 +62,16 @@ tunnelClientConfig*.json
 .gomodcache/
 **/.gocache/
 **/.gomodcache/
+**/bin/
+**/obj/
 
 ### Node modules ###
 node_modules/
+
+### Generated admin web artifacts ###
+/apps/admin-web/dist/
+/implementations/java/server/src/main/resources/static/
+/implementations/go/server/web/static/
+/implementations/csharp/server/src/ShuaiTunnel.Server/wwwroot/
 
 .reorg-backup/

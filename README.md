@@ -71,6 +71,7 @@ mvn clean install
 ```
 
 `tunnel-server` 的 Maven 构建会在 `generate-resources` 阶段执行 `apps/admin-web` 的 `npm run deploy:java`：先构建 React 管理后台，再把 `dist/` 只同步到 Java server 的 `src/main/resources/static/`。首次构建前请在 `apps/admin-web` 下执行一次 `npm ci` 安装依赖。
+`apps/admin-web/dist/` 和各 server 的静态同步目录都是构建产物,已在 `.gitignore` 中忽略,不要提交到仓库。
 
 如只想构建后端、跳过前端打包与产物同步：
 
