@@ -47,9 +47,12 @@
 
     <!-- Google tag (gtag.js)
          主 loader 走外部 CDN（CSP 单独放行 googletagmanager.com）。
-         初始化脚本放在 /gtag-init.js（同源），避免 CSP 限制内联脚本。 -->
+         初始化逻辑同时内联在下方 + 备份在同源 /gtag-init.js 中：
+         - 内联版本：让 Google Search Console / Analytics 所有权验证器能从纯
+           HTML 扫到 gtag('config','G-...') 这段；它不执行 JS。
+         - 内联脚本 sha256 hash 已加入 CSP script-src 白名单。 -->
     <script async src="https://www.googletagmanager.com/gtag/js?id=G-TNJRNXHJ40"></script>
-    <script src="/gtag-init.js"></script>
+    <script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-TNJRNXHJ40');</script>
   </head>
   <body>
     <div id="root"></div>

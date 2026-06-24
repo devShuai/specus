@@ -65,6 +65,8 @@ public class SecurityConfig {
                 /*
                  * CSP：管理后台为 React + HeroUI 构建产物,脚本是同源外部 bundle(/assets/*.js)。
                  * - script-src 'self' + googletagmanager.com:外部模块脚本同源 + GA 主 loader
+                 *     额外放行 GA 初始化的内联脚本 sha256 hash（同时保留在 /gtag-init.js 作 fallback）。
+                 *     如果修改 index.html 中的内联 gtag 片段，需要重算 sha256 并同步这里。
                  * - style-src 'self' 'unsafe-inline':HeroUI/framer-motion 会写内联 style 属性
                  * - img-src / font-src 允许 data:;额外允许 GA pixel beacon 域
                  * - connect-src 允许 ws:/wss: 供 /ws/connections,以及 GA4 /g/collect 上报域
@@ -76,7 +78,7 @@ public class SecurityConfig {
                 .headers(headers -> headers
                         .contentSecurityPolicy(csp -> csp.policyDirectives(
                                 "default-src 'self'; "
-                                + "script-src 'self' https://www.googletagmanager.com; "
+                                + "script-src 'self' https://www.googletagmanager.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE='; "
                                 + "style-src 'self' 'unsafe-inline'; "
                                 + "img-src 'self' data: https://www.google-analytics.com https://*.googletagmanager.com; "
                                 + "font-src 'self' data:; "
