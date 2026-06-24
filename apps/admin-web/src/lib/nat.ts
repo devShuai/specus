@@ -88,6 +88,17 @@ export const NAT_TYPE_PROFILES: Record<string, NatTypeProfile> = {
     detection: "主端口和辅助端口看到的 mapped endpoint 稳定，辅助探测有响应。",
     recommendation: "优先走 direct；只有网络策略阻断时才需要 relay。",
   },
+  CONE_LIKE_NAT: {
+    key: "CONE_LIKE_NAT",
+    label: "锥形 NAT（cone-like）",
+    shortLabel: "Cone-like",
+    tone: "primary",
+    reachability: "likely",
+    reachabilityLabel: "直连较友好",
+    summary: "多个 STUN 看到的公网端点一致，但端口被改写。可能是 Full Cone / Restricted / Port Restricted，浏览器不能再细分。",
+    detection: "浏览器侧观测：同一本机 socket 给多个 STUN，看到相同的 server-reflexive 端点。",
+    recommendation: "通常可以 direct 打洞，失败时由 Peer Mesh 自动回退 relay。",
+  },
   PORT_RESTRICTED_NAT: {
     key: "PORT_RESTRICTED_NAT",
     label: "Port Restricted NAT",

@@ -1,0 +1,11 @@
+User-agent: *
+Allow: /
+Allow: /#/nat-detect
+
+# 管理后台路由由 hash 控制，不会被搜索引擎索引为不同 URL
+# /api 走后端 JSON，禁止抓取
+Disallow: /api/
+Disallow: /oidc/
+Disallow: /auth/
+
+Sitemap: https://tunnel.devshuai.com/sitemap.xml

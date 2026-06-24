@@ -6,6 +6,7 @@ import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { AppLogo } from "../components/AppLogo";
 import { fetchPublicClientDownloads } from "../api/client";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
+import { usePageSeo } from "../lib/seo";
 
 const metrics = [
   { value: "TCP", label: "公网端口映射" },
@@ -91,6 +92,27 @@ export function LoginPage() {
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const loginPanelRef = useRef<HTMLDivElement>(null);
+
+  usePageSeo({
+    title: "shuai-tunnel · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
+    description:
+      "shuai-tunnel 是一套自托管的内网穿透控制面，支持 TCP 端口映射、HTTP 反向代理（含路径改写）、私有组网对端互联与浏览器 NAT 类型检测，自带 Java / Go / .NET 多语言客户端。",
+    canonical: "https://tunnel.devshuai.com/",
+    keywords:
+      "内网穿透,NAT 检测,STUN 探测,Symmetric NAT,WebRTC,HTTP 反向代理,对端互联,Peer Mesh,P2P 打洞,frp 替代,自托管,shuai-tunnel",
+    jsonLd: {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "shuai-tunnel",
+      "url": "https://tunnel.devshuai.com/",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux, Windows, macOS",
+      "description":
+        "自托管内网穿透与对端互联控制面：TCP 端口映射、HTTP 反向代理（含路径改写）、Peer Mesh 私有组网与浏览器 NAT 类型检测。",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "CNY" },
+      "creator": { "@type": "Person", "name": "devShuai" },
+    },
+  });
 
   const passwordEnabled = oidcConfig?.passwordLoginEnabled ?? true;
   const oidcEnabled = oidcConfig?.configured ?? false;
