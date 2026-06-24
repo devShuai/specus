@@ -167,7 +167,7 @@ export function ClientsPanel() {
   return (
     <div className="mt-3 flex min-w-0 flex-col gap-5">
       <section className="min-w-0 space-y-3">
-        <div className="flex flex-wrap items-end justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
             <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret，clientName 由服务端按机器自动分配。</p>

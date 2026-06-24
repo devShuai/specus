@@ -180,7 +180,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     <div className="flex flex-col gap-4">
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(360px,0.8fr)]">
       <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
-        <CardHeader className="flex items-start justify-between gap-4 px-5 pb-2 pt-5">
+        <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
           <div>
             <h2 className="text-lg font-semibold text-foreground">用户管理</h2>
             <p className="mt-1 text-small text-default-500">数据库用户、角色和启用状态</p>
@@ -325,7 +325,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
       </Card>
 
       <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
-        <CardHeader className="flex items-start justify-between gap-4 px-5 pb-2 pt-5">
+        <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
           <div>
             <h2 className="text-lg font-semibold text-foreground">数据库</h2>
             <p className="mt-1 text-small text-default-500">基础数据维护</p>
@@ -349,7 +349,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     </div>
 
     <Card shadow="none" className="rounded-md border border-default-200 bg-content1">
-      <CardHeader className="flex items-start justify-between gap-4 px-5 pb-2 pt-5">
+      <CardHeader className="flex items-center justify-between gap-4 px-5 pb-2 pt-5">
         <div>
           <h2 className="text-lg font-semibold text-foreground">客户端下载链接</h2>
           <p className="mt-1 text-small text-default-500">

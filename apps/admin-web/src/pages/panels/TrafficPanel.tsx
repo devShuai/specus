@@ -678,7 +678,7 @@ function HttpExchangeTable({
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
       <CardBody className="gap-3 p-3">
-        <div className="flex flex-wrap items-end justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h3 className="text-small font-semibold">HTTP 协议记录</h3>
             <p className="text-tiny text-default-500">请求行、响应状态、headers 与 body 预览</p>
