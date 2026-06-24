@@ -10,7 +10,7 @@ import {
 } from "@heroui/react";
 import { AppLogo } from "../../components/AppLogo";
 import { ThemeToggleButton } from "../../components/ThemeToggleButton";
-import { NAT_TRAVERSAL_REFERENCE } from "../../lib/nat";
+import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
 
 const DEFAULT_STUN_SERVERS = [
   "stun:stun.miwifi.com:3478",
@@ -48,6 +48,7 @@ interface StunProbeResult {
 
 interface BrowserNatResult {
   kind: BrowserNatKind;
+  natType: string | null;
   startedAt: number;
   finishedAt: number;
   probes: StunProbeResult[];
@@ -75,6 +76,7 @@ export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean
       if (!("RTCPeerConnection" in window)) {
         setResult({
           kind: "not-supported",
+          natType: null,
           startedAt,
           finishedAt: Date.now(),
           probes: [],
@@ -99,6 +101,7 @@ export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean
     } catch (error) {
       setResult({
         kind: "failed",
+        natType: null,
         startedAt,
         finishedAt: Date.now(),
         probes: [],
@@ -194,6 +197,7 @@ function NatHero({
 }: NatHeroProps) {
   const profile = browserNatProfile(result?.kind ?? (checking ? "checking" : "idle"));
   const accent = ACCENTS[profile.color];
+  const natTypeProfileEntry = result?.natType ? natTypeProfile(result.natType) : null;
 
   return (
     <section
@@ -213,6 +217,17 @@ function NatHero({
           >
             {profile.badge}
           </Chip>
+          {natTypeProfileEntry && (
+            <a
+              href="#/help/peer-mesh#nat-types"
+              title={`${natTypeProfileEntry.summary}（点击查看帮助文档）`}
+              className="inline-flex items-center gap-1.5 rounded-md border border-black/10 bg-white/70 px-2 py-0.5 text-tiny font-medium transition-colors hover:border-black/20 hover:bg-white dark:border-white/10 dark:bg-white/[0.06] dark:hover:border-white/20 dark:hover:bg-white/[0.1]"
+            >
+              <span className={`inline-block h-2 w-2 rounded-full ${natToneBg(natTypeProfileEntry.tone)}`} />
+              <span>{natTypeProfileEntry.label}</span>
+              <span className="text-zinc-500 dark:text-zinc-400">· {natTypeProfileEntry.reachabilityLabel}</span>
+            </a>
+          )}
           {result && (
             <span className="text-tiny text-zinc-600 dark:text-zinc-400">
               耗时 {Math.max(0, result.finishedAt - result.startedAt)} ms
@@ -560,6 +575,21 @@ function DotIcon({ className = "" }: { className?: string }) {
   );
 }
 
+function natToneBg(tone: "default" | "primary" | "success" | "warning" | "danger"): string {
+  switch (tone) {
+    case "success":
+      return "bg-emerald-500";
+    case "primary":
+      return "bg-cyan-500";
+    case "warning":
+      return "bg-amber-500";
+    case "danger":
+      return "bg-rose-500";
+    default:
+      return "bg-zinc-400 dark:bg-zinc-500";
+  }
+}
+
 async function probeStunServer(server: string, timeoutMs: number): Promise<StunProbeResult> {
   const startedAt = performance.now();
   const candidates: BrowserIceCandidate[] = [];
@@ -626,10 +656,12 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
   const hostCandidates = allCandidates.filter((candidate) => candidate.type === "host");
   const mappedEndpoints = Array.from(new Set(srflxCandidates.map(endpointOf))).sort();
   const finishedAt = Date.now();
+  const natType = inferNatType(srflxCandidates, hostCandidates, mappedEndpoints);
 
   if (mappedEndpoints.length === 0) {
     return {
       kind: "udp-blocked",
+      natType,
       startedAt,
       finishedAt,
       probes,
@@ -643,6 +675,7 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
   if (mappedEndpoints.length > 1) {
     return {
       kind: "mapping-changing",
+      natType,
       startedAt,
       finishedAt,
       probes,
@@ -655,6 +688,7 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
 
   return {
     kind: "mapping-stable",
+    natType,
     startedAt,
     finishedAt,
     probes,
@@ -663,6 +697,53 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
     summary: "多个 STUN 探测得到的公网映射端点稳定，当前浏览器网络具备较好的 UDP 打洞基础。",
     recommendation: "这通常对 direct path 比较友好。仍需注意对端 NAT、防火墙和运营商 UDP 策略，失败时继续使用 relay 回退。",
   };
+}
+
+/**
+ * 基于浏览器 ICE 观测推断 NAT 类型，分类与 NAT_TYPE_PROFILES 对齐。
+ *
+ * <p>浏览器侧没有服务端备用端口主动回包能力，所以无法严格区分 Full Cone / Restricted /
+ * Port Restricted。这里只做 5 类粗分：
+ *
+ * <ul>
+ *   <li>多个 srflx 端点 → SYMMETRIC_NAT
+ *   <li>没有 srflx → null（由上层 udp-blocked 文案兜底）
+ *   <li>srflx 与对应 host candidate 地址端口完全一致 → NO_NAT
+ *   <li>srflx 端口 == host 的 rport（端口保持）→ PORT_PRESERVED_NAT
+ *   <li>其它（端口变化但映射稳定）→ FULL_CONE_OR_RESTRICTED_NAT
+ * </ul>
+ */
+function inferNatType(
+  srflxCandidates: BrowserIceCandidate[],
+  hostCandidates: BrowserIceCandidate[],
+  mappedEndpoints: string[],
+): string | null {
+  if (srflxCandidates.length === 0) {
+    return null;
+  }
+  if (mappedEndpoints.length > 1) {
+    return "SYMMETRIC_NAT";
+  }
+
+  const sample = srflxCandidates[0];
+  const hostMatch = hostCandidates.find((host) => host.address === sample.relatedAddress);
+  // host 候选可能被现代浏览器用 mDNS 隐藏（.local 后缀），此时无法直接对比 IP
+  const hostHidden = hostCandidates.some((host) => /\.local$/i.test(host.address));
+
+  if (sample.relatedAddress && sample.address === sample.relatedAddress && sample.port === sample.relatedPort) {
+    return "NO_NAT";
+  }
+  if (sample.relatedPort != null && sample.port === sample.relatedPort) {
+    return "PORT_PRESERVED_NAT";
+  }
+  if (hostMatch && hostMatch.port === sample.relatedPort && sample.port !== sample.relatedPort) {
+    return "FULL_CONE_OR_RESTRICTED_NAT";
+  }
+  if (hostHidden && sample.relatedPort != null) {
+    // host 被 mDNS 隐藏：仅有 srflx，依靠 srflx 自身 port vs rport 判断
+    return sample.port === sample.relatedPort ? "PORT_PRESERVED_NAT" : "FULL_CONE_OR_RESTRICTED_NAT";
+  }
+  return "NAT";
 }
 
 function parseCandidate(raw: string): BrowserIceCandidate | null {
