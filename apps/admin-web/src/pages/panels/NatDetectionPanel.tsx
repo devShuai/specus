@@ -15,7 +15,7 @@ import { usePageSeo } from "../../lib/seo";
 
 const DEFAULT_STUN_SERVERS = [
   "stun:stun.miwifi.com:3478",
-  "stun:stun.qq.com:3478",
+  "stun:stun.chat.bilibili.com:3478",
 ];
 
 type BrowserNatKind =
