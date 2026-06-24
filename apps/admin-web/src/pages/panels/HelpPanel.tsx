@@ -1,6 +1,29 @@
-import { useState } from "react";
-import { Button, Card, CardBody, CardHeader, Tab, Tabs } from "@heroui/react";
+import { useEffect, useState } from "react";
+import { Button, Card, CardBody, CardHeader, Chip, Tab, Tabs } from "@heroui/react";
 import { notify } from "../../components/toast";
+import { NAT_TRAVERSAL_REFERENCE, NAT_TYPE_PROFILES } from "../../lib/nat";
+
+const HELP_TABS = [
+  "quickstart",
+  "java",
+  "go",
+  "csharp",
+  "peer-mesh",
+  "protocol",
+  "faq",
+] as const;
+type HelpTabKey = (typeof HELP_TABS)[number];
+const HELP_TAB_SET = new Set<HelpTabKey>(HELP_TABS);
+
+export const HELP_NAT_TYPES_ANCHOR = "nat-types";
+
+function readHelpTabFromLocation(): HelpTabKey {
+  // hash 形如 #/help/peer-mesh 或 #/help/peer-mesh#nat-types
+  const raw = window.location.hash.replace(/^#\/?/, "");
+  const segments = raw.split(/[?#]/, 1)[0].split("/");
+  const candidate = segments[1] ?? "";
+  return HELP_TAB_SET.has(candidate as HelpTabKey) ? (candidate as HelpTabKey) : "quickstart";
+}
 
 /**
  * 静态帮助文档面板。内置三大客户端启动说明、配置示例、常见问题。
@@ -9,6 +32,35 @@ import { notify } from "../../components/toast";
  * 修改这个文件即可。代码块支持一键复制。
  */
 export function HelpPanel() {
+  const [activeTab, setActiveTab] = useState<HelpTabKey>(() => readHelpTabFromLocation());
+
+  useEffect(() => {
+    const sync = () => {
+      setActiveTab(readHelpTabFromLocation());
+      // 处理 hash 中的二级锚点 #/help/peer-mesh#nat-types
+      const sub = window.location.hash.split("#")[2];
+      if (sub) {
+        setTimeout(() => {
+          document.getElementById(sub)?.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 80);
+      }
+    };
+    sync();
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+
+  const onTabChange = (key: string | number) => {
+    const next = (typeof key === "string" ? key : String(key)) as HelpTabKey;
+    if (!HELP_TAB_SET.has(next)) {
+      return;
+    }
+    setActiveTab(next);
+    if (window.location.hash !== `#/help/${next}`) {
+      window.location.hash = `/help/${next}`;
+    }
+  };
+
   return (
     <div className="mt-4 flex flex-col gap-4">
       <div>
@@ -16,7 +68,7 @@ export function HelpPanel() {
         <p className="text-small text-default-500">客户端启动方法、配置模板与常见问题</p>
       </div>
 
-      <Tabs aria-label="帮助文档" variant="underlined">
+      <Tabs aria-label="帮助文档" variant="underlined" selectedKey={activeTab} onSelectionChange={onTabChange}>
         <Tab key="quickstart" title="快速开始">
           <QuickStartSection />
         </Tab>
@@ -211,20 +263,87 @@ sudo firewall-cmd --add-port=3479/udp --permanent
 sudo firewall-cmd --reload`} />
       </DocCard>
 
-      <DocCard title="NAT 类型探测">
-        <p className="mb-2 text-small">
-          客户端会向主端口发送 binding；服务端从主端口返回映射地址，同时从备用端口主动回包；
-          客户端还会主动向备用端口再发送一次 binding。三类观测组合后展示 NAT 类型：
+      <DocCard title="检测链路">
+        <p className="mb-2 text-small text-default-500">
+          客户端使用 UDP 主端口和辅助端口判断公网映射行为。四步组成一次完整的 NAT 类型探测：
         </p>
-        <ul className="ml-5 list-disc space-y-1 text-small">
-          <li><Inline>无 NAT</Inline>：公网映射地址就是客户端本机地址，端口也保持一致。</li>
-          <li><Inline>Symmetric NAT</Inline>：主端口和备用端口看到的映射端点不同，直连成功率最低。</li>
-          <li><Inline>Port Restricted NAT</Inline>：映射端点稳定，但收不到服务端备用端口主动回包。</li>
-          <li><Inline>Full cone / Restricted NAT</Inline>：映射端点稳定，且能收到备用端口主动回包。</li>
-        </ul>
-        <p className="mt-2 text-small text-default-500">
+        <div className="grid gap-2">
+          {[
+            ["1", "Binding", "客户端向 STUN/TURN-lite 主端口发送探测包。"],
+            ["2", "Mapped Endpoint", "服务端记录公网 IP:Port 并回传。"],
+            ["3", "Alternate Port", "向辅助 UDP 端口探测，比较映射是否变化。"],
+            ["4", "Path Policy", "直连友好优先 direct，Symmetric NAT 快速 relay。"],
+          ].map(([index, title, text]) => (
+            <div
+              key={index}
+              className="grid grid-cols-[32px_minmax(0,1fr)] gap-3 rounded-md border border-default-200 bg-default-50 p-2 dark:bg-default-100/10"
+            >
+              <span className="flex h-8 w-8 items-center justify-center rounded bg-primary-100 font-mono text-small text-primary">
+                {index}
+              </span>
+              <span className="min-w-0">
+                <span className="block font-semibold text-foreground">{title}</span>
+                <span className="text-small text-default-500">{text}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      </DocCard>
+
+      <DocCard title={<span id={HELP_NAT_TYPES_ANCHOR}>NAT 类型速查</span>}>
+        <p className="mb-2 text-small text-default-500">
+          下表用于解释「私有组网」面板里客户端 NAT 探测结果和路径建议。
+        </p>
+        <div className="grid gap-2 md:grid-cols-2">
+          {Object.values(NAT_TYPE_PROFILES).map((profile) => (
+            <div
+              key={profile.key}
+              className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-small font-semibold">{profile.label}</span>
+                <Chip size="sm" color={profile.tone} variant="flat">
+                  {profile.reachabilityLabel}
+                </Chip>
+              </div>
+              <p className="mt-1 text-tiny leading-5 text-default-500">{profile.summary}</p>
+              <p className="mt-1 text-tiny leading-5 text-default-400">
+                <span className="text-default-500">建议：</span>
+                {profile.recommendation}
+              </p>
+            </div>
+          ))}
+        </div>
+        <p className="mt-3 text-tiny text-default-500">
           只有一个公网 IP 时，不能严格拆分 Full Cone 与 Address-Restricted NAT，所以页面合并展示。
         </p>
+      </DocCard>
+
+      <DocCard title="NAT 穿透说明">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <p className="text-small text-default-500">根据 Tailscale NAT traversal 文章做中文改写。</p>
+          <Button
+            as="a"
+            href={NAT_TRAVERSAL_REFERENCE.url}
+            rel="noreferrer"
+            target="_blank"
+            size="sm"
+            variant="flat"
+          >
+            阅读原文
+          </Button>
+        </div>
+        <div className="grid gap-2 md:grid-cols-2">
+          {NAT_TRAVERSAL_REFERENCE.notes.map((note) => (
+            <div
+              key={note.title}
+              className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10"
+            >
+              <div className="text-small font-semibold text-foreground">{note.title}</div>
+              <p className="mt-1 text-small leading-6 text-default-500">{note.text}</p>
+            </div>
+          ))}
+        </div>
       </DocCard>
 
       <DocCard title="虚拟网卡要求">
@@ -346,7 +465,7 @@ function FaqSection() {
 
 // ---- 通用 UI 部件 ----
 
-function DocCard({ title, children }: { title: string; children: React.ReactNode }) {
+function DocCard({ title, children }: { title: React.ReactNode; children: React.ReactNode }) {
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
       <CardHeader className="px-5 pb-2 pt-4">
