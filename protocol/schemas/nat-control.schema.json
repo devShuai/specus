@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devshuai.com/shuai-tunnel/schemas/nat-control.schema.json",
+  "title": "shuai-tunnel NAT_CONTROL",
+  "description": "MessageType.NAT_CONTROL 的 JSON 消息体。字段缺省语义见 protocol/spec/control-protocol.md。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clientName",
+    "remotePort",
+    "tunnelConfigList"
+  ],
+  "properties": {
+    "clientName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "目标客户端名。"
+    },
+    "remoteAddress": {
+      "type": "string",
+      "description": "服务端公网地址，可为空，主要用于展示。"
+    },
+    "remotePort": {
+      "$ref": "#/$defs/Port",
+      "description": "控制连接端口。"
+    },
+    "tunnelConfigList": {
+      "type": "array",
+      "description": "已启用 TCP 端口映射全集。空数组表示清空。缺省不合法。",
+      "items": {
+        "$ref": "#/$defs/TunnelConfig"
+      }
+    },
+    "httpTunnelConfigList": {
+      "type": "array",
+      "description": "已启用 HTTP route 全集。字段缺省表示服务端尚未接管该客户端 HTTP route；空数组表示清空。",
+      "items": {
+        "$ref": "#/$defs/HttpTunnelConfig"
+      }
+    }
+  },
+  "$defs": {
+    "Port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "TunnelConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "port",
+        "tunnelAddress",
+        "tunnelPort"
+      ],
+      "properties": {
+        "port": {
+          "$ref": "#/$defs/Port",
+          "description": "服务端公网监听端口。"
+        },
+        "tunnelAddress": {
+          "type": "string",
+          "minLength": 1,
+          "description": "客户端侧目标地址。"
+        },
+        "tunnelPort": {
+          "$ref": "#/$defs/Port",
+          "description": "客户端侧目标端口。"
+        }
+      }
+    },
+    "HttpTunnelConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route",
+        "targetBaseUrl"
+      ],
+      "properties": {
+        "route": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._~-]+$",
+          "description": "公网入口 /http/{clientName}/{route}/** 中的 route。"
+        },
+        "targetBaseUrl": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "客户端侧目标基础地址。"
+        }
+      }
+    }
+  }
+}

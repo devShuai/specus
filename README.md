@@ -1,6 +1,6 @@
 # shuai-tunnel
 
-`shuai-tunnel` 是一个以内网服务接入为核心的多语言实验项目。Java 版本是当前参考实现；Go、C#、C 版本按同一协议逐步对齐。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务。
+`shuai-tunnel` 是一个以内网服务接入为核心的多语言实验项目。Java 版本是当前参考实现；Go、C#、C 版本按同一协议逐步对齐。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；实验性 Peer Mesh 还可以让同一用户下的多个客户端通过虚拟 IP 互访。
 
 > 当前仓库适合用于学习和继续开发，不建议直接用于生产环境。现有功能和待完善项详见[当前状态](#当前状态)。
 
@@ -16,15 +16,21 @@ flowchart TD
     L -->|访问内网地址和端口| S[本地 TCP 服务]
     H[HTTP 访问者] -->|访问 /http/client/route/path| W[HttpTunnelController]
     W <-->|通过 7010 控制连接直转 HTTP| C
+    PM[PeerSignalService + STUN/TURN-lite]
+    A[客户端 A shuai0] <-->|Peer Mesh UDP direct / relay| B[客户端 B shuai0]
+    A -.->|PEER_CONTROL / UDP probe| PM
+    B -.->|PEER_CONTROL / UDP probe| PM
 ```
 
 核心流程：
 
 1. `tunnel-server` 启动 Spring Boot 应用，并在 `7010` 端口监听客户端控制连接。
-2. `tunnel-client` 读取工作目录下的 `tunnelClientConfig.json`，连接服务端并完成登录。
-3. 服务端向客户端发送 `NAT_CONTROL` 消息后，客户端动态添加 `NatClientHandler` 并注册端口映射。
-4. 服务端为每个公网映射端口创建一个 `TcpServer`。
-5. 公网请求到达映射端口后，数据经控制连接转发至客户端，再由客户端连接目标内网服务。
+2. `tunnel-client` 读取工作目录下的 `tunnelClientConfig.json`，先通过 HTTP `apiKey/secret` 登录，获取运行时 `clientName`、`accessToken`、控制连接地址和初始配置。
+3. 客户端建立 Netty 控制连接并发送 `LOGIN_REQUEST`，服务端校验 token 后绑定在线会话。
+4. 服务端向客户端发送 `NAT_CONTROL` 消息后，客户端动态添加 `NatClientHandler` 并注册端口映射。
+5. 服务端为每个公网映射端口创建一个 `TcpServer`。
+6. 公网请求到达映射端口后，数据经控制连接转发至客户端，再由客户端连接目标内网服务。
+7. 开启 Peer Mesh 时，服务端通过 `PEER_CONTROL` 做设备列表、候选地址和 session 授权，客户端之间的数据面走加密 UDP direct，失败时回退到 server relay。
 
 ## 模块结构
 
@@ -117,7 +123,10 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 {
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "demo-client",
-  "secret": "test1234"
+  "secret": "test1234",
+  "peerMeshDevice": "noop",
+  "peerMeshTunName": "shuai0",
+  "peerMeshMtu": 1400
 }
 ```
 
@@ -128,8 +137,11 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `serverBaseUrl` | 服务端管理 HTTP 地址，客户端会调用 `/api/client/auth/login` 获取运行时连接信息 |
 | `apiKey` | 管理后台创建的客户端启动凭证 key |
 | `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求 |
+| `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`auto` |
+| `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `shuai0` |
+| `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1400` |
 
-> 完整示例见 `implementations/go/client/tunnelClientConfig.example.json`。
+> 完整示例见 `implementations/java/client/tunnelClientConfig.example.json` 和 `implementations/go/client/tunnelClientConfig.example.json`。
 
 启动客户端：
 
@@ -138,12 +150,7 @@ cd implementations/java/client
 mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
-客户端的 `application.yml` 也将 Spring Boot Web 端口设置为 `8088`。如果服务端和客户端在同一台机器上联调，需要为客户端覆盖该端口：
-
-```bash
-mvn org.springframework.boot:spring-boot-maven-plugin:run \
-  -Dspring-boot.run.arguments=--server.port=8089
-```
+Java 客户端使用 `WebApplicationType.NONE`，不启动 Spring Web，也不监听 HTTP 端口；同机运行服务端和客户端时不再需要为客户端覆盖 `server.port`。
 
 ### 3. 下发端口映射
 
@@ -179,6 +186,15 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 
 ## 协议概览
 
+完整跨语言协议说明见 [protocol/spec](protocol/spec/README.md)。根 README 只保留主流程摘要：
+
+| 文档 | 内容 |
+| --- | --- |
+| [control-protocol.md](protocol/spec/control-protocol.md) | 控制连接帧、`Command`、`MessageType`、`NAT_CONTROL` 和 `NAT_MESSAGE` |
+| [client-auth.md](protocol/spec/client-auth.md) | 客户端 HTTP 登录、apiKey/secret 签名、运行时 token 和刷新 |
+| [http-route.md](protocol/spec/http-route.md) | HTTP route、WebSocket 隧道、Header 规则、路径改写和观测字段 |
+| [peer-mesh.md](protocol/spec/peer-mesh.md) | 私有组网、虚拟 IP、STUN/TURN-lite、加密数据帧和管理面 |
+
 控制连接使用自定义二进制协议：
 
 | 字段 | 长度 | 说明 |
@@ -201,6 +217,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 - 查看、编辑、停用和删除客户端
 - 创建和管理客户端启动凭证（apiKey/secret），并限制同一凭证的在线实例数
 - 维护每个客户端的 TCP 端口映射，并向在线客户端下发 `NAT_CONTROL` 配置
+- 管理私有组网设备、虚拟 IP、在线状态、NAT 探测结果、链路、活跃会话和 ACL，并支持清理会话
 - 查看控制连接成功和失败记录
 - 按客户端和 UTC 日期汇总上下行流量，并查看 HTTP 请求/响应详情与 TCP payload 记录
 - HTTP 记录支持按常用字段、方法、状态码、路径、Header、Body 等字段分页搜索；Header 可在表单/Raw 间切换，并内置常见 Header 说明与规范链接
@@ -270,6 +287,24 @@ curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 ```
 
 该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=tunnel`。`/http/**` 默认作为公开流量入口，不需要管理令牌；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `TUNNEL_HTTP_TIMEOUT_MS` 调整。
+
+## 私有组网（Peer Mesh）
+
+Peer Mesh 是当前 Java 实现中的实验性能力，默认关闭。开启后，同一租户和同一用户下的客户端会被分配 `100.96.0.0/11` 内的虚拟 IP，并通过 `shuai0` 这类虚拟网卡互访。控制面仍走现有 Netty 连接，服务端通过 `PEER_CONTROL` 下发设备列表、候选地址、session 授权和启停状态；数据面优先走客户端之间的 UDP direct，失败时回退到服务端内置 TURN-lite relay。
+
+服务端相关配置：
+
+| 配置 | 环境变量 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `tunnel.peer-mesh.enabled` | `TUNNEL_PEER_MESH_ENABLED` | `false` | 是否启用 Peer Mesh |
+| `tunnel.peer-mesh.cidr` | `TUNNEL_PEER_MESH_CIDR` | `100.96.0.0/11` | 虚拟网段 |
+| `tunnel.peer-mesh.public-address` | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | （空） | 对客户端公布的 STUN/TURN-lite 地址；为空时回退请求域名 |
+| `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | STUN/TURN-lite UDP 端口 |
+| `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `0` | NAT 探测备用 UDP 端口；`0` 表示使用主端口 + 1 |
+| `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
+| `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation TTL |
+
+客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
 
 ## 控制连接 TLS
 
@@ -390,17 +425,18 @@ HTTP 流量入库前会根据 `Content-Encoding` 对 `gzip`、`deflate`、`br` �
 - 控制连接断开后的指数退避重连
 - TCP 公网端口监听和双向数据转发
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
+- 实验性 Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun、同用户默认互通、`PEER_CONTROL` 信令、UDP direct、server relay、NAT 类型探测、链路和会话展示
 - 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
 - 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 需要继续完善：
 
-- 服务端和客户端的 Spring Boot Web 端口默认均为 `8088`，部署在同一台机器时需要覆盖其中一个端口。
-- UDP 转发尚未实现，`UdpConnection` 当前为空。
+- 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
+- 非 Java 实现仍需继续对齐最新的客户端 HTTP 登录、Peer Mesh 和管理面能力。
 - Java 客户端入口尚未默认开启控制连接 TLS，启用需自行调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
 
 ## 开发建议
 
-服务端下发 `NAT_CONTROL` 的管理接口已实现（见[下发端口映射](#3-下发端口映射)），客户端启动登录已升级为基于 apiKey/secret 的 HMAC-SHA256（secret 明文不上线）。后续可优先：让 Java/Go 客户端默认支持控制连接 TLS 并提供配置开关，补齐真实 MySQL/PostgreSQL 与端到端隧道的自动化测试，并实现 UDP 转发。
+服务端下发 `NAT_CONTROL` 的管理接口已实现（见[下发端口映射](#3-下发端口映射)），客户端启动登录已升级为基于 apiKey/secret 的 HMAC-SHA256（secret 明文不上线）。后续可优先：让 Java/Go 客户端默认支持控制连接 TLS 并提供配置开关，补齐真实 MySQL/PostgreSQL 与端到端隧道的自动化测试，继续完善 Peer Mesh 的稳定性与跨语言实现，并实现公网 UDP 端口映射。

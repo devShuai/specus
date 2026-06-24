@@ -1,0 +1,558 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devshuai.com/shuai-tunnel/schemas/peer-control.schema.json",
+  "title": "shuai-tunnel PEER_CONTROL",
+  "description": "MessageType.PEER_CONTROL 的 JSON 信令。Java 使用同一个 PeerControlMessage DTO 承载多种 type。",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/PeerConfig"
+    },
+    {
+      "$ref": "#/$defs/Roster"
+    },
+    {
+      "$ref": "#/$defs/SessionGrant"
+    },
+    {
+      "$ref": "#/$defs/Candidates"
+    },
+    {
+      "$ref": "#/$defs/PathReport"
+    },
+    {
+      "$ref": "#/$defs/TrafficReport"
+    },
+    {
+      "$ref": "#/$defs/DeviceReport"
+    },
+    {
+      "$ref": "#/$defs/Close"
+    }
+  ],
+  "$defs": {
+    "LongId": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "Endpoint": {
+      "type": "string",
+      "minLength": 1,
+      "description": "host:port、ip:port 或 relay:{allocationId}。"
+    },
+    "EpochMillis": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "BaseMessage": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "createdAtMillis": {
+          "$ref": "#/$defs/EpochMillis"
+        }
+      }
+    },
+    "ClientIdentityFields": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sourceClientId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "sourceClientName": {
+          "type": "string"
+        },
+        "sourceVirtualIp": {
+          "type": "string",
+          "format": "ipv4"
+        },
+        "sourcePublicKey": {
+          "type": "string",
+          "contentEncoding": "base64"
+        },
+        "targetClientId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "targetClientName": {
+          "type": "string"
+        },
+        "targetVirtualIp": {
+          "type": "string",
+          "format": "ipv4"
+        },
+        "targetPublicKey": {
+          "type": "string",
+          "contentEncoding": "base64"
+        }
+      }
+    },
+    "PeerCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "transport",
+        "address",
+        "port",
+        "priority"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "host",
+            "srflx",
+            "relay"
+          ]
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "udp"
+          ]
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "foundation": {
+          "type": "string"
+        },
+        "relayId": {
+          "type": "string"
+        }
+      }
+    },
+    "PeerRosterItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clientId",
+        "clientName",
+        "virtualIp",
+        "publicKey",
+        "online"
+      ],
+      "properties": {
+        "clientId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "clientName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "virtualIp": {
+          "type": "string",
+          "format": "ipv4"
+        },
+        "publicKey": {
+          "type": "string",
+          "contentEncoding": "base64"
+        },
+        "online": {
+          "type": "boolean"
+        }
+      }
+    },
+    "PeerMeshConfig": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "clientId": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "clientName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "virtualIp": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ipv4"
+        },
+        "cidr": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stunHost": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stunPort": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "turnHost": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnPort": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "iceUsername": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iceCredential": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "serverPublicKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientPublicKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionTtlSeconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "PeerConfig": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "peerMesh"
+          ],
+          "properties": {
+            "type": {
+              "const": "peer-config"
+            },
+            "sourceClientId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "sourceClientName": {
+              "type": "string"
+            },
+            "peerMesh": {
+              "$ref": "#/$defs/PeerMeshConfig"
+            }
+          }
+        }
+      ]
+    },
+    "Roster": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "clientId",
+            "clientName",
+            "peers"
+          ],
+          "properties": {
+            "type": {
+              "const": "roster"
+            },
+            "clientId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "clientName": {
+              "type": "string",
+              "minLength": 1
+            },
+            "peers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PeerRosterItem"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SessionGrant": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "$ref": "#/$defs/ClientIdentityFields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "sessionId",
+            "sourceClientId",
+            "targetClientId",
+            "token",
+            "expiresAt"
+          ],
+          "properties": {
+            "type": {
+              "const": "session-grant"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "token": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expiresAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "pathType": {
+              "type": "string",
+              "enum": [
+                "DIRECT",
+                "RELAY",
+                "UNKNOWN"
+              ]
+            },
+            "status": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "Candidates": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "$ref": "#/$defs/ClientIdentityFields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "targetClientId",
+            "candidates"
+          ],
+          "properties": {
+            "type": {
+              "const": "candidates"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "token": {
+              "type": "string"
+            },
+            "expiresAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "candidates": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PeerCandidate"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "PathReport": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "$ref": "#/$defs/ClientIdentityFields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "sessionId",
+            "pathType",
+            "status",
+            "remoteEndpoint"
+          ],
+          "properties": {
+            "type": {
+              "const": "path-report"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "pathType": {
+              "type": "string",
+              "enum": [
+                "DIRECT",
+                "RELAY"
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "rttMillis": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "localEndpoint": {
+              "$ref": "#/$defs/Endpoint"
+            },
+            "remoteEndpoint": {
+              "$ref": "#/$defs/Endpoint"
+            }
+          }
+        }
+      ]
+    },
+    "TrafficReport": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "$ref": "#/$defs/ClientIdentityFields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "sessionId"
+          ],
+          "properties": {
+            "type": {
+              "const": "traffic-report"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "directBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "relayBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          }
+        }
+      ]
+    },
+    "DeviceReport": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "$ref": "#/$defs/ClientIdentityFields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "device-report"
+            },
+            "virtualDeviceMode": {
+              "type": "string"
+            },
+            "virtualDeviceName": {
+              "type": "string"
+            },
+            "virtualDeviceStatus": {
+              "type": "string"
+            },
+            "virtualDeviceError": {
+              "type": "string"
+            },
+            "natType": {
+              "type": "string"
+            },
+            "lastEndpoint": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "Close": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BaseMessage"
+        },
+        {
+          "$ref": "#/$defs/ClientIdentityFields"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "sessionId"
+          ],
+          "properties": {
+            "type": {
+              "const": "close"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/LongId"
+            },
+            "status": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
