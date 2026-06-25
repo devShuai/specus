@@ -19,10 +19,18 @@ public sealed class TunnelDbContext : DbContext
     public DbSet<ClientCredential> ClientCredentials => Set<ClientCredential>();
     public DbSet<ClientIdentity> ClientIdentities => Set<ClientIdentity>();
     public DbSet<ClientSession> ClientSessions => Set<ClientSession>();
+    public DbSet<ManagementUser> ManagementUsers => Set<ManagementUser>();
+    public DbSet<ClientDownloadLink> ClientDownloadLinks => Set<ClientDownloadLink>();
     public DbSet<ConnectionRecord> ConnectionRecords => Set<ConnectionRecord>();
     public DbSet<TunnelMapping> TunnelMappings => Set<TunnelMapping>();
     public DbSet<HttpRouteMapping> HttpRouteMappings => Set<HttpRouteMapping>();
     public DbSet<TrafficUsage> TrafficUsages => Set<TrafficUsage>();
+    public DbSet<ResourceTrafficUsage> ResourceTrafficUsages => Set<ResourceTrafficUsage>();
+    public DbSet<HttpTrafficExchange> HttpTrafficExchanges => Set<HttpTrafficExchange>();
+    public DbSet<TcpTrafficFrame> TcpTrafficFrames => Set<TcpTrafficFrame>();
+    public DbSet<PeerMeshDevice> PeerMeshDevices => Set<PeerMeshDevice>();
+    public DbSet<PeerMeshAcl> PeerMeshAcls => Set<PeerMeshAcl>();
+    public DbSet<PeerMeshSession> PeerMeshSessions => Set<PeerMeshSession>();
     public DbSet<ConnectionStat> ConnectionStats => Set<ConnectionStat>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -134,11 +142,51 @@ public sealed class TunnelDbContext : DbContext
                 .HasDatabaseName("idx_client_session_machine_status");
         });
 
+        modelBuilder.Entity<ManagementUser>(b =>
+        {
+            b.ToTable("tunnel_management_user");
+            b.HasKey(x => x.Username);
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Role).HasColumnName("role").HasMaxLength(20).IsRequired()
+                .HasConversion<string>();
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_management_user_tenant");
+            b.HasIndex(x => x.Role).HasDatabaseName("idx_management_user_role");
+        });
+
+        modelBuilder.Entity<ClientDownloadLink>(b =>
+        {
+            b.ToTable("client_download_link");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.Implementation).HasColumnName("implementation").HasMaxLength(32).IsRequired();
+            b.Property(x => x.Platform).HasColumnName("platform").HasMaxLength(32).IsRequired();
+            b.Property(x => x.Arch).HasColumnName("arch").HasMaxLength(32).IsRequired();
+            b.Property(x => x.DisplayName).HasColumnName("display_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.DownloadUrl).HasColumnName("download_url").HasMaxLength(1024).IsRequired();
+            b.Property(x => x.Description).HasColumnName("description").HasMaxLength(512);
+            b.Property(x => x.DisplayOrder).HasColumnName("display_order").IsRequired();
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.Implementation).HasDatabaseName("idx_client_download_impl");
+            b.HasIndex(x => x.DisplayOrder).HasDatabaseName("idx_client_download_order");
+        });
+
         modelBuilder.Entity<ConnectionRecord>(b =>
         {
             b.ToTable("tunnel_connection_record");
             b.HasKey(x => x.Id);
             b.Property(x => x.Id).ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80);
             b.Property(x => x.ClientId).HasColumnName("client_id");
             b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
             b.Property(x => x.ChannelId).HasColumnName("channel_id").HasMaxLength(160);
@@ -155,6 +203,7 @@ public sealed class TunnelDbContext : DbContext
             b.HasIndex(x => new { x.ClientId, x.ConnectedAt })
                 .HasDatabaseName("idx_tunnel_connection_client_time");
             b.HasIndex(x => x.ConnectedAt).HasDatabaseName("idx_tunnel_connection_connected_at");
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_tunnel_connection_tenant");
         });
 
         modelBuilder.Entity<TunnelMapping>(b =>
@@ -168,6 +217,7 @@ public sealed class TunnelDbContext : DbContext
             b.Property(x => x.TargetAddress).HasColumnName("target_address").HasMaxLength(255).IsRequired();
             b.Property(x => x.TargetPort).HasColumnName("target_port").IsRequired();
             b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.DetailCaptureEnabled).HasColumnName("detail_capture_enabled").IsRequired();
             b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
@@ -186,6 +236,8 @@ public sealed class TunnelDbContext : DbContext
             b.Property(x => x.Route).HasColumnName("route").HasMaxLength(60).IsRequired();
             b.Property(x => x.TargetBaseUrl).HasColumnName("target_base_url").HasMaxLength(512).IsRequired();
             b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.DetailCaptureEnabled).HasColumnName("detail_capture_enabled").IsRequired();
+            b.Property(x => x.PathRewriteEnabled).HasColumnName("path_rewrite_enabled").IsRequired();
             b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
@@ -199,6 +251,7 @@ public sealed class TunnelDbContext : DbContext
             b.ToTable("tunnel_traffic_usage");
             b.HasKey(x => x.Id);
             b.Property(x => x.Id).ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80);
             b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
             b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
             b.Property(x => x.UsageDate).HasColumnName("usage_date").HasMaxLength(10).IsRequired();
@@ -207,7 +260,203 @@ public sealed class TunnelDbContext : DbContext
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.HasIndex(x => new { x.ClientId, x.UsageDate }).IsUnique();
-            b.HasIndex(x => x.ClientId);
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_tunnel_traffic_tenant");
+            b.HasIndex(x => x.ClientId).HasDatabaseName("idx_tunnel_traffic_client");
+        });
+
+        modelBuilder.Entity<ResourceTrafficUsage>(b =>
+        {
+            b.ToTable("tunnel_resource_traffic_usage");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
+            b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.ResourceType).HasColumnName("resource_type").HasMaxLength(32).IsRequired();
+            b.Property(x => x.ResourceKey).HasColumnName("resource_key").HasMaxLength(128).IsRequired();
+            b.Property(x => x.ResourceId).HasColumnName("resource_id");
+            b.Property(x => x.ResourceName).HasColumnName("resource_name").HasMaxLength(255).IsRequired();
+            b.Property(x => x.UsageDate).HasColumnName("usage_date").HasMaxLength(10).IsRequired();
+            b.Property(x => x.UploadBytes).HasColumnName("upload_bytes").IsRequired();
+            b.Property(x => x.DownloadBytes).HasColumnName("download_bytes").IsRequired();
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.ClientId, x.ResourceType, x.ResourceKey, x.UsageDate })
+                .IsUnique()
+                .HasDatabaseName("uk_resource_traffic_resource_date");
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_resource_traffic_tenant");
+            b.HasIndex(x => x.ClientId).HasDatabaseName("idx_resource_traffic_client");
+            b.HasIndex(x => x.ResourceType).HasDatabaseName("idx_resource_traffic_type");
+            b.HasIndex(x => x.UsageDate).HasDatabaseName("idx_resource_traffic_date");
+        });
+
+        modelBuilder.Entity<HttpTrafficExchange>(b =>
+        {
+            b.ToTable("tunnel_http_traffic_exchange");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
+            b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.Route).HasColumnName("route").HasMaxLength(128).IsRequired();
+            b.Property(x => x.ResourceId).HasColumnName("resource_id");
+            b.Property(x => x.ResourceName).HasColumnName("resource_name").HasMaxLength(255);
+            b.Property(x => x.Method).HasColumnName("method").HasMaxLength(16);
+            b.Property(x => x.RelativePath).HasColumnName("relative_path").HasMaxLength(1024);
+            b.Property(x => x.RawQuery).HasColumnName("raw_query").HasMaxLength(2048);
+            b.Property(x => x.StatusCode).HasColumnName("status_code").IsRequired();
+            b.Property(x => x.Success).HasColumnName("success").IsRequired();
+            b.Property(x => x.Error).HasColumnName("error").HasMaxLength(2048);
+            b.Property(x => x.RemoteAddress).HasColumnName("remote_address").HasMaxLength(255);
+            b.Property(x => x.RequestBytes).HasColumnName("request_bytes").IsRequired();
+            b.Property(x => x.ResponseBytes).HasColumnName("response_bytes").IsRequired();
+            b.Property(x => x.ElapsedMs).HasColumnName("elapsed_ms").IsRequired();
+            b.Property(x => x.RequestContentType).HasColumnName("request_content_type").HasMaxLength(255);
+            b.Property(x => x.ResponseContentType).HasColumnName("response_content_type").HasMaxLength(255);
+            b.Property(x => x.ResponseBodyType).HasColumnName("response_body_type").HasMaxLength(32);
+            b.Property(x => x.RequestHeaders).HasColumnName("request_headers").HasMaxLength(8192);
+            b.Property(x => x.ResponseHeaders).HasColumnName("response_headers").HasMaxLength(8192);
+            b.Property(x => x.RequestPreviewHex).HasColumnName("request_preview_hex").HasMaxLength(4096);
+            b.Property(x => x.RequestPreviewText).HasColumnName("request_preview_text");
+            b.Property(x => x.ResponsePreviewHex).HasColumnName("response_preview_hex").HasMaxLength(4096);
+            b.Property(x => x.ResponsePreviewText).HasColumnName("response_preview_text");
+            b.Property(x => x.RequestTruncated).HasColumnName("request_truncated").IsRequired();
+            b.Property(x => x.ResponseTruncated).HasColumnName("response_truncated").IsRequired();
+            b.Property(x => x.CapturedAt).HasColumnName("captured_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_http_traffic_tenant");
+            b.HasIndex(x => x.ClientId).HasDatabaseName("idx_http_traffic_client");
+            b.HasIndex(x => x.Route).HasDatabaseName("idx_http_traffic_route");
+            b.HasIndex(x => x.ResponseBodyType).HasDatabaseName("idx_http_traffic_body_type");
+            b.HasIndex(x => x.CapturedAt).HasDatabaseName("idx_http_traffic_captured_at");
+        });
+
+        modelBuilder.Entity<TcpTrafficFrame>(b =>
+        {
+            b.ToTable("tunnel_tcp_traffic_frame");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
+            b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.ListenPort).HasColumnName("listen_port").IsRequired();
+            b.Property(x => x.ResourceId).HasColumnName("resource_id");
+            b.Property(x => x.ResourceName).HasColumnName("resource_name").HasMaxLength(255);
+            b.Property(x => x.ChannelId).HasColumnName("channel_id").HasMaxLength(120).IsRequired();
+            b.Property(x => x.Direction).HasColumnName("frame_direction").HasMaxLength(32).IsRequired();
+            b.Property(x => x.RemoteAddress).HasColumnName("remote_address").HasMaxLength(255);
+            b.Property(x => x.SourceAddress).HasColumnName("source_address").HasMaxLength(255);
+            b.Property(x => x.SourcePort).HasColumnName("source_port");
+            b.Property(x => x.DestinationAddress).HasColumnName("destination_address").HasMaxLength(255);
+            b.Property(x => x.DestinationPort).HasColumnName("destination_port");
+            b.Property(x => x.StreamOffset).HasColumnName("stream_offset").IsRequired();
+            b.Property(x => x.StreamEndOffset).HasColumnName("stream_end_offset").IsRequired();
+            b.Property(x => x.FrameIndex).HasColumnName("frame_index").IsRequired();
+            b.Property(x => x.PayloadBytes).HasColumnName("payload_bytes").IsRequired();
+            b.Property(x => x.PayloadData).HasColumnName("payload_data").IsRequired();
+            b.Property(x => x.PayloadPreviewHex).HasColumnName("payload_preview_hex").HasMaxLength(4096);
+            b.Property(x => x.PayloadPreviewText).HasColumnName("payload_preview_text").HasMaxLength(4096);
+            b.Property(x => x.Truncated).HasColumnName("truncated").IsRequired();
+            b.Property(x => x.FrameTime).HasColumnName("frame_time").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_tcp_traffic_tenant");
+            b.HasIndex(x => x.ClientId).HasDatabaseName("idx_tcp_traffic_client");
+            b.HasIndex(x => x.ListenPort).HasDatabaseName("idx_tcp_traffic_listen_port");
+            b.HasIndex(x => x.ChannelId).HasDatabaseName("idx_tcp_traffic_channel");
+            b.HasIndex(x => new { x.TenantId, x.ChannelId, x.Direction, x.StreamOffset })
+                .HasDatabaseName("idx_tcp_traffic_stream");
+            b.HasIndex(x => x.FrameTime).HasDatabaseName("idx_tcp_traffic_frame_time");
+        });
+
+        modelBuilder.Entity<PeerMeshDevice>(b =>
+        {
+            b.ToTable("peer_mesh_device");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.OwnerUsername).HasColumnName("owner_username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.ClientId).HasColumnName("client_id").IsRequired();
+            b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.VirtualIp).HasColumnName("virtual_ip").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Cidr).HasColumnName("cidr").HasMaxLength(64).IsRequired();
+            b.Property(x => x.PublicKey).HasColumnName("public_key").HasMaxLength(256);
+            b.Property(x => x.NatType).HasColumnName("nat_type").HasMaxLength(80);
+            b.Property(x => x.LastEndpoint).HasColumnName("last_endpoint").HasMaxLength(255);
+            b.Property(x => x.VirtualDeviceMode).HasColumnName("virtual_device_mode").HasMaxLength(80);
+            b.Property(x => x.VirtualDeviceName).HasColumnName("virtual_device_name").HasMaxLength(80);
+            b.Property(x => x.VirtualDeviceStatus).HasColumnName("virtual_device_status").HasMaxLength(80);
+            b.Property(x => x.VirtualDeviceError).HasColumnName("virtual_device_error").HasMaxLength(512);
+            b.Property(x => x.VirtualDeviceUpdatedAt).HasColumnName("virtual_device_updated_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.Property(x => x.Enabled).HasColumnName("enabled").IsRequired();
+            b.Property(x => x.LastSeenAt).HasColumnName("last_seen_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.ClientId }).IsUnique()
+                .HasDatabaseName("uk_peer_mesh_device_client");
+            b.HasIndex(x => new { x.TenantId, x.VirtualIp }).IsUnique()
+                .HasDatabaseName("uk_peer_mesh_device_ip");
+            b.HasIndex(x => new { x.TenantId, x.OwnerUsername }).HasDatabaseName("idx_peer_mesh_device_owner");
+            b.HasIndex(x => x.ClientName).HasDatabaseName("idx_peer_mesh_device_client_name");
+        });
+
+        modelBuilder.Entity<PeerMeshAcl>(b =>
+        {
+            b.ToTable("peer_mesh_acl");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.OwnerUsername).HasColumnName("owner_username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.SourceClientId).HasColumnName("source_client_id").IsRequired();
+            b.Property(x => x.SourceClientName).HasColumnName("source_client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.TargetClientId).HasColumnName("target_client_id").IsRequired();
+            b.Property(x => x.TargetClientName).HasColumnName("target_client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.Allowed).HasColumnName("allowed").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.SourceClientId, x.TargetClientId }).IsUnique()
+                .HasDatabaseName("uk_peer_mesh_acl_pair");
+            b.HasIndex(x => new { x.TenantId, x.SourceClientId }).HasDatabaseName("idx_peer_mesh_acl_source");
+            b.HasIndex(x => new { x.TenantId, x.TargetClientId }).HasDatabaseName("idx_peer_mesh_acl_target");
+        });
+
+        modelBuilder.Entity<PeerMeshSession>(b =>
+        {
+            b.ToTable("peer_mesh_session");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.SourceClientId).HasColumnName("source_client_id").IsRequired();
+            b.Property(x => x.SourceClientName).HasColumnName("source_client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.TargetClientId).HasColumnName("target_client_id").IsRequired();
+            b.Property(x => x.TargetClientName).HasColumnName("target_client_name").HasMaxLength(120).IsRequired();
+            b.Property(x => x.PathType).HasColumnName("path_type").HasMaxLength(40).IsRequired();
+            b.Property(x => x.Status).HasColumnName("status").HasMaxLength(40).IsRequired();
+            b.Property(x => x.TokenHash).HasColumnName("token_hash").HasMaxLength(64);
+            b.Property(x => x.StartedAt).HasColumnName("started_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ClosedAt).HasColumnName("closed_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.Property(x => x.RttMillis).HasColumnName("rtt_millis");
+            b.Property(x => x.LocalEndpoint).HasColumnName("local_endpoint").HasMaxLength(255);
+            b.Property(x => x.RemoteEndpoint).HasColumnName("remote_endpoint").HasMaxLength(255);
+            b.Property(x => x.DirectBytes).HasColumnName("direct_bytes").IsRequired();
+            b.Property(x => x.RelayBytes).HasColumnName("relay_bytes").IsRequired();
+            b.Property(x => x.LastTrafficAt).HasColumnName("last_traffic_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_peer_mesh_session_tenant");
+            b.HasIndex(x => new { x.TenantId, x.SourceClientId }).HasDatabaseName("idx_peer_mesh_session_source");
+            b.HasIndex(x => new { x.TenantId, x.TargetClientId }).HasDatabaseName("idx_peer_mesh_session_target");
+            b.HasIndex(x => x.Status).HasDatabaseName("idx_peer_mesh_session_status");
         });
 
         modelBuilder.Entity<ConnectionStat>(b =>
@@ -215,6 +464,7 @@ public sealed class TunnelDbContext : DbContext
             b.ToTable("tunnel_connection_stat");
             b.HasKey(x => x.Id);
             b.Property(x => x.Id).ValueGeneratedOnAdd();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
             b.Property(x => x.ClientId).HasColumnName("client_id");
             b.Property(x => x.ClientName).HasColumnName("client_name").HasMaxLength(120).IsRequired();
             b.Property(x => x.StatMonth).HasColumnName("stat_month").HasMaxLength(7).IsRequired();
@@ -223,7 +473,9 @@ public sealed class TunnelDbContext : DbContext
             b.Property(x => x.FailureCount).HasColumnName("failure_count").IsRequired();
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
-            b.HasIndex(x => new { x.ClientName, x.StatMonth }).IsUnique();
+            b.HasIndex(x => x.TenantId).HasDatabaseName("idx_tunnel_connection_stat_tenant");
+            b.HasIndex(x => new { x.TenantId, x.ClientName, x.StatMonth }).IsUnique()
+                .HasDatabaseName("uk_tunnel_connection_stat");
             b.HasIndex(x => x.ClientName);
         });
     }

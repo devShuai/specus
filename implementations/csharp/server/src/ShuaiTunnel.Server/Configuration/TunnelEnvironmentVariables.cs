@@ -86,6 +86,55 @@ public static class TunnelEnvironmentVariables
             return $"Tunnel:{ToSectionName(parts[0])}";
         }
 
+        if (parts.Length >= 2
+            && parts[0].Equals("CONNECTION", StringComparison.OrdinalIgnoreCase))
+        {
+            if (parts[1].Equals("DETAIL", StringComparison.OrdinalIgnoreCase))
+            {
+                return parts.Length == 2
+                    ? "Tunnel:ConnectionRecord:DetailRetentionDays"
+                    : $"Tunnel:ConnectionRecord:Detail{ToPascal(parts[2..])}";
+            }
+
+            if (parts[1].Equals("ARCHIVE", StringComparison.OrdinalIgnoreCase))
+            {
+                return parts.Length == 2
+                    ? "Tunnel:ConnectionRecord:ArchiveIntervalMs"
+                    : $"Tunnel:ConnectionRecord:Archive{ToPascal(parts[2..])}";
+            }
+        }
+
+        if (parts.Length >= 2
+            && parts[0].Equals("CLIENT", StringComparison.OrdinalIgnoreCase)
+            && parts[1].Equals("AUTH", StringComparison.OrdinalIgnoreCase))
+        {
+            return parts.Length == 2
+                ? "Tunnel:ClientAuth"
+                : $"Tunnel:ClientAuth:{ToPascal(parts[2..])}";
+        }
+
+        if (parts.Length == 3
+            && parts[0].Equals("LOGIN", StringComparison.OrdinalIgnoreCase)
+            && parts[1].Equals("EXECUTOR", StringComparison.OrdinalIgnoreCase))
+        {
+            return parts[2].ToUpperInvariant() switch
+            {
+                "CORE" => "Tunnel:Login:ExecutorCoreSize",
+                "MAX" => "Tunnel:Login:ExecutorMaxSize",
+                "QUEUE" => "Tunnel:Login:ExecutorQueueCapacity",
+                _ => null,
+            };
+        }
+
+        if (parts.Length >= 2
+            && parts[0].Equals("PEER", StringComparison.OrdinalIgnoreCase)
+            && parts[1].Equals("MESH", StringComparison.OrdinalIgnoreCase))
+        {
+            return parts.Length == 2
+                ? "Tunnel:PeerMesh"
+                : $"Tunnel:PeerMesh:{ToPascal(parts[2..])}";
+        }
+
         return $"Tunnel:{ToSectionName(parts[0])}:{ToPascal(parts[1..])}";
     }
 

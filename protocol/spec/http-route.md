@@ -151,11 +151,13 @@ text/ecmascript
 不会改写：
 
 - `http://`、`https://` 等完整 URL。
-- `//cdn.example.com` 这类协议相对路径。
+- 响应 body 中的 `//cdn.example.com` 这类协议相对 URL。
 - `data:`、`javascript:` 等特殊协议。
 - 已带 `/http/{clientName}/{route}` 前缀的路径。
 
 如果 body 超过 `tunnel.http.rewrite.max-body-bytes`，或压缩解码失败，会跳过改写并原样返回。
+
+请求转发时，公网入口已经把 host 和 route 解析为服务端控制的字段，客户端只接收 `relativePath`。因此 `relativePath` 中的双斜线不会被当成协议相对 URL 或跨 host 跳转；例如 `//assets/app.js` 会按 Java 参考实现保留为同一 upstream host 下的普通路径，最终访问 `{targetBaseUrl}//assets/app.js`，同时仍会拒绝 `.` / `..` 段、query/fragment 型 base URL，以及 scheme/host/port 越界。
 
 ## WebSocket 隧道
 

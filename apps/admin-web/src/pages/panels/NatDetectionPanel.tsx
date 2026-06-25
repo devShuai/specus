@@ -16,7 +16,11 @@ import { usePageSeo } from "../../lib/seo";
 const DEFAULT_STUN_SERVERS = [
   "stun:stun.miwifi.com:3478",
   "stun:stun.chat.bilibili.com:3478",
+  "stun:stun.douyucdn.cn:3478",
+  "stun:stun1.douyucdn.cn:3478",
+  "stun:stun.dingtalk.com:3478",
 ];
+const UNASSIGNED_STUN_SERVER = "未归属 ICE candidate";
 
 type BrowserNatKind =
   | "idle"
@@ -26,6 +30,8 @@ type BrowserNatKind =
   | "mapping-stable"
   | "mapping-changing"
   | "failed";
+
+type BrowserNatConfidence = "high" | "medium" | "low";
 
 interface BrowserIceCandidate {
   raw: string;
@@ -45,6 +51,7 @@ interface StunProbeResult {
   candidates: BrowserIceCandidate[];
   error: string | null;
   elapsedMs: number;
+  sourceKnown: boolean;
 }
 
 interface BrowserNatResult {
@@ -55,13 +62,15 @@ interface BrowserNatResult {
   probes: StunProbeResult[];
   mappedEndpoints: string[];
   hostCandidates: BrowserIceCandidate[];
+  confidence: BrowserNatConfidence;
+  evidence: string;
   summary: string;
   recommendation: string;
 }
 
 export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean }) {
   const [serversText, setServersText] = useState(DEFAULT_STUN_SERVERS.join("\n"));
-  const [timeoutMs, setTimeoutMs] = useState("7000");
+  const [timeoutMs, setTimeoutMs] = useState("9000");
   const [result, setResult] = useState<BrowserNatResult | null>(null);
   const [checking, setChecking] = useState(false);
 
@@ -115,7 +124,7 @@ export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean
                   "acceptedAnswer": {
                     "@type": "Answer",
                     "text":
-                      "检测完全在本地浏览器内进行，不向 shuai-tunnel 后端上传任何数据。浏览器会创建一个空的 WebRTC data channel，触发 ICE candidate 收集，并向你配置的 STUN 服务器（默认小米与腾讯公开 STUN）发送 binding 请求。",
+                      "检测完全在本地浏览器内进行，不向 shuai-tunnel 后端上传任何数据。浏览器会创建一个空的 WebRTC data channel，触发 ICE candidate 收集，并向你配置的多个 STUN 服务器发送 binding 请求。",
                   },
                 },
               ],
@@ -147,6 +156,8 @@ export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean
           probes: [],
           mappedEndpoints: [],
           hostCandidates: [],
+          confidence: "low",
+          evidence: "浏览器不支持 RTCPeerConnection",
           summary: "当前浏览器不支持 WebRTC RTCPeerConnection，无法在页面内执行 STUN 探测。",
           recommendation: "换用 Chrome、Edge、Firefox 等支持 WebRTC 的浏览器，或使用客户端侧 NAT 探测结果。",
         });
@@ -169,6 +180,8 @@ export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean
         probes: [],
         mappedEndpoints: [],
         hostCandidates: [],
+        confidence: "low",
+        evidence: "检测流程异常",
         summary: error instanceof Error ? error.message : "浏览器 NAT 检测失败。",
         recommendation: "检查浏览器是否允许 WebRTC，或尝试更换 STUN 服务地址。",
       });
@@ -295,6 +308,11 @@ function NatHero({
               耗时 {Math.max(0, result.finishedAt - result.startedAt)} ms
             </span>
           )}
+          {result && (
+            <span className="rounded-md bg-white/70 px-2 py-0.5 text-tiny text-zinc-600 dark:bg-white/[0.06] dark:text-zinc-300">
+              置信度：{confidenceLabel(result.confidence)}
+            </span>
+          )}
         </div>
 
         <div className="flex flex-col gap-3">
@@ -307,6 +325,11 @@ function NatHero({
           {result?.recommendation && (
             <p className="max-w-2xl rounded-lg border border-black/5 bg-white/70 p-3 text-small leading-6 text-zinc-700 backdrop-blur dark:border-white/10 dark:bg-white/[0.04] dark:text-zinc-300">
               {result.recommendation}
+            </p>
+          )}
+          {result?.evidence && (
+            <p className="max-w-2xl text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+              证据：{result.evidence}
             </p>
           )}
         </div>
@@ -343,14 +366,14 @@ function NatHero({
           </summary>
           <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
             <Textarea
-              label="STUN 服务（每行一个）"
+              label="STUN 服务（每行一个，默认中国节点）"
               size="sm"
               variant="bordered"
               radius="sm"
               minRows={2}
               value={serversText}
               onValueChange={onServersTextChange}
-              description="仅支持标准 STUN/TURN，浏览器不能直接连 server 内置的 TURN-lite。"
+              description="默认使用国内 STUN。仅支持标准 STUN/TURN，浏览器不能直接连 server 内置的 TURN-lite。"
             />
             <Input
               label="单服务超时"
@@ -370,7 +393,7 @@ function NatHero({
 
 function MetricStrip({ result }: { result: BrowserNatResult | null }) {
   const items = [
-    { label: "STUN 服务", value: result?.probes.length ?? 0 },
+    { label: "STUN 服务", value: result?.probes.filter((probe) => probe.sourceKnown).length ?? 0 },
     { label: "公网映射端点", value: result?.mappedEndpoints.length ?? 0 },
     { label: "本地候选", value: result?.hostCandidates.length ?? 0 },
     {
@@ -652,6 +675,17 @@ function natToneBg(tone: "default" | "primary" | "success" | "warning" | "danger
   }
 }
 
+function confidenceLabel(confidence: BrowserNatConfidence): string {
+  switch (confidence) {
+    case "high":
+      return "高";
+    case "medium":
+      return "中";
+    default:
+      return "低";
+  }
+}
+
 /**
  * 同一个 RTCPeerConnection 同时挂多个 STUN 服务器，让所有 STUN 都从同一组本机
  * UDP socket 出去。只有这样浏览器返回的多个 srflx 才可比对：
@@ -692,23 +726,33 @@ async function probeStunServers(servers: string[], timeoutMs: number): Promise<S
       pc.close();
 
       const elapsedMs = Math.round(performance.now() - startedAt);
-      const results: StunProbeResult[] = servers.map((server) => {
-        const collected = candidatesByServer.get(server) ?? [];
-        const hasSrflx = collected.some((c) => c.type === "srflx");
-        const noteworthy = !hasSrflx ? candidatesUnassigned.filter((c) => c.type === "srflx") : [];
-        // host 候选不属于任何 STUN，但每个 STUN 展示时都需要看到，复制一份
         const hostShared = candidatesUnassigned.filter((c) => c.type === "host");
-        const merged = [...collected, ...hostShared, ...noteworthy];
-        const error = errorMap.get(server) ?? null;
-        return {
-          server,
-          candidates: merged,
-          error: error ?? (timedOut && !hasSrflx ? "超时，未收集到 srflx" : null),
-          elapsedMs,
-        };
-      });
-      resolve(results);
-    };
+        const unassignedNetworkCandidates = candidatesUnassigned.filter((c) => c.type !== "host");
+        const results: StunProbeResult[] = servers.map((server) => {
+          const collected = candidatesByServer.get(server) ?? [];
+          const hasSrflx = collected.some((c) => c.type === "srflx");
+          // host 候选不属于任何 STUN，但每个 STUN 展示时都需要看到，复制一份。
+          const merged = [...collected, ...hostShared];
+          const error = errorMap.get(server) ?? null;
+          return {
+            server,
+            candidates: merged,
+            error: error ?? (timedOut && !hasSrflx ? "超时，未收集到 srflx" : null),
+            elapsedMs,
+            sourceKnown: true,
+          };
+        });
+        if (unassignedNetworkCandidates.length > 0) {
+          results.push({
+            server: UNASSIGNED_STUN_SERVER,
+            candidates: unassignedNetworkCandidates,
+            error: "浏览器未暴露 candidate.url，无法确认来自哪个 STUN；仅用于展示，不用于强分类。",
+            elapsedMs,
+            sourceKnown: false,
+          });
+        }
+        resolve(results);
+      };
 
     const timer = window.setTimeout(() => finalize(true), timeoutMs);
 
@@ -770,17 +814,28 @@ function findServerByUrl(url: string, servers: string[]): string | null {
 
 function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]): BrowserNatResult {
   const finishedAt = Date.now();
-  // 把所有 srflx 收齐，按地址族分组：IPv4 / IPv6 各自独立判断，避免双栈被误判 Symmetric
-  const srflxAll = uniqueCandidates(
-    probes.flatMap((probe) => probe.candidates.filter((c) => c.type === "srflx")),
+  const knownProbes = probes.filter((probe) => probe.sourceKnown);
+  const unknownProbes = probes.filter((probe) => !probe.sourceKnown);
+  const knownSrflxAll = uniqueCandidates(
+    knownProbes.flatMap((probe) => probe.candidates.filter((c) => c.type === "srflx")),
   );
+  const unknownSrflxAll = uniqueCandidates(
+    unknownProbes.flatMap((probe) => probe.candidates.filter((c) => c.type === "srflx")),
+  );
+  // 全量 srflx 用于展示；强分类只使用可归属到具体 STUN 的候选。
+  const srflxAll = uniqueCandidates([...knownSrflxAll, ...unknownSrflxAll]);
   const hostAll = uniqueCandidates(
     probes.flatMap((probe) => probe.candidates.filter((c) => c.type === "host")),
   );
   const mappedEndpoints = Array.from(new Set(srflxAll.map(endpointOf))).sort();
 
-  const srflxV4 = srflxAll.filter(isIpv4Candidate);
-  const srflxV6 = srflxAll.filter(isIpv6Candidate);
+  const knownSrflxByServer = knownProbes.filter((probe) =>
+    probe.candidates.some((candidate) => candidate.type === "srflx"),
+  );
+  const enoughKnownStunEvidence = knownSrflxByServer.length >= 2;
+
+  const srflxV4 = knownSrflxAll.filter(isIpv4Candidate);
+  const srflxV6 = knownSrflxAll.filter(isIpv6Candidate);
   const hostV4 = hostAll.filter(isIpv4Candidate);
   const hostV6 = hostAll.filter(isIpv6Candidate);
 
@@ -792,6 +847,7 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
   const v6 = srflxV6.length > 0 ? groupVerdict(srflxV6, hostV6) : null;
 
   const natType = pickWorstNatType(v4, v6);
+  const evidence = `${knownSrflxByServer.length} 个 STUN 返回可归属公网映射，${unknownSrflxAll.length} 个公网映射未归属来源`;
 
   if (srflxAll.length === 0) {
     return {
@@ -802,8 +858,34 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
       probes,
       mappedEndpoints,
       hostCandidates: hostAll,
+      confidence: "high",
+      evidence,
       summary: "没有拿到 server-reflexive candidate。当前浏览器网络可能阻断 UDP/STUN，或浏览器策略禁用了 WebRTC candidate 暴露。",
       recommendation: "如果 Peer Mesh 要在这个网络下直连，建议检查防火墙和 UDP 出站策略；业务上应准备 relay 回退。",
+    };
+  }
+
+  if (!enoughKnownStunEvidence) {
+    const knownCount = knownSrflxByServer.length;
+    const unknownCount = unknownSrflxAll.length;
+    const bestEffortNatType = natType ?? inferBestEffortNatType(srflxAll, hostAll) ?? "NAT";
+    const bestEffortSymmetric = bestEffortNatType === "SYMMETRIC_NAT";
+    return {
+      kind: bestEffortSymmetric ? "mapping-changing" : "mapping-stable",
+      natType: bestEffortNatType,
+      startedAt,
+      finishedAt,
+      probes,
+      mappedEndpoints,
+      hostCandidates: hostAll,
+      confidence: "low",
+      evidence,
+      summary: bestEffortSymmetric
+        ? "结论：疑似 Symmetric NAT。浏览器可见的公网映射端点出现变化，但部分 candidate 来源不完整，按低置信度处理。"
+        : `结论：${natConclusionLabel(bestEffortNatType)}。当前可见公网映射未出现变化，但只有 ${knownCount} 个 STUN 返回可归属结果，按低置信度处理。`,
+      recommendation: unknownCount > 0 && knownCount === 0
+        ? "浏览器没有暴露 candidate.url，页面仍给出最佳判断。建议保留 relay 回退，或更换浏览器/网络后复测。"
+        : "建议继续使用更多 STUN 复测；业务策略上可先尝试 direct，但必须保留 relay 回退。",
     };
   }
 
@@ -816,6 +898,8 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
       probes,
       mappedEndpoints,
       hostCandidates: hostAll,
+      confidence: knownSrflxByServer.length >= 3 ? "high" : "medium",
+      evidence,
       summary: "同一个本机 socket 在不同 STUN 服务看到了不同的公网映射端点，说明 NAT 的映射依赖目标地址或目标端口，符合 Symmetric NAT 行为。",
       recommendation: "这种网络下 UDP 打洞通常失败，Peer Mesh 应直接走 relay；只有对端是 Endpoint-Independent 类 NAT 时才有机会打洞。",
     };
@@ -829,6 +913,8 @@ function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]):
     probes,
     mappedEndpoints,
     hostCandidates: hostAll,
+    confidence: knownSrflxByServer.length >= 3 ? "high" : "medium",
+    evidence,
     summary: natType === "NO_NAT"
       ? "公网地址端口与本机一致，没有 NAT，直接是公网出口。"
       : natType === "PORT_PRESERVED_NAT"
@@ -880,6 +966,37 @@ function inferNatTypeForGroup(
     return sample.port === sample.relatedPort ? "PORT_PRESERVED_NAT" : "CONE_LIKE_NAT";
   }
   return "CONE_LIKE_NAT";
+}
+
+function inferBestEffortNatType(
+  srflxAll: BrowserIceCandidate[],
+  hostAll: BrowserIceCandidate[],
+): string | null {
+  const srflxV4 = srflxAll.filter(isIpv4Candidate);
+  const srflxV6 = srflxAll.filter(isIpv6Candidate);
+  const hostV4 = hostAll.filter(isIpv4Candidate);
+  const hostV6 = hostAll.filter(isIpv6Candidate);
+  return pickWorstNatType(
+    srflxV4.length > 0 ? inferNatTypeForGroup(srflxV4, hostV4) : null,
+    srflxV6.length > 0 ? inferNatTypeForGroup(srflxV6, hostV6) : null,
+  );
+}
+
+function natConclusionLabel(natType: string | null): string {
+  switch (natType) {
+    case "SYMMETRIC_NAT":
+      return "疑似 Symmetric NAT";
+    case "NO_NAT":
+      return "无 NAT / 公网直连";
+    case "PORT_PRESERVED_NAT":
+      return "端口保持 NAT";
+    case "CONE_LIKE_NAT":
+      return "疑似 Cone-like NAT";
+    case "PORT_RESTRICTED_NAT":
+      return "疑似 Port Restricted NAT";
+    default:
+      return "疑似 NAT";
+  }
 }
 
 const NAT_TYPE_SEVERITY: Record<string, number> = {

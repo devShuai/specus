@@ -36,6 +36,7 @@ type clientEnvironmentInfo struct {
 	OSArch             string   `json:"osArch"`
 	ClientVersion      string   `json:"clientVersion"`
 	JavaVersion        string   `json:"javaVersion"`
+	PeerPublicKey      string   `json:"peerPublicKey"`
 	LocalAddresses     []string `json:"localAddresses"`
 	StartedAt          string   `json:"startedAt"`
 }
@@ -81,6 +82,9 @@ func (client *Client) login(ctx context.Context) (RuntimeConfig, error) {
 		runtime.NettyPort < 1 || runtime.NettyPort > 65535 {
 		return RuntimeConfig{}, fmt.Errorf("client HTTP login response is missing client/session/token/netty endpoint")
 	}
+	if runtime.TokenTTLSeconds > 0 {
+		runtime.TokenExpiresAt = time.Now().Add(time.Duration(runtime.TokenTTLSeconds) * time.Second)
+	}
 	return runtime, nil
 }
 
@@ -105,7 +109,7 @@ func collectEnvironment() clientEnvironmentInfo {
 	}
 	username := "unknown"
 	if current, err := user.Current(); err == nil && current.Username != "" {
-		username = current.Username
+		username = normalizeOSUser(current.Username)
 	}
 	return clientEnvironmentInfo{
 		MachineFingerprint: machineFingerprint(hostname),
@@ -115,9 +119,27 @@ func collectEnvironment() clientEnvironmentInfo {
 		OSArch:             runtime.GOARCH,
 		ClientVersion:      "",
 		JavaVersion:        "",
+		PeerPublicKey:      peerPublicKeyBase64(),
 		LocalAddresses:     localAddresses(),
 		StartedAt:          time.Now().UTC().Format(time.RFC3339Nano),
 	}
+}
+
+func normalizeOSUser(value string) string {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return "unknown"
+	}
+	if index := strings.LastIndex(normalized, `\`); index >= 0 && index+1 < len(normalized) {
+		normalized = normalized[index+1:]
+	}
+	if index := strings.LastIndex(normalized, "/"); index >= 0 && index+1 < len(normalized) {
+		normalized = normalized[index+1:]
+	}
+	if normalized == "" {
+		return "unknown"
+	}
+	return normalized
 }
 
 func machineFingerprint(hostname string) string {

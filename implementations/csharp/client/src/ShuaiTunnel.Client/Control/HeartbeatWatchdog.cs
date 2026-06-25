@@ -31,6 +31,7 @@ internal sealed class HeartbeatWatchdog : IAsyncDisposable
         var now = Environment.TickCount64;
         _lastReadTicks = now;
         _lastWriteTicks = now;
+        _writer.PacketWritten += MarkWrite;
     }
 
     public void Start(CancellationToken linkedToken)
@@ -63,7 +64,6 @@ internal sealed class HeartbeatWatchdog : IAsyncDisposable
                     {
                         await _writer.WriteAsync(new HeartbeatRequestPacket(), cancellationToken)
                             .ConfigureAwait(false);
-                        MarkWrite();
                     }
                     catch (Exception ex)
                     {
@@ -83,6 +83,7 @@ internal sealed class HeartbeatWatchdog : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
+        _writer.PacketWritten -= MarkWrite;
         if (_loop is not null)
         {
             try

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -139,11 +141,11 @@ func (db *DB) CountConnectionsSince(ctx context.Context, clientID int64, since t
 
 // InsertConnectionRecord persists a login audit row and returns its generated id.
 func (db *DB) InsertConnectionRecord(ctx context.Context, record ConnectionRecord) (int64, error) {
-	const cols = `(client_id, client_name, channel_id, remote_address, connected_at,
+	const cols = `(tenant_id, client_id, client_name, channel_id, remote_address, connected_at,
 		disconnected_at, success, failure_reason, disconnect_reason)`
-	const vals = `(?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	const vals = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	args := []any{
-		record.ClientID, record.ClientName, record.ChannelID, record.RemoteAddress,
+		defaultTenant(record.TenantID), record.ClientID, record.ClientName, record.ChannelID, record.RemoteAddress,
 		formatTime(record.ConnectedAt), nullableTime(record.DisconnectedAt),
 		boolToInt(record.Success), record.FailureReason, record.DisconnectReason,
 	}
@@ -176,6 +178,15 @@ func (db *DB) MarkDisconnect(ctx context.Context, recordID int64, reason string,
 func (db *DB) CountClients(ctx context.Context) (int64, error) {
 	var count int64
 	err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM tunnel_client_account`).Scan(&count)
+	return count, err
+}
+
+// CountClientsByTenant returns the number of client accounts in a tenant.
+func (db *DB) CountClientsByTenant(ctx context.Context, tenantID string) (int64, error) {
+	var count int64
+	err := db.sql.QueryRowContext(ctx,
+		db.rebind(`SELECT COUNT(*) FROM tunnel_client_account WHERE COALESCE(tenant_id, 'default') = ?`),
+		defaultTenant(tenantID)).Scan(&count)
 	return count, err
 }
 
@@ -247,7 +258,7 @@ func (db *DB) InsertCredentialIfAbsent(ctx context.Context, credential ClientCre
 // ListEnabledTunnels returns enabled tunnel mappings for a client, ordered by id.
 func (db *DB) ListEnabledTunnels(ctx context.Context, clientID int64) ([]TunnelMapping, error) {
 	query := db.rebind(`SELECT id, client_id, client_name, listen_port, target_address, target_port,
-		enabled, created_at, updated_at FROM tunnel_mapping
+		enabled, detail_capture_enabled, created_at, updated_at FROM tunnel_mapping
 		WHERE client_id = ? AND enabled = 1 ORDER BY id`)
 	rows, err := db.sql.QueryContext(ctx, query, clientID)
 	if err != nil {
@@ -259,13 +270,15 @@ func (db *DB) ListEnabledTunnels(ctx context.Context, clientID int64) ([]TunnelM
 		var (
 			mapping            TunnelMapping
 			enabled            int
+			detailCapture      int
 			createdAt, updated string
 		)
 		if err := rows.Scan(&mapping.ID, &mapping.ClientID, &mapping.ClientName, &mapping.ListenPort,
-			&mapping.TargetAddress, &mapping.TargetPort, &enabled, &createdAt, &updated); err != nil {
+			&mapping.TargetAddress, &mapping.TargetPort, &enabled, &detailCapture, &createdAt, &updated); err != nil {
 			return nil, err
 		}
 		mapping.Enabled = enabled != 0
+		mapping.DetailCaptureEnabled = detailCapture != 0
 		mapping.CreatedAt = parseTime(createdAt)
 		mapping.UpdatedAt = parseTime(updated)
 		mappings = append(mappings, mapping)
@@ -284,7 +297,7 @@ func (db *DB) CountHTTPRoutes(ctx context.Context, clientID int64) (int, error) 
 // ListEnabledHTTPRoutes returns enabled HTTP route mappings for a client, ordered by id.
 func (db *DB) ListEnabledHTTPRoutes(ctx context.Context, clientID int64) ([]HTTPRouteMapping, error) {
 	query := db.rebind(`SELECT id, client_id, client_name, route, target_base_url, enabled,
-		created_at, updated_at FROM http_route_mapping
+		detail_capture_enabled, path_rewrite_enabled, created_at, updated_at FROM http_route_mapping
 		WHERE client_id = ? AND enabled = 1 ORDER BY id`)
 	rows, err := db.sql.QueryContext(ctx, query, clientID)
 	if err != nil {
@@ -296,13 +309,17 @@ func (db *DB) ListEnabledHTTPRoutes(ctx context.Context, clientID int64) ([]HTTP
 		var (
 			route              HTTPRouteMapping
 			enabled            int
+			detailCapture      int
+			pathRewrite        int
 			createdAt, updated string
 		)
 		if err := rows.Scan(&route.ID, &route.ClientID, &route.ClientName, &route.Route,
-			&route.TargetBaseURL, &enabled, &createdAt, &updated); err != nil {
+			&route.TargetBaseURL, &enabled, &detailCapture, &pathRewrite, &createdAt, &updated); err != nil {
 			return nil, err
 		}
 		route.Enabled = enabled != 0
+		route.DetailCaptureEnabled = detailCapture != 0
+		route.PathRewriteEnabled = pathRewrite != 0
 		route.CreatedAt = parseTime(createdAt)
 		route.UpdatedAt = parseTime(updated)
 		routes = append(routes, route)
@@ -310,28 +327,136 @@ func (db *DB) ListEnabledHTTPRoutes(ctx context.Context, clientID int64) ([]HTTP
 	return routes, rows.Err()
 }
 
+// HTTPRoutePathRewriteEnabled reports whether a client route has server-side response path
+// rewriting enabled. Missing client/route rows are treated as disabled.
+func (db *DB) HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route string) (bool, error) {
+	account, err := db.FindClientByName(ctx, clientName)
+	if err != nil || account == nil {
+		return false, err
+	}
+	query := db.rebind(`SELECT path_rewrite_enabled FROM http_route_mapping
+		WHERE client_id = ? AND route = ?`)
+	var enabled int
+	err = db.sql.QueryRowContext(ctx, query, account.ID, route).Scan(&enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return enabled != 0, nil
+}
+
 // AddTraffic increments today's upload/download byte counters for a client, upserting the row.
-func (db *DB) AddTraffic(ctx context.Context, clientID int64, clientName, usageDate string, upload, download int64) error {
+func (db *DB) AddTraffic(ctx context.Context, account ClientAccount, usageDate string, upload, download int64) error {
 	now := formatTime(time.Now())
 	switch db.dialect {
 	case DialectMySQL:
 		query := `INSERT INTO tunnel_traffic_usage
-			(client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			(tenant_id, client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE upload_bytes = upload_bytes + VALUES(upload_bytes),
+				tenant_id = VALUES(tenant_id),
 				download_bytes = download_bytes + VALUES(download_bytes), updated_at = VALUES(updated_at)`
-		_, err := db.sql.ExecContext(ctx, query, clientID, clientName, usageDate, upload, download, now)
+		_, err := db.sql.ExecContext(ctx, query, defaultTenant(account.TenantID), account.ID,
+			account.ClientName, usageDate, upload, download, now)
 		return err
 	default:
 		query := db.rebind(`INSERT INTO tunnel_traffic_usage
-			(client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			(tenant_id, client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (client_id, usage_date) DO UPDATE SET
+				tenant_id = excluded.tenant_id,
 				upload_bytes = tunnel_traffic_usage.upload_bytes + ?,
 				download_bytes = tunnel_traffic_usage.download_bytes + ?,
 				updated_at = ?`)
-		_, err := db.sql.ExecContext(ctx, query, clientID, clientName, usageDate, upload, download, now,
+		_, err := db.sql.ExecContext(ctx, query, defaultTenant(account.TenantID), account.ID,
+			account.ClientName, usageDate, upload, download, now, upload, download, now)
+		return err
+	}
+}
+
+// AddResourceTraffic increments one resource-level daily traffic row.
+func (db *DB) AddResourceTraffic(ctx context.Context, account ClientAccount, resourceType, resourceKey,
+	usageDate string, upload, download int64) error {
+	now := formatTime(time.Now())
+	resourceID, resourceName := db.resourceDescriptor(ctx, account.ID, resourceType, resourceKey)
+	switch db.dialect {
+	case DialectMySQL:
+		query := `INSERT INTO tunnel_resource_traffic_usage
+			(tenant_id, client_id, client_name, resource_type, resource_key, resource_id, resource_name,
+			 usage_date, upload_bytes, download_bytes, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON DUPLICATE KEY UPDATE resource_id = VALUES(resource_id), resource_name = VALUES(resource_name),
+				upload_bytes = upload_bytes + VALUES(upload_bytes),
+				download_bytes = download_bytes + VALUES(download_bytes), updated_at = VALUES(updated_at)`
+		_, err := db.sql.ExecContext(ctx, query, defaultTenant(account.TenantID), account.ID, account.ClientName,
+			resourceType, resourceKey, nullableInt64(resourceID), resourceName, usageDate, upload, download, now)
+		return err
+	default:
+		query := db.rebind(`INSERT INTO tunnel_resource_traffic_usage
+			(tenant_id, client_id, client_name, resource_type, resource_key, resource_id, resource_name,
+			 usage_date, upload_bytes, download_bytes, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (tenant_id, client_id, resource_type, resource_key, usage_date) DO UPDATE SET
+				resource_id = excluded.resource_id,
+				resource_name = excluded.resource_name,
+				upload_bytes = tunnel_resource_traffic_usage.upload_bytes + ?,
+				download_bytes = tunnel_resource_traffic_usage.download_bytes + ?,
+				updated_at = ?`)
+		_, err := db.sql.ExecContext(ctx, query, defaultTenant(account.TenantID), account.ID, account.ClientName,
+			resourceType, resourceKey, nullableInt64(resourceID), resourceName, usageDate, upload, download, now,
 			upload, download, now)
 		return err
 	}
+}
+
+func (db *DB) resourceDescriptor(ctx context.Context, clientID int64, resourceType, resourceKey string) (*int64, string) {
+	switch resourceType {
+	case "TCP_TUNNEL":
+		listenPort := parseTCPResourceKey(resourceKey)
+		var id int64
+		var targetAddress string
+		var targetPort int
+		err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT id, target_address, target_port
+			FROM tunnel_mapping WHERE client_id = ? AND listen_port = ?`), clientID, listenPort).
+			Scan(&id, &targetAddress, &targetPort)
+		if err == nil {
+			return &id, strconv.Itoa(listenPort) + " -> " + targetAddress + ":" + strconv.Itoa(targetPort)
+		}
+		return nil, "端口 " + strconv.Itoa(listenPort)
+	case "HTTP_ROUTE":
+		route := parseHTTPResourceKey(resourceKey)
+		var id int64
+		var targetBaseURL string
+		err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT id, target_base_url
+			FROM http_route_mapping WHERE client_id = ? AND route = ?`), clientID, route).
+			Scan(&id, &targetBaseURL)
+		if err == nil {
+			return &id, route + " -> " + targetBaseURL
+		}
+		return nil, route
+	default:
+		return nil, resourceKey
+	}
+}
+
+func nullableInt64(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func parseTCPResourceKey(resourceKey string) int {
+	value := strings.TrimPrefix(resourceKey, "tcp:")
+	port, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return port
+}
+
+func parseHTTPResourceKey(resourceKey string) string {
+	return strings.TrimPrefix(resourceKey, "http:")
 }

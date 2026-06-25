@@ -17,25 +17,25 @@ implementations/c/server/
 
 ## 当前状态
 
-已实现第一版核心 server 路径：
+当前 C server 冻结在“轻量兼容实现”阶段，用于协议联调和最小可用管理面，不继续扩展 Peer Mesh 数据面：
 
 - C11 + POSIX socket + pthread + zlib 构建。
 - Java 协议帧头：`0x14353565`、`version=1`、`serializer`、`command`、body length。
-- HMAC-SHA256 登录鉴权，兼容 Java/Go client。
-- `LoginRequest`、`LoginResponse`、`HeartbeatResponse`、`MessageResponse/NAT_CONTROL`、`NAT_MESSAGE` 子集。
 - Java compact payload 的 raw/deflate 编解码，使用 raw deflate 参数对齐 Java `Deflater(..., true)` / `Inflater(true)`。
-- 登录成功后主动下发 `NAT_CONTROL`。
-- TCP NAT 的 `REGISTER`、`REGISTER_RESULT`、`CONNECTED`、`DATA`、`DISCONNECTED`、`UNREGISTER` 基本流程。
-- 使用现有 Java wire fixtures 做字节级测试，覆盖登录响应、心跳响应、NAT 注册结果、小 DATA、大 DATA deflate。
+- HMAC-SHA256 启动鉴权，支持 SQLite `tunnel_client_credential` 校验，创建/复用机器用户绑定的客户端身份，写入 `tunnel_client_session`，并签发 Java-shaped `cs_` runtime token。
+- Netty 控制通道按 `clientSessionId + accessToken` 登录，校验 token 过期、客户端/凭证启用状态、同机单实例和最大在线实例数，登录成功后进入 `NETTY_ONLINE`，断开后标记 `DISCONNECTED`。
+- `NAT_CONTROL`、TCP NAT 的 `REGISTER`、`CONNECTED`、`DATA`、`DISCONNECTED`、`UNREGISTER` 核心流程可用。
+- 轻量管理 HTTP listener 已覆盖本地密码登录、HS256 管理 JWT、管理用户、客户端凭证、客户端、TCP 映射、HTTP route、连接记录、连接归档统计、日流量、资源流量和 SQLite HTTP/TCP 明细查询。
+- Direct HTTP 已支持普通 HTTP 请求和 WebSocket upgrade bridge，并接入 Java-compatible 响应路径改写，覆盖 HTML/CSS、runtime polyfill、gzip/deflate 解码。
+- OIDC 浏览器配置接口已对齐 Java；`/oidc/token` 支持 HTTP token endpoint 的 Authorization Code + PKCE 代理交换，`https://` token endpoint 明确返回 `502`。
+- Peer Mesh 管理契约已覆盖 status、device list、device enabled 持久化、ACL list/create/delete、session list/close/close-open；C 数据面不会主动创建真实 peer session，虚拟网卡状态固定为 `UNSUPPORTED`。
 
-尚未实现：
+仍未实现或暂不推进：
 
-- 多客户端账号模型和数据库持久化。
-- 管理 API、管理页面、WebSocket 事件。
-- Direct HTTP 转发。
-- OIDC、本地管理 JWT、TLS。
-- 完整流量统计、连接记录、限流、归档。
-- 高并发背压、连接数限制、生产级资源治理。
+- TLS listener 与 HTTPS OIDC token exchange。
+- Elasticsearch 明细存储。
+- Peer Mesh 真实数据面、虚拟网卡、STUN/TURN-lite relay。
+- Java 同级别的生产级背压、水位线和完整 HA 治理。
 
 ## 项目布局
 

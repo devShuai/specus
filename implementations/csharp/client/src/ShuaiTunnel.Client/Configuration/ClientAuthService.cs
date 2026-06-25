@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
+using ShuaiTunnel.Client.PeerMesh;
 using ShuaiTunnel.Protocol.Security;
 
 namespace ShuaiTunnel.Client.Configuration;
@@ -75,14 +76,16 @@ public sealed class ClientAuthService
         runtime.TunnelConfigList ??= new List<TunnelConfigEntry>();
         runtime.HttpTunnelConfigList ??= new List<HttpTunnelConfigEntry>();
         runtime.Policy ??= new ClientPolicy();
+        runtime.PeerMesh ??= new PeerMeshConfig();
         _logger.LogInformation(
-            "客户端 HTTP 登录成功: clientName={ClientName}, session={Session}, tunnel={Host}:{Port}, tcp={Tcp}, http={Http}, maxOnlineInstances={Max}",
+            "客户端 HTTP 登录成功: clientName={ClientName}, session={Session}, tunnel={Host}:{Port}, tcp={Tcp}, http={Http}, peerMesh={PeerMesh}, maxOnlineInstances={Max}",
             runtime.ClientName,
             runtime.ClientSessionId,
             runtime.NettyHost,
             runtime.NettyPort,
             runtime.TunnelConfigList.Count,
             runtime.HttpTunnelConfigList.Count,
+            runtime.PeerMesh.Enabled ? "enabled" : "disabled",
             runtime.MaxOnlineInstances);
         return runtime;
     }
@@ -158,6 +161,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("javaVersion")]
     public string? JavaVersion { get; set; }
 
+    [JsonPropertyName("peerPublicKey")]
+    public string? PeerPublicKey { get; set; }
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -170,12 +176,13 @@ public sealed class ClientEnvironmentInfo
         {
             MachineFingerprint = BuildMachineFingerprint(),
             Hostname = HostName(),
-            OsUser = Environment.UserName,
+            OsUser = NormalizeOsUser(Environment.UserName),
             OsName = Environment.OSVersion.Platform.ToString(),
             OsVersion = Environment.OSVersion.VersionString,
             OsArch = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture.ToString(),
             ClientVersion = typeof(ClientEnvironmentInfo).Assembly.GetName().Version?.ToString(),
             JavaVersion = "",
+            PeerPublicKey = PeerKeyStore.PublicKeyBase64(logger),
             StartedAt = DateTimeOffset.UtcNow.ToString("O"),
         };
         try
@@ -196,6 +203,21 @@ public sealed class ClientEnvironmentInfo
             logger.LogDebug(ex, "采集本地 IP 失败");
         }
         return info;
+    }
+
+    internal static string NormalizeOsUser(string? value)
+    {
+        var normalized = value?.Trim() ?? "";
+        if (normalized.Length == 0)
+        {
+            return "unknown";
+        }
+        var slash = Math.Max(normalized.LastIndexOf('\\'), normalized.LastIndexOf('/'));
+        if (slash >= 0 && slash + 1 < normalized.Length)
+        {
+            normalized = normalized[(slash + 1)..];
+        }
+        return normalized.Length == 0 ? "unknown" : normalized;
     }
 
     private static string BuildMachineFingerprint()

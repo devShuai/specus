@@ -10,9 +10,11 @@ import (
 
 // Listener accepts control-channel TCP connections and runs each through a Handler.
 type Listener struct {
-	maxFrameSize int
-	handler      Handler
-	tlsConfig    *tls.Config
+	maxFrameSize       int
+	writeLowWaterMark  int
+	writeHighWaterMark int
+	handler            Handler
+	tlsConfig          *tls.Config
 
 	mu        sync.Mutex
 	listener  net.Listener
@@ -20,8 +22,13 @@ type Listener struct {
 }
 
 // NewListener builds a control-channel listener that dispatches to handler.
-func NewListener(maxFrameSize int, handler Handler) *Listener {
-	return &Listener{maxFrameSize: maxFrameSize, handler: handler}
+func NewListener(maxFrameSize, writeLowWaterMark, writeHighWaterMark int, handler Handler) *Listener {
+	return &Listener{
+		maxFrameSize:       maxFrameSize,
+		writeLowWaterMark:  writeLowWaterMark,
+		writeHighWaterMark: writeHighWaterMark,
+		handler:            handler,
+	}
 }
 
 // SetTLS enables TLS on the control channel using the given config (nil disables TLS).
@@ -81,7 +88,7 @@ func (l *Listener) Serve(ctx context.Context) error {
 			_ = tcp.SetNoDelay(true)
 			_ = tcp.SetKeepAlive(true)
 		}
-		conn := newConn(netConn, l.maxFrameSize, ctx)
+		conn := newConn(netConn, l.maxFrameSize, l.writeLowWaterMark, l.writeHighWaterMark, ctx)
 		go conn.run(l.handler)
 	}
 }

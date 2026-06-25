@@ -28,6 +28,25 @@ public class PacketCodecFixtureTests
     }
 
     [Fact]
+    public void LoginRequest_ZeroClientSessionId_EncodesAsNonNullLongLikeJava()
+    {
+        var packet = new LoginRequestPacket
+        {
+            ClientName = "csharp-client",
+            ClientSessionId = 0,
+            AccessToken = "token",
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        var raw = CompactBinarySerializer.DecodePayload(encoded[PacketCodec.HeaderSize..]);
+        var nameLengthMarker = raw[0];
+        var sessionMarkerIndex = 1 + nameLengthMarker - 1;
+
+        Assert.Equal(1, raw[sessionMarkerIndex]);
+        Assert.Equal(0, raw[sessionMarkerIndex + 1]);
+    }
+
+    [Fact]
     public void LoginResponse_Success_Roundtrips()
     {
         Fixtures.DecodeAndAssertRoundtrip<LoginResponsePacket>("login_response.bin", p =>
@@ -90,6 +109,29 @@ public class PacketCodecFixtureTests
     }
 
     [Fact]
+    public void MessageRequest_PeerControl_Roundtrips()
+    {
+        var packet = new MessageRequestPacket
+        {
+            ClientName = "csharp-client",
+            ToClientName = "",
+            MessageType = MessageType.PeerControl,
+            Message = "{\"type\":\"device-report\"}",
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
+        Assert.Equal(encoded.Length, consumed);
+        var decoded = decodedPacket as MessageRequestPacket;
+
+        Assert.NotNull(decoded);
+        Assert.Equal(packet.ClientName, decoded!.ClientName);
+        Assert.Equal(packet.ToClientName, decoded.ToClientName);
+        Assert.Equal(packet.MessageType, decoded.MessageType);
+        Assert.Equal(packet.Message, decoded.Message);
+    }
+
+    [Fact]
     public void MessageResponse_NatControl_Roundtrips()
     {
         Fixtures.DecodeAndAssertRoundtrip<MessageResponsePacket>("message_response.bin", p =>
@@ -99,6 +141,29 @@ public class PacketCodecFixtureTests
             Assert.Equal(MessageType.NatControl, p.MessageType);
             Assert.Equal("{\"clientName\":\"Demo client\",\"remotePort\":7010}", p.Message);
         });
+    }
+
+    [Fact]
+    public void MessageResponse_PeerControl_Roundtrips()
+    {
+        var packet = new MessageResponsePacket
+        {
+            ClientName = "server",
+            ToClientName = "csharp-client",
+            MessageType = MessageType.PeerControl,
+            Message = "{\"type\":\"roster\",\"peers\":[]}",
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
+        Assert.Equal(encoded.Length, consumed);
+        var decoded = decodedPacket as MessageResponsePacket;
+
+        Assert.NotNull(decoded);
+        Assert.Equal(packet.ClientName, decoded!.ClientName);
+        Assert.Equal(packet.ToClientName, decoded.ToClientName);
+        Assert.Equal(packet.MessageType, decoded.MessageType);
+        Assert.Equal(packet.Message, decoded.Message);
     }
 
     [Fact]
@@ -166,5 +231,91 @@ public class PacketCodecFixtureTests
             Assert.Equal("{\"ok\":true}", System.Text.Encoding.UTF8.GetString(p.Body!));
             Assert.Null(p.Error);
         });
+    }
+
+    [Fact]
+    public void DirectHttpResponseEmptyErrorPreservesNonNullStringLikeJava()
+    {
+        var packet = new DirectHttpResponsePacket
+        {
+            RequestId = "8b284fef-0987-4948-ac66-7f2059336989",
+            StatusCode = 502,
+            Headers = new List<string>(),
+            Body = Array.Empty<byte>(),
+            Error = "",
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
+        Assert.Equal(encoded.Length, consumed);
+        var decoded = Assert.IsType<DirectHttpResponsePacket>(decodedPacket);
+
+        Assert.NotNull(decoded.Error);
+        Assert.Equal("", decoded.Error);
+    }
+
+    [Fact]
+    public void UuidCodec_PreservesNonCanonicalCaseLikeJava()
+    {
+        var packet = new DirectHttpResponsePacket
+        {
+            RequestId = "8B284FEF-0987-4948-AC66-7F2059336989",
+            StatusCode = 204,
+            Headers = new List<string>(),
+            Body = Array.Empty<byte>(),
+            Error = null,
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
+        Assert.Equal(encoded.Length, consumed);
+        var decoded = Assert.IsType<DirectHttpResponsePacket>(decodedPacket);
+
+        Assert.Equal(packet.RequestId, decoded.RequestId);
+    }
+
+    [Fact]
+    public void HttpMethodCodec_PreservesNonCanonicalCaseLikeJava()
+    {
+        var packet = new DirectHttpRequestPacket
+        {
+            RequestId = "8b284fef-0987-4948-ac66-7f2059336989",
+            RequestMethod = "get",
+            Route = "api",
+            RelativePath = "/socket",
+            RawQuery = "",
+            Headers = new List<string>(),
+            Body = Array.Empty<byte>(),
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
+        Assert.Equal(encoded.Length, consumed);
+        var decoded = Assert.IsType<DirectHttpRequestPacket>(decodedPacket);
+
+        Assert.Equal(packet.RequestMethod, decoded.RequestMethod);
+    }
+
+    [Fact]
+    public void EmptyUuidAndHttpMethod_EncodeAsStringsLikeJava()
+    {
+        var packet = new DirectHttpRequestPacket
+        {
+            RequestId = "",
+            RequestMethod = "",
+            Route = "api",
+            RelativePath = "/socket",
+            RawQuery = "",
+            Headers = new List<string>(),
+            Body = Array.Empty<byte>(),
+        };
+
+        var encoded = PacketCodec.Encode(packet);
+        var raw = CompactBinarySerializer.DecodePayload(encoded[PacketCodec.HeaderSize..]);
+
+        Assert.Equal(2, raw[0]);
+        Assert.Equal(1, raw[1]);
+        Assert.Equal(5, raw[2]);
+        Assert.Equal(1, raw[3]);
     }
 }

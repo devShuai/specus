@@ -32,7 +32,7 @@ final class PeerVirtualDevices {
     static String key(PeerVirtualDeviceOptions options, ClientAuthLoginResponse.PeerMeshConfig config) {
         String mode = options == null ? "noop" : options.mode().toLowerCase(Locale.ROOT);
         String name = options == null ? "shuai0" : options.tunName();
-        int mtu = options == null ? 1400 : options.mtu();
+        int mtu = options == null ? PeerVirtualDeviceOptions.DEFAULT_MTU : options.mtu();
         String virtualIp = config == null ? "" : config.getVirtualIp();
         String cidr = config == null ? "" : config.getCidr();
         return mode + "|" + name + "|" + mtu + "|" + virtualIp + "|" + cidr;

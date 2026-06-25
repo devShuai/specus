@@ -8,7 +8,20 @@ import "errors"
 var (
 	ErrValidation = errors.New("validation error") // -> 400
 	ErrConflict   = errors.New("conflict")         // -> 409
+	ErrForbidden  = errors.New("forbidden")        // -> 403
 )
+
+// ManagementUserView is the JSON representation of a management UI user.
+type ManagementUserView struct {
+	Username  string `json:"username"`
+	TenantID  string `json:"tenantId"`
+	Role      string `json:"role"`
+	Admin     bool   `json:"admin"`
+	BuiltIn   bool   `json:"builtIn"`
+	Enabled   bool   `json:"enabled"`
+	CreatedAt string `json:"createdAt"`
+	UpdatedAt string `json:"updatedAt"`
+}
 
 // ClientView is the JSON representation of a client account for the SPA.
 type ClientView struct {
@@ -46,29 +59,47 @@ type CredentialResult struct {
 	Secret     string         `json:"secret,omitempty"`
 }
 
+// ClientDownloadLinkView is the JSON representation of a managed/public client download link.
+type ClientDownloadLinkView struct {
+	ID             int64   `json:"id"`
+	Implementation string  `json:"implementation"`
+	Platform       string  `json:"platform"`
+	Arch           string  `json:"arch"`
+	DisplayName    string  `json:"displayName"`
+	DownloadURL    string  `json:"downloadUrl"`
+	Description    *string `json:"description,omitempty"`
+	DisplayOrder   int     `json:"displayOrder"`
+	Enabled        bool    `json:"enabled"`
+	CreatedAt      string  `json:"createdAt"`
+	UpdatedAt      string  `json:"updatedAt"`
+}
+
 // TunnelView is the JSON representation of a tunnel mapping.
 type TunnelView struct {
-	ID            int64  `json:"id"`
-	ClientID      int64  `json:"clientId"`
-	ClientName    string `json:"clientName"`
-	ListenPort    int    `json:"listenPort"`
-	TargetAddress string `json:"targetAddress"`
-	TargetPort    int    `json:"targetPort"`
-	Enabled       bool   `json:"enabled"`
-	CreatedAt     string `json:"createdAt"`
-	UpdatedAt     string `json:"updatedAt"`
+	ID                   int64  `json:"id"`
+	ClientID             int64  `json:"clientId"`
+	ClientName           string `json:"clientName"`
+	ListenPort           int    `json:"listenPort"`
+	TargetAddress        string `json:"targetAddress"`
+	TargetPort           int    `json:"targetPort"`
+	Enabled              bool   `json:"enabled"`
+	DetailCaptureEnabled bool   `json:"detailCaptureEnabled"`
+	CreatedAt            string `json:"createdAt"`
+	UpdatedAt            string `json:"updatedAt"`
 }
 
 // HTTPRouteView is the JSON representation of an HTTP route mapping.
 type HTTPRouteView struct {
-	ID            int64  `json:"id"`
-	ClientID      int64  `json:"clientId"`
-	ClientName    string `json:"clientName"`
-	Route         string `json:"route"`
-	TargetBaseURL string `json:"targetBaseUrl"`
-	Enabled       bool   `json:"enabled"`
-	CreatedAt     string `json:"createdAt"`
-	UpdatedAt     string `json:"updatedAt"`
+	ID                   int64  `json:"id"`
+	ClientID             int64  `json:"clientId"`
+	ClientName           string `json:"clientName"`
+	Route                string `json:"route"`
+	TargetBaseURL        string `json:"targetBaseUrl"`
+	Enabled              bool   `json:"enabled"`
+	DetailCaptureEnabled bool   `json:"detailCaptureEnabled"`
+	PathRewriteEnabled   bool   `json:"pathRewriteEnabled"`
+	CreatedAt            string `json:"createdAt"`
+	UpdatedAt            string `json:"updatedAt"`
 }
 
 // ConnectionItem is one row in a paged connection listing.
@@ -104,6 +135,87 @@ type TrafficView struct {
 	UploadBytes   int64  `json:"uploadBytes"`
 	DownloadBytes int64  `json:"downloadBytes"`
 	UpdatedAt     string `json:"updatedAt"`
+}
+
+type ResourceTrafficUsageView struct {
+	ID            int64  `json:"id"`
+	ClientID      int64  `json:"clientId"`
+	ClientName    string `json:"clientName"`
+	ResourceType  string `json:"resourceType"`
+	ResourceKey   string `json:"resourceKey"`
+	ResourceID    *int64 `json:"resourceId,omitempty"`
+	ResourceName  string `json:"resourceName"`
+	UsageDate     string `json:"usageDate"`
+	UploadBytes   int64  `json:"uploadBytes"`
+	DownloadBytes int64  `json:"downloadBytes"`
+	UpdatedAt     string `json:"updatedAt"`
+}
+
+// HTTPTrafficExchangeView mirrors the Java HTTP exchange detail payload.
+type HTTPTrafficExchangeView struct {
+	ID                  string  `json:"id"`
+	ClientID            int64   `json:"clientId"`
+	ClientName          string  `json:"clientName"`
+	Route               string  `json:"route"`
+	ResourceID          *int64  `json:"resourceId,omitempty"`
+	ResourceName        *string `json:"resourceName,omitempty"`
+	Method              string  `json:"method"`
+	RelativePath        string  `json:"relativePath"`
+	RawQuery            string  `json:"rawQuery"`
+	StatusCode          int     `json:"statusCode"`
+	Success             bool    `json:"success"`
+	Error               *string `json:"error,omitempty"`
+	RemoteAddress       *string `json:"remoteAddress,omitempty"`
+	RequestBytes        int64   `json:"requestBytes"`
+	ResponseBytes       int64   `json:"responseBytes"`
+	ElapsedMs           int64   `json:"elapsedMs"`
+	RequestContentType  *string `json:"requestContentType,omitempty"`
+	ResponseContentType *string `json:"responseContentType,omitempty"`
+	ResponseBodyType    string  `json:"responseBodyType"`
+	RequestHeaders      string  `json:"requestHeaders"`
+	ResponseHeaders     string  `json:"responseHeaders"`
+	RequestPreviewHex   string  `json:"requestPreviewHex"`
+	RequestPreviewText  string  `json:"requestPreviewText"`
+	ResponsePreviewHex  string  `json:"responsePreviewHex"`
+	ResponsePreviewText string  `json:"responsePreviewText"`
+	RequestTruncated    bool    `json:"requestTruncated"`
+	ResponseTruncated   bool    `json:"responseTruncated"`
+	CapturedAt          string  `json:"capturedAt"`
+}
+
+// TCPTrafficFrameView mirrors the Java TCP frame detail payload.
+type TCPTrafficFrameView struct {
+	ID                 string  `json:"id"`
+	ClientID           int64   `json:"clientId"`
+	ClientName         string  `json:"clientName"`
+	ListenPort         int     `json:"listenPort"`
+	ResourceID         *int64  `json:"resourceId,omitempty"`
+	ResourceName       *string `json:"resourceName,omitempty"`
+	ChannelID          string  `json:"channelId"`
+	Direction          string  `json:"direction"`
+	RemoteAddress      *string `json:"remoteAddress,omitempty"`
+	SourceAddress      *string `json:"sourceAddress,omitempty"`
+	SourcePort         *int    `json:"sourcePort,omitempty"`
+	DestinationAddress *string `json:"destinationAddress,omitempty"`
+	DestinationPort    *int    `json:"destinationPort,omitempty"`
+	StreamOffset       int64   `json:"streamOffset"`
+	StreamEndOffset    int64   `json:"streamEndOffset"`
+	FrameIndex         int64   `json:"frameIndex"`
+	PayloadBytes       int64   `json:"payloadBytes"`
+	PayloadBase64      string  `json:"payloadBase64,omitempty"`
+	PayloadPreviewHex  string  `json:"payloadPreviewHex"`
+	PayloadPreviewText string  `json:"payloadPreviewText"`
+	Truncated          bool    `json:"truncated"`
+	FrameTime          string  `json:"frameTime"`
+}
+
+// TrafficDetailPage is the shared paged payload used by detail traffic endpoints.
+type TrafficDetailPage[T any] struct {
+	Items      []T `json:"items"`
+	Total      int `json:"total"`
+	Page       int `json:"page"`
+	Size       int `json:"size"`
+	TotalPages int `json:"totalPages"`
 }
 
 // ConnectionStatView is one archived monthly stat row.
@@ -144,23 +256,44 @@ type credentialMutation struct {
 	MaxOnlineInstances *int   `json:"maxOnlineInstances"`
 }
 
+type clientDownloadLinkMutation struct {
+	Implementation string `json:"implementation"`
+	Platform       string `json:"platform"`
+	Arch           string `json:"arch"`
+	DisplayName    string `json:"displayName"`
+	DownloadURL    string `json:"downloadUrl"`
+	Description    string `json:"description"`
+	DisplayOrder   *int   `json:"displayOrder"`
+	Enabled        *bool  `json:"enabled"`
+}
+
 // tunnelMutation is the create/update tunnel request body.
 type tunnelMutation struct {
-	ListenPort    int    `json:"listenPort"`
-	TargetAddress string `json:"targetAddress"`
-	TargetPort    int    `json:"targetPort"`
-	Enabled       *bool  `json:"enabled"`
+	ListenPort           int    `json:"listenPort"`
+	TargetAddress        string `json:"targetAddress"`
+	TargetPort           int    `json:"targetPort"`
+	Enabled              *bool  `json:"enabled"`
+	DetailCaptureEnabled *bool  `json:"detailCaptureEnabled"`
 }
 
 // httpRouteMutation is the create/update HTTP route request body.
 type httpRouteMutation struct {
-	Route         string `json:"route"`
-	TargetBaseURL string `json:"targetBaseUrl"`
-	Enabled       *bool  `json:"enabled"`
+	Route                string `json:"route"`
+	TargetBaseURL        string `json:"targetBaseUrl"`
+	Enabled              *bool  `json:"enabled"`
+	DetailCaptureEnabled *bool  `json:"detailCaptureEnabled"`
+	PathRewriteEnabled   *bool  `json:"pathRewriteEnabled"`
 }
 
 // loginRequest is the admin login body.
 type loginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type userMutation struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Role     string `json:"role"`
+	Enabled  *bool  `json:"enabled"`
 }

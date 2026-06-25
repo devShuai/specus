@@ -4,8 +4,10 @@
 package directhttp
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/session"
+	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
 )
 
 var skippedHeaders = map[string]struct{}{
@@ -24,8 +27,18 @@ var skippedHeaders = map[string]struct{}{
 
 // TrafficRecorder lets the forwarder account request/response bytes (optional).
 type TrafficRecorder interface {
-	RecordUpload(clientName string, bytes int64)
-	RecordDownload(clientName string, bytes int64)
+	RecordHTTPUpload(clientName, route string, bytes int64)
+	RecordHTTPDownload(clientName, route string, bytes int64)
+}
+
+// RouteSettings looks up server-side options for an HTTP route.
+type RouteSettings interface {
+	HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route string) (bool, error)
+}
+
+// DetailRecorder optionally persists full HTTP exchange details.
+type DetailRecorder interface {
+	RecordHTTPExchange(ctx context.Context, record store.HTTPExchangeRecord) error
 }
 
 // Service forwards HTTP requests and matches responses by request id.
@@ -34,18 +47,27 @@ type Service struct {
 	timeout     time.Duration
 	maxBodySize int
 	traffic     TrafficRecorder
+	routes      RouteSettings
+	detail      DetailRecorder
+	detailOpts  store.TrafficDetailOptions
+	rewriter    responseRewriter
 
 	mu      sync.Mutex
 	pending map[string]chan protocol.DirectHTTPResponse
 }
 
 // NewService builds the Direct HTTP forwarder.
-func NewService(sessions *session.Registry, timeout time.Duration, maxBodySize int, traffic TrafficRecorder) *Service {
+func NewService(sessions *session.Registry, timeout time.Duration, maxBodySize int, rewriteMaxBodyBytes int,
+	traffic TrafficRecorder, routes RouteSettings, detail DetailRecorder, detailOpts store.TrafficDetailOptions) *Service {
 	return &Service{
 		sessions:    sessions,
 		timeout:     timeout,
 		maxBodySize: maxBodySize,
 		traffic:     traffic,
+		routes:      routes,
+		detail:      detail,
+		detailOpts:  detailOpts,
+		rewriter:    newResponseRewriter(rewriteMaxBodyBytes),
 		pending:     make(map[string]chan protocol.DirectHTTPResponse),
 	}
 }
@@ -65,24 +87,16 @@ func (s *Service) Ack(response protocol.DirectHTTPResponse) {
 
 // ServeHTTP handles /http/{clientName}/{route}[/{rest...}] for all methods.
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
 	clientName := r.PathValue("clientName")
 	route := r.PathValue("route")
-	rest := r.PathValue("rest")
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.maxBodySize)+1))
 	if err != nil {
 		writeTextError(w, http.StatusBadGateway, "读取请求体失败")
 		return
 	}
-	if len(body) > s.maxBodySize {
-		writeTextError(w, http.StatusRequestEntityTooLarge, "HTTP 请求体超过限制")
-		return
-	}
-
-	relativePath := "/"
-	if rest != "" {
-		relativePath = "/" + rest
-	}
+	relativePath := relativePath(r)
 	request := protocol.DirectHTTPRequest{
 		RequestID:     newRequestID(),
 		RequestMethod: r.Method,
@@ -92,37 +106,114 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Headers:       collectHeaders(r.Header),
 		Body:          body,
 	}
+	if len(body) > s.maxBodySize {
+		errorText := "HTTP 请求体超过限制"
+		s.recordHTTPDetail(r.Context(), clientName, route, request, protocol.DirectHTTPResponse{
+			StatusCode: http.StatusRequestEntityTooLarge,
+			Headers:    plainErrorHeaders(),
+			Body:       []byte(errorText),
+			Error:      stringPtr(errorText),
+		}, startedAt, r.RemoteAddr)
+		writeTextError(w, http.StatusRequestEntityTooLarge, errorText)
+		return
+	}
 
 	response, err := s.forward(clientName, request)
 	if err != nil {
-		writeTextError(w, statusForError(err), err.Error())
+		status := statusForError(err)
+		errorText := err.Error()
+		s.recordHTTPDetail(r.Context(), clientName, route, request, protocol.DirectHTTPResponse{
+			StatusCode: status,
+			Headers:    plainErrorHeaders(),
+			Body:       []byte(errorText),
+			Error:      stringPtr(errorText),
+		}, startedAt, r.RemoteAddr)
+		writeTextError(w, status, errorText)
 		return
 	}
 	if s.traffic != nil {
-		s.traffic.RecordUpload(clientName, int64(len(body)))
-		s.traffic.RecordDownload(clientName, int64(len(response.Body)))
+		s.traffic.RecordHTTPUpload(clientName, route, int64(len(body)))
+		s.traffic.RecordHTTPDownload(clientName, route, int64(len(response.Body)))
 	}
 	if response.Error != nil && *response.Error != "" {
 		status := response.StatusCode
 		if status <= 0 {
 			status = http.StatusBadGateway
 		}
-		writeTextError(w, status, *response.Error)
+		errorText := *response.Error
+		s.recordHTTPDetail(r.Context(), clientName, route, request, protocol.DirectHTTPResponse{
+			StatusCode: status,
+			Headers:    plainErrorHeaders(),
+			Body:       []byte(errorText),
+			Error:      stringPtr(errorText),
+		}, startedAt, r.RemoteAddr)
+		writeTextError(w, status, errorText)
 		return
 	}
-	applyResponseHeaders(w, response.Headers)
+	responseHeaders := response.Headers
+	if s.pathRewriteEnabled(r.Context(), clientName, route) {
+		if rewritten, ok := s.rewriter.rewrite(response.Body, clientName, route, responseHeaders); ok {
+			response.Body = rewritten
+			responseHeaders = stripRewriteHeaders(responseHeaders)
+		}
+	}
+	applyResponseHeaders(w, responseHeaders)
 	status := response.StatusCode
 	if status <= 0 {
 		status = http.StatusOK
 	}
+	s.recordHTTPDetail(r.Context(), clientName, route, request, response, startedAt, r.RemoteAddr)
 	w.WriteHeader(status)
 	_, _ = w.Write(response.Body)
+}
+
+func (s *Service) recordHTTPDetail(ctx context.Context, clientName, route string, request protocol.DirectHTTPRequest,
+	response protocol.DirectHTTPResponse, startedAt time.Time, remoteAddress string) {
+	if s.detail == nil {
+		return
+	}
+	errText := ""
+	if response.Error != nil {
+		errText = *response.Error
+	}
+	statusCode := response.StatusCode
+	if statusCode <= 0 {
+		if errText != "" {
+			statusCode = http.StatusBadGateway
+		} else {
+			statusCode = http.StatusOK
+		}
+	}
+	_ = s.detail.RecordHTTPExchange(ctx, store.HTTPExchangeRecord{
+		ClientName:      clientName,
+		Route:           route,
+		Method:          request.RequestMethod,
+		RelativePath:    request.RelativePath,
+		RawQuery:        request.RawQuery,
+		RequestHeaders:  request.Headers,
+		RequestBody:     request.Body,
+		StatusCode:      statusCode,
+		ResponseHeaders: response.Headers,
+		ResponseBody:    response.Body,
+		StartedAt:       startedAt,
+		RemoteAddress:   remoteAddress,
+		Error:           errText,
+		Options:         s.detailOpts,
+	})
+}
+
+func (s *Service) pathRewriteEnabled(ctx context.Context, clientName, route string) bool {
+	if s.routes == nil {
+		return false
+	}
+	enabled, err := s.routes.HTTPRoutePathRewriteEnabled(ctx, clientName, route)
+	return err == nil && enabled
 }
 
 func (s *Service) forward(clientName string, request protocol.DirectHTTPRequest) (protocol.DirectHTTPResponse, error) {
 	bound, ok := s.sessions.Find(clientName)
 	if !ok {
-		return protocol.DirectHTTPResponse{}, errOffline
+		return protocol.DirectHTTPResponse{}, fmt.Errorf("%w: %s", errOffline, clientName)
 	}
 
 	ch := make(chan protocol.DirectHTTPResponse, 1)
@@ -136,7 +227,14 @@ func (s *Service) forward(clientName string, request protocol.DirectHTTPRequest)
 	}()
 
 	if err := bound.Send(request); err != nil {
-		return protocol.DirectHTTPResponse{}, errForward
+		errorText := "HTTP 转发请求发送失败"
+		return protocol.DirectHTTPResponse{
+			RequestID:  request.RequestID,
+			StatusCode: http.StatusBadGateway,
+			Headers:    nil,
+			Body:       nil,
+			Error:      stringPtr(errorText),
+		}, nil
 	}
 	select {
 	case response := <-ch:
@@ -159,6 +257,28 @@ func collectHeaders(header http.Header) []string {
 	return headers
 }
 
+func relativePath(r *http.Request) string {
+	path := r.URL.EscapedPath()
+	const prefix = "/http/"
+	if !strings.HasPrefix(path, prefix) {
+		rest := r.PathValue("rest")
+		if rest == "" {
+			return "/"
+		}
+		return "/" + rest
+	}
+	clientSeparator := strings.IndexByte(path[len(prefix):], '/')
+	if clientSeparator < 0 {
+		return "/"
+	}
+	afterClient := len(prefix) + clientSeparator + 1
+	routeSeparator := strings.IndexByte(path[afterClient:], '/')
+	if routeSeparator < 0 {
+		return "/"
+	}
+	return path[afterClient+routeSeparator:]
+}
+
 func applyResponseHeaders(w http.ResponseWriter, headers []string) {
 	for _, header := range headers {
 		idx := strings.IndexByte(header, ':')
@@ -171,6 +291,27 @@ func applyResponseHeaders(w http.ResponseWriter, headers []string) {
 		}
 		w.Header().Add(name, strings.TrimSpace(header[idx+1:]))
 	}
+}
+
+func stripRewriteHeaders(headers []string) []string {
+	result := make([]string, 0, len(headers))
+	for _, header := range headers {
+		idx := strings.IndexByte(header, ':')
+		if idx <= 0 {
+			result = append(result, header)
+			continue
+		}
+		name := strings.TrimSpace(header[:idx])
+		if strings.EqualFold(name, "content-encoding") || strings.EqualFold(name, "content-length") {
+			continue
+		}
+		result = append(result, header)
+	}
+	return result
+}
+
+func plainErrorHeaders() []string {
+	return []string{"Content-Type:text/plain;charset=UTF-8"}
 }
 
 func writeTextError(w http.ResponseWriter, status int, message string) {
@@ -187,3 +328,5 @@ func newRequestID() string {
 	encoded := hex.EncodeToString(raw[:])
 	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
 }
+
+func stringPtr(value string) *string { return &value }

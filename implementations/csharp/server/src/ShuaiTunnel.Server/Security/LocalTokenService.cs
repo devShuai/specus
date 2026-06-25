@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Configuration;
+using ShuaiTunnel.Server.Data.Entities;
 
 namespace ShuaiTunnel.Server.Security;
 
@@ -39,11 +40,18 @@ public sealed class LocalTokenService
     }
 
     public TokenResponse IssueTokenBody(string username) => new(
-        IssueToken(username),
+        IssueToken(username, _options.TenantId, ManagementRole.Admin),
         "Bearer",
         TtlSeconds);
 
-    public string IssueToken(string username)
+    public TokenResponse IssueTokenBody(string username, string tenantId, ManagementRole role) => new(
+        IssueToken(username, tenantId, role),
+        "Bearer",
+        TtlSeconds);
+
+    public string IssueToken(string username) => IssueToken(username, _options.TenantId, ManagementRole.Admin);
+
+    public string IssueToken(string username, string tenantId, ManagementRole role)
     {
         var now = DateTimeOffset.UtcNow;
         var header = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(new
@@ -55,6 +63,8 @@ public sealed class LocalTokenService
         {
             iss = Issuer,
             sub = username,
+            tenant_id = NormalizeTenant(tenantId),
+            role = RoleWire(role),
             iat = now.ToUnixTimeSeconds(),
             exp = now.AddSeconds(TtlSeconds).ToUnixTimeSeconds(),
         }, JsonOptions));
@@ -111,6 +121,13 @@ public sealed class LocalTokenService
             {
                 return null;
             }
+            var tenantId = TryGetString(payload.RootElement, "tenant_id") ?? _options.TenantId;
+            var role = ParseRole(TryGetString(payload.RootElement, "role"));
+            if (role == ManagementRole.User
+                && string.Equals(subject, _options.Username, StringComparison.OrdinalIgnoreCase))
+            {
+                role = ManagementRole.Admin;
+            }
             var exp = payload.RootElement.GetProperty("exp").GetInt64();
             if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= exp)
             {
@@ -121,6 +138,9 @@ public sealed class LocalTokenService
             identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, subject));
             identity.AddClaim(new Claim(ClaimTypes.Name, subject));
             identity.AddClaim(new Claim("iss", Issuer));
+            identity.AddClaim(new Claim("tenant_id", NormalizeTenant(tenantId)));
+            identity.AddClaim(new Claim(ClaimTypes.Role, RoleWire(role)));
+            identity.AddClaim(new Claim("role", RoleWire(role)));
             return new ClaimsPrincipal(identity);
         }
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException
@@ -158,6 +178,19 @@ public sealed class LocalTokenService
         padded = padded.PadRight(padded.Length + ((4 - padded.Length % 4) % 4), '=');
         return Convert.FromBase64String(padded);
     }
+
+    private static string NormalizeTenant(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? "default" : value.Trim();
+
+    private static string RoleWire(ManagementRole role) => role == ManagementRole.Admin ? "ADMIN" : "USER";
+
+    private static ManagementRole ParseRole(string? value) =>
+        string.Equals(value, "ADMIN", StringComparison.OrdinalIgnoreCase)
+            ? ManagementRole.Admin
+            : ManagementRole.User;
+
+    private static string? TryGetString(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) ? value.GetString() : null;
 }
 
 public sealed record TokenResponse(string AccessToken, string TokenType, long ExpiresIn);

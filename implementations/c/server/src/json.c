@@ -1,6 +1,7 @@
 #include "json.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -241,7 +242,7 @@ char *st_json_get_string(const char *json, const char *key)
     return out;
 }
 
-int st_json_get_int(const char *json, const char *key, int *out)
+int st_json_get_i64(const char *json, const char *key, long long *out)
 {
     const char *p = find_value(json, key);
     if (p == NULL) {
@@ -256,12 +257,64 @@ int st_json_get_int(const char *json, const char *key, int *out)
         p = string_value;
     }
     char *end = NULL;
-    long parsed = strtol(p, &end, 10);
-    int ok = end != p && parsed >= INT_MIN && parsed <= INT_MAX;
+    errno = 0;
+    long long parsed = strtoll(p, &end, 10);
+    int ok = end != p && errno != ERANGE;
     free(string_value);
     if (!ok) {
         return -1;
     }
+    *out = parsed;
+    return 0;
+}
+
+int st_json_get_int(const char *json, const char *key, int *out)
+{
+    long long parsed = 0;
+    if (st_json_get_i64(json, key, &parsed) != 0 || parsed < INT_MIN || parsed > INT_MAX) {
+        return -1;
+    }
     *out = (int)parsed;
     return 0;
+}
+
+int st_json_get_bool(const char *json, const char *key, int *out)
+{
+    const char *p = find_value(json, key);
+    if (p == NULL) {
+        return -1;
+    }
+    if (strncmp(p, "true", 4) == 0 && !isalnum((unsigned char)p[4]) && p[4] != '_') {
+        *out = 1;
+        return 0;
+    }
+    if (strncmp(p, "false", 5) == 0 && !isalnum((unsigned char)p[5]) && p[5] != '_') {
+        *out = 0;
+        return 0;
+    }
+    char *string_value = NULL;
+    if (*p == '"') {
+        string_value = st_json_get_string(json, key);
+        if (string_value == NULL) {
+            return -1;
+        }
+        if (strcmp(string_value, "true") == 0 || strcmp(string_value, "1") == 0) {
+            *out = 1;
+            free(string_value);
+            return 0;
+        }
+        if (strcmp(string_value, "false") == 0 || strcmp(string_value, "0") == 0) {
+            *out = 0;
+            free(string_value);
+            return 0;
+        }
+        free(string_value);
+        return -1;
+    }
+    int int_value = 0;
+    if (st_json_get_int(json, key, &int_value) == 0 && (int_value == 0 || int_value == 1)) {
+        *out = int_value;
+        return 0;
+    }
+    return -1;
 }

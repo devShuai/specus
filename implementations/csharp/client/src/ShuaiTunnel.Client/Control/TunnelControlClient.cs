@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.DirectHttp;
 using ShuaiTunnel.Client.Nat;
+using ShuaiTunnel.Client.PeerMesh;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
@@ -23,22 +24,32 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private const int ConnectTimeoutMs = 5000;
     private const int BaseBackoffSeconds = 2;
     private const int MaxBackoffSeconds = 60;
+    private static readonly TimeSpan TokenRefreshMaxLead = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan TokenRefreshMinLead = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan TokenRefreshMinDelay = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan TokenRefreshRetryDelay = TimeSpan.FromSeconds(60);
 
+    private readonly TunnelClientConfig _config;
     private readonly ClientAuthService _auth;
     private readonly DirectHttpForwarder _httpForwarder;
+    private readonly PeerMeshClient _peerMesh;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TunnelControlClient> _logger;
     private int _backoffAttempts;
+    private bool _resetBackoffOnNextHttpLogin;
     private CancellationTokenSource? _sessionCts;
     private TunnelRuntimeState? _runtime;
 
     public TunnelControlClient(
+        TunnelClientConfig config,
         ClientAuthService auth,
         DirectHttpForwarder httpForwarder,
         ILoggerFactory loggerFactory)
     {
+        _config = config;
         _auth = auth;
         _httpForwarder = httpForwarder;
+        _peerMesh = new PeerMeshClient(config, loggerFactory.CreateLogger<PeerMeshClient>());
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<TunnelControlClient>();
     }
@@ -48,6 +59,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
     {
         while (!cancellationToken.IsCancellationRequested)
         {
+            var reconnectImmediately = false;
             try
             {
                 await RunOnceAsync(cancellationToken).ConfigureAwait(false);
@@ -55,6 +67,22 @@ public sealed class TunnelControlClient : IAsyncDisposable
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 return;
+            }
+            catch (ControlLoginRejectedException ex) when (ex.Action == ControlLoginFailureAction.RefreshImmediately)
+            {
+                _logger.LogWarning("control login failed: {reason}; refreshing credentials and reconnecting immediately",
+                    ex.ReasonOrDefault);
+                _resetBackoffOnNextHttpLogin = true;
+                reconnectImmediately = true;
+            }
+            catch (ControlLoginRejectedException ex) when (ex.Action == ControlLoginFailureAction.Stop)
+            {
+                _logger.LogWarning("control login rejected: {reason}; stopping reconnect", ex.ReasonOrDefault);
+                return;
+            }
+            catch (ControlLoginRejectedException ex)
+            {
+                _logger.LogWarning("control login failed: {reason}; reconnecting with backoff", ex.ReasonOrDefault);
             }
             catch (Exception ex)
             {
@@ -64,6 +92,10 @@ public sealed class TunnelControlClient : IAsyncDisposable
             if (cancellationToken.IsCancellationRequested)
             {
                 return;
+            }
+            if (reconnectImmediately)
+            {
+                continue;
             }
             var delay = NextBackoff();
             _logger.LogInformation("reconnect attempt #{attempt} in {delay}s", _backoffAttempts, delay);
@@ -89,6 +121,16 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private async Task RunOnceAsync(CancellationToken cancellationToken)
     {
         var runtime = await _auth.LoginAsync(cancellationToken).ConfigureAwait(false);
+        if (_resetBackoffOnNextHttpLogin)
+        {
+            _resetBackoffOnNextHttpLogin = false;
+            if (_backoffAttempts > 0)
+            {
+                _logger.LogInformation("客户端访问令牌刷新成功, reconnect backoff reset (was attempt #{attempt})",
+                    _backoffAttempts);
+            }
+            _backoffAttempts = 0;
+        }
         _runtime = runtime;
 
         using var tcp = new TcpClient { NoDelay = true };
@@ -110,7 +152,8 @@ public sealed class TunnelControlClient : IAsyncDisposable
         await using var stream = tcp.GetStream();
         await using var writer = new FrameWriter(stream);
         _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var session = _sessionCts.Token;
+        var sessionCts = _sessionCts;
+        var session = sessionCts.Token;
 
         var directHttp = new DirectHttpHandler(
             runtime.HttpTunnelConfigList, writer, _httpForwarder, _loggerFactory.CreateLogger<DirectHttpHandler>());
@@ -128,6 +171,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
         watchdog.Start(session);
 
         await SendLoginAsync(writer, session).ConfigureAwait(false);
+        var refreshLoop = RefreshRuntimeLoopAsync(writer, nat, directHttp, session);
 
         var reader = PipeReader.Create(stream);
         try
@@ -147,9 +191,18 @@ public sealed class TunnelControlClient : IAsyncDisposable
         }
         finally
         {
+            sessionCts.Cancel();
+            try
+            {
+                await refreshLoop.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
             await reader.CompleteAsync().ConfigureAwait(false);
             await nat.DisposeAsync().ConfigureAwait(false);
-            _sessionCts.Dispose();
+            await _peerMesh.DisposeAsync().ConfigureAwait(false);
+            sessionCts.Dispose();
             _sessionCts = null;
         }
     }
@@ -168,6 +221,94 @@ public sealed class TunnelControlClient : IAsyncDisposable
             runtime.ClientName, runtime.ClientSessionId);
     }
 
+    private async Task RefreshRuntimeLoopAsync(
+        FrameWriter writer, NatClientHandler nat, DirectHttpHandler directHttp, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var runtime = _runtime;
+            if (runtime is null || runtime.TokenExpiresAt == default)
+            {
+                return;
+            }
+
+            var delay = TokenRefreshDelay(DateTimeOffset.UtcNow, runtime.TokenExpiresAt);
+            try
+            {
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            TunnelRuntimeState refreshed;
+            try
+            {
+                refreshed = await _auth.LoginAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "客户端访问令牌刷新失败，{delay}s 后重试",
+                    (int)TokenRefreshRetryDelay.TotalSeconds);
+                try
+                {
+                    await Task.Delay(TokenRefreshRetryDelay, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                continue;
+            }
+
+            if (_runtime is { } previous
+                && (previous.NettyHost != refreshed.NettyHost || previous.NettyPort != refreshed.NettyPort))
+            {
+                _logger.LogInformation("HTTP 登录返回新的控制端地址 {oldHost}:{oldPort} -> {newHost}:{newPort}",
+                    previous.NettyHost, previous.NettyPort, refreshed.NettyHost, refreshed.NettyPort);
+            }
+            _runtime = refreshed;
+            await nat.ApplyConfigAsync(refreshed.TunnelConfigList).ConfigureAwait(false);
+            directHttp.ApplyRoutes(refreshed.HttpTunnelConfigList);
+            await nat.ReportHttpRoutesAsync(force: true).ConfigureAwait(false);
+            await _peerMesh.StartAsync(refreshed, writer, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("客户端访问令牌刷新成功: client={client}, session={session}",
+                refreshed.ClientName, refreshed.ClientSessionId);
+        }
+    }
+
+    private static TimeSpan TokenRefreshDelay(DateTimeOffset now, DateTimeOffset expiresAt)
+    {
+        var remaining = expiresAt - now;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return TokenRefreshMinDelay;
+        }
+        var lead = TokenRefreshLead(remaining);
+        var delay = remaining - lead;
+        return delay < TokenRefreshMinDelay ? TokenRefreshMinDelay : delay;
+    }
+
+    private static TimeSpan TokenRefreshLead(TimeSpan remaining)
+    {
+        if (remaining <= TokenRefreshMinLead * 2)
+        {
+            var half = TimeSpan.FromTicks(remaining.Ticks / 2);
+            return half < TokenRefreshMinDelay ? TokenRefreshMinDelay : half;
+        }
+        var tenth = TimeSpan.FromTicks(remaining.Ticks / 10);
+        if (tenth < TokenRefreshMinLead)
+        {
+            return TokenRefreshMinLead;
+        }
+        return tenth > TokenRefreshMaxLead ? TokenRefreshMaxLead : tenth;
+    }
+
     private async Task DispatchAsync(
         Packet packet, FrameWriter writer, NatClientHandler nat,
         DirectHttpHandler directHttp, CancellationToken cancellationToken)
@@ -181,11 +322,12 @@ public sealed class TunnelControlClient : IAsyncDisposable
                     _backoffAttempts = 0;
                     await nat.RegisterAllAsync().ConfigureAwait(false);
                     await nat.ReportHttpRoutesAsync().ConfigureAwait(false);
+                    await _peerMesh.StartAsync(_runtime ?? throw new InvalidOperationException("runtime missing"), writer, cancellationToken)
+                        .ConfigureAwait(false);
                 }
                 else
                 {
-                    _logger.LogWarning("[{client}] 登录失败: {reason}", response.ClientName, response.Reason);
-                    _sessionCts?.Cancel();
+                    throw ControlLoginRejectedException.FromReason(response.Reason);
                 }
                 break;
 
@@ -196,6 +338,10 @@ public sealed class TunnelControlClient : IAsyncDisposable
 
             case MessageResponsePacket message when message.MessageType == MessageType.NatControl:
                 await ApplyNatControlAsync(message.Message ?? "", nat, directHttp).ConfigureAwait(false);
+                break;
+
+            case MessageResponsePacket message when message.MessageType == MessageType.PeerControl:
+                await ApplyPeerControlAsync(message.Message ?? "", writer, cancellationToken).ConfigureAwait(false);
                 break;
 
             case NatMessagePacket natMessage:
@@ -218,6 +364,15 @@ public sealed class TunnelControlClient : IAsyncDisposable
 
         // Suppress unused-parameter warning when only some branches need the writer.
         _ = writer;
+    }
+
+    private async Task ApplyPeerControlAsync(string payload, FrameWriter writer, CancellationToken cancellationToken)
+    {
+        var runtime = _runtime;
+        if (runtime is not null)
+        {
+            await _peerMesh.HandleControlAsync(payload, runtime, writer, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private async Task ApplyNatControlAsync(
@@ -249,6 +404,51 @@ public sealed class TunnelControlClient : IAsyncDisposable
     {
         _sessionCts?.Cancel();
         _sessionCts?.Dispose();
-        return ValueTask.CompletedTask;
+        return _peerMesh.DisposeAsync();
     }
+
+    internal static ControlLoginFailureAction ClassifyControlLoginFailure(string? reason)
+    {
+        if (!string.IsNullOrEmpty(reason)
+            && reason.Contains("访问令牌已过期", StringComparison.Ordinal))
+        {
+            return ControlLoginFailureAction.RefreshImmediately;
+        }
+        if (!string.IsNullOrEmpty(reason)
+            && (reason.Contains("服务器繁忙", StringComparison.Ordinal)
+                || reason.Contains("连接频率超过限制", StringComparison.Ordinal)))
+        {
+            return ControlLoginFailureAction.Backoff;
+        }
+        return ControlLoginFailureAction.Stop;
+    }
+}
+
+internal enum ControlLoginFailureAction
+{
+    Backoff,
+    RefreshImmediately,
+    Stop,
+}
+
+internal sealed class ControlLoginRejectedException : Exception
+{
+    private ControlLoginRejectedException(string? reason, ControlLoginFailureAction action)
+        : base($"control login failed: {ReasonOrDefaultValue(reason)}")
+    {
+        Reason = reason;
+        Action = action;
+    }
+
+    public string? Reason { get; }
+
+    public ControlLoginFailureAction Action { get; }
+
+    public string ReasonOrDefault => ReasonOrDefaultValue(Reason);
+
+    public static ControlLoginRejectedException FromReason(string? reason)
+        => new(reason, TunnelControlClient.ClassifyControlLoginFailure(reason));
+
+    private static string ReasonOrDefaultValue(string? reason)
+        => string.IsNullOrWhiteSpace(reason) ? "login rejected" : reason;
 }

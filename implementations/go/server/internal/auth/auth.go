@@ -20,20 +20,32 @@ import (
 // passwordAlphabet excludes visually ambiguous characters (matches the C# generator).
 const passwordAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 
+const (
+	StatusHTTPAuthenticated = "HTTP_AUTHENTICATED"
+	StatusNettyOnline       = "NETTY_ONLINE"
+	StatusDisconnected      = "DISCONNECTED"
+)
+
 // Result is the outcome of an authentication attempt.
 type Result struct {
 	Success bool
 	Reason  string
 	Account *store.ClientAccount
+	Session Session
 }
 
 type Session struct {
-	ID          int64
-	ClientID    int64
-	ClientName  string
-	AccessToken string
-	TokenHash   string
-	ExpiresAt   time.Time
+	ID                 int64
+	TenantID           string
+	CredentialID       int64
+	ClientID           int64
+	ClientName         string
+	MachineFingerprint string
+	OSUser             string
+	AccessToken        string
+	TokenHash          string
+	ExpiresAt          time.Time
+	Status             string
 }
 
 type SessionStore struct {
@@ -50,14 +62,24 @@ func NewSessionStore() *SessionStore {
 }
 
 func (s *SessionStore) Create(account store.ClientAccount, ttl time.Duration) Session {
+	return s.CreateForClient(account, 0, "", "", ttl)
+}
+
+func (s *SessionStore) CreateForClient(account store.ClientAccount, credentialID int64,
+	machineFingerprint, osUser string, ttl time.Duration) Session {
 	token := "cs_" + randomHex(32) + randomHex(32)
 	session := Session{
-		ID:          NewClientID(),
-		ClientID:    account.ID,
-		ClientName:  account.ClientName,
-		AccessToken: token,
-		TokenHash:   HashPassword(token),
-		ExpiresAt:   time.Now().Add(ttl),
+		ID:                 NewClientID(),
+		TenantID:           account.TenantID,
+		CredentialID:       credentialID,
+		ClientID:           account.ID,
+		ClientName:         account.ClientName,
+		MachineFingerprint: machineFingerprint,
+		OSUser:             osUser,
+		AccessToken:        token,
+		TokenHash:          HashPassword(token),
+		ExpiresAt:          time.Now().Add(ttl),
+		Status:             StatusHTTPAuthenticated,
 	}
 	s.mu.Lock()
 	s.byTokenHash[session.TokenHash] = session
@@ -80,6 +102,63 @@ func (s *SessionStore) Find(sessionID int64, accessToken string) (Session, bool)
 	session, ok := s.byTokenHash[hash]
 	s.mu.RUnlock()
 	return session, ok
+}
+
+func (s *SessionStore) MarkOnline(sessionID int64) {
+	s.updateStatus(sessionID, StatusNettyOnline)
+}
+
+func (s *SessionStore) MarkDisconnected(sessionID int64) {
+	s.updateStatus(sessionID, StatusDisconnected)
+}
+
+func (s *SessionStore) CountOnlineByMachineUser(credentialID int64, machineFingerprint, osUser string) int {
+	if credentialID <= 0 || machineFingerprint == "" || osUser == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, session := range s.byTokenHash {
+		if session.Status == StatusNettyOnline && session.CredentialID == credentialID &&
+			session.MachineFingerprint == machineFingerprint && session.OSUser == osUser {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *SessionStore) CountOnlineByCredential(credentialID int64) int {
+	if credentialID <= 0 {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, session := range s.byTokenHash {
+		if session.Status == StatusNettyOnline && session.CredentialID == credentialID {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *SessionStore) updateStatus(sessionID int64, status string) {
+	if sessionID <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tokenHash, ok := s.tokenHashBySessionID[sessionID]
+	if !ok {
+		return
+	}
+	session, ok := s.byTokenHash[tokenHash]
+	if !ok {
+		return
+	}
+	session.Status = status
+	s.byTokenHash[tokenHash] = session
 }
 
 // HashPassword returns the lowercase hex SHA-256 of the plaintext password (no salt),
@@ -121,14 +200,23 @@ func NewClientID() int64 {
 
 // Authenticator verifies login requests against the store.
 type Authenticator struct {
-	db       *store.DB
-	sessions *SessionStore
-	now      func() time.Time
+	db                         *store.DB
+	sessions                   *SessionStore
+	perMachineUserMaxInstances int
+	now                        func() time.Time
 }
 
 // NewAuthenticator builds an Authenticator backed by db.
-func NewAuthenticator(db *store.DB, sessions *SessionStore) *Authenticator {
-	return &Authenticator{db: db, sessions: sessions, now: time.Now}
+func NewAuthenticator(db *store.DB, sessions *SessionStore, perMachineUserMaxInstances int) *Authenticator {
+	if perMachineUserMaxInstances <= 0 {
+		perMachineUserMaxInstances = 1
+	}
+	return &Authenticator{
+		db:                         db,
+		sessions:                   sessions,
+		perMachineUserMaxInstances: perMachineUserMaxInstances,
+		now:                        time.Now,
+	}
 }
 
 // Authenticate runs the full login check sequence and returns the result. The error is
@@ -139,6 +227,8 @@ func (a *Authenticator) Authenticate(ctx context.Context, request protocol.Login
 		return Result{Reason: "客户端访问令牌无效"}, nil
 	}
 	if session.ExpiresAt.Before(a.now()) {
+		a.sessions.MarkDisconnected(session.ID)
+		_ = a.db.MarkClientSessionDisconnected(ctx, session.ID, StatusDisconnected, a.now())
 		return Result{Reason: "客户端访问令牌已过期"}, nil
 	}
 	account, err := a.db.FindClientByName(ctx, session.ClientName)
@@ -151,6 +241,26 @@ func (a *Authenticator) Authenticate(ctx context.Context, request protocol.Login
 	if !account.Enabled {
 		return Result{Reason: "客户端已停用", Account: account}, nil
 	}
+	if session.CredentialID > 0 {
+		credential, err := a.db.GetCredential(ctx, session.CredentialID)
+		if err != nil {
+			if err == store.ErrNotFound {
+				return Result{Reason: "客户端凭证不存在", Account: account}, nil
+			}
+			return Result{}, err
+		}
+		if !credential.Enabled {
+			return Result{Reason: "客户端凭证已停用", Account: account}, nil
+		}
+		if a.sessions.CountOnlineByMachineUser(session.CredentialID, session.MachineFingerprint, session.OSUser) >=
+			a.perMachineUserMaxInstances {
+			return Result{Reason: "同一台机器和用户已经有在线实例", Account: account}, nil
+		}
+		if credential.MaxOnlineInstances > 0 &&
+			a.sessions.CountOnlineByCredential(session.CredentialID) >= credential.MaxOnlineInstances {
+			return Result{Reason: "在线实例数已达上限", Account: account}, nil
+		}
+	}
 	if account.ConnectionRateLimitPerMinute > 0 {
 		since := a.now().Add(-time.Minute)
 		count, err := a.db.CountConnectionsSince(ctx, account.ID, since)
@@ -161,7 +271,15 @@ func (a *Authenticator) Authenticate(ctx context.Context, request protocol.Login
 			return Result{Reason: "连接频率超过限制", Account: account}, nil
 		}
 	}
-	return Result{Success: true, Account: account}, nil
+	return Result{Success: true, Account: account, Session: session}, nil
+}
+
+func (a *Authenticator) MarkOnline(sessionID int64) {
+	a.sessions.MarkOnline(sessionID)
+}
+
+func (a *Authenticator) MarkDisconnected(sessionID int64) {
+	a.sessions.MarkDisconnected(sessionID)
 }
 
 func randomHex(size int) string {

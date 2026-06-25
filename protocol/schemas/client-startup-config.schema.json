@@ -35,9 +35,12 @@
         "linux-tun",
         "windows-wintun",
         "wintun",
+        "utun",
+        "macos-utun",
+        "darwin-utun",
         "auto"
       ],
-      "description": "Peer Mesh 虚拟网卡模式。"
+      "description": "Peer Mesh 虚拟网卡模式。Java 参考客户端当前支持 Linux TUN 与 Windows Wintun；Go/.NET 客户端额外支持 macOS utun；noop 表示不创建虚拟网卡。"
     },
     "peerMeshTunName": {
       "type": "string",
@@ -47,10 +50,10 @@
     },
     "peerMeshMtu": {
       "type": "integer",
-      "default": 1400,
+      "default": 1280,
       "minimum": 576,
-      "maximum": 9000,
-      "description": "Peer Mesh 虚拟网卡 MTU。"
+      "maximum": 1280,
+      "description": "Peer Mesh 虚拟网卡 MTU。大于 1280 会被客户端归一化，以避免 UDP 封装后公网路径分片丢包。"
     }
   }
 }

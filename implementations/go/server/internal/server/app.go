@@ -16,6 +16,8 @@ import (
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/directhttp"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/management"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/nat"
+	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/peermesh"
+	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/security"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/session"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
@@ -48,6 +50,7 @@ type App struct {
 	directHTTP  *directhttp.Service
 	wsHub       *wsevents.Hub
 	api         *management.API
+	peerMesh    *peermesh.Service
 	tlsConfig   *tls.Config
 	clientAuth  *auth.SessionStore
 }
@@ -58,41 +61,98 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.Elasticsearch.Configured() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := db.UseElasticsearchTraffic(ctx, store.ElasticsearchTrafficOptions{
+			URIs:              cfg.Elasticsearch.EndpointURIs(),
+			Username:          cfg.Elasticsearch.Username,
+			Password:          cfg.Elasticsearch.Password,
+			APIKey:            cfg.Elasticsearch.APIKey,
+			HTTPIndex:         cfg.Elasticsearch.HTTPIndex,
+			TCPIndex:          cfg.Elasticsearch.TCPIndex,
+			HTTPMaxStoreBytes: config.ParseDataSizeBytes(cfg.Elasticsearch.HTTPMaxStoreSize, 100*1024*1024*1024),
+			TCPMaxStoreBytes:  config.ParseDataSizeBytes(cfg.Elasticsearch.TCPMaxStoreSize, 10*1024*1024*1024),
+		})
+		cancel()
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("configure elasticsearch traffic detail: %w", err)
+		}
+		logger.Info("traffic detail store: elasticsearch",
+			"httpIndex", cfg.Elasticsearch.HTTPIndex, "tcpIndex", cfg.Elasticsearch.TCPIndex)
+	} else {
+		logger.Info("traffic detail store: database")
+	}
 
 	if cfg.Database.SeedDemoClient {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := seedDemoClient(ctx, db, logger)
+		err := seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		cancel()
 		if err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		closed, err := db.CloseClientSessionsByStatus(ctx, auth.StatusNettyOnline, auth.StatusDisconnected, time.Now())
+		cancel()
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("close stale client sessions: %w", err)
+		}
+		if closed > 0 {
+			logger.Info("closed stale client sessions at startup", "count", closed)
+		}
+	}
 
 	sessions := session.NewRegistry()
 	clientSessions := auth.NewSessionStore()
 	executor := control.NewLoginExecutor(cfg.Login.ExecutorMaxSize, cfg.Login.ExecutorQueueCapacity)
-	authenticator := auth.NewAuthenticator(db, clientSessions)
+	authenticator := auth.NewAuthenticator(db, clientSessions, cfg.ClientAuth.PerMachineUserMaxInstances)
 	dispatcher := NewDispatcher(db, authenticator, sessions, executor, logger)
-	listener := control.NewListener(cfg.Netty.MaxFrameSize, dispatcher)
+	listener := control.NewListener(cfg.Netty.MaxFrameSize,
+		cfg.Netty.WriteBufferLowWaterMark, cfg.Netty.WriteBufferHighWaterMark, dispatcher)
 
 	traffic := nat.NewTrafficService(db, time.Duration(cfg.Traffic.FlushIntervalMs)*time.Millisecond, logger)
+	db.ConfigureTrafficDetailQueue(cfg.Traffic.CaptureMaxPending, cfg.Traffic.CaptureFlushBatchSize)
 	remotePorts := nat.NewRemotePortManager(cfg.Netty.MaxExternalConnections)
 	limits := nat.Limits{
-		Global:    cfg.Netty.MaxExternalConnections,
-		PerClient: cfg.Netty.MaxExternalConnectionsPerClient,
-		PerPort:   cfg.Netty.MaxExternalConnectionsPerPort,
+		Global:              cfg.Netty.MaxExternalConnections,
+		PerClient:           cfg.Netty.MaxExternalConnectionsPerClient,
+		PerPort:             cfg.Netty.MaxExternalConnectionsPerPort,
+		WriteBufferLowMark:  cfg.Netty.WriteBufferLowWaterMark,
+		WriteBufferHighMark: cfg.Netty.WriteBufferHighWaterMark,
 	}
-	coordinator := nat.NewCoordinator(remotePorts, traffic, limits, logger)
+	detailOptions := store.TrafficDetailOptions{
+		Enabled:      cfg.Traffic.CaptureDetailEnabled,
+		PreviewBytes: cfg.Traffic.CapturePreviewBytes,
+		HeaderChars:  cfg.Traffic.CaptureHeaderChars,
+	}
+	coordinator := nat.NewCoordinator(remotePorts, traffic, db, detailOptions, limits, logger)
 	natControl := nat.NewControlService(db, sessions, cfg.Netty.Port, cfg.PublicAddress)
 
 	tokens := security.NewLocalTokenService(cfg.Auth)
 	oidcValidator := security.NewOidcValidator(cfg.Oidc)
+	peerMesh := peermesh.New(cfg.PeerMesh, db, sessions, logger)
 	directHTTP := directhttp.NewService(sessions,
-		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize, traffic)
-	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc,
-		func(ctx context.Context) error { return seedDemoClient(ctx, db, logger) })
-	wsHub := wsevents.NewHub(api.ValidateToken)
+		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
+		cfg.HTTP.RewriteMaxBodyBytes, traffic, db, db, detailOptions)
+	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
+		cfg.ClientAuth, func(ctx context.Context) error {
+			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
+		}, peerMesh)
+	wsHub := wsevents.NewHub(api.ValidateConnectionWebSocketToken, func(access wsevents.Access, event wsevents.Event) bool {
+		if access.Admin {
+			return true
+		}
+		if event.Connection.ClientID == nil {
+			return false
+		}
+		account, err := db.GetClient(context.Background(), *event.Connection.ClientID)
+		return err == nil && account != nil &&
+			account.TenantID == access.TenantID && account.OwnerUsername == access.Username
+	})
 
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
@@ -104,16 +164,27 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 
 	dispatcher.SetNatHandler(coordinator.Handle)
+	dispatcher.SetPeerControlHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
+		return peerMesh.HandleSignal(conn.Context(), request, conn.ClientName())
+	})
 	dispatcher.SetOnDisconnect(coordinator.Close)
 	dispatcher.SetDirectHTTPAck(directHTTP.Ack)
 	dispatcher.SetOnConnectionEvent(func(eventType string, record store.ConnectionRecord) {
-		wsHub.Broadcast(wsevents.Event{Type: eventType, Connection: toConnectionView(record)})
+		wsHub.Broadcast(wsevents.Event{
+			TenantID:   record.TenantID,
+			Type:       eventType,
+			Connection: toConnectionView(record),
+		})
 	})
 	dispatcher.SetOnLoginSuccess(func(conn *control.Conn) {
 		pushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if _, _, err := natControl.PushToName(pushCtx, conn.ClientName()); err != nil {
 			logger.Error("NAT_CONTROL push failed", "client", conn.ClientName(), "err", err)
+		}
+		if account, err := db.FindClientByName(pushCtx, conn.ClientName()); err == nil && account != nil {
+			peerMesh.PushConfig(pushCtx, *account)
+			peerMesh.PushRoster(pushCtx, *account)
 		}
 	})
 
@@ -132,6 +203,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		directHTTP:  directHTTP,
 		wsHub:       wsHub,
 		api:         api,
+		peerMesh:    peerMesh,
 		tlsConfig:   tlsConfig,
 		clientAuth:  clientSessions,
 	}, nil
@@ -163,7 +235,12 @@ func (a *App) Close() error { return a.db.Close() }
 func (a *App) Run(ctx context.Context) error {
 	a.executor.Start(ctx, a.cfg.Login.ExecutorMaxSize)
 	go a.traffic.Run(ctx)
-	go runArchive(ctx, a.db, a.logger)
+	go a.peerMesh.Run(ctx)
+	go a.peerMesh.RunStunTurn(ctx)
+	go a.db.RunTrafficDetailFlush(ctx,
+		time.Duration(a.cfg.Traffic.CaptureFlushIntervalMs)*time.Millisecond,
+		func(err error) { a.logger.Error("traffic detail flush failed", "err", err) })
+	go runArchive(ctx, a.db, a.logger, a.cfg.ConnectionRecord)
 
 	controlAddr := ":" + strconv.Itoa(a.cfg.Netty.Port)
 	if err := a.listener.Start(controlAddr); err != nil {
@@ -264,7 +341,10 @@ func toConnectionView(record store.ConnectionRecord) wsevents.ConnectionView {
 	return view
 }
 
-func seedDemoClient(ctx context.Context, db *store.DB, logger *slog.Logger) error {
+func seedDemoClient(ctx context.Context, db *store.DB, logger *slog.Logger, defaultMaxOnlineInstances int) error {
+	if defaultMaxOnlineInstances < 1 || defaultMaxOnlineInstances > 10000 {
+		defaultMaxOnlineInstances = 2
+	}
 	now := time.Now()
 	inserted, err := db.InsertClientIfAbsent(ctx, store.ClientAccount{
 		ID:                           auth.NewClientID(),
@@ -290,7 +370,7 @@ func seedDemoClient(ctx context.Context, db *store.DB, logger *slog.Logger) erro
 		APIKey:             DemoCredentialAPIKey,
 		SecretHash:         auth.HashPassword(DemoCredentialPlainSecret),
 		Enabled:            true,
-		MaxOnlineInstances: 2,
+		MaxOnlineInstances: defaultMaxOnlineInstances,
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}); err != nil {

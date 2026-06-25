@@ -47,6 +47,7 @@ const (
 	MessageTypeClientToServer = 1
 	MessageTypeClientToClient = 2
 	MessageTypeNatControl     = 3
+	MessageTypePeerControl    = 4
 
 	// NAT_MESSAGE sub-types (the explicit wire code).
 	NatRegister         = 1
@@ -184,6 +185,10 @@ func (output *compactOutput) writeOptionalString(value *string) {
 }
 
 func (output *compactOutput) writeByteArray(value []byte) {
+	if value == nil {
+		_ = output.writeVarInt(0)
+		return
+	}
 	_ = output.writeVarInt(len(value) + 1)
 	output.Write(value)
 }
@@ -228,10 +233,6 @@ func (output *compactOutput) writeVarLong(value uint64) {
 }
 
 func (output *compactOutput) writeNullableLong(value int64) {
-	if value == 0 {
-		output.WriteByte(0)
-		return
-	}
 	output.WriteByte(1)
 	output.writeVarLong(uint64(value<<1) ^ uint64(value>>63))
 }
@@ -248,11 +249,7 @@ func (output *compactOutput) writeNumericString(value string) {
 }
 
 func (output *compactOutput) writeHTTPMethod(value string) {
-	if value == "" {
-		output.WriteByte(0)
-		return
-	}
-	switch strings.ToUpper(value) {
+	switch value {
 	case "GET":
 		output.WriteByte(1)
 	case "POST":
@@ -270,10 +267,6 @@ func (output *compactOutput) writeHTTPMethod(value string) {
 func (output *compactOutput) writeUUIDString(value string) {
 	decoded, ok := parseUUID(value)
 	if !ok {
-		if value == "" {
-			output.WriteByte(0)
-			return
-		}
 		output.WriteByte(2)
 		output.writeString(value)
 		return
@@ -517,7 +510,10 @@ func parseUUID(value string) ([]byte, bool) {
 		return nil, false
 	}
 	decoded, err := hex.DecodeString(strings.ReplaceAll(value, "-", ""))
-	return decoded, err == nil && len(decoded) == 16
+	if err != nil || len(decoded) != 16 {
+		return nil, false
+	}
+	return decoded, formatUUID(decoded) == value
 }
 
 func formatUUID(value []byte) string {

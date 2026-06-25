@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Sockets;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Protocol;
@@ -7,6 +9,7 @@ using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.Management;
 
 namespace ShuaiTunnel.Server.Nat;
 
@@ -15,6 +18,7 @@ internal sealed class NatClientSession : IAsyncDisposable
     private readonly TunnelConnectionContext _context;
     private readonly RemotePortServerManager _remotePorts;
     private readonly TrafficUsageService _traffic;
+    private readonly TrafficInspectionService _inspection;
     private readonly NettyServerOptions _options;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<NatClientSession> _logger;
@@ -29,6 +33,7 @@ internal sealed class NatClientSession : IAsyncDisposable
     public NatClientSession(TunnelConnectionContext context,
         RemotePortServerManager remotePorts,
         TrafficUsageService traffic,
+        TrafficInspectionService inspection,
         IOptions<NettyServerOptions> options,
         ILoggerFactory loggerFactory,
         ILogger<NatClientSession> logger)
@@ -36,6 +41,7 @@ internal sealed class NatClientSession : IAsyncDisposable
         _context = context;
         _remotePorts = remotePorts;
         _traffic = traffic;
+        _inspection = inspection;
         _options = options.Value;
         _loggerFactory = loggerFactory;
         _logger = logger;
@@ -204,6 +210,7 @@ internal sealed class NatClientSession : IAsyncDisposable
 
         external.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
         await external.DisposeAsync().ConfigureAwait(false);
+        _inspection.ReleaseTcpStream(channelId);
         UpdateControlReadForWritability();
     }
 
@@ -219,7 +226,7 @@ internal sealed class NatClientSession : IAsyncDisposable
         try
         {
             external = new ExternalConnection(socket, port, _context.ClientName!,
-                _context, _traffic, _options, _loggerFactory.CreateLogger<ExternalConnection>());
+                _context, _traffic, _inspection, _options, _loggerFactory.CreateLogger<ExternalConnection>());
             external.WriteBackpressure.BackpressureChanged += OnExternalWriteBackpressureChanged;
 
             // Mirror Java's `syncExternalReadWithControl`: a fresh external inherits the
@@ -240,6 +247,7 @@ internal sealed class NatClientSession : IAsyncDisposable
             {
                 external.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
                 _externalChannels.TryRemove(external.ChannelId, out _);
+                _inspection.ReleaseTcpStream(external.ChannelId);
                 UpdateControlReadForWritability();
             }
             ReleaseExternalChannel(port);
@@ -359,7 +367,23 @@ internal sealed class NatClientSession : IAsyncDisposable
         {
             return null;
         }
-        return value?.ToString();
+        return value switch
+        {
+            null => null,
+            string s => s,
+            bool b => b ? "true" : "false",
+            IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
+            JsonElement element => element.ValueKind switch
+            {
+                JsonValueKind.Null or JsonValueKind.Undefined => null,
+                JsonValueKind.String => element.GetString(),
+                JsonValueKind.True => "true",
+                JsonValueKind.False => "false",
+                JsonValueKind.Number => element.GetRawText(),
+                _ => element.ToString(),
+            },
+            _ => value.ToString(),
+        };
     }
 
     private static int? AsInt(Dictionary<string, object?>? meta, string key)
@@ -371,11 +395,25 @@ internal sealed class NatClientSession : IAsyncDisposable
         return value switch
         {
             int i => i,
-            long l when l >= int.MinValue && l <= int.MaxValue => (int)l,
-            double d when d >= int.MinValue && d <= int.MaxValue => (int)d,
+            long l => unchecked((int)l),
+            short s => s,
+            byte b => b,
+            float f => (int)f,
+            double d => (int)d,
+            decimal m => (int)m,
+            JsonElement e when e.ValueKind == JsonValueKind.Number && e.TryGetInt32(out var parsedJsonInt) => parsedJsonInt,
+            JsonElement e when e.ValueKind == JsonValueKind.Number && e.TryGetDouble(out var parsedJsonDouble) => (int)parsedJsonDouble,
+            JsonElement e when e.ValueKind == JsonValueKind.String => ParseInt(e.GetString()),
             string s when int.TryParse(s, System.Globalization.NumberStyles.Integer,
                 System.Globalization.CultureInfo.InvariantCulture, out var parsed) => parsed,
             _ => null,
         };
+    }
+
+    private static int? ParseInt(string? value)
+    {
+        return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
     }
 }

@@ -85,7 +85,7 @@ internal sealed class NumericStringValueCodec : IValueCodec
             return;
         }
         var str = (string)value;
-        if (long.TryParse(str, System.Globalization.NumberStyles.Integer,
+        if (long.TryParse(str, System.Globalization.NumberStyles.AllowLeadingSign,
                 System.Globalization.CultureInfo.InvariantCulture, out var longValue))
         {
             writer.WriteByte(1);

@@ -21,6 +21,11 @@ import (
 func startTestApp(t *testing.T) (*App, int) {
 	t.Helper()
 	cfg := config.Default()
+	return startTestAppWithConfig(t, cfg)
+}
+
+func startTestAppWithConfig(t *testing.T, cfg config.Config) (*App, int) {
+	t.Helper()
 	cfg.Netty.Port = 0
 	cfg.ManagementAddr = "127.0.0.1:0"
 	cfg.ConnectionString = filepath.Join(t.TempDir(), "test.db")

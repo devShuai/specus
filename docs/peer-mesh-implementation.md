@@ -17,8 +17,15 @@
 * 客户端数据面使用 X25519 + HKDF + AES-GCM，加密后的 IP packet 通过 UDP frame 传输；server relay 不解密业务明文。
 * 客户端 replay 保护使用滑动窗口，允许小范围乱序，拒绝重复包和窗口外旧包。
 * Linux TUN：支持 `/dev/net/tun`，配置虚拟 IP、MTU 和 mesh route。
-* Windows Wintun：支持动态加载 `wintun.dll`，配置虚拟 IP、MTU 和 mesh route。
+* Windows Wintun：Java / Go / .NET 客户端均支持随包携带 `wintun.dll`，配置虚拟 IP、MTU 和 mesh route。
 * 管理页“私有组网”展示设备、虚拟 IP、在线状态、NAT 类型、ACL、active session、direct/relay 路径、RTT 和流量。
+
+多语言实现当前状态：
+
+* Java client 是完整参考实现，Linux TUN 与随包 Wintun 均已支持。
+* Go server 和 .NET server 已补齐 Java 兼容 STUN/TURN-lite UDP relay：binding、alternate port NAT 探测、allocation/refresh、relay send/data 转发、`SPM1` frame relay 授权和 relay 字节计量。
+* Go client 已支持 Linux TUN、随包 Windows Wintun、macOS utun、Java 兼容 X25519/HKDF/AES-GCM frame、direct UDP 与 TURN-lite relay data frame。
+* .NET client 已补 X25519 key 上报、Java 兼容 AES-GCM frame codec、replay window、UDP 控制面，以及随包 Windows Wintun / Linux TUN / macOS utun packet 读写；当前仍需要真实 Windows/Linux/macOS 双机环境做 ping、HTTP 和 relay fallback 手工验收。
 
 需要真实环境手工验收：
 
@@ -78,7 +85,7 @@ NAT 类型探测说明：
   "secret": "YOUR_CLIENT_SECRET",
   "peerMeshDevice": "noop",
   "peerMeshTunName": "shuai0",
-  "peerMeshMtu": 1400
+  "peerMeshMtu": 1280
 }
 ```
 
@@ -87,7 +94,10 @@ NAT 类型探测说明：
 * `noop`：默认值，只做控制面、候选交换、UDP 探测、加密 frame 数据面，不创建虚拟网卡。
 * `linux-tun`：Linux 使用 `/dev/net/tun` 创建 TUN。
 * `windows-wintun` 或 `wintun`：Windows 使用 Wintun。
-* `auto`：按当前操作系统选择 Linux TUN 或 Windows Wintun，不支持的平台回退 noop。
+* `utun`、`macos-utun` 或 `darwin-utun`：Go / .NET 客户端可在 macOS 使用 utun；Java 参考客户端当前未实现 macOS 虚拟网卡。
+* `auto`：Java 参考客户端会按当前操作系统选择 Linux TUN 或 Windows Wintun；Go / .NET 客户端还会在 macOS 选择 utun，不支持的平台回退 noop。
+
+`peerMeshMtu` 与 Java 参考实现保持一致，客户端会归一化到 `576..1280`。示例使用 `1280`，为 UDP 封装、AES-GCM tag 和公网路径预留空间，降低分片导致的丢包概率。
 
 Linux 启动条件：
 
@@ -105,11 +115,17 @@ sudo setcap cap_net_admin+ep /path/to/java
 Windows 启动条件：
 
 * 使用管理员权限运行客户端。
-* 安装或准备 Wintun，并确保 `wintun.dll` 在工作目录或 PATH。
-* 也可以显式指定：
+* Java / Go / .NET 客户端发布包会携带 `native/windows/<arch>/wintun.dll`。
+* 如果要覆盖随包版本，Java 可使用系统属性显式指定：
 
 ```powershell
 java -Dshuai.peerMesh.wintunDll=C:\path\to\wintun.dll -jar tunnel-client.jar
+```
+
+Go / .NET 客户端可使用环境变量覆盖：
+
+```powershell
+$env:SHUAI_PEER_MESH_WINTUN_DLL="C:\path\to\wintun.dll"
 ```
 
 ## 验收步骤
@@ -184,8 +200,9 @@ ping 100.96.x.y
 确认：
 
 * 管理员权限启动。
-* `wintun.dll` 位数和当前 JVM 位数一致。
-* `wintun.dll` 在工作目录 / PATH，或通过 `-Dshuai.peerMesh.wintunDll=完整路径` 指定。
+* `wintun.dll` 位数和当前进程架构一致。
+* 发布包内存在 `native/windows/<arch>/wintun.dll`。Go 客户端会先把内置资源解压到本地缓存再加载；.NET 客户端会在 build / publish 输出目录带上该 native 目录。
+* 如果需要覆盖，Java 通过 `-Dshuai.peerMesh.wintunDll=完整路径` 指定，Go / .NET 通过 `SHUAI_PEER_MESH_WINTUN_DLL` 指定。
 
 ### 一直走 relay
 
@@ -197,7 +214,7 @@ ping 100.96.x.y
 
 ## 后续可增强
 
-* macOS `utun` 适配。
+* 真实 macOS / Windows / Linux 多端互通和 relay fallback 压测。
 * 更完整的 RFC STUN/TURN 兼容层，当前是项目内 TURN-lite JSON 协议。
 * 客户端侧更细粒度的 direct / relay 统计签名上报。
 * 管理页拓扑图动画和 session 时间线。

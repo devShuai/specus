@@ -1,19 +1,23 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Security;
 using ShuaiTunnel.Protocol.Packets;
 
 namespace ShuaiTunnel.Client.DirectHttp;
 
 /// <summary>
 /// Forwards <see cref="DirectHttpRequestPacket"/> calls to a configured upstream base URL,
-/// honoring the route-containment, header-filtering, and 16&#160;MiB body caps of the Java
-/// <c>DirectHttpForwarder</c>. Errors are translated to a <c>502</c>
+/// honoring the route-containment, header-filtering, HTTPS trust, body caps, and range bounding
+/// of the Java <c>DirectHttpForwarder</c>. Errors are translated to a <c>502</c>
 /// <see cref="DirectHttpResponsePacket"/> with the exception message in <c>Error</c>.
 /// </summary>
 public sealed class DirectHttpForwarder
 {
-    public const int MaxBodySize = 16 * 1024 * 1024;
+    public const int MaxRequestBodySize = 16 * 1024 * 1024;
+    public const int MaxResponseBodySize = 64 * 1024 * 1024;
+    public const int MaxBodySize = MaxRequestBodySize;
     public const int FailureStatus = 502;
+    private const long MaxRangeBytes = 8L * 1024 * 1024;
 
     // Hop-by-hop headers per RFC 7230; never forwarded in either direction.
     public static readonly IReadOnlySet<string> SkippedHeaders =
@@ -34,14 +38,26 @@ public sealed class DirectHttpForwarder
     /// <summary>Builds a default <see cref="HttpClient"/> matching the Java client's timeouts.</summary>
     public static HttpClient BuildDefaultClient()
     {
+        return new HttpClient(BuildDefaultHandler()) { Timeout = TimeSpan.FromSeconds(20) };
+    }
+
+    public static SocketsHttpHandler BuildDefaultHandler()
+    {
         var handler = new SocketsHttpHandler
         {
             AllowAutoRedirect = false,
             AutomaticDecompression = DecompressionMethods.None,
             ConnectTimeout = TimeSpan.FromSeconds(5),
             PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+            UseProxy = false,
+            // Java DirectHttpForwarder trusts operator-configured LAN HTTPS upstreams, which
+            // commonly use self-signed certificates for PVE, NAS, Nacos, and similar services.
+            SslOptions = new SslClientAuthenticationOptions
+            {
+                RemoteCertificateValidationCallback = static (_, _, _, _) => true,
+            },
         };
-        return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
+        return handler;
     }
 
     public async Task<DirectHttpResponsePacket> ForwardAsync(
@@ -49,9 +65,9 @@ public sealed class DirectHttpForwarder
         IReadOnlyDictionary<string, string> routes,
         CancellationToken cancellationToken)
     {
-        if (request.Body is { Length: > MaxBodySize })
+        if (request.Body is { Length: > MaxRequestBodySize })
         {
-            return Failure(request.RequestId, "请求体超过 16MB 上限");
+            return Failure(request.RequestId, "HTTP 请求体超过限制");
         }
         if (string.IsNullOrWhiteSpace(request.Route) || !routes.TryGetValue(request.Route!, out var baseUrl))
         {
@@ -67,7 +83,13 @@ public sealed class DirectHttpForwarder
         {
             message.Content = new ByteArrayContent(request.Body);
         }
-        CopyRequestHeaders(request.Headers, message);
+        var originalRange = FirstHeader(request.Headers, "range");
+        var boundedRange = BoundedRange(originalRange);
+        CopyRequestHeaders(request.Headers, message, skipRange: boundedRange is not null);
+        if (boundedRange is not null)
+        {
+            message.Headers.TryAddWithoutValidation("Range", boundedRange);
+        }
 
         try
         {
@@ -119,65 +141,63 @@ public sealed class DirectHttpForwarder
         }
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri))
         {
-            error = "目标地址无效";
+            error = "HTTP route 地址无效";
             return false;
         }
         var scheme = baseUri.Scheme.ToLowerInvariant();
         if (scheme != "http" && scheme != "https")
         {
-            error = "目标 scheme 必须是 http/https";
+            error = "HTTP route 仅支持 http 和 https";
             return false;
         }
         if (!string.IsNullOrEmpty(baseUri.Query) || !string.IsNullOrEmpty(baseUri.Fragment))
         {
-            error = "目标地址不能包含 query 或 fragment";
+            error = "HTTP route 地址无效";
             return false;
         }
         if (string.IsNullOrEmpty(baseUri.Host))
         {
-            error = "目标地址缺少 host";
+            error = "HTTP route 地址无效";
             return false;
         }
 
         var path = string.IsNullOrWhiteSpace(relativePath) ? "/" : relativePath!;
         if (!path.StartsWith('/'))
         {
-            error = "relativePath 必须以 / 开头";
-            return false;
-        }
-        // Reject network-path references like "//host/path" (RFC 3986 §4.2) — they would
-        // hop to a different authority via Uri resolution.
-        if (path.StartsWith("//", StringComparison.Ordinal))
-        {
-            error = "relativePath 跨主机";
+            error = "HTTP 转发路径无效";
             return false;
         }
         if (path.Contains('\r') || path.Contains('\n'))
         {
-            error = "relativePath 含有非法控制字符";
+            error = "HTTP 转发路径无效";
+            return false;
+        }
+        if (ContainsDotSegment(path))
+        {
+            error = "HTTP 转发路径越界";
             return false;
         }
 
-        var basePath = baseUri.AbsolutePath.TrimEnd('/');
-        var combined = basePath + path;
-        if (!string.IsNullOrWhiteSpace(rawQuery))
+        var baseText = baseUrl.Trim();
+        if (baseText.EndsWith("/", StringComparison.Ordinal))
         {
-            combined += "?" + rawQuery;
+            baseText = baseText[..^1];
         }
-        var builder = new UriBuilder(baseUri) { Path = "", Query = "" };
-        if (!Uri.TryCreate(builder.Uri, combined, out var candidate))
+        var combined = baseText + path + (string.IsNullOrWhiteSpace(rawQuery) ? "" : "?" + rawQuery);
+        if (!Uri.TryCreate(combined, UriKind.Absolute, out var candidate))
         {
-            error = "目标地址拼接失败";
+            error = "HTTP 转发目标越界";
             return false;
         }
         if (!string.Equals(candidate.Scheme, baseUri.Scheme, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(candidate.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase)
             || candidate.Port != baseUri.Port)
         {
-            error = "目标地址跨主机";
+            error = "HTTP 转发目标越界";
             return false;
         }
 
+        var basePath = baseUri.AbsolutePath.TrimEnd('/');
         var basePrefix = basePath.Length == 0 ? "/" : basePath;
         var candidatePath = candidate.AbsolutePath;
         if (basePrefix == "/")
@@ -186,16 +206,17 @@ public sealed class DirectHttpForwarder
         }
         else if (candidatePath != basePrefix && !candidatePath.StartsWith(basePrefix + "/", StringComparison.Ordinal))
         {
-            error = "请求路径越出 route 范围";
+            error = "HTTP 转发路径越界";
             return false;
         }
 
         // Walk segments to reject "." and ".." as in the Java forwarder.
         foreach (var segment in candidatePath.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
-            if (segment == "." || segment == "..")
+            var decoded = Uri.UnescapeDataString(segment);
+            if (decoded == "." || decoded == "..")
             {
-                error = "请求路径包含非法段";
+                error = "HTTP 转发路径越界";
                 return false;
             }
         }
@@ -204,7 +225,20 @@ public sealed class DirectHttpForwarder
         return true;
     }
 
-    private static void CopyRequestHeaders(IReadOnlyList<string>? headers, HttpRequestMessage message)
+    private static bool ContainsDotSegment(string path)
+    {
+        foreach (var segment in path.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var decoded = Uri.UnescapeDataString(segment);
+            if (decoded == "." || decoded == "..")
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void CopyRequestHeaders(IReadOnlyList<string>? headers, HttpRequestMessage message, bool skipRange)
     {
         if (headers is null)
         {
@@ -218,6 +252,10 @@ public sealed class DirectHttpForwarder
                 continue;
             }
             var name = header[..idx];
+            if (skipRange && string.Equals(name, "range", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
             if (SkippedHeaders.Contains(name))
             {
                 continue;
@@ -230,6 +268,78 @@ public sealed class DirectHttpForwarder
                 message.Content?.Headers.TryAddWithoutValidation(name, value);
             }
         }
+    }
+
+    private static string? FirstHeader(IReadOnlyList<string>? headers, string headerName)
+    {
+        if (headers is null)
+        {
+            return null;
+        }
+        foreach (var header in headers)
+        {
+            var idx = header.IndexOf(':');
+            if (idx > 0 && string.Equals(header[..idx], headerName, StringComparison.OrdinalIgnoreCase))
+            {
+                return header[(idx + 1)..];
+            }
+        }
+        return null;
+    }
+
+    public static string? BoundedRange(string? rangeHeader)
+    {
+        if (rangeHeader is null)
+        {
+            return null;
+        }
+        var value = rangeHeader.Trim();
+        if (!value.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        var spec = value["bytes=".Length..].Trim();
+        if (spec.Length == 0 || spec.Contains(',', StringComparison.Ordinal))
+        {
+            return null;
+        }
+        var dash = spec.IndexOf('-');
+        if (dash < 0)
+        {
+            return null;
+        }
+
+        var startPart = spec[..dash].Trim();
+        var endPart = spec[(dash + 1)..].Trim();
+        if (startPart.Length == 0)
+        {
+            if (endPart.Length == 0 || !long.TryParse(endPart, out var suffixLength) || suffixLength <= 0)
+            {
+                return null;
+            }
+            return "bytes=-" + Math.Min(suffixLength, MaxRangeBytes);
+        }
+
+        if (!long.TryParse(startPart, out var start) || start < 0)
+        {
+            return null;
+        }
+        var maxEnd = BoundedRangeEnd(start);
+        if (endPart.Length == 0)
+        {
+            return $"bytes={start}-{maxEnd}";
+        }
+        if (!long.TryParse(endPart, out var end) || end < start)
+        {
+            return null;
+        }
+        return $"bytes={start}-{Math.Min(end, maxEnd)}";
+    }
+
+    private static long BoundedRangeEnd(long start)
+    {
+        var delta = MaxRangeBytes - 1;
+        return long.MaxValue - start < delta ? long.MaxValue : start + delta;
     }
 
     private static List<string> CollectResponseHeaders(HttpResponseMessage response)
@@ -264,9 +374,9 @@ public sealed class DirectHttpForwarder
         {
             return Array.Empty<byte>();
         }
-        if (response.Content.Headers.ContentLength is long announced && announced > MaxBodySize)
+        if (response.Content.Headers.ContentLength is long announced && announced > MaxResponseBodySize)
         {
-            throw new InvalidOperationException("响应体超过 16MB 上限");
+            throw new InvalidOperationException("HTTP 响应体超过限制");
         }
         await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
         using var memory = new MemoryStream();
@@ -280,9 +390,9 @@ public sealed class DirectHttpForwarder
                 break;
             }
             total += read;
-            if (total > MaxBodySize)
+            if (total > MaxResponseBodySize)
             {
-                throw new InvalidOperationException("响应体超过 16MB 上限");
+                throw new InvalidOperationException("HTTP 响应体超过限制");
             }
             memory.Write(buffer, 0, read);
         }

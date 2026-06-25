@@ -4,5 +4,5 @@
   "secret": "YOUR_CLIENT_SECRET",
   "peerMeshDevice": "noop",
   "peerMeshTunName": "shuai0",
-  "peerMeshMtu": 1400
+  "peerMeshMtu": 1280
 }

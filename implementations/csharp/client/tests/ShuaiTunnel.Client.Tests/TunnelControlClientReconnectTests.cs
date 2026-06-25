@@ -19,6 +19,19 @@ namespace ShuaiTunnel.Client.Tests;
 /// </summary>
 public class TunnelControlClientReconnectTests
 {
+    [Theory]
+    [InlineData("客户端访问令牌已过期", (int)ControlLoginFailureAction.RefreshImmediately)]
+    [InlineData("服务器繁忙，请稍后再试", (int)ControlLoginFailureAction.Backoff)]
+    [InlineData("连接频率超过限制", (int)ControlLoginFailureAction.Backoff)]
+    [InlineData("", (int)ControlLoginFailureAction.Stop)]
+    [InlineData("客户端已被禁用", (int)ControlLoginFailureAction.Stop)]
+    public void ControlLoginFailureClassificationMatchesJava(
+        string reason,
+        int expected)
+    {
+        Assert.Equal((ControlLoginFailureAction)expected, TunnelControlClient.ClassifyControlLoginFailure(reason));
+    }
+
     [Fact]
     public async Task ClientLogsIn_Registers_RoundtripsData_AndReconnects()
     {
@@ -46,7 +59,7 @@ public class TunnelControlClientReconnectTests
 
         using var http = new HttpClient();
         var auth = new ClientAuthService(config, http, NullLogger<ClientAuthService>.Instance);
-        var client = new TunnelControlClient(auth, new DirectHttpForwarder(http), NullLoggerFactory.Instance);
+        var client = new TunnelControlClient(config, auth, new DirectHttpForwarder(http), NullLoggerFactory.Instance);
         var clientTask = Task.Run(() => client.RunAsync(cts.Token), cts.Token);
 
         try

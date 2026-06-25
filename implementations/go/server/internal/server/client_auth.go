@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/auth"
+	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/peermesh"
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
 )
 
@@ -33,23 +34,25 @@ type clientEnvironmentInfo struct {
 	OSArch             string   `json:"osArch"`
 	ClientVersion      string   `json:"clientVersion"`
 	JavaVersion        string   `json:"javaVersion"`
+	PeerPublicKey      string   `json:"peerPublicKey"`
 	LocalAddresses     []string `json:"localAddresses"`
 	StartedAt          string   `json:"startedAt"`
 }
 
 type clientAuthLoginResponse struct {
-	TenantID             string              `json:"tenantId"`
-	ClientID             int64               `json:"clientId"`
-	ClientName           string              `json:"clientName"`
-	ClientSessionID      int64               `json:"clientSessionId"`
-	AccessToken          string              `json:"accessToken"`
-	TokenTTLSeconds      int64               `json:"tokenTtlSeconds"`
-	NettyHost            string              `json:"nettyHost"`
-	NettyPort            int                 `json:"nettyPort"`
-	MaxOnlineInstances   int                 `json:"maxOnlineInstances"`
-	Policy               clientPolicy        `json:"policy"`
-	TunnelConfigList     []tunnelEndpoint    `json:"tunnelConfigList"`
-	HTTPTunnelConfigList []httpRouteEndpoint `json:"httpTunnelConfigList"`
+	TenantID             string               `json:"tenantId"`
+	ClientID             int64                `json:"clientId"`
+	ClientName           string               `json:"clientName"`
+	ClientSessionID      int64                `json:"clientSessionId"`
+	AccessToken          string               `json:"accessToken"`
+	TokenTTLSeconds      int64                `json:"tokenTtlSeconds"`
+	NettyHost            string               `json:"nettyHost"`
+	NettyPort            int                  `json:"nettyPort"`
+	MaxOnlineInstances   int                  `json:"maxOnlineInstances"`
+	Policy               clientPolicy         `json:"policy"`
+	PeerMesh             peermesh.LoginConfig `json:"peerMesh"`
+	TunnelConfigList     []tunnelEndpoint     `json:"tunnelConfigList"`
+	HTTPTunnelConfigList []httpRouteEndpoint  `json:"httpTunnelConfigList"`
 }
 
 type clientPolicy struct {
@@ -89,7 +92,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeClientAuthError(w, http.StatusBadRequest, "客户端凭证已停用")
 		return
 	}
-	account, err := a.findOrCreateClientIdentity(r.Context(), *credential, request.Environment)
+	account, identity, err := a.findOrCreateClientIdentity(r.Context(), *credential, request.Environment)
 	if err != nil {
 		writeClientAuthError(w, http.StatusInternalServerError, "客户端身份创建失败")
 		return
@@ -98,11 +101,47 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeClientAuthError(w, http.StatusBadRequest, "客户端已停用")
 		return
 	}
-	ttl := time.Duration(a.cfg.Auth.TokenTTLSeconds) * time.Second
+	ttl := time.Duration(a.cfg.ClientAuth.TokenTTLSeconds) * time.Second
 	if ttl <= 0 {
 		ttl = 8 * time.Hour
 	}
-	session := a.clientAuth.Create(*account, ttl)
+	machineFingerprint := limit(strings.TrimSpace(request.Environment.MachineFingerprint), 160)
+	osUser := limit(strings.TrimSpace(request.Environment.OSUser), 120)
+	if _, err := a.db.CloseHTTPAuthenticatedClientSessions(r.Context(), credential.ID,
+		machineFingerprint, osUser, auth.StatusHTTPAuthenticated, auth.StatusDisconnected, time.Now()); err != nil {
+		writeClientAuthError(w, http.StatusInternalServerError, "清理旧客户端会话失败")
+		return
+	}
+	session := a.clientAuth.CreateForClient(*account,
+		credential.ID,
+		machineFingerprint,
+		osUser,
+		ttl)
+	now := time.Now()
+	if err := a.db.InsertClientSession(r.Context(), store.ClientSession{
+		ID:                 session.ID,
+		TenantID:           session.TenantID,
+		CredentialID:       credential.ID,
+		IdentityID:         identity.ID,
+		ClientID:           account.ID,
+		ClientName:         account.ClientName,
+		TokenHash:          session.TokenHash,
+		Status:             auth.StatusHTTPAuthenticated,
+		MachineFingerprint: machineFingerprint,
+		OSUser:             osUser,
+		Hostname:           limitedTextPtr(request.Environment.Hostname, 160),
+		OSName:             limitedTextPtr(request.Environment.OSName, 120),
+		OSVersion:          limitedTextPtr(request.Environment.OSVersion, 80),
+		OSArch:             limitedTextPtr(request.Environment.OSArch, 60),
+		ClientVersion:      limitedTextPtr(request.Environment.ClientVersion, 80),
+		JavaVersion:        limitedTextPtr(request.Environment.JavaVersion, 80),
+		LocalAddresses:     limitedTextPtr(strings.Join(request.Environment.LocalAddresses, ","), 2000),
+		HTTPLoginAt:        now,
+		ExpiresAt:          session.ExpiresAt,
+	}); err != nil {
+		writeClientAuthError(w, http.StatusInternalServerError, "保存客户端会话失败")
+		return
+	}
 	tunnels, err := a.db.ListEnabledTunnels(r.Context(), account.ID)
 	if err != nil {
 		writeClientAuthError(w, http.StatusInternalServerError, "加载 TCP 映射失败")
@@ -113,8 +152,13 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeClientAuthError(w, http.StatusInternalServerError, "加载 HTTP 路由失败")
 		return
 	}
+	peerMesh, err := a.peerMesh.BuildLoginConfig(r.Context(), *account, request.Environment.PeerPublicKey, r.Host)
+	if err != nil {
+		writeClientAuthError(w, http.StatusInternalServerError, "加载私有组网配置失败")
+		return
+	}
 	response := clientAuthLoginResponse{
-		TenantID:           "default",
+		TenantID:           firstText(credential.TenantID, "default"),
 		ClientID:           account.ID,
 		ClientName:         account.ClientName,
 		ClientSessionID:    session.ID,
@@ -124,6 +168,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		NettyPort:          a.cfg.Netty.Port,
 		MaxOnlineInstances: credential.MaxOnlineInstances,
 		Policy:             clientPolicy{Enabled: true, BillingStatus: "ACTIVE"},
+		PeerMesh:           peerMesh,
 	}
 	for _, item := range tunnels {
 		response.TunnelConfigList = append(response.TunnelConfigList, tunnelEndpoint{
@@ -154,23 +199,27 @@ func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthL
 }
 
 func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.ClientCredential,
-	environment clientEnvironmentInfo) (*store.ClientAccount, error) {
+	environment clientEnvironmentInfo) (*store.ClientAccount, *store.ClientIdentity, error) {
 	machine := limit(strings.TrimSpace(environment.MachineFingerprint), 160)
 	osUser := limit(strings.TrimSpace(environment.OSUser), 120)
 	hostname := limit(firstText(environment.Hostname, "unknown-host"), 160)
 	identity, err := a.db.FindIdentity(ctx, credential.ID, machine, osUser)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if identity != nil {
 		_ = a.db.UpdateIdentityLastSeen(ctx, identity.ID, hostname, time.Now())
-		return a.db.GetClient(ctx, identity.ClientID)
+		account, err := a.db.GetClient(ctx, identity.ClientID)
+		if err != nil {
+			return nil, nil, err
+		}
+		return account, identity, nil
 	}
 
 	now := time.Now()
 	clientName, err := a.generateClientName(ctx, credential, machine, osUser, hostname)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	account := store.ClientAccount{
 		ID:                           auth.NewClientID(),
@@ -184,7 +233,7 @@ func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.C
 		UpdatedAt:                    now,
 	}
 	if err := a.db.InsertClient(ctx, account); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	identity = &store.ClientIdentity{
 		ID:                 auth.NewClientID(),
@@ -199,9 +248,9 @@ func (a *App) findOrCreateClientIdentity(ctx context.Context, credential store.C
 		LastSeenAt:         now,
 	}
 	if err := a.db.InsertIdentity(ctx, *identity); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &account, nil
+	return &account, identity, nil
 }
 
 func (a *App) generateClientName(ctx context.Context, credential store.ClientCredential,
@@ -238,6 +287,15 @@ func limit(value string, maxLength int) string {
 		return value
 	}
 	return value[:maxLength]
+}
+
+func limitedTextPtr(value string, maxLength int) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	limited := limit(trimmed, maxLength)
+	return &limited
 }
 
 func slug(value, fallback string) string {

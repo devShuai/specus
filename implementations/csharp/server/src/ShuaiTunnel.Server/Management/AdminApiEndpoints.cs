@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Hosting;
+using ShuaiTunnel.Server.PeerMesh;
 using ShuaiTunnel.Server.Security;
 
 namespace ShuaiTunnel.Server.Management;
@@ -23,6 +24,11 @@ public static class AdminApiEndpoints
             catch (InvalidOperationException ex) when (IsAdminSurface(context.Request.Path))
             {
                 context.Response.StatusCode = StatusCodes.Status409Conflict;
+                await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
+            }
+            catch (UnauthorizedAccessException ex) when (IsAdminSurface(context.Request.Path))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
             }
         });
@@ -61,18 +67,24 @@ public static class AdminApiEndpoints
 
     public static void MapAdminApi(this WebApplication app)
     {
-        app.MapPost("/auth/login", (AdminLoginRequest? request, LocalTokenService tokens) =>
+        app.MapPost("/auth/login", async (AdminLoginRequest? request, LocalTokenService tokens,
+            ManagementUserService users, CancellationToken cancellationToken) =>
         {
-            if (request is null || !tokens.Authenticate(request.Username, request.Password))
+            var user = request is null
+                ? null
+                : await users.AuthenticateAsync(request.Username, request.Password, cancellationToken)
+                    .ConfigureAwait(false);
+            if (user is null)
             {
                 return Results.Json(new { error = "用户名或密码错误" },
                     statusCode: StatusCodes.Status401Unauthorized);
             }
 
-            return Results.Ok(tokens.IssueTokenBody(request.Username!));
+            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
         });
 
-        app.MapPost("/auth/refresh", (HttpContext context, LocalTokenService tokens) =>
+        app.MapPost("/auth/refresh", (HttpContext context, LocalTokenService tokens,
+            IOptions<AuthOptions> authOptions) =>
         {
             if (!string.Equals(context.User.FindFirst("iss")?.Value, LocalTokenService.Issuer,
                     StringComparison.Ordinal))
@@ -81,14 +93,8 @@ public static class AdminApiEndpoints
                     statusCode: StatusCodes.Status400BadRequest);
             }
 
-            var username = context.User.Identity?.Name;
-            if (string.IsNullOrWhiteSpace(username))
-            {
-                return Results.Json(new { error = "未授权" },
-                    statusCode: StatusCodes.Status401Unauthorized);
-            }
-
-            return Results.Ok(tokens.IssueTokenBody(username));
+            var principal = ManagementContext.From(context, authOptions.Value);
+            return Results.Ok(tokens.IssueTokenBody(principal.Username, principal.TenantId, principal.Role));
         });
 
         app.MapGet("/oidc-config", (IOptions<OidcOptions> options, LocalTokenService tokens) =>
@@ -111,125 +117,348 @@ public static class AdminApiEndpoints
                 CancellationToken cancellationToken) =>
                 exchange.ExchangeAsync(request, cancellationToken));
 
-        app.MapGet("/api/admin/overview",
+        app.MapGet("/api/public/client-downloads",
             (ManagementQueryService service, CancellationToken cancellationToken) =>
-                service.GetOverviewAsync(cancellationToken));
+                service.ListPublicClientDownloadsAsync(cancellationToken));
+
+        app.MapGet("/api/admin/me",
+            (HttpContext context, IOptions<AuthOptions> authOptions, ManagementUserService service,
+                CancellationToken cancellationToken) =>
+                service.CurrentUserAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
+
+        app.MapGet("/api/admin/users",
+            (HttpContext context, IOptions<AuthOptions> authOptions, ManagementUserService service,
+                CancellationToken cancellationToken) =>
+                service.ListUsersAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
+
+        app.MapPost("/api/admin/users",
+            async (HttpContext context, UserMutation request, IOptions<AuthOptions> authOptions,
+                ManagementUserService service, CancellationToken cancellationToken) =>
+            {
+                var created = await service.CreateUserAsync(
+                    ManagementContext.From(context, authOptions.Value), request, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.Json(created, statusCode: StatusCodes.Status201Created);
+            });
+
+        app.MapPut("/api/admin/users/{username}",
+            (HttpContext context, string username, UserMutation request, IOptions<AuthOptions> authOptions,
+                ManagementUserService service, CancellationToken cancellationToken) =>
+                service.UpdateUserAsync(ManagementContext.From(context, authOptions.Value), username,
+                    request, cancellationToken));
+
+        app.MapDelete("/api/admin/users/{username}",
+            async (HttpContext context, string username, IOptions<AuthOptions> authOptions,
+                ManagementUserService service, CancellationToken cancellationToken) =>
+            {
+                await service.DeleteUserAsync(ManagementContext.From(context, authOptions.Value),
+                        username, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.NoContent();
+            });
+
+        app.MapGet("/api/admin/overview",
+            (HttpContext context, IOptions<AuthOptions> authOptions, ManagementQueryService service,
+                CancellationToken cancellationToken) =>
+                service.GetOverviewAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
 
         app.MapPost("/api/admin/database/initialize",
-            (DatabaseInitializer initializer, CancellationToken cancellationToken) =>
-                initializer.InitializeAsync(cancellationToken));
+            (HttpContext context, IOptions<AuthOptions> authOptions, DatabaseInitializer initializer,
+                CancellationToken cancellationToken) =>
+            {
+                var managementContext = ManagementContext.From(context, authOptions.Value);
+                ManagementUserService.RequireAdmin(managementContext);
+                return initializer.InitializeAsync(cancellationToken,
+                    managementContext.TenantId, managementContext.Username);
+            });
 
         app.MapGet("/api/admin/clients",
-            (ManagementQueryService service, CancellationToken cancellationToken) =>
-                service.ListClientsAsync(cancellationToken));
+            (HttpContext context, IOptions<AuthOptions> authOptions, ManagementQueryService service,
+                CancellationToken cancellationToken) =>
+                service.ListClientsAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
 
         app.MapPost("/api/admin/clients",
-            async (ClientMutation request, ManagementMutationService service, CancellationToken cancellationToken) =>
+            async (HttpContext context, ClientMutation request, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
             {
-                var created = await service.CreateClientAsync(request, cancellationToken).ConfigureAwait(false);
+                var created = await service.CreateClientAsync(
+                    ManagementContext.From(context, authOptions.Value), request, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 
         app.MapPut("/api/admin/clients/{id:long}",
-            (long id, ClientMutation request, ManagementMutationService service, CancellationToken cancellationToken) =>
-                service.UpdateClientAsync(id, request, cancellationToken));
+            (HttpContext context, long id, ClientMutation request, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+                service.UpdateClientAsync(ManagementContext.From(context, authOptions.Value), id,
+                    request, cancellationToken));
 
         app.MapDelete("/api/admin/clients/{id:long}",
-            async (long id, ManagementMutationService service, CancellationToken cancellationToken) =>
+            async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
             {
-                await service.DeleteClientAsync(id, cancellationToken).ConfigureAwait(false);
+                await service.DeleteClientAsync(ManagementContext.From(context, authOptions.Value),
+                        id, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.NoContent();
             });
 
         app.MapGet("/api/admin/client-credentials",
-            (ManagementMutationService service, CancellationToken cancellationToken) =>
-                service.ListCredentialsAsync(cancellationToken));
+            (HttpContext context, IOptions<AuthOptions> authOptions, ManagementMutationService service,
+                CancellationToken cancellationToken) =>
+                service.ListCredentialsAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
 
         app.MapPost("/api/admin/client-credentials",
-            async (CredentialMutation request, ManagementMutationService service,
-                CancellationToken cancellationToken) =>
+            async (HttpContext context, CredentialMutation request, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
             {
-                var created = await service.CreateCredentialAsync(request, cancellationToken).ConfigureAwait(false);
+                var created = await service.CreateCredentialAsync(
+                    ManagementContext.From(context, authOptions.Value), request, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 
         app.MapPut("/api/admin/client-credentials/{id:long}",
-            (long id, CredentialMutation request, ManagementMutationService service,
-                CancellationToken cancellationToken) =>
-                service.UpdateCredentialAsync(id, request, cancellationToken));
+            (HttpContext context, long id, CredentialMutation request, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+                service.UpdateCredentialAsync(ManagementContext.From(context, authOptions.Value), id,
+                    request, cancellationToken));
 
         app.MapDelete("/api/admin/client-credentials/{id:long}",
-            async (long id, ManagementMutationService service, CancellationToken cancellationToken) =>
+            async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
             {
-                await service.DeleteCredentialAsync(id, cancellationToken).ConfigureAwait(false);
+                await service.DeleteCredentialAsync(ManagementContext.From(context, authOptions.Value),
+                        id, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.NoContent();
+            });
+
+        app.MapGet("/api/admin/client-downloads",
+            (HttpContext context, IOptions<AuthOptions> authOptions, ManagementMutationService service,
+                CancellationToken cancellationToken) =>
+                service.ListClientDownloadsAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
+        app.MapPost("/api/admin/client-downloads",
+            async (HttpContext context, ClientDownloadLinkMutation request, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+            {
+                var created = await service.CreateClientDownloadAsync(
+                        ManagementContext.From(context, authOptions.Value), request, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.Json(created, statusCode: StatusCodes.Status201Created);
+            });
+
+        app.MapPut("/api/admin/client-downloads/{id:long}",
+            (HttpContext context, long id, ClientDownloadLinkMutation request,
+                IOptions<AuthOptions> authOptions, ManagementMutationService service,
+                CancellationToken cancellationToken) =>
+                service.UpdateClientDownloadAsync(ManagementContext.From(context, authOptions.Value),
+                    id, request, cancellationToken));
+
+        app.MapDelete("/api/admin/client-downloads/{id:long}",
+            async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+            {
+                await service.DeleteClientDownloadAsync(ManagementContext.From(context, authOptions.Value),
+                        id, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.NoContent();
             });
 
         app.MapGet("/api/admin/tunnels",
-            (long? clientId, ManagementMutationService service, CancellationToken cancellationToken) =>
-                service.ListTunnelsAsync(clientId, cancellationToken));
+            (HttpContext context, long? clientId, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+                service.ListTunnelsAsync(ManagementContext.From(context, authOptions.Value),
+                    clientId, cancellationToken));
 
         app.MapPost("/api/admin/clients/{id:long}/tunnels",
-            async (long id, TunnelMappingMutation request, ManagementMutationService service,
+            async (HttpContext context, long id, TunnelMappingMutation request,
+                IOptions<AuthOptions> authOptions, ManagementMutationService service,
                 CancellationToken cancellationToken) =>
             {
-                var created = await service.CreateTunnelAsync(id, request, cancellationToken).ConfigureAwait(false);
+                var created = await service.CreateTunnelAsync(
+                    ManagementContext.From(context, authOptions.Value), id, request, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 
         app.MapPut("/api/admin/tunnels/{tunnelId:long}",
-            (long tunnelId, TunnelMappingMutation request, ManagementMutationService service,
+            (HttpContext context, long tunnelId, TunnelMappingMutation request,
+                IOptions<AuthOptions> authOptions, ManagementMutationService service,
                 CancellationToken cancellationToken) =>
-                service.UpdateTunnelAsync(tunnelId, request, cancellationToken));
+                service.UpdateTunnelAsync(ManagementContext.From(context, authOptions.Value),
+                    tunnelId, request, cancellationToken));
 
         app.MapDelete("/api/admin/tunnels/{tunnelId:long}",
-            async (long tunnelId, ManagementMutationService service, CancellationToken cancellationToken) =>
+            async (HttpContext context, long tunnelId, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
             {
-                await service.DeleteTunnelAsync(tunnelId, cancellationToken).ConfigureAwait(false);
+                await service.DeleteTunnelAsync(ManagementContext.From(context, authOptions.Value),
+                        tunnelId, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.NoContent();
             });
 
         app.MapPost("/api/admin/clients/{id:long}/nat-control",
-            (long id, ManagementMutationService service, CancellationToken cancellationToken) =>
-                service.PushNatControlAsync(id, cancellationToken));
+            (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+                service.PushNatControlAsync(ManagementContext.From(context, authOptions.Value),
+                    id, cancellationToken));
 
         app.MapGet("/api/admin/http-routes",
-            (long? clientId, ManagementMutationService service, CancellationToken cancellationToken) =>
-                service.ListHttpRoutesAsync(clientId, cancellationToken));
+            (HttpContext context, long? clientId, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+                service.ListHttpRoutesAsync(ManagementContext.From(context, authOptions.Value),
+                    clientId, cancellationToken));
 
         app.MapPost("/api/admin/clients/{id:long}/http-routes",
-            async (long id, HttpRouteMutation request, ManagementMutationService service,
+            async (HttpContext context, long id, HttpRouteMutation request,
+                IOptions<AuthOptions> authOptions, ManagementMutationService service,
                 CancellationToken cancellationToken) =>
             {
-                var created = await service.CreateHttpRouteAsync(id, request, cancellationToken).ConfigureAwait(false);
+                var created = await service.CreateHttpRouteAsync(
+                    ManagementContext.From(context, authOptions.Value), id, request, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.Json(created, statusCode: StatusCodes.Status201Created);
             });
 
         app.MapPut("/api/admin/http-routes/{routeId:long}",
-            (long routeId, HttpRouteMutation request, ManagementMutationService service,
+            (HttpContext context, long routeId, HttpRouteMutation request,
+                IOptions<AuthOptions> authOptions, ManagementMutationService service,
                 CancellationToken cancellationToken) =>
-                service.UpdateHttpRouteAsync(routeId, request, cancellationToken));
+                service.UpdateHttpRouteAsync(ManagementContext.From(context, authOptions.Value),
+                    routeId, request, cancellationToken));
 
         app.MapDelete("/api/admin/http-routes/{routeId:long}",
-            async (long routeId, ManagementMutationService service, CancellationToken cancellationToken) =>
+            async (HttpContext context, long routeId, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
             {
-                await service.DeleteHttpRouteAsync(routeId, cancellationToken).ConfigureAwait(false);
+                await service.DeleteHttpRouteAsync(ManagementContext.From(context, authOptions.Value),
+                        routeId, cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.NoContent();
             });
 
         app.MapGet("/api/admin/connections",
             (long? clientId, bool? success, string? from, string? to, int? page, int? size,
+                HttpContext context, IOptions<AuthOptions> authOptions,
                 ManagementQueryService service, CancellationToken cancellationToken) =>
-                service.ListConnectionsAsync(clientId, success, from, to, page, size, cancellationToken));
+                service.ListConnectionsAsync(ManagementContext.From(context, authOptions.Value),
+                    clientId, success, from, to, page, size, cancellationToken));
 
         app.MapGet("/api/admin/traffic",
-            (long? clientId, int? limit, ManagementQueryService service, CancellationToken cancellationToken) =>
-                service.ListTrafficAsync(clientId, limit, cancellationToken));
+            (long? clientId, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+                ManagementQueryService service, CancellationToken cancellationToken) =>
+                service.ListTrafficAsync(ManagementContext.From(context, authOptions.Value),
+                    clientId, limit, cancellationToken));
+
+        app.MapGet("/api/admin/traffic/resources",
+            (string? type, long? clientId, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+                ManagementQueryService service, CancellationToken cancellationToken) =>
+                service.ListResourceTrafficAsync(ManagementContext.From(context, authOptions.Value),
+                    type, clientId, limit, cancellationToken));
+
+        app.MapGet("/api/admin/traffic/http-exchanges",
+            (long? clientId, string? route, string? responseBodyType, string? responseDataType,
+                string? field, string? q, int? page, int? size, HttpContext context,
+                IOptions<AuthOptions> authOptions, ManagementQueryService service,
+                CancellationToken cancellationToken) =>
+                service.ListHttpExchangesAsync(ManagementContext.From(context, authOptions.Value),
+                    clientId, route, FirstText(responseBodyType, responseDataType), field, q,
+                    page, size, cancellationToken));
+
+        app.MapGet("/api/admin/traffic/tcp-frames",
+            (long? clientId, int? listenPort, int? page, int? size, int? limit,
+                HttpContext context, IOptions<AuthOptions> authOptions, ManagementQueryService service,
+                CancellationToken cancellationToken) =>
+                service.ListTcpFramesAsync(ManagementContext.From(context, authOptions.Value),
+                    clientId, listenPort, page, size, limit, cancellationToken));
+
+        app.MapGet("/api/admin/traffic/tcp-frames/{id:long}",
+            async (long id, HttpContext context, IOptions<AuthOptions> authOptions,
+                ManagementQueryService service, CancellationToken cancellationToken) =>
+            {
+                var frame = await service.GetTcpFrameAsync(
+                        ManagementContext.From(context, authOptions.Value), id, cancellationToken)
+                    .ConfigureAwait(false);
+                return frame is null ? Results.NotFound(new { error = "TCP frame not found" }) : Results.Ok(frame);
+            });
+
+        app.MapGet("/api/admin/traffic/tcp-streams",
+            (string channelId, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+                ManagementQueryService service, CancellationToken cancellationToken) =>
+                service.ListTcpStreamAsync(ManagementContext.From(context, authOptions.Value),
+                    channelId, limit, cancellationToken));
 
         app.MapGet("/api/admin/connection-stats",
-            (string? clientName, int? limit, ManagementQueryService service, CancellationToken cancellationToken) =>
-                service.ListConnectionStatsAsync(clientName, limit, cancellationToken));
+            (string? clientName, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+                ManagementQueryService service, CancellationToken cancellationToken) =>
+                service.ListConnectionStatsAsync(ManagementContext.From(context, authOptions.Value),
+                    clientName, limit, cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/status",
+            (PeerMeshService service) => Results.Ok(new { enabled = service.Enabled }));
+
+        app.MapGet("/api/admin/peer-mesh/devices",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.ListDevicesAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
+
+        app.MapPut("/api/admin/peer-mesh/devices/{clientId:long}",
+            (HttpContext context, long clientId, PeerMeshDeviceMutation request,
+                IOptions<AuthOptions> authOptions, PeerMeshService service, CancellationToken cancellationToken) =>
+                service.UpdateDeviceAsync(ManagementContext.From(context, authOptions.Value), clientId,
+                    request, cancellationToken));
+
+        app.MapGet("/api/admin/peer-mesh/acls",
+            (HttpContext context, IOptions<AuthOptions> authOptions, PeerMeshService service,
+                CancellationToken cancellationToken) =>
+                service.ListAclsAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
+
+        app.MapPost("/api/admin/peer-mesh/acls",
+            async (HttpContext context, PeerMeshAclMutation request, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+            {
+                var created = await service.CreateAclAsync(
+                        ManagementContext.From(context, authOptions.Value), request, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.Json(created, statusCode: StatusCodes.Status201Created);
+            });
+
+        app.MapDelete("/api/admin/peer-mesh/acls/{id:long}",
+            async (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+            {
+                await service.DeleteAclAsync(ManagementContext.From(context, authOptions.Value),
+                        id, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.NoContent();
+            });
+
+        app.MapGet("/api/admin/peer-mesh/sessions",
+            (int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.ListSessionsAsync(ManagementContext.From(context, authOptions.Value),
+                    limit, cancellationToken));
+
+        app.MapDelete("/api/admin/peer-mesh/sessions/{id:long}",
+            (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.ForceCloseAsync(ManagementContext.From(context, authOptions.Value),
+                    id, cancellationToken));
+
+        app.MapDelete("/api/admin/peer-mesh/sessions",
+            (HttpContext context, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.CloseOpenSessionsAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
     }
+
+    private static string? FirstText(string? first, string? second) =>
+        string.IsNullOrWhiteSpace(first) ? second : first;
 
     private static bool RequiresAdminAuth(PathString path) =>
         path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase)

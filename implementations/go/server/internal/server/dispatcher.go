@@ -27,6 +27,7 @@ type Dispatcher struct {
 	// Optional hooks wired in later phases (nil-safe).
 	natHandler        func(conn *control.Conn, message protocol.NatMessage) error
 	directHTTPAck     func(response protocol.DirectHTTPResponse)
+	peerControl       func(conn *control.Conn, request protocol.MessageRequest) error
 	onLoginSuccess    func(conn *control.Conn)
 	onDisconnect      func(conn *control.Conn)
 	onConnectionEvent func(eventType string, record store.ConnectionRecord)
@@ -52,6 +53,11 @@ func (d *Dispatcher) SetOnDisconnect(hook func(conn *control.Conn)) { d.onDiscon
 // SetDirectHTTPAck installs the Direct HTTP response handler (G4).
 func (d *Dispatcher) SetDirectHTTPAck(ack func(response protocol.DirectHTTPResponse)) {
 	d.directHTTPAck = ack
+}
+
+// SetPeerControlHandler installs the Peer Mesh control-plane signal handler.
+func (d *Dispatcher) SetPeerControlHandler(handler func(conn *control.Conn, request protocol.MessageRequest) error) {
+	d.peerControl = handler
 }
 
 // SetOnConnectionEvent installs a hook fired when a connection record is created/updated (G4).
@@ -95,6 +101,18 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 			d.directHTTPAck(p)
 		}
 		return nil
+	case protocol.MessageRequest:
+		if p.MessageType == protocol.MessageTypePeerControl {
+			if d.peerControl == nil {
+				d.logger.Info("dropped PEER_CONTROL: peer mesh handler is not configured",
+					"channel", conn.ChannelID(), "client", conn.ClientName(), "bytes", len(p.Message))
+				return nil
+			}
+			return d.peerControl(conn, p)
+		}
+		d.logger.Debug("dropped unhandled message request",
+			"channel", conn.ChannelID(), "client", conn.ClientName(), "messageType", p.MessageType)
+		return nil
 	default:
 		d.logger.Debug("dropped unhandled packet", "channel", conn.ChannelID(), "cmd", packet.Command())
 		return nil
@@ -108,6 +126,14 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 	}
 	if name := conn.ClientName(); name != "" {
 		d.sessions.Unbind(name, conn)
+	}
+	d.auth.MarkDisconnected(conn.ClientSessionID())
+	if sessionID := conn.ClientSessionID(); sessionID > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := d.db.MarkClientSessionDisconnected(ctx, sessionID, auth.StatusDisconnected, time.Now()); err != nil {
+			d.logger.Error("mark client session disconnected failed", "session", sessionID, "err", err)
+		}
+		cancel()
 	}
 	recordID := conn.ConnectionRecordID()
 	if recordID == 0 {
@@ -128,7 +154,7 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 		channelID := conn.ChannelID()
 		reasonCopy := reason
 		d.onConnectionEvent("updated", store.ConnectionRecord{
-			ID: recordID, ClientName: conn.ClientName(), ChannelID: &channelID,
+			ID: recordID, TenantID: conn.TenantID(), ClientName: conn.ClientName(), ChannelID: &channelID,
 			ConnectedAt: now, DisconnectedAt: &now, Success: true, DisconnectReason: &reasonCopy,
 		})
 	}
@@ -160,6 +186,7 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		clientName = result.Account.ClientName
 	}
 	record := store.ConnectionRecord{
+		TenantID:    "default",
 		ClientName:  clientName,
 		ConnectedAt: time.Now(),
 		Success:     result.Success,
@@ -170,6 +197,7 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		record.RemoteAddress = &remote
 	}
 	if result.Account != nil {
+		record.TenantID = result.Account.TenantID
 		record.ClientID = &result.Account.ID
 	}
 	if !result.Success {
@@ -194,6 +222,23 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		d.onConnectionEvent("created", record)
 	}
 
+	if result.Success {
+		now := time.Now()
+		if err := d.db.MarkClientSessionOnline(ctx, result.Session.ID, auth.StatusNettyOnline,
+			conn.ChannelID(), conn.RemoteAddress(), now); err != nil {
+			d.logger.Error("mark client session online failed", "channel", conn.ChannelID(),
+				"client", clientName, "err", err)
+			result.Success = false
+			result.Reason = "保存客户端会话状态失败"
+			record.DisconnectedAt = &now
+			reason := store.ReasonIOError
+			record.DisconnectReason = &reason
+			conn.MarkReason(store.ReasonIOError)
+		} else {
+			d.auth.MarkOnline(result.Session.ID)
+		}
+	}
+
 	response := protocol.LoginResponse{ClientName: clientName, Success: result.Success}
 	if result.Reason != "" {
 		reason := result.Reason
@@ -211,7 +256,7 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 	}
 
 	conn.SetConnectionRecordID(recordID)
-	conn.OnLoginSuccess(clientName, time.Now().UnixMilli())
+	conn.OnLoginSuccess(clientName, result.Account.TenantID, result.Session.ID, time.Now().UnixMilli())
 
 	if displaced := d.sessions.Replace(conn); displaced != nil {
 		displaced.Close(store.ReasonReplacedByNewLogin)

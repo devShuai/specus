@@ -32,6 +32,12 @@ type OidcValidator struct {
 	cacheTTL time.Duration
 }
 
+// OidcIdentity is the normalized identity extracted from a verified OIDC token.
+type OidcIdentity struct {
+	Username string
+	TenantID string
+}
+
 // NewOidcValidator builds an OIDC validator.
 func NewOidcValidator(cfg config.OidcConfig) *OidcValidator {
 	return &OidcValidator{
@@ -47,23 +53,32 @@ func (v *OidcValidator) Configured() bool { return strings.TrimSpace(v.cfg.JwkSe
 
 // Validate verifies an RS256 token and returns the subject claim, or "" if invalid.
 func (v *OidcValidator) Validate(ctx context.Context, token string) (string, bool) {
-	if !v.Configured() {
+	identity, ok := v.ValidateIdentity(ctx, token)
+	if !ok {
 		return "", false
+	}
+	return identity.Username, true
+}
+
+// ValidateIdentity verifies an RS256 token and returns the normalized username and tenant claim.
+func (v *OidcValidator) ValidateIdentity(ctx context.Context, token string) (OidcIdentity, bool) {
+	if !v.Configured() {
+		return OidcIdentity{}, false
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return "", false
+		return OidcIdentity{}, false
 	}
 	header, err := decodeJSONSegment(parts[0])
 	if err != nil || header["alg"] != "RS256" {
-		return "", false
+		return OidcIdentity{}, false
 	}
 	kid, _ := header["kid"].(string)
 
 	signingInput := parts[0] + "." + parts[1]
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
-		return "", false
+		return OidcIdentity{}, false
 	}
 
 	key := v.lookupKey(ctx, kid, false)
@@ -71,18 +86,25 @@ func (v *OidcValidator) Validate(ctx context.Context, token string) (string, boo
 		// Force-refresh once in case of key rotation.
 		key = v.lookupKey(ctx, kid, true)
 		if key == nil || !verifyRS256(key, signingInput, signature) {
-			return "", false
+			return OidcIdentity{}, false
 		}
 	}
 
 	claims, err := decodeJSONSegment(parts[1])
 	if err != nil {
-		return "", false
+		return OidcIdentity{}, false
 	}
 	if !v.validClaims(claims) {
-		return "", false
+		return OidcIdentity{}, false
 	}
-	return claimSubject(claims), true
+	username := claimSubject(claims)
+	if username == "" {
+		return OidcIdentity{}, false
+	}
+	return OidcIdentity{
+		Username: username,
+		TenantID: claimAsString(claims, tenantClaimName(v.cfg.TenantClaim)),
+	}, true
 }
 
 func (v *OidcValidator) validClaims(claims map[string]any) bool {
@@ -279,9 +301,31 @@ func audienceContains(aud any, want string) bool {
 
 func claimSubject(claims map[string]any) string {
 	for _, key := range []string{"preferred_username", "name", "sub"} {
-		if value, ok := claims[key].(string); ok && value != "" {
+		if value := claimAsString(claims, key); value != "" {
 			return value
 		}
 	}
 	return ""
+}
+
+func tenantClaimName(value string) string {
+	if normalized := strings.TrimSpace(value); normalized != "" {
+		return normalized
+	}
+	return "tenant_id"
+}
+
+func claimAsString(claims map[string]any, key string) string {
+	value, ok := claims[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case float64, bool:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	default:
+		return ""
+	}
 }

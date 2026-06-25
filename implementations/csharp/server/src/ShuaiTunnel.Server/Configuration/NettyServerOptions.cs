@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace ShuaiTunnel.Server.Configuration;
 
 /// <summary>
@@ -71,8 +73,26 @@ public sealed class AuthOptions
     public bool PasswordLoginEnabled { get; set; } = true;
     public string Username { get; set; } = "admin";
     public string Password { get; set; } = "admin";
+    public string TenantId { get; set; } = "default";
     public string? JwtSecret { get; set; }
     public int TokenTtlSeconds { get; set; } = 8 * 60 * 60;
+}
+
+public sealed class ClientAuthOptions
+{
+    public const string SectionName = "Tunnel:ClientAuth";
+
+    public int DefaultMaxOnlineInstances { get; set; } = 2;
+    public int PerMachineUserMaxInstances { get; set; } = 1;
+    public int TokenTtlSeconds { get; set; } = 8 * 60 * 60;
+}
+
+public sealed class ConnectionRecordOptions
+{
+    public const string SectionName = "Tunnel:ConnectionRecord";
+
+    public int DetailRetentionDays { get; set; } = 60;
+    public int ArchiveIntervalMs { get; set; } = 3_600_000;
 }
 
 public sealed class TrafficOptions
@@ -80,6 +100,72 @@ public sealed class TrafficOptions
     public const string SectionName = "Tunnel:Traffic";
 
     public int FlushIntervalMs { get; set; } = 5_000;
+    public bool CaptureDetailEnabled { get; set; } = true;
+    public int CapturePreviewBytes { get; set; } = 256;
+    public int CaptureHeaderChars { get; set; } = 8192;
+    public int CaptureMaxPending { get; set; } = 20_000;
+    public int CaptureFlushBatchSize { get; set; } = 1_000;
+    public int CaptureFlushIntervalMs { get; set; } = 2_000;
+}
+
+public sealed class ElasticsearchOptions
+{
+    public const string SectionName = "Tunnel:Elasticsearch";
+
+    public string Uris { get; set; } = string.Empty;
+    public string Username { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
+    public string ApiKey { get; set; } = string.Empty;
+    public string HttpIndex { get; set; } = "shuai-tunnel-http-traffic";
+    public string TcpIndex { get; set; } = "shuai-tunnel-tcp-traffic";
+    public string HttpMaxStoreSize { get; set; } = "100GB";
+    public string TcpMaxStoreSize { get; set; } = "10GB";
+
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(Uris);
+
+    public IReadOnlyList<Uri> EndpointUris() => Uris
+        .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+        .Select(value => new Uri(value.TrimEnd('/')))
+        .ToList();
+
+    public long HttpMaxStoreBytes => ParseDataSizeBytes(HttpMaxStoreSize, 100L * 1024 * 1024 * 1024);
+    public long TcpMaxStoreBytes => ParseDataSizeBytes(TcpMaxStoreSize, 10L * 1024 * 1024 * 1024);
+
+    private static long ParseDataSizeBytes(string? value, long fallback)
+    {
+        var normalized = (value ?? string.Empty).Trim().ToUpperInvariant();
+        if (normalized.Length == 0)
+        {
+            return fallback;
+        }
+
+        var multiplier = 1L;
+        foreach (var (suffix, factor) in new[]
+        {
+            ("KIB", 1024L),
+            ("MIB", 1024L * 1024),
+            ("GIB", 1024L * 1024 * 1024),
+            ("TIB", 1024L * 1024 * 1024 * 1024),
+            ("KB", 1024L),
+            ("MB", 1024L * 1024),
+            ("GB", 1024L * 1024 * 1024),
+            ("TB", 1024L * 1024 * 1024 * 1024),
+            ("B", 1L),
+        })
+        {
+            if (!normalized.EndsWith(suffix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            multiplier = factor;
+            normalized = normalized[..^suffix.Length].Trim();
+            break;
+        }
+
+        return long.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out var number) && number >= 0
+            ? number * multiplier
+            : fallback;
+    }
 }
 
 public sealed class DirectHttpOptions
@@ -88,6 +174,21 @@ public sealed class DirectHttpOptions
 
     public int TimeoutMs { get; set; } = 30_000;
     public int MaxRequestBodySize { get; set; } = 16 * 1024 * 1024;
+    public int RewriteMaxBodyBytes { get; set; } = 10 * 1024 * 1024;
+}
+
+public sealed class PeerMeshOptions
+{
+    public const string SectionName = "Tunnel:PeerMesh";
+
+    public bool Enabled { get; set; } = false;
+    public string Cidr { get; set; } = "100.96.0.0/11";
+    public string PublicAddress { get; set; } = string.Empty;
+    public int StunTurnPort { get; set; } = 3478;
+    public int NatProbeAlternatePort { get; set; } = 0;
+    public long SessionTtlSeconds { get; set; } = 3600;
+    public long AllocationTtlSeconds { get; set; } = 300;
+    public long SessionCleanupIntervalMs { get; set; } = 60000;
 }
 
 public sealed class OidcOptions
@@ -104,6 +205,7 @@ public sealed class OidcOptions
     public string RedirectUri { get; set; } = "http://127.0.0.1:8088/";
     public string Scope { get; set; } = "openid";
     public string Audience { get; set; } = string.Empty;
+    public string TenantClaim { get; set; } = "tenant_id";
 }
 
 /// <summary>

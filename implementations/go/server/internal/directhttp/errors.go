@@ -7,7 +7,6 @@ import (
 
 var (
 	errOffline = errors.New("客户端不在线")
-	errForward = errors.New("HTTP 转发请求失败")
 	errTimeout = errors.New("HTTP 转发请求超时")
 )
 

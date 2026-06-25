@@ -42,29 +42,33 @@ type Conn struct {
 	remoteAddress string
 	maxFrameSize  int
 
-	ReadGate *ReadGate
+	ReadGate          *ReadGate
+	WriteBackpressure *WriteBackpressureGate
 
 	reasonOnce sync.Once
 	reason     atomic.Value // string
 
 	clientName atomic.Value // string
+	tenantID   atomic.Value // string
 	loginTime  atomic.Int64
 	recordID   atomic.Int64
+	sessionID  atomic.Int64
 
 	lastReadUnixNano  atomic.Int64
 	lastWriteUnixNano atomic.Int64
 }
 
-func newConn(netConn net.Conn, maxFrameSize int, parent context.Context) *Conn {
+func newConn(netConn net.Conn, maxFrameSize, writeLowWaterMark, writeHighWaterMark int, parent context.Context) *Conn {
 	ctx, cancel := context.WithCancel(parent)
 	conn := &Conn{
-		netConn:      netConn,
-		writer:       bufio.NewWriter(netConn),
-		ctx:          ctx,
-		cancel:       cancel,
-		channelID:    newChannelID(),
-		maxFrameSize: maxFrameSize,
-		ReadGate:     NewReadGate(),
+		netConn:           netConn,
+		writer:            bufio.NewWriter(netConn),
+		ctx:               ctx,
+		cancel:            cancel,
+		channelID:         newChannelID(),
+		maxFrameSize:      maxFrameSize,
+		ReadGate:          NewReadGate(),
+		WriteBackpressure: NewWriteBackpressureGate(writeLowWaterMark, writeHighWaterMark),
 	}
 	if addr := netConn.RemoteAddr(); addr != nil {
 		conn.remoteAddress = addr.String()
@@ -98,18 +102,31 @@ func (c *Conn) ClientName() string {
 	return ""
 }
 
+// TenantID returns the authenticated tenant id, or "" before login.
+func (c *Conn) TenantID() string {
+	if v, ok := c.tenantID.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
 // LoginTimeMs returns the unix-ms login timestamp, or 0 before login.
 func (c *Conn) LoginTimeMs() int64 { return c.loginTime.Load() }
 
 // ConnectionRecordID returns the audit row id, or 0 if none.
 func (c *Conn) ConnectionRecordID() int64 { return c.recordID.Load() }
 
+// ClientSessionID returns the authenticated HTTP login session id, or 0 before login.
+func (c *Conn) ClientSessionID() int64 { return c.sessionID.Load() }
+
 // SetConnectionRecordID stores the audit row id.
 func (c *Conn) SetConnectionRecordID(id int64) { c.recordID.Store(id) }
 
 // OnLoginSuccess records the authenticated client name and login time.
-func (c *Conn) OnLoginSuccess(clientName string, loginTimeMs int64) {
+func (c *Conn) OnLoginSuccess(clientName string, tenantID string, clientSessionID int64, loginTimeMs int64) {
 	c.clientName.Store(clientName)
+	c.tenantID.Store(tenantID)
+	c.sessionID.Store(clientSessionID)
 	c.loginTime.Store(loginTimeMs)
 }
 
@@ -137,9 +154,16 @@ func (c *Conn) Close(reason string) {
 // Send serializes and writes a packet, updating the write-idle timestamp. It is safe to call
 // from multiple goroutines.
 func (c *Conn) Send(packet protocol.Packet) error {
+	frame, err := protocol.EncodeFrame(packet)
+	if err != nil {
+		return err
+	}
+	trackedBytes := c.WriteBackpressure.AddPending(len(frame))
+	defer c.WriteBackpressure.ReleasePending(trackedBytes)
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if err := protocol.WritePacket(c.writer, packet); err != nil {
+	if _, err := c.writer.Write(frame); err != nil {
 		return err
 	}
 	if err := c.writer.Flush(); err != nil {

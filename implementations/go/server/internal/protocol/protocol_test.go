@@ -37,8 +37,8 @@ func decodeFixture(t *testing.T, name string, byteExact bool) Packet {
 			t.Fatalf("%s: re-encoded bytes differ\n want %x\n got  %x", name, raw, encoded)
 		}
 	} else {
-		// Deflate-compressed fixtures cannot match byte-for-byte (Go's compress/flate emits
-		// different bytes than Java/.NET zlib) but inflate identically, so they interoperate.
+		// Deflate-compressed fixtures cannot match byte-for-byte across implementations even
+		// though they all use raw deflate and inflate identically, so they interoperate.
 		// Verify Go's own encode->decode is lossless instead.
 		encoded, err := EncodeFrame(packet)
 		if err != nil {
@@ -77,6 +77,34 @@ func TestLoginRequestFixture(t *testing.T) {
 	}
 }
 
+func TestZeroClientSessionIDEncodesAsNonNullLongLikeJava(t *testing.T) {
+	encoded, err := EncodeBody(LoginRequest{ClientName: "go-client", ClientSessionID: 0, AccessToken: "token"})
+	if err != nil {
+		t.Fatalf("EncodeBody() error = %v", err)
+	}
+	input, err := newCompactInput(encoded)
+	if err != nil {
+		t.Fatalf("newCompactInput() error = %v", err)
+	}
+	if _, err := input.readString(); err != nil {
+		t.Fatalf("clientName read error = %v", err)
+	}
+	marker, err := input.readByte()
+	if err != nil {
+		t.Fatalf("session marker read error = %v", err)
+	}
+	if marker != 1 {
+		t.Fatalf("zero clientSessionId marker = %d, want Java non-null long marker 1", marker)
+	}
+	value, err := input.readVarLong()
+	if err != nil {
+		t.Fatalf("session value read error = %v", err)
+	}
+	if value != 0 {
+		t.Fatalf("zero clientSessionId zigzag value = %d, want 0", value)
+	}
+}
+
 func TestLoginResponseFixtures(t *testing.T) {
 	ok := decodeFixture(t, "login_response.bin", true).(LoginResponse)
 	if ok.ClientName != "Demo client" || !ok.Success || ok.Reason != nil {
@@ -109,12 +137,60 @@ func TestMessageRequestFixture(t *testing.T) {
 	}
 }
 
+func TestPeerControlMessageRequestRoundtrip(t *testing.T) {
+	expected := MessageRequest{
+		ClientName:   "go-client",
+		ToClientName: "",
+		MessageType:  MessageTypePeerControl,
+		Message:      `{"type":"device-report"}`,
+	}
+	encoded, err := EncodeFrame(expected)
+	if err != nil {
+		t.Fatalf("encode peer control: %v", err)
+	}
+	decoded, consumed, err := DecodeFrame(encoded)
+	if err != nil {
+		t.Fatalf("decode peer control: %v", err)
+	}
+	if consumed != len(encoded) {
+		t.Fatalf("consumed %d of %d bytes", consumed, len(encoded))
+	}
+	got := decoded.(MessageRequest)
+	if got != expected {
+		t.Fatalf("peer control roundtrip = %+v, want %+v", got, expected)
+	}
+}
+
 func TestMessageResponseFixture(t *testing.T) {
 	packet := decodeFixture(t, "message_response.bin", false).(MessageResponse)
 	if packet.ClientName != "admin" || packet.ToClientName != "Demo client" ||
 		packet.MessageType != MessageTypeNatControl ||
 		packet.Message != `{"clientName":"Demo client","remotePort":7010}` {
 		t.Fatalf("unexpected message response: %+v", packet)
+	}
+}
+
+func TestPeerControlMessageResponseRoundtrip(t *testing.T) {
+	expected := MessageResponse{
+		ClientName:   "server",
+		ToClientName: "go-client",
+		MessageType:  MessageTypePeerControl,
+		Message:      `{"type":"roster","peers":[]}`,
+	}
+	encoded, err := EncodeFrame(expected)
+	if err != nil {
+		t.Fatalf("encode peer control response: %v", err)
+	}
+	decoded, consumed, err := DecodeFrame(encoded)
+	if err != nil {
+		t.Fatalf("decode peer control response: %v", err)
+	}
+	if consumed != len(encoded) {
+		t.Fatalf("consumed %d of %d bytes", consumed, len(encoded))
+	}
+	got := decoded.(MessageResponse)
+	if got != expected {
+		t.Fatalf("peer control response roundtrip = %+v, want %+v", got, expected)
 	}
 }
 
@@ -166,6 +242,154 @@ func TestDirectHTTPResponseFixture(t *testing.T) {
 	}
 	if string(packet.Body) != `{"ok":true}` || packet.Error != nil {
 		t.Fatalf("unexpected body/error: %q / %v", packet.Body, packet.Error)
+	}
+}
+
+func TestUUIDCodecPreservesNonCanonicalCaseLikeJava(t *testing.T) {
+	expected := DirectHTTPRequest{
+		RequestID:     "8B284FEF-0987-4948-AC66-7F2059336989",
+		RequestMethod: "GET",
+		Route:         "api",
+		RelativePath:  "/socket",
+	}
+	encoded, err := EncodeFrame(expected)
+	if err != nil {
+		t.Fatalf("EncodeFrame() error = %v", err)
+	}
+	decoded, consumed, err := DecodeFrame(encoded)
+	if err != nil {
+		t.Fatalf("DecodeFrame() error = %v", err)
+	}
+	if consumed != len(encoded) {
+		t.Fatalf("consumed %d of %d bytes", consumed, len(encoded))
+	}
+	actual := decoded.(DirectHTTPRequest)
+	if actual.RequestID != expected.RequestID {
+		t.Fatalf("RequestID = %q, want %q", actual.RequestID, expected.RequestID)
+	}
+}
+
+func TestHTTPMethodCodecPreservesNonCanonicalCaseLikeJava(t *testing.T) {
+	expected := DirectHTTPRequest{
+		RequestID:     "8b284fef-0987-4948-ac66-7f2059336989",
+		RequestMethod: "get",
+		Route:         "api",
+		RelativePath:  "/socket",
+	}
+	encoded, err := EncodeFrame(expected)
+	if err != nil {
+		t.Fatalf("EncodeFrame() error = %v", err)
+	}
+	decoded, consumed, err := DecodeFrame(encoded)
+	if err != nil {
+		t.Fatalf("DecodeFrame() error = %v", err)
+	}
+	if consumed != len(encoded) {
+		t.Fatalf("consumed %d of %d bytes", consumed, len(encoded))
+	}
+	actual := decoded.(DirectHTTPRequest)
+	if actual.RequestMethod != expected.RequestMethod {
+		t.Fatalf("RequestMethod = %q, want %q", actual.RequestMethod, expected.RequestMethod)
+	}
+}
+
+func TestEmptyUUIDAndHTTPMethodEncodeAsStringsLikeJava(t *testing.T) {
+	encoded, err := EncodeBody(DirectHTTPRequest{
+		RequestID:     "",
+		RequestMethod: "",
+		Route:         "api",
+		RelativePath:  "/socket",
+	})
+	if err != nil {
+		t.Fatalf("EncodeBody() error = %v", err)
+	}
+	input, err := newCompactInput(encoded)
+	if err != nil {
+		t.Fatalf("newCompactInput() error = %v", err)
+	}
+	uuidMarker, err := input.readByte()
+	if err != nil {
+		t.Fatalf("uuid marker read error = %v", err)
+	}
+	if uuidMarker != 2 {
+		t.Fatalf("empty UUID marker = %d, want Java string marker 2", uuidMarker)
+	}
+	uuidValue, err := input.readString()
+	if err != nil {
+		t.Fatalf("uuid string read error = %v", err)
+	}
+	if uuidValue != "" {
+		t.Fatalf("empty UUID string = %q, want empty", uuidValue)
+	}
+	methodMarker, err := input.readByte()
+	if err != nil {
+		t.Fatalf("method marker read error = %v", err)
+	}
+	if methodMarker != 5 {
+		t.Fatalf("empty HTTP method marker = %d, want Java string marker 5", methodMarker)
+	}
+	methodValue, err := input.readString()
+	if err != nil {
+		t.Fatalf("method string read error = %v", err)
+	}
+	if methodValue != "" {
+		t.Fatalf("empty HTTP method string = %q, want empty", methodValue)
+	}
+}
+
+func TestNilAndEmptyCollectionsUseJavaMarkers(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		headers       []string
+		body          []byte
+		wantHeaders   int
+		wantBodyBytes int
+	}{
+		{name: "nil", headers: nil, body: nil, wantHeaders: 0, wantBodyBytes: 0},
+		{name: "empty", headers: []string{}, body: []byte{}, wantHeaders: 1, wantBodyBytes: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := EncodeBody(DirectHTTPRequest{
+				RequestID:     "8b284fef-0987-4948-ac66-7f2059336989",
+				RequestMethod: "GET",
+				Route:         "api",
+				RelativePath:  "/socket",
+				Headers:       tc.headers,
+				Body:          tc.body,
+			})
+			if err != nil {
+				t.Fatalf("EncodeBody() error = %v", err)
+			}
+			input, err := newCompactInput(encoded)
+			if err != nil {
+				t.Fatalf("newCompactInput() error = %v", err)
+			}
+			if _, err := input.readUUIDString(); err != nil {
+				t.Fatalf("uuid read error = %v", err)
+			}
+			if _, err := input.readHTTPMethod(); err != nil {
+				t.Fatalf("method read error = %v", err)
+			}
+			for _, field := range []string{"route", "relativePath", "rawQuery"} {
+				if _, err := input.readString(); err != nil {
+					t.Fatalf("%s read error = %v", field, err)
+				}
+			}
+			headersMarker, err := input.readVarInt()
+			if err != nil {
+				t.Fatalf("headers marker read error = %v", err)
+			}
+			if headersMarker != tc.wantHeaders {
+				t.Fatalf("headers marker = %d, want %d", headersMarker, tc.wantHeaders)
+			}
+			bodyMarker, err := input.readVarInt()
+			if err != nil {
+				t.Fatalf("body marker read error = %v", err)
+			}
+			if bodyMarker != tc.wantBodyBytes {
+				t.Fatalf("body marker = %d, want %d", bodyMarker, tc.wantBodyBytes)
+			}
+		})
 	}
 }
 

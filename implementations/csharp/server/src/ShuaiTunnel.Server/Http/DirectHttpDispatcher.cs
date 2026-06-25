@@ -39,7 +39,25 @@ public sealed class DirectHttpDispatcher
 
         try
         {
-            await context.Writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await context.Writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[http-direct] request {RequestId} write failed", requestId);
+                return new DirectHttpResponsePacket
+                {
+                    RequestId = requestId,
+                    StatusCode = StatusCodes.Status502BadGateway,
+                    Error = "HTTP 转发请求发送失败",
+                };
+            }
+
             return await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(Math.Max(1, _options.TimeoutMs)),
                     cancellationToken)
                 .ConfigureAwait(false);

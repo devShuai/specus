@@ -8,6 +8,7 @@ using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.PeerMesh;
 
 namespace ShuaiTunnel.Server.Authentication;
 
@@ -25,22 +26,24 @@ public sealed class ClientAccountService
     public const string StatusNettyOnline = "NETTY_ONLINE";
     public const string StatusDisconnected = "DISCONNECTED";
     private const string DefaultTenantId = "default";
-    private const int PerMachineUserMaxInstances = 1;
 
     private readonly TunnelDbContext _db;
     private readonly ClientAuthSessionStore _sessionStore;
     private readonly NettyServerOptions _netty;
-    private readonly AuthOptions _auth;
+    private readonly ClientAuthOptions _clientAuth;
     private readonly TunnelOptions _tunnel;
+    private readonly PeerMeshService _peerMesh;
 
     public ClientAccountService(TunnelDbContext db, ClientAuthSessionStore sessionStore,
-        IOptions<NettyServerOptions> netty, IOptions<AuthOptions> auth, IOptions<TunnelOptions> tunnel)
+        IOptions<NettyServerOptions> netty, IOptions<ClientAuthOptions> clientAuth, IOptions<TunnelOptions> tunnel,
+        PeerMeshService peerMesh)
     {
         _db = db;
         _sessionStore = sessionStore;
         _netty = netty.Value;
-        _auth = auth.Value;
+        _clientAuth = clientAuth.Value;
         _tunnel = tunnel.Value;
+        _peerMesh = peerMesh;
     }
 
     public async Task<ClientAuthLoginResponse> LoginAsync(
@@ -67,7 +70,7 @@ public sealed class ClientAccountService
 
         await CloseStaleHttpAuthenticatedSessionsAsync(credential, environment, cancellationToken)
             .ConfigureAwait(false);
-        var ttlSeconds = _auth.TokenTtlSeconds <= 0 ? 8 * 60 * 60 : _auth.TokenTtlSeconds;
+        var ttlSeconds = _clientAuth.TokenTtlSeconds <= 0 ? 8 * 60 * 60 : _clientAuth.TokenTtlSeconds;
         var session = _sessionStore.Create(credential, identity, account, TimeSpan.FromSeconds(ttlSeconds), environment);
         _db.ClientSessions.Add(ToSessionEntity(session, environment));
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -104,6 +107,9 @@ public sealed class ClientAccountService
                     TargetBaseUrl = r.TargetBaseUrl,
                 })
                 .ToListAsync(cancellationToken)
+                .ConfigureAwait(false),
+            PeerMesh = await _peerMesh.BuildLoginConfigAsync(account, environment, requestServerName,
+                    cancellationToken)
                 .ConfigureAwait(false),
         };
     }
@@ -161,6 +167,10 @@ public sealed class ClientAccountService
             .ConfigureAwait(false);
         return AuthenticationResult.Pass(account);
     }
+
+    private int PerMachineUserMaxInstances => _clientAuth.PerMachineUserMaxInstances <= 0
+        ? 1
+        : _clientAuth.PerMachineUserMaxInstances;
 
     private async Task<bool> ExceedsRateLimitAsync(long clientId, int limit, CancellationToken ct)
     {

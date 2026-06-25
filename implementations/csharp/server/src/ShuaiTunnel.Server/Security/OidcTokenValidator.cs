@@ -113,6 +113,10 @@ public sealed class OidcTokenValidator
         {
             identity.AddClaim(new Claim("iss", payload.Issuer));
         }
+        if (!string.IsNullOrWhiteSpace(payload.TenantId))
+        {
+            identity.AddClaim(new Claim("tenant_id", payload.TenantId));
+        }
         foreach (var audience in payload.Audiences)
         {
             identity.AddClaim(new Claim("aud", audience));
@@ -221,21 +225,22 @@ public sealed class OidcTokenValidator
             root.TryGetProperty("kid", out var kid) ? kid.GetString() : null);
     }
 
-    private static TokenPayload ReadPayload(string encoded)
+    private TokenPayload ReadPayload(string encoded)
     {
         using var document = JsonDocument.Parse(JwtTokenUtility.Base64UrlDecode(encoded));
         var root = document.RootElement;
-        var subject = ReadString(root, "sub") ?? string.Empty;
-        var name = ReadString(root, "preferred_username")
-            ?? ReadString(root, "name")
+        var subject = ReadClaimAsString(root, "sub") ?? string.Empty;
+        var name = ReadClaimAsString(root, "preferred_username")
+            ?? ReadClaimAsString(root, "name")
             ?? subject;
         return new TokenPayload(
-            ReadString(root, "iss"),
+            ReadClaimAsString(root, "iss"),
             subject,
             name,
             ReadAudiences(root),
             ReadUnixTime(root, "exp"),
-            ReadUnixTime(root, "nbf"));
+            ReadUnixTime(root, "nbf"),
+            ReadClaimAsString(root, TenantClaimName(_options.TenantClaim)));
     }
 
     private static IReadOnlyList<RsaJwk> ParseJwks(string body)
@@ -280,6 +285,26 @@ public sealed class OidcTokenValidator
         element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
             ? property.GetString()
             : null;
+
+    private static string TenantClaimName(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? "tenant_id" : value.Trim();
+
+    private static string? ReadClaimAsString(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return null;
+        }
+
+        return property.ValueKind switch
+        {
+            JsonValueKind.String => string.IsNullOrWhiteSpace(property.GetString())
+                ? null
+                : property.GetString()!.Trim(),
+            JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False => property.GetRawText(),
+            _ => null,
+        };
+    }
 
     private static IReadOnlyList<string> ReadAudiences(JsonElement root)
     {
@@ -336,7 +361,8 @@ public sealed class OidcTokenValidator
         string? Name,
         IReadOnlyList<string> Audiences,
         DateTimeOffset? ExpiresAt,
-        DateTimeOffset? NotBefore);
+        DateTimeOffset? NotBefore,
+        string? TenantId);
 
     private sealed record RsaJwk(string? KeyId, byte[] Modulus, byte[] Exponent);
 }

@@ -3,7 +3,9 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
@@ -138,6 +140,34 @@ public sealed class Phase5SecurityTests
     }
 
     [Fact]
+    public async Task OidcRs256BearerUsesConfiguredTenantClaim()
+    {
+        using var rsa = RSA.Create(2048);
+        var token = CreateOidcToken(rsa, "tenant-key", tenantClaimName: "org_id", tenantId: "tenant-oidc");
+        var jwks = CreateJwks(rsa, "tenant-key");
+        await using var server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
+        {
+            ["Tunnel:Auth:TenantId"] = "default",
+            ["Tunnel:Oidc:Issuer"] = "https://issuer.example",
+            ["Tunnel:Oidc:Audience"] = "admin-api",
+            ["Tunnel:Oidc:JwkSetUri"] = "https://issuer.example/jwks",
+            ["Tunnel:Oidc:TenantClaim"] = "org_id",
+        }, services =>
+        {
+            services.RemoveAll<IOidcJwkProvider>();
+            services.AddSingleton<IOidcJwkProvider>(new StaticOidcJwkProvider(jwks));
+        });
+        using var client = server.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var me = await client.GetFromJsonAsync<CurrentUserBody>("/api/admin/me", JsonOptions);
+
+        Assert.NotNull(me);
+        Assert.Equal("oidc-user@example.com", me!.Username);
+        Assert.Equal("tenant-oidc", me.TenantId);
+    }
+
+    [Fact]
     public async Task SelfSignedTlsModeAcceptsControlChannelSslHandshake()
     {
         await using var server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
@@ -147,10 +177,15 @@ public sealed class Phase5SecurityTests
 
         using var tcp = new TcpClient();
         await tcp.ConnectAsync(IPAddress.Loopback, server.ControlPort);
-        using var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false,
-            (_, _, _, _) => true);
+        using var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
 
-        await ssl.AuthenticateAsClientAsync("localhost");
+        await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        {
+            TargetHost = "localhost",
+            EnabledSslProtocols = SslProtocols.Tls12,
+            CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+            RemoteCertificateValidationCallback = (_, _, _, _) => true,
+        });
 
         Assert.True(ssl.IsAuthenticated);
         Assert.True(ssl.IsEncrypted);
@@ -164,7 +199,8 @@ public sealed class Phase5SecurityTests
         ["Tunnel:Oidc:RedirectUri"] = "http://127.0.0.1:8088/callback",
     };
 
-    private static string CreateOidcToken(RSA rsa, string keyId)
+    private static string CreateOidcToken(RSA rsa, string keyId,
+        string? tenantClaimName = null, string? tenantId = null)
     {
         var now = DateTimeOffset.UtcNow;
         var header = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(new
@@ -173,15 +209,20 @@ public sealed class Phase5SecurityTests
             typ = "JWT",
             kid = keyId,
         }, JsonOptions));
-        var payload = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(new
+        var payloadValues = new Dictionary<string, object?>
         {
-            iss = "https://issuer.example",
-            sub = "oidc-user",
-            preferred_username = "oidc-user@example.com",
-            aud = new[] { "admin-api" },
-            iat = now.ToUnixTimeSeconds(),
-            exp = now.AddMinutes(10).ToUnixTimeSeconds(),
-        }, JsonOptions));
+            ["iss"] = "https://issuer.example",
+            ["sub"] = "oidc-user",
+            ["preferred_username"] = "oidc-user@example.com",
+            ["aud"] = new[] { "admin-api" },
+            ["iat"] = now.ToUnixTimeSeconds(),
+            ["exp"] = now.AddMinutes(10).ToUnixTimeSeconds(),
+        };
+        if (!string.IsNullOrWhiteSpace(tenantClaimName))
+        {
+            payloadValues[tenantClaimName] = tenantId;
+        }
+        var payload = Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(payloadValues, JsonOptions));
         var signingInput = $"{header}.{payload}";
         var signature = rsa.SignData(Encoding.ASCII.GetBytes(signingInput),
             HashAlgorithmName.SHA256,
@@ -251,6 +292,14 @@ public sealed class Phase5SecurityTests
         string RedirectUri,
         string Scope,
         bool PasswordLoginEnabled);
+
+    private sealed record CurrentUserBody(
+        string Username,
+        string TenantId,
+        string Role,
+        bool Admin,
+        bool BuiltIn,
+        bool Enabled);
 
     private sealed record OidcTokenBody(
         string? AccessToken,

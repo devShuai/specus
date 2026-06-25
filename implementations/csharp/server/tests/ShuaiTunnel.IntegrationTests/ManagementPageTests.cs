@@ -32,7 +32,7 @@ public sealed class ManagementPageTests : IAsyncLifetime
         var index = await client.GetAsync("/");
         index.EnsureSuccessStatusCode();
         var html = await index.Content.ReadAsStringAsync();
-        Assert.Contains("shuai-tunnel 管理后台", html);
+        Assert.Contains("自托管内网穿透控制面", html);
         Assert.Equal("nosniff", index.Headers.GetValues("X-Content-Type-Options").Single());
         Assert.Contains("script-src 'self'", index.Headers.GetValues("Content-Security-Policy").Single());
 
@@ -60,6 +60,7 @@ public sealed class ManagementPageTests : IAsyncLifetime
         var body = await response.Content.ReadFromJsonAsync<DatabaseInitializeBody>(JsonOptions);
         Assert.NotNull(body);
         Assert.True(body!.Initialized);
+        Assert.Equal("default", body.TenantId);
         Assert.Equal("entity-framework-core", body.Orm);
         Assert.Equal("sqlite", body.Dialect);
         Assert.True(body.Clients >= 1);
@@ -80,5 +81,5 @@ public sealed class ManagementPageTests : IAsyncLifetime
 
     private sealed record TokenBody(string AccessToken, string TokenType, long ExpiresIn);
 
-    private sealed record DatabaseInitializeBody(bool Initialized, string Orm, string Dialect, long Clients);
+    private sealed record DatabaseInitializeBody(bool Initialized, string TenantId, string Orm, string Dialect, long Clients);
 }

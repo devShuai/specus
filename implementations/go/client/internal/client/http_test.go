@@ -26,6 +26,45 @@ func TestBuildTargetRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestBuildTargetErrorsUseJavaMessages(t *testing.T) {
+	tests := []struct {
+		name        string
+		targetBase  string
+		relativeURL string
+		want        string
+	}{
+		{name: "missing route", targetBase: "", relativeURL: "/", want: "未配置 HTTP route"},
+		{name: "unsupported scheme", targetBase: "ftp://example.com/base", relativeURL: "/", want: "HTTP route 仅支持 http 和 https"},
+		{name: "invalid base", targetBase: "https://example.com/base?x=1", relativeURL: "/", want: "HTTP route 地址无效"},
+		{name: "invalid path", targetBase: "https://example.com/base", relativeURL: "api", want: "HTTP 转发路径无效"},
+		{name: "path traversal", targetBase: "https://example.com/base", relativeURL: "/../secret", want: "HTTP 转发路径越界"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := buildTarget(tc.targetBase, tc.relativeURL, "")
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("buildTarget() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildTargetRejectsEncodedTraversalLikeJava(t *testing.T) {
+	if _, err := buildTarget("https://example.com/base", "/v1/%2e%2e/secret", ""); err == nil {
+		t.Fatal("buildTarget() accepted an encoded traversal path")
+	}
+}
+
+func TestBuildTargetAcceptsDoubleSlashPathLikeJava(t *testing.T) {
+	target, err := buildTarget("https://example.com/base", "//assets/app.js", "")
+	if err != nil {
+		t.Fatalf("buildTarget() error = %v", err)
+	}
+	if actual := target.String(); actual != "https://example.com/base//assets/app.js" {
+		t.Fatalf("buildTarget() = %q", actual)
+	}
+}
+
 func TestExecuteDirectHTTP(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if actual := request.Header.Get("X-Tunnel-Test"); actual != "demo" {
@@ -52,12 +91,93 @@ func TestExecuteDirectHTTP(t *testing.T) {
 		Headers:   []string{"X-Tunnel-Test:demo", "Host:ignored"},
 		Body:      []byte("request"),
 	})
-	if response.Error != "" || response.StatusCode != http.StatusCreated || string(response.Body) != "response" {
+	if response.Error != nil || response.StatusCode != http.StatusCreated || string(response.Body) != "response" {
 		t.Fatalf("executeDirectHTTP() = %#v", response)
 	}
 	if len(response.Headers) != 3 && len(response.Headers) != 4 {
 		t.Fatalf("response headers = %#v", response.Headers)
 	}
+}
+
+func TestExecuteDirectHTTPTrustsSelfSignedHTTPS(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusOK)
+		_, _ = response.Write([]byte("secure"))
+	}))
+	defer upstream.Close()
+
+	tunnelClient := New(Config{}, nil)
+	tunnelClient.applyRuntime(RuntimeConfig{
+		ClientName:           "Demo client",
+		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "secure", TargetBaseURL: upstream.URL}},
+	})
+	response := tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
+		RequestID: "8b284fef-0987-4948-ac66-7f2059336992",
+		Method:    http.MethodGet,
+		Route:     "secure",
+	})
+	if response.Error != nil || response.StatusCode != http.StatusOK || string(response.Body) != "secure" {
+		t.Fatalf("executeDirectHTTP() = %#v", response)
+	}
+}
+
+func TestExecuteDirectHTTPBoundsRange(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if actual := request.Header.Get("Range"); actual != "bytes=0-8388607" {
+			t.Errorf("Range = %q", actual)
+		}
+		response.WriteHeader(http.StatusPartialContent)
+		_, _ = response.Write([]byte("range"))
+	}))
+	defer upstream.Close()
+
+	tunnelClient := New(Config{}, nil)
+	tunnelClient.applyRuntime(RuntimeConfig{
+		ClientName:           "Demo client",
+		HTTPTunnelConfigList: []HTTPTunnelConfig{{Route: "web", TargetBaseURL: upstream.URL}},
+	})
+	response := tunnelClient.executeDirectHTTP(protocol.DirectHTTPRequest{
+		RequestID: "8b284fef-0987-4948-ac66-7f2059336993",
+		Method:    http.MethodGet,
+		Route:     "web",
+		Headers:   []string{"Range:bytes=0-"},
+	})
+	if response.Error != nil || response.StatusCode != http.StatusPartialContent || string(response.Body) != "range" {
+		t.Fatalf("executeDirectHTTP() = %#v", response)
+	}
+}
+
+func TestBoundedRange(t *testing.T) {
+	tests := map[string]string{
+		"bytes=0-":          "bytes=0-8388607",
+		"bytes=10-20":       "bytes=10-20",
+		"bytes=10-99999999": "bytes=10-8388617",
+		"bytes=-99999999":   "bytes=-8388608",
+		"bytes=20-10":       "",
+		"bytes=0-1,2-3":     "",
+		"items=0-10":        "",
+	}
+	for input, expected := range tests {
+		if actual := boundedRange(input); actual != expected {
+			t.Fatalf("boundedRange(%q) = %q, want %q", input, actual, expected)
+		}
+	}
+}
+
+func TestReadLimitedBodyErrorUsesJavaMessage(t *testing.T) {
+	_, err := readLimitedBody(io.LimitReader(repeatingReader{}, maxHTTPResponseBodySize+1))
+	if err == nil || err.Error() != "HTTP 响应体超过限制" {
+		t.Fatalf("readLimitedBody() error = %v, want Java message", err)
+	}
+}
+
+type repeatingReader struct{}
+
+func (repeatingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
 }
 
 func TestSyncHTTPTunnelConfigsUpdatesDirectHTTPRoutes(t *testing.T) {
@@ -100,7 +220,7 @@ func TestSyncHTTPTunnelConfigsUpdatesDirectHTTPRoutes(t *testing.T) {
 		Method:    http.MethodGet,
 		Route:     "web",
 	})
-	if response.StatusCode != http.StatusBadGateway || response.Error == "" {
+	if response.StatusCode != http.StatusBadGateway || response.Error == nil || *response.Error == "" {
 		t.Fatalf("cleared response = %#v", response)
 	}
 }

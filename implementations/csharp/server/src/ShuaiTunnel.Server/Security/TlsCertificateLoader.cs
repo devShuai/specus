@@ -1,3 +1,4 @@
+using System.Net;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Options;
@@ -32,7 +33,8 @@ public sealed class ControlChannelTlsProvider
 
 public static class TlsCertificateLoader
 {
-    private const X509KeyStorageFlags ServerKeyStorageFlags = X509KeyStorageFlags.Exportable;
+    private const X509KeyStorageFlags ServerKeyStorageFlags =
+        X509KeyStorageFlags.Exportable | X509KeyStorageFlags.UserKeySet;
 
     public static X509Certificate2? LoadServerCertificate(TlsOptions options) => options.ResolveMode() switch
     {
@@ -95,6 +97,17 @@ public static class TlsCertificateLoader
         request.CertificateExtensions.Add(new X509KeyUsageExtension(
             X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
             critical: true));
+        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+            new OidCollection
+            {
+                new Oid("1.3.6.1.5.5.7.3.1", "Server Authentication"),
+            },
+            critical: false));
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddDnsName("localhost");
+        san.AddIpAddress(IPAddress.Loopback);
+        san.AddIpAddress(IPAddress.IPv6Loopback);
+        request.CertificateExtensions.Add(san.Build());
         request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
 
         using var certificate = request.CreateSelfSigned(

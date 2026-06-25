@@ -10,6 +10,7 @@ namespace ShuaiTunnel.Server.Data.Entities;
 public sealed class ConnectionRecord
 {
     public long Id { get; set; }
+    public string? TenantId { get; set; } = "default";
     public long? ClientId { get; set; }
     public string ClientName { get; set; } = string.Empty;
     public string? ChannelId { get; set; }

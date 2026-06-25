@@ -1,11 +1,13 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Http;
 using ShuaiTunnel.Server.Nat;
+using ShuaiTunnel.Server.PeerMesh;
 using ShuaiTunnel.Server.Sessions;
 
 namespace ShuaiTunnel.Server.Services;
@@ -80,6 +82,14 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 return;
             case DirectHttpResponsePacket response:
                 _directHttp.Ack(response);
+                return;
+            case MessageRequestPacket message when message.MessageType == MessageType.PeerControl:
+                await using (var scope = _services.CreateAsyncScope())
+                {
+                    var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
+                    await peerMesh.HandleSignalAsync(message, context.ClientName!, context.Lifetime)
+                        .ConfigureAwait(false);
+                }
                 return;
             default:
                 // MESSAGE_* and future packet types are known on the wire but not meaningful to
@@ -218,6 +228,12 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 var natControl = scope.ServiceProvider.GetRequiredService<NatControlService>();
                 await natControl.PushOnLoginAsync(packet.ClientName!, context.Lifetime)
                     .ConfigureAwait(false);
+                var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
+                if (result.Account is not null)
+                {
+                    await peerMesh.PushConfigAsync(result.Account, context.Lifetime).ConfigureAwait(false);
+                    await peerMesh.PushRosterAsync(result.Account, context.Lifetime).ConfigureAwait(false);
+                }
             }
             catch (OperationCanceledException)
             {

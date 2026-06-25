@@ -21,6 +21,7 @@ internal sealed class FrameWriter : IAsyncDisposable
     private bool _backpressured;
 
     public event Action<bool>? WritabilityChanged;
+    public event Action? PacketWritten;
 
     public FrameWriter(Stream stream)
     {
@@ -41,6 +42,7 @@ internal sealed class FrameWriter : IAsyncDisposable
             {
                 await _stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
                 await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                PacketWritten?.Invoke();
             }
             finally
             {

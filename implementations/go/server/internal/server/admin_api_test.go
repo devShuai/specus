@@ -9,12 +9,25 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
 )
 
 // newAPIServer boots an App and wraps its management handler in an httptest.Server.
 func newAPIServer(t *testing.T) (*App, *httptest.Server) {
 	t.Helper()
 	app, _ := startTestApp(t)
+	return newHTTPTestServer(t, app)
+}
+
+func newAPIServerWithConfig(t *testing.T, cfg config.Config) (*App, *httptest.Server) {
+	t.Helper()
+	app, _ := startTestAppWithConfig(t, cfg)
+	return newHTTPTestServer(t, app)
+}
+
+func newHTTPTestServer(t *testing.T, app *App) (*App, *httptest.Server) {
+	t.Helper()
 	ts := httptest.NewServer(app.managementHandler())
 	t.Cleanup(ts.Close)
 	return app, ts
@@ -22,7 +35,12 @@ func newAPIServer(t *testing.T) (*App, *httptest.Server) {
 
 func adminToken(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"username": "admin", "password": "admin"})
+	return loginToken(t, ts, "admin", "admin")
+}
+
+func loginToken(t *testing.T, ts *httptest.Server, username, password string) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
 	resp, err := http.Post(ts.URL+"/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("login: %v", err)
@@ -132,12 +150,19 @@ func TestClientAndTunnelCrud(t *testing.T) {
 	}
 
 	// Create a tunnel for the client.
-	tunnelBody := `{"listenPort":45999,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true}`
+	tunnelBody := `{"listenPort":45999,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true,"detailCaptureEnabled":true}`
 	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/tunnels", token, tunnelBody)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create tunnel status %d", resp.StatusCode)
 	}
+	var tunnel struct {
+		DetailCaptureEnabled bool `json:"detailCaptureEnabled"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&tunnel)
 	resp.Body.Close()
+	if !tunnel.DetailCaptureEnabled {
+		t.Fatalf("expected detail capture enabled in tunnel response")
+	}
 
 	// nat-control push should 409 because the client is offline.
 	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/nat-control", token, "")
@@ -170,9 +195,247 @@ func TestHTTPRouteValidation(t *testing.T) {
 
 	// Valid route -> 201.
 	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(demo.ID)+"/http-routes", token,
-		`{"route":"api","targetBaseUrl":"https://example.com/base","enabled":true}`)
+		`{"route":"api","targetBaseUrl":"https://example.com/base","enabled":true,"detailCaptureEnabled":true,"pathRewriteEnabled":true}`)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 for valid route, got %d", resp.StatusCode)
+	}
+	var route struct {
+		DetailCaptureEnabled bool `json:"detailCaptureEnabled"`
+		PathRewriteEnabled   bool `json:"pathRewriteEnabled"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&route)
+	resp.Body.Close()
+	if !route.DetailCaptureEnabled || !route.PathRewriteEnabled {
+		t.Fatalf("expected route capture/rewrite flags enabled: %+v", route)
+	}
+}
+
+func TestManagementUsersAndOwnerScope(t *testing.T) {
+	_, ts := newAPIServer(t)
+	admin := adminToken(t, ts)
+
+	resp := authRequest(t, ts, http.MethodPost, "/api/admin/database/initialize", admin, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin initialize status %d", resp.StatusCode)
+	}
+	var initializeBody struct {
+		Initialized bool   `json:"initialized"`
+		TenantID    string `json:"tenantId"`
+		Orm         string `json:"orm"`
+		Dialect     string `json:"dialect"`
+		Clients     int64  `json:"clients"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&initializeBody)
+	resp.Body.Close()
+	if !initializeBody.Initialized || initializeBody.TenantID != "default" ||
+		initializeBody.Orm != "database/sql" || initializeBody.Dialect == "" || initializeBody.Clients < 1 {
+		t.Fatalf("unexpected initialize body: %+v", initializeBody)
+	}
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/users", admin,
+		`{"username":"alice","password":"alice-password","role":"USER","enabled":true}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create user status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	alice := loginToken(t, ts, "alice", "alice-password")
+
+	resp = authRequest(t, ts, http.MethodGet, "/api/admin/me", alice, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("me status %d", resp.StatusCode)
+	}
+	var me struct {
+		Username string `json:"username"`
+		Role     string `json:"role"`
+		Admin    bool   `json:"admin"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&me)
+	resp.Body.Close()
+	if me.Username != "alice" || me.Role != "USER" || me.Admin {
+		t.Fatalf("unexpected me: %+v", me)
+	}
+
+	resp = authRequest(t, ts, http.MethodGet, "/api/admin/users", alice, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-admin users status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/database/initialize", alice, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-admin initialize status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients", alice,
+		`{"clientName":"alice-client","enabled":true,"connectionRateLimitPerMinute":12}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("alice create client status %d", resp.StatusCode)
+	}
+	var aliceClient struct {
+		Client management_ClientView `json:"client"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&aliceClient)
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients", admin,
+		`{"clientName":"admin-client","enabled":true,"connectionRateLimitPerMinute":12}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("admin create client status %d", resp.StatusCode)
+	}
+	var adminClient struct {
+		Client management_ClientView `json:"client"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&adminClient)
+	resp.Body.Close()
+
+	aliceClients := listClients(t, ts, alice)
+	if len(aliceClients) != 1 || aliceClients[0].ClientName != "alice-client" {
+		t.Fatalf("alice should only see own client, got %+v", aliceClients)
+	}
+
+	resp = authRequest(t, ts, http.MethodDelete, "/api/admin/clients/"+itoa(adminClient.Client.ID), alice, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("alice delete admin client status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/client-credentials", alice,
+		`{"apiKey":"ck_alice","secret":"alice-secret","enabled":true,"maxOnlineInstances":2}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("alice create credential status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/client-credentials", admin,
+		`{"apiKey":"ck_admin","secret":"admin-secret","enabled":true,"maxOnlineInstances":2}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("admin create credential status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodGet, "/api/admin/client-credentials", alice, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("alice list credentials status %d", resp.StatusCode)
+	}
+	var credentials []struct {
+		APIKey string `json:"apiKey"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&credentials)
+	resp.Body.Close()
+	if len(credentials) != 1 || credentials[0].APIKey != "ck_alice" {
+		t.Fatalf("alice should only see own credential, got %+v", credentials)
+	}
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(adminClient.Client.ID)+"/tunnels", alice,
+		`{"listenPort":46001,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true}`)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("alice create tunnel for admin client status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(aliceClient.Client.ID)+"/tunnels", alice,
+		`{"listenPort":46002,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("alice create own tunnel status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestClientDownloadLinksAdminCrudAndPublicList(t *testing.T) {
+	_, ts := newAPIServer(t)
+	admin := adminToken(t, ts)
+
+	resp := authRequest(t, ts, http.MethodPost, "/api/admin/client-downloads", admin,
+		`{"implementation":"java","platform":"any","arch":"any","displayName":"Java exec jar","downloadUrl":"https://example.com/shuai-tunnel.jar","description":"cross platform","displayOrder":20,"enabled":false}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create disabled download status %d", resp.StatusCode)
+	}
+	var disabled struct {
+		ID          int64  `json:"id"`
+		DisplayName string `json:"displayName"`
+		Enabled     bool   `json:"enabled"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&disabled)
+	resp.Body.Close()
+	if disabled.ID == 0 || disabled.DisplayName != "Java exec jar" || disabled.Enabled {
+		t.Fatalf("unexpected disabled download: %+v", disabled)
+	}
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/client-downloads", admin,
+		`{"implementation":"go","platform":"linux","arch":"x64","displayName":"Linux x64","downloadUrl":"https://example.com/shuai-tunnel-linux-amd64","displayOrder":10}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create enabled download status %d", resp.StatusCode)
+	}
+	var enabled struct {
+		ID             int64  `json:"id"`
+		Implementation string `json:"implementation"`
+		Platform       string `json:"platform"`
+		Arch           string `json:"arch"`
+		Enabled        bool   `json:"enabled"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&enabled)
+	resp.Body.Close()
+	if enabled.Implementation != "go" || enabled.Platform != "linux" || enabled.Arch != "x64" || !enabled.Enabled {
+		t.Fatalf("unexpected enabled download: %+v", enabled)
+	}
+
+	resp, err := http.Get(ts.URL + "/api/public/client-downloads")
+	if err != nil {
+		t.Fatalf("public client downloads: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("public downloads status %d", resp.StatusCode)
+	}
+	var public []struct {
+		ID          int64  `json:"id"`
+		DisplayName string `json:"displayName"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&public)
+	resp.Body.Close()
+	if len(public) != 1 || public[0].ID != enabled.ID {
+		t.Fatalf("public downloads should include only enabled link, got %+v", public)
+	}
+
+	resp = authRequest(t, ts, http.MethodPut, "/api/admin/client-downloads/"+itoa(enabled.ID), admin,
+		`{"implementation":"csharp","platform":"windows","arch":"x64","displayName":"Windows x64","downloadUrl":"https://example.com/shuai-tunnel-win-x64.zip","enabled":true}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("update download status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodGet, "/api/admin/client-downloads", admin, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list admin downloads status %d", resp.StatusCode)
+	}
+	var all []struct {
+		ID          int64  `json:"id"`
+		DisplayName string `json:"displayName"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&all)
+	resp.Body.Close()
+	if len(all) != 2 || all[0].DisplayName != "Windows x64" || all[1].DisplayName != "Java exec jar" {
+		t.Fatalf("admin downloads order mismatch: %+v", all)
+	}
+
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/users", admin,
+		`{"username":"download-user","password":"download-password","role":"USER","enabled":true}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create ordinary user status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	userToken := loginToken(t, ts, "download-user", "download-password")
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/client-downloads", userToken,
+		`{"implementation":"go","platform":"linux","arch":"arm64","displayName":"Forbidden","downloadUrl":"https://example.com/forbidden"}`)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("ordinary user create download status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodDelete, "/api/admin/client-downloads/"+itoa(disabled.ID), admin, "")
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete download status %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }

@@ -141,6 +141,77 @@ namespace ShuaiTunnel.Server.Data.Migrations
                     b.ToTable("tunnel_client_credential", (string)null);
                 });
 
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ClientDownloadLink", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Arch")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("arch");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Description")
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("description");
+
+                    b.Property<string>("DisplayName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("display_name");
+
+                    b.Property<int>("DisplayOrder")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("display_order");
+
+                    b.Property<string>("DownloadUrl")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("download_url");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("Implementation")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("implementation");
+
+                    b.Property<string>("Platform")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("platform");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DisplayOrder")
+                        .HasDatabaseName("idx_client_download_order");
+
+                    b.HasIndex("Implementation")
+                        .HasDatabaseName("idx_client_download_impl");
+
+                    b.ToTable("client_download_link", (string)null);
+                });
+
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ClientIdentity", b =>
                 {
                     b.Property<long>("Id")
@@ -359,6 +430,11 @@ namespace ShuaiTunnel.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("client_id");
 
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
                     b.Property<string>("ClientName")
                         .IsRequired()
                         .HasMaxLength(120)
@@ -395,6 +471,11 @@ namespace ShuaiTunnel.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("success");
 
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
                     b.HasKey("Id");
 
                     b.HasIndex("ConnectedAt")
@@ -403,7 +484,312 @@ namespace ShuaiTunnel.Server.Data.Migrations
                     b.HasIndex("ClientId", "ConnectedAt")
                         .HasDatabaseName("idx_tunnel_connection_client_time");
 
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_tunnel_connection_tenant");
+
                     b.ToTable("tunnel_connection_record", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.PeerMeshAcl", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("Allowed")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("allowed");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("OwnerUsername")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("owner_username");
+
+                    b.Property<long>("SourceClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("source_client_id");
+
+                    b.Property<string>("SourceClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("source_client_name");
+
+                    b.Property<long>("TargetClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("target_client_id");
+
+                    b.Property<string>("TargetClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("target_client_name");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TenantId", "SourceClientId")
+                        .HasDatabaseName("idx_peer_mesh_acl_source");
+
+                    b.HasIndex("TenantId", "TargetClientId")
+                        .HasDatabaseName("idx_peer_mesh_acl_target");
+
+                    b.HasIndex("TenantId", "SourceClientId", "TargetClientId")
+                        .IsUnique()
+                        .HasDatabaseName("uk_peer_mesh_acl_pair");
+
+                    b.ToTable("peer_mesh_acl", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.PeerMeshDevice", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Cidr")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("cidr");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("client_name");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("LastEndpoint")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("last_endpoint");
+
+                    b.Property<string>("LastSeenAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("last_seen_at");
+
+                    b.Property<string>("NatType")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("nat_type");
+
+                    b.Property<string>("OwnerUsername")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("owner_username");
+
+                    b.Property<string>("PublicKey")
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("public_key");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("VirtualDeviceError")
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("virtual_device_error");
+
+                    b.Property<string>("VirtualDeviceMode")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("virtual_device_mode");
+
+                    b.Property<string>("VirtualDeviceName")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("virtual_device_name");
+
+                    b.Property<string>("VirtualDeviceStatus")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("virtual_device_status");
+
+                    b.Property<string>("VirtualDeviceUpdatedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("virtual_device_updated_at");
+
+                    b.Property<string>("VirtualIp")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("virtual_ip");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ClientName")
+                        .HasDatabaseName("idx_peer_mesh_device_client_name");
+
+                    b.HasIndex("TenantId", "ClientId")
+                        .IsUnique()
+                        .HasDatabaseName("uk_peer_mesh_device_client");
+
+                    b.HasIndex("TenantId", "OwnerUsername")
+                        .HasDatabaseName("idx_peer_mesh_device_owner");
+
+                    b.HasIndex("TenantId", "VirtualIp")
+                        .IsUnique()
+                        .HasDatabaseName("uk_peer_mesh_device_ip");
+
+                    b.ToTable("peer_mesh_device", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.PeerMeshSession", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ClosedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("closed_at");
+
+                    b.Property<long>("DirectBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("direct_bytes");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("LastTrafficAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("last_traffic_at");
+
+                    b.Property<string>("LocalEndpoint")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("local_endpoint");
+
+                    b.Property<string>("PathType")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("path_type");
+
+                    b.Property<long>("RelayBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("relay_bytes");
+
+                    b.Property<string>("RemoteEndpoint")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("remote_endpoint");
+
+                    b.Property<long?>("RttMillis")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("rtt_millis");
+
+                    b.Property<long>("SourceClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("source_client_id");
+
+                    b.Property<string>("SourceClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("source_client_name");
+
+                    b.Property<string>("StartedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("started_at");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("status");
+
+                    b.Property<long>("TargetClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("target_client_id");
+
+                    b.Property<string>("TargetClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("target_client_name");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("TokenHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("token_hash");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Status")
+                        .HasDatabaseName("idx_peer_mesh_session_status");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_peer_mesh_session_tenant");
+
+                    b.HasIndex("TenantId", "SourceClientId")
+                        .HasDatabaseName("idx_peer_mesh_session_source");
+
+                    b.HasIndex("TenantId", "TargetClientId")
+                        .HasDatabaseName("idx_peer_mesh_session_target");
+
+                    b.ToTable("peer_mesh_session", (string)null);
                 });
 
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ConnectionStat", b =>
@@ -415,6 +801,12 @@ namespace ShuaiTunnel.Server.Data.Migrations
                     b.Property<long?>("ClientId")
                         .HasColumnType("INTEGER")
                         .HasColumnName("client_id");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
 
                     b.Property<string>("ClientName")
                         .IsRequired()
@@ -450,8 +842,12 @@ namespace ShuaiTunnel.Server.Data.Migrations
 
                     b.HasIndex("ClientName");
 
-                    b.HasIndex("ClientName", "StatMonth")
-                        .IsUnique();
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_tunnel_connection_stat_tenant");
+
+                    b.HasIndex("TenantId", "ClientName", "StatMonth")
+                        .IsUnique()
+                        .HasDatabaseName("uk_tunnel_connection_stat");
 
                     b.ToTable("tunnel_connection_stat", (string)null);
                 });
@@ -477,9 +873,17 @@ namespace ShuaiTunnel.Server.Data.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("created_at");
 
+                    b.Property<bool>("DetailCaptureEnabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("detail_capture_enabled");
+
                     b.Property<bool>("Enabled")
                         .HasColumnType("INTEGER")
                         .HasColumnName("enabled");
+
+                    b.Property<bool>("PathRewriteEnabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("path_rewrite_enabled");
 
                     b.Property<string>("Route")
                         .IsRequired()
@@ -509,6 +913,439 @@ namespace ShuaiTunnel.Server.Data.Migrations
                     b.ToTable("http_route_mapping", (string)null);
                 });
 
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.HttpTrafficExchange", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("CapturedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("captured_at");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("client_name");
+
+                    b.Property<long>("ElapsedMs")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("elapsed_ms");
+
+                    b.Property<string>("Error")
+                        .HasMaxLength(2048)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("error");
+
+                    b.Property<string>("Method")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("method");
+
+                    b.Property<string>("RawQuery")
+                        .HasMaxLength(2048)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("raw_query");
+
+                    b.Property<string>("RelativePath")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("relative_path");
+
+                    b.Property<string>("RemoteAddress")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("remote_address");
+
+                    b.Property<long>("RequestBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("request_bytes");
+
+                    b.Property<string>("RequestContentType")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("request_content_type");
+
+                    b.Property<string>("RequestHeaders")
+                        .HasMaxLength(8192)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("request_headers");
+
+                    b.Property<string>("RequestPreviewHex")
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("request_preview_hex");
+
+                    b.Property<string>("RequestPreviewText")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("request_preview_text");
+
+                    b.Property<bool>("RequestTruncated")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("request_truncated");
+
+                    b.Property<long?>("ResourceId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("resource_id");
+
+                    b.Property<string>("ResourceName")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resource_name");
+
+                    b.Property<string>("ResponseBodyType")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("response_body_type");
+
+                    b.Property<long>("ResponseBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("response_bytes");
+
+                    b.Property<string>("ResponseContentType")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("response_content_type");
+
+                    b.Property<string>("ResponseHeaders")
+                        .HasMaxLength(8192)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("response_headers");
+
+                    b.Property<string>("ResponsePreviewHex")
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("response_preview_hex");
+
+                    b.Property<string>("ResponsePreviewText")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("response_preview_text");
+
+                    b.Property<bool>("ResponseTruncated")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("response_truncated");
+
+                    b.Property<string>("Route")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("route");
+
+                    b.Property<int>("StatusCode")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("status_code");
+
+                    b.Property<bool>("Success")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("success");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CapturedAt")
+                        .HasDatabaseName("idx_http_traffic_captured_at");
+
+                    b.HasIndex("ClientId")
+                        .HasDatabaseName("idx_http_traffic_client");
+
+                    b.HasIndex("ResponseBodyType")
+                        .HasDatabaseName("idx_http_traffic_body_type");
+
+                    b.HasIndex("Route")
+                        .HasDatabaseName("idx_http_traffic_route");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_http_traffic_tenant");
+
+                    b.ToTable("tunnel_http_traffic_exchange", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ManagementUser", b =>
+                {
+                    b.Property<string>("Username")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("username");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("PasswordHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("password_hash");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("role");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.HasKey("Username");
+
+                    b.HasIndex("Role")
+                        .HasDatabaseName("idx_management_user_role");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_management_user_tenant");
+
+                    b.ToTable("tunnel_management_user", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ResourceTrafficUsage", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("client_name");
+
+                    b.Property<long>("DownloadBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("download_bytes");
+
+                    b.Property<long?>("ResourceId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("resource_id");
+
+                    b.Property<string>("ResourceKey")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resource_key");
+
+                    b.Property<string>("ResourceName")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resource_name");
+
+                    b.Property<string>("ResourceType")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resource_type");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.Property<long>("UploadBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("upload_bytes");
+
+                    b.Property<string>("UsageDate")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("usage_date");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ClientId")
+                        .HasDatabaseName("idx_resource_traffic_client");
+
+                    b.HasIndex("ResourceType")
+                        .HasDatabaseName("idx_resource_traffic_type");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_resource_traffic_tenant");
+
+                    b.HasIndex("UsageDate")
+                        .HasDatabaseName("idx_resource_traffic_date");
+
+                    b.HasIndex("TenantId", "ClientId", "ResourceType", "ResourceKey", "UsageDate")
+                        .IsUnique()
+                        .HasDatabaseName("uk_resource_traffic_resource_date");
+
+                    b.ToTable("tunnel_resource_traffic_usage", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.TcpTrafficFrame", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ChannelId")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("channel_id");
+
+                    b.Property<long>("ClientId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("client_id");
+
+                    b.Property<string>("ClientName")
+                        .IsRequired()
+                        .HasMaxLength(120)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("client_name");
+
+                    b.Property<string>("DestinationAddress")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("destination_address");
+
+                    b.Property<int?>("DestinationPort")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("destination_port");
+
+                    b.Property<string>("Direction")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("frame_direction");
+
+                    b.Property<long>("FrameIndex")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("frame_index");
+
+                    b.Property<string>("FrameTime")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("frame_time");
+
+                    b.Property<int>("ListenPort")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("listen_port");
+
+                    b.Property<long>("PayloadBytes")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("payload_bytes");
+
+                    b.Property<byte[]>("PayloadData")
+                        .IsRequired()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("payload_data");
+
+                    b.Property<string>("PayloadPreviewHex")
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("payload_preview_hex");
+
+                    b.Property<string>("PayloadPreviewText")
+                        .HasMaxLength(4096)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("payload_preview_text");
+
+                    b.Property<string>("RemoteAddress")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("remote_address");
+
+                    b.Property<long?>("ResourceId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("resource_id");
+
+                    b.Property<string>("ResourceName")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resource_name");
+
+                    b.Property<string>("SourceAddress")
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("source_address");
+
+                    b.Property<int?>("SourcePort")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("source_port");
+
+                    b.Property<long>("StreamEndOffset")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("stream_end_offset");
+
+                    b.Property<long>("StreamOffset")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("stream_offset");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<bool>("Truncated")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("truncated");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ChannelId")
+                        .HasDatabaseName("idx_tcp_traffic_channel");
+
+                    b.HasIndex("ClientId")
+                        .HasDatabaseName("idx_tcp_traffic_client");
+
+                    b.HasIndex("FrameTime")
+                        .HasDatabaseName("idx_tcp_traffic_frame_time");
+
+                    b.HasIndex("ListenPort")
+                        .HasDatabaseName("idx_tcp_traffic_listen_port");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_tcp_traffic_tenant");
+
+                    b.HasIndex("TenantId", "ChannelId", "Direction", "StreamOffset")
+                        .HasDatabaseName("idx_tcp_traffic_stream");
+
+                    b.ToTable("tunnel_tcp_traffic_frame", (string)null);
+                });
+
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.TrafficUsage", b =>
                 {
                     b.Property<long>("Id")
@@ -529,6 +1366,12 @@ namespace ShuaiTunnel.Server.Data.Migrations
                         .HasColumnType("INTEGER")
                         .HasColumnName("download_bytes");
 
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
                     b.Property<string>("UpdatedAt")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -547,7 +1390,11 @@ namespace ShuaiTunnel.Server.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("ClientId");
+                    b.HasIndex("ClientId")
+                        .HasDatabaseName("idx_tunnel_traffic_client");
+
+                    b.HasIndex("TenantId")
+                        .HasDatabaseName("idx_tunnel_traffic_tenant");
 
                     b.HasIndex("ClientId", "UsageDate")
                         .IsUnique();
@@ -575,6 +1422,10 @@ namespace ShuaiTunnel.Server.Data.Migrations
                         .HasMaxLength(40)
                         .HasColumnType("TEXT")
                         .HasColumnName("created_at");
+
+                    b.Property<bool>("DetailCaptureEnabled")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("detail_capture_enabled");
 
                     b.Property<bool>("Enabled")
                         .HasColumnType("INTEGER")

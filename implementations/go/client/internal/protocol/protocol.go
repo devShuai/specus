@@ -22,7 +22,10 @@ const (
 
 	CommandLoginRequest       int8 = 1
 	CommandLoginResponse      int8 = -1
+	CommandMessageRequest     int8 = 2
 	CommandMessageResponse    int8 = -2
+	CommandLogoutRequest      int8 = 3
+	CommandLogoutResponse     int8 = -3
 	CommandHeartbeatRequest   int8 = 4
 	CommandHeartbeatResponse  int8 = -4
 	CommandLegacyHTTPRequest  int8 = 5
@@ -40,7 +43,8 @@ const (
 	NatUnregister       = 7
 	NatHTTPRoutesReport = 8
 
-	MessageTypeNatControl = 3
+	MessageTypeNatControl  = 3
+	MessageTypePeerControl = 4
 
 	maxFrameSize    = 32 * 1024 * 1024
 	maxInflatedSize = 16 * 1024 * 1024
@@ -64,6 +68,15 @@ type MessageResponse struct {
 	Message      string
 }
 
+func EncodeMessageRequest(clientName, toClientName string, messageType int, message string) []byte {
+	output := newCompactOutput()
+	output.writeString(clientName)
+	output.writeString(toClientName)
+	output.writeEnum(messageType)
+	output.writeString(message)
+	return encodePayload(output.Bytes())
+}
+
 type DirectHTTPRequest struct {
 	RequestID    string
 	Method       string
@@ -79,7 +92,7 @@ type DirectHTTPResponse struct {
 	StatusCode int
 	Headers    []string
 	Body       []byte
-	Error      string
+	Error      *string
 }
 
 type LegacyHTTPRequest struct {
@@ -288,7 +301,7 @@ func DecodeDirectHTTPResponse(body []byte) (DirectHTTPResponse, error) {
 	if err != nil {
 		return DirectHTTPResponse{}, err
 	}
-	responseError, err := input.readString()
+	responseError, err := input.readOptionalString()
 	if err != nil {
 		return DirectHTTPResponse{}, err
 	}
@@ -477,20 +490,28 @@ func (output *compactOutput) writeString(value string) {
 	output.WriteString(value)
 }
 
-func (output *compactOutput) writeOptionalString(value string) {
-	if value == "" {
+func (output *compactOutput) writeOptionalString(value *string) {
+	if value == nil {
 		output.writeVarInt(0)
 		return
 	}
-	output.writeString(value)
+	output.writeString(*value)
 }
 
 func (output *compactOutput) writeByteArray(value []byte) {
+	if value == nil {
+		output.writeVarInt(0)
+		return
+	}
 	output.writeVarInt(len(value) + 1)
 	output.Write(value)
 }
 
 func (output *compactOutput) writeStringList(values []string) {
+	if values == nil {
+		output.writeVarInt(0)
+		return
+	}
 	output.writeVarInt(len(values) + 1)
 	for _, value := range values {
 		output.writeString(value)
@@ -514,12 +535,12 @@ func (output *compactOutput) writeVarLong(value uint64) {
 }
 
 func (output *compactOutput) writeNullableLong(value int64) {
-	if value == 0 {
-		output.WriteByte(0)
-		return
-	}
 	output.WriteByte(1)
 	output.writeVarLong(uint64(value<<1) ^ uint64(value>>63))
+}
+
+func (output *compactOutput) writeEnum(ordinal int) {
+	output.writeVarLong(uint64(ordinal + 1))
 }
 
 func (output *compactOutput) writeNumericString(value string) error {
@@ -600,6 +621,22 @@ func (input *compactInput) readString() (string, error) {
 	}
 	value, err := input.readBytes(length - 1)
 	return string(value), err
+}
+
+func (input *compactInput) readOptionalString() (*string, error) {
+	length, err := input.readVarInt()
+	if err != nil {
+		return nil, err
+	}
+	if length == 0 {
+		return nil, nil
+	}
+	value, err := input.readBytes(length - 1)
+	if err != nil {
+		return nil, err
+	}
+	result := string(value)
+	return &result, nil
 }
 
 func (input *compactInput) readByteArray() ([]byte, error) {
@@ -735,7 +772,10 @@ func parseUUID(value string) ([]byte, bool) {
 		return nil, false
 	}
 	decoded, err := hex.DecodeString(strings.ReplaceAll(value, "-", ""))
-	return decoded, err == nil && len(decoded) == 16
+	if err != nil || len(decoded) != 16 {
+		return nil, false
+	}
+	return decoded, formatUUID(decoded) == value
 }
 
 func formatUUID(value []byte) string {

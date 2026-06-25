@@ -1,0 +1,46 @@
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
+using ShuaiTunnel.Server.Data;
+
+#nullable disable
+
+namespace ShuaiTunnel.Server.Data.MySql.Migrations
+{
+    [DbContext(typeof(TunnelDbContext))]
+    [Migration("20260625140001_AddClientDownloadLinks")]
+    public partial class AddClientDownloadLinks : Migration
+    {
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.CreateTable(
+                name: "client_download_link",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false),
+                    implementation = table.Column<string>(type: "varchar(32)", maxLength: 32, nullable: false),
+                    platform = table.Column<string>(type: "varchar(32)", maxLength: 32, nullable: false),
+                    arch = table.Column<string>(type: "varchar(32)", maxLength: 32, nullable: false),
+                    display_name = table.Column<string>(type: "varchar(120)", maxLength: 120, nullable: false),
+                    download_url = table.Column<string>(type: "varchar(1024)", maxLength: 1024, nullable: false),
+                    description = table.Column<string>(type: "varchar(512)", maxLength: 512, nullable: true),
+                    display_order = table.Column<int>(type: "int", nullable: false),
+                    enabled = table.Column<bool>(type: "tinyint(1)", nullable: false),
+                    created_at = table.Column<string>(type: "varchar(40)", maxLength: 40, nullable: false),
+                    updated_at = table.Column<string>(type: "varchar(40)", maxLength: 40, nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_client_download_link", x => x.Id);
+                })
+                .Annotation("MySQL:Charset", "utf8mb4");
+
+            migrationBuilder.CreateIndex("idx_client_download_impl", "client_download_link", "implementation");
+            migrationBuilder.CreateIndex("idx_client_download_order", "client_download_link", "display_order");
+        }
+
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(name: "client_download_link");
+        }
+    }
+}

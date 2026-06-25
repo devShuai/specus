@@ -16,6 +16,13 @@ static int expect_hex(const char *name, const uint8_t *bytes, size_t len, const 
 
 int main(void)
 {
+    uint8_t sha1_digest[ST_SHA1_LEN];
+    st_sha1((const uint8_t *)"abc", 3, sha1_digest);
+    if (expect_hex("sha1", sha1_digest, sizeof(sha1_digest),
+                   "a9993e364706816aba3e25717850c26c9cd0d89d") != 0) {
+        return 1;
+    }
+
     uint8_t digest[ST_SHA256_LEN];
     st_sha256((const uint8_t *)"abc", 3, digest);
     if (expect_hex("sha256", digest, sizeof(digest),

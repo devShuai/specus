@@ -28,7 +28,7 @@ export function App() {
     };
   }, []);
 
-  if (publicRoute === "nat-detect" && !authed) {
+  if (publicRoute === "nat-detect") {
     return (
       <Suspense fallback={<FullScreenLoading />}>
         <LazyNatDetectionPanel publicPage />

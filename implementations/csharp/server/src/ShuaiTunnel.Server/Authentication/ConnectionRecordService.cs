@@ -33,6 +33,7 @@ public sealed class ConnectionRecordService
         var now = DateTimeOffset.UtcNow;
         var record = new ConnectionRecord
         {
+            TenantId = result.Account?.TenantId ?? "default",
             ClientId = result.Account?.Id,
             ClientName = clientName,
             ChannelId = channelId,
@@ -45,7 +46,7 @@ public sealed class ConnectionRecordService
         };
         _db.ConnectionRecords.Add(record);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        await _events.BroadcastAsync(new ConnectionEvent("created", ToView(record))).ConfigureAwait(false);
+        await _events.BroadcastAsync(new ConnectionEvent(record.TenantId, "created", ToView(record))).ConfigureAwait(false);
         return record.Id;
     }
 
@@ -77,7 +78,7 @@ public sealed class ConnectionRecordService
         if (dirty)
         {
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            await _events.BroadcastAsync(new ConnectionEvent("updated", ToView(record))).ConfigureAwait(false);
+            await _events.BroadcastAsync(new ConnectionEvent(record.TenantId, "updated", ToView(record))).ConfigureAwait(false);
         }
     }
 

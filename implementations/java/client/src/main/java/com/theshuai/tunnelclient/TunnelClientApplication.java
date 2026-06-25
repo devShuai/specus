@@ -102,7 +102,7 @@ public class TunnelClientApplication {
         tunnelBean.setPeerMeshTunName(startupConfig.getPeerMeshTunName());
         tunnelBean.setPeerMeshMtu(startupConfig.getPeerMeshMtu());
         tunnelBean.setAuthRefresher(() -> loginAndBuildTunnel(startupConfig));
-        log.info("客户端 HTTP 登录成功: clientName={}, session={}, tunnel={}:{}, tcp={}, http={}, peerMesh={}, peerMeshDevice={}, maxOnlineInstances={}",
+        log.info("客户端 HTTP 登录成功: clientName={}, session={}, tunnel={}:{}, tcp={}, http={}, peerMesh={}, peerMeshDevice={}, peerMeshMtu={}, maxOnlineInstances={}",
                 tunnelBean.getClientName(),
                 tunnelBean.getClientSessionId(),
                 tunnelBean.getRemoteAddress(),
@@ -111,6 +111,7 @@ public class TunnelClientApplication {
                 tunnelBean.getHttpTunnelConfigList().size(),
                 response.getPeerMesh() != null && response.getPeerMesh().isEnabled(),
                 tunnelBean.getPeerMeshDevice(),
+                tunnelBean.getPeerMeshMtu(),
                 tunnelBean.getMaxOnlineInstances());
         return tunnelBean;
     }

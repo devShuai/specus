@@ -26,6 +26,14 @@ type TokenResponse struct {
 	ExpiresIn   int64  `json:"expiresIn"`
 }
 
+// Claims is the local management JWT identity used by the admin API.
+type Claims struct {
+	Username string
+	TenantID string
+	Role     string
+	Expires  int64
+}
+
 // LocalTokenService issues and validates HS256 admin tokens and checks admin credentials.
 type LocalTokenService struct {
 	auth config.AuthConfig
@@ -71,18 +79,34 @@ func (s *LocalTokenService) Authenticate(username, password string) bool {
 
 // IssueBody mints a token and wraps it in the API response body.
 func (s *LocalTokenService) IssueBody(username string) TokenResponse {
-	return TokenResponse{AccessToken: s.Issue(username), TokenType: "Bearer", ExpiresIn: s.TTLSeconds()}
+	return s.IssueBodyForUser(username, s.auth.TenantID, "ADMIN")
+}
+
+// IssueBodyForUser mints a token with tenant/role claims and wraps it in the API response body.
+func (s *LocalTokenService) IssueBodyForUser(username, tenantID, role string) TokenResponse {
+	return TokenResponse{
+		AccessToken: s.IssueForUser(username, tenantID, role),
+		TokenType:   "Bearer",
+		ExpiresIn:   s.TTLSeconds(),
+	}
 }
 
 // Issue mints a signed HS256 JWT for the given subject.
 func (s *LocalTokenService) Issue(username string) string {
+	return s.IssueForUser(username, s.auth.TenantID, "ADMIN")
+}
+
+// IssueForUser mints a signed HS256 JWT for a management user.
+func (s *LocalTokenService) IssueForUser(username, tenantID, role string) string {
 	now := time.Now()
 	header := encodeSegment(map[string]any{"alg": "HS256", "typ": "JWT"})
 	payload := encodeSegment(map[string]any{
-		"iss": Issuer,
-		"sub": username,
-		"iat": now.Unix(),
-		"exp": now.Add(time.Duration(s.TTLSeconds()) * time.Second).Unix(),
+		"iss":       Issuer,
+		"sub":       username,
+		"tenant_id": normalizeTenant(tenantID),
+		"role":      normalizeRole(role),
+		"iat":       now.Unix(),
+		"exp":       now.Add(time.Duration(s.TTLSeconds()) * time.Second).Unix(),
 	})
 	signingInput := header + "." + payload
 	signature := base64URL(sign(s.key, signingInput))
@@ -91,51 +115,71 @@ func (s *LocalTokenService) Issue(username string) string {
 
 // Validate verifies a local token and returns the subject (username), or "" if invalid.
 func (s *LocalTokenService) Validate(token string) (string, bool) {
+	claims, ok := s.ValidateClaims(token)
+	if !ok {
+		return "", false
+	}
+	return claims.Username, true
+}
+
+// ValidateClaims verifies a local token and returns the management identity claims.
+func (s *LocalTokenService) ValidateClaims(token string) (Claims, bool) {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return "", false
+		return Claims{}, false
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return "", false
+		return Claims{}, false
 	}
 	signingInput := parts[0] + "." + parts[1]
 	expected := sign(s.key, signingInput)
 	actual, err := decodeBase64URL(parts[2])
 	if err != nil || subtle.ConstantTimeCompare(expected, actual) != 1 {
-		return "", false
+		return Claims{}, false
 	}
 
 	headerBytes, err := decodeBase64URL(parts[0])
 	if err != nil {
-		return "", false
+		return Claims{}, false
 	}
 	var header struct {
 		Alg string `json:"alg"`
 	}
 	if json.Unmarshal(headerBytes, &header) != nil || header.Alg != "HS256" {
-		return "", false
+		return Claims{}, false
 	}
 
 	payloadBytes, err := decodeBase64URL(parts[1])
 	if err != nil {
-		return "", false
+		return Claims{}, false
 	}
 	var claims struct {
-		Iss string `json:"iss"`
-		Sub string `json:"sub"`
-		Exp int64  `json:"exp"`
+		Iss      string `json:"iss"`
+		Sub      string `json:"sub"`
+		TenantID string `json:"tenant_id"`
+		Role     string `json:"role"`
+		Exp      int64  `json:"exp"`
 	}
 	if json.Unmarshal(payloadBytes, &claims) != nil {
-		return "", false
+		return Claims{}, false
 	}
 	if claims.Iss != Issuer || claims.Sub == "" {
-		return "", false
+		return Claims{}, false
 	}
 	if time.Now().Unix() >= claims.Exp {
-		return "", false
+		return Claims{}, false
 	}
-	return claims.Sub, true
+	role := normalizeRole(claims.Role)
+	if role == "USER" && strings.EqualFold(claims.Sub, s.auth.Username) {
+		role = "ADMIN"
+	}
+	return Claims{
+		Username: claims.Sub,
+		TenantID: normalizeTenant(firstNonBlank(claims.TenantID, s.auth.TenantID)),
+		Role:     role,
+		Expires:  claims.Exp,
+	}, true
 }
 
 func hash(value string) []byte {
@@ -160,4 +204,30 @@ func base64URL(data []byte) string {
 
 func decodeBase64URL(value string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(value)
+}
+
+func normalizeTenant(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "default"
+	}
+	return value
+}
+
+func normalizeRole(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "ADMIN":
+		return "ADMIN"
+	default:
+		return "USER"
+	}
+}
+
+func firstNonBlank(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

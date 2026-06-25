@@ -2,6 +2,7 @@ package com.theshuai.tunnelclient.bean;
 
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.tunnelclient.client.ClientAuthRefresher;
+import com.theshuai.tunnelclient.peer.PeerVirtualDeviceOptions;
 import lombok.Data;
 
 import java.util.List;
@@ -19,7 +20,7 @@ public class TunnelBean {
     private ClientAuthLoginResponse.PeerMeshConfig peerMesh;
     private String peerMeshDevice = "noop";
     private String peerMeshTunName = "shuai0";
-    private int peerMeshMtu = 1400;
+    private int peerMeshMtu = PeerVirtualDeviceOptions.DEFAULT_MTU;
     private String remoteAddress;
     private int remotePort;
     private transient ClientAuthRefresher authRefresher;

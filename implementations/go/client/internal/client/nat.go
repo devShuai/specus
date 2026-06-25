@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -97,17 +98,30 @@ func (client *Client) handleNatMessage(connection net.Conn, body []byte) error {
 	case protocol.NatRegisterResult:
 		client.handleNatRegisterResult(message.Metadata)
 	case protocol.NatConnected:
-		go client.connectLocalTunnel(connection, message.Metadata)
+		if source, _ := metadataStringOptional(message.Metadata, "source"); source == "ws" {
+			go client.connectWebSocketTunnel(connection, message.Metadata)
+		} else {
+			go client.connectLocalTunnel(connection, message.Metadata)
+		}
 	case protocol.NatDisconnected:
 		channelID, err := metadataString(message.Metadata, "channelId")
 		if err != nil {
 			return err
 		}
-		client.removeLocalConnection(channelID)
+		if !client.removeWebSocketConnection(channelID) {
+			client.removeLocalConnection(channelID)
+		}
 	case protocol.NatData:
 		channelID, err := metadataString(message.Metadata, "channelId")
 		if err != nil {
 			return err
+		}
+		if handled, err := client.writeWebSocketData(channelID, message.Data); handled {
+			if err != nil {
+				client.logger.Printf("write local websocket tunnel %q failed: %v", channelID, err)
+				client.disconnectWebSocketTunnel(connection, channelID)
+			}
+			return nil
 		}
 		if err := client.writeLocalData(channelID, message.Data); err != nil {
 			client.logger.Printf("write local tunnel %q failed: %v", channelID, err)
@@ -136,15 +150,14 @@ func (client *Client) handleNatRegisterResult(metadata map[string]any) {
 }
 
 func (client *Client) connectLocalTunnel(connection net.Conn, metadata map[string]any) {
-	channelID, err := metadataString(metadata, "channelId")
+	port, err := metadataInt(metadata, "port")
 	if err != nil {
 		client.logger.Printf("invalid NAT connected message: %v", err)
 		return
 	}
-	port, err := metadataInt(metadata, "port")
+	channelID, err := metadataString(metadata, "channelId")
 	if err != nil {
 		client.logger.Printf("invalid NAT connected message: %v", err)
-		client.sendNatDisconnected(connection, channelID)
 		return
 	}
 	client.tunnelsMu.RLock()
@@ -152,7 +165,6 @@ func (client *Client) connectLocalTunnel(connection net.Conn, metadata map[strin
 	client.tunnelsMu.RUnlock()
 	if !exists {
 		client.logger.Printf("no local tunnel configured for NAT port %d", port)
-		client.sendNatDisconnected(connection, channelID)
 		return
 	}
 	address := net.JoinHostPort(config.TunnelAddress, strconv.Itoa(config.TunnelPort))
@@ -257,6 +269,7 @@ func (client *Client) closeLocalConnections() {
 	for _, connection := range connections {
 		_ = connection.Close()
 	}
+	client.closeWebSocketConnections()
 }
 
 func metadataString(metadata map[string]any, name string) (string, error) {
@@ -264,11 +277,25 @@ func metadataString(metadata map[string]any, name string) (string, error) {
 	if !exists {
 		return "", fmt.Errorf("NAT metadata is missing %q", name)
 	}
+	if value == nil {
+		return "", fmt.Errorf("NAT metadata %q is null", name)
+	}
+	if text, ok := value.(string); ok {
+		return text, nil
+	}
+	return fmt.Sprint(value), nil
+}
+
+func metadataStringOptional(metadata map[string]any, name string) (string, bool) {
+	value, exists := metadata[name]
+	if !exists || value == nil {
+		return "", false
+	}
 	text, ok := value.(string)
 	if !ok {
-		return "", fmt.Errorf("NAT metadata %q is not a string", name)
+		return fmt.Sprint(value), true
 	}
-	return text, nil
+	return text, true
 }
 
 func metadataInt(metadata map[string]any, name string) (int, error) {
@@ -279,8 +306,26 @@ func metadataInt(metadata map[string]any, name string) (int, error) {
 	switch number := value.(type) {
 	case float64:
 		return int(number), nil
+	case float32:
+		return int(number), nil
 	case int:
 		return number, nil
+	case int64:
+		return int(number), nil
+	case int32:
+		return int(number), nil
+	case json.Number:
+		parsed, err := strconv.ParseInt(number.String(), 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("NAT metadata %q is not a number", name)
+		}
+		return int(parsed), nil
+	case string:
+		parsed, err := strconv.ParseInt(number, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("NAT metadata %q is not a number", name)
+		}
+		return int(parsed), nil
 	default:
 		return 0, fmt.Errorf("NAT metadata %q is not a number", name)
 	}

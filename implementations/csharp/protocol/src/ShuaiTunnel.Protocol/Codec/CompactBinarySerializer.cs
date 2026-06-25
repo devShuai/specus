@@ -32,6 +32,7 @@ public static class CompactBinarySerializer
         MessageType.ClientToServer,
         MessageType.ClientToClient,
         MessageType.NatControl,
+        MessageType.PeerControl,
     });
 
     private static readonly IValueCodec StringMapCodec = new StringMapValueCodec();

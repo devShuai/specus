@@ -21,6 +21,7 @@ public static class TunnelClientConfigLoader
         var json = File.ReadAllText(path);
         var config = JsonSerializer.Deserialize<TunnelClientConfig>(json, JsonOptions)
             ?? throw new InvalidDataException($"Empty tunnel client config at {path}");
+        config.Normalize();
         Validate(config, path);
         return config;
     }

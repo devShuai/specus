@@ -46,6 +46,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("javaVersion")]
     public string? JavaVersion { get; set; }
 
+    [JsonPropertyName("peerPublicKey")]
+    public string? PeerPublicKey { get; set; }
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -85,6 +88,9 @@ public sealed class ClientAuthLoginResponse
     [JsonPropertyName("policy")]
     public ClientPolicy Policy { get; set; } = new();
 
+    [JsonPropertyName("peerMesh")]
+    public PeerMeshConfig PeerMesh { get; set; } = new();
+
     [JsonPropertyName("tunnelConfigList")]
     public List<TunnelEndpoint> TunnelConfigList { get; set; } = new();
 
@@ -102,6 +108,51 @@ public sealed class ClientPolicy
 
     [JsonPropertyName("retryAfterSeconds")]
     public long RetryAfterSeconds { get; set; }
+}
+
+public sealed class PeerMeshConfig
+{
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+
+    [JsonPropertyName("clientId")]
+    public long ClientId { get; set; }
+
+    [JsonPropertyName("clientName")]
+    public string? ClientName { get; set; }
+
+    [JsonPropertyName("virtualIp")]
+    public string? VirtualIp { get; set; }
+
+    [JsonPropertyName("cidr")]
+    public string? Cidr { get; set; }
+
+    [JsonPropertyName("stunHost")]
+    public string? StunHost { get; set; }
+
+    [JsonPropertyName("stunPort")]
+    public int StunPort { get; set; }
+
+    [JsonPropertyName("turnHost")]
+    public string? TurnHost { get; set; }
+
+    [JsonPropertyName("turnPort")]
+    public int TurnPort { get; set; }
+
+    [JsonPropertyName("iceUsername")]
+    public string? IceUsername { get; set; }
+
+    [JsonPropertyName("iceCredential")]
+    public string? IceCredential { get; set; }
+
+    [JsonPropertyName("serverPublicKey")]
+    public string? ServerPublicKey { get; set; }
+
+    [JsonPropertyName("clientPublicKey")]
+    public string? ClientPublicKey { get; set; }
+
+    [JsonPropertyName("sessionTtlSeconds")]
+    public long SessionTtlSeconds { get; set; }
 }
 
 public sealed class TunnelEndpoint

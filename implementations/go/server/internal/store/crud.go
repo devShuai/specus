@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -184,12 +185,99 @@ func scanCredential(scanner credentialScanner) (ClientCredential, error) {
 	return credential, nil
 }
 
+// ---- client download links ----------------------------------------------------------
+
+func (db *DB) ListClientDownloadLinks(ctx context.Context, enabledOnly bool) ([]ClientDownloadLink, error) {
+	query := `SELECT id, implementation, platform, arch, display_name, download_url, description,
+		display_order, enabled, created_at, updated_at FROM client_download_link`
+	if enabledOnly {
+		query += ` WHERE enabled <> 0 ORDER BY implementation, display_order, id`
+	} else {
+		query += ` ORDER BY display_order, id`
+	}
+	rows, err := db.sql.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var links []ClientDownloadLink
+	for rows.Next() {
+		link, err := scanClientDownloadLink(rows)
+		if err != nil {
+			return nil, err
+		}
+		links = append(links, link)
+	}
+	return links, rows.Err()
+}
+
+func (db *DB) GetClientDownloadLink(ctx context.Context, id int64) (*ClientDownloadLink, error) {
+	query := db.rebind(`SELECT id, implementation, platform, arch, display_name, download_url, description,
+		display_order, enabled, created_at, updated_at FROM client_download_link WHERE id = ?`)
+	link, err := scanClientDownloadLink(db.sql.QueryRowContext(ctx, query, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &link, nil
+}
+
+func (db *DB) InsertClientDownloadLink(ctx context.Context, link ClientDownloadLink) error {
+	query := db.rebind(`INSERT INTO client_download_link
+		(id, implementation, platform, arch, display_name, download_url, description,
+		 display_order, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := db.sql.ExecContext(ctx, query, link.ID, link.Implementation, link.Platform, link.Arch,
+		link.DisplayName, link.DownloadURL, link.Description, link.DisplayOrder, boolToInt(link.Enabled),
+		formatTime(link.CreatedAt), formatTime(link.UpdatedAt))
+	return err
+}
+
+func (db *DB) UpdateClientDownloadLink(ctx context.Context, link ClientDownloadLink) error {
+	query := db.rebind(`UPDATE client_download_link SET implementation = ?, platform = ?, arch = ?,
+		display_name = ?, download_url = ?, description = ?, display_order = ?, enabled = ?,
+		updated_at = ? WHERE id = ?`)
+	_, err := db.sql.ExecContext(ctx, query, link.Implementation, link.Platform, link.Arch,
+		link.DisplayName, link.DownloadURL, link.Description, link.DisplayOrder, boolToInt(link.Enabled),
+		formatTime(link.UpdatedAt), link.ID)
+	return err
+}
+
+func (db *DB) DeleteClientDownloadLink(ctx context.Context, id int64) error {
+	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM client_download_link WHERE id = ?`), id)
+	return err
+}
+
+func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, error) {
+	var (
+		link               ClientDownloadLink
+		description        sql.NullString
+		enabled            int
+		createdAt, updated string
+	)
+	err := scanner.Scan(&link.ID, &link.Implementation, &link.Platform, &link.Arch,
+		&link.DisplayName, &link.DownloadURL, &description, &link.DisplayOrder, &enabled,
+		&createdAt, &updated)
+	if err != nil {
+		return ClientDownloadLink{}, err
+	}
+	if description.Valid {
+		link.Description = &description.String
+	}
+	link.Enabled = enabled != 0
+	link.CreatedAt = parseTime(createdAt)
+	link.UpdatedAt = parseTime(updated)
+	return link, nil
+}
+
 // ---- tunnels -------------------------------------------------------------------------
 
 // ListTunnels returns tunnel mappings, optionally filtered by client id, ordered by id.
 func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping, error) {
 	query := `SELECT id, client_id, client_name, listen_port, target_address, target_port,
-		enabled, created_at, updated_at FROM tunnel_mapping`
+		enabled, detail_capture_enabled, created_at, updated_at FROM tunnel_mapping`
 	var args []any
 	if clientID != nil {
 		query += ` WHERE client_id = ?`
@@ -206,13 +294,15 @@ func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping
 		var (
 			m                  TunnelMapping
 			enabled            int
+			detailCapture      int
 			createdAt, updated string
 		)
 		if err := rows.Scan(&m.ID, &m.ClientID, &m.ClientName, &m.ListenPort, &m.TargetAddress,
-			&m.TargetPort, &enabled, &createdAt, &updated); err != nil {
+			&m.TargetPort, &enabled, &detailCapture, &createdAt, &updated); err != nil {
 			return nil, err
 		}
 		m.Enabled = enabled != 0
+		m.DetailCaptureEnabled = detailCapture != 0
 		m.CreatedAt = parseTime(createdAt)
 		m.UpdatedAt = parseTime(updated)
 		mappings = append(mappings, m)
@@ -245,19 +335,21 @@ func (db *DB) ListenPortInUse(ctx context.Context, listenPort int, excludeID int
 // InsertTunnel persists a new tunnel mapping (id is caller-assigned).
 func (db *DB) InsertTunnel(ctx context.Context, m TunnelMapping) error {
 	query := db.rebind(`INSERT INTO tunnel_mapping
-		(id, client_id, client_name, listen_port, target_address, target_port, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		(id, client_id, client_name, listen_port, target_address, target_port, enabled,
+		 detail_capture_enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query, m.ID, m.ClientID, m.ClientName, m.ListenPort,
-		m.TargetAddress, m.TargetPort, boolToInt(m.Enabled), formatTime(m.CreatedAt), formatTime(m.UpdatedAt))
+		m.TargetAddress, m.TargetPort, boolToInt(m.Enabled), boolToInt(m.DetailCaptureEnabled),
+		formatTime(m.CreatedAt), formatTime(m.UpdatedAt))
 	return err
 }
 
 // UpdateTunnel updates a tunnel mapping's mutable fields.
 func (db *DB) UpdateTunnel(ctx context.Context, m TunnelMapping) error {
 	query := db.rebind(`UPDATE tunnel_mapping SET listen_port = ?, target_address = ?, target_port = ?,
-		enabled = ?, updated_at = ? WHERE id = ?`)
+		enabled = ?, detail_capture_enabled = ?, updated_at = ? WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, m.ListenPort, m.TargetAddress, m.TargetPort,
-		boolToInt(m.Enabled), formatTime(m.UpdatedAt), m.ID)
+		boolToInt(m.Enabled), boolToInt(m.DetailCaptureEnabled), formatTime(m.UpdatedAt), m.ID)
 	return err
 }
 
@@ -271,7 +363,8 @@ func (db *DB) DeleteTunnel(ctx context.Context, id int64) error {
 
 // ListHTTPRoutes returns HTTP route mappings, optionally filtered by client id, ordered by id.
 func (db *DB) ListHTTPRoutes(ctx context.Context, clientID *int64) ([]HTTPRouteMapping, error) {
-	query := `SELECT id, client_id, client_name, route, target_base_url, enabled, created_at, updated_at
+	query := `SELECT id, client_id, client_name, route, target_base_url, enabled,
+		detail_capture_enabled, path_rewrite_enabled, created_at, updated_at
 		FROM http_route_mapping`
 	var args []any
 	if clientID != nil {
@@ -289,13 +382,17 @@ func (db *DB) ListHTTPRoutes(ctx context.Context, clientID *int64) ([]HTTPRouteM
 		var (
 			r                  HTTPRouteMapping
 			enabled            int
+			detailCapture      int
+			pathRewrite        int
 			createdAt, updated string
 		)
 		if err := rows.Scan(&r.ID, &r.ClientID, &r.ClientName, &r.Route, &r.TargetBaseURL,
-			&enabled, &createdAt, &updated); err != nil {
+			&enabled, &detailCapture, &pathRewrite, &createdAt, &updated); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled != 0
+		r.DetailCaptureEnabled = detailCapture != 0
+		r.PathRewriteEnabled = pathRewrite != 0
 		r.CreatedAt = parseTime(createdAt)
 		r.UpdatedAt = parseTime(updated)
 		routes = append(routes, r)
@@ -328,19 +425,21 @@ func (db *DB) RouteInUse(ctx context.Context, clientID int64, route string, excl
 // InsertHTTPRoute persists a new HTTP route mapping (id is caller-assigned).
 func (db *DB) InsertHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
 	query := db.rebind(`INSERT INTO http_route_mapping
-		(id, client_id, client_name, route, target_base_url, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		(id, client_id, client_name, route, target_base_url, enabled, detail_capture_enabled,
+		 path_rewrite_enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query, r.ID, r.ClientID, r.ClientName, r.Route,
-		r.TargetBaseURL, boolToInt(r.Enabled), formatTime(r.CreatedAt), formatTime(r.UpdatedAt))
+		r.TargetBaseURL, boolToInt(r.Enabled), boolToInt(r.DetailCaptureEnabled),
+		boolToInt(r.PathRewriteEnabled), formatTime(r.CreatedAt), formatTime(r.UpdatedAt))
 	return err
 }
 
 // UpdateHTTPRoute updates an HTTP route mapping's mutable fields.
 func (db *DB) UpdateHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
 	query := db.rebind(`UPDATE http_route_mapping SET route = ?, target_base_url = ?, enabled = ?,
-		updated_at = ? WHERE id = ?`)
+		detail_capture_enabled = ?, path_rewrite_enabled = ?, updated_at = ? WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, r.Route, r.TargetBaseURL, boolToInt(r.Enabled),
-		formatTime(r.UpdatedAt), r.ID)
+		boolToInt(r.DetailCaptureEnabled), boolToInt(r.PathRewriteEnabled), formatTime(r.UpdatedAt), r.ID)
 	return err
 }
 
@@ -354,21 +453,32 @@ func (db *DB) DeleteHTTPRoute(ctx context.Context, id int64) error {
 
 // ConnectionFilter narrows a connection-record query.
 type ConnectionFilter struct {
-	ClientID *int64
-	Success  *bool
-	FromISO  string
-	ToISO    string
-	Page     int
-	Size     int
+	TenantID  string
+	ClientID  *int64
+	ClientIDs []int64
+	Success   *bool
+	FromISO   string
+	ToISO     string
+	Page      int
+	Size      int
 }
 
 // ListConnections returns a page of connection records (newest first) and the total count.
 func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]ConnectionRecord, int, error) {
 	where := ` WHERE 1=1`
 	var args []any
+	if filter.TenantID != "" {
+		where += ` AND (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')`
+		args = append(args, defaultTenant(filter.TenantID))
+	}
 	if filter.ClientID != nil {
 		where += ` AND client_id = ?`
 		args = append(args, *filter.ClientID)
+	} else if len(filter.ClientIDs) > 0 {
+		where += ` AND client_id IN (` + placeholders(len(filter.ClientIDs)) + `)`
+		for _, id := range filter.ClientIDs {
+			args = append(args, id)
+		}
 	}
 	if filter.Success != nil {
 		where += ` AND success = ?`
@@ -398,7 +508,7 @@ func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]C
 		page = 0
 	}
 	listArgs := append(append([]any{}, args...), size, page*size)
-	query := db.rebind(`SELECT id, client_id, client_name, channel_id, remote_address, connected_at,
+	query := db.rebind(`SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, channel_id, remote_address, connected_at,
 		disconnected_at, success, failure_reason, disconnect_reason FROM tunnel_connection_record` +
 		where + ` ORDER BY id DESC LIMIT ? OFFSET ?`)
 	rows, err := db.sql.QueryContext(ctx, query, listArgs...)
@@ -419,7 +529,7 @@ func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]C
 			disconnectRsn  sql.NullString
 			clientID       sql.NullInt64
 		)
-		if err := rows.Scan(&r.ID, &clientID, &r.ClientName, &channelID, &remoteAddress, &connectedAt,
+		if err := rows.Scan(&r.ID, &r.TenantID, &clientID, &r.ClientName, &channelID, &remoteAddress, &connectedAt,
 			&disconnectedAt, &success, &failureReason, &disconnectRsn); err != nil {
 			return nil, 0, err
 		}
@@ -451,12 +561,30 @@ func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]C
 
 // ListTraffic returns traffic usage rows, optionally filtered by client id, newest date first.
 func (db *DB) ListTraffic(ctx context.Context, clientID *int64, limit int) ([]TrafficUsage, error) {
-	query := `SELECT id, client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at
+	return db.ListTrafficScoped(ctx, "", clientID, nil, limit)
+}
+
+// ListTrafficScoped returns traffic usage rows constrained to a visible client set when provided.
+func (db *DB) ListTrafficScoped(ctx context.Context, tenantID string, clientID *int64, clientIDs []int64, limit int) ([]TrafficUsage, error) {
+	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at
 		FROM tunnel_traffic_usage`
 	var args []any
+	var clauses []string
+	if tenantID != "" {
+		clauses = append(clauses, `(tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')`)
+		args = append(args, defaultTenant(tenantID))
+	}
 	if clientID != nil {
-		query += ` WHERE client_id = ?`
+		clauses = append(clauses, `client_id = ?`)
 		args = append(args, *clientID)
+	} else if len(clientIDs) > 0 {
+		clauses = append(clauses, `client_id IN (`+placeholders(len(clientIDs))+`)`)
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+	}
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, ` AND `)
 	}
 	query += ` ORDER BY usage_date DESC, id DESC`
 	if limit <= 0 || limit > 1000 {
@@ -475,7 +603,7 @@ func (db *DB) ListTraffic(ctx context.Context, clientID *int64, limit int) ([]Tr
 			u       TrafficUsage
 			updated string
 		)
-		if err := rows.Scan(&u.ID, &u.ClientID, &u.ClientName, &u.UsageDate, &u.UploadBytes,
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.ClientID, &u.ClientName, &u.UsageDate, &u.UploadBytes,
 			&u.DownloadBytes, &updated); err != nil {
 			return nil, err
 		}
@@ -485,14 +613,89 @@ func (db *DB) ListTraffic(ctx context.Context, clientID *int64, limit int) ([]Tr
 	return usages, rows.Err()
 }
 
+// ListResourceTrafficScoped returns resource-level usage rows constrained to a visible client set.
+func (db *DB) ListResourceTrafficScoped(ctx context.Context, tenantID string, clientID *int64, clientIDs []int64,
+	resourceType string, limit int) ([]ResourceTrafficUsage, error) {
+	query := `SELECT id, tenant_id, client_id, client_name, resource_type, resource_key, resource_id,
+		resource_name, usage_date, upload_bytes, download_bytes, updated_at
+		FROM tunnel_resource_traffic_usage`
+	var args []any
+	var clauses []string
+	if tenantID != "" {
+		clauses = append(clauses, `tenant_id = ?`)
+		args = append(args, defaultTenant(tenantID))
+	}
+	if clientID != nil {
+		clauses = append(clauses, `client_id = ?`)
+		args = append(args, *clientID)
+	} else if len(clientIDs) > 0 {
+		clauses = append(clauses, `client_id IN (`+placeholders(len(clientIDs))+`)`)
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+	}
+	if resourceType != "" {
+		clauses = append(clauses, `resource_type = ?`)
+		args = append(args, strings.ToUpper(strings.TrimSpace(resourceType)))
+	}
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, ` AND `)
+	}
+	query += ` ORDER BY usage_date DESC, id DESC`
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query += ` LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.sql.QueryContext(ctx, db.rebind(query), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var usages []ResourceTrafficUsage
+	for rows.Next() {
+		var (
+			u          ResourceTrafficUsage
+			resourceID sql.NullInt64
+			updated    string
+		)
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.ClientID, &u.ClientName, &u.ResourceType,
+			&u.ResourceKey, &resourceID, &u.ResourceName, &u.UsageDate, &u.UploadBytes,
+			&u.DownloadBytes, &updated); err != nil {
+			return nil, err
+		}
+		if resourceID.Valid {
+			u.ResourceID = &resourceID.Int64
+		}
+		u.UpdatedAt = parseTime(updated)
+		usages = append(usages, u)
+	}
+	return usages, rows.Err()
+}
+
 // ListConnectionStats returns archived monthly stats, optionally filtered by client name.
 func (db *DB) ListConnectionStats(ctx context.Context, clientName string, limit int) ([]ConnectionStat, error) {
-	query := `SELECT id, client_id, client_name, stat_month, total_count, success_count, failure_count, updated_at
+	return db.ListConnectionStatsScoped(ctx, "default", clientName, nil, limit)
+}
+
+// ListConnectionStatsScoped returns archived monthly stats constrained to one tenant and optionally
+// a visible client-id set. A nil clientIDs slice means all tenant rows are visible.
+func (db *DB) ListConnectionStatsScoped(ctx context.Context, tenantID, clientName string, clientIDs []int64, limit int) ([]ConnectionStat, error) {
+	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, stat_month, total_count, success_count, failure_count, updated_at
 		FROM tunnel_connection_stat`
-	var args []any
+	args := []any{defaultTenant(tenantID)}
+	query += ` WHERE (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')`
 	if clientName != "" {
-		query += ` WHERE client_name = ?`
+		query += ` AND client_name = ?`
 		args = append(args, clientName)
+	} else if clientIDs != nil {
+		if len(clientIDs) == 0 {
+			return nil, nil
+		}
+		query += ` AND client_id IN (` + placeholders(len(clientIDs)) + `)`
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
 	}
 	query += ` ORDER BY stat_month DESC, id DESC`
 	if limit <= 0 || limit > 1000 {
@@ -512,7 +715,7 @@ func (db *DB) ListConnectionStats(ctx context.Context, clientName string, limit 
 			clientID sql.NullInt64
 			updated  string
 		)
-		if err := rows.Scan(&stat.ID, &clientID, &stat.ClientName, &stat.StatMonth, &stat.TotalCount,
+		if err := rows.Scan(&stat.ID, &stat.TenantID, &clientID, &stat.ClientName, &stat.StatMonth, &stat.TotalCount,
 			&stat.SuccessCount, &stat.FailureCount, &updated); err != nil {
 			return nil, err
 		}
@@ -523,6 +726,13 @@ func (db *DB) ListConnectionStats(ctx context.Context, clientName string, limit 
 		stats = append(stats, stat)
 	}
 	return stats, rows.Err()
+}
+
+func placeholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
 }
 
 // Overview aggregates the dashboard counters.
@@ -557,15 +767,16 @@ func (db *DB) LoadOverview(ctx context.Context) (Overview, error) {
 }
 
 // ArchiveOldConnections aggregates connection records older than cutoff into monthly stats and
-// deletes them, returning the number of archived rows. Mirrors the C# ConnectionArchiveService.
+// deletes them, returning the number of archived rows. Mirrors the Java ConnectionArchiveService.
 func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int64, error) {
 	cutoffISO := formatTime(cutoff)
-	rows, err := db.sql.QueryContext(ctx, db.rebind(`SELECT client_id, client_name, connected_at, success
+	rows, err := db.sql.QueryContext(ctx, db.rebind(`SELECT COALESCE(tenant_id, 'default'), client_id, client_name, connected_at, success
 		FROM tunnel_connection_record WHERE connected_at < ?`), cutoffISO)
 	if err != nil {
 		return 0, err
 	}
 	type key struct {
+		tenantID   string
 		clientName string
 		month      string
 	}
@@ -577,17 +788,18 @@ func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int6
 	var archived int64
 	for rows.Next() {
 		var (
+			tenantID    string
 			clientID    sql.NullInt64
 			clientName  string
 			connectedAt string
 			success     int
 		)
-		if err := rows.Scan(&clientID, &clientName, &connectedAt, &success); err != nil {
+		if err := rows.Scan(&tenantID, &clientID, &clientName, &connectedAt, &success); err != nil {
 			rows.Close()
 			return 0, err
 		}
 		month := parseTime(connectedAt).Format("2006-01")
-		k := key{clientName: clientName, month: month}
+		k := key{tenantID: defaultTenant(tenantID), clientName: clientName, month: month}
 		bucket := buckets[k]
 		if bucket == nil {
 			bucket = &agg{}
@@ -614,7 +826,7 @@ func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int6
 	}
 
 	for k, bucket := range buckets {
-		if err := db.upsertStat(ctx, bucket.clientID, k.clientName, k.month,
+		if err := db.upsertStat(ctx, k.tenantID, bucket.clientID, k.clientName, k.month,
 			bucket.total, bucket.success, bucket.fail); err != nil {
 			return 0, err
 		}
@@ -626,29 +838,29 @@ func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int6
 	return archived, nil
 }
 
-func (db *DB) upsertStat(ctx context.Context, clientID *int64, clientName, month string, total, success, fail int64) error {
+func (db *DB) upsertStat(ctx context.Context, tenantID string, clientID *int64, clientName, month string, total, success, fail int64) error {
 	now := formatTime(time.Now())
-	switch db.dialect {
-	case DialectMySQL:
-		query := `INSERT INTO tunnel_connection_stat
-			(client_id, client_name, stat_month, total_count, success_count, failure_count, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON DUPLICATE KEY UPDATE total_count = total_count + VALUES(total_count),
-				success_count = success_count + VALUES(success_count),
-				failure_count = failure_count + VALUES(failure_count), updated_at = VALUES(updated_at)`
-		_, err := db.sql.ExecContext(ctx, query, clientID, clientName, month, total, success, fail, now)
-		return err
-	default:
-		query := db.rebind(`INSERT INTO tunnel_connection_stat
-			(client_id, client_name, stat_month, total_count, success_count, failure_count, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (client_name, stat_month) DO UPDATE SET
-				total_count = tunnel_connection_stat.total_count + ?,
-				success_count = tunnel_connection_stat.success_count + ?,
-				failure_count = tunnel_connection_stat.failure_count + ?,
-				updated_at = ?`)
-		_, err := db.sql.ExecContext(ctx, query, clientID, clientName, month, total, success, fail, now,
-			total, success, fail, now)
+	clientIDValue := nullableInt64(clientID)
+	update := db.rebind(`UPDATE tunnel_connection_stat
+		SET client_id = COALESCE(client_id, ?),
+			total_count = total_count + ?,
+			success_count = success_count + ?,
+			failure_count = failure_count + ?,
+			updated_at = ?
+		WHERE (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')
+			AND client_name = ? AND stat_month = ?`)
+	result, err := db.sql.ExecContext(ctx, update, clientIDValue, total, success, fail, now,
+		defaultTenant(tenantID), clientName, month)
+	if err != nil {
 		return err
 	}
+	if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+		return nil
+	}
+	insert := db.rebind(`INSERT INTO tunnel_connection_stat
+		(tenant_id, client_id, client_name, stat_month, total_count, success_count, failure_count, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err = db.sql.ExecContext(ctx, insert, defaultTenant(tenantID), clientIDValue, clientName, month,
+		total, success, fail, now)
+	return err
 }

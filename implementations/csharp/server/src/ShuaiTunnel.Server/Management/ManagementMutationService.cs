@@ -1,5 +1,7 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Authentication;
+using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Nat;
@@ -9,27 +11,37 @@ namespace ShuaiTunnel.Server.Management;
 
 public sealed class ManagementMutationService
 {
+    private static readonly HashSet<string> AllowedDownloadImplementations =
+        new(StringComparer.OrdinalIgnoreCase) { "java", "go", "csharp" };
+    private static readonly HashSet<string> AllowedDownloadPlatforms =
+        new(StringComparer.OrdinalIgnoreCase) { "windows", "linux", "macos", "any" };
+    private static readonly HashSet<string> AllowedDownloadArchitectures =
+        new(StringComparer.OrdinalIgnoreCase) { "x64", "arm64", "any" };
+
     private readonly TunnelDbContext _db;
     private readonly SessionRegistry _sessions;
     private readonly NatControlService _natControl;
+    private readonly ClientAuthOptions _clientAuth;
 
     public ManagementMutationService(TunnelDbContext db, SessionRegistry sessions,
-        NatControlService natControl)
+        NatControlService natControl, IOptions<ClientAuthOptions> clientAuth)
     {
         _db = db;
         _sessions = sessions;
         _natControl = natControl;
+        _clientAuth = clientAuth.Value;
     }
 
-    public async Task<ClientResult> CreateClientAsync(ClientMutation request, CancellationToken cancellationToken)
+    public async Task<ClientResult> CreateClientAsync(ManagementContext context, ClientMutation request,
+        CancellationToken cancellationToken)
     {
         var clientName = RequireClientName(request.ClientName);
         var now = DateTimeOffset.UtcNow;
         var account = new ClientAccount
         {
             Id = ClientIdGenerator.NewId(),
-            TenantId = "default",
-            OwnerUsername = "admin",
+            TenantId = context.TenantId,
+            OwnerUsername = context.Username,
             ClientName = clientName,
             PasswordHash = PasswordHasher.Hash(Guid.NewGuid().ToString("N")),
             Enabled = request.Enabled ?? true,
@@ -43,10 +55,10 @@ public sealed class ManagementMutationService
         return new ClientResult(ToClientView(account, upload: 0, download: 0));
     }
 
-    public async Task<ClientResult> UpdateClientAsync(long id, ClientMutation request,
+    public async Task<ClientResult> UpdateClientAsync(ManagementContext context, long id, ClientMutation request,
         CancellationToken cancellationToken)
     {
-        var account = await FindClientAsync(id, cancellationToken).ConfigureAwait(false);
+        var account = await FindClientAsync(context, id, cancellationToken).ConfigureAwait(false);
         var oldName = account.ClientName;
 
         if (!string.IsNullOrWhiteSpace(request.ClientName))
@@ -67,28 +79,31 @@ public sealed class ManagementMutationService
             CloseOnlineChannel(oldName, account.Enabled ? DisconnectReason.AdminRenamed : DisconnectReason.AdminDisabled);
         }
 
-        var totals = await ReadTrafficTotalsAsync(account.Id, cancellationToken).ConfigureAwait(false);
+        var totals = await ReadTrafficTotalsAsync(context, account.Id, cancellationToken).ConfigureAwait(false);
         return new ClientResult(ToClientView(account, totals.Upload, totals.Download));
     }
 
-    public async Task DeleteClientAsync(long id, CancellationToken cancellationToken)
+    public async Task DeleteClientAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
-        var account = await FindClientAsync(id, cancellationToken).ConfigureAwait(false);
+        var account = await FindClientAsync(context, id, cancellationToken).ConfigureAwait(false);
         CloseOnlineChannel(account.ClientName, DisconnectReason.AdminDeleted);
         _db.ClientAccounts.Remove(account);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<IReadOnlyList<ClientCredentialView>> ListCredentialsAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<ClientCredentialView>> ListCredentialsAsync(ManagementContext context,
+        CancellationToken cancellationToken)
     {
         var rows = await _db.ClientCredentials.AsNoTracking()
+            .Where(c => c.TenantId == context.TenantId
+                && (context.IsAdmin || c.OwnerUsername == context.Username))
             .OrderByDescending(c => c.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         return rows.Select(ToCredentialView).ToList();
     }
 
-    public async Task<CredentialResult> CreateCredentialAsync(CredentialMutation request,
+    public async Task<CredentialResult> CreateCredentialAsync(ManagementContext context, CredentialMutation request,
         CancellationToken cancellationToken)
     {
         var apiKey = string.IsNullOrWhiteSpace(request.ApiKey)
@@ -108,12 +123,13 @@ public sealed class ManagementMutationService
         var credential = new ClientCredential
         {
             Id = ClientIdGenerator.NewId(),
-            TenantId = "default",
-            OwnerUsername = "admin",
+            TenantId = context.TenantId,
+            OwnerUsername = context.Username,
             ApiKey = apiKey,
             SecretHash = PasswordHasher.Hash(secret),
             Enabled = request.Enabled ?? true,
-            MaxOnlineInstances = NormalizeMaxOnline(request.MaxOnlineInstances),
+            MaxOnlineInstances = NormalizeMaxOnline(request.MaxOnlineInstances,
+                _clientAuth.DefaultMaxOnlineInstances),
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -122,11 +138,13 @@ public sealed class ManagementMutationService
         return new CredentialResult(ToCredentialView(credential), secret);
     }
 
-    public async Task<CredentialResult> UpdateCredentialAsync(long id, CredentialMutation request,
+    public async Task<CredentialResult> UpdateCredentialAsync(ManagementContext context, long id,
+        CredentialMutation request,
         CancellationToken cancellationToken)
     {
         var credential = await _db.ClientCredentials.FirstOrDefaultAsync(c => c.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"credential not found: {id}");
+        EnsureCredentialAccess(context, credential);
         if (!string.IsNullOrWhiteSpace(request.ApiKey))
         {
             var apiKey = NormalizeApiKey(request.ApiKey);
@@ -154,37 +172,105 @@ public sealed class ManagementMutationService
         }
         if (request.MaxOnlineInstances is not null)
         {
-            credential.MaxOnlineInstances = NormalizeMaxOnline(request.MaxOnlineInstances);
+            credential.MaxOnlineInstances = NormalizeMaxOnline(request.MaxOnlineInstances,
+                _clientAuth.DefaultMaxOnlineInstances);
         }
         credential.UpdatedAt = DateTimeOffset.UtcNow;
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
         return new CredentialResult(ToCredentialView(credential), revealedSecret);
     }
 
-    public async Task DeleteCredentialAsync(long id, CancellationToken cancellationToken)
+    public async Task DeleteCredentialAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
         var credential = await _db.ClientCredentials.FirstOrDefaultAsync(c => c.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"credential not found: {id}");
+        EnsureCredentialAccess(context, credential);
         _db.ClientCredentials.Remove(credential);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<IReadOnlyList<TunnelMappingView>> ListTunnelsAsync(long? clientId,
+    public async Task<IReadOnlyList<ClientDownloadLinkView>> ListClientDownloadsAsync(
+        ManagementContext context,
         CancellationToken cancellationToken)
     {
+        ManagementUserService.RequireAdmin(context);
+        var rows = await _db.ClientDownloadLinks.AsNoTracking()
+            .OrderBy(link => link.DisplayOrder)
+            .ThenBy(link => link.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return rows.Select(ToClientDownloadLinkView).ToList();
+    }
+
+    public async Task<ClientDownloadLinkView> CreateClientDownloadAsync(
+        ManagementContext context,
+        ClientDownloadLinkMutation request,
+        CancellationToken cancellationToken)
+    {
+        ManagementUserService.RequireAdmin(context);
+        var now = DateTimeOffset.UtcNow;
+        var link = new ClientDownloadLink
+        {
+            Id = ClientIdGenerator.NewId(),
+            DisplayOrder = request.DisplayOrder ?? 0,
+            Enabled = request.Enabled ?? true,
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        ApplyClientDownloadMutation(link, request);
+        link.CreatedAt = now;
+        _db.ClientDownloadLinks.Add(link);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return ToClientDownloadLinkView(link);
+    }
+
+    public async Task<ClientDownloadLinkView> UpdateClientDownloadAsync(
+        ManagementContext context,
+        long id,
+        ClientDownloadLinkMutation request,
+        CancellationToken cancellationToken)
+    {
+        ManagementUserService.RequireAdmin(context);
+        var link = await _db.ClientDownloadLinks.FirstOrDefaultAsync(row => row.Id == id, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
+        ApplyClientDownloadMutation(link, request);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return ToClientDownloadLinkView(link);
+    }
+
+    public async Task DeleteClientDownloadAsync(ManagementContext context, long id,
+        CancellationToken cancellationToken)
+    {
+        ManagementUserService.RequireAdmin(context);
+        var link = await _db.ClientDownloadLinks.FirstOrDefaultAsync(row => row.Id == id, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException($"client download link not found: {id}");
+        _db.ClientDownloadLinks.Remove(link);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<TunnelMappingView>> ListTunnelsAsync(ManagementContext context, long? clientId,
+        CancellationToken cancellationToken)
+    {
+        var visibleIds = await VisibleClientIdsAsync(context, cancellationToken).ConfigureAwait(false);
         var query = _db.TunnelMappings.AsNoTracking();
         if (clientId is not null)
         {
+            EnsureVisibleClient(visibleIds, clientId.Value);
             query = query.Where(t => t.ClientId == clientId.Value);
+        }
+        else
+        {
+            query = query.Where(t => visibleIds.Contains(t.ClientId));
         }
         var rows = await query.OrderByDescending(t => t.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
         return rows.Select(ToTunnelView).ToList();
     }
 
-    public async Task<TunnelMappingView> CreateTunnelAsync(long clientId, TunnelMappingMutation request,
+    public async Task<TunnelMappingView> CreateTunnelAsync(ManagementContext context, long clientId,
+        TunnelMappingMutation request,
         CancellationToken cancellationToken)
     {
-        var account = await FindClientAsync(clientId, cancellationToken).ConfigureAwait(false);
+        var account = await FindClientAsync(context, clientId, cancellationToken).ConfigureAwait(false);
         var listenPort = RequirePort(request.ListenPort, "listenPort");
         await EnsureListenPortAvailableAsync(listenPort, existingId: null, cancellationToken).ConfigureAwait(false);
 
@@ -198,6 +284,7 @@ public sealed class ManagementMutationService
             TargetAddress = RequireTargetAddress(request.TargetAddress),
             TargetPort = RequirePort(request.TargetPort, "targetPort"),
             Enabled = request.Enabled ?? true,
+            DetailCaptureEnabled = request.DetailCaptureEnabled ?? false,
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -207,11 +294,13 @@ public sealed class ManagementMutationService
         return ToTunnelView(mapping);
     }
 
-    public async Task<TunnelMappingView> UpdateTunnelAsync(long id, TunnelMappingMutation request,
+    public async Task<TunnelMappingView> UpdateTunnelAsync(ManagementContext context, long id,
+        TunnelMappingMutation request,
         CancellationToken cancellationToken)
     {
         var mapping = await _db.TunnelMappings.FirstOrDefaultAsync(t => t.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"mapping not found: {id}");
+        await EnsureClientAccessAsync(context, mapping.ClientId, cancellationToken).ConfigureAwait(false);
         var listenPort = RequirePort(request.ListenPort, "listenPort");
         if (listenPort != mapping.ListenPort)
         {
@@ -221,46 +310,56 @@ public sealed class ManagementMutationService
         mapping.ListenPort = listenPort;
         mapping.TargetAddress = RequireTargetAddress(request.TargetAddress);
         mapping.TargetPort = RequirePort(request.TargetPort, "targetPort");
-        mapping.Enabled = request.Enabled ?? true;
+        mapping.Enabled = request.Enabled ?? mapping.Enabled;
+        mapping.DetailCaptureEnabled = request.DetailCaptureEnabled ?? mapping.DetailCaptureEnabled;
         mapping.UpdatedAt = DateTimeOffset.UtcNow;
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(mapping.ClientId, cancellationToken).ConfigureAwait(false);
         return ToTunnelView(mapping);
     }
 
-    public async Task DeleteTunnelAsync(long id, CancellationToken cancellationToken)
+    public async Task DeleteTunnelAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
         var mapping = await _db.TunnelMappings.FirstOrDefaultAsync(t => t.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"mapping not found: {id}");
+        await EnsureClientAccessAsync(context, mapping.ClientId, cancellationToken).ConfigureAwait(false);
         var clientId = mapping.ClientId;
         _db.TunnelMappings.Remove(mapping);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<NatControlPushResponse> PushNatControlAsync(long clientId,
+    public async Task<NatControlPushResponse> PushNatControlAsync(ManagementContext context, long clientId,
         CancellationToken cancellationToken)
     {
+        await EnsureClientAccessAsync(context, clientId, cancellationToken).ConfigureAwait(false);
         var result = await _natControl.PushToClientAsync(clientId, cancellationToken).ConfigureAwait(false);
         return new NatControlPushResponse(result.Tunnels, result.Tunnels, result.HttpRoutes);
     }
 
-    public async Task<IReadOnlyList<HttpRouteView>> ListHttpRoutesAsync(long? clientId,
+    public async Task<IReadOnlyList<HttpRouteView>> ListHttpRoutesAsync(ManagementContext context, long? clientId,
         CancellationToken cancellationToken)
     {
+        var visibleIds = await VisibleClientIdsAsync(context, cancellationToken).ConfigureAwait(false);
         var query = _db.HttpRouteMappings.AsNoTracking();
         if (clientId is not null)
         {
+            EnsureVisibleClient(visibleIds, clientId.Value);
             query = query.Where(r => r.ClientId == clientId.Value);
+        }
+        else
+        {
+            query = query.Where(r => visibleIds.Contains(r.ClientId));
         }
         var rows = await query.OrderByDescending(r => r.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
         return rows.Select(ToHttpRouteView).ToList();
     }
 
-    public async Task<HttpRouteView> CreateHttpRouteAsync(long clientId, HttpRouteMutation request,
+    public async Task<HttpRouteView> CreateHttpRouteAsync(ManagementContext context, long clientId,
+        HttpRouteMutation request,
         CancellationToken cancellationToken)
     {
-        var account = await FindClientAsync(clientId, cancellationToken).ConfigureAwait(false);
+        var account = await FindClientAsync(context, clientId, cancellationToken).ConfigureAwait(false);
         var route = RequireRoute(request.Route);
         await EnsureRouteAvailableAsync(account.Id, route, existingId: null, cancellationToken).ConfigureAwait(false);
 
@@ -273,6 +372,8 @@ public sealed class ManagementMutationService
             Route = route,
             TargetBaseUrl = RequireTargetBaseUrl(request.TargetBaseUrl),
             Enabled = request.Enabled ?? true,
+            DetailCaptureEnabled = request.DetailCaptureEnabled ?? false,
+            PathRewriteEnabled = request.PathRewriteEnabled ?? false,
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -282,11 +383,13 @@ public sealed class ManagementMutationService
         return ToHttpRouteView(row);
     }
 
-    public async Task<HttpRouteView> UpdateHttpRouteAsync(long id, HttpRouteMutation request,
+    public async Task<HttpRouteView> UpdateHttpRouteAsync(ManagementContext context, long id,
+        HttpRouteMutation request,
         CancellationToken cancellationToken)
     {
         var row = await _db.HttpRouteMappings.FirstOrDefaultAsync(r => r.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"http route not found: {id}");
+        await EnsureClientAccessAsync(context, row.ClientId, cancellationToken).ConfigureAwait(false);
         var route = RequireRoute(request.Route);
         if (!string.Equals(route, row.Route, StringComparison.Ordinal))
         {
@@ -295,32 +398,77 @@ public sealed class ManagementMutationService
 
         row.Route = route;
         row.TargetBaseUrl = RequireTargetBaseUrl(request.TargetBaseUrl);
-        row.Enabled = request.Enabled ?? true;
+        row.Enabled = request.Enabled ?? row.Enabled;
+        row.DetailCaptureEnabled = request.DetailCaptureEnabled ?? row.DetailCaptureEnabled;
+        row.PathRewriteEnabled = request.PathRewriteEnabled ?? row.PathRewriteEnabled;
         row.UpdatedAt = DateTimeOffset.UtcNow;
         await SaveChangesMappingDuplicateAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(row.ClientId, cancellationToken).ConfigureAwait(false);
         return ToHttpRouteView(row);
     }
 
-    public async Task DeleteHttpRouteAsync(long id, CancellationToken cancellationToken)
+    public async Task DeleteHttpRouteAsync(ManagementContext context, long id, CancellationToken cancellationToken)
     {
         var row = await _db.HttpRouteMappings.FirstOrDefaultAsync(r => r.Id == id, cancellationToken)
             .ConfigureAwait(false) ?? throw new ArgumentException($"http route not found: {id}");
+        await EnsureClientAccessAsync(context, row.ClientId, cancellationToken).ConfigureAwait(false);
         var clientId = row.ClientId;
         _db.HttpRouteMappings.Remove(row);
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await _natControl.PushSnapshotIfOnlineAsync(clientId, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<ClientAccount> FindClientAsync(long id, CancellationToken cancellationToken) =>
-        await _db.ClientAccounts.FirstOrDefaultAsync(c => c.Id == id, cancellationToken).ConfigureAwait(false)
-        ?? throw new ArgumentException($"client not found: {id}");
+    private async Task<ClientAccount> FindClientAsync(ManagementContext context, long id,
+        CancellationToken cancellationToken)
+    {
+        var account = await _db.ClientAccounts.FirstOrDefaultAsync(c => c.Id == id, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException($"client not found: {id}");
+        if (!context.CanAccess(account))
+        {
+            throw new UnauthorizedAccessException("无权访问客户端");
+        }
+        return account;
+    }
 
-    private async Task<(long Upload, long Download)> ReadTrafficTotalsAsync(long clientId,
+    private async Task EnsureClientAccessAsync(ManagementContext context, long clientId,
+        CancellationToken cancellationToken)
+    {
+        _ = await FindClientAsync(context, clientId, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<IReadOnlyList<long>> VisibleClientIdsAsync(ManagementContext context,
+        CancellationToken cancellationToken) =>
+        await _db.ClientAccounts.AsNoTracking()
+            .Where(c => c.TenantId == context.TenantId
+                && (context.IsAdmin || c.OwnerUsername == context.Username))
+            .Select(c => c.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+    private static void EnsureVisibleClient(IReadOnlyList<long> visibleIds, long clientId)
+    {
+        if (!visibleIds.Contains(clientId))
+        {
+            throw new UnauthorizedAccessException("无权访问客户端");
+        }
+    }
+
+    private static void EnsureCredentialAccess(ManagementContext context, ClientCredential credential)
+    {
+        if (!context.CanAccess(credential))
+        {
+            throw new UnauthorizedAccessException("无权访问客户端凭证");
+        }
+    }
+
+    private async Task<(long Upload, long Download)> ReadTrafficTotalsAsync(ManagementContext context, long clientId,
         CancellationToken cancellationToken)
     {
         var rows = await _db.TrafficUsages.AsNoTracking()
-            .Where(t => t.ClientId == clientId)
+            .Where(t => t.ClientId == clientId
+                        && (t.TenantId == context.TenantId
+                            || t.TenantId == null
+                            || t.TenantId == string.Empty))
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         return (rows.Sum(t => t.UploadBytes), rows.Sum(t => t.DownloadBytes));
@@ -360,6 +508,19 @@ public sealed class ManagementMutationService
         credential.CreatedAt.ToString("O"),
         credential.UpdatedAt.ToString("O"));
 
+    private static ClientDownloadLinkView ToClientDownloadLinkView(ClientDownloadLink link) => new(
+        link.Id,
+        link.Implementation,
+        link.Platform,
+        link.Arch,
+        link.DisplayName,
+        link.DownloadUrl,
+        link.Description,
+        link.DisplayOrder,
+        link.Enabled,
+        link.CreatedAt.ToString("O"),
+        link.UpdatedAt.ToString("O"));
+
     private static TunnelMappingView ToTunnelView(TunnelMapping mapping) => new(
         mapping.Id,
         mapping.ClientId,
@@ -368,6 +529,7 @@ public sealed class ManagementMutationService
         mapping.TargetAddress,
         mapping.TargetPort,
         mapping.Enabled,
+        mapping.DetailCaptureEnabled,
         mapping.CreatedAt.ToString("O"),
         mapping.UpdatedAt.ToString("O"));
 
@@ -378,6 +540,8 @@ public sealed class ManagementMutationService
         row.Route,
         row.TargetBaseUrl,
         row.Enabled,
+        row.DetailCaptureEnabled,
+        row.PathRewriteEnabled,
         row.CreatedAt.ToString("O"),
         row.UpdatedAt.ToString("O"));
 
@@ -441,9 +605,9 @@ public sealed class ManagementMutationService
         return normalized;
     }
 
-    private static int NormalizeMaxOnline(int? maxOnlineInstances)
+    private static int NormalizeMaxOnline(int? maxOnlineInstances, int defaultValue)
     {
-        var normalized = maxOnlineInstances ?? 2;
+        var normalized = maxOnlineInstances ?? defaultValue;
         if (normalized is < 1 or > 10_000)
         {
             throw new ArgumentException("maxOnlineInstances must be between 1 and 10000");
@@ -463,6 +627,82 @@ public sealed class ManagementMutationService
             throw new ArgumentException("apiKey length must be between 3 and 120");
         }
         return normalized;
+    }
+
+    private static void ApplyClientDownloadMutation(ClientDownloadLink link, ClientDownloadLinkMutation request)
+    {
+        link.Implementation = RequireDownloadEnum(request.Implementation, AllowedDownloadImplementations,
+            "implementation must be one of [java go csharp]");
+        link.Platform = RequireDownloadEnum(request.Platform, AllowedDownloadPlatforms,
+            "platform must be one of [windows linux macos any]");
+        link.Arch = RequireDownloadEnum(request.Arch, AllowedDownloadArchitectures,
+            "arch must be one of [x64 arm64 any]");
+        link.DisplayName = RequireDisplayName(request.DisplayName);
+        link.DownloadUrl = RequireDownloadUrl(request.DownloadUrl);
+        link.Description = NormalizeDownloadDescription(request.Description);
+        if (request.DisplayOrder is not null)
+        {
+            link.DisplayOrder = request.DisplayOrder.Value;
+        }
+        if (request.Enabled is not null)
+        {
+            link.Enabled = request.Enabled.Value;
+        }
+        link.UpdatedAt = DateTimeOffset.UtcNow;
+    }
+
+    private static string RequireDownloadEnum(string? value, IReadOnlySet<string> allowed, string message)
+    {
+        var normalized = value?.Trim().ToLowerInvariant() ?? string.Empty;
+        if (!allowed.Contains(normalized))
+        {
+            throw new ArgumentException(message);
+        }
+        return normalized;
+    }
+
+    private static string RequireDisplayName(string? displayName)
+    {
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            throw new ArgumentException("displayName cannot be blank");
+        }
+        var normalized = displayName.Trim();
+        if (normalized.Length > 120)
+        {
+            throw new ArgumentException("displayName is too long (max 120)");
+        }
+        return normalized;
+    }
+
+    private static string RequireDownloadUrl(string? downloadUrl)
+    {
+        if (string.IsNullOrWhiteSpace(downloadUrl))
+        {
+            throw new ArgumentException("downloadUrl cannot be blank");
+        }
+        var normalized = downloadUrl.Trim();
+        if (normalized.Length > 1024)
+        {
+            throw new ArgumentException("downloadUrl is too long (max 1024)");
+        }
+        if (!Uri.TryCreate(normalized, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || string.IsNullOrWhiteSpace(uri.Host))
+        {
+            throw new ArgumentException("downloadUrl must be an absolute http(s) URL");
+        }
+        return normalized;
+    }
+
+    private static string? NormalizeDownloadDescription(string? description)
+    {
+        if (string.IsNullOrWhiteSpace(description))
+        {
+            return null;
+        }
+        var normalized = description.Trim();
+        return normalized.Length > 512 ? normalized[..512] : normalized;
     }
 
     private static int RequirePort(int? port, string field)

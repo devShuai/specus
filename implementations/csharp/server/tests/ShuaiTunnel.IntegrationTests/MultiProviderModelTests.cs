@@ -17,6 +17,7 @@ public sealed class MultiProviderModelTests
         "tunnel_connection_record",
         "tunnel_mapping",
         "http_route_mapping",
+        "client_download_link",
         "tunnel_traffic_usage",
         "tunnel_connection_stat",
     };

@@ -10,6 +10,7 @@ public enum MessageType
     ClientToServer = 1,
     ClientToClient = 2,
     NatControl = 3,
+    PeerControl = 4,
 }
 
 /// <summary>

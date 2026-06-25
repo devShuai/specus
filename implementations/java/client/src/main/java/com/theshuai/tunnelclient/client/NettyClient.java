@@ -96,13 +96,15 @@ public class NettyClient {
         this.host = tunnelBean.getRemoteAddress();
         this.port = tunnelBean.getRemotePort();
         this.sslContext = sslContext;
-        this.peerMeshClient = new PeerMeshClient(
-                tunnelBean.getPeerMesh(),
-                this::sendPeerControl,
-                new PeerVirtualDeviceOptions(
-                        tunnelBean.getPeerMeshDevice(),
-                        tunnelBean.getPeerMeshTunName(),
-                        tunnelBean.getPeerMeshMtu()));
+        PeerVirtualDeviceOptions peerOptions = new PeerVirtualDeviceOptions(
+                tunnelBean.getPeerMeshDevice(),
+                tunnelBean.getPeerMeshTunName(),
+                tunnelBean.getPeerMeshMtu());
+        if (tunnelBean.getPeerMeshMtu() != peerOptions.mtu()) {
+            log.warn("Peer mesh MTU normalized: configured={}, effective={}, reason=reserve-udp-encapsulation-overhead",
+                    tunnelBean.getPeerMeshMtu(), peerOptions.mtu());
+        }
+        this.peerMeshClient = new PeerMeshClient(tunnelBean.getPeerMesh(), this::sendPeerControl, peerOptions);
     }
 
     public void start() {

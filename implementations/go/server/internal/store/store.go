@@ -1,11 +1,13 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -31,8 +33,26 @@ const (
 
 // DB is the persistence layer over a multi-dialect database/sql connection.
 type DB struct {
-	sql     *sql.DB
-	dialect Dialect
+	sql                  *sql.DB
+	dialect              Dialect
+	detailStore          trafficDetailBackend
+	tcpCursorMu          sync.Mutex
+	tcpCursors           map[string]*tcpStreamCursor
+	detailMu             sync.Mutex
+	detailDecisions      map[string]detailCaptureDecision
+	pendingHTTPExchanges []HTTPExchangeRecord
+	pendingTCPFrames     []TCPFrameRecord
+	detailMaxPending     int
+	detailFlushBatchSize int
+}
+
+type trafficDetailBackend interface {
+	InsertHTTPExchange(ctx context.Context, e HTTPTrafficExchange) error
+	InsertTCPFrame(ctx context.Context, f TCPTrafficFrame) error
+	ListHTTPExchanges(ctx context.Context, filter HTTPExchangeFilter) ([]HTTPTrafficExchange, int, error)
+	ListTCPFrames(ctx context.Context, filter TCPFrameFilter) ([]TCPTrafficFrame, int, error)
+	GetTCPFrame(ctx context.Context, tenantID string, id int64, clientIDs []int64) (*TCPTrafficFrame, error)
+	ListTCPStream(ctx context.Context, tenantID, channelID string, clientIDs []int64, limit int) ([]TCPTrafficFrame, error)
 }
 
 // Open connects using the given provider (sqlite|postgres|mysql) and connection string,
@@ -54,7 +74,14 @@ func Open(provider, connectionString string) (*DB, error) {
 		handle.Close()
 		return nil, fmt.Errorf("ping %s database: %w", dialect, err)
 	}
-	db := &DB{sql: handle, dialect: dialect}
+	db := &DB{
+		sql:                  handle,
+		dialect:              dialect,
+		tcpCursors:           make(map[string]*tcpStreamCursor),
+		detailDecisions:      make(map[string]detailCaptureDecision),
+		detailMaxPending:     20000,
+		detailFlushBatchSize: 1000,
+	}
 	if err := db.migrate(); err != nil {
 		handle.Close()
 		return nil, err
@@ -96,7 +123,127 @@ func (db *DB) migrate() error {
 			return fmt.Errorf("apply schema statement: %w\n%s", err, stmt)
 		}
 	}
+	if err := db.ensureCompatibleColumns(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (db *DB) ensureCompatibleColumns() error {
+	boolType := "INTEGER NOT NULL DEFAULT 0"
+	switch db.dialect {
+	case DialectPostgres:
+		boolType = "SMALLINT NOT NULL DEFAULT 0"
+	case DialectMySQL:
+		boolType = "TINYINT(1) NOT NULL DEFAULT 0"
+	}
+	columns := []struct {
+		table      string
+		name       string
+		definition string
+	}{
+		{"tunnel_connection_record", "tenant_id", "VARCHAR(80)"},
+		{"tunnel_connection_stat", "tenant_id", "VARCHAR(80)"},
+		{"tunnel_traffic_usage", "tenant_id", "VARCHAR(80)"},
+		{"tunnel_mapping", "detail_capture_enabled", boolType},
+		{"http_route_mapping", "detail_capture_enabled", boolType},
+		{"http_route_mapping", "path_rewrite_enabled", boolType},
+	}
+	for _, column := range columns {
+		if err := db.ensureColumn(column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err := db.ensureIndex("idx_tunnel_connection_tenant", "tunnel_connection_record", "tenant_id"); err != nil {
+		return err
+	}
+	if _, err := db.sql.Exec(db.rebind(`UPDATE tunnel_connection_stat
+		SET tenant_id = COALESCE(
+			(SELECT c.tenant_id FROM tunnel_client_account c WHERE c.id = tunnel_connection_stat.client_id LIMIT 1),
+			(SELECT c.tenant_id FROM tunnel_client_account c WHERE tunnel_connection_stat.client_id IS NULL
+				AND c.client_name = tunnel_connection_stat.client_name LIMIT 1),
+			tenant_id,
+			'default')
+		WHERE tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'default'`)); err != nil {
+		return fmt.Errorf("backfill tunnel_connection_stat tenant_id: %w", err)
+	}
+	if err := db.ensureIndex("idx_tunnel_connection_stat_tenant", "tunnel_connection_stat", "tenant_id"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *DB) ensureIndex(indexName, table, columns string) error {
+	if db.dialect == DialectMySQL {
+		var count int
+		query := `SELECT COUNT(*) FROM information_schema.statistics
+			WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`
+		if err := db.sql.QueryRow(query, table, indexName).Scan(&count); err != nil {
+			return fmt.Errorf("inspect index %s: %w", indexName, err)
+		}
+		if count > 0 {
+			return nil
+		}
+		if _, err := db.sql.Exec(fmt.Sprintf("CREATE INDEX %s ON %s (%s)", indexName, table, columns)); err != nil {
+			return fmt.Errorf("create index %s: %w", indexName, err)
+		}
+		return nil
+	}
+	if _, err := db.sql.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)", indexName, table, columns)); err != nil {
+		return fmt.Errorf("create index %s: %w", indexName, err)
+	}
+	return nil
+}
+
+func (db *DB) ensureColumn(table, column, definition string) error {
+	exists, err := db.columnExists(table, column)
+	if err != nil {
+		return fmt.Errorf("inspect column %s.%s: %w", table, column, err)
+	}
+	if exists {
+		return nil
+	}
+	statement := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)
+	if _, err := db.sql.Exec(statement); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+func (db *DB) columnExists(table, column string) (bool, error) {
+	switch db.dialect {
+	case DialectSQLite:
+		rows, err := db.sql.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				cid        int
+				name       string
+				columnType string
+				notNull    int
+				defaultVal sql.NullString
+				pk         int
+			)
+			if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &pk); err != nil {
+				return false, err
+			}
+			if strings.EqualFold(name, column) {
+				return true, nil
+			}
+		}
+		return false, rows.Err()
+	default:
+		query := db.rebind(`SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_name = ? AND column_name = ?`)
+		var count int
+		if err := db.sql.QueryRow(query, table, column).Scan(&count); err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	}
 }
 
 // splitStatements splits a schema file into individual statements on ';' boundaries,

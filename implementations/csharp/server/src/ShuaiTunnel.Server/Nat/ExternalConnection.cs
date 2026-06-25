@@ -1,9 +1,11 @@
+using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.ControlChannel;
+using ShuaiTunnel.Server.Management;
 using ShuaiTunnel.Server.Networking;
 
 namespace ShuaiTunnel.Server.Nat;
@@ -16,6 +18,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
     private readonly NetworkStream _stream;
     private readonly TunnelConnectionContext _control;
     private readonly TrafficUsageService _traffic;
+    private readonly TrafficInspectionService _inspection;
     private readonly ILogger _logger;
     private readonly ReadGate _readGate;
     private readonly WriteBackpressureGate _writeBackpressure;
@@ -23,7 +26,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
 
     public ExternalConnection(Socket socket, int port, string clientName,
         TunnelConnectionContext control, TrafficUsageService traffic,
-        NettyServerOptions options, ILogger logger)
+        TrafficInspectionService inspection, NettyServerOptions options, ILogger logger)
     {
         _socket = socket;
         _stream = new NetworkStream(socket, ownsSocket: false);
@@ -31,6 +34,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
         ClientName = clientName;
         _control = control;
         _traffic = traffic;
+        _inspection = inspection;
         _logger = logger;
         ChannelId = Guid.NewGuid().ToString("N");
         _readGate = new ReadGate(_control.Lifetime);
@@ -73,7 +77,20 @@ internal sealed class ExternalConnection : IAsyncDisposable
                 }
 
                 var payload = buffer.AsSpan(0, read).ToArray();
-                _traffic.RecordDownload(ClientName, payload.Length);
+                _traffic.RecordTcpDownload(ClientName, Port, payload.Length);
+                var (sourceAddress, sourcePort) = Endpoint(_socket.RemoteEndPoint);
+                var (destinationAddress, destinationPort) = Endpoint(_socket.LocalEndPoint);
+                await _inspection.RecordTcpFrameAsync(new TcpFrameCapture(
+                        ClientName,
+                        Port,
+                        ChannelId,
+                        TrafficInspectionService.DirectionPublicToClient,
+                        sourceAddress,
+                        sourcePort,
+                        destinationAddress,
+                        destinationPort,
+                        payload), cancellationToken)
+                    .ConfigureAwait(false);
                 await SendControlAsync(NatMessageType.Data, new Dictionary<string, object?>
                 {
                     ["channelId"] = ChannelId,
@@ -104,7 +121,20 @@ internal sealed class ExternalConnection : IAsyncDisposable
         {
             await _stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
             await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-            _traffic.RecordUpload(ClientName, data.Length);
+            _traffic.RecordTcpUpload(ClientName, Port, data.Length);
+            var (sourceAddress, sourcePort) = Endpoint(_socket.LocalEndPoint);
+            var (destinationAddress, destinationPort) = Endpoint(_socket.RemoteEndPoint);
+            await _inspection.RecordTcpFrameAsync(new TcpFrameCapture(
+                    ClientName,
+                    Port,
+                    ChannelId,
+                    TrafficInspectionService.DirectionClientToPublic,
+                    sourceAddress,
+                    sourcePort,
+                    destinationAddress,
+                    destinationPort,
+                    data), cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException
             or OperationCanceledException)
@@ -159,5 +189,14 @@ internal sealed class ExternalConnection : IAsyncDisposable
             Data = data,
         };
         return _control.Writer.WriteAsync(message, cancellationToken);
+    }
+
+    private static (string? Address, int? Port) Endpoint(EndPoint? endpoint)
+    {
+        if (endpoint is IPEndPoint ip)
+        {
+            return (ip.Address.ToString(), ip.Port);
+        }
+        return (endpoint?.ToString(), null);
     }
 }

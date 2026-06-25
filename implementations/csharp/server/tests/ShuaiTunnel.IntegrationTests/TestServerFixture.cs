@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
@@ -149,6 +150,8 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
                 config.AddInMemoryCollection(_configurationOverrides);
             }
         });
+
+        builder.ConfigureLogging(logging => logging.ClearProviders());
 
         if (_configureServices is not null)
         {

@@ -17,7 +17,7 @@
   "secret": "test1234",
   "peerMeshDevice": "noop",
   "peerMeshTunName": "shuai0",
-  "peerMeshMtu": 1400
+  "peerMeshMtu": 1280
 }
 ```
 
@@ -28,7 +28,7 @@
 | `secret` | 是 | 客户端凭证明文，只在创建或重置时展示一次 |
 | `peerMeshDevice` | 否 | Peer Mesh 虚拟网卡模式，默认 `noop` |
 | `peerMeshTunName` | 否 | 虚拟网卡名称，默认 `shuai0` |
-| `peerMeshMtu` | 否 | 虚拟网卡 MTU，默认 `1400` |
+| `peerMeshMtu` | 否 | 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化 |
 
 客户端不需要也不接受本地配置 `clientName`。服务端会按 `apiKey + machineFingerprint + osUser` 找到或创建唯一客户端身份，并分配稳定的 `clientName`。
 

@@ -7,6 +7,7 @@ using ShuaiTunnel.Server.Hosting;
 using ShuaiTunnel.Server.Http;
 using ShuaiTunnel.Server.Management;
 using ShuaiTunnel.Server.Nat;
+using ShuaiTunnel.Server.PeerMesh;
 using ShuaiTunnel.Server.Security;
 using ShuaiTunnel.Server.Services;
 using ShuaiTunnel.Server.Sessions;
@@ -29,10 +30,18 @@ builder.Services.Configure<DatabaseOptions>(
     builder.Configuration.GetSection(DatabaseOptions.SectionName));
 builder.Services.Configure<AuthOptions>(
     builder.Configuration.GetSection(AuthOptions.SectionName));
+builder.Services.Configure<ClientAuthOptions>(
+    builder.Configuration.GetSection(ClientAuthOptions.SectionName));
+builder.Services.Configure<ConnectionRecordOptions>(
+    builder.Configuration.GetSection(ConnectionRecordOptions.SectionName));
 builder.Services.Configure<TrafficOptions>(
     builder.Configuration.GetSection(TrafficOptions.SectionName));
+builder.Services.Configure<ElasticsearchOptions>(
+    builder.Configuration.GetSection(ElasticsearchOptions.SectionName));
 builder.Services.Configure<DirectHttpOptions>(
     builder.Configuration.GetSection(DirectHttpOptions.SectionName));
+builder.Services.Configure<PeerMeshOptions>(
+    builder.Configuration.GetSection(PeerMeshOptions.SectionName));
 builder.Services.Configure<OidcOptions>(
     builder.Configuration.GetSection(OidcOptions.SectionName));
 builder.Services.Configure<TlsOptions>(
@@ -82,6 +91,13 @@ builder.Services.AddScoped<ConnectionRecordService>();
 builder.Services.AddScoped<NatControlService>();
 builder.Services.AddScoped<ManagementQueryService>();
 builder.Services.AddScoped<ManagementMutationService>();
+builder.Services.AddScoped<ManagementUserService>();
+builder.Services.AddScoped<PeerMeshService>();
+builder.Services.AddHostedService<StunTurnServer>();
+builder.Services.AddSingleton<ElasticsearchTrafficDetailClient>();
+builder.Services.AddSingleton<TrafficInspectionService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficInspectionService>());
+builder.Services.AddHttpClient();
 
 builder.Services.AddSingleton<ClientAuthSessionStore>();
 builder.Services.AddSingleton<LocalTokenService>();
@@ -91,6 +107,8 @@ builder.Services.AddSingleton<IOidcJwkProvider, HttpOidcJwkProvider>();
 builder.Services.AddSingleton<OidcTokenExchangeService>();
 builder.Services.AddSingleton<IOidcTokenEndpointClient, HttpOidcTokenEndpointClient>();
 builder.Services.AddSingleton<DatabaseInitializer>();
+builder.Services.AddSingleton<ConnectionArchiveService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ConnectionArchiveService>());
 
 // Control-channel pipeline --------------------------------------------------------------------
 

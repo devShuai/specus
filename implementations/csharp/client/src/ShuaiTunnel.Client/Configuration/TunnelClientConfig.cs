@@ -10,6 +10,12 @@ namespace ShuaiTunnel.Client.Configuration;
 /// </summary>
 public sealed class TunnelClientConfig
 {
+    public const string DefaultPeerMeshDevice = "noop";
+    public const string DefaultPeerMeshTunName = "shuai0";
+    public const int DefaultPeerMeshMtu = 1280;
+    public const int MinPeerMeshMtu = 576;
+    public const int MaxPeerMeshMtu = 1280;
+
     [JsonPropertyName("serverBaseUrl")]
     public string ServerBaseUrl { get; set; } = "";
 
@@ -18,6 +24,31 @@ public sealed class TunnelClientConfig
 
     [JsonPropertyName("secret")]
     public string? Secret { get; set; }
+
+    [JsonPropertyName("peerMeshDevice")]
+    public string PeerMeshDevice { get; set; } = DefaultPeerMeshDevice;
+
+    [JsonPropertyName("peerMeshTunName")]
+    public string PeerMeshTunName { get; set; } = DefaultPeerMeshTunName;
+
+    [JsonPropertyName("peerMeshMtu")]
+    public int PeerMeshMtu { get; set; } = DefaultPeerMeshMtu;
+
+    public void Normalize()
+    {
+        ServerBaseUrl = ServerBaseUrl.Trim();
+        ApiKey = ApiKey?.Trim();
+        Secret = Secret?.Trim();
+        PeerMeshDevice = string.IsNullOrWhiteSpace(PeerMeshDevice)
+            ? DefaultPeerMeshDevice
+            : PeerMeshDevice.Trim();
+        PeerMeshTunName = string.IsNullOrWhiteSpace(PeerMeshTunName)
+            ? DefaultPeerMeshTunName
+            : PeerMeshTunName.Trim();
+        PeerMeshMtu = PeerMeshMtu <= 0
+            ? DefaultPeerMeshMtu
+            : Math.Clamp(PeerMeshMtu, MinPeerMeshMtu, MaxPeerMeshMtu);
+    }
 }
 
 public sealed class TunnelRuntimeState
@@ -52,6 +83,9 @@ public sealed class TunnelRuntimeState
     [JsonPropertyName("policy")]
     public ClientPolicy Policy { get; set; } = new();
 
+    [JsonPropertyName("peerMesh")]
+    public PeerMeshConfig PeerMesh { get; set; } = new();
+
     [JsonPropertyName("tunnelConfigList")]
     public List<TunnelConfigEntry> TunnelConfigList { get; set; } = new();
 
@@ -72,6 +106,51 @@ public sealed class ClientPolicy
 
     [JsonPropertyName("retryAfterSeconds")]
     public long RetryAfterSeconds { get; set; }
+}
+
+public sealed class PeerMeshConfig
+{
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; }
+
+    [JsonPropertyName("clientId")]
+    public long ClientId { get; set; }
+
+    [JsonPropertyName("clientName")]
+    public string? ClientName { get; set; }
+
+    [JsonPropertyName("virtualIp")]
+    public string? VirtualIp { get; set; }
+
+    [JsonPropertyName("cidr")]
+    public string? Cidr { get; set; }
+
+    [JsonPropertyName("stunHost")]
+    public string? StunHost { get; set; }
+
+    [JsonPropertyName("stunPort")]
+    public int StunPort { get; set; }
+
+    [JsonPropertyName("turnHost")]
+    public string? TurnHost { get; set; }
+
+    [JsonPropertyName("turnPort")]
+    public int TurnPort { get; set; }
+
+    [JsonPropertyName("iceUsername")]
+    public string? IceUsername { get; set; }
+
+    [JsonPropertyName("iceCredential")]
+    public string? IceCredential { get; set; }
+
+    [JsonPropertyName("serverPublicKey")]
+    public string? ServerPublicKey { get; set; }
+
+    [JsonPropertyName("clientPublicKey")]
+    public string? ClientPublicKey { get; set; }
+
+    [JsonPropertyName("sessionTtlSeconds")]
+    public long SessionTtlSeconds { get; set; }
 }
 
 public sealed class TunnelConfigSnapshot

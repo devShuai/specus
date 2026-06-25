@@ -111,7 +111,7 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 ### 多租户
 
-Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP 映射、HTTP 路由、连接记录、连接归档和流量统计都会绑定 `tenant_id`；本地密码登录签发的 JWT 会写入 `tenant_id` claim，默认来自 `TUNNEL_AUTH_TENANT_ID=default`。OIDC 登录可通过 `TUNNEL_OIDC_TENANT_CLAIM` 指定租户 claim，默认读取 `tenant_id`；缺失时回退到默认租户。
+Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP 映射、HTTP 路由、连接记录、连接归档和流量统计都会绑定 `tenant_id`；本地密码登录签发的 JWT 会写入 `tenant_id` claim，默认来自 `TUNNEL_AUTH_TENANT_ID=default`。OIDC 登录可通过 `TUNNEL_OIDC_TENANT_CLAIM` 指定租户 claim，默认读取 `tenant_id`；缺失时回退到默认租户。Go server 与 .NET server 已同步管理用户表、`/api/admin/me`、`/api/admin/users`、本地 JWT 的 `tenant_id` / `role` claims，以及客户端、凭证、映射、连接、流量列表的 owner 可见性过滤。
 
 旧库升级时，启动初始化会把历史数据的空 `tenant_id` 回填为默认租户。需要注意的是，公网 TCP `listen_port` 仍是整台 server 的全局资源，不能被不同租户重复绑定。
 
@@ -126,7 +126,7 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
   "secret": "test1234",
   "peerMeshDevice": "noop",
   "peerMeshTunName": "shuai0",
-  "peerMeshMtu": 1400
+  "peerMeshMtu": 1280
 }
 ```
 
@@ -139,7 +139,7 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求 |
 | `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`auto` |
 | `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `shuai0` |
-| `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1400` |
+| `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化，避免 UDP 封装后公网路径分片丢包 |
 
 > 完整示例见 `implementations/java/client/tunnelClientConfig.example.json` 和 `implementations/go/client/tunnelClientConfig.example.json`。
 
@@ -169,7 +169,7 @@ Java/Go/C# 客户端登录成功后收到服务端返回的初始映射快照，
 # 用户名/密码登录换取 HS256 JWT（默认 admin / admin，请务必修改）
 TOKEN=$(curl -s -X POST http://127.0.0.1:8088/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin"}' | jq -r .token)
+  -d '{"username":"admin","password":"admin"}' | jq -r .accessToken)
 ```
 
 ```bash
@@ -239,6 +239,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | --- | --- | --- |
 | `TUNNEL_AUTH_USERNAME` | `admin` | 管理用户名 |
 | `TUNNEL_AUTH_PASSWORD` | `admin` | 管理密码；留空则禁用密码登录 |
+| `TUNNEL_AUTH_TENANT_ID` | `default` | 本地密码登录和内置 admin 使用的默认租户 |
 | `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | 是否启用密码登录 |
 | `TUNNEL_AUTH_JWT_SECRET` | （空） | HS256 签名密钥；留空则启动时随机生成（重启后旧令牌失效，需重新登录） |
 | `TUNNEL_AUTH_TOKEN_TTL_SECONDS` | `28800` | 密码登录令牌有效期（秒），默认 8 小时 |
@@ -260,8 +261,9 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | `TUNNEL_OIDC_AUDIENCE` | （空） | 设置后额外校验 JWT 的 audience |
 | `TUNNEL_OIDC_ISSUER` / `TUNNEL_OIDC_JWK_SET_URI` | 指向网关 | JWT 验签与 issuer 校验；JWKS 在首次校验令牌时按需拉取，不在启动时联网 |
 | `TUNNEL_OIDC_AUTHORIZATION_ENDPOINT` / `TUNNEL_OIDC_TOKEN_ENDPOINT` / `TUNNEL_OIDC_END_SESSION_ENDPOINT` | 指向网关 | 授权 / 令牌 / 登出端点 |
+| `TUNNEL_OIDC_TENANT_CLAIM` | `tenant_id` | 从 OIDC JWT 读取租户的 claim 名称；缺失时回退默认租户 |
 
-> 当前任意来自该网关的有效令牌即可访问管理 API（仅做认证，未做用户/角色白名单）。需要限制具体用户时可在此基础上加 `sub`/邮箱白名单或 scope 校验。
+> OIDC 令牌会先完成签名、issuer 和可选 audience 校验；Java、Go 和 .NET server 均可通过 `TUNNEL_OIDC_TENANT_CLAIM` 解析 OIDC 租户，claim 缺失时回退默认租户。本地密码登录令牌包含明确的 `tenant_id` / `role`。
 
 ## HTTP 直转通道
 
@@ -286,7 +288,7 @@ HTTP 直转通道与 TCP 端口映射并行工作。服务端收到请求后，�
 curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 ```
 
-该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=tunnel`。`/http/**` 默认作为公开流量入口，不需要管理令牌；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `TUNNEL_HTTP_TIMEOUT_MS` 调整。
+该请求会转发到客户端网络中的 `http://127.0.0.1:8080/api/hello?source=tunnel`。`/http/**` 默认作为公开流量入口，不需要管理令牌；只有客户端配置过的 route 可以被访问。单次请求体默认限制为 `16 MiB`，可通过 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 调整。转发超时默认是 `30000` 毫秒，可通过 `TUNNEL_HTTP_TIMEOUT_MS` 调整。HTTP 路由开启路径改写时，单次可改写响应体默认上限是 `10 MiB`，可通过 `TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES` 调整。
 
 ## 私有组网（Peer Mesh）
 
@@ -304,7 +306,7 @@ Peer Mesh 是当前 Java 实现中的实验性能力，默认关闭。开启后�
 | `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
 | `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation TTL |
 
-客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
+客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；Go / .NET 客户端还支持 `utun` / `macos-utun` / `darwin-utun` 以接入 macOS utun；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
 
 ## 控制连接 TLS
 
@@ -392,11 +394,13 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | `tunnel.connection-record.archive-interval-ms` | `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` | `3600000` | 归档任务执行间隔（毫秒） |
 | `spring.jpa.properties.hibernate.jdbc.batch_size` | `TUNNEL_DB_BATCH_SIZE` | `50` | Hibernate JDBC 批量大小 |
 
+Go server 与 .NET server 也兼容 `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` 和 `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS`，用于对齐 Java 的连接明细归档策略。
+
 > 月度归档总量（`tunnel_connection_stat`）与每日流量（`tunnel_traffic_usage`）都长期保留，只有连接明细会被汇总后清理。对于超大规模部署，建议进一步在数据库层对明细表按 `connected_at` 做时间分区（如 PostgreSQL 声明式分区）；JPA 的 `ddl-auto` 不会自动建立分区，需要在数据库侧维护。首次归档历史积压较大时，单次事务会汇总并删除全部过期明细，必要时可分批执行。
 
 ### 流量明细存储
 
-HTTP 协议记录和 TCP payload 记录默认写入业务数据库；配置 Elasticsearch 后会自动切换到 ES 存储，管理页查询同一套接口。明细采集由全局总开关和通道开关共同控制，每条 HTTP 路由 / TCP 映射新建时默认关闭明细采集，需要在管理页单独打开。写入时会保留完整 HTTP body 与 TCP 二进制 payload，页面按分页读取；HTTP 与 TCP 索引都可通过体积上限自动清理最旧记录。
+Java 参考实现中，HTTP 协议记录和 TCP payload 记录默认写入业务数据库；配置 Elasticsearch 后会自动切换到 ES 存储，管理页查询同一套接口。明细采集由全局总开关和通道开关共同控制，每条 HTTP 路由 / TCP 映射新建时默认关闭明细采集，需要在管理页单独打开。写入时会保留完整 HTTP body 与 TCP 二进制 payload，页面按分页读取；HTTP 与 TCP 索引都可通过体积上限自动清理最旧记录。
 
 | 配置 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -411,6 +415,8 @@ HTTP 协议记录和 TCP payload 记录默认写入业务数据库；配置 Elas
 
 HTTP 流量入库前会根据 `Content-Encoding` 对 `gzip`、`deflate`、`br` 响应体做解压，管理页再按 `Content-Type` 提供对应预览；如果历史记录只保存了已损坏的压缩文本，页面会提示缺少可还原的原始压缩字节。
 
+Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 明细采集、分页查询、字段搜索和 TCP 串流查询，并已兼容 `gzip`、`deflate` 的 zlib / raw deflate 以及 `br` Brotli 响应预览解码；同时支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理。
+
 ## 当前状态
 
 已实现：
@@ -419,21 +425,25 @@ HTTP 流量入库前会根据 `Content-Encoding` 对 `gzip`、`deflate`、`br` �
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
 - 客户端账号分配、连接记录、连接频率限制（默认每分钟 `30` 次，`0` 表示不限）和流量统计
 - 内置管理 API 和管理页面，支持用户名/密码与 OIDC（授权码 + PKCE）两种登录，后端统一校验 Bearer JWT
+- 多租户管理用户：内置 admin 来自配置，其它用户保存到数据库；admin 可管理用户和查看租户内全部资源，普通用户只能看到自己创建的客户端、凭证、映射、连接和流量
 - 端口映射的持久化管理，以及通过 `NAT_CONTROL` 完成登录自动下发和在线快照同步
 - 基于客户端 route 白名单的 HTTP 请求直接转发
 - HTTP / TCP 流量明细观测，支持通道级采集开关（默认关闭）、分页搜索、Header 说明、HTTP Body 类型化预览、压缩响应解码，以及 DB / Elasticsearch 存储切换
 - 控制连接断开后的指数退避重连
 - TCP 公网端口监听和双向数据转发
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
-- 实验性 Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun、同用户默认互通、`PEER_CONTROL` 信令、UDP direct、server relay、NAT 类型探测、链路和会话展示
+- 实验性 Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun / macOS utun、同用户默认互通、`PEER_CONTROL` 信令、UDP direct、server relay、NAT 类型探测、链路和会话展示
 - 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
 - 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
+- Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled` 管理字段以及 HTTP 路由的 `pathRewriteEnabled` 配置和回包路径改写行为
+- Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
+- Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；C server 只保留轻量兼容面
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 需要继续完善：
 
 - 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
-- 非 Java 实现仍需继续对齐最新的客户端 HTTP 登录、Peer Mesh 和管理面能力。
+- Peer Mesh 的 Go/.NET 数据面仍需要真实 Windows/Linux/macOS 双机环境继续做 ping、HTTP 和 relay fallback 手工验收；C server 仍是 smoke-test 级移植，不具备完整管理面、OIDC、完整 Direct HTTP 观测和 Peer Mesh 数据面。
 - Java 客户端入口尚未默认开启控制连接 TLS，启用需自行调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
 

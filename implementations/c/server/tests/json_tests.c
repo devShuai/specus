@@ -6,10 +6,15 @@
 
 int main(void)
 {
-    const char *json = "{\"channelId\":\"c-1\",\"port\":18080,\"escaped\":\"line\\nnext\",\"asString\":\"42\"}";
+    const char *json = "{\"channelId\":\"c-1\",\"port\":18080,\"largeId\":3813672224291582,\"escaped\":\"line\\nnext\",\"asString\":\"42\"}";
     int port = 0;
+    long long large_id = 0;
     if (st_json_get_int(json, "port", &port) != 0 || port != 18080) {
         fprintf(stderr, "json int mismatch\n");
+        return 1;
+    }
+    if (st_json_get_i64(json, "largeId", &large_id) != 0 || large_id != 3813672224291582LL) {
+        fprintf(stderr, "json i64 mismatch\n");
         return 1;
     }
     if (st_json_get_int(json, "asString", &port) != 0 || port != 42) {

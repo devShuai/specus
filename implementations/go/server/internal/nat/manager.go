@@ -10,9 +10,11 @@ import (
 // Limits captures the three-tier external-connection admission caps. A value <= 0 means
 // unlimited (matching the C# semantics).
 type Limits struct {
-	Global    int
-	PerClient int
-	PerPort   int
+	Global              int
+	PerClient           int
+	PerPort             int
+	WriteBufferLowMark  int
+	WriteBufferHighMark int
 }
 
 // RemotePortManager owns the public-port TCP listeners and enforces the global external

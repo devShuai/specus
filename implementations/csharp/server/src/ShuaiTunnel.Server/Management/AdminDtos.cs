@@ -2,6 +2,22 @@ namespace ShuaiTunnel.Server.Management;
 
 public sealed record AdminLoginRequest(string? Username, string? Password);
 
+public sealed record ManagementUserView(
+    string Username,
+    string TenantId,
+    string Role,
+    bool Admin,
+    bool BuiltIn,
+    bool Enabled,
+    string CreatedAt,
+    string UpdatedAt);
+
+public sealed record UserMutation(
+    string? Username,
+    string? Password,
+    string? Role,
+    bool? Enabled);
+
 public sealed record ClientMutation(
     string? ClientName,
     bool? Enabled,
@@ -25,6 +41,29 @@ public sealed record ClientCredentialView(
     int MaxOnlineInstances,
     string CreatedAt,
     string UpdatedAt);
+
+public sealed record ClientDownloadLinkView(
+    long Id,
+    string Implementation,
+    string Platform,
+    string Arch,
+    string DisplayName,
+    string DownloadUrl,
+    string? Description,
+    int DisplayOrder,
+    bool Enabled,
+    string CreatedAt,
+    string UpdatedAt);
+
+public sealed record ClientDownloadLinkMutation(
+    string? Implementation,
+    string? Platform,
+    string? Arch,
+    string? DisplayName,
+    string? DownloadUrl,
+    string? Description,
+    int? DisplayOrder,
+    bool? Enabled);
 
 public sealed record ClientAccountView(
     long Id,
@@ -57,6 +96,7 @@ public sealed record TunnelMappingView(
     string TargetAddress,
     int TargetPort,
     bool Enabled,
+    bool DetailCaptureEnabled,
     string CreatedAt,
     string UpdatedAt);
 
@@ -64,7 +104,8 @@ public sealed record TunnelMappingMutation(
     int? ListenPort,
     string? TargetAddress,
     int? TargetPort,
-    bool? Enabled);
+    bool? Enabled,
+    bool? DetailCaptureEnabled);
 
 public sealed record HttpRouteView(
     long Id,
@@ -73,13 +114,17 @@ public sealed record HttpRouteView(
     string Route,
     string TargetBaseUrl,
     bool Enabled,
+    bool DetailCaptureEnabled,
+    bool PathRewriteEnabled,
     string CreatedAt,
     string UpdatedAt);
 
 public sealed record HttpRouteMutation(
     string? Route,
     string? TargetBaseUrl,
-    bool? Enabled);
+    bool? Enabled,
+    bool? DetailCaptureEnabled,
+    bool? PathRewriteEnabled);
 
 public sealed record NatControlPushResponse(int Pushed, int Tunnels, int HttpRoutes);
 
@@ -96,7 +141,7 @@ public sealed record ConnectionRecordView(
     string? DisconnectReason,
     string? DisconnectReasonText);
 
-public sealed record ConnectionEvent(string Type, ConnectionRecordView Record);
+public sealed record ConnectionEvent(string? TenantId, string Type, ConnectionRecordView Connection);
 
 public sealed record ConnectionPageResponse(
     IReadOnlyList<ConnectionRecordView> Items,
@@ -113,6 +158,80 @@ public sealed record TrafficUsageView(
     long UploadBytes,
     long DownloadBytes,
     string UpdatedAt);
+
+public sealed record ResourceTrafficUsageView(
+    long Id,
+    long ClientId,
+    string ClientName,
+    string ResourceType,
+    string ResourceKey,
+    long? ResourceId,
+    string ResourceName,
+    string UsageDate,
+    long UploadBytes,
+    long DownloadBytes,
+    string UpdatedAt);
+
+public sealed record HttpTrafficExchangeView(
+    string Id,
+    long ClientId,
+    string ClientName,
+    string Route,
+    long? ResourceId,
+    string? ResourceName,
+    string Method,
+    string RelativePath,
+    string? RawQuery,
+    int StatusCode,
+    bool Success,
+    string? Error,
+    string? RemoteAddress,
+    long RequestBytes,
+    long ResponseBytes,
+    long ElapsedMs,
+    string? RequestContentType,
+    string? ResponseContentType,
+    string ResponseBodyType,
+    string? RequestHeaders,
+    string? ResponseHeaders,
+    string? RequestPreviewHex,
+    string? RequestPreviewText,
+    string? ResponsePreviewHex,
+    string? ResponsePreviewText,
+    bool RequestTruncated,
+    bool ResponseTruncated,
+    string CapturedAt);
+
+public sealed record TcpTrafficFrameView(
+    string Id,
+    long ClientId,
+    string ClientName,
+    int ListenPort,
+    long? ResourceId,
+    string? ResourceName,
+    string ChannelId,
+    string Direction,
+    string? RemoteAddress,
+    string? SourceAddress,
+    int? SourcePort,
+    string? DestinationAddress,
+    int? DestinationPort,
+    long StreamOffset,
+    long StreamEndOffset,
+    long FrameIndex,
+    long PayloadBytes,
+    string? PayloadBase64,
+    string? PayloadPreviewHex,
+    string? PayloadPreviewText,
+    bool Truncated,
+    string FrameTime);
+
+public sealed record TrafficDetailPage<T>(
+    IReadOnlyList<T> Items,
+    long Total,
+    int Page,
+    int Size,
+    int TotalPages);
 
 public sealed record ConnectionStatView(
     long Id,

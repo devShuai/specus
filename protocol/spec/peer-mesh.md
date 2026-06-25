@@ -24,14 +24,15 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | --- | --- | --- |
 | `peerMeshDevice` | `noop` | 虚拟网卡模式 |
 | `peerMeshTunName` | `shuai0` | 虚拟网卡名 |
-| `peerMeshMtu` | `1400` | MTU |
+| `peerMeshMtu` | `1280` | MTU；为 UDP 封装、AES-GCM tag 和公网路径预留空间，配置大于 `1280` 时客户端会归一化 |
 
 `peerMeshDevice` 可选值：
 
 - `noop`：不创建虚拟网卡，只运行控制面和 UDP 探测。
 - `linux-tun`：Linux 使用 `/dev/net/tun`。
 - `windows-wintun` / `wintun`：Windows 使用 Wintun，客户端包内包含 `wintun.dll`。
-- `auto`：按系统自动选择 Linux TUN 或 Windows Wintun，不支持的平台回退 `noop`。
+- `utun` / `macos-utun` / `darwin-utun`：Go / .NET 客户端可在 macOS 使用 utun；Java 参考客户端当前未实现 macOS 虚拟网卡。
+- `auto`：Java 参考客户端按系统自动选择 Linux TUN 或 Windows Wintun；Go / .NET 客户端还会在 macOS 选择 utun，不支持的平台回退 `noop`。
 
 ## 设备与虚拟 IP
 
@@ -377,7 +378,7 @@ Windows：
 ## 当前限制
 
 - 当前是 TURN-lite JSON 协议，不兼容标准 coturn。
-- macOS `utun` 还未实现。
+- Java client 当前仍以 Linux TUN 与 Windows Wintun 为主；Go / .NET client 已提供实验性 macOS `utun` 数据面。
 - `noop` 模式不会创建虚拟网卡，因此无法通过系统 `ping` / `curl` 访问虚拟 IP。
 - direct 路径依赖双方 UDP 可达；对称 NAT 或严格防火墙下通常会走 relay。
 - 控制连接断开后不能创建新 peer session；已建立 direct session 在 TTL 内可继续传输。
