@@ -24,6 +24,7 @@ VITE_API_TARGET=http://127.0.0.1:8088 npm run dev
 
 ```bash
 npm run build        # 类型检查 + 产出 dist/(index.html + assets/)
+npm run build:openresty # build 后额外生成 .gz/.br 预压缩文件，供 OpenResty 静态服务
 npm run deploy:java  # build 后只写 implementations/java/server/src/main/resources/static/
 npm run deploy:go     # build 后只写 implementations/go/server/web/static/
 npm run deploy:csharp # build 后只写 implementations/csharp/server/src/ShuaiTunnel.Server/wwwroot/
@@ -39,6 +40,18 @@ Java `tunnel-server` 的 Maven 构建已经接入该流程：执行 `mvn package
 C# `ShuaiTunnel.Server` 的 MSBuild 构建会调用 `npm run deploy:csharp`，可用
 `/p:TunnelServerWebSkip=true` 跳过。Go server 没有 `go build` 前置生命周期，使用
 `go generate ./web` 调用 `npm run deploy:go` 后再构建。
+
+如果生产环境使用 OpenResty 前置加速，推荐不要让应用进程直接承担静态资源流量：
+
+```bash
+npm run build:openresty
+sudo bash ../../deploy/openresty/install-admin-web.sh
+sudo openresty -s reload
+```
+
+OpenResty 会对 `/assets/*` 启用长期强缓存和 `gzip_static`，并把 `/api`、`/auth`、
+`/oidc`、`/http`、`/ws` 反代到后端 `tunnel-server:8088`。完整配置见
+`deploy/openresty/README.md`。
 
 `scripts/deploy.mjs` 会按 `--target` 清空并写入目标目录，只有 `deploy:all` 才会写入三端:
 - `implementations/go/server/web/static/`(go:embed —— 之后需 `go build` 重新嵌入)

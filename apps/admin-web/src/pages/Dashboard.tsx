@@ -13,6 +13,7 @@ import { adminApi } from "../api/client";
 import { notify, notifyError } from "../components/toast";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { AppLogo } from "../components/AppLogo";
+import { HeroRuntime } from "../components/HeroRuntime";
 
 const LazyOverviewPanel = lazy(() => import("./panels/OverviewPanel").then((module) => ({ default: module.OverviewPanel })));
 const LazyClientsPanel = lazy(() => import("./panels/ClientsPanel").then((module) => ({ default: module.ClientsPanel })));
@@ -63,6 +64,14 @@ function panelHash(panel: PanelKey) {
 }
 
 export function Dashboard() {
+  return (
+    <HeroRuntime>
+      <DashboardContent />
+    </HeroRuntime>
+  );
+}
+
+function DashboardContent() {
   const { logout, profile } = useAuth();
   const [initializing, setInitializing] = useState(false);
   const [activePanel, setActivePanel] = useState<PanelKey>(() => readPanelFromLocation());

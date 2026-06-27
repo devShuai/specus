@@ -23,6 +23,14 @@ export default defineConfig(({ mode }) => {
       outDir: "dist",
       // Keep asset paths stable under /assets so any static file server can serve the SPA.
       assetsDir: "assets",
+      modulePreload: {
+        resolveDependencies(_filename, deps, context) {
+          if (context.hostType !== "html") {
+            return deps;
+          }
+          return deps.filter((dep) => dep.includes("react-vendor"));
+        },
+      },
       rollupOptions: {
         output: {
           manualChunks(id) {

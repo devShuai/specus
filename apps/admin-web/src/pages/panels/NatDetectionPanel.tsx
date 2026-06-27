@@ -10,6 +10,7 @@ import {
 } from "@heroui/react";
 import { AppLogo } from "../../components/AppLogo";
 import { ThemeToggleButton } from "../../components/ThemeToggleButton";
+import { HeroRuntime } from "../../components/HeroRuntime";
 import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
 import { usePageSeo } from "../../lib/seo";
 
@@ -69,6 +70,15 @@ interface BrowserNatResult {
 }
 
 export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean }) {
+  const content = <NatDetectionPanelContent publicPage={publicPage} />;
+
+  if (publicPage) {
+    return <HeroRuntime>{content}</HeroRuntime>;
+  }
+  return content;
+}
+
+function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean }) {
   const [serversText, setServersText] = useState(DEFAULT_STUN_SERVERS.join("\n"));
   const [timeoutMs, setTimeoutMs] = useState("9000");
   const [result, setResult] = useState<BrowserNatResult | null>(null);
