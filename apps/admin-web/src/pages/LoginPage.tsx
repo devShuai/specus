@@ -4,6 +4,7 @@ import { useAuth } from "../auth/AuthContext";
 import { notifyError } from "../components/toast";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { AppLogo } from "../components/AppLogo";
+import { HeroRuntime } from "../components/HeroRuntime";
 import { fetchPublicClientDownloads } from "../api/client";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 import { usePageSeo } from "../lib/seo";
@@ -48,7 +49,7 @@ const featureCards = [
   },
 ];
 
-const flowNodes = ["公网入口", "控制面鉴权", "策略编排", "内网服务 · 对端客户端"];
+const flowNodes = ["公网入口", "控制面鉴权", "策略编排", "内网服务"];
 
 const httpRouteNodes = [
   { eyebrow: "公网用户", title: "app.example.com", meta: "GET /api/orders" },
@@ -87,6 +88,14 @@ const inputClassNames = {
 } as const;
 
 export function LoginPage() {
+  return (
+    <HeroRuntime>
+      <LoginPageContent />
+    </HeroRuntime>
+  );
+}
+
+function LoginPageContent() {
   const { oidcConfig, loginHint, passwordLogin, startOidcLogin } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -166,7 +175,7 @@ export function LoginPage() {
             <div className="max-w-3xl">
               <h1 className="text-5xl font-semibold leading-tight text-zinc-950 dark:text-white">shuai-tunnel</h1>
               <p className="mt-5 max-w-2xl text-lg leading-8 text-zinc-700 dark:text-zinc-300">
-                把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测、TLS 自带电池。
+                把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测，TLS 开箱即用。
               </p>
             </div>
 
@@ -489,7 +498,7 @@ function TopologyDiagram() {
           className="topology-peer-flow"
         />
         <path
-          d="M 890 200 C 870 215, 870 235, 890 250"
+          d="M 890 250 C 870 235, 870 215, 890 200"
           fill="none"
           stroke="rgb(16,185,129)"
           strokeWidth="2"
