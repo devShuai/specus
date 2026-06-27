@@ -4,10 +4,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.peermesh.PeerCandidate;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerCrypto;
+import com.theshuai.common.peermesh.PeerRelayBinaryFrame;
 import com.theshuai.common.peermesh.PeerRelayMessage;
 import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.util.JsonUtil;
+import com.theshuai.tunnelclient.peer.portmap.NatPortMapping;
+import com.theshuai.tunnelclient.peer.portmap.NatPortMappingService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.StringUtils;
 
@@ -60,6 +63,10 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile String virtualDeviceKey = "noop";
     private volatile PeerCandidate serverReflexiveCandidate;
     private volatile PeerCandidate relayCandidate;
+    private volatile PeerCandidate portMapCandidate;
+    private volatile NatPortMapping portMapping;
+    private volatile long lastPortMapAttemptMillis;
+    private final NatPortMappingService natPortMappingService = new NatPortMappingService();
     private volatile String natType = "";
     private volatile String lastEndpoint = "";
     private volatile String relayAllocationId;
@@ -76,6 +83,13 @@ public class PeerMeshClient implements AutoCloseable {
     private static final long ON_DEMAND_PREPARE_INTERVAL_MILLIS = 2_000;
     private static final long NAT_PROBE_STALE_MILLIS = 120_000;
     private static final long ALTERNATE_NAT_PROBE_MIN_INTERVAL_MILLIS = 15_000;
+    /**
+     * 端口映射重试节流：上次尝试失败后，最少等多久再试一次。失败的网关通常持续失败，
+     * 30 秒退避足够避免狂刷 log 也保证用户在路由器 reboot 后能尽快重新映射。
+     */
+    private static final long PORT_MAPPING_RETRY_INTERVAL_MILLIS = 30_000;
+    /** 端口映射 lease 请求长度（秒）。多数路由器会钳到 7200 或自家默认值。 */
+    private static final int PORT_MAPPING_LEASE_SECONDS = 7_200;
 
     public PeerMeshClient(ClientAuthLoginResponse.PeerMeshConfig config, ControlSender controlSender) {
         this(config, controlSender, new PeerVirtualDeviceOptions(
@@ -110,6 +124,7 @@ public class PeerMeshClient implements AutoCloseable {
             pathPrepareMillis.clear();
             serverReflexiveCandidate = null;
             relayCandidate = null;
+            releasePortMapping();
             natType = "";
             lastEndpoint = "";
             directSuppressedLogged.set(false);
@@ -124,6 +139,7 @@ public class PeerMeshClient implements AutoCloseable {
         }
         running = true;
         startUdpSocket();
+        tryAcquirePortMappingAsync();
         startMaintenance();
         requestPeerServerCandidates();
         PeerVirtualDevice activeDevice = startVirtualDevice(nextConfig);
@@ -220,9 +236,125 @@ public class PeerMeshClient implements AutoCloseable {
         packetTraceLogMillis.clear();
         pendingVirtualPackets.clear();
         pathPrepareMillis.clear();
+        // 先释放 port mapping（best-effort 通知路由器撤销），再停 socket。
+        // 即使释放失败，路由器侧的 lease 也会自动过期。
+        releasePortMapping();
         stopMaintenance();
         stopUdpSocket();
         closeVirtualDevice();
+    }
+
+    // ─── NAT Port Mapping (UPnP / NAT-PMP / PCP) ────────────────────────────────
+
+    /**
+     * 异步触发一次端口映射协商。UPnP SSDP 多播 + 3 个 mapper 并发，最多 4 秒返回。
+     * 单独起线程，不阻塞 startOrUpdate 的同步段。失败兜底交给 STUN/打洞。
+     *
+     * <p>节流：上一次（成功或失败）{@link #PORT_MAPPING_RETRY_INTERVAL_MILLIS} 毫秒内不重试，
+     * 避免坏路由器场景里反复打满 log。
+     */
+    private void tryAcquirePortMappingAsync() {
+        DatagramSocket socket = udpSocket;
+        if (socket == null || socket.isClosed()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastPortMapAttemptMillis < PORT_MAPPING_RETRY_INTERVAL_MILLIS && portMapping == null) {
+            return;
+        }
+        lastPortMapAttemptMillis = now;
+        int internalPort = socket.getLocalPort();
+        if (internalPort <= 0) {
+            return;
+        }
+        Thread thread = new Thread(() -> attemptPortMapping(internalPort), "peer-mesh-port-mapper");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void attemptPortMapping(int internalPort) {
+        if (!running) {
+            return;
+        }
+        NatPortMapping mapping;
+        try {
+            mapping = natPortMappingService.tryAcquireMapping(
+                    internalPort,
+                    internalPort,
+                    PORT_MAPPING_LEASE_SECONDS,
+                    "shuai-tunnel peer mesh");
+        } catch (Exception e) {
+            log.debug("Peer mesh NAT 端口映射尝试异常: {}", e.getMessage());
+            return;
+        }
+        if (!running || mapping == null) {
+            return;
+        }
+        // 把映射结果转成一个 candidate，对端来连这个 (externalAddress, externalPort) 就能直达。
+        // type=srflx 让现有协议路径（连通性检查、Path 选择）零修改就能用上。
+        PeerCandidate candidate = new PeerCandidate();
+        candidate.setType("srflx");
+        candidate.setTransport("udp");
+        candidate.setAddress(mapping.externalAddress());
+        candidate.setPort(mapping.externalPort());
+        // 比 STUN srflx (800) 高，因为这是路由器**显式承诺**的映射，比通过 STUN 推断的更可靠。
+        candidate.setPriority(900);
+        candidate.setFoundation("port-map-" + mapping.protocol().name().toLowerCase());
+        portMapCandidate = candidate;
+        portMapping = mapping;
+        log.info("Peer mesh NAT 端口映射成功: protocol={}, external={}:{}, internal={}, lease={}s",
+                mapping.protocol(),
+                mapping.externalAddress(),
+                mapping.externalPort(),
+                mapping.internalPort(),
+                mapping.leaseSeconds());
+        announceCandidatesToOnlinePeers();
+    }
+
+    private void renewPortMappingIfNeeded() {
+        NatPortMapping current = portMapping;
+        if (current == null) {
+            // 没有现存映射，看看是不是节流窗口外了，可以重新尝试。
+            tryAcquirePortMappingAsync();
+            return;
+        }
+        if (!current.shouldRenew(Instant.now())) {
+            return;
+        }
+        DatagramSocket socket = udpSocket;
+        if (socket == null || socket.isClosed()) {
+            return;
+        }
+        NatPortMapping renewed = natPortMappingService.renewMapping(
+                current,
+                PORT_MAPPING_LEASE_SECONDS,
+                "shuai-tunnel peer mesh");
+        if (renewed != null) {
+            portMapping = renewed;
+            log.debug("Peer mesh NAT 端口映射续期: protocol={}, external={}:{}, lease={}s",
+                    renewed.protocol(), renewed.externalAddress(), renewed.externalPort(), renewed.leaseSeconds());
+        } else {
+            // 续期失败，丢掉当前映射，让 maintenance 下一轮重新发起 acquire
+            log.info("Peer mesh NAT 端口映射续期失败，下次 maintenance 重新协商");
+            portMapping = null;
+            portMapCandidate = null;
+            lastPortMapAttemptMillis = 0;  // 立刻允许重试
+        }
+    }
+
+    private void releasePortMapping() {
+        NatPortMapping current = portMapping;
+        portMapping = null;
+        portMapCandidate = null;
+        lastPortMapAttemptMillis = 0;
+        if (current != null) {
+            try {
+                natPortMappingService.releaseMapping(current);
+            } catch (Exception e) {
+                log.debug("Peer mesh NAT 端口映射释放失败（best-effort，路由器侧 lease 会自动过期）: {}",
+                        e.getMessage());
+            }
+        }
     }
 
     private void handleCandidates(PeerControlMessage control) {
@@ -474,6 +606,13 @@ public class PeerMeshClient implements AutoCloseable {
         if (srflx != null && !directDisabled) {
             candidates.add(srflx);
         }
+        // 端口映射 candidate 不受 NAT 类型限制——UPnP/NAT-PMP/PCP 在路由器上建立了显式映射，
+        // 对端 UDP 包能直接被路由器转发到我们，跳过整套 NAT 行为约束。即使本地是 Symmetric
+        // NAT，对端往这个端点发包也能命中。
+        PeerCandidate portMap = portMapCandidate;
+        if (portMap != null) {
+            candidates.add(portMap);
+        }
         PeerCandidate relay = relayCandidate;
         if (relay != null) {
             candidates.add(relay);
@@ -588,6 +727,7 @@ public class PeerMeshClient implements AutoCloseable {
                     cleanupPendingProbes();
                     cleanupPendingVirtualPackets();
                     requestPeerServerCandidates();
+                    renewPortMappingIfNeeded();
                     announceCandidatesToOnlinePeers();
                     probeKnownCandidates();
                 }
@@ -840,6 +980,11 @@ public class PeerMeshClient implements AutoCloseable {
     private void handleUdpPacket(DatagramPacket packet) {
         byte[] payload = Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength());
         InetSocketAddress observedRemote = new InetSocketAddress(packet.getAddress(), packet.getPort());
+        PeerRelayBinaryFrame binaryFrame = PeerRelayBinaryFrame.parse(payload);
+        if (binaryFrame != null && binaryFrame.type() == PeerRelayBinaryFrame.TYPE_DATA) {
+            handleUdpPayload(binaryFrame.payload(), observedRemote, binaryFrame.fromAllocationId());
+            return;
+        }
         String raw = new String(payload, StandardCharsets.UTF_8);
         if (raw.startsWith("{") && raw.contains(PeerRelayMessage.MAGIC)) {
             PeerRelayMessage relayMessage = JsonUtil.stringToObject(raw, PeerRelayMessage.class);
@@ -1515,14 +1660,18 @@ public class PeerMeshClient implements AutoCloseable {
         if (endpoint == null) {
             return false;
         }
-        PeerRelayMessage message = new PeerRelayMessage();
-        message.setType(PeerRelayMessage.TYPE_SEND);
-        message.setTransactionId(UUID.randomUUID().toString());
-        message.setAllocationId(relayAllocationId);
-        message.setToAllocationId(targetAllocationId);
-        message.setPayloadBase64(Base64.getEncoder().encodeToString(payload));
-        sendRelayControl(message, endpoint);
-        return true;
+        DatagramSocket socket = udpSocket;
+        if (socket == null || socket.isClosed()) {
+            return false;
+        }
+        try {
+            byte[] bytes = PeerRelayBinaryFrame.send(relayAllocationId, targetAllocationId, payload).toBytes();
+            socket.send(new DatagramPacket(bytes, bytes.length, endpoint));
+            return true;
+        } catch (Exception e) {
+            log.debug("Peer mesh relay payload 发送失败: reason={}", e.getMessage());
+            return false;
+        }
     }
 
     private InetSocketAddress relayEndpoint() {
