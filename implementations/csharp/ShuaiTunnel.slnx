@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/protocol/">
+    <Project Path="protocol/src/ShuaiTunnel.Protocol/ShuaiTunnel.Protocol.csproj" />
+    <Project Path="protocol/tests/ShuaiTunnel.Protocol.Tests/ShuaiTunnel.Protocol.Tests.csproj" />
+  </Folder>
+  <Folder Name="/client/">
+    <Project Path="client/src/ShuaiTunnel.Client/ShuaiTunnel.Client.csproj" />
+    <Project Path="client/tests/ShuaiTunnel.Client.Tests/ShuaiTunnel.Client.Tests.csproj" />
+  </Folder>
+  <Folder Name="/server/">
+    <Project Path="server/src/ShuaiTunnel.Server/ShuaiTunnel.Server.csproj" />
+    <Project Path="server/src/ShuaiTunnel.Server.Data/ShuaiTunnel.Server.Data.csproj" />
+    <Project Path="server/src/ShuaiTunnel.Server.Data.MySql/ShuaiTunnel.Server.Data.MySql.csproj" />
+    <Project Path="server/src/ShuaiTunnel.Server.Data.Postgres/ShuaiTunnel.Server.Data.Postgres.csproj" />
+    <Project Path="server/tests/ShuaiTunnel.IntegrationTests/ShuaiTunnel.IntegrationTests.csproj" />
+  </Folder>
+</Solution>

@@ -188,18 +188,37 @@ public sealed class DatabaseInitializer
             "tenant_id", cancellationToken).ConfigureAwait(false);
     }
 
-    private static Task BackfillConnectionStatTenantAsync(TunnelDbContext db, CancellationToken cancellationToken) =>
-        db.Database.ExecuteSqlRawAsync("""
-            UPDATE tunnel_connection_stat
-            SET tenant_id = COALESCE(
-                (SELECT c.tenant_id FROM tunnel_client_account c WHERE c.id = tunnel_connection_stat.client_id LIMIT 1),
-                (SELECT c.tenant_id FROM tunnel_client_account c
-                    WHERE tunnel_connection_stat.client_id IS NULL
-                      AND c.client_name = tunnel_connection_stat.client_name LIMIT 1),
-                tenant_id,
-                'default')
-            WHERE tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'default'
-            """, cancellationToken);
+    private static Task BackfillConnectionStatTenantAsync(TunnelDbContext db, CancellationToken cancellationToken)
+    {
+        return db.Database.ExecuteSqlRawAsync(
+            BuildConnectionStatTenantBackfillSql(db.Database.ProviderName),
+            cancellationToken);
+    }
+
+    private static string BuildConnectionStatTenantBackfillSql(string? providerName)
+    {
+        // The PK column on tunnel_client_account is created as PascalCase "Id" by EF Core's
+        // migration. PostgreSQL preserves the casing and requires "Id" to be double-quoted in
+        // raw SQL; SQLite and MySQL are case-insensitive on column names so plain Id also works
+        // there. The column name is a compile-time constant chosen from a closed set per
+        // provider — no user input — so the EF1002 raw-SQL warning at the call site doesn't
+        // apply here. We build the SQL string ahead of the call to keep the analyzer quiet.
+        var idColumn = DatabaseDialect(providerName) switch
+        {
+            "postgresql" => "\"Id\"",
+            _ => "Id",
+        };
+        return
+            "UPDATE tunnel_connection_stat " +
+            "SET tenant_id = COALESCE(" +
+                "(SELECT c.tenant_id FROM tunnel_client_account c WHERE c." + idColumn + " = tunnel_connection_stat.client_id LIMIT 1)," +
+                "(SELECT c.tenant_id FROM tunnel_client_account c " +
+                    "WHERE tunnel_connection_stat.client_id IS NULL " +
+                      "AND c.client_name = tunnel_connection_stat.client_name LIMIT 1)," +
+                "tenant_id," +
+                "'default') " +
+            "WHERE tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'default'";
+    }
 
     private static async Task EnsureTrafficDetailTablesAsync(TunnelDbContext db,
         CancellationToken cancellationToken)
