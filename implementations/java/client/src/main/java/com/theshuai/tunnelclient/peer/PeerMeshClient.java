@@ -67,10 +67,11 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile long lastRelayCandidateRequestMillis;
     private volatile long lastAlternateNatProbeRequestMillis;
     private volatile ScheduledExecutorService maintenanceExecutor;
-    private static final long SESSION_REFRESH_WINDOW_MILLIS = 120_000;
+    private static final long MAX_SESSION_REFRESH_WINDOW_MILLIS = 120_000;
+    private static final long MIN_SESSION_REFRESH_WINDOW_MILLIS = 10_000;
     private static final long DIRECT_STALE_MILLIS = 45_000;
     private static final long PENDING_PROBE_TTL_MILLIS = 15_000;
-    private static final long PENDING_PACKET_TTL_MILLIS = 8_000;
+    private static final long PENDING_PACKET_TTL_MILLIS = 30_000;
     private static final int MAX_PENDING_PACKETS_PER_PEER = 32;
     private static final long ON_DEMAND_PREPARE_INTERVAL_MILLIS = 2_000;
     private static final long NAT_PROBE_STALE_MILLIS = 120_000;
@@ -253,10 +254,21 @@ public class PeerMeshClient implements AutoCloseable {
         );
         PeerSession previous = sessions.put(peerId, next);
         if (previous != null) {
+            boolean sameSession = previous.sessionId().equals(next.sessionId());
+            if (sameSession) {
+                next.outboundSequence.set(previous.outboundSequence.get());
+                next.inboundReplayWindow = previous.inboundReplayWindow.copy();
+            }
             next.remoteEndpoint = previous.remoteEndpoint;
-            next.inboundReplayWindow = previous.inboundReplayWindow.copy();
             next.relayTargetAllocationId = previous.relayTargetAllocationId;
             next.directBytesSinceReport.addAndGet(previous.drainDirectBytes());
+            next.lastDirectSuccessMillis = previous.lastDirectSuccessMillis;
+            next.lastRelaySuccessMillis = previous.lastRelaySuccessMillis;
+            next.lastPathLogMillis = previous.lastPathLogMillis;
+            next.lastPathReportMillis = previous.lastPathReportMillis;
+            next.lastKeyMissingLogMillis = previous.lastKeyMissingLogMillis;
+            next.lastPathRemoteText = previous.lastPathRemoteText;
+            next.currentPathType = previous.currentPathType;
         }
         log.debug("Peer mesh session 已授权: session={}, peer={}", control.getSessionId(), peerId);
     }
@@ -290,6 +302,11 @@ public class PeerMeshClient implements AutoCloseable {
         long peerId = peerId(control);
         if (peerId > 0) {
             sessions.remove(peerId);
+            PeerInfo peer = peers.get(peerId);
+            if (peer != null && peer.online()) {
+                pathPrepareMillis.remove(peerId);
+                preparePathForPeer(peer, null);
+            }
         }
     }
 
@@ -355,7 +372,7 @@ public class PeerMeshClient implements AutoCloseable {
             sessions.remove(peerId, session);
             return null;
         }
-        if (session.isExpiringWithin(now, SESSION_REFRESH_WINDOW_MILLIS)) {
+        if (session.shouldRefresh(now)) {
             return null;
         }
         return session;
@@ -1632,6 +1649,7 @@ public class PeerMeshClient implements AutoCloseable {
         private final String token;
         private final String expiresAt;
         private final byte[] aesKey;
+        private final long createdAtMillis;
         private final AtomicLong outboundSequence = new AtomicLong();
         private final AtomicLong directBytesSinceReport = new AtomicLong();
         private volatile PeerReplayWindow inboundReplayWindow = new PeerReplayWindow();
@@ -1646,15 +1664,20 @@ public class PeerMeshClient implements AutoCloseable {
         private volatile String relayTargetAllocationId;
 
         private PeerSession(Long sessionId, long peerId, String token, String expiresAt, byte[] aesKey) {
+            this(sessionId, peerId, token, expiresAt, aesKey, System.currentTimeMillis());
+        }
+
+        private PeerSession(Long sessionId, long peerId, String token, String expiresAt, byte[] aesKey, long createdAtMillis) {
             this.sessionId = sessionId;
             this.peerId = peerId;
             this.token = token;
             this.expiresAt = expiresAt;
             this.aesKey = aesKey;
+            this.createdAtMillis = createdAtMillis;
         }
 
         PeerSession withAesKey(byte[] nextKey) {
-            PeerSession next = new PeerSession(sessionId, peerId, token, expiresAt, nextKey);
+            PeerSession next = new PeerSession(sessionId, peerId, token, expiresAt, nextKey, createdAtMillis);
             next.outboundSequence.set(outboundSequence.get());
             next.directBytesSinceReport.set(directBytesSinceReport.get());
             next.remoteEndpoint = remoteEndpoint;
@@ -1745,9 +1768,19 @@ public class PeerMeshClient implements AutoCloseable {
             return expiresAtMillis != Long.MAX_VALUE && expiresAtMillis <= nowMillis;
         }
 
-        boolean isExpiringWithin(long nowMillis, long windowMillis) {
+        boolean shouldRefresh(long nowMillis) {
             long expiresAtMillis = expiresAtMillis();
-            return expiresAtMillis != Long.MAX_VALUE && expiresAtMillis - nowMillis <= windowMillis;
+            return expiresAtMillis != Long.MAX_VALUE && expiresAtMillis - nowMillis <= refreshWindowMillis(expiresAtMillis);
+        }
+
+        long refreshWindowMillis(long expiresAtMillis) {
+            if (expiresAtMillis == Long.MAX_VALUE) {
+                return 0;
+            }
+            long lifetimeMillis = Math.max(0, expiresAtMillis - createdAtMillis);
+            long proportionalWindow = lifetimeMillis / 4;
+            long boundedWindow = Math.max(MIN_SESSION_REFRESH_WINDOW_MILLIS, proportionalWindow);
+            return Math.min(MAX_SESSION_REFRESH_WINDOW_MILLIS, boundedWindow);
         }
 
         private long expiresAtMillis() {
