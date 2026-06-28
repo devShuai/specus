@@ -7,6 +7,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 ADMIN_WEB_DIST="${ADMIN_WEB_DIST:-${REPO_ROOT}/apps/admin-web/dist}"
 ADMIN_WEB_ROOT="${ADMIN_WEB_ROOT:-/opt/shuai-tunnel/admin-web}"
 OPENRESTY_CONF_DIR="${OPENRESTY_CONF_DIR:-/usr/local/openresty/nginx/conf/conf.d}"
+OPENRESTY_CONF_NAME="${OPENRESTY_CONF_NAME:-tunnel.devshuai.com.conf}"
 OPENRESTY_BIN="${OPENRESTY_BIN:-openresty}"
 
 if [[ ! -d "${ADMIN_WEB_DIST}" ]]; then
@@ -18,11 +19,14 @@ fi
 install -d -m 0755 "${ADMIN_WEB_ROOT}"
 rm -rf "${ADMIN_WEB_ROOT:?}/"*
 cp -a "${ADMIN_WEB_DIST}/." "${ADMIN_WEB_ROOT}/"
+chmod 0755 "${ADMIN_WEB_ROOT}"
+find "${ADMIN_WEB_ROOT}" -type d -exec chmod 0755 {} \;
+find "${ADMIN_WEB_ROOT}" -type f -exec chmod 0644 {} \;
 
 if [[ -d "${OPENRESTY_CONF_DIR}" ]]; then
-  install -m 0644 "${SCRIPT_DIR}/shuai-tunnel.conf" "${OPENRESTY_CONF_DIR}/shuai-tunnel.conf"
+  install -m 0644 "${SCRIPT_DIR}/shuai-tunnel.conf" "${OPENRESTY_CONF_DIR}/${OPENRESTY_CONF_NAME}"
   "${OPENRESTY_BIN}" -t
-  echo "installed OpenResty config: ${OPENRESTY_CONF_DIR}/shuai-tunnel.conf"
+  echo "installed OpenResty config: ${OPENRESTY_CONF_DIR}/${OPENRESTY_CONF_NAME}"
 else
   echo "skip config install, directory missing: ${OPENRESTY_CONF_DIR}" >&2
 fi

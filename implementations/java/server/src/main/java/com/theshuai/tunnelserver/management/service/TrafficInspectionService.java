@@ -57,20 +57,25 @@ public class TrafficInspectionService {
     private final Map<String, StreamCursor> tcpStreamCursors = new ConcurrentHashMap<>();
     private final AtomicInteger pendingHttpCount = new AtomicInteger();
     private final AtomicInteger pendingTcpCount = new AtomicInteger();
+    private final AtomicLong droppedHttpCount = new AtomicLong();
+    private final AtomicLong droppedTcpCount = new AtomicLong();
     private final boolean captureEnabled;
     private final int previewBytes;
     private final int headerChars;
+    private final int decodeMaxBytes;
     private final int maxPending;
     private final int flushBatchSize;
+    private volatile Instant lastFlushedAt;
 
     public TrafficInspectionService(ClientAccountService clientAccountService,
                                     TunnelMappingRepository tunnelMappingRepository,
                                     HttpRouteMappingRepository httpRouteMappingRepository,
                                     HttpTrafficExchangeStore httpTrafficExchangeStore,
                                     TcpTrafficFrameStore tcpTrafficFrameStore,
-                                    @Value("${tunnel.traffic.capture-detail-enabled:true}") boolean captureEnabled,
+                                    @Value("${tunnel.traffic.capture-detail-enabled:false}") boolean captureEnabled,
                                     @Value("${tunnel.traffic.capture-preview-bytes:256}") int previewBytes,
                                     @Value("${tunnel.traffic.capture-header-chars:8192}") int headerChars,
+                                    @Value("${tunnel.traffic.capture-decode-max-bytes:1048576}") int decodeMaxBytes,
                                     @Value("${tunnel.traffic.capture-max-pending:20000}") int maxPending,
                                     @Value("${tunnel.traffic.capture-flush-batch-size:1000}") int flushBatchSize) {
         this.clientAccountService = clientAccountService;
@@ -81,6 +86,7 @@ public class TrafficInspectionService {
         this.captureEnabled = captureEnabled;
         this.previewBytes = Math.max(0, previewBytes);
         this.headerChars = Math.max(0, headerChars);
+        this.decodeMaxBytes = Math.max(1024, decodeMaxBytes);
         this.maxPending = Math.max(0, maxPending);
         this.flushBatchSize = Math.max(1, flushBatchSize);
     }
@@ -98,7 +104,8 @@ public class TrafficInspectionService {
                                    long startedAtMillis,
                                    String remoteAddress,
                                    String error) {
-        if (!captureEnabled || clientName == null || !shouldCaptureHttpDetail(clientName, route) || !acquireSlot(pendingHttpCount)) {
+        if (!captureEnabled || clientName == null || !shouldCaptureHttpDetail(clientName, route)
+                || !acquireSlot(pendingHttpCount, droppedHttpCount)) {
             return;
         }
 
@@ -172,7 +179,7 @@ public class TrafficInspectionService {
                                 Integer destinationPort,
                                 byte[] payload) {
         if (!captureEnabled || clientName == null || listenPort <= 0 || !shouldCaptureTcpDetail(clientName, listenPort)
-                || !acquireSlot(pendingTcpCount)) {
+                || !acquireSlot(pendingTcpCount, droppedTcpCount)) {
             return;
         }
 
@@ -210,11 +217,36 @@ public class TrafficInspectionService {
         tcpStreamCursors.keySet().removeIf(key -> key.contains(token));
     }
 
+    /**
+     * S1.4 把原本单个 {@code synchronized flush()} 拆成两个独立 {@code @Scheduled} 方法。
+     * 原实现里 HTTP 与 TCP 共用一把 monitor 锁：一旦 TCP 落库慢（大帧写 ES/DB），
+     * HTTP 落库会被整段阻塞，反过来也一样。拆开之后两条路径互不阻塞；drain 本身走
+     * {@link ConcurrentLinkedQueue#poll()} + {@link AtomicInteger#decrementAndGet()}，天然线程安全，
+     * 不需要 {@code synchronized} 保护。
+     *
+     * <p>两个方法各自独立 {@code @Transactional}，事务粒度更小。{@link #lastFlushedAt} 是
+     * {@code volatile} 的展示字段，两个方法都更新，last-write-wins 即可。
+     *
+     * <p>保留无注解的 {@link #flush()} 给 {@link #flushBeforeShutdown()} 与单测调用。
+     */
     @Scheduled(fixedDelayString = "${tunnel.traffic.capture-flush-interval-ms:2000}")
     @Transactional
-    public synchronized void flush() {
-        flushHttp();
-        flushTcp();
+    public void flushHttp() {
+        flushHttpInternal();
+        lastFlushedAt = Instant.now();
+    }
+
+    @Scheduled(fixedDelayString = "${tunnel.traffic.capture-flush-interval-ms:2000}")
+    @Transactional
+    public void flushTcp() {
+        flushTcpInternal();
+        lastFlushedAt = Instant.now();
+    }
+
+    public void flush() {
+        flushHttpInternal();
+        flushTcpInternal();
+        lastFlushedAt = Instant.now();
     }
 
     @PreDestroy
@@ -222,7 +254,7 @@ public class TrafficInspectionService {
         flush();
     }
 
-    private void flushHttp() {
+    private void flushHttpInternal() {
         List<PendingHttpExchange> pending = drain(pendingHttpExchanges, pendingHttpCount);
         if (pending.isEmpty()) {
             return;
@@ -271,7 +303,7 @@ public class TrafficInspectionService {
         httpTrafficExchangeStore.saveAll(entities);
     }
 
-    private void flushTcp() {
+    private void flushTcpInternal() {
         List<PendingTcpFrame> pending = drain(pendingTcpFrames, pendingTcpCount);
         if (pending.isEmpty()) {
             return;
@@ -349,13 +381,27 @@ public class TrafficInspectionService {
         return items;
     }
 
-    private boolean acquireSlot(AtomicInteger count) {
+    public Snapshot snapshot() {
+        Instant flushedAt = lastFlushedAt;
+        return new Snapshot(
+                captureEnabled,
+                pendingHttpCount.get(),
+                pendingTcpCount.get(),
+                droppedHttpCount.get(),
+                droppedTcpCount.get(),
+                flushedAt == null ? null : flushedAt.toString()
+        );
+    }
+
+    private boolean acquireSlot(AtomicInteger count, AtomicLong droppedCount) {
         if (maxPending <= 0) {
+            droppedCount.incrementAndGet();
             return false;
         }
         int value = count.incrementAndGet();
         if (value > maxPending) {
             count.decrementAndGet();
+            droppedCount.incrementAndGet();
             return false;
         }
         return true;
@@ -460,22 +506,23 @@ public class TrafficInspectionService {
         DecodedBody decoded = decodeContentEncoding(data, contentEncoding);
         byte[] displayData = decoded.data();
         if (!decoded.decoded() && hasEncodedBody(contentEncoding) && !looksLikeText(displayData)) {
-            return new Preview("", "data:application/octet-stream;base64," + Base64.getEncoder().encodeToString(displayData), false);
+            return new Preview("", "data:application/octet-stream;base64," + Base64.getEncoder().encodeToString(displayData), decoded.truncated());
         }
         if (!isTextBody(contentType) && !looksLikeText(displayData)) {
             String mediaType = mediaType(contentType);
-            return new Preview("", "data:" + mediaType + ";base64," + Base64.getEncoder().encodeToString(displayData), false);
+            return new Preview("", "data:" + mediaType + ";base64," + Base64.getEncoder().encodeToString(displayData), decoded.truncated());
         }
-        return new Preview("", sanitizeText(new String(displayData, StandardCharsets.UTF_8)), false);
+        return new Preview("", sanitizeText(new String(displayData, StandardCharsets.UTF_8)), decoded.truncated());
     }
 
     private DecodedBody decodeContentEncoding(byte[] data, String contentEncoding) {
         if (!hasEncodedBody(contentEncoding)) {
-            return new DecodedBody(data, false);
+            return new DecodedBody(data, false, false);
         }
         String[] tokens = contentEncoding.split(",");
         byte[] current = data;
         boolean decoded = false;
+        boolean truncated = false;
         try {
             for (int i = tokens.length - 1; i >= 0; i--) {
                 String token = tokens[i].trim().toLowerCase(Locale.ROOT);
@@ -483,56 +530,80 @@ public class TrafficInspectionService {
                     continue;
                 }
                 if (token.equals("gzip") || token.equals("x-gzip")) {
-                    current = gunzip(current);
+                    LimitedBytes result = gunzip(current);
+                    current = result.data();
+                    truncated = truncated || result.truncated();
                     decoded = true;
+                    if (truncated) {
+                        break;
+                    }
                     continue;
                 }
                 if (token.equals("deflate") || token.equals("x-deflate")) {
-                    current = inflate(current);
+                    LimitedBytes result = inflate(current);
+                    current = result.data();
+                    truncated = truncated || result.truncated();
                     decoded = true;
+                    if (truncated) {
+                        break;
+                    }
                     continue;
                 }
                 if (token.equals("br")) {
-                    current = brotli(current);
+                    LimitedBytes result = brotli(current);
+                    current = result.data();
+                    truncated = truncated || result.truncated();
                     decoded = true;
+                    if (truncated) {
+                        break;
+                    }
                     continue;
                 }
-                return new DecodedBody(data, false);
+                return new DecodedBody(data, false, false);
             }
-            return new DecodedBody(current, decoded);
+            return new DecodedBody(current, decoded, truncated);
         } catch (IOException | IllegalArgumentException ignored) {
-            return new DecodedBody(data, false);
+            return new DecodedBody(data, false, false);
         }
     }
 
-    private byte[] gunzip(byte[] data) throws IOException {
+    private LimitedBytes gunzip(byte[] data) throws IOException {
         try (GZIPInputStream input = new GZIPInputStream(new ByteArrayInputStream(data))) {
-            return readAll(input);
+            return readLimited(input);
         }
     }
 
-    private byte[] inflate(byte[] data) throws IOException {
+    private LimitedBytes inflate(byte[] data) throws IOException {
         try {
             try (InflaterInputStream input = new InflaterInputStream(new ByteArrayInputStream(data))) {
-                return readAll(input);
+                return readLimited(input);
             }
         } catch (IOException first) {
             try (InflaterInputStream input = new InflaterInputStream(new ByteArrayInputStream(data), new Inflater(true))) {
-                return readAll(input);
+                return readLimited(input);
             }
         }
     }
 
-    private byte[] brotli(byte[] data) throws IOException {
+    private LimitedBytes brotli(byte[] data) throws IOException {
         try (BrotliInputStream input = new BrotliInputStream(new ByteArrayInputStream(data))) {
-            return readAll(input);
+            return readLimited(input);
         }
     }
 
-    private byte[] readAll(java.io.InputStream input) throws IOException {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        input.transferTo(output);
-        return output.toByteArray();
+    private LimitedBytes readLimited(java.io.InputStream input) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream(Math.min(decodeMaxBytes, 8192));
+        byte[] buffer = new byte[8192];
+        int remaining = decodeMaxBytes;
+        while (remaining > 0) {
+            int read = input.read(buffer, 0, Math.min(buffer.length, remaining));
+            if (read < 0) {
+                return new LimitedBytes(output.toByteArray(), false);
+            }
+            output.write(buffer, 0, read);
+            remaining -= read;
+        }
+        return new LimitedBytes(output.toByteArray(), input.read() >= 0);
     }
 
     private boolean hasEncodedBody(String contentEncoding) {
@@ -691,7 +762,18 @@ public class TrafficInspectionService {
     private record Preview(String hex, String text, boolean truncated) {
     }
 
-    private record DecodedBody(byte[] data, boolean decoded) {
+    public record Snapshot(boolean enabled,
+                           int pendingHttp,
+                           int pendingTcp,
+                           long droppedHttp,
+                           long droppedTcp,
+                           String lastFlushedAt) {
+    }
+
+    private record DecodedBody(byte[] data, boolean decoded, boolean truncated) {
+    }
+
+    private record LimitedBytes(byte[] data, boolean truncated) {
     }
 
     private record CaptureDecision(boolean enabled, long expiresAtNanos) {

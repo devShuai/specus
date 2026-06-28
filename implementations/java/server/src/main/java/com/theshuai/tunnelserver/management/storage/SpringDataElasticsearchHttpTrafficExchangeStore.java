@@ -65,7 +65,6 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
         }
         ensureIndex();
         operations.save(exchanges.stream().map(this::toDocument).toList());
-        operations.indexOps(HttpTrafficExchangeDocument.class).refresh();
         trimIfNecessary();
     }
 
@@ -396,7 +395,6 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
                     operations.delete(document.getDocumentId(), HttpTrafficExchangeDocument.class);
                     deleted++;
                 }
-                operations.indexOps(HttpTrafficExchangeDocument.class).refresh();
                 storeBytes = currentStoreBytes();
                 batches++;
             }

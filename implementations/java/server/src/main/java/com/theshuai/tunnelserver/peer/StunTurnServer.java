@@ -1,6 +1,7 @@
 package com.theshuai.tunnelserver.peer;
 
 import com.theshuai.common.peermesh.PeerDataFrameHeader;
+import com.theshuai.common.peermesh.PeerRelayBinaryFrame;
 import com.theshuai.common.peermesh.PeerRelayMessage;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
@@ -21,7 +22,12 @@ import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 @Component
 @Slf4j
@@ -34,6 +40,7 @@ public class StunTurnServer implements ApplicationRunner {
     private DatagramSocket alternateSocket;
     private Thread primaryThread;
     private Thread alternateThread;
+    private ExecutorService relayExecutor;
     private volatile boolean running;
 
     public StunTurnServer(PeerMeshProperties properties, PeerMeshService peerMeshService) {
@@ -48,6 +55,7 @@ public class StunTurnServer implements ApplicationRunner {
         }
         try {
             primarySocket = new DatagramSocket(properties.getStunTurnPort());
+            relayExecutor = createRelayExecutor();
             running = true;
             primaryThread = new Thread(
                     () -> receiveLoop(primarySocket, PeerRelayMessage.PROBE_PRIMARY),
@@ -96,8 +104,13 @@ public class StunTurnServer implements ApplicationRunner {
     }
 
     private void handle(DatagramPacket packet, DatagramSocket receiveSocket, String probeRole) throws Exception {
-        String message = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8).trim();
         InetSocketAddress remote = new InetSocketAddress(packet.getAddress(), packet.getPort());
+        PeerRelayBinaryFrame binaryFrame = PeerRelayBinaryFrame.parse(packet.getData(), packet.getOffset(), packet.getLength());
+        if (binaryFrame != null) {
+            dispatchRelayBinaryFrame(binaryFrame, remote);
+            return;
+        }
+        String message = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8).trim();
         if (message.startsWith("{")) {
             PeerRelayMessage relayMessage = JsonUtil.stringToObject(message, PeerRelayMessage.class);
             if (relayMessage != null && PeerRelayMessage.MAGIC.equals(relayMessage.getMagic())) {
@@ -128,6 +141,29 @@ public class StunTurnServer implements ApplicationRunner {
         receiveSocket.send(new DatagramPacket(bytes, bytes.length, packet.getAddress(), packet.getPort()));
     }
 
+    private void dispatchRelayBinaryFrame(PeerRelayBinaryFrame frame, InetSocketAddress remote) {
+        ExecutorService executor = relayExecutor;
+        if (executor == null) {
+            try {
+                handleRelayBinaryFrame(frame, remote);
+            } catch (Exception e) {
+                log.debug("[peer-mesh] binary relay frame failed: {}", e.toString());
+            }
+            return;
+        }
+        try {
+            executor.execute(() -> {
+                try {
+                    handleRelayBinaryFrame(frame, remote);
+                } catch (Exception e) {
+                    log.debug("[peer-mesh] binary relay frame failed: {}", e.toString());
+                }
+            });
+        } catch (RuntimeException e) {
+            log.debug("[peer-mesh] binary relay frame dropped: {}", e.toString());
+        }
+    }
+
     private void handleRelayMessage(PeerRelayMessage message,
                                     InetSocketAddress remote,
                                     DatagramSocket receiveSocket,
@@ -139,6 +175,27 @@ public class StunTurnServer implements ApplicationRunner {
             case PeerRelayMessage.TYPE_SEND -> relayData(message, remote);
             default -> sendRelayResponse(primarySocket, remote, error(message, "unsupported-command"));
         }
+    }
+
+    private void handleRelayBinaryFrame(PeerRelayBinaryFrame frame, InetSocketAddress remote) throws Exception {
+        if (frame.type() != PeerRelayBinaryFrame.TYPE_SEND) {
+            return;
+        }
+        Allocation source = allocations.get(frame.fromAllocationId());
+        if (source == null || !sameEndpoint(source.remote(), remote)) {
+            return;
+        }
+        Allocation target = allocations.get(frame.toAllocationId());
+        if (target == null) {
+            return;
+        }
+        byte[] payload = frame.payload();
+        PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
+        if (header != null && !peerMeshService.authorizeRelayFrameForRelay(header, payload.length)) {
+            return;
+        }
+        PeerRelayBinaryFrame data = PeerRelayBinaryFrame.data(source.id(), target.id(), payload);
+        sendRelayBinary(primarySocket, target.remote(), data);
     }
 
     private void binding(PeerRelayMessage request,
@@ -221,7 +278,7 @@ public class StunTurnServer implements ApplicationRunner {
             return;
         }
         PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
-        if (header != null && !peerMeshService.authorizeRelayFrame(header, payload.length)) {
+        if (header != null && !peerMeshService.authorizeRelayFrameForRelay(header, payload.length)) {
             sendRelayResponse(primarySocket, remote, error(request, "relay-session-denied"));
             return;
         }
@@ -262,6 +319,14 @@ public class StunTurnServer implements ApplicationRunner {
         outbound.send(new DatagramPacket(bytes, bytes.length, remote));
     }
 
+    private void sendRelayBinary(DatagramSocket outbound, InetSocketAddress remote, PeerRelayBinaryFrame frame) throws Exception {
+        if (outbound == null || outbound.isClosed()) {
+            return;
+        }
+        byte[] bytes = frame.toBytes();
+        outbound.send(new DatagramPacket(bytes, bytes.length, remote));
+    }
+
     @Scheduled(fixedDelay = 30_000)
     public void cleanupExpiredAllocations() {
         Instant now = Instant.now();
@@ -282,6 +347,9 @@ public class StunTurnServer implements ApplicationRunner {
         }
         if (alternateSocket != null) {
             alternateSocket.close();
+        }
+        if (relayExecutor != null) {
+            relayExecutor.shutdownNow();
         }
     }
 
@@ -319,5 +387,31 @@ public class StunTurnServer implements ApplicationRunner {
             return "";
         }
         return responseSocket.getLocalAddress().getHostAddress();
+    }
+
+    private ExecutorService createRelayExecutor() {
+        int configuredThreads = properties.getRelayWorkerThreads();
+        int workers = configuredThreads > 0
+                ? configuredThreads
+                : Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+        int queueCapacity = Math.max(1, properties.getRelayWorkerQueueCapacity());
+        ThreadFactory threadFactory = new ThreadFactory() {
+            private int index;
+
+            @Override
+            public Thread newThread(Runnable runnable) {
+                Thread thread = new Thread(runnable, "peer-mesh-relay-" + (++index));
+                thread.setDaemon(true);
+                return thread;
+            }
+        };
+        return new ThreadPoolExecutor(
+                workers,
+                workers,
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(queueCapacity),
+                threadFactory,
+                new ThreadPoolExecutor.DiscardPolicy());
     }
 }

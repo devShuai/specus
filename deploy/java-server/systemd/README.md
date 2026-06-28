@@ -123,6 +123,9 @@ TUNNEL_PEER_MESH_PUBLIC_ADDRESS=tunnel.example.com
 TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
 TUNNEL_PEER_MESH_SESSION_TTL_SECONDS=3600
 TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
+TUNNEL_PEER_MESH_RELAY_WORKER_THREADS=0
+TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY=10000
+TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS=5000
 ```
 
 启用后需要额外放行 UDP：
@@ -137,6 +140,8 @@ sudo firewall-cmd --reload
 `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` 调整备用端口；只有一个公网 IP 时，Full Cone 与
 Address-Restricted NAT 仍会合并展示为 `Full cone / Restricted NAT`。
 
+relay 数据面使用二进制 UDP frame，控制面仍使用 JSON binding/allocate/refresh。`TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` 控制二进制 relay 数据帧工作线程，0 表示自动；relay 流量不会每帧写库，而是按 `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` 周期聚合入库。
+
 客户端侧默认 `peerMeshDevice=noop`，只运行控制面、候选交换、探测和加密 UDP 数据面；要真正接管虚拟 IP 流量，需要启用虚拟网卡：
 
 * Linux：`peerMeshDevice=linux-tun` 或 `auto`，进程需要 root 或 `CAP_NET_ADMIN`，系统需要 `/dev/net/tun` 和 `ip` 命令。
@@ -150,15 +155,16 @@ Address-Restricted NAT 仍会合并展示为 `Full cone / Restricted NAT`。
 TUNNEL_HTTP_TIMEOUT_MS=30000
 TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE=16777216
 
-TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED=true
+TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED=false
 TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES=256
 TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS=8192
+TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES=1048576
 TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING=20000
 TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE=1000
 TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS=2000
 ```
 
-HTTP / TCP 明细默认写入业务数据库；管理页会分页读取 HTTP 请求/响应和 TCP payload。`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` 是总开关，每条 HTTP 路由 / TCP 映射仍需在管理页单独开启明细采集，新建通道默认关闭。HTTP Body 入库前会按 `Content-Encoding` 解压 `gzip`、`deflate`、`br`，前端也会对旧记录做 best-effort 兜底。
+HTTP / TCP 明细默认写入业务数据库；管理页会分页读取 HTTP 请求/响应和 TCP payload。`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` 是总开关，默认关闭；每条 HTTP 路由 / TCP 映射仍需在管理页单独开启明细采集，新建通道默认关闭。HTTP Body 入库前会按 `Content-Encoding` 解压 `gzip`、`deflate`、`br`，解压预览受 `TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES` 限制，前端也会对旧记录做 best-effort 兜底。管理查询默认不强制 flush，手动排查时可在流量明细接口追加 `flush=true`。
 
 ### 4.7 Elasticsearch 流量明细存储（可选）
 

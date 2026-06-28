@@ -62,22 +62,19 @@ public class JpaTcpTrafficFrameStore implements TcpTrafficFrameStore {
     }
 
     @Override
-    public List<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
+    public Page<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
                                                 Pageable pageable) {
         if (channelId == null || channelId.isBlank()) {
-            return List.of();
+            return Page.empty(pageable);
         }
         if (visibleClientIds != null && visibleClientIds.isEmpty()) {
-            return List.of();
+            return Page.empty(pageable);
         }
-        List<TcpTrafficFrame> frames = visibleClientIds == null
+        Page<TcpTrafficFrame> frames = visibleClientIds == null
                 ? repository.findByTenantIdAndChannelIdOrderByIdAsc(tenant.tenantId(), channelId.trim(), pageable)
                 : repository.findByTenantIdAndChannelIdAndClientIdInOrderByIdAsc(
                         tenant.tenantId(), channelId.trim(), List.copyOf(visibleClientIds), pageable);
-        return frames
-                .stream()
-                .map(frame -> toView(frame, true))
-                .toList();
+        return frames.map(frame -> toView(frame, true));
     }
 
     private static boolean isDenied(Long clientId, Set<Long> visibleClientIds) {

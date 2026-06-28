@@ -243,8 +243,20 @@ export interface TcpTrafficStream {
   channelId: string;
   items: TcpTrafficFrame[];
   total: number;
+  page: number;
+  size: number;
   limit: number;
+  totalPages: number;
   truncated: boolean;
+}
+
+export interface TrafficInspectionStatus {
+  enabled: boolean;
+  pendingHttp: number;
+  pendingTcp: number;
+  droppedHttp: number;
+  droppedTcp: number;
+  lastFlushedAt: string | null;
 }
 
 export interface NatControlResult {
@@ -316,6 +328,14 @@ export interface PeerMeshSession {
   updatedAt: string;
   expiresAt: string;
   closedAt: string | null;
+}
+
+export interface PeerMeshSessionPage {
+  items: PeerMeshSession[];
+  total: number;
+  page: number;
+  size: number;
+  totalPages: number;
 }
 
 export interface DatabaseInitResult {

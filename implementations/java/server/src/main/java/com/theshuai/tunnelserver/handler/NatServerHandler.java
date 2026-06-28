@@ -159,17 +159,21 @@ public class NatServerHandler extends NatCommonHandler {
         }
         int listenPort = externalChannelPorts.getOrDefault(channelId, 0);
         trafficUsageService.recordTcpUpload(clientName, listenPort, data.length);
+        // S1.1 endpoint 字符串走 target channel 上 RemoteTunnelHandler.channelActive 缓存的 attr，
+        // 替代每帧 endpointAddress() 里的 instanceof + getHostAddress() 分配。
+        ChannelAttributes.EndpointSnapshot localEp = ChannelAttributes.localEndpoint(target);
+        ChannelAttributes.EndpointSnapshot remoteEp = ChannelAttributes.remoteEndpoint(target);
         trafficInspectionService.recordTcpFrame(clientName, listenPort, channelId,
                 TrafficInspectionService.DIRECTION_CLIENT_TO_PUBLIC,
-                endpointAddress(target.localAddress()),
-                endpointPort(target.localAddress()),
-                endpointAddress(target.remoteAddress()),
-                endpointPort(target.remoteAddress()),
+                localEp.address(),
+                localEp.port(),
+                remoteEp.address(),
+                remoteEp.port(),
                 data);
         target.writeAndFlush(data).addListener(future -> {
             if (!future.isSuccess()) {
                 log.warn("write DATA to external channel {} failed [{}]",
-                        target.id().asLongText(), clientName, future.cause());
+                        ChannelAttributes.channelId(target), clientName, future.cause());
                 target.close();
             }
         });

@@ -64,7 +64,6 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
         }
         ensureIndex();
         operations.save(frames.stream().map(this::toDocument).toList());
-        operations.indexOps(TcpTrafficFrameDocument.class).refresh();
         trimIfNecessary();
     }
 
@@ -112,13 +111,13 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
     }
 
     @Override
-    public List<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
+    public Page<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
                                                 Pageable pageable) {
         if (channelId == null || channelId.isBlank()) {
-            return List.of();
+            return Page.empty(pageable);
         }
         if (visibleClientIds != null && visibleClientIds.isEmpty()) {
-            return List.of();
+            return Page.empty(pageable);
         }
         ensureIndex();
         String normalizedChannelId = channelId.trim();
@@ -134,10 +133,11 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
                 .withSort(sort -> sort.field(field -> field.field("id").order(SortOrder.Asc)))
                 .build();
         SearchHits<TcpTrafficFrameDocument> hits = operations.search(nativeQuery, TcpTrafficFrameDocument.class);
-        return hits.getSearchHits().stream()
+        List<TcpTrafficFrameView> items = hits.getSearchHits().stream()
                 .map(SearchHit::getContent)
                 .map(document -> toView(document, true))
                 .toList();
+        return new PageImpl<>(items, pageable, hits.getTotalHits());
     }
 
     @Override
@@ -299,7 +299,6 @@ public class SpringDataElasticsearchTcpTrafficFrameStore implements TcpTrafficFr
                     operations.delete(document.getDocumentId(), TcpTrafficFrameDocument.class);
                     deleted++;
                 }
-                operations.indexOps(TcpTrafficFrameDocument.class).refresh();
                 storeBytes = currentStoreBytes();
                 batches++;
             }

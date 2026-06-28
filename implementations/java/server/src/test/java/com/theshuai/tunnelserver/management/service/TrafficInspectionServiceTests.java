@@ -54,6 +54,7 @@ class TrafficInspectionServiceTests {
                 true,
                 8,
                 8192,
+                1048576,
                 10,
                 10
         );
@@ -117,6 +118,7 @@ class TrafficInspectionServiceTests {
                 true,
                 8,
                 8192,
+                1048576,
                 10,
                 10
         );
@@ -166,6 +168,7 @@ class TrafficInspectionServiceTests {
                 true,
                 8,
                 8192,
+                1048576,
                 10,
                 10
         );
@@ -228,6 +231,7 @@ class TrafficInspectionServiceTests {
                 true,
                 8,
                 8192,
+                1048576,
                 10,
                 10
         );
@@ -287,6 +291,7 @@ class TrafficInspectionServiceTests {
                 true,
                 4,
                 8192,
+                1048576,
                 10,
                 10
         );

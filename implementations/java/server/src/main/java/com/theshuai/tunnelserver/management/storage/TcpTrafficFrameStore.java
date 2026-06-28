@@ -18,7 +18,7 @@ public interface TcpTrafficFrameStore {
 
     Optional<TcpTrafficFrameView> findById(TenantContext tenant, long id, Set<Long> visibleClientIds);
 
-    List<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
+    Page<TcpTrafficFrameView> findStream(TenantContext tenant, String channelId, Set<Long> visibleClientIds,
                                          Pageable pageable);
 
     String backend();

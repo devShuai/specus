@@ -78,8 +78,19 @@ public class PeerMeshResource {
     }
 
     @GetMapping("/sessions")
-    public List<PeerMeshSessionView> sessions(@AuthenticationPrincipal Jwt jwt,
-                                              @RequestParam(defaultValue = "100") int limit) {
+    public Object sessions(@AuthenticationPrincipal Jwt jwt,
+                           @RequestParam(defaultValue = "100") int limit,
+                           @RequestParam(required = false) Integer page,
+                           @RequestParam(required = false) Integer size,
+                           @RequestParam(defaultValue = "false") boolean openOnly) {
+        if (page != null || size != null) {
+            return peerMeshService.listSessionsPage(
+                    contextResolver.resolve(jwt),
+                    page == null ? 0 : page,
+                    size == null ? limit : size,
+                    openOnly
+            );
+        }
         return peerMeshService.listSessions(contextResolver.resolve(jwt), limit);
     }
 

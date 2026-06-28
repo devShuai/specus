@@ -24,8 +24,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 流量使用查询。GET 时主动 flush 一次，使返回值反映最新计数器累计；写入累计本身在
- * {@link TrafficUsageService} 的热路径里完成。
+ * 流量使用查询。热路径只做内存累计和入队，后台定时 flush；查询默认不触发同步写入，
+ * 需要准实时刷新时可显式传 flush=true。
  */
 @RestController
 @RequestMapping("/api/admin/traffic")
@@ -48,8 +48,11 @@ public class TrafficResource {
     @GetMapping
     public List<TrafficUsageView> listTraffic(@AuthenticationPrincipal Jwt jwt,
                                               @RequestParam(required = false) Long clientId,
-                                              @RequestParam(defaultValue = "100") int limit) {
-        trafficUsageService.flush();
+                                              @RequestParam(defaultValue = "100") int limit,
+                                              @RequestParam(defaultValue = "false") boolean flush) {
+        if (flush) {
+            trafficUsageService.flush();
+        }
         return trafficViewService.listTraffic(contextResolver.resolve(jwt), clientId, limit);
     }
 
@@ -57,8 +60,11 @@ public class TrafficResource {
     public List<ResourceTrafficUsageView> listResourceTraffic(@AuthenticationPrincipal Jwt jwt,
                                                              @RequestParam(required = false) String type,
                                                              @RequestParam(required = false) Long clientId,
-                                                             @RequestParam(defaultValue = "200") int limit) {
-        trafficUsageService.flush();
+                                                             @RequestParam(defaultValue = "200") int limit,
+                                                             @RequestParam(defaultValue = "false") boolean flush) {
+        if (flush) {
+            trafficUsageService.flush();
+        }
         return trafficViewService.listResourceTraffic(contextResolver.resolve(jwt), type, clientId, limit);
     }
 
@@ -71,8 +77,11 @@ public class TrafficResource {
                                                  @RequestParam(required = false) String field,
                                                  @RequestParam(required = false) String q,
                                                  @RequestParam(defaultValue = "0") int page,
-                                                 @RequestParam(defaultValue = "50") int size) {
-        trafficInspectionService.flush();
+                                                 @RequestParam(defaultValue = "50") int size,
+                                                 @RequestParam(defaultValue = "false") boolean flush) {
+        if (flush) {
+            trafficInspectionService.flush();
+        }
         int normalizedSize = Math.clamp(size, 1, 500);
         int normalizedPage = Math.max(0, page);
         ManagementContext context = contextResolver.resolve(jwt);
@@ -99,8 +108,11 @@ public class TrafficResource {
                                              @RequestParam(required = false) Integer listenPort,
                                              @RequestParam(defaultValue = "0") int page,
                                              @RequestParam(required = false) Integer size,
-                                             @RequestParam(required = false) Integer limit) {
-        trafficInspectionService.flush();
+                                             @RequestParam(required = false) Integer limit,
+                                             @RequestParam(defaultValue = "false") boolean flush) {
+        if (flush) {
+            trafficInspectionService.flush();
+        }
         int requestedSize = size == null ? (limit == null ? 50 : limit) : size;
         int normalizedSize = Math.clamp(requestedSize, 1, 500);
         int normalizedPage = Math.max(0, page);
@@ -121,7 +133,6 @@ public class TrafficResource {
     @GetMapping("/tcp-frames/{id}")
     public TcpTrafficFrameView getTcpFrame(@AuthenticationPrincipal Jwt jwt,
                                            @PathVariable long id) {
-        trafficInspectionService.flush();
         return trafficViewService.getTcpFrame(contextResolver.resolve(jwt), id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "TCP frame not found"));
     }
@@ -129,18 +140,34 @@ public class TrafficResource {
     @GetMapping("/tcp-streams")
     public Map<String, Object> getTcpStream(@AuthenticationPrincipal Jwt jwt,
                                             @RequestParam String channelId,
-                                            @RequestParam(defaultValue = "500") int limit) {
-        trafficInspectionService.flush();
-        int normalizedLimit = Math.clamp(limit, 1, 1000);
-        List<TcpTrafficFrameView> items = trafficViewService.listTcpStream(
-                contextResolver.resolve(jwt), channelId, normalizedLimit);
+                                            @RequestParam(defaultValue = "500") int limit,
+                                            @RequestParam(required = false) Integer page,
+                                            @RequestParam(required = false) Integer size,
+                                            @RequestParam(defaultValue = "false") boolean flush) {
+        if (flush) {
+            trafficInspectionService.flush();
+        }
+        int normalizedPage = Math.max(0, page == null ? 0 : page);
+        int normalizedSize = Math.clamp(size == null ? limit : size, 1, 1000);
+        Page<TcpTrafficFrameView> stream = trafficViewService.listTcpStream(
+                contextResolver.resolve(jwt),
+                channelId,
+                PageRequest.of(normalizedPage, normalizedSize, Sort.by(Sort.Direction.ASC, "id")));
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("channelId", channelId);
-        response.put("items", items);
-        response.put("total", items.size());
-        response.put("limit", normalizedLimit);
-        response.put("truncated", items.size() >= normalizedLimit);
+        response.put("items", stream.getContent());
+        response.put("total", stream.getTotalElements());
+        response.put("page", normalizedPage);
+        response.put("size", normalizedSize);
+        response.put("limit", normalizedSize);
+        response.put("totalPages", Math.max(1, stream.getTotalPages()));
+        response.put("truncated", normalizedPage + 1 < stream.getTotalPages());
         return response;
+    }
+
+    @GetMapping("/inspection-status")
+    public TrafficInspectionService.Snapshot inspectionStatus() {
+        return trafficInspectionService.snapshot();
     }
 
     private String firstText(String first, String second) {

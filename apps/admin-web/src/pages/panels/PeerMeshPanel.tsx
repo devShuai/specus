@@ -5,15 +5,18 @@ import {
   CardBody,
   Chip,
   Input,
+  Pagination,
   Select,
   SelectItem,
   Switch,
+  Tab,
   Table,
   TableBody,
   TableCell,
   TableColumn,
   TableHeader,
   TableRow,
+  Tabs,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { PeerMeshAcl, PeerMeshDevice, PeerMeshSession, PeerMeshStatus } from "../../api/types";
@@ -36,6 +39,8 @@ const peerNatFilterOptions = [
 ] as const;
 
 type PeerNatFilterKey = (typeof peerNatFilterOptions)[number]["key"];
+type PeerMeshViewKey = "devices" | "sessions" | "acl" | "nat";
+const SESSION_PAGE_SIZE = 20;
 
 export function PeerMeshPanel() {
   const [status, setStatus] = useState<PeerMeshStatus | null>(null);
@@ -48,6 +53,10 @@ export function PeerMeshPanel() {
   const [targetClientId, setTargetClientId] = useState("");
   const [natFilter, setNatFilter] = useState<PeerNatFilterKey>("all");
   const [natKeyword, setNatKeyword] = useState("");
+  const [peerView, setPeerView] = useState<PeerMeshViewKey>("devices");
+  const [sessionPage, setSessionPage] = useState(0);
+  const [sessionTotal, setSessionTotal] = useState(0);
+  const [sessionTotalPages, setSessionTotalPages] = useState(1);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -56,18 +65,24 @@ export function PeerMeshPanel() {
         adminApi.peerMeshStatus(),
         adminApi.listPeerMeshDevices(),
         adminApi.listPeerMeshAcls(),
-        adminApi.listPeerMeshSessions(100),
+        adminApi.listPeerMeshSessionsPage({
+          page: sessionPage,
+          size: SESSION_PAGE_SIZE,
+          openOnly: true,
+        }),
       ]);
       setStatus(nextStatus);
       setDevices(nextDevices);
       setAcls(nextAcls);
-      setSessions(nextSessions);
+      setSessions(nextSessions.items);
+      setSessionTotal(nextSessions.total);
+      setSessionTotalPages(Math.max(1, nextSessions.totalPages));
     } catch (error) {
       notifyError(error, "加载私有组网失败");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [sessionPage]);
 
   useEffect(() => {
     void load();
@@ -153,6 +168,7 @@ export function PeerMeshPanel() {
       const closed = await adminApi.closePeerMeshSession(session.id);
       setSessions((items) => items.map((item) => (item.id === closed.id ? closed : item)));
       notify("Peer session 已断开");
+      await load();
     } catch (error) {
       notifyError(error, "断开 peer session 失败");
     }
@@ -171,8 +187,10 @@ export function PeerMeshPanel() {
       const closedSessions = await adminApi.closeOpenPeerMeshSessions();
       const closedById = new Map(closedSessions.map((session) => [session.id, session]));
       setSessions((items) => items.map((item) => closedById.get(item.id) ?? item));
+      setSessionPage(0);
+      setSessionTotal(0);
+      setSessionTotalPages(1);
       notify(`已清理 ${closedSessions.length} 条活跃 peer 链路`);
-      await load();
     } catch (error) {
       notifyError(error, "清理活跃 peer 链路失败");
     } finally {
@@ -219,6 +237,19 @@ export function PeerMeshPanel() {
         </Card>
       )}
 
+      <Tabs
+        aria-label="私有组网视图"
+        selectedKey={peerView}
+        variant="underlined"
+        onSelectionChange={(key) => setPeerView(String(key) as PeerMeshViewKey)}
+      >
+        <Tab key="devices" title="设备拓扑" />
+        <Tab key="sessions" title={`会话 ${sessionTotal}`} />
+        <Tab key="acl" title={`ACL ${acls.length}`} />
+        <Tab key="nat" title="NAT 诊断" />
+      </Tabs>
+
+      {peerView === "nat" && (
       <PeerNatInsight
         devices={natDevices}
         devicesTotal={devices.length}
@@ -229,7 +260,10 @@ export function PeerMeshPanel() {
         onKeywordChange={setNatKeyword}
         stats={natStats}
       />
+      )}
 
+      {peerView === "devices" && (
+      <>
       <TopologyView devices={devices} sessions={activeSessions} />
 
       <section className="min-w-0 space-y-2">
@@ -393,8 +427,11 @@ export function PeerMeshPanel() {
         </Table>
         </div>
       </section>
+      </>
+      )}
 
-      <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]">
+      {peerView === "acl" && (
+      <section className="grid gap-3">
         <Card shadow="none" className="rounded-md border border-default-200">
           <CardBody className="gap-3 p-3">
             <div>
@@ -488,12 +525,21 @@ export function PeerMeshPanel() {
             </div>
           </CardBody>
         </Card>
+      </section>
+      )}
 
+      {peerView === "sessions" && (
+      <section className="grid gap-3">
         <Card shadow="none" className="rounded-md border border-default-200">
           <CardBody className="gap-3 p-3">
-            <div>
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
               <h3 className="text-base font-semibold">活跃会话</h3>
-              <p className="text-small text-default-500">只展示未关闭的 ICE 会话；清理后会同步断开拓扑链路。</p>
+              <p className="text-small text-default-500">
+                只展示未关闭的 Peer 会话；第 {sessionPage + 1} / {sessionTotalPages} 页，清理后会同步断开拓扑链路。
+              </p>
+              </div>
+              <span className="text-small text-default-500">共 {sessionTotal} 条</span>
             </div>
 
             {/* mobile: 会话卡片 */}
@@ -633,9 +679,20 @@ export function PeerMeshPanel() {
               </TableBody>
             </Table>
             </div>
+            {sessionTotalPages > 1 && (
+              <div className="flex justify-end">
+                <Pagination
+                  showControls
+                  page={sessionPage + 1}
+                  total={sessionTotalPages}
+                  onChange={(page) => setSessionPage(Math.max(0, page - 1))}
+                />
+              </div>
+            )}
           </CardBody>
         </Card>
       </section>
+      )}
     </div>
   );
 }

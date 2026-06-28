@@ -15,4 +15,6 @@ public class PeerMeshProperties {
     private int natProbeAlternatePort = 0;
     private long sessionTtlSeconds = 3600;
     private long allocationTtlSeconds = 300;
+    private int relayWorkerThreads = 0;
+    private int relayWorkerQueueCapacity = 10000;
 }

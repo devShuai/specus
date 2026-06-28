@@ -400,7 +400,7 @@ Go server 与 .NET server 也兼容 `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` �
 
 ### 流量明细存储
 
-Java 参考实现中，HTTP 协议记录和 TCP payload 记录默认写入业务数据库；配置 Elasticsearch 后会自动切换到 ES 存储，管理页查询同一套接口。明细采集由全局总开关和通道开关共同控制，每条 HTTP 路由 / TCP 映射新建时默认关闭明细采集，需要在管理页单独打开。写入时会保留完整 HTTP body 与 TCP 二进制 payload，页面按分页读取；HTTP 与 TCP 索引都可通过体积上限自动清理最旧记录。
+Java 参考实现中，HTTP 协议记录和 TCP payload 记录默认写入业务数据库；配置 Elasticsearch 后会自动切换到 ES 存储，管理页查询同一套接口。明细采集由全局总开关和通道开关共同控制，全局总开关默认关闭，每条 HTTP 路由 / TCP 映射新建时也默认关闭明细采集，需要在管理页单独打开。写入时会保留完整 HTTP body 与 TCP 二进制 payload，压缩 HTTP Body 的解压预览有独立大小上限，页面按分页读取；HTTP 与 TCP 索引都可通过体积上限自动清理最旧记录。管理查询默认不强制 flush，避免读请求放大写入压力。
 
 | 配置 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |

@@ -29,6 +29,7 @@ import type {
   ResourceTrafficUsage,
   TcpTrafficFrame,
   TcpTrafficStream,
+  TrafficInspectionStatus,
   TrafficUsage,
 } from "../../api/types";
 import { formatBytes, formatDateTime } from "../../lib/format";
@@ -37,6 +38,7 @@ import { MobileListCard, MobileListCardList } from "../../components/MobileListC
 
 const HTTP_EXCHANGE_PAGE_SIZE = 20;
 const TCP_FRAME_PAGE_SIZE = 20;
+const TCP_STREAM_PAGE_SIZE = 200;
 type TrafficViewKey = "client" | "tcp" | "http";
 const TRAFFIC_VIEW_TABS: Array<{ key: TrafficViewKey; label: string }> = [
   { key: "client", label: "客户端汇总" },
@@ -143,6 +145,7 @@ export function TrafficPanel() {
   const [tcpStreamLoadingChannel, setTcpStreamLoadingChannel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [trafficView, setTrafficView] = useState<TrafficViewKey>("client");
+  const [inspectionStatus, setInspectionStatus] = useState<TrafficInspectionStatus | null>(null);
   const httpExchangeRequestId = useRef(0);
   const tcpFrameRequestId = useRef(0);
 
@@ -161,6 +164,14 @@ export function TrafficPanel() {
       notifyError(error, "加载流量失败");
     } finally {
       setLoading(false);
+    }
+  }, []);
+
+  const loadInspectionStatus = useCallback(async () => {
+    try {
+      setInspectionStatus(await adminApi.getTrafficInspectionStatus());
+    } catch {
+      setInspectionStatus(null);
     }
   }, []);
 
@@ -223,11 +234,13 @@ export function TrafficPanel() {
     void loadTraffic();
     void loadTcpFrames();
     void loadHttpExchanges();
-  }, [loadTraffic, loadTcpFrames, loadHttpExchanges]);
+    void loadInspectionStatus();
+  }, [loadTraffic, loadTcpFrames, loadHttpExchanges, loadInspectionStatus]);
 
   useEffect(() => {
     void loadTraffic();
-  }, [loadTraffic]);
+    void loadInspectionStatus();
+  }, [loadTraffic, loadInspectionStatus]);
 
   useEffect(() => {
     void loadTcpFrames();
@@ -315,7 +328,7 @@ export function TrafficPanel() {
   const openTcpStream = useCallback(async (row: TcpTrafficFrame) => {
     setTcpStreamLoadingChannel(row.channelId);
     try {
-      const stream = await adminApi.getTcpTrafficStream(row.channelId, 500);
+      const stream = await adminApi.getTcpTrafficStream(row.channelId, 0, TCP_STREAM_PAGE_SIZE);
       setSelectedTcpStream(stream);
     } catch (error) {
       notifyError(error, "加载 TCP 数据流失败");
@@ -323,6 +336,21 @@ export function TrafficPanel() {
       setTcpStreamLoadingChannel(null);
     }
   }, []);
+
+  const changeTcpStreamPage = useCallback(async (page: number) => {
+    if (!selectedTcpStream) {
+      return;
+    }
+    setTcpStreamLoadingChannel(selectedTcpStream.channelId);
+    try {
+      const stream = await adminApi.getTcpTrafficStream(selectedTcpStream.channelId, page, selectedTcpStream.size || TCP_STREAM_PAGE_SIZE);
+      setSelectedTcpStream(stream);
+    } catch (error) {
+      notifyError(error, "切换 TCP 数据流分页失败");
+    } finally {
+      setTcpStreamLoadingChannel(null);
+    }
+  }, [selectedTcpStream]);
 
   return (
     <div className="mt-2 flex min-w-0 flex-col gap-2">
@@ -342,6 +370,8 @@ export function TrafficPanel() {
           刷新
         </Button>
       </div>
+
+      <TrafficInspectionStatusBar status={inspectionStatus} />
 
       {trafficView === "client" && <ClientTrafficTable rows={clientRows} loading={loading} />}
 
@@ -402,7 +432,12 @@ export function TrafficPanel() {
       )}
       <HttpExchangeModal row={selectedHttpExchange} onClose={() => setSelectedHttpExchange(null)} />
       <TcpFrameModal row={selectedTcpFrame} onClose={() => setSelectedTcpFrame(null)} />
-      <TcpStreamModal stream={selectedTcpStream} onClose={() => setSelectedTcpStream(null)} />
+      <TcpStreamModal
+        stream={selectedTcpStream}
+        loading={selectedTcpStream != null && tcpStreamLoadingChannel === selectedTcpStream.channelId}
+        onClose={() => setSelectedTcpStream(null)}
+        onPageChange={changeTcpStreamPage}
+      />
     </div>
   );
 }
@@ -496,6 +531,67 @@ function TrafficViewTab({
     >
       {children}
     </button>
+  );
+}
+
+function TrafficInspectionStatusBar({ status }: { status: TrafficInspectionStatus | null }) {
+  const pendingTotal = (status?.pendingHttp ?? 0) + (status?.pendingTcp ?? 0);
+  const droppedTotal = (status?.droppedHttp ?? 0) + (status?.droppedTcp ?? 0);
+
+  return (
+    <Card shadow="none" className="rounded-md border border-default-200">
+      <CardBody className="grid gap-2 p-3 md:grid-cols-4">
+        <TrafficStatusItem
+          label="明细采集"
+          value={status?.enabled ? "全局开启" : "全局关闭"}
+          tone={status?.enabled ? "success" : "default"}
+          hint="仍需通道级开关开启"
+        />
+        <TrafficStatusItem
+          label="待写入"
+          value={`${pendingTotal}`}
+          tone={pendingTotal > 0 ? "warning" : "default"}
+          hint={`HTTP ${status?.pendingHttp ?? 0} / TCP ${status?.pendingTcp ?? 0}`}
+        />
+        <TrafficStatusItem
+          label="已丢弃"
+          value={`${droppedTotal}`}
+          tone={droppedTotal > 0 ? "danger" : "default"}
+          hint={`HTTP ${status?.droppedHttp ?? 0} / TCP ${status?.droppedTcp ?? 0}`}
+        />
+        <TrafficStatusItem
+          label="最近 flush"
+          value={formatDateTime(status?.lastFlushedAt)}
+          tone="default"
+          hint="查询不再强制 flush"
+        />
+      </CardBody>
+    </Card>
+  );
+}
+
+function TrafficStatusItem({
+  hint,
+  label,
+  tone,
+  value,
+}: {
+  hint: string;
+  label: string;
+  tone: "default" | "success" | "warning" | "danger";
+  value: string;
+}) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-2 rounded-small bg-default-50 px-3 py-2">
+      <div className="min-w-0">
+        <div className="text-tiny text-default-500">{label}</div>
+        <div className="truncate text-small font-semibold text-foreground">{value}</div>
+        <div className="truncate text-tiny text-default-400">{hint}</div>
+      </div>
+      <Chip color={tone} size="sm" variant="flat">
+        {tone === "default" ? "OK" : tone}
+      </Chip>
+    </div>
   );
 }
 
@@ -2011,7 +2107,17 @@ function TcpFrameModal({ row, onClose }: { row: TcpTrafficFrame | null; onClose:
   );
 }
 
-function TcpStreamModal({ stream, onClose }: { stream: TcpTrafficStream | null; onClose: () => void }) {
+function TcpStreamModal({
+  loading,
+  onClose,
+  onPageChange,
+  stream,
+}: {
+  loading: boolean;
+  onClose: () => void;
+  onPageChange: (page: number) => void;
+  stream: TcpTrafficStream | null;
+}) {
   const frames = useMemo(
     () => [...(stream?.items ?? [])].sort((left, right) => Number(left.id) - Number(right.id)),
     [stream],
@@ -2046,12 +2152,17 @@ function TcpStreamModal({ stream, onClose }: { stream: TcpTrafficStream | null; 
                   </Chip>
                   {stream.truncated && (
                     <Chip color="warning" size="sm" variant="flat">
-                      已达加载上限
+                      后续分页可用
                     </Chip>
                   )}
                 </div>
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-small font-normal text-default-500">
-                  <span>{frames.length} 帧</span>
+                  <span>
+                    第 {stream.page + 1} / {Math.max(1, stream.totalPages)} 页
+                  </span>
+                  <span>
+                    {stream.total} 帧中的 {frames.length} 帧
+                  </span>
                   <span>{formatBytes(totalBytes)}</span>
                   {frames[0] && <span>{frames[0].resourceName}</span>}
                 </div>
@@ -2076,6 +2187,15 @@ function TcpStreamModal({ stream, onClose }: { stream: TcpTrafficStream | null; 
                 </Tabs>
               </ModalBody>
               <ModalFooter>
+                {stream.totalPages > 1 && (
+                  <Pagination
+                    showControls
+                    isDisabled={loading}
+                    page={stream.page + 1}
+                    total={Math.max(1, stream.totalPages)}
+                    onChange={(page) => onPageChange(Math.max(0, page - 1))}
+                  />
+                )}
                 <Button variant="flat" onPress={close}>
                   关闭
                 </Button>

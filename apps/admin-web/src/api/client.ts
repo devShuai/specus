@@ -24,6 +24,7 @@ import type {
   PeerMeshAclMutation,
   PeerMeshDevice,
   PeerMeshDeviceMutation,
+  PeerMeshSessionPage,
   PeerMeshSession,
   PeerMeshStatus,
   ResourceTrafficType,
@@ -31,6 +32,7 @@ import type {
   TcpTrafficFrame,
   TcpTrafficFramePage,
   TcpTrafficStream,
+  TrafficInspectionStatus,
   TokenResponse,
   TrafficUsage,
   Tunnel,
@@ -200,6 +202,12 @@ export interface TcpTrafficFrameQuery {
   listenPort?: number;
 }
 
+export interface PeerMeshSessionQuery {
+  page: number;
+  size: number;
+  openOnly?: boolean;
+}
+
 export const adminApi = {
   me: () => request<ManagementUser>("/me"),
   overview: () => request<Overview>("/overview"),
@@ -326,12 +334,14 @@ export const adminApi = {
     return data;
   },
   getTcpTrafficFrame: (id: string) => request<TcpTrafficFrame>(`/traffic/tcp-frames/${id}`),
-  getTcpTrafficStream: (channelId: string, limit = 500) => {
+  getTcpTrafficStream: (channelId: string, page = 0, size = 200) => {
     const params = new URLSearchParams();
     params.set("channelId", channelId);
-    params.set("limit", String(limit));
+    params.set("page", String(page));
+    params.set("size", String(size));
     return request<TcpTrafficStream>(`/traffic/tcp-streams?${params.toString()}`);
   },
+  getTrafficInspectionStatus: () => request<TrafficInspectionStatus>("/traffic/inspection-status"),
   peerMeshStatus: () => request<PeerMeshStatus>("/peer-mesh/status"),
   listPeerMeshDevices: () => request<PeerMeshDevice[]>("/peer-mesh/devices"),
   updatePeerMeshDevice: (clientId: number, body: PeerMeshDeviceMutation) =>
@@ -341,6 +351,15 @@ export const adminApi = {
     request<PeerMeshAcl>("/peer-mesh/acls", { method: "POST", body: JSON.stringify(body) }),
   deletePeerMeshAcl: (id: number) => request<null>(`/peer-mesh/acls/${id}`, { method: "DELETE" }),
   listPeerMeshSessions: (limit = 100) => request<PeerMeshSession[]>(`/peer-mesh/sessions?limit=${limit}`),
+  listPeerMeshSessionsPage: (query: PeerMeshSessionQuery) => {
+    const params = new URLSearchParams();
+    params.set("page", String(query.page));
+    params.set("size", String(query.size));
+    if (query.openOnly !== undefined) {
+      params.set("openOnly", String(query.openOnly));
+    }
+    return request<PeerMeshSessionPage>(`/peer-mesh/sessions?${params.toString()}`);
+  },
   closePeerMeshSession: (id: number) => request<PeerMeshSession>(`/peer-mesh/sessions/${id}`, { method: "DELETE" }),
   closeOpenPeerMeshSessions: () => request<PeerMeshSession[]>("/peer-mesh/sessions", { method: "DELETE" }),
 

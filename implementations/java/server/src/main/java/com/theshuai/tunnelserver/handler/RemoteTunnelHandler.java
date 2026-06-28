@@ -4,12 +4,11 @@ import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
+import com.theshuai.tunnelserver.handler.ChannelAttributes.EndpointSnapshot;
 import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import io.netty.channel.ChannelHandlerContext;
 
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -41,10 +40,16 @@ public class RemoteTunnelHandler extends NatCommonHandler {
             ctx.close();
             return;
         }
+        // S1.1 一次性把 channelId / endpoint 字符串缓存到 channel attr 上，
+        // 之后 channelRead 每帧不再触发 asLongText + getHostAddress。
+        ChannelAttributes.initHotPath(ctx.channel());
+        String channelId = ChannelAttributes.channelId(ctx.channel());
+
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.CONNECTED);
-        Map<String, Object> metaData = new HashMap<>();
-        metaData.put("channelId", ctx.channel().id().asLongText());
+        // 元数据只有 2 个 key，给一个匹配大小的 HashMap 容量，避免默认 16 桶的浪费
+        Map<String, Object> metaData = new HashMap<>(4, 0.75f);
+        metaData.put("channelId", channelId);
         metaData.put("port", port);
         message.setMetaData(metaData);
         controlCtx.writeAndFlush(message);
@@ -52,11 +57,13 @@ public class RemoteTunnelHandler extends NatCommonHandler {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        trafficInspectionService.releaseTcpStream(ctx.channel().id().asLongText());
+        String channelId = ChannelAttributes.channelId(ctx.channel());
+        trafficInspectionService.releaseTcpStream(channelId);
+
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.DISCONNECTED);
-        Map<String, Object> metaData = new HashMap<>();
-        metaData.put("channelId", ctx.channel().id().asLongText());
+        Map<String, Object> metaData = new HashMap<>(2, 0.75f);
+        metaData.put("channelId", channelId);
         message.setMetaData(metaData);
         ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
         if (controlCtx != null && controlCtx.channel().isActive()) {
@@ -72,25 +79,30 @@ public class RemoteTunnelHandler extends NatCommonHandler {
             ctx.close();
             return;
         }
+        // 读 channel-level 缓存的 channelId / endpoint，替代每帧 asLongText() + getHostAddress()
+        String channelId = ChannelAttributes.channelId(ctx.channel());
+        EndpointSnapshot remote = ChannelAttributes.remoteEndpoint(ctx.channel());
+        EndpointSnapshot local = ChannelAttributes.localEndpoint(ctx.channel());
+
         trafficUsageService.recordTcpDownload(clientName, port, data.length);
-        trafficInspectionService.recordTcpFrame(clientName, port, ctx.channel().id().asLongText(),
+        trafficInspectionService.recordTcpFrame(clientName, port, channelId,
                 TrafficInspectionService.DIRECTION_PUBLIC_TO_CLIENT,
-                endpointAddress(ctx.channel().remoteAddress()),
-                endpointPort(ctx.channel().remoteAddress()),
-                endpointAddress(ctx.channel().localAddress()),
-                endpointPort(ctx.channel().localAddress()),
+                remote.address(),
+                remote.port(),
+                local.address(),
+                local.port(),
                 data);
+
         NatMessagePacket message = new NatMessagePacket();
         message.setNatMessageType(NatMessageType.DATA);
-        Map<String, Object> metaData = new HashMap<>();
-        metaData.put("channelId", ctx.channel().id().asLongText());
+        Map<String, Object> metaData = new HashMap<>(2, 0.75f);
+        metaData.put("channelId", channelId);
         message.setMetaData(metaData);
         message.setData(data);
-        controlCtx.writeAndFlush(message).addListener(future -> {
-            if (!future.isSuccess()) {
-                ctx.close();
-            }
-        });
+        // 用 attr-cached listener 实例，避免每帧 new lambda；listener 内部
+        // 关闭的是 future.channel()（写入端 = 控制连接）失败时；如果想关闭读取端
+        // （ctx.channel()），用 closeOnFailureOf(ctx.channel()) 拿到 channel-scoped 单例。
+        controlCtx.writeAndFlush(message).addListener(ChannelAttributes.closeOnFailureOf(ctx.channel()));
         if (!controlCtx.channel().isWritable()) {
             ChannelBackpressure.setAutoRead(ctx.channel(), false);
         }
@@ -100,18 +112,5 @@ public class RemoteTunnelHandler extends NatCommonHandler {
     public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
         tunnelHandler.updateControlAutoReadForExternalWritability();
         super.channelWritabilityChanged(ctx);
-    }
-
-    private String endpointAddress(SocketAddress address) {
-        if (address instanceof InetSocketAddress socketAddress) {
-            return socketAddress.getAddress() == null
-                    ? socketAddress.getHostString()
-                    : socketAddress.getAddress().getHostAddress();
-        }
-        return address == null ? null : address.toString();
-    }
-
-    private Integer endpointPort(SocketAddress address) {
-        return address instanceof InetSocketAddress socketAddress ? socketAddress.getPort() : null;
     }
 }

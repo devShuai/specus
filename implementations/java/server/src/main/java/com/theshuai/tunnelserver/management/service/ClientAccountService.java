@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -95,6 +96,7 @@ public class ClientAccountService {
         account.setConnectionRateLimitPerMinute(normalizeRateLimit(request.connectionRateLimitPerMinute(), 30));
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
+        invalidateNameCache(account.getClientName());
         return new ClientResult(toView(clientAccountRepository.save(account), null));
     }
 
@@ -116,6 +118,7 @@ public class ClientAccountService {
         account.setConnectionRateLimitPerMinute(normalizeRateLimit(request.connectionRateLimitPerMinute(), 30));
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
+        invalidateNameCache(account.getClientName());
         return new ClientResult(toView(clientAccountRepository.save(account), null));
     }
 
@@ -155,6 +158,7 @@ public class ClientAccountService {
                 account.getConnectionRateLimitPerMinute()
         ));
         account.setUpdatedAt(Instant.now().toString());
+        invalidateNameCache(account.getClientName());
         clientAccountRepository.save(account);
         if (!account.isEnabled() || !account.getClientName().equals(originalClientName)) {
             // 优先用"停用"作为原因（更直接），若只是改名则用 ADMIN_RENAMED。
@@ -178,6 +182,7 @@ public class ClientAccountService {
     public void deleteClient(TenantContext tenant, long id) {
         ClientAccount account = findClientById(tenant, id);
         closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
+        invalidateNameCache(account.getClientName());
         clientAccountRepository.delete(account);
     }
 
@@ -185,13 +190,39 @@ public class ClientAccountService {
     public void deleteClient(ManagementContext context, long id) {
         ClientAccount account = findClientById(context, id);
         closeOnlineChannel(account.getClientName(), DisconnectReason.ADMIN_DELETED);
+        invalidateNameCache(account.getClientName());
         clientAccountRepository.delete(account);
     }
 
     @Transactional(readOnly = true)
     public Optional<ClientAccount> findClientByName(String clientName) {
-        return clientAccountRepository.findByClientName(clientName);
+        if (clientName == null) {
+            return Optional.empty();
+        }
+        // S1.3 60 秒 TTL 名称缓存。trafficUsageService.flushCounter() 每 5 秒为每个活跃
+        // 客户端调一次本方法，加缓存后稳定状态下 DB 查询量降到 ~1/12。
+        CachedClient cached = nameCache.get(clientName);
+        long now = System.currentTimeMillis();
+        if (cached != null && cached.expiresAtMillis > now) {
+            return Optional.ofNullable(cached.account);
+        }
+        Optional<ClientAccount> fresh = clientAccountRepository.findByClientName(clientName);
+        nameCache.put(clientName, new CachedClient(fresh.orElse(null), now + NAME_CACHE_TTL_MILLIS));
+        return fresh;
     }
+
+    /** 缓存任何客户端账号被增/改/删后调用，确保下次 findClientByName 拿到最新。 */
+    private void invalidateNameCache(String clientName) {
+        if (clientName != null) {
+            nameCache.remove(clientName);
+        }
+    }
+
+    /** 60s TTL 缓存条目；过期则从 DB 重读。 */
+    private record CachedClient(ClientAccount account, long expiresAtMillis) {}
+
+    private static final long NAME_CACHE_TTL_MILLIS = 60_000;
+    private final Map<String, CachedClient> nameCache = new ConcurrentHashMap<>();
 
     private ClientAccount findClientById(long id) {
         return clientAccountRepository.findById(id)

@@ -30,9 +30,9 @@ public interface TcpTrafficFrameRepository extends JpaRepository<TcpTrafficFrame
     Page<TcpTrafficFrame> findByTenantIdAndClientIdInAndListenPortOrderByIdDesc(
             String tenantId, List<Long> clientIds, int listenPort, Pageable pageable);
 
-    List<TcpTrafficFrame> findByTenantIdAndChannelIdOrderByIdAsc(
+    Page<TcpTrafficFrame> findByTenantIdAndChannelIdOrderByIdAsc(
             String tenantId, String channelId, Pageable pageable);
 
-    List<TcpTrafficFrame> findByTenantIdAndChannelIdAndClientIdInOrderByIdAsc(
+    Page<TcpTrafficFrame> findByTenantIdAndChannelIdAndClientIdInOrderByIdAsc(
             String tenantId, String channelId, List<Long> clientIds, Pageable pageable);
 }

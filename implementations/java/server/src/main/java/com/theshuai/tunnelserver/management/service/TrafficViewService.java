@@ -200,14 +200,19 @@ public class TrafficViewService {
     }
 
     @Transactional(readOnly = true)
-    public List<TcpTrafficFrameView> listTcpStream(TenantContext tenant, String channelId, int limit) {
+    public Page<TcpTrafficFrameView> listTcpStream(TenantContext tenant, String channelId, int limit) {
         return tcpTrafficFrameStore.findStream(tenant, channelId, null, PageRequest.of(0, Math.clamp(limit, 1, 1000)));
     }
 
     @Transactional(readOnly = true)
-    public List<TcpTrafficFrameView> listTcpStream(ManagementContext context, String channelId, int limit) {
+    public Page<TcpTrafficFrameView> listTcpStream(ManagementContext context, String channelId, int limit) {
         return tcpTrafficFrameStore.findStream(
                 context.tenant(), channelId, visibleClientIds(context), PageRequest.of(0, Math.clamp(limit, 1, 1000)));
+    }
+
+    @Transactional(readOnly = true)
+    public Page<TcpTrafficFrameView> listTcpStream(ManagementContext context, String channelId, Pageable pageable) {
+        return tcpTrafficFrameStore.findStream(context.tenant(), channelId, visibleClientIds(context), pageable);
     }
 
     private TrafficUsageView toView(TrafficUsage usage) {

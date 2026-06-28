@@ -20,6 +20,13 @@ spring:
       hibernate.jdbc.batch_size: ${TUNNEL_DB_BATCH_SIZE:50}
       hibernate.order_inserts: true
       hibernate.order_updates: true
+  task:
+    scheduling:
+      # S1.4: flushHttp/flushTcp are separate @Scheduled methods; the default pool size 1
+      # would serialize them. 2 lets the HTTP and TCP flush paths run concurrently so a
+      # slow TCP flush can no longer block HTTP persistence (and vice versa).
+      pool:
+        size: ${TUNNEL_SCHEDULING_POOL_SIZE:2}
   elasticsearch:
     uris: ${TUNNEL_ELASTICSEARCH_URIS:http://localhost:9200}
     username: ${TUNNEL_ELASTICSEARCH_USERNAME:}
@@ -58,6 +65,9 @@ tunnel:
     nat-probe-alternate-port: ${TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT:0}
     session-ttl-seconds: ${TUNNEL_PEER_MESH_SESSION_TTL_SECONDS:3600}
     allocation-ttl-seconds: ${TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS:300}
+    relay-worker-threads: ${TUNNEL_PEER_MESH_RELAY_WORKER_THREADS:0}
+    relay-worker-queue-capacity: ${TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY:10000}
+    relay-traffic-flush-interval-ms: ${TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS:5000}
   client-auth:
     default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
     per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}
@@ -89,10 +99,11 @@ tunnel:
     tenant-claim: ${TUNNEL_OIDC_TENANT_CLAIM:tenant_id}
   traffic:
     flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}
-    capture-detail-enabled: ${TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED:true}
+    capture-detail-enabled: ${TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED:false}
     # TCP keeps a short preview for list rendering and stores the full payload separately.
     capture-preview-bytes: ${TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES:256}
     capture-header-chars: ${TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS:8192}
+    capture-decode-max-bytes: ${TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES:1048576}
     capture-max-pending: ${TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING:20000}
     capture-flush-batch-size: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE:1000}
     capture-flush-interval-ms: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS:2000}

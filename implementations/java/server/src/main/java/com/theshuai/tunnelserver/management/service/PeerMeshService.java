@@ -20,6 +20,7 @@ import com.theshuai.tunnelserver.management.repository.PeerMeshSessionRepository
 import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.security.PasswordService;
 import com.theshuai.tunnelserver.session.SessionUtil;
+import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -33,6 +34,9 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 
 @Service
@@ -42,12 +46,15 @@ public class PeerMeshService {
     public static final String STATUS_NEGOTIATING = "NEGOTIATING";
     public static final String STATUS_ACTIVE = "ACTIVE";
     public static final String STATUS_CLOSED = "CLOSED";
+    private static final long RELAY_AUTH_CACHE_TTL_NANOS = TimeUnit.SECONDS.toNanos(30);
 
     private final PeerMeshProperties properties;
     private final PeerMeshDeviceRepository deviceRepository;
     private final PeerMeshAclRepository aclRepository;
     private final PeerMeshSessionRepository sessionRepository;
     private final ClientAccountRepository clientAccountRepository;
+    private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
+    private final Map<Long, LongAdder> pendingRelayBytes = new ConcurrentHashMap<>();
 
     public PeerMeshService(PeerMeshProperties properties,
                            PeerMeshDeviceRepository deviceRepository,
@@ -267,6 +274,7 @@ public class PeerMeshService {
         session.setLocalEndpoint(limit(report.getLocalEndpoint(), 255));
         session.setRemoteEndpoint(limit(report.getRemoteEndpoint(), 255));
         session.setUpdatedAt(now.toString());
+        relayAuthorizationCache.remove(session.getId());
         return toSessionView(sessionRepository.save(session));
     }
 
@@ -347,6 +355,46 @@ public class PeerMeshService {
                 .orElse(false);
     }
 
+    public boolean authorizeRelayFrameForRelay(PeerDataFrameHeader header, long bytes) {
+        if (header == null || bytes <= 0) {
+            return false;
+        }
+        long nowNanos = System.nanoTime();
+        long nowMillis = System.currentTimeMillis();
+        RelayAuthorization cached = relayAuthorizationCache.get(header.sessionId());
+        if (cached != null && cached.validAt(nowNanos, nowMillis)) {
+            if (!cached.matches(header)) {
+                return false;
+            }
+            pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new LongAdder()).add(bytes);
+            return true;
+        }
+        return authorizeRelayFrameForRelaySlow(header, bytes, nowNanos);
+    }
+
+    @Transactional
+    protected boolean authorizeRelayFrameForRelaySlow(PeerDataFrameHeader header, long bytes, long nowNanos) {
+        return sessionRepository.findById(header.sessionId())
+                .map(session -> {
+                    Instant now = Instant.now();
+                    if (closeIfExpired(session, now)) {
+                        sessionRepository.save(session);
+                        relayAuthorizationCache.remove(header.sessionId());
+                        pendingRelayBytes.remove(header.sessionId());
+                        return false;
+                    }
+                    RelayAuthorization authorization = RelayAuthorization.from(session, nowNanos + RELAY_AUTH_CACHE_TTL_NANOS);
+                    if (!authorization.active() || !authorization.matches(header)) {
+                        relayAuthorizationCache.remove(header.sessionId());
+                        return false;
+                    }
+                    relayAuthorizationCache.put(header.sessionId(), authorization);
+                    pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new LongAdder()).add(bytes);
+                    return true;
+                })
+                .orElse(false);
+    }
+
     @Transactional
     public PeerMeshSessionView closeSession(ClientAccount reporter, PeerControlMessage close) {
         if (close.getSessionId() == null || close.getSessionId() <= 0) {
@@ -412,16 +460,49 @@ public class PeerMeshService {
         List<PeerMeshSession> sessions;
         if (context.isAdmin()) {
             sessions = sessionRepository.findByTenantIdOrderByUpdatedAtDesc(
-                    context.tenant().tenantId(), PageRequest.of(0, pageSize));
+                    context.tenant().tenantId(), PageRequest.of(0, pageSize)).getContent();
         } else {
             List<Long> visible = visibleClientIds(context);
             if (visible.isEmpty()) {
                 return List.of();
             }
             sessions = sessionRepository.findVisible(
-                    context.tenant().tenantId(), visible, PageRequest.of(0, pageSize));
+                    context.tenant().tenantId(), visible, PageRequest.of(0, pageSize)).getContent();
         }
         return sessions.stream().map(this::toSessionView).toList();
+    }
+
+    @Transactional
+    public PeerMeshSessionPage listSessionsPage(ManagementContext context, int page, int size, boolean openOnly) {
+        expireStaleSessionsBatch(Instant.now(), 500);
+        int normalizedPage = Math.max(0, page);
+        int normalizedSize = Math.clamp(size, 1, 100);
+        PageRequest pageRequest = PageRequest.of(normalizedPage, normalizedSize);
+        Page<PeerMeshSession> sessions;
+        if (context.isAdmin()) {
+            sessions = openOnly
+                    ? sessionRepository.findByTenantIdAndStatusNotOrderByUpdatedAtDesc(
+                            context.tenant().tenantId(), STATUS_CLOSED, pageRequest)
+                    : sessionRepository.findByTenantIdOrderByUpdatedAtDesc(
+                            context.tenant().tenantId(), pageRequest);
+        } else {
+            List<Long> visible = visibleClientIds(context);
+            if (visible.isEmpty()) {
+                return new PeerMeshSessionPage(List.of(), 0, normalizedPage, normalizedSize, 1);
+            }
+            sessions = openOnly
+                    ? sessionRepository.findVisibleOpenPage(
+                            context.tenant().tenantId(), visible, STATUS_CLOSED, pageRequest)
+                    : sessionRepository.findVisible(
+                            context.tenant().tenantId(), visible, pageRequest);
+        }
+        return new PeerMeshSessionPage(
+                sessions.getContent().stream().map(this::toSessionView).toList(),
+                sessions.getTotalElements(),
+                normalizedPage,
+                normalizedSize,
+                Math.max(1, sessions.getTotalPages())
+        );
     }
 
     private List<Long> visibleClientIds(ManagementContext context) {
@@ -436,6 +517,32 @@ public class PeerMeshService {
     @Transactional
     public void expireStaleSessions() {
         expireStaleSessionsBatch(Instant.now(), 500);
+    }
+
+    @Scheduled(fixedDelayString = "${tunnel.peer-mesh.relay-traffic-flush-interval-ms:5000}")
+    @Transactional
+    public void flushRelayTraffic() {
+        if (pendingRelayBytes.isEmpty()) {
+            return;
+        }
+        Instant now = Instant.now();
+        pendingRelayBytes.forEach((sessionId, counter) -> {
+            long bytes = counter.sumThenReset();
+            if (bytes <= 0) {
+                return;
+            }
+            sessionRepository.findById(sessionId).ifPresentOrElse(session -> {
+                if (!closeIfExpired(session, now)) {
+                    applyTraffic(session, 0, bytes, now);
+                } else {
+                    relayAuthorizationCache.remove(sessionId);
+                }
+                sessionRepository.save(session);
+            }, () -> {
+                relayAuthorizationCache.remove(sessionId);
+                pendingRelayBytes.remove(sessionId);
+            });
+        });
     }
 
     @Transactional(readOnly = true)
@@ -696,6 +803,10 @@ public class PeerMeshService {
             session.setClosedAt(now.toString());
         }
         session.setUpdatedAt(now.toString());
+        if (session.getId() != null) {
+            relayAuthorizationCache.remove(session.getId());
+            pendingRelayBytes.remove(session.getId());
+        }
     }
 
     private long saturatedAdd(long current, long delta) {
@@ -754,6 +865,13 @@ public class PeerMeshService {
     public record DeviceMutation(Boolean enabled) {
     }
 
+    public record PeerMeshSessionPage(List<PeerMeshSessionView> items,
+                                      long total,
+                                      int page,
+                                      int size,
+                                      int totalPages) {
+    }
+
     public record AclMutation(Long sourceClientId, Long targetClientId, Boolean allowed) {
     }
 
@@ -764,5 +882,43 @@ public class PeerMeshService {
     }
 
     public record PeerIdentity(String virtualIp, String publicKey) {
+    }
+
+    private record RelayAuthorization(long sourceClientId,
+                                      long targetClientId,
+                                      boolean active,
+                                      long sessionExpiresAtMillis,
+                                      long cacheExpiresAtNanos) {
+        private static RelayAuthorization from(PeerMeshSession session, long cacheExpiresAtNanos) {
+            return new RelayAuthorization(
+                    session.getSourceClientId(),
+                    session.getTargetClientId(),
+                    STATUS_ACTIVE.equals(session.getStatus()),
+                    parseInstantMillis(session.getExpiresAt()),
+                    cacheExpiresAtNanos
+            );
+        }
+
+        private boolean validAt(long nowNanos, long nowMillis) {
+            return active && cacheExpiresAtNanos > nowNanos
+                    && (sessionExpiresAtMillis <= 0 || sessionExpiresAtMillis > nowMillis);
+        }
+
+        private boolean matches(PeerDataFrameHeader header) {
+            boolean forward = header.fromClientId() == sourceClientId && header.toClientId() == targetClientId;
+            boolean reverse = header.fromClientId() == targetClientId && header.toClientId() == sourceClientId;
+            return forward || reverse;
+        }
+
+        private static long parseInstantMillis(String value) {
+            if (!StringUtils.hasText(value)) {
+                return 0;
+            }
+            try {
+                return Instant.parse(value).toEpochMilli();
+            } catch (Exception ignored) {
+                return 0;
+            }
+        }
     }
 }
