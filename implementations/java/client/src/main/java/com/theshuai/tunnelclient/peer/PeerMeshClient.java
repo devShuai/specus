@@ -16,7 +16,6 @@ import org.springframework.util.StringUtils;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
-import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
@@ -396,6 +395,7 @@ public class PeerMeshClient implements AutoCloseable {
             next.directBytesSinceReport.addAndGet(previous.drainDirectBytes());
             next.lastDirectSuccessMillis = previous.lastDirectSuccessMillis;
             next.lastRelaySuccessMillis = previous.lastRelaySuccessMillis;
+            next.lastDirectKeepaliveMillis = previous.lastDirectKeepaliveMillis;
             next.lastPathLogMillis = previous.lastPathLogMillis;
             next.lastPathReportMillis = previous.lastPathReportMillis;
             next.lastKeyMissingLogMillis = previous.lastKeyMissingLogMillis;
@@ -581,12 +581,25 @@ public class PeerMeshClient implements AutoCloseable {
                     Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
                     while (addresses.hasMoreElements()) {
                         InetAddress address = addresses.nextElement();
-                        if (!(address instanceof Inet4Address)
-                                || address.isAnyLocalAddress()
+                        // 公共过滤：未定地址 / multicast / link-local（fe80::/10、169.254/16）
+                        // 都不是对端能直接 reach 的有效端点；mesh 自身分配的虚拟 IP 也跳过避免回环。
+                        if (address.isAnyLocalAddress()
                                 || address.isMulticastAddress()
                                 || address.isLinkLocalAddress()
                                 || isMeshAddress(address.getHostAddress())) {
                             continue;
+                        }
+                        // IPv6 额外过滤：跳过 ULA (fc00::/7)、IPv4-compatible (::a.b.c.d)、
+                        // IPv4-mapped (::ffff:a.b.c.d) ——这些都是同 LAN 或回环语义，对端 reach 不到。
+                        // 全局 IPv6 (2000::/3) 通常是公网直连无 NAT，是最优 host candidate。
+                        if (address instanceof java.net.Inet6Address ipv6) {
+                            byte first = ipv6.getAddress()[0];
+                            if ((first & 0xfe) == 0xfc) {
+                                continue; // ULA
+                            }
+                            if (ipv6.isIPv4CompatibleAddress()) {
+                                continue;
+                            }
                         }
                         PeerCandidate candidate = new PeerCandidate();
                         candidate.setType("host");
@@ -637,6 +650,27 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
+    /**
+     * S0.3 探测 burst 配置：对每个 direct candidate 发送多个相同 nonce 的 STUN binding，
+     * 间隔短于 NAT conntrack 的 race window。提高 first-RTT 成功率，对 NAT 设备做 conntrack
+     * jitter 处理时尤其管用。
+     *
+     * <p>三个常量做 PROBE_BURST_COUNT × PROBE_BURST_INTERVAL_MILLIS = 总窗口（默认 90 ms）。
+     * Relay candidate 不做 burst——relay 已经是 reliable 转发，多发只是浪费流量。
+     */
+    private static final int PROBE_BURST_COUNT = 3;
+    private static final long PROBE_BURST_INTERVAL_MILLIS = 30;
+
+    /**
+     * S0.4 Direct keepalive 间隔。每个 ACTIVE DIRECT 会话至少 {@code KEEPALIVE_INTERVAL_MILLIS}
+     * 毫秒发一次小包探测，用来在中国宽带 NAT 30~60 秒 mapping TTL 内保活。
+     *
+     * <p>注意这是「最小间隔」而不是「精确周期」——调度器以 5 秒 tick 跑，根据 session
+     * 各自的 lastDirectKeepaliveMillis 决定是否需要发。25 秒打底确保即使最短 NAT TTL
+     * 也来得及刷新。
+     */
+    private static final long DIRECT_KEEPALIVE_INTERVAL_MILLIS = 25_000;
+
     private void sendUdpProbe(PeerSession session, PeerCandidate candidate) {
         DatagramSocket socket = udpSocket;
         if (socket == null || socket.isClosed()) {
@@ -667,13 +701,115 @@ public class PeerMeshClient implements AutoCloseable {
                     pendingProbes.remove(nonce);
                     return;
                 }
+                log.debug("Peer mesh UDP check 已发送 (relay): session={}, remote={}", session.sessionId(), remote);
             } else {
+                // direct candidate: 发 burst 提高 conntrack race 下的命中率
                 socket.send(new DatagramPacket(bytes, bytes.length, remote));
+                scheduleProbeBurst(socket, bytes, remote, nonce, session.sessionId());
+                log.debug("Peer mesh UDP check 已发送 (burst x{}): session={}, remote={}",
+                        PROBE_BURST_COUNT, session.sessionId(), remote);
             }
-            log.debug("Peer mesh UDP check 已发送: session={}, remote={}", session.sessionId(), remote);
         } catch (Exception e) {
             pendingProbes.remove(nonce);
             log.debug("Peer mesh UDP check 发送失败: remote={}, reason={}", remote, e.getMessage());
+        }
+    }
+
+    /**
+     * 调度 burst 的后续重发。所有重发使用同一 nonce，对端去重；若第一发已被处理，
+     * 后续发送也无害——pendingProbes 的 entry 还在，{@link #completeUdpProbe} 是幂等的。
+     */
+    private void scheduleProbeBurst(DatagramSocket socket, byte[] bytes, InetSocketAddress remote,
+                                    String nonce, Long sessionId) {
+        ScheduledExecutorService executor = maintenanceExecutor;
+        if (executor == null || executor.isShutdown()) {
+            return;
+        }
+        for (int i = 1; i < PROBE_BURST_COUNT; i++) {
+            long delay = PROBE_BURST_INTERVAL_MILLIS * i;
+            executor.schedule(() -> {
+                if (!running || socket.isClosed()) {
+                    return;
+                }
+                // 如果 probe 已经被对方响应（pendingProbes 里没了），就不再发后续 burst 包。
+                if (!pendingProbes.containsKey(nonce)) {
+                    return;
+                }
+                try {
+                    socket.send(new DatagramPacket(bytes, bytes.length, remote));
+                } catch (Exception e) {
+                    log.trace("Peer mesh UDP burst retx 失败: session={}, remote={}, reason={}",
+                            sessionId, remote, e.getMessage());
+                }
+            }, delay, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * S0.4：遍历所有 session，对当前正走 DIRECT 通路、且距上次 keepalive ≥
+     * {@link #DIRECT_KEEPALIVE_INTERVAL_MILLIS} 的，发一发小包刷新 NAT 映射。
+     *
+     * <p>跑在 maintenance 调度器的 5 秒 tick 上，每个 session 实际发送频率受 lastDirectKeepaliveMillis
+     * 节流。relay 路径不做 keepalive——server 端有自己的连接保活，且 relay 包穿透 NAT 不靠对端映射。
+     */
+    private void keepaliveDirectPaths() {
+        DatagramSocket socket = udpSocket;
+        if (socket == null || socket.isClosed()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (PeerSession session : sessions.values()) {
+            if (!session.hasHealthyDirect(now)) {
+                continue;
+            }
+            long sinceLast = now - session.lastDirectKeepaliveMillis;
+            if (sinceLast < DIRECT_KEEPALIVE_INTERVAL_MILLIS) {
+                continue;
+            }
+            InetSocketAddress endpoint = session.remoteEndpoint;
+            if (endpoint == null || isMeshAddress(endpoint.getAddress().getHostAddress())) {
+                continue;
+            }
+            sendDirectKeepalive(session, endpoint);
+            session.lastDirectKeepaliveMillis = now;
+        }
+    }
+
+    /**
+     * 给一个 session 的已确认 DIRECT endpoint 发一发轻量 keepalive probe。
+     * 和正常 connectivity check 用同一种 PeerUdpProbe.TYPE_CHECK 报文格式，对端透明地回 ACK，
+     * 借此更新本端 lastDirectSuccessMillis 把 path 一直标为「健康」。不做 burst：
+     * 已建路径不再有 NAT race 风险，单包足够。
+     */
+    private void sendDirectKeepalive(PeerSession session, InetSocketAddress endpoint) {
+        DatagramSocket socket = udpSocket;
+        if (socket == null || socket.isClosed()) {
+            return;
+        }
+        String nonce = newNonce();
+        PeerUdpProbe probe = new PeerUdpProbe();
+        probe.setType(PeerUdpProbe.TYPE_CHECK);
+        probe.setSessionId(session.sessionId());
+        probe.setFromClientId(config.getClientId());
+        probe.setToClientId(session.peerId());
+        probe.setNonce(nonce);
+        probe.setToken(session.token());
+        probe.setSentAtMillis(System.currentTimeMillis());
+        byte[] bytes = JsonUtil.objectToString(probe).getBytes(StandardCharsets.UTF_8);
+        pendingProbes.put(nonce, new PendingProbe(
+                session.sessionId(),
+                session.peerId(),
+                System.currentTimeMillis(),
+                endpoint,
+                false,    // direct, not relay
+                null));
+        try {
+            socket.send(new DatagramPacket(bytes, bytes.length, endpoint));
+            log.trace("Peer mesh keepalive sent: session={}, remote={}", session.sessionId(), endpoint);
+        } catch (Exception e) {
+            pendingProbes.remove(nonce);
+            log.debug("Peer mesh keepalive 发送失败: session={}, remote={}, reason={}",
+                    session.sessionId(), endpoint, e.getMessage());
         }
     }
 
@@ -735,6 +871,17 @@ public class PeerMeshClient implements AutoCloseable {
                 log.debug("Peer mesh maintenance failed: {}", e.getMessage());
             }
         }, 30, 30, TimeUnit.SECONDS);
+        // S0.4 独立 keepalive：每 5 秒检查一次，每个 ACTIVE DIRECT 会话每 25 秒发一次轻量 probe
+        // 用以保活 NAT 映射。30s maintenance cycle 对 30-60s 的 NAT TTL 偏迟，单独跑细粒度任务。
+        next.scheduleAtFixedRate(() -> {
+            try {
+                if (running) {
+                    keepaliveDirectPaths();
+                }
+            } catch (Exception e) {
+                log.debug("Peer mesh keepalive failed: {}", e.getMessage());
+            }
+        }, 5, 5, TimeUnit.SECONDS);
     }
 
     private synchronized void stopMaintenance() {
@@ -1582,8 +1729,18 @@ public class PeerMeshClient implements AutoCloseable {
         return true;
     }
 
+    /**
+     * 历史上：当本机 NAT 是 Symmetric 时，本方法返回 true，导致 12 个调用点把 direct 全部禁掉、
+     * 只走 relay。这种"准入开关"过于保守——Symmetric × Cone 这种组合在实际网络里占 30%+，
+     * 让 Symmetric 端往对端 Cone NAT 的 srflx 发包，Cone 端的 NAT 会建立 mapping，
+     * 反向回包就能命中，依然可以直连。
+     *
+     * <p>S0.1 改造：永远返回 false。direct 在所有 NAT 组合下都被尝试；不通的情况下
+     * 已有的 relay 回退路径会自动接管。NAT 类型仍然通过控制面上报，仅用于运营观察和
+     * 路径优先级的"软调度"（参见 S4.1 RTT-aware 路径选择）。
+     */
     private boolean shouldAvoidDirectPath() {
-        return "SYMMETRIC_NAT".equalsIgnoreCase(natType);
+        return false;
     }
 
     private void logDirectSuppressed(String reason) {
@@ -1804,6 +1961,7 @@ public class PeerMeshClient implements AutoCloseable {
         private volatile PeerReplayWindow inboundReplayWindow = new PeerReplayWindow();
         private volatile long lastDirectSuccessMillis;
         private volatile long lastRelaySuccessMillis;
+        private volatile long lastDirectKeepaliveMillis;
         private volatile long lastPathLogMillis;
         private volatile long lastPathReportMillis;
         private volatile long lastKeyMissingLogMillis;
@@ -1834,6 +1992,7 @@ public class PeerMeshClient implements AutoCloseable {
             next.relayTargetAllocationId = relayTargetAllocationId;
             next.lastDirectSuccessMillis = lastDirectSuccessMillis;
             next.lastRelaySuccessMillis = lastRelaySuccessMillis;
+            next.lastDirectKeepaliveMillis = lastDirectKeepaliveMillis;
             next.lastPathLogMillis = lastPathLogMillis;
             next.lastPathReportMillis = lastPathReportMillis;
             next.lastKeyMissingLogMillis = lastKeyMissingLogMillis;
