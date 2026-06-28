@@ -40,11 +40,15 @@ class PeerMeshServiceTests {
 
     @Test
     void sameOwnerCanPeerByDefault() {
+        mockDeviceEnabled(1L);
+        mockDeviceEnabled(2L);
         assertThat(service.canPeer(client(1, "alice", "a"), client(2, "alice", "b"))).isTrue();
     }
 
     @Test
     void crossOwnerDeniedWithoutAcl() {
+        mockDeviceEnabled(1L);
+        mockDeviceEnabled(2L);
         when(aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId("tenant-a", 1L, 2L))
                 .thenReturn(Optional.empty());
 
@@ -53,6 +57,8 @@ class PeerMeshServiceTests {
 
     @Test
     void crossOwnerAllowedWithExplicitAcl() {
+        mockDeviceEnabled(1L);
+        mockDeviceEnabled(2L);
         PeerMeshAcl acl = new PeerMeshAcl();
         acl.setAllowed(true);
         when(aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId("tenant-a", 1L, 2L))
@@ -188,6 +194,13 @@ class PeerMeshServiceTests {
         account.setClientName(name);
         account.setEnabled(true);
         return account;
+    }
+
+    private void mockDeviceEnabled(long clientId) {
+        PeerMeshDevice device = new PeerMeshDevice();
+        device.setClientId(clientId);
+        device.setEnabled(true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", clientId)).thenReturn(Optional.of(device));
     }
 
     private PeerMeshSession activeSession() {

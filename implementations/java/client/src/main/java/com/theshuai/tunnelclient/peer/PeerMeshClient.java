@@ -77,6 +77,8 @@ public class PeerMeshClient implements AutoCloseable {
     private static final long MIN_SESSION_REFRESH_WINDOW_MILLIS = 10_000;
     private static final long DIRECT_STALE_MILLIS = 45_000;
     private static final long PENDING_PROBE_TTL_MILLIS = 15_000;
+    /** S4.1 RTT 滞回阈值：避免 direct/relay 频繁切换 */
+    private static final long RTT_HYSTERESIS_MS = 100;
     private static final long PENDING_PACKET_TTL_MILLIS = 30_000;
     private static final int MAX_PENDING_PACKETS_PER_PEER = 32;
     private static final long ON_DEMAND_PREPARE_INTERVAL_MILLIS = 2_000;
@@ -1441,6 +1443,27 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         long rttMillis = Math.max(0, now - pending.sentAtMillis());
+        // S4.1 RTT 感知选路：记录最优 RTT
+        if (pending.relay()) {
+            session.bestRelayRtt = Math.min(session.bestRelayRtt, rttMillis);
+        } else {
+            session.bestDirectRtt = Math.min(session.bestDirectRtt, rttMillis);
+        }
+        // 滞回比较：relay RTT 显著优于 direct 时切到 relay
+        boolean directIsStale = !session.hasHealthyDirect(now);
+        boolean relayBetterThanDirect = !pending.relay() ? session.bestRelayRtt + RTT_HYSTERESIS_MS < session.bestDirectRtt
+                : session.bestDirectRtt + RTT_HYSTERESIS_MS < rttMillis;
+        if (pending.relay() && session.hasHealthyDirect(now) && !shouldAvoidDirectPath()
+                && !(session.bestRelayRtt + RTT_HYSTERESIS_MS < session.bestDirectRtt)) {
+            log.debug("Peer mesh relay UDP path ignored because direct path is healthy: session={}, peer={}",
+                    session.sessionId(), session.peerId());
+            return;
+        }
+        // 切回 direct：direct 再次活跃且 RTT 优于 relay
+        if (!pending.relay() && session.currentPathType.equals("RELAY")
+                && session.bestDirectRtt + RTT_HYSTERESIS_MS < session.bestRelayRtt) {
+            session.bestRelayRtt = Long.MAX_VALUE; // 重置 relay RTT，避免旧数据干扰
+        }
         String remote = pending.relay()
                 ? "relay:" + (StringUtils.hasText(relayFromAllocationId) ? relayFromAllocationId : pending.relayId())
                 : observedRemote.getAddress().getHostAddress() + ":" + observedRemote.getPort();
@@ -1454,7 +1477,7 @@ public class PeerMeshClient implements AutoCloseable {
         boolean changed = !pathType.equals(previousPath) || !remote.equals(previousRemote);
         session.lastPathRemoteText = remote;
         if (changed || now - session.lastPathLogMillis >= 60_000) {
-            log.info("Peer mesh {} UDP path active: session={}, peer={}, remote={}, rtt={}ms",
+            log.debug("Peer mesh {} UDP path active: session={}, peer={}, remote={}, rtt={}ms",
                     pathType.toLowerCase(), session.sessionId(), session.peerId(), remote, rttMillis);
             session.lastPathLogMillis = now;
         } else {
@@ -1663,7 +1686,7 @@ public class PeerMeshClient implements AutoCloseable {
             }
         }
         if (flushed > 0) {
-            log.info("Peer mesh pending virtual packet flushed: peer={}, count={}", session.peerId(), flushed);
+            log.debug("Peer mesh pending virtual packet flushed: peer={}, count={}", session.peerId(), flushed);
         }
     }
 
@@ -1690,7 +1713,7 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         packetTraceLogMillis.put(key, now);
-        log.info("Peer mesh packet {}: {} bytes={}",
+        log.debug("Peer mesh packet {}: {} bytes={}",
                 direction, PeerIpPacket.describe(packet), packet == null ? 0 : packet.length);
     }
 
@@ -1967,6 +1990,9 @@ public class PeerMeshClient implements AutoCloseable {
         private volatile long lastKeyMissingLogMillis;
         private volatile String lastPathRemoteText = "";
         private volatile String currentPathType = "";
+        /** S4.1 RTT 追踪：用于 direct/relay 择优切换 */
+        private volatile long bestDirectRtt = Long.MAX_VALUE;
+        private volatile long bestRelayRtt = Long.MAX_VALUE;
         private volatile InetSocketAddress remoteEndpoint;
         private volatile String relayTargetAllocationId;
 

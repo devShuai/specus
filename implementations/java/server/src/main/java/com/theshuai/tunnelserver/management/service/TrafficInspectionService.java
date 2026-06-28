@@ -65,6 +65,8 @@ public class TrafficInspectionService {
     private final int decodeMaxBytes;
     private final int maxPending;
     private final int flushBatchSize;
+    /** S4.2 帧采样率 0.0-1.0；首帧/尾帧/异常帧始终捕获 */
+    private final double sampleRate;
     private volatile Instant lastFlushedAt;
 
     public TrafficInspectionService(ClientAccountService clientAccountService,
@@ -77,7 +79,8 @@ public class TrafficInspectionService {
                                     @Value("${tunnel.traffic.capture-header-chars:8192}") int headerChars,
                                     @Value("${tunnel.traffic.capture-decode-max-bytes:1048576}") int decodeMaxBytes,
                                     @Value("${tunnel.traffic.capture-max-pending:20000}") int maxPending,
-                                    @Value("${tunnel.traffic.capture-flush-batch-size:1000}") int flushBatchSize) {
+                                    @Value("${tunnel.traffic.capture-flush-batch-size:1000}") int flushBatchSize,
+                                    @Value("${tunnel.traffic.capture-sample-rate:1.0}") double sampleRate) {
         this.clientAccountService = clientAccountService;
         this.tunnelMappingRepository = tunnelMappingRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
@@ -89,6 +92,7 @@ public class TrafficInspectionService {
         this.decodeMaxBytes = Math.max(1024, decodeMaxBytes);
         this.maxPending = Math.max(0, maxPending);
         this.flushBatchSize = Math.max(1, flushBatchSize);
+        this.sampleRate = Math.max(0.0, Math.min(1.0, sampleRate));
     }
 
     public void recordHttpExchange(String clientName,
@@ -183,9 +187,14 @@ public class TrafficInspectionService {
             return;
         }
 
+        // S4.2 采样：首帧始终捕获，后续按采样率随机捕获
+        FramePosition framePosition = nextFramePosition(clientName, listenPort, channelId, direction, payload == null ? 0 : payload.length);
+        if (framePosition.frameIndex() > 0 && sampleRate < 1.0 && Math.random() >= sampleRate) {
+            return;
+        }
+
         Preview preview = preview(payload);
         long payloadBytes = length(payload);
-        FramePosition framePosition = nextFramePosition(clientName, listenPort, channelId, direction, payloadBytes);
         byte[] payloadData = payload == null || payload.length == 0 ? new byte[0] : Arrays.copyOf(payload, payload.length);
         pendingTcpFrames.add(new PendingTcpFrame(
                 clientName,

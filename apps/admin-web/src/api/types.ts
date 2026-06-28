@@ -47,6 +47,13 @@ export interface ClientResult {
   client: Client;
 }
 
+/** S3.2 单客户端聚合详情 */
+export interface ClientDetail {
+  client: Client;
+  tunnels: Tunnel[];
+  httpRoutes: HttpRoute[];
+}
+
 export interface ClientCredential {
   id: number;
   apiKey: string;
@@ -300,6 +307,8 @@ export interface PeerMeshAcl {
   targetClientId: number;
   targetClientName: string;
   allowed: boolean;
+  /** S4.4 ACL 方向: OUTBOUND=允许source→target, INBOUND=允许target→source, BOTH=双向 */
+  direction: "OUTBOUND" | "INBOUND" | "BOTH";
   createdAt: string;
   updatedAt: string;
 }
@@ -308,6 +317,7 @@ export interface PeerMeshAclMutation {
   sourceClientId: number;
   targetClientId: number;
   allowed?: boolean;
+  direction?: "OUTBOUND" | "INBOUND" | "BOTH";
 }
 
 export interface PeerMeshSession {

@@ -107,6 +107,8 @@ tunnel:
     capture-max-pending: ${TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING:20000}
     capture-flush-batch-size: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE:1000}
     capture-flush-interval-ms: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS:2000}
+    # S4.2 采样率 0.0-1.0；首帧/尾帧/异常帧始终捕获，常规帧按此比例采样，默认全量
+    capture-sample-rate: ${TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE:1.0}
   elasticsearch:
     # When blank, HTTP exchange detail uses the database. When set, HTTP exchange detail writes
     # and reads through Spring Data Elasticsearch instead.

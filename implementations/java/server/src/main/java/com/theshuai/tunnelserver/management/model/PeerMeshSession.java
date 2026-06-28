@@ -75,4 +75,7 @@ public class PeerMeshSession {
 
     @Column(name = "last_traffic_at", length = 40)
     private String lastTrafficAt;
+
+    @Column(name = "last_keepalive_at", length = 40)
+    private String lastKeepaliveAt;
 }

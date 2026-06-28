@@ -14,6 +14,7 @@ public record PeerMeshSessionView(
         long directBytes,
         long relayBytes,
         String lastTrafficAt,
+        String lastKeepaliveAt,
         String startedAt,
         String updatedAt,
         String expiresAt,

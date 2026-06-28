@@ -56,7 +56,8 @@ class TrafficInspectionServiceTests {
                 8192,
                 1048576,
                 10,
-                10
+                10,
+                1.0
         );
         String requestBody = "0123456789abcdefghijklmnopqrstuvwxyz";
         String responseBody = "response-body-with-more-than-eight-bytes";
@@ -120,7 +121,8 @@ class TrafficInspectionServiceTests {
                 8192,
                 1048576,
                 10,
-                10
+                10,
+                1.0
         );
 
         service.recordHttpExchange(
@@ -170,7 +172,8 @@ class TrafficInspectionServiceTests {
                 8192,
                 1048576,
                 10,
-                10
+                10,
+                1.0
         );
         String responseBody = "{\"ok\":true,\"message\":\"gzip response\"}";
         byte[] gzipBytes = gzip(responseBody.getBytes(StandardCharsets.UTF_8));
@@ -233,7 +236,8 @@ class TrafficInspectionServiceTests {
                 8192,
                 1048576,
                 10,
-                10
+                10,
+                1.0
         );
         byte[] pngBytes = new byte[] {(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
 
@@ -293,7 +297,8 @@ class TrafficInspectionServiceTests {
                 8192,
                 1048576,
                 10,
-                10
+                10,
+                1.0
         );
         byte[] payload = "hello-tcp-payload".getBytes(StandardCharsets.UTF_8);
 

@@ -209,10 +209,17 @@ public class PeerMeshService {
         if (normalizeOwner(source.getOwnerUsername()).equals(normalizeOwner(target.getOwnerUsername()))) {
             return true;
         }
+        // S4.4 方向性 ACL：OUTBOUND=source→target, INBOUND=target→source, BOTH=双向
         return aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId(
                         source.getTenantId(), source.getId(), target.getId())
-                .map(PeerMeshAcl::isAllowed)
-                .orElse(false);
+                .filter(PeerMeshAcl::isAllowed)
+                .filter(acl -> "OUTBOUND".equals(acl.getDirection()) || "BOTH".equals(acl.getDirection()))
+                .isPresent()
+                || aclRepository.findByTenantIdAndSourceClientIdAndTargetClientId(
+                        source.getTenantId(), target.getId(), source.getId())
+                .filter(PeerMeshAcl::isAllowed)
+                .filter(acl -> "INBOUND".equals(acl.getDirection()) || "BOTH".equals(acl.getDirection()))
+                .isPresent();
     }
 
     private boolean isDeviceEnabled(ClientAccount account) {
@@ -274,6 +281,7 @@ public class PeerMeshService {
         session.setLocalEndpoint(limit(report.getLocalEndpoint(), 255));
         session.setRemoteEndpoint(limit(report.getRemoteEndpoint(), 255));
         session.setUpdatedAt(now.toString());
+        session.setLastKeepaliveAt(now.toString());
         relayAuthorizationCache.remove(session.getId());
         return toSessionView(sessionRepository.save(session));
     }
@@ -683,6 +691,7 @@ public class PeerMeshService {
                 session.getDirectBytes(),
                 session.getRelayBytes(),
                 session.getLastTrafficAt(),
+                session.getLastKeepaliveAt(),
                 session.getStartedAt(),
                 session.getUpdatedAt(),
                 session.getExpiresAt(),
@@ -735,6 +744,7 @@ public class PeerMeshService {
         session.setDirectBytes(saturatedAdd(session.getDirectBytes(), directBytes));
         session.setRelayBytes(saturatedAdd(session.getRelayBytes(), relayBytes));
         session.setLastTrafficAt(now.toString());
+        session.setLastKeepaliveAt(now.toString());
         session.setUpdatedAt(now.toString());
     }
 

@@ -46,6 +46,10 @@ public class PeerMeshAcl {
     @Column(nullable = false)
     private boolean allowed = true;
 
+    /** S4.4 ACL 方向: OUTBOUND=允许 source→target, INBOUND=允许 target→source, BOTH=双向 */
+    @Column(nullable = false, length = 16)
+    private String direction = "OUTBOUND";
+
     @Column(name = "created_at", nullable = false, length = 40)
     private String createdAt;
 

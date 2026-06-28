@@ -3,6 +3,7 @@ import type {
   ClientCredential,
   ClientCredentialMutation,
   ClientCredentialResult,
+  ClientDetail,
   ClientDownloadLink,
   ClientDownloadLinkMutation,
   ClientMutation,
@@ -226,6 +227,10 @@ export const adminApi = {
     request<ClientResult>(`/clients/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteClient: (id: number) => request<null>(`/clients/${id}`, { method: "DELETE" }),
   pushNatControl: (id: number) => request<NatControlResult>(`/clients/${id}/nat-control`, { method: "POST" }),
+  /** S3.2 单客户端聚合详情 */
+  getClient: (id: number) => request<ClientDetail>(`/clients/${id}`),
+  /** S3.2 强制刷新端口映射 */
+  forceRefreshPortMapping: (id: number) => request<NatControlResult>(`/clients/${id}/force-refresh-port-mapping`, { method: "POST" }),
 
   listClientCredentials: () => request<ClientCredential[]>("/client-credentials"),
   createClientCredential: (body: ClientCredentialMutation) =>
