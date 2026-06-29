@@ -2,6 +2,10 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   Button,
   Chip,
+  Dropdown,
+  DropdownItem,
+  DropdownMenu,
+  DropdownTrigger,
   Input,
   Modal,
   ModalBody,
@@ -155,7 +159,7 @@ export function HttpRoutesPanel() {
         </Select>
         <Input className="w-full sm:w-40" label="路由名" placeholder="web" value={route} onValueChange={setRoute} maxLength={60} isRequired />
         <Input className="w-full sm:w-64" label="目标地址" placeholder="http://127.0.0.1:8080" value={targetBaseUrl} onValueChange={setTargetBaseUrl} maxLength={512} isRequired />
-        <Button className="w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+        <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建路由
         </Button>
       </form>
@@ -177,7 +181,7 @@ export function HttpRoutesPanel() {
         </div>
       )}
 
-      <div className="flex flex-wrap items-end gap-3">
+      <div className="flex flex-wrap items-end gap-3 xl:hidden">
         <Select
           className="w-full sm:w-48"
           label="筛选客户端"
@@ -187,13 +191,13 @@ export function HttpRoutesPanel() {
         >
           {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
-        <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="flat" onPress={() => void load()}>
           刷新
         </Button>
       </div>
 
       {/* mobile: 卡片堆叠 */}
-      <div className="lg:hidden">
+      <div className="xl:hidden">
         <MobileListCardList
           items={routes}
           isLoading={loading}
@@ -289,31 +293,54 @@ export function HttpRoutesPanel() {
         />
       </div>
 
-      {/* desktop: 表格 + 横向溢出滚动兜底 */}
-      <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table aria-label="HTTP 路由列表" isHeaderSticky removeWrapper>
+      {/* desktop: 表格优先自适应，长文本单行省略 */}
+      <div className="hidden min-w-0 xl:block">
+        <Table
+          aria-label="HTTP 路由列表"
+          classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
+          isHeaderSticky
+          removeWrapper
+        >
         <TableHeader>
-          <TableColumn>ID</TableColumn>
-          <TableColumn>客户端</TableColumn>
-          <TableColumn>路由名</TableColumn>
-          <TableColumn>目标地址</TableColumn>
-          <TableColumn>访问链接</TableColumn>
-          <TableColumn>状态</TableColumn>
-          <TableColumn>明细采集</TableColumn>
-          <TableColumn>路径改写</TableColumn>
-          <TableColumn>更新时间</TableColumn>
-          <TableColumn>操作</TableColumn>
+          <TableColumn className="w-[8%]">ID</TableColumn>
+          <TableColumn className="w-[13%]">
+            <ClientFilterHeader
+              clients={clients}
+              selectedClientId={filterClientId}
+              onSelect={setFilterClientId}
+            />
+          </TableColumn>
+          <TableColumn className="w-[8%]">路由名</TableColumn>
+          <TableColumn className="w-[17%]">目标地址</TableColumn>
+          <TableColumn className="w-[19%]">访问链接</TableColumn>
+          <TableColumn className="w-[6%]">状态</TableColumn>
+          <TableColumn className="w-[6%]">明细</TableColumn>
+          <TableColumn className="w-[6%]">改写</TableColumn>
+          <TableColumn className="w-[11%]">更新时间</TableColumn>
+          <TableColumn className="w-[6%]">操作</TableColumn>
         </TableHeader>
         <TableBody items={routes} isLoading={loading} emptyContent="后台尚未维护 HTTP 路由">
           {(item) => (
             <TableRow key={item.id}>
-              <TableCell>{item.id}</TableCell>
-              <TableCell>{item.clientName}</TableCell>
               <TableCell>
-                <code>{item.route}</code>
+                <span className="block truncate font-mono text-tiny" title={String(item.id)}>
+                  {item.id}
+                </span>
               </TableCell>
               <TableCell>
-                <code>{item.targetBaseUrl || "-"}</code>
+                <span className="block truncate" title={item.clientName}>
+                  {item.clientName}
+                </span>
+              </TableCell>
+              <TableCell>
+                <code className="block truncate" title={item.route}>
+                  {item.route}
+                </code>
+              </TableCell>
+              <TableCell>
+                <code className="block truncate" title={item.targetBaseUrl || "-"}>
+                  {item.targetBaseUrl || "-"}
+                </code>
               </TableCell>
               <TableCell>
                 <HttpRouteAccessLink route={item} />
@@ -352,13 +379,17 @@ export function HttpRoutesPanel() {
                   {item.pathRewriteEnabled ? "开启" : "关闭"}
                 </Chip>
               </TableCell>
-              <TableCell>{formatDateTime(item.updatedAt || item.createdAt)}</TableCell>
               <TableCell>
-                <div className="flex gap-2">
-                  <Button size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
+                <span className="block truncate" title={formatDateTime(item.updatedAt || item.createdAt)}>
+                  {formatDateTime(item.updatedAt || item.createdAt)}
+                </span>
+              </TableCell>
+              <TableCell>
+                <div className="flex gap-1">
+                  <Button className="min-w-0 px-2" size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
                     编辑
                   </Button>
-                  <Button size="sm" color="danger" variant="flat" onPress={() => void remove(item)}>
+                  <Button className="min-w-0 px-2" size="sm" color="danger" variant="flat" onPress={() => void remove(item)}>
                     删除
                   </Button>
                 </div>
@@ -380,7 +411,7 @@ function HttpRouteAccessLink({ route }: { route: HttpRoute }) {
   return (
     <div className="flex min-w-0 flex-col gap-1">
       <a
-        className="max-w-80 truncate font-mono text-tiny text-primary underline-offset-2 hover:underline"
+        className="block max-w-full truncate font-mono text-tiny text-primary underline-offset-2 hover:underline"
         href={accessUrl}
         rel="noreferrer"
         target="_blank"
@@ -394,6 +425,63 @@ function HttpRouteAccessLink({ route }: { route: HttpRoute }) {
         </Button>
       </div>
     </div>
+  );
+}
+
+function ClientFilterHeader({
+  clients,
+  onSelect,
+  selectedClientId,
+}: {
+  clients: Array<{ id: number; clientName: string }>;
+  onSelect: (clientId: string) => void;
+  selectedClientId: string;
+}) {
+  const activeClient = clients.find((client) => String(client.id) === selectedClientId);
+  const label = activeClient ? `客户端: ${activeClient.clientName}` : "客户端";
+  const filterItems = [
+    { key: "", label: "全部客户端" },
+    ...clients.map((client) => ({ key: String(client.id), label: client.clientName })),
+  ];
+
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      <span className="truncate" title={label}>
+        {label}
+      </span>
+      <Dropdown placement="bottom-start" shouldBlockScroll={false}>
+        <DropdownTrigger>
+          <Button
+            isIconOnly
+            aria-label="筛选客户端"
+            className="h-7 min-w-7 text-default-500"
+            color={selectedClientId ? "primary" : "default"}
+            size="sm"
+            title="筛选客户端"
+            variant={selectedClientId ? "flat" : "light"}
+          >
+            <FilterIcon />
+          </Button>
+        </DropdownTrigger>
+        <DropdownMenu
+          aria-label="筛选 HTTP 路由客户端"
+          items={filterItems}
+          selectedKeys={[selectedClientId || ""]}
+          selectionMode="single"
+          onAction={(key) => onSelect(String(key))}
+        >
+          {(item) => <DropdownItem key={item.key}>{item.label}</DropdownItem>}
+        </DropdownMenu>
+      </Dropdown>
+    </div>
+  );
+}
+
+function FilterIcon() {
+  return (
+    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">
+      <path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" />
+    </svg>
   );
 }
 

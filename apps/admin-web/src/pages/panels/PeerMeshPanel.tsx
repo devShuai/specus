@@ -6,6 +6,9 @@ import {
   Chip,
   Input,
   Pagination,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Select,
   SelectItem,
   Switch,
@@ -714,7 +717,7 @@ function PeerNatInsight({
               </div>
 
               <div className="min-w-0 space-y-2">
-                <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_220px]">
+                <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_220px] lg:hidden">
                   <Input
                     aria-label="搜索客户端 NAT 结果"
                     placeholder="搜索客户端 / IP / Endpoint"
@@ -773,14 +776,22 @@ function PeerNatInsight({
                   />
                 </div>
 
-                <div className="hidden min-w-0 overflow-x-auto lg:block">
-                  <Table aria-label="客户端 NAT 检测结果" removeWrapper>
+                <div className="hidden min-w-0 lg:block">
+                  <Table
+                    aria-label="客户端 NAT 检测结果"
+                    classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
+                    removeWrapper
+                  >
                     <TableHeader>
-                      <TableColumn>客户端</TableColumn>
-                      <TableColumn>NAT 类型</TableColumn>
-                      <TableColumn>Endpoint</TableColumn>
-                      <TableColumn>建议</TableColumn>
-                      <TableColumn>上报</TableColumn>
+                      <TableColumn className="w-[24%]">
+                        <PeerNatKeywordHeader keyword={keyword} onKeywordChange={onKeywordChange} />
+                      </TableColumn>
+                      <TableColumn className="w-[16%]">
+                        <PeerNatTypeFilterHeader filter={filter} onFilterChange={onFilterChange} />
+                      </TableColumn>
+                      <TableColumn className="w-[22%]">Endpoint</TableColumn>
+                      <TableColumn className="w-[24%]">建议</TableColumn>
+                      <TableColumn className="w-[14%]">上报</TableColumn>
                     </TableHeader>
                     <TableBody items={devices} isLoading={loading} emptyContent="暂无客户端 NAT 检测结果">
                       {(device) => {
@@ -789,8 +800,8 @@ function PeerNatInsight({
                           <TableRow key={device.clientId}>
                             <TableCell>
                               <div className="flex min-w-0 flex-col">
-                                <span className="font-semibold">{device.clientName}</span>
-                                <span className="font-mono text-tiny text-default-400">{device.virtualIp || "-"}</span>
+                                <span className="truncate font-semibold" title={device.clientName}>{device.clientName}</span>
+                                <span className="truncate font-mono text-tiny text-default-400" title={device.virtualIp || "-"}>{device.virtualIp || "-"}</span>
                               </div>
                             </TableCell>
                             <TableCell>
@@ -799,18 +810,18 @@ function PeerNatInsight({
                               </Chip>
                             </TableCell>
                             <TableCell>
-                              <span className="block max-w-60 break-all font-mono text-tiny">{device.lastEndpoint || "-"}</span>
+                              <span className="block truncate font-mono text-tiny" title={device.lastEndpoint || "-"}>{device.lastEndpoint || "-"}</span>
                             </TableCell>
                             <TableCell>
-                              <div className="flex max-w-72 flex-col text-small">
-                                <span className="font-semibold">{profile.reachabilityLabel}</span>
-                                <span className="text-tiny text-default-500">{profile.recommendation}</span>
+                              <div className="flex min-w-0 flex-col text-small">
+                                <span className="truncate font-semibold" title={profile.reachabilityLabel}>{profile.reachabilityLabel}</span>
+                                <span className="truncate text-tiny text-default-500" title={profile.recommendation}>{profile.recommendation}</span>
                               </div>
                             </TableCell>
                             <TableCell>
                               <div className="flex flex-col text-small">
-                                <span>{formatDateTime(peerNatLastReportAt(device))}</span>
-                                <span className="text-tiny text-default-400">{peerNatAgeLabel(peerNatLastReportAt(device))}</span>
+                                <span className="truncate" title={formatDateTime(peerNatLastReportAt(device))}>{formatDateTime(peerNatLastReportAt(device))}</span>
+                                <span className="truncate text-tiny text-default-400" title={peerNatAgeLabel(peerNatLastReportAt(device))}>{peerNatAgeLabel(peerNatLastReportAt(device))}</span>
                               </div>
                             </TableCell>
                           </TableRow>
@@ -860,6 +871,117 @@ function PeerNatInsight({
         </Card>
       </div>
     </section>
+  );
+}
+
+function PeerNatKeywordHeader({
+  keyword,
+  onKeywordChange,
+}: {
+  keyword: string;
+  onKeywordChange: (value: string) => void;
+}) {
+  const active = Boolean(keyword.trim());
+  const label = active ? `客户端: ${keyword.trim()}` : "客户端";
+
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      <span className="truncate" title={label}>
+        {label}
+      </span>
+      <Popover placement="bottom-start" shouldBlockScroll={false}>
+        <PopoverTrigger>
+          <Button
+            isIconOnly
+            aria-label="搜索客户端 NAT 结果"
+            className="h-7 min-w-7 text-default-500"
+            color={active ? "primary" : "default"}
+            size="sm"
+            title="搜索客户端 NAT 结果"
+            variant={active ? "flat" : "light"}
+          >
+            <PeerNatFilterIcon />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-72 p-3">
+          <div className="flex w-full flex-col gap-3">
+            <div className="text-small font-semibold">搜索客户端</div>
+            <Input
+              autoFocus
+              label="关键词"
+              placeholder="客户端 / IP / Endpoint"
+              size="sm"
+              value={keyword}
+              onValueChange={onKeywordChange}
+            />
+            <Button size="sm" variant="flat" onPress={() => onKeywordChange("")}>
+              清空搜索
+            </Button>
+          </div>
+        </PopoverContent>
+      </Popover>
+      {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
+    </div>
+  );
+}
+
+function PeerNatTypeFilterHeader({
+  filter,
+  onFilterChange,
+}: {
+  filter: PeerNatFilterKey;
+  onFilterChange: (value: PeerNatFilterKey) => void;
+}) {
+  const active = filter !== "all";
+  const activeOption = peerNatFilterOptions.find((option) => option.key === filter) ?? peerNatFilterOptions[0];
+  const label = active ? `NAT: ${activeOption.label}` : "NAT 类型";
+
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      <span className="truncate" title={label}>
+        {label}
+      </span>
+      <Popover placement="bottom-start" shouldBlockScroll={false}>
+        <PopoverTrigger>
+          <Button
+            isIconOnly
+            aria-label="筛选 NAT 类型"
+            className="h-7 min-w-7 text-default-500"
+            color={active ? "primary" : "default"}
+            size="sm"
+            title="筛选 NAT 类型"
+            variant={active ? "flat" : "light"}
+          >
+            <PeerNatFilterIcon />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-56 p-3">
+          <div className="flex w-full flex-col gap-3">
+            <div className="text-small font-semibold">NAT 类型筛选</div>
+            <select
+              className="h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+              value={filter}
+              onChange={(event) => onFilterChange(event.target.value as PeerNatFilterKey)}
+            >
+              {peerNatFilterOptions.map((option) => (
+                <option key={option.key} value={option.key}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </PopoverContent>
+      </Popover>
+      {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
+    </div>
+  );
+}
+
+function PeerNatFilterIcon() {
+  return (
+    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">
+      <path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" />
+    </svg>
   );
 }
 

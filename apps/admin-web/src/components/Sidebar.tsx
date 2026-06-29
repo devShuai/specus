@@ -6,10 +6,9 @@ export interface SidebarProps { groups: NavGroup[]; active: string; onSelect: (k
 
 export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose }: SidebarProps) {
   return <nav aria-label="主导航" className="flex h-full flex-col">
-    {variant === "desktop" && <div className="shrink-0 border-b border-divider px-3 py-4"><AppLogo className="min-w-0" label="shuai-tunnel" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
+    {variant === "desktop" && <div className="flex h-16 shrink-0 items-center px-3"><AppLogo className="min-w-0" label="shuai-tunnel" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
     <div className="flex-1 overflow-y-auto px-2 py-3">
       {groups.map((g, gi) => <div key={g.label} className={gi === 0 ? "mb-3" : "mt-3 mb-3"}>
-        {gi > 0 && <div className="mx-3 mb-2 border-t border-divider" />}
         <div className="mb-1 px-3 text-small font-semibold text-default-400">{g.label}</div>
         <ul className="flex flex-col gap-0.5">{g.items.map(item => { const isActive = item.key === active; return <li key={item.key}>
           <button className={["flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-small transition-colors", isActive ? "border-l-2 border-primary bg-primary-50 font-semibold text-primary-700 rounded-l-none pl-2.5 dark:bg-primary-400/10 dark:text-primary-400" : "text-default-600 hover:bg-default-100 hover:text-foreground"].join(" ")} type="button" onClick={() => { onSelect(item.key); onClose?.(); }}>
@@ -20,7 +19,7 @@ export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose
         </li>})}</ul>
       </div>)}
     </div>
-    {variant === "desktop" && <div className="shrink-0 border-t border-divider px-3 py-3" />}
+    {variant === "desktop" && <div className="shrink-0 px-3 py-3" />}
   </nav>;
 }
 

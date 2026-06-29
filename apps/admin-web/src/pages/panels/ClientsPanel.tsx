@@ -183,7 +183,7 @@ export function ClientsPanel() {
           <Input className="w-full sm:w-64" label="apiKey" placeholder="留空自动生成" value={apiKey} onValueChange={setApiKey} />
           <Input className="w-full sm:w-56" label="secret" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
           <Input className="w-full sm:w-44" type="number" label="在线实例上限" min={1} max={10000} value={maxOnline} onValueChange={setMaxOnline} />
-          <Button className="w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+          <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
             新建接入凭证
           </Button>
         </form>

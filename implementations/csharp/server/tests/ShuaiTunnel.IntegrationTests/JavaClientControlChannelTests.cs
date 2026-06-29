@@ -26,7 +26,7 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
 {
     private static readonly string RepoRoot = LocateRepoRoot();
     private static readonly string ClientJar = Path.Combine(RepoRoot,
-        "implementations", "java", "client", "target", "tunnel-client-0.0.1-SNAPSHOT-exec.jar");
+        "implementations", "java", "client", "target", "tunnel-client-1.0.0-SNAPSHOT-exec.jar");
 
     private TestServerFixture? _server;
     private ClientAuthStub? _authStub;

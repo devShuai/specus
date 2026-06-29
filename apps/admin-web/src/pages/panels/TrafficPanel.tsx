@@ -11,6 +11,9 @@ import {
   ModalFooter,
   ModalHeader,
   Pagination,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Tab,
   Table,
   TableBody,
@@ -86,6 +89,8 @@ const HTTP_RESPONSE_BODY_TYPES: Array<{ value: "" | HttpResponseBodyType; label:
   { value: "text", label: "文本" },
   { value: "binary", label: "二进制" },
 ];
+const desktopFilterControlClass =
+  "h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary";
 
 interface TrafficSummary {
   resources: number;
@@ -790,12 +795,12 @@ function HttpExchangeTable({
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
       <CardBody className="gap-3 p-3">
-        <div className="flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-center lg:justify-between">
+        <div className="flex flex-col gap-1">
           <div>
             <h3 className="text-small font-semibold">HTTP 协议记录</h3>
             <p className="text-tiny text-default-500">请求行、响应状态、headers 与 body 预览</p>
           </div>
-          <div className="flex flex-wrap items-end gap-2 lg:flex-1 lg:justify-end">
+          <div className="flex flex-wrap items-end gap-2 xl:hidden">
             <label className="flex min-w-[6.5rem] flex-1 flex-col gap-1 sm:flex-none sm:w-32">
               <span className="text-tiny text-default-500">搜索字段</span>
               <select
@@ -838,7 +843,7 @@ function HttpExchangeTable({
               }}
               onValueChange={onSearchDraftChange}
             />
-            <div className="flex gap-2">
+            <div className="flex items-center gap-2">
               <Button className="h-9" size="sm" variant="flat" onPress={onSearch}>
                 搜索
               </Button>
@@ -868,7 +873,7 @@ function HttpExchangeTable({
         )}
 
         {/* mobile: HTTP 协议记录卡片 */}
-        <div className="lg:hidden">
+        <div className="xl:hidden">
           <MobileListCardList
             items={tableRows}
             isLoading={loading}
@@ -933,27 +938,57 @@ function HttpExchangeTable({
           />
         </div>
 
-        <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table key={tableCollectionKey} aria-label="HTTP 协议记录" isHeaderSticky removeWrapper>
+        <div className="hidden min-w-0 xl:block">
+        <Table
+          key={tableCollectionKey}
+          aria-label="HTTP 协议记录"
+          classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
+          isHeaderSticky
+          removeWrapper
+        >
           <TableHeader>
-            <TableColumn>时间</TableColumn>
-            <TableColumn>请求</TableColumn>
-            <TableColumn>状态</TableColumn>
-            <TableColumn>返回类型</TableColumn>
-            <TableColumn>资源</TableColumn>
-            <TableColumn>流量</TableColumn>
-            <TableColumn>耗时</TableColumn>
-            <TableColumn>协议详情</TableColumn>
+            <TableColumn className="w-[14%]">时间</TableColumn>
+            <TableColumn className="w-[22%]">
+              <HttpSearchFilterHeader
+                activeSearch={activeSearch}
+                activeSearchField={activeSearchField}
+                onResetSearch={onResetSearch}
+                onSearch={onSearch}
+                onSearchDraftChange={onSearchDraftChange}
+                onSearchFieldChange={onSearchFieldChange}
+                searchDraft={searchDraft}
+                searchField={searchField}
+                searchFieldOption={searchFieldOption}
+              />
+            </TableColumn>
+            <TableColumn className="w-[8%]">状态</TableColumn>
+            <TableColumn className="w-[11%]">
+              <HttpResponseTypeFilterHeader
+                activeResponseType={activeResponseType}
+                onResetSearch={onResetSearch}
+                onSearch={onSearch}
+                onResponseTypeChange={onResponseTypeChange}
+                responseType={responseType}
+              />
+            </TableColumn>
+            <TableColumn className="w-[21%]">资源</TableColumn>
+            <TableColumn className="w-[10%]">流量</TableColumn>
+            <TableColumn className="w-[6%]">耗时</TableColumn>
+            <TableColumn className="w-[8%]">协议详情</TableColumn>
           </TableHeader>
           <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent="暂无 HTTP 协议记录">
             {(row) => (
               <TableRow key={row.tableKey}>
-                <TableCell>{formatDateTime(row.capturedAt)}</TableCell>
+                <TableCell>
+                  <span className="block truncate" title={formatDateTime(row.capturedAt)}>
+                    {formatDateTime(row.capturedAt)}
+                  </span>
+                </TableCell>
                 <TableCell>
                   <div className="flex min-w-0 flex-col">
                     <span className="font-mono text-small font-semibold">{row.method}</span>
-                    <span className="max-w-80 truncate font-mono text-tiny text-default-500">{httpPath(row)}</span>
-                    {row.remoteAddress && <span className="text-tiny text-default-400">{row.remoteAddress}</span>}
+                    <span className="block max-w-full truncate font-mono text-tiny text-default-500" title={httpPath(row)}>{httpPath(row)}</span>
+                    {row.remoteAddress && <span className="block truncate text-tiny text-default-400" title={row.remoteAddress}>{row.remoteAddress}</span>}
                   </div>
                 </TableCell>
                 <TableCell>
@@ -972,10 +1007,10 @@ function HttpExchangeTable({
                 </TableCell>
                 <TableCell>
                   <div className="flex min-w-0 flex-col">
-                    <span className="max-w-96 whitespace-normal break-all font-medium" title={row.resourceName}>
+                    <span className="block max-w-full truncate font-medium" title={row.resourceName}>
                       {row.resourceName}
                     </span>
-                    <span className="text-tiny text-default-400">{row.clientName}</span>
+                    <span className="block truncate text-tiny text-default-400" title={row.clientName}>{row.clientName}</span>
                   </div>
                 </TableCell>
                 <TableCell>
@@ -1008,6 +1043,184 @@ function HttpExchangeTable({
         </div>
       </CardBody>
     </Card>
+  );
+}
+
+function HttpSearchFilterHeader({
+  activeSearch,
+  activeSearchField,
+  onResetSearch,
+  onSearch,
+  onSearchDraftChange,
+  onSearchFieldChange,
+  searchDraft,
+  searchField,
+  searchFieldOption,
+}: {
+  activeSearch: string;
+  activeSearchField: HttpTrafficSearchField;
+  onResetSearch: () => void;
+  onSearch: () => void;
+  onSearchDraftChange: (value: string) => void;
+  onSearchFieldChange: (field: HttpTrafficSearchField) => void;
+  searchDraft: string;
+  searchField: HttpTrafficSearchField;
+  searchFieldOption: { label: string; placeholder: string; value: HttpTrafficSearchField };
+}) {
+  const active = Boolean(activeSearch || activeSearchField !== "summary");
+  const label = active ? `请求: ${httpSearchFieldOption(activeSearchField).label}` : "请求";
+
+  return (
+    <TrafficTableFilterHeader label={label} active={active} title="搜索 HTTP 记录">
+      <Popover placement="bottom-start" shouldBlockScroll={false}>
+        <PopoverTrigger>
+          <Button
+            isIconOnly
+            aria-label="搜索 HTTP 记录"
+            className="h-7 min-w-7 text-default-500"
+            color={active ? "primary" : "default"}
+            size="sm"
+            title="搜索 HTTP 记录"
+            variant={active ? "flat" : "light"}
+          >
+            <TrafficFilterIcon />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-80 p-3">
+          <div className="flex w-full flex-col gap-3">
+            <div className="text-small font-semibold">HTTP 记录搜索</div>
+            <label className="flex flex-col gap-1">
+              <span className="text-tiny text-default-500">搜索字段</span>
+              <select
+                className={desktopFilterControlClass}
+                value={searchField}
+                onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
+              >
+                {HTTP_SEARCH_FIELDS.map((field) => (
+                  <option key={field.value} value={field.value}>
+                    {field.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Input
+              label="搜索内容"
+              placeholder={searchFieldOption.placeholder}
+              size="sm"
+              value={searchDraft}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  onSearch();
+                }
+              }}
+              onValueChange={onSearchDraftChange}
+            />
+            <div className="flex justify-end gap-2">
+              <Button className="h-9" size="sm" variant="flat" onPress={onResetSearch}>
+                重置
+              </Button>
+              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={onSearch}>
+                应用
+              </Button>
+            </div>
+          </div>
+        </PopoverContent>
+      </Popover>
+    </TrafficTableFilterHeader>
+  );
+}
+
+function HttpResponseTypeFilterHeader({
+  activeResponseType,
+  onResetSearch,
+  onResponseTypeChange,
+  onSearch,
+  responseType,
+}: {
+  activeResponseType: "" | HttpResponseBodyType;
+  onResetSearch: () => void;
+  onResponseTypeChange: (type: "" | HttpResponseBodyType) => void;
+  onSearch: () => void;
+  responseType: "" | HttpResponseBodyType;
+}) {
+  const active = Boolean(activeResponseType);
+  const label = active ? `返回: ${httpResponseTypeOption(activeResponseType).label}` : "返回类型";
+
+  return (
+    <TrafficTableFilterHeader label={label} active={active} title="筛选返回类型">
+      <Popover placement="bottom-start" shouldBlockScroll={false}>
+        <PopoverTrigger>
+          <Button
+            isIconOnly
+            aria-label="筛选返回类型"
+            className="h-7 min-w-7 text-default-500"
+            color={active ? "primary" : "default"}
+            size="sm"
+            title="筛选返回类型"
+            variant={active ? "flat" : "light"}
+          >
+            <TrafficFilterIcon />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-64 p-3">
+          <div className="flex w-full flex-col gap-3">
+            <div className="text-small font-semibold">返回类型筛选</div>
+            <label className="flex flex-col gap-1">
+              <span className="text-tiny text-default-500">返回类型</span>
+              <select
+                className={desktopFilterControlClass}
+                value={responseType}
+                onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
+              >
+                {HTTP_RESPONSE_BODY_TYPES.map((type) => (
+                  <option key={type.value || "all"} value={type.value}>
+                    {type.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button className="h-9" size="sm" variant="flat" onPress={onResetSearch}>
+                重置
+              </Button>
+              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={onSearch}>
+                应用
+              </Button>
+            </div>
+          </div>
+        </PopoverContent>
+      </Popover>
+    </TrafficTableFilterHeader>
+  );
+}
+
+function TrafficTableFilterHeader({
+  active,
+  children,
+  label,
+  title,
+}: {
+  active: boolean;
+  children: ReactNode;
+  label: string;
+  title: string;
+}) {
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      <span className="truncate" title={label}>
+        {label}
+      </span>
+      <span title={title}>{children}</span>
+      {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
+    </div>
+  );
+}
+
+function TrafficFilterIcon() {
+  return (
+    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">
+      <path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" />
+    </svg>
   );
 }
 

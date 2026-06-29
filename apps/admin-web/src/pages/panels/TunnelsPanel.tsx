@@ -140,10 +140,10 @@ export function TunnelsPanel() {
         <Input className="w-full sm:w-32" type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
         <Input className="w-full sm:w-44" label="内网目标地址" placeholder="127.0.0.1" value={targetAddress} onValueChange={setTargetAddress} isRequired />
         <Input className="w-full sm:w-32" type="number" label="内网端口" value={targetPort} onValueChange={setTargetPort} min={1} max={65535} isRequired />
-        <Button className="w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
+        <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建映射
         </Button>
-        <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="flat" onPress={() => void load()}>
           刷新
         </Button>
       </form>

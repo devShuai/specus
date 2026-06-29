@@ -103,18 +103,18 @@ function DashboardContent() {
 
   return (
     <div className="flex min-h-screen">
-      <aside className="hidden w-60 shrink-0 border-r border-divider bg-background shadow-[1px_0_3px_rgba(0,0,0,0.04)] lg:flex lg:flex-col">
+      <aside className="hidden w-60 shrink-0 bg-background shadow-[1px_0_3px_rgba(0,0,0,0.04)] lg:fixed lg:inset-y-0 lg:left-0 lg:z-30 lg:flex lg:flex-col">
         <Sidebar groups={visibleGroups} active={renderedPanel} onSelect={activatePanel} variant="desktop" />
       </aside>
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="border-b border-divider bg-background/80 backdrop-blur">
+      <div className="flex min-w-0 flex-1 flex-col lg:ml-60">
+        <header className="bg-background/80 backdrop-blur">
           <div className="flex items-center gap-2 px-3 py-2 sm:px-4 lg:hidden">
             <Button isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
             <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
             <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
             {renderActions("flex shrink-0 items-center gap-1.5")}
           </div>
-          <div className="hidden w-full px-4 py-3 sm:px-6 lg:flex lg:items-center lg:justify-between lg:py-0">
+          <div className="hidden h-16 w-full px-4 py-3 sm:px-6 lg:flex lg:items-center lg:justify-between lg:py-0">
             <h2 className="text-lg font-semibold text-foreground">{activeTitle}</h2>
             {renderActions("flex shrink-0 items-center gap-3")}
           </div>
@@ -135,8 +135,8 @@ function DashboardContent() {
 function MobileNav({ open, groups, active, onSelect, onClose }: { open: boolean; groups: NavGroup[]; active: PanelKey; onSelect: (p: PanelKey) => void; onClose: () => void }) {
   return (<>
     <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-sm transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
-    <aside className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[82vw] flex-col border-r border-divider bg-background shadow-2xl transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}>
-      <div className="flex items-center justify-between gap-2 border-b border-divider px-4 py-3">
+    <aside className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[82vw] flex-col bg-background shadow-2xl transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}>
+      <div className="flex items-center justify-between gap-2 px-4 py-3">
         <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
         <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="sm" variant="light" onPress={onClose}><CloseIcon /></Button>
       </div>
@@ -153,7 +153,7 @@ function UserMenu({ profile, onLogout }: { profile: ReturnType<typeof useAuth>["
   const initials = name.slice(0, 1).toUpperCase();
   const { theme, setTheme, resetToSystem, userOverride } = useTheme();
   return (
-    <Dropdown placement="bottom-end">
+    <Dropdown placement="bottom-end" shouldBlockScroll={false}>
       <DropdownTrigger>
         <Button isIconOnly aria-label="个人菜单" className="h-10 w-10 min-w-10 rounded-full" radius="full" variant="flat">
           <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
