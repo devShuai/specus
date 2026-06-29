@@ -136,8 +136,11 @@ public class PeerSignalService {
         config.setType(PeerControlMessage.TYPE_CONFIG);
         config.setSourceClientId(account.getId());
         config.setSourceClientName(account.getClientName());
-        config.setPeerMesh(peerMeshService.buildRuntimeConfig(account));
+        var peerMeshConfig = peerMeshService.buildRuntimeConfig(account);
+        config.setPeerMesh(peerMeshConfig);
         config.setCreatedAtMillis(System.currentTimeMillis());
+        log.info("[peer-mesh] push runtime config: client={}, enabled={}, virtualIp={}",
+                account.getClientName(), peerMeshConfig.isEnabled(), peerMeshConfig.getVirtualIp());
         sendSignal(channel, "server", account.getClientName(), config);
     }
 

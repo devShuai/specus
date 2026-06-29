@@ -27,6 +27,7 @@ import { notify, notifyError } from "../../components/toast";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { EmptyState } from "../../components/EmptyState";
+import { useNowTick } from "../../hooks/useNowTick";
 import {
   NAT_TYPE_PROFILES,
   natReachabilityWeight,
@@ -45,6 +46,7 @@ const peerNatFilterOptions = [
 type PeerNatFilterKey = (typeof peerNatFilterOptions)[number]["key"];
 type PeerMeshViewKey = "devices" | "sessions" | "acl" | "nat";
 const SESSION_PAGE_SIZE = 20;
+const PEER_SESSION_FRESH_MILLIS = 120_000;
 
 export function PeerMeshPanel() {
   const [status, setStatus] = useState<PeerMeshStatus | null>(null);
@@ -64,6 +66,7 @@ export function PeerMeshPanel() {
   const [sessionPage, setSessionPage] = useState(0);
   const [sessionTotal, setSessionTotal] = useState(0);
   const [sessionTotalPages, setSessionTotalPages] = useState(1);
+  const now = useNowTick(1000);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -97,7 +100,12 @@ export function PeerMeshPanel() {
 
   const enabledDevices = useMemo(() => devices.filter((device) => device.enabled), [devices]);
   const onlineDevices = useMemo(() => devices.filter((device) => device.online), [devices]);
-  const activeSessions = useMemo(() => sessions.filter((session) => session.status !== "CLOSED"), [sessions]);
+  const deviceById = useMemo(() => new Map(devices.map((device) => [device.clientId, device])), [devices]);
+  const openSessions = useMemo(() => sessions.filter((session) => session.status !== "CLOSED"), [sessions]);
+  const activeSessions = useMemo(
+    () => sessions.filter((session) => isPeerSessionEffectivelyActive(session, deviceById, now)),
+    [sessions, deviceById, now],
+  );
   const directSessions = useMemo(() => activeSessions.filter((session) => session.pathType === "DIRECT"), [activeSessions]);
   const relaySessions = useMemo(() => activeSessions.filter((session) => session.pathType === "RELAY"), [activeSessions]);
   const peerTrafficBytes = useMemo(
@@ -183,11 +191,11 @@ export function PeerMeshPanel() {
   };
 
   const closeOpenSessions = async () => {
-    if (activeSessions.length === 0) {
-      notify("当前没有活跃 peer 链路");
+    if (openSessions.length === 0) {
+      notify("当前没有未关闭 peer 链路");
       return;
     }
-    if (!window.confirm(`确定清理当前权限范围内的活跃 peer 链路吗？页面当前显示 ${activeSessions.length} 条。`)) {
+    if (!window.confirm(`确定清理当前权限范围内的未关闭 peer 链路吗？当前有效活跃 ${activeSessions.length} 条，未关闭 ${openSessions.length} 条。`)) {
       return;
     }
     setClearingSessions(true);
@@ -198,9 +206,9 @@ export function PeerMeshPanel() {
       setSessionPage(0);
       setSessionTotal(0);
       setSessionTotalPages(1);
-      notify(`已清理 ${closedSessions.length} 条活跃 peer 链路`);
+      notify(`已清理 ${closedSessions.length} 条 peer 链路`);
     } catch (error) {
-      notifyError(error, "清理活跃 peer 链路失败");
+      notifyError(error, "清理 peer 链路失败");
     } finally {
       setClearingSessions(false);
     }
@@ -217,11 +225,11 @@ export function PeerMeshPanel() {
           <Button
             color="danger"
             variant="flat"
-            isDisabled={activeSessions.length === 0}
+            isDisabled={openSessions.length === 0}
             isLoading={clearingSessions}
             onPress={() => void closeOpenSessions()}
           >
-            清理活跃链路
+            清理未关闭链路
           </Button>
           <Button variant="flat" onPress={() => void load()}>
             刷新
@@ -233,7 +241,7 @@ export function PeerMeshPanel() {
         <MetricCard label="全局开关" value={status?.enabled ? "已开启" : "默认关闭"} tone={status?.enabled ? "success" : "default"} />
         <MetricCard label="已启用设备" value={`${enabledDevices.length} / ${devices.length}`} />
         <MetricCard label="在线设备" value={String(onlineDevices.length)} tone={onlineDevices.length > 0 ? "success" : "default"} />
-        <MetricCard label="Direct / Relay" value={`${directSessions.length} / ${relaySessions.length}`} />
+        <MetricCard label="活跃 Direct / Relay" value={`${directSessions.length} / ${relaySessions.length}`} />
         <MetricCard label="Peer 流量" value={formatBytes(peerTrafficBytes)} tone={peerTrafficBytes > 0 ? "success" : "default"} />
       </div>
 
@@ -252,7 +260,7 @@ export function PeerMeshPanel() {
         onSelectionChange={(key) => setPeerView(String(key) as PeerMeshViewKey)}
       >
         <Tab key="devices" title="设备拓扑" />
-        <Tab key="sessions" title={`会话 ${sessionTotal}`} />
+        <Tab key="sessions" title={`活跃会话 ${activeSessions.length}`} />
         <Tab key="acl" title={`ACL ${acls.length}`} />
         <Tab key="nat" title="NAT 诊断" />
       </Tabs>
@@ -543,7 +551,7 @@ export function PeerMeshPanel() {
             <div className="hidden lg:flex lg:gap-3 lg:min-h-[320px]">
               <Card shadow="none" className="w-[38%] min-w-0 shrink-0 rounded-md border border-default-200">
                 <CardBody className="gap-2 p-3">
-                  <div className="flex items-center justify-between"><h3 className="text-small font-semibold">会话列表</h3><span className="text-tiny text-default-500">共 {sessionTotal} 条</span></div>
+                  <div className="flex items-center justify-between"><h3 className="text-small font-semibold">活跃会话</h3><span className="text-tiny text-default-500">有效 {activeSessions.length} / 未关闭 {sessionTotal}</span></div>
                   <div className="flex-1 space-y-1 overflow-y-auto">
                     {activeSessions.map((s) => (
                       <button key={s.id} type="button" onClick={() => setSelectedSession(s)}
@@ -576,7 +584,7 @@ export function PeerMeshPanel() {
               {!mobileDetailOpen ? (
                 <Card shadow="none" className="rounded-md border border-default-200">
                   <CardBody className="gap-2 p-3">
-                    <h3 className="text-small font-semibold">活跃会话 · 共 {sessionTotal} 条</h3>
+                    <h3 className="text-small font-semibold">活跃会话 · 有效 {activeSessions.length} / 未关闭 {sessionTotal}</h3>
                     <MobileListCardList items={activeSessions} isLoading={loading} emptyContent="暂无活跃 peer session" renderCard={(raw) => {
                       const s = raw as PeerMeshSession;
                       return (
@@ -1145,6 +1153,34 @@ function peerNatAgeLabel(value: string | null | undefined) {
     return `${Math.floor(seconds / 3600)}h 前`;
   }
   return `${Math.floor(seconds / 86400)}d 前`;
+}
+
+function isPeerSessionEffectivelyActive(session: PeerMeshSession, deviceById: Map<number, PeerMeshDevice>, now: number) {
+  return peerSessionEffectiveStatus(session, deviceById, now) === "ACTIVE";
+}
+
+function peerSessionEffectiveStatus(session: PeerMeshSession, deviceById: Map<number, PeerMeshDevice>, now: number) {
+  if (session.status === "CLOSED") {
+    return "CLOSED";
+  }
+  const sourceOnline = Boolean(deviceById.get(session.sourceClientId)?.online);
+  const targetOnline = Boolean(deviceById.get(session.targetClientId)?.online);
+  if (!sourceOnline || !targetOnline) {
+    return "OFFLINE";
+  }
+  if (!isPeerSessionFresh(session, now)) {
+    return "STALE";
+  }
+  return session.status || "NEGOTIATING";
+}
+
+function isPeerSessionFresh(session: PeerMeshSession, now: number) {
+  const value = session.lastKeepaliveAt || session.updatedAt || session.startedAt;
+  if (!value) {
+    return false;
+  }
+  const time = Date.parse(value);
+  return Number.isFinite(time) && now - time <= PEER_SESSION_FRESH_MILLIS;
 }
 
 function peerNatBarColor(tone: string) {

@@ -169,6 +169,10 @@ public class PeerMeshClient implements AutoCloseable {
         announceCandidatesToOnlinePeers();
     }
 
+    public boolean isRunning() {
+        return running;
+    }
+
     public void handleControlMessage(String message) {
         if (!StringUtils.hasText(message)) {
             return;

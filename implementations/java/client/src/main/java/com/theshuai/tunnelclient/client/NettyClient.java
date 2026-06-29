@@ -244,7 +244,14 @@ public class NettyClient {
         if (prior > 0) {
             log.info("Login succeeded, reconnect backoff reset (was attempt #{})", prior);
         }
-        peerMeshClient.startOrUpdate(tunnelBean.getPeerMesh());
+        var cachedPeerMesh = tunnelBean.getPeerMesh();
+        if (cachedPeerMesh != null && cachedPeerMesh.isEnabled()) {
+            peerMeshClient.startOrUpdate(cachedPeerMesh);
+        } else if (!peerMeshClient.isRunning()) {
+            peerMeshClient.startOrUpdate(cachedPeerMesh);
+        } else {
+            log.debug("Skip cached disabled peer mesh config after control login; waiting for server runtime config");
+        }
     }
 
     public void stopReconnecting(String reason) {
