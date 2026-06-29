@@ -7,6 +7,7 @@ public record PeerMeshAclView(
         long targetClientId,
         String targetClientName,
         boolean allowed,
+        String direction,
         String createdAt,
         String updatedAt
 ) {

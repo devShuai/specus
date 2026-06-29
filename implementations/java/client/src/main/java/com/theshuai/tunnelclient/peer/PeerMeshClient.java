@@ -365,7 +365,27 @@ public class PeerMeshClient implements AutoCloseable {
         }
         mergePeer(peer, control.getCandidates());
         rememberSession(control);
+
+        // P1-6 Hairpin 检测：对端 srflx 地址与本端相同 → 同 NAT，只探 host 候选
+        PeerCandidate mySrflx = serverReflexiveCandidate;
+        if (mySrflx != null && mySrflx.getAddress() != null
+                && hasSameNatAddress(control.getCandidates(), mySrflx.getAddress())) {
+            control.setCandidates(control.getCandidates().stream()
+                    .filter(c -> "host".equalsIgnoreCase(c.getType()))
+                    .toList());
+        }
+
         sendConnectivityChecks(control);
+    }
+
+    /** 同 NAT 检测：对端 srflx/portmap 地址与本端 STUN 观测地址相同 */
+    private boolean hasSameNatAddress(List<PeerCandidate> candidates, String mySrflx) {
+        int colon = mySrflx.lastIndexOf(':');
+        if (colon <= 0) return false;
+        String myIp = mySrflx.substring(0, colon);
+        return candidates.stream().anyMatch(c ->
+                ("srflx".equalsIgnoreCase(c.getType()) || "portmap".equalsIgnoreCase(c.getType()))
+                && c.getAddress() != null && c.getAddress().equals(myIp));
     }
 
     private void rememberSession(PeerControlMessage control) {
@@ -649,6 +669,22 @@ public class PeerMeshClient implements AutoCloseable {
                 continue;
             }
             sendUdpProbe(session, candidate);
+            // P1-3 对称 NAT 端口预测：向候选端口 ±PREDICTED_PORT_RANGE 范围额外发探针
+            if (!"relay".equalsIgnoreCase(candidate.getType())) {
+                int basePort = candidate.getPort();
+                for (int d = 1; d <= PREDICTED_PORT_RANGE; d++) {
+                    PeerCandidate above = new PeerCandidate();
+                    above.setAddress(candidate.getAddress());
+                    above.setPort(basePort + d);
+                    above.setTransport("udp");
+                    sendUdpProbe(session, above);
+                    PeerCandidate below = new PeerCandidate();
+                    below.setAddress(candidate.getAddress());
+                    below.setPort(basePort - d);
+                    below.setTransport("udp");
+                    sendUdpProbe(session, below);
+                }
+            }
         }
     }
 
@@ -662,6 +698,8 @@ public class PeerMeshClient implements AutoCloseable {
      */
     private static final int PROBE_BURST_COUNT = 3;
     private static final long PROBE_BURST_INTERVAL_MILLIS = 30;
+    /** P1-3 对称 NAT 端口预测：除候选字面端口外，扫描 ±RANGE 范围 */
+    private static final int PREDICTED_PORT_RANGE = 8;
 
     /**
      * S0.4 Direct keepalive 间隔。每个 ACTIVE DIRECT 会话至少 {@code KEEPALIVE_INTERVAL_MILLIS}
@@ -1321,10 +1359,24 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         PeerSession session = sessions.get(probe.getFromClientId());
-        if (session == null || !session.token().equals(probe.getToken())) {
+        if (session == null || !session.token().equals(probe.getToken())
+                || !session.sessionId.equals(probe.getSessionId())) {
             return;
         }
         markPathFromInboundCheck(session, observedRemote, relayFromAllocationId);
+
+        // P1-5 触发式双向探针：收到入站探针时，若 direct 路径尚未建立则再扫一轮对端端口
+        if (!session.hasHealthyDirect(System.currentTimeMillis())) {
+            PeerInfo peerInfo = peers.get(session.peerId());
+            if (peerInfo != null && !peerInfo.candidates().isEmpty()) {
+                PeerControlMessage trigger = new PeerControlMessage();
+                trigger.setSessionId(session.sessionId());
+                trigger.setSourceClientId(peerInfo.clientId());
+                trigger.setCandidates(peerInfo.candidates());
+                sendConnectivityChecks(trigger);
+            }
+        }
+
         PeerUdpProbe response = new PeerUdpProbe();
         response.setType(PeerUdpProbe.TYPE_CHECK_RESPONSE);
         response.setSessionId(probe.getSessionId());
@@ -1462,7 +1514,9 @@ public class PeerMeshClient implements AutoCloseable {
         // 切回 direct：direct 再次活跃且 RTT 优于 relay
         if (!pending.relay() && session.currentPathType.equals("RELAY")
                 && session.bestDirectRtt + RTT_HYSTERESIS_MS < session.bestRelayRtt) {
-            session.bestRelayRtt = Long.MAX_VALUE; // 重置 relay RTT，避免旧数据干扰
+            session.bestRelayRtt = Long.MAX_VALUE;
+            session.markPath("DIRECT", now);
+            session.remoteEndpoint = observedRemote;
         }
         String remote = pending.relay()
                 ? "relay:" + (StringUtils.hasText(relayFromAllocationId) ? relayFromAllocationId : pending.relayId())
@@ -2092,8 +2146,7 @@ public class PeerMeshClient implements AutoCloseable {
         }
 
         boolean hasHealthyDirect(long nowMillis) {
-            return "DIRECT".equals(currentPathType)
-                    && lastDirectSuccessMillis > 0
+            return lastDirectSuccessMillis > 0
                     && nowMillis - lastDirectSuccessMillis <= DIRECT_STALE_MILLIS;
         }
 

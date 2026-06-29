@@ -117,6 +117,22 @@ interface BodyPreviewTarget {
 
 type HttpBodyDecodeStatus = "plain" | "pending" | "decoded" | "stored-decoded" | "unsupported" | "failed";
 
+export function TcpTrafficTab({ rows, loading, page, pageSize, total, totalPages, onPageChange }: { rows: any; loading: any; page: any; pageSize: any; total: any; totalPages: any; onPageChange: any }) {
+  const [selectedFrame, setSelectedFrame] = useState<any>(null);
+  const [selectedStream, setSelectedStream] = useState<any>(null);
+  const [frameDetailLoadingId, setFrameDetailLoadingId] = useState<string | null>(null);
+  const [streamLoadingChannel, setStreamLoadingChannel] = useState<string | null>(null);
+  const openDetails = useCallback(async (row: any) => { setFrameDetailLoadingId(row.id); try { setSelectedFrame(await adminApi.getTcpTrafficFrame(row.id)); } catch (e) { notifyError(e, "加载失败"); } finally { setFrameDetailLoadingId(null); } }, []);
+  const openStream = useCallback(async (row: any) => { setStreamLoadingChannel(row.channelId); try { setSelectedStream(await adminApi.getTcpTrafficStream(row.channelId, 0, TCP_STREAM_PAGE_SIZE)); } catch (e) { notifyError(e, "加载失败"); } finally { setStreamLoadingChannel(null); } }, []);
+  const changeStreamPage = useCallback(async (p: number) => { if (!selectedStream) return; setStreamLoadingChannel(selectedStream.channelId); try { setSelectedStream(await adminApi.getTcpTrafficStream(selectedStream.channelId, p, selectedStream.size || TCP_STREAM_PAGE_SIZE)); } catch (e) { notifyError(e, "切换失败"); } finally { setStreamLoadingChannel(null); } }, [selectedStream]);
+  return <><TcpFrameTable rows={rows} loading={loading} page={page} pageSize={pageSize} total={total} totalPages={totalPages} detailLoadingId={frameDetailLoadingId} streamLoadingChannel={streamLoadingChannel} onPageChange={onPageChange} onOpenDetails={openDetails} onOpenStream={openStream} /><TcpFrameModal row={selectedFrame} onClose={() => setSelectedFrame(null)} /><TcpStreamModal stream={selectedStream} loading={selectedStream != null && streamLoadingChannel === selectedStream.channelId} onClose={() => setSelectedStream(null)} onPageChange={changeStreamPage} /></>;
+}
+
+export function HttpTrafficTab({ rows, loading, page, pageSize, total, totalPages, searchDraft, searchField, responseType, activeSearchField, activeSearch, activeResponseType, onPageChange, onSearchDraftChange, onSearchFieldChange, onResponseTypeChange, onSearch, onResetSearch }: any) {
+  const [selectedExchange, setSelectedExchange] = useState<any>(null);
+  return <><HttpExchangeTable rows={rows} loading={loading} page={page} pageSize={pageSize} total={total} totalPages={totalPages} searchDraft={searchDraft} searchField={searchField} responseType={responseType} activeSearchField={activeSearchField} activeSearch={activeSearch} activeResponseType={activeResponseType} onPageChange={onPageChange} onSearchDraftChange={onSearchDraftChange} onSearchFieldChange={onSearchFieldChange} onResponseTypeChange={onResponseTypeChange} onSearch={onSearch} onResetSearch={onResetSearch} onOpenDetails={setSelectedExchange} /><HttpExchangeModal row={selectedExchange} onClose={() => setSelectedExchange(null)} /></>;
+}
+
 export function TrafficPanel() {
   const [clientRows, setClientRows] = useState<TrafficUsage[]>([]);
   const [tcpRows, setTcpRows] = useState<ResourceTrafficUsage[]>([]);

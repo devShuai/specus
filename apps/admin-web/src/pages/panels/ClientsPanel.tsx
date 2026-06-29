@@ -24,6 +24,7 @@ import { formatBytes, formatDateTime, formatSince } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
 import { useNowTick } from "../../hooks/useNowTick";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import { ClientDetailDrawer } from "../../components/ClientDetailDrawer";
 
 export function ClientsPanel() {
   const [clients, setClients] = useState<Client[]>([]);
@@ -40,6 +41,7 @@ export function ClientsPanel() {
   const clientModal = useDisclosure();
   const credentialModal = useDisclosure();
   const secretModal = useDisclosure();
+  const [detailClient, setDetailClient] = useState<Client | null>(null);
   const now = useNowTick(1000);
   const durationTick = Math.floor(now / 1000);
 
@@ -389,6 +391,7 @@ export function ClientsPanel() {
           )}
         </ModalContent>
       </Modal>
+      <ClientDetailDrawer client={detailClient} open={detailClient != null} onClose={() => setDetailClient(null)} />
     </div>
   );
 }

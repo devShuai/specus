@@ -406,8 +406,14 @@ function LoginPageContent() {
 function TopologyDiagram() {
   return (
     <div className="rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
+      <div className="flex flex-col gap-3 sm:hidden">
+        <div className="rounded-md border border-cyan-200 bg-cyan-50 px-3 py-2 text-small dark:border-cyan-800 dark:bg-cyan-950"><span className="font-semibold text-cyan-700 dark:text-cyan-300">公网用户 / API</span><span className="ml-2 text-tiny text-default-500">→ Server (relay)</span></div>
+        <div className="rounded-md border border-default-200 bg-default-50 px-3 py-2 text-small dark:border-default-700 dark:bg-default-900"><span className="font-semibold">Server 控制面</span><span className="ml-2 text-tiny text-default-500">TLS 加密信道 + 信令</span></div>
+        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-small dark:border-emerald-800 dark:bg-emerald-950"><span className="font-semibold text-emerald-700 dark:text-emerald-300">客户端 A</span><span className="ml-2 text-tiny text-default-500">→ 客户端 B (直连)</span></div>
+        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-small dark:border-emerald-800 dark:bg-emerald-950"><span className="font-semibold text-emerald-700 dark:text-emerald-300">客户端 B</span><span className="ml-2 text-tiny text-default-500">← 客户端 A (直连)</span></div>
+      </div>
       <svg
-        className="topology-svg"
+        className="topology-svg hidden sm:block"
         viewBox="0 0 1080 440"
         xmlns="http://www.w3.org/2000/svg"
         role="img"

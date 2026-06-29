@@ -21,6 +21,7 @@ import { useConnectionsFeed } from "../../hooks/useConnectionsFeed";
 import { useNowTick } from "../../hooks/useNowTick";
 import { useAuth } from "../../auth/AuthContext";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import { EmptyState } from "../../components/EmptyState";
 
 const PAGE_SIZE = 50;
 
@@ -252,6 +253,10 @@ export function ConnectionsPanel() {
         </Button>
       </div>
 
+      {!loading && tableRows.length === 0 ? (
+        <EmptyState icon="connections" title="暂无连接记录" description="客户端连接记录将会出现在这里。" />
+      ) : (
+      <>
       {/* mobile: 卡片堆叠 */}
       <div className="lg:hidden">
         <MobileListCardList
@@ -328,6 +333,8 @@ export function ConnectionsPanel() {
       </Table>
       </div>
 
+      </>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-small text-default-500">
           {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}

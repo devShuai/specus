@@ -47,6 +47,12 @@ export interface ClientResult {
   client: Client;
 }
 
+export interface ClientDetail {
+  client: Client;
+  tunnels: Tunnel[];
+  httpRoutes: HttpRoute[];
+}
+
 /** S3.2 单客户端聚合详情 */
 export interface ClientDetail {
   client: Client;
@@ -334,6 +340,7 @@ export interface PeerMeshSession {
   directBytes: number;
   relayBytes: number;
   lastTrafficAt: string | null;
+  lastKeepaliveAt: string | null;
   startedAt: string;
   updatedAt: string;
   expiresAt: string;

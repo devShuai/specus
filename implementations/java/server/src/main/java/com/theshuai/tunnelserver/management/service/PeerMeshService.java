@@ -55,6 +55,7 @@ public class PeerMeshService {
     private final ClientAccountRepository clientAccountRepository;
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
     private final Map<Long, LongAdder> pendingRelayBytes = new ConcurrentHashMap<>();
+    private volatile long lastExpireMillis;
 
     public PeerMeshService(PeerMeshProperties properties,
                            PeerMeshDeviceRepository deviceRepository,
@@ -182,6 +183,13 @@ public class PeerMeshService {
         acl.setTargetClientId(target.getId());
         acl.setTargetClientName(target.getClientName());
         acl.setAllowed(mutation.allowed() == null || mutation.allowed());
+        if (mutation.direction() != null) {
+            String dir = mutation.direction().toUpperCase();
+            if (!"OUTBOUND".equals(dir) && !"INBOUND".equals(dir) && !"BOTH".equals(dir)) {
+                throw new IllegalArgumentException("invalid direction: " + mutation.direction());
+            }
+            acl.setDirection(dir);
+        }
         acl.setUpdatedAt(Instant.now().toString());
         return toAclView(aclRepository.save(acl));
     }
@@ -463,7 +471,7 @@ public class PeerMeshService {
 
     @Transactional
     public List<PeerMeshSessionView> listSessions(ManagementContext context, int limit) {
-        expireStaleSessionsBatch(Instant.now(), 500);
+        expireIfStale();
         int pageSize = Math.clamp(limit, 1, 200);
         List<PeerMeshSession> sessions;
         if (context.isAdmin()) {
@@ -482,7 +490,7 @@ public class PeerMeshService {
 
     @Transactional
     public PeerMeshSessionPage listSessionsPage(ManagementContext context, int page, int size, boolean openOnly) {
-        expireStaleSessionsBatch(Instant.now(), 500);
+        expireIfStale();
         int normalizedPage = Math.max(0, page);
         int normalizedSize = Math.clamp(size, 1, 100);
         PageRequest pageRequest = PageRequest.of(normalizedPage, normalizedSize);
@@ -671,6 +679,7 @@ public class PeerMeshService {
                 acl.getTargetClientId(),
                 acl.getTargetClientName(),
                 acl.isAllowed(),
+                acl.getDirection(),
                 acl.getCreatedAt(),
                 acl.getUpdatedAt()
         );
@@ -882,7 +891,7 @@ public class PeerMeshService {
                                       int totalPages) {
     }
 
-    public record AclMutation(Long sourceClientId, Long targetClientId, Boolean allowed) {
+    public record AclMutation(Long sourceClientId, Long targetClientId, Boolean allowed, String direction) {
     }
 
     public record PeerRosterItem(long clientId, String clientName, String virtualIp, String publicKey, boolean online) {
@@ -929,6 +938,14 @@ public class PeerMeshService {
             } catch (Exception ignored) {
                 return 0;
             }
+        }
+    }
+
+    private void expireIfStale() {
+        long now = System.currentTimeMillis();
+        if (now - lastExpireMillis > 30_000) {
+            lastExpireMillis = now;
+            expireStaleSessionsBatch(Instant.now(), 500);
         }
     }
 }

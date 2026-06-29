@@ -182,14 +182,17 @@ public class TrafficInspectionService {
                                 String destinationAddress,
                                 Integer destinationPort,
                                 byte[] payload) {
-        if (!captureEnabled || clientName == null || listenPort <= 0 || !shouldCaptureTcpDetail(clientName, listenPort)
-                || !acquireSlot(pendingTcpCount, droppedTcpCount)) {
+        if (!captureEnabled || clientName == null || listenPort <= 0 || !shouldCaptureTcpDetail(clientName, listenPort)) {
             return;
         }
 
-        // S4.2 采样：首帧始终捕获，后续按采样率随机捕获
+        // S4.2 采样：首帧始终捕获，后续按采样率随机抽样
         FramePosition framePosition = nextFramePosition(clientName, listenPort, channelId, direction, payload == null ? 0 : payload.length);
         if (framePosition.frameIndex() > 0 && sampleRate < 1.0 && Math.random() >= sampleRate) {
+            return;
+        }
+
+        if (!acquireSlot(pendingTcpCount, droppedTcpCount)) {
             return;
         }
 

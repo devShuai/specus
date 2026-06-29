@@ -23,6 +23,7 @@ import type { PeerMeshAcl, PeerMeshDevice, PeerMeshSession, PeerMeshStatus } fro
 import { notify, notifyError } from "../../components/toast";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import { EmptyState } from "../../components/EmptyState";
 import {
   NAT_TYPE_PROFILES,
   natReachabilityWeight,
@@ -47,6 +48,9 @@ export function PeerMeshPanel() {
   const [devices, setDevices] = useState<PeerMeshDevice[]>([]);
   const [acls, setAcls] = useState<PeerMeshAcl[]>([]);
   const [sessions, setSessions] = useState<PeerMeshSession[]>([]);
+  const [selectedSession, setSelectedSession] = useState<PeerMeshSession | null>(null);
+  const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
+  const [aclDirection, setAclDirection] = useState<"OUTBOUND" | "INBOUND" | "BOTH">("OUTBOUND");
   const [loading, setLoading] = useState(true);
   const [clearingSessions, setClearingSessions] = useState(false);
   const [sourceClientId, setSourceClientId] = useState("");
@@ -139,7 +143,7 @@ export function PeerMeshPanel() {
       return;
     }
     try {
-      const acl = await adminApi.createPeerMeshAcl({ sourceClientId: source, targetClientId: target, allowed: true });
+      const acl = await adminApi.createPeerMeshAcl({ sourceClientId: source, targetClientId: target, allowed: true, direction: aclDirection });
       setAcls((items) => [acl, ...items.filter((item) => item.id !== acl.id)]);
       notify("Peer ACL 已创建");
     } catch (error) {
@@ -167,6 +171,7 @@ export function PeerMeshPanel() {
     try {
       const closed = await adminApi.closePeerMeshSession(session.id);
       setSessions((items) => items.map((item) => (item.id === closed.id ? closed : item)));
+      if (selectedSession?.id === session.id) setSelectedSession(null);
       notify("Peer session 已断开");
       await load();
     } catch (error) {
@@ -438,28 +443,19 @@ export function PeerMeshPanel() {
               <h3 className="text-base font-semibold">显式 ACL</h3>
               <p className="text-small text-default-500">同一用户默认放行；跨用户互访需要 admin 创建显式 ACL。</p>
             </div>
-            <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
-              <Select
-                label="源客户端"
-                selectedKeys={sourceClientId ? [sourceClientId] : []}
-                onSelectionChange={(keys) => setSourceClientId(String(Array.from(keys)[0] ?? ""))}
-              >
-                {devices.map((device) => (
-                  <SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>
-                ))}
+            <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto]">
+              <Select label="源客户端" selectedKeys={sourceClientId ? [sourceClientId] : []} onSelectionChange={(keys) => setSourceClientId(String(Array.from(keys)[0] ?? ""))}>
+                {devices.map((device) => (<SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>))}
               </Select>
-              <Select
-                label="目标客户端"
-                selectedKeys={targetClientId ? [targetClientId] : []}
-                onSelectionChange={(keys) => setTargetClientId(String(Array.from(keys)[0] ?? ""))}
-              >
-                {devices.map((device) => (
-                  <SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>
-                ))}
+              <Select label="目标客户端" selectedKeys={targetClientId ? [targetClientId] : []} onSelectionChange={(keys) => setTargetClientId(String(Array.from(keys)[0] ?? ""))}>
+                {devices.map((device) => (<SelectItem key={String(device.clientId)}>{device.clientName}</SelectItem>))}
               </Select>
-              <Button className="md:self-end" color="primary" onPress={() => void createAcl()}>
-                放行
-              </Button>
+              <Select label="方向" selectedKeys={[aclDirection]} onSelectionChange={(keys) => setAclDirection(String(Array.from(keys)[0] ?? "OUTBOUND") as typeof aclDirection)}>
+                <SelectItem key="OUTBOUND">允许我连他人</SelectItem>
+                <SelectItem key="INBOUND">允许他人连我</SelectItem>
+                <SelectItem key="BOTH">双向允许</SelectItem>
+              </Select>
+              <Button className="md:self-end" color="primary" onPress={() => void createAcl()}>放行</Button>
             </div>
 
             {/* mobile: ACL 卡片 */}
@@ -500,6 +496,7 @@ export function PeerMeshPanel() {
               <TableHeader>
                 <TableColumn>源</TableColumn>
                 <TableColumn>目标</TableColumn>
+                <TableColumn>方向</TableColumn>
                 <TableColumn>状态</TableColumn>
                 <TableColumn>操作</TableColumn>
               </TableHeader>
@@ -508,6 +505,7 @@ export function PeerMeshPanel() {
                   <TableRow key={acl.id}>
                     <TableCell>{acl.sourceClientName}</TableCell>
                     <TableCell>{acl.targetClientName}</TableCell>
+                    <TableCell><Chip size="sm" variant="flat" color={acl.direction === "BOTH" ? "success" : acl.direction === "INBOUND" ? "warning" : "primary"}>{acl.direction === "OUTBOUND" ? "→" : acl.direction === "INBOUND" ? "←" : "⇄"}</Chip></TableCell>
                     <TableCell>
                       <Chip size="sm" color={acl.allowed ? "success" : "danger"} variant="flat">
                         {acl.allowed ? "允许" : "拒绝"}
@@ -530,172 +528,133 @@ export function PeerMeshPanel() {
 
       {peerView === "sessions" && (
       <section className="grid gap-3">
-        <Card shadow="none" className="rounded-md border border-default-200">
-          <CardBody className="gap-3 p-3">
-            <div className="flex flex-wrap items-start justify-between gap-2">
-              <div>
-              <h3 className="text-base font-semibold">活跃会话</h3>
-              <p className="text-small text-default-500">
-                只展示未关闭的 Peer 会话；第 {sessionPage + 1} / {sessionTotalPages} 页，清理后会同步断开拓扑链路。
-              </p>
-              </div>
-              <span className="text-small text-default-500">共 {sessionTotal} 条</span>
+        {!loading && activeSessions.length === 0 ? (
+          <Card shadow="none" className="rounded-md border border-default-200">
+            <CardBody className="p-3">
+              <EmptyState icon="peer" title="暂无活跃 peer 会话" description="客户端之间建立直连或 relay 链路后，活跃会话将在这里显示。" actionLabel="配置私有组网" onAction={() => { window.location.hash = "/help/peer-mesh"; }} />
+            </CardBody>
+          </Card>
+        ) : (
+          <>
+            {/* 桌面端主从分栏 */}
+            <div className="hidden lg:flex lg:gap-3 lg:min-h-[320px]">
+              <Card shadow="none" className="w-[38%] min-w-0 shrink-0 rounded-md border border-default-200">
+                <CardBody className="gap-2 p-3">
+                  <div className="flex items-center justify-between"><h3 className="text-small font-semibold">会话列表</h3><span className="text-tiny text-default-500">共 {sessionTotal} 条</span></div>
+                  <div className="flex-1 space-y-1 overflow-y-auto">
+                    {activeSessions.map((s) => (
+                      <button key={s.id} type="button" onClick={() => setSelectedSession(s)}
+                        className={`flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors ${selectedSession?.id === s.id ? "bg-primary-50 dark:bg-primary-400/10" : "hover:bg-default-100"}`}>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-small font-medium">{s.sourceClientName} → {s.targetClientName}</div>
+                          <div className="mt-0.5 flex items-center gap-2 text-tiny text-default-500">
+                            <Chip size="sm" variant="flat" color={s.pathType === "DIRECT" ? "success" : s.pathType === "RELAY" ? "warning" : "default"}>{s.pathType}</Chip>
+                            <span>{s.rttMillis != null ? `${s.rttMillis} ms` : "-"}</span>
+                            <span>·</span>
+                            <span>{s.lastKeepaliveAt ? formatDateTime(s.lastKeepaliveAt) : "-"}</span>
+                          </div>
+                        </div>
+                        <svg className="h-4 w-4 shrink-0 text-default-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
+                      </button>
+                    ))}
+                  </div>
+                  {sessionTotalPages > 1 && <div className="flex justify-end pt-1"><Pagination showControls size="sm" page={sessionPage + 1} total={sessionTotalPages} onChange={(p) => setSessionPage(Math.max(0, p - 1))} /></div>}
+                </CardBody>
+              </Card>
+              <Card shadow="none" className="flex-1 min-w-0 rounded-md border border-default-200">
+                <CardBody className="gap-4 p-4">
+                  {selectedSession ? <SessionDetail session={selectedSession} onDisconnect={(s) => void closeSession(s)} /> : <div className="flex h-full items-center justify-center text-small text-default-400">← 选择左侧会话查看详情</div>}
+                </CardBody>
+              </Card>
             </div>
 
-            {/* mobile: 会话卡片 */}
+            {/* 移动端全宽列表 + 详情 */}
             <div className="lg:hidden">
-              <MobileListCardList
-                items={activeSessions}
-                isLoading={loading}
-                emptyContent="暂无活跃 peer session"
-                renderCard={(raw) => {
-                  const session = raw as PeerMeshSession;
-                  return (
-                    <MobileListCard
-                      key={session.id}
-                      title={
-                        <span className="break-all">
-                          {session.sourceClientName} → {session.targetClientName}
-                        </span>
-                      }
-                      badges={
-                        <>
-                          <Chip size="sm" color={session.status === "ACTIVE" ? "success" : "default"} variant="flat">
-                            {session.pathType}
-                          </Chip>
-                          <Chip size="sm" variant="flat">{session.status}</Chip>
-                        </>
-                      }
-                      fields={[
-                        { label: "RTT", value: session.rttMillis == null ? "-" : `${session.rttMillis} ms` },
-                        {
-                          label: "流量",
-                          value: (
-                            <div className="flex flex-col gap-0.5">
-                              <span>direct {formatBytes(session.directBytes)}</span>
-                              <span className="text-default-400">relay {formatBytes(session.relayBytes)}</span>
-                              <span className="text-tiny text-default-400">最后 {formatDateTime(session.lastTrafficAt)}</span>
-                            </div>
-                          ),
-                        },
-                        {
-                          label: "Endpoint",
-                          value: (
-                            <div className="flex flex-col gap-0.5 break-all">
-                              <span>local: {session.localEndpoint || "-"}</span>
-                              <span className="text-default-400">remote: {session.remoteEndpoint || "-"}</span>
-                            </div>
-                          ),
-                        },
-                        {
-                          label: "过期",
-                          value: (
-                            <div className="flex flex-col gap-0.5">
-                              <span>{formatDateTime(session.expiresAt)}</span>
-                              <span className="text-tiny text-default-400">更新 {formatDateTime(session.updatedAt)}</span>
-                            </div>
-                          ),
-                        },
-                      ]}
-                      actions={
-                        <Button
-                          size="sm"
-                          color="danger"
-                          variant="flat"
-                          isDisabled={session.status === "CLOSED"}
-                          onPress={() => void closeSession(session)}
-                        >
-                          断开
-                        </Button>
-                      }
-                    />
-                  );
-                }}
-              />
-            </div>
-
-            {/* desktop: 会话表格 */}
-            <div className="hidden min-w-0 overflow-x-auto lg:block">
-            <Table aria-label="Peer mesh 会话" removeWrapper>
-              <TableHeader>
-                <TableColumn>Peer</TableColumn>
-                <TableColumn>路径</TableColumn>
-                <TableColumn>RTT</TableColumn>
-                <TableColumn>流量</TableColumn>
-                <TableColumn>Endpoint</TableColumn>
-                <TableColumn>过期</TableColumn>
-                <TableColumn>操作</TableColumn>
-              </TableHeader>
-              <TableBody items={activeSessions} isLoading={loading} emptyContent="暂无活跃 peer session">
-                {(session) => (
-                  <TableRow key={session.id}>
-                    <TableCell>
-                      <div className="flex flex-col">
-                        <span>{session.sourceClientName}</span>
-                        <span className="text-tiny text-default-400">{"-> "}{session.targetClientName}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex flex-col gap-1">
-                        <Chip size="sm" color={session.status === "ACTIVE" ? "success" : "default"} variant="flat">
-                          {session.pathType}
-                        </Chip>
-                        <span className="text-tiny text-default-400">{session.status}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>{session.rttMillis == null ? "-" : `${session.rttMillis} ms`}</TableCell>
-                    <TableCell>
-                      <div className="flex flex-col text-tiny">
-                        <span>direct {formatBytes(session.directBytes)}</span>
-                        <span className="text-default-400">relay {formatBytes(session.relayBytes)}</span>
-                        <span className="text-default-400">最后 {formatDateTime(session.lastTrafficAt)}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex max-w-56 flex-col break-all text-tiny">
-                        <span>local: {session.localEndpoint || "-"}</span>
-                        <span className="text-default-400">remote: {session.remoteEndpoint || "-"}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex flex-col text-tiny">
-                        <span>{formatDateTime(session.expiresAt)}</span>
-                        <span className="text-default-400">更新 {formatDateTime(session.updatedAt)}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <Button
-                        size="sm"
-                        color="danger"
-                        variant="flat"
-                        isDisabled={session.status === "CLOSED"}
-                        onPress={() => void closeSession(session)}
-                      >
-                        断开
+              {!mobileDetailOpen ? (
+                <Card shadow="none" className="rounded-md border border-default-200">
+                  <CardBody className="gap-2 p-3">
+                    <h3 className="text-small font-semibold">活跃会话 · 共 {sessionTotal} 条</h3>
+                    <MobileListCardList items={activeSessions} isLoading={loading} emptyContent="暂无活跃 peer session" renderCard={(raw) => {
+                      const s = raw as PeerMeshSession;
+                      return (
+                        <MobileListCard key={s.id}
+                          title={<span className="break-all">{s.sourceClientName} → {s.targetClientName}</span>}
+                          badges={<Chip size="sm" variant="flat" color={s.pathType === "DIRECT" ? "success" : s.pathType === "RELAY" ? "warning" : "default"}>{s.pathType}</Chip>}
+                          fields={[
+                            { label: "RTT", value: s.rttMillis == null ? "-" : `${s.rttMillis} ms` },
+                            { label: "Keepalive", value: s.lastKeepaliveAt ? formatDateTime(s.lastKeepaliveAt) : "-" },
+                          ]}
+                          actions={<Button size="sm" variant="flat" onPress={() => { setSelectedSession(s); setMobileDetailOpen(true); }}>详情</Button>}
+                        />
+                      );
+                    }} />
+                    {sessionTotalPages > 1 && <div className="flex justify-end pt-1"><Pagination showControls size="sm" page={sessionPage + 1} total={sessionTotalPages} onChange={(p) => setSessionPage(Math.max(0, p - 1))} /></div>}
+                  </CardBody>
+                </Card>
+              ) : (
+                <Card shadow="none" className="rounded-md border border-default-200">
+                  <CardBody className="gap-3 p-3">
+                    <div className="flex items-center gap-2">
+                      <Button size="sm" variant="light" isIconOnly onPress={() => setMobileDetailOpen(false)}>
+                        <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" /></svg>
                       </Button>
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
+                      <span className="text-small font-semibold">会话详情</span>
+                    </div>
+                    {selectedSession && <SessionDetail session={selectedSession} onDisconnect={(s) => void closeSession(s)} />}
+                  </CardBody>
+                </Card>
+              )}
             </div>
-            {sessionTotalPages > 1 && (
-              <div className="flex justify-end">
-                <Pagination
-                  showControls
-                  page={sessionPage + 1}
-                  total={sessionTotalPages}
-                  onChange={(page) => setSessionPage(Math.max(0, page - 1))}
-                />
-              </div>
-            )}
-          </CardBody>
-        </Card>
+          </>
+        )}
       </section>
       )}
     </div>
   );
 }
+
+
+/* ──────── SessionDetail 会话详情面板 ──────── */
+
+function SessionDetail({ session, onDisconnect }: { session: PeerMeshSession; onDisconnect: (session: PeerMeshSession) => void }) {
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-base font-semibold">{session.sourceClientName} → {session.targetClientName}</h3>
+        <div className="flex items-center gap-2">
+          <Chip size="sm" variant="flat" color={session.pathType === "DIRECT" ? "success" : session.pathType === "RELAY" ? "warning" : "default"}>{session.pathType}</Chip>
+          <Chip size="sm" variant="flat" color={session.status === "ACTIVE" ? "success" : session.status === "CLOSED" ? "danger" : "default"}>{session.status}</Chip>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3 rounded-md border border-default-200 bg-default-50 p-3 text-small">
+        <div><span className="text-default-500">RTT</span><div className="font-semibold">{session.rttMillis != null ? `${session.rttMillis} ms` : "-"}</div></div>
+        <div><span className="text-default-500">创建</span><div>{formatDateTime(session.startedAt)}</div></div>
+        <div><span className="text-default-500">最后流量</span><div>{session.lastTrafficAt ? formatDateTime(session.lastTrafficAt) : "-"}</div></div>
+        <div><span className="text-default-500">最后保活</span><div>{session.lastKeepaliveAt ? formatDateTime(session.lastKeepaliveAt) : "-"}</div></div>
+        <div><span className="text-default-500">过期</span><div>{formatDateTime(session.expiresAt)}</div></div>
+        <div><span className="text-default-500">更新</span><div>{formatDateTime(session.updatedAt)}</div></div>
+      </div>
+      <div>
+        <h4 className="mb-2 text-small font-semibold">流量统计</h4>
+        <div className="grid grid-cols-2 gap-3 rounded-md border border-default-200 bg-default-50 p-3 text-small">
+          <div><span className="text-default-500">Direct</span><div className="font-semibold">{formatBytes(session.directBytes)}</div></div>
+          <div><span className="text-default-500">Relay</span><div className="font-semibold">{formatBytes(session.relayBytes)}</div></div>
+        </div>
+      </div>
+      <div>
+        <h4 className="mb-2 text-small font-semibold">端点</h4>
+        <div className="space-y-2 rounded-md border border-default-200 bg-default-50 p-3 text-small">
+          <div className="break-all"><span className="text-default-500">Local: </span><span className="font-mono">{session.localEndpoint || "-"}</span></div>
+          <div className="break-all"><span className="text-default-500">Remote: </span><span className="font-mono">{session.remoteEndpoint || "-"}</span></div>
+        </div>
+      </div>
+      <div className="flex gap-2 pt-1">
+        <Button size="sm" color="danger" variant="flat" isDisabled={session.status === "CLOSED"} onPress={() => onDisconnect(session)}>断开会话</Button>
+      </div>
+    </div>
+  );
+}
+
 
 function PeerNatInsight({
   devices,

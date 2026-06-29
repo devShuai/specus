@@ -158,7 +158,10 @@ public class ClientAccountService {
                 account.getConnectionRateLimitPerMinute()
         ));
         account.setUpdatedAt(Instant.now().toString());
-        invalidateNameCache(account.getClientName());
+        invalidateNameCache(originalClientName);
+        if (!newClientName.equals(originalClientName)) {
+            invalidateNameCache(newClientName);
+        }
         clientAccountRepository.save(account);
         if (!account.isEnabled() || !account.getClientName().equals(originalClientName)) {
             // 优先用"停用"作为原因（更直接），若只是改名则用 ADMIN_RENAMED。
