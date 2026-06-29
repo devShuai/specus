@@ -2,9 +2,9 @@ package peermesh
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
+	"io"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
@@ -12,59 +12,116 @@ import (
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
 )
 
-func TestStunTurnAllocateReusesExpiredAllocationBeforeCleanup(t *testing.T) {
-	server := newStunTurnTestServer()
+func TestStunTurnBindingReturnsMappedAndOtherAddress(t *testing.T) {
+	server := newStunTurnTestServer(t)
+	primary := listenUDP(t)
+	alternate := listenUDP(t)
+	client := listenUDP(t)
+	server.primary = primary
+	server.alternate = alternate
+
+	tx := newStunTransactionID()
+	err := server.binding(primary, "primary", newStunMessage(stunBindingRequest, tx), udpAddr(client))
+	if err != nil {
+		t.Fatalf("binding: %v", err)
+	}
+
+	response := readStunMessage(t, client)
+	if response.Type != stunBindingSuccess {
+		t.Fatalf("binding response type = 0x%x", response.Type)
+	}
+	mapped, ok := response.xorMappedAddress()
+	if !ok || mapped.Port != udpAddr(client).Port {
+		t.Fatalf("mapped address = %+v", mapped)
+	}
+	other, ok := response.otherAddress()
+	if !ok || other.Port != udpAddr(alternate).Port {
+		t.Fatalf("other address = %+v", other)
+	}
+}
+
+func TestStunTurnAllocateReplacesExpiredAllocationBeforeCleanup(t *testing.T) {
+	server := newStunTurnTestServer(t)
 	remote := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 50000}
 
-	first := server.allocate(remote)
+	first, err := server.allocate(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("first allocate: %v", err)
+	}
 	expireAllocation(server, first.ID, remote)
 
-	again := server.allocate(remote)
-	if again.ID != first.ID {
-		t.Fatalf("allocate created new id for expired allocation before cleanup: got %q want %q", again.ID, first.ID)
+	again, err := server.allocate(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("second allocate: %v", err)
+	}
+	if again.ID == first.ID {
+		t.Fatalf("allocate reused expired allocation id: %q", again.ID)
 	}
 	if !again.ExpiresAt.After(time.Now()) {
-		t.Fatalf("reused allocation was not refreshed: %+v", again)
+		t.Fatalf("new allocation was not refreshed: %+v", again)
 	}
 }
 
-func TestStunTurnRefreshReusesExpiredAllocationBeforeCleanup(t *testing.T) {
-	server := newStunTurnTestServer()
-	remote := &net.UDPAddr{IP: net.ParseIP("192.0.2.11"), Port: 50001}
+func TestStunTurnAllocateRequestReturnsRelayedAddress(t *testing.T) {
+	server := newStunTurnTestServer(t)
+	primary := listenUDP(t)
+	client := listenUDP(t)
+	server.primary = primary
 
-	allocation := server.allocate(remote)
-	expireAllocation(server, allocation.ID, remote)
+	tx := newStunTransactionID()
+	request := newStunMessage(stunAllocateRequest, tx, stunAttrRequestedUDPTransport())
+	if err := server.allocateRequest(context.Background(), request, udpAddr(client)); err != nil {
+		t.Fatalf("allocate request: %v", err)
+	}
 
-	if err := server.refresh(relayMessage{AllocationID: allocation.ID}, remote); err != nil {
-		t.Fatalf("refresh expired allocation before cleanup: %v", err)
+	response := readStunMessage(t, client)
+	if response.Type != stunAllocateSuccess {
+		t.Fatalf("allocate response type = 0x%x", response.Type)
+	}
+	relayed, ok := response.xorRelayedAddress()
+	if !ok || relayed.Port <= 0 {
+		t.Fatalf("relayed address = %+v", relayed)
+	}
+	if response.lifetimeSeconds(0) != 60 {
+		t.Fatalf("lifetime = %d", response.lifetimeSeconds(0))
+	}
+}
+
+func TestStunTurnRefreshRejectsExpiredAllocationBeforeCleanup(t *testing.T) {
+	server := newStunTurnTestServer(t)
+	primary := listenUDP(t)
+	client := listenUDP(t)
+	server.primary = primary
+
+	allocation, err := server.allocate(context.Background(), udpAddr(client))
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	expireAllocation(server, allocation.ID, udpAddr(client))
+
+	tx := newStunTransactionID()
+	request := newStunMessage(stunRefreshRequest, tx, stunAttrLifetimeValue(30))
+	if err := server.refresh(request, udpAddr(client)); err != nil {
+		t.Fatalf("refresh expired allocation: %v", err)
 	}
 	stored := server.allocations[allocation.ID]
-	if !stored.ExpiresAt.After(time.Now()) {
-		t.Fatalf("expired allocation was not refreshed: %+v", stored)
+	if stored != nil {
+		t.Fatalf("expired allocation was not removed: %+v", stored)
 	}
-}
-
-func TestStunTurnSourceAllocationAcceptsExpiredAllocationBeforeCleanup(t *testing.T) {
-	server := newStunTurnTestServer()
-	remote := &net.UDPAddr{IP: net.ParseIP("192.0.2.12"), Port: 50002}
-
-	allocation := server.allocate(remote)
-	expireAllocation(server, allocation.ID, remote)
-
-	source := server.sourceAllocation(relayMessage{AllocationID: allocation.ID}, remote)
-	if source == nil || source.ID != allocation.ID {
-		t.Fatalf("source allocation mismatch: got %+v want id %q", source, allocation.ID)
-	}
-	if found := server.findAllocation(allocation.ID); found == nil || found.ID != allocation.ID {
-		t.Fatalf("find allocation mismatch: got %+v want id %q", found, allocation.ID)
+	response := readStunMessage(t, client)
+	if response.Type != stunRefreshError {
+		t.Fatalf("refresh response type = 0x%x, want error", response.Type)
 	}
 }
 
 func TestStunTurnCleanupRemovesExpiredAllocation(t *testing.T) {
-	server := newStunTurnTestServer()
+	server := newStunTurnTestServer(t)
 	remote := &net.UDPAddr{IP: net.ParseIP("192.0.2.13"), Port: 50003}
 
-	allocation := server.allocate(remote)
+	allocation, err := server.allocate(context.Background(), remote)
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
 	expireAllocation(server, allocation.ID, remote)
 
 	server.cleanupExpired()
@@ -77,145 +134,111 @@ func TestStunTurnCleanupRemovesExpiredAllocation(t *testing.T) {
 	}
 }
 
-func TestStunTurnRelayDataRejectsMissingSourceAllocation(t *testing.T) {
-	server := newStunTurnTestServer()
+func TestStunTurnSendIndicationForwardsOpaquePayload(t *testing.T) {
+	server := newStunTurnTestServer(t)
 	primary := listenUDP(t)
-	sourceSocket := listenUDP(t)
+	client := listenUDP(t)
+	peer := listenUDP(t)
 	server.primary = primary
-
-	err := server.relayData(context.Background(), relayMessage{
-		AllocationID:   "missing-source",
-		ToAllocationID: "missing-target",
-		PayloadBase64:  base64.StdEncoding.EncodeToString([]byte("hello")),
-	}, udpAddr(sourceSocket))
+	allocation, err := server.allocate(context.Background(), udpAddr(client))
 	if err != nil {
-		t.Fatalf("relay data missing source: %v", err)
+		t.Fatalf("allocate: %v", err)
+	}
+	allocation.Permission[permissionKey(udpAddr(peer))] = time.Now().Add(time.Minute)
+
+	tx := newStunTransactionID()
+	request := newStunMessage(stunSendIndication, tx,
+		newStunAttrXorPeerAddress(udpAddr(peer), tx),
+		stunAttrDataValue([]byte("hello")))
+	if err := server.sendIndication(context.Background(), request, udpAddr(client)); err != nil {
+		t.Fatalf("send indication: %v", err)
 	}
 
-	response := readRelayMessage(t, sourceSocket)
-	if response.Type != relayTypeError || response.Error != "allocation-not-found" {
-		t.Fatalf("source allocation error mismatch: %+v", response)
+	if got := readUDPBytes(t, peer); string(got) != "hello" {
+		t.Fatalf("peer payload = %q", string(got))
 	}
 }
 
-func TestStunTurnRelayDataRejectsMissingTargetAllocation(t *testing.T) {
-	server := newStunTurnTestServer()
-	primary := listenUDP(t)
-	sourceSocket := listenUDP(t)
-	server.primary = primary
-	source := server.allocate(udpAddr(sourceSocket))
-
-	err := server.relayData(context.Background(), relayMessage{
-		AllocationID:   source.ID,
-		ToAllocationID: "missing-target",
-		PayloadBase64:  base64.StdEncoding.EncodeToString([]byte("hello")),
-	}, udpAddr(sourceSocket))
-	if err != nil {
-		t.Fatalf("relay data missing target: %v", err)
-	}
-
-	response := readRelayMessage(t, sourceSocket)
-	if response.Type != relayTypeError || response.Error != "target-allocation-not-found" {
-		t.Fatalf("target allocation error mismatch: %+v", response)
-	}
-}
-
-func TestStunTurnRelayDataRejectsInvalidPayload(t *testing.T) {
-	server := newStunTurnTestServer()
-	primary := listenUDP(t)
-	sourceSocket := listenUDP(t)
-	targetSocket := listenUDP(t)
-	server.primary = primary
-	source := server.allocate(udpAddr(sourceSocket))
-	target := server.allocate(udpAddr(targetSocket))
-
-	err := server.relayData(context.Background(), relayMessage{
-		AllocationID:   source.ID,
-		ToAllocationID: target.ID,
-		PayloadBase64:  "not-base64%",
-	}, udpAddr(sourceSocket))
-	if err != nil {
-		t.Fatalf("relay data invalid payload: %v", err)
-	}
-
-	response := readRelayMessage(t, sourceSocket)
-	if response.Type != relayTypeError || response.Error != "invalid-payload" {
-		t.Fatalf("invalid payload error mismatch: %+v", response)
-	}
-}
-
-func TestStunTurnRelayDataRejectsDeniedPeerFrame(t *testing.T) {
-	server := newStunTurnTestServer()
+func TestStunTurnSendIndicationRejectsDeniedPeerFrame(t *testing.T) {
+	server := newStunTurnTestServer(t)
 	server.service.db = openPeerMeshTestDB(t)
-	primary := listenUDP(t)
-	sourceSocket := listenUDP(t)
-	targetSocket := listenUDP(t)
-	server.primary = primary
-	source := server.allocate(udpAddr(sourceSocket))
-	target := server.allocate(udpAddr(targetSocket))
-
-	err := server.relayData(context.Background(), relayMessage{
-		AllocationID:   source.ID,
-		ToAllocationID: target.ID,
-		PayloadBase64:  base64.StdEncoding.EncodeToString(testPeerDataFrame(9901, 1, 2)),
-	}, udpAddr(sourceSocket))
+	client := listenUDP(t)
+	peer := listenUDP(t)
+	allocation, err := server.allocate(context.Background(), udpAddr(client))
 	if err != nil {
-		t.Fatalf("relay data denied peer frame: %v", err)
+		t.Fatalf("allocate: %v", err)
 	}
+	allocation.Permission[permissionKey(udpAddr(peer))] = time.Now().Add(time.Minute)
 
-	response := readRelayMessage(t, sourceSocket)
-	if response.Type != relayTypeError || response.Error != "relay-session-denied" {
-		t.Fatalf("relay denied error mismatch: %+v", response)
+	tx := newStunTransactionID()
+	request := newStunMessage(stunSendIndication, tx,
+		newStunAttrXorPeerAddress(udpAddr(peer), tx),
+		stunAttrDataValue(testPeerDataFrame(9901, 1, 2)))
+	if err := server.sendIndication(context.Background(), request, udpAddr(client)); err != nil {
+		t.Fatalf("send indication denied frame: %v", err)
+	}
+	if got := readOptionalUDPBytes(t, peer); len(got) != 0 {
+		t.Fatalf("denied peer received payload: %x", got)
 	}
 }
 
-func TestStunTurnRelayDataForwardsOpaquePayload(t *testing.T) {
-	server := newStunTurnTestServer()
+func TestStunTurnRelayReceiveDispatchesDataIndication(t *testing.T) {
+	server := newStunTurnTestServer(t)
 	primary := listenUDP(t)
-	sourceSocket := listenUDP(t)
-	targetSocket := listenUDP(t)
+	client := listenUDP(t)
+	peer := listenUDP(t)
 	server.primary = primary
-	source := server.allocate(udpAddr(sourceSocket))
-	target := server.allocate(udpAddr(targetSocket))
-	payload := base64.StdEncoding.EncodeToString([]byte("hello"))
-
-	err := server.relayData(context.Background(), relayMessage{
-		TransactionID:  "tx-1",
-		AllocationID:   source.ID,
-		ToAllocationID: target.ID,
-		PayloadBase64:  payload,
-	}, udpAddr(sourceSocket))
+	allocation, err := server.allocate(context.Background(), udpAddr(client))
 	if err != nil {
-		t.Fatalf("relay data forward opaque payload: %v", err)
+		t.Fatalf("allocate: %v", err)
 	}
+	allocation.Permission[permissionKey(udpAddr(peer))] = time.Now().Add(time.Minute)
 
-	response := readRelayMessage(t, targetSocket)
-	if response.Type != relayTypeData || response.FromAllocationID != source.ID ||
-		response.ToAllocationID != target.ID || response.PayloadBase64 != payload || response.TransactionID != "tx-1" {
-		t.Fatalf("forwarded data mismatch: %+v", response)
+	if err := server.dispatchDataIndication(allocation, udpAddr(peer), []byte("world")); err != nil {
+		t.Fatalf("dispatch data indication: %v", err)
+	}
+	response := readStunMessage(t, client)
+	if response.Type != stunDataIndication {
+		t.Fatalf("data indication type = 0x%x", response.Type)
+	}
+	peerAddr, ok := response.xorPeerAddress()
+	if !ok || peerAddr.Port != udpAddr(peer).Port {
+		t.Fatalf("peer address = %+v", peerAddr)
+	}
+	payload, ok := response.data()
+	if !ok || string(payload) != "world" {
+		t.Fatalf("payload = %q", string(payload))
 	}
 }
 
-func newStunTurnTestServer() *stunTurnServer {
-	return &stunTurnServer{
+func newStunTurnTestServer(t *testing.T) *stunTurnServer {
+	t.Helper()
+	server := &stunTurnServer{
 		service: &Service{cfg: config.PeerMeshConfig{
 			Enabled:              true,
 			AllocationTTLSeconds: 60,
 			StunTurnPort:         3478,
+			RelayMinPort:         0,
+			RelayMaxPort:         0,
 		}},
-		allocations:          make(map[string]relayAllocation),
+		logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		allocations:          make(map[string]*relayAllocation),
 		allocationByEndpoint: make(map[string]string),
 	}
+	t.Cleanup(server.closeAllAllocations)
+	return server
 }
 
 func expireAllocation(server *stunTurnServer, id string, remote *net.UDPAddr) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	server.allocations[id] = relayAllocation{
-		ID:        id,
-		Remote:    cloneUDPAddr(remote),
-		ExpiresAt: time.Now().Add(-time.Second),
+	allocation := server.allocations[id]
+	if allocation == nil {
+		allocation = &relayAllocation{ID: id, Client: cloneUDPAddr(remote), Permission: make(map[string]time.Time)}
+		server.allocations[id] = allocation
 	}
+	allocation.Client = cloneUDPAddr(remote)
+	allocation.ExpiresAt = time.Now().Add(-time.Second)
 	server.allocationByEndpoint[endpointKey(remote)] = id
 }
 
@@ -233,7 +256,17 @@ func udpAddr(conn *net.UDPConn) *net.UDPAddr {
 	return conn.LocalAddr().(*net.UDPAddr)
 }
 
-func readRelayMessage(t *testing.T, conn *net.UDPConn) relayMessage {
+func readStunMessage(t *testing.T, conn *net.UDPConn) stunMessage {
+	t.Helper()
+	packet := readUDPBytes(t, conn)
+	message, err := parseStunMessage(packet)
+	if err != nil {
+		t.Fatalf("parse stun message: %v; raw=%x", err, packet)
+	}
+	return *message
+}
+
+func readUDPBytes(t *testing.T, conn *net.UDPConn) []byte {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set read deadline: %v", err)
@@ -241,13 +274,25 @@ func readRelayMessage(t *testing.T, conn *net.UDPConn) relayMessage {
 	var buf [65507]byte
 	n, _, err := conn.ReadFromUDP(buf[:])
 	if err != nil {
-		t.Fatalf("read relay message: %v", err)
+		t.Fatalf("read udp: %v", err)
 	}
-	var message relayMessage
-	if err := json.Unmarshal(buf[:n], &message); err != nil {
-		t.Fatalf("decode relay message: %v; raw=%s", err, string(buf[:n]))
+	return append([]byte(nil), buf[:n]...)
+}
+
+func readOptionalUDPBytes(t *testing.T, conn *net.UDPConn) []byte {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
 	}
-	return message
+	var buf [65507]byte
+	n, _, err := conn.ReadFromUDP(buf[:])
+	if err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return nil
+		}
+		t.Fatalf("read udp: %v", err)
+	}
+	return append([]byte(nil), buf[:n]...)
 }
 
 func testPeerDataFrame(sessionID, fromClientID, toClientID int64) []byte {

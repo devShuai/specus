@@ -38,12 +38,14 @@ go build ./cmd/shuai-tunnel-server
 | `TUNNEL_PUBLIC_ADDRESS` | 下发给 client 的公网地址 | - |
 | `TUNNEL_HTTP_TIMEOUT_MS` / `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` | Direct HTTP 超时 / 请求体体积上限 | 30000 / 16MiB |
 | `TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES` | HTTP 路由路径改写响应体上限 | 10MiB |
-| `TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` | HTTP/TCP 明细采集全局开关 | true |
+| `TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` | HTTP/TCP 明细采集全局开关 | false |
 | `TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES` | TCP payload 预览字节数 | 256 |
 | `TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS` | HTTP Header 保存字符上限 | 8192 |
+| `TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES` | HTTP body 解压预览最大字节数，避免压缩响应在管理页预览时无界膨胀 | 1048576 |
 | `TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING` | HTTP/TCP 明细采集每类队列最大积压条数 | 20000 |
 | `TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` | HTTP/TCP 明细采集单次 flush 最大条数 | 1000 |
 | `TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` | HTTP/TCP 明细采集后台 flush 间隔 | 2000 |
+| `TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE` | TCP 常规帧采样率，首帧仍会捕获；取值 `0.0` 到 `1.0` | 1.0 |
 | `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` | 连接明细保留天数；更早记录归档到月度统计，`0` 关闭归档 | 60 |
 | `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` | 连接明细归档任务执行间隔 | 3600000 |
 | `TUNNEL_ELASTICSEARCH_URIS` | ES 地址，多个节点逗号分隔；为空时用数据库保存明细 | - |
@@ -54,10 +56,14 @@ go build ./cmd/shuai-tunnel-server
 | `TUNNEL_PEER_MESH_ENABLED` | 是否启用私有组网控制面 | false |
 | `TUNNEL_PEER_MESH_CIDR` | 私有组网虚拟网段 | `100.96.0.0/11` |
 | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | 下发给客户端的 STUN/TURN 地址；空则回退 `TUNNEL_PUBLIC_ADDRESS` | - |
-| `TUNNEL_PEER_MESH_STUN_TURN_PORT` | STUN/TURN-lite UDP 端口 | 3478 |
-| `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | NAT 辅助探测端口；0 表示关闭 | 0 |
+| `TUNNEL_PEER_MESH_STUN_TURN_PORT` | 标准 STUN/TURN UDP 主端口 | 3478 |
+| `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | NAT 辅助探测端口；0 表示按主端口 +1 兜底 | 3479 |
+| `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | 下发给客户端和公开 NAT 检测页的公共 STUN 服务器，逗号或空白分隔 | - |
 | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | Peer session 授权有效期 | 3600 |
 | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | Relay allocation TTL | 300 |
+| `TUNNEL_PEER_MESH_RELAY_MIN_PORT` / `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | 标准 TURN relay allocation 端口范围 | 49152 / 65535 |
+| `TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` / `TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | Java relay worker 配置；Go 标准 TURN 当前由 relay socket goroutine 处理，先读取保留 | 0 / 10000 |
+| `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` | Java relay 流量聚合 flush 间隔；Go 当前 relay 热路径直接计量，先读取保留 | 5000 |
 | `TUNNEL_TLS_MODE` | `disabled` / `file` / `self-signed` | disabled |
 | `TUNNEL_TLS_KEYSTORE` / `TUNNEL_TLS_KEYSTORE_PASSWORD` | PKCS12 / PFX keystore 与密码(mode=file) | - |
 | `TUNNEL_TLS_CERT_FILE` / `TUNNEL_TLS_KEY_FILE` | PEM 证书/私钥(mode=file) | - |
@@ -135,9 +141,9 @@ Go server 已对齐 Java 当前 Peer Mesh 控制面：
 - 按租户/用户分配虚拟 IP，默认同一 `tenantId + ownerUsername` 放行。
 - 管理 API：状态、设备、ACL、会话列表、启停设备、清理会话。
 - 设备上报、会话授权、路径/流量上报、强制关闭和在线 roster 下发。
-- 内置 STUN/TURN-lite UDP relay：binding、备用端口 NAT 探测、allocation/refresh、relay send/data 转发、`SPM1` frame 授权校验和 relay 字节计量。
+- 内置标准 STUN/TURN UDP relay：Binding、备用端口 NAT 探测、Allocate、Refresh、CreatePermission、Send/Data Indication、`SPM1` frame 授权校验和 relay 字节计量。
 
-Go client 当前已实现 Peer Mesh UDP 控制面、Java 兼容 X25519/HKDF/AES-GCM IP 数据帧、Linux `/dev/net/tun`、Windows Wintun 与 macOS utun 虚拟网卡读写、direct UDP 与 TURN-lite relay data frame；Linux / Windows / macOS 客户端可通过虚拟 IP 承载真实业务流量。
+Go client 当前已实现 Peer Mesh UDP 控制面、Java 兼容 X25519/HKDF/AES-GCM IP 数据帧、Linux `/dev/net/tun`、Windows Wintun 与 macOS utun 虚拟网卡读写、direct UDP 与标准 TURN relay data indication；Linux / Windows / macOS 客户端可通过虚拟 IP 承载真实业务流量。
 
 ## 包结构
 

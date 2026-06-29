@@ -185,9 +185,14 @@ public sealed class PeerMeshOptions
     public string Cidr { get; set; } = "100.96.0.0/11";
     public string PublicAddress { get; set; } = string.Empty;
     public int StunTurnPort { get; set; } = 3478;
-    public int NatProbeAlternatePort { get; set; } = 0;
+    public int NatProbeAlternatePort { get; set; } = 3479;
+    public List<string> PublicStunServers { get; set; } = [];
     public long SessionTtlSeconds { get; set; } = 3600;
     public long AllocationTtlSeconds { get; set; } = 300;
+    public int RelayMinPort { get; set; } = 49152;
+    public int RelayMaxPort { get; set; } = 65535;
+    public int RelayWorkerThreads { get; set; }
+    public int RelayWorkerQueueCapacity { get; set; } = 10_000;
     public long SessionCleanupIntervalMs { get; set; } = 60000;
 }
 

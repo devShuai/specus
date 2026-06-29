@@ -55,6 +55,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /oidc-config", a.handleOidcConfig)
 	mux.HandleFunc("POST /oidc/token", a.handleOidcToken)
 	mux.HandleFunc("GET /api/public/client-downloads", a.handlePublicClientDownloads)
+	mux.HandleFunc("GET /api/public/peer-mesh/stun-config", a.handlePublicPeerMeshStunConfig)
 
 	mux.HandleFunc("GET /api/admin/overview", a.requireAuth(a.handleOverview))
 	mux.HandleFunc("POST /api/admin/database/initialize", a.requireAuth(a.handleDatabaseInitialize))
@@ -107,6 +108,14 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/peer-mesh/sessions", a.requireAuth(a.handlePeerMeshSessions))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/sessions/{id}", a.requireAuth(a.handlePeerMeshCloseSession))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/sessions", a.requireAuth(a.handlePeerMeshCloseSessions))
+}
+
+func (a *API) handlePublicPeerMeshStunConfig(w http.ResponseWriter, r *http.Request) {
+	if a.peerMesh == nil {
+		writeJSON(w, http.StatusOK, peermesh.PublicStunConfig{})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.peerMesh.PublicStunConfig(forwardedHost(r)))
 }
 
 // ValidateToken reports whether a raw token is a valid admin token (used by the WS hub).
@@ -2175,6 +2184,23 @@ func firstText(first, second string) string {
 		return first
 	}
 	return second
+}
+
+func forwardedHost(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	host := r.Header.Get("X-Forwarded-Host")
+	if strings.TrimSpace(host) == "" {
+		host = r.Header.Get("Host")
+	}
+	if strings.TrimSpace(host) == "" {
+		host = r.Host
+	}
+	if comma := strings.IndexByte(host, ','); comma >= 0 {
+		host = host[:comma]
+	}
+	return strings.TrimSpace(host)
 }
 
 func adminOnlyCounter(principal managementPrincipal, value int64) int64 {

@@ -1,7 +1,6 @@
 package client
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -226,12 +225,12 @@ func TestPeerMeshRequestRelayCandidatesIsThrottledLikeJava(t *testing.T) {
 	}
 
 	mesh.requestRelayCandidates()
-	first := readPeerRelayMessages(t, relay, 2)
-	if first[0].Type != peerRelayTypeBinding || first[1].Type != peerRelayTypeAllocate {
+	first := readStunMessages(t, relay, 2)
+	if first[0].Type != stunBindingRequest || first[1].Type != stunAllocateRequest {
 		t.Fatalf("first relay request messages = %+v, want binding+allocate", first)
 	}
 	mesh.requestRelayCandidates()
-	if messages := readPeerRelayMessages(t, relay, 1); len(messages) != 0 {
+	if messages := readStunMessages(t, relay, 1); len(messages) != 0 {
 		t.Fatalf("second relay request was not throttled: %+v", messages)
 	}
 }
@@ -260,13 +259,12 @@ func TestPeerMeshRequestRelayRefreshIsThrottledLikeJava(t *testing.T) {
 	}
 
 	mesh.requestRelayCandidates()
-	first := readPeerRelayMessages(t, relay, 2)
-	if first[0].Type != peerRelayTypeBinding || first[1].Type != peerRelayTypeRefresh ||
-		first[1].AllocationID != "alloc-a" {
-		t.Fatalf("first relay refresh messages = %+v, want binding+refresh alloc-a", first)
+	first := readStunMessages(t, relay, 2)
+	if first[0].Type != stunBindingRequest || first[1].Type != stunRefreshRequest {
+		t.Fatalf("first relay refresh messages = %+v, want binding+refresh", first)
 	}
 	mesh.requestRelayCandidates()
-	if messages := readPeerRelayMessages(t, relay, 1); len(messages) != 0 {
+	if messages := readStunMessages(t, relay, 1); len(messages) != 0 {
 		t.Fatalf("fresh relay refresh was not throttled: %+v", messages)
 	}
 }
@@ -288,20 +286,22 @@ func TestPeerMeshRequestAlternateProbeIsThrottledLikeJava(t *testing.T) {
 		logger:  log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{CIDR: "100.96.0.0/11"}},
 	}
-	response := peerRelayMessage{
-		ProbeRole:        peerRelayProbePrimary,
-		AlternateAddress: "127.0.0.1",
-		AlternatePort:    alternate.LocalAddr().(*net.UDPAddr).Port,
-	}
 	observed := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3478}
+	alternateAddr := alternate.LocalAddr().(*net.UDPAddr)
 
-	mesh.requestAlternateProbe(response, observed)
-	first := readPeerRelayMessages(t, alternate, 1)
-	if first[0].Type != peerRelayTypeBinding || first[0].ProbeRole != peerRelayProbeAlternate {
+	mesh.requestAlternateProbe(peerRelayProbePrimary, alternateAddr, observed)
+	first := readStunMessages(t, alternate, 1)
+	if first[0].Type != stunBindingRequest {
 		t.Fatalf("alternate probe message = %+v, want alternate binding", first[0])
 	}
-	mesh.requestAlternateProbe(response, observed)
-	if messages := readPeerRelayMessages(t, alternate, 1); len(messages) != 0 {
+	mesh.mu.Lock()
+	role := mesh.pendingStun[stunTransactionHex(first[0].TransactionID)]
+	mesh.mu.Unlock()
+	if role != peerRelayProbeAlternate {
+		t.Fatalf("alternate probe role = %q", role)
+	}
+	mesh.requestAlternateProbe(peerRelayProbePrimary, alternateAddr, observed)
+	if messages := readStunMessages(t, alternate, 1); len(messages) != 0 {
 		t.Fatalf("second alternate probe was not throttled: %+v", messages)
 	}
 }
@@ -329,15 +329,16 @@ func TestPeerMeshSendUsesRelayAllocationLikeJava(t *testing.T) {
 		Token:                   "token",
 		ExpiresAt:               time.Now().Add(time.Minute),
 		RemoteEndpoint:          direct.LocalAddr().(*net.UDPAddr),
-		RelayTargetAllocationID: "alloc-peer",
+		RelayTargetAllocationID: endpointKeyUDP(direct.LocalAddr().(*net.UDPAddr)),
 		PathType:                "DIRECT",
 		LastDirectSuccess:       time.Now(),
 		AESKey:                  []byte("0123456789abcdef0123456789abcdef"),
 	}
 	mesh := &peerMeshClient{
-		udp:     udp,
-		relayID: "alloc-local",
-		logger:  log.New(io.Discard, "", 0),
+		udp:      udp,
+		relayID:  "alloc-local",
+		relayTTL: time.Now().Add(time.Minute),
+		logger:   log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
 			ClientID: 1,
 			TurnHost: "127.0.0.1",
@@ -350,9 +351,13 @@ func TestPeerMeshSendUsesRelayAllocationLikeJava(t *testing.T) {
 	if err := mesh.sendEncryptedPayload(session, []byte("payload")); err != nil {
 		t.Fatalf("send encrypted payload: %v", err)
 	}
-	relayMessages := readPeerRelayMessages(t, relay, 1)
-	if len(relayMessages) != 1 || relayMessages[0].Type != peerRelayTypeSend || relayMessages[0].ToAllocationID != "alloc-peer" {
-		t.Fatalf("relay messages = %+v, want send to alloc-peer", relayMessages)
+	relayMessages := readStunMessages(t, relay, 2)
+	if len(relayMessages) != 2 || relayMessages[0].Type != stunCreatePermissionRequest || relayMessages[1].Type != stunSendIndication {
+		t.Fatalf("relay messages = %+v, want permission+send indication", relayMessages)
+	}
+	peer, ok := relayMessages[1].xorPeerAddress()
+	if !ok || peer.Port != direct.LocalAddr().(*net.UDPAddr).Port {
+		t.Fatalf("relay peer address = %+v", peer)
 	}
 	if messages := readUDPPackets(t, direct, 1); len(messages) != 0 {
 		t.Fatalf("direct endpoint received packets while relay allocation exists: %d", len(messages))
@@ -418,9 +423,9 @@ func readUDPPackets(t *testing.T, conn *net.UDPConn, max int) [][]byte {
 	return packets
 }
 
-func readPeerRelayMessages(t *testing.T, conn *net.UDPConn, max int) []peerRelayMessage {
+func readStunMessages(t *testing.T, conn *net.UDPConn, max int) []stunMessage {
 	t.Helper()
-	messages := make([]peerRelayMessage, 0, max)
+	messages := make([]stunMessage, 0, max)
 	for i := 0; i < max; i++ {
 		if err := conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
 			t.Fatalf("set read deadline: %v", err)
@@ -433,11 +438,11 @@ func readPeerRelayMessages(t *testing.T, conn *net.UDPConn, max int) []peerRelay
 			}
 			t.Fatalf("read relay message: %v", err)
 		}
-		var message peerRelayMessage
-		if err := json.Unmarshal(buf[:n], &message); err != nil {
-			t.Fatalf("decode relay message: %v; raw=%s", err, string(buf[:n]))
+		message, err := parseStunMessage(buf[:n])
+		if err != nil {
+			t.Fatalf("decode stun message: %v; raw=%x", err, buf[:n])
 		}
-		messages = append(messages, message)
+		messages = append(messages, *message)
 	}
 	return messages
 }

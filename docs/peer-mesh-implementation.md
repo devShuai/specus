@@ -9,9 +9,9 @@
 * 默认关闭：`TUNNEL_PEER_MESH_ENABLED=false`。
 * 服务端按租户 / 用户 / 客户端维护 peer device、peer ACL、peer session。
 * 默认 ACL：同一 `tenantId + ownerUsername` 的客户端互通；跨用户默认拒绝，admin 可配置显式 ACL。
-* 客户端登录响应下发 `peerMesh` 配置，包括虚拟 IP、CIDR、STUN/TURN-lite 地址、会话 TTL 和设备公钥相关信息。
+* 客户端登录响应下发 `peerMesh` 配置，包括虚拟 IP、CIDR、标准 STUN/TURN 地址、公共 STUN 列表、会话 TTL 和设备公钥相关信息。
 * 控制协议通过现有控制长连接承载 `PEER_CONTROL` JSON 信令，不破坏现有 NAT / HTTP 协议。
-* 服务端内置 UDP STUN/TURN-lite：支持 binding、allocation、refresh、send、relay receive。
+* Java / Go / .NET 服务端内置标准 UDP STUN/TURN：支持 Binding、Allocate、Refresh、CreatePermission、Send Indication 和 Data Indication；relay 转发使用独立 UDP allocation 端口。
 * relay 转发前会校验 session 是否存在、是否 ACTIVE、是否过期、source/target 是否匹配，拒绝未授权 relay frame。
 * 客户端已实现 UDP host candidate、relay candidate、connectivity check、path nominated、direct 优先、relay fallback。
 * 客户端数据面使用 X25519 + HKDF + AES-GCM，加密后的 IP packet 通过 UDP frame 传输；server relay 不解密业务明文。
@@ -23,9 +23,10 @@
 多语言实现当前状态：
 
 * Java client 是完整参考实现，Linux TUN 与随包 Wintun 均已支持。
-* Go server 和 .NET server 已补齐 Java 兼容 STUN/TURN-lite UDP relay：binding、alternate port NAT 探测、allocation/refresh、relay send/data 转发、`SPM1` frame relay 授权和 relay 字节计量。
-* Go client 已支持 Linux TUN、随包 Windows Wintun、macOS utun、Java 兼容 X25519/HKDF/AES-GCM frame、direct UDP 与 TURN-lite relay data frame。
-* .NET client 已补 X25519 key 上报、Java 兼容 AES-GCM frame codec、replay window、UDP 控制面，以及随包 Windows Wintun / Linux TUN / macOS utun packet 读写；当前仍需要真实 Windows/Linux/macOS 双机环境做 ping、HTTP 和 relay fallback 手工验收。
+* Go server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；过期 allocation 按 Java 语义清理并由新 Allocate 重建。
+* .NET server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；同时提供公开 `/api/public/peer-mesh/stun-config` 用于 NAT 检测页面和外部探测。
+* Go client 已支持 Linux TUN、随包 Windows Wintun、macOS utun、Java 兼容 X25519/HKDF/AES-GCM frame、direct UDP 与标准 TURN relay data indication。
+* .NET client 已补 X25519 key 上报、Java 兼容 AES-GCM frame codec、replay window、标准 STUN/TURN UDP 控制面、公共 STUN 候选，以及随包 Windows Wintun / Linux TUN / macOS utun packet 读写；当前仍需要真实 Windows/Linux/macOS 双机环境做 ping、HTTP 和 relay fallback 手工验收。
 
 需要真实环境手工验收：
 
@@ -53,8 +54,8 @@ TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 * `TUNNEL_PEER_MESH_ENABLED`：总开关，生产默认保持 `false`，需要灰度时再启用。
 * `TUNNEL_PEER_MESH_CIDR`：mesh 虚拟网段，默认 `100.96.0.0/11`。
 * `TUNNEL_PEER_MESH_PUBLIC_ADDRESS`：UDP 探测和 relay 对外地址。服务器在 NAT 后面时必须显式配置。
-* `TUNNEL_PEER_MESH_STUN_TURN_PORT`：内置 STUN/TURN-lite UDP 端口，默认 `3478`。
-* `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：NAT 类型辅助探测 UDP 端口。默认 `0` 表示使用 `STUN/TURN-lite 端口 + 1`，即 `3479`。备用端口只用于探测，不承载 relay allocation。
+* `TUNNEL_PEER_MESH_STUN_TURN_PORT`：内置标准 STUN/TURN UDP 主端口，默认 `3478`。
+* `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：NAT 类型辅助探测 UDP 端口。默认 `0` 表示使用 `STUN/TURN 端口 + 1`，即 `3479`。备用端口只用于 Binding 探测，不承载 relay allocation。
 * `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS`：peer session 授权有效期。
 * `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS`：relay allocation 有效期，客户端会提前 refresh。
 
@@ -144,7 +145,7 @@ TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
 journalctl -u tunnel-server -f
 ```
 
-期望看到 STUN/TURN-lite UDP server 监听成功。
+期望看到标准 STUN/TURN UDP server 监听成功。
 
 ### 2. 启动两个同用户客户端
 
@@ -215,6 +216,6 @@ ping 100.96.x.y
 ## 后续可增强
 
 * 真实 macOS / Windows / Linux 多端互通和 relay fallback 压测。
-* 更完整的 RFC STUN/TURN 兼容层，当前是项目内 TURN-lite JSON 协议。
+* .NET server / .NET client 继续做真实跨 NAT 压测，验证 direct 失败后的标准 TURN relay fallback、relay 计量和管理展示。
 * 客户端侧更细粒度的 direct / relay 统计签名上报。
 * 管理页拓扑图动画和 session 时间线。

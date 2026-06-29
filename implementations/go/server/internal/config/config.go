@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -79,13 +80,15 @@ type ConnectionRecordConfig struct {
 
 // TrafficConfig mirrors Tunnel:Traffic.
 type TrafficConfig struct {
-	FlushIntervalMs        int  `json:"flushIntervalMs"`
-	CaptureDetailEnabled   bool `json:"captureDetailEnabled"`
-	CapturePreviewBytes    int  `json:"capturePreviewBytes"`
-	CaptureHeaderChars     int  `json:"captureHeaderChars"`
-	CaptureMaxPending      int  `json:"captureMaxPending"`
-	CaptureFlushBatchSize  int  `json:"captureFlushBatchSize"`
-	CaptureFlushIntervalMs int  `json:"captureFlushIntervalMs"`
+	FlushIntervalMs        int     `json:"flushIntervalMs"`
+	CaptureDetailEnabled   bool    `json:"captureDetailEnabled"`
+	CapturePreviewBytes    int     `json:"capturePreviewBytes"`
+	CaptureHeaderChars     int     `json:"captureHeaderChars"`
+	CaptureDecodeMaxBytes  int     `json:"captureDecodeMaxBytes"`
+	CaptureMaxPending      int     `json:"captureMaxPending"`
+	CaptureFlushBatchSize  int     `json:"captureFlushBatchSize"`
+	CaptureFlushIntervalMs int     `json:"captureFlushIntervalMs"`
+	CaptureSampleRate      float64 `json:"captureSampleRate"`
 }
 
 // ElasticsearchConfig mirrors Tunnel:Elasticsearch for traffic detail storage.
@@ -160,14 +163,20 @@ type DirectHTTPConfig struct {
 
 // PeerMeshConfig mirrors tunnel.peer-mesh in the Java server.
 type PeerMeshConfig struct {
-	Enabled                  bool   `json:"enabled"`
-	CIDR                     string `json:"cidr"`
-	PublicAddress            string `json:"publicAddress"`
-	StunTurnPort             int    `json:"stunTurnPort"`
-	NatProbeAlternatePort    int    `json:"natProbeAlternatePort"`
-	SessionTTLSeconds        int64  `json:"sessionTtlSeconds"`
-	AllocationTTLSeconds     int64  `json:"allocationTtlSeconds"`
-	SessionCleanupIntervalMs int64  `json:"sessionCleanupIntervalMs"`
+	Enabled                     bool     `json:"enabled"`
+	CIDR                        string   `json:"cidr"`
+	PublicAddress               string   `json:"publicAddress"`
+	StunTurnPort                int      `json:"stunTurnPort"`
+	NatProbeAlternatePort       int      `json:"natProbeAlternatePort"`
+	PublicStunServers           []string `json:"publicStunServers"`
+	SessionTTLSeconds           int64    `json:"sessionTtlSeconds"`
+	AllocationTTLSeconds        int64    `json:"allocationTtlSeconds"`
+	SessionCleanupIntervalMs    int64    `json:"sessionCleanupIntervalMs"`
+	RelayMinPort                int      `json:"relayMinPort"`
+	RelayMaxPort                int      `json:"relayMaxPort"`
+	RelayWorkerThreads          int      `json:"relayWorkerThreads"`
+	RelayWorkerQueueCapacity    int      `json:"relayWorkerQueueCapacity"`
+	RelayTrafficFlushIntervalMs int      `json:"relayTrafficFlushIntervalMs"`
 }
 
 // OidcConfig mirrors Tunnel:Oidc.
@@ -227,12 +236,14 @@ func Default() Config {
 		},
 		Traffic: TrafficConfig{
 			FlushIntervalMs:        5000,
-			CaptureDetailEnabled:   true,
+			CaptureDetailEnabled:   false,
 			CapturePreviewBytes:    256,
 			CaptureHeaderChars:     8192,
+			CaptureDecodeMaxBytes:  1024 * 1024,
 			CaptureMaxPending:      20000,
 			CaptureFlushBatchSize:  1000,
 			CaptureFlushIntervalMs: 2000,
+			CaptureSampleRate:      1.0,
 		},
 		Elasticsearch: ElasticsearchConfig{
 			HTTPIndex:        "shuai-tunnel-http-traffic",
@@ -246,13 +257,17 @@ func Default() Config {
 			RewriteMaxBodyBytes: 10 * 1024 * 1024,
 		},
 		PeerMesh: PeerMeshConfig{
-			Enabled:                  false,
-			CIDR:                     "100.96.0.0/11",
-			StunTurnPort:             3478,
-			NatProbeAlternatePort:    0,
-			SessionTTLSeconds:        3600,
-			AllocationTTLSeconds:     300,
-			SessionCleanupIntervalMs: 60000,
+			Enabled:                     false,
+			CIDR:                        "100.96.0.0/11",
+			StunTurnPort:                3478,
+			NatProbeAlternatePort:       3479,
+			SessionTTLSeconds:           3600,
+			AllocationTTLSeconds:        300,
+			SessionCleanupIntervalMs:    60000,
+			RelayMinPort:                49152,
+			RelayMaxPort:                65535,
+			RelayWorkerQueueCapacity:    10000,
+			RelayTrafficFlushIntervalMs: 5000,
 		},
 		Oidc: OidcConfig{
 			Issuer:                "https://gateway.toys.theshuai.com/auth",
@@ -326,6 +341,25 @@ func (cfg *Config) applyEnv(env map[string]string) {
 			}
 		}
 	}
+	setFloat64 := func(key string, target *float64) {
+		if v, ok := env[key]; ok {
+			if n, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				*target = n
+			}
+		}
+	}
+	setStrSlice := func(key string, target *[]string) {
+		if v, ok := env[key]; ok {
+			parts := regexp.MustCompile(`[,\s]+`).Split(v, -1)
+			out := make([]string, 0, len(parts))
+			for _, part := range parts {
+				if trimmed := strings.TrimSpace(part); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			}
+			*target = out
+		}
+	}
 
 	setInt("TUNNEL_NETTY_PORT", &cfg.Netty.Port)
 	setInt("TUNNEL_NETTY_MAX_FRAME_SIZE", &cfg.Netty.MaxFrameSize)
@@ -361,9 +395,11 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setBool("TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED", &cfg.Traffic.CaptureDetailEnabled)
 	setInt("TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES", &cfg.Traffic.CapturePreviewBytes)
 	setInt("TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS", &cfg.Traffic.CaptureHeaderChars)
+	setInt("TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES", &cfg.Traffic.CaptureDecodeMaxBytes)
 	setInt("TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING", &cfg.Traffic.CaptureMaxPending)
 	setInt("TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE", &cfg.Traffic.CaptureFlushBatchSize)
 	setInt("TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS", &cfg.Traffic.CaptureFlushIntervalMs)
+	setFloat64("TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE", &cfg.Traffic.CaptureSampleRate)
 
 	setStr("TUNNEL_ELASTICSEARCH_URIS", &cfg.Elasticsearch.URIs)
 	setStr("TUNNEL_ELASTICSEARCH_USERNAME", &cfg.Elasticsearch.Username)
@@ -383,9 +419,15 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("TUNNEL_PEER_MESH_PUBLIC_ADDRESS", &cfg.PeerMesh.PublicAddress)
 	setInt("TUNNEL_PEER_MESH_STUN_TURN_PORT", &cfg.PeerMesh.StunTurnPort)
 	setInt("TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", &cfg.PeerMesh.NatProbeAlternatePort)
+	setStrSlice("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", &cfg.PeerMesh.PublicStunServers)
 	setInt64("TUNNEL_PEER_MESH_SESSION_TTL_SECONDS", &cfg.PeerMesh.SessionTTLSeconds)
 	setInt64("TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS", &cfg.PeerMesh.AllocationTTLSeconds)
 	setInt64("TUNNEL_PEER_MESH_SESSION_CLEANUP_INTERVAL_MS", &cfg.PeerMesh.SessionCleanupIntervalMs)
+	setInt("TUNNEL_PEER_MESH_RELAY_MIN_PORT", &cfg.PeerMesh.RelayMinPort)
+	setInt("TUNNEL_PEER_MESH_RELAY_MAX_PORT", &cfg.PeerMesh.RelayMaxPort)
+	setInt("TUNNEL_PEER_MESH_RELAY_WORKER_THREADS", &cfg.PeerMesh.RelayWorkerThreads)
+	setInt("TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY", &cfg.PeerMesh.RelayWorkerQueueCapacity)
+	setInt("TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", &cfg.PeerMesh.RelayTrafficFlushIntervalMs)
 
 	setStr("TUNNEL_OIDC_ISSUER", &cfg.Oidc.Issuer)
 	setStr("TUNNEL_OIDC_JWK_SET_URI", &cfg.Oidc.JwkSetURI)

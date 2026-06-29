@@ -139,6 +139,9 @@ public sealed class PeerMeshConfig
     [JsonPropertyName("turnPort")]
     public int TurnPort { get; set; }
 
+    [JsonPropertyName("publicStunServers")]
+    public List<string> PublicStunServers { get; set; } = new();
+
     [JsonPropertyName("iceUsername")]
     public string? IceUsername { get; set; }
 

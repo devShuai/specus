@@ -96,7 +96,7 @@ tunnel:
 * 接收客户端 Netty 控制连接，维护本地 `clientName -> Channel` 路由表。
 * 按配置动态监听公网 TCP 端口。
 * 接收 HTTP route / WebSocket route 的公网请求，并转发给本 edge 上的客户端。
-* 运行 peer mesh UDP/STUN/TURN-lite relay。
+* 运行 peer mesh UDP / 标准 STUN/TURN relay。
 * 上报在线客户端、连接数、端口监听状态、流量统计和错误状态。
 
 edge 本地仍可以保留 `SessionUtil`，但它只表示“本 edge 当前进程持有哪些客户端连接”，不再代表全局在线状态。

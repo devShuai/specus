@@ -95,6 +95,8 @@ func TestLoadFromEnvMapsJavaTrafficCaptureQueueOptions(t *testing.T) {
 	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING", "300")
 	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE", "25")
 	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS", "500")
+	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES", "2048")
+	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE", "0.25")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -109,5 +111,51 @@ func TestLoadFromEnvMapsJavaTrafficCaptureQueueOptions(t *testing.T) {
 	}
 	if cfg.Traffic.CaptureFlushIntervalMs != 500 {
 		t.Fatalf("capture flush interval = %d, want 500", cfg.Traffic.CaptureFlushIntervalMs)
+	}
+	if cfg.Traffic.CaptureDecodeMaxBytes != 2048 {
+		t.Fatalf("capture decode max bytes = %d, want 2048", cfg.Traffic.CaptureDecodeMaxBytes)
+	}
+	if cfg.Traffic.CaptureSampleRate != 0.25 {
+		t.Fatalf("capture sample rate = %f, want 0.25", cfg.Traffic.CaptureSampleRate)
+	}
+}
+
+func TestLoadFromEnvMapsJavaPeerMeshStunAndRelayOptions(t *testing.T) {
+	t.Setenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", "stun:stun1.example.com:3478, stun2.example.com:5349")
+	t.Setenv("TUNNEL_PEER_MESH_RELAY_MIN_PORT", "50000")
+	t.Setenv("TUNNEL_PEER_MESH_RELAY_MAX_PORT", "50100")
+	t.Setenv("TUNNEL_PEER_MESH_RELAY_WORKER_THREADS", "4")
+	t.Setenv("TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY", "1234")
+	t.Setenv("TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", "2500")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if len(cfg.PeerMesh.PublicStunServers) != 2 {
+		t.Fatalf("public stun servers = %#v, want 2 entries", cfg.PeerMesh.PublicStunServers)
+	}
+	if cfg.PeerMesh.RelayMinPort != 50000 || cfg.PeerMesh.RelayMaxPort != 50100 {
+		t.Fatalf("relay port range = %d-%d, want 50000-50100", cfg.PeerMesh.RelayMinPort, cfg.PeerMesh.RelayMaxPort)
+	}
+	if cfg.PeerMesh.RelayWorkerThreads != 4 {
+		t.Fatalf("relay worker threads = %d, want 4", cfg.PeerMesh.RelayWorkerThreads)
+	}
+	if cfg.PeerMesh.RelayWorkerQueueCapacity != 1234 {
+		t.Fatalf("relay worker queue = %d, want 1234", cfg.PeerMesh.RelayWorkerQueueCapacity)
+	}
+	if cfg.PeerMesh.RelayTrafficFlushIntervalMs != 2500 {
+		t.Fatalf("relay traffic flush = %d, want 2500", cfg.PeerMesh.RelayTrafficFlushIntervalMs)
+	}
+}
+
+func TestDefaultTrafficCaptureDetailDisabledLikeJava(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Traffic.CaptureDetailEnabled {
+		t.Fatalf("capture detail should default to disabled")
 	}
 }

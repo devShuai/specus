@@ -6,6 +6,7 @@ import (
 	"compress/zlib"
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -240,19 +241,30 @@ func TestRecordHTTPExchangeQueuesAndFlushesLikeJava(t *testing.T) {
 func TestDecodeBodySupportsZlibAndRawDeflate(t *testing.T) {
 	plain := []byte(`{"ok":true,"message":"hello"}`)
 
-	if got := decodeBody(zlibDeflate(t, plain), "deflate"); !bytes.Equal(got, plain) {
+	if got, truncated := decodeBody(zlibDeflate(t, plain), "deflate", defaultDecodeMaxBytes); truncated || !bytes.Equal(got, plain) {
 		t.Fatalf("zlib deflate decoded to %q, want %q", got, plain)
 	}
 
-	if got := decodeBody(rawDeflate(t, plain), "deflate"); !bytes.Equal(got, plain) {
+	if got, truncated := decodeBody(rawDeflate(t, plain), "deflate", defaultDecodeMaxBytes); truncated || !bytes.Equal(got, plain) {
 		t.Fatalf("raw deflate decoded to %q, want %q", got, plain)
 	}
 }
 
 func TestDecodeBodySupportsBrotli(t *testing.T) {
 	plain := []byte(`<html><body>hello</body></html>`)
-	if got := decodeBody(brotliCompress(t, plain), "br"); !bytes.Equal(got, plain) {
+	if got, truncated := decodeBody(brotliCompress(t, plain), "br", defaultDecodeMaxBytes); truncated || !bytes.Equal(got, plain) {
 		t.Fatalf("brotli decoded to %q, want %q", got, plain)
+	}
+}
+
+func TestDecodeBodyRespectsPreviewLimit(t *testing.T) {
+	plain := []byte(strings.Repeat("a", 4096))
+	got, truncated := decodeBody(zlibDeflate(t, plain), "deflate", 1024)
+	if !truncated {
+		t.Fatalf("decode should report truncated")
+	}
+	if len(got) != 1024 {
+		t.Fatalf("decoded len = %d, want 1024", len(got))
 	}
 }
 

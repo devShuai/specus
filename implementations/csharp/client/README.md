@@ -70,8 +70,8 @@ dotnet publish src/ShuaiTunnel.Client -c Release -o out
   都会回发 `DISCONNECTED source=ws`。
 - **Peer Mesh**:读取与 Java 相同的 `peerMeshDevice/peerMeshTunName/peerMeshMtu` 启动配置，
   登录环境会上报 Java 兼容 X25519 public key；已识别 HTTP 登录响应里的 `peerMesh` 配置和控制通道
-  `PEER_CONTROL` 消息，支持 roster/session/candidates、STUN/TURN-lite binding/allocate、UDP connectivity
-  check、path-report 与 direct-only traffic-report；relay 字节由服务端 relay 热路径计量；已补 Java 兼容 `SPM1` AES-GCM frame codec 和 replay window。
+  `PEER_CONTROL` 消息，支持 roster/session/candidates、标准 STUN/TURN Binding/Allocate/Refresh/CreatePermission/Send/Data Indication、
+  公共 STUN srflx 候选、UDP connectivity check、path-report 与 direct-only traffic-report；relay 字节由服务端 relay 热路径计量；已补 Java 兼容 `SPM1` AES-GCM frame codec 和 replay window。
   Linux 使用 `/dev/net/tun`，Windows 会随 build/publish 输出 `native/windows/<arch>/wintun.dll`，
   并支持通过 `SHUAI_PEER_MESH_WINTUN_DLL` 覆盖，macOS 使用 `utun`。启用 `peerMeshDevice=linux-tun`、`windows-wintun`、
   `utun`、`macos-utun`、`darwin-utun` 或 `auto` 后，虚拟网卡出站 IPv4 packet 会按目标虚拟 IP

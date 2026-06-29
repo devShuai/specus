@@ -111,6 +111,32 @@ public sealed class PeerMeshService
         return BuildConfig(account, device, null);
     }
 
+    public PublicStunConfig PublicStunConfig(string? requestHost)
+    {
+        var servers = new List<string>();
+        var selfHosted = string.Empty;
+        if (Enabled)
+        {
+            var host = ResolvePeerHost(requestHost);
+            if (!string.IsNullOrWhiteSpace(host) && _options.StunTurnPort > 0)
+            {
+                selfHosted = $"stun:{BracketIpv6(host)}:{_options.StunTurnPort}";
+                servers.Add(selfHosted);
+            }
+        }
+        foreach (var item in _options.PublicStunServers
+                     .Where(value => !string.IsNullOrWhiteSpace(value))
+                     .Select(NormalizeStunUrl)
+                     .Where(value => !string.IsNullOrWhiteSpace(value)))
+        {
+            if (!servers.Contains(item, StringComparer.OrdinalIgnoreCase))
+            {
+                servers.Add(item);
+            }
+        }
+        return new PublicStunConfig(Enabled, selfHosted, servers, _options.StunTurnPort);
+    }
+
     public async Task HandleSignalAsync(MessageRequestPacket request, string sourceClientName,
         CancellationToken cancellationToken)
     {
@@ -401,6 +427,12 @@ public sealed class PeerMeshService
         config.TurnHost = config.StunHost;
         config.StunPort = _options.StunTurnPort;
         config.TurnPort = _options.StunTurnPort;
+        config.PublicStunServers = _options.PublicStunServers
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(NormalizeStunUrl)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
         config.IceUsername = "pm-" + account.Id;
         config.IceCredential = ShortToken(account.TenantId, account.ClientName, device.VirtualIp);
         config.ServerPublicKey = ServerPublicKey();
@@ -943,6 +975,55 @@ public sealed class PeerMeshService
         return requestServerName?.Trim() ?? string.Empty;
     }
 
+    private static string NormalizeStunUrl(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+        var normalized = value.Trim();
+        if (normalized.StartsWith("stun://", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["stun://".Length..];
+        }
+        else if (normalized.StartsWith("stun:", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["stun:".Length..];
+        }
+        var slash = normalized.IndexOf('/', StringComparison.Ordinal);
+        if (slash >= 0)
+        {
+            normalized = normalized[..slash];
+        }
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return string.Empty;
+        }
+        if (normalized.StartsWith("[", StringComparison.Ordinal))
+        {
+            var end = normalized.IndexOf(']', StringComparison.Ordinal);
+            if (end > 0)
+            {
+                var host = normalized[1..end];
+                var portText = normalized.Length > end + 2 && normalized[end + 1] == ':'
+                    ? normalized[(end + 2)..]
+                    : string.Empty;
+                var port = int.TryParse(portText, out var parsed) && parsed > 0 ? parsed : 3478;
+                return $"stun:{BracketIpv6(host)}:{port}";
+            }
+        }
+        var colon = normalized.LastIndexOf(':');
+        var hostPart = colon > 0 ? normalized[..colon] : normalized;
+        var portPart = colon > 0 ? normalized[(colon + 1)..] : string.Empty;
+        var stunPort = int.TryParse(portPart, out var valuePort) && valuePort > 0 ? valuePort : 3478;
+        return string.IsNullOrWhiteSpace(hostPart) ? string.Empty : $"stun:{BracketIpv6(hostPart)}:{stunPort}";
+    }
+
+    private static string BracketIpv6(string host) =>
+        host.Contains(':', StringComparison.Ordinal) && !host.StartsWith("[", StringComparison.Ordinal)
+            ? $"[{host}]"
+            : host;
+
     private static string ShortToken(params string[] parts)
     {
         var random = RandomNumberGenerator.GetHexString(32).ToLowerInvariant();
@@ -982,6 +1063,12 @@ public sealed class PeerMeshService
 
     private sealed record PeerSessionGrant(PeerMeshSessionView Session, string Token);
 }
+
+public sealed record PublicStunConfig(
+    bool PeerMeshEnabled,
+    string SelfHostedStunServer,
+    List<string> StunServers,
+    int StunTurnPort);
 
 public sealed record PeerMeshDeviceView(
     long Id,

@@ -62,20 +62,21 @@ type ClientPolicy struct {
 }
 
 type PeerMeshConfig struct {
-	Enabled           bool   `json:"enabled"`
-	ClientID          int64  `json:"clientId"`
-	ClientName        string `json:"clientName"`
-	VirtualIP         string `json:"virtualIp"`
-	CIDR              string `json:"cidr"`
-	StunHost          string `json:"stunHost"`
-	StunPort          int    `json:"stunPort"`
-	TurnHost          string `json:"turnHost"`
-	TurnPort          int    `json:"turnPort"`
-	IceUsername       string `json:"iceUsername"`
-	IceCredential     string `json:"iceCredential"`
-	ServerPublicKey   string `json:"serverPublicKey"`
-	ClientPublicKey   string `json:"clientPublicKey"`
-	SessionTTLSeconds int64  `json:"sessionTtlSeconds"`
+	Enabled           bool     `json:"enabled"`
+	ClientID          int64    `json:"clientId"`
+	ClientName        string   `json:"clientName"`
+	VirtualIP         string   `json:"virtualIp"`
+	CIDR              string   `json:"cidr"`
+	StunHost          string   `json:"stunHost"`
+	StunPort          int      `json:"stunPort"`
+	TurnHost          string   `json:"turnHost"`
+	TurnPort          int      `json:"turnPort"`
+	PublicStunServers []string `json:"publicStunServers"`
+	IceUsername       string   `json:"iceUsername"`
+	IceCredential     string   `json:"iceCredential"`
+	ServerPublicKey   string   `json:"serverPublicKey"`
+	ClientPublicKey   string   `json:"clientPublicKey"`
+	SessionTTLSeconds int64    `json:"sessionTtlSeconds"`
 }
 
 func LoadConfig(path string) (Config, error) {

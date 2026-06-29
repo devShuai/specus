@@ -49,7 +49,21 @@ public static class TunnelEnvironmentVariables
         var key = MapKey(rawKey[Prefix.Length..]);
         if (key is not null)
         {
+            if (key.Equals("Tunnel:PeerMesh:PublicStunServers", StringComparison.OrdinalIgnoreCase))
+            {
+                AddStringList(result, key, value);
+                return;
+            }
             result[key] = value;
+        }
+    }
+
+    private static void AddStringList(IDictionary<string, string?> result, string key, string value)
+    {
+        var index = 0;
+        foreach (var item in value.Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            result[$"{key}:{index++}"] = item;
         }
     }
 

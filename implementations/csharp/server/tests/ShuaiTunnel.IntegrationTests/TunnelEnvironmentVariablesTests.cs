@@ -25,6 +25,10 @@ public sealed class TunnelEnvironmentVariablesTests
             ["TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING"] = "300",
             ["TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE"] = "25",
             ["TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS"] = "500",
+            ["TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS"] = "stun:stun1.example.com:3478, stun:stun2.example.com:3478",
+            ["TUNNEL_PEER_MESH_RELAY_MIN_PORT"] = "49152",
+            ["TUNNEL_PEER_MESH_RELAY_MAX_PORT"] = "49200",
+            ["TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY"] = "10000",
             ["TUNNEL_OIDC_JWK_SET_URI"] = "https://issuer.example/jwks",
             ["TUNNEL_OIDC_TENANT_CLAIM"] = "org_id",
             ["TUNNEL_TLS_KEYSTORE_PASSWORD"] = "changeit",
@@ -47,6 +51,11 @@ public sealed class TunnelEnvironmentVariablesTests
         Assert.Equal("300", mapped["Tunnel:Traffic:CaptureMaxPending"]);
         Assert.Equal("25", mapped["Tunnel:Traffic:CaptureFlushBatchSize"]);
         Assert.Equal("500", mapped["Tunnel:Traffic:CaptureFlushIntervalMs"]);
+        Assert.Equal("stun:stun1.example.com:3478", mapped["Tunnel:PeerMesh:PublicStunServers:0"]);
+        Assert.Equal("stun:stun2.example.com:3478", mapped["Tunnel:PeerMesh:PublicStunServers:1"]);
+        Assert.Equal("49152", mapped["Tunnel:PeerMesh:RelayMinPort"]);
+        Assert.Equal("49200", mapped["Tunnel:PeerMesh:RelayMaxPort"]);
+        Assert.Equal("10000", mapped["Tunnel:PeerMesh:RelayWorkerQueueCapacity"]);
         Assert.Equal("https://issuer.example/jwks", mapped["Tunnel:Oidc:JwkSetUri"]);
         Assert.Equal("org_id", mapped["Tunnel:Oidc:TenantClaim"]);
         Assert.Equal("changeit", mapped["Tunnel:Tls:KeystorePassword"]);

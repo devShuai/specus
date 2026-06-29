@@ -121,6 +121,10 @@ public static class AdminApiEndpoints
             (ManagementQueryService service, CancellationToken cancellationToken) =>
                 service.ListPublicClientDownloadsAsync(cancellationToken));
 
+        app.MapGet("/api/public/peer-mesh/stun-config",
+            (HttpContext context, PeerMeshService service) =>
+                Results.Ok(service.PublicStunConfig(ForwardedHost(context))));
+
         app.MapGet("/api/admin/me",
             (HttpContext context, IOptions<AuthOptions> authOptions, ManagementUserService service,
                 CancellationToken cancellationToken) =>
@@ -459,6 +463,16 @@ public static class AdminApiEndpoints
 
     private static string? FirstText(string? first, string? second) =>
         string.IsNullOrWhiteSpace(first) ? second : first;
+
+    private static string ForwardedHost(HttpContext context)
+    {
+        var forwarded = context.Request.Headers["X-Forwarded-Host"].ToString();
+        if (string.IsNullOrWhiteSpace(forwarded))
+        {
+            forwarded = context.Request.Headers["Host"].ToString();
+        }
+        return string.IsNullOrWhiteSpace(forwarded) ? context.Request.Host.ToString() : forwarded.Split(',', 2)[0].Trim();
+    }
 
     private static bool RequiresAdminAuth(PathString path) =>
         path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase)

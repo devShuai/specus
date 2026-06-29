@@ -24,17 +24,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private const string TypeDeviceReport = "device-report";
     private const string TypeClose = "close";
 
-    private const string RelayMagic = "shuai-peer-relay";
-    private const string RelayTypeBinding = "binding";
-    private const string RelayTypeBindingResponse = "binding-response";
-    private const string RelayTypeAllocate = "allocate";
-    private const string RelayTypeAllocated = "allocated";
-    private const string RelayTypeRefresh = "refresh";
-    private const string RelayTypeSend = "send";
-    private const string RelayTypeData = "data";
     private const string RelayProbePrimary = "primary";
     private const string RelayProbeAlternate = "alternate";
     private const string RelayProbeChangedPort = "changed-port";
+    private const string PublicStunRolePrefix = "public-stun:";
 
     private const string ProbeMagic = "shuai-peer-mesh";
     private const string ProbeTypeCheck = "check";
@@ -51,6 +44,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan RelayFreshRequestInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan RelayExpiringRequestInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan AlternateProbeMinInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan TurnPermissionTtl = TimeSpan.FromMinutes(4);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -66,6 +60,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly Dictionary<long, List<PendingVirtualPacket>> _pendingPackets = new();
     private readonly Dictionary<long, DateTimeOffset> _pathPreparedAt = new();
     private readonly Dictionary<string, string> _natByRole = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PeerCandidate> _srflxCandidates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _turnPermissions = new(StringComparer.OrdinalIgnoreCase);
 
     private CancellationTokenSource? _cts;
     private UdpClient? _udp;
@@ -133,6 +130,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pendingPackets.Clear();
             _pathPreparedAt.Clear();
             _natByRole.Clear();
+            _pendingStun.Clear();
+            _srflxCandidates.Clear();
+            _turnPermissions.Clear();
             _srflx = null;
             _relay = null;
             _relayId = null;
@@ -275,19 +275,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
+        var stun = StunMessage.Parse(payload);
+        if (stun is not null)
+        {
+            await HandleStunTurnMessageAsync(stun, remote).ConfigureAwait(false);
+            return;
+        }
         if (PeerDataFrameCodec.LooksLikeDataFrame(payload))
         {
             await HandlePeerDataFrameAsync(payload, remote, "").ConfigureAwait(false);
             return;
-        }
-        if (payload[0] == (byte)'{' && Encoding.UTF8.GetString(payload).Contains(RelayMagic, StringComparison.Ordinal))
-        {
-            var relay = JsonSerializer.Deserialize<PeerRelayMessage>(payload, JsonOptions);
-            if (relay?.Magic == RelayMagic)
-            {
-                await HandleRelayMessageAsync(relay, remote).ConfigureAwait(false);
-                return;
-            }
         }
         var probe = JsonSerializer.Deserialize<PeerUdpProbe>(payload, JsonOptions);
         if (probe?.Magic == ProbeMagic)
@@ -296,57 +293,125 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
-    private async Task HandleRelayMessageAsync(PeerRelayMessage message, IPEndPoint remote)
+    private async Task HandleStunTurnMessageAsync(StunMessage message, IPEndPoint remote)
     {
         switch (message.Type)
         {
-            case RelayTypeBindingResponse:
-                if (!string.IsNullOrWhiteSpace(message.MappedAddress) && message.MappedPort > 0)
+            case StunMessage.BindingSuccess:
+                await HandleStunBindingSuccessAsync(message, remote).ConfigureAwait(false);
+                break;
+            case StunMessage.AllocateSuccess:
+                await HandleTurnAllocatedAsync(message).ConfigureAwait(false);
+                break;
+            case StunMessage.RefreshSuccess:
+                lock (_sync)
                 {
-                    var role = string.IsNullOrWhiteSpace(message.ProbeRole) ? RelayProbePrimary : message.ProbeRole;
-                    var endpoint = $"{message.MappedAddress}:{message.MappedPort}";
-                    lock (_sync)
-                    {
-                        _natByRole[role] = endpoint;
-                        _srflx = new PeerCandidate("srflx", "udp", message.MappedAddress, message.MappedPort, 800, "server-reflexive", "");
-                    }
-                    await ReportDeviceAsync(DeviceStatus(), "", NatType(), endpoint).ConfigureAwait(false);
-                    await RequestAlternateProbeAsync(message, remote).ConfigureAwait(false);
-                    await AnnounceCandidatesAsync().ConfigureAwait(false);
+                    _relayTtl = DateTimeOffset.UtcNow.AddSeconds(Math.Max(30, message.LifetimeSeconds(300)));
                 }
                 break;
-            case RelayTypeAllocated:
-                if (!string.IsNullOrWhiteSpace(message.AllocationId))
+            case StunMessage.CreatePermissionSuccess:
+                _logger.LogTrace("Peer Mesh TURN permission created: tx={TransactionId}", message.TransactionIdHex);
+                break;
+            case StunMessage.DataIndication:
+                var peer = message.XorPeerAddress();
+                var inner = message.Data();
+                if (peer is not null && inner is not null)
                 {
-                    lock (_sync)
-                    {
-                        _relayId = message.AllocationId;
-                        _relayTtl = DateTimeOffset.UtcNow.AddSeconds(Math.Max(30, message.TtlSeconds));
-                        _relay = new PeerCandidate("relay", "udp", remote.Address.ToString(), remote.Port, 100, "turn-lite", message.AllocationId);
-                    }
-                    await AnnounceCandidatesAsync().ConfigureAwait(false);
+                    await HandleUdpPayloadAsync(inner, remote, EndpointKey(peer)).ConfigureAwait(false);
                 }
                 break;
-            case RelayTypeData:
-                if (string.IsNullOrWhiteSpace(message.PayloadBase64))
-                {
-                    return;
-                }
-                var inner = Convert.FromBase64String(message.PayloadBase64);
-                if (PeerDataFrameCodec.LooksLikeDataFrame(inner))
-                {
-                    await HandlePeerDataFrameAsync(inner, remote, message.FromAllocationId ?? "").ConfigureAwait(false);
-                    return;
-                }
-                var probe = JsonSerializer.Deserialize<PeerUdpProbe>(inner, JsonOptions);
-                if (probe?.Magic == ProbeMagic)
-                {
-                    await HandleProbeAsync(probe, remote, message.FromAllocationId ?? "").ConfigureAwait(false);
-                }
+            case StunMessage.AllocateError:
+            case StunMessage.RefreshError:
+            case StunMessage.CreatePermissionError:
+                _logger.LogWarning("Peer Mesh STUN/TURN error response: type=0x{Type:x}, tx={TransactionId}",
+                    message.Type,
+                    message.TransactionIdHex);
                 break;
-            case "error":
-                _logger.LogWarning("Peer Mesh relay error: {Error}", message.Error);
-                break;
+        }
+    }
+
+    private async Task HandleStunBindingSuccessAsync(StunMessage message, IPEndPoint remote)
+    {
+        var mapped = message.XorMappedAddress();
+        if (mapped is null)
+        {
+            return;
+        }
+        string role;
+        lock (_sync)
+        {
+            role = _pendingStun.Remove(message.TransactionIdHex, out var pendingRole)
+                ? pendingRole
+                : RelayProbePrimary;
+        }
+        var publicStun = IsPublicStunRole(role);
+        var endpoint = EndpointKey(mapped);
+        if (!publicStun)
+        {
+            lock (_sync)
+            {
+                _natByRole[NormalizeProbeRole(role)] = endpoint;
+            }
+            await ReportDeviceAsync(DeviceStatus(), "", NatType(), endpoint).ConfigureAwait(false);
+            await RequestAlternateProbeAsync(role, message.OtherAddress(), remote).ConfigureAwait(false);
+        }
+
+        var candidate = new PeerCandidate(
+            "srflx",
+            "udp",
+            mapped.Address.ToString(),
+            mapped.Port,
+            800,
+            publicStun ? "public-stun" : "standard-stun",
+            "");
+        lock (_sync)
+        {
+            _srflxCandidates[CandidateEndpointKey(candidate)] = candidate;
+            if (!publicStun)
+            {
+                _srflx = candidate;
+            }
+        }
+        await AnnounceCandidatesAsync().ConfigureAwait(false);
+    }
+
+    private async Task HandleTurnAllocatedAsync(StunMessage message)
+    {
+        var relayed = message.XorRelayedAddress();
+        var turnServer = RelayEndpoint();
+        if (relayed is null || turnServer is null)
+        {
+            return;
+        }
+        var relayId = EndpointKey(relayed);
+        var relayHost = RelayHost();
+        lock (_sync)
+        {
+            _relayId = relayId;
+            _relayTtl = DateTimeOffset.UtcNow.AddSeconds(Math.Max(30, message.LifetimeSeconds(300)));
+            _relay = new PeerCandidate(
+                "relay",
+                "udp",
+                relayHost,
+                turnServer.Port,
+                100,
+                "standard-turn",
+                relayId);
+        }
+        await AnnounceCandidatesAsync().ConfigureAwait(false);
+    }
+
+    private async Task HandleUdpPayloadAsync(byte[] payload, IPEndPoint remote, string relayFrom)
+    {
+        if (PeerDataFrameCodec.LooksLikeDataFrame(payload))
+        {
+            await HandlePeerDataFrameAsync(payload, remote, relayFrom).ConfigureAwait(false);
+            return;
+        }
+        var probe = JsonSerializer.Deserialize<PeerUdpProbe>(payload, JsonOptions);
+        if (probe?.Magic == ProbeMagic)
+        {
+            await HandleProbeAsync(probe, remote, relayFrom).ConfigureAwait(false);
         }
     }
 
@@ -614,8 +679,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             payload);
         if (useRelay)
         {
-            await SendRelayPayloadAsync(session.RelayTargetAllocationId, frame).ConfigureAwait(false);
-            return true;
+            return await SendRelayPayloadAsync(session.RelayTargetAllocationId, frame).ConfigureAwait(false);
         }
         await udp.SendAsync(frame, session.RemoteEndpoint).ConfigureAwait(false);
         lock (_sync)
@@ -1107,14 +1171,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     {
         UdpClient? udp;
         TunnelRuntimeState? runtime;
-        PeerCandidate? srflx;
+        List<PeerCandidate> srflxCandidates;
         PeerCandidate? relay;
         bool avoidDirect;
         lock (_sync)
         {
             udp = _udp;
             runtime = _runtime;
-            srflx = _srflx;
+            srflxCandidates = _srflxCandidates.Values.ToList();
             relay = _relay;
             avoidDirect = ShouldAvoidDirectPathLocked();
         }
@@ -1143,9 +1207,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 }
             }
         }
-        if (srflx is not null && !avoidDirect)
+        if (!avoidDirect)
         {
-            candidates.Add(srflx);
+            candidates.AddRange(srflxCandidates);
         }
         if (relay is not null)
         {
@@ -1162,11 +1226,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             return;
         }
         var now = DateTimeOffset.UtcNow;
-        string? allocationId;
         bool fresh;
         lock (_sync)
         {
-            allocationId = _relayId;
             fresh = !string.IsNullOrWhiteSpace(_relayId) && _relayTtl > now.AddMinutes(1);
             var expiring = string.IsNullOrWhiteSpace(_relayId) || _relayTtl <= now.AddMinutes(1);
             if (!expiring && now - _lastRelayCandidateRequest < RelayFreshRequestInterval)
@@ -1179,36 +1241,78 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             _lastRelayCandidateRequest = now;
         }
-        await SendRelayControlAsync(new PeerRelayMessage
-        {
-            Magic = RelayMagic,
-            Type = RelayTypeBinding,
-            ProbeRole = RelayProbePrimary,
-            TransactionId = RandomHex(12),
-        }, endpoint).ConfigureAwait(false);
+        await SendStunBindingAsync(endpoint, RelayProbePrimary).ConfigureAwait(false);
+        await RequestPublicStunBindingsAsync().ConfigureAwait(false);
         if (fresh)
         {
-            await SendRelayControlAsync(new PeerRelayMessage
-            {
-                Magic = RelayMagic,
-                Type = RelayTypeRefresh,
-                AllocationId = allocationId,
-                TransactionId = RandomHex(12),
-            }, endpoint).ConfigureAwait(false);
+            await SendStunRequestAsync(StunMessage.Of(
+                StunMessage.RefreshRequest,
+                StunMessage.NewTransactionId(),
+                StunMessage.Lifetime(Math.Max(30, Runtime()?.PeerMesh.SessionTtlSeconds ?? 300))),
+                endpoint).ConfigureAwait(false);
             return;
         }
-        await SendRelayControlAsync(new PeerRelayMessage
-        {
-            Magic = RelayMagic,
-            Type = RelayTypeAllocate,
-            TransactionId = RandomHex(12),
-        }, endpoint).ConfigureAwait(false);
+        await SendStunRequestAsync(StunMessage.Of(
+            StunMessage.AllocateRequest,
+            StunMessage.NewTransactionId(),
+            StunMessage.RequestedUdpTransportAttribute()),
+            endpoint).ConfigureAwait(false);
     }
 
-    private async Task RequestAlternateProbeAsync(PeerRelayMessage response, IPEndPoint observed)
+    private async Task SendStunBindingAsync(IPEndPoint endpoint, string role)
     {
-        if (!string.Equals(response.ProbeRole, RelayProbePrimary, StringComparison.OrdinalIgnoreCase)
-            || response.AlternatePort <= 0)
+        var transactionId = StunMessage.NewTransactionId();
+        lock (_sync)
+        {
+            _pendingStun[Convert.ToHexString(transactionId).ToLowerInvariant()] = BindingProbeRole(role);
+        }
+        await SendStunRequestAsync(StunMessage.Of(
+            StunMessage.BindingRequest,
+            transactionId,
+            StunMessage.Software("shuai-tunnel-peer-client")),
+            endpoint).ConfigureAwait(false);
+    }
+
+    private async Task RequestPublicStunBindingsAsync()
+    {
+        var runtime = Runtime();
+        if (runtime?.PeerMesh.PublicStunServers is not { Count: > 0 } servers)
+        {
+            RemovePublicStunCandidates();
+            return;
+        }
+        RemovePublicStunCandidates();
+        var sent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in servers)
+        {
+            var endpoint = ParseStunServer(item);
+            if (endpoint is null || !sent.Add($"{endpoint.Address}:{endpoint.Port}"))
+            {
+                continue;
+            }
+            await SendStunBindingAsync(endpoint, PublicStunRolePrefix + $"{endpoint.Address}:{endpoint.Port}")
+                .ConfigureAwait(false);
+        }
+    }
+
+    private void RemovePublicStunCandidates()
+    {
+        lock (_sync)
+        {
+            foreach (var key in _srflxCandidates
+                         .Where(item => string.Equals(item.Value.Foundation, "public-stun", StringComparison.OrdinalIgnoreCase))
+                         .Select(item => item.Key)
+                         .ToList())
+            {
+                _srflxCandidates.Remove(key);
+            }
+        }
+    }
+
+    private async Task RequestAlternateProbeAsync(string role, IPEndPoint? alternate, IPEndPoint observed)
+    {
+        if (!string.Equals(NormalizeProbeRole(role), RelayProbePrimary, StringComparison.OrdinalIgnoreCase)
+            || alternate is null)
         {
             return;
         }
@@ -1220,10 +1324,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 return;
             }
         }
-        var address = string.IsNullOrWhiteSpace(response.AlternateAddress) || response.AlternateAddress == "0.0.0.0"
-            ? observed.Address.ToString()
-            : response.AlternateAddress;
-        if (response.AlternatePort == observed.Port || !IPAddress.TryParse(address, out var ip))
+        var address = IsUnspecifiedAddress(alternate.Address) ? observed.Address : alternate.Address;
+        if (alternate.Port == observed.Port)
         {
             return;
         }
@@ -1231,16 +1333,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             _lastAlternateProbeRequest = now;
         }
-        await SendRelayControlAsync(new PeerRelayMessage
-        {
-            Magic = RelayMagic,
-            Type = RelayTypeBinding,
-            ProbeRole = RelayProbeAlternate,
-            TransactionId = RandomHex(12),
-        }, new IPEndPoint(ip, response.AlternatePort)).ConfigureAwait(false);
+        await SendStunBindingAsync(new IPEndPoint(address, alternate.Port), RelayProbeAlternate).ConfigureAwait(false);
     }
 
-    private async Task SendRelayControlAsync(PeerRelayMessage message, IPEndPoint endpoint)
+    private async Task SendStunRequestAsync(StunMessage message, IPEndPoint endpoint)
     {
         UdpClient? udp;
         lock (_sync)
@@ -1251,35 +1347,71 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        var body = JsonSerializer.SerializeToUtf8Bytes(message, JsonOptions);
+        var body = message.ToBytes();
         await udp.SendAsync(body, endpoint).ConfigureAwait(false);
     }
 
-    private async Task SendRelayPayloadAsync(string? toAllocationId, byte[] payload)
+    private async Task<bool> SendRelayPayloadAsync(string? toAllocationId, byte[] payload)
     {
         if (string.IsNullOrWhiteSpace(toAllocationId))
         {
-            return;
+            return false;
         }
         var endpoint = RelayEndpoint();
         if (endpoint is null)
         {
-            return;
+            return false;
         }
         string? allocationId;
+        DateTimeOffset relayTtl;
         lock (_sync)
         {
             allocationId = _relayId;
+            relayTtl = _relayTtl;
         }
-        await SendRelayControlAsync(new PeerRelayMessage
+        if (string.IsNullOrWhiteSpace(allocationId) || relayTtl <= DateTimeOffset.UtcNow)
         {
-            Magic = RelayMagic,
-            Type = RelayTypeSend,
-            TransactionId = RandomHex(12),
-            AllocationId = allocationId,
-            ToAllocationId = toAllocationId,
-            PayloadBase64 = Convert.ToBase64String(payload),
-        }, endpoint).ConfigureAwait(false);
+            return false;
+        }
+        var peer = ParseEndpoint(toAllocationId);
+        if (peer is null)
+        {
+            return false;
+        }
+        await EnsureTurnPermissionAsync(peer).ConfigureAwait(false);
+        var transactionId = StunMessage.NewTransactionId();
+        await SendStunRequestAsync(StunMessage.Of(
+            StunMessage.SendIndication,
+            transactionId,
+            StunMessage.XorPeerAddress(peer, transactionId),
+            StunMessage.Data(payload)),
+            endpoint).ConfigureAwait(false);
+        return true;
+    }
+
+    private async Task EnsureTurnPermissionAsync(IPEndPoint peer)
+    {
+        var turnServer = RelayEndpoint();
+        if (turnServer is null)
+        {
+            return;
+        }
+        var now = DateTimeOffset.UtcNow;
+        var key = EndpointKey(peer);
+        lock (_sync)
+        {
+            if (_turnPermissions.TryGetValue(key, out var expiresAt) && expiresAt - now > TimeSpan.FromSeconds(30))
+            {
+                return;
+            }
+            _turnPermissions[key] = now + TurnPermissionTtl;
+        }
+        var transactionId = StunMessage.NewTransactionId();
+        await SendStunRequestAsync(StunMessage.Of(
+            StunMessage.CreatePermissionRequest,
+            transactionId,
+            StunMessage.XorPeerAddress(peer, transactionId)),
+            turnServer).ConfigureAwait(false);
     }
 
     private IPEndPoint? RelayEndpoint()
@@ -1308,6 +1440,128 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         return ip is null ? null : new IPEndPoint(ip, port);
     }
+
+    private string RelayHost()
+    {
+        var runtime = Runtime();
+        return runtime is null ? "" : FirstNonEmpty(runtime.PeerMesh.TurnHost, runtime.PeerMesh.StunHost);
+    }
+
+    private IPEndPoint? ParseStunServer(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+        var normalized = value.Trim();
+        if (normalized.StartsWith("stun://", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["stun://".Length..];
+        }
+        else if (normalized.StartsWith("stun:", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["stun:".Length..];
+        }
+        var slash = normalized.IndexOf('/', StringComparison.Ordinal);
+        if (slash >= 0)
+        {
+            normalized = normalized[..slash];
+        }
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return null;
+        }
+        var host = normalized;
+        var port = 3478;
+        if (normalized.StartsWith("[", StringComparison.Ordinal))
+        {
+            var end = normalized.IndexOf(']', StringComparison.Ordinal);
+            if (end > 0)
+            {
+                host = normalized[1..end];
+                if (normalized.Length > end + 2
+                    && normalized[end + 1] == ':'
+                    && int.TryParse(normalized[(end + 2)..], out var parsedPort)
+                    && parsedPort > 0)
+                {
+                    port = parsedPort;
+                }
+            }
+        }
+        else
+        {
+            var colon = normalized.LastIndexOf(':');
+            if (colon > 0
+                && int.TryParse(normalized[(colon + 1)..], out var parsedPort)
+                && parsedPort > 0)
+            {
+                host = normalized[..colon];
+                port = parsedPort;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return null;
+        }
+        if (!IPAddress.TryParse(host, out var ip))
+        {
+            try
+            {
+                ip = Dns.GetHostAddresses(host).FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork);
+            }
+            catch (SocketException ex)
+            {
+                _logger.LogDebug(ex, "Peer Mesh STUN endpoint resolve failed: {Host}:{Port}", host, port);
+            }
+        }
+        return ip is null ? null : new IPEndPoint(ip, port);
+    }
+
+    private static IPEndPoint? ParseEndpoint(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+        var normalized = value.Trim();
+        if (normalized.StartsWith("turn:", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["turn:".Length..];
+        }
+        if (IPEndPoint.TryParse(normalized, out var endpoint))
+        {
+            return endpoint;
+        }
+        var colon = normalized.LastIndexOf(':');
+        if (colon <= 0 || !int.TryParse(normalized[(colon + 1)..], out var port) || port <= 0)
+        {
+            return null;
+        }
+        return IPAddress.TryParse(normalized[..colon], out var ip) ? new IPEndPoint(ip, port) : null;
+    }
+
+    private static string EndpointKey(IPEndPoint endpoint) => $"{endpoint.Address}:{endpoint.Port}";
+
+    private static string CandidateEndpointKey(PeerCandidate candidate) =>
+        $"{candidate.Type}|{candidate.Address}|{candidate.Port}|{candidate.Foundation}";
+
+    private static string NormalizeProbeRole(string? role) =>
+        string.Equals(role, RelayProbeAlternate, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(role, RelayProbeChangedPort, StringComparison.OrdinalIgnoreCase)
+            ? role!
+            : RelayProbePrimary;
+
+    private static string BindingProbeRole(string? role) =>
+        IsPublicStunRole(role) ? role!.Trim() : NormalizeProbeRole(role);
+
+    private static bool IsPublicStunRole(string? role) =>
+        !string.IsNullOrWhiteSpace(role) && role.StartsWith(PublicStunRolePrefix, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsUnspecifiedAddress(IPAddress address) =>
+        IPAddress.Any.Equals(address)
+        || IPAddress.IPv6Any.Equals(address)
+        || address.ToString() == "0.0.0.0"
+        || address.ToString() == "::";
 
     private async Task ReportDeviceAsync(string status, string error, string natType, string endpoint)
     {
@@ -1601,6 +1855,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pendingPackets.Clear();
             _pathPreparedAt.Clear();
             _natByRole.Clear();
+            _pendingStun.Clear();
+            _srflxCandidates.Clear();
+            _turnPermissions.Clear();
             _srflx = null;
             _relay = null;
             _relayId = null;
@@ -1766,42 +2023,6 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public List<PeerCandidate> Candidates { get; set; } = [];
         [JsonPropertyName("createdAtMillis")]
         public long CreatedAtMillis { get; set; }
-    }
-
-    private sealed record PeerRelayMessage
-    {
-        [JsonPropertyName("magic")]
-        public string? Magic { get; init; }
-        [JsonPropertyName("type")]
-        public string? Type { get; init; }
-        [JsonPropertyName("transactionId")]
-        public string? TransactionId { get; init; }
-        [JsonPropertyName("probeRole")]
-        public string? ProbeRole { get; init; }
-        [JsonPropertyName("allocationId")]
-        public string? AllocationId { get; init; }
-        [JsonPropertyName("fromAllocationId")]
-        public string? FromAllocationId { get; init; }
-        [JsonPropertyName("toAllocationId")]
-        public string? ToAllocationId { get; init; }
-        [JsonPropertyName("mappedAddress")]
-        public string? MappedAddress { get; init; }
-        [JsonPropertyName("mappedPort")]
-        public int MappedPort { get; init; }
-        [JsonPropertyName("alternateAddress")]
-        public string? AlternateAddress { get; init; }
-        [JsonPropertyName("alternatePort")]
-        public int AlternatePort { get; init; }
-        [JsonPropertyName("observedByAddress")]
-        public string? ObservedByAddress { get; init; }
-        [JsonPropertyName("observedByPort")]
-        public int ObservedByPort { get; init; }
-        [JsonPropertyName("ttlSeconds")]
-        public long TtlSeconds { get; init; }
-        [JsonPropertyName("payloadBase64")]
-        public string? PayloadBase64 { get; init; }
-        [JsonPropertyName("error")]
-        public string? Error { get; init; }
     }
 
     private sealed record PeerUdpProbe(

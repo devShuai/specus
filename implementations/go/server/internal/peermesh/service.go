@@ -53,20 +53,21 @@ type AccessContext struct {
 
 // LoginConfig is the client-auth peerMesh object.
 type LoginConfig struct {
-	Enabled           bool   `json:"enabled"`
-	ClientID          int64  `json:"clientId"`
-	ClientName        string `json:"clientName"`
-	VirtualIP         string `json:"virtualIp"`
-	CIDR              string `json:"cidr"`
-	StunHost          string `json:"stunHost"`
-	StunPort          int    `json:"stunPort"`
-	TurnHost          string `json:"turnHost"`
-	TurnPort          int    `json:"turnPort"`
-	IceUsername       string `json:"iceUsername"`
-	IceCredential     string `json:"iceCredential"`
-	ServerPublicKey   string `json:"serverPublicKey"`
-	ClientPublicKey   string `json:"clientPublicKey"`
-	SessionTTLSeconds int64  `json:"sessionTtlSeconds"`
+	Enabled           bool     `json:"enabled"`
+	ClientID          int64    `json:"clientId"`
+	ClientName        string   `json:"clientName"`
+	VirtualIP         string   `json:"virtualIp"`
+	CIDR              string   `json:"cidr"`
+	StunHost          string   `json:"stunHost"`
+	StunPort          int      `json:"stunPort"`
+	TurnHost          string   `json:"turnHost"`
+	TurnPort          int      `json:"turnPort"`
+	PublicStunServers []string `json:"publicStunServers"`
+	IceUsername       string   `json:"iceUsername"`
+	IceCredential     string   `json:"iceCredential"`
+	ServerPublicKey   string   `json:"serverPublicKey"`
+	ClientPublicKey   string   `json:"clientPublicKey"`
+	SessionTTLSeconds int64    `json:"sessionTtlSeconds"`
 }
 
 type DeviceView struct {
@@ -119,6 +120,13 @@ type SessionView struct {
 	UpdatedAt        string  `json:"updatedAt"`
 	ExpiresAt        string  `json:"expiresAt"`
 	ClosedAt         *string `json:"closedAt,omitempty"`
+}
+
+type PublicStunConfig struct {
+	PeerMeshEnabled      bool     `json:"peerMeshEnabled"`
+	SelfHostedStunServer string   `json:"selfHostedStunServer"`
+	StunServers          []string `json:"stunServers"`
+	StunTurnPort         int      `json:"stunTurnPort"`
 }
 
 type RosterItem struct {
@@ -309,6 +317,7 @@ func (s *Service) buildConfig(account store.ClientAccount, device *store.PeerMes
 	cfg.TurnHost = cfg.StunHost
 	cfg.StunPort = s.cfg.StunTurnPort
 	cfg.TurnPort = s.cfg.StunTurnPort
+	cfg.PublicStunServers = s.publicStunServers()
 	cfg.IceUsername = "pm-" + strconv.FormatInt(account.ID, 10)
 	cfg.IceCredential = s.shortToken(account.TenantID, account.ClientName, device.VirtualIP)
 	cfg.ServerPublicKey = serverPublicKey()
@@ -316,6 +325,30 @@ func (s *Service) buildConfig(account store.ClientAccount, device *store.PeerMes
 		cfg.ClientPublicKey = *device.PublicKey
 	}
 	return cfg
+}
+
+func (s *Service) PublicStunConfig(requestHost string) PublicStunConfig {
+	if s == nil {
+		return PublicStunConfig{}
+	}
+	servers := make([]string, 0, 1+len(s.cfg.PublicStunServers))
+	seen := make(map[string]struct{})
+	selfHosted := ""
+	if s.Enabled() {
+		selfHosted = s.selfHostedStunServer(requestHost)
+		if selfHosted != "" {
+			servers = appendUnique(servers, seen, selfHosted)
+		}
+	}
+	for _, item := range s.publicStunServers() {
+		servers = appendUnique(servers, seen, item)
+	}
+	return PublicStunConfig{
+		PeerMeshEnabled:      s.Enabled(),
+		SelfHostedStunServer: selfHosted,
+		StunServers:          servers,
+		StunTurnPort:         s.cfg.StunTurnPort,
+	}
 }
 
 func (s *Service) EnsureDevice(ctx context.Context, account store.ClientAccount, peerPublicKey string) (*store.PeerMeshDevice, error) {
@@ -1189,6 +1222,123 @@ func (s *Service) resolvePeerHost(requestHost string) string {
 		return strings.TrimSpace(host)
 	}
 	return strings.TrimSpace(requestHost)
+}
+
+func (s *Service) selfHostedStunServer(requestHost string) string {
+	host := s.resolvePeerHost(requestHost)
+	host = normalizeStunHost(host)
+	if host == "" || s.cfg.StunTurnPort <= 0 {
+		return ""
+	}
+	return "stun:" + bracketIPv6(host) + ":" + strconv.Itoa(s.cfg.StunTurnPort)
+}
+
+func (s *Service) publicStunServers() []string {
+	if s == nil || len(s.cfg.PublicStunServers) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.cfg.PublicStunServers))
+	seen := make(map[string]struct{})
+	for _, item := range s.cfg.PublicStunServers {
+		normalized := normalizeStunURL(item)
+		if normalized != "" {
+			out = appendUnique(out, seen, normalized)
+		}
+	}
+	return out
+}
+
+func normalizeStunURL(value string) string {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return ""
+	}
+	lower := strings.ToLower(normalized)
+	if strings.HasPrefix(lower, "stun://") {
+		normalized = normalized[len("stun://"):]
+	} else if strings.HasPrefix(lower, "stun:") {
+		normalized = normalized[len("stun:"):]
+	}
+	host := normalizeStunHost(normalized)
+	if host == "" {
+		return ""
+	}
+	return "stun:" + bracketIPv6(host) + ":" + strconv.Itoa(parseStunPort(normalized, 3478))
+}
+
+func normalizeStunHost(value string) string {
+	host := strings.TrimSpace(value)
+	if host == "" {
+		return ""
+	}
+	if scheme := strings.Index(host, "://"); scheme >= 0 {
+		host = host[scheme+3:]
+	}
+	if slash := strings.IndexByte(host, '/'); slash >= 0 {
+		host = host[:slash]
+	}
+	if strings.HasPrefix(host, "[") {
+		if close := strings.IndexByte(host, ']'); close > 0 {
+			return strings.TrimSpace(host[1:close])
+		}
+		return ""
+	}
+	firstColon := strings.IndexByte(host, ':')
+	lastColon := strings.LastIndexByte(host, ':')
+	if firstColon > 0 && firstColon == lastColon {
+		host = host[:firstColon]
+	}
+	return strings.TrimSpace(host)
+}
+
+func parseStunPort(value string, fallback int) int {
+	normalized := strings.TrimSpace(value)
+	if scheme := strings.Index(normalized, "://"); scheme >= 0 {
+		normalized = normalized[scheme+3:]
+	}
+	if slash := strings.IndexByte(normalized, '/'); slash >= 0 {
+		normalized = normalized[:slash]
+	}
+	if strings.HasPrefix(normalized, "[") {
+		close := strings.IndexByte(normalized, ']')
+		if close > 0 && close+2 < len(normalized) && normalized[close+1] == ':' {
+			return validStunPort(normalized[close+2:], fallback)
+		}
+		return fallback
+	}
+	firstColon := strings.IndexByte(normalized, ':')
+	lastColon := strings.LastIndexByte(normalized, ':')
+	if firstColon > 0 && firstColon == lastColon && lastColon < len(normalized)-1 {
+		return validStunPort(normalized[lastColon+1:], fallback)
+	}
+	return fallback
+}
+
+func validStunPort(value string, fallback int) int {
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || port <= 0 || port > 65535 {
+		return fallback
+	}
+	return port
+}
+
+func bracketIPv6(host string) string {
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+func appendUnique(values []string, seen map[string]struct{}, value string) []string {
+	if value == "" {
+		return values
+	}
+	key := strings.ToLower(value)
+	if _, ok := seen[key]; ok {
+		return values
+	}
+	seen[key] = struct{}{}
+	return append(values, value)
 }
 
 func (s *Service) shortToken(parts ...string) string {

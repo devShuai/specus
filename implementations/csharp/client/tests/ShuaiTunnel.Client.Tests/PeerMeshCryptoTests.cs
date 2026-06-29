@@ -5,7 +5,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
-using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.PeerMesh;
@@ -161,12 +160,12 @@ public sealed class PeerMeshCryptoTests
         var client = RelayTestClient(udp, relay);
 
         await InvokePrivateAsync(client, "RequestRelayCandidatesAsync");
-        var first = await ReadRelayMessagesAsync(relay, 2);
-        Assert.Equal("binding", JsonString(first[0], "type"));
-        Assert.Equal("allocate", JsonString(first[1], "type"));
+        var first = await ReadStunMessagesAsync(relay, 2);
+        Assert.Equal(StunMessage.BindingRequest, first[0].Type);
+        Assert.Equal(StunMessage.AllocateRequest, first[1].Type);
 
         await InvokePrivateAsync(client, "RequestRelayCandidatesAsync");
-        Assert.Empty(await ReadRelayMessagesAsync(relay, 1));
+        Assert.Empty(await ReadStunMessagesAsync(relay, 1));
     }
 
     [Fact]
@@ -176,17 +175,16 @@ public sealed class PeerMeshCryptoTests
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
         using var relay = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         var client = RelayTestClient(udp, relay);
-        SetPrivateField(client, "_relayId", "alloc-a");
+        SetPrivateField(client, "_relayId", "127.0.0.1:50001");
         SetPrivateField(client, "_relayTtl", DateTimeOffset.UtcNow.AddMinutes(2));
 
         await InvokePrivateAsync(client, "RequestRelayCandidatesAsync");
-        var first = await ReadRelayMessagesAsync(relay, 2);
-        Assert.Equal("binding", JsonString(first[0], "type"));
-        Assert.Equal("refresh", JsonString(first[1], "type"));
-        Assert.Equal("alloc-a", JsonString(first[1], "allocationId"));
+        var first = await ReadStunMessagesAsync(relay, 2);
+        Assert.Equal(StunMessage.BindingRequest, first[0].Type);
+        Assert.Equal(StunMessage.RefreshRequest, first[1].Type);
 
         await InvokePrivateAsync(client, "RequestRelayCandidatesAsync");
-        Assert.Empty(await ReadRelayMessagesAsync(relay, 1));
+        Assert.Empty(await ReadStunMessagesAsync(relay, 1));
     }
 
     [Fact]
@@ -198,38 +196,29 @@ public sealed class PeerMeshCryptoTests
         var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
         SetPrivateField(client, "_udp", udp);
         SetPrivateField(client, "_runtime", new TunnelRuntimeState { PeerMesh = new PeerMeshConfig { Cidr = "100.96.0.0/11" } });
-        var response = PeerRelayMessage(
-            probeRole: "primary",
-            alternateAddress: "127.0.0.1",
-            alternatePort: ((IPEndPoint)alternate.Client.LocalEndPoint!).Port);
+        var alternateEndpoint = new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)alternate.Client.LocalEndPoint!).Port);
 
-        await InvokePrivateAsync(client, "RequestAlternateProbeAsync", response, new IPEndPoint(IPAddress.Loopback, 3478));
-        var first = await ReadRelayMessagesAsync(alternate, 1);
-        Assert.Equal("binding", JsonString(first[0], "type"));
-        Assert.Equal("alternate", JsonString(first[0], "probeRole"));
+        await InvokePrivateAsync(client, "RequestAlternateProbeAsync", "primary", alternateEndpoint, new IPEndPoint(IPAddress.Loopback, 3478));
+        var first = await ReadStunMessagesAsync(alternate, 1);
+        Assert.Equal(StunMessage.BindingRequest, first[0].Type);
 
-        await InvokePrivateAsync(client, "RequestAlternateProbeAsync", response, new IPEndPoint(IPAddress.Loopback, 3478));
-        Assert.Empty(await ReadRelayMessagesAsync(alternate, 1));
+        await InvokePrivateAsync(client, "RequestAlternateProbeAsync", "primary", alternateEndpoint, new IPEndPoint(IPAddress.Loopback, 3478));
+        Assert.Empty(await ReadStunMessagesAsync(alternate, 1));
     }
 
     [Fact]
-    public void PeerRelayMessageCarriesObservedByEndpointLikeJava()
+    public void StunBindingResponseCarriesMappedAndOtherAddressLikeJava()
     {
-        var message = PeerRelayMessage(
-            probeRole: "primary",
-            alternateAddress: "203.0.113.10",
-            alternatePort: 3479,
-            observedByAddress: "203.0.113.20",
-            observedByPort: 3480);
-        var json = JsonSerializer.SerializeToElement(message);
+        var transactionId = StunMessage.NewTransactionId();
+        var message = StunMessage.Of(
+            StunMessage.BindingSuccess,
+            transactionId,
+            StunMessage.XorMappedAddress(new IPEndPoint(IPAddress.Parse("203.0.113.20"), 3480), transactionId),
+            StunMessage.OtherAddress(new IPEndPoint(IPAddress.Parse("203.0.113.10"), 3479), transactionId));
+        var decoded = StunMessage.Parse(message.ToBytes())!;
 
-        Assert.Equal("203.0.113.20", JsonString(json, "observedByAddress"));
-        Assert.Equal(3480, JsonInt(json, "observedByPort"));
-
-        var type = typeof(PeerMeshClient).GetNestedType("PeerRelayMessage", BindingFlags.NonPublic)!;
-        var decoded = JsonSerializer.Deserialize(json.GetRawText(), type)!;
-        Assert.Equal("203.0.113.20", type.GetProperty("ObservedByAddress")!.GetValue(decoded));
-        Assert.Equal(3480, type.GetProperty("ObservedByPort")!.GetValue(decoded));
+        Assert.Equal(new IPEndPoint(IPAddress.Parse("203.0.113.20"), 3480), decoded.XorMappedAddress());
+        Assert.Equal(new IPEndPoint(IPAddress.Parse("203.0.113.10"), 3479), decoded.OtherAddress());
     }
 
     [Fact]
@@ -240,13 +229,15 @@ public sealed class PeerMeshCryptoTests
         using var direct = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         using var relay = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         var client = RelayTestClient(udp, relay);
-        SetPrivateField(client, "_relayId", "alloc-local");
+        SetPrivateField(client, "_relayId", "127.0.0.1:50001");
+        SetPrivateField(client, "_relayTtl", DateTimeOffset.UtcNow.AddMinutes(2));
+        var peerRelay = $"127.0.0.1:{((IPEndPoint)relay.Client.LocalEndPoint!).Port + 1}";
         var session = NewPeerMeshSession(
             id: 1001,
             peerId: 2,
             token: "token",
             remote: (IPEndPoint)direct.Client.LocalEndPoint!,
-            relayTargetAllocationId: "alloc-peer",
+            relayTargetAllocationId: peerRelay,
             pathType: "DIRECT",
             lastDirectSuccess: DateTimeOffset.UtcNow);
         PrivateField<IDictionary>(client, "_sessions").Add(2L, session);
@@ -254,10 +245,12 @@ public sealed class PeerMeshCryptoTests
         var sent = await InvokePrivateAsync<bool>(client, "SendEncryptedPayloadAsync", 2L, "payload"u8.ToArray());
 
         Assert.True(sent);
-        var relayMessages = await ReadRelayMessagesAsync(relay, 1);
-        Assert.Single(relayMessages);
-        Assert.Equal("send", JsonString(relayMessages[0], "type"));
-        Assert.Equal("alloc-peer", JsonString(relayMessages[0], "toAllocationId"));
+        var relayMessages = await ReadStunMessagesAsync(relay, 2);
+        Assert.Equal(2, relayMessages.Count);
+        Assert.Equal(StunMessage.CreatePermissionRequest, relayMessages[0].Type);
+        Assert.Equal(ParseEndpoint(peerRelay), relayMessages[0].XorPeerAddress());
+        Assert.Equal(StunMessage.SendIndication, relayMessages[1].Type);
+        Assert.Equal(ParseEndpoint(peerRelay), relayMessages[1].XorPeerAddress());
         Assert.Empty(await ReadUdpPayloadsAsync(direct, 1));
     }
 
@@ -394,34 +387,20 @@ public sealed class PeerMeshCryptoTests
         return client;
     }
 
-    private static object PeerRelayMessage(
-        string? probeRole = null,
-        string? alternateAddress = null,
-        int alternatePort = 0,
-        string? observedByAddress = null,
-        int observedByPort = 0)
+    private static async Task<List<StunMessage>> ReadStunMessagesAsync(UdpClient socket, int max)
     {
-        var type = typeof(PeerMeshClient).GetNestedType("PeerRelayMessage", BindingFlags.NonPublic)!;
-        var message = Activator.CreateInstance(type)!;
-        type.GetProperty("ProbeRole")!.SetValue(message, probeRole);
-        type.GetProperty("AlternateAddress")!.SetValue(message, alternateAddress);
-        type.GetProperty("AlternatePort")!.SetValue(message, alternatePort);
-        type.GetProperty("ObservedByAddress")!.SetValue(message, observedByAddress);
-        type.GetProperty("ObservedByPort")!.SetValue(message, observedByPort);
-        return message;
-    }
-
-    private static async Task<List<JsonElement>> ReadRelayMessagesAsync(UdpClient socket, int max)
-    {
-        var messages = new List<JsonElement>();
+        var messages = new List<StunMessage>();
         for (var i = 0; i < max; i++)
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
             try
             {
                 var result = await socket.ReceiveAsync(cts.Token);
-                using var document = JsonDocument.Parse(result.Buffer);
-                messages.Add(document.RootElement.Clone());
+                var message = StunMessage.Parse(result.Buffer);
+                if (message is not null)
+                {
+                    messages.Add(message);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -450,11 +429,12 @@ public sealed class PeerMeshCryptoTests
         return messages;
     }
 
-    private static string? JsonString(JsonElement element, string name) =>
-        element.TryGetProperty(name, out var value) ? value.GetString() : null;
-
-    private static int? JsonInt(JsonElement element, string name) =>
-        element.TryGetProperty(name, out var value) ? value.GetInt32() : null;
+    private static IPEndPoint ParseEndpoint(string value)
+    {
+        var index = value.LastIndexOf(':');
+        Assert.True(index > 0);
+        return new IPEndPoint(IPAddress.Parse(value[..index]), int.Parse(value[(index + 1)..], CultureInfo.InvariantCulture));
+    }
 
     private static byte[] MinimalTcpPacket(string source, ushort sourcePort, string target, ushort targetPort)
     {

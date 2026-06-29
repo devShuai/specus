@@ -125,9 +125,11 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		WriteBufferHighMark: cfg.Netty.WriteBufferHighWaterMark,
 	}
 	detailOptions := store.TrafficDetailOptions{
-		Enabled:      cfg.Traffic.CaptureDetailEnabled,
-		PreviewBytes: cfg.Traffic.CapturePreviewBytes,
-		HeaderChars:  cfg.Traffic.CaptureHeaderChars,
+		Enabled:        cfg.Traffic.CaptureDetailEnabled,
+		PreviewBytes:   cfg.Traffic.CapturePreviewBytes,
+		HeaderChars:    cfg.Traffic.CaptureHeaderChars,
+		DecodeMaxBytes: cfg.Traffic.CaptureDecodeMaxBytes,
+		SampleRate:     cfg.Traffic.CaptureSampleRate,
 	}
 	coordinator := nat.NewCoordinator(remotePorts, traffic, db, detailOptions, limits, logger)
 	natControl := nat.NewControlService(db, sessions, cfg.Netty.Port, cfg.PublicAddress)

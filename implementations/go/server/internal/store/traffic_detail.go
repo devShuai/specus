@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -25,14 +26,17 @@ const (
 	TCPDirectionClientToPublic = "CLIENT_TO_PUBLIC"
 	defaultPreviewBytes        = 256
 	defaultHeaderChars         = 8192
+	defaultDecodeMaxBytes      = 1024 * 1024
 	detailCaptureDecisionTTL   = 2 * time.Second
 )
 
 // TrafficDetailOptions controls the optional detailed traffic capture path.
 type TrafficDetailOptions struct {
-	Enabled      bool
-	PreviewBytes int
-	HeaderChars  int
+	Enabled        bool
+	PreviewBytes   int
+	HeaderChars    int
+	DecodeMaxBytes int
+	SampleRate     float64
 }
 
 type detailCaptureDecision struct {
@@ -70,6 +74,10 @@ type TCPFrameRecord struct {
 	DestinationPort    *int
 	Payload            []byte
 	Options            TrafficDetailOptions
+	StreamOffset       int64
+	StreamEndOffset    int64
+	FrameIndex         int64
+	HasStreamPosition  bool
 }
 
 // HTTPExchangeFilter narrows the paged HTTP detail query.
@@ -221,8 +229,8 @@ func (db *DB) persistHTTPExchange(ctx context.Context, record HTTPExchangeRecord
 	resourceID, resourceName := db.httpResource(ctx, account, route)
 	requestContentType := headerValue(record.RequestHeaders, "content-type")
 	responseContentType := headerValue(record.ResponseHeaders, "content-type")
-	requestText := bodyPreviewText(record.RequestBody, requestContentType, headerValue(record.RequestHeaders, "content-encoding"))
-	responseText := bodyPreviewText(record.ResponseBody, responseContentType, headerValue(record.ResponseHeaders, "content-encoding"))
+	requestPreview := bodyPreview(record.RequestBody, requestContentType, headerValue(record.RequestHeaders, "content-encoding"), decodeMaxBytes(record.Options))
+	responsePreview := bodyPreview(record.ResponseBody, responseContentType, headerValue(record.ResponseHeaders, "content-encoding"), decodeMaxBytes(record.Options))
 	startedAt := record.StartedAt
 	if startedAt.IsZero() {
 		startedAt = time.Now()
@@ -249,8 +257,10 @@ func (db *DB) persistHTTPExchange(ctx context.Context, record HTTPExchangeRecord
 		ResponseBodyType:    classifyHTTPBody(responseContentType, len(record.ResponseBody)),
 		RequestHeaders:      capString(joinHeaders(record.RequestHeaders), headerChars(record.Options)),
 		ResponseHeaders:     capString(joinHeaders(record.ResponseHeaders), headerChars(record.Options)),
-		RequestPreviewText:  requestText,
-		ResponsePreviewText: responseText,
+		RequestPreviewText:  requestPreview.text,
+		ResponsePreviewText: responsePreview.text,
+		RequestTruncated:    requestPreview.truncated,
+		ResponseTruncated:   responsePreview.truncated,
 		CapturedAt:          time.Now(),
 	}
 	return db.InsertHTTPExchange(ctx, exchange)
@@ -268,6 +278,15 @@ func (db *DB) RecordTCPFrame(ctx context.Context, record TCPFrameRecord) error {
 	if err != nil || !enabled {
 		return err
 	}
+	offset, endOffset, frameIndex := db.nextTCPFramePosition(record.ClientName, record.ListenPort,
+		record.ChannelID, record.Direction, int64(len(record.Payload)))
+	if frameIndex > 0 && !sampleAllowed(record.Options.SampleRate) {
+		return nil
+	}
+	record.StreamOffset = offset
+	record.StreamEndOffset = endOffset
+	record.FrameIndex = frameIndex
+	record.HasStreamPosition = true
 	db.enqueueTCPFrame(record)
 	return nil
 }
@@ -278,7 +297,11 @@ func (db *DB) persistTCPFrame(ctx context.Context, record TCPFrameRecord) error 
 		return err
 	}
 	resourceID, resourceName := db.tcpResource(ctx, account, record.ListenPort)
-	offset, endOffset, frameIndex := db.nextTCPFramePosition(record.ClientName, record.ListenPort, record.ChannelID, record.Direction, int64(len(record.Payload)))
+	offset, endOffset, frameIndex := record.StreamOffset, record.StreamEndOffset, record.FrameIndex
+	if !record.HasStreamPosition {
+		offset, endOffset, frameIndex = db.nextTCPFramePosition(record.ClientName, record.ListenPort,
+			record.ChannelID, record.Direction, int64(len(record.Payload)))
+	}
 	previewHex, previewText, truncated := tcpPreview(record.Payload, previewBytes(record.Options))
 	frame := TCPTrafficFrame{
 		TenantID:           defaultTenant(account.TenantID),
@@ -897,41 +920,57 @@ func normalizeTrafficPage(size, page int) (int, int) {
 	return size, page
 }
 
-func bodyPreviewText(data []byte, contentType, contentEncoding string) string {
-	if len(data) == 0 {
-		return ""
-	}
-	displayData := decodeBody(data, contentEncoding)
-	if !isTextBody(contentType) && !looksLikeText(displayData) {
-		mediaType := contentMediaType(contentType)
-		return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(displayData)
-	}
-	return sanitizeText(string(displayData))
+type bodyPreviewResult struct {
+	text      string
+	truncated bool
 }
 
-func decodeBody(data []byte, contentEncoding string) []byte {
+func bodyPreview(data []byte, contentType, contentEncoding string, maxBytes int) bodyPreviewResult {
+	if len(data) == 0 {
+		return bodyPreviewResult{}
+	}
+	displayData, truncated := decodeBody(data, contentEncoding, maxBytes)
+	if !isTextBody(contentType) && !looksLikeText(displayData) {
+		mediaType := contentMediaType(contentType)
+		return bodyPreviewResult{
+			text:      "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(displayData),
+			truncated: truncated,
+		}
+	}
+	return bodyPreviewResult{text: sanitizeText(string(displayData)), truncated: truncated}
+}
+
+func decodeBody(data []byte, contentEncoding string, maxBytes int) ([]byte, bool) {
 	tokens := strings.Split(contentEncoding, ",")
 	current := data
 	decoded := false
+	truncated := false
 	for i := len(tokens) - 1; i >= 0; i-- {
 		token := strings.ToLower(strings.TrimSpace(tokens[i]))
 		if token == "" || token == "identity" {
 			continue
 		}
-		next, ok := decodeOne(current, token)
+		next, itemTruncated, ok := decodeOne(current, token, maxBytes)
 		if !ok {
 			if decoded {
-				return current
+				return current, truncated
 			}
-			return data
+			return data, false
 		}
 		current = next
+		truncated = truncated || itemTruncated
 		decoded = true
+		if truncated {
+			return current, true
+		}
 	}
-	return current
+	if !decoded && len(current) > maxBytes && maxBytes > 0 {
+		return append([]byte(nil), current[:maxBytes]...), true
+	}
+	return current, truncated
 }
 
-func decodeOne(data []byte, token string) ([]byte, bool) {
+func decodeOne(data []byte, token string, maxBytes int) ([]byte, bool, bool) {
 	var reader io.ReadCloser
 	var err error
 	switch token {
@@ -946,14 +985,14 @@ func decodeOne(data []byte, token string) ([]byte, bool) {
 	case "br":
 		reader = io.NopCloser(brotli.NewReader(bytes.NewReader(data)))
 	default:
-		return nil, false
+		return nil, false, false
 	}
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	defer reader.Close()
-	out, err := io.ReadAll(reader)
-	return out, err == nil
+	out, truncated, err := readLimited(reader, maxBytes)
+	return out, truncated, err == nil
 }
 
 func tcpPreview(data []byte, maxBytes int) (string, string, bool) {
@@ -1171,6 +1210,45 @@ func headerChars(options TrafficDetailOptions) int {
 		return defaultHeaderChars
 	}
 	return options.HeaderChars
+}
+
+func decodeMaxBytes(options TrafficDetailOptions) int {
+	if options.DecodeMaxBytes < 1024 {
+		return defaultDecodeMaxBytes
+	}
+	return options.DecodeMaxBytes
+}
+
+func sampleAllowed(rate float64) bool {
+	if rate >= 1 {
+		return true
+	}
+	if rate <= 0 {
+		return false
+	}
+	return rand.Float64() < rate
+}
+
+func readLimited(reader io.Reader, maxBytes int) ([]byte, bool, error) {
+	if maxBytes < 1024 {
+		maxBytes = defaultDecodeMaxBytes
+	}
+	var out bytes.Buffer
+	if maxBytes < 8192 {
+		out.Grow(maxBytes)
+	} else {
+		out.Grow(8192)
+	}
+	limited := io.LimitReader(reader, int64(maxBytes)+1)
+	_, err := out.ReadFrom(limited)
+	if err != nil {
+		return nil, false, err
+	}
+	data := out.Bytes()
+	if len(data) > maxBytes {
+		return append([]byte(nil), data[:maxBytes]...), true, nil
+	}
+	return append([]byte(nil), data...), false, nil
 }
 
 func maxInt64(a, b int64) int64 {

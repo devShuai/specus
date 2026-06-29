@@ -33,6 +33,50 @@ func newHTTPTestServer(t *testing.T, app *App) (*App, *httptest.Server) {
 	return app, ts
 }
 
+func TestPublicPeerMeshStunConfigMatchesJavaShape(t *testing.T) {
+	cfg := config.Default()
+	cfg.PeerMesh.Enabled = true
+	cfg.PeerMesh.PublicAddress = "tunnel.example.com"
+	cfg.PeerMesh.StunTurnPort = 3478
+	cfg.PeerMesh.PublicStunServers = []string{
+		"stun://stun1.example.com",
+		"stun:stun2.example.com:5349",
+		"stun1.example.com:3478",
+	}
+	_, ts := newAPIServerWithConfig(t, cfg)
+
+	resp, err := http.Get(ts.URL + "/api/public/peer-mesh/stun-config")
+	if err != nil {
+		t.Fatalf("get stun config: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var decoded struct {
+		PeerMeshEnabled      bool     `json:"peerMeshEnabled"`
+		SelfHostedStunServer string   `json:"selfHostedStunServer"`
+		StunServers          []string `json:"stunServers"`
+		StunTurnPort         int      `json:"stunTurnPort"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode stun config: %v", err)
+	}
+	if !decoded.PeerMeshEnabled {
+		t.Fatalf("peerMeshEnabled = false, want true")
+	}
+	if decoded.SelfHostedStunServer != "stun:tunnel.example.com:3478" {
+		t.Fatalf("selfHosted = %q", decoded.SelfHostedStunServer)
+	}
+	want := []string{"stun:tunnel.example.com:3478", "stun:stun1.example.com:3478", "stun:stun2.example.com:5349"}
+	if strings.Join(decoded.StunServers, ",") != strings.Join(want, ",") {
+		t.Fatalf("stunServers = %#v, want %#v", decoded.StunServers, want)
+	}
+	if decoded.StunTurnPort != 3478 {
+		t.Fatalf("stunTurnPort = %d", decoded.StunTurnPort)
+	}
+}
+
 func adminToken(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
 	return loginToken(t, ts, "admin", "admin")
