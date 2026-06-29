@@ -1,8 +1,8 @@
 # shuai-tunnel
 
-`shuai-tunnel` 是一个以内网服务接入为核心的多语言实验项目。Java 版本是当前参考实现；Go、C#、C 版本按同一协议逐步对齐。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；实验性 Peer Mesh 还可以让同一用户下的多个客户端通过虚拟 IP 互访。
+`shuai-tunnel` 是一个以内网服务接入和私有组网为核心的多语言项目。Java 版本是当前基准实现；Go、C#、C 版本按同一协议对齐。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；Peer Mesh 让同一用户下的多个客户端通过虚拟 IP 互访，数据面优先走 UDP direct，失败时回退到服务端标准 TURN relay。
 
-> 当前仓库适合用于学习和继续开发，不建议直接用于生产环境。现有功能和待完善项详见[当前状态](#当前状态)。
+> 当前 README 按 Java 基准实现维护；其它语言实现的覆盖范围见[当前状态](#当前状态)。
 
 ## 工作原理
 
@@ -16,7 +16,7 @@ flowchart TD
     L -->|访问内网地址和端口| S[本地 TCP 服务]
     H[HTTP 访问者] -->|访问 /http/client/route/path| W[HttpTunnelController]
     W <-->|通过 7010 控制连接直转 HTTP| C
-    PM[PeerSignalService + STUN/TURN-lite]
+    PM[PeerSignalService + 标准 STUN/TURN]
     A[客户端 A shuai0] <-->|Peer Mesh UDP direct / relay| B[客户端 B shuai0]
     A -.->|PEER_CONTROL / UDP probe| PM
     B -.->|PEER_CONTROL / UDP probe| PM
@@ -30,7 +30,7 @@ flowchart TD
 4. 服务端向客户端发送 `NAT_CONTROL` 消息后，客户端动态添加 `NatClientHandler` 并注册端口映射。
 5. 服务端为每个公网映射端口创建一个 `TcpServer`。
 6. 公网请求到达映射端口后，数据经控制连接转发至客户端，再由客户端连接目标内网服务。
-7. 开启 Peer Mesh 时，服务端通过 `PEER_CONTROL` 做设备列表、候选地址和 session 授权，客户端之间的数据面走加密 UDP direct，失败时回退到 server relay。
+7. 开启 Peer Mesh 时，服务端通过 `PEER_CONTROL` 做设备列表、候选地址和 session 授权，客户端之间的数据面走加密 UDP direct，失败时回退到标准 TURN relay。
 
 ## 模块结构
 
@@ -47,7 +47,7 @@ flowchart TD
 | `implementations/csharp/protocol` | .NET 协议库，server/client 共同 ProjectReference 复用 |
 | `implementations/csharp/server` | .NET 服务端移植(EF Core,多库) |
 | `implementations/csharp/client` | .NET 内网客户端，与 Java/Go 客户端字节兼容 |
-| `implementations/c/server` | C 服务端移植(实验性) |
+| `implementations/c/server` | C 服务端轻量移植 |
 
 主要入口：
 
@@ -193,7 +193,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | [control-protocol.md](protocol/spec/control-protocol.md) | 控制连接帧、`Command`、`MessageType`、`NAT_CONTROL` 和 `NAT_MESSAGE` |
 | [client-auth.md](protocol/spec/client-auth.md) | 客户端 HTTP 登录、apiKey/secret 签名、运行时 token 和刷新 |
 | [http-route.md](protocol/spec/http-route.md) | HTTP route、WebSocket 隧道、Header 规则、路径改写和观测字段 |
-| [peer-mesh.md](protocol/spec/peer-mesh.md) | 私有组网、虚拟 IP、STUN/TURN-lite、加密数据帧和管理面 |
+| [peer-mesh.md](protocol/spec/peer-mesh.md) | 私有组网、虚拟 IP、标准 STUN/TURN、加密数据帧和管理面 |
 
 控制连接使用自定义二进制协议：
 
@@ -292,7 +292,9 @@ curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 
 ## 私有组网（Peer Mesh）
 
-Peer Mesh 是当前 Java 实现中的实验性能力，默认关闭。开启后，同一租户和同一用户下的客户端会被分配 `100.96.0.0/11` 内的虚拟 IP，并通过 `shuai0` 这类虚拟网卡互访。控制面仍走现有 Netty 连接，服务端通过 `PEER_CONTROL` 下发设备列表、候选地址、session 授权和启停状态；数据面优先走客户端之间的 UDP direct，失败时回退到服务端内置 TURN-lite relay。
+Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端会被分配 `100.96.0.0/11` 内的虚拟 IP，并通过 `shuai0` 这类虚拟网卡互访。控制面仍走现有 Netty 连接，服务端通过 `PEER_CONTROL` 下发设备列表、候选地址、session 授权和启停状态；数据面优先走客户端之间的加密 UDP direct，direct 失效或不可达时回退到服务端标准 TURN relay。服务端 relay 只校验会话授权和 frame 头，不解密业务 IP 包明文。
+
+当前实现同时使用自建 STUN/TURN 和可配置公共 STUN。客户端登录后会拿到 `stunHost/stunPort`、`turnHost/turnPort`、公共 STUN 列表和 ICE 凭证；自建 STUN/TURN 负责 NAT 探测、候选交换和 relay，公共 STUN 只用于补充 server-reflexive 候选地址，不提供 relay。客户端会保存多个公网映射观测值，按端口变化做自适应预测，并在 direct path 过期后主动触发重新探测和 relay fallback。
 
 服务端相关配置：
 
@@ -300,13 +302,23 @@ Peer Mesh 是当前 Java 实现中的实验性能力，默认关闭。开启后�
 | --- | --- | --- | --- |
 | `tunnel.peer-mesh.enabled` | `TUNNEL_PEER_MESH_ENABLED` | `false` | 是否启用 Peer Mesh |
 | `tunnel.peer-mesh.cidr` | `TUNNEL_PEER_MESH_CIDR` | `100.96.0.0/11` | 虚拟网段 |
-| `tunnel.peer-mesh.public-address` | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | （空） | 对客户端公布的 STUN/TURN-lite 地址；为空时回退请求域名 |
-| `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | STUN/TURN-lite UDP 端口 |
-| `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `0` | NAT 探测备用 UDP 端口；`0` 表示使用主端口 + 1 |
+| `tunnel.peer-mesh.public-address` | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | （空） | 对客户端公布的 STUN/TURN 地址；为空时回退登录请求域名 |
+| `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | 标准 STUN/TURN UDP 主端口 |
+| `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `3479` | NAT 探测备用 UDP 端口，用于更准确地区分端口映射行为 |
+| `tunnel.peer-mesh.public-stun-servers` | `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | （空） | 额外公共 STUN 服务器，多个地址用英文逗号分隔，支持 `host:port` / `stun:host:port` |
 | `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
 | `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation TTL |
+| `tunnel.peer-mesh.relay-min-port` | `TUNNEL_PEER_MESH_RELAY_MIN_PORT` | `49152` | TURN relay 分配端口范围下限 |
+| `tunnel.peer-mesh.relay-max-port` | `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | `65535` | TURN relay 分配端口范围上限 |
+| `tunnel.peer-mesh.relay-worker-threads` | `TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` | `0` | relay 数据帧工作线程数，`0` 表示按 CPU 自动选择 |
+| `tunnel.peer-mesh.relay-worker-queue-capacity` | `TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | `10000` | relay 工作队列上限，队列满时丢弃新的 relay 数据帧以保护服务端 |
+| `tunnel.peer-mesh.relay-traffic-flush-interval-ms` | `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` | `5000` | relay 流量聚合入库间隔 |
+
+公网安全组 / 防火墙需要放行 `3478/udp`、`3479/udp` 和 relay 分配端口范围（默认 `49152-65535/udp`）。如果不希望开放完整高端口范围，可以把 `relay-min-port` / `relay-max-port` 收窄到可控区间，并同步开放该区间。
 
 客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；Go / .NET 客户端还支持 `utun` / `macos-utun` / `darwin-utun` 以接入 macOS utun；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
+
+管理后台的「私有组网」页面展示设备虚拟 IP、在线状态、虚拟网卡状态、NAT 类型、候选 Endpoint、链路和活跃会话，并支持启停设备、配置 ACL、分页查看会话、清理活跃会话和链路。公开的浏览器 NAT 检测页会调用 `/api/public/peer-mesh/stun-config` 获取自建 STUN，再结合配置的公共 STUN 进行 WebRTC 探测。
 
 ## 控制连接 TLS
 
@@ -432,7 +444,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - 控制连接断开后的指数退避重连
 - TCP 公网端口监听和双向数据转发
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
-- 实验性 Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun / macOS utun、同用户默认互通、`PEER_CONTROL` 信令、UDP direct、server relay、NAT 类型探测、链路和会话展示
+- Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun / macOS utun、同用户默认互通、`PEER_CONTROL` 信令、标准 STUN/TURN、公共 STUN 候选补充、UDP direct、server relay、NAT 类型探测、链路和会话展示
 - 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
 - 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
 - Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled` 管理字段以及 HTTP 路由的 `pathRewriteEnabled` 配置和回包路径改写行为
@@ -440,13 +452,13 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；C server 只保留轻量兼容面
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
-需要继续完善：
+实现边界：
 
 - 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
-- Peer Mesh 的 Go/.NET 数据面仍需要真实 Windows/Linux/macOS 双机环境继续做 ping、HTTP 和 relay fallback 手工验收；C server 仍是 smoke-test 级移植，不具备完整管理面、OIDC、完整 Direct HTTP 观测和 Peer Mesh 数据面。
+- Peer Mesh 的 Go/.NET 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 保留轻量兼容面，不包含完整管理面、OIDC、完整 Direct HTTP 观测和 Peer Mesh 数据面。
 - Java 客户端入口尚未默认开启控制连接 TLS，启用需自行调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
 
-## 开发建议
+## 开发入口
 
-服务端下发 `NAT_CONTROL` 的管理接口已实现（见[下发端口映射](#3-下发端口映射)），客户端启动登录已升级为基于 apiKey/secret 的 HMAC-SHA256（secret 明文不上线）。后续可优先：让 Java/Go 客户端默认支持控制连接 TLS 并提供配置开关，补齐真实 MySQL/PostgreSQL 与端到端隧道的自动化测试，继续完善 Peer Mesh 的稳定性与跨语言实现，并实现公网 UDP 端口映射。
+服务端下发 `NAT_CONTROL` 的管理接口见[下发端口映射](#3-下发端口映射)，客户端启动登录使用基于 apiKey/secret 的 HMAC-SHA256（secret 明文不上线）。协议字段和跨语言实现入口优先查看 [protocol/spec](protocol/spec/README.md)；Java 基准实现的服务端、客户端和公共协议分别位于 `implementations/java/server`、`implementations/java/client` 和 `implementations/java/common`。

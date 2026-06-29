@@ -103,6 +103,7 @@ public class PeerMeshService {
         config.setClientName(account.getClientName());
         config.setCidr(properties.getCidr());
         config.setSessionTtlSeconds(properties.getSessionTtlSeconds());
+        config.setPublicStunServers(publicStunServers());
         if (!properties.isEnabled() || device == null) {
             return config;
         }
@@ -713,6 +714,18 @@ public class PeerMeshService {
             return properties.getPublicAddress().trim();
         }
         return StringUtils.hasText(requestServerName) ? requestServerName.trim() : "";
+    }
+
+    private List<String> publicStunServers() {
+        if (properties.getPublicStunServers() == null || properties.getPublicStunServers().isEmpty()) {
+            return List.of();
+        }
+        return properties.getPublicStunServers().stream()
+                .filter(StringUtils::hasText)
+                .map(String::trim)
+                .distinct()
+                .limit(16)
+                .toList();
     }
 
     private PeerMeshSession findReportableSession(ClientAccount reporter, long sessionId) {

@@ -4,10 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.peermesh.PeerCandidate;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerCrypto;
-import com.theshuai.common.peermesh.PeerRelayBinaryFrame;
 import com.theshuai.common.peermesh.PeerRelayMessage;
 import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
+import com.theshuai.common.stun.StunMessage;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelclient.peer.portmap.NatPortMapping;
 import com.theshuai.tunnelclient.peer.portmap.NatPortMappingService;
@@ -25,13 +25,11 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.Enumeration;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -49,6 +47,9 @@ public class PeerMeshClient implements AutoCloseable {
     private final Map<String, Long> packetTraceLogMillis = new ConcurrentHashMap<>();
     private final Map<Long, List<PendingVirtualPacket>> pendingVirtualPackets = new ConcurrentHashMap<>();
     private final Map<Long, Long> pathPrepareMillis = new ConcurrentHashMap<>();
+    private final Map<String, String> pendingStunBindings = new ConcurrentHashMap<>();
+    private final Map<String, Long> turnPermissions = new ConcurrentHashMap<>();
+    private final Map<String, SrflxObservation> srflxObservations = new ConcurrentHashMap<>();
     private final AtomicBoolean directSuppressedLogged = new AtomicBoolean(false);
     private final SecureRandom secureRandom = new SecureRandom();
     private final ControlSender controlSender;
@@ -61,6 +62,7 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile PeerVirtualDevice virtualDevice = new NoopPeerVirtualDevice();
     private volatile String virtualDeviceKey = "noop";
     private volatile PeerCandidate serverReflexiveCandidate;
+    private final Map<String, PeerCandidate> serverReflexiveCandidates = new ConcurrentHashMap<>();
     private volatile PeerCandidate relayCandidate;
     private volatile PeerCandidate portMapCandidate;
     private volatile NatPortMapping portMapping;
@@ -83,7 +85,12 @@ public class PeerMeshClient implements AutoCloseable {
     private static final int MAX_PENDING_PACKETS_PER_PEER = 32;
     private static final long ON_DEMAND_PREPARE_INTERVAL_MILLIS = 2_000;
     private static final long NAT_PROBE_STALE_MILLIS = 120_000;
+    private static final long SRFLX_OBSERVATION_TTL_MILLIS = 180_000;
     private static final long ALTERNATE_NAT_PROBE_MIN_INTERVAL_MILLIS = 15_000;
+    private static final long TURN_PERMISSION_TTL_MILLIS = 240_000;
+    private static final String PUBLIC_STUN_ROLE_PREFIX = "public-stun:";
+    private static final int MAX_ADAPTIVE_PREDICTED_PORTS = 16;
+    private static final int MAX_ADAPTIVE_PORT_DELTA = 512;
     /**
      * 端口映射重试节流：上次尝试失败后，最少等多久再试一次。失败的网关通常持续失败，
      * 30 秒退避足够避免狂刷 log 也保证用户在路由器 reboot 后能尽快重新映射。
@@ -123,7 +130,11 @@ public class PeerMeshClient implements AutoCloseable {
             packetTraceLogMillis.clear();
             pendingVirtualPackets.clear();
             pathPrepareMillis.clear();
+            pendingStunBindings.clear();
+            turnPermissions.clear();
+            srflxObservations.clear();
             serverReflexiveCandidate = null;
+            serverReflexiveCandidates.clear();
             relayCandidate = null;
             releasePortMapping();
             natType = "";
@@ -144,14 +155,14 @@ public class PeerMeshClient implements AutoCloseable {
         startMaintenance();
         requestPeerServerCandidates();
         PeerVirtualDevice activeDevice = startVirtualDevice(nextConfig);
-        log.info("Peer mesh 已启用: client={}, virtualIp={}, cidr={}, stun={}:{}, turn={}:{}",
+        log.info("Peer mesh 已启用: client={}, virtualIp={}, cidr={}, stun={}:{}, turn={}, publicStun={}",
                 nextConfig.getClientName(),
                 nextConfig.getVirtualIp(),
                 nextConfig.getCidr(),
                 nextConfig.getStunHost(),
                 nextConfig.getStunPort(),
-                nextConfig.getTurnHost(),
-                nextConfig.getTurnPort());
+                nextConfig.getTurnHost() + ":" + nextConfig.getTurnPort(),
+                nextConfig.getPublicStunServers() == null ? 0 : nextConfig.getPublicStunServers().size());
         log.info("Peer mesh UDP 探测端口: {}，虚拟网卡适配: {}",
                 udpSocket == null ? "-" : udpSocket.getLocalPort(),
                 activeDevice.name());
@@ -237,6 +248,11 @@ public class PeerMeshClient implements AutoCloseable {
         packetTraceLogMillis.clear();
         pendingVirtualPackets.clear();
         pathPrepareMillis.clear();
+        pendingStunBindings.clear();
+        turnPermissions.clear();
+        srflxObservations.clear();
+        serverReflexiveCandidate = null;
+        serverReflexiveCandidates.clear();
         // 先释放 port mapping（best-effort 通知路由器撤销），再停 socket。
         // 即使释放失败，路由器侧的 lease 也会自动过期。
         releasePortMapping();
@@ -366,26 +382,51 @@ public class PeerMeshClient implements AutoCloseable {
         mergePeer(peer, control.getCandidates());
         rememberSession(control);
 
-        // P1-6 Hairpin 检测：对端 srflx 地址与本端相同 → 同 NAT，只探 host 候选
-        PeerCandidate mySrflx = serverReflexiveCandidate;
-        if (mySrflx != null && mySrflx.getAddress() != null
-                && hasSameNatAddress(control.getCandidates(), mySrflx.getAddress())) {
+        // Hairpin 检测：双方 STUN 公网地址相同，优先 LAN host；但保留 relay，避免 CGNAT
+        // 共享出口 IP 或 NAT 不支持 hairpin 时被错误剪掉兜底路径。
+        if (hasSameNatAddress(control.getCandidates()) && hasUsableHostCandidate(control.getCandidates())) {
             control.setCandidates(control.getCandidates().stream()
-                    .filter(c -> "host".equalsIgnoreCase(c.getType()))
+                    .filter(candidate -> !isSameNatReflexiveCandidate(candidate))
                     .toList());
         }
 
         sendConnectivityChecks(control);
     }
 
-    /** 同 NAT 检测：对端 srflx/portmap 地址与本端 STUN 观测地址相同 */
-    private boolean hasSameNatAddress(List<PeerCandidate> candidates, String mySrflx) {
-        int colon = mySrflx.lastIndexOf(':');
-        if (colon <= 0) return false;
-        String myIp = mySrflx.substring(0, colon);
-        return candidates.stream().anyMatch(c ->
-                ("srflx".equalsIgnoreCase(c.getType()) || "portmap".equalsIgnoreCase(c.getType()))
-                && c.getAddress() != null && c.getAddress().equals(myIp));
+    /** 同 NAT 检测：对端 srflx/端口映射地址与本端 STUN 观测公网地址相同 */
+    private boolean hasSameNatAddress(List<PeerCandidate> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return false;
+        }
+        return candidates.stream().anyMatch(this::isSameNatReflexiveCandidate);
+    }
+
+    private boolean isSameNatReflexiveCandidate(PeerCandidate candidate) {
+        if (candidate == null || !StringUtils.hasText(candidate.getAddress()) || "relay".equalsIgnoreCase(candidate.getType())) {
+            return false;
+        }
+        boolean reflexive = "srflx".equalsIgnoreCase(candidate.getType())
+                || (StringUtils.hasText(candidate.getFoundation()) && candidate.getFoundation().startsWith("port-map-"));
+        if (!reflexive) {
+            return false;
+        }
+        String address = candidate.getAddress();
+        return serverReflexiveCandidates.values().stream()
+                .map(PeerCandidate::getAddress)
+                .filter(StringUtils::hasText)
+                .anyMatch(address::equals);
+    }
+
+    private boolean hasUsableHostCandidate(List<PeerCandidate> candidates) {
+        if (candidates == null) {
+            return false;
+        }
+        return candidates.stream().anyMatch(candidate ->
+                "host".equalsIgnoreCase(candidate.getType())
+                        && "udp".equalsIgnoreCase(candidate.getTransport())
+                        && StringUtils.hasText(candidate.getAddress())
+                        && candidate.getPort() > 0
+                        && !isRecursiveDirectCandidate(candidate));
     }
 
     private void rememberSession(PeerControlMessage control) {
@@ -549,36 +590,71 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         lastRelayCandidateRequestMillis = now;
-        PeerRelayMessage binding = new PeerRelayMessage();
-        binding.setType(PeerRelayMessage.TYPE_BINDING);
-        binding.setProbeRole(PeerRelayMessage.PROBE_PRIMARY);
-        binding.setTransactionId(UUID.randomUUID().toString());
-        sendRelayControl(binding, relayEndpoint);
+        sendStunBinding(relayEndpoint, PeerRelayMessage.PROBE_PRIMARY);
+        requestPublicStunBindings();
 
         if (relayAllocationId != null && relayAllocationExpiresAtMillis - now > 60_000) {
-            PeerRelayMessage refresh = new PeerRelayMessage();
-            refresh.setType(PeerRelayMessage.TYPE_REFRESH);
-            refresh.setTransactionId(UUID.randomUUID().toString());
-            refresh.setAllocationId(relayAllocationId);
-            sendRelayControl(refresh, relayEndpoint);
+            sendStunRequest(StunMessage.of(
+                    StunMessage.REFRESH_REQUEST,
+                    StunMessage.newTransactionId(),
+                    StunMessage.lifetime(Math.max(30, config.getSessionTtlSeconds()))), relayEndpoint);
             return;
         }
-        PeerRelayMessage allocate = new PeerRelayMessage();
-        allocate.setType(PeerRelayMessage.TYPE_ALLOCATE);
-        allocate.setTransactionId(UUID.randomUUID().toString());
-        sendRelayControl(allocate, relayEndpoint);
+        sendStunRequest(StunMessage.of(
+                StunMessage.ALLOCATE_REQUEST,
+                StunMessage.newTransactionId(),
+                StunMessage.requestedUdpTransportAttribute()), relayEndpoint);
     }
 
-    private void sendRelayControl(PeerRelayMessage message, InetSocketAddress relayEndpoint) {
+    private void sendStunBinding(InetSocketAddress endpoint, String probeRole) {
+        byte[] transactionId = StunMessage.newTransactionId();
+        pendingStunBindings.put(StunMessage.hex(transactionId), bindingProbeRole(probeRole));
+        sendStunRequest(StunMessage.of(
+                StunMessage.BINDING_REQUEST,
+                transactionId,
+                StunMessage.software("shuai-tunnel-peer-client")), endpoint);
+    }
+
+    private void requestPublicStunBindings() {
+        ClientAuthLoginResponse.PeerMeshConfig current = config;
+        if (current == null || current.getPublicStunServers() == null || current.getPublicStunServers().isEmpty()) {
+            removePublicStunCandidates();
+            return;
+        }
+        removePublicStunCandidates();
+        List<String> sent = new ArrayList<>();
+        for (String item : current.getPublicStunServers()) {
+            InetSocketAddress endpoint = parseStunServer(item);
+            if (endpoint == null) {
+                continue;
+            }
+            String key = endpoint.getHostString() + ":" + endpoint.getPort();
+            if (sent.contains(key)) {
+                continue;
+            }
+            sent.add(key);
+            sendStunBinding(endpoint, PUBLIC_STUN_ROLE_PREFIX + key);
+        }
+    }
+
+    private void removePublicStunCandidates() {
+        serverReflexiveCandidates.entrySet().removeIf(entry -> {
+            PeerCandidate candidate = entry.getValue();
+            return candidate != null && "public-stun".equalsIgnoreCase(candidate.getFoundation());
+        });
+    }
+
+    private void sendStunRequest(StunMessage message, InetSocketAddress relayEndpoint) {
         DatagramSocket socket = udpSocket;
         if (socket == null || socket.isClosed() || relayEndpoint == null) {
             return;
         }
         try {
-            byte[] bytes = JsonUtil.objectToString(message).getBytes(StandardCharsets.UTF_8);
+            byte[] bytes = message.toBytes();
             socket.send(new DatagramPacket(bytes, bytes.length, relayEndpoint));
         } catch (Exception e) {
-            log.debug("Peer mesh relay control 发送失败: type={}, reason={}", message.getType(), e.getMessage());
+            log.debug("Peer mesh STUN/TURN request 发送失败: type=0x{}, reason={}",
+                    Integer.toHexString(message.type()), e.getMessage());
         }
     }
 
@@ -637,9 +713,8 @@ public class PeerMeshClient implements AutoCloseable {
                 log.warn("Peer mesh host candidate 枚举失败: {}", e.getMessage());
             }
         }
-        PeerCandidate srflx = serverReflexiveCandidate;
-        if (srflx != null && !directDisabled) {
-            candidates.add(srflx);
+        if (!directDisabled) {
+            candidates.addAll(serverReflexiveCandidates.values());
         }
         // 端口映射 candidate 不受 NAT 类型限制——UPnP/NAT-PMP/PCP 在路由器上建立了显式映射，
         // 对端 UDP 包能直接被路由器转发到我们，跳过整套 NAT 行为约束。即使本地是 Symmetric
@@ -669,21 +744,16 @@ public class PeerMeshClient implements AutoCloseable {
                 continue;
             }
             sendUdpProbe(session, candidate);
-            // P1-3 对称 NAT 端口预测：向候选端口 ±PREDICTED_PORT_RANGE 范围额外发探针
-            if (!"relay".equalsIgnoreCase(candidate.getType())) {
-                int basePort = candidate.getPort();
-                for (int d = 1; d <= PREDICTED_PORT_RANGE; d++) {
-                    PeerCandidate above = new PeerCandidate();
-                    above.setAddress(candidate.getAddress());
-                    above.setPort(basePort + d);
-                    above.setTransport("udp");
-                    sendUdpProbe(session, above);
-                    PeerCandidate below = new PeerCandidate();
-                    below.setAddress(candidate.getAddress());
-                    below.setPort(basePort - d);
-                    below.setTransport("udp");
-                    sendUdpProbe(session, below);
-                }
+            // 对称 NAT 端口预测：根据多 STUN srflx 观测到的端口变化自适应补探，
+            // 不再固定扫描 ±8，避免无观测依据时制造额外 UDP 噪声。
+            for (Integer predictedPort : adaptivePredictedPorts(candidate, control.getCandidates())) {
+                PeerCandidate predicted = new PeerCandidate();
+                predicted.setType(candidate.getType());
+                predicted.setAddress(candidate.getAddress());
+                predicted.setPort(predictedPort);
+                predicted.setTransport("udp");
+                predicted.setFoundation("adaptive-port-predict");
+                sendUdpProbe(session, predicted);
             }
         }
     }
@@ -698,9 +768,6 @@ public class PeerMeshClient implements AutoCloseable {
      */
     private static final int PROBE_BURST_COUNT = 3;
     private static final long PROBE_BURST_INTERVAL_MILLIS = 30;
-    /** P1-3 对称 NAT 端口预测：除候选字面端口外，扫描 ±RANGE 范围 */
-    private static final int PREDICTED_PORT_RANGE = 8;
-
     /**
      * S0.4 Direct keepalive 间隔。每个 ACTIVE DIRECT 会话至少 {@code KEEPALIVE_INTERVAL_MILLIS}
      * 毫秒发一次小包探测，用来在中国宽带 NAT 30~60 秒 mapping TTL 内保活。
@@ -728,16 +795,21 @@ public class PeerMeshClient implements AutoCloseable {
         byte[] bytes = JsonUtil.objectToString(probe).getBytes(StandardCharsets.UTF_8);
         InetSocketAddress remote = new InetSocketAddress(candidate.getAddress(), candidate.getPort());
         boolean relay = "relay".equalsIgnoreCase(candidate.getType());
+        String relayTarget = relay ? candidate.getRelayId() : "";
         pendingProbes.put(nonce, new PendingProbe(
                 session.sessionId(),
                 session.peerId(),
                 System.currentTimeMillis(),
                 remote,
                 relay,
-                candidate.getRelayId()));
+                relayTarget));
         try {
             if (relay) {
-                if (!sendRelayPayload(candidate.getRelayId(), bytes)) {
+                if (!StringUtils.hasText(relayTarget)) {
+                    pendingProbes.remove(nonce);
+                    return;
+                }
+                if (!sendRelayPayload(relayTarget, bytes)) {
                     pendingProbes.remove(nonce);
                     return;
                 }
@@ -753,6 +825,84 @@ public class PeerMeshClient implements AutoCloseable {
             pendingProbes.remove(nonce);
             log.debug("Peer mesh UDP check 发送失败: remote={}, reason={}", remote, e.getMessage());
         }
+    }
+
+    private List<Integer> adaptivePredictedPorts(PeerCandidate candidate, List<PeerCandidate> allCandidates) {
+        if (candidate == null
+                || "relay".equalsIgnoreCase(candidate.getType())
+                || candidate.getPort() <= 0
+                || !StringUtils.hasText(candidate.getAddress())) {
+            return List.of();
+        }
+        List<Integer> deltas = adaptivePortDeltas(candidate, allCandidates);
+        if (deltas.isEmpty()) {
+            deltas = localSrflxPortDeltas();
+        }
+        if (deltas.isEmpty()) {
+            return List.of();
+        }
+        List<Integer> ports = new ArrayList<>();
+        for (Integer delta : deltas) {
+            if (delta == null || delta <= 0 || delta > MAX_ADAPTIVE_PORT_DELTA) {
+                continue;
+            }
+            addPredictedPort(ports, candidate.getPort() + delta, candidate.getPort());
+            addPredictedPort(ports, candidate.getPort() - delta, candidate.getPort());
+            if (ports.size() >= MAX_ADAPTIVE_PREDICTED_PORTS) {
+                break;
+            }
+        }
+        return ports;
+    }
+
+    private List<Integer> adaptivePortDeltas(PeerCandidate candidate, List<PeerCandidate> allCandidates) {
+        if (allCandidates == null || allCandidates.isEmpty()) {
+            return List.of();
+        }
+        List<Integer> ports = allCandidates.stream()
+                .filter(item -> item != null)
+                .filter(item -> !"relay".equalsIgnoreCase(item.getType()))
+                .filter(item -> StringUtils.hasText(item.getAddress()) && item.getAddress().equals(candidate.getAddress()))
+                .map(PeerCandidate::getPort)
+                .filter(port -> port != null && port > 0 && port <= 65_535)
+                .distinct()
+                .sorted()
+                .toList();
+        return deltasFromPorts(ports);
+    }
+
+    private List<Integer> localSrflxPortDeltas() {
+        long now = System.currentTimeMillis();
+        pruneSrflxObservations(now);
+        List<Integer> ports = srflxObservations.values().stream()
+                .filter(item -> now - item.observedAtMillis() <= SRFLX_OBSERVATION_TTL_MILLIS)
+                .map(SrflxObservation::mappedPort)
+                .filter(port -> port > 0 && port <= 65_535)
+                .distinct()
+                .sorted()
+                .toList();
+        return deltasFromPorts(ports);
+    }
+
+    private List<Integer> deltasFromPorts(List<Integer> ports) {
+        if (ports == null || ports.size() < 2) {
+            return List.of();
+        }
+        List<Integer> deltas = new ArrayList<>();
+        for (int i = 1; i < ports.size(); i++) {
+            int delta = Math.abs(ports.get(i) - ports.get(i - 1));
+            if (delta > 0 && delta <= MAX_ADAPTIVE_PORT_DELTA && !deltas.contains(delta)) {
+                deltas.add(delta);
+            }
+        }
+        return deltas;
+    }
+
+    private void addPredictedPort(List<Integer> ports, int port, int basePort) {
+        if (port <= 0 || port > 65_535 || port == basePort || ports.contains(port)) {
+            return;
+        }
+        ports.add(port);
     }
 
     /**
@@ -812,6 +962,26 @@ public class PeerMeshClient implements AutoCloseable {
             }
             sendDirectKeepalive(session, endpoint);
             session.lastDirectKeepaliveMillis = now;
+        }
+    }
+
+    private void fallbackStaleDirectPaths() {
+        long now = System.currentTimeMillis();
+        for (PeerInfo peer : peers.values()) {
+            PeerSession session = sessions.get(peer.clientId());
+            if (session == null
+                    || session.isExpired(now)
+                    || !"DIRECT".equals(session.currentPathType)
+                    || session.hasHealthyDirect(now)) {
+                continue;
+            }
+            session.remoteEndpoint = null;
+            PeerInfo currentPeer = peers.get(session.peerId());
+            if (currentPeer != null && currentPeer.online()) {
+                log.debug("Peer mesh direct path stale, probing fallback: session={}, peer={}",
+                        session.sessionId(), session.peerId());
+                preparePathForPeer(currentPeer, session);
+            }
         }
     }
 
@@ -917,6 +1087,7 @@ public class PeerMeshClient implements AutoCloseable {
             try {
                 if (running) {
                     keepaliveDirectPaths();
+                    fallbackStaleDirectPaths();
                 }
             } catch (Exception e) {
                 log.debug("Peer mesh keepalive failed: {}", e.getMessage());
@@ -1093,6 +1264,17 @@ public class PeerMeshClient implements AutoCloseable {
         return PeerRelayMessage.PROBE_PRIMARY;
     }
 
+    private String bindingProbeRole(String role) {
+        if (isPublicStunRole(role)) {
+            return role;
+        }
+        return normalizeProbeRole(role);
+    }
+
+    private boolean isPublicStunRole(String role) {
+        return StringUtils.hasText(role) && role.startsWith(PUBLIC_STUN_ROLE_PREFIX);
+    }
+
     private boolean isLocalAddress(String mappedAddress) {
         if (!StringUtils.hasText(mappedAddress)) {
             return false;
@@ -1167,65 +1349,118 @@ public class PeerMeshClient implements AutoCloseable {
     private void handleUdpPacket(DatagramPacket packet) {
         byte[] payload = Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength());
         InetSocketAddress observedRemote = new InetSocketAddress(packet.getAddress(), packet.getPort());
-        PeerRelayBinaryFrame binaryFrame = PeerRelayBinaryFrame.parse(payload);
-        if (binaryFrame != null && binaryFrame.type() == PeerRelayBinaryFrame.TYPE_DATA) {
-            handleUdpPayload(binaryFrame.payload(), observedRemote, binaryFrame.fromAllocationId());
+        StunMessage stun = StunMessage.parse(packet.getData(), packet.getOffset(), packet.getLength());
+        if (stun != null) {
+            handleStunTurnMessage(stun, observedRemote);
             return;
-        }
-        String raw = new String(payload, StandardCharsets.UTF_8);
-        if (raw.startsWith("{") && raw.contains(PeerRelayMessage.MAGIC)) {
-            PeerRelayMessage relayMessage = JsonUtil.stringToObject(raw, PeerRelayMessage.class);
-            if (relayMessage != null && PeerRelayMessage.MAGIC.equals(relayMessage.getMagic())) {
-                handleRelayMessage(relayMessage, observedRemote);
-                return;
-            }
         }
         handleUdpPayload(payload, observedRemote, null);
     }
 
-    private void handleRelayMessage(PeerRelayMessage message, InetSocketAddress observedRemote) {
-        switch (message.getType()) {
-            case PeerRelayMessage.TYPE_BINDING_RESPONSE -> {
-                if (StringUtils.hasText(message.getMappedAddress()) && message.getMappedPort() > 0) {
-                    recordNatObservation(message, observedRemote);
-                    requestAlternateNatProbe(message, observedRemote);
-                    PeerCandidate candidate = new PeerCandidate();
-                    candidate.setType("srflx");
-                    candidate.setTransport("udp");
-                    candidate.setAddress(message.getMappedAddress());
-                    candidate.setPort(message.getMappedPort());
-                    candidate.setPriority(800);
-                    candidate.setFoundation("server-reflexive");
-                    serverReflexiveCandidate = candidate;
-                    announceCandidatesToOnlinePeers();
+    private void handleStunTurnMessage(StunMessage message, InetSocketAddress observedRemote) {
+        switch (message.type()) {
+            case StunMessage.BINDING_SUCCESS -> handleStunBindingSuccess(message, observedRemote);
+            case StunMessage.ALLOCATE_SUCCESS -> handleTurnAllocated(message);
+            case StunMessage.REFRESH_SUCCESS -> relayAllocationExpiresAtMillis = System.currentTimeMillis()
+                    + Math.max(30, message.lifetimeSeconds(300)) * 1000;
+            case StunMessage.CREATE_PERMISSION_SUCCESS -> log.trace("Peer mesh TURN permission created: tx={}",
+                    message.transactionIdHex());
+            case StunMessage.DATA_INDICATION -> {
+                InetSocketAddress peer = message.xorPeerAddress().orElse(null);
+                byte[] inner = message.data().orElse(null);
+                if (peer != null && inner != null) {
+                    handleUdpPayload(inner, observedRemote, endpointKey(peer));
                 }
             }
-            case PeerRelayMessage.TYPE_ALLOCATED -> {
-                if (StringUtils.hasText(message.getAllocationId())) {
-                    relayAllocationId = message.getAllocationId();
-                    relayAllocationExpiresAtMillis = System.currentTimeMillis()
-                            + Math.max(30, message.getTtlSeconds()) * 1000;
-                    PeerCandidate candidate = new PeerCandidate();
-                    candidate.setType("relay");
-                    candidate.setTransport("udp");
-                    candidate.setAddress(observedRemote.getAddress().getHostAddress());
-                    candidate.setPort(observedRemote.getPort());
-                    candidate.setPriority(100);
-                    candidate.setFoundation("turn-lite");
-                    candidate.setRelayId(relayAllocationId);
-                    relayCandidate = candidate;
-                    announceCandidatesToOnlinePeers();
-                }
-            }
-            case PeerRelayMessage.TYPE_DATA -> {
-                if (StringUtils.hasText(message.getPayloadBase64())) {
-                    byte[] inner = Base64.getDecoder().decode(message.getPayloadBase64());
-                    handleUdpPayload(inner, observedRemote, message.getFromAllocationId());
-                }
-            }
-            case PeerRelayMessage.TYPE_ERROR -> log.debug("Peer mesh relay error: {}", message.getError());
-            default -> log.trace("Peer mesh relay message ignored: type={}", message.getType());
+            default -> log.trace("Peer mesh STUN/TURN message ignored: type=0x{}",
+                    Integer.toHexString(message.type()));
         }
+    }
+
+    private void handleStunBindingSuccess(StunMessage message, InetSocketAddress observedRemote) {
+        InetSocketAddress mapped = message.xorMappedAddress().orElse(null);
+        if (mapped == null) {
+            return;
+        }
+        String role = pendingStunBindings.remove(message.transactionIdHex());
+        if (!StringUtils.hasText(role)) {
+            role = PeerRelayMessage.PROBE_PRIMARY;
+        }
+        boolean publicStun = isPublicStunRole(role);
+        if (!publicStun) {
+            PeerRelayMessage observation = new PeerRelayMessage();
+            observation.setType(PeerRelayMessage.TYPE_BINDING_RESPONSE);
+            observation.setProbeRole(role);
+            observation.setMappedAddress(mapped.getAddress().getHostAddress());
+            observation.setMappedPort(mapped.getPort());
+            message.otherAddress().ifPresent(other -> {
+                observation.setAlternateAddress(other.getAddress().getHostAddress());
+                observation.setAlternatePort(other.getPort());
+            });
+            recordNatObservation(observation, observedRemote);
+            requestAlternateNatProbe(observation, observedRemote);
+        }
+
+        PeerCandidate candidate = new PeerCandidate();
+        candidate.setType("srflx");
+        candidate.setTransport("udp");
+        candidate.setAddress(mapped.getAddress().getHostAddress());
+        candidate.setPort(mapped.getPort());
+        candidate.setPriority(800);
+        candidate.setFoundation(publicStun ? "public-stun" : "standard-stun");
+        String candidateKey = candidateEndpointKey(candidate);
+        recordSrflxObservation(role, observedRemote, mapped);
+        if (publicStun) {
+            serverReflexiveCandidates.putIfAbsent(candidateKey, candidate);
+        } else {
+            serverReflexiveCandidates.put(candidateKey, candidate);
+            serverReflexiveCandidate = candidate;
+        }
+        announceCandidatesToOnlinePeers();
+    }
+
+    private void recordSrflxObservation(String role, InetSocketAddress stunServer, InetSocketAddress mapped) {
+        if (mapped == null || mapped.getAddress() == null || mapped.getPort() <= 0) {
+            return;
+        }
+        String server = stunServer == null || stunServer.getAddress() == null
+                ? role
+                : stunServer.getAddress().getHostAddress() + ":" + stunServer.getPort();
+        srflxObservations.put(server + "|" + role, new SrflxObservation(
+                role,
+                mapped.getAddress().getHostAddress(),
+                mapped.getPort(),
+                server,
+                System.currentTimeMillis()));
+        pruneSrflxObservations(System.currentTimeMillis());
+    }
+
+    private void pruneSrflxObservations(long now) {
+        srflxObservations.entrySet().removeIf(entry -> now - entry.getValue().observedAtMillis() > SRFLX_OBSERVATION_TTL_MILLIS);
+    }
+
+    private void handleTurnAllocated(StunMessage message) {
+        InetSocketAddress relayed = message.xorRelayedAddress().orElse(null);
+        if (relayed == null) {
+            return;
+        }
+        InetSocketAddress turnServer = relayEndpoint();
+        if (turnServer == null) {
+            return;
+        }
+        relayAllocationId = "turn:" + endpointKey(relayed);
+        relayAllocationExpiresAtMillis = System.currentTimeMillis()
+                + Math.max(30, message.lifetimeSeconds(300)) * 1000;
+        PeerCandidate candidate = new PeerCandidate();
+        candidate.setType("relay");
+        candidate.setTransport("udp");
+        candidate.setAddress(turnServer.getHostString());
+        candidate.setPort(turnServer.getPort());
+        candidate.setPriority(100);
+        candidate.setFoundation("standard-turn");
+        candidate.setRelayId(endpointKey(relayed));
+        relayCandidate = candidate;
+        announceCandidatesToOnlinePeers();
     }
 
     private void requestAlternateNatProbe(PeerRelayMessage response, InetSocketAddress observedRemote) {
@@ -1247,11 +1482,8 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         lastAlternateNatProbeRequestMillis = now;
-        PeerRelayMessage binding = new PeerRelayMessage();
-        binding.setType(PeerRelayMessage.TYPE_BINDING);
-        binding.setProbeRole(PeerRelayMessage.PROBE_ALTERNATE);
-        binding.setTransactionId(UUID.randomUUID().toString());
-        sendRelayControl(binding, new InetSocketAddress(alternateAddress, response.getAlternatePort()));
+        sendStunBinding(new InetSocketAddress(alternateAddress, response.getAlternatePort()),
+                PeerRelayMessage.PROBE_ALTERNATE);
     }
 
     private boolean isUnspecifiedAddress(String address) {
@@ -1501,10 +1733,6 @@ public class PeerMeshClient implements AutoCloseable {
         } else {
             session.bestDirectRtt = Math.min(session.bestDirectRtt, rttMillis);
         }
-        // 滞回比较：relay RTT 显著优于 direct 时切到 relay
-        boolean directIsStale = !session.hasHealthyDirect(now);
-        boolean relayBetterThanDirect = !pending.relay() ? session.bestRelayRtt + RTT_HYSTERESIS_MS < session.bestDirectRtt
-                : session.bestDirectRtt + RTT_HYSTERESIS_MS < rttMillis;
         if (pending.relay() && session.hasHealthyDirect(now) && !shouldAvoidDirectPath()
                 && !(session.bestRelayRtt + RTT_HYSTERESIS_MS < session.bestDirectRtt)) {
             log.debug("Peer mesh relay UDP path ignored because direct path is healthy: session={}, peer={}",
@@ -1639,6 +1867,16 @@ public class PeerMeshClient implements AutoCloseable {
         try {
             if (StringUtils.hasText(session.relayTargetAllocationId)) {
                 return sendRelayPayload(session.relayTargetAllocationId, frame);
+            }
+            long now = System.currentTimeMillis();
+            if ("DIRECT".equals(session.currentPathType) && !session.hasHealthyDirect(now)) {
+                session.remoteEndpoint = null;
+                if (allowPendingQueue) {
+                    queuePendingPacket(peer, payload);
+                    preparePathForPeer(peer, session);
+                }
+                logPayloadDrop(targetVirtualIp, "direct-stale-waiting-relay");
+                return false;
             }
             if (shouldAvoidDirectPath()) {
                 if (allowPendingQueue) {
@@ -1886,12 +2124,13 @@ public class PeerMeshClient implements AutoCloseable {
         return result;
     }
 
-    private boolean sendRelayPayload(String targetAllocationId, byte[] payload) {
-        if (!StringUtils.hasText(relayAllocationId) || !StringUtils.hasText(targetAllocationId) || payload == null) {
+    private boolean sendRelayPayload(String targetRelayEndpoint, byte[] payload) {
+        if (!StringUtils.hasText(relayAllocationId) || !StringUtils.hasText(targetRelayEndpoint) || payload == null) {
             return false;
         }
-        InetSocketAddress endpoint = relayEndpoint();
-        if (endpoint == null) {
+        InetSocketAddress turnServer = relayEndpoint();
+        InetSocketAddress peer = parseEndpoint(targetRelayEndpoint);
+        if (turnServer == null || peer == null) {
             return false;
         }
         DatagramSocket socket = udpSocket;
@@ -1899,8 +2138,15 @@ public class PeerMeshClient implements AutoCloseable {
             return false;
         }
         try {
-            byte[] bytes = PeerRelayBinaryFrame.send(relayAllocationId, targetAllocationId, payload).toBytes();
-            socket.send(new DatagramPacket(bytes, bytes.length, endpoint));
+            ensureTurnPermission(peer);
+            byte[] transactionId = StunMessage.newTransactionId();
+            StunMessage indication = StunMessage.of(
+                    StunMessage.SEND_INDICATION,
+                    transactionId,
+                    StunMessage.xorPeerAddress(peer, transactionId),
+                    StunMessage.data(payload));
+            byte[] bytes = indication.toBytes();
+            socket.send(new DatagramPacket(bytes, bytes.length, turnServer));
             return true;
         } catch (Exception e) {
             log.debug("Peer mesh relay payload 发送失败: reason={}", e.getMessage());
@@ -1908,11 +2154,116 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
+    private void ensureTurnPermission(InetSocketAddress peer) {
+        InetSocketAddress turnServer = relayEndpoint();
+        if (peer == null || turnServer == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        String key = endpointKey(peer);
+        Long expiresAt = turnPermissions.get(key);
+        if (expiresAt != null && expiresAt - now > 30_000) {
+            return;
+        }
+        byte[] transactionId = StunMessage.newTransactionId();
+        sendStunRequest(StunMessage.of(
+                StunMessage.CREATE_PERMISSION_REQUEST,
+                transactionId,
+                StunMessage.xorPeerAddress(peer, transactionId)), turnServer);
+        turnPermissions.put(key, now + TURN_PERMISSION_TTL_MILLIS);
+    }
+
     private InetSocketAddress relayEndpoint() {
         if (config == null || !StringUtils.hasText(config.getTurnHost()) || config.getTurnPort() <= 0) {
             return null;
         }
         return new InetSocketAddress(config.getTurnHost(), config.getTurnPort());
+    }
+
+    private String endpointKey(InetSocketAddress endpoint) {
+        if (endpoint == null || endpoint.getAddress() == null) {
+            return "";
+        }
+        return endpoint.getAddress().getHostAddress() + ":" + endpoint.getPort();
+    }
+
+    private InetSocketAddress parseEndpoint(String value) {
+        if (!StringUtils.hasText(value)) {
+            return null;
+        }
+        String normalized = value.trim();
+        if (normalized.startsWith("turn:")) {
+            normalized = normalized.substring("turn:".length());
+        }
+        int colon = normalized.lastIndexOf(':');
+        if (colon <= 0 || colon >= normalized.length() - 1) {
+            return null;
+        }
+        try {
+            String host = normalized.substring(0, colon);
+            int port = Integer.parseInt(normalized.substring(colon + 1));
+            return new InetSocketAddress(host, port);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private InetSocketAddress parseStunServer(String value) {
+        if (!StringUtils.hasText(value)) {
+            return null;
+        }
+        String normalized = value.trim();
+        String lower = normalized.toLowerCase();
+        if (lower.startsWith("stun://")) {
+            normalized = normalized.substring("stun://".length());
+        } else if (lower.startsWith("stun:")) {
+            normalized = normalized.substring("stun:".length());
+        }
+        int slash = normalized.indexOf('/');
+        if (slash >= 0) {
+            normalized = normalized.substring(0, slash);
+        }
+        if (!StringUtils.hasText(normalized)) {
+            return null;
+        }
+        String host = normalized;
+        int port = 3478;
+        if (normalized.startsWith("[")) {
+            int close = normalized.indexOf(']');
+            if (close <= 1) {
+                return null;
+            }
+            host = normalized.substring(1, close);
+            if (close + 1 < normalized.length() && normalized.charAt(close + 1) == ':') {
+                port = parsePort(normalized.substring(close + 2), 3478);
+            }
+        } else {
+            int firstColon = normalized.indexOf(':');
+            int lastColon = normalized.lastIndexOf(':');
+            if (firstColon > 0 && firstColon == lastColon && lastColon < normalized.length() - 1) {
+                host = normalized.substring(0, lastColon);
+                port = parsePort(normalized.substring(lastColon + 1), 3478);
+            }
+        }
+        if (!StringUtils.hasText(host) || port <= 0 || port > 65535) {
+            return null;
+        }
+        return new InetSocketAddress(host.trim(), port);
+    }
+
+    private int parsePort(String value, int fallback) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
+    private String candidateEndpointKey(PeerCandidate candidate) {
+        if (candidate == null || !StringUtils.hasText(candidate.getAddress()) || candidate.getPort() <= 0) {
+            return "";
+        }
+        return candidate.getType() + ":" + candidate.getAddress() + ":" + candidate.getPort();
     }
 
     private void mergePeerFromSignal(PeerControlMessage control, List<PeerCandidate> candidates) {
@@ -2208,6 +2559,13 @@ public class PeerMeshClient implements AutoCloseable {
                     && mappedPort == other.mappedPort
                     && Objects.equals(mappedAddress, other.mappedAddress);
         }
+    }
+
+    private record SrflxObservation(String role,
+                                    String mappedAddress,
+                                    int mappedPort,
+                                    String serverEndpoint,
+                                    long observedAtMillis) {
     }
 
     private record NatProbeResult(String natType, String endpoint) {

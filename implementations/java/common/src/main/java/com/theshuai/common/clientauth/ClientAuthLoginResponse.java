@@ -52,6 +52,7 @@ public class ClientAuthLoginResponse {
         private int stunPort;
         private String turnHost;
         private int turnPort;
+        private List<String> publicStunServers = new ArrayList<>();
         private String iceUsername;
         private String iceCredential;
         private String serverPublicKey;

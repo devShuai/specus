@@ -121,8 +121,12 @@ TUNNEL_PEER_MESH_ENABLED=false
 TUNNEL_PEER_MESH_CIDR=100.96.0.0/11
 TUNNEL_PEER_MESH_PUBLIC_ADDRESS=tunnel.example.com
 TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
+TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT=3479
+TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS=stun.example.com:3478,stun2.example.com:3478
 TUNNEL_PEER_MESH_SESSION_TTL_SECONDS=3600
 TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
+TUNNEL_PEER_MESH_RELAY_MIN_PORT=49152
+TUNNEL_PEER_MESH_RELAY_MAX_PORT=65535
 TUNNEL_PEER_MESH_RELAY_WORKER_THREADS=0
 TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY=10000
 TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS=5000
@@ -133,14 +137,20 @@ TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS=5000
 ```bash
 sudo firewall-cmd --add-port=3478/udp --permanent
 sudo firewall-cmd --add-port=3479/udp --permanent
+sudo firewall-cmd --add-port=49152-65535/udp --permanent
 sudo firewall-cmd --reload
 ```
 
-默认 `3478/udp` 承载 STUN/TURN-lite 与 relay，`3479/udp` 是 NAT 类型辅助探测端口。可通过
+默认 `3478/udp` 承载服务端标准 STUN/TURN 控制面，`3479/udp` 是 NAT 类型辅助探测端口，`49152-65535/udp`
+是标准 TURN relay 分配端口范围。可通过
 `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` 调整备用端口；只有一个公网 IP 时，Full Cone 与
 Address-Restricted NAT 仍会合并展示为 `Full cone / Restricted NAT`。
 
-relay 数据面使用二进制 UDP frame，控制面仍使用 JSON binding/allocate/refresh。`TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` 控制二进制 relay 数据帧工作线程，0 表示自动；relay 流量不会每帧写库，而是按 `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` 周期聚合入库。
+`TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` 是额外公共 STUN 列表，客户端会同时向服务端 STUN 和这些公共 STUN
+发起 Binding 探测。公共 STUN 只补充 `srflx` 候选地址，不参与 relay；服务端 TURN 仍是直连失败后的兜底路径。
+
+relay 数据面使用标准 TURN `Send Indication` / `Data Indication` 承载加密后的 peer frame。
+`TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` 控制 relay 数据帧工作线程，0 表示自动；relay 流量不会每帧写库，而是按 `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` 周期聚合入库。
 
 客户端侧默认 `peerMeshDevice=noop`，只运行控制面、候选交换、探测和加密 UDP 数据面；要真正接管虚拟 IP 流量，需要启用虚拟网卡：
 

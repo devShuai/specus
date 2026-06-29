@@ -281,6 +281,13 @@ export interface PeerMeshStatus {
   enabled: boolean;
 }
 
+export interface PublicPeerStunConfig {
+  peerMeshEnabled: boolean;
+  selfHostedStunServer: string;
+  stunServers: string[];
+  stunTurnPort: number;
+}
+
 export interface PeerMeshDevice {
   id: number;
   clientId: number;

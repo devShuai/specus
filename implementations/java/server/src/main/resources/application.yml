@@ -62,9 +62,12 @@ tunnel:
     cidr: ${TUNNEL_PEER_MESH_CIDR:100.96.0.0/11}
     public-address: ${TUNNEL_PEER_MESH_PUBLIC_ADDRESS:}
     stun-turn-port: ${TUNNEL_PEER_MESH_STUN_TURN_PORT:3478}
-    nat-probe-alternate-port: ${TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT:0}
+    nat-probe-alternate-port: ${TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT:3479}
+    public-stun-servers: ${TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS:}
     session-ttl-seconds: ${TUNNEL_PEER_MESH_SESSION_TTL_SECONDS:3600}
     allocation-ttl-seconds: ${TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS:300}
+    relay-min-port: ${TUNNEL_PEER_MESH_RELAY_MIN_PORT:49152}
+    relay-max-port: ${TUNNEL_PEER_MESH_RELAY_MAX_PORT:65535}
     relay-worker-threads: ${TUNNEL_PEER_MESH_RELAY_WORKER_THREADS:0}
     relay-worker-queue-capacity: ${TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY:10000}
     relay-traffic-flush-interval-ms: ${TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS:5000}

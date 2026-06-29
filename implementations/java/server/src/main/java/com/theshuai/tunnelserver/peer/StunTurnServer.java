@@ -1,9 +1,7 @@
 package com.theshuai.tunnelserver.peer;
 
 import com.theshuai.common.peermesh.PeerDataFrameHeader;
-import com.theshuai.common.peermesh.PeerRelayBinaryFrame;
-import com.theshuai.common.peermesh.PeerRelayMessage;
-import com.theshuai.common.util.JsonUtil;
+import com.theshuai.common.stun.StunMessage;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.service.PeerMeshService;
 import jakarta.annotation.PreDestroy;
@@ -15,10 +13,10 @@ import org.springframework.stereotype.Component;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -27,11 +25,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 @Component
 @Slf4j
 public class StunTurnServer implements ApplicationRunner {
+    private static final String SOFTWARE = "shuai-tunnel-standard-stun-turn";
+    private static final long PERMISSION_TTL_SECONDS = 300;
+
     private final PeerMeshProperties properties;
     private final PeerMeshService peerMeshService;
     private final Map<String, Allocation> allocations = new ConcurrentHashMap<>();
@@ -58,14 +60,14 @@ public class StunTurnServer implements ApplicationRunner {
             relayExecutor = createRelayExecutor();
             running = true;
             primaryThread = new Thread(
-                    () -> receiveLoop(primarySocket, PeerRelayMessage.PROBE_PRIMARY),
+                    () -> receiveLoop(primarySocket, "primary"),
                     "peer-mesh-stun-turn");
             primaryThread.setDaemon(true);
             primaryThread.start();
             startAlternateSocket();
-            log.info("[peer-mesh] STUN/TURN-lite UDP server listening on {}", properties.getStunTurnPort());
+            log.info("[peer-mesh] standard STUN/TURN UDP server listening on {}", properties.getStunTurnPort());
         } catch (Exception e) {
-            log.warn("[peer-mesh] STUN/TURN-lite UDP server failed to start on {}: {}",
+            log.warn("[peer-mesh] standard STUN/TURN UDP server failed to start on {}: {}",
                     properties.getStunTurnPort(), e.getMessage());
         }
     }
@@ -78,13 +80,13 @@ public class StunTurnServer implements ApplicationRunner {
         try {
             alternateSocket = new DatagramSocket(alternatePort);
             alternateThread = new Thread(
-                    () -> receiveLoop(alternateSocket, PeerRelayMessage.PROBE_ALTERNATE),
+                    () -> receiveLoop(alternateSocket, "alternate"),
                     "peer-mesh-stun-probe-alt");
             alternateThread.setDaemon(true);
             alternateThread.start();
-            log.info("[peer-mesh] NAT probe alternate UDP port listening on {}", alternatePort);
+            log.info("[peer-mesh] standard STUN alternate UDP port listening on {}", alternatePort);
         } catch (Exception e) {
-            log.warn("[peer-mesh] NAT probe alternate UDP port {} unavailable: {}", alternatePort, e.getMessage());
+            log.warn("[peer-mesh] standard STUN alternate UDP port {} unavailable: {}", alternatePort, e.getMessage());
         }
     }
 
@@ -97,7 +99,7 @@ public class StunTurnServer implements ApplicationRunner {
                 handle(packet, receiveSocket, probeRole);
             } catch (Exception e) {
                 if (running) {
-                    log.debug("[peer-mesh] STUN/TURN-lite receive failed: {}", e.toString());
+                    log.debug("[peer-mesh] STUN/TURN receive failed: {}", e.toString());
                 }
             }
         }
@@ -105,238 +107,281 @@ public class StunTurnServer implements ApplicationRunner {
 
     private void handle(DatagramPacket packet, DatagramSocket receiveSocket, String probeRole) throws Exception {
         InetSocketAddress remote = new InetSocketAddress(packet.getAddress(), packet.getPort());
-        PeerRelayBinaryFrame binaryFrame = PeerRelayBinaryFrame.parse(packet.getData(), packet.getOffset(), packet.getLength());
-        if (binaryFrame != null) {
-            dispatchRelayBinaryFrame(binaryFrame, remote);
+        StunMessage message = StunMessage.parse(packet.getData(), packet.getOffset(), packet.getLength());
+        if (message == null) {
             return;
         }
-        String message = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8).trim();
-        if (message.startsWith("{")) {
-            PeerRelayMessage relayMessage = JsonUtil.stringToObject(message, PeerRelayMessage.class);
-            if (relayMessage != null && PeerRelayMessage.MAGIC.equals(relayMessage.getMagic())) {
-                handleRelayMessage(relayMessage, remote, receiveSocket, probeRole);
-                return;
-            }
-        }
-        String response;
-        if (message.startsWith("BINDING")) {
-            response = "MAPPED " + packet.getAddress().getHostAddress() + " " + packet.getPort();
-        } else if (message.startsWith("ALLOCATE")) {
-            String id = UUID.randomUUID().toString();
-            allocations.put(id, new Allocation(id, remote, Instant.now().plusSeconds(properties.getAllocationTtlSeconds())));
-            response = "ALLOCATED " + id + " " + properties.getAllocationTtlSeconds();
-        } else if (message.startsWith("REFRESH ")) {
-            String id = message.substring("REFRESH ".length()).trim();
-            Allocation allocation = allocations.get(id);
-            if (allocation == null) {
-                response = "ERROR allocation-not-found";
-            } else {
-                allocations.put(id, new Allocation(id, remote, Instant.now().plusSeconds(properties.getAllocationTtlSeconds())));
-                response = "REFRESHED " + id + " " + properties.getAllocationTtlSeconds();
-            }
-        } else {
-            response = "ERROR unsupported-command";
-        }
-        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
-        receiveSocket.send(new DatagramPacket(bytes, bytes.length, packet.getAddress(), packet.getPort()));
-    }
-
-    private void dispatchRelayBinaryFrame(PeerRelayBinaryFrame frame, InetSocketAddress remote) {
-        ExecutorService executor = relayExecutor;
-        if (executor == null) {
-            try {
-                handleRelayBinaryFrame(frame, remote);
-            } catch (Exception e) {
-                log.debug("[peer-mesh] binary relay frame failed: {}", e.toString());
-            }
-            return;
-        }
-        try {
-            executor.execute(() -> {
-                try {
-                    handleRelayBinaryFrame(frame, remote);
-                } catch (Exception e) {
-                    log.debug("[peer-mesh] binary relay frame failed: {}", e.toString());
-                }
-            });
-        } catch (RuntimeException e) {
-            log.debug("[peer-mesh] binary relay frame dropped: {}", e.toString());
+        switch (message.type()) {
+            case StunMessage.BINDING_REQUEST -> binding(message, remote, receiveSocket, probeRole);
+            case StunMessage.ALLOCATE_REQUEST -> allocate(message, remote);
+            case StunMessage.REFRESH_REQUEST -> refresh(message, remote);
+            case StunMessage.CREATE_PERMISSION_REQUEST -> createPermission(message, remote);
+            case StunMessage.SEND_INDICATION -> sendIndication(message, remote);
+            default -> sendError(receiveSocket, remote, message, errorType(message.type()), 400, "unsupported-method");
         }
     }
 
-    private void handleRelayMessage(PeerRelayMessage message,
-                                    InetSocketAddress remote,
-                                    DatagramSocket receiveSocket,
-                                    String probeRole) throws Exception {
-        switch (message.getType()) {
-            case PeerRelayMessage.TYPE_BINDING -> binding(message, remote, receiveSocket, probeRole);
-            case PeerRelayMessage.TYPE_ALLOCATE -> allocate(message, remote);
-            case PeerRelayMessage.TYPE_REFRESH -> refresh(message, remote);
-            case PeerRelayMessage.TYPE_SEND -> relayData(message, remote);
-            default -> sendRelayResponse(primarySocket, remote, error(message, "unsupported-command"));
-        }
-    }
-
-    private void handleRelayBinaryFrame(PeerRelayBinaryFrame frame, InetSocketAddress remote) throws Exception {
-        if (frame.type() != PeerRelayBinaryFrame.TYPE_SEND) {
-            return;
-        }
-        Allocation source = allocations.get(frame.fromAllocationId());
-        if (source == null || !sameEndpoint(source.remote(), remote)) {
-            return;
-        }
-        Allocation target = allocations.get(frame.toAllocationId());
-        if (target == null) {
-            return;
-        }
-        byte[] payload = frame.payload();
-        PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
-        if (header != null && !peerMeshService.authorizeRelayFrameForRelay(header, payload.length)) {
-            return;
-        }
-        PeerRelayBinaryFrame data = PeerRelayBinaryFrame.data(source.id(), target.id(), payload);
-        sendRelayBinary(primarySocket, target.remote(), data);
-    }
-
-    private void binding(PeerRelayMessage request,
+    private void binding(StunMessage request,
                          InetSocketAddress remote,
                          DatagramSocket receiveSocket,
                          String probeRole) throws Exception {
-        sendRelayResponse(receiveSocket, remote, bindingResponse(request, remote, receiveSocket, probeRole));
-        if (PeerRelayMessage.PROBE_PRIMARY.equals(probeRole)
-                && alternateSocket != null
-                && !alternateSocket.isClosed()) {
-            sendRelayResponse(alternateSocket, remote, bindingResponse(
-                    request,
-                    remote,
-                    alternateSocket,
-                    PeerRelayMessage.PROBE_CHANGED_PORT));
-        }
+        InetSocketAddress responseOrigin = advertisedSocketAddress(receiveSocket);
+        StunMessage response = alternateSocket != null && !alternateSocket.isClosed()
+                ? StunMessage.of(
+                StunMessage.BINDING_SUCCESS,
+                request.transactionId(),
+                StunMessage.xorMappedAddress(remote, request.transactionId()),
+                StunMessage.software(SOFTWARE),
+                new StunMessage.Attribute(StunMessage.ATTR_RESPONSE_ORIGIN,
+                        StunMessage.encodeXorAddress(responseOrigin, request.transactionId())),
+                StunMessage.otherAddress(advertisedSocketAddress(alternateSocket), request.transactionId()))
+                : StunMessage.of(
+                StunMessage.BINDING_SUCCESS,
+                request.transactionId(),
+                StunMessage.xorMappedAddress(remote, request.transactionId()),
+                StunMessage.software(SOFTWARE),
+                new StunMessage.Attribute(StunMessage.ATTR_RESPONSE_ORIGIN,
+                        StunMessage.encodeXorAddress(responseOrigin, request.transactionId())));
+        sendStun(receiveSocket, remote, response);
+        log.trace("[peer-mesh] STUN binding role={} remote={}", probeRole, remote);
     }
 
-    private PeerRelayMessage bindingResponse(PeerRelayMessage request,
-                                             InetSocketAddress remote,
-                                             DatagramSocket responseSocket,
-                                             String probeRole) {
-        PeerRelayMessage response = baseResponse(request, PeerRelayMessage.TYPE_BINDING_RESPONSE);
-        response.setProbeRole(probeRole);
-        response.setMappedAddress(remote.getAddress().getHostAddress());
-        response.setMappedPort(remote.getPort());
-        response.setObservedByAddress(advertisedAddress(responseSocket));
-        response.setObservedByPort(responseSocket.getLocalPort());
-        if (alternateSocket != null && !alternateSocket.isClosed()) {
-            response.setAlternateAddress(advertisedAddress(alternateSocket));
-            response.setAlternatePort(alternateSocket.getLocalPort());
+    private void allocate(StunMessage request, InetSocketAddress remote) throws Exception {
+        if (!request.requestedUdpTransport()) {
+            sendError(primarySocket, remote, request, StunMessage.ALLOCATE_ERROR, 442, "unsupported-transport");
+            return;
         }
-        return response;
-    }
-
-    private void allocate(PeerRelayMessage request, InetSocketAddress remote) throws Exception {
         String endpointKey = endpointKey(remote);
-        String existingId = allocationByEndpoint.get(endpointKey);
-        Allocation allocation = existingId == null ? null : allocations.get(existingId);
-        String id = allocation == null ? UUID.randomUUID().toString() : allocation.id();
-        Instant expiresAt = Instant.now().plusSeconds(properties.getAllocationTtlSeconds());
-        allocations.put(id, new Allocation(id, remote, expiresAt));
-        allocationByEndpoint.put(endpointKey, id);
-
-        PeerRelayMessage response = baseResponse(request, PeerRelayMessage.TYPE_ALLOCATED);
-        response.setAllocationId(id);
-        response.setTtlSeconds(properties.getAllocationTtlSeconds());
-        sendRelayResponse(primarySocket, remote, response);
+        Allocation allocation = allocationByEndpoint.containsKey(endpointKey)
+                ? allocations.get(allocationByEndpoint.get(endpointKey))
+                : null;
+        if (allocation == null || allocation.isExpired(Instant.now())) {
+            allocation = createAllocation(remote);
+        } else {
+            allocation.expiresAt = Instant.now().plusSeconds(properties.getAllocationTtlSeconds());
+        }
+        StunMessage response = StunMessage.of(
+                StunMessage.ALLOCATE_SUCCESS,
+                request.transactionId(),
+                StunMessage.xorRelayedAddress(allocation.relayAddress, request.transactionId()),
+                StunMessage.xorMappedAddress(remote, request.transactionId()),
+                StunMessage.lifetime(properties.getAllocationTtlSeconds()),
+                StunMessage.software(SOFTWARE)
+        );
+        sendStun(primarySocket, remote, response);
     }
 
-    private void refresh(PeerRelayMessage request, InetSocketAddress remote) throws Exception {
-        Allocation allocation = allocations.get(request.getAllocationId());
-        if (allocation == null || !sameEndpoint(allocation.remote(), remote)) {
-            sendRelayResponse(primarySocket, remote, error(request, "allocation-not-found"));
-            return;
-        }
-        allocations.put(allocation.id(), new Allocation(
-                allocation.id(),
+    private Allocation createAllocation(InetSocketAddress remote) throws Exception {
+        DatagramSocket relaySocket = bindRelaySocket();
+        Allocation allocation = new Allocation(
+                UUID.randomUUID().toString(),
                 remote,
-                Instant.now().plusSeconds(properties.getAllocationTtlSeconds())));
-        sendRelayResponse(primarySocket, remote, allocatedResponse(request, allocation.id()));
+                relaySocket,
+                advertisedSocketAddress(relaySocket),
+                Instant.now().plusSeconds(properties.getAllocationTtlSeconds())
+        );
+        allocations.put(allocation.id, allocation);
+        allocationByEndpoint.put(endpointKey(remote), allocation.id);
+
+        Thread thread = new Thread(() -> relayReceiveLoop(allocation), "peer-turn-relay-" + relaySocket.getLocalPort());
+        thread.setDaemon(true);
+        allocation.relayThread = thread;
+        thread.start();
+        log.info("[peer-mesh] TURN allocation created: client={}, relay={}", remote, allocation.relayAddress);
+        return allocation;
     }
 
-    private void relayData(PeerRelayMessage request, InetSocketAddress remote) throws Exception {
-        Allocation source = allocations.get(request.getAllocationId());
-        if (source == null || !sameEndpoint(source.remote(), remote)) {
-            sendRelayResponse(primarySocket, remote, error(request, "allocation-not-found"));
+    private DatagramSocket bindRelaySocket() throws Exception {
+        int min = Math.max(1, Math.min(65_535, properties.getRelayMinPort()));
+        int max = Math.max(1, Math.min(65_535, properties.getRelayMaxPort()));
+        if (min > max) {
+            int tmp = min;
+            min = max;
+            max = tmp;
+        }
+        int capacity = max - min + 1;
+        int attempts = Math.min(128, Math.max(16, capacity));
+        int start = min + ThreadLocalRandom.current().nextInt(capacity);
+        Exception last = null;
+        for (int i = 0; i < attempts; i++) {
+            int port = min + ((start - min + i) % capacity);
+            try {
+                return new DatagramSocket(port);
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        if (last != null) {
+            throw last;
+        }
+        return new DatagramSocket(0);
+    }
+
+    private void refresh(StunMessage request, InetSocketAddress remote) throws Exception {
+        Allocation allocation = allocationForRemote(remote);
+        if (allocation == null) {
+            sendError(primarySocket, remote, request, StunMessage.REFRESH_ERROR, 437, "allocation-mismatch");
             return;
         }
-        Allocation target = allocations.get(request.getToAllocationId());
-        if (target == null) {
-            sendRelayResponse(primarySocket, remote, error(request, "target-allocation-not-found"));
+        long lifetime = request.lifetimeSeconds(properties.getAllocationTtlSeconds());
+        if (lifetime <= 0) {
+            closeAllocation(allocation);
+        } else {
+            allocation.expiresAt = Instant.now().plusSeconds(Math.min(lifetime, properties.getAllocationTtlSeconds()));
+        }
+        StunMessage response = StunMessage.of(
+                StunMessage.REFRESH_SUCCESS,
+                request.transactionId(),
+                StunMessage.lifetime(lifetime <= 0 ? 0 : properties.getAllocationTtlSeconds()),
+                StunMessage.software(SOFTWARE)
+        );
+        sendStun(primarySocket, remote, response);
+    }
+
+    private void createPermission(StunMessage request, InetSocketAddress remote) throws Exception {
+        Allocation allocation = allocationForRemote(remote);
+        if (allocation == null) {
+            sendError(primarySocket, remote, request, StunMessage.CREATE_PERMISSION_ERROR, 437, "allocation-mismatch");
             return;
         }
-        byte[] payload;
-        try {
-            payload = Base64.getDecoder().decode(request.getPayloadBase64());
-        } catch (Exception e) {
-            sendRelayResponse(primarySocket, remote, error(request, "invalid-payload"));
+        Instant expiresAt = Instant.now().plusSeconds(PERMISSION_TTL_SECONDS);
+        for (StunMessage.Attribute attribute : request.all(StunMessage.ATTR_XOR_PEER_ADDRESS)) {
+            new StunMessage(request.type(), request.transactionId(), java.util.List.of(attribute))
+                    .xorPeerAddress()
+                    .ifPresent(address -> allocation.permissions.put(permissionKey(address), expiresAt));
+        }
+        StunMessage response = StunMessage.of(
+                StunMessage.CREATE_PERMISSION_SUCCESS,
+                request.transactionId(),
+                StunMessage.software(SOFTWARE)
+        );
+        sendStun(primarySocket, remote, response);
+    }
+
+    private void sendIndication(StunMessage indication, InetSocketAddress remote) throws Exception {
+        Allocation allocation = allocationForRemote(remote);
+        if (allocation == null) {
+            return;
+        }
+        InetSocketAddress peer = indication.xorPeerAddress().orElse(null);
+        byte[] payload = indication.data().orElse(null);
+        if (peer == null || payload == null || !hasPermission(allocation, peer)) {
             return;
         }
         PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
         if (header != null && !peerMeshService.authorizeRelayFrameForRelay(header, payload.length)) {
-            sendRelayResponse(primarySocket, remote, error(request, "relay-session-denied"));
             return;
         }
-        PeerRelayMessage data = new PeerRelayMessage();
-        data.setType(PeerRelayMessage.TYPE_DATA);
-        data.setTransactionId(request.getTransactionId());
-        data.setFromAllocationId(source.id());
-        data.setToAllocationId(target.id());
-        data.setPayloadBase64(request.getPayloadBase64());
-        sendRelayResponse(primarySocket, target.remote(), data);
+        allocation.relaySocket.send(new DatagramPacket(payload, payload.length, peer));
     }
 
-    private PeerRelayMessage allocatedResponse(PeerRelayMessage request, String id) {
-        PeerRelayMessage response = baseResponse(request, PeerRelayMessage.TYPE_ALLOCATED);
-        response.setAllocationId(id);
-        response.setTtlSeconds(properties.getAllocationTtlSeconds());
-        return response;
+    private void relayReceiveLoop(Allocation allocation) {
+        byte[] buffer = new byte[65_507];
+        while (running && !allocation.closed && allocation.relaySocket != null && !allocation.relaySocket.isClosed()) {
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            try {
+                allocation.relaySocket.receive(packet);
+                InetSocketAddress peer = new InetSocketAddress(packet.getAddress(), packet.getPort());
+                if (!hasPermission(allocation, peer)) {
+                    continue;
+                }
+                byte[] payload = java.util.Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength());
+                dispatchDataIndication(allocation, peer, payload);
+            } catch (Exception e) {
+                if (running && !allocation.closed) {
+                    log.debug("[peer-mesh] TURN relay receive failed: {}", e.toString());
+                }
+            }
+        }
     }
 
-    private PeerRelayMessage baseResponse(PeerRelayMessage request, String type) {
-        PeerRelayMessage response = new PeerRelayMessage();
-        response.setType(type);
-        response.setTransactionId(request.getTransactionId());
-        return response;
-    }
-
-    private PeerRelayMessage error(PeerRelayMessage request, String reason) {
-        PeerRelayMessage response = baseResponse(request, PeerRelayMessage.TYPE_ERROR);
-        response.setError(reason);
-        return response;
-    }
-
-    private void sendRelayResponse(DatagramSocket outbound, InetSocketAddress remote, PeerRelayMessage response) throws Exception {
-        if (outbound == null || outbound.isClosed()) {
+    private void dispatchDataIndication(Allocation allocation, InetSocketAddress peer, byte[] payload) {
+        ExecutorService executor = relayExecutor;
+        Runnable task = () -> {
+            try {
+                byte[] transactionId = StunMessage.newTransactionId();
+                StunMessage data = StunMessage.of(
+                        StunMessage.DATA_INDICATION,
+                        transactionId,
+                        StunMessage.xorPeerAddress(peer, transactionId),
+                        StunMessage.data(payload)
+                );
+                sendStun(primarySocket, allocation.clientRemote, data);
+            } catch (Exception e) {
+                log.debug("[peer-mesh] TURN data indication failed: {}", e.toString());
+            }
+        };
+        if (executor == null) {
+            task.run();
             return;
         }
-        byte[] bytes = JsonUtil.objectToString(response).getBytes(StandardCharsets.UTF_8);
-        outbound.send(new DatagramPacket(bytes, bytes.length, remote));
+        try {
+            executor.execute(task);
+        } catch (RuntimeException e) {
+            log.debug("[peer-mesh] TURN data indication dropped: {}", e.toString());
+        }
     }
 
-    private void sendRelayBinary(DatagramSocket outbound, InetSocketAddress remote, PeerRelayBinaryFrame frame) throws Exception {
-        if (outbound == null || outbound.isClosed()) {
+    private Allocation allocationForRemote(InetSocketAddress remote) {
+        String id = allocationByEndpoint.get(endpointKey(remote));
+        Allocation allocation = id == null ? null : allocations.get(id);
+        if (allocation == null || allocation.isExpired(Instant.now())) {
+            if (allocation != null) {
+                closeAllocation(allocation);
+            }
+            return null;
+        }
+        allocation.clientRemote = remote;
+        return allocation;
+    }
+
+    private boolean hasPermission(Allocation allocation, InetSocketAddress peer) {
+        Instant expiresAt = allocation.permissions.get(permissionKey(peer));
+        return expiresAt != null && expiresAt.isAfter(Instant.now());
+    }
+
+    private void sendStun(DatagramSocket socket, InetSocketAddress remote, StunMessage message) throws Exception {
+        if (socket == null || socket.isClosed() || remote == null) {
             return;
         }
-        byte[] bytes = frame.toBytes();
-        outbound.send(new DatagramPacket(bytes, bytes.length, remote));
+        byte[] bytes = message.toBytes();
+        socket.send(new DatagramPacket(bytes, bytes.length, remote));
+    }
+
+    private void sendError(DatagramSocket socket,
+                           InetSocketAddress remote,
+                           StunMessage request,
+                           int responseType,
+                           int code,
+                           String reason) throws Exception {
+        StunMessage response = StunMessage.of(
+                responseType,
+                request.transactionId(),
+                StunMessage.errorCode(code, reason),
+                StunMessage.software(SOFTWARE)
+        );
+        sendStun(socket, remote, response);
+    }
+
+    private int errorType(int requestType) {
+        return switch (requestType) {
+            case StunMessage.BINDING_REQUEST -> StunMessage.BINDING_ERROR;
+            case StunMessage.ALLOCATE_REQUEST -> StunMessage.ALLOCATE_ERROR;
+            case StunMessage.REFRESH_REQUEST -> StunMessage.REFRESH_ERROR;
+            case StunMessage.CREATE_PERMISSION_REQUEST -> StunMessage.CREATE_PERMISSION_ERROR;
+            default -> StunMessage.BINDING_ERROR;
+        };
     }
 
     @Scheduled(fixedDelay = 30_000)
     public void cleanupExpiredAllocations() {
         Instant now = Instant.now();
-        allocations.entrySet().removeIf(entry -> {
-            boolean expired = entry.getValue().expiresAt().isBefore(now);
-            if (expired) {
-                allocationByEndpoint.remove(endpointKey(entry.getValue().remote()), entry.getKey());
+        for (Allocation allocation : allocations.values()) {
+            allocation.permissions.entrySet().removeIf(entry -> entry.getValue().isBefore(now));
+            if (allocation.isExpired(now)) {
+                closeAllocation(allocation);
             }
-            return expired;
-        });
+        }
     }
 
     @PreDestroy
@@ -348,16 +393,27 @@ public class StunTurnServer implements ApplicationRunner {
         if (alternateSocket != null) {
             alternateSocket.close();
         }
+        for (Allocation allocation : allocations.values()) {
+            closeAllocation(allocation);
+        }
         if (relayExecutor != null) {
             relayExecutor.shutdownNow();
         }
     }
 
-    private record Allocation(String id, InetSocketAddress remote, Instant expiresAt) {
-    }
-
-    private boolean sameEndpoint(InetSocketAddress left, InetSocketAddress right) {
-        return Objects.equals(endpointKey(left), endpointKey(right));
+    private void closeAllocation(Allocation allocation) {
+        if (allocation == null || allocation.closed) {
+            return;
+        }
+        allocation.closed = true;
+        allocations.remove(allocation.id);
+        allocationByEndpoint.remove(endpointKey(allocation.clientRemote), allocation.id);
+        if (allocation.relaySocket != null) {
+            allocation.relaySocket.close();
+        }
+        if (allocation.relayThread != null) {
+            allocation.relayThread.interrupt();
+        }
     }
 
     private String endpointKey(InetSocketAddress remote) {
@@ -365,6 +421,13 @@ public class StunTurnServer implements ApplicationRunner {
             return "";
         }
         return remote.getAddress().getHostAddress() + ":" + remote.getPort();
+    }
+
+    private String permissionKey(InetSocketAddress remote) {
+        if (remote == null || remote.getAddress() == null) {
+            return "";
+        }
+        return remote.getAddress().getHostAddress();
     }
 
     private int natProbeAlternatePort() {
@@ -376,17 +439,22 @@ public class StunTurnServer implements ApplicationRunner {
         return next > 0 && next <= 65_535 ? next : 0;
     }
 
-    private String advertisedAddress(DatagramSocket responseSocket) {
-        if (properties.getPublicAddress() != null && !properties.getPublicAddress().isBlank()) {
-            return properties.getPublicAddress().trim();
+    private InetSocketAddress advertisedSocketAddress(DatagramSocket socket) {
+        return new InetSocketAddress(advertisedAddress(socket), socket == null ? 0 : socket.getLocalPort());
+    }
+
+    private InetAddress advertisedAddress(DatagramSocket socket) {
+        try {
+            if (properties.getPublicAddress() != null && !properties.getPublicAddress().isBlank()) {
+                return InetAddress.getByName(properties.getPublicAddress().trim());
+            }
+            if (socket != null && socket.getLocalAddress() != null && !socket.getLocalAddress().isAnyLocalAddress()) {
+                return socket.getLocalAddress();
+            }
+            return InetAddress.getLocalHost();
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot resolve advertised TURN address", e);
         }
-        if (responseSocket == null || responseSocket.getLocalAddress() == null) {
-            return "";
-        }
-        if (responseSocket.getLocalAddress().isAnyLocalAddress()) {
-            return "";
-        }
-        return responseSocket.getLocalAddress().getHostAddress();
     }
 
     private ExecutorService createRelayExecutor() {
@@ -413,5 +481,32 @@ public class StunTurnServer implements ApplicationRunner {
                 new ArrayBlockingQueue<>(queueCapacity),
                 threadFactory,
                 new ThreadPoolExecutor.DiscardPolicy());
+    }
+
+    private static final class Allocation {
+        private final String id;
+        private volatile InetSocketAddress clientRemote;
+        private final DatagramSocket relaySocket;
+        private final InetSocketAddress relayAddress;
+        private final Map<String, Instant> permissions = new ConcurrentHashMap<>();
+        private volatile Instant expiresAt;
+        private volatile Thread relayThread;
+        private volatile boolean closed;
+
+        private Allocation(String id,
+                           InetSocketAddress clientRemote,
+                           DatagramSocket relaySocket,
+                           InetSocketAddress relayAddress,
+                           Instant expiresAt) {
+            this.id = Objects.requireNonNull(id, "id");
+            this.clientRemote = clientRemote;
+            this.relaySocket = relaySocket;
+            this.relayAddress = relayAddress;
+            this.expiresAt = expiresAt;
+        }
+
+        private boolean isExpired(Instant now) {
+            return closed || expiresAt == null || !expiresAt.isAfter(now);
+        }
     }
 }

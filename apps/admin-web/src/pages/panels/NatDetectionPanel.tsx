@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Button,
   Card,
@@ -11,10 +11,12 @@ import {
 import { AppLogo } from "../../components/AppLogo";
 import { ThemeToggleButton } from "../../components/ThemeToggleButton";
 import { HeroRuntime } from "../../components/HeroRuntime";
+import { fetchPublicPeerStunConfig } from "../../api/client";
 import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
 import { usePageSeo } from "../../lib/seo";
 
-const DEFAULT_STUN_SERVERS = [
+const FALLBACK_SELF_HOSTED_STUN_HOST = "tunnel.devshuai.com";
+const PUBLIC_STUN_SERVERS = [
   "stun:stun.miwifi.com:3478",
   "stun:stun.chat.bilibili.com:3478",
   "stun:stun.douyucdn.cn:3478",
@@ -22,6 +24,58 @@ const DEFAULT_STUN_SERVERS = [
   "stun:stun.dingtalk.com:3478",
 ];
 const UNASSIGNED_STUN_SERVER = "未归属 ICE candidate";
+
+function defaultStunServers(): string[] {
+  return uniqueStunServers([selfHostedStunServerFromLocation(), ...PUBLIC_STUN_SERVERS]);
+}
+
+function selfHostedStunServerFromLocation(): string {
+  if (typeof window === "undefined") {
+    return `stun:${FALLBACK_SELF_HOSTED_STUN_HOST}:3478`;
+  }
+  const host = window.location.hostname;
+  const normalizedHost = host && !isLocalBrowserHost(host) ? host : FALLBACK_SELF_HOSTED_STUN_HOST;
+  return `stun:${bracketIpv6(normalizedHost)}:3478`;
+}
+
+function isLocalBrowserHost(host: string): boolean {
+  return host === "localhost"
+    || host === "127.0.0.1"
+    || host === "::1"
+    || host.endsWith(".local");
+}
+
+function bracketIpv6(host: string): string {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+function uniqueStunServers(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = normalizeStunUrl(value);
+    if (!normalized || seen.has(normalized.toLowerCase())) {
+      continue;
+    }
+    seen.add(normalized.toLowerCase());
+    result.push(normalized);
+  }
+  return result;
+}
+
+function normalizeStunUrl(value: string | null | undefined): string {
+  if (!value) {
+    return "";
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (/^stuns?:/i.test(trimmed)) {
+    return trimmed.replace(/^stun:\/\//i, "stun:");
+  }
+  return `stun:${trimmed}`;
+}
 
 type BrowserNatKind =
   | "idle"
@@ -79,10 +133,37 @@ export function NatDetectionPanel({ publicPage = false }: { publicPage?: boolean
 }
 
 function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean }) {
-  const [serversText, setServersText] = useState(DEFAULT_STUN_SERVERS.join("\n"));
+  const initialServers = useMemo(() => defaultStunServers(), []);
+  const [defaultServers, setDefaultServers] = useState(initialServers);
+  const [selfHostedStunServer, setSelfHostedStunServer] = useState(initialServers[0] ?? "");
+  const [serversText, setServersText] = useState(initialServers.join("\n"));
   const [timeoutMs, setTimeoutMs] = useState("9000");
   const [result, setResult] = useState<BrowserNatResult | null>(null);
   const [checking, setChecking] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void fetchPublicPeerStunConfig().then((config) => {
+      if (!active || !config) {
+        return;
+      }
+      const nextServers = uniqueStunServers([
+        config.selfHostedStunServer,
+        ...config.stunServers,
+        ...PUBLIC_STUN_SERVERS,
+      ]);
+      if (nextServers.length === 0) {
+        return;
+      }
+      const previousDefaultText = defaultStunServers().join("\n");
+      setSelfHostedStunServer(config.selfHostedStunServer || nextServers[0] || "");
+      setDefaultServers(nextServers);
+      setServersText((current) => (current === previousDefaultText ? nextServers.join("\n") : current));
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   usePageSeo(
     publicPage
@@ -178,7 +259,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
       const probeTimeoutMs = Number.isFinite(numericTimeout)
         ? Math.min(15000, Math.max(3000, numericTimeout))
         : 7000;
-      const selectedServers = servers.length > 0 ? servers : DEFAULT_STUN_SERVERS;
+      const selectedServers = servers.length > 0 ? servers : defaultServers;
       const probes = await probeStunServers(selectedServers, probeTimeoutMs);
       setResult(classifyBrowserNatResult(startedAt, probes));
     } catch (error) {
@@ -225,7 +306,8 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
             onServersTextChange={setServersText}
             timeoutMs={timeoutMs}
             onTimeoutChange={setTimeoutMs}
-            onResetServers={() => setServersText(DEFAULT_STUN_SERVERS.join("\n"))}
+            selfHostedStunServer={selfHostedStunServer}
+            onResetServers={() => setServersText(defaultServers.join("\n"))}
           />
 
           {(result || checking) && (
@@ -250,7 +332,8 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         onServersTextChange={setServersText}
         timeoutMs={timeoutMs}
         onTimeoutChange={setTimeoutMs}
-        onResetServers={() => setServersText(DEFAULT_STUN_SERVERS.join("\n"))}
+        selfHostedStunServer={selfHostedStunServer}
+        onResetServers={() => setServersText(defaultServers.join("\n"))}
       />
       {(result || checking) && <NatResultDetails result={result} checking={checking} />}
     </div>
@@ -266,6 +349,7 @@ interface NatHeroProps {
   onServersTextChange: (text: string) => void;
   timeoutMs: string;
   onTimeoutChange: (value: string) => void;
+  selfHostedStunServer: string;
   onResetServers: () => void;
 }
 
@@ -278,6 +362,7 @@ function NatHero({
   onServersTextChange,
   timeoutMs,
   onTimeoutChange,
+  selfHostedStunServer,
   onResetServers,
 }: NatHeroProps) {
   const profile = browserNatProfile(result?.kind ?? (checking ? "checking" : "idle"));
@@ -383,7 +468,7 @@ function NatHero({
               minRows={2}
               value={serversText}
               onValueChange={onServersTextChange}
-              description="默认使用国内 STUN。仅支持标准 STUN/TURN，浏览器不能直接连 server 内置的 TURN-lite。"
+              description={`默认优先使用自建 STUN${selfHostedStunServer ? `（${selfHostedStunServer}）` : ""}，再使用国内公共 STUN。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
             />
             <Input
               label="单服务超时"

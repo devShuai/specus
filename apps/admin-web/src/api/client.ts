@@ -28,6 +28,7 @@ import type {
   PeerMeshSessionPage,
   PeerMeshSession,
   PeerMeshStatus,
+  PublicPeerStunConfig,
   ResourceTrafficType,
   ResourceTrafficUsage,
   TcpTrafficFrame,
@@ -391,5 +392,18 @@ export async function fetchPublicClientDownloads(): Promise<ClientDownloadLink[]
     return Array.isArray(body) ? body : [];
   } catch {
     return [];
+  }
+}
+
+export async function fetchPublicPeerStunConfig(): Promise<PublicPeerStunConfig | null> {
+  try {
+    const response = await fetch(`/api/public/peer-mesh/stun-config`);
+    if (!response.ok) {
+      return null;
+    }
+    const body = (await response.json()) as PublicPeerStunConfig;
+    return body && Array.isArray(body.stunServers) ? body : null;
+  } catch {
+    return null;
   }
 }
