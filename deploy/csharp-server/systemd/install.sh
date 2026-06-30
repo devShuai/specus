@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# C# server first-time install
+# Usage: sudo bash install.sh <path-to-publish-output-dir>
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+
+PUBLISH_DIR="${1:-${REPO_ROOT}/implementations/csharp/server/publish}"
+SERVICE_NAME="tunnel-server-csharp"
+INSTALL_DIR="/opt/tunnel-server-csharp"
+CONFIG_DIR="/etc/tunnel-server-csharp"
+DATA_DIR="/var/lib/tunnel-server-csharp"
+LOG_DIR="/var/log/tunnel-server-csharp"
+USER="tunnel"
+GROUP="tunnel"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "请以 root 身份运行" >&2
+  exit 1
+fi
+
+if [[ ! -d "$PUBLISH_DIR" ]]; then
+  echo "发布目录不存在: $PUBLISH_DIR" >&2
+  echo "请先发布: dotnet publish ..." >&2
+  exit 1
+fi
+
+if [[ ! -f "${PUBLISH_DIR}/ShuaiTunnel.Server.dll" ]]; then
+  echo "发布目录中未找到 ShuaiTunnel.Server.dll" >&2
+  exit 1
+fi
+
+# Create system user
+if ! id -u "$USER" &>/dev/null; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$USER"
+fi
+
+# Create directories
+install -d -m 0755 "$INSTALL_DIR"
+install -d -m 0750 "$CONFIG_DIR"
+install -d -m 0750 "$DATA_DIR" -o "$USER" -g "$GROUP"
+install -d -m 0750 "$LOG_DIR" -o "$USER" -g "$GROUP"
+
+# Install publish output (rsync to preserve structure)
+rsync -a --delete "${PUBLISH_DIR}/" "${INSTALL_DIR}/"
+chown -R root:root "$INSTALL_DIR"
+chmod -R 0755 "$INSTALL_DIR"
+
+# Ensure wwwroot is readable
+if [[ -d "${INSTALL_DIR}/wwwroot" ]]; then
+  find "${INSTALL_DIR}/wwwroot" -type f -exec chmod 0644 {} \;
+fi
+
+# Install env template (never overwrite live env)
+cp "$SCRIPT_DIR/tunnel-server.env.example" "$CONFIG_DIR/tunnel-server.env.example"
+if [[ ! -f "$CONFIG_DIR/tunnel-server.env" ]]; then
+  cp "$SCRIPT_DIR/tunnel-server.env.example" "$CONFIG_DIR/tunnel-server.env"
+  chmod 0640 "$CONFIG_DIR/tunnel-server.env"
+  chown "$USER:$GROUP" "$CONFIG_DIR/tunnel-server.env"
+  echo "已创建 $CONFIG_DIR/tunnel-server.env — 请编辑后启动服务"
+fi
+
+# Install systemd unit
+cp "$SCRIPT_DIR/tunnel-server-csharp.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
+
+echo "C# server 安装完成"
+echo "  - 安装目录: $INSTALL_DIR"
+echo "  - 配置:     $CONFIG_DIR/tunnel-server.env"
+echo "  - 启动:     sudo systemctl start $SERVICE_NAME"

@@ -1,0 +1,34 @@
+[Unit]
+Description=shuai-tunnel Go server
+Documentation=https://github.com/devShuai/shuai-tunnel
+After=network.target
+
+[Service]
+Type=simple
+User=tunnel
+Group=tunnel
+WorkingDirectory=/var/lib/tunnel-server-go
+EnvironmentFile=-/etc/tunnel-server-go/tunnel-server.env
+ExecStart=/opt/tunnel-server-go/shuai-tunnel-server
+KillSignal=SIGTERM
+TimeoutStopSec=30
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0027
+ReadWritePaths=/var/lib/tunnel-server-go /var/log/tunnel-server-go
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tunnel-server-go
+
+[Install]
+WantedBy=multi-user.target
