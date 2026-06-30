@@ -167,10 +167,13 @@ public sealed class ManagementQueryService
     }
 
     public async Task<IReadOnlyList<TrafficUsageView>> ListTrafficAsync(ManagementContext context,
-        long? clientId, int? limit,
+        long? clientId, int? limit, bool flush,
         CancellationToken cancellationToken)
     {
-        await _traffic.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (flush)
+        {
+            await _traffic.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
         var normalizedLimit = Math.Clamp(limit ?? 100, 1, 500);
         var query = _db.TrafficUsages.AsNoTracking()
             .Where(t => t.TenantId == context.TenantId || t.TenantId == null || t.TenantId == string.Empty);
@@ -199,9 +202,13 @@ public sealed class ManagementQueryService
 
     public async Task<IReadOnlyList<ResourceTrafficUsageView>> ListResourceTrafficAsync(
         ManagementContext context, string? resourceType, long? clientId, int? limit,
+        bool flush,
         CancellationToken cancellationToken)
     {
-        await _traffic.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (flush)
+        {
+            await _traffic.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
         var normalizedLimit = Math.Clamp(limit ?? 100, 1, 500);
         var visibleIds = await VisibleClientIdsAsync(context, cancellationToken).ConfigureAwait(false);
         var query = _db.ResourceTrafficUsages.AsNoTracking()
@@ -236,9 +243,12 @@ public sealed class ManagementQueryService
 
     public async Task<TrafficDetailPage<HttpTrafficExchangeView>> ListHttpExchangesAsync(
         ManagementContext context, long? clientId, string? route, string? responseBodyType,
-        string? field, string? q, int? page, int? size, CancellationToken cancellationToken)
+        string? field, string? q, int? page, int? size, bool flush, CancellationToken cancellationToken)
     {
-        await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (flush)
+        {
+            await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         var normalizedPage = Math.Max(0, page ?? 0);
         var normalizedSize = Math.Clamp(size ?? 50, 1, 500);
@@ -292,9 +302,12 @@ public sealed class ManagementQueryService
 
     public async Task<TrafficDetailPage<TcpTrafficFrameView>> ListTcpFramesAsync(
         ManagementContext context, long? clientId, int? listenPort, int? page, int? size,
-        int? limit, CancellationToken cancellationToken)
+        int? limit, bool flush, CancellationToken cancellationToken)
     {
-        await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (flush)
+        {
+            await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         var normalizedPage = Math.Max(0, page ?? 0);
         var normalizedSize = Math.Clamp(size ?? limit ?? 50, 1, 500);
@@ -339,10 +352,13 @@ public sealed class ManagementQueryService
             TotalPages(total, normalizedSize));
     }
 
-    public async Task<TcpTrafficFrameView?> GetTcpFrameAsync(ManagementContext context, long id,
+    public async Task<TcpTrafficFrameView?> GetTcpFrameAsync(ManagementContext context, long id, bool flush,
         CancellationToken cancellationToken)
     {
-        await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (flush)
+        {
+            await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         var visibleIds = await VisibleClientIdsAsync(context, cancellationToken).ConfigureAwait(false);
         if (_elasticsearchTraffic.IsEnabled)
@@ -358,10 +374,13 @@ public sealed class ManagementQueryService
         return frame is null ? null : ToTcpTrafficFrameView(frame, includePayload: true);
     }
 
-    public async Task<object> ListTcpStreamAsync(ManagementContext context, string channelId, int? limit,
+    public async Task<object> ListTcpStreamAsync(ManagementContext context, string channelId, int? limit, bool flush,
         CancellationToken cancellationToken)
     {
-        await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (flush)
+        {
+            await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         if (string.IsNullOrWhiteSpace(channelId))
         {

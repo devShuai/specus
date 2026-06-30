@@ -223,7 +223,7 @@ public sealed class ElasticsearchTrafficDetailClient
     }
 
     private async Task PutDocumentAsync(string index, string id, object document, CancellationToken cancellationToken) =>
-        await RequestJsonAsync<object>(HttpMethod.Put, $"/{Escape(index)}/_doc/{Escape(id)}?refresh=true",
+        await RequestJsonAsync<object>(HttpMethod.Put, $"/{Escape(index)}/_doc/{Escape(id)}",
                 document, cancellationToken)
             .ConfigureAwait(false);
 
@@ -341,7 +341,7 @@ public sealed class ElasticsearchTrafficDetailClient
             }, JsonOptions));
             builder.Append('\n');
         }
-        using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(_endpoint!, "/_bulk?refresh=true"))
+        using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(_endpoint!, "/_bulk"))
         {
             Content = new StringContent(builder.ToString(), Encoding.UTF8, "application/x-ndjson"),
         };

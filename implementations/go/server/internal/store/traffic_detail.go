@@ -103,6 +103,16 @@ type TCPFrameFilter struct {
 	Size       int
 }
 
+// TrafficInspectionSnapshot exposes the in-memory detail capture queue state.
+type TrafficInspectionSnapshot struct {
+	CaptureEnabled bool    `json:"captureEnabled"`
+	PendingHTTP    int     `json:"pendingHttp"`
+	PendingTCP     int     `json:"pendingTcp"`
+	DroppedHTTP    int64   `json:"droppedHttp"`
+	DroppedTCP     int64   `json:"droppedTcp"`
+	LastFlushedAt  *string `json:"lastFlushedAt"`
+}
+
 type tcpStreamCursor struct {
 	offset atomic.Int64
 	index  atomic.Int64
@@ -156,7 +166,28 @@ func (db *DB) FlushTrafficDetails(ctx context.Context) error {
 			return err
 		}
 	}
+	db.detailMu.Lock()
+	db.lastDetailFlushedAt = time.Now()
+	db.detailMu.Unlock()
 	return nil
+}
+
+func (db *DB) TrafficInspectionSnapshot(captureEnabled bool) TrafficInspectionSnapshot {
+	db.detailMu.Lock()
+	defer db.detailMu.Unlock()
+	var last *string
+	if !db.lastDetailFlushedAt.IsZero() {
+		value := db.lastDetailFlushedAt.Format(time.RFC3339Nano)
+		last = &value
+	}
+	return TrafficInspectionSnapshot{
+		CaptureEnabled: captureEnabled,
+		PendingHTTP:    len(db.pendingHTTPExchanges),
+		PendingTCP:     len(db.pendingTCPFrames),
+		DroppedHTTP:    db.droppedHTTPDetails,
+		DroppedTCP:     db.droppedTCPDetails,
+		LastFlushedAt:  last,
+	}
 }
 
 func (db *DB) drainTrafficDetails() ([]HTTPExchangeRecord, []TCPFrameRecord) {
@@ -357,6 +388,7 @@ func (db *DB) enqueueHTTPExchange(record HTTPExchangeRecord) {
 	db.detailMu.Lock()
 	defer db.detailMu.Unlock()
 	if db.detailMaxPending <= 0 || len(db.pendingHTTPExchanges) >= db.detailMaxPending {
+		db.droppedHTTPDetails++
 		return
 	}
 	db.pendingHTTPExchanges = append(db.pendingHTTPExchanges, cloneHTTPExchangeRecord(record))
@@ -366,6 +398,7 @@ func (db *DB) enqueueTCPFrame(record TCPFrameRecord) {
 	db.detailMu.Lock()
 	defer db.detailMu.Unlock()
 	if db.detailMaxPending <= 0 || len(db.pendingTCPFrames) >= db.detailMaxPending {
+		db.droppedTCPDetails++
 		return
 	}
 	db.pendingTCPFrames = append(db.pendingTCPFrames, cloneTCPFrameRecord(record))

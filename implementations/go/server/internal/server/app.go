@@ -141,7 +141,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
 		cfg.HTTP.RewriteMaxBodyBytes, traffic, db, db, detailOptions)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
-		cfg.ClientAuth, func(ctx context.Context) error {
+		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh)
 	wsHub := wsevents.NewHub(api.ValidateConnectionWebSocketToken, func(access wsevents.Access, event wsevents.Event) bool {

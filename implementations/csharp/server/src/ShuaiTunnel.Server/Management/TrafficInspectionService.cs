@@ -28,6 +28,9 @@ public sealed class TrafficInspectionService : BackgroundService
     private readonly SemaphoreSlim _flushLock = new(1, 1);
     private int _pendingHttpCount;
     private int _pendingTcpCount;
+    private long _droppedHttpCount;
+    private long _droppedTcpCount;
+    private DateTimeOffset? _lastFlushedAt;
 
     public TrafficInspectionService(IServiceProvider services, IOptions<TrafficOptions> options,
         ElasticsearchTrafficDetailClient elasticsearch, ILogger<TrafficInspectionService> logger)
@@ -80,13 +83,17 @@ public sealed class TrafficInspectionService : BackgroundService
 
         var route = (capture.Route ?? string.Empty).Trim();
         if (!await ShouldCaptureHttpDetailAsync(capture.ClientName, route, cancellationToken).ConfigureAwait(false)
-            || !AcquireSlot(ref _pendingHttpCount))
+            || !AcquireSlot(ref _pendingHttpCount, ref _droppedHttpCount))
         {
             return;
         }
 
         var requestContentType = HeaderValue(capture.RequestHeaders, "content-type");
         var responseContentType = HeaderValue(capture.ResponseHeaders, "content-type");
+        var requestPreview = BodyText(capture.RequestBody, requestContentType,
+            HeaderValue(capture.RequestHeaders, "content-encoding"));
+        var responsePreview = BodyText(capture.ResponseBody, responseContentType,
+            HeaderValue(capture.ResponseHeaders, "content-encoding"));
         var now = DateTimeOffset.UtcNow;
         var success = capture.Error is null;
         _pendingHttpExchanges.Enqueue(new PendingHttpExchange(
@@ -109,12 +116,12 @@ public sealed class TrafficInspectionService : BackgroundService
             ClassifyHttpBody(responseContentType, capture.ResponseBody?.Length ?? 0),
             Cap(JoinHeaders(capture.RequestHeaders), HeaderChars),
             Cap(JoinHeaders(capture.ResponseHeaders), HeaderChars),
-            string.Empty,
-            BodyText(capture.RequestBody, requestContentType, HeaderValue(capture.RequestHeaders, "content-encoding")),
-            string.Empty,
-            BodyText(capture.ResponseBody, responseContentType, HeaderValue(capture.ResponseHeaders, "content-encoding")),
-            false,
-            false,
+            requestPreview.Hex,
+            requestPreview.Text,
+            responsePreview.Hex,
+            responsePreview.Text,
+            requestPreview.Truncated,
+            responsePreview.Truncated,
             now));
     }
 
@@ -127,8 +134,7 @@ public sealed class TrafficInspectionService : BackgroundService
             return;
         }
 
-        if (!await ShouldCaptureTcpDetailAsync(capture.ClientName, capture.ListenPort, cancellationToken).ConfigureAwait(false)
-            || !AcquireSlot(ref _pendingTcpCount))
+        if (!await ShouldCaptureTcpDetailAsync(capture.ClientName, capture.ListenPort, cancellationToken).ConfigureAwait(false))
         {
             return;
         }
@@ -136,6 +142,14 @@ public sealed class TrafficInspectionService : BackgroundService
         var payload = capture.Payload ?? [];
         var (offset, endOffset, frameIndex) = NextPosition(capture.ClientName, capture.ListenPort,
             capture.ChannelId, capture.Direction, payload.Length);
+        if (frameIndex > 0 && SampleRate < 1.0 && Random.Shared.NextDouble() >= SampleRate)
+        {
+            return;
+        }
+        if (!AcquireSlot(ref _pendingTcpCount, ref _droppedTcpCount))
+        {
+            return;
+        }
         var (hex, text, truncated) = TcpPreview(payload, PreviewBytes);
         _pendingTcpFrames.Enqueue(new PendingTcpFrame(
             capture.ClientName,
@@ -182,12 +196,21 @@ public sealed class TrafficInspectionService : BackgroundService
         {
             await FlushHttpAsync(cancellationToken).ConfigureAwait(false);
             await FlushTcpAsync(cancellationToken).ConfigureAwait(false);
+            _lastFlushedAt = DateTimeOffset.UtcNow;
         }
         finally
         {
             _flushLock.Release();
         }
     }
+
+    public TrafficInspectionSnapshot Snapshot() => new(
+        _options.CaptureDetailEnabled,
+        Math.Max(0, Volatile.Read(ref _pendingHttpCount)),
+        Math.Max(0, Volatile.Read(ref _pendingTcpCount)),
+        Volatile.Read(ref _droppedHttpCount),
+        Volatile.Read(ref _droppedTcpCount),
+        _lastFlushedAt?.ToString("O"));
 
     private async Task FlushHttpAsync(CancellationToken cancellationToken)
     {
@@ -355,8 +378,10 @@ public sealed class TrafficInspectionService : BackgroundService
 
     private int PreviewBytes => _options.CapturePreviewBytes <= 0 ? 256 : _options.CapturePreviewBytes;
     private int HeaderChars => _options.CaptureHeaderChars <= 0 ? 8192 : _options.CaptureHeaderChars;
+    private int DecodeMaxBytes => Math.Max(1024, _options.CaptureDecodeMaxBytes);
     private int MaxPending => Math.Max(0, _options.CaptureMaxPending);
     private int FlushBatchSize => Math.Max(1, _options.CaptureFlushBatchSize);
+    private double SampleRate => Math.Clamp(_options.CaptureSampleRate, 0.0, 1.0);
     private TimeSpan CaptureFlushInterval => _options.CaptureFlushIntervalMs > 0
         ? TimeSpan.FromMilliseconds(_options.CaptureFlushIntervalMs)
         : DefaultCaptureFlushInterval;
@@ -427,10 +452,11 @@ public sealed class TrafficInspectionService : BackgroundService
         return enabled;
     }
 
-    private bool AcquireSlot(ref int count)
+    private bool AcquireSlot(ref int count, ref long dropped)
     {
         if (MaxPending <= 0)
         {
+            Interlocked.Increment(ref dropped);
             return false;
         }
 
@@ -441,6 +467,7 @@ public sealed class TrafficInspectionService : BackgroundService
         }
 
         Interlocked.Decrement(ref count);
+        Interlocked.Increment(ref dropped);
         return false;
     }
 
@@ -551,29 +578,38 @@ public sealed class TrafficInspectionService : BackgroundService
         || name.Equals("x-auth-token", StringComparison.OrdinalIgnoreCase)
         || name.Equals("x-csrf-token", StringComparison.OrdinalIgnoreCase);
 
-    private static string BodyText(byte[]? data, string? contentType, string? contentEncoding)
+    private Preview BodyText(byte[]? data, string? contentType, string? contentEncoding)
     {
         if (data is null || data.Length == 0)
         {
-            return string.Empty;
+            return new Preview(string.Empty, string.Empty, false);
         }
         var display = DecodeContentEncoding(data, contentEncoding);
-        if (!IsTextBody(contentType) && !LooksLikeText(display))
+        if (!display.Decoded && HasEncodedBody(contentEncoding) && !LooksLikeText(display.Data))
         {
-            return $"data:{MediaType(contentType)};base64,{Convert.ToBase64String(display)}";
+            return new Preview(string.Empty,
+                $"data:application/octet-stream;base64,{Convert.ToBase64String(display.Data)}",
+                display.Truncated);
         }
-        return SanitizeText(Encoding.UTF8.GetString(display));
+        if (!IsTextBody(contentType) && !LooksLikeText(display.Data))
+        {
+            return new Preview(string.Empty,
+                $"data:{MediaType(contentType)};base64,{Convert.ToBase64String(display.Data)}",
+                display.Truncated);
+        }
+        return new Preview(string.Empty, SanitizeText(Encoding.UTF8.GetString(display.Data)), display.Truncated);
     }
 
-    private static byte[] DecodeContentEncoding(byte[] data, string? contentEncoding)
+    private DecodedBody DecodeContentEncoding(byte[] data, string? contentEncoding)
     {
-        if (string.IsNullOrWhiteSpace(contentEncoding))
+        if (!HasEncodedBody(contentEncoding))
         {
-            return data;
+            return new DecodedBody(data, false, false);
         }
         var current = data;
         var decoded = false;
-        foreach (var token in contentEncoding.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Reverse())
+        var truncated = false;
+        foreach (var token in contentEncoding!.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Reverse())
         {
             if (token.Equals("identity", StringComparison.OrdinalIgnoreCase))
             {
@@ -582,15 +618,20 @@ public sealed class TrafficInspectionService : BackgroundService
             var next = DecodeOne(current, token);
             if (next is null)
             {
-                return decoded ? current : data;
+                return decoded ? new DecodedBody(current, true, truncated) : new DecodedBody(data, false, false);
             }
-            current = next;
+            current = next.Data;
+            truncated = truncated || next.Truncated;
             decoded = true;
+            if (truncated)
+            {
+                break;
+            }
         }
-        return current;
+        return new DecodedBody(current, decoded, truncated);
     }
 
-    private static byte[]? DecodeOne(byte[] data, string token)
+    private LimitedBytes? DecodeOne(byte[] data, string token)
     {
         var normalized = token.ToLowerInvariant();
         return normalized switch
@@ -604,15 +645,13 @@ public sealed class TrafficInspectionService : BackgroundService
         };
     }
 
-    private static byte[]? TryDecode(byte[] data, Func<Stream, Stream> decoderFactory)
+    private LimitedBytes? TryDecode(byte[] data, Func<Stream, Stream> decoderFactory)
     {
         try
         {
             using var source = new MemoryStream(data);
             using var decoder = decoderFactory(source);
-            using var output = new MemoryStream();
-            decoder.CopyTo(output);
-            return output.ToArray();
+            return ReadLimited(decoder);
         }
         catch (InvalidDataException)
         {
@@ -623,6 +662,29 @@ public sealed class TrafficInspectionService : BackgroundService
             return null;
         }
     }
+
+    private LimitedBytes ReadLimited(Stream input)
+    {
+        using var output = new MemoryStream(Math.Min(DecodeMaxBytes, 8192));
+        var buffer = new byte[8192];
+        var remaining = DecodeMaxBytes;
+        while (remaining > 0)
+        {
+            var read = input.Read(buffer, 0, Math.Min(buffer.Length, remaining));
+            if (read <= 0)
+            {
+                return new LimitedBytes(output.ToArray(), false);
+            }
+            output.Write(buffer, 0, read);
+            remaining -= read;
+        }
+        return new LimitedBytes(output.ToArray(), input.ReadByte() >= 0);
+    }
+
+    private static bool HasEncodedBody(string? contentEncoding) =>
+        !string.IsNullOrWhiteSpace(contentEncoding)
+        && contentEncoding.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Any(token => !token.Equals("identity", StringComparison.OrdinalIgnoreCase));
 
     private static bool IsTextBody(string? contentType)
     {
@@ -752,6 +814,12 @@ public sealed class TrafficInspectionService : BackgroundService
 
     private sealed record ResourceDescriptor(long? ResourceId, string? ResourceName);
 
+    private sealed record Preview(string Hex, string Text, bool Truncated);
+
+    private sealed record DecodedBody(byte[] Data, bool Decoded, bool Truncated);
+
+    private sealed record LimitedBytes(byte[] Data, bool Truncated);
+
     private sealed record PendingHttpExchange(
         string ClientName,
         string Route,
@@ -807,6 +875,14 @@ public sealed class TrafficInspectionService : BackgroundService
         public long NextIndex() => Interlocked.Increment(ref _index) - 1;
     }
 }
+
+public sealed record TrafficInspectionSnapshot(
+    bool CaptureEnabled,
+    int PendingHttp,
+    int PendingTcp,
+    long DroppedHttp,
+    long DroppedTcp,
+    string? LastFlushedAt);
 
 public sealed record HttpExchangeCapture(
     string ClientName,

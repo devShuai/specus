@@ -28,8 +28,9 @@ public sealed class ConnectionArchiveServiceTests
             ["Tunnel:ConnectionRecord:ArchiveIntervalMs"] = "3600000",
         });
 
-        var old = DateTimeOffset.UtcNow.AddDays(-90);
-        var fresh = DateTimeOffset.UtcNow.AddDays(-10);
+        var cutoff = ConnectionArchiveService.CalculateCutoff(DateTimeOffset.UtcNow, 60);
+        var old = cutoff.AddMonths(-1).AddHours(12);
+        var fresh = cutoff.AddDays(10);
         const string tenantId = "archive-tenant";
         const string clientName = "archive-client";
         const long clientId = 998877;

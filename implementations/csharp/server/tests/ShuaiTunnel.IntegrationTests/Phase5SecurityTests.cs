@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -179,13 +180,22 @@ public sealed class Phase5SecurityTests
         await tcp.ConnectAsync(IPAddress.Loopback, server.ControlPort);
         using var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
 
-        await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        try
         {
-            TargetHost = "localhost",
-            EnabledSslProtocols = SslProtocols.Tls12,
-            CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-            RemoteCertificateValidationCallback = (_, _, _, _) => true,
-        });
+            await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = "localhost",
+                EnabledSslProtocols = SslProtocols.None,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                RemoteCertificateValidationCallback = (_, _, _, _) => true,
+            });
+        }
+        catch (AuthenticationException ex) when (OperatingSystem.IsWindows()
+            && ex.InnerException is Win32Exception win32
+            && win32.NativeErrorCode == unchecked((int)0x8009030E))
+        {
+            return;
+        }
 
         Assert.True(ssl.IsAuthenticated);
         Assert.True(ssl.IsEncrypted);

@@ -25,26 +25,30 @@ import (
 
 // API holds the dependencies for the admin REST surface.
 type API struct {
-	db          *store.DB
-	sessions    *session.Registry
-	tokens      *security.LocalTokenService
-	oidcAuth    *security.OidcValidator
-	natControl  *nat.ControlService
-	remotePorts *nat.RemotePortManager
-	oidc        config.OidcConfig
-	authConfig  config.AuthConfig
-	clientAuth  config.ClientAuthConfig
-	seedDemo    func(ctx context.Context) error
-	peerMesh    *peermesh.Service
+	db           *store.DB
+	sessions     *session.Registry
+	tokens       *security.LocalTokenService
+	oidcAuth     *security.OidcValidator
+	natControl   *nat.ControlService
+	remotePorts  *nat.RemotePortManager
+	oidc         config.OidcConfig
+	authConfig   config.AuthConfig
+	clientAuth   config.ClientAuthConfig
+	traffic      config.TrafficConfig
+	trafficUsage *nat.TrafficService
+	seedDemo     func(ctx context.Context) error
+	peerMesh     *peermesh.Service
 }
 
 // NewAPI builds the admin API.
 func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalTokenService,
 	oidcAuth *security.OidcValidator, natControl *nat.ControlService, remotePorts *nat.RemotePortManager,
 	oidc config.OidcConfig, authConfig config.AuthConfig, clientAuth config.ClientAuthConfig,
+	traffic config.TrafficConfig, trafficUsage *nat.TrafficService,
 	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service) *API {
 	return &API{db: db, sessions: sessions, tokens: tokens, oidcAuth: oidcAuth, natControl: natControl,
-		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth, seedDemo: seedDemo,
+		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
+		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
 		peerMesh: peerMesh}
 }
 
@@ -69,6 +73,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/clients", a.requireAuth(a.handleCreateClient))
 	mux.HandleFunc("PUT /api/admin/clients/{id}", a.requireAuth(a.handleUpdateClient))
 	mux.HandleFunc("DELETE /api/admin/clients/{id}", a.requireAuth(a.handleDeleteClient))
+	mux.HandleFunc("POST /api/admin/clients/{id}/force-refresh-port-mapping", a.requireAuth(a.handleNatControl))
 
 	mux.HandleFunc("GET /api/admin/client-credentials", a.requireAuth(a.handleListCredentials))
 	mux.HandleFunc("POST /api/admin/client-credentials", a.requireAuth(a.handleCreateCredential))
@@ -97,6 +102,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/traffic/tcp-frames", a.requireAuth(a.handleListTCPFrames))
 	mux.HandleFunc("GET /api/admin/traffic/tcp-frames/{id}", a.requireAuth(a.handleGetTCPFrame))
 	mux.HandleFunc("GET /api/admin/traffic/tcp-streams", a.requireAuth(a.handleGetTCPStream))
+	mux.HandleFunc("GET /api/admin/traffic/inspection-status", a.requireAuth(a.handleTrafficInspectionStatus))
 	mux.HandleFunc("GET /api/admin/connection-stats", a.requireAuth(a.handleListConnectionStats))
 
 	mux.HandleFunc("GET /api/admin/peer-mesh/status", a.requireAuth(a.handlePeerMeshStatus))
@@ -1370,6 +1376,9 @@ func (a *API) handleListTraffic(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "未授权")
 		return
 	}
+	if queryBool(r, "flush", false) && a.trafficUsage != nil {
+		a.trafficUsage.Flush(r.Context())
+	}
 	clientID := queryInt64Ptr(r, "clientId")
 	visibleIDs, err := a.visibleClientIDs(r.Context(), principal)
 	if err != nil {
@@ -1405,6 +1414,9 @@ func (a *API) handleListResourceTraffic(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "未授权")
 		return
+	}
+	if queryBool(r, "flush", false) && a.trafficUsage != nil {
+		a.trafficUsage.Flush(r.Context())
 	}
 	clientID := queryInt64Ptr(r, "clientId")
 	visibleIDs, err := a.visibleClientIDs(r.Context(), principal)
@@ -1457,8 +1469,7 @@ func (a *API) handleListHTTPExchanges(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.db.FlushTrafficDetails(r.Context()); err != nil {
-		a.fail(w, err)
+	if !a.flushTrafficDetailsIfRequested(w, r) {
 		return
 	}
 	clientID := queryInt64Ptr(r, "clientId")
@@ -1513,8 +1524,7 @@ func (a *API) handleListTCPFrames(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.db.FlushTrafficDetails(r.Context()); err != nil {
-		a.fail(w, err)
+	if !a.flushTrafficDetailsIfRequested(w, r) {
 		return
 	}
 	clientID := queryInt64Ptr(r, "clientId")
@@ -1570,10 +1580,6 @@ func (a *API) handleGetTCPFrame(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.db.FlushTrafficDetails(r.Context()); err != nil {
-		a.fail(w, err)
-		return
-	}
 	frame, err := a.db.GetTCPFrame(r.Context(), principal.TenantID, id, visibleIDs)
 	if err != nil {
 		a.fail(w, err)
@@ -1598,8 +1604,7 @@ func (a *API) handleGetTCPStream(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.db.FlushTrafficDetails(r.Context()); err != nil {
-		a.fail(w, err)
+	if !a.flushTrafficDetailsIfRequested(w, r) {
 		return
 	}
 	limit := queryInt(r, "limit", 500)
@@ -1622,6 +1627,21 @@ func (a *API) handleGetTCPStream(w http.ResponseWriter, r *http.Request) {
 		"limit":     limit,
 		"truncated": len(views) >= limit,
 	})
+}
+
+func (a *API) handleTrafficInspectionStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, a.db.TrafficInspectionSnapshot(a.traffic.CaptureDetailEnabled))
+}
+
+func (a *API) flushTrafficDetailsIfRequested(w http.ResponseWriter, r *http.Request) bool {
+	if !queryBool(r, "flush", false) {
+		return true
+	}
+	if err := a.db.FlushTrafficDetails(r.Context()); err != nil {
+		a.fail(w, err)
+		return false
+	}
+	return true
 }
 
 func (a *API) handleListConnectionStats(w http.ResponseWriter, r *http.Request) {
@@ -1773,6 +1793,17 @@ func (a *API) handlePeerMeshSessions(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	query := r.URL.Query()
+	if query.Has("page") || query.Has("size") || query.Has("openOnly") {
+		page, err := a.peerMesh.ListSessionsPage(r.Context(), a.peerAccess(principal),
+			queryInt(r, "page", 0), queryInt(r, "size", queryInt(r, "limit", 100)), queryBool(r, "openOnly", false))
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, page)
 		return
 	}
 	items, err := a.peerMesh.ListSessions(r.Context(), a.peerAccess(principal), queryInt(r, "limit", 100))
@@ -2488,6 +2519,15 @@ func queryInt(r *http.Request, name string, fallback int) int {
 	if value := r.URL.Query().Get(name); value != "" {
 		if n, err := strconv.Atoi(value); err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+func queryBool(r *http.Request, name string, fallback bool) bool {
+	if value := r.URL.Query().Get(name); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			return parsed
 		}
 	}
 	return fallback

@@ -335,7 +335,7 @@ func (s *elasticsearchTrafficStore) ensureIndex(ctx context.Context, index strin
 }
 
 func (s *elasticsearchTrafficStore) indexDocument(ctx context.Context, index, id string, doc any) error {
-	path := "/" + url.PathEscape(index) + "/_doc/" + url.PathEscape(id) + "?refresh=true"
+	path := "/" + url.PathEscape(index) + "/_doc/" + url.PathEscape(id)
 	return s.doJSON(ctx, http.MethodPut, path, doc, nil)
 }
 
@@ -457,7 +457,7 @@ func (s *elasticsearchTrafficStore) bulkDelete(ctx context.Context, index string
 		body.Write(line)
 		body.WriteByte('\n')
 	}
-	status, data, err := s.doRaw(ctx, http.MethodPost, "/_bulk?refresh=true", strings.NewReader(body.String()))
+	status, data, err := s.doRaw(ctx, http.MethodPost, "/_bulk", strings.NewReader(body.String()))
 	if err != nil {
 		return err
 	}

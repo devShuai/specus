@@ -139,7 +139,12 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
                 ["Tunnel:Netty:Port"] = "0",
                 ["Tunnel:Auth:JwtSecret"] = "integration-test-secret",
                 ["Tunnel:Http:MaxRequestBodySize"] = "64",
+                ["Tunnel:Database:Provider"] = "sqlite",
                 ["ConnectionStrings:Tunnel"] = $"Data Source={_dbPath}",
+                ["Tunnel:Elasticsearch:Uris"] = "",
+                ["Tunnel:Elasticsearch:Username"] = "",
+                ["Tunnel:Elasticsearch:Password"] = "",
+                ["Tunnel:Elasticsearch:ApiKey"] = "",
                 // HTTP surface unused at this phase, but we still bind to ephemeral so we don't
                 // collide with anything. WebApplicationFactory uses an in-memory test server by
                 // default, so this is mostly defense-in-depth.

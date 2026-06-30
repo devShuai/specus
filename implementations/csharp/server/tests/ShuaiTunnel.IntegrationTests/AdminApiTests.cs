@@ -28,7 +28,10 @@ public sealed class AdminApiTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _server = await TestServerFixture.StartAsync();
+        _server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
+        {
+            ["Tunnel:Traffic:CaptureDetailEnabled"] = "true",
+        });
     }
 
     public async Task DisposeAsync()
@@ -560,7 +563,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.ServiceUnavailable, offline.StatusCode);
 
         var offlineDetails = await admin.GetFromJsonAsync<HttpExchangePageBody>(
-            "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=503&page=0&size=20",
+            "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=503&page=0&size=20&flush=true",
             JsonOptions);
         Assert.NotNull(offlineDetails);
         var offlineRow = Assert.Single(offlineDetails!.Items);
@@ -574,7 +577,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, tooLarge.StatusCode);
 
         var details = await admin.GetFromJsonAsync<HttpExchangePageBody>(
-            "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=413&page=0&size=20",
+            "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=413&page=0&size=20&flush=true",
             JsonOptions);
         Assert.NotNull(details);
         var row = Assert.Single(details!.Items);
@@ -604,7 +607,7 @@ public sealed class AdminApiTests : IAsyncLifetime
             Assert.Equal(HttpStatusCode.BadGateway, writeFailed.StatusCode);
 
             var writeFailedDetails = await admin.GetFromJsonAsync<HttpExchangePageBody>(
-                "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=502&page=0&size=20",
+                "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=502&page=0&size=20&flush=true",
                 JsonOptions);
             Assert.NotNull(writeFailedDetails);
             var writeFailedRow = Assert.Single(writeFailedDetails!.Items);
@@ -707,7 +710,7 @@ public sealed class AdminApiTests : IAsyncLifetime
             }
 
             var details = await admin.GetFromJsonAsync<HttpExchangePageBody>(
-                "/api/admin/traffic/http-exchanges?field=responseHeaders&q=Content-Encoding&page=0&size=20",
+                "/api/admin/traffic/http-exchanges?field=responseHeaders&q=Content-Encoding&page=0&size=20&flush=true",
                 JsonOptions);
             Assert.NotNull(details);
             var row = Assert.Single(details!.Items, item => item.Route == "rewrite-capture");

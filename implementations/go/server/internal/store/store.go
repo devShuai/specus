@@ -44,6 +44,9 @@ type DB struct {
 	pendingTCPFrames     []TCPFrameRecord
 	detailMaxPending     int
 	detailFlushBatchSize int
+	droppedHTTPDetails   int64
+	droppedTCPDetails    int64
+	lastDetailFlushedAt  time.Time
 }
 
 type trafficDetailBackend interface {

@@ -312,6 +312,12 @@ public static class AdminApiEndpoints
                 service.PushNatControlAsync(ManagementContext.From(context, authOptions.Value),
                     id, cancellationToken));
 
+        app.MapPost("/api/admin/clients/{id:long}/force-refresh-port-mapping",
+            (HttpContext context, long id, IOptions<AuthOptions> authOptions,
+                ManagementMutationService service, CancellationToken cancellationToken) =>
+                service.PushNatControlAsync(ManagementContext.From(context, authOptions.Value),
+                    id, cancellationToken));
+
         app.MapGet("/api/admin/http-routes",
             (HttpContext context, long? clientId, IOptions<AuthOptions> authOptions,
                 ManagementMutationService service, CancellationToken cancellationToken) =>
@@ -354,48 +360,51 @@ public static class AdminApiEndpoints
                     clientId, success, from, to, page, size, cancellationToken));
 
         app.MapGet("/api/admin/traffic",
-            (long? clientId, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+            (long? clientId, int? limit, bool? flush, HttpContext context, IOptions<AuthOptions> authOptions,
                 ManagementQueryService service, CancellationToken cancellationToken) =>
                 service.ListTrafficAsync(ManagementContext.From(context, authOptions.Value),
-                    clientId, limit, cancellationToken));
+                    clientId, limit, flush ?? false, cancellationToken));
 
         app.MapGet("/api/admin/traffic/resources",
-            (string? type, long? clientId, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+            (string? type, long? clientId, int? limit, bool? flush, HttpContext context, IOptions<AuthOptions> authOptions,
                 ManagementQueryService service, CancellationToken cancellationToken) =>
                 service.ListResourceTrafficAsync(ManagementContext.From(context, authOptions.Value),
-                    type, clientId, limit, cancellationToken));
+                    type, clientId, limit, flush ?? false, cancellationToken));
 
         app.MapGet("/api/admin/traffic/http-exchanges",
             (long? clientId, string? route, string? responseBodyType, string? responseDataType,
-                string? field, string? q, int? page, int? size, HttpContext context,
+                string? field, string? q, int? page, int? size, bool? flush, HttpContext context,
                 IOptions<AuthOptions> authOptions, ManagementQueryService service,
                 CancellationToken cancellationToken) =>
                 service.ListHttpExchangesAsync(ManagementContext.From(context, authOptions.Value),
                     clientId, route, FirstText(responseBodyType, responseDataType), field, q,
-                    page, size, cancellationToken));
+                    page, size, flush ?? false, cancellationToken));
 
         app.MapGet("/api/admin/traffic/tcp-frames",
-            (long? clientId, int? listenPort, int? page, int? size, int? limit,
+            (long? clientId, int? listenPort, int? page, int? size, int? limit, bool? flush,
                 HttpContext context, IOptions<AuthOptions> authOptions, ManagementQueryService service,
                 CancellationToken cancellationToken) =>
                 service.ListTcpFramesAsync(ManagementContext.From(context, authOptions.Value),
-                    clientId, listenPort, page, size, limit, cancellationToken));
+                    clientId, listenPort, page, size, limit, flush ?? false, cancellationToken));
 
         app.MapGet("/api/admin/traffic/tcp-frames/{id:long}",
-            async (long id, HttpContext context, IOptions<AuthOptions> authOptions,
+            async (long id, bool? flush, HttpContext context, IOptions<AuthOptions> authOptions,
                 ManagementQueryService service, CancellationToken cancellationToken) =>
             {
                 var frame = await service.GetTcpFrameAsync(
-                        ManagementContext.From(context, authOptions.Value), id, cancellationToken)
+                        ManagementContext.From(context, authOptions.Value), id, flush ?? false, cancellationToken)
                     .ConfigureAwait(false);
                 return frame is null ? Results.NotFound(new { error = "TCP frame not found" }) : Results.Ok(frame);
             });
 
         app.MapGet("/api/admin/traffic/tcp-streams",
-            (string channelId, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
+            (string channelId, int? limit, bool? flush, HttpContext context, IOptions<AuthOptions> authOptions,
                 ManagementQueryService service, CancellationToken cancellationToken) =>
                 service.ListTcpStreamAsync(ManagementContext.From(context, authOptions.Value),
-                    channelId, limit, cancellationToken));
+                    channelId, limit, flush ?? false, cancellationToken));
+
+        app.MapGet("/api/admin/traffic/inspection-status",
+            (TrafficInspectionService service) => Results.Ok(service.Snapshot()));
 
         app.MapGet("/api/admin/connection-stats",
             (string? clientName, int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
@@ -443,10 +452,21 @@ public static class AdminApiEndpoints
             });
 
         app.MapGet("/api/admin/peer-mesh/sessions",
-            (int? limit, HttpContext context, IOptions<AuthOptions> authOptions,
-                PeerMeshService service, CancellationToken cancellationToken) =>
-                service.ListSessionsAsync(ManagementContext.From(context, authOptions.Value),
-                    limit, cancellationToken));
+            async (int? limit, int? page, int? size, bool? openOnly, HttpContext context,
+                IOptions<AuthOptions> authOptions, PeerMeshService service, CancellationToken cancellationToken) =>
+            {
+                var managementContext = ManagementContext.From(context, authOptions.Value);
+                if (page.HasValue || size.HasValue || openOnly.HasValue)
+                {
+                    var result = await service.ListSessionsPageAsync(managementContext, page, size, openOnly ?? false,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    return Results.Json(result);
+                }
+                var items = await service.ListSessionsAsync(managementContext, limit, cancellationToken)
+                    .ConfigureAwait(false);
+                return Results.Json(items);
+            });
 
         app.MapDelete("/api/admin/peer-mesh/sessions/{id:long}",
             (HttpContext context, long id, IOptions<AuthOptions> authOptions,

@@ -101,26 +101,31 @@ public sealed class ConnectionArchiveService : BackgroundService
         }
 
         var now = DateTimeOffset.UtcNow;
-        var buckets = rows
-            .GroupBy(r => new
+        var buckets = new Dictionary<(string TenantId, string ClientName, string StatMonth), ArchiveBucket>();
+        foreach (var row in rows)
+        {
+            var key = (
+                TenantId: NormalizeTenant(row.TenantId),
+                row.ClientName,
+                StatMonth: row.ConnectedAt.ToUniversalTime().ToString("yyyy-MM", CultureInfo.InvariantCulture));
+            if (!buckets.TryGetValue(key, out var bucket))
             {
-                TenantId = NormalizeTenant(r.TenantId),
-                r.ClientName,
-                StatMonth = r.ConnectedAt.ToUniversalTime().ToString("yyyy-MM", CultureInfo.InvariantCulture),
-            })
-            .Select(g => new
+                bucket = new ArchiveBucket(key.TenantId, key.ClientName, key.StatMonth);
+                buckets[key] = bucket;
+            }
+            bucket.ClientId ??= row.ClientId;
+            bucket.Total++;
+            if (row.Success)
             {
-                g.Key.TenantId,
-                g.Key.ClientName,
-                g.Key.StatMonth,
-                ClientId = g.Select(r => r.ClientId).FirstOrDefault(id => id.HasValue),
-                Total = (long)g.Count(),
-                Success = (long)g.Count(r => r.Success),
-                Failure = (long)g.Count(r => !r.Success),
-            })
-            .ToList();
+                bucket.Success++;
+            }
+            else
+            {
+                bucket.Failure++;
+            }
+        }
 
-        foreach (var bucket in buckets)
+        foreach (var bucket in buckets.Values)
         {
             var stat = await db.ConnectionStats
                 .FirstOrDefaultAsync(s =>
@@ -165,4 +170,15 @@ public sealed class ConnectionArchiveService : BackgroundService
 
     private static string NormalizeTenant(string? tenantId) =>
         string.IsNullOrWhiteSpace(tenantId) ? "default" : tenantId;
+
+    private sealed class ArchiveBucket(string tenantId, string clientName, string statMonth)
+    {
+        public string TenantId { get; } = tenantId;
+        public string ClientName { get; } = clientName;
+        public string StatMonth { get; } = statMonth;
+        public long? ClientId { get; set; }
+        public long Total { get; set; }
+        public long Success { get; set; }
+        public long Failure { get; set; }
+    }
 }
