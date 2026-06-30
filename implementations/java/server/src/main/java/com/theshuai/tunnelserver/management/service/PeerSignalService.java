@@ -110,6 +110,16 @@ public class PeerSignalService {
         channel.writeAndFlush(packet);
     }
 
+    public void pushOnLogin(ClientAccount account) {
+        if (!peerMeshService.isEnabled() || account == null) {
+            return;
+        }
+        pushConfig(account);
+        for (ClientAccount target : peerMeshService.rosterRefreshTargets(account)) {
+            pushRoster(target);
+        }
+    }
+
     public List<PeerMeshSessionView> refreshDevice(ManagementContext context, long clientId, boolean enabled) {
         ClientAccount account = clientAccountService.findClientById(context, clientId);
         pushConfig(account);
@@ -136,6 +146,8 @@ public class PeerSignalService {
         config.setType(PeerControlMessage.TYPE_CONFIG);
         config.setSourceClientId(account.getId());
         config.setSourceClientName(account.getClientName());
+        config.setTargetClientId(account.getId());
+        config.setTargetClientName(account.getClientName());
         var peerMeshConfig = peerMeshService.buildRuntimeConfig(account);
         config.setPeerMesh(peerMeshConfig);
         config.setCreatedAtMillis(System.currentTimeMillis());

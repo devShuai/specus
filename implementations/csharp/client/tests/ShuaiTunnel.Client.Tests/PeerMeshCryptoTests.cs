@@ -86,22 +86,27 @@ public sealed class PeerMeshCryptoTests
     }
 
     [Fact]
-    public void DeriveAesKeyMatchesBothSidesWhenX25519IsAvailable()
+    public void X25519RawMatchesRfc7748Vector()
     {
-        using var alice = TryCreateX25519();
-        using var bob = TryCreateX25519();
-        if (alice is null || bob is null)
-        {
-            return;
-        }
+        var alicePrivate = Convert.FromHexString("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        var alicePublic = Convert.FromHexString("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        var bobPrivate = Convert.FromHexString("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+        var bobPublic = Convert.FromHexString("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+        var shared = Convert.FromHexString("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
 
-        var alicePrivate = Convert.ToBase64String(alice.ExportPkcs8PrivateKey());
-        var alicePublic = Convert.ToBase64String(alice.ExportSubjectPublicKeyInfo());
-        var bobPrivate = Convert.ToBase64String(bob.ExportPkcs8PrivateKey());
-        var bobPublic = Convert.ToBase64String(bob.ExportSubjectPublicKeyInfo());
+        Assert.Equal(alicePublic, PeerCrypto.X25519Raw(alicePrivate, Convert.FromHexString("0900000000000000000000000000000000000000000000000000000000000000")));
+        Assert.Equal(shared, PeerCrypto.X25519Raw(alicePrivate, bobPublic));
+        Assert.Equal(shared, PeerCrypto.X25519Raw(bobPrivate, alicePublic));
+    }
 
-        var aliceKey = PeerCrypto.DeriveAes256Key(alicePrivate, bobPublic, 1001, "token", 1, 2);
-        var bobKey = PeerCrypto.DeriveAes256Key(bobPrivate, alicePublic, 1001, "token", 2, 1);
+    [Fact]
+    public void DeriveAesKeyMatchesBothSides()
+    {
+        var alice = PeerCrypto.GenerateKeyMaterial();
+        var bob = PeerCrypto.GenerateKeyMaterial();
+
+        var aliceKey = PeerCrypto.DeriveAes256Key(alice.PrivateKeyBase64, bob.PublicKeyBase64, 1001, "token", 1, 2);
+        var bobKey = PeerCrypto.DeriveAes256Key(bob.PrivateKeyBase64, alice.PublicKeyBase64, 1001, "token", 2, 1);
 
         Assert.Equal(aliceKey, bobKey);
     }
@@ -320,16 +325,26 @@ public sealed class PeerMeshCryptoTests
         Assert.Empty(await ReadUdpPayloadsAsync(direct, 1));
     }
 
-    private static ECDiffieHellman? TryCreateX25519()
+    [Fact]
+    public void MergeRosterToleratesMissingCandidateList()
     {
-        try
-        {
-            return PeerCrypto.CreateX25519();
-        }
-        catch (Exception ex) when (ex is CryptographicException or PlatformNotSupportedException)
-        {
-            return null;
-        }
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        var peer = NewNested(
+            typeof(PeerMeshClient),
+            "PeerMeshPeer",
+            2L,
+            "peer-a",
+            "100.112.0.2",
+            "public-key",
+            true,
+            null);
+
+        InvokePrivate(client, "MergeRoster", NewPeerList(peer));
+
+        var peers = PrivateField<IDictionary>(client, "_peers");
+        var stored = peers[2L]!;
+        var candidates = Assert.IsAssignableFrom<ICollection>(Property<object>(stored, "Candidates"));
+        Assert.Empty(candidates);
     }
 
     private static string InvokeNatType(PeerMeshClient client)
@@ -413,6 +428,17 @@ public sealed class PeerMeshCryptoTests
         (T?)instance.GetType()
             .GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
             .GetValue(instance);
+
+    private static object NewPeerList(params object[] peers)
+    {
+        var peerType = typeof(PeerMeshClient).GetNestedType("PeerMeshPeer", BindingFlags.NonPublic)!;
+        var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(peerType))!;
+        foreach (var peer in peers)
+        {
+            list.Add(peer);
+        }
+        return list;
+    }
 
     private static PeerMeshClient RelayTestClient(UdpClient udp, UdpClient relay)
     {

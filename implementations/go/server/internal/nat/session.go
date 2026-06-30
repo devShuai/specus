@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/control"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
 const externalReadBuffer = 16 * 1024

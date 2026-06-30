@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
 	"golang.org/x/crypto/pkcs12"
 )
 

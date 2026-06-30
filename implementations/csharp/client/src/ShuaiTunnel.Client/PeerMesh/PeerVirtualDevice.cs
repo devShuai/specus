@@ -484,18 +484,25 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
         }
         (_library, _api) = LoadWintun();
         _adapter = _api.OpenAdapter(Name);
+        var openError = Marshal.GetLastWin32Error();
         if (_adapter == IntPtr.Zero)
         {
             _adapter = _api.CreateAdapter(Name, "shuai-tunnel", IntPtr.Zero);
         }
+        var createError = Marshal.GetLastWin32Error();
         if (_adapter == IntPtr.Zero)
         {
-            throw new InvalidOperationException("Wintun adapter create/open failed; run as administrator and ensure wintun.dll is available");
+            throw new InvalidOperationException(
+                "Wintun adapter create/open failed; run as administrator and ensure wintun.dll is available. " +
+                $"name={Name}, arch={RuntimeInformation.ProcessArchitecture}, baseDir={AppContext.BaseDirectory}, " +
+                $"openLastError={openError}, createLastError={createError}");
         }
         _session = _api.StartSession(_adapter, RingCapacity);
+        var sessionError = Marshal.GetLastWin32Error();
         if (_session == IntPtr.Zero)
         {
-            throw new InvalidOperationException("Wintun session start failed");
+            throw new InvalidOperationException(
+                $"Wintun session start failed; name={Name}, lastError={sessionError}");
         }
         await ConfigureAsync(cancellationToken).ConfigureAwait(false);
         Status = "UP";
@@ -643,15 +650,15 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
             return Marshal.GetDelegateForFunctionPointer<T>(NativeLibrary.GetExport(library, name));
         }
 
-        [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
+        [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode, SetLastError = true)]
         public delegate IntPtr OpenAdapterDelegate(string name);
-        [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode)]
+        [UnmanagedFunctionPointer(CallingConvention.Winapi, CharSet = CharSet.Unicode, SetLastError = true)]
         public delegate IntPtr CreateAdapterDelegate(string name, string tunnelType, IntPtr requestedGuid);
-        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        [UnmanagedFunctionPointer(CallingConvention.Winapi, SetLastError = true)]
         public delegate void CloseAdapterDelegate(IntPtr adapter);
-        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        [UnmanagedFunctionPointer(CallingConvention.Winapi, SetLastError = true)]
         public delegate IntPtr StartSessionDelegate(IntPtr adapter, uint capacity);
-        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        [UnmanagedFunctionPointer(CallingConvention.Winapi, SetLastError = true)]
         public delegate void EndSessionDelegate(IntPtr session);
         [UnmanagedFunctionPointer(CallingConvention.Winapi)]
         public delegate IntPtr ReceivePacketDelegate(IntPtr session, out uint packetSize);

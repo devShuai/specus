@@ -5,7 +5,7 @@ package session
 import (
 	"sync"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
 )
 
 // Session is a control connection that can be addressed by client name, written to, and closed.

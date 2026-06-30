@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/session"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
 // ControlService builds and pushes NAT_CONTROL messages from the persisted tunnel/HTTP-route

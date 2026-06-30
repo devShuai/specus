@@ -1,3 +1,3 @@
-module github.com/devShuai/shuai-tunnel/tunnel-client-go
+module github.com/devShuai/shuai-tunnel/implementations/go/client
 
 go 1.26.0

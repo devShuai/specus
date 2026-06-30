@@ -44,12 +44,10 @@ internal static class PeerKeyStore
             }
 
             Directory.CreateDirectory(directory);
-            using var key = PeerCrypto.CreateX25519();
-            var publicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
-            var privateKey = Convert.ToBase64String(key.ExportPkcs8PrivateKey());
-            File.WriteAllText(publicKeyPath, publicKey, Encoding.UTF8);
-            File.WriteAllText(privateKeyPath, privateKey, Encoding.UTF8);
-            return new PeerKeyMaterial(publicKey, privateKey);
+            var keyMaterial = PeerCrypto.GenerateKeyMaterial();
+            File.WriteAllText(publicKeyPath, keyMaterial.PublicKeyBase64, Encoding.UTF8);
+            File.WriteAllText(privateKeyPath, keyMaterial.PrivateKeyBase64, Encoding.UTF8);
+            return keyMaterial;
         }
     }
 }

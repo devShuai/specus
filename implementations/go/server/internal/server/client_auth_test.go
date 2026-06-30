@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/auth"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
 func TestClientAuthLoginUsesCredentialTenant(t *testing.T) {

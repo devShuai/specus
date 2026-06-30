@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/auth"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/peermesh"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/peermesh"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
 type clientAuthLoginRequest struct {

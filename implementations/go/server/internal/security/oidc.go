@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
 )
 
 // clockSkew is the allowed leeway when checking token exp/nbf.

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
 type trafficCounter struct {

@@ -210,34 +210,41 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        switch (message.Type)
+        try
         {
-            case TypeConfig:
-                if (message.PeerMesh is not null)
-                {
-                    runtime.PeerMesh = message.PeerMesh;
-                }
-                await StartAsync(runtime, writer, cancellationToken).ConfigureAwait(false);
-                break;
-            case TypeRoster:
-                MergeRoster(message.Peers);
-                await AnnounceCandidatesAsync().ConfigureAwait(false);
-                break;
-            case TypeSessionGrant:
-                MergeSession(message);
-                await AnnounceCandidatesAsync().ConfigureAwait(false);
-                break;
-            case TypeCandidates:
-                MergePeerFromSignal(message);
-                MergeSession(message);
-                await SendConnectivityChecksAsync(message).ConfigureAwait(false);
-                break;
-            case TypeClose:
-                CloseSession(message);
-                break;
-            default:
-                _logger.LogDebug("ignored peer-control message type={Type}", message.Type);
-                break;
+            switch (message.Type)
+            {
+                case TypeConfig:
+                    if (message.PeerMesh is not null)
+                    {
+                        runtime.PeerMesh = message.PeerMesh;
+                    }
+                    await StartAsync(runtime, writer, cancellationToken).ConfigureAwait(false);
+                    break;
+                case TypeRoster:
+                    MergeRoster(message.Peers);
+                    await AnnounceCandidatesAsync().ConfigureAwait(false);
+                    break;
+                case TypeSessionGrant:
+                    MergeSession(message);
+                    await AnnounceCandidatesAsync().ConfigureAwait(false);
+                    break;
+                case TypeCandidates:
+                    MergePeerFromSignal(message);
+                    MergeSession(message);
+                    await SendConnectivityChecksAsync(message).ConfigureAwait(false);
+                    break;
+                case TypeClose:
+                    CloseSession(message);
+                    break;
+                default:
+                    _logger.LogDebug("ignored peer-control message type={Type}", message.Type);
+                    break;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "PEER_CONTROL handle failed: type={Type}", message.Type);
         }
     }
 
@@ -257,6 +264,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             catch (ObjectDisposedException)
             {
                 return;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+            {
+                _logger.LogDebug(ex, "Peer Mesh UDP receive reset ignored");
+                continue;
             }
             catch (SocketException ex)
             {
@@ -939,11 +951,19 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         lock (_sync)
         {
-            foreach (var peer in peers.Where(x => x.ClientId > 0))
+            foreach (var rawPeer in peers)
             {
+                if (rawPeer is null || rawPeer.ClientId <= 0)
+                {
+                    continue;
+                }
+                var peer = rawPeer with
+                {
+                    Candidates = NormalizeCandidates(rawPeer.Candidates),
+                };
                 if (_peers.TryGetValue(peer.ClientId, out var existing) && peer.Candidates.Count == 0)
                 {
-                    peer.Candidates.AddRange(existing.Candidates);
+                    peer.Candidates.AddRange(NormalizeCandidates(existing.Candidates));
                 }
                 _peers[peer.ClientId] = peer;
             }
@@ -957,9 +977,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
+        var candidates = NormalizeCandidates(message.Candidates);
         var peer = message.SourceClientId != 0 && message.SourceClientId != runtime.PeerMesh.ClientId
-            ? new PeerMeshPeer(message.SourceClientId, message.SourceClientName, message.SourceVirtualIp, message.SourcePublicKey, true, message.Candidates)
-            : new PeerMeshPeer(message.TargetClientId, message.TargetClientName, message.TargetVirtualIp, message.TargetPublicKey, true, message.Candidates);
+            ? new PeerMeshPeer(message.SourceClientId, message.SourceClientName, message.SourceVirtualIp, message.SourcePublicKey, true, candidates)
+            : new PeerMeshPeer(message.TargetClientId, message.TargetClientName, message.TargetVirtualIp, message.TargetPublicKey, true, candidates);
         if (peer.ClientId <= 0)
         {
             return;
@@ -1124,7 +1145,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        foreach (var candidate in message.Candidates.Where(x =>
+        var candidates = NormalizeCandidates(message.Candidates);
+        foreach (var candidate in candidates.Where(x =>
             string.Equals(x.Transport, "udp", StringComparison.OrdinalIgnoreCase)
             && !string.IsNullOrWhiteSpace(x.Address)
             && x.Port > 0))
@@ -1134,7 +1156,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 continue;
             }
             await SendProbeAsync(session, candidate).ConfigureAwait(false);
-            foreach (var predictedPort in AdaptivePredictedPorts(candidate, message.Candidates))
+            foreach (var predictedPort in AdaptivePredictedPorts(candidate, candidates))
             {
                 var predicted = candidate with
                 {
@@ -1151,11 +1173,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         List<PeerMeshPeer> peers;
         lock (_sync)
         {
-            peers = _peers.Values.Where(x => x.Online && x.Candidates.Count > 0).ToList();
+            peers = _peers.Values.Where(x => x.Online && NormalizeCandidates(x.Candidates).Count > 0).ToList();
         }
         foreach (var peer in peers)
         {
-            await SendConnectivityChecksAsync(new PeerControlMessage { SourceClientId = peer.ClientId, Candidates = peer.Candidates })
+            await SendConnectivityChecksAsync(new PeerControlMessage { SourceClientId = peer.ClientId, Candidates = NormalizeCandidates(peer.Candidates) })
                 .ConfigureAwait(false);
         }
     }
@@ -1919,6 +1941,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private static string EndpointKey(IPEndPoint endpoint) => $"{endpoint.Address}:{endpoint.Port}";
 
+    private static List<PeerCandidate> NormalizeCandidates(IEnumerable<PeerCandidate?>? candidates) =>
+        candidates?.OfType<PeerCandidate>().ToList() ?? [];
+
     private static string CandidateEndpointKey(PeerCandidate candidate) =>
         $"{candidate.Type}|{candidate.Address}|{candidate.Port}|{candidate.Foundation}";
 
@@ -2355,6 +2380,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         [JsonPropertyName("type")]
         public string? Type { get; set; }
         [JsonPropertyName("sourceClientId")]
+        [JsonConverter(typeof(NullToZeroInt64Converter))]
         public long SourceClientId { get; set; }
         [JsonPropertyName("sourceClientName")]
         public string? SourceClientName { get; set; }
@@ -2363,6 +2389,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         [JsonPropertyName("sourcePublicKey")]
         public string? SourcePublicKey { get; set; }
         [JsonPropertyName("targetClientId")]
+        [JsonConverter(typeof(NullToZeroInt64Converter))]
         public long TargetClientId { get; set; }
         [JsonPropertyName("targetClientName")]
         public string? TargetClientName { get; set; }
@@ -2410,6 +2437,25 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public List<PeerCandidate> Candidates { get; set; } = [];
         [JsonPropertyName("createdAtMillis")]
         public long CreatedAtMillis { get; set; }
+    }
+
+    private sealed class NullToZeroInt64Converter : JsonConverter<long>
+    {
+        public override long Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            if (reader.TokenType == JsonTokenType.Null)
+            {
+                return 0;
+            }
+            if (reader.TokenType == JsonTokenType.String)
+            {
+                return long.TryParse(reader.GetString(), out var value) ? value : 0;
+            }
+            return reader.GetInt64();
+        }
+
+        public override void Write(Utf8JsonWriter writer, long value, JsonSerializerOptions options) =>
+            writer.WriteNumberValue(value);
     }
 
     private sealed record PeerUdpProbe(

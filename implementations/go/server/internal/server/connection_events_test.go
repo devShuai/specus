@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
 )
 
 func TestConnectionEventsWebSocketAuthAndLifecycleBroadcast(t *testing.T) {

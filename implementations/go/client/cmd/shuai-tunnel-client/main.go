@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-client-go/internal/client"
+	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/client"
 )
 
 func main() {

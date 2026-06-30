@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/server"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/server"
 )
 
 func main() {

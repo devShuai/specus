@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
 )
 
 // Issuer is the JWT issuer claim for locally minted admin tokens.

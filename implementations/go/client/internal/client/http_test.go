@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-client-go/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
 )
 
 func TestBuildTarget(t *testing.T) {

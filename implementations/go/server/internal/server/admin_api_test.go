@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
 )
 
 // newAPIServer boots an App and wraps its management handler in an httptest.Server.

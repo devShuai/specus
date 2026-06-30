@@ -1,4 +1,4 @@
-module github.com/devShuai/shuai-tunnel/tunnel-server-go
+module github.com/devShuai/shuai-tunnel/implementations/go/server
 
 go 1.26.0
 

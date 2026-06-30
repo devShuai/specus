@@ -100,8 +100,7 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
                 if (authentication.success()) {
                     // pushOnLogin reads the DB; run it off the event loop, after the session is bound.
                     submit(() -> natControlService.pushOnLogin(packet.getClientName()));
-                    submit(() -> peerSignalService.pushConfig(authentication.account()));
-                    submit(() -> peerSignalService.pushRoster(authentication.account()));
+                    submit(() -> peerSignalService.pushOnLogin(authentication.account()));
                 } else {
                     // 登录失败必须主动关连接，否则客户端心跳会让 server 端 reader idle 一直不超时，
                     // 形成"无 session 但保活"的僵尸连接，浪费资源也阻塞合法重连。

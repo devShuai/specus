@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-client-go/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
 )
 
 const (

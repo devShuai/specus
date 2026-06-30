@@ -13,14 +13,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/auth"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/config"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/nat"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/peermesh"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/security"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/session"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/store"
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/wsevents"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/nat"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/peermesh"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
 )
 
 // API holds the dependencies for the admin REST surface.

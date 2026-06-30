@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
 )
 
 // freeTCPPort grabs an ephemeral port by binding and immediately releasing it.
