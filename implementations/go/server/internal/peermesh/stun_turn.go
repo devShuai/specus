@@ -2,9 +2,12 @@ package peermesh
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +37,7 @@ type stunTurnServer struct {
 	allocationByEndpoint map[string]string
 	primary              *net.UDPConn
 	alternate            *net.UDPConn
+	relayTasks           chan func()
 }
 
 func (s *Service) RunStunTurn(ctx context.Context) {
@@ -57,6 +61,7 @@ func (s *stunTurnServer) run(ctx context.Context) {
 		return
 	}
 	s.primary = primary
+	s.startRelayWorkers(ctx)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -215,8 +220,9 @@ func (s *stunTurnServer) bindRelaySocket() (*net.UDPConn, error) {
 	if attempts > maxRelayBindAttempt {
 		attempts = maxRelayBindAttempt
 	}
+	start := relayBindStart(capacity)
 	for i := 0; i < attempts; i++ {
-		port := minPort + (i % capacity)
+		port := minPort + ((start + i) % capacity)
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 		if err == nil {
 			return conn, nil
@@ -236,8 +242,12 @@ func (s *stunTurnServer) refresh(request stunMessage, remote *net.UDPAddr) error
 	} else {
 		allocation.ExpiresAt = time.Now().Add(time.Duration(minInt64(lifetime, s.service.cfg.AllocationTTLSeconds)) * time.Second)
 	}
+	grantedLifetime := int64(0)
+	if lifetime > 0 {
+		grantedLifetime = s.service.cfg.AllocationTTLSeconds
+	}
 	response := newStunMessage(stunRefreshSuccess, request.TransactionID,
-		stunAttrLifetimeValue(lifetime),
+		stunAttrLifetimeValue(grantedLifetime),
 		stunAttrSoftwareValue(stunTurnSoftware))
 	return s.sendStun(s.primary, remote, response)
 }
@@ -299,11 +309,25 @@ func (s *stunTurnServer) relayReceiveLoop(ctx context.Context, allocation *relay
 }
 
 func (s *stunTurnServer) dispatchDataIndication(allocation *relayAllocation, peer *net.UDPAddr, payload []byte) error {
-	tx := newStunTransactionID()
-	message := newStunMessage(stunDataIndication, tx,
-		newStunAttrXorPeerAddress(peer, tx),
-		stunAttrDataValue(payload))
-	return s.sendStun(s.primary, allocation.Client, message)
+	task := func() {
+		tx := newStunTransactionID()
+		message := newStunMessage(stunDataIndication, tx,
+			newStunAttrXorPeerAddress(peer, tx),
+			stunAttrDataValue(payload))
+		if err := s.sendStun(s.primary, allocation.Client, message); err != nil {
+			s.logger.Debug("[peer-mesh] TURN data indication failed", "err", err)
+		}
+	}
+	if s.relayTasks == nil {
+		task()
+		return nil
+	}
+	select {
+	case s.relayTasks <- task:
+	default:
+		s.logger.Debug("[peer-mesh] TURN data indication dropped")
+	}
+	return nil
 }
 
 func (s *stunTurnServer) allocationForRemote(remote *net.UDPAddr) *relayAllocation {
@@ -431,6 +455,43 @@ func (s *stunTurnServer) closeAllocation(allocation *relayAllocation) {
 	}
 }
 
+func (s *stunTurnServer) startRelayWorkers(ctx context.Context) {
+	workers := relayWorkerCount(s.service.cfg.RelayWorkerThreads)
+	capacity := s.service.cfg.RelayWorkerQueueCapacity
+	if capacity <= 0 {
+		capacity = 10000
+	}
+	s.relayTasks = make(chan func(), capacity)
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case task := <-s.relayTasks:
+					if task != nil {
+						task()
+					}
+				}
+			}
+		}()
+	}
+}
+
+func relayWorkerCount(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	workers := runtime.NumCPU()
+	if workers < 2 {
+		return 2
+	}
+	if workers > 8 {
+		return 8
+	}
+	return workers
+}
+
 func (s *stunTurnServer) natProbeAlternatePort() int {
 	if s.service.cfg.NatProbeAlternatePort > 0 {
 		return s.service.cfg.NatProbeAlternatePort
@@ -490,6 +551,17 @@ func cloneUDPAddr(remote *net.UDPAddr) *net.UDPAddr {
 		return nil
 	}
 	return &net.UDPAddr{IP: append(net.IP(nil), remote.IP...), Port: remote.Port, Zone: remote.Zone}
+}
+
+func relayBindStart(capacity int) int {
+	if capacity <= 1 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(capacity)))
+	if err == nil {
+		return int(n.Int64())
+	}
+	return int(time.Now().UnixNano() % int64(capacity))
 }
 
 func relayPortRange(minPort, maxPort int) (int, int) {

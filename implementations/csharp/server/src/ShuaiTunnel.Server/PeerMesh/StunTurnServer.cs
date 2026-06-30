@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Channels;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Configuration;
 
@@ -18,6 +19,7 @@ public sealed class StunTurnServer : BackgroundService
     private readonly ConcurrentDictionary<string, string> _allocationByEndpoint = new(StringComparer.Ordinal);
     private UdpClient? _primary;
     private UdpClient? _alternate;
+    private Channel<Func<CancellationToken, Task>>? _relayQueue;
 
     public StunTurnServer(IOptions<PeerMeshOptions> options, IServiceScopeFactory scopeFactory,
         ILogger<StunTurnServer> logger)
@@ -45,6 +47,7 @@ public sealed class StunTurnServer : BackgroundService
             return;
         }
 
+        StartRelayWorkers(stoppingToken);
         var tasks = new List<Task>
         {
             ReceiveLoopAsync(_primary, "primary", stoppingToken),
@@ -75,6 +78,7 @@ public sealed class StunTurnServer : BackgroundService
 
     public override Task StopAsync(CancellationToken cancellationToken)
     {
+        _relayQueue?.Writer.TryComplete();
         _primary?.Dispose();
         _alternate?.Dispose();
         foreach (var allocation in _allocations.Values)
@@ -82,6 +86,56 @@ public sealed class StunTurnServer : BackgroundService
             CloseAllocation(allocation);
         }
         return base.StopAsync(cancellationToken);
+    }
+
+    private void StartRelayWorkers(CancellationToken cancellationToken)
+    {
+        var workerCount = RelayWorkerCount(_options.RelayWorkerThreads);
+        var queueCapacity = Math.Max(1, _options.RelayWorkerQueueCapacity);
+        _relayQueue = Channel.CreateBounded<Func<CancellationToken, Task>>(new BoundedChannelOptions(queueCapacity)
+        {
+            SingleReader = false,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+        for (var i = 0; i < workerCount; i++)
+        {
+            _ = Task.Run(() => RelayWorkerLoopAsync(cancellationToken), CancellationToken.None);
+        }
+    }
+
+    private async Task RelayWorkerLoopAsync(CancellationToken cancellationToken)
+    {
+        var reader = _relayQueue?.Reader;
+        if (reader is null)
+        {
+            return;
+        }
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested
+                   && await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                while (reader.TryRead(out var task))
+                {
+                    try
+                    {
+                        await task(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is SocketException or ObjectDisposedException or OperationCanceledException)
+                    {
+                        if (!cancellationToken.IsCancellationRequested)
+                        {
+                            _logger.LogDebug(ex, "[peer-mesh] TURN data indication failed");
+                        }
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown.
+        }
     }
 
     private async Task ReceiveLoopAsync(UdpClient socket, string probeRole, CancellationToken cancellationToken)
@@ -348,8 +402,28 @@ public sealed class StunTurnServer : BackgroundService
         }
     }
 
-    private async Task DispatchDataIndicationAsync(Allocation allocation, IPEndPoint peer, byte[] payload)
+    private Task DispatchDataIndicationAsync(Allocation allocation, IPEndPoint peer, byte[] payload)
     {
+        Func<CancellationToken, Task> task = token => SendDataIndicationAsync(allocation, peer, payload, token);
+        var queue = _relayQueue;
+        if (queue is null)
+        {
+            return task(CancellationToken.None);
+        }
+        if (!queue.Writer.TryWrite(task))
+        {
+            _logger.LogDebug("[peer-mesh] TURN data indication dropped");
+        }
+        return Task.CompletedTask;
+    }
+
+    private async Task SendDataIndicationAsync(Allocation allocation, IPEndPoint peer, byte[] payload,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
         var tx = StunMessage.NewTransactionId();
         await SendStunAsync(_primary, allocation.Remote, StunMessage.Of(
             StunMessage.DataIndication,
@@ -514,6 +588,15 @@ public sealed class StunTurnServer : BackgroundService
     private static string EndpointKey(IPEndPoint endpoint) => $"{endpoint.Address}:{endpoint.Port}";
 
     private static string PermissionKey(IPEndPoint endpoint) => endpoint.Address.ToString();
+
+    private static int RelayWorkerCount(int configured)
+    {
+        if (configured > 0)
+        {
+            return configured;
+        }
+        return Math.Max(2, Math.Min(8, Environment.ProcessorCount));
+    }
 
     private static (int Min, int Max) RelayPortRange(int min, int max)
     {

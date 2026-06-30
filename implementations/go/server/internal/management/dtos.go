@@ -43,6 +43,13 @@ type ClientResult struct {
 	Client ClientView `json:"client"`
 }
 
+// ClientDetail is the aggregate detail shape used by the management drawer.
+type ClientDetail struct {
+	Client     ClientView      `json:"client"`
+	Tunnels    []TunnelView    `json:"tunnels"`
+	HTTPRoutes []HTTPRouteView `json:"httpRoutes"`
+}
+
 // CredentialView is the JSON representation of a startup credential.
 type CredentialView struct {
 	ID                 int64  `json:"id"`

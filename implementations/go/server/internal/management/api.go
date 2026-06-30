@@ -70,6 +70,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/admin/users/{username}", a.requireAuth(a.handleDeleteUser))
 
 	mux.HandleFunc("GET /api/admin/clients", a.requireAuth(a.handleListClients))
+	mux.HandleFunc("GET /api/admin/clients/{id}", a.requireAuth(a.handleGetClient))
 	mux.HandleFunc("POST /api/admin/clients", a.requireAuth(a.handleCreateClient))
 	mux.HandleFunc("PUT /api/admin/clients/{id}", a.requireAuth(a.handleUpdateClient))
 	mux.HandleFunc("DELETE /api/admin/clients/{id}", a.requireAuth(a.handleDeleteClient))
@@ -549,6 +550,47 @@ func (a *API) handleListClients(w http.ResponseWriter, r *http.Request) {
 		views = append(views, a.clientView(r.Context(), clients[i]))
 	}
 	writeJSON(w, http.StatusOK, views)
+}
+
+func (a *API) handleGetClient(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	clientID, err := pathInt(r, "id")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	account, err := a.requireClientAccess(r.Context(), principal, clientID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	tunnels, err := a.db.ListTunnels(r.Context(), &clientID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	routes, err := a.db.ListHTTPRoutes(r.Context(), &clientID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	tunnelViews := make([]TunnelView, 0, len(tunnels))
+	for _, tunnel := range tunnels {
+		tunnelViews = append(tunnelViews, tunnelView(tunnel))
+	}
+	routeViews := make([]HTTPRouteView, 0, len(routes))
+	for _, route := range routes {
+		routeViews = append(routeViews, httpRouteView(route))
+	}
+	writeJSON(w, http.StatusOK, ClientDetail{
+		Client:     a.clientView(r.Context(), *account),
+		Tunnels:    tunnelViews,
+		HTTPRoutes: routeViews,
+	})
 }
 
 func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {

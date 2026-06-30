@@ -82,6 +82,54 @@ public sealed class ManagementQueryService
         }).ToList();
     }
 
+    public async Task<ClientDetailView> GetClientAsync(ManagementContext context, long id,
+        CancellationToken cancellationToken)
+    {
+        await _traffic.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+        var account = await VisibleAccounts(context).AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == id, cancellationToken)
+            .ConfigureAwait(false) ?? throw new ArgumentException($"client not found: {id}");
+        var totals = await _db.TrafficUsages.AsNoTracking()
+            .Where(t => t.ClientId == id
+                        && (t.TenantId == context.TenantId || t.TenantId == null || t.TenantId == string.Empty))
+            .GroupBy(t => t.ClientId)
+            .Select(g => new
+            {
+                Upload = g.Sum(t => t.UploadBytes),
+                Download = g.Sum(t => t.DownloadBytes),
+            })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var session = _sessions.Find(account.ClientName);
+        var client = new ClientAccountView(
+            account.Id,
+            account.ClientName,
+            account.OwnerUsername,
+            account.Enabled,
+            account.ConnectionRateLimitPerMinute,
+            session is not null,
+            session?.LoginTimeMs,
+            totals?.Upload ?? 0,
+            totals?.Download ?? 0,
+            account.CreatedAt.ToString("O"),
+            account.UpdatedAt.ToString("O"));
+        var tunnels = await _db.TunnelMappings.AsNoTracking()
+            .Where(t => t.ClientId == id)
+            .OrderByDescending(t => t.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var httpRoutes = await _db.HttpRouteMappings.AsNoTracking()
+            .Where(r => r.ClientId == id)
+            .OrderByDescending(r => r.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return new ClientDetailView(
+            client,
+            tunnels.Select(ToTunnelView).ToList(),
+            httpRoutes.Select(ToHttpRouteView).ToList());
+    }
+
     public async Task<OverviewResponse> GetOverviewAsync(ManagementContext context,
         CancellationToken cancellationToken)
     {
@@ -522,6 +570,30 @@ public sealed class ManagementQueryService
         usage.UploadBytes,
         usage.DownloadBytes,
         usage.UpdatedAt.ToString("O"));
+
+    private static TunnelMappingView ToTunnelView(TunnelMapping mapping) => new(
+        mapping.Id,
+        mapping.ClientId,
+        mapping.ClientName,
+        mapping.ListenPort,
+        mapping.TargetAddress,
+        mapping.TargetPort,
+        mapping.Enabled,
+        mapping.DetailCaptureEnabled,
+        mapping.CreatedAt.ToString("O"),
+        mapping.UpdatedAt.ToString("O"));
+
+    private static HttpRouteView ToHttpRouteView(HttpRouteMapping row) => new(
+        row.Id,
+        row.ClientId,
+        row.ClientName,
+        row.Route,
+        row.TargetBaseUrl,
+        row.Enabled,
+        row.DetailCaptureEnabled,
+        row.PathRewriteEnabled,
+        row.CreatedAt.ToString("O"),
+        row.UpdatedAt.ToString("O"));
 
     private static ResourceTrafficUsageView ToResourceTrafficView(ResourceTrafficUsage usage) => new(
         usage.Id,

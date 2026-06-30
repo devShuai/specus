@@ -208,6 +208,33 @@ func TestClientAndTunnelCrud(t *testing.T) {
 		t.Fatalf("expected detail capture enabled in tunnel response")
 	}
 
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/http-routes", token,
+		`{"route":"crud-detail","targetBaseUrl":"https://example.com/base","enabled":true,"detailCaptureEnabled":true}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create http route status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = authRequest(t, ts, http.MethodGet, "/api/admin/clients/"+itoa(created.Client.ID), token, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("client detail status %d", resp.StatusCode)
+	}
+	var detail struct {
+		Client  management_ClientView `json:"client"`
+		Tunnels []struct {
+			ListenPort int `json:"listenPort"`
+		} `json:"tunnels"`
+		HTTPRoutes []struct {
+			Route string `json:"route"`
+		} `json:"httpRoutes"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&detail)
+	resp.Body.Close()
+	if detail.Client.ID != created.Client.ID || len(detail.Tunnels) != 1 || len(detail.HTTPRoutes) != 1 ||
+		detail.HTTPRoutes[0].Route != "crud-detail" {
+		t.Fatalf("unexpected client detail: %+v", detail)
+	}
+
 	// nat-control push should 409 because the client is offline.
 	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/nat-control", token, "")
 	if resp.StatusCode != http.StatusConflict {

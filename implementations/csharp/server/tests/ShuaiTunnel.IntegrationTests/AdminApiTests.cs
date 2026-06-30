@@ -131,6 +131,33 @@ public sealed class AdminApiTests : IAsyncLifetime
         Assert.Equal("Phase4 CRUD renamed", updated!.Client.ClientName);
         Assert.False(updated.Client.Enabled);
 
+        var createTunnel = await client.PostAsJsonAsync($"/api/admin/clients/{created.Client.Id}/tunnels", new
+        {
+            listenPort = 45998,
+            targetAddress = "127.0.0.1",
+            targetPort = 8080,
+            enabled = true,
+            detailCaptureEnabled = true,
+        });
+        Assert.Equal(HttpStatusCode.Created, createTunnel.StatusCode);
+
+        var createRoute = await client.PostAsJsonAsync($"/api/admin/clients/{created.Client.Id}/http-routes", new
+        {
+            route = "phase4-detail",
+            targetBaseUrl = "https://example.com/base",
+            enabled = true,
+            detailCaptureEnabled = true,
+        });
+        Assert.Equal(HttpStatusCode.Created, createRoute.StatusCode);
+
+        var detail = await client.GetFromJsonAsync<ClientDetailBody>(
+            $"/api/admin/clients/{created.Client.Id}", JsonOptions);
+        Assert.NotNull(detail);
+        Assert.Equal(created.Client.Id, detail!.Client.Id);
+        Assert.Single(detail.Tunnels);
+        Assert.Single(detail.HttpRoutes);
+        Assert.Equal("phase4-detail", detail.HttpRoutes[0].Route);
+
         var delete = await client.DeleteAsync($"/api/admin/clients/{created.Client.Id}");
         Assert.Equal(HttpStatusCode.NoContent, delete.StatusCode);
 
@@ -1012,6 +1039,8 @@ public sealed class AdminApiTests : IAsyncLifetime
         string UpdatedAt);
 
     private sealed record ClientResultBody(ClientBody Client);
+
+    private sealed record ClientDetailBody(ClientBody Client, List<TunnelBody> Tunnels, List<HttpRouteBody> HttpRoutes);
 
     private sealed record CredentialBody(CredentialViewBody Credential, string? Secret);
 

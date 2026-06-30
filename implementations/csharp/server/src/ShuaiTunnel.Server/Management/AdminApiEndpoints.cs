@@ -181,6 +181,11 @@ public static class AdminApiEndpoints
                 CancellationToken cancellationToken) =>
                 service.ListClientsAsync(ManagementContext.From(context, authOptions.Value), cancellationToken));
 
+        app.MapGet("/api/admin/clients/{id:long}",
+            (HttpContext context, long id, IOptions<AuthOptions> authOptions, ManagementQueryService service,
+                CancellationToken cancellationToken) =>
+                service.GetClientAsync(ManagementContext.From(context, authOptions.Value), id, cancellationToken));
+
         app.MapPost("/api/admin/clients",
             async (HttpContext context, ClientMutation request, IOptions<AuthOptions> authOptions,
                 ManagementMutationService service, CancellationToken cancellationToken) =>

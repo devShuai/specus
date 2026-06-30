@@ -25,6 +25,11 @@ public sealed record ClientMutation(
 
 public sealed record ClientResult(ClientAccountView Client);
 
+public sealed record ClientDetailView(
+    ClientAccountView Client,
+    IReadOnlyList<TunnelMappingView> Tunnels,
+    IReadOnlyList<HttpRouteView> HttpRoutes);
+
 public sealed record CredentialMutation(
     string? ApiKey,
     string? Secret,

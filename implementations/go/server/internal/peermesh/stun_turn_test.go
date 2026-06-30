@@ -114,6 +114,30 @@ func TestStunTurnRefreshRejectsExpiredAllocationBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestStunTurnRefreshReturnsGrantedServerLifetime(t *testing.T) {
+	server := newStunTurnTestServer(t)
+	primary := listenUDP(t)
+	client := listenUDP(t)
+	server.primary = primary
+
+	if _, err := server.allocate(context.Background(), udpAddr(client)); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	tx := newStunTransactionID()
+	request := newStunMessage(stunRefreshRequest, tx, stunAttrLifetimeValue(120))
+	if err := server.refresh(request, udpAddr(client)); err != nil {
+		t.Fatalf("refresh allocation: %v", err)
+	}
+	response := readStunMessage(t, client)
+	if response.Type != stunRefreshSuccess {
+		t.Fatalf("refresh response type = 0x%x, want success", response.Type)
+	}
+	if got := response.lifetimeSeconds(0); got != 60 {
+		t.Fatalf("refresh lifetime = %d, want granted server ttl 60", got)
+	}
+}
+
 func TestStunTurnCleanupRemovesExpiredAllocation(t *testing.T) {
 	server := newStunTurnTestServer(t)
 	remote := &net.UDPAddr{IP: net.ParseIP("192.0.2.13"), Port: 50003}
