@@ -22,7 +22,7 @@
 
 多语言实现当前状态：
 
-* Java client 是完整参考实现，Linux TUN 与随包 Wintun 均已支持。
+* Java client 是完整参考实现，Linux TUN、随包 Wintun 与 macOS utun 均已支持。
 * Go server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；过期 allocation 按 Java 语义清理并由新 Allocate 重建。
 * .NET server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；同时提供公开 `/api/public/peer-mesh/stun-config` 用于 NAT 检测页面和外部探测。
 * Go client 已支持 Linux TUN、随包 Windows Wintun、macOS utun、Java 兼容 X25519/HKDF/AES-GCM frame、direct UDP 与标准 TURN relay data indication。
@@ -95,8 +95,9 @@ NAT 类型探测说明：
 * `noop`：默认值，只做控制面、候选交换、UDP 探测、加密 frame 数据面，不创建虚拟网卡。
 * `linux-tun`：Linux 使用 `/dev/net/tun` 创建 TUN。
 * `windows-wintun` 或 `wintun`：Windows 使用 Wintun。
-* `utun`、`macos-utun` 或 `darwin-utun`：Go / .NET 客户端可在 macOS 使用 utun；Java 参考客户端当前未实现 macOS 虚拟网卡。
-* `auto`：Java 参考客户端会按当前操作系统选择 Linux TUN 或 Windows Wintun；Go / .NET 客户端还会在 macOS 选择 utun，不支持的平台回退 noop。
+* `mac-utun` 或 `utun`：Java 客户端可在 macOS 使用 utun；配置 `peerMeshTunName=utun5` 时会尽量请求固定编号，否则由系统自动分配 `utunN`。
+* `utun`、`macos-utun` 或 `darwin-utun`：Go / .NET 客户端可在 macOS 使用 utun。
+* `auto`：Java 参考客户端会按当前操作系统选择 Linux TUN、Windows Wintun 或 macOS utun；Go / .NET 客户端也会在 macOS 选择 utun，不支持的平台回退 noop。
 
 `peerMeshMtu` 与 Java 参考实现保持一致，客户端会归一化到 `576..1280`。示例使用 `1280`，为 UDP 封装、AES-GCM tag 和公网路径预留空间，降低分片导致的丢包概率。
 

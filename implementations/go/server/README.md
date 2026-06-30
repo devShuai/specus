@@ -63,7 +63,7 @@ go build ./cmd/shuai-tunnel-server
 | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | Relay allocation TTL | 300 |
 | `TUNNEL_PEER_MESH_RELAY_MIN_PORT` / `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | 标准 TURN relay allocation 端口范围 | 49152 / 65535 |
 | `TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` / `TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | Java relay worker 配置；Go 标准 TURN 当前由 relay socket goroutine 处理，先读取保留 | 0 / 10000 |
-| `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` | Java relay 流量聚合 flush 间隔；Go 当前 relay 热路径直接计量，先读取保留 | 5000 |
+| `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` | Peer Mesh relay 流量聚合 flush 间隔；Go server 与 Java 一样在 relay 热路径聚合、后台批量落库 | 5000 |
 | `TUNNEL_TLS_MODE` | `disabled` / `file` / `self-signed` | disabled |
 | `TUNNEL_TLS_KEYSTORE` / `TUNNEL_TLS_KEYSTORE_PASSWORD` | PKCS12 / PFX keystore 与密码(mode=file) | - |
 | `TUNNEL_TLS_CERT_FILE` / `TUNNEL_TLS_KEY_FILE` | PEM 证书/私钥(mode=file) | - |
@@ -88,7 +88,7 @@ TUNNEL_CONNECTIONSTRINGS_TUNNEL="user:pass@tcp(localhost:3306)/shuai?parseTime=t
 
 映射表已包含 Java 管理面当前使用的通道级开关：TCP 映射的 `detail_capture_enabled`，HTTP 路由的 `detail_capture_enabled` 与 `path_rewrite_enabled`。这些字段默认关闭，启动迁移会对历史库幂等补列；当前 Go server 已能通过管理 API 保存和返回这些配置，并在 `path_rewrite_enabled=true` 时对可文本化 HTTP 响应做路径改写。
 
-资源级流量和 HTTP/TCP 明细采集也已对齐到 Java 管理契约：TCP 映射 / HTTP route 会聚合写入 `tunnel_resource_traffic_usage`，Direct HTTP 成功/失败响应会写入 `tunnel_http_traffic_exchange`，TCP 端口映射双向 payload 会写入 `tunnel_tcp_traffic_frame`；明细采集热路径只入队，后台按配置批量 flush，管理明细查询前会主动 flush 一次；管理 API 支持资源流量列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询。HTTP 响应展示已兼容 `gzip`、`deflate` 的 zlib / raw deflate，以及 `br` Brotli 解码。
+资源级流量和 HTTP/TCP 明细采集也已对齐到 Java 管理契约：TCP 映射 / HTTP route 会聚合写入 `tunnel_resource_traffic_usage`，Direct HTTP 成功/失败响应会写入 `tunnel_http_traffic_exchange`，TCP 端口映射双向 payload 会写入 `tunnel_tcp_traffic_frame`；明细采集热路径只入队，后台按配置批量 flush，管理明细查询默认不打断批量节奏，只有显式传 `flush=true` 时才会先 flush 再查；管理 API 支持资源流量列表、HTTP 分页与字段搜索、TCP 分页、单帧详情、按 channel 串流查询和 `inspection-status` 采集状态。HTTP 响应展示已兼容 `gzip`、`deflate` 的 zlib / raw deflate，以及 `br` Brotli 解码。
 
 TCP 转发背压已对齐 Java/.NET 的 high/low watermark 语义：控制通道写入和外部 socket 写入都会按 `TUNNEL_NETTY_WRITE_BUFFER_LOW_WATER_MARK` / `TUNNEL_NETTY_WRITE_BUFFER_HIGH_WATER_MARK` 统计待写字节；超过高水位会暂停对应读循环，回落到低水位后恢复，避免慢 client 或慢公网连接造成无界积压。
 

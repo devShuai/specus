@@ -74,7 +74,7 @@ dotnet publish src/ShuaiTunnel.Client -c Release -o out
   公共 STUN srflx 候选、UDP connectivity check、path-report 与 direct-only traffic-report；relay 字节由服务端 relay 热路径计量；已补 Java 兼容 `SPM1` AES-GCM frame codec 和 replay window。
   Linux 使用 `/dev/net/tun`，Windows 会随 build/publish 输出 `native/windows/<arch>/wintun.dll`，
   并支持通过 `SHUAI_PEER_MESH_WINTUN_DLL` 覆盖，macOS 使用 `utun`。启用 `peerMeshDevice=linux-tun`、`windows-wintun`、
-  `utun`、`macos-utun`、`darwin-utun` 或 `auto` 后，虚拟网卡出站 IPv4 packet 会按目标虚拟 IP
+  `mac-utun`、`utun`、`macos-utun`、`darwin-utun` 或 `auto` 后，虚拟网卡出站 IPv4 packet 会按目标虚拟 IP
   查 peer session 并封装为加密 UDP frame，入站 frame 解密后写回虚拟网卡。
 - **关停**:`IHostApplicationLifetime` 取消,关闭控制 socket;**不发** `LogoutRequest`(对齐 Java)。
 

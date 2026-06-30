@@ -137,7 +137,7 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `serverBaseUrl` | 服务端管理 HTTP 地址，客户端会调用 `/api/client/auth/login` 获取运行时连接信息 |
 | `apiKey` | 管理后台创建的客户端启动凭证 key |
 | `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求 |
-| `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`auto` |
+| `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`mac-utun`、`utun`、`auto` |
 | `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `shuai0` |
 | `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化，避免 UDP 封装后公网路径分片丢包 |
 
@@ -316,7 +316,7 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 
 公网安全组 / 防火墙需要放行 `3478/udp`、`3479/udp` 和 relay 分配端口范围（默认 `49152-65535/udp`）。如果不希望开放完整高端口范围，可以把 `relay-min-port` / `relay-max-port` 收窄到可控区间，并同步开放该区间。
 
-客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；Go / .NET 客户端还支持 `utun` / `macos-utun` / `darwin-utun` 以接入 macOS utun；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
+客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；Java / Go / .NET 客户端均支持 `utun` 接入 macOS utun，其中 Java 可使用 `mac-utun` / `utun`，`auto` 会按系统选择；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
 
 管理后台的「私有组网」页面展示设备虚拟 IP、在线状态、虚拟网卡状态、NAT 类型、候选 Endpoint、链路和活跃会话，并支持启停设备、配置 ACL、分页查看会话、清理活跃会话和链路。公开的浏览器 NAT 检测页会调用 `/api/public/peer-mesh/stun-config` 获取自建 STUN，再结合配置的公共 STUN 进行 WebRTC 探测。
 
@@ -449,7 +449,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
 - Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled` 管理字段以及 HTTP 路由的 `pathRewriteEnabled` 配置和回包路径改写行为
 - Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
-- Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；C server 只保留轻量兼容面
+- Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 只保留轻量兼容面
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 实现边界：

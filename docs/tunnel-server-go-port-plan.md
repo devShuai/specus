@@ -32,7 +32,7 @@ implementations/go/server/
 ### G4 — 管理 API + JWT + WebSocket + Direct HTTP + SPA + 归档 ✅
 - 全量 `/auth/*`、`/api/admin/*`(overview/clients/tunnels/http-routes/connections/traffic/connection-stats/nat-control/database-initialize)、`/oidc-config`、`/health`。
 - 本地 HS256 JWT;`/ws/connections`(?token,403+X-Auth-Reason)连接事件广播;Direct HTTP `/http/{client}/{route}/{**rest}`;CRUD 后热推 NAT_CONTROL;改名/停用/删除踢线;CSP/安全头;SPA go:embed;连接明细默认每小时归档 60 天前记录→月度统计，可通过 Java 同名 `TUNNEL_CONNECTION_*` 环境变量调整。
-- HTTP/TCP 明细采集热路径已改为 Java 对齐的队列模型：通道开启时先入队，后台按 `TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` 批量写入 DB/ES，`TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING` 和 `TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` 控制积压与批量大小；明细查询前会主动 flush。
+- HTTP/TCP 明细采集热路径已改为 Java 对齐的队列模型：通道开启时先入队，后台按 `TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` 批量写入 DB/ES，`TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING` 和 `TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` 控制积压与批量大小；明细查询默认不强制 flush，需要追最新数据时可显式传 `flush=true`。
 - **验收**:admin 鉴权 / 登录 / overview / client+tunnel CRUD / nat-control 离线 409 / 路由校验 / Direct HTTP 离线 503。
 
 ### G5 — OIDC + TLS ✅
