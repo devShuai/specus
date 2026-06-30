@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/devShuai/shuai-tunnel/tunnel-server-go/internal/auth"
@@ -42,6 +43,8 @@ const (
 	StatusNegotiating = "NEGOTIATING"
 	StatusActive      = "ACTIVE"
 	StatusClosed      = "CLOSED"
+
+	relayAuthorizationCacheTTL = 30 * time.Second
 )
 
 // AccessContext is the tiny management-auth shape needed by Peer Mesh.
@@ -122,6 +125,14 @@ type SessionView struct {
 	ClosedAt         *string `json:"closedAt,omitempty"`
 }
 
+type SessionPage struct {
+	Items      []SessionView `json:"items"`
+	Total      int           `json:"total"`
+	Page       int           `json:"page"`
+	Size       int           `json:"size"`
+	TotalPages int           `json:"totalPages"`
+}
+
 type PublicStunConfig struct {
 	PeerMeshEnabled      bool     `json:"peerMeshEnabled"`
 	SelfHostedStunServer string   `json:"selfHostedStunServer"`
@@ -196,10 +207,21 @@ type sessionGrant struct {
 }
 
 type Service struct {
-	cfg      config.PeerMeshConfig
-	db       *store.DB
-	sessions *session.Registry
-	logger   *slog.Logger
+	cfg                 config.PeerMeshConfig
+	db                  *store.DB
+	sessions            *session.Registry
+	logger              *slog.Logger
+	relayMu             sync.Mutex
+	relayAuthorizations map[int64]relayAuthorization
+	pendingRelayBytes   map[int64]int64
+}
+
+type relayAuthorization struct {
+	sourceClientID   int64
+	targetClientID   int64
+	active           bool
+	sessionExpiresAt time.Time
+	cacheExpiresAt   time.Time
 }
 
 func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, logger *slog.Logger) *Service {
@@ -218,7 +240,14 @@ func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, lo
 	if cfg.SessionCleanupIntervalMs <= 0 {
 		cfg.SessionCleanupIntervalMs = 60000
 	}
-	return &Service{cfg: cfg, db: db, sessions: sessions, logger: logger}
+	if cfg.RelayTrafficFlushIntervalMs <= 0 {
+		cfg.RelayTrafficFlushIntervalMs = 5000
+	}
+	return &Service{
+		cfg: cfg, db: db, sessions: sessions, logger: logger,
+		relayAuthorizations: make(map[int64]relayAuthorization),
+		pendingRelayBytes:   make(map[int64]int64),
+	}
 }
 
 func (s *Service) Enabled() bool {
@@ -229,11 +258,14 @@ func (s *Service) AuthorizeRelayFrame(ctx context.Context, header DataFrameHeade
 	if s == nil || bytes <= 0 {
 		return false
 	}
+	now := time.Now()
+	if s.authorizeRelayFrameCached(header, bytes, now) {
+		return true
+	}
 	item, err := s.db.GetPeerMeshSession(ctx, header.SessionID)
 	if err != nil || item == nil {
 		return false
 	}
-	now := time.Now()
 	if s.closeIfExpired(item, now) {
 		_ = s.db.UpdatePeerMeshSession(ctx, *item)
 		return false
@@ -244,27 +276,38 @@ func (s *Service) AuthorizeRelayFrame(ctx context.Context, header DataFrameHeade
 	forward := header.FromClientID == item.SourceClientID && header.ToClientID == item.TargetClientID
 	reverse := header.FromClientID == item.TargetClientID && header.ToClientID == item.SourceClientID
 	if !forward && !reverse {
+		s.removeRelaySession(header.SessionID)
 		return false
 	}
-	s.applyTraffic(item, 0, bytes, now)
-	return s.db.UpdatePeerMeshSession(ctx, *item) == nil
+	s.cacheRelayAuthorization(*item, now)
+	s.addPendingRelayBytes(header.SessionID, bytes)
+	return true
 }
 
 func (s *Service) Run(ctx context.Context) {
 	if s == nil {
 		return
 	}
-	ticker := time.NewTicker(time.Duration(s.cfg.SessionCleanupIntervalMs) * time.Millisecond)
-	defer ticker.Stop()
+	sessionTicker := time.NewTicker(time.Duration(s.cfg.SessionCleanupIntervalMs) * time.Millisecond)
+	defer sessionTicker.Stop()
+	relayTicker := time.NewTicker(time.Duration(s.cfg.RelayTrafficFlushIntervalMs) * time.Millisecond)
+	defer relayTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			if err := s.FlushRelayTraffic(context.Background()); err != nil {
+				s.logger.Warn("peer mesh relay traffic final flush failed", "err", err)
+			}
 			return
-		case <-ticker.C:
+		case <-sessionTicker.C:
 			if n, err := s.expireStaleSessions(ctx, 500); err != nil {
 				s.logger.Warn("peer mesh session cleanup failed", "err", err)
 			} else if n > 0 {
 				s.logger.Debug("peer mesh sessions expired", "count", n)
+			}
+		case <-relayTicker.C:
+			if err := s.FlushRelayTraffic(ctx); err != nil {
+				s.logger.Warn("peer mesh relay traffic flush failed", "err", err)
 			}
 		}
 	}
@@ -642,6 +685,41 @@ func (s *Service) ListSessions(ctx context.Context, access AccessContext, limit 
 		views = append(views, sessionView(item))
 	}
 	return views, nil
+}
+
+func (s *Service) ListSessionsPage(ctx context.Context, access AccessContext, page, size int, openOnly bool) (SessionPage, error) {
+	_, _ = s.expireStaleSessions(ctx, 500)
+	if page < 0 {
+		page = 0
+	}
+	if size <= 0 || size > 200 {
+		size = 100
+	}
+	var ids []int64
+	filterIDs := false
+	if !access.Admin {
+		var err error
+		ids, err = s.visibleClientIDs(ctx, access)
+		if err != nil {
+			return SessionPage{}, err
+		}
+		filterIDs = true
+	}
+	sessions, total, err := s.db.ListPeerMeshSessionsPage(ctx, access.TenantID, ids, filterIDs, page, size, openOnly, StatusClosed)
+	if err != nil {
+		return SessionPage{}, err
+	}
+	views := make([]SessionView, 0, len(sessions))
+	for _, item := range sessions {
+		views = append(views, sessionView(item))
+	}
+	return SessionPage{
+		Items:      views,
+		Total:      total,
+		Page:       page,
+		Size:       size,
+		TotalPages: totalPages(total, size),
+	}, nil
 }
 
 func (s *Service) ForceClose(ctx context.Context, access AccessContext, sessionID int64) (SessionView, error) {
@@ -1148,6 +1226,40 @@ func (s *Service) expireStaleSessions(ctx context.Context, limit int) (int, erro
 	return len(items), nil
 }
 
+// FlushRelayTraffic batches TURN relay byte counters into peer sessions. The relay hot path
+// only validates frames and accumulates bytes in memory.
+func (s *Service) FlushRelayTraffic(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	pending := s.drainPendingRelayBytes()
+	if len(pending) == 0 {
+		return nil
+	}
+	now := time.Now()
+	for sessionID, bytes := range pending {
+		if bytes <= 0 {
+			continue
+		}
+		item, err := s.db.GetPeerMeshSession(ctx, sessionID)
+		if err != nil || item == nil {
+			s.removeRelaySession(sessionID)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		if !s.closeIfExpired(item, now) {
+			s.applyTraffic(item, 0, bytes, now)
+		}
+		if err := s.db.UpdatePeerMeshSession(ctx, *item); err != nil {
+			s.addPendingRelayBytes(sessionID, bytes)
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) closeIfExpired(item *store.PeerMeshSession, now time.Time) bool {
 	if item.Status == StatusClosed {
 		return true
@@ -1165,6 +1277,7 @@ func (s *Service) markClosed(item *store.PeerMeshSession, now time.Time) {
 		item.ClosedAt = &now
 	}
 	item.UpdatedAt = now
+	s.removeRelaySession(item.ID)
 }
 
 func (s *Service) applyTraffic(item *store.PeerMeshSession, directBytes, relayBytes int64, now time.Time) {
@@ -1175,6 +1288,77 @@ func (s *Service) applyTraffic(item *store.PeerMeshSession, directBytes, relayBy
 	item.RelayBytes = saturatedAdd(item.RelayBytes, relayBytes)
 	item.LastTrafficAt = &now
 	item.UpdatedAt = now
+}
+
+func (s *Service) authorizeRelayFrameCached(header DataFrameHeader, bytes int64, now time.Time) bool {
+	s.relayMu.Lock()
+	authz, ok := s.relayAuthorizations[header.SessionID]
+	if !ok || !authz.validAt(now) {
+		if ok {
+			delete(s.relayAuthorizations, header.SessionID)
+		}
+		s.relayMu.Unlock()
+		return false
+	}
+	if !authz.matches(header) {
+		s.relayMu.Unlock()
+		return false
+	}
+	s.pendingRelayBytes[header.SessionID] += bytes
+	s.relayMu.Unlock()
+	return true
+}
+
+func (s *Service) cacheRelayAuthorization(item store.PeerMeshSession, now time.Time) {
+	s.relayMu.Lock()
+	s.relayAuthorizations[item.ID] = relayAuthorization{
+		sourceClientID:   item.SourceClientID,
+		targetClientID:   item.TargetClientID,
+		active:           item.Status == StatusActive,
+		sessionExpiresAt: item.ExpiresAt,
+		cacheExpiresAt:   now.Add(relayAuthorizationCacheTTL),
+	}
+	s.relayMu.Unlock()
+}
+
+func (s *Service) addPendingRelayBytes(sessionID int64, bytes int64) {
+	if sessionID <= 0 || bytes <= 0 {
+		return
+	}
+	s.relayMu.Lock()
+	s.pendingRelayBytes[sessionID] += bytes
+	s.relayMu.Unlock()
+}
+
+func (s *Service) drainPendingRelayBytes() map[int64]int64 {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	if len(s.pendingRelayBytes) == 0 {
+		return nil
+	}
+	pending := s.pendingRelayBytes
+	s.pendingRelayBytes = make(map[int64]int64)
+	return pending
+}
+
+func (s *Service) removeRelaySession(sessionID int64) {
+	if sessionID <= 0 {
+		return
+	}
+	s.relayMu.Lock()
+	delete(s.relayAuthorizations, sessionID)
+	delete(s.pendingRelayBytes, sessionID)
+	s.relayMu.Unlock()
+}
+
+func (a relayAuthorization) validAt(now time.Time) bool {
+	return a.active && a.cacheExpiresAt.After(now) && (a.sessionExpiresAt.IsZero() || a.sessionExpiresAt.After(now))
+}
+
+func (a relayAuthorization) matches(header DataFrameHeader) bool {
+	forward := header.FromClientID == a.sourceClientID && header.ToClientID == a.targetClientID
+	reverse := header.FromClientID == a.targetClientID && header.ToClientID == a.sourceClientID
+	return forward || reverse
 }
 
 func (s *Service) deviceView(device store.PeerMeshDevice) DeviceView {
@@ -1212,6 +1396,13 @@ func sessionView(item store.PeerMeshSession) SessionView {
 		UpdatedAt: item.UpdatedAt.Format(time.RFC3339Nano), ExpiresAt: item.ExpiresAt.Format(time.RFC3339Nano),
 		ClosedAt: timePtrString(item.ClosedAt),
 	}
+}
+
+func totalPages(total, size int) int {
+	if total <= 0 || size <= 0 {
+		return 0
+	}
+	return (total + size - 1) / size
 }
 
 func (s *Service) resolvePeerHost(requestHost string) string {

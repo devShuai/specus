@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -33,6 +34,9 @@ public sealed class PeerMeshService
     private const string TypeTrafficReport = "traffic-report";
     private const string TypeDeviceReport = "device-report";
     private const string TypeClose = "close";
+    private static readonly TimeSpan RelayAuthorizationCacheTtl = TimeSpan.FromSeconds(30);
+    private static readonly ConcurrentDictionary<long, RelayAuthorization> RelayAuthorizations = new();
+    private static readonly ConcurrentDictionary<long, long> PendingRelayBytes = new();
 
     private readonly TunnelDbContext _db;
     private readonly SessionRegistry _sessions;
@@ -57,6 +61,11 @@ public sealed class PeerMeshService
         {
             return false;
         }
+        var now = DateTimeOffset.UtcNow;
+        if (AuthorizeRelayFrameCached(header, bytes, now))
+        {
+            return true;
+        }
         var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(s => s.Id == header.SessionId,
                 cancellationToken)
             .ConfigureAwait(false);
@@ -64,7 +73,6 @@ public sealed class PeerMeshService
         {
             return false;
         }
-        var now = DateTimeOffset.UtcNow;
         if (CloseIfExpired(session, now))
         {
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -78,10 +86,11 @@ public sealed class PeerMeshService
         var reverse = header.FromClientId == session.TargetClientId && header.ToClientId == session.SourceClientId;
         if (!forward && !reverse)
         {
+            RemoveRelaySession(header.SessionId);
             return false;
         }
-        ApplyTraffic(session, 0, bytes, now);
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        CacheRelayAuthorization(session, now);
+        AddPendingRelayBytes(header.SessionId, bytes);
         return true;
     }
 
@@ -369,6 +378,37 @@ public sealed class PeerMeshService
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         return rows.Select(SessionView).ToList();
+    }
+
+    public async Task<PeerMeshSessionPage> ListSessionsPageAsync(ManagementContext context, int? page, int? size,
+        bool openOnly, CancellationToken cancellationToken)
+    {
+        await ExpireStaleSessionsAsync(cancellationToken).ConfigureAwait(false);
+        var normalizedPage = Math.Max(0, page ?? 0);
+        var normalizedSize = Math.Clamp(size ?? 100, 1, 200);
+        IQueryable<PeerMeshSession> query = _db.PeerMeshSessions.AsNoTracking()
+            .Where(s => s.TenantId == context.TenantId);
+        if (openOnly)
+        {
+            query = query.Where(s => s.Status != StatusClosed);
+        }
+        if (!context.IsAdmin)
+        {
+            var ids = await VisibleClientIdsAsync(context, cancellationToken).ConfigureAwait(false);
+            query = query.Where(s => ids.Contains(s.SourceClientId) || ids.Contains(s.TargetClientId));
+        }
+        var total = await query.LongCountAsync(cancellationToken).ConfigureAwait(false);
+        var rows = await query.OrderByDescending(s => s.UpdatedAt)
+            .Skip(normalizedPage * normalizedSize)
+            .Take(normalizedSize)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return new PeerMeshSessionPage(
+            rows.Select(SessionView).ToList(),
+            total,
+            normalizedPage,
+            normalizedSize,
+            TotalPages(total, normalizedSize));
     }
 
     public async Task<PeerMeshSessionView> ForceCloseAsync(ManagementContext context, long sessionId,
@@ -904,7 +944,36 @@ public sealed class PeerMeshService
         }
     }
 
-    private static bool CloseIfExpired(PeerMeshSession session, DateTimeOffset now)
+    public async Task FlushRelayTrafficAsync(CancellationToken cancellationToken)
+    {
+        var pending = DrainPendingRelayBytes();
+        if (pending.Count == 0)
+        {
+            return;
+        }
+        var now = DateTimeOffset.UtcNow;
+        foreach (var (sessionId, bytes) in pending)
+        {
+            if (bytes <= 0)
+            {
+                continue;
+            }
+            var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(s => s.Id == sessionId, cancellationToken)
+                .ConfigureAwait(false);
+            if (session is null)
+            {
+                RemoveRelaySession(sessionId);
+                continue;
+            }
+            if (!CloseIfExpired(session, now))
+            {
+                ApplyTraffic(session, 0, bytes, now);
+            }
+        }
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private bool CloseIfExpired(PeerMeshSession session, DateTimeOffset now)
     {
         if (session.Status == StatusClosed)
         {
@@ -918,11 +987,12 @@ public sealed class PeerMeshService
         return true;
     }
 
-    private static void MarkClosed(PeerMeshSession session, DateTimeOffset now)
+    private void MarkClosed(PeerMeshSession session, DateTimeOffset now)
     {
         session.Status = StatusClosed;
         session.ClosedAt ??= now;
         session.UpdatedAt = now;
+        RemoveRelaySession(session.Id);
     }
 
     private static void ApplyTraffic(PeerMeshSession session, long directBytes, long relayBytes, DateTimeOffset now)
@@ -935,6 +1005,67 @@ public sealed class PeerMeshService
         session.RelayBytes = SaturatedAdd(session.RelayBytes, relayBytes);
         session.LastTrafficAt = now;
         session.UpdatedAt = now;
+    }
+
+    private static bool AuthorizeRelayFrameCached(PeerDataFrameHeader header, long bytes, DateTimeOffset now)
+    {
+        if (!RelayAuthorizations.TryGetValue(header.SessionId, out var authorization))
+        {
+            return false;
+        }
+        if (!authorization.ValidAt(now))
+        {
+            RemoveRelaySession(header.SessionId);
+            return false;
+        }
+        if (!authorization.Matches(header))
+        {
+            return false;
+        }
+        AddPendingRelayBytes(header.SessionId, bytes);
+        return true;
+    }
+
+    private static void CacheRelayAuthorization(PeerMeshSession session, DateTimeOffset now)
+    {
+        RelayAuthorizations[session.Id] = new RelayAuthorization(
+            session.SourceClientId,
+            session.TargetClientId,
+            string.Equals(session.Status, StatusActive, StringComparison.Ordinal),
+            session.ExpiresAt,
+            now.Add(RelayAuthorizationCacheTtl));
+    }
+
+    private static void AddPendingRelayBytes(long sessionId, long bytes)
+    {
+        if (sessionId <= 0 || bytes <= 0)
+        {
+            return;
+        }
+        PendingRelayBytes.AddOrUpdate(sessionId, bytes, (_, current) => SaturatedAdd(current, bytes));
+    }
+
+    private static Dictionary<long, long> DrainPendingRelayBytes()
+    {
+        var snapshot = new Dictionary<long, long>();
+        foreach (var (sessionId, _) in PendingRelayBytes.ToArray())
+        {
+            if (PendingRelayBytes.TryRemove(sessionId, out var bytes) && bytes > 0)
+            {
+                snapshot[sessionId] = bytes;
+            }
+        }
+        return snapshot;
+    }
+
+    private static void RemoveRelaySession(long sessionId)
+    {
+        if (sessionId <= 0)
+        {
+            return;
+        }
+        RelayAuthorizations.TryRemove(sessionId, out _);
+        PendingRelayBytes.TryRemove(sessionId, out _);
     }
 
     private PeerMeshDeviceView DeviceView(PeerMeshDevice device) => new(
@@ -954,6 +1085,9 @@ public sealed class PeerMeshService
         session.LocalEndpoint, session.RemoteEndpoint, session.DirectBytes, session.RelayBytes,
         Iso(session.LastTrafficAt), Iso(session.StartedAt)!, Iso(session.UpdatedAt)!,
         Iso(session.ExpiresAt)!, Iso(session.ClosedAt));
+
+    private static int TotalPages(long total, int size) =>
+        total <= 0 || size <= 0 ? 0 : (int)((total + size - 1) / size);
 
     private string ResolvePeerHost(string? requestServerName)
     {
@@ -1061,6 +1195,24 @@ public sealed class PeerMeshService
         return long.MaxValue - current < delta ? long.MaxValue : current + delta;
     }
 
+    private sealed record RelayAuthorization(
+        long SourceClientId,
+        long TargetClientId,
+        bool Active,
+        DateTimeOffset SessionExpiresAt,
+        DateTimeOffset CacheExpiresAt)
+    {
+        public bool ValidAt(DateTimeOffset now) =>
+            Active && CacheExpiresAt > now && SessionExpiresAt > now;
+
+        public bool Matches(PeerDataFrameHeader header)
+        {
+            var forward = header.FromClientId == SourceClientId && header.ToClientId == TargetClientId;
+            var reverse = header.FromClientId == TargetClientId && header.ToClientId == SourceClientId;
+            return forward || reverse;
+        }
+    }
+
     private sealed record PeerSessionGrant(PeerMeshSessionView Session, string Token);
 }
 
@@ -1118,6 +1270,13 @@ public sealed record PeerMeshSessionView(
     string UpdatedAt,
     string ExpiresAt,
     string? ClosedAt);
+
+public sealed record PeerMeshSessionPage(
+    IReadOnlyList<PeerMeshSessionView> Items,
+    long Total,
+    int Page,
+    int Size,
+    int TotalPages);
 
 public sealed record PeerMeshDeviceMutation(bool? Enabled);
 

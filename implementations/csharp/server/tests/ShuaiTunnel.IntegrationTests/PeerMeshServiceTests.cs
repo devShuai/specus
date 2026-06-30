@@ -139,8 +139,12 @@ public sealed class PeerMeshServiceTests
         var allowed = await AuthorizeRelayFrameAsync(fixture.Service, 9101, source.Id, target.Id, 7, 512);
 
         Assert.True(allowed);
+        allowed = await AuthorizeRelayFrameAsync(fixture.Service, 9101, target.Id, source.Id, 8, 256);
+        Assert.True(allowed);
+        await fixture.Service.FlushRelayTrafficAsync(CancellationToken.None);
+
         var stored = await ReloadSessionAsync(fixture, 9101);
-        Assert.Equal(512, stored.RelayBytes);
+        Assert.Equal(768, stored.RelayBytes);
         Assert.Equal(0, stored.DirectBytes);
         Assert.NotNull(stored.LastTrafficAt);
         Assert.Equal(PeerMeshService.StatusActive, stored.Status);

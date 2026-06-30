@@ -288,6 +288,46 @@ func (db *DB) ListVisiblePeerMeshSessions(ctx context.Context, tenantID string, 
 	return db.listPeerMeshSessions(ctx, db.rebind(query), args...)
 }
 
+func (db *DB) ListPeerMeshSessionsPage(ctx context.Context, tenantID string, clientIDs []int64, filterClientIDs bool, page, size int, openOnly bool, closedStatus string) ([]PeerMeshSession, int, error) {
+	if filterClientIDs && len(clientIDs) == 0 {
+		return nil, 0, nil
+	}
+	if page < 0 {
+		page = 0
+	}
+	if size <= 0 || size > 200 {
+		size = 100
+	}
+	args := []any{defaultTenant(tenantID)}
+	where := ` WHERE tenant_id = ?`
+	if openOnly {
+		where += ` AND status <> ?`
+		args = append(args, closedStatus)
+	}
+	if filterClientIDs {
+		where += ` AND (source_client_id IN (` + placeholders(len(clientIDs)) + `)
+			OR target_client_id IN (` + placeholders(len(clientIDs)) + `))`
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+	}
+	var total int
+	countQuery := db.rebind(`SELECT COUNT(*) FROM peer_mesh_session` + where)
+	if err := db.sql.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	listArgs := append(append([]any{}, args...), size, page*size)
+	listQuery := db.rebind(`SELECT id, tenant_id, source_client_id, source_client_name, target_client_id,
+		target_client_name, path_type, status, token_hash, started_at, updated_at, expires_at,
+		closed_at, rtt_millis, local_endpoint, remote_endpoint, direct_bytes, relay_bytes,
+		last_traffic_at FROM peer_mesh_session` + where + ` ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+	items, err := db.listPeerMeshSessions(ctx, listQuery, listArgs...)
+	return items, total, err
+}
+
 func (db *DB) ListOpenPeerMeshSessions(ctx context.Context, tenantID string, clientIDs []int64, closedStatus string) ([]PeerMeshSession, error) {
 	args := []any{defaultTenant(tenantID), closedStatus}
 	query := `SELECT id, tenant_id, source_client_id, source_client_name, target_client_id,

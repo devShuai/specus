@@ -170,9 +170,21 @@ func TestAuthorizeRelayFrameRequiresActiveMatchingSessionAndAccountsBytes(t *tes
 	if !allowed {
 		t.Fatalf("AuthorizeRelayFrame active matching session = false, want true")
 	}
+	allowed = service.AuthorizeRelayFrame(ctx, DataFrameHeader{
+		SessionID:    9101,
+		FromClientID: target.ID,
+		ToClientID:   source.ID,
+		Sequence:     8,
+	}, 256)
+	if !allowed {
+		t.Fatalf("AuthorizeRelayFrame cached reverse session = false, want true")
+	}
+	if err := service.FlushRelayTraffic(ctx); err != nil {
+		t.Fatalf("flush relay traffic: %v", err)
+	}
 
 	stored := getPeerSession(t, db, 9101)
-	if stored.RelayBytes != 512 || stored.DirectBytes != 0 || stored.LastTrafficAt == nil {
+	if stored.RelayBytes != 768 || stored.DirectBytes != 0 || stored.LastTrafficAt == nil {
 		t.Fatalf("relay accounting mismatch: %+v", stored)
 	}
 	if stored.Status != StatusActive || stored.ClosedAt != nil {

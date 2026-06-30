@@ -100,12 +100,14 @@ public sealed class TrafficOptions
     public const string SectionName = "Tunnel:Traffic";
 
     public int FlushIntervalMs { get; set; } = 5_000;
-    public bool CaptureDetailEnabled { get; set; } = true;
+    public bool CaptureDetailEnabled { get; set; } = false;
     public int CapturePreviewBytes { get; set; } = 256;
     public int CaptureHeaderChars { get; set; } = 8192;
+    public int CaptureDecodeMaxBytes { get; set; } = 1_048_576;
     public int CaptureMaxPending { get; set; } = 20_000;
     public int CaptureFlushBatchSize { get; set; } = 1_000;
     public int CaptureFlushIntervalMs { get; set; } = 2_000;
+    public double CaptureSampleRate { get; set; } = 1.0;
 }
 
 public sealed class ElasticsearchOptions
@@ -194,6 +196,7 @@ public sealed class PeerMeshOptions
     public int RelayWorkerThreads { get; set; }
     public int RelayWorkerQueueCapacity { get; set; } = 10_000;
     public long SessionCleanupIntervalMs { get; set; } = 60000;
+    public int RelayTrafficFlushIntervalMs { get; set; } = 5000;
 }
 
 public sealed class OidcOptions

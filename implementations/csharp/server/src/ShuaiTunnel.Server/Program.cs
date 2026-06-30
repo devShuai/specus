@@ -94,6 +94,7 @@ builder.Services.AddScoped<ManagementMutationService>();
 builder.Services.AddScoped<ManagementUserService>();
 builder.Services.AddScoped<PeerMeshService>();
 builder.Services.AddHostedService<StunTurnServer>();
+builder.Services.AddHostedService<PeerMeshRelayTrafficFlushService>();
 builder.Services.AddSingleton<ElasticsearchTrafficDetailClient>();
 builder.Services.AddSingleton<TrafficInspectionService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficInspectionService>());
