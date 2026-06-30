@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -137,7 +138,7 @@ func TestPeerMeshNatTypeUsesJavaEnumNames(t *testing.T) {
 	}
 }
 
-func TestPeerMeshGatherCandidatesKeepsOnlyRelayForSymmetricNat(t *testing.T) {
+func TestPeerMeshGatherCandidatesStillTriesDirectForSymmetricNatLikeJava(t *testing.T) {
 	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
@@ -170,11 +171,64 @@ func TestPeerMeshGatherCandidatesKeepsOnlyRelayForSymmetricNat(t *testing.T) {
 
 	candidates := mesh.gatherCandidates()
 
-	if len(candidates) != 1 {
-		t.Fatalf("candidate count = %d, want 1: %+v", len(candidates), candidates)
+	foundSrflx := false
+	foundRelay := false
+	for _, candidate := range candidates {
+		if candidate.Type == "srflx" && candidate.Address == "198.51.100.1" && candidate.Port == 41000 {
+			foundSrflx = true
+		}
+		if candidate.Type == "relay" && candidate.RelayID == "alloc-a" {
+			foundRelay = true
+		}
 	}
-	if candidates[0].Type != "relay" || candidates[0].RelayID != "alloc-a" {
-		t.Fatalf("candidate = %+v, want relay alloc-a", candidates[0])
+	if !foundSrflx || !foundRelay {
+		t.Fatalf("candidates = %+v, want direct srflx and relay", candidates)
+	}
+}
+
+func TestPeerMeshGatherCandidatesIncludesPortMapCandidateEvenWhenNatIsSymmetric(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udp.Close()
+
+	mesh := &peerMeshClient{
+		udp: udp,
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			CIDR: "100.96.0.0/11",
+		}},
+		natByRole: map[string]string{
+			peerRelayProbePrimary:   "198.51.100.1:41000",
+			peerRelayProbeAlternate: "198.51.100.1:42000",
+		},
+		portMap: &peerCandidate{
+			Type:       "srflx",
+			Transport:  "udp",
+			Address:    "203.0.113.20",
+			Port:       52000,
+			Priority:   900,
+			Foundation: "port-map-upnp",
+		},
+		relay: &peerCandidate{
+			Type:      "relay",
+			Transport: "udp",
+			Address:   "203.0.113.10",
+			Port:      7011,
+			RelayID:   "alloc-a",
+		},
+	}
+
+	candidates := mesh.gatherCandidates()
+
+	foundPortMap := false
+	for _, candidate := range candidates {
+		if candidate.Foundation == "port-map-upnp" && candidate.Address == "203.0.113.20" && candidate.Port == 52000 {
+			foundPortMap = true
+		}
+	}
+	if !foundPortMap {
+		t.Fatalf("port-map candidate missing: %+v", candidates)
 	}
 }
 
@@ -400,6 +454,61 @@ func TestPeerMeshRelayProbeDoesNotOverrideHealthyDirectLikeJava(t *testing.T) {
 
 	if session.PathType != "DIRECT" || session.RelayTargetAllocationID != "" {
 		t.Fatalf("session path = %s relay=%q, want healthy direct unchanged", session.PathType, session.RelayTargetAllocationID)
+	}
+}
+
+func TestPeerMeshDirectKeepaliveUsesNominatedEndpointLikeJava(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen client udp: %v", err)
+	}
+	defer udp.Close()
+	direct, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen direct udp: %v", err)
+	}
+	defer direct.Close()
+
+	session := &peerMeshSession{
+		ID:                1001,
+		PeerID:            2,
+		Token:             "token",
+		ExpiresAt:         time.Now().Add(time.Minute),
+		RemoteEndpoint:    direct.LocalAddr().(*net.UDPAddr),
+		PathType:          "DIRECT",
+		LastDirectSuccess: time.Now(),
+		AESKey:            []byte("0123456789abcdef0123456789abcdef"),
+	}
+	mesh := &peerMeshClient{
+		udp:      udp,
+		stopCh:   make(chan struct{}),
+		logger:   log.New(io.Discard, "", 0),
+		runtime:  RuntimeConfig{PeerMesh: PeerMeshConfig{ClientID: 1, CIDR: "100.96.0.0/11"}},
+		sessions: map[int64]*peerMeshSession{2: session},
+		pending:  map[string]pendingPeerProbe{},
+	}
+	defer close(mesh.stopCh)
+
+	mesh.keepaliveDirectPaths()
+
+	packets := readUDPPackets(t, direct, 1)
+	if len(packets) != 1 {
+		t.Fatalf("direct keepalive packets = %d, want 1", len(packets))
+	}
+	var probe peerUDPProbe
+	if err := json.Unmarshal(packets[0], &probe); err != nil {
+		t.Fatalf("decode keepalive probe: %v", err)
+	}
+	if probe.Magic != peerProbeMagic || probe.Type != peerProbeTypeCheck || probe.SessionID != session.ID || probe.Token != session.Token {
+		t.Fatalf("probe = %+v, want direct keepalive check", probe)
+	}
+	if len(mesh.pending) != 1 {
+		t.Fatalf("pending probes = %d, want 1", len(mesh.pending))
+	}
+
+	mesh.keepaliveDirectPaths()
+	if packets := readUDPPackets(t, direct, 1); len(packets) != 0 {
+		t.Fatalf("second keepalive inside throttle sent %d packets", len(packets))
 	}
 }
 

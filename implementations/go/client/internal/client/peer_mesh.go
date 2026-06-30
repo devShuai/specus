@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,9 +38,16 @@ const (
 	peerNatTypeFullConeOrRestricted = "FULL_CONE_OR_RESTRICTED_NAT"
 	peerNatTypeNat                  = "NAT"
 
-	peerPendingPacketTTL       = 8 * time.Second
-	peerMaxPendingPackets      = 32
-	peerPathPrepareMinInterval = 2 * time.Second
+	peerPendingPacketTTL          = 30 * time.Second
+	peerMaxPendingPackets         = 32
+	peerPathPrepareMinInterval    = 2 * time.Second
+	peerPortMappingRetry          = 30 * time.Second
+	peerPortMappingLease          = 7200
+	peerProbeBurstCount           = 3
+	peerProbeBurstInterval        = 30 * time.Millisecond
+	peerMaxAdaptivePredictedPorts = 16
+	peerMaxAdaptivePortDelta      = 512
+	peerDirectKeepaliveInterval   = 25 * time.Second
 )
 
 type peerControlSender func(net.Conn, string, any) error
@@ -65,6 +73,10 @@ type peerMeshClient struct {
 	relay                *peerCandidate
 	relayID              string
 	relayTTL             time.Time
+	portMap              *peerCandidate
+	portMapping          *natPortMapping
+	portMappingService   *natPortMappingService
+	lastPortMapAttempt   time.Time
 	lastRelayRequest     time.Time
 	lastAlternateRequest time.Time
 	natByRole            map[string]string
@@ -137,6 +149,7 @@ type peerMeshSession struct {
 	RelayTargetAllocationID string
 	PathType                string
 	LastDirectSuccess       time.Time
+	LastDirectKeepalive     time.Time
 	LastRelaySuccess        time.Time
 	LastPathLog             time.Time
 	LastPathReport          time.Time
@@ -184,7 +197,7 @@ func newPeerMeshClient(config Config, logger *log.Logger) *peerMeshClient {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &peerMeshClient{config: config, logger: logger}
+	return &peerMeshClient{config: config, logger: logger, portMappingService: newNatPortMappingService(logger)}
 }
 
 func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender peerControlSender) {
@@ -208,6 +221,9 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.natByRole = make(map[string]string)
 	mesh.turnPermissions = make(map[string]time.Time)
 	mesh.localKey = localKey
+	if mesh.portMappingService == nil {
+		mesh.portMappingService = newNatPortMappingService(mesh.logger)
+	}
 	mesh.stopCh = make(chan struct{})
 	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
@@ -235,6 +251,7 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.reportDevice(conn, sender, device.Status(), firstNonEmpty(deviceErr, device.Error()), "", "")
 	go mesh.udpLoop(udp, stopCh)
 	go mesh.maintenanceLoop(stopCh)
+	mesh.tryAcquirePortMappingAsync()
 	mesh.requestRelayCandidates()
 }
 
@@ -270,6 +287,12 @@ func (mesh *peerMeshClient) stopLocked() {
 	mesh.relay = nil
 	mesh.relayID = ""
 	mesh.relayTTL = time.Time{}
+	if mesh.portMappingService != nil && mesh.portMapping != nil {
+		mesh.portMappingService.releaseMapping(*mesh.portMapping)
+	}
+	mesh.portMap = nil
+	mesh.portMapping = nil
+	mesh.lastPortMapAttempt = time.Time{}
 	mesh.lastRelayRequest = time.Time{}
 	mesh.lastAlternateRequest = time.Time{}
 	mesh.natByRole = nil
@@ -333,18 +356,24 @@ func (mesh *peerMeshClient) udpLoop(conn *net.UDPConn, stopCh <-chan struct{}) {
 }
 
 func (mesh *peerMeshClient) maintenanceLoop(stopCh <-chan struct{}) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+	maintenanceTicker := time.NewTicker(15 * time.Second)
+	defer maintenanceTicker.Stop()
+	keepaliveTicker := time.NewTicker(5 * time.Second)
+	defer keepaliveTicker.Stop()
 	for {
 		select {
 		case <-stopCh:
 			return
-		case <-ticker.C:
+		case <-maintenanceTicker.C:
 			mesh.cleanupProbes()
 			mesh.cleanupPendingPackets()
+			mesh.renewPortMappingIfNeeded()
 			mesh.requestRelayCandidates()
 			mesh.probeKnownCandidates()
 			mesh.reportTrafficDeltas()
+		case <-keepaliveTicker.C:
+			mesh.keepaliveDirectPaths()
+			mesh.fallbackStaleDirectPaths()
 		}
 	}
 }
@@ -1045,6 +1074,12 @@ func (mesh *peerMeshClient) sendConnectivityChecks(message peerControlMessage) {
 			continue
 		}
 		mesh.sendProbe(session, candidate)
+		for _, predictedPort := range mesh.adaptivePredictedPorts(candidate, message.Candidates) {
+			predicted := candidate
+			predicted.Port = predictedPort
+			predicted.Foundation = "adaptive-port-predict"
+			mesh.sendProbe(session, predicted)
+		}
 	}
 }
 
@@ -1060,6 +1095,40 @@ func (mesh *peerMeshClient) probeKnownCandidates() {
 	for _, peer := range peers {
 		message := peerControlMessage{SourceClientID: peer.ClientID, Candidates: peer.Candidates}
 		mesh.sendConnectivityChecks(message)
+	}
+}
+
+func (mesh *peerMeshClient) keepaliveDirectPaths() {
+	now := time.Now()
+	type keepalive struct {
+		session  *peerMeshSession
+		endpoint *net.UDPAddr
+	}
+	items := make([]keepalive, 0)
+	mesh.mu.Lock()
+	for _, session := range mesh.sessions {
+		if !session.hasHealthyDirect(now) || now.After(session.ExpiresAt) {
+			continue
+		}
+		if since := now.Sub(session.LastDirectKeepalive); !session.LastDirectKeepalive.IsZero() && since < peerDirectKeepaliveInterval {
+			continue
+		}
+		endpoint := session.RemoteEndpoint
+		if endpoint == nil {
+			continue
+		}
+		items = append(items, keepalive{session: session, endpoint: endpoint})
+	}
+	mesh.mu.Unlock()
+	for _, item := range items {
+		if mesh.isMeshEndpoint(item.endpoint) {
+			continue
+		}
+		if mesh.sendDirectKeepalive(item.session, item.endpoint) {
+			mesh.mu.Lock()
+			item.session.LastDirectKeepalive = time.Now()
+			mesh.mu.Unlock()
+		}
 	}
 }
 
@@ -1107,6 +1176,184 @@ func (mesh *peerMeshClient) sendProbe(session *peerMeshSession, candidate peerCa
 		mesh.mu.Lock()
 		delete(mesh.pending, nonce)
 		mesh.mu.Unlock()
+		return
+	}
+	mesh.scheduleProbeBurst(udp, body, addr, nonce)
+}
+
+func (mesh *peerMeshClient) sendDirectKeepalive(session *peerMeshSession, endpoint *net.UDPAddr) bool {
+	mesh.mu.Lock()
+	udp := mesh.udp
+	runtime := mesh.runtime
+	mesh.mu.Unlock()
+	if udp == nil || session == nil || endpoint == nil || time.Now().After(session.ExpiresAt) {
+		return false
+	}
+	nonce := randomHex(12)
+	probe := peerUDPProbe{
+		Magic:        peerProbeMagic,
+		Type:         peerProbeTypeCheck,
+		SessionID:    session.ID,
+		FromClientID: runtime.PeerMesh.ClientID,
+		ToClientID:   session.PeerID,
+		Nonce:        nonce,
+		Token:        session.Token,
+		SentAtMillis: time.Now().UnixMilli(),
+	}
+	body, _ := json.Marshal(probe)
+	mesh.mu.Lock()
+	mesh.pending[nonce] = pendingPeerProbe{SessionID: session.ID, PeerID: session.PeerID, SentAt: time.Now(), Remote: endpoint.String()}
+	mesh.mu.Unlock()
+	if _, err := udp.WriteToUDP(body, endpoint); err != nil {
+		mesh.mu.Lock()
+		delete(mesh.pending, nonce)
+		mesh.mu.Unlock()
+		mesh.logger.Printf("Peer Mesh direct keepalive send failed: session=%d remote=%s err=%v", session.ID, endpoint, err)
+		return false
+	}
+	return true
+}
+
+func (mesh *peerMeshClient) scheduleProbeBurst(udp *net.UDPConn, body []byte, addr *net.UDPAddr, nonce string) {
+	if udp == nil || addr == nil || peerProbeBurstCount <= 1 {
+		return
+	}
+	for i := 1; i < peerProbeBurstCount; i++ {
+		delay := time.Duration(i) * peerProbeBurstInterval
+		time.AfterFunc(delay, func() {
+			mesh.mu.Lock()
+			_, pending := mesh.pending[nonce]
+			running := mesh.stopCh != nil
+			mesh.mu.Unlock()
+			if !pending || !running {
+				return
+			}
+			_, _ = udp.WriteToUDP(body, addr)
+		})
+	}
+}
+
+func (mesh *peerMeshClient) adaptivePredictedPorts(candidate peerCandidate, allCandidates []peerCandidate) []int {
+	if candidate.Port <= 0 || candidate.Port > 65535 || candidate.Address == "" || strings.EqualFold(candidate.Type, "relay") {
+		return nil
+	}
+	deltas := adaptivePortDeltas(candidate, allCandidates)
+	if len(deltas) == 0 {
+		deltas = mesh.localSrflxPortDeltas()
+	}
+	if len(deltas) == 0 {
+		return nil
+	}
+	ports := make([]int, 0, peerMaxAdaptivePredictedPorts)
+	for _, delta := range deltas {
+		if delta <= 0 || delta > peerMaxAdaptivePortDelta {
+			continue
+		}
+		ports = addPredictedPort(ports, candidate.Port+delta, candidate.Port)
+		ports = addPredictedPort(ports, candidate.Port-delta, candidate.Port)
+		if len(ports) >= peerMaxAdaptivePredictedPorts {
+			break
+		}
+	}
+	return ports
+}
+
+func adaptivePortDeltas(candidate peerCandidate, allCandidates []peerCandidate) []int {
+	if len(allCandidates) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	ports := make([]int, 0, len(allCandidates))
+	for _, item := range allCandidates {
+		if item.Address != candidate.Address || item.Port <= 0 || item.Port > 65535 || strings.EqualFold(item.Type, "relay") {
+			continue
+		}
+		if _, ok := seen[item.Port]; ok {
+			continue
+		}
+		seen[item.Port] = struct{}{}
+		ports = append(ports, item.Port)
+	}
+	return deltasFromPorts(ports)
+}
+
+func (mesh *peerMeshClient) localSrflxPortDeltas() []int {
+	mesh.mu.Lock()
+	candidates := make([]peerCandidate, 0, len(mesh.srflxCandidates))
+	for _, candidate := range mesh.srflxCandidates {
+		candidates = append(candidates, candidate)
+	}
+	mesh.mu.Unlock()
+	seen := make(map[int]struct{})
+	ports := make([]int, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Port <= 0 || candidate.Port > 65535 {
+			continue
+		}
+		if _, ok := seen[candidate.Port]; ok {
+			continue
+		}
+		seen[candidate.Port] = struct{}{}
+		ports = append(ports, candidate.Port)
+	}
+	return deltasFromPorts(ports)
+}
+
+func deltasFromPorts(ports []int) []int {
+	if len(ports) < 2 {
+		return nil
+	}
+	sort.Ints(ports)
+	deltas := make([]int, 0, len(ports)-1)
+	seen := make(map[int]struct{})
+	for i := 1; i < len(ports); i++ {
+		delta := ports[i] - ports[i-1]
+		if delta <= 0 || delta > peerMaxAdaptivePortDelta {
+			continue
+		}
+		if _, ok := seen[delta]; ok {
+			continue
+		}
+		seen[delta] = struct{}{}
+		deltas = append(deltas, delta)
+	}
+	return deltas
+}
+
+func addPredictedPort(ports []int, port, basePort int) []int {
+	if port <= 0 || port > 65535 || port == basePort {
+		return ports
+	}
+	for _, existing := range ports {
+		if existing == port {
+			return ports
+		}
+	}
+	return append(ports, port)
+}
+
+func (mesh *peerMeshClient) fallbackStaleDirectPaths() {
+	now := time.Now()
+	type fallbackPeer struct {
+		peer    *peerMeshPeer
+		session *peerMeshSession
+	}
+	var items []fallbackPeer
+	mesh.mu.Lock()
+	for _, peer := range mesh.peers {
+		if peer == nil || !peer.Online {
+			continue
+		}
+		session := mesh.sessions[peer.ClientID]
+		if session == nil || now.After(session.ExpiresAt) || !strings.EqualFold(session.PathType, "DIRECT") || session.hasHealthyDirect(now) {
+			continue
+		}
+		session.RemoteEndpoint = nil
+		items = append(items, fallbackPeer{peer: peer, session: session})
+	}
+	mesh.mu.Unlock()
+	for _, item := range items {
+		mesh.preparePathForPeer(item.peer, item.session)
 	}
 }
 
@@ -1120,6 +1367,7 @@ func (mesh *peerMeshClient) gatherCandidates() []peerCandidate {
 		srflxCandidates = append(srflxCandidates, candidate)
 	}
 	relay := mesh.relay
+	portMap := mesh.portMap
 	avoidDirect := mesh.shouldAvoidDirectPathLocked()
 	mesh.mu.Unlock()
 	if udp == nil {
@@ -1163,10 +1411,111 @@ func (mesh *peerMeshClient) gatherCandidates() []peerCandidate {
 			candidates = append(candidates, candidate)
 		}
 	}
+	if portMap != nil {
+		candidates = append(candidates, *portMap)
+	}
 	if relay != nil {
 		candidates = append(candidates, *relay)
 	}
 	return candidates
+}
+
+func (mesh *peerMeshClient) tryAcquirePortMappingAsync() {
+	mesh.mu.Lock()
+	udp := mesh.udp
+	if mesh.portMapping != nil {
+		mesh.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	if !mesh.lastPortMapAttempt.IsZero() && now.Sub(mesh.lastPortMapAttempt) < peerPortMappingRetry {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.lastPortMapAttempt = now
+	service := mesh.portMappingService
+	mesh.mu.Unlock()
+	if udp == nil {
+		return
+	}
+	local, ok := udp.LocalAddr().(*net.UDPAddr)
+	if !ok || local.Port <= 0 {
+		return
+	}
+	if service == nil {
+		service = newNatPortMappingService(mesh.logger)
+		mesh.mu.Lock()
+		if mesh.portMappingService == nil {
+			mesh.portMappingService = service
+		}
+		mesh.mu.Unlock()
+	}
+	go mesh.attemptPortMapping(service, local.Port)
+}
+
+func (mesh *peerMeshClient) attemptPortMapping(service *natPortMappingService, internalPort int) {
+	mapping, err := service.tryAcquireMapping(internalPort, internalPort, peerPortMappingLease, "shuai-tunnel peer mesh")
+	if err != nil {
+		mesh.logger.Printf("Peer Mesh NAT port mapping failed: %v", err)
+		return
+	}
+	if mapping == nil || mapping.ExternalAddress == "" || mapping.ExternalPort <= 0 {
+		return
+	}
+	candidate := peerCandidate{
+		Type:       "srflx",
+		Transport:  "udp",
+		Address:    mapping.ExternalAddress,
+		Port:       mapping.ExternalPort,
+		Priority:   900,
+		Foundation: "port-map-" + strings.ToLower(string(mapping.Protocol)),
+	}
+	mesh.mu.Lock()
+	if mesh.udp == nil {
+		mesh.mu.Unlock()
+		service.releaseMapping(*mapping)
+		return
+	}
+	mesh.portMapping = mapping
+	mesh.portMap = &candidate
+	mesh.mu.Unlock()
+	mesh.logger.Printf("Peer Mesh NAT port mapping active: protocol=%s external=%s:%d internal=%d lease=%ds",
+		mapping.Protocol, mapping.ExternalAddress, mapping.ExternalPort, mapping.InternalPort, mapping.LeaseSeconds)
+	mesh.announceCandidates()
+}
+
+func (mesh *peerMeshClient) renewPortMappingIfNeeded() {
+	mesh.mu.Lock()
+	current := mesh.portMapping
+	service := mesh.portMappingService
+	mesh.mu.Unlock()
+	if current == nil {
+		mesh.tryAcquirePortMappingAsync()
+		return
+	}
+	if !current.shouldRenew(time.Now()) {
+		return
+	}
+	if service == nil {
+		service = newNatPortMappingService(mesh.logger)
+	}
+	renewed, err := service.renewMapping(*current, peerPortMappingLease, "shuai-tunnel peer mesh")
+	if err != nil || renewed == nil {
+		mesh.logger.Printf("Peer Mesh NAT port mapping renew failed, will retry: %v", err)
+		mesh.mu.Lock()
+		mesh.portMapping = nil
+		mesh.portMap = nil
+		mesh.lastPortMapAttempt = time.Time{}
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.mu.Lock()
+	mesh.portMapping = renewed
+	if mesh.portMap != nil {
+		mesh.portMap.Address = renewed.ExternalAddress
+		mesh.portMap.Port = renewed.ExternalPort
+	}
+	mesh.mu.Unlock()
 }
 
 func (mesh *peerMeshClient) requestRelayCandidates() {
@@ -1535,7 +1884,7 @@ func (mesh *peerMeshClient) shouldAvoidDirectPath() bool {
 }
 
 func (mesh *peerMeshClient) shouldAvoidDirectPathLocked() bool {
-	return mesh.natTypeLocked() == peerNatTypeSymmetric
+	return false
 }
 
 func (mesh *peerMeshClient) shouldSkipDirectCandidate(candidate peerCandidate) bool {

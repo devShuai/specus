@@ -39,12 +39,21 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private const string NatTypeFullConeOrRestricted = "FULL_CONE_OR_RESTRICTED_NAT";
     private const string NatTypeNat = "NAT";
     private const int MaxPendingPacketsPerPeer = 32;
-    private static readonly TimeSpan PendingPacketTtl = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan PendingPacketTtl = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan PathPrepareMinInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan RelayFreshRequestInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan RelayExpiringRequestInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan AlternateProbeMinInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan TurnPermissionTtl = TimeSpan.FromMinutes(4);
+    private static readonly TimeSpan PortMappingRetryInterval = TimeSpan.FromSeconds(30);
+    private const int PortMappingLeaseSeconds = 7200;
+    private const int ProbeBurstCount = 3;
+    private static readonly TimeSpan ProbeBurstInterval = TimeSpan.FromMilliseconds(30);
+    private const int MaxAdaptivePredictedPorts = 16;
+    private const int MaxAdaptivePortDelta = 512;
+    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan KeepaliveTickInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DirectKeepaliveInterval = TimeSpan.FromSeconds(25);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -63,6 +72,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly Dictionary<string, string> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PeerCandidate> _srflxCandidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _turnPermissions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly NatPortMappingService _portMappingService;
 
     private CancellationTokenSource? _cts;
     private UdpClient? _udp;
@@ -70,8 +80,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private FrameWriter? _writer;
     private PeerCandidate? _srflx;
     private PeerCandidate? _relay;
+    private PeerCandidate? _portMap;
     private string? _relayId;
     private DateTimeOffset _relayTtl;
+    private NatPortMapping? _portMapping;
+    private DateTimeOffset _lastPortMapAttempt;
     private DateTimeOffset _lastRelayCandidateRequest;
     private DateTimeOffset _lastAlternateProbeRequest;
     private PeerKeyMaterial? _keyMaterial;
@@ -81,6 +94,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     {
         _config = config;
         _logger = logger;
+        _portMappingService = new NatPortMappingService(logger);
     }
 
     public async Task StartAsync(TunnelRuntimeState runtime, FrameWriter writer, CancellationToken cancellationToken)
@@ -135,6 +149,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _turnPermissions.Clear();
             _srflx = null;
             _relay = null;
+            _portMap = null;
+            _portMapping = null;
+            _lastPortMapAttempt = DateTimeOffset.MinValue;
             _relayId = null;
             _relayTtl = DateTimeOffset.MinValue;
             _lastRelayCandidateRequest = DateTimeOffset.MinValue;
@@ -169,6 +186,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _ = Task.Run(() => ReceiveLoopAsync(udp, cts.Token), CancellationToken.None);
         _ = Task.Run(() => MaintenanceLoopAsync(cts.Token), CancellationToken.None);
         await ReportDeviceAsync(runtime, writer, DeviceStatus(), FirstNonEmpty(deviceError, device.Error), "", "", cancellationToken).ConfigureAwait(false);
+        _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
     }
 
@@ -251,16 +269,25 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(15));
+        using var timer = new PeriodicTimer(KeepaliveTickInterval);
+        var lastMaintenance = DateTimeOffset.MinValue;
         try
         {
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                CleanupProbes();
-                CleanupPendingPackets();
-                await RequestRelayCandidatesAsync().ConfigureAwait(false);
-                await ProbeKnownCandidatesAsync().ConfigureAwait(false);
-                await ReportTrafficDeltasAsync().ConfigureAwait(false);
+                var now = DateTimeOffset.UtcNow;
+                if (lastMaintenance == DateTimeOffset.MinValue || now - lastMaintenance >= MaintenanceInterval)
+                {
+                    lastMaintenance = now;
+                    CleanupProbes();
+                    CleanupPendingPackets();
+                    await RenewPortMappingIfNeededAsync(cancellationToken).ConfigureAwait(false);
+                    await RequestRelayCandidatesAsync().ConfigureAwait(false);
+                    await ProbeKnownCandidatesAsync().ConfigureAwait(false);
+                    await ReportTrafficDeltasAsync().ConfigureAwait(false);
+                }
+                await KeepaliveDirectPathsAsync().ConfigureAwait(false);
+                await FallbackStaleDirectPathsAsync().ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -1107,6 +1134,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 continue;
             }
             await SendProbeAsync(session, candidate).ConfigureAwait(false);
+            foreach (var predictedPort in AdaptivePredictedPorts(candidate, message.Candidates))
+            {
+                var predicted = candidate with
+                {
+                    Port = predictedPort,
+                    Foundation = "adaptive-port-predict",
+                };
+                await SendProbeAsync(session, predicted).ConfigureAwait(false);
+            }
         }
     }
 
@@ -1121,6 +1157,44 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             await SendConnectivityChecksAsync(new PeerControlMessage { SourceClientId = peer.ClientId, Candidates = peer.Candidates })
                 .ConfigureAwait(false);
+        }
+    }
+
+    private async Task KeepaliveDirectPathsAsync()
+    {
+        var now = DateTimeOffset.UtcNow;
+        List<(PeerMeshSession Session, IPEndPoint Endpoint)> items = [];
+        lock (_sync)
+        {
+            foreach (var session in _sessions.Values)
+            {
+                if (now > session.ExpiresAt
+                    || !session.HasHealthyDirect(now)
+                    || session.RemoteEndpoint is null)
+                {
+                    continue;
+                }
+                if (session.LastDirectKeepalive != default
+                    && now - session.LastDirectKeepalive < DirectKeepaliveInterval)
+                {
+                    continue;
+                }
+                items.Add((session, session.RemoteEndpoint));
+            }
+        }
+        foreach (var item in items)
+        {
+            if (IsMeshEndpoint(item.Endpoint))
+            {
+                continue;
+            }
+            if (await SendDirectKeepaliveAsync(item.Session, item.Endpoint).ConfigureAwait(false))
+            {
+                lock (_sync)
+                {
+                    item.Session.LastDirectKeepalive = DateTimeOffset.UtcNow;
+                }
+            }
         }
     }
 
@@ -1163,7 +1237,197 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         if (IPAddress.TryParse(candidate.Address, out var ip))
         {
-            await udp.SendAsync(body, new IPEndPoint(ip, candidate.Port)).ConfigureAwait(false);
+            var remote = new IPEndPoint(ip, candidate.Port);
+            await udp.SendAsync(body, remote).ConfigureAwait(false);
+            ScheduleProbeBurst(udp, body, remote, nonce);
+        }
+    }
+
+    private async Task<bool> SendDirectKeepaliveAsync(PeerMeshSession session, IPEndPoint remote)
+    {
+        UdpClient? udp;
+        var runtime = Runtime();
+        lock (_sync)
+        {
+            udp = _udp;
+        }
+        if (udp is null || runtime is null || DateTimeOffset.UtcNow > session.ExpiresAt)
+        {
+            return false;
+        }
+        var nonce = RandomHex(12);
+        var probe = new PeerUdpProbe(
+            ProbeMagic,
+            ProbeTypeCheck,
+            session.Id,
+            runtime.PeerMesh.ClientId,
+            session.PeerId,
+            nonce,
+            session.Token,
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        var body = JsonSerializer.SerializeToUtf8Bytes(probe, JsonOptions);
+        lock (_sync)
+        {
+            _pending[nonce] = new PendingProbe(session.Id, session.PeerId, DateTimeOffset.UtcNow, false, null);
+        }
+        try
+        {
+            await udp.SendAsync(body, remote).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
+        {
+            lock (_sync)
+            {
+                _pending.Remove(nonce);
+            }
+            _logger.LogDebug(ex, "Peer Mesh direct keepalive send failed: session={Session} remote={Remote}", session.Id, remote);
+            return false;
+        }
+        return true;
+    }
+
+    private void ScheduleProbeBurst(UdpClient udp, byte[] body, IPEndPoint remote, string nonce)
+    {
+        for (var i = 1; i < ProbeBurstCount; i++)
+        {
+            var delay = TimeSpan.FromMilliseconds(ProbeBurstInterval.TotalMilliseconds * i);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(delay).ConfigureAwait(false);
+                    lock (_sync)
+                    {
+                        if (!_pending.ContainsKey(nonce) || _cts is null)
+                        {
+                            return;
+                        }
+                    }
+                    await udp.SendAsync(body, remote).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
+                {
+                    _logger.LogTrace(ex, "Peer Mesh UDP burst resend failed: remote={Remote}", remote);
+                }
+            });
+        }
+    }
+
+    private List<int> AdaptivePredictedPorts(PeerCandidate candidate, IReadOnlyCollection<PeerCandidate> allCandidates)
+    {
+        if (candidate.Port <= 0
+            || candidate.Port > 65535
+            || string.IsNullOrWhiteSpace(candidate.Address)
+            || string.Equals(candidate.Type, "relay", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+        var deltas = AdaptivePortDeltas(candidate, allCandidates);
+        if (deltas.Count == 0)
+        {
+            deltas = LocalSrflxPortDeltas();
+        }
+        if (deltas.Count == 0)
+        {
+            return [];
+        }
+        var ports = new List<int>(MaxAdaptivePredictedPorts);
+        foreach (var delta in deltas)
+        {
+            if (delta <= 0 || delta > MaxAdaptivePortDelta)
+            {
+                continue;
+            }
+            AddPredictedPort(ports, candidate.Port + delta, candidate.Port);
+            AddPredictedPort(ports, candidate.Port - delta, candidate.Port);
+            if (ports.Count >= MaxAdaptivePredictedPorts)
+            {
+                break;
+            }
+        }
+        return ports;
+    }
+
+    private static List<int> AdaptivePortDeltas(PeerCandidate candidate, IEnumerable<PeerCandidate> allCandidates)
+    {
+        var ports = allCandidates
+            .Where(x => !string.Equals(x.Type, "relay", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(x.Address, candidate.Address, StringComparison.Ordinal)
+                && x.Port is > 0 and <= 65535)
+            .Select(x => x.Port)
+            .Distinct()
+            .Order()
+            .ToList();
+        return DeltasFromPorts(ports);
+    }
+
+    private List<int> LocalSrflxPortDeltas()
+    {
+        List<int> ports;
+        lock (_sync)
+        {
+            ports = _srflxCandidates.Values
+                .Where(x => x.Port is > 0 and <= 65535)
+                .Select(x => x.Port)
+                .Distinct()
+                .Order()
+                .ToList();
+        }
+        return DeltasFromPorts(ports);
+    }
+
+    private static List<int> DeltasFromPorts(IReadOnlyList<int> ports)
+    {
+        if (ports.Count < 2)
+        {
+            return [];
+        }
+        var deltas = new List<int>();
+        for (var i = 1; i < ports.Count; i++)
+        {
+            var delta = Math.Abs(ports[i] - ports[i - 1]);
+            if (delta > 0 && delta <= MaxAdaptivePortDelta && !deltas.Contains(delta))
+            {
+                deltas.Add(delta);
+            }
+        }
+        return deltas;
+    }
+
+    private static void AddPredictedPort(List<int> ports, int port, int basePort)
+    {
+        if (port <= 0 || port > 65535 || port == basePort || ports.Contains(port))
+        {
+            return;
+        }
+        ports.Add(port);
+    }
+
+    private async Task FallbackStaleDirectPathsAsync()
+    {
+        var now = DateTimeOffset.UtcNow;
+        List<(PeerMeshPeer Peer, PeerMeshSession Session)> stale = [];
+        lock (_sync)
+        {
+            foreach (var peer in _peers.Values)
+            {
+                if (!peer.Online || !_sessions.TryGetValue(peer.ClientId, out var session))
+                {
+                    continue;
+                }
+                if (now > session.ExpiresAt
+                    || !string.Equals(session.PathType, "DIRECT", StringComparison.OrdinalIgnoreCase)
+                    || session.HasHealthyDirect(now))
+                {
+                    continue;
+                }
+                session.RemoteEndpoint = null;
+                stale.Add((peer, session));
+            }
+        }
+        foreach (var item in stale)
+        {
+            await PreparePathForPeerAsync(item.Peer, item.Session).ConfigureAwait(false);
         }
     }
 
@@ -1173,6 +1437,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         TunnelRuntimeState? runtime;
         List<PeerCandidate> srflxCandidates;
         PeerCandidate? relay;
+        PeerCandidate? portMap;
         bool avoidDirect;
         lock (_sync)
         {
@@ -1180,6 +1445,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             runtime = _runtime;
             srflxCandidates = _srflxCandidates.Values.ToList();
             relay = _relay;
+            portMap = _portMap;
             avoidDirect = ShouldAvoidDirectPathLocked();
         }
         if (udp is null || runtime is null)
@@ -1211,11 +1477,122 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             candidates.AddRange(srflxCandidates);
         }
+        if (portMap is not null)
+        {
+            candidates.Add(portMap);
+        }
         if (relay is not null)
         {
             candidates.Add(relay);
         }
         return candidates;
+    }
+
+    private Task TryAcquirePortMappingAsync(CancellationToken cancellationToken)
+    {
+        UdpClient? udp;
+        lock (_sync)
+        {
+            udp = _udp;
+            if (_portMapping is not null)
+            {
+                return Task.CompletedTask;
+            }
+            var now = DateTimeOffset.UtcNow;
+            if (_lastPortMapAttempt != DateTimeOffset.MinValue && now - _lastPortMapAttempt < PortMappingRetryInterval)
+            {
+                return Task.CompletedTask;
+            }
+            _lastPortMapAttempt = now;
+        }
+        if (udp?.Client.LocalEndPoint is not IPEndPoint local || local.Port <= 0)
+        {
+            return Task.CompletedTask;
+        }
+        return Task.Run(async () =>
+        {
+            try
+            {
+                var mapping = await _portMappingService.TryAcquireMappingAsync(
+                    local.Port,
+                    local.Port,
+                    PortMappingLeaseSeconds,
+                    "shuai-tunnel peer mesh",
+                    cancellationToken).ConfigureAwait(false);
+                if (mapping is null || string.IsNullOrWhiteSpace(mapping.ExternalAddress) || mapping.ExternalPort <= 0)
+                {
+                    return;
+                }
+                var candidate = new PeerCandidate(
+                    "srflx",
+                    "udp",
+                    mapping.ExternalAddress,
+                    mapping.ExternalPort,
+                    900,
+                    "port-map-" + mapping.Protocol.ToString().ToLowerInvariant(),
+                    "");
+                lock (_sync)
+                {
+                    if (_udp is null)
+                    {
+                        _ = _portMappingService.ReleaseMappingAsync(mapping, CancellationToken.None);
+                        return;
+                    }
+                    _portMapping = mapping;
+                    _portMap = candidate;
+                }
+                _logger.LogInformation(
+                    "Peer Mesh NAT port mapping active: protocol={Protocol}, external={Address}:{Port}, internal={Internal}, lease={Lease}s",
+                    mapping.Protocol,
+                    mapping.ExternalAddress,
+                    mapping.ExternalPort,
+                    mapping.InternalPort,
+                    mapping.LeaseSeconds);
+                await AnnounceCandidatesAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException or HttpRequestException or TaskCanceledException or InvalidOperationException)
+            {
+                _logger.LogDebug(ex, "Peer Mesh NAT port mapping failed");
+            }
+        }, CancellationToken.None);
+    }
+
+    private async Task RenewPortMappingIfNeededAsync(CancellationToken cancellationToken)
+    {
+        NatPortMapping? current;
+        lock (_sync)
+        {
+            current = _portMapping;
+        }
+        if (current is null)
+        {
+            await TryAcquirePortMappingAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        if (!current.ShouldRenew(DateTimeOffset.UtcNow))
+        {
+            return;
+        }
+        var renewed = await _portMappingService.RenewMappingAsync(
+            current,
+            PortMappingLeaseSeconds,
+            "shuai-tunnel peer mesh",
+            cancellationToken).ConfigureAwait(false);
+        lock (_sync)
+        {
+            if (renewed is null)
+            {
+                _portMapping = null;
+                _portMap = null;
+                _lastPortMapAttempt = DateTimeOffset.MinValue;
+                return;
+            }
+            _portMapping = renewed;
+            _portMap = _portMap is null
+                ? new PeerCandidate("srflx", "udp", renewed.ExternalAddress, renewed.ExternalPort, 900,
+                    "port-map-" + renewed.Protocol.ToString().ToLowerInvariant(), "")
+                : _portMap with { Address = renewed.ExternalAddress, Port = renewed.ExternalPort };
+        }
     }
 
     private async Task RequestRelayCandidatesAsync()
@@ -1766,7 +2143,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     }
 
     private bool ShouldAvoidDirectPathLocked()
-        => string.Equals(NatTypeLocked(), NatTypeSymmetric, StringComparison.OrdinalIgnoreCase);
+        => false;
 
     private bool ShouldSkipDirectCandidate(PeerCandidate candidate)
     {
@@ -1839,11 +2216,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         CancellationTokenSource? cts;
         UdpClient? udp;
         IPeerVirtualDevice? device;
+        NatPortMapping? portMapping;
         lock (_sync)
         {
             cts = _cts;
             udp = _udp;
             device = _device;
+            portMapping = _portMapping;
             _cts = null;
             _udp = null;
             _device = null;
@@ -1860,6 +2239,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _turnPermissions.Clear();
             _srflx = null;
             _relay = null;
+            _portMap = null;
+            _portMapping = null;
+            _lastPortMapAttempt = DateTimeOffset.MinValue;
             _relayId = null;
             _relayTtl = DateTimeOffset.MinValue;
             _lastRelayCandidateRequest = DateTimeOffset.MinValue;
@@ -1875,6 +2257,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         if (device is not null)
         {
             await device.DisposeAsync().ConfigureAwait(false);
+        }
+        if (portMapping is not null)
+        {
+            await _portMappingService.ReleaseMappingAsync(portMapping, CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -1931,6 +2317,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public string? RelayTargetAllocationId { get; set; }
         public string? PathType { get; set; }
         public DateTimeOffset LastDirectSuccess { get; set; }
+        public DateTimeOffset LastDirectKeepalive { get; set; }
         public DateTimeOffset LastRelaySuccess { get; set; }
         public DateTimeOffset LastPathLog { get; set; }
         public DateTimeOffset LastPathReport { get; set; }

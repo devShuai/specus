@@ -45,7 +45,7 @@ internal static class PeerVirtualDevices
                     : OperatingSystem.IsMacOS()
                         ? new DarwinUtunPeerVirtualDevice(config, peerMesh, logger)
                         : new NoopPeerVirtualDevice(config.PeerMeshTunName, "ERROR", "Peer Mesh virtual device is not supported on this OS"),
-            "utun" or "macos-utun" or "darwin-utun" => OperatingSystem.IsMacOS()
+            "utun" or "mac-utun" or "macos-utun" or "darwin-utun" => OperatingSystem.IsMacOS()
                 ? new DarwinUtunPeerVirtualDevice(config, peerMesh, logger)
                 : new NoopPeerVirtualDevice(config.PeerMeshTunName, "ERROR", "utun can only run on macOS"),
             _ => new NoopPeerVirtualDevice(config.PeerMeshTunName, "NOOP", $"unsupported peerMeshDevice: {config.PeerMeshDevice}"),

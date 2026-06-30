@@ -59,7 +59,7 @@ type darwinSockaddrCtl struct {
 
 func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger *log.Logger) peerVirtualDevice {
 	mode := strings.ToLower(strings.TrimSpace(config.PeerMeshDevice))
-	if mode != "auto" && mode != "utun" && mode != "macos-utun" && mode != "darwin-utun" {
+	if mode != "auto" && mode != "utun" && mode != "mac-utun" && mode != "macos-utun" && mode != "darwin-utun" {
 		return newUnsupportedPeerVirtualDevice(config, fmt.Sprintf("unsupported peerMeshDevice on macOS: %s", config.PeerMeshDevice))
 	}
 	return &darwinUtunDevice{

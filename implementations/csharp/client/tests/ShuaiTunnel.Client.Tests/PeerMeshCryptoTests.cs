@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.PeerMesh;
@@ -276,6 +277,47 @@ public sealed class PeerMeshCryptoTests
 
         Assert.Equal("DIRECT", Property<string>(session, "PathType"));
         Assert.Equal("", Property<string>(session, "RelayTargetAllocationId"));
+    }
+
+    [Fact]
+    public async Task DirectKeepaliveUsesNominatedEndpointLikeJava()
+    {
+        using var udp = new UdpClient(AddressFamily.InterNetwork);
+        udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+        using var direct = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        SetPrivateField(client, "_udp", udp);
+        SetPrivateField(client, "_runtime", new TunnelRuntimeState
+        {
+            PeerMesh = new PeerMeshConfig
+            {
+                ClientId = 1,
+                Cidr = "100.96.0.0/11",
+            },
+        });
+        var session = NewPeerMeshSession(
+            id: 1001,
+            peerId: 2,
+            token: "token",
+            remote: (IPEndPoint)direct.Client.LocalEndPoint!,
+            relayTargetAllocationId: "",
+            pathType: "DIRECT",
+            lastDirectSuccess: DateTimeOffset.UtcNow);
+        PrivateField<IDictionary>(client, "_sessions").Add(2L, session);
+
+        await InvokePrivateAsync(client, "KeepaliveDirectPathsAsync");
+
+        var payloads = await ReadUdpPayloadsAsync(direct, 1);
+        var payload = Assert.Single(payloads);
+        using var json = JsonDocument.Parse(payload);
+        Assert.Equal("shuai-peer-mesh", json.RootElement.GetProperty("magic").GetString());
+        Assert.Equal("check", json.RootElement.GetProperty("type").GetString());
+        Assert.Equal(1001, json.RootElement.GetProperty("sessionId").GetInt64());
+        Assert.Equal("token", json.RootElement.GetProperty("token").GetString());
+        Assert.Single(PrivateField<IDictionary>(client, "_pending"));
+
+        await InvokePrivateAsync(client, "KeepaliveDirectPathsAsync");
+        Assert.Empty(await ReadUdpPayloadsAsync(direct, 1));
     }
 
     private static ECDiffieHellman? TryCreateX25519()

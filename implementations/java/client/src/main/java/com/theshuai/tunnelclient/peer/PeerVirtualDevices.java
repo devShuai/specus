@@ -16,12 +16,16 @@ final class PeerVirtualDevices {
         return switch (mode) {
             case "linux-tun" -> createLinuxTun(options, config);
             case "windows-wintun", "wintun" -> createWindowsWintun(options, config);
+            case "mac-utun", "utun", "macos-utun", "darwin-utun" -> createMacUtun(options, config);
             case "auto" -> {
                 if (isLinux()) {
                     yield createLinuxTun(options, config);
                 }
                 if (isWindows()) {
                     yield createWindowsWintun(options, config);
+                }
+                if (isMac()) {
+                    yield createMacUtun(options, config);
                 }
                 yield new NoopPeerVirtualDevice();
             }
@@ -56,11 +60,25 @@ final class PeerVirtualDevices {
         return new WindowsWintunPeerVirtualDevice(options, config);
     }
 
+    private static PeerVirtualDevice createMacUtun(PeerVirtualDeviceOptions options,
+                                                   ClientAuthLoginResponse.PeerMeshConfig config) {
+        if (!isMac()) {
+            log.warn("Peer mesh macOS utun 只能在 macOS 上启用，当前系统为 {}", System.getProperty("os.name", ""));
+            return new NoopPeerVirtualDevice();
+        }
+        return new MacUtunPeerVirtualDevice(options, config);
+    }
+
     private static boolean isLinux() {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux");
     }
 
     private static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("windows");
+    }
+
+    private static boolean isMac() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        return os.contains("mac") || os.contains("darwin");
     }
 }
