@@ -562,6 +562,7 @@ body {
   font-size: 0.66rem;
   font-weight: 700;
   line-height: 1.35;
+  overflow: visible;
   text-align: center;
 }
 
@@ -719,23 +720,27 @@ body {
 
 @keyframes topology-mobile-edge-packet-x {
   0% {
+    left: 2px;
     opacity: 0;
-    transform: translateX(0) scale(0.78);
+    transform: scale(0.78);
   }
 
   12% {
+    left: 10px;
     opacity: 1;
-    transform: translateX(8px) scale(1);
+    transform: scale(1);
   }
 
   82% {
+    left: calc(100% - 18px);
     opacity: 1;
-    transform: translateX(48px) scale(1);
+    transform: scale(1);
   }
 
   100% {
+    left: calc(100% - 14px);
     opacity: 0;
-    transform: translateX(58px) scale(0.78);
+    transform: scale(0.78);
   }
 }
 
@@ -1132,12 +1137,20 @@ body {
     -webkit-backdrop-filter: none !important;
   }
 
+  .principle-card,
   .principle-flowgrid,
   .principle-node,
   .topology-mobile,
   .topology-mobile-section,
-  .topology-mobile-node {
-    backface-visibility: hidden;
+  .topology-mobile-node,
+  .topology-mobile-peer-link,
+  .topology-mobile-peer-link span {
+    backface-visibility: visible;
+    -webkit-backface-visibility: visible;
+  }
+
+  .principle-card {
+    overflow: visible;
   }
 
   .principle-flowgrid {
