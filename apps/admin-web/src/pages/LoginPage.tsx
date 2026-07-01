@@ -87,6 +87,85 @@ const inputClassNames = {
   input: "!text-zinc-950 placeholder:text-zinc-500 dark:!text-white dark:placeholder:text-zinc-500",
 } as const;
 
+const landingDebugTargets = [
+  { key: "shell", selector: ".landing-shell" },
+  { key: "topology-panel", selector: ".topology-panel" },
+  { key: "topology-mobile", selector: ".topology-mobile" },
+  { key: "topology-peer-link", selector: ".topology-mobile-peer-link" },
+  { key: "topology-peer-label", selector: ".topology-mobile-peer-link span" },
+  { key: "principle-card", selector: ".principle-card" },
+  { key: "principle-card-body", selector: ".principle-card-body" },
+  { key: "principle-flowgrid", selector: ".principle-flowgrid" },
+  { key: "principle-node", selector: ".principle-node" },
+  { key: "principle-note", selector: ".principle-note span" },
+] as const;
+
+type LandingDebugRect = {
+  bottom: number;
+  height: number;
+  left: number;
+  right: number;
+  top: number;
+  width: number;
+  x: number;
+  y: number;
+};
+
+type LandingDebugAncestor = {
+  className: string;
+  css: Pick<LandingDebugElement["css"], "clipPath" | "contain" | "maskImage" | "overflow" | "overflowX" | "overflowY" | "transform">;
+  rect: LandingDebugRect;
+  tagName: string;
+};
+
+type LandingDebugElement = {
+  ancestorClips: LandingDebugAncestor[];
+  css: {
+    backfaceVisibility: string;
+    clipPath: string;
+    contain: string;
+    contentVisibility: string;
+    display: string;
+    filter: string;
+    isolation: string;
+    maskImage: string;
+    opacity: string;
+    overflow: string;
+    overflowX: string;
+    overflowY: string;
+    position: string;
+    transform: string;
+    visibility: string;
+    webkitBackfaceVisibility: string;
+    zIndex: string;
+  };
+  index: number;
+  inViewport: boolean;
+  key: string;
+  rect: LandingDebugRect;
+  selector: string;
+  text: string;
+  visibleByLayout: boolean;
+};
+
+type LandingDebugSnapshot = {
+  elements: LandingDebugElement[];
+  environment: {
+    colorScheme: string;
+    dpr: number;
+    hash: string;
+    prefersReducedMotion: boolean;
+    screen: string;
+    scroll: { x: number; y: number };
+    themeClass: string;
+    timestamp: string;
+    url: string;
+    userAgent: string;
+    viewport: string;
+    visualViewport: string;
+  };
+};
+
 export function LoginPage() {
   return (
     <HeroRuntime>
@@ -101,6 +180,7 @@ function LoginPageContent() {
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const loginPanelRef = useRef<HTMLDivElement>(null);
+  const landingDebugEnabled = useLandingDebugEnabled();
 
   usePageSeo({
     title: "shuai-tunnel · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
@@ -143,7 +223,7 @@ function LoginPageContent() {
   };
 
   return (
-    <main className="landing-shell min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
+    <main className="landing-shell min-h-screen text-zinc-950 dark:text-white">
       <SignalField />
       <div className="landing-grid" aria-hidden="true" />
       <div className="landing-scanline" aria-hidden="true" />
@@ -388,8 +468,316 @@ function LoginPageContent() {
           <ClientDownloadsSection />
         </div>
       </section>
+
+      {landingDebugEnabled && <LandingDebugPanel />}
     </main>
   );
+}
+
+function useLandingDebugEnabled() {
+  const [enabled, setEnabled] = useState(() => isLandingDebugEnabled());
+
+  useEffect(() => {
+    const update = () => setEnabled(isLandingDebugEnabled());
+    window.addEventListener("hashchange", update);
+    window.addEventListener("popstate", update);
+    return () => {
+      window.removeEventListener("hashchange", update);
+      window.removeEventListener("popstate", update);
+    };
+  }, []);
+
+  return enabled;
+}
+
+function isLandingDebugEnabled() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const searchParams = new URLSearchParams(window.location.search);
+  if (searchParams.get("landingDebug") === "1") {
+    return true;
+  }
+
+  const hash = window.location.hash.replace(/^#/, "");
+  const hashQueryIndex = hash.indexOf("?");
+  const hashParamsText = hashQueryIndex >= 0 ? hash.slice(hashQueryIndex + 1) : hash;
+  return new URLSearchParams(hashParamsText).get("landingDebug") === "1";
+}
+
+function LandingDebugPanel() {
+  const [snapshot, setSnapshot] = useState<LandingDebugSnapshot>(() => collectLandingDebugSnapshot());
+  const [collapsed, setCollapsed] = useState(false);
+  const [copyLabel, setCopyLabel] = useState("复制诊断");
+
+  useEffect(() => {
+    const update = () => setSnapshot(collectLandingDebugSnapshot());
+    const interval = window.setInterval(update, 1000);
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, { passive: true });
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update);
+    };
+  }, []);
+
+  const suspectElements = snapshot.elements.filter(
+    (element) => !element.visibleByLayout || !element.inViewport || element.ancestorClips.length > 0,
+  );
+
+  const copySnapshot = async () => {
+    const text = JSON.stringify(snapshot, null, 2);
+    try {
+      await copyText(text);
+      setCopyLabel("已复制");
+    } catch {
+      setCopyLabel("复制失败");
+    } finally {
+      window.setTimeout(() => setCopyLabel("复制诊断"), 1400);
+    }
+  };
+
+  if (collapsed) {
+    return (
+      <button className="landing-debug-pill" type="button" onClick={() => setCollapsed(false)}>
+        Landing debug
+      </button>
+    );
+  }
+
+  return (
+    <aside className="landing-debug-panel" aria-label="Landing debug diagnostics">
+      <div className="landing-debug-panel-header">
+        <strong>Landing debug</strong>
+        <div className="landing-debug-panel-actions">
+          <button type="button" onClick={() => setSnapshot(collectLandingDebugSnapshot())}>刷新</button>
+          <button type="button" onClick={() => void copySnapshot()}>{copyLabel}</button>
+          <button type="button" onClick={() => setCollapsed(true)}>收起</button>
+        </div>
+      </div>
+
+      <div className="landing-debug-panel-body">
+        <section>
+          <h4>环境</h4>
+          <dl>
+            <div><dt>viewport</dt><dd>{snapshot.environment.viewport}</dd></div>
+            <div><dt>visual</dt><dd>{snapshot.environment.visualViewport}</dd></div>
+            <div><dt>dpr</dt><dd>{snapshot.environment.dpr}</dd></div>
+            <div><dt>scroll</dt><dd>{snapshot.environment.scroll.x}, {snapshot.environment.scroll.y}</dd></div>
+            <div><dt>theme</dt><dd>{snapshot.environment.themeClass || "-"}</dd></div>
+            <div><dt>motion</dt><dd>{snapshot.environment.prefersReducedMotion ? "reduce" : "normal"}</dd></div>
+            <div><dt>ua</dt><dd>{snapshot.environment.userAgent}</dd></div>
+          </dl>
+        </section>
+
+        <section>
+          <h4>可疑项 {suspectElements.length}</h4>
+          {suspectElements.length === 0 ? (
+            <p className="landing-debug-muted">当前采样未发现 display/visibility/overflow 直接异常。</p>
+          ) : (
+            <ul className="landing-debug-list">
+              {suspectElements.slice(0, 12).map((element) => (
+                <li key={`${element.key}-${element.index}`}>
+                  <strong>{element.key}[{element.index}]</strong>
+                  <span>{element.visibleByLayout ? "layout ok" : "layout hidden"} · {element.inViewport ? "in viewport" : "out viewport"} · clips {element.ancestorClips.length}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section>
+          <h4>元素采样</h4>
+          <div className="landing-debug-elements">
+            {snapshot.elements.slice(0, 28).map((element) => (
+              <details key={`${element.key}-${element.index}`}>
+                <summary>
+                  {element.key}[{element.index}] {formatDebugRect(element.rect)}
+                </summary>
+                <pre>{JSON.stringify(element, null, 2)}</pre>
+              </details>
+            ))}
+          </div>
+        </section>
+      </div>
+    </aside>
+  );
+}
+
+function collectLandingDebugSnapshot(): LandingDebugSnapshot {
+  if (typeof window === "undefined") {
+    return {
+      elements: [],
+      environment: {
+        colorScheme: "unknown",
+        dpr: 1,
+        hash: "",
+        prefersReducedMotion: false,
+        screen: "",
+        scroll: { x: 0, y: 0 },
+        themeClass: "",
+        timestamp: "",
+        url: "",
+        userAgent: "",
+        viewport: "",
+        visualViewport: "",
+      },
+    };
+  }
+
+  const elements = landingDebugTargets.flatMap(({ key, selector }) =>
+    Array.from(document.querySelectorAll(selector))
+      .slice(0, selector.includes("principle-node") ? 16 : 6)
+      .map((element, index) => collectLandingDebugElement(key, selector, element, index)),
+  );
+
+  const visualViewport = window.visualViewport;
+  return {
+    elements,
+    environment: {
+      colorScheme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+      dpr: window.devicePixelRatio || 1,
+      hash: window.location.hash,
+      prefersReducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+      screen: `${window.screen.width}x${window.screen.height}`,
+      scroll: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) },
+      themeClass: document.documentElement.className,
+      timestamp: new Date().toISOString(),
+      url: window.location.href,
+      userAgent: window.navigator.userAgent,
+      viewport: `${window.innerWidth}x${window.innerHeight}`,
+      visualViewport: visualViewport
+        ? `${Math.round(visualViewport.width)}x${Math.round(visualViewport.height)} scale=${visualViewport.scale}`
+        : "unavailable",
+    },
+  };
+}
+
+function collectLandingDebugElement(
+  key: string,
+  selector: string,
+  element: Element,
+  index: number,
+): LandingDebugElement {
+  const rect = toLandingDebugRect(element.getBoundingClientRect());
+  const css = readDebugCss(element);
+  const visibleByLayout =
+    rect.width > 0 &&
+    rect.height > 0 &&
+    css.display !== "none" &&
+    css.visibility !== "hidden" &&
+    css.opacity !== "0";
+
+  return {
+    ancestorClips: collectDebugAncestorClips(element),
+    css,
+    index,
+    inViewport: rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth,
+    key,
+    rect,
+    selector,
+    text: (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 180),
+    visibleByLayout,
+  };
+}
+
+function collectDebugAncestorClips(element: Element): LandingDebugAncestor[] {
+  const ancestors: LandingDebugAncestor[] = [];
+  let current = element.parentElement;
+
+  while (current && current !== document.documentElement && ancestors.length < 8) {
+    const css = readDebugCss(current);
+    const overflowValues = [css.overflow, css.overflowX, css.overflowY];
+    const hasOverflowClip = overflowValues.some((value) => ["auto", "clip", "hidden", "scroll"].includes(value));
+    const hasPaintContain = /\b(content|paint|strict)\b/.test(css.contain);
+    const hasMask = css.maskImage !== "none";
+    const hasClipPath = css.clipPath !== "none";
+
+    if (hasOverflowClip || hasPaintContain || hasMask || hasClipPath) {
+      ancestors.push({
+        className: current.className.toString(),
+        css: {
+          clipPath: css.clipPath,
+          contain: css.contain,
+          maskImage: css.maskImage,
+          overflow: css.overflow,
+          overflowX: css.overflowX,
+          overflowY: css.overflowY,
+          transform: css.transform,
+        },
+        rect: toLandingDebugRect(current.getBoundingClientRect()),
+        tagName: current.tagName.toLowerCase(),
+      });
+    }
+
+    current = current.parentElement;
+  }
+
+  return ancestors;
+}
+
+function readDebugCss(element: Element): LandingDebugElement["css"] {
+  const style = window.getComputedStyle(element);
+  return {
+    backfaceVisibility: style.backfaceVisibility,
+    clipPath: style.clipPath,
+    contain: style.contain,
+    contentVisibility: style.contentVisibility,
+    display: style.display,
+    filter: style.filter,
+    isolation: style.isolation,
+    maskImage: style.maskImage,
+    opacity: style.opacity,
+    overflow: style.overflow,
+    overflowX: style.overflowX,
+    overflowY: style.overflowY,
+    position: style.position,
+    transform: style.transform,
+    visibility: style.visibility,
+    webkitBackfaceVisibility: style.getPropertyValue("-webkit-backface-visibility"),
+    zIndex: style.zIndex,
+  };
+}
+
+function toLandingDebugRect(rect: DOMRect): LandingDebugRect {
+  return {
+    bottom: roundDebugNumber(rect.bottom),
+    height: roundDebugNumber(rect.height),
+    left: roundDebugNumber(rect.left),
+    right: roundDebugNumber(rect.right),
+    top: roundDebugNumber(rect.top),
+    width: roundDebugNumber(rect.width),
+    x: roundDebugNumber(rect.x),
+    y: roundDebugNumber(rect.y),
+  };
+}
+
+function roundDebugNumber(value: number) {
+  return Math.round(value * 100) / 100;
+}
+
+function formatDebugRect(rect: LandingDebugRect) {
+  return `${Math.round(rect.width)}x${Math.round(rect.height)} @ ${Math.round(rect.left)},${Math.round(rect.top)}`;
+}
+
+async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
 }
 
 /**
@@ -712,7 +1100,7 @@ function PrincipleCard({
       shadow="none"
       className={`principle-card principle-card-${accent} rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none`}
     >
-      <CardBody className="gap-5 p-5">
+      <CardBody className="principle-card-body gap-5 p-5">
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="principle-badge w-fit rounded-md px-2 py-1 text-tiny">{badge}</span>
