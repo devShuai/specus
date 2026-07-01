@@ -143,7 +143,7 @@ function LoginPageContent() {
   };
 
   return (
-    <main className="landing-shell min-h-screen overflow-hidden text-zinc-950 dark:text-white">
+    <main className="landing-shell min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
       <SignalField />
       <div className="landing-grid" aria-hidden="true" />
       <div className="landing-scanline" aria-hidden="true" />
