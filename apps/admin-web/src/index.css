@@ -201,16 +201,26 @@ body {
   container-type: inline-size;
   position: relative;
   overflow: hidden;
+  isolation: isolate;
+  backface-visibility: hidden;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: pan-y;
 }
 
 .principle-card::before {
   position: absolute;
   inset: -40% -20% auto auto;
+  z-index: 0;
   width: 280px;
   height: 280px;
   content: "";
   pointer-events: none;
   background: radial-gradient(circle, rgba(var(--principle-accent), 0.2), transparent 66%);
+}
+
+.principle-card > * {
+  position: relative;
+  z-index: 1;
 }
 
 .principle-card-cyan {
@@ -278,6 +288,358 @@ body {
   max-height: 480px;
 }
 
+.topology-mobile {
+  position: relative;
+  display: grid;
+  gap: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(8, 47, 73, 0.12);
+  border-radius: 6px;
+  padding: 12px;
+  background:
+    linear-gradient(135deg, rgba(6, 182, 212, 0.14), transparent 44%),
+    linear-gradient(rgba(8, 47, 73, 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(8, 47, 73, 0.07) 1px, transparent 1px),
+    rgba(255, 255, 255, 0.62);
+  background-size: auto, 26px 26px, 26px 26px, auto;
+  color: #18181b;
+  isolation: isolate;
+}
+
+.dark .topology-mobile {
+  border-color: rgba(255, 255, 255, 0.11);
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.16), transparent 42%),
+    linear-gradient(rgba(255, 255, 255, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.055) 1px, transparent 1px),
+    rgba(0, 0, 0, 0.2);
+  color: #fff;
+}
+
+.topology-mobile-section {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(8, 47, 73, 0.12);
+  border-radius: 6px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.dark .topology-mobile-section {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.topology-mobile-section-relay {
+  box-shadow: inset 0 0 0 1px rgba(6, 182, 212, 0.08);
+}
+
+.topology-mobile-section-peer {
+  box-shadow: inset 0 0 0 1px rgba(16, 185, 129, 0.08);
+}
+
+.topology-mobile-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: rgba(63, 63, 70, 0.92);
+  font-size: 0.75rem;
+}
+
+.topology-mobile-heading strong {
+  flex: none;
+  border-radius: 4px;
+  padding: 3px 7px;
+  color: rgb(8, 145, 178);
+  font-size: 0.68rem;
+  background: rgba(6, 182, 212, 0.12);
+}
+
+.topology-mobile-section-peer .topology-mobile-heading strong {
+  color: rgb(5, 150, 105);
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.dark .topology-mobile-heading {
+  color: rgba(212, 212, 216, 0.78);
+}
+
+.dark .topology-mobile-heading strong {
+  color: rgb(103, 232, 249);
+  background: rgba(34, 211, 238, 0.12);
+}
+
+.dark .topology-mobile-section-peer .topology-mobile-heading strong {
+  color: rgb(110, 231, 183);
+  background: rgba(52, 211, 153, 0.12);
+}
+
+.topology-mobile-chain {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+}
+
+.topology-mobile-node {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  min-width: 0;
+  min-height: 72px;
+  align-content: center;
+  gap: 5px;
+  border: 1px solid rgba(6, 182, 212, 0.28);
+  border-radius: 6px;
+  padding: 12px;
+  background:
+    linear-gradient(135deg, rgba(6, 182, 212, 0.14), rgba(255, 255, 255, 0.64)),
+    rgba(255, 255, 255, 0.72);
+  box-shadow: 0 0 18px rgba(6, 182, 212, 0.08);
+}
+
+.dark .topology-mobile-node {
+  border-color: rgba(34, 211, 238, 0.22);
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.11), rgba(255, 255, 255, 0.055)),
+    rgba(24, 24, 27, 0.72);
+  box-shadow: 0 0 18px rgba(34, 211, 238, 0.08);
+}
+
+.topology-mobile-node strong {
+  min-width: 0;
+  color: #18181b;
+  font-size: 1rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.topology-mobile-node span {
+  min-width: 0;
+  color: rgba(63, 63, 70, 0.82);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.dark .topology-mobile-node strong {
+  color: #fff;
+}
+
+.dark .topology-mobile-node span {
+  color: rgba(212, 212, 216, 0.74);
+}
+
+.topology-mobile-node-server {
+  border-color: rgba(6, 182, 212, 0.46);
+  background:
+    linear-gradient(135deg, rgba(6, 182, 212, 0.82), rgba(20, 184, 166, 0.72)),
+    rgb(8, 145, 178);
+  box-shadow: 0 0 26px rgba(6, 182, 212, 0.18);
+}
+
+.topology-mobile-node-server strong,
+.topology-mobile-node-server span {
+  color: #fff;
+}
+
+.topology-mobile-node-peer {
+  border-color: rgba(16, 185, 129, 0.48);
+  background:
+    linear-gradient(135deg, rgba(16, 185, 129, 0.16), rgba(255, 255, 255, 0.56)),
+    rgba(255, 255, 255, 0.72);
+}
+
+.dark .topology-mobile-node-peer {
+  border-color: rgba(52, 211, 153, 0.48);
+  background:
+    linear-gradient(135deg, rgba(52, 211, 153, 0.14), rgba(255, 255, 255, 0.055)),
+    rgba(24, 24, 27, 0.72);
+}
+
+.topology-mobile-node-compact {
+  min-height: 80px;
+  padding: 11px;
+}
+
+.topology-mobile-edge {
+  position: relative;
+  display: flex;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  color: rgb(8, 145, 178);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.topology-mobile-edge::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  content: "";
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.46;
+  transform: translateX(-50%);
+}
+
+.topology-mobile-edge::after {
+  position: absolute;
+  top: -4px;
+  left: 50%;
+  width: 10px;
+  height: 14px;
+  content: "";
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 14px currentColor;
+  transform: translateX(-50%);
+  animation: topology-mobile-edge-packet-y 1.8s linear infinite;
+}
+
+.topology-mobile-edge span {
+  position: relative;
+  z-index: 1;
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.dark .topology-mobile-edge {
+  color: rgb(34, 211, 238);
+}
+
+.dark .topology-mobile-edge span {
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.topology-mobile-edge-peer {
+  color: rgb(5, 150, 105);
+}
+
+.dark .topology-mobile-edge-peer {
+  color: rgb(52, 211, 153);
+}
+
+.topology-mobile-signal {
+  border: 1px dashed rgba(16, 185, 129, 0.3);
+  border-radius: 6px;
+  padding: 9px 10px;
+  color: rgb(5, 150, 105);
+  font-size: 0.74rem;
+  line-height: 1.45;
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.dark .topology-mobile-signal {
+  border-color: rgba(52, 211, 153, 0.3);
+  color: rgb(110, 231, 183);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.topology-mobile-peer-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 68px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.topology-mobile-peer-link {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  height: 52px;
+  place-items: center;
+  color: rgb(5, 150, 105);
+  font-size: 0.66rem;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.topology-mobile-peer-link::before {
+  position: absolute;
+  right: 0;
+  left: 0;
+  top: 50%;
+  height: 2px;
+  content: "";
+  border-radius: 999px;
+  background: repeating-linear-gradient(90deg, currentColor 0 8px, transparent 8px 14px);
+  opacity: 0.72;
+}
+
+.topology-mobile-peer-link::after {
+  position: absolute;
+  top: calc(50% - 5px);
+  left: 0;
+  width: 12px;
+  height: 10px;
+  content: "";
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 14px currentColor;
+  animation: topology-mobile-edge-packet-x 2.1s linear infinite;
+}
+
+.topology-mobile-peer-link span {
+  position: relative;
+  z-index: 1;
+  border-radius: 999px;
+  padding: 1px 5px;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.dark .topology-mobile-peer-link {
+  color: rgb(52, 211, 153);
+}
+
+.dark .topology-mobile-peer-link span {
+  background: rgba(0, 0, 0, 0.68);
+}
+
+.topology-mobile-note {
+  border-radius: 6px;
+  padding: 10px 11px;
+  color: rgba(63, 63, 70, 0.9);
+  font-size: 0.74rem;
+  line-height: 1.55;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.dark .topology-mobile-note {
+  color: rgba(212, 212, 216, 0.82);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+@media (max-width: 380px) {
+  .topology-mobile-peer-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .topology-mobile-peer-link {
+    height: 34px;
+  }
+
+  .topology-mobile-peer-link::before {
+    right: 50%;
+    bottom: 0;
+    left: 50%;
+    top: 0;
+    width: 2px;
+    height: auto;
+    transform: translateX(-50%);
+  }
+}
+
 /* 节点框（公网用户 / 客户端 A）：浅色半透明白；暗色半透明深 + 浅色边 */
 .topo-card {
   fill: rgba(255, 255, 255, 0.55);
@@ -333,9 +695,55 @@ body {
   to { stroke-dashoffset: 30; }
 }
 
+@keyframes topology-mobile-edge-packet-y {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(0) scale(0.78);
+  }
+
+  12% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(6px) scale(1);
+  }
+
+  82% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(25px) scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(32px) scale(0.78);
+  }
+}
+
+@keyframes topology-mobile-edge-packet-x {
+  0% {
+    opacity: 0;
+    transform: translateX(0) scale(0.78);
+  }
+
+  12% {
+    opacity: 1;
+    transform: translateX(8px) scale(1);
+  }
+
+  82% {
+    opacity: 1;
+    transform: translateX(48px) scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateX(58px) scale(0.78);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .topology-relay-flow,
-  .topology-peer-flow {
+  .topology-peer-flow,
+  .topology-mobile-edge::after,
+  .topology-mobile-peer-link::after {
     animation: none;
   }
 }
@@ -347,7 +755,7 @@ body {
 }
 
 .principle-flowgrid {
-  --flow-cycle: 6.9s;
+  --flow-cycle: 6.2s;
   --principle-node-height: 150px;
   --principle-panel-bg: rgba(255, 255, 255, 0.72);
   --principle-grid-line: rgba(8, 47, 73, 0.1);
@@ -356,10 +764,11 @@ body {
   --principle-node-muted: #3f3f46;
   --principle-node-index: rgba(24, 24, 27, 0.68);
   position: relative;
+  container-type: inline-size;
   display: grid;
   grid-template-columns:
-    minmax(112px, 1fr) 34px minmax(112px, 1fr) 34px minmax(112px, 1fr) 34px
-    minmax(112px, 1fr);
+    minmax(96px, 1fr) 28px minmax(96px, 1fr) 28px minmax(96px, 1fr) 28px
+    minmax(96px, 1fr);
   gap: 0;
   align-items: center;
   min-width: 0;
@@ -376,7 +785,7 @@ body {
 .dark .principle-flowgrid {
   --principle-panel-bg: rgba(0, 0, 0, 0.24);
   --principle-grid-line: rgba(255, 255, 255, 0.055);
-  --principle-node-bg: rgba(3, 5, 9, 0.74);
+  --principle-node-bg: rgba(24, 24, 27, 0.88);
   --principle-node-title: #fff;
   --principle-node-muted: #a1a1aa;
   --principle-node-index: rgba(255, 255, 255, 0.72);
@@ -408,21 +817,41 @@ body {
   gap: 8px;
   padding: 16px 14px;
   overflow: hidden;
-  border: 1px solid rgba(var(--principle-accent), 0.22);
+  border: 1px solid rgba(var(--principle-accent), 0.46);
   border-radius: 6px;
   background:
-    linear-gradient(180deg, rgba(var(--principle-accent), 0.14), rgba(255, 255, 255, 0.2)),
+    linear-gradient(180deg, rgba(var(--principle-accent), 0.14), rgba(255, 255, 255, 0.1)),
     var(--principle-node-bg);
   box-shadow:
     0 0 24px rgba(var(--principle-accent), 0.12),
     0 0 0 1px rgba(var(--principle-accent), 0.08) inset;
+  isolation: isolate;
+  backface-visibility: hidden;
+  -webkit-tap-highlight-color: transparent;
   animation: principle-node-sequence var(--flow-cycle) ease-in-out infinite;
+  animation-delay: var(--node-delay);
+}
+
+.principle-node::before {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  content: "";
+  pointer-events: none;
+  border: 1px solid rgba(var(--principle-accent), 0.76);
+  border-radius: inherit;
+  box-shadow:
+    0 0 34px rgba(var(--principle-accent), 0.28),
+    0 0 0 1px rgba(var(--principle-accent), 0.2) inset;
+  opacity: 0;
+  animation: principle-node-highlight var(--flow-cycle) ease-in-out infinite;
   animation-delay: var(--node-delay);
 }
 
 .principle-node::after {
   position: absolute;
   inset: 0;
+  z-index: 1;
   content: "";
   pointer-events: none;
   background: linear-gradient(110deg, transparent 0%, rgba(255, 255, 255, 0.12) 46%, transparent 58%);
@@ -433,7 +862,7 @@ body {
 
 .principle-node strong {
   position: relative;
-  z-index: 1;
+  z-index: 2;
   display: flex;
   min-height: 2.7em;
   align-items: center;
@@ -445,7 +874,7 @@ body {
 
 .principle-node span {
   position: relative;
-  z-index: 1;
+  z-index: 2;
 }
 
 .principle-node-eyebrow {
@@ -683,105 +1112,154 @@ body {
   }
 }
 
-@keyframes principle-node-sequence {
+@keyframes principle-node-highlight {
   0%,
   14% {
-    border-color: rgba(var(--principle-accent), 0.72);
-    background:
-      linear-gradient(180deg, rgba(var(--principle-accent), 0.18), rgba(255, 255, 255, 0.16)),
-      var(--principle-node-bg);
-    box-shadow:
-      0 0 34px rgba(var(--principle-accent), 0.28),
-      0 0 0 1px rgba(var(--principle-accent), 0.2) inset;
+    opacity: 1;
   }
 
   22%,
   100% {
-    border-color: rgba(var(--principle-accent), 0.22);
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.09)),
-      var(--principle-node-bg);
-    box-shadow:
-      0 0 24px rgba(var(--principle-accent), 0.08),
-      0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+    opacity: 0;
   }
 }
 
 @media (max-width: 900px) {
+  .landing-card,
+  .principle-card,
+  .topology-panel {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  .principle-flowgrid,
+  .principle-node,
+  .topology-mobile,
+  .topology-mobile-section,
+  .topology-mobile-node {
+    backface-visibility: hidden;
+  }
+
   .principle-flowgrid {
+    --principle-node-height: 126px;
     grid-template-columns: minmax(0, 1fr);
     gap: 0;
     min-height: auto;
+    padding: 12px;
   }
 
   .principle-node {
     height: auto;
     min-height: var(--principle-node-height);
     justify-content: flex-start;
-    padding-right: 48px;
-    overflow: visible;
+    gap: 6px;
+    padding: 42px 14px 14px;
+    overflow: hidden;
+  }
+
+  .principle-node .principle-node-index {
+    position: absolute;
+    top: 12px;
+    right: auto;
+    left: 14px;
+    width: 26px;
+    height: 26px;
+    font-size: 0.72rem;
+  }
+
+  .principle-node strong {
+    min-height: auto;
+    font-size: 0.95rem;
+    line-height: 1.28;
+  }
+
+  .principle-node-meta {
+    min-height: auto;
   }
 
   .principle-edge {
-    width: 4px;
-    height: 44px;
+    width: 6px;
+    height: 56px;
     margin: 0 auto;
     border-radius: 999px;
   }
 
   .principle-edge::before {
-    top: -16px;
+    top: -18px;
     left: 50%;
-    width: 16px;
-    height: 24px;
+    width: 20px;
+    height: 28px;
     animation-name: principle-packet-y;
   }
 
   .principle-edge::after {
-    top: -28%;
-    left: -2px;
-    width: 8px;
-    height: 52%;
+    top: -30%;
+    left: -3px;
+    width: 12px;
+    height: 56%;
     background: linear-gradient(180deg, transparent, rgba(var(--principle-accent), 0.95), transparent);
     animation-name: principle-beam-y;
   }
 }
 
-@container (max-width: 640px) {
+@container (max-width: 720px) {
   .principle-flowgrid {
+    --principle-node-height: 126px;
     grid-template-columns: minmax(0, 1fr);
     gap: 0;
     min-height: auto;
+    padding: 12px;
   }
 
   .principle-node {
     height: auto;
     min-height: var(--principle-node-height);
     justify-content: flex-start;
-    padding-right: 48px;
-    overflow: visible;
+    gap: 6px;
+    padding: 42px 14px 14px;
+    overflow: hidden;
+  }
+
+  .principle-node .principle-node-index {
+    position: absolute;
+    top: 12px;
+    right: auto;
+    left: 14px;
+    width: 26px;
+    height: 26px;
+    font-size: 0.72rem;
+  }
+
+  .principle-node strong {
+    min-height: auto;
+    font-size: 0.95rem;
+    line-height: 1.28;
+  }
+
+  .principle-node-meta {
+    min-height: auto;
   }
 
   .principle-edge {
-    width: 4px;
-    height: 44px;
+    width: 6px;
+    height: 56px;
     margin: 0 auto;
     border-radius: 999px;
   }
 
   .principle-edge::before {
-    top: -16px;
+    top: -18px;
     left: 50%;
-    width: 16px;
-    height: 24px;
+    width: 20px;
+    height: 28px;
     animation-name: principle-packet-y;
   }
 
   .principle-edge::after {
-    top: -28%;
-    left: -2px;
-    width: 8px;
-    height: 52%;
+    top: -30%;
+    left: -3px;
+    width: 12px;
+    height: 56%;
     background: linear-gradient(180deg, transparent, rgba(var(--principle-accent), 0.95), transparent);
     animation-name: principle-beam-y;
   }
@@ -789,11 +1267,15 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .landing-scanline,
-  .landing-route-line::after {
+  .landing-route-line::after,
+  .principle-node,
+  .principle-node::before,
+  .principle-node::after,
+  .principle-edge::before,
+  .principle-edge::after {
     animation: none;
   }
-
   .principle-flowgrid {
-    --flow-cycle: 8.6s;
+    --flow-cycle: 0s;
   }
 }
