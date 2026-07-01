@@ -405,13 +405,8 @@ function LoginPageContent() {
  */
 function TopologyDiagram() {
   return (
-    <div className="rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
-      <div className="flex flex-col gap-3 sm:hidden">
-        <div className="rounded-md border border-cyan-200 bg-cyan-50 px-3 py-2 text-small dark:border-cyan-800 dark:bg-cyan-950"><span className="font-semibold text-cyan-700 dark:text-cyan-300">公网用户 / API</span><span className="ml-2 text-tiny text-default-500">→ Server (relay)</span></div>
-        <div className="rounded-md border border-default-200 bg-default-50 px-3 py-2 text-small dark:border-default-700 dark:bg-default-900"><span className="font-semibold">Server 控制面</span><span className="ml-2 text-tiny text-default-500">TLS 加密信道 + 信令</span></div>
-        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-small dark:border-emerald-800 dark:bg-emerald-950"><span className="font-semibold text-emerald-700 dark:text-emerald-300">客户端 A</span><span className="ml-2 text-tiny text-default-500">→ 客户端 B (直连)</span></div>
-        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-small dark:border-emerald-800 dark:bg-emerald-950"><span className="font-semibold text-emerald-700 dark:text-emerald-300">客户端 B</span><span className="ml-2 text-tiny text-default-500">← 客户端 A (直连)</span></div>
-      </div>
+    <div className="topology-panel rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
+      <MobileTopologyDiagram />
       <svg
         className="topology-svg hidden sm:block"
         viewBox="0 0 1080 440"
@@ -519,6 +514,76 @@ function TopologyDiagram() {
         实线（青）= 经 Server 中继的反向隧道，HTTP 路由与 TCP 端口映射走这条主路径；
         虚线（绿）= 客户端互联，控制面下发设备清单与会话凭证后，两端在 UDP 直连或 TURN 回退上跑加密 frame 数据面。
       </p>
+    </div>
+  );
+}
+
+function MobileTopologyDiagram() {
+  return (
+    <div
+      className="topology-mobile sm:hidden"
+      aria-label="组网形态移动端动画：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连或 TURN 回退"
+    >
+      <div className="topology-mobile-section topology-mobile-section-relay">
+        <div className="topology-mobile-heading">
+          <span>公网访问路径</span>
+          <strong>Relay</strong>
+        </div>
+        <div className="topology-mobile-chain">
+          <MobileTopologyNode title="公网用户 / API" meta="浏览器、curl、SSH 等" />
+          <MobileTopologyEdge label="公网请求 / 响应" tone="relay" />
+          <MobileTopologyNode title="Server" meta="HTTP 网关 · TCP 映射 · 租户 ACL" tone="server" />
+          <MobileTopologyEdge label="反向隧道" tone="relay" />
+          <MobileTopologyNode title="客户端 A" meta="访问内网服务 127.0.0.1:8080" />
+        </div>
+      </div>
+
+      <div className="topology-mobile-section topology-mobile-section-peer">
+        <div className="topology-mobile-heading">
+          <span>客户端互联路径</span>
+          <strong>Peer / TURN</strong>
+        </div>
+        <div className="topology-mobile-signal">Server 只负责 ACL 校验、设备清单与 PEER_CONTROL 信令</div>
+        <div className="topology-mobile-peer-row">
+          <MobileTopologyNode title="客户端 A" meta="100.96.0.0/11" compact />
+          <div className="topology-mobile-peer-link" aria-hidden="true">
+            <span>直连</span>
+            <span>TURN 回退</span>
+          </div>
+          <MobileTopologyNode title="客户端 B" meta="加密 frame 数据面" tone="peer" compact />
+        </div>
+      </div>
+
+      <div className="topology-mobile-note">
+        青色表示公网访问经 Server 中继；绿色表示客户端之间的数据面直连，失败后回退 TURN。
+      </div>
+    </div>
+  );
+}
+
+function MobileTopologyNode({
+  compact = false,
+  meta,
+  title,
+  tone = "default",
+}: {
+  compact?: boolean;
+  meta: string;
+  title: string;
+  tone?: "default" | "peer" | "server";
+}) {
+  return (
+    <div className={`topology-mobile-node topology-mobile-node-${tone} ${compact ? "topology-mobile-node-compact" : ""}`}>
+      <strong>{title}</strong>
+      <span>{meta}</span>
+    </div>
+  );
+}
+
+function MobileTopologyEdge({ label, tone }: { label: string; tone: "peer" | "relay" }) {
+  return (
+    <div className={`topology-mobile-edge topology-mobile-edge-${tone}`} aria-hidden="true">
+      <span>{label}</span>
     </div>
   );
 }
