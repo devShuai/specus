@@ -83,4 +83,50 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
               and (s.sourceClientId in :clientIds or s.targetClientId in :clientIds)
             """)
     Page<PeerMeshSession> findVisibleOpenPage(String tenantId, List<Long> clientIds, String closedStatus, Pageable pageable);
+
+    /**
+     * 打洞/路径统计投影。reportedSessions = rttMillis 非空的会话数——rtt 只由客户端
+     * PATH_REPORT 写入，因此非空即「至少确立过一次路径」；纯 NEGOTIATING 超时关闭的
+     * 会话不计入，避免 createSession 默认 pathType=DIRECT 虚高直连占比。
+     */
+    interface PathTypeAggregate {
+        String getPathType();
+
+        String getStatus();
+
+        long getSessions();
+
+        long getReportedSessions();
+
+        Double getAvgRttMillis();
+
+        long getDirectBytes();
+
+        long getRelayBytes();
+    }
+
+    @Query("""
+            select s.pathType as pathType, s.status as status,
+                   count(s) as sessions, count(s.rttMillis) as reportedSessions,
+                   avg(s.rttMillis) as avgRttMillis,
+                   coalesce(sum(s.directBytes), 0) as directBytes,
+                   coalesce(sum(s.relayBytes), 0) as relayBytes
+            from PeerMeshSession s
+            where s.tenantId = :tenantId
+            group by s.pathType, s.status
+            """)
+    List<PathTypeAggregate> aggregatePathTypes(String tenantId);
+
+    @Query("""
+            select s.pathType as pathType, s.status as status,
+                   count(s) as sessions, count(s.rttMillis) as reportedSessions,
+                   avg(s.rttMillis) as avgRttMillis,
+                   coalesce(sum(s.directBytes), 0) as directBytes,
+                   coalesce(sum(s.relayBytes), 0) as relayBytes
+            from PeerMeshSession s
+            where s.tenantId = :tenantId
+              and (s.sourceClientId in :clientIds or s.targetClientId in :clientIds)
+            group by s.pathType, s.status
+            """)
+    List<PathTypeAggregate> aggregateVisiblePathTypes(String tenantId, List<Long> clientIds);
 }

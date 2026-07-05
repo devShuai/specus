@@ -220,3 +220,7 @@ ping 100.96.x.y
 * .NET server / .NET client 继续做真实跨 NAT 压测，验证 direct 失败后的标准 TURN relay fallback、relay 计量和管理展示。
 * 客户端侧更细粒度的 direct / relay 统计签名上报。
 * 管理页拓扑图动画和 session 时间线。
+
+## 相关记录
+
+* Java 客户端打洞审计与修复(2026-07,含 roster 候选保留、keepalive burst、endpoint 粘滞、广播去重、`/api/admin/peer-mesh/stats` 聚合统计):`docs/peer-mesh-java-client-audit-fixes.md`

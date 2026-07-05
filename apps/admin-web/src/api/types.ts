@@ -362,6 +362,34 @@ export interface PeerMeshSessionPage {
   totalPages: number;
 }
 
+export interface PeerMeshPathTypeStat {
+  pathType: string;
+  status: string;
+  sessions: number;
+  /** rttMillis 非空的会话数 = 至少确立过一次路径（收到过 PATH_REPORT） */
+  reportedSessions: number;
+  avgRttMillis: number | null;
+  directBytes: number;
+  relayBytes: number;
+}
+
+export interface PeerMeshNatTypeStat {
+  natType: string;
+  devices: number;
+}
+
+export interface PeerMeshPathStats {
+  totalSessions: number;
+  reportedSessions: number;
+  activeSessions: number;
+  activeDirectSessions: number;
+  activeRelaySessions: number;
+  /** 活跃会话中 DIRECT 占比，打洞成功率的代理指标；无活跃会话时为 null */
+  activeDirectRatio: number | null;
+  pathTypes: PeerMeshPathTypeStat[];
+  natTypes: PeerMeshNatTypeStat[];
+}
+
 export interface DatabaseInitResult {
   initialized: boolean;
   orm: string;

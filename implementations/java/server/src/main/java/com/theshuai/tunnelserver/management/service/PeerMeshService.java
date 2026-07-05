@@ -11,6 +11,7 @@ import com.theshuai.tunnelserver.management.model.PeerMeshAcl;
 import com.theshuai.tunnelserver.management.model.PeerMeshAclView;
 import com.theshuai.tunnelserver.management.model.PeerMeshDevice;
 import com.theshuai.tunnelserver.management.model.PeerMeshDeviceView;
+import com.theshuai.tunnelserver.management.model.PeerMeshPathStatsView;
 import com.theshuai.tunnelserver.management.model.PeerMeshSession;
 import com.theshuai.tunnelserver.management.model.PeerMeshSessionView;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
@@ -30,7 +31,9 @@ import org.springframework.util.StringUtils;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -547,6 +550,72 @@ public class PeerMeshService {
                 normalizedSize,
                 Math.max(1, sessions.getTotalPages())
         );
+    }
+
+    /**
+     * 打洞/路径聚合统计。可见性与 listSessions 一致：admin 看全租户，普通用户只看
+     * 自己客户端参与的会话与自己名下设备的 NAT 分布。
+     */
+    @Transactional
+    public PeerMeshPathStatsView pathStats(ManagementContext context) {
+        expireIfStale();
+        List<PeerMeshSessionRepository.PathTypeAggregate> aggregates;
+        List<PeerMeshDeviceRepository.NatTypeAggregate> natAggregates;
+        if (context.isAdmin()) {
+            aggregates = sessionRepository.aggregatePathTypes(context.tenant().tenantId());
+            natAggregates = deviceRepository.aggregateNatTypes(context.tenant().tenantId());
+        } else {
+            List<Long> visible = visibleClientIds(context);
+            aggregates = visible.isEmpty()
+                    ? List.of()
+                    : sessionRepository.aggregateVisiblePathTypes(context.tenant().tenantId(), visible);
+            natAggregates = deviceRepository.aggregateNatTypesByOwner(
+                    context.tenant().tenantId(), context.username());
+        }
+        long total = 0;
+        long reported = 0;
+        long active = 0;
+        long activeDirect = 0;
+        long activeRelay = 0;
+        List<PeerMeshPathStatsView.PathTypeStat> pathTypes = new ArrayList<>();
+        for (PeerMeshSessionRepository.PathTypeAggregate aggregate : aggregates) {
+            total += aggregate.getSessions();
+            reported += aggregate.getReportedSessions();
+            if (STATUS_ACTIVE.equals(aggregate.getStatus())) {
+                active += aggregate.getSessions();
+                if (PATH_DIRECT.equals(aggregate.getPathType())) {
+                    activeDirect += aggregate.getSessions();
+                } else if (PATH_RELAY.equals(aggregate.getPathType())) {
+                    activeRelay += aggregate.getSessions();
+                }
+            }
+            pathTypes.add(new PeerMeshPathStatsView.PathTypeStat(
+                    aggregate.getPathType(),
+                    aggregate.getStatus(),
+                    aggregate.getSessions(),
+                    aggregate.getReportedSessions(),
+                    aggregate.getAvgRttMillis(),
+                    aggregate.getDirectBytes(),
+                    aggregate.getRelayBytes()));
+        }
+        // 空串与 null 的 natType 归并为 UNKNOWN
+        Map<String, Long> natCounts = new LinkedHashMap<>();
+        for (PeerMeshDeviceRepository.NatTypeAggregate item : natAggregates) {
+            String key = StringUtils.hasText(item.getNatType()) ? item.getNatType() : "UNKNOWN";
+            natCounts.merge(key, item.getDevices(), Long::sum);
+        }
+        List<PeerMeshPathStatsView.NatTypeStat> natTypes = natCounts.entrySet().stream()
+                .map(entry -> new PeerMeshPathStatsView.NatTypeStat(entry.getKey(), entry.getValue()))
+                .toList();
+        return new PeerMeshPathStatsView(
+                total,
+                reported,
+                active,
+                activeDirect,
+                activeRelay,
+                active == 0 ? null : (double) activeDirect / active,
+                pathTypes,
+                natTypes);
     }
 
     private List<Long> visibleClientIds(ManagementContext context) {

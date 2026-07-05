@@ -22,7 +22,7 @@ import {
   Tabs,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
-import type { PeerMeshAcl, PeerMeshDevice, PeerMeshSession, PeerMeshStatus } from "../../api/types";
+import type { PeerMeshAcl, PeerMeshDevice, PeerMeshPathStats, PeerMeshSession, PeerMeshStatus } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
@@ -31,6 +31,7 @@ import { useNowTick } from "../../hooks/useNowTick";
 import {
   NAT_TYPE_PROFILES,
   natReachabilityWeight,
+  natTypeColor,
   natTypeLabel,
   natTypeProfile,
 } from "../../lib/nat";
@@ -50,6 +51,7 @@ const PEER_SESSION_FRESH_MILLIS = 120_000;
 
 export function PeerMeshPanel() {
   const [status, setStatus] = useState<PeerMeshStatus | null>(null);
+  const [pathStats, setPathStats] = useState<PeerMeshPathStats | null>(null);
   const [devices, setDevices] = useState<PeerMeshDevice[]>([]);
   const [acls, setAcls] = useState<PeerMeshAcl[]>([]);
   const [sessions, setSessions] = useState<PeerMeshSession[]>([]);
@@ -71,7 +73,7 @@ export function PeerMeshPanel() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextStatus, nextDevices, nextAcls, nextSessions] = await Promise.all([
+      const [nextStatus, nextDevices, nextAcls, nextSessions, nextPathStats] = await Promise.all([
         adminApi.peerMeshStatus(),
         adminApi.listPeerMeshDevices(),
         adminApi.listPeerMeshAcls(),
@@ -80,8 +82,11 @@ export function PeerMeshPanel() {
           size: SESSION_PAGE_SIZE,
           openOnly: true,
         }),
+        // Go / C# 服务端尚未实现 stats 端点，失败时降级为 null，不影响面板其余部分
+        adminApi.peerMeshStats().catch(() => null),
       ]);
       setStatus(nextStatus);
+      setPathStats(nextPathStats);
       setDevices(nextDevices);
       setAcls(nextAcls);
       setSessions(nextSessions.items);
@@ -237,11 +242,16 @@ export function PeerMeshPanel() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-3 xl:grid-cols-6">
         <MetricCard label="全局开关" value={status?.enabled ? "已开启" : "默认关闭"} tone={status?.enabled ? "success" : "default"} />
         <MetricCard label="已启用设备" value={`${enabledDevices.length} / ${devices.length}`} />
         <MetricCard label="在线设备" value={String(onlineDevices.length)} tone={onlineDevices.length > 0 ? "success" : "default"} />
         <MetricCard label="活跃 Direct / Relay" value={`${directSessions.length} / ${relaySessions.length}`} />
+        <MetricCard
+          label="直连占比"
+          value={pathStats?.activeDirectRatio == null ? "-" : `${Math.round(pathStats.activeDirectRatio * 100)}%`}
+          tone={pathStats?.activeDirectRatio != null && pathStats.activeDirectRatio >= 0.5 ? "success" : "default"}
+        />
         <MetricCard label="Peer 流量" value={formatBytes(peerTrafficBytes)} tone={peerTrafficBytes > 0 ? "success" : "default"} />
       </div>
 
@@ -539,6 +549,7 @@ export function PeerMeshPanel() {
 
       {peerView === "sessions" && (
       <section className="grid gap-3">
+        <PeerPathStatsCard stats={pathStats} />
         {!loading && activeSessions.length === 0 ? (
           <Card shadow="none" className="rounded-md border border-default-200">
             <CardBody className="p-3">
@@ -666,6 +677,97 @@ function SessionDetail({ session, onDisconnect }: { session: PeerMeshSession; on
   );
 }
 
+
+/* ──────── PeerPathStatsCard 打洞/路径统计 ──────── */
+
+function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
+  if (!stats) {
+    // Go / C# 服务端尚未提供 stats 端点时静默隐藏
+    return null;
+  }
+  const ratioPercent = stats.activeDirectRatio == null ? null : Math.round(stats.activeDirectRatio * 100);
+  const pathTypeRows = [...stats.pathTypes].sort((a, b) => b.sessions - a.sessions);
+  const natTypeRows = [...stats.natTypes].sort((a, b) => b.devices - a.devices);
+  return (
+    <Card shadow="none" className="rounded-md border border-default-200">
+      <CardBody className="gap-3 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-small font-semibold">打洞 / 路径统计</h3>
+          <span className="text-tiny text-default-500">
+            累计会话 {stats.totalSessions} · 确立过路径 {stats.reportedSessions} · 当前活跃 {stats.activeSessions}
+          </span>
+        </div>
+
+        <div className="flex flex-col gap-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-tiny text-default-500">
+            <span>活跃会话直连占比（打洞成功率代理指标）</span>
+            <span className="text-small font-semibold text-foreground">
+              {ratioPercent == null ? "暂无活跃会话" : `${ratioPercent}%`}
+            </span>
+          </div>
+          <div className="h-2 overflow-hidden rounded-full bg-default-200">
+            <div
+              className="h-full rounded-full bg-success transition-[width] duration-500"
+              style={{ width: `${ratioPercent ?? 0}%` }}
+            />
+          </div>
+          <div className="flex justify-between text-tiny text-default-400">
+            <span>Direct {stats.activeDirectSessions}</span>
+            <span>Relay {stats.activeRelaySessions}</span>
+          </div>
+        </div>
+
+        {pathTypeRows.length > 0 && (
+          <div className="min-w-0 overflow-x-auto">
+            <Table aria-label="路径类型统计" removeWrapper>
+              <TableHeader>
+                <TableColumn>路径</TableColumn>
+                <TableColumn>状态</TableColumn>
+                <TableColumn>会话数</TableColumn>
+                <TableColumn>确立过路径</TableColumn>
+                <TableColumn>平均 RTT</TableColumn>
+                <TableColumn>Direct 流量</TableColumn>
+                <TableColumn>Relay 流量</TableColumn>
+              </TableHeader>
+              <TableBody>
+                {pathTypeRows.map((row) => (
+                  <TableRow key={`${row.pathType}-${row.status}`}>
+                    <TableCell>
+                      <Chip size="sm" variant="flat" color={row.pathType === "DIRECT" ? "success" : row.pathType === "RELAY" ? "warning" : "default"}>
+                        {row.pathType}
+                      </Chip>
+                    </TableCell>
+                    <TableCell>
+                      <Chip size="sm" variant="flat" color={row.status === "ACTIVE" ? "success" : row.status === "CLOSED" ? "default" : "warning"}>
+                        {row.status}
+                      </Chip>
+                    </TableCell>
+                    <TableCell>{row.sessions}</TableCell>
+                    <TableCell>{row.reportedSessions}</TableCell>
+                    <TableCell>{row.avgRttMillis == null ? "-" : `${Math.round(row.avgRttMillis)} ms`}</TableCell>
+                    <TableCell>{formatBytes(row.directBytes)}</TableCell>
+                    <TableCell>{formatBytes(row.relayBytes)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+
+        {natTypeRows.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-tiny text-default-500">设备 NAT 分布：</span>
+            {natTypeRows.map((item) => (
+              <Chip key={item.natType} size="sm" variant="flat" color={natTypeColor(item.natType)}>
+                {natTypeLabel(item.natType)} · {item.devices}
+              </Chip>
+            ))}
+          </div>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
 
 function PeerNatInsight({
   devices,

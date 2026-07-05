@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.management.controller;
 
 import com.theshuai.tunnelserver.management.model.PeerMeshAclView;
 import com.theshuai.tunnelserver.management.model.PeerMeshDeviceView;
+import com.theshuai.tunnelserver.management.model.PeerMeshPathStatsView;
 import com.theshuai.tunnelserver.management.model.PeerMeshSessionView;
 import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import com.theshuai.tunnelserver.management.service.PeerMeshService;
@@ -75,6 +76,12 @@ public class PeerMeshResource {
     @DeleteMapping("/acls/{id}")
     public void deleteAcl(@AuthenticationPrincipal Jwt jwt, @PathVariable long id) {
         peerMeshService.deleteAcl(contextResolver.resolve(jwt), id);
+    }
+
+    /** 打洞/路径聚合统计：activeDirectRatio 即当前活跃会话的直连占比 */
+    @GetMapping("/stats")
+    public PeerMeshPathStatsView stats(@AuthenticationPrincipal Jwt jwt) {
+        return peerMeshService.pathStats(contextResolver.resolve(jwt));
     }
 
     @GetMapping("/sessions")

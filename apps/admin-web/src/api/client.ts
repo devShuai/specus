@@ -25,6 +25,7 @@ import type {
   PeerMeshAclMutation,
   PeerMeshDevice,
   PeerMeshDeviceMutation,
+  PeerMeshPathStats,
   PeerMeshSessionPage,
   PeerMeshSession,
   PeerMeshStatus,
@@ -349,6 +350,7 @@ export const adminApi = {
   },
   getTrafficInspectionStatus: () => request<TrafficInspectionStatus>("/traffic/inspection-status"),
   peerMeshStatus: () => request<PeerMeshStatus>("/peer-mesh/status"),
+  peerMeshStats: () => request<PeerMeshPathStats>("/peer-mesh/stats"),
   listPeerMeshDevices: () => request<PeerMeshDevice[]>("/peer-mesh/devices"),
   updatePeerMeshDevice: (clientId: number, body: PeerMeshDeviceMutation) =>
     request<PeerMeshDevice>(`/peer-mesh/devices/${clientId}`, { method: "PUT", body: JSON.stringify(body) }),
