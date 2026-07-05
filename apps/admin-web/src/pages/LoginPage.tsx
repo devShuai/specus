@@ -1146,6 +1146,7 @@ function FlowStep({
   return (
     <>
       <div className="principle-node" style={nodeStyle}>
+        <span className="principle-node-android-glow" aria-hidden="true" />
         <span className="principle-node-index">{index + 1}</span>
         <span className="principle-node-eyebrow">{node.eyebrow}</span>
         <strong>{node.title}</strong>
@@ -1156,7 +1157,10 @@ function FlowStep({
           className="principle-edge"
           style={edgeStyle}
           aria-hidden="true"
-        />
+        >
+          <span className="principle-edge-android-packet" />
+          <span className="principle-edge-android-beam" />
+        </div>
       )}
     </>
   );

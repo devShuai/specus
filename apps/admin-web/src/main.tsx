@@ -5,6 +5,19 @@ import { App } from "./App";
 import { ThemeProvider } from "./theme/ThemeContext";
 import "./index.css";
 
+applyPlatformClasses();
+
+function applyPlatformClasses() {
+  const userAgent = window.navigator.userAgent;
+  const isAndroid = /\bAndroid\b/i.test(userAgent);
+  const isChrome = /\bChrome\//i.test(userAgent);
+  const isExcludedChromiumShell = /\b(EdgA|OPR|SamsungBrowser|HuaweiBrowser|MiuiBrowser)\//i.test(userAgent);
+
+  if (isAndroid && isChrome && !isExcludedChromiumShell) {
+    document.documentElement.classList.add("android-chrome");
+  }
+}
+
 function Root() {
   return (
     <ThemeProvider>

@@ -1061,6 +1061,12 @@ body {
   animation-delay: var(--node-delay);
 }
 
+.principle-node-android-glow,
+.principle-edge-android-packet,
+.principle-edge-android-beam {
+  display: none;
+}
+
 .principle-node strong {
   position: relative;
   z-index: 2;
@@ -1433,6 +1439,98 @@ body {
     height: 56%;
     background: linear-gradient(180deg, transparent, rgba(var(--principle-accent), 0.95), transparent);
     animation-name: principle-beam-y;
+  }
+}
+
+@media (max-width: 900px) {
+  .android-chrome .principle-card,
+  .android-chrome .principle-flowgrid {
+    container-type: normal;
+  }
+
+  .android-chrome .principle-card {
+    isolation: auto;
+  }
+
+  .android-chrome .principle-card-body > div:first-child,
+  .android-chrome .principle-card-body > div:first-child *,
+  .android-chrome .principle-note,
+  .android-chrome .principle-note *,
+  .android-chrome .principle-flowgrid,
+  .android-chrome .principle-node,
+  .android-chrome .principle-node > * {
+    backface-visibility: visible;
+    transform: none !important;
+    -webkit-backface-visibility: visible;
+    -webkit-transform: none !important;
+    will-change: auto;
+  }
+
+  .android-chrome .principle-node {
+    background-color: var(--principle-node-bg);
+    isolation: auto;
+  }
+
+  .android-chrome .principle-node::before,
+  .android-chrome .principle-node::after,
+  .android-chrome .principle-edge::before,
+  .android-chrome .principle-edge::after {
+    animation: none !important;
+    opacity: 0 !important;
+  }
+
+  .android-chrome .principle-node-android-glow {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    display: block;
+    pointer-events: none;
+    border: 1px solid rgba(var(--principle-accent), 0.76);
+    border-radius: inherit;
+    box-shadow:
+      0 0 34px rgba(var(--principle-accent), 0.28),
+      0 0 0 1px rgba(var(--principle-accent), 0.2) inset;
+    opacity: 0;
+    animation: principle-node-highlight var(--flow-cycle) ease-in-out infinite;
+    animation-delay: var(--node-delay);
+  }
+
+  .android-chrome .principle-edge-android-packet,
+  .android-chrome .principle-edge-android-beam {
+    position: absolute;
+    z-index: 1;
+    display: block;
+    pointer-events: none;
+    opacity: 0;
+  }
+
+  .android-chrome .principle-edge-android-packet {
+    top: -18px;
+    left: 50%;
+    width: 20px;
+    height: 28px;
+    border-radius: 999px;
+    background: rgb(var(--principle-accent));
+    box-shadow: 0 0 18px rgba(var(--principle-accent), 0.74);
+    animation: principle-packet-y var(--flow-cycle) linear infinite;
+    animation-delay: var(--edge-delay);
+  }
+
+  .android-chrome .principle-edge-android-beam {
+    top: -30%;
+    left: -3px;
+    width: 12px;
+    height: 56%;
+    background: linear-gradient(180deg, transparent, rgba(var(--principle-accent), 0.9), transparent);
+    animation: principle-beam-y var(--flow-cycle) linear infinite;
+    animation-delay: var(--edge-delay);
+  }
+
+  .android-chrome .principle-node-index,
+  .android-chrome .principle-node-eyebrow,
+  .android-chrome .principle-node strong,
+  .android-chrome .principle-node-meta {
+    z-index: 2;
   }
 }
 
