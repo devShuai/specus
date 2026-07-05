@@ -13,8 +13,8 @@
 #   5) 拷新 jar
 #   6) systemctl start tunnel-server
 #   7) 健康检查：
-#        - 等服务 active（最多 60s）
-#        - actuator /health 状态 UP（最多 60s）
+#        - 等服务 active（默认最多 60s，可用 TUNNEL_ACTIVE_TIMEOUT_SEC 覆盖）
+#        - actuator /health 状态 UP（默认最多 120s，可用 TUNNEL_HEALTH_TIMEOUT_SEC 覆盖）
 #   8) 任一步失败 → 回滚到上一份 bak 并重启
 #
 # 退出码：
@@ -31,8 +31,8 @@ ENV_FILE="$CONFIG_DIR/tunnel-server.env"
 ENV_EXAMPLE_FILE="$CONFIG_DIR/tunnel-server.env.example"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_KEEP=5
-ACTIVE_TIMEOUT_SEC=60
-HEALTH_TIMEOUT_SEC=60
+ACTIVE_TIMEOUT_SEC="${TUNNEL_ACTIVE_TIMEOUT_SEC:-60}"
+HEALTH_TIMEOUT_SEC="${TUNNEL_HEALTH_TIMEOUT_SEC:-120}"
 
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 fail() { printf '[%s] [ERR] %s\n' "$(date '+%F %T')" "$*" >&2; }

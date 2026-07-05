@@ -15,7 +15,6 @@ import org.mockito.ArgumentCaptor;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
 import java.util.zip.GZIPOutputStream;
@@ -30,7 +29,7 @@ import static org.mockito.Mockito.when;
 class TrafficInspectionServiceTests {
 
     @Test
-    void httpBodiesAreStoredWithoutPreviewTruncation() {
+    void httpBodiesAreStoredAsBinaryWithShortSearchPreview() {
         ClientAccountService clientAccountService = mock(ClientAccountService.class);
         TunnelMappingRepository tunnelMappingRepository = mock(TunnelMappingRepository.class);
         HttpRouteMappingRepository httpRouteMappingRepository = mock(HttpRouteMappingRepository.class);
@@ -86,9 +85,11 @@ class TrafficInspectionServiceTests {
 
         assertThat(saved).hasSize(1);
         HttpTrafficExchange exchange = saved.get(0);
-        assertThat(exchange.getRequestPreviewText()).isEqualTo(requestBody);
+        assertThat(exchange.getRequestBodyData()).containsExactly(requestBody.getBytes(StandardCharsets.UTF_8));
+        assertThat(exchange.getRequestPreviewText()).isEqualTo("01234567");
         assertThat(exchange.isRequestTruncated()).isFalse();
-        assertThat(exchange.getResponsePreviewText()).isEqualTo(responseBody);
+        assertThat(exchange.getResponseBodyData()).containsExactly(responseBody.getBytes(StandardCharsets.UTF_8));
+        assertThat(exchange.getResponsePreviewText()).isEqualTo("response");
         assertThat(exchange.isResponseTruncated()).isFalse();
     }
 
@@ -205,12 +206,13 @@ class TrafficInspectionServiceTests {
         assertThat(exchange.getResponseBytes()).isEqualTo(gzipBytes.length);
         assertThat(exchange.getResponseBodyType()).isEqualTo("json");
         assertThat(exchange.getResponseHeaders()).contains("Content-Encoding: gzip");
-        assertThat(exchange.getResponsePreviewText()).isEqualTo(responseBody);
+        assertThat(exchange.getResponseBodyData()).containsExactly(gzipBytes);
+        assertThat(exchange.getResponsePreviewText()).isEqualTo(responseBody.substring(0, 8));
         assertThat(exchange.isResponseTruncated()).isFalse();
     }
 
     @Test
-    void binaryHttpBodyIsStoredAsDataUrl() {
+    void binaryHttpBodyIsStoredAsBinaryWithoutTextPreview() {
         ClientAccountService clientAccountService = mock(ClientAccountService.class);
         TunnelMappingRepository tunnelMappingRepository = mock(TunnelMappingRepository.class);
         HttpRouteMappingRepository httpRouteMappingRepository = mock(HttpRouteMappingRepository.class);
@@ -266,8 +268,8 @@ class TrafficInspectionServiceTests {
         assertThat(saved).hasSize(1);
         HttpTrafficExchange exchange = saved.get(0);
         assertThat(exchange.getResponseBodyType()).isEqualTo("image");
-        assertThat(exchange.getResponsePreviewText())
-                .isEqualTo("data:image/png;base64," + Base64.getEncoder().encodeToString(pngBytes));
+        assertThat(exchange.getResponseBodyData()).containsExactly(pngBytes);
+        assertThat(exchange.getResponsePreviewText()).isEmpty();
         assertThat(exchange.isResponseTruncated()).isFalse();
     }
 

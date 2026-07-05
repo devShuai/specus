@@ -1566,6 +1566,17 @@ function useHttpBodyDisplay({
       };
     }
 
+    if (isProbablyStoredDecodedBody(content, bodyBytes, contentType, contentEncoding)) {
+      setDisplay({
+        content,
+        status: "stored-decoded",
+        message: `Content-Encoding: ${contentEncoding}。服务端已按压缩编码解码后返回预览内容。`,
+      });
+      return () => {
+        canceled = true;
+      };
+    }
+
     const unsupported = unsupportedContentEncodings(contentEncoding);
     if (unsupported.length > 0) {
       setDisplay({
@@ -1574,17 +1585,6 @@ function useHttpBodyDisplay({
         message: `该 Body 声明了 Content-Encoding: ${contentEncoding}，当前浏览器预览暂不支持 ${unsupported.join(
           "、",
         )} 解压，先展示保存的原始内容。`,
-      });
-      return () => {
-        canceled = true;
-      };
-    }
-
-    if (encodingIncludesGzip(contentEncoding) && !hasGzipMagic(bodyBytes)) {
-      setDisplay({
-        content,
-        status: "stored-decoded",
-        message: `Content-Encoding: ${contentEncoding}。当前保存内容不像原始 gzip 字节，按服务端已解码内容展示。`,
       });
       return () => {
         canceled = true;
@@ -1665,6 +1665,23 @@ function encodingIncludesGzip(value: string | null): boolean {
   return contentEncodingTokens(value).some((token) => token === "gzip" || token === "x-gzip");
 }
 
+function isProbablyStoredDecodedBody(
+  content: string,
+  bodyBytes: Uint8Array,
+  contentType: string | null,
+  contentEncoding: string | null,
+): boolean {
+  if (encodingIncludesGzip(contentEncoding) && !hasGzipMagic(bodyBytes)) {
+    return true;
+  }
+  const storedMediaType = dataUrlMediaType(content);
+  const responseMediaType = mediaTypeFromContentType(contentType);
+  if (storedMediaType && storedMediaType !== "application/octet-stream" && storedMediaType === responseMediaType) {
+    return true;
+  }
+  return isTextContentType(responseMediaType) && looksLikeTextPayload(bodyBytes);
+}
+
 function hasGzipMagic(bytes: Uint8Array): boolean {
   return bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
 }
@@ -1684,6 +1701,11 @@ function decodeDataUrlBytes(content: string): Uint8Array | null {
     return null;
   }
   return decodeBase64Bytes(match[2].replace(/\s/g, ""));
+}
+
+function dataUrlMediaType(content: string): string | null {
+  const match = content.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,/is);
+  return match?.[1]?.trim().toLowerCase() || null;
 }
 
 async function decodeHttpBodyBytes(bytes: Uint8Array, contentEncoding: string | null): Promise<Uint8Array> {

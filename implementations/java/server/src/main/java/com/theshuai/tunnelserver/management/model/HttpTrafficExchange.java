@@ -94,11 +94,19 @@ public class HttpTrafficExchange {
     private String requestPreviewHex;
 
     @Lob
+    @Column(name = "request_body_data")
+    private byte[] requestBodyData;
+
+    @Lob
     @Column(name = "request_preview_text")
     private String requestPreviewText;
 
     @Column(name = "response_preview_hex", length = 4096)
     private String responsePreviewHex;
+
+    @Lob
+    @Column(name = "response_body_data")
+    private byte[] responseBodyData;
 
     @Lob
     @Column(name = "response_preview_text")

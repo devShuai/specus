@@ -830,18 +830,22 @@ func (mesh *peerMeshClient) sendEncryptedPayload(session *peerMeshSession, paylo
 }
 
 func (mesh *peerMeshClient) completeProbe(probe peerUDPProbe, remote *net.UDPAddr, relayFrom string) {
+	now := time.Now()
 	mesh.mu.Lock()
 	pending, ok := mesh.pending[probe.Nonce]
 	if ok {
 		delete(mesh.pending, probe.Nonce)
 	}
 	session := mesh.sessions[pending.PeerID]
-	mesh.mu.Unlock()
 	if !ok || session == nil || session.ID != probe.SessionID || session.Token != probe.Token {
+		mesh.mu.Unlock()
 		return
 	}
 	if len(session.AESKey) == 0 {
-		mesh.logger.Printf("Peer Mesh UDP path checked but session key is unavailable: session=%d peer=%d", session.ID, session.PeerID)
+		sessionID := session.ID
+		peerID := session.PeerID
+		mesh.mu.Unlock()
+		mesh.logger.Printf("Peer Mesh UDP path checked but session key is unavailable: session=%d peer=%d", sessionID, peerID)
 		return
 	}
 	rtt := time.Since(pending.SentAt).Milliseconds()
@@ -851,13 +855,12 @@ func (mesh *peerMeshClient) completeProbe(probe peerUDPProbe, remote *net.UDPAdd
 		pathType = "RELAY"
 		remoteText = "relay:" + firstNonEmpty(relayFrom, pending.RelayID)
 	}
-	if pathType == "DIRECT" && (mesh.shouldAvoidDirectPath() || mesh.isMeshEndpoint(remote)) {
+	if pathType == "DIRECT" && (mesh.shouldAvoidDirectPathLocked() || mesh.isMeshEndpointLocked(remote)) {
+		mesh.mu.Unlock()
 		return
 	}
-	now := time.Now()
 	shouldLog := false
 	shouldReport := false
-	mesh.mu.Lock()
 	previousPath := session.PathType
 	previousRemote := session.LastPathRemoteText
 	if pending.Relay {
@@ -974,13 +977,40 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 			peerPublicKey = peer.PublicKey
 		}
 	}
+	previous := mesh.sessions[peerID]
+	if previous != nil {
+		if peerName == "" {
+			peerName = previous.PeerName
+		}
+		if peerVirtualIP == "" {
+			peerVirtualIP = previous.PeerVirtualIP
+		}
+		if peerPublicKey == "" {
+			peerPublicKey = previous.PeerPublicKey
+		}
+	}
 	expiresAt := time.Now().Add(time.Hour)
 	if parsed, err := time.Parse(time.RFC3339Nano, message.ExpiresAt); err == nil {
 		expiresAt = parsed
 	}
-	session := mesh.sessions[peerID]
-	if session == nil || session.ID != *message.SessionID {
-		session = &peerMeshSession{Replay: peerReplayWindow{}}
+	sameSession := previous != nil && previous.ID == *message.SessionID
+	session := &peerMeshSession{Replay: peerReplayWindow{}}
+	if previous != nil {
+		if sameSession {
+			session.Sequence = previous.Sequence
+			session.Replay = previous.Replay
+		}
+		session.RemoteEndpoint = previous.RemoteEndpoint
+		session.RelayTargetAllocationID = previous.RelayTargetAllocationID
+		session.PathType = previous.PathType
+		session.LastDirectSuccess = previous.LastDirectSuccess
+		session.LastDirectKeepalive = previous.LastDirectKeepalive
+		session.LastRelaySuccess = previous.LastRelaySuccess
+		session.LastPathLog = previous.LastPathLog
+		session.LastPathReport = previous.LastPathReport
+		session.LastPathRemoteText = previous.LastPathRemoteText
+		session.DirectBytes = previous.DirectBytes
+		session.DirectBytesPending = previous.DirectBytesPending
 	}
 	session.ID = *message.SessionID
 	session.PeerID = peerID
@@ -989,7 +1019,9 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 	session.PeerPublicKey = peerPublicKey
 	session.Token = message.Token
 	session.ExpiresAt = expiresAt
-	session.PathType = message.PathType
+	if strings.TrimSpace(message.PathType) != "" {
+		session.PathType = message.PathType
+	}
 	if len(session.AESKey) == 0 && mesh.localKey != nil && strings.TrimSpace(peerPublicKey) != "" {
 		aesKey, err := derivePeerMeshAESKey(mesh.localKey, peerPublicKey, session.ID, session.Token, mesh.runtime.PeerMesh.ClientID, peerID)
 		if err != nil {
@@ -1027,6 +1059,10 @@ func (mesh *peerMeshClient) announceCandidates() {
 	conn := mesh.conn
 	sender := mesh.sender
 	runtime := mesh.runtime
+	if sender == nil {
+		mesh.mu.Unlock()
+		return
+	}
 	peers := make([]peerMeshPeer, 0, len(mesh.peers))
 	for _, peer := range mesh.peers {
 		if peer.Online && strings.TrimSpace(peer.ClientName) != "" {
@@ -1909,9 +1945,15 @@ func (mesh *peerMeshClient) isMeshEndpoint(endpoint *net.UDPAddr) bool {
 		return false
 	}
 	mesh.mu.Lock()
-	cidr := mesh.runtime.PeerMesh.CIDR
-	mesh.mu.Unlock()
-	return inCIDR(endpoint.IP, cidr)
+	defer mesh.mu.Unlock()
+	return mesh.isMeshEndpointLocked(endpoint)
+}
+
+func (mesh *peerMeshClient) isMeshEndpointLocked(endpoint *net.UDPAddr) bool {
+	if endpoint == nil {
+		return false
+	}
+	return inCIDR(endpoint.IP, mesh.runtime.PeerMesh.CIDR)
 }
 
 func (mesh *peerMeshClient) isNoNatLocked(endpoint string) bool {

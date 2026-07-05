@@ -64,6 +64,7 @@ public class DatabaseInitializer {
     @Transactional
     public synchronized Map<String, Object> initialize(TenantContext tenant) {
         widenHttpBodyTextColumns();
+        ensureHttpBinaryBodyColumns();
         backfillDefaultTenant();
         backfillDefaultOwner();
         if (seedDemoClient && clientAccountRepository
@@ -170,6 +171,29 @@ public class DatabaseInitializer {
                 jdbcTemplate.execute(statement);
             } catch (DataAccessException e) {
                 log.debug("[schema] skip widening HTTP body text column with '{}': {}", statement, e.getMessage());
+            }
+        }
+    }
+
+    private void ensureHttpBinaryBodyColumns() {
+        String normalizedPlatform = databasePlatform == null ? "" : databasePlatform.toLowerCase();
+        List<String> sql = List.of();
+        if (normalizedPlatform.contains("mysql") || normalizedPlatform.contains("mariadb")) {
+            sql = List.of(
+                    "alter table tunnel_http_traffic_exchange add column request_body_data longblob",
+                    "alter table tunnel_http_traffic_exchange add column response_body_data longblob"
+            );
+        } else if (normalizedPlatform.contains("postgres")) {
+            sql = List.of(
+                    "alter table tunnel_http_traffic_exchange add column request_body_data bytea",
+                    "alter table tunnel_http_traffic_exchange add column response_body_data bytea"
+            );
+        }
+        for (String statement : sql) {
+            try {
+                jdbcTemplate.execute(statement);
+            } catch (DataAccessException e) {
+                log.debug("[schema] skip adding HTTP binary body column with '{}': {}", statement, e.getMessage());
             }
         }
     }

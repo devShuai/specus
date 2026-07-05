@@ -9,6 +9,7 @@ import co.elastic.clients.elasticsearch._types.query_dsl.Query;
 import co.elastic.clients.elasticsearch.indices.IndicesStatsResponse;
 import co.elastic.clients.elasticsearch.indices.stats.IndicesStats;
 import com.theshuai.tunnelserver.config.ElasticsearchProperties;
+import com.theshuai.tunnelserver.management.model.HttpBodyDataCodec;
 import com.theshuai.tunnelserver.management.model.HttpBodyTypeClassifier;
 import com.theshuai.tunnelserver.management.model.HttpTrafficExchange;
 import com.theshuai.tunnelserver.management.model.HttpTrafficExchangeView;
@@ -113,9 +114,24 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
                 indexOperations.create();
                 indexOperations.putMapping(indexOperations.createMapping(HttpTrafficExchangeDocument.class));
             } else {
-                log.debug("Elasticsearch index {} already exists, skip mapping update", properties.getIndex());
+                putBinaryBodyMapping();
             }
             indexReady = true;
+        }
+    }
+
+    private void putBinaryBodyMapping() {
+        if (client == null) {
+            return;
+        }
+        try {
+            client.indices().putMapping(request -> request
+                    .index(properties.getIndex())
+                    .properties("requestBodyData", property -> property.binary(binary -> binary))
+                    .properties("responseBodyData", property -> property.binary(binary -> binary)));
+        } catch (Exception ex) {
+            log.warn("Failed to update HTTP traffic Elasticsearch binary body mapping for index {}",
+                    properties.getIndex(), ex);
         }
     }
 
@@ -293,8 +309,10 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
         document.setRequestHeaders(exchange.getRequestHeaders());
         document.setResponseHeaders(exchange.getResponseHeaders());
         document.setRequestPreviewHex(exchange.getRequestPreviewHex());
+        document.setRequestBodyData(exchange.getRequestBodyData());
         document.setRequestPreviewText(exchange.getRequestPreviewText());
         document.setResponsePreviewHex(exchange.getResponsePreviewHex());
+        document.setResponseBodyData(exchange.getResponseBodyData());
         document.setResponsePreviewText(exchange.getResponsePreviewText());
         document.setRequestTruncated(exchange.isRequestTruncated());
         document.setResponseTruncated(exchange.isResponseTruncated());
@@ -327,9 +345,11 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
                 document.getRequestHeaders(),
                 document.getResponseHeaders(),
                 document.getRequestPreviewHex(),
-                document.getRequestPreviewText(),
+                HttpBodyDataCodec.toDisplayText(document.getRequestBodyData(),
+                        document.getRequestContentType(), document.getRequestHeaders(), document.getRequestPreviewText()),
                 document.getResponsePreviewHex(),
-                document.getResponsePreviewText(),
+                HttpBodyDataCodec.toDisplayText(document.getResponseBodyData(),
+                        document.getResponseContentType(), document.getResponseHeaders(), document.getResponsePreviewText()),
                 document.isRequestTruncated(),
                 document.isResponseTruncated(),
                 document.getCapturedAt()

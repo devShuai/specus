@@ -232,6 +232,87 @@ func TestPeerMeshGatherCandidatesIncludesPortMapCandidateEvenWhenNatIsSymmetric(
 	}
 }
 
+func TestPeerMeshMergeSessionPreservesNominatedPathAcrossRefreshLikeJava(t *testing.T) {
+	oldEndpoint := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 20), Port: 52099}
+	oldDirectAt := time.Now().Add(-5 * time.Second)
+	oldKeepaliveAt := time.Now().Add(-2 * time.Second)
+	oldReportAt := time.Now().Add(-time.Minute)
+	oldLogAt := time.Now().Add(-time.Minute)
+	oldSession := &peerMeshSession{
+		ID:                  1001,
+		PeerID:              2,
+		PeerName:            "java-b",
+		PeerVirtualIP:       "100.112.186.105",
+		PeerPublicKey:       "peer-key",
+		Token:               "old-token",
+		ExpiresAt:           time.Now().Add(time.Minute),
+		RemoteEndpoint:      oldEndpoint,
+		PathType:            "DIRECT",
+		LastDirectSuccess:   oldDirectAt,
+		LastDirectKeepalive: oldKeepaliveAt,
+		LastRelaySuccess:    time.Now().Add(-10 * time.Second),
+		LastPathLog:         oldLogAt,
+		LastPathReport:      oldReportAt,
+		LastPathRemoteText:  oldEndpoint.String(),
+		AESKey:              []byte("0123456789abcdef0123456789abcdef"),
+		Sequence:            42,
+		Replay:              peerReplayWindow{highest: 7, bits: 3},
+		DirectBytes:         100,
+		DirectBytesPending:  25,
+	}
+	mesh := &peerMeshClient{
+		logger: log.New(io.Discard, "", 0),
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			ClientID: 1,
+			CIDR:     "100.96.0.0/11",
+		}},
+		peers: map[int64]*peerMeshPeer{
+			2: {ClientID: 2, ClientName: "java-b", VirtualIP: "100.112.186.105", PublicKey: "peer-key", Online: true},
+		},
+		sessions: map[int64]*peerMeshSession{2: oldSession},
+	}
+	newSessionID := int64(2002)
+
+	mesh.mergeSession(peerControlMessage{
+		SourceClientID:   1,
+		TargetClientID:   2,
+		TargetClientName: "java-b",
+		TargetVirtualIP:  "100.112.186.105",
+		TargetPublicKey:  "peer-key",
+		SessionID:        &newSessionID,
+		Token:            "new-token",
+		ExpiresAt:        time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		PathType:         "",
+		CreatedAtMillis:  time.Now().UnixMilli(),
+	})
+
+	session := mesh.sessions[2]
+	if session == nil {
+		t.Fatal("session missing after merge")
+	}
+	if session.ID != newSessionID {
+		t.Fatalf("session ID = %d, want %d", session.ID, newSessionID)
+	}
+	if session.RemoteEndpoint == nil || session.RemoteEndpoint.String() != oldEndpoint.String() {
+		t.Fatalf("remote endpoint = %v, want %v", session.RemoteEndpoint, oldEndpoint)
+	}
+	if session.PathType != "DIRECT" {
+		t.Fatalf("path type = %q, want DIRECT", session.PathType)
+	}
+	if !session.LastDirectSuccess.Equal(oldDirectAt) || !session.LastDirectKeepalive.Equal(oldKeepaliveAt) {
+		t.Fatalf("direct timestamps not preserved: success=%v keepalive=%v", session.LastDirectSuccess, session.LastDirectKeepalive)
+	}
+	if session.LastPathRemoteText != oldEndpoint.String() {
+		t.Fatalf("last path remote = %q, want %q", session.LastPathRemoteText, oldEndpoint.String())
+	}
+	if session.Sequence != 0 || session.Replay.highest != 0 {
+		t.Fatalf("new session copied replay state: sequence=%d replay=%+v", session.Sequence, session.Replay)
+	}
+	if session.DirectBytes != 100 || session.DirectBytesPending != 25 {
+		t.Fatalf("traffic counters = %d/%d, want 100/25", session.DirectBytes, session.DirectBytesPending)
+	}
+}
+
 func TestPeerMeshPendingPacketQueueCapsAndExpires(t *testing.T) {
 	mesh := &peerMeshClient{
 		packets: make(map[int64][]pendingPeerPacket),

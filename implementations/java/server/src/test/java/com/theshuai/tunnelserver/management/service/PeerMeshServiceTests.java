@@ -16,11 +16,15 @@ import com.theshuai.tunnelserver.management.repository.PeerMeshSessionRepository
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class PeerMeshServiceTests {
@@ -120,6 +124,32 @@ class PeerMeshServiceTests {
         assertThat(view.status()).isEqualTo(PeerMeshService.STATUS_CLOSED);
         assertThat(view.directBytes()).isZero();
         assertThat(view.closedAt()).isNotBlank();
+    }
+
+    @Test
+    void createSessionReusesCachedOpenSessionForSamePeerPair() {
+        mockDeviceEnabled(1L);
+        mockDeviceEnabled(2L);
+        AtomicReference<PeerMeshSession> saved = new AtomicReference<>();
+        when(sessionRepository.findOpenBetweenClients("tenant-a", 1L, 2L, PeerMeshService.STATUS_CLOSED))
+                .thenAnswer(invocation -> saved.get() == null ? List.of() : List.of(saved.get()));
+        when(sessionRepository.findOpenBetweenClients("tenant-a", 2L, 1L, PeerMeshService.STATUS_CLOSED))
+                .thenAnswer(invocation -> saved.get() == null ? List.of() : List.of(saved.get()));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> {
+            PeerMeshSession session = invocation.getArgument(0);
+            saved.set(session);
+            return session;
+        });
+
+        var first = service.createSession(client(1, "alice", "a"), client(2, "alice", "b"), PeerMeshService.PATH_DIRECT);
+        var second = service.createSession(client(1, "alice", "a"), client(2, "alice", "b"), PeerMeshService.PATH_DIRECT);
+        var reverse = service.createSession(client(2, "alice", "b"), client(1, "alice", "a"), PeerMeshService.PATH_DIRECT);
+
+        assertThat(second.session().id()).isEqualTo(first.session().id());
+        assertThat(second.token()).isEqualTo(first.token());
+        assertThat(reverse.session().id()).isEqualTo(first.session().id());
+        assertThat(reverse.token()).isEqualTo(first.token());
+        verify(sessionRepository, times(1)).save(any(PeerMeshSession.class));
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.theshuai.tunnelserver.management.storage;
 import com.theshuai.tunnelserver.management.model.HttpTrafficExchange;
 import com.theshuai.tunnelserver.management.model.HttpTrafficExchangeView;
 import com.theshuai.tunnelserver.management.model.HttpBodyTypeClassifier;
+import com.theshuai.tunnelserver.management.model.HttpBodyDataCodec;
 import com.theshuai.tunnelserver.management.repository.HttpTrafficExchangeRepository;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import jakarta.persistence.criteria.Path;
@@ -77,9 +78,11 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
                 exchange.getRequestHeaders(),
                 exchange.getResponseHeaders(),
                 exchange.getRequestPreviewHex(),
-                exchange.getRequestPreviewText(),
+                HttpBodyDataCodec.toDisplayText(exchange.getRequestBodyData(),
+                        exchange.getRequestContentType(), exchange.getRequestHeaders(), exchange.getRequestPreviewText()),
                 exchange.getResponsePreviewHex(),
-                exchange.getResponsePreviewText(),
+                HttpBodyDataCodec.toDisplayText(exchange.getResponseBodyData(),
+                        exchange.getResponseContentType(), exchange.getResponseHeaders(), exchange.getResponsePreviewText()),
                 exchange.isRequestTruncated(),
                 exchange.isResponseTruncated(),
                 exchange.getCapturedAt()

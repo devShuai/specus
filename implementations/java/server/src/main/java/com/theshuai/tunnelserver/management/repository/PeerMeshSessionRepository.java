@@ -24,6 +24,22 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
             """)
     List<PeerMeshSession> findOpenByClientId(String tenantId, Long clientId, String closedStatus);
 
+    @Query("""
+            select s from PeerMeshSession s
+            where s.tenantId = :tenantId
+              and s.status <> :closedStatus
+              and (
+                (s.sourceClientId = :sourceClientId and s.targetClientId = :targetClientId)
+                or (s.sourceClientId = :targetClientId and s.targetClientId = :sourceClientId)
+              )
+            order by s.updatedAt desc
+            """)
+    List<PeerMeshSession> findOpenBetweenClients(
+            String tenantId,
+            Long sourceClientId,
+            Long targetClientId,
+            String closedStatus);
+
     List<PeerMeshSession> findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(
             String status,
             String expiresAt,

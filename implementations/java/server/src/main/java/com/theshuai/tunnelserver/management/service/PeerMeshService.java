@@ -55,6 +55,7 @@ public class PeerMeshService {
     private final ClientAccountRepository clientAccountRepository;
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
     private final Map<Long, LongAdder> pendingRelayBytes = new ConcurrentHashMap<>();
+    private final Map<Long, String> sessionTokenCache = new ConcurrentHashMap<>();
     private volatile long lastExpireMillis;
 
     public PeerMeshService(PeerMeshProperties properties,
@@ -253,6 +254,10 @@ public class PeerMeshService {
             throw new IllegalArgumentException("peer access denied");
         }
         Instant now = Instant.now();
+        Optional<PeerSessionGrant> reusable = reusableSessionGrant(source, target, now);
+        if (reusable.isPresent()) {
+            return reusable.get();
+        }
         String token = shortToken(source.getClientName(), target.getClientName(), String.valueOf(now.toEpochMilli()));
         PeerMeshSession session = new PeerMeshSession();
         session.setId(ClientIdGenerator.newId());
@@ -267,7 +272,29 @@ public class PeerMeshService {
         session.setStartedAt(now.toString());
         session.setUpdatedAt(now.toString());
         session.setExpiresAt(now.plusSeconds(properties.getSessionTtlSeconds()).toString());
-        return new PeerSessionGrant(toSessionView(sessionRepository.save(session)), token);
+        PeerMeshSession saved = sessionRepository.save(session);
+        sessionTokenCache.put(saved.getId(), token);
+        return new PeerSessionGrant(toSessionView(saved), token);
+    }
+
+    private Optional<PeerSessionGrant> reusableSessionGrant(ClientAccount source, ClientAccount target, Instant now) {
+        List<PeerMeshSession> sessions = sessionRepository.findOpenBetweenClients(
+                source.getTenantId(),
+                source.getId(),
+                target.getId(),
+                STATUS_CLOSED);
+        for (PeerMeshSession session : sessions) {
+            if (closeIfExpired(session, now)) {
+                sessionRepository.save(session);
+                continue;
+            }
+            String token = sessionTokenCache.get(session.getId());
+            if (!StringUtils.hasText(token)) {
+                continue;
+            }
+            return Optional.of(new PeerSessionGrant(toSessionView(session), token));
+        }
+        return Optional.empty();
     }
 
     @Transactional
@@ -838,6 +865,7 @@ public class PeerMeshService {
         if (session.getId() != null) {
             relayAuthorizationCache.remove(session.getId());
             pendingRelayBytes.remove(session.getId());
+            sessionTokenCache.remove(session.getId());
         }
     }
 

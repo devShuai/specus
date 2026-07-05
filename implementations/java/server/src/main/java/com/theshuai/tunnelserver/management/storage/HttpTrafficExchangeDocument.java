@@ -83,11 +83,17 @@ public class HttpTrafficExchangeDocument {
     @Field(type = FieldType.Text)
     private String requestPreviewHex;
 
+    @Field(type = FieldType.Binary)
+    private byte[] requestBodyData;
+
     @Field(type = FieldType.Text)
     private String requestPreviewText;
 
     @Field(type = FieldType.Text)
     private String responsePreviewHex;
+
+    @Field(type = FieldType.Binary)
+    private byte[] responseBodyData;
 
     @Field(type = FieldType.Text)
     private String responsePreviewText;

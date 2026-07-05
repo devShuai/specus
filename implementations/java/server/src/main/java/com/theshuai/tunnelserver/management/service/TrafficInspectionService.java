@@ -24,7 +24,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -118,8 +117,8 @@ public class TrafficInspectionService {
         String responseBodyType = HttpBodyTypeClassifier.classify(responseContentType, length(responseBody));
         String requestContentEncoding = contentEncoding(requestHeaders);
         String responseContentEncoding = contentEncoding(responseHeaders);
-        Preview requestPreview = bodyText(requestBody, requestContentType, requestContentEncoding);
-        Preview responsePreview = bodyText(responseBody, responseContentType, responseContentEncoding);
+        HttpBodyCapture requestCapture = captureHttpBody(requestBody, requestContentType, requestContentEncoding);
+        HttpBodyCapture responseCapture = captureHttpBody(responseBody, responseContentType, responseContentEncoding);
         pendingHttpExchanges.add(new PendingHttpExchange(
                 clientName,
                 blankToEmpty(route),
@@ -138,12 +137,14 @@ public class TrafficInspectionService {
                 responseBodyType,
                 cap(joinHeaders(requestHeaders), headerChars),
                 cap(joinHeaders(responseHeaders), headerChars),
-                requestPreview.hex(),
-                requestPreview.text(),
-                responsePreview.hex(),
-                responsePreview.text(),
-                requestPreview.truncated(),
-                responsePreview.truncated(),
+                requestCapture.previewHex(),
+                requestCapture.bodyData(),
+                requestCapture.searchText(),
+                responseCapture.previewHex(),
+                responseCapture.bodyData(),
+                responseCapture.searchText(),
+                requestCapture.truncated(),
+                responseCapture.truncated(),
                 Instant.now().toString()
         ));
     }
@@ -304,8 +305,10 @@ public class TrafficInspectionService {
             exchange.setRequestHeaders(item.requestHeaders());
             exchange.setResponseHeaders(item.responseHeaders());
             exchange.setRequestPreviewHex(item.requestPreviewHex());
+            exchange.setRequestBodyData(item.requestBodyData());
             exchange.setRequestPreviewText(item.requestPreviewText());
             exchange.setResponsePreviewHex(item.responsePreviewHex());
+            exchange.setResponseBodyData(item.responseBodyData());
             exchange.setResponsePreviewText(item.responsePreviewText());
             exchange.setRequestTruncated(item.requestTruncated());
             exchange.setResponseTruncated(item.responseTruncated());
@@ -511,20 +514,27 @@ public class TrafficInspectionService {
         return new Preview(hex.toString(), text, totalLength > previewLength);
     }
 
-    private Preview bodyText(byte[] data, String contentType, String contentEncoding) {
+    private HttpBodyCapture captureHttpBody(byte[] data, String contentType, String contentEncoding) {
         if (data == null || data.length == 0) {
-            return new Preview("", "", false);
+            return new HttpBodyCapture("", new byte[0], "", false);
         }
+        Preview rawPreview = preview(data);
+        byte[] bodyData = Arrays.copyOf(data, data.length);
+        String searchText = searchableBodyText(data, contentType, contentEncoding);
+        return new HttpBodyCapture(rawPreview.hex(), bodyData, searchText, false);
+    }
+
+    private String searchableBodyText(byte[] data, String contentType, String contentEncoding) {
         DecodedBody decoded = decodeContentEncoding(data, contentEncoding);
         byte[] displayData = decoded.data();
-        if (!decoded.decoded() && hasEncodedBody(contentEncoding) && !looksLikeText(displayData)) {
-            return new Preview("", "data:application/octet-stream;base64," + Base64.getEncoder().encodeToString(displayData), decoded.truncated());
-        }
         if (!isTextBody(contentType) && !looksLikeText(displayData)) {
-            String mediaType = mediaType(contentType);
-            return new Preview("", "data:" + mediaType + ";base64," + Base64.getEncoder().encodeToString(displayData), decoded.truncated());
+            return "";
         }
-        return new Preview("", sanitizeText(new String(displayData, StandardCharsets.UTF_8)), decoded.truncated());
+        String text = sanitizeText(new String(displayData, StandardCharsets.UTF_8));
+        if (previewBytes <= 0) {
+            return "";
+        }
+        return cap(text, previewBytes);
     }
 
     private DecodedBody decodeContentEncoding(byte[] data, String contentEncoding) {
@@ -774,6 +784,9 @@ public class TrafficInspectionService {
     private record Preview(String hex, String text, boolean truncated) {
     }
 
+    private record HttpBodyCapture(String previewHex, byte[] bodyData, String searchText, boolean truncated) {
+    }
+
     public record Snapshot(boolean enabled,
                            int pendingHttp,
                            int pendingTcp,
@@ -813,8 +826,10 @@ public class TrafficInspectionService {
             String requestHeaders,
             String responseHeaders,
             String requestPreviewHex,
+            byte[] requestBodyData,
             String requestPreviewText,
             String responsePreviewHex,
+            byte[] responseBodyData,
             String responsePreviewText,
             boolean requestTruncated,
             boolean responseTruncated,

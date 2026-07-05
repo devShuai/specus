@@ -822,6 +822,16 @@ body {
     height: auto;
     transform: translateX(-50%);
   }
+
+  /* 连线转为竖向后，粒子也要改走竖向 keyframes，避免横穿空白区域 */
+  .topology-mobile-peer-link::after {
+    top: -4px;
+    left: 50%;
+    width: 10px;
+    height: 14px;
+    transform: translateX(-50%);
+    animation-name: topology-mobile-edge-packet-y;
+  }
 }
 
 /* 节点框（公网用户 / 客户端 A）：浅色半透明白；暗色半透明深 + 浅色边 */
@@ -929,10 +939,15 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .topology-relay-flow,
-  .topology-peer-flow,
+  .topology-peer-flow {
+    animation: none;
+  }
+
+  /* 粒子点没有基础 opacity:0，只停动画会以发光点形态卡在起点，需一并隐藏 */
   .topology-mobile-edge::after,
   .topology-mobile-peer-link::after {
     animation: none;
+    opacity: 0;
   }
 }
 
@@ -1016,8 +1031,6 @@ body {
   isolation: isolate;
   backface-visibility: hidden;
   -webkit-tap-highlight-color: transparent;
-  animation: principle-node-sequence var(--flow-cycle) ease-in-out infinite;
-  animation-delay: var(--node-delay);
 }
 
 .principle-node::before {
@@ -1509,12 +1522,16 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .landing-scanline,
   .landing-route-line::after,
-  .principle-node,
   .principle-node::before,
   .principle-node::after,
   .principle-edge::before,
   .principle-edge::after {
     animation: none;
+  }
+
+  /* 光条没有基础 opacity:0，只停动画会以 38% 宽的静止亮条卡在线段起点 */
+  .landing-route-line::after {
+    opacity: 0;
   }
   .principle-flowgrid {
     --flow-cycle: 0s;
