@@ -8,6 +8,7 @@ using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.Control;
+using ShuaiTunnel.Client.Runtime;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
 
@@ -62,6 +63,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private readonly TunnelClientConfig _config;
     private readonly ILogger<PeerMeshClient> _logger;
+    private readonly ITunnelClientObserver? _observer;
     private readonly object _sync = new();
     private readonly Dictionary<long, PeerMeshPeer> _peers = new();
     private readonly Dictionary<long, PeerMeshSession> _sessions = new();
@@ -90,10 +92,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private PeerKeyMaterial? _keyMaterial;
     private IPeerVirtualDevice? _device;
 
-    public PeerMeshClient(TunnelClientConfig config, ILogger<PeerMeshClient> logger)
+    public PeerMeshClient(TunnelClientConfig config, ILogger<PeerMeshClient> logger, ITunnelClientObserver? observer = null)
     {
         _config = config;
         _logger = logger;
+        _observer = observer;
         _portMappingService = new NatPortMappingService(logger);
     }
 
@@ -186,6 +189,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _ = Task.Run(() => ReceiveLoopAsync(udp, cts.Token), CancellationToken.None);
         _ = Task.Run(() => MaintenanceLoopAsync(cts.Token), CancellationToken.None);
         await ReportDeviceAsync(runtime, writer, DeviceStatus(), FirstNonEmpty(deviceError, device.Error), "", "", cancellationToken).ConfigureAwait(false);
+        PublishPeerMeshSnapshot();
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
     }
@@ -608,6 +612,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     current.LastPathReport = now;
                 }
                 current.LastPathRemoteText = remoteText;
+                current.LastRttMillis = rtt;
             }
         }
         if (shouldLog)
@@ -619,6 +624,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             await ReportPathAsync(session, path, LocalEndpoint(), remoteText, rtt).ConfigureAwait(false);
         }
+        PublishPeerMeshSnapshot();
         await FlushPendingPacketsAsync(session).ConfigureAwait(false);
     }
 
@@ -968,6 +974,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 _peers[peer.ClientId] = peer;
             }
         }
+        PublishPeerMeshSnapshot();
     }
 
     private void MergePeerFromSignal(PeerControlMessage message)
@@ -998,6 +1005,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             _peers[peer.ClientId] = peer;
         }
+        PublishPeerMeshSnapshot();
     }
 
     private void MergeSession(PeerControlMessage message)
@@ -1051,6 +1059,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             session.AesKey = DeriveSessionKey(peerPublicKey, session.Id, session.Token, runtime.PeerMesh.ClientId, peerId);
             _sessions[peerId] = session;
         }
+        PublishPeerMeshSnapshot();
     }
 
     private byte[] DeriveSessionKey(string? peerPublicKey, long sessionId, string token, long localClientId, long peerId)
@@ -2099,6 +2108,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 _sessions.Remove(key);
             }
         }
+        PublishPeerMeshSnapshot();
     }
 
     private string LocalEndpoint()
@@ -2287,11 +2297,64 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             await _portMappingService.ReleaseMappingAsync(portMapping, CancellationToken.None).ConfigureAwait(false);
         }
+        _observer?.OnPeerMeshChanged(TunnelPeerMeshSnapshot.Disabled(_config.PeerMeshDevice, _config.PeerMeshTunName));
     }
 
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
+    }
+
+    private void PublishPeerMeshSnapshot()
+    {
+        var observer = _observer;
+        if (observer is null)
+        {
+            return;
+        }
+
+        TunnelPeerMeshSnapshot snapshot;
+        lock (_sync)
+        {
+            var runtime = _runtime;
+            snapshot = new TunnelPeerMeshSnapshot
+            {
+                Enabled = runtime?.PeerMesh.Enabled == true,
+                VirtualIp = runtime?.PeerMesh.VirtualIp,
+                Cidr = runtime?.PeerMesh.Cidr,
+                DeviceMode = _config.PeerMeshDevice,
+                DeviceName = _config.PeerMeshTunName,
+                DeviceStatus = _device?.Status
+                    ?? (string.Equals(_config.PeerMeshDevice, "noop", StringComparison.OrdinalIgnoreCase) ? "NOOP" : "UDP_READY"),
+                Peers = _peers.Values
+                    .OrderBy(item => item.ClientName, StringComparer.OrdinalIgnoreCase)
+                    .Select(item => new PeerRouteSnapshot
+                    {
+                        ClientId = item.ClientId,
+                        ClientName = item.ClientName,
+                        VirtualIp = item.VirtualIp,
+                        Online = item.Online,
+                        CandidateCount = item.Candidates.Count,
+                    })
+                    .ToList(),
+                Sessions = _sessions.Values
+                    .OrderBy(item => item.PeerName, StringComparer.OrdinalIgnoreCase)
+                    .Select(item => new PeerSessionSnapshot
+                    {
+                        SessionId = item.Id,
+                        PeerId = item.PeerId,
+                        PeerName = item.PeerName,
+                        PeerVirtualIp = item.PeerVirtualIp,
+                        PathType = item.PathType,
+                        RemoteEndpoint = FirstNonEmpty(item.LastPathRemoteText, item.RemoteEndpoint?.ToString(), item.RelayTargetAllocationId),
+                        RttMillis = item.LastRttMillis,
+                        ExpiresAt = item.ExpiresAt,
+                    })
+                    .ToList(),
+                UpdatedAt = DateTimeOffset.Now,
+            };
+        }
+        observer.OnPeerMeshChanged(snapshot);
     }
 
     private static bool InCidr(IPAddress address, string? cidr)
@@ -2347,6 +2410,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public DateTimeOffset LastPathLog { get; set; }
         public DateTimeOffset LastPathReport { get; set; }
         public string LastPathRemoteText { get; set; } = "";
+        public long? LastRttMillis { get; set; }
         public byte[] AesKey { get; set; } = [];
         public PeerReplayWindow Replay { get; } = new();
         public long Sequence { get; set; }

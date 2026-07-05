@@ -10,6 +10,7 @@ cd implementations/csharp/client
 dotnet build ShuaiTunnel.Client.slnx
 dotnet run --project src/ShuaiTunnel.Client                   # 当前目录读取 tunnelClientConfig.json
 dotnet run --project src/ShuaiTunnel.Client -- --config path  # 显式配置文件
+dotnet run --project src/ShuaiTunnel.Client.Desktop           # Windows 桌面客户端
 ```
 
 发布:
@@ -18,6 +19,18 @@ dotnet run --project src/ShuaiTunnel.Client -- --config path  # 显式配置文�
 dotnet publish src/ShuaiTunnel.Client -c Release -o out
 ./out/shuai-tunnel-client --config /etc/shuai-tunnel/client.json
 ```
+
+桌面版发布:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\publish-desktop-win-x64.ps1
+.\out\desktop-win-x64\shuai-tunnel-desktop.exe
+```
+
+桌面客户端会在界面上填写 `serverBaseUrl/apiKey/secret`，连接后展示当前客户端名、控制端地址、
+Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映射和本机 HTTP route。配置默认保存到
+`%APPDATA%\ShuaiTunnel\desktop-client.json`。如果启用 `windows-wintun` 或 `auto` 创建虚拟网卡，
+仍然需要管理员权限和随包输出的 `native/windows/<arch>/wintun.dll`。
 
 ## 配置 (`tunnelClientConfig.json`)
 

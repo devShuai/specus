@@ -6,6 +6,7 @@ using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.DirectHttp;
 using ShuaiTunnel.Client.Nat;
 using ShuaiTunnel.Client.PeerMesh;
+using ShuaiTunnel.Client.Runtime;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
@@ -35,6 +36,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private readonly PeerMeshClient _peerMesh;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TunnelControlClient> _logger;
+    private readonly ITunnelClientObserver? _observer;
     private int _backoffAttempts;
     private bool _resetBackoffOnNextHttpLogin;
     private CancellationTokenSource? _sessionCts;
@@ -44,12 +46,14 @@ public sealed class TunnelControlClient : IAsyncDisposable
         TunnelClientConfig config,
         ClientAuthService auth,
         DirectHttpForwarder httpForwarder,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        ITunnelClientObserver? observer = null)
     {
         _config = config;
         _auth = auth;
         _httpForwarder = httpForwarder;
-        _peerMesh = new PeerMeshClient(config, loggerFactory.CreateLogger<PeerMeshClient>());
+        _observer = observer;
+        _peerMesh = new PeerMeshClient(config, loggerFactory.CreateLogger<PeerMeshClient>(), observer);
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<TunnelControlClient>();
     }
@@ -57,6 +61,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
     /// <summary>Runs the reconnect loop until cancellation; never returns success.</summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        PublishStatus("STARTING", "客户端启动中", running: true, controlConnected: false, loggedIn: false);
         while (!cancellationToken.IsCancellationRequested)
         {
             var reconnectImmediately = false;
@@ -78,15 +83,18 @@ public sealed class TunnelControlClient : IAsyncDisposable
             catch (ControlLoginRejectedException ex) when (ex.Action == ControlLoginFailureAction.Stop)
             {
                 _logger.LogWarning("control login rejected: {reason}; stopping reconnect", ex.ReasonOrDefault);
+                PublishStatus("STOPPED", ex.ReasonOrDefault, running: false, controlConnected: false, loggedIn: false);
                 return;
             }
             catch (ControlLoginRejectedException ex)
             {
                 _logger.LogWarning("control login failed: {reason}; reconnecting with backoff", ex.ReasonOrDefault);
+                PublishStatus("RECONNECTING", ex.ReasonOrDefault, running: true, controlConnected: false, loggedIn: false);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "control channel session ended");
+                PublishStatus("RECONNECTING", ex.Message, running: true, controlConnected: false, loggedIn: false);
             }
 
             if (cancellationToken.IsCancellationRequested)
@@ -99,6 +107,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
             }
             var delay = NextBackoff();
             _logger.LogInformation("reconnect attempt #{attempt} in {delay}s", _backoffAttempts, delay);
+            PublishStatus("RECONNECTING", $"控制连接断开，{delay}s 后重连", running: true, controlConnected: false, loggedIn: false);
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(delay), cancellationToken).ConfigureAwait(false);
@@ -120,6 +129,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
 
     private async Task RunOnceAsync(CancellationToken cancellationToken)
     {
+        PublishStatus("HTTP_LOGIN", "正在通过 HTTP 登录服务端", running: true, controlConnected: false, loggedIn: false);
         var runtime = await _auth.LoginAsync(cancellationToken).ConfigureAwait(false);
         if (_resetBackoffOnNextHttpLogin)
         {
@@ -132,6 +142,8 @@ public sealed class TunnelControlClient : IAsyncDisposable
             _backoffAttempts = 0;
         }
         _runtime = runtime;
+        PublishStatus("HTTP_LOGIN_OK", "HTTP 登录成功，准备建立控制连接", running: true, controlConnected: false, loggedIn: false);
+        PublishRoutes(runtime.TunnelConfigList, runtime.HttpTunnelConfigList);
 
         using var tcp = new TcpClient { NoDelay = true };
         tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
@@ -148,6 +160,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
                 $"connect to {runtime.NettyHost}:{runtime.NettyPort} timed out after {ConnectTimeoutMs} ms");
         }
         _logger.LogInformation("connected to {addr}:{port}", runtime.NettyHost, runtime.NettyPort);
+        PublishStatus("CONTROL_CONNECTED", $"已连接控制端 {runtime.NettyHost}:{runtime.NettyPort}", running: true, controlConnected: true, loggedIn: false);
 
         await using var stream = tcp.GetStream();
         await using var writer = new FrameWriter(stream);
@@ -202,6 +215,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
             await reader.CompleteAsync().ConfigureAwait(false);
             await nat.DisposeAsync().ConfigureAwait(false);
             await _peerMesh.DisposeAsync().ConfigureAwait(false);
+            PublishStatus("SESSION_CLOSED", "控制会话已关闭", running: true, controlConnected: false, loggedIn: false);
             sessionCts.Dispose();
             _sessionCts = null;
         }
@@ -275,6 +289,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
             _runtime = refreshed;
             await nat.ApplyConfigAsync(refreshed.TunnelConfigList).ConfigureAwait(false);
             directHttp.ApplyRoutes(refreshed.HttpTunnelConfigList);
+            PublishRoutes(refreshed.TunnelConfigList, refreshed.HttpTunnelConfigList);
             await nat.ReportHttpRoutesAsync(force: true).ConfigureAwait(false);
             await _peerMesh.StartAsync(refreshed, writer, cancellationToken).ConfigureAwait(false);
             _logger.LogInformation("客户端访问令牌刷新成功: client={client}, session={session}",
@@ -320,6 +335,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
                 {
                     _logger.LogInformation("[{client}] 登录成功", response.ClientName);
                     _backoffAttempts = 0;
+                    PublishStatus("RUNNING", $"控制通道登录成功：{response.ClientName}", running: true, controlConnected: true, loggedIn: true);
                     await nat.RegisterAllAsync().ConfigureAwait(false);
                     await nat.ReportHttpRoutesAsync().ConfigureAwait(false);
                     await _peerMesh.StartAsync(_runtime ?? throw new InvalidOperationException("runtime missing"), writer, cancellationToken)
@@ -398,6 +414,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
         }
         await nat.ApplyConfigAsync(snapshot.TunnelConfigList).ConfigureAwait(false);
         directHttp.ApplyRoutes(snapshot.HttpTunnelConfigList);
+        PublishRoutes(snapshot.TunnelConfigList, snapshot.HttpTunnelConfigList);
     }
 
     public ValueTask DisposeAsync()
@@ -405,6 +422,24 @@ public sealed class TunnelControlClient : IAsyncDisposable
         _sessionCts?.Cancel();
         _sessionCts?.Dispose();
         return _peerMesh.DisposeAsync();
+    }
+
+    private void PublishStatus(
+        string phase,
+        string detail,
+        bool running,
+        bool controlConnected,
+        bool loggedIn)
+    {
+        _observer?.OnStatusChanged(TunnelClientStatusSnapshot.FromRuntime(
+            _runtime, phase, detail, running, controlConnected, loggedIn));
+    }
+
+    private void PublishRoutes(
+        IEnumerable<TunnelConfigEntry>? tcpRoutes,
+        IEnumerable<HttpTunnelConfigEntry>? httpRoutes)
+    {
+        _observer?.OnRoutesChanged(TunnelClientRoutesSnapshot.FromRoutes(tcpRoutes, httpRoutes));
     }
 
     internal static ControlLoginFailureAction ClassifyControlLoginFailure(string? reason)

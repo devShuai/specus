@@ -5,6 +5,7 @@
   </Folder>
   <Folder Name="/client/">
     <Project Path="client/src/ShuaiTunnel.Client/ShuaiTunnel.Client.csproj" />
+    <Project Path="client/src/ShuaiTunnel.Client.Desktop/ShuaiTunnel.Client.Desktop.csproj" />
     <Project Path="client/tests/ShuaiTunnel.Client.Tests/ShuaiTunnel.Client.Tests.csproj" />
   </Folder>
   <Folder Name="/server/">
