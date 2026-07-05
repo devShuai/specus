@@ -47,7 +47,7 @@ public class PeerMeshClient implements AutoCloseable {
     private final Map<String, Long> packetTraceLogMillis = new ConcurrentHashMap<>();
     private final Map<Long, List<PendingVirtualPacket>> pendingVirtualPackets = new ConcurrentHashMap<>();
     private final Map<Long, Long> pathPrepareMillis = new ConcurrentHashMap<>();
-    private final Map<String, String> pendingStunBindings = new ConcurrentHashMap<>();
+    private final Map<String, PendingStunBinding> pendingStunBindings = new ConcurrentHashMap<>();
     private final Map<String, Long> turnPermissions = new ConcurrentHashMap<>();
     private final Map<String, SrflxObservation> srflxObservations = new ConcurrentHashMap<>();
     private final AtomicBoolean directSuppressedLogged = new AtomicBoolean(false);
@@ -219,6 +219,10 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private void updateRoster(JsonNode peerNodes) {
+        // roster 只带身份与在线状态，不带 candidates。保留旧 entry 已学到的候选，
+        // 否则每次 roster 推送（任意客户端上下线都会触发）都会清空全部对端候选，
+        // probeKnownCandidates 失效，必须等下一轮候选交换才能恢复直连探测。
+        Map<Long, PeerInfo> previous = Map.copyOf(peers);
         peers.clear();
         if (peerNodes != null && peerNodes.isArray()) {
             for (JsonNode node : peerNodes) {
@@ -226,13 +230,14 @@ public class PeerMeshClient implements AutoCloseable {
                 if (clientId <= 0) {
                     continue;
                 }
+                PeerInfo existing = previous.get(clientId);
                 peers.put(clientId, new PeerInfo(
                         clientId,
                         node.path("clientName").asText(""),
                         node.path("virtualIp").asText(""),
                         node.path("publicKey").asText(""),
                         node.path("online").asBoolean(false),
-                        List.of()
+                        existing == null ? List.of() : existing.candidates()
                 ));
             }
         }
@@ -321,6 +326,7 @@ public class PeerMeshClient implements AutoCloseable {
         // 比 STUN srflx (800) 高，因为这是路由器**显式承诺**的映射，比通过 STUN 推断的更可靠。
         candidate.setPriority(900);
         candidate.setFoundation("port-map-" + mapping.protocol().name().toLowerCase());
+        PeerCandidate previousPortMap = portMapCandidate;
         portMapCandidate = candidate;
         portMapping = mapping;
         log.info("Peer mesh NAT 端口映射成功: protocol={}, external={}:{}, internal={}, lease={}s",
@@ -329,7 +335,11 @@ public class PeerMeshClient implements AutoCloseable {
                 mapping.externalPort(),
                 mapping.internalPort(),
                 mapping.leaseSeconds());
-        announceCandidatesToOnlinePeers();
+        if (previousPortMap == null
+                || !Objects.equals(previousPortMap.getAddress(), candidate.getAddress())
+                || !Objects.equals(previousPortMap.getPort(), candidate.getPort())) {
+            announceCandidatesToOnlinePeers();
+        }
     }
 
     private void renewPortMappingIfNeeded() {
@@ -460,6 +470,8 @@ public class PeerMeshClient implements AutoCloseable {
             next.remoteEndpoint = previous.remoteEndpoint;
             next.relayTargetAllocationId = previous.relayTargetAllocationId;
             next.directBytesSinceReport.addAndGet(previous.drainDirectBytes());
+            next.endpointSuccessMillis = previous.endpointSuccessMillis;
+            next.endpointRtt = previous.endpointRtt;
             next.lastDirectSuccessMillis = previous.lastDirectSuccessMillis;
             next.lastRelaySuccessMillis = previous.lastRelaySuccessMillis;
             next.lastDirectKeepaliveMillis = previous.lastDirectKeepaliveMillis;
@@ -612,7 +624,8 @@ public class PeerMeshClient implements AutoCloseable {
 
     private void sendStunBinding(InetSocketAddress endpoint, String probeRole) {
         byte[] transactionId = StunMessage.newTransactionId();
-        pendingStunBindings.put(StunMessage.hex(transactionId), bindingProbeRole(probeRole));
+        pendingStunBindings.put(StunMessage.hex(transactionId),
+                new PendingStunBinding(bindingProbeRole(probeRole), System.currentTimeMillis()));
         sendStunRequest(StunMessage.of(
                 StunMessage.BINDING_REQUEST,
                 transactionId,
@@ -992,8 +1005,12 @@ public class PeerMeshClient implements AutoCloseable {
     /**
      * 给一个 session 的已确认 DIRECT endpoint 发一发轻量 keepalive probe。
      * 和正常 connectivity check 用同一种 PeerUdpProbe.TYPE_CHECK 报文格式，对端透明地回 ACK，
-     * 借此更新本端 lastDirectSuccessMillis 把 path 一直标为「健康」。不做 burst：
-     * 已建路径不再有 NAT race 风险，单包足够。
+     * 借此更新本端 lastDirectSuccessMillis 把 path 一直标为「健康」。
+     *
+     * <p>keepalive 也做 burst（同 nonce 重发）：这里没有 NAT race，但 keepalive 25s 间隔
+     * 与 45s stale 阈值之间只容得下一次机会——单包一丢，路径就会被判 stale 拆掉重打，
+     * 一次普通 UDP 丢包就引发 direct→relay 抖动。收到 ACK 后 pendingProbes 里的 nonce
+     * 被移除，后续 burst 自动跳过，代价可忽略。
      */
     private void sendDirectKeepalive(PeerSession session, InetSocketAddress endpoint) {
         DatagramSocket socket = udpSocket;
@@ -1019,6 +1036,7 @@ public class PeerMeshClient implements AutoCloseable {
                 null));
         try {
             socket.send(new DatagramPacket(bytes, bytes.length, endpoint));
+            scheduleProbeBurst(socket, bytes, endpoint, nonce, session.sessionId());
             log.trace("Peer mesh keepalive sent: session={}, remote={}", session.sessionId(), endpoint);
         } catch (Exception e) {
             pendingProbes.remove(nonce);
@@ -1386,7 +1404,8 @@ public class PeerMeshClient implements AutoCloseable {
         if (mapped == null) {
             return;
         }
-        String role = pendingStunBindings.remove(message.transactionIdHex());
+        PendingStunBinding pendingBinding = pendingStunBindings.remove(message.transactionIdHex());
+        String role = pendingBinding == null ? null : pendingBinding.role();
         if (!StringUtils.hasText(role)) {
             role = PeerRelayMessage.PROBE_PRIMARY;
         }
@@ -1414,13 +1433,19 @@ public class PeerMeshClient implements AutoCloseable {
         candidate.setFoundation(publicStun ? "public-stun" : "standard-stun");
         String candidateKey = candidateEndpointKey(candidate);
         recordSrflxObservation(role, observedRemote, mapped);
+        // key 含 addr:port，put 返回 null ⇔ 观测到新映射。同一映射被周期性 STUN 反复确认
+        // 时不再触发全员广播——配置 N 个公共 STUN 时每轮会到达 N+1 个 binding success，
+        // 逐个广播会让每个在线 peer 连着跑 N+1 轮 connectivity check。
+        boolean candidateChanged;
         if (publicStun) {
-            serverReflexiveCandidates.putIfAbsent(candidateKey, candidate);
+            candidateChanged = serverReflexiveCandidates.putIfAbsent(candidateKey, candidate) == null;
         } else {
-            serverReflexiveCandidates.put(candidateKey, candidate);
+            candidateChanged = serverReflexiveCandidates.put(candidateKey, candidate) == null;
             serverReflexiveCandidate = candidate;
         }
-        announceCandidatesToOnlinePeers();
+        if (candidateChanged) {
+            announceCandidatesToOnlinePeers();
+        }
     }
 
     private void recordSrflxObservation(String role, InetSocketAddress stunServer, InetSocketAddress mapped) {
@@ -1463,8 +1488,15 @@ public class PeerMeshClient implements AutoCloseable {
         candidate.setPriority(100);
         candidate.setFoundation("standard-turn");
         candidate.setRelayId(endpointKey(relayed));
+        PeerCandidate previous = relayCandidate;
         relayCandidate = candidate;
-        announceCandidatesToOnlinePeers();
+        // relay 端点没变（同一 allocation 被重复确认）就不必广播
+        if (previous == null
+                || !Objects.equals(previous.getRelayId(), candidate.getRelayId())
+                || !Objects.equals(previous.getAddress(), candidate.getAddress())
+                || !Objects.equals(previous.getPort(), candidate.getPort())) {
+            announceCandidatesToOnlinePeers();
+        }
     }
 
     private void requestAlternateNatProbe(PeerRelayMessage response, InetSocketAddress observedRemote) {
@@ -1652,8 +1684,20 @@ public class PeerMeshClient implements AutoCloseable {
             logDirectSuppressed("ignore-direct-inbound-check");
             return;
         }
-        session.remoteEndpoint = observedRemote;
-        session.relayTargetAllocationId = null;
+        // S4.2 endpoint 粘滞（入站侧）：现有 direct endpoint 仍健康时不被其他来源地址抢占，
+        // 对称 NAT 对端的多个映射地址才不会来回翻转本端的发送目标。
+        InetSocketAddress currentEndpoint = session.remoteEndpoint;
+        if (observedRemote.equals(currentEndpoint)) {
+            session.endpointSuccessMillis = now;
+        } else if (!("DIRECT".equals(session.currentPathType)
+                && currentEndpoint != null
+                && now - session.endpointSuccessMillis <= DIRECT_STALE_MILLIS)) {
+            session.remoteEndpoint = observedRemote;
+            session.relayTargetAllocationId = null;
+            session.endpointSuccessMillis = now;
+            // RTT 未知：留 MAX 让下一个带 RTT 的探测响应可以接管并校准
+            session.endpointRtt = Long.MAX_VALUE;
+        }
         session.markPath("DIRECT", now);
         flushPendingPackets(session);
     }
@@ -1666,6 +1710,9 @@ public class PeerMeshClient implements AutoCloseable {
     private void cleanupPendingProbes() {
         long now = System.currentTimeMillis();
         pendingProbes.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
+        // STUN binding 响应正常在亚秒级到达；entry 只在成功响应时移除，
+        // STUN 服务器不可达时会以每 60s × N 个 server 的速度永久累积。
+        pendingStunBindings.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
     }
 
     private void probeKnownCandidates() {
@@ -1750,15 +1797,42 @@ public class PeerMeshClient implements AutoCloseable {
             session.markPath("DIRECT", now);
             session.remoteEndpoint = observedRemote;
         }
+        // S4.2 endpoint 粘滞：多个 direct candidate 都能通时，RTT 大的响应最后到达，
+        // 无条件覆盖会让最慢路径胜出，且 30s 周期重探导致 endpoint 反复摆动。
+        // 现有 endpoint 仍健康（keepalive ACK 会持续刷新 endpointSuccessMillis）且新
+        // RTT 没有明显更优时保持不动；endpoint 失效后自然放行下一个响应者接管。
+        boolean adoptEndpoint = true;
+        if (!pending.relay()) {
+            InetSocketAddress currentEndpoint = session.remoteEndpoint;
+            if (observedRemote.equals(currentEndpoint)) {
+                session.endpointSuccessMillis = now;
+                session.endpointRtt = rttMillis;
+            } else if ("DIRECT".equals(session.currentPathType)
+                    && currentEndpoint != null
+                    && now - session.endpointSuccessMillis <= DIRECT_STALE_MILLIS
+                    && rttMillis + RTT_HYSTERESIS_MS >= session.endpointRtt) {
+                adoptEndpoint = false;
+                log.trace("Peer mesh direct endpoint sticky: session={}, keep={}, ignore={} ({}ms)",
+                        session.sessionId(), currentEndpoint, observedRemote, rttMillis);
+            }
+        }
         String remote = pending.relay()
                 ? "relay:" + (StringUtils.hasText(relayFromAllocationId) ? relayFromAllocationId : pending.relayId())
                 : observedRemote.getAddress().getHostAddress() + ":" + observedRemote.getPort();
         String local = localEndpoint();
         String previousPath = session.currentPathType;
         String previousRemote = session.lastPathRemoteText;
-        session.remoteEndpoint = pending.relay() ? relayEndpoint() : observedRemote;
-        session.relayTargetAllocationId = pending.relay() ? pending.relayId() : null;
         String pathType = pending.relay() ? "RELAY" : "DIRECT";
+        if (adoptEndpoint) {
+            session.remoteEndpoint = pending.relay() ? relayEndpoint() : observedRemote;
+            session.relayTargetAllocationId = pending.relay() ? pending.relayId() : null;
+            if (!pending.relay()) {
+                session.endpointSuccessMillis = now;
+                session.endpointRtt = rttMillis;
+            }
+        } else {
+            remote = previousRemote;
+        }
         session.markPath(pathType, now);
         boolean changed = !pathType.equals(previousPath) || !remote.equals(previousRemote);
         session.lastPathRemoteText = remote;
@@ -2402,6 +2476,9 @@ public class PeerMeshClient implements AutoCloseable {
         /** S4.1 RTT 追踪：用于 direct/relay 择优切换 */
         private volatile long bestDirectRtt = Long.MAX_VALUE;
         private volatile long bestRelayRtt = Long.MAX_VALUE;
+        /** S4.2 endpoint 粘滞：当前 direct endpoint 最近一次响应时间与 RTT，用于抑制慢响应者抢占 */
+        private volatile long endpointSuccessMillis;
+        private volatile long endpointRtt = Long.MAX_VALUE;
         private volatile InetSocketAddress remoteEndpoint;
         private volatile String relayTargetAllocationId;
 
@@ -2425,6 +2502,8 @@ public class PeerMeshClient implements AutoCloseable {
             next.remoteEndpoint = remoteEndpoint;
             next.inboundReplayWindow = inboundReplayWindow.copy();
             next.relayTargetAllocationId = relayTargetAllocationId;
+            next.endpointSuccessMillis = endpointSuccessMillis;
+            next.endpointRtt = endpointRtt;
             next.lastDirectSuccessMillis = lastDirectSuccessMillis;
             next.lastRelaySuccessMillis = lastRelaySuccessMillis;
             next.lastDirectKeepaliveMillis = lastDirectKeepaliveMillis;
@@ -2547,6 +2626,10 @@ public class PeerMeshClient implements AutoCloseable {
 
     private record PendingVirtualPacket(byte[] packet,
                                         long createdAtMillis) {
+    }
+
+    private record PendingStunBinding(String role,
+                                      long sentAtMillis) {
     }
 
     private record NatProbeObservation(String role,
