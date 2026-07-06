@@ -69,7 +69,7 @@ STUN binding 事务 entry 只在收到 success 响应时移除;STUN 服务器不
 
 涉及文件:`PeerMeshSessionRepository`(聚合投影)、`PeerMeshDeviceRepository`(NAT 分布)、`PeerMeshPathStatsView`(新)、`PeerMeshService.pathStats`、`PeerMeshResource`。
 
-管理台已配套展示(`apps/admin-web`,私有组网面板):顶部指标卡新增「直连占比」;「活跃会话」页顶部新增「打洞 / 路径统计」卡片,含直连占比进度条、`pathType × status` 明细表与设备 NAT 分布。Go / C# 服务端尚未实现该端点,前端对 stats 请求做了降级(失败时静默隐藏统计卡片,不影响面板其余部分)。
+管理台已配套展示(`apps/admin-web`,私有组网面板):顶部指标卡新增「直连占比」;「活跃会话」页顶部新增「打洞 / 路径统计」卡片,含直连占比进度条、`pathType × status` 明细表与设备 NAT 分布。Go / C# 服务端已补齐同名 `/api/admin/peer-mesh/stats` 端点,返回结构和 Java `PeerMeshPathStatsView` 保持一致;前端仍保留失败降级逻辑,避免非 Java 历史部署未升级时影响面板其余部分。
 
 ## 使用建议
 
@@ -81,12 +81,29 @@ STUN binding 事务 entry 只在收到 success 响应时移除;STUN 服务器不
 
 ## 已知未修复事项
 
-审计中发现但本次未处理,按建议优先级排列:
+审计中发现但本次未处理,按建议优先级排列。2026-07-05 已继续补齐 Java 端低风险项:
 
-1. **Go / C# 客户端同源问题**:`peer_mesh.go` 与 `PeerMeshClient.cs` 是同一套协议逻辑,大概率存在问题 1~5 的对应缺陷,需对齐修复(已建后台任务)。
-2. **RTT 永不老化**:`bestDirectRtt` / `bestRelayRtt` 是历史最小值,网络变化后选路依据失真;建议改 EWMA 或定期衰减。
-3. **数据面性能**(影响吞吐,不影响打洞):单线程阻塞式 `DatagramSocket` 收包,解析/AES-GCM 解密/TUN 写入同线程;每包 `Cipher.getInstance` 与多次数组拷贝;`handleDataFrame` 线性遍历 session 试解码(帧头含 sessionId,可建索引直查)。等 peer 流量规模上来再做。
-4. **探测无 pacing**:所有候选的 check + burst 同时打出,极端情况下可能触发个别 NAT 的限速;ICE 惯例 20ms pacing,低优先级。
+* RTT 选路由历史最小值改为 EWMA,避免网络变化后长期使用过时的最优 RTT。
+* 数据面先读取加密 frame AAD 中的 sessionId,通过 `sessionsById` 直接定位会话,不再线性遍历全部 session 逐个试解密。
+* connectivity check 增加 20ms 候选级 pacing,避免所有候选和端口预测 burst 在同一瞬间打出。
+* `PeerMeshServiceTests` 增加 `pathStatsAggregatesDirectRatioAndNatTypes`,覆盖 `activeDirectRatio`、`reportedSessions` 和 NAT 类型归并。
+
+本次补齐项已通过 Java client/server 主代码编译:`mvn -f implementations\java\client\pom.xml -DskipTests compile`、`mvn -f implementations\java\server\pom.xml "-Dtunnel.server.web.skip=true" -DskipTests compile`。定向测试当前被既有 testCompile 问题拦截:client 旧 handler 测试仍引用已移除的 `bean/client` 包,server 多个测试仍引用重组前的 `management` / `server` 包路径,需后续单独修复测试目录。
+
+2026-07-06 已继续对齐 Go / C# 客户端同源实现:
+
+* Go / C# frame codec 均可从 AAD 读取 `sessionId`,客户端维护 `sessionsById` / `_sessionsById`,数据面不再遍历所有 session 逐个试解密。
+* Go / C# connectivity check 增加 20ms 候选级 pacing;direct keepalive 复用 3 发 burst。
+* Go / C# STUN pending binding 增加 30s TTL 清理;srflx / relay / port-map 候选只有端点实际变化时才广播。
+* Go / C# direct endpoint 增加健康窗口粘滞与 RTT EWMA 字段;C# session grant 刷新同步保留 nominated path 状态。
+* Go client public STUN candidate 生命周期对齐 Java:每轮公网 STUN 探测前清理 `foundation=public-stun` 的旧 candidate,避免三端候选集合语义漂移。
+* Go / C# server 均已补齐 `/api/admin/peer-mesh/stats`,并按 Java 规则统计 `reportedSessions=count(rttMillis)`、`activeDirectRatio`、`pathType × status` 明细和 NAT 类型分布。
+* C# client tests 通过: `dotnet test implementations\csharp\client\tests\ShuaiTunnel.Client.Tests\ShuaiTunnel.Client.Tests.csproj --no-restore` 69/69。
+* C# server 后端编译通过: `dotnet build implementations\csharp\server\src\ShuaiTunnel.Server\ShuaiTunnel.Server.csproj --no-restore -p:TunnelServerWebSkip=true -v minimal`。未加 `TunnelServerWebSkip=true` 时会触发前端 `npm run deploy:csharp`,当前沙箱因 esbuild 读取外层目录权限失败而中断,不作为后端代码结论。
+* C# server PeerMeshService 定向测试通过: `dotnet test implementations\csharp\server\tests\ShuaiTunnel.IntegrationTests\ShuaiTunnel.IntegrationTests.csproj --no-restore -p:TunnelServerWebSkip=true -v minimal --filter "FullyQualifiedName~PeerMeshServiceTests"` 7/7,覆盖 session grant、关闭通知、relay 授权和路径统计聚合。
+* Go 测试通过:设置 `GOCACHE=.gocache` 后,`go test ./internal/client`、`go test ./internal/peermesh ./internal/store ./internal/management` 均通过。
+
+1. **数据面进一步性能优化**(影响吞吐,不影响打洞):Java 仍是单线程阻塞式 `DatagramSocket` 收包,解析/AES-GCM 解密/TUN 写入同线程;每包仍 `Cipher.getInstance`,还有多次数组拷贝。三端 sessionId 索引已消除线性试解码,后续可继续拆 UDP worker / TUN writer 与 Cipher 复用。
 
 ## 相关文档
 

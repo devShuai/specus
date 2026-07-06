@@ -456,6 +456,12 @@ public static class AdminApiEndpoints
                 return Results.NoContent();
             });
 
+        app.MapGet("/api/admin/peer-mesh/stats",
+            (HttpContext context, IOptions<AuthOptions> authOptions,
+                PeerMeshService service, CancellationToken cancellationToken) =>
+                service.PathStatsAsync(ManagementContext.From(context, authOptions.Value),
+                    cancellationToken));
+
         app.MapGet("/api/admin/peer-mesh/sessions",
             async (int? limit, int? page, int? size, bool? openOnly, HttpContext context,
                 IOptions<AuthOptions> authOptions, PeerMeshService service, CancellationToken cancellationToken) =>

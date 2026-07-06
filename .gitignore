@@ -81,3 +81,4 @@ node_modules/
 /implementations/csharp/server/src/ShuaiTunnel.Server/wwwroot/
 
 .reorg-backup/
+/.codex/skills/anthropic-skills/

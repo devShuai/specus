@@ -128,6 +128,92 @@ public sealed class PeerMeshServiceTests
     }
 
     [Fact]
+    public async Task PathStatsAggregatesDirectRatioReportedSessionsAndNatTypes()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(2501, "tenant-a", "alice", "alice-laptop");
+        var target = fixture.AddClient(2502, "tenant-a", "alice", "alice-nas");
+        fixture.AddDevice(source, "100.96.0.30", "source-key");
+        fixture.AddDevice(target, "100.96.0.31", "target-key");
+        fixture.Db.PeerMeshDevices.Local.Single(d => d.ClientId == source.Id).NatType = "PORT_RESTRICTED_NAT";
+        var now = DateTimeOffset.UtcNow;
+        fixture.Db.PeerMeshSessions.AddRange(
+            new PeerMeshSession
+            {
+                Id = 9201,
+                TenantId = "tenant-a",
+                SourceClientId = source.Id,
+                SourceClientName = source.ClientName,
+                TargetClientId = target.Id,
+                TargetClientName = target.ClientName,
+                PathType = PeerMeshService.PathDirect,
+                Status = PeerMeshService.StatusActive,
+                RttMillis = 10,
+                DirectBytes = 100,
+                RelayBytes = 5,
+                StartedAt = now.AddMinutes(-2),
+                UpdatedAt = now.AddMinutes(-2),
+                ExpiresAt = now.AddHours(1),
+            },
+            new PeerMeshSession
+            {
+                Id = 9202,
+                TenantId = "tenant-a",
+                SourceClientId = target.Id,
+                SourceClientName = target.ClientName,
+                TargetClientId = source.Id,
+                TargetClientName = source.ClientName,
+                PathType = PeerMeshService.PathRelay,
+                Status = PeerMeshService.StatusActive,
+                RttMillis = 30,
+                DirectBytes = 0,
+                RelayBytes = 200,
+                StartedAt = now.AddMinutes(-2),
+                UpdatedAt = now.AddMinutes(-2),
+                ExpiresAt = now.AddHours(1),
+            },
+            new PeerMeshSession
+            {
+                Id = 9203,
+                TenantId = "tenant-a",
+                SourceClientId = source.Id,
+                SourceClientName = source.ClientName,
+                TargetClientId = target.Id,
+                TargetClientName = target.ClientName,
+                PathType = PeerMeshService.PathDirect,
+                Status = PeerMeshService.StatusNegotiating,
+                StartedAt = now.AddMinutes(-2),
+                UpdatedAt = now.AddMinutes(-2),
+                ExpiresAt = now.AddHours(1),
+            });
+        await fixture.SaveChangesAsync();
+
+        var stats = await fixture.Service.PathStatsAsync(
+            new ManagementContext("tenant-a", "alice", ManagementRole.Admin, true),
+            CancellationToken.None);
+
+        Assert.Equal(3, stats.TotalSessions);
+        Assert.Equal(2, stats.ReportedSessions);
+        Assert.Equal(2, stats.ActiveSessions);
+        Assert.Equal(1, stats.ActiveDirectSessions);
+        Assert.Equal(1, stats.ActiveRelaySessions);
+        Assert.Equal(0.5, stats.ActiveDirectRatio);
+        var directActive = Assert.Single(stats.PathTypes,
+            item => item.PathType == PeerMeshService.PathDirect && item.Status == PeerMeshService.StatusActive);
+        Assert.Equal(1, directActive.Sessions);
+        Assert.Equal(1, directActive.ReportedSessions);
+        Assert.Equal(10d, directActive.AvgRttMillis);
+        Assert.Equal(100, directActive.DirectBytes);
+        Assert.Equal(5, directActive.RelayBytes);
+        var directNegotiating = Assert.Single(stats.PathTypes,
+            item => item.PathType == PeerMeshService.PathDirect
+                && item.Status == PeerMeshService.StatusNegotiating);
+        Assert.Equal(0, directNegotiating.ReportedSessions);
+        Assert.Contains(stats.NatTypes, item => item.NatType == "PORT_RESTRICTED_NAT" && item.Devices == 1);
+        Assert.Contains(stats.NatTypes, item => item.NatType == "UNKNOWN" && item.Devices == 1);
+    }
+
+    [Fact]
     public async Task RelayFrameRequiresActiveMatchingSessionAndAccountsBytes()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();

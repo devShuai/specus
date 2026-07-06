@@ -55,6 +55,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan KeepaliveTickInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DirectKeepaliveInterval = TimeSpan.FromSeconds(25);
+    private static readonly TimeSpan DirectStaleInterval = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan ConnectivityCheckPacing = TimeSpan.FromMilliseconds(20);
+    private const long RttHysteresisMillis = 100;
+    private const long RttEwmaOldWeight = 7;
+    private const long RttEwmaNewWeight = 1;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -67,11 +72,12 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly object _sync = new();
     private readonly Dictionary<long, PeerMeshPeer> _peers = new();
     private readonly Dictionary<long, PeerMeshSession> _sessions = new();
+    private readonly Dictionary<long, PeerMeshSession> _sessionsById = new();
     private readonly Dictionary<string, PendingProbe> _pending = new(StringComparer.Ordinal);
     private readonly Dictionary<long, List<PendingVirtualPacket>> _pendingPackets = new();
     private readonly Dictionary<long, DateTimeOffset> _pathPreparedAt = new();
     private readonly Dictionary<string, string> _natByRole = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingStunBinding> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PeerCandidate> _srflxCandidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _turnPermissions = new(StringComparer.OrdinalIgnoreCase);
     private readonly NatPortMappingService _portMappingService;
@@ -143,6 +149,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _keyMaterial = keyMaterial;
             _peers.Clear();
             _sessions.Clear();
+            _sessionsById.Clear();
             _pending.Clear();
             _pendingPackets.Clear();
             _pathPreparedAt.Clear();
@@ -384,7 +391,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         lock (_sync)
         {
             role = _pendingStun.Remove(message.TransactionIdHex, out var pendingRole)
-                ? pendingRole
+                ? pendingRole.Role
                 : RelayProbePrimary;
         }
         var publicStun = IsPublicStunRole(role);
@@ -407,15 +414,22 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             800,
             publicStun ? "public-stun" : "standard-stun",
             "");
+        bool announce;
         lock (_sync)
         {
-            _srflxCandidates[CandidateEndpointKey(candidate)] = candidate;
+            var key = CandidateEndpointKey(candidate);
+            announce = !_srflxCandidates.ContainsKey(key)
+                || (!publicStun && (_srflx is null || CandidateEndpointKey(_srflx) != key));
+            _srflxCandidates[key] = candidate;
             if (!publicStun)
             {
                 _srflx = candidate;
             }
         }
-        await AnnounceCandidatesAsync().ConfigureAwait(false);
+        if (announce)
+        {
+            await AnnounceCandidatesAsync().ConfigureAwait(false);
+        }
     }
 
     private async Task HandleTurnAllocatedAsync(StunMessage message)
@@ -428,8 +442,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         var relayId = EndpointKey(relayed);
         var relayHost = RelayHost();
+        bool announce;
         lock (_sync)
         {
+            announce = _relayId != relayId
+                || _relay is null
+                || !string.Equals(_relay.Address, relayHost, StringComparison.OrdinalIgnoreCase)
+                || _relay.Port != turnServer.Port;
             _relayId = relayId;
             _relayTtl = DateTimeOffset.UtcNow.AddSeconds(Math.Max(30, message.LifetimeSeconds(300)));
             _relay = new PeerCandidate(
@@ -441,7 +460,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 "standard-turn",
                 relayId);
         }
-        await AnnounceCandidatesAsync().ConfigureAwait(false);
+        if (announce)
+        {
+            await AnnounceCandidatesAsync().ConfigureAwait(false);
+        }
     }
 
     private async Task HandleUdpPayloadAsync(byte[] payload, IPEndPoint remote, string relayFrom)
@@ -532,10 +554,24 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             else
             {
+                var now = DateTimeOffset.UtcNow;
+                var currentEndpoint = current.RemoteEndpoint;
+                if (Equals(currentEndpoint, remote))
+                {
+                    current.EndpointSuccess = now;
+                }
+                else if (!(string.Equals(current.PathType, "DIRECT", StringComparison.OrdinalIgnoreCase)
+                    && currentEndpoint is not null
+                    && current.EndpointSuccess != default
+                    && now - current.EndpointSuccess <= DirectStaleInterval))
+                {
+                    current.RemoteEndpoint = remote;
+                    current.RelayTargetAllocationId = "";
+                    current.EndpointSuccess = now;
+                    current.EndpointRttMillis = long.MaxValue;
+                }
                 current.PathType = "DIRECT";
-                current.RemoteEndpoint = remote;
-                current.RelayTargetAllocationId = "";
-                current.LastDirectSuccess = DateTimeOffset.UtcNow;
+                current.LastDirectSuccess = now;
                 ready = current;
             }
         }
@@ -588,15 +624,43 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     {
                         return;
                     }
+                    current.BestRelayRttMillis = SmoothRtt(current.BestRelayRttMillis, rtt);
                     current.PathType = path;
                     current.RelayTargetAllocationId = pending.RelayId;
                     current.LastRelaySuccess = now;
                 }
                 else
                 {
+                    current.BestDirectRttMillis = SmoothRtt(current.BestDirectRttMillis, rtt);
+                    var adoptEndpoint = true;
+                    var currentEndpoint = current.RemoteEndpoint;
+                    if (Equals(currentEndpoint, remote))
+                    {
+                        current.EndpointSuccess = now;
+                        current.EndpointRttMillis = rtt;
+                    }
+                    else if (string.Equals(current.PathType, "DIRECT", StringComparison.OrdinalIgnoreCase)
+                        && currentEndpoint is not null
+                        && current.EndpointSuccess != default
+                        && now - current.EndpointSuccess <= DirectStaleInterval
+                        && current.EndpointRttMillis > 0
+                        && current.EndpointRttMillis != long.MaxValue
+                        && rtt + RttHysteresisMillis >= current.EndpointRttMillis)
+                    {
+                        adoptEndpoint = false;
+                    }
                     current.PathType = path;
-                    current.RemoteEndpoint = remote;
-                    current.RelayTargetAllocationId = "";
+                    if (adoptEndpoint)
+                    {
+                        current.RemoteEndpoint = remote;
+                        current.RelayTargetAllocationId = "";
+                        current.EndpointSuccess = now;
+                        current.EndpointRttMillis = rtt;
+                    }
+                    else
+                    {
+                        remoteText = previousRemote;
+                    }
                     current.LastDirectSuccess = now;
                 }
                 var pathChanged = !string.Equals(previousPath, path, StringComparison.OrdinalIgnoreCase)
@@ -855,88 +919,83 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        List<PeerMeshSession> sessions;
+        var frameSessionId = PeerDataFrameCodec.SessionId(payload);
+        if (frameSessionId is null)
+        {
+            return;
+        }
+        PeerMeshSession? session;
         IPeerVirtualDevice? device;
         TunnelRuntimeState? runtime;
         lock (_sync)
         {
-            sessions = _sessions.Values.Where(item => item.AesKey.Length == 32).ToList();
+            _sessionsById.TryGetValue(frameSessionId.Value, out session);
             device = _device;
             runtime = _runtime;
         }
-        if (device is null || runtime is null || sessions.Count == 0)
+        if (device is null || runtime is null || session is null || session.AesKey.Length != 32)
         {
             return;
         }
-        foreach (var session in sessions)
+        PeerDataFrame frame;
+        try
         {
-            PeerDataFrame frame;
-            try
+            frame = PeerDataFrameCodec.Decode(session.AesKey, payload);
+        }
+        catch (CryptographicException)
+        {
+            return;
+        }
+        if (frame.SessionId != session.Id
+            || frame.FromClientId != session.PeerId
+            || frame.ToClientId != runtime.PeerMesh.ClientId)
+        {
+            return;
+        }
+        PeerMeshSession? ready = null;
+        lock (_sync)
+        {
+            if (!_sessionsById.TryGetValue(frame.SessionId, out var current)
+                || current.PeerId != session.PeerId
+                || DateTimeOffset.UtcNow > current.ExpiresAt
+                || !current.Replay.Accept(frame.Sequence))
             {
-                frame = PeerDataFrameCodec.Decode(session.AesKey, payload);
+                return;
             }
-            catch (CryptographicException)
+            var frameBytes = payload.LongLength;
+            if (!string.IsNullOrWhiteSpace(relayFrom))
             {
-                continue;
-            }
-            if (frame.SessionId != session.Id
-                || frame.FromClientId != session.PeerId
-                || frame.ToClientId != runtime.PeerMesh.ClientId)
-            {
-                continue;
-            }
-            PeerMeshSession? ready = null;
-            lock (_sync)
-            {
-                if (!_sessions.TryGetValue(session.PeerId, out var current)
-                    || DateTimeOffset.UtcNow > current.ExpiresAt
-                    || !current.Replay.Accept(frame.Sequence))
-                {
-                    return;
-                }
-                var frameBytes = payload.LongLength;
-                if (!string.IsNullOrWhiteSpace(relayFrom))
-                {
-                    current.PathType = "RELAY";
-                    current.RelayTargetAllocationId = relayFrom;
-                    current.RemoteEndpoint = null;
-                    current.LastRelaySuccess = DateTimeOffset.UtcNow;
-                }
-                else
-                {
-                    current.PathType = "DIRECT";
-                    current.RemoteEndpoint = remote;
-                    current.RelayTargetAllocationId = "";
-                    current.LastDirectSuccess = DateTimeOffset.UtcNow;
-                    current.DirectBytesPending += frameBytes;
-                }
-                ready = current;
-            }
-            if (ready is not null)
-            {
-                await FlushPendingPacketsAsync(ready).ConfigureAwait(false);
-            }
-            if (device is NoopPeerVirtualDevice)
-            {
-                var reply = PeerIpPacket.IcmpEchoReplyFor(frame.Payload, runtime.PeerMesh.VirtualIp);
-                if (reply is not null && ready is not null
-                    && await SendEncryptedPayloadAsync(ready.PeerId, reply).ConfigureAwait(false))
-                {
-                    return;
-                }
+                current.PathType = "RELAY";
+                current.RelayTargetAllocationId = relayFrom;
+                current.RemoteEndpoint = null;
+                current.LastRelaySuccess = DateTimeOffset.UtcNow;
             }
             else
             {
-                try
-                {
-                    await device.WritePacketAsync(frame.Payload, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
-                {
-                    _logger.LogWarning(ex, "Peer Mesh virtual packet write failed: session={Session} peer={Peer}", session.Id, session.PeerId);
-                }
+                current.PathType = "DIRECT";
+                current.RemoteEndpoint = remote;
+                current.RelayTargetAllocationId = "";
+                current.LastDirectSuccess = DateTimeOffset.UtcNow;
+                current.EndpointSuccess = DateTimeOffset.UtcNow;
+                current.DirectBytesPending += frameBytes;
+            }
+            ready = current;
+        }
+        if (ready is not null)
+        {
+            await FlushPendingPacketsAsync(ready).ConfigureAwait(false);
+        }
+        if (device is NoopPeerVirtualDevice)
+        {
+            var reply = PeerIpPacket.IcmpEchoReplyFor(frame.Payload, runtime.PeerMesh.VirtualIp);
+            if (reply is not null && ready is not null
+                && await SendEncryptedPayloadAsync(ready.PeerId, reply).ConfigureAwait(false))
+            {
                 return;
             }
+        }
+        else
+        {
             try
             {
                 await device.WritePacketAsync(frame.Payload, CancellationToken.None).ConfigureAwait(false);
@@ -946,6 +1005,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 _logger.LogWarning(ex, "Peer Mesh virtual packet write failed: session={Session} peer={Peer}", session.Id, session.PeerId);
             }
             return;
+        }
+        try
+        {
+            await device.WritePacketAsync(frame.Payload, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or ObjectDisposedException)
+        {
+            _logger.LogWarning(ex, "Peer Mesh virtual packet write failed: session={Session} peer={Peer}", session.Id, session.PeerId);
         }
     }
 
@@ -1043,10 +1110,30 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             {
                 expiresAt = parsed;
             }
-            _sessions.TryGetValue(peerId, out var session);
-            if (session is null || session.Id != message.SessionId)
+            _sessions.TryGetValue(peerId, out var previous);
+            var sameSession = previous is not null && previous.Id == message.SessionId;
+            var session = sameSession ? previous! : new PeerMeshSession();
+            if (previous is not null)
             {
-                session = new PeerMeshSession();
+                session.RemoteEndpoint = previous.RemoteEndpoint;
+                session.RelayTargetAllocationId = previous.RelayTargetAllocationId;
+                session.PathType = previous.PathType;
+                session.LastDirectSuccess = previous.LastDirectSuccess;
+                session.LastDirectKeepalive = previous.LastDirectKeepalive;
+                session.LastRelaySuccess = previous.LastRelaySuccess;
+                session.LastPathLog = previous.LastPathLog;
+                session.LastPathReport = previous.LastPathReport;
+                session.LastPathRemoteText = previous.LastPathRemoteText;
+                session.LastRttMillis = previous.LastRttMillis;
+                session.EndpointSuccess = previous.EndpointSuccess;
+                session.EndpointRttMillis = previous.EndpointRttMillis;
+                session.BestDirectRttMillis = previous.BestDirectRttMillis;
+                session.BestRelayRttMillis = previous.BestRelayRttMillis;
+                session.DirectBytesPending = previous.DirectBytesPending;
+                if (sameSession)
+                {
+                    session.Sequence = previous.Sequence;
+                }
             }
             session.Id = message.SessionId.Value;
             session.PeerId = peerId;
@@ -1055,9 +1142,17 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             session.PeerPublicKey = peerPublicKey;
             session.Token = message.Token;
             session.ExpiresAt = expiresAt;
-            session.PathType = message.PathType;
+            if (!string.IsNullOrWhiteSpace(message.PathType))
+            {
+                session.PathType = message.PathType;
+            }
             session.AesKey = DeriveSessionKey(peerPublicKey, session.Id, session.Token, runtime.PeerMesh.ClientId, peerId);
+            if (previous is not null)
+            {
+                _sessionsById.Remove(previous.Id);
+            }
             _sessions[peerId] = session;
+            _sessionsById[session.Id] = session;
         }
         PublishPeerMeshSnapshot();
     }
@@ -1090,6 +1185,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             foreach (var peerId in _sessions.Where(item => item.Value.Id == message.SessionId).Select(item => item.Key).ToList())
             {
+                _sessionsById.Remove(_sessions[peerId].Id);
                 _sessions.Remove(peerId);
             }
         }
@@ -1155,6 +1251,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             return;
         }
         var candidates = NormalizeCandidates(message.Candidates);
+        var delay = TimeSpan.Zero;
         foreach (var candidate in candidates.Where(x =>
             string.Equals(x.Transport, "udp", StringComparison.OrdinalIgnoreCase)
             && !string.IsNullOrWhiteSpace(x.Address)
@@ -1164,7 +1261,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             {
                 continue;
             }
-            await SendProbeAsync(session, candidate).ConfigureAwait(false);
+            SendProbePaced(session, candidate, delay);
+            delay += ConnectivityCheckPacing;
             foreach (var predictedPort in AdaptivePredictedPorts(candidate, candidates))
             {
                 var predicted = candidate with
@@ -1172,7 +1270,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     Port = predictedPort,
                     Foundation = "adaptive-port-predict",
                 };
-                await SendProbeAsync(session, predicted).ConfigureAwait(false);
+                SendProbePaced(session, predicted, delay);
+                delay += ConnectivityCheckPacing;
             }
         }
     }
@@ -1227,6 +1326,36 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 }
             }
         }
+    }
+
+    private void SendProbePaced(PeerMeshSession session, PeerCandidate candidate, TimeSpan delay)
+    {
+        var sessionId = session.Id;
+        var peerId = session.PeerId;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                if (delay > TimeSpan.Zero)
+                {
+                    await Task.Delay(delay).ConfigureAwait(false);
+                }
+                PeerMeshSession? current;
+                lock (_sync)
+                {
+                    _sessions.TryGetValue(peerId, out current);
+                    if (_udp is null || current is null || current.Id != sessionId || DateTimeOffset.UtcNow > current.ExpiresAt)
+                    {
+                        return;
+                    }
+                }
+                await SendProbeAsync(current, candidate).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or SocketException or InvalidOperationException)
+            {
+                _logger.LogTrace(ex, "Peer Mesh paced probe send failed");
+            }
+        });
     }
 
     private async Task SendProbeAsync(PeerMeshSession session, PeerCandidate candidate)
@@ -1304,6 +1433,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         try
         {
             await udp.SendAsync(body, remote).ConfigureAwait(false);
+            ScheduleProbeBurst(udp, body, remote, nonce);
         }
         catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
         {
@@ -1569,8 +1699,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                         _ = _portMappingService.ReleaseMappingAsync(mapping, CancellationToken.None);
                         return;
                     }
+                    var changed = _portMap is null || CandidateEndpointKey(_portMap) != CandidateEndpointKey(candidate);
                     _portMapping = mapping;
                     _portMap = candidate;
+                    if (!changed)
+                    {
+                        return;
+                    }
                 }
                 _logger.LogInformation(
                     "Peer Mesh NAT port mapping active: protocol={Protocol}, external={Address}:{Port}, internal={Internal}, lease={Lease}s",
@@ -1672,7 +1807,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         var transactionId = StunMessage.NewTransactionId();
         lock (_sync)
         {
-            _pendingStun[Convert.ToHexString(transactionId).ToLowerInvariant()] = BindingProbeRole(role);
+            _pendingStun[Convert.ToHexString(transactionId).ToLowerInvariant()] =
+                new PendingStunBinding(BindingProbeRole(role), DateTimeOffset.UtcNow);
         }
         await SendStunRequestAsync(StunMessage.Of(
             StunMessage.BindingRequest,
@@ -2103,8 +2239,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             {
                 _pending.Remove(key);
             }
+            foreach (var key in _pendingStun.Where(item => now - item.Value.SentAt > TimeSpan.FromSeconds(30)).Select(item => item.Key).ToList())
+            {
+                _pendingStun.Remove(key);
+            }
             foreach (var key in _sessions.Where(item => now > item.Value.ExpiresAt).Select(item => item.Key).ToList())
             {
+                _sessionsById.Remove(_sessions[key].Id);
                 _sessions.Remove(key);
             }
         }
@@ -2265,6 +2406,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _writer = null;
             _peers.Clear();
             _sessions.Clear();
+            _sessionsById.Clear();
             _pending.Clear();
             _pendingPackets.Clear();
             _pathPreparedAt.Clear();
@@ -2388,7 +2530,23 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? "";
     }
 
+    private static long SmoothRtt(long previous, long sample)
+    {
+        if (sample < 0)
+        {
+            return previous;
+        }
+        if (previous <= 0 || previous == long.MaxValue)
+        {
+            return sample;
+        }
+        return ((previous * RttEwmaOldWeight) + (sample * RttEwmaNewWeight)) /
+            (RttEwmaOldWeight + RttEwmaNewWeight);
+    }
+
     private sealed record PendingProbe(long SessionId, long PeerId, DateTimeOffset SentAt, bool Relay, string? RelayId);
+
+    private sealed record PendingStunBinding(string Role, DateTimeOffset SentAt);
 
     private sealed record PendingVirtualPacket(byte[] Packet, DateTimeOffset CreatedAt);
 
@@ -2411,6 +2569,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public DateTimeOffset LastPathReport { get; set; }
         public string LastPathRemoteText { get; set; } = "";
         public long? LastRttMillis { get; set; }
+        public DateTimeOffset EndpointSuccess { get; set; }
+        public long EndpointRttMillis { get; set; }
+        public long BestDirectRttMillis { get; set; }
+        public long BestRelayRttMillis { get; set; }
         public byte[] AesKey { get; set; } = [];
         public PeerReplayWindow Replay { get; } = new();
         public long Sequence { get; set; }

@@ -45,9 +45,15 @@ const (
 	peerPortMappingLease          = 7200
 	peerProbeBurstCount           = 3
 	peerProbeBurstInterval        = 30 * time.Millisecond
+	peerConnectivityCheckPacing   = 20 * time.Millisecond
 	peerMaxAdaptivePredictedPorts = 16
 	peerMaxAdaptivePortDelta      = 512
 	peerDirectKeepaliveInterval   = 25 * time.Second
+	peerDirectStaleInterval       = 45 * time.Second
+	peerRttHysteresisMillis       = int64(100)
+	peerRttEWMAOldWeight          = int64(7)
+	peerRttEWMANewWeight          = int64(1)
+	peerRttUnsetMillis            = int64(1<<63 - 1)
 )
 
 type peerControlSender func(net.Conn, string, any) error
@@ -64,8 +70,9 @@ type peerMeshClient struct {
 	stopCh               chan struct{}
 	peers                map[int64]*peerMeshPeer
 	sessions             map[int64]*peerMeshSession
+	sessionsByID         map[int64]*peerMeshSession
 	pending              map[string]pendingPeerProbe
-	pendingStun          map[string]string
+	pendingStun          map[string]pendingStunBinding
 	packets              map[int64][]pendingPeerPacket
 	prepared             map[int64]time.Time
 	srflx                *peerCandidate
@@ -154,6 +161,10 @@ type peerMeshSession struct {
 	LastPathLog             time.Time
 	LastPathReport          time.Time
 	LastPathRemoteText      string
+	EndpointSuccess         time.Time
+	EndpointRTT             int64
+	BestDirectRTT           int64
+	BestRelayRTT            int64
 	AESKey                  []byte
 	Sequence                uint64
 	Replay                  peerReplayWindow
@@ -175,6 +186,11 @@ type pendingPeerProbe struct {
 	Remote    string
 	Relay     bool
 	RelayID   string
+}
+
+type pendingStunBinding struct {
+	Role   string
+	SentAt time.Time
 }
 
 type pendingPeerPacket struct {
@@ -213,8 +229,9 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.sender = sender
 	mesh.peers = make(map[int64]*peerMeshPeer)
 	mesh.sessions = make(map[int64]*peerMeshSession)
+	mesh.sessionsByID = make(map[int64]*peerMeshSession)
 	mesh.pending = make(map[string]pendingPeerProbe)
-	mesh.pendingStun = make(map[string]string)
+	mesh.pendingStun = make(map[string]pendingStunBinding)
 	mesh.packets = make(map[int64][]pendingPeerPacket)
 	mesh.prepared = make(map[int64]time.Time)
 	mesh.srflxCandidates = make(map[string]peerCandidate)
@@ -278,6 +295,7 @@ func (mesh *peerMeshClient) stopLocked() {
 	mesh.sender = nil
 	mesh.peers = nil
 	mesh.sessions = nil
+	mesh.sessionsByID = nil
 	mesh.pending = nil
 	mesh.pendingStun = nil
 	mesh.packets = nil
@@ -438,8 +456,8 @@ func (mesh *peerMeshClient) handleStunBindingSuccess(message stunMessage, observ
 	role := peerRelayProbePrimary
 	tx := stunTransactionHex(message.TransactionID)
 	mesh.mu.Lock()
-	if configured := mesh.pendingStun[tx]; configured != "" {
-		role = configured
+	if binding, ok := mesh.pendingStun[tx]; ok {
+		role = binding.Role
 		delete(mesh.pendingStun, tx)
 	}
 	if mesh.srflxCandidates == nil {
@@ -458,11 +476,18 @@ func (mesh *peerMeshClient) handleStunBindingSuccess(message stunMessage, observ
 	if publicStun {
 		candidate.Foundation = "public-stun"
 	}
-	mesh.srflxCandidates[candidateEndpointKey(candidate)] = candidate
+	candidateKey := candidateEndpointKey(candidate)
+	_, candidateKnown := mesh.srflxCandidates[candidateKey]
+	previousPrimary := ""
+	if mesh.srflx != nil {
+		previousPrimary = candidateEndpointKey(*mesh.srflx)
+	}
+	mesh.srflxCandidates[candidateKey] = candidate
 	if !publicStun {
 		mesh.natByRole[role] = endpoint
 		mesh.srflx = &candidate
 	}
+	announce := !candidateKnown || (!publicStun && previousPrimary != candidateKey)
 	natType := mesh.natTypeLocked()
 	mesh.mu.Unlock()
 
@@ -472,7 +497,9 @@ func (mesh *peerMeshClient) handleStunBindingSuccess(message stunMessage, observ
 			mesh.requestAlternateProbe(role, other, observedRemote)
 		}
 	}
-	mesh.announceCandidates()
+	if announce {
+		mesh.announceCandidates()
+	}
 }
 
 func (mesh *peerMeshClient) handleTurnAllocated(message stunMessage, remote *net.UDPAddr) {
@@ -486,6 +513,10 @@ func (mesh *peerMeshClient) handleTurnAllocated(message stunMessage, remote *net
 	}
 	relayID := endpointKeyUDP(relayed)
 	mesh.mu.Lock()
+	relayChanged := mesh.relayID != relayID ||
+		mesh.relay == nil ||
+		mesh.relay.Address != endpoint.IP.String() ||
+		mesh.relay.Port != endpoint.Port
 	mesh.relayID = relayID
 	mesh.relayTTL = time.Now().Add(time.Duration(maxInt64(30, message.lifetimeSeconds(300))) * time.Second)
 	mesh.relay = &peerCandidate{
@@ -499,7 +530,9 @@ func (mesh *peerMeshClient) handleTurnAllocated(message stunMessage, remote *net
 	}
 	mesh.mu.Unlock()
 	_ = remote
-	mesh.announceCandidates()
+	if relayChanged {
+		mesh.announceCandidates()
+	}
 }
 
 func (mesh *peerMeshClient) handleProbe(probe peerUDPProbe, remote *net.UDPAddr, relayFrom string) {
@@ -551,63 +584,66 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 	if relayFrom == "" && (mesh.shouldAvoidDirectPath() || mesh.isMeshEndpoint(remote)) {
 		return
 	}
+	sessionID, ok := peerDataFrameSessionID(payload)
+	if !ok {
+		return
+	}
 	mesh.mu.Lock()
 	runtime := mesh.runtime
-	sessions := make([]*peerMeshSession, 0, len(mesh.sessions))
-	for _, session := range mesh.sessions {
-		if len(session.AESKey) > 0 {
-			sessions = append(sessions, session)
-		}
+	session := mesh.sessionsByID[sessionID]
+	if session == nil || len(session.AESKey) != 32 {
+		mesh.mu.Unlock()
+		return
 	}
+	aesKey := append([]byte(nil), session.AESKey...)
+	peerID := session.PeerID
 	device := mesh.device
 	mesh.mu.Unlock()
 	if runtime.PeerMesh.ClientID <= 0 || device == nil {
 		return
 	}
-	for _, session := range sessions {
-		frame, err := decodePeerDataFrame(session.AESKey, payload)
-		if err != nil {
-			continue
-		}
-		if frame.SessionID != session.ID || frame.FromClientID != session.PeerID || frame.ToClientID != runtime.PeerMesh.ClientID {
-			continue
-		}
-		mesh.mu.Lock()
-		current := mesh.sessions[session.PeerID]
-		if current == nil || !current.Replay.accept(frame.Sequence) || time.Now().After(current.ExpiresAt) {
-			mesh.mu.Unlock()
-			return
-		}
-		if relayFrom != "" {
-			current.PathType = "RELAY"
-			current.RelayTargetAllocationID = relayFrom
-			current.RemoteEndpoint = nil
-			current.LastRelaySuccess = time.Now()
-		} else {
-			current.PathType = "DIRECT"
-			current.RemoteEndpoint = remote
-			current.RelayTargetAllocationID = ""
-			current.LastDirectSuccess = time.Now()
-			current.DirectBytes += int64(len(payload))
-			current.DirectBytesPending += int64(len(payload))
-		}
+	frame, err := decodePeerDataFrame(aesKey, payload)
+	if err != nil {
+		return
+	}
+	if frame.SessionID != sessionID || frame.FromClientID != peerID || frame.ToClientID != runtime.PeerMesh.ClientID {
+		return
+	}
+	mesh.mu.Lock()
+	current := mesh.sessionsByID[sessionID]
+	if current == nil || current.PeerID != peerID || !current.Replay.accept(frame.Sequence) || time.Now().After(current.ExpiresAt) {
 		mesh.mu.Unlock()
-		mesh.flushPendingPackets(current)
-		if _, noop := device.(*noopPeerVirtualDevice); !noop {
-			if err := device.WritePacket(frame.Payload); err != nil {
-				mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, frame.FromClientID, err)
-			}
-			return
-		}
-		if reply := peerPacketICMPEchoReplyFor(frame.Payload, runtime.PeerMesh.VirtualIP); len(reply) > 0 {
-			if err := mesh.sendEncryptedPayload(current, reply); err == nil {
-				return
-			}
-		}
+		return
+	}
+	if relayFrom != "" {
+		current.PathType = "RELAY"
+		current.RelayTargetAllocationID = relayFrom
+		current.RemoteEndpoint = nil
+		current.LastRelaySuccess = time.Now()
+	} else {
+		current.PathType = "DIRECT"
+		current.RemoteEndpoint = remote
+		current.RelayTargetAllocationID = ""
+		current.LastDirectSuccess = time.Now()
+		current.EndpointSuccess = time.Now()
+		current.DirectBytes += int64(len(payload))
+		current.DirectBytesPending += int64(len(payload))
+	}
+	mesh.mu.Unlock()
+	mesh.flushPendingPackets(current)
+	if _, noop := device.(*noopPeerVirtualDevice); !noop {
 		if err := device.WritePacket(frame.Payload); err != nil {
 			mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, frame.FromClientID, err)
 		}
 		return
+	}
+	if reply := peerPacketICMPEchoReplyFor(frame.Payload, runtime.PeerMesh.VirtualIP); len(reply) > 0 {
+		if err := mesh.sendEncryptedPayload(current, reply); err == nil {
+			return
+		}
+	}
+	if err := device.WritePacket(frame.Payload); err != nil {
+		mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, frame.FromClientID, err)
 	}
 }
 
@@ -634,10 +670,21 @@ func (mesh *peerMeshClient) markPathFromInboundCheck(session *peerMeshSession, r
 		mesh.mu.Unlock()
 		return
 	}
+	now := time.Now()
+	currentEndpoint := current.RemoteEndpoint
+	if udpAddrEqual(remote, currentEndpoint) {
+		current.EndpointSuccess = now
+	} else if !(strings.EqualFold(current.PathType, "DIRECT") &&
+		currentEndpoint != nil &&
+		!current.EndpointSuccess.IsZero() &&
+		now.Sub(current.EndpointSuccess) <= peerDirectStaleInterval) {
+		current.RemoteEndpoint = remote
+		current.RelayTargetAllocationID = ""
+		current.EndpointSuccess = now
+		current.EndpointRTT = peerRttUnsetMillis
+	}
 	current.PathType = "DIRECT"
-	current.RemoteEndpoint = remote
-	current.RelayTargetAllocationID = ""
-	current.LastDirectSuccess = time.Now()
+	current.LastDirectSuccess = now
 	mesh.mu.Unlock()
 	mesh.flushPendingPackets(current)
 }
@@ -868,13 +915,35 @@ func (mesh *peerMeshClient) completeProbe(probe peerUDPProbe, remote *net.UDPAdd
 			mesh.mu.Unlock()
 			return
 		}
+		session.BestRelayRTT = smoothPeerRTT(session.BestRelayRTT, rtt)
 		session.PathType = pathType
 		session.RelayTargetAllocationID = pending.RelayID
 		session.LastRelaySuccess = now
 	} else {
+		session.BestDirectRTT = smoothPeerRTT(session.BestDirectRTT, rtt)
+		adoptEndpoint := true
+		currentEndpoint := session.RemoteEndpoint
+		if udpAddrEqual(remote, currentEndpoint) {
+			session.EndpointSuccess = now
+			session.EndpointRTT = rtt
+		} else if strings.EqualFold(session.PathType, "DIRECT") &&
+			currentEndpoint != nil &&
+			!session.EndpointSuccess.IsZero() &&
+			now.Sub(session.EndpointSuccess) <= peerDirectStaleInterval &&
+			session.EndpointRTT > 0 &&
+			session.EndpointRTT != peerRttUnsetMillis &&
+			rtt+peerRttHysteresisMillis >= session.EndpointRTT {
+			adoptEndpoint = false
+		}
 		session.PathType = pathType
-		session.RemoteEndpoint = remote
-		session.RelayTargetAllocationID = ""
+		if adoptEndpoint {
+			session.RemoteEndpoint = remote
+			session.RelayTargetAllocationID = ""
+			session.EndpointSuccess = now
+			session.EndpointRTT = rtt
+		} else {
+			remoteText = previousRemote
+		}
 		session.LastDirectSuccess = now
 	}
 	pathChanged := previousRemote != remoteText || !strings.EqualFold(previousPath, pathType)
@@ -1009,6 +1078,10 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 		session.LastPathLog = previous.LastPathLog
 		session.LastPathReport = previous.LastPathReport
 		session.LastPathRemoteText = previous.LastPathRemoteText
+		session.EndpointSuccess = previous.EndpointSuccess
+		session.EndpointRTT = previous.EndpointRTT
+		session.BestDirectRTT = previous.BestDirectRTT
+		session.BestRelayRTT = previous.BestRelayRTT
 		session.DirectBytes = previous.DirectBytes
 		session.DirectBytesPending = previous.DirectBytesPending
 	}
@@ -1030,7 +1103,14 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 			session.AESKey = aesKey
 		}
 	}
+	if mesh.sessionsByID == nil {
+		mesh.sessionsByID = make(map[int64]*peerMeshSession)
+	}
+	if previous != nil {
+		delete(mesh.sessionsByID, previous.ID)
+	}
 	mesh.sessions[peerID] = session
+	mesh.sessionsByID[session.ID] = session
 }
 
 func (mesh *peerMeshClient) closeSession(message peerControlMessage) {
@@ -1042,6 +1122,7 @@ func (mesh *peerMeshClient) closeSession(message peerControlMessage) {
 	for peerID, session := range mesh.sessions {
 		if session.ID == *message.SessionID {
 			delete(mesh.sessions, peerID)
+			delete(mesh.sessionsByID, session.ID)
 		}
 	}
 }
@@ -1102,6 +1183,7 @@ func (mesh *peerMeshClient) sendConnectivityChecks(message peerControlMessage) {
 	if session == nil {
 		return
 	}
+	delay := time.Duration(0)
 	for _, candidate := range message.Candidates {
 		if strings.ToLower(candidate.Transport) != "udp" || candidate.Address == "" || candidate.Port <= 0 {
 			continue
@@ -1109,12 +1191,14 @@ func (mesh *peerMeshClient) sendConnectivityChecks(message peerControlMessage) {
 		if mesh.shouldSkipDirectCandidate(candidate) {
 			continue
 		}
-		mesh.sendProbe(session, candidate)
+		mesh.sendProbePaced(session, candidate, delay)
+		delay += peerConnectivityCheckPacing
 		for _, predictedPort := range mesh.adaptivePredictedPorts(candidate, message.Candidates) {
 			predicted := candidate
 			predicted.Port = predictedPort
 			predicted.Foundation = "adaptive-port-predict"
-			mesh.sendProbe(session, predicted)
+			mesh.sendProbePaced(session, predicted, delay)
+			delay += peerConnectivityCheckPacing
 		}
 	}
 }
@@ -1166,6 +1250,25 @@ func (mesh *peerMeshClient) keepaliveDirectPaths() {
 			mesh.mu.Unlock()
 		}
 	}
+}
+
+func (mesh *peerMeshClient) sendProbePaced(session *peerMeshSession, candidate peerCandidate, delay time.Duration) {
+	if delay <= 0 {
+		mesh.sendProbe(session, candidate)
+		return
+	}
+	sessionID := session.ID
+	peerID := session.PeerID
+	time.AfterFunc(delay, func() {
+		mesh.mu.Lock()
+		current := mesh.sessions[peerID]
+		running := mesh.udp != nil
+		mesh.mu.Unlock()
+		if !running || current == nil || current.ID != sessionID || time.Now().After(current.ExpiresAt) {
+			return
+		}
+		mesh.sendProbe(current, candidate)
+	})
 }
 
 func (mesh *peerMeshClient) sendProbe(session *peerMeshSession, candidate peerCandidate) {
@@ -1247,6 +1350,7 @@ func (mesh *peerMeshClient) sendDirectKeepalive(session *peerMeshSession, endpoi
 		mesh.logger.Printf("Peer Mesh direct keepalive send failed: session=%d remote=%s err=%v", session.ID, endpoint, err)
 		return false
 	}
+	mesh.scheduleProbeBurst(udp, body, endpoint, nonce)
 	return true
 }
 
@@ -1512,12 +1616,15 @@ func (mesh *peerMeshClient) attemptPortMapping(service *natPortMappingService, i
 		service.releaseMapping(*mapping)
 		return
 	}
+	changed := mesh.portMap == nil || candidateEndpointKey(*mesh.portMap) != candidateEndpointKey(candidate)
 	mesh.portMapping = mapping
 	mesh.portMap = &candidate
 	mesh.mu.Unlock()
 	mesh.logger.Printf("Peer Mesh NAT port mapping active: protocol=%s external=%s:%d internal=%d lease=%ds",
 		mapping.Protocol, mapping.ExternalAddress, mapping.ExternalPort, mapping.InternalPort, mapping.LeaseSeconds)
-	mesh.announceCandidates()
+	if changed {
+		mesh.announceCandidates()
+	}
 }
 
 func (mesh *peerMeshClient) renewPortMappingIfNeeded() {
@@ -1611,13 +1718,28 @@ func (mesh *peerMeshClient) requestAlternateProbe(role string, alternate *net.UD
 func (mesh *peerMeshClient) requestPublicStunBindings() {
 	mesh.mu.Lock()
 	servers := append([]string(nil), mesh.runtime.PeerMesh.PublicStunServers...)
+	mesh.removePublicStunCandidatesLocked()
 	mesh.mu.Unlock()
+	sent := make(map[string]struct{}, len(servers))
 	for _, server := range servers {
 		endpoint := parseStunServer(server)
 		if endpoint == nil {
 			continue
 		}
-		mesh.sendStunBinding(endpoint, publicStunRolePrefix+endpointKeyUDP(endpoint))
+		key := endpointKeyUDP(endpoint)
+		if _, ok := sent[key]; ok {
+			continue
+		}
+		sent[key] = struct{}{}
+		mesh.sendStunBinding(endpoint, publicStunRolePrefix+key)
+	}
+}
+
+func (mesh *peerMeshClient) removePublicStunCandidatesLocked() {
+	for key, candidate := range mesh.srflxCandidates {
+		if strings.EqualFold(candidate.Foundation, "public-stun") {
+			delete(mesh.srflxCandidates, key)
+		}
 	}
 }
 
@@ -1625,9 +1747,9 @@ func (mesh *peerMeshClient) sendStunBinding(endpoint *net.UDPAddr, role string) 
 	tx := newStunTransactionID()
 	mesh.mu.Lock()
 	if mesh.pendingStun == nil {
-		mesh.pendingStun = make(map[string]string)
+		mesh.pendingStun = make(map[string]pendingStunBinding)
 	}
-	mesh.pendingStun[stunTransactionHex(tx)] = role
+	mesh.pendingStun[stunTransactionHex(tx)] = pendingStunBinding{Role: role, SentAt: time.Now()}
 	mesh.mu.Unlock()
 	mesh.sendStunRequest(newStunMessage(stunBindingRequest, tx, stunAttrSoftwareValue("shuai-tunnel-peer-client")), endpoint)
 }
@@ -1842,9 +1964,15 @@ func (mesh *peerMeshClient) cleanupProbes() {
 			delete(mesh.pending, nonce)
 		}
 	}
+	for tx, pending := range mesh.pendingStun {
+		if now.Sub(pending.SentAt) > 30*time.Second {
+			delete(mesh.pendingStun, tx)
+		}
+	}
 	for peerID, session := range mesh.sessions {
 		if now.After(session.ExpiresAt) {
 			delete(mesh.sessions, peerID)
+			delete(mesh.sessionsByID, session.ID)
 		}
 	}
 }
@@ -2006,9 +2134,27 @@ func endpointKeyUDP(endpoint *net.UDPAddr) string {
 	return net.JoinHostPort(endpoint.IP.String(), fmt.Sprintf("%d", endpoint.Port))
 }
 
+func udpAddrEqual(left, right *net.UDPAddr) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Port == right.Port && left.IP.Equal(right.IP)
+}
+
 func candidateEndpointKey(candidate peerCandidate) string {
 	return strings.ToLower(candidate.Type) + "|" + strings.ToLower(candidate.Transport) + "|" +
 		net.JoinHostPort(candidate.Address, fmt.Sprintf("%d", candidate.Port))
+}
+
+func smoothPeerRTT(previous, sample int64) int64 {
+	if sample < 0 {
+		return previous
+	}
+	if previous <= 0 || previous == peerRttUnsetMillis {
+		return sample
+	}
+	return ((previous * peerRttEWMAOldWeight) + (sample * peerRttEWMANewWeight)) /
+		(peerRttEWMAOldWeight + peerRttEWMANewWeight)
 }
 
 func runtimeSessionTTL(value int64) int64 {

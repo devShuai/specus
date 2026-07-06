@@ -56,6 +56,10 @@ func TestPeerDataFrameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sessionID, ok := peerDataFrameSessionID(frame)
+	if !ok || sessionID != 1001 {
+		t.Fatalf("peerDataFrameSessionID() = %d/%v, want 1001/true", sessionID, ok)
+	}
 	if decoded.SessionID != 1001 || decoded.FromClientID != 1 || decoded.ToClientID != 2 || decoded.Sequence != 1 {
 		t.Fatalf("unexpected frame header: %+v", decoded)
 	}
@@ -71,6 +75,12 @@ func TestPeerDataFrameRejectsWrongKey(t *testing.T) {
 	}
 	if _, err := decodePeerDataFrame(bytes.Repeat([]byte{8}, 32), frame); err == nil {
 		t.Fatal("wrong key should fail")
+	}
+}
+
+func TestPeerDataFrameSessionIDRejectsMalformedFrame(t *testing.T) {
+	if sessionID, ok := peerDataFrameSessionID([]byte{1, 2, 3}); ok || sessionID != 0 {
+		t.Fatalf("peerDataFrameSessionID() = %d/%v, want 0/false", sessionID, ok)
 	}
 }
 

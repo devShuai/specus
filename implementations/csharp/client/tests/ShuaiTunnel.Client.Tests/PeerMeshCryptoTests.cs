@@ -22,6 +22,7 @@ public sealed class PeerMeshCryptoTests
 
         var decoded = PeerDataFrameCodec.Decode(key, frame);
 
+        Assert.Equal(1001, PeerDataFrameCodec.SessionId(frame));
         Assert.Equal(1001, decoded.SessionId);
         Assert.Equal(1, decoded.FromClientId);
         Assert.Equal(2, decoded.ToClientId);
@@ -36,6 +37,12 @@ public sealed class PeerMeshCryptoTests
 
         Assert.ThrowsAny<CryptographicException>(() =>
             PeerDataFrameCodec.Decode(Enumerable.Repeat((byte)8, 32).ToArray(), frame));
+    }
+
+    [Fact]
+    public void DataFrameSessionIdRejectsMalformedFrame()
+    {
+        Assert.Null(PeerDataFrameCodec.SessionId([1, 2, 3]));
     }
 
     [Fact]
@@ -290,8 +297,10 @@ public sealed class PeerMeshCryptoTests
         using var udp = new UdpClient(AddressFamily.InterNetwork);
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
         using var direct = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var cts = new CancellationTokenSource();
         var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
         SetPrivateField(client, "_udp", udp);
+        SetPrivateField(client, "_cts", cts);
         SetPrivateField(client, "_runtime", new TunnelRuntimeState
         {
             PeerMesh = new PeerMeshConfig
@@ -312,8 +321,9 @@ public sealed class PeerMeshCryptoTests
 
         await InvokePrivateAsync(client, "KeepaliveDirectPathsAsync");
 
-        var payloads = await ReadUdpPayloadsAsync(direct, 1);
-        var payload = Assert.Single(payloads);
+        var payloads = await ReadUdpPayloadsAsync(direct, 3);
+        Assert.Equal(3, payloads.Count);
+        var payload = payloads[0];
         using var json = JsonDocument.Parse(payload);
         Assert.Equal("shuai-peer-mesh", json.RootElement.GetProperty("magic").GetString());
         Assert.Equal("check", json.RootElement.GetProperty("type").GetString());

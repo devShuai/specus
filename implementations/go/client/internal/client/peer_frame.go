@@ -143,6 +143,19 @@ func decodePeerDataFrame(aesKey []byte, packet []byte) (*peerDataFrame, error) {
 	}, nil
 }
 
+func peerDataFrameSessionID(packet []byte) (int64, bool) {
+	if len(packet) < peerDataFrameAADBytes+4 {
+		return 0, false
+	}
+	if binary.BigEndian.Uint32(packet[0:4]) != peerDataFrameMagic {
+		return 0, false
+	}
+	if packet[4] != peerDataFrameVersion || packet[5] != peerDataFrameTypeData {
+		return 0, false
+	}
+	return int64(binary.BigEndian.Uint64(packet[6:14])), true
+}
+
 func looksLikePeerDataFrame(packet []byte) bool {
 	return len(packet) >= 4 && binary.BigEndian.Uint32(packet[0:4]) == peerDataFrameMagic
 }

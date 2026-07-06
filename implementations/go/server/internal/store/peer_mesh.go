@@ -371,6 +371,92 @@ func (db *DB) ListExpiredPeerMeshSessions(ctx context.Context, closedStatus stri
 	return db.listPeerMeshSessions(ctx, query, closedStatus, formatTime(expiresAt), limit)
 }
 
+type PeerMeshPathTypeAggregate struct {
+	PathType         string
+	Status           string
+	Sessions         int64
+	ReportedSessions int64
+	AvgRttMillis     *float64
+	DirectBytes      int64
+	RelayBytes       int64
+}
+
+func (db *DB) AggregatePeerMeshPathTypes(ctx context.Context, tenantID string, clientIDs []int64, filterClientIDs bool) ([]PeerMeshPathTypeAggregate, error) {
+	if filterClientIDs && len(clientIDs) == 0 {
+		return nil, nil
+	}
+	args := []any{defaultTenant(tenantID)}
+	where := ` WHERE tenant_id = ?`
+	if filterClientIDs {
+		where += ` AND (source_client_id IN (` + placeholders(len(clientIDs)) + `)
+			OR target_client_id IN (` + placeholders(len(clientIDs)) + `))`
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+	}
+	query := db.rebind(`SELECT path_type, status,
+		COUNT(*) AS sessions,
+		COUNT(rtt_millis) AS reported_sessions,
+		AVG(rtt_millis) AS avg_rtt_millis,
+		COALESCE(SUM(direct_bytes), 0) AS direct_bytes,
+		COALESCE(SUM(relay_bytes), 0) AS relay_bytes
+		FROM peer_mesh_session` + where + ` GROUP BY path_type, status`)
+	rows, err := db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PeerMeshPathTypeAggregate
+	for rows.Next() {
+		var item PeerMeshPathTypeAggregate
+		var avg sql.NullFloat64
+		if err := rows.Scan(&item.PathType, &item.Status, &item.Sessions, &item.ReportedSessions,
+			&avg, &item.DirectBytes, &item.RelayBytes); err != nil {
+			return nil, err
+		}
+		if avg.Valid {
+			item.AvgRttMillis = &avg.Float64
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+type PeerMeshNatTypeAggregate struct {
+	NatType *string
+	Devices int64
+}
+
+func (db *DB) AggregatePeerMeshNatTypes(ctx context.Context, tenantID, ownerUsername string, filterOwner bool) ([]PeerMeshNatTypeAggregate, error) {
+	args := []any{defaultTenant(tenantID)}
+	where := ` WHERE tenant_id = ?`
+	if filterOwner {
+		where += ` AND owner_username = ?`
+		args = append(args, defaultOwner(ownerUsername))
+	}
+	query := db.rebind(`SELECT nat_type, COUNT(*) AS devices
+		FROM peer_mesh_device` + where + ` GROUP BY nat_type`)
+	rows, err := db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PeerMeshNatTypeAggregate
+	for rows.Next() {
+		var item PeerMeshNatTypeAggregate
+		var natType sql.NullString
+		if err := rows.Scan(&natType, &item.Devices); err != nil {
+			return nil, err
+		}
+		item.NatType = nullStringPtr(natType)
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 func (db *DB) listPeerMeshSessions(ctx context.Context, query string, args ...any) ([]PeerMeshSession, error) {
 	rows, err := db.sql.QueryContext(ctx, query, args...)
 	if err != nil {

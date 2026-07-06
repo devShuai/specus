@@ -22,6 +22,7 @@ namespace ShuaiTunnel.Server.PeerMesh;
 public sealed class PeerMeshService
 {
     public const string PathDirect = "DIRECT";
+    public const string PathRelay = "RELAY";
     public const string StatusNegotiating = "NEGOTIATING";
     public const string StatusActive = "ACTIVE";
     public const string StatusClosed = "CLOSED";
@@ -409,6 +410,92 @@ public sealed class PeerMeshService
             normalizedPage,
             normalizedSize,
             TotalPages(total, normalizedSize));
+    }
+
+    public async Task<PeerMeshPathStatsView> PathStatsAsync(ManagementContext context,
+        CancellationToken cancellationToken)
+    {
+        await ExpireStaleSessionsAsync(cancellationToken).ConfigureAwait(false);
+        List<long>? visibleIds = null;
+        IQueryable<PeerMeshSession> sessionQuery = _db.PeerMeshSessions.AsNoTracking()
+            .Where(s => s.TenantId == context.TenantId);
+        if (!context.IsAdmin)
+        {
+            visibleIds = await VisibleClientIdsAsync(context, cancellationToken).ConfigureAwait(false);
+            if (visibleIds.Count == 0)
+            {
+                sessionQuery = sessionQuery.Where(_ => false);
+            }
+            else
+            {
+                sessionQuery = sessionQuery.Where(s => visibleIds.Contains(s.SourceClientId)
+                    || visibleIds.Contains(s.TargetClientId));
+            }
+        }
+        var pathRows = await sessionQuery
+            .GroupBy(s => new { s.PathType, s.Status })
+            .Select(g => new
+            {
+                g.Key.PathType,
+                g.Key.Status,
+                Sessions = g.LongCount(),
+                ReportedSessions = g.LongCount(s => s.RttMillis != null),
+                AvgRttMillis = g.Average(s => (double?)s.RttMillis),
+                DirectBytes = g.Sum(s => s.DirectBytes),
+                RelayBytes = g.Sum(s => s.RelayBytes)
+            })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        IQueryable<PeerMeshDevice> natQuery = _db.PeerMeshDevices.AsNoTracking()
+            .Where(d => d.TenantId == context.TenantId);
+        if (!context.IsAdmin)
+        {
+            natQuery = natQuery.Where(d => d.OwnerUsername == context.Username);
+        }
+        var natRows = await natQuery
+            .GroupBy(d => d.NatType)
+            .Select(g => new { NatType = g.Key, Devices = g.LongCount() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        long total = 0;
+        long reported = 0;
+        long active = 0;
+        long activeDirect = 0;
+        long activeRelay = 0;
+        var pathTypes = new List<PeerMeshPathTypeStat>(pathRows.Count);
+        foreach (var row in pathRows)
+        {
+            total += row.Sessions;
+            reported += row.ReportedSessions;
+            if (string.Equals(row.Status, StatusActive, StringComparison.Ordinal))
+            {
+                active += row.Sessions;
+                if (string.Equals(row.PathType, PathDirect, StringComparison.Ordinal))
+                {
+                    activeDirect += row.Sessions;
+                }
+                else if (string.Equals(row.PathType, PathRelay, StringComparison.Ordinal))
+                {
+                    activeRelay += row.Sessions;
+                }
+            }
+            pathTypes.Add(new PeerMeshPathTypeStat(row.PathType, row.Status, row.Sessions,
+                row.ReportedSessions, row.AvgRttMillis, row.DirectBytes, row.RelayBytes));
+        }
+
+        var natCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var row in natRows)
+        {
+            var key = string.IsNullOrWhiteSpace(row.NatType) ? "UNKNOWN" : row.NatType!;
+            natCounts.TryAdd(key, 0);
+            natCounts[key] += row.Devices;
+        }
+        var natTypes = natCounts.Select(item => new PeerMeshNatTypeStat(item.Key, item.Value)).ToList();
+        double? ratio = active == 0 ? null : (double)activeDirect / active;
+        return new PeerMeshPathStatsView(total, reported, active, activeDirect, activeRelay, ratio,
+            pathTypes, natTypes);
     }
 
     public async Task<PeerMeshSessionView> ForceCloseAsync(ManagementContext context, long sessionId,
@@ -1277,6 +1364,27 @@ public sealed record PeerMeshSessionPage(
     int Page,
     int Size,
     int TotalPages);
+
+public sealed record PeerMeshPathStatsView(
+    long TotalSessions,
+    long ReportedSessions,
+    long ActiveSessions,
+    long ActiveDirectSessions,
+    long ActiveRelaySessions,
+    double? ActiveDirectRatio,
+    IReadOnlyList<PeerMeshPathTypeStat> PathTypes,
+    IReadOnlyList<PeerMeshNatTypeStat> NatTypes);
+
+public sealed record PeerMeshPathTypeStat(
+    string PathType,
+    string Status,
+    long Sessions,
+    long ReportedSessions,
+    double? AvgRttMillis,
+    long DirectBytes,
+    long RelayBytes);
+
+public sealed record PeerMeshNatTypeStat(string NatType, long Devices);
 
 public sealed record PeerMeshDeviceMutation(bool? Enabled);
 

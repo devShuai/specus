@@ -82,6 +82,20 @@ final class PeerDataFrameCodec {
         }
     }
 
+    static Long sessionId(byte[] packet) {
+        if (packet == null || packet.length < AAD_BYTES + Integer.BYTES) {
+            return null;
+        }
+        ByteBuffer header = ByteBuffer.wrap(packet, 0, AAD_BYTES);
+        int magic = header.getInt();
+        byte version = header.get();
+        byte type = header.get();
+        if (magic != MAGIC || version != VERSION || type != TYPE_DATA) {
+            return null;
+        }
+        return header.getLong();
+    }
+
     static boolean looksLikeDataFrame(byte[] packet, int offset, int length) {
         if (packet == null || length < Integer.BYTES) {
             return false;

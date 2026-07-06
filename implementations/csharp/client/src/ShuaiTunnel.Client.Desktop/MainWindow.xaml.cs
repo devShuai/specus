@@ -2,8 +2,10 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Interop;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.Control;
@@ -46,6 +48,12 @@ public partial class MainWindow : Window
         _observer = new UiTunnelObserver(this);
         LoadSettingsIntoForm();
         UpdateStoppedUi("未连接", "填写连接信息后启动客户端");
+    }
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        ApplyDarkTitleBar();
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -417,6 +425,48 @@ public partial class MainWindow : Window
         var index = category.LastIndexOf('.');
         return index >= 0 && index + 1 < category.Length ? category[(index + 1)..] : category;
     }
+
+    private void ApplyDarkTitleBar()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var enabled = 1;
+        if (DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode, ref enabled, sizeof(int)) != 0)
+        {
+            _ = DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkModeBefore20H1, ref enabled, sizeof(int));
+        }
+
+        var captionColor = ColorRef(0x07, 0x10, 0x18);
+        var textColor = ColorRef(0xF4, 0xFA, 0xFF);
+        _ = DwmSetWindowAttribute(hwnd, DwmwaCaptionColor, ref captionColor, sizeof(int));
+        _ = DwmSetWindowAttribute(hwnd, DwmwaTextColor, ref textColor, sizeof(int));
+    }
+
+    private static int ColorRef(byte red, byte green, byte blue)
+    {
+        return red | (green << 8) | (blue << 16);
+    }
+
+    private const int DwmwaUseImmersiveDarkModeBefore20H1 = 19;
+    private const int DwmwaUseImmersiveDarkMode = 20;
+    private const int DwmwaCaptionColor = 35;
+    private const int DwmwaTextColor = 36;
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(
+        IntPtr hwnd,
+        int dwAttribute,
+        ref int pvAttribute,
+        int cbAttribute);
 
     private sealed class UiTunnelObserver : ITunnelClientObserver
     {

@@ -152,6 +152,107 @@ func TestRefreshDeviceDisableClosesOpenSessionsAndNotifiesBothPeers(t *testing.T
 	assertHasMessageType(t, targetMessages, TypeRoster)
 }
 
+func TestPathStatsAggregatesDirectRatioReportedSessionsAndNatTypes(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := newPeerMeshTestService(db)
+
+	source := insertPeerClient(t, db, 2501, "tenant-a", "alice", "alice-laptop")
+	target := insertPeerClient(t, db, 2502, "tenant-a", "alice", "alice-nas")
+	insertPeerDevice(t, db, source, "100.96.0.30", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.31", "target-key")
+	sourceDevice, err := db.FindPeerMeshDeviceByClientID(ctx, "tenant-a", source.ID)
+	if err != nil {
+		t.Fatalf("find source peer device: %v", err)
+	}
+	natType := "PORT_RESTRICTED_NAT"
+	sourceDevice.NatType = &natType
+	if err := db.UpdatePeerMeshDevice(ctx, *sourceDevice); err != nil {
+		t.Fatalf("update source peer device: %v", err)
+	}
+
+	now := time.Now().UTC()
+	rttDirect := int64(10)
+	rttRelay := int64(30)
+	for _, item := range []store.PeerMeshSession{
+		{
+			ID:               9201,
+			TenantID:         "tenant-a",
+			SourceClientID:   source.ID,
+			SourceClientName: source.ClientName,
+			TargetClientID:   target.ID,
+			TargetClientName: target.ClientName,
+			PathType:         PathDirect,
+			Status:           StatusActive,
+			RTTMillis:        &rttDirect,
+			DirectBytes:      100,
+			RelayBytes:       5,
+			StartedAt:        now.Add(-2 * time.Minute),
+			UpdatedAt:        now.Add(-2 * time.Minute),
+			ExpiresAt:        now.Add(time.Hour),
+		},
+		{
+			ID:               9202,
+			TenantID:         "tenant-a",
+			SourceClientID:   target.ID,
+			SourceClientName: target.ClientName,
+			TargetClientID:   source.ID,
+			TargetClientName: source.ClientName,
+			PathType:         PathRelay,
+			Status:           StatusActive,
+			RTTMillis:        &rttRelay,
+			DirectBytes:      0,
+			RelayBytes:       200,
+			StartedAt:        now.Add(-2 * time.Minute),
+			UpdatedAt:        now.Add(-2 * time.Minute),
+			ExpiresAt:        now.Add(time.Hour),
+		},
+		{
+			ID:               9203,
+			TenantID:         "tenant-a",
+			SourceClientID:   source.ID,
+			SourceClientName: source.ClientName,
+			TargetClientID:   target.ID,
+			TargetClientName: target.ClientName,
+			PathType:         PathDirect,
+			Status:           StatusNegotiating,
+			StartedAt:        now.Add(-2 * time.Minute),
+			UpdatedAt:        now.Add(-2 * time.Minute),
+			ExpiresAt:        now.Add(time.Hour),
+		},
+	} {
+		if err := db.InsertPeerMeshSession(ctx, item); err != nil {
+			t.Fatalf("insert peer session %d: %v", item.ID, err)
+		}
+	}
+
+	stats, err := service.PathStats(ctx, AccessContext{Username: "alice", TenantID: "tenant-a", Admin: true})
+	if err != nil {
+		t.Fatalf("path stats: %v", err)
+	}
+	if stats.TotalSessions != 3 || stats.ReportedSessions != 2 ||
+		stats.ActiveSessions != 2 || stats.ActiveDirectSessions != 1 || stats.ActiveRelaySessions != 1 {
+		t.Fatalf("stats counters mismatch: %+v", stats)
+	}
+	if stats.ActiveDirectRatio == nil || *stats.ActiveDirectRatio != 0.5 {
+		t.Fatalf("active direct ratio = %v, want 0.5", stats.ActiveDirectRatio)
+	}
+	directActive := findPathTypeStat(stats.PathTypes, PathDirect, StatusActive)
+	if directActive == nil || directActive.Sessions != 1 || directActive.ReportedSessions != 1 ||
+		directActive.AvgRttMillis == nil || *directActive.AvgRttMillis != 10 ||
+		directActive.DirectBytes != 100 || directActive.RelayBytes != 5 {
+		t.Fatalf("direct active aggregate mismatch: %+v", directActive)
+	}
+	directNegotiating := findPathTypeStat(stats.PathTypes, PathDirect, StatusNegotiating)
+	if directNegotiating == nil || directNegotiating.ReportedSessions != 0 {
+		t.Fatalf("direct negotiating aggregate mismatch: %+v", directNegotiating)
+	}
+	if findNatTypeStat(stats.NatTypes, "PORT_RESTRICTED_NAT") != 1 ||
+		findNatTypeStat(stats.NatTypes, "UNKNOWN") != 1 {
+		t.Fatalf("nat type aggregate mismatch: %+v", stats.NatTypes)
+	}
+}
+
 func TestAuthorizeRelayFrameRequiresActiveMatchingSessionAndAccountsBytes(t *testing.T) {
 	ctx := context.Background()
 	db := openPeerMeshTestDB(t)
@@ -390,6 +491,24 @@ func assertHasMessageType(t *testing.T, messages []ControlMessage, messageType s
 		}
 	}
 	t.Fatalf("missing message type %q in %+v", messageType, messages)
+}
+
+func findPathTypeStat(items []PathTypeStat, pathType, status string) *PathTypeStat {
+	for i := range items {
+		if items[i].PathType == pathType && items[i].Status == status {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func findNatTypeStat(items []NatTypeStat, natType string) int64 {
+	for _, item := range items {
+		if item.NatType == natType {
+			return item.Devices
+		}
+	}
+	return 0
 }
 
 type recordingSession struct {

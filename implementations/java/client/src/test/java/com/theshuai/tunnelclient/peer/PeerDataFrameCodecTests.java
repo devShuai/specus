@@ -20,6 +20,7 @@ class PeerDataFrameCodecTests {
         byte[] packet = PeerDataFrameCodec.encode(key, 99L, 1L, 2L, 7L, payload);
         PeerDataFrame frame = PeerDataFrameCodec.decode(key, packet, 99L, 2L);
 
+        assertEquals(99L, PeerDataFrameCodec.sessionId(packet));
         assertNotNull(frame);
         assertEquals(99L, frame.sessionId());
         assertEquals(1L, frame.fromClientId());
@@ -35,6 +36,11 @@ class PeerDataFrameCodecTests {
         byte[] packet = PeerDataFrameCodec.encode(key, 99L, 1L, 2L, 7L, new byte[]{1, 2, 3});
 
         assertNull(PeerDataFrameCodec.decode(key, packet, 99L, 3L));
+    }
+
+    @Test
+    void shouldNotReadSessionIdFromMalformedFrame() {
+        assertNull(PeerDataFrameCodec.sessionId(new byte[]{1, 2, 3}));
     }
 
     @Test

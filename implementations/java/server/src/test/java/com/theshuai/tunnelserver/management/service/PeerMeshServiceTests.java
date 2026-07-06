@@ -13,6 +13,8 @@ import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshSessionRepository;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -216,6 +218,37 @@ class PeerMeshServiceTests {
         assertThat(session.getRelayBytes()).isZero();
     }
 
+    @Test
+    void pathStatsAggregatesDirectRatioAndNatTypes() {
+        when(sessionRepository.findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(any(), any(), any()))
+                .thenReturn(List.of());
+        when(sessionRepository.aggregatePathTypes("tenant-a")).thenReturn(List.of(
+                pathAggregate(PeerMeshService.PATH_DIRECT, PeerMeshService.STATUS_ACTIVE, 3, 2, 12.5, 900, 0),
+                pathAggregate(PeerMeshService.PATH_RELAY, PeerMeshService.STATUS_ACTIVE, 1, 1, 80.0, 10, 400),
+                pathAggregate(PeerMeshService.PATH_DIRECT, PeerMeshService.STATUS_CLOSED, 1, 0, null, 0, 0)
+        ));
+        when(deviceRepository.aggregateNatTypes("tenant-a")).thenReturn(List.of(
+                natAggregate(null, 2),
+                natAggregate("SYMMETRIC_NAT", 1)
+        ));
+
+        var stats = service.pathStats(new ManagementContext(new TenantContext("tenant-a"), "admin", true));
+
+        assertThat(stats.totalSessions()).isEqualTo(5);
+        assertThat(stats.reportedSessions()).isEqualTo(3);
+        assertThat(stats.activeSessions()).isEqualTo(4);
+        assertThat(stats.activeDirectSessions()).isEqualTo(3);
+        assertThat(stats.activeRelaySessions()).isEqualTo(1);
+        assertThat(stats.activeDirectRatio()).isEqualTo(0.75);
+        assertThat(stats.pathTypes()).hasSize(3);
+        assertThat(stats.natTypes())
+                .extracting("natType", "devices")
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple("UNKNOWN", 2L),
+                        org.assertj.core.groups.Tuple.tuple("SYMMETRIC_NAT", 1L)
+                );
+    }
+
     private ClientAccount client(long id, String owner, String name) {
         ClientAccount account = new ClientAccount();
         account.setId(id);
@@ -248,5 +281,31 @@ class PeerMeshServiceTests {
         session.setUpdatedAt(now.toString());
         session.setExpiresAt(now.plusSeconds(60).toString());
         return session;
+    }
+
+    private PeerMeshSessionRepository.PathTypeAggregate pathAggregate(
+            String pathType,
+            String status,
+            long sessions,
+            long reportedSessions,
+            Double avgRttMillis,
+            long directBytes,
+            long relayBytes) {
+        PeerMeshSessionRepository.PathTypeAggregate aggregate = mock(PeerMeshSessionRepository.PathTypeAggregate.class);
+        when(aggregate.getPathType()).thenReturn(pathType);
+        when(aggregate.getStatus()).thenReturn(status);
+        when(aggregate.getSessions()).thenReturn(sessions);
+        when(aggregate.getReportedSessions()).thenReturn(reportedSessions);
+        when(aggregate.getAvgRttMillis()).thenReturn(avgRttMillis);
+        when(aggregate.getDirectBytes()).thenReturn(directBytes);
+        when(aggregate.getRelayBytes()).thenReturn(relayBytes);
+        return aggregate;
+    }
+
+    private PeerMeshDeviceRepository.NatTypeAggregate natAggregate(String natType, long devices) {
+        PeerMeshDeviceRepository.NatTypeAggregate aggregate = mock(PeerMeshDeviceRepository.NatTypeAggregate.class);
+        when(aggregate.getNatType()).thenReturn(natType);
+        when(aggregate.getDevices()).thenReturn(devices);
+        return aggregate;
     }
 }

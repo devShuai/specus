@@ -133,6 +133,32 @@ type SessionPage struct {
 	TotalPages int           `json:"totalPages"`
 }
 
+type PathStatsView struct {
+	TotalSessions        int64          `json:"totalSessions"`
+	ReportedSessions     int64          `json:"reportedSessions"`
+	ActiveSessions       int64          `json:"activeSessions"`
+	ActiveDirectSessions int64          `json:"activeDirectSessions"`
+	ActiveRelaySessions  int64          `json:"activeRelaySessions"`
+	ActiveDirectRatio    *float64       `json:"activeDirectRatio"`
+	PathTypes            []PathTypeStat `json:"pathTypes"`
+	NatTypes             []NatTypeStat  `json:"natTypes"`
+}
+
+type PathTypeStat struct {
+	PathType         string   `json:"pathType"`
+	Status           string   `json:"status"`
+	Sessions         int64    `json:"sessions"`
+	ReportedSessions int64    `json:"reportedSessions"`
+	AvgRttMillis     *float64 `json:"avgRttMillis"`
+	DirectBytes      int64    `json:"directBytes"`
+	RelayBytes       int64    `json:"relayBytes"`
+}
+
+type NatTypeStat struct {
+	NatType string `json:"natType"`
+	Devices int64  `json:"devices"`
+}
+
 type PublicStunConfig struct {
 	PeerMeshEnabled      bool     `json:"peerMeshEnabled"`
 	SelfHostedStunServer string   `json:"selfHostedStunServer"`
@@ -719,6 +745,83 @@ func (s *Service) ListSessionsPage(ctx context.Context, access AccessContext, pa
 		Page:       page,
 		Size:       size,
 		TotalPages: totalPages(total, size),
+	}, nil
+}
+
+func (s *Service) PathStats(ctx context.Context, access AccessContext) (PathStatsView, error) {
+	_, _ = s.expireStaleSessions(ctx, 500)
+	var ids []int64
+	filterIDs := false
+	var err error
+	if !access.Admin {
+		ids, err = s.visibleClientIDs(ctx, access)
+		if err != nil {
+			return PathStatsView{}, err
+		}
+		filterIDs = true
+	}
+	pathAggregates, err := s.db.AggregatePeerMeshPathTypes(ctx, access.TenantID, ids, filterIDs)
+	if err != nil {
+		return PathStatsView{}, err
+	}
+	natAggregates, err := s.db.AggregatePeerMeshNatTypes(ctx, access.TenantID, access.Username, !access.Admin)
+	if err != nil {
+		return PathStatsView{}, err
+	}
+	var total, reported, active, activeDirect, activeRelay int64
+	pathTypes := make([]PathTypeStat, 0, len(pathAggregates))
+	for _, item := range pathAggregates {
+		total += item.Sessions
+		reported += item.ReportedSessions
+		if item.Status == StatusActive {
+			active += item.Sessions
+			switch item.PathType {
+			case PathDirect:
+				activeDirect += item.Sessions
+			case PathRelay:
+				activeRelay += item.Sessions
+			}
+		}
+		pathTypes = append(pathTypes, PathTypeStat{
+			PathType:         item.PathType,
+			Status:           item.Status,
+			Sessions:         item.Sessions,
+			ReportedSessions: item.ReportedSessions,
+			AvgRttMillis:     item.AvgRttMillis,
+			DirectBytes:      item.DirectBytes,
+			RelayBytes:       item.RelayBytes,
+		})
+	}
+	natCounts := make(map[string]int64)
+	natOrder := make([]string, 0, len(natAggregates))
+	for _, item := range natAggregates {
+		key := "UNKNOWN"
+		if item.NatType != nil && strings.TrimSpace(*item.NatType) != "" {
+			key = *item.NatType
+		}
+		if _, ok := natCounts[key]; !ok {
+			natOrder = append(natOrder, key)
+		}
+		natCounts[key] += item.Devices
+	}
+	natTypes := make([]NatTypeStat, 0, len(natOrder))
+	for _, key := range natOrder {
+		natTypes = append(natTypes, NatTypeStat{NatType: key, Devices: natCounts[key]})
+	}
+	var directRatio *float64
+	if active > 0 {
+		value := float64(activeDirect) / float64(active)
+		directRatio = &value
+	}
+	return PathStatsView{
+		TotalSessions:        total,
+		ReportedSessions:     reported,
+		ActiveSessions:       active,
+		ActiveDirectSessions: activeDirect,
+		ActiveRelaySessions:  activeRelay,
+		ActiveDirectRatio:    directRatio,
+		PathTypes:            pathTypes,
+		NatTypes:             natTypes,
 	}, nil
 }
 

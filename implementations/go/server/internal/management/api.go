@@ -112,6 +112,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/peer-mesh/acls", a.requireAuth(a.handlePeerMeshACLs))
 	mux.HandleFunc("POST /api/admin/peer-mesh/acls", a.requireAuth(a.handlePeerMeshCreateACL))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/acls/{id}", a.requireAuth(a.handlePeerMeshDeleteACL))
+	mux.HandleFunc("GET /api/admin/peer-mesh/stats", a.requireAuth(a.handlePeerMeshStats))
 	mux.HandleFunc("GET /api/admin/peer-mesh/sessions", a.requireAuth(a.handlePeerMeshSessions))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/sessions/{id}", a.requireAuth(a.handlePeerMeshCloseSession))
 	mux.HandleFunc("DELETE /api/admin/peer-mesh/sessions", a.requireAuth(a.handlePeerMeshCloseSessions))
@@ -1829,6 +1830,20 @@ func (a *API) handlePeerMeshDeleteACL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) handlePeerMeshStats(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	view, err := a.peerMesh.PathStats(r.Context(), a.peerAccess(principal))
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 func (a *API) handlePeerMeshSessions(w http.ResponseWriter, r *http.Request) {

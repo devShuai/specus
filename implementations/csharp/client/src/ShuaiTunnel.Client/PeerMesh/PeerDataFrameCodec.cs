@@ -94,6 +94,19 @@ internal static class PeerDataFrameCodec
         return value.Length >= 4 && BinaryPrimitives.ReadUInt32BigEndian(value[..4]) == Magic;
     }
 
+    public static long? SessionId(ReadOnlySpan<byte> value)
+    {
+        if (value.Length < AadBytes + 4 || !LooksLikeDataFrame(value))
+        {
+            return null;
+        }
+        if (value[4] != Version || value[5] != TypeData)
+        {
+            return null;
+        }
+        return (long)BinaryPrimitives.ReadUInt64BigEndian(value.Slice(6, 8));
+    }
+
     private static void WriteHeader(
         Span<byte> header,
         long sessionId,

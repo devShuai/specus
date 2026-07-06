@@ -430,7 +430,7 @@ func TestPeerMeshRequestAlternateProbeIsThrottledLikeJava(t *testing.T) {
 		t.Fatalf("alternate probe message = %+v, want alternate binding", first[0])
 	}
 	mesh.mu.Lock()
-	role := mesh.pendingStun[stunTransactionHex(first[0].TransactionID)]
+	role := mesh.pendingStun[stunTransactionHex(first[0].TransactionID)].Role
 	mesh.mu.Unlock()
 	if role != peerRelayProbeAlternate {
 		t.Fatalf("alternate probe role = %q", role)
@@ -572,9 +572,9 @@ func TestPeerMeshDirectKeepaliveUsesNominatedEndpointLikeJava(t *testing.T) {
 
 	mesh.keepaliveDirectPaths()
 
-	packets := readUDPPackets(t, direct, 1)
-	if len(packets) != 1 {
-		t.Fatalf("direct keepalive packets = %d, want 1", len(packets))
+	packets := readUDPPackets(t, direct, peerProbeBurstCount)
+	if len(packets) != peerProbeBurstCount {
+		t.Fatalf("direct keepalive packets = %d, want %d burst packets", len(packets), peerProbeBurstCount)
 	}
 	var probe peerUDPProbe
 	if err := json.Unmarshal(packets[0], &probe); err != nil {
