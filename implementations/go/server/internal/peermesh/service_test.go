@@ -97,6 +97,64 @@ func TestHandleSignalCandidatesCreatesGrantAndForwardsJavaShape(t *testing.T) {
 	}
 }
 
+func TestPushOnLoginRefreshesRosterForTenantPeers(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	registry := session.NewRegistry()
+	service := New(config.PeerMeshConfig{
+		Enabled:           true,
+		CIDR:              "100.96.0.0/11",
+		PublicAddress:     "203.0.113.10",
+		StunTurnPort:      3478,
+		SessionTTLSeconds: 3600,
+	}, db, registry, nil)
+
+	source := insertPeerClient(t, db, 1101, "tenant-a", "alice", "alice-laptop")
+	target := insertPeerClient(t, db, 1102, "tenant-a", "alice", "alice-nas")
+	insertPeerDevice(t, db, source, "100.96.0.10", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.11", "target-key")
+
+	sourceSession := &recordingSession{name: source.ClientName}
+	targetSession := &recordingSession{name: target.ClientName}
+	registry.Replace(sourceSession)
+	registry.Replace(targetSession)
+
+	service.PushOnLogin(ctx, source)
+
+	sourceMessages := sourceSession.peerMessages(t)
+	var configMessage *ControlMessage
+	var sourceRoster *ControlMessage
+	for i := range sourceMessages {
+		switch sourceMessages[i].Type {
+		case TypeConfig:
+			configMessage = &sourceMessages[i]
+		case TypeRoster:
+			sourceRoster = &sourceMessages[i]
+		}
+	}
+	if configMessage == nil {
+		t.Fatalf("source did not receive peer config: %+v", sourceMessages)
+	}
+	if configMessage.TargetClientID != source.ID || configMessage.TargetClientName != source.ClientName {
+		t.Fatalf("peer config target fields mismatch: %+v", configMessage)
+	}
+	if sourceRoster == nil || !rosterContains(sourceRoster.Peers, target.ID, target.ClientName, true) {
+		t.Fatalf("source roster missing online target: %+v", sourceRoster)
+	}
+
+	targetMessages := targetSession.peerMessages(t)
+	var targetRoster *ControlMessage
+	for i := range targetMessages {
+		if targetMessages[i].Type == TypeRoster {
+			targetRoster = &targetMessages[i]
+			break
+		}
+	}
+	if targetRoster == nil || !rosterContains(targetRoster.Peers, source.ID, source.ClientName, true) {
+		t.Fatalf("target roster missing online source: %+v", targetMessages)
+	}
+}
+
 func TestRefreshDeviceDisableClosesOpenSessionsAndNotifiesBothPeers(t *testing.T) {
 	ctx := context.Background()
 	db := openPeerMeshTestDB(t)
@@ -547,6 +605,15 @@ func assertHasMessageType(t *testing.T, messages []ControlMessage, messageType s
 		}
 	}
 	t.Fatalf("missing message type %q in %+v", messageType, messages)
+}
+
+func rosterContains(items []RosterItem, clientID int64, clientName string, online bool) bool {
+	for _, item := range items {
+		if item.ClientID == clientID && item.ClientName == clientName && item.Online == online {
+			return true
+		}
+	}
+	return false
 }
 
 func findPathTypeStat(items []PathTypeStat, pathType, status string) *PathTypeStat {

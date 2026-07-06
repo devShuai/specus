@@ -185,8 +185,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			logger.Error("NAT_CONTROL push failed", "client", conn.ClientName(), "err", err)
 		}
 		if account, err := db.FindClientByName(pushCtx, conn.ClientName()); err == nil && account != nil {
-			peerMesh.PushConfig(pushCtx, *account)
-			peerMesh.PushRoster(pushCtx, *account)
+			peerMesh.PushOnLogin(pushCtx, *account)
 		}
 	})
 

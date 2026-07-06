@@ -542,8 +542,19 @@ func (s *Service) PushConfig(ctx context.Context, account store.ClientAccount) {
 	}
 	_ = s.sendSignal(bound, "server", account.ClientName, ControlMessage{
 		Type: TypeConfig, SourceClientID: account.ID, SourceClientName: account.ClientName,
+		TargetClientID: account.ID, TargetClientName: account.ClientName,
 		PeerMesh: &cfg, CreatedAtMillis: time.Now().UnixMilli(),
 	})
+}
+
+func (s *Service) PushOnLogin(ctx context.Context, account store.ClientAccount) {
+	if !s.Enabled() {
+		return
+	}
+	s.PushConfig(ctx, account)
+	for _, target := range s.rosterRefreshTargets(ctx, account) {
+		s.PushRoster(ctx, target)
+	}
 }
 
 func (s *Service) RefreshDevice(ctx context.Context, access AccessContext, clientID int64, enabled bool) ([]SessionView, error) {

@@ -75,6 +75,114 @@ func TestPeerMeshAnnounceCandidatesIncludesServerReflexive(t *testing.T) {
 	}
 }
 
+func TestPeerMeshAnnounceCandidatesReusesExistingSession(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udp.Close()
+
+	var sent peerControlMessage
+	sessionID := int64(9001)
+	expiresAt := time.Now().Add(time.Hour).UTC()
+	mesh := &peerMeshClient{
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		logger: log.New(io.Discard, "", 0),
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			Enabled:         true,
+			ClientID:        1,
+			ClientName:      "go-a",
+			VirtualIP:       "100.96.0.1",
+			CIDR:            "100.96.0.0/11",
+			ClientPublicKey: "local-key",
+		}},
+		udp: udp,
+		peers: map[int64]*peerMeshPeer{
+			2: {ClientID: 2, ClientName: "java-b", VirtualIP: "100.96.0.2", PublicKey: "peer-key", Online: true},
+		},
+		sessions: map[int64]*peerMeshSession{
+			2: {ID: sessionID, PeerID: 2, Token: "session-token", ExpiresAt: expiresAt},
+		},
+		sessionsByID: map[int64]*peerMeshSession{},
+		srflx: &peerCandidate{
+			Type:       "srflx",
+			Transport:  "udp",
+			Address:    "203.0.113.10",
+			Port:       34567,
+			Priority:   800,
+			Foundation: "server-reflexive",
+		},
+		sender: func(_ net.Conn, _ string, message any) error {
+			cast, ok := message.(peerControlMessage)
+			if !ok {
+				t.Fatalf("unexpected message type %T", message)
+			}
+			sent = cast
+			return nil
+		},
+	}
+
+	mesh.announceCandidates()
+
+	if sent.SessionID == nil || *sent.SessionID != sessionID {
+		t.Fatalf("session id = %v, want %d", sent.SessionID, sessionID)
+	}
+	if sent.Token != "session-token" {
+		t.Fatalf("token = %q, want existing session token", sent.Token)
+	}
+	if sent.ExpiresAt == "" {
+		t.Fatal("expiresAt missing from candidates message")
+	}
+}
+
+func TestPeerMeshStartLightweightRefreshPreservesRosterAndSession(t *testing.T) {
+	var sent []peerControlMessage
+	runtime := RuntimeConfig{PeerMesh: PeerMeshConfig{
+		Enabled:         true,
+		ClientID:        1,
+		ClientName:      "go-a",
+		VirtualIP:       "100.96.0.1",
+		CIDR:            "100.96.0.0/11",
+		ClientPublicKey: "local-key",
+	}}
+	mesh := newPeerMeshClient(Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0", PeerMeshMTU: 1280}, log.New(io.Discard, "", 0))
+	sender := func(_ net.Conn, _ string, message any) error {
+		if cast, ok := message.(peerControlMessage); ok {
+			sent = append(sent, cast)
+		}
+		return nil
+	}
+	mesh.start(nil, runtime, sender)
+	defer mesh.stop()
+
+	sessionID := int64(9002)
+	mesh.mu.Lock()
+	mesh.peers[2] = &peerMeshPeer{ClientID: 2, ClientName: "java-b", VirtualIP: "100.96.0.2", PublicKey: "peer-key", Online: true}
+	mesh.sessions[2] = &peerMeshSession{ID: sessionID, PeerID: 2, Token: "session-token", ExpiresAt: time.Now().Add(time.Hour)}
+	mesh.sessionsByID[sessionID] = mesh.sessions[2]
+	mesh.srflx = &peerCandidate{Type: "srflx", Transport: "udp", Address: "203.0.113.10", Port: 34567, Priority: 800}
+	mesh.mu.Unlock()
+
+	mesh.start(nil, runtime, sender)
+
+	mesh.mu.Lock()
+	peer := mesh.peers[2]
+	session := mesh.sessions[2]
+	mesh.mu.Unlock()
+	if peer == nil || session == nil || session.ID != sessionID {
+		t.Fatalf("lightweight refresh cleared peer/session: peer=%+v session=%+v", peer, session)
+	}
+	foundCandidateWithSession := false
+	for _, message := range sent {
+		if message.Type == peerControlTypeCandidates && message.SessionID != nil && *message.SessionID == sessionID {
+			foundCandidateWithSession = true
+		}
+	}
+	if !foundCandidateWithSession {
+		t.Fatalf("missing candidates announcement with reused session: %+v", sent)
+	}
+}
+
 func TestPeerMeshNatTypeUsesJavaEnumNames(t *testing.T) {
 	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {

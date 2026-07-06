@@ -90,6 +90,7 @@ type peerMeshClient struct {
 	turnPermissions      map[string]time.Time
 	localKey             *ecdh.PrivateKey
 	device               peerVirtualDevice
+	runtimeConfigKey     string
 }
 
 type peerMeshPeer struct {
@@ -221,10 +222,28 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 		mesh.stop()
 		return
 	}
+	nextRuntimeConfigKey := mesh.runtimeConfigKeyFor(runtime.PeerMesh)
+	mesh.mu.Lock()
+	if mesh.isStartedLocked() &&
+		mesh.runtimeConfigKey == nextRuntimeConfigKey &&
+		!mesh.shouldRetryVirtualDeviceStartLocked() {
+		mesh.runtime = runtime
+		mesh.conn = conn
+		mesh.sender = sender
+		mesh.mu.Unlock()
+		mesh.reportDevice(conn, sender, mesh.deviceStatus(), mesh.deviceError(), "", "")
+		mesh.tryAcquirePortMappingAsync()
+		mesh.requestRelayCandidates()
+		mesh.announceCandidates()
+		return
+	}
+	mesh.mu.Unlock()
+
 	localKey, keyErr := loadPeerPrivateKey()
 	mesh.mu.Lock()
 	mesh.stopLocked()
 	mesh.runtime = runtime
+	mesh.runtimeConfigKey = nextRuntimeConfigKey
 	mesh.conn = conn
 	mesh.sender = sender
 	mesh.peers = make(map[int64]*peerMeshPeer)
@@ -270,6 +289,7 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	go mesh.maintenanceLoop(stopCh)
 	mesh.tryAcquirePortMappingAsync()
 	mesh.requestRelayCandidates()
+	mesh.announceCandidates()
 }
 
 func (mesh *peerMeshClient) stop() {
@@ -316,6 +336,44 @@ func (mesh *peerMeshClient) stopLocked() {
 	mesh.natByRole = nil
 	mesh.turnPermissions = nil
 	mesh.localKey = nil
+	mesh.runtimeConfigKey = ""
+}
+
+func (mesh *peerMeshClient) isStartedLocked() bool {
+	return mesh.udp != nil && mesh.stopCh != nil && mesh.runtime.PeerMesh.Enabled
+}
+
+func (mesh *peerMeshClient) shouldRetryVirtualDeviceStartLocked() bool {
+	if mesh.device == nil {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(mesh.config.PeerMeshDevice))
+	if mode == "" || mode == "noop" {
+		return false
+	}
+	return strings.EqualFold(mesh.device.Status(), "ERROR")
+}
+
+func (mesh *peerMeshClient) runtimeConfigKeyFor(peerMesh PeerMeshConfig) string {
+	publicStunServers := append([]string(nil), peerMesh.PublicStunServers...)
+	sort.Strings(publicStunServers)
+	parts := []string{
+		strings.TrimSpace(mesh.config.PeerMeshDevice),
+		strings.TrimSpace(mesh.config.PeerMeshTunName),
+		fmt.Sprintf("%d", mesh.config.PeerMeshMTU),
+		fmt.Sprintf("%d", peerMesh.ClientID),
+		strings.TrimSpace(peerMesh.ClientName),
+		strings.TrimSpace(peerMesh.VirtualIP),
+		strings.TrimSpace(peerMesh.CIDR),
+		strings.TrimSpace(peerMesh.StunHost),
+		fmt.Sprintf("%d", peerMesh.StunPort),
+		strings.TrimSpace(peerMesh.TurnHost),
+		fmt.Sprintf("%d", peerMesh.TurnPort),
+		strings.TrimSpace(peerMesh.ClientPublicKey),
+		strings.TrimSpace(peerMesh.ServerPublicKey),
+		strings.Join(publicStunServers, ","),
+	}
+	return strings.Join(parts, "|")
 }
 
 func (mesh *peerMeshClient) handleControl(conn net.Conn, payload string, base RuntimeConfig, sender peerControlSender) {
@@ -387,6 +445,7 @@ func (mesh *peerMeshClient) maintenanceLoop(stopCh <-chan struct{}) {
 			mesh.cleanupPendingPackets()
 			mesh.renewPortMappingIfNeeded()
 			mesh.requestRelayCandidates()
+			mesh.announceCandidates()
 			mesh.probeKnownCandidates()
 			mesh.reportTrafficDeltas()
 		case <-keepaliveTicker.C:
@@ -1127,6 +1186,24 @@ func (mesh *peerMeshClient) closeSession(message peerControlMessage) {
 	}
 }
 
+func (mesh *peerMeshClient) reusableSessionLocked(peerID int64, now time.Time) *peerMeshSession {
+	if mesh.sessions == nil {
+		return nil
+	}
+	session := mesh.sessions[peerID]
+	if session == nil {
+		return nil
+	}
+	if now.After(session.ExpiresAt) {
+		delete(mesh.sessions, peerID)
+		if mesh.sessionsByID != nil {
+			delete(mesh.sessionsByID, session.ID)
+		}
+		return nil
+	}
+	return session
+}
+
 func (mesh *peerMeshClient) announceCandidates() {
 	candidates := mesh.gatherCandidates()
 	if len(candidates) == 0 {
@@ -1144,29 +1221,43 @@ func (mesh *peerMeshClient) announceCandidates() {
 		mesh.mu.Unlock()
 		return
 	}
-	peers := make([]peerMeshPeer, 0, len(mesh.peers))
+	type announceTarget struct {
+		peer    peerMeshPeer
+		session *peerMeshSession
+	}
+	now := time.Now()
+	peers := make([]announceTarget, 0, len(mesh.peers))
 	for _, peer := range mesh.peers {
 		if peer.Online && strings.TrimSpace(peer.ClientName) != "" {
-			peers = append(peers, *peer)
+			peers = append(peers, announceTarget{
+				peer:    *peer,
+				session: mesh.reusableSessionLocked(peer.ClientID, now),
+			})
 		}
 	}
 	mesh.mu.Unlock()
-	for _, peer := range peers {
+	for _, target := range peers {
 		message := peerControlMessage{
 			Type:             peerControlTypeCandidates,
 			SourceClientID:   runtime.PeerMesh.ClientID,
 			SourceClientName: runtime.PeerMesh.ClientName,
 			SourceVirtualIP:  runtime.PeerMesh.VirtualIP,
 			SourcePublicKey:  runtime.PeerMesh.ClientPublicKey,
-			TargetClientID:   peer.ClientID,
-			TargetClientName: peer.ClientName,
-			TargetVirtualIP:  peer.VirtualIP,
-			TargetPublicKey:  peer.PublicKey,
+			TargetClientID:   target.peer.ClientID,
+			TargetClientName: target.peer.ClientName,
+			TargetVirtualIP:  target.peer.VirtualIP,
+			TargetPublicKey:  target.peer.PublicKey,
 			Candidates:       candidates,
 			CreatedAtMillis:  time.Now().UnixMilli(),
 		}
-		if err := sender(conn, peer.ClientName, message); err != nil {
-			mesh.logger.Printf("Peer Mesh candidates send failed: peer=%s err=%v", peer.ClientName, err)
+		if target.session != nil {
+			sessionID := target.session.ID
+			message.SessionID = &sessionID
+			message.Token = target.session.Token
+			message.ExpiresAt = target.session.ExpiresAt.Format(time.RFC3339Nano)
+		}
+		if err := sender(conn, target.peer.ClientName, message); err != nil {
+			mesh.logger.Printf("Peer Mesh candidates send failed: peer=%s err=%v", target.peer.ClientName, err)
 		}
 	}
 }
