@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  "title": "shuai-tunnel 客户端启动配置",
+  "description": "client.jsonc JSONC 启动配置的跨语言字段约束。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "serverBaseUrl",
+    "apiKey",
+    "secret"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri-reference",
+      "description": "可选的本地或远程 JSON Schema 引用，用于编辑器提示。"
+    },
+    "serverBaseUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://",
+      "description": "服务端管理 HTTP 地址，客户端启动后调用 /api/client/auth/login。"
+    },
+    "apiKey": {
+      "type": "string",
+      "minLength": 1,
+      "description": "管理后台创建的客户端凭证 key。"
+    },
+    "secret": {
+      "type": "string",
+      "minLength": 1,
+      "description": "客户端凭证明文，只在创建或重置时展示一次。"
+    },
+    "peerMeshDevice": {
+      "type": "string",
+      "default": "noop",
+      "enum": [
+        "noop",
+        "linux-tun",
+        "windows-wintun",
+        "wintun",
+        "utun",
+        "mac-utun",
+        "macos-utun",
+        "darwin-utun",
+        "auto"
+      ],
+      "description": "Peer Mesh 虚拟网卡模式。Java 参考客户端当前支持 Linux TUN 与 Windows Wintun；Go/.NET 客户端额外支持 macOS utun；noop 表示不创建虚拟网卡。"
+    },
+    "peerMeshTunName": {
+      "type": "string",
+      "default": "shuai0",
+      "minLength": 1,
+      "description": "Peer Mesh 虚拟网卡名称。"
+    },
+    "peerMeshMtu": {
+      "type": "integer",
+      "default": 1280,
+      "minimum": 576,
+      "maximum": 1280,
+      "description": "Peer Mesh 虚拟网卡 MTU。大于 1280 会被客户端归一化，以避免 UDP 封装后公网路径分片丢包。"
+    }
+  }
+}

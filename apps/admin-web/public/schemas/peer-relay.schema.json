@@ -1,0 +1,383 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tunnel.devshuai.com/schemas/peer-relay.schema.json",
+  "title": "shuai-tunnel Peer Relay UDP JSON",
+  "description": "Peer Mesh STUN/TURN-lite UDP JSON 消息。包含 relay 控制消息和 direct UDP connectivity check。",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/RelayBinding"
+    },
+    {
+      "$ref": "#/$defs/RelayBindingResponse"
+    },
+    {
+      "$ref": "#/$defs/RelayAllocate"
+    },
+    {
+      "$ref": "#/$defs/RelayAllocated"
+    },
+    {
+      "$ref": "#/$defs/RelayRefresh"
+    },
+    {
+      "$ref": "#/$defs/RelaySend"
+    },
+    {
+      "$ref": "#/$defs/RelayData"
+    },
+    {
+      "$ref": "#/$defs/RelayError"
+    },
+    {
+      "$ref": "#/$defs/UdpCheck"
+    },
+    {
+      "$ref": "#/$defs/UdpCheckResponse"
+    }
+  ],
+  "$defs": {
+    "TransactionId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "LongId": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "Port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "RelayBase": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "magic",
+        "type",
+        "transactionId"
+      ],
+      "properties": {
+        "magic": {
+          "const": "shuai-peer-relay"
+        },
+        "type": {
+          "type": "string"
+        },
+        "transactionId": {
+          "$ref": "#/$defs/TransactionId"
+        }
+      }
+    },
+    "UdpProbeBase": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "magic",
+        "type",
+        "sessionId",
+        "fromClientId",
+        "toClientId",
+        "nonce",
+        "token",
+        "sentAtMillis"
+      ],
+      "properties": {
+        "magic": {
+          "const": "shuai-peer-mesh"
+        },
+        "type": {
+          "type": "string"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "fromClientId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "toClientId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "nonce": {
+          "type": "string",
+          "minLength": 1
+        },
+        "token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sentAtMillis": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "RelayBinding": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "binding"
+            },
+            "probeRole": {
+              "type": "string",
+              "enum": [
+                "primary",
+                "alternate",
+                "changed-port"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "RelayBindingResponse": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "probeRole",
+            "mappedAddress",
+            "mappedPort",
+            "observedByAddress",
+            "observedByPort"
+          ],
+          "properties": {
+            "type": {
+              "const": "binding-response"
+            },
+            "probeRole": {
+              "type": "string",
+              "enum": [
+                "primary",
+                "alternate",
+                "changed-port"
+              ]
+            },
+            "mappedAddress": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mappedPort": {
+              "$ref": "#/$defs/Port"
+            },
+            "alternateAddress": {
+              "type": "string"
+            },
+            "alternatePort": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "observedByAddress": {
+              "type": "string",
+              "minLength": 1
+            },
+            "observedByPort": {
+              "$ref": "#/$defs/Port"
+            }
+          }
+        }
+      ]
+    },
+    "RelayAllocate": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "allocate"
+            }
+          }
+        }
+      ]
+    },
+    "RelayAllocated": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "allocationId",
+            "ttlSeconds"
+          ],
+          "properties": {
+            "type": {
+              "const": "allocated"
+            },
+            "allocationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ttlSeconds": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "RelayRefresh": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "allocationId"
+          ],
+          "properties": {
+            "type": {
+              "const": "refresh"
+            },
+            "allocationId": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "RelaySend": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "allocationId",
+            "toAllocationId",
+            "payloadBase64"
+          ],
+          "properties": {
+            "type": {
+              "const": "send"
+            },
+            "allocationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "toAllocationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "payloadBase64": {
+              "type": "string",
+              "contentEncoding": "base64"
+            }
+          }
+        }
+      ]
+    },
+    "RelayData": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "fromAllocationId",
+            "toAllocationId",
+            "payloadBase64"
+          ],
+          "properties": {
+            "type": {
+              "const": "data"
+            },
+            "fromAllocationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "toAllocationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "payloadBase64": {
+              "type": "string",
+              "contentEncoding": "base64"
+            }
+          }
+        }
+      ]
+    },
+    "RelayError": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/RelayBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "error"
+          ],
+          "properties": {
+            "type": {
+              "const": "error"
+            },
+            "error": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "UdpCheck": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/UdpProbeBase"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "check"
+            }
+          }
+        }
+      ]
+    },
+    "UdpCheckResponse": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/UdpProbeBase"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "check-response"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

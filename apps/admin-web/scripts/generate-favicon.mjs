@@ -14,108 +14,54 @@ function putUint32(buffer, offset, value) {
   buffer.writeUInt32LE(value, offset);
 }
 
-function blend(base, overlay, alpha) {
-  return Math.round(base * (1 - alpha) + overlay * alpha);
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
 }
 
-function distanceToSegment(px, py, ax, ay, bx, by) {
-  const dx = bx - ax;
-  const dy = by - ay;
-  const lengthSq = dx * dx + dy * dy;
-  const t = lengthSq === 0 ? 0 : Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lengthSq));
-  const x = ax + t * dx;
-  const y = ay + t * dy;
-  return Math.sqrt((px - x) ** 2 + (py - y) ** 2);
+function roundedRectDistance(px, py, x, y, width, height, radius) {
+  const qx = Math.abs(px - (x + width / 2)) - (width / 2 - radius);
+  const qy = Math.abs(py - (y + height / 2)) - (height / 2 - radius);
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - radius;
+}
+
+function fillCoverage(size, px, py, x, y, width, height, radius) {
+  const antialias = 64 / size;
+  return clamp01(0.5 - roundedRectDistance(px, py, x, y, width, height, radius) / antialias);
+}
+
+function strokeCoverage(size, px, py, x, y, width, height, radius, strokeWidth) {
+  const antialias = 64 / size;
+  const distance = Math.abs(roundedRectDistance(px, py, x, y, width, height, radius)) - strokeWidth / 2;
+  return clamp01(0.5 - distance / antialias);
+}
+
+function paint(pixel, color, coverage) {
+  const sourceAlpha = (color[3] / 255) * coverage;
+  const targetAlpha = pixel[3] / 255;
+  const outputAlpha = sourceAlpha + targetAlpha * (1 - sourceAlpha);
+
+  if (outputAlpha <= 0) {
+    return;
+  }
+
+  pixel[0] = Math.round((color[0] * sourceAlpha + pixel[0] * targetAlpha * (1 - sourceAlpha)) / outputAlpha);
+  pixel[1] = Math.round((color[1] * sourceAlpha + pixel[1] * targetAlpha * (1 - sourceAlpha)) / outputAlpha);
+  pixel[2] = Math.round((color[2] * sourceAlpha + pixel[2] * targetAlpha * (1 - sourceAlpha)) / outputAlpha);
+  pixel[3] = Math.round(outputAlpha * 255);
 }
 
 function colorAt(size, x, y) {
-  const radius = size * 0.22;
-  const inside =
-    (x >= radius || y >= radius || (x - radius) ** 2 + (y - radius) ** 2 <= radius ** 2) &&
-    (x <= size - radius || y >= radius || (x - (size - radius)) ** 2 + (y - radius) ** 2 <= radius ** 2) &&
-    (x >= radius || y <= size - radius || (x - radius) ** 2 + (y - (size - radius)) ** 2 <= radius ** 2) &&
-    (x <= size - radius || y <= size - radius || (x - (size - radius)) ** 2 + (y - (size - radius)) ** 2 <= radius ** 2);
+  const px = (x / size) * 64;
+  const py = (y / size) * 64;
+  const pixel = [0, 0, 0, 0];
 
-  if (!inside) {
-    return [0, 0, 0, 0];
-  }
+  paint(pixel, [20, 22, 31, 255], fillCoverage(size, px, py, 0, 0, 64, 64, 14));
+  paint(pixel, [242, 243, 247, 255], strokeCoverage(size, px, py, 10.5, 10.5, 43, 43, 12, 4));
+  paint(pixel, [242, 243, 247, 158], strokeCoverage(size, px, py, 18, 18, 28, 28, 8.5, 4));
+  paint(pixel, [242, 243, 247, 87], strokeCoverage(size, px, py, 24.5, 24.5, 15, 15, 5.5, 4));
+  paint(pixel, [155, 130, 255, 255], fillCoverage(size, px, py, 29, 29, 6, 6, 2));
 
-  const t = (x + y) / (size * 2);
-  let r = blend(7, 5, t);
-  let g = blend(17, 7, t);
-  let b = blend(31, 12, t);
-  let a = 255;
-
-  const px = x / size;
-  const py = y / size;
-  const lineWidth = size <= 16 ? 0.07 : 0.048;
-  const ringWidth = size <= 16 ? 0.16 : 0.11;
-  const ellipse = Math.sqrt(((px - 0.5) / 0.18) ** 2 + ((py - 0.5) / 0.27) ** 2);
-  const portalFill = ellipse < 0.92;
-  const tunnelRing = Math.abs(ellipse - 1) < ringWidth;
-  const innerRing = Math.abs(ellipse - 0.52) < ringWidth * 0.65;
-  const ingress = distanceToSegment(px, py, 0.16, 0.5, 0.38, 0.5) < lineWidth;
-  const httpRoute =
-    Math.min(
-      distanceToSegment(px, py, 0.58, 0.43, 0.72, 0.32),
-      distanceToSegment(px, py, 0.72, 0.32, 0.84, 0.31),
-    ) < lineWidth;
-  const tcpRoute =
-    Math.min(
-      distanceToSegment(px, py, 0.58, 0.57, 0.72, 0.68),
-      distanceToSegment(px, py, 0.72, 0.68, 0.84, 0.69),
-    ) < lineWidth;
-  const ingressNode = (px - 0.16) ** 2 + (py - 0.5) ** 2 < 0.0044;
-  const httpNode = (px - 0.84) ** 2 + (py - 0.31) ** 2 < 0.0044;
-  const tcpNode = (px - 0.84) ** 2 + (py - 0.69) ** 2 < 0.0044;
-
-  if (portalFill) {
-    r = 8;
-    g = 47;
-    b = 73;
-  }
-  if (ingress) {
-    r = 240;
-    g = 253;
-    b = 255;
-  }
-  if (httpRoute) {
-    r = 34;
-    g = 211;
-    b = 238;
-  }
-  if (tcpRoute) {
-    r = 251;
-    g = 191;
-    b = 36;
-  }
-  if (tunnelRing) {
-    r = 103;
-    g = 232;
-    b = 249;
-  }
-  if (innerRing) {
-    r = 186;
-    g = 230;
-    b = 253;
-  }
-  if (ingressNode) {
-    r = 248;
-    g = 250;
-    b = 252;
-  }
-  if (httpNode) {
-    r = 103;
-    g = 232;
-    b = 249;
-  }
-  if (tcpNode) {
-    r = 251;
-    g = 191;
-    b = 36;
-  }
-
-  return [r, g, b, a];
+  return pixel;
 }
 
 function createDib(size) {

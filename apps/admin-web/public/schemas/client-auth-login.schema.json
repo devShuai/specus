@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tunnel.devshuai.com/schemas/client-auth-login.schema.json",
+  "title": "shuai-tunnel 客户端 HTTP 登录",
+  "description": "POST /api/client/auth/login 的请求和响应字段约束。",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/LoginRequest"
+    },
+    {
+      "$ref": "#/$defs/LoginResponse"
+    }
+  ],
+  "$defs": {
+    "NonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "LongId": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "Port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "HmacSha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "EpochMillisString": {
+      "type": "string",
+      "pattern": "^[0-9]{10,17}$"
+    },
+    "IsoInstantString": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Base64String": {
+      "type": "string",
+      "contentEncoding": "base64"
+    },
+    "IpAddress": {
+      "type": "string",
+      "anyOf": [
+        {
+          "format": "ipv4"
+        },
+        {
+          "format": "ipv6"
+        }
+      ]
+    },
+    "ClientEnvironmentInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "machineFingerprint",
+        "osUser"
+      ],
+      "properties": {
+        "machineFingerprint": {
+          "$ref": "#/$defs/NonEmptyString",
+          "description": "机器稳定指纹，优先来自用户目录 .shuai-tunnel/machine-id。"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "osUser": {
+          "$ref": "#/$defs/NonEmptyString",
+          "description": "操作系统用户。"
+        },
+        "osName": {
+          "type": "string"
+        },
+        "osVersion": {
+          "type": "string"
+        },
+        "osArch": {
+          "type": "string"
+        },
+        "clientVersion": {
+          "type": "string"
+        },
+        "javaVersion": {
+          "type": "string"
+        },
+        "peerPublicKey": {
+          "$ref": "#/$defs/Base64String",
+          "description": "Peer Mesh X25519 public key，未启用时可为空或缺省。"
+        },
+        "localAddresses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "LoginRequest": {
+      "title": "ClientAuthLoginRequest",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "apiKey",
+        "timestamp",
+        "nonce",
+        "signature",
+        "environment"
+      ],
+      "properties": {
+        "apiKey": {
+          "$ref": "#/$defs/NonEmptyString"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/EpochMillisString"
+        },
+        "nonce": {
+          "$ref": "#/$defs/NonEmptyString"
+        },
+        "signature": {
+          "$ref": "#/$defs/HmacSha256Hex"
+        },
+        "environment": {
+          "$ref": "#/$defs/ClientEnvironmentInfo"
+        }
+      }
+    },
+    "ClientPolicy": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "billingStatus": {
+          "type": "string",
+          "default": "ACTIVE"
+        },
+        "retryAfterSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    },
+    "TunnelEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "port",
+        "tunnelAddress",
+        "tunnelPort"
+      ],
+      "properties": {
+        "port": {
+          "$ref": "#/$defs/Port",
+          "description": "服务端公网监听端口。"
+        },
+        "tunnelAddress": {
+          "$ref": "#/$defs/NonEmptyString",
+          "description": "客户端侧目标地址。"
+        },
+        "tunnelPort": {
+          "$ref": "#/$defs/Port",
+          "description": "客户端侧目标端口。"
+        }
+      }
+    },
+    "HttpRouteEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route",
+        "targetBaseUrl"
+      ],
+      "properties": {
+        "route": {
+          "$ref": "#/$defs/NonEmptyString"
+        },
+        "targetBaseUrl": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://"
+        }
+      }
+    },
+    "PeerMeshConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "clientId": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "clientName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "virtualIp": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ipv4"
+        },
+        "cidr": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+        },
+        "stunHost": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stunPort": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "turnHost": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnPort": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "iceUsername": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iceCredential": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "serverPublicKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientPublicKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionTtlSeconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "LoginResponse": {
+      "title": "ClientAuthLoginResponse",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tenantId",
+        "clientId",
+        "clientName",
+        "clientSessionId",
+        "accessToken",
+        "tokenTtlSeconds",
+        "nettyHost",
+        "nettyPort",
+        "maxOnlineInstances",
+        "policy",
+        "peerMesh",
+        "tunnelConfigList",
+        "httpTunnelConfigList"
+      ],
+      "properties": {
+        "tenantId": {
+          "$ref": "#/$defs/NonEmptyString"
+        },
+        "clientId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "clientName": {
+          "$ref": "#/$defs/NonEmptyString"
+        },
+        "clientSessionId": {
+          "$ref": "#/$defs/LongId"
+        },
+        "accessToken": {
+          "$ref": "#/$defs/NonEmptyString"
+        },
+        "tokenTtlSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nettyHost": {
+          "$ref": "#/$defs/NonEmptyString"
+        },
+        "nettyPort": {
+          "$ref": "#/$defs/Port"
+        },
+        "maxOnlineInstances": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2
+        },
+        "policy": {
+          "$ref": "#/$defs/ClientPolicy"
+        },
+        "peerMesh": {
+          "$ref": "#/$defs/PeerMeshConfig"
+        },
+        "tunnelConfigList": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TunnelEndpoint"
+          }
+        },
+        "httpTunnelConfigList": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HttpRouteEndpoint"
+          }
+        }
+      }
+    }
+  }
+}
