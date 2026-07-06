@@ -14,6 +14,10 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -34,6 +38,7 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
     private volatile int fd = -1;
     private volatile String ifName;
     private volatile Thread readerThread;
+    private final Set<String> syncedPeerRoutes = ConcurrentHashMap.newKeySet();
 
     LinuxTunPeerVirtualDevice(PeerVirtualDeviceOptions options, ClientAuthLoginResponse.PeerMeshConfig config) {
         this.options = options;
@@ -71,6 +76,21 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
     }
 
     @Override
+    public synchronized void syncPeerRoutes(Collection<String> peerVirtualIps) {
+        Set<String> desired = normalizePeerRoutes(peerVirtualIps);
+        for (String routeIp : new HashSet<>(syncedPeerRoutes)) {
+            if (!desired.contains(routeIp)) {
+                deletePeerRoute(routeIp);
+            }
+        }
+        for (String routeIp : desired) {
+            if (!syncedPeerRoutes.contains(routeIp)) {
+                addPeerRoute(routeIp);
+            }
+        }
+    }
+
+    @Override
     public void writePacket(byte[] packet) {
         int current = fd;
         if (current < 0 || packet == null || packet.length == 0) {
@@ -88,6 +108,11 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
 
     @Override
     public synchronized void close() {
+        try {
+            syncPeerRoutes(Set.of());
+        } catch (Exception e) {
+            log.debug("Peer mesh Linux TUN 清理 peer routes 失败: {}", e.getMessage());
+        }
         running.set(false);
         int current = fd;
         fd = -1;
@@ -121,10 +146,43 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
     }
 
     private void configureInterface(String name, String virtualIp, String cidr, int mtu) {
-        String prefix = cidrPrefix(cidr);
-        runCommand(Duration.ofSeconds(10), "ip", "addr", "replace", virtualIp + "/" + prefix, "dev", name);
+        runCommand(Duration.ofSeconds(10), "ip", "addr", "replace", virtualIp + "/32", "dev", name);
         runCommand(Duration.ofSeconds(10), "ip", "link", "set", "dev", name, "mtu", String.valueOf(mtu), "up");
-        runCommand(Duration.ofSeconds(10), "ip", "route", "replace", cidr, "dev", name);
+        if (StringUtils.hasText(cidr)) {
+            runCommandQuiet(Duration.ofSeconds(5), "ip", "route", "del", cidr, "dev", name);
+        }
+    }
+
+    private Set<String> normalizePeerRoutes(Collection<String> peerVirtualIps) {
+        Set<String> desired = new HashSet<>();
+        if (peerVirtualIps == null) {
+            return desired;
+        }
+        for (String peerVirtualIp : peerVirtualIps) {
+            String normalized = peerVirtualIp == null ? "" : peerVirtualIp.trim();
+            if (isIpv4(normalized) && !normalized.equals(config.getVirtualIp())) {
+                desired.add(normalized);
+            }
+        }
+        return desired;
+    }
+
+    private void addPeerRoute(String peerVirtualIp) {
+        String route = peerVirtualIp + "/32";
+        try {
+            runCommand(Duration.ofSeconds(10), "ip", "route", "replace", route, "dev", name());
+            syncedPeerRoutes.add(peerVirtualIp);
+            log.debug("Peer mesh Linux TUN peer route 已同步: {}", route);
+        } catch (Exception e) {
+            log.warn("Peer mesh Linux TUN 添加 peer route 失败: route={}, reason={}", route, e.getMessage());
+        }
+    }
+
+    private void deletePeerRoute(String peerVirtualIp) {
+        String route = peerVirtualIp + "/32";
+        runCommandQuiet(Duration.ofSeconds(5), "ip", "route", "del", route, "dev", name());
+        syncedPeerRoutes.remove(peerVirtualIp);
+        log.debug("Peer mesh Linux TUN peer route 已移除: {}", route);
     }
 
     private void readLoop(PacketHandler outboundHandler) {
@@ -152,12 +210,25 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
         return new String(bytes, 0, length, StandardCharsets.US_ASCII);
     }
 
-    private String cidrPrefix(String cidr) {
-        int slash = cidr == null ? -1 : cidr.indexOf('/');
-        if (slash < 0 || slash == cidr.length() - 1) {
-            throw new IllegalArgumentException("peer mesh cidr 无效: " + cidr);
+    private boolean isIpv4(String value) {
+        if (!StringUtils.hasText(value)) {
+            return false;
         }
-        return cidr.substring(slash + 1);
+        String[] parts = value.split("\\.", -1);
+        if (parts.length != 4) {
+            return false;
+        }
+        for (String part : parts) {
+            try {
+                int octet = Integer.parseInt(part);
+                if (octet < 0 || octet > 255) {
+                    return false;
+                }
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void runCommand(Duration timeout, String... command) {
@@ -180,6 +251,16 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
             throw new IllegalStateException("命令被中断: " + String.join(" ", command), e);
         } catch (Exception e) {
             throw new IllegalStateException("配置 Linux TUN 失败: " + e.getMessage(), e);
+        }
+    }
+
+    private boolean runCommandQuiet(Duration timeout, String... command) {
+        try {
+            runCommand(timeout, command);
+            return true;
+        } catch (Exception e) {
+            log.debug("忽略命令失败: {} {}", String.join(" ", command), e.getMessage());
+            return false;
         }
     }
 

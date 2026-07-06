@@ -17,7 +17,11 @@ import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -32,6 +36,7 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
     private volatile Pointer adapter;
     private volatile Pointer session;
     private volatile Thread readerThread;
+    private final Set<String> syncedPeerRoutes = ConcurrentHashMap.newKeySet();
 
     WindowsWintunPeerVirtualDevice(PeerVirtualDeviceOptions options, ClientAuthLoginResponse.PeerMeshConfig config) {
         this.options = options;
@@ -83,6 +88,21 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
     }
 
     @Override
+    public synchronized void syncPeerRoutes(Collection<String> peerVirtualIps) {
+        Set<String> desired = normalizePeerRoutes(peerVirtualIps);
+        for (String routeIp : new HashSet<>(syncedPeerRoutes)) {
+            if (!desired.contains(routeIp)) {
+                deletePeerRoute(routeIp);
+            }
+        }
+        for (String routeIp : desired) {
+            if (!syncedPeerRoutes.contains(routeIp)) {
+                addPeerRoute(routeIp);
+            }
+        }
+    }
+
+    @Override
     public void writePacket(byte[] packet) {
         Wintun api = wintun;
         Pointer currentSession = session;
@@ -99,6 +119,11 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
 
     @Override
     public synchronized void close() {
+        try {
+            syncPeerRoutes(Set.of());
+        } catch (Exception e) {
+            log.debug("Peer mesh Wintun 清理 peer routes 失败: {}", e.getMessage());
+        }
         running.set(false);
         Wintun api = wintun;
         Pointer currentSession = session;
@@ -213,21 +238,50 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
     }
 
     private void configureInterface(String name, String virtualIp, String cidr, int mtu) {
-        String mask = ipv4Mask(cidrPrefix(cidr));
         runCommand(Duration.ofSeconds(10), "netsh", "interface", "ip", "set", "address",
-                "name=" + name, "static", virtualIp, mask);
+                "name=" + name, "static", virtualIp, ipv4Mask(32));
         runCommand(Duration.ofSeconds(10), "netsh", "interface", "ipv4", "set", "subinterface",
                 name, "mtu=" + mtu, "store=active");
-        runCommand(Duration.ofSeconds(10), "netsh", "interface", "ipv4", "add", "route",
-                cidr, name, "store=active");
+        if (StringUtils.hasText(cidr)) {
+            runCommandQuiet(Duration.ofSeconds(5), "netsh", "interface", "ipv4", "delete", "route",
+                    cidr, name, "store=active");
+        }
     }
 
-    private int cidrPrefix(String cidr) {
-        int slash = cidr == null ? -1 : cidr.indexOf('/');
-        if (slash < 0 || slash == cidr.length() - 1) {
-            throw new IllegalArgumentException("peer mesh cidr 无效: " + cidr);
+    private Set<String> normalizePeerRoutes(Collection<String> peerVirtualIps) {
+        Set<String> desired = new HashSet<>();
+        if (peerVirtualIps == null) {
+            return desired;
         }
-        return Integer.parseInt(cidr.substring(slash + 1));
+        for (String peerVirtualIp : peerVirtualIps) {
+            String normalized = peerVirtualIp == null ? "" : peerVirtualIp.trim();
+            if (isIpv4(normalized) && !normalized.equals(config.getVirtualIp())) {
+                desired.add(normalized);
+            }
+        }
+        return desired;
+    }
+
+    private void addPeerRoute(String peerVirtualIp) {
+        String route = peerVirtualIp + "/32";
+        runCommandQuiet(Duration.ofSeconds(5), "netsh", "interface", "ipv4", "delete", "route",
+                route, name(), "store=active");
+        try {
+            runCommand(Duration.ofSeconds(10), "netsh", "interface", "ipv4", "add", "route",
+                    route, name(), "store=active");
+            syncedPeerRoutes.add(peerVirtualIp);
+            log.debug("Peer mesh Wintun peer route 已同步: {}", route);
+        } catch (Exception e) {
+            log.warn("Peer mesh Wintun 添加 peer route 失败: route={}, reason={}", route, e.getMessage());
+        }
+    }
+
+    private void deletePeerRoute(String peerVirtualIp) {
+        String route = peerVirtualIp + "/32";
+        runCommandQuiet(Duration.ofSeconds(5), "netsh", "interface", "ipv4", "delete", "route",
+                route, name(), "store=active");
+        syncedPeerRoutes.remove(peerVirtualIp);
+        log.debug("Peer mesh Wintun peer route 已移除: {}", route);
     }
 
     private String ipv4Mask(int prefix) {
@@ -239,6 +293,27 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
                 + ((mask >>> 16) & 0xFF) + "."
                 + ((mask >>> 8) & 0xFF) + "."
                 + (mask & 0xFF);
+    }
+
+    private boolean isIpv4(String value) {
+        if (!StringUtils.hasText(value)) {
+            return false;
+        }
+        String[] parts = value.split("\\.", -1);
+        if (parts.length != 4) {
+            return false;
+        }
+        for (String part : parts) {
+            try {
+                int octet = Integer.parseInt(part);
+                if (octet < 0 || octet > 255) {
+                    return false;
+                }
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void runCommand(Duration timeout, String... command) {
@@ -261,6 +336,16 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
             throw new IllegalStateException("命令被中断: " + String.join(" ", command), e);
         } catch (Exception e) {
             throw new IllegalStateException("配置 Wintun 失败: " + e.getMessage(), e);
+        }
+    }
+
+    private boolean runCommandQuiet(Duration timeout, String... command) {
+        try {
+            runCommand(timeout, command);
+            return true;
+        } catch (Exception e) {
+            log.debug("忽略命令失败: {} {}", String.join(" ", command), e.getMessage());
+            return false;
         }
     }
 

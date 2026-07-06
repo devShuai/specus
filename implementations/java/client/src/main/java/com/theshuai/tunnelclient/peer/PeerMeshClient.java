@@ -62,6 +62,7 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile Thread receiverThread;
     private volatile PeerVirtualDevice virtualDevice = new NoopPeerVirtualDevice();
     private volatile String virtualDeviceKey = "noop";
+    private volatile String runtimeConfigKey = "";
     private volatile PeerCandidate serverReflexiveCandidate;
     private final Map<String, PeerCandidate> serverReflexiveCandidates = new ConcurrentHashMap<>();
     private volatile PeerCandidate relayCandidate;
@@ -120,12 +121,13 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     public synchronized void startOrUpdate(ClientAuthLoginResponse.PeerMeshConfig nextConfig) {
-        this.config = nextConfig;
         if (nextConfig == null || !nextConfig.isEnabled()) {
+            this.config = nextConfig;
             if (running) {
                 log.info("Peer mesh 已关闭");
             }
             running = false;
+            runtimeConfigKey = "";
             peers.clear();
             sessions.clear();
             sessionsById.clear();
@@ -154,12 +156,27 @@ public class PeerMeshClient implements AutoCloseable {
             closeVirtualDevice();
             return;
         }
+        String nextRuntimeConfigKey = runtimeConfigKey(nextConfig);
+        boolean sameRuntimeConfig = running && Objects.equals(runtimeConfigKey, nextRuntimeConfigKey);
+        this.config = nextConfig;
+        if (sameRuntimeConfig && !isFallbackVirtualDevice() && isUdpSocketReady()) {
+            syncVirtualDeviceRoutes();
+            requestPeerServerCandidates();
+            announceCandidatesToOnlinePeers();
+            log.debug("Peer mesh 配置未变化，已执行轻量刷新: client={}, virtualIp={}",
+                    nextConfig.getClientName(), nextConfig.getVirtualIp());
+            return;
+        }
         running = true;
+        runtimeConfigKey = nextRuntimeConfigKey;
         startUdpSocket();
-        tryAcquirePortMappingAsync();
+        if (!sameRuntimeConfig || portMapping == null) {
+            tryAcquirePortMappingAsync();
+        }
         startMaintenance();
         requestPeerServerCandidates();
         PeerVirtualDevice activeDevice = startVirtualDevice(nextConfig);
+        syncVirtualDeviceRoutes();
         log.info("Peer mesh 已启用: client={}, virtualIp={}, cidr={}, stun={}:{}, turn={}, publicStun={}",
                 nextConfig.getClientName(),
                 nextConfig.getVirtualIp(),
@@ -247,13 +264,64 @@ public class PeerMeshClient implements AutoCloseable {
             }
         }
         log.info("Peer mesh 可互联客户端刷新: {} 个", peers.size());
+        syncVirtualDeviceRoutes();
         refreshSessionKeys();
         announceCandidatesToOnlinePeers();
+    }
+
+    private String runtimeConfigKey(ClientAuthLoginResponse.PeerMeshConfig value) {
+        if (value == null || !value.isEnabled()) {
+            return "disabled";
+        }
+        List<String> publicStun = value.getPublicStunServers() == null
+                ? List.of()
+                : value.getPublicStunServers();
+        return PeerVirtualDevices.key(virtualDeviceOptions, value)
+                + "|" + value.getClientId()
+                + "|" + value.getClientName()
+                + "|" + value.getStunHost()
+                + "|" + value.getStunPort()
+                + "|" + value.getTurnHost()
+                + "|" + value.getTurnPort()
+                + "|" + String.join(",", publicStun);
+    }
+
+    private boolean isFallbackVirtualDevice() {
+        return virtualDeviceKey != null && virtualDeviceKey.startsWith("fallback|");
+    }
+
+    private boolean isUdpSocketReady() {
+        DatagramSocket socket = udpSocket;
+        return socket != null && !socket.isClosed();
+    }
+
+    private void syncVirtualDeviceRoutes() {
+        PeerVirtualDevice device = virtualDevice;
+        ClientAuthLoginResponse.PeerMeshConfig current = config;
+        if (device == null || current == null) {
+            return;
+        }
+        List<String> routeIps = peers.values().stream()
+                .filter(PeerInfo::online)
+                .map(PeerInfo::virtualIp)
+                .filter(StringUtils::hasText)
+                .map(String::trim)
+                .filter(ip -> !ip.equals(current.getVirtualIp()))
+                .distinct()
+                .sorted()
+                .toList();
+        try {
+            device.syncPeerRoutes(routeIps);
+        } catch (Exception e) {
+            log.warn("Peer mesh 同步 peer routes 失败: device={}, routes={}, reason={}",
+                    device.name(), routeIps.size(), e.getMessage());
+        }
     }
 
     @Override
     public void close() {
         running = false;
+        runtimeConfigKey = "";
         peers.clear();
         sessions.clear();
         sessionsById.clear();
@@ -2076,8 +2144,66 @@ public class PeerMeshClient implements AutoCloseable {
             log.trace("Peer mesh 忽略非 IPv4 或无效 IP 包");
             return false;
         }
+        if (shouldIgnoreVirtualPacketTarget(targetVirtualIp)) {
+            logIgnoredVirtualPacket(targetVirtualIp, "non-peer-unicast");
+            return false;
+        }
+        if (!isKnownOnlinePeerVirtualIp(targetVirtualIp)) {
+            logIgnoredVirtualPacket(targetVirtualIp, "unknown-peer-route");
+            return false;
+        }
         tracePacket("outbound-from-tun", ipv4Packet);
         return sendEncryptedPayload(targetVirtualIp, ipv4Packet);
+    }
+
+    private boolean isKnownOnlinePeerVirtualIp(String targetVirtualIp) {
+        return peers.values().stream()
+                .anyMatch(peer -> peer.online() && targetVirtualIp.equals(peer.virtualIp()));
+    }
+
+    private boolean shouldIgnoreVirtualPacketTarget(String targetVirtualIp) {
+        Long ip = ipv4ToLong(targetVirtualIp);
+        if (ip == null) {
+            return true;
+        }
+        int firstOctet = (int) ((ip >>> 24) & 0xFF);
+        if (firstOctet >= 224 || firstOctet == 0 || targetVirtualIp.equals("255.255.255.255")) {
+            return true;
+        }
+        ClientAuthLoginResponse.PeerMeshConfig current = config;
+        if (current != null && targetVirtualIp.equals(current.getVirtualIp())) {
+            return true;
+        }
+        return isMeshBoundaryAddress(targetVirtualIp);
+    }
+
+    private boolean isMeshBoundaryAddress(String targetVirtualIp) {
+        ClientAuthLoginResponse.PeerMeshConfig current = config;
+        if (current == null || !StringUtils.hasText(current.getCidr())) {
+            return false;
+        }
+        String[] parts = current.getCidr().split("/", 2);
+        if (parts.length != 2) {
+            return false;
+        }
+        Long ip = ipv4ToLong(targetVirtualIp);
+        Long base = ipv4ToLong(parts[0]);
+        if (ip == null || base == null) {
+            return false;
+        }
+        int prefix;
+        try {
+            prefix = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (prefix < 0 || prefix >= 31) {
+            return false;
+        }
+        long mask = prefix == 0 ? 0 : (0xFFFF_FFFFL << (32 - prefix)) & 0xFFFF_FFFFL;
+        long network = base & mask;
+        long broadcast = network | (~mask & 0xFFFF_FFFFL);
+        return ip == network || ip == broadcast;
     }
 
     private void queuePendingPacket(PeerInfo peer, byte[] payload) {
@@ -2184,6 +2310,18 @@ public class PeerMeshClient implements AutoCloseable {
         }
         payloadDropLogMillis.put(key, now);
         log.warn("Peer mesh 虚拟包未发送: target={}, reason={}, peers={}, sessions={}",
+                targetVirtualIp, reason, peers.size(), sessions.size());
+    }
+
+    private void logIgnoredVirtualPacket(String targetVirtualIp, String reason) {
+        long now = System.currentTimeMillis();
+        String key = "ignored|" + targetVirtualIp + "|" + reason;
+        Long previous = payloadDropLogMillis.get(key);
+        if (previous != null && now - previous < 30_000) {
+            return;
+        }
+        payloadDropLogMillis.put(key, now);
+        log.debug("Peer mesh 忽略非对端虚拟包: target={}, reason={}, peers={}, sessions={}",
                 targetVirtualIp, reason, peers.size(), sessions.size());
     }
 
@@ -2456,6 +2594,7 @@ public class PeerMeshClient implements AutoCloseable {
                     nextCandidates
             );
         });
+        syncVirtualDeviceRoutes();
     }
 
     private String firstText(String first, String fallback) {
