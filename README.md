@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo/logo.svg" alt="shuai-tunnel" width="320" />
+</p>
+
 # shuai-tunnel
 
 `shuai-tunnel` 是一个以内网服务接入和私有组网为核心的多语言项目。Java 版本是当前基准实现；Go、C#、C 版本按同一协议对齐。它在公网服务端和内网客户端之间维护控制连接，并在收到映射配置后，将公网 TCP/HTTP 流量转发到客户端可访问的本地服务；Peer Mesh 让同一用户下的多个客户端通过虚拟 IP 互访，数据面优先走 UDP direct，失败时回退到服务端标准 TURN relay。
@@ -25,7 +29,7 @@ flowchart TD
 核心流程：
 
 1. `tunnel-server` 启动 Spring Boot 应用，并在 `7010` 端口监听客户端控制连接。
-2. `tunnel-client` 读取工作目录下的 `tunnelClientConfig.json`，先通过 HTTP `apiKey/secret` 登录，获取运行时 `clientName`、`accessToken`、控制连接地址和初始配置。
+2. `tunnel-client` 读取工作目录下的 `client.jsonc`（JSONC），先通过 HTTP `apiKey/secret` 登录，获取运行时 `clientName`、`accessToken`、控制连接地址和初始配置。
 3. 客户端建立 Netty 控制连接并发送 `LOGIN_REQUEST`，服务端校验 token 后绑定在线会话。
 4. 服务端向客户端发送 `NAT_CONTROL` 消息后，客户端动态添加 `NatClientHandler` 并注册端口映射。
 5. 服务端为每个公网映射端口创建一个 `TcpServer`。
@@ -46,7 +50,7 @@ flowchart TD
 | `implementations/go/client` | Go 内网客户端，与 Java 客户端使用相同配置和紧凑二进制协议 |
 | `implementations/csharp/protocol` | .NET 协议库，server/client 共同 ProjectReference 复用 |
 | `implementations/csharp/server` | .NET 服务端移植(EF Core,多库) |
-| `implementations/csharp/client` | .NET 内网客户端，与 Java/Go 客户端字节兼容 |
+| `implementations/csharp/client` | .NET 内网客户端（CLI + Windows WPF 桌面客户端），与 Java/Go 客户端字节兼容 |
 | `implementations/c/server` | C 服务端轻量移植 |
 
 主要入口：
@@ -55,7 +59,8 @@ flowchart TD
 - 服务端(Go)：`implementations/go/server/cmd/shuai-tunnel-server/main.go`
 - 客户端(Java)：`implementations/java/client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`
 - 客户端(Go)：`implementations/go/client/cmd/shuai-tunnel-client/main.go`
-- 客户端(.NET)：`implementations/csharp/client/src/ShuaiTunnel.Client/Program.cs`
+- 客户端(.NET CLI)：`implementations/csharp/client/src/ShuaiTunnel.Client/Program.cs`
+- 客户端(.NET 桌面)：`implementations/csharp/client/src/ShuaiTunnel.Client.Desktop/MainWindow.xaml`
 - 管理后台前端：`apps/admin-web/`(`npm run dev` / `npm run deploy:java|go|csharp`)
 - 协议实现：`implementations/java/common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
 
@@ -65,6 +70,7 @@ flowchart TD
 - Maven 3.x
 - Node.js / npm（构建服务端管理后台静态资源时需要）
 - Go 1.26（仅构建 Go 实现时需要）
+- .NET 10 SDK（仅构建 .NET 实现时需要；Windows 桌面客户端目标框架为 `net10.0-windows`）
 
 根目录 `pom.xml` 将 Java 编译版本设置为 `21`。仓库中的 Maven Wrapper 脚本没有可执行权限，且未提交 `.mvn` 目录，因此建议使用本机安装的 Maven。
 
@@ -86,6 +92,8 @@ mvn clean install "-Dtunnel.server.web.skip=true"
 ```
 
 Go / C# server 构建各自处理自己的前端产物：C# 项目构建时执行 `npm run deploy:csharp`；Go server 使用 `go generate ./web` 执行 `npm run deploy:go` 后再 `go build`，这样不会改动其它 server 的静态目录。
+
+.NET 实现统一使用 `net10.0`；CLI 客户端、服务端和 Windows 桌面客户端可在对应 `implementations/csharp/*` 目录下用 `dotnet build` / `dotnet run` 构建运行。
 
 ## 启动
 
@@ -117,10 +125,12 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 
 ### 2. 配置并启动客户端
 
-客户端从当前工作目录读取 `tunnelClientConfig.json`。在 `implementations/java/client` 目录中创建或修改该文件：
+客户端从当前工作目录读取 `client.jsonc`。该文件使用 JSONC 语法，支持 `//` / `/* */` 注释和尾逗号。在 `implementations/java/client` 目录中创建或修改该文件：
 
-```json
+```jsonc
 {
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // 服务端管理 HTTP 地址
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "demo-client",
   "secret": "test1234",
@@ -141,7 +151,7 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `shuai0` |
 | `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化，避免 UDP 封装后公网路径分片丢包 |
 
-> 完整示例见 `implementations/java/client/tunnelClientConfig.example.json` 和 `implementations/go/client/tunnelClientConfig.example.json`。
+> 完整示例见 `implementations/java/client/client.example.jsonc`、`implementations/go/client/client.example.jsonc` 和 `implementations/csharp/client/src/ShuaiTunnel.Client/client.example.jsonc`。
 
 启动客户端：
 
@@ -151,6 +161,35 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 ```
 
 Java 客户端使用 `WebApplicationType.NONE`，不启动 Spring Web，也不监听 HTTP 端口；同机运行服务端和客户端时不再需要为客户端覆盖 `server.port`。
+
+Go / .NET CLI 客户端使用同一份配置结构。
+
+Go 客户端：
+
+```bash
+cd implementations/go/client
+go run ./cmd/shuai-tunnel-client
+```
+
+.NET CLI 客户端：
+
+```bash
+cd implementations/csharp/client
+dotnet run --project src/ShuaiTunnel.Client -- --config client.jsonc
+```
+
+Windows 桌面客户端提供图形化连接入口，不需要手写 `client.jsonc`：在界面填写 `serverBaseUrl`、`apiKey`、`secret`、Peer Mesh 虚拟网卡模式、网卡名和 MTU 后点击连接。它会保存配置到 `%APPDATA%\ShuaiTunnel\desktop-client.json`，并展示当前客户端名、控制端地址、TCP 路由、HTTP 路由、Peer Mesh 对端、活跃 session 和运行日志。主题支持跟随系统、浅色和深色。
+
+```powershell
+cd implementations/csharp/client
+dotnet run --project src/ShuaiTunnel.Client.Desktop
+
+# 发布 win-x64 单文件桌面包
+powershell -ExecutionPolicy Bypass -File scripts\publish-desktop-win-x64.ps1
+.\out\desktop-win-x64\shuai-tunnel-desktop.exe
+```
+
+如果桌面客户端用 `windows-wintun` 或 `auto` 创建 Peer Mesh 虚拟网卡，需要管理员权限；发布产物会带上 `native/windows/<arch>/wintun.dll`，也可以通过 `SHUAI_PEER_MESH_WINTUN_DLL` 覆盖 Wintun DLL 路径。
 
 ### 3. 下发端口映射
 
@@ -450,6 +489,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled` 管理字段以及 HTTP 路由的 `pathRewriteEnabled` 配置和回包路径改写行为
 - Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
 - Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 只保留轻量兼容面
+- .NET Windows 桌面客户端已接入同一套 .NET 客户端运行时，支持保存连接配置、启动/停止客户端、查看 TCP/HTTP 路由和 Peer Mesh 状态、活跃 session、运行日志，以及跟随系统/浅色/深色主题
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 实现边界：
