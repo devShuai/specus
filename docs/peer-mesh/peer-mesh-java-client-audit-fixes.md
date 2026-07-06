@@ -107,6 +107,6 @@ STUN binding 事务 entry 只在收到 success 响应时移除;STUN 服务器不
 
 ## 相关文档
 
-* 实现全貌与部署验收:`docs/peer-mesh-implementation.md`
-* 打洞技术调研:`docs/direct-connect-hole-punching-research.md`
-* 跨语言对齐计划:`docs/cross-language-java-alignment-plan.md`
+* 实现全貌与部署验收:`docs/peer-mesh/peer-mesh-implementation.md`
+* 打洞技术调研:`docs/peer-mesh/direct-connect-hole-punching-research.md`
+* 跨语言对齐计划:`docs/cross-language/cross-language-java-alignment-plan.md`

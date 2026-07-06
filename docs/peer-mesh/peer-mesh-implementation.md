@@ -223,4 +223,4 @@ ping 100.96.x.y
 
 ## 相关记录
 
-* Java 客户端打洞审计与修复(2026-07,含 roster 候选保留、keepalive burst、endpoint 粘滞、广播去重、`/api/admin/peer-mesh/stats` 聚合统计):`docs/peer-mesh-java-client-audit-fixes.md`
+* Java 客户端打洞审计与修复(2026-07,含 roster 候选保留、keepalive burst、endpoint 粘滞、广播去重、`/api/admin/peer-mesh/stats` 聚合统计):`docs/peer-mesh/peer-mesh-java-client-audit-fixes.md`

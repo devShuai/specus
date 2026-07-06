@@ -2,7 +2,7 @@
 
 Experimental C port of `tunnel-server`.
 
-Full migration plan: [docs/tunnel-server-c-port-plan.md](../../../docs/tunnel-server-c-port-plan.md).
+Full migration plan: [docs/cross-language/tunnel-server-c-port-plan.md](../../../docs/cross-language/tunnel-server-c-port-plan.md).
 
 This version implements the Java-compatible core server path:
 

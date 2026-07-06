@@ -157,7 +157,7 @@ relay 数据面使用标准 TURN `Send Indication` / `Data Indication` 承载加
 * Linux：`peerMeshDevice=linux-tun` 或 `auto`，进程需要 root 或 `CAP_NET_ADMIN`，系统需要 `/dev/net/tun` 和 `ip` 命令。
 * Windows：`peerMeshDevice=windows-wintun` 或 `auto`，需要管理员权限，并把 `wintun.dll` 放在工作目录 / PATH，或通过 `-Dshuai.peerMesh.wintunDll=完整路径` 指定。
 
-更多验证步骤见仓库内 `docs/peer-mesh-implementation.md`。
+更多验证步骤见仓库内 `docs/peer-mesh/peer-mesh-implementation.md`。
 
 ### 4.6 HTTP 直转与流量明细（可选）
 

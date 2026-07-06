@@ -11,11 +11,11 @@
 2. **易部署**：一个 Spring Boot 服务端 + 一个 Java/Go 客户端，默认使用 SQLite 即可跑通。
 3. **可观测**：登录成功/失败、流量、连接频率、端口映射状态都进入数据库与管理后台。
 4. **安全升级路径清晰**：HMAC 登录、Bearer JWT 鉴权、可选 TLS 控制通道，留出生产化空间。
-5. **不追求极致性能**：当前默认是单服务端节点；针对单机 1 万连接的优化方案见 `docs/single-node-10k-connections-optimization-plan.md`。
+5. **不追求极致性能**：当前默认是单服务端节点；针对单机 1 万连接的优化方案见 `docs/performance/single-node-10k-connections-optimization-plan.md`。
 
-当前版本仍以单体 `tunnel-server` 部署为主。后续若要把控制端和连接端拆分、让连接端做高可用和滚动 drain，方案见 `docs/server-control-edge-ha-plan.md`。
+当前版本仍以单体 `tunnel-server` 部署为主。后续若要把控制端和连接端拆分、让连接端做高可用和滚动 drain，方案见 `docs/architecture/server-control-edge-ha-plan.md`。
 
-非目标：不提供 P2P 打洞（相关研究见 `docs/direct-connect-hole-punching-research.md`）、不实现 UDP 穿透（`UdpConnection` 留空占位）、不做多区域调度。
+非目标：不提供 P2P 打洞（相关研究见 `docs/peer-mesh/direct-connect-hole-punching-research.md`）、不实现 UDP 穿透（`UdpConnection` 留空占位）、不做多区域调度。
 
 ## 2. 顶层架构
 
@@ -416,7 +416,7 @@ Admin UI               AdminController        ClientManagementService    NatCont
 - **登录 nonce 未持久化**：当前在 30s 窗口内可重放同一签名。建议在 `loginExecutor` 处加内存 LRU（按 `clientName`），并在多节点部署时升级到共享存储（Redis）。
 - **UDP 转发缺失**：`UdpConnection` 留空。如要补齐，需要在协议层新增 `NAT_UDP_*` 命令，并在服务端为每个 UDP 映射启动 `DatagramChannel`，按 `(srcAddr, srcPort)` 分配 connectionId。
 - **测试覆盖**：核心协议有单元测试，但缺少真实 MySQL/PostgreSQL 集成测试和端到端隧道测试。`tools/` 下已有 load test 辅助。
-- **服务端水平扩展**：当前 `Session` 与 `NatServerHandler` 状态都在 JVM 内存。若要多节点：客户端 → 节点之间需要绑定（一致性哈希或粘性路由），公网入站连接也必须落到客户端实际所在节点。详细方案见 `docs/single-node-10k-connections-optimization-plan.md` 与 P2P 研究文档。
+- **服务端水平扩展**：当前 `Session` 与 `NatServerHandler` 状态都在 JVM 内存。若要多节点：客户端 → 节点之间需要绑定（一致性哈希或粘性路由），公网入站连接也必须落到客户端实际所在节点。详细方案见 `docs/performance/single-node-10k-connections-optimization-plan.md` 与 P2P 研究文档。
 - **同端口冲突**：`server.port=8088` 与 `tunnel-client` 默认相同，单机同时跑要覆盖其中一个。
 - **协议演进**：`magic` 与 `version` 已预留；新增命令时建议保留向后兼容（旧版本未识别的 `cmd` 应当忽略而非断链），目前未实现该容忍逻辑。
 
