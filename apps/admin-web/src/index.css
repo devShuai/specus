@@ -195,164 +195,145 @@ body {
     0 0 0 1px rgba(255, 255, 255, 0.03) inset;
 }
 
-.landing-debug-panel,
-.landing-debug-pill {
-  position: fixed;
-  right: 10px;
-  bottom: 10px;
-  z-index: 2147483647;
-  color: #f8fafc;
-  font-family:
-    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-}
-
-.landing-debug-panel {
-  display: flex;
-  width: min(430px, calc(100vw - 20px));
-  max-height: min(74vh, 680px);
-  flex-direction: column;
-  overflow: hidden;
-  border: 1px solid rgba(125, 211, 252, 0.42);
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.94);
-  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.46);
-}
-
-.landing-debug-panel-header {
-  display: flex;
+.landing-ghost-button,
+.landing-icon-button,
+.landing-primary-button,
+.landing-secondary-button {
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px;
-  border-bottom: 1px solid rgba(125, 211, 252, 0.22);
+  justify-content: center;
+  min-height: 2.25rem;
+  border-radius: 0.375rem;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    opacity 160ms ease,
+    transform 160ms ease;
 }
 
-.landing-debug-panel-header strong {
-  color: #67e8f9;
-  font-size: 0.78rem;
+.landing-ghost-button {
+  padding: 0 0.875rem;
+  color: #09090b;
+  background: rgba(255, 255, 255, 0.7);
+  font-size: 0.875rem;
 }
 
-.landing-debug-panel-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
+.landing-icon-button {
+  width: 2.25rem;
+  color: #09090b;
+  background: rgba(255, 255, 255, 0.7);
 }
 
-.landing-debug-panel button,
-.landing-debug-pill {
-  border: 1px solid rgba(125, 211, 252, 0.36);
-  border-radius: 5px;
-  padding: 5px 7px;
-  color: #e0f2fe;
-  font-size: 0.68rem;
-  background: rgba(8, 47, 73, 0.86);
+.landing-ghost-button:hover,
+.landing-icon-button:hover {
+  background: rgba(255, 255, 255, 0.86);
 }
 
-.landing-debug-panel-body {
-  display: grid;
-  gap: 10px;
-  overflow: auto;
-  padding: 10px;
-  overscroll-behavior: contain;
+.dark .landing-ghost-button,
+.dark .landing-icon-button {
+  color: #fafafa;
+  background: rgba(255, 255, 255, 0.1);
 }
 
-.landing-debug-panel h4 {
-  margin: 0 0 6px;
-  color: #a7f3d0;
-  font-size: 0.72rem;
+.dark .landing-ghost-button:hover,
+.dark .landing-icon-button:hover {
+  background: rgba(255, 255, 255, 0.14);
 }
 
-.landing-debug-panel dl {
-  display: grid;
-  gap: 4px;
-  margin: 0;
+.landing-form-input {
+  width: 100%;
+  min-height: 2.75rem;
+  border: 1px solid rgba(24, 24, 27, 0.12);
+  border-radius: 0.375rem;
+  padding: 0 0.875rem;
+  color: #09090b;
+  background: rgba(255, 255, 255, 0.72);
+  outline: none;
+  box-shadow: 0 1px 2px rgba(8, 47, 73, 0.08);
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
 }
 
-.landing-debug-panel dl div {
-  display: grid;
-  grid-template-columns: 82px minmax(0, 1fr);
-  gap: 8px;
+.landing-form-input:hover {
+  background: rgba(255, 255, 255, 0.84);
+  border-color: rgba(8, 145, 178, 0.45);
 }
 
-.landing-debug-panel dt {
-  color: #7dd3fc;
-  font-size: 0.66rem;
+.landing-form-input:focus,
+.landing-form-input:focus-visible {
+  border-color: rgba(8, 145, 178, 0.76);
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.16);
 }
 
-.landing-debug-panel dd {
-  min-width: 0;
-  margin: 0;
-  color: #e5e7eb;
-  font-size: 0.66rem;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
+.dark .landing-form-input {
+  color: #fff;
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: none;
 }
 
-.landing-debug-muted {
-  margin: 0;
-  color: #cbd5e1;
-  font-size: 0.68rem;
-  line-height: 1.45;
+.dark .landing-form-input:hover {
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.12);
 }
 
-.landing-debug-list {
-  display: grid;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
+.dark .landing-form-input:focus,
+.dark .landing-form-input:focus-visible {
+  border-color: transparent;
+  background: rgba(9, 9, 11, 0.85);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.22);
 }
 
-.landing-debug-list li {
-  display: grid;
-  gap: 2px;
-  border: 1px solid rgba(251, 191, 36, 0.26);
-  border-radius: 6px;
-  padding: 7px;
-  background: rgba(251, 191, 36, 0.08);
+.landing-primary-button {
+  width: 100%;
+  padding: 0 1rem;
+  color: #09090b;
+  background: #67e8f9;
+  font-weight: 700;
 }
 
-.landing-debug-list strong {
-  color: #fde68a;
-  font-size: 0.68rem;
+.landing-primary-button:hover {
+  background: #22d3ee;
 }
 
-.landing-debug-list span {
-  color: #f8fafc;
-  font-size: 0.65rem;
+.landing-primary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
 }
 
-.landing-debug-elements {
-  display: grid;
-  gap: 6px;
+.landing-secondary-button {
+  width: 100%;
+  border: 1px solid rgba(24, 24, 27, 0.2);
+  padding: 0 1rem;
+  color: #09090b;
+  background: transparent;
 }
 
-.landing-debug-elements details {
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 6px;
-  background: rgba(15, 23, 42, 0.8);
+.landing-secondary-button:hover {
+  border-color: rgba(8, 145, 178, 0.45);
+  background: rgba(255, 255, 255, 0.42);
 }
 
-.landing-debug-elements summary {
-  padding: 7px;
-  color: #bfdbfe;
-  font-size: 0.66rem;
-  cursor: pointer;
+.dark .landing-secondary-button {
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #fff;
 }
 
-.landing-debug-elements pre {
-  max-height: 260px;
-  margin: 0;
-  overflow: auto;
-  border-top: 1px solid rgba(148, 163, 184, 0.18);
-  padding: 7px;
-  color: #d1d5db;
-  font-size: 0.62rem;
-  line-height: 1.35;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+.dark .landing-secondary-button:hover {
+  border-color: rgba(103, 232, 249, 0.45);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.landing-ghost-button:focus-visible,
+.landing-icon-button:focus-visible,
+.landing-primary-button:focus-visible,
+.landing-secondary-button:focus-visible {
+  outline: 2px solid rgba(8, 145, 178, 0.72);
+  outline-offset: 2px;
 }
 
 .landing-route-line {

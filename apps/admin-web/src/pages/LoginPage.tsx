@@ -1,13 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
-import { Button, Card, CardBody, CardHeader, Chip, Divider, Input } from "@heroui/react";
 import { useAuth } from "../auth/AuthContext";
-import { notifyError } from "../components/toast";
-import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { AppLogo } from "../components/AppLogo";
-import { HeroRuntime } from "../components/HeroRuntime";
-import { fetchPublicClientDownloads } from "../api/client";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 import { usePageSeo } from "../lib/seo";
+import { useTheme } from "../theme/ThemeContext";
 
 const metrics = [
   { value: "TCP", label: "公网端口映射" },
@@ -79,99 +75,8 @@ const implementationChips = [
   { name: "C", note: "实验性 · 资源最小" },
 ];
 
-const inputClassNames = {
-  inputWrapper:
-    "landing-input-wrapper border-white/15 bg-white/[0.72] !text-zinc-950 shadow-sm hover:bg-white/[0.84] data-[hover=true]:border-cyan-500/60 group-data-[focus=true]:!border-cyan-500 group-data-[focus=true]:bg-white dark:!border-transparent dark:bg-white/[0.08] dark:!text-white dark:hover:bg-white/[0.12] dark:group-data-[focus=true]:bg-zinc-950/85 dark:group-data-[focus=true]:!border-transparent",
-  label:
-    "!text-zinc-700 group-data-[focus=true]:!text-cyan-700 dark:!text-zinc-300 dark:group-data-[focus=true]:!text-cyan-200",
-  input: "!text-zinc-950 placeholder:text-zinc-500 dark:!text-white dark:placeholder:text-zinc-500",
-} as const;
-
-const landingDebugTargets = [
-  { key: "shell", selector: ".landing-shell" },
-  { key: "topology-panel", selector: ".topology-panel" },
-  { key: "topology-mobile", selector: ".topology-mobile" },
-  { key: "topology-peer-link", selector: ".topology-mobile-peer-link" },
-  { key: "topology-peer-label", selector: ".topology-mobile-peer-link span" },
-  { key: "principle-card", selector: ".principle-card" },
-  { key: "principle-card-body", selector: ".principle-card-body" },
-  { key: "principle-flowgrid", selector: ".principle-flowgrid" },
-  { key: "principle-node", selector: ".principle-node" },
-  { key: "principle-note", selector: ".principle-note span" },
-] as const;
-
-type LandingDebugRect = {
-  bottom: number;
-  height: number;
-  left: number;
-  right: number;
-  top: number;
-  width: number;
-  x: number;
-  y: number;
-};
-
-type LandingDebugAncestor = {
-  className: string;
-  css: Pick<LandingDebugElement["css"], "clipPath" | "contain" | "maskImage" | "overflow" | "overflowX" | "overflowY" | "transform">;
-  rect: LandingDebugRect;
-  tagName: string;
-};
-
-type LandingDebugElement = {
-  ancestorClips: LandingDebugAncestor[];
-  css: {
-    backfaceVisibility: string;
-    clipPath: string;
-    contain: string;
-    contentVisibility: string;
-    display: string;
-    filter: string;
-    isolation: string;
-    maskImage: string;
-    opacity: string;
-    overflow: string;
-    overflowX: string;
-    overflowY: string;
-    position: string;
-    transform: string;
-    visibility: string;
-    webkitBackfaceVisibility: string;
-    zIndex: string;
-  };
-  index: number;
-  inViewport: boolean;
-  key: string;
-  rect: LandingDebugRect;
-  selector: string;
-  text: string;
-  visibleByLayout: boolean;
-};
-
-type LandingDebugSnapshot = {
-  elements: LandingDebugElement[];
-  environment: {
-    colorScheme: string;
-    dpr: number;
-    hash: string;
-    prefersReducedMotion: boolean;
-    screen: string;
-    scroll: { x: number; y: number };
-    themeClass: string;
-    timestamp: string;
-    url: string;
-    userAgent: string;
-    viewport: string;
-    visualViewport: string;
-  };
-};
-
 export function LoginPage() {
-  return (
-    <HeroRuntime>
-      <LoginPageContent />
-    </HeroRuntime>
-  );
+  return <LoginPageContent />;
 }
 
 function LoginPageContent() {
@@ -179,8 +84,8 @@ function LoginPageContent() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
   const loginPanelRef = useRef<HTMLDivElement>(null);
-  const landingDebugEnabled = useLandingDebugEnabled();
 
   usePageSeo({
     title: "shuai-tunnel · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
@@ -209,12 +114,22 @@ function LoginPageContent() {
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     setSubmitting(true);
+    setLoginError(null);
     try {
       await passwordLogin(username, password);
     } catch (error) {
-      notifyError(error, "登录失败");
+      setLoginError(error instanceof Error ? error.message : "登录失败");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const loginWithOidc = async () => {
+    setLoginError(null);
+    try {
+      await startOidcLogin();
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : "OIDC 登录失败");
     }
   };
 
@@ -232,25 +147,21 @@ function LoginPageContent() {
         <header className="flex items-center justify-between gap-4">
           <AppLogo label="shuai-tunnel" subtitle="内网服务接入控制面" />
           <div className="flex items-center gap-2">
-            <ThemeToggleButton className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" />
-            <Button as="a" href="#/nat-detect" radius="sm" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" variant="flat">
+            <LandingThemeToggleButton />
+            <a href="#/nat-detect" className="landing-ghost-button">
               NAT 检测
-            </Button>
-            <Button radius="sm" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" variant="flat" onPress={focusLogin}>
+            </a>
+            <button type="button" className="landing-ghost-button" onClick={focusLogin}>
               进入控制台
-            </Button>
+            </button>
           </div>
         </header>
 
         <div className="grid flex-1 items-center gap-8 py-10 lg:grid-cols-[minmax(0,1fr)_420px]">
           <div className="flex min-w-0 flex-col gap-7">
-            <Chip
-              className="w-fit border border-emerald-500/35 bg-emerald-300/15 px-2 text-emerald-700 dark:border-emerald-300/35 dark:bg-emerald-300/10 dark:text-emerald-100"
-              radius="sm"
-              variant="flat"
-            >
+            <span className="w-fit rounded-md border border-emerald-500/35 bg-emerald-300/15 px-2 py-1 text-small text-emerald-700 dark:border-emerald-300/35 dark:bg-emerald-300/10 dark:text-emerald-100">
               Secure tunnel control plane
-            </Chip>
+            </span>
 
             <div className="max-w-3xl">
               <h1 className="text-5xl font-semibold leading-tight text-zinc-950 dark:text-white">shuai-tunnel</h1>
@@ -282,69 +193,71 @@ function LoginPageContent() {
           </div>
 
           <div ref={loginPanelRef} id="login-panel">
-            <Card shadow="none" className="landing-card rounded-md border border-black/10 bg-white/80 text-zinc-950 backdrop-blur-xl dark:border-white/15 dark:bg-white/[0.08] dark:text-white">
-              <CardHeader className="flex flex-col items-start gap-2 px-5 pb-2 pt-5">
-                <Chip radius="sm" className="bg-cyan-300/25 text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100" variant="flat">
+            <div className="landing-card rounded-md border border-black/10 bg-white/80 text-zinc-950 backdrop-blur-xl dark:border-white/15 dark:bg-white/[0.08] dark:text-white">
+              <div className="flex flex-col items-start gap-2 px-5 pb-2 pt-5">
+                <span className="rounded-md bg-cyan-300/25 px-2 py-1 text-tiny text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100">
                   管理台登录
-                </Chip>
+                </span>
                 <div>
                   <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">进入控制台</h2>
                   <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">{loginHint}</p>
                 </div>
-              </CardHeader>
-              <CardBody className="gap-4 px-5 pb-5">
+              </div>
+              <div className="flex flex-col gap-4 px-5 pb-5">
                 {passwordEnabled && (
                   <form className="flex flex-col gap-3" onSubmit={onSubmit}>
-                    <Input
-                      label="用户名"
-                      value={username}
-                      onValueChange={setUsername}
-                      autoComplete="username"
-                      variant="bordered"
-                      radius="sm"
-                      classNames={inputClassNames}
-                      isRequired
-                    />
-                    <Input
-                      label="密码"
-                      type="password"
-                      value={password}
-                      onValueChange={setPassword}
-                      autoComplete="current-password"
-                      variant="bordered"
-                      radius="sm"
-                      classNames={inputClassNames}
-                      isRequired
-                    />
-                    <Button
+                    <label className="grid gap-1.5 text-small text-zinc-700 dark:text-zinc-300">
+                      <span>用户名 <span className="text-danger">*</span></span>
+                      <input
+                        className="landing-form-input"
+                        value={username}
+                        onChange={(event) => setUsername(event.target.value)}
+                        autoComplete="username"
+                        required
+                      />
+                    </label>
+                    <label className="grid gap-1.5 text-small text-zinc-700 dark:text-zinc-300">
+                      <span>密码 <span className="text-danger">*</span></span>
+                      <input
+                        className="landing-form-input"
+                        type="password"
+                        value={password}
+                        onChange={(event) => setPassword(event.target.value)}
+                        autoComplete="current-password"
+                        required
+                      />
+                    </label>
+                    {loginError && (
+                      <p className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-small text-danger-700 dark:text-danger-200">
+                        {loginError}
+                      </p>
+                    )}
+                    <button
                       type="submit"
-                      radius="sm"
-                      className="bg-cyan-300 font-semibold text-zinc-950"
-                      isLoading={submitting}
-                      isDisabled={!username || !password}
+                      className="landing-primary-button"
+                      disabled={submitting || !username || !password}
                     >
-                      登录管理台
-                    </Button>
+                      {submitting ? "登录中..." : "登录管理台"}
+                    </button>
                   </form>
                 )}
 
                 {passwordEnabled && oidcEnabled && (
                   <div className="flex items-center gap-3 text-tiny text-zinc-500 dark:text-zinc-500">
-                    <Divider className="flex-1 bg-black/10 dark:bg-white/10" />
+                    <span className="h-px flex-1 bg-black/10 dark:bg-white/10" />
                     <span>或</span>
-                    <Divider className="flex-1 bg-black/10 dark:bg-white/10" />
+                    <span className="h-px flex-1 bg-black/10 dark:bg-white/10" />
                   </div>
                 )}
 
                 {oidcEnabled && (
-                  <Button
-                    radius="sm"
-                    variant="bordered"
-                    className="border-black/20 text-zinc-950 dark:border-white/20 dark:text-white"
-                    onPress={() => void startOidcLogin()}
+                  <button
+                    type="button"
+                    className="landing-secondary-button"
+                    onClick={() => void loginWithOidc()}
                   >
                     使用 OIDC 登录
-                  </Button>
+                  </button>
                 )}
 
                 {!passwordEnabled && !oidcEnabled && (
@@ -352,8 +265,8 @@ function LoginPageContent() {
                     未配置任何登录方式：请设置用户名/密码或 OIDC
                   </p>
                 )}
-              </CardBody>
-            </Card>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -424,19 +337,18 @@ function LoginPageContent() {
           </div>
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {featureCards.map((feature) => (
-              <Card
+              <article
                 key={feature.title}
-                shadow="none"
                 className="rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none"
               >
-                <CardBody className="gap-3 p-4">
+                <div className="grid gap-3 p-4">
                   <span className="w-fit rounded-md border border-cyan-500/25 bg-cyan-300/15 px-2 py-1 text-tiny text-cyan-700 dark:border-cyan-300/25 dark:bg-cyan-300/10 dark:text-cyan-100">
                     {feature.label}
                   </span>
                   <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{feature.title}</h3>
                   <p className="text-small leading-6 text-zinc-600 dark:text-zinc-400">{feature.description}</p>
-                </CardBody>
-              </Card>
+                </div>
+              </article>
             ))}
           </div>
 
@@ -469,315 +381,46 @@ function LoginPageContent() {
         </div>
       </section>
 
-      {landingDebugEnabled && <LandingDebugPanel />}
     </main>
   );
 }
 
-function useLandingDebugEnabled() {
-  const [enabled, setEnabled] = useState(() => isLandingDebugEnabled());
-
-  useEffect(() => {
-    const update = () => setEnabled(isLandingDebugEnabled());
-    window.addEventListener("hashchange", update);
-    window.addEventListener("popstate", update);
-    return () => {
-      window.removeEventListener("hashchange", update);
-      window.removeEventListener("popstate", update);
-    };
-  }, []);
-
-  return enabled;
-}
-
-function isLandingDebugEnabled() {
-  if (typeof window === "undefined") {
-    return false;
-  }
-
-  const searchParams = new URLSearchParams(window.location.search);
-  if (searchParams.get("landingDebug") === "1") {
-    return true;
-  }
-
-  const hash = window.location.hash.replace(/^#/, "");
-  const hashQueryIndex = hash.indexOf("?");
-  const hashParamsText = hashQueryIndex >= 0 ? hash.slice(hashQueryIndex + 1) : hash;
-  return new URLSearchParams(hashParamsText).get("landingDebug") === "1";
-}
-
-function LandingDebugPanel() {
-  const [snapshot, setSnapshot] = useState<LandingDebugSnapshot>(() => collectLandingDebugSnapshot());
-  const [collapsed, setCollapsed] = useState(false);
-  const [copyLabel, setCopyLabel] = useState("复制诊断");
-
-  useEffect(() => {
-    const update = () => setSnapshot(collectLandingDebugSnapshot());
-    const interval = window.setInterval(update, 1000);
-    update();
-    window.addEventListener("resize", update);
-    window.addEventListener("scroll", update, { passive: true });
-    return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("resize", update);
-      window.removeEventListener("scroll", update);
-    };
-  }, []);
-
-  const suspectElements = snapshot.elements.filter(
-    (element) => !element.visibleByLayout || !element.inViewport || element.ancestorClips.length > 0,
-  );
-
-  const copySnapshot = async () => {
-    const text = JSON.stringify(snapshot, null, 2);
-    try {
-      await copyText(text);
-      setCopyLabel("已复制");
-    } catch {
-      setCopyLabel("复制失败");
-    } finally {
-      window.setTimeout(() => setCopyLabel("复制诊断"), 1400);
-    }
-  };
-
-  if (collapsed) {
-    return (
-      <button className="landing-debug-pill" type="button" onClick={() => setCollapsed(false)}>
-        Landing debug
-      </button>
-    );
-  }
-
+function LandingThemeToggleButton() {
+  const { theme, toggleTheme } = useTheme();
+  const nextThemeLabel = theme === "dark" ? "切换到浅色模式" : "切换到深色模式";
   return (
-    <aside className="landing-debug-panel" aria-label="Landing debug diagnostics">
-      <div className="landing-debug-panel-header">
-        <strong>Landing debug</strong>
-        <div className="landing-debug-panel-actions">
-          <button type="button" onClick={() => setSnapshot(collectLandingDebugSnapshot())}>刷新</button>
-          <button type="button" onClick={() => void copySnapshot()}>{copyLabel}</button>
-          <button type="button" onClick={() => setCollapsed(true)}>收起</button>
-        </div>
-      </div>
-
-      <div className="landing-debug-panel-body">
-        <section>
-          <h4>环境</h4>
-          <dl>
-            <div><dt>viewport</dt><dd>{snapshot.environment.viewport}</dd></div>
-            <div><dt>visual</dt><dd>{snapshot.environment.visualViewport}</dd></div>
-            <div><dt>dpr</dt><dd>{snapshot.environment.dpr}</dd></div>
-            <div><dt>scroll</dt><dd>{snapshot.environment.scroll.x}, {snapshot.environment.scroll.y}</dd></div>
-            <div><dt>theme</dt><dd>{snapshot.environment.themeClass || "-"}</dd></div>
-            <div><dt>motion</dt><dd>{snapshot.environment.prefersReducedMotion ? "reduce" : "normal"}</dd></div>
-            <div><dt>ua</dt><dd>{snapshot.environment.userAgent}</dd></div>
-          </dl>
-        </section>
-
-        <section>
-          <h4>可疑项 {suspectElements.length}</h4>
-          {suspectElements.length === 0 ? (
-            <p className="landing-debug-muted">当前采样未发现 display/visibility/overflow 直接异常。</p>
-          ) : (
-            <ul className="landing-debug-list">
-              {suspectElements.slice(0, 12).map((element) => (
-                <li key={`${element.key}-${element.index}`}>
-                  <strong>{element.key}[{element.index}]</strong>
-                  <span>{element.visibleByLayout ? "layout ok" : "layout hidden"} · {element.inViewport ? "in viewport" : "out viewport"} · clips {element.ancestorClips.length}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-
-        <section>
-          <h4>元素采样</h4>
-          <div className="landing-debug-elements">
-            {snapshot.elements.slice(0, 28).map((element) => (
-              <details key={`${element.key}-${element.index}`}>
-                <summary>
-                  {element.key}[{element.index}] {formatDebugRect(element.rect)}
-                </summary>
-                <pre>{JSON.stringify(element, null, 2)}</pre>
-              </details>
-            ))}
-          </div>
-        </section>
-      </div>
-    </aside>
+    <button type="button" className="landing-icon-button" aria-label={nextThemeLabel} title={nextThemeLabel} onClick={toggleTheme}>
+      {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+    </button>
   );
 }
 
-function collectLandingDebugSnapshot(): LandingDebugSnapshot {
-  if (typeof window === "undefined") {
-    return {
-      elements: [],
-      environment: {
-        colorScheme: "unknown",
-        dpr: 1,
-        hash: "",
-        prefersReducedMotion: false,
-        screen: "",
-        scroll: { x: 0, y: 0 },
-        themeClass: "",
-        timestamp: "",
-        url: "",
-        userAgent: "",
-        viewport: "",
-        visualViewport: "",
-      },
-    };
-  }
-
-  const elements = landingDebugTargets.flatMap(({ key, selector }) =>
-    Array.from(document.querySelectorAll(selector))
-      .slice(0, selector.includes("principle-node") ? 16 : 6)
-      .map((element, index) => collectLandingDebugElement(key, selector, element, index)),
+function SunIcon() {
+  return (
+    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M12 4V2M12 22v-2M4.93 4.93 3.52 3.52M20.48 20.48l-1.41-1.41M4 12H2M22 12h-2M4.93 19.07l-1.41 1.41M20.48 3.52l-1.41 1.41M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
   );
-
-  const visualViewport = window.visualViewport;
-  return {
-    elements,
-    environment: {
-      colorScheme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
-      dpr: window.devicePixelRatio || 1,
-      hash: window.location.hash,
-      prefersReducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
-      screen: `${window.screen.width}x${window.screen.height}`,
-      scroll: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) },
-      themeClass: document.documentElement.className,
-      timestamp: new Date().toISOString(),
-      url: window.location.href,
-      userAgent: window.navigator.userAgent,
-      viewport: `${window.innerWidth}x${window.innerHeight}`,
-      visualViewport: visualViewport
-        ? `${Math.round(visualViewport.width)}x${Math.round(visualViewport.height)} scale=${visualViewport.scale}`
-        : "unavailable",
-    },
-  };
 }
 
-function collectLandingDebugElement(
-  key: string,
-  selector: string,
-  element: Element,
-  index: number,
-): LandingDebugElement {
-  const rect = toLandingDebugRect(element.getBoundingClientRect());
-  const css = readDebugCss(element);
-  const visibleByLayout =
-    rect.width > 0 &&
-    rect.height > 0 &&
-    css.display !== "none" &&
-    css.visibility !== "hidden" &&
-    css.opacity !== "0";
-
-  return {
-    ancestorClips: collectDebugAncestorClips(element),
-    css,
-    index,
-    inViewport: rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth,
-    key,
-    rect,
-    selector,
-    text: (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 180),
-    visibleByLayout,
-  };
-}
-
-function collectDebugAncestorClips(element: Element): LandingDebugAncestor[] {
-  const ancestors: LandingDebugAncestor[] = [];
-  let current = element.parentElement;
-
-  while (current && current !== document.documentElement && ancestors.length < 8) {
-    const css = readDebugCss(current);
-    const overflowValues = [css.overflow, css.overflowX, css.overflowY];
-    const hasOverflowClip = overflowValues.some((value) => ["auto", "clip", "hidden", "scroll"].includes(value));
-    const hasPaintContain = /\b(content|paint|strict)\b/.test(css.contain);
-    const hasMask = css.maskImage !== "none";
-    const hasClipPath = css.clipPath !== "none";
-
-    if (hasOverflowClip || hasPaintContain || hasMask || hasClipPath) {
-      ancestors.push({
-        className: current.className.toString(),
-        css: {
-          clipPath: css.clipPath,
-          contain: css.contain,
-          maskImage: css.maskImage,
-          overflow: css.overflow,
-          overflowX: css.overflowX,
-          overflowY: css.overflowY,
-          transform: css.transform,
-        },
-        rect: toLandingDebugRect(current.getBoundingClientRect()),
-        tagName: current.tagName.toLowerCase(),
-      });
-    }
-
-    current = current.parentElement;
-  }
-
-  return ancestors;
-}
-
-function readDebugCss(element: Element): LandingDebugElement["css"] {
-  const style = window.getComputedStyle(element);
-  return {
-    backfaceVisibility: style.backfaceVisibility,
-    clipPath: style.clipPath,
-    contain: style.contain,
-    contentVisibility: style.contentVisibility,
-    display: style.display,
-    filter: style.filter,
-    isolation: style.isolation,
-    maskImage: style.maskImage,
-    opacity: style.opacity,
-    overflow: style.overflow,
-    overflowX: style.overflowX,
-    overflowY: style.overflowY,
-    position: style.position,
-    transform: style.transform,
-    visibility: style.visibility,
-    webkitBackfaceVisibility: style.getPropertyValue("-webkit-backface-visibility"),
-    zIndex: style.zIndex,
-  };
-}
-
-function toLandingDebugRect(rect: DOMRect): LandingDebugRect {
-  return {
-    bottom: roundDebugNumber(rect.bottom),
-    height: roundDebugNumber(rect.height),
-    left: roundDebugNumber(rect.left),
-    right: roundDebugNumber(rect.right),
-    top: roundDebugNumber(rect.top),
-    width: roundDebugNumber(rect.width),
-    x: roundDebugNumber(rect.x),
-    y: roundDebugNumber(rect.y),
-  };
-}
-
-function roundDebugNumber(value: number) {
-  return Math.round(value * 100) / 100;
-}
-
-function formatDebugRect(rect: LandingDebugRect) {
-  return `${Math.round(rect.width)}x${Math.round(rect.height)} @ ${Math.round(rect.left)},${Math.round(rect.top)}`;
-}
-
-async function copyText(text: string) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-
-  const textarea = document.createElement("textarea");
-  textarea.value = text;
-  textarea.setAttribute("readonly", "true");
-  textarea.style.position = "fixed";
-  textarea.style.left = "-9999px";
-  document.body.appendChild(textarea);
-  textarea.select();
-  document.execCommand("copy");
-  document.body.removeChild(textarea);
+function MoonIcon() {
+  return (
+    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M20.25 14.15A7.75 7.75 0 0 1 9.85 3.75 8.5 8.5 0 1 0 20.25 14.15Z"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
 }
 
 /**
@@ -984,21 +627,43 @@ const IMPL_LABELS: Record<ClientImplementation, string> = {
 
 const IMPL_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
 
+async function fetchLandingClientDownloads(): Promise<ClientDownloadLink[]> {
+  try {
+    const response = await fetch("/api/public/client-downloads");
+    if (!response.ok) {
+      return [];
+    }
+    const data = await response.json();
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
 function ClientDownloadsSection() {
   const [links, setLinks] = useState<ClientDownloadLink[]>([]);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
-      const data = await fetchPublicClientDownloads();
+    let cancelScheduledLoad = () => {};
+    const load = async () => {
+      const data = await fetchLandingClientDownloads();
       if (!cancelled) {
         setLinks(data);
         setLoaded(true);
       }
-    })();
+    };
+    if ("requestIdleCallback" in window && "cancelIdleCallback" in window) {
+      const handle = window.requestIdleCallback(() => void load(), { timeout: 2200 });
+      cancelScheduledLoad = () => window.cancelIdleCallback(handle);
+    } else {
+      const handle = globalThis.setTimeout(() => void load(), 1200);
+      cancelScheduledLoad = () => globalThis.clearTimeout(handle);
+    }
     return () => {
       cancelled = true;
+      cancelScheduledLoad();
     };
   }, []);
 
@@ -1021,15 +686,14 @@ function ClientDownloadsSection() {
       </div>
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {grouped.map(({ implementation, items }) => (
-          <Card
+          <section
             key={implementation}
-            shadow="none"
             className="rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none"
           >
-            <CardBody className="gap-3 p-4">
-              <Chip className="w-fit bg-cyan-300/25 text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100" radius="sm" variant="flat">
+            <div className="grid gap-3 p-4">
+              <span className="w-fit rounded-md bg-cyan-300/25 px-2 py-1 text-tiny text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100">
                 {IMPL_LABELS[implementation]}
-              </Chip>
+              </span>
               <div className="flex flex-col gap-2">
                 {items.map((link) => (
                   <a
@@ -1053,8 +717,8 @@ function ClientDownloadsSection() {
                   </a>
                 ))}
               </div>
-            </CardBody>
-          </Card>
+            </div>
+          </section>
         ))}
       </div>
     </div>
@@ -1096,11 +760,10 @@ function PrincipleCard({
   title: string;
 }) {
   return (
-    <Card
-      shadow="none"
+    <article
       className={`principle-card principle-card-${accent} rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none`}
     >
-      <CardBody className="principle-card-body gap-5 p-5">
+      <div className="principle-card-body grid gap-5 p-5">
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="principle-badge w-fit rounded-md px-2 py-1 text-tiny">{badge}</span>
@@ -1110,8 +773,8 @@ function PrincipleCard({
           <p className="text-small leading-6 text-zinc-600 dark:text-zinc-400">{description}</p>
         </div>
         {children}
-      </CardBody>
-    </Card>
+      </div>
+    </article>
   );
 }
 

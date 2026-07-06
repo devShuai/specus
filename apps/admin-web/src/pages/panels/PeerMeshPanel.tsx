@@ -82,7 +82,7 @@ export function PeerMeshPanel() {
           size: SESSION_PAGE_SIZE,
           openOnly: true,
         }),
-        // Go / C# 服务端尚未实现 stats 端点，失败时降级为 null，不影响面板其余部分
+        // stats 暂不可用时降级为 null，不影响面板其余部分。
         adminApi.peerMeshStats().catch(() => null),
       ]);
       setStatus(nextStatus);
@@ -682,7 +682,7 @@ function SessionDetail({ session, onDisconnect }: { session: PeerMeshSession; on
 
 function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
   if (!stats) {
-    // Go / C# 服务端尚未提供 stats 端点时静默隐藏
+    // stats 暂不可用时静默隐藏。
     return null;
   }
   const ratioPercent = stats.activeDirectRatio == null ? null : Math.round(stats.activeDirectRatio * 100);

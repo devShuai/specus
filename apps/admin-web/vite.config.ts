@@ -24,10 +24,7 @@ export default defineConfig(({ mode }) => {
       // Keep asset paths stable under /assets so any static file server can serve the SPA.
       assetsDir: "assets",
       modulePreload: {
-        resolveDependencies(_filename, deps, context) {
-          if (context.hostType !== "html") {
-            return deps;
-          }
+        resolveDependencies(_filename, deps) {
           return deps.filter((dep) => dep.includes("react-vendor"));
         },
       },
@@ -35,6 +32,9 @@ export default defineConfig(({ mode }) => {
         output: {
           manualChunks(id) {
             const normalized = id.replace(/\\/g, "/");
+            if (normalized.includes("vite/preload-helper")) {
+              return "vite-runtime";
+            }
             if (!normalized.includes("/node_modules/")) {
               return undefined;
             }
