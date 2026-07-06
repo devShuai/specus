@@ -363,6 +363,7 @@ export interface PeerMeshSessionPage {
 }
 
 export interface PeerMeshPathTypeStat {
+  /** 有业务流量时按 direct/relay 字节占优方归类；无业务流量时使用客户端 PATH_REPORT 的探测路径 */
   pathType: string;
   status: string;
   sessions: number;

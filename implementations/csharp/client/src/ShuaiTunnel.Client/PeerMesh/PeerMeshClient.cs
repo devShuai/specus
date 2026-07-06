@@ -86,6 +86,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private UdpClient? _udp;
     private TunnelRuntimeState? _runtime;
     private FrameWriter? _writer;
+    private string _runtimeConfigKey = "";
     private PeerCandidate? _srflx;
     private PeerCandidate? _relay;
     private PeerCandidate? _portMap;
@@ -113,6 +114,33 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             await StopAsync().ConfigureAwait(false);
             return;
         }
+        var nextRuntimeConfigKey = RuntimeConfigKey(runtime.PeerMesh);
+        bool lightweightRefresh;
+        lock (_sync)
+        {
+            lightweightRefresh = IsStartedLocked()
+                && string.Equals(_runtimeConfigKey, nextRuntimeConfigKey, StringComparison.Ordinal)
+                && !ShouldRetryVirtualDeviceStartLocked();
+            if (lightweightRefresh)
+            {
+                _runtime = runtime;
+                _writer = writer;
+            }
+        }
+        if (lightweightRefresh)
+        {
+            _logger.LogDebug("Peer Mesh config unchanged, applying lightweight refresh: client={Client}, virtualIp={VirtualIp}",
+                runtime.PeerMesh.ClientName,
+                runtime.PeerMesh.VirtualIp);
+            await ReportDeviceAsync(runtime, writer, DeviceStatus(), _device?.Error ?? "", "", "", cancellationToken)
+                .ConfigureAwait(false);
+            PublishPeerMeshSnapshot();
+            _ = TryAcquirePortMappingAsync(CancellationToken.None);
+            await RequestRelayCandidatesAsync().ConfigureAwait(false);
+            await AnnounceCandidatesAsync().ConfigureAwait(false);
+            return;
+        }
+
         await StopAsync().ConfigureAwait(false);
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         UdpClient udp;
@@ -144,6 +172,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             _runtime = runtime;
             _writer = writer;
+            _runtimeConfigKey = nextRuntimeConfigKey;
             _udp = udp;
             _cts = cts;
             _keyMaterial = keyMaterial;
@@ -199,6 +228,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         PublishPeerMeshSnapshot();
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
+        await AnnounceCandidatesAsync().ConfigureAwait(false);
     }
 
     public async Task HandleControlAsync(string payload, TunnelRuntimeState runtime, FrameWriter writer, CancellationToken cancellationToken)
@@ -259,6 +289,44 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
+    private bool IsStartedLocked() =>
+        _udp is not null
+        && _cts is not null
+        && !_cts.IsCancellationRequested
+        && _runtime?.PeerMesh.Enabled == true;
+
+    private bool ShouldRetryVirtualDeviceStartLocked() =>
+        _device is NoopPeerVirtualDevice
+        && !string.Equals(_config.PeerMeshDevice, TunnelClientConfig.DefaultPeerMeshDevice, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(_config.PeerMeshDevice, "noop", StringComparison.OrdinalIgnoreCase);
+
+    private string RuntimeConfigKey(PeerMeshConfig peerMesh)
+    {
+        if (!peerMesh.Enabled)
+        {
+            return "disabled";
+        }
+        var publicStun = peerMesh.PublicStunServers
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .Order(StringComparer.OrdinalIgnoreCase);
+        return string.Join('|',
+            NormalizeConfigValue(_config.PeerMeshDevice),
+            NormalizeConfigValue(_config.PeerMeshTunName),
+            _config.PeerMeshMtu.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            peerMesh.ClientId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            NormalizeConfigValue(peerMesh.ClientName),
+            NormalizeConfigValue(peerMesh.VirtualIp),
+            NormalizeConfigValue(peerMesh.Cidr),
+            NormalizeConfigValue(peerMesh.StunHost),
+            peerMesh.StunPort.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            NormalizeConfigValue(peerMesh.TurnHost),
+            peerMesh.TurnPort.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            NormalizeConfigValue(peerMesh.ClientPublicKey),
+            NormalizeConfigValue(peerMesh.ServerPublicKey),
+            string.Join(',', publicStun));
+    }
+
     private async Task ReceiveLoopAsync(UdpClient udp, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -306,6 +374,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     CleanupPendingPackets();
                     await RenewPortMappingIfNeededAsync(cancellationToken).ConfigureAwait(false);
                     await RequestRelayCandidatesAsync().ConfigureAwait(false);
+                    await AnnounceCandidatesAsync().ConfigureAwait(false);
                     await ProbeKnownCandidatesAsync().ConfigureAwait(false);
                     await ReportTrafficDeltasAsync().ConfigureAwait(false);
                 }
@@ -1075,6 +1144,21 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         PublishPeerMeshSnapshot();
     }
 
+    private PeerMeshSession? ReusableSessionLocked(long peerId, DateTimeOffset now)
+    {
+        if (!_sessions.TryGetValue(peerId, out var session))
+        {
+            return null;
+        }
+        if (now <= session.ExpiresAt)
+        {
+            return session;
+        }
+        _sessions.Remove(peerId);
+        _sessionsById.Remove(session.Id);
+        return null;
+    }
+
     private void MergeSession(PeerControlMessage message)
     {
         var runtime = Runtime();
@@ -1204,29 +1288,36 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             return;
         }
         TunnelRuntimeState? runtime;
-        List<PeerMeshPeer> peers;
+        List<(PeerMeshPeer Peer, PeerMeshSession? Session)> peers;
+        var now = DateTimeOffset.UtcNow;
         lock (_sync)
         {
             runtime = _runtime;
-            peers = _peers.Values.Where(x => x.Online && !string.IsNullOrWhiteSpace(x.ClientName)).ToList();
+            peers = _peers.Values
+                .Where(x => x.Online && !string.IsNullOrWhiteSpace(x.ClientName))
+                .Select(x => (Peer: x, Session: ReusableSessionLocked(x.ClientId, now)))
+                .ToList();
         }
         if (runtime is null)
         {
             return;
         }
-        foreach (var peer in peers)
+        foreach (var item in peers)
         {
-            await SendPeerControlAsync(FirstNonEmpty(peer.ClientName), new PeerControlMessage
+            await SendPeerControlAsync(FirstNonEmpty(item.Peer.ClientName), new PeerControlMessage
             {
                 Type = TypeCandidates,
                 SourceClientId = runtime.PeerMesh.ClientId,
                 SourceClientName = runtime.PeerMesh.ClientName,
                 SourceVirtualIp = runtime.PeerMesh.VirtualIp,
                 SourcePublicKey = runtime.PeerMesh.ClientPublicKey,
-                TargetClientId = peer.ClientId,
-                TargetClientName = peer.ClientName,
-                TargetVirtualIp = peer.VirtualIp,
-                TargetPublicKey = peer.PublicKey,
+                TargetClientId = item.Peer.ClientId,
+                TargetClientName = item.Peer.ClientName,
+                TargetVirtualIp = item.Peer.VirtualIp,
+                TargetPublicKey = item.Peer.PublicKey,
+                SessionId = item.Session?.Id,
+                Token = item.Session?.Token,
+                ExpiresAt = item.Session?.ExpiresAt.ToString("O"),
                 Candidates = candidates,
                 CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             }).ConfigureAwait(false);
@@ -2404,6 +2495,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _device = null;
             _runtime = null;
             _writer = null;
+            _runtimeConfigKey = "";
             _peers.Clear();
             _sessions.Clear();
             _sessionsById.Clear();
@@ -2529,6 +2621,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     {
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? "";
     }
+
+    private static string NormalizeConfigValue(string? value) => value?.Trim() ?? "";
 
     private static long SmoothRtt(long previous, long sample)
     {

@@ -371,6 +371,62 @@ func TestAuthorizeRelayFrameRejectsNegotiatingSession(t *testing.T) {
 	}
 }
 
+func TestEffectivePathTypeUsesBusinessTrafficDominance(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := newPeerMeshTestService(db)
+
+	source := insertPeerClient(t, db, 3401, "tenant-a", "alice", "alice-laptop")
+	target := insertPeerClient(t, db, 3402, "tenant-a", "alice", "alice-nas")
+	insertPeerSession(t, db, 9401, source, target, StatusActive, time.Now().UTC().Add(time.Hour))
+
+	sessionID := int64(9401)
+	if _, err := service.ReportTraffic(ctx, source, ControlMessage{
+		SessionID:   &sessionID,
+		DirectBytes: 20_000,
+		RelayBytes:  5_800_000,
+	}); err != nil {
+		t.Fatalf("report traffic: %v", err)
+	}
+	rtt := int64(7)
+	view, err := service.ReportPath(ctx, source, ControlMessage{
+		SessionID: &sessionID,
+		PathType:  PathDirect,
+		Status:    StatusActive,
+		RTTMillis: &rtt,
+	})
+	if err != nil {
+		t.Fatalf("report path: %v", err)
+	}
+	if view.PathType != PathRelay {
+		t.Fatalf("session view pathType = %q, want %q: %+v", view.PathType, PathRelay, view)
+	}
+
+	stored := getPeerSession(t, db, sessionID)
+	if stored.PathType != PathRelay {
+		t.Fatalf("stored pathType = %q, want %q: %+v", stored.PathType, PathRelay, stored)
+	}
+
+	stats, err := service.PathStats(ctx, AccessContext{Username: "alice", TenantID: "tenant-a", Admin: true})
+	if err != nil {
+		t.Fatalf("path stats: %v", err)
+	}
+	if stats.ActiveDirectSessions != 0 || stats.ActiveRelaySessions != 1 {
+		t.Fatalf("active path counters mismatch: %+v", stats)
+	}
+	if stats.ActiveDirectRatio == nil || *stats.ActiveDirectRatio != 0 {
+		t.Fatalf("active direct ratio = %v, want 0", stats.ActiveDirectRatio)
+	}
+	relayActive := findPathTypeStat(stats.PathTypes, PathRelay, StatusActive)
+	if relayActive == nil || relayActive.Sessions != 1 || relayActive.ReportedSessions != 1 ||
+		relayActive.DirectBytes != 20_000 || relayActive.RelayBytes != 5_800_000 {
+		t.Fatalf("relay active aggregate mismatch: %+v", relayActive)
+	}
+	if directActive := findPathTypeStat(stats.PathTypes, PathDirect, StatusActive); directActive != nil {
+		t.Fatalf("unexpected direct active aggregate: %+v", directActive)
+	}
+}
+
 func openPeerMeshTestDB(t *testing.T) *store.DB {
 	t.Helper()
 	db, err := store.Open("sqlite", filepath.Join(t.TempDir(), "peer-mesh.db"))

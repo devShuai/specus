@@ -231,8 +231,7 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
                 if (result.Account is not null)
                 {
-                    await peerMesh.PushConfigAsync(result.Account, context.Lifetime).ConfigureAwait(false);
-                    await peerMesh.PushRosterAsync(result.Account, context.Lifetime).ConfigureAwait(false);
+                    await peerMesh.PushOnLoginAsync(result.Account, context.Lifetime).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException)

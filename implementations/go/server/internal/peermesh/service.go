@@ -948,7 +948,11 @@ func (s *Service) ReportPath(ctx context.Context, reporter store.ClientAccount, 
 	now := time.Now()
 	if !s.closeIfExpired(item, now) {
 		if strings.TrimSpace(report.PathType) != "" {
-			item.PathType = capString(report.PathType, 40)
+			if item.DirectBytes <= 0 && item.RelayBytes <= 0 {
+				item.PathType = capString(report.PathType, 40)
+			} else {
+				item.PathType = effectivePathType(*item)
+			}
 		}
 		if strings.TrimSpace(report.Status) != "" {
 			item.Status = capString(report.Status, 40)
@@ -1389,6 +1393,7 @@ func (s *Service) applyTraffic(item *store.PeerMeshSession, directBytes, relayBy
 	}
 	item.DirectBytes = saturatedAdd(item.DirectBytes, directBytes)
 	item.RelayBytes = saturatedAdd(item.RelayBytes, relayBytes)
+	item.PathType = effectivePathType(*item)
 	item.LastTrafficAt = &now
 	item.UpdatedAt = now
 }
@@ -1492,13 +1497,26 @@ func sessionView(item store.PeerMeshSession) SessionView {
 	return SessionView{
 		ID: item.ID, SourceClientID: item.SourceClientID, SourceClientName: item.SourceClientName,
 		TargetClientID: item.TargetClientID, TargetClientName: item.TargetClientName,
-		PathType: item.PathType, Status: item.Status, RTTMillis: item.RTTMillis,
+		PathType: effectivePathType(item), Status: item.Status, RTTMillis: item.RTTMillis,
 		LocalEndpoint: item.LocalEndpoint, RemoteEndpoint: item.RemoteEndpoint,
 		DirectBytes: item.DirectBytes, RelayBytes: item.RelayBytes,
 		LastTrafficAt: timePtrString(item.LastTrafficAt), StartedAt: item.StartedAt.Format(time.RFC3339Nano),
 		UpdatedAt: item.UpdatedAt.Format(time.RFC3339Nano), ExpiresAt: item.ExpiresAt.Format(time.RFC3339Nano),
 		ClosedAt: timePtrString(item.ClosedAt),
 	}
+}
+
+func effectivePathType(item store.PeerMeshSession) string {
+	if item.RelayBytes > item.DirectBytes {
+		return PathRelay
+	}
+	if item.DirectBytes > item.RelayBytes {
+		return PathDirect
+	}
+	if strings.TrimSpace(item.PathType) != "" {
+		return item.PathType
+	}
+	return PathDirect
 }
 
 func totalPages(total, size int) int {

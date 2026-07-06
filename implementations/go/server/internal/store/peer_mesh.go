@@ -397,13 +397,18 @@ func (db *DB) AggregatePeerMeshPathTypes(ctx context.Context, tenantID string, c
 			args = append(args, id)
 		}
 	}
-	query := db.rebind(`SELECT path_type, status,
+	effectivePathType := `CASE
+		WHEN relay_bytes > direct_bytes THEN 'RELAY'
+		WHEN direct_bytes > relay_bytes THEN 'DIRECT'
+		ELSE path_type
+	END`
+	query := db.rebind(`SELECT ` + effectivePathType + ` AS path_type, status,
 		COUNT(*) AS sessions,
 		COUNT(rtt_millis) AS reported_sessions,
 		AVG(rtt_millis) AS avg_rtt_millis,
 		COALESCE(SUM(direct_bytes), 0) AS direct_bytes,
 		COALESCE(SUM(relay_bytes), 0) AS relay_bytes
-		FROM peer_mesh_session` + where + ` GROUP BY path_type, status`)
+		FROM peer_mesh_session` + where + ` GROUP BY ` + effectivePathType + `, status`)
 	rows, err := db.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err

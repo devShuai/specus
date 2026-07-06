@@ -229,6 +229,8 @@ public sealed class PeerMeshService
             Type = TypeConfig,
             SourceClientId = account.Id,
             SourceClientName = account.ClientName,
+            TargetClientId = account.Id,
+            TargetClientName = account.ClientName,
             PeerMesh = config,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         }, cancellationToken).ConfigureAwait(false);
@@ -254,6 +256,20 @@ public sealed class PeerMeshService
             Peers = peers,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task PushOnLoginAsync(ClientAccount account, CancellationToken cancellationToken)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+        await PushConfigAsync(account, cancellationToken).ConfigureAwait(false);
+        var targets = await RosterRefreshTargetsAsync(account, cancellationToken).ConfigureAwait(false);
+        foreach (var target in targets)
+        {
+            await PushRosterAsync(target, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task<IReadOnlyList<PeerMeshDeviceView>> ListDevicesAsync(ManagementContext context,
@@ -433,7 +449,15 @@ public sealed class PeerMeshService
             }
         }
         var pathRows = await sessionQuery
-            .GroupBy(s => new { s.PathType, s.Status })
+            .GroupBy(s => new
+            {
+                PathType = s.RelayBytes > s.DirectBytes
+                    ? PathRelay
+                    : s.DirectBytes > s.RelayBytes
+                        ? PathDirect
+                        : s.PathType,
+                s.Status,
+            })
             .Select(g => new
             {
                 g.Key.PathType,
@@ -738,7 +762,12 @@ public sealed class PeerMeshService
         var now = DateTimeOffset.UtcNow;
         if (!CloseIfExpired(session, now))
         {
-            session.PathType = Limit(string.IsNullOrWhiteSpace(report.PathType) ? session.PathType : report.PathType, 40)!;
+            if (!string.IsNullOrWhiteSpace(report.PathType))
+            {
+                session.PathType = session.DirectBytes <= 0 && session.RelayBytes <= 0
+                    ? Limit(report.PathType, 40)!
+                    : EffectivePathType(session);
+            }
             session.Status = Limit(string.IsNullOrWhiteSpace(report.Status) ? StatusActive : report.Status, 40)!;
             session.RttMillis = report.RttMillis;
             session.LocalEndpoint = Limit(report.LocalEndpoint, 255);
@@ -819,15 +848,17 @@ public sealed class PeerMeshService
                 await SendCloseAsync(session, cancellationToken).ConfigureAwait(false);
             }
         }
-        var targets = await _db.ClientAccounts.AsNoTracking()
-            .Where(c => c.TenantId == account.TenantId)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
+        var targets = await RosterRefreshTargetsAsync(account, cancellationToken).ConfigureAwait(false);
         foreach (var target in targets)
         {
             await PushRosterAsync(target, cancellationToken).ConfigureAwait(false);
         }
     }
+
+    private Task<List<ClientAccount>> RosterRefreshTargetsAsync(ClientAccount account, CancellationToken cancellationToken) =>
+        _db.ClientAccounts.AsNoTracking()
+            .Where(c => c.TenantId == account.TenantId)
+            .ToListAsync(cancellationToken);
 
     private async Task<IReadOnlyList<RosterItem>> AllowedRosterAsync(ClientAccount account,
         CancellationToken cancellationToken)
@@ -1090,6 +1121,7 @@ public sealed class PeerMeshService
         }
         session.DirectBytes = SaturatedAdd(session.DirectBytes, directBytes);
         session.RelayBytes = SaturatedAdd(session.RelayBytes, relayBytes);
+        session.PathType = EffectivePathType(session);
         session.LastTrafficAt = now;
         session.UpdatedAt = now;
     }
@@ -1168,10 +1200,23 @@ public sealed class PeerMeshService
 
     private static PeerMeshSessionView SessionView(PeerMeshSession session) => new(
         session.Id, session.SourceClientId, session.SourceClientName, session.TargetClientId,
-        session.TargetClientName, session.PathType, session.Status, session.RttMillis,
+        session.TargetClientName, EffectivePathType(session), session.Status, session.RttMillis,
         session.LocalEndpoint, session.RemoteEndpoint, session.DirectBytes, session.RelayBytes,
         Iso(session.LastTrafficAt), Iso(session.StartedAt)!, Iso(session.UpdatedAt)!,
         Iso(session.ExpiresAt)!, Iso(session.ClosedAt));
+
+    private static string EffectivePathType(PeerMeshSession session)
+    {
+        if (session.RelayBytes > session.DirectBytes)
+        {
+            return PathRelay;
+        }
+        if (session.DirectBytes > session.RelayBytes)
+        {
+            return PathDirect;
+        }
+        return string.IsNullOrWhiteSpace(session.PathType) ? PathDirect : session.PathType;
+    }
 
     private static int TotalPages(long total, int size) =>
         total <= 0 || size <= 0 ? 0 : (int)((total + size - 1) / size);

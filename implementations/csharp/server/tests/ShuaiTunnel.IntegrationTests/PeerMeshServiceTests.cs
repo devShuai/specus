@@ -128,6 +128,33 @@ public sealed class PeerMeshServiceTests
     }
 
     [Fact]
+    public async Task PushOnLoginRefreshesRosterForTenantPeers()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(2101, "tenant-a", "alice", "alice-laptop");
+        var target = fixture.AddClient(2102, "tenant-a", "alice", "alice-nas");
+        fixture.AddDevice(source, "100.96.0.22", "source-key");
+        fixture.AddDevice(target, "100.96.0.23", "target-key");
+        await fixture.SaveChangesAsync();
+
+        var sourceWriter = fixture.Bind(source);
+        var targetWriter = fixture.Bind(target);
+
+        await fixture.Service.PushOnLoginAsync(source, CancellationToken.None);
+
+        var sourceMessages = sourceWriter.PeerMessages();
+        Assert.Contains(sourceMessages, message => message.Type == "peer-config"
+            && message.SourceClientId == source.Id
+            && message.TargetClientId == source.Id);
+        Assert.Contains(sourceMessages, message => message.Type == "roster"
+            && message.Peers is not null
+            && message.Peers.Any(peer => peer.ClientId == target.Id && peer.Online));
+
+        var targetRoster = Assert.Single(targetWriter.PeerMessages(), message => message.Type == "roster");
+        Assert.Contains(targetRoster.Peers ?? [], peer => peer.ClientId == source.Id && peer.Online);
+    }
+
+    [Fact]
     public async Task PathStatsAggregatesDirectRatioReportedSessionsAndNatTypes()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();
@@ -235,6 +262,68 @@ public sealed class PeerMeshServiceTests
         Assert.NotNull(stored.LastTrafficAt);
         Assert.Equal(PeerMeshService.StatusActive, stored.Status);
         Assert.Null(stored.ClosedAt);
+    }
+
+    [Fact]
+    public async Task EffectivePathTypeUsesBusinessTrafficDominance()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(3401, "tenant-a", "alice", "alice-laptop");
+        var target = fixture.AddClient(3402, "tenant-a", "alice", "alice-nas");
+        fixture.AddSession(9401, source, target, PeerMeshService.StatusActive, DateTimeOffset.UtcNow.AddHours(1));
+        await fixture.SaveChangesAsync();
+
+        await fixture.Service.HandleSignalAsync(new MessageRequestPacket
+        {
+            MessageType = MessageType.PeerControl,
+            Message = JsonSerializer.Serialize(new PeerControlMessage
+            {
+                Type = "traffic-report",
+                SessionId = 9401,
+                DirectBytes = 20_000,
+                RelayBytes = 5_800_000,
+            }),
+        }, source.ClientName, CancellationToken.None);
+        await fixture.Service.HandleSignalAsync(new MessageRequestPacket
+        {
+            MessageType = MessageType.PeerControl,
+            Message = JsonSerializer.Serialize(new PeerControlMessage
+            {
+                Type = "path-report",
+                SessionId = 9401,
+                PathType = PeerMeshService.PathDirect,
+                Status = PeerMeshService.StatusActive,
+                RttMillis = 7,
+            }),
+        }, source.ClientName, CancellationToken.None);
+
+        var stored = await ReloadSessionAsync(fixture, 9401);
+        Assert.Equal(PeerMeshService.PathRelay, stored.PathType);
+
+        var sessions = await fixture.Service.ListSessionsAsync(
+            new ManagementContext("tenant-a", "alice", ManagementRole.Admin, true),
+            10,
+            CancellationToken.None);
+        var view = Assert.Single(sessions);
+        Assert.Equal(PeerMeshService.PathRelay, view.PathType);
+        Assert.Equal(20_000, view.DirectBytes);
+        Assert.Equal(5_800_000, view.RelayBytes);
+
+        var stats = await fixture.Service.PathStatsAsync(
+            new ManagementContext("tenant-a", "alice", ManagementRole.Admin, true),
+            CancellationToken.None);
+        Assert.Equal(1, stats.ActiveSessions);
+        Assert.Equal(0, stats.ActiveDirectSessions);
+        Assert.Equal(1, stats.ActiveRelaySessions);
+        Assert.Equal(0d, stats.ActiveDirectRatio);
+        var relayActive = Assert.Single(stats.PathTypes,
+            item => item.PathType == PeerMeshService.PathRelay && item.Status == PeerMeshService.StatusActive);
+        Assert.Equal(1, relayActive.Sessions);
+        Assert.Equal(1, relayActive.ReportedSessions);
+        Assert.Equal(20_000, relayActive.DirectBytes);
+        Assert.Equal(5_800_000, relayActive.RelayBytes);
+        Assert.DoesNotContain(stats.PathTypes,
+            item => item.PathType == PeerMeshService.PathDirect && item.Status == PeerMeshService.StatusActive);
     }
 
     [Fact]

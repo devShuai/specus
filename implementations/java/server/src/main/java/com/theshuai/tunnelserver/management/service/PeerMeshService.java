@@ -311,7 +311,11 @@ public class PeerMeshService {
             return toSessionView(sessionRepository.save(session));
         }
         if (StringUtils.hasText(report.getPathType())) {
-            session.setPathType(limit(report.getPathType(), 40));
+            if (session.getDirectBytes() <= 0 && session.getRelayBytes() <= 0) {
+                session.setPathType(limit(report.getPathType(), 40));
+            } else {
+                session.setPathType(effectivePathType(session));
+            }
         }
         session.setStatus(StringUtils.hasText(report.getStatus())
                 ? limit(report.getStatus(), 40)
@@ -789,7 +793,7 @@ public class PeerMeshService {
                 session.getSourceClientName(),
                 session.getTargetClientId(),
                 session.getTargetClientName(),
-                session.getPathType(),
+                effectivePathType(session),
                 session.getStatus(),
                 session.getRttMillis(),
                 session.getLocalEndpoint(),
@@ -803,6 +807,19 @@ public class PeerMeshService {
                 session.getExpiresAt(),
                 session.getClosedAt()
         );
+    }
+
+    private String effectivePathType(PeerMeshSession session) {
+        if (session == null) {
+            return PATH_DIRECT;
+        }
+        if (session.getRelayBytes() > session.getDirectBytes()) {
+            return PATH_RELAY;
+        }
+        if (session.getDirectBytes() > session.getRelayBytes()) {
+            return PATH_DIRECT;
+        }
+        return StringUtils.hasText(session.getPathType()) ? session.getPathType() : PATH_DIRECT;
     }
 
     private String resolvePeerHost(String requestServerName) {
@@ -861,6 +878,7 @@ public class PeerMeshService {
         }
         session.setDirectBytes(saturatedAdd(session.getDirectBytes(), directBytes));
         session.setRelayBytes(saturatedAdd(session.getRelayBytes(), relayBytes));
+        session.setPathType(effectivePathType(session));
         session.setLastTrafficAt(now.toString());
         session.setLastKeepaliveAt(now.toString());
         session.setUpdatedAt(now.toString());

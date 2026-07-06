@@ -111,8 +111,8 @@ export function PeerMeshPanel() {
     () => sessions.filter((session) => isPeerSessionEffectivelyActive(session, deviceById, now)),
     [sessions, deviceById, now],
   );
-  const directSessions = useMemo(() => activeSessions.filter((session) => session.pathType === "DIRECT"), [activeSessions]);
-  const relaySessions = useMemo(() => activeSessions.filter((session) => session.pathType === "RELAY"), [activeSessions]);
+  const directSessions = useMemo(() => activeSessions.filter((session) => effectivePeerSessionPathType(session) === "DIRECT"), [activeSessions]);
+  const relaySessions = useMemo(() => activeSessions.filter((session) => effectivePeerSessionPathType(session) === "RELAY"), [activeSessions]);
   const peerTrafficBytes = useMemo(
     () => sessions.reduce((total, session) => total + (session.directBytes || 0) + (session.relayBytes || 0), 0),
     [sessions],
@@ -564,21 +564,24 @@ export function PeerMeshPanel() {
                 <CardBody className="gap-2 p-3">
                   <div className="flex items-center justify-between"><h3 className="text-small font-semibold">活跃会话</h3><span className="text-tiny text-default-500">有效 {activeSessions.length} / 未关闭 {sessionTotal}</span></div>
                   <div className="flex-1 space-y-1 overflow-y-auto">
-                    {activeSessions.map((s) => (
-                      <button key={s.id} type="button" onClick={() => setSelectedSession(s)}
-                        className={`flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors ${selectedSession?.id === s.id ? "bg-primary-50 dark:bg-primary-400/10" : "hover:bg-default-100"}`}>
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-small font-medium">{s.sourceClientName} → {s.targetClientName}</div>
-                          <div className="mt-0.5 flex items-center gap-2 text-tiny text-default-500">
-                            <Chip size="sm" variant="flat" color={s.pathType === "DIRECT" ? "success" : s.pathType === "RELAY" ? "warning" : "default"}>{s.pathType}</Chip>
-                            <span>{s.rttMillis != null ? `${s.rttMillis} ms` : "-"}</span>
-                            <span>·</span>
-                            <span>{s.lastKeepaliveAt ? formatDateTime(s.lastKeepaliveAt) : "-"}</span>
+                    {activeSessions.map((s) => {
+                      const pathType = effectivePeerSessionPathType(s);
+                      return (
+                        <button key={s.id} type="button" onClick={() => setSelectedSession(s)}
+                          className={`flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors ${selectedSession?.id === s.id ? "bg-primary-50 dark:bg-primary-400/10" : "hover:bg-default-100"}`}>
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-small font-medium">{s.sourceClientName} → {s.targetClientName}</div>
+                            <div className="mt-0.5 flex items-center gap-2 text-tiny text-default-500">
+                              <Chip size="sm" variant="flat" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>
+                              <span>{s.rttMillis != null ? `${s.rttMillis} ms` : "-"}</span>
+                              <span>·</span>
+                              <span>{s.lastKeepaliveAt ? formatDateTime(s.lastKeepaliveAt) : "-"}</span>
+                            </div>
                           </div>
-                        </div>
-                        <svg className="h-4 w-4 shrink-0 text-default-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
-                      </button>
-                    ))}
+                          <svg className="h-4 w-4 shrink-0 text-default-400" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
+                        </button>
+                      );
+                    })}
                   </div>
                   {sessionTotalPages > 1 && <div className="flex justify-end pt-1"><Pagination showControls size="sm" page={sessionPage + 1} total={sessionTotalPages} onChange={(p) => setSessionPage(Math.max(0, p - 1))} /></div>}
                 </CardBody>
@@ -598,10 +601,11 @@ export function PeerMeshPanel() {
                     <h3 className="text-small font-semibold">活跃会话 · 有效 {activeSessions.length} / 未关闭 {sessionTotal}</h3>
                     <MobileListCardList items={activeSessions} isLoading={loading} emptyContent="暂无活跃 peer session" renderCard={(raw) => {
                       const s = raw as PeerMeshSession;
+                      const pathType = effectivePeerSessionPathType(s);
                       return (
                         <MobileListCard key={s.id}
                           title={<span className="break-all">{s.sourceClientName} → {s.targetClientName}</span>}
-                          badges={<Chip size="sm" variant="flat" color={s.pathType === "DIRECT" ? "success" : s.pathType === "RELAY" ? "warning" : "default"}>{s.pathType}</Chip>}
+                          badges={<Chip size="sm" variant="flat" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>}
                           fields={[
                             { label: "RTT", value: s.rttMillis == null ? "-" : `${s.rttMillis} ms` },
                             { label: "Keepalive", value: s.lastKeepaliveAt ? formatDateTime(s.lastKeepaliveAt) : "-" },
@@ -639,12 +643,13 @@ export function PeerMeshPanel() {
 /* ──────── SessionDetail 会话详情面板 ──────── */
 
 function SessionDetail({ session, onDisconnect }: { session: PeerMeshSession; onDisconnect: (session: PeerMeshSession) => void }) {
+  const pathType = effectivePeerSessionPathType(session);
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <h3 className="text-base font-semibold">{session.sourceClientName} → {session.targetClientName}</h3>
         <div className="flex items-center gap-2">
-          <Chip size="sm" variant="flat" color={session.pathType === "DIRECT" ? "success" : session.pathType === "RELAY" ? "warning" : "default"}>{session.pathType}</Chip>
+          <Chip size="sm" variant="flat" color={pathType === "DIRECT" ? "success" : pathType === "RELAY" ? "warning" : "default"}>{pathType}</Chip>
           <Chip size="sm" variant="flat" color={session.status === "ACTIVE" ? "success" : session.status === "CLOSED" ? "danger" : "default"}>{session.status}</Chip>
         </div>
       </div>
@@ -1352,6 +1357,7 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
           ) : (
             topologyLinks.slice(0, 12).map((link) => {
               const session = link.representative;
+              const pathType = effectivePeerSessionPathType(session);
               return (
                 <div key={link.key} className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1360,8 +1366,8 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
                       <span className="px-2 text-default-400">{"<->"}</span>
                       <span>{link.secondName}</span>
                     </div>
-                    <Chip size="sm" color={pathColor(session.pathType, session.status)} variant="flat">
-                      {session.pathType} · {session.status}
+                    <Chip size="sm" color={pathColor(pathType, session.status)} variant="flat">
+                      {pathType} · {session.status}
                     </Chip>
                   </div>
                   <div className="mt-2 grid gap-1 text-tiny text-default-500 sm:grid-cols-2">
@@ -1442,8 +1448,8 @@ function buildTopologyLinks(devices: PeerMeshDevice[], sessions: PeerMeshSession
         representative,
         sessions: items,
         activeSessions: activeItems.length,
-        directSessions: activeItems.filter((item) => item.pathType === "DIRECT").length,
-        relaySessions: activeItems.filter((item) => item.pathType === "RELAY").length,
+        directSessions: activeItems.filter((item) => effectivePeerSessionPathType(item) === "DIRECT").length,
+        relaySessions: activeItems.filter((item) => effectivePeerSessionPathType(item) === "RELAY").length,
         directBytes,
         relayBytes,
         totalBytes: directBytes + relayBytes,
@@ -1479,7 +1485,7 @@ function latestSessionTime(sessions: PeerMeshSession[]) {
 
 function compareRepresentativeSession(left: PeerMeshSession, right: PeerMeshSession) {
   const statusScore = (session: PeerMeshSession) => (session.status === "ACTIVE" ? 2 : session.status === "NEGOTIATING" ? 1 : 0);
-  const pathScore = (session: PeerMeshSession) => (session.pathType === "DIRECT" ? 2 : session.pathType === "RELAY" ? 1 : 0);
+  const pathScore = (session: PeerMeshSession) => (effectivePeerSessionPathType(session) === "DIRECT" ? 2 : effectivePeerSessionPathType(session) === "RELAY" ? 1 : 0);
   return (
     statusScore(right) - statusScore(left) ||
     pathScore(right) - pathScore(left) ||
@@ -1490,6 +1496,18 @@ function compareRepresentativeSession(left: PeerMeshSession, right: PeerMeshSess
 function sessionTimeMillis(session: PeerMeshSession) {
   const time = Date.parse(session.lastTrafficAt || session.updatedAt || session.startedAt || "");
   return Number.isFinite(time) ? time : 0;
+}
+
+function effectivePeerSessionPathType(session: PeerMeshSession) {
+  const directBytes = session.directBytes || 0;
+  const relayBytes = session.relayBytes || 0;
+  if (relayBytes > directBytes) {
+    return "RELAY";
+  }
+  if (directBytes > relayBytes) {
+    return "DIRECT";
+  }
+  return session.pathType || "DIRECT";
 }
 
 function pathColor(pathType: string, status: string): "default" | "success" | "warning" {

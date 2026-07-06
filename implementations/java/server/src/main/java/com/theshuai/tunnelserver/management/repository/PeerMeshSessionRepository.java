@@ -85,9 +85,9 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
     Page<PeerMeshSession> findVisibleOpenPage(String tenantId, List<Long> clientIds, String closedStatus, Pageable pageable);
 
     /**
-     * 打洞/路径统计投影。reportedSessions = rttMillis 非空的会话数——rtt 只由客户端
-     * PATH_REPORT 写入，因此非空即「至少确立过一次路径」；纯 NEGOTIATING 超时关闭的
-     * 会话不计入，避免 createSession 默认 pathType=DIRECT 虚高直连占比。
+     * 打洞/路径统计投影。pathType 使用「有效业务路径」：有业务流量时按 direct/relay
+     * 字节占优方归类，没业务流量时才使用 PATH_REPORT 写入的探测路径。reportedSessions =
+     * rttMillis 非空的会话数，表示至少确立过一次路径。
      */
     interface PathTypeAggregate {
         String getPathType();
@@ -106,19 +106,34 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
     }
 
     @Query("""
-            select s.pathType as pathType, s.status as status,
+            select case
+                     when s.relayBytes > s.directBytes then 'RELAY'
+                     when s.directBytes > s.relayBytes then 'DIRECT'
+                     else s.pathType
+                   end as pathType,
+                   s.status as status,
                    count(s) as sessions, count(s.rttMillis) as reportedSessions,
                    avg(s.rttMillis) as avgRttMillis,
                    coalesce(sum(s.directBytes), 0) as directBytes,
                    coalesce(sum(s.relayBytes), 0) as relayBytes
             from PeerMeshSession s
             where s.tenantId = :tenantId
-            group by s.pathType, s.status
+            group by case
+                       when s.relayBytes > s.directBytes then 'RELAY'
+                       when s.directBytes > s.relayBytes then 'DIRECT'
+                       else s.pathType
+                     end,
+                     s.status
             """)
     List<PathTypeAggregate> aggregatePathTypes(String tenantId);
 
     @Query("""
-            select s.pathType as pathType, s.status as status,
+            select case
+                     when s.relayBytes > s.directBytes then 'RELAY'
+                     when s.directBytes > s.relayBytes then 'DIRECT'
+                     else s.pathType
+                   end as pathType,
+                   s.status as status,
                    count(s) as sessions, count(s.rttMillis) as reportedSessions,
                    avg(s.rttMillis) as avgRttMillis,
                    coalesce(sum(s.directBytes), 0) as directBytes,
@@ -126,7 +141,12 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
             from PeerMeshSession s
             where s.tenantId = :tenantId
               and (s.sourceClientId in :clientIds or s.targetClientId in :clientIds)
-            group by s.pathType, s.status
+            group by case
+                       when s.relayBytes > s.directBytes then 'RELAY'
+                       when s.directBytes > s.relayBytes then 'DIRECT'
+                       else s.pathType
+                     end,
+                     s.status
             """)
     List<PathTypeAggregate> aggregateVisiblePathTypes(String tenantId, List<Long> clientIds);
 }
