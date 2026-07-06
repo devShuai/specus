@@ -21,7 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="tunnelClientConfig.example.json">
+    <None Include="client.example.jsonc">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <Content Include="..\..\..\..\java\client\src\main\resources\native\windows\**\*">

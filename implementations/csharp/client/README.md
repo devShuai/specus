@@ -8,7 +8,7 @@ shuai-tunnel 内网客户端的 .NET 实现,与 Java / Go 客户端**线协议�
 ```bash
 cd implementations/csharp/client
 dotnet build ShuaiTunnel.Client.slnx
-dotnet run --project src/ShuaiTunnel.Client                   # 当前目录读取 tunnelClientConfig.json
+dotnet run --project src/ShuaiTunnel.Client                   # 当前目录读取 client.jsonc
 dotnet run --project src/ShuaiTunnel.Client -- --config path  # 显式配置文件
 dotnet run --project src/ShuaiTunnel.Client.Desktop           # Windows 桌面客户端
 ```
@@ -17,7 +17,7 @@ dotnet run --project src/ShuaiTunnel.Client.Desktop           # Windows 桌面�
 
 ```bash
 dotnet publish src/ShuaiTunnel.Client -c Release -o out
-./out/shuai-tunnel-client --config /etc/shuai-tunnel/client.json
+./out/shuai-tunnel-client --config /etc/shuai-tunnel/client.jsonc
 ```
 
 桌面版发布:
@@ -32,12 +32,14 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
 `%APPDATA%\ShuaiTunnel\desktop-client.json`。如果启用 `windows-wintun` 或 `auto` 创建虚拟网卡，
 仍然需要管理员权限和随包输出的 `native/windows/<arch>/wintun.dll`。
 
-## 配置 (`tunnelClientConfig.json`)
+## 配置 (`client.jsonc`)
 
-与 Java/Go 客户端共享同一 JSON 结构(可直接互换):
+与 Java/Go 客户端共享同一 JSONC 结构(可直接互换，支持注释和尾逗号):
 
-```json
+```jsonc
 {
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // 服务端管理 HTTP 地址
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "demo-client",
   "secret": "test1234",
@@ -51,7 +53,7 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
 签名登录。登录成功后服务端返回运行时 `clientName/clientSessionId/accessToken`、控制通道地址、TCP
 映射和 HTTP 路由快照；客户端再发起控制通道长连接。
 
-配置文件加载顺序与 Java 客户端一致:`{cwd}/tunnelClientConfig.json` → `./tunnelClientConfig.json` →
+配置文件加载顺序与 Java 客户端一致:`{cwd}/client.jsonc` → `./client.jsonc` →
 失败抛 `FileNotFoundException`。
 
 ## 行为对齐(与 Java 严格一致)

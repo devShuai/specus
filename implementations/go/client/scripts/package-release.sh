@@ -7,7 +7,7 @@
 #
 # 产物: out/release/<version>/shuai-tunnel-client-go-<version>-<platform>-<arch>.{tar.gz|zip}
 #   - 二进制为静态交叉编译（CGO_ENABLED=0），wintun.dll 已 go:embed 进 Windows 二进制，
-#     无需随包携带；包内附 tunnelClientConfig.example.json，Windows 包附 Wintun LICENSE。
+#     无需随包携带；包内附 client.example.jsonc，Windows 包附 Wintun LICENSE。
 #   - platform/arch 命名与管理台「客户端下载」的 platform(windows|linux|macos) /
 #     arch(x64|arm64) 枚举一致，可直接登记为下载链接。
 #   - 同目录生成 SHA256SUMS.txt。
@@ -63,7 +63,7 @@ for target in "${TARGETS[@]}"; do
     go build -trimpath -ldflags "-s -w" \
     -o "${stage}/${bin}" ./cmd/shuai-tunnel-client
 
-  cp tunnelClientConfig.example.json "${stage}/"
+  cp client.example.jsonc "${stage}/"
   if [ "${goos}" = "windows" ]; then
     # wintun.dll 已嵌入二进制，但其许可证要求随分发附带
     cp internal/client/native/windows/LICENSE.txt "${stage}/WINTUN-LICENSE.txt"
@@ -81,7 +81,7 @@ for target in "${TARGETS[@]}"; do
     tar -cf "${plain_tar}" -C "${stage}" \
       --owner=0 --group=0 --numeric-owner --mode=0755 "${bin}"
     tar -rf "${plain_tar}" -C "${stage}" \
-      --owner=0 --group=0 --numeric-owner --mode=0644 tunnelClientConfig.example.json
+      --owner=0 --group=0 --numeric-owner --mode=0644 client.example.jsonc
     gzip -9 -f "${plain_tar}"
   fi
   echo "    -> ${artifact}"

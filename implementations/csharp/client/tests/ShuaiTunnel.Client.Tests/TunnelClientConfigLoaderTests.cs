@@ -8,17 +8,19 @@ public sealed class TunnelClientConfigLoaderTests
     [Fact]
     public void LoadNormalizesPeerMeshOptions()
     {
-        var path = Path.Combine(Path.GetTempPath(), $"shuai-tunnel-config-{Guid.NewGuid():N}.json");
+        var path = Path.Combine(Path.GetTempPath(), $"shuai-tunnel-client-{Guid.NewGuid():N}.jsonc");
         try
         {
             File.WriteAllText(path, """
             {
+              "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+              // JSONC comments are allowed in client.jsonc.
               "serverBaseUrl": " http://127.0.0.1:8088/ ",
               "apiKey": " demo-client ",
               "secret": " test1234 ",
               "peerMeshDevice": " auto ",
               "peerMeshTunName": " mesh0 ",
-              "peerMeshMtu": 4096
+              "peerMeshMtu": 4096,
             }
             """);
 
@@ -40,7 +42,7 @@ public sealed class TunnelClientConfigLoaderTests
     [Fact]
     public void LoadDefaultsPeerMeshOptions()
     {
-        var path = Path.Combine(Path.GetTempPath(), $"shuai-tunnel-config-{Guid.NewGuid():N}.json");
+        var path = Path.Combine(Path.GetTempPath(), $"shuai-tunnel-client-{Guid.NewGuid():N}.jsonc");
         try
         {
             File.WriteAllText(path, """

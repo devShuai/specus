@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://devshuai.com/shuai-tunnel/schemas/client-auth-login.schema.json",
+  "$id": "https://tunnel.devshuai.com/schemas/client-auth-login.schema.json",
   "title": "shuai-tunnel 客户端 HTTP 登录",
   "description": "POST /api/client/auth/login 的请求和响应字段约束。",
   "oneOf": [

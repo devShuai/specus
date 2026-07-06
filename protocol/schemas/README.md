@@ -2,9 +2,11 @@
 
 本目录用于保存跨语言共享的 JSON Schema。Schema 只描述线协议字段，不生成或存放任意语言的业务代码。
 
+前端构建会把 `*.schema.json` 同步到 `apps/admin-web/public/schemas/`，线上可通过 `https://tunnel.devshuai.com/schemas/<schema-file>` 访问。
+
 当前已有：
 
-- [client-startup-config.schema.json](client-startup-config.schema.json)：客户端 `tunnelClientConfig.json` 启动配置。
+- [client-startup-config.schema.json](client-startup-config.schema.json)：客户端 `client.jsonc` JSONC 启动配置。
 - [client-auth-login.schema.json](client-auth-login.schema.json)：客户端 HTTP 登录请求和响应。
 - [nat-control.schema.json](nat-control.schema.json)：`MessageType.NAT_CONTROL` 的 JSON 消息体。
 - [peer-control.schema.json](peer-control.schema.json)：`MessageType.PEER_CONTROL` 的 JSON 信令。

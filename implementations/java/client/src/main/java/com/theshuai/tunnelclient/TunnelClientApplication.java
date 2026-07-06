@@ -42,7 +42,7 @@ import lombok.extern.slf4j.Slf4j;
 @SpringBootApplication
 @Slf4j
 public class TunnelClientApplication {
-    private static final String CONFIG_FILE = "tunnelClientConfig.json";
+    private static final String CONFIG_FILE = "client.jsonc";
 
     public static void main(String[] args) {
         SpringApplication application = new SpringApplication(TunnelClientApplication.class);

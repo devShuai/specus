@@ -126,7 +126,7 @@ function QuickStartSection() {
 
       <DocCard title="4. 下载并启动客户端">
         <p>
-          打开「客户端下载」面板获取对应实现的客户端，按下面各 Tab 的说明启动。所有实现共享同一份 JSON 配置格式。
+          打开「客户端下载」面板获取对应实现的客户端，按下面各 Tab 的说明启动。所有实现共享同一份 JSONC 配置格式。
           端口映射、HTTP 路由和私有组网配置都由服务端登录响应下发。
         </p>
       </DocCard>
@@ -141,9 +141,9 @@ function JavaSection() {
         <p>JDK 21 或更高版本。</p>
       </DocCard>
 
-      <DocCard title="配置文件 tunnelClientConfig.json">
+      <DocCard title="配置文件 client.jsonc">
         <p className="mb-2 text-small">放在与 jar 同目录或工作目录下：</p>
-        <CodeBlock language="json" code={SAMPLE_CONFIG} />
+        <CodeBlock language="jsonc" code={SAMPLE_CONFIG} />
       </DocCard>
 
       <DocCard title="启动命令">
@@ -171,9 +171,9 @@ function GoSection() {
         <p>无需额外运行时，单二进制部署。各操作系统/架构有独立产物。</p>
       </DocCard>
 
-      <DocCard title="配置文件">
+      <DocCard title="配置文件 client.jsonc">
         <p className="mb-2 text-small">放在二进制同目录或工作目录下：</p>
-        <CodeBlock language="json" code={SAMPLE_CONFIG} />
+        <CodeBlock language="jsonc" code={SAMPLE_CONFIG} />
         <p className="mt-2 text-small text-default-500">
           非 Java 客户端需要与当前 Java 协议保持一致：启动配置只包含 HTTP 登录凭证，端口映射和 HTTP 路由由服务端下发。
         </p>
@@ -204,9 +204,9 @@ function CsharpSection() {
         </p>
       </DocCard>
 
-      <DocCard title="配置文件">
+      <DocCard title="配置文件 client.jsonc">
         <p className="mb-2 text-small">放在程序集所在目录或工作目录下：</p>
-        <CodeBlock language="json" code={SAMPLE_CONFIG} />
+        <CodeBlock language="jsonc" code={SAMPLE_CONFIG} />
         <p className="mt-2 text-small text-default-500">
           非 Java 客户端需要与当前 Java 协议保持一致：启动配置只包含 HTTP 登录凭证，端口映射和 HTTP 路由由服务端下发。
         </p>
@@ -244,7 +244,7 @@ function PeerMeshSection() {
       </DocCard>
 
       <DocCard title="客户端配置示例">
-        <CodeBlock language="json" code={PEER_MESH_CONFIG} />
+        <CodeBlock language="jsonc" code={PEER_MESH_CONFIG} />
       </DocCard>
 
       <DocCard title="UDP 端口">
@@ -509,18 +509,22 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
   );
 }
 
-// 共享配置示例（与 README.md "tunnelClientConfig.json" 样例保持一致）
+// 共享配置示例（与 README.md "client.jsonc" 样例保持一致）
 const SAMPLE_CONFIG = `{
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // 服务端管理 HTTP 地址
   "serverBaseUrl": "https://tunnel.example.com",
   "apiKey": "demo-client",
-  "secret": "your-client-secret"
+  "secret": "your-client-secret",
 }`;
 
 const PEER_MESH_CONFIG = `{
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // 服务端管理 HTTP 地址
   "serverBaseUrl": "https://tunnel.example.com",
   "apiKey": "demo-client",
   "secret": "your-client-secret",
   "peerMeshDevice": "auto",
   "peerMeshTunName": "shuai0",
-  "peerMeshMtu": 1400
+  "peerMeshMtu": 1280,
 }`;

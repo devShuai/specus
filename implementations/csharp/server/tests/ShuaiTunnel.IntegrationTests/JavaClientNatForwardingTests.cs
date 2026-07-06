@@ -92,7 +92,7 @@ public sealed class JavaClientNatForwardingTests : IAsyncLifetime
         await _server.SeedTunnelMappingAsync(_remoteListenPort, "127.0.0.1", _echo.BoundPort);
 
         _clientWorkDir = Directory.CreateTempSubdirectory("tunnel-client-nat-it-").FullName;
-        File.WriteAllText(Path.Combine(_clientWorkDir, "tunnelClientConfig.json"),
+        File.WriteAllText(Path.Combine(_clientWorkDir, "client.jsonc"),
             JsonSerializer.Serialize(new
             {
                 serverBaseUrl = _authStub.ServerBaseUrl,

@@ -8,10 +8,12 @@
 
 ## 启动配置
 
-客户端从当前工作目录读取 `tunnelClientConfig.json`：
+客户端从当前工作目录读取 `client.jsonc`。该文件使用 JSONC 语法，支持 `//` / `/* */` 注释和尾逗号：
 
-```json
+```jsonc
 {
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // 服务端管理 HTTP 地址
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "demo-client",
   "secret": "test1234",

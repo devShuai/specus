@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://devshuai.com/shuai-tunnel/schemas/client-startup-config.schema.json",
+  "$id": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
   "title": "shuai-tunnel 客户端启动配置",
-  "description": "tunnelClientConfig.json 的跨语言字段约束。",
+  "description": "client.jsonc JSONC 启动配置的跨语言字段约束。",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,6 +11,11 @@
     "secret"
   ],
   "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri-reference",
+      "description": "可选的本地或远程 JSON Schema 引用，用于编辑器提示。"
+    },
     "serverBaseUrl": {
       "type": "string",
       "format": "uri",
@@ -36,6 +41,7 @@
         "windows-wintun",
         "wintun",
         "utun",
+        "mac-utun",
         "macos-utun",
         "darwin-utun",
         "auto"

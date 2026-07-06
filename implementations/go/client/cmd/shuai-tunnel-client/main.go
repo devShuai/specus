@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "tunnelClientConfig.json", "path to the tunnel client JSON config")
+	configPath := flag.String("config", client.DefaultConfigFileName, "path to the tunnel client JSONC config")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)

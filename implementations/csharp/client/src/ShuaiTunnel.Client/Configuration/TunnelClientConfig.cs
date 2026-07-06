@@ -6,7 +6,7 @@ namespace ShuaiTunnel.Client.Configuration;
 // /api/client/auth/login and NAT_CONTROL, not by the local startup file.
 
 /// <summary>
-/// Root configuration for the tunnel client, loaded from <c>tunnelClientConfig.json</c>.
+/// Root configuration for the tunnel client, loaded from <c>client.jsonc</c>.
 /// </summary>
 public sealed class TunnelClientConfig
 {

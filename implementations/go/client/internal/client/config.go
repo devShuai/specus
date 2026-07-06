@@ -20,6 +20,7 @@ type Config struct {
 }
 
 const (
+	DefaultConfigFileName  = "client.jsonc"
 	DefaultPeerMeshDevice  = "noop"
 	DefaultPeerMeshTunName = "shuai0"
 	DefaultPeerMeshMTU     = 1280
@@ -85,7 +86,7 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
+	if err := unmarshalJSONC(data, &config); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
 	if err := config.Validate(); err != nil {
@@ -130,4 +131,116 @@ func (config *Config) Validate() error {
 		return errors.New("secret is required")
 	}
 	return nil
+}
+
+func unmarshalJSONC(data []byte, value any) error {
+	withoutComments := stripJSONCComments(data)
+	normalized := stripJSONCTrailingCommas(withoutComments)
+	return json.Unmarshal(normalized, value)
+}
+
+func stripJSONCComments(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	inString := false
+	escaped := false
+	inLineComment := false
+	inBlockComment := false
+
+	for i := 0; i < len(data); i++ {
+		ch := data[i]
+		next := byte(0)
+		if i+1 < len(data) {
+			next = data[i+1]
+		}
+
+		switch {
+		case inLineComment:
+			if ch == '\r' || ch == '\n' {
+				inLineComment = false
+				out = append(out, ch)
+			} else {
+				out = append(out, ' ')
+			}
+			continue
+		case inBlockComment:
+			if ch == '*' && next == '/' {
+				inBlockComment = false
+				out = append(out, ' ', ' ')
+				i++
+			} else if ch == '\r' || ch == '\n' {
+				out = append(out, ch)
+			} else {
+				out = append(out, ' ')
+			}
+			continue
+		case inString:
+			out = append(out, ch)
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		if ch == '"' {
+			inString = true
+			out = append(out, ch)
+			continue
+		}
+		if ch == '/' && next == '/' {
+			inLineComment = true
+			out = append(out, ' ', ' ')
+			i++
+			continue
+		}
+		if ch == '/' && next == '*' {
+			inBlockComment = true
+			out = append(out, ' ', ' ')
+			i++
+			continue
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
+func stripJSONCTrailingCommas(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(data); i++ {
+		ch := data[i]
+		if inString {
+			out = append(out, ch)
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		if ch == '"' {
+			inString = true
+			out = append(out, ch)
+			continue
+		}
+		if ch == ',' {
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\r' || data[j] == '\n') {
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				continue
+			}
+		}
+		out = append(out, ch)
+	}
+	return out
 }

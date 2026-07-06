@@ -1,4 +1,6 @@
 {
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // client.jsonc is JSONC: comments and trailing commas are supported.
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "YOUR_CLIENT_API_KEY",
   "secret": "YOUR_CLIENT_SECRET",

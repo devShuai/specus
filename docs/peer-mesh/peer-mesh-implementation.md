@@ -77,7 +77,7 @@ NAT 类型探测说明：
 
 ## 客户端配置
 
-客户端仍使用 HTTP 登录配置文件 `tunnelClientConfig.json`。peer mesh 虚拟网卡由客户端配置控制，默认 `noop` 不接管本机路由。
+客户端仍使用 HTTP 登录配置文件 `client.jsonc`（JSONC）。peer mesh 虚拟网卡由客户端配置控制，默认 `noop` 不接管本机路由。
 
 ```json
 {

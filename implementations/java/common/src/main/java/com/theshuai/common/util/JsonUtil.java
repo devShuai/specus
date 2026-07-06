@@ -2,6 +2,7 @@ package com.theshuai.common.util;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.core.json.JsonReadFeature;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -16,6 +17,9 @@ public class JsonUtil {
 
     static {
         objectMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        objectMapper.getFactory().configure(JsonReadFeature.ALLOW_JAVA_COMMENTS.mappedFeature(), true);
+        objectMapper.getFactory().configure(JsonReadFeature.ALLOW_YAML_COMMENTS.mappedFeature(), true);
+        objectMapper.getFactory().configure(JsonReadFeature.ALLOW_TRAILING_COMMA.mappedFeature(), true);
     }
 
     public static JsonNode readString(String jsonString) {

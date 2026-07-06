@@ -412,7 +412,7 @@ Admin UI               AdminController        ClientManagementService    NatCont
 
 ## 13. 已知 gap 与演进路线
 
-- **TLS 客户端默认不开**：Java 客户端入口 `TunnelClientApplication` 仍以明文连接为默认，需把 TLS 抬到 `tunnelClientConfig.json` 字段（如 `tls: { enabled, trustStorePath, trustStorePassword, insecureSkipVerify }`），Go 客户端同步暴露相同字段。
+- **TLS 客户端默认不开**：Java 客户端入口 `TunnelClientApplication` 仍以明文连接为默认，需把 TLS 抬到 `client.jsonc` 字段（如 `tls: { enabled, trustStorePath, trustStorePassword, insecureSkipVerify }`），Go 客户端同步暴露相同字段。
 - **登录 nonce 未持久化**：当前在 30s 窗口内可重放同一签名。建议在 `loginExecutor` 处加内存 LRU（按 `clientName`），并在多节点部署时升级到共享存储（Redis）。
 - **UDP 转发缺失**：`UdpConnection` 留空。如要补齐，需要在协议层新增 `NAT_UDP_*` 命令，并在服务端为每个 UDP 映射启动 `DatagramChannel`，按 `(srcAddr, srcPort)` 分配 connectionId。
 - **测试覆盖**：核心协议有单元测试，但缺少真实 MySQL/PostgreSQL 集成测试和端到端隧道测试。`tools/` 下已有 load test 辅助。

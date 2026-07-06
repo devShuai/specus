@@ -48,8 +48,13 @@ shuai-tunnel.db-journal
 ### Local client credentials ###
 tunnelClientConfig.json
 tunnelClientConfig*.json
-!tunnelClientConfig.example.json
-!implementations/java/client/tunnelClientConfig.json
+client.json
+client.jsonc
+client-local.json
+client-local.jsonc
+client2.json
+client2.jsonc
+!implementations/java/client/client.jsonc
 
 ### Local agent settings ###
 .claude/

@@ -56,7 +56,7 @@ TUNNEL_TCP_MAPPINGS="$PUBLIC_PORT=127.0.0.1:$ECHO_PORT" \
 "$C_DIR/build/shuai-tunnel-server-c" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
-cat >"$TMP_DIR/tunnelClientConfig.json" <<JSON
+cat >"$TMP_DIR/client.jsonc" <<JSON
 {
   "serverBaseUrl": "http://127.0.0.1:$ADMIN_PORT",
   "apiKey": "c-smoke",

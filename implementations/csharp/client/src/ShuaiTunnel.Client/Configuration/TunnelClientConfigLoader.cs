@@ -3,13 +3,13 @@ using System.Text.Json;
 namespace ShuaiTunnel.Client.Configuration;
 
 /// <summary>
-/// Loads <c>tunnelClientConfig.json</c> from disk, mirroring the Java client's lookup order:
+/// Loads <c>client.jsonc</c> from disk, mirroring the Java client's lookup order:
 /// first the absolute path under the current working directory, then the relative path.
 /// Unknown fields are tolerated (System.Text.Json default behavior).
 /// </summary>
 public static class TunnelClientConfigLoader
 {
-    private const string FileName = "tunnelClientConfig.json";
+    private const string FileName = "client.jsonc";
 
     /// <summary>
     /// Loads the config from the first matching location, or returns the explicit override.
@@ -45,7 +45,7 @@ public static class TunnelClientConfigLoader
             return fallback;
         }
         throw new FileNotFoundException(
-            $"未找到 tunnelClientConfig.json. 已检查路径: [{primary}], [{fallback}]");
+            $"未找到 client.jsonc. 已检查路径: [{primary}], [{fallback}]");
     }
 
     internal static readonly JsonSerializerOptions JsonOptions = new()

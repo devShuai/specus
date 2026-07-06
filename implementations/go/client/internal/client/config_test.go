@@ -9,14 +9,16 @@ import (
 )
 
 func TestLoadConfigNormalizesPeerMeshOptions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tunnelClientConfig.json")
+	path := filepath.Join(t.TempDir(), "client.jsonc")
 	content := `{
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // JSONC comments are allowed in client.jsonc.
   "serverBaseUrl": " http://127.0.0.1:8088/ ",
   "apiKey": " demo-client ",
   "secret": " test1234 ",
   "peerMeshDevice": " auto ",
   "peerMeshTunName": " mesh0 ",
-  "peerMeshMtu": 4096
+  "peerMeshMtu": 4096,
 }`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -41,7 +43,7 @@ func TestLoadConfigNormalizesPeerMeshOptions(t *testing.T) {
 }
 
 func TestLoadConfigDefaultsPeerMeshOptions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tunnelClientConfig.json")
+	path := filepath.Join(t.TempDir(), "client.jsonc")
 	content := `{"serverBaseUrl":"http://127.0.0.1:8088","apiKey":"demo","secret":"test1234"}`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -63,7 +65,7 @@ func TestLoadConfigDefaultsPeerMeshOptions(t *testing.T) {
 }
 
 func TestLoadConfigRejectsNonHTTPServerBaseURL(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tunnelClientConfig.json")
+	path := filepath.Join(t.TempDir(), "client.jsonc")
 	content := `{"serverBaseUrl":"ftp://127.0.0.1:8088","apiKey":"demo","secret":"test1234"}`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)

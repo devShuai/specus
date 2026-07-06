@@ -57,7 +57,7 @@ public sealed class JavaClientControlChannelTests : IAsyncLifetime
         _authStub = ClientAuthStub.Start(_server);
 
         _clientWorkDir = Directory.CreateTempSubdirectory("tunnel-client-it-").FullName;
-        var configPath = Path.Combine(_clientWorkDir, "tunnelClientConfig.json");
+        var configPath = Path.Combine(_clientWorkDir, "client.jsonc");
         File.WriteAllText(configPath, JsonSerializer.Serialize(new
         {
             serverBaseUrl = _authStub.ServerBaseUrl,

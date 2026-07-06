@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://devshuai.com/shuai-tunnel/schemas/nat-control.schema.json",
+  "$id": "https://tunnel.devshuai.com/schemas/nat-control.schema.json",
   "title": "shuai-tunnel NAT_CONTROL",
   "description": "MessageType.NAT_CONTROL 的 JSON 消息体。字段缺省语义见 protocol/spec/control-protocol.md。",
   "type": "object",

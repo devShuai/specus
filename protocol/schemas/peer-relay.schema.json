@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://devshuai.com/shuai-tunnel/schemas/peer-relay.schema.json",
+  "$id": "https://tunnel.devshuai.com/schemas/peer-relay.schema.json",
   "title": "shuai-tunnel Peer Relay UDP JSON",
   "description": "Peer Mesh STUN/TURN-lite UDP JSON 消息。包含 relay 控制消息和 direct UDP connectivity check。",
   "oneOf": [
