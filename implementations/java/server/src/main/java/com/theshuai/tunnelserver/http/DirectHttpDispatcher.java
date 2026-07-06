@@ -43,7 +43,7 @@ public class DirectHttpDispatcher {
         SyncFuture<DirectHttpResponsePacket> future = new SyncFuture<>();
         futures.put(requestId, future);
         try {
-            log.info("[http-direct][server->client] requestId={} clientName={} method={} route={} path={} queryPresent={} bodyBytes={} timeoutMs={}",
+            log.debug("[http-direct][server->client] requestId={} clientName={} method={} route={} path={} queryPresent={} bodyBytes={} timeoutMs={}",
                     requestId, clientName, packet.getRequestMethod(), packet.getRoute(), packet.getRelativePath(),
                     packet.getRawQuery() != null, size(packet.getBody()), timeoutMillis);
             channel.writeAndFlush(packet).addListener(result -> {
@@ -52,7 +52,7 @@ public class DirectHttpDispatcher {
                             requestId, clientName, errorMessage(result.cause()));
                     future.setResponse(failure(requestId, "HTTP 转发请求发送失败"));
                 } else {
-                    log.info("[http-direct][server->client] requestId={} clientName={} write=success", requestId, clientName);
+                    log.debug("[http-direct][server->client] requestId={} clientName={} write=success", requestId, clientName);
                 }
             });
             DirectHttpResponsePacket response = future.get(timeoutMillis, TimeUnit.MILLISECONDS);
@@ -61,7 +61,7 @@ public class DirectHttpDispatcher {
                         requestId, clientName, timeoutMillis, System.currentTimeMillis() - startedAt);
                 throw new DirectHttpTunnelException(504, "HTTP 转发请求超时");
             }
-            log.info("[http-direct][server-wait] requestId={} clientName={} status={} errorPresent={} bodyBytes={} elapsedMs={}",
+            log.debug("[http-direct][server-wait] requestId={} clientName={} status={} errorPresent={} bodyBytes={} elapsedMs={}",
                     requestId, clientName, response.getStatusCode(), response.getError() != null,
                     size(response.getBody()), System.currentTimeMillis() - startedAt);
             return response;
@@ -80,7 +80,7 @@ public class DirectHttpDispatcher {
     public void ack(DirectHttpResponsePacket packet) {
         SyncFuture<DirectHttpResponsePacket> future = futures.get(packet.getRequestId());
         if (future != null) {
-            log.info("[http-direct][client->server] requestId={} status={} errorPresent={} bodyBytes={}",
+            log.debug("[http-direct][client->server] requestId={} status={} errorPresent={} bodyBytes={}",
                     packet.getRequestId(), packet.getStatusCode(), packet.getError() != null, size(packet.getBody()));
             future.setResponse(packet);
         } else {

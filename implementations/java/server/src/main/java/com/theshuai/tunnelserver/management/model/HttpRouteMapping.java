@@ -11,7 +11,7 @@ import lombok.Setter;
 
 /**
  * 后台维护的"客户端 HTTP 路由"记录。一行对应客户端
- * {@code tunnelClientConfig.json:httpTunnelConfigList} 中的一项，但服务端为权威来源：
+ * {@code client.jsonc:httpTunnelConfigList} 中的一项，但服务端为权威来源：
  * 客户端登录或后台 CRUD 时通过 {@code NAT_CONTROL} 全量下发，由
  * {@code DirectHttpRequestHandler} 热替换内存路由表。
  *
@@ -29,7 +29,10 @@ import lombok.Setter;
         ),
         indexes = {
                 @Index(name = "idx_http_route_tenant", columnList = "tenant_id"),
-                @Index(name = "idx_http_route_client", columnList = "client_id")
+                @Index(name = "idx_http_route_client", columnList = "client_id"),
+                @Index(name = "idx_http_route_tenant_client_id", columnList = "tenant_id, client_id, id"),
+                @Index(name = "idx_http_route_tenant_client_enabled_id", columnList = "tenant_id, client_id, enabled, id"),
+                @Index(name = "idx_http_route_tenant_client_route", columnList = "tenant_id, client_id, route")
         })
 @Getter
 @Setter

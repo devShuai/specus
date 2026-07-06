@@ -131,6 +131,7 @@ tunnel:
   http:
     timeout-ms: ${TUNNEL_HTTP_TIMEOUT_MS:30000}
     max-request-body-size: ${TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE:16777216}
+    route-cache-ttl-ms: ${TUNNEL_HTTP_ROUTE_CACHE_TTL_MS:2000}
   login:
     executor:
       core-size: ${TUNNEL_LOGIN_EXECUTOR_CORE:8}

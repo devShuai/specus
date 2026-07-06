@@ -15,6 +15,8 @@ public interface HttpRouteMappingRepository extends JpaRepository<HttpRouteMappi
 
     List<HttpRouteMapping> findByTenantIdAndClientIdOrderByIdDesc(String tenantId, Long clientId);
 
+    List<HttpRouteMapping> findByTenantIdAndClientIdInOrderByIdDesc(String tenantId, List<Long> clientIds);
+
     /**
      * 用于下发：仅取启用项，按 id 升序保证客户端面板呈现稳定。
      */
@@ -31,7 +33,7 @@ public interface HttpRouteMappingRepository extends JpaRepository<HttpRouteMappi
     /**
      * 区分"该客户端从未在后台管理过 HTTP 路由"和"管理过但当前都禁用/删除"。前一种情况下
      * {@code NatControlService} 会跳过 {@code httpTunnelConfigList} 字段，让客户端继续用本地
-     * {@code tunnelClientConfig.json} —— 避免升级时误清除遗留配置。
+     * {@code client.jsonc} —— 避免升级时误清除遗留配置。
      */
     boolean existsByClientId(Long clientId);
 

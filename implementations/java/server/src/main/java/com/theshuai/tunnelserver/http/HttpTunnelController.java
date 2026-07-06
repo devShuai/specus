@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 @RestController
 @RequestMapping("/http")
@@ -45,6 +47,8 @@ public class HttpTunnelController {
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final long timeoutMillis;
     private final int maxRequestBodySize;
+    private final long routeCacheTtlMillis;
+    private final ConcurrentMap<String, RewriteDecision> rewriteDecisionCache = new ConcurrentHashMap<>();
 
     public HttpTunnelController(DirectHttpDispatcher dispatcher,
                                 TrafficUsageService trafficUsageService,
@@ -53,7 +57,8 @@ public class HttpTunnelController {
                                 ClientAccountService clientAccountService,
                                 HttpRouteMappingRepository httpRouteMappingRepository,
                                 @Value("${tunnel.http.timeout-ms:30000}") long timeoutMillis,
-                                @Value("${tunnel.http.max-request-body-size:16777216}") int maxRequestBodySize) {
+                                @Value("${tunnel.http.max-request-body-size:16777216}") int maxRequestBodySize,
+                                @Value("${tunnel.http.route-cache-ttl-ms:2000}") long routeCacheTtlMillis) {
         this.dispatcher = dispatcher;
         this.trafficUsageService = trafficUsageService;
         this.trafficInspectionService = trafficInspectionService;
@@ -62,6 +67,7 @@ public class HttpTunnelController {
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.timeoutMillis = timeoutMillis;
         this.maxRequestBodySize = maxRequestBodySize;
+        this.routeCacheTtlMillis = Math.max(0, routeCacheTtlMillis);
     }
 
     @RequestMapping("/{clientName}/{route}/**")
@@ -73,7 +79,7 @@ public class HttpTunnelController {
         long startedAt = System.currentTimeMillis();
         String relativePath = relativePath(request);
         List<String> forwardedHeaders = requestHeaders(request);
-        log.info("[http-direct][server-ingress] clientName={} method={} route={} path={} queryPresent={} bodyBytes={}",
+        log.debug("[http-direct][server-ingress] clientName={} method={} route={} path={} queryPresent={} bodyBytes={}",
                 clientName, request.getMethod(), route, relativePath,
                 request.getQueryString() != null, requestBody.length);
         if (requestBody.length > maxRequestBodySize) {
@@ -115,10 +121,11 @@ public class HttpTunnelController {
             // 路径改写：仅当路由开启时生效。改写成功后需要剥离 Content-Encoding/Content-Length，
             // 让 Spring/Tomcat 按实际字节重新计算 Content-Length（Tomcat 不会主动重压缩）。
             List<String> responseHeaders = response.getHeaders();
-            boolean rewriteEnabled = isPathRewriteEnabled(clientName, route);
+            boolean rewriteCandidate = responseRewriter.mayRewrite(responseBody, responseHeaders);
+            boolean rewriteEnabled = rewriteCandidate && isPathRewriteEnabled(clientName, route);
             boolean rewritten = false;
-            log.info("[http-direct][rewrite-check] requestId={} clientName={} route={} pathRewriteEnabled={} contentType={}",
-                    response.getRequestId(), clientName, route, rewriteEnabled,
+            log.debug("[http-direct][rewrite-check] requestId={} clientName={} route={} rewriteCandidate={} pathRewriteEnabled={} contentType={}",
+                    response.getRequestId(), clientName, route, rewriteCandidate, rewriteEnabled,
                     findHeaderValue(responseHeaders, "content-type"));
             if (rewriteEnabled) {
                 Optional<byte[]> maybeRewritten = responseRewriter.rewrite(responseBody, clientName, route, responseHeaders);
@@ -129,7 +136,7 @@ public class HttpTunnelController {
                 }
             }
             copyHeaders(responseHeaders, headers);
-            log.info("[http-direct][server-egress] requestId={} clientName={} status={} bodyBytes={} rewritten={} elapsedMs={}",
+            log.debug("[http-direct][server-egress] requestId={} clientName={} status={} bodyBytes={} rewritten={} elapsedMs={}",
                     response.getRequestId(), clientName, response.getStatusCode(), responseBody.length, rewritten,
                     System.currentTimeMillis() - startedAt);
             trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
@@ -206,21 +213,36 @@ public class HttpTunnelController {
     }
 
     /**
-     * 查路由配置，判断该路由是否开启了响应体路径改写。查询走 JPA cache，开销可控；
+     * 查路由配置，判断该路由是否开启了响应体路径改写。结果短 TTL 缓存，避免每个
+     * Spring Boot HTTP 直转请求都额外打两次数据库查询；
      * 任意查询异常一律视为"未开启"，避免改写故障影响主链路。
      */
     private boolean isPathRewriteEnabled(String clientName, String route) {
+        String cacheKey = clientName + '\n' + route;
+        long now = System.currentTimeMillis();
+        RewriteDecision cached = rewriteDecisionCache.get(cacheKey);
+        if (cached != null && cached.expiresAtMillis() > now) {
+            return cached.enabled();
+        }
+        boolean enabled = loadPathRewriteEnabled(clientName, route);
+        if (routeCacheTtlMillis > 0) {
+            rewriteDecisionCache.put(cacheKey, new RewriteDecision(enabled, now + routeCacheTtlMillis));
+        }
+        return enabled;
+    }
+
+    private boolean loadPathRewriteEnabled(String clientName, String route) {
         try {
             Optional<ClientAccount> account = clientAccountService.findClientByName(clientName);
             if (account.isEmpty()) {
-                log.warn("[http-direct][rewrite-lookup] clientName={} route={} result=client-not-found",
+                log.debug("[http-direct][rewrite-lookup] clientName={} route={} result=client-not-found",
                         clientName, route);
                 return false;
             }
             Optional<HttpRouteMapping> mapping = httpRouteMappingRepository
                     .findByClientIdAndRoute(account.get().getId(), route);
             if (mapping.isEmpty()) {
-                log.warn("[http-direct][rewrite-lookup] clientName={} route={} clientId={} result=route-not-found",
+                log.debug("[http-direct][rewrite-lookup] clientName={} route={} clientId={} result=route-not-found",
                         clientName, route, account.get().getId());
                 return false;
             }
@@ -270,5 +292,8 @@ public class HttpTunnelController {
             result.add(header);
         }
         return result;
+    }
+
+    private record RewriteDecision(boolean enabled, long expiresAtMillis) {
     }
 }

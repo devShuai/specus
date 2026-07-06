@@ -18,6 +18,11 @@ import lombok.Setter;
                 @Index(name = "idx_tcp_frame_client", columnList = "client_id"),
                 @Index(name = "idx_tcp_frame_port", columnList = "listen_port"),
                 @Index(name = "idx_tcp_frame_channel", columnList = "channel_id"),
+                @Index(name = "idx_tcp_frame_tenant_id", columnList = "tenant_id, id"),
+                @Index(name = "idx_tcp_frame_tenant_client_id", columnList = "tenant_id, client_id, id"),
+                @Index(name = "idx_tcp_frame_tenant_port_id", columnList = "tenant_id, listen_port, id"),
+                @Index(name = "idx_tcp_frame_tenant_client_port_id", columnList = "tenant_id, client_id, listen_port, id"),
+                @Index(name = "idx_tcp_frame_tenant_channel_id", columnList = "tenant_id, channel_id, id"),
                 @Index(name = "idx_tcp_frame_stream", columnList = "tenant_id, channel_id, frame_direction, stream_offset"),
                 @Index(name = "idx_tcp_frame_time", columnList = "frame_time")
         })

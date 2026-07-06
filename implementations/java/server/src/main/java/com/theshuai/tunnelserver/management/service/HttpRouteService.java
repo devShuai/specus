@@ -60,13 +60,19 @@ public class HttpRouteService {
 
     @Transactional(readOnly = true)
     public List<HttpRouteView> listRoutes(ManagementContext context, Long clientId) {
+        if (context.isAdmin()) {
+            return listRoutes(context.tenant(), clientId);
+        }
+        List<Long> visibleClientIds = visibleClientIds(context);
+        if (visibleClientIds.isEmpty() || (clientId != null && !visibleClientIds.contains(clientId))) {
+            return List.of();
+        }
         List<HttpRouteMapping> rows = clientId == null
-                ? httpRouteMappingRepository.findByTenantIdOrderByIdDesc(context.tenant().tenantId())
-                : httpRouteMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(context.tenant().tenantId(), clientId);
-        return rows.stream()
-                .filter(row -> canAccessClient(context, row.getClientId()))
-                .map(this::toView)
-                .toList();
+                ? httpRouteMappingRepository.findByTenantIdAndClientIdInOrderByIdDesc(
+                        context.tenant().tenantId(), visibleClientIds)
+                : httpRouteMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(
+                        context.tenant().tenantId(), clientId);
+        return rows.stream().map(this::toView).toList();
     }
 
     @Transactional
@@ -218,6 +224,14 @@ public class HttpRouteService {
         }
         return clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
                 clientId, context.tenant().tenantId(), context.username()).isPresent();
+    }
+
+    private List<Long> visibleClientIds(ManagementContext context) {
+        return clientAccountRepository
+                .findByTenantIdAndOwnerUsernameOrderByIdDesc(context.tenant().tenantId(), context.username())
+                .stream()
+                .map(ClientAccount::getId)
+                .toList();
     }
 
     private String requireRoute(String route) {

@@ -92,21 +92,11 @@ public class ResponseRewriter {
      * 改写响应正文的绝对路径。条件不满足时返回 {@link Optional#empty()}，调用方应原样透传 body。
      */
     public Optional<byte[]> rewrite(byte[] body, String clientName, String route, List<String> headers) {
-        if (body == null || body.length == 0) {
-            log.debug("[rewrite] skip: empty body, clientName={} route={}", clientName, route);
-            return Optional.empty();
-        }
-        if (body.length > maxBodyBytes) {
-            log.info("[rewrite] skip: body too large ({} > {}), clientName={} route={}",
-                    body.length, maxBodyBytes, clientName, route);
+        if (!mayRewrite(body, headers)) {
+            log.debug("[rewrite] skip: not a rewrite candidate, clientName={} route={}", clientName, route);
             return Optional.empty();
         }
         String contentType = extractContentType(headers);
-        if (contentType == null || !REWRITABLE_CONTENT_TYPES.contains(contentType)) {
-            log.debug("[rewrite] skip: content-type not rewritable, contentType={} clientName={} route={}",
-                    contentType, clientName, route);
-            return Optional.empty();
-        }
         byte[] decompressed = decompressIfNeeded(body, headers);
         if (decompressed == null) {
             log.warn("[rewrite] skip: decompress failed, clientName={} route={} contentType={} encoding={}",
@@ -146,13 +136,26 @@ public class ResponseRewriter {
         rewritten = rewritten.replace(placeholder, prefix + "/");
 
         if (rewritten.equals(text)) {
-            log.info("[rewrite] no-op: no absolute paths matched, clientName={} route={} contentType={} bytes={}",
+            log.debug("[rewrite] no-op: no absolute paths matched, clientName={} route={} contentType={} bytes={}",
                     clientName, route, contentType, body.length);
             return Optional.empty();
         }
-        log.info("[rewrite] applied clientName={} route={} contentType={} originalBytes={} rewrittenBytes={} prefix={}",
+        log.debug("[rewrite] applied clientName={} route={} contentType={} originalBytes={} rewrittenBytes={} prefix={}",
                 clientName, route, contentType, body.length, rewritten.length(), prefix);
         return Optional.of(rewritten.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Cheap preflight used by the controller before consulting route rewrite settings.
+     * Most HTTP tunnel responses are JSON, images, or other non-rewritable payloads; skipping
+     * the route lookup there removes an avoidable DB/cache hit from the common request path.
+     */
+    public boolean mayRewrite(byte[] body, List<String> headers) {
+        if (body == null || body.length == 0 || body.length > maxBodyBytes) {
+            return false;
+        }
+        String contentType = extractContentType(headers);
+        return contentType != null && REWRITABLE_CONTENT_TYPES.contains(contentType);
     }
 
     /**

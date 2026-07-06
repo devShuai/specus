@@ -17,7 +17,9 @@ import lombok.Setter;
         ),
         indexes = {
                 @Index(name = "idx_tunnel_mapping_tenant", columnList = "tenant_id"),
-                @Index(name = "idx_tunnel_mapping_client", columnList = "client_id")
+                @Index(name = "idx_tunnel_mapping_client", columnList = "client_id"),
+                @Index(name = "idx_tunnel_mapping_tenant_client_id", columnList = "tenant_id, client_id, id"),
+                @Index(name = "idx_tunnel_mapping_tenant_client_enabled_id", columnList = "tenant_id, client_id, enabled, id")
         })
 @Getter
 @Setter

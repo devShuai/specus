@@ -77,13 +77,19 @@ public class NatControlService {
 
     @Transactional(readOnly = true)
     public List<TunnelMappingView> listMappings(ManagementContext context, Long clientId) {
+        if (context.isAdmin()) {
+            return listMappings(context.tenant(), clientId);
+        }
+        List<Long> visibleClientIds = visibleClientIds(context);
+        if (visibleClientIds.isEmpty() || (clientId != null && !visibleClientIds.contains(clientId))) {
+            return List.of();
+        }
         List<TunnelMapping> mappings = clientId == null
-                ? tunnelMappingRepository.findByTenantIdOrderByIdDesc(context.tenant().tenantId())
-                : tunnelMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(context.tenant().tenantId(), clientId);
-        return mappings.stream()
-                .filter(mapping -> canAccessClient(context, mapping.getClientId()))
-                .map(this::toView)
-                .toList();
+                ? tunnelMappingRepository.findByTenantIdAndClientIdInOrderByIdDesc(
+                        context.tenant().tenantId(), visibleClientIds)
+                : tunnelMappingRepository.findByTenantIdAndClientIdOrderByIdDesc(
+                        context.tenant().tenantId(), clientId);
+        return mappings.stream().map(this::toView).toList();
     }
 
     @Transactional
@@ -362,6 +368,14 @@ public class NatControlService {
         }
         return clientAccountRepository.findByIdAndTenantIdAndOwnerUsername(
                 clientId, context.tenant().tenantId(), context.username()).isPresent();
+    }
+
+    private List<Long> visibleClientIds(ManagementContext context) {
+        return clientAccountRepository
+                .findByTenantIdAndOwnerUsernameOrderByIdDesc(context.tenant().tenantId(), context.username())
+                .stream()
+                .map(ClientAccount::getId)
+                .toList();
     }
 
     private int requirePort(Integer port, String field) {

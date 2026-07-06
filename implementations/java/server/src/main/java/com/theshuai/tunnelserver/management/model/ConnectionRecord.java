@@ -17,7 +17,11 @@ import lombok.Setter;
         // and per-client history listings ordered by time.
         @Index(name = "idx_tunnel_connection_client_time", columnList = "client_id, connected_at"),
         // Serves the retention purge (connected_at < cutoff).
-        @Index(name = "idx_tunnel_connection_connected_at", columnList = "connected_at")
+        @Index(name = "idx_tunnel_connection_connected_at", columnList = "connected_at"),
+        @Index(name = "idx_tunnel_connection_tenant_id", columnList = "tenant_id, id"),
+        @Index(name = "idx_tunnel_connection_tenant_client_id", columnList = "tenant_id, client_id, id"),
+        @Index(name = "idx_tunnel_connection_tenant_success", columnList = "tenant_id, success"),
+        @Index(name = "idx_tunnel_connection_tenant_client_time", columnList = "tenant_id, client_id, connected_at")
 })
 @Getter
 @Setter

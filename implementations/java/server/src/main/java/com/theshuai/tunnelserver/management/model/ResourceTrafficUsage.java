@@ -21,7 +21,11 @@ import lombok.Setter;
                 @Index(name = "idx_resource_traffic_tenant", columnList = "tenant_id"),
                 @Index(name = "idx_resource_traffic_client", columnList = "client_id"),
                 @Index(name = "idx_resource_traffic_type", columnList = "resource_type"),
-                @Index(name = "idx_resource_traffic_date", columnList = "usage_date")
+                @Index(name = "idx_resource_traffic_date", columnList = "usage_date"),
+                @Index(name = "idx_resource_traffic_tenant_date_id", columnList = "tenant_id, usage_date, id"),
+                @Index(name = "idx_resource_traffic_tenant_client_date_id", columnList = "tenant_id, client_id, usage_date, id"),
+                @Index(name = "idx_resource_traffic_tenant_type_date_id", columnList = "tenant_id, resource_type, usage_date, id"),
+                @Index(name = "idx_resource_traffic_tenant_client_type_date_id", columnList = "tenant_id, client_id, resource_type, usage_date, id")
         })
 @Getter
 @Setter

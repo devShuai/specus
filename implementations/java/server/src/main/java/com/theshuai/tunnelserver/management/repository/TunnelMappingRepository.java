@@ -15,6 +15,8 @@ public interface TunnelMappingRepository extends JpaRepository<TunnelMapping, Lo
 
     List<TunnelMapping> findByTenantIdAndClientIdOrderByIdDesc(String tenantId, Long clientId);
 
+    List<TunnelMapping> findByTenantIdAndClientIdInOrderByIdDesc(String tenantId, List<Long> clientIds);
+
     List<TunnelMapping> findByClientIdAndEnabledTrueOrderByIdAsc(Long clientId);
 
     List<TunnelMapping> findByTenantIdAndClientIdAndEnabledTrueOrderByIdAsc(String tenantId, Long clientId);

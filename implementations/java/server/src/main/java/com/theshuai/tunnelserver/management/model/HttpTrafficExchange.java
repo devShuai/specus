@@ -18,7 +18,12 @@ import lombok.Setter;
                 @Index(name = "idx_http_exchange_client", columnList = "client_id"),
                 @Index(name = "idx_http_exchange_route", columnList = "route"),
                 @Index(name = "idx_http_exchange_response_body_type", columnList = "response_body_type"),
-                @Index(name = "idx_http_exchange_captured_at", columnList = "captured_at")
+                @Index(name = "idx_http_exchange_captured_at", columnList = "captured_at"),
+                @Index(name = "idx_http_exchange_tenant_id", columnList = "tenant_id, id"),
+                @Index(name = "idx_http_exchange_tenant_client_id", columnList = "tenant_id, client_id, id"),
+                @Index(name = "idx_http_exchange_tenant_route_id", columnList = "tenant_id, route, id"),
+                @Index(name = "idx_http_exchange_tenant_client_route_id", columnList = "tenant_id, client_id, route, id"),
+                @Index(name = "idx_http_exchange_tenant_body_type_id", columnList = "tenant_id, response_body_type, id")
         })
 @Getter
 @Setter
