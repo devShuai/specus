@@ -144,10 +144,14 @@ body {
 
 .landing-canvas {
   position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
   z-index: 0;
   width: 100%;
-  height: 100%;
+  /* 只覆盖首屏 hero：canvas 每帧全量重绘，若跟随整页高度，移动端会产生
+     ~824×8000 设备像素的纹理逐帧上传，挤占 Android GPU 带宽导致下方
+     卡片图层丢 tile。首屏以下的 section 自带背景，视觉无差异。 */
+  height: 100vh;
   opacity: 0.52;
 }
 
@@ -1253,53 +1257,56 @@ body {
   }
 }
 
-@keyframes principle-packet-y {
+/*
+ * Compositor-only 版本的移动端粒子/光束动画（Android Chrome 丢 tile 修复）。
+ *
+ * principle-packet-y / principle-beam-y 逐帧动 top（布局属性），每帧都使卡片
+ * 文字所在图层失效并重光栅化；Mali/Adreno 驱动在持续重光栅化压力下会间歇性
+ * 丢弃整个 256px tile——表现为框体、框内文字、框外文字整块消失。
+ * 改用 translate/scale/opacity 个体属性后动画完全跑在合成器上，文字层零失效。
+ *
+ * 位移用 px 精确换算（移动端 edge 固定 6×56px）：
+ *  - packet：静态 top -14px，原 top -14px → calc(100% - 2px)=54px，行程 68px；
+ *  - beam：静态 top -13px，原 top -24% → 84%（56px 基准 ≈ -13.4px → 47px），行程 60px。
+ */
+@keyframes principle-packet-slide-y {
   0% {
-    top: -14px;
     opacity: 0;
-    transform: translateX(-50%) scale(0.74);
+    translate: -50% 0;
+    scale: 0.74;
   }
 
   4% {
     opacity: 1;
-    transform: translateX(-50%) scale(1);
+    scale: 1;
   }
 
   10% {
     opacity: 1;
   }
 
-  13% {
-    top: calc(100% - 2px);
-    opacity: 0;
-    transform: translateX(-50%) scale(0.74);
-  }
-
+  13%,
   100% {
-    top: calc(100% - 2px);
     opacity: 0;
-    transform: translateX(-50%) scale(0.74);
+    translate: -50% 68px;
+    scale: 0.74;
   }
 }
 
-@keyframes principle-beam-y {
+@keyframes principle-beam-slide-y {
   0% {
-    top: -24%;
     opacity: 0;
+    translate: 0 0;
   }
 
   5% {
     opacity: 1;
   }
 
-  13% {
-    top: 84%;
-    opacity: 0;
-  }
-
+  13%,
   100% {
-    top: 84%;
     opacity: 0;
+    translate: 0 60px;
   }
 }
 
@@ -1425,20 +1432,24 @@ body {
   }
 
   .principle-edge::before {
-    top: -18px;
+    top: -14px;
     left: 50%;
     width: 20px;
     height: 28px;
-    animation-name: principle-packet-y;
+    will-change: translate, opacity;
+    animation-name: principle-packet-slide-y;
   }
 
   .principle-edge::after {
-    top: -30%;
+    top: -13px;
     left: -3px;
     width: 12px;
     height: 56%;
     background: linear-gradient(180deg, transparent, rgba(var(--principle-accent), 0.95), transparent);
-    animation-name: principle-beam-y;
+    /* blur 逐帧重光栅化开销大，柔边交给渐变本身 */
+    filter: none;
+    will-change: translate, opacity;
+    animation-name: principle-beam-slide-y;
   }
 }
 
@@ -1491,6 +1502,8 @@ body {
       0 0 34px rgba(var(--principle-accent), 0.28),
       0 0 0 1px rgba(var(--principle-accent), 0.2) inset;
     opacity: 0;
+    /* 提前promote成独立层，opacity 动画不触碰节点文字层 */
+    will-change: opacity;
     animation: principle-node-highlight var(--flow-cycle) ease-in-out infinite;
     animation-delay: var(--node-delay);
   }
@@ -1505,24 +1518,26 @@ body {
   }
 
   .android-chrome .principle-edge-android-packet {
-    top: -18px;
+    top: -14px;
     left: 50%;
     width: 20px;
     height: 28px;
     border-radius: 999px;
     background: rgb(var(--principle-accent));
     box-shadow: 0 0 18px rgba(var(--principle-accent), 0.74);
-    animation: principle-packet-y var(--flow-cycle) linear infinite;
+    will-change: translate, opacity;
+    animation: principle-packet-slide-y var(--flow-cycle) linear infinite;
     animation-delay: var(--edge-delay);
   }
 
   .android-chrome .principle-edge-android-beam {
-    top: -30%;
+    top: -13px;
     left: -3px;
     width: 12px;
     height: 56%;
     background: linear-gradient(180deg, transparent, rgba(var(--principle-accent), 0.9), transparent);
-    animation: principle-beam-y var(--flow-cycle) linear infinite;
+    will-change: translate, opacity;
+    animation: principle-beam-slide-y var(--flow-cycle) linear infinite;
     animation-delay: var(--edge-delay);
   }
 
@@ -1600,20 +1615,24 @@ body {
   }
 
   .principle-edge::before {
-    top: -18px;
+    top: -14px;
     left: 50%;
     width: 20px;
     height: 28px;
-    animation-name: principle-packet-y;
+    will-change: translate, opacity;
+    animation-name: principle-packet-slide-y;
   }
 
   .principle-edge::after {
-    top: -30%;
+    top: -13px;
     left: -3px;
     width: 12px;
     height: 56%;
     background: linear-gradient(180deg, transparent, rgba(var(--principle-accent), 0.95), transparent);
-    animation-name: principle-beam-y;
+    /* blur 逐帧重光栅化开销大，柔边交给渐变本身 */
+    filter: none;
+    will-change: translate, opacity;
+    animation-name: principle-beam-slide-y;
   }
 }
 
@@ -1623,7 +1642,10 @@ body {
   .principle-node::before,
   .principle-node::after,
   .principle-edge::before,
-  .principle-edge::after {
+  .principle-edge::after,
+  .principle-node-android-glow,
+  .principle-edge-android-packet,
+  .principle-edge-android-beam {
     animation: none;
   }
 

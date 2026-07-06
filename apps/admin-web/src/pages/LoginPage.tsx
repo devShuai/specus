@@ -1187,8 +1187,12 @@ function SignalField() {
     let height = 0;
     let frame = 0;
     let raf = 0;
+    let running = false;
+    let visible = true;
     let nodes: SignalNode[] = [];
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    // Android GPU 逐帧上传全 dpr 纹理会挤占合成器带宽（丢 tile 根因之一），钳到 1
+    const dprCap = /\bAndroid\b/i.test(window.navigator.userAgent) ? 1 : 2;
 
     const rebuildNodes = () => {
       const count = Math.max(20, Math.min(52, Math.floor((width * height) / 32000)));
@@ -1202,7 +1206,7 @@ function SignalField() {
 
     const resize = () => {
       const rect = canvas.getBoundingClientRect();
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const dpr = Math.min(window.devicePixelRatio || 1, dprCap);
       width = rect.width;
       height = rect.height;
       canvas.width = Math.floor(width * dpr);
@@ -1261,17 +1265,37 @@ function SignalField() {
         context.fillRect(x + 180, y + 24, 5, 5);
       }
 
-      if (!reducedMotion) {
+      if (!reducedMotion && visible) {
         frame += 1;
         raf = window.requestAnimationFrame(draw);
+        running = true;
+      } else {
+        running = false;
       }
     };
+
+    // canvas 只在视口内时才跑 rAF：滚到能力卡片区后完全停画，
+    // 不与卡片动画争抢 Android GPU 光栅化带宽。
+    const observer = new IntersectionObserver((entries) => {
+      visible = entries[0]?.isIntersecting ?? true;
+      if (!visible) {
+        window.cancelAnimationFrame(raf);
+        running = false;
+        return;
+      }
+      if (!running && !reducedMotion) {
+        running = true;
+        raf = window.requestAnimationFrame(draw);
+      }
+    });
+    observer.observe(canvas);
 
     resize();
     draw();
     window.addEventListener("resize", resize);
 
     return () => {
+      observer.disconnect();
       window.removeEventListener("resize", resize);
       window.cancelAnimationFrame(raf);
     };
