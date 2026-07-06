@@ -58,6 +58,7 @@ tunnelClientConfig*.json
 /implementations/go/client/shuai-tunnel-client
 /implementations/go/client/shuai-tunnel-client.exe
 /implementations/csharp/client/out/
+/implementations/go/client/out/
 
 ### Local build caches ###
 .appdata/
