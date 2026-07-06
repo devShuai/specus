@@ -205,11 +205,43 @@
                                           AlternationCount="2"
                                           ItemsSource="{Binding PeerRoutes}">
                                     <DataGrid.Columns>
-                                        <DataGridTextColumn Header="客户端" Binding="{Binding ClientName}" Width="2*" />
-                                        <DataGridTextColumn Header="虚拟 IP" Binding="{Binding VirtualIp}" Width="*" />
+                                        <DataGridTemplateColumn Header="客户端" SortMemberPath="ClientName" ClipboardContentBinding="{Binding ClientName}" Width="2*">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding ClientName}"
+                                                             ToolTip="{Binding ClientName}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTemplateColumn Header="虚拟 IP" SortMemberPath="VirtualIp" ClipboardContentBinding="{Binding VirtualIp}" Width="150">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding VirtualIp}"
+                                                             ToolTip="{Binding VirtualIp}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
                                         <DataGridCheckBoxColumn Header="在线" Binding="{Binding Online}" Width="80" />
-                                        <DataGridTextColumn Header="候选地址" Binding="{Binding CandidateCount}" Width="90" />
-                                        <DataGridTextColumn Header="Client ID" Binding="{Binding ClientId}" Width="150" />
+                                        <DataGridTemplateColumn Header="候选地址" SortMemberPath="CandidateCount" ClipboardContentBinding="{Binding CandidateCount}" Width="90">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding CandidateCount}"
+                                                             ToolTip="{Binding CandidateCount}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTemplateColumn Header="Client ID" SortMemberPath="ClientId" ClipboardContentBinding="{Binding ClientId}" Width="170">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding ClientId}"
+                                                             ToolTip="{Binding ClientId}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </Border>
@@ -224,11 +256,51 @@
                                           AlternationCount="2"
                                           ItemsSource="{Binding PeerSessions}">
                                     <DataGrid.Columns>
-                                        <DataGridTextColumn Header="对端" Binding="{Binding PeerName}" Width="2*" />
-                                        <DataGridTextColumn Header="虚拟 IP" Binding="{Binding PeerVirtualIp}" Width="*" />
-                                        <DataGridTextColumn Header="路径" Binding="{Binding PathType}" Width="90" />
-                                        <DataGridTextColumn Header="Endpoint" Binding="{Binding RemoteEndpoint}" Width="2*" />
-                                        <DataGridTextColumn Header="RTT(ms)" Binding="{Binding RttMillis}" Width="90" />
+                                        <DataGridTemplateColumn Header="对端" SortMemberPath="PeerName" ClipboardContentBinding="{Binding PeerName}" Width="2*">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding PeerName}"
+                                                             ToolTip="{Binding PeerName}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTemplateColumn Header="虚拟 IP" SortMemberPath="PeerVirtualIp" ClipboardContentBinding="{Binding PeerVirtualIp}" Width="150">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding PeerVirtualIp}"
+                                                             ToolTip="{Binding PeerVirtualIp}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTemplateColumn Header="路径" SortMemberPath="PathType" ClipboardContentBinding="{Binding PathType}" Width="90">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding PathType}"
+                                                             ToolTip="{Binding PathType}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTemplateColumn Header="Endpoint" SortMemberPath="RemoteEndpoint" ClipboardContentBinding="{Binding RemoteEndpoint}" Width="2*">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding RemoteEndpoint}"
+                                                             ToolTip="{Binding RemoteEndpoint}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                        <DataGridTemplateColumn Header="RTT(ms)" SortMemberPath="RttMillis" ClipboardContentBinding="{Binding RttMillis}" Width="90">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                             Text="{Binding RttMillis}"
+                                                             ToolTip="{Binding RttMillis}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </Border>
@@ -242,10 +314,42 @@
                                       AlternationCount="2"
                                       ItemsSource="{Binding TcpRoutes}">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="公网端口" Binding="{Binding PublicPort}" Width="120" />
-                                    <DataGridTextColumn Header="本机目标" Binding="{Binding Target}" Width="2*" />
-                                    <DataGridTextColumn Header="目标地址" Binding="{Binding TargetAddress}" Width="2*" />
-                                    <DataGridTextColumn Header="目标端口" Binding="{Binding TargetPort}" Width="120" />
+                                    <DataGridTemplateColumn Header="公网端口" SortMemberPath="PublicPort" ClipboardContentBinding="{Binding PublicPort}" Width="120">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding PublicPort}"
+                                                         ToolTip="{Binding PublicPort}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="本机目标" SortMemberPath="Target" ClipboardContentBinding="{Binding Target}" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Target}"
+                                                         ToolTip="{Binding Target}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="目标地址" SortMemberPath="TargetAddress" ClipboardContentBinding="{Binding TargetAddress}" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding TargetAddress}"
+                                                         ToolTip="{Binding TargetAddress}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="目标端口" SortMemberPath="TargetPort" ClipboardContentBinding="{Binding TargetPort}" Width="120">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding TargetPort}"
+                                                         ToolTip="{Binding TargetPort}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                 </DataGrid.Columns>
                             </DataGrid>
                         </Border>
@@ -258,8 +362,24 @@
                                       AlternationCount="2"
                                       ItemsSource="{Binding HttpRoutes}">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="Route" Binding="{Binding Route}" Width="*" />
-                                    <DataGridTextColumn Header="Target Base URL" Binding="{Binding TargetBaseUrl}" Width="4*" />
+                                    <DataGridTemplateColumn Header="Route" SortMemberPath="Route" ClipboardContentBinding="{Binding Route}" Width="*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Route}"
+                                                         ToolTip="{Binding Route}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="Target Base URL" SortMemberPath="TargetBaseUrl" ClipboardContentBinding="{Binding TargetBaseUrl}" Width="4*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding TargetBaseUrl}"
+                                                         ToolTip="{Binding TargetBaseUrl}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
                                 </DataGrid.Columns>
                             </DataGrid>
                         </Border>
@@ -282,23 +402,9 @@
                                Foreground="{StaticResource TextSecondaryBrush}"
                                FontWeight="SemiBold"
                                Margin="0,0,0,8" />
-                    <ListBox x:Name="LogList"
+                    <TextBox x:Name="LogTextBox"
                              Grid.Row="1"
-                             ItemsSource="{Binding Logs}"
-                             Background="{StaticResource LogBackgroundBrush}"
-                             BorderThickness="0"
-                             Foreground="{StaticResource LogTextBrush}"
-                             ItemContainerStyle="{StaticResource LogListBoxItemStyle}">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <TextBlock FontFamily="Consolas"
-                                           FontSize="12"
-                                           Foreground="{StaticResource LogTextBrush}"
-                                           Text="{Binding Text}"
-                                           TextWrapping="NoWrap" />
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
+                             Style="{StaticResource LogTextBoxStyle}" />
                 </Grid>
             </Border>
         </Grid>

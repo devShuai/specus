@@ -397,7 +397,8 @@ public partial class MainWindow : Window
         {
             Logs.RemoveAt(0);
         }
-        LogList.ScrollIntoView(Logs[^1]);
+        LogTextBox.Text = string.Join(Environment.NewLine, Logs.Select(line => line.Text));
+        LogTextBox.ScrollToEnd();
     }
 
     private static string StatusTitle(TunnelClientStatusSnapshot snapshot)
