@@ -38,105 +38,47 @@ import type {
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { notifyError } from "../../components/toast";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
-
-const HTTP_EXCHANGE_PAGE_SIZE = 20;
-const TCP_FRAME_PAGE_SIZE = 20;
-const TCP_STREAM_PAGE_SIZE = 200;
-type TrafficViewKey = "client" | "tcp" | "http";
-const TRAFFIC_VIEW_TABS: Array<{ key: TrafficViewKey; label: string }> = [
-  { key: "client", label: "客户端汇总" },
-  { key: "tcp", label: "TCP 映射" },
-  { key: "http", label: "HTTP 路由" },
-];
-const TRAFFIC_MODAL_CLASS_NAMES = {
-  wrapper: "overflow-hidden p-2 sm:p-4",
-  base: "my-0 max-h-[calc(100dvh-2rem)]",
-  header: "px-4 py-3 sm:px-5",
-  body: "px-4 py-2 sm:px-5",
-  footer: "px-4 py-3 sm:px-5",
-} as const;
-
-const HTTP_SEARCH_FIELDS: Array<{ value: HttpTrafficSearchField; label: string; placeholder: string }> = [
-  { value: "summary", label: "常用字段", placeholder: "method / 状态 / 路径 / 客户端 / route" },
-  { value: "method", label: "请求方法", placeholder: "GET / POST / PUT" },
-  { value: "status", label: "状态码", placeholder: "200 / 404 / 500" },
-  { value: "path", label: "路径与查询", placeholder: "/api/user 或 keyword" },
-  { value: "route", label: "HTTP 路由", placeholder: "route 名称" },
-  { value: "client", label: "客户端", placeholder: "客户端名称或 ID" },
-  { value: "resource", label: "资源", placeholder: "资源名称或 ID" },
-  { value: "remote", label: "远端地址", placeholder: "IP / 端口" },
-  { value: "contentType", label: "Content-Type", placeholder: "application/json" },
-  { value: "error", label: "错误信息", placeholder: "异常 / timeout / refused" },
-  { value: "requestHeaders", label: "请求 Header", placeholder: "Header 名称或值" },
-  { value: "responseHeaders", label: "响应 Header", placeholder: "Header 名称或值" },
-  { value: "requestBody", label: "请求 Body", placeholder: "请求体内容" },
-  { value: "responseBody", label: "响应 Body", placeholder: "响应体内容" },
-  { value: "id", label: "记录 ID", placeholder: "记录 ID" },
-  { value: "all", label: "全部字段", placeholder: "跨所有字段搜索" },
-];
-
-const HTTP_RESPONSE_BODY_TYPES: Array<{ value: "" | HttpResponseBodyType; label: string }> = [
-  { value: "", label: "全部类型" },
-  { value: "empty", label: "空响应" },
-  { value: "json", label: "JSON" },
-  { value: "html", label: "HTML" },
-  { value: "xml", label: "XML" },
-  { value: "image", label: "图片" },
-  { value: "video", label: "视频" },
-  { value: "audio", label: "音频" },
-  { value: "form", label: "表单" },
-  { value: "script", label: "脚本" },
-  { value: "text", label: "文本" },
-  { value: "binary", label: "二进制" },
-];
-const desktopFilterControlClass =
-  "h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary";
-
-interface TrafficSummary {
-  resources: number;
-  uploadBytes: number;
-  downloadBytes: number;
-  updatedAt: string | null;
-}
-
-interface ResourceTotal {
-  key: string;
-  name: string;
-  clientName: string;
-  uploadBytes: number;
-  downloadBytes: number;
-  totalBytes: number;
-  updatedAt: string | null;
-}
-
-interface BodyPreviewTarget {
-  title: string;
-  contentType: string | null;
-  contentEncoding: string | null;
-  content: string | null;
-  bytes: number;
-  truncated: boolean;
-  decodeMessage: string | null;
-  decodeStatus: HttpBodyDecodeStatus;
-}
-
-type HttpBodyDecodeStatus = "plain" | "pending" | "decoded" | "stored-decoded" | "unsupported" | "failed";
-
-export function TcpTrafficTab({ rows, loading, page, pageSize, total, totalPages, onPageChange }: { rows: any; loading: any; page: any; pageSize: any; total: any; totalPages: any; onPageChange: any }) {
-  const [selectedFrame, setSelectedFrame] = useState<any>(null);
-  const [selectedStream, setSelectedStream] = useState<any>(null);
-  const [frameDetailLoadingId, setFrameDetailLoadingId] = useState<string | null>(null);
-  const [streamLoadingChannel, setStreamLoadingChannel] = useState<string | null>(null);
-  const openDetails = useCallback(async (row: any) => { setFrameDetailLoadingId(row.id); try { setSelectedFrame(await adminApi.getTcpTrafficFrame(row.id)); } catch (e) { notifyError(e, "加载失败"); } finally { setFrameDetailLoadingId(null); } }, []);
-  const openStream = useCallback(async (row: any) => { setStreamLoadingChannel(row.channelId); try { setSelectedStream(await adminApi.getTcpTrafficStream(row.channelId, 0, TCP_STREAM_PAGE_SIZE)); } catch (e) { notifyError(e, "加载失败"); } finally { setStreamLoadingChannel(null); } }, []);
-  const changeStreamPage = useCallback(async (p: number) => { if (!selectedStream) return; setStreamLoadingChannel(selectedStream.channelId); try { setSelectedStream(await adminApi.getTcpTrafficStream(selectedStream.channelId, p, selectedStream.size || TCP_STREAM_PAGE_SIZE)); } catch (e) { notifyError(e, "切换失败"); } finally { setStreamLoadingChannel(null); } }, [selectedStream]);
-  return <><TcpFrameTable rows={rows} loading={loading} page={page} pageSize={pageSize} total={total} totalPages={totalPages} detailLoadingId={frameDetailLoadingId} streamLoadingChannel={streamLoadingChannel} onPageChange={onPageChange} onOpenDetails={openDetails} onOpenStream={openStream} /><TcpFrameModal row={selectedFrame} onClose={() => setSelectedFrame(null)} /><TcpStreamModal stream={selectedStream} loading={selectedStream != null && streamLoadingChannel === selectedStream.channelId} onClose={() => setSelectedStream(null)} onPageChange={changeStreamPage} /></>;
-}
-
-export function HttpTrafficTab({ rows, loading, page, pageSize, total, totalPages, searchDraft, searchField, responseType, activeSearchField, activeSearch, activeResponseType, onPageChange, onSearchDraftChange, onSearchFieldChange, onResponseTypeChange, onSearch, onResetSearch }: any) {
-  const [selectedExchange, setSelectedExchange] = useState<any>(null);
-  return <><HttpExchangeTable rows={rows} loading={loading} page={page} pageSize={pageSize} total={total} totalPages={totalPages} searchDraft={searchDraft} searchField={searchField} responseType={responseType} activeSearchField={activeSearchField} activeSearch={activeSearch} activeResponseType={activeResponseType} onPageChange={onPageChange} onSearchDraftChange={onSearchDraftChange} onSearchFieldChange={onSearchFieldChange} onResponseTypeChange={onResponseTypeChange} onSearch={onSearch} onResetSearch={onResetSearch} onOpenDetails={setSelectedExchange} /><HttpExchangeModal row={selectedExchange} onClose={() => setSelectedExchange(null)} /></>;
-}
+import {
+  aggregateResources,
+  desktopFilterControlClass,
+  HTTP_EXCHANGE_PAGE_SIZE,
+  HTTP_RESPONSE_BODY_TYPES,
+  HTTP_SEARCH_FIELDS,
+  httpResponseTypeColor,
+  httpResponseTypeLabel,
+  httpResponseTypeOption,
+  httpSearchFieldOption,
+  latestUpdatedAt,
+  normalizeHttpResponseType,
+  normalizeHttpSearchField,
+  TCP_FRAME_PAGE_SIZE,
+  TCP_STREAM_PAGE_SIZE,
+  TRAFFIC_MODAL_CLASS_NAMES,
+  TRAFFIC_VIEW_TABS,
+  type BodyPreviewTarget,
+  type HttpBodyDecodeStatus,
+  type ResourceTotal,
+  type TrafficSummary,
+  type TrafficViewKey,
+} from "./traffic/trafficModel";
+import {
+  analyzeTcpPayload,
+  bytesToHexDump,
+  concatTcpPayloads,
+  decodeBase64Bytes,
+  decodeHexPreview,
+  decodeUtf8,
+  detectImageMime,
+  looksLikeTextPayload,
+  parseTcpJson,
+  parseTcpHttpMessage,
+  tcpFlowLabel,
+  tcpHeaderValue,
+  tcpPayloadKindLabel,
+  tcpStreamRange,
+  type TcpHeaderPair,
+  type TcpPayloadAnalysis,
+} from "./traffic/tcpPayload";
 
 export function TrafficPanel() {
   const [clientRows, setClientRows] = useState<TrafficUsage[]>([]);
@@ -2530,7 +2472,18 @@ function TcpStreamPayload({ frames }: { frames: TcpTrafficFrame[] }) {
         <Tab key="parsed" title="解析">
           {http ? (
             <TcpParsedPayload
-              analysis={tcpAnalysis("http", bytes, text, hexDump, fullAvailable, http, null, null, null, "HTTP")}
+              analysis={{
+                binaryLabel: "HTTP",
+                bytes,
+                fullAvailable,
+                hexDump,
+                http,
+                imageDataUrl: null,
+                imageMime: null,
+                jsonPretty: null,
+                kind: "http",
+                text,
+              }}
             />
           ) : jsonPretty ? (
             <JsonHighlightedPreview content={jsonPretty} maxHeightClass="max-h-[52dvh]" />
@@ -3184,252 +3137,6 @@ function previewKindLabel(kind: BodyPreviewKind): string {
   return "文本";
 }
 
-type TcpPayloadKind = "http" | "json" | "image" | "text" | "binary";
-
-interface TcpPayloadAnalysis {
-  binaryLabel: string;
-  bytes: Uint8Array;
-  fullAvailable: boolean;
-  hexDump: string;
-  http: TcpHttpMessage | null;
-  imageDataUrl: string | null;
-  imageMime: string | null;
-  jsonPretty: string | null;
-  kind: TcpPayloadKind;
-  text: string;
-}
-
-interface TcpHttpMessage {
-  body: string;
-  headers: TcpHeaderPair[];
-  startLine: string;
-}
-
-interface TcpHeaderPair {
-  name: string;
-  value: string;
-}
-
-function analyzeTcpPayload(row: TcpTrafficFrame): TcpPayloadAnalysis {
-  const fullAvailable = Boolean(row.payloadBase64);
-  const bytes = fullAvailable ? decodeBase64Bytes(row.payloadBase64) : decodeHexPreview(row.payloadPreviewHex);
-  const text = decodeUtf8(bytes);
-  const hexDump = bytesToHexDump(bytes);
-  const imageMime = detectImageMime(bytes);
-  const http = parseTcpHttpMessage(text);
-  const jsonPretty = parseTcpJson(text);
-
-  if (http) {
-    return tcpAnalysis("http", bytes, text, hexDump, fullAvailable, http, null, null, null, "HTTP");
-  }
-  if (jsonPretty) {
-    return tcpAnalysis("json", bytes, text, hexDump, fullAvailable, null, null, null, jsonPretty, "JSON");
-  }
-  if (imageMime && fullAvailable) {
-    return tcpAnalysis(
-      "image",
-      bytes,
-      text,
-      hexDump,
-      fullAvailable,
-      null,
-      imageMime,
-      `data:${imageMime};base64,${row.payloadBase64}`,
-      null,
-      imageMime,
-    );
-  }
-  if (looksLikeTextPayload(bytes)) {
-    return tcpAnalysis("text", bytes, text, hexDump, fullAvailable, null, null, null, null, "文本");
-  }
-  return tcpAnalysis("binary", bytes, text, hexDump, fullAvailable, null, null, null, null, detectBinaryLabel(bytes));
-}
-
-function tcpAnalysis(
-  kind: TcpPayloadKind,
-  bytes: Uint8Array,
-  text: string,
-  hexDump: string,
-  fullAvailable: boolean,
-  http: TcpHttpMessage | null,
-  imageMime: string | null,
-  imageDataUrl: string | null,
-  jsonPretty: string | null,
-  binaryLabel: string,
-): TcpPayloadAnalysis {
-  return { binaryLabel, bytes, fullAvailable, hexDump, http, imageDataUrl, imageMime, jsonPretty, kind, text };
-}
-
-function tcpPayloadKindLabel(kind: TcpPayloadKind): string {
-  if (kind === "http") {
-    return "HTTP";
-  }
-  if (kind === "json") {
-    return "JSON";
-  }
-  if (kind === "image") {
-    return "图片";
-  }
-  if (kind === "text") {
-    return "文本";
-  }
-  return "二进制";
-}
-
-function decodeBase64Bytes(base64: string): Uint8Array {
-  try {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  } catch {
-    return new Uint8Array();
-  }
-}
-
-function decodeHexPreview(hex: string | null | undefined): Uint8Array {
-  const pairs = hex?.match(/[0-9a-fA-F]{2}/g) ?? [];
-  const bytes = new Uint8Array(pairs.length);
-  pairs.forEach((pair, index) => {
-    bytes[index] = Number.parseInt(pair, 16);
-  });
-  return bytes;
-}
-
-function decodeUtf8(bytes: Uint8Array): string {
-  if (bytes.length === 0) {
-    return "";
-  }
-  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-}
-
-function parseTcpHttpMessage(text: string): TcpHttpMessage | null {
-  const startLineMatch = text.match(/^([A-Z]{3,12}\s+\S+\s+HTTP\/\d(?:\.\d)?|HTTP\/\d(?:\.\d)?\s+\d{3}.*)(?:\r?\n|$)/);
-  if (!startLineMatch) {
-    return null;
-  }
-  const separatorMatch = /\r?\n\r?\n/.exec(text);
-  const headerBlock = separatorMatch ? text.slice(0, separatorMatch.index) : text;
-  const body = separatorMatch ? text.slice(separatorMatch.index + separatorMatch[0].length) : "";
-  const [startLine, ...headerLines] = headerBlock.split(/\r?\n/);
-  const headers = headerLines
-    .map((line) => {
-      const splitAt = line.indexOf(":");
-      if (splitAt <= 0) {
-        return null;
-      }
-      return { name: line.slice(0, splitAt).trim(), value: line.slice(splitAt + 1).trim() };
-    })
-    .filter((header): header is TcpHeaderPair => header != null);
-  return { body, headers, startLine };
-}
-
-function parseTcpJson(text: string): string | null {
-  const trimmed = text.trim();
-  if (!/^[\[{]/.test(trimmed)) {
-    return null;
-  }
-  try {
-    return JSON.stringify(JSON.parse(trimmed), null, 2);
-  } catch {
-    return null;
-  }
-}
-
-function tcpHeaderValue(headers: TcpHeaderPair[], name: string): string | null {
-  const target = name.toLowerCase();
-  return headers.find((header) => header.name.toLowerCase() === target)?.value ?? null;
-}
-
-function detectImageMime(bytes: Uint8Array): string | null {
-  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
-    return "image/png";
-  }
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return "image/jpeg";
-  }
-  if (bytes.length >= 6) {
-    const signature = String.fromCharCode(...bytes.slice(0, 6));
-    if (signature === "GIF87a" || signature === "GIF89a") {
-      return "image/gif";
-    }
-  }
-  if (bytes.length >= 12) {
-    const riff = String.fromCharCode(...bytes.slice(0, 4));
-    const webp = String.fromCharCode(...bytes.slice(8, 12));
-    if (riff === "RIFF" && webp === "WEBP") {
-      return "image/webp";
-    }
-  }
-  return null;
-}
-
-function looksLikeTextPayload(bytes: Uint8Array): boolean {
-  if (bytes.length === 0) {
-    return true;
-  }
-  const sampleLength = Math.min(bytes.length, 4096);
-  let control = 0;
-  for (let i = 0; i < sampleLength; i += 1) {
-    const value = bytes[i];
-    const allowedWhitespace = value === 0x09 || value === 0x0a || value === 0x0d;
-    if ((value < 0x20 && !allowedWhitespace) || value === 0x7f) {
-      control += 1;
-    }
-  }
-  return control / sampleLength < 0.08;
-}
-
-function detectBinaryLabel(bytes: Uint8Array): string {
-  if (bytes.length >= 3 && bytes[0] === 0x16 && bytes[1] === 0x03) {
-    return "TLS Handshake";
-  }
-  if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
-    return "Gzip";
-  }
-  if (bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b) {
-    return "ZIP";
-  }
-  return "Binary";
-}
-
-function bytesToHexDump(bytes: Uint8Array): string {
-  if (bytes.length === 0) {
-    return "";
-  }
-  const lines: string[] = [];
-  for (let offset = 0; offset < bytes.length; offset += 16) {
-    const slice = bytes.slice(offset, offset + 16);
-    let hex = "";
-    let ascii = "";
-    for (let i = 0; i < 16; i += 1) {
-      if (i < slice.length) {
-        const value = slice[i];
-        hex += `${value.toString(16).padStart(2, "0").toUpperCase()} `;
-        ascii += value >= 0x20 && value <= 0x7e ? String.fromCharCode(value) : ".";
-      } else {
-        hex += "   ";
-        ascii += " ";
-      }
-      if (i === 7) {
-        hex += " ";
-      }
-    }
-    lines.push(`${offset.toString(16).padStart(8, "0").toUpperCase()}  ${hex} |${ascii}|`);
-  }
-  return lines.join("\n");
-}
-
-function normalizeHttpSearchField(value: string): HttpTrafficSearchField {
-  return HTTP_SEARCH_FIELDS.some((field) => field.value === value) ? (value as HttpTrafficSearchField) : "summary";
-}
-
-function httpSearchFieldOption(value: HttpTrafficSearchField) {
-  return HTTP_SEARCH_FIELDS.find((field) => field.value === value) ?? HTTP_SEARCH_FIELDS[0];
-}
-
 function parseJsonPreview(content: string): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(content) };
@@ -3619,106 +3326,6 @@ function ResourceBars({ items }: { items: ResourceTotal[] }) {
   );
 }
 
-function aggregateResources(rows: ResourceTrafficUsage[]): ResourceTotal[] {
-  const byResource = new Map<string, ResourceTotal>();
-  for (const row of rows) {
-    const key = `${row.resourceType}:${row.resourceKey}:${row.clientId}`;
-    const item = byResource.get(key) ?? {
-      key,
-      name: row.resourceName,
-      clientName: row.clientName,
-      uploadBytes: 0,
-      downloadBytes: 0,
-      totalBytes: 0,
-      updatedAt: null,
-    };
-    item.name = row.resourceName || item.name;
-    item.clientName = row.clientName || item.clientName;
-    item.uploadBytes += row.uploadBytes;
-    item.downloadBytes += row.downloadBytes;
-    item.totalBytes = item.uploadBytes + item.downloadBytes;
-    item.updatedAt = later(item.updatedAt, row.updatedAt);
-    byResource.set(key, item);
-  }
-  return Array.from(byResource.values()).sort((a, b) => b.totalBytes - a.totalBytes);
-}
-
-function normalizeHttpResponseType(value: string): "" | HttpResponseBodyType {
-  return HTTP_RESPONSE_BODY_TYPES.some((type) => type.value === value) ? (value as "" | HttpResponseBodyType) : "";
-}
-
-function httpResponseTypeOption(value: "" | HttpResponseBodyType) {
-  return HTTP_RESPONSE_BODY_TYPES.find((type) => type.value === value) ?? HTTP_RESPONSE_BODY_TYPES[0];
-}
-
-function httpResponseTypeLabel(
-  value: string | null | undefined,
-  contentType: string | null | undefined,
-  bytes: number,
-): string {
-  const normalized = normalizeHttpResponseType(value ?? "") || inferHttpResponseType(contentType, bytes);
-  return httpResponseTypeOption(normalized).label;
-}
-
-function httpResponseTypeColor(
-  value: string | null | undefined,
-  contentType: string | null | undefined,
-  bytes: number,
-): "default" | "primary" | "secondary" | "success" | "warning" {
-  const normalized = normalizeHttpResponseType(value ?? "") || inferHttpResponseType(contentType, bytes);
-  if (normalized === "json" || normalized === "html" || normalized === "xml") {
-    return "primary";
-  }
-  if (normalized === "image" || normalized === "video" || normalized === "audio") {
-    return "secondary";
-  }
-  if (normalized === "empty") {
-    return "success";
-  }
-  if (normalized === "binary") {
-    return "warning";
-  }
-  return "default";
-}
-
-function inferHttpResponseType(contentType: string | null | undefined, bytes: number): "" | HttpResponseBodyType {
-  if (bytes <= 0) {
-    return "empty";
-  }
-  const mediaType = (contentType ?? "").split(";", 1)[0]?.trim().toLowerCase() ?? "";
-  if (!mediaType) {
-    return "binary";
-  }
-  if (mediaType === "application/json" || mediaType.endsWith("+json")) {
-    return "json";
-  }
-  if (mediaType === "text/html") {
-    return "html";
-  }
-  if (mediaType === "application/xml" || mediaType === "text/xml" || mediaType.endsWith("+xml")) {
-    return "xml";
-  }
-  if (mediaType.startsWith("image/")) {
-    return "image";
-  }
-  if (mediaType.startsWith("video/")) {
-    return "video";
-  }
-  if (mediaType.startsWith("audio/")) {
-    return "audio";
-  }
-  if (mediaType === "application/x-www-form-urlencoded" || mediaType === "multipart/form-data") {
-    return "form";
-  }
-  if (mediaType.includes("javascript") || mediaType.includes("ecmascript")) {
-    return "script";
-  }
-  if (mediaType.startsWith("text/")) {
-    return "text";
-  }
-  return "binary";
-}
-
 function httpPath(row: HttpTrafficExchange): string {
   return `${row.relativePath || "/"}${row.rawQuery ? `?${row.rawQuery}` : ""}`;
 }
@@ -3750,55 +3357,3 @@ function shortChannel(channelId: string): string {
   return `${channelId.slice(0, 8)}...${channelId.slice(-8)}`;
 }
 
-function tcpEndpoint(address: string | null | undefined, port: number | null | undefined): string {
-  if (!address && port == null) {
-    return "-";
-  }
-  if (!address) {
-    return `:${port}`;
-  }
-  return port == null ? address : `${address}:${port}`;
-}
-
-function tcpFlowLabel(row: TcpTrafficFrame): string {
-  const source = tcpEndpoint(row.sourceAddress, row.sourcePort);
-  const destination = tcpEndpoint(row.destinationAddress, row.destinationPort);
-  if (source === "-" && destination === "-") {
-    return row.remoteAddress || "-";
-  }
-  return `${source} -> ${destination}`;
-}
-
-function tcpStreamRange(row: TcpTrafficFrame): string {
-  const start = row.streamOffset ?? 0;
-  const end = row.streamEndOffset ?? start + row.payloadBytes;
-  return `${start}-${end}`;
-}
-
-function concatTcpPayloads(frames: TcpTrafficFrame[]): Uint8Array {
-  const chunks = frames.map((frame) =>
-    frame.payloadBase64 ? decodeBase64Bytes(frame.payloadBase64) : decodeHexPreview(frame.payloadPreviewHex),
-  );
-  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result;
-}
-
-function latestUpdatedAt(rows: Array<{ updatedAt: string }>): string | null {
-  return rows.reduce<string | null>((latest, row) => later(latest, row.updatedAt), null);
-}
-
-function later(left: string | null, right: string | null | undefined): string | null {
-  if (!right) {
-    return left;
-  }
-  if (!left) {
-    return right;
-  }
-  return new Date(right).getTime() > new Date(left).getTime() ? right : left;
-}
