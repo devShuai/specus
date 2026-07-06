@@ -52,7 +52,6 @@ export function ConnectionsPanel() {
   filterRef.current = { clientId, result, fromDate, toDate, page };
 
   const now = useNowTick(1000); // live durations for active rows
-  const durationTick = Math.floor(now / 1000);
 
   useEffect(() => {
     adminApi
@@ -207,8 +206,8 @@ export function ConnectionsPanel() {
   const rangeStart = total === 0 ? 0 : page * PAGE_SIZE + 1;
   const rangeEnd = Math.min(total, (page + 1) * PAGE_SIZE);
   const tableScopeKey = useMemo(
-    () => `${page}:${PAGE_SIZE}:${clientId}:${result}:${fromDate}:${toDate}:${durationTick}`,
-    [clientId, durationTick, fromDate, page, result, toDate],
+    () => `${page}:${PAGE_SIZE}:${clientId}:${result}:${fromDate}:${toDate}`,
+    [clientId, fromDate, page, result, toDate],
   );
   const tableRows = useMemo(
     () =>
