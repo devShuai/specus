@@ -1178,18 +1178,23 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
   return (
     <>
       <Modal classNames={TRAFFIC_MODAL_CLASS_NAMES} isOpen={Boolean(row)} onClose={onClose} size="5xl" scrollBehavior="inside">
-        <ModalContent className="max-w-[min(96vw,1180px)]">
+        <ModalContent className="max-w-[min(96vw,1180px)] overflow-hidden">
           {row && (
             <>
-              <ModalHeader className="flex flex-col gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Chip color="primary" size="sm" variant="flat">
+              <ModalHeader className="flex min-w-0 flex-col gap-2 pr-12">
+                <div className="grid min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] items-start gap-2">
+                  <Chip className="mt-0.5" color="primary" size="sm" variant="flat">
                     {row.method}
                   </Chip>
-                  <Chip color={httpStatusColor(row)} size="sm" variant="flat">
+                  <Chip className="mt-0.5" color={httpStatusColor(row)} size="sm" variant="flat">
                     {row.statusCode}
                   </Chip>
-                  <span className="min-w-0 flex-1 break-all font-mono text-small">{httpPath(row)}</span>
+                  <span
+                    className="max-h-16 min-w-0 overflow-y-auto break-all pr-1 font-mono text-small leading-relaxed"
+                    title={httpPath(row)}
+                  >
+                    {httpPath(row)}
+                  </span>
                 </div>
                 <div className="flex flex-wrap gap-x-4 gap-y-1 text-tiny font-normal text-default-500">
                   <span>{formatDateTime(row.capturedAt)}</span>
@@ -1226,7 +1231,7 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
                     previewText={row.requestPreviewText}
                     truncated={row.requestTruncated}
                     contentType={row.requestContentType}
-                    bodyMaxHeightClass="max-h-[38dvh]"
+                    bodyMaxHeightClass="h-full"
                     onPreview={setBodyPreview}
                   />
                   <HttpMessagePanel
@@ -1242,7 +1247,7 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
                     previewText={row.responsePreviewText}
                     truncated={row.responseTruncated}
                     contentType={row.responseContentType}
-                    bodyMaxHeightClass="max-h-[38dvh]"
+                    bodyMaxHeightClass="h-full"
                     onPreview={setBodyPreview}
                   />
                 </div>
@@ -1306,70 +1311,72 @@ function HttpMessagePanel({
   const previewKind = detectBodyPreviewKind(contentType, bodyDisplay.content);
 
   return (
-    <div className="flex h-full min-w-0 flex-col gap-2 overflow-hidden rounded-small border border-default-200 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
+    <div className="grid h-full min-h-[min(68dvh,44rem)] min-w-0 grid-rows-[4.75rem_17rem_minmax(14rem,1fr)] gap-3 overflow-hidden rounded-small border border-default-200 p-3">
+      <div className="flex min-h-0 items-start justify-between gap-3 overflow-hidden">
+        <div className="min-w-0">
           <h4 className="text-small font-semibold">{title}</h4>
-          <div className="mt-1 flex flex-wrap gap-2 text-tiny text-default-500">
+          <div className="mt-1 flex min-w-0 flex-col gap-1 text-tiny text-default-500">
             {meta.filter(Boolean).map((item) => (
-              <span key={item ?? ""} className="max-w-full break-all">
+              <span key={item ?? ""} className="block max-w-full truncate" title={item ?? ""}>
                 {item}
               </span>
             ))}
           </div>
         </div>
-        <Chip size="sm" variant="flat">
+        <Chip className="shrink-0" size="sm" variant="flat">
           {formatBytes(bytes)}
         </Chip>
       </div>
       <HeaderBlock content={headers} />
-      {bodyDisplay.message && (
-        <div
-          className={`rounded-small border p-2 text-tiny leading-relaxed ${
-            bodyDisplay.status === "failed" || bodyDisplay.status === "unsupported"
-              ? "border-warning-200 bg-warning-50 text-warning-700"
-              : "border-primary-100 bg-primary-50 text-primary-700"
-          }`}
-        >
-          {bodyDisplay.message}
-        </div>
-      )}
-      <ProtocolBlock
-        title={truncated ? "Body Preview / truncated" : "Body"}
-        content={bodyDisplay.content}
-        className="min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)]"
-        maxHeightClass={`h-full ${bodyMaxHeightClass}`}
-        contentClassName="min-h-28"
-        action={
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            {contentEncoding && (
-              <Chip color="secondary" size="sm" variant="flat">
-                Content-Encoding {contentEncoding}
-              </Chip>
-            )}
-            <Button
-              isDisabled={!hasBody || bodyDisplay.status === "pending"}
-              isLoading={bodyDisplay.status === "pending"}
-              size="sm"
-              variant="flat"
-              onPress={() =>
-                onPreview({
-                  title: `${title} Body`,
-                  contentType,
-                  contentEncoding,
-                  content: bodyDisplay.content,
-                  bytes,
-                  truncated,
-                  decodeMessage: bodyDisplay.message,
-                  decodeStatus: bodyDisplay.status,
-                })
-              }
-            >
-              {previewButtonText(previewKind)}
-            </Button>
+      <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-2">
+        {bodyDisplay.message && (
+          <div
+            className={`max-h-20 overflow-y-auto rounded-small border p-2 text-tiny leading-relaxed ${
+              bodyDisplay.status === "failed" || bodyDisplay.status === "unsupported"
+                ? "border-warning-200 bg-warning-50 text-warning-700"
+                : "border-primary-100 bg-primary-50 text-primary-700"
+            }`}
+          >
+            {bodyDisplay.message}
           </div>
-        }
-      />
+        )}
+        <ProtocolBlock
+          title={truncated ? "Body Preview / truncated" : "Body"}
+          content={bodyDisplay.content}
+          className="min-h-0 grid-rows-[auto_minmax(0,1fr)]"
+          maxHeightClass={bodyMaxHeightClass}
+          contentClassName="min-h-0"
+          action={
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {contentEncoding && (
+                <Chip color="secondary" size="sm" variant="flat">
+                  Content-Encoding {contentEncoding}
+                </Chip>
+              )}
+              <Button
+                isDisabled={!hasBody || bodyDisplay.status === "pending"}
+                isLoading={bodyDisplay.status === "pending"}
+                size="sm"
+                variant="flat"
+                onPress={() =>
+                  onPreview({
+                    title: `${title} Body`,
+                    contentType,
+                    contentEncoding,
+                    content: bodyDisplay.content,
+                    bytes,
+                    truncated,
+                    decodeMessage: bodyDisplay.message,
+                    decodeStatus: bodyDisplay.status,
+                  })
+                }
+              >
+                {previewButtonText(previewKind)}
+              </Button>
+            </div>
+          }
+        />
+      </div>
     </div>
   );
 }
@@ -2613,16 +2620,22 @@ function HeaderBlock({ content }: { content: string | null }) {
   const rows = useMemo(() => parseHeaderRows(value), [value]);
 
   return (
-    <div className="grid min-w-0 gap-1">
+    <div className="grid min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)] gap-1">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-tiny font-semibold text-default-500">Headers</span>
         <Chip size="sm" variant="flat">
           {rows.length} 项
         </Chip>
       </div>
-      <Tabs aria-label="Header 展示方式" size="sm" variant="underlined" destroyInactiveTabPanel={false}>
+      <Tabs
+        aria-label="Header 展示方式"
+        classNames={{ base: "min-h-0", panel: "min-h-0 py-0" }}
+        destroyInactiveTabPanel={false}
+        size="sm"
+        variant="underlined"
+      >
         <Tab key="form" title="表单">
-          <div className="mt-2 grid h-48 min-w-0 gap-2 overflow-y-auto rounded-small border border-default-200 bg-default-50 p-2">
+          <div className="mt-2 grid h-[12.75rem] min-w-0 gap-2 overflow-y-auto rounded-small border border-default-200 bg-default-50 p-2">
             {rows.length === 0 ? (
               <div className="rounded-small bg-background p-3 text-tiny text-default-400">暂无 Header</div>
             ) : (
@@ -2659,8 +2672,13 @@ function HeaderBlock({ content }: { content: string | null }) {
           </div>
         </Tab>
         <Tab key="raw" title="Raw">
-          <div className="mt-2">
-            <ProtocolBlock content={value} maxHeightClass="max-h-40" title="Raw Headers" />
+          <div className="mt-2 h-[12.75rem]">
+            <ProtocolBlock
+              className="h-full grid-rows-[auto_minmax(0,1fr)]"
+              content={value}
+              maxHeightClass="h-full"
+              title="Raw Headers"
+            />
           </div>
         </Tab>
       </Tabs>
