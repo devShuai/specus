@@ -5,7 +5,10 @@ using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Interop;
+using System.Windows.Media;
+using Microsoft.Win32;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.Control;
@@ -21,15 +24,27 @@ public partial class MainWindow : Window
         WriteIndented = true,
     };
 
+    private const string ThemeModeSystem = "system";
+    private const string ThemeModeLight = "light";
+    private const string ThemeModeDark = "dark";
+    private const string ThemeModeSystemIcon = "M4,5 H20 V15 H4 Z M8,19 H16 M12,15 V19";
+    private const string ThemeModeLightIcon = "M12,5 A7,7 0 1 1 12,19 A7,7 0 1 1 12,5 M12,1 V3 M12,21 V23 M4.22,4.22 L5.64,5.64 M18.36,18.36 L19.78,19.78 M1,12 H3 M21,12 H23 M4.22,19.78 L5.64,18.36 M18.36,5.64 L19.78,4.22";
+    private const string ThemeModeDarkIcon = "M20,14.5 A8.5,8.5 0 0 1 9.5,4 A7,7 0 1 0 20,14.5 Z";
+
     private readonly UiTunnelObserver _observer;
     private CancellationTokenSource? _clientCts;
     private TunnelControlClient? _client;
     private Task? _clientTask;
     private ILoggerFactory? _loggerFactory;
     private HttpClient? _httpClient;
+    private string _themeMode = ThemeModeSystem;
+    private bool _effectiveDarkTheme = true;
+    private bool _peerMeshEnabled;
+    private bool _loadingSettings;
     private bool _running;
     private bool _stopping;
     private bool _closing;
+    private bool _logExpanded;
 
     public ObservableCollection<TcpRouteSnapshot> TcpRoutes { get; } = new();
 
@@ -46,14 +61,22 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = this;
         _observer = new UiTunnelObserver(this);
+        SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
         LoadSettingsIntoForm();
+        ApplyConfiguredTheme();
         UpdateStoppedUi("未连接", "填写连接信息后启动客户端");
     }
 
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
-        ApplyDarkTitleBar();
+        ApplyTitleBar(_effectiveDarkTheme);
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+        base.OnClosed(e);
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -78,6 +101,83 @@ public partial class MainWindow : Window
         {
             MessageBox.Show(this, ex.Message, "保存配置失败", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
+    }
+
+    private void ThemeModeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_loadingSettings)
+        {
+            return;
+        }
+        _themeMode = NextThemeMode(_themeMode);
+        ApplyConfiguredTheme();
+        try
+        {
+            SaveSettingsFromForm(validateConnection: false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            AppendLog(LogLevel.Warning, "desktop", $"主题设置保存失败: {ex.Message}", null);
+        }
+    }
+
+    private void LogExpandButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_logExpanded)
+        {
+            CollapseLogPanel();
+        }
+        else
+        {
+            ExpandLogPanel();
+        }
+    }
+
+    private void Window_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Escape && _logExpanded)
+        {
+            CollapseLogPanel();
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// 把日志面板从右侧内容区底部挪到根网格并铺满两列，覆盖整个窗口。
+    /// WPF 元素不能同时挂两处，放大/还原通过重挂载实现，日志内容与滚动位置保持不变。
+    /// </summary>
+    private void ExpandLogPanel()
+    {
+        if (_logExpanded)
+        {
+            return;
+        }
+        MainContentGrid.Children.Remove(LogPanelBorder);
+        Grid.SetRow(LogPanelBorder, 0);
+        Grid.SetColumn(LogPanelBorder, 0);
+        Grid.SetColumnSpan(LogPanelBorder, 2);
+        LogPanelBorder.Margin = new Thickness(16);
+        Panel.SetZIndex(LogPanelBorder, 10);
+        RootLayoutGrid.Children.Add(LogPanelBorder);
+        LogExpandButton.Content = "还原";
+        _logExpanded = true;
+    }
+
+    private void CollapseLogPanel()
+    {
+        if (!_logExpanded)
+        {
+            return;
+        }
+        RootLayoutGrid.Children.Remove(LogPanelBorder);
+        Grid.SetRow(LogPanelBorder, 2);
+        Grid.SetColumn(LogPanelBorder, 0);
+        Grid.SetColumnSpan(LogPanelBorder, 1);
+        LogPanelBorder.Margin = new Thickness(0);
+        Panel.SetZIndex(LogPanelBorder, 0);
+        MainContentGrid.Children.Add(LogPanelBorder);
+        LogExpandButton.Content = "放大";
+        _logExpanded = false;
     }
 
     protected override void OnClosing(CancelEventArgs e)
@@ -259,12 +359,16 @@ public partial class MainWindow : Window
     private void LoadSettingsIntoForm()
     {
         var settings = LoadSettings();
+        _loadingSettings = true;
         ServerBaseUrlBox.Text = settings.ServerBaseUrl;
         ApiKeyBox.Text = settings.ApiKey;
         SecretBox.Password = settings.Secret;
         PeerMeshDeviceBox.Text = settings.PeerMeshDevice;
+        _themeMode = NormalizeThemeMode(settings.ThemeMode);
+        UpdateThemeModeButton();
         TunNameBox.Text = settings.PeerMeshTunName;
         MtuBox.Text = settings.PeerMeshMtu.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        _loadingSettings = false;
     }
 
     private static DesktopClientSettings LoadSettings()
@@ -286,21 +390,31 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SaveSettingsFromForm()
+    private void SaveSettingsFromForm(bool validateConnection = true)
     {
-        var config = BuildConfigFromForm();
+        TunnelClientConfig? config = validateConnection ? BuildConfigFromForm() : null;
         var settings = new DesktopClientSettings
         {
-            ServerBaseUrl = config.ServerBaseUrl,
-            ApiKey = config.ApiKey ?? "",
-            Secret = config.Secret ?? "",
-            PeerMeshDevice = config.PeerMeshDevice,
-            PeerMeshTunName = config.PeerMeshTunName,
-            PeerMeshMtu = config.PeerMeshMtu,
+            ServerBaseUrl = config?.ServerBaseUrl ?? ServerBaseUrlBox.Text.Trim(),
+            ApiKey = config?.ApiKey ?? ApiKeyBox.Text,
+            Secret = config?.Secret ?? SecretBox.Password,
+            PeerMeshDevice = config?.PeerMeshDevice ?? (string.IsNullOrWhiteSpace(PeerMeshDeviceBox.Text)
+                ? "auto"
+                : PeerMeshDeviceBox.Text.Trim()),
+            ThemeMode = NormalizeThemeMode(_themeMode),
+            PeerMeshTunName = config?.PeerMeshTunName ?? TunNameBox.Text.Trim(),
+            PeerMeshMtu = config?.PeerMeshMtu ?? ParseMtuOrDefault(),
         };
         var path = SettingsPath();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, JsonSerializer.Serialize(settings, SettingsJsonOptions));
+    }
+
+    private int ParseMtuOrDefault()
+    {
+        return int.TryParse(MtuBox.Text.Trim(), out var mtu)
+            ? mtu
+            : TunnelClientConfig.DefaultPeerMeshMtu;
     }
 
     private static string SettingsPath()
@@ -309,6 +423,180 @@ public partial class MainWindow : Window
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "ShuaiTunnel",
             "desktop-client.json");
+    }
+
+    private void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+    {
+        if (!string.Equals(_themeMode, ThemeModeSystem, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+        if (e.Category is UserPreferenceCategory.Color
+            or UserPreferenceCategory.General
+            or UserPreferenceCategory.VisualStyle)
+        {
+            Dispatcher.BeginInvoke(new Action(ApplyConfiguredTheme));
+        }
+    }
+
+    private void ApplyConfiguredTheme()
+    {
+        var useDark = string.Equals(_themeMode, ThemeModeDark, StringComparison.OrdinalIgnoreCase)
+            || (string.Equals(_themeMode, ThemeModeSystem, StringComparison.OrdinalIgnoreCase) && !SystemUsesLightTheme());
+        _effectiveDarkTheme = useDark;
+        ApplyPalette(useDark ? DarkPalette() : LightPalette());
+        ApplyTitleBar(useDark);
+        UpdateThemeModeButton();
+        UpdatePeerMeshStatusBrush();
+    }
+
+    private static bool SystemUsesLightTheme()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return false;
+        }
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            var value = key?.GetValue("AppsUseLightTheme");
+            return value switch
+            {
+                int intValue => intValue > 0,
+                long longValue => longValue > 0,
+                _ => false,
+            };
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private void ApplyPalette(IReadOnlyDictionary<string, Color> palette)
+    {
+        foreach (var (key, color) in palette)
+        {
+            SetBrush(key, color);
+        }
+
+        SetBrush("PanelBrush", palette["SurfaceBrush"]);
+        SetBrush("BorderBrush", palette["PanelStrokeBrush"]);
+        SetBrush("AccentBrush", palette["PrimaryBrush"]);
+        SetBrush("AccentSoftBrush", palette["PrimarySoftBrush"]);
+        SetBrush("MutedBrush", palette["TextMutedBrush"]);
+    }
+
+    private void SetBrush(string key, Color color)
+    {
+        Application.Current.Resources[key] = new SolidColorBrush(color);
+    }
+
+    private static IReadOnlyDictionary<string, Color> DarkPalette() => new Dictionary<string, Color>
+    {
+        ["AppBackgroundBrush"] = Rgb(0x07, 0x10, 0x18),
+        ["SidebarBrush"] = Rgb(0x09, 0x14, 0x1E),
+        ["SurfaceBrush"] = Rgb(0x0D, 0x18, 0x24),
+        ["SurfaceAltBrush"] = Rgb(0x10, 0x1D, 0x2B),
+        ["SurfaceRaisedBrush"] = Rgb(0x13, 0x23, 0x33),
+        ["ControlBrush"] = Rgb(0x12, 0x1F, 0x2D),
+        ["ControlHoverBrush"] = Rgb(0x17, 0x28, 0x3A),
+        ["PanelStrokeBrush"] = Rgb(0x22, 0x34, 0x47),
+        ["PanelStrokeStrongBrush"] = Rgb(0x2E, 0x4B, 0x62),
+        ["DividerBrush"] = Rgb(0x18, 0x26, 0x35),
+        ["PrimaryBrush"] = Rgb(0x22, 0xD3, 0xEE),
+        ["PrimaryHoverBrush"] = Rgb(0x67, 0xE8, 0xF9),
+        ["PrimarySoftBrush"] = Rgb(0x12, 0x3B, 0x49),
+        ["SecondaryBrush"] = Rgb(0x1A, 0x2A, 0x3A),
+        ["SecondaryHoverBrush"] = Rgb(0x24, 0x38, 0x4B),
+        ["SuccessBrush"] = Rgb(0x34, 0xD3, 0x99),
+        ["WarningBrush"] = Rgb(0xFB, 0xBF, 0x24),
+        ["DangerBrush"] = Rgb(0xFB, 0x71, 0x85),
+        ["TextPrimaryBrush"] = Rgb(0xF4, 0xFA, 0xFF),
+        ["TextSecondaryBrush"] = Rgb(0xB8, 0xC6, 0xD8),
+        ["TextMutedBrush"] = Rgb(0x7E, 0x8E, 0xA3),
+        ["LogBackgroundBrush"] = Rgb(0x05, 0x0A, 0x10),
+        ["LogTextBrush"] = Rgb(0xB9, 0xF6, 0xFF),
+        ["TableHeaderBrush"] = Rgb(0x14, 0x22, 0x33),
+        ["TableLineBrush"] = Rgb(0x1B, 0x2B, 0x3E),
+        ["InfoStripBorderBrush"] = Rgb(0x23, 0x65, 0x79),
+        ["ControlFocusBrush"] = Rgb(0x0F, 0x25, 0x30),
+        ["ComboSelectedBrush"] = Rgb(0x16, 0x34, 0x45),
+        ["TableRowHoverBrush"] = Rgb(0x17, 0x25, 0x36),
+        ["ScrollThumbBrush"] = Rgb(0x35, 0x50, 0x6B),
+        ["ScrollThumbHoverBrush"] = Rgb(0x4B, 0x6C, 0x8F),
+        ["PrimaryButtonTextBrush"] = Rgb(0x04, 0x21, 0x2A),
+    };
+
+    private static IReadOnlyDictionary<string, Color> LightPalette() => new Dictionary<string, Color>
+    {
+        ["AppBackgroundBrush"] = Rgb(0xF4, 0xF8, 0xFB),
+        ["SidebarBrush"] = Rgb(0xFF, 0xFF, 0xFF),
+        ["SurfaceBrush"] = Rgb(0xFF, 0xFF, 0xFF),
+        ["SurfaceAltBrush"] = Rgb(0xEC, 0xF4, 0xFA),
+        ["SurfaceRaisedBrush"] = Rgb(0xFF, 0xFF, 0xFF),
+        ["ControlBrush"] = Rgb(0xF1, 0xF6, 0xFA),
+        ["ControlHoverBrush"] = Rgb(0xE6, 0xF0, 0xF7),
+        ["PanelStrokeBrush"] = Rgb(0xC9, 0xD8, 0xE5),
+        ["PanelStrokeStrongBrush"] = Rgb(0x82, 0xA8, 0xBE),
+        ["DividerBrush"] = Rgb(0xD9, 0xE4, 0xEE),
+        ["PrimaryBrush"] = Rgb(0x08, 0x91, 0xB2),
+        ["PrimaryHoverBrush"] = Rgb(0x0E, 0x74, 0x90),
+        ["PrimarySoftBrush"] = Rgb(0xDE, 0xF7, 0xFB),
+        ["SecondaryBrush"] = Rgb(0xE9, 0xF1, 0xF7),
+        ["SecondaryHoverBrush"] = Rgb(0xD9, 0xE8, 0xF2),
+        ["SuccessBrush"] = Rgb(0x05, 0x96, 0x69),
+        ["WarningBrush"] = Rgb(0xB7, 0x79, 0x1F),
+        ["DangerBrush"] = Rgb(0xE1, 0x1D, 0x48),
+        ["TextPrimaryBrush"] = Rgb(0x10, 0x20, 0x2F),
+        ["TextSecondaryBrush"] = Rgb(0x35, 0x51, 0x68),
+        ["TextMutedBrush"] = Rgb(0x6B, 0x7E, 0x8F),
+        ["LogBackgroundBrush"] = Rgb(0xF7, 0xFB, 0xFE),
+        ["LogTextBrush"] = Rgb(0x16, 0x42, 0x59),
+        ["TableHeaderBrush"] = Rgb(0xE7, 0xF0, 0xF8),
+        ["TableLineBrush"] = Rgb(0xCF, 0xDF, 0xEC),
+        ["InfoStripBorderBrush"] = Rgb(0x8D, 0xD6, 0xE7),
+        ["ControlFocusBrush"] = Rgb(0xE2, 0xF6, 0xFB),
+        ["ComboSelectedBrush"] = Rgb(0xD7, 0xF0, 0xF7),
+        ["TableRowHoverBrush"] = Rgb(0xEA, 0xF5, 0xFB),
+        ["ScrollThumbBrush"] = Rgb(0x9A, 0xB0, 0xC4),
+        ["ScrollThumbHoverBrush"] = Rgb(0x70, 0x8A, 0xA3),
+        ["PrimaryButtonTextBrush"] = Rgb(0xFF, 0xFF, 0xFF),
+    };
+
+    private static Color Rgb(byte red, byte green, byte blue) => Color.FromRgb(red, green, blue);
+
+    private void UpdateThemeModeButton()
+    {
+        var normalized = NormalizeThemeMode(_themeMode);
+        var (icon, label) = normalized switch
+        {
+            ThemeModeLight => (ThemeModeLightIcon, "浅色"),
+            ThemeModeDark => (ThemeModeDarkIcon, "深色"),
+            _ => (ThemeModeSystemIcon, "跟随系统"),
+        };
+        ThemeModeIcon.Data = Geometry.Parse(icon);
+        ThemeModeButton.ToolTip = $"主题：{label}（点击切换）";
+    }
+
+    private static string NextThemeMode(string themeMode)
+    {
+        return NormalizeThemeMode(themeMode) switch
+        {
+            ThemeModeSystem => ThemeModeLight,
+            ThemeModeLight => ThemeModeDark,
+            _ => ThemeModeSystem,
+        };
+    }
+
+    private static string NormalizeThemeMode(string? themeMode)
+    {
+        return themeMode?.Trim().ToLowerInvariant() switch
+        {
+            ThemeModeLight => ThemeModeLight,
+            ThemeModeDark => ThemeModeDark,
+            _ => ThemeModeSystem,
+        };
     }
 
     private void ApplyStatus(TunnelClientStatusSnapshot snapshot)
@@ -332,9 +620,16 @@ public partial class MainWindow : Window
         Replace(PeerRoutes, snapshot.Peers);
         Replace(PeerSessions, snapshot.Sessions);
         PeerCountText.Text = snapshot.Peers.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        _peerMeshEnabled = snapshot.Enabled;
         PeerMeshSummaryText.Text = snapshot.Enabled
             ? $"本机 {snapshot.VirtualIp ?? "-"} · {snapshot.Cidr ?? "-"} · {snapshot.DeviceName} / {snapshot.DeviceStatus} · 会话 {snapshot.Sessions.Count}"
             : $"Peer Mesh 未启动 · {snapshot.DeviceName} / {snapshot.DeviceStatus}";
+        UpdatePeerMeshStatusBrush();
+    }
+
+    private void UpdatePeerMeshStatusBrush()
+    {
+        PeerMeshStatusDot.Background = (Brush)FindResource(_peerMeshEnabled ? "SuccessBrush" : "TextMutedBrush");
     }
 
     private static void Replace<T>(ObservableCollection<T> collection, IEnumerable<T> items)
@@ -355,7 +650,9 @@ public partial class MainWindow : Window
         TcpCountText.Text = "0";
         HttpCountText.Text = "0";
         PeerCountText.Text = "0";
+        _peerMeshEnabled = false;
         PeerMeshSummaryText.Text = "Peer Mesh 未启动";
+        UpdatePeerMeshStatusBrush();
     }
 
     private void UpdateStoppedUi(string phase, string detail)
@@ -365,6 +662,9 @@ public partial class MainWindow : Window
         SetInputsEnabled(true);
         UpdateStatusText(phase, detail);
         RuntimeSummaryText.Text = "连接后显示客户端、控制端和 Peer Mesh 信息";
+        _peerMeshEnabled = false;
+        PeerMeshSummaryText.Text = "Peer Mesh 未启动";
+        UpdatePeerMeshStatusBrush();
     }
 
     private void UpdateStatusText(string phase, string detail)
@@ -387,6 +687,8 @@ public partial class MainWindow : Window
 
     private void AppendLog(LogLevel level, string category, string message, Exception? exception)
     {
+        var followTail = LogScrollViewer.ScrollableHeight <= 0
+            || LogScrollViewer.VerticalOffset >= LogScrollViewer.ScrollableHeight - 2;
         var text = $"{DateTime.Now:HH:mm:ss} {level,-11} {ShortCategory(category)} {message}";
         if (exception is not null)
         {
@@ -398,7 +700,12 @@ public partial class MainWindow : Window
             Logs.RemoveAt(0);
         }
         LogTextBox.Text = string.Join(Environment.NewLine, Logs.Select(line => line.Text));
-        LogTextBox.ScrollToEnd();
+        LogTextBox.CaretIndex = LogTextBox.Text.Length;
+        LogScrollViewer.UpdateLayout();
+        if (followTail)
+        {
+            LogScrollViewer.ScrollToEnd();
+        }
     }
 
     private static string StatusTitle(TunnelClientStatusSnapshot snapshot)
@@ -427,7 +734,7 @@ public partial class MainWindow : Window
         return index >= 0 && index + 1 < category.Length ? category[(index + 1)..] : category;
     }
 
-    private void ApplyDarkTitleBar()
+    private void ApplyTitleBar(bool dark)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -440,14 +747,18 @@ public partial class MainWindow : Window
             return;
         }
 
-        var enabled = 1;
+        var enabled = dark ? 1 : 0;
         if (DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode, ref enabled, sizeof(int)) != 0)
         {
             _ = DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkModeBefore20H1, ref enabled, sizeof(int));
         }
 
-        var captionColor = ColorRef(0x07, 0x10, 0x18);
-        var textColor = ColorRef(0xF4, 0xFA, 0xFF);
+        var captionColor = dark
+            ? ColorRef(0x07, 0x10, 0x18)
+            : ColorRef(0xF4, 0xF8, 0xFB);
+        var textColor = dark
+            ? ColorRef(0xF4, 0xFA, 0xFF)
+            : ColorRef(0x10, 0x20, 0x2F);
         _ = DwmSetWindowAttribute(hwnd, DwmwaCaptionColor, ref captionColor, sizeof(int));
         _ = DwmSetWindowAttribute(hwnd, DwmwaTextColor, ref textColor, sizeof(int));
     }
@@ -564,6 +875,8 @@ public partial class MainWindow : Window
 
         public string PeerMeshDevice { get; set; } = "";
 
+        public string ThemeMode { get; set; } = ThemeModeSystem;
+
         public string PeerMeshTunName { get; set; } = "";
 
         public int PeerMeshMtu { get; set; }
@@ -574,6 +887,7 @@ public partial class MainWindow : Window
             {
                 ServerBaseUrl = "https://tunnel.devshuai.com",
                 PeerMeshDevice = "auto",
+                ThemeMode = ThemeModeSystem,
                 PeerMeshTunName = TunnelClientConfig.DefaultPeerMeshTunName,
                 PeerMeshMtu = TunnelClientConfig.DefaultPeerMeshMtu,
             };

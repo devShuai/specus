@@ -1,6 +1,7 @@
 <Application x:Class="ShuaiTunnel.Client.Desktop.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:desktop="clr-namespace:ShuaiTunnel.Client.Desktop"
              StartupUri="MainWindow.xaml">
     <Application.Resources>
         <SolidColorBrush x:Key="AppBackgroundBrush" Color="#071018" />
@@ -28,6 +29,13 @@
         <SolidColorBrush x:Key="LogTextBrush" Color="#B9F6FF" />
         <SolidColorBrush x:Key="TableHeaderBrush" Color="#142233" />
         <SolidColorBrush x:Key="TableLineBrush" Color="#1B2B3E" />
+        <SolidColorBrush x:Key="InfoStripBorderBrush" Color="#236579" />
+        <SolidColorBrush x:Key="ControlFocusBrush" Color="#0F2530" />
+        <SolidColorBrush x:Key="ComboSelectedBrush" Color="#163445" />
+        <SolidColorBrush x:Key="TableRowHoverBrush" Color="#172536" />
+        <SolidColorBrush x:Key="ScrollThumbBrush" Color="#35506B" />
+        <SolidColorBrush x:Key="ScrollThumbHoverBrush" Color="#4B6C8F" />
+        <SolidColorBrush x:Key="PrimaryButtonTextBrush" Color="#04212A" />
 
         <!-- Legacy resource names kept so older XAML references stay valid. -->
         <SolidColorBrush x:Key="PanelBrush" Color="#0D1824" />
@@ -38,52 +46,56 @@
 
         <Style TargetType="TextBlock">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="LineStackingStrategy" Value="BlockLineHeight" />
         </Style>
 
         <Style x:Key="SectionLabelTextStyle" TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
-            <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
             <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="FontSize" Value="13" />
         </Style>
 
         <Style x:Key="CaptionTextStyle" TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
-            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
             <Setter Property="FontSize" Value="12" />
         </Style>
 
+        <!-- 圆角统一两档：外层面板/卡片/日志 16，控件/表格外壳/信息条 12，内层可选项 8 -->
         <Style x:Key="SurfacePanelStyle" TargetType="Border">
-            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
-            <Setter Property="BorderBrush" Value="{StaticResource PanelStrokeBrush}" />
+            <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="18" />
+            <Setter Property="CornerRadius" Value="16" />
             <Setter Property="Padding" Value="16" />
         </Style>
 
         <Style x:Key="MetricCardStyle" TargetType="Border">
-            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
-            <Setter Property="BorderBrush" Value="{StaticResource PanelStrokeBrush}" />
+            <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="CornerRadius" Value="16" />
             <Setter Property="Padding" Value="14" />
         </Style>
 
         <Style x:Key="InfoStripStyle" TargetType="Border">
-            <Setter Property="Background" Value="{StaticResource PrimarySoftBrush}" />
-            <Setter Property="BorderBrush" Value="#236579" />
+            <Setter Property="Background" Value="{DynamicResource PrimarySoftBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource InfoStripBorderBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="13" />
+            <Setter Property="CornerRadius" Value="12" />
             <Setter Property="Padding" Value="14" />
         </Style>
 
+        <!-- RoundedClip 把裁剪应用到 Child（DataGrid），表头等方角内容随外壳圆角，
+             描边本身不参与裁剪，圆角处不再出现锯齿/漏色 -->
         <Style x:Key="TableShellStyle" TargetType="Border">
-            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
-            <Setter Property="BorderBrush" Value="{StaticResource PanelStrokeBrush}" />
+            <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="14" />
+            <Setter Property="CornerRadius" Value="12" />
             <Setter Property="Padding" Value="1" />
             <Setter Property="SnapsToDevicePixels" Value="True" />
+            <Setter Property="desktop:RoundedClip.CornerRadius" Value="12" />
         </Style>
 
         <Style x:Key="GridCellSelectableTextBoxStyle" TargetType="TextBox">
@@ -92,15 +104,15 @@
             <Setter Property="MinHeight" Value="0" />
             <Setter Property="Padding" Value="0" />
             <Setter Property="Background" Value="Transparent" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="IsReadOnly" Value="True" />
             <Setter Property="IsReadOnlyCaretVisible" Value="False" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="HorizontalContentAlignment" Value="Left" />
             <Setter Property="TextWrapping" Value="NoWrap" />
-            <Setter Property="SelectionBrush" Value="{StaticResource PrimaryBrush}" />
-            <Setter Property="CaretBrush" Value="{StaticResource PrimaryHoverBrush}" />
+            <Setter Property="SelectionBrush" Value="{DynamicResource PrimaryBrush}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource PrimaryHoverBrush}" />
             <Setter Property="Cursor" Value="IBeam" />
             <Setter Property="Template">
                 <Setter.Value>
@@ -114,28 +126,97 @@
             </Setter>
         </Style>
 
+        <Style x:Key="LogScrollViewerStyle" TargetType="ScrollViewer">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ScrollViewer">
+                        <Grid Background="{DynamicResource LogBackgroundBrush}"
+                              SnapsToDevicePixels="True">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <ScrollContentPresenter x:Name="PART_ScrollContentPresenter"
+                                                    Grid.Row="0"
+                                                    Grid.Column="0"
+                                                    CanContentScroll="{TemplateBinding CanContentScroll}"
+                                                    CanHorizontallyScroll="False"
+                                                    CanVerticallyScroll="False"
+                                                    Content="{TemplateBinding Content}"
+                                                    ContentTemplate="{TemplateBinding ContentTemplate}"
+                                                    ContentStringFormat="{TemplateBinding ContentStringFormat}"
+                                                    SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}" />
+
+                            <ScrollBar x:Name="PART_VerticalScrollBar"
+                                       Grid.Row="0"
+                                       Grid.Column="1"
+                                       Margin="6,0,0,0"
+                                       Maximum="{TemplateBinding ScrollableHeight}"
+                                       Orientation="Vertical"
+                                       Value="{Binding VerticalOffset, Mode=OneWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                       ViewportSize="{TemplateBinding ViewportHeight}"
+                                       Visibility="{TemplateBinding ComputedVerticalScrollBarVisibility}" />
+
+                            <ScrollBar x:Name="PART_HorizontalScrollBar"
+                                       Grid.Row="1"
+                                       Grid.Column="0"
+                                       Margin="0,6,0,0"
+                                       Maximum="{TemplateBinding ScrollableWidth}"
+                                       Orientation="Horizontal"
+                                       Value="{Binding HorizontalOffset, Mode=OneWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                       ViewportSize="{TemplateBinding ViewportWidth}"
+                                       Visibility="{TemplateBinding ComputedHorizontalScrollBarVisibility}" />
+
+                            <Border x:Name="ScrollCorner"
+                                    Grid.Row="1"
+                                    Grid.Column="1"
+                                    Width="14"
+                                    Height="14"
+                                    Background="{DynamicResource LogBackgroundBrush}"
+                                    Visibility="Collapsed" />
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="ComputedHorizontalScrollBarVisibility" Value="Visible" />
+                                    <Condition Property="ComputedVerticalScrollBarVisibility" Value="Visible" />
+                                </MultiTrigger.Conditions>
+                                <Setter TargetName="ScrollCorner" Property="Visibility" Value="Visible" />
+                            </MultiTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style x:Key="LogTextBoxStyle" TargetType="TextBox">
             <Setter Property="FontFamily" Value="Consolas" />
             <Setter Property="FontSize" Value="12" />
             <Setter Property="Padding" Value="0" />
-            <Setter Property="Background" Value="{StaticResource LogBackgroundBrush}" />
-            <Setter Property="Foreground" Value="{StaticResource LogTextBrush}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="{DynamicResource LogTextBrush}" />
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="IsReadOnlyCaretVisible" Value="False" />
             <Setter Property="TextWrapping" Value="NoWrap" />
             <Setter Property="AcceptsReturn" Value="True" />
             <Setter Property="AcceptsTab" Value="True" />
-            <Setter Property="VerticalScrollBarVisibility" Value="Auto" />
-            <Setter Property="HorizontalScrollBarVisibility" Value="Auto" />
-            <Setter Property="SelectionBrush" Value="{StaticResource PrimaryBrush}" />
-            <Setter Property="CaretBrush" Value="{StaticResource PrimaryHoverBrush}" />
+            <Setter Property="VerticalScrollBarVisibility" Value="Disabled" />
+            <Setter Property="HorizontalScrollBarVisibility" Value="Disabled" />
+            <Setter Property="SelectionBrush" Value="{DynamicResource PrimaryBrush}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource PrimaryHoverBrush}" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="TextBox">
                         <ScrollViewer x:Name="PART_ContentHost"
-                                      Background="{TemplateBinding Background}"
-                                      HorizontalScrollBarVisibility="{TemplateBinding HorizontalScrollBarVisibility}"
-                                      VerticalScrollBarVisibility="{TemplateBinding VerticalScrollBarVisibility}" />
+                                      Background="Transparent"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      VerticalScrollBarVisibility="Disabled" />
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
@@ -145,12 +226,12 @@
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
             <Setter Property="Padding" Value="12,8" />
             <Setter Property="MinHeight" Value="40" />
-            <Setter Property="Background" Value="{StaticResource ControlBrush}" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
-            <Setter Property="BorderBrush" Value="{StaticResource PanelStrokeBrush}" />
+            <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
-            <Setter Property="SelectionBrush" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="SelectionBrush" Value="{DynamicResource PrimaryBrush}" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="TextBox">
@@ -165,12 +246,12 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource ControlHoverBrush}" />
-                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource PanelStrokeStrongBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlHoverBrush}" />
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource PanelStrokeStrongBrush}" />
                             </Trigger>
                             <Trigger Property="IsKeyboardFocusWithin" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="#0F2530" />
-                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlFocusBrush}" />
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource PrimaryBrush}" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter TargetName="Chrome" Property="Opacity" Value="0.55" />
@@ -185,12 +266,12 @@
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
             <Setter Property="Padding" Value="12,8" />
             <Setter Property="MinHeight" Value="40" />
-            <Setter Property="Background" Value="{StaticResource ControlBrush}" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
-            <Setter Property="BorderBrush" Value="{StaticResource PanelStrokeBrush}" />
+            <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
-            <Setter Property="SelectionBrush" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="SelectionBrush" Value="{DynamicResource PrimaryBrush}" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="PasswordBox">
@@ -205,12 +286,12 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource ControlHoverBrush}" />
-                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource PanelStrokeStrongBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlHoverBrush}" />
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource PanelStrokeStrongBrush}" />
                             </Trigger>
                             <Trigger Property="IsKeyboardFocusWithin" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="#0F2530" />
-                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlFocusBrush}" />
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource PrimaryBrush}" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter TargetName="Chrome" Property="Opacity" Value="0.55" />
@@ -228,10 +309,10 @@
             <Setter Property="MinHeight" Value="0" />
             <Setter Property="Padding" Value="0" />
             <Setter Property="Background" Value="Transparent" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="CaretBrush" Value="{StaticResource PrimaryHoverBrush}" />
-            <Setter Property="SelectionBrush" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource PrimaryHoverBrush}" />
+            <Setter Property="SelectionBrush" Value="{DynamicResource PrimaryBrush}" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="TextBox">
@@ -249,9 +330,9 @@
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
             <Setter Property="Padding" Value="12,8" />
             <Setter Property="MinHeight" Value="40" />
-            <Setter Property="Background" Value="{StaticResource ControlBrush}" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
-            <Setter Property="BorderBrush" Value="{StaticResource PanelStrokeBrush}" />
+            <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="MaxDropDownHeight" Value="220" />
             <Setter Property="Template">
@@ -274,12 +355,12 @@
                                                 CornerRadius="12" />
                                         <ControlTemplate.Triggers>
                                             <Trigger Property="IsMouseOver" Value="True">
-                                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource ControlHoverBrush}" />
-                                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource PanelStrokeStrongBrush}" />
+                                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlHoverBrush}" />
+                                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource PanelStrokeStrongBrush}" />
                                             </Trigger>
                                             <Trigger Property="IsChecked" Value="True">
-                                                <Setter TargetName="Chrome" Property="Background" Value="#0F2530" />
-                                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+                                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlFocusBrush}" />
+                                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource PrimaryBrush}" />
                                             </Trigger>
                                             <Trigger Property="IsEnabled" Value="False">
                                                 <Setter TargetName="Chrome" Property="Opacity" Value="0.55" />
@@ -313,7 +394,7 @@
                                   Margin="0,0,15,0"
                                   HorizontalAlignment="Right"
                                   VerticalAlignment="Center"
-                                  Fill="{StaticResource TextSecondaryBrush}"
+                                  Fill="{DynamicResource TextSecondaryBrush}"
                                   IsHitTestVisible="False"
                                   Stretch="Uniform"
                                   Data="M 0 0 L 10 0 L 5 6 Z" />
@@ -324,8 +405,8 @@
                                    Focusable="False"
                                    IsOpen="{TemplateBinding IsDropDownOpen}"
                                    PopupAnimation="Fade">
-                                <Border Background="{StaticResource SurfaceRaisedBrush}"
-                                        BorderBrush="{StaticResource PanelStrokeStrongBrush}"
+                                <Border Background="{DynamicResource SurfaceRaisedBrush}"
+                                        BorderBrush="{DynamicResource PanelStrokeStrongBrush}"
                                         BorderThickness="1"
                                         CornerRadius="12"
                                         MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
@@ -345,9 +426,9 @@
                                 <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible" />
                             </Trigger>
                             <Trigger Property="IsKeyboardFocusWithin" Value="True">
-                                <Setter TargetName="DropDownToggle" Property="Background" Value="#0F2530" />
-                                <Setter TargetName="DropDownToggle" Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
-                                <Setter TargetName="Arrow" Property="Fill" Value="{StaticResource PrimaryHoverBrush}" />
+                                <Setter TargetName="DropDownToggle" Property="Background" Value="{DynamicResource ControlFocusBrush}" />
+                                <Setter TargetName="DropDownToggle" Property="BorderBrush" Value="{DynamicResource PrimaryBrush}" />
+                                <Setter TargetName="Arrow" Property="Fill" Value="{DynamicResource PrimaryHoverBrush}" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.55" />
@@ -360,7 +441,7 @@
 
         <Style TargetType="ComboBoxItem">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="Padding" Value="10,8" />
             <Setter Property="Margin" Value="0,1" />
             <Setter Property="FocusVisualStyle" Value="{x:Null}" />
@@ -375,12 +456,12 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsHighlighted" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource PrimarySoftBrush}" />
-                                <Setter Property="Foreground" Value="{StaticResource PrimaryHoverBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource PrimarySoftBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource PrimaryHoverBrush}" />
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="#163445" />
-                                <Setter Property="Foreground" Value="{StaticResource PrimaryHoverBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ComboSelectedBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource PrimaryHoverBrush}" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.45" />
@@ -395,10 +476,10 @@
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
             <Setter Property="Padding" Value="14,8" />
             <Setter Property="MinHeight" Value="38" />
-            <Setter Property="Background" Value="{StaticResource SecondaryBrush}" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Background" Value="{DynamicResource SecondaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="BorderBrush" Value="{StaticResource PanelStrokeBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="Cursor" Value="Hand" />
             <Setter Property="Template">
                 <Setter.Value>
@@ -416,8 +497,8 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SecondaryHoverBrush}" />
-                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource PanelStrokeStrongBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource SecondaryHoverBrush}" />
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource PanelStrokeStrongBrush}" />
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
                                 <Setter TargetName="Chrome" Property="Opacity" Value="0.78" />
@@ -432,15 +513,15 @@
         </Style>
 
         <Style x:Key="PrimaryButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
-            <Setter Property="Background" Value="{StaticResource PrimaryBrush}" />
-            <Setter Property="Foreground" Value="#04212A" />
-            <Setter Property="BorderBrush" Value="{StaticResource PrimaryBrush}" />
+            <Setter Property="Background" Value="{DynamicResource PrimaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource PrimaryButtonTextBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource PrimaryBrush}" />
             <Setter Property="FontWeight" Value="Bold" />
         </Style>
 
         <Style x:Key="SecondaryButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
-            <Setter Property="Background" Value="{StaticResource SecondaryBrush}" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Background" Value="{DynamicResource SecondaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
         </Style>
 
         <Style x:Key="ModernTabControlStyle" TargetType="TabControl">
@@ -450,7 +531,7 @@
             <Setter Property="ItemsPanel">
                 <Setter.Value>
                     <ItemsPanelTemplate>
-                        <UniformGrid Rows="1" />
+                        <StackPanel Orientation="Horizontal" />
                     </ItemsPanelTemplate>
                 </Setter.Value>
             </Setter>
@@ -462,18 +543,9 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
                             </Grid.RowDefinitions>
-                            <Border Background="{StaticResource SurfaceAltBrush}"
-                                    BorderBrush="{StaticResource PanelStrokeBrush}"
-                                    BorderThickness="1"
-                                    CornerRadius="15"
-                                    Padding="5"
-                                    HorizontalAlignment="Left"
-                                    MinWidth="460"
-                                    ClipToBounds="True"
-                                    MaxWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}">
-                                <ItemsPresenter KeyboardNavigation.TabIndex="1"
-                                                Panel.ZIndex="1" />
-                            </Border>
+                            <ItemsPresenter KeyboardNavigation.TabIndex="1"
+                                            Panel.ZIndex="1"
+                                            HorizontalAlignment="Left" />
                             <ContentPresenter Grid.Row="1"
                                               Margin="0,14,0,0"
                                               ContentSource="SelectedContent" />
@@ -487,17 +559,17 @@
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
             <Setter Property="FontSize" Value="13" />
             <Setter Property="FontWeight" Value="SemiBold" />
-            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
-            <Setter Property="Padding" Value="14,9" />
-            <Setter Property="Margin" Value="0" />
+            <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+            <Setter Property="Padding" Value="18,9" />
+            <Setter Property="Margin" Value="0,0,14,0" />
             <Setter Property="MinHeight" Value="36" />
-            <Setter Property="MinWidth" Value="140" />
+            <Setter Property="MinWidth" Value="148" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="TabItem">
                         <Border x:Name="Chrome"
                                 Background="Transparent"
-                                CornerRadius="11"
+                                CornerRadius="8"
                                 Padding="{TemplateBinding Padding}"
                                 TextElement.Foreground="{TemplateBinding Foreground}">
                             <ContentPresenter ContentSource="Header"
@@ -507,12 +579,12 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource ControlHoverBrush}" />
-                                <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlHoverBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource PrimarySoftBrush}" />
-                                <Setter Property="Foreground" Value="{StaticResource PrimaryHoverBrush}" />
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource PrimarySoftBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource PrimaryHoverBrush}" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.45" />
@@ -533,7 +605,7 @@
             <Setter Property="HeadersVisibility" Value="Column" />
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="RowHeaderWidth" Value="0" />
             <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Auto" />
             <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto" />
@@ -541,21 +613,21 @@
             <Setter Property="EnableColumnVirtualization" Value="True" />
             <Setter Property="RowHeight" Value="42" />
             <Setter Property="ColumnHeaderHeight" Value="42" />
-            <Setter Property="RowBackground" Value="{StaticResource SurfaceBrush}" />
-            <Setter Property="AlternatingRowBackground" Value="{StaticResource SurfaceAltBrush}" />
+            <Setter Property="RowBackground" Value="{DynamicResource SurfaceBrush}" />
+            <Setter Property="AlternatingRowBackground" Value="{DynamicResource SurfaceAltBrush}" />
             <Setter Property="SelectionMode" Value="Single" />
             <Setter Property="SelectionUnit" Value="FullRow" />
             <Setter Property="ColumnHeaderStyle">
                 <Setter.Value>
                     <Style TargetType="DataGridColumnHeader">
-                        <Setter Property="Background" Value="{StaticResource TableHeaderBrush}" />
-                        <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}" />
+                        <Setter Property="Background" Value="{DynamicResource TableHeaderBrush}" />
+                        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
                         <Setter Property="FontWeight" Value="SemiBold" />
                         <Setter Property="BorderThickness" Value="0,0,0,1" />
-                        <Setter Property="BorderBrush" Value="{StaticResource TableLineBrush}" />
+                        <Setter Property="BorderBrush" Value="{DynamicResource TableLineBrush}" />
                         <Setter Property="Padding" Value="14,0" />
                         <Setter Property="HorizontalContentAlignment" Value="Left" />
-                        <Setter Property="SeparatorBrush" Value="{StaticResource TableLineBrush}" />
+                        <Setter Property="SeparatorBrush" Value="{DynamicResource TableLineBrush}" />
                     </Style>
                 </Setter.Value>
             </Setter>
@@ -586,8 +658,8 @@
                         </Setter>
                         <Style.Triggers>
                             <Trigger Property="IsSelected" Value="True">
-                                <Setter Property="Background" Value="{StaticResource PrimarySoftBrush}" />
-                                <Setter Property="Foreground" Value="{StaticResource PrimaryHoverBrush}" />
+                                <Setter Property="Background" Value="{DynamicResource PrimarySoftBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource PrimaryHoverBrush}" />
                             </Trigger>
                         </Style.Triggers>
                     </Style>
@@ -600,10 +672,10 @@
                         <Setter Property="Margin" Value="0,1" />
                         <Style.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="Background" Value="#172536" />
+                                <Setter Property="Background" Value="{DynamicResource TableRowHoverBrush}" />
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
-                                <Setter Property="Background" Value="{StaticResource PrimarySoftBrush}" />
+                                <Setter Property="Background" Value="{DynamicResource PrimarySoftBrush}" />
                             </Trigger>
                         </Style.Triggers>
                     </Style>
@@ -611,14 +683,29 @@
             </Setter>
         </Style>
 
+        <Style x:Key="ScrollBarPageButtonStyle" TargetType="RepeatButton">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="IsTabStop" Value="False" />
+            <Setter Property="OverridesDefaultStyle" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RepeatButton">
+                        <Border Background="Transparent" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style TargetType="ScrollBar">
             <Setter Property="Stylus.IsPressAndHoldEnabled" Value="False" />
             <Setter Property="Stylus.IsFlicksEnabled" Value="False" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="IsTabStop" Value="False" />
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="Width" Value="8" />
             <Setter Property="MinWidth" Value="8" />
-            <Setter Property="Height" Value="8" />
-            <Setter Property="MinHeight" Value="8" />
+            <Setter Property="Height" Value="Auto" />
+            <Setter Property="MinHeight" Value="0" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ScrollBar">
@@ -627,13 +714,13 @@
                                 <Track.DecreaseRepeatButton>
                                     <RepeatButton x:Name="DecreaseButton"
                                                   Command="ScrollBar.PageUpCommand"
-                                                  Opacity="0"
+                                                  Style="{StaticResource ScrollBarPageButtonStyle}"
                                                   Focusable="False" />
                                 </Track.DecreaseRepeatButton>
                                 <Track.IncreaseRepeatButton>
                                     <RepeatButton x:Name="IncreaseButton"
                                                   Command="ScrollBar.PageDownCommand"
-                                                  Opacity="0"
+                                                  Style="{StaticResource ScrollBarPageButtonStyle}"
                                                   Focusable="False" />
                                 </Track.IncreaseRepeatButton>
                                 <Track.Thumb>
@@ -643,14 +730,14 @@
                                         <Thumb.Template>
                                             <ControlTemplate TargetType="Thumb">
                                                 <Border x:Name="ThumbChrome"
-                                                        Background="#35506B"
+                                                        Background="{DynamicResource ScrollThumbBrush}"
                                                         CornerRadius="4" />
                                                 <ControlTemplate.Triggers>
                                                     <Trigger Property="IsMouseOver" Value="True">
-                                                        <Setter TargetName="ThumbChrome" Property="Background" Value="#4B6C8F" />
+                                                        <Setter TargetName="ThumbChrome" Property="Background" Value="{DynamicResource ScrollThumbHoverBrush}" />
                                                     </Trigger>
                                                     <Trigger Property="IsDragging" Value="True">
-                                                        <Setter TargetName="ThumbChrome" Property="Background" Value="{StaticResource PrimaryBrush}" />
+                                                        <Setter TargetName="ThumbChrome" Property="Background" Value="{DynamicResource PrimaryBrush}" />
                                                     </Trigger>
                                                 </ControlTemplate.Triggers>
                                             </ControlTemplate>
@@ -680,11 +767,11 @@
         <Style TargetType="ListBox">
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
         </Style>
 
         <Style x:Key="LogListBoxItemStyle" TargetType="ListBoxItem">
-            <Setter Property="Foreground" Value="{StaticResource LogTextBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource LogTextBrush}" />
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="Padding" Value="0,2" />
             <Setter Property="BorderThickness" Value="0" />

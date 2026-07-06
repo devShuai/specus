@@ -7,19 +7,21 @@
         MinWidth="1120"
         MinHeight="680"
         WindowStartupLocation="CenterScreen"
-        Background="{StaticResource AppBackgroundBrush}"
+        Icon="Assets/favicon.ico"
+        Background="{DynamicResource AppBackgroundBrush}"
         UseLayoutRounding="True"
         TextOptions.TextFormattingMode="Display"
-        TextOptions.TextRenderingMode="ClearType">
-    <Grid>
+        TextOptions.TextRenderingMode="ClearType"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <Grid x:Name="RootLayoutGrid">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="340" />
             <ColumnDefinition Width="*" />
         </Grid.ColumnDefinitions>
 
         <Border Grid.Column="0"
-                Background="{StaticResource SidebarBrush}"
-                BorderBrush="{StaticResource DividerBrush}"
+                Background="{DynamicResource SidebarBrush}"
+                BorderBrush="{DynamicResource DividerBrush}"
                 BorderThickness="0,0,1,0"
                 Padding="24">
             <Grid>
@@ -35,12 +37,51 @@
                               HorizontalScrollBarVisibility="Disabled"
                               Padding="0,0,8,0">
                     <StackPanel>
-                        <TextBlock Text="shuai-tunnel"
-                                   FontSize="28"
-                                   FontWeight="Bold" />
-                        <TextBlock Text="桌面客户端"
-                                   Margin="0,4,0,24"
-                                   Foreground="{StaticResource MutedBrush}" />
+                        <Grid Margin="0,0,0,24">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="46" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Width="46"
+                                    Height="46"
+                                    CornerRadius="10"
+                                    Background="#14161F"
+                                    HorizontalAlignment="Left"
+                                    VerticalAlignment="Center">
+                                <Grid>
+                                    <Border Margin="7.5"
+                                            CornerRadius="8"
+                                            BorderBrush="#F2F3F7"
+                                            BorderThickness="3" />
+                                    <Border Margin="13"
+                                            CornerRadius="6"
+                                            BorderBrush="#F2F3F7"
+                                            BorderThickness="3"
+                                            Opacity="0.62" />
+                                    <Border Margin="18"
+                                            CornerRadius="4"
+                                            BorderBrush="#F2F3F7"
+                                            BorderThickness="3"
+                                            Opacity="0.34" />
+                                    <Border Width="5"
+                                            Height="5"
+                                            CornerRadius="2"
+                                            Background="#9B82FF"
+                                            HorizontalAlignment="Center"
+                                            VerticalAlignment="Center" />
+                                </Grid>
+                            </Border>
+                            <StackPanel Grid.Column="1"
+                                        Margin="12,0,0,0"
+                                        VerticalAlignment="Center">
+                                <TextBlock Text="shuai-tunnel"
+                                           FontSize="24"
+                                           FontWeight="Bold" />
+                                <TextBlock Text="桌面客户端"
+                                           Margin="0,2,0,0"
+                                           Foreground="{DynamicResource MutedBrush}" />
+                            </StackPanel>
+                        </Grid>
 
                         <TextBlock Text="服务端地址" Style="{StaticResource SectionLabelTextStyle}" />
                         <TextBox x:Name="ServerBaseUrlBox"
@@ -100,7 +141,7 @@
                     <StackPanel>
                         <TextBlock Text="当前状态"
                                    FontWeight="SemiBold"
-                                   Foreground="{StaticResource MutedBrush}" />
+                                   Foreground="{DynamicResource MutedBrush}" />
                         <TextBlock x:Name="StatusPhaseText"
                                    Text="未连接"
                                    FontSize="18"
@@ -109,13 +150,13 @@
                         <TextBlock x:Name="StatusDetailText"
                                    Text="填写连接信息后启动客户端"
                                    TextWrapping="Wrap"
-                                   Foreground="{StaticResource MutedBrush}" />
+                                   Foreground="{DynamicResource MutedBrush}" />
                     </StackPanel>
                 </Border>
             </Grid>
         </Border>
 
-        <Grid Grid.Column="1" Margin="28,24,28,24">
+        <Grid x:Name="MainContentGrid" Grid.Column="1" Margin="28,24,28,24">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
@@ -123,6 +164,11 @@
             </Grid.RowDefinitions>
 
             <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
@@ -134,9 +180,58 @@
                     <TextBlock x:Name="RuntimeSummaryText"
                                Text="连接后显示客户端、控制端和 Peer Mesh 信息"
                                Margin="0,5,0,0"
-                               Foreground="{StaticResource MutedBrush}" />
+                               Foreground="{DynamicResource MutedBrush}" />
                 </StackPanel>
+                <Border x:Name="PeerMeshStatusStrip"
+                        Grid.Column="1"
+                        Style="{StaticResource InfoStripStyle}"
+                        MaxWidth="460"
+                        Padding="12,9"
+                        Margin="20,0,12,0"
+                        VerticalAlignment="Center">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Border x:Name="PeerMeshStatusDot"
+                                Width="10"
+                                Height="10"
+                                CornerRadius="5"
+                                Background="{DynamicResource TextMutedBrush}"
+                                VerticalAlignment="Center"
+                                Margin="0,0,10,0" />
+                        <TextBlock x:Name="PeerMeshSummaryText"
+                                   Grid.Column="1"
+                                   Text="Peer Mesh 未启动"
+                                   FontWeight="SemiBold"
+                                   TextTrimming="CharacterEllipsis"
+                                   Foreground="{DynamicResource PrimaryHoverBrush}" />
+                    </Grid>
+                </Border>
+                <Button x:Name="ThemeModeButton"
+                        Grid.Column="2"
+                        Width="38"
+                        Height="38"
+                        MinHeight="38"
+                        Padding="9"
+                        BorderThickness="0"
+                        VerticalAlignment="Center"
+                        Click="ThemeModeButton_Click">
+                    <Viewbox Width="18"
+                             Height="18"
+                             Stretch="Uniform">
+                        <Path x:Name="ThemeModeIcon"
+                              Data="M4,5 H20 V15 H4 Z M8,19 H16 M12,15 V19"
+                              Stroke="{DynamicResource TextSecondaryBrush}"
+                              StrokeThickness="2"
+                              StrokeStartLineCap="Round"
+                              StrokeEndLineCap="Round"
+                              StrokeLineJoin="Round" />
+                    </Viewbox>
+                </Button>
                 <UniformGrid Grid.Row="1"
+                             Grid.ColumnSpan="3"
                              Rows="1"
                              Columns="3"
                              Margin="0,16,0,0">
@@ -144,23 +239,23 @@
                              Margin="0,0,10,0"
                              MinWidth="0">
                         <StackPanel>
-                            <TextBlock Text="TCP 路由" Foreground="{StaticResource MutedBrush}" />
-                            <TextBlock x:Name="TcpCountText" Text="0" FontSize="22" FontWeight="Bold" Foreground="{StaticResource PrimaryHoverBrush}" />
+                            <TextBlock Text="TCP 路由" Foreground="{DynamicResource MutedBrush}" />
+                            <TextBlock x:Name="TcpCountText" Text="0" FontSize="22" FontWeight="Bold" Foreground="{DynamicResource PrimaryHoverBrush}" />
                         </StackPanel>
                     </Border>
                     <Border Style="{StaticResource MetricCardStyle}"
                              Margin="0,0,10,0"
                              MinWidth="0">
                         <StackPanel>
-                            <TextBlock Text="HTTP 路由" Foreground="{StaticResource MutedBrush}" />
-                            <TextBlock x:Name="HttpCountText" Text="0" FontSize="22" FontWeight="Bold" Foreground="{StaticResource PrimaryHoverBrush}" />
+                            <TextBlock Text="HTTP 路由" Foreground="{DynamicResource MutedBrush}" />
+                            <TextBlock x:Name="HttpCountText" Text="0" FontSize="22" FontWeight="Bold" Foreground="{DynamicResource PrimaryHoverBrush}" />
                         </StackPanel>
                     </Border>
                     <Border Style="{StaticResource MetricCardStyle}"
                             MinWidth="0">
                         <StackPanel>
-                            <TextBlock Text="Peer 对端" Foreground="{StaticResource MutedBrush}" />
-                            <TextBlock x:Name="PeerCountText" Text="0" FontSize="22" FontWeight="Bold" Foreground="{StaticResource PrimaryHoverBrush}" />
+                            <TextBlock Text="Peer 对端" Foreground="{DynamicResource MutedBrush}" />
+                            <TextBlock x:Name="PeerCountText" Text="0" FontSize="22" FontWeight="Bold" Foreground="{DynamicResource PrimaryHoverBrush}" />
                         </StackPanel>
                     </Border>
                 </UniformGrid>
@@ -171,35 +266,15 @@
                         Style="{StaticResource ModernTabControlStyle}"
                         ItemContainerStyle="{StaticResource ModernTabItemStyle}">
                 <TabItem Header="对端路由">
-                    <Border Style="{StaticResource SurfacePanelStyle}">
-                        <Grid>
+                    <Grid>
                             <Grid.RowDefinitions>
+                                <!-- 两张表按比例分配并设最小高度：窗口再矮也不会把
+                                     任何一张表挤没，表格外框始终完整可见，行数多时表内滚动 -->
+                                <RowDefinition Height="3*" MinHeight="120" />
                                 <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="190" />
+                                <RowDefinition Height="2*" MinHeight="110" />
                             </Grid.RowDefinitions>
-                            <Border Style="{StaticResource InfoStripStyle}"
-                                    Margin="0,0,0,12">
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Border Width="10"
-                                            Height="10"
-                                            CornerRadius="5"
-                                            Background="{StaticResource SuccessBrush}"
-                                            VerticalAlignment="Center"
-                                            Margin="0,0,10,0" />
-                                    <TextBlock x:Name="PeerMeshSummaryText"
-                                               Grid.Column="1"
-                                               Text="Peer Mesh 未启动"
-                                               FontWeight="SemiBold"
-                                               Foreground="{StaticResource PrimaryHoverBrush}" />
-                                </Grid>
-                            </Border>
-                            <Border Grid.Row="1"
+                            <Border Grid.Row="0"
                                     Style="{StaticResource TableShellStyle}">
                                 <DataGrid x:Name="PeerGrid"
                                           AlternationCount="2"
@@ -245,12 +320,12 @@
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </Border>
-                            <TextBlock Grid.Row="2"
+                            <TextBlock Grid.Row="1"
                                        Text="活跃会话"
                                        FontWeight="SemiBold"
-                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                       Foreground="{DynamicResource TextSecondaryBrush}"
                                        Margin="0,14,0,8" />
-                            <Border Grid.Row="3"
+                            <Border Grid.Row="2"
                                     Style="{StaticResource TableShellStyle}">
                                 <DataGrid x:Name="PeerSessionGrid"
                                           AlternationCount="2"
@@ -304,13 +379,11 @@
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </Border>
-                        </Grid>
-                    </Border>
+                    </Grid>
                 </TabItem>
                 <TabItem Header="本机 TCP 路由">
-                    <Border Style="{StaticResource SurfacePanelStyle}">
-                        <Border Style="{StaticResource TableShellStyle}">
-                            <DataGrid x:Name="TcpRouteGrid"
+                    <Border Style="{StaticResource TableShellStyle}">
+                        <DataGrid x:Name="TcpRouteGrid"
                                       AlternationCount="2"
                                       ItemsSource="{Binding TcpRoutes}">
                                 <DataGrid.Columns>
@@ -351,14 +424,12 @@
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
                                 </DataGrid.Columns>
-                            </DataGrid>
-                        </Border>
+                        </DataGrid>
                     </Border>
                 </TabItem>
                 <TabItem Header="本机 HTTP 路由">
-                    <Border Style="{StaticResource SurfacePanelStyle}">
-                        <Border Style="{StaticResource TableShellStyle}">
-                            <DataGrid x:Name="HttpRouteGrid"
+                    <Border Style="{StaticResource TableShellStyle}">
+                        <DataGrid x:Name="HttpRouteGrid"
                                       AlternationCount="2"
                                       ItemsSource="{Binding HttpRoutes}">
                                 <DataGrid.Columns>
@@ -381,15 +452,15 @@
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
                                 </DataGrid.Columns>
-                            </DataGrid>
-                        </Border>
+                        </DataGrid>
                     </Border>
                 </TabItem>
             </TabControl>
 
-            <Border Grid.Row="2"
-                    Background="{StaticResource LogBackgroundBrush}"
-                    BorderBrush="{StaticResource PanelStrokeBrush}"
+            <Border x:Name="LogPanelBorder"
+                    Grid.Row="2"
+                    Background="{DynamicResource LogBackgroundBrush}"
+                    BorderBrush="{DynamicResource PanelStrokeBrush}"
                     BorderThickness="1"
                     CornerRadius="16"
                     Padding="12">
@@ -398,13 +469,34 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
                     </Grid.RowDefinitions>
-                    <TextBlock Text="运行日志"
-                               Foreground="{StaticResource TextSecondaryBrush}"
-                               FontWeight="SemiBold"
-                               Margin="0,0,0,8" />
-                    <TextBox x:Name="LogTextBox"
-                             Grid.Row="1"
-                             Style="{StaticResource LogTextBoxStyle}" />
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="运行日志"
+                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                   FontWeight="SemiBold"
+                                   VerticalAlignment="Center" />
+                        <Button x:Name="LogExpandButton"
+                                Grid.Column="1"
+                                Content="放大"
+                                MinHeight="0"
+                                Height="26"
+                                Padding="12,2"
+                                FontSize="12"
+                                ToolTip="放大到整个窗口（Esc 还原）"
+                                Click="LogExpandButton_Click" />
+                    </Grid>
+                    <ScrollViewer x:Name="LogScrollViewer"
+                                  Grid.Row="1"
+                                  Style="{StaticResource LogScrollViewerStyle}"
+                                  HorizontalScrollBarVisibility="Auto"
+                                  VerticalScrollBarVisibility="Auto">
+                        <TextBox x:Name="LogTextBox"
+                                 MinWidth="{Binding ViewportWidth, ElementName=LogScrollViewer}"
+                                 Style="{StaticResource LogTextBoxStyle}" />
+                    </ScrollViewer>
                 </Grid>
             </Border>
         </Grid>
