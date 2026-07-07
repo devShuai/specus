@@ -1,0 +1,10 @@
+{
+  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  // Android client config. Comments and trailing commas are supported.
+  "serverBaseUrl": "https://tunnel.devshuai.com",
+  "apiKey": "YOUR_CLIENT_API_KEY",
+  "secret": "YOUR_CLIENT_SECRET",
+  "peerMeshDevice": "noop",
+  "peerMeshTunName": "shuai0",
+  "peerMeshMtu": 1280
+}

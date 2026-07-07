@@ -51,6 +51,7 @@ flowchart TD
 | `implementations/csharp/protocol` | .NET 协议库，server/client 共同 ProjectReference 复用 |
 | `implementations/csharp/server` | .NET 服务端移植(EF Core,多库) |
 | `implementations/csharp/client` | .NET 内网客户端（CLI + Windows WPF 桌面客户端），与 Java/Go 客户端字节兼容 |
+| `implementations/android/client` | Android 图形客户端，提供运行控制台、JSONC 配置、前台服务、TCP/HTTP 隧道、VpnService 和 Peer Mesh 基础数据面 |
 | `implementations/c/server` | C 服务端轻量移植 |
 
 主要入口：
@@ -61,6 +62,7 @@ flowchart TD
 - 客户端(Go)：`implementations/go/client/cmd/shuai-tunnel-client/main.go`
 - 客户端(.NET CLI)：`implementations/csharp/client/src/ShuaiTunnel.Client/Program.cs`
 - 客户端(.NET 桌面)：`implementations/csharp/client/src/ShuaiTunnel.Client.Desktop/MainWindow.xaml`
+- 客户端(Android)：`implementations/android/client/app/src/main/java/com/theshuai/tunnel/android/MainActivity.java`
 - 管理后台前端：`apps/admin-web/`(`npm run dev` / `npm run deploy:java|go|csharp`)
 - 协议实现：`implementations/java/common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
 
@@ -163,6 +165,8 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 Java 客户端使用 `WebApplicationType.NONE`，不启动 Spring Web，也不监听 HTTP 端口；同机运行服务端和客户端时不再需要为客户端覆盖 `server.port`。
 
 Go / .NET CLI 客户端使用同一份配置结构。
+
+Android 客户端位于 `implementations/android/client`，提供运行控制台、配置摘要、JSONC 编辑器、启动/停止按钮和运行事件流；保存的配置兼容 `client.jsonc`，内置 `VpnService` 权限流程。开启 Peer Mesh 时，Android 会创建系统 VPN 接口，并接入 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新、direct-stale fallback 以及基础链路/流量/设备上报；端口预测和完整真机矩阵仍以 Java/Go/.NET 客户端为准。
 
 Go 客户端：
 
@@ -490,12 +494,14 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
 - Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 只保留轻量兼容面
 - .NET Windows 桌面客户端已接入同一套 .NET 客户端运行时，支持保存连接配置、启动/停止客户端、查看 TCP/HTTP 路由和 Peer Mesh 状态、活跃 session、运行日志，以及跟随系统/浅色/深色主题
+- Android 客户端已提供原生运行控制台、JSONC 配置编辑与摘要、前台服务、HTTP 登录、控制连接、TCP 映射、HTTP 直转、VpnService TUN 生命周期，以及 Peer Mesh 基础数据面（X25519/HKDF/AES-GCM、候选交换、session 授权/刷新、STUN/TURN、direct-stale relay fallback、链路/流量/设备上报和 IPv4 包收发）
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
 
 实现边界：
 
 - 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
 - Peer Mesh 的 Go/.NET 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 保留轻量兼容面，不包含完整管理面、OIDC、完整 Direct HTTP 观测和 Peer Mesh 数据面。
+- Android Peer Mesh 已覆盖 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新和基础链路/流量/设备上报；端口预测、本地 ACL 镜像和完整真机端到端矩阵仍待补齐。
 - Java 客户端入口尚未默认开启控制连接 TLS，启用需自行调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
 

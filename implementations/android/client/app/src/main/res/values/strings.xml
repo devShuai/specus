@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Shuai Tunnel</string>
+    <string name="notification_channel">Tunnel client</string>
+</resources>

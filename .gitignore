@@ -69,11 +69,14 @@ client2.jsonc
 .appdata/
 .dotnet/
 .dotnet-home/
+.m2/
 .nuget/
 .gocache/
 .gomodcache/
 **/.gocache/
 **/.gomodcache/
+**/.gradle/
+local.properties
 **/bin/
 **/obj/
 
