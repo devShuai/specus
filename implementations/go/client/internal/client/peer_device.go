@@ -3,16 +3,34 @@ package client
 import (
 	"fmt"
 	"log"
+	"net"
 	"strings"
 )
 
 type peerVirtualDevice interface {
 	Name() string
 	Start(stopCh <-chan struct{}, outbound func([]byte)) error
+	SyncPeerRoutes(peerVirtualIPs []string)
 	WritePacket(packet []byte) error
 	Close() error
 	Status() string
 	Error() string
+}
+
+func normalizePeerRouteIPs(peerVirtualIPs []string, selfVirtualIP string) map[string]struct{} {
+	desired := make(map[string]struct{}, len(peerVirtualIPs))
+	self := strings.TrimSpace(selfVirtualIP)
+	for _, peerVirtualIP := range peerVirtualIPs {
+		normalized := strings.TrimSpace(peerVirtualIP)
+		if normalized == "" || normalized == self {
+			continue
+		}
+		if ip := net.ParseIP(normalized); ip == nil || ip.To4() == nil || strings.Contains(normalized, ":") {
+			continue
+		}
+		desired[normalized] = struct{}{}
+	}
+	return desired
 }
 
 type noopPeerVirtualDevice struct {
@@ -42,6 +60,9 @@ func (device *noopPeerVirtualDevice) Start(_ <-chan struct{}, _ func([]byte)) er
 		return fmt.Errorf("%s", device.err)
 	}
 	return nil
+}
+
+func (device *noopPeerVirtualDevice) SyncPeerRoutes(_ []string) {
 }
 
 func (device *noopPeerVirtualDevice) WritePacket(_ []byte) error {

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +38,9 @@ type windowsWintunDevice struct {
 	session uintptr
 	status  string
 	err     string
+
+	routesMu         sync.Mutex
+	syncedPeerRoutes map[string]struct{}
 }
 
 type wintunAPI struct {
@@ -59,12 +61,13 @@ func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger 
 		return newUnsupportedPeerVirtualDevice(config, fmt.Sprintf("unsupported peerMeshDevice on Windows: %s", config.PeerMeshDevice))
 	}
 	return &windowsWintunDevice{
-		name:    firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
-		virtual: runtime.VirtualIP,
-		cidr:    runtime.CIDR,
-		mtu:     config.PeerMeshMTU,
-		logger:  logger,
-		status:  "INIT",
+		name:             firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
+		virtual:          runtime.VirtualIP,
+		cidr:             runtime.CIDR,
+		mtu:              config.PeerMeshMTU,
+		logger:           logger,
+		status:           "INIT",
+		syncedPeerRoutes: make(map[string]struct{}),
 	}
 }
 
@@ -124,6 +127,45 @@ func (device *windowsWintunDevice) Start(stopCh <-chan struct{}, outbound func([
 	return nil
 }
 
+func (device *windowsWintunDevice) SyncPeerRoutes(peerVirtualIPs []string) {
+	device.routesMu.Lock()
+	defer device.routesMu.Unlock()
+	desired := normalizePeerRouteIPs(peerVirtualIPs, device.virtual)
+	for routeIP := range device.syncedPeerRoutes {
+		if _, ok := desired[routeIP]; !ok {
+			device.deletePeerRouteLocked(routeIP)
+		}
+	}
+	for routeIP := range desired {
+		if _, ok := device.syncedPeerRoutes[routeIP]; !ok {
+			device.addPeerRouteLocked(routeIP)
+		}
+	}
+}
+
+func (device *windowsWintunDevice) addPeerRouteLocked(peerVirtualIP string) {
+	route := peerVirtualIP + "/32"
+	device.runCommandQuiet("netsh", "interface", "ipv4", "delete", "route", route, device.name, "store=active")
+	if err := runWindowsCommand("netsh", "interface", "ipv4", "add", "route", route, device.name, "store=active"); err != nil {
+		if device.logger != nil {
+			device.logger.Printf("Peer Mesh Wintun add peer route failed: route=%s err=%v", route, err)
+		}
+		return
+	}
+	device.syncedPeerRoutes[peerVirtualIP] = struct{}{}
+}
+
+func (device *windowsWintunDevice) deletePeerRouteLocked(peerVirtualIP string) {
+	device.runCommandQuiet("netsh", "interface", "ipv4", "delete", "route", peerVirtualIP+"/32", device.name, "store=active")
+	delete(device.syncedPeerRoutes, peerVirtualIP)
+}
+
+func (device *windowsWintunDevice) runCommandQuiet(args ...string) {
+	if err := runWindowsCommand(args...); err != nil && device.logger != nil {
+		device.logger.Printf("Peer Mesh Wintun ignored command failure: %v", err)
+	}
+}
+
 func (device *windowsWintunDevice) WritePacket(packet []byte) error {
 	device.mu.Lock()
 	api := device.api
@@ -143,6 +185,7 @@ func (device *windowsWintunDevice) WritePacket(packet []byte) error {
 }
 
 func (device *windowsWintunDevice) Close() error {
+	device.SyncPeerRoutes(nil)
 	device.mu.Lock()
 	api := device.api
 	session := device.session
@@ -202,22 +245,20 @@ func (device *windowsWintunDevice) readLoop(stopCh <-chan struct{}, outbound fun
 }
 
 func (device *windowsWintunDevice) configure() error {
-	prefix, mask, err := windowsCIDRPrefixAndMask(device.cidr)
-	if err != nil {
-		return err
-	}
 	if device.mtu <= 0 {
 		device.mtu = DefaultPeerMeshMTU
 	}
 	commands := [][]string{
-		{"netsh", "interface", "ip", "set", "address", "name=" + device.name, "static", device.virtual, mask},
+		{"netsh", "interface", "ip", "set", "address", "name=" + device.name, "static", device.virtual, "255.255.255.255"},
 		{"netsh", "interface", "ipv4", "set", "subinterface", device.name, fmt.Sprintf("mtu=%d", device.mtu), "store=active"},
-		{"netsh", "interface", "ipv4", "add", "route", fmt.Sprintf("%s/%d", strings.Split(device.cidr, "/")[0], prefix), device.name, "store=active"},
 	}
 	for _, args := range commands {
 		if err := runWindowsCommand(args...); err != nil {
 			return err
 		}
+	}
+	if strings.TrimSpace(device.cidr) != "" {
+		device.runCommandQuiet("netsh", "interface", "ipv4", "delete", "route", device.cidr, device.name, "store=active")
 	}
 	return nil
 }
@@ -341,21 +382,6 @@ func wintunArchDir() string {
 	default:
 		return ""
 	}
-}
-
-func windowsCIDRPrefixAndMask(cidr string) (int, string, error) {
-	ip, network, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return 0, "", fmt.Errorf("parse peer mesh CIDR %q failed: %w", cidr, err)
-	}
-	if ip.To4() == nil {
-		return 0, "", fmt.Errorf("peer mesh CIDR must be IPv4: %s", cidr)
-	}
-	ones, bits := network.Mask.Size()
-	if bits != 32 {
-		return 0, "", fmt.Errorf("peer mesh CIDR must be IPv4: %s", cidr)
-	}
-	return ones, net.IP(network.Mask).String(), nil
 }
 
 func runWindowsCommand(args ...string) error {

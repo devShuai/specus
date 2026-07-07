@@ -80,6 +80,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly Dictionary<string, PendingStunBinding> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PeerCandidate> _srflxCandidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _turnPermissions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _ignoredPacketLogAt = new(StringComparer.Ordinal);
     private readonly NatPortMappingService _portMappingService;
 
     private CancellationTokenSource? _cts;
@@ -134,6 +135,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 runtime.PeerMesh.VirtualIp);
             await ReportDeviceAsync(runtime, writer, DeviceStatus(), _device?.Error ?? "", "", "", cancellationToken)
                 .ConfigureAwait(false);
+            await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
             PublishPeerMeshSnapshot();
             _ = TryAcquirePortMappingAsync(CancellationToken.None);
             await RequestRelayCandidatesAsync().ConfigureAwait(false);
@@ -186,6 +188,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pendingStun.Clear();
             _srflxCandidates.Clear();
             _turnPermissions.Clear();
+            _ignoredPacketLogAt.Clear();
             _srflx = null;
             _relay = null;
             _portMap = null;
@@ -225,6 +228,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _ = Task.Run(() => ReceiveLoopAsync(udp, cts.Token), CancellationToken.None);
         _ = Task.Run(() => MaintenanceLoopAsync(cts.Token), CancellationToken.None);
         await ReportDeviceAsync(runtime, writer, DeviceStatus(), FirstNonEmpty(deviceError, device.Error), "", "", cancellationToken).ConfigureAwait(false);
+        await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
         PublishPeerMeshSnapshot();
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
@@ -264,6 +268,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     break;
                 case TypeRoster:
                     MergeRoster(message.Peers);
+                    await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
                     await AnnounceCandidatesAsync().ConfigureAwait(false);
                     break;
                 case TypeSessionGrant:
@@ -273,6 +278,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 case TypeCandidates:
                     MergePeerFromSignal(message);
                     MergeSession(message);
+                    await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
                     await SendConnectivityChecksAsync(message).ConfigureAwait(false);
                     break;
                 case TypeClose:
@@ -768,14 +774,26 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
+        if (ShouldIgnoreVirtualPacketTarget(target))
+        {
+            LogIgnoredVirtualPacket(target, "non-peer-unicast");
+            return;
+        }
         PeerMeshSession? session;
         PeerMeshPeer? peer;
         lock (_sync)
         {
             session = _sessions.Values.FirstOrDefault(item =>
                 string.Equals(item.PeerVirtualIp, target, StringComparison.OrdinalIgnoreCase));
-            peer = _peers.Values.FirstOrDefault(item =>
-                string.Equals(item.VirtualIp, target, StringComparison.OrdinalIgnoreCase));
+            var matches = _peers.Values
+                .Where(item => string.Equals(item.VirtualIp, target, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            peer = matches.FirstOrDefault(item => item.Online) ?? matches.FirstOrDefault();
+        }
+        if (peer is null || !peer.Online)
+        {
+            LogIgnoredVirtualPacket(target, "unknown-peer-route");
+            return;
         }
         if (session is null)
         {
@@ -1093,6 +1111,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         lock (_sync)
         {
+            // Roster 推送只带身份与在线状态；清空重建让被移出 roster 的 peer 立即消失，
+            // 同时保留仍在 roster 中 peer 已学到的 candidates，避免 probe 探测失效。
+            var previous = new Dictionary<long, PeerMeshPeer>(_peers);
+            _peers.Clear();
             foreach (var rawPeer in peers)
             {
                 if (rawPeer is null || rawPeer.ClientId <= 0)
@@ -1103,7 +1125,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 {
                     Candidates = NormalizeCandidates(rawPeer.Candidates),
                 };
-                if (_peers.TryGetValue(peer.ClientId, out var existing) && peer.Candidates.Count == 0)
+                if (previous.TryGetValue(peer.ClientId, out var existing) && peer.Candidates.Count == 0)
                 {
                     peer.Candidates.AddRange(NormalizeCandidates(existing.Candidates));
                 }
@@ -2436,6 +2458,130 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         return runtime is not null && InCidr(endpoint.Address, runtime.PeerMesh.Cidr);
     }
 
+    private async Task SyncVirtualDeviceRoutesAsync()
+    {
+        IPeerVirtualDevice? device;
+        List<string> routeIps;
+        lock (_sync)
+        {
+            device = _device;
+            var selfVirtualIp = _runtime?.PeerMesh.VirtualIp?.Trim() ?? "";
+            routeIps = _peers.Values
+                .Where(peer => peer.Online && !string.IsNullOrWhiteSpace(peer.VirtualIp))
+                .Select(peer => peer.VirtualIp!.Trim())
+                .Where(ip => !string.Equals(ip, selfVirtualIp, StringComparison.Ordinal))
+                .Distinct(StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal)
+                .ToList();
+        }
+        if (device is null)
+        {
+            return;
+        }
+        try
+        {
+            await device.SyncPeerRoutesAsync(routeIps, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Peer Mesh peer route sync failed: device={Device}, routes={Routes}",
+                device.Name, routeIps.Count);
+        }
+    }
+
+    private bool ShouldIgnoreVirtualPacketTarget(string targetVirtualIp)
+    {
+        var ip = Ipv4ToUInt(targetVirtualIp);
+        if (ip is null)
+        {
+            return true;
+        }
+        var firstOctet = (int)((ip.Value >> 24) & 0xFF);
+        if (firstOctet >= 224 || firstOctet == 0 || targetVirtualIp == "255.255.255.255")
+        {
+            return true;
+        }
+        var runtime = Runtime();
+        if (runtime is not null && string.Equals(targetVirtualIp, runtime.PeerMesh.VirtualIp, StringComparison.Ordinal))
+        {
+            return true;
+        }
+        return IsMeshBoundaryAddress(targetVirtualIp, runtime?.PeerMesh.Cidr);
+    }
+
+    // 网段的 network / broadcast 地址不属于任何 peer；/31、/32 没有边界地址。
+    private static bool IsMeshBoundaryAddress(string targetVirtualIp, string? cidr)
+    {
+        if (string.IsNullOrWhiteSpace(cidr))
+        {
+            return false;
+        }
+        var parts = cidr.Split('/', 2);
+        if (parts.Length != 2)
+        {
+            return false;
+        }
+        var ip = Ipv4ToUInt(targetVirtualIp);
+        var baseValue = Ipv4ToUInt(parts[0]);
+        if (ip is null || baseValue is null)
+        {
+            return false;
+        }
+        if (!int.TryParse(parts[1].Trim(), out var prefix) || prefix < 0 || prefix >= 31)
+        {
+            return false;
+        }
+        var mask = prefix == 0 ? 0u : uint.MaxValue << (32 - prefix);
+        var network = baseValue.Value & mask;
+        var broadcast = network | ~mask;
+        return ip.Value == network || ip.Value == broadcast;
+    }
+
+    private static uint? Ipv4ToUInt(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+        var parts = value.Split('.');
+        if (parts.Length != 4)
+        {
+            return null;
+        }
+        var result = 0u;
+        foreach (var part in parts)
+        {
+            if (!int.TryParse(part, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var octet)
+                || octet is < 0 or > 255)
+            {
+                return null;
+            }
+            result = (result << 8) | (uint)octet;
+        }
+        return result;
+    }
+
+    private void LogIgnoredVirtualPacket(string targetVirtualIp, string reason)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var key = $"ignored|{targetVirtualIp}|{reason}";
+        int peerCount;
+        int sessionCount;
+        lock (_sync)
+        {
+            if (_ignoredPacketLogAt.TryGetValue(key, out var previous) && now - previous < TimeSpan.FromSeconds(30))
+            {
+                return;
+            }
+            _ignoredPacketLogAt[key] = now;
+            peerCount = _peers.Count;
+            sessionCount = _sessions.Count;
+        }
+        _logger.LogDebug("Peer Mesh ignored non-peer virtual packet: target={Target}, reason={Reason}, peers={Peers}, sessions={Sessions}",
+            targetVirtualIp, reason, peerCount, sessionCount);
+    }
+
     private bool IsPortPreservedLocked(IPEndPoint endpoint)
     {
         return _udp?.Client.LocalEndPoint is IPEndPoint local
@@ -2506,6 +2652,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pendingStun.Clear();
             _srflxCandidates.Clear();
             _turnPermissions.Clear();
+            _ignoredPacketLogAt.Clear();
             _srflx = null;
             _relay = null;
             _portMap = null;

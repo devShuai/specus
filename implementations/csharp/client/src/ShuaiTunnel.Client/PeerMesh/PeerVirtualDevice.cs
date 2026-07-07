@@ -16,6 +16,10 @@ internal interface IPeerVirtualDevice : IAsyncDisposable
     string Status { get; }
     string Error { get; }
     Task StartAsync(Func<byte[], ValueTask> outboundHandler, CancellationToken cancellationToken);
+
+    Task SyncPeerRoutesAsync(IReadOnlyCollection<string> peerVirtualIps, CancellationToken cancellationToken) =>
+        Task.CompletedTask;
+
     ValueTask WritePacketAsync(byte[] packet, CancellationToken cancellationToken);
 }
 
@@ -81,6 +85,8 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
     private readonly TunnelClientConfig _config;
     private readonly PeerMeshConfig _peerMesh;
     private readonly ILogger _logger;
+    private readonly SemaphoreSlim _routeSync = new(1, 1);
+    private readonly HashSet<string> _syncedPeerRoutes = new(StringComparer.Ordinal);
     private FileStream? _stream;
     private Task? _readTask;
 
@@ -126,6 +132,38 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
         _readTask = Task.Run(() => ReadLoopAsync(outboundHandler, cancellationToken), CancellationToken.None);
     }
 
+    public async Task SyncPeerRoutesAsync(IReadOnlyCollection<string> peerVirtualIps, CancellationToken cancellationToken)
+    {
+        await _routeSync.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var desired = NormalizePeerRoutes(peerVirtualIps, _peerMesh.VirtualIp);
+            foreach (var routeIp in _syncedPeerRoutes.Where(item => !desired.Contains(item)).ToList())
+            {
+                await RunCommandQuietAsync(_logger, cancellationToken, "ip", "route", "del", $"{routeIp}/32", "dev", Name)
+                    .ConfigureAwait(false);
+                _syncedPeerRoutes.Remove(routeIp);
+            }
+            foreach (var routeIp in desired.Where(item => !_syncedPeerRoutes.Contains(item)))
+            {
+                try
+                {
+                    await RunCommandAsync(cancellationToken, "ip", "route", "replace", $"{routeIp}/32", "dev", Name)
+                        .ConfigureAwait(false);
+                    _syncedPeerRoutes.Add(routeIp);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Peer Mesh Linux TUN add peer route failed: route={Route}/32", routeIp);
+                }
+            }
+        }
+        finally
+        {
+            _routeSync.Release();
+        }
+    }
+
     public async ValueTask WritePacketAsync(byte[] packet, CancellationToken cancellationToken)
     {
         if (_stream is null || packet.Length == 0)
@@ -138,6 +176,14 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
 
     public async ValueTask DisposeAsync()
     {
+        try
+        {
+            await SyncPeerRoutesAsync([], CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Peer Mesh Linux TUN peer route cleanup failed");
+        }
         if (_stream is not null)
         {
             await _stream.DisposeAsync().ConfigureAwait(false);
@@ -178,10 +224,12 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
 
     private async Task ConfigureAsync(CancellationToken cancellationToken)
     {
-        var prefix = CidrPrefix(_peerMesh.Cidr);
-        await RunCommandAsync(cancellationToken, "ip", "addr", "replace", $"{_peerMesh.VirtualIp}/{prefix}", "dev", Name).ConfigureAwait(false);
+        await RunCommandAsync(cancellationToken, "ip", "addr", "replace", $"{_peerMesh.VirtualIp}/32", "dev", Name).ConfigureAwait(false);
         await RunCommandAsync(cancellationToken, "ip", "link", "set", "dev", Name, "mtu", _config.PeerMeshMtu.ToString(System.Globalization.CultureInfo.InvariantCulture), "up").ConfigureAwait(false);
-        await RunCommandAsync(cancellationToken, "ip", "route", "replace", _peerMesh.Cidr!, "dev", Name).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(_peerMesh.Cidr))
+        {
+            await RunCommandQuietAsync(_logger, cancellationToken, "ip", "route", "del", _peerMesh.Cidr!, "dev", Name).ConfigureAwait(false);
+        }
     }
 
     private static string ReadInterfaceName(byte[] ifreq)
@@ -224,6 +272,8 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
     private readonly PeerMeshConfig _peerMesh;
     private readonly ILogger _logger;
     private readonly object _sync = new();
+    private readonly SemaphoreSlim _routeSync = new(1, 1);
+    private readonly HashSet<string> _syncedPeerRoutes = new(StringComparer.Ordinal);
     private int _fd = -1;
     private Task? _readTask;
 
@@ -276,6 +326,40 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
         }
     }
 
+    public async Task SyncPeerRoutesAsync(IReadOnlyCollection<string> peerVirtualIps, CancellationToken cancellationToken)
+    {
+        await _routeSync.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var desired = NormalizePeerRoutes(peerVirtualIps, _peerMesh.VirtualIp);
+            foreach (var routeIp in _syncedPeerRoutes.Where(item => !desired.Contains(item)).ToList())
+            {
+                await RunCommandQuietAsync(_logger, cancellationToken, "route", "-n", "delete", "-host", routeIp)
+                    .ConfigureAwait(false);
+                _syncedPeerRoutes.Remove(routeIp);
+            }
+            foreach (var routeIp in desired.Where(item => !_syncedPeerRoutes.Contains(item)))
+            {
+                await RunCommandQuietAsync(_logger, cancellationToken, "route", "-n", "delete", "-host", routeIp)
+                    .ConfigureAwait(false);
+                try
+                {
+                    await RunCommandAsync(cancellationToken, "route", "-n", "add", "-host", routeIp, "-interface", Name)
+                        .ConfigureAwait(false);
+                    _syncedPeerRoutes.Add(routeIp);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Peer Mesh macOS utun add peer route failed: route={Route}/32", routeIp);
+                }
+            }
+        }
+        finally
+        {
+            _routeSync.Release();
+        }
+    }
+
     public ValueTask WritePacketAsync(byte[] packet, CancellationToken cancellationToken)
     {
         if (packet.Length == 0)
@@ -309,8 +393,16 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        try
+        {
+            await SyncPeerRoutesAsync([], CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Peer Mesh macOS utun peer route cleanup failed");
+        }
         int fd;
         lock (_sync)
         {
@@ -321,7 +413,6 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
         {
             _ = Close(fd);
         }
-        return ValueTask.CompletedTask;
     }
 
     private async Task ReadLoopAsync(Func<byte[], ValueTask> outboundHandler, CancellationToken cancellationToken)
@@ -361,23 +452,15 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
 
     private async Task ConfigureAsync(CancellationToken cancellationToken)
     {
-        var prefix = CidrPrefix(_peerMesh.Cidr);
-        var network = IPv4NetworkAddress(_peerMesh.Cidr);
-        var mask = IPv4Mask(prefix);
         var mtu = _config.PeerMeshMtu <= 0 ? TunnelClientConfig.DefaultPeerMeshMtu : _config.PeerMeshMtu;
         await RunCommandAsync(cancellationToken,
-            "ifconfig", Name, "inet", _peerMesh.VirtualIp!, _peerMesh.VirtualIp!, "netmask", mask, "mtu",
+            "ifconfig", Name, "inet", _peerMesh.VirtualIp!, _peerMesh.VirtualIp!, "netmask", IPv4Mask(32), "mtu",
             mtu.ToString(System.Globalization.CultureInfo.InvariantCulture), "up").ConfigureAwait(false);
-        try
+        if (!string.IsNullOrWhiteSpace(_peerMesh.Cidr))
         {
-            await RunCommandAsync(cancellationToken, "route", "-n", "delete", "-net", network, "-netmask", mask)
+            await RunCommandQuietAsync(_logger, cancellationToken, "route", "-n", "delete", "-net", _peerMesh.Cidr!)
                 .ConfigureAwait(false);
         }
-        catch (InvalidOperationException)
-        {
-        }
-        await RunCommandAsync(cancellationToken, "route", "-n", "add", "-net", network, "-netmask", mask,
-            "-interface", Name).ConfigureAwait(false);
     }
 
     private uint RequestedUnit()
@@ -456,6 +539,8 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
     private readonly TunnelClientConfig _config;
     private readonly PeerMeshConfig _peerMesh;
     private readonly ILogger _logger;
+    private readonly SemaphoreSlim _routeSync = new(1, 1);
+    private readonly HashSet<string> _syncedPeerRoutes = new(StringComparer.Ordinal);
     private IntPtr _library;
     private IntPtr _adapter;
     private IntPtr _session;
@@ -510,6 +595,40 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
         _readTask = Task.Run(() => ReadLoopAsync(outboundHandler, cancellationToken), CancellationToken.None);
     }
 
+    public async Task SyncPeerRoutesAsync(IReadOnlyCollection<string> peerVirtualIps, CancellationToken cancellationToken)
+    {
+        await _routeSync.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var desired = NormalizePeerRoutes(peerVirtualIps, _peerMesh.VirtualIp);
+            foreach (var routeIp in _syncedPeerRoutes.Where(item => !desired.Contains(item)).ToList())
+            {
+                await RunCommandQuietAsync(_logger, cancellationToken, "netsh", "interface", "ipv4", "delete", "route",
+                    $"{routeIp}/32", Name, "store=active").ConfigureAwait(false);
+                _syncedPeerRoutes.Remove(routeIp);
+            }
+            foreach (var routeIp in desired.Where(item => !_syncedPeerRoutes.Contains(item)))
+            {
+                await RunCommandQuietAsync(_logger, cancellationToken, "netsh", "interface", "ipv4", "delete", "route",
+                    $"{routeIp}/32", Name, "store=active").ConfigureAwait(false);
+                try
+                {
+                    await RunCommandAsync(cancellationToken, "netsh", "interface", "ipv4", "add", "route",
+                        $"{routeIp}/32", Name, "store=active").ConfigureAwait(false);
+                    _syncedPeerRoutes.Add(routeIp);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Peer Mesh Wintun add peer route failed: route={Route}/32", routeIp);
+                }
+            }
+        }
+        finally
+        {
+            _routeSync.Release();
+        }
+    }
+
     public ValueTask WritePacketAsync(byte[] packet, CancellationToken cancellationToken)
     {
         if (_api is null || _session == IntPtr.Zero || packet.Length == 0)
@@ -526,8 +645,16 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        try
+        {
+            await SyncPeerRoutesAsync([], CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Peer Mesh Wintun peer route cleanup failed");
+        }
         if (_api is not null && _session != IntPtr.Zero)
         {
             _api.EndSession(_session);
@@ -544,7 +671,6 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
             _library = IntPtr.Zero;
         }
         _api = null;
-        return ValueTask.CompletedTask;
     }
 
     private async Task ReadLoopAsync(Func<byte[], ValueTask> outboundHandler, CancellationToken cancellationToken)
@@ -579,13 +705,15 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
 
     private async Task ConfigureAsync(CancellationToken cancellationToken)
     {
-        var mask = IPv4Mask(CidrPrefix(_peerMesh.Cidr));
         await RunCommandAsync(cancellationToken, "netsh", "interface", "ip", "set", "address",
-            $"name={Name}", "static", _peerMesh.VirtualIp!, mask).ConfigureAwait(false);
+            $"name={Name}", "static", _peerMesh.VirtualIp!, IPv4Mask(32)).ConfigureAwait(false);
         await RunCommandAsync(cancellationToken, "netsh", "interface", "ipv4", "set", "subinterface",
             Name, $"mtu={_config.PeerMeshMtu}", "store=active").ConfigureAwait(false);
-        await RunCommandAsync(cancellationToken, "netsh", "interface", "ipv4", "add", "route",
-            _peerMesh.Cidr!, Name, "store=active").ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(_peerMesh.Cidr))
+        {
+            await RunCommandQuietAsync(_logger, cancellationToken, "netsh", "interface", "ipv4", "delete", "route",
+                _peerMesh.Cidr!, Name, "store=active").ConfigureAwait(false);
+        }
     }
 
     private static (IntPtr Library, WintunApi Api) LoadWintun()
@@ -715,6 +843,62 @@ internal static class PeerVirtualDeviceHelpers
         Span<byte> bytes = stackalloc byte[4];
         BinaryPrimitives.WriteUInt32BigEndian(bytes, network);
         return new IPAddress(bytes.ToArray()).ToString();
+    }
+
+    public static HashSet<string> NormalizePeerRoutes(IEnumerable<string?>? peerVirtualIps, string? selfVirtualIp)
+    {
+        var desired = new HashSet<string>(StringComparer.Ordinal);
+        if (peerVirtualIps is null)
+        {
+            return desired;
+        }
+        var self = selfVirtualIp?.Trim() ?? "";
+        foreach (var peerVirtualIp in peerVirtualIps)
+        {
+            var normalized = peerVirtualIp?.Trim() ?? "";
+            if (IsIPv4(normalized) && !string.Equals(normalized, self, StringComparison.Ordinal))
+            {
+                desired.Add(normalized);
+            }
+        }
+        return desired;
+    }
+
+    public static bool IsIPv4(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+        var parts = value.Split('.');
+        if (parts.Length != 4)
+        {
+            return false;
+        }
+        foreach (var part in parts)
+        {
+            if (!int.TryParse(part, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var octet)
+                || octet is < 0 or > 255)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public static async Task<bool> RunCommandQuietAsync(ILogger logger, CancellationToken cancellationToken, params string[] command)
+    {
+        try
+        {
+            await RunCommandAsync(cancellationToken, command).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Peer Mesh ignored command failure: {Command}", string.Join(' ', command));
+            return false;
+        }
     }
 
     public static async Task RunCommandAsync(CancellationToken cancellationToken, params string[] command)

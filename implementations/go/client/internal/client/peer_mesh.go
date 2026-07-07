@@ -2,6 +2,7 @@ package client
 
 import (
 	"crypto/ecdh"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -91,6 +92,7 @@ type peerMeshClient struct {
 	localKey             *ecdh.PrivateKey
 	device               peerVirtualDevice
 	runtimeConfigKey     string
+	ignoredPacketLogAt   map[string]time.Time
 }
 
 type peerMeshPeer struct {
@@ -232,6 +234,7 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 		mesh.sender = sender
 		mesh.mu.Unlock()
 		mesh.reportDevice(conn, sender, mesh.deviceStatus(), mesh.deviceError(), "", "")
+		mesh.syncVirtualDeviceRoutes()
 		mesh.tryAcquirePortMappingAsync()
 		mesh.requestRelayCandidates()
 		mesh.announceCandidates()
@@ -256,6 +259,7 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.srflxCandidates = make(map[string]peerCandidate)
 	mesh.natByRole = make(map[string]string)
 	mesh.turnPermissions = make(map[string]time.Time)
+	mesh.ignoredPacketLogAt = make(map[string]time.Time)
 	mesh.localKey = localKey
 	if mesh.portMappingService == nil {
 		mesh.portMappingService = newNatPortMappingService(mesh.logger)
@@ -285,6 +289,7 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.mu.Unlock()
 
 	mesh.reportDevice(conn, sender, device.Status(), firstNonEmpty(deviceErr, device.Error()), "", "")
+	mesh.syncVirtualDeviceRoutes()
 	go mesh.udpLoop(udp, stopCh)
 	go mesh.maintenanceLoop(stopCh)
 	mesh.tryAcquirePortMappingAsync()
@@ -335,6 +340,7 @@ func (mesh *peerMeshClient) stopLocked() {
 	mesh.lastAlternateRequest = time.Time{}
 	mesh.natByRole = nil
 	mesh.turnPermissions = nil
+	mesh.ignoredPacketLogAt = nil
 	mesh.localKey = nil
 	mesh.runtimeConfigKey = ""
 }
@@ -753,6 +759,10 @@ func (mesh *peerMeshClient) handleVirtualPacket(packet []byte) {
 	if targetIP == "" {
 		return
 	}
+	if mesh.shouldIgnoreVirtualPacketTarget(targetIP) {
+		mesh.logIgnoredVirtualPacket(targetIP, "non-peer-unicast")
+		return
+	}
 	mesh.mu.Lock()
 	var session *peerMeshSession
 	for _, candidate := range mesh.sessions {
@@ -763,14 +773,24 @@ func (mesh *peerMeshClient) handleVirtualPacket(packet []byte) {
 	}
 	var peer *peerMeshPeer
 	for _, candidate := range mesh.peers {
-		if candidate.VirtualIP == targetIP {
+		if candidate.VirtualIP != targetIP {
+			continue
+		}
+		if candidate.Online {
 			peer = candidate
 			break
+		}
+		if peer == nil {
+			peer = candidate
 		}
 	}
 	udp := mesh.udp
 	runtime := mesh.runtime
 	mesh.mu.Unlock()
+	if peer == nil || !peer.Online {
+		mesh.logIgnoredVirtualPacket(targetIP, "unknown-peer-route")
+		return
+	}
 	if session == nil || udp == nil || runtime.PeerMesh.ClientID <= 0 {
 		if peer != nil {
 			mesh.queuePendingPacket(peer.ClientID, packet)
@@ -788,6 +808,97 @@ func (mesh *peerMeshClient) handleVirtualPacket(packet []byte) {
 		mesh.preparePathForPeer(peer, session)
 		mesh.logger.Printf("Peer Mesh send virtual packet failed: peer=%d target=%s flow=%s err=%v", session.PeerID, targetIP, peerPacketFlowKey(packet), err)
 	}
+}
+
+func (mesh *peerMeshClient) shouldIgnoreVirtualPacketTarget(targetVirtualIP string) bool {
+	ipv4 := net.ParseIP(targetVirtualIP).To4()
+	if ipv4 == nil {
+		return true
+	}
+	firstOctet := int(ipv4[0])
+	if firstOctet >= 224 || firstOctet == 0 || targetVirtualIP == "255.255.255.255" {
+		return true
+	}
+	mesh.mu.Lock()
+	virtualIP := strings.TrimSpace(mesh.runtime.PeerMesh.VirtualIP)
+	cidr := mesh.runtime.PeerMesh.CIDR
+	mesh.mu.Unlock()
+	if targetVirtualIP == virtualIP {
+		return true
+	}
+	return isMeshBoundaryAddress(targetVirtualIP, cidr)
+}
+
+// isMeshBoundaryAddress reports whether the target is the network or broadcast
+// address of the mesh CIDR; /31 and /32 have no such boundary addresses.
+func isMeshBoundaryAddress(targetVirtualIP, cidr string) bool {
+	if strings.TrimSpace(cidr) == "" {
+		return false
+	}
+	ipv4 := net.ParseIP(targetVirtualIP).To4()
+	_, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil || ipv4 == nil {
+		return false
+	}
+	networkIPv4 := network.IP.To4()
+	if networkIPv4 == nil || len(network.Mask) != 4 {
+		return false
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 || ones >= 31 {
+		return false
+	}
+	ipValue := binary.BigEndian.Uint32(ipv4)
+	networkValue := binary.BigEndian.Uint32(networkIPv4)
+	mask := binary.BigEndian.Uint32(network.Mask)
+	broadcast := networkValue | ^mask
+	return ipValue == networkValue || ipValue == broadcast
+}
+
+func (mesh *peerMeshClient) logIgnoredVirtualPacket(targetVirtualIP, reason string) {
+	now := time.Now()
+	key := "ignored|" + targetVirtualIP + "|" + reason
+	mesh.mu.Lock()
+	if mesh.ignoredPacketLogAt == nil {
+		mesh.ignoredPacketLogAt = make(map[string]time.Time)
+	}
+	if previous, ok := mesh.ignoredPacketLogAt[key]; ok && now.Sub(previous) < 30*time.Second {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.ignoredPacketLogAt[key] = now
+	peerCount := len(mesh.peers)
+	sessionCount := len(mesh.sessions)
+	mesh.mu.Unlock()
+	mesh.logger.Printf("Peer Mesh ignored non-peer virtual packet: target=%s reason=%s peers=%d sessions=%d",
+		targetVirtualIP, reason, peerCount, sessionCount)
+}
+
+func (mesh *peerMeshClient) syncVirtualDeviceRoutes() {
+	mesh.mu.Lock()
+	device := mesh.device
+	selfVirtualIP := strings.TrimSpace(mesh.runtime.PeerMesh.VirtualIP)
+	routeSet := make(map[string]struct{}, len(mesh.peers))
+	for _, peer := range mesh.peers {
+		if peer == nil || !peer.Online {
+			continue
+		}
+		virtualIP := strings.TrimSpace(peer.VirtualIP)
+		if virtualIP == "" || virtualIP == selfVirtualIP {
+			continue
+		}
+		routeSet[virtualIP] = struct{}{}
+	}
+	mesh.mu.Unlock()
+	if device == nil {
+		return
+	}
+	routeIPs := make([]string, 0, len(routeSet))
+	for routeIP := range routeSet {
+		routeIPs = append(routeIPs, routeIP)
+	}
+	sort.Strings(routeIPs)
+	device.SyncPeerRoutes(routeIPs)
 }
 
 func (mesh *peerMeshClient) queuePendingPacket(peerID int64, packet []byte) {
@@ -1028,23 +1139,32 @@ func (mesh *peerMeshClient) completeProbe(probe peerUDPProbe, remote *net.UDPAdd
 
 func (mesh *peerMeshClient) mergeRoster(items []peerMeshPeer) {
 	mesh.mu.Lock()
-	defer mesh.mu.Unlock()
-	if mesh.peers == nil {
-		mesh.peers = make(map[int64]*peerMeshPeer)
-	}
+	// Roster 推送只带身份与在线状态；清空重建让被移出 roster 的 peer 立即消失，
+	// 同时保留仍在 roster 中 peer 已学到的 candidates，避免 probeKnownCandidates 失效。
+	previous := mesh.peers
+	next := make(map[int64]*peerMeshPeer, len(items))
 	for _, item := range items {
 		if item.ClientID <= 0 {
 			continue
 		}
 		copy := item
-		if existing := mesh.peers[item.ClientID]; existing != nil && len(copy.Candidates) == 0 {
+		if existing := previous[item.ClientID]; existing != nil && len(copy.Candidates) == 0 {
 			copy.Candidates = existing.Candidates
 		}
-		mesh.peers[item.ClientID] = &copy
+		next[item.ClientID] = &copy
 	}
+	mesh.peers = next
+	mesh.mu.Unlock()
+	mesh.syncVirtualDeviceRoutes()
 }
 
 func (mesh *peerMeshClient) mergePeerFromSignal(message peerControlMessage) {
+	if mesh.applyPeerFromSignal(message) {
+		mesh.syncVirtualDeviceRoutes()
+	}
+}
+
+func (mesh *peerMeshClient) applyPeerFromSignal(message peerControlMessage) bool {
 	mesh.mu.Lock()
 	defer mesh.mu.Unlock()
 	if mesh.peers == nil {
@@ -1058,7 +1178,7 @@ func (mesh *peerMeshClient) mergePeerFromSignal(message peerControlMessage) {
 		peer = peerMeshPeer{ClientID: message.TargetClientID, ClientName: message.TargetClientName, VirtualIP: message.TargetVirtualIP, PublicKey: message.TargetPublicKey, Online: true}
 	}
 	if peer.ClientID <= 0 {
-		return
+		return false
 	}
 	if existing := mesh.peers[peer.ClientID]; existing != nil {
 		if peer.ClientName == "" {
@@ -1073,6 +1193,7 @@ func (mesh *peerMeshClient) mergePeerFromSignal(message peerControlMessage) {
 	}
 	peer.Candidates = append([]peerCandidate(nil), message.Candidates...)
 	mesh.peers[peer.ClientID] = &peer
+	return true
 }
 
 func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {

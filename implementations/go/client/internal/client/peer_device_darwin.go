@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -41,6 +40,9 @@ type darwinUtunDevice struct {
 	fd     int
 	status string
 	err    string
+
+	routesMu         sync.Mutex
+	syncedPeerRoutes map[string]struct{}
 }
 
 type darwinCtlInfo struct {
@@ -63,13 +65,14 @@ func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger 
 		return newUnsupportedPeerVirtualDevice(config, fmt.Sprintf("unsupported peerMeshDevice on macOS: %s", config.PeerMeshDevice))
 	}
 	return &darwinUtunDevice{
-		name:    firstNonEmpty(config.PeerMeshTunName, darwinUtunDefaultPrefix),
-		virtual: runtime.VirtualIP,
-		cidr:    runtime.CIDR,
-		mtu:     config.PeerMeshMTU,
-		logger:  logger,
-		fd:      -1,
-		status:  "INIT",
+		name:             firstNonEmpty(config.PeerMeshTunName, darwinUtunDefaultPrefix),
+		virtual:          runtime.VirtualIP,
+		cidr:             runtime.CIDR,
+		mtu:              config.PeerMeshMTU,
+		logger:           logger,
+		fd:               -1,
+		status:           "INIT",
+		syncedPeerRoutes: make(map[string]struct{}),
 	}
 }
 
@@ -111,6 +114,44 @@ func (device *darwinUtunDevice) Start(stopCh <-chan struct{}, outbound func([]by
 	return nil
 }
 
+func (device *darwinUtunDevice) SyncPeerRoutes(peerVirtualIPs []string) {
+	device.routesMu.Lock()
+	defer device.routesMu.Unlock()
+	desired := normalizePeerRouteIPs(peerVirtualIPs, device.virtual)
+	for routeIP := range device.syncedPeerRoutes {
+		if _, ok := desired[routeIP]; !ok {
+			device.deletePeerRouteLocked(routeIP)
+		}
+	}
+	for routeIP := range desired {
+		if _, ok := device.syncedPeerRoutes[routeIP]; !ok {
+			device.addPeerRouteLocked(routeIP)
+		}
+	}
+}
+
+func (device *darwinUtunDevice) addPeerRouteLocked(peerVirtualIP string) {
+	device.runCommandQuiet("route", "-n", "delete", "-host", peerVirtualIP)
+	if err := runDarwinCommand("route", "-n", "add", "-host", peerVirtualIP, "-interface", device.Name()); err != nil {
+		if device.logger != nil {
+			device.logger.Printf("Peer Mesh utun add peer route failed: route=%s/32 err=%v", peerVirtualIP, err)
+		}
+		return
+	}
+	device.syncedPeerRoutes[peerVirtualIP] = struct{}{}
+}
+
+func (device *darwinUtunDevice) deletePeerRouteLocked(peerVirtualIP string) {
+	device.runCommandQuiet("route", "-n", "delete", "-host", peerVirtualIP)
+	delete(device.syncedPeerRoutes, peerVirtualIP)
+}
+
+func (device *darwinUtunDevice) runCommandQuiet(args ...string) {
+	if err := runDarwinCommand(args...); err != nil && device.logger != nil {
+		device.logger.Printf("Peer Mesh utun ignored command failure: %v", err)
+	}
+}
+
 func (device *darwinUtunDevice) WritePacket(packet []byte) error {
 	device.mu.Lock()
 	fd := device.fd
@@ -142,6 +183,7 @@ func (device *darwinUtunDevice) WritePacket(packet []byte) error {
 }
 
 func (device *darwinUtunDevice) Close() error {
+	device.SyncPeerRoutes(nil)
 	device.mu.Lock()
 	fd := device.fd
 	device.fd = -1
@@ -198,24 +240,15 @@ func (device *darwinUtunDevice) readLoop(stopCh <-chan struct{}, outbound func([
 }
 
 func (device *darwinUtunDevice) configure() error {
-	prefix, network, mask, err := darwinCIDRParts(device.cidr)
-	if err != nil {
-		return err
-	}
 	if device.mtu <= 0 {
 		device.mtu = DefaultPeerMeshMTU
 	}
-	commands := [][]string{
-		{"ifconfig", device.name, "inet", device.virtual, device.virtual, "netmask", mask, "mtu", fmt.Sprintf("%d", device.mtu), "up"},
-		{"route", "-n", "delete", "-net", network, "-netmask", mask},
-		{"route", "-n", "add", "-net", network, "-netmask", mask, "-interface", device.name},
-	}
-	if err := runDarwinCommand(commands[0]...); err != nil {
+	if err := runDarwinCommand("ifconfig", device.name, "inet", device.virtual, device.virtual,
+		"netmask", "255.255.255.255", "mtu", fmt.Sprintf("%d", device.mtu), "up"); err != nil {
 		return err
 	}
-	_ = runDarwinCommand(commands[1]...)
-	if err := runDarwinCommand(commands[2]...); err != nil {
-		return fmt.Errorf("configure peer mesh route %s/%d failed: %w", network, prefix, err)
+	if strings.TrimSpace(device.cidr) != "" {
+		device.runCommandQuiet("route", "-n", "delete", "-net", device.cidr)
 	}
 	return nil
 }
@@ -282,21 +315,6 @@ func darwinUtunName(fd int) (string, error) {
 		end++
 	}
 	return string(name[:end]), nil
-}
-
-func darwinCIDRParts(cidr string) (int, string, string, error) {
-	ip, network, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return 0, "", "", fmt.Errorf("parse peer mesh CIDR %q failed: %w", cidr, err)
-	}
-	if ip.To4() == nil {
-		return 0, "", "", fmt.Errorf("peer mesh CIDR must be IPv4: %s", cidr)
-	}
-	ones, bits := network.Mask.Size()
-	if bits != 32 {
-		return 0, "", "", fmt.Errorf("peer mesh CIDR must be IPv4: %s", cidr)
-	}
-	return ones, network.IP.String(), net.IP(network.Mask).String(), nil
 }
 
 func runDarwinCommand(args ...string) error {

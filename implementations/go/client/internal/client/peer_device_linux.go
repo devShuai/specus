@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -35,16 +34,20 @@ type linuxTunDevice struct {
 	file   *os.File
 	status string
 	err    string
+
+	routesMu         sync.Mutex
+	syncedPeerRoutes map[string]struct{}
 }
 
 func newPlatformPeerVirtualDevice(config Config, runtime PeerMeshConfig, logger *log.Logger) peerVirtualDevice {
 	return &linuxTunDevice{
-		name:    firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
-		virtual: runtime.VirtualIP,
-		cidr:    runtime.CIDR,
-		mtu:     config.PeerMeshMTU,
-		logger:  logger,
-		status:  "INIT",
+		name:             firstNonEmpty(config.PeerMeshTunName, DefaultPeerMeshTunName),
+		virtual:          runtime.VirtualIP,
+		cidr:             runtime.CIDR,
+		mtu:              config.PeerMeshMTU,
+		logger:           logger,
+		status:           "INIT",
+		syncedPeerRoutes: make(map[string]struct{}),
 	}
 }
 
@@ -90,6 +93,44 @@ func (device *linuxTunDevice) Start(stopCh <-chan struct{}, outbound func([]byte
 	return nil
 }
 
+func (device *linuxTunDevice) SyncPeerRoutes(peerVirtualIPs []string) {
+	device.routesMu.Lock()
+	defer device.routesMu.Unlock()
+	desired := normalizePeerRouteIPs(peerVirtualIPs, device.virtual)
+	for routeIP := range device.syncedPeerRoutes {
+		if _, ok := desired[routeIP]; !ok {
+			device.deletePeerRouteLocked(routeIP)
+		}
+	}
+	for routeIP := range desired {
+		if _, ok := device.syncedPeerRoutes[routeIP]; !ok {
+			device.addPeerRouteLocked(routeIP)
+		}
+	}
+}
+
+func (device *linuxTunDevice) addPeerRouteLocked(peerVirtualIP string) {
+	route := peerVirtualIP + "/32"
+	if err := runCommand("ip", "route", "replace", route, "dev", device.name); err != nil {
+		if device.logger != nil {
+			device.logger.Printf("Peer Mesh Linux TUN add peer route failed: route=%s err=%v", route, err)
+		}
+		return
+	}
+	device.syncedPeerRoutes[peerVirtualIP] = struct{}{}
+}
+
+func (device *linuxTunDevice) deletePeerRouteLocked(peerVirtualIP string) {
+	device.runCommandQuiet("ip", "route", "del", peerVirtualIP+"/32", "dev", device.name)
+	delete(device.syncedPeerRoutes, peerVirtualIP)
+}
+
+func (device *linuxTunDevice) runCommandQuiet(args ...string) {
+	if err := runCommand(args...); err != nil && device.logger != nil {
+		device.logger.Printf("Peer Mesh Linux TUN ignored command failure: %v", err)
+	}
+}
+
 func (device *linuxTunDevice) WritePacket(packet []byte) error {
 	device.mu.Lock()
 	file := device.file
@@ -111,6 +152,7 @@ func (device *linuxTunDevice) WritePacket(packet []byte) error {
 }
 
 func (device *linuxTunDevice) Close() error {
+	device.SyncPeerRoutes(nil)
 	device.mu.Lock()
 	file := device.file
 	device.file = nil
@@ -162,23 +204,20 @@ func (device *linuxTunDevice) readLoop(stopCh <-chan struct{}, outbound func([]b
 }
 
 func (device *linuxTunDevice) configure() error {
-	prefix, err := cidrPrefixLength(device.cidr)
-	if err != nil {
-		return err
-	}
 	if device.mtu <= 0 {
 		device.mtu = DefaultPeerMeshMTU
 	}
-	address := fmt.Sprintf("%s/%d", device.virtual, prefix)
 	commands := [][]string{
-		{"ip", "addr", "replace", address, "dev", device.name},
+		{"ip", "addr", "replace", device.virtual + "/32", "dev", device.name},
 		{"ip", "link", "set", "dev", device.name, "mtu", fmt.Sprintf("%d", device.mtu), "up"},
-		{"ip", "route", "replace", device.cidr, "dev", device.name},
 	}
 	for _, args := range commands {
 		if err := runCommand(args...); err != nil {
 			return err
 		}
+	}
+	if strings.TrimSpace(device.cidr) != "" {
+		device.runCommandQuiet("ip", "route", "del", device.cidr, "dev", device.name)
 	}
 	return nil
 }
@@ -188,15 +227,6 @@ func (device *linuxTunDevice) setStatus(status, errText string) {
 	device.status = status
 	device.err = errText
 	device.mu.Unlock()
-}
-
-func cidrPrefixLength(cidr string) (int, error) {
-	_, network, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return 0, fmt.Errorf("parse peer mesh CIDR %q failed: %w", cidr, err)
-	}
-	ones, _ := network.Mask.Size()
-	return ones, nil
 }
 
 func runCommand(args ...string) error {
