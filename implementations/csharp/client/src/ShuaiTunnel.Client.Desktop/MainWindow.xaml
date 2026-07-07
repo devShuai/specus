@@ -381,6 +381,108 @@
                             </Border>
                     </Grid>
                 </TabItem>
+                <TabItem Header="客户端消息">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Border Style="{StaticResource SurfacePanelStyle}"
+                                Padding="14"
+                                Margin="0,0,0,12">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="240" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="92" />
+                                </Grid.ColumnDefinitions>
+                                <ComboBox x:Name="MessageTargetBox"
+                                          IsEditable="True"
+                                          ItemsSource="{Binding PeerRoutes}"
+                                          DisplayMemberPath="ClientName"
+                                          SelectedValuePath="ClientName"
+                                          Margin="0,0,10,0" />
+                                <TextBox x:Name="MessageBodyBox"
+                                         Grid.Column="1"
+                                         MinHeight="38"
+                                         MaxHeight="96"
+                                         AcceptsReturn="True"
+                                         TextWrapping="Wrap"
+                                         VerticalScrollBarVisibility="Auto"
+                                         Margin="0,0,10,0" />
+                                <Button x:Name="SendMessageButton"
+                                        Grid.Column="2"
+                                        Content="发送"
+                                        Style="{StaticResource PrimaryButtonStyle}"
+                                        IsEnabled="False"
+                                        Click="SendMessageButton_Click" />
+                            </Grid>
+                        </Border>
+                        <Border Grid.Row="1"
+                                Style="{StaticResource TableShellStyle}">
+                            <DataGrid x:Name="ClientMessageGrid"
+                                      AlternationCount="2"
+                                      ItemsSource="{Binding ClientMessages}">
+                                <DataGrid.Columns>
+                                    <DataGridTemplateColumn Header="时间" SortMemberPath="CreatedAtText" ClipboardContentBinding="{Binding CreatedAtText}" Width="92">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding CreatedAtText}"
+                                                         ToolTip="{Binding CreatedAtText}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="方向" SortMemberPath="DirectionText" ClipboardContentBinding="{Binding DirectionText}" Width="82">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding DirectionText}"
+                                                         ToolTip="{Binding DirectionText}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="对端" SortMemberPath="Peer" ClipboardContentBinding="{Binding Peer}" Width="2*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Peer}"
+                                                         ToolTip="{Binding Peer}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="通道" SortMemberPath="TransportText" ClipboardContentBinding="{Binding TransportText}" Width="110">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding TransportText}"
+                                                         ToolTip="{Binding TransportText}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="状态" SortMemberPath="StatusText" ClipboardContentBinding="{Binding StatusText}" Width="92">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding StatusText}"
+                                                         ToolTip="{Binding StatusText}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                    <DataGridTemplateColumn Header="消息" SortMemberPath="Message" ClipboardContentBinding="{Binding Message}" Width="4*">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
+                                                         Text="{Binding Message}"
+                                                         ToolTip="{Binding Message}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Border>
+                    </Grid>
+                </TabItem>
                 <TabItem Header="本机 TCP 路由">
                     <Border Style="{StaticResource TableShellStyle}">
                         <DataGrid x:Name="TcpRouteGrid"

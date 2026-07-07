@@ -41,6 +41,8 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private bool _resetBackoffOnNextHttpLogin;
     private CancellationTokenSource? _sessionCts;
     private TunnelRuntimeState? _runtime;
+    private FrameWriter? _activeWriter;
+    private volatile bool _loggedIn;
 
     public TunnelControlClient(
         TunnelClientConfig config,
@@ -56,6 +58,95 @@ public sealed class TunnelControlClient : IAsyncDisposable
         _peerMesh = new PeerMeshClient(config, loggerFactory.CreateLogger<PeerMeshClient>(), observer);
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<TunnelControlClient>();
+    }
+
+    public async Task<ClientMessageSendResult> SendClientMessageAsync(
+        string toClientName,
+        string message,
+        CancellationToken cancellationToken = default)
+    {
+        var target = toClientName.Trim();
+        var body = message.Trim();
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            throw new ArgumentException("目标客户端不能为空。", nameof(toClientName));
+        }
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            throw new ArgumentException("消息内容不能为空。", nameof(message));
+        }
+
+        var runtime = _runtime;
+        if (runtime is null || _activeWriter is null || !_loggedIn)
+        {
+            throw new InvalidOperationException("客户端尚未登录控制通道。");
+        }
+
+        try
+        {
+            var peerResult = await _peerMesh.SendClientMessageAsync(target, body, cancellationToken)
+                .ConfigureAwait(false);
+            if (peerResult is not null)
+            {
+                PublishClientMessage(new ClientMessageSnapshot
+                {
+                    Id = peerResult.MessageId,
+                    Direction = "OUT",
+                    FromClientName = runtime.ClientName,
+                    ToClientName = target,
+                    Message = body,
+                    Transport = peerResult.Transport,
+                    Status = "sent",
+                    CreatedAt = DateTimeOffset.Now,
+                });
+                return new ClientMessageSendResult
+                {
+                    MessageId = peerResult.MessageId,
+                    Transport = peerResult.Transport,
+                    FallbackUsed = false,
+                };
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "peer client message path failed, using server fallback: target={Target}", target);
+        }
+
+        var writer = _activeWriter;
+        var sessionCts = _sessionCts;
+        runtime = _runtime;
+        if (writer is null || sessionCts is null || runtime is null || sessionCts.IsCancellationRequested || !_loggedIn)
+        {
+            throw new InvalidOperationException("客户端控制通道不可用。");
+        }
+
+        var messageId = Guid.NewGuid().ToString("N");
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, sessionCts.Token);
+        await writer.WriteAsync(new MessageRequestPacket
+        {
+            ClientName = runtime.ClientName,
+            ToClientName = target,
+            MessageType = MessageType.ClientToClient,
+            Message = body,
+        }, linkedCts.Token).ConfigureAwait(false);
+
+        PublishClientMessage(new ClientMessageSnapshot
+        {
+            Id = messageId,
+            Direction = "OUT",
+            FromClientName = runtime.ClientName,
+            ToClientName = target,
+            Message = body,
+            Transport = "server",
+            Status = "submitted",
+            CreatedAt = DateTimeOffset.Now,
+        });
+        return new ClientMessageSendResult
+        {
+            MessageId = messageId,
+            Transport = "server",
+            FallbackUsed = true,
+        };
     }
 
     /// <summary>Runs the reconnect loop until cancellation; never returns success.</summary>
@@ -164,6 +255,8 @@ public sealed class TunnelControlClient : IAsyncDisposable
 
         await using var stream = tcp.GetStream();
         await using var writer = new FrameWriter(stream);
+        _activeWriter = writer;
+        _loggedIn = false;
         _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var sessionCts = _sessionCts;
         var session = sessionCts.Token;
@@ -204,6 +297,8 @@ public sealed class TunnelControlClient : IAsyncDisposable
         }
         finally
         {
+            _activeWriter = null;
+            _loggedIn = false;
             sessionCts.Cancel();
             try
             {
@@ -335,6 +430,7 @@ public sealed class TunnelControlClient : IAsyncDisposable
                 {
                     _logger.LogInformation("[{client}] 登录成功", response.ClientName);
                     _backoffAttempts = 0;
+                    _loggedIn = true;
                     PublishStatus("RUNNING", $"控制通道登录成功：{response.ClientName}", running: true, controlConnected: true, loggedIn: true);
                     await nat.RegisterAllAsync().ConfigureAwait(false);
                     await nat.ReportHttpRoutesAsync().ConfigureAwait(false);
@@ -360,6 +456,10 @@ public sealed class TunnelControlClient : IAsyncDisposable
                 await ApplyPeerControlAsync(message.Message ?? "", writer, cancellationToken).ConfigureAwait(false);
                 break;
 
+            case MessageResponsePacket message when message.MessageType == MessageType.ClientToClient:
+                ApplyClientMessage(message);
+                break;
+
             case NatMessagePacket natMessage:
                 await nat.HandleAsync(natMessage).ConfigureAwait(false);
                 break;
@@ -380,6 +480,22 @@ public sealed class TunnelControlClient : IAsyncDisposable
 
         // Suppress unused-parameter warning when only some branches need the writer.
         _ = writer;
+    }
+
+    private void ApplyClientMessage(MessageResponsePacket message)
+    {
+        var runtime = _runtime;
+        PublishClientMessage(new ClientMessageSnapshot
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Direction = "IN",
+            FromClientName = FirstNonEmpty(message.ClientName, "server"),
+            ToClientName = FirstNonEmpty(message.ToClientName, runtime?.ClientName),
+            Message = message.Message ?? "",
+            Transport = "server",
+            Status = "received",
+            CreatedAt = DateTimeOffset.Now,
+        });
     }
 
     private async Task ApplyPeerControlAsync(string payload, FrameWriter writer, CancellationToken cancellationToken)
@@ -440,6 +556,16 @@ public sealed class TunnelControlClient : IAsyncDisposable
         IEnumerable<HttpTunnelConfigEntry>? httpRoutes)
     {
         _observer?.OnRoutesChanged(TunnelClientRoutesSnapshot.FromRoutes(tcpRoutes, httpRoutes));
+    }
+
+    private void PublishClientMessage(ClientMessageSnapshot snapshot)
+    {
+        _observer?.OnClientMessage(snapshot);
+    }
+
+    private static string FirstNonEmpty(params string?[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? "";
     }
 
     internal static ControlLoginFailureAction ClassifyControlLoginFailure(string? reason)

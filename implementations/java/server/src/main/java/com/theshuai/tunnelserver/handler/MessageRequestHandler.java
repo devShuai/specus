@@ -2,7 +2,11 @@ package com.theshuai.tunnelserver.handler;
 
 import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
+import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.session.Session;
+import com.theshuai.tunnelserver.management.model.ClientAccount;
+import com.theshuai.tunnelserver.management.service.ClientAccountService;
+import com.theshuai.tunnelserver.management.service.PeerMeshService;
 import com.theshuai.tunnelserver.management.service.PeerSignalService;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import io.netty.channel.Channel;
@@ -11,6 +15,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 
 /**
  * 控制连接通用消息分发：依据 messageType 把 {@link MessageRequestPacket} 路由到目标客户端。
@@ -21,9 +26,15 @@ import org.springframework.stereotype.Component;
 @Slf4j
 public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRequestPacket> {
     private final PeerSignalService peerSignalService;
+    private final ClientAccountService clientAccountService;
+    private final PeerMeshService peerMeshService;
 
-    public MessageRequestHandler(PeerSignalService peerSignalService) {
+    public MessageRequestHandler(PeerSignalService peerSignalService,
+                                 ClientAccountService clientAccountService,
+                                 PeerMeshService peerMeshService) {
         this.peerSignalService = peerSignalService;
+        this.clientAccountService = clientAccountService;
+        this.peerMeshService = peerMeshService;
     }
 
     @Override
@@ -51,20 +62,56 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
     }
 
     private void clientToClient(MessageRequestPacket messageRequestPacket, Session session) {
+        if (session == null || !StringUtils.hasText(session.getClientName())) {
+            log.warn("client->client rejected: unauthenticated sender");
+            return;
+        }
+        if (!StringUtils.hasText(messageRequestPacket.getToClientName())) {
+            log.warn("client->client rejected: target is empty, source={}", session.getClientName());
+            return;
+        }
+        if (!StringUtils.hasText(messageRequestPacket.getMessage())) {
+            log.warn("client->client rejected: message is empty, source={}, target={}",
+                    session.getClientName(), messageRequestPacket.getToClientName());
+            return;
+        }
+
+        ClientAccount source = clientAccountService.findClientByName(session.getClientName())
+                .orElse(null);
+        ClientAccount target = clientAccountService.findClientByName(messageRequestPacket.getToClientName().trim())
+                .orElse(null);
+        if (source == null || target == null || !source.isEnabled() || !target.isEnabled()) {
+            log.warn("client->client rejected: source/target account unavailable, source={}, target={}",
+                    session.getClientName(), messageRequestPacket.getToClientName());
+            return;
+        }
+        if (!peerMeshService.canPeer(source, target)) {
+            log.warn("client->client rejected: peer access denied, source={}, target={}",
+                    source.getClientName(), target.getClientName());
+            return;
+        }
+
         MessageResponsePacket messageResponsePacket = new MessageResponsePacket();
-        messageResponsePacket.setClientName(messageRequestPacket.getClientName());
+        messageResponsePacket.setClientName(source.getClientName());
+        messageResponsePacket.setToClientName(target.getClientName());
+        messageResponsePacket.setMessageType(MessageType.CLIENT_TO_CLIENT);
         messageResponsePacket.setMessage(messageRequestPacket.getMessage());
 
-        Channel toClientChannel = SessionUtil.getChannel(messageRequestPacket.getToClientName());
+        Channel toClientChannel = SessionUtil.getChannel(target.getClientName());
 
         if (toClientChannel != null && SessionUtil.hasLogin(toClientChannel)) {
             toClientChannel.writeAndFlush(messageResponsePacket).addListener(future -> {
-                if (future.isDone()) {
-                    log.info("发送结束");
+                if (future.isSuccess()) {
+                    log.info("client->client fallback delivered: source={}, target={}",
+                            source.getClientName(), target.getClientName());
+                } else if (future.cause() != null) {
+                    log.warn("client->client fallback delivery failed: source={}, target={}, reason={}",
+                            source.getClientName(), target.getClientName(), future.cause().getMessage());
                 }
             });
         } else {
-            log.info("[{}] 不在线，发送失败", session == null ? "?" : session.getClientName());
+            log.info("client->client fallback target offline: source={}, target={}",
+                    source.getClientName(), target.getClientName());
         }
     }
 

@@ -9,6 +9,8 @@ public interface ITunnelClientObserver
     void OnRoutesChanged(TunnelClientRoutesSnapshot snapshot) { }
 
     void OnPeerMeshChanged(TunnelPeerMeshSnapshot snapshot) { }
+
+    void OnClientMessage(ClientMessageSnapshot snapshot) { }
 }
 
 public sealed class TunnelClientStatusSnapshot
@@ -125,6 +127,34 @@ public sealed class HttpRouteSnapshot
     public string Route { get; init; } = "";
 
     public string TargetBaseUrl { get; init; } = "";
+}
+
+public sealed class ClientMessageSnapshot
+{
+    public string Id { get; init; } = "";
+
+    public string Direction { get; init; } = "";
+
+    public string FromClientName { get; init; } = "";
+
+    public string ToClientName { get; init; } = "";
+
+    public string Message { get; init; } = "";
+
+    public string Transport { get; init; } = "";
+
+    public string Status { get; init; } = "";
+
+    public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.Now;
+}
+
+public sealed class ClientMessageSendResult
+{
+    public string MessageId { get; init; } = "";
+
+    public string Transport { get; init; } = "";
+
+    public bool FallbackUsed { get; init; }
 }
 
 public sealed class TunnelPeerMeshSnapshot

@@ -696,7 +696,7 @@ public sealed class PeerMeshService
         }
     }
 
-    private async Task<bool> CanPeerAsync(ClientAccount source, ClientAccount target, CancellationToken cancellationToken)
+    public async Task<bool> CanPeerAsync(ClientAccount source, ClientAccount target, CancellationToken cancellationToken)
     {
         if (!ManagementContext.SameTenant(source.TenantId, target.TenantId))
         {

@@ -1,9 +1,11 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.ControlChannel;
+using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Http;
 using ShuaiTunnel.Server.Nat;
@@ -83,6 +85,9 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             case DirectHttpResponsePacket response:
                 _directHttp.Ack(response);
                 return;
+            case MessageRequestPacket message when message.MessageType == MessageType.ClientToClient:
+                await HandleClientToClientAsync(context, message).ConfigureAwait(false);
+                return;
             case MessageRequestPacket message when message.MessageType == MessageType.PeerControl:
                 await using (var scope = _services.CreateAsyncScope())
                 {
@@ -99,6 +104,74 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                     context.ChannelId, packet.Command);
                 return;
         }
+    }
+
+    private async Task HandleClientToClientAsync(TunnelConnectionContext context, MessageRequestPacket request)
+    {
+        if (string.IsNullOrWhiteSpace(context.ClientName)
+            || string.IsNullOrWhiteSpace(request.ToClientName)
+            || string.IsNullOrWhiteSpace(request.Message))
+        {
+            _logger.LogWarning("[{ChannelId}] client message rejected: invalid source/target/body",
+                context.ChannelId);
+            return;
+        }
+
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TunnelDbContext>();
+        var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
+        var source = await db.ClientAccounts.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.ClientName == context.ClientName, context.Lifetime)
+            .ConfigureAwait(false);
+        var targetName = request.ToClientName.Trim();
+        var target = await db.ClientAccounts.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.ClientName == targetName, context.Lifetime)
+            .ConfigureAwait(false);
+        if (source is null || target is null || !source.Enabled || !target.Enabled)
+        {
+            _logger.LogWarning("[{ChannelId}] client message rejected: account unavailable source={Source} target={Target}",
+                context.ChannelId, context.ClientName, targetName);
+            return;
+        }
+        if (!await peerMesh.CanPeerAsync(source, target, context.Lifetime).ConfigureAwait(false))
+        {
+            _logger.LogWarning("[{ChannelId}] client message rejected: peer access denied source={Source} target={Target}",
+                context.ChannelId, source.ClientName, target.ClientName);
+            return;
+        }
+
+        var targetSession = _sessions.Find(target.ClientName);
+        if (targetSession is null)
+        {
+            _logger.LogInformation("[{ChannelId}] client message target offline source={Source} target={Target}",
+                context.ChannelId, source.ClientName, target.ClientName);
+            return;
+        }
+
+        try
+        {
+            await targetSession.Writer.WriteAsync(new MessageResponsePacket
+            {
+                ClientName = source.ClientName,
+                ToClientName = target.ClientName,
+                MessageType = MessageType.ClientToClient,
+                Message = request.Message,
+            }, targetSession.Lifetime).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (targetSession.Lifetime.IsCancellationRequested)
+        {
+            _logger.LogInformation("[{ChannelId}] client message target closed during fallback source={Source} target={Target}",
+                context.ChannelId, source.ClientName, target.ClientName);
+            return;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "[{ChannelId}] client message fallback write failed source={Source} target={Target}",
+                context.ChannelId, source.ClientName, target.ClientName);
+            return;
+        }
+        _logger.LogInformation("[{ChannelId}] client message fallback delivered source={Source} target={Target}",
+            context.ChannelId, source.ClientName, target.ClientName);
     }
 
     public async Task OnConnectionClosedAsync(TunnelConnectionContext context)

@@ -57,6 +57,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan DirectKeepaliveInterval = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan DirectStaleInterval = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan ConnectivityCheckPacing = TimeSpan.FromMilliseconds(20);
+    private static readonly TimeSpan PeerMessageSessionWaitTimeout = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan PeerMessageAckTimeout = TimeSpan.FromMilliseconds(1500);
     private const long RttHysteresisMillis = 100;
     private const long RttEwmaOldWeight = 7;
     private const long RttEwmaNewWeight = 1;
@@ -80,6 +82,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly Dictionary<string, PendingStunBinding> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PeerCandidate> _srflxCandidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _turnPermissions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingClientMessageAck> _pendingMessageAcks = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> _ignoredPacketLogAt = new(StringComparer.Ordinal);
     private readonly NatPortMappingService _portMappingService;
 
@@ -233,6 +236,107 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
         await AnnounceCandidatesAsync().ConfigureAwait(false);
+    }
+
+    public async Task<PeerClientMessageSendResult?> SendClientMessageAsync(
+        string toClientName,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        var target = toClientName.Trim();
+        if (string.IsNullOrWhiteSpace(target) || string.IsNullOrWhiteSpace(message))
+        {
+            return null;
+        }
+
+        var runtime = Runtime();
+        if (runtime is null || !runtime.PeerMesh.Enabled)
+        {
+            return null;
+        }
+
+        PeerMeshPeer? peer;
+        PeerMeshSession? session;
+        var now = DateTimeOffset.UtcNow;
+        lock (_sync)
+        {
+            peer = _peers.Values.FirstOrDefault(item =>
+                item.Online
+                && string.Equals(item.ClientName, target, StringComparison.OrdinalIgnoreCase));
+            session = peer is null ? null : ReusableSessionLocked(peer.ClientId, now);
+        }
+        if (peer is null)
+        {
+            return null;
+        }
+
+        if (session is null || session.AesKey.Length != 32)
+        {
+            await PreparePathForPeerAsync(peer, session).ConfigureAwait(false);
+            session = await WaitForReadyPeerMessageSessionAsync(peer.ClientId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        if (session is null)
+        {
+            return null;
+        }
+
+        var messageId = Guid.NewGuid().ToString("N");
+        var appMessage = new PeerAppMessage
+        {
+            Type = PeerAppMessageCodec.TypeMessage,
+            Id = messageId,
+            FromClientId = runtime.PeerMesh.ClientId,
+            FromClientName = runtime.PeerMesh.ClientName,
+            ToClientId = peer.ClientId,
+            ToClientName = FirstNonEmpty(peer.ClientName, target),
+            Message = message,
+            CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        };
+
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_sync)
+        {
+            _pendingMessageAcks[messageId] = new PendingClientMessageAck(completion, DateTimeOffset.UtcNow);
+        }
+
+        try
+        {
+            var payload = PeerAppMessageCodec.Encode(appMessage);
+            if (!await SendEncryptedPayloadAsync(peer.ClientId, payload).ConfigureAwait(false))
+            {
+                await PreparePathForPeerAsync(peer, session).ConfigureAwait(false);
+                return null;
+            }
+
+            var completed = await Task.WhenAny(
+                    completion.Task,
+                    Task.Delay(PeerMessageAckTimeout, cancellationToken))
+                .ConfigureAwait(false);
+            if (completed == completion.Task && await completion.Task.ConfigureAwait(false))
+            {
+                return new PeerClientMessageSendResult(messageId, PeerTransportFor(peer.ClientId));
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            await PreparePathForPeerAsync(peer, session).ConfigureAwait(false);
+            return null;
+        }
+        catch (Exception ex) when (ex is CryptographicException
+                                   or SocketException
+                                   or InvalidOperationException
+                                   or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Peer Mesh client message send failed: target={Target}", target);
+            return null;
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                _pendingMessageAcks.Remove(messageId);
+            }
+        }
     }
 
     public async Task HandleControlAsync(string payload, TunnelRuntimeState runtime, FrameWriter writer, CancellationToken cancellationToken)
@@ -1000,6 +1104,26 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
+    private async Task<PeerMeshSession?> WaitForReadyPeerMessageSessionAsync(long peerId, CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow + PeerMessageSessionWaitTimeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (_sync)
+            {
+                if (_sessions.TryGetValue(peerId, out var session)
+                    && DateTimeOffset.UtcNow <= session.ExpiresAt
+                    && session.AesKey.Length == 32)
+                {
+                    return session;
+                }
+            }
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken).ConfigureAwait(false);
+        }
+        return null;
+    }
+
     private async Task HandlePeerDataFrameAsync(byte[] payload, IPEndPoint remote, string relayFrom)
     {
         if (string.IsNullOrWhiteSpace(relayFrom) && (ShouldAvoidDirectPath() || IsMeshEndpoint(remote)))
@@ -1072,6 +1196,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             await FlushPendingPacketsAsync(ready).ConfigureAwait(false);
         }
+        if (ready is not null
+            && await HandlePeerAppMessageAsync(frame.Payload, ready, relayFrom, runtime).ConfigureAwait(false))
+        {
+            return;
+        }
         if (device is NoopPeerVirtualDevice)
         {
             var reply = PeerIpPacket.IcmpEchoReplyFor(frame.Payload, runtime.PeerMesh.VirtualIp);
@@ -1103,6 +1232,103 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
+    private async Task<bool> HandlePeerAppMessageAsync(
+        byte[] payload,
+        PeerMeshSession session,
+        string relayFrom,
+        TunnelRuntimeState runtime)
+    {
+        if (!PeerAppMessageCodec.LooksLike(payload))
+        {
+            return false;
+        }
+        if (!PeerAppMessageCodec.TryDecode(payload, out var message))
+        {
+            _logger.LogDebug("Peer Mesh app message decode failed: session={Session} peer={Peer}",
+                session.Id,
+                session.PeerId);
+            return true;
+        }
+
+        if (string.Equals(message.Type, PeerAppMessageCodec.TypeAck, StringComparison.OrdinalIgnoreCase))
+        {
+            CompletePeerMessageAck(message.Id);
+            return true;
+        }
+        if (!string.Equals(message.Type, PeerAppMessageCodec.TypeMessage, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (message.ToClientId != 0 && message.ToClientId != runtime.PeerMesh.ClientId)
+        {
+            return true;
+        }
+
+        _observer?.OnClientMessage(new ClientMessageSnapshot
+        {
+            Id = FirstNonEmpty(message.Id, Guid.NewGuid().ToString("N")),
+            Direction = "IN",
+            FromClientName = FirstNonEmpty(message.FromClientName, session.PeerName, session.PeerId.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            ToClientName = FirstNonEmpty(message.ToClientName, runtime.PeerMesh.ClientName),
+            Message = message.Message ?? "",
+            Transport = PeerTransport(session, relayFrom),
+            Status = "received",
+            CreatedAt = DateTimeOffset.Now,
+        });
+        await SendPeerClientMessageAckAsync(message, session, runtime).ConfigureAwait(false);
+        return true;
+    }
+
+    private void CompletePeerMessageAck(string? messageId)
+    {
+        if (string.IsNullOrWhiteSpace(messageId))
+        {
+            return;
+        }
+        PendingClientMessageAck? pending = null;
+        lock (_sync)
+        {
+            if (_pendingMessageAcks.Remove(messageId.Trim(), out var found))
+            {
+                pending = found;
+            }
+        }
+        pending?.Completion.TrySetResult(true);
+    }
+
+    private async Task SendPeerClientMessageAckAsync(
+        PeerAppMessage message,
+        PeerMeshSession session,
+        TunnelRuntimeState runtime)
+    {
+        if (string.IsNullOrWhiteSpace(message.Id))
+        {
+            return;
+        }
+        var ack = new PeerAppMessage
+        {
+            Type = PeerAppMessageCodec.TypeAck,
+            Id = message.Id,
+            FromClientId = runtime.PeerMesh.ClientId,
+            FromClientName = runtime.PeerMesh.ClientName,
+            ToClientId = session.PeerId,
+            ToClientName = FirstNonEmpty(message.FromClientName, session.PeerName),
+            CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        };
+        try
+        {
+            await SendEncryptedPayloadAsync(session.PeerId, PeerAppMessageCodec.Encode(ack))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is CryptographicException
+                                   or SocketException
+                                   or InvalidOperationException
+                                   or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Peer Mesh client message ack failed: peer={Peer}", session.PeerId);
+        }
+    }
+
     private void MergeRoster(IReadOnlyList<PeerMeshPeer>? peers)
     {
         if (peers is null)
@@ -1111,8 +1337,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         lock (_sync)
         {
-            // Roster 推送只带身份与在线状态；清空重建让被移出 roster 的 peer 立即消失，
-            // 同时保留仍在 roster 中 peer 已学到的 candidates，避免 probe 探测失效。
+            // Roster updates carry identity and online state; rebuild so removed peers disappear immediately
+            // while preserving learned candidates for peers that remain in the roster.
             var previous = new Dictionary<long, PeerMeshPeer>(_peers);
             _peers.Clear();
             foreach (var rawPeer in peers)
@@ -2509,7 +2735,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         return IsMeshBoundaryAddress(targetVirtualIp, runtime?.PeerMesh.Cidr);
     }
 
-    // 网段的 network / broadcast 地址不属于任何 peer；/31、/32 没有边界地址。
+    // Network and broadcast addresses do not belong to peers; /31 and /32 have no boundary addresses.
     private static bool IsMeshBoundaryAddress(string targetVirtualIp, string? cidr)
     {
         if (string.IsNullOrWhiteSpace(cidr))
@@ -2630,12 +2856,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         UdpClient? udp;
         IPeerVirtualDevice? device;
         NatPortMapping? portMapping;
+        List<PendingClientMessageAck> pendingMessageAcks;
         lock (_sync)
         {
             cts = _cts;
             udp = _udp;
             device = _device;
             portMapping = _portMapping;
+            pendingMessageAcks = [.. _pendingMessageAcks.Values];
             _cts = null;
             _udp = null;
             _device = null;
@@ -2652,6 +2880,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pendingStun.Clear();
             _srflxCandidates.Clear();
             _turnPermissions.Clear();
+            _pendingMessageAcks.Clear();
             _ignoredPacketLogAt.Clear();
             _srflx = null;
             _relay = null;
@@ -2663,6 +2892,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _lastRelayCandidateRequest = DateTimeOffset.MinValue;
             _lastAlternateProbeRequest = DateTimeOffset.MinValue;
             _keyMaterial = null;
+        }
+        foreach (var pending in pendingMessageAcks)
+        {
+            pending.Completion.TrySetResult(false);
         }
         if (cts is not null)
         {
@@ -2769,6 +3002,25 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? "";
     }
 
+    private string PeerTransportFor(long peerId)
+    {
+        lock (_sync)
+        {
+            return _sessions.TryGetValue(peerId, out var session)
+                ? PeerTransport(session, session.RelayTargetAllocationId ?? "")
+                : "peer";
+        }
+    }
+
+    private static string PeerTransport(PeerMeshSession session, string relayFrom)
+    {
+        return !string.IsNullOrWhiteSpace(relayFrom)
+               || !string.IsNullOrWhiteSpace(session.RelayTargetAllocationId)
+               || string.Equals(session.PathType, "RELAY", StringComparison.OrdinalIgnoreCase)
+            ? "peer-relay"
+            : "peer-direct";
+    }
+
     private static string NormalizeConfigValue(string? value) => value?.Trim() ?? "";
 
     private static long SmoothRtt(long previous, long sample)
@@ -2790,6 +3042,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private sealed record PendingStunBinding(string Role, DateTimeOffset SentAt);
 
     private sealed record PendingVirtualPacket(byte[] Packet, DateTimeOffset CreatedAt);
+
+    private sealed record PendingClientMessageAck(TaskCompletionSource<bool> Completion, DateTimeOffset CreatedAt);
+
+    internal sealed record PeerClientMessageSendResult(string MessageId, string Transport);
 
     private sealed class PeerMeshSession
     {

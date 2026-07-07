@@ -1736,6 +1736,11 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private void handlePlainPacket(PeerDataFrame frame) {
+        if (PeerAppMessageCodec.looksLike(frame.plaintext())) {
+            handlePeerAppMessage(frame);
+            return;
+        }
+
         PeerVirtualDevice device = virtualDevice;
         if (device != null && !(device instanceof NoopPeerVirtualDevice)) {
             try {
@@ -1759,6 +1764,54 @@ public class PeerMeshClient implements AutoCloseable {
         if (device != null) {
             device.writePacket(frame.plaintext());
         }
+    }
+
+    private void handlePeerAppMessage(PeerDataFrame frame) {
+        PeerAppMessageCodec.PeerAppMessage message = PeerAppMessageCodec.decode(frame.plaintext());
+        if (message == null) {
+            log.debug("Peer mesh app message decode failed: session={}, from={}",
+                    frame.sessionId(), frame.fromClientId());
+            return;
+        }
+        if (PeerAppMessageCodec.TYPE_ACK.equalsIgnoreCase(message.getType())) {
+            return;
+        }
+        if (!PeerAppMessageCodec.TYPE_MESSAGE.equalsIgnoreCase(message.getType())) {
+            return;
+        }
+        ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
+        if (currentConfig != null
+                && message.getToClientId() != 0
+                && message.getToClientId() != currentConfig.getClientId()) {
+            return;
+        }
+
+        String fromName = StringUtils.hasText(message.getFromClientName())
+                ? message.getFromClientName()
+                : String.valueOf(frame.fromClientId());
+        log.info("Peer message from {}: {}", fromName, message.getMessage());
+        sendPeerAppMessageAck(frame, message);
+    }
+
+    private void sendPeerAppMessageAck(PeerDataFrame frame, PeerAppMessageCodec.PeerAppMessage message) {
+        ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
+        if (currentConfig == null || !StringUtils.hasText(message.getId())) {
+            return;
+        }
+        PeerInfo peer = peers.get(frame.fromClientId());
+        if (peer == null || !StringUtils.hasText(peer.virtualIp())) {
+            return;
+        }
+
+        PeerAppMessageCodec.PeerAppMessage ack = new PeerAppMessageCodec.PeerAppMessage();
+        ack.setType(PeerAppMessageCodec.TYPE_ACK);
+        ack.setId(message.getId());
+        ack.setFromClientId(currentConfig.getClientId());
+        ack.setFromClientName(currentConfig.getClientName());
+        ack.setToClientId(frame.fromClientId());
+        ack.setToClientName(StringUtils.hasText(message.getFromClientName()) ? message.getFromClientName() : peer.clientName());
+        ack.setCreatedAtMillis(System.currentTimeMillis());
+        sendEncryptedPayload(peer.virtualIp(), PeerAppMessageCodec.encode(ack), false);
     }
 
     private void replyUdpProbe(PeerUdpProbe probe, InetSocketAddress observedRemote, String relayFromAllocationId) {

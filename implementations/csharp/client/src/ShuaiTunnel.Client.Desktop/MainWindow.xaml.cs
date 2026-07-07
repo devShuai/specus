@@ -45,6 +45,7 @@ public partial class MainWindow : Window
     private bool _stopping;
     private bool _closing;
     private bool _logExpanded;
+    private bool _clientLoggedIn;
 
     public ObservableCollection<TcpRouteSnapshot> TcpRoutes { get; } = new();
 
@@ -53,6 +54,8 @@ public partial class MainWindow : Window
     public ObservableCollection<PeerRouteSnapshot> PeerRoutes { get; } = new();
 
     public ObservableCollection<PeerSessionSnapshot> PeerSessions { get; } = new();
+
+    public ObservableCollection<ClientMessageLine> ClientMessages { get; } = new();
 
     public ObservableCollection<LogLine> Logs { get; } = new();
 
@@ -130,6 +133,51 @@ public partial class MainWindow : Window
         else
         {
             ExpandLogPanel();
+        }
+    }
+
+    private async void SendMessageButton_Click(object sender, RoutedEventArgs e)
+    {
+        var client = _client;
+        if (client is null)
+        {
+            return;
+        }
+        var target = ResolveMessageTarget();
+        var body = MessageBodyBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(target) || string.IsNullOrWhiteSpace(body))
+        {
+            MessageBox.Show(this, "目标客户端和消息内容不能为空。", "发送消息", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        SendMessageButton.IsEnabled = false;
+        try
+        {
+            var result = await client.SendClientMessageAsync(
+                target,
+                body,
+                _clientCts?.Token ?? CancellationToken.None);
+            MessageBodyBox.Clear();
+            AppendLog(LogLevel.Information, "desktop",
+                $"消息已提交: {target}, channel={result.Transport}", null);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException)
+        {
+            AppendLog(LogLevel.Warning, "desktop", $"消息发送失败: {ex.Message}", null);
+            MessageBox.Show(this, ex.Message, "发送消息失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        catch (Exception ex)
+        {
+            AppendLog(LogLevel.Error, "desktop", "消息发送异常", ex);
+            MessageBox.Show(this, ex.Message, "发送消息失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            UpdateMessageSendState();
         }
     }
 
@@ -235,6 +283,7 @@ public partial class MainWindow : Window
         _client = new TunnelControlClient(config, auth, forwarder, _loggerFactory, _observer);
         _running = true;
         _stopping = false;
+        await Dispatcher.InvokeAsync(UpdateMessageSendState);
 
         var cancellationToken = _clientCts.Token;
         _clientTask = Task.Run(async () =>
@@ -605,6 +654,8 @@ public partial class MainWindow : Window
         RuntimeSummaryText.Text = snapshot.ClientName is null
             ? "连接后显示客户端、控制端和 Peer Mesh 信息"
             : $"{snapshot.ClientName} · {snapshot.TunnelEndpoint} · Peer Mesh {(snapshot.PeerMeshEnabled ? "启用" : "关闭")} · {snapshot.VirtualIp ?? "-"}";
+        _clientLoggedIn = snapshot.LoggedIn;
+        UpdateMessageSendState();
     }
 
     private void ApplyRoutes(TunnelClientRoutesSnapshot snapshot)
@@ -627,6 +678,35 @@ public partial class MainWindow : Window
         UpdatePeerMeshStatusBrush();
     }
 
+    private void ApplyClientMessage(ClientMessageSnapshot snapshot)
+    {
+        ClientMessages.Add(ClientMessageLine.FromSnapshot(snapshot));
+        while (ClientMessages.Count > 300)
+        {
+            ClientMessages.RemoveAt(0);
+        }
+    }
+
+    private string ResolveMessageTarget()
+    {
+        var text = MessageTargetBox.Text.Trim();
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            return text;
+        }
+        if (MessageTargetBox.SelectedItem is PeerRouteSnapshot selectedPeer
+            && !string.IsNullOrWhiteSpace(selectedPeer.ClientName))
+        {
+            return selectedPeer.ClientName.Trim();
+        }
+        return "";
+    }
+
+    private void UpdateMessageSendState()
+    {
+        SendMessageButton.IsEnabled = _running && !_stopping && _clientLoggedIn;
+    }
+
     private void UpdatePeerMeshStatusBrush()
     {
         PeerMeshStatusDot.Background = (Brush)FindResource(_peerMeshEnabled ? "SuccessBrush" : "TextMutedBrush");
@@ -647,12 +727,15 @@ public partial class MainWindow : Window
         HttpRoutes.Clear();
         PeerRoutes.Clear();
         PeerSessions.Clear();
+        ClientMessages.Clear();
         TcpCountText.Text = "0";
         HttpCountText.Text = "0";
         PeerCountText.Text = "0";
         _peerMeshEnabled = false;
+        _clientLoggedIn = false;
         PeerMeshSummaryText.Text = "Peer Mesh 未启动";
         UpdatePeerMeshStatusBrush();
+        UpdateMessageSendState();
     }
 
     private void UpdateStoppedUi(string phase, string detail)
@@ -663,8 +746,10 @@ public partial class MainWindow : Window
         UpdateStatusText(phase, detail);
         RuntimeSummaryText.Text = "连接后显示客户端、控制端和 Peer Mesh 信息";
         _peerMeshEnabled = false;
+        _clientLoggedIn = false;
         PeerMeshSummaryText.Text = "Peer Mesh 未启动";
         UpdatePeerMeshStatusBrush();
+        UpdateMessageSendState();
     }
 
     private void UpdateStatusText(string phase, string detail)
@@ -683,6 +768,7 @@ public partial class MainWindow : Window
         MtuBox.IsEnabled = enabled;
         SaveButton.IsEnabled = enabled;
         ConnectButton.IsEnabled = true;
+        UpdateMessageSendState();
     }
 
     private void AppendLog(LogLevel level, string category, string message, Exception? exception)
@@ -803,6 +889,11 @@ public partial class MainWindow : Window
         {
             _window.Dispatcher.BeginInvoke(new Action(() => _window.ApplyPeerMesh(snapshot)));
         }
+
+        public void OnClientMessage(ClientMessageSnapshot snapshot)
+        {
+            _window.Dispatcher.BeginInvoke(new Action(() => _window.ApplyClientMessage(snapshot)));
+        }
     }
 
     private sealed class UiLoggerProvider : ILoggerProvider
@@ -896,3 +987,54 @@ public partial class MainWindow : Window
 }
 
 public sealed record LogLine(string Text);
+
+public sealed class ClientMessageLine
+{
+    public string CreatedAtText { get; init; } = "";
+
+    public string DirectionText { get; init; } = "";
+
+    public string Peer { get; init; } = "";
+
+    public string TransportText { get; init; } = "";
+
+    public string StatusText { get; init; } = "";
+
+    public string Message { get; init; } = "";
+
+    public static ClientMessageLine FromSnapshot(ClientMessageSnapshot snapshot)
+    {
+        var outbound = string.Equals(snapshot.Direction, "OUT", StringComparison.OrdinalIgnoreCase);
+        return new ClientMessageLine
+        {
+            CreatedAtText = snapshot.CreatedAt.LocalDateTime.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+            DirectionText = outbound ? "发送" : "接收",
+            Peer = outbound ? snapshot.ToClientName : snapshot.FromClientName,
+            TransportText = MapTransportText(snapshot.Transport),
+            StatusText = MapStatusText(snapshot.Status),
+            Message = snapshot.Message,
+        };
+    }
+
+    private static string MapTransportText(string transport)
+    {
+        return transport switch
+        {
+            "peer-direct" => "Peer 直连",
+            "peer-relay" => "Peer 中继",
+            "server" => "服务端",
+            _ => transport,
+        };
+    }
+
+    private static string MapStatusText(string status)
+    {
+        return status switch
+        {
+            "sent" => "已发送",
+            "submitted" => "已提交",
+            "received" => "已接收",
+            _ => status,
+        };
+    }
+}
