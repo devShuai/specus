@@ -68,7 +68,9 @@ public class SecurityConfig {
                  *     额外放行 GA 初始化的内联脚本 sha256 hash（同时保留在 /gtag-init.js 作 fallback）。
                  *     如果修改 index.html 中的内联 gtag 片段，需要重算 sha256 并同步这里。
                  * - style-src 'self' 'unsafe-inline':HeroUI/framer-motion 会写内联 style 属性
-                 * - img-src / font-src 允许 data:;额外允许 GA pixel beacon 域
+                 * - img-src 允许 blob:/data: 供直连文件预览与内联图片;额外允许 GA pixel beacon 域
+                 * - media-src 允许 blob:/data: 供直连视频/音频预览
+                 * - font-src 允许 data:
                  * - connect-src 允许 ws:/wss: 供 /ws/connections,以及 GA4 /g/collect 上报域
                  * - form-action 'self' 阻止跨站表单提交;frame-ancestors 'none' 防 clickjacking
                  *
@@ -80,7 +82,8 @@ public class SecurityConfig {
                                 "default-src 'self'; "
                                 + "script-src 'self' https://www.googletagmanager.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE='; "
                                 + "style-src 'self' 'unsafe-inline'; "
-                                + "img-src 'self' data: https://www.google-analytics.com https://*.googletagmanager.com; "
+                                + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com; "
+                                + "media-src 'self' blob: data:; "
                                 + "font-src 'self' data:; "
                                 + "connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com; "
                                 + "form-action 'self'; "
