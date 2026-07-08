@@ -39,6 +39,7 @@ interface IncomingAttachment {
   downloadExpiresAt: string | null;
   direct?: boolean;
   previewUrl?: string;
+  blob?: Blob;
   downloading?: boolean;
   downloadProgress?: number;
   downloadError?: string | null;
@@ -84,7 +85,6 @@ export function PublicTransferPage() {
 }
 
 function PublicTransferPageContent() {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const discoverySocketRef = useRef<WebSocket | null>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
@@ -688,6 +688,7 @@ function PublicTransferPageContent() {
         downloadExpiresAt: null,
         direct: true,
         previewUrl,
+        blob,
       },
       ...items,
     ].slice(0, 20));
@@ -738,11 +739,15 @@ function PublicTransferPageContent() {
       return;
     }
     try {
-      const response = record.direct
-        ? { downloadUrl: record.previewUrl, downloadHeaders: {}, expiresAt: record.downloadExpiresAt ?? "" }
-        : record.downloadUrl
-          ? { downloadUrl: record.downloadUrl, downloadHeaders: {}, expiresAt: record.downloadExpiresAt ?? "" }
-          : await publicPresignAttachmentDownload(record.attachment.attachmentId, { roomToken });
+      if (record.direct) {
+        downloadBlob(record.file, record.attachment.fileName);
+        setNotice(`已保存：${record.attachment.fileName}`);
+        setError(null);
+        return;
+      }
+      const response = record.downloadUrl
+        ? { downloadUrl: record.downloadUrl, downloadHeaders: {}, expiresAt: record.downloadExpiresAt ?? "" }
+        : await publicPresignAttachmentDownload(record.attachment.attachmentId, { roomToken });
       if (!record.downloadUrl && !record.direct && "attachment" in response) {
         setRecord({
           ...record,
@@ -762,11 +767,22 @@ function PublicTransferPageContent() {
     const key = incomingItemKey(item);
     try {
       setIncomingDownloadState(key, { downloading: true, downloadProgress: 0, downloadError: null });
-      const response = item.direct
-        ? { downloadUrl: item.downloadUrl || item.previewUrl || "", downloadHeaders: {}, expiresAt: item.downloadExpiresAt ?? "" }
-        : item.downloadUrl
-          ? { downloadUrl: item.downloadUrl, downloadHeaders: {}, expiresAt: item.downloadExpiresAt ?? "" }
-          : await publicPresignAttachmentDownload(item.attachment.attachmentId, { roomToken });
+      if (item.direct) {
+        if (item.blob) {
+          downloadBlob(item.blob, item.attachment.fileName);
+        } else if (item.downloadUrl || item.previewUrl) {
+          triggerUrlDownload(item.downloadUrl || item.previewUrl || "", item.attachment.fileName);
+        } else {
+          throw new Error("直连文件缓存不可用");
+        }
+        setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
+        setNotice(`已保存：${item.attachment.fileName}`);
+        setError(null);
+        return;
+      }
+      const response = item.downloadUrl
+        ? { downloadUrl: item.downloadUrl, downloadHeaders: {}, expiresAt: item.downloadExpiresAt ?? "" }
+        : await publicPresignAttachmentDownload(item.attachment.attachmentId, { roomToken });
       if (!response.downloadUrl) {
         throw new Error("下载地址不可用");
       }
@@ -906,9 +922,12 @@ function PublicTransferPageContent() {
 
           <div className="mt-5 rounded-lg border border-dashed border-zinc-300 bg-white/60 p-4 dark:border-white/15 dark:bg-white/[0.03]">
             <input
-              ref={fileInputRef}
+              id="public-transfer-file-input"
               type="file"
-              className="hidden"
+              className="sr-only"
+              onClick={(event) => {
+                event.currentTarget.value = "";
+              }}
               onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
             />
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -921,9 +940,12 @@ function PublicTransferPageContent() {
                 </div>
               </div>
               <div className="flex shrink-0 gap-2">
-                <Button radius="sm" variant="flat" onPress={() => fileInputRef.current?.click()}>
+                <label
+                  htmlFor="public-transfer-file-input"
+                  className="inline-flex h-10 min-w-20 cursor-pointer items-center justify-center rounded-small bg-default-100 px-4 text-small font-normal text-foreground transition-colors hover:bg-default-200"
+                >
                   选择文件
-                </Button>
+                </label>
                 <Button color="primary" radius="sm" isLoading={state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
                   发送
                 </Button>
@@ -1371,6 +1393,11 @@ async function saveUrlAs(
 
 function downloadBlob(blob: Blob, fileName: string) {
   const url = URL.createObjectURL(blob);
+  triggerUrlDownload(url, fileName);
+  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function triggerUrlDownload(url: string, fileName: string) {
   const link = document.createElement("a");
   link.href = url;
   link.download = normalizeDownloadName(fileName);
@@ -1378,7 +1405,6 @@ function downloadBlob(blob: Blob, fileName: string) {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
 function normalizeDownloadName(fileName: string) {
