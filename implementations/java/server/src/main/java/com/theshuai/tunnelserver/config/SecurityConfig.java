@@ -70,6 +70,7 @@ public class SecurityConfig {
                  * - style-src 'self' 'unsafe-inline':HeroUI/framer-motion 会写内联 style 属性
                  * - img-src 允许 blob:/data: 供直连文件预览与内联图片;额外允许 GA pixel beacon 域
                  * - media-src 允许 blob:/data: 供直连视频/音频预览
+                 * - object-src / frame-src 允许 blob: 供 PDF 预览
                  * - font-src 允许 data:
                  * - connect-src 允许 ws:/wss: 供 /ws/connections,以及 GA4 /g/collect 上报域
                  * - form-action 'self' 阻止跨站表单提交;frame-ancestors 'none' 防 clickjacking
@@ -84,6 +85,8 @@ public class SecurityConfig {
                                 + "style-src 'self' 'unsafe-inline'; "
                                 + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com; "
                                 + "media-src 'self' blob: data:; "
+                                + "object-src 'self' blob:; "
+                                + "frame-src 'self' blob:; "
                                 + "font-src 'self' data:; "
                                 + "connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com; "
                                 + "form-action 'self'; "

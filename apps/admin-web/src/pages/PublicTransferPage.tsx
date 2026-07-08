@@ -96,7 +96,7 @@ function PublicTransferPageContent() {
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
   const [sharedDiscoveryEnabled, setSharedDiscoveryEnabled] = useState(() => Boolean(readInitialRoomToken()));
-  const [qrVisible, setQrVisible] = useState(() => Boolean(readInitialRoomToken()));
+  const [qrVisible, setQrVisible] = useState(false);
   const [sharedAttachmentId] = useState(() => readInitialSharedAttachmentId());
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedPeerId, setSelectedPeerId] = useState("");
@@ -1016,6 +1016,13 @@ function PublicTransferPageContent() {
             </div>
           )}
 
+          <IncomingFilesPanel
+            receivingTransfers={receivingTransfers}
+            incoming={incoming}
+            onShare={shareIncomingFile}
+            onDownload={downloadIncoming}
+          />
+
           {record && (
             <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
               <div className="rounded-lg border border-black/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/[0.03]">
@@ -1108,67 +1115,6 @@ function PublicTransferPageContent() {
             ))}
           </div>
 
-          <h2 className="mt-6 text-lg font-semibold">收到的附件</h2>
-          {receivingTransfers.length > 0 && (
-            <div className="mt-3 flex flex-col gap-2">
-              {receivingTransfers.map((item) => {
-                const percent = transferProgress(item.receivedBytes, item.sizeBytes);
-                return (
-                  <div key={receivingTransferKey(item)} className="rounded-lg border border-cyan-400/30 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10">
-                    <div className="truncate text-small font-medium text-cyan-950 dark:text-cyan-100">{item.fileName}</div>
-                    <div className="mt-1 text-tiny text-cyan-800/75 dark:text-cyan-100/70">
-                      来自 {item.sourcePeerId} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}
-                    </div>
-                    <Progress className="mt-2" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          <div className="mt-3 flex flex-col gap-2">
-            {incoming.length === 0 ? (
-              <div className="rounded-lg border border-black/10 bg-white/60 p-3 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400">
-                暂无附件消息。
-              </div>
-            ) : incoming.map((item) => (
-              <div key={incomingItemKey(item)} className="rounded-lg border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.03]">
-                <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
-                <div className="mt-1 text-tiny text-zinc-500">
-                  来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
-                </div>
-                {(item.previewUrl || item.direct) && (
-                  <FilePreview
-                    fileName={item.attachment.fileName}
-                    mimeType={item.attachment.mimeType}
-                    url={item.previewUrl}
-                    compact
-                  />
-                )}
-                <div className="mt-2 flex gap-2">
-                  <Button size="sm" radius="sm" variant="flat" onPress={() => void shareIncomingFile(item)}>
-                    分享
-                  </Button>
-                  <Button
-                    size="sm"
-                    radius="sm"
-                    color="success"
-                    variant={item.downloadUrl || item.direct ? "solid" : "flat"}
-                    isLoading={item.downloading}
-                    onPress={() => void downloadIncoming(item)}
-                  >
-                    {item.direct ? "保存" : "下载"}
-                  </Button>
-                </div>
-                {item.downloading && (
-                  <Progress className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} color="success" size="sm" value={item.downloadProgress ?? 0} />
-                )}
-                {item.downloadError && (
-                  <div className="mt-2 text-tiny text-rose-600 dark:text-rose-200">{item.downloadError}</div>
-                )}
-              </div>
-            ))}
-          </div>
-
           <h2 className="mt-6 text-lg font-semibold">当前传输配置</h2>
           <dl className="mt-4 flex flex-col gap-3 text-small">
             <InfoRow label="ICE servers" value={String(iceConfig?.iceServers.length ?? 0)} />
@@ -1184,12 +1130,106 @@ function PublicTransferPageContent() {
   );
 }
 
+function IncomingFilesPanel({
+  receivingTransfers,
+  incoming,
+  onShare,
+  onDownload,
+}: {
+  receivingTransfers: ReceivingTransfer[];
+  incoming: IncomingAttachment[];
+  onShare: (item: IncomingAttachment) => Promise<void>;
+  onDownload: (item: IncomingAttachment) => Promise<void>;
+}) {
+  const hasReceiving = receivingTransfers.length > 0;
+  const hasIncoming = incoming.length > 0;
+
+  return (
+    <section className="mt-5 rounded-lg border border-black/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/[0.03]">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-base font-semibold text-zinc-950 dark:text-white">收到的文件</h2>
+          <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
+            接收进度、预览和保存入口会显示在这里。
+          </div>
+        </div>
+        <Chip size="sm" radius="sm" variant="flat" color={hasIncoming || hasReceiving ? "primary" : "default"}>
+          {incoming.length + receivingTransfers.length} 项
+        </Chip>
+      </div>
+
+      {hasReceiving && (
+        <div className="mt-3 grid gap-2 md:grid-cols-2">
+          {receivingTransfers.map((item) => {
+            const percent = transferProgress(item.receivedBytes, item.sizeBytes);
+            return (
+              <div key={receivingTransferKey(item)} className="rounded-lg border border-cyan-400/30 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10">
+                <div className="truncate text-small font-medium text-cyan-950 dark:text-cyan-100">{item.fileName}</div>
+                <div className="mt-1 text-tiny text-cyan-800/75 dark:text-cyan-100/70">
+                  来自 {item.sourcePeerId} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}
+                </div>
+                <Progress className="mt-2" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="mt-3 grid gap-3 md:grid-cols-2">
+        {!hasIncoming ? (
+          <div className="rounded-lg border border-dashed border-black/10 bg-white/60 p-4 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400 md:col-span-2">
+            暂无附件消息。对方发送文件后会出现在这里。
+          </div>
+        ) : incoming.map((item) => (
+          <div key={incomingItemKey(item)} className="rounded-lg border border-black/10 bg-white/70 p-3 dark:border-white/10 dark:bg-white/[0.04]">
+            <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
+            <div className="mt-1 text-tiny text-zinc-500">
+              来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
+            </div>
+            {(item.previewUrl || item.direct) && (
+              <FilePreview
+                fileName={item.attachment.fileName}
+                mimeType={item.attachment.mimeType}
+                url={item.previewUrl}
+                blob={item.blob}
+                compact
+              />
+            )}
+            <div className="mt-2 flex gap-2">
+              <Button size="sm" radius="sm" variant="flat" onPress={() => void onShare(item)}>
+                分享
+              </Button>
+              <Button
+                size="sm"
+                radius="sm"
+                color="success"
+                variant={item.downloadUrl || item.direct ? "solid" : "flat"}
+                isLoading={item.downloading}
+                onPress={() => void onDownload(item)}
+              >
+                {item.direct ? "保存" : "下载"}
+              </Button>
+            </div>
+            {item.downloading && (
+              <Progress className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} color="success" size="sm" value={item.downloadProgress ?? 0} />
+            )}
+            {item.downloadError && (
+              <div className="mt-2 text-tiny text-rose-600 dark:text-rose-200">{item.downloadError}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function Preview({ record }: { record: UploadRecord }) {
   return (
     <FilePreview
       fileName={record.attachment.fileName}
       mimeType={record.attachment.mimeType}
       url={record.previewUrl}
+      blob={record.file}
     />
   );
 }
@@ -1198,11 +1238,13 @@ function FilePreview({
   fileName,
   mimeType,
   url,
+  blob,
   compact = false,
 }: {
   fileName: string;
   mimeType?: string | null;
   url?: string | null;
+  blob?: Blob | null;
   compact?: boolean;
 }) {
   const kind = mediaKind(fileName, mimeType);
@@ -1216,6 +1258,9 @@ function FilePreview({
   const mediaClass = compact
     ? "max-h-44 w-full object-contain"
     : "h-64 w-full object-contain";
+  const documentClass = compact
+    ? "h-44 w-full"
+    : "h-80 w-full";
   const fallbackClass = compact
     ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded border border-black/10 bg-white/60 p-3 text-center dark:border-white/10 dark:bg-white/[0.03]"
     : "flex h-64 flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]";
@@ -1243,11 +1288,71 @@ function FilePreview({
       </div>
     );
   }
+  if (url && kind === "pdf" && !previewFailed) {
+    return (
+      <div className={`${frameClass} bg-white`}>
+        <object data={url} type="application/pdf" className={documentClass} onError={() => setPreviewFailed(true)}>
+          <div className="flex h-full items-center justify-center p-3 text-small text-zinc-500">PDF 预览不可用</div>
+        </object>
+      </div>
+    );
+  }
+  if (kind === "text" && blob) {
+    return <TextFilePreview fileName={fileName} mimeType={mimeType} blob={blob} compact={compact} />;
+  }
   return (
     <div className={fallbackClass}>
-      <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>FILE</div>
+      <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
       <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
       <div className="mt-1 text-tiny text-zinc-500">{effectiveMimeType(fileName, mimeType)}</div>
+    </div>
+  );
+}
+
+function TextFilePreview({
+  fileName,
+  mimeType,
+  blob,
+  compact,
+}: {
+  fileName: string;
+  mimeType?: string | null;
+  blob: Blob;
+  compact: boolean;
+}) {
+  const [text, setText] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const maxPreviewBytes = 96 * 1024;
+    void blob.slice(0, maxPreviewBytes).text()
+      .then((value) => {
+        if (active) {
+          setText(value);
+          setError(null);
+        }
+      })
+      .catch((err) => {
+        if (active) {
+          setText("");
+          setError(err instanceof Error ? err.message : "文本预览失败");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [blob]);
+
+  return (
+    <div className={`${compact ? "mt-2" : ""} overflow-hidden rounded border border-black/10 bg-zinc-950 text-zinc-100 dark:border-white/10`}>
+      <div className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
+        <span className="min-w-0 truncate text-tiny font-medium">{fileName}</span>
+        <span className="shrink-0 text-[10px] uppercase text-zinc-400">{shortMimeLabel(effectiveMimeType(fileName, mimeType))}</span>
+      </div>
+      <pre className={`${compact ? "max-h-44" : "h-80"} overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5`}>
+        {error || text || "正在读取预览..."}
+      </pre>
     </div>
   );
 }
@@ -1423,11 +1528,18 @@ function directAttachment(transferId: string, fileName: string, mimeType: string
   };
 }
 
-type MediaKind = "image" | "video" | "audio" | "file";
+type MediaKind = "image" | "video" | "audio" | "pdf" | "text" | "document" | "archive" | "file";
 
 const IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "svg", "webp"]);
 const VIDEO_EXTENSIONS = new Set(["3gp", "avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ogv", "webm"]);
 const AUDIO_EXTENSIONS = new Set(["aac", "flac", "m4a", "mp3", "oga", "ogg", "opus", "wav", "weba"]);
+const TEXT_EXTENSIONS = new Set([
+  "c", "conf", "config", "cpp", "cs", "css", "csv", "env", "go", "h", "html", "ini", "java", "js", "json",
+  "jsx", "log", "md", "mjs", "properties", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt",
+  "xml", "yaml", "yml",
+]);
+const DOCUMENT_EXTENSIONS = new Set(["doc", "docx", "key", "numbers", "odp", "ods", "odt", "pages", "ppt", "pptx", "rtf", "xls", "xlsx"]);
+const ARCHIVE_EXTENSIONS = new Set(["7z", "bz2", "gz", "rar", "tar", "tgz", "xz", "zip"]);
 
 function effectiveMimeType(fileName: string, mimeType?: string | null) {
   const normalized = mimeType?.trim().toLowerCase();
@@ -1491,7 +1603,42 @@ function effectiveMimeType(fileName: string, mimeType?: string | null) {
       return "audio/wav";
     case "weba":
       return "audio/webm";
+    case "pdf":
+      return "application/pdf";
+    case "csv":
+      return "text/csv";
+    case "html":
+      return "text/html";
+    case "json":
+      return "application/json";
+    case "log":
+    case "txt":
+      return "text/plain";
+    case "md":
+      return "text/markdown";
+    case "xml":
+      return "application/xml";
+    case "yaml":
+    case "yml":
+      return "application/yaml";
+    case "doc":
+      return "application/msword";
+    case "docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case "ppt":
+      return "application/vnd.ms-powerpoint";
+    case "pptx":
+      return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    case "xls":
+      return "application/vnd.ms-excel";
+    case "xlsx":
+      return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    case "zip":
+      return "application/zip";
     default:
+      if (TEXT_EXTENSIONS.has(ext)) {
+        return "text/plain";
+      }
       return normalized || "application/octet-stream";
   }
 }
@@ -1507,6 +1654,17 @@ function mediaKind(fileName: string, mimeType?: string | null): MediaKind {
   if (type.startsWith("audio/")) {
     return "audio";
   }
+  if (type === "application/pdf") {
+    return "pdf";
+  }
+  if (type.startsWith("text/")
+    || type === "application/json"
+    || type === "application/xml"
+    || type === "application/yaml"
+    || type.endsWith("+json")
+    || type.endsWith("+xml")) {
+    return "text";
+  }
   const ext = fileExtension(fileName);
   if (IMAGE_EXTENSIONS.has(ext)) {
     return "image";
@@ -1517,7 +1675,45 @@ function mediaKind(fileName: string, mimeType?: string | null): MediaKind {
   if (AUDIO_EXTENSIONS.has(ext)) {
     return "audio";
   }
+  if (ext === "pdf") {
+    return "pdf";
+  }
+  if (TEXT_EXTENSIONS.has(ext)) {
+    return "text";
+  }
+  if (DOCUMENT_EXTENSIONS.has(ext)) {
+    return "document";
+  }
+  if (ARCHIVE_EXTENSIONS.has(ext)) {
+    return "archive";
+  }
   return "file";
+}
+
+function previewKindLabel(kind: MediaKind) {
+  switch (kind) {
+    case "image":
+      return "IMAGE";
+    case "video":
+      return "VIDEO";
+    case "audio":
+      return "AUDIO";
+    case "pdf":
+      return "PDF";
+    case "text":
+      return "TEXT";
+    case "document":
+      return "DOC";
+    case "archive":
+      return "ZIP";
+    default:
+      return "FILE";
+  }
+}
+
+function shortMimeLabel(mimeType: string) {
+  const normalized = mimeType.replace(/^application\//, "").replace(/^text\//, "");
+  return normalized.length > 24 ? `${normalized.slice(0, 21)}...` : normalized;
 }
 
 function fileExtension(fileName: string) {
