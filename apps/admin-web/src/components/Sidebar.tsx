@@ -30,6 +30,7 @@ function Icon(k: string) {
     case "overview": return <svg className={C} {...A} viewBox="0 0 24 24"><rect height="7" rx="1" width="7" x="3" y="3"/><rect height="7" rx="1" width="7" x="14" y="3"/><rect height="7" rx="1" width="7" x="3" y="14"/><rect height="7" rx="1" width="7" x="14" y="14"/></svg>;
     case "clients": return <svg className={C} {...A} viewBox="0 0 24 24"><rect height="13" rx="2" width="18" x="3" y="3"/><line x1="12" x2="12" y1="16" y2="20"/><line x1="8" x2="16" y1="20" y2="20"/></svg>;
     case "messages": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 016.5 3h11A2.5 2.5 0 0120 5.5v7A2.5 2.5 0 0117.5 15H10l-4 4v-4.2A2.5 2.5 0 014 12.5z"/><path d="M8 8h8M8 11h5"/></svg>;
+    case "transfer": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M4 7.5A2.5 2.5 0 016.5 5h3l2 2h6A2.5 2.5 0 0120 9.5v7A2.5 2.5 0 0117.5 19h-11A2.5 2.5 0 014 16.5z"/><path d="M12 10v5"/><path d="M9.5 12.5 12 10l2.5 2.5"/></svg>;
     case "tunnels": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M7 7h10M7 10v7a2 2 0 002 2h6a2 2 0 002-2v-7M12 3v7M16 17v3a1 1 0 01-1 1h-6a1 1 0 01-1-1v-3"/></svg>;
     case "http-routes": return <svg className={C} {...A} viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><line x1="3" x2="21" y1="12" y2="12"/></svg>;
     case "downloads": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M12 3v12"/><polyline points="8,11 12,15 16,11"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>;

@@ -14,11 +14,12 @@ const LazyPublicTransferPage = lazy(() =>
 
 function readPublicRoute() {
   const hash = window.location.hash.replace(/^#\/?/, "").split(/[/?#]/, 1)[0];
+  const path = window.location.pathname.replace(/^\/+/, "").split(/[/?#]/, 1)[0];
   const queryPanel = new URLSearchParams(window.location.search).get("panel");
-  if (hash === "nat-detect" || queryPanel === "nat-detect") {
+  if (hash === "nat-detect" || path === "nat-detect" || queryPanel === "nat-detect") {
     return "nat-detect";
   }
-  if (hash === "transfer" || queryPanel === "transfer") {
+  if (hash === "transfer" || path === "transfer" || queryPanel === "transfer") {
     return "transfer";
   }
   return null;

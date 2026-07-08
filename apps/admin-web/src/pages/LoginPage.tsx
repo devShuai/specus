@@ -148,6 +148,9 @@ function LoginPageContent() {
           <AppLogo label="shuai-tunnel" subtitle="内网服务接入控制面" />
           <div className="flex items-center gap-2">
             <LandingThemeToggleButton />
+            <a href="#/transfer" className="landing-ghost-button">
+              文件互传
+            </a>
             <a href="#/nat-detect" className="landing-ghost-button">
               NAT 检测
             </a>
