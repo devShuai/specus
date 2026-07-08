@@ -68,6 +68,21 @@ public class ClientSession {
     @Column(name = "local_addresses", length = 2000)
     private String localAddresses;
 
+    @Column(name = "message_send_capable", nullable = false)
+    private boolean messageSendCapable;
+
+    @Column(name = "message_receive_capable", nullable = false)
+    private boolean messageReceiveCapable;
+
+    @Column(name = "message_attachments_capable", nullable = false)
+    private boolean messageAttachmentsCapable;
+
+    @Column(name = "message_media_preview_capable", nullable = false)
+    private boolean messageMediaPreviewCapable;
+
+    @Column(name = "message_max_attachment_bytes", nullable = false)
+    private long messageMaxAttachmentBytes;
+
     @Column(name = "http_login_at", nullable = false, length = 40)
     private String httpLoginAt;
 

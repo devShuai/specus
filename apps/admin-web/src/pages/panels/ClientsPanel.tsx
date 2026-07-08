@@ -166,6 +166,20 @@ export function ClientsPanel() {
     return tooltip ? <Tooltip content={tooltip}>{chip}</Tooltip> : chip;
   };
 
+  const messageCapabilityChip = (client: Client) => (
+    <Tooltip
+      content={
+        client.messageReceiveCapable
+          ? `附件 ${client.messageAttachmentsCapable ? "支持" : "不支持"} · 预览 ${client.messageMediaPreviewCapable ? "支持" : "不支持"}`
+          : "该客户端未上报消息能力"
+      }
+    >
+      <Chip size="sm" color={client.messageReceiveCapable ? "success" : "default"} variant="flat">
+        {client.messageReceiveCapable ? "可聊天" : "不可聊天"}
+      </Chip>
+    </Tooltip>
+  );
+
   return (
     <div className="mt-3 flex min-w-0 flex-col gap-5">
       <section className="min-w-0 space-y-3">
@@ -290,6 +304,7 @@ export function ClientsPanel() {
                   badges={statusChip(client)}
                   fields={[
                     { label: "每分钟上限", value: client.connectionRateLimitPerMinute || "不限" },
+                    { label: "消息", value: messageCapabilityChip(client) },
                     { label: "上传", value: formatBytes(client.uploadBytes) },
                     { label: "下载", value: formatBytes(client.downloadBytes) },
                     { label: "创建时间", value: formatDateTime(client.createdAt) },
@@ -321,6 +336,7 @@ export function ClientsPanel() {
             <TableColumn>客户端</TableColumn>
             <TableColumn>归属</TableColumn>
             <TableColumn>状态</TableColumn>
+            <TableColumn>消息</TableColumn>
             <TableColumn>每分钟上限</TableColumn>
             <TableColumn>上传</TableColumn>
             <TableColumn>下载</TableColumn>
@@ -334,6 +350,7 @@ export function ClientsPanel() {
                 <TableCell>{client.clientName}</TableCell>
                 <TableCell>{client.ownerUsername || "-"}</TableCell>
                 <TableCell>{statusChip(client)}</TableCell>
+                <TableCell>{messageCapabilityChip(client)}</TableCell>
                 <TableCell>{client.connectionRateLimitPerMinute || "不限"}</TableCell>
                 <TableCell>{formatBytes(client.uploadBytes)}</TableCell>
                 <TableCell>{formatBytes(client.downloadBytes)}</TableCell>

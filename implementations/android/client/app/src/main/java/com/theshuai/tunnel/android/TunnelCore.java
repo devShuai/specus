@@ -300,6 +300,7 @@ public final class TunnelCore {
         String clientVersion;
         String javaVersion;
         String peerPublicKey;
+        ClientMessageCapabilities clientMessageCapabilities = new ClientMessageCapabilities();
         List<String> localAddresses = new ArrayList<>();
         String startedAt;
 
@@ -315,6 +316,7 @@ public final class TunnelCore {
             info.clientVersion = "android-0.1.0";
             info.javaVersion = System.getProperty("java.version", "");
             info.peerPublicKey = PeerMeshEngine.KeyStore.publicKeyBase64(context);
+            info.clientMessageCapabilities = ClientMessageCapabilities.androidDefault();
             info.localAddresses = localAddresses();
             info.startedAt = Instant.now().toString();
             return info;
@@ -331,6 +333,7 @@ public final class TunnelCore {
             json.put("clientVersion", clientVersion);
             json.put("javaVersion", javaVersion);
             json.put("peerPublicKey", peerPublicKey);
+            json.put("clientMessageCapabilities", clientMessageCapabilities.toJson());
             json.put("localAddresses", new JSONArray(localAddresses));
             json.put("startedAt", startedAt);
             return json;
@@ -352,6 +355,34 @@ public final class TunnelCore {
             } catch (Exception ignored) {
             }
             return addresses;
+        }
+    }
+
+    private static final class ClientMessageCapabilities {
+        boolean sendMessages;
+        boolean receiveMessages;
+        boolean attachments;
+        boolean mediaPreview;
+        long maxAttachmentBytes;
+
+        static ClientMessageCapabilities androidDefault() {
+            ClientMessageCapabilities capabilities = new ClientMessageCapabilities();
+            capabilities.sendMessages = true;
+            capabilities.receiveMessages = true;
+            capabilities.attachments = true;
+            capabilities.mediaPreview = true;
+            capabilities.maxAttachmentBytes = 512L * 1024L * 1024L;
+            return capabilities;
+        }
+
+        JSONObject toJson() throws Exception {
+            JSONObject json = new JSONObject();
+            json.put("sendMessages", sendMessages);
+            json.put("receiveMessages", receiveMessages);
+            json.put("attachments", attachments);
+            json.put("mediaPreview", mediaPreview);
+            json.put("maxAttachmentBytes", maxAttachmentBytes);
+            return json;
         }
     }
 
@@ -493,6 +524,10 @@ public final class TunnelCore {
         public List<String> publicStunServers = new ArrayList<>();
         public String serverPublicKey;
         public String clientPublicKey;
+        public String iceUsername;
+        public String iceCredential;
+        public String iceRealm;
+        public String iceNonce;
         public long sessionTtlSeconds;
         public int mtu = 1280;
 
@@ -513,6 +548,10 @@ public final class TunnelCore {
             config.publicStunServers = parseStringArray(json.optJSONArray("publicStunServers"));
             config.serverPublicKey = json.optString("serverPublicKey", "");
             config.clientPublicKey = json.optString("clientPublicKey", "");
+            config.iceUsername = json.optString("iceUsername", "");
+            config.iceCredential = json.optString("iceCredential", "");
+            config.iceRealm = json.optString("iceRealm", "");
+            config.iceNonce = json.optString("iceNonce", "");
             config.sessionTtlSeconds = json.optLong("sessionTtlSeconds", 0L);
             return config;
         }
@@ -630,8 +669,14 @@ public final class TunnelCore {
                 peerMeshEngine.handleControlMessage(packet.message);
             } else if (packet.messageType == MessageType.CLIENT_TO_CLIENT) {
                 status.publish("Message received",
-                        firstText(packet.clientName, "server") + ": " + firstText(packet.message, ""), true);
+                        firstText(packet.clientName, "server") + ": " + clientMessageText(packet.message), true);
             }
+        }
+
+        private String clientMessageText(String body) {
+            String value = firstText(body, "");
+            PeerAppMessageCodec.PeerAppMessage message = PeerAppMessageCodec.decode(value.getBytes(StandardCharsets.UTF_8));
+            return message == null ? value : PeerAppMessageCodec.displayText(message);
         }
 
         private void handlePeerControl(String message) throws Exception {

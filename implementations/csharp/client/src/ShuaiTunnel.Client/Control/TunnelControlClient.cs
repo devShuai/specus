@@ -485,13 +485,14 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private void ApplyClientMessage(MessageResponsePacket message)
     {
         var runtime = _runtime;
+        var body = DisplayClientMessage(message.Message ?? "");
         PublishClientMessage(new ClientMessageSnapshot
         {
             Id = Guid.NewGuid().ToString("N"),
             Direction = "IN",
             FromClientName = FirstNonEmpty(message.ClientName, "server"),
             ToClientName = FirstNonEmpty(message.ToClientName, runtime?.ClientName),
-            Message = message.Message ?? "",
+            Message = body,
             Transport = "server",
             Status = "received",
             CreatedAt = DateTimeOffset.Now,
@@ -566,6 +567,18 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private static string FirstNonEmpty(params string?[] values)
     {
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? "";
+    }
+
+    private static string DisplayClientMessage(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return "";
+        }
+        var bytes = System.Text.Encoding.UTF8.GetBytes(body);
+        return PeerAppMessageCodec.LooksLike(bytes) && PeerAppMessageCodec.TryDecode(bytes, out var message)
+            ? PeerAppMessageCodec.DisplayText(message)
+            : body;
     }
 
     internal static ControlLoginFailureAction ClassifyControlLoginFailure(string? reason)

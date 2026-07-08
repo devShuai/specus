@@ -146,6 +146,12 @@ public sealed class PeerMeshConfig
     [JsonPropertyName("iceCredential")]
     public string? IceCredential { get; set; }
 
+    [JsonPropertyName("iceRealm")]
+    public string? IceRealm { get; set; }
+
+    [JsonPropertyName("iceNonce")]
+    public string? IceNonce { get; set; }
+
     [JsonPropertyName("serverPublicKey")]
     public string? ServerPublicKey { get; set; }
 

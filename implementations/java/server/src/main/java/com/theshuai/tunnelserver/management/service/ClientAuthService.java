@@ -396,6 +396,9 @@ public class ClientAuthService {
         environment.setOsUser(limit(requireText(environment.getOsUser(), "osUser"), 120));
         environment.setHostname(limit(firstText(environment.getHostname(), "unknown-host"), 160));
         environment.setPeerPublicKey(limit(environment.getPeerPublicKey(), 256));
+        if (environment.getClientMessageCapabilities() == null) {
+            environment.setClientMessageCapabilities(new ClientEnvironmentInfo.ClientMessageCapabilities());
+        }
         return environment;
     }
 
@@ -410,6 +413,12 @@ public class ClientAuthService {
         session.setJavaVersion(limit(environment.getJavaVersion(), 80));
         List<String> addresses = environment.getLocalAddresses() == null ? List.of() : environment.getLocalAddresses();
         session.setLocalAddresses(limit(String.join(",", addresses.stream().filter(Objects::nonNull).toList()), 2000));
+        ClientEnvironmentInfo.ClientMessageCapabilities messages = environment.getClientMessageCapabilities();
+        session.setMessageSendCapable(messages.isSendMessages());
+        session.setMessageReceiveCapable(messages.isReceiveMessages());
+        session.setMessageAttachmentsCapable(messages.isAttachments());
+        session.setMessageMediaPreviewCapable(messages.isMediaPreview());
+        session.setMessageMaxAttachmentBytes(Math.max(0L, messages.getMaxAttachmentBytes()));
     }
 
     private List<ClientAuthLoginResponse.TunnelEndpoint> loadTcpMappings(ClientAccount account) {

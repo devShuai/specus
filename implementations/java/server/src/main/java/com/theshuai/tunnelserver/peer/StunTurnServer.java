@@ -15,8 +15,9 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -36,6 +37,7 @@ public class StunTurnServer implements ApplicationRunner {
 
     private final PeerMeshProperties properties;
     private final PeerMeshService peerMeshService;
+    private final TurnCredentialService turnCredentialService;
     private final Map<String, Allocation> allocations = new ConcurrentHashMap<>();
     private final Map<String, String> allocationByEndpoint = new ConcurrentHashMap<>();
     private DatagramSocket primarySocket;
@@ -45,9 +47,12 @@ public class StunTurnServer implements ApplicationRunner {
     private ExecutorService relayExecutor;
     private volatile boolean running;
 
-    public StunTurnServer(PeerMeshProperties properties, PeerMeshService peerMeshService) {
+    public StunTurnServer(PeerMeshProperties properties,
+                          PeerMeshService peerMeshService,
+                          TurnCredentialService turnCredentialService) {
         this.properties = properties;
         this.peerMeshService = peerMeshService;
+        this.turnCredentialService = turnCredentialService;
     }
 
     @Override
@@ -113,9 +118,9 @@ public class StunTurnServer implements ApplicationRunner {
         }
         switch (message.type()) {
             case StunMessage.BINDING_REQUEST -> binding(message, remote, receiveSocket, probeRole);
-            case StunMessage.ALLOCATE_REQUEST -> allocate(message, remote);
-            case StunMessage.REFRESH_REQUEST -> refresh(message, remote);
-            case StunMessage.CREATE_PERMISSION_REQUEST -> createPermission(message, remote);
+            case StunMessage.ALLOCATE_REQUEST -> allocate(message, packet, remote);
+            case StunMessage.REFRESH_REQUEST -> refresh(message, packet, remote);
+            case StunMessage.CREATE_PERMISSION_REQUEST -> createPermission(message, packet, remote);
             case StunMessage.SEND_INDICATION -> sendIndication(message, remote);
             default -> sendError(receiveSocket, remote, message, errorType(message.type()), 400, "unsupported-method");
         }
@@ -146,7 +151,11 @@ public class StunTurnServer implements ApplicationRunner {
         log.trace("[peer-mesh] STUN binding role={} remote={}", probeRole, remote);
     }
 
-    private void allocate(StunMessage request, InetSocketAddress remote) throws Exception {
+    private void allocate(StunMessage request, DatagramPacket packet, InetSocketAddress remote) throws Exception {
+        TurnAuth auth = authenticate(request, packet, remote, StunMessage.ALLOCATE_ERROR);
+        if (!auth.allowed()) {
+            return;
+        }
         if (!request.requestedUdpTransport()) {
             sendError(primarySocket, remote, request, StunMessage.ALLOCATE_ERROR, 442, "unsupported-transport");
             return;
@@ -168,7 +177,7 @@ public class StunTurnServer implements ApplicationRunner {
                 StunMessage.lifetime(properties.getAllocationTtlSeconds()),
                 StunMessage.software(SOFTWARE)
         );
-        sendStun(primarySocket, remote, response);
+        sendStun(primarySocket, remote, response, auth.messageIntegrityKey());
     }
 
     private Allocation createAllocation(InetSocketAddress remote) throws Exception {
@@ -217,7 +226,11 @@ public class StunTurnServer implements ApplicationRunner {
         return new DatagramSocket(0);
     }
 
-    private void refresh(StunMessage request, InetSocketAddress remote) throws Exception {
+    private void refresh(StunMessage request, DatagramPacket packet, InetSocketAddress remote) throws Exception {
+        TurnAuth auth = authenticate(request, packet, remote, StunMessage.REFRESH_ERROR);
+        if (!auth.allowed()) {
+            return;
+        }
         Allocation allocation = allocationForRemote(remote);
         if (allocation == null) {
             sendError(primarySocket, remote, request, StunMessage.REFRESH_ERROR, 437, "allocation-mismatch");
@@ -235,10 +248,14 @@ public class StunTurnServer implements ApplicationRunner {
                 StunMessage.lifetime(lifetime <= 0 ? 0 : properties.getAllocationTtlSeconds()),
                 StunMessage.software(SOFTWARE)
         );
-        sendStun(primarySocket, remote, response);
+        sendStun(primarySocket, remote, response, auth.messageIntegrityKey());
     }
 
-    private void createPermission(StunMessage request, InetSocketAddress remote) throws Exception {
+    private void createPermission(StunMessage request, DatagramPacket packet, InetSocketAddress remote) throws Exception {
+        TurnAuth auth = authenticate(request, packet, remote, StunMessage.CREATE_PERMISSION_ERROR);
+        if (!auth.allowed()) {
+            return;
+        }
         Allocation allocation = allocationForRemote(remote);
         if (allocation == null) {
             sendError(primarySocket, remote, request, StunMessage.CREATE_PERMISSION_ERROR, 437, "allocation-mismatch");
@@ -255,7 +272,57 @@ public class StunTurnServer implements ApplicationRunner {
                 request.transactionId(),
                 StunMessage.software(SOFTWARE)
         );
-        sendStun(primarySocket, remote, response);
+        sendStun(primarySocket, remote, response, auth.messageIntegrityKey());
+    }
+
+    private TurnAuth authenticate(StunMessage request,
+                                  DatagramPacket packet,
+                                  InetSocketAddress remote,
+                                  int responseType) throws Exception {
+        if (!turnCredentialService.authRequired()) {
+            return TurnAuth.none();
+        }
+        String username = request.username().orElse("");
+        String realm = request.realm().orElse("");
+        String nonce = request.nonce().orElse("");
+        if (!turnCredentialService.realm().equals(realm)
+                || username.isBlank()
+                || nonce.isBlank()) {
+            sendTurnAuthError(remote, request, responseType, 401, "unauthorized");
+            return TurnAuth.denied();
+        }
+        if (!turnCredentialService.nonce().equals(nonce)) {
+            sendTurnAuthError(remote, request, responseType, 438, "stale-nonce");
+            return TurnAuth.denied();
+        }
+        String credential = turnCredentialService.credentialForUsername(username);
+        if (!turnCredentialService.usernameCredentialValid(username, credential)) {
+            sendTurnAuthError(remote, request, responseType, 401, "unauthorized");
+            return TurnAuth.denied();
+        }
+        byte[] key = turnCredentialService.longTermKey(username, credential);
+        if (!StunMessage.verifyMessageIntegrity(
+                packet.getData(), packet.getOffset(), packet.getLength(), key)) {
+            sendTurnAuthError(remote, request, responseType, 401, "bad-message-integrity");
+            return TurnAuth.denied();
+        }
+        return TurnAuth.allowed(key);
+    }
+
+    private void sendTurnAuthError(InetSocketAddress remote,
+                                   StunMessage request,
+                                   int responseType,
+                                   int code,
+                                   String reason) throws Exception {
+        sendError(
+                primarySocket,
+                remote,
+                request,
+                responseType,
+                code,
+                reason,
+                StunMessage.realm(turnCredentialService.realm()),
+                StunMessage.nonce(turnCredentialService.nonce()));
     }
 
     private void sendIndication(StunMessage indication, InetSocketAddress remote) throws Exception {
@@ -341,10 +408,17 @@ public class StunTurnServer implements ApplicationRunner {
     }
 
     private void sendStun(DatagramSocket socket, InetSocketAddress remote, StunMessage message) throws Exception {
+        sendStun(socket, remote, message, null);
+    }
+
+    private void sendStun(DatagramSocket socket,
+                          InetSocketAddress remote,
+                          StunMessage message,
+                          byte[] messageIntegrityKey) throws Exception {
         if (socket == null || socket.isClosed() || remote == null) {
             return;
         }
-        byte[] bytes = message.toBytes();
+        byte[] bytes = message.toBytes(messageIntegrityKey);
         socket.send(new DatagramPacket(bytes, bytes.length, remote));
     }
 
@@ -353,13 +427,15 @@ public class StunTurnServer implements ApplicationRunner {
                            StunMessage request,
                            int responseType,
                            int code,
-                           String reason) throws Exception {
-        StunMessage response = StunMessage.of(
-                responseType,
-                request.transactionId(),
-                StunMessage.errorCode(code, reason),
-                StunMessage.software(SOFTWARE)
-        );
+                           String reason,
+                           StunMessage.Attribute... extraAttributes) throws Exception {
+        List<StunMessage.Attribute> attributes = new ArrayList<>();
+        attributes.add(StunMessage.errorCode(code, reason));
+        attributes.add(StunMessage.software(SOFTWARE));
+        if (extraAttributes != null) {
+            attributes.addAll(List.of(extraAttributes));
+        }
+        StunMessage response = new StunMessage(responseType, request.transactionId(), attributes);
         sendStun(socket, remote, response);
     }
 
@@ -507,6 +583,20 @@ public class StunTurnServer implements ApplicationRunner {
 
         private boolean isExpired(Instant now) {
             return closed || expiresAt == null || !expiresAt.isAfter(now);
+        }
+    }
+
+    private record TurnAuth(boolean allowed, byte[] messageIntegrityKey) {
+        private static TurnAuth none() {
+            return new TurnAuth(true, null);
+        }
+
+        private static TurnAuth denied() {
+            return new TurnAuth(false, null);
+        }
+
+        private static TurnAuth allowed(byte[] messageIntegrityKey) {
+            return new TurnAuth(true, messageIntegrityKey);
         }
     }
 }

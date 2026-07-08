@@ -27,10 +27,14 @@ internal sealed class StunMessage
     public const ushort SendIndication = 0x0016;
     public const ushort DataIndication = 0x0017;
 
+    public const ushort AttrUsername = 0x0006;
+    public const ushort AttrMessageIntegrity = 0x0008;
     public const ushort AttrErrorCode = 0x0009;
     public const ushort AttrLifetime = 0x000D;
     public const ushort AttrXorPeerAddress = 0x0012;
     public const ushort AttrData = 0x0013;
+    public const ushort AttrRealm = 0x0014;
+    public const ushort AttrNonce = 0x0015;
     public const ushort AttrXorRelayedAddress = 0x0016;
     public const ushort AttrRequestedTransport = 0x0019;
     public const ushort AttrXorMappedAddress = 0x0020;
@@ -106,14 +110,38 @@ internal sealed class StunMessage
 
     public byte[] ToBytes()
     {
+        return ToBytes(null);
+    }
+
+    public byte[] ToBytes(byte[]? messageIntegrityKey)
+    {
         var length = Attributes.Sum(attr => 4 + attr.Value.Length + Padding(attr.Value.Length));
+        if (messageIntegrityKey is { Length: > 0 })
+        {
+            var beforeIntegrity = Serialize(length + 24, Attributes);
+            using var hmac = new HMACSHA1(messageIntegrityKey);
+            var digest = hmac.ComputeHash(beforeIntegrity);
+            var packetWithIntegrity = new byte[beforeIntegrity.Length + 24];
+            beforeIntegrity.CopyTo(packetWithIntegrity, 0);
+            var offset = beforeIntegrity.Length;
+            BinaryPrimitives.WriteUInt16BigEndian(packetWithIntegrity.AsSpan(offset, 2), AttrMessageIntegrity);
+            BinaryPrimitives.WriteUInt16BigEndian(packetWithIntegrity.AsSpan(offset + 2, 2), (ushort)digest.Length);
+            digest.CopyTo(packetWithIntegrity.AsSpan(offset + 4));
+            return packetWithIntegrity;
+        }
+        return Serialize(length, Attributes);
+    }
+
+    private byte[] Serialize(int declaredLength, IReadOnlyList<StunAttribute> attributes)
+    {
+        var length = attributes.Sum(attr => 4 + attr.Value.Length + Padding(attr.Value.Length));
         var packet = new byte[HeaderBytes + length];
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(0, 2), Type);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)length);
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)declaredLength);
         BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4, 4), MagicCookie);
         TransactionId.CopyTo(packet.AsSpan(8, TransactionIdBytes));
         var offset = HeaderBytes;
-        foreach (var attr in Attributes)
+        foreach (var attr in attributes)
         {
             BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(offset, 2), attr.Type);
             BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(offset + 2, 2), (ushort)attr.Value.Length);
@@ -173,6 +201,15 @@ internal sealed class StunMessage
 
     public static StunAttribute Software(string value) =>
         new(AttrSoftware, Encoding.UTF8.GetBytes(value));
+
+    public static StunAttribute Username(string value) =>
+        new(AttrUsername, Encoding.UTF8.GetBytes(value));
+
+    public static StunAttribute Realm(string value) =>
+        new(AttrRealm, Encoding.UTF8.GetBytes(value));
+
+    public static StunAttribute Nonce(string value) =>
+        new(AttrNonce, Encoding.UTF8.GetBytes(value));
 
     public static StunAttribute ErrorCode(int code, string reason)
     {

@@ -55,6 +55,8 @@ public class ClientAuthLoginResponse {
         private List<String> publicStunServers = new ArrayList<>();
         private String iceUsername;
         private String iceCredential;
+        private String iceRealm;
+        private String iceNonce;
         private String serverPublicKey;
         private String clientPublicKey;
         private long sessionTtlSeconds;

@@ -26,6 +26,10 @@ public interface ClientSessionRepository extends JpaRepository<ClientSession, Lo
                                                                                   String osUser,
                                                                                   String status);
 
+    List<ClientSession> findByTenantIdAndClientIdInAndStatus(String tenantId,
+                                                             List<Long> clientIds,
+                                                             String status);
+
     @Modifying
     @Query("update ClientSession s set s.status = :status, s.disconnectedAt = :disconnectedAt where s.status = :onlineStatus")
     int closeSessionsByStatus(@Param("onlineStatus") String onlineStatus,

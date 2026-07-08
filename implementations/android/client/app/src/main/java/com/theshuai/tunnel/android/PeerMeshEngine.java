@@ -20,6 +20,7 @@ import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayDeque;
@@ -231,6 +232,11 @@ final class PeerMeshEngine implements Closeable {
                         item.optString("virtualIp", ""),
                         item.optString("publicKey", ""),
                         item.optBoolean("online", false),
+                        item.optBoolean("messageSendCapable", false),
+                        item.optBoolean("messageReceiveCapable", false),
+                        item.optBoolean("messageAttachmentsCapable", false),
+                        item.optBoolean("messageMediaPreviewCapable", false),
+                        item.optLong("messageMaxAttachmentBytes", 0L),
                         previous.containsKey(item.optLong("clientId", 0L))
                                 ? previous.get(item.optLong("clientId", 0L)).candidates
                                 : List.of());
@@ -502,9 +508,13 @@ final class PeerMeshEngine implements Closeable {
         PeerInfo peer = peers.get(session.peerId);
         String from = firstText(message.fromClientName,
                 peer == null ? String.valueOf(session.peerId) : peer.clientName);
-        publish("Message received", from + ": " + firstText(message.message, ""));
+        publish("Message received", from + ": " + peerAppMessageText(message));
         sendPeerClientMessageAck(message, session, current);
         return true;
+    }
+
+    private String peerAppMessageText(PeerAppMessageCodec.PeerAppMessage message) {
+        return PeerAppMessageCodec.displayText(message);
     }
 
     private void completePeerMessageAck(String messageId) {
@@ -653,7 +663,7 @@ final class PeerMeshEngine implements Closeable {
             return null;
         }
         for (PeerInfo peer : peers.values()) {
-            if (peer != null && peer.online && clientName.equalsIgnoreCase(peer.clientName)) {
+            if (peer != null && peer.online && peer.messageReceiveCapable && clientName.equalsIgnoreCase(peer.clientName)) {
                 return peer;
             }
         }
@@ -866,13 +876,13 @@ final class PeerMeshEngine implements Closeable {
             sendStunRequest(StunMessage.of(
                     StunMessage.REFRESH_REQUEST,
                     StunMessage.newTransactionId(),
-                    StunMessage.lifetime(Math.max(30L, config.sessionTtlSeconds))), turn);
+                    authenticatedTurnAttributes(StunMessage.lifetime(Math.max(30L, config.sessionTtlSeconds)))), turn);
             return;
         }
         sendStunRequest(StunMessage.of(
                 StunMessage.ALLOCATE_REQUEST,
                 StunMessage.newTransactionId(),
-                StunMessage.requestedUdpTransportAttribute()), turn);
+                authenticatedTurnAttributes(StunMessage.requestedUdpTransportAttribute())), turn);
     }
 
     private void sendStunBinding(InetSocketAddress endpoint, boolean publicStun) {
@@ -890,11 +900,44 @@ final class PeerMeshEngine implements Closeable {
             return;
         }
         try {
-            byte[] bytes = message.toBytes();
+            byte[] bytes = message.hasAttribute(StunMessage.ATTR_USERNAME)
+                    ? message.toBytes(turnMessageIntegrityKey())
+                    : message.toBytes();
             socket.send(new DatagramPacket(bytes, bytes.length, endpoint));
         } catch (Exception e) {
             publish("Peer STUN failed", e.getMessage());
         }
+    }
+
+    private StunMessage.Attribute[] authenticatedTurnAttributes(StunMessage.Attribute... attributes) {
+        TunnelCore.PeerMeshConfig current = config;
+        if (current == null
+                || isBlank(current.iceUsername)
+                || isBlank(current.iceCredential)
+                || isBlank(current.iceRealm)
+                || isBlank(current.iceNonce)) {
+            return attributes;
+        }
+        List<StunMessage.Attribute> result = new ArrayList<>();
+        if (attributes != null) {
+            result.addAll(Arrays.asList(attributes));
+        }
+        result.add(StunMessage.username(current.iceUsername));
+        result.add(StunMessage.realm(current.iceRealm));
+        result.add(StunMessage.nonce(current.iceNonce));
+        return result.toArray(new StunMessage.Attribute[0]);
+    }
+
+    private byte[] turnMessageIntegrityKey() throws Exception {
+        TunnelCore.PeerMeshConfig current = config;
+        if (current == null
+                || isBlank(current.iceUsername)
+                || isBlank(current.iceCredential)
+                || isBlank(current.iceRealm)) {
+            return null;
+        }
+        String text = current.iceUsername + ":" + current.iceRealm + ":" + current.iceCredential;
+        return MessageDigest.getInstance("MD5").digest(text.getBytes(StandardCharsets.UTF_8));
     }
 
     private PeerSession rememberSession(JSONObject json) {
@@ -976,6 +1019,11 @@ final class PeerMeshEngine implements Closeable {
                     json.optString("sourceVirtualIp", ""),
                     json.optString("sourcePublicKey", ""),
                     true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0L,
                     parseCandidates(json.optJSONArray("candidates")));
         }
         if (targetId > 0 && targetId != config.clientId) {
@@ -984,6 +1032,11 @@ final class PeerMeshEngine implements Closeable {
                     json.optString("targetVirtualIp", ""),
                     json.optString("targetPublicKey", ""),
                     true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0L,
                     parseCandidates(json.optJSONArray("candidates")));
         }
         return null;
@@ -1018,6 +1071,11 @@ final class PeerMeshEngine implements Closeable {
                 firstText(peer.virtualIp, current == null ? "" : current.virtualIp),
                 firstText(peer.publicKey, current == null ? "" : current.publicKey),
                 peer.online || (current != null && current.online),
+                peer.messageSendCapable || (current != null && current.messageSendCapable),
+                peer.messageReceiveCapable || (current != null && current.messageReceiveCapable),
+                peer.messageAttachmentsCapable || (current != null && current.messageAttachmentsCapable),
+                peer.messageMediaPreviewCapable || (current != null && current.messageMediaPreviewCapable),
+                Math.max(peer.messageMaxAttachmentBytes, current == null ? 0L : current.messageMaxAttachmentBytes),
                 nextCandidates == null ? List.of() : List.copyOf(nextCandidates));
         peers.put(merged.clientId, merged);
         if (!isBlank(merged.virtualIp)) {
@@ -1205,7 +1263,7 @@ final class PeerMeshEngine implements Closeable {
         sendStunRequest(StunMessage.of(
                 StunMessage.CREATE_PERMISSION_REQUEST,
                 transactionId,
-                StunMessage.xorPeerAddress(peer, transactionId)), turn);
+                authenticatedTurnAttributes(StunMessage.xorPeerAddress(peer, transactionId))), turn);
         turnPermissions.put(key, now + TURN_PERMISSION_TTL_MS);
     }
 
@@ -1588,15 +1646,31 @@ final class PeerMeshEngine implements Closeable {
         final String virtualIp;
         final String publicKey;
         final boolean online;
+        final boolean messageSendCapable;
+        final boolean messageReceiveCapable;
+        final boolean messageAttachmentsCapable;
+        final boolean messageMediaPreviewCapable;
+        final long messageMaxAttachmentBytes;
         final List<PeerCandidate> candidates;
 
         PeerInfo(long clientId, String clientName, String virtualIp, String publicKey,
-                 boolean online, List<PeerCandidate> candidates) {
+                 boolean online,
+                 boolean messageSendCapable,
+                 boolean messageReceiveCapable,
+                 boolean messageAttachmentsCapable,
+                 boolean messageMediaPreviewCapable,
+                 long messageMaxAttachmentBytes,
+                 List<PeerCandidate> candidates) {
             this.clientId = clientId;
             this.clientName = clientName;
             this.virtualIp = virtualIp;
             this.publicKey = publicKey;
             this.online = online;
+            this.messageSendCapable = messageSendCapable;
+            this.messageReceiveCapable = messageReceiveCapable;
+            this.messageAttachmentsCapable = messageAttachmentsCapable;
+            this.messageMediaPreviewCapable = messageMediaPreviewCapable;
+            this.messageMaxAttachmentBytes = messageMaxAttachmentBytes;
             this.candidates = candidates == null ? List.of() : candidates;
         }
     }
@@ -1761,9 +1835,13 @@ final class PeerMeshEngine implements Closeable {
         static final int CREATE_PERMISSION_REQUEST = 0x0008;
         static final int SEND_INDICATION = 0x0016;
         static final int DATA_INDICATION = 0x0017;
+        static final int ATTR_USERNAME = 0x0006;
+        static final int ATTR_MESSAGE_INTEGRITY = 0x0008;
         static final int ATTR_LIFETIME = 0x000D;
         static final int ATTR_XOR_PEER_ADDRESS = 0x0012;
         static final int ATTR_DATA = 0x0013;
+        static final int ATTR_REALM = 0x0014;
+        static final int ATTR_NONCE = 0x0015;
         static final int ATTR_XOR_RELAYED_ADDRESS = 0x0016;
         static final int ATTR_REQUESTED_TRANSPORT = 0x0019;
         static final int ATTR_XOR_MAPPED_ADDRESS = 0x0020;
@@ -1831,16 +1909,45 @@ final class PeerMeshEngine implements Closeable {
         }
 
         byte[] toBytes() {
+            return toBytes(null);
+        }
+
+        byte[] toBytes(byte[] messageIntegrityKey) {
             int attributeBytes = 0;
             for (Attribute attribute : attributes) {
                 attributeBytes += 4 + attribute.value.length + padding(attribute.value.length);
             }
+            if (messageIntegrityKey != null && messageIntegrityKey.length > 0) {
+                byte[] beforeIntegrity = serialize(attributeBytes + 24, attributes);
+                byte[] digest;
+                try {
+                    Mac mac = Mac.getInstance("HmacSHA1");
+                    mac.init(new SecretKeySpec(messageIntegrityKey, "HmacSHA1"));
+                    digest = mac.doFinal(beforeIntegrity);
+                } catch (Exception e) {
+                    throw new IllegalStateException("cannot compute STUN message integrity", e);
+                }
+                ByteBuffer packet = ByteBuffer.allocate(beforeIntegrity.length + 24);
+                packet.put(beforeIntegrity);
+                packet.putShort((short) ATTR_MESSAGE_INTEGRITY);
+                packet.putShort((short) digest.length);
+                packet.put(digest);
+                return packet.array();
+            }
+            return serialize(attributeBytes, attributes);
+        }
+
+        private byte[] serialize(int declaredAttributeBytes, List<Attribute> serializedAttributes) {
+            int attributeBytes = 0;
+            for (Attribute attribute : serializedAttributes) {
+                attributeBytes += 4 + attribute.value.length + padding(attribute.value.length);
+            }
             ByteBuffer buffer = ByteBuffer.allocate(HEADER_BYTES + attributeBytes);
             buffer.putShort((short) type);
-            buffer.putShort((short) attributeBytes);
+            buffer.putShort((short) declaredAttributeBytes);
             buffer.putInt(MAGIC_COOKIE);
             buffer.put(transactionId);
-            for (Attribute attribute : attributes) {
+            for (Attribute attribute : serializedAttributes) {
                 buffer.putShort((short) attribute.type);
                 buffer.putShort((short) attribute.value.length);
                 buffer.put(attribute.value);
@@ -1887,6 +1994,10 @@ final class PeerMeshEngine implements Closeable {
                 }
             }
             return null;
+        }
+
+        boolean hasAttribute(int type) {
+            return first(type) != null;
         }
 
         private InetSocketAddress firstXorAddress(int type) {
@@ -1943,6 +2054,18 @@ final class PeerMeshEngine implements Closeable {
 
         static Attribute software(String value) {
             return new Attribute(ATTR_SOFTWARE, (value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
+        }
+
+        static Attribute username(String value) {
+            return new Attribute(ATTR_USERNAME, (value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
+        }
+
+        static Attribute realm(String value) {
+            return new Attribute(ATTR_REALM, (value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
+        }
+
+        static Attribute nonce(String value) {
+            return new Attribute(ATTR_NONCE, (value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
         }
 
         private static byte[] encodeXorAddress(InetSocketAddress address, byte[] transactionId) {

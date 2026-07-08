@@ -8,6 +8,11 @@ import type {
   ClientDownloadLinkMutation,
   ClientMutation,
   ConnectionPage,
+  AttachmentCompleteRequest,
+  AttachmentPresignDownloadRequest,
+  AttachmentPresignDownloadResponse,
+  AttachmentPresignUploadRequest,
+  AttachmentPresignUploadResponse,
   ClientResult,
   DatabaseInitResult,
   HttpRoute,
@@ -29,6 +34,7 @@ import type {
   PeerMeshSessionPage,
   PeerMeshSession,
   PeerMeshStatus,
+  PublicTransferIceConfig,
   PublicPeerStunConfig,
   ResourceTrafficType,
   ResourceTrafficUsage,
@@ -377,6 +383,20 @@ export const adminApi = {
   updateClientDownload: (id: number, body: ClientDownloadLinkMutation) =>
     request<ClientDownloadLink>(`/client-downloads/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteClientDownload: (id: number) => request<null>(`/client-downloads/${id}`, { method: "DELETE" }),
+
+  presignClientMessageAttachmentUpload: (body: AttachmentPresignUploadRequest) =>
+    request<AttachmentPresignUploadResponse>("/client-messages/attachments/presign-upload", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  completeClientMessageAttachment: (attachmentId: number) =>
+    request<AttachmentPresignUploadResponse["attachment"]>(`/client-messages/attachments/${attachmentId}/complete`, {
+      method: "POST",
+    }),
+  presignClientMessageAttachmentDownload: (attachmentId: number) =>
+    request<AttachmentPresignDownloadResponse>(`/client-messages/attachments/${attachmentId}/presign-download`, {
+      method: "POST",
+    }),
 };
 
 // ---- public API（无需 Bearer，登录页和未登录上下文可用）-------------------------------
@@ -408,4 +428,57 @@ export async function fetchPublicPeerStunConfig(): Promise<PublicPeerStunConfig 
   } catch {
     return null;
   }
+}
+
+async function publicJsonRequest<T>(path: string, body?: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  const text = await response.text();
+  const parsed = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new ApiError(parsed?.error || response.statusText);
+  }
+  return parsed as T;
+}
+
+export async function fetchPublicTransferIceConfig(): Promise<PublicTransferIceConfig | null> {
+  try {
+    const response = await fetch(`/api/public/transfer/ice-config`);
+    if (!response.ok) {
+      return null;
+    }
+    const body = (await response.json()) as PublicTransferIceConfig;
+    return body && Array.isArray(body.iceServers) ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+export function publicPresignAttachmentUpload(
+  body: AttachmentPresignUploadRequest,
+): Promise<AttachmentPresignUploadResponse> {
+  return publicJsonRequest<AttachmentPresignUploadResponse>("/api/public/transfer/attachments/presign-upload", body);
+}
+
+export function publicCompleteAttachment(
+  attachmentId: number,
+  body: AttachmentCompleteRequest,
+): Promise<AttachmentPresignUploadResponse["attachment"]> {
+  return publicJsonRequest<AttachmentPresignUploadResponse["attachment"]>(
+    `/api/public/transfer/attachments/${attachmentId}/complete`,
+    body,
+  );
+}
+
+export function publicPresignAttachmentDownload(
+  attachmentId: number,
+  body: AttachmentPresignDownloadRequest,
+): Promise<AttachmentPresignDownloadResponse> {
+  return publicJsonRequest<AttachmentPresignDownloadResponse>(
+    `/api/public/transfer/attachments/${attachmentId}/presign-download`,
+    body,
+  );
 }

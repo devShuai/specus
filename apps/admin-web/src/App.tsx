@@ -8,11 +8,20 @@ const LazyDashboard = lazy(() => import("./pages/Dashboard").then((module) => ({
 const LazyNatDetectionPanel = lazy(() =>
   import("./pages/panels/NatDetectionPanel").then((module) => ({ default: module.NatDetectionPanel })),
 );
+const LazyPublicTransferPage = lazy(() =>
+  import("./pages/PublicTransferPage").then((module) => ({ default: module.PublicTransferPage })),
+);
 
 function readPublicRoute() {
   const hash = window.location.hash.replace(/^#\/?/, "").split(/[/?#]/, 1)[0];
   const queryPanel = new URLSearchParams(window.location.search).get("panel");
-  return hash === "nat-detect" || queryPanel === "nat-detect" ? "nat-detect" : null;
+  if (hash === "nat-detect" || queryPanel === "nat-detect") {
+    return "nat-detect";
+  }
+  if (hash === "transfer" || queryPanel === "transfer") {
+    return "transfer";
+  }
+  return null;
 }
 
 function hasOidcCallback() {
@@ -38,6 +47,14 @@ export function App() {
     return (
       <Suspense fallback={<FullScreenLoading />}>
         <LazyNatDetectionPanel publicPage />
+      </Suspense>
+    );
+  }
+
+  if (publicRoute === "transfer") {
+    return (
+      <Suspense fallback={<FullScreenLoading />}>
+        <LazyPublicTransferPage />
       </Suspense>
     );
   }

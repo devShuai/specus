@@ -23,4 +23,8 @@ public class PeerMeshProperties {
     private int relayMaxPort = 65535;
     private int relayWorkerThreads = 0;
     private int relayWorkerQueueCapacity = 10000;
+    private boolean turnAuthRequired = true;
+    private String turnRealm = "shuai-tunnel";
+    private String turnSharedSecret = "";
+    private long turnCredentialTtlSeconds = 3600;
 }

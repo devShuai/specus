@@ -262,6 +262,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             peer = _peers.Values.FirstOrDefault(item =>
                 item.Online
+                && item.MessageReceiveCapable
                 && string.Equals(item.ClientName, target, StringComparison.OrdinalIgnoreCase));
             session = peer is null ? null : ReusableSessionLocked(peer.ClientId, now);
         }
@@ -1270,13 +1271,31 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             Direction = "IN",
             FromClientName = FirstNonEmpty(message.FromClientName, session.PeerName, session.PeerId.ToString(System.Globalization.CultureInfo.InvariantCulture)),
             ToClientName = FirstNonEmpty(message.ToClientName, runtime.PeerMesh.ClientName),
-            Message = message.Message ?? "",
+            Message = PeerAppMessageText(message),
             Transport = PeerTransport(session, relayFrom),
             Status = "received",
             CreatedAt = DateTimeOffset.Now,
         });
         await SendPeerClientMessageAckAsync(message, session, runtime).ConfigureAwait(false);
         return true;
+    }
+
+    private static string PeerAppMessageText(PeerAppMessage message)
+    {
+        return PeerAppMessageCodec.DisplayText(message);
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB" };
+        double value = Math.Max(0L, bytes);
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return $"{value:0.#} {units[unit]}";
     }
 
     private void CompletePeerMessageAck(string? messageId)
@@ -1370,8 +1389,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         var candidates = NormalizeCandidates(message.Candidates);
         var peer = message.SourceClientId != 0 && message.SourceClientId != runtime.PeerMesh.ClientId
-            ? new PeerMeshPeer(message.SourceClientId, message.SourceClientName, message.SourceVirtualIp, message.SourcePublicKey, true, candidates)
-            : new PeerMeshPeer(message.TargetClientId, message.TargetClientName, message.TargetVirtualIp, message.TargetPublicKey, true, candidates);
+            ? new PeerMeshPeer(message.SourceClientId, message.SourceClientName, message.SourceVirtualIp,
+                message.SourcePublicKey, true, false, false, false, false, 0, candidates)
+            : new PeerMeshPeer(message.TargetClientId, message.TargetClientName, message.TargetVirtualIp,
+                message.TargetPublicKey, true, false, false, false, false, 0, candidates);
         if (peer.ClientId <= 0)
         {
             return;
@@ -1382,10 +1403,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             {
                 peer = peer with
                 {
-                    ClientName = FirstNonEmpty(peer.ClientName, existing.ClientName),
-                    VirtualIp = FirstNonEmpty(peer.VirtualIp, existing.VirtualIp),
-                    PublicKey = FirstNonEmpty(peer.PublicKey, existing.PublicKey),
-                };
+                        ClientName = FirstNonEmpty(peer.ClientName, existing.ClientName),
+                        VirtualIp = FirstNonEmpty(peer.VirtualIp, existing.VirtualIp),
+                        PublicKey = FirstNonEmpty(peer.PublicKey, existing.PublicKey),
+                        MessageSendCapable = peer.MessageSendCapable || existing.MessageSendCapable,
+                        MessageReceiveCapable = peer.MessageReceiveCapable || existing.MessageReceiveCapable,
+                        MessageAttachmentsCapable = peer.MessageAttachmentsCapable || existing.MessageAttachmentsCapable,
+                        MessageMediaPreviewCapable = peer.MessageMediaPreviewCapable || existing.MessageMediaPreviewCapable,
+                        MessageMaxAttachmentBytes = Math.Max(peer.MessageMaxAttachmentBytes, existing.MessageMaxAttachmentBytes),
+                    };
             }
             _peers[peer.ClientId] = peer;
         }
@@ -2130,14 +2156,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             await SendStunRequestAsync(StunMessage.Of(
                 StunMessage.RefreshRequest,
                 StunMessage.NewTransactionId(),
-                StunMessage.Lifetime(Math.Max(30, Runtime()?.PeerMesh.SessionTtlSeconds ?? 300))),
+                AuthenticatedTurnAttributes(StunMessage.Lifetime(Math.Max(30, Runtime()?.PeerMesh.SessionTtlSeconds ?? 300)))),
                 endpoint).ConfigureAwait(false);
             return;
         }
         await SendStunRequestAsync(StunMessage.Of(
             StunMessage.AllocateRequest,
             StunMessage.NewTransactionId(),
-            StunMessage.RequestedUdpTransportAttribute()),
+            AuthenticatedTurnAttributes(StunMessage.RequestedUdpTransportAttribute())),
             endpoint).ConfigureAwait(false);
     }
 
@@ -2230,7 +2256,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        var body = message.ToBytes();
+        var body = message.First(StunMessage.AttrUsername) is null
+            ? message.ToBytes()
+            : message.ToBytes(TurnMessageIntegrityKey());
         await udp.SendAsync(body, endpoint).ConfigureAwait(false);
     }
 
@@ -2293,8 +2321,45 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         await SendStunRequestAsync(StunMessage.Of(
             StunMessage.CreatePermissionRequest,
             transactionId,
-            StunMessage.XorPeerAddress(peer, transactionId)),
+            AuthenticatedTurnAttributes(StunMessage.XorPeerAddress(peer, transactionId))),
             turnServer).ConfigureAwait(false);
+    }
+
+    private StunAttribute[] AuthenticatedTurnAttributes(params StunAttribute[] attributes)
+    {
+        var runtime = Runtime();
+        var username = runtime?.PeerMesh.IceUsername?.Trim();
+        var credential = runtime?.PeerMesh.IceCredential?.Trim();
+        var realm = runtime?.PeerMesh.IceRealm?.Trim();
+        var nonce = runtime?.PeerMesh.IceNonce?.Trim();
+        if (string.IsNullOrWhiteSpace(username)
+            || string.IsNullOrWhiteSpace(credential)
+            || string.IsNullOrWhiteSpace(realm)
+            || string.IsNullOrWhiteSpace(nonce))
+        {
+            return attributes;
+        }
+        return [
+            .. attributes,
+            StunMessage.Username(username),
+            StunMessage.Realm(realm),
+            StunMessage.Nonce(nonce),
+        ];
+    }
+
+    private byte[]? TurnMessageIntegrityKey()
+    {
+        var runtime = Runtime();
+        var username = runtime?.PeerMesh.IceUsername?.Trim();
+        var credential = runtime?.PeerMesh.IceCredential?.Trim();
+        var realm = runtime?.PeerMesh.IceRealm?.Trim();
+        if (string.IsNullOrWhiteSpace(username)
+            || string.IsNullOrWhiteSpace(credential)
+            || string.IsNullOrWhiteSpace(realm))
+        {
+            return null;
+        }
+        return MD5.HashData(Encoding.UTF8.GetBytes($"{username}:{realm}:{credential}"));
     }
 
     private IPEndPoint? RelayEndpoint()
@@ -2948,6 +3013,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                         ClientName = item.ClientName,
                         VirtualIp = item.VirtualIp,
                         Online = item.Online,
+                        MessageSendCapable = item.MessageSendCapable,
+                        MessageReceiveCapable = item.MessageReceiveCapable,
+                        MessageAttachmentsCapable = item.MessageAttachmentsCapable,
+                        MessageMediaPreviewCapable = item.MessageMediaPreviewCapable,
+                        MessageMaxAttachmentBytes = item.MessageMaxAttachmentBytes,
                         CandidateCount = item.Candidates.Count,
                     })
                     .ToList(),
@@ -3087,6 +3157,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         [property: JsonPropertyName("virtualIp")] string? VirtualIp,
         [property: JsonPropertyName("publicKey")] string? PublicKey,
         [property: JsonPropertyName("online")] bool Online,
+        [property: JsonPropertyName("messageSendCapable")] bool MessageSendCapable,
+        [property: JsonPropertyName("messageReceiveCapable")] bool MessageReceiveCapable,
+        [property: JsonPropertyName("messageAttachmentsCapable")] bool MessageAttachmentsCapable,
+        [property: JsonPropertyName("messageMediaPreviewCapable")] bool MessageMediaPreviewCapable,
+        [property: JsonPropertyName("messageMaxAttachmentBytes")] long MessageMaxAttachmentBytes,
         [property: JsonPropertyName("candidates")] List<PeerCandidate> Candidates);
 
     private sealed record PeerCandidate(

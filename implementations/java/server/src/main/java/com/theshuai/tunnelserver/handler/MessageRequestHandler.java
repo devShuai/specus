@@ -9,6 +9,7 @@ import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.PeerMeshService;
 import com.theshuai.tunnelserver.management.service.PeerSignalService;
 import com.theshuai.tunnelserver.session.SessionUtil;
+import com.theshuai.tunnelserver.websocket.ClientMessagesWebSocketHandler;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -28,13 +29,16 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
     private final PeerSignalService peerSignalService;
     private final ClientAccountService clientAccountService;
     private final PeerMeshService peerMeshService;
+    private final ClientMessagesWebSocketHandler clientMessagesWebSocketHandler;
 
     public MessageRequestHandler(PeerSignalService peerSignalService,
                                  ClientAccountService clientAccountService,
-                                 PeerMeshService peerMeshService) {
+                                 PeerMeshService peerMeshService,
+                                 ClientMessagesWebSocketHandler clientMessagesWebSocketHandler) {
         this.peerSignalService = peerSignalService;
         this.clientAccountService = clientAccountService;
         this.peerMeshService = peerMeshService;
+        this.clientMessagesWebSocketHandler = clientMessagesWebSocketHandler;
     }
 
     @Override
@@ -78,9 +82,22 @@ public class MessageRequestHandler extends SimpleChannelInboundHandler<MessageRe
 
         ClientAccount source = clientAccountService.findClientByName(session.getClientName())
                 .orElse(null);
+        String targetName = messageRequestPacket.getToClientName().trim();
+        if (source == null || !source.isEnabled()) {
+            log.warn("client->client rejected: source account unavailable, source={}", session.getClientName());
+            return;
+        }
+        if (targetName.regionMatches(true, 0, "admin:", 0, "admin:".length())) {
+            boolean delivered = clientMessagesWebSocketHandler.deliverFromClient(
+                    source, targetName, messageRequestPacket.getMessage());
+            log.info("client->admin websocket {}: source={}, target={}",
+                    delivered ? "delivered" : "not-delivered",
+                    source.getClientName(), targetName);
+            return;
+        }
         ClientAccount target = clientAccountService.findClientByName(messageRequestPacket.getToClientName().trim())
                 .orElse(null);
-        if (source == null || target == null || !source.isEnabled() || !target.isEnabled()) {
+        if (target == null || !target.isEnabled()) {
             log.warn("client->client rejected: source/target account unavailable, source={}, target={}",
                     session.getClientName(), messageRequestPacket.getToClientName());
             return;

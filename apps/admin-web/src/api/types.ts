@@ -36,6 +36,11 @@ export interface Client {
   enabled: boolean;
   online: boolean;
   connectedSinceMs: number | null;
+  messageSendCapable: boolean;
+  messageReceiveCapable: boolean;
+  messageAttachmentsCapable: boolean;
+  messageMediaPreviewCapable: boolean;
+  messageMaxAttachmentBytes: number;
   connectionRateLimitPerMinute: number;
   uploadBytes: number;
   downloadBytes: number;
@@ -286,6 +291,67 @@ export interface PublicPeerStunConfig {
   selfHostedStunServer: string;
   stunServers: string[];
   stunTurnPort: number;
+}
+
+export interface PublicIceServer {
+  urls: string;
+  username: string;
+  credential: string;
+}
+
+export interface PublicTransferIceConfig {
+  peerMeshEnabled: boolean;
+  iceServers: PublicIceServer[];
+  turnAuthRequired: boolean;
+  stunTurnPort: number;
+}
+
+export interface TransferAttachment {
+  attachmentId: number;
+  objectId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256?: string | null;
+  status: "PENDING" | "UPLOADED" | "EXPIRED" | string;
+  expiresAt: string;
+}
+
+export interface AttachmentPresignUploadRequest {
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256?: string | null;
+  roomId?: string;
+  roomToken?: string;
+  targetClientId?: number;
+}
+
+export interface AttachmentPresignUploadResponse {
+  attachmentId: number;
+  objectId: string;
+  objectKey: string;
+  uploadUrl: string;
+  uploadHeaders: Record<string, string>;
+  expiresAt: string;
+  attachment: TransferAttachment;
+}
+
+export interface AttachmentCompleteRequest {
+  roomToken?: string;
+}
+
+export interface AttachmentPresignDownloadRequest {
+  roomToken?: string;
+}
+
+export interface AttachmentPresignDownloadResponse {
+  attachmentId: number;
+  objectId: string;
+  downloadUrl: string;
+  downloadHeaders: Record<string, string>;
+  expiresAt: string;
+  attachment: TransferAttachment;
 }
 
 export interface PeerMeshDevice {

@@ -164,6 +164,9 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("peerPublicKey")]
     public string? PeerPublicKey { get; set; }
 
+    [JsonPropertyName("clientMessageCapabilities")]
+    public ClientMessageCapabilities ClientMessageCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
@@ -183,6 +186,7 @@ public sealed class ClientEnvironmentInfo
             ClientVersion = typeof(ClientEnvironmentInfo).Assembly.GetName().Version?.ToString(),
             JavaVersion = "",
             PeerPublicKey = PeerKeyStore.PublicKeyBase64(logger),
+            ClientMessageCapabilities = ClientMessageCapabilities.DesktopDefault(),
             StartedAt = DateTimeOffset.UtcNow.ToString("O"),
         };
         try
@@ -259,4 +263,31 @@ public sealed class ClientEnvironmentInfo
             return "unknown-host";
         }
     }
+}
+
+public sealed class ClientMessageCapabilities
+{
+    [JsonPropertyName("sendMessages")]
+    public bool SendMessages { get; set; }
+
+    [JsonPropertyName("receiveMessages")]
+    public bool ReceiveMessages { get; set; }
+
+    [JsonPropertyName("attachments")]
+    public bool Attachments { get; set; }
+
+    [JsonPropertyName("mediaPreview")]
+    public bool MediaPreview { get; set; }
+
+    [JsonPropertyName("maxAttachmentBytes")]
+    public long MaxAttachmentBytes { get; set; }
+
+    public static ClientMessageCapabilities DesktopDefault() => new()
+    {
+        SendMessages = true,
+        ReceiveMessages = true,
+        Attachments = true,
+        MediaPreview = true,
+        MaxAttachmentBytes = 512L * 1024L * 1024L,
+    };
 }

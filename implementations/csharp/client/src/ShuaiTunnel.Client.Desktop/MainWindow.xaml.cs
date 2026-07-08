@@ -53,6 +53,8 @@ public partial class MainWindow : Window
 
     public ObservableCollection<PeerRouteSnapshot> PeerRoutes { get; } = new();
 
+    public ObservableCollection<PeerRouteSnapshot> MessagePeerRoutes { get; } = new();
+
     public ObservableCollection<PeerSessionSnapshot> PeerSessions { get; } = new();
 
     public ObservableCollection<ClientMessageLine> ClientMessages { get; } = new();
@@ -148,6 +150,11 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(target) || string.IsNullOrWhiteSpace(body))
         {
             MessageBox.Show(this, "目标客户端和消息内容不能为空。", "发送消息", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        if (!IsKnownMessageTarget(target))
+        {
+            MessageBox.Show(this, "请选择在线且支持接收消息的客户端。", "发送消息", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -669,6 +676,9 @@ public partial class MainWindow : Window
     private void ApplyPeerMesh(TunnelPeerMeshSnapshot snapshot)
     {
         Replace(PeerRoutes, snapshot.Peers);
+        Replace(MessagePeerRoutes, snapshot.Peers
+            .Where(peer => peer.Online && peer.MessageReceiveCapable)
+            .OrderBy(peer => peer.ClientName, StringComparer.OrdinalIgnoreCase));
         Replace(PeerSessions, snapshot.Sessions);
         PeerCountText.Text = snapshot.Peers.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
         _peerMeshEnabled = snapshot.Enabled;
@@ -676,6 +686,7 @@ public partial class MainWindow : Window
             ? $"本机 {snapshot.VirtualIp ?? "-"} · {snapshot.Cidr ?? "-"} · {snapshot.DeviceName} / {snapshot.DeviceStatus} · 会话 {snapshot.Sessions.Count}"
             : $"Peer Mesh 未启动 · {snapshot.DeviceName} / {snapshot.DeviceStatus}";
         UpdatePeerMeshStatusBrush();
+        UpdateMessageSendState();
     }
 
     private void ApplyClientMessage(ClientMessageSnapshot snapshot)
@@ -707,6 +718,16 @@ public partial class MainWindow : Window
         SendMessageButton.IsEnabled = _running && !_stopping && _clientLoggedIn;
     }
 
+    private bool IsKnownMessageTarget(string target)
+    {
+        if (target.StartsWith("admin:", StringComparison.OrdinalIgnoreCase)
+            && target.Length > "admin:".Length)
+        {
+            return true;
+        }
+        return MessagePeerRoutes.Any(peer => string.Equals(peer.ClientName, target, StringComparison.OrdinalIgnoreCase));
+    }
+
     private void UpdatePeerMeshStatusBrush()
     {
         PeerMeshStatusDot.Background = (Brush)FindResource(_peerMeshEnabled ? "SuccessBrush" : "TextMutedBrush");
@@ -726,6 +747,7 @@ public partial class MainWindow : Window
         TcpRoutes.Clear();
         HttpRoutes.Clear();
         PeerRoutes.Clear();
+        MessagePeerRoutes.Clear();
         PeerSessions.Clear();
         ClientMessages.Clear();
         TcpCountText.Text = "0";

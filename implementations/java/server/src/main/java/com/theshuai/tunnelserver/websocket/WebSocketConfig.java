@@ -31,13 +31,19 @@ import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry
 public class WebSocketConfig implements WebSocketConfigurer {
 
     private final ConnectionEventsWebSocketHandler connectionEventsHandler;
+    private final PublicTransferDiscoveryWebSocketHandler publicTransferDiscoveryHandler;
+    private final ClientMessagesWebSocketHandler clientMessagesHandler;
     private final JwtDecoder jwtDecoder;
     private final ManagementContextResolver contextResolver;
 
     public WebSocketConfig(ConnectionEventsWebSocketHandler connectionEventsHandler,
+                           PublicTransferDiscoveryWebSocketHandler publicTransferDiscoveryHandler,
+                           ClientMessagesWebSocketHandler clientMessagesHandler,
                            JwtDecoder jwtDecoder,
                            ManagementContextResolver contextResolver) {
         this.connectionEventsHandler = connectionEventsHandler;
+        this.publicTransferDiscoveryHandler = publicTransferDiscoveryHandler;
+        this.clientMessagesHandler = clientMessagesHandler;
         this.jwtDecoder = jwtDecoder;
         this.contextResolver = contextResolver;
     }
@@ -47,6 +53,12 @@ public class WebSocketConfig implements WebSocketConfigurer {
         registry.addHandler(connectionEventsHandler, "/ws/connections")
                 .addInterceptors(new JwtHandshakeInterceptor(jwtDecoder, contextResolver))
                 // 默认 '*' 同源；显式写出来以示意，不引入 CORS 漏洞
+                .setAllowedOriginPatterns("*");
+        registry.addHandler(publicTransferDiscoveryHandler, "/ws/public-transfer/discovery")
+                .addInterceptors(new PublicTransferDiscoveryWebSocketHandler.PublicTransferDiscoveryHandshakeInterceptor())
+                .setAllowedOriginPatterns("*");
+        registry.addHandler(clientMessagesHandler, "/ws/client-messages")
+                .addInterceptors(new JwtHandshakeInterceptor(jwtDecoder, contextResolver))
                 .setAllowedOriginPatterns("*");
     }
 }

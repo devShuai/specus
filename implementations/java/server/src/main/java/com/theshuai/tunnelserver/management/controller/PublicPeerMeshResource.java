@@ -1,6 +1,7 @@
 package com.theshuai.tunnelserver.management.controller;
 
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
+import com.theshuai.tunnelserver.peer.TurnCredentialService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -13,9 +14,12 @@ import java.util.List;
 @RestController
 public class PublicPeerMeshResource {
     private final PeerMeshProperties properties;
+    private final TurnCredentialService turnCredentialService;
 
-    public PublicPeerMeshResource(PeerMeshProperties properties) {
+    public PublicPeerMeshResource(PeerMeshProperties properties,
+                                  TurnCredentialService turnCredentialService) {
         this.properties = properties;
+        this.turnCredentialService = turnCredentialService;
     }
 
     @GetMapping("/api/public/peer-mesh/stun-config")
@@ -38,6 +42,41 @@ public class PublicPeerMeshResource {
                 new ArrayList<>(servers),
                 properties.getStunTurnPort()
         );
+    }
+
+    @GetMapping("/api/public/transfer/ice-config")
+    public PublicIceConfig iceConfig(HttpServletRequest request) {
+        PublicStunConfig stun = stunConfig(request);
+        List<IceServer> iceServers = new ArrayList<>(stun.stunServers().stream()
+                .map(url -> new IceServer(url, "", ""))
+                .toList());
+        String turnServer = properties.isEnabled() ? selfHostedTurnServer(request) : "";
+        if (StringUtils.hasText(turnServer)) {
+            TurnCredentialService.TurnCredential credential =
+                    turnCredentialService.issue("public-transfer");
+            iceServers.add(new IceServer(turnServer, credential.username(), credential.credential()));
+        }
+        return new PublicIceConfig(
+                stun.peerMeshEnabled(),
+                iceServers,
+                turnCredentialService.authRequired(),
+                stun.stunTurnPort()
+        );
+    }
+
+    private String selfHostedTurnServer(HttpServletRequest request) {
+        String host = properties.getPublicAddress();
+        if (!StringUtils.hasText(host)) {
+            host = forwardedHost(request);
+        }
+        if (!StringUtils.hasText(host)) {
+            host = request.getServerName();
+        }
+        host = normalizeHost(host);
+        if (!StringUtils.hasText(host) || properties.getStunTurnPort() <= 0) {
+            return "";
+        }
+        return "turn:" + bracketIpv6(host) + ":" + properties.getStunTurnPort() + "?transport=udp";
     }
 
     private String selfHostedStunServer(HttpServletRequest request) {
@@ -149,5 +188,16 @@ public class PublicPeerMeshResource {
                                    String selfHostedStunServer,
                                    List<String> stunServers,
                                    int stunTurnPort) {
+    }
+
+    public record PublicIceConfig(boolean peerMeshEnabled,
+                                  List<IceServer> iceServers,
+                                  boolean turnAuthRequired,
+                                  int stunTurnPort) {
+    }
+
+    public record IceServer(String urls,
+                            String username,
+                            String credential) {
     }
 }

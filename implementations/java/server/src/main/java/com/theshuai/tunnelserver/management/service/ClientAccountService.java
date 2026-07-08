@@ -3,8 +3,10 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.tunnelserver.attribute.ServerAttributes;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.ClientAccountView;
+import com.theshuai.tunnelserver.management.model.ClientSession;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
+import com.theshuai.tunnelserver.management.repository.ClientSessionRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficTotal;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
 import com.theshuai.tunnelserver.management.security.ManagementContext;
@@ -43,11 +45,14 @@ import java.util.stream.Collectors;
 public class ClientAccountService {
     private final ClientAccountRepository clientAccountRepository;
     private final TrafficUsageRepository trafficUsageRepository;
+    private final ClientSessionRepository clientSessionRepository;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
-                                TrafficUsageRepository trafficUsageRepository) {
+                                TrafficUsageRepository trafficUsageRepository,
+                                ClientSessionRepository clientSessionRepository) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
+        this.clientSessionRepository = clientSessionRepository;
     }
 
     @Transactional(readOnly = true)
@@ -60,8 +65,10 @@ public class ClientAccountService {
         // 一次性聚合所有客户端的上下行总量，避免 N+1（每客户端一条 findByClientId 查询）。
         Map<Long, TrafficTotal> totals = trafficUsageRepository.sumBytesByTenantId(tenant.tenantId()).stream()
                 .collect(Collectors.toMap(TrafficTotal::getClientId, t -> t));
-        return clientAccountRepository.findByTenantIdOrderByIdDesc(tenant.tenantId()).stream()
-                .map(account -> toView(account, totals.get(account.getId())))
+        List<ClientAccount> accounts = clientAccountRepository.findByTenantIdOrderByIdDesc(tenant.tenantId());
+        Map<Long, ClientSession> activeSessions = activeSessionMap(tenant.tenantId(), accounts);
+        return accounts.stream()
+                .map(account -> toView(account, totals.get(account.getId()), activeSessions.get(account.getId())))
                 .toList();
     }
 
@@ -69,8 +76,10 @@ public class ClientAccountService {
     public List<ClientAccountView> listClients(ManagementContext context) {
         Map<Long, TrafficTotal> totals = trafficUsageRepository.sumBytesByTenantId(context.tenant().tenantId()).stream()
                 .collect(Collectors.toMap(TrafficTotal::getClientId, t -> t));
-        return visibleAccounts(context).stream()
-                .map(account -> toView(account, totals.get(account.getId())))
+        List<ClientAccount> accounts = visibleAccounts(context);
+        Map<Long, ClientSession> activeSessions = activeSessionMap(context.tenant().tenantId(), accounts);
+        return accounts.stream()
+                .map(account -> toView(account, totals.get(account.getId()), activeSessions.get(account.getId())))
                 .toList();
     }
 
@@ -97,7 +106,7 @@ public class ClientAccountService {
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
         invalidateNameCache(account.getClientName());
-        return new ClientResult(toView(clientAccountRepository.save(account), null));
+        return new ClientResult(toView(clientAccountRepository.save(account), null, null));
     }
 
     @Transactional
@@ -119,7 +128,7 @@ public class ClientAccountService {
         account.setCreatedAt(now);
         account.setUpdatedAt(now);
         invalidateNameCache(account.getClientName());
-        return new ClientResult(toView(clientAccountRepository.save(account), null));
+        return new ClientResult(toView(clientAccountRepository.save(account), null, null));
     }
 
     @Transactional
@@ -173,7 +182,7 @@ public class ClientAccountService {
         TrafficTotal total = trafficUsageRepository
                 .sumBytesByTenantIdAndClientId(tenant.tenantId(), account.getId())
                 .orElse(null);
-        return new ClientResult(toView(account, total));
+        return new ClientResult(toView(account, total, null));
     }
 
     @Transactional
@@ -269,10 +278,38 @@ public class ClientAccountService {
                         context.tenant().tenantId(), context.username());
     }
 
-    private ClientAccountView toView(ClientAccount account, TrafficTotal total) {
+    private Map<Long, ClientSession> activeSessionMap(String tenantId, List<ClientAccount> accounts) {
+        if (accounts == null || accounts.isEmpty()) {
+            return Map.of();
+        }
+        List<Long> clientIds = accounts.stream().map(ClientAccount::getId).toList();
+        return clientSessionRepository
+                .findByTenantIdAndClientIdInAndStatus(tenantId, clientIds, ClientAuthService.STATUS_NETTY_ONLINE)
+                .stream()
+                .collect(Collectors.toMap(
+                        ClientSession::getClientId,
+                        session -> session,
+                        this::newerSession
+                ));
+    }
+
+    private ClientSession newerSession(ClientSession left, ClientSession right) {
+        String leftAt = left.getNettyConnectedAt();
+        String rightAt = right.getNettyConnectedAt();
+        if (leftAt == null) {
+            return right;
+        }
+        if (rightAt == null) {
+            return left;
+        }
+        return leftAt.compareTo(rightAt) >= 0 ? left : right;
+    }
+
+    private ClientAccountView toView(ClientAccount account, TrafficTotal total, ClientSession activeSession) {
         Channel channel = SessionUtil.getChannel(account.getClientName());
         boolean online = channel != null;
         Long connectedSinceMs = online ? channel.attr(ServerAttributes.LOGIN_TIME_MS).get() : null;
+        ClientSession messageSession = online ? activeSession : null;
         long uploadBytes = total == null ? 0L : total.getUploadBytes();
         long downloadBytes = total == null ? 0L : total.getDownloadBytes();
         return new ClientAccountView(
@@ -283,6 +320,11 @@ public class ClientAccountService {
                 account.getConnectionRateLimitPerMinute(),
                 online,
                 connectedSinceMs,
+                messageSession != null && messageSession.isMessageSendCapable(),
+                messageSession != null && messageSession.isMessageReceiveCapable(),
+                messageSession != null && messageSession.isMessageAttachmentsCapable(),
+                messageSession != null && messageSession.isMessageMediaPreviewCapable(),
+                messageSession == null ? 0L : messageSession.getMessageMaxAttachmentBytes(),
                 uploadBytes,
                 downloadBytes,
                 account.getCreatedAt(),

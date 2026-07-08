@@ -7,6 +7,7 @@ import com.theshuai.common.peermesh.PeerDataFrameHeader;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
+import com.theshuai.tunnelserver.management.model.ClientSession;
 import com.theshuai.tunnelserver.management.model.PeerMeshAcl;
 import com.theshuai.tunnelserver.management.model.PeerMeshAclView;
 import com.theshuai.tunnelserver.management.model.PeerMeshDevice;
@@ -15,10 +16,12 @@ import com.theshuai.tunnelserver.management.model.PeerMeshPathStatsView;
 import com.theshuai.tunnelserver.management.model.PeerMeshSession;
 import com.theshuai.tunnelserver.management.model.PeerMeshSessionView;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
+import com.theshuai.tunnelserver.management.repository.ClientSessionRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshSessionRepository;
 import com.theshuai.tunnelserver.management.security.ManagementContext;
+import com.theshuai.tunnelserver.peer.TurnCredentialService;
 import com.theshuai.tunnelserver.security.PasswordService;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import org.springframework.data.domain.Page;
@@ -56,6 +59,8 @@ public class PeerMeshService {
     private final PeerMeshAclRepository aclRepository;
     private final PeerMeshSessionRepository sessionRepository;
     private final ClientAccountRepository clientAccountRepository;
+    private final TurnCredentialService turnCredentialService;
+    private final ClientSessionRepository clientSessionRepository;
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
     private final Map<Long, LongAdder> pendingRelayBytes = new ConcurrentHashMap<>();
     private final Map<Long, String> sessionTokenCache = new ConcurrentHashMap<>();
@@ -65,12 +70,16 @@ public class PeerMeshService {
                            PeerMeshDeviceRepository deviceRepository,
                            PeerMeshAclRepository aclRepository,
                            PeerMeshSessionRepository sessionRepository,
-                           ClientAccountRepository clientAccountRepository) {
+                           ClientAccountRepository clientAccountRepository,
+                           TurnCredentialService turnCredentialService,
+                           ClientSessionRepository clientSessionRepository) {
         this.properties = properties;
         this.deviceRepository = deviceRepository;
         this.aclRepository = aclRepository;
         this.sessionRepository = sessionRepository;
         this.clientAccountRepository = clientAccountRepository;
+        this.turnCredentialService = turnCredentialService;
+        this.clientSessionRepository = clientSessionRepository;
     }
 
     public boolean isEnabled() {
@@ -117,8 +126,12 @@ public class PeerMeshService {
         config.setTurnHost(resolvePeerHost(requestServerName));
         config.setStunPort(properties.getStunTurnPort());
         config.setTurnPort(properties.getStunTurnPort());
-        config.setIceUsername("pm-" + account.getId());
-        config.setIceCredential(shortToken(account.getTenantId(), account.getClientName(), device.getVirtualIp()));
+        TurnCredentialService.TurnCredential turnCredential =
+                turnCredentialService.issue("pm-" + account.getId());
+        config.setIceUsername(turnCredential.username());
+        config.setIceCredential(turnCredential.credential());
+        config.setIceRealm(turnCredential.realm());
+        config.setIceNonce(turnCredential.nonce());
         config.setServerPublicKey(serverPublicKey());
         config.setClientPublicKey(device.getPublicKey());
         return config;
@@ -680,14 +693,50 @@ public class PeerMeshService {
             }
         }
         devices.remove(account.getId());
+        Map<Long, ClientSession> onlineSessions = devices.isEmpty()
+                ? Map.of()
+                : clientSessionRepository.findByTenantIdAndClientIdInAndStatus(
+                                account.getTenantId(),
+                                devices.keySet().stream().toList(),
+                                ClientAuthService.STATUS_NETTY_ONLINE)
+                        .stream()
+                        .collect(Collectors.toMap(
+                                ClientSession::getClientId,
+                                session -> session,
+                                this::mergeMessageCapabilities));
         return devices.values().stream()
-                .map(device -> new PeerRosterItem(
-                        device.getClientId(),
-                        device.getClientName(),
-                        device.getVirtualIp(),
-                        device.getPublicKey(),
-                        SessionUtil.getChannel(device.getClientName()) != null))
+                .map(device -> {
+                    ClientSession session = onlineSessions.get(device.getClientId());
+                    boolean online = SessionUtil.getChannel(device.getClientName()) != null;
+                    return new PeerRosterItem(
+                            device.getClientId(),
+                            device.getClientName(),
+                            device.getVirtualIp(),
+                            device.getPublicKey(),
+                            online,
+                            online && session != null && session.isMessageSendCapable(),
+                            online && session != null && session.isMessageReceiveCapable(),
+                            online && session != null && session.isMessageAttachmentsCapable(),
+                            online && session != null && session.isMessageMediaPreviewCapable(),
+                            online && session != null ? session.getMessageMaxAttachmentBytes() : 0);
+                })
                 .toList();
+    }
+
+    private ClientSession mergeMessageCapabilities(ClientSession left, ClientSession right) {
+        if (left == null) {
+            return right;
+        }
+        if (right == null) {
+            return left;
+        }
+        if (right.isMessageReceiveCapable() && !left.isMessageReceiveCapable()) {
+            return right;
+        }
+        if (right.isMessageSendCapable() && !left.isMessageSendCapable()) {
+            return right;
+        }
+        return right.getMessageMaxAttachmentBytes() > left.getMessageMaxAttachmentBytes() ? right : left;
     }
 
     @Transactional(readOnly = true)
@@ -1022,7 +1071,16 @@ public class PeerMeshService {
     public record AclMutation(Long sourceClientId, Long targetClientId, Boolean allowed, String direction) {
     }
 
-    public record PeerRosterItem(long clientId, String clientName, String virtualIp, String publicKey, boolean online) {
+    public record PeerRosterItem(long clientId,
+                                 String clientName,
+                                 String virtualIp,
+                                 String publicKey,
+                                 boolean online,
+                                 boolean messageSendCapable,
+                                 boolean messageReceiveCapable,
+                                 boolean messageAttachmentsCapable,
+                                 boolean messageMediaPreviewCapable,
+                                 long messageMaxAttachmentBytes) {
     }
 
     public record PeerSessionGrant(PeerMeshSessionView session, String token) {

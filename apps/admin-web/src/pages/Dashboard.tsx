@@ -13,6 +13,7 @@ import { Sidebar, type NavGroup } from "../components/Sidebar";
 
 const LazyOverviewPanel = lazy(() => import("./panels/OverviewPanel").then(m => ({ default: m.OverviewPanel })));
 const LazyClientsPanel = lazy(() => import("./panels/ClientsPanel").then(m => ({ default: m.ClientsPanel })));
+const LazyAdminMessagesPanel = lazy(() => import("./panels/AdminMessagesPanel").then(m => ({ default: m.AdminMessagesPanel })));
 const LazyTunnelsPanel = lazy(() => import("./panels/TunnelsPanel").then(m => ({ default: m.TunnelsPanel })));
 const LazyHttpRoutesPanel = lazy(() => import("./panels/HttpRoutesPanel").then(m => ({ default: m.HttpRoutesPanel })));
 const LazyConnectionsPanel = lazy(() => import("./panels/ConnectionsPanel").then(m => ({ default: m.ConnectionsPanel })));
@@ -26,6 +27,7 @@ const navGroups: NavGroup[] = [
   { label: "概览", items: [{ key: "overview" as const, title: "概览" }] },
   { label: "接入", items: [
     { key: "clients" as const, title: "客户端" },
+    { key: "messages" as const, title: "消息" },
     { key: "tunnels" as const, title: "端口映射" },
     { key: "http-routes" as const, title: "HTTP 路由" },
     { key: "downloads" as const, title: "客户端下载" },
@@ -193,6 +195,7 @@ function CheckIcon() { return <svg className="h-4 w-4 text-primary" fill="none" 
 function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: PanelKey; initializing: boolean; onInitializeDatabase: () => Promise<void> }) {
   switch (panel) {
     case "clients": return <LazyClientsPanel />;
+    case "messages": return <LazyAdminMessagesPanel />;
     case "tunnels": return <LazyTunnelsPanel />;
     case "http-routes": return <LazyHttpRoutesPanel />;
     case "peer-mesh": return <LazyPeerMeshPanel />;

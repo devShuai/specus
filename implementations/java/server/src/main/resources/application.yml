@@ -71,6 +71,24 @@ tunnel:
     relay-worker-threads: ${TUNNEL_PEER_MESH_RELAY_WORKER_THREADS:0}
     relay-worker-queue-capacity: ${TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY:10000}
     relay-traffic-flush-interval-ms: ${TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS:5000}
+    turn-auth-required: ${TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED:true}
+    turn-realm: ${TUNNEL_PEER_MESH_TURN_REALM:shuai-tunnel}
+    turn-shared-secret: ${TUNNEL_PEER_MESH_TURN_SHARED_SECRET:}
+    turn-credential-ttl-seconds: ${TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS:3600}
+  object-storage:
+    # disabled | aliyun-oss. Attachments use server-generated short-lived presigned URLs;
+    # clients upload/download directly to the private bucket.
+    provider: ${TUNNEL_OBJECT_STORAGE_PROVIDER:disabled}
+    endpoint: ${TUNNEL_OBJECT_STORAGE_ENDPOINT:}
+    bucket: ${TUNNEL_OBJECT_STORAGE_BUCKET:}
+    access-key-id: ${TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID:}
+    access-key-secret: ${TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET:}
+    object-prefix: ${TUNNEL_OBJECT_STORAGE_PREFIX:shuai-tunnel/attachments}
+    upload-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS:900}
+    download-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS:600}
+    retention-hours: ${TUNNEL_OBJECT_STORAGE_RETENTION_HOURS:72}
+    max-attachment-bytes: ${TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES:536870912}
+    expiration-scan-interval-ms: ${TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS:3600000}
   client-auth:
     default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
     per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}

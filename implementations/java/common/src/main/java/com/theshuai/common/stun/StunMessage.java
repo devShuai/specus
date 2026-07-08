@@ -5,6 +5,8 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
@@ -123,16 +125,38 @@ public final class StunMessage {
     }
 
     public byte[] toBytes() {
+        return toBytes(null);
+    }
+
+    public byte[] toBytes(byte[] messageIntegrityKey) {
         int attributeBytes = 0;
         for (Attribute attribute : attributes) {
             attributeBytes += 4 + attribute.value().length + padding(attribute.value().length);
         }
-        ByteBuffer buffer = ByteBuffer.allocate(HEADER_BYTES + attributeBytes);
+        if (messageIntegrityKey != null && messageIntegrityKey.length > 0) {
+            byte[] beforeIntegrity = serialize(attributeBytes + 24, attributes);
+            byte[] digest = hmacSha1(messageIntegrityKey, beforeIntegrity);
+            ByteBuffer packet = ByteBuffer.allocate(beforeIntegrity.length + 24);
+            packet.put(beforeIntegrity);
+            packet.putShort((short) ATTR_MESSAGE_INTEGRITY);
+            packet.putShort((short) digest.length);
+            packet.put(digest);
+            return packet.array();
+        }
+        return serialize(attributeBytes, attributes);
+    }
+
+    private byte[] serialize(int declaredAttributeBytes, List<Attribute> serializedAttributes) {
+        int actualAttributeBytes = 0;
+        for (Attribute attribute : serializedAttributes) {
+            actualAttributeBytes += 4 + attribute.value().length + padding(attribute.value().length);
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(HEADER_BYTES + actualAttributeBytes);
         buffer.putShort((short) type);
-        buffer.putShort((short) attributeBytes);
+        buffer.putShort((short) declaredAttributeBytes);
         buffer.putInt(MAGIC_COOKIE);
         buffer.put(transactionId);
-        for (Attribute attribute : attributes) {
+        for (Attribute attribute : serializedAttributes) {
             buffer.putShort((short) attribute.type());
             buffer.putShort((short) attribute.value().length);
             buffer.put(attribute.value());
@@ -141,6 +165,40 @@ public final class StunMessage {
             }
         }
         return buffer.array();
+    }
+
+    public static boolean verifyMessageIntegrity(byte[] packet, int offset, int length, byte[] messageIntegrityKey) {
+        if (messageIntegrityKey == null || messageIntegrityKey.length == 0 || !looksLike(packet, offset, length)) {
+            return false;
+        }
+        int declaredLength = Short.toUnsignedInt(ByteBuffer.wrap(packet, offset + 2, Short.BYTES).getShort());
+        int end = offset + HEADER_BYTES + declaredLength;
+        int position = offset + HEADER_BYTES;
+        while (position < end) {
+            if (end - position < 4) {
+                return false;
+            }
+            int attrType = Short.toUnsignedInt(ByteBuffer.wrap(packet, position, Short.BYTES).getShort());
+            int attrLength = Short.toUnsignedInt(ByteBuffer.wrap(packet, position + 2, Short.BYTES).getShort());
+            int valueOffset = position + 4;
+            int next = valueOffset + attrLength + padding(attrLength);
+            if (attrLength > end - valueOffset || next > end) {
+                return false;
+            }
+            if (attrType == ATTR_MESSAGE_INTEGRITY) {
+                if (attrLength != 20) {
+                    return false;
+                }
+                int signedLength = position - offset + 24 - HEADER_BYTES;
+                byte[] signed = Arrays.copyOfRange(packet, offset, position);
+                ByteBuffer.wrap(signed, 2, Short.BYTES).putShort((short) signedLength);
+                byte[] expected = hmacSha1(messageIntegrityKey, signed);
+                byte[] actual = Arrays.copyOfRange(packet, valueOffset, valueOffset + attrLength);
+                return Arrays.equals(expected, actual);
+            }
+            position = next;
+        }
+        return false;
     }
 
     public int type() {
@@ -185,6 +243,18 @@ public final class StunMessage {
 
     public Optional<byte[]> data() {
         return first(ATTR_DATA).map(attribute -> Arrays.copyOf(attribute.value(), attribute.value().length));
+    }
+
+    public Optional<String> username() {
+        return textAttribute(ATTR_USERNAME);
+    }
+
+    public Optional<String> realm() {
+        return textAttribute(ATTR_REALM);
+    }
+
+    public Optional<String> nonce() {
+        return textAttribute(ATTR_NONCE);
     }
 
     public long lifetimeSeconds(long fallback) {
@@ -266,6 +336,18 @@ public final class StunMessage {
         return new Attribute(ATTR_SOFTWARE, text(value));
     }
 
+    public static Attribute username(String value) {
+        return new Attribute(ATTR_USERNAME, text(value));
+    }
+
+    public static Attribute realm(String value) {
+        return new Attribute(ATTR_REALM, text(value));
+    }
+
+    public static Attribute nonce(String value) {
+        return new Attribute(ATTR_NONCE, text(value));
+    }
+
     public static Attribute errorCode(int code, String reason) {
         int klass = Math.max(3, Math.min(6, code / 100));
         int number = Math.max(0, Math.min(99, code % 100));
@@ -328,6 +410,20 @@ public final class StunMessage {
 
     private static byte[] text(String value) {
         return (value == null ? "" : value).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private Optional<String> textAttribute(int type) {
+        return first(type).map(attribute -> new String(attribute.value(), StandardCharsets.UTF_8));
+    }
+
+    private static byte[] hmacSha1(byte[] key, byte[] payload) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA1");
+            mac.init(new SecretKeySpec(key, "HmacSHA1"));
+            return mac.doFinal(payload);
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot compute STUN message integrity", e);
+        }
     }
 
     public record Attribute(int type, byte[] value) {

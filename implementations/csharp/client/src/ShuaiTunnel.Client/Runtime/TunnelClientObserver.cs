@@ -200,6 +200,16 @@ public sealed class PeerRouteSnapshot
 
     public bool Online { get; init; }
 
+    public bool MessageSendCapable { get; init; }
+
+    public bool MessageReceiveCapable { get; init; }
+
+    public bool MessageAttachmentsCapable { get; init; }
+
+    public bool MessageMediaPreviewCapable { get; init; }
+
+    public long MessageMaxAttachmentBytes { get; init; }
+
     public int CandidateCount { get; init; }
 }
 

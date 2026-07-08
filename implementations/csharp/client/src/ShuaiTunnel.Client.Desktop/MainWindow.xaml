@@ -398,7 +398,7 @@
                                 </Grid.ColumnDefinitions>
                                 <ComboBox x:Name="MessageTargetBox"
                                           IsEditable="True"
-                                          ItemsSource="{Binding PeerRoutes}"
+                                          ItemsSource="{Binding MessagePeerRoutes}"
                                           DisplayMemberPath="ClientName"
                                           SelectedValuePath="ClientName"
                                           Margin="0,0,10,0" />
