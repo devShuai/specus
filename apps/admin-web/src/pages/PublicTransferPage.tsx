@@ -39,6 +39,9 @@ interface IncomingAttachment {
   downloadExpiresAt: string | null;
   direct?: boolean;
   previewUrl?: string;
+  downloading?: boolean;
+  downloadProgress?: number;
+  downloadError?: string | null;
 }
 
 interface DiscoverySignalPayload {
@@ -61,6 +64,15 @@ interface DirectAckWaiter {
   resolve: () => void;
   reject: (error: Error) => void;
   timer: number;
+}
+
+interface ReceivingTransfer {
+  transferId: string;
+  sourcePeerId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  receivedBytes: number;
 }
 
 export function PublicTransferPage() {
@@ -89,6 +101,7 @@ function PublicTransferPageContent() {
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [peers, setPeers] = useState<DiscoveryPeer[]>([]);
   const [incoming, setIncoming] = useState<IncomingAttachment[]>([]);
+  const [receivingTransfers, setReceivingTransfers] = useState<ReceivingTransfer[]>([]);
   const [state, setState] = useState<UploadState>("idle");
   const [progress, setProgress] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
@@ -157,7 +170,7 @@ function PublicTransferPageContent() {
   }, [roomToken, sharedAttachmentId]);
 
   useEffect(() => {
-    const url = discoveryWebSocketUrl(roomId, peerId, sharedDiscoveryEnabled ? roomToken : "");
+    const url = discoveryWebSocketUrl(roomId, peerId, sharedDiscoveryEnabled ? roomToken : "", peerId);
     const socket = new WebSocket(url);
     discoverySocketRef.current = socket;
     socket.onmessage = (event) => {
@@ -576,6 +589,8 @@ function PublicTransferPageContent() {
       if (dataChannelsRef.current.get(sourcePeerId) === channel) {
         dataChannelsRef.current.delete(sourcePeerId);
       }
+      directIncomingRef.current.delete(sourcePeerId);
+      setReceivingTransfers((items) => items.filter((item) => item.sourcePeerId !== sourcePeerId));
     };
   };
 
@@ -589,6 +604,7 @@ function PublicTransferPageContent() {
       if (current) {
         current.chunks.push(data);
         current.receivedBytes += data.byteLength;
+        updateReceivingTransfer(current);
       }
       return;
     }
@@ -605,7 +621,7 @@ function PublicTransferPageContent() {
       return;
     }
     if (message.kind === "file-meta" && message.transferId) {
-      directIncomingRef.current.set(sourcePeerId, {
+      const incomingState = {
         transferId: message.transferId,
         sourcePeerId,
         fileName: message.fileName || "attachment",
@@ -613,7 +629,9 @@ function PublicTransferPageContent() {
         sizeBytes: Number(message.sizeBytes || 0),
         chunks: [],
         receivedBytes: 0,
-      });
+      };
+      directIncomingRef.current.set(sourcePeerId, incomingState);
+      updateReceivingTransfer(incomingState);
       return;
     }
     if (message.kind === "file-complete" && message.transferId) {
@@ -630,12 +648,28 @@ function PublicTransferPageContent() {
     }
   };
 
+  const updateReceivingTransfer = (incomingState: DirectIncomingState) => {
+    setReceivingTransfers((items) => {
+      const view: ReceivingTransfer = {
+        transferId: incomingState.transferId,
+        sourcePeerId: incomingState.sourcePeerId,
+        fileName: incomingState.fileName,
+        mimeType: incomingState.mimeType,
+        sizeBytes: incomingState.sizeBytes,
+        receivedBytes: incomingState.receivedBytes,
+      };
+      const key = receivingTransferKey(view);
+      return [view, ...items.filter((item) => receivingTransferKey(item) !== key)].slice(0, 10);
+    });
+  };
+
   const completeDirectIncoming = (sourcePeerId: string, transferId: string) => {
     const incomingState = directIncomingRef.current.get(sourcePeerId);
     if (!incomingState || incomingState.transferId !== transferId) {
       return;
     }
     directIncomingRef.current.delete(sourcePeerId);
+    setReceivingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== `${sourcePeerId}:${transferId}`));
     const blob = new Blob(incomingState.chunks, { type: incomingState.mimeType });
     const previewUrl = URL.createObjectURL(blob);
     directPreviewUrlsRef.current.push(previewUrl);
@@ -699,15 +733,64 @@ function PublicTransferPageContent() {
     }
   };
 
-  const downloadIncoming = async (item: IncomingAttachment) => {
+  const downloadRecordFile = async () => {
+    if (!record) {
+      return;
+    }
     try {
-      const response = await publicPresignAttachmentDownload(item.attachment.attachmentId, { roomToken });
-      setIncoming((items) => items.map((current) => current === item
+      const response = record.direct
+        ? { downloadUrl: record.previewUrl, downloadHeaders: {}, expiresAt: record.downloadExpiresAt ?? "" }
+        : record.downloadUrl
+          ? { downloadUrl: record.downloadUrl, downloadHeaders: {}, expiresAt: record.downloadExpiresAt ?? "" }
+          : await publicPresignAttachmentDownload(record.attachment.attachmentId, { roomToken });
+      if (!record.downloadUrl && !record.direct && "attachment" in response) {
+        setRecord({
+          ...record,
+          downloadUrl: response.downloadUrl,
+          downloadExpiresAt: response.expiresAt,
+        });
+      }
+      await saveUrlAs(response.downloadUrl, record.attachment.fileName, response.downloadHeaders);
+      setNotice(`已保存：${record.attachment.fileName}`);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存文件失败");
+    }
+  };
+
+  const downloadIncoming = async (item: IncomingAttachment) => {
+    const key = incomingItemKey(item);
+    try {
+      setIncomingDownloadState(key, { downloading: true, downloadProgress: 0, downloadError: null });
+      const response = item.direct
+        ? { downloadUrl: item.downloadUrl || item.previewUrl || "", downloadHeaders: {}, expiresAt: item.downloadExpiresAt ?? "" }
+        : item.downloadUrl
+          ? { downloadUrl: item.downloadUrl, downloadHeaders: {}, expiresAt: item.downloadExpiresAt ?? "" }
+          : await publicPresignAttachmentDownload(item.attachment.attachmentId, { roomToken });
+      if (!response.downloadUrl) {
+        throw new Error("下载地址不可用");
+      }
+      setIncoming((items) => items.map((current) => incomingItemKey(current) === key
         ? { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt }
         : current));
+      await saveUrlAs(response.downloadUrl, item.attachment.fileName, response.downloadHeaders, (value) => {
+        setIncomingDownloadState(key, { downloading: true, downloadProgress: value, downloadError: null });
+      });
+      setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
+      setNotice(`已保存：${item.attachment.fileName}`);
+      setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "换取下载地址失败");
+      const message = err instanceof Error ? err.message : "保存文件失败";
+      setIncomingDownloadState(key, { downloading: false, downloadError: message });
+      setError(message);
     }
+  };
+
+  const setIncomingDownloadState = (
+    key: string,
+    patch: Pick<IncomingAttachment, "downloading" | "downloadProgress" | "downloadError">,
+  ) => {
+    setIncoming((items) => items.map((current) => incomingItemKey(current) === key ? { ...current, ...patch } : current));
   };
 
   const publishAttachmentEnvelope = (targetPeerId: string, objectId: string, attachment: TransferAttachment) => {
@@ -796,6 +879,16 @@ function PublicTransferPageContent() {
               <div className="text-small font-semibold text-cyan-950 dark:text-cyan-100">房间分享</div>
               <div className="mt-1 truncate font-mono text-tiny text-cyan-800/80 dark:text-cyan-100/70">
                 {roomId || "nearby"} · {sharedDiscoveryEnabled ? "共享房间，可跨公网" : "附近模式，同公网出口"} · {peers.length} 个浏览器
+              </div>
+              <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 text-tiny text-cyan-800/80 dark:text-cyan-100/70">
+                <span>我的客户端名称</span>
+                <button
+                  type="button"
+                  className="max-w-full truncate rounded bg-white/70 px-1.5 py-0.5 font-mono underline-offset-2 hover:underline dark:bg-white/10"
+                  onClick={() => void copyText(peerId).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
+                >
+                  {peerId}
+                </button>
               </div>
             </div>
             <div className="flex shrink-0 flex-wrap gap-2">
@@ -911,8 +1004,13 @@ function PublicTransferPageContent() {
                     </Button>
                   )}
                   {record.downloadUrl && (
-                    <Button as="a" radius="sm" color="success" href={record.downloadUrl} target="_blank" rel="noreferrer">
-                      下载
+                    <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
+                      保存为原文件名
+                    </Button>
+                  )}
+                  {!record.downloadUrl && record.presign && (
+                    <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
+                      下载并保存
                     </Button>
                   )}
                 </div>
@@ -952,13 +1050,29 @@ function PublicTransferPageContent() {
           </div>
 
           <h2 className="mt-6 text-lg font-semibold">收到的附件</h2>
+          {receivingTransfers.length > 0 && (
+            <div className="mt-3 flex flex-col gap-2">
+              {receivingTransfers.map((item) => {
+                const percent = transferProgress(item.receivedBytes, item.sizeBytes);
+                return (
+                  <div key={receivingTransferKey(item)} className="rounded-lg border border-cyan-400/30 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10">
+                    <div className="truncate text-small font-medium text-cyan-950 dark:text-cyan-100">{item.fileName}</div>
+                    <div className="mt-1 text-tiny text-cyan-800/75 dark:text-cyan-100/70">
+                      来自 {item.sourcePeerId} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}
+                    </div>
+                    <Progress className="mt-2" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
+                  </div>
+                );
+              })}
+            </div>
+          )}
           <div className="mt-3 flex flex-col gap-2">
             {incoming.length === 0 ? (
               <div className="rounded-lg border border-black/10 bg-white/60 p-3 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400">
                 暂无附件消息。
               </div>
             ) : incoming.map((item) => (
-              <div key={`${item.sourcePeerId}-${item.attachment.attachmentId}`} className="rounded-lg border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.03]">
+              <div key={incomingItemKey(item)} className="rounded-lg border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.03]">
                 <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
                 <div className="mt-1 text-tiny text-zinc-500">
                   来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
@@ -973,17 +1087,23 @@ function PublicTransferPageContent() {
                   <Button size="sm" radius="sm" variant="flat" onPress={() => void shareIncomingFile(item)}>
                     分享
                   </Button>
-                  {!item.direct && (
-                    <Button size="sm" radius="sm" variant="flat" onPress={() => void downloadIncoming(item)}>
-                      换取下载
-                    </Button>
-                  )}
-                  {item.downloadUrl && (
-                    <Button as="a" size="sm" radius="sm" color="success" href={item.downloadUrl} target="_blank" rel="noreferrer">
-                      {item.direct ? "保存" : "下载"}
-                    </Button>
-                  )}
+                  <Button
+                    size="sm"
+                    radius="sm"
+                    color="success"
+                    variant={item.downloadUrl || item.direct ? "solid" : "flat"}
+                    isLoading={item.downloading}
+                    onPress={() => void downloadIncoming(item)}
+                  >
+                    {item.direct ? "保存" : "下载"}
+                  </Button>
                 </div>
+                {item.downloading && (
+                  <Progress className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} color="success" size="sm" value={item.downloadProgress ?? 0} />
+                )}
+                {item.downloadError && (
+                  <div className="mt-2 text-tiny text-rose-600 dark:text-rose-200">{item.downloadError}</div>
+                )}
               </div>
             ))}
           </div>
@@ -1194,6 +1314,78 @@ function formatBytes(bytes: number) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
 }
 
+function transferProgress(doneBytes: number, totalBytes: number) {
+  if (!Number.isFinite(doneBytes) || !Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, Math.round((doneBytes / totalBytes) * 100)));
+}
+
+function receivingTransferKey(item: Pick<ReceivingTransfer, "sourcePeerId" | "transferId">) {
+  return `${item.sourcePeerId}:${item.transferId}`;
+}
+
+function incomingItemKey(item: IncomingAttachment) {
+  return `${item.sourcePeerId}:${item.attachment.attachmentId}:${item.objectId}`;
+}
+
+async function saveUrlAs(
+  url: string,
+  fileName: string,
+  headers: Record<string, string> = {},
+  onProgress?: (value: number) => void,
+) {
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    throw new Error(`下载失败：HTTP ${response.status}`);
+  }
+  const contentLength = Number(response.headers.get("Content-Length") || 0);
+  const chunks: BlobPart[] = [];
+  let received = 0;
+  if (response.body) {
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        const copy = new Uint8Array(value.byteLength);
+        copy.set(value);
+        chunks.push(copy.buffer);
+        received += value.byteLength;
+        onProgress?.(contentLength > 0 ? transferProgress(received, contentLength) : 0);
+      }
+    }
+  } else {
+    const buffer = await response.arrayBuffer();
+    chunks.push(buffer);
+    received = buffer.byteLength;
+  }
+  const blob = new Blob(chunks, {
+    type: response.headers.get("Content-Type") || "application/octet-stream",
+  });
+  downloadBlob(blob, fileName);
+  onProgress?.(100);
+}
+
+function downloadBlob(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = normalizeDownloadName(fileName);
+  link.rel = "noreferrer";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function normalizeDownloadName(fileName: string) {
+  const text = fileName.trim().replace(/[\\/:*?"<>|]+/g, "_");
+  return text || "attachment";
+}
+
 function loadOrCreateRoomToken(preferred?: string | null) {
   if (preferred) {
     sessionStorage.setItem("public-transfer-room-token", preferred);
@@ -1314,12 +1506,12 @@ function loadOrCreatePeerId() {
   return next;
 }
 
-function discoveryWebSocketUrl(roomId: string, peerId: string, roomToken: string) {
+function discoveryWebSocketUrl(roomId: string, peerId: string, roomToken: string, displayName: string) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const params = new URLSearchParams({
     roomId: roomId || "nearby",
     peerId,
-    displayName: navigator.userAgent.includes("Mobile") ? "mobile-web" : "web",
+    displayName: displayName || peerId,
   });
   if (roomToken.trim()) {
     params.set("roomToken", roomToken.trim());
