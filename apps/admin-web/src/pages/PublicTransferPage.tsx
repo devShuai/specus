@@ -450,9 +450,10 @@ function PublicTransferPageContent() {
     setState("presigning");
     setProgress(0);
     try {
+      const mimeType = effectiveMimeType(file.name || "attachment", file.type);
       const presign = await publicPresignAttachmentUpload({
         fileName: file.name || "attachment",
-        mimeType: file.type || "application/octet-stream",
+        mimeType,
         sizeBytes: file.size,
         roomId,
         roomToken,
@@ -491,14 +492,14 @@ function PublicTransferPageContent() {
       kind: "file-meta",
       transferId,
       fileName: file.name || "attachment",
-      mimeType: file.type || "application/octet-stream",
+      mimeType: effectiveMimeType(file.name || "attachment", file.type),
       sizeBytes: file.size,
     }));
     await sendFileChunks(channel, file, setProgress);
     channel.send(JSON.stringify({ kind: "file-complete", transferId }));
     await ack;
 
-    const attachment = directAttachment(transferId, file.name || "attachment", file.type || "application/octet-stream", file.size);
+    const attachment = directAttachment(transferId, file.name || "attachment", effectiveMimeType(file.name || "attachment", file.type), file.size);
     setRecord({
       file,
       previewUrl: URL.createObjectURL(file),
@@ -670,13 +671,14 @@ function PublicTransferPageContent() {
     }
     directIncomingRef.current.delete(sourcePeerId);
     setReceivingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== `${sourcePeerId}:${transferId}`));
-    const blob = new Blob(incomingState.chunks, { type: incomingState.mimeType });
+    const mimeType = effectiveMimeType(incomingState.fileName, incomingState.mimeType);
+    const blob = new Blob(incomingState.chunks, { type: mimeType });
     const previewUrl = URL.createObjectURL(blob);
     directPreviewUrlsRef.current.push(previewUrl);
     const attachment = directAttachment(
       transferId,
       incomingState.fileName,
-      incomingState.mimeType,
+      mimeType,
       incomingState.receivedBytes || incomingState.sizeBytes,
     );
     setIncoming((items) => [
@@ -1099,11 +1101,13 @@ function PublicTransferPageContent() {
                 <div className="mt-1 text-tiny text-zinc-500">
                   来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
                 </div>
-                {item.previewUrl && item.attachment.mimeType.startsWith("image/") && (
-                  <img src={item.previewUrl} alt={item.attachment.fileName} className="mt-2 max-h-44 w-full rounded object-contain" />
-                )}
-                {item.previewUrl && item.attachment.mimeType.startsWith("video/") && (
-                  <video src={item.previewUrl} controls className="mt-2 max-h-44 w-full rounded bg-black object-contain" />
+                {(item.previewUrl || item.direct) && (
+                  <FilePreview
+                    fileName={item.attachment.fileName}
+                    mimeType={item.attachment.mimeType}
+                    url={item.previewUrl}
+                    compact
+                  />
                 )}
                 <div className="mt-2 flex gap-2">
                   <Button size="sm" radius="sm" variant="flat" onPress={() => void shareIncomingFile(item)}>
@@ -1146,25 +1150,69 @@ function PublicTransferPageContent() {
 }
 
 function Preview({ record }: { record: UploadRecord }) {
-  if (record.attachment.mimeType.startsWith("image/")) {
+  return (
+    <FilePreview
+      fileName={record.attachment.fileName}
+      mimeType={record.attachment.mimeType}
+      url={record.previewUrl}
+    />
+  );
+}
+
+function FilePreview({
+  fileName,
+  mimeType,
+  url,
+  compact = false,
+}: {
+  fileName: string;
+  mimeType?: string | null;
+  url?: string | null;
+  compact?: boolean;
+}) {
+  const kind = mediaKind(fileName, mimeType);
+  const [previewFailed, setPreviewFailed] = useState(false);
+  useEffect(() => {
+    setPreviewFailed(false);
+  }, [fileName, mimeType, url]);
+  const frameClass = compact
+    ? "mt-2 overflow-hidden rounded border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
+    : "overflow-hidden rounded-lg border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]";
+  const mediaClass = compact
+    ? "max-h-44 w-full object-contain"
+    : "h-64 w-full object-contain";
+  const fallbackClass = compact
+    ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded border border-black/10 bg-white/60 p-3 text-center dark:border-white/10 dark:bg-white/[0.03]"
+    : "flex h-64 flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]";
+
+  if (url && kind === "image" && !previewFailed) {
     return (
-      <div className="overflow-hidden rounded-lg border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]">
-        <img src={record.previewUrl} alt={record.attachment.fileName} className="h-64 w-full object-contain" />
+      <div className={frameClass}>
+        <img src={url} alt={fileName} className={mediaClass} onError={() => setPreviewFailed(true)} />
       </div>
     );
   }
-  if (record.attachment.mimeType.startsWith("video/")) {
+  if (url && kind === "video" && !previewFailed) {
     return (
-      <div className="overflow-hidden rounded-lg border border-black/10 bg-zinc-950 dark:border-white/10">
-        <video src={record.previewUrl} controls className="h-64 w-full object-contain" />
+      <div className={`${frameClass} bg-zinc-950`}>
+        <video src={url} controls preload="metadata" className={mediaClass} onError={() => setPreviewFailed(true)} />
+      </div>
+    );
+  }
+  if (url && kind === "audio" && !previewFailed) {
+    return (
+      <div className={fallbackClass}>
+        <div className="text-2xl font-semibold text-zinc-300 dark:text-white/20">AUDIO</div>
+        <div className="mt-2 max-w-full truncate text-small font-medium">{fileName}</div>
+        <audio src={url} controls preload="metadata" className="mt-3 w-full" onError={() => setPreviewFailed(true)} />
       </div>
     );
   }
   return (
-    <div className="flex h-64 flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]">
-      <div className="text-4xl font-semibold text-zinc-300 dark:text-white/20">FILE</div>
-      <div className="mt-3 max-w-full truncate text-small font-medium">{record.attachment.fileName}</div>
-      <div className="mt-1 text-tiny text-zinc-500">{record.attachment.mimeType}</div>
+    <div className={fallbackClass}>
+      <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>FILE</div>
+      <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
+      <div className="mt-1 text-tiny text-zinc-500">{effectiveMimeType(fileName, mimeType)}</div>
     </div>
   );
 }
@@ -1299,6 +1347,112 @@ function directAttachment(transferId: string, fileName: string, mimeType: string
     status: "DIRECT",
     expiresAt: "",
   };
+}
+
+type MediaKind = "image" | "video" | "audio" | "file";
+
+const IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "svg", "webp"]);
+const VIDEO_EXTENSIONS = new Set(["3gp", "avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ogv", "webm"]);
+const AUDIO_EXTENSIONS = new Set(["aac", "flac", "m4a", "mp3", "oga", "ogg", "opus", "wav", "weba"]);
+
+function effectiveMimeType(fileName: string, mimeType?: string | null) {
+  const normalized = mimeType?.trim().toLowerCase();
+  if (normalized && normalized !== "application/octet-stream") {
+    return normalized;
+  }
+  const ext = fileExtension(fileName);
+  switch (ext) {
+    case "avif":
+      return "image/avif";
+    case "bmp":
+      return "image/bmp";
+    case "gif":
+      return "image/gif";
+    case "heic":
+      return "image/heic";
+    case "heif":
+      return "image/heif";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "svg":
+      return "image/svg+xml";
+    case "webp":
+      return "image/webp";
+    case "3gp":
+      return "video/3gpp";
+    case "avi":
+      return "video/x-msvideo";
+    case "m4v":
+      return "video/x-m4v";
+    case "mkv":
+      return "video/x-matroska";
+    case "mov":
+      return "video/quicktime";
+    case "mp4":
+      return "video/mp4";
+    case "mpeg":
+    case "mpg":
+      return "video/mpeg";
+    case "ogv":
+      return "video/ogg";
+    case "webm":
+      return "video/webm";
+    case "aac":
+      return "audio/aac";
+    case "flac":
+      return "audio/flac";
+    case "m4a":
+      return "audio/mp4";
+    case "mp3":
+      return "audio/mpeg";
+    case "oga":
+    case "ogg":
+      return "audio/ogg";
+    case "opus":
+      return "audio/opus";
+    case "wav":
+      return "audio/wav";
+    case "weba":
+      return "audio/webm";
+    default:
+      return normalized || "application/octet-stream";
+  }
+}
+
+function mediaKind(fileName: string, mimeType?: string | null): MediaKind {
+  const type = effectiveMimeType(fileName, mimeType);
+  if (type.startsWith("image/")) {
+    return "image";
+  }
+  if (type.startsWith("video/")) {
+    return "video";
+  }
+  if (type.startsWith("audio/")) {
+    return "audio";
+  }
+  const ext = fileExtension(fileName);
+  if (IMAGE_EXTENSIONS.has(ext)) {
+    return "image";
+  }
+  if (VIDEO_EXTENSIONS.has(ext)) {
+    return "video";
+  }
+  if (AUDIO_EXTENSIONS.has(ext)) {
+    return "audio";
+  }
+  return "file";
+}
+
+function fileExtension(fileName: string) {
+  const cleanName = fileName.trim().split(/[\\/]/).pop() || "";
+  const dot = cleanName.lastIndexOf(".");
+  if (dot < 0 || dot === cleanName.length - 1) {
+    return "";
+  }
+  return cleanName.slice(dot + 1).toLowerCase();
 }
 
 function stateLabel(state: UploadState, progress: number) {
