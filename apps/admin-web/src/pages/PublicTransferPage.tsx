@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Chip, Input, Progress, Textarea } from "@heroui/react";
+import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress, Textarea } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { HeroRuntime } from "../components/HeroRuntime";
@@ -43,6 +43,13 @@ interface IncomingAttachment {
   downloading?: boolean;
   downloadProgress?: number;
   downloadError?: string | null;
+}
+
+interface PreviewTarget {
+  fileName: string;
+  mimeType?: string | null;
+  url?: string | null;
+  blob?: Blob | null;
 }
 
 interface DiscoverySignalPayload {
@@ -108,6 +115,7 @@ function PublicTransferPageContent() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [record, setRecord] = useState<UploadRecord | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [iceConfig, setIceConfig] = useState<PublicTransferIceConfig | null>(null);
 
   usePageSeo({
@@ -800,9 +808,14 @@ function PublicTransferPageContent() {
       setIncoming((items) => items.map((current) => incomingItemKey(current) === key
         ? { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt }
         : current));
-      await saveUrlAs(response.downloadUrl, item.attachment.fileName, response.downloadHeaders, (value) => {
+      const blob = await saveUrlAs(response.downloadUrl, item.attachment.fileName, response.downloadHeaders, (value) => {
         setIncomingDownloadState(key, { downloading: true, downloadProgress: value, downloadError: null });
       });
+      const previewUrl = URL.createObjectURL(blob);
+      directPreviewUrlsRef.current.push(previewUrl);
+      setIncoming((items) => items.map((current) => incomingItemKey(current) === key
+        ? { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt, previewUrl, blob }
+        : current));
       setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
       setNotice(`已保存：${item.attachment.fileName}`);
       setError(null);
@@ -838,13 +851,13 @@ function PublicTransferPageContent() {
   };
 
   return (
-    <main className="landing-shell relative min-h-screen overflow-hidden text-zinc-950 dark:text-white">
+    <main className="landing-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
       <div className="landing-grid" aria-hidden="true" />
       <div className="landing-scanline" aria-hidden="true" />
 
-      <header className="relative z-10 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-5 py-5 sm:px-8">
-        <AppLogo label="shuai-tunnel" subtitle="免登录文件互传" markClassName="h-9 w-9" />
-        <div className="flex items-center gap-2">
+      <header className="relative z-10 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
+        <AppLogo label="shuai-tunnel" subtitle="免登录文件互传" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
+        <div className="flex shrink-0 items-center gap-2">
           <ThemeToggleButton className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" />
           <Button as="a" href="/" radius="sm" variant="flat" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white">
             控制台
@@ -852,8 +865,8 @@ function PublicTransferPageContent() {
         </div>
       </header>
 
-      <section className="relative z-10 mx-auto grid w-full max-w-[1120px] gap-5 px-5 pb-14 sm:px-8 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="rounded-xl border border-black/10 bg-white/70 p-5 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05] sm:p-6">
+      <section className="relative z-10 mx-auto grid w-full max-w-[1120px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <div className="min-w-0 rounded-xl border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05] sm:p-6">
           <div className="flex flex-wrap items-center gap-2">
             <Chip radius="sm" variant="flat" color="primary">
               WebRTC 优先
@@ -869,7 +882,7 @@ function PublicTransferPageContent() {
           </div>
 
           <div className="mt-5 flex flex-col gap-3">
-            <h1 className="text-3xl font-semibold sm:text-4xl">免登录互传文件</h1>
+            <h1 className="text-2xl font-semibold sm:text-4xl">免登录互传文件</h1>
             <p className="max-w-2xl text-small leading-6 text-zinc-700 dark:text-zinc-300">
               上传时只向服务端申请短期签名，文件字节由浏览器直接 PUT 到对象存储。消息 envelope 只包含 objectId 与附件元数据。
             </p>
@@ -918,17 +931,17 @@ function PublicTransferPageContent() {
                 </button>
               </div>
             </div>
-            <div className="flex shrink-0 flex-wrap gap-2">
-              <Button radius="sm" variant="flat" onPress={createNewRoom}>
+            <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:shrink-0 sm:flex-wrap">
+              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={createNewRoom}>
                 新房间
               </Button>
-              <Button radius="sm" variant="flat" onPress={() => void copyRoomLink()}>
+              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => void copyRoomLink()}>
                 复制链接
               </Button>
-              <Button color="primary" radius="sm" variant="flat" onPress={() => void shareRoom()}>
+              <Button color="primary" radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => void shareRoom()}>
                 分享房间
               </Button>
-              <Button color={qrVisible ? "default" : "secondary"} radius="sm" variant="flat" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
+              <Button color={qrVisible ? "default" : "secondary"} radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
                 {qrVisible ? "收起二维码" : "手机扫码"}
               </Button>
             </div>
@@ -942,7 +955,7 @@ function PublicTransferPageContent() {
                 <div className="mt-1 text-tiny leading-5 text-zinc-600 dark:text-zinc-300">
                   手机打开后会自动带上房间和口令，适合临时把手机照片、视频发到电脑。
                 </div>
-                <div className="mt-2 truncate rounded bg-zinc-950/5 px-2 py-1 font-mono text-tiny text-zinc-700 dark:bg-white/10 dark:text-zinc-200">
+                <div className="mt-2 break-all rounded bg-zinc-950/5 px-2 py-1 font-mono text-tiny text-zinc-700 dark:bg-white/10 dark:text-zinc-200 sm:truncate">
                   {roomJoinUrl}
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2">
@@ -976,14 +989,14 @@ function PublicTransferPageContent() {
                   {selectedFile ? `${formatBytes(selectedFile.size)} · ${selectedFile.type || "application/octet-stream"}` : "支持图片、视频和任意二进制附件"}
                 </div>
               </div>
-              <div className="flex shrink-0 gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0">
                 <label
                   htmlFor="public-transfer-file-input"
-                  className="inline-flex h-10 min-w-20 cursor-pointer items-center justify-center rounded-small bg-default-100 px-4 text-small font-normal text-foreground transition-colors hover:bg-default-200"
+                  className="inline-flex h-10 min-w-20 w-full cursor-pointer items-center justify-center rounded-small bg-default-100 px-4 text-small font-normal text-foreground transition-colors hover:bg-default-200 sm:w-auto"
                 >
                   选择文件
                 </label>
-                <Button color="primary" radius="sm" isLoading={state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
+                <Button color="primary" radius="sm" className="w-full sm:w-auto" isLoading={state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
                   发送
                 </Button>
               </div>
@@ -1021,6 +1034,7 @@ function PublicTransferPageContent() {
             incoming={incoming}
             onShare={shareIncomingFile}
             onDownload={downloadIncoming}
+            onPreview={setPreviewTarget}
           />
 
           {record && (
@@ -1086,12 +1100,12 @@ function PublicTransferPageContent() {
                   </div>
                 )}
               </div>
-              <Preview record={record} />
+              <Preview record={record} onPreview={setPreviewTarget} />
             </div>
           )}
         </div>
 
-        <aside className="rounded-xl border border-black/10 bg-white/70 p-5 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05]">
+        <aside className="min-w-0 rounded-xl border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05] sm:p-5">
           <h2 className="text-lg font-semibold">{sharedDiscoveryEnabled ? "房间浏览器" : "附近浏览器"}</h2>
           <div className="mt-3 flex flex-col gap-2">
             {peers.length === 0 ? (
@@ -1126,6 +1140,7 @@ function PublicTransferPageContent() {
           </div>
         </aside>
       </section>
+      <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
     </main>
   );
 }
@@ -1135,11 +1150,13 @@ function IncomingFilesPanel({
   incoming,
   onShare,
   onDownload,
+  onPreview,
 }: {
   receivingTransfers: ReceivingTransfer[];
   incoming: IncomingAttachment[];
   onShare: (item: IncomingAttachment) => Promise<void>;
   onDownload: (item: IncomingAttachment) => Promise<void>;
+  onPreview: (target: PreviewTarget) => void;
 }) {
   const hasReceiving = receivingTransfers.length > 0;
   const hasIncoming = incoming.length > 0;
@@ -1180,57 +1197,98 @@ function IncomingFilesPanel({
           <div className="rounded-lg border border-dashed border-black/10 bg-white/60 p-4 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400 md:col-span-2">
             暂无附件消息。对方发送文件后会出现在这里。
           </div>
-        ) : incoming.map((item) => (
-          <div key={incomingItemKey(item)} className="rounded-lg border border-black/10 bg-white/70 p-3 dark:border-white/10 dark:bg-white/[0.04]">
-            <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
-            <div className="mt-1 text-tiny text-zinc-500">
-              来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
+        ) : incoming.map((item) => {
+          const previewUrl = item.previewUrl || item.downloadUrl;
+          return (
+            <div key={incomingItemKey(item)} className="rounded-lg border border-black/10 bg-white/70 p-3 dark:border-white/10 dark:bg-white/[0.04]">
+              <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
+              <div className="mt-1 text-tiny text-zinc-500">
+                来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
+              </div>
+              {(previewUrl || item.direct) && (
+                <FilePreview
+                  fileName={item.attachment.fileName}
+                  mimeType={item.attachment.mimeType}
+                  url={previewUrl}
+                  blob={item.blob}
+                  compact
+                  onPreview={onPreview}
+                />
+              )}
+              <div className="mt-2 flex gap-2">
+                <Button size="sm" radius="sm" variant="flat" onPress={() => void onShare(item)}>
+                  分享
+                </Button>
+                <Button
+                  size="sm"
+                  radius="sm"
+                  color="success"
+                  variant={item.downloadUrl || item.direct ? "solid" : "flat"}
+                  isLoading={item.downloading}
+                  onPress={() => void onDownload(item)}
+                >
+                  {item.direct ? "保存" : "下载"}
+                </Button>
+              </div>
+              {item.downloading && (
+                <Progress className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} color="success" size="sm" value={item.downloadProgress ?? 0} />
+              )}
+              {item.downloadError && (
+                <div className="mt-2 text-tiny text-rose-600 dark:text-rose-200">{item.downloadError}</div>
+              )}
             </div>
-            {(item.previewUrl || item.direct) && (
-              <FilePreview
-                fileName={item.attachment.fileName}
-                mimeType={item.attachment.mimeType}
-                url={item.previewUrl}
-                blob={item.blob}
-                compact
-              />
-            )}
-            <div className="mt-2 flex gap-2">
-              <Button size="sm" radius="sm" variant="flat" onPress={() => void onShare(item)}>
-                分享
-              </Button>
-              <Button
-                size="sm"
-                radius="sm"
-                color="success"
-                variant={item.downloadUrl || item.direct ? "solid" : "flat"}
-                isLoading={item.downloading}
-                onPress={() => void onDownload(item)}
-              >
-                {item.direct ? "保存" : "下载"}
-              </Button>
-            </div>
-            {item.downloading && (
-              <Progress className="mt-2" aria-label={`${item.attachment.fileName} 下载进度`} color="success" size="sm" value={item.downloadProgress ?? 0} />
-            )}
-            {item.downloadError && (
-              <div className="mt-2 text-tiny text-rose-600 dark:text-rose-200">{item.downloadError}</div>
-            )}
-          </div>
-        ))}
+          );
+        })}
       </div>
     </section>
   );
 }
 
-function Preview({ record }: { record: UploadRecord }) {
+function Preview({ record, onPreview }: { record: UploadRecord; onPreview: (target: PreviewTarget) => void }) {
   return (
     <FilePreview
       fileName={record.attachment.fileName}
       mimeType={record.attachment.mimeType}
       url={record.previewUrl}
       blob={record.file}
+      onPreview={onPreview}
     />
+  );
+}
+
+function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClose: () => void }) {
+  const kind = mediaKind(target?.fileName ?? "", target?.mimeType ?? null);
+  const mimeType = target ? effectiveMimeType(target.fileName, target.mimeType) : "";
+
+  return (
+    <Modal isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
+      <ModalContent className="max-w-[min(96vw,1180px)]">
+        {target && (
+          <>
+            <ModalHeader className="flex min-w-0 flex-col gap-2 pr-12">
+              <div className="min-w-0 truncate text-base font-semibold sm:text-lg">{target.fileName}</div>
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <Chip color="primary" size="sm" variant="flat">
+                  {previewKindLabel(kind)}
+                </Chip>
+                <span className="min-w-0 break-all font-mono text-tiny font-normal text-default-500">
+                  {mimeType}
+                </span>
+              </div>
+            </ModalHeader>
+            <ModalBody className="overflow-y-auto px-4 pb-4">
+              <FilePreview
+                fileName={target.fileName}
+                mimeType={target.mimeType}
+                url={target.url}
+                blob={target.blob}
+                expanded
+              />
+            </ModalBody>
+          </>
+        )}
+      </ModalContent>
+    </Modal>
   );
 }
 
@@ -1240,72 +1298,117 @@ function FilePreview({
   url,
   blob,
   compact = false,
+  expanded = false,
+  onPreview,
 }: {
   fileName: string;
   mimeType?: string | null;
   url?: string | null;
   blob?: Blob | null;
   compact?: boolean;
+  expanded?: boolean;
+  onPreview?: (target: PreviewTarget) => void;
 }) {
   const kind = mediaKind(fileName, mimeType);
   const [previewFailed, setPreviewFailed] = useState(false);
   useEffect(() => {
     setPreviewFailed(false);
-  }, [fileName, mimeType, url]);
+  }, [fileName, mimeType, url, blob]);
+  const canOpenPreview = Boolean(onPreview && !expanded && (url || blob));
+  const previewAction = canOpenPreview ? (
+    <div className="mt-2 flex justify-end">
+      <Button
+        size="sm"
+        radius="sm"
+        variant="flat"
+        className="h-8"
+        aria-label={`放大预览 ${fileName}`}
+        onPress={() => onPreview?.({ fileName, mimeType, url, blob })}
+      >
+        {compact ? "放大" : "放大预览"}
+      </Button>
+    </div>
+  ) : null;
   const frameClass = compact
     ? "mt-2 overflow-hidden rounded border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
     : "overflow-hidden rounded-lg border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]";
-  const mediaClass = compact
-    ? "max-h-44 w-full object-contain"
-    : "h-64 w-full object-contain";
-  const documentClass = compact
-    ? "h-44 w-full"
-    : "h-80 w-full";
-  const fallbackClass = compact
-    ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded border border-black/10 bg-white/60 p-3 text-center dark:border-white/10 dark:bg-white/[0.03]"
-    : "flex h-64 flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]";
+  const mediaClass = expanded
+    ? "max-h-[70dvh] w-full object-contain"
+    : compact
+      ? "max-h-44 w-full object-contain"
+      : "h-64 w-full object-contain";
+  const documentClass = expanded
+    ? "h-[70dvh] w-full"
+    : compact
+      ? "h-44 w-full"
+      : "h-80 w-full";
+  const fallbackClass = expanded
+    ? "flex min-h-[45dvh] flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]"
+    : compact
+      ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded border border-black/10 bg-white/60 p-3 text-center dark:border-white/10 dark:bg-white/[0.03]"
+      : "flex h-64 flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]";
 
   if (url && kind === "image" && !previewFailed) {
     return (
-      <div className={frameClass}>
-        <img src={url} alt={fileName} className={mediaClass} onError={() => setPreviewFailed(true)} />
-      </div>
+      <>
+        <div className={frameClass}>
+          <img src={url} alt={fileName} className={mediaClass} onError={() => setPreviewFailed(true)} />
+        </div>
+        {previewAction}
+      </>
     );
   }
   if (url && kind === "video" && !previewFailed) {
     return (
-      <div className={`${frameClass} bg-zinc-950`}>
-        <video src={url} controls preload="metadata" className={mediaClass} onError={() => setPreviewFailed(true)} />
-      </div>
+      <>
+        <div className={`${frameClass} bg-zinc-950`}>
+          <video src={url} controls preload="metadata" className={mediaClass} onError={() => setPreviewFailed(true)} />
+        </div>
+        {previewAction}
+      </>
     );
   }
   if (url && kind === "audio" && !previewFailed) {
     return (
-      <div className={fallbackClass}>
-        <div className="text-2xl font-semibold text-zinc-300 dark:text-white/20">AUDIO</div>
-        <div className="mt-2 max-w-full truncate text-small font-medium">{fileName}</div>
-        <audio src={url} controls preload="metadata" className="mt-3 w-full" onError={() => setPreviewFailed(true)} />
-      </div>
+      <>
+        <div className={fallbackClass}>
+          <div className="text-2xl font-semibold text-zinc-300 dark:text-white/20">AUDIO</div>
+          <div className="mt-2 max-w-full truncate text-small font-medium">{fileName}</div>
+          <audio src={url} controls preload="metadata" className="mt-3 w-full" onError={() => setPreviewFailed(true)} />
+        </div>
+        {previewAction}
+      </>
     );
   }
   if (url && kind === "pdf" && !previewFailed) {
     return (
-      <div className={`${frameClass} bg-white`}>
-        <object data={url} type="application/pdf" className={documentClass} onError={() => setPreviewFailed(true)}>
-          <div className="flex h-full items-center justify-center p-3 text-small text-zinc-500">PDF 预览不可用</div>
-        </object>
-      </div>
+      <>
+        <div className={`${frameClass} bg-white`}>
+          <object data={url} type="application/pdf" className={documentClass} onError={() => setPreviewFailed(true)}>
+            <div className="flex h-full items-center justify-center p-3 text-small text-zinc-500">PDF 预览不可用</div>
+          </object>
+        </div>
+        {previewAction}
+      </>
     );
   }
   if (kind === "text" && blob) {
-    return <TextFilePreview fileName={fileName} mimeType={mimeType} blob={blob} compact={compact} />;
+    return (
+      <>
+        <TextFilePreview fileName={fileName} mimeType={mimeType} blob={blob} compact={compact} expanded={expanded} />
+        {previewAction}
+      </>
+    );
   }
   return (
-    <div className={fallbackClass}>
-      <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
-      <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
-      <div className="mt-1 text-tiny text-zinc-500">{effectiveMimeType(fileName, mimeType)}</div>
-    </div>
+    <>
+      <div className={fallbackClass}>
+        <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
+        <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
+        <div className="mt-1 text-tiny text-zinc-500">{effectiveMimeType(fileName, mimeType)}</div>
+      </div>
+      {previewAction}
+    </>
   );
 }
 
@@ -1314,11 +1417,13 @@ function TextFilePreview({
   mimeType,
   blob,
   compact,
+  expanded,
 }: {
   fileName: string;
   mimeType?: string | null;
   blob: Blob;
   compact: boolean;
+  expanded: boolean;
 }) {
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1350,7 +1455,7 @@ function TextFilePreview({
         <span className="min-w-0 truncate text-tiny font-medium">{fileName}</span>
         <span className="shrink-0 text-[10px] uppercase text-zinc-400">{shortMimeLabel(effectiveMimeType(fileName, mimeType))}</span>
       </div>
-      <pre className={`${compact ? "max-h-44" : "h-80"} overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5`}>
+      <pre className={`${expanded ? "h-[68dvh]" : compact ? "max-h-44" : "h-80"} overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-5`}>
         {error || text || "正在读取预览..."}
       </pre>
     </div>
@@ -1377,7 +1482,7 @@ function RoomQrCode({ value }: { value: string }) {
 
   if (!qr.matrix) {
     return (
-      <div className="flex h-36 w-36 shrink-0 items-center justify-center rounded-md border border-dashed border-zinc-300 bg-white p-3 text-center text-tiny text-zinc-500">
+      <div className="mx-auto flex h-36 w-36 shrink-0 items-center justify-center rounded-md border border-dashed border-zinc-300 bg-white p-3 text-center text-tiny text-zinc-500 sm:mx-0">
         {qr.error}
       </div>
     );
@@ -1392,7 +1497,7 @@ function RoomQrCode({ value }: { value: string }) {
 
   return (
     <svg
-      className="h-36 w-36 shrink-0 rounded-md bg-white p-2 shadow-sm ring-1 ring-black/10"
+      className="mx-auto h-36 w-36 shrink-0 rounded-md bg-white p-2 shadow-sm ring-1 ring-black/10 sm:mx-0"
       viewBox={`0 0 ${viewSize} ${viewSize}`}
       role="img"
       aria-label="当前房间二维码"
@@ -2206,7 +2311,7 @@ async function saveUrlAs(
   fileName: string,
   headers: Record<string, string> = {},
   onProgress?: (value: number) => void,
-) {
+): Promise<Blob> {
   const response = await fetch(url, { headers });
   if (!response.ok) {
     throw new Error(`下载失败：HTTP ${response.status}`);
@@ -2239,6 +2344,7 @@ async function saveUrlAs(
   });
   downloadBlob(blob, fileName);
   onProgress?.(100);
+  return blob;
 }
 
 function downloadBlob(blob: Blob, fileName: string) {
