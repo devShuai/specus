@@ -1,6 +1,7 @@
 package com.theshuai.tunnelserver.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
@@ -28,15 +29,15 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
     private static final int MAX_MESSAGE_CHARS = 64 * 1024;
 
-    private final ObjectMapper objectMapper;
+    private final ObjectMapper objectMapper = new ObjectMapper()
+            .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+            .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
     private final ClientAccountService clientAccountService;
     private final ClientSessionRepository clientSessionRepository;
     private final Map<String, Set<WebSocketSession>> adminSessions = new ConcurrentHashMap<>();
 
-    public ClientMessagesWebSocketHandler(ObjectMapper objectMapper,
-                                          ClientAccountService clientAccountService,
+    public ClientMessagesWebSocketHandler(ClientAccountService clientAccountService,
                                           ClientSessionRepository clientSessionRepository) {
-        this.objectMapper = objectMapper;
         this.clientAccountService = clientAccountService;
         this.clientSessionRepository = clientSessionRepository;
     }
