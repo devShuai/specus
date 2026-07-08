@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress, Textarea } from "@heroui/react";
+import type { ReactNode } from "react";
+import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { HeroRuntime } from "../components/HeroRuntime";
@@ -120,7 +121,7 @@ function PublicTransferPageContent() {
 
   usePageSeo({
     title: "免登录文件互传 · shuai-tunnel",
-    description: "通过 WebRTC 优先直连，对象存储预签名 URL 兜底的免登录文件互传页面。",
+    description: "打开同一个房间链接，在电脑和手机之间快速互传文件。",
     canonical: "https://tunnel.devshuai.com/#/transfer",
   });
 
@@ -251,22 +252,11 @@ function PublicTransferPageContent() {
     directPreviewUrlsRef.current = [];
   }, []);
 
-  const envelopeText = useMemo(() => {
-    if (!record?.presign) {
-      return "";
-    }
-    return JSON.stringify(
-      {
-        type: "STMSG2",
-        messageType: "attachment",
-        objectId: record.presign.objectId,
-        attachment: record.attachment,
-      },
-      null,
-      2,
-    );
-  }, [record]);
   const roomJoinUrl = useMemo(() => roomShareUrl(roomId, roomToken), [roomId, roomToken]);
+  const selectedPeer = useMemo(
+    () => peers.find((peer) => peer.peerId === selectedPeerId) ?? null,
+    [peers, selectedPeerId],
+  );
 
   const updateRoomToken = (value: string) => {
     setRoomToken(value);
@@ -383,29 +373,6 @@ function PublicTransferPageContent() {
     }
   };
 
-  const copyRecordDownloadUrl = async () => {
-    if (!record?.presign) {
-      return;
-    }
-    try {
-      const response = record.downloadUrl
-        ? { downloadUrl: record.downloadUrl, expiresAt: record.downloadExpiresAt ?? "" }
-        : await publicPresignAttachmentDownload(record.attachment.attachmentId, { roomToken });
-      if (!record.downloadUrl && "attachment" in response) {
-        setRecord({
-          ...record,
-          downloadUrl: response.downloadUrl,
-          downloadExpiresAt: response.expiresAt,
-        });
-      }
-      await copyText(response.downloadUrl);
-      setNotice("短期下载地址已复制");
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "复制短期下载地址失败");
-    }
-  };
-
   const shareIncomingFile = async (item: IncomingAttachment) => {
     try {
       if (item.direct) {
@@ -457,7 +424,7 @@ function PublicTransferPageContent() {
         await sendDirect(selectedPeerId, selectedFile);
         return;
       } catch (err) {
-        setError(`直连未完成，已切换 OSS 兜底：${err instanceof Error ? err.message : "unknown"}`);
+        setError(`直接发送未完成，正在改用分享链接：${err instanceof Error ? err.message : "unknown"}`);
       }
     }
     await uploadViaOss(selectedFile);
@@ -737,22 +704,6 @@ function PublicTransferPageContent() {
     directAckWaitersRef.current.set(transferId, { resolve, reject, timer });
   });
 
-  const createDownloadUrl = async () => {
-    if (!record) {
-      return;
-    }
-    try {
-      const response = await publicPresignAttachmentDownload(record.attachment.attachmentId, { roomToken });
-      setRecord({
-        ...record,
-        downloadUrl: response.downloadUrl,
-        downloadExpiresAt: response.expiresAt,
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "换取下载地址失败");
-    }
-  };
-
   const downloadRecordFile = async () => {
     if (!record) {
       return;
@@ -856,7 +807,7 @@ function PublicTransferPageContent() {
       <div className="landing-scanline" aria-hidden="true" />
 
       <header className="relative z-10 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
-        <AppLogo label="shuai-tunnel" subtitle="免登录文件互传" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
+        <AppLogo label="shuai-tunnel" subtitle="传文件" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="flex shrink-0 items-center gap-2">
           <ThemeToggleButton className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" />
           <Button as="a" href="/" radius="sm" variant="flat" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white">
@@ -867,61 +818,22 @@ function PublicTransferPageContent() {
 
       <section className="relative z-10 mx-auto grid w-full max-w-[1120px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 lg:grid-cols-[minmax(0,1fr)_360px]">
         <div className="min-w-0 rounded-xl border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05] sm:p-6">
-          <div className="flex flex-wrap items-center gap-2">
-            <Chip radius="sm" variant="flat" color="primary">
-              WebRTC 优先
-            </Chip>
-            <Chip radius="sm" variant="flat" color="success">
-              OSS 直传兜底
-            </Chip>
-            {iceConfig?.turnAuthRequired && (
-              <Chip radius="sm" variant="flat" color="warning">
-                TURN 需认证
-              </Chip>
-            )}
-          </div>
-
-          <div className="mt-5 flex flex-col gap-3">
-            <h1 className="text-2xl font-semibold sm:text-4xl">免登录互传文件</h1>
+          <div className="flex flex-col gap-2">
+            <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">文件互传</div>
+            <h1 className="text-2xl font-semibold sm:text-4xl">把文件发给另一台设备</h1>
             <p className="max-w-2xl text-small leading-6 text-zinc-700 dark:text-zinc-300">
-              上传时只向服务端申请短期签名，文件字节由浏览器直接 PUT 到对象存储。消息 envelope 只包含 objectId 与附件元数据。
+              选文件，邀请对方加入，点发送。手机和电脑都可以直接打开这个页面。
             </p>
-          </div>
-
-          <div className="mt-6 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-            <Input
-              label="房间"
-              radius="sm"
-              variant="bordered"
-              value={roomId}
-              onValueChange={setRoomId}
-              maxLength={120}
-            />
-            <Input
-              label="房间口令"
-              radius="sm"
-              variant="bordered"
-              value={roomToken}
-              onValueChange={updateRoomToken}
-              endContent={
-                <Button size="sm" variant="light" onPress={() => {
-                  const next = createRoomToken();
-                  updateRoomToken(next);
-                }}>
-                  生成
-                </Button>
-              }
-            />
           </div>
 
           <div className="mt-4 flex flex-col gap-3 rounded-lg border border-cyan-500/20 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
-              <div className="text-small font-semibold text-cyan-950 dark:text-cyan-100">房间分享</div>
-              <div className="mt-1 truncate font-mono text-tiny text-cyan-800/80 dark:text-cyan-100/70">
-                {roomId || "nearby"} · {sharedDiscoveryEnabled ? "共享房间，可跨公网" : "附近模式，同公网出口"} · {peers.length} 个浏览器
+              <div className="text-small font-semibold text-cyan-950 dark:text-cyan-100">邀请对方加入</div>
+              <div className="mt-1 text-tiny leading-5 text-cyan-800/80 dark:text-cyan-100/70">
+                复制邀请链接，或让手机扫码。对方打开后会出现在右侧列表。
               </div>
               <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 text-tiny text-cyan-800/80 dark:text-cyan-100/70">
-                <span>我的客户端名称</span>
+                <span>我的名称</span>
                 <button
                   type="button"
                   className="max-w-full truncate rounded bg-white/70 px-1.5 py-0.5 font-mono underline-offset-2 hover:underline dark:bg-white/10"
@@ -932,20 +844,49 @@ function PublicTransferPageContent() {
               </div>
             </div>
             <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:shrink-0 sm:flex-wrap">
-              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={createNewRoom}>
-                新房间
-              </Button>
-              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => void copyRoomLink()}>
-                复制链接
-              </Button>
               <Button color="primary" radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => void shareRoom()}>
-                分享房间
+                邀请对方
               </Button>
               <Button color={qrVisible ? "default" : "secondary"} radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
                 {qrVisible ? "收起二维码" : "手机扫码"}
               </Button>
+              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => void copyRoomLink()}>
+                复制链接
+              </Button>
+              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={createNewRoom}>
+                新房间
+              </Button>
             </div>
           </div>
+
+          <details className="mt-3 rounded-lg border border-black/10 bg-white/55 p-3 text-small dark:border-white/10 dark:bg-white/[0.03]">
+            <summary className="cursor-pointer font-medium text-zinc-900 dark:text-white">房间设置</summary>
+            <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+              <Input
+                label="房间名"
+                radius="sm"
+                variant="bordered"
+                value={roomId}
+                onValueChange={setRoomId}
+                maxLength={120}
+              />
+              <Input
+                label="加入口令"
+                radius="sm"
+                variant="bordered"
+                value={roomToken}
+                onValueChange={updateRoomToken}
+                endContent={
+                  <Button size="sm" variant="light" onPress={() => {
+                    const next = createRoomToken();
+                    updateRoomToken(next);
+                  }}>
+                    生成
+                  </Button>
+                }
+              />
+            </div>
+          </details>
 
           {qrVisible && (
             <div className="mt-3 flex flex-col gap-3 rounded-lg border border-cyan-500/20 bg-white/65 p-3 dark:border-cyan-300/20 dark:bg-white/[0.04] sm:flex-row sm:items-center">
@@ -982,11 +923,12 @@ function PublicTransferPageContent() {
             />
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
-                <div className="truncate text-small font-medium text-zinc-900 dark:text-white">
+                <div className="text-tiny font-medium uppercase tracking-[0.12em] text-zinc-500 dark:text-zinc-400">选择文件</div>
+                <div className="mt-1 truncate text-small font-medium text-zinc-900 dark:text-white">
                   {selectedFile ? selectedFile.name : "尚未选择文件"}
                 </div>
                 <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                  {selectedFile ? `${formatBytes(selectedFile.size)} · ${selectedFile.type || "application/octet-stream"}` : "支持图片、视频和任意二进制附件"}
+                  {selectedFile ? `${formatBytes(selectedFile.size)} · ${selectedFile.type || "未知类型"}` : selectedPeer ? `将发送给 ${selectedPeer.displayName || selectedPeer.peerId}` : "未选择对方时会先生成分享链接"}
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0">
@@ -997,7 +939,7 @@ function PublicTransferPageContent() {
                   选择文件
                 </label>
                 <Button color="primary" radius="sm" className="w-full sm:w-auto" isLoading={state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
-                  发送
+                  {selectedPeer ? "发送给对方" : "生成分享链接"}
                 </Button>
               </div>
             </div>
@@ -1040,65 +982,31 @@ function PublicTransferPageContent() {
           {record && (
             <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
               <div className="rounded-lg border border-black/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/[0.03]">
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-base font-semibold text-zinc-950 dark:text-white">
+                      {record.direct ? "已发送给对方" : selectedPeer ? "已通知对方接收" : "分享链接已准备好"}
+                    </div>
+                    <div className="mt-1 truncate text-small font-medium text-zinc-700 dark:text-zinc-200">{record.attachment.fileName}</div>
+                    <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
+                      {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "可复制链接发给别人"}
+                    </div>
+                  </div>
                   <Chip size="sm" color="success" variant="flat">
-                    {record.attachment.status}
+                    完成
                   </Chip>
-                  <span className="text-small font-medium">{record.attachment.fileName}</span>
-                  <span className="text-tiny text-zinc-500">{formatBytes(record.attachment.sizeBytes)}</span>
                 </div>
-                {record.presign && (
-                  <Textarea
-                    className="mt-3"
-                    label="STMSG2 envelope"
-                    radius="sm"
-                    variant="bordered"
-                    minRows={8}
-                    value={envelopeText}
-                    readOnly
-                  />
-                )}
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button radius="sm" color="primary" variant="flat" onPress={() => void shareRecordFile()}>
-                    分享文件
+                    分享
                   </Button>
                   <Button radius="sm" variant="flat" onPress={() => void copyRecordFileLink()}>
-                    复制文件链接
+                    复制链接
                   </Button>
-                  {record.presign && (
-                    <>
-                      <Button radius="sm" variant="flat" onPress={() => void navigator.clipboard?.writeText(envelopeText)}>
-                        复制 envelope
-                      </Button>
-                      <Button radius="sm" color="primary" variant="flat" onPress={() => void createDownloadUrl()}>
-                        换取下载地址
-                      </Button>
-                      <Button radius="sm" variant="flat" onPress={() => void copyRecordDownloadUrl()}>
-                        复制短期下载
-                      </Button>
-                    </>
-                  )}
-                  {record.direct && (
-                    <Button as="a" radius="sm" color="success" href={record.previewUrl} download={record.attachment.fileName}>
-                      保存
-                    </Button>
-                  )}
-                  {record.downloadUrl && (
-                    <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
-                      保存为原文件名
-                    </Button>
-                  )}
-                  {!record.downloadUrl && record.presign && (
-                    <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
-                      下载并保存
-                    </Button>
-                  )}
+                  <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
+                    保存到本机
+                  </Button>
                 </div>
-                {record.downloadExpiresAt && (
-                  <div className="mt-2 text-tiny text-zinc-500 dark:text-zinc-400">
-                    下载地址过期时间：{record.downloadExpiresAt}
-                  </div>
-                )}
               </div>
               <Preview record={record} onPreview={setPreviewTarget} />
             </div>
@@ -1106,11 +1014,21 @@ function PublicTransferPageContent() {
         </div>
 
         <aside className="min-w-0 rounded-xl border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05] sm:p-5">
-          <h2 className="text-lg font-semibold">{sharedDiscoveryEnabled ? "房间浏览器" : "附近浏览器"}</h2>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold">发送给谁</h2>
+              <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                对方打开邀请链接后，点一下名字再发送。
+              </div>
+            </div>
+            <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "primary" : "default"}>
+              {peers.length} 台
+            </Chip>
+          </div>
           <div className="mt-3 flex flex-col gap-2">
             {peers.length === 0 ? (
               <div className="rounded-lg border border-black/10 bg-white/60 p-3 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400">
-                {sharedDiscoveryEnabled ? "当前共享房间内没有其它网页端。对方打开房间链接后会出现在这里。" : "当前同公网出口、同房间内没有其它网页端。复制或分享房间链接后可跨公网发现。"}
+                还没有其它设备。点击“邀请对方”或“手机扫码”，打开后会出现在这里。
               </div>
             ) : peers.map((peer) => (
               <button
@@ -1123,21 +1041,20 @@ function PublicTransferPageContent() {
                     : "border-black/10 bg-white/60 text-zinc-700 hover:border-black/20 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-200"
                 }`}
               >
-                <div className="font-medium">{peer.displayName || peer.peerId}</div>
-                <div className="mt-0.5 font-mono text-tiny opacity-70">{peer.peerId}</div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0 truncate font-medium">{peer.displayName || peer.peerId}</div>
+                  {selectedPeerId === peer.peerId && (
+                    <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-700 dark:text-cyan-100">
+                      已选
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 truncate font-mono text-tiny opacity-70">{peer.peerId}</div>
               </button>
             ))}
           </div>
 
-          <h2 className="mt-6 text-lg font-semibold">当前传输配置</h2>
-          <dl className="mt-4 flex flex-col gap-3 text-small">
-            <InfoRow label="ICE servers" value={String(iceConfig?.iceServers.length ?? 0)} />
-            <InfoRow label="STUN/TURN 端口" value={String(iceConfig?.stunTurnPort ?? "-")} />
-            <InfoRow label="TURN 认证" value={iceConfig?.turnAuthRequired ? "开启" : "未知"} />
-          </dl>
-          <div className="mt-5 rounded-lg border border-black/10 bg-white/60 p-3 text-tiny leading-5 text-zinc-600 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-300">
-            同一个房间口令用于公开传输附件的 complete 和 download 换签。真正进入聊天流时，只发送 objectId，不携带 uploadUrl 或 downloadUrl。
-          </div>
+          <TransferFaq iceConfig={iceConfig} />
         </aside>
       </section>
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
@@ -1462,12 +1379,44 @@ function TextFilePreview({
   );
 }
 
-function InfoRow({ label, value }: { label: string; value: string }) {
+function TransferFaq({ iceConfig }: { iceConfig: PublicTransferIceConfig | null }) {
+  const routeLabel = iceConfig?.turnAuthRequired ? "备用通道已启用" : "备用通道检测中";
+
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-black/10 pb-2 dark:border-white/10">
-      <dt className="text-zinc-500 dark:text-zinc-400">{label}</dt>
-      <dd className="font-mono text-zinc-900 dark:text-white">{value}</dd>
-    </div>
+    <section className="mt-6 rounded-lg border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.03]">
+      <h2 className="text-base font-semibold text-zinc-950 dark:text-white">常见问题</h2>
+      <div className="mt-2 divide-y divide-black/10 dark:divide-white/10">
+        <FaqItem title="怎么把手机加进来？">
+          点“手机扫码”，用手机相机扫二维码。手机打开后会自动进入同一个房间。
+        </FaqItem>
+        <FaqItem title="找不到对方怎么办？">
+          先点“邀请对方”或“复制链接”发给对方。对方打开页面后，会出现在“发送给谁”列表里。
+        </FaqItem>
+        <FaqItem title="没有选对方也能发送吗？">
+          可以。页面会先生成一个分享链接，你可以复制或系统分享给任何加入这个房间的人。
+        </FaqItem>
+        <FaqItem title="文件会怎么传？">
+          页面会优先让两端直接传；如果网络不适合直连，会自动换成临时安全链接完成传输。
+        </FaqItem>
+        <FaqItem title="更多说明">
+          房间口令只用于确认接收权限；文件地址是短期有效的。当前状态：{routeLabel}。
+        </FaqItem>
+      </div>
+    </section>
+  );
+}
+
+function FaqItem({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <details className="group py-2">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-small font-medium text-zinc-800 dark:text-zinc-100">
+        <span>{title}</span>
+        <span className="shrink-0 text-lg leading-none text-zinc-400 transition-transform group-open:rotate-45">+</span>
+      </summary>
+      <div className="mt-2 text-tiny leading-5 text-zinc-600 dark:text-zinc-300">
+        {children}
+      </div>
+    </details>
   );
 }
 
@@ -1532,10 +1481,10 @@ function putObject(
         onProgress(100);
         resolve();
       } else {
-        reject(new Error(`对象存储上传失败：HTTP ${xhr.status}`));
+        reject(new Error(`文件发送失败：HTTP ${xhr.status}`));
       }
     };
-    xhr.onerror = () => reject(new Error("对象存储上传失败，请检查 bucket CORS 与网络"));
+    xhr.onerror = () => reject(new Error("文件发送失败，请检查网络后重试"));
     xhr.send(file);
   });
 }
@@ -2259,19 +2208,19 @@ function cloneQrMatrix(modules: Array<Array<boolean | null>>) {
 function stateLabel(state: UploadState, progress: number) {
   switch (state) {
     case "connecting":
-      return "正在建立 WebRTC 直连通道";
+      return "正在连接对方设备";
     case "direct":
-      return `浏览器正在通过 WebRTC 直传：${progress}%`;
+      return `正在直接发送：${progress}%`;
     case "presigning":
-      return "正在向服务端申请短期上传签名";
+      return "正在准备分享链接";
     case "uploading":
-      return `浏览器正在直传对象存储：${progress}%`;
+      return `正在发送文件：${progress}%`;
     case "completing":
-      return "正在通知服务端附件已上传完成";
+      return "正在整理接收信息";
     case "done":
-      return "上传完成";
+      return "发送完成";
     case "failed":
-      return "上传失败";
+      return "发送失败";
     default:
       return "";
   }
