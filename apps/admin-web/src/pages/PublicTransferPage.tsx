@@ -78,16 +78,19 @@ function PublicTransferPageContent() {
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
   const directIncomingRef = useRef<Map<string, DirectIncomingState>>(new Map());
   const directAckWaitersRef = useRef<Map<string, DirectAckWaiter>>(new Map());
+  const loadedSharedAttachmentRef = useRef("");
   const directPreviewUrlsRef = useRef<string[]>([]);
   const [peerId] = useState(() => loadOrCreatePeerId());
-  const [roomId, setRoomId] = useState(() => "nearby");
-  const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken());
+  const [roomId, setRoomId] = useState(() => readInitialRoomId());
+  const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
+  const [sharedAttachmentId] = useState(() => readInitialSharedAttachmentId());
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [peers, setPeers] = useState<DiscoveryPeer[]>([]);
   const [incoming, setIncoming] = useState<IncomingAttachment[]>([]);
   const [state, setState] = useState<UploadState>("idle");
   const [progress, setProgress] = useState(0);
+  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [record, setRecord] = useState<UploadRecord | null>(null);
   const [iceConfig, setIceConfig] = useState<PublicTransferIceConfig | null>(null);
@@ -109,6 +112,48 @@ function PublicTransferPageContent() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    sessionStorage.setItem("public-transfer-room-id", roomId || "nearby");
+  }, [roomId]);
+
+  useEffect(() => {
+    if (!sharedAttachmentId || !roomToken.trim()) {
+      return;
+    }
+    const loadKey = `${sharedAttachmentId}:${roomToken}`;
+    if (loadedSharedAttachmentRef.current === loadKey) {
+      return;
+    }
+    loadedSharedAttachmentRef.current = loadKey;
+    let active = true;
+    void publicPresignAttachmentDownload(sharedAttachmentId, { roomToken })
+      .then((response) => {
+        if (!active) {
+          return;
+        }
+        setIncoming((items) => [
+          {
+            sourcePeerId: "shared-link",
+            attachment: response.attachment,
+            objectId: response.objectId,
+            downloadUrl: response.downloadUrl,
+            downloadExpiresAt: response.expiresAt,
+          },
+          ...items.filter((item) => item.attachment.attachmentId !== response.attachment.attachmentId),
+        ].slice(0, 20));
+        setNotice(`已打开共享文件：${response.attachment.fileName}`);
+      })
+      .catch((err) => {
+        if (active) {
+          loadedSharedAttachmentRef.current = "";
+          setError(err instanceof Error ? err.message : "打开共享文件失败");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [roomToken, sharedAttachmentId]);
 
   useEffect(() => {
     const url = discoveryWebSocketUrl(roomId, peerId);
@@ -199,6 +244,152 @@ function PublicTransferPageContent() {
     );
   }, [record]);
 
+  const updateRoomToken = (value: string) => {
+    setRoomToken(value);
+    sessionStorage.setItem("public-transfer-room-token", value);
+  };
+
+  const createNewRoom = () => {
+    const nextRoom = `room-${createRoomToken().slice(0, 8)}`;
+    const nextToken = createRoomToken();
+    setRoomId(nextRoom);
+    updateRoomToken(nextToken);
+    setSelectedPeerId("");
+    setIncoming([]);
+    window.history.replaceState({}, "", roomShareUrl(nextRoom, nextToken));
+    setNotice("已创建新房间");
+    setError(null);
+  };
+
+  const copyRoomLink = async () => {
+    try {
+      await copyText(roomShareUrl(roomId, roomToken));
+      setNotice("房间链接已复制");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "复制房间链接失败");
+    }
+  };
+
+  const shareRoom = async () => {
+    const url = roomShareUrl(roomId, roomToken);
+    try {
+      await shareOrCopy(
+        {
+          title: "加入 shuai-tunnel 文件互传房间",
+          text: `房间：${roomId || "nearby"}`,
+          url,
+        },
+        url,
+      );
+      setNotice(canUseSystemShare() ? "已打开系统分享" : "房间链接已复制");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "分享房间失败");
+    }
+  };
+
+  const shareRecordFile = async () => {
+    if (!record) {
+      return;
+    }
+    try {
+      if (record.direct) {
+        const fileShareData = {
+          title: record.attachment.fileName,
+          text: "shuai-tunnel 直连文件",
+          files: [record.file],
+        };
+        if (canShareFiles(fileShareData)) {
+          await navigator.share(fileShareData);
+          setNotice("已打开系统文件分享");
+        } else {
+          await copyText(roomShareUrl(roomId, roomToken));
+          setNotice("直连文件只在当前会话内可用；已复制房间链接");
+        }
+      } else {
+        const url = fileShareUrl(record.attachment, roomId, roomToken);
+        await shareOrCopy(
+          {
+            title: `接收 ${record.attachment.fileName}`,
+            text: `${record.attachment.fileName} · ${formatBytes(record.attachment.sizeBytes)}`,
+            url,
+          },
+          url,
+        );
+        setNotice(canUseSystemShare() ? "已打开系统分享" : "文件链接已复制");
+      }
+      setError(null);
+    } catch (err) {
+      if (isShareCancelled(err)) {
+        return;
+      }
+      setError(err instanceof Error ? err.message : "分享文件失败");
+    }
+  };
+
+  const copyRecordFileLink = async () => {
+    if (!record) {
+      return;
+    }
+    try {
+      await copyText(record.direct ? roomShareUrl(roomId, roomToken) : fileShareUrl(record.attachment, roomId, roomToken));
+      setNotice(record.direct ? "已复制房间链接" : "文件链接已复制");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "复制文件链接失败");
+    }
+  };
+
+  const copyRecordDownloadUrl = async () => {
+    if (!record?.presign) {
+      return;
+    }
+    try {
+      const response = record.downloadUrl
+        ? { downloadUrl: record.downloadUrl, expiresAt: record.downloadExpiresAt ?? "" }
+        : await publicPresignAttachmentDownload(record.attachment.attachmentId, { roomToken });
+      if (!record.downloadUrl && "attachment" in response) {
+        setRecord({
+          ...record,
+          downloadUrl: response.downloadUrl,
+          downloadExpiresAt: response.expiresAt,
+        });
+      }
+      await copyText(response.downloadUrl);
+      setNotice("短期下载地址已复制");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "复制短期下载地址失败");
+    }
+  };
+
+  const shareIncomingFile = async (item: IncomingAttachment) => {
+    try {
+      if (item.direct) {
+        await copyText(roomShareUrl(roomId, roomToken));
+        setNotice("直连文件只在当前会话内可用；已复制房间链接");
+      } else {
+        const url = fileShareUrl(item.attachment, roomId, roomToken);
+        await shareOrCopy(
+          {
+            title: `接收 ${item.attachment.fileName}`,
+            text: `${item.attachment.fileName} · ${formatBytes(item.attachment.sizeBytes)}`,
+            url,
+          },
+          url,
+        );
+        setNotice(canUseSystemShare() ? "已打开系统分享" : "文件链接已复制");
+      }
+      setError(null);
+    } catch (err) {
+      if (isShareCancelled(err)) {
+        return;
+      }
+      setError(err instanceof Error ? err.message : "分享文件失败");
+    }
+  };
+
   const upload = async () => {
     if (!selectedFile) {
       setError("请选择要发送的文件");
@@ -211,6 +402,7 @@ function PublicTransferPageContent() {
 
     setProgress(0);
     setError(null);
+    setNotice(null);
     if (record?.previewUrl) {
       URL.revokeObjectURL(record.previewUrl);
     }
@@ -573,20 +765,36 @@ function PublicTransferPageContent() {
               radius="sm"
               variant="bordered"
               value={roomToken}
-              onValueChange={(value) => {
-                setRoomToken(value);
-                sessionStorage.setItem("public-transfer-room-token", value);
-              }}
+              onValueChange={updateRoomToken}
               endContent={
                 <Button size="sm" variant="light" onPress={() => {
                   const next = createRoomToken();
-                  setRoomToken(next);
-                  sessionStorage.setItem("public-transfer-room-token", next);
+                  updateRoomToken(next);
                 }}>
                   生成
                 </Button>
               }
             />
+          </div>
+
+          <div className="mt-4 flex flex-col gap-3 rounded-lg border border-cyan-500/20 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <div className="text-small font-semibold text-cyan-950 dark:text-cyan-100">房间分享</div>
+              <div className="mt-1 truncate font-mono text-tiny text-cyan-800/80 dark:text-cyan-100/70">
+                {roomId || "nearby"} · {peers.length} 个附近浏览器
+              </div>
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <Button radius="sm" variant="flat" onPress={createNewRoom}>
+                新房间
+              </Button>
+              <Button radius="sm" variant="flat" onPress={() => void copyRoomLink()}>
+                复制链接
+              </Button>
+              <Button color="primary" radius="sm" variant="flat" onPress={() => void shareRoom()}>
+                分享房间
+              </Button>
+            </div>
           </div>
 
           <div className="mt-5 rounded-lg border border-dashed border-zinc-300 bg-white/60 p-4 dark:border-white/15 dark:bg-white/[0.03]">
@@ -630,6 +838,12 @@ function PublicTransferPageContent() {
             </div>
           )}
 
+          {notice && (
+            <div className="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-small text-emerald-800 dark:border-emerald-400/30 dark:bg-emerald-500/10 dark:text-emerald-100">
+              {notice}
+            </div>
+          )}
+
           {error && (
             <div className="mt-4 rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-small text-rose-700 dark:border-rose-400/30 dark:bg-rose-500/10 dark:text-rose-100">
               {error}
@@ -658,6 +872,12 @@ function PublicTransferPageContent() {
                   />
                 )}
                 <div className="mt-3 flex flex-wrap gap-2">
+                  <Button radius="sm" color="primary" variant="flat" onPress={() => void shareRecordFile()}>
+                    分享文件
+                  </Button>
+                  <Button radius="sm" variant="flat" onPress={() => void copyRecordFileLink()}>
+                    复制文件链接
+                  </Button>
                   {record.presign && (
                     <>
                       <Button radius="sm" variant="flat" onPress={() => void navigator.clipboard?.writeText(envelopeText)}>
@@ -665,6 +885,9 @@ function PublicTransferPageContent() {
                       </Button>
                       <Button radius="sm" color="primary" variant="flat" onPress={() => void createDownloadUrl()}>
                         换取下载地址
+                      </Button>
+                      <Button radius="sm" variant="flat" onPress={() => void copyRecordDownloadUrl()}>
+                        复制短期下载
                       </Button>
                     </>
                   )}
@@ -733,6 +956,9 @@ function PublicTransferPageContent() {
                   <video src={item.previewUrl} controls className="mt-2 max-h-44 w-full rounded bg-black object-contain" />
                 )}
                 <div className="mt-2 flex gap-2">
+                  <Button size="sm" radius="sm" variant="flat" onPress={() => void shareIncomingFile(item)}>
+                    分享
+                  </Button>
                   {!item.direct && (
                     <Button size="sm" radius="sm" variant="flat" onPress={() => void downloadIncoming(item)}>
                       换取下载
@@ -954,7 +1180,11 @@ function formatBytes(bytes: number) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
 }
 
-function loadOrCreateRoomToken() {
+function loadOrCreateRoomToken(preferred?: string | null) {
+  if (preferred) {
+    sessionStorage.setItem("public-transfer-room-token", preferred);
+    return preferred;
+  }
   const existing = sessionStorage.getItem("public-transfer-room-token");
   if (existing) {
     return existing;
@@ -962,6 +1192,90 @@ function loadOrCreateRoomToken() {
   const next = createRoomToken();
   sessionStorage.setItem("public-transfer-room-token", next);
   return next;
+}
+
+function readInitialRoomId() {
+  const params = readTransferParams();
+  const room = params.get("room") || params.get("roomId") || sessionStorage.getItem("public-transfer-room-id");
+  return normalizeRoomId(room);
+}
+
+function readInitialRoomToken() {
+  const params = readTransferParams();
+  return params.get("token") || params.get("roomToken") || null;
+}
+
+function readInitialSharedAttachmentId() {
+  const params = readTransferParams();
+  const value = params.get("attachmentId") || params.get("file");
+  const id = Number(value);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+function readTransferParams() {
+  const params = new URLSearchParams(window.location.search);
+  const queryStart = window.location.hash.indexOf("?");
+  if (queryStart >= 0) {
+    const hashParams = new URLSearchParams(window.location.hash.slice(queryStart + 1).split("#", 1)[0]);
+    hashParams.forEach((value, key) => {
+      if (!params.has(key)) {
+        params.set(key, value);
+      }
+    });
+  }
+  return params;
+}
+
+function normalizeRoomId(value: string | null) {
+  const text = value?.trim();
+  if (!text) {
+    return "nearby";
+  }
+  return text.length > 120 ? text.substring(0, 120) : text;
+}
+
+function roomShareUrl(roomId: string, roomToken: string) {
+  const url = new URL("/transfer", window.location.origin);
+  url.searchParams.set("room", normalizeRoomId(roomId));
+  if (roomToken.trim()) {
+    url.searchParams.set("token", roomToken.trim());
+  }
+  return url.toString();
+}
+
+function fileShareUrl(attachment: TransferAttachment, roomId: string, roomToken: string) {
+  const url = new URL(roomShareUrl(roomId, roomToken));
+  url.searchParams.set("attachmentId", String(attachment.attachmentId));
+  return url.toString();
+}
+
+async function copyText(value: string) {
+  if (!navigator.clipboard?.writeText) {
+    throw new Error("当前浏览器不允许自动复制");
+  }
+  await navigator.clipboard.writeText(value);
+}
+
+async function shareOrCopy(data: ShareData, fallbackText: string) {
+  if (navigator.share) {
+    await navigator.share(data);
+    return;
+  }
+  await copyText(fallbackText);
+}
+
+function canUseSystemShare() {
+  return typeof navigator.share === "function";
+}
+
+function canShareFiles(data: ShareData) {
+  return typeof navigator.share === "function"
+    && typeof navigator.canShare === "function"
+    && navigator.canShare(data);
+}
+
+function isShareCancelled(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function createRoomToken() {
