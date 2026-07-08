@@ -18,9 +18,12 @@ import org.springframework.web.socket.server.HandshakeInterceptor;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -49,6 +52,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 "peerId", participant.peerId(),
                 "roomId", participant.roomId(),
                 "publicAddress", participant.publicAddress(),
+                "sharedRoom", participant.sharedRoom(),
                 "connectedAt", participant.connectedAt()
         ));
         broadcastRoster(participant);
@@ -122,6 +126,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                     view.put("displayName", peer.displayName());
                     view.put("roomId", peer.roomId());
                     view.put("publicAddress", peer.publicAddress());
+                    view.put("sharedRoom", peer.sharedRoom());
                     view.put("connectedAt", peer.connectedAt());
                     return view;
                 })
@@ -130,6 +135,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 "type", "roster",
                 "roomId", group.roomId(),
                 "publicAddress", group.publicAddress(),
+                "sharedRoom", group.sharedRoom(),
                 "peers", peers
         );
         broadcastToGroup(group, payload, false);
@@ -192,6 +198,8 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             String displayName,
             String roomId,
             String publicAddress,
+            String roomKey,
+            boolean sharedRoom,
             String connectedAt
     ) {
         private static Participant from(WebSocketSession session) {
@@ -202,12 +210,14 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                     stringAttr(attrs, "displayName", "web"),
                     stringAttr(attrs, "roomId", "nearby"),
                     stringAttr(attrs, "publicAddress", "unknown"),
+                    stringAttr(attrs, "roomKey", "public:unknown"),
+                    Boolean.TRUE.equals(attrs.get("sharedRoom")),
                     Instant.now().toString()
             );
         }
 
         private boolean sameGroup(Participant other) {
-            return roomId.equals(other.roomId) && publicAddress.equals(other.publicAddress);
+            return roomId.equals(other.roomId) && roomKey.equals(other.roomKey);
         }
 
         private static String stringAttr(Map<String, Object> attrs, String key, String fallback) {
@@ -230,7 +240,12 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             attributes.put("roomId", query(params, "roomId", "nearby", 120));
             attributes.put("peerId", query(params, "peerId", "", 120));
             attributes.put("displayName", query(params, "displayName", "web", 120));
-            attributes.put("publicAddress", publicAddress(request));
+            String publicAddress = publicAddress(request);
+            String roomToken = query(params, "roomToken", "", 512);
+            boolean sharedRoom = StringUtils.hasText(roomToken);
+            attributes.put("publicAddress", publicAddress);
+            attributes.put("sharedRoom", sharedRoom);
+            attributes.put("roomKey", sharedRoom ? "token:" + sha256(roomToken) : "public:" + publicAddress);
             return true;
         }
 
@@ -272,6 +287,15 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 return "";
             }
             return value.split(",", 2)[0].trim();
+        }
+
+        private static String sha256(String value) {
+            try {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                return HexFormat.of().formatHex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
+            } catch (Exception e) {
+                throw new IllegalStateException("failed to hash room token", e);
+            }
         }
     }
 }

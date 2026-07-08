@@ -83,6 +83,7 @@ function PublicTransferPageContent() {
   const [peerId] = useState(() => loadOrCreatePeerId());
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
+  const [sharedDiscoveryEnabled, setSharedDiscoveryEnabled] = useState(() => Boolean(readInitialRoomToken()));
   const [sharedAttachmentId] = useState(() => readInitialSharedAttachmentId());
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedPeerId, setSelectedPeerId] = useState("");
@@ -156,7 +157,7 @@ function PublicTransferPageContent() {
   }, [roomToken, sharedAttachmentId]);
 
   useEffect(() => {
-    const url = discoveryWebSocketUrl(roomId, peerId);
+    const url = discoveryWebSocketUrl(roomId, peerId, sharedDiscoveryEnabled ? roomToken : "");
     const socket = new WebSocket(url);
     discoverySocketRef.current = socket;
     socket.onmessage = (event) => {
@@ -200,7 +201,7 @@ function PublicTransferPageContent() {
       }
       socket.close();
     };
-  }, [peerId, roomId]);
+  }, [peerId, roomId, roomToken, sharedDiscoveryEnabled]);
 
   useEffect(() => {
     return () => {
@@ -249,11 +250,17 @@ function PublicTransferPageContent() {
     sessionStorage.setItem("public-transfer-room-token", value);
   };
 
+  const enableSharedDiscovery = () => {
+    setSharedDiscoveryEnabled(true);
+    window.history.replaceState({}, "", roomShareUrl(roomId, roomToken));
+  };
+
   const createNewRoom = () => {
     const nextRoom = `room-${createRoomToken().slice(0, 8)}`;
     const nextToken = createRoomToken();
     setRoomId(nextRoom);
     updateRoomToken(nextToken);
+    setSharedDiscoveryEnabled(true);
     setSelectedPeerId("");
     setIncoming([]);
     window.history.replaceState({}, "", roomShareUrl(nextRoom, nextToken));
@@ -263,6 +270,7 @@ function PublicTransferPageContent() {
 
   const copyRoomLink = async () => {
     try {
+      enableSharedDiscovery();
       await copyText(roomShareUrl(roomId, roomToken));
       setNotice("房间链接已复制");
       setError(null);
@@ -274,6 +282,7 @@ function PublicTransferPageContent() {
   const shareRoom = async () => {
     const url = roomShareUrl(roomId, roomToken);
     try {
+      enableSharedDiscovery();
       await shareOrCopy(
         {
           title: "加入 shuai-tunnel 文件互传房间",
@@ -304,10 +313,12 @@ function PublicTransferPageContent() {
           await navigator.share(fileShareData);
           setNotice("已打开系统文件分享");
         } else {
+          enableSharedDiscovery();
           await copyText(roomShareUrl(roomId, roomToken));
           setNotice("直连文件只在当前会话内可用；已复制房间链接");
         }
       } else {
+        enableSharedDiscovery();
         const url = fileShareUrl(record.attachment, roomId, roomToken);
         await shareOrCopy(
           {
@@ -333,6 +344,7 @@ function PublicTransferPageContent() {
       return;
     }
     try {
+      enableSharedDiscovery();
       await copyText(record.direct ? roomShareUrl(roomId, roomToken) : fileShareUrl(record.attachment, roomId, roomToken));
       setNotice(record.direct ? "已复制房间链接" : "文件链接已复制");
       setError(null);
@@ -367,9 +379,11 @@ function PublicTransferPageContent() {
   const shareIncomingFile = async (item: IncomingAttachment) => {
     try {
       if (item.direct) {
+        enableSharedDiscovery();
         await copyText(roomShareUrl(roomId, roomToken));
         setNotice("直连文件只在当前会话内可用；已复制房间链接");
       } else {
+        enableSharedDiscovery();
         const url = fileShareUrl(item.attachment, roomId, roomToken);
         await shareOrCopy(
           {
@@ -781,7 +795,7 @@ function PublicTransferPageContent() {
             <div className="min-w-0">
               <div className="text-small font-semibold text-cyan-950 dark:text-cyan-100">房间分享</div>
               <div className="mt-1 truncate font-mono text-tiny text-cyan-800/80 dark:text-cyan-100/70">
-                {roomId || "nearby"} · {peers.length} 个附近浏览器
+                {roomId || "nearby"} · {sharedDiscoveryEnabled ? "共享房间，可跨公网" : "附近模式，同公网出口"} · {peers.length} 个浏览器
               </div>
             </div>
             <div className="flex shrink-0 flex-wrap gap-2">
@@ -914,11 +928,11 @@ function PublicTransferPageContent() {
         </div>
 
         <aside className="rounded-xl border border-black/10 bg-white/70 p-5 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05]">
-          <h2 className="text-lg font-semibold">附近浏览器</h2>
+          <h2 className="text-lg font-semibold">{sharedDiscoveryEnabled ? "房间浏览器" : "附近浏览器"}</h2>
           <div className="mt-3 flex flex-col gap-2">
             {peers.length === 0 ? (
               <div className="rounded-lg border border-black/10 bg-white/60 p-3 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400">
-                当前同公网出口、同房间内没有其它网页端。
+                {sharedDiscoveryEnabled ? "当前共享房间内没有其它网页端。对方打开房间链接后会出现在这里。" : "当前同公网出口、同房间内没有其它网页端。复制或分享房间链接后可跨公网发现。"}
               </div>
             ) : peers.map((peer) => (
               <button
@@ -1300,12 +1314,15 @@ function loadOrCreatePeerId() {
   return next;
 }
 
-function discoveryWebSocketUrl(roomId: string, peerId: string) {
+function discoveryWebSocketUrl(roomId: string, peerId: string, roomToken: string) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const params = new URLSearchParams({
     roomId: roomId || "nearby",
     peerId,
     displayName: navigator.userAgent.includes("Mobile") ? "mobile-web" : "web",
   });
+  if (roomToken.trim()) {
+    params.set("roomToken", roomToken.trim());
+  }
   return `${protocol}//${window.location.host}/ws/public-transfer/discovery?${params.toString()}`;
 }
