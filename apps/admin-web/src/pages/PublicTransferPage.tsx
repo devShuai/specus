@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress } from "@heroui/react";
+import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress, Switch } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { HeroRuntime } from "../components/HeroRuntime";
@@ -83,6 +83,7 @@ function PublicTransferPageContent() {
   const [peerId] = useState(() => loadOrCreatePeerId());
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
+  const [receiveConfirmationRequired, setReceiveConfirmationRequired] = useState(() => loadReceiveConfirmationRequired());
   const [sharedDiscoveryEnabled, setSharedDiscoveryEnabled] = useState(() => Boolean(readInitialRoomToken()));
   const [qrVisible, setQrVisible] = useState(false);
   const [sharedAttachmentId] = useState(() => readInitialSharedAttachmentId());
@@ -161,6 +162,7 @@ function PublicTransferPageContent() {
     iceConfig,
     peers,
     directMemoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
+    receiveConfirmationRequired,
     sendSignal: sendDiscoverySignal,
     onIncoming: (item) => {
       setIncoming((items) => limitIncomingItems([item, ...items]));
@@ -182,6 +184,15 @@ function PublicTransferPageContent() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (receiveConfirmationRequired) {
+      return;
+    }
+    pendingTransfers.forEach((item) => {
+      acceptIncomingTransfer(item.sourcePeerId, item.transferId);
+    });
+  }, [acceptIncomingTransfer, pendingTransfers, receiveConfirmationRequired]);
 
   useEffect(() => {
     sessionStorage.setItem("public-transfer-room-id", roomId || "nearby");
@@ -380,6 +391,11 @@ function PublicTransferPageContent() {
   const updateRoomToken = (value: string) => {
     setRoomToken(value);
     sessionStorage.setItem("public-transfer-room-token", value);
+  };
+
+  const updateReceiveConfirmationRequired = (value: boolean) => {
+    setReceiveConfirmationRequired(value);
+    sessionStorage.setItem("public-transfer-receive-confirmation", value ? "true" : "false");
   };
 
   const enableSharedDiscovery = () => {
@@ -811,6 +827,23 @@ function PublicTransferPageContent() {
                   </Button>
                 }
               />
+            </div>
+            <div className="mt-3 rounded-lg border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.03]">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <div className="text-small font-medium text-zinc-900 dark:text-white">接收前确认</div>
+                  <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                    默认关闭，房间内设备发来的直连文件会自动开始接收。
+                  </div>
+                </div>
+                <Switch
+                  size="sm"
+                  isSelected={receiveConfirmationRequired}
+                  onValueChange={updateReceiveConfirmationRequired}
+                >
+                  {receiveConfirmationRequired ? "手动确认" : "直接接收"}
+                </Switch>
+              </div>
             </div>
           </details>
 
@@ -1599,6 +1632,10 @@ function loadOrCreateRoomToken(preferred?: string | null) {
   const next = createRoomToken();
   sessionStorage.setItem("public-transfer-room-token", next);
   return next;
+}
+
+function loadReceiveConfirmationRequired() {
+  return sessionStorage.getItem("public-transfer-receive-confirmation") === "true";
 }
 
 function readInitialRoomId() {

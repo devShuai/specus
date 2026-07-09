@@ -69,13 +69,14 @@ interface DirectAckWaiter {
 interface DirectPendingRequest extends DirectPendingTransfer {
   expectedSha256?: string | null;
   channel: RTCDataChannel;
-  timer: number;
+  timer?: number;
 }
 
 interface UseDirectTransferOptions {
   iceConfig: PublicTransferIceConfig | null;
   peers: DirectTransferPeer[];
   directMemoryLimitBytes: number;
+  receiveConfirmationRequired: boolean;
   receivingTransferLimit?: number;
   sendSignal: (targetPeerId: string, payload: DirectTransferSignalPayload) => void;
   onIncoming: (item: DirectIncomingAttachment) => void;
@@ -114,7 +115,9 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       waiter.reject(new Error("page closed"));
     }
     for (const request of pendingDirectRequestsRef.current.values()) {
-      window.clearTimeout(request.timer);
+      if (request.timer !== undefined) {
+        window.clearTimeout(request.timer);
+      }
     }
     peerConnectionsRef.current.clear();
     dataChannelsRef.current.clear();
@@ -147,7 +150,9 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   const removePendingTransfer = useCallback((key: string) => {
     const request = pendingDirectRequestsRef.current.get(key);
     if (request) {
-      window.clearTimeout(request.timer);
+      if (request.timer !== undefined) {
+        window.clearTimeout(request.timer);
+      }
       pendingDirectRequestsRef.current.delete(key);
       pendingChannelTransfersRef.current.delete(request.channel);
     }
@@ -177,12 +182,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     });
   }, []);
 
-  const acceptIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
-    const transferKey = receivingTransferKey({ sourcePeerId, transferId });
-    const request = pendingDirectRequestsRef.current.get(transferKey);
-    if (!request) {
-      return;
-    }
+  const startIncomingTransfer = useCallback((request: DirectPendingRequest, transferKey: string) => {
     if (request.channel.readyState !== "open") {
       removePendingTransfer(transferKey);
       optionsRef.current.onError("直连通道已断开，请让对方重新发送");
@@ -202,8 +202,17 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     directIncomingRef.current.set(transferKey, incomingState);
     directChannelTransfersRef.current.set(request.channel, transferKey);
     updateReceivingTransfer(incomingState);
-    request.channel.send(JSON.stringify({ kind: "file-ready", transferId }));
+    request.channel.send(JSON.stringify({ kind: "file-ready", transferId: request.transferId }));
   }, [removePendingTransfer, updateReceivingTransfer]);
+
+  const acceptIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
+    const transferKey = receivingTransferKey({ sourcePeerId, transferId });
+    const request = pendingDirectRequestsRef.current.get(transferKey);
+    if (!request) {
+      return;
+    }
+    startIncomingTransfer(request, transferKey);
+  }, [startIncomingTransfer]);
 
   const rejectIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
@@ -303,11 +312,15 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         sizeBytes,
         expectedSha256: message.sha256 || null,
         channel,
-        timer: window.setTimeout(() => {
-          sendDirectReject(channel, message.transferId!, "接收确认超时");
-          removePendingTransfer(transferKey);
-        }, 118000),
       };
+      if (!optionsRef.current.receiveConfirmationRequired) {
+        startIncomingTransfer(request, transferKey);
+        return;
+      }
+      request.timer = window.setTimeout(() => {
+        sendDirectReject(channel, message.transferId!, "接收确认超时");
+        removePendingTransfer(transferKey);
+      }, 118000);
       pendingDirectRequestsRef.current.set(transferKey, request);
       pendingChannelTransfersRef.current.set(channel, transferKey);
       setPendingTransfers((items) => [
@@ -343,7 +356,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         waiter.reject(new Error(message.reason || "对方拒绝接收"));
       }
     }
-  }, [completeDirectIncoming, sendDirectReject, updateReceivingTransfer]);
+  }, [completeDirectIncoming, removePendingTransfer, sendDirectReject, startIncomingTransfer]);
 
   const handleDataChannelMessage = useCallback((sourcePeerId: string, channel: RTCDataChannel, data: unknown) => {
     if (typeof data === "string") {
