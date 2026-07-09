@@ -10,10 +10,12 @@ import com.theshuai.tunnelserver.management.model.PeerMeshAcl;
 import com.theshuai.tunnelserver.management.model.PeerMeshDevice;
 import com.theshuai.tunnelserver.management.model.PeerMeshSession;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
+import com.theshuai.tunnelserver.management.repository.ClientSessionRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshAclRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshDeviceRepository;
 import com.theshuai.tunnelserver.management.repository.PeerMeshSessionRepository;
 import com.theshuai.tunnelserver.management.security.ManagementContext;
+import com.theshuai.tunnelserver.peer.TurnCredentialService;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import org.junit.jupiter.api.Test;
 
@@ -35,13 +37,17 @@ class PeerMeshServiceTests {
     private final PeerMeshAclRepository aclRepository = mock(PeerMeshAclRepository.class);
     private final PeerMeshSessionRepository sessionRepository = mock(PeerMeshSessionRepository.class);
     private final ClientAccountRepository clientAccountRepository = mock(ClientAccountRepository.class);
+    private final TurnCredentialService turnCredentialService = mock(TurnCredentialService.class);
+    private final ClientSessionRepository clientSessionRepository = mock(ClientSessionRepository.class);
     private final PeerMeshProperties properties = new PeerMeshProperties();
     private final PeerMeshService service = new PeerMeshService(
             properties,
             deviceRepository,
             aclRepository,
             sessionRepository,
-            clientAccountRepository
+            clientAccountRepository,
+            turnCredentialService,
+            clientSessionRepository
     );
 
     @Test
@@ -79,6 +85,8 @@ class PeerMeshServiceTests {
         when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.empty());
         when(deviceRepository.findByTenantIdAndVirtualIp(any(), any())).thenReturn(Optional.empty());
         when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(turnCredentialService.issue(any())).thenReturn(new TurnCredentialService.TurnCredential(
+                "ice-user", "ice-cred", "shuai-tunnel", "nonce", Instant.now().plusSeconds(3600)));
 
         ClientEnvironmentInfo environment = new ClientEnvironmentInfo();
         environment.setPeerPublicKey("public-key");
@@ -222,15 +230,16 @@ class PeerMeshServiceTests {
     void pathStatsAggregatesDirectRatioAndNatTypes() {
         when(sessionRepository.findByStatusNotAndExpiresAtLessThanEqualOrderByExpiresAtAsc(any(), any(), any()))
                 .thenReturn(List.of());
-        when(sessionRepository.aggregatePathTypes("tenant-a")).thenReturn(List.of(
-                pathAggregate(PeerMeshService.PATH_DIRECT, PeerMeshService.STATUS_ACTIVE, 3, 2, 12.5, 900, 0),
-                pathAggregate(PeerMeshService.PATH_RELAY, PeerMeshService.STATUS_ACTIVE, 1, 1, 80.0, 10, 400),
-                pathAggregate(PeerMeshService.PATH_DIRECT, PeerMeshService.STATUS_CLOSED, 1, 0, null, 0, 0)
-        ));
-        when(deviceRepository.aggregateNatTypes("tenant-a")).thenReturn(List.of(
-                natAggregate(null, 2),
-                natAggregate("SYMMETRIC_NAT", 1)
-        ));
+        // 先把各 aggregate mock 建好再传入 thenReturn:若在 thenReturn(...) 参数里内联调用
+        // pathAggregate/natAggregate(内部又有 when()),会在外层 when() 的 stubbing 未完成时嵌套打桩,
+        // 触发 Mockito UnfinishedStubbing。
+        var directActive = pathAggregate(PeerMeshService.PATH_DIRECT, PeerMeshService.STATUS_ACTIVE, 3, 2, 12.5, 900, 0);
+        var relayActive = pathAggregate(PeerMeshService.PATH_RELAY, PeerMeshService.STATUS_ACTIVE, 1, 1, 80.0, 10, 400);
+        var directClosed = pathAggregate(PeerMeshService.PATH_DIRECT, PeerMeshService.STATUS_CLOSED, 1, 0, null, 0, 0);
+        when(sessionRepository.aggregatePathTypes("tenant-a")).thenReturn(List.of(directActive, relayActive, directClosed));
+        var natUnknown = natAggregate(null, 2);
+        var natSymmetric = natAggregate("SYMMETRIC_NAT", 1);
+        when(deviceRepository.aggregateNatTypes("tenant-a")).thenReturn(List.of(natUnknown, natSymmetric));
 
         var stats = service.pathStats(new ManagementContext(new TenantContext("tenant-a"), "admin", true));
 
