@@ -44,6 +44,11 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
+        // Tomcat/Spring 默认单条消息缓冲仅 8KB,而 offer SDP(尤其携带 TURN candidate 时)常超过 8KB。
+        // 抬到 MAX_MESSAGE_CHARS(64KB),让 Spring 按此上限重组分片消息,避免大信令被拒/截断导致直连失败;
+        // 超过该上限由 handleTextMessage 显式以 TOO_BIG 关闭,而非底层静默断连。
+        session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
+        session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
         Participant participant = Participant.from(session);
         sessions.add(session);
         participantsBySession.put(session.getId(), participant);
@@ -268,11 +273,16 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         private static String publicAddress(ServerHttpRequest request) {
             if (request instanceof ServletServerHttpRequest servletRequest) {
                 HttpServletRequest raw = servletRequest.getServletRequest();
-                String forwarded = firstForwarded(raw.getHeader("X-Forwarded-For"));
-                if (StringUtils.hasText(forwarded)) {
-                    return forwarded;
+                // X-Real-IP 由可信反代覆写(nginx: proxy_set_header X-Real-IP $remote_addr),
+                // 客户端无法伪造,优先采信。
+                String realIp = raw.getHeader("X-Real-IP");
+                if (StringUtils.hasText(realIp)) {
+                    return realIp.trim();
                 }
-                forwarded = firstForwarded(raw.getHeader("X-Real-IP"));
+                // 退而取 X-Forwarded-For 末位:反代用 $proxy_add_x_forwarded_for 追加,
+                // 末段是紧邻的可信来源;取首段会被客户端自带的 XFF 头伪造,借以冒充他人 IP
+                // 加入其 public:<ip> 房间(绕过"附近设备"隔离)。
+                String forwarded = lastForwarded(raw.getHeader("X-Forwarded-For"));
                 if (StringUtils.hasText(forwarded)) {
                     return forwarded;
                 }
@@ -282,11 +292,12 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                     : request.getRemoteAddress().getAddress().getHostAddress();
         }
 
-        private static String firstForwarded(String value) {
+        private static String lastForwarded(String value) {
             if (!StringUtils.hasText(value)) {
                 return "";
             }
-            return value.split(",", 2)[0].trim();
+            String[] parts = value.split(",");
+            return parts.length == 0 ? "" : parts[parts.length - 1].trim();
         }
 
         private static String sha256(String value) {

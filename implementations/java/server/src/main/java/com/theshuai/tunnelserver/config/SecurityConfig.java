@@ -43,7 +43,14 @@ import java.util.List;
 public class SecurityConfig {
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http, JwtDecoder jwtDecoder) throws Exception {
+    public SecurityFilterChain securityFilterChain(HttpSecurity http,
+                                                   JwtDecoder jwtDecoder,
+                                                   ObjectStorageProperties objectStorageProperties) throws Exception {
+        // 启用对象存储(OSS 兜底上传/下载)时,浏览器需直连 bucket 域名 PUT/GET 与内联预览,
+        // 未放行会被 connect-src/img-src/media-src 拦死,直连失败后的兜底链路整体不可用。
+        // provider=disabled(默认)时后缀为空,CSP 与原先字节一致,不影响既有部署。
+        String ossOrigin = ossCspOrigin(objectStorageProperties);
+        String ossSuffix = ossOrigin.isEmpty() ? "" : " " + ossOrigin;
         http
                 .authorizeHttpRequests(authorize -> authorize
                         // /ws/** 由 JwtHandshakeInterceptor 在握手阶段单独鉴权，
@@ -83,12 +90,12 @@ public class SecurityConfig {
                                 "default-src 'self'; "
                                 + "script-src 'self' https://www.googletagmanager.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE='; "
                                 + "style-src 'self' 'unsafe-inline'; "
-                                + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com; "
-                                + "media-src 'self' blob: data:; "
+                                + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; "
+                                + "media-src 'self' blob: data:" + ossSuffix + "; "
                                 + "object-src 'self' blob:; "
                                 + "frame-src 'self' blob:; "
                                 + "font-src 'self' data:; "
-                                + "connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com; "
+                                + "connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; "
                                 + "form-action 'self'; "
                                 + "frame-ancestors 'none'; "
                                 + "base-uri 'self'"))
@@ -105,6 +112,27 @@ public class SecurityConfig {
     private boolean shouldAuthenticateBearer(HttpServletRequest request) {
         String path = request.getRequestURI().substring(request.getContextPath().length());
         return path.startsWith("/api/admin/") || "/auth/refresh".equals(path);
+    }
+
+    /**
+     * 计算对象存储 bucket 的 CSP 来源(如 {@code https://my-bucket.oss-cn-hangzhou.aliyuncs.com})。
+     * 仅在 {@code provider=aliyun-oss} 且 endpoint / bucket 均已配置时返回,否则返回空串,CSP 保持不变。
+     * bucket 域名 = {@code <bucket>.<endpoint host>},与 AliyunOssObjectStorageService.objectUrl 一致。
+     */
+    private String ossCspOrigin(ObjectStorageProperties props) {
+        if (props == null || !"aliyun-oss".equalsIgnoreCase(props.getProvider())) {
+            return "";
+        }
+        String endpoint = props.getEndpoint() == null ? "" : props.getEndpoint().trim();
+        String bucket = props.getBucket() == null ? "" : props.getBucket().trim();
+        if (endpoint.isEmpty() || bucket.isEmpty()) {
+            return "";
+        }
+        String host = endpoint.replaceFirst("(?i)^https?://", "").replaceAll("/.*$", "").trim();
+        if (host.isEmpty()) {
+            return "";
+        }
+        return "https://" + bucket + "." + host;
     }
 
     @Bean
