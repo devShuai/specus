@@ -144,17 +144,17 @@ function LoginPageContent() {
       <div className="landing-scanline" aria-hidden="true" />
 
       <section className="relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
-        <header className="flex items-center justify-between gap-4">
-          <AppLogo label="shuai-tunnel" subtitle="内网服务接入控制面" />
-          <div className="flex items-center gap-2">
+        <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <AppLogo className="w-full sm:w-auto" label="shuai-tunnel" subtitle="内网服务接入控制面" />
+          <div className="grid w-full grid-cols-[2.25rem_repeat(3,minmax(0,1fr))] gap-2 sm:flex sm:w-auto sm:items-center">
             <LandingThemeToggleButton />
-            <a href="#/transfer" className="landing-ghost-button">
+            <a href="#/transfer" className="landing-ghost-button landing-nav-button">
               文件互传
             </a>
-            <a href="#/nat-detect" className="landing-ghost-button">
+            <a href="#/nat-detect" className="landing-ghost-button landing-nav-button">
               NAT 检测
             </a>
-            <button type="button" className="landing-ghost-button" onClick={focusLogin}>
+            <button type="button" className="landing-ghost-button landing-nav-button" onClick={focusLogin}>
               进入控制台
             </button>
           </div>
@@ -167,7 +167,7 @@ function LoginPageContent() {
             </span>
 
             <div className="max-w-3xl">
-              <h1 className="text-5xl font-semibold leading-tight text-zinc-950 dark:text-white">shuai-tunnel</h1>
+              <h1 className="text-4xl font-semibold leading-tight text-zinc-950 dark:text-white sm:text-5xl">shuai-tunnel</h1>
               <p className="mt-5 max-w-2xl text-lg leading-8 text-zinc-700 dark:text-zinc-300">
                 把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测，TLS 开箱即用。
               </p>
