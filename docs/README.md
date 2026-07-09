@@ -14,6 +14,10 @@
 * [peer-mesh-java-client-audit-fixes.md](peer-mesh/peer-mesh-java-client-audit-fixes.md) — Java 客户端打洞审计与修复记录(2026-07),含成功率观测方法。
 * [direct-connect-hole-punching-research.md](peer-mesh/direct-connect-hole-punching-research.md) — P2P 直连打洞技术调研。
 
+## transfer/ — 免登录文件互传
+
+* [public-file-transfer-audit.md](transfer/public-file-transfer-audit.md) — 免登录文件互传审计与优化清单(2026-07),含安全/功能/性能问题分级与建议修法。
+
 ## cross-language/ — 多语言移植与一致性
 
 * [cross-language-java-alignment-plan.md](cross-language/cross-language-java-alignment-plan.md) — 以 Java 为参考实现的对齐计划。
