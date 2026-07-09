@@ -1,6 +1,7 @@
 package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.tunnelserver.config.ObjectStorageProperties;
+import com.theshuai.tunnelserver.config.PublicTransferProperties;
 import com.theshuai.tunnelserver.management.model.TransferAttachment;
 import com.theshuai.tunnelserver.management.model.TransferAttachmentView;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentRepository;
@@ -39,21 +40,28 @@ public class TransferAttachmentService {
     private final TransferAttachmentRepository repository;
     private final ObjectStorageService objectStorageService;
     private final ObjectStorageProperties properties;
+    private final PublicTransferProperties publicTransferProperties;
     private final ClientAccountService clientAccountService;
 
     public TransferAttachmentService(TransferAttachmentRepository repository,
                                      ObjectStorageService objectStorageService,
                                      ObjectStorageProperties properties,
+                                     PublicTransferProperties publicTransferProperties,
                                      ClientAccountService clientAccountService) {
         this.repository = repository;
         this.objectStorageService = objectStorageService;
         this.properties = properties;
+        this.publicTransferProperties = publicTransferProperties;
         this.clientAccountService = clientAccountService;
     }
 
     @Transactional
     public PresignUploadResponse createPublicUpload(PresignUploadRequest request) {
         String roomTokenHash = roomTokenHash(requireText(request.roomToken(), "roomToken"));
+        int maxPending = Math.max(1, publicTransferProperties.getMaxPendingUploadsPerRoom());
+        if (repository.countByScopeAndRoomTokenHashAndStatus(SCOPE_PUBLIC_TRANSFER, roomTokenHash, STATUS_PENDING) >= maxPending) {
+            throw new RateLimitedException("当前房间待上传文件过多,请稍后再试");
+        }
         return createUpload(
                 SCOPE_PUBLIC_TRANSFER,
                 null,
@@ -197,11 +205,34 @@ public class TransferAttachmentService {
         if (Instant.parse(attachment.getUploadExpiresAt()).isBefore(now)) {
             throw new IllegalStateException("attachment upload URL is expired");
         }
+        verifyUploadedObject(attachment);
         attachment.setStatus(STATUS_UPLOADED);
         attachment.setUploadedAt(now.toString());
         attachment.setUpdatedAt(now.toString());
         repository.save(attachment);
         return toView(attachment);
+    }
+
+    /**
+     * 预签名 PUT 不绑定 Content-Length,声明大小(sizeBytes)不可信。complete 阶段 HEAD 对象:
+     * 不存在则拒绝(未真正上传);实际大小超限则删对象并拒绝;否则以实际大小为准回写。
+     */
+    private void verifyUploadedObject(TransferAttachment attachment) {
+        if (!objectStorageService.isEnabled()) {
+            return;
+        }
+        ObjectStorageService.ObjectStat stat = objectStorageService.statObject(attachment.getObjectKey());
+        if (!stat.exists()) {
+            throw new IllegalStateException("attachment object was not uploaded");
+        }
+        long actualBytes = stat.contentLength();
+        if (actualBytes > properties.getMaxAttachmentBytes()) {
+            objectStorageService.deleteObject(attachment.getObjectKey());
+            throw new IllegalArgumentException("attachment is too large");
+        }
+        if (actualBytes >= 0) {
+            attachment.setSizeBytes(actualBytes);
+        }
     }
 
     private PresignDownloadResponse createDownload(TransferAttachment attachment) {

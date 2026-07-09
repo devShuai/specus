@@ -89,6 +89,12 @@ tunnel:
     retention-hours: ${TUNNEL_OBJECT_STORAGE_RETENTION_HOURS:72}
     max-attachment-bytes: ${TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES:536870912}
     expiration-scan-interval-ms: ${TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS:3600000}
+  public-transfer:
+    # 免登录文件互传的滥用防护。presign-upload 无鉴权,按来源 IP 固定窗口限流,
+    # 并对单房间(按 roomToken 哈希)的 PENDING 附件数设上限。进程内计数,多实例部署时按实例数放大。
+    presign-rate-limit-per-ip: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP:30}
+    presign-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS:300}
+    max-pending-uploads-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM:50}
   client-auth:
     default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
     per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}

@@ -88,6 +88,39 @@ public class AliyunOssObjectStorageService implements ObjectStorageService {
     }
 
     @Override
+    public ObjectStat statObject(String objectKey) {
+        ensureEnabled();
+        validateObjectKey(objectKey);
+        String now = HTTP_DATE.format(Instant.now());
+        String canonicalResource = canonicalResource(objectKey);
+        String stringToSign = "HEAD\n\n\n" + now + "\n" + canonicalResource;
+        String signature = hmacSha1(stringToSign);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(objectUrl(objectKey)))
+                .timeout(Duration.ofSeconds(20))
+                .header("Date", now)
+                .header("Authorization", "OSS " + properties.getAccessKeyId() + ":" + signature)
+                .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                .build();
+        try {
+            HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+            int status = response.statusCode();
+            if (status == 404) {
+                return new ObjectStat(false, -1L);
+            }
+            if (status >= 400) {
+                throw new IllegalStateException("failed to stat object: HTTP " + status);
+            }
+            long length = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
+            return new ObjectStat(true, length);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("stat object interrupted", e);
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to stat object", e);
+        }
+    }
+
+    @Override
     public void deleteObject(String objectKey) {
         ensureEnabled();
         validateObjectKey(objectKey);

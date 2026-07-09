@@ -11,5 +11,7 @@ public interface TransferAttachmentRepository extends JpaRepository<TransferAtta
 
     Optional<TransferAttachment> findByIdAndTenantIdAndScope(Long id, String tenantId, String scope);
 
+    long countByScopeAndRoomTokenHashAndStatus(String scope, String roomTokenHash, String status);
+
     List<TransferAttachment> findTop100ByExpiresAtBeforeAndStatusNotOrderByExpiresAtAsc(String now, String status);
 }

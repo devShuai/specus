@@ -1,5 +1,6 @@
 package com.theshuai.tunnelserver.management.controller;
 
+import com.theshuai.tunnelserver.management.service.RateLimitedException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -15,6 +16,7 @@ import java.util.Map;
  * <ul>
  *   <li>{@link IllegalArgumentException} → 400，参数/约束类错误</li>
  *   <li>{@link IllegalStateException} → 409，状态冲突（例如客户端离线时手动下发映射）</li>
+ *   <li>{@link RateLimitedException} → 429，触发限流或房间配额</li>
  *   <li>{@link DataIntegrityViolationException} → 400，DB 唯一/外键约束</li>
  * </ul>
  */
@@ -24,6 +26,11 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> handleIllegalArgument(IllegalArgumentException exception) {
         return ResponseEntity.badRequest().body(Map.of("error", exception.getMessage()));
+    }
+
+    @ExceptionHandler(RateLimitedException.class)
+    public ResponseEntity<Map<String, String>> handleRateLimited(RateLimitedException exception) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", exception.getMessage()));
     }
 
     @ExceptionHandler(IllegalStateException.class)
