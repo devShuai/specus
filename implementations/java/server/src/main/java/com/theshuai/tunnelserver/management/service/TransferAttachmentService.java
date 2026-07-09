@@ -8,6 +8,7 @@ import com.theshuai.tunnelserver.management.repository.TransferAttachmentReposit
 import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.storage.object.ObjectStorageService;
 import com.theshuai.tunnelserver.management.storage.object.PresignedObjectUrl;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -20,6 +21,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -131,14 +133,21 @@ public class TransferAttachmentService {
     @Transactional
     public void expireOldAttachments() {
         String now = Instant.now().toString();
-        for (TransferAttachment attachment : repository.findTop100ByExpiresAtBeforeAndStatusNotOrderByExpiresAtAsc(
-                now, STATUS_EXPIRED)) {
-            if (objectStorageService.isEnabled()) {
-                objectStorageService.deleteObject(attachment.getObjectKey());
+        while (true) {
+            List<TransferAttachment> expired = repository.findTop100ByExpiresAtBeforeAndStatusNotOrderByExpiresAtAsc(
+                    now, STATUS_EXPIRED);
+            if (expired.isEmpty()) {
+                return;
             }
-            attachment.setStatus(STATUS_EXPIRED);
-            attachment.setUpdatedAt(now);
-            repository.save(attachment);
+            for (TransferAttachment attachment : expired) {
+                if (objectStorageService.isEnabled()) {
+                    objectStorageService.deleteObject(attachment.getObjectKey());
+                }
+                attachment.setStatus(STATUS_EXPIRED);
+                attachment.setUpdatedAt(now);
+                repository.save(attachment);
+            }
+            repository.flush();
         }
     }
 
@@ -160,41 +169,60 @@ public class TransferAttachmentService {
         Instant uploadExpiresAt = now.plusSeconds(properties.getUploadUrlTtlSeconds());
         Instant expiresAt = now.plusSeconds(Math.max(1L, properties.getRetentionHours()) * 3600L);
 
-        TransferAttachment attachment = new TransferAttachment();
-        attachment.setId(ClientIdGenerator.newId());
-        attachment.setTenantId(tenantId);
-        attachment.setScope(scope);
-        attachment.setRoomId(roomId);
-        attachment.setRoomTokenHash(roomTokenHash);
-        attachment.setOwnerUsername(ownerUsername);
-        attachment.setTargetClientId(targetClientId);
-        attachment.setObjectKey(objectKey(scope, attachment.getId(), fileName, now));
-        attachment.setFileName(fileName);
-        attachment.setMimeType(mimeType);
-        attachment.setSizeBytes(sizeBytes);
-        attachment.setSha256(sha256);
-        attachment.setStatus(STATUS_PENDING);
-        attachment.setCreatedAt(now.toString());
-        attachment.setUpdatedAt(now.toString());
-        attachment.setUploadExpiresAt(uploadExpiresAt.toString());
-        attachment.setExpiresAt(expiresAt.toString());
+        for (int attempt = 0; attempt < 8; attempt++) {
+            TransferAttachment attachment = new TransferAttachment();
+            attachment.setId(newAttachmentId());
+            attachment.setTenantId(tenantId);
+            attachment.setScope(scope);
+            attachment.setRoomId(roomId);
+            attachment.setRoomTokenHash(roomTokenHash);
+            attachment.setOwnerUsername(ownerUsername);
+            attachment.setTargetClientId(targetClientId);
+            attachment.setObjectKey(objectKey(scope, attachment.getId(), fileName, now));
+            attachment.setFileName(fileName);
+            attachment.setMimeType(mimeType);
+            attachment.setSizeBytes(sizeBytes);
+            attachment.setSha256(sha256);
+            attachment.setStatus(STATUS_PENDING);
+            attachment.setCreatedAt(now.toString());
+            attachment.setUpdatedAt(now.toString());
+            attachment.setUploadExpiresAt(uploadExpiresAt.toString());
+            attachment.setExpiresAt(expiresAt.toString());
 
-        objectStorageService.validateObjectKey(attachment.getObjectKey());
-        PresignedObjectUrl upload = objectStorageService.presignUpload(
-                attachment.getObjectKey(),
-                mimeType,
-                Duration.ofSeconds(properties.getUploadUrlTtlSeconds())
-        );
-        repository.save(attachment);
-        return new PresignUploadResponse(
-                attachment.getId(),
-                String.valueOf(attachment.getId()),
-                attachment.getObjectKey(),
-                upload.url(),
-                upload.headers(),
-                upload.expiresAt(),
-                toView(attachment)
-        );
+            objectStorageService.validateObjectKey(attachment.getObjectKey());
+            PresignedObjectUrl upload = objectStorageService.presignUpload(
+                    attachment.getObjectKey(),
+                    mimeType,
+                    Duration.ofSeconds(properties.getUploadUrlTtlSeconds())
+            );
+            try {
+                repository.saveAndFlush(attachment);
+                return new PresignUploadResponse(
+                        attachment.getId(),
+                        String.valueOf(attachment.getId()),
+                        attachment.getObjectKey(),
+                        upload.url(),
+                        upload.headers(),
+                        upload.expiresAt(),
+                        toView(attachment)
+                );
+            } catch (DataIntegrityViolationException e) {
+                if (attempt == 7) {
+                    throw e;
+                }
+            }
+        }
+        throw new IllegalStateException("failed to allocate attachment id");
+    }
+
+    private long newAttachmentId() {
+        for (int i = 0; i < 8; i++) {
+            long candidate = ClientIdGenerator.newId();
+            if (!repository.existsById(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("failed to allocate attachment id");
     }
 
     private TransferAttachmentView complete(TransferAttachment attachment) {

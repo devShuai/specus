@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
@@ -12,6 +12,16 @@ import {
 } from "../api/client";
 import type { AttachmentPresignUploadResponse, PublicTransferIceConfig, TransferAttachment } from "../api/types";
 import { usePageSeo } from "../lib/seo";
+import { createQrMatrix } from "../lib/qr";
+import { sha256Blob } from "../lib/sha256";
+import { effectiveMimeType, mediaKind, previewKindLabel, shortMimeLabel } from "../lib/transferPreview";
+import {
+  DEFAULT_DIRECT_MEMORY_LIMIT_BYTES,
+  receivingTransferKey,
+  useDirectTransfer,
+  type DirectReceivingTransfer,
+  type DirectTransferSignalPayload,
+} from "../hooks/useDirectTransfer";
 
 type UploadState = "idle" | "connecting" | "direct" | "presigning" | "uploading" | "completing" | "done" | "failed";
 
@@ -53,36 +63,9 @@ interface PreviewTarget {
   blob?: Blob | null;
 }
 
-interface DiscoverySignalPayload {
-  signalType?: "offer" | "answer" | "ice";
-  description?: RTCSessionDescriptionInit;
-  candidate?: RTCIceCandidateInit;
-}
-
-interface DirectIncomingState {
-  transferId: string;
-  sourcePeerId: string;
-  fileName: string;
-  mimeType: string;
-  sizeBytes: number;
-  chunks: ArrayBuffer[];
-  receivedBytes: number;
-}
-
-interface DirectAckWaiter {
-  resolve: () => void;
-  reject: (error: Error) => void;
-  timer: number;
-}
-
-interface ReceivingTransfer {
-  transferId: string;
-  sourcePeerId: string;
-  fileName: string;
-  mimeType: string;
-  sizeBytes: number;
-  receivedBytes: number;
-}
+const INCOMING_ITEM_LIMIT = 20;
+const DIRECT_MEMORY_LIMIT_BYTES = DEFAULT_DIRECT_MEMORY_LIMIT_BYTES;
+const STREAM_DOWNLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
 
 export function PublicTransferPage() {
   return (
@@ -94,24 +77,18 @@ export function PublicTransferPage() {
 
 function PublicTransferPageContent() {
   const discoverySocketRef = useRef<WebSocket | null>(null);
-  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
-  const directIncomingRef = useRef<Map<string, DirectIncomingState>>(new Map());
-  const directAckWaitersRef = useRef<Map<string, DirectAckWaiter>>(new Map());
   const loadedSharedAttachmentRef = useRef("");
-  const directPreviewUrlsRef = useRef<string[]>([]);
-  const iceConfigRef = useRef<PublicTransferIceConfig | null>(null);
+  const directPreviewUrlsRef = useRef<Set<string>>(new Set());
   const [peerId] = useState(() => loadOrCreatePeerId());
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
   const [sharedDiscoveryEnabled, setSharedDiscoveryEnabled] = useState(() => Boolean(readInitialRoomToken()));
   const [qrVisible, setQrVisible] = useState(false);
   const [sharedAttachmentId] = useState(() => readInitialSharedAttachmentId());
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [peers, setPeers] = useState<DiscoveryPeer[]>([]);
   const [incoming, setIncoming] = useState<IncomingAttachment[]>([]);
-  const [receivingTransfers, setReceivingTransfers] = useState<ReceivingTransfer[]>([]);
   const [state, setState] = useState<UploadState>("idle");
   const [progress, setProgress] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
@@ -126,13 +103,70 @@ function PublicTransferPageContent() {
     canonical: "https://tunnel.devshuai.com/#/transfer",
   });
 
+  const rememberPreviewUrl = (url?: string | null) => {
+    if (url?.startsWith("blob:")) {
+      directPreviewUrlsRef.current.add(url);
+    }
+  };
+
+  const revokePreviewUrl = (url?: string | null) => {
+    if (url?.startsWith("blob:") && directPreviewUrlsRef.current.delete(url)) {
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  const releaseIncomingItem = (item: IncomingAttachment) => {
+    revokePreviewUrl(item.previewUrl);
+    if (item.downloadUrl !== item.previewUrl) {
+      revokePreviewUrl(item.downloadUrl);
+    }
+  };
+
+  const limitIncomingItems = (items: IncomingAttachment[]) => {
+    const kept = items.slice(0, INCOMING_ITEM_LIMIT);
+    for (const item of items.slice(INCOMING_ITEM_LIMIT)) {
+      releaseIncomingItem(item);
+    }
+    return kept;
+  };
+
+  const clearIncomingItems = () => {
+    setIncoming((items) => {
+      items.forEach(releaseIncomingItem);
+      return [];
+    });
+  };
+
+  const sendDiscoverySignal = useCallback((targetPeerId: string, payload: DirectTransferSignalPayload) => {
+    const socket = discoverySocketRef.current;
+    if (!targetPeerId || !socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("发现通道不可用");
+    }
+    socket.send(JSON.stringify({
+      type: "signal",
+      targetPeerId,
+      payload,
+    }));
+  }, []);
+
+  const { receivingTransfers, sendDirect, handleSignal } = useDirectTransfer({
+    iceConfig,
+    peers,
+    directMemoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
+    sendSignal: sendDiscoverySignal,
+    onIncoming: (item) => {
+      setIncoming((items) => limitIncomingItems([item, ...items]));
+    },
+    onPreviewUrl: rememberPreviewUrl,
+    onStateChange: (nextState) => setState(nextState),
+    onProgress: setProgress,
+    onError: setError,
+  });
+
   useEffect(() => {
     let active = true;
     void fetchPublicTransferIceConfig().then((config) => {
       if (active) {
-        // 存入 ref:被动接收 offer 的一端在 socket.onmessage 闭包里建连接,
-        // 只有从 ref 读才能拿到异步返回后的最新 ICE 配置(否则恒为初始 null,跨 NAT 无 STUN/TURN)。
-        iceConfigRef.current = config;
         setIceConfig(config);
       }
     });
@@ -160,7 +194,7 @@ function PublicTransferPageContent() {
         if (!active) {
           return;
         }
-        setIncoming((items) => [
+        setIncoming((items) => limitIncomingItems([
           {
             sourcePeerId: "shared-link",
             attachment: response.attachment,
@@ -169,7 +203,7 @@ function PublicTransferPageContent() {
             downloadExpiresAt: response.expiresAt,
           },
           ...items.filter((item) => item.attachment.attachmentId !== response.attachment.attachmentId),
-        ].slice(0, 20));
+        ]));
         setNotice(`已打开共享文件：${response.attachment.fileName}`);
       })
       .catch((err) => {
@@ -184,23 +218,55 @@ function PublicTransferPageContent() {
   }, [roomToken, sharedAttachmentId]);
 
   useEffect(() => {
-    const url = discoveryWebSocketUrl(roomId, peerId, sharedDiscoveryEnabled ? roomToken : "", peerId);
-    const socket = new WebSocket(url);
-    discoverySocketRef.current = socket;
-    socket.onmessage = (event) => {
+    let active = true;
+    let reconnectTimer: number | null = null;
+    let heartbeatTimer: number | null = null;
+    let reconnectAttempt = 0;
+    let lastPongAt = Date.now();
+
+    const clearHeartbeat = () => {
+      if (heartbeatTimer !== null) {
+        window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+
+    const startHeartbeat = (socket: WebSocket) => {
+      clearHeartbeat();
+      heartbeatTimer = window.setInterval(() => {
+        if (!active || discoverySocketRef.current !== socket) {
+          return;
+        }
+        if (socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        if (Date.now() - lastPongAt > 75_000) {
+          socket.close();
+          return;
+        }
+        socket.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+      }, 25_000);
+    };
+
+    const handleMessage = (event: MessageEvent) => {
       try {
         const message = JSON.parse(String(event.data)) as {
           type?: string;
+          error?: string;
           sourcePeerId?: string;
           peers?: DiscoveryPeer[];
-          payload?: ({ objectId?: string; attachment?: TransferAttachment } & DiscoverySignalPayload);
+          payload?: ({ objectId?: string; attachment?: TransferAttachment } & DirectTransferSignalPayload);
         };
-        if (message.type === "roster" && Array.isArray(message.peers)) {
+        if (message.type === "pong") {
+          lastPongAt = Date.now();
+        } else if (message.type === "error" && message.error) {
+          setError(message.error);
+        } else if (message.type === "roster" && Array.isArray(message.peers)) {
           const visiblePeers = message.peers.filter((peer) => peer.peerId !== peerId);
           setPeers(visiblePeers);
           setSelectedPeerId((current) => current && visiblePeers.some((peer) => peer.peerId === current) ? current : visiblePeers[0]?.peerId ?? "");
         } else if (message.type === "attachment" && message.payload?.attachment) {
-          setIncoming((items) => [
+          setIncoming((items) => limitIncomingItems([
             {
               sourcePeerId: message.sourcePeerId ?? "peer",
               attachment: message.payload!.attachment!,
@@ -209,7 +275,7 @@ function PublicTransferPageContent() {
               downloadExpiresAt: null,
             },
             ...items,
-          ].slice(0, 20));
+          ]));
         } else if (message.type === "signal" && message.sourcePeerId && message.payload) {
           void handleSignal(message.sourcePeerId, message.payload);
         }
@@ -217,18 +283,53 @@ function PublicTransferPageContent() {
         // Ignore malformed discovery messages; the page can keep working through manual copy.
       }
     };
-    socket.onclose = () => {
-      if (discoverySocketRef.current === socket) {
-        discoverySocketRef.current = null;
+
+    const connect = () => {
+      if (!active) {
+        return;
       }
+      const url = discoveryWebSocketUrl(roomId, peerId, sharedDiscoveryEnabled ? roomToken : "", peerId);
+      const socket = new WebSocket(url);
+      discoverySocketRef.current = socket;
+      socket.onopen = () => {
+        reconnectAttempt = 0;
+        lastPongAt = Date.now();
+        startHeartbeat(socket);
+      };
+      socket.onmessage = handleMessage;
+      socket.onerror = () => {
+        socket.close();
+      };
+      socket.onclose = () => {
+        if (discoverySocketRef.current !== socket) {
+          return;
+        }
+        discoverySocketRef.current = null;
+        clearHeartbeat();
+        if (!active) {
+          return;
+        }
+        const delayMs = Math.min(1000 * (2 ** Math.min(reconnectAttempt, 4)), 10000);
+        reconnectAttempt += 1;
+        reconnectTimer = window.setTimeout(connect, delayMs);
+      };
     };
+
+    connect();
+
     return () => {
-      if (discoverySocketRef.current === socket) {
-        discoverySocketRef.current = null;
+      active = false;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
       }
-      socket.close();
+      clearHeartbeat();
+      const socket = discoverySocketRef.current;
+      if (socket) {
+        discoverySocketRef.current = null;
+        socket.close();
+      }
     };
-  }, [peerId, roomId, roomToken, sharedDiscoveryEnabled]);
+  }, [handleSignal, peerId, roomId, roomToken, sharedDiscoveryEnabled]);
 
   useEffect(() => {
     return () => {
@@ -239,21 +340,10 @@ function PublicTransferPageContent() {
   }, [record?.previewUrl]);
 
   useEffect(() => () => {
-    for (const connection of peerConnectionsRef.current.values()) {
-      connection.close();
-    }
-    for (const waiter of directAckWaitersRef.current.values()) {
-      window.clearTimeout(waiter.timer);
-      waiter.reject(new Error("page closed"));
-    }
     for (const url of directPreviewUrlsRef.current) {
       URL.revokeObjectURL(url);
     }
-    peerConnectionsRef.current.clear();
-    dataChannelsRef.current.clear();
-    directIncomingRef.current.clear();
-    directAckWaitersRef.current.clear();
-    directPreviewUrlsRef.current = [];
+    directPreviewUrlsRef.current.clear();
   }, []);
 
   const roomJoinUrl = useMemo(() => roomShareUrl(roomId, roomToken), [roomId, roomToken]);
@@ -261,6 +351,23 @@ function PublicTransferPageContent() {
     () => peers.find((peer) => peer.peerId === selectedPeerId) ?? null,
     [peers, selectedPeerId],
   );
+  const selectedFilesSize = useMemo(
+    () => selectedFiles.reduce((total, file) => total + file.size, 0),
+    [selectedFiles],
+  );
+  const selectedFileTitle = selectedFiles.length === 0
+    ? "尚未选择文件"
+    : selectedFiles.length === 1
+      ? selectedFiles[0].name
+      : `${selectedFiles.length} 个文件`;
+  const selectedFileDetail = selectedFiles.length === 0
+    ? selectedPeer ? `将发送给 ${selectedPeer.displayName || selectedPeer.peerId}` : "未选择对方时会先生成分享链接"
+    : selectedFiles.length === 1
+      ? `${formatBytes(selectedFiles[0].size)} · ${selectedFiles[0].type || "未知类型"}`
+      : `${formatBytes(selectedFilesSize)} · 批量顺序发送`;
+  const uploadButtonLabel = selectedFiles.length > 1
+    ? selectedPeer ? "发送多个文件" : "生成多个链接"
+    : selectedPeer ? "发送给对方" : "生成分享链接";
 
   const updateRoomToken = (value: string) => {
     setRoomToken(value);
@@ -279,7 +386,7 @@ function PublicTransferPageContent() {
     updateRoomToken(nextToken);
     setSharedDiscoveryEnabled(true);
     setSelectedPeerId("");
-    setIncoming([]);
+    clearIncomingItems();
     window.history.replaceState({}, "", roomShareUrl(nextRoom, nextToken));
     setNotice("已创建新房间");
     setError(null);
@@ -406,7 +513,7 @@ function PublicTransferPageContent() {
   };
 
   const upload = async () => {
-    if (!selectedFile) {
+    if (selectedFiles.length === 0) {
       setError("请选择要发送的文件");
       return;
     }
@@ -423,26 +530,54 @@ function PublicTransferPageContent() {
     }
     setRecord(null);
 
-    if (selectedPeerId && typeof RTCPeerConnection !== "undefined") {
-      try {
-        await sendDirect(selectedPeerId, selectedFile);
-        return;
-      } catch (err) {
-        setError(`直接发送未完成，正在改用分享链接：${err instanceof Error ? err.message : "unknown"}`);
+    const files = [...selectedFiles];
+    const targetPeerId = selectedPeerId;
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      if (files.length > 1) {
+        setNotice(`正在发送 ${index + 1}/${files.length}：${file.name || "attachment"}`);
       }
+      if (targetPeerId && typeof RTCPeerConnection !== "undefined") {
+        try {
+          const direct = await sendDirect(targetPeerId, file);
+          setRecord({
+            file,
+            previewUrl: direct.previewUrl,
+            presign: null,
+            attachment: direct.attachment,
+            downloadUrl: null,
+            downloadExpiresAt: null,
+            direct: true,
+          });
+          setState("done");
+          continue;
+        } catch (err) {
+          const directError = err instanceof Error ? err.message : "unknown";
+          if (directError.includes("拒绝接收")) {
+            setError(directError);
+            continue;
+          }
+          setError(`直接发送未完成，正在改用分享链接：${directError}`);
+        }
+      }
+      await uploadViaOss(file, targetPeerId);
     }
-    await uploadViaOss(selectedFile);
+    if (files.length > 1) {
+      setNotice(`已处理 ${files.length} 个文件`);
+    }
   };
 
-  const uploadViaOss = async (file: File) => {
+  const uploadViaOss = async (file: File, targetPeerId = selectedPeerId) => {
     setState("presigning");
     setProgress(0);
     try {
       const mimeType = effectiveMimeType(file.name || "attachment", file.type);
+      const sha256 = await sha256Blob(file);
       const presign = await publicPresignAttachmentUpload({
         fileName: file.name || "attachment",
         mimeType,
         sizeBytes: file.size,
+        sha256,
         roomId,
         roomToken,
       });
@@ -452,7 +587,7 @@ function PublicTransferPageContent() {
 
       setState("completing");
       const attachment = await publicCompleteAttachment(presign.attachmentId, { roomToken });
-      publishAttachmentEnvelope(selectedPeerId, presign.objectId, attachment);
+      publishAttachmentEnvelope(targetPeerId, presign.objectId, attachment);
       setRecord({
         file,
         previewUrl: URL.createObjectURL(file),
@@ -468,248 +603,6 @@ function PublicTransferPageContent() {
       setError(err instanceof Error ? err.message : "上传失败");
     }
   };
-
-  const sendDirect = async (targetPeerId: string, file: File) => {
-    setState("connecting");
-    setProgress(0);
-    const channel = await openDirectChannel(targetPeerId);
-    const transferId = createTransferId();
-    setState("direct");
-    channel.send(JSON.stringify({
-      kind: "file-meta",
-      transferId,
-      fileName: file.name || "attachment",
-      mimeType: effectiveMimeType(file.name || "attachment", file.type),
-      sizeBytes: file.size,
-    }));
-    await sendFileChunks(channel, file, setProgress);
-    // ACK 等待放在整段发送之后再起算,只覆盖"对端接收完成 → 回执"的窗口。若在发送前起算,
-    // 大文件传输耗时超过超时值会误判失败并退回 OSS 重传(同一文件传两遍)。先注册再发 complete,
-    // 避免对端的 ack 抢在 waiter 注册之前到达。
-    const ack = waitForDirectAck(transferId, 15000);
-    channel.send(JSON.stringify({ kind: "file-complete", transferId }));
-    await ack;
-
-    const attachment = directAttachment(transferId, file.name || "attachment", effectiveMimeType(file.name || "attachment", file.type), file.size);
-    setRecord({
-      file,
-      previewUrl: URL.createObjectURL(file),
-      presign: null,
-      attachment,
-      downloadUrl: null,
-      downloadExpiresAt: null,
-      direct: true,
-    });
-    setState("done");
-  };
-
-  const openDirectChannel = async (targetPeerId: string): Promise<RTCDataChannel> => {
-    const existing = dataChannelsRef.current.get(targetPeerId);
-    if (existing?.readyState === "open") {
-      return existing;
-    }
-    const connection = createPeerConnection(targetPeerId);
-    const channel = connection.createDataChannel(`file-${Date.now()}`, { ordered: true });
-    setupDataChannel(targetPeerId, channel);
-    const opened = waitForDataChannelOpen(channel, 8000);
-    const offer = await connection.createOffer();
-    await connection.setLocalDescription(offer);
-    sendSignal(targetPeerId, { signalType: "offer", description: connection.localDescription ?? offer });
-    return opened;
-  };
-
-  const handleSignal = async (sourcePeerId: string, payload: DiscoverySignalPayload) => {
-    if (!payload.signalType) {
-      return;
-    }
-    const connection = createPeerConnection(sourcePeerId);
-    if (payload.signalType === "offer" && payload.description) {
-      await connection.setRemoteDescription(payload.description);
-      const answer = await connection.createAnswer();
-      await connection.setLocalDescription(answer);
-      sendSignal(sourcePeerId, { signalType: "answer", description: connection.localDescription ?? answer });
-      return;
-    }
-    if (payload.signalType === "answer" && payload.description) {
-      if (connection.signalingState !== "stable") {
-        await connection.setRemoteDescription(payload.description);
-      }
-      return;
-    }
-    if (payload.signalType === "ice" && payload.candidate) {
-      try {
-        await connection.addIceCandidate(payload.candidate);
-      } catch {
-        // ICE candidates can race SDP on refresh; the next candidate usually repairs the path.
-      }
-    }
-  };
-
-  const createPeerConnection = (targetPeerId: string) => {
-    const existing = peerConnectionsRef.current.get(targetPeerId);
-    if (existing && existing.connectionState !== "failed" && existing.connectionState !== "closed") {
-      return existing;
-    }
-    existing?.close();
-    const connection = new RTCPeerConnection({
-      iceServers: iceConfigRef.current?.iceServers.map((server) => ({
-        urls: server.urls,
-        username: server.username || undefined,
-        credential: server.credential || undefined,
-      })) ?? [],
-    });
-    peerConnectionsRef.current.set(targetPeerId, connection);
-    connection.onicecandidate = (event) => {
-      if (event.candidate) {
-        sendSignal(targetPeerId, { signalType: "ice", candidate: event.candidate.toJSON() });
-      }
-    };
-    connection.ondatachannel = (event) => setupDataChannel(targetPeerId, event.channel);
-    connection.onconnectionstatechange = () => {
-      if (connection.connectionState === "failed" || connection.connectionState === "closed") {
-        dataChannelsRef.current.delete(targetPeerId);
-      }
-    };
-    return connection;
-  };
-
-  const setupDataChannel = (sourcePeerId: string, channel: RTCDataChannel) => {
-    channel.binaryType = "arraybuffer";
-    dataChannelsRef.current.set(sourcePeerId, channel);
-    channel.onmessage = (event) => handleDataChannelMessage(sourcePeerId, event.data);
-    channel.onclose = () => {
-      if (dataChannelsRef.current.get(sourcePeerId) === channel) {
-        dataChannelsRef.current.delete(sourcePeerId);
-      }
-      directIncomingRef.current.delete(sourcePeerId);
-      setReceivingTransfers((items) => items.filter((item) => item.sourcePeerId !== sourcePeerId));
-    };
-  };
-
-  const handleDataChannelMessage = (sourcePeerId: string, data: unknown) => {
-    if (typeof data === "string") {
-      handleDirectControlMessage(sourcePeerId, data);
-      return;
-    }
-    if (data instanceof ArrayBuffer) {
-      const current = directIncomingRef.current.get(sourcePeerId);
-      if (current) {
-        current.chunks.push(data);
-        current.receivedBytes += data.byteLength;
-        updateReceivingTransfer(current);
-      }
-      return;
-    }
-    if (data instanceof Blob) {
-      void data.arrayBuffer().then((buffer) => handleDataChannelMessage(sourcePeerId, buffer));
-    }
-  };
-
-  const handleDirectControlMessage = (sourcePeerId: string, data: string) => {
-    let message: { kind?: string; transferId?: string; fileName?: string; mimeType?: string; sizeBytes?: number };
-    try {
-      message = JSON.parse(data);
-    } catch {
-      return;
-    }
-    if (message.kind === "file-meta" && message.transferId) {
-      const incomingState = {
-        transferId: message.transferId,
-        sourcePeerId,
-        fileName: message.fileName || "attachment",
-        mimeType: message.mimeType || "application/octet-stream",
-        sizeBytes: Number(message.sizeBytes || 0),
-        chunks: [],
-        receivedBytes: 0,
-      };
-      directIncomingRef.current.set(sourcePeerId, incomingState);
-      updateReceivingTransfer(incomingState);
-      return;
-    }
-    if (message.kind === "file-complete" && message.transferId) {
-      completeDirectIncoming(sourcePeerId, message.transferId);
-      return;
-    }
-    if (message.kind === "file-ack" && message.transferId) {
-      const waiter = directAckWaitersRef.current.get(message.transferId);
-      if (waiter) {
-        window.clearTimeout(waiter.timer);
-        directAckWaitersRef.current.delete(message.transferId);
-        waiter.resolve();
-      }
-    }
-  };
-
-  const updateReceivingTransfer = (incomingState: DirectIncomingState) => {
-    setReceivingTransfers((items) => {
-      const view: ReceivingTransfer = {
-        transferId: incomingState.transferId,
-        sourcePeerId: incomingState.sourcePeerId,
-        fileName: incomingState.fileName,
-        mimeType: incomingState.mimeType,
-        sizeBytes: incomingState.sizeBytes,
-        receivedBytes: incomingState.receivedBytes,
-      };
-      const key = receivingTransferKey(view);
-      return [view, ...items.filter((item) => receivingTransferKey(item) !== key)].slice(0, 10);
-    });
-  };
-
-  const completeDirectIncoming = (sourcePeerId: string, transferId: string) => {
-    const incomingState = directIncomingRef.current.get(sourcePeerId);
-    if (!incomingState || incomingState.transferId !== transferId) {
-      return;
-    }
-    directIncomingRef.current.delete(sourcePeerId);
-    setReceivingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== `${sourcePeerId}:${transferId}`));
-    const mimeType = effectiveMimeType(incomingState.fileName, incomingState.mimeType);
-    const blob = new Blob(incomingState.chunks, { type: mimeType });
-    const previewUrl = URL.createObjectURL(blob);
-    directPreviewUrlsRef.current.push(previewUrl);
-    const attachment = directAttachment(
-      transferId,
-      incomingState.fileName,
-      mimeType,
-      incomingState.receivedBytes || incomingState.sizeBytes,
-    );
-    setIncoming((items) => [
-      {
-        sourcePeerId,
-        attachment,
-        objectId: attachment.objectId,
-        downloadUrl: previewUrl,
-        downloadExpiresAt: null,
-        direct: true,
-        previewUrl,
-        blob,
-      },
-      ...items,
-    ].slice(0, 20));
-    const channel = dataChannelsRef.current.get(sourcePeerId);
-    if (channel?.readyState === "open") {
-      channel.send(JSON.stringify({ kind: "file-ack", transferId }));
-    }
-  };
-
-  const sendSignal = (targetPeerId: string, payload: DiscoverySignalPayload) => {
-    const socket = discoverySocketRef.current;
-    if (!targetPeerId || !socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error("发现通道不可用");
-    }
-    socket.send(JSON.stringify({
-      type: "signal",
-      targetPeerId,
-      payload,
-    }));
-  };
-
-  const waitForDirectAck = (transferId: string, timeoutMs: number) => new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      directAckWaitersRef.current.delete(transferId);
-      reject(new Error("直连确认超时"));
-    }, timeoutMs);
-    directAckWaitersRef.current.set(transferId, { resolve, reject, timer });
-  });
 
   const downloadRecordFile = async () => {
     if (!record) {
@@ -731,6 +624,12 @@ function PublicTransferPageContent() {
           downloadUrl: response.downloadUrl,
           downloadExpiresAt: response.expiresAt,
         });
+      }
+      if (record.attachment.sizeBytes > STREAM_DOWNLOAD_THRESHOLD_BYTES && !hasRequestHeaders(response.downloadHeaders)) {
+        triggerUrlDownload(response.downloadUrl, record.attachment.fileName);
+        setNotice(`已开始下载：${record.attachment.fileName}`);
+        setError(null);
+        return;
       }
       await saveUrlAs(response.downloadUrl, record.attachment.fileName, response.downloadHeaders);
       setNotice(`已保存：${record.attachment.fileName}`);
@@ -766,14 +665,25 @@ function PublicTransferPageContent() {
       setIncoming((items) => items.map((current) => incomingItemKey(current) === key
         ? { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt }
         : current));
+      if (item.attachment.sizeBytes > STREAM_DOWNLOAD_THRESHOLD_BYTES && !hasRequestHeaders(response.downloadHeaders)) {
+        triggerUrlDownload(response.downloadUrl, item.attachment.fileName);
+        setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
+        setNotice(`已开始下载：${item.attachment.fileName}`);
+        setError(null);
+        return;
+      }
       const blob = await saveUrlAs(response.downloadUrl, item.attachment.fileName, response.downloadHeaders, (value) => {
         setIncomingDownloadState(key, { downloading: true, downloadProgress: value, downloadError: null });
       });
       const previewUrl = URL.createObjectURL(blob);
-      directPreviewUrlsRef.current.push(previewUrl);
-      setIncoming((items) => items.map((current) => incomingItemKey(current) === key
-        ? { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt, previewUrl, blob }
-        : current));
+      rememberPreviewUrl(previewUrl);
+      setIncoming((items) => items.map((current) => {
+        if (incomingItemKey(current) !== key) {
+          return current;
+        }
+        revokePreviewUrl(current.previewUrl);
+        return { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt, previewUrl, blob };
+      }));
       setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
       setNotice(`已保存：${item.attachment.fileName}`);
       setError(null);
@@ -922,20 +832,21 @@ function PublicTransferPageContent() {
             <input
               id="public-transfer-file-input"
               type="file"
+              multiple
               className="sr-only"
               onClick={(event) => {
                 event.currentTarget.value = "";
               }}
-              onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
+              onChange={(event) => setSelectedFiles(Array.from(event.target.files ?? []))}
             />
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
                 <div className="text-tiny font-medium uppercase tracking-[0.12em] text-zinc-500 dark:text-zinc-400">选择文件</div>
                 <div className="mt-1 truncate text-small font-medium text-zinc-900 dark:text-white">
-                  {selectedFile ? selectedFile.name : "尚未选择文件"}
+                  {selectedFileTitle}
                 </div>
                 <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                  {selectedFile ? `${formatBytes(selectedFile.size)} · ${selectedFile.type || "未知类型"}` : selectedPeer ? `将发送给 ${selectedPeer.displayName || selectedPeer.peerId}` : "未选择对方时会先生成分享链接"}
+                  {selectedFileDetail}
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0">
@@ -945,8 +856,8 @@ function PublicTransferPageContent() {
                 >
                   选择文件
                 </label>
-                <Button color="primary" radius="sm" className="w-full sm:w-auto" isLoading={state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
-                  {selectedPeer ? "发送给对方" : "生成分享链接"}
+                <Button color="primary" radius="sm" className="w-full sm:w-auto" isLoading={state === "connecting" || state === "direct" || state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
+                  {uploadButtonLabel}
                 </Button>
               </div>
             </div>
@@ -1076,7 +987,7 @@ function IncomingFilesPanel({
   onDownload,
   onPreview,
 }: {
-  receivingTransfers: ReceivingTransfer[];
+  receivingTransfers: DirectReceivingTransfer[];
   incoming: IncomingAttachment[];
   onShare: (item: IncomingAttachment) => Promise<void>;
   onDownload: (item: IncomingAttachment) => Promise<void>;
@@ -1475,6 +1386,7 @@ function putObject(
   headers: Record<string, string>,
   onProgress: (value: number) => void,
 ): Promise<void> {
+  const reportProgress = createProgressReporter(onProgress);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", url, true);
@@ -1483,12 +1395,12 @@ function putObject(
     }
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
-        onProgress(Math.round((event.loaded / event.total) * 100));
+        reportProgress(Math.round((event.loaded / event.total) * 100));
       }
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        onProgress(100);
+        reportProgress(100, true);
         resolve();
       } else {
         reject(new Error(`文件发送失败：HTTP ${xhr.status}`));
@@ -1499,720 +1411,22 @@ function putObject(
   });
 }
 
-function waitForDataChannelOpen(channel: RTCDataChannel, timeoutMs: number): Promise<RTCDataChannel> {
-  if (channel.readyState === "open") {
-    return Promise.resolve(channel);
-  }
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      cleanup();
-      reject(new Error("DataChannel 打开超时"));
-    }, timeoutMs);
-    const cleanup = () => {
-      window.clearTimeout(timer);
-      channel.removeEventListener("open", onOpen);
-      channel.removeEventListener("error", onError);
-      channel.removeEventListener("close", onClose);
-    };
-    const onOpen = () => {
-      cleanup();
-      resolve(channel);
-    };
-    const onError = () => {
-      cleanup();
-      reject(new Error("DataChannel 连接失败"));
-    };
-    const onClose = () => {
-      cleanup();
-      reject(new Error("DataChannel 已关闭"));
-    };
-    channel.addEventListener("open", onOpen);
-    channel.addEventListener("error", onError);
-    channel.addEventListener("close", onClose);
-  });
-}
-
-async function sendFileChunks(
-  channel: RTCDataChannel,
-  file: File,
-  onProgress: (value: number) => void,
-) {
-  const chunkSize = 64 * 1024;
-  channel.bufferedAmountLowThreshold = 1024 * 1024;
-  for (let offset = 0; offset < file.size; offset += chunkSize) {
-    if (channel.readyState !== "open") {
-      throw new Error("DataChannel 已关闭");
+function createProgressReporter(onProgress: (value: number) => void, minIntervalMs = 200) {
+  let lastAt = 0;
+  let lastValue = -1;
+  return (value: number, force = false) => {
+    const nextValue = Math.max(0, Math.min(100, Math.round(value)));
+    const now = Date.now();
+    if (force || nextValue === 0 || nextValue === 100 || (nextValue !== lastValue && now - lastAt >= minIntervalMs)) {
+      lastAt = now;
+      lastValue = nextValue;
+      onProgress(nextValue);
     }
-    while (channel.bufferedAmount > 4 * 1024 * 1024) {
-      await waitForBufferedAmountLow(channel);
-    }
-    const end = Math.min(file.size, offset + chunkSize);
-    channel.send(await file.slice(offset, end).arrayBuffer());
-    onProgress(Math.round((end / file.size) * 100));
-  }
-}
-
-function waitForBufferedAmountLow(channel: RTCDataChannel) {
-  if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) {
-    return Promise.resolve();
-  }
-  return new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      cleanup();
-      reject(new Error("DataChannel 发送缓冲区等待超时"));
-    }, 5000);
-    const cleanup = () => {
-      window.clearTimeout(timer);
-      channel.removeEventListener("bufferedamountlow", onLow);
-      channel.removeEventListener("close", onClose);
-    };
-    const onLow = () => {
-      cleanup();
-      resolve();
-    };
-    const onClose = () => {
-      cleanup();
-      reject(new Error("DataChannel 已关闭"));
-    };
-    channel.addEventListener("bufferedamountlow", onLow);
-    channel.addEventListener("close", onClose);
-  });
-}
-
-function directAttachment(transferId: string, fileName: string, mimeType: string, sizeBytes: number): TransferAttachment {
-  return {
-    attachmentId: 0,
-    objectId: `direct:${transferId}`,
-    fileName,
-    mimeType,
-    sizeBytes,
-    sha256: null,
-    status: "DIRECT",
-    expiresAt: "",
   };
 }
 
-type MediaKind = "image" | "video" | "audio" | "pdf" | "text" | "document" | "archive" | "file";
-
-const IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "svg", "webp"]);
-const VIDEO_EXTENSIONS = new Set(["3gp", "avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ogv", "webm"]);
-const AUDIO_EXTENSIONS = new Set(["aac", "flac", "m4a", "mp3", "oga", "ogg", "opus", "wav", "weba"]);
-const TEXT_EXTENSIONS = new Set([
-  "c", "conf", "config", "cpp", "cs", "css", "csv", "env", "go", "h", "html", "ini", "java", "js", "json",
-  "jsx", "log", "md", "mjs", "properties", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt",
-  "xml", "yaml", "yml",
-]);
-const DOCUMENT_EXTENSIONS = new Set(["doc", "docx", "key", "numbers", "odp", "ods", "odt", "pages", "ppt", "pptx", "rtf", "xls", "xlsx"]);
-const ARCHIVE_EXTENSIONS = new Set(["7z", "bz2", "gz", "rar", "tar", "tgz", "xz", "zip"]);
-
-function effectiveMimeType(fileName: string, mimeType?: string | null) {
-  const normalized = mimeType?.trim().toLowerCase();
-  if (normalized && normalized !== "application/octet-stream") {
-    return normalized;
-  }
-  const ext = fileExtension(fileName);
-  switch (ext) {
-    case "avif":
-      return "image/avif";
-    case "bmp":
-      return "image/bmp";
-    case "gif":
-      return "image/gif";
-    case "heic":
-      return "image/heic";
-    case "heif":
-      return "image/heif";
-    case "jpg":
-    case "jpeg":
-      return "image/jpeg";
-    case "png":
-      return "image/png";
-    case "svg":
-      return "image/svg+xml";
-    case "webp":
-      return "image/webp";
-    case "3gp":
-      return "video/3gpp";
-    case "avi":
-      return "video/x-msvideo";
-    case "m4v":
-      return "video/x-m4v";
-    case "mkv":
-      return "video/x-matroska";
-    case "mov":
-      return "video/quicktime";
-    case "mp4":
-      return "video/mp4";
-    case "mpeg":
-    case "mpg":
-      return "video/mpeg";
-    case "ogv":
-      return "video/ogg";
-    case "webm":
-      return "video/webm";
-    case "aac":
-      return "audio/aac";
-    case "flac":
-      return "audio/flac";
-    case "m4a":
-      return "audio/mp4";
-    case "mp3":
-      return "audio/mpeg";
-    case "oga":
-    case "ogg":
-      return "audio/ogg";
-    case "opus":
-      return "audio/opus";
-    case "wav":
-      return "audio/wav";
-    case "weba":
-      return "audio/webm";
-    case "pdf":
-      return "application/pdf";
-    case "csv":
-      return "text/csv";
-    case "html":
-      return "text/html";
-    case "json":
-      return "application/json";
-    case "log":
-    case "txt":
-      return "text/plain";
-    case "md":
-      return "text/markdown";
-    case "xml":
-      return "application/xml";
-    case "yaml":
-    case "yml":
-      return "application/yaml";
-    case "doc":
-      return "application/msword";
-    case "docx":
-      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-    case "ppt":
-      return "application/vnd.ms-powerpoint";
-    case "pptx":
-      return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-    case "xls":
-      return "application/vnd.ms-excel";
-    case "xlsx":
-      return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-    case "zip":
-      return "application/zip";
-    default:
-      if (TEXT_EXTENSIONS.has(ext)) {
-        return "text/plain";
-      }
-      return normalized || "application/octet-stream";
-  }
-}
-
-function mediaKind(fileName: string, mimeType?: string | null): MediaKind {
-  const type = effectiveMimeType(fileName, mimeType);
-  if (type.startsWith("image/")) {
-    return "image";
-  }
-  if (type.startsWith("video/")) {
-    return "video";
-  }
-  if (type.startsWith("audio/")) {
-    return "audio";
-  }
-  if (type === "application/pdf") {
-    return "pdf";
-  }
-  if (type.startsWith("text/")
-    || type === "application/json"
-    || type === "application/xml"
-    || type === "application/yaml"
-    || type.endsWith("+json")
-    || type.endsWith("+xml")) {
-    return "text";
-  }
-  const ext = fileExtension(fileName);
-  if (IMAGE_EXTENSIONS.has(ext)) {
-    return "image";
-  }
-  if (VIDEO_EXTENSIONS.has(ext)) {
-    return "video";
-  }
-  if (AUDIO_EXTENSIONS.has(ext)) {
-    return "audio";
-  }
-  if (ext === "pdf") {
-    return "pdf";
-  }
-  if (TEXT_EXTENSIONS.has(ext)) {
-    return "text";
-  }
-  if (DOCUMENT_EXTENSIONS.has(ext)) {
-    return "document";
-  }
-  if (ARCHIVE_EXTENSIONS.has(ext)) {
-    return "archive";
-  }
-  return "file";
-}
-
-function previewKindLabel(kind: MediaKind) {
-  switch (kind) {
-    case "image":
-      return "IMAGE";
-    case "video":
-      return "VIDEO";
-    case "audio":
-      return "AUDIO";
-    case "pdf":
-      return "PDF";
-    case "text":
-      return "TEXT";
-    case "document":
-      return "DOC";
-    case "archive":
-      return "ZIP";
-    default:
-      return "FILE";
-  }
-}
-
-function shortMimeLabel(mimeType: string) {
-  const normalized = mimeType.replace(/^application\//, "").replace(/^text\//, "");
-  return normalized.length > 24 ? `${normalized.slice(0, 21)}...` : normalized;
-}
-
-function fileExtension(fileName: string) {
-  const cleanName = fileName.trim().split(/[\\/]/).pop() || "";
-  const dot = cleanName.lastIndexOf(".");
-  if (dot < 0 || dot === cleanName.length - 1) {
-    return "";
-  }
-  return cleanName.slice(dot + 1).toLowerCase();
-}
-
-interface QrVersionSpec {
-  version: number;
-  dataCodewords: number;
-  ecCodewords: number;
-}
-
-const QR_VERSION_SPECS: QrVersionSpec[] = [
-  { version: 1, dataCodewords: 19, ecCodewords: 7 },
-  { version: 2, dataCodewords: 34, ecCodewords: 10 },
-  { version: 3, dataCodewords: 55, ecCodewords: 15 },
-  { version: 4, dataCodewords: 80, ecCodewords: 20 },
-  { version: 5, dataCodewords: 108, ecCodewords: 26 },
-];
-
-const QR_ALIGNMENT_PATTERN_POSITIONS: Record<number, number[]> = {
-  1: [],
-  2: [6, 18],
-  3: [6, 22],
-  4: [6, 26],
-  5: [6, 30],
-};
-
-const GF_EXP = (() => {
-  const exp = new Array<number>(255);
-  let value = 1;
-  for (let i = 0; i < 255; i += 1) {
-    exp[i] = value;
-    value <<= 1;
-    if (value >= 0x100) {
-      value ^= 0x11d;
-    }
-  }
-  return exp;
-})();
-
-const GF_LOG = (() => {
-  const log = new Array<number>(256).fill(0);
-  for (let i = 0; i < 255; i += 1) {
-    log[GF_EXP[i]] = i;
-  }
-  return log;
-})();
-
-function createQrMatrix(value: string): boolean[][] {
-  const data = Array.from(new TextEncoder().encode(value));
-  const spec = QR_VERSION_SPECS.find((item) => data.length <= qrByteCapacity(item));
-  if (!spec) {
-    throw new Error("链接太长，请复制链接打开");
-  }
-
-  const dataCodewords = encodeQrDataCodewords(data, spec);
-  const generator = reedSolomonGenerator(spec.ecCodewords);
-  const ecCodewords = reedSolomonRemainder(dataCodewords, generator);
-  const codewords = [...dataCodewords, ...ecCodewords];
-  const base = drawQrFunctionPatterns(spec.version);
-  placeQrDataBits(base.modules, base.isFunction, codewords);
-
-  let bestMatrix: Array<Array<boolean | null>> | null = null;
-  let bestPenalty = Number.POSITIVE_INFINITY;
-  for (let mask = 0; mask < 8; mask += 1) {
-    const candidate = cloneQrMatrix(base.modules);
-    applyQrMask(candidate, base.isFunction, mask);
-    drawQrFormatBits(candidate, base.isFunction, mask);
-    const penalty = qrPenaltyScore(candidate);
-    if (penalty < bestPenalty) {
-      bestPenalty = penalty;
-      bestMatrix = candidate;
-    }
-  }
-  if (!bestMatrix) {
-    throw new Error("二维码生成失败");
-  }
-  return bestMatrix.map((row) => row.map(Boolean));
-}
-
-function qrByteCapacity(spec: QrVersionSpec) {
-  return Math.floor((spec.dataCodewords * 8 - 12) / 8);
-}
-
-function encodeQrDataCodewords(data: number[], spec: QrVersionSpec) {
-  const bits: number[] = [];
-  appendQrBits(bits, 0b0100, 4);
-  appendQrBits(bits, data.length, 8);
-  for (const byte of data) {
-    appendQrBits(bits, byte, 8);
-  }
-
-  const capacityBits = spec.dataCodewords * 8;
-  if (bits.length > capacityBits) {
-    throw new Error("链接太长，请复制链接打开");
-  }
-  for (let i = 0, length = Math.min(4, capacityBits - bits.length); i < length; i += 1) {
-    bits.push(0);
-  }
-  while (bits.length % 8 !== 0) {
-    bits.push(0);
-  }
-
-  const result: number[] = [];
-  for (let i = 0; i < bits.length; i += 8) {
-    let value = 0;
-    for (let j = 0; j < 8; j += 1) {
-      value = (value << 1) | bits[i + j];
-    }
-    result.push(value);
-  }
-  for (let padIndex = 0; result.length < spec.dataCodewords; padIndex += 1) {
-    result.push(padIndex % 2 === 0 ? 0xec : 0x11);
-  }
-  return result;
-}
-
-function appendQrBits(bits: number[], value: number, length: number) {
-  for (let i = length - 1; i >= 0; i -= 1) {
-    bits.push((value >>> i) & 1);
-  }
-}
-
-function reedSolomonGenerator(degree: number) {
-  const result = new Array<number>(degree).fill(0);
-  result[degree - 1] = 1;
-  let root = 1;
-  for (let i = 0; i < degree; i += 1) {
-    for (let j = 0; j < result.length; j += 1) {
-      result[j] = gfMultiply(result[j], root);
-      if (j + 1 < result.length) {
-        result[j] ^= result[j + 1];
-      }
-    }
-    root = gfMultiply(root, 0x02);
-  }
-  return result;
-}
-
-function reedSolomonRemainder(data: number[], generator: number[]) {
-  const result = new Array<number>(generator.length).fill(0);
-  for (const byte of data) {
-    const factor = byte ^ (result.shift() ?? 0);
-    result.push(0);
-    for (let i = 0; i < generator.length; i += 1) {
-      result[i] ^= gfMultiply(generator[i], factor);
-    }
-  }
-  return result;
-}
-
-function gfMultiply(x: number, y: number) {
-  if (x === 0 || y === 0) {
-    return 0;
-  }
-  return GF_EXP[(GF_LOG[x] + GF_LOG[y]) % 255];
-}
-
-function drawQrFunctionPatterns(version: number) {
-  const size = qrSize(version);
-  const modules = Array.from({ length: size }, () => new Array<boolean | null>(size).fill(null));
-  const isFunction = Array.from({ length: size }, () => new Array<boolean>(size).fill(false));
-  const setFunction = (x: number, y: number, dark: boolean) => {
-    modules[y][x] = dark;
-    isFunction[y][x] = true;
-  };
-
-  drawQrFinderPattern(modules, isFunction, 3, 3);
-  drawQrFinderPattern(modules, isFunction, size - 4, 3);
-  drawQrFinderPattern(modules, isFunction, 3, size - 4);
-
-  for (let i = 0; i < size; i += 1) {
-    if (!isFunction[6][i]) {
-      setFunction(i, 6, i % 2 === 0);
-    }
-    if (!isFunction[i][6]) {
-      setFunction(6, i, i % 2 === 0);
-    }
-  }
-
-  for (const y of QR_ALIGNMENT_PATTERN_POSITIONS[version] ?? []) {
-    for (const x of QR_ALIGNMENT_PATTERN_POSITIONS[version] ?? []) {
-      if (!isFunction[y][x]) {
-        drawQrAlignmentPattern(modules, isFunction, x, y);
-      }
-    }
-  }
-
-  drawQrFormatBits(modules, isFunction, 0);
-  setFunction(8, size - 8, true);
-  return { modules, isFunction };
-}
-
-function drawQrFinderPattern(
-  modules: Array<Array<boolean | null>>,
-  isFunction: boolean[][],
-  centerX: number,
-  centerY: number,
-) {
-  for (let dy = -4; dy <= 4; dy += 1) {
-    for (let dx = -4; dx <= 4; dx += 1) {
-      const x = centerX + dx;
-      const y = centerY + dy;
-      if (x < 0 || y < 0 || y >= modules.length || x >= modules.length) {
-        continue;
-      }
-      const distance = Math.max(Math.abs(dx), Math.abs(dy));
-      modules[y][x] = distance !== 2 && distance !== 4;
-      isFunction[y][x] = true;
-    }
-  }
-}
-
-function drawQrAlignmentPattern(
-  modules: Array<Array<boolean | null>>,
-  isFunction: boolean[][],
-  centerX: number,
-  centerY: number,
-) {
-  for (let dy = -2; dy <= 2; dy += 1) {
-    for (let dx = -2; dx <= 2; dx += 1) {
-      const x = centerX + dx;
-      const y = centerY + dy;
-      const distance = Math.max(Math.abs(dx), Math.abs(dy));
-      modules[y][x] = distance !== 1;
-      isFunction[y][x] = true;
-    }
-  }
-}
-
-function drawQrFormatBits(
-  modules: Array<Array<boolean | null>>,
-  isFunction: boolean[][],
-  mask: number,
-) {
-  const size = modules.length;
-  const bits = qrFormatBits(mask);
-  const setFunction = (x: number, y: number, dark: boolean) => {
-    modules[y][x] = dark;
-    isFunction[y][x] = true;
-  };
-
-  for (let i = 0; i <= 5; i += 1) {
-    setFunction(8, i, qrBit(bits, i));
-  }
-  setFunction(8, 7, qrBit(bits, 6));
-  setFunction(8, 8, qrBit(bits, 7));
-  setFunction(7, 8, qrBit(bits, 8));
-  for (let i = 9; i < 15; i += 1) {
-    setFunction(14 - i, 8, qrBit(bits, i));
-  }
-  for (let i = 0; i < 8; i += 1) {
-    setFunction(size - 1 - i, 8, qrBit(bits, i));
-  }
-  for (let i = 8; i < 15; i += 1) {
-    setFunction(8, size - 15 + i, qrBit(bits, i));
-  }
-  setFunction(8, size - 8, true);
-}
-
-function qrFormatBits(mask: number) {
-  const errorCorrectionLevelL = 0b01;
-  const data = (errorCorrectionLevelL << 3) | mask;
-  let bits = data << 10;
-  const generator = 0x537;
-  for (let i = 14; i >= 10; i -= 1) {
-    if (((bits >>> i) & 1) !== 0) {
-      bits ^= generator << (i - 10);
-    }
-  }
-  return ((data << 10) | bits) ^ 0x5412;
-}
-
-function qrBit(value: number, index: number) {
-  return ((value >>> index) & 1) !== 0;
-}
-
-function placeQrDataBits(
-  modules: Array<Array<boolean | null>>,
-  isFunction: boolean[][],
-  codewords: number[],
-) {
-  const size = modules.length;
-  const bits = codewords.flatMap((word) => Array.from({ length: 8 }, (_, index) => ((word >>> (7 - index)) & 1) !== 0));
-  let bitIndex = 0;
-  let upward = true;
-  for (let right = size - 1; right >= 1; right -= 2) {
-    if (right === 6) {
-      right = 5;
-    }
-    for (let vertical = 0; vertical < size; vertical += 1) {
-      const y = upward ? size - 1 - vertical : vertical;
-      for (let dx = 0; dx < 2; dx += 1) {
-        const x = right - dx;
-        if (!isFunction[y][x]) {
-          modules[y][x] = bits[bitIndex] ?? false;
-          bitIndex += 1;
-        }
-      }
-    }
-    upward = !upward;
-  }
-}
-
-function applyQrMask(
-  modules: Array<Array<boolean | null>>,
-  isFunction: boolean[][],
-  mask: number,
-) {
-  for (let y = 0; y < modules.length; y += 1) {
-    for (let x = 0; x < modules.length; x += 1) {
-      if (!isFunction[y][x] && qrMaskBit(mask, x, y)) {
-        modules[y][x] = !modules[y][x];
-      }
-    }
-  }
-}
-
-function qrMaskBit(mask: number, x: number, y: number) {
-  switch (mask) {
-    case 0:
-      return (x + y) % 2 === 0;
-    case 1:
-      return y % 2 === 0;
-    case 2:
-      return x % 3 === 0;
-    case 3:
-      return (x + y) % 3 === 0;
-    case 4:
-      return (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0;
-    case 5:
-      return ((x * y) % 2) + ((x * y) % 3) === 0;
-    case 6:
-      return (((x * y) % 2) + ((x * y) % 3)) % 2 === 0;
-    case 7:
-      return (((x + y) % 2) + ((x * y) % 3)) % 2 === 0;
-    default:
-      return false;
-  }
-}
-
-function qrPenaltyScore(modules: Array<Array<boolean | null>>) {
-  const matrix = modules.map((row) => row.map(Boolean));
-  const size = matrix.length;
-  let penalty = 0;
-
-  for (let y = 0; y < size; y += 1) {
-    penalty += qrLinePenalty(matrix[y]);
-  }
-  for (let x = 0; x < size; x += 1) {
-    penalty += qrLinePenalty(matrix.map((row) => row[x]));
-  }
-
-  for (let y = 0; y < size - 1; y += 1) {
-    for (let x = 0; x < size - 1; x += 1) {
-      const color = matrix[y][x];
-      if (matrix[y][x + 1] === color && matrix[y + 1][x] === color && matrix[y + 1][x + 1] === color) {
-        penalty += 3;
-      }
-    }
-  }
-
-  for (let y = 0; y < size; y += 1) {
-    for (let x = 0; x <= size - 7; x += 1) {
-      if (qrFinderLikePattern(matrix[y].slice(x, x + 7))
-        && (qrLightRun(matrix[y], x - 4, x) || qrLightRun(matrix[y], x + 7, x + 11))) {
-        penalty += 40;
-      }
-    }
-  }
-  for (let x = 0; x < size; x += 1) {
-    const column = matrix.map((row) => row[x]);
-    for (let y = 0; y <= size - 7; y += 1) {
-      if (qrFinderLikePattern(column.slice(y, y + 7))
-        && (qrLightRun(column, y - 4, y) || qrLightRun(column, y + 7, y + 11))) {
-        penalty += 40;
-      }
-    }
-  }
-
-  const dark = matrix.flat().filter(Boolean).length;
-  penalty += Math.floor(Math.abs(dark * 20 - size * size * 10) / (size * size)) * 10;
-  return penalty;
-}
-
-function qrLinePenalty(line: boolean[]) {
-  let penalty = 0;
-  let runColor = line[0];
-  let runLength = 1;
-  for (let i = 1; i < line.length; i += 1) {
-    if (line[i] === runColor) {
-      runLength += 1;
-      if (runLength === 5) {
-        penalty += 3;
-      } else if (runLength > 5) {
-        penalty += 1;
-      }
-    } else {
-      runColor = line[i];
-      runLength = 1;
-    }
-  }
-  return penalty;
-}
-
-function qrFinderLikePattern(pattern: boolean[]) {
-  return pattern.length === 7
-    && pattern[0]
-    && !pattern[1]
-    && pattern[2]
-    && pattern[3]
-    && pattern[4]
-    && !pattern[5]
-    && pattern[6];
-}
-
-function qrLightRun(line: boolean[], start: number, end: number) {
-  if (start < 0 || end > line.length) {
-    return true;
-  }
-  return line.slice(start, end).every((value) => !value);
-}
-
-function qrSize(version: number) {
-  return version * 4 + 17;
-}
-
-function cloneQrMatrix(modules: Array<Array<boolean | null>>) {
-  return modules.map((row) => row.slice());
+function hasRequestHeaders(headers: Record<string, string>) {
+  return Object.keys(headers).length > 0;
 }
 
 function stateLabel(state: UploadState, progress: number) {
@@ -2257,10 +1471,6 @@ function transferProgress(doneBytes: number, totalBytes: number) {
   return Math.max(0, Math.min(100, Math.round((doneBytes / totalBytes) * 100)));
 }
 
-function receivingTransferKey(item: Pick<ReceivingTransfer, "sourcePeerId" | "transferId">) {
-  return `${item.sourcePeerId}:${item.transferId}`;
-}
-
 function incomingItemKey(item: IncomingAttachment) {
   return `${item.sourcePeerId}:${item.attachment.attachmentId}:${item.objectId}`;
 }
@@ -2271,6 +1481,7 @@ async function saveUrlAs(
   headers: Record<string, string> = {},
   onProgress?: (value: number) => void,
 ): Promise<Blob> {
+  const reportProgress = onProgress ? createProgressReporter(onProgress) : null;
   const response = await fetch(url, { headers });
   if (!response.ok) {
     throw new Error(`下载失败：HTTP ${response.status}`);
@@ -2290,7 +1501,7 @@ async function saveUrlAs(
         copy.set(value);
         chunks.push(copy.buffer);
         received += value.byteLength;
-        onProgress?.(contentLength > 0 ? transferProgress(received, contentLength) : 0);
+        reportProgress?.(contentLength > 0 ? transferProgress(received, contentLength) : 0);
       }
     }
   } else {
@@ -2302,7 +1513,7 @@ async function saveUrlAs(
     type: response.headers.get("Content-Type") || "application/octet-stream",
   });
   downloadBlob(blob, fileName);
-  onProgress?.(100);
+  reportProgress?.(100, true);
   return blob;
 }
 
@@ -2427,12 +1638,6 @@ function isShareCancelled(error: unknown) {
 
 function createRoomToken() {
   const bytes = new Uint8Array(12);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function createTransferId() {
-  const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }

@@ -22,4 +22,13 @@ public class PublicTransferProperties {
 
     /** 单房间(按 roomToken 哈希)同时存在的 PENDING 附件上限。 */
     private int maxPendingUploadsPerRoom = 50;
+
+    /** 单个公开传输房间允许同时在线的浏览器数量。 */
+    private int maxDiscoveryPeersPerRoom = 32;
+
+    /** 单个发现 WebSocket 连接在一个时间窗内允许发送的消息数。 */
+    private int discoveryMessageRateLimitPerConnection = 120;
+
+    /** 发现 WebSocket 消息限流时间窗长度(秒)。 */
+    private long discoveryMessageRateLimitWindowSeconds = 60;
 }

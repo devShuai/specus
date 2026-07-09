@@ -4,7 +4,7 @@
 
 涉及的主要文件:
 
-* 前端:`apps/admin-web/src/pages/PublicTransferPage.tsx`(约 2450 行,含 WebRTC 收发、QR 生成、MIME 映射)
+* 前端:`apps/admin-web/src/pages/PublicTransferPage.tsx`(原始约 2300 行;当前已拆出 QR 生成、MIME/预览工具与 WebRTC 直连 hook)
 * 信令:`implementations/java/server/.../websocket/PublicTransferDiscoveryWebSocketHandler.java`
 * 附件服务:`implementations/java/server/.../management/service/TransferAttachmentService.java`
 * 附件接口:`implementations/java/server/.../management/controller/TransferAttachmentResource.java`
@@ -15,7 +15,7 @@
 
 * 整体链路设计合理:WebRTC 直连优先、OSS 预签名兜底、信令按 roomKey 分组隔离、附件 ID 随机不可枚举。
 * 找到 **4 个 P0**(2 安全 + 2 功能)、**4 个 P1**、多个 P2,详见下表。其中 XFF 伪造与生产 CSP 缺 OSS 域名两项会直接影响可用性/隔离性。
-* 截至本次审计,以下问题**均未修复**,本文作为待处理清单。
+* 本文保留原始审计问题与修复核对记录;截至 2026-07-09 当前代码核对,P0/P1/P2/P3 主项已处理或按产品语义确认,本文同时作为修复进度清单。
 
 ## 机制强项(审计前已具备,列出以免重复怀疑)
 
@@ -45,11 +45,38 @@
 | P2 | 13 | 过期清理固定 Top100,滥用时清理跟不上 | 健壮性 |
 | P2 | 14 | 附件 ID 随机生成无唯一性重试,撞主键直接抛异常 | 健壮性 |
 | P3 | 15 | 直连静默接收,房间内任何人可向对方推文件 | 安全 |
-| P3 | 16 | `PublicTransferPage.tsx` 2450 行,QR/MIME/WebRTC 逻辑未拆分 | 结构 |
+| P3 | 16 | `PublicTransferPage.tsx` 约 2300 行,QR/MIME/WebRTC 逻辑未拆分 | 结构 |
 | P3 | 17 | 一次仅支持单文件,`directIncomingRef` 按 peerId 键控会覆盖并发传输 | 功能 |
 | P3 | 18 | 后端已支持 sha256 字段,前端从不计算/传递,直连无完整性校验 | 功能 |
 
-> **修复进展(2026-07-09)**:P0 全部处理(#1、#3、#4 已修复;#2 经产品确认为预期的"房间共享"语义,已补 UI 提示)。P1(#5、#6、#7、#8)已修复,服务端 42 项单测 + 前端 `tsc --noEmit` 全绿(其间顺带修复了与本功能无关、HEAD 上已无法编译的 `PeerMeshServiceTests`)。P2/P3 待排期。各条目末尾附「状态」。
+> **修复进展(2026-07-09)**:P0 全部处理(#1、#3、#4 已修复;#2 经产品确认为预期的"房间共享"语义,已补 UI 提示)。P1 全部处理(#5、#6、#7、#8)。P2/P3 全部处理:#9 通过大文件直连转 OSS 与 OSS 大文件原生下载避免浏览器内存承压;#10~#15、#17、#18 已处理;#16 已拆出 QR、MIME/预览工具与 `useDirectTransfer` hook。各条目末尾附「状态」。
+
+## 当前实现核对结果(2026-07-09)
+
+本次按当前 `main` 工作区实现重新核对,结论如下。注意:#4 当前实现方式为 `WebSocketSession#setTextMessageSizeLimit/#setBinaryMessageSizeLimit`,未找到原文描述的 `ServletServerContainerFactoryBean`;从代码意图看已把会话消息上限抬到 64KB,但实现方式与原记录不同。
+
+| 编号 | 当前判断 | 核对依据 |
+|---|---|---|
+| #1 XFF 伪造 | 已处理 | `PublicTransferDiscoveryHandshakeInterceptor.publicAddress()` 与 `TransferAttachmentResource.clientIp()` 均优先 `X-Real-IP`,退而取 XFF 末位;nginx 同步设置 `X-Real-IP $remote_addr`。 |
+| #2 同房间下载权限 | 按预期处理 | 当前仍按 `roomTokenHash` 授权同房间下载;前端已在完成卡片与 `TransferFaq` 明示"同房间成员可下载"。 |
+| #3 生产 CSP 缺 OSS | 已处理 | `SecurityConfig.ossCspOrigin()` 动态注入 bucket origin;OpenResty 两处 CSP 已放行 `https://*.aliyuncs.com` 的 `connect-src/img-src/media-src`。 |
+| #4 WS 8KB 缓冲 | 已处理,实现方式不同 | `afterConnectionEstablished()` 调 `session.setTextMessageSizeLimit(64KB)` 和 `setBinaryMessageSizeLimit(64KB)`;未找到 `ServletServerContainerFactoryBean`。 |
+| #5 上传大小绕过 | 已处理 | `TransferAttachmentService.complete()` 调 `verifyUploadedObject()`,通过 `ObjectStorageService.statObject()` HEAD 对象,不存在拒绝、超大小删除并拒绝、实际大小回写。 |
+| #6 公开上传无限流 | 已处理 | 已有 `PublicTransferRateLimiter` 按来源 IP 限流、单房间 PENDING 上限;发现 WS 也增加房间人数上限与每连接固定窗口消息限流。 |
+| #7 ACK 起算过早 | 已处理 | `sendDirect()` 在 `sendFileChunks()` 后注册 `waitForDirectAck(15000)`,再发送 `file-complete`。 |
+| #8 ICE 配置闭包旧值 | 已处理 | `iceConfigRef` 在拉取配置后同步更新,`createPeerConnection()` 从 ref 读取最新 ICE server。 |
+| #9 大文件内存缓冲 | 已处理 | 直连文件超过 128MB 不再内存接收,发送端自动回退 OSS;OSS 下载超过 64MB 且无需自定义 header 时用浏览器原生下载,避免整段读入 JS 内存。 |
+| #10 进度无节流 | 已处理 | 上传、直连发送、下载进度统一 200ms 左右节流;接收进度按 transfer key 节流,完成态立即刷新。 |
+| #11 blob URL/Blob 淘汰不释放 | 已处理 | `incoming` 淘汰旧项时 revoke 本页创建的 `blob:` URL;页面卸载统一清理 Set。 |
+| #12 WS 无重连/心跳 | 已处理 | 发现 WS 增加应用层 `ping/pong` 心跳、75s pong 超时关闭、指数退避重连。 |
+| #13 过期清理 Top100 | 已处理 | `expireOldAttachments()` 循环取 Top100 批次直到取空,避免单次扫描只清一页。 |
+| #14 ID 撞库无重试 | 已处理 | 新建附件先 `existsById` 预检查,保存时 `saveAndFlush` 捕获唯一冲突并有限重试。 |
+| #15 静默接收 | 已处理 | 直连 `file-meta` 到达先弹确认;拒绝会回 `file-reject`,发送端不再绕过用户拒绝自动回退。 |
+| #16 单文件过长 | 已处理 | `PublicTransferPage.tsx` 当前约 1558 行;QR 生成器拆到 `src/lib/qr.ts`,MIME/预览判断拆到 `src/lib/transferPreview.ts`,WebRTC 直连收发拆到 `src/hooks/useDirectTransfer.ts`。 |
+| #17 单文件/并发覆盖 | 已处理 | 文件 input 开启 `multiple`,批量顺序发送;直连接收按 `sourcePeerId:transferId` 键控,避免同 peer 状态覆盖。 |
+| #18 sha256 未使用 | 已处理 | 前端上传/直连发送流式计算 SHA-256;OSS 预签名请求携带 sha256,直连接收完成后按 hash 校验。 |
+
+验证说明:本次核对包含代码静态比对与构建验证。`apps/admin-web` 下 `npm test` 与 `npm run build` 已通过。服务端使用 `mvn -pl implementations/java/server -am compile -DskipTests "-Dtunnel.server.web.skip=true"` 在非沙箱权限下已通过;沙箱内 `javac` 读取 reactor classpath 时会误报 `com.theshuai.common.*` 不存在并伴随 `AccessDeniedException`,不作为代码失败判断。新增 `TransferAttachmentServiceTests`,覆盖公开上传限额、元数据规范化、ID 冲突重试、未 complete 禁止下载、对象存在/大小校验、过期附件循环清理;目标测试命令 `mvn -pl implementations/java/server -am -Dtest=TransferAttachmentServiceTests "-Dsurefire.failIfNoSpecifiedTests=false" test "-Dtunnel.server.web.skip=true"` 已通过。
 
 ## 问题与建议明细
 
@@ -69,7 +96,7 @@
 
 信令侧 attachment 广播消息携带 `attachmentId`,同房间成员据此 + 已知 token 即可 presign-download。这可能是"房间即共享空间"的有意设计,也可能是疏漏。**需产品确认**:若非预期,应在附件上绑定 uploader peerId / roomId,下载时校验;若为预期,应在 UI 明示"同房间可见"。
 
-状态:**已确认为预期行为(2026-07-09)**。产品定为"房间即共享空间",授权模型维持不变;已在前端补 UI 提示:`TransferFaq` 新增"谁能看到我发的文件？"条目并调整"更多说明"文案,分享链接完成卡片对非直连文件标注"同房间成员可下载"。若后续需要私密投递,再评估"收紧到点对点"方案。
+状态:**已确认为预期行为(2026-07-09)**。产品定为"房间即共享空间",授权模型维持不变;已在前端补 UI 提示:`TransferFaq` 新增"谁能看到我发的文件？"条目并调整"更多说明"文案,分享链接完成卡片对非直连文件标注"同房间成员可下载"。本轮功能边界不包含私密点对点 OSS 投递。
 
 ### 3. 生产 CSP 未放行 OSS 域名,预签名兜底跑不通(P0 功能)
 
@@ -91,7 +118,7 @@ handler 声明 `MAX_MESSAGE_CHARS = 64 * 1024`,但未找到 `ServletServerContai
 
 建议:显式配置 WebSocket container 的 `maxTextMessageBufferSize`(与 handler 的 64KB 对齐),必要时同时调 `maxBinaryMessageBufferSize`。
 
-状态:**已修复(2026-07-09)**。`WebSocketConfig` 新增 `ServletServerContainerFactoryBean` bean,将文本/二进制缓冲上限均设为 64KB,与 handler 的 `MAX_MESSAGE_CHARS` 对齐。
+状态:**已修复(2026-07-09,当前实现方式已核对)**。`PublicTransferDiscoveryWebSocketHandler.afterConnectionEstablished()` 调用 `session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS)` 与 `session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS)`,将文本/二进制会话消息上限抬到 64KB,与 handler 的 `MAX_MESSAGE_CHARS` 对齐。当前代码未找到 `ServletServerContainerFactoryBean`;此处以实际实现为准。
 
 ### 5. 上传预签名不绑定 Content-Length(P1 安全)
 
@@ -107,7 +134,7 @@ handler 声明 `MAX_MESSAGE_CHARS = 64 * 1024`,但未找到 `ServletServerContai
 
 建议:presign-upload 加 per-IP / per-room 限流 + 单房间 PENDING 附件数上限;WS 加房间人数上限与每连接消息速率限制。
 
-状态:**部分修复(2026-07-09)**。新增 `PublicTransferRateLimiter`(按来源 IP 固定窗口限流,默认 30 次 / 300s)与 `PublicTransferProperties` 配置;控制器取来源 IP(与 #1 同口径:X-Real-IP 优先、XFF 末位)后校验,超限抛 `RateLimitedException` → HTTP 429。`createPublicUpload` 增加单房间 PENDING 附件上限(默认 50)。限流为进程内计数,多实例部署时按实例数放大(见类注释);**WS 房间人数 / 消息频率上限尚未做**,留待后续。
+状态:**已修复(2026-07-09)**。新增 `PublicTransferRateLimiter`(按来源 IP 固定窗口限流,默认 30 次 / 300s)与 `PublicTransferProperties` 配置;控制器取来源 IP(与 #1 同口径:X-Real-IP 优先、XFF 末位)后校验,超限抛 `RateLimitedException` → HTTP 429。`createPublicUpload` 增加单房间 PENDING 附件上限(默认 50)。发现 WS 增加单房间在线人数上限(默认 32)与每连接消息频率上限(默认 120 次 / 60s),并对超限连接返回 error 后关闭。限流为进程内计数,多实例部署时上限按实例数放大(见类注释)。
 
 ### 7. 直连 ACK 超时在发送前起算(P1 功能)
 
@@ -129,43 +156,63 @@ handler 声明 `MAX_MESSAGE_CHARS = 64 * 1024`,但未找到 `ServletServerContai
 
 直连接收把所有 chunk 存入 `chunks: ArrayBuffer[]` 再拼 Blob(`completeDirectIncoming`);OSS 下载 `saveUrlAs` 也是整段读入内存再触发保存。手机上传/接收 1GB+ 文件大概率 OOM 崩页面。建议:桌面端用 File System Access API 流式落盘;下载在无自定义 header 时直接 `<a download href={presignedUrl}>` 交给浏览器流式处理(当前为进度条牺牲了内存,可按文件大小分流)。
 
+状态:**已修复(2026-07-09)**。直连发送端对超过 128MB 的文件直接回退 OSS;接收端收到超过阈值的 `file-meta` 会拒绝并提示改用分享链接,避免移动端内存接收。OSS 下载超过 64MB 且不需要自定义请求头时,改用浏览器原生 `<a download>` 触发下载,不再把整段 response 拼成 Blob。小文件仍保留 Blob 预览。
+
 ### 10. 进度 setState 无节流(P2 性能)
 
 发送端 `sendFileChunks` 的 `onProgress` 与接收端 `updateReceivingTransfer` 每个 64KB chunk 触发一次 React 更新,1GB 文件约 1.6 万次 re-render。建议按时间(如 200ms)或百分比变化节流。
+
+状态:**已修复(2026-07-09)**。`putObject`、`sendFileChunks`、`saveUrlAs` 使用统一进度 reporter,约 200ms 刷新一次并强制刷新 100%;接收进度按 `sourcePeerId:transferId` 节流,完成态立即刷新。
 
 ### 11. blob URL 与 blob 只增不减(P2 性能)
 
 `directPreviewUrlsRef` 只 push 不 revoke;`incoming` 列表 `.slice(0, 20)` 淘汰旧项时,对应 `previewUrl` 与 `blob` 未释放。长会话传多个大文件,内存持续增长。建议:列表淘汰或组件卸载时 `URL.revokeObjectURL` 并丢弃 blob 引用。
 
+状态:**已修复(2026-07-09)**。本地创建的 `blob:` URL 统一记录到 Set,`incoming` 超限淘汰、房间切换、预览替换、页面卸载时都会 revoke;非本页创建的 HTTPS 预签名 URL 不做 revoke。
+
 ### 12. 发现 WS 无断线重连、无心跳(P2 健壮性)
 
 `socket.onclose` 仅清空 ref,不重连(`PublicTransferPage.tsx` 信令 effect)。手机锁屏断连后 peers 列表僵死,须刷新页面。建议:加指数退避重连 + 应用层心跳。服务端 `send` 里的 `synchronized(session)` 直发可换 Spring `ConcurrentWebSocketSessionDecorator`,避免慢客户端阻塞广播。
+
+状态:**已修复(2026-07-09)**。前端发现 WS 增加应用层 `ping/pong` 心跳,25s ping、75s 未收到 pong 主动关闭并指数退避重连;服务端识别 `ping` 并返回 `pong`。
 
 ### 13. 过期清理固定 Top100(P2 健壮性)
 
 `expireOldAttachments` 每次(默认每小时)最多清 `findTop100...` 100 条(`TransferAttachmentService.java`)。被滥用时清理速度跟不上堆积。建议改为循环取批直到取空(或提高频率 + 批量删)。
 
+状态:**已修复(2026-07-09)**。`expireOldAttachments()` 已改为循环取 Top100 批次直到取空,每批仍逐条删除 OSS 对象并更新状态。
+
 ### 14. 附件 ID 随机生成无唯一性重试(P2 健壮性)
 
 `ClientIdGenerator.newId` 用 `ThreadLocalRandom` 随机取值,`createUpload` 直接 `setId` 后 `save`。撞主键(概率约 1/9e15,极低)会直接抛异常而非重试。建议:save 捕获唯一约束冲突后重取 ID 重试有限次数。
+
+状态:**已修复(2026-07-09)**。新增 `newAttachmentId()` 做存在性预检查;`createUpload()` 保存时使用 `saveAndFlush`,捕获 `DataIntegrityViolationException` 后重新生成 ID、objectKey 与 presign URL 并有限重试。
 
 ### 15. 直连静默接收(P3 安全)
 
 接收方收到 offer 即自动建连、自动收文件(`ondatachannel` / `handleDirectControlMessage` 的 `file-meta`),房间内任何人可向你的设备推任意文件并占用内存。建议:file-meta 到达时弹出接收确认,拒绝则回 reject 控制消息并关闭 channel。
 
+状态:**已修复(2026-07-09)**。`file-meta` 到达后先弹确认;拒绝发送 `file-reject`,发送端识别用户拒绝后不再自动回退 OSS。超过直连接收阈值或声明大小异常也会拒绝。
+
 ### 16. 单文件超长,工具代码未拆分(P3 结构)
 
-`PublicTransferPage.tsx` 已 2450 行,其中 QR 生成器(Reed-Solomon + 掩码,约 600 行)、MIME 映射(约 150 行)为纯工具代码,建议抽到 `lib/qr.ts`、`lib/mime.ts`;WebRTC 收发适合抽成 `useDirectTransfer` hook,降低单文件复杂度与回归风险。
+原问题:`PublicTransferPage.tsx` 约 2300 行,其中 QR 生成器(Reed-Solomon + 掩码,约 600 行)、MIME 映射(约 150 行)为纯工具代码,建议抽到 `lib/qr.ts`、`lib/mime.ts`;WebRTC 收发适合抽成 `useDirectTransfer` hook,降低单文件复杂度与回归风险。
+
+状态:**已修复(2026-07-09)**。QR 生成器已拆到 `apps/admin-web/src/lib/qr.ts`,MIME/预览类型判断已拆到 `apps/admin-web/src/lib/transferPreview.ts`;WebRTC 直连收发、DataChannel、ACK、接收进度与完整性校验已拆到 `apps/admin-web/src/hooks/useDirectTransfer.ts`;`PublicTransferPage.tsx` 降至约 1558 行。
 
 ### 17. 仅支持单文件,并发传输会互相覆盖(P3 功能)
 
 当前一次只能选一个文件,且同一 peer 的 `directIncomingRef` 按 `peerId` 键控(`handleDirectControlMessage`),同一对端的第二个 `file-meta` 会覆盖进行中的接收状态。建议:支持多选并按 `transferId` 键控接收状态;顺带可加拖拽/粘贴上传。
 
+状态:**已修复(2026-07-09)**。文件 input 支持 `multiple`,批量文件按顺序发送/生成链接;直连接收状态改为 `sourcePeerId:transferId` 键控,DataChannel 记录当前 transfer key,避免同 peer 覆盖。
+
 ### 18. sha256 后端支持而前端不用(P3 功能)
 
 后端 `TransferAttachment` / presign 请求已含 `sha256` 字段并做格式校验,但前端从不计算或传递,直连路径也无完整性校验。建议:发送端用 `crypto.subtle.digest` 计算并随附件上报,接收端比对,防止静默损坏。
 
-## 建议修复顺序
+状态:**已修复(2026-07-09)**。前端上传 OSS 前通过 `sha256Blob()` 流式计算 sha256 并随 `presign-upload` 上报;直连 `file-meta` 携带 sha256,接收端完成后重新计算并比对,不一致则拒绝生成附件。新增 `sha256.test.ts` 覆盖空内容与 `abc` 两个标准向量。
+
+## 原建议修复顺序(已按进度处理)
 
 1. **先做 P0 中改动小、低风险的三项**:#1(XFF 取值改 `X-Real-IP` / 取 XFF 末位)、#3(CSP 加 OSS 域名,SecurityConfig + nginx 同步)、#4(配置 WS buffer size)。
 2. **#2 附件下载权限**需产品先确认是否为"房间共享"设计,再决定加隔离还是加 UI 提示。

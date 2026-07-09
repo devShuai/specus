@@ -3,6 +3,7 @@ package com.theshuai.tunnelserver.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.theshuai.tunnelserver.config.PublicTransferProperties;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,11 +37,17 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
     private static final Logger log = LoggerFactory.getLogger(PublicTransferDiscoveryWebSocketHandler.class);
     private static final int MAX_MESSAGE_CHARS = 64 * 1024;
 
+    private final PublicTransferProperties properties;
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final Map<String, Participant> participantsBySession = new ConcurrentHashMap<>();
+    private final Map<String, RateWindow> messageWindowsBySession = new ConcurrentHashMap<>();
     private final ObjectMapper objectMapper = new ObjectMapper()
             .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
+
+    public PublicTransferDiscoveryWebSocketHandler(PublicTransferProperties properties) {
+        this.properties = properties;
+    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
@@ -50,8 +57,14 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
         session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
         Participant participant = Participant.from(session);
+        if (roomPeerCount(participant) >= Math.max(1, properties.getMaxDiscoveryPeersPerRoom())) {
+            send(session, Map.of("type", "error", "error", "room is full"));
+            closeQuietly(session, CloseStatus.POLICY_VIOLATION);
+            return;
+        }
         sessions.add(session);
         participantsBySession.put(session.getId(), participant);
+        messageWindowsBySession.put(session.getId(), new RateWindow(System.currentTimeMillis()));
         send(session, Map.of(
                 "type", "hello",
                 "peerId", participant.peerId(),
@@ -76,8 +89,17 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             closeQuietly(session, CloseStatus.TOO_BIG_TO_PROCESS);
             return;
         }
+        if (!allowMessage(session)) {
+            send(session, Map.of("type", "error", "error", "rate limited"));
+            closeQuietly(session, CloseStatus.POLICY_VIOLATION);
+            return;
+        }
         try {
             JsonNode node = objectMapper.readTree(payload);
+            if ("ping".equals(text(node, "type"))) {
+                send(session, Map.of("type", "pong", "ts", Instant.now().toString()));
+                return;
+            }
             String targetPeerId = text(node, "targetPeerId");
             Map<String, Object> envelope = new LinkedHashMap<>();
             envelope.put("type", text(node, "type", "signal"));
@@ -100,6 +122,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         sessions.remove(session);
         Participant removed = participantsBySession.remove(session.getId());
+        messageWindowsBySession.remove(session.getId());
         if (removed != null) {
             broadcastRoster(removed);
         }
@@ -146,6 +169,22 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         broadcastToGroup(group, payload, false);
     }
 
+    private long roomPeerCount(Participant group) {
+        return participantsBySession.values().stream()
+                .filter(peer -> peer.sameGroup(group))
+                .count();
+    }
+
+    private boolean allowMessage(WebSocketSession session) {
+        int limit = Math.max(1, properties.getDiscoveryMessageRateLimitPerConnection());
+        long windowMillis = Math.max(1L, properties.getDiscoveryMessageRateLimitWindowSeconds()) * 1000L;
+        RateWindow window = messageWindowsBySession.computeIfAbsent(
+                session.getId(),
+                ignored -> new RateWindow(System.currentTimeMillis())
+        );
+        return window.allow(limit, windowMillis, System.currentTimeMillis());
+    }
+
     private void broadcastToGroup(Participant group, Object payload, boolean excludeSource) {
         List<WebSocketSession> dead = new ArrayList<>();
         for (WebSocketSession session : sessions) {
@@ -160,6 +199,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         dead.forEach(deadSession -> {
             sessions.remove(deadSession);
             participantsBySession.remove(deadSession.getId());
+            messageWindowsBySession.remove(deadSession.getId());
             closeQuietly(deadSession, CloseStatus.SERVER_ERROR);
         });
     }
@@ -231,6 +271,24 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 return text;
             }
             return fallback;
+        }
+    }
+
+    private static final class RateWindow {
+        private long startedAtMs;
+        private int count;
+
+        private RateWindow(long startedAtMs) {
+            this.startedAtMs = startedAtMs;
+        }
+
+        private synchronized boolean allow(int limit, long windowMillis, long nowMs) {
+            if (nowMs - startedAtMs >= windowMillis) {
+                startedAtMs = nowMs;
+                count = 0;
+            }
+            count += 1;
+            return count <= limit;
         }
     }
 
