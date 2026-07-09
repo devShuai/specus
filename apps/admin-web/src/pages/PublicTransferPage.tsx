@@ -100,6 +100,7 @@ function PublicTransferPageContent() {
   const directAckWaitersRef = useRef<Map<string, DirectAckWaiter>>(new Map());
   const loadedSharedAttachmentRef = useRef("");
   const directPreviewUrlsRef = useRef<string[]>([]);
+  const iceConfigRef = useRef<PublicTransferIceConfig | null>(null);
   const [peerId] = useState(() => loadOrCreatePeerId());
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
@@ -129,6 +130,9 @@ function PublicTransferPageContent() {
     let active = true;
     void fetchPublicTransferIceConfig().then((config) => {
       if (active) {
+        // 存入 ref:被动接收 offer 的一端在 socket.onmessage 闭包里建连接,
+        // 只有从 ref 读才能拿到异步返回后的最新 ICE 配置(否则恒为初始 null,跨 NAT 无 STUN/TURN)。
+        iceConfigRef.current = config;
         setIceConfig(config);
       }
     });
@@ -470,7 +474,6 @@ function PublicTransferPageContent() {
     setProgress(0);
     const channel = await openDirectChannel(targetPeerId);
     const transferId = createTransferId();
-    const ack = waitForDirectAck(transferId, 8000);
     setState("direct");
     channel.send(JSON.stringify({
       kind: "file-meta",
@@ -480,6 +483,10 @@ function PublicTransferPageContent() {
       sizeBytes: file.size,
     }));
     await sendFileChunks(channel, file, setProgress);
+    // ACK 等待放在整段发送之后再起算,只覆盖"对端接收完成 → 回执"的窗口。若在发送前起算,
+    // 大文件传输耗时超过超时值会误判失败并退回 OSS 重传(同一文件传两遍)。先注册再发 complete,
+    // 避免对端的 ack 抢在 waiter 注册之前到达。
+    const ack = waitForDirectAck(transferId, 15000);
     channel.send(JSON.stringify({ kind: "file-complete", transferId }));
     await ack;
 
@@ -545,7 +552,7 @@ function PublicTransferPageContent() {
     }
     existing?.close();
     const connection = new RTCPeerConnection({
-      iceServers: iceConfig?.iceServers.map((server) => ({
+      iceServers: iceConfigRef.current?.iceServers.map((server) => ({
         urls: server.urls,
         username: server.username || undefined,
         credential: server.credential || undefined,
@@ -989,7 +996,7 @@ function PublicTransferPageContent() {
                     </div>
                     <div className="mt-1 truncate text-small font-medium text-zinc-700 dark:text-zinc-200">{record.attachment.fileName}</div>
                     <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                      {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "可复制链接发给别人"}
+                      {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "同房间成员可下载 · 可复制链接发给别人"}
                     </div>
                   </div>
                   <Chip size="sm" color="success" variant="flat">
@@ -1398,8 +1405,11 @@ function TransferFaq({ iceConfig }: { iceConfig: PublicTransferIceConfig | null 
         <FaqItem title="文件会怎么传？">
           页面会优先让两端直接传；如果网络不适合直连，会自动换成临时安全链接完成传输。
         </FaqItem>
+        <FaqItem title="谁能看到我发的文件？">
+          分享到房间的文件，同一个房间里的成员都能看到并下载。只想发给某一台设备时，先在右侧点选对方再发送，会走两端直连、不进房间共享。
+        </FaqItem>
         <FaqItem title="更多说明">
-          房间口令只用于确认接收权限；文件地址是短期有效的。当前状态：{routeLabel}。
+          房间口令用于确认房间成员身份；同房间成员可下载分享到该房间的文件，文件地址是短期有效的。当前状态：{routeLabel}。
         </FaqItem>
       </div>
     </section>
