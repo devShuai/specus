@@ -23,6 +23,14 @@ export interface DirectReceivingTransfer {
   receivedBytes: number;
 }
 
+export interface DirectPendingTransfer {
+  transferId: string;
+  sourcePeerId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+}
+
 export interface DirectIncomingAttachment {
   sourcePeerId: string;
   attachment: TransferAttachment;
@@ -39,7 +47,7 @@ export interface DirectTransferResult {
   previewUrl: string;
 }
 
-type DirectTransferPhase = "connecting" | "direct";
+type DirectTransferPhase = "connecting" | "waiting" | "direct";
 
 interface DirectIncomingState {
   transferId: string;
@@ -55,6 +63,12 @@ interface DirectIncomingState {
 interface DirectAckWaiter {
   resolve: () => void;
   reject: (error: Error) => void;
+  timer: number;
+}
+
+interface DirectPendingRequest extends DirectPendingTransfer {
+  expectedSha256?: string | null;
+  channel: RTCDataChannel;
   timer: number;
 }
 
@@ -81,8 +95,11 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
   const directIncomingRef = useRef<Map<string, DirectIncomingState>>(new Map());
   const directChannelTransfersRef = useRef<Map<RTCDataChannel, string>>(new Map());
+  const pendingDirectRequestsRef = useRef<Map<string, DirectPendingRequest>>(new Map());
+  const pendingChannelTransfersRef = useRef<Map<RTCDataChannel, string>>(new Map());
   const receivingProgressRef = useRef<Map<string, { lastAt: number; lastBytes: number }>>(new Map());
   const directAckWaitersRef = useRef<Map<string, DirectAckWaiter>>(new Map());
+  const [pendingTransfers, setPendingTransfers] = useState<DirectPendingTransfer[]>([]);
   const [receivingTransfers, setReceivingTransfers] = useState<DirectReceivingTransfer[]>([]);
 
   optionsRef.current = options;
@@ -96,10 +113,15 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       window.clearTimeout(waiter.timer);
       waiter.reject(new Error("page closed"));
     }
+    for (const request of pendingDirectRequestsRef.current.values()) {
+      window.clearTimeout(request.timer);
+    }
     peerConnectionsRef.current.clear();
     dataChannelsRef.current.clear();
     directIncomingRef.current.clear();
     directChannelTransfersRef.current.clear();
+    pendingDirectRequestsRef.current.clear();
+    pendingChannelTransfersRef.current.clear();
     receivingProgressRef.current.clear();
     directAckWaitersRef.current.clear();
   }, []);
@@ -120,6 +142,16 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     if (channel.readyState === "open") {
       channel.send(JSON.stringify({ kind: "file-reject", transferId, reason }));
     }
+  }, []);
+
+  const removePendingTransfer = useCallback((key: string) => {
+    const request = pendingDirectRequestsRef.current.get(key);
+    if (request) {
+      window.clearTimeout(request.timer);
+      pendingDirectRequestsRef.current.delete(key);
+      pendingChannelTransfersRef.current.delete(request.channel);
+    }
+    setPendingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== key));
   }, []);
 
   const updateReceivingTransfer = useCallback((incomingState: DirectIncomingState) => {
@@ -144,6 +176,44 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         .slice(0, optionsRef.current.receivingTransferLimit ?? DEFAULT_RECEIVING_TRANSFER_LIMIT);
     });
   }, []);
+
+  const acceptIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
+    const transferKey = receivingTransferKey({ sourcePeerId, transferId });
+    const request = pendingDirectRequestsRef.current.get(transferKey);
+    if (!request) {
+      return;
+    }
+    if (request.channel.readyState !== "open") {
+      removePendingTransfer(transferKey);
+      optionsRef.current.onError("直连通道已断开，请让对方重新发送");
+      return;
+    }
+    removePendingTransfer(transferKey);
+    const incomingState: DirectIncomingState = {
+      transferId: request.transferId,
+      sourcePeerId: request.sourcePeerId,
+      fileName: request.fileName,
+      mimeType: request.mimeType,
+      sizeBytes: request.sizeBytes,
+      expectedSha256: request.expectedSha256 || null,
+      chunks: [],
+      receivedBytes: 0,
+    };
+    directIncomingRef.current.set(transferKey, incomingState);
+    directChannelTransfersRef.current.set(request.channel, transferKey);
+    updateReceivingTransfer(incomingState);
+    request.channel.send(JSON.stringify({ kind: "file-ready", transferId }));
+  }, [removePendingTransfer, updateReceivingTransfer]);
+
+  const rejectIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
+    const transferKey = receivingTransferKey({ sourcePeerId, transferId });
+    const request = pendingDirectRequestsRef.current.get(transferKey);
+    if (!request) {
+      return;
+    }
+    sendDirectReject(request.channel, transferId, "对方已拒绝接收");
+    removePendingTransfer(transferKey);
+  }, [removePendingTransfer, sendDirectReject]);
 
   const completeDirectIncoming = useCallback(async (sourcePeerId: string, channel: RTCDataChannel, transferId: string) => {
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
@@ -215,28 +285,41 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         sendDirectReject(channel, message.transferId, "当前还有文件正在接收");
         return;
       }
-      const sourceName = optionsRef.current.peers.find((peer) => peer.peerId === sourcePeerId)?.displayName || sourcePeerId;
-      const fileName = message.fileName || "attachment";
-      const accepted = window.confirm(`${sourceName} 想发送文件：${fileName}\n大小：${formatTransferBytes(sizeBytes)}\n是否接收？`);
-      if (!accepted) {
-        sendDirectReject(channel, message.transferId, "对方已拒绝接收");
+      const pendingTransferKey = pendingChannelTransfersRef.current.get(channel);
+      if (pendingTransferKey && pendingDirectRequestsRef.current.has(pendingTransferKey)) {
+        sendDirectReject(channel, message.transferId, "当前还有文件等待确认");
         return;
       }
-      const incomingState = {
+      const fileName = message.fileName || "attachment";
+      const transferKey = receivingTransferKey({ sourcePeerId, transferId: message.transferId });
+      if (pendingDirectRequestsRef.current.has(transferKey) || directIncomingRef.current.has(transferKey)) {
+        return;
+      }
+      const request: DirectPendingRequest = {
         transferId: message.transferId,
         sourcePeerId,
         fileName,
         mimeType: message.mimeType || "application/octet-stream",
         sizeBytes,
         expectedSha256: message.sha256 || null,
-        chunks: [],
-        receivedBytes: 0,
+        channel,
+        timer: window.setTimeout(() => {
+          sendDirectReject(channel, message.transferId!, "接收确认超时");
+          removePendingTransfer(transferKey);
+        }, 118000),
       };
-      const transferKey = receivingTransferKey(incomingState);
-      directIncomingRef.current.set(transferKey, incomingState);
-      directChannelTransfersRef.current.set(channel, transferKey);
-      updateReceivingTransfer(incomingState);
-      channel.send(JSON.stringify({ kind: "file-ready", transferId: message.transferId }));
+      pendingDirectRequestsRef.current.set(transferKey, request);
+      pendingChannelTransfersRef.current.set(channel, transferKey);
+      setPendingTransfers((items) => [
+        {
+          transferId: request.transferId,
+          sourcePeerId: request.sourcePeerId,
+          fileName: request.fileName,
+          mimeType: request.mimeType,
+          sizeBytes: request.sizeBytes,
+        },
+        ...items.filter((item) => receivingTransferKey(item) !== transferKey),
+      ].slice(0, optionsRef.current.receivingTransferLimit ?? DEFAULT_RECEIVING_TRANSFER_LIMIT));
       return;
     }
     if (message.kind === "file-complete" && message.transferId) {
@@ -306,8 +389,12 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         receivingProgressRef.current.delete(activeTransferKey);
         setReceivingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== activeTransferKey));
       }
+      const pendingTransferKey = pendingChannelTransfersRef.current.get(channel);
+      if (pendingTransferKey) {
+        removePendingTransfer(pendingTransferKey);
+      }
     };
-  }, [handleDataChannelMessage]);
+  }, [handleDataChannelMessage, removePendingTransfer]);
 
   const createPeerConnection = useCallback((targetPeerId: string) => {
     const existing = peerConnectionsRef.current.get(targetPeerId);
@@ -394,7 +481,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     const fileName = file.name || "attachment";
     const mimeType = effectiveMimeType(fileName, file.type);
     const sha256 = await sha256Blob(file);
-    optionsRef.current.onStateChange("direct");
+    optionsRef.current.onStateChange("waiting");
     channel.send(JSON.stringify({
       kind: "file-meta",
       transferId,
@@ -403,7 +490,8 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       sizeBytes: file.size,
       sha256,
     }));
-    await waitForDirectAck(transferId, 30000, "对方未确认接收");
+    await waitForDirectAck(transferId, 120000, "对方未确认接收");
+    optionsRef.current.onStateChange("direct");
     await sendFileChunks(channel, file, optionsRef.current.onProgress);
     const ack = waitForDirectAck(transferId, 15000, "对方未确认完成");
     channel.send(JSON.stringify({ kind: "file-complete", transferId }));
@@ -416,9 +504,12 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   }, [openDirectChannel, waitForDirectAck]);
 
   return {
+    pendingTransfers,
     receivingTransfers,
     sendDirect,
     handleSignal,
+    acceptIncomingTransfer,
+    rejectIncomingTransfer,
   };
 }
 

@@ -19,11 +19,12 @@ import {
   DEFAULT_DIRECT_MEMORY_LIMIT_BYTES,
   receivingTransferKey,
   useDirectTransfer,
+  type DirectPendingTransfer,
   type DirectReceivingTransfer,
   type DirectTransferSignalPayload,
 } from "../hooks/useDirectTransfer";
 
-type UploadState = "idle" | "connecting" | "direct" | "presigning" | "uploading" | "completing" | "done" | "failed";
+type UploadState = "idle" | "connecting" | "waiting" | "direct" | "presigning" | "uploading" | "completing" | "done" | "failed";
 
 interface UploadRecord {
   file: File;
@@ -149,7 +150,14 @@ function PublicTransferPageContent() {
     }));
   }, []);
 
-  const { receivingTransfers, sendDirect, handleSignal } = useDirectTransfer({
+  const {
+    pendingTransfers,
+    receivingTransfers,
+    sendDirect,
+    handleSignal,
+    acceptIncomingTransfer,
+    rejectIncomingTransfer,
+  } = useDirectTransfer({
     iceConfig,
     peers,
     directMemoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
@@ -555,6 +563,7 @@ function PublicTransferPageContent() {
           const directError = err instanceof Error ? err.message : "unknown";
           if (directError.includes("拒绝接收")) {
             setError(directError);
+            setState("failed");
             continue;
           }
           setError(`直接发送未完成，正在改用分享链接：${directError}`);
@@ -856,7 +865,7 @@ function PublicTransferPageContent() {
                 >
                   选择文件
                 </label>
-                <Button color="primary" radius="sm" className="w-full sm:w-auto" isLoading={state === "connecting" || state === "direct" || state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
+                <Button color="primary" radius="sm" className="w-full sm:w-auto" isLoading={state === "connecting" || state === "waiting" || state === "direct" || state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
                   {uploadButtonLabel}
                 </Button>
               </div>
@@ -890,8 +899,11 @@ function PublicTransferPageContent() {
           )}
 
           <IncomingFilesPanel
+            pendingTransfers={pendingTransfers}
             receivingTransfers={receivingTransfers}
             incoming={incoming}
+            onAcceptDirect={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
+            onRejectDirect={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
             onShare={shareIncomingFile}
             onDownload={downloadIncoming}
             onPreview={setPreviewTarget}
@@ -981,18 +993,25 @@ function PublicTransferPageContent() {
 }
 
 function IncomingFilesPanel({
+  pendingTransfers,
   receivingTransfers,
   incoming,
+  onAcceptDirect,
+  onRejectDirect,
   onShare,
   onDownload,
   onPreview,
 }: {
+  pendingTransfers: DirectPendingTransfer[];
   receivingTransfers: DirectReceivingTransfer[];
   incoming: IncomingAttachment[];
+  onAcceptDirect: (item: DirectPendingTransfer) => void;
+  onRejectDirect: (item: DirectPendingTransfer) => void;
   onShare: (item: IncomingAttachment) => Promise<void>;
   onDownload: (item: IncomingAttachment) => Promise<void>;
   onPreview: (target: PreviewTarget) => void;
 }) {
+  const hasPending = pendingTransfers.length > 0;
   const hasReceiving = receivingTransfers.length > 0;
   const hasIncoming = incoming.length > 0;
 
@@ -1005,10 +1024,38 @@ function IncomingFilesPanel({
             接收进度、预览和保存入口会显示在这里。
           </div>
         </div>
-        <Chip size="sm" radius="sm" variant="flat" color={hasIncoming || hasReceiving ? "primary" : "default"}>
-          {incoming.length + receivingTransfers.length} 项
+        <Chip size="sm" radius="sm" variant="flat" color={hasIncoming || hasReceiving || hasPending ? "primary" : "default"}>
+          {incoming.length + receivingTransfers.length + pendingTransfers.length} 项
         </Chip>
       </div>
+
+      {hasPending && (
+        <div className="mt-3 grid gap-2 md:grid-cols-2">
+          {pendingTransfers.map((item) => (
+            <div key={receivingTransferKey(item)} className="rounded-lg border border-amber-300 bg-amber-50/80 p-3 dark:border-amber-300/25 dark:bg-amber-300/10">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="truncate text-small font-semibold text-amber-950 dark:text-amber-100">{item.fileName}</div>
+                  <div className="mt-1 text-tiny text-amber-800/75 dark:text-amber-100/70">
+                    来自 {item.sourcePeerId} · {formatBytes(item.sizeBytes)}
+                  </div>
+                </div>
+                <Chip size="sm" radius="sm" color="warning" variant="flat">
+                  待确认
+                </Chip>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <Button size="sm" radius="sm" color="primary" onPress={() => onAcceptDirect(item)}>
+                  接收
+                </Button>
+                <Button size="sm" radius="sm" variant="flat" onPress={() => onRejectDirect(item)}>
+                  拒绝
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {hasReceiving && (
         <div className="mt-3 grid gap-2 md:grid-cols-2">
@@ -1028,7 +1075,7 @@ function IncomingFilesPanel({
       )}
 
       <div className="mt-3 grid gap-3 md:grid-cols-2">
-        {!hasIncoming ? (
+        {!hasIncoming && !hasPending && !hasReceiving ? (
           <div className="rounded-lg border border-dashed border-black/10 bg-white/60 p-4 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400 md:col-span-2">
             暂无附件消息。对方发送文件后会出现在这里。
           </div>
@@ -1433,6 +1480,8 @@ function stateLabel(state: UploadState, progress: number) {
   switch (state) {
     case "connecting":
       return "正在连接对方设备";
+    case "waiting":
+      return "等待对方确认接收";
     case "direct":
       return `正在直接发送：${progress}%`;
     case "presigning":
