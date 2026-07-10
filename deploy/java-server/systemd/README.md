@@ -88,11 +88,19 @@ TUNNEL_DB_POOL_SIZE=16
 
 ### 4.2 管理员账号
 
+先在 shell 中生成随机值并复制输出：
+
+```bash
+openssl rand -base64 48
+```
+
+再把**字面量结果**写入 env 文件：
+
 ```env
 TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED=true
 TUNNEL_AUTH_USERNAME=admin
 TUNNEL_AUTH_PASSWORD=YourStrongAdminPassword
-TUNNEL_AUTH_JWT_SECRET=$(openssl rand -base64 48)   # 用命令生成后填入
+TUNNEL_AUTH_JWT_SECRET=粘贴上一步生成的随机值
 TUNNEL_AUTH_TENANT_ID=default
 ```
 
@@ -130,6 +138,10 @@ TUNNEL_PEER_MESH_RELAY_MAX_PORT=65535
 TUNNEL_PEER_MESH_RELAY_WORKER_THREADS=0
 TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY=10000
 TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS=5000
+TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED=true
+TUNNEL_PEER_MESH_TURN_REALM=shuai-tunnel
+#TUNNEL_PEER_MESH_TURN_SHARED_SECRET=CHANGE_ME_RANDOM_SECRET
+TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS=3600
 ```
 
 启用后需要额外放行 UDP：
@@ -156,10 +168,39 @@ relay 数据面使用标准 TURN `Send Indication` / `Data Indication` 承载加
 
 * Linux：`peerMeshDevice=linux-tun` 或 `auto`，进程需要 root 或 `CAP_NET_ADMIN`，系统需要 `/dev/net/tun` 和 `ip` 命令。
 * Windows：`peerMeshDevice=windows-wintun` 或 `auto`，需要管理员权限，并把 `wintun.dll` 放在工作目录 / PATH，或通过 `-Dshuai.peerMesh.wintunDll=完整路径` 指定。
+* macOS：`peerMeshDevice=mac-utun`、`utun` 或 `auto`，Java 客户端会创建 utun；可用 `peerMeshTunName=utunN` 尝试请求固定编号，否则由系统分配。
 
 更多验证步骤见仓库内 `docs/peer-mesh/peer-mesh-implementation.md`。
 
-### 4.6 HTTP 直转与流量明细（可选）
+### 4.6 公共互传附件 / 私有 OSS（可选，默认关闭）
+
+公共发现信令无需对象存储；附件上传/下载需要配置私有 Aliyun OSS。浏览器使用短期预签名 URL 直传，
+服务端只保存元数据并在存储启用时用 HEAD 校验实际大小。完整变量及限流默认值以同目录
+`tunnel-server.env.example` 为准：
+
+```env
+TUNNEL_OBJECT_STORAGE_PROVIDER=disabled
+#TUNNEL_OBJECT_STORAGE_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
+#TUNNEL_OBJECT_STORAGE_BUCKET=your-private-bucket
+#TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID=
+#TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET=
+TUNNEL_OBJECT_STORAGE_PREFIX=shuai-tunnel/attachments
+TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS=900
+TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS=600
+TUNNEL_OBJECT_STORAGE_RETENTION_HOURS=72
+TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES=536870912
+TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS=3600000
+TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP=30
+TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS=300
+TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM=50
+TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM=32
+TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION=120
+TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS=60
+```
+
+生产环境不要把 OSS 密钥提交到仓库；通过仅 root 可读的 systemd environment file 注入。
+
+### 4.7 HTTP 直转与流量明细（可选）
 
 ```env
 TUNNEL_HTTP_TIMEOUT_MS=30000
@@ -176,7 +217,7 @@ TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS=2000
 
 HTTP / TCP 明细默认写入业务数据库；管理页会分页读取 HTTP 请求/响应和 TCP payload。`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` 是总开关，默认关闭；每条 HTTP 路由 / TCP 映射仍需在管理页单独开启明细采集，新建通道默认关闭。HTTP Body 入库前会按 `Content-Encoding` 解压 `gzip`、`deflate`、`br`，解压预览受 `TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES` 限制，前端也会对旧记录做 best-effort 兜底。管理查询默认不强制 flush，手动排查时可在流量明细接口追加 `flush=true`。
 
-### 4.7 Elasticsearch 流量明细存储（可选）
+### 4.8 Elasticsearch 流量明细存储（可选）
 
 配置 `TUNNEL_ELASTICSEARCH_URIS` 后，HTTP / TCP 明细会从业务数据库切换到 Elasticsearch，聚合流量和管理业务数据仍在 MySQL。
 
@@ -227,7 +268,7 @@ sudo bash deploy/java-server/systemd/update.sh /tmp/tunnel-server-NEW.jar
 2. 备份当前 jar → `/opt/tunnel-server/tunnel-server.jar.bak.<时间戳>`（保留最近 5 份）
 3. `systemctl stop` → 替换 jar → `systemctl start`
 4. 等服务进入 `active`（最多 60s）
-5. 轮询 actuator health 直到返回 `UP`（最多 60s）
+5. 轮询 actuator health 直到返回 `UP`（默认最多 120s，可用 `TUNNEL_HEALTH_TIMEOUT_SEC` 覆盖）
 6. 任一步失败 → 自动回滚到刚刚备份的旧 jar 并重启
 
 退出码：`0` 成功 / `2` 升级失败但已回滚 / `3` 回滚失败需人工介入。

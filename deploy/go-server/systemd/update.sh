@@ -7,7 +7,7 @@ set -euo pipefail
 SERVICE_NAME="tunnel-server-go"
 INSTALL_DIR="/opt/tunnel-server-go"
 BACKUP_DIR="${INSTALL_DIR}/backup"
-HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:8088/api/admin/me}"
+HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:8088/health}"
 MAX_RETRIES=30
 RETRY_INTERVAL=2
 

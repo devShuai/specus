@@ -13,12 +13,14 @@ Internet
 OpenResty
   |-- /assets/*、favicon、robots、sitemap  直接读磁盘
   |-- /、/#/...、/index.html             SPA fallback
-  |-- /api、/auth、/oidc、/http          proxy -> tunnel-server:8088
+  |-- /api、/auth、/oidc、/oidc-config、/http、/actuator、/health、/.well-known
+  |                                         proxy -> tunnel-server:8088
   `-- /ws                                WebSocket proxy -> tunnel-server:8088
 
 tunnel-server
   |-- 7010/tcp  客户端控制连接，不经过 OpenResty
-  `-- 3478/3479/udp Peer Mesh STUN/TURN-lite，不经过 OpenResty
+  |-- 3478/3479/udp Peer Mesh 标准 STUN/TURN 控制与 NAT 探测，不经过 OpenResty
+  `-- 49152-65535/udp TURN relay 分配端口，不经过 OpenResty
 ```
 
 默认配置按当前公网域名写成：
@@ -41,8 +43,10 @@ npm run build:openresty
 
 `build:openresty` 会执行：
 
-1. `tsc --noEmit && vite build`
-2. `scripts/precompress.mjs` 为 `html/js/css/json/svg/xml/txt` 生成 `.gz` 和 `.br`
+1. `sync:schemas` 从 `protocol/schemas` 重新同步公开 Schema。
+2. `tsc --noEmit && vite build`。
+3. `scripts/precompress.mjs` 对不少于 1024 字节的
+   `css/html/js/json/map/mjs/svg/txt/webmanifest/xml` 文件生成 `.gz` 和 `.br`；压缩后不变小的副本会被丢弃。
 
 OpenResty 默认使用 `gzip_static on`，如果你的 OpenResty 编译了 `ngx_brotli`，可以在
 `shuai-tunnel.conf` 中打开 `brotli_static on`，直接服务 `.br` 文件。
@@ -61,6 +65,7 @@ sudo openresty -s reload
 | `ADMIN_WEB_DIST` | `apps/admin-web/dist` | 本次构建产物 |
 | `ADMIN_WEB_ROOT` | `/opt/shuai-tunnel/admin-web` | OpenResty 静态根目录 |
 | `OPENRESTY_CONF_DIR` | `/usr/local/openresty/nginx/conf/conf.d` | OpenResty include 目录 |
+| `OPENRESTY_CONF_NAME` | `tunnel.devshuai.com.conf` | 安装后的配置文件名 |
 | `OPENRESTY_BIN` | `openresty` | OpenResty 命令 |
 
 如果发行版路径不同，可以覆盖变量：
@@ -81,39 +86,29 @@ sudo ADMIN_WEB_ROOT=/data/shuai-tunnel/admin-web \
 | `/assets/*` | `public, max-age=31536000, immutable` | Vite 带 hash 的 JS/CSS，长期强缓存 |
 | `/index.html`、`/`、SPA fallback | `no-cache, no-store, must-revalidate` | 每次检查入口，避免发版后引用旧 chunk |
 | `favicon/logo/robots/sitemap/gtag-init.js` | `public, max-age=3600` | 小静态资源短缓存 |
-| `/api`、`/auth`、`/oidc`、`/http`、`/ws` | 不设置静态缓存 | 动态请求直接反代 |
+| `/api`、`/auth`、`/oidc`、`/oidc-config`、`/http`、`/actuator`、`/health`、`/.well-known`、`/ws` | 不设置静态缓存 | 动态请求直接反代 |
 
 ## HTTPS
 
-建议生产启用 HTTPS + HTTP/2：
+当前 `shuai-tunnel.conf` 已同时定义 `80` 的 HTTP server 和 `443` 的 HTTPS/HTTP2 server；两者目前都会
+直接服务页面与代理请求，HTTP **不会**自动跳转到 HTTPS。安装前必须把 HTTPS server 中的证书路径改成
+目标机器上的真实文件：
 
-1. 用 `certbot`、云厂商证书或自己的证书签发 `tunnel.devshuai.com`。
-2. 把配置里的 `listen 80;` 改成 `listen 443 ssl http2;`。
-3. 在同一个 `server` 内加入：
+```nginx
+ssl_certificate_key /usr/local/openresty/nginx/certs/devshuai.com.key.pem;
+ssl_certificate /usr/local/openresty/nginx/certs/devshuai.com.cert.pem;
+```
 
-   ```nginx
-   ssl_certificate /etc/letsencrypt/live/tunnel.devshuai.com/fullchain.pem;
-   ssl_certificate_key /etc/letsencrypt/live/tunnel.devshuai.com/privkey.pem;
-   ssl_session_timeout 1d;
-   ssl_session_cache shared:SSL:10m;
-   ssl_session_tickets off;
-   ```
-
-4. 另建一个 80 端口 server 做跳转：
-
-   ```nginx
-   server {
-       listen 80;
-       server_name tunnel.devshuai.com;
-       return 301 https://$host$request_uri;
-   }
-   ```
+如果生产策略要求强制 HTTPS，把 80 端口 server 的业务 `location` 改成单一
+`return 301 https://$host$request_uri;`，不要再新增第二个冲突的 80 端口 server。证书可来自 certbot、
+云厂商或内部 CA；修改后先执行 `openresty -t` 再 reload。
 
 ## 验证
 
 ```bash
 openresty -t
 curl -I http://tunnel.devshuai.com/
+curl -Ik https://tunnel.devshuai.com/
 curl -I http://tunnel.devshuai.com/assets/index-xxxx.js
 curl -I -H 'Accept-Encoding: gzip' http://tunnel.devshuai.com/assets/index-xxxx.js
 curl -I http://tunnel.devshuai.com/api/admin/overview
@@ -129,7 +124,8 @@ curl -I http://tunnel.devshuai.com/api/admin/overview
 ## 注意事项
 
 * OpenResty 只代理 HTTP 管理面和 HTTP route；客户端控制连接 `7010/tcp`、Peer Mesh UDP
-  `3478/3479` 仍需防火墙直接放行到 `tunnel-server`。
+  `3478/3479` 以及默认 TURN relay 范围 `49152-65535/udp` 仍需防火墙直接放行到 `tunnel-server`。
+  如果调整了 `TUNNEL_PEER_MESH_RELAY_MIN_PORT` / `TUNNEL_PEER_MESH_RELAY_MAX_PORT`，防火墙范围必须同步调整。
 * 如果后端开启了自签 TLS，OpenResty 到后端建议仍用本机明文 `127.0.0.1:8088`，公网 TLS
   在 OpenResty 终止即可。
 * 如果管理页部署在 OpenResty 下，应用进程内的静态资源服务可以保留作为回退，但生产流量应走
