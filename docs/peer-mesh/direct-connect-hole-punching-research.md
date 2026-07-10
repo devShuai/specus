@@ -1,5 +1,9 @@
 # 内网服务尽量直连方案讨论纪要
 
+> 历史基线：本文形成于 `57f1a67`（2026-06-16），用于记录方案选择过程，文中的“当前项目”不代表
+> 2026-07-10 的实现状态。Peer Mesh 的 UDP direct、标准 STUN/TURN relay、TUN/Wintun/utun 和管理面现已落地；
+> 当前行为见 `peer-mesh-implementation.md` 与 `../../protocol/spec/peer-mesh.md`。
+
 > 目标：整理“公网普通用户访问内网服务时也尽量直连”的技术边界、PCDN/Surge Ponte 的实现启发，以及 `shuai-tunnel` 后续可落地的演进路线。
 >
 > 本文是设计讨论记录，不代表当前代码已经实现这些能力。

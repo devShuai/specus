@@ -10,13 +10,13 @@
 ## peer-mesh/ — 私有组网与 NAT 打洞
 
 * [peer-mesh-implementation.md](peer-mesh/peer-mesh-implementation.md) — peer mesh 实现全貌、部署开关与验收步骤。
-* [peer-mesh-mobile-plan.md](peer-mesh/peer-mesh-mobile-plan.md) — 移动端组网方案。
+* [peer-mesh-mobile-plan.md](peer-mesh/peer-mesh-mobile-plan.md) — Android/iOS 目标方案与当前 Android 实现偏差说明。
 * [peer-mesh-java-client-audit-fixes.md](peer-mesh/peer-mesh-java-client-audit-fixes.md) — Java 客户端打洞审计与修复记录(2026-07),含成功率观测方法。
-* [direct-connect-hole-punching-research.md](peer-mesh/direct-connect-hole-punching-research.md) — P2P 直连打洞技术调研。
+* [direct-connect-hole-punching-research.md](peer-mesh/direct-connect-hole-punching-research.md) — P2P 直连打洞历史调研（基线 `57f1a67`）。
 
 ## transfer/ — 免登录文件互传
 
-* [public-file-transfer-audit.md](transfer/public-file-transfer-audit.md) — 免登录文件互传审计与优化清单(2026-07),含安全/功能/性能问题分级与建议修法。
+* [public-file-transfer-audit.md](transfer/public-file-transfer-audit.md) — 免登录文件互传当前实现与审计清单(2026-07)；“接收前确认”默认关闭（自动接收），开启后才要求接收/拒绝，拒绝不回退 OSS。
 
 ## cross-language/ — 多语言移植与一致性
 
@@ -28,7 +28,7 @@
 
 ## performance/ — 性能与容量
 
-* [single-node-10k-connections-optimization-plan.md](performance/single-node-10k-connections-optimization-plan.md) — 单机 10k 连接优化清单。
+* [single-node-10k-connections-optimization-plan.md](performance/single-node-10k-connections-optimization-plan.md) — 单机 10k 连接历史基线与优化清单；进度以统一改进计划为准。
 
 ## references/ — 外部参考资料
 

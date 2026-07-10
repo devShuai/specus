@@ -15,7 +15,7 @@
 
 * 整体链路设计合理:WebRTC 直连优先、OSS 预签名兜底、信令按 roomKey 分组隔离、附件 ID 随机不可枚举。
 * 找到 **4 个 P0**(2 安全 + 2 功能)、**4 个 P1**、多个 P2,详见下表。其中 XFF 伪造与生产 CSP 缺 OSS 域名两项会直接影响可用性/隔离性。
-* 本文保留原始审计问题与修复核对记录;截至 2026-07-09 当前代码核对,P0/P1/P2/P3 主项已处理或按产品语义确认,本文同时作为修复进度清单。
+* 本文保留原始审计问题与修复核对记录;截至 2026-07-10 当前代码核对,P0/P1/P2/P3 主项已处理或按产品语义确认,本文同时作为修复进度清单。
 
 ## 机制强项(审计前已具备,列出以免重复怀疑)
 
@@ -49,9 +49,9 @@
 | P3 | 17 | 一次仅支持单文件,`directIncomingRef` 按 peerId 键控会覆盖并发传输 | 功能 |
 | P3 | 18 | 后端已支持 sha256 字段,前端从不计算/传递,直连无完整性校验 | 功能 |
 
-> **修复进展(2026-07-09)**:P0 全部处理(#1、#3、#4 已修复;#2 经产品确认为预期的"房间共享"语义,已补 UI 提示)。P1 全部处理(#5、#6、#7、#8)。P2/P3 全部处理:#9 通过大文件直连转 OSS 与 OSS 大文件原生下载避免浏览器内存承压;#10~#15、#17、#18 已处理;#16 已拆出 QR、MIME/预览工具与 `useDirectTransfer` hook。各条目末尾附「状态」。
+> **修复进展(2026-07-10)**:P0 全部处理(#1、#3、#4 已修复;#2 经产品确认为预期的"房间共享"语义,已补 UI 提示)。P1 全部处理(#5、#6、#7、#8)。P2/P3 中 #9~#14、#17、#18 已修复;#15 改为产品可配置项(默认自动接收,可开启接收前确认);#16 已拆出 QR、MIME/预览工具与 `useDirectTransfer` hook。各条目末尾附「状态」。
 
-## 当前实现核对结果(2026-07-09)
+## 当前实现核对结果(2026-07-10)
 
 本次按当前 `main` 工作区实现重新核对,结论如下。注意:#4 当前实现方式为 `WebSocketSession#setTextMessageSizeLimit/#setBinaryMessageSizeLimit`,未找到原文描述的 `ServletServerContainerFactoryBean`;从代码意图看已把会话消息上限抬到 64KB,但实现方式与原记录不同。
 
@@ -71,8 +71,8 @@
 | #12 WS 无重连/心跳 | 已处理 | 发现 WS 增加应用层 `ping/pong` 心跳、75s pong 超时关闭、指数退避重连。 |
 | #13 过期清理 Top100 | 已处理 | `expireOldAttachments()` 循环取 Top100 批次直到取空,避免单次扫描只清一页。 |
 | #14 ID 撞库无重试 | 已处理 | 新建附件先 `existsById` 预检查,保存时 `saveAndFlush` 捕获唯一冲突并有限重试。 |
-| #15 静默接收 | 已处理 | 直连 `file-meta` 到达先弹确认;拒绝会回 `file-reject`,发送端不再绕过用户拒绝自动回退。 |
-| #16 单文件过长 | 已处理 | `PublicTransferPage.tsx` 当前约 1558 行;QR 生成器拆到 `src/lib/qr.ts`,MIME/预览判断拆到 `src/lib/transferPreview.ts`,WebRTC 直连收发拆到 `src/hooks/useDirectTransfer.ts`。 |
+| #15 静默接收 | 按产品语义处理 | 「接收前确认」为会话级可选项,默认关闭时收到 `file-meta` 会自动回 `file-ready` 并开始接收;开启后在页面内显示待确认卡片,可接收或拒绝。拒绝会回 `file-reject`,发送端不会绕过拒绝自动回退 OSS。 |
+| #16 单文件过长 | 已处理 | `PublicTransferPage.tsx` 当前约 1750 行;QR 生成器拆到 `src/lib/qr.ts`,MIME/预览判断拆到 `src/lib/transferPreview.ts`,WebRTC 直连收发拆到 `src/hooks/useDirectTransfer.ts`。 |
 | #17 单文件/并发覆盖 | 已处理 | 文件 input 开启 `multiple`,批量顺序发送;直连接收按 `sourcePeerId:transferId` 键控,避免同 peer 状态覆盖。 |
 | #18 sha256 未使用 | 已处理 | 前端上传/直连发送流式计算 SHA-256;OSS 预签名请求携带 sha256,直连接收完成后按 hash 校验。 |
 
@@ -134,7 +134,7 @@ handler 声明 `MAX_MESSAGE_CHARS = 64 * 1024`,但未找到 `ServletServerContai
 
 建议:presign-upload 加 per-IP / per-room 限流 + 单房间 PENDING 附件数上限;WS 加房间人数上限与每连接消息速率限制。
 
-状态:**已修复(2026-07-09)**。新增 `PublicTransferRateLimiter`(按来源 IP 固定窗口限流,默认 30 次 / 300s)与 `PublicTransferProperties` 配置;控制器取来源 IP(与 #1 同口径:X-Real-IP 优先、XFF 末位)后校验,超限抛 `RateLimitedException` → HTTP 429。`createPublicUpload` 增加单房间 PENDING 附件上限(默认 50)。发现 WS 增加单房间在线人数上限(默认 32)与每连接消息频率上限(默认 120 次 / 60s),并对超限连接返回 error 后关闭。限流为进程内计数,多实例部署时上限按实例数放大(见类注释)。
+状态:**已修复(2026-07-09)**。新增 `PublicTransferRateLimiter`(按来源 IP 固定窗口限流,默认 30 次 / 300s)与 `PublicTransferProperties` 配置;控制器取来源 IP(与 #1 同口径:X-Real-IP 优先、XFF 末位)后校验,超限抛 `RateLimitedException` → HTTP 429。`createPublicUpload` 增加单房间 PENDING 附件上限(默认 50),该配额从附件持久化表计数。发现 WS 增加单房间在线人数上限(默认 32)与每连接消息频率上限(默认 120 次 / 60s),并对超限连接返回 error 后关闭。来源 IP 与发现 WS 限流为进程内计数,多实例部署时上限按实例数放大;共享数据库下的 PENDING 配额不属于进程内计数器。
 
 ### 7. 直连 ACK 超时在发送前起算(P1 功能)
 
@@ -192,7 +192,7 @@ handler 声明 `MAX_MESSAGE_CHARS = 64 * 1024`,但未找到 `ServletServerContai
 
 接收方收到 offer 即自动建连、自动收文件(`ondatachannel` / `handleDirectControlMessage` 的 `file-meta`),房间内任何人可向你的设备推任意文件并占用内存。建议:file-meta 到达时弹出接收确认,拒绝则回 reject 控制消息并关闭 channel。
 
-状态:**已修复(2026-07-09)**。`file-meta` 到达后先弹确认;拒绝发送 `file-reject`,发送端识别用户拒绝后不再自动回退 OSS。超过直连接收阈值或声明大小异常也会拒绝。
+状态:**按产品语义处理(2026-07-10)**。接收确认已从浏览器弹窗改为页面内待确认卡片,并提供「接收前确认」开关。开关默认关闭,房间内设备发来的直连文件会自动开始接收;开启后必须显式接收或拒绝。拒绝会发送 `file-reject`,发送端识别用户拒绝后不再自动回退 OSS。超过直连接收阈值或声明大小异常仍会直接拒绝。该行为是易用性优先的产品取舍,不等同于强制接收确认。
 
 ### 16. 单文件超长,工具代码未拆分(P3 结构)
 

@@ -16,8 +16,9 @@
 * 客户端已实现 UDP host candidate、relay candidate、connectivity check、path nominated、direct 优先、relay fallback。
 * 客户端数据面使用 X25519 + HKDF + AES-GCM，加密后的 IP packet 通过 UDP frame 传输；server relay 不解密业务明文。
 * 客户端 replay 保护使用滑动窗口，允许小范围乱序，拒绝重复包和窗口外旧包。
-* Linux TUN：支持 `/dev/net/tun`，配置虚拟 IP、MTU 和 mesh route。
-* Windows Wintun：Java / Go / .NET 客户端均支持随包携带 `wintun.dll`，配置虚拟 IP、MTU 和 mesh route。
+* Linux TUN：支持 `/dev/net/tun`，配置虚拟 IP、MTU，并只为当前 roster 中的在线 peer 同步 `/32` host route。
+* Windows Wintun：Java / Go / .NET 客户端均支持随包携带 `wintun.dll`，配置虚拟 IP、MTU，并同步在线 peer 的 `/32` host route。
+* macOS utun：Java / Go / .NET 客户端均可创建 utun，并同步在线 peer 的 `/32` host route。
 * 管理页“私有组网”展示设备、虚拟 IP、在线状态、NAT 类型、ACL、active session、direct/relay 路径、RTT 和流量。
 
 多语言实现当前状态：
@@ -30,7 +31,7 @@
 
 需要真实环境手工验收：
 
-* 两台 Linux / Windows 客户端创建真实 TUN/Wintun 后互 ping 虚拟 IP。
+* 两台 Linux / Windows / macOS 客户端创建真实 TUN/Wintun/utun 后互 ping 虚拟 IP。
 * 访问对端 TCP 服务，例如 `curl http://100.96.x.y:8080` 或 SSH 到对端虚拟 IP。
 * 屏蔽 UDP direct 后确认自动切到 relay，恢复后确认回到 direct。
 * 控制连接断开后确认新 session 不再创建，已建立 direct session 在密钥有效期内继续转发。
@@ -186,7 +187,7 @@ ping 100.96.x.y
 
 ### 管理页看到设备但 ping 不通
 
-先确认客户端没有使用 `peerMeshDevice=noop`。noop 模式不会创建虚拟网卡，也不会把本机发往 mesh CIDR 的 IP 包交给 peer mesh。
+先确认客户端没有使用 `peerMeshDevice=noop`。noop 模式不会创建虚拟网卡，也不会安装在线 peer 的 `/32` host route，因此系统 `ping` / `curl` 不会把虚拟 IP 流量交给 peer mesh。
 
 ### Linux 创建 TUN 失败
 

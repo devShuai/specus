@@ -1,17 +1,17 @@
 # tunnel-server Go 移植计划与状态
 
-Go 实现的 shuai-tunnel 服务端(`implementations/go/server/`),module 仍为 `github.com/devShuai/shuai-tunnel/tunnel-server-go`,Go 1.26。与 Java client / C# server 线协议字节兼容。分 5 个阶段交付,每阶段 `go build ./... && go test ./... && go vet ./...` 全绿。
+Go 实现的 shuai-tunnel 服务端(`implementations/go/server/`),module 为 `github.com/devShuai/shuai-tunnel/implementations/go/server`,Go 1.26。与 Java / Go / .NET / Android client 线协议兼容。分 6 个阶段交付；下述“全绿”是阶段交付时的历史记录，当前验证结果以 `cross-language-java-alignment-plan.md` 的“当前验证”为准。
 
 ## 项目布局
 
 ```
 implementations/go/server/
 ├── cmd/shuai-tunnel-server/main.go
-├── web/static/{index.html,app.js,app.css}   # 内嵌 SPA(同 Java/C#)
-└── internal/{protocol,config,store,auth,session,control,nat,directhttp,management,security,wsevents}
+├── web/static/{index.html,assets/**,...}    # 内嵌 SPA(同 Java/C#)
+└── internal/{protocol,config,store,auth,session,control,nat,directhttp,management,transfer,security,wsevents,server}
 ```
 
-依赖:`modernc.org/sqlite`(纯 Go)、`github.com/jackc/pgx/v5`、`github.com/go-sql-driver/mysql`、`github.com/coder/websocket`;JWT(HS256/RS256)、OIDC、TLS(PEM/PKCS12/自签)均 stdlib 手写。
+直接依赖:`modernc.org/sqlite`(纯 Go)、`github.com/jackc/pgx/v5`、`github.com/go-sql-driver/mysql`、`github.com/coder/websocket`、`github.com/andybalholm/brotli` 和 `golang.org/x/crypto`。JWT(HS256/RS256)与 OIDC 核心逻辑基于 stdlib 实现；TLS 的 PEM/自签路径使用 stdlib，PKCS12/PFX 读取使用 `golang.org/x/crypto/pkcs12`。
 
 ## 阶段
 
@@ -20,7 +20,7 @@ implementations/go/server/
 - **验收**:`go test ./internal/protocol`;21 个 golden fixtures 全部交叉校验(非压缩字节级一致,deflate 语义自洽)。
 
 ### G2 — 控制通道 + 登录 + 多库持久化 ✅
-- TCP 监听、帧读写、60s 读 / 30s 写空闲心跳看门狗、有界登录线程池(满则 SERVER_BUSY)、HMAC 校验 + ±30s 窗口 + 每分钟频率限制、会话顶替(REPLACED_BY_NEW_LOGIN)、连接审计落库。
+- TCP 监听、帧读写、60s 读 / 30s 写空闲心跳看门狗、有界登录线程池(满则 SERVER_BUSY)、HMAC 校验 + ±60s 窗口 + 每分钟频率限制、会话顶替(REPLACED_BY_NEW_LOGIN)、连接审计落库。
 - 多库 store:sqlite/postgres/mysql,embed schema 幂等建表,六表对齐。
 - **验收**:登录成功 / 错密码拒绝 / 未认证即断开 / 心跳回环 / 连接记录落库。
 
@@ -40,6 +40,12 @@ implementations/go/server/
 - TLS:`disabled`/`file`(PKCS12/PFX 或 PEM)/`self-signed`(启动生成),作用于控制通道 + 管理 HTTP。
 - **验收**:本地 JWT 往返、OIDC 交换(mock IdP)、TLS 模式加载(disabled→nil / self-signed→证书 / 未知→报错)。
 
+### G6 — 公共互传、客户端消息、TURN 认证与帧边界 ✅
+- `/api/public/transfer/ice-config`、6 个附件 REST 路径、Aliyun OSS 预签名/HEAD 校验/过期清理，以及按 IP/roomToken 的有界限流。
+- `/ws/public-transfer/discovery` 按 roomToken 哈希或同公网 IP 隔离，支持 roster、定向 signal、房间人数与单连接消息限流；`/ws/client-messages` 支持 query-first/Bearer JWT、tenant/owner 和任一在线 receive-capable session 校验。
+- TURN 临时 credential、realm/nonce、MESSAGE-INTEGRITY、401/438；完整帧上限包含 11 字节 header，非法配置拒绝。
+- **验收**：server/client 全量 `go test -count=1 ./...` 与 `go build ./...` 通过；精确结果见总对齐计划“当前验证”。
+
 ## 能力 × 验证矩阵
 
 | 能力 | 验证方式 | 状态 |
@@ -55,6 +61,10 @@ implementations/go/server/
 | 连接归档 | `ArchiveOldConnections` + 定时 + `TUNNEL_CONNECTION_*` 配置 | ✅ |
 | OIDC | mock IdP 交换测试 + RS256 校验 | ✅ |
 | TLS | 模式加载测试(PKCS12/PEM/自签) | ✅ |
+| 公共发现 + 6 个附件接口 | WebSocket 隔离/限流测试 + OSS service/HTTP 集成测试 | ✅ |
+| client-messages | Bearer/query 鉴权、多 session 能力、双向 fallback 测试 | ✅ |
+| TURN auth | credential + MESSAGE-INTEGRITY + 401/438 测试 | ✅ |
+| 完整帧边界 | 32 MiB header+body 等号/超限测试 | ✅ |
 
 ## 常用命令
 
@@ -69,4 +79,4 @@ go run ./cmd/shuai-tunnel-server
 ## 已知简化 / 待办
 
 - TLS 支持 PKCS12/PFX、PEM 和自签；真实生产证书链仍建议做环境级手工验收。
-- Java client × Go server 的 jar 级 E2E 可作为可选手动验证(协议已由 fixtures 保证字节兼容)。
+- Java client × Go server 的 jar 级 E2E 尚未形成持续执行证据；fixtures 只验证编解码，不能替代真实登录、心跳、TCP、HTTP 和 Peer Mesh 行为。它属于跨语言 P0 必测项，不是可选验收。

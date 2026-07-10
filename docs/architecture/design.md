@@ -1,445 +1,439 @@
 # shuai-tunnel 详细设计文档
 
-> 版本：与 `main` 分支当前实现对齐（顶层提交 `57f1a67 feat: add load test helpers and enhance connection management for scaling`）。
-> 本文档描述系统的总体设计、协议、各模块职责、数据模型、并发模型、安全模型与运维相关的关键决策，便于后续二次开发和审计。
+> 基线：2026-07-10，提交 `93823f4`。本文以 Java server/client/common 当前实现为准；跨语言线协议以 `protocol/spec/` 为权威入口。
+> README 面向运行与部署，本文聚焦模块边界、关键数据流、线程与安全模型。
 
-## 1. 目标与定位
+## 1. 目标与边界
 
-`shuai-tunnel` 是一个用于学习与演进的 **Java 内网穿透平台**。设计目标按优先级依次为：
+`shuai-tunnel` 是以内网服务接入和私有组网为核心的多语言项目，Java 是当前参考实现。主要目标是：
 
-1. **可读性与可演进**：以最小可用的协议栈实现一条公网到内网的隧道，所有关键流程可直接从源码读出，不依赖外部框架黑盒。
-2. **易部署**：一个 Spring Boot 服务端 + 一个 Java/Go 客户端，默认使用 SQLite 即可跑通。
-3. **可观测**：登录成功/失败、流量、连接频率、端口映射状态都进入数据库与管理后台。
-4. **安全升级路径清晰**：HMAC 登录、Bearer JWT 鉴权、可选 TLS 控制通道，留出生产化空间。
-5. **不追求极致性能**：当前默认是单服务端节点；针对单机 1 万连接的优化方案见 `docs/performance/single-node-10k-connections-optimization-plan.md`。
+1. 通过一条长期控制连接承载登录、心跳、配置下发、TCP 隧道和 HTTP 直转。
+2. 使用管理面维护客户端凭证、账号、TCP 映射、HTTP 路由、连接记录和流量观测。
+3. 让同一租户和用户下的客户端通过 Peer Mesh 虚拟 IP 互访，优先 UDP direct，失败时回退标准 TURN relay。
+4. 默认以单节点、SQLite 和明文控制连接低门槛启动，同时提供 MySQL/PostgreSQL、TLS、OIDC、Elasticsearch 等升级路径。
 
-当前版本仍以单体 `tunnel-server` 部署为主。后续若要把控制端和连接端拆分、让连接端做高可用和滚动 drain，方案见 `docs/architecture/server-control-edge-ha-plan.md`。
+当前边界：
 
-非目标：不提供 P2P 打洞（相关研究见 `docs/peer-mesh/direct-connect-hole-punching-research.md`）、不实现 UDP 穿透（`UdpConnection` 留空占位）、不做多区域调度。
+- 公网 TCP 映射、HTTP/WS 直转和 Peer Mesh UDP 数据面已经实现。
+- 公网 UDP 端口映射尚未实现；空的 `UdpConnection` 只是该能力的占位，不代表 Peer Mesh 没有 UDP。
+- 控制连接和在线路由状态仍在单个 server 进程内；多节点需要粘性路由或共享会话/路由层。
 
 ## 2. 顶层架构
 
+```text
+                         管理 JWT / 客户端 HTTP HMAC 登录
+管理后台、客户端启动器 ─────────────────────────────────────► Spring Boot :8088
+                                                              │
+公网 HTTP / WebSocket ───────► /http/{client}/{route}/**       │
+                                                              ▼
+公网 TCP ─► 动态 TcpServer ─► RemoteTunnelHandler ◄──────► Netty control :7010 ◄────► Java client
+                                                              │                         │
+                                                              │                         ├─► 内网 TCP
+                                                              │                         └─► 内网 HTTP/WS
+                                                              │
+                                                              └─► STUN/TURN :3478/:3479 + relay 端口
+                                                                                 ▲
+Peer A 虚拟网卡 ◄──────── 加密 UDP direct / TURN relay ────────┴────────► Peer B 虚拟网卡
 ```
-+-------------+   TCP/HTTP    +---------------------------+   Custom Frame Protocol    +----------------+   TCP    +-------------+
-| 公网访问者   | ────────────► |  tunnel-server (8088/7010)| ◄────────────────────────► | tunnel-client  | ───────► | 内网目标服务 |
-+-------------+               +---------------------------+   (over TCP / 可选 TLS)    +----------------+          +-------------+
-                                          ▲
-                                          │ Bearer JWT (HS256/RS256)
-                                          ▼
-                              +---------------------------+
-                              |      管理后台 / OIDC       |
-                              +---------------------------+
-```
 
-**两类入口**：
+关键入口分为四类：
 
-- **TCP**：服务端按"公网映射端口 → 客户端 → 内网目标"的链路转发原始字节流。每个 `TunnelMapping` 在服务端动态启动一个 `TcpServer`。
-- **HTTP**：服务端在 `8088/http/{client}/{route}/...` 上接收请求，通过控制连接同步发给客户端，客户端在本地发起真实 HTTP 请求并把响应回传，最终由服务端写回原始 HTTP 响应。
+- **客户端启动登录**：`POST /api/client/auth/login`，用 `apiKey/secret` HMAC 换取短期运行时 token、控制端地址和配置快照。
+- **控制连接**：默认 `7010/TCP`，可选 TLS；承载运行时 token 登录、心跳、`NAT_CONTROL`、`PEER_CONTROL`、`DIRECT_HTTP_*` 和 `NAT_MESSAGE`。
+- **公网业务入口**：每个已注册 TCP `listenPort` 一个动态监听；HTTP/WS 使用 `/http/**`。
+- **Peer Mesh 数据面**：标准 STUN/TURN 和客户端间 UDP direct；业务 IP 包端到端加密，relay 不解密业务明文。
 
-**两类连接**：
+## 3. Java 模块
 
-- **控制连接**：客户端与服务端之间一条长连接（默认 `7010/TCP`，可叠加 TLS）。承载登录、心跳、`NAT_CONTROL` 下发、HTTP 直转、NAT 隧道字节流。所有控制信令多路复用在这一条连接上。
-- **公网监听端口**：每条启用的 `TunnelMapping` 一个监听端口，承载真实数据流量。
-
-## 3. 模块结构
-
-| 模块 | 路径 | 职责 |
+| 模块 | 路径 | 主要职责 |
 | --- | --- | --- |
-| `tunnel-common` | `implementations/java/common/src/main/java/com/theshuai/common` | 协议、编解码、命令、序列化、HMAC、通用 Handler、`Session`/`SyncFuture` |
-| `tunnel-server` | `implementations/java/server/src/main/java/com/theshuai/tunnelserver` | Netty 服务端、管理 REST、登录鉴权、HTTP 直转入口、TLS、持久化、归档 |
-| `tunnel-client` | `implementations/java/client/src/main/java/com/theshuai/tunnelclient` | Java 客户端：启动、读取本地配置、控制连接重连、本地连接池 |
-| `implementations/go/client` | `implementations/go/client` | Go 客户端：与 Java 客户端协议对等，登录后还会注册本地 `tunnelConfigList` |
-| `tools/` | `tools/` | 负载测试与运维辅助脚本 |
+| `tunnel-common` | `implementations/java/common` | 线协议、帧编解码、固定 schema 紧凑二进制、HMAC、心跳、NAT/Peer 公共模型 |
+| `tunnel-server` | `implementations/java/server` | Netty 控制端与公网 TCP 监听、管理 REST、客户端认证、HTTP/WS 直转、Peer Mesh、持久化与观测 |
+| `tunnel-client` | `implementations/java/client` | 读取 `client.jsonc`、HTTP 启动登录、控制连接与重连、本地 TCP/HTTP/WS 转发、Peer Mesh 虚拟网卡 |
+| 管理前端 | `apps/admin-web` | 管理客户端、凭证、映射、路由、连接、流量和 Peer Mesh；构建产物由 server 静态托管 |
 
-模块之间**只有 Java 三模块互相依赖**，Go 客户端独立维护协议实现，因此协议变更需要同步两套实现。
+Java 的协议变更需要同步 `protocol/spec/`、测试向量和其它语言实现。
 
-## 4. 协议设计
+## 4. 控制协议
 
-### 4.1 帧格式（`PacketCodec`）
+### 4.1 帧格式与大小边界
 
-控制连接上所有消息均为定长帧头 + 变长帧体：
+普通控制帧使用 11 字节固定头：
 
-```
-+--------+--------+----------+----------+------------+-------------------+
-| magic  | ver    | algo(1B) | cmd(1B)  | length(4B) | body (length B)   |
-| 4B     | 1B     |          |          |            |                   |
-+--------+--------+----------+----------+------------+-------------------+
-0        4        5          6          7            11
+```text
++----------+---------+---------------+---------+------------+-----------------+
+| magic 4B | ver 1B  | serializer 1B | cmd 1B  | length 4B  | body length bytes|
++----------+---------+---------------+---------+------------+-----------------+
+0          4         5               6         7            11
 ```
 
-- `magic = 0x14353565`（位于 `PacketCodec`），用于 `Spliter` 在错位/脏数据时丢弃直到下一个 magic。
-- `ver = 1`，预留扩展。
-- `algo`：序列化算法号，对应 `SerializerAlgorithm` 枚举：`COMPACT_BINARY`（默认）、`FASTJSON`、`PROTOBUF`、`JACKSON`。
-- `cmd`：业务命令号，对应 `Command`（见 §4.3）。
-- `length`：body 字节长度，约束在 `0..16 MiB`。
+- `magic = 0x14353565`，`version = 1`。
+- `length` 是 body 长度；`Spliter` 基于 `LengthFieldBasedFrameDecoder` 处理半包和粘包。
+- `Spliter` 默认最大**整帧**为 `32 MiB`。Java server 可用 `TUNNEL_NETTY_MAX_FRAME_SIZE` 覆盖；Java client 当前使用默认值。
+- `CompactBinarySerializer` 的 `16 MiB` 是 Deflate **解压后 payload** 上限，不是整帧上限。
 
-**帧拆分**：`Spliter`（基于 LengthFieldBasedFrameDecoder 思路）保证半包/粘包正确切分。
+`NAT_MESSAGE` 仍使用同一个 11 字节帧头，但 body 是专用布局：
 
-### 4.2 序列化算法（`com.theshuai.common.serialize.impl`）
+```text
+natType(4B) + metadataLength(4B) + metadata(JSON) + optional data(compact payload)
+```
 
-| 算法 | 用途 | 备注 |
+因此 NAT 帧头的 serializer 标记为 FastJSON；只有 metadata 使用 JSON，隧道字节 `data` 使用紧凑 payload 的 raw/Deflate 包装。
+
+### 4.2 序列化算法
+
+| 线值 | 实现 | 当前用途 |
 | --- | --- | --- |
-| `CompactBinarySerializer` | **默认**控制消息编码 | 自描述紧凑二进制：省略字段名、变长整数、短类型标记；payload ≥ 阈值且压缩后变小时启用 Deflate；带 1 字节 payload 类型标记，解压上限 16 MiB |
-| `FastJsonSerializer` | NAT 元数据 (`NatMessagePacket`) | 因为 NAT 元数据采用自定义布局：JSON 头 + 紧凑二进制载荷段 |
-| `ProtobufSerializer` | 预留 | 当前未在主路径上使用 |
-| `JacksonSerializer` | 工具 | REST 层使用 |
+| `1` | `FastJsonSerializer` | NAT metadata JSON；也作为可选普通帧 codec |
+| `2` | `JacksonSerializer` | 可选普通帧 codec；Spring MVC REST 不依赖这个封装类 |
+| `3` | `XML` 标记 | 仅保留常量，未注册 serializer |
+| `4` | `CompactBinarySerializer` | 普通控制帧默认 codec；双方依赖相同的预注册固定 schema，并非自描述格式 |
+| `5` | `ProtobufSerializer` | 已实现并有测试，但不在默认主路径 |
 
-NAT 数据帧的封装规则：
-1. `NatMessagePacket` 头由 FastJSON 序列化（保留可读性，便于排查）；
-2. 隧道字节流 payload 走紧凑二进制的 **payload 编码**（同样可触发 Deflate）；
-3. 整体仍以一个 `Command.NAT_*` 帧发送。
+紧凑二进制省略字段名，按固定字段顺序编码，使用变长整数和短类型 codec。payload 首字节只表示 raw 或 Deflate；原始数据至少 `64 B` 且压缩后更小时才使用 Deflate。
 
-### 4.3 命令集（`Command` 枚举）
+### 4.3 三层消息类型
 
-| 类别 | 命令 | 含义 |
-| --- | --- | --- |
-| 控制 | `LOGIN_REQUEST` / `LOGIN_RESPONSE` | 客户端登录、服务端返回结果 |
-| 控制 | `LOGOUT_REQUEST` / `LOGOUT_RESPONSE` | 客户端主动离线 |
-| 控制 | `HEARTBEAT_REQUEST` / `HEARTBEAT_RESPONSE` | 心跳保活 |
-| 控制 | `MESSAGE_REQUEST` / `MESSAGE_RESPONSE` | 通用控制消息（含服务端下发 `NAT_CONTROL` 配置） |
-| HTTP | `HTTP_REQUEST` / `HTTP_RESPONSE` | 服务端代客户端发起 HTTP 同步请求（用于将客户端作为 HTTP "前置代理"） |
-| HTTP 直转 | `DIRECT_HTTP_REQUEST` / `DIRECT_HTTP_RESPONSE` | 公网 HTTP 入口 → 客户端目标服务（`HttpTunnelController` 主路径） |
-| NAT | `NAT_REGISTER` / `NAT_REGISTER_RESULT` / `NAT_UNREGISTER` | 客户端注册/反注册一组端口映射 |
-| NAT | `NAT_CONNECT_ESTABLISHED` / `NAT_DISCONNECT` | 公网连接到达 / 断开通知，触发客户端建立/销毁 LocalTunnel |
-| NAT | `NAT_DATA` / `NAT_KEEPALIVE` | 真实字节流转发与保活（`NatMessageType` 区分子类型） |
+第一层是帧头 `Command`：
 
-### 4.4 握手与会话
+| Command | 值 | 说明 |
+| --- | ---: | --- |
+| `LOGIN_REQUEST` / `LOGIN_RESPONSE` | `1` / `-1` | 控制连接 token 登录 |
+| `MESSAGE_REQUEST` / `MESSAGE_RESPONSE` | `2` / `-2` | 通用控制消息 |
+| `LOGOUT_REQUEST` / `LOGOUT_RESPONSE` | `3` / `-3` | 主动离线 |
+| `HEARTBEAT_REQUEST` / `HEARTBEAT_RESPONSE` | `4` / `-4` | 心跳 |
+| `HTTP_REQUEST` / `HTTP_RESPONSE` | `5` / `-5` | 保留的同步 HTTP 协议类型；当前公网主路径不使用 |
+| `NAT_MESSAGE` | `6` | NAT/WS 隧道统一承载帧 |
+| `DIRECT_HTTP_REQUEST` / `DIRECT_HTTP_RESPONSE` | `7` / `-7` | 当前公网 HTTP 直转主路径 |
 
-```
-client                                  server
-  │  TCP/TLS handshake                     │
-  │ ─────────────────────────────────────► │
-  │  LoginRequestPacket                    │
-  │   { clientName, password=HMAC(pw)·     │
-  │     nonce, timestamp }                 │
-  │ ─────────────────────────────────────► │
-  │                  ┌─────────────────────┤  (a) 服务端按 clientName 查 ClientAccount
-  │                  │  ManagedLoginRequest│  (b) 时间戳 ±30s 校验
-  │                  │  Handler            │  (c) HMAC-SHA256 校验：key = SHA-256(plainPwd) hex
-  │                  │                     │  (d) 频率限制（默认 30/min）
-  │                  │                     │  (e) 写 ConnectionRecord（成功/失败原因）
-  │                  └─────────────────────┤
-  │  LoginResponsePacket(success/reason)   │
-  │ ◄───────────────────────────────────── │
-  │                                        │
-  │  服务端如登录成功 → 推送启用映射快照    │
-  │  Command.MESSAGE_REQUEST(NAT_CONTROL)  │
-  │ ◄───────────────────────────────────── │
-  │                                        │
-  │  HeartbeatRequest（每 ~30s）            │
-  │ ─────────────────────────────────────► │
-  │  HeartbeatResponse                     │
-  │ ◄───────────────────────────────────── │
-```
+第二层是 `MESSAGE_*` 内的 `MessageType`：
 
-登录签名（`HmacSigner`）：
+- `SERVER_TO_CLIENT`
+- `CLIENT_TO_SERVER`
+- `CLIENT_TO_CLIENT`
+- `NAT_CONTROL`：TCP 映射与 HTTP 路由权威快照
+- `PEER_CONTROL`：Peer Mesh 设备、候选地址、探测和 session 信令
 
-- `key = lower_hex( SHA-256(plain_password) )`：与 `PasswordService` 保存到数据库中的摘要保持一致，**明文密码本身从不上线**。
-- `signature = HMAC-SHA256(key, clientName | "\n" | timestamp | "\n" | nonce)`。
-- `timestamp` 单位为秒，服务端允许 ±30 秒漂移；`nonce` 为单调或随机字符串。
-- 当前版本**不强制持久化 nonce**，因此严格意义上是"基于时间窗的弱重放防护"。如需更强的防重放，需要扩展为窗口内 nonce 集合（见 §13）。
+第三层是 `NAT_MESSAGE` 内的 `NatMessageType`：
 
-会话表示：`Session`（`tunnel-common`）。每条已登录的控制连接在服务端管理一个 `Session`，`SessionUtil` 提供按 `clientName` / `Channel` 双向查找。`Channel.attr` 上挂 `Attributes.SESSION` 等若干槽位（见 `Attributes`）。
+- `REGISTER`、`REGISTER_RESULT`、`UNREGISTER`
+- `CONNECTED`、`DISCONNECTED`、`DATA`、`KEEPALIVE`
+- `HTTP_ROUTES_REPORT`：为旧客户端保留的线值；当前 Java server 收到后直接忽略
+
+### 4.4 两阶段客户端认证
+
+客户端认证不是在 Netty `LOGIN_REQUEST` 中直接发送密码 HMAC，而是分两步：
+
+1. **HTTP 启动登录**
+   - 客户端读取工作目录中的 `client.jsonc`，收集 `machineFingerprint`、`osUser` 等环境信息。
+   - canonical message 为 `apiKey + "\n" + timestamp + "\n" + nonce + "\n" + machineFingerprint + "\n" + osUser`。
+   - `key = SHA-256(secret)`，签名为 HMAC-SHA256；`timestamp` 单位是毫秒。
+   - server 从 `ClientCredential.secretHash` 还原 HMAC key，校验签名和 `±60s` 时间窗，创建/复用 `ClientIdentity` 与 `ClientAccount`，再创建 `ClientSession`。
+   - 响应包含 `clientName`、`clientSessionId`、明文 `accessToken`、token TTL、Netty 地址、TCP/HTTP 快照和 Peer Mesh 配置；数据库只保存 token hash。
+2. **Netty 控制连接登录**
+   - `LoginRequestPacket` 发送 `clientName`、`clientSessionId` 和 `accessToken`。
+   - server 只保存 token 的 SHA-256，验证 session 未过期、账号/凭证启用、连接频率和在线实例上限。
+   - 成功后绑定 `clientName → Channel`，写连接记录，并异步推送 `NAT_CONTROL` 与 `PEER_CONTROL`。
+
+secret 明文不会发送到 server；数据库保存其 SHA-256。当前没有 nonce 去重存储，因此同一 HTTP 登录请求在 60 秒窗口内仍可能被重放，时间窗只是弱重放缓解。
 
 ## 5. Netty Pipeline
 
-### 5.1 服务端控制连接 Pipeline（`NettyServer`）
+### 5.1 Server 控制连接
 
+实际初始化顺序：
+
+```text
+[SslHandler]
+→ SocketIdleStateHandler
+→ Spliter(maxFrameSize)
+→ PacketCodecHandler
+→ ManagedLoginRequestHandler
+→ AuthHandler
+→ HeartbeatRequestHandler
+→ NatServerHandler
+→ DirectHttpResponseHandler
+→ ServerMessageHandler
+→ LogoutRequestHandler
 ```
-[可选] SslHandler  ──►  Spliter  ──►  PacketDecoder  ──►  PacketEncoder
-                                          │
-                                          ▼
-                  IdleStateHandler(SocketIdleStateHandler)
-                                          │
-                                          ▼
-       ┌──────────────────────┬──────────────────────┬──────────────────────┐
-       ▼                      ▼                      ▼                      ▼
-ManagedLoginRequest    HeartbeatRequest    MessageRequest          NatServerHandler
-Handler                Handler             Handler                 (动态附加)
-       │                      │                      │
-       ▼                      ▼                      ▼
-LogoutRequestHandler   ServerMessageHandler    DirectHttp/HttpResponseHandler
+
+- `SslHandler` 只在 `TUNNEL_TLS_MODE != disabled` 时安装。
+- `ManagedLoginRequestHandler` 把 DB/token 校验提交到有界 `loginExecutor`，涉及 Channel 的绑定和回包再切回该 Channel 的 EventLoop。
+- `NatServerHandler` 从连接建立时就存在；它用 `REGISTER` 成功状态约束普通 TCP `DATA/DISCONNECTED`，并不是注册后才动态挂载。
+- `PacketCodecHandler` 在 server 同时承担 decode/encode；不是两个独立的 `PacketDecoder`/`PacketEncoder`。
+
+### 5.2 Java client 控制连接
+
+初始顺序：
+
+```text
+[SslHandler]
+→ ClientSocketIdleStateHandler
+→ Spliter
+→ PacketDecoder
+→ LoginResponseHandler
+→ MessageResponseHandler
+→ DirectHttpRequestHandler
+→ LogoutResponseHandler
+→ PacketEncoder
 ```
 
-要点：
+收到首个 `NAT_CONTROL` 后，`MessageResponseHandler` 动态追加 `NatClientHandler`；handler 添加到已激活 Channel 时立即注册当前 TCP 映射并上报 HTTP routes。后续完整快照通过 `applyConfig`/`applyRoutes` 热替换。
 
-- `SslHandler` 是否安装由 `TUNNEL_TLS_MODE` 决定（`disabled` / `file` / `self-signed`，见 `TlsProperties` + `TlsContextFactory`）。
-- `IdleStateHandler` 配合 `HEARTBEAT_REQUEST` 实现"读空闲 → 触发心跳 / 关闭连接"。
-- `NatServerHandler` 在客户端发出 `NAT_REGISTER` 之后挂入；它持有该客户端正在使用的 `tunnelId → Channel`、`connectionId → Channel` 映射，用于把公网入站 `RemoteTunnelHandler` 的字节流绑定到该客户端。
-- 公网监听端口（`TcpServer`）的 pipeline 为 `RemoteTunnelHandler`，不参与控制连接帧解析，它只负责把 `ByteBuf` 包成 `NAT_DATA` 写到对应客户端的控制 Channel。
-
-### 5.2 客户端控制连接 Pipeline（`NettyClient`）
-
-与服务端对偶：`Spliter → PacketDecoder → PacketEncoder → SocketIdleStateHandler → AuthHandler → MessageRequestHandler/HeartbeatResponseHandler/...`。客户端额外有：
-
-- `NatClientHandler`：收到 `NAT_REGISTER_RESULT` / `NAT_CONNECT_ESTABLISHED` 后挂入；每个建立的 NAT 连接维护一条到本地 `LocalTunnelHandler` 的下游 socket。
-- `LocalTunnelHandler`：连本地真实业务，把回程字节流再经 `NatClientHandler → 控制连接 → 服务端 RemoteTunnelHandler` 写回公网访问者。
-- `DirectHttpResponseHandler`：把客户端本地发起的 HTTP 响应（来自 `tunnel-client` 的 `HttpRequestExecutor` 或 Go 的 `http.go`）打包成 `DIRECT_HTTP_RESPONSE` 回传。
+客户端没有独立的 `AuthHandler` 或 `HeartbeatResponseHandler`。`DirectHttpRequestHandler` 接收 server 请求并回写 `DIRECT_HTTP_RESPONSE`；`DirectHttpResponseHandler` 位于 server。
 
 ## 6. 数据流
 
-### 6.1 NAT TCP 转发
+### 6.1 TCP NAT
 
-```
-公网访问者
-   │  1. 连接到服务端公网映射端口 (TcpServer)
-   ▼
-RemoteTunnelHandler
-   │  2. channelActive：申请 connectionId，写一条 NAT_CONNECT_ESTABLISHED
-   │     给目标客户端的控制 Channel
-   ▼
-NatServerHandler (服务端侧)
-   │  3. 通过控制连接发出 NAT_CONNECT_ESTABLISHED(tunnelId, connId)
-   ▼
-NatClientHandler (客户端侧)
-   │  4. 按 tunnelId 取出本地 (target_addr, target_port)，
-   │     建立 LocalTunnelHandler 连接
-   ▼
-LocalTunnelHandler ──► 内网目标 TCP 服务
+注册阶段：
 
-数据帧：
-公网字节 → NAT_DATA(connId, payload) → 控制连接 → NatClientHandler → LocalTunnelHandler → 内网
-内网字节 → LocalTunnelHandler → NAT_DATA(connId, payload) → 控制连接 → NatServerHandler → RemoteTunnelHandler → 公网
-
-断开：
-任一侧 channelInactive → 发 NAT_DISCONNECT(connId) → 对端关闭对应下游连接
+```text
+server NAT_CONTROL 完整快照
+  → client MessageResponseHandler
+  → NatClientHandler REGISTER(port, tunnelAddress, tunnelPort, clientName)
+  → server NatServerHandler 校验登录身份和全局端口占用
+  → RemotePortServerManager.bind(port)
+  → REGISTER_RESULT
 ```
 
-设计要点：
+转发阶段使用 `port` 标识映射、使用 Netty `channelId` 标识一条公网连接：
 
-- **连接 ID 而非 tunnel ID 寻路**：每条公网入站连接在服务端分配一个全局唯一 `connectionId`，避免同一映射上多并发流量错路由。
-- **背压**：使用 Netty `ChannelBackpressure`（`AUTO_READ` 模式），对端不可写时关闭本端 `autoRead`，恢复后再打开，避免内存堆积。
-- **保活**：长时间无流量时由 `NAT_KEEPALIVE` 维持中间链路，避免 NAT 设备清理表项。
+```text
+公网连接 channelActive
+  → CONNECTED {port, channelId}
+  → client 按 port 找目标并建立本地 TCP Channel
 
-### 6.2 HTTP 直转（`HttpTunnelController` + `DirectHttpResponseHandler`）
+公网字节
+  → DATA {channelId} + payload
+  → client LocalTunnelHandler
+  → 内网服务
 
-```
-GET /http/{clientName}/{route}/api/foo?x=1   (公网 HTTP 8088)
-         │
-         ▼
-HttpTunnelController
-  - 校验 client 在线、route 在 client 配置白名单内
-  - 构造 DirectHttpRequestPacket(reqId, method, path, headers, body)
-  - 通过 DirectHttpFutureManager 注册一个 SyncFuture<DirectHttpResponsePacket>
-  - 发送到客户端控制 Channel
-         │
-         ▼ (客户端)
-client 解码 → 调用本地 HTTP 客户端访问 targetBaseUrl + path → 把响应封装成 DIRECT_HTTP_RESPONSE 回传
-         │
-         ▼
-DirectHttpResponseHandler
-  - 通过 reqId 找到 SyncFuture，写入响应
-HttpTunnelController
-  - 等待 future（默认超时 30s，TUNNEL_HTTP_TIMEOUT_MS）
-  - 把状态码、头、body 写回访问者
+内网回包
+  → DATA {channelId} + payload
+  → server externalChannels[channelId]
+  → 公网连接
 ```
 
-约束：
+任一侧断开都发送 `DISCONNECTED {channelId}`。控制 Channel 与公网/本地 Channel 之间通过 `ChannelBackpressure` 联动 `AUTO_READ`，避免不可写时无限积压。`listenPort` 是整台 server 的全局资源，不能跨租户复用。
 
-- **请求体大小**：默认 16 MiB（`TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE`），超过返回 413。
-- **超时**：30s（`TUNNEL_HTTP_TIMEOUT_MS`），超时触发清理 `SyncFuture`。
-- **白名单**：客户端配置 `httpTunnelConfigList[].route`，未注册的 route 返回 404；关键安全边界。
+### 6.2 HTTP 与 WebSocket 直转
+
+HTTP 主路径：
+
+```text
+/http/{clientName}/{route}/**
+  → HttpTunnelController 构造 DirectHttpRequestPacket
+  → DirectHttpDispatcher 注册 SyncFuture、写控制 Channel 并等待
+  → client DirectHttpRequestHandler 在线程池执行 DirectHttpForwarder
+  → 按 route 精确查 targetBaseUrl，转发 method/path/query/headers/body
+  → DIRECT_HTTP_RESPONSE
+  → server DirectHttpResponseHandler → DirectHttpDispatcher.ack
+  → Controller 返回状态码、headers 和 body
+```
+
+当前边界：
+
+- server 请求体默认上限 `16 MiB`，等待默认 `30s`；离线返回 `503`，等待超时返回 `504`。
+- client 也把请求体本地读取限制为 `16 MiB`、响应体本地读取限制为 `64 MiB`，并把单段 Range 控制在
+  `8 MiB`；但 Direct HTTP 仍封装成单个控制帧，实际端到端能力还受默认 `32 MiB` 整帧和 deflate 后
+  `16 MiB` 解压上限约束。因此 `64 MiB` 不是可保证传输的响应上限，稳定使用应把完整序列化 payload
+  控制在 `16 MiB` 以下并预留字段开销。
+- route 不存在时由 client 拒绝，当前响应是 `502` 和“未配置 HTTP route”，不是 controller 预先返回 `404`。
+- client 校验 target scheme 为 HTTP/HTTPS、目标 origin 不变，且相对路径不能逃逸 base path。
+- HTTP 路由开启路径改写后，server 可改写可识别响应中的绝对路径；默认单体上限 `10 MiB`。
+
+WebSocket 升级同样挂在 `/http/**`，由 `WebSocketTunnelHandler` 建立 stream，并复用 `NAT_MESSAGE` 的 `CONNECTED/DATA/DISCONNECTED`，metadata 中以 `source="ws"` 和 `channelId` 区分。
+
+### 6.3 Peer Mesh
+
+Peer Mesh 默认关闭。启用后：
+
+- `PeerMeshService` 分配 `100.96.0.0/11` 虚拟 IP，并按租户、owner 和 ACL 选择可见对端。
+- `PeerSignalService` 通过 `PEER_CONTROL` 交换设备、候选地址和 session 授权。
+- Java client 支持 Linux TUN、Windows Wintun、macOS utun 和 `noop`；`auto` 按当前系统选择。
+- 客户端通过 STUN、UPnP/NAT-PMP/PCP 和候选探测尝试 UDP direct；direct 不健康时回退 TURN relay。
+- Peer 数据帧使用 X25519/HKDF 派生密钥和 AES-GCM；server relay 只处理授权与外层帧。
 
 ## 7. 安全模型
 
-### 7.1 控制连接加密（`TlsProperties` / `TlsContextFactory`）
+### 7.1 控制连接 TLS
 
 | 模式 | 行为 |
 | --- | --- |
-| `disabled`（默认） | 明文 TCP，向后兼容 |
-| `file` | 加载 JKS / PKCS12 keystore 签发服务端证书，生产推荐 |
-| `self-signed` | 启动时一次性生成自签名证书，仅供开发/测试 |
+| `disabled`（默认） | 明文 TCP，兼容旧部署 |
+| `file` | 从 JKS/PKCS12 keystore 加载 server 证书 |
+| `self-signed` | 启动时生成临时自签名证书，仅用于开发/测试 |
 
-**当前限制**：Java 客户端入口 `TunnelClientApplication` 默认按明文连接；启用 TLS 需要显式调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。Go 客户端同理需要在控制连接上显式启用 TLS。这是已知 gap（见 §13）。
+Java client 入口默认仍以明文连接；启用 TLS 需要构造 `SslContext` 并使用 `NettyClient(TunnelBean, SslContext)`。`buildClientSslContext` 加载 truststore，`buildInsecureClientSslContext` 仅供测试。
 
-### 7.2 客户端到服务端：HMAC 登录
+### 7.2 客户端与管理面鉴权
 
-详见 §4.4。要点：
+- 客户端 HTTP 登录使用 `ClientCredential` 的 apiKey/secret HMAC；Netty 控制连接只使用 `ClientSession` runtime token。
+- client token 默认 TTL 为 `28800s`。Java client 会在到期前主动重新执行 HTTP 登录；收到“访问令牌已过期”也会刷新后重连。
+- 控制连接频率限制按 `ClientAccount` 统计最近一分钟连接记录，默认 `30/min`，`0` 表示不限。
+- 管理本地登录由 `/auth/login` 签发 HS256 JWT；OIDC token 通过 JWKS 验签。`SecurityConfig` 根据 JWT 算法路由 decoder。
 
-- 数据库存储 SHA-256(明文)，同时作为 HMAC 密钥；明文密码仅在创建/重置时一次性向管理员展示。
-- 时间戳 ±30s 滑动窗，nonce 当前不持久化。
-- 频率限制按 `client` 维度：默认每分钟 30 次（含成功与失败），`0` = 不限。
+### 7.3 HTTP 安全边界
 
-### 7.3 管理后台：双登录通道
+Spring Security 当前只要求 `/api/admin/**` 与 `/auth/refresh` 必须携带认证；`/api/public/**`、`/ws/**` 和其它请求在 filter chain 层 permitAll。`/ws/**` 中需要保护的端点由握手拦截器单独校验 JWT。
 
-`SecurityConfig` 配置 `OAuth2 Resource Server`，对 `/api/admin/**` 校验 Bearer JWT，按 JWT header 的 `alg` 自动路由：
+`/http/**` 是有意公开的业务入口，不要求管理 JWT。它的访问边界是在线客户端和该客户端当前生效的 route；公网 TCP 入口则受已登录客户端成功 `REGISTER` 的端口集合约束。
 
-| 方式 | 算法 | 校验路径 |
-| --- | --- | --- |
-| 用户名/密码（`/auth/login`） | HS256 | `LocalTokenService` 用本地 `TUNNEL_AUTH_JWT_SECRET`（留空时启动随机生成）签发与校验 |
-| OIDC Authorization Code + PKCE | RS256 | 通过 `TUNNEL_OIDC_JWK_SET_URI` JWKS 远程验签 |
+## 8. 持久化
 
-公开路径白名单：`/`, `/index.html`, 静态资源, `/auth/login`, `/oidc/**`, `/http/**`, `/actuator/health`。
+### 8.1 客户端身份与运行时会话
 
-`/http/**` 故意不需要管理 token——它是面向公网的业务流量入口，仅靠"客户端配置中的 route 白名单"控制可见性。
-
-### 7.4 威胁模型与边界
-
-- **可信**：服务端进程本身、数据库、管理员浏览器（在 OIDC/密码登录之后）。
-- **半可信**：客户端进程（密码丢失即等于身份丢失，故密码以摘要存储且支持重置）。
-- **不可信**：公网访问者、`/http/**` 调用方、未经 NAT_CONTROL 注册的端口请求。
-- **未覆盖**：传输层在 `disabled` 模式下不防止 MITM；nonce 未持久化时存在重放窗口（30s 内可重放同一签名）。
-
-## 8. 持久化设计
-
-### 8.1 ER 简图
-
-```
-ClientAccount (1) ─── (N) TunnelMapping
-       │
-       ├─── (N) ConnectionRecord  ── 滚动 60 天
-       │              │
-       │              └── 月度汇总到 ConnectionStat (长期保留)
-       │
-       └─── (N) TrafficUsage  (按 clientName + UTC 日期聚合)
+```text
+ClientCredential
+  └─ ClientIdentity (credential + machineFingerprint + osUser)
+       └─ ClientAccount
+            ├─ ClientSession
+            ├─ TunnelMapping
+            ├─ HttpRouteMapping
+            ├─ ConnectionRecord ──► ConnectionStat（月度归档）
+            ├─ TrafficUsage / ResourceTrafficUsage
+            └─ PeerMeshDevice / PeerMeshSession / PeerMeshAcl
 ```
 
-### 8.2 关键实体
+- **`ClientCredential`**：`apiKey`、`secretHash`、启用状态和最大在线实例数；启动 secret 的权威存储。
+- **`ClientIdentity`**：把凭证与 `machineFingerprint + osUser` 绑定到一个账号。
+- **`ClientAccount`**：Long `id`、tenant、owner、`clientName`、启用状态和频率限制。遗留 `passwordHash` 字段仍在表中，但当前 HTTP/Netty 登录不使用它。
+- **`ClientSession`**：只保存 runtime token hash，并记录 HTTP 已认证、Netty 在线、断开、环境和过期时间。
 
-- **`ClientAccount`**：`clientId`（外部短码）、`clientName`、`passwordHash`（hex SHA-256）、`enabled`、`connectionRateLimitPerMinute`（默认 30）、`createdAt`、`updatedAt`。
-- **`TunnelMapping`**：`clientId`、`listenPort`、`targetAddress`、`targetPort`、`enabled`、时间戳。
-- **`ConnectionRecord`**：连接尝试明细，含成功/失败原因、源 IP、登录耗时、字节计数。**滚动 60 天**保留。
-- **`ConnectionStat`**：月度汇总 (`yearMonth`, `clientName`, `successCount`, `failureCount`, `totalCount`)，长期保留。
-- **`TrafficUsage`**：按 `(clientName, utcDate)` 聚合的上下行字节数，`TrafficUsageService` 在内存中累加并周期性 flush。
+### 8.2 路由、连接与流量
 
-### 8.3 数据库支持矩阵
+- **`TunnelMapping`**：全局唯一 `listen_port`、目标地址/端口、启用状态和明细采集开关。
+- **`HttpRouteMapping`**：`(client_id, route)` 唯一，保存 target base URL、启用、明细采集和路径改写开关。
+- **`ConnectionRecord`**：client、channel、remote address、连接/断开时间、成功状态、失败原因和断开原因；不保存登录耗时或流量字节。
+- **`ConnectionStat`**：按 tenant、clientName、自然月累加 total/success/failure，长期保留。
+- **`TrafficUsage`**：按 `(client_id, usage_date)` 聚合上下行字节。
+- **`ResourceTrafficUsage`**：按 tenant、client、资源类型/键和 UTC 日期聚合 TCP 映射或 HTTP route 流量。
 
-| DB | 驱动 | Dialect | 备注 |
-| --- | --- | --- | --- |
-| SQLite | `org.sqlite.JDBC` | `org.hibernate.community.dialect.SQLiteDialect` | 默认；适合演示与单机部署 |
-| MySQL | `com.mysql.cj.jdbc.Driver` | `org.hibernate.dialect.MySQLDialect` | 通过 `TUNNEL_DB_*` 切换 |
-| PostgreSQL | `org.postgresql.Driver` | `org.hibernate.dialect.PostgreSQLDialect` | 同上 |
+连接记录关键索引是 `(client_id, connected_at)` 和 `connected_at`，分别服务频率限制/客户端历史与归档扫描。早于滚动保留窗口的记录按自然月汇总后，在同一事务中删除；默认保留 60 天。
 
-`DatabaseInitializer` 提供幂等初始化与可选的种子数据（`TUNNEL_DB_SEED_DEMO_CLIENT=true` 时插入 `Demo client / test1234`）。
+HTTP/TCP 明细默认写业务数据库；配置 `TUNNEL_ELASTICSEARCH_URIS` 后切换到 Elasticsearch store。全局采集开关与每条 route/mapping 开关都必须开启才会记录明细。
 
-### 8.4 索引与查询
+### 8.3 数据库
 
-- `ConnectionRecord (clientName, occurredAt)` 复合索引：用于按客户端的时间范围明细查询与归档扫描。
-- `TrafficUsage (clientName, usageDate)` 唯一约束 + 复合索引。
-- 控制路径上**不**对热点表做联表，避免 Hibernate 多次 N+1。
-
-## 9. 并发与线程模型（`ServerExecutorConfig`）
-
-| 池 | 用途 | 默认 |
+| 数据库 | Driver | Hibernate Dialect |
 | --- | --- | --- |
-| Netty boss | 接受新连接 | 1 线程 |
-| Netty worker | I/O 多路复用 | CPU 数 × 2 |
-| `loginExecutor` | 处理登录中的密码校验、写连接记录 | 有界（避免登录风暴打满 worker） |
-| `trafficFlushScheduler` | 定时把 `TrafficUsage` 内存累计 flush 到 DB | `TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS` |
-| `connectionArchiveScheduler` | 月度归档 + 删除老明细 | `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS`（默认 1h） |
-| Spring MVC | `/api/admin/**`、`/auth/**`、`/http/**` | Tomcat 默认 |
+| SQLite（默认） | `org.sqlite.JDBC` | `org.hibernate.community.dialect.SQLiteDialect` |
+| MySQL | `com.mysql.cj.jdbc.Driver` | `org.hibernate.dialect.MySQLDialect` |
+| PostgreSQL | `org.postgresql.Driver` | `org.hibernate.dialect.PostgreSQLDialect` |
 
-线程交接关键点：
+`DatabaseInitializer` 负责旧库 tenant/owner 和 HTTP body 字段回填，并可用 `TUNNEL_DB_SEED_DEMO_CLIENT` 控制 `Demo client` 与 `demo-client/test1234` 演示凭证种子。
 
-1. **登录**：worker 收到 `LOGIN_REQUEST` → 提交到 `loginExecutor` → DB 校验 → 回到 Channel 的 EventLoop 写 `LoginResponse`。所有写回 Channel 的动作必须切回该 Channel 的 EventLoop。
-2. **HTTP 直转等待**：`HttpTunnelController.handle()` 在 Tomcat 线程上 `SyncFuture.get(timeout)`，由 worker 线程的 `DirectHttpResponseHandler.complete()` 唤醒。
-3. **NAT 数据帧**：`RemoteTunnelHandler` 与控制连接在不同 worker 上，写控制连接时会跨 EventLoop 调度。
+## 9. 并发与线程模型
 
-## 10. 重连与空闲
+| 执行单元 | 当前行为 |
+| --- | --- |
+| Netty control boss | 默认 1 线程 |
+| Netty control worker | `0` 表示使用 Netty 默认线程数 |
+| 公网 TCP boss/worker | 与 control 分离；默认 boss 1、worker 使用 Netty 默认 |
+| `loginExecutor` | 有界池，默认 core 8、max 32、queue 20000；执行 token 鉴权、连接记录和登录后配置推送 |
+| Spring scheduler | 默认 pool size 2；执行流量 flush、连接归档、Peer/附件清理等定时任务 |
+| HTTP 直转 | Tomcat 线程在 `DirectHttpDispatcher.forward` 中等待 `SyncFuture`；Netty worker 收到响应后唤醒 |
+| client HTTP worker | `DirectHttpRequestHandler` 提交到共享 `ExecuteService` cached thread pool，避免阻塞 control EventLoop |
+| TURN relay worker | 可配置有界工作池；队列满时丢弃新 relay 数据帧保护 server |
 
-### 10.1 客户端重连
+所有 DB 和阻塞工作都应避免直接占用 Netty EventLoop。跨 Channel 写由 Netty 调度到目标 EventLoop；NAT 两端用 writability 和 `AUTO_READ` 做背压。
 
-`NettyClient` 在 `channelInactive` 后启动指数退避重连：初始 1 秒，倍增至上限（典型 30 秒），上限后保持周期重试。Go 客户端使用同样的退避策略（`client.go`）。重连成功后会重新走完整的登录 + 等待 `NAT_CONTROL` 流程，确保映射状态一致。
+## 10. 重连与心跳
+
+### 10.1 Java client 重连与 token 刷新
+
+控制连接失败后，`NettyClient` 使用 `2s → 4s → 8s → 16s → 32s → 60s` 指数退避，之后保持 60 秒上限。只有收到成功的 `LOGIN_RESPONSE` 才重置退避计数。
+
+普通重连复用未过期 runtime token，再走完整 Netty 登录；登录成功后 server 重新推送权威 `NAT_CONTROL`/`PEER_CONTROL`。token 快过期时 client 主动重新执行 HTTP 登录，刷新 token、session、控制端地址和配置；明确的认证/策略拒绝会停止无意义重试。
 
 ### 10.2 空闲检测
 
-`SocketIdleStateHandler` 配合心跳：
+- Java client：写空闲 `5s` 发送 `HEARTBEAT_REQUEST`，读空闲 `60s` 关闭并进入重连。
+- Java server：写空闲 `30s` 发送兜底 `HEARTBEAT_RESPONSE`，读空闲 `60s` 关闭并清理 session、连接记录和 NAT 资源。
 
-- 客户端：写空闲达到阈值 → 主动发 `HEARTBEAT_REQUEST`。
-- 服务端：读空闲超过 N 倍心跳间隔 → 关闭连接，触发资源清理（`SessionUtil.unbind`、关闭对应所有 NAT 下游连接）。
+## 11. 核心配置默认值
 
-## 11. 配置矩阵（环境变量）
-
-| 类别 | 变量 | 默认 |
+| 类别 | 配置 / 环境变量 | 默认 |
 | --- | --- | --- |
-| 端口 | `TUNNEL_NETTY_PORT` | `7010` |
-| 端口 | `server.port` (Spring Boot) | `8088` |
-| 公网地址 | `TUNNEL_PUBLIC_ADDRESS` | (空，用于管理页展示) |
-| DB | `TUNNEL_DB_URL` / `_DRIVER` / `_DIALECT` / `_USERNAME` / `_PASSWORD` / `_POOL_SIZE` / `_BATCH_SIZE` / `_SEED_DEMO_CLIENT` | SQLite 默认 |
-| 流量 | `TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS` | 视实现 |
-| 归档 | `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` | `60` |
-| 归档 | `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` | `3600000` |
-| HTTP | `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` | `16 MiB` |
-| HTTP | `TUNNEL_HTTP_TIMEOUT_MS` | `30000` |
-| 鉴权 | `TUNNEL_AUTH_USERNAME` / `_PASSWORD` / `_PASSWORD_LOGIN_ENABLED` / `_JWT_SECRET` / `_TOKEN_TTL_SECONDS` | `admin` / `admin` / `true` / 启动随机 / `28800` |
-| OIDC | `TUNNEL_OIDC_*`（CLIENT_ID, REDIRECT_URI, SCOPE, AUDIENCE, ISSUER, JWK_SET_URI, AUTHORIZATION_ENDPOINT, TOKEN_ENDPOINT, END_SESSION_ENDPOINT, CLIENT_SECRET）| 默认指向项目网关 |
-| TLS | `TUNNEL_TLS_MODE` / `_KEYSTORE` / `_KEYSTORE_PASSWORD` / `_KEY_PASSWORD` | `disabled` |
+| Web | `server.port` | `8088` |
+| Control | `TUNNEL_NETTY_PORT` | `7010` |
+| Frame | `TUNNEL_NETTY_MAX_FRAME_SIZE` | `33554432`（32 MiB） |
+| DB | `TUNNEL_DB_URL` / `TUNNEL_DB_POOL_SIZE` / `TUNNEL_DB_BATCH_SIZE` | SQLite / `1` / `50` |
+| Seed | `TUNNEL_DB_SEED_DEMO_CLIENT` | `true` |
+| Client token | `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` |
+| Traffic | `TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS` | `5000` |
+| Archive | `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` / `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` | `60` / `3600000` |
+| HTTP | `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` / `TUNNEL_HTTP_TIMEOUT_MS` | `16777216` / `30000` |
+| Admin auth | `TUNNEL_AUTH_USERNAME` / `_PASSWORD` / `_TOKEN_TTL_SECONDS` | `admin` / `admin` / `28800` |
+| Peer Mesh | `TUNNEL_PEER_MESH_ENABLED` / `_STUN_TURN_PORT` / `_NAT_PROBE_ALTERNATE_PORT` | `false` / `3478` / `3479` |
+| TLS | `TUNNEL_TLS_MODE` | `disabled` |
 
-## 12. 关键流程时序
+完整配置以 `implementations/java/server/src/main/resources/application.yml` 和对应 `@ConfigurationProperties` 类为准。
 
-### 12.1 登录 + 自动下发映射
+## 12. 关键时序
 
-```
-client                     server                       DB
-  │ TCP/TLS connect            │                          │
-  │ ─────────────────────────► │                          │
-  │ LOGIN_REQUEST              │                          │
-  │ ─────────────────────────► │ findByClientName ───────►│
-  │                            │ ◄─────────────── account │
-  │                            │ verify HMAC + ts window  │
-  │                            │ rate-limit check         │
-  │                            │ insert ConnectionRecord ─►
-  │ LOGIN_RESPONSE(success)    │                          │
-  │ ◄───────────────────────── │                          │
-  │ MESSAGE_REQUEST(NAT_CONTROL│                          │
-  │   = mappings snapshot)     │ findEnabledMappings ────►│
-  │ ◄───────────────────────── │                          │
-  │ NAT_REGISTER (ack)         │                          │
-  │ ─────────────────────────► │                          │
-  │ NAT_REGISTER_RESULT        │ start TcpServer per port │
-  │ ◄───────────────────────── │                          │
+### 12.1 启动登录与自动注册
+
+```text
+Java client                 Spring HTTP                 DB                 Netty server
+    │ POST client/auth/login     │                       │                       │
+    │ HMAC(apiKey, ms, nonce, env) ────────────────────►│                       │
+    │                            │ credential/identity/account/session           │
+    │ ◄── token + session + endpoints + config ─────────│                       │
+    │                                                                            │
+    │ TCP[/TLS] connect ────────────────────────────────────────────────────────► │
+    │ LOGIN_REQUEST(clientName, sessionId, accessToken) ───────────────────────► │
+    │                                            verify token/session + rate limit│
+    │ ◄──────────────────────── LOGIN_RESPONSE(success) ───────────────────────── │
+    │ ◄──────────────────────── MESSAGE_RESPONSE(NAT_CONTROL snapshot) ────────── │
+    │ NAT_MESSAGE REGISTER(port...) ────────────────────────────────────────────► │
+    │ ◄──────────────────────── NAT_MESSAGE REGISTER_RESULT ───────────────────── │
 ```
 
-### 12.2 管理员新增映射 → 实时下发
+### 12.2 管理面热更新
 
-```
-Admin UI               AdminController        ClientManagementService    NatControlService    Online client
-  │  POST /tunnels        │                        │                          │                       │
-  │ ────────────────────► │                        │                          │                       │
-  │                       │ validate, persist ────►│ saveTunnelMapping        │                       │
-  │                       │                        │ publish snapshot ───────►│                       │
-  │                       │                        │                          │ findChannelByClient   │
-  │                       │                        │                          │ writeAndFlush ───────►│
-  │                       │                        │                          │   MESSAGE_REQUEST(NAT │
-  │                       │                        │                          │   _CONTROL=snapshot)  │
-  │                       │                        │                          │                       │ register
-  │                       │                        │                          │ ◄──────────────────── ack
-  │ 200 OK                │                        │                          │                       │
-  │ ◄──────────────────── │                        │                          │                       │
+```text
+Admin REST mutation
+  → 在事务中保存 TunnelMapping / HttpRouteMapping
+  → NatControlService.pushSnapshotIfOnline
+  → 在线 client 收到完整 NAT_CONTROL 权威快照
+  → TCP 映射增删触发 REGISTER / UNREGISTER
+  → HTTP route 原子替换 DirectHttpRequestHandler 的不可变 route map
 ```
 
-客户端离线时不会立即推送，下次登录会自动重新发送完整启用映射快照（**最终一致**）。手动调用 `POST /api/admin/clients/{id}/nat-control` 在客户端离线时返回 `409`。
+客户端离线时自动推送静默跳过，下次登录重新取得完整快照；手动 `POST /api/admin/clients/{id}/nat-control` 在离线时返回 `409`。
 
-## 13. 已知 gap 与演进路线
+## 13. 已知限制与后续工作
 
-- **TLS 客户端默认不开**：Java 客户端入口 `TunnelClientApplication` 仍以明文连接为默认，需把 TLS 抬到 `client.jsonc` 字段（如 `tls: { enabled, trustStorePath, trustStorePassword, insecureSkipVerify }`），Go 客户端同步暴露相同字段。
-- **登录 nonce 未持久化**：当前在 30s 窗口内可重放同一签名。建议在 `loginExecutor` 处加内存 LRU（按 `clientName`），并在多节点部署时升级到共享存储（Redis）。
-- **UDP 转发缺失**：`UdpConnection` 留空。如要补齐，需要在协议层新增 `NAT_UDP_*` 命令，并在服务端为每个 UDP 映射启动 `DatagramChannel`，按 `(srcAddr, srcPort)` 分配 connectionId。
-- **测试覆盖**：核心协议有单元测试，但缺少真实 MySQL/PostgreSQL 集成测试和端到端隧道测试。`tools/` 下已有 load test 辅助。
-- **服务端水平扩展**：当前 `Session` 与 `NatServerHandler` 状态都在 JVM 内存。若要多节点：客户端 → 节点之间需要绑定（一致性哈希或粘性路由），公网入站连接也必须落到客户端实际所在节点。详细方案见 `docs/performance/single-node-10k-connections-optimization-plan.md` 与 P2P 研究文档。
-- **同端口冲突**：`server.port=8088` 与 `tunnel-client` 默认相同，单机同时跑要覆盖其中一个。
-- **协议演进**：`magic` 与 `version` 已预留；新增命令时建议保留向后兼容（旧版本未识别的 `cmd` 应当忽略而非断链），目前未实现该容忍逻辑。
+- **Java client TLS 未配置化**：入口默认明文，需要把 truststore/校验策略正式加入 `client.jsonc`。
+- **HTTP 登录 nonce 未去重**：签名有 60 秒时间窗，但窗口内可重放；单节点可加有界 nonce cache，多节点需共享存储。
+- **公网 UDP 映射缺失**：如要实现，需要新增协议子类型、server `DatagramChannel` 和按来源端点维护的映射；这与已实现 Peer Mesh UDP 不同。
+- **E2E 覆盖有限**：已有 `EndToEndTunnelIT` 覆盖 SQLite 进程内 HTTP HMAC、Netty token、真实 TCP 隧道和 route 热更新，但 `*IT` 尚未接入 Maven Failsafe；仍缺真实 MySQL/PostgreSQL、跨进程和 TLS 矩阵。
+- **水平扩展**：`SessionUtil`、`NatServerHandler` 和动态监听仍是进程内状态；需要控制/连接端拆分、粘性路由、共享状态和 drain。详见 `server-control-edge-ha-plan.md`。
+- **未知协议值容忍**：`magic`/`version` 已预留，但未知 `Command`/serializer 当前不能保证被安全忽略，协议演进必须先做兼容性验证。
 
-## 14. 参考源码索引
+## 14. 源码索引
 
-| 主题 | 入口 |
+| 主题 | 当前入口 |
 | --- | --- |
-| 服务端启动 | `implementations/java/server/.../TunnelServerApplication.java` |
-| Netty 服务 | `implementations/java/server/.../server/NettyServer.java`、`server/TcpServer.java`、`server/RemotePortServerManager.java` |
-| 公网入站 | `implementations/java/server/.../handler/RemoteTunnelHandler.java` |
-| 控制连接 | `implementations/java/server/.../handler/NatServerHandler.java`、`handler/ManagedLoginRequestHandler.java` |
-| 管理 REST | `implementations/java/server/.../management/controller/{Admin,Auth,Oidc}Controller.java` |
-| 管理服务 | `implementations/java/server/.../management/service/{ClientManagement,NatControl,TrafficUsage,ConnectionArchive}Service.java` |
-| 安全 | `implementations/java/server/.../security/{LocalTokenService,PasswordService,TlsContextFactory,TlsProperties}.java` |
-| HTTP 直转 | `implementations/java/server/.../http/HttpTunnelController.java` |
-| 协议核心 | `implementations/java/common/.../protocol/{PacketCodec,Packet,NatMessagePacket,NatMessageType,MessageType}.java` |
-| 编解码 | `implementations/java/common/.../codec/{Spliter,PacketDecoder,PacketEncoder,PacketCodecHandler}.java` |
-| 命令枚举 | `implementations/java/common/.../command/Command.java` |
-| 序列化 | `implementations/java/common/.../serialize/**` |
-| HMAC | `implementations/java/common/.../security/HmacSigner.java` |
-| Java 客户端 | `implementations/java/client/.../client/{NettyClient,LocalTunnelHandler,UdpConnection}.java` |
-| Go 客户端 | `implementations/go/client/internal/client/{client,nat,http,config}.go`、`internal/protocol/protocol.go` |
+| Server 启动 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/TunnelServerApplication.java` |
+| Control Netty | `.../server/NettyServer.java`、`.../handler/ManagedLoginRequestHandler.java`、`.../handler/AuthHandler.java` |
+| Client HTTP 认证 | `.../management/controller/ClientAuthResource.java`、`.../management/service/ClientAuthService.java` |
+| Client 凭证/账号 | `.../management/service/ClientCredentialService.java`、`.../management/service/ClientAccountService.java` |
+| NAT server | `.../handler/NatServerHandler.java`、`.../handler/RemoteTunnelHandler.java`、`.../server/RemotePortServerManager.java` |
+| HTTP/WS 直转 | `.../http/HttpTunnelController.java`、`.../http/DirectHttpDispatcher.java`、`.../http/WebSocketTunnelHandler.java` |
+| Peer Mesh server | `.../management/service/PeerMeshService.java`、`.../management/service/PeerSignalService.java`、`.../peer/StunTurnServer.java` |
+| 管理 REST | `.../management/controller/*Resource.java`、`.../management/controller/AuthController.java`、`.../management/controller/OidcController.java` |
+| 安全 | `.../config/SecurityConfig.java`、`.../security/LocalTokenService.java`、`.../security/TlsContextFactory.java` |
+| 协议核心 | `implementations/java/common/src/main/java/com/theshuai/common/protocol/*`、`.../command/Command.java` |
+| 编解码 | `.../codec/Spliter.java`、`.../codec/PacketCodecHandler.java`、`.../protocol/PacketCodec.java` |
+| 紧凑二进制 | `.../serialize/impl/CompactBinarySerializer.java` |
+| Java client 启动/连接 | `implementations/java/client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`、`.../client/NettyClient.java` |
+| Java client NAT/HTTP | `.../handler/NatClientHandler.java`、`.../handler/LocalTunnelHandler.java`、`.../handler/DirectHttpRequestHandler.java` |
+| Java client Peer Mesh | `.../peer/PeerMeshClient.java`、`.../peer/PeerVirtualDevices.java` |
+| 进程内 E2E | `implementations/java/server/src/test/java/com/theshuai/tunnelserver/integration/EndToEndTunnelIT.java` |
 
 ---
 
-> 本设计文档与 README 互为补充：README 面向"如何运行"，本文档面向"为什么这样设计、关键路径在哪条文件里、改动时该警惕什么"。修改协议、登录、TLS 或归档逻辑时，请同步更新本文档相关章节。
+修改协议、客户端认证、TLS、NAT/HTTP 路由、Peer Mesh 或归档逻辑时，应同时更新本文、根 README、`protocol/spec/` 和跨语言测试向量。

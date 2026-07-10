@@ -2,6 +2,11 @@
 
 > 将 shuai-tunnel 的 peer-to-peer mesh 组网能力移植到 Android（Kotlin）和 iOS（Swift），
 > 使移动设备能通过 VPN 隧道参与私有组网，与其他 peer 设备直连或经 relay 通信。
+>
+> 状态复核（2026-07-10）：本文主体仍是跨 Android/iOS 的目标方案，不是当前代码结构说明。仓库已经有
+> `implementations/android/client`，采用原生 Java 独立实现而非 KMP/OkHttp WebSocket，已接入 HTTP 启动登录、
+> 二进制控制连接、`VpnService`、X25519/HKDF/AES-GCM、标准 STUN/TURN、UDP direct/relay 和基础状态上报；
+> 端口预测、本地 ACL 镜像和完整真机 E2E 仍待完成。iOS 与 KMP 共享核心尚未实现。
 
 ---
 
@@ -9,7 +14,7 @@
 
 ```
 ┌─────────────────────────────────────────────┐
-│          移动端 App (Kotlin/Swift)            │
+│       目标移动端 App (Kotlin/Swift)           │
 │                                              │
 │  ┌───────────────────────────────────────┐  │
 │  │        PeerMeshEngine (共享核心)        │  │
@@ -252,12 +257,10 @@ class MeshPacketTunnelProvider: NEPacketTunnelProvider {
 |--------|-----------|
 | `PeerControlMessage` JSON | `@SerialName` 与 Java 字段名一致 |
 | `PeerUdpProbe` JSON | magic `"shuai-peer-mesh"` + 字段名一致 |
-| `PeerRelayMessage` JSON | magic + type 常量一致 |
-| `PeerRelayBinaryFrame` | `0x53505231` big-endian |
 | `PeerDataFrameHeader` | `0x53504D31` + 46 字节 AAD |
 | `deriveAes256Key` | HKDF salt = `SHA-256("shuai-peer-mesh\n<sessionId>\n<token>\n<minId>\n<maxId>")` |
-| STUN binding | `XOR-MAPPED-ADDRESS` 属性解析、`OTHER-ADDRESS` |
-| TURN allocate | UDP 传输、`XOR-RELAYED-ADDRESS`、`LIFETIME` |
+| 标准 STUN binding | 二进制 STUN、`XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN`、`OTHER-ADDRESS` |
+| 标准 TURN | Allocate / Refresh / CreatePermission / Send Indication / Data Indication；当前不使用 ChannelBind/ChannelData |
 | 探针突发 | `PROBE_BURST_COUNT=3`, `INTERVAL=30ms` |
 | 端口预测 | `PREDICTED_PORT_RANGE=8` |
 | 保活 | `DIRECT_KEEPALIVE_INTERVAL=25s`, `DIRECT_STALE=45s` |
