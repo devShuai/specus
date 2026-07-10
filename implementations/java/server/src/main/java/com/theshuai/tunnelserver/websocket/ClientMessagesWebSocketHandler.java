@@ -44,6 +44,10 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        // Keep the container aggregation limit aligned with the explicit 64K character guard.
+        // Tomcat/Spring otherwise defaults to a much smaller text-message buffer.
+        session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
+        session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
         adminSessions.computeIfAbsent(adminSessionKey(session), ignored -> ConcurrentHashMap.newKeySet()).add(session);
         send(session, Map.of(
                 "type", "hello",

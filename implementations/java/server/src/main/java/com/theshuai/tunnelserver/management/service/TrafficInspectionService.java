@@ -64,7 +64,7 @@ public class TrafficInspectionService {
     private final int decodeMaxBytes;
     private final int maxPending;
     private final int flushBatchSize;
-    /** S4.2 帧采样率 0.0-1.0；首帧/尾帧/异常帧始终捕获 */
+    /** S4.2 帧采样率 0.0-1.0；每个方向的首帧始终捕获，其余帧按采样率决定 */
     private final double sampleRate;
     private volatile Instant lastFlushedAt;
 

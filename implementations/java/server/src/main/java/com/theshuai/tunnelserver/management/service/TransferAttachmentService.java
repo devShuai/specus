@@ -325,24 +325,58 @@ public class TransferAttachmentService {
     }
 
     private String normalizeFileName(String fileName) {
-        String normalized = requireText(fileName, "fileName").replace('\\', '/');
-        int slash = normalized.lastIndexOf('/');
-        if (slash >= 0) {
-            normalized = normalized.substring(slash + 1);
+        if (fileName == null || fileName.isEmpty()) {
+            throw new IllegalArgumentException("fileName cannot be blank");
         }
-        normalized = normalized.replaceAll("[\\r\\n\\t]", "_").replaceAll("[^\\p{Alnum}._ -]", "_").trim();
-        if (!StringUtils.hasText(normalized)) {
-            normalized = "attachment";
-        }
-        if (normalized.length() > 180) {
-            String extension = "";
-            int dot = normalized.lastIndexOf('.');
-            if (dot > 0 && dot < normalized.length() - 1) {
-                extension = normalized.substring(dot);
+
+        int slash = Math.max(fileName.lastIndexOf('/'), fileName.lastIndexOf('\\'));
+        String segment = fileName.substring(slash + 1);
+        StringBuilder normalized = new StringBuilder(segment.length());
+        boolean previousWasInvalid = false;
+        boolean previousWasDot = false;
+        for (int offset = 0; offset < segment.length();) {
+            int codePoint = segment.codePointAt(offset);
+            offset += Character.charCount(codePoint);
+            boolean asciiAlphaNumeric = codePoint >= 'A' && codePoint <= 'Z'
+                    || codePoint >= 'a' && codePoint <= 'z'
+                    || codePoint >= '0' && codePoint <= '9';
+            boolean allowed = asciiAlphaNumeric || codePoint == '.' || codePoint == '_' || codePoint == '-';
+            if (!allowed) {
+                if (!previousWasInvalid) {
+                    normalized.append('_');
+                }
+                previousWasInvalid = true;
+                previousWasDot = false;
+                continue;
             }
-            normalized = normalized.substring(0, Math.min(180 - extension.length(), normalized.length())) + extension;
+            previousWasInvalid = false;
+            if (codePoint == '.') {
+                if (!previousWasDot) {
+                    normalized.append('.');
+                }
+                previousWasDot = true;
+            } else {
+                normalized.appendCodePoint(codePoint);
+                previousWasDot = false;
+            }
         }
-        return normalized;
+
+        String result = normalized.toString();
+        if (result.isEmpty() || result.equals(".")) {
+            return "attachment";
+        }
+        if (result.length() <= 180) {
+            return result;
+        }
+
+        int dot = result.lastIndexOf('.');
+        if (dot > 0 && dot < result.length() - 1) {
+            String extension = result.substring(dot);
+            if (extension.length() < 180) {
+                return result.substring(0, 180 - extension.length()) + extension;
+            }
+        }
+        return result.substring(0, 180);
     }
 
     private String normalizeMimeType(String mimeType) {

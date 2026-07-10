@@ -325,7 +325,21 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 return fallback;
             }
             String normalized = value.trim();
-            return normalized.length() > maxLength ? normalized.substring(0, maxLength) : normalized;
+            return truncateUtf16WithoutSplittingSurrogate(normalized, maxLength);
+        }
+
+        static String truncateUtf16WithoutSplittingSurrogate(String value, int maxLength) {
+            if (value == null || value.length() <= maxLength) {
+                return value;
+            }
+            int end = Math.max(0, maxLength);
+            if (end > 0
+                    && end < value.length()
+                    && Character.isHighSurrogate(value.charAt(end - 1))
+                    && Character.isLowSurrogate(value.charAt(end))) {
+                end--;
+            }
+            return value.substring(0, end);
         }
 
         private static String publicAddress(ServerHttpRequest request) {

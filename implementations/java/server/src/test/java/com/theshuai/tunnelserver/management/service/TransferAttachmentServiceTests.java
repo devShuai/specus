@@ -107,6 +107,48 @@ class TransferAttachmentServiceTests {
     }
 
     @Test
+    void fileNameNormalizationUsesUnicodeCodePointsAndSafeLengthBoundaries() {
+        mockEnabledStorage();
+        when(repository.countByScopeAndRoomTokenHashAndStatus(any(), any(), any())).thenReturn(0L);
+        when(repository.existsById(anyLong())).thenReturn(false);
+        when(repository.saveAndFlush(any(TransferAttachment.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(objectStorageService.presignUpload(any(), any(), any()))
+                .thenReturn(new PresignedObjectUrl("https://oss/upload", Map.of(), Instant.now().plusSeconds(900).toString()));
+
+        Map<String, String> cases = Map.ofEntries(
+                Map.entry("mixed/path\\photo😀  中文.png", "photo_.png"),
+                Map.entry("😀😀.txt", "_.txt"),
+                Map.entry("folder/", "attachment"),
+                Map.entry("folder\\", "attachment"),
+                Map.entry("folder/...", "attachment"),
+                Map.entry("archive..tar...gz", "archive.tar.gz"),
+                Map.entry(".env", ".env"),
+                Map.entry("file.", "file."),
+                Map.entry("   ", "_"),
+                Map.entry("  photo .png  ", "_photo_.png_")
+        );
+        cases.forEach((input, expected) -> {
+            var response = service.createPublicUpload(new TransferAttachmentService.PresignUploadRequest(
+                    input, "application/octet-stream", 10L, null, "room-a", ROOM_TOKEN, null));
+            assertThat(response.attachment().fileName()).as("input %s", input).isEqualTo(expected);
+            assertThat(response.objectKey()).doesNotContain("..").endsWith("/" + expected);
+        });
+
+        String shortExtension = "." + "b".repeat(178);
+        Map<String, String> longCases = Map.of(
+                "a".repeat(200) + ".txt", "a".repeat(176) + ".txt",
+                "abcdefghij" + shortExtension, "a" + shortExtension,
+                "a." + "b".repeat(180), "a." + "b".repeat(178),
+                "x".repeat(181), "x".repeat(180)
+        );
+        longCases.forEach((input, expected) -> {
+            var response = service.createPublicUpload(new TransferAttachmentService.PresignUploadRequest(
+                    input, "application/octet-stream", 10L, null, "room-a", ROOM_TOKEN, null));
+            assertThat(response.attachment().fileName()).as("long input").isEqualTo(expected).hasSize(180);
+        });
+    }
+
+    @Test
     void createPublicUploadRetriesWhenSaveHitsIdCollision() {
         mockEnabledStorage();
         when(repository.countByScopeAndRoomTokenHashAndStatus(any(), any(), any())).thenReturn(0L);

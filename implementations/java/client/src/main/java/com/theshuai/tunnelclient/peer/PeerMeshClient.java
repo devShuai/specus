@@ -49,10 +49,12 @@ public class PeerMeshClient implements AutoCloseable {
     private final Map<Long, List<PendingVirtualPacket>> pendingVirtualPackets = new ConcurrentHashMap<>();
     private final Map<Long, Long> pathPrepareMillis = new ConcurrentHashMap<>();
     private final Map<String, PendingStunBinding> pendingStunBindings = new ConcurrentHashMap<>();
+    private final Map<String, PendingTurnRequest> pendingTurnRequests = new ConcurrentHashMap<>();
     private final Map<String, Long> turnPermissions = new ConcurrentHashMap<>();
     private final Map<String, SrflxObservation> srflxObservations = new ConcurrentHashMap<>();
     private final AtomicBoolean directSuppressedLogged = new AtomicBoolean(false);
     private final SecureRandom secureRandom = new SecureRandom();
+    private final TurnLongTermAuthenticator turnAuthenticator = new TurnLongTermAuthenticator();
     private final ControlSender controlSender;
     private final PeerKeyStore.KeyMaterial keyMaterial;
     private final PeerVirtualDeviceOptions virtualDeviceOptions;
@@ -121,6 +123,9 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     public synchronized void startOrUpdate(ClientAuthLoginResponse.PeerMeshConfig nextConfig) {
+        if (turnAuthenticator.update(nextConfig)) {
+            pendingTurnRequests.clear();
+        }
         if (nextConfig == null || !nextConfig.isEnabled()) {
             this.config = nextConfig;
             if (running) {
@@ -138,6 +143,7 @@ public class PeerMeshClient implements AutoCloseable {
             pendingVirtualPackets.clear();
             pathPrepareMillis.clear();
             pendingStunBindings.clear();
+            pendingTurnRequests.clear();
             turnPermissions.clear();
             srflxObservations.clear();
             serverReflexiveCandidate = null;
@@ -332,6 +338,7 @@ public class PeerMeshClient implements AutoCloseable {
         pendingVirtualPackets.clear();
         pathPrepareMillis.clear();
         pendingStunBindings.clear();
+        pendingTurnRequests.clear();
         turnPermissions.clear();
         srflxObservations.clear();
         serverReflexiveCandidate = null;
@@ -762,14 +769,36 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private void sendStunRequest(StunMessage message, InetSocketAddress relayEndpoint) {
+        sendStunRequest(message, relayEndpoint, 0);
+    }
+
+    private void sendStunRequest(StunMessage message,
+                                 InetSocketAddress relayEndpoint,
+                                 int authenticationAttempt) {
         DatagramSocket socket = udpSocket;
         if (socket == null || socket.isClosed() || relayEndpoint == null) {
             return;
         }
+        boolean authenticatedTurnRequest = TurnLongTermAuthenticator.requiresAuthentication(message.type())
+                && turnAuthenticator.canAuthenticate();
+        String transactionKey = message.transactionIdHex();
+        PendingTurnRequest pending = null;
+        if (authenticatedTurnRequest) {
+            pending = new PendingTurnRequest(
+                    message.type(),
+                    message.attributes(),
+                    relayEndpoint,
+                    authenticationAttempt,
+                    System.currentTimeMillis());
+            pendingTurnRequests.put(transactionKey, pending);
+        }
         try {
-            byte[] bytes = message.toBytes();
+            byte[] bytes = turnAuthenticator.encode(message);
             socket.send(new DatagramPacket(bytes, bytes.length, relayEndpoint));
         } catch (Exception e) {
+            if (pending != null) {
+                pendingTurnRequests.remove(transactionKey, pending);
+            }
             log.debug("Peer mesh STUN/TURN request 发送失败: type=0x{}, reason={}",
                     Integer.toHexString(message.type()), e.getMessage());
         }
@@ -1510,11 +1539,22 @@ public class PeerMeshClient implements AutoCloseable {
     private void handleStunTurnMessage(StunMessage message, InetSocketAddress observedRemote) {
         switch (message.type()) {
             case StunMessage.BINDING_SUCCESS -> handleStunBindingSuccess(message, observedRemote);
-            case StunMessage.ALLOCATE_SUCCESS -> handleTurnAllocated(message);
-            case StunMessage.REFRESH_SUCCESS -> relayAllocationExpiresAtMillis = System.currentTimeMillis()
-                    + Math.max(30, message.lifetimeSeconds(300)) * 1000;
-            case StunMessage.CREATE_PERMISSION_SUCCESS -> log.trace("Peer mesh TURN permission created: tx={}",
-                    message.transactionIdHex());
+            case StunMessage.ALLOCATE_SUCCESS -> {
+                completeTurnRequest(message, observedRemote);
+                handleTurnAllocated(message);
+            }
+            case StunMessage.REFRESH_SUCCESS -> {
+                completeTurnRequest(message, observedRemote);
+                relayAllocationExpiresAtMillis = System.currentTimeMillis()
+                        + Math.max(30, message.lifetimeSeconds(300)) * 1000;
+            }
+            case StunMessage.CREATE_PERMISSION_SUCCESS -> {
+                completeTurnRequest(message, observedRemote);
+                log.trace("Peer mesh TURN permission created: tx={}", message.transactionIdHex());
+            }
+            case StunMessage.ALLOCATE_ERROR,
+                 StunMessage.REFRESH_ERROR,
+                 StunMessage.CREATE_PERMISSION_ERROR -> handleTurnError(message, observedRemote);
             case StunMessage.DATA_INDICATION -> {
                 InetSocketAddress peer = message.xorPeerAddress().orElse(null);
                 byte[] inner = message.data().orElse(null);
@@ -1766,6 +1806,50 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
+    private void completeTurnRequest(StunMessage response, InetSocketAddress observedRemote) {
+        String transactionKey = response.transactionIdHex();
+        PendingTurnRequest pending = pendingTurnRequests.get(transactionKey);
+        if (pending != null && sameEndpoint(pending.endpoint(), observedRemote)) {
+            pendingTurnRequests.remove(transactionKey, pending);
+        }
+    }
+
+    private void handleTurnError(StunMessage response, InetSocketAddress observedRemote) {
+        String transactionKey = response.transactionIdHex();
+        PendingTurnRequest pending = pendingTurnRequests.remove(transactionKey);
+        int errorCode = TurnLongTermAuthenticator.errorCode(response);
+        if (pending == null || !sameEndpoint(pending.endpoint(), observedRemote)) {
+            log.debug("Peer mesh TURN error ignored: type=0x{}, code={}, tx={}",
+                    Integer.toHexString(response.type()), errorCode, transactionKey);
+            return;
+        }
+        if ((errorCode != 401 && errorCode != 438)
+                || pending.authenticationAttempt() >= 1
+                || !turnAuthenticator.applyChallenge(response)) {
+            log.debug("Peer mesh TURN request failed: type=0x{}, code={}, authAttempt={}",
+                    Integer.toHexString(pending.requestType()), errorCode, pending.authenticationAttempt());
+            return;
+        }
+
+        StunMessage retry = new StunMessage(
+                pending.requestType(),
+                StunMessage.newTransactionId(),
+                pending.attributes());
+        log.debug("Peer mesh TURN auth challenge received, retrying once: type=0x{}, code={}",
+                Integer.toHexString(pending.requestType()), errorCode);
+        sendStunRequest(retry, pending.endpoint(), pending.authenticationAttempt() + 1);
+    }
+
+    private boolean sameEndpoint(InetSocketAddress expected, InetSocketAddress actual) {
+        if (expected == null || actual == null || expected.getPort() != actual.getPort()) {
+            return false;
+        }
+        if (expected.getAddress() != null && actual.getAddress() != null) {
+            return expected.getAddress().equals(actual.getAddress());
+        }
+        return expected.getHostString().equalsIgnoreCase(actual.getHostString());
+    }
+
     private void handlePeerAppMessage(PeerDataFrame frame) {
         PeerAppMessageCodec.PeerAppMessage message = PeerAppMessageCodec.decode(frame.plaintext());
         if (message == null) {
@@ -1911,6 +1995,7 @@ public class PeerMeshClient implements AutoCloseable {
         // STUN binding 响应正常在亚秒级到达；entry 只在成功响应时移除，
         // STUN 服务器不可达时会以每 60s × N 个 server 的速度永久累积。
         pendingStunBindings.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
+        pendingTurnRequests.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
     }
 
     private void probeKnownCandidates() {
@@ -2910,6 +2995,16 @@ public class PeerMeshClient implements AutoCloseable {
 
     private record PendingStunBinding(String role,
                                       long sentAtMillis) {
+    }
+
+    private record PendingTurnRequest(int requestType,
+                                      List<StunMessage.Attribute> attributes,
+                                      InetSocketAddress endpoint,
+                                      int authenticationAttempt,
+                                      long sentAtMillis) {
+        private PendingTurnRequest {
+            attributes = attributes == null ? List.of() : List.copyOf(attributes);
+        }
     }
 
     private record NatProbeObservation(String role,

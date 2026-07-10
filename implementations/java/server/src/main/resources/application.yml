@@ -95,6 +95,9 @@ tunnel:
     presign-rate-limit-per-ip: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP:30}
     presign-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS:300}
     max-pending-uploads-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM:50}
+    max-discovery-peers-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM:32}
+    discovery-message-rate-limit-per-connection: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION:120}
+    discovery-message-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS:60}
   client-auth:
     default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
     per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}
@@ -134,7 +137,7 @@ tunnel:
     capture-max-pending: ${TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING:20000}
     capture-flush-batch-size: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE:1000}
     capture-flush-interval-ms: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS:2000}
-    # S4.2 采样率 0.0-1.0；首帧/尾帧/异常帧始终捕获，常规帧按此比例采样，默认全量
+    # S4.2 采样率 0.0-1.0；每个方向的首帧始终捕获，其余帧按此比例采样，默认全量
     capture-sample-rate: ${TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE:1.0}
   elasticsearch:
     # When blank, HTTP exchange detail uses the database. When set, HTTP exchange detail writes
