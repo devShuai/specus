@@ -4,6 +4,8 @@ import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progr
 import { AppLogo } from "../components/AppLogo";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { HeroRuntime } from "../components/HeroRuntime";
+import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhiteboard";
+import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
 import {
   fetchPublicTransferIceConfig,
   publicCompleteAttachment,
@@ -98,6 +100,7 @@ function PublicTransferPageContent() {
   const [record, setRecord] = useState<UploadRecord | null>(null);
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [iceConfig, setIceConfig] = useState<PublicTransferIceConfig | null>(null);
+  const [whiteboardEvents, setWhiteboardEvents] = useState<WhiteboardInboundEvent[]>([]);
 
   usePageSeo({
     title: "免登录文件互传 · shuai-tunnel",
@@ -151,19 +154,43 @@ function PublicTransferPageContent() {
     }));
   }, []);
 
+  const pushWhiteboardEvent = useCallback((sourcePeerId: string, payload: WhiteboardPayload) => {
+    if (!sourcePeerId || sourcePeerId === peerId) {
+      return;
+    }
+    const eventId = whiteboardEventKey(sourcePeerId, payload);
+    setWhiteboardEvents((items) => [
+      ...items.slice(-299),
+      {
+        eventId,
+        sourcePeerId,
+        payload,
+        receivedAt: Date.now(),
+      },
+    ]);
+  }, [peerId]);
+
   const {
     pendingTransfers,
     receivingTransfers,
     sendDirect,
+    sendPeerMessage,
     handleSignal,
     acceptIncomingTransfer,
     rejectIncomingTransfer,
   } = useDirectTransfer({
+    selfPeerId: peerId,
     iceConfig,
     peers,
     directMemoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
     receiveConfirmationRequired,
+    preconnectPeerChannels: true,
     sendSignal: sendDiscoverySignal,
+    onPeerMessage: (sourcePeerId, message) => {
+      if (message.messageType === "whiteboard" && isWhiteboardPayload(message.payload)) {
+        pushWhiteboardEvent(sourcePeerId, message.payload);
+      }
+    },
     onIncoming: (item) => {
       setIncoming((items) => limitIncomingItems([item, ...items]));
     },
@@ -274,7 +301,7 @@ function PublicTransferPageContent() {
           error?: string;
           sourcePeerId?: string;
           peers?: DiscoveryPeer[];
-          payload?: ({ objectId?: string; attachment?: TransferAttachment } & DirectTransferSignalPayload);
+          payload?: unknown;
         };
         if (message.type === "pong") {
           lastPongAt = Date.now();
@@ -284,19 +311,24 @@ function PublicTransferPageContent() {
           const visiblePeers = message.peers.filter((peer) => peer.peerId !== peerId);
           setPeers(visiblePeers);
           setSelectedPeerId((current) => current && visiblePeers.some((peer) => peer.peerId === current) ? current : visiblePeers[0]?.peerId ?? "");
-        } else if (message.type === "attachment" && message.payload?.attachment) {
-          setIncoming((items) => limitIncomingItems([
-            {
-              sourcePeerId: message.sourcePeerId ?? "peer",
-              attachment: message.payload!.attachment!,
-              objectId: message.payload!.objectId ?? message.payload!.attachment!.objectId,
-              downloadUrl: null,
-              downloadExpiresAt: null,
-            },
-            ...items,
-          ]));
+        } else if (message.type === "attachment") {
+          const attachmentPayload = message.payload;
+          if (isAttachmentDiscoveryPayload(attachmentPayload)) {
+            setIncoming((items) => limitIncomingItems([
+              {
+                sourcePeerId: message.sourcePeerId ?? "peer",
+                attachment: attachmentPayload.attachment,
+                objectId: attachmentPayload.objectId ?? attachmentPayload.attachment.objectId,
+                downloadUrl: null,
+                downloadExpiresAt: null,
+              },
+              ...items,
+            ]));
+          }
+        } else if (message.type === "whiteboard" && message.sourcePeerId && isWhiteboardPayload(message.payload)) {
+          pushWhiteboardEvent(message.sourcePeerId, message.payload);
         } else if (message.type === "signal" && message.sourcePeerId && message.payload) {
-          void handleSignal(message.sourcePeerId, message.payload);
+          void handleSignal(message.sourcePeerId, message.payload as DirectTransferSignalPayload);
         }
       } catch {
         // Ignore malformed discovery messages; the page can keep working through manual copy.
@@ -348,7 +380,7 @@ function PublicTransferPageContent() {
         socket.close();
       }
     };
-  }, [handleSignal, peerId, roomId, roomToken, sharedDiscoveryEnabled]);
+  }, [handleSignal, peerId, pushWhiteboardEvent, roomId, roomToken, sharedDiscoveryEnabled]);
 
   useEffect(() => {
     return () => {
@@ -743,6 +775,31 @@ function PublicTransferPageContent() {
     }));
   };
 
+  const publishWhiteboardEnvelope = useCallback((targetPeerId: string, payload: WhiteboardPayload) => {
+    const socket = discoverySocketRef.current;
+    if (!targetPeerId || !socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    socket.send(JSON.stringify({
+      type: "whiteboard",
+      targetPeerId,
+      payload,
+    }));
+  }, []);
+
+  const sendWhiteboardPayload = useCallback((payload: WhiteboardPayload) => {
+    if (peers.length === 0) {
+      return;
+    }
+    for (const peer of peers) {
+      void sendPeerMessage(peer.peerId, { messageType: "whiteboard", payload }, 1600).then((sentDirect) => {
+        if (!sentDirect) {
+          publishWhiteboardEnvelope(peer.peerId, payload);
+        }
+      });
+    }
+  }, [peers, publishWhiteboardEnvelope, sendPeerMessage]);
+
   return (
     <main className="landing-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
       <div className="landing-grid" aria-hidden="true" />
@@ -930,6 +987,15 @@ function PublicTransferPageContent() {
               {error}
             </div>
           )}
+
+          <SyncedWhiteboard
+            boardKey={`${roomId}:${sharedDiscoveryEnabled ? roomToken : "nearby"}`}
+            peerId={peerId}
+            peerCount={peers.length}
+            isConnected={peers.length > 0}
+            events={whiteboardEvents}
+            onSend={sendWhiteboardPayload}
+          />
 
           <IncomingFilesPanel
             pendingTransfers={pendingTransfers}
@@ -1555,6 +1621,52 @@ function transferProgress(doneBytes: number, totalBytes: number) {
 
 function incomingItemKey(item: IncomingAttachment) {
   return `${item.sourcePeerId}:${item.attachment.attachmentId}:${item.objectId}`;
+}
+
+function isAttachmentDiscoveryPayload(value: unknown): value is { objectId?: string; attachment: TransferAttachment } {
+  if (!isPlainRecord(value)) {
+    return false;
+  }
+  const attachment = value.attachment;
+  if (!isPlainRecord(attachment)) {
+    return false;
+  }
+  return typeof attachment.fileName === "string"
+    && typeof attachment.objectId === "string"
+    && typeof attachment.sizeBytes === "number";
+}
+
+function whiteboardEventKey(sourcePeerId: string, payload: WhiteboardPayload) {
+  if (payload.kind === "stroke-start") {
+    return `${sourcePeerId}:start:${payload.strokeId}:${payload.createdAt}:${payload.point.x}:${payload.point.y}`;
+  }
+  if (payload.kind === "stroke-points" || payload.kind === "stroke-end") {
+    const first = payload.points[0];
+    const last = payload.points[payload.points.length - 1];
+    return [
+      sourcePeerId,
+      payload.kind,
+      payload.strokeId,
+      payload.createdAt,
+      payload.points.length,
+      first ? `${first.x}:${first.y}` : "empty",
+      last ? `${last.x}:${last.y}` : "empty",
+    ].join(":");
+  }
+  if (payload.kind === "remove-stroke") {
+    return `${sourcePeerId}:remove:${payload.strokeId}:${payload.createdAt}`;
+  }
+  if (payload.kind === "clear") {
+    return `${sourcePeerId}:clear:${payload.clearId}:${payload.createdAt}`;
+  }
+  if (payload.kind === "snapshot") {
+    return `${sourcePeerId}:snapshot:${payload.createdAt}:${payload.strokes.length}`;
+  }
+  return `${sourcePeerId}:whiteboard:${payload.createdAt}`;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 async function saveUrlAs(

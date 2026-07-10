@@ -318,7 +318,7 @@ func Default() Config {
 			PresignRateLimitWindowSeconds:          300,
 			MaxPendingUploadsPerRoom:               50,
 			MaxDiscoveryPeersPerRoom:               32,
-			DiscoveryMessageRateLimitPerConnection: 120,
+			DiscoveryMessageRateLimitPerConnection: 360,
 			DiscoveryMessageRateLimitWindowSeconds: 60,
 		},
 		Oidc: OidcConfig{

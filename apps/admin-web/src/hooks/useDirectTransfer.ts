@@ -9,6 +9,11 @@ export interface DirectTransferSignalPayload {
   candidate?: RTCIceCandidateInit;
 }
 
+export interface DirectPeerMessage {
+  messageType: string;
+  payload?: unknown;
+}
+
 export interface DirectTransferPeer {
   peerId: string;
   displayName: string;
@@ -73,12 +78,15 @@ interface DirectPendingRequest extends DirectPendingTransfer {
 }
 
 interface UseDirectTransferOptions {
+  selfPeerId?: string;
   iceConfig: PublicTransferIceConfig | null;
   peers: DirectTransferPeer[];
   directMemoryLimitBytes: number;
   receiveConfirmationRequired: boolean;
+  preconnectPeerChannels?: boolean;
   receivingTransferLimit?: number;
   sendSignal: (targetPeerId: string, payload: DirectTransferSignalPayload) => void;
+  onPeerMessage?: (sourcePeerId: string, message: DirectPeerMessage) => void;
   onIncoming: (item: DirectIncomingAttachment) => void;
   onPreviewUrl: (url: string) => void;
   onStateChange: (state: DirectTransferPhase) => void;
@@ -94,6 +102,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   const iceConfigRef = useRef<PublicTransferIceConfig | null>(options.iceConfig);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
+  const openingChannelsRef = useRef<Map<string, Promise<RTCDataChannel>>>(new Map());
   const directIncomingRef = useRef<Map<string, DirectIncomingState>>(new Map());
   const directChannelTransfersRef = useRef<Map<RTCDataChannel, string>>(new Map());
   const pendingDirectRequestsRef = useRef<Map<string, DirectPendingRequest>>(new Map());
@@ -121,6 +130,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     }
     peerConnectionsRef.current.clear();
     dataChannelsRef.current.clear();
+    openingChannelsRef.current.clear();
     directIncomingRef.current.clear();
     directChannelTransfersRef.current.clear();
     pendingDirectRequestsRef.current.clear();
@@ -271,10 +281,27 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   }, [sendDirectReject]);
 
   const handleDirectControlMessage = useCallback((sourcePeerId: string, channel: RTCDataChannel, data: string) => {
-    let message: { kind?: string; transferId?: string; fileName?: string; mimeType?: string; sizeBytes?: number; sha256?: string | null; reason?: string };
+    let message: {
+      kind?: string;
+      transferId?: string;
+      fileName?: string;
+      mimeType?: string;
+      sizeBytes?: number;
+      sha256?: string | null;
+      reason?: string;
+      messageType?: string;
+      payload?: unknown;
+    };
     try {
       message = JSON.parse(data);
     } catch {
+      return;
+    }
+    if (message.kind === "app-message" && typeof message.messageType === "string") {
+      optionsRef.current.onPeerMessage?.(sourcePeerId, {
+        messageType: message.messageType,
+        payload: message.payload,
+      });
       return;
     }
     if (message.kind === "file-meta" && message.transferId) {
@@ -395,6 +422,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       if (dataChannelsRef.current.get(sourcePeerId) === channel) {
         dataChannelsRef.current.delete(sourcePeerId);
       }
+      openingChannelsRef.current.delete(sourcePeerId);
       const activeTransferKey = directChannelTransfersRef.current.get(channel);
       directChannelTransfersRef.current.delete(channel);
       if (activeTransferKey) {
@@ -437,19 +465,34 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     return connection;
   }, [sendSignal, setupDataChannel]);
 
-  const openDirectChannel = useCallback(async (targetPeerId: string): Promise<RTCDataChannel> => {
+  const openDirectChannel = useCallback(async (targetPeerId: string, timeoutMs = 8000): Promise<RTCDataChannel> => {
     const existing = dataChannelsRef.current.get(targetPeerId);
     if (existing?.readyState === "open") {
       return existing;
     }
+    if (existing?.readyState === "connecting") {
+      return waitForDataChannelOpen(existing, timeoutMs);
+    }
+    const opening = openingChannelsRef.current.get(targetPeerId);
+    if (opening) {
+      return opening;
+    }
     const connection = createPeerConnection(targetPeerId);
     const channel = connection.createDataChannel(`file-${Date.now()}`, { ordered: true });
     setupDataChannel(targetPeerId, channel);
-    const opened = waitForDataChannelOpen(channel, 8000);
-    const offer = await connection.createOffer();
-    await connection.setLocalDescription(offer);
-    sendSignal(targetPeerId, { signalType: "offer", description: connection.localDescription ?? offer });
-    return opened;
+    const opened = waitForDataChannelOpen(channel, timeoutMs);
+    const openingTask = (async () => {
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+      sendSignal(targetPeerId, { signalType: "offer", description: connection.localDescription ?? offer });
+      return opened;
+    })();
+    openingChannelsRef.current.set(targetPeerId, openingTask);
+    try {
+      return await openingTask;
+    } finally {
+      openingChannelsRef.current.delete(targetPeerId);
+    }
   }, [createPeerConnection, sendSignal, setupDataChannel]);
 
   const handleSignal = useCallback(async (sourcePeerId: string, payload: DirectTransferSignalPayload) => {
@@ -478,6 +521,43 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       }
     }
   }, [createPeerConnection, sendSignal]);
+
+  useEffect(() => {
+    if (!options.preconnectPeerChannels || !options.selfPeerId || typeof RTCPeerConnection === "undefined") {
+      return;
+    }
+    const selfPeerId = options.selfPeerId;
+    for (const peer of options.peers) {
+      if (selfPeerId.localeCompare(peer.peerId) < 0) {
+        void openDirectChannel(peer.peerId, 10000).catch(() => {
+          // A later whiteboard/file send can fall back or retry; preconnect is best-effort.
+        });
+      }
+    }
+  }, [openDirectChannel, options.peers, options.preconnectPeerChannels, options.selfPeerId]);
+
+  const sendPeerMessage = useCallback(async (targetPeerId: string, message: DirectPeerMessage, timeoutMs = 1600): Promise<boolean> => {
+    if (!targetPeerId || typeof RTCPeerConnection === "undefined") {
+      return false;
+    }
+    try {
+      const channel = await openDirectChannel(targetPeerId, timeoutMs);
+      if (channel.readyState !== "open") {
+        return false;
+      }
+      if (channel.bufferedAmount > 1024 * 1024) {
+        await waitForBufferedAmountLow(channel);
+      }
+      channel.send(JSON.stringify({
+        kind: "app-message",
+        messageType: message.messageType,
+        payload: message.payload,
+      }));
+      return true;
+    } catch {
+      return false;
+    }
+  }, [openDirectChannel]);
 
   const sendDirect = useCallback(async (targetPeerId: string, file: File): Promise<DirectTransferResult> => {
     const limitBytes = optionsRef.current.directMemoryLimitBytes;
@@ -520,6 +600,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     pendingTransfers,
     receivingTransfers,
     sendDirect,
+    sendPeerMessage,
     handleSignal,
     acceptIncomingTransfer,
     rejectIncomingTransfer,

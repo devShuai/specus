@@ -27,7 +27,7 @@ public class PublicTransferProperties {
     private int maxDiscoveryPeersPerRoom = 32;
 
     /** 单个发现 WebSocket 连接在一个时间窗内允许发送的消息数。 */
-    private int discoveryMessageRateLimitPerConnection = 120;
+    private int discoveryMessageRateLimitPerConnection = 360;
 
     /** 发现 WebSocket 消息限流时间窗长度(秒)。 */
     private long discoveryMessageRateLimitWindowSeconds = 60;

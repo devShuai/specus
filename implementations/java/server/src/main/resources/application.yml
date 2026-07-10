@@ -96,7 +96,7 @@ tunnel:
     presign-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS:300}
     max-pending-uploads-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM:50}
     max-discovery-peers-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM:32}
-    discovery-message-rate-limit-per-connection: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION:120}
+    discovery-message-rate-limit-per-connection: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION:360}
     discovery-message-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS:60}
   client-auth:
     default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}

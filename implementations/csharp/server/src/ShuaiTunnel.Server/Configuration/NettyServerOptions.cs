@@ -187,7 +187,7 @@ public sealed class PublicTransferOptions
     public long PresignRateLimitWindowSeconds { get; set; } = 300;
     public int MaxPendingUploadsPerRoom { get; set; } = 50;
     public int MaxDiscoveryPeersPerRoom { get; set; } = 32;
-    public int DiscoveryMessageRateLimitPerConnection { get; set; } = 120;
+    public int DiscoveryMessageRateLimitPerConnection { get; set; } = 360;
     public long DiscoveryMessageRateLimitWindowSeconds { get; set; } = 60;
 }
 
