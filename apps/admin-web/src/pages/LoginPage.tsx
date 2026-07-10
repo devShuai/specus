@@ -167,7 +167,7 @@ function LoginPageContent() {
             </span>
 
             <div className="max-w-3xl">
-              <h1 className="text-4xl font-semibold leading-tight text-zinc-950 dark:text-white sm:text-5xl">shuai-tunnel</h1>
+              <h1 className="text-display-lg font-semibold text-zinc-950 dark:text-white sm:text-display-xl">shuai-tunnel</h1>
               <p className="mt-5 max-w-2xl text-lg leading-8 text-zinc-700 dark:text-zinc-300">
                 把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测，TLS 开箱即用。
               </p>
@@ -202,7 +202,7 @@ function LoginPageContent() {
                   管理台登录
                 </span>
                 <div>
-                  <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">进入控制台</h2>
+                  <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">进入控制台</h2>
                   <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">{loginHint}</p>
                 </div>
               </div>
@@ -277,7 +277,7 @@ function LoginPageContent() {
       <section className="glass glass-border relative z-10 border-t px-5 py-10 sm:px-8">
         <div className="mx-auto max-w-[1440px]">
           <div className="mb-6 max-w-2xl">
-            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">组网形态</h2>
+            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">组网形态</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
               一套控制面承担两类流量：公网用户经 Server 中继访问内网服务，受控客户端之间在控制面协调下走对端互联通道。
             </p>
@@ -285,7 +285,7 @@ function LoginPageContent() {
           <TopologyDiagram />
 
           <div className="mb-6 mt-12 max-w-2xl">
-            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">三类接入能力</h2>
+            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">三类接入能力</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
               HTTP 路由与端口映射承担反向中继；客户端互联（Peer）通过控制面信令撮合，加密 frame 走 UDP 直连或 TURN 回退。
             </p>
@@ -333,7 +333,7 @@ function LoginPageContent() {
           </div>
 
           <div className="mb-6 mt-12 max-w-2xl">
-            <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">平台特性</h2>
+            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">平台特性</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
               从协议字节级兼容到部署形态，shuai-tunnel 把传统反向隧道工具缺失的工程化关切补齐。
             </p>
@@ -682,7 +682,7 @@ function ClientDownloadsSection() {
   return (
     <div className="mt-10">
       <div className="mb-6 max-w-2xl">
-        <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">获取客户端</h2>
+        <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">获取客户端</h2>
         <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
           选择对应的实现下载，所有客户端共享同一份 JSON 配置格式。详细启动方法见登录后的「帮助文档」。
         </p>

@@ -762,7 +762,7 @@ function PublicTransferPageContent() {
         <div className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-6">
           <div className="flex flex-col gap-2">
             <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">文件互传</div>
-            <h1 className="text-2xl font-semibold sm:text-4xl">把文件发给另一台设备</h1>
+            <h1 className="text-display-md font-semibold sm:text-display-lg">把文件发给另一台设备</h1>
             <p className="max-w-2xl text-small leading-6 text-zinc-700 dark:text-zinc-300">
               选文件，邀请对方加入，点发送。手机和电脑都可以直接打开这个页面。
             </p>

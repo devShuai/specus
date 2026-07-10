@@ -20,6 +20,7 @@
     "deploy:csharp": "npm run build && node scripts/deploy.mjs --target csharp"
   },
   "dependencies": {
+    "@fontsource-variable/inter": "^5.2.8",
     "@heroui/react": "^2.8.0",
     "framer-motion": "^11.18.0",
     "react": "^18.3.1",

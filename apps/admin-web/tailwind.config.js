@@ -110,7 +110,29 @@ export default {
     "./node_modules/@heroui/react/node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}",
   ],
   theme: {
-    extend: {},
+    extend: {
+      // Inter 变体字体 + CJK 系统回退（中文走系统字体，不内嵌巨型 CJK 字体）。
+      fontFamily: {
+        sans: [
+          "Inter Variable",
+          "Inter",
+          "PingFang SC",
+          "Hiragino Sans GB",
+          "Microsoft YaHei",
+          "Noto Sans CJK SC",
+          "Noto Sans SC",
+          "system-ui",
+          "sans-serif",
+        ],
+      },
+      // Vercel 风格 display 字阶：大字号配负字距，越小越松。用于 hero / 章节标题。
+      fontSize: {
+        "display-xl": ["3rem", { lineHeight: "1.05", letterSpacing: "-0.04em" }],
+        "display-lg": ["2rem", { lineHeight: "1.1", letterSpacing: "-0.03em" }],
+        "display-md": ["1.5rem", { lineHeight: "1.15", letterSpacing: "-0.02em" }],
+        "display-sm": ["1.25rem", { lineHeight: "1.2", letterSpacing: "-0.01em" }],
+      },
+    },
   },
   darkMode: "class",
   plugins: [

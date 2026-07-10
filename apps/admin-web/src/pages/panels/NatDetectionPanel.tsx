@@ -411,7 +411,7 @@ function NatHero({
         </div>
 
         <div className="flex flex-col gap-3">
-          <h1 className={embedded ? "text-2xl font-semibold" : "text-3xl font-semibold sm:text-4xl"}>
+          <h1 className={embedded ? "text-2xl font-semibold tracking-tight" : "text-3xl font-semibold tracking-tight sm:text-4xl"}>
             {profile.title}
           </h1>
           <p className="max-w-2xl text-small leading-6 text-zinc-700 dark:text-zinc-300 sm:text-medium">
