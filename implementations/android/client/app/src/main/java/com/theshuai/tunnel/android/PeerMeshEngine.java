@@ -53,6 +53,7 @@ final class PeerMeshEngine implements Closeable {
     private static final long RELAY_REQUEST_MIN_INTERVAL_MS = 15_000L;
     private static final long RELAY_REFRESH_WINDOW_MS = 60_000L;
     private static final long TURN_PERMISSION_TTL_MS = 240_000L;
+    private static final long TURN_REQUEST_TTL_MS = 15_000L;
     private static final long SESSION_REFRESH_MIN_WINDOW_MS = 60_000L;
     private static final long SESSION_REFRESH_MAX_WINDOW_MS = 300_000L;
     private static final long REPORT_INTERVAL_MS = 60_000L;
@@ -76,6 +77,7 @@ final class PeerMeshEngine implements Closeable {
     private final Map<Long, ArrayDeque<PendingPacket>> pendingPackets = new ConcurrentHashMap<>();
     private final Map<String, PeerCandidate> serverReflexiveCandidates = new ConcurrentHashMap<>();
     private final Map<String, PendingStunBinding> pendingStunBindings = new ConcurrentHashMap<>();
+    private final Map<String, PendingTurnRequest> pendingTurnRequests = new ConcurrentHashMap<>();
     private final Map<String, Long> turnPermissions = new ConcurrentHashMap<>();
     private final Map<String, PendingAppMessageAck> pendingMessageAcks = new ConcurrentHashMap<>();
     private volatile TunnelCore.PeerMeshConfig config;
@@ -106,6 +108,9 @@ final class PeerMeshEngine implements Closeable {
             stop();
             return;
         }
+        pendingTurnRequests.clear();
+        nextConfig.peerRoutes = TunnelCore.PeerMeshConfig.normalizePeerRoutes(
+                onlinePeerVirtualIps(), nextConfig.virtualIp);
         config = nextConfig;
         enabled.set(true);
         startUdpSocket();
@@ -243,9 +248,32 @@ final class PeerMeshEngine implements Closeable {
                 mergePeer(peer, null);
             }
         }
+        refreshVpnRoutes();
         announceCandidatesToOnlinePeers();
         refreshSessionKeys();
         publish("Peer roster", peers.size() + " peer(s)");
+    }
+
+    private List<String> onlinePeerVirtualIps() {
+        List<String> routes = new ArrayList<>();
+        for (PeerInfo peer : peers.values()) {
+            if (peer != null && peer.online && !isBlank(peer.virtualIp)) {
+                routes.add(peer.virtualIp);
+            }
+        }
+        return routes;
+    }
+
+    private void refreshVpnRoutes() throws Exception {
+        TunnelCore.PeerMeshConfig current = config;
+        if (current == null) {
+            return;
+        }
+        current.peerRoutes = TunnelCore.PeerMeshConfig.normalizePeerRoutes(
+                onlinePeerVirtualIps(), current.virtualIp);
+        if (vpnPlatform != null && current.enabled) {
+            vpnPlatform.startVpn(current, this::sendVirtualPacket);
+        }
     }
 
     private void sendVirtualPacket(byte[] ipv4Packet) {
@@ -285,11 +313,7 @@ final class PeerMeshEngine implements Closeable {
                     payload);
             String relayTarget = relayFallbackTarget(peer, session);
             if (!isBlank(relayTarget)) {
-                boolean sent = sendRelayPayload(relayTarget, frame);
-                if (sent) {
-                    session.addRelayBytes(frame.length);
-                }
-                return sent;
+                return sendRelayPayload(relayTarget, frame);
             }
             InetSocketAddress remote = session.remoteEndpoint;
             socket.send(new DatagramPacket(frame, frame.length, remote));
@@ -336,6 +360,7 @@ final class PeerMeshEngine implements Closeable {
                 }
                 reportTrafficDeltas();
                 removeExpiredSessions();
+                removeExpiredTurnRequests();
                 requestPeerServerCandidates();
                 announceCandidatesToOnlinePeers();
                 keepaliveActivePaths();
@@ -394,6 +419,10 @@ final class PeerMeshEngine implements Closeable {
     }
 
     private void handleStunTurnMessage(StunMessage message, InetSocketAddress remote) throws Exception {
+        PendingTurnRequest pendingTurn = pendingTurnRequests.remove(message.transactionIdHex());
+        if (pendingTurn != null && !sameEndpoint(pendingTurn.endpoint, remote)) {
+            pendingTurn = null;
+        }
         switch (message.type) {
             case StunMessage.BINDING_SUCCESS:
                 handleStunBindingSuccess(message);
@@ -405,6 +434,17 @@ final class PeerMeshEngine implements Closeable {
                 relayAllocationExpiresAtMillis = System.currentTimeMillis()
                         + Math.max(30L, message.lifetimeSeconds(300L)) * 1000L;
                 break;
+            case StunMessage.CREATE_PERMISSION_SUCCESS:
+                if (pendingTurn != null && pendingTurn.peer != null) {
+                    turnPermissions.put(endpointKey(pendingTurn.peer),
+                            System.currentTimeMillis() + TURN_PERMISSION_TTL_MS);
+                }
+                break;
+            case StunMessage.ALLOCATE_ERROR:
+            case StunMessage.REFRESH_ERROR:
+            case StunMessage.CREATE_PERMISSION_ERROR:
+                handleTurnError(message, pendingTurn);
+                break;
             case StunMessage.DATA_INDICATION:
                 InetSocketAddress peer = message.xorPeerAddress();
                 byte[] inner = message.data();
@@ -414,6 +454,31 @@ final class PeerMeshEngine implements Closeable {
                 break;
             default:
                 break;
+        }
+    }
+
+    private void handleTurnError(StunMessage message, PendingTurnRequest pending) {
+        TurnChallenge challenge = TurnChallenge.from(message);
+        if (pending == null || challenge == null) {
+            return;
+        }
+        PendingTurnRequest retry = pending.retryOnce();
+        TunnelCore.PeerMeshConfig current = config;
+        if (!challenge.retryable()
+                || retry == null
+                || current == null
+                || !challenge.applyTo(current)) {
+            clearFailedTurnPermission(pending);
+            publish("Peer TURN rejected", challenge.code + " " + challenge.reason);
+            return;
+        }
+        publish("Peer TURN challenge", challenge.code + " retrying " + pending.operation.name().toLowerCase(Locale.ROOT));
+        sendTurnRequest(retry);
+    }
+
+    private void clearFailedTurnPermission(PendingTurnRequest pending) {
+        if (pending != null && pending.peer != null) {
+            turnPermissions.remove(endpointKey(pending.peer));
         }
     }
 
@@ -873,16 +938,10 @@ final class PeerMeshEngine implements Closeable {
         }
         sendStunBinding(turn, false);
         if (relayAllocationId != null && relayAllocationExpiresAtMillis - now > RELAY_REFRESH_WINDOW_MS) {
-            sendStunRequest(StunMessage.of(
-                    StunMessage.REFRESH_REQUEST,
-                    StunMessage.newTransactionId(),
-                    authenticatedTurnAttributes(StunMessage.lifetime(Math.max(30L, config.sessionTtlSeconds)))), turn);
+            sendTurnRequest(PendingTurnRequest.refresh(Math.max(30L, config.sessionTtlSeconds)));
             return;
         }
-        sendStunRequest(StunMessage.of(
-                StunMessage.ALLOCATE_REQUEST,
-                StunMessage.newTransactionId(),
-                authenticatedTurnAttributes(StunMessage.requestedUdpTransportAttribute())), turn);
+        sendTurnRequest(PendingTurnRequest.allocate());
     }
 
     private void sendStunBinding(InetSocketAddress endpoint, boolean publicStun) {
@@ -894,19 +953,46 @@ final class PeerMeshEngine implements Closeable {
                 StunMessage.software("shuai-tunnel-android")), endpoint);
     }
 
-    private void sendStunRequest(StunMessage message, InetSocketAddress endpoint) {
+    private boolean sendStunRequest(StunMessage message, InetSocketAddress endpoint) {
         DatagramSocket socket = udpSocket;
         if (socket == null || socket.isClosed() || endpoint == null) {
-            return;
+            return false;
         }
         try {
             byte[] bytes = message.hasAttribute(StunMessage.ATTR_USERNAME)
                     ? message.toBytes(turnMessageIntegrityKey())
                     : message.toBytes();
             socket.send(new DatagramPacket(bytes, bytes.length, endpoint));
+            return true;
         } catch (Exception e) {
             publish("Peer STUN failed", e.getMessage());
+            return false;
         }
+    }
+
+    private void sendTurnRequest(PendingTurnRequest pending) {
+        InetSocketAddress turn = relayEndpoint();
+        if (pending == null || turn == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        removeExpiredTurnRequests();
+        byte[] transactionId = StunMessage.newTransactionId();
+        StunMessage message = StunMessage.of(
+                pending.operation.requestType,
+                transactionId,
+                authenticatedTurnAttributes(pending.operationAttributes(transactionId)));
+        PendingTurnRequest tracked = pending.withEndpointAndCreatedAt(turn, now);
+        pendingTurnRequests.put(message.transactionIdHex(), tracked);
+        if (!sendStunRequest(message, turn)) {
+            pendingTurnRequests.remove(message.transactionIdHex(), tracked);
+        }
+    }
+
+    private void removeExpiredTurnRequests() {
+        long now = System.currentTimeMillis();
+        pendingTurnRequests.entrySet().removeIf(
+                entry -> now - entry.getValue().createdAtMillis > TURN_REQUEST_TTL_MS);
     }
 
     private StunMessage.Attribute[] authenticatedTurnAttributes(StunMessage.Attribute... attributes) {
@@ -954,19 +1040,8 @@ final class PeerMeshEngine implements Closeable {
             next.aesKey = deriveSessionKey(next, peer.publicKey);
         }
         if (previous != null) {
-            next.remoteEndpoint = previous.remoteEndpoint;
-            next.relayTargetAllocationId = previous.relayTargetAllocationId;
-            next.pathReady = previous.pathReady;
-            next.sequence.set(previous.sequence.get());
-            next.directBytesSinceReport.addAndGet(previous.drainDirectBytes());
-            next.relayBytesSinceReport.addAndGet(previous.drainRelayBytes());
-            next.lastDirectSuccessMillis = previous.lastDirectSuccessMillis;
-            next.lastRelaySuccessMillis = previous.lastRelaySuccessMillis;
-            next.lastPathReportMillis = previous.lastPathReportMillis;
-            next.lastPathRemoteText = previous.lastPathRemoteText;
-            next.currentPathType = previous.currentPathType;
-            next.bestDirectRtt = previous.bestDirectRtt;
-            next.bestRelayRtt = previous.bestRelayRtt;
+            next.inheritTransportState(previous);
+            sessionsById.remove(previous.sessionId, previous);
         }
         sessions.put(peerId, next);
         sessionsById.put(sessionId, next);
@@ -1259,11 +1334,7 @@ final class PeerMeshEngine implements Closeable {
         if (expiresAt != null && expiresAt - now > 30_000L) {
             return;
         }
-        byte[] transactionId = StunMessage.newTransactionId();
-        sendStunRequest(StunMessage.of(
-                StunMessage.CREATE_PERMISSION_REQUEST,
-                transactionId,
-                authenticatedTurnAttributes(StunMessage.xorPeerAddress(peer, transactionId))), turn);
+        sendTurnRequest(PendingTurnRequest.createPermission(peer));
         turnPermissions.put(key, now + TURN_PERMISSION_TTL_MS);
     }
 
@@ -1335,6 +1406,16 @@ final class PeerMeshEngine implements Closeable {
         return host + ":" + endpoint.getPort();
     }
 
+    static boolean sameEndpoint(InetSocketAddress expected, InetSocketAddress actual) {
+        if (expected == null || actual == null || expected.getPort() != actual.getPort()) {
+            return false;
+        }
+        if (expected.getAddress() != null && actual.getAddress() != null) {
+            return expected.getAddress().equals(actual.getAddress());
+        }
+        return expected.getHostString().equalsIgnoreCase(actual.getHostString());
+    }
+
     private String candidateEndpointKey(PeerCandidate candidate) {
         if (candidate == null) {
             return "";
@@ -1370,18 +1451,15 @@ final class PeerMeshEngine implements Closeable {
         }
         for (PeerSession session : sessions.values()) {
             long directBytes = session.drainDirectBytes();
-            long relayBytes = session.drainRelayBytes();
-            if (directBytes <= 0 && relayBytes <= 0) {
+            if (directBytes <= 0) {
                 continue;
             }
             try {
                 JSONObject report = basePeerReport("traffic-report", session);
                 report.put("directBytes", directBytes);
-                report.put("relayBytes", relayBytes);
                 controlSender.send("", report.toString());
             } catch (Exception e) {
                 session.addDirectBytes(directBytes);
-                session.addRelayBytes(relayBytes);
                 publish("Peer traffic report failed", e.getMessage());
             }
         }
@@ -1539,6 +1617,7 @@ final class PeerMeshEngine implements Closeable {
         pendingMessageAcks.clear();
         serverReflexiveCandidates.clear();
         pendingStunBindings.clear();
+        pendingTurnRequests.clear();
         turnPermissions.clear();
         relayCandidate = null;
         relayAllocationId = null;
@@ -1685,7 +1764,7 @@ final class PeerMeshEngine implements Closeable {
         String relayId;
     }
 
-    private static final class PeerSession {
+    static final class PeerSession {
         final long peerId;
         final long sessionId;
         final String token;
@@ -1693,8 +1772,7 @@ final class PeerMeshEngine implements Closeable {
         final long createdAtMillis = System.currentTimeMillis();
         final AtomicLong sequence = new AtomicLong();
         final AtomicLong directBytesSinceReport = new AtomicLong();
-        final AtomicLong relayBytesSinceReport = new AtomicLong();
-        final ReplayWindow replay = new ReplayWindow();
+        volatile ReplayWindow replay = new ReplayWindow();
         volatile byte[] aesKey;
         volatile InetSocketAddress remoteEndpoint;
         volatile String relayTargetAllocationId = "";
@@ -1712,6 +1790,27 @@ final class PeerMeshEngine implements Closeable {
             this.sessionId = sessionId;
             this.token = token;
             this.expiresAt = expiresAt;
+        }
+
+        void inheritTransportState(PeerSession previous) {
+            if (previous == null) {
+                return;
+            }
+            if (previous.sessionId == sessionId) {
+                sequence.set(previous.sequence.get());
+                replay = previous.replay.copy();
+            }
+            remoteEndpoint = previous.remoteEndpoint;
+            relayTargetAllocationId = previous.relayTargetAllocationId;
+            pathReady = previous.pathReady;
+            directBytesSinceReport.addAndGet(previous.drainDirectBytes());
+            lastDirectSuccessMillis = previous.lastDirectSuccessMillis;
+            lastRelaySuccessMillis = previous.lastRelaySuccessMillis;
+            lastPathReportMillis = previous.lastPathReportMillis;
+            lastPathRemoteText = previous.lastPathRemoteText;
+            currentPathType = previous.currentPathType;
+            bestDirectRtt = previous.bestDirectRtt;
+            bestRelayRtt = previous.bestRelayRtt;
         }
 
         long nextSequence() {
@@ -1759,18 +1858,8 @@ final class PeerMeshEngine implements Closeable {
             }
         }
 
-        void addRelayBytes(long bytes) {
-            if (bytes > 0) {
-                relayBytesSinceReport.addAndGet(bytes);
-            }
-        }
-
         long drainDirectBytes() {
             return directBytesSinceReport.getAndSet(0L);
-        }
-
-        long drainRelayBytes() {
-            return relayBytesSinceReport.getAndSet(0L);
         }
 
         boolean accept(long inboundSequence) {
@@ -1794,6 +1883,120 @@ final class PeerMeshEngine implements Closeable {
 
         PendingStunBinding(boolean publicStun) {
             this.publicStun = publicStun;
+        }
+    }
+
+    enum TurnOperation {
+        ALLOCATE(StunMessage.ALLOCATE_REQUEST),
+        REFRESH(StunMessage.REFRESH_REQUEST),
+        CREATE_PERMISSION(StunMessage.CREATE_PERMISSION_REQUEST);
+
+        final int requestType;
+
+        TurnOperation(int requestType) {
+            this.requestType = requestType;
+        }
+    }
+
+    static final class PendingTurnRequest {
+        final TurnOperation operation;
+        final long lifetimeSeconds;
+        final InetSocketAddress peer;
+        final InetSocketAddress endpoint;
+        final boolean retried;
+        final long createdAtMillis;
+
+        private PendingTurnRequest(TurnOperation operation, long lifetimeSeconds,
+                                   InetSocketAddress peer, InetSocketAddress endpoint,
+                                   boolean retried, long createdAtMillis) {
+            this.operation = operation;
+            this.lifetimeSeconds = lifetimeSeconds;
+            this.peer = peer;
+            this.endpoint = endpoint;
+            this.retried = retried;
+            this.createdAtMillis = createdAtMillis;
+        }
+
+        static PendingTurnRequest allocate() {
+            return new PendingTurnRequest(TurnOperation.ALLOCATE, 0L, null, null, false, 0L);
+        }
+
+        static PendingTurnRequest refresh(long lifetimeSeconds) {
+            return new PendingTurnRequest(TurnOperation.REFRESH, lifetimeSeconds, null, null, false, 0L);
+        }
+
+        static PendingTurnRequest createPermission(InetSocketAddress peer) {
+            return new PendingTurnRequest(TurnOperation.CREATE_PERMISSION, 0L, peer, null, false, 0L);
+        }
+
+        PendingTurnRequest retryOnce() {
+            if (retried) {
+                return null;
+            }
+            return new PendingTurnRequest(operation, lifetimeSeconds, peer, endpoint, true, 0L);
+        }
+
+        PendingTurnRequest withEndpointAndCreatedAt(InetSocketAddress endpoint, long createdAtMillis) {
+            return new PendingTurnRequest(operation, lifetimeSeconds, peer, endpoint, retried, createdAtMillis);
+        }
+
+        StunMessage.Attribute[] operationAttributes(byte[] transactionId) {
+            switch (operation) {
+                case ALLOCATE:
+                    return new StunMessage.Attribute[]{StunMessage.requestedUdpTransportAttribute()};
+                case REFRESH:
+                    return new StunMessage.Attribute[]{StunMessage.lifetime(lifetimeSeconds)};
+                case CREATE_PERMISSION:
+                    return new StunMessage.Attribute[]{StunMessage.xorPeerAddress(peer, transactionId)};
+                default:
+                    throw new IllegalStateException("unsupported TURN operation");
+            }
+        }
+    }
+
+    static final class TurnChallenge {
+        final int code;
+        final String reason;
+        final String realm;
+        final String nonce;
+
+        private TurnChallenge(int code, String reason, String realm, String nonce) {
+            this.code = code;
+            this.reason = reason;
+            this.realm = realm;
+            this.nonce = nonce;
+        }
+
+        static TurnChallenge from(StunMessage message) {
+            if (message == null) {
+                return null;
+            }
+            int code = message.errorCode();
+            if (code <= 0) {
+                return null;
+            }
+            return new TurnChallenge(
+                    code,
+                    message.errorReason(),
+                    message.textAttribute(StunMessage.ATTR_REALM),
+                    message.textAttribute(StunMessage.ATTR_NONCE));
+        }
+
+        boolean retryable() {
+            return code == 401 || code == 438;
+        }
+
+        boolean applyTo(TunnelCore.PeerMeshConfig config) {
+            if (!retryable() || config == null || isBlank(nonce)) {
+                return false;
+            }
+            if (!isBlank(realm)) {
+                config.iceRealm = realm;
+            }
+            config.iceNonce = nonce;
+            return !isBlank(config.iceUsername)
+                    && !isBlank(config.iceCredential)
+                    && !isBlank(config.iceRealm);
         }
     }
 
@@ -1822,7 +2025,7 @@ final class PeerMeshEngine implements Closeable {
         volatile boolean delivered;
     }
 
-    private static final class StunMessage {
+    static final class StunMessage {
         static final int MAGIC_COOKIE = 0x2112A442;
         static final int HEADER_BYTES = 20;
         static final int TRANSACTION_ID_BYTES = 12;
@@ -1830,13 +2033,18 @@ final class PeerMeshEngine implements Closeable {
         static final int BINDING_SUCCESS = 0x0101;
         static final int ALLOCATE_REQUEST = 0x0003;
         static final int ALLOCATE_SUCCESS = 0x0103;
+        static final int ALLOCATE_ERROR = 0x0113;
         static final int REFRESH_REQUEST = 0x0004;
         static final int REFRESH_SUCCESS = 0x0104;
+        static final int REFRESH_ERROR = 0x0114;
         static final int CREATE_PERMISSION_REQUEST = 0x0008;
+        static final int CREATE_PERMISSION_SUCCESS = 0x0108;
+        static final int CREATE_PERMISSION_ERROR = 0x0118;
         static final int SEND_INDICATION = 0x0016;
         static final int DATA_INDICATION = 0x0017;
         static final int ATTR_USERNAME = 0x0006;
         static final int ATTR_MESSAGE_INTEGRITY = 0x0008;
+        static final int ATTR_ERROR_CODE = 0x0009;
         static final int ATTR_LIFETIME = 0x000D;
         static final int ATTR_XOR_PEER_ADDRESS = 0x0012;
         static final int ATTR_DATA = 0x0013;
@@ -1987,6 +2195,27 @@ final class PeerMeshEngine implements Closeable {
             return Integer.toUnsignedLong(ByteBuffer.wrap(attribute.value).getInt());
         }
 
+        int errorCode() {
+            Attribute attribute = first(ATTR_ERROR_CODE);
+            if (attribute == null || attribute.value.length < 4) {
+                return 0;
+            }
+            return (attribute.value[2] & 0x07) * 100 + (attribute.value[3] & 0xFF);
+        }
+
+        String errorReason() {
+            Attribute attribute = first(ATTR_ERROR_CODE);
+            if (attribute == null || attribute.value.length <= 4) {
+                return "";
+            }
+            return new String(attribute.value, 4, attribute.value.length - 4, StandardCharsets.UTF_8);
+        }
+
+        String textAttribute(int type) {
+            Attribute attribute = first(type);
+            return attribute == null ? "" : new String(attribute.value, StandardCharsets.UTF_8);
+        }
+
         private Attribute first(int type) {
             for (Attribute attribute : attributes) {
                 if (attribute.type == type) {
@@ -2068,6 +2297,16 @@ final class PeerMeshEngine implements Closeable {
             return new Attribute(ATTR_NONCE, (value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
         }
 
+        static Attribute errorCode(int code, String reason) {
+            byte[] reasonBytes = (reason == null ? "" : reason).getBytes(StandardCharsets.UTF_8);
+            ByteBuffer buffer = ByteBuffer.allocate(4 + reasonBytes.length);
+            buffer.putShort((short) 0);
+            buffer.put((byte) ((code / 100) & 0x07));
+            buffer.put((byte) (code % 100));
+            buffer.put(reasonBytes);
+            return new Attribute(ATTR_ERROR_CODE, buffer.array());
+        }
+
         private static byte[] encodeXorAddress(InetSocketAddress address, byte[] transactionId) {
             if (address == null || address.getAddress() == null) {
                 throw new IllegalArgumentException("address is required");
@@ -2117,7 +2356,7 @@ final class PeerMeshEngine implements Closeable {
             return (4 - (length % 4)) % 4;
         }
 
-        private static final class Attribute {
+        static final class Attribute {
             final int type;
             final byte[] value;
 
@@ -2128,7 +2367,7 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
-    private static final class DataFrame {
+    static final class DataFrame {
         final long sessionId;
         final long fromClientId;
         final long toClientId;
@@ -2144,7 +2383,7 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
-    private static final class DataFrameCodec {
+    static final class DataFrameCodec {
         private static final int MAGIC = 0x53504D31;
         private static final byte VERSION = 1;
         private static final byte TYPE_DATA = 1;
@@ -2192,7 +2431,7 @@ final class PeerMeshEngine implements Closeable {
                     return null;
                 }
                 int ciphertextLength = buffer.getInt();
-                if (ciphertextLength < 0 || ciphertextLength > buffer.remaining()) {
+                if (ciphertextLength < 0 || ciphertextLength != buffer.remaining()) {
                     return null;
                 }
                 byte[] ciphertext = new byte[ciphertextLength];
@@ -2235,7 +2474,7 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
-    private static final class ReplayWindow {
+    static final class ReplayWindow {
         private long highest;
         private long bitmap;
 
@@ -2259,6 +2498,13 @@ final class PeerMeshEngine implements Closeable {
             }
             bitmap |= mask;
             return true;
+        }
+
+        synchronized ReplayWindow copy() {
+            ReplayWindow copy = new ReplayWindow();
+            copy.highest = highest;
+            copy.bitmap = bitmap;
+            return copy;
         }
     }
 

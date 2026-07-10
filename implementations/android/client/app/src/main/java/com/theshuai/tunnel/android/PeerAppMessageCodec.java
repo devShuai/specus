@@ -52,6 +52,13 @@ final class PeerAppMessageCodec {
     }
 
     static byte[] encode(PeerAppMessage message) throws Exception {
+        // Java and Go currently recognize STMSG1 only. Keep every ordinary text
+        // message and ACK on that interoperable envelope. STMSG2 is reserved for
+        // the optional attachment extension, which Android does not advertise or
+        // expose through its send path yet.
+        boolean attachmentV2 = message != null
+                && TYPE_MESSAGE.equalsIgnoreCase(text(message.type))
+                && message.attachment != null;
         JSONObject json = new JSONObject();
         json.put("type", text(message == null ? null : message.type));
         json.put("id", text(message == null ? null : message.id));
@@ -60,14 +67,15 @@ final class PeerAppMessageCodec {
         json.put("toClientId", message == null ? 0L : message.toClientId);
         json.put("toClientName", text(message == null ? null : message.toClientName));
         json.put("message", text(message == null ? null : message.message));
-        if (message != null && message.attachment != null) {
+        if (attachmentV2) {
             json.put("attachment", message.attachment);
         }
         json.put("createdAtMillis", message == null ? 0L : message.createdAtMillis);
         byte[] body = json.toString().getBytes(StandardCharsets.UTF_8);
-        byte[] payload = new byte[PREFIX_V2.length + body.length];
-        System.arraycopy(PREFIX_V2, 0, payload, 0, PREFIX_V2.length);
-        System.arraycopy(body, 0, payload, PREFIX_V2.length, body.length);
+        byte[] prefix = attachmentV2 ? PREFIX_V2 : PREFIX_V1;
+        byte[] payload = new byte[prefix.length + body.length];
+        System.arraycopy(prefix, 0, payload, 0, prefix.length);
+        System.arraycopy(body, 0, payload, prefix.length, body.length);
         return payload;
     }
 
@@ -78,13 +86,18 @@ final class PeerAppMessageCodec {
         if (message.attachment == null) {
             return text(message.message);
         }
-        String fileName = message.attachment.optString("fileName",
-                text(message.attachment.optString("objectId", "attachment")));
-        String mimeType = message.attachment.optString("mimeType", "application/octet-stream");
+        String fileName = firstNonBlank(
+                message.attachment.optString("fileName", ""),
+                message.attachment.optString("objectId", ""),
+                "attachment");
+        String mimeType = firstNonBlank(
+                message.attachment.optString("mimeType", ""),
+                "application/octet-stream");
         long size = message.attachment.optLong("sizeBytes", 0L);
         String prefix = text(message.message).trim();
         return (prefix.isEmpty() ? "" : prefix + " ")
-                + "[附件] " + fileName + " · " + mimeType + " · " + formatBytes(size);
+                + "[附件] " + fileName + " · " + mimeType + " · "
+                + (size > 0L ? formatBytes(size) : "-");
     }
 
     private static int prefixLength(byte[] payload) {
@@ -95,6 +108,17 @@ final class PeerAppMessageCodec {
 
     private static String text(String value) {
         return value == null ? "" : value;
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values != null) {
+            for (String value : values) {
+                if (value != null && !value.trim().isEmpty()) {
+                    return value.trim();
+                }
+            }
+        }
+        return "";
     }
 
     private static String formatBytes(long bytes) {

@@ -19,3 +19,11 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 }
+
+dependencies {
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+    testImplementation "junit:junit:4.13.2"
+    // Android's org.json classes are stubs in local JVM tests. Use the matching
+    // standalone implementation so protocol JSON is exercised for real.
+    testImplementation "org.json:json:20250517"
+}

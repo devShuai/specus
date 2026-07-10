@@ -16,6 +16,7 @@ import java.io.FileOutputStream;
 import java.net.DatagramSocket;
 import java.net.Socket;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -173,19 +174,26 @@ public class TunnelForegroundService extends VpnService implements TunnelCore.Vp
             stopVpn();
             return;
         }
-        vpnPacketHandler = packetHandler;
-        String key = config.virtualIp + "|" + config.cidr + "|" + config.mtu;
+        Cidr.parse(config.cidr); // Validate the advertised mesh network.
+        List<String> peerRoutes = TunnelCore.PeerMeshConfig.normalizePeerRoutes(
+                config.peerRoutes, config.virtualIp);
+        int mtu = TunnelCore.PeerMeshConfig.normalizeMtu(config.mtu);
+        String key = config.virtualIp + "|" + config.cidr + "|" + mtu
+                + "|" + String.join(",", peerRoutes);
         if (vpnRunning && key.equals(vpnKey)) {
+            vpnPacketHandler = packetHandler;
             return;
         }
         stopVpn();
+        vpnPacketHandler = packetHandler;
 
-        Cidr cidr = Cidr.parse(config.cidr);
         Builder builder = new Builder()
                 .setSession("shuai-tunnel")
-                .setMtu(config.mtu <= 0 ? 1280 : config.mtu)
-                .addAddress(config.virtualIp, cidr.prefix)
-                .addRoute(cidr.address, cidr.prefix);
+                .setMtu(mtu)
+                .addAddress(config.virtualIp, 32);
+        for (String peerRoute : peerRoutes) {
+            builder.addRoute(peerRoute, 32);
+        }
         try {
             builder.addDisallowedApplication(getPackageName());
         } catch (PackageManager.NameNotFoundException ignored) {
@@ -197,10 +205,10 @@ public class TunnelForegroundService extends VpnService implements TunnelCore.Vp
         vpnOutput = new FileOutputStream(vpnInterface.getFileDescriptor());
         vpnRunning = true;
         vpnKey = key;
-        publish("VPN active", config.virtualIp + " " + config.cidr, true);
+        publish("VPN active", config.virtualIp + "/32 peers=" + peerRoutes.size(), true);
 
         ParcelFileDescriptor active = vpnInterface;
-        vpnExecutor.submit(() -> readVpnLoop(active, packetHandler));
+        vpnExecutor.submit(() -> readVpnLoop(active));
     }
 
     @Override
@@ -233,7 +241,7 @@ public class TunnelForegroundService extends VpnService implements TunnelCore.Vp
         }
     }
 
-    private void readVpnLoop(ParcelFileDescriptor descriptor, TunnelCore.VpnPacketHandler packetHandler) {
+    private void readVpnLoop(ParcelFileDescriptor descriptor) {
         byte[] buffer = new byte[64 * 1024];
         try (FileInputStream in = new FileInputStream(descriptor.getFileDescriptor())) {
             while (vpnRunning && descriptor == vpnInterface) {
