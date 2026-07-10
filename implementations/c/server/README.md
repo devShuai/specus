@@ -8,11 +8,12 @@ This version implements the Java-compatible core server path:
 
 - TCP listener on `TUNNEL_NETTY_PORT` (default `7010`)
 - Java wire frame header (`0x14353565`, version `1`, compact-binary serializer `4`)
-- compact-binary subset for `LoginRequest`, `LoginResponse`, `MessageResponse`, and heartbeat packets
+- compact-binary subset for `LoginRequest`, `LoginResponse`, `MessageResponse`, heartbeat, and `DirectHttpRequest/Response` packets
 - control-channel token verification compatible with the current Java client runtime login packet
 - a Java-compatible `/api/client/auth/login` endpoint: SQLite credential login writes `tunnel_client_session`, returns a runtime `cs_` access token, and falls back to the older environment-token smoke-test mode when no matching DB credential exists
 - a lightweight management HTTP skeleton with Java-shaped `/auth/login`, `/oidc-config`, HTTP-only `/oidc/token` exchange, `/api/admin/me`, database initialization, management user CRUD, `/api/admin/overview`, client CRUD, TCP mapping CRUD, connection record pagination, traffic summaries, SQLite HTTP/TCP traffic detail queries, and Peer Mesh management contract responses
 - Java-shaped client package download metadata: public enabled-list endpoint plus admin-only CRUD backed by SQLite
+- Java-shaped public ICE discovery at `/api/public/peer-mesh/stun-config` and `/api/public/transfer/ice-config`, including time-limited HMAC-SHA1 TURN credentials for an explicitly configured external STUN/TURN service
 - a Direct HTTP bridge for `/http/{clientName}/{route}/...` on the management listener, forwarding ordinary HTTP requests with `DIRECT_HTTP_REQUEST/RESPONSE` and WebSocket upgrades with Java-compatible `source=ws` NAT frames
 - `NAT_CONTROL` push after login
 - TCP tunnel `REGISTER`, `CONNECTED`, `DATA`, `DISCONNECTED`, and `UNREGISTER` flow
@@ -31,7 +32,7 @@ The older environment-token mode remains available for local smoke tests.
 make -C implementations/c/server test
 ```
 
-The C build uses pthreads and zlib.
+The C build uses pthreads, zlib, and SQLite3.
 
 ## Run
 
@@ -79,7 +80,13 @@ Additional runtime knobs:
 | `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | Password-login visibility flag returned by the Java-shaped `/oidc-config` response. |
 | `TUNNEL_AUTH_JWT_SECRET` | unset | Optional HS256 signing secret for local management Bearer JWTs; when unset the C process uses an ephemeral in-memory key and old tokens fail after restart. |
 | `TUNNEL_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management Bearer JWT lifetime; values below 60 seconds are normalized to 60. |
-| `TUNNEL_PEER_MESH_ENABLED` | `false` | Java-shaped `enabled` flag returned by the C Peer Mesh status endpoint. It does not enable a C Peer Mesh data plane. |
+| `TUNNEL_PEER_MESH_ENABLED` | `false` | Java-shaped `enabled` flag returned by the Peer Mesh status and public discovery endpoints. It does not enable a C Peer Mesh data plane. |
+| `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | unset | Explicit host of an externally deployed STUN/TURN service. C never derives this from the HTTP host because it has no built-in UDP Peer Mesh listener. |
+| `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | Port published in self-hosted/external STUN and TURN URLs. |
+| `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | unset | Optional comma-separated public STUN URLs appended to the discovery response; missing ports default to `3478` and duplicates are removed. |
+| `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | Authentication flag returned by the public ICE response. |
+| `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` | unset | Shared secret used for temporary TURN HMAC-SHA1 credentials. When auth is required, C omits the TURN URL until this is explicitly set so it cannot advertise unusable credentials. |
+| `TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | Temporary public-transfer TURN credential lifetime, clamped to at least 60 seconds. |
 | `TUNNEL_OIDC_CLIENT_ID` | unset | OIDC browser client id returned by `/oidc-config`; a non-empty value marks OIDC as configured. |
 | `TUNNEL_OIDC_AUTHORIZATION_ENDPOINT` | unset | OIDC authorization endpoint returned by `/oidc-config`. |
 | `TUNNEL_OIDC_TOKEN_ENDPOINT` | unset | HTTP token endpoint used by the C `/oidc/token` proxy. `https://` endpoints currently return `502` because the C server has no TLS HTTP client. |
@@ -143,6 +150,8 @@ TCP mapping endpoints `GET /api/admin/tunnels`, `POST /api/admin/clients/{id}/tu
 `GET /api/admin/traffic/resources?type=&clientId=&limit=`,
 `GET /api/admin/traffic/http-exchanges`, `GET /api/admin/traffic/tcp-frames`,
 `GET /api/admin/traffic/tcp-frames/{id}`, `GET /api/admin/traffic/tcp-streams`,
+public ICE discovery endpoints `GET /api/public/peer-mesh/stun-config` and
+`GET /api/public/transfer/ice-config`,
 and Peer Mesh management endpoints:
 `GET /api/admin/peer-mesh/status`, `GET /api/admin/peer-mesh/devices`,
 `GET/POST /api/admin/peer-mesh/acls`, `DELETE /api/admin/peer-mesh/acls/{id}`,
@@ -153,9 +162,12 @@ SQLite client and returns Java-shaped disabled/offline device views, so the mana
 which clients would participate once the C data plane exists. `PUT /api/admin/peer-mesh/devices/{clientId}`
 persists the device `enabled` flag after applying the same tenant/owner visibility rule as clients;
 the returned `virtualDeviceStatus` remains `UNSUPPORTED` because C still has no Peer Mesh data plane.
-SQLite mode supports Java-shaped ACL list/create/delete with the same basic tenant/owner rules as
-clients: source must be visible to the caller, target must be in the same tenant, and non-admin users
-cannot create cross-user ACLs. SQLite mode also creates `peer_mesh_session` and supports
+SQLite mode supports Java-shaped ACL list/create/delete, including `OUTBOUND` / `INBOUND` / `BOTH`
+direction persistence. A new ACL without `direction` defaults to `OUTBOUND`; updating an existing ACL
+without `direction` preserves its current value. Tenant and owner authorization comparisons are
+case-sensitive, matching Java: the source must be visible to the caller, the target must be in the
+same tenant, and non-admin users cannot create cross-user ACLs. SQLite mode also creates
+`peer_mesh_session` and supports
 `GET /api/admin/peer-mesh/sessions?limit=`, `DELETE /api/admin/peer-mesh/sessions/{id}`, and
 `DELETE /api/admin/peer-mesh/sessions` against persisted rows with the same tenant/owner visibility
 rule as Java. The C data plane still does not create real peer sessions by itself; the endpoint support
@@ -163,6 +175,18 @@ only keeps the management contract and schema aligned. Other unsupported Peer Me
 return `501`.
 `GET /api/admin/peer-mesh/status` only mirrors the Java-shaped `enabled` flag from
 `TUNNEL_PEER_MESH_ENABLED`; it does not imply that the C Peer Mesh data plane is implemented.
+The public discovery endpoints likewise publish a self-hosted-looking STUN/TURN URL only when
+`TUNNEL_PEER_MESH_PUBLIC_ADDRESS` explicitly identifies an external compatible service. The C
+process itself does not bind a STUN/TURN UDP port, perform hole punching, or relay peer traffic.
+Startup login persists the wire-level `clientMessageCapabilities` on each SQLite session. Because
+the lightweight C management views currently report these clients/devices as offline, their public
+capability fields are zeroed just like Java's offline views; persistence is not a claim that C
+implements the live peer roster or message transport.
+The exact Java attachment paths—public/admin `presign-upload`, `/{attachmentId}/complete`, and
+`/{attachmentId}/presign-download` under `/api/public/transfer/attachments` or
+`/api/admin/client-messages/attachments`—return Java-compatible `409 Conflict` with
+`object storage is not configured` / `OBJECT_STORAGE_DISABLED`. The C
+server has no object-storage abstraction, so these routes never return successful placeholder URLs.
 The management auth login endpoint validates the built-in admin password from
 `TUNNEL_AUTH_USERNAME` / `TUNNEL_AUTH_PASSWORD`; when `TUNNEL_DATABASE_PATH` is configured, it also
 validates enabled rows in `tunnel_management_user` using the Java-compatible SHA-256 password hash.

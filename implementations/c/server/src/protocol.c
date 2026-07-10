@@ -437,10 +437,11 @@ static int writer_string_list(compact_writer *writer, char **values, size_t len)
 static st_buffer encode_raw_frame(uint8_t serializer, int8_t command, const uint8_t *body, size_t body_len)
 {
     st_buffer buffer = {0};
-    size_t frame_len = ST_HEADER_SIZE + body_len;
-    if (body_len > UINT32_MAX) {
+    /* Java's Netty maxFrameLength covers the complete 11-byte header + body. */
+    if (body_len > ST_MAX_BODY_SIZE) {
         return buffer;
     }
+    size_t frame_len = ST_HEADER_SIZE + body_len;
     buffer.data = (uint8_t *)malloc(frame_len);
     if (buffer.data == NULL) {
         return buffer;
@@ -559,13 +560,19 @@ static int decode_compact_payload(const uint8_t *payload, size_t payload_len, ui
     int status;
     do {
         if (stream.total_out == cap) {
-            if (cap == ST_MAX_INFLATED_SIZE) {
+            if (cap > ST_MAX_INFLATED_SIZE) {
                 free(buffer);
                 inflateEnd(&stream);
                 return -1;
             }
-            size_t next = cap * 2U;
-            if (next > ST_MAX_INFLATED_SIZE) {
+            /*
+             * Give zlib one sentinel byte at the exact Java limit so that a
+             * stream ending at 16 MiB is accepted while 16 MiB + 1 is not.
+             */
+            size_t next = cap == ST_MAX_INFLATED_SIZE
+                ? ST_MAX_INFLATED_SIZE + 1U
+                : cap * 2U;
+            if (next > ST_MAX_INFLATED_SIZE && cap < ST_MAX_INFLATED_SIZE) {
                 next = ST_MAX_INFLATED_SIZE;
             }
             uint8_t *grown = (uint8_t *)realloc(buffer, next);
@@ -582,7 +589,7 @@ static int decode_compact_payload(const uint8_t *payload, size_t payload_len, ui
         status = inflate(&stream, Z_NO_FLUSH);
     } while (status == Z_OK);
 
-    if (status != Z_STREAM_END) {
+    if (status != Z_STREAM_END || stream.total_out > ST_MAX_INFLATED_SIZE) {
         free(buffer);
         inflateEnd(&stream);
         return -1;
@@ -603,7 +610,7 @@ int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *
     header->serializer = raw[5];
     header->command = (int8_t)raw[6];
     header->length = read_be32(raw + 7);
-    if (header->version != ST_VERSION || header->length > ST_MAX_FRAME_SIZE) {
+    if (header->version != ST_VERSION || header->length > ST_MAX_BODY_SIZE) {
         return -1;
     }
     return 0;

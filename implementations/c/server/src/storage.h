@@ -11,6 +11,11 @@ typedef struct {
     char owner_username[128];
     int enabled;
     int connection_rate_limit_per_minute;
+    int message_send_capable;
+    int message_receive_capable;
+    int message_attachments_capable;
+    int message_media_preview_capable;
+    long long message_max_attachment_bytes;
     char created_at[64];
     char updated_at[64];
 } st_storage_client;
@@ -82,6 +87,11 @@ typedef struct {
     char client_version[81];
     char java_version[81];
     char local_addresses[2001];
+    int message_send_capable;
+    int message_receive_capable;
+    int message_attachments_capable;
+    int message_media_preview_capable;
+    long long message_max_attachment_bytes;
     char http_login_at[64];
     char netty_connected_at[64];
     char disconnected_at[64];
@@ -183,6 +193,11 @@ typedef struct {
     char virtual_device_updated_at[64];
     char last_seen_at[64];
     char updated_at[64];
+    int message_send_capable;
+    int message_receive_capable;
+    int message_attachments_capable;
+    int message_media_preview_capable;
+    long long message_max_attachment_bytes;
 } st_storage_peer_mesh_device;
 
 typedef struct {
@@ -194,6 +209,7 @@ typedef struct {
     long long target_client_id;
     char target_client_name[256];
     int allowed;
+    char direction[16];
     char created_at[64];
     char updated_at[64];
 } st_storage_peer_mesh_acl;
@@ -675,6 +691,7 @@ int st_storage_upsert_peer_mesh_acl(const char *path,
                                     const st_storage_client *source,
                                     const st_storage_client *target,
                                     int allowed,
+                                    const char *direction,
                                     st_storage_peer_mesh_acl *out_acl);
 int st_storage_delete_peer_mesh_acl_visible(const char *path,
                                             long long id,

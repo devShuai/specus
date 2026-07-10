@@ -169,6 +169,11 @@ int st_storage_init(const char *path, int seed_demo_client)
         "client_version TEXT,"
         "java_version TEXT,"
         "local_addresses TEXT,"
+        "message_send_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_receive_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_attachments_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_media_preview_capable INTEGER NOT NULL DEFAULT 0,"
+        "message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,"
         "http_login_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "netty_connected_at TEXT,"
         "disconnected_at TEXT,"
@@ -343,6 +348,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "target_client_id INTEGER NOT NULL,"
         "target_client_name TEXT NOT NULL,"
         "allowed INTEGER NOT NULL DEFAULT 1,"
+        "direction TEXT NOT NULL DEFAULT 'OUTBOUND',"
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "UNIQUE(tenant_id, source_client_id, target_client_id)"
@@ -391,6 +397,21 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "http_route_mapping", "path_rewrite_enabled", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
+        rc = add_column_if_missing(db, "tunnel_client_session", "message_send_capable", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "tunnel_client_session", "message_receive_capable", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "tunnel_client_session", "message_attachments_capable", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "tunnel_client_session", "message_media_preview_capable", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "tunnel_client_session", "message_max_attachment_bytes", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
     }
     if (rc == 0) {
@@ -416,6 +437,9 @@ int st_storage_init(const char *path, int seed_demo_client)
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "traffic_usage", "updated_at", "TEXT");
+    }
+    if (rc == 0) {
+        rc = add_column_if_missing(db, "peer_mesh_acl", "direction", "TEXT NOT NULL DEFAULT 'OUTBOUND'");
     }
     if (rc == 0) {
         rc = exec_sql(db,
@@ -548,6 +572,11 @@ static int scan_client(sqlite3_stmt *stmt, st_storage_client *client)
     }
     client->enabled = sqlite3_column_int(stmt, 4) != 0;
     client->connection_rate_limit_per_minute = sqlite3_column_int(stmt, 5);
+    client->message_send_capable = sqlite3_column_int(stmt, 8) != 0;
+    client->message_receive_capable = sqlite3_column_int(stmt, 9) != 0;
+    client->message_attachments_capable = sqlite3_column_int(stmt, 10) != 0;
+    client->message_media_preview_capable = sqlite3_column_int(stmt, 11) != 0;
+    client->message_max_attachment_bytes = sqlite3_column_int64(stmt, 12);
     return 0;
 }
 
@@ -635,14 +664,19 @@ static int scan_client_session(sqlite3_stmt *stmt, st_storage_client_session *se
         || copy_text_column(stmt, 14, session->client_version, sizeof(session->client_version)) != 0
         || copy_text_column(stmt, 15, session->java_version, sizeof(session->java_version)) != 0
         || copy_text_column(stmt, 16, session->local_addresses, sizeof(session->local_addresses)) != 0
-        || copy_text_column(stmt, 17, session->http_login_at, sizeof(session->http_login_at)) != 0
-        || copy_text_column(stmt, 18, session->netty_connected_at, sizeof(session->netty_connected_at)) != 0
-        || copy_text_column(stmt, 19, session->disconnected_at, sizeof(session->disconnected_at)) != 0
-        || copy_text_column(stmt, 20, session->expires_at, sizeof(session->expires_at)) != 0
-        || copy_text_column(stmt, 21, session->channel_id, sizeof(session->channel_id)) != 0
-        || copy_text_column(stmt, 22, session->remote_address, sizeof(session->remote_address)) != 0) {
+        || copy_text_column(stmt, 22, session->http_login_at, sizeof(session->http_login_at)) != 0
+        || copy_text_column(stmt, 23, session->netty_connected_at, sizeof(session->netty_connected_at)) != 0
+        || copy_text_column(stmt, 24, session->disconnected_at, sizeof(session->disconnected_at)) != 0
+        || copy_text_column(stmt, 25, session->expires_at, sizeof(session->expires_at)) != 0
+        || copy_text_column(stmt, 26, session->channel_id, sizeof(session->channel_id)) != 0
+        || copy_text_column(stmt, 27, session->remote_address, sizeof(session->remote_address)) != 0) {
         return -1;
     }
+    session->message_send_capable = sqlite3_column_int(stmt, 17) != 0;
+    session->message_receive_capable = sqlite3_column_int(stmt, 18) != 0;
+    session->message_attachments_capable = sqlite3_column_int(stmt, 19) != 0;
+    session->message_media_preview_capable = sqlite3_column_int(stmt, 20) != 0;
+    session->message_max_attachment_bytes = sqlite3_column_int64(stmt, 21);
     return 0;
 }
 
@@ -780,8 +814,9 @@ static int scan_peer_mesh_acl(sqlite3_stmt *stmt, st_storage_peer_mesh_acl *acl)
         || copy_text_column(stmt, 2, acl->owner_username, sizeof(acl->owner_username)) != 0
         || copy_text_column(stmt, 4, acl->source_client_name, sizeof(acl->source_client_name)) != 0
         || copy_text_column(stmt, 6, acl->target_client_name, sizeof(acl->target_client_name)) != 0
-        || copy_text_column(stmt, 8, acl->created_at, sizeof(acl->created_at)) != 0
-        || copy_text_column(stmt, 9, acl->updated_at, sizeof(acl->updated_at)) != 0) {
+        || copy_text_column(stmt, 8, acl->direction, sizeof(acl->direction)) != 0
+        || copy_text_column(stmt, 9, acl->created_at, sizeof(acl->created_at)) != 0
+        || copy_text_column(stmt, 10, acl->updated_at, sizeof(acl->updated_at)) != 0) {
         return -1;
     }
     acl->allowed = sqlite3_column_int(stmt, 7) != 0;
@@ -988,7 +1023,12 @@ int st_storage_list_clients(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
-        "connection_limit_per_minute, created_at, updated_at "
+        "connection_limit_per_minute, created_at, updated_at, "
+        "COALESCE((SELECT message_send_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_receive_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_attachments_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_media_preview_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_max_attachment_bytes FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account ORDER BY client_name",
         -1,
         &stmt,
@@ -1019,7 +1059,12 @@ int st_storage_get_client(const char *path, long long id, st_storage_client *cli
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
-        "connection_limit_per_minute, created_at, updated_at "
+        "connection_limit_per_minute, created_at, updated_at, "
+        "COALESCE((SELECT message_send_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_receive_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_attachments_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_media_preview_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_max_attachment_bytes FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE rowid = ?",
         -1,
         &stmt,
@@ -1045,7 +1090,12 @@ int st_storage_get_client_by_name(const char *path, const char *client_name, st_
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
-        "connection_limit_per_minute, created_at, updated_at "
+        "connection_limit_per_minute, created_at, updated_at, "
+        "COALESCE((SELECT message_send_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_receive_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_attachments_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_media_preview_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_max_attachment_bytes FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE client_name = ?",
         -1,
         &stmt,
@@ -1808,7 +1858,9 @@ static int load_client_session_by_id(const char *path, long long id, st_storage_
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status, "
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, "
-        "local_addresses, http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address "
+        "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
+        "message_media_preview_capable, message_max_attachment_bytes, http_login_at, netty_connected_at, "
+        "disconnected_at, expires_at, channel_id, remote_address "
         "FROM tunnel_client_session WHERE id = ?",
         -1,
         &stmt,
@@ -1837,7 +1889,8 @@ int st_storage_create_client_session(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO tunnel_client_session(tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status, "
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, local_addresses, "
-        "http_login_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "message_send_capable, message_receive_capable, message_attachments_capable, message_media_preview_capable, "
+        "message_max_attachment_bytes, http_login_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1,
         &stmt,
         NULL);
@@ -1858,8 +1911,13 @@ int st_storage_create_client_session(const char *path,
         sqlite3_bind_text(stmt, 14, session->client_version, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 15, session->java_version, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 16, session->local_addresses, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 17, session->http_login_at, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 18, session->expires_at, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 17, session->message_send_capable ? 1 : 0);
+        sqlite3_bind_int(stmt, 18, session->message_receive_capable ? 1 : 0);
+        sqlite3_bind_int(stmt, 19, session->message_attachments_capable ? 1 : 0);
+        sqlite3_bind_int(stmt, 20, session->message_media_preview_capable ? 1 : 0);
+        sqlite3_bind_int64(stmt, 21, session->message_max_attachment_bytes < 0 ? 0 : session->message_max_attachment_bytes);
+        sqlite3_bind_text(stmt, 22, session->http_login_at, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 23, session->expires_at, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
     } else {
         rc = -1;
@@ -1886,7 +1944,9 @@ int st_storage_get_client_session_for_login(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status, "
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, "
-        "local_addresses, http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address "
+        "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
+        "message_media_preview_capable, message_max_attachment_bytes, http_login_at, netty_connected_at, "
+        "disconnected_at, expires_at, channel_id, remote_address "
         "FROM tunnel_client_session WHERE id = ? AND token_hash = ?",
         -1,
         &stmt,
@@ -3852,9 +3912,9 @@ int st_storage_list_peer_mesh_acls_visible(const char *path,
     int written = snprintf(sql,
                            sizeof(sql),
                            "SELECT id, tenant_id, owner_username, source_client_id, source_client_name, "
-                           "target_client_id, target_client_name, allowed, created_at, updated_at "
-                           "FROM peer_mesh_acl WHERE tenant_id = ?%s ORDER BY id DESC",
-                           include_all_clients ? "" : " AND owner_username = ?");
+                            "target_client_id, target_client_name, allowed, direction, created_at, updated_at "
+                           "FROM peer_mesh_acl WHERE tenant_id COLLATE BINARY = ?%s ORDER BY id DESC",
+                           include_all_clients ? "" : " AND owner_username COLLATE BINARY = ?");
     if (written < 0 || (size_t)written >= sizeof(sql)) {
         sqlite3_close(db);
         return -1;
@@ -3943,6 +4003,13 @@ int st_storage_ensure_peer_mesh_device(const char *path,
     sqlite3_finalize(stmt);
     if (rc == 0 && out_device != NULL) {
         rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
+        if (rc == 0) {
+            out_device->message_send_capable = client->message_send_capable;
+            out_device->message_receive_capable = client->message_receive_capable;
+            out_device->message_attachments_capable = client->message_attachments_capable;
+            out_device->message_media_preview_capable = client->message_media_preview_capable;
+            out_device->message_max_attachment_bytes = client->message_max_attachment_bytes;
+        }
     }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
@@ -3984,6 +4051,13 @@ int st_storage_update_peer_mesh_device_enabled(const char *path,
     sqlite3_finalize(stmt);
     if (rc == 0 && out_device != NULL) {
         rc = read_peer_mesh_device(db, client->tenant_id, client->id, out_device);
+        if (rc == 0) {
+            out_device->message_send_capable = client->message_send_capable;
+            out_device->message_receive_capable = client->message_receive_capable;
+            out_device->message_attachments_capable = client->message_attachments_capable;
+            out_device->message_media_preview_capable = client->message_media_preview_capable;
+            out_device->message_max_attachment_bytes = client->message_max_attachment_bytes;
+        }
     }
     sqlite3_close(db);
     return rc == 0 ? 0 : -1;
@@ -3998,7 +4072,7 @@ int st_storage_get_peer_mesh_acl(const char *path, long long id, st_storage_peer
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, owner_username, source_client_id, source_client_name, "
-        "target_client_id, target_client_name, allowed, created_at, updated_at "
+        "target_client_id, target_client_name, allowed, direction, created_at, updated_at "
         "FROM peer_mesh_acl WHERE id = ?",
         -1,
         &stmt,
@@ -4021,9 +4095,21 @@ int st_storage_upsert_peer_mesh_acl(const char *path,
                                     const st_storage_client *source,
                                     const st_storage_client *target,
                                     int allowed,
+                                    const char *direction,
                                     st_storage_peer_mesh_acl *out_acl)
 {
+    const char *normalized_tenant_id = normalize_tenant_id(tenant_id);
     if (source == NULL || target == NULL || source->id <= 0 || target->id <= 0 || source->id == target->id) {
+        return -1;
+    }
+    if (strcmp(source->tenant_id, normalized_tenant_id) != 0
+        || strcmp(target->tenant_id, normalized_tenant_id) != 0) {
+        return -1;
+    }
+    if (direction != NULL
+        && strcmp(direction, "OUTBOUND") != 0
+        && strcmp(direction, "INBOUND") != 0
+        && strcmp(direction, "BOTH") != 0) {
         return -1;
     }
     sqlite3 *db = NULL;
@@ -4033,13 +4119,14 @@ int st_storage_upsert_peer_mesh_acl(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "INSERT INTO peer_mesh_acl(tenant_id, owner_username, source_client_id, source_client_name, "
-        "target_client_id, target_client_name, allowed, created_at, updated_at) "
-        "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) "
+        "target_client_id, target_client_name, allowed, direction, created_at, updated_at) "
+        "VALUES(?,?,?,?,?,?,?,COALESCE(?, 'OUTBOUND'),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) "
         "ON CONFLICT(tenant_id, source_client_id, target_client_id) DO UPDATE SET "
         "owner_username=excluded.owner_username, "
         "source_client_name=excluded.source_client_name, "
         "target_client_name=excluded.target_client_name, "
         "allowed=excluded.allowed, "
+        "direction=COALESCE(?, peer_mesh_acl.direction), "
         "updated_at=CURRENT_TIMESTAMP",
         -1,
         &stmt,
@@ -4048,13 +4135,20 @@ int st_storage_upsert_peer_mesh_acl(const char *path,
         sqlite3_close(db);
         return -1;
     }
-    sqlite3_bind_text(stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, normalized_tenant_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, normalize_owner_username(owner_username), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 3, source->id);
     sqlite3_bind_text(stmt, 4, source->client_name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 5, target->id);
     sqlite3_bind_text(stmt, 6, target->client_name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 7, allowed ? 1 : 0);
+    if (direction == NULL) {
+        sqlite3_bind_null(stmt, 8);
+        sqlite3_bind_null(stmt, 9);
+    } else {
+        sqlite3_bind_text(stmt, 8, direction, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 9, direction, -1, SQLITE_TRANSIENT);
+    }
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     sqlite3_close(db);
@@ -4071,8 +4165,8 @@ int st_storage_upsert_peer_mesh_acl(const char *path,
     sqlite3_stmt *read_stmt = NULL;
     rc = sqlite3_prepare_v2(read_db,
         "SELECT id, tenant_id, owner_username, source_client_id, source_client_name, "
-        "target_client_id, target_client_name, allowed, created_at, updated_at "
-        "FROM peer_mesh_acl WHERE tenant_id = ? AND source_client_id = ? AND target_client_id = ?",
+        "target_client_id, target_client_name, allowed, direction, created_at, updated_at "
+        "FROM peer_mesh_acl WHERE tenant_id COLLATE BINARY = ? AND source_client_id = ? AND target_client_id = ?",
         -1,
         &read_stmt,
         NULL);
@@ -4080,7 +4174,7 @@ int st_storage_upsert_peer_mesh_acl(const char *path,
         sqlite3_close(read_db);
         return -1;
     }
-    sqlite3_bind_text(read_stmt, 1, normalize_tenant_id(tenant_id), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(read_stmt, 1, normalized_tenant_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(read_stmt, 2, source->id);
     sqlite3_bind_int64(read_stmt, 3, target->id);
     rc = sqlite3_step(read_stmt);
@@ -4103,8 +4197,8 @@ int st_storage_delete_peer_mesh_acl_visible(const char *path,
     char sql[256];
     int written = snprintf(sql,
                            sizeof(sql),
-                           "DELETE FROM peer_mesh_acl WHERE id = ? AND tenant_id = ?%s",
-                           include_all_clients ? "" : " AND owner_username = ?");
+                           "DELETE FROM peer_mesh_acl WHERE id = ? AND tenant_id COLLATE BINARY = ?%s",
+                           include_all_clients ? "" : " AND owner_username COLLATE BINARY = ?");
     if (written < 0 || (size_t)written >= sizeof(sql)) {
         sqlite3_close(db);
         return -1;

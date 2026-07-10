@@ -54,6 +54,23 @@ static int contains(const char *haystack, const char *needle)
     return strstr(haystack, needle) != NULL;
 }
 
+static void test_base64url_no_padding(const uint8_t *data, size_t len, char *out)
+{
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t written = 0;
+    for (size_t i = 0; i < len; i += 3U) {
+        uint32_t value = (uint32_t)data[i] << 16;
+        size_t remaining = len - i;
+        if (remaining > 1U) value |= (uint32_t)data[i + 1U] << 8;
+        if (remaining > 2U) value |= data[i + 2U];
+        out[written++] = alphabet[(value >> 18) & 63U];
+        out[written++] = alphabet[(value >> 12) & 63U];
+        if (remaining > 1U) out[written++] = alphabet[(value >> 6) & 63U];
+        if (remaining > 2U) out[written++] = alphabet[value & 63U];
+    }
+    out[written] = '\0';
+}
+
 static char *test_dup_string(const char *value)
 {
     size_t len = strlen(value);
@@ -200,6 +217,98 @@ int main(void)
         free(admin_token);
         return 1;
     }
+
+    unsetenv("TUNNEL_PEER_MESH_ENABLED");
+    unsetenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
+    unsetenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS");
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"peerMeshEnabled\":false")
+        || !contains(response, "\"selfHostedStunServer\":\"\"")
+        || !contains(response, "\"stunServers\":[]")
+        || !contains(response, "\"stunTurnPort\":3478")) {
+        fprintf(stderr, "disabled public stun config mismatch\n");
+        return 1;
+    }
+    setenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", "STUN://fallback.example.test", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (len <= 0 || !contains(response, "\"peerMeshEnabled\":false")
+        || !contains(response, "\"selfHostedStunServer\":\"\"")
+        || !contains(response, "\"stun:fallback.example.test:3478\"")) {
+        fprintf(stderr, "disabled public fallback stun config mismatch\n");
+        return 1;
+    }
+    setenv("TUNNEL_PEER_MESH_ENABLED", "true", 1);
+    setenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS", "ice.example.test", 1);
+    setenv("TUNNEL_PEER_MESH_STUN_TURN_PORT", "5349", 1);
+    setenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", "stun://stun.example.test, stun:stun.example.test:3478", 1);
+    setenv("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED", "true", 1);
+    setenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET", "turn-test-secret", 1);
+    setenv("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", "3600", 1);
+    len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"peerMeshEnabled\":true")
+        || !contains(response, "\"selfHostedStunServer\":\"stun:ice.example.test:5349\"")
+        || !contains(response, "\"stun:stun.example.test:3478\"")) {
+        fprintf(stderr, "enabled public stun config mismatch\n");
+        return 1;
+    }
+    len = st_admin_build_response("GET", "/api/public/transfer/ice-config", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"urls\":\"turn:ice.example.test:5349?transport=udp\"")
+        || !contains(response, ":public-transfer:")
+        || !contains(response, "\"credential\":\"")
+        || !contains(response, "\"turnAuthRequired\":true")) {
+        fprintf(stderr, "public ice config mismatch\n");
+        return 1;
+    }
+    const char *turn_entry = strstr(response, "\"urls\":\"turn:");
+    char *turn_username = turn_entry == NULL ? NULL : st_json_get_string(turn_entry, "username");
+    char *turn_credential = turn_entry == NULL ? NULL : st_json_get_string(turn_entry, "credential");
+    uint8_t expected_turn_mac[ST_SHA1_LEN];
+    char expected_turn_credential[32];
+    if (turn_username != NULL) {
+        st_hmac_sha1((const uint8_t *)"turn-test-secret",
+                     strlen("turn-test-secret"),
+                     (const uint8_t *)turn_username,
+                     strlen(turn_username),
+                     expected_turn_mac);
+        test_base64url_no_padding(expected_turn_mac, sizeof(expected_turn_mac), expected_turn_credential);
+    }
+    char *turn_subject = turn_username == NULL ? NULL : strstr(turn_username, ":public-transfer:");
+    if (turn_username == NULL || turn_credential == NULL || turn_subject == NULL
+        || strlen(turn_subject + strlen(":public-transfer:")) != 8U
+        || strcmp(turn_credential, expected_turn_credential) != 0) {
+        fprintf(stderr, "temporary turn credential mismatch\n");
+        free(turn_username);
+        free(turn_credential);
+        return 1;
+    }
+    free(turn_username);
+    free(turn_credential);
+    len = st_admin_build_response("POST", "/api/public/transfer/attachments/presign-upload", response, sizeof(response));
+    if (len <= 0 || !contains(response, "409 Conflict")
+        || !contains(response, "\"error\":\"object storage is not configured\"")
+        || !contains(response, "\"code\":\"OBJECT_STORAGE_DISABLED\"")
+        || !contains(response, "\"enabled\":false")) {
+        fprintf(stderr, "disabled public attachment response mismatch\n");
+        return 1;
+    }
+    len = st_admin_build_response("POST",
+                                  "/api/public/transfer/attachments/not-a-java-route",
+                                  response,
+                                  sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found")) {
+        fprintf(stderr, "unknown attachment path should remain not found\n");
+        return 1;
+    }
+    unsetenv("TUNNEL_PEER_MESH_ENABLED");
+    unsetenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
+    unsetenv("TUNNEL_PEER_MESH_STUN_TURN_PORT");
+    unsetenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS");
+    unsetenv("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED");
+    unsetenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET");
+    unsetenv("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS");
     len = st_admin_build_response_with_auth("GET", "/api/admin/overview", NULL, NULL, response, sizeof(response));
     if (len <= 0 || !contains(response, "401 Unauthorized")) {
         fprintf(stderr, "unauthenticated admin api response mismatch\n");
@@ -211,6 +320,19 @@ int main(void)
     len = st_admin_build_response_with_auth("GET", "/api/admin/overview", authorization, NULL, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"server\":\"c\"")) {
         fprintf(stderr, "authenticated admin api response mismatch\n");
+        free(admin_token);
+        return 1;
+    }
+    len = st_admin_build_response_with_auth("POST",
+                                            "/api/admin/client-messages/attachments/presign-upload",
+                                            authorization,
+                                            "{}",
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "409 Conflict")
+        || !contains(response, "\"error\":\"object storage is not configured\"")
+        || !contains(response, "\"code\":\"OBJECT_STORAGE_DISABLED\"")) {
+        fprintf(stderr, "disabled admin attachment response mismatch\n");
         free(admin_token);
         return 1;
     }
@@ -355,7 +477,10 @@ int main(void)
     snprintf(body,
              sizeof(body),
              "{\"apiKey\":\"db-api\",\"timestamp\":\"%s\",\"nonce\":\"nonce-db\",\"signature\":\"%s\","
-             "\"environment\":{\"machineFingerprint\":\"machine-db\",\"osUser\":\"db-user\",\"hostname\":\"DB Host\"}}",
+             "\"environment\":{\"machineFingerprint\":\"machine-db\",\"osUser\":\"db-user\",\"hostname\":\"DB Host\","
+             "\"clientMessageCapabilities\":{\"sendMessages\":true,\"receiveMessages\":true,"
+             "\"attachments\":true,\"mediaPreview\":true,"
+             "\"maxAttachmentBytes\":16777216}}}",
              timestamp,
              signature);
     len = st_admin_build_response_with_body("POST", "/api/client/auth/login", body, response, sizeof(response));
@@ -365,6 +490,24 @@ int main(void)
         || !contains(response, "\"maxOnlineInstances\":4")
         || !contains(response, "db-host-db-user-")) {
         fprintf(stderr, "client auth database login response mismatch\n");
+        return 1;
+    }
+    len = st_admin_build_response("GET", "/api/admin/clients", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"messageSendCapable\":false")
+        || !contains(response, "\"messageReceiveCapable\":false")
+        || !contains(response, "\"messageAttachmentsCapable\":false")
+        || !contains(response, "\"messageMediaPreviewCapable\":false")
+        || !contains(response, "\"messageMaxAttachmentBytes\":0")) {
+        fprintf(stderr, "client message capability management response mismatch\n");
+        return 1;
+    }
+    len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || !contains(response, "\"messageAttachmentsCapable\":false")
+        || !contains(response, "\"messageMaxAttachmentBytes\":0")
+        || !contains(response, "C server does not implement Peer Mesh data plane")) {
+        fprintf(stderr, "peer mesh capability management response mismatch\n");
         return 1;
     }
     snprintf(body,
@@ -643,6 +786,118 @@ int main(void)
         free(alice_token);
         return 1;
     }
+    st_storage_client alice_client;
+    st_storage_client owner_case_client;
+    st_storage_client tenant_case_client;
+    if (st_storage_get_client(db_path, alice_client_id, &alice_client) != 0
+        || st_storage_upsert_client(db_path,
+                                    0,
+                                    "tenant-admin",
+                                    "Owner case client",
+                                    "Alice",
+                                    1,
+                                    30,
+                                    &owner_case_client) != 0
+        || st_storage_upsert_client(db_path,
+                                    0,
+                                    "TENANT-ADMIN",
+                                    "Tenant case client",
+                                    "alice",
+                                    1,
+                                    30,
+                                    &tenant_case_client) != 0) {
+        fprintf(stderr, "peer mesh case-sensitive client setup failed\n");
+        free(alice_token);
+        return 1;
+    }
+    len = st_admin_build_response_with_auth("GET", "/api/admin/clients", authorization, NULL, response, sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK")
+        || contains(response, "Owner case client")
+        || contains(response, "Tenant case client")) {
+        fprintf(stderr, "client tenant/owner visibility must be case-sensitive\n");
+        free(alice_token);
+        return 1;
+    }
+    char case_acl_body[256];
+    snprintf(case_acl_body,
+             sizeof(case_acl_body),
+             "{\"sourceClientId\":%lld,\"targetClientId\":%d}",
+             owner_case_client.id,
+             alice_client_id);
+    len = st_admin_build_response_with_auth("POST",
+                                            "/api/admin/peer-mesh/acls",
+                                            authorization,
+                                            case_acl_body,
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "source client not found")) {
+        fprintf(stderr, "peer mesh acl source-owner authorization must be case-sensitive\n");
+        free(alice_token);
+        return 1;
+    }
+    snprintf(case_acl_body,
+             sizeof(case_acl_body),
+             "{\"sourceClientId\":%d,\"targetClientId\":%lld}",
+             alice_client_id,
+             owner_case_client.id);
+    len = st_admin_build_response_with_auth("POST",
+                                            "/api/admin/peer-mesh/acls",
+                                            authorization,
+                                            case_acl_body,
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request") || !contains(response, "cross-user peer ACL")) {
+        fprintf(stderr, "peer mesh acl target-owner authorization must be case-sensitive\n");
+        free(alice_token);
+        return 1;
+    }
+    snprintf(case_acl_body,
+             sizeof(case_acl_body),
+             "{\"sourceClientId\":%d,\"targetClientId\":%lld}",
+             alice_client_id,
+             tenant_case_client.id);
+    len = st_admin_build_response_with_auth("POST",
+                                            "/api/admin/peer-mesh/acls",
+                                            authorization,
+                                            case_acl_body,
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found") || !contains(response, "target client not found")) {
+        fprintf(stderr, "peer mesh acl tenant authorization must be case-sensitive\n");
+        free(alice_token);
+        return 1;
+    }
+    st_storage_peer_mesh_acl hidden_case_acl;
+    if (st_storage_upsert_peer_mesh_acl(db_path,
+                                        "tenant-admin",
+                                        "Alice",
+                                        &alice_client,
+                                        &owner_case_client,
+                                        1,
+                                        "OUTBOUND",
+                                        &hidden_case_acl) != 0) {
+        fprintf(stderr, "peer mesh case-sensitive acl setup failed\n");
+        free(alice_token);
+        return 1;
+    }
+    len = st_admin_build_response_with_auth("GET",
+                                            "/api/admin/peer-mesh/acls",
+                                            authorization,
+                                            NULL,
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "200 OK") || contains(response, "Owner case client")) {
+        fprintf(stderr, "peer mesh acl owner visibility must be case-sensitive\n");
+        free(alice_token);
+        return 1;
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%lld", hidden_case_acl.id);
+    len = st_admin_build_response_with_auth("DELETE", request_path, authorization, NULL, response, sizeof(response));
+    if (len <= 0 || !contains(response, "404 Not Found")) {
+        fprintf(stderr, "peer mesh acl delete authorization must be case-sensitive\n");
+        free(alice_token);
+        return 1;
+    }
     snprintf(request_path, sizeof(request_path), "/api/admin/clients/%d", alice_client_id);
     len = st_admin_build_response_with_auth("DELETE", request_path, authorization, NULL, response, sizeof(response));
     if (len <= 0 || !contains(response, "204 No Content")) {
@@ -722,7 +977,7 @@ int main(void)
     char acl_body[256];
     snprintf(acl_body,
              sizeof(acl_body),
-             "{\"sourceClientId\":%d,\"targetClientId\":%d,\"allowed\":true}",
+             "{\"sourceClientId\":%d,\"targetClientId\":%d,\"allowed\":true,\"direction\":\"both\"}",
              created_client_id,
              target_client_id);
     len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
@@ -731,6 +986,7 @@ int main(void)
         || !contains(response, "\"sourceClientName\":\"C managed\"")
         || !contains(response, "\"targetClientName\":\"C peer target\"")
         || !contains(response, "\"allowed\":true")
+        || !contains(response, "\"direction\":\"BOTH\"")
         || st_json_get_int(response, "id", &created_acl_id) != 0
         || created_acl_id <= 0) {
         fprintf(stderr, "peer mesh acl create response mismatch\n");
@@ -739,8 +995,70 @@ int main(void)
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/acls", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"sourceClientName\":\"C managed\"")
-        || !contains(response, "\"targetClientName\":\"C peer target\"")) {
+        || !contains(response, "\"targetClientName\":\"C peer target\"")
+        || !contains(response, "\"direction\":\"BOTH\"")) {
         fprintf(stderr, "peer mesh acl list response mismatch\n");
+        return 1;
+    }
+    snprintf(acl_body,
+             sizeof(acl_body),
+             "{\"sourceClientId\":%d,\"targetClientId\":%d,\"allowed\":true}",
+             created_client_id,
+             target_client_id);
+    len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"BOTH\"")) {
+        fprintf(stderr, "peer mesh acl omitted direction should preserve existing value\n");
+        return 1;
+    }
+    snprintf(acl_body,
+             sizeof(acl_body),
+             "{\"sourceClientId\":%d,\"targetClientId\":%d,\"allowed\":true}",
+             target_client_id,
+             created_client_id);
+    len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
+    int default_direction_acl_id = 0;
+    if (len <= 0 || !contains(response, "201 Created")
+        || !contains(response, "\"direction\":\"OUTBOUND\"")
+        || st_json_get_int(response, "id", &default_direction_acl_id) != 0
+        || default_direction_acl_id <= 0) {
+        fprintf(stderr, "peer mesh acl default direction response mismatch\n");
+        return 1;
+    }
+    snprintf(acl_body,
+             sizeof(acl_body),
+             "{\"sourceClientId\":%d,\"targetClientId\":%d,\"direction\":\"inbound\"}",
+             target_client_id,
+             created_client_id);
+    len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"INBOUND\"")) {
+        fprintf(stderr, "peer mesh acl inbound direction response mismatch\n");
+        return 1;
+    }
+    snprintf(acl_body,
+             sizeof(acl_body),
+             "{\"sourceClientId\":%d,\"targetClientId\":%d}",
+             target_client_id,
+             created_client_id);
+    len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "201 Created") || !contains(response, "\"direction\":\"INBOUND\"")) {
+        fprintf(stderr, "peer mesh acl omitted direction should preserve inbound value\n");
+        return 1;
+    }
+    snprintf(acl_body,
+             sizeof(acl_body),
+             "{\"sourceClientId\":%d,\"targetClientId\":%d,\"direction\":\"SIDEWAYS\"}",
+             created_client_id,
+             target_client_id);
+    len = st_admin_build_response_with_body("POST", "/api/admin/peer-mesh/acls", acl_body, response, sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "invalid direction: SIDEWAYS")) {
+        fprintf(stderr, "peer mesh acl direction validation mismatch\n");
+        return 1;
+    }
+    snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%d", default_direction_acl_id);
+    len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
+    if (len <= 0 || !contains(response, "204 No Content")) {
+        fprintf(stderr, "default direction peer mesh acl delete response mismatch\n");
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/peer-mesh/acls/%d", created_acl_id);

@@ -1,12 +1,64 @@
 #include "storage.h"
 
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+static int test_peer_mesh_acl_direction_migration(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/shuai-tunnel-c-acl-migration-%ld.db", (long)getpid());
+    unlink(path);
+    sqlite3 *db = NULL;
+    char *error = NULL;
+    const char *legacy_schema =
+        "CREATE TABLE peer_mesh_acl ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "tenant_id TEXT NOT NULL DEFAULT 'default',"
+        "owner_username TEXT NOT NULL DEFAULT 'admin',"
+        "source_client_id INTEGER NOT NULL,"
+        "source_client_name TEXT NOT NULL,"
+        "target_client_id INTEGER NOT NULL,"
+        "target_client_name TEXT NOT NULL,"
+        "allowed INTEGER NOT NULL DEFAULT 1,"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "UNIQUE(tenant_id, source_client_id, target_client_id));"
+        "INSERT INTO peer_mesh_acl(tenant_id, owner_username, source_client_id, source_client_name, "
+        "target_client_id, target_client_name, allowed) "
+        "VALUES('tenant-migration','OwnerCase',1,'source',2,'target',1);";
+    if (sqlite3_open(path, &db) != SQLITE_OK
+        || sqlite3_exec(db, legacy_schema, NULL, NULL, &error) != SQLITE_OK) {
+        fprintf(stderr, "peer mesh acl legacy schema setup failed: %s\n", error == NULL ? "sqlite error" : error);
+        sqlite3_free(error);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_close(db);
+    if (st_storage_init(path, 0) != 0) {
+        fprintf(stderr, "peer mesh acl direction migration failed\n");
+        unlink(path);
+        return 1;
+    }
+    st_storage_peer_mesh_acl acl;
+    if (st_storage_get_peer_mesh_acl(path, 1, &acl) != 0
+        || strcmp(acl.direction, "OUTBOUND") != 0) {
+        fprintf(stderr, "peer mesh acl migrated direction default mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    unlink(path);
+    return 0;
+}
+
 int main(void)
 {
+    if (test_peer_mesh_acl_direction_migration() != 0) {
+        return 1;
+    }
     char path[256];
     snprintf(path, sizeof(path), "/tmp/shuai-tunnel-c-storage-%ld.db", (long)getpid());
     unlink(path);
@@ -279,12 +331,22 @@ int main(void)
     snprintf(session.machine_fingerprint, sizeof(session.machine_fingerprint), "%s", "machine-1");
     snprintf(session.os_user, sizeof(session.os_user), "%s", "tester");
     snprintf(session.hostname, sizeof(session.hostname), "%s", "host-two");
+    session.message_send_capable = 1;
+    session.message_receive_capable = 1;
+    session.message_attachments_capable = 1;
+    session.message_media_preview_capable = 1;
+    session.message_max_attachment_bytes = 16777216;
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", "2026-06-25T00:00:00Z");
     snprintf(session.expires_at, sizeof(session.expires_at), "%s", "2026-06-25T08:00:00Z");
     if (st_storage_create_client_session(path, &session, &session) != 0
         || session.id <= 0
         || strcmp(session.status, "HTTP_AUTHENTICATED") != 0
-        || strcmp(session.client_name, identity.client_name) != 0) {
+        || strcmp(session.client_name, identity.client_name) != 0
+        || !session.message_send_capable
+        || !session.message_receive_capable
+        || !session.message_attachments_capable
+        || !session.message_media_preview_capable
+        || session.message_max_attachment_bytes != 16777216) {
         fprintf(stderr, "client session create mismatch\n");
         unlink(path);
         return 1;
@@ -296,6 +358,11 @@ int main(void)
                                                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                                                 &login_session) != 0
         || login_session.id != session.id
+        || !login_session.message_send_capable
+        || !login_session.message_receive_capable
+        || !login_session.message_attachments_capable
+        || !login_session.message_media_preview_capable
+        || login_session.message_max_attachment_bytes != 16777216
         || st_storage_count_online_sessions_by_machine(path,
                                                        credential.id,
                                                        "machine-1",
@@ -317,6 +384,21 @@ int main(void)
                                                        session.id,
                                                        "2026-06-25T00:03:00Z") != 0) {
         fprintf(stderr, "client session runtime state mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    st_storage_client capability_client;
+    st_storage_peer_mesh_device capability_device;
+    if (st_storage_get_client(path, identity.client_id, &capability_client) != 0
+        || !capability_client.message_send_capable
+        || !capability_client.message_receive_capable
+        || !capability_client.message_attachments_capable
+        || !capability_client.message_media_preview_capable
+        || capability_client.message_max_attachment_bytes != 16777216
+        || st_storage_ensure_peer_mesh_device(path, &capability_client, &capability_device) != 0
+        || !capability_device.message_attachments_capable
+        || capability_device.message_max_attachment_bytes != 16777216) {
+        fprintf(stderr, "client message capability projection mismatch\n");
         unlink(path);
         return 1;
     }
@@ -347,6 +429,122 @@ int main(void)
         || strcmp(created_client.owner_username, "owner2") != 0
         || created_client.connection_rate_limit_per_minute != 12) {
         fprintf(stderr, "client update mismatch\n");
+        unlink(path);
+        return 1;
+    }
+
+    st_storage_client acl_target;
+    if (st_storage_upsert_client(path, 0, "tenant-c", "ACL target", "owner2", 1, 30, &acl_target) != 0) {
+        fprintf(stderr, "peer mesh acl target create mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    st_storage_peer_mesh_acl acl;
+    if (st_storage_upsert_peer_mesh_acl(path,
+                                        "tenant-c",
+                                        "OwnerCase",
+                                        &created_client,
+                                        &acl_target,
+                                        1,
+                                        NULL,
+                                        &acl) != 0
+        || strcmp(acl.direction, "OUTBOUND") != 0) {
+        fprintf(stderr, "peer mesh acl default direction mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    long long acl_id = acl.id;
+    if (st_storage_upsert_peer_mesh_acl(path,
+                                        "tenant-c",
+                                        "OwnerCase",
+                                        &created_client,
+                                        &acl_target,
+                                        0,
+                                        "INBOUND",
+                                        &acl) != 0
+        || acl.id != acl_id
+        || strcmp(acl.direction, "INBOUND") != 0
+        || acl.allowed) {
+        fprintf(stderr, "peer mesh acl explicit direction update mismatch\n");
+        unlink(path);
+        return 1;
+    }
+    if (st_storage_upsert_peer_mesh_acl(path,
+                                        "tenant-c",
+                                        "OwnerCase",
+                                        &created_client,
+                                        &acl_target,
+                                        1,
+                                        NULL,
+                                        &acl) != 0
+        || acl.id != acl_id
+        || strcmp(acl.direction, "INBOUND") != 0
+        || !acl.allowed) {
+        fprintf(stderr, "peer mesh acl omitted direction should preserve existing value\n");
+        unlink(path);
+        return 1;
+    }
+    if (st_storage_upsert_peer_mesh_acl(path,
+                                        "tenant-c",
+                                        "OwnerCase",
+                                        &created_client,
+                                        &acl_target,
+                                        1,
+                                        "SIDEWAYS",
+                                        NULL) == 0) {
+        fprintf(stderr, "peer mesh acl invalid storage direction should be rejected\n");
+        unlink(path);
+        return 1;
+    }
+    st_storage_peer_mesh_acl visible_acls[4];
+    size_t visible_acl_count = 0;
+    if (st_storage_list_peer_mesh_acls_visible(path,
+                                               "tenant-c",
+                                               "OwnerCase",
+                                               0,
+                                               visible_acls,
+                                               4,
+                                               &visible_acl_count) != 0
+        || visible_acl_count != 1U
+        || visible_acls[0].id != acl_id
+        || st_storage_list_peer_mesh_acls_visible(path,
+                                                  "tenant-c",
+                                                  "ownercase",
+                                                  0,
+                                                  visible_acls,
+                                                  4,
+                                                  &visible_acl_count) != 0
+        || visible_acl_count != 0U
+        || st_storage_list_peer_mesh_acls_visible(path,
+                                                  "TENANT-C",
+                                                  "OwnerCase",
+                                                  1,
+                                                  visible_acls,
+                                                  4,
+                                                  &visible_acl_count) != 0
+        || visible_acl_count != 0U) {
+        fprintf(stderr, "peer mesh acl tenant/owner visibility must be case-sensitive\n");
+        unlink(path);
+        return 1;
+    }
+    st_storage_client case_variant_target;
+    if (st_storage_upsert_client(path, 0, "TENANT-C", "ACL case target", "owner2", 1, 30, &case_variant_target) != 0
+        || st_storage_upsert_peer_mesh_acl(path,
+                                           "tenant-c",
+                                           "OwnerCase",
+                                           &created_client,
+                                           &case_variant_target,
+                                           1,
+                                           "OUTBOUND",
+                                           NULL) == 0) {
+        fprintf(stderr, "peer mesh acl cross-tenant case variant should be rejected\n");
+        unlink(path);
+        return 1;
+    }
+    if (st_storage_delete_peer_mesh_acl_visible(path, acl_id, "TENANT-C", "OwnerCase", 1) == 0
+        || st_storage_delete_peer_mesh_acl_visible(path, acl_id, "tenant-c", "ownercase", 0) == 0
+        || st_storage_delete_peer_mesh_acl_visible(path, acl_id, "tenant-c", "OwnerCase", 0) != 0) {
+        fprintf(stderr, "peer mesh acl delete visibility must be case-sensitive\n");
         unlink(path);
         return 1;
     }

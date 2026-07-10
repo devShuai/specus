@@ -78,6 +78,38 @@ static int test_empty_packets(void)
     return 0;
 }
 
+static int test_frame_limit_includes_header(void)
+{
+    uint8_t raw[ST_HEADER_SIZE] = {0};
+    st_frame_header header;
+    raw[0] = (uint8_t)(ST_MAGIC >> 24U);
+    raw[1] = (uint8_t)(ST_MAGIC >> 16U);
+    raw[2] = (uint8_t)(ST_MAGIC >> 8U);
+    raw[3] = (uint8_t)ST_MAGIC;
+    raw[4] = ST_VERSION;
+    raw[5] = ST_SERIALIZER_COMPACT_BINARY;
+    raw[6] = (uint8_t)ST_CMD_HEARTBEAT_REQUEST;
+    raw[7] = (uint8_t)(ST_MAX_BODY_SIZE >> 24U);
+    raw[8] = (uint8_t)(ST_MAX_BODY_SIZE >> 16U);
+    raw[9] = (uint8_t)(ST_MAX_BODY_SIZE >> 8U);
+    raw[10] = (uint8_t)ST_MAX_BODY_SIZE;
+    if (st_protocol_read_header(raw, &header) != 0 || header.length != ST_MAX_BODY_SIZE) {
+        fprintf(stderr, "maximum Java-compatible frame should be accepted\n");
+        return 1;
+    }
+
+    uint32_t oversized = ST_MAX_BODY_SIZE + 1U;
+    raw[7] = (uint8_t)(oversized >> 24U);
+    raw[8] = (uint8_t)(oversized >> 16U);
+    raw[9] = (uint8_t)(oversized >> 8U);
+    raw[10] = (uint8_t)oversized;
+    if (st_protocol_read_header(raw, &header) == 0) {
+        fprintf(stderr, "frame larger than Java's complete-frame limit should be rejected\n");
+        return 1;
+    }
+    return 0;
+}
+
 static int test_nat_decode(void)
 {
     const struct {
@@ -126,6 +158,51 @@ static int test_nat_decode(void)
             fprintf(stderr, "%s NAT content mismatch\n", cases[i].fixture);
             return 1;
         }
+    }
+    return 0;
+}
+
+static int test_inflated_payload_limit_is_inclusive(void)
+{
+    uint8_t *data = (uint8_t *)malloc(ST_MAX_INFLATED_SIZE + 1U);
+    if (data == NULL) {
+        return 1;
+    }
+    memset(data, 'A', ST_MAX_INFLATED_SIZE + 1U);
+
+    st_buffer exact = st_protocol_encode_nat_message(ST_NAT_DATA, "{}", data, ST_MAX_INFLATED_SIZE);
+    st_frame_header header;
+    st_nat_message decoded;
+    int exact_ok = exact.data != NULL
+        && st_protocol_read_header(exact.data, &header) == 0
+        && st_protocol_decode_nat_message(exact.data + ST_HEADER_SIZE, header.length, &decoded) == 0
+        && decoded.data_len == ST_MAX_INFLATED_SIZE;
+    if (exact_ok) {
+        st_nat_message_free(&decoded);
+    }
+    st_buffer_free(&exact);
+    if (!exact_ok) {
+        free(data);
+        fprintf(stderr, "exactly 16 MiB inflated payload should be accepted\n");
+        return 1;
+    }
+
+    st_buffer oversized = st_protocol_encode_nat_message(
+        ST_NAT_DATA,
+        "{}",
+        data,
+        ST_MAX_INFLATED_SIZE + 1U);
+    int oversized_rejected = oversized.data != NULL
+        && st_protocol_read_header(oversized.data, &header) == 0
+        && st_protocol_decode_nat_message(
+            oversized.data + ST_HEADER_SIZE,
+            header.length,
+            &decoded) != 0;
+    st_buffer_free(&oversized);
+    free(data);
+    if (!oversized_rejected) {
+        fprintf(stderr, "inflated payload larger than 16 MiB should be rejected\n");
+        return 1;
     }
     return 0;
 }
@@ -321,7 +398,9 @@ int main(void)
     return test_login_request_decode() != 0
         || test_message_response_decode() != 0
         || test_empty_packets() != 0
+        || test_frame_limit_includes_header() != 0
         || test_nat_decode() != 0
+        || test_inflated_payload_limit_is_inclusive() != 0
         || test_direct_http_decode() != 0
         || test_direct_http_encode_round_trip() != 0
         || test_java_encode_fixtures() != 0;

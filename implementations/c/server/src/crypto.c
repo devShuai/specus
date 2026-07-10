@@ -274,6 +274,43 @@ void st_sha1(const uint8_t *data, size_t len, uint8_t out[ST_SHA1_LEN])
     sha1_final(&ctx, out);
 }
 
+void st_hmac_sha1(const uint8_t *key, size_t key_len,
+                  const uint8_t *data, size_t len,
+                  uint8_t out[ST_SHA1_LEN])
+{
+    uint8_t normalized_key[ST_SHA1_LEN];
+    uint8_t block[64];
+    uint8_t inner_hash[ST_SHA1_LEN];
+
+    if (key_len > sizeof(block)) {
+        st_sha1(key, key_len, normalized_key);
+        key = normalized_key;
+        key_len = sizeof(normalized_key);
+    }
+    memset(block, 0x36, sizeof(block));
+    for (size_t i = 0; i < key_len; ++i) {
+        block[i] ^= key[i];
+    }
+    sha1_ctx ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, block, sizeof(block));
+    sha1_update(&ctx, data, len);
+    sha1_final(&ctx, inner_hash);
+
+    memset(block, 0x5c, sizeof(block));
+    for (size_t i = 0; i < key_len; ++i) {
+        block[i] ^= key[i];
+    }
+    sha1_init(&ctx);
+    sha1_update(&ctx, block, sizeof(block));
+    sha1_update(&ctx, inner_hash, sizeof(inner_hash));
+    sha1_final(&ctx, out);
+
+    memset(normalized_key, 0, sizeof(normalized_key));
+    memset(inner_hash, 0, sizeof(inner_hash));
+    memset(block, 0, sizeof(block));
+}
+
 void st_sha256(const uint8_t *data, size_t len, uint8_t out[ST_SHA256_LEN])
 {
     sha256_ctx ctx;

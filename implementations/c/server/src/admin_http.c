@@ -1076,6 +1076,242 @@ static void build_prefixed_token(const char *prefix, char *out, size_t out_len)
     snprintf(out, out_len, "%s%s%s", prefix == NULL ? "" : prefix, hex1, hex2);
 }
 
+static char turn_runtime_secret[160];
+static pthread_once_t turn_runtime_secret_once = PTHREAD_ONCE_INIT;
+
+static void initialize_turn_runtime_secret(void)
+{
+    build_prefixed_token("turn_", turn_runtime_secret, sizeof(turn_runtime_secret));
+}
+
+static const char *turn_credential_secret(void)
+{
+    const char *configured = getenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET");
+    if (configured != NULL && *configured != '\0') {
+        return configured;
+    }
+    pthread_once(&turn_runtime_secret_once, initialize_turn_runtime_secret);
+    return turn_runtime_secret;
+}
+
+static void base64url_no_padding(const uint8_t *data, size_t len, char *out, size_t out_len)
+{
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t written = 0;
+    for (size_t i = 0; i < len && written + 1U < out_len; i += 3U) {
+        uint32_t value = (uint32_t)data[i] << 16;
+        size_t remaining = len - i;
+        if (remaining > 1U) value |= (uint32_t)data[i + 1U] << 8;
+        if (remaining > 2U) value |= data[i + 2U];
+        if (written + 1U < out_len) out[written++] = alphabet[(value >> 18) & 63U];
+        if (written + 1U < out_len) out[written++] = alphabet[(value >> 12) & 63U];
+        if (remaining > 1U && written + 1U < out_len) out[written++] = alphabet[(value >> 6) & 63U];
+        if (remaining > 2U && written + 1U < out_len) out[written++] = alphabet[value & 63U];
+    }
+    out[written] = '\0';
+}
+
+static int build_public_ice_url(const char *scheme,
+                                const char *host,
+                                int port,
+                                const char *suffix,
+                                char *out,
+                                size_t out_len)
+{
+    if (host == NULL || *host == '\0') {
+        return -1;
+    }
+    while (isspace((unsigned char)*host)) ++host;
+    if (strncmp(host, "http://", 7) == 0) host += 7;
+    else if (strncmp(host, "https://", 8) == 0) host += 8;
+    const char *end = host + strlen(host);
+    while (end > host && isspace((unsigned char)end[-1])) --end;
+    const char *slash = memchr(host, '/', (size_t)(end - host));
+    if (slash != NULL) end = slash;
+    if (end <= host) return -1;
+
+    char normalized[384];
+    size_t host_len = (size_t)(end - host);
+    if (host_len >= sizeof(normalized)) return -1;
+    memcpy(normalized, host, host_len);
+    normalized[host_len] = '\0';
+    int colon_count = 0;
+    for (size_t i = 0; i < host_len; ++i) {
+        if (normalized[i] == ':') ++colon_count;
+    }
+    int written;
+    if (normalized[0] == '[' || colon_count <= 1) {
+        char *last_colon = strrchr(normalized, ':');
+        if (normalized[0] == '[') {
+            char *bracket = strchr(normalized, ']');
+            if (bracket != NULL) bracket[1] = '\0';
+        } else if (last_colon != NULL) {
+            *last_colon = '\0';
+        }
+        written = snprintf(out, out_len, "%s:%s:%d%s", scheme, normalized, port, suffix == NULL ? "" : suffix);
+    } else {
+        written = snprintf(out, out_len, "%s:[%s]:%d%s", scheme, normalized, port, suffix == NULL ? "" : suffix);
+    }
+    return written > 0 && (size_t)written < out_len ? 0 : -1;
+}
+
+static int normalize_public_stun_url(const char *value, char *out, size_t out_len)
+{
+    while (isspace((unsigned char)*value)) ++value;
+    size_t value_len = strlen(value);
+    if (value_len >= 7U
+        && tolower((unsigned char)value[0]) == 's'
+        && tolower((unsigned char)value[1]) == 't'
+        && tolower((unsigned char)value[2]) == 'u'
+        && tolower((unsigned char)value[3]) == 'n'
+        && value[4] == ':' && value[5] == '/' && value[6] == '/') {
+        value += 7;
+    } else if (value_len >= 5U
+               && tolower((unsigned char)value[0]) == 's'
+               && tolower((unsigned char)value[1]) == 't'
+               && tolower((unsigned char)value[2]) == 'u'
+               && tolower((unsigned char)value[3]) == 'n'
+               && value[4] == ':') {
+        value += 5;
+    }
+    const char *end = value + strlen(value);
+    while (end > value && isspace((unsigned char)end[-1])) --end;
+    if (end <= value || (size_t)(end - value) >= 384U) return -1;
+    char host[384];
+    memcpy(host, value, (size_t)(end - value));
+    host[end - value] = '\0';
+    int port = 3478;
+    char *last_colon = strrchr(host, ':');
+    if (host[0] == '[') {
+        char *bracket = strchr(host, ']');
+        if (bracket != NULL && bracket[1] == ':') {
+            int parsed = atoi(bracket + 2);
+            if (parsed > 0 && parsed <= 65535) port = parsed;
+        }
+    } else if (last_colon != NULL && strchr(host, ':') == last_colon) {
+        int parsed = atoi(last_colon + 1);
+        if (parsed > 0 && parsed <= 65535) port = parsed;
+    }
+    return build_public_ice_url("stun", host, port, "", out, out_len);
+}
+
+static size_t collect_public_stun_urls(char urls[][512], size_t max_urls, int include_self)
+{
+    size_t count = 0;
+    int port = env_int("TUNNEL_PEER_MESH_STUN_TURN_PORT", 3478);
+    const char *public_address = getenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
+    if (count < max_urls && include_self && public_address != NULL && *public_address != '\0'
+        && build_public_ice_url("stun", public_address, port, "", urls[count], sizeof(urls[count])) == 0) {
+        ++count;
+    }
+    const char *configured = getenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS");
+    if (configured == NULL || *configured == '\0') return count;
+    char *copy = strdup(configured);
+    if (copy == NULL) return count;
+    char *save = NULL;
+    for (char *item = strtok_r(copy, ",", &save); item != NULL && count < max_urls; item = strtok_r(NULL, ",", &save)) {
+        char normalized[512];
+        if (normalize_public_stun_url(item, normalized, sizeof(normalized)) != 0) continue;
+        int duplicate = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (strcmp(urls[i], normalized) == 0) duplicate = 1;
+        }
+        if (!duplicate) snprintf(urls[count++], sizeof(urls[0]), "%s", normalized);
+    }
+    free(copy);
+    return count;
+}
+
+static int build_public_stun_config_response(char *out, size_t out_len)
+{
+    int enabled = env_bool("TUNNEL_PEER_MESH_ENABLED", 0);
+    int port = env_int("TUNNEL_PEER_MESH_STUN_TURN_PORT", 3478);
+    char urls[16][512];
+    size_t count = collect_public_stun_urls(urls, 16U, enabled);
+    char self_url[512] = "";
+    const char *public_address = getenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
+    if (enabled && public_address != NULL && *public_address != '\0') {
+        (void)build_public_ice_url("stun", public_address, port, "", self_url, sizeof(self_url));
+    }
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder,
+                              "{\"peerMeshEnabled\":%s,\"selfHostedStunServer\":",
+                              enabled ? "true" : "false");
+    if (rc == 0) rc = admin_sb_append_json_string(&builder, self_url);
+    if (rc == 0) rc = admin_sb_append(&builder, ",\"stunServers\":[");
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, urls[i]);
+    }
+    if (rc == 0) rc = admin_sb_appendf(&builder, "],\"stunTurnPort\":%d}", port);
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"stun config response failed\"}");
+    }
+    int result = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return result;
+}
+
+static int build_public_ice_config_response(char *out, size_t out_len)
+{
+    int enabled = env_bool("TUNNEL_PEER_MESH_ENABLED", 0);
+    int auth_required = env_bool("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED", 1);
+    int port = env_int("TUNNEL_PEER_MESH_STUN_TURN_PORT", 3478);
+    char urls[16][512];
+    size_t count = collect_public_stun_urls(urls, 16U, enabled);
+    st_admin_string_builder builder = {0};
+    int rc = admin_sb_appendf(&builder, "{\"peerMeshEnabled\":%s,\"iceServers\":[", enabled ? "true" : "false");
+    for (size_t i = 0; rc == 0 && i < count; ++i) {
+        if (i > 0) rc = admin_sb_append(&builder, ",");
+        if (rc == 0) rc = admin_sb_append(&builder, "{\"urls\":");
+        if (rc == 0) rc = admin_sb_append_json_string(&builder, urls[i]);
+        if (rc == 0) rc = admin_sb_append(&builder, ",\"username\":\"\",\"credential\":\"\"}");
+    }
+    const char *public_address = getenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
+    const char *shared_secret = getenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET");
+    int turn_publishable = enabled && public_address != NULL && *public_address != '\0'
+        && (!auth_required || (shared_secret != NULL && *shared_secret != '\0'));
+    if (rc == 0 && turn_publishable) {
+        long long ttl = env_i64("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", 3600);
+        if (ttl < 60) ttl = 60;
+        long long expires = current_time_millis() / 1000LL + ttl;
+        char random_hex[160];
+        char username[128];
+        build_prefixed_token("", random_hex, sizeof(random_hex));
+        snprintf(username, sizeof(username), "%lld:public-transfer:%.8s", expires, random_hex);
+        uint8_t mac[ST_SHA1_LEN];
+        char credential[64];
+        const char *secret = turn_credential_secret();
+        st_hmac_sha1((const uint8_t *)secret, strlen(secret), (const uint8_t *)username, strlen(username), mac);
+        base64url_no_padding(mac, sizeof(mac), credential, sizeof(credential));
+        char turn_url[512];
+        if (build_public_ice_url("turn", public_address, port, "?transport=udp", turn_url, sizeof(turn_url)) == 0) {
+            if (count > 0) rc = admin_sb_append(&builder, ",");
+            if (rc == 0) rc = admin_sb_append(&builder, "{\"urls\":");
+            if (rc == 0) rc = admin_sb_append_json_string(&builder, turn_url);
+            if (rc == 0) rc = admin_sb_append(&builder, ",\"username\":");
+            if (rc == 0) rc = admin_sb_append_json_string(&builder, username);
+            if (rc == 0) rc = admin_sb_append(&builder, ",\"credential\":");
+            if (rc == 0) rc = admin_sb_append_json_string(&builder, credential);
+            if (rc == 0) rc = admin_sb_append(&builder, "}");
+        }
+    }
+    if (rc == 0) {
+        rc = admin_sb_appendf(&builder,
+                              "],\"turnAuthRequired\":%s,\"stunTurnPort\":%d}",
+                              auth_required ? "true" : "false",
+                              port);
+    }
+    if (rc != 0 || builder.data == NULL) {
+        free(builder.data);
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"ice config response failed\"}");
+    }
+    int result = write_response(out, out_len, 200, "OK", builder.data);
+    free(builder.data);
+    return result;
+}
+
 static void build_client_access_token(char out[160])
 {
     build_prefixed_token("cs_", out, 160);
@@ -1190,6 +1426,23 @@ static int build_database_client_auth_login_response(const char *database_path,
     char *os_arch = st_json_get_string(body, "osArch");
     char *client_version = st_json_get_string(body, "clientVersion");
     char *java_version = st_json_get_string(body, "javaVersion");
+    int message_send_capable = 0;
+    int message_receive_capable = 0;
+    int message_attachments_capable = 0;
+    int message_media_preview_capable = 0;
+    long long message_max_attachment_bytes = 0;
+    /* ClientEnvironmentInfo uses the wire-level capability names below.  The
+     * management projection deliberately keeps its message*Capable names, but
+     * accepting those projection names here would silently discard the real
+     * Java/Go/.NET/Android login payload. */
+    (void)st_json_get_bool(body, "sendMessages", &message_send_capable);
+    (void)st_json_get_bool(body, "receiveMessages", &message_receive_capable);
+    (void)st_json_get_bool(body, "attachments", &message_attachments_capable);
+    (void)st_json_get_bool(body, "mediaPreview", &message_media_preview_capable);
+    (void)st_json_get_i64(body, "maxAttachmentBytes", &message_max_attachment_bytes);
+    if (message_max_attachment_bytes < 0) {
+        message_max_attachment_bytes = 0;
+    }
     if (timestamp == NULL || nonce == NULL || signature == NULL
         || machine_fingerprint == NULL || *machine_fingerprint == '\0'
         || os_user == NULL || *os_user == '\0') {
@@ -1337,6 +1590,11 @@ static int build_database_client_auth_login_response(const char *database_path,
     snprintf(session.os_arch, sizeof(session.os_arch), "%s", os_arch == NULL ? "" : os_arch);
     snprintf(session.client_version, sizeof(session.client_version), "%s", client_version == NULL ? "" : client_version);
     snprintf(session.java_version, sizeof(session.java_version), "%s", java_version == NULL ? "" : java_version);
+    session.message_send_capable = message_send_capable;
+    session.message_receive_capable = message_receive_capable;
+    session.message_attachments_capable = message_attachments_capable;
+    session.message_media_preview_capable = message_media_preview_capable;
+    session.message_max_attachment_bytes = message_max_attachment_bytes;
     snprintf(session.http_login_at, sizeof(session.http_login_at), "%s", now_text);
     snprintf(session.expires_at, sizeof(session.expires_at), "%s", expires_text);
     if (st_storage_create_client_session(database_path, &session, &session) != 0) {
@@ -1707,6 +1965,9 @@ static int append_client_view(st_admin_string_builder *builder, const st_storage
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"clientName\":\"%s\",\"ownerUsername\":\"%s\","
                               "\"enabled\":%s,\"connectionRateLimitPerMinute\":%d,"
+                              "\"messageSendCapable\":%s,\"messageReceiveCapable\":%s,"
+                              "\"messageAttachmentsCapable\":%s,\"messageMediaPreviewCapable\":%s,"
+                              "\"messageMaxAttachmentBytes\":%lld,"
                               "\"online\":false,\"connectedSinceMs\":null,"
                               "\"uploadBytes\":0,\"downloadBytes\":0,"
                               "\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
@@ -1715,6 +1976,11 @@ static int append_client_view(st_admin_string_builder *builder, const st_storage
                               owner,
                               client->enabled ? "true" : "false",
                               client->connection_rate_limit_per_minute,
+                              "false",
+                              "false",
+                              "false",
+                              "false",
+                              0LL,
                               created,
                               updated);
     free(client_name);
@@ -1759,6 +2025,17 @@ static int append_peer_mesh_device_view(st_admin_string_builder *builder, const 
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->virtual_device_updated_at);
     if (rc == 0) rc = admin_sb_append(builder, ",\"lastSeenAt\":");
     if (rc == 0) rc = admin_sb_append_nullable_json_string(builder, device->last_seen_at);
+    if (rc == 0) {
+        rc = admin_sb_appendf(builder,
+                              ",\"messageSendCapable\":%s,\"messageReceiveCapable\":%s,"
+                              "\"messageAttachmentsCapable\":%s,\"messageMediaPreviewCapable\":%s,"
+                              "\"messageMaxAttachmentBytes\":%lld",
+                              "false",
+                              "false",
+                              "false",
+                              "false",
+                              0LL);
+    }
     if (rc == 0) rc = admin_sb_append(builder, ",\"updatedAt\":");
     if (rc == 0) rc = admin_sb_append_json_string(builder, device->updated_at);
     if (rc == 0) rc = admin_sb_append(builder, "}");
@@ -1771,29 +2048,33 @@ static int append_peer_mesh_acl_view(st_admin_string_builder *builder, const st_
     char *target = st_json_escape(acl->target_client_name);
     char *created = st_json_escape(acl->created_at);
     char *updated = st_json_escape(acl->updated_at);
-    if (source == NULL || target == NULL || created == NULL || updated == NULL) {
+    char *direction = st_json_escape(acl->direction);
+    if (source == NULL || target == NULL || created == NULL || updated == NULL || direction == NULL) {
         free(source);
         free(target);
         free(created);
         free(updated);
+        free(direction);
         return -1;
     }
     int rc = admin_sb_appendf(builder,
                               "{\"id\":%lld,\"sourceClientId\":%lld,\"sourceClientName\":\"%s\","
                               "\"targetClientId\":%lld,\"targetClientName\":\"%s\","
-                              "\"allowed\":%s,\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
+                              "\"allowed\":%s,\"direction\":\"%s\",\"createdAt\":\"%s\",\"updatedAt\":\"%s\"}",
                               acl->id,
                               acl->source_client_id,
                               source,
                               acl->target_client_id,
                               target,
                               acl->allowed ? "true" : "false",
+                              direction,
                               created,
                               updated);
     free(source);
     free(target);
     free(created);
     free(updated);
+    free(direction);
     return rc;
 }
 
@@ -2761,10 +3042,10 @@ static int admin_can_access_client(const st_admin_context *context, const st_sto
     if (context == NULL || client == NULL) {
         return 0;
     }
-    if (admin_ascii_casecmp(client->tenant_id, context->tenant_id) != 0) {
+    if (strcmp(client->tenant_id, context->tenant_id) != 0) {
         return 0;
     }
-    return context->admin || admin_ascii_casecmp(client->owner_username, context->username) == 0;
+    return context->admin || strcmp(client->owner_username, context->username) == 0;
 }
 
 static int admin_can_access_credential(const st_admin_context *context, const st_storage_client_credential *credential)
@@ -2772,10 +3053,10 @@ static int admin_can_access_credential(const st_admin_context *context, const st
     if (context == NULL || credential == NULL) {
         return 0;
     }
-    if (admin_ascii_casecmp(credential->tenant_id, context->tenant_id) != 0) {
+    if (strcmp(credential->tenant_id, context->tenant_id) != 0) {
         return 0;
     }
-    return context->admin || admin_ascii_casecmp(credential->owner_username, context->username) == 0;
+    return context->admin || strcmp(credential->owner_username, context->username) == 0;
 }
 
 static int admin_load_accessible_client(const char *database_path,
@@ -2794,7 +3075,7 @@ static int admin_load_tenant_client(const char *database_path,
 {
     return st_storage_get_client(database_path, client_id, client) == 0
         && context != NULL
-        && admin_ascii_casecmp(client->tenant_id, context->tenant_id) == 0;
+        && strcmp(client->tenant_id, context->tenant_id) == 0;
 }
 
 static int build_clients_response(const st_admin_context *context, char *out, size_t out_len)
@@ -3992,11 +4273,35 @@ static int handle_peer_mesh_acl_create(const st_admin_context *context, const ch
     if (!admin_load_tenant_client(database_path, context, target_client_id, &target)) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"target client not found\"}");
     }
-    if (!context->admin && admin_ascii_casecmp(target.owner_username, context->username) != 0) {
+    if (!context->admin && strcmp(target.owner_username, context->username) != 0) {
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"ordinary users cannot create cross-user peer ACL\"}");
     }
     int allowed = 1;
     (void)st_json_get_bool(body, "allowed", &allowed);
+    char *direction_value = st_json_get_string(body, "direction");
+    const char *direction = NULL;
+    if (direction_value != NULL && admin_ascii_casecmp(direction_value, "OUTBOUND") == 0) {
+        direction = "OUTBOUND";
+    } else if (direction_value != NULL && admin_ascii_casecmp(direction_value, "INBOUND") == 0) {
+        direction = "INBOUND";
+    } else if (direction_value != NULL && admin_ascii_casecmp(direction_value, "BOTH") == 0) {
+        direction = "BOTH";
+    } else if (direction_value != NULL) {
+        char *escaped_direction = st_json_escape(direction_value);
+        st_admin_string_builder error = {0};
+        int error_rc = escaped_direction == NULL
+            ? -1
+            : admin_sb_appendf(&error, "{\"error\":\"invalid direction: %s\"}", escaped_direction);
+        free(escaped_direction);
+        free(direction_value);
+        if (error_rc != 0 || error.data == NULL) {
+            free(error.data);
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl validation failed\"}");
+        }
+        int response_len = write_response(out, out_len, 400, "Bad Request", error.data);
+        free(error.data);
+        return response_len;
+    }
     st_storage_peer_mesh_acl acl;
     if (st_storage_upsert_peer_mesh_acl(database_path,
                                         context->tenant_id,
@@ -4004,9 +4309,12 @@ static int handle_peer_mesh_acl_create(const st_admin_context *context, const ch
                                         &source,
                                         &target,
                                         allowed,
+                                        direction,
                                         &acl) != 0) {
+        free(direction_value);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"peer mesh acl create failed\"}");
     }
+    free(direction_value);
     return build_peer_mesh_acl_result_response(&acl, 201, "Created", out, out_len);
 }
 
@@ -5340,6 +5648,39 @@ static int st_admin_build_response_internal(const char *method,
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/health")) {
         return write_response(out, out_len, 200, "OK", "{\"status\":\"ok\"}");
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/public/peer-mesh/stun-config")) {
+        return build_public_stun_config_response(out, out_len);
+    }
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/public/transfer/ice-config")) {
+        return build_public_ice_config_response(out, out_len);
+    }
+    long long attachment_id = 0;
+    int public_attachment_path = admin_path_equals(path, "/api/public/transfer/attachments/presign-upload")
+        || admin_parse_nested_path_id(path,
+                                      "/api/public/transfer/attachments/",
+                                      "/complete",
+                                      &attachment_id) == 0
+        || admin_parse_nested_path_id(path,
+                                      "/api/public/transfer/attachments/",
+                                      "/presign-download",
+                                      &attachment_id) == 0;
+    int admin_attachment_path = admin_path_equals(path, "/api/admin/client-messages/attachments/presign-upload")
+        || admin_parse_nested_path_id(path,
+                                      "/api/admin/client-messages/attachments/",
+                                      "/complete",
+                                      &attachment_id) == 0
+        || admin_parse_nested_path_id(path,
+                                      "/api/admin/client-messages/attachments/",
+                                      "/presign-download",
+                                      &attachment_id) == 0;
+    if (strcmp(method, "POST") == 0 && (public_attachment_path || admin_attachment_path)) {
+        return write_response(out,
+                              out_len,
+                              409,
+                              "Conflict",
+                              "{\"error\":\"object storage is not configured\","
+                              "\"code\":\"OBJECT_STORAGE_DISABLED\",\"enabled\":false}");
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/overview")) {
         return build_overview_response(&context, out, out_len);

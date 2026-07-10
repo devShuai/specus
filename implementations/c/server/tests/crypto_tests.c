@@ -33,6 +33,12 @@ int main(void)
 
     uint8_t key[20];
     memset(key, 0x0b, sizeof(key));
+    uint8_t sha1_mac[ST_SHA1_LEN];
+    st_hmac_sha1(key, sizeof(key), (const uint8_t *)"Hi There", 8, sha1_mac);
+    if (expect_hex("hmac-sha1", sha1_mac, sizeof(sha1_mac),
+                   "b617318655057264e28bc0b6fb378c8ef146be00") != 0) {
+        return 1;
+    }
     uint8_t mac[ST_SHA256_LEN];
     st_hmac_sha256(key, sizeof(key), (const uint8_t *)"Hi There", 8, mac);
     if (expect_hex("hmac", mac, sizeof(mac),
