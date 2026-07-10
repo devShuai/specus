@@ -197,7 +197,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
                   "acceptedAnswer": {
                     "@type": "Answer",
                     "text":
-                      "Symmetric NAT 会根据目标地址或端口生成不同的公网映射端点。同一本机 socket 向 STUN A 与 STUN B 发送 binding 时，得到的公网 IP:Port 不同。打洞依赖对端用我们告知的公网端点回包，Symmetric NAT 让这个端点对其它对端不可用，所以打洞通常失败，必须走 relay。",
+                      "Symmetric NAT 会根据目标地址或端口生成不同的公网映射端点。同一本机 socket 向 STUN A 与 STUN B 发送 binding 时，得到的公网 IP:Port 不同。打洞依赖对端用我们告知的公网端点回包，因此通常难以成功；客户端仍会尝试 direct candidate，失败后通常回退 relay。",
                   },
                 },
                 {

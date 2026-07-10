@@ -250,7 +250,7 @@ function PeerMeshSection() {
       <DocCard title="UDP 端口">
         <ul className="ml-5 list-disc space-y-1 text-small">
           <li>
-            <Inline>3478/udp</Inline>：内置 STUN/TURN-lite 主端口，承载 binding、relay allocation 和 relay 数据。
+            <Inline>3478/udp</Inline>：内置标准 STUN/TURN 子集主端口，承载 binding、relay allocation 和 relay 数据。
           </li>
           <li>
             <Inline>3479/udp</Inline>：NAT 类型辅助探测端口。默认由
@@ -269,10 +269,10 @@ sudo firewall-cmd --reload`} />
         </p>
         <div className="grid gap-2">
           {[
-            ["1", "Binding", "客户端向 STUN/TURN-lite 主端口发送探测包。"],
+            ["1", "Binding", "客户端向标准 STUN/TURN 子集主端口发送探测包。"],
             ["2", "Mapped Endpoint", "服务端记录公网 IP:Port 并回传。"],
             ["3", "Alternate Port", "向辅助 UDP 端口探测，比较映射是否变化。"],
-            ["4", "Path Policy", "直连友好优先 direct，Symmetric NAT 快速 relay。"],
+            ["4", "Path Policy", "所有 NAT 结论都先尝试 direct candidate，失败后再回退 relay。"],
           ].map(([index, title, text]) => (
             <div
               key={index}
@@ -372,7 +372,7 @@ function ProtocolSection() {
           </li>
           <li>各「端口映射」自定义的公网监听端口（如 9000）。</li>
           <li>
-            <Inline>3478/udp</Inline> — peer mesh STUN/TURN-lite 主端口。
+            <Inline>3478/udp</Inline> — peer mesh 标准 STUN/TURN 子集主端口。
             通过环境变量 <Inline>TUNNEL_PEER_MESH_STUN_TURN_PORT</Inline> 覆盖。
           </li>
           <li>
@@ -386,7 +386,7 @@ function ProtocolSection() {
         <p className="text-small">
           控制连接走自定义二进制协议，默认 11 字节头（magic / version / serializer / command / length），
           消息体采用紧凑二进制序列化，必要时启用 deflate 压缩。客户端实现之间字节级兼容。
-          Peer mesh 信令复用控制连接的 <Inline>PEER_CONTROL</Inline>，数据面优先 UDP 直连，失败后走内置 TURN-lite relay。
+          Peer mesh 信令复用控制连接的 <Inline>PEER_CONTROL</Inline>，数据面优先 UDP 直连，失败后走内置标准 TURN 子集 relay。
         </p>
       </DocCard>
 

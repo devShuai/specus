@@ -51,7 +51,7 @@ export const UNKNOWN_NAT_PROFILE: NatTypeProfile = {
   reachabilityLabel: "等待检测",
   summary: "客户端还没有上报完整 NAT 探测结果，或服务端 UDP 探测端口不可达。",
   detection: "没有可用的 mapped endpoint，页面只能展示未知状态。",
-  recommendation: "确认客户端在线、已启用私有组网，并放行 STUN/TURN-lite UDP 主端口和辅助探测端口。",
+  recommendation: "确认客户端在线、已启用私有组网，并放行标准 STUN/TURN 子集 UDP 主端口和辅助探测端口。",
 };
 
 export const NAT_TYPE_PROFILES: Record<string, NatTypeProfile> = {
@@ -108,7 +108,7 @@ export const NAT_TYPE_PROFILES: Record<string, NatTypeProfile> = {
     reachabilityLabel: "直连受限",
     summary: "公网映射端点相对稳定，但入站 UDP 往往要求先向目标 IP:Port 发过包。",
     detection: "主端口映射稳定，但辅助端口主动回包不可达或不足以确认 Full cone。",
-    recommendation: "双方都不是 Symmetric NAT 时可尝试 direct；失败后应快速切 relay。",
+    recommendation: "仍会尝试 direct candidate；若对端映射不可达，应自动回退 relay。",
   },
   SYMMETRIC_NAT: {
     key: "SYMMETRIC_NAT",

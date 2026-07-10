@@ -810,7 +810,7 @@ function PeerNatInsight({
               <div>
                 <h3 className="text-base font-semibold">客户端 NAT 探测</h3>
                 <p className="text-small text-default-500">
-                  这里展示 tunnel-client 上报的 STUN/TURN-lite 探测结果，用于判断 Peer Mesh direct / relay 选择。
+                  这里展示 tunnel-client 上报的标准 STUN/TURN 子集探测结果，用于判断 Peer Mesh direct / relay 选择。
                 </p>
               </div>
               <Chip size="sm" variant="flat">

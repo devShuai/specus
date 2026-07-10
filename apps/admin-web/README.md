@@ -11,7 +11,7 @@ npm install
 npm run dev          # http://localhost:5173,代理后端到 127.0.0.1:8088
 ```
 
-`npm run dev` 会把 `/api`、`/auth`、`/oidc-config`、`/oidc`、`/http`、`/ws` 代理到后端。
+`npm run dev` 会把 `/api`、`/auth`、`/oidc-config`、`/oidc`、`/http`、`/health`、`/ws` 代理到后端。
 后端地址可用环境变量覆盖:
 
 ```bash
@@ -23,7 +23,7 @@ VITE_API_TARGET=http://127.0.0.1:8088 npm run dev
 ## 构建与部署
 
 ```bash
-npm run build        # 类型检查 + 产出 dist/(index.html + assets/)
+npm run build        # 同步 protocol/schemas + 类型检查 + 产出 dist/(index.html + assets/)
 npm run build:openresty # build 后额外生成 .gz/.br 预压缩文件，供 OpenResty 静态服务
 npm run deploy:java  # build 后只写 implementations/java/server/src/main/resources/static/
 npm run deploy:go     # build 后只写 implementations/go/server/web/static/
@@ -50,10 +50,11 @@ sudo openresty -s reload
 ```
 
 OpenResty 会对 `/assets/*` 启用长期强缓存和 `gzip_static`，并把 `/api`、`/auth`、
-`/oidc`、`/http`、`/ws` 反代到后端 `tunnel-server:8088`。完整配置见
+`/oidc`、`/oidc-config`、`/http`、`/actuator`、`/health`、`/.well-known`、`/ws` 反代到后端 `tunnel-server:8088`。完整配置见
 `deploy/openresty/README.md`。
 
-`scripts/deploy.mjs` 会按 `--target` 清空并写入目标目录，只有 `deploy:all` 才会写入三端:
+`scripts/deploy.mjs` 会按 `--target` 清空并写入目标目录，只有 `deploy:all` 才会写入三端：
+
 - `implementations/go/server/web/static/`(go:embed —— 之后需 `go build` 重新嵌入)
 - `implementations/csharp/server/src/ShuaiTunnel.Server/wwwroot/`(下次 `dotnet build`/运行生效)
 - `implementations/java/server/src/main/resources/static/`(Spring 静态,下次构建/运行生效)
@@ -61,30 +62,35 @@ OpenResty 会对 `/assets/*` 启用长期强缓存和 `gzip_static`，并把 `/a
 ## 测试
 
 ```bash
-npm run test         # Vitest:格式化与 PKCE 工具单测
+npm run test         # Vitest:格式化、PKCE 与流式 SHA-256 工具单测
 npm run typecheck    # tsc --noEmit
 ```
 
 ## 功能
 
-复刻原 vanilla SPA 全部能力:
+当前主要能力：
+
 - 登录:用户名/密码 + OIDC(PKCE S256);token 存 `sessionStorage`,密码登录自动续期,401 统一登出。
-- 概览、客户端(增改删 + 下发映射 + 一次性密码)、端口映射(增改删 + 状态切换)、HTTP 路由(增改删 + 筛选 + 切换)。
+- 概览、客户端/凭证、端口映射、HTTP 路由、客户端应用包下载和系统管理。
+- 客户端消息与附件、免登录房间文件互传（WebRTC 直连优先、OSS 分享兜底）。
 - 连接记录:筛选 + 分页 + WebSocket 实时(created/updated)+ 活动连接 1Hz 时长刷新。
 - 流量观测:客户端 / TCP 映射 / HTTP 路由聚合，HTTP 协议记录和 TCP 数据帧分页查看。
 - HTTP 协议详情:请求/响应两列展示，Header 支持表单与 Raw 切换，常见 Header 带中文说明和规范链接。
 - Body 预览:JSON 高亮、表单、Multipart、HTML、XML、图片和文本预览；`Content-Encoding: gzip` / `deflate` 会在旧记录展示时尝试浏览器侧解压，新记录由服务端入库前解压，`br` 新记录由服务端处理。
 - TCP 详情:保留完整二进制 payload，前端按 HTTP、JSON、图片、文本或 hexdump 做 best-effort 解析。
+- Peer Mesh 设备、ACL、会话、NAT/路径/RTT/流量展示，以及公开免登录 NAT 检测页。
+- 内置帮助页、响应式分组导航、客户端详情抽屉和客户端下载入口。
 - 全中文、HeroUI 深浅主题，落地页与后台均支持主题切换。
 
 ## 结构
 
 ```
 src/
-├── api/{client.ts,types.ts}   # fetch 封装 + DTO
-├── auth/AuthContext.tsx        # token / 刷新 / OIDC PKCE / 401
-├── hooks/{useConnectionsFeed,useNowTick,useClients}.ts
-├── lib/{format,pkce}.ts
-├── components/toast.ts
-└── pages/{LoginPage,Dashboard}.tsx + pages/panels/*Panel.tsx
+├── api/{client.ts,types.ts}                       # fetch 封装 + DTO
+├── auth/AuthContext.tsx                           # token / 刷新 / OIDC PKCE / 401
+├── hooks/{useConnectionsFeed,useNowTick,useClients,useDirectTransfer}.ts
+├── lib/{format,nat,pkce,qr,seo,sha256,transferPreview}.ts
+├── components/{Sidebar,EmptyState,ClientDetailDrawer,...}.tsx
+└── pages/{LoginPage,Dashboard,PublicTransferPage}.tsx
+    └── panels/{Overview,Clients,AdminMessages,Tunnels,HttpRoutes,Connections,Traffic,PeerMesh,ClientDownloads,System,Help,NatDetection}Panel.tsx
 ```
