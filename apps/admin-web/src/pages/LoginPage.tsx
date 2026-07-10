@@ -175,14 +175,14 @@ function LoginPageContent() {
 
             <div className="grid max-w-3xl grid-cols-2 gap-3 sm:grid-cols-4">
               {metrics.map((item) => (
-                <div key={item.label} className="rounded-md border border-black/10 bg-white/65 p-3 shadow-sm dark:border-white/10 dark:bg-white/[0.055] dark:shadow-none">
+                <div key={item.label} className="glass glass-border rounded-md border p-3 shadow-sm dark:shadow-none">
                   <p className="text-xl font-semibold text-cyan-700 dark:text-cyan-100">{item.value}</p>
                   <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{item.label}</p>
                 </div>
               ))}
             </div>
 
-            <div className="flex max-w-3xl flex-col gap-3 rounded-md border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-black/30 dark:shadow-none sm:flex-row sm:items-center">
+            <div className="glass glass-border flex max-w-3xl flex-col gap-3 rounded-md border p-4 shadow-sm dark:shadow-none sm:flex-row sm:items-center">
               {flowNodes.map((node, index) => (
                 <div key={node} className="flex min-w-0 flex-1 items-center gap-3">
                   <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-amber-500/35 bg-amber-300/20 text-small text-amber-800 dark:border-amber-300/30 dark:bg-amber-300/10 dark:text-amber-100">
@@ -196,7 +196,7 @@ function LoginPageContent() {
           </div>
 
           <div ref={loginPanelRef} id="login-panel">
-            <div className="landing-card rounded-md border border-black/10 bg-white/80 text-zinc-950 backdrop-blur-xl dark:border-white/15 dark:bg-white/[0.08] dark:text-white">
+            <div className="landing-card glass-strong glass-border rounded-md border text-zinc-950 dark:text-white">
               <div className="flex flex-col items-start gap-2 px-5 pb-2 pt-5">
                 <span className="rounded-md bg-cyan-300/25 px-2 py-1 text-tiny text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100">
                   管理台登录
@@ -274,7 +274,7 @@ function LoginPageContent() {
         </div>
       </section>
 
-      <section className="relative z-10 border-t border-black/10 bg-white/65 px-5 py-10 backdrop-blur-md dark:border-white/10 dark:bg-black/50 sm:px-8">
+      <section className="glass glass-border relative z-10 border-t px-5 py-10 sm:px-8">
         <div className="mx-auto max-w-[1440px]">
           <div className="mb-6 max-w-2xl">
             <h2 className="text-2xl font-semibold text-zinc-950 dark:text-white">组网形态</h2>
@@ -342,7 +342,7 @@ function LoginPageContent() {
             {featureCards.map((feature) => (
               <article
                 key={feature.title}
-                className="rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none"
+                className="glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
               >
                 <div className="grid gap-3 p-4">
                   <span className="w-fit rounded-md border border-cyan-500/25 bg-cyan-300/15 px-2 py-1 text-tiny text-cyan-700 dark:border-cyan-300/25 dark:bg-cyan-300/10 dark:text-cyan-100">
@@ -355,7 +355,7 @@ function LoginPageContent() {
             ))}
           </div>
 
-          <div className="mt-12 flex flex-col gap-3 rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
+          <div className="glass glass-border mt-12 flex flex-col gap-3 rounded-md border p-5">
             <div className="flex flex-wrap items-center gap-3">
               <span className="text-base font-semibold text-zinc-950 dark:text-white">四种实现 · 一份协议</span>
               <span className="rounded-md border border-emerald-500/25 bg-emerald-300/15 px-2 py-0.5 text-tiny text-emerald-700 dark:border-emerald-300/25 dark:bg-emerald-300/10 dark:text-emerald-100">
@@ -366,7 +366,7 @@ function LoginPageContent() {
               {implementationChips.map((chip) => (
                 <span
                   key={chip.name}
-                  className="inline-flex items-baseline gap-1.5 rounded-md border border-black/10 bg-white/65 px-3 py-1.5 text-tiny text-zinc-700 dark:border-white/10 dark:bg-white/[0.04] dark:text-zinc-300"
+                  className="glass-chip glass-border inline-flex items-baseline gap-1.5 rounded-md border px-3 py-1.5 text-tiny text-zinc-700 dark:text-zinc-300"
                 >
                   <span className="font-semibold text-cyan-700 dark:text-cyan-200">{chip.name}</span>
                   <span className="text-zinc-500 dark:text-zinc-500">·</span>
@@ -439,7 +439,7 @@ function MoonIcon() {
  */
 function TopologyDiagram() {
   return (
-    <div className="topology-panel rounded-md border border-black/10 bg-white/70 p-5 backdrop-blur-md dark:border-white/10 dark:bg-white/[0.04]">
+    <div className="topology-panel glass glass-border rounded-md border p-5">
       <MobileTopologyDiagram />
       <svg
         className="topology-svg hidden sm:block"
@@ -691,7 +691,7 @@ function ClientDownloadsSection() {
         {grouped.map(({ implementation, items }) => (
           <section
             key={implementation}
-            className="rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none"
+            className="glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
           >
             <div className="grid gap-3 p-4">
               <span className="w-fit rounded-md bg-cyan-300/25 px-2 py-1 text-tiny text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100">
@@ -701,7 +701,7 @@ function ClientDownloadsSection() {
                 {items.map((link) => (
                   <a
                     key={link.id}
-                    className="group flex items-start justify-between gap-2 rounded-md border border-black/10 bg-white/65 p-2.5 transition hover:border-cyan-500/40 hover:bg-white/85 dark:border-white/10 dark:bg-white/[0.04] dark:hover:bg-white/[0.08]"
+                    className="glass-chip glass-border group flex items-start justify-between gap-2 rounded-md border p-2.5 transition hover:border-cyan-500/40 hover:bg-white/85 dark:hover:bg-white/[0.08]"
                     href={link.downloadUrl}
                     rel="noopener noreferrer"
                     target="_blank"
@@ -764,7 +764,7 @@ function PrincipleCard({
 }) {
   return (
     <article
-      className={`principle-card principle-card-${accent} rounded-md border border-black/10 bg-white/70 text-zinc-950 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-white/[0.055] dark:text-white dark:shadow-none`}
+      className={`principle-card principle-card-${accent} glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none`}
     >
       <div className="principle-card-body grid gap-5 p-5">
         <div className="flex flex-col gap-2">

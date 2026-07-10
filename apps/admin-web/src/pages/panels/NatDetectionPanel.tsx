@@ -290,8 +290,8 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         <header className="relative z-10 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8">
           <AppLogo label="shuai-tunnel" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
           <div className="flex items-center gap-2">
-            <ThemeToggleButton className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" />
-            <Button as="a" href="/" radius="sm" variant="flat" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white">
+            <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
+            <Button as="a" href="/" radius="sm" variant="flat" className="glass-chip text-zinc-950 dark:text-white">
               进入控制台
             </Button>
           </div>
@@ -391,7 +391,7 @@ function NatHero({
             <a
               href="#/help/peer-mesh#nat-types"
               title={`${natTypeProfileEntry.summary}（点击查看帮助文档）`}
-              className="inline-flex items-center gap-1.5 rounded-md border border-black/10 bg-white/70 px-2 py-0.5 text-tiny font-medium transition-colors hover:border-black/20 hover:bg-white dark:border-white/10 dark:bg-white/[0.06] dark:hover:border-white/20 dark:hover:bg-white/[0.1]"
+              className="inline-flex items-center gap-1.5 rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium transition-colors hover:border-black/20 hover:bg-white dark:hover:border-white/20 dark:hover:bg-white/[0.1]"
             >
               <span className={`inline-block h-2 w-2 rounded-full ${natToneBg(natTypeProfileEntry.tone)}`} />
               <span>{natTypeProfileEntry.label}</span>
@@ -404,7 +404,7 @@ function NatHero({
             </span>
           )}
           {result && (
-            <span className="rounded-md bg-white/70 px-2 py-0.5 text-tiny text-zinc-600 dark:bg-white/[0.06] dark:text-zinc-300">
+            <span className="rounded-md glass-chip px-2 py-0.5 text-tiny text-zinc-600 dark:text-zinc-300">
               置信度：{confidenceLabel(result.confidence)}
             </span>
           )}
@@ -418,7 +418,7 @@ function NatHero({
             {result?.summary ?? profile.description}
           </p>
           {result?.recommendation && (
-            <p className="max-w-2xl rounded-lg border border-black/5 bg-white/70 p-3 text-small leading-6 text-zinc-700 backdrop-blur dark:border-white/10 dark:bg-white/[0.04] dark:text-zinc-300">
+            <p className="max-w-2xl rounded-lg border border-black/5 dark:border-white/10 glass p-3 text-small leading-6 text-zinc-700 dark:text-zinc-300">
               {result.recommendation}
             </p>
           )}
@@ -449,7 +449,7 @@ function NatHero({
           <MetricStrip result={result} />
         )}
 
-        <details className="group rounded-lg border border-black/10 bg-white/60 px-3 py-2 text-small backdrop-blur dark:border-white/10 dark:bg-white/[0.04]">
+        <details className="group rounded-lg border glass glass-border px-3 py-2 text-small">
           <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-zinc-700 transition-colors hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-white">
             <span className="flex items-center gap-2">
               <ChevronIcon className="h-4 w-4 transition-transform group-open:rotate-90" />
@@ -501,7 +501,7 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
       {items.map((item) => (
         <div
           key={item.label}
-          className="rounded-lg border border-black/10 bg-white/65 px-3 py-2 backdrop-blur dark:border-white/10 dark:bg-white/[0.04]"
+          className="rounded-lg border glass glass-border px-3 py-2"
         >
           <div className="text-tiny text-zinc-500 dark:text-zinc-400">{item.label}</div>
           <div className="mt-0.5 font-mono text-lg font-semibold text-zinc-950 dark:text-white">
@@ -522,7 +522,7 @@ function NatResultDetails({
 }) {
   if (!result) {
     return (
-      <Card shadow="none" className="mt-6 rounded-xl border border-black/10 bg-white/60 backdrop-blur dark:border-white/10 dark:bg-white/[0.03]">
+      <Card shadow="none" className="mt-6 rounded-xl border glass glass-border">
         <CardBody className="flex flex-row items-center gap-3 p-5">
           <Spinner size="sm" />
           <span className="text-small text-zinc-600 dark:text-zinc-400">
@@ -543,14 +543,14 @@ function NatResultDetails({
 
 function MappedEndpointsCard({ result }: { result: BrowserNatResult }) {
   return (
-    <Card shadow="none" className="rounded-xl border border-black/10 bg-white/60 backdrop-blur dark:border-white/10 dark:bg-white/[0.03]">
+    <Card shadow="none" className="rounded-xl border glass glass-border">
       <CardBody className="gap-4 p-5">
         <div className="flex items-center gap-2">
           <DotIcon className={result.mappedEndpoints.length ? "text-emerald-500" : "text-zinc-400"} />
           <h2 className="text-base font-semibold">公网映射端点</h2>
         </div>
         {result.mappedEndpoints.length === 0 ? (
-          <p className="rounded-lg border border-dashed border-black/15 bg-white/40 p-3 text-small text-zinc-600 dark:border-white/15 dark:bg-white/[0.02] dark:text-zinc-400">
+          <p className="rounded-lg border border-dashed border-black/15 dark:border-white/15 glass-chip p-3 text-small text-zinc-600 dark:text-zinc-400">
             未发现 server-reflexive 映射端点。
           </p>
         ) : (
@@ -580,7 +580,7 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
   );
 
   return (
-    <details className="rounded-xl border border-black/10 bg-white/60 backdrop-blur transition-colors open:border-black/15 dark:border-white/10 dark:bg-white/[0.03] dark:open:border-white/15">
+    <details className="rounded-xl border glass glass-border transition-colors open:border-black/15 dark:open:border-white/15">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-5 text-base font-semibold">
         <span className="flex items-center gap-2">
           <ChevronIcon className="h-4 w-4 transition-transform" />
@@ -657,7 +657,7 @@ function NatTips() {
       {tips.map((tip) => (
         <div
           key={tip.title}
-          className="rounded-xl border border-black/10 bg-white/55 p-4 backdrop-blur dark:border-white/10 dark:bg-white/[0.03]"
+          className="rounded-xl border glass glass-border p-4"
         >
           <div className="text-small font-semibold text-zinc-900 dark:text-white">{tip.title}</div>
           <p className="mt-1.5 text-small leading-6 text-zinc-600 dark:text-zinc-400">{tip.text}</p>
@@ -676,7 +676,7 @@ function NatTips() {
             size="sm"
             radius="sm"
             variant="flat"
-            className="bg-white/80 text-zinc-950 dark:bg-white/10 dark:text-white"
+            className="glass-chip text-zinc-950 dark:text-white"
           >
             阅读 Tailscale NAT traversal
           </Button>

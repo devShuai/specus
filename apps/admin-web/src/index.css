@@ -195,6 +195,52 @@ body {
     0 0 0 1px rgba(255, 255, 255, 0.03) inset;
 }
 
+/*
+ * 玻璃拟态层级：landing/公开页叠在渐变 hero 上的半透明表面。
+ * 归并原先散落的 bg-white/55..80 与 dark:bg-white/[0.03]..[0.08] 魔法透明度。
+ * 填充与描边分离，便于自定义描边（如 cyan）的元素只取填充：
+ *   .glass         常规表面：白纱 0.65 / 暗白纱 0.04 + 8px 模糊
+ *   .glass-strong  强调表面：白纱 0.80 / 暗白纱 0.08 + 16px 模糊
+ *   .glass-chip    小徽标/内联码：白纱 0.70 / 暗白纱 0.10，无模糊
+ *   .glass-border  标准玻璃描边：黑 0.10 / 白 0.10，需配合 `border` 宽度使用
+ * 自定义描边的元素用 .glass/.glass-strong + 自带 border 工具类，不要叠加 .glass-border。
+ */
+.glass {
+  background-color: rgb(255 255 255 / 0.65);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.dark .glass {
+  background-color: rgb(255 255 255 / 0.04);
+}
+
+.glass-strong {
+  background-color: rgb(255 255 255 / 0.8);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.dark .glass-strong {
+  background-color: rgb(255 255 255 / 0.08);
+}
+
+.glass-chip {
+  background-color: rgb(255 255 255 / 0.7);
+}
+
+.dark .glass-chip {
+  background-color: rgb(255 255 255 / 0.1);
+}
+
+.glass-border {
+  border-color: rgb(0 0 0 / 0.1);
+}
+
+.dark .glass-border {
+  border-color: rgb(255 255 255 / 0.1);
+}
+
 .landing-ghost-button,
 .landing-icon-button,
 .landing-primary-button,
@@ -1348,7 +1394,9 @@ body {
 
   .landing-card,
   .principle-card,
-  .topology-panel {
+  .topology-panel,
+  .glass,
+  .glass-strong {
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
   }

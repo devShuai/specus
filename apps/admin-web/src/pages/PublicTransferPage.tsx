@@ -751,15 +751,15 @@ function PublicTransferPageContent() {
       <header className="relative z-10 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
         <AppLogo label="shuai-tunnel" subtitle="传文件" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="flex shrink-0 items-center gap-2">
-          <ThemeToggleButton className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white" />
-          <Button as="a" href="/" radius="sm" variant="flat" className="bg-white/70 text-zinc-950 dark:bg-white/10 dark:text-white">
+          <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
+          <Button as="a" href="/" radius="sm" variant="flat" className="glass-chip text-zinc-950 dark:text-white">
             控制台
           </Button>
         </div>
       </header>
 
       <section className="relative z-10 mx-auto grid w-full max-w-[1120px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="min-w-0 rounded-xl border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05] sm:p-6">
+        <div className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-6">
           <div className="flex flex-col gap-2">
             <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">文件互传</div>
             <h1 className="text-2xl font-semibold sm:text-4xl">把文件发给另一台设备</h1>
@@ -778,7 +778,7 @@ function PublicTransferPageContent() {
                 <span>我的名称</span>
                 <button
                   type="button"
-                  className="max-w-full truncate rounded bg-white/70 px-1.5 py-0.5 font-mono underline-offset-2 hover:underline dark:bg-white/10"
+                  className="max-w-full truncate rounded glass-chip px-1.5 py-0.5 font-mono underline-offset-2 hover:underline"
                   onClick={() => void copyText(peerId).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
                 >
                   {peerId}
@@ -801,7 +801,7 @@ function PublicTransferPageContent() {
             </div>
           </div>
 
-          <details className="mt-3 rounded-lg border border-black/10 bg-white/55 p-3 text-small dark:border-white/10 dark:bg-white/[0.03]">
+          <details className="mt-3 rounded-lg glass glass-border border p-3 text-small">
             <summary className="cursor-pointer font-medium text-zinc-900 dark:text-white">房间设置</summary>
             <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
               <Input
@@ -828,7 +828,7 @@ function PublicTransferPageContent() {
                 }
               />
             </div>
-            <div className="mt-3 rounded-lg border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.03]">
+            <div className="mt-3 rounded-lg glass glass-border border p-3">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
                   <div className="text-small font-medium text-zinc-900 dark:text-white">接收前确认</div>
@@ -848,7 +848,7 @@ function PublicTransferPageContent() {
           </details>
 
           {qrVisible && (
-            <div className="mt-3 flex flex-col gap-3 rounded-lg border border-cyan-500/20 bg-white/65 p-3 dark:border-cyan-300/20 dark:bg-white/[0.04] sm:flex-row sm:items-center">
+            <div className="mt-3 flex flex-col gap-3 rounded-lg glass border border-cyan-500/20 p-3 dark:border-cyan-300/20 sm:flex-row sm:items-center">
               <RoomQrCode value={roomJoinUrl} />
               <div className="min-w-0 flex-1">
                 <div className="text-small font-semibold text-zinc-900 dark:text-white">扫码加入当前房间</div>
@@ -870,7 +870,7 @@ function PublicTransferPageContent() {
             </div>
           )}
 
-          <div className="mt-5 rounded-lg border border-dashed border-zinc-300 bg-white/60 p-4 dark:border-white/15 dark:bg-white/[0.03]">
+          <div className="mt-5 rounded-lg glass border border-dashed border-zinc-300 p-4 dark:border-white/15">
             <input
               id="public-transfer-file-input"
               type="file"
@@ -944,7 +944,7 @@ function PublicTransferPageContent() {
 
           {record && (
             <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
-              <div className="rounded-lg border border-black/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/[0.03]">
+              <div className="rounded-lg glass glass-border border p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="text-base font-semibold text-zinc-950 dark:text-white">
@@ -976,7 +976,7 @@ function PublicTransferPageContent() {
           )}
         </div>
 
-        <aside className="min-w-0 rounded-xl border border-black/10 bg-white/70 p-4 shadow-sm backdrop-blur dark:border-white/10 dark:bg-white/[0.05] sm:p-5">
+        <aside className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5">
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold">发送给谁</h2>
@@ -990,7 +990,7 @@ function PublicTransferPageContent() {
           </div>
           <div className="mt-3 flex flex-col gap-2">
             {peers.length === 0 ? (
-              <div className="rounded-lg border border-black/10 bg-white/60 p-3 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400">
+              <div className="rounded-lg glass glass-border border p-3 text-small text-zinc-500 dark:text-zinc-400">
                 还没有其它设备。点击“邀请对方”或“手机扫码”，打开后会出现在这里。
               </div>
             ) : peers.map((peer) => (
@@ -1001,7 +1001,7 @@ function PublicTransferPageContent() {
                 className={`rounded-lg border px-3 py-2 text-left text-small transition-colors ${
                   selectedPeerId === peer.peerId
                     ? "border-cyan-400 bg-cyan-50 text-cyan-900 dark:border-cyan-300/40 dark:bg-cyan-400/10 dark:text-cyan-100"
-                    : "border-black/10 bg-white/60 text-zinc-700 hover:border-black/20 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-200"
+                    : "glass glass-border text-zinc-700 hover:border-black/20 dark:text-zinc-200"
                 }`}
               >
                 <div className="flex items-center justify-between gap-2">
@@ -1049,7 +1049,7 @@ function IncomingFilesPanel({
   const hasIncoming = incoming.length > 0;
 
   return (
-    <section className="mt-5 rounded-lg border border-black/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/[0.03]">
+    <section className="mt-5 rounded-lg glass glass-border border p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h2 className="text-base font-semibold text-zinc-950 dark:text-white">收到的文件</h2>
@@ -1109,13 +1109,13 @@ function IncomingFilesPanel({
 
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         {!hasIncoming && !hasPending && !hasReceiving ? (
-          <div className="rounded-lg border border-dashed border-black/10 bg-white/60 p-4 text-small text-zinc-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400 md:col-span-2">
+          <div className="rounded-lg glass border border-dashed glass-border p-4 text-small text-zinc-500 dark:text-zinc-400 md:col-span-2">
             暂无附件消息。对方发送文件后会出现在这里。
           </div>
         ) : incoming.map((item) => {
           const previewUrl = item.previewUrl || item.downloadUrl;
           return (
-            <div key={incomingItemKey(item)} className="rounded-lg border border-black/10 bg-white/70 p-3 dark:border-white/10 dark:bg-white/[0.04]">
+            <div key={incomingItemKey(item)} className="rounded-lg glass glass-border border p-3">
               <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
               <div className="mt-1 text-tiny text-zinc-500">
                 来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
@@ -1258,10 +1258,10 @@ function FilePreview({
       ? "h-44 w-full"
       : "h-80 w-full";
   const fallbackClass = expanded
-    ? "flex min-h-[45dvh] flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]"
+    ? "flex min-h-[45dvh] flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center"
     : compact
-      ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded border border-black/10 bg-white/60 p-3 text-center dark:border-white/10 dark:bg-white/[0.03]"
-      : "flex h-64 flex-col items-center justify-center rounded-lg border border-black/10 bg-white/60 p-4 text-center dark:border-white/10 dark:bg-white/[0.03]";
+      ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded glass glass-border border p-3 text-center"
+      : "flex h-64 flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center";
 
   if (url && kind === "image" && !previewFailed) {
     return (
@@ -1381,7 +1381,7 @@ function TransferFaq({ iceConfig }: { iceConfig: PublicTransferIceConfig | null 
   const routeLabel = iceConfig?.turnAuthRequired ? "备用通道已启用" : "备用通道检测中";
 
   return (
-    <section className="mt-6 rounded-lg border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.03]">
+    <section className="mt-6 rounded-lg glass glass-border border p-3">
       <h2 className="text-base font-semibold text-zinc-950 dark:text-white">常见问题</h2>
       <div className="mt-2 divide-y divide-black/10 dark:divide-white/10">
         <FaqItem title="怎么把手机加进来？">
