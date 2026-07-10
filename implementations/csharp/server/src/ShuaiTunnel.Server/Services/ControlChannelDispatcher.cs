@@ -11,6 +11,7 @@ using ShuaiTunnel.Server.Http;
 using ShuaiTunnel.Server.Nat;
 using ShuaiTunnel.Server.PeerMesh;
 using ShuaiTunnel.Server.Sessions;
+using ShuaiTunnel.Server.WebSockets;
 
 namespace ShuaiTunnel.Server.Services;
 
@@ -31,10 +32,12 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
     private readonly SessionRegistry _sessions;
     private readonly NatServerHandler _nat;
     private readonly DirectHttpDispatcher _directHttp;
+    private readonly ClientMessagesHub _clientMessages;
     private readonly ILogger<ControlChannelDispatcher> _logger;
 
     public ControlChannelDispatcher(IServiceProvider services, LoginExecutor loginExecutor,
         SessionRegistry sessions, NatServerHandler nat, DirectHttpDispatcher directHttp,
+        ClientMessagesHub clientMessages,
         ILogger<ControlChannelDispatcher> logger)
     {
         _services = services;
@@ -42,6 +45,7 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         _sessions = sessions;
         _nat = nat;
         _directHttp = directHttp;
+        _clientMessages = clientMessages;
         _logger = logger;
     }
 
@@ -123,11 +127,29 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         var source = await db.ClientAccounts.AsNoTracking()
             .FirstOrDefaultAsync(c => c.ClientName == context.ClientName, context.Lifetime)
             .ConfigureAwait(false);
+        if (source is null || !source.Enabled)
+        {
+            _logger.LogWarning("[{ChannelId}] client message rejected: source account unavailable source={Source}",
+                context.ChannelId, context.ClientName);
+            return;
+        }
         var targetName = request.ToClientName.Trim();
+        if (targetName.StartsWith("admin:", StringComparison.OrdinalIgnoreCase))
+        {
+            var delivered = await _clientMessages.DeliverFromClientAsync(
+                source, targetName, request.Message, context.Lifetime).ConfigureAwait(false);
+            if (!delivered)
+            {
+                _logger.LogInformation(
+                    "[{ChannelId}] client message admin target offline source={Source} target={Target}",
+                    context.ChannelId, source.ClientName, targetName);
+            }
+            return;
+        }
         var target = await db.ClientAccounts.AsNoTracking()
             .FirstOrDefaultAsync(c => c.ClientName == targetName, context.Lifetime)
             .ConfigureAwait(false);
-        if (source is null || target is null || !source.Enabled || !target.Enabled)
+        if (target is null || !target.Enabled)
         {
             _logger.LogWarning("[{ChannelId}] client message rejected: account unavailable source={Source} target={Target}",
                 context.ChannelId, context.ClientName, targetName);

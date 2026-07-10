@@ -31,13 +31,14 @@ public sealed class ConnectionEventsHub
             return;
         }
 
+        var token = AdminBearerTokenValidator.ExtractWebSocketToken(context.Request);
         var principal = await tokens.ValidateAsync(
-            context.Request.Query["token"].ToString(),
+            token,
             context.RequestAborted).ConfigureAwait(false);
         if (principal is null)
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
-            context.Response.Headers["X-Auth-Reason"] = "invalid token";
+            context.Response.Headers["X-Auth-Reason"] = token is null ? "missing token" : "invalid token";
             return;
         }
 

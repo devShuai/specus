@@ -32,6 +32,7 @@ public sealed class TunnelDbContext : DbContext
     public DbSet<PeerMeshAcl> PeerMeshAcls => Set<PeerMeshAcl>();
     public DbSet<PeerMeshSession> PeerMeshSessions => Set<PeerMeshSession>();
     public DbSet<ConnectionStat> ConnectionStats => Set<ConnectionStat>();
+    public DbSet<TransferAttachment> TransferAttachments => Set<TransferAttachment>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -126,6 +127,11 @@ public sealed class TunnelDbContext : DbContext
             b.Property(x => x.ClientVersion).HasColumnName("client_version").HasMaxLength(80);
             b.Property(x => x.JavaVersion).HasColumnName("java_version").HasMaxLength(80);
             b.Property(x => x.LocalAddresses).HasColumnName("local_addresses").HasMaxLength(2000);
+            b.Property(x => x.MessageSendCapable).HasColumnName("message_send_capable").IsRequired();
+            b.Property(x => x.MessageReceiveCapable).HasColumnName("message_receive_capable").IsRequired();
+            b.Property(x => x.MessageAttachmentsCapable).HasColumnName("message_attachments_capable").IsRequired();
+            b.Property(x => x.MessageMediaPreviewCapable).HasColumnName("message_media_preview_capable").IsRequired();
+            b.Property(x => x.MessageMaxAttachmentBytes).HasColumnName("message_max_attachment_bytes").IsRequired();
             b.Property(x => x.HttpLoginAt).HasColumnName("http_login_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.NettyConnectedAt).HasColumnName("netty_connected_at").HasMaxLength(40)
@@ -415,6 +421,8 @@ public sealed class TunnelDbContext : DbContext
             b.Property(x => x.TargetClientId).HasColumnName("target_client_id").IsRequired();
             b.Property(x => x.TargetClientName).HasColumnName("target_client_name").HasMaxLength(120).IsRequired();
             b.Property(x => x.Allowed).HasColumnName("allowed").IsRequired();
+            b.Property(x => x.Direction).HasColumnName("direction").HasMaxLength(16).IsRequired()
+                .HasDefaultValue("OUTBOUND");
             b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
                 .HasConversion(iso);
             b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
@@ -477,6 +485,41 @@ public sealed class TunnelDbContext : DbContext
             b.HasIndex(x => new { x.TenantId, x.ClientName, x.StatMonth }).IsUnique()
                 .HasDatabaseName("uk_tunnel_connection_stat");
             b.HasIndex(x => x.ClientName);
+        });
+
+        modelBuilder.Entity<TransferAttachment>(b =>
+        {
+            b.ToTable("transfer_attachment");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80);
+            b.Property(x => x.Scope).HasColumnName("scope").HasMaxLength(40).IsRequired();
+            b.Property(x => x.RoomId).HasColumnName("room_id").HasMaxLength(120);
+            b.Property(x => x.RoomTokenHash).HasColumnName("room_token_hash").HasMaxLength(64);
+            b.Property(x => x.OwnerUsername).HasColumnName("owner_username").HasMaxLength(80);
+            b.Property(x => x.TargetClientId).HasColumnName("target_client_id");
+            b.Property(x => x.ObjectKey).HasColumnName("object_key").HasMaxLength(512).IsRequired();
+            b.Property(x => x.FileName).HasColumnName("file_name").HasMaxLength(255).IsRequired();
+            b.Property(x => x.MimeType).HasColumnName("mime_type").HasMaxLength(120).IsRequired();
+            b.Property(x => x.SizeBytes).HasColumnName("size_bytes").IsRequired();
+            b.Property(x => x.Sha256).HasColumnName("sha256").HasMaxLength(64);
+            b.Property(x => x.Status).HasColumnName("status").HasMaxLength(24).IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UploadExpiresAt).HasColumnName("upload_expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UploadedAt).HasColumnName("uploaded_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.HasIndex(x => new { x.TenantId, x.Scope, x.Id })
+                .HasDatabaseName("idx_transfer_attachment_tenant");
+            b.HasIndex(x => new { x.Scope, x.RoomId, x.Id })
+                .HasDatabaseName("idx_transfer_attachment_room");
+            b.HasIndex(x => new { x.ExpiresAt, x.Status })
+                .HasDatabaseName("idx_transfer_attachment_expires");
         });
     }
 }

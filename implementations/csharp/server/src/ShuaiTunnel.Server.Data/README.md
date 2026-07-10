@@ -31,7 +31,7 @@ must be re-scaffolded for all three providers**, each using its own project as b
 (this avoids the multi `IDesignTimeDbContextFactory` ambiguity):
 
 ```bash
-# from csharp/
+# from implementations/csharp/server/
 dotnet ef migrations add <Name> -p src/ShuaiTunnel.Server.Data         -s src/ShuaiTunnel.Server.Data         -o Migrations
 dotnet ef migrations add <Name> -p src/ShuaiTunnel.Server.Data.Postgres -s src/ShuaiTunnel.Server.Data.Postgres -o Migrations
 dotnet ef migrations add <Name> -p src/ShuaiTunnel.Server.Data.MySql    -s src/ShuaiTunnel.Server.Data.MySql    -o Migrations
@@ -48,11 +48,18 @@ The model now contains Java-aligned resource traffic and HTTP/TCP detail entitie
 - `tunnel_http_traffic_exchange`
 - `tunnel_tcp_traffic_frame`
 
-Runtime startup creates these tables idempotently for SQLite, PostgreSQL, and MySQL so existing
-deployments can read/write detailed traffic records without a destructive migration step. Startup
-also creates the Java-aligned query indexes used by resource listing, paging, body-type filtering,
-and TCP stream lookup. The next schema pass should scaffold provider-specific EF migrations for these tables,
-then remove the temporary raw-SQL compatibility path.
+本轮消息/互传模型还为 `tunnel_client_session` 增加发送、接收、附件、媒体预览和附件大小能力字段，并新增
+`transfer_attachment`（公开房间或管理消息作用域、tenant/owner/target、object key、上传/保留时间和状态）。
+SQLite、PostgreSQL、MySQL 都有对应的 `AddClientMessagingAndTransfer` migration 与同步 snapshot；三种 provider
+的 `HasPendingModelChanges` 检查均应保持无漂移。
+Peer Mesh ACL 的 `direction` 由三套 `AddPeerMeshAclDirection` migration 补齐，缺省 `OUTBOUND`；启动兼容 SQL
+也会为旧库幂等补列并回填空值，保证正向/反向 ACL 判定可直接使用。
+
+Provider-specific EF migrations for these tables are committed for SQLite, PostgreSQL, and MySQL.
+Runtime startup also creates the tables and Java-aligned query indexes idempotently so deployments
+with older or incomplete migration history can read/write detailed traffic records without a
+destructive upgrade. This raw-SQL path is retained as a compatibility layer rather than a substitute
+for the committed migrations.
 
 `tunnel_traffic_usage` now includes Java-aligned `tenant_id`. Startup adds the column and
 `idx_tunnel_traffic_tenant` to existing databases, traffic flush writes the owning client's tenant,

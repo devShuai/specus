@@ -23,12 +23,30 @@ public sealed class TunnelEnvironmentVariablesTests
             ["TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS"] = "7",
             ["TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS"] = "15000",
             ["TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING"] = "300",
+            ["TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES"] = "1048576",
             ["TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE"] = "25",
             ["TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS"] = "500",
+            ["TUNNEL_PEER_MESH_ENABLED"] = "true",
+            ["TUNNEL_PEER_MESH_CIDR"] = "100.96.0.0/11",
+            ["TUNNEL_PEER_MESH_PUBLIC_ADDRESS"] = "turn.example.com",
+            ["TUNNEL_PEER_MESH_STUN_TURN_PORT"] = "3478",
+            ["TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT"] = "3479",
             ["TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS"] = "stun:stun1.example.com:3478, stun:stun2.example.com:3478",
+            ["TUNNEL_PEER_MESH_SESSION_TTL_SECONDS"] = "3600",
+            ["TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS"] = "300",
+            ["TUNNEL_PEER_MESH_SESSION_CLEANUP_INTERVAL_MS"] = "60000",
             ["TUNNEL_PEER_MESH_RELAY_MIN_PORT"] = "49152",
             ["TUNNEL_PEER_MESH_RELAY_MAX_PORT"] = "49200",
+            ["TUNNEL_PEER_MESH_RELAY_WORKER_THREADS"] = "4",
             ["TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY"] = "10000",
+            ["TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS"] = "5000",
+            ["TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED"] = "true",
+            ["TUNNEL_PEER_MESH_TURN_REALM"] = "shuai-tunnel",
+            ["TUNNEL_PEER_MESH_TURN_SHARED_SECRET"] = "test-secret",
+            ["TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS"] = "3600",
+            ["TUNNEL_OBJECT_STORAGE_PROVIDER"] = "aliyun-oss",
+            ["TUNNEL_OBJECT_STORAGE_PREFIX"] = "files",
+            ["TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM"] = "12",
             ["TUNNEL_OIDC_JWK_SET_URI"] = "https://issuer.example/jwks",
             ["TUNNEL_OIDC_TENANT_CLAIM"] = "org_id",
             ["TUNNEL_TLS_KEYSTORE_PASSWORD"] = "changeit",
@@ -49,13 +67,31 @@ public sealed class TunnelEnvironmentVariablesTests
         Assert.Equal("7", mapped["Tunnel:ConnectionRecord:DetailRetentionDays"]);
         Assert.Equal("15000", mapped["Tunnel:ConnectionRecord:ArchiveIntervalMs"]);
         Assert.Equal("300", mapped["Tunnel:Traffic:CaptureMaxPending"]);
+        Assert.Equal("1048576", mapped["Tunnel:Traffic:CaptureDecodeMaxBytes"]);
         Assert.Equal("25", mapped["Tunnel:Traffic:CaptureFlushBatchSize"]);
         Assert.Equal("500", mapped["Tunnel:Traffic:CaptureFlushIntervalMs"]);
+        Assert.Equal("true", mapped["Tunnel:PeerMesh:Enabled"]);
+        Assert.Equal("100.96.0.0/11", mapped["Tunnel:PeerMesh:Cidr"]);
+        Assert.Equal("turn.example.com", mapped["Tunnel:PeerMesh:PublicAddress"]);
+        Assert.Equal("3478", mapped["Tunnel:PeerMesh:StunTurnPort"]);
+        Assert.Equal("3479", mapped["Tunnel:PeerMesh:NatProbeAlternatePort"]);
         Assert.Equal("stun:stun1.example.com:3478", mapped["Tunnel:PeerMesh:PublicStunServers:0"]);
         Assert.Equal("stun:stun2.example.com:3478", mapped["Tunnel:PeerMesh:PublicStunServers:1"]);
+        Assert.Equal("3600", mapped["Tunnel:PeerMesh:SessionTtlSeconds"]);
+        Assert.Equal("300", mapped["Tunnel:PeerMesh:AllocationTtlSeconds"]);
+        Assert.Equal("60000", mapped["Tunnel:PeerMesh:SessionCleanupIntervalMs"]);
         Assert.Equal("49152", mapped["Tunnel:PeerMesh:RelayMinPort"]);
         Assert.Equal("49200", mapped["Tunnel:PeerMesh:RelayMaxPort"]);
+        Assert.Equal("4", mapped["Tunnel:PeerMesh:RelayWorkerThreads"]);
         Assert.Equal("10000", mapped["Tunnel:PeerMesh:RelayWorkerQueueCapacity"]);
+        Assert.Equal("5000", mapped["Tunnel:PeerMesh:RelayTrafficFlushIntervalMs"]);
+        Assert.Equal("true", mapped["Tunnel:PeerMesh:TurnAuthRequired"]);
+        Assert.Equal("shuai-tunnel", mapped["Tunnel:PeerMesh:TurnRealm"]);
+        Assert.Equal("test-secret", mapped["Tunnel:PeerMesh:TurnSharedSecret"]);
+        Assert.Equal("3600", mapped["Tunnel:PeerMesh:TurnCredentialTtlSeconds"]);
+        Assert.Equal("aliyun-oss", mapped["Tunnel:ObjectStorage:Provider"]);
+        Assert.Equal("files", mapped["Tunnel:ObjectStorage:ObjectPrefix"]);
+        Assert.Equal("12", mapped["Tunnel:PublicTransfer:MaxDiscoveryPeersPerRoom"]);
         Assert.Equal("https://issuer.example/jwks", mapped["Tunnel:Oidc:JwkSetUri"]);
         Assert.Equal("org_id", mapped["Tunnel:Oidc:TenantClaim"]);
         Assert.Equal("changeit", mapped["Tunnel:Tls:KeystorePassword"]);

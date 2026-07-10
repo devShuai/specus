@@ -49,11 +49,32 @@ public sealed class ClientEnvironmentInfo
     [JsonPropertyName("peerPublicKey")]
     public string? PeerPublicKey { get; set; }
 
+    [JsonPropertyName("clientMessageCapabilities")]
+    public ClientMessageCapabilities ClientMessageCapabilities { get; set; } = new();
+
     [JsonPropertyName("localAddresses")]
     public List<string> LocalAddresses { get; set; } = new();
 
     [JsonPropertyName("startedAt")]
     public string? StartedAt { get; set; }
+}
+
+public sealed class ClientMessageCapabilities
+{
+    [JsonPropertyName("sendMessages")]
+    public bool SendMessages { get; set; }
+
+    [JsonPropertyName("receiveMessages")]
+    public bool ReceiveMessages { get; set; }
+
+    [JsonPropertyName("attachments")]
+    public bool Attachments { get; set; }
+
+    [JsonPropertyName("mediaPreview")]
+    public bool MediaPreview { get; set; }
+
+    [JsonPropertyName("maxAttachmentBytes")]
+    public long MaxAttachmentBytes { get; set; }
 }
 
 public sealed class ClientAuthLoginResponse
@@ -147,6 +168,12 @@ public sealed class PeerMeshConfig
 
     [JsonPropertyName("iceCredential")]
     public string? IceCredential { get; set; }
+
+    [JsonPropertyName("iceRealm")]
+    public string? IceRealm { get; set; }
+
+    [JsonPropertyName("iceNonce")]
+    public string? IceNonce { get; set; }
 
     [JsonPropertyName("serverPublicKey")]
     public string? ServerPublicKey { get; set; }

@@ -153,6 +153,22 @@ internal sealed class StunMessage
     }
 
     public StunAttribute? First(ushort type) => Attributes.FirstOrDefault(attr => attr.Type == type);
+    public string? TextAttribute(ushort type)
+    {
+        var value = First(type)?.Value;
+        return value is { Length: > 0 } ? Encoding.UTF8.GetString(value) : null;
+    }
+
+    public int ErrorCode()
+    {
+        var value = First(AttrErrorCode)?.Value;
+        if (value is not { Length: >= 4 })
+        {
+            return -1;
+        }
+        return (value[2] & 0x07) * 100 + value[3];
+    }
+
     public IPEndPoint? XorMappedAddress() => DecodeXorAddress(First(AttrXorMappedAddress)?.Value);
     public IPEndPoint? XorRelayedAddress() => DecodeXorAddress(First(AttrXorRelayedAddress)?.Value);
     public IPEndPoint? XorPeerAddress() => DecodeXorAddress(First(AttrXorPeerAddress)?.Value);

@@ -15,7 +15,7 @@ public sealed class PostgresDesignTimeDbContextFactory : IDesignTimeDbContextFac
     {
         var options = new DbContextOptionsBuilder<TunnelDbContext>()
             .UseNpgsql(
-                "Host=localhost;Database=shuai_tunnel;Username=postgres;Password=postgres",
+                "Host=localhost;Database=design_time",
                 npgsql => npgsql.MigrationsAssembly(typeof(PostgresDesignTimeDbContextFactory).Assembly.GetName().Name))
             .Options;
         return new TunnelDbContext(options);

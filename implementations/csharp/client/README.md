@@ -1,6 +1,6 @@
 # implementations/csharp/client
 
-shuai-tunnel 内网客户端的 .NET 实现,与 Java / Go 客户端**线协议字节兼容**。通过控制
+shuai-tunnel 内网客户端的 .NET 实现,可连接 Java / Go / .NET server，并与其它桌面/Android 客户端共享**线协议**。通过控制
 通道登录服务端,自动注册 TCP 端口映射,转发外部连接到本地目标,并代理 Direct HTTP 请求。
 
 ## 构建运行
@@ -34,7 +34,7 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
 
 ## 配置 (`client.jsonc`)
 
-与 Java/Go 客户端共享同一 JSONC 结构(可直接互换，支持注释和尾逗号):
+与 Java/Go/Android 客户端共享同一 JSONC 结构(可直接互换，支持注释和尾逗号):
 
 ```jsonc
 {
@@ -85,12 +85,15 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
   都会回发 `DISCONNECTED source=ws`。
 - **Peer Mesh**:读取与 Java 相同的 `peerMeshDevice/peerMeshTunName/peerMeshMtu` 启动配置，
   登录环境会上报 Java 兼容 X25519 public key；已识别 HTTP 登录响应里的 `peerMesh` 配置和控制通道
-  `PEER_CONTROL` 消息，支持 roster/session/candidates、标准 STUN/TURN Binding/Allocate/Refresh/CreatePermission/Send/Data Indication、
-  公共 STUN srflx 候选、UDP connectivity check、path-report 与 direct-only traffic-report；relay 字节由服务端 relay 热路径计量；已补 Java 兼容 `SPM1` AES-GCM frame codec 和 replay window。
+  `PEER_CONTROL` 消息，支持 roster/session/candidates、标准 STUN/TURN Binding，以及带临时 credential、realm/nonce、MESSAGE-INTEGRITY 的 Allocate/Refresh/CreatePermission、Send/Data Indication；
+  收到 `401`/`438` 会更新 realm/nonce、换新 transaction ID 并最多重试一次，pending 请求会在成功、15 秒超时、发送失败、停止或凭证切换时清理；
+  同时支持公共 STUN srflx 候选、UDP connectivity check、path-report 与 direct-only traffic-report；relay 字节由服务端 relay 热路径计量；已补 Java 兼容 `SPM1` AES-GCM frame codec 和 replay window。
   Linux 使用 `/dev/net/tun`，Windows 会随 build/publish 输出 `native/windows/<arch>/wintun.dll`，
   并支持通过 `SHUAI_PEER_MESH_WINTUN_DLL` 覆盖，macOS 使用 `utun`。启用 `peerMeshDevice=linux-tun`、`windows-wintun`、
   `mac-utun`、`utun`、`macos-utun`、`darwin-utun` 或 `auto` 后，虚拟网卡出站 IPv4 packet 会按目标虚拟 IP
   查 peer session 并封装为加密 UDP frame，入站 frame 解密后写回虚拟网卡。
+  以上是当前源码与自动化测试覆盖的实现状态；真实 Windows / Linux / macOS 双机 ping、HTTP 和 relay fallback 仍需按跨语言验收矩阵手工验证。
+- **客户端消息能力**:登录声明 `sendMessages=true`、`receiveMessages=true`；当前客户端没有附件下载/媒体预览数据面，因此如实声明 `attachments=false`、`mediaPreview=false`、`maxAttachmentBytes=0`。普通文本和 ACK 编码为与 Java / Go 互通的 Peer Mesh `STMSG1`，解码器同时兼容 `STMSG1` 与可选附件扩展 `STMSG2`；文本也可走服务端 `CLIENT_TO_CLIENT` fallback。
 - **关停**:`IHostApplicationLifetime` 取消,关闭控制 socket;**不发** `LogoutRequest`(对齐 Java)。
 
 ## 测试
@@ -99,12 +102,15 @@ Peer Mesh 虚拟 IP、对端路由、活跃 peer session、本机 TCP 端口映�
 dotnet test implementations/csharp/client/ShuaiTunnel.Client.slnx
 ```
 
+当前全量客户端测试为 86/86；精确的跨模块验证记录见 `docs/cross-language/cross-language-java-alignment-plan.md`。
+
 - 单元:`DirectHttpForwarder.TryBuildTarget` 路径越界 / 跨主机 / 越界段 / scheme 校验,
   16 MiB 请求体被拒、Range 裁剪、自签 HTTPS upstream 默认 handler 策略；HTTP route WebSocket
   target 构造、双斜线路径保留、自签 `wss` upstream 证书策略、握手头过滤和 loopback text frame → NAT `DATA source=ws` 转发；loopback
   `HttpListener` 端到端往返；Peer Mesh frame/replay/key 派生与 IPv4 packet 解析协议测试。
 - 端到端:`TunnelControlClientReconnectTests` 用 in-process `TcpListener` 充当服务端,
   验证登录 → REGISTER → CONNECTED → 双向 DATA 回环 → 断开后自动重连。
+- 边界覆盖完整帧 32 MiB（header + body）、TURN MESSAGE-INTEGRITY、真实能力声明和 token 主动刷新。
 
 ## TLS
 

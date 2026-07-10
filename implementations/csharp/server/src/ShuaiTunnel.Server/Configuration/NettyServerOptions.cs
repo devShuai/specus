@@ -70,9 +70,9 @@ public sealed class AuthOptions
 {
     public const string SectionName = "Tunnel:Auth";
 
-    public bool PasswordLoginEnabled { get; set; } = true;
+    public bool PasswordLoginEnabled { get; set; } = false;
     public string Username { get; set; } = "admin";
-    public string Password { get; set; } = "admin";
+    public string Password { get; set; } = string.Empty;
     public string TenantId { get; set; } = "default";
     public string? JwtSecret { get; set; }
     public int TokenTtlSeconds { get; set; } = 8 * 60 * 60;
@@ -179,6 +179,35 @@ public sealed class DirectHttpOptions
     public int RewriteMaxBodyBytes { get; set; } = 10 * 1024 * 1024;
 }
 
+public sealed class PublicTransferOptions
+{
+    public const string SectionName = "Tunnel:PublicTransfer";
+
+    public int PresignRateLimitPerIp { get; set; } = 30;
+    public long PresignRateLimitWindowSeconds { get; set; } = 300;
+    public int MaxPendingUploadsPerRoom { get; set; } = 50;
+    public int MaxDiscoveryPeersPerRoom { get; set; } = 32;
+    public int DiscoveryMessageRateLimitPerConnection { get; set; } = 120;
+    public long DiscoveryMessageRateLimitWindowSeconds { get; set; } = 60;
+}
+
+public sealed class ObjectStorageOptions
+{
+    public const string SectionName = "Tunnel:ObjectStorage";
+
+    public string Provider { get; set; } = "disabled";
+    public string Endpoint { get; set; } = string.Empty;
+    public string Bucket { get; set; } = string.Empty;
+    public string AccessKeyId { get; set; } = string.Empty;
+    public string AccessKeySecret { get; set; } = string.Empty;
+    public string ObjectPrefix { get; set; } = "shuai-tunnel/attachments";
+    public long UploadUrlTtlSeconds { get; set; } = 900;
+    public long DownloadUrlTtlSeconds { get; set; } = 600;
+    public long RetentionHours { get; set; } = 72;
+    public long MaxAttachmentBytes { get; set; } = 512L * 1024 * 1024;
+    public long ExpirationScanIntervalMs { get; set; } = 3_600_000;
+}
+
 public sealed class PeerMeshOptions
 {
     public const string SectionName = "Tunnel:PeerMesh";
@@ -195,6 +224,10 @@ public sealed class PeerMeshOptions
     public int RelayMaxPort { get; set; } = 65535;
     public int RelayWorkerThreads { get; set; }
     public int RelayWorkerQueueCapacity { get; set; } = 10_000;
+    public bool TurnAuthRequired { get; set; } = true;
+    public string TurnRealm { get; set; } = "shuai-tunnel";
+    public string TurnSharedSecret { get; set; } = string.Empty;
+    public long TurnCredentialTtlSeconds { get; set; } = 3600;
     public long SessionCleanupIntervalMs { get; set; } = 60000;
     public int RelayTrafficFlushIntervalMs { get; set; } = 5000;
 }

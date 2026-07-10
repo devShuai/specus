@@ -26,6 +26,9 @@ public sealed class PeerMeshService
     public const string StatusNegotiating = "NEGOTIATING";
     public const string StatusActive = "ACTIVE";
     public const string StatusClosed = "CLOSED";
+    public const string DirectionOutbound = "OUTBOUND";
+    public const string DirectionInbound = "INBOUND";
+    public const string DirectionBoth = "BOTH";
 
     private const string TypeCandidates = "candidates";
     private const string TypeSessionGrant = "session-grant";
@@ -42,14 +45,16 @@ public sealed class PeerMeshService
     private readonly TunnelDbContext _db;
     private readonly SessionRegistry _sessions;
     private readonly PeerMeshOptions _options;
+    private readonly TurnCredentialService _turnCredentials;
     private readonly ILogger<PeerMeshService> _logger;
 
     public PeerMeshService(TunnelDbContext db, SessionRegistry sessions, IOptions<PeerMeshOptions> options,
-        ILogger<PeerMeshService> logger)
+        ILogger<PeerMeshService> logger, TurnCredentialService? turnCredentials = null)
     {
         _db = db;
         _sessions = sessions;
         _options = options.Value;
+        _turnCredentials = turnCredentials ?? new TurnCredentialService(options);
         _logger = logger;
     }
 
@@ -145,6 +150,28 @@ public sealed class PeerMeshService
             }
         }
         return new PublicStunConfig(Enabled, selfHosted, servers, _options.StunTurnPort);
+    }
+
+    public PublicIceConfig PublicIceConfig(string? requestHost)
+    {
+        var stun = PublicStunConfig(requestHost);
+        var servers = stun.StunServers
+            .Select(url => new IceServer(url, string.Empty, string.Empty))
+            .ToList();
+        if (Enabled)
+        {
+            var host = ResolvePeerHost(requestHost);
+            if (!string.IsNullOrWhiteSpace(host) && _options.StunTurnPort > 0)
+            {
+                var credential = _turnCredentials.Issue("public-transfer");
+                servers.Add(new IceServer(
+                    $"turn:{BracketIpv6(host)}:{_options.StunTurnPort}?transport=udp",
+                    credential.Username,
+                    credential.Credential));
+            }
+        }
+        return new PublicIceConfig(Enabled, servers, _turnCredentials.AuthRequired,
+            _options.StunTurnPort);
     }
 
     public async Task HandleSignalAsync(MessageRequestPacket request, string sourceClientName,
@@ -335,7 +362,7 @@ public sealed class PeerMeshService
             throw new ArgumentException("source and target cannot be the same client");
         }
         if (!context.IsAdmin && !string.Equals(NormalizeOwner(target.OwnerUsername), context.Username,
-                StringComparison.OrdinalIgnoreCase))
+                StringComparison.Ordinal))
         {
             throw new ArgumentException("普通用户不能创建跨用户 peer ACL");
         }
@@ -361,6 +388,15 @@ public sealed class PeerMeshService
         acl.TargetClientId = target.Id;
         acl.TargetClientName = target.ClientName;
         acl.Allowed = request.Allowed ?? true;
+        if (request.Direction is not null)
+        {
+            var direction = request.Direction.ToUpperInvariant();
+            if (direction is not (DirectionOutbound or DirectionInbound or DirectionBoth))
+            {
+                throw new ArgumentException($"invalid direction: {request.Direction}");
+            }
+            acl.Direction = direction;
+        }
         acl.UpdatedAt = now;
         await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return AclView(acl);
@@ -584,8 +620,11 @@ public sealed class PeerMeshService
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        config.IceUsername = "pm-" + account.Id;
-        config.IceCredential = ShortToken(account.TenantId, account.ClientName, device.VirtualIp);
+        var turnCredential = _turnCredentials.Issue("pm-" + account.Id);
+        config.IceUsername = turnCredential.Username;
+        config.IceCredential = turnCredential.Credential;
+        config.IceRealm = turnCredential.Realm;
+        config.IceNonce = turnCredential.Nonce;
         config.ServerPublicKey = ServerPublicKey();
         config.ClientPublicKey = device.PublicKey;
         return config;
@@ -698,7 +737,7 @@ public sealed class PeerMeshService
 
     public async Task<bool> CanPeerAsync(ClientAccount source, ClientAccount target, CancellationToken cancellationToken)
     {
-        if (!ManagementContext.SameTenant(source.TenantId, target.TenantId))
+        if (!string.Equals(source.TenantId, target.TenantId, StringComparison.Ordinal))
         {
             return false;
         }
@@ -713,15 +752,27 @@ public sealed class PeerMeshService
             return false;
         }
         if (string.Equals(NormalizeOwner(source.OwnerUsername), NormalizeOwner(target.OwnerUsername),
-                StringComparison.OrdinalIgnoreCase))
+                StringComparison.Ordinal))
+        {
+            return true;
+        }
+        var forward = await _db.PeerMeshAcls.AsNoTracking().AnyAsync(a =>
+                a.TenantId == source.TenantId
+                && a.SourceClientId == source.Id
+                && a.TargetClientId == target.Id
+                && a.Allowed
+                && (a.Direction == DirectionOutbound || a.Direction == DirectionBoth), cancellationToken)
+            .ConfigureAwait(false);
+        if (forward)
         {
             return true;
         }
         return await _db.PeerMeshAcls.AsNoTracking().AnyAsync(a =>
                 a.TenantId == source.TenantId
-                && a.SourceClientId == source.Id
-                && a.TargetClientId == target.Id
-                && a.Allowed, cancellationToken)
+                && a.SourceClientId == target.Id
+                && a.TargetClientId == source.Id
+                && a.Allowed
+                && (a.Direction == DirectionInbound || a.Direction == DirectionBoth), cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -889,8 +940,50 @@ public sealed class PeerMeshService
             }
         }
         devices.Remove(account.Id);
-        return devices.Values.Select(d => new RosterItem(
-            d.ClientId, d.ClientName, d.VirtualIp, d.PublicKey, _sessions.Find(d.ClientName) is not null)).ToList();
+        var deviceIds = devices.Keys.ToArray();
+        var messageSessions = deviceIds.Length == 0
+            ? new Dictionary<long, ClientSession>()
+            : (await _db.ClientSessions.AsNoTracking()
+                .Where(session => session.TenantId == account.TenantId
+                    && deviceIds.Contains(session.ClientId)
+                    && session.Status == ClientAccountService.StatusNettyOnline)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+                .GroupBy(session => session.ClientId)
+                .ToDictionary(group => group.Key, group => group.Aggregate(MergeMessageCapabilities));
+        return devices.Values.Select(device =>
+        {
+            var online = _sessions.Find(device.ClientName) is not null;
+            messageSessions.TryGetValue(device.ClientId, out var capability);
+            if (!online)
+            {
+                capability = null;
+            }
+            return new RosterItem(
+                device.ClientId,
+                device.ClientName,
+                device.VirtualIp,
+                device.PublicKey,
+                online,
+                capability?.MessageSendCapable ?? false,
+                capability?.MessageReceiveCapable ?? false,
+                capability?.MessageAttachmentsCapable ?? false,
+                capability?.MessageMediaPreviewCapable ?? false,
+                capability?.MessageMaxAttachmentBytes ?? 0L);
+        }).ToList();
+    }
+
+    private static ClientSession MergeMessageCapabilities(ClientSession left, ClientSession right)
+    {
+        if (right.MessageReceiveCapable && !left.MessageReceiveCapable)
+        {
+            return right;
+        }
+        if (right.MessageSendCapable && !left.MessageSendCapable)
+        {
+            return right;
+        }
+        return right.MessageMaxAttachmentBytes > left.MessageMaxAttachmentBytes ? right : left;
     }
 
     private async Task SendSessionGrantAsync(ClientAccount source, ClientAccount target, PeerSessionGrant grant,
@@ -1196,7 +1289,7 @@ public sealed class PeerMeshService
 
     private static PeerMeshAclView AclView(PeerMeshAcl acl) => new(
         acl.Id, acl.SourceClientId, acl.SourceClientName, acl.TargetClientId, acl.TargetClientName,
-        acl.Allowed, Iso(acl.CreatedAt)!, Iso(acl.UpdatedAt)!);
+        acl.Allowed, acl.Direction, Iso(acl.CreatedAt)!, Iso(acl.UpdatedAt)!);
 
     private static PeerMeshSessionView SessionView(PeerMeshSession session) => new(
         session.Id, session.SourceClientId, session.SourceClientName, session.TargetClientId,
@@ -1225,20 +1318,9 @@ public sealed class PeerMeshService
     {
         if (!string.IsNullOrWhiteSpace(_options.PublicAddress))
         {
-            return _options.PublicAddress.Trim();
+            return NormalizeHost(_options.PublicAddress);
         }
-        if (!string.IsNullOrWhiteSpace(requestServerName)
-            && IPEndPoint.TryParse(requestServerName, out var endPoint))
-        {
-            return endPoint.Address.ToString();
-        }
-        if (!string.IsNullOrWhiteSpace(requestServerName)
-            && requestServerName.Contains(':', StringComparison.Ordinal)
-            && requestServerName.Split(':', 2)[0] is { Length: > 0 } host)
-        {
-            return host;
-        }
-        return requestServerName?.Trim() ?? string.Empty;
+        return NormalizeHost(requestServerName);
     }
 
     private static string NormalizeStunUrl(string value)
@@ -1256,34 +1338,72 @@ public sealed class PeerMeshService
         {
             normalized = normalized["stun:".Length..];
         }
+        var host = NormalizeHost(normalized);
+        return string.IsNullOrWhiteSpace(host)
+            ? string.Empty
+            : $"stun:{BracketIpv6(host)}:{ParsePort(normalized, 3478)}";
+    }
+
+    private static string NormalizeHost(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+        var host = value.Trim();
+        var scheme = host.IndexOf("://", StringComparison.Ordinal);
+        if (scheme >= 0)
+        {
+            host = host[(scheme + 3)..];
+        }
+        var slash = host.IndexOf('/', StringComparison.Ordinal);
+        if (slash >= 0)
+        {
+            host = host[..slash];
+        }
+        if (host.StartsWith("[", StringComparison.Ordinal))
+        {
+            var close = host.IndexOf(']', StringComparison.Ordinal);
+            return close > 0 ? host[1..close] : string.Empty;
+        }
+        var firstColon = host.IndexOf(':', StringComparison.Ordinal);
+        var lastColon = host.LastIndexOf(':');
+        if (firstColon > 0 && firstColon == lastColon)
+        {
+            host = host[..firstColon];
+        }
+        return host.Trim();
+    }
+
+    private static int ParsePort(string value, int fallback)
+    {
+        var normalized = value.Trim();
+        var scheme = normalized.IndexOf("://", StringComparison.Ordinal);
+        if (scheme >= 0)
+        {
+            normalized = normalized[(scheme + 3)..];
+        }
         var slash = normalized.IndexOf('/', StringComparison.Ordinal);
         if (slash >= 0)
         {
             normalized = normalized[..slash];
         }
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            return string.Empty;
-        }
         if (normalized.StartsWith("[", StringComparison.Ordinal))
         {
-            var end = normalized.IndexOf(']', StringComparison.Ordinal);
-            if (end > 0)
-            {
-                var host = normalized[1..end];
-                var portText = normalized.Length > end + 2 && normalized[end + 1] == ':'
-                    ? normalized[(end + 2)..]
-                    : string.Empty;
-                var port = int.TryParse(portText, out var parsed) && parsed > 0 ? parsed : 3478;
-                return $"stun:{BracketIpv6(host)}:{port}";
-            }
+            var close = normalized.IndexOf(']', StringComparison.Ordinal);
+            return close > 0 && close + 2 < normalized.Length && normalized[close + 1] == ':'
+                ? ParsePortNumber(normalized[(close + 2)..], fallback)
+                : fallback;
         }
-        var colon = normalized.LastIndexOf(':');
-        var hostPart = colon > 0 ? normalized[..colon] : normalized;
-        var portPart = colon > 0 ? normalized[(colon + 1)..] : string.Empty;
-        var stunPort = int.TryParse(portPart, out var valuePort) && valuePort > 0 ? valuePort : 3478;
-        return string.IsNullOrWhiteSpace(hostPart) ? string.Empty : $"stun:{BracketIpv6(hostPart)}:{stunPort}";
+        var firstColon = normalized.IndexOf(':', StringComparison.Ordinal);
+        var lastColon = normalized.LastIndexOf(':');
+        return firstColon > 0 && firstColon == lastColon && lastColon < normalized.Length - 1
+            ? ParsePortNumber(normalized[(lastColon + 1)..], fallback)
+            : fallback;
     }
+
+    private static int ParsePortNumber(string value, int fallback) =>
+        int.TryParse(value.Trim(), out var port) && port is > 0 and <= 65535 ? port : fallback;
 
     private static string BracketIpv6(string host) =>
         host.Contains(':', StringComparison.Ordinal) && !host.StartsWith("[", StringComparison.Ordinal)
@@ -1354,6 +1474,14 @@ public sealed record PublicStunConfig(
     List<string> StunServers,
     int StunTurnPort);
 
+public sealed record PublicIceConfig(
+    bool PeerMeshEnabled,
+    List<IceServer> IceServers,
+    bool TurnAuthRequired,
+    int StunTurnPort);
+
+public sealed record IceServer(string Urls, string Username, string Credential);
+
 public sealed record PeerMeshDeviceView(
     long Id,
     long ClientId,
@@ -1381,6 +1509,7 @@ public sealed record PeerMeshAclView(
     long TargetClientId,
     string TargetClientName,
     bool Allowed,
+    string Direction,
     string CreatedAt,
     string UpdatedAt);
 
@@ -1433,14 +1562,20 @@ public sealed record PeerMeshNatTypeStat(string NatType, long Devices);
 
 public sealed record PeerMeshDeviceMutation(bool? Enabled);
 
-public sealed record PeerMeshAclMutation(long? SourceClientId, long? TargetClientId, bool? Allowed);
+public sealed record PeerMeshAclMutation(long? SourceClientId, long? TargetClientId, bool? Allowed,
+    string? Direction = null);
 
 public sealed record RosterItem(
     [property: JsonPropertyName("clientId")] long ClientId,
     [property: JsonPropertyName("clientName")] string ClientName,
     [property: JsonPropertyName("virtualIp")] string VirtualIp,
     [property: JsonPropertyName("publicKey")] string? PublicKey,
-    [property: JsonPropertyName("online")] bool Online);
+    [property: JsonPropertyName("online")] bool Online,
+    [property: JsonPropertyName("messageSendCapable")] bool MessageSendCapable,
+    [property: JsonPropertyName("messageReceiveCapable")] bool MessageReceiveCapable,
+    [property: JsonPropertyName("messageAttachmentsCapable")] bool MessageAttachmentsCapable,
+    [property: JsonPropertyName("messageMediaPreviewCapable")] bool MessageMediaPreviewCapable,
+    [property: JsonPropertyName("messageMaxAttachmentBytes")] long MessageMaxAttachmentBytes);
 
 public sealed record PeerCandidate(
     [property: JsonPropertyName("type")] string? Type,

@@ -137,6 +137,8 @@ internal sealed class TestServerFixture : WebApplicationFactory<Program>, IAsync
             {
                 // Listen on an ephemeral TCP control port so we can run in parallel.
                 ["Tunnel:Netty:Port"] = "0",
+                ["Tunnel:Auth:PasswordLoginEnabled"] = "true",
+                ["Tunnel:Auth:Password"] = "admin",
                 ["Tunnel:Auth:JwtSecret"] = "integration-test-secret",
                 ["Tunnel:Http:MaxRequestBodySize"] = "64",
                 ["Tunnel:Database:Provider"] = "sqlite",

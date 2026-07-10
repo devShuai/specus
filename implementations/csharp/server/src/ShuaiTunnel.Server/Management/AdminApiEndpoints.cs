@@ -16,6 +16,11 @@ public static class AdminApiEndpoints
             {
                 await next().ConfigureAwait(false);
             }
+            catch (RateLimitedException ex) when (IsAdminSurface(context.Request.Path))
+            {
+                context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
+            }
             catch (ArgumentException ex) when (IsAdminSurface(context.Request.Path))
             {
                 context.Response.StatusCode = StatusCodes.Status400BadRequest;
@@ -124,6 +129,10 @@ public static class AdminApiEndpoints
         app.MapGet("/api/public/peer-mesh/stun-config",
             (HttpContext context, PeerMeshService service) =>
                 Results.Ok(service.PublicStunConfig(ForwardedHost(context))));
+
+        app.MapGet("/api/public/transfer/ice-config",
+            (HttpContext context, PeerMeshService service) =>
+                Results.Ok(service.PublicIceConfig(ForwardedHost(context))));
 
         app.MapGet("/api/admin/me",
             (HttpContext context, IOptions<AuthOptions> authOptions, ManagementUserService service,
@@ -511,5 +520,7 @@ public static class AdminApiEndpoints
 
     private static bool IsAdminSurface(PathString path) =>
         RequiresAdminAuth(path)
-        || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase);
+        || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/api/public/transfer/attachments",
+            StringComparison.OrdinalIgnoreCase);
 }

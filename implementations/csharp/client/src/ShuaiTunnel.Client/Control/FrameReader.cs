@@ -63,11 +63,12 @@ internal static class FrameReader
             throw new InvalidDataException($"invalid frame magic: 0x{magic:X8}");
         }
         var length = BinaryPrimitives.ReadInt32BigEndian(header.Slice(7, 4));
-        if (length < 0 || length > maxFrameSize)
+        var total = (long)PacketCodec.HeaderSize + length;
+        if (length < 0 || total > maxFrameSize)
         {
-            throw new InvalidDataException($"invalid frame body length: {length}");
+            throw new InvalidDataException(
+                $"invalid frame length: {total} (body {length}, limit {maxFrameSize})");
         }
-        var total = PacketCodec.HeaderSize + length;
         if (buffer.Length < total)
         {
             packet = null;

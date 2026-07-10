@@ -15,6 +15,7 @@ public sealed class StunTurnServer : BackgroundService
     private readonly PeerMeshOptions _options;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<StunTurnServer> _logger;
+    private readonly TurnCredentialService _turnCredentials;
     private readonly ConcurrentDictionary<string, Allocation> _allocations = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _allocationByEndpoint = new(StringComparer.Ordinal);
     private UdpClient? _primary;
@@ -22,11 +23,12 @@ public sealed class StunTurnServer : BackgroundService
     private Channel<Func<CancellationToken, Task>>? _relayQueue;
 
     public StunTurnServer(IOptions<PeerMeshOptions> options, IServiceScopeFactory scopeFactory,
-        ILogger<StunTurnServer> logger)
+        ILogger<StunTurnServer> logger, TurnCredentialService? turnCredentials = null)
     {
         _options = options.Value;
         _scopeFactory = scopeFactory;
         _logger = logger;
+        _turnCredentials = turnCredentials ?? new TurnCredentialService(options);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -190,13 +192,14 @@ public sealed class StunTurnServer : BackgroundService
                 await BindingAsync(message, remote, receiveSocket, probeRole).ConfigureAwait(false);
                 break;
             case StunMessage.AllocateRequest:
-                await AllocateRequestAsync(message, remote, cancellationToken).ConfigureAwait(false);
+                await AllocateRequestAuthenticatedAsync(message, payload, remote, cancellationToken)
+                    .ConfigureAwait(false);
                 break;
             case StunMessage.RefreshRequest:
-                await RefreshAsync(message, remote).ConfigureAwait(false);
+                await RefreshAuthenticatedAsync(message, payload, remote).ConfigureAwait(false);
                 break;
             case StunMessage.CreatePermissionRequest:
-                await CreatePermissionAsync(message, remote).ConfigureAwait(false);
+                await CreatePermissionAuthenticatedAsync(message, payload, remote).ConfigureAwait(false);
                 break;
             case StunMessage.SendIndication:
                 await SendIndicationAsync(message, remote, cancellationToken).ConfigureAwait(false);
@@ -227,6 +230,23 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private async Task AllocateRequestAsync(StunMessage request, IPEndPoint remote, CancellationToken cancellationToken)
+        => await AllocateRequestCoreAsync(request, remote, null, cancellationToken).ConfigureAwait(false);
+
+    private async Task AllocateRequestAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote,
+        CancellationToken cancellationToken)
+    {
+        var auth = await AuthenticateAsync(request, packet, remote, StunMessage.AllocateError)
+            .ConfigureAwait(false);
+        if (!auth.Allowed)
+        {
+            return;
+        }
+        await AllocateRequestCoreAsync(request, remote, auth.MessageIntegrityKey, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task AllocateRequestCoreAsync(StunMessage request, IPEndPoint remote,
+        byte[]? messageIntegrityKey, CancellationToken cancellationToken)
     {
         if (!request.RequestedUdpTransport())
         {
@@ -241,7 +261,7 @@ public sealed class StunTurnServer : BackgroundService
             StunMessage.XorRelayedAddress(allocation.RelayAddress, request.TransactionId),
             StunMessage.XorMappedAddress(remote, request.TransactionId),
             StunMessage.Lifetime(_options.AllocationTtlSeconds),
-            StunMessage.Software(SoftwareName))).ConfigureAwait(false);
+            StunMessage.Software(SoftwareName)), messageIntegrityKey).ConfigureAwait(false);
     }
 
     private Allocation Allocate(IPEndPoint remote, CancellationToken cancellationToken = default)
@@ -293,6 +313,20 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private async Task RefreshAsync(StunMessage request, IPEndPoint remote)
+        => await RefreshCoreAsync(request, remote, null).ConfigureAwait(false);
+
+    private async Task RefreshAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote)
+    {
+        var auth = await AuthenticateAsync(request, packet, remote, StunMessage.RefreshError)
+            .ConfigureAwait(false);
+        if (!auth.Allowed)
+        {
+            return;
+        }
+        await RefreshCoreAsync(request, remote, auth.MessageIntegrityKey).ConfigureAwait(false);
+    }
+
+    private async Task RefreshCoreAsync(StunMessage request, IPEndPoint remote, byte[]? messageIntegrityKey)
     {
         var allocation = AllocationForRemote(remote);
         if (allocation is null)
@@ -314,10 +348,25 @@ public sealed class StunTurnServer : BackgroundService
             StunMessage.RefreshSuccess,
             request.TransactionId,
             StunMessage.Lifetime(lifetime <= 0 ? 0 : _options.AllocationTtlSeconds),
-            StunMessage.Software(SoftwareName))).ConfigureAwait(false);
+            StunMessage.Software(SoftwareName)), messageIntegrityKey).ConfigureAwait(false);
     }
 
     private async Task CreatePermissionAsync(StunMessage request, IPEndPoint remote)
+        => await CreatePermissionCoreAsync(request, remote, null).ConfigureAwait(false);
+
+    private async Task CreatePermissionAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote)
+    {
+        var auth = await AuthenticateAsync(request, packet, remote, StunMessage.CreatePermissionError)
+            .ConfigureAwait(false);
+        if (!auth.Allowed)
+        {
+            return;
+        }
+        await CreatePermissionCoreAsync(request, remote, auth.MessageIntegrityKey).ConfigureAwait(false);
+    }
+
+    private async Task CreatePermissionCoreAsync(StunMessage request, IPEndPoint remote,
+        byte[]? messageIntegrityKey)
     {
         var allocation = AllocationForRemote(remote);
         if (allocation is null)
@@ -338,7 +387,7 @@ public sealed class StunTurnServer : BackgroundService
         await SendStunAsync(_primary, remote, StunMessage.Of(
             StunMessage.CreatePermissionSuccess,
             request.TransactionId,
-            StunMessage.Software(SoftwareName))).ConfigureAwait(false);
+            StunMessage.Software(SoftwareName)), messageIntegrityKey).ConfigureAwait(false);
     }
 
     private async Task SendIndicationAsync(StunMessage request, IPEndPoint remote,
@@ -454,22 +503,75 @@ public sealed class StunTurnServer : BackgroundService
         && expiresAt > DateTimeOffset.UtcNow;
 
     private static async Task SendStunAsync(UdpClient? socket, IPEndPoint remote, StunMessage response)
+        => await SendStunAsync(socket, remote, response, null).ConfigureAwait(false);
+
+    private static async Task SendStunAsync(UdpClient? socket, IPEndPoint remote, StunMessage response,
+        byte[]? messageIntegrityKey)
     {
         if (socket is null)
         {
             return;
         }
-        var bytes = response.ToBytes();
+        var bytes = response.ToBytes(messageIntegrityKey);
         await socket.SendAsync(bytes, bytes.Length, remote).ConfigureAwait(false);
     }
 
     private static Task SendErrorAsync(UdpClient? socket, IPEndPoint remote, StunMessage request,
-        ushort responseType, int code, string reason) =>
-        SendStunAsync(socket, remote, StunMessage.Of(
-            responseType,
-            request.TransactionId,
+        ushort responseType, int code, string reason, params StunAttribute[] attributes)
+    {
+        var responseAttributes = new List<StunAttribute>
+        {
             StunMessage.ErrorCode(code, reason),
-            StunMessage.Software(SoftwareName)));
+            StunMessage.Software(SoftwareName),
+        };
+        responseAttributes.AddRange(attributes);
+        return SendStunAsync(socket, remote,
+            new StunMessage(responseType, request.TransactionId, responseAttributes));
+    }
+
+    private async Task<TurnAuth> AuthenticateAsync(StunMessage request, byte[] packet, IPEndPoint remote,
+        ushort responseType)
+    {
+        if (!_turnCredentials.AuthRequired)
+        {
+            return TurnAuth.NoAuthentication;
+        }
+        var username = request.UsernameValue()?.Trim() ?? string.Empty;
+        var realm = request.RealmValue()?.Trim() ?? string.Empty;
+        var nonce = request.NonceValue()?.Trim() ?? string.Empty;
+        if (!string.Equals(_turnCredentials.Realm, realm, StringComparison.Ordinal)
+            || username.Length == 0 || nonce.Length == 0)
+        {
+            await SendTurnAuthErrorAsync(remote, request, responseType, 401, "unauthorized")
+                .ConfigureAwait(false);
+            return TurnAuth.Denied;
+        }
+        if (!string.Equals(_turnCredentials.Nonce, nonce, StringComparison.Ordinal))
+        {
+            await SendTurnAuthErrorAsync(remote, request, responseType, 438, "stale-nonce")
+                .ConfigureAwait(false);
+            return TurnAuth.Denied;
+        }
+        var credential = _turnCredentials.CredentialForUsername(username);
+        if (!_turnCredentials.UsernameCredentialValid(username, credential))
+        {
+            await SendTurnAuthErrorAsync(remote, request, responseType, 401, "unauthorized")
+                .ConfigureAwait(false);
+            return TurnAuth.Denied;
+        }
+        var key = _turnCredentials.LongTermKey(username, credential);
+        if (!StunMessage.VerifyMessageIntegrity(packet, key))
+        {
+            await SendTurnAuthErrorAsync(remote, request, responseType, 401, "bad-message-integrity")
+                .ConfigureAwait(false);
+            return TurnAuth.Denied;
+        }
+        return new TurnAuth(true, key);
+    }
+
+    private Task SendTurnAuthErrorAsync(IPEndPoint remote, StunMessage request, ushort responseType,
+        int code, string reason) => SendErrorAsync(_primary, remote, request, responseType, code, reason,
+        StunMessage.Realm(_turnCredentials.Realm), StunMessage.Nonce(_turnCredentials.Nonce));
 
     private static ushort ErrorType(ushort requestType) => requestType switch
     {
@@ -624,5 +726,11 @@ public sealed class StunTurnServer : BackgroundService
         public DateTimeOffset ExpiresAt { get; set; }
         public ConcurrentDictionary<string, DateTimeOffset> Permissions { get; } = new(StringComparer.Ordinal);
         public bool Closed { get; set; }
+    }
+
+    private sealed record TurnAuth(bool Allowed, byte[]? MessageIntegrityKey)
+    {
+        public static TurnAuth Denied { get; } = new(false, null);
+        public static TurnAuth NoAuthentication { get; } = new(true, null);
     }
 }

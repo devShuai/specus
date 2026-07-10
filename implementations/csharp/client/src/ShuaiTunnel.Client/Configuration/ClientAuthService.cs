@@ -286,8 +286,8 @@ public sealed class ClientMessageCapabilities
     {
         SendMessages = true,
         ReceiveMessages = true,
-        Attachments = true,
-        MediaPreview = true,
-        MaxAttachmentBytes = 512L * 1024L * 1024L,
+        Attachments = false,
+        MediaPreview = false,
+        MaxAttachmentBytes = 0L,
     };
 }

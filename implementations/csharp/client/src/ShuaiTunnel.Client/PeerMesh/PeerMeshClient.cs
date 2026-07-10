@@ -59,6 +59,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan ConnectivityCheckPacing = TimeSpan.FromMilliseconds(20);
     private static readonly TimeSpan PeerMessageSessionWaitTimeout = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan PeerMessageAckTimeout = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan PendingTurnRequestTtl = TimeSpan.FromSeconds(15);
     private const long RttHysteresisMillis = 100;
     private const long RttEwmaOldWeight = 7;
     private const long RttEwmaNewWeight = 1;
@@ -80,11 +81,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly Dictionary<long, DateTimeOffset> _pathPreparedAt = new();
     private readonly Dictionary<string, string> _natByRole = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PendingStunBinding> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingTurnRequest> _pendingTurn = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PeerCandidate> _srflxCandidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _turnPermissions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PendingClientMessageAck> _pendingMessageAcks = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> _ignoredPacketLogAt = new(StringComparer.Ordinal);
     private readonly NatPortMappingService _portMappingService;
+    private readonly TurnLongTermAuthenticator _turnAuthenticator = new();
 
     private CancellationTokenSource? _cts;
     private UdpClient? _udp;
@@ -113,6 +116,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     public async Task StartAsync(TunnelRuntimeState runtime, FrameWriter writer, CancellationToken cancellationToken)
     {
+        UpdateTurnCredentials(runtime.PeerMesh);
         if (!runtime.PeerMesh.Enabled)
         {
             await StopAsync().ConfigureAwait(false);
@@ -189,6 +193,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pathPreparedAt.Clear();
             _natByRole.Clear();
             _pendingStun.Clear();
+            _pendingTurn.Clear();
             _srflxCandidates.Clear();
             _turnPermissions.Clear();
             _ignoredPacketLogAt.Clear();
@@ -236,6 +241,18 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         _ = TryAcquirePortMappingAsync(CancellationToken.None);
         await RequestRelayCandidatesAsync().ConfigureAwait(false);
         await AnnounceCandidatesAsync().ConfigureAwait(false);
+    }
+
+    private void UpdateTurnCredentials(PeerMeshConfig config)
+    {
+        if (!_turnAuthenticator.Update(config))
+        {
+            return;
+        }
+        lock (_sync)
+        {
+            _pendingTurn.Clear();
+        }
     }
 
     public async Task<PeerClientMessageSendResult?> SendClientMessageAsync(
@@ -531,15 +548,18 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 await HandleStunBindingSuccessAsync(message, remote).ConfigureAwait(false);
                 break;
             case StunMessage.AllocateSuccess:
+                CompleteTurnRequest(message, remote);
                 await HandleTurnAllocatedAsync(message).ConfigureAwait(false);
                 break;
             case StunMessage.RefreshSuccess:
                 lock (_sync)
                 {
+                    _pendingTurn.Remove(TurnRequestKey(message.TransactionIdHex, remote));
                     _relayTtl = DateTimeOffset.UtcNow.AddSeconds(Math.Max(30, message.LifetimeSeconds(300)));
                 }
                 break;
             case StunMessage.CreatePermissionSuccess:
+                CompleteTurnRequest(message, remote);
                 _logger.LogTrace("Peer Mesh TURN permission created: tx={TransactionId}", message.TransactionIdHex);
                 break;
             case StunMessage.DataIndication:
@@ -553,11 +573,59 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             case StunMessage.AllocateError:
             case StunMessage.RefreshError:
             case StunMessage.CreatePermissionError:
-                _logger.LogWarning("Peer Mesh STUN/TURN error response: type=0x{Type:x}, tx={TransactionId}",
-                    message.Type,
-                    message.TransactionIdHex);
+                await HandleTurnErrorAsync(message, remote).ConfigureAwait(false);
                 break;
         }
+    }
+
+    private void CompleteTurnRequest(StunMessage response, IPEndPoint remote)
+    {
+        lock (_sync)
+        {
+            _pendingTurn.Remove(TurnRequestKey(response.TransactionIdHex, remote));
+        }
+    }
+
+    private async Task HandleTurnErrorAsync(StunMessage response, IPEndPoint remote)
+    {
+        PendingTurnRequest? pending;
+        var transactionKey = TurnRequestKey(response.TransactionIdHex, remote);
+        lock (_sync)
+        {
+            _pendingTurn.Remove(transactionKey, out pending);
+        }
+        var errorCode = response.ErrorCode();
+        if (pending is null)
+        {
+            _logger.LogDebug(
+                "Peer Mesh TURN error ignored: type=0x{Type:x}, code={Code}, tx={TransactionId}",
+                response.Type,
+                errorCode,
+                response.TransactionIdHex);
+            return;
+        }
+        if (errorCode is not (401 or 438)
+            || pending.AuthenticationAttempt >= 1
+            || !_turnAuthenticator.ApplyChallenge(response))
+        {
+            _logger.LogWarning(
+                "Peer Mesh TURN request failed: type=0x{Type:x}, code={Code}, attempt={Attempt}",
+                pending.RequestType,
+                errorCode,
+                pending.AuthenticationAttempt);
+            return;
+        }
+
+        var retry = new StunMessage(
+            pending.RequestType,
+            StunMessage.NewTransactionId(),
+            pending.Attributes);
+        _logger.LogDebug(
+            "Peer Mesh TURN auth challenge received, retrying once: type=0x{Type:x}, code={Code}",
+            pending.RequestType,
+            errorCode);
+        await SendStunRequestAsync(retry, pending.Endpoint, pending.AuthenticationAttempt + 1)
+            .ConfigureAwait(false);
     }
 
     private async Task HandleStunBindingSuccessAsync(StunMessage message, IPEndPoint remote)
@@ -2156,14 +2224,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             await SendStunRequestAsync(StunMessage.Of(
                 StunMessage.RefreshRequest,
                 StunMessage.NewTransactionId(),
-                AuthenticatedTurnAttributes(StunMessage.Lifetime(Math.Max(30, Runtime()?.PeerMesh.SessionTtlSeconds ?? 300)))),
+                StunMessage.Lifetime(Math.Max(30, Runtime()?.PeerMesh.SessionTtlSeconds ?? 300))),
                 endpoint).ConfigureAwait(false);
             return;
         }
         await SendStunRequestAsync(StunMessage.Of(
             StunMessage.AllocateRequest,
             StunMessage.NewTransactionId(),
-            AuthenticatedTurnAttributes(StunMessage.RequestedUdpTransportAttribute())),
+            StunMessage.RequestedUdpTransportAttribute()),
             endpoint).ConfigureAwait(false);
     }
 
@@ -2247,6 +2315,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private async Task SendStunRequestAsync(StunMessage message, IPEndPoint endpoint)
     {
+        await SendStunRequestAsync(message, endpoint, 0).ConfigureAwait(false);
+    }
+
+    private async Task SendStunRequestAsync(
+        StunMessage message,
+        IPEndPoint endpoint,
+        int authenticationAttempt)
+    {
         UdpClient? udp;
         lock (_sync)
         {
@@ -2256,10 +2332,43 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        var body = message.First(StunMessage.AttrUsername) is null
-            ? message.ToBytes()
-            : message.ToBytes(TurnMessageIntegrityKey());
-        await udp.SendAsync(body, endpoint).ConfigureAwait(false);
+        var authenticatedTurnRequest = TurnLongTermAuthenticator.RequiresAuthentication(message.Type)
+                                       && _turnAuthenticator.CanAuthenticate;
+        PendingTurnRequest? pending = null;
+        var transactionKey = TurnRequestKey(message.TransactionIdHex, endpoint);
+        if (authenticatedTurnRequest)
+        {
+            pending = new PendingTurnRequest(
+                message.Type,
+                message.Attributes.Select(attribute => new StunAttribute(attribute.Type, attribute.Value)).ToList(),
+                endpoint,
+                authenticationAttempt,
+                DateTimeOffset.UtcNow);
+            lock (_sync)
+            {
+                _pendingTurn[transactionKey] = pending;
+            }
+        }
+        try
+        {
+            var body = _turnAuthenticator.Encode(message);
+            await udp.SendAsync(body, endpoint).ConfigureAwait(false);
+        }
+        catch
+        {
+            if (pending is not null)
+            {
+                lock (_sync)
+                {
+                    if (_pendingTurn.TryGetValue(transactionKey, out var current)
+                        && ReferenceEquals(current, pending))
+                    {
+                        _pendingTurn.Remove(transactionKey);
+                    }
+                }
+            }
+            throw;
+        }
     }
 
     private async Task<bool> SendRelayPayloadAsync(string? toAllocationId, byte[] payload)
@@ -2321,45 +2430,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         await SendStunRequestAsync(StunMessage.Of(
             StunMessage.CreatePermissionRequest,
             transactionId,
-            AuthenticatedTurnAttributes(StunMessage.XorPeerAddress(peer, transactionId))),
+            StunMessage.XorPeerAddress(peer, transactionId)),
             turnServer).ConfigureAwait(false);
-    }
-
-    private StunAttribute[] AuthenticatedTurnAttributes(params StunAttribute[] attributes)
-    {
-        var runtime = Runtime();
-        var username = runtime?.PeerMesh.IceUsername?.Trim();
-        var credential = runtime?.PeerMesh.IceCredential?.Trim();
-        var realm = runtime?.PeerMesh.IceRealm?.Trim();
-        var nonce = runtime?.PeerMesh.IceNonce?.Trim();
-        if (string.IsNullOrWhiteSpace(username)
-            || string.IsNullOrWhiteSpace(credential)
-            || string.IsNullOrWhiteSpace(realm)
-            || string.IsNullOrWhiteSpace(nonce))
-        {
-            return attributes;
-        }
-        return [
-            .. attributes,
-            StunMessage.Username(username),
-            StunMessage.Realm(realm),
-            StunMessage.Nonce(nonce),
-        ];
-    }
-
-    private byte[]? TurnMessageIntegrityKey()
-    {
-        var runtime = Runtime();
-        var username = runtime?.PeerMesh.IceUsername?.Trim();
-        var credential = runtime?.PeerMesh.IceCredential?.Trim();
-        var realm = runtime?.PeerMesh.IceRealm?.Trim();
-        if (string.IsNullOrWhiteSpace(username)
-            || string.IsNullOrWhiteSpace(credential)
-            || string.IsNullOrWhiteSpace(realm))
-        {
-            return null;
-        }
-        return MD5.HashData(Encoding.UTF8.GetBytes($"{username}:{realm}:{credential}"));
     }
 
     private IPEndPoint? RelayEndpoint()
@@ -2489,6 +2561,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     }
 
     private static string EndpointKey(IPEndPoint endpoint) => $"{endpoint.Address}:{endpoint.Port}";
+
+    private static string TurnRequestKey(string transactionIdHex, IPEndPoint endpoint) =>
+        $"{transactionIdHex}@{EndpointKey(endpoint)}";
 
     private static List<PeerCandidate> NormalizeCandidates(IEnumerable<PeerCandidate?>? candidates) =>
         candidates?.OfType<PeerCandidate>().ToList() ?? [];
@@ -2646,6 +2721,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             foreach (var key in _pendingStun.Where(item => now - item.Value.SentAt > TimeSpan.FromSeconds(30)).Select(item => item.Key).ToList())
             {
                 _pendingStun.Remove(key);
+            }
+            foreach (var key in _pendingTurn.Where(item => now - item.Value.SentAt > PendingTurnRequestTtl).Select(item => item.Key).ToList())
+            {
+                _pendingTurn.Remove(key);
             }
             foreach (var key in _sessions.Where(item => now > item.Value.ExpiresAt).Select(item => item.Key).ToList())
             {
@@ -2943,6 +3022,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pathPreparedAt.Clear();
             _natByRole.Clear();
             _pendingStun.Clear();
+            _pendingTurn.Clear();
             _srflxCandidates.Clear();
             _turnPermissions.Clear();
             _pendingMessageAcks.Clear();
@@ -3110,6 +3190,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private sealed record PendingProbe(long SessionId, long PeerId, DateTimeOffset SentAt, bool Relay, string? RelayId);
 
     private sealed record PendingStunBinding(string Role, DateTimeOffset SentAt);
+
+    private sealed record PendingTurnRequest(
+        ushort RequestType,
+        IReadOnlyList<StunAttribute> Attributes,
+        IPEndPoint Endpoint,
+        int AuthenticationAttempt,
+        DateTimeOffset SentAt);
 
     private sealed record PendingVirtualPacket(byte[] Packet, DateTimeOffset CreatedAt);
 

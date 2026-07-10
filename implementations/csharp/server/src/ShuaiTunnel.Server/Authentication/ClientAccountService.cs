@@ -264,7 +264,7 @@ public sealed class ClientAccountService
             .ToLowerInvariant();
         return CryptographicOperations.FixedTimeEquals(
             Encoding.ASCII.GetBytes(expected),
-            Encoding.ASCII.GetBytes(request.Signature.ToLowerInvariant()));
+            Encoding.ASCII.GetBytes(request.Signature));
     }
 
     private async Task<ClientIdentity> FindOrCreateIdentityAsync(
@@ -383,6 +383,11 @@ public sealed class ClientAccountService
             ClientVersion = Limit(environment.ClientVersion, 80),
             JavaVersion = Limit(environment.JavaVersion, 80),
             LocalAddresses = Limit(string.Join(",", localAddresses.Where(a => a is not null)), 2000),
+            MessageSendCapable = environment.ClientMessageCapabilities.SendMessages,
+            MessageReceiveCapable = environment.ClientMessageCapabilities.ReceiveMessages,
+            MessageAttachmentsCapable = environment.ClientMessageCapabilities.Attachments,
+            MessageMediaPreviewCapable = environment.ClientMessageCapabilities.MediaPreview,
+            MessageMaxAttachmentBytes = Math.Max(0L, environment.ClientMessageCapabilities.MaxAttachmentBytes),
             HttpLoginAt = DateTimeOffset.UtcNow,
             ExpiresAt = session.ExpiresAt,
         };
@@ -436,6 +441,7 @@ public sealed class ClientAccountService
         environment.OsUser = Limit(environment.OsUser.Trim(), 120);
         environment.Hostname = Limit(
             string.IsNullOrWhiteSpace(environment.Hostname) ? "unknown-host" : environment.Hostname.Trim(), 160);
+        environment.ClientMessageCapabilities ??= new ClientMessageCapabilities();
         return environment;
     }
 

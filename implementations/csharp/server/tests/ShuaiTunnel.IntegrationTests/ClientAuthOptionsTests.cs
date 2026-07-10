@@ -13,6 +13,30 @@ namespace ShuaiTunnel.IntegrationTests;
 public sealed class ClientAuthOptionsTests
 {
     [Fact]
+    public async Task ClientAuthSignatureHexIsCaseSensitiveLikeJava()
+    {
+        await using var server = await TestServerFixture.StartAsync();
+        using var client = server.CreateClient();
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+        var nonce = Guid.NewGuid().ToString("N");
+        const string machine = "machine-uppercase-signature";
+        const string osUser = "alice";
+        var signature = Sign(DatabaseInitializer.DemoCredentialApiKey, timestamp, nonce, machine, osUser,
+            DatabaseInitializer.DemoCredentialSecret).ToUpperInvariant();
+
+        var response = await client.PostAsJsonAsync("/api/client/auth/login", new
+        {
+            apiKey = DatabaseInitializer.DemoCredentialApiKey,
+            timestamp,
+            nonce,
+            signature,
+            environment = new { machineFingerprint = machine, hostname = "host", osUser },
+        });
+
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
     public async Task ClientAuthLoginUsesClientAuthTokenTtl()
     {
         await using var server = await TestServerFixture.StartAsync(new Dictionary<string, string?>
@@ -41,6 +65,14 @@ public sealed class ClientAuthOptionsTests
                 osUser,
                 osName = "test-os",
                 osArch = "amd64",
+                clientMessageCapabilities = new
+                {
+                    sendMessages = true,
+                    receiveMessages = true,
+                    attachments = true,
+                    mediaPreview = true,
+                    maxAttachmentBytes = 123456L,
+                },
                 localAddresses = new[] { "10.1.2.3" },
             },
         });
@@ -57,6 +89,11 @@ public sealed class ClientAuthOptionsTests
         var minExpiresAt = before.AddSeconds(1234 - 2);
         var maxExpiresAt = DateTimeOffset.UtcNow.AddSeconds(1234 + 2);
         Assert.InRange(session.ExpiresAt, minExpiresAt, maxExpiresAt);
+        Assert.True(session.MessageSendCapable);
+        Assert.True(session.MessageReceiveCapable);
+        Assert.True(session.MessageAttachmentsCapable);
+        Assert.True(session.MessageMediaPreviewCapable);
+        Assert.Equal(123456L, session.MessageMaxAttachmentBytes);
     }
 
     [Fact]

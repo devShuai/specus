@@ -51,10 +51,17 @@ internal static class PeerAppMessageCodec
 
     public static byte[] Encode(PeerAppMessage message)
     {
-        var json = JsonSerializer.SerializeToUtf8Bytes(message, JsonOptions);
-        var payload = new byte[PrefixV2.Length + json.Length];
-        PrefixV2.CopyTo(payload, 0);
-        json.CopyTo(payload.AsSpan(PrefixV2.Length));
+        // Java and Go only understand STMSG1. Keep ordinary text messages and
+        // ACKs on that envelope; STMSG2 is solely the optional attachment
+        // extension and must never leak attachment metadata into an ACK.
+        var attachmentV2 = string.Equals(message.Type, TypeMessage, StringComparison.OrdinalIgnoreCase)
+            && message.Attachment is not null;
+        var wireMessage = attachmentV2 ? message : WithoutAttachment(message);
+        var prefix = attachmentV2 ? PrefixV2 : PrefixV1;
+        var json = JsonSerializer.SerializeToUtf8Bytes(wireMessage, JsonOptions);
+        var payload = new byte[prefix.Length + json.Length];
+        prefix.CopyTo(payload, 0);
+        json.CopyTo(payload.AsSpan(prefix.Length));
         return payload;
     }
 
@@ -71,6 +78,18 @@ internal static class PeerAppMessageCodec
 
     private static int PrefixLength(byte[] payload) =>
         payload.AsSpan(0, PrefixV2.Length).SequenceEqual(PrefixV2) ? PrefixV2.Length : PrefixV1.Length;
+
+    private static PeerAppMessage WithoutAttachment(PeerAppMessage message) => new()
+    {
+        Type = message.Type,
+        Id = message.Id,
+        FromClientId = message.FromClientId,
+        FromClientName = message.FromClientName,
+        ToClientId = message.ToClientId,
+        ToClientName = message.ToClientName,
+        Message = message.Message,
+        CreatedAtMillis = message.CreatedAtMillis,
+    };
 
     private static string FormatBytes(long bytes)
     {

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging.Abstractions;
 using ShuaiTunnel.Client.Configuration;
 
 namespace ShuaiTunnel.Client.Tests;
@@ -75,6 +76,26 @@ public sealed class TunnelClientConfigLoaderTests
     public void NormalizeOsUserMatchesJavaStyleUsername(string input, string expected)
     {
         Assert.Equal(expected, ClientEnvironmentInfo.NormalizeOsUser(input));
+    }
+
+    [Fact]
+    public void CollectedEnvironmentAdvertisesOnlyImplementedMessageCapabilities()
+    {
+        var environment = ClientEnvironmentInfo.Collect(NullLogger.Instance);
+
+        Assert.True(environment.ClientMessageCapabilities.SendMessages);
+        Assert.True(environment.ClientMessageCapabilities.ReceiveMessages);
+        Assert.False(environment.ClientMessageCapabilities.Attachments);
+        Assert.False(environment.ClientMessageCapabilities.MediaPreview);
+        Assert.Equal(0L, environment.ClientMessageCapabilities.MaxAttachmentBytes);
+
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(environment));
+        var capabilities = json.RootElement.GetProperty("clientMessageCapabilities");
+        Assert.True(capabilities.GetProperty("sendMessages").GetBoolean());
+        Assert.True(capabilities.GetProperty("receiveMessages").GetBoolean());
+        Assert.False(capabilities.GetProperty("attachments").GetBoolean());
+        Assert.False(capabilities.GetProperty("mediaPreview").GetBoolean());
+        Assert.Equal(0L, capabilities.GetProperty("maxAttachmentBytes").GetInt64());
     }
 
     [Fact]

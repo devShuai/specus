@@ -33,6 +33,7 @@ public sealed class PeerMeshAcl
     public long TargetClientId { get; set; }
     public string TargetClientName { get; set; } = string.Empty;
     public bool Allowed { get; set; } = true;
+    public string Direction { get; set; } = "OUTBOUND";
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }

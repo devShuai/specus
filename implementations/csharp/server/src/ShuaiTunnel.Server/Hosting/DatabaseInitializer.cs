@@ -46,6 +46,8 @@ public sealed class DatabaseInitializer
         await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
         await EnsureManagementUserTableAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureClientDownloadLinkTableAsync(db, cancellationToken).ConfigureAwait(false);
+        await EnsureClientMessageCapabilityColumnsAsync(db, cancellationToken).ConfigureAwait(false);
+        await EnsureTransferAttachmentTableAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureMappingCompatibilityColumnsAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureTrafficDetailTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsurePeerMeshTablesAsync(db, cancellationToken).ConfigureAwait(false);
@@ -186,6 +188,66 @@ public sealed class DatabaseInitializer
             .ConfigureAwait(false);
         await EnsureIndexAsync(db, "idx_tunnel_traffic_tenant", "tunnel_traffic_usage",
             "tenant_id", cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task EnsureClientMessageCapabilityColumnsAsync(TunnelDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var booleanDefinition = DatabaseDialect(db.Database.ProviderName) switch
+        {
+            "postgresql" => "BOOLEAN NOT NULL DEFAULT FALSE",
+            "mysql" => "TINYINT(1) NOT NULL DEFAULT 0",
+            _ => "INTEGER NOT NULL DEFAULT 0",
+        };
+        await EnsureColumnAsync(db, "tunnel_client_session", "message_send_capable",
+            booleanDefinition, cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "tunnel_client_session", "message_receive_capable",
+            booleanDefinition, cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "tunnel_client_session", "message_attachments_capable",
+            booleanDefinition, cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "tunnel_client_session", "message_media_preview_capable",
+            booleanDefinition, cancellationToken).ConfigureAwait(false);
+        await EnsureColumnAsync(db, "tunnel_client_session", "message_max_attachment_bytes",
+            "BIGINT NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task EnsureTransferAttachmentTableAsync(TunnelDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var idType = DatabaseDialect(db.Database.ProviderName) switch
+        {
+            "mysql" => "BIGINT NOT NULL PRIMARY KEY",
+            "postgresql" => "BIGINT PRIMARY KEY",
+            _ => "INTEGER PRIMARY KEY",
+        };
+        await ExecuteSchemaSqlAsync(db, $"""
+            CREATE TABLE IF NOT EXISTS transfer_attachment (
+              id {idType},
+              tenant_id VARCHAR(80),
+              scope VARCHAR(40) NOT NULL,
+              room_id VARCHAR(120),
+              room_token_hash VARCHAR(64),
+              owner_username VARCHAR(80),
+              target_client_id BIGINT,
+              object_key VARCHAR(512) NOT NULL,
+              file_name VARCHAR(255) NOT NULL,
+              mime_type VARCHAR(120) NOT NULL,
+              size_bytes BIGINT NOT NULL,
+              sha256 VARCHAR(64),
+              status VARCHAR(24) NOT NULL,
+              created_at VARCHAR(40) NOT NULL,
+              updated_at VARCHAR(40) NOT NULL,
+              upload_expires_at VARCHAR(40) NOT NULL,
+              expires_at VARCHAR(40) NOT NULL,
+              uploaded_at VARCHAR(40)
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_transfer_attachment_tenant", "transfer_attachment",
+            "tenant_id, scope, id", cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_transfer_attachment_room", "transfer_attachment",
+            "scope, room_id, id", cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_transfer_attachment_expires", "transfer_attachment",
+            "expires_at, status", cancellationToken).ConfigureAwait(false);
     }
 
     private static Task BackfillConnectionStatTenantAsync(TunnelDbContext db, CancellationToken cancellationToken)
@@ -354,7 +416,7 @@ public sealed class DatabaseInitializer
             "frame_time", cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task EnsurePeerMeshTablesAsync(TunnelDbContext db,
+    internal static async Task EnsurePeerMeshTablesAsync(TunnelDbContext db,
         CancellationToken cancellationToken)
     {
         var dialect = DatabaseDialect(db.Database.ProviderName);
@@ -402,11 +464,18 @@ public sealed class DatabaseInitializer
               target_client_id BIGINT NOT NULL,
               target_client_name VARCHAR(120) NOT NULL,
               allowed {boolType},
+              direction VARCHAR(16) NOT NULL DEFAULT 'OUTBOUND',
               created_at VARCHAR(40) NOT NULL,
               updated_at VARCHAR(40) NOT NULL,
               CONSTRAINT uk_peer_mesh_acl_pair UNIQUE (tenant_id, source_client_id, target_client_id)
             )
             """, cancellationToken).ConfigureAwait(false);
+
+        await EnsureColumnAsync(db, "peer_mesh_acl", "direction",
+            "VARCHAR(16) NOT NULL DEFAULT 'OUTBOUND'", cancellationToken).ConfigureAwait(false);
+        await db.Database.ExecuteSqlRawAsync(
+            "UPDATE peer_mesh_acl SET direction = 'OUTBOUND' WHERE direction IS NULL OR TRIM(direction) = ''",
+            cancellationToken).ConfigureAwait(false);
 
         await ExecuteSchemaSqlAsync(db, $"""
             CREATE TABLE IF NOT EXISTS peer_mesh_session (

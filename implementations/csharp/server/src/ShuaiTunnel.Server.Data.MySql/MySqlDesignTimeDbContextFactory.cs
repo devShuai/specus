@@ -16,7 +16,7 @@ public sealed class MySqlDesignTimeDbContextFactory : IDesignTimeDbContextFactor
     {
         var options = new DbContextOptionsBuilder<TunnelDbContext>()
             .UseMySQL(
-                "server=localhost;database=shuai_tunnel;user=root;password=root",
+                "server=localhost;database=design_time",
                 mysql => mysql.MigrationsAssembly(typeof(MySqlDesignTimeDbContextFactory).Assembly.GetName().Name))
             .Options;
         return new TunnelDbContext(options);

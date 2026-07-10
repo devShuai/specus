@@ -124,6 +124,12 @@ public static class CompactBinarySerializer
 
     private static byte[] Inflate(byte[] bytes)
     {
+        // DeflateStream historically treats input EOF as a successful end even
+        // when the raw DEFLATE stream never reached a final block. Java checks
+        // Inflater.finished(), while Go reports io.ErrUnexpectedEOF. Validate
+        // the block structure first so all implementations reject truncation
+        // and streams that were only flushed but never finished.
+        RawDeflateValidator.EnsureFinished(bytes);
         using var input = new MemoryStream(bytes);
         using var deflate = new DeflateStream(input, CompressionMode.Decompress);
         using var output = new MemoryStream(bytes.Length * 2);

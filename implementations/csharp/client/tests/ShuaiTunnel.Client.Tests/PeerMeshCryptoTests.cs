@@ -347,6 +347,11 @@ public sealed class PeerMeshCryptoTests
             "100.112.0.2",
             "public-key",
             true,
+            false,
+            false,
+            false,
+            false,
+            0L,
             null);
 
         InvokePrivate(client, "MergeRoster", NewPeerList(peer));

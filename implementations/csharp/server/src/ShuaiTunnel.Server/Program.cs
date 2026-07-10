@@ -40,6 +40,10 @@ builder.Services.Configure<ElasticsearchOptions>(
     builder.Configuration.GetSection(ElasticsearchOptions.SectionName));
 builder.Services.Configure<DirectHttpOptions>(
     builder.Configuration.GetSection(DirectHttpOptions.SectionName));
+builder.Services.Configure<PublicTransferOptions>(
+    builder.Configuration.GetSection(PublicTransferOptions.SectionName));
+builder.Services.Configure<ObjectStorageOptions>(
+    builder.Configuration.GetSection(ObjectStorageOptions.SectionName));
 builder.Services.Configure<PeerMeshOptions>(
     builder.Configuration.GetSection(PeerMeshOptions.SectionName));
 builder.Services.Configure<OidcOptions>(
@@ -92,13 +96,21 @@ builder.Services.AddScoped<NatControlService>();
 builder.Services.AddScoped<ManagementQueryService>();
 builder.Services.AddScoped<ManagementMutationService>();
 builder.Services.AddScoped<ManagementUserService>();
+builder.Services.AddSingleton<TurnCredentialService>();
 builder.Services.AddScoped<PeerMeshService>();
 builder.Services.AddHostedService<StunTurnServer>();
 builder.Services.AddHostedService<PeerMeshRelayTrafficFlushService>();
 builder.Services.AddSingleton<ElasticsearchTrafficDetailClient>();
+builder.Services.AddSingleton<IObjectStorageService, AliyunOssObjectStorageService>();
+builder.Services.AddSingleton<PublicTransferRateLimiter>();
+builder.Services.AddHostedService<PublicTransferRateLimiterCleanupService>();
+builder.Services.AddScoped<TransferAttachmentService>();
+builder.Services.AddHostedService<TransferAttachmentExpirationService>();
 builder.Services.AddSingleton<TrafficInspectionService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficInspectionService>());
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient(nameof(AliyunOssObjectStorageService))
+    .ConfigurePrimaryHttpMessageHandler(AliyunOssObjectStorageService.CreateNoRedirectHandler);
 
 builder.Services.AddSingleton<ClientAuthSessionStore>();
 builder.Services.AddSingleton<LocalTokenService>();
@@ -123,6 +135,8 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficUsageServic
 builder.Services.AddSingleton<NatServerHandler>();
 builder.Services.AddSingleton<DirectHttpDispatcher>();
 builder.Services.AddSingleton<ConnectionEventsHub>();
+builder.Services.AddSingleton<ClientMessagesHub>();
+builder.Services.AddSingleton<PublicTransferDiscoveryHub>();
 builder.Services.AddSingleton<ControlChannelTlsProvider>();
 builder.Services.AddSingleton<IControlChannelDispatcher, ControlChannelDispatcher>();
 builder.Services.AddSingleton<ControlChannelListener>();
@@ -148,8 +162,11 @@ app.MapStaticAssets();
 
 app.MapAdminApi();
 app.MapClientAuthApi();
+app.MapTransferAttachmentApi();
 app.MapDirectHttpTunnel();
 app.MapConnectionEventsWebSocket();
+app.MapClientMessagesWebSocket();
+app.MapPublicTransferDiscoveryWebSocket();
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 

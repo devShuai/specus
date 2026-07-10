@@ -27,10 +27,14 @@ public sealed class StunMessage
     public const ushort SendIndication = 0x0016;
     public const ushort DataIndication = 0x0017;
 
+    public const ushort AttrUsername = 0x0006;
+    public const ushort AttrMessageIntegrity = 0x0008;
     public const ushort AttrErrorCode = 0x0009;
     public const ushort AttrLifetime = 0x000D;
     public const ushort AttrXorPeerAddress = 0x0012;
     public const ushort AttrData = 0x0013;
+    public const ushort AttrRealm = 0x0014;
+    public const ushort AttrNonce = 0x0015;
     public const ushort AttrXorRelayedAddress = 0x0016;
     public const ushort AttrRequestedTransport = 0x0019;
     public const ushort AttrXorMappedAddress = 0x0020;
@@ -104,16 +108,39 @@ public sealed class StunMessage
         return new StunMessage(type, transactionId, attributes);
     }
 
-    public byte[] ToBytes()
+    public byte[] ToBytes() => ToBytes(null);
+
+    public byte[] ToBytes(byte[]? messageIntegrityKey)
     {
         var length = Attributes.Sum(attr => 4 + attr.Value.Length + Padding(attr.Value.Length));
+        if (messageIntegrityKey is { Length: > 0 })
+        {
+            var beforeIntegrity = Serialize(length + 24, Attributes);
+            using var hmac = new HMACSHA1(messageIntegrityKey);
+            var digest = hmac.ComputeHash(beforeIntegrity);
+            var packetWithIntegrity = new byte[beforeIntegrity.Length + 24];
+            beforeIntegrity.CopyTo(packetWithIntegrity, 0);
+            var integrityOffset = beforeIntegrity.Length;
+            BinaryPrimitives.WriteUInt16BigEndian(packetWithIntegrity.AsSpan(integrityOffset, 2),
+                AttrMessageIntegrity);
+            BinaryPrimitives.WriteUInt16BigEndian(packetWithIntegrity.AsSpan(integrityOffset + 2, 2),
+                (ushort)digest.Length);
+            digest.CopyTo(packetWithIntegrity.AsSpan(integrityOffset + 4));
+            return packetWithIntegrity;
+        }
+        return Serialize(length, Attributes);
+    }
+
+    private byte[] Serialize(int declaredLength, IReadOnlyList<StunAttribute> attributes)
+    {
+        var length = attributes.Sum(attr => 4 + attr.Value.Length + Padding(attr.Value.Length));
         var packet = new byte[HeaderBytes + length];
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(0, 2), Type);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)length);
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)declaredLength);
         BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4, 4), MagicCookie);
         TransactionId.CopyTo(packet.AsSpan(8, TransactionIdBytes));
         var offset = HeaderBytes;
-        foreach (var attr in Attributes)
+        foreach (var attr in attributes)
         {
             BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(offset, 2), attr.Type);
             BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(offset + 2, 2), (ushort)attr.Value.Length);
@@ -124,6 +151,47 @@ public sealed class StunMessage
         return packet;
     }
 
+    public static bool VerifyMessageIntegrity(ReadOnlySpan<byte> packet, ReadOnlySpan<byte> key)
+    {
+        if (key.IsEmpty || !LooksLike(packet))
+        {
+            return false;
+        }
+        var end = HeaderBytes + BinaryPrimitives.ReadUInt16BigEndian(packet[2..4]);
+        var offset = HeaderBytes;
+        while (offset < end)
+        {
+            if (end - offset < 4)
+            {
+                return false;
+            }
+            var type = BinaryPrimitives.ReadUInt16BigEndian(packet[offset..(offset + 2)]);
+            var length = BinaryPrimitives.ReadUInt16BigEndian(packet[(offset + 2)..(offset + 4)]);
+            var valueOffset = offset + 4;
+            var next = valueOffset + length + Padding(length);
+            if (length > end - valueOffset || next > end)
+            {
+                return false;
+            }
+            if (type == AttrMessageIntegrity)
+            {
+                if (length != 20)
+                {
+                    return false;
+                }
+                var signed = packet[..offset].ToArray();
+                BinaryPrimitives.WriteUInt16BigEndian(signed.AsSpan(2, 2),
+                    checked((ushort)(offset + 24 - HeaderBytes)));
+                using var hmac = new HMACSHA1(key.ToArray());
+                var expected = hmac.ComputeHash(signed);
+                var actual = packet.Slice(valueOffset, length);
+                return CryptographicOperations.FixedTimeEquals(expected, actual);
+            }
+            offset = next;
+        }
+        return false;
+    }
+
     public StunAttribute? First(ushort type) => Attributes.FirstOrDefault(attr => attr.Type == type);
     public IEnumerable<StunAttribute> All(ushort type) => Attributes.Where(attr => attr.Type == type);
     public IPEndPoint? XorMappedAddress() => DecodeXorAddress(First(AttrXorMappedAddress)?.Value);
@@ -131,6 +199,9 @@ public sealed class StunMessage
     public IPEndPoint? XorPeerAddress() => DecodeXorAddress(First(AttrXorPeerAddress)?.Value);
     public IPEndPoint? OtherAddress() => DecodeXorAddress(First(AttrOtherAddress)?.Value);
     public byte[]? Data() => First(AttrData)?.Value.ToArray();
+    public string? UsernameValue() => DecodeText(First(AttrUsername)?.Value);
+    public string? RealmValue() => DecodeText(First(AttrRealm)?.Value);
+    public string? NonceValue() => DecodeText(First(AttrNonce)?.Value);
 
     public long LifetimeSeconds(long fallback)
     {
@@ -174,6 +245,15 @@ public sealed class StunMessage
 
     public static StunAttribute Software(string value) =>
         new(AttrSoftware, Encoding.UTF8.GetBytes(value));
+
+    public static StunAttribute Username(string value) =>
+        new(AttrUsername, Encoding.UTF8.GetBytes(value));
+
+    public static StunAttribute Realm(string value) =>
+        new(AttrRealm, Encoding.UTF8.GetBytes(value));
+
+    public static StunAttribute Nonce(string value) =>
+        new(AttrNonce, Encoding.UTF8.GetBytes(value));
 
     public static StunAttribute ErrorCode(int code, string reason)
     {
@@ -259,6 +339,10 @@ public sealed class StunMessage
     }
 
     private static int Padding(int length) => (4 - length % 4) % 4;
+
+    private static string? DecodeText(byte[]? value) => value is null
+        ? null
+        : Encoding.UTF8.GetString(value);
 }
 
 public sealed record StunAttribute(ushort Type, byte[] Value)

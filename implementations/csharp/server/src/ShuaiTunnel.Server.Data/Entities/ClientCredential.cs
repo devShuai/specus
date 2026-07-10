@@ -53,6 +53,11 @@ public sealed class ClientSession
     public string? ClientVersion { get; set; }
     public string? JavaVersion { get; set; }
     public string? LocalAddresses { get; set; }
+    public bool MessageSendCapable { get; set; }
+    public bool MessageReceiveCapable { get; set; }
+    public bool MessageAttachmentsCapable { get; set; }
+    public bool MessageMediaPreviewCapable { get; set; }
+    public long MessageMaxAttachmentBytes { get; set; }
     public DateTimeOffset HttpLoginAt { get; set; }
     public DateTimeOffset? NettyConnectedAt { get; set; }
     public DateTimeOffset? DisconnectedAt { get; set; }

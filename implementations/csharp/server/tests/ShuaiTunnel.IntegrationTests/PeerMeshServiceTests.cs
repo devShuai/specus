@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
+using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data;
@@ -19,6 +20,59 @@ namespace ShuaiTunnel.IntegrationTests;
 
 public sealed class PeerMeshServiceTests
 {
+    [Fact]
+    public async Task PublicStunConfigNormalizesJavaStyleHostsAndIpv6()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync(
+            "https://relay.example.com:8443/path",
+            ["stun://stun.example.com:5349/path", "2001:db8::1"]);
+
+        var config = fixture.Service.PublicStunConfig("ignored.example.com:8088");
+
+        Assert.Equal("stun:relay.example.com:3478", config.SelfHostedStunServer);
+        Assert.Contains("stun:stun.example.com:5349", config.StunServers);
+        Assert.Contains("stun:[2001:db8::1]:3478", config.StunServers);
+    }
+
+    [Fact]
+    public async Task DirectionalAclAndExactTenantOwnerMatchingFollowJava()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(1101, "tenant-a", "Alice", "alice-laptop");
+        var target = fixture.AddClient(1102, "tenant-a", "alice", "alice-nas");
+        var normalizedTenantMismatch = fixture.AddClient(1103, "tenant-a ", "Alice", "other-tenant");
+        fixture.AddDevice(source, "100.96.0.40", "source-key");
+        fixture.AddDevice(target, "100.96.0.41", "target-key");
+        fixture.AddDevice(normalizedTenantMismatch, "100.96.0.42", "other-key");
+        await fixture.SaveChangesAsync();
+
+        Assert.False(await fixture.Service.CanPeerAsync(source, target, CancellationToken.None));
+        Assert.False(await fixture.Service.CanPeerAsync(source, normalizedTenantMismatch,
+            CancellationToken.None));
+
+        var admin = new ManagementContext("tenant-a", "admin", ManagementRole.Admin, false);
+        var inbound = await fixture.Service.CreateAclAsync(admin,
+            new PeerMeshAclMutation(source.Id, target.Id, true, "inbound"), CancellationToken.None);
+        Assert.Equal(PeerMeshService.DirectionInbound, inbound.Direction);
+        Assert.False(await fixture.Service.CanPeerAsync(source, target, CancellationToken.None));
+        Assert.True(await fixture.Service.CanPeerAsync(target, source, CancellationToken.None));
+
+        var outbound = await fixture.Service.CreateAclAsync(admin,
+            new PeerMeshAclMutation(source.Id, target.Id, true, "OUTBOUND"), CancellationToken.None);
+        Assert.Equal(PeerMeshService.DirectionOutbound, outbound.Direction);
+        Assert.True(await fixture.Service.CanPeerAsync(source, target, CancellationToken.None));
+        Assert.False(await fixture.Service.CanPeerAsync(target, source, CancellationToken.None));
+
+        var both = await fixture.Service.CreateAclAsync(admin,
+            new PeerMeshAclMutation(source.Id, target.Id, true, "BOTH"), CancellationToken.None);
+        Assert.Equal(PeerMeshService.DirectionBoth, both.Direction);
+        Assert.True(await fixture.Service.CanPeerAsync(source, target, CancellationToken.None));
+        Assert.True(await fixture.Service.CanPeerAsync(target, source, CancellationToken.None));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.CreateAclAsync(admin,
+            new PeerMeshAclMutation(source.Id, target.Id, true, "SIDEWAYS"), CancellationToken.None));
+    }
+
     [Fact]
     public async Task CandidatesSignalCreatesSessionGrantAndForwardsJavaShape()
     {
@@ -135,6 +189,37 @@ public sealed class PeerMeshServiceTests
         var target = fixture.AddClient(2102, "tenant-a", "alice", "alice-nas");
         fixture.AddDevice(source, "100.96.0.22", "source-key");
         fixture.AddDevice(target, "100.96.0.23", "target-key");
+        var now = DateTimeOffset.UtcNow;
+        fixture.Db.ClientSessions.AddRange(
+            new ClientSession
+            {
+                Id = 21021,
+                TenantId = "tenant-a",
+                ClientId = target.Id,
+                ClientName = target.ClientName,
+                Status = ClientAccountService.StatusNettyOnline,
+                TokenHash = "older-capable-token",
+                MachineFingerprint = "machine-a",
+                OsUser = "alice",
+                MessageReceiveCapable = true,
+                HttpLoginAt = now.AddMinutes(-2),
+                NettyConnectedAt = now.AddMinutes(-2),
+                ExpiresAt = now.AddHours(1),
+            },
+            new ClientSession
+            {
+                Id = 21022,
+                TenantId = "tenant-a",
+                ClientId = target.Id,
+                ClientName = target.ClientName,
+                Status = ClientAccountService.StatusNettyOnline,
+                TokenHash = "newer-incapable-token",
+                MachineFingerprint = "machine-b",
+                OsUser = "alice",
+                HttpLoginAt = now.AddMinutes(-1),
+                NettyConnectedAt = now.AddMinutes(-1),
+                ExpiresAt = now.AddHours(1),
+            });
         await fixture.SaveChangesAsync();
 
         var sourceWriter = fixture.Bind(source);
@@ -148,7 +233,9 @@ public sealed class PeerMeshServiceTests
             && message.TargetClientId == source.Id);
         Assert.Contains(sourceMessages, message => message.Type == "roster"
             && message.Peers is not null
-            && message.Peers.Any(peer => peer.ClientId == target.Id && peer.Online));
+            && message.Peers.Any(peer => peer.ClientId == target.Id
+                && peer.Online
+                && peer.MessageReceiveCapable));
 
         var targetRoster = Assert.Single(targetWriter.PeerMessages(), message => message.Type == "roster");
         Assert.Contains(targetRoster.Peers ?? [], peer => peer.ClientId == source.Id && peer.Online);
@@ -430,7 +517,9 @@ public sealed class PeerMeshServiceTests
 
         public PeerMeshService Service { get; }
 
-        public static async Task<PeerMeshFixture> CreateAsync()
+        public static async Task<PeerMeshFixture> CreateAsync(
+            string publicAddress = "203.0.113.10",
+            IReadOnlyList<string>? publicStunServers = null)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -444,8 +533,9 @@ public sealed class PeerMeshServiceTests
             {
                 Enabled = true,
                 Cidr = "100.96.0.0/11",
-                PublicAddress = "203.0.113.10",
+                PublicAddress = publicAddress,
                 StunTurnPort = 3478,
+                PublicStunServers = publicStunServers?.ToList() ?? [],
                 SessionTtlSeconds = 3600,
             }), NullLogger<PeerMeshService>.Instance);
             return new PeerMeshFixture(connection, db, registry, service);

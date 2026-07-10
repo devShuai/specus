@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Nat;
@@ -62,11 +63,29 @@ public sealed class ManagementQueryService
             .OrderByDescending(c => c.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+        var accountIds = accounts.Select(account => account.Id).ToArray();
+        var capabilitySessions = accountIds.Length == 0
+            ? new Dictionary<long, ClientSession>()
+            : (await _db.ClientSessions.AsNoTracking()
+                .Where(session => session.TenantId == context.TenantId
+                    && accountIds.Contains(session.ClientId)
+                    && session.Status == ClientAccountService.StatusNettyOnline)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+                .GroupBy(session => session.ClientId)
+                .ToDictionary(group => group.Key, group => group
+                    .OrderByDescending(session => session.NettyConnectedAt ?? session.HttpLoginAt)
+                    .First());
 
         return accounts.Select(account =>
         {
             totals.TryGetValue(account.Id, out var total);
             var session = _sessions.Find(account.ClientName);
+            capabilitySessions.TryGetValue(account.Id, out var capability);
+            if (session is null)
+            {
+                capability = null;
+            }
             return new ClientAccountView(
                 account.Id,
                 account.ClientName,
@@ -75,6 +94,11 @@ public sealed class ManagementQueryService
                 account.ConnectionRateLimitPerMinute,
                 session is not null,
                 session?.LoginTimeMs,
+                capability?.MessageSendCapable ?? false,
+                capability?.MessageReceiveCapable ?? false,
+                capability?.MessageAttachmentsCapable ?? false,
+                capability?.MessageMediaPreviewCapable ?? false,
+                capability?.MessageMaxAttachmentBytes ?? 0L,
                 total?.Upload ?? 0,
                 total?.Download ?? 0,
                 account.CreatedAt.ToString("O"),
@@ -102,6 +126,15 @@ public sealed class ManagementQueryService
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
         var session = _sessions.Find(account.ClientName);
+        var capability = session is null
+            ? null
+            : await _db.ClientSessions.AsNoTracking()
+                .Where(row => row.TenantId == context.TenantId
+                    && row.ClientId == account.Id
+                    && row.Status == ClientAccountService.StatusNettyOnline)
+                .OrderByDescending(row => row.NettyConnectedAt ?? row.HttpLoginAt)
+                .FirstOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
         var client = new ClientAccountView(
             account.Id,
             account.ClientName,
@@ -110,6 +143,11 @@ public sealed class ManagementQueryService
             account.ConnectionRateLimitPerMinute,
             session is not null,
             session?.LoginTimeMs,
+            capability?.MessageSendCapable ?? false,
+            capability?.MessageReceiveCapable ?? false,
+            capability?.MessageAttachmentsCapable ?? false,
+            capability?.MessageMediaPreviewCapable ?? false,
+            capability?.MessageMaxAttachmentBytes ?? 0L,
             totals?.Upload ?? 0,
             totals?.Download ?? 0,
             account.CreatedAt.ToString("O"),

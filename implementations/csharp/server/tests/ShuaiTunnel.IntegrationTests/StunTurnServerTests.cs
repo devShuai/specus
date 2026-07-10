@@ -15,6 +15,38 @@ namespace ShuaiTunnel.IntegrationTests;
 public sealed class StunTurnServerTests
 {
     [Fact]
+    public async Task AllocateRequiresAndAcceptsJavaCompatibleTurnCredentials()
+    {
+        using var fixture = StunTurnFixture.Create();
+        using var primary = ListenUdp();
+        using var source = ListenUdp();
+        fixture.SetPrimary(primary);
+        var tx = StunMessage.NewTransactionId();
+        var unauthenticated = StunMessage.Of(StunMessage.AllocateRequest, tx,
+            StunMessage.RequestedUdpTransportAttribute());
+
+        await fixture.HandleAsync(unauthenticated.ToBytes(), Remote(source), primary);
+        var challengeBytes = await ReadBytesAsync(source);
+        var challenge = StunMessage.Parse(challengeBytes)!;
+        Assert.Equal(StunMessage.AllocateError, challenge.Type);
+        Assert.Equal(fixture.TurnCredentials.Realm, challenge.RealmValue());
+        Assert.Equal(fixture.TurnCredentials.Nonce, challenge.NonceValue());
+
+        var credential = fixture.TurnCredentials.Issue("test-client");
+        var authenticated = StunMessage.Of(StunMessage.AllocateRequest, StunMessage.NewTransactionId(),
+            StunMessage.RequestedUdpTransportAttribute(),
+            StunMessage.Username(credential.Username),
+            StunMessage.Realm(credential.Realm),
+            StunMessage.Nonce(credential.Nonce));
+        var key = fixture.TurnCredentials.LongTermKey(credential.Username, credential.Credential);
+        await fixture.HandleAsync(authenticated.ToBytes(key), Remote(source), primary);
+        var successBytes = await ReadBytesAsync(source);
+        var success = StunMessage.Parse(successBytes)!;
+        Assert.Equal(StunMessage.AllocateSuccess, success.Type);
+        Assert.True(StunMessage.VerifyMessageIntegrity(successBytes, key));
+    }
+
+    [Fact]
     public void AllocateReplacesExpiredAllocationBeforeCleanup()
     {
         using var fixture = StunTurnFixture.Create();
@@ -217,6 +249,14 @@ public sealed class StunTurnServerTests
             var endpoint = (IPEndPoint)relay.Client.LocalEndPoint!;
             return new IPEndPoint(IPAddress.Loopback, endpoint.Port);
         }
+
+        public TurnCredentialService TurnCredentials => (TurnCredentialService)typeof(StunTurnServer)
+            .GetField("_turnCredentials", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(Server)!;
+
+        public async Task HandleAsync(byte[] payload, IPEndPoint remote, UdpClient socket) =>
+            await InvokeTask("HandleAsync", payload, remote, socket, "primary", CancellationToken.None)
+                .ConfigureAwait(false);
 
         private object Allocations => typeof(StunTurnServer)
             .GetField("_allocations", BindingFlags.Instance | BindingFlags.NonPublic)!

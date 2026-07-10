@@ -35,11 +35,11 @@ public sealed record ManagementContext(
 
     public bool CanAccess(ClientAccount account) =>
         SameTenant(TenantId, account.TenantId)
-        && (IsAdmin || string.Equals(account.OwnerUsername, Username, StringComparison.OrdinalIgnoreCase));
+        && (IsAdmin || string.Equals(account.OwnerUsername, Username, StringComparison.Ordinal));
 
     public bool CanAccess(ClientCredential credential) =>
         SameTenant(TenantId, credential.TenantId)
-        && (IsAdmin || string.Equals(credential.OwnerUsername, Username, StringComparison.OrdinalIgnoreCase));
+        && (IsAdmin || string.Equals(credential.OwnerUsername, Username, StringComparison.Ordinal));
 
     public static string NormalizeTenant(string? value) =>
         string.IsNullOrWhiteSpace(value) ? "default" : value.Trim();
@@ -53,5 +53,5 @@ public sealed record ManagementContext(
     public static string RoleWire(ManagementRole role) => role == ManagementRole.Admin ? "ADMIN" : "USER";
 
     public static bool SameTenant(string? left, string? right) =>
-        string.Equals(NormalizeTenant(left), NormalizeTenant(right), StringComparison.OrdinalIgnoreCase);
+        string.Equals(NormalizeTenant(left), NormalizeTenant(right), StringComparison.Ordinal);
 }

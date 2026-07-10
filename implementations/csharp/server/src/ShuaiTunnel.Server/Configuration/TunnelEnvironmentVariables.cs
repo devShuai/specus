@@ -149,6 +149,28 @@ public static class TunnelEnvironmentVariables
                 : $"Tunnel:PeerMesh:{ToPascal(parts[2..])}";
         }
 
+        if (parts.Length >= 2
+            && parts[0].Equals("OBJECT", StringComparison.OrdinalIgnoreCase)
+            && parts[1].Equals("STORAGE", StringComparison.OrdinalIgnoreCase))
+        {
+            if (parts.Length == 3 && parts[2].Equals("PREFIX", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Tunnel:ObjectStorage:ObjectPrefix";
+            }
+            return parts.Length == 2
+                ? "Tunnel:ObjectStorage"
+                : $"Tunnel:ObjectStorage:{ToPascal(parts[2..])}";
+        }
+
+        if (parts.Length >= 2
+            && parts[0].Equals("PUBLIC", StringComparison.OrdinalIgnoreCase)
+            && parts[1].Equals("TRANSFER", StringComparison.OrdinalIgnoreCase))
+        {
+            return parts.Length == 2
+                ? "Tunnel:PublicTransfer"
+                : $"Tunnel:PublicTransfer:{ToPascal(parts[2..])}";
+        }
+
         return $"Tunnel:{ToSectionName(parts[0])}:{ToPascal(parts[1..])}";
     }
 

@@ -18,6 +18,7 @@ public sealed class MultiProviderModelTests
         "tunnel_mapping",
         "http_route_mapping",
         "client_download_link",
+        "peer_mesh_acl",
         "tunnel_traffic_usage",
         "tunnel_connection_stat",
     };
@@ -37,6 +38,8 @@ public sealed class MultiProviderModelTests
         {
             Assert.Contains(table, script, StringComparison.Ordinal);
         }
+        Assert.Contains("direction", script, StringComparison.Ordinal);
+        Assert.Contains("OUTBOUND", script, StringComparison.Ordinal);
     }
 
     [Theory]
