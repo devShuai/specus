@@ -134,11 +134,14 @@ func (db *DB) migrate() error {
 
 func (db *DB) ensureCompatibleColumns() error {
 	boolType := "INTEGER NOT NULL DEFAULT 0"
+	clientCapabilityBoolType := boolType
 	switch db.dialect {
 	case DialectPostgres:
 		boolType = "SMALLINT NOT NULL DEFAULT 0"
+		clientCapabilityBoolType = "BOOLEAN NOT NULL DEFAULT FALSE"
 	case DialectMySQL:
 		boolType = "TINYINT(1) NOT NULL DEFAULT 0"
+		clientCapabilityBoolType = boolType
 	}
 	columns := []struct {
 		table      string
@@ -149,13 +152,24 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"tunnel_connection_stat", "tenant_id", "VARCHAR(80)"},
 		{"tunnel_traffic_usage", "tenant_id", "VARCHAR(80)"},
 		{"tunnel_mapping", "detail_capture_enabled", boolType},
+		{"tunnel_mapping", "tenant_id", "VARCHAR(80)"},
 		{"http_route_mapping", "detail_capture_enabled", boolType},
 		{"http_route_mapping", "path_rewrite_enabled", boolType},
+		{"http_route_mapping", "tenant_id", "VARCHAR(80)"},
+		{"tunnel_client_session", "message_send_capable", clientCapabilityBoolType},
+		{"tunnel_client_session", "message_receive_capable", clientCapabilityBoolType},
+		{"tunnel_client_session", "message_attachments_capable", clientCapabilityBoolType},
+		{"tunnel_client_session", "message_media_preview_capable", clientCapabilityBoolType},
+		{"tunnel_client_session", "message_max_attachment_bytes", "BIGINT NOT NULL DEFAULT 0"},
+		{"peer_mesh_acl", "direction", "VARCHAR(16) NOT NULL DEFAULT 'OUTBOUND'"},
 	}
 	for _, column := range columns {
 		if err := db.ensureColumn(column.table, column.name, column.definition); err != nil {
 			return err
 		}
+	}
+	if err := db.ensurePostgresClientMessageCapabilityTypes(); err != nil {
+		return err
 	}
 	if err := db.ensureIndex("idx_tunnel_connection_tenant", "tunnel_connection_record", "tenant_id"); err != nil {
 		return err
@@ -173,7 +187,99 @@ func (db *DB) ensureCompatibleColumns() error {
 	if err := db.ensureIndex("idx_tunnel_connection_stat_tenant", "tunnel_connection_stat", "tenant_id"); err != nil {
 		return err
 	}
+	for _, table := range []string{"tunnel_mapping", "http_route_mapping"} {
+		statement := fmt.Sprintf(`UPDATE %s SET tenant_id = COALESCE(
+			(SELECT c.tenant_id FROM tunnel_client_account c WHERE c.id = %s.client_id LIMIT 1),
+			tenant_id, 'default') WHERE tenant_id IS NULL OR tenant_id = ''`, table, table)
+		if _, err := db.sql.Exec(db.rebind(statement)); err != nil {
+			return fmt.Errorf("backfill %s tenant_id: %w", table, err)
+		}
+	}
+	indexes := []struct{ name, table, columns string }{
+		{"idx_tunnel_connection_tenant_id", "tunnel_connection_record", "tenant_id, id"},
+		{"idx_tunnel_connection_tenant_client_id", "tunnel_connection_record", "tenant_id, client_id, id"},
+		{"idx_tunnel_connection_tenant_success", "tunnel_connection_record", "tenant_id, success"},
+		{"idx_tunnel_connection_tenant_client_time", "tunnel_connection_record", "tenant_id, client_id, connected_at"},
+		{"idx_tunnel_mapping_tenant_client_id", "tunnel_mapping", "tenant_id, client_id, id"},
+		{"idx_tunnel_mapping_tenant_client_enabled_id", "tunnel_mapping", "tenant_id, client_id, enabled, id"},
+		{"idx_http_route_tenant_client_id", "http_route_mapping", "tenant_id, client_id, id"},
+		{"idx_http_route_tenant_client_enabled_id", "http_route_mapping", "tenant_id, client_id, enabled, id"},
+		{"idx_http_route_tenant_client_route", "http_route_mapping", "tenant_id, client_id, route"},
+		{"idx_tunnel_traffic_tenant_date_id", "tunnel_traffic_usage", "tenant_id, usage_date, id"},
+		{"idx_tunnel_traffic_tenant_client_date_id", "tunnel_traffic_usage", "tenant_id, client_id, usage_date, id"},
+		{"idx_resource_traffic_tenant_date_id", "tunnel_resource_traffic_usage", "tenant_id, usage_date, id"},
+		{"idx_resource_traffic_tenant_client_date_id", "tunnel_resource_traffic_usage", "tenant_id, client_id, usage_date, id"},
+		{"idx_resource_traffic_tenant_type_date_id", "tunnel_resource_traffic_usage", "tenant_id, resource_type, usage_date, id"},
+		{"idx_resource_traffic_tenant_client_type_date_id", "tunnel_resource_traffic_usage", "tenant_id, client_id, resource_type, usage_date, id"},
+		{"idx_http_exchange_tenant_id", "tunnel_http_traffic_exchange", "tenant_id, id"},
+		{"idx_http_exchange_tenant_client_id", "tunnel_http_traffic_exchange", "tenant_id, client_id, id"},
+		{"idx_http_exchange_tenant_route_id", "tunnel_http_traffic_exchange", "tenant_id, route, id"},
+		{"idx_http_exchange_tenant_client_route_id", "tunnel_http_traffic_exchange", "tenant_id, client_id, route, id"},
+		{"idx_http_exchange_tenant_body_type_id", "tunnel_http_traffic_exchange", "tenant_id, response_body_type, id"},
+		{"idx_tcp_frame_tenant_id", "tunnel_tcp_traffic_frame", "tenant_id, id"},
+		{"idx_tcp_frame_tenant_client_id", "tunnel_tcp_traffic_frame", "tenant_id, client_id, id"},
+		{"idx_tcp_frame_tenant_port_id", "tunnel_tcp_traffic_frame", "tenant_id, listen_port, id"},
+		{"idx_tcp_frame_tenant_client_port_id", "tunnel_tcp_traffic_frame", "tenant_id, client_id, listen_port, id"},
+		{"idx_tcp_frame_tenant_channel_id", "tunnel_tcp_traffic_frame", "tenant_id, channel_id, id"},
+	}
+	for _, index := range indexes {
+		if err := db.ensureIndex(index.name, index.table, index.columns); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+var clientMessageCapabilityColumns = []string{
+	"message_send_capable",
+	"message_receive_capable",
+	"message_attachments_capable",
+	"message_media_preview_capable",
+}
+
+// ensurePostgresClientMessageCapabilityTypes upgrades the short-lived Go schema that used
+// SMALLINT for these four Java boolean fields. All conversions run in one transaction so a
+// startup failure cannot leave a partially converted client-session table.
+func (db *DB) ensurePostgresClientMessageCapabilityTypes() error {
+	if db.dialect != DialectPostgres {
+		return nil
+	}
+	tx, err := db.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin PostgreSQL client capability migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, column := range clientMessageCapabilityColumns {
+		var dataType string
+		err := tx.QueryRow(`SELECT data_type FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2`,
+			"tunnel_client_session", column).Scan(&dataType)
+		if err != nil {
+			return fmt.Errorf("inspect tunnel_client_session.%s type: %w", column, err)
+		}
+		switch strings.ToLower(strings.TrimSpace(dataType)) {
+		case "boolean":
+			continue
+		case "smallint", "integer", "bigint":
+			if _, err := tx.Exec(postgresClientCapabilityBooleanMigration(column)); err != nil {
+				return fmt.Errorf("convert tunnel_client_session.%s to boolean: %w", column, err)
+			}
+		default:
+			return fmt.Errorf("cannot safely convert tunnel_client_session.%s from PostgreSQL type %q to boolean", column, dataType)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit PostgreSQL client capability migration: %w", err)
+	}
+	return nil
+}
+
+func postgresClientCapabilityBooleanMigration(column string) string {
+	return fmt.Sprintf(`ALTER TABLE tunnel_client_session
+		ALTER COLUMN %s DROP DEFAULT,
+		ALTER COLUMN %s TYPE BOOLEAN USING (%s <> 0),
+		ALTER COLUMN %s SET DEFAULT FALSE,
+		ALTER COLUMN %s SET NOT NULL`, column, column, column, column, column)
 }
 
 func (db *DB) ensureIndex(indexName, table, columns string) error {

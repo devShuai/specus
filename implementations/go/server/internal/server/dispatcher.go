@@ -28,6 +28,7 @@ type Dispatcher struct {
 	natHandler        func(conn *control.Conn, message protocol.NatMessage) error
 	directHTTPAck     func(response protocol.DirectHTTPResponse)
 	peerControl       func(conn *control.Conn, request protocol.MessageRequest) error
+	clientMessage     func(conn *control.Conn, request protocol.MessageRequest) error
 	onLoginSuccess    func(conn *control.Conn)
 	onDisconnect      func(conn *control.Conn)
 	onConnectionEvent func(eventType string, record store.ConnectionRecord)
@@ -58,6 +59,11 @@ func (d *Dispatcher) SetDirectHTTPAck(ack func(response protocol.DirectHTTPRespo
 // SetPeerControlHandler installs the Peer Mesh control-plane signal handler.
 func (d *Dispatcher) SetPeerControlHandler(handler func(conn *control.Conn, request protocol.MessageRequest) error) {
 	d.peerControl = handler
+}
+
+// SetClientMessageHandler installs CLIENT_TO_CLIENT/CLIENT_TO_SERVER routing.
+func (d *Dispatcher) SetClientMessageHandler(handler func(conn *control.Conn, request protocol.MessageRequest) error) {
+	d.clientMessage = handler
 }
 
 // SetOnConnectionEvent installs a hook fired when a connection record is created/updated (G4).
@@ -109,6 +115,9 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 				return nil
 			}
 			return d.peerControl(conn, p)
+		}
+		if d.clientMessage != nil {
+			return d.clientMessage(conn, p)
 		}
 		d.logger.Debug("dropped unhandled message request",
 			"channel", conn.ChannelID(), "client", conn.ClientName(), "messageType", p.MessageType)

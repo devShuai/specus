@@ -2,6 +2,7 @@ package client
 
 import (
 	"crypto/ecdh"
+	"crypto/md5"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,7 @@ const (
 	peerNatTypeNat                  = "NAT"
 
 	peerPendingPacketTTL          = 30 * time.Second
+	peerPendingTurnRequestTTL     = 15 * time.Second
 	peerMaxPendingPackets         = 32
 	peerPathPrepareMinInterval    = 2 * time.Second
 	peerPortMappingRetry          = 30 * time.Second
@@ -74,6 +76,7 @@ type peerMeshClient struct {
 	sessionsByID         map[int64]*peerMeshSession
 	pending              map[string]pendingPeerProbe
 	pendingStun          map[string]pendingStunBinding
+	pendingTurn          map[string]pendingTurnRequest
 	packets              map[int64][]pendingPeerPacket
 	prepared             map[int64]time.Time
 	srflx                *peerCandidate
@@ -93,6 +96,8 @@ type peerMeshClient struct {
 	device               peerVirtualDevice
 	runtimeConfigKey     string
 	ignoredPacketLogAt   map[string]time.Time
+	messageHandler       func(ClientMessage)
+	turnAuth             turnAuthCredentials
 }
 
 type peerMeshPeer struct {
@@ -196,6 +201,26 @@ type pendingStunBinding struct {
 	SentAt time.Time
 }
 
+type pendingTurnRequest struct {
+	RequestType           uint16
+	Attributes            []stunAttribute
+	Endpoint              *net.UDPAddr
+	AuthenticationAttempt int
+	SentAt                time.Time
+}
+
+type turnAuthCredentials struct {
+	Username   string
+	Credential string
+	Realm      string
+	Nonce      string
+}
+
+func (credentials turnAuthCredentials) complete() bool {
+	return credentials.Username != "" && credentials.Credential != "" &&
+		credentials.Realm != "" && credentials.Nonce != ""
+}
+
 type pendingPeerPacket struct {
 	Packet []byte
 	SentAt time.Time
@@ -219,7 +244,35 @@ func newPeerMeshClient(config Config, logger *log.Logger) *peerMeshClient {
 	return &peerMeshClient{config: config, logger: logger, portMappingService: newNatPortMappingService(logger)}
 }
 
+func (mesh *peerMeshClient) setMessageHandler(handler func(ClientMessage)) {
+	mesh.mu.Lock()
+	mesh.messageHandler = handler
+	mesh.mu.Unlock()
+}
+
+func turnAuthCredentialsFrom(peerMesh PeerMeshConfig) turnAuthCredentials {
+	return turnAuthCredentials{
+		Username:   strings.TrimSpace(peerMesh.IceUsername),
+		Credential: strings.TrimSpace(peerMesh.IceCredential),
+		Realm:      strings.TrimSpace(peerMesh.IceRealm),
+		Nonce:      strings.TrimSpace(peerMesh.IceNonce),
+	}
+}
+
+func (mesh *peerMeshClient) updateTurnAuthLocked(peerMesh PeerMeshConfig) bool {
+	next := turnAuthCredentialsFrom(peerMesh)
+	if mesh.turnAuth == next {
+		return false
+	}
+	mesh.turnAuth = next
+	clear(mesh.pendingTurn)
+	return true
+}
+
 func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender peerControlSender) {
+	mesh.mu.Lock()
+	mesh.updateTurnAuthLocked(runtime.PeerMesh)
+	mesh.mu.Unlock()
 	if !runtime.PeerMesh.Enabled {
 		mesh.stop()
 		return
@@ -254,6 +307,7 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.sessionsByID = make(map[int64]*peerMeshSession)
 	mesh.pending = make(map[string]pendingPeerProbe)
 	mesh.pendingStun = make(map[string]pendingStunBinding)
+	mesh.pendingTurn = make(map[string]pendingTurnRequest)
 	mesh.packets = make(map[int64][]pendingPeerPacket)
 	mesh.prepared = make(map[int64]time.Time)
 	mesh.srflxCandidates = make(map[string]peerCandidate)
@@ -323,6 +377,7 @@ func (mesh *peerMeshClient) stopLocked() {
 	mesh.sessionsByID = nil
 	mesh.pending = nil
 	mesh.pendingStun = nil
+	mesh.pendingTurn = nil
 	mesh.packets = nil
 	mesh.prepared = nil
 	mesh.srflx = nil
@@ -488,13 +543,18 @@ func (mesh *peerMeshClient) handleStunTurnMessage(message stunMessage, remote *n
 	case stunBindingSuccess:
 		mesh.handleStunBindingSuccess(message, remote)
 	case stunAllocateSuccess:
+		mesh.completeTurnRequest(message, remote)
 		mesh.handleTurnAllocated(message, remote)
 	case stunRefreshSuccess:
+		mesh.completeTurnRequest(message, remote)
 		mesh.mu.Lock()
 		mesh.relayTTL = time.Now().Add(time.Duration(maxInt64(30, message.lifetimeSeconds(300))) * time.Second)
 		mesh.mu.Unlock()
 	case stunCreatePermissionSuccess:
+		mesh.completeTurnRequest(message, remote)
 		return
+	case stunAllocateError, stunRefreshError, stunCreatePermissionError:
+		mesh.handleTurnError(message, remote)
 	case stunDataIndication:
 		peer, okPeer := message.xorPeerAddress()
 		inner, okData := message.data()
@@ -511,6 +571,78 @@ func (mesh *peerMeshClient) handleStunTurnMessage(message stunMessage, remote *n
 			mesh.handleProbe(probe, remote, relayFrom)
 		}
 	}
+}
+
+func (mesh *peerMeshClient) completeTurnRequest(message stunMessage, remote *net.UDPAddr) {
+	tx := stunTransactionHex(message.TransactionID)
+	mesh.mu.Lock()
+	pending, ok := mesh.pendingTurn[tx]
+	if ok && sameUDPEndpoint(pending.Endpoint, remote) {
+		delete(mesh.pendingTurn, tx)
+	}
+	mesh.mu.Unlock()
+}
+
+func (mesh *peerMeshClient) handleTurnError(message stunMessage, remote *net.UDPAddr) {
+	tx := stunTransactionHex(message.TransactionID)
+	errorCode := message.errorCode()
+	mesh.mu.Lock()
+	pending, ok := mesh.pendingTurn[tx]
+	delete(mesh.pendingTurn, tx)
+	if !ok || !sameUDPEndpoint(pending.Endpoint, remote) {
+		mesh.mu.Unlock()
+		mesh.logger.Printf("Peer Mesh TURN error ignored: type=0x%x code=%d tx=%s", message.Type, errorCode, tx)
+		return
+	}
+	if errorCode != 401 && errorCode != 438 || pending.AuthenticationAttempt >= 1 || !mesh.applyTurnChallengeLocked(message) {
+		mesh.mu.Unlock()
+		mesh.logger.Printf("Peer Mesh TURN request failed: type=0x%x code=%d authAttempt=%d",
+			pending.RequestType, errorCode, pending.AuthenticationAttempt)
+		return
+	}
+	mesh.mu.Unlock()
+
+	retry := newStunMessage(pending.RequestType, newStunTransactionID(), cloneStunAttributes(pending.Attributes)...)
+	mesh.logger.Printf("Peer Mesh TURN auth challenge received, retrying once: type=0x%x code=%d",
+		pending.RequestType, errorCode)
+	mesh.sendStunRequestAttempt(retry, pending.Endpoint, pending.AuthenticationAttempt+1)
+}
+
+func (mesh *peerMeshClient) applyTurnChallengeLocked(message stunMessage) bool {
+	if code := message.errorCode(); code != 401 && code != 438 {
+		return false
+	}
+	credentials := mesh.turnAuth
+	if credentials.Username == "" || credentials.Credential == "" {
+		return false
+	}
+	realm := strings.TrimSpace(message.text(stunAttrRealm))
+	if realm == "" {
+		realm = credentials.Realm
+	}
+	nonce := strings.TrimSpace(message.text(stunAttrNonce))
+	if nonce == "" {
+		nonce = credentials.Nonce
+	}
+	next := turnAuthCredentials{
+		Username: credentials.Username, Credential: credentials.Credential,
+		Realm: realm, Nonce: nonce,
+	}
+	if !next.complete() {
+		return false
+	}
+	mesh.turnAuth = next
+	return true
+}
+
+func sameUDPEndpoint(expected, actual *net.UDPAddr) bool {
+	if expected == nil || actual == nil || expected.Port != actual.Port {
+		return false
+	}
+	if expected.IP != nil && actual.IP != nil {
+		return expected.IP.Equal(actual.IP)
+	}
+	return strings.EqualFold(expected.String(), actual.String())
 }
 
 func (mesh *peerMeshClient) handleStunBindingSuccess(message stunMessage, observedRemote *net.UDPAddr) {
@@ -696,6 +828,9 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 	}
 	mesh.mu.Unlock()
 	mesh.flushPendingPackets(current)
+	if mesh.handlePeerAppMessage(frame, current, runtime) {
+		return
+	}
 	if _, noop := device.(*noopPeerVirtualDevice); !noop {
 		if err := device.WritePacket(frame.Payload); err != nil {
 			mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, frame.FromClientID, err)
@@ -710,6 +845,57 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 	if err := device.WritePacket(frame.Payload); err != nil {
 		mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, frame.FromClientID, err)
 	}
+}
+
+func (mesh *peerMeshClient) handlePeerAppMessage(frame *peerDataFrame, session *peerMeshSession, runtime RuntimeConfig) bool {
+	if !looksLikePeerAppMessage(frame.Payload) {
+		return false
+	}
+	message, ok := decodePeerAppMessage(frame.Payload)
+	if !ok {
+		mesh.logger.Printf("Peer Mesh app message decode failed: session=%d from=%d", frame.SessionID, frame.FromClientID)
+		return true
+	}
+	if strings.EqualFold(message.Type, peerAppMessageTypeAck) {
+		return true
+	}
+	if !strings.EqualFold(message.Type, peerAppMessageTypeMessage) {
+		return true
+	}
+	if message.ToClientID != 0 && message.ToClientID != runtime.PeerMesh.ClientID {
+		return true
+	}
+	fromName := strings.TrimSpace(message.FromClientName)
+	if fromName == "" {
+		fromName = fmt.Sprint(frame.FromClientID)
+	}
+	mesh.logger.Printf("Peer message from %s: %s", fromName, message.Message)
+	mesh.mu.Lock()
+	handler := mesh.messageHandler
+	mesh.mu.Unlock()
+	if handler != nil {
+		handler(ClientMessage{
+			FromClientName: fromName,
+			ToClientName:   message.ToClientName,
+			Message:        message.Message,
+		})
+	}
+	if strings.TrimSpace(message.ID) == "" {
+		return true
+	}
+	ack, err := encodePeerAppMessage(peerAppMessage{
+		Type:            peerAppMessageTypeAck,
+		ID:              message.ID,
+		FromClientID:    runtime.PeerMesh.ClientID,
+		FromClientName:  runtime.PeerMesh.ClientName,
+		ToClientID:      frame.FromClientID,
+		ToClientName:    firstNonEmpty(strings.TrimSpace(message.FromClientName), session.PeerName),
+		CreatedAtMillis: time.Now().UnixMilli(),
+	})
+	if err == nil {
+		_ = mesh.sendEncryptedPayload(session, ack)
+	}
+	return true
 }
 
 func (mesh *peerMeshClient) markPathFromInboundCheck(session *peerMeshSession, remote *net.UDPAddr, relayFrom string) {
@@ -1967,13 +2153,112 @@ func (mesh *peerMeshClient) sendStunBinding(endpoint *net.UDPAddr, role string) 
 }
 
 func (mesh *peerMeshClient) sendStunRequest(message stunMessage, endpoint *net.UDPAddr) {
+	mesh.sendStunRequestAttempt(message, endpoint, 0)
+}
+
+func (mesh *peerMeshClient) sendStunRequestAttempt(message stunMessage, endpoint *net.UDPAddr, authenticationAttempt int) {
 	mesh.mu.Lock()
 	udp := mesh.udp
+	credentials := mesh.turnAuth
+	baseAttributes := withoutTurnAuthenticationAttributes(message.Attributes)
+	message.Attributes = baseAttributes
+	authenticated := turnRequestRequiresAuthentication(message.Type) && credentials.complete()
+	tx := stunTransactionHex(message.TransactionID)
+	if authenticated {
+		if mesh.pendingTurn == nil {
+			mesh.pendingTurn = make(map[string]pendingTurnRequest)
+		}
+		mesh.pendingTurn[tx] = pendingTurnRequest{
+			RequestType: message.Type, Attributes: cloneStunAttributes(baseAttributes),
+			Endpoint: cloneUDPAddr(endpoint), AuthenticationAttempt: authenticationAttempt, SentAt: time.Now(),
+		}
+	}
 	mesh.mu.Unlock()
 	if udp == nil || endpoint == nil {
+		if authenticated {
+			mesh.mu.Lock()
+			delete(mesh.pendingTurn, tx)
+			mesh.mu.Unlock()
+		}
 		return
 	}
-	_, _ = udp.WriteToUDP(message.bytes(), endpoint)
+	body := message.bytes()
+	if authenticated {
+		message = authenticatedTurnMessageWithCredentials(message, credentials)
+		body = message.bytesWithIntegrity(turnCredentialsIntegrityKey(credentials))
+	}
+	if _, err := udp.WriteToUDP(body, endpoint); err != nil && authenticated {
+		mesh.mu.Lock()
+		delete(mesh.pendingTurn, tx)
+		mesh.mu.Unlock()
+	}
+}
+
+func (mesh *peerMeshClient) authenticatedTurnMessage(message stunMessage) stunMessage {
+	mesh.mu.Lock()
+	credentials := mesh.turnAuth
+	if credentials == (turnAuthCredentials{}) {
+		credentials = turnAuthCredentialsFrom(mesh.runtime.PeerMesh)
+	}
+	mesh.mu.Unlock()
+	return authenticatedTurnMessageWithCredentials(message, credentials)
+}
+
+func authenticatedTurnMessageWithCredentials(message stunMessage, credentials turnAuthCredentials) stunMessage {
+	message.Attributes = withoutTurnAuthenticationAttributes(message.Attributes)
+	if !credentials.complete() {
+		return message
+	}
+	message.Attributes = append(message.Attributes,
+		stunAttrUsernameValue(credentials.Username),
+		stunAttrRealmValue(credentials.Realm),
+		stunAttrNonceValue(credentials.Nonce))
+	return message
+}
+
+func turnMessageIntegrityKey(peerMesh PeerMeshConfig) []byte {
+	return turnCredentialsIntegrityKey(turnAuthCredentialsFrom(peerMesh))
+}
+
+func turnCredentialsIntegrityKey(credentials turnAuthCredentials) []byte {
+	if credentials.Username == "" || credentials.Credential == "" || credentials.Realm == "" {
+		return nil
+	}
+	digest := md5.Sum([]byte(credentials.Username + ":" + credentials.Realm + ":" + credentials.Credential))
+	return digest[:]
+}
+
+func turnRequestRequiresAuthentication(messageType uint16) bool {
+	return messageType == stunAllocateRequest || messageType == stunRefreshRequest ||
+		messageType == stunCreatePermissionRequest
+}
+
+func withoutTurnAuthenticationAttributes(attributes []stunAttribute) []stunAttribute {
+	result := make([]stunAttribute, 0, len(attributes))
+	for _, attribute := range attributes {
+		switch attribute.Type {
+		case stunAttrUsername, stunAttrRealm, stunAttrNonce, stunAttrMessageIntegrity:
+			continue
+		default:
+			result = append(result, stunAttribute{Type: attribute.Type, Value: append([]byte(nil), attribute.Value...)})
+		}
+	}
+	return result
+}
+
+func cloneStunAttributes(attributes []stunAttribute) []stunAttribute {
+	result := make([]stunAttribute, len(attributes))
+	for index, attribute := range attributes {
+		result[index] = stunAttribute{Type: attribute.Type, Value: append([]byte(nil), attribute.Value...)}
+	}
+	return result
+}
+
+func cloneUDPAddr(value *net.UDPAddr) *net.UDPAddr {
+	if value == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), value.IP...), Port: value.Port, Zone: value.Zone}
 }
 
 func (mesh *peerMeshClient) sendRelayPayload(targetRelayEndpoint string, payload []byte) error {
@@ -2024,7 +2309,8 @@ func (mesh *peerMeshClient) ensureTurnPermission(peer *net.UDPAddr) {
 	mesh.turnPermissions[key] = now.Add(4 * time.Minute)
 	mesh.mu.Unlock()
 	tx := newStunTransactionID()
-	mesh.sendStunRequest(newStunMessage(stunCreatePermissionRequest, tx, newStunAttrXorPeerAddress(peer, tx)), endpoint)
+	mesh.sendStunRequest(newStunMessage(stunCreatePermissionRequest, tx,
+		newStunAttrXorPeerAddress(peer, tx)), endpoint)
 }
 
 func (mesh *peerMeshClient) relayEndpoint() *net.UDPAddr {
@@ -2179,6 +2465,11 @@ func (mesh *peerMeshClient) cleanupProbes() {
 	for tx, pending := range mesh.pendingStun {
 		if now.Sub(pending.SentAt) > 30*time.Second {
 			delete(mesh.pendingStun, tx)
+		}
+	}
+	for tx, pending := range mesh.pendingTurn {
+		if now.Sub(pending.SentAt) > peerPendingTurnRequestTTL {
+			delete(mesh.pendingTurn, tx)
 		}
 	}
 	for peerID, session := range mesh.sessions {

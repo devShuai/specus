@@ -40,6 +40,11 @@ type stunTurnServer struct {
 	relayTasks           chan func()
 }
 
+type turnAuth struct {
+	allowed bool
+	key     []byte
+}
+
 func (s *Service) RunStunTurn(ctx context.Context) {
 	if s == nil || !s.cfg.Enabled {
 		return
@@ -154,6 +159,10 @@ func (s *stunTurnServer) binding(conn *net.UDPConn, probeRole string, request st
 }
 
 func (s *stunTurnServer) allocateRequest(ctx context.Context, request stunMessage, remote *net.UDPAddr) error {
+	auth := s.authenticate(request, remote, stunAllocateError)
+	if !auth.allowed {
+		return nil
+	}
 	if !request.requestedUDPTransport() {
 		return s.sendError(s.primary, remote, request, stunAllocateError, 442, "unsupported-transport")
 	}
@@ -166,7 +175,7 @@ func (s *stunTurnServer) allocateRequest(ctx context.Context, request stunMessag
 		newStunAttrXorMappedAddress(remote, request.TransactionID),
 		stunAttrLifetimeValue(s.service.cfg.AllocationTTLSeconds),
 		stunAttrSoftwareValue(stunTurnSoftware))
-	return s.sendStun(s.primary, remote, response)
+	return s.sendStunWithIntegrity(s.primary, remote, response, auth.key)
 }
 
 func (s *stunTurnServer) allocate(ctx context.Context, remote *net.UDPAddr) (*relayAllocation, error) {
@@ -232,6 +241,10 @@ func (s *stunTurnServer) bindRelaySocket() (*net.UDPConn, error) {
 }
 
 func (s *stunTurnServer) refresh(request stunMessage, remote *net.UDPAddr) error {
+	auth := s.authenticate(request, remote, stunRefreshError)
+	if !auth.allowed {
+		return nil
+	}
 	allocation := s.allocationForRemote(remote)
 	if allocation == nil {
 		return s.sendError(s.primary, remote, request, stunRefreshError, 437, "allocation-mismatch")
@@ -249,10 +262,14 @@ func (s *stunTurnServer) refresh(request stunMessage, remote *net.UDPAddr) error
 	response := newStunMessage(stunRefreshSuccess, request.TransactionID,
 		stunAttrLifetimeValue(grantedLifetime),
 		stunAttrSoftwareValue(stunTurnSoftware))
-	return s.sendStun(s.primary, remote, response)
+	return s.sendStunWithIntegrity(s.primary, remote, response, auth.key)
 }
 
 func (s *stunTurnServer) createPermission(request stunMessage, remote *net.UDPAddr) error {
+	auth := s.authenticate(request, remote, stunCreatePermissionError)
+	if !auth.allowed {
+		return nil
+	}
 	allocation := s.allocationForRemote(remote)
 	if allocation == nil {
 		return s.sendError(s.primary, remote, request, stunCreatePermissionError, 437, "allocation-mismatch")
@@ -267,7 +284,45 @@ func (s *stunTurnServer) createPermission(request stunMessage, remote *net.UDPAd
 	}
 	s.mu.Unlock()
 	response := newStunMessage(stunCreatePermissionSuccess, request.TransactionID, stunAttrSoftwareValue(stunTurnSoftware))
-	return s.sendStun(s.primary, remote, response)
+	return s.sendStunWithIntegrity(s.primary, remote, response, auth.key)
+}
+
+func (s *stunTurnServer) authenticate(request stunMessage, remote *net.UDPAddr, responseType uint16) turnAuth {
+	credentials := s.service.turnCredentials
+	if credentials == nil || !credentials.authRequired() {
+		return turnAuth{allowed: true}
+	}
+	username := strings.TrimSpace(request.text(stunAttrUsername))
+	realm := strings.TrimSpace(request.text(stunAttrRealm))
+	nonce := strings.TrimSpace(request.text(stunAttrNonce))
+	if username == "" || nonce == "" || realm != credentials.realm() {
+		_ = s.sendTurnAuthError(remote, request, responseType, 401, "unauthorized")
+		return turnAuth{}
+	}
+	if nonce != credentials.nonce {
+		_ = s.sendTurnAuthError(remote, request, responseType, 438, "stale-nonce")
+		return turnAuth{}
+	}
+	credential := credentials.credentialForUsername(username)
+	if !credentials.usernameCredentialValid(username, credential) {
+		_ = s.sendTurnAuthError(remote, request, responseType, 401, "unauthorized")
+		return turnAuth{}
+	}
+	key := credentials.longTermKey(username, credential)
+	if !request.verifyMessageIntegrity(key) {
+		_ = s.sendTurnAuthError(remote, request, responseType, 401, "bad-message-integrity")
+		return turnAuth{}
+	}
+	return turnAuth{allowed: true, key: key}
+}
+
+func (s *stunTurnServer) sendTurnAuthError(remote *net.UDPAddr, request stunMessage, typ uint16, code int, reason string) error {
+	credentials := s.service.turnCredentials
+	return s.sendStun(s.primary, remote, newStunMessage(typ, request.TransactionID,
+		stunAttrErrorCodeValue(code, reason),
+		stunAttrSoftwareValue(stunTurnSoftware),
+		stunAttrRealmValue(credentials.realm()),
+		stunAttrNonceValue(credentials.nonce)))
 }
 
 func (s *stunTurnServer) sendIndication(ctx context.Context, indication stunMessage, remote *net.UDPAddr) error {
@@ -368,6 +423,14 @@ func (s *stunTurnServer) sendStun(conn *net.UDPConn, remote *net.UDPAddr, messag
 		return nil
 	}
 	_, err := conn.WriteToUDP(message.bytes(), remote)
+	return err
+}
+
+func (s *stunTurnServer) sendStunWithIntegrity(conn *net.UDPConn, remote *net.UDPAddr, message stunMessage, key []byte) error {
+	if conn == nil || remote == nil {
+		return nil
+	}
+	_, err := conn.WriteToUDP(message.bytesWithIntegrity(key), remote)
 	return err
 }
 

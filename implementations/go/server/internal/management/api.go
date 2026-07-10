@@ -20,6 +20,7 @@ import (
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
 )
 
@@ -38,6 +39,7 @@ type API struct {
 	trafficUsage *nat.TrafficService
 	seedDemo     func(ctx context.Context) error
 	peerMesh     *peermesh.Service
+	attachments  *transfer.Service
 }
 
 // NewAPI builds the admin API.
@@ -45,11 +47,11 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 	oidcAuth *security.OidcValidator, natControl *nat.ControlService, remotePorts *nat.RemotePortManager,
 	oidc config.OidcConfig, authConfig config.AuthConfig, clientAuth config.ClientAuthConfig,
 	traffic config.TrafficConfig, trafficUsage *nat.TrafficService,
-	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service) *API {
+	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service, attachments *transfer.Service) *API {
 	return &API{db: db, sessions: sessions, tokens: tokens, oidcAuth: oidcAuth, natControl: natControl,
 		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
-		peerMesh: peerMesh}
+		peerMesh: peerMesh, attachments: attachments}
 }
 
 // Register attaches all auth and admin routes to mux.
@@ -60,6 +62,13 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /oidc/token", a.handleOidcToken)
 	mux.HandleFunc("GET /api/public/client-downloads", a.handlePublicClientDownloads)
 	mux.HandleFunc("GET /api/public/peer-mesh/stun-config", a.handlePublicPeerMeshStunConfig)
+	mux.HandleFunc("GET /api/public/transfer/ice-config", a.handlePublicTransferIceConfig)
+	mux.HandleFunc("POST /api/public/transfer/attachments/presign-upload", a.handlePublicAttachmentPresignUpload)
+	mux.HandleFunc("POST /api/public/transfer/attachments/{attachmentId}/complete", a.handlePublicAttachmentComplete)
+	mux.HandleFunc("POST /api/public/transfer/attachments/{attachmentId}/presign-download", a.handlePublicAttachmentPresignDownload)
+	mux.HandleFunc("POST /api/admin/client-messages/attachments/presign-upload", a.requireAuth(a.handleAdminAttachmentPresignUpload))
+	mux.HandleFunc("POST /api/admin/client-messages/attachments/{attachmentId}/complete", a.requireAuth(a.handleAdminAttachmentComplete))
+	mux.HandleFunc("POST /api/admin/client-messages/attachments/{attachmentId}/presign-download", a.requireAuth(a.handleAdminAttachmentPresignDownload))
 
 	mux.HandleFunc("GET /api/admin/overview", a.requireAuth(a.handleOverview))
 	mux.HandleFunc("POST /api/admin/database/initialize", a.requireAuth(a.handleDatabaseInitialize))
@@ -124,6 +133,14 @@ func (a *API) handlePublicPeerMeshStunConfig(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, a.peerMesh.PublicStunConfig(forwardedHost(r)))
+}
+
+func (a *API) handlePublicTransferIceConfig(w http.ResponseWriter, r *http.Request) {
+	if a.peerMesh == nil {
+		writeJSON(w, http.StatusOK, peermesh.PublicIceConfig{})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.peerMesh.PublicIceConfig(forwardedHost(r)))
 }
 
 // ValidateToken reports whether a raw token is a valid admin token (used by the WS hub).
@@ -1066,6 +1083,7 @@ func (a *API) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	mapping := store.TunnelMapping{
 		ID:                   auth.NewClientID(),
+		TenantID:             account.TenantID,
 		ClientID:             account.ID,
 		ClientName:           account.ClientName,
 		ListenPort:           req.ListenPort,
@@ -1263,6 +1281,7 @@ func (a *API) handleCreateHTTPRoute(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	mapping := store.HTTPRouteMapping{
 		ID:                   auth.NewClientID(),
+		TenantID:             account.TenantID,
 		ClientID:             account.ID,
 		ClientName:           account.ClientName,
 		Route:                route,
@@ -1932,6 +1951,13 @@ func (a *API) clientView(ctx context.Context, account store.ClientAccount) Clien
 		view.Online = true
 		login := bound.LoginTimeMs()
 		view.ConnectedSinceMs = &login
+		if active, err := a.db.GetOnlineClientSession(ctx, account.TenantID, account.ID, auth.StatusNettyOnline); err == nil && active != nil {
+			view.MessageSendCapable = active.MessageSendCapable
+			view.MessageReceiveCapable = active.MessageReceiveCapable
+			view.MessageAttachmentsCapable = active.MessageAttachmentsCapable
+			view.MessageMediaPreviewCapable = active.MessageMediaPreviewCapable
+			view.MessageMaxAttachmentBytes = active.MessageMaxAttachmentBytes
+		}
 	}
 	if up, down, err := a.db.SumTraffic(ctx, account.ClientName); err == nil {
 		view.UploadBytes = up
@@ -1996,17 +2022,17 @@ type managementPrincipal struct {
 }
 
 func (p managementPrincipal) canAccessClient(account store.ClientAccount) bool {
-	if !sameTenant(p.TenantID, account.TenantID) {
+	if normalizeTenant(p.TenantID) != normalizeTenant(account.TenantID) {
 		return false
 	}
-	return p.Admin || strings.EqualFold(account.OwnerUsername, p.Username)
+	return p.Admin || account.OwnerUsername == p.Username
 }
 
 func (p managementPrincipal) canAccessCredential(credential store.ClientCredential) bool {
-	if !sameTenant(p.TenantID, credential.TenantID) {
+	if normalizeTenant(p.TenantID) != normalizeTenant(credential.TenantID) {
 		return false
 	}
-	return p.Admin || strings.EqualFold(credential.OwnerUsername, p.Username)
+	return p.Admin || credential.OwnerUsername == p.Username
 }
 
 func (a *API) requireAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -2208,7 +2234,7 @@ func normalizeRole(value string) string {
 }
 
 func sameTenant(left, right string) bool {
-	return strings.EqualFold(normalizeTenant(left), normalizeTenant(right))
+	return normalizeTenant(left) == normalizeTenant(right)
 }
 
 func clientIDs(clients []store.ClientAccount) []int64 {

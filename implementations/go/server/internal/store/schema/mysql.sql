@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS tunnel_client_session (
   client_version VARCHAR(80),
   java_version VARCHAR(80),
   local_addresses VARCHAR(2000),
+  message_send_capable TINYINT(1) NOT NULL DEFAULT 0,
+  message_receive_capable TINYINT(1) NOT NULL DEFAULT 0,
+  message_attachments_capable TINYINT(1) NOT NULL DEFAULT 0,
+  message_media_preview_capable TINYINT(1) NOT NULL DEFAULT 0,
+  message_max_attachment_bytes BIGINT NOT NULL DEFAULT 0,
   http_login_at VARCHAR(40) NOT NULL,
   netty_connected_at VARCHAR(40),
   disconnected_at VARCHAR(40),
@@ -103,6 +108,31 @@ CREATE TABLE IF NOT EXISTS client_download_link (
   KEY idx_client_download_order (display_order)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS transfer_attachment (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80),
+  scope VARCHAR(40) NOT NULL,
+  room_id VARCHAR(120),
+  room_token_hash VARCHAR(64),
+  owner_username VARCHAR(80),
+  target_client_id BIGINT,
+  object_key VARCHAR(512) NOT NULL,
+  file_name VARCHAR(255) NOT NULL,
+  mime_type VARCHAR(120) NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  sha256 VARCHAR(64),
+  status VARCHAR(24) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  upload_expires_at VARCHAR(40) NOT NULL,
+  expires_at VARCHAR(40) NOT NULL,
+  uploaded_at VARCHAR(40),
+  UNIQUE KEY uk_transfer_attachment_object_key (object_key),
+  KEY idx_transfer_attachment_tenant (tenant_id, scope, id),
+  KEY idx_transfer_attachment_room (scope, room_id, id),
+  KEY idx_transfer_attachment_expires (expires_at, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80),
@@ -122,6 +152,7 @@ CREATE TABLE IF NOT EXISTS tunnel_connection_record (
 
 CREATE TABLE IF NOT EXISTS tunnel_mapping (
   id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
   client_id BIGINT NOT NULL,
   client_name VARCHAR(120) NOT NULL,
   listen_port INT NOT NULL,
@@ -137,6 +168,7 @@ CREATE TABLE IF NOT EXISTS tunnel_mapping (
 
 CREATE TABLE IF NOT EXISTS http_route_mapping (
   id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
   client_id BIGINT NOT NULL,
   client_name VARCHAR(120) NOT NULL,
   route VARCHAR(60) NOT NULL,
@@ -288,6 +320,7 @@ CREATE TABLE IF NOT EXISTS peer_mesh_acl (
   target_client_id BIGINT NOT NULL,
   target_client_name VARCHAR(120) NOT NULL,
   allowed TINYINT(1) NOT NULL DEFAULT 1,
+  direction VARCHAR(16) NOT NULL DEFAULT 'OUTBOUND',
   created_at VARCHAR(40) NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
   UNIQUE KEY uk_peer_mesh_acl_pair (tenant_id, source_client_id, target_client_id),

@@ -43,11 +43,16 @@ const (
 	NatUnregister       = 7
 	NatHTTPRoutesReport = 8
 
-	MessageTypeNatControl  = 3
-	MessageTypePeerControl = 4
+	MessageTypeServerToClient = 0
+	MessageTypeClientToServer = 1
+	MessageTypeClientToClient = 2
+	MessageTypeNatControl     = 3
+	MessageTypePeerControl    = 4
 
-	maxFrameSize    = 32 * 1024 * 1024
-	maxInflatedSize = 16 * 1024 * 1024
+	frameHeaderSize  = 11
+	maxFrameSize     = 32 * 1024 * 1024
+	maxFrameBodySize = maxFrameSize - frameHeaderSize
+	maxInflatedSize  = 16 * 1024 * 1024
 )
 
 type Packet struct {
@@ -120,7 +125,7 @@ type NatMessage struct {
 }
 
 func ReadPacket(reader io.Reader) (Packet, error) {
-	header := make([]byte, 11)
+	header := make([]byte, frameHeaderSize)
 	if _, err := io.ReadFull(reader, header); err != nil {
 		return Packet{}, err
 	}
@@ -128,7 +133,7 @@ func ReadPacket(reader io.Reader) (Packet, error) {
 		return Packet{}, errors.New("invalid packet magic number")
 	}
 	length := int(binary.BigEndian.Uint32(header[7:11]))
-	if length < 0 || length > maxFrameSize {
+	if length < 0 || length > maxFrameBodySize {
 		return Packet{}, fmt.Errorf("invalid packet body length: %d", length)
 	}
 	body := make([]byte, length)
@@ -139,10 +144,10 @@ func ReadPacket(reader io.Reader) (Packet, error) {
 }
 
 func WritePacket(writer io.Writer, command int8, body []byte) error {
-	if len(body) > maxFrameSize {
+	if len(body) > maxFrameBodySize {
 		return fmt.Errorf("packet body exceeds limit: %d", len(body))
 	}
-	header := make([]byte, 11)
+	header := make([]byte, frameHeaderSize)
 	binary.BigEndian.PutUint32(header[:4], MagicNumber)
 	header[4] = Version
 	header[5] = SerializerCompact

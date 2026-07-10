@@ -276,7 +276,7 @@ func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, erro
 
 // ListTunnels returns tunnel mappings, optionally filtered by client id, ordered by id.
 func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping, error) {
-	query := `SELECT id, client_id, client_name, listen_port, target_address, target_port,
+	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, listen_port, target_address, target_port,
 		enabled, detail_capture_enabled, created_at, updated_at FROM tunnel_mapping`
 	var args []any
 	if clientID != nil {
@@ -297,7 +297,7 @@ func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping
 			detailCapture      int
 			createdAt, updated string
 		)
-		if err := rows.Scan(&m.ID, &m.ClientID, &m.ClientName, &m.ListenPort, &m.TargetAddress,
+		if err := rows.Scan(&m.ID, &m.TenantID, &m.ClientID, &m.ClientName, &m.ListenPort, &m.TargetAddress,
 			&m.TargetPort, &enabled, &detailCapture, &createdAt, &updated); err != nil {
 			return nil, err
 		}
@@ -335,10 +335,10 @@ func (db *DB) ListenPortInUse(ctx context.Context, listenPort int, excludeID int
 // InsertTunnel persists a new tunnel mapping (id is caller-assigned).
 func (db *DB) InsertTunnel(ctx context.Context, m TunnelMapping) error {
 	query := db.rebind(`INSERT INTO tunnel_mapping
-		(id, client_id, client_name, listen_port, target_address, target_port, enabled,
+		(id, tenant_id, client_id, client_name, listen_port, target_address, target_port, enabled,
 		 detail_capture_enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, m.ID, m.ClientID, m.ClientName, m.ListenPort,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := db.sql.ExecContext(ctx, query, m.ID, defaultTenant(m.TenantID), m.ClientID, m.ClientName, m.ListenPort,
 		m.TargetAddress, m.TargetPort, boolToInt(m.Enabled), boolToInt(m.DetailCaptureEnabled),
 		formatTime(m.CreatedAt), formatTime(m.UpdatedAt))
 	return err
@@ -363,7 +363,7 @@ func (db *DB) DeleteTunnel(ctx context.Context, id int64) error {
 
 // ListHTTPRoutes returns HTTP route mappings, optionally filtered by client id, ordered by id.
 func (db *DB) ListHTTPRoutes(ctx context.Context, clientID *int64) ([]HTTPRouteMapping, error) {
-	query := `SELECT id, client_id, client_name, route, target_base_url, enabled,
+	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, route, target_base_url, enabled,
 		detail_capture_enabled, path_rewrite_enabled, created_at, updated_at
 		FROM http_route_mapping`
 	var args []any
@@ -386,7 +386,7 @@ func (db *DB) ListHTTPRoutes(ctx context.Context, clientID *int64) ([]HTTPRouteM
 			pathRewrite        int
 			createdAt, updated string
 		)
-		if err := rows.Scan(&r.ID, &r.ClientID, &r.ClientName, &r.Route, &r.TargetBaseURL,
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.ClientID, &r.ClientName, &r.Route, &r.TargetBaseURL,
 			&enabled, &detailCapture, &pathRewrite, &createdAt, &updated); err != nil {
 			return nil, err
 		}
@@ -425,10 +425,10 @@ func (db *DB) RouteInUse(ctx context.Context, clientID int64, route string, excl
 // InsertHTTPRoute persists a new HTTP route mapping (id is caller-assigned).
 func (db *DB) InsertHTTPRoute(ctx context.Context, r HTTPRouteMapping) error {
 	query := db.rebind(`INSERT INTO http_route_mapping
-		(id, client_id, client_name, route, target_base_url, enabled, detail_capture_enabled,
+		(id, tenant_id, client_id, client_name, route, target_base_url, enabled, detail_capture_enabled,
 		 path_rewrite_enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, r.ID, r.ClientID, r.ClientName, r.Route,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := db.sql.ExecContext(ctx, query, r.ID, defaultTenant(r.TenantID), r.ClientID, r.ClientName, r.Route,
 		r.TargetBaseURL, boolToInt(r.Enabled), boolToInt(r.DetailCaptureEnabled),
 		boolToInt(r.PathRewriteEnabled), formatTime(r.CreatedAt), formatTime(r.UpdatedAt))
 	return err

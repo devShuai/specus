@@ -114,6 +114,28 @@ type ClientDownloadLink struct {
 	UpdatedAt      time.Time
 }
 
+// TransferAttachment mirrors transfer_attachment used by public transfers and admin messages.
+type TransferAttachment struct {
+	ID              int64
+	TenantID        *string
+	Scope           string
+	RoomID          *string
+	RoomTokenHash   *string
+	OwnerUsername   *string
+	TargetClientID  *int64
+	ObjectKey       string
+	FileName        string
+	MimeType        string
+	SizeBytes       int64
+	SHA256          *string
+	Status          string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	UploadExpiresAt time.Time
+	ExpiresAt       time.Time
+	UploadedAt      *time.Time
+}
+
 // ClientIdentity mirrors tunnel_client_identity.
 type ClientIdentity struct {
 	ID                 int64
@@ -130,29 +152,34 @@ type ClientIdentity struct {
 
 // ClientSession mirrors tunnel_client_session.
 type ClientSession struct {
-	ID                 int64
-	TenantID           string
-	CredentialID       int64
-	IdentityID         int64
-	ClientID           int64
-	ClientName         string
-	TokenHash          string
-	Status             string
-	MachineFingerprint string
-	OSUser             string
-	Hostname           *string
-	OSName             *string
-	OSVersion          *string
-	OSArch             *string
-	ClientVersion      *string
-	JavaVersion        *string
-	LocalAddresses     *string
-	HTTPLoginAt        time.Time
-	NettyConnectedAt   *time.Time
-	DisconnectedAt     *time.Time
-	ExpiresAt          time.Time
-	ChannelID          *string
-	RemoteAddress      *string
+	ID                         int64
+	TenantID                   string
+	CredentialID               int64
+	IdentityID                 int64
+	ClientID                   int64
+	ClientName                 string
+	TokenHash                  string
+	Status                     string
+	MachineFingerprint         string
+	OSUser                     string
+	Hostname                   *string
+	OSName                     *string
+	OSVersion                  *string
+	OSArch                     *string
+	ClientVersion              *string
+	JavaVersion                *string
+	LocalAddresses             *string
+	MessageSendCapable         bool
+	MessageReceiveCapable      bool
+	MessageAttachmentsCapable  bool
+	MessageMediaPreviewCapable bool
+	MessageMaxAttachmentBytes  int64
+	HTTPLoginAt                time.Time
+	NettyConnectedAt           *time.Time
+	DisconnectedAt             *time.Time
+	ExpiresAt                  time.Time
+	ChannelID                  *string
+	RemoteAddress              *string
 }
 
 // PeerMeshDevice mirrors peer_mesh_device.
@@ -188,6 +215,7 @@ type PeerMeshACL struct {
 	TargetClientID   int64
 	TargetClientName string
 	Allowed          bool
+	Direction        string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
@@ -233,6 +261,7 @@ type ConnectionRecord struct {
 // TunnelMapping mirrors tunnel_mapping.
 type TunnelMapping struct {
 	ID                   int64
+	TenantID             string
 	ClientID             int64
 	ClientName           string
 	ListenPort           int
@@ -247,6 +276,7 @@ type TunnelMapping struct {
 // HTTPRouteMapping mirrors http_route_mapping.
 type HTTPRouteMapping struct {
 	ID                   int64
+	TenantID             string
 	ClientID             int64
 	ClientName           string
 	Route                string

@@ -32,6 +32,11 @@ type ClientView struct {
 	ConnectionRateLimitPerMinute int    `json:"connectionRateLimitPerMinute"`
 	Online                       bool   `json:"online"`
 	ConnectedSinceMs             *int64 `json:"connectedSinceMs"`
+	MessageSendCapable           bool   `json:"messageSendCapable"`
+	MessageReceiveCapable        bool   `json:"messageReceiveCapable"`
+	MessageAttachmentsCapable    bool   `json:"messageAttachmentsCapable"`
+	MessageMediaPreviewCapable   bool   `json:"messageMediaPreviewCapable"`
+	MessageMaxAttachmentBytes    int64  `json:"messageMaxAttachmentBytes"`
 	UploadBytes                  int64  `json:"uploadBytes"`
 	DownloadBytes                int64  `json:"downloadBytes"`
 	CreatedAt                    string `json:"createdAt"`

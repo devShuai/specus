@@ -124,7 +124,7 @@ func (db *DB) UpdatePeerMeshDevice(ctx context.Context, device PeerMeshDevice) e
 
 func (db *DB) FindPeerMeshACL(ctx context.Context, tenantID string, sourceClientID, targetClientID int64) (*PeerMeshACL, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, source_client_id, source_client_name,
-		target_client_id, target_client_name, allowed, created_at, updated_at FROM peer_mesh_acl
+		target_client_id, target_client_name, allowed, direction, created_at, updated_at FROM peer_mesh_acl
 		WHERE tenant_id = ? AND source_client_id = ? AND target_client_id = ?`)
 	row := db.sql.QueryRowContext(ctx, query, defaultTenant(tenantID), sourceClientID, targetClientID)
 	acl, err := scanPeerMeshACL(row)
@@ -139,14 +139,14 @@ func (db *DB) FindPeerMeshACL(ctx context.Context, tenantID string, sourceClient
 
 func (db *DB) ListPeerMeshACLsByTenant(ctx context.Context, tenantID string) ([]PeerMeshACL, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, source_client_id, source_client_name,
-		target_client_id, target_client_name, allowed, created_at, updated_at FROM peer_mesh_acl
+		target_client_id, target_client_name, allowed, direction, created_at, updated_at FROM peer_mesh_acl
 		WHERE tenant_id = ? ORDER BY id DESC`)
 	return db.listPeerMeshACLs(ctx, query, defaultTenant(tenantID))
 }
 
 func (db *DB) ListPeerMeshACLsByOwner(ctx context.Context, tenantID, ownerUsername string) ([]PeerMeshACL, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, source_client_id, source_client_name,
-		target_client_id, target_client_name, allowed, created_at, updated_at FROM peer_mesh_acl
+		target_client_id, target_client_name, allowed, direction, created_at, updated_at FROM peer_mesh_acl
 		WHERE tenant_id = ? AND owner_username = ? ORDER BY id DESC`)
 	return db.listPeerMeshACLs(ctx, query, defaultTenant(tenantID), defaultOwner(ownerUsername))
 }
@@ -171,19 +171,19 @@ func (db *DB) listPeerMeshACLs(ctx context.Context, query string, args ...any) (
 func (db *DB) InsertPeerMeshACL(ctx context.Context, acl PeerMeshACL) error {
 	query := db.rebind(`INSERT INTO peer_mesh_acl
 		(id, tenant_id, owner_username, source_client_id, source_client_name,
-		 target_client_id, target_client_name, allowed, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		 target_client_id, target_client_name, allowed, direction, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query, acl.ID, defaultTenant(acl.TenantID), defaultOwner(acl.OwnerUsername),
 		acl.SourceClientID, acl.SourceClientName, acl.TargetClientID, acl.TargetClientName,
-		boolToInt(acl.Allowed), formatTime(acl.CreatedAt), formatTime(acl.UpdatedAt))
+		boolToInt(acl.Allowed), defaultACLDirection(acl.Direction), formatTime(acl.CreatedAt), formatTime(acl.UpdatedAt))
 	return err
 }
 
 func (db *DB) UpdatePeerMeshACL(ctx context.Context, acl PeerMeshACL) error {
 	query := db.rebind(`UPDATE peer_mesh_acl SET owner_username = ?, source_client_name = ?,
-		target_client_name = ?, allowed = ?, updated_at = ? WHERE id = ?`)
+		target_client_name = ?, allowed = ?, direction = ?, updated_at = ? WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, defaultOwner(acl.OwnerUsername), acl.SourceClientName,
-		acl.TargetClientName, boolToInt(acl.Allowed), formatTime(acl.UpdatedAt), acl.ID)
+		acl.TargetClientName, boolToInt(acl.Allowed), defaultACLDirection(acl.Direction), formatTime(acl.UpdatedAt), acl.ID)
 	return err
 }
 
@@ -194,7 +194,7 @@ func (db *DB) DeletePeerMeshACL(ctx context.Context, id int64) error {
 
 func (db *DB) GetPeerMeshACL(ctx context.Context, id int64) (*PeerMeshACL, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, source_client_id, source_client_name,
-		target_client_id, target_client_name, allowed, created_at, updated_at FROM peer_mesh_acl
+		target_client_id, target_client_name, allowed, direction, created_at, updated_at FROM peer_mesh_acl
 		WHERE id = ?`)
 	row := db.sql.QueryRowContext(ctx, query, id)
 	acl, err := scanPeerMeshACL(row)
@@ -522,7 +522,7 @@ func scanPeerMeshACL(scanner scanner) (PeerMeshACL, error) {
 	var allowed int
 	err := scanner.Scan(&acl.ID, &acl.TenantID, &acl.OwnerUsername, &acl.SourceClientID,
 		&acl.SourceClientName, &acl.TargetClientID, &acl.TargetClientName, &allowed,
-		&created, &updated)
+		&acl.Direction, &created, &updated)
 	if err != nil {
 		return PeerMeshACL{}, err
 	}
@@ -530,6 +530,13 @@ func scanPeerMeshACL(scanner scanner) (PeerMeshACL, error) {
 	acl.CreatedAt = parseTime(created)
 	acl.UpdatedAt = parseTime(updated)
 	return acl, nil
+}
+
+func defaultACLDirection(value string) string {
+	if value == "" {
+		return "OUTBOUND"
+	}
+	return value
 }
 
 func scanPeerMeshSession(scanner scanner) (PeerMeshSession, error) {

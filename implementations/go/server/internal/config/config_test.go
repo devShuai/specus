@@ -159,3 +159,50 @@ func TestDefaultTrafficCaptureDetailDisabledLikeJava(t *testing.T) {
 		t.Fatalf("capture detail should default to disabled")
 	}
 }
+
+func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
+	t.Setenv("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED", "false")
+	t.Setenv("TUNNEL_PEER_MESH_TURN_REALM", "example.org")
+	t.Setenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET", "shared")
+	t.Setenv("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", "7200")
+	t.Setenv("TUNNEL_OBJECT_STORAGE_PROVIDER", "aliyun-oss")
+	t.Setenv("TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", "12345")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", "7")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", "9")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PeerMesh.TurnAuthRequired || cfg.PeerMesh.TurnRealm != "example.org" ||
+		cfg.PeerMesh.TurnSharedSecret != "shared" || cfg.PeerMesh.TurnCredentialTTLSeconds != 7200 {
+		t.Fatalf("TURN env mapping mismatch: %+v", cfg.PeerMesh)
+	}
+	if cfg.ObjectStorage.Provider != "aliyun-oss" || cfg.ObjectStorage.MaxAttachmentBytes != 12345 ||
+		cfg.PublicTransfer.MaxPendingUploadsPerRoom != 7 || cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 9 {
+		t.Fatalf("transfer env mapping mismatch: object=%+v public=%+v", cfg.ObjectStorage, cfg.PublicTransfer)
+	}
+}
+
+func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
+	cfg := Default()
+	if !cfg.PeerMesh.TurnAuthRequired || cfg.PeerMesh.TurnRealm != "shuai-tunnel" ||
+		cfg.PeerMesh.TurnCredentialTTLSeconds != 3600 {
+		t.Fatalf("TURN defaults mismatch: %+v", cfg.PeerMesh)
+	}
+	if cfg.ObjectStorage.Provider != "disabled" || cfg.ObjectStorage.MaxAttachmentBytes != 512*1024*1024 ||
+		cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 32 {
+		t.Fatalf("transfer defaults mismatch: object=%+v public=%+v", cfg.ObjectStorage, cfg.PublicTransfer)
+	}
+}
+
+func TestLoadAllowsHeaderOnlyFrameLimitAndRejectsSmaller(t *testing.T) {
+	t.Setenv("TUNNEL_NETTY_MAX_FRAME_SIZE", "11")
+	if cfg, err := Load(""); err != nil || cfg.Netty.MaxFrameSize != 11 {
+		t.Fatalf("11-byte full-frame limit rejected: cfg=%+v err=%v", cfg.Netty, err)
+	}
+	t.Setenv("TUNNEL_NETTY_MAX_FRAME_SIZE", "10")
+	if _, err := Load(""); err == nil {
+		t.Fatal("10-byte full-frame limit should be rejected")
+	}
+}

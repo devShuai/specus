@@ -24,6 +24,8 @@ type Config struct {
 	Elasticsearch    ElasticsearchConfig    `json:"elasticsearch"`
 	HTTP             DirectHTTPConfig       `json:"http"`
 	PeerMesh         PeerMeshConfig         `json:"peerMesh"`
+	ObjectStorage    ObjectStorageConfig    `json:"objectStorage"`
+	PublicTransfer   PublicTransferConfig   `json:"publicTransfer"`
 	Oidc             OidcConfig             `json:"oidc"`
 	TLS              TLSConfig              `json:"tls"`
 	PublicAddress    string                 `json:"publicAddress"`
@@ -177,6 +179,36 @@ type PeerMeshConfig struct {
 	RelayWorkerThreads          int      `json:"relayWorkerThreads"`
 	RelayWorkerQueueCapacity    int      `json:"relayWorkerQueueCapacity"`
 	RelayTrafficFlushIntervalMs int      `json:"relayTrafficFlushIntervalMs"`
+	TurnAuthRequired            bool     `json:"turnAuthRequired"`
+	TurnRealm                   string   `json:"turnRealm"`
+	TurnSharedSecret            string   `json:"turnSharedSecret"`
+	TurnCredentialTTLSeconds    int64    `json:"turnCredentialTtlSeconds"`
+}
+
+// ObjectStorageConfig mirrors tunnel.object-storage. Attachments are uploaded directly
+// to a private Aliyun OSS bucket through short-lived presigned URLs.
+type ObjectStorageConfig struct {
+	Provider                 string `json:"provider"`
+	Endpoint                 string `json:"endpoint"`
+	Bucket                   string `json:"bucket"`
+	AccessKeyID              string `json:"accessKeyId"`
+	AccessKeySecret          string `json:"accessKeySecret"`
+	ObjectPrefix             string `json:"objectPrefix"`
+	UploadURLTTLSeconds      int64  `json:"uploadUrlTtlSeconds"`
+	DownloadURLTTLSeconds    int64  `json:"downloadUrlTtlSeconds"`
+	RetentionHours           int64  `json:"retentionHours"`
+	MaxAttachmentBytes       int64  `json:"maxAttachmentBytes"`
+	ExpirationScanIntervalMs int64  `json:"expirationScanIntervalMs"`
+}
+
+// PublicTransferConfig mirrors tunnel.public-transfer abuse-protection limits.
+type PublicTransferConfig struct {
+	PresignRateLimitPerIP                  int   `json:"presignRateLimitPerIp"`
+	PresignRateLimitWindowSeconds          int64 `json:"presignRateLimitWindowSeconds"`
+	MaxPendingUploadsPerRoom               int   `json:"maxPendingUploadsPerRoom"`
+	MaxDiscoveryPeersPerRoom               int   `json:"maxDiscoveryPeersPerRoom"`
+	DiscoveryMessageRateLimitPerConnection int   `json:"discoveryMessageRateLimitPerConnection"`
+	DiscoveryMessageRateLimitWindowSeconds int64 `json:"discoveryMessageRateLimitWindowSeconds"`
 }
 
 // OidcConfig mirrors Tunnel:Oidc.
@@ -268,6 +300,26 @@ func Default() Config {
 			RelayMaxPort:                65535,
 			RelayWorkerQueueCapacity:    10000,
 			RelayTrafficFlushIntervalMs: 5000,
+			TurnAuthRequired:            true,
+			TurnRealm:                   "shuai-tunnel",
+			TurnCredentialTTLSeconds:    3600,
+		},
+		ObjectStorage: ObjectStorageConfig{
+			Provider:                 "disabled",
+			ObjectPrefix:             "shuai-tunnel/attachments",
+			UploadURLTTLSeconds:      900,
+			DownloadURLTTLSeconds:    600,
+			RetentionHours:           72,
+			MaxAttachmentBytes:       512 * 1024 * 1024,
+			ExpirationScanIntervalMs: 3600000,
+		},
+		PublicTransfer: PublicTransferConfig{
+			PresignRateLimitPerIP:                  30,
+			PresignRateLimitWindowSeconds:          300,
+			MaxPendingUploadsPerRoom:               50,
+			MaxDiscoveryPeersPerRoom:               32,
+			DiscoveryMessageRateLimitPerConnection: 120,
+			DiscoveryMessageRateLimitWindowSeconds: 60,
 		},
 		Oidc: OidcConfig{
 			Issuer:                "https://gateway.toys.theshuai.com/auth",
@@ -300,6 +352,9 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg.applyEnv(environMap())
+	if cfg.Netty.MaxFrameSize < 11 {
+		return Config{}, fmt.Errorf("netty.maxFrameSize must be at least the 11-byte frame header")
+	}
 	return cfg, nil
 }
 
@@ -428,6 +483,29 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("TUNNEL_PEER_MESH_RELAY_WORKER_THREADS", &cfg.PeerMesh.RelayWorkerThreads)
 	setInt("TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY", &cfg.PeerMesh.RelayWorkerQueueCapacity)
 	setInt("TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", &cfg.PeerMesh.RelayTrafficFlushIntervalMs)
+	setBool("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED", &cfg.PeerMesh.TurnAuthRequired)
+	setStr("TUNNEL_PEER_MESH_TURN_REALM", &cfg.PeerMesh.TurnRealm)
+	setStr("TUNNEL_PEER_MESH_TURN_SHARED_SECRET", &cfg.PeerMesh.TurnSharedSecret)
+	setInt64("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", &cfg.PeerMesh.TurnCredentialTTLSeconds)
+
+	setStr("TUNNEL_OBJECT_STORAGE_PROVIDER", &cfg.ObjectStorage.Provider)
+	setStr("TUNNEL_OBJECT_STORAGE_ENDPOINT", &cfg.ObjectStorage.Endpoint)
+	setStr("TUNNEL_OBJECT_STORAGE_BUCKET", &cfg.ObjectStorage.Bucket)
+	setStr("TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID", &cfg.ObjectStorage.AccessKeyID)
+	setStr("TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET", &cfg.ObjectStorage.AccessKeySecret)
+	setStr("TUNNEL_OBJECT_STORAGE_PREFIX", &cfg.ObjectStorage.ObjectPrefix)
+	setInt64("TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS", &cfg.ObjectStorage.UploadURLTTLSeconds)
+	setInt64("TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS", &cfg.ObjectStorage.DownloadURLTTLSeconds)
+	setInt64("TUNNEL_OBJECT_STORAGE_RETENTION_HOURS", &cfg.ObjectStorage.RetentionHours)
+	setInt64("TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", &cfg.ObjectStorage.MaxAttachmentBytes)
+	setInt64("TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS", &cfg.ObjectStorage.ExpirationScanIntervalMs)
+
+	setInt("TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP", &cfg.PublicTransfer.PresignRateLimitPerIP)
+	setInt64("TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS", &cfg.PublicTransfer.PresignRateLimitWindowSeconds)
+	setInt("TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", &cfg.PublicTransfer.MaxPendingUploadsPerRoom)
+	setInt("TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", &cfg.PublicTransfer.MaxDiscoveryPeersPerRoom)
+	setInt("TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION", &cfg.PublicTransfer.DiscoveryMessageRateLimitPerConnection)
+	setInt64("TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS", &cfg.PublicTransfer.DiscoveryMessageRateLimitWindowSeconds)
 
 	setStr("TUNNEL_OIDC_ISSUER", &cfg.Oidc.Issuer)
 	setStr("TUNNEL_OIDC_JWK_SET_URI", &cfg.Oidc.JwkSetURI)

@@ -1,7 +1,9 @@
 package peermesh
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -40,6 +42,11 @@ const (
 	stunAttrOtherAddress       = 0x802C
 
 	stunTransportUDP = 17
+
+	stunAttrUsername         = 0x0006
+	stunAttrMessageIntegrity = 0x0008
+	stunAttrRealm            = 0x0014
+	stunAttrNonce            = 0x0015
 )
 
 type stunAttribute struct {
@@ -51,6 +58,7 @@ type stunMessage struct {
 	Type          uint16
 	TransactionID [stunTransactionIDBytes]byte
 	Attributes    []stunAttribute
+	Raw           []byte
 }
 
 func newStunMessage(typ uint16, tx [stunTransactionIDBytes]byte, attrs ...stunAttribute) stunMessage {
@@ -83,6 +91,7 @@ func parseStunMessage(packet []byte) (*stunMessage, error) {
 	length := int(binary.BigEndian.Uint16(packet[2:4]))
 	end := stunHeaderBytes + length
 	message := &stunMessage{Type: binary.BigEndian.Uint16(packet[:2])}
+	message.Raw = append([]byte(nil), packet[:end]...)
 	copy(message.TransactionID[:], packet[8:20])
 	for offset := stunHeaderBytes; offset < end; {
 		if end-offset < 4 {
@@ -102,17 +111,46 @@ func parseStunMessage(packet []byte) (*stunMessage, error) {
 }
 
 func (m stunMessage) bytes() []byte {
+	return m.serialize(m.attributeBytes(), m.Attributes)
+}
+
+func (m stunMessage) bytesWithIntegrity(key []byte) []byte {
+	if len(key) == 0 {
+		return m.bytes()
+	}
+	beforeIntegrity := m.serialize(m.attributeBytes()+24, m.Attributes)
+	mac := hmac.New(sha1.New, key)
+	_, _ = mac.Write(beforeIntegrity)
+	digest := mac.Sum(nil)
+	result := make([]byte, len(beforeIntegrity)+24)
+	copy(result, beforeIntegrity)
+	offset := len(beforeIntegrity)
+	binary.BigEndian.PutUint16(result[offset:offset+2], stunAttrMessageIntegrity)
+	binary.BigEndian.PutUint16(result[offset+2:offset+4], uint16(len(digest)))
+	copy(result[offset+4:], digest)
+	return result
+}
+
+func (m stunMessage) attributeBytes() int {
 	length := 0
 	for _, attr := range m.Attributes {
 		length += 4 + len(attr.Value) + stunPadding(len(attr.Value))
 	}
-	packet := make([]byte, stunHeaderBytes+length)
+	return length
+}
+
+func (m stunMessage) serialize(declaredLength int, attrs []stunAttribute) []byte {
+	actualLength := 0
+	for _, attr := range attrs {
+		actualLength += 4 + len(attr.Value) + stunPadding(len(attr.Value))
+	}
+	packet := make([]byte, stunHeaderBytes+actualLength)
 	binary.BigEndian.PutUint16(packet[:2], m.Type)
-	binary.BigEndian.PutUint16(packet[2:4], uint16(length))
+	binary.BigEndian.PutUint16(packet[2:4], uint16(declaredLength))
 	binary.BigEndian.PutUint32(packet[4:8], stunMagicCookie)
 	copy(packet[8:20], m.TransactionID[:])
 	offset := stunHeaderBytes
-	for _, attr := range m.Attributes {
+	for _, attr := range attrs {
 		binary.BigEndian.PutUint16(packet[offset:offset+2], attr.Type)
 		binary.BigEndian.PutUint16(packet[offset+2:offset+4], uint16(len(attr.Value)))
 		offset += 4
@@ -120,6 +158,38 @@ func (m stunMessage) bytes() []byte {
 		offset += len(attr.Value) + stunPadding(len(attr.Value))
 	}
 	return packet
+}
+
+func (m stunMessage) verifyMessageIntegrity(key []byte) bool {
+	packet := m.Raw
+	if len(key) == 0 || !looksLikeStun(packet) {
+		return false
+	}
+	end := stunHeaderBytes + int(binary.BigEndian.Uint16(packet[2:4]))
+	for position := stunHeaderBytes; position < end; {
+		if end-position < 4 {
+			return false
+		}
+		attrType := binary.BigEndian.Uint16(packet[position : position+2])
+		attrLength := int(binary.BigEndian.Uint16(packet[position+2 : position+4]))
+		valueOffset := position + 4
+		next := valueOffset + attrLength + stunPadding(attrLength)
+		if attrLength > end-valueOffset || next > end {
+			return false
+		}
+		if attrType == stunAttrMessageIntegrity {
+			if attrLength != sha1.Size {
+				return false
+			}
+			signed := append([]byte(nil), packet[:position]...)
+			binary.BigEndian.PutUint16(signed[2:4], uint16(position+24-stunHeaderBytes))
+			mac := hmac.New(sha1.New, key)
+			_, _ = mac.Write(signed)
+			return hmac.Equal(mac.Sum(nil), packet[valueOffset:valueOffset+attrLength])
+		}
+		position = next
+	}
+	return false
 }
 
 func (m stunMessage) first(attrType uint16) (stunAttribute, bool) {
@@ -181,6 +251,14 @@ func (m stunMessage) data() ([]byte, bool) {
 	return append([]byte(nil), attr.Value...), true
 }
 
+func (m stunMessage) text(attrType uint16) string {
+	attr, ok := m.first(attrType)
+	if !ok {
+		return ""
+	}
+	return string(attr.Value)
+}
+
 func (m stunMessage) lifetimeSeconds(fallback int64) int64 {
 	attr, ok := m.first(stunAttrLifetime)
 	if !ok || len(attr.Value) != 4 {
@@ -236,6 +314,18 @@ func stunAttrRequestedUDPTransport() stunAttribute {
 
 func stunAttrSoftwareValue(value string) stunAttribute {
 	return stunAttribute{Type: stunAttrSoftware, Value: []byte(value)}
+}
+
+func stunAttrUsernameValue(value string) stunAttribute {
+	return stunAttribute{Type: stunAttrUsername, Value: []byte(value)}
+}
+
+func stunAttrRealmValue(value string) stunAttribute {
+	return stunAttribute{Type: stunAttrRealm, Value: []byte(value)}
+}
+
+func stunAttrNonceValue(value string) stunAttribute {
+	return stunAttribute{Type: stunAttrNonce, Value: []byte(value)}
 }
 
 func stunAttrErrorCodeValue(code int, reason string) stunAttribute {

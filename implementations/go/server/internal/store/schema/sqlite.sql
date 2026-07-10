@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS tunnel_client_session (
   client_version TEXT,
   java_version TEXT,
   local_addresses TEXT,
+  message_send_capable INTEGER NOT NULL DEFAULT 0,
+  message_receive_capable INTEGER NOT NULL DEFAULT 0,
+  message_attachments_capable INTEGER NOT NULL DEFAULT 0,
+  message_media_preview_capable INTEGER NOT NULL DEFAULT 0,
+  message_max_attachment_bytes INTEGER NOT NULL DEFAULT 0,
   http_login_at TEXT NOT NULL,
   netty_connected_at TEXT,
   disconnected_at TEXT,
@@ -106,6 +111,31 @@ CREATE TABLE IF NOT EXISTS client_download_link (
 CREATE INDEX IF NOT EXISTS idx_client_download_impl ON client_download_link (implementation);
 CREATE INDEX IF NOT EXISTS idx_client_download_order ON client_download_link (display_order);
 
+CREATE TABLE IF NOT EXISTS transfer_attachment (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT,
+  scope TEXT NOT NULL,
+  room_id TEXT,
+  room_token_hash TEXT,
+  owner_username TEXT,
+  target_client_id INTEGER,
+  object_key TEXT NOT NULL UNIQUE,
+  file_name TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  sha256 TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  upload_expires_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  uploaded_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_attachment_tenant ON transfer_attachment (tenant_id, scope, id);
+CREATE INDEX IF NOT EXISTS idx_transfer_attachment_room ON transfer_attachment (scope, room_id, id);
+CREATE INDEX IF NOT EXISTS idx_transfer_attachment_expires ON transfer_attachment (expires_at, status);
+
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT,
@@ -126,6 +156,7 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_connection_connected_at ON tunnel_connecti
 
 CREATE TABLE IF NOT EXISTS tunnel_mapping (
   id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
   client_id INTEGER NOT NULL,
   client_name TEXT NOT NULL,
   listen_port INTEGER NOT NULL UNIQUE,
@@ -141,6 +172,7 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_mapping_client_id ON tunnel_mapping (clien
 
 CREATE TABLE IF NOT EXISTS http_route_mapping (
   id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
   client_id INTEGER NOT NULL,
   client_name TEXT NOT NULL,
   route TEXT NOT NULL,
@@ -298,6 +330,7 @@ CREATE TABLE IF NOT EXISTS peer_mesh_acl (
   target_client_id INTEGER NOT NULL,
   target_client_name TEXT NOT NULL,
   allowed INTEGER NOT NULL DEFAULT 1,
+  direction TEXT NOT NULL DEFAULT 'OUTBOUND',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (tenant_id, source_client_id, target_client_id)

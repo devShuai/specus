@@ -154,7 +154,7 @@ func (c *Conn) Close(reason string) {
 // Send serializes and writes a packet, updating the write-idle timestamp. It is safe to call
 // from multiple goroutines.
 func (c *Conn) Send(packet protocol.Packet) error {
-	frame, err := protocol.EncodeFrame(packet)
+	frame, err := protocol.EncodeFrameLimit(packet, c.maxFrameSize)
 	if err != nil {
 		return err
 	}
@@ -195,7 +195,7 @@ func (c *Conn) run(handler Handler) {
 			return
 		}
 
-		command, body, err := protocol.ReadFrame(reader)
+		command, body, err := protocol.ReadFrameLimit(reader, c.maxFrameSize)
 		if err != nil {
 			// Distinguish a clean peer close from a protocol/IO error for the audit row.
 			if c.ctx.Err() == nil {

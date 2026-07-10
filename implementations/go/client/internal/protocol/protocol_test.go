@@ -2,9 +2,20 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
 	"reflect"
 	"testing"
 )
+
+func TestReadPacketRejectsBodyThatExceedsFullFrameLimit(t *testing.T) {
+	header := make([]byte, frameHeaderSize)
+	binary.BigEndian.PutUint32(header[:4], MagicNumber)
+	header[6] = byte(CommandHeartbeatRequest)
+	binary.BigEndian.PutUint32(header[7:11], uint32(maxFrameBodySize+1))
+	if _, err := ReadPacket(bytes.NewReader(header)); err == nil {
+		t.Fatal("body that makes the full frame exceed the Java Netty limit was accepted")
+	}
+}
 
 func TestPacketRoundTrip(t *testing.T) {
 	var encoded bytes.Buffer

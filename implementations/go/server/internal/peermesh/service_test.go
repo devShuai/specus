@@ -3,6 +3,7 @@ package peermesh
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -152,6 +153,157 @@ func TestPushOnLoginRefreshesRosterForTenantPeers(t *testing.T) {
 	}
 	if targetRoster == nil || !rosterContains(targetRoster.Peers, source.ID, source.ClientName, true) {
 		t.Fatalf("target roster missing online source: %+v", targetMessages)
+	}
+}
+
+func TestCanPeerMatchesJavaCaseSensitiveIdentityAndDirectionalACLs(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := newPeerMeshTestService(db)
+
+	source := insertPeerClient(t, db, 1201, "tenant-a", "Alice", "alice-laptop")
+	target := insertPeerClient(t, db, 1202, "tenant-a", "alice", "alice-nas")
+	insertPeerDevice(t, db, source, "100.96.0.12", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.13", "target-key")
+
+	if allowed, err := service.CanPeer(ctx, source, target); err != nil || allowed {
+		t.Fatalf("case-distinct owners bypassed ACL: allowed=%v err=%v", allowed, err)
+	}
+	caseDistinctTenant := target
+	caseDistinctTenant.TenantID = "TENANT-A"
+	if allowed, err := service.CanPeer(ctx, source, caseDistinctTenant); err != nil || allowed {
+		t.Fatalf("case-distinct tenants were treated as equal: allowed=%v err=%v", allowed, err)
+	}
+
+	access := AccessContext{Username: "admin", TenantID: "tenant-a", Admin: true}
+	direction := "inbound"
+	view, err := service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &source.ID, TargetClientID: &target.ID, Direction: &direction,
+	})
+	if err != nil {
+		t.Fatalf("create inbound ACL: %v", err)
+	}
+	if view.Direction != "INBOUND" || !view.Allowed {
+		t.Fatalf("management ACL view lost direction/default allowed: %+v", view)
+	}
+	if allowed, _ := service.CanPeer(ctx, source, target); allowed {
+		t.Fatal("INBOUND ACL allowed source -> target")
+	}
+	if allowed, err := service.CanPeer(ctx, target, source); err != nil || !allowed {
+		t.Fatalf("INBOUND ACL did not allow target -> source: allowed=%v err=%v", allowed, err)
+	}
+
+	direction = "OUTBOUND"
+	view, err = service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &source.ID, TargetClientID: &target.ID, Direction: &direction,
+	})
+	if err != nil || view.Direction != "OUTBOUND" {
+		t.Fatalf("update outbound ACL: view=%+v err=%v", view, err)
+	}
+	if allowed, err := service.CanPeer(ctx, source, target); err != nil || !allowed {
+		t.Fatalf("OUTBOUND ACL did not allow source -> target: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, _ := service.CanPeer(ctx, target, source); allowed {
+		t.Fatal("OUTBOUND ACL allowed target -> source")
+	}
+
+	direction = "both"
+	view, err = service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &source.ID, TargetClientID: &target.ID, Direction: &direction,
+	})
+	if err != nil || view.Direction != "BOTH" {
+		t.Fatalf("update bidirectional ACL: view=%+v err=%v", view, err)
+	}
+	for _, pair := range [][2]store.ClientAccount{{source, target}, {target, source}} {
+		if allowed, err := service.CanPeer(ctx, pair[0], pair[1]); err != nil || !allowed {
+			t.Fatalf("BOTH ACL denied %s -> %s: allowed=%v err=%v", pair[0].ClientName, pair[1].ClientName, allowed, err)
+		}
+	}
+
+	invalid := " inbound "
+	if _, err := service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &source.ID, TargetClientID: &target.ID, Direction: &invalid,
+	}); err == nil {
+		t.Fatal("direction with Java-invalid surrounding whitespace was accepted")
+	}
+	allowedFlag := false
+	view, err = service.CreateACL(ctx, access, ACLMutation{
+		SourceClientID: &source.ID, TargetClientID: &target.ID, Allowed: &allowedFlag,
+	})
+	if err != nil || view.Direction != "BOTH" || view.Allowed {
+		t.Fatalf("omitted direction did not preserve existing value: view=%+v err=%v", view, err)
+	}
+	for _, pair := range [][2]store.ClientAccount{{source, target}, {target, source}} {
+		if allowed, _ := service.CanPeer(ctx, pair[0], pair[1]); allowed {
+			t.Fatalf("disabled BOTH ACL still allowed %s -> %s", pair[0].ClientName, pair[1].ClientName)
+		}
+	}
+}
+
+func TestManagementAccessAndVisibilityRejectMixedCaseTenantAndOwner(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := newPeerMeshTestService(db)
+
+	source := insertPeerClient(t, db, 1251, "tenant-a", "Alice", "alice-laptop")
+	target := insertPeerClient(t, db, 1252, "tenant-a", "Alice", "alice-nas")
+	caseTenant := insertPeerClient(t, db, 1253, "TENANT-A", "Alice", "case-tenant-host")
+	lowerOwnerSource := insertPeerClient(t, db, 1254, "tenant-a", "alice", "lower-owner-host")
+	insertPeerDevice(t, db, source, "100.96.0.14", "source-key")
+	insertPeerDevice(t, db, target, "100.96.0.15", "target-key")
+	insertPeerDevice(t, db, caseTenant, "100.96.0.16", "case-tenant-key")
+	insertPeerSession(t, db, 9251, source, target, StatusActive, time.Now().UTC().Add(time.Hour))
+	now := time.Now().UTC()
+	acl := store.PeerMeshACL{
+		ID: 8251, TenantID: source.TenantID, OwnerUsername: source.OwnerUsername,
+		SourceClientID: source.ID, SourceClientName: source.ClientName,
+		TargetClientID: target.ID, TargetClientName: target.ClientName,
+		Allowed: true, Direction: "OUTBOUND", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.InsertPeerMeshACL(ctx, acl); err != nil {
+		t.Fatalf("insert peer ACL: %v", err)
+	}
+
+	ownerCaseMismatch := AccessContext{Username: "alice", TenantID: "tenant-a"}
+	if _, err := service.findClient(ctx, ownerCaseMismatch, source.ID, false); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("mixed-case owner accessed client: %v", err)
+	}
+	if _, err := service.findAccessibleDevice(ctx, ownerCaseMismatch, source.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("mixed-case owner accessed device: %v", err)
+	}
+	ids, err := service.visibleClientIDs(ctx, ownerCaseMismatch)
+	if err != nil || len(ids) != 1 || ids[0] != lowerOwnerSource.ID {
+		t.Fatalf("mixed-case owner visible client ids = %v, err=%v", ids, err)
+	}
+	if _, err := service.CreateACL(ctx, ownerCaseMismatch, ACLMutation{
+		SourceClientID: &lowerOwnerSource.ID, TargetClientID: &target.ID,
+	}); err == nil {
+		t.Fatal("mixed-case target owner created ACL")
+	}
+	if err := service.DeleteACL(ctx, ownerCaseMismatch, acl.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("mixed-case owner deleted ACL: %v", err)
+	}
+
+	tenantCaseMismatch := AccessContext{Username: "Alice", TenantID: "TENANT-A", Admin: true}
+	if _, err := service.findTenantClient(ctx, tenantCaseMismatch.TenantID, source.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("mixed-case tenant accessed client: %v", err)
+	}
+	if _, err := service.findAccessibleSession(ctx, tenantCaseMismatch, 9251); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("mixed-case tenant accessed session: %v", err)
+	}
+	if err := service.DeleteACL(ctx, tenantCaseMismatch, acl.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("mixed-case tenant deleted ACL: %v", err)
+	}
+	reporter := source
+	reporter.TenantID = "TENANT-A"
+	sessionID := int64(9251)
+	if _, err := service.findReportableSession(ctx, reporter, &sessionID); err == nil {
+		t.Fatal("mixed-case tenant reported traffic for session")
+	}
+
+	refreshTargets := service.rosterRefreshTargets(ctx, reporter)
+	if len(refreshTargets) != 1 || refreshTargets[0].ID != caseTenant.ID {
+		t.Fatalf("mixed-case tenant roster leaked other tenant casing: %+v", refreshTargets)
 	}
 }
 

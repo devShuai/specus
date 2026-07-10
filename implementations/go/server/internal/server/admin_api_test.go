@@ -2,6 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,8 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
 )
 
 // newAPIServer boots an App and wraps its management handler in an httptest.Server.
@@ -74,6 +80,127 @@ func TestPublicPeerMeshStunConfigMatchesJavaShape(t *testing.T) {
 	}
 	if decoded.StunTurnPort != 3478 {
 		t.Fatalf("stunTurnPort = %d", decoded.StunTurnPort)
+	}
+}
+
+func TestPublicIceConfigNormalizesIPv6AndForwardedHost(t *testing.T) {
+	cfg := config.Default()
+	cfg.PeerMesh.Enabled = true
+	cfg.PeerMesh.PublicAddress = ""
+	cfg.PeerMesh.PublicStunServers = []string{
+		"stun://[2001:db8::10]:5349", "stun:stun.example.com:3479",
+	}
+	_, ts := newAPIServerWithConfig(t, cfg)
+	request, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/public/transfer/ice-config", nil)
+	request.Header.Set("X-Forwarded-Host", "[2001:db8::20]:8443, proxy.internal")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var decoded struct {
+		PeerMeshEnabled  bool                                          `json:"peerMeshEnabled"`
+		TurnAuthRequired bool                                          `json:"turnAuthRequired"`
+		IceServers       []struct{ URLs, Username, Credential string } `json:"iceServers"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.PeerMeshEnabled || !decoded.TurnAuthRequired {
+		t.Fatalf("flags = %+v", decoded)
+	}
+	urls := make([]string, 0, len(decoded.IceServers))
+	for _, server := range decoded.IceServers {
+		urls = append(urls, server.URLs)
+	}
+	want := []string{
+		"stun:[2001:db8::20]:3478", "stun:[2001:db8::10]:5349",
+		"stun:stun.example.com:3479", "turn:[2001:db8::20]:3478?transport=udp",
+	}
+	if strings.Join(urls, ",") != strings.Join(want, ",") {
+		t.Fatalf("ice URLs = %#v, want %#v", urls, want)
+	}
+	turn := decoded.IceServers[len(decoded.IceServers)-1]
+	if turn.Username == "" || turn.Credential == "" {
+		t.Fatalf("TURN credential missing: %+v", turn)
+	}
+}
+
+func TestStaticResourceCacheHeadersMatchJava(t *testing.T) {
+	_, ts := newAPIServer(t)
+	response, err := http.Get(ts.URL + "/favicon.svg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != "public, max-age=604800" {
+		t.Fatalf("favicon status/cache = %d/%q", response.StatusCode, response.Header.Get("Cache-Control"))
+	}
+	for path, want := range map[string]string{
+		"/assets/app.js":                    "public, max-age=31536000, immutable",
+		"/schemas/peer-control.schema.json": "public, max-age=3600",
+	} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		staticResourceCacheHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})).ServeHTTP(recorder, request)
+		if recorder.Header().Get("Cache-Control") != want {
+			t.Fatalf("%s cache = %q, want %q", path, recorder.Header().Get("Cache-Control"), want)
+		}
+	}
+}
+
+func TestPublicAttachmentHTTPStatusMatchesJavaExceptionMapping(t *testing.T) {
+	cfg := config.Default()
+	cfg.PublicTransfer.PresignRateLimitPerIP = 1
+	app, ts := newAPIServerWithConfig(t, cfg)
+	body := `{"fileName":"a.txt","sizeBytes":1,"roomToken":"room-secret"}`
+	request := func() *http.Response {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/public/transfer/attachments/presign-upload", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Real-IP", "203.0.113.10")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	first := request()
+	defer first.Body.Close()
+	var firstError map[string]string
+	_ = json.NewDecoder(first.Body).Decode(&firstError)
+	if first.StatusCode != http.StatusConflict || firstError["error"] != "object storage is not configured" {
+		t.Fatalf("disabled storage status/body = %d/%#v", first.StatusCode, firstError)
+	}
+	second := request()
+	defer second.Body.Close()
+	var secondError map[string]string
+	_ = json.NewDecoder(second.Body).Decode(&secondError)
+	if second.StatusCode != http.StatusTooManyRequests || secondError["error"] != "请求过于频繁,请稍后再试" {
+		t.Fatalf("rate limit status/body = %d/%#v", second.StatusCode, secondError)
+	}
+
+	now := time.Now().UTC()
+	tokenHash := sha256.Sum256([]byte("room-secret"))
+	tokenHashText := hex.EncodeToString(tokenHash[:])
+	item := store.TransferAttachment{ID: 880001, Scope: transfer.ScopePublicTransfer,
+		RoomTokenHash: &tokenHashText, ObjectKey: "prefix/a", FileName: "a.txt",
+		MimeType: "text/plain", SizeBytes: 1, Status: transfer.StatusPending,
+		CreatedAt: now, UpdatedAt: now, UploadExpiresAt: now.Add(time.Minute), ExpiresAt: now.Add(time.Hour)}
+	if err := app.db.InsertTransferAttachment(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post(ts.URL+"/api/public/transfer/attachments/880001/presign-download",
+		"application/json", strings.NewReader(`{"roomToken":"room-secret"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var stateError map[string]string
+	_ = json.NewDecoder(response.Body).Decode(&stateError)
+	if response.StatusCode != http.StatusConflict || stateError["error"] != "attachment is not uploaded" {
+		t.Fatalf("state conflict status/body = %d/%#v", response.StatusCode, stateError)
 	}
 }
 
@@ -248,6 +375,63 @@ func TestClientAndTunnelCrud(t *testing.T) {
 		t.Fatalf("delete client status %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+func TestPeerMeshACLAPIExposesAndPersistsDirection(t *testing.T) {
+	_, ts := newAPIServer(t)
+	token := adminToken(t, ts)
+	createClient := func(name string) int64 {
+		response := authRequest(t, ts, http.MethodPost, "/api/admin/clients", token,
+			`{"clientName":"`+name+`","enabled":true}`)
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusCreated {
+			t.Fatalf("create client %s status %d", name, response.StatusCode)
+		}
+		var result struct {
+			Client management_ClientView `json:"client"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		return result.Client.ID
+	}
+	sourceID := createClient("acl-source")
+	targetID := createClient("acl-target")
+	body := `{"sourceClientId":` + itoa(sourceID) + `,"targetClientId":` + itoa(targetID) + `,"direction":"both"}`
+	response := authRequest(t, ts, http.MethodPost, "/api/admin/peer-mesh/acls", token, body)
+	if response.StatusCode != http.StatusCreated {
+		response.Body.Close()
+		t.Fatalf("create ACL status %d", response.StatusCode)
+	}
+	var created struct {
+		ID        int64  `json:"id"`
+		Allowed   bool   `json:"allowed"`
+		Direction string `json:"direction"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if created.ID == 0 || !created.Allowed || created.Direction != "BOTH" {
+		t.Fatalf("unexpected ACL response: %+v", created)
+	}
+
+	response = authRequest(t, ts, http.MethodGet, "/api/admin/peer-mesh/acls", token, "")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("list ACLs status %d", response.StatusCode)
+	}
+	var listed []struct {
+		ID        int64  `json:"id"`
+		Direction string `json:"direction"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != created.ID || listed[0].Direction != "BOTH" {
+		t.Fatalf("listed ACL direction mismatch: %+v", listed)
+	}
 }
 
 func TestHTTPRouteValidation(t *testing.T) {

@@ -28,17 +28,26 @@ type authLoginRequest struct {
 }
 
 type clientEnvironmentInfo struct {
-	MachineFingerprint string   `json:"machineFingerprint"`
-	Hostname           string   `json:"hostname"`
-	OSUser             string   `json:"osUser"`
-	OSName             string   `json:"osName"`
-	OSVersion          string   `json:"osVersion"`
-	OSArch             string   `json:"osArch"`
-	ClientVersion      string   `json:"clientVersion"`
-	JavaVersion        string   `json:"javaVersion"`
-	PeerPublicKey      string   `json:"peerPublicKey"`
-	LocalAddresses     []string `json:"localAddresses"`
-	StartedAt          string   `json:"startedAt"`
+	MachineFingerprint        string                    `json:"machineFingerprint"`
+	Hostname                  string                    `json:"hostname"`
+	OSUser                    string                    `json:"osUser"`
+	OSName                    string                    `json:"osName"`
+	OSVersion                 string                    `json:"osVersion"`
+	OSArch                    string                    `json:"osArch"`
+	ClientVersion             string                    `json:"clientVersion"`
+	JavaVersion               string                    `json:"javaVersion"`
+	PeerPublicKey             string                    `json:"peerPublicKey"`
+	ClientMessageCapabilities clientMessageCapabilities `json:"clientMessageCapabilities"`
+	LocalAddresses            []string                  `json:"localAddresses"`
+	StartedAt                 string                    `json:"startedAt"`
+}
+
+type clientMessageCapabilities struct {
+	SendMessages       bool  `json:"sendMessages"`
+	ReceiveMessages    bool  `json:"receiveMessages"`
+	Attachments        bool  `json:"attachments"`
+	MediaPreview       bool  `json:"mediaPreview"`
+	MaxAttachmentBytes int64 `json:"maxAttachmentBytes"`
 }
 
 var authHTTPClient = &http.Client{Timeout: 20 * time.Second}
@@ -120,8 +129,11 @@ func collectEnvironment() clientEnvironmentInfo {
 		ClientVersion:      "",
 		JavaVersion:        "",
 		PeerPublicKey:      peerPublicKeyBase64(),
-		LocalAddresses:     localAddresses(),
-		StartedAt:          time.Now().UTC().Format(time.RFC3339Nano),
+		ClientMessageCapabilities: clientMessageCapabilities{
+			SendMessages: true, ReceiveMessages: true,
+		},
+		LocalAddresses: localAddresses(),
+		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 }
 

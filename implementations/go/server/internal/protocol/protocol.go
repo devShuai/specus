@@ -62,8 +62,10 @@ const (
 	// FrameHeaderSize is the fixed framing header length.
 	FrameHeaderSize = 11
 
-	MaxFrameSize    = 32 * 1024 * 1024
-	maxInflatedSize = 16 * 1024 * 1024
+	// MaxFrameSize is Java Netty's full frame limit, including the 11-byte header.
+	MaxFrameSize     = 32 * 1024 * 1024
+	MaxFrameBodySize = MaxFrameSize - FrameHeaderSize
+	maxInflatedSize  = 16 * 1024 * 1024
 	// CompressionThreshold is the minimum raw payload size before deflate is attempted.
 	compressionThreshold = 64
 )
@@ -71,6 +73,14 @@ const (
 // ReadFrame reads a single framed packet from reader, returning the command byte and
 // the raw (still CompactBinary-wrapped) body. It validates magic and length bounds.
 func ReadFrame(reader io.Reader) (command int8, body []byte, err error) {
+	return ReadFrameLimit(reader, MaxFrameSize)
+}
+
+// ReadFrameLimit reads a frame using a full-frame limit (header + body).
+func ReadFrameLimit(reader io.Reader, maxFrameSize int) (command int8, body []byte, err error) {
+	if maxFrameSize < FrameHeaderSize {
+		return 0, nil, fmt.Errorf("max frame size must be at least header size: %d", maxFrameSize)
+	}
 	header := make([]byte, FrameHeaderSize)
 	if _, err = io.ReadFull(reader, header); err != nil {
 		return 0, nil, err
@@ -79,7 +89,7 @@ func ReadFrame(reader io.Reader) (command int8, body []byte, err error) {
 		return 0, nil, errors.New("invalid packet magic number")
 	}
 	length := int(int32(binary.BigEndian.Uint32(header[7:11])))
-	if length < 0 || length > MaxFrameSize {
+	if length < 0 || length > maxFrameSize-FrameHeaderSize {
 		return 0, nil, fmt.Errorf("invalid packet body length: %d", length)
 	}
 	body = make([]byte, length)
@@ -91,7 +101,7 @@ func ReadFrame(reader io.Reader) (command int8, body []byte, err error) {
 
 // writeFrameBytes writes a framed packet for the given command and body to writer.
 func writeFrameBytes(writer io.Writer, command int8, body []byte) error {
-	if len(body) > MaxFrameSize {
+	if len(body) > MaxFrameBodySize {
 		return fmt.Errorf("packet body exceeds limit: %d", len(body))
 	}
 	header := make([]byte, FrameHeaderSize)

@@ -38,6 +38,9 @@ type Client struct {
 
 	writeMu           sync.Mutex
 	lastWriteUnixNano atomic.Int64
+	controlMu         sync.RWMutex
+	controlConn       net.Conn
+	messageHandler    func(ClientMessage)
 
 	reconnectMu                 sync.Mutex
 	reconnectAttempts           int
@@ -60,6 +63,14 @@ type Client struct {
 	wsLocals   map[string]*webSocketLocalConnection
 
 	peerMesh *peerMeshClient
+}
+
+// ClientMessage is an application message delivered through either the encrypted
+// Peer Mesh app-message channel or the CLIENT_TO_CLIENT control-channel fallback.
+type ClientMessage struct {
+	FromClientName string
+	ToClientName   string
+	Message        string
 }
 
 type natControlConfig struct {
@@ -229,9 +240,17 @@ func (client *Client) runOnce(ctx context.Context) error {
 		return fmt.Errorf("connect %s: %w", address, err)
 	}
 	client.logger.Printf("connected to tunnel server %s", address)
+	client.controlMu.Lock()
+	client.controlConn = connection
+	client.controlMu.Unlock()
 	client.resetConnectionState()
 	client.markControlWrite()
 	defer func() {
+		client.controlMu.Lock()
+		if client.controlConn == connection {
+			client.controlConn = nil
+		}
+		client.controlMu.Unlock()
 		client.peerMesh.stop()
 		_ = connection.Close()
 		client.closeLocalConnections()
@@ -445,6 +464,14 @@ func (client *Client) handleMessageResponse(connection net.Conn, body []byte) er
 			return client.handlePeerControl(connection, response.Message)
 		}
 		client.logger.Printf("received message type=%d from=%q: %s", response.MessageType, response.ClientName, response.Message)
+		if response.MessageType == protocol.MessageTypeClientToClient {
+			client.controlMu.RLock()
+			handler := client.messageHandler
+			client.controlMu.RUnlock()
+			if handler != nil {
+				handler(ClientMessage{FromClientName: response.ClientName, ToClientName: response.ToClientName, Message: response.Message})
+			}
+		}
 		return nil
 	}
 	var config natControlConfig
@@ -456,6 +483,33 @@ func (client *Client) handleMessageResponse(connection net.Conn, body []byte) er
 		client.syncHTTPTunnelConfigs(*config.HTTPTunnelConfigList)
 	}
 	return nil
+}
+
+// SetMessageHandler installs a callback for received CLIENT_TO_CLIENT messages.
+func (client *Client) SetMessageHandler(handler func(ClientMessage)) {
+	client.controlMu.Lock()
+	client.messageHandler = handler
+	client.controlMu.Unlock()
+	client.peerMesh.setMessageHandler(handler)
+}
+
+// SendMessage delivers an application message through the control-channel fallback.
+func (client *Client) SendMessage(toClientName, message string) error {
+	toClientName = strings.TrimSpace(toClientName)
+	message = strings.TrimSpace(message)
+	if toClientName == "" || message == "" {
+		return errors.New("target and message are required")
+	}
+	client.controlMu.RLock()
+	connection := client.controlConn
+	client.controlMu.RUnlock()
+	if connection == nil {
+		return errors.New("control connection is not online")
+	}
+	runtime := client.currentRuntime()
+	packet := protocol.EncodeMessageRequest(runtime.ClientName, toClientName,
+		protocol.MessageTypeClientToClient, message)
+	return client.send(connection, protocol.CommandMessageRequest, packet)
 }
 
 func (client *Client) handlePeerControl(connection net.Conn, payload string) error {

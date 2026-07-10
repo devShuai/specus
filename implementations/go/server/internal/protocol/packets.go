@@ -194,9 +194,20 @@ func EncodeBody(packet Packet) ([]byte, error) {
 
 // EncodeFrame serializes a packet to a complete framed wire message.
 func EncodeFrame(packet Packet) ([]byte, error) {
+	return EncodeFrameLimit(packet, MaxFrameSize)
+}
+
+// EncodeFrameLimit serializes a packet while enforcing a full-frame limit.
+func EncodeFrameLimit(packet Packet, maxFrameSize int) ([]byte, error) {
 	body, err := EncodeBody(packet)
 	if err != nil {
 		return nil, err
+	}
+	if maxFrameSize < FrameHeaderSize {
+		return nil, fmt.Errorf("max frame size must be at least header size: %d", maxFrameSize)
+	}
+	if len(body) > maxFrameSize-FrameHeaderSize {
+		return nil, fmt.Errorf("packet body exceeds limit: %d", len(body))
 	}
 	header := make([]byte, FrameHeaderSize)
 	binary.BigEndian.PutUint32(header[:4], MagicNumber)
@@ -229,7 +240,7 @@ func DecodeFrame(data []byte) (Packet, int, error) {
 		return nil, 0, errors.New("invalid packet magic number")
 	}
 	length := int(int32(binary.BigEndian.Uint32(data[7:11])))
-	if length < 0 || length > MaxFrameSize {
+	if length < 0 || length > MaxFrameBodySize {
 		return nil, 0, fmt.Errorf("invalid packet body length: %d", length)
 	}
 	if len(data) < FrameHeaderSize+length {

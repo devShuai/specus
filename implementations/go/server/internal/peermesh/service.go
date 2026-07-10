@@ -68,6 +68,8 @@ type LoginConfig struct {
 	PublicStunServers []string `json:"publicStunServers"`
 	IceUsername       string   `json:"iceUsername"`
 	IceCredential     string   `json:"iceCredential"`
+	IceRealm          string   `json:"iceRealm"`
+	IceNonce          string   `json:"iceNonce"`
 	ServerPublicKey   string   `json:"serverPublicKey"`
 	ClientPublicKey   string   `json:"clientPublicKey"`
 	SessionTTLSeconds int64    `json:"sessionTtlSeconds"`
@@ -101,6 +103,7 @@ type ACLView struct {
 	TargetClientID   int64  `json:"targetClientId"`
 	TargetClientName string `json:"targetClientName"`
 	Allowed          bool   `json:"allowed"`
+	Direction        string `json:"direction"`
 	CreatedAt        string `json:"createdAt"`
 	UpdatedAt        string `json:"updatedAt"`
 }
@@ -166,6 +169,19 @@ type PublicStunConfig struct {
 	StunTurnPort         int      `json:"stunTurnPort"`
 }
 
+type PublicIceConfig struct {
+	PeerMeshEnabled  bool        `json:"peerMeshEnabled"`
+	IceServers       []IceServer `json:"iceServers"`
+	TurnAuthRequired bool        `json:"turnAuthRequired"`
+	StunTurnPort     int         `json:"stunTurnPort"`
+}
+
+type IceServer struct {
+	URLs       string `json:"urls"`
+	Username   string `json:"username"`
+	Credential string `json:"credential"`
+}
+
 type RosterItem struct {
 	ClientID   int64   `json:"clientId"`
 	ClientName string  `json:"clientName"`
@@ -222,9 +238,10 @@ type DeviceMutation struct {
 }
 
 type ACLMutation struct {
-	SourceClientID *int64 `json:"sourceClientId"`
-	TargetClientID *int64 `json:"targetClientId"`
-	Allowed        *bool  `json:"allowed"`
+	SourceClientID *int64  `json:"sourceClientId"`
+	TargetClientID *int64  `json:"targetClientId"`
+	Allowed        *bool   `json:"allowed"`
+	Direction      *string `json:"direction"`
 }
 
 type sessionGrant struct {
@@ -240,6 +257,7 @@ type Service struct {
 	relayMu             sync.Mutex
 	relayAuthorizations map[int64]relayAuthorization
 	pendingRelayBytes   map[int64]int64
+	turnCredentials     *turnCredentialService
 }
 
 type relayAuthorization struct {
@@ -269,10 +287,18 @@ func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, lo
 	if cfg.RelayTrafficFlushIntervalMs <= 0 {
 		cfg.RelayTrafficFlushIntervalMs = 5000
 	}
+	if strings.TrimSpace(cfg.TurnRealm) == "" {
+		cfg.TurnRealm = "shuai-tunnel"
+	}
+	if cfg.TurnCredentialTTLSeconds <= 0 {
+		cfg.TurnCredentialTTLSeconds = 3600
+	}
+	credentials := newTurnCredentialService(cfg)
 	return &Service{
 		cfg: cfg, db: db, sessions: sessions, logger: logger,
 		relayAuthorizations: make(map[int64]relayAuthorization),
 		pendingRelayBytes:   make(map[int64]int64),
+		turnCredentials:     credentials,
 	}
 }
 
@@ -387,8 +413,11 @@ func (s *Service) buildConfig(account store.ClientAccount, device *store.PeerMes
 	cfg.StunPort = s.cfg.StunTurnPort
 	cfg.TurnPort = s.cfg.StunTurnPort
 	cfg.PublicStunServers = s.publicStunServers()
-	cfg.IceUsername = "pm-" + strconv.FormatInt(account.ID, 10)
-	cfg.IceCredential = s.shortToken(account.TenantID, account.ClientName, device.VirtualIP)
+	credential := s.turnCredentials.issue("pm-" + strconv.FormatInt(account.ID, 10))
+	cfg.IceUsername = credential.Username
+	cfg.IceCredential = credential.Credential
+	cfg.IceRealm = credential.Realm
+	cfg.IceNonce = credential.Nonce
 	cfg.ServerPublicKey = serverPublicKey()
 	if device.PublicKey != nil {
 		cfg.ClientPublicKey = *device.PublicKey
@@ -417,6 +446,35 @@ func (s *Service) PublicStunConfig(requestHost string) PublicStunConfig {
 		SelfHostedStunServer: selfHosted,
 		StunServers:          servers,
 		StunTurnPort:         s.cfg.StunTurnPort,
+	}
+}
+
+// PublicIceConfig returns browser-compatible STUN/TURN URLs and short-lived credentials.
+func (s *Service) PublicIceConfig(requestHost string) PublicIceConfig {
+	stun := s.PublicStunConfig(requestHost)
+	servers := make([]IceServer, 0, len(stun.StunServers)+1)
+	for _, value := range stun.StunServers {
+		servers = append(servers, IceServer{URLs: value})
+	}
+	if s != nil && s.Enabled() {
+		host := normalizeStunHost(s.resolvePeerHost(requestHost))
+		if strings.TrimSpace(host) != "" && s.cfg.StunTurnPort > 0 {
+			if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+				host = "[" + host + "]"
+			}
+			credential := s.turnCredentials.issue("public-transfer")
+			servers = append(servers, IceServer{
+				URLs:       "turn:" + host + ":" + strconv.Itoa(s.cfg.StunTurnPort) + "?transport=udp",
+				Username:   credential.Username,
+				Credential: credential.Credential,
+			})
+		}
+	}
+	return PublicIceConfig{
+		PeerMeshEnabled:  stun.PeerMeshEnabled,
+		IceServers:       servers,
+		TurnAuthRequired: s != nil && s.cfg.TurnAuthRequired,
+		StunTurnPort:     stun.StunTurnPort,
 	}
 }
 
@@ -651,7 +709,7 @@ func (s *Service) CreateACL(ctx context.Context, access AccessContext, mutation 
 	if source.ID == target.ID {
 		return ACLView{}, errors.New("source and target cannot be the same client")
 	}
-	if !access.Admin && !strings.EqualFold(normalizeOwner(target.OwnerUsername), access.Username) {
+	if !access.Admin && normalizeOwner(target.OwnerUsername) != access.Username {
 		return ACLView{}, errors.New("普通用户不能创建跨用户 peer ACL")
 	}
 	acl, err := s.db.FindPeerMeshACL(ctx, access.TenantID, source.ID, target.ID)
@@ -660,7 +718,10 @@ func (s *Service) CreateACL(ctx context.Context, access AccessContext, mutation 
 	}
 	now := time.Now()
 	if acl == nil {
-		acl = &store.PeerMeshACL{ID: auth.NewClientID(), TenantID: access.TenantID, CreatedAt: now}
+		acl = &store.PeerMeshACL{
+			ID: auth.NewClientID(), TenantID: access.TenantID,
+			Direction: "OUTBOUND", CreatedAt: now,
+		}
 	}
 	allowed := true
 	if mutation.Allowed != nil {
@@ -672,6 +733,13 @@ func (s *Service) CreateACL(ctx context.Context, access AccessContext, mutation 
 	acl.TargetClientID = target.ID
 	acl.TargetClientName = target.ClientName
 	acl.Allowed = allowed
+	if mutation.Direction != nil {
+		direction := strings.ToUpper(*mutation.Direction)
+		if direction != "OUTBOUND" && direction != "INBOUND" && direction != "BOTH" {
+			return ACLView{}, fmt.Errorf("invalid direction: %s", *mutation.Direction)
+		}
+		acl.Direction = direction
+	}
 	acl.UpdatedAt = now
 	if acl.CreatedAt.IsZero() {
 		acl.CreatedAt = now
@@ -695,7 +763,7 @@ func (s *Service) DeleteACL(ctx context.Context, access AccessContext, id int64)
 	if err != nil {
 		return err
 	}
-	if !strings.EqualFold(acl.TenantID, access.TenantID) || (!access.Admin && !strings.EqualFold(acl.OwnerUsername, access.Username)) {
+	if acl.TenantID != access.TenantID || (!access.Admin && acl.OwnerUsername != access.Username) {
 		return store.ErrNotFound
 	}
 	return s.db.DeletePeerMeshACL(ctx, id)
@@ -899,7 +967,7 @@ func (s *Service) CloseOpenSessionsForDevice(ctx context.Context, access AccessC
 }
 
 func (s *Service) CanPeer(ctx context.Context, source, target store.ClientAccount) (bool, error) {
-	if !strings.EqualFold(source.TenantID, target.TenantID) {
+	if source.TenantID != target.TenantID {
 		return false, nil
 	}
 	sourceDevice, err := s.db.FindPeerMeshDeviceByClientID(ctx, source.TenantID, source.ID)
@@ -910,14 +978,21 @@ func (s *Service) CanPeer(ctx context.Context, source, target store.ClientAccoun
 	if err != nil || targetDevice == nil || !targetDevice.Enabled {
 		return false, err
 	}
-	if strings.EqualFold(normalizeOwner(source.OwnerUsername), normalizeOwner(target.OwnerUsername)) {
+	if normalizeOwner(source.OwnerUsername) == normalizeOwner(target.OwnerUsername) {
 		return true, nil
 	}
-	acl, err := s.db.FindPeerMeshACL(ctx, source.TenantID, source.ID, target.ID)
-	if err != nil || acl == nil {
+	forward, err := s.db.FindPeerMeshACL(ctx, source.TenantID, source.ID, target.ID)
+	if err != nil {
 		return false, err
 	}
-	return acl.Allowed, nil
+	if forward != nil && forward.Allowed && (forward.Direction == "OUTBOUND" || forward.Direction == "BOTH") {
+		return true, nil
+	}
+	reverse, err := s.db.FindPeerMeshACL(ctx, source.TenantID, target.ID, source.ID)
+	if err != nil {
+		return false, err
+	}
+	return reverse != nil && reverse.Allowed && (reverse.Direction == "INBOUND" || reverse.Direction == "BOTH"), nil
 }
 
 func (s *Service) CreateSession(ctx context.Context, source, target store.ClientAccount, pathType string) (sessionGrant, error) {
@@ -1229,7 +1304,7 @@ func (s *Service) findAccessibleDevice(ctx context.Context, access AccessContext
 		}
 		return nil, store.ErrNotFound
 	}
-	if access.Admin || strings.EqualFold(device.OwnerUsername, access.Username) {
+	if access.Admin || device.OwnerUsername == access.Username {
 		return device, nil
 	}
 	return nil, store.ErrNotFound
@@ -1240,7 +1315,7 @@ func (s *Service) findClient(ctx context.Context, access AccessContext, clientID
 	if err != nil {
 		return nil, err
 	}
-	if !access.Admin && !strings.EqualFold(account.OwnerUsername, access.Username) {
+	if !access.Admin && account.OwnerUsername != access.Username {
 		return nil, store.ErrNotFound
 	}
 	if createDevice {
@@ -1256,7 +1331,7 @@ func (s *Service) findTenantClient(ctx context.Context, tenantID string, clientI
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(account.TenantID, tenantID) {
+	if account.TenantID != tenantID {
 		return nil, store.ErrNotFound
 	}
 	return account, nil
@@ -1269,8 +1344,8 @@ func (s *Service) visibleClientIDs(ctx context.Context, access AccessContext) ([
 	}
 	var ids []int64
 	for _, client := range clients {
-		if strings.EqualFold(client.TenantID, access.TenantID) &&
-			(access.Admin || strings.EqualFold(client.OwnerUsername, access.Username)) {
+		if client.TenantID == access.TenantID &&
+			(access.Admin || client.OwnerUsername == access.Username) {
 			ids = append(ids, client.ID)
 		}
 	}
@@ -1282,7 +1357,7 @@ func (s *Service) findAccessibleSession(ctx context.Context, access AccessContex
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(item.TenantID, access.TenantID) {
+	if item.TenantID != access.TenantID {
 		return nil, store.ErrNotFound
 	}
 	if access.Admin {
@@ -1308,7 +1383,7 @@ func (s *Service) findReportableSession(ctx context.Context, reporter store.Clie
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(item.TenantID, reporter.TenantID) ||
+	if item.TenantID != reporter.TenantID ||
 		(item.SourceClientID != reporter.ID && item.TargetClientID != reporter.ID) {
 		return nil, errors.New("peer session report source mismatch")
 	}
@@ -1322,7 +1397,7 @@ func (s *Service) rosterRefreshTargets(ctx context.Context, account store.Client
 	}
 	out := make([]store.ClientAccount, 0, len(clients))
 	for _, client := range clients {
-		if strings.EqualFold(client.TenantID, account.TenantID) {
+		if client.TenantID == account.TenantID {
 			out = append(out, client)
 		}
 	}
@@ -1499,7 +1574,7 @@ func aclView(acl store.PeerMeshACL) ACLView {
 	return ACLView{
 		ID: acl.ID, SourceClientID: acl.SourceClientID, SourceClientName: acl.SourceClientName,
 		TargetClientID: acl.TargetClientID, TargetClientName: acl.TargetClientName,
-		Allowed: acl.Allowed, CreatedAt: acl.CreatedAt.Format(time.RFC3339Nano),
+		Allowed: acl.Allowed, Direction: acl.Direction, CreatedAt: acl.CreatedAt.Format(time.RFC3339Nano),
 		UpdatedAt: acl.UpdatedAt.Format(time.RFC3339Nano),
 	}
 }

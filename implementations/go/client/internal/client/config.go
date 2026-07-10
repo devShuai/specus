@@ -75,6 +75,8 @@ type PeerMeshConfig struct {
 	PublicStunServers []string `json:"publicStunServers"`
 	IceUsername       string   `json:"iceUsername"`
 	IceCredential     string   `json:"iceCredential"`
+	IceRealm          string   `json:"iceRealm"`
+	IceNonce          string   `json:"iceNonce"`
 	ServerPublicKey   string   `json:"serverPublicKey"`
 	ClientPublicKey   string   `json:"clientPublicKey"`
 	SessionTTLSeconds int64    `json:"sessionTtlSeconds"`

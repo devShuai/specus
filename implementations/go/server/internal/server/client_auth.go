@@ -26,17 +26,26 @@ type clientAuthLoginRequest struct {
 }
 
 type clientEnvironmentInfo struct {
-	MachineFingerprint string   `json:"machineFingerprint"`
-	Hostname           string   `json:"hostname"`
-	OSUser             string   `json:"osUser"`
-	OSName             string   `json:"osName"`
-	OSVersion          string   `json:"osVersion"`
-	OSArch             string   `json:"osArch"`
-	ClientVersion      string   `json:"clientVersion"`
-	JavaVersion        string   `json:"javaVersion"`
-	PeerPublicKey      string   `json:"peerPublicKey"`
-	LocalAddresses     []string `json:"localAddresses"`
-	StartedAt          string   `json:"startedAt"`
+	MachineFingerprint        string                    `json:"machineFingerprint"`
+	Hostname                  string                    `json:"hostname"`
+	OSUser                    string                    `json:"osUser"`
+	OSName                    string                    `json:"osName"`
+	OSVersion                 string                    `json:"osVersion"`
+	OSArch                    string                    `json:"osArch"`
+	ClientVersion             string                    `json:"clientVersion"`
+	JavaVersion               string                    `json:"javaVersion"`
+	PeerPublicKey             string                    `json:"peerPublicKey"`
+	ClientMessageCapabilities clientMessageCapabilities `json:"clientMessageCapabilities"`
+	LocalAddresses            []string                  `json:"localAddresses"`
+	StartedAt                 string                    `json:"startedAt"`
+}
+
+type clientMessageCapabilities struct {
+	SendMessages       bool  `json:"sendMessages"`
+	ReceiveMessages    bool  `json:"receiveMessages"`
+	Attachments        bool  `json:"attachments"`
+	MediaPreview       bool  `json:"mediaPreview"`
+	MaxAttachmentBytes int64 `json:"maxAttachmentBytes"`
 }
 
 type clientAuthLoginResponse struct {
@@ -119,25 +128,30 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		ttl)
 	now := time.Now()
 	if err := a.db.InsertClientSession(r.Context(), store.ClientSession{
-		ID:                 session.ID,
-		TenantID:           session.TenantID,
-		CredentialID:       credential.ID,
-		IdentityID:         identity.ID,
-		ClientID:           account.ID,
-		ClientName:         account.ClientName,
-		TokenHash:          session.TokenHash,
-		Status:             auth.StatusHTTPAuthenticated,
-		MachineFingerprint: machineFingerprint,
-		OSUser:             osUser,
-		Hostname:           limitedTextPtr(request.Environment.Hostname, 160),
-		OSName:             limitedTextPtr(request.Environment.OSName, 120),
-		OSVersion:          limitedTextPtr(request.Environment.OSVersion, 80),
-		OSArch:             limitedTextPtr(request.Environment.OSArch, 60),
-		ClientVersion:      limitedTextPtr(request.Environment.ClientVersion, 80),
-		JavaVersion:        limitedTextPtr(request.Environment.JavaVersion, 80),
-		LocalAddresses:     limitedTextPtr(strings.Join(request.Environment.LocalAddresses, ","), 2000),
-		HTTPLoginAt:        now,
-		ExpiresAt:          session.ExpiresAt,
+		ID:                         session.ID,
+		TenantID:                   session.TenantID,
+		CredentialID:               credential.ID,
+		IdentityID:                 identity.ID,
+		ClientID:                   account.ID,
+		ClientName:                 account.ClientName,
+		TokenHash:                  session.TokenHash,
+		Status:                     auth.StatusHTTPAuthenticated,
+		MachineFingerprint:         machineFingerprint,
+		OSUser:                     osUser,
+		Hostname:                   limitedTextPtr(request.Environment.Hostname, 160),
+		OSName:                     limitedTextPtr(request.Environment.OSName, 120),
+		OSVersion:                  limitedTextPtr(request.Environment.OSVersion, 80),
+		OSArch:                     limitedTextPtr(request.Environment.OSArch, 60),
+		ClientVersion:              limitedTextPtr(request.Environment.ClientVersion, 80),
+		JavaVersion:                limitedTextPtr(request.Environment.JavaVersion, 80),
+		LocalAddresses:             limitedTextPtr(strings.Join(request.Environment.LocalAddresses, ","), 2000),
+		MessageSendCapable:         request.Environment.ClientMessageCapabilities.SendMessages,
+		MessageReceiveCapable:      request.Environment.ClientMessageCapabilities.ReceiveMessages,
+		MessageAttachmentsCapable:  request.Environment.ClientMessageCapabilities.Attachments,
+		MessageMediaPreviewCapable: request.Environment.ClientMessageCapabilities.MediaPreview,
+		MessageMaxAttachmentBytes:  max64(0, request.Environment.ClientMessageCapabilities.MaxAttachmentBytes),
+		HTTPLoginAt:                now,
+		ExpiresAt:                  session.ExpiresAt,
 	}); err != nil {
 		writeClientAuthError(w, http.StatusInternalServerError, "保存客户端会话失败")
 		return
@@ -185,6 +199,13 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+func max64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthLoginRequest) (*store.ClientCredential, error) {

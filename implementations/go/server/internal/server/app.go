@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
@@ -21,6 +22,7 @@ import (
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/web"
 )
@@ -36,27 +38,33 @@ var errUnauthenticated = errors.New("packet on unauthenticated channel")
 
 // App is the composed server: store + control channel + management HTTP surface.
 type App struct {
-	cfg         config.Config
-	logger      *slog.Logger
-	db          *store.DB
-	sessions    *session.Registry
-	executor    *control.LoginExecutor
-	listener    *control.Listener
-	dispatcher  *Dispatcher
-	traffic     *nat.TrafficService
-	natControl  *nat.ControlService
-	remotePorts *nat.RemotePortManager
-	tokens      *security.LocalTokenService
-	directHTTP  *directhttp.Service
-	wsHub       *wsevents.Hub
-	api         *management.API
-	peerMesh    *peermesh.Service
-	tlsConfig   *tls.Config
-	clientAuth  *auth.SessionStore
+	cfg                     config.Config
+	logger                  *slog.Logger
+	db                      *store.DB
+	sessions                *session.Registry
+	executor                *control.LoginExecutor
+	listener                *control.Listener
+	dispatcher              *Dispatcher
+	traffic                 *nat.TrafficService
+	natControl              *nat.ControlService
+	remotePorts             *nat.RemotePortManager
+	tokens                  *security.LocalTokenService
+	directHTTP              *directhttp.Service
+	wsHub                   *wsevents.Hub
+	api                     *management.API
+	peerMesh                *peermesh.Service
+	tlsConfig               *tls.Config
+	clientAuth              *auth.SessionStore
+	clientMessages          *clientMessagesHub
+	publicTransferDiscovery *publicTransferDiscoveryHub
+	attachments             *transfer.Service
 }
 
 // New opens the database, applies the schema, seeds the demo client, and builds the app.
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
+	if cfg.Netty.MaxFrameSize < protocol.FrameHeaderSize {
+		return nil, fmt.Errorf("netty max frame size must be at least %d", protocol.FrameHeaderSize)
+	}
 	db, err := store.Open(cfg.Database.Provider, cfg.ConnectionString)
 	if err != nil {
 		return nil, err
@@ -137,13 +145,14 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	tokens := security.NewLocalTokenService(cfg.Auth)
 	oidcValidator := security.NewOidcValidator(cfg.Oidc)
 	peerMesh := peermesh.New(cfg.PeerMesh, db, sessions, logger)
+	attachments := transfer.NewService(db, cfg.ObjectStorage, cfg.PublicTransfer)
 	directHTTP := directhttp.NewService(sessions,
 		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
 		cfg.HTTP.RewriteMaxBodyBytes, traffic, db, db, detailOptions)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
-		}, peerMesh)
+		}, peerMesh, attachments)
 	wsHub := wsevents.NewHub(api.ValidateConnectionWebSocketToken, func(access wsevents.Access, event wsevents.Event) bool {
 		if access.Admin {
 			return true
@@ -155,6 +164,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return err == nil && account != nil &&
 			account.TenantID == access.TenantID && account.OwnerUsername == access.Username
 	})
+	clientMessages := newClientMessagesHub(db, sessions, api.ValidateConnectionWebSocketToken, logger)
+	publicTransferDiscovery := newPublicTransferDiscoveryHub(cfg.PublicTransfer)
 
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
@@ -171,6 +182,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	})
 	dispatcher.SetOnDisconnect(coordinator.Close)
 	dispatcher.SetDirectHTTPAck(directHTTP.Ack)
+	dispatcher.SetClientMessageHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
+		return (&App{db: db, sessions: sessions, peerMesh: peerMesh, clientMessages: clientMessages, logger: logger}).handleClientMessage(conn, request)
+	})
 	dispatcher.SetOnConnectionEvent(func(eventType string, record store.ConnectionRecord) {
 		wsHub.Broadcast(wsevents.Event{
 			TenantID:   record.TenantID,
@@ -190,23 +204,26 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	})
 
 	return &App{
-		cfg:         cfg,
-		logger:      logger,
-		db:          db,
-		sessions:    sessions,
-		executor:    executor,
-		listener:    listener,
-		dispatcher:  dispatcher,
-		traffic:     traffic,
-		natControl:  natControl,
-		remotePorts: remotePorts,
-		tokens:      tokens,
-		directHTTP:  directHTTP,
-		wsHub:       wsHub,
-		api:         api,
-		peerMesh:    peerMesh,
-		tlsConfig:   tlsConfig,
-		clientAuth:  clientSessions,
+		cfg:                     cfg,
+		logger:                  logger,
+		db:                      db,
+		sessions:                sessions,
+		executor:                executor,
+		listener:                listener,
+		dispatcher:              dispatcher,
+		traffic:                 traffic,
+		natControl:              natControl,
+		remotePorts:             remotePorts,
+		tokens:                  tokens,
+		directHTTP:              directHTTP,
+		wsHub:                   wsHub,
+		api:                     api,
+		peerMesh:                peerMesh,
+		tlsConfig:               tlsConfig,
+		clientAuth:              clientSessions,
+		clientMessages:          clientMessages,
+		publicTransferDiscovery: publicTransferDiscovery,
+		attachments:             attachments,
 	}, nil
 }
 
@@ -238,6 +255,7 @@ func (a *App) Run(ctx context.Context) error {
 	go a.traffic.Run(ctx)
 	go a.peerMesh.Run(ctx)
 	go a.peerMesh.RunStunTurn(ctx)
+	go a.attachments.RunExpiration(ctx)
 	go a.db.RunTrafficDetailFlush(ctx,
 		time.Duration(a.cfg.Traffic.CaptureFlushIntervalMs)*time.Millisecond,
 		func(err error) { a.logger.Error("traffic detail flush failed", "err", err) })
@@ -294,6 +312,8 @@ func (a *App) managementHandler() http.Handler {
 	mux.Handle("/http/{clientName}/{route}/{rest...}", a.directHTTP)
 	mux.Handle("/http/{clientName}/{route}", a.directHTTP)
 	mux.Handle("/ws/connections", a.wsHub)
+	mux.Handle("/ws/client-messages", a.clientMessages)
+	mux.Handle("/ws/public-transfer/discovery", a.publicTransferDiscovery)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -301,22 +321,73 @@ func (a *App) managementHandler() http.Handler {
 	})
 
 	fileServer := http.FileServerFS(web.StaticFS())
-	mux.Handle("/", fileServer)
+	mux.Handle("/", staticResourceCacheHeaders(fileServer))
 
-	return securityHeaders(mux)
+	return securityHeaders(mux, a.cfg.ObjectStorage)
 }
 
-// securityHeaders adds the CSP and related response headers, mirroring the C# SecurityConfig.
-func securityHeaders(next http.Handler) http.Handler {
+func staticResourceCacheHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		header := w.Header()
-		header.Set("Content-Security-Policy",
-			"default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'")
-		header.Set("X-Content-Type-Options", "nosniff")
-		header.Set("X-Frame-Options", "DENY")
-		header.Set("Referrer-Policy", "no-referrer")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/assets/"):
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		case strings.HasPrefix(r.URL.Path, "/schemas/"):
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+		case r.URL.Path == "/favicon.ico" || r.URL.Path == "/favicon.svg" ||
+			r.URL.Path == "/logo.svg" || r.URL.Path == "/gtag-init.js":
+			w.Header().Set("Cache-Control", "public, max-age=604800")
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// securityHeaders adds the CSP and related response headers, mirroring the Java SecurityConfig.
+func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig) http.Handler {
+	ossSuffix := ""
+	if origin := objectStorageCSPOrigin(objectStorage); origin != "" {
+		ossSuffix = " " + origin
+	}
+	policy := "default-src 'self'; " +
+		"script-src 'self' https://www.googletagmanager.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE='; " +
+		"style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; " +
+		"media-src 'self' blob: data:" + ossSuffix + "; " +
+		"object-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; " +
+		"connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; " +
+		"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := w.Header()
+		header.Set("Content-Security-Policy", policy)
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("X-Frame-Options", "DENY")
+		header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func objectStorageCSPOrigin(cfg config.ObjectStorageConfig) string {
+	if !strings.EqualFold(strings.TrimSpace(cfg.Provider), "aliyun-oss") {
+		return ""
+	}
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	bucket := strings.TrimSpace(cfg.Bucket)
+	if endpoint == "" || bucket == "" {
+		return ""
+	}
+	lowerEndpoint := strings.ToLower(endpoint)
+	if strings.HasPrefix(lowerEndpoint, "https://") {
+		endpoint = endpoint[len("https://"):]
+	} else if strings.HasPrefix(lowerEndpoint, "http://") {
+		endpoint = endpoint[len("http://"):]
+	}
+	if slash := strings.IndexByte(endpoint, '/'); slash >= 0 {
+		endpoint = endpoint[:slash]
+	}
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+	return "https://" + bucket + "." + endpoint
 }
 
 func toConnectionView(record store.ConnectionRecord) wsevents.ConnectionView {

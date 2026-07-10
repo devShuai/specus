@@ -2,11 +2,52 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestReadFrameLimitCountsHeaderBytes(t *testing.T) {
+	const fullFrameLimit = 64
+	validBody := bytes.Repeat([]byte{0x2a}, fullFrameLimit-FrameHeaderSize)
+	var frame bytes.Buffer
+	header := make([]byte, FrameHeaderSize)
+	binary.BigEndian.PutUint32(header[:4], MagicNumber)
+	header[6] = byte(CommandHeartbeatRequest)
+	binary.BigEndian.PutUint32(header[7:11], uint32(len(validBody)))
+	frame.Write(header)
+	frame.Write(validBody)
+	_, body, err := ReadFrameLimit(&frame, fullFrameLimit)
+	if err != nil || len(body) != len(validBody) {
+		t.Fatalf("boundary frame rejected: body=%d err=%v", len(body), err)
+	}
+
+	binary.BigEndian.PutUint32(header[7:11], uint32(fullFrameLimit-FrameHeaderSize+1))
+	if _, _, err := ReadFrameLimit(bytes.NewReader(header), fullFrameLimit); err == nil {
+		t.Fatal("body that makes the full frame exceed the limit was accepted")
+	}
+}
+
+func TestFrameLimitEqualToHeaderAcceptsZeroBodyAndSmallerIsRejected(t *testing.T) {
+	header := make([]byte, FrameHeaderSize)
+	binary.BigEndian.PutUint32(header[:4], MagicNumber)
+	header[6] = byte(CommandHeartbeatRequest)
+	if command, body, err := ReadFrameLimit(bytes.NewReader(header), FrameHeaderSize); err != nil ||
+		command != CommandHeartbeatRequest || len(body) != 0 {
+		t.Fatalf("11-byte zero-body frame rejected: command=%d body=%d err=%v", command, len(body), err)
+	}
+	if _, _, err := ReadFrameLimit(bytes.NewReader(nil), FrameHeaderSize-1); err == nil {
+		t.Fatal("frame limit smaller than the header was accepted")
+	}
+	if _, err := EncodeFrameLimit(HeartbeatRequest{}, FrameHeaderSize-1); err == nil {
+		t.Fatal("encode frame limit smaller than the header was accepted")
+	}
+	if _, err := EncodeFrameLimit(HeartbeatRequest{}, FrameHeaderSize); err == nil {
+		t.Fatal("one-byte CompactBinary body fit into a header-only frame limit")
+	}
+}
 
 func readFixture(t *testing.T, name string) []byte {
 	t.Helper()

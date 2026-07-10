@@ -45,6 +45,10 @@ func TestClientAuthLoginUsesCredentialTenant(t *testing.T) {
 	if session.MachineFingerprint != "machine-tenant-a" || session.OSUser != "alice" {
 		t.Fatalf("unexpected persisted environment: %+v", session)
 	}
+	if !session.MessageSendCapable || !session.MessageReceiveCapable || !session.MessageAttachmentsCapable ||
+		!session.MessageMediaPreviewCapable || session.MessageMaxAttachmentBytes != 123456 {
+		t.Fatalf("client message capabilities were not persisted: %+v", session)
+	}
 }
 
 func TestClientAuthLoginUsesClientAuthTokenTTL(t *testing.T) {
@@ -177,6 +181,10 @@ func clientAuthLoginForTest(t *testing.T, baseURL, apiKey, secret, machineFinger
 		"osName":             "test-os",
 		"osArch":             "amd64",
 		"localAddresses":     []string{"10.1.2.3"},
+		"clientMessageCapabilities": map[string]any{
+			"sendMessages": true, "receiveMessages": true, "attachments": true,
+			"mediaPreview": true, "maxAttachmentBytes": 123456,
+		},
 	}
 	request := map[string]any{
 		"apiKey":      apiKey,
