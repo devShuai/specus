@@ -46,7 +46,7 @@
         "darwin-utun",
         "auto"
       ],
-      "description": "Peer Mesh 虚拟网卡模式。Java 参考客户端当前支持 Linux TUN 与 Windows Wintun；Go/.NET 客户端额外支持 macOS utun；noop 表示不创建虚拟网卡。"
+      "description": "Peer Mesh 虚拟网卡模式。Java、Go、.NET 客户端支持 Linux TUN、Windows Wintun，并提供实验性 macOS utun；noop 表示不创建虚拟网卡。"
     },
     "peerMeshTunName": {
       "type": "string",

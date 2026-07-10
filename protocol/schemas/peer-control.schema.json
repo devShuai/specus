@@ -166,6 +166,27 @@
         },
         "online": {
           "type": "boolean"
+        },
+        "messageSendCapable": {
+          "type": "boolean",
+          "default": false
+        },
+        "messageReceiveCapable": {
+          "type": "boolean",
+          "default": false
+        },
+        "messageAttachmentsCapable": {
+          "type": "boolean",
+          "default": false
+        },
+        "messageMediaPreviewCapable": {
+          "type": "boolean",
+          "default": false
+        },
+        "messageMaxAttachmentBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
         }
       }
     },
@@ -221,6 +242,14 @@
           "minimum": 0,
           "maximum": 65535
         },
+        "publicStunServers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
         "iceUsername": {
           "type": [
             "string",
@@ -228,6 +257,18 @@
           ]
         },
         "iceCredential": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iceRealm": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iceNonce": {
           "type": [
             "string",
             "null"

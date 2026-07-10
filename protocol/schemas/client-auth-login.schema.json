@@ -56,6 +56,33 @@
         }
       ]
     },
+    "ClientMessageCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sendMessages": {
+          "type": "boolean",
+          "default": false
+        },
+        "receiveMessages": {
+          "type": "boolean",
+          "default": false
+        },
+        "attachments": {
+          "type": "boolean",
+          "default": false
+        },
+        "mediaPreview": {
+          "type": "boolean",
+          "default": false
+        },
+        "maxAttachmentBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    },
     "ClientEnvironmentInfo": {
       "type": "object",
       "additionalProperties": false,
@@ -93,6 +120,10 @@
         "peerPublicKey": {
           "$ref": "#/$defs/Base64String",
           "description": "Peer Mesh X25519 public key，未启用时可为空或缺省。"
+        },
+        "clientMessageCapabilities": {
+          "$ref": "#/$defs/ClientMessageCapabilities",
+          "description": "客户端消息、附件和媒体预览能力；缺省时按全部关闭处理。"
         },
         "localAddresses": {
           "type": "array",
@@ -250,6 +281,14 @@
           "minimum": 0,
           "maximum": 65535
         },
+        "publicStunServers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
         "iceUsername": {
           "type": [
             "string",
@@ -257,6 +296,18 @@
           ]
         },
         "iceCredential": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iceRealm": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iceNonce": {
           "type": [
             "string",
             "null"

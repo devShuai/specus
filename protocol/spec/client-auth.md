@@ -61,6 +61,13 @@ Content-Type: application/json
     "clientVersion": "1.0-SNAPSHOT",
     "javaVersion": "21.0.11",
     "peerPublicKey": "base64-x25519-public-key",
+    "clientMessageCapabilities": {
+      "sendMessages": false,
+      "receiveMessages": false,
+      "attachments": false,
+      "mediaPreview": false,
+      "maxAttachmentBytes": 0
+    },
     "localAddresses": ["192.168.1.10"],
     "startedAt": "2026-06-24T00:00:00Z"
   }
@@ -99,6 +106,20 @@ signature = HEX(HMAC_SHA256(key, message))
 - 自动生成客户端名。
 - 展示主机、操作系统、Java 版本和本地地址。
 - Peer Mesh 分配虚拟 IP 和保存设备公钥。
+- 在 Peer roster 中发布当前客户端的消息、附件和媒体预览能力。
+
+`environment.clientMessageCapabilities` 是可选能力声明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `sendMessages` | 客户端能否主动发送点对点消息 |
+| `receiveMessages` | 客户端能否接收点对点消息 |
+| `attachments` | 客户端能否处理附件 |
+| `mediaPreview` | 客户端能否预览媒体附件 |
+| `maxAttachmentBytes` | 客户端声明的单附件最大字节数；`0` 表示没有声明 peer-specific 上限，不表示无限制，也不覆盖服务端对象存储上限 |
+
+字段整体缺省时按全部 `false`、大小 `0` 处理，兼容旧客户端。只有 `attachments=true` 才表示附件能力可用；
+若同时 `maxAttachmentBytes=0`，发送端不能据此承诺任意大小，只能依赖服务端上传接口的配置上限和实际返回结果。
 
 ## HTTP 登录响应
 
@@ -132,8 +153,11 @@ signature = HEX(HMAC_SHA256(key, message))
     "stunPort": 3478,
     "turnHost": "",
     "turnPort": 3478,
+    "publicStunServers": [],
     "iceUsername": null,
     "iceCredential": null,
+    "iceRealm": null,
+    "iceNonce": null,
     "serverPublicKey": null,
     "clientPublicKey": null,
     "sessionTtlSeconds": 3600
@@ -187,6 +211,16 @@ HTTP 登录成功后，客户端建立控制连接并发送 `LOGIN_REQUEST`：
 - Peer Mesh 开启时下发可互联 roster。
 
 登录失败后服务端会主动关闭连接。客户端会按失败原因决定重试、刷新 token 或停止重连。
+
+### runtime token 的重放与传输边界
+
+`accessToken` 是在过期前可复用的 bearer token，不是一次性 token。普通断线重连会继续使用同一
+`clientSessionId + accessToken`；它当前不绑定某条 TCP channel、TLS session、源 IP 或设备公钥。
+服务端仍会校验 session 过期、客户端/凭证启用状态、同机用户实例数和凭证最大在线实例数，但截获 token 的
+一方在这些约束和 TTL 内仍可能尝试重放。
+
+因此生产部署必须为 HTTP 登录和控制连接启用 TLS，并避免把 token 写入日志、命令行或可被其他用户读取的
+配置。文档中的 `http://127.0.0.1` 只用于本机开发示例；它不是公网安全部署方式。
 
 ## token 刷新
 

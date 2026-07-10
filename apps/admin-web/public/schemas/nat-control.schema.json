@@ -17,7 +17,10 @@
       "description": "目标客户端名。"
     },
     "remoteAddress": {
-      "type": "string",
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "服务端公网地址，可为空，主要用于展示。"
     },
     "remotePort": {

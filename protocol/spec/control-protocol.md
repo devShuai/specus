@@ -17,6 +17,19 @@
 
 Netty pipeline 中 `Spliter` 负责按 `magic + length` 切帧，`PacketDecoder` / `PacketEncoder` 负责调用 `PacketCodec` 编解码。
 
+### 长度与拒绝边界
+
+- `length` 是有符号 big-endian int32，必须大于等于 `0`，且只能覆盖当前帧的 body。
+- 跨语言默认兼容上限是**完整帧（11 字节头 + body）不超过 `32 MiB`**。Java、Go、C# client
+  都固定使用 `32 MiB`；Java、Go、C# server 可配置接收上限，C server 固定为 `32 MiB`。为了能与所有
+  当前实现互通，发送方不能依赖服务端放大后的值。
+- Java、Go、C#、C 与 Android 当前都按完整帧检查上限：合法 body 最大值为“配置的完整帧上限减去
+  11 字节头”。`TUNNEL_NETTY_MAX_FRAME_SIZE` 在 Java、Go、C# server 中也采用这一口径；跨语言发送方
+  不得把配置值误当作 body 上限。
+- `NAT_MESSAGE.metaDataLength` 必须满足 `0 <= metaDataLength <= length - 8`；其余字节才是可选 data payload。
+  NAT metadata 和 data 没有独立于主帧的更大额度。
+- 非法 magic、负长度、超过上限、截断 body、越界 metadata 都应拒绝，不能继续分配相应长度的内存。
+
 ## `Command`
 
 | 指令 | 数值 | 消息体 | 方向 | 说明 |
@@ -50,7 +63,9 @@ Netty pipeline 中 `Spliter` 负责按 `magic + length` 切帧，`PacketDecoder`
 
 - 原始对象 schema 编码结果大于等于 `64` 字节时尝试 deflate。
 - 压缩后更短才使用 `payloadType=1`。
-- 解压上限为 `16 MiB`，超过会拒绝。
+- `payloadType=1` 解压后的 schema payload 上限为 `16 MiB`，超过会拒绝；`payloadType=0` 没有第二个
+  serializer 上限，但仍受上述 `32 MiB` 完整帧上限约束。
+- raw-deflate 必须包含正常结束的 final block；截断流或只 flush、未 finish 的流即使已经产出看似完整的明文也必须拒绝。
 - 字符串使用 UTF-8，空值用长度标记 `0` 表示。
 - `int` 使用无符号 varint；可空 `long` 使用 `0/1` 标记加 ZigZag varlong。
 
@@ -160,7 +175,7 @@ Netty pipeline 中 `Spliter` 负责按 `magic + length` 切帧，`PacketDecoder`
 | `DATA` | `5` | 双向数据 payload |
 | `KEEPALIVE` | `6` | 保活 |
 | `UNREGISTER` | `7` | 取消端口注册 |
-| `HTTP_ROUTES_REPORT` | `8` | 客户端上报当前 HTTP route 快照，仅用于展示和诊断 |
+| `HTTP_ROUTES_REPORT` | `8` | 历史兼容编号；Java/C# 客户端每个控制会话仍单次发送诊断快照，现行 Java server 以后台持久化配置为权威并明确忽略该消息 |
 
 常见 `metaData` 字段：
 
@@ -184,4 +199,12 @@ TCP 端口映射流程：
 5. 双方用 `DATA(channelId)` 传输字节。
 6. 任一端关闭后发送 `DISCONNECTED(channelId)`。
 
+`DATA` 是 TCP 字节流的任意切片，不形成应用层消息边界；单帧仍受主帧上限约束。控制连接本身是 TCP，
+因此同一 channel 的 DATA 依赖底层有序可靠传输，NAT 子协议不再增加 sequence、ACK 或重传。当前协议没有
+half-close 表示，任一侧 EOF/关闭都会收敛为 `DISCONNECTED` 并完整关闭对应连接。水位线和暂停读取属于各实现
+的背压策略，不改变 wire 格式。
+
 WebSocket 隧道复用 `NAT_MESSAGE`，但 `DATA.data[0]` 是帧类型前缀：`0x01` 表示 TextFrame，`0x02` 表示 BinaryFrame。
+
+`HTTP_ROUTES_REPORT` 保留是为了旧客户端、跨语言 fixture 和枚举序号兼容，不代表服务端接纳客户端上报作为配置来源；
+管理端不得用该消息推断当前权威 route 状态。

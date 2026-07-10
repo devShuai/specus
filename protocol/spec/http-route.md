@@ -107,7 +107,17 @@ target = targetBaseUrl + relativePath + ?rawQuery
 - `bytes=0-999999999` 会收敛为 `bytes=0-8388607`。
 - 多段 Range 或非 bytes Range 不做改写。
 
-响应体限制为 `64 MiB`。超过限制时客户端返回 `502` 和错误信息。
+Java client 从上游读取响应体时设置了 `64 MiB` 本地读取上限，超过时返回 `502`。这不是当前控制连接能保证
+传输的响应大小：`DIRECT_HTTP_RESPONSE` 仍是单个 CompactBinary 控制帧，默认完整帧上限为 `32 MiB`，而
+deflate payload 解压后上限为 `16 MiB`。因此当前实现的有效上限取决于序列化开销和内容可压缩性：
+
+- 不可压缩响应最终受完整帧 `32 MiB` 上限约束；
+- 会被 deflate 的响应，其解压后完整 schema payload 超过 `16 MiB` 会被接收端拒绝；
+- 跨语言稳定使用场景应把单次响应控制在 `16 MiB` 以下，并为 headers、字段和长度编码预留空间；
+- `64 MiB` 只是客户端读取防护值，不能作为端到端能力承诺。当前协议没有响应分片机制。
+
+同理，请求入口虽然默认限制 body 为 `16 MiB`，但请求包的完整 schema payload 还包含 method、route、路径和
+headers；接近边界时必须预留这些字段的序列化开销。
 
 ## `DIRECT_HTTP_RESPONSE`
 
@@ -169,6 +179,10 @@ text/ecmascript
 4. `data[0]` 表示帧类型：`0x01` 为 TextFrame，`0x02` 为 BinaryFrame。
 5. 客户端连接内网 WebSocket 服务后，双向转发 DATA。
 6. 任一端关闭时发送 `DISCONNECTED(channelId)`。
+
+当前隧道只保留完整 Text 和 Binary frame，并在 DATA 前加上述单字节类型。Ping/Pong、Close code/reason、
+RSV 位以及 fragmented/continuation frame 的原始边界没有单独 wire 表示；上游关闭会收敛为通用
+`DISCONNECTED`。因此不能把当前 WebSocket 隧道描述成逐帧元数据完全保真的透明代理。
 
 ## 观测与存储
 

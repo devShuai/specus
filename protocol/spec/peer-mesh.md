@@ -1,6 +1,6 @@
 # Peer Mesh 私有组网协议
 
-Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网络。每个客户端分配一个虚拟 IP，客户端之间优先通过 UDP direct 通信；direct 不通时使用服务端内置 TURN-lite relay。服务端负责身份、授权、虚拟 IP、候选交换、session 管理和 relay 授权；业务 IP 包在客户端之间端到端加密，服务端 relay 不解密明文。
+Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网络。每个客户端分配一个虚拟 IP，客户端之间优先通过 UDP direct 通信；direct 不通时使用服务端内置 TURN relay。服务端负责身份、授权、虚拟 IP、候选交换、session 管理和 relay 授权；业务 IP 包在客户端之间端到端加密，服务端 relay 不解密明文。
 
 当前 Java 实现为实验性能力，默认关闭。
 
@@ -13,10 +13,16 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `tunnel.peer-mesh.enabled` | `TUNNEL_PEER_MESH_ENABLED` | `false` | 总开关 |
 | `tunnel.peer-mesh.cidr` | `TUNNEL_PEER_MESH_CIDR` | `100.96.0.0/11` | 虚拟网段 |
 | `tunnel.peer-mesh.public-address` | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | 空 | UDP 探测和 relay 对外地址 |
-| `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | STUN/TURN-lite UDP 主端口 |
-| `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `0` | NAT 辅助探测端口；`0` 表示主端口 + 1 |
+| `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | 标准 STUN/TURN UDP 主端口 |
+| `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `3479` | NAT 辅助探测端口；显式设为 `0` 时使用主端口 + 1 |
+| `tunnel.peer-mesh.public-stun-servers` | `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | 空 | 额外公共 STUN server，逗号分隔，只补充 `srflx` candidate |
 | `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
 | `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation 有效期 |
+| `tunnel.peer-mesh.relay-min-port` / `relay-max-port` | `TUNNEL_PEER_MESH_RELAY_MIN_PORT` / `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | `49152` / `65535` | TURN relay UDP 分配端口范围 |
+| `tunnel.peer-mesh.turn-auth-required` | `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | 是否要求 TURN 长期凭证认证 |
+| `tunnel.peer-mesh.turn-realm` | `TUNNEL_PEER_MESH_TURN_REALM` | `shuai-tunnel` | TURN realm |
+| `tunnel.peer-mesh.turn-shared-secret` | `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` | 空 | TURN credential 派生密钥；留空时使用本进程随机密钥 |
+| `tunnel.peer-mesh.turn-credential-ttl-seconds` | `TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | 登录响应中 TURN credential 的有效期 |
 
 客户端配置：
 
@@ -31,8 +37,8 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 - `noop`：不创建虚拟网卡，只运行控制面和 UDP 探测。
 - `linux-tun`：Linux 使用 `/dev/net/tun`。
 - `windows-wintun` / `wintun`：Windows 使用 Wintun，客户端包内包含 `wintun.dll`。
-- `utun` / `macos-utun` / `darwin-utun`：Go / .NET 客户端可在 macOS 使用 utun；Java 参考客户端当前未实现 macOS 虚拟网卡。
-- `auto`：Java 参考客户端按系统自动选择 Linux TUN 或 Windows Wintun；Go / .NET 客户端还会在 macOS 选择 utun，不支持的平台回退 `noop`。
+- `mac-utun` / `utun` / `macos-utun` / `darwin-utun`：macOS 使用内核 utun；Java、Go、.NET 客户端均提供实验性实现。
+- `auto`：Java、Go、.NET 客户端按系统选择 Linux TUN、Windows Wintun 或 macOS utun；不支持的平台回退 `noop`。
 
 ## 设备与虚拟 IP
 
@@ -45,10 +51,15 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 
 默认 ACL：
 
-- 同一 `tenantId + ownerUsername` 的客户端允许互联。
+- `tenantId` 和规范化后的 `ownerUsername` 都区分大小写；同一 `tenantId + ownerUsername` 的客户端允许互联。
 - 跨用户默认拒绝。
-- admin 可创建显式 ACL 允许跨用户互联。
+- admin 可创建显式 ACL 允许跨用户互联：正向 `source -> target` 使用 `OUTBOUND/BOTH`，反向授权使用
+  `target -> source` 记录上的 `INBOUND/BOTH`；只有 `allowed=true` 生效。
 - 设备被禁用时不能创建新 session。
+
+`POST /api/admin/peer-mesh/acls` 按 `tenantId + sourceClientId + targetClientId` upsert。新建时省略
+`direction` 缺省为 `OUTBOUND`；更新已有记录时省略 `direction` 必须保留原方向，不得重置。显式 direction
+不区分输入大小写并归一化为 `OUTBOUND`、`INBOUND` 或 `BOTH`，其他值拒绝。
 
 管理接口：
 
@@ -74,9 +85,11 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `clientId` / `clientName` | 当前客户端身份 |
 | `virtualIp` | 当前客户端虚拟 IP |
 | `cidr` | Mesh 虚拟网段 |
-| `stunHost` / `stunPort` | STUN-lite 端点 |
-| `turnHost` / `turnPort` | TURN-lite relay 端点 |
-| `iceUsername` / `iceCredential` | 候选探测凭证，当前为项目内轻量凭证 |
+| `stunHost` / `stunPort` | 标准 STUN 端点 |
+| `turnHost` / `turnPort` | 标准 TURN relay 端点 |
+| `publicStunServers` | 额外公共 STUN server 列表，只用于补充 `srflx` candidate |
+| `iceUsername` / `iceCredential` | TURN 长期凭证认证使用的临时用户名和 credential |
+| `iceRealm` / `iceNonce` | TURN `REALM` / `NONCE`；认证开启时与 `MESSAGE-INTEGRITY` 一起使用 |
 | `serverPublicKey` | 服务端标识用 public key 摘要，目前不参与业务加密 |
 | `clientPublicKey` | 当前客户端 public key |
 | `sessionTtlSeconds` | peer session TTL |
@@ -102,13 +115,22 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
       "clientName": "client-b",
       "virtualIp": "100.96.0.2",
       "publicKey": "base64-x25519-public-key",
-      "online": true
+      "online": true,
+      "messageSendCapable": true,
+      "messageReceiveCapable": true,
+      "messageAttachmentsCapable": true,
+      "messageMediaPreviewCapable": true,
+      "messageMaxAttachmentBytes": 536870912
     }
   ]
 }
 ```
 
 客户端收到后刷新本地 peer 表，并向在线 peer 上报候选地址。
+
+五个 `message*` 字段来自 peer 当前在线 session 上报的
+`environment.clientMessageCapabilities`；peer 离线或没有匹配的在线 session 时为 `false` / `0`。
+旧服务端缺省这些字段时，客户端也按 `false` / `0` 处理。
 
 ### `candidates`
 
@@ -146,7 +168,7 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
       "type": "relay",
       "transport": "udp",
       "address": "tunnel.example.com",
-      "port": 3478,
+      "port": 49152,
       "priority": 10,
       "foundation": "relay",
       "relayId": "allocation-id"
@@ -160,8 +182,8 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 | 类型 | 说明 |
 | --- | --- |
 | `host` | 本机非 loopback、非 link-local IPv4 地址 |
-| `srflx` | 通过 STUN-lite binding 获得的公网映射地址 |
-| `relay` | 通过 TURN-lite allocate 获得的 relay allocation |
+| `srflx` | 通过标准 STUN Binding 获得的公网映射地址 |
+| `relay` | 通过标准 TURN Allocate 获得的 relay allocation |
 
 ### `session-grant`
 
@@ -204,7 +226,8 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 
 ### `traffic-report`
 
-客户端周期上报 direct/relay 字节数：
+`traffic-report` schema 同时保留 direct/relay 字段；当前客户端周期上报尚未由服务端热路径掌握的 direct
+增量，通常把 `relayBytes` 置为 `0`：
 
 ```json
 {
@@ -215,7 +238,7 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 }
 ```
 
-relay 数据在服务端转发时也会计入 session。
+relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不得重复上报同一批 relay 字节。
 
 ### `device-report`
 
@@ -228,7 +251,7 @@ relay 数据在服务端转发时也会计入 session。
   "virtualDeviceName": "shuai0",
   "virtualDeviceStatus": "UP",
   "virtualDeviceError": "",
-  "natType": "Symmetric NAT",
+  "natType": "SYMMETRIC_NAT",
   "lastEndpoint": "58.41.26.74:1132"
 }
 ```
@@ -247,62 +270,87 @@ relay 数据在服务端转发时也会计入 session。
 
 服务端标记 session 为 `CLOSED`，并向双方在线客户端转发 close 信令。
 
-## STUN/TURN-lite UDP 协议
+## STUN/TURN UDP 协议与 direct check
 
 服务端开启后监听：
 
 - 主端口：`TUNNEL_PEER_MESH_STUN_TURN_PORT`，默认 `3478/udp`。
-- 备用探测端口：`TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`，默认主端口 + 1。
+- 备用探测端口：`TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`，默认 `3479/udp`；配置为 `0` 时取主端口 + 1。
+- relay 分配端口：默认 `49152-65535/udp`。
 
-当前实现是项目内 JSON 协议，不是完整 RFC STUN/TURN。
+STUN/TURN 控制消息使用标准的二进制 STUN 头、magic cookie、transaction ID 和 TLV attribute，
+不是旧版 `shuai-peer-relay` JSON。内置服务端实现的是项目所需的 RFC STUN/TURN 子集：
 
-### JSON 消息格式
+- 线格式使用 20 字节 STUN header、magic cookie `0x2112A442`、12 字节 transaction ID；message length
+  不含 header，attribute 按 4 字节补齐。基础头和 XOR 地址遵循 STUN RFC 5389/8489 兼容格式，
+  `RESPONSE-ORIGIN` / `OTHER-ADDRESS` 用于 RFC 5780 风格的辅助观测，relay 方法采用 TURN RFC 5766/8656
+  兼容的本项目子集。
+- 当前 codec 能编码 IPv4/IPv6 XOR 地址，但 Peer Mesh 业务数据面和虚拟路由只支持 IPv4；这不构成 IPv6
+  Mesh 能力声明。
+- 客户端不会对单个 STUN transaction 做 RFC 定时重传；未响应项在 15 秒后视为过期，并由 30 秒维护循环
+  清理，后续维护轮次会重新发起探测或 allocation 刷新。因此外部实现不能依赖本项目客户端的逐包重传行为。
 
-所有 JSON 消息都有：
+| 方法 / indication | 方向 | 关键 attribute / 说明 |
+| --- | --- | --- |
+| Binding Request / Success | client <-> server | `XOR-MAPPED-ADDRESS`；内置 server 还返回 `RESPONSE-ORIGIN`，有备用端口时返回 `OTHER-ADDRESS` |
+| Allocate Request / Success | client <-> server | `REQUESTED-TRANSPORT=UDP`、`XOR-RELAYED-ADDRESS`、`XOR-MAPPED-ADDRESS`、`LIFETIME` |
+| Refresh Request / Success | client <-> server | 刷新或释放 allocation |
+| Create Permission Request / Success | client <-> server | 为目标 relay endpoint 建立短期 permission |
+| Send Indication | client -> server | `XOR-PEER-ADDRESS` + `DATA`，承载加密 peer frame |
+| Data Indication | server -> client | `XOR-PEER-ADDRESS` + `DATA`，承载加密 peer frame |
+
+TURN 认证默认开启。登录响应下发 `iceUsername`、`iceCredential`、`iceRealm` 和 `iceNonce`；
+受保护请求携带 `USERNAME`、`REALM`、`NONCE` 和 `MESSAGE-INTEGRITY`。认证失败使用标准错误响应，
+例如 `401 Unauthorized` 和 `438 Stale Nonce`。
+
+当前长期凭证派生为：`iceUsername` 含过期时间；`iceCredential = Base64Url(HMAC-SHA1(turnSharedSecret,
+iceUsername))`；`MESSAGE-INTEGRITY` 使用 HMAC-SHA1，key 为 `MD5(username + ":" + realm + ":" + credential)`。
+`Allocate`、`Refresh`、`CreatePermission` 受该校验保护；`Send Indication` 依赖已认证创建的 allocation 和
+permission。未配置 `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` 时服务端使用进程内随机密钥，重启后旧凭证失效。
+
+客户端必须按 `transaction ID + TURN endpoint` 跟踪上述受保护请求。收到 `401` 或 `438` 时，客户端从
+错误响应更新 `REALM` / `NONCE`，使用新的 transaction ID 和重新计算的 `MESSAGE-INTEGRITY` 最多重试一次；
+第二次 challenge、响应端点不匹配或缺少有效凭证时不得继续重试。请求成功、发送失败、超时、配置/凭证切换
+以及客户端停止时都必须清理对应 pending 状态。Binding Request 和 Send Indication 不添加这组长期认证属性。
+
+额外的 `publicStunServers` 只接收 Binding 请求，用于补充 server-reflexive candidate；
+它们不提供本项目的 relay。
+
+### 客户端间 direct connectivity check
+
+客户端 candidate 之间的连通性检查仍使用项目内 JSON `PeerUdpProbe`，它不经过 STUN/TURN server：
 
 ```json
 {
-  "magic": "shuai-peer-relay",
-  "type": "binding",
-  "transactionId": "uuid"
+  "magic": "shuai-peer-mesh",
+  "type": "check",
+  "sessionId": 8254181000350692,
+  "fromClientId": 1,
+  "toClientId": 2,
+  "nonce": "random-nonce",
+  "token": "peer-session-token",
+  "sentAtMillis": 1780000000000
 }
 ```
 
-`type`：
-
-| 类型 | 方向 | 说明 |
-| --- | --- | --- |
-| `binding` | client -> server | 请求公网映射地址 |
-| `binding-response` | server -> client | 返回 mapped endpoint、观测端口和备用端口 |
-| `allocate` | client -> server | 创建 relay allocation |
-| `allocated` | server -> client | 返回 allocationId 和 TTL |
-| `refresh` | client -> server | 刷新 allocation TTL |
-| `send` | client -> server | 通过 relay 发送加密数据帧 |
-| `data` | server -> client | relay 转发到目标 allocation |
-| `error` | server -> client | 错误 |
-
-`binding-response` 字段：
-
-| 字段 | 说明 |
-| --- | --- |
-| `probeRole` | `primary`、`alternate` 或 `changed-port` |
-| `mappedAddress` / `mappedPort` | 服务端看到的客户端公网映射 |
-| `observedByAddress` / `observedByPort` | 响应该 probe 的服务端端点 |
-| `alternateAddress` / `alternatePort` | 备用探测端点 |
+`type=check-response` 使用相同字段并回显 `nonce`、session 和双方 client ID。接收方同时校验
+session、token、目标 client ID 和时间窗口。
 
 ### NAT 类型判断
 
-客户端会比较主端口和备用端口观察到的映射：
+主端口的 Binding Success 在备用 socket 可用时返回 `RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`。客户端收到后，
+主动向 `OTHER-ADDRESS` 再发送一个标准 Binding Request；服务端不会把主请求“主动改端口回包”，也未实现
+`CHANGE-REQUEST`。客户端比较主端口、备用端口和可选公共 STUN 观察到的映射：
 
 - 映射端点不同：倾向判断为 `Symmetric NAT`。
-- 映射端点相同且能收到备用端口主动回包：展示为 `Full cone / Restricted NAT`。
-- 映射端点相同但收不到备用端口主动回包：展示为 `Port Restricted NAT` 或保守 `NAT`。
+- 主、备用观察相同：只能保守展示为 `NAT` 或端口保持类结果，不能据此严格区分 cone 类型。
+- 历史 `changed-port` 观察若存在，才会辅助展示为 `Full cone / Restricted NAT`；现行标准 Binding 流程不主动生成该观察。
 
 在只有一个公网 IP 和两个 UDP 端口的部署中，无法严格区分所有 NAT 类型。
 
 ## 数据面加密帧
 
-客户端从 TUN/Wintun 读取原始 IPv4 packet，按目的虚拟 IP 找到 peer session，再封装为 AES-GCM 加密帧通过 UDP 发送。
+客户端从 Linux TUN、Windows Wintun 或 macOS utun 读取原始 IPv4 packet，按目的虚拟 IP 找到 peer session，再封装为 AES-GCM 加密帧通过 UDP 发送。
 
 密钥派生：
 
@@ -340,13 +388,15 @@ AAD 是从 `magic` 到 `nonce` 的完整头部。接收方校验：
 
 ## direct 与 relay
 
-发送优先级：
+发送优先级按当前 Java 状态机执行：
 
-1. 已有健康 `DIRECT` 路径时直接发送。
-2. direct candidate 连通性检查成功后切到 `DIRECT`。
-3. direct 不可用但双方有 relay allocation 时走 `RELAY`。
+1. session 已绑定 `relayTargetAllocationId` 时优先走 `RELAY`；这表示 relay check/data 已明确选定可用目标。
+2. 未绑定 relay 目标且已有健康 `DIRECT` 路径时直接发送。
+3. direct candidate 连通性检查成功后切到 `DIRECT`；收到有效 direct 数据会清理旧 relay 目标，避免路径状态残留。
+4. direct 尚不可用时继续申请/探测 TURN allocation，relay 目标建立后按第 1 条发送。
 
-服务端 relay 处理 `send` 时会解析加密帧头，并调用 `PeerMeshService.authorizeRelayFrame`：
+服务端 relay 处理 TURN `Send Indication` 中的加密帧时，会解析帧头并调用
+`PeerMeshService.authorizeRelayFrame`：
 
 - session 必须存在。
 - session 未过期。
@@ -355,30 +405,41 @@ AAD 是从 `magic` 到 `nonce` 的完整头部。接收方校验：
 
 relay 只校验头部和授权，不解密业务明文。
 
+初次 relay 建链不会被 `ACTIVE` 条件卡住：客户端先通过 TURN `Send/Data Indication` 转发 JSON
+`PeerUdpProbe` 检查包；它不是 `SPM1` 业务帧，服务端不会对它执行 `authorizeRelayFrame`。检查响应成功后，
+客户端先通过控制连接上报 `path-report(status=ACTIVE, pathType=RELAY)`，随后发送的 `SPM1` 业务帧才满足
+relay 授权条件。若 `path-report` 未到达，业务帧会被拒绝。
+
 ## 虚拟网卡行为
 
 Linux：
 
 - 打开 `/dev/net/tun`。
-- 使用 `TUNSETIFF` 创建 TUN。
-- 执行 `ip addr replace {virtualIp}/{prefix} dev {name}`。
+- 使用 `TUNSETIFF` 创建 TUN，并给接口配置本机 `{virtualIp}/32`。
 - 执行 `ip link set dev {name} mtu {mtu} up`。
-- 执行 `ip route replace {cidr} dev {name}`。
+- 为 roster 中每个在线 peer 执行 `ip route replace {peerVirtualIp}/32 dev {name}`。
 
 Windows：
 
 - 加载随包或指定路径的 `wintun.dll`。
-- 打开或创建 Wintun adapter。
-- 执行 `netsh interface ip set address` 设置虚拟 IP。
+- 打开或创建 Wintun adapter，并给接口配置本机 `/32` 虚拟 IP。
 - 设置 MTU。
-- 添加 mesh CIDR 路由。
+- 为 roster 中每个在线 peer 执行 `netsh interface ipv4 delete route {peerVirtualIp}/32 {name} store=active`
+  清理旧项，再执行 `netsh interface ipv4 add route {peerVirtualIp}/32 {name} store=active` 添加 host route。
 
-只接管 mesh CIDR，不修改默认路由。
+macOS：
+
+- 通过 `com.apple.net.utun_control` 打开 utun，并给接口配置本机 `/32` 虚拟 IP 和 MTU。
+- 为 roster 中每个在线 peer 添加 `route -n add -host {peerVirtualIp} -interface {utun}`。
+
+三种实现都不安装整个 mesh CIDR 路由，只为当前在线 peer 维护 `/32` host route；
+peer 离线、从 roster 消失或虚拟设备停止时会移除对应路由。默认路由不会被修改。
 
 ## 当前限制
 
-- 当前是 TURN-lite JSON 协议，不兼容标准 coturn。
-- Java client 当前仍以 Linux TUN 与 Windows Wintun 为主；Go / .NET client 已提供实验性 macOS `utun` 数据面。
+- 内置 STUN/TURN server 只实现本项目使用的方法和 attribute，不等同于完整 coturn 功能集。
+- Java、Go、.NET client 的 macOS `utun` 数据面仍属于实验性能力。
 - `noop` 模式不会创建虚拟网卡，因此无法通过系统 `ping` / `curl` 访问虚拟 IP。
 - direct 路径依赖双方 UDP 可达；对称 NAT 或严格防火墙下通常会走 relay。
+- 业务数据面只接受完整 IPv4 packet，未实现 IPv6 Mesh 路由或 IPv6 TUN packet 转发。
 - 控制连接断开后不能创建新 peer session；已建立 direct session 在 TTL 内可继续传输。
