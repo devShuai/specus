@@ -23,6 +23,7 @@ import { usePageSeo } from "../lib/seo";
 import { createQrMatrix } from "../lib/qr";
 import { sha256Blob } from "../lib/sha256";
 import { effectiveMimeType, mediaKind, previewKindLabel, shortMimeLabel } from "../lib/transferPreview";
+import { shouldPreferWhiteboardRelay } from "../lib/whiteboardTransport";
 import {
   clipboardSyncEventKey,
   isClipboardSyncPayload,
@@ -1137,13 +1138,18 @@ function PublicTransferPageContent() {
       || !targetPeerId
       || !socket
       || socket.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
-    socket.send(JSON.stringify({
-      type: "whiteboard",
-      targetPeerId,
-      payload,
-    }));
+    try {
+      socket.send(JSON.stringify({
+        type: "whiteboard",
+        targetPeerId,
+        payload,
+      }));
+      return true;
+    } catch {
+      return false;
+    }
   }, []);
 
   const sendWhiteboardPayload = useCallback((payload: WhiteboardPayload) => {
@@ -1152,6 +1158,10 @@ function PublicTransferPageContent() {
     }
     const sendRoomEpoch = roomEpochRef.current;
     for (const peer of peers) {
+      if (shouldPreferWhiteboardRelay(payload)
+        && publishWhiteboardEnvelope(peer.peerId, payload, sendRoomEpoch)) {
+        continue;
+      }
       void sendPeerMessage(peer.peerId, { messageType: "whiteboard", payload }, 1600).then((sentDirect) => {
         if (!sentDirect
           && roomEpochRef.current === sendRoomEpoch
