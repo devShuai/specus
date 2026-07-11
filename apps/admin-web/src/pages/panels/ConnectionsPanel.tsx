@@ -230,24 +230,66 @@ export function ConnectionsPanel() {
       last ? `${last.id}:${last.connectedAt}` : "empty",
     ].join("|");
   }, [items, tableScopeKey]);
+  const activeFilterCount = [clientId, result, fromDate, toDate].filter(Boolean).length;
+  const hasActiveFilters = activeFilterCount > 0;
 
   return (
-    <div className="mt-2 flex min-w-0 flex-col gap-3">
+    <div className="mt-2 flex min-w-0 flex-col gap-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-lg font-semibold text-foreground">连接记录</h2>
+            <Chip radius="sm" size="sm" variant="flat">
+              {total} 条
+            </Chip>
+          </div>
+          <p className="mt-1 text-small text-default-500">查看客户端连接结果、来源地址与在线时长。</p>
+        </div>
+        <Button
+          className="w-full shrink-0 sm:w-auto"
+          color="primary"
+          isLoading={loading}
+          radius="sm"
+          variant="flat"
+          onPress={() => void load()}
+        >
+          刷新记录
+        </Button>
+      </div>
+
       {/* mobile: 卡片堆叠 */}
       <div className="xl:hidden">
-        <div className="flex flex-wrap items-end gap-3 mb-3">
-          <Select className="w-full sm:w-44" label="客户端" items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]} selectedKeys={clientId ? [clientId] : [""]} onChange={(event) => changeClientId(event.target.value)}>
-            {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
-          </Select>
-          <Select className="w-full sm:w-32" label="结果" selectedKeys={result ? [result] : [""]} onChange={(event) => changeResult(event.target.value)}>
-            <SelectItem key="">全部</SelectItem>
-            <SelectItem key="true">成功</SelectItem>
-            <SelectItem key="false">失败</SelectItem>
-          </Select>
-          <Input className="w-full sm:w-44" type="date" label="开始日期" value={fromDate} onValueChange={changeFromDate} />
-          <Input className="w-full sm:w-44" type="date" label="结束日期" value={toDate} onValueChange={changeToDate} />
-          <Button className="h-14 w-full sm:w-auto" variant="flat" onPress={reset}>重置</Button>
-          <Button className="h-14 w-full sm:w-auto" variant="flat" onPress={() => void load()}>刷新</Button>
+        <div className="mb-3 rounded-lg border border-default-200 bg-content1 p-3 sm:p-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-small font-semibold text-foreground">筛选条件</div>
+              <div className="mt-0.5 truncate text-tiny text-default-500">
+                {hasActiveFilters ? `已启用 ${activeFilterCount} 项筛选` : "按客户端、结果和时间范围筛选"}
+              </div>
+            </div>
+            <Button
+              className="shrink-0"
+              isDisabled={!hasActiveFilters}
+              radius="sm"
+              size="sm"
+              variant="light"
+              onPress={reset}
+            >
+              重置筛选
+            </Button>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Select className="w-full" label="客户端" items={[{ id: "", clientName: "全部" }, ...clients.map((c) => ({ id: String(c.id), clientName: c.clientName }))]} selectedKeys={clientId ? [clientId] : [""]} onChange={(event) => changeClientId(event.target.value)}>
+              {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
+            </Select>
+            <Select className="w-full" label="结果" selectedKeys={result ? [result] : [""]} onChange={(event) => changeResult(event.target.value)}>
+              <SelectItem key="">全部</SelectItem>
+              <SelectItem key="true">成功</SelectItem>
+              <SelectItem key="false">失败</SelectItem>
+            </Select>
+            <Input className="w-full" type="date" label="开始日期" value={fromDate} onValueChange={changeFromDate} />
+            <Input className="w-full" type="date" label="结束日期" value={toDate} onValueChange={changeToDate} />
+          </div>
         </div>
         <MobileListCardList
           items={tableRows}
@@ -289,9 +331,25 @@ export function ConnectionsPanel() {
       <div className="hidden min-w-0 xl:block">
       <Card shadow="none" className="overflow-visible rounded-lg border border-default-200 bg-content1">
         <CardBody className="p-3">
-        <div className="mb-2 flex justify-end gap-2">
-            <Button className="h-9" size="sm" variant="flat" onPress={reset}>重置</Button>
-            <Button className="h-9" size="sm" variant="flat" onPress={() => void load()}>刷新</Button>
+        <div className="mb-3 flex min-h-9 items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2 text-tiny text-default-500">
+            <span className="truncate">点击列标题旁的筛选图标缩小记录范围</span>
+            {hasActiveFilters ? (
+              <Chip color="primary" radius="sm" size="sm" variant="flat">
+                {activeFilterCount} 项筛选
+              </Chip>
+            ) : null}
+          </div>
+          <Button
+            className="h-9 shrink-0"
+            isDisabled={!hasActiveFilters}
+            radius="sm"
+            size="sm"
+            variant="light"
+            onPress={reset}
+          >
+            重置筛选
+          </Button>
         </div>
         <Table
           key={tableCollectionKey}
