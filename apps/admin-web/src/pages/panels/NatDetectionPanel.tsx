@@ -7,10 +7,12 @@ import {
   Input,
   Spinner,
   Textarea,
+  Tooltip,
 } from "@heroui/react";
 import { AppLogo } from "../../components/AppLogo";
 import { ThemeToggleButton } from "../../components/ThemeToggleButton";
 import { HeroRuntime } from "../../components/HeroRuntime";
+import { notify } from "../../components/toast";
 import { fetchPublicPeerStunConfig } from "../../api/client";
 import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
 import { usePageSeo } from "../../lib/seo";
@@ -19,9 +21,6 @@ const FALLBACK_SELF_HOSTED_STUN_HOST = "tunnel.devshuai.com";
 const PUBLIC_STUN_SERVERS = [
   "stun:stun.miwifi.com:3478",
   "stun:stun.chat.bilibili.com:3478",
-  "stun:stun.douyucdn.cn:3478",
-  "stun:stun1.douyucdn.cn:3478",
-  "stun:stun.dingtalk.com:3478",
 ];
 const UNASSIGNED_STUN_SERVER = "未归属 ICE candidate";
 
@@ -383,20 +382,30 @@ function NatHero({
           <Chip
             radius="sm"
             variant="flat"
+            startContent={<StatusGlyph color={profile.color} className="ml-1" />}
             className={`${accent.chipBg} ${accent.chipText} border ${accent.chipBorder}`}
           >
             {profile.badge}
           </Chip>
           {natTypeProfileEntry && (
-            <a
-              href="#/help/peer-mesh#nat-types"
-              title={`${natTypeProfileEntry.summary}（点击查看帮助文档）`}
-              className="inline-flex items-center gap-1.5 rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium transition-colors hover:border-black/20 hover:bg-white dark:hover:border-white/20 dark:hover:bg-white/[0.1]"
+            <Tooltip
+              placement="bottom"
+              content={
+                <div className="max-w-64 space-y-1 py-0.5 text-tiny">
+                  <p>{natTypeProfileEntry.summary}</p>
+                  <p className="text-zinc-400">点击查看帮助文档中的 NAT 类型说明。</p>
+                </div>
+              }
             >
-              <span className={`inline-block h-2 w-2 rounded-full ${natToneBg(natTypeProfileEntry.tone)}`} />
-              <span>{natTypeProfileEntry.label}</span>
-              <span className="text-zinc-500 dark:text-zinc-400">· {natTypeProfileEntry.reachabilityLabel}</span>
-            </a>
+              <a
+                href="#/help/peer-mesh#nat-types"
+                className="inline-flex items-center gap-1.5 rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium transition-colors hover:border-black/20 hover:bg-white dark:hover:border-white/20 dark:hover:bg-white/[0.1]"
+              >
+                <span className={`inline-block h-2 w-2 rounded-full ${natToneBg(natTypeProfileEntry.tone)}`} />
+                <span>{natTypeProfileEntry.label}</span>
+                <span className="text-zinc-500 dark:text-zinc-400">· {natTypeProfileEntry.reachabilityLabel}</span>
+              </a>
+            </Tooltip>
           )}
           {result && (
             <span className="text-tiny text-zinc-600 dark:text-zinc-400">
@@ -404,9 +413,19 @@ function NatHero({
             </span>
           )}
           {result && (
-            <span className="rounded-md glass-chip px-2 py-0.5 text-tiny text-zinc-600 dark:text-zinc-300">
-              置信度：{confidenceLabel(result.confidence)}
-            </span>
+            <Tooltip
+              placement="bottom"
+              content={
+                <div className="max-w-64 py-0.5 text-tiny">
+                  置信度由能归属到具体 STUN 服务的公网映射数量决定：3 个及以上为高、2 个为中、不足 2 个为低。低置信度建议增加 STUN 服务或更换网络复测。
+                </div>
+              }
+            >
+              <span className="flex cursor-help items-center gap-1.5 rounded-md glass-chip px-2 py-0.5 text-tiny text-zinc-600 dark:text-zinc-300">
+                <ConfidenceBars confidence={result.confidence} />
+                置信度：{confidenceLabel(result.confidence)}
+              </span>
+            </Tooltip>
           )}
         </div>
 
@@ -487,27 +506,50 @@ function NatHero({
 }
 
 function MetricStrip({ result }: { result: BrowserNatResult | null }) {
+  const knownProbes = result?.probes.filter((probe) => probe.sourceKnown) ?? [];
+  const respondedCount = knownProbes.filter((probe) =>
+    probe.candidates.some((candidate) => candidate.type === "srflx"),
+  ).length;
   const items = [
-    { label: "STUN 服务", value: result?.probes.filter((probe) => probe.sourceKnown).length ?? 0 },
-    { label: "公网映射端点", value: result?.mappedEndpoints.length ?? 0 },
-    { label: "本地候选", value: result?.hostCandidates.length ?? 0 },
+    {
+      label: "STUN 服务",
+      value: result ? `${respondedCount}/${knownProbes.length}` : "—",
+      hint: "返回公网映射的 STUN 服务数 / 参与探测的总数。返回数越多，NAT 类型结论越可靠。",
+    },
+    {
+      label: "公网映射端点",
+      value: result ? String(result.mappedEndpoints.length) : "—",
+      hint: "NAT 分配给本机的公网 IP:Port（server-reflexive）。同一地址族出现多个不同端点，通常意味着 Symmetric NAT。",
+    },
+    {
+      label: "本地候选",
+      value: result ? String(result.hostCandidates.length) : "—",
+      hint: "本机网卡上收集到的 host candidate 数量，包含内网 IPv4 / IPv6 地址或浏览器的 mDNS 混淆地址。",
+    },
     {
       label: "总耗时",
       value: result ? `${Math.max(0, result.finishedAt - result.startedAt)} ms` : "—",
+      hint: "从发起检测到 ICE 收集结束的总时间，受「单服务超时」设置影响。",
     },
   ];
   return (
     <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
       {items.map((item) => (
-        <div
+        <Tooltip
           key={item.label}
-          className="rounded-lg border glass glass-border px-3 py-2"
+          placement="bottom"
+          content={<div className="max-w-60 py-0.5 text-tiny">{item.hint}</div>}
         >
-          <div className="text-tiny text-zinc-500 dark:text-zinc-400">{item.label}</div>
-          <div className="mt-0.5 font-mono text-lg font-semibold text-zinc-950 dark:text-white">
-            {item.value === 0 ? "0" : item.value || "—"}
+          <div className="cursor-help rounded-lg border glass glass-border px-3 py-2">
+            <div className="flex items-center gap-1 text-tiny text-zinc-500 dark:text-zinc-400">
+              <span>{item.label}</span>
+              <InfoIcon className="h-3 w-3 shrink-0 opacity-60" />
+            </div>
+            <div className="mt-0.5 font-mono text-lg font-semibold text-zinc-950 dark:text-white">
+              {item.value}
+            </div>
           </div>
-        </div>
+        </Tooltip>
       ))}
     </div>
   );
@@ -536,38 +578,161 @@ function NatResultDetails({
   return (
     <div className="mt-6 flex flex-col gap-4">
       <MappedEndpointsCard result={result} />
+      <StunProbesCard result={result} />
       <CandidateTableCard result={result} />
     </div>
   );
 }
 
 function MappedEndpointsCard({ result }: { result: BrowserNatResult }) {
+  const groups = [
+    { label: "IPv4", endpoints: result.mappedEndpoints.filter((endpoint) => !isIpv6Endpoint(endpoint)) },
+    { label: "IPv6", endpoints: result.mappedEndpoints.filter((endpoint) => isIpv6Endpoint(endpoint)) },
+  ].filter((group) => group.endpoints.length > 0);
+
   return (
     <Card shadow="none" className="rounded-xl border glass glass-border">
       <CardBody className="gap-4 p-5">
-        <div className="flex items-center gap-2">
-          <DotIcon className={result.mappedEndpoints.length ? "text-emerald-500" : "text-zinc-400"} />
-          <h2 className="text-base font-semibold">公网映射端点</h2>
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span className="flex items-center gap-2">
+            <DotIcon className={result.mappedEndpoints.length ? "text-emerald-500" : "text-zinc-400"} />
+            <h2 className="text-base font-semibold">公网映射端点</h2>
+          </span>
+          <span className="text-tiny text-zinc-500 dark:text-zinc-400">
+            NAT 分配给本机的公网出口，点击可复制
+          </span>
         </div>
-        {result.mappedEndpoints.length === 0 ? (
+        {groups.length === 0 ? (
           <p className="rounded-lg border border-dashed border-black/15 dark:border-white/15 glass-chip p-3 text-small text-zinc-600 dark:text-zinc-400">
-            未发现 server-reflexive 映射端点。
+            未发现 server-reflexive 映射端点。UDP 出站可能被阻断，或配置的 STUN 服务均不可达。
           </p>
         ) : (
-          <div className="flex flex-wrap gap-2">
-            {result.mappedEndpoints.map((endpoint) => (
-              <code
-                key={endpoint}
-                className="rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-1.5 font-mono text-small text-emerald-700 dark:border-emerald-300/30 dark:bg-emerald-300/10 dark:text-emerald-100"
-              >
-                {endpoint}
-              </code>
+          <div className="flex flex-col gap-2">
+            {groups.map((group) => (
+              <div key={group.label} className="flex flex-wrap items-center gap-2">
+                <span className="w-10 shrink-0 text-tiny font-medium text-zinc-500 dark:text-zinc-400">
+                  {group.label}
+                </span>
+                {group.endpoints.map((endpoint) => (
+                  <button
+                    key={endpoint}
+                    type="button"
+                    onClick={() => void copyEndpoint(endpoint)}
+                    className="group/copy flex items-center gap-1.5 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-1.5 font-mono text-small text-emerald-700 transition-colors hover:border-emerald-500/45 hover:bg-emerald-500/20 dark:border-emerald-300/30 dark:bg-emerald-300/10 dark:text-emerald-100 dark:hover:border-emerald-300/50 dark:hover:bg-emerald-300/20"
+                  >
+                    <span className="break-all text-left">{endpoint}</span>
+                    <CopyIcon className="h-3.5 w-3.5 shrink-0 opacity-50 transition-opacity group-hover/copy:opacity-100" />
+                  </button>
+                ))}
+              </div>
             ))}
           </div>
         )}
       </CardBody>
     </Card>
   );
+}
+
+function StunProbesCard({ result }: { result: BrowserNatResult }) {
+  const knownProbes = result.probes.filter((probe) => probe.sourceKnown);
+  const respondedCount = knownProbes.filter((probe) =>
+    probe.candidates.some((candidate) => candidate.type === "srflx"),
+  ).length;
+  const headDotClass = respondedCount === 0
+    ? "text-rose-500"
+    : respondedCount < knownProbes.length
+      ? "text-amber-500"
+      : "text-emerald-500";
+
+  return (
+    <Card shadow="none" className="rounded-xl border glass glass-border">
+      <CardBody className="gap-3 p-5">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span className="flex items-center gap-2">
+            <DotIcon className={headDotClass} />
+            <h2 className="text-base font-semibold">STUN 服务状态</h2>
+          </span>
+          <span className="text-tiny text-zinc-500 dark:text-zinc-400">
+            每个 STUN 服务是否返回公网映射，以及它看到的端点
+          </span>
+        </div>
+        <div className="flex flex-col gap-2">
+          {result.probes.map((probe) => {
+            const status = probeStatus(probe);
+            const endpoints = Array.from(
+              new Set(
+                probe.candidates
+                  .filter((candidate) => candidate.type === "srflx")
+                  .map(endpointOf),
+              ),
+            );
+            return (
+              <div
+                key={probe.server}
+                className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border glass-chip glass-border px-3 py-2"
+              >
+                <Chip size="sm" variant="flat" color={status.color} className="shrink-0">
+                  {status.label}
+                </Chip>
+                <code className="break-all font-mono text-tiny text-zinc-800 dark:text-zinc-200">
+                  {probe.server}
+                </code>
+                {endpoints.length > 0 && (
+                  <span className="flex flex-wrap items-center gap-1.5 sm:ml-auto">
+                    {endpoints.map((endpoint) => (
+                      <code
+                        key={endpoint}
+                        className="rounded border border-black/10 bg-black/[0.03] px-1.5 py-0.5 font-mono text-tiny text-zinc-600 dark:border-white/10 dark:bg-white/[0.06] dark:text-zinc-300"
+                      >
+                        {endpoint}
+                      </code>
+                    ))}
+                  </span>
+                )}
+                {probe.error && (
+                  <p className={`w-full text-tiny ${probe.sourceKnown ? "text-danger" : "text-zinc-500 dark:text-zinc-400"}`}>
+                    {probe.error}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function probeStatus(probe: StunProbeResult): {
+  color: "success" | "warning" | "danger" | "default";
+  label: string;
+} {
+  if (!probe.sourceKnown) {
+    return { color: "default", label: "来源未归属" };
+  }
+  if (probe.candidates.some((candidate) => candidate.type === "srflx")) {
+    return { color: "success", label: "已返回映射" };
+  }
+  if (probe.error) {
+    return { color: "danger", label: "超时/失败" };
+  }
+  return { color: "warning", label: "未返回映射" };
+}
+
+async function copyEndpoint(endpoint: string) {
+  try {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(endpoint);
+    notify(`已复制 ${endpoint}`);
+  } catch {
+    notify("复制失败，当前浏览器环境不允许自动写入剪贴板，请手动选择文本复制", "error");
+  }
+}
+
+function isIpv6Endpoint(endpoint: string): boolean {
+  return (endpoint.match(/:/g) ?? []).length > 1;
 }
 
 function CandidateTableCard({ result }: { result: BrowserNatResult }) {
@@ -580,16 +745,19 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
   );
 
   return (
-    <details className="rounded-xl border glass glass-border transition-colors open:border-black/15 dark:open:border-white/15">
+    <details className="group rounded-xl border glass glass-border transition-colors open:border-black/15 dark:open:border-white/15">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-5 text-base font-semibold">
         <span className="flex items-center gap-2">
-          <ChevronIcon className="h-4 w-4 transition-transform" />
+          <ChevronIcon className="h-4 w-4 transition-transform group-open:rotate-90" />
           ICE Candidate 明细
           <span className="ml-1 text-small font-normal text-zinc-500 dark:text-zinc-400">
             ({candidates.length})
           </span>
         </span>
-        <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">点击展开</span>
+        <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
+          <span className="group-open:hidden">点击展开</span>
+          <span className="hidden group-open:inline">点击收起</span>
+        </span>
       </summary>
       <div className="border-t border-black/5 px-5 pb-5 pt-3 dark:border-white/5">
         {candidates.length === 0 ? (
@@ -603,7 +771,21 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
                   <th className="px-2 py-1.5 text-left font-medium">类型</th>
                   <th className="px-2 py-1.5 text-left font-medium">协议</th>
                   <th className="px-2 py-1.5 text-left font-medium">地址</th>
-                  <th className="px-2 py-1.5 text-left font-medium">关联地址</th>
+                  <th className="px-2 py-1.5 text-left font-medium">
+                    <Tooltip
+                      placement="top"
+                      content={
+                        <div className="max-w-60 py-0.5 text-tiny">
+                          raddr / rport：srflx 候选对应的本机源地址与源端口，用于对照公网端口是否被 NAT 改写。
+                        </div>
+                      }
+                    >
+                      <span className="inline-flex cursor-help items-center gap-1">
+                        关联地址
+                        <InfoIcon className="h-3 w-3 opacity-60" />
+                      </span>
+                    </Tooltip>
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -619,9 +801,14 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
                       </div>
                     </td>
                     <td className="px-2 py-2 align-top">
-                      <Chip size="sm" color={candidateColor(item.candidate.type)} variant="flat">
-                        {item.candidate.type}
-                      </Chip>
+                      <Tooltip
+                        placement="top"
+                        content={<div className="max-w-60 py-0.5 text-tiny">{candidateTypeHint(item.candidate.type)}</div>}
+                      >
+                        <Chip size="sm" color={candidateColor(item.candidate.type)} variant="flat" className="cursor-help">
+                          {item.candidate.type}
+                        </Chip>
+                      </Tooltip>
                     </td>
                     <td className="px-2 py-2 align-top text-tiny uppercase text-zinc-500 dark:text-zinc-400">
                       {item.candidate.protocol}
@@ -745,6 +932,105 @@ function ChevronIcon({ className = "h-4 w-4" }: { className?: string }) {
       <polyline points="9 18 15 12 9 6" />
     </svg>
   );
+}
+
+function InfoIcon({ className = "h-3.5 w-3.5" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <line x1="12" y1="11" x2="12" y2="16" />
+      <circle cx="12" cy="8" r="0.5" fill="currentColor" />
+    </svg>
+  );
+}
+
+function CopyIcon({ className = "h-3.5 w-3.5" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="9" width="11" height="11" rx="2" />
+      <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+    </svg>
+  );
+}
+
+// 结果徽章上的状态图标：成功打勾、警告感叹号、失败打叉、检测中呼吸点。
+function StatusGlyph({
+  color,
+  className = "",
+}: {
+  color: "default" | "primary" | "success" | "warning" | "danger";
+  className?: string;
+}) {
+  const base = `h-3.5 w-3.5 shrink-0 ${className}`;
+  switch (color) {
+    case "success":
+      return (
+        <svg className={base} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9" strokeWidth="2" />
+          <polyline points="8.5 12.5 11 15 15.5 9.5" />
+        </svg>
+      );
+    case "warning":
+      return (
+        <svg className={base} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <line x1="12" y1="7.5" x2="12" y2="13" />
+          <circle cx="12" cy="16.5" r="0.5" fill="currentColor" />
+        </svg>
+      );
+    case "danger":
+      return (
+        <svg className={base} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          <line x1="9" y1="9" x2="15" y2="15" />
+          <line x1="15" y1="9" x2="9" y2="15" />
+        </svg>
+      );
+    case "primary":
+      return (
+        <span className={`relative flex h-2.5 w-2.5 shrink-0 items-center justify-center ${className}`}>
+          <span className="absolute h-full w-full animate-ping rounded-full bg-current opacity-50" />
+          <span className="h-1.5 w-1.5 rounded-full bg-current" />
+        </span>
+      );
+    default:
+      return <DotIcon className={`shrink-0 ${className}`} />;
+  }
+}
+
+// 置信度三格量表：高亮格数对应高/中/低。
+function ConfidenceBars({ confidence }: { confidence: BrowserNatConfidence }) {
+  const filled = confidence === "high" ? 3 : confidence === "medium" ? 2 : 1;
+  const heights = ["h-1.5", "h-2", "h-2.5"];
+  return (
+    <span aria-hidden="true" className="flex items-end gap-0.5">
+      {heights.map((height, index) => (
+        <span
+          key={height}
+          className={`w-1 rounded-sm ${height} ${
+            index < filled
+              ? "bg-cyan-500 dark:bg-cyan-300"
+              : "bg-zinc-300/80 dark:bg-white/15"
+          }`}
+        />
+      ))}
+    </span>
+  );
+}
+
+function candidateTypeHint(type: string): string {
+  switch (type) {
+    case "srflx":
+      return "server-reflexive：STUN 服务看到的公网映射地址，即 NAT 分配给本机的公网出口。";
+    case "host":
+      return "host：本机网卡上的本地地址（内网 IP，或浏览器出于隐私生成的 .local mDNS 地址）。";
+    case "relay":
+      return "relay：经 TURN 中继分配的地址。本页只使用标准 STUN Binding，一般不会出现。";
+    case "prflx":
+      return "peer-reflexive：连接检查阶段由对端观察到的地址。";
+    default:
+      return "浏览器上报的其他 candidate 类型。";
+  }
 }
 
 function DotIcon({ className = "" }: { className?: string }) {
