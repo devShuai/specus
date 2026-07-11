@@ -43,14 +43,21 @@ export interface WhiteboardShapeObject extends WhiteboardObjectBase {
   shapeKind: WhiteboardShapeKind;
 }
 
+export interface WhiteboardFlowNodeObject extends WhiteboardObjectBase {
+  kind: "flow-node";
+  nodeKind: WhiteboardFlowNodeKind;
+  text: string;
+}
+
 export interface WhiteboardImageObject extends WhiteboardObjectBase {
   kind: "image";
   dataUrl: string;
   fileName: string;
 }
 
-export type WhiteboardObject = WhiteboardTextObject | WhiteboardShapeObject | WhiteboardImageObject;
+export type WhiteboardObject = WhiteboardTextObject | WhiteboardShapeObject | WhiteboardFlowNodeObject | WhiteboardImageObject;
 export type WhiteboardShapeKind = "rectangle" | "ellipse" | "arrow";
+export type WhiteboardFlowNodeKind = "start" | "process" | "decision" | "end";
 
 export type WhiteboardPayload =
   | {
@@ -117,7 +124,7 @@ interface SyncedWhiteboardProps {
   onSend: (payload: WhiteboardPayload) => void;
 }
 
-type WhiteboardTool = "select" | "pen" | "eraser" | "text" | WhiteboardShapeKind;
+type WhiteboardTool = "pan" | "select" | "pen" | "eraser" | "text" | WhiteboardShapeKind;
 
 interface ObjectDragState {
   objectId: string;
@@ -135,9 +142,22 @@ interface ShapeDraftState {
   start: WhiteboardPoint;
 }
 
+interface CanvasPanState {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startScrollLeft: number;
+  startScrollTop: number;
+}
+
 interface TextDraft {
   x: number;
   y: number;
+  text: string;
+}
+
+interface FlowLabelDraft {
+  objectId: string;
   text: string;
 }
 
@@ -164,7 +184,11 @@ const MAX_SNAPSHOT_POINTS = 120;
 const MAX_OBJECTS = 80;
 const MAX_SYNC_OBJECTS = 32;
 const MAX_TEXT_LENGTH = 500;
+const MAX_FLOW_LABEL_LENGTH = 120;
 const MAX_IMAGE_SOURCE_BYTES = 15 * 1024 * 1024;
+const WHITEBOARD_SURFACE_MIN_WIDTH = 720;
+const WHITEBOARD_SURFACE_HEIGHT = 1280;
+const MAX_CANVAS_PIXEL_COUNT = 8 * 1024 * 1024;
 const ERASER_COLOR = "#ffffff";
 
 export function SyncedWhiteboard({
@@ -177,6 +201,7 @@ export function SyncedWhiteboard({
   onSend,
 }: SyncedWhiteboardProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasViewportRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const strokesRef = useRef<WhiteboardStroke[]>([]);
   const objectsRef = useRef<WhiteboardObject[]>([]);
@@ -189,6 +214,7 @@ export function SyncedWhiteboard({
   const objectDragRef = useRef<ObjectDragState | null>(null);
   const objectResizeRef = useRef<ObjectResizeState | null>(null);
   const shapeDraftRef = useRef<ShapeDraftState | null>(null);
+  const canvasPanRef = useRef<CanvasPanState | null>(null);
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const redrawRef = useRef<() => void>(() => undefined);
 
@@ -199,6 +225,8 @@ export function SyncedWhiteboard({
   const [selectedTool, setSelectedTool] = useState<WhiteboardTool>("pen");
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
+  const [flowLabelDraft, setFlowLabelDraft] = useState<FlowLabelDraft | null>(null);
+  const [isFlowchartOpen, setIsFlowchartOpen] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isImportingImage, setIsImportingImage] = useState(false);
   const [boardMessage, setBoardMessage] = useState("画笔已就绪，可直接在画布上绘制。");
@@ -209,8 +237,15 @@ export function SyncedWhiteboard({
   const selectTool = useCallback((tool: WhiteboardTool) => {
     setSelectedTool(tool);
     if (tool === "text") {
-      setTextDraft((current) => current ?? { x: 0.18, y: 0.18, text: "" });
+      const center = canvasViewportCenter(canvasRef.current, canvasViewportRef.current);
+      setTextDraft((current) => current ?? {
+        x: clamp(center.x - 0.15, 0.02, 0.7),
+        y: clamp(center.y - 0.05, 0.02, 0.9),
+        text: "",
+      });
       setBoardMessage("输入文本，按 Ctrl/⌘ + Enter 插入，Esc 取消；也可以点击画布调整位置。");
+    } else if (tool === "pan") {
+      setBoardMessage("拖动画布可上下左右移动，桌面端也可以使用滚轮和滚动条。");
     }
   }, []);
 
@@ -239,7 +274,9 @@ export function SyncedWhiteboard({
     const rect = canvas.getBoundingClientRect();
     const width = Math.max(1, Math.floor(rect.width));
     const height = Math.max(1, Math.floor(rect.height));
-    const ratio = window.devicePixelRatio || 1;
+    const requestedRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelLimitedRatio = Math.sqrt(MAX_CANVAS_PIXEL_COUNT / (width * height));
+    const ratio = Math.max(1, Math.min(requestedRatio, pixelLimitedRatio));
     const backingWidth = Math.max(1, Math.floor(width * ratio));
     const backingHeight = Math.max(1, Math.floor(height * ratio));
     if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
@@ -298,7 +335,7 @@ export function SyncedWhiteboard({
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !textDraft) {
+      if (event.key === "Escape" && !textDraft && !flowLabelDraft) {
         setIsExpanded(false);
       }
     };
@@ -307,7 +344,7 @@ export function SyncedWhiteboard({
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isExpanded, textDraft]);
+  }, [flowLabelDraft, isExpanded, textDraft]);
 
   useEffect(() => {
     if (!isActive) {
@@ -322,6 +359,8 @@ export function SyncedWhiteboard({
     setObjects([]);
     selectObject(null);
     setTextDraft(null);
+    setFlowLabelDraft(null);
+    setIsFlowchartOpen(false);
     setBoardMessage("已切换到新的房间白板。");
     imageCacheRef.current.clear();
     seenEventsRef.current.clear();
@@ -330,7 +369,12 @@ export function SyncedWhiteboard({
     objectDragRef.current = null;
     objectResizeRef.current = null;
     shapeDraftRef.current = null;
+    canvasPanRef.current = null;
     pendingPointsRef.current = [];
+    if (canvasViewportRef.current) {
+      canvasViewportRef.current.scrollLeft = 0;
+      canvasViewportRef.current.scrollTop = 0;
+    }
     if (flushTimerRef.current !== null) {
       window.clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
@@ -431,6 +475,7 @@ export function SyncedWhiteboard({
     }
     if (payload.kind === "remove-object") {
       updateObjects((current) => current.filter((object) => object.objectId !== payload.objectId));
+      setFlowLabelDraft((current) => current?.objectId === payload.objectId ? null : current);
       if (selectedObjectIdRef.current === payload.objectId) {
         selectObject(null);
       }
@@ -440,6 +485,7 @@ export function SyncedWhiteboard({
       updateStrokes(() => []);
       updateObjects(() => []);
       selectObject(null);
+      setFlowLabelDraft(null);
       return;
     }
     if (payload.kind === "snapshot") {
@@ -544,8 +590,82 @@ export function SyncedWhiteboard({
     });
   }, [onSend]);
 
+  const getVisibleCanvasCenter = useCallback((): WhiteboardPoint => {
+    return canvasViewportCenter(canvasRef.current, canvasViewportRef.current);
+  }, []);
+
+  const startFlowNodeEdit = useCallback((objectId: string) => {
+    const object = objectsRef.current.find((item) => item.objectId === objectId);
+    if (object?.kind !== "flow-node") {
+      return;
+    }
+    setTextDraft(null);
+    setFlowLabelDraft({ objectId, text: object.text });
+    selectObject(objectId);
+    setSelectedTool("select");
+    setBoardMessage("编辑流程节点文字，按 Enter 保存，Esc 取消。");
+  }, [selectObject]);
+
+  const commitFlowLabelDraft = useCallback(() => {
+    if (!flowLabelDraft) {
+      return;
+    }
+    const object = objectsRef.current.find((item) => item.objectId === flowLabelDraft.objectId);
+    if (object?.kind !== "flow-node") {
+      setFlowLabelDraft(null);
+      return;
+    }
+    const updated: WhiteboardFlowNodeObject = {
+      ...object,
+      text: flowLabelDraft.text.trim() || "未命名节点",
+      updatedAt: Date.now(),
+    };
+    updateObjects((current) => current.map((item) => item.objectId === updated.objectId ? updated : item));
+    sendObject(updated);
+    setFlowLabelDraft(null);
+    setBoardMessage("流程节点文字已更新并同步。");
+  }, [flowLabelDraft, sendObject, updateObjects]);
+
+  const insertFlowNode = useCallback((nodeKind: WhiteboardFlowNodeKind, text: string) => {
+    const visibleCenter = getVisibleCanvasCenter();
+    const flowNodeCount = objectsRef.current.filter((object) => object.kind === "flow-node").length;
+    const offset = (flowNodeCount % 5) * 0.018;
+    const object = createFlowNodeObject(
+      peerId,
+      nodeKind,
+      text,
+      { x: visibleCenter.x + offset, y: visibleCenter.y + offset },
+      selectedColor,
+      Math.max(2, selectedWidth / 2),
+    );
+    updateObjects((current) => [...current, object]);
+    sendObject(object);
+    selectObject(object.objectId);
+    setTextDraft(null);
+    setFlowLabelDraft({ objectId: object.objectId, text: object.text });
+    setSelectedTool("select");
+    setBoardMessage("流程节点已插入，输入名称后按 Enter 保存。");
+  }, [getVisibleCanvasCenter, peerId, selectObject, selectedColor, selectedWidth, sendObject, updateObjects]);
+
+  const insertFlowTemplate = useCallback(() => {
+    const flowObjects = createFlowchartTemplate(
+      peerId,
+      getVisibleCanvasCenter(),
+      selectedColor,
+      Math.max(2, selectedWidth / 2),
+    );
+    updateObjects((current) => [...current, ...flowObjects]);
+    flowObjects.forEach(sendObject);
+    setTextDraft(null);
+    setFlowLabelDraft(null);
+    selectObject(flowObjects[0]?.objectId ?? null);
+    setSelectedTool("select");
+    setBoardMessage("基础流程已插入，节点和连接线已同步，可逐个编辑文字。");
+  }, [getVisibleCanvasCenter, peerId, selectObject, selectedColor, selectedWidth, sendObject, updateObjects]);
+
   const removeObject = useCallback((objectId: string) => {
     updateObjects((current) => current.filter((object) => object.objectId !== objectId));
+    setFlowLabelDraft((current) => current?.objectId === objectId ? null : current);
     if (selectedObjectIdRef.current === objectId) {
       selectObject(null);
     }
@@ -651,6 +771,23 @@ export function SyncedWhiteboard({
     if (event.button !== 0 && event.pointerType === "mouse") {
       return;
     }
+    if (selectedTool === "pan") {
+      const viewport = canvasViewportRef.current;
+      if (!viewport) {
+        return;
+      }
+      event.preventDefault();
+      canvasPanRef.current = {
+        pointerId: event.pointerId,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        startScrollLeft: viewport.scrollLeft,
+        startScrollTop: viewport.scrollTop,
+      };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      setBoardMessage("正在移动画布，松开后可继续编辑。");
+      return;
+    }
     const point = pointFromEvent(event);
     if (!point) {
       return;
@@ -659,7 +796,7 @@ export function SyncedWhiteboard({
       event.preventDefault();
       setTextDraft((current) => ({
         x: clamp(point.x, 0.02, 0.7),
-        y: clamp(point.y, 0.02, 0.78),
+        y: clamp(point.y, 0.02, 0.9),
         text: current?.text ?? "",
       }));
       setBoardMessage("输入文本，按 Ctrl/⌘ + Enter 插入，Esc 取消。");
@@ -706,6 +843,15 @@ export function SyncedWhiteboard({
   }, [peerId, removeObject, selectObject, selectedColor, selectedTool, selectedWidth, startStroke, updateObjects]);
 
   const handlePointerMove = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    const pan = canvasPanRef.current;
+    if (pan?.pointerId === event.pointerId) {
+      const viewport = canvasViewportRef.current;
+      if (viewport) {
+        viewport.scrollLeft = pan.startScrollLeft - (event.clientX - pan.startClientX);
+        viewport.scrollTop = pan.startScrollTop - (event.clientY - pan.startClientY);
+      }
+      return;
+    }
     const point = pointFromEvent(event);
     if (!point) {
       return;
@@ -722,6 +868,14 @@ export function SyncedWhiteboard({
   }, [moveStroke, updateObjectDrag, updateObjectResize, updateShapeDraft]);
 
   const handlePointerEnd = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (canvasPanRef.current?.pointerId === event.pointerId) {
+      canvasPanRef.current = null;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      setBoardMessage("画布已移动，可使用滚轮、滚动条或继续拖动浏览。");
+      return;
+    }
     const point = pointFromEvent(event);
     if (activeStrokeIdRef.current) {
       if (point) {
@@ -774,6 +928,18 @@ export function SyncedWhiteboard({
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
   }, [flushPendingPoints, moveStroke, sendObject, updateObjectDrag, updateObjectResize, updateObjects, updateShapeDraft]);
+
+  const handleCanvasDoubleClick = useCallback((event: React.MouseEvent<HTMLCanvasElement>) => {
+    const point = pointFromMouseEvent(event);
+    if (!point) {
+      return;
+    }
+    const object = findObjectAtPoint(objectsRef.current, point);
+    if (object?.kind === "flow-node") {
+      event.preventDefault();
+      startFlowNodeEdit(object.objectId);
+    }
+  }, [startFlowNodeEdit]);
 
   const commitTextDraft = useCallback(() => {
     if (!textDraft) {
@@ -832,12 +998,13 @@ export function SyncedWhiteboard({
       }
       objectWidth = clamp(objectWidth, 0.16, 0.55);
       objectHeight = clamp(objectHeight, 0.14, 0.55);
+      const visibleCenter = getVisibleCanvasCenter();
       const object: WhiteboardImageObject = {
         objectId: createWhiteboardId(peerId, "image"),
         sourcePeerId: peerId,
         kind: "image",
-        x: (1 - objectWidth) / 2,
-        y: (1 - objectHeight) / 2,
+        x: clamp(visibleCenter.x - objectWidth / 2, 0, 1 - objectWidth),
+        y: clamp(visibleCenter.y - objectHeight / 2, 0, 1 - objectHeight),
         width: objectWidth,
         height: objectHeight,
         color: selectedColor,
@@ -856,7 +1023,7 @@ export function SyncedWhiteboard({
     } finally {
       setIsImportingImage(false);
     }
-  }, [peerId, selectObject, selectedColor, sendObject, updateObjects]);
+  }, [getVisibleCanvasCenter, peerId, selectObject, selectedColor, sendObject, updateObjects]);
 
   const handleImageInput = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
@@ -936,6 +1103,7 @@ export function SyncedWhiteboard({
     }
     const shortcut = event.key.toLowerCase();
     const shortcuts: Partial<Record<string, WhiteboardTool>> = {
+      h: "pan",
       v: "select",
       p: "pen",
       e: "eraser",
@@ -956,24 +1124,35 @@ export function SyncedWhiteboard({
     () => strokes.length + " 笔 · " + objects.length + " 个对象",
     [objects.length, strokes.length],
   );
-  const cursorClass = selectedTool === "select"
-    ? "cursor-default"
-    : selectedTool === "text"
-      ? "cursor-text"
-      : "cursor-crosshair";
+  const selectedFlowNode = objects.find((object): object is WhiteboardFlowNodeObject => (
+    object.objectId === selectedObjectId && object.kind === "flow-node"
+  ));
+  const editingFlowNode = flowLabelDraft
+    ? objects.find((object): object is WhiteboardFlowNodeObject => (
+        object.objectId === flowLabelDraft.objectId && object.kind === "flow-node"
+      ))
+    : undefined;
+  const cursorClass = selectedTool === "pan"
+    ? "cursor-grab active:cursor-grabbing"
+    : selectedTool === "select"
+      ? "cursor-default"
+      : selectedTool === "text"
+        ? "cursor-text"
+        : "cursor-crosshair";
 
   const board = (
     <section
       className={
         (isExpanded
-          ? "fixed inset-0 z-[90] m-0 flex h-[100dvh] flex-col overflow-hidden rounded-none border-0 bg-zinc-100 p-3 dark:bg-zinc-950 sm:p-4"
+          ? "fixed inset-0 z-[90] m-0 h-[100dvh] overflow-hidden rounded-none border-0 bg-zinc-100 dark:bg-zinc-950"
           : "mt-5 rounded-xl glass glass-border border p-3 sm:p-4")
         + (isActive ? "" : " hidden")
       }
       aria-hidden={!isActive}
       onPaste={handleBoardPaste}
     >
-      <div className="flex shrink-0 flex-wrap items-start justify-between gap-3">
+      <input ref={imageInputRef} type="file" accept="image/*" hidden onChange={handleImageInput} />
+      {!isExpanded ? <div className="flex shrink-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步白板</h2>
@@ -985,7 +1164,7 @@ export function SyncedWhiteboard({
             </Chip>
           </div>
           <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-            插入的文本、图形和压缩图片会与笔画一起同步给房间设备。
+            可滚动画布支持文本、图片、图形和流程图，所有对象都会同步给房间设备。
           </div>
         </div>
         <Button
@@ -998,16 +1177,18 @@ export function SyncedWhiteboard({
           <span className="mr-1.5"><ToolGlyph name={isExpanded ? "collapse" : "fullscreen"} /></span>
           {isExpanded ? "退出全屏" : "全屏白板"}
         </Button>
-      </div>
+      </div> : null}
 
       <div
         className={
-          "mt-3 flex min-h-0 flex-col overflow-hidden rounded-xl border border-black/10 bg-white/70 shadow-sm dark:border-white/10 dark:bg-white/[0.04]"
-          + (isExpanded ? " flex-1" : "")
+          (isExpanded
+            ? "absolute inset-0 overflow-hidden bg-zinc-100 dark:bg-zinc-950"
+            : "mt-3 flex min-h-0 flex-col overflow-hidden rounded-xl border border-black/10 bg-white/70 shadow-sm dark:border-white/10 dark:bg-white/[0.04]")
         }
       >
-        <div className="shrink-0 border-b border-black/10 bg-white/80 p-2.5 dark:border-white/10 dark:bg-zinc-900/90">
+        {!isExpanded ? <div className="shrink-0 border-b border-black/10 bg-white/80 p-2.5 dark:border-white/10 dark:bg-zinc-900/90">
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1" role="toolbar" aria-label="白板工具">
+            <WhiteboardToolButton tool="pan" label="移动" activeTool={selectedTool} onSelect={selectTool} />
             <WhiteboardToolButton tool="select" label="选择" activeTool={selectedTool} onSelect={selectTool} />
             <WhiteboardToolButton tool="pen" label="画笔" activeTool={selectedTool} onSelect={selectTool} />
             <WhiteboardToolButton tool="eraser" label="橡皮" activeTool={selectedTool} onSelect={selectTool} />
@@ -1018,6 +1199,20 @@ export function SyncedWhiteboard({
             <WhiteboardToolButton tool="arrow" label="箭头" activeTool={selectedTool} onSelect={selectTool} />
             <button
               type="button"
+              aria-expanded={isFlowchartOpen}
+              className={
+                "flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[#4262ff] "
+                + (isFlowchartOpen
+                  ? "bg-[#ffd02f] text-[#1c1c1e] shadow-sm"
+                  : "text-zinc-700 hover:bg-[#fff4c4] hover:text-[#1c1c1e] dark:text-zinc-200 dark:hover:bg-[#ffd02f]/15 dark:hover:text-[#fff4c4]")
+              }
+              onClick={() => setIsFlowchartOpen((value) => !value)}
+            >
+              <ToolGlyph name="flow" />
+              流程图
+            </button>
+            <button
+              type="button"
               className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium text-zinc-700 transition hover:bg-cyan-50 hover:text-cyan-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100"
               onClick={() => imageInputRef.current?.click()}
               disabled={isImportingImage}
@@ -1025,8 +1220,21 @@ export function SyncedWhiteboard({
               <ToolGlyph name="image" />
               {isImportingImage ? "处理中" : "图片"}
             </button>
-            <input ref={imageInputRef} type="file" accept="image/*" hidden onChange={handleImageInput} />
           </div>
+
+          {isFlowchartOpen ? (
+            <FlowchartPanel
+              className="mt-2"
+              selectedNode={selectedFlowNode}
+              onInsertNode={insertFlowNode}
+              onInsertTemplate={insertFlowTemplate}
+              onSelectConnector={() => {
+                selectTool("arrow");
+                setBoardMessage("连接线已就绪，在画布上拖动绘制带箭头的连线。");
+              }}
+              onEditNode={startFlowNodeEdit}
+            />
+          ) : null}
 
           <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-black/5 pt-2 dark:border-white/5">
             <div className="flex items-center gap-1.5" aria-label="画笔颜色">
@@ -1090,10 +1298,14 @@ export function SyncedWhiteboard({
               清空
             </Button>
           </div>
-        </div>
+        </div> : null}
 
         <div
-          className={"relative min-h-0 overflow-hidden bg-white" + (isExpanded ? " flex-1" : "")}
+          ref={canvasViewportRef}
+          className={isExpanded
+            ? "absolute inset-0 overflow-auto overscroll-contain bg-zinc-100 dark:bg-zinc-900"
+            : "min-h-0 overflow-auto overscroll-contain bg-zinc-100 dark:bg-zinc-900"}
+          style={{ maxHeight: isExpanded ? undefined : "clamp(420px, 70dvh, 760px)" }}
           onDragOver={(event) => {
             if (Array.from(event.dataTransfer.items).some((item) => item.kind === "file" && item.type.startsWith("image/"))) {
               event.preventDefault();
@@ -1101,59 +1313,267 @@ export function SyncedWhiteboard({
           }}
           onDrop={handleImageDrop}
         >
-          <canvas
-            ref={canvasRef}
-            className={"block w-full touch-none bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 " + cursorClass}
-            style={{ height: isExpanded ? "100%" : "clamp(320px, 58dvh, 680px)" }}
-            aria-label="同步白板画布"
-            tabIndex={0}
-            onKeyDown={handleCanvasKeyDown}
-            onPointerDown={handlePointerDown}
-            onPointerMove={handlePointerMove}
-            onPointerUp={handlePointerEnd}
-            onPointerCancel={handlePointerEnd}
-            onPointerLeave={(event) => {
-              if ((activeStrokeIdRef.current || shapeDraftRef.current || objectResizeRef.current || objectDragRef.current) && event.pointerType === "mouse") {
-                handlePointerEnd(event);
-              }
+          <div
+            className="relative bg-white shadow-sm"
+            style={{
+              width: "100%",
+              minWidth: WHITEBOARD_SURFACE_MIN_WIDTH,
+              height: isExpanded ? `max(${WHITEBOARD_SURFACE_HEIGHT}px, 100dvh)` : WHITEBOARD_SURFACE_HEIGHT,
             }}
-          />
-          {textDraft ? (
-            <textarea
-              autoFocus
-              value={textDraft.text}
-              maxLength={MAX_TEXT_LENGTH}
-              placeholder="输入文本..."
-              aria-label="白板文本框内容"
-              className="absolute z-20 h-28 w-[min(18rem,72%)] resize-none rounded-lg border-2 border-cyan-500 bg-white/95 p-3 text-small text-zinc-950 shadow-xl outline-none ring-4 ring-cyan-500/10"
-              style={{
-                left: Math.min(textDraft.x, 0.26) * 100 + "%",
-                top: Math.min(textDraft.y, 0.64) * 100 + "%",
-              }}
-              onChange={(event) => {
-                const value = event.currentTarget.value;
-                setTextDraft((current) => current ? { ...current, text: value } : current);
-              }}
-              onPointerDown={(event) => event.stopPropagation()}
-              onBlur={() => commitTextDraft()}
-              onKeyDown={(event) => {
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  setTextDraft(null);
-                  setBoardMessage("已取消文本框。");
-                } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                  event.preventDefault();
-                  commitTextDraft();
+          >
+            <canvas
+              ref={canvasRef}
+              className={"block h-full w-full touch-none bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 " + cursorClass}
+              aria-label="同步白板画布"
+              tabIndex={0}
+              onKeyDown={handleCanvasKeyDown}
+              onDoubleClick={handleCanvasDoubleClick}
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerEnd}
+              onPointerCancel={handlePointerEnd}
+              onPointerLeave={(event) => {
+                if ((activeStrokeIdRef.current || shapeDraftRef.current || objectResizeRef.current || objectDragRef.current)
+                  && event.pointerType === "mouse") {
+                  handlePointerEnd(event);
                 }
               }}
             />
-          ) : null}
+            {!isExpanded ? <div className="pointer-events-none absolute right-3 top-3 rounded-full border border-[#e0e2e8] bg-white/90 px-2.5 py-1 text-[10px] font-medium text-[#6b6f7e] shadow-sm">
+              可滚动画布 · {WHITEBOARD_SURFACE_MIN_WIDTH} × {WHITEBOARD_SURFACE_HEIGHT}
+            </div> : null}
+            {textDraft ? (
+              <textarea
+                autoFocus
+                value={textDraft.text}
+                maxLength={MAX_TEXT_LENGTH}
+                placeholder="输入文本..."
+                aria-label="白板文本框内容"
+                className="absolute z-20 h-28 w-[min(18rem,72%)] resize-none rounded-lg border-2 border-cyan-500 bg-white/95 p-3 text-small text-zinc-950 shadow-xl outline-none ring-4 ring-cyan-500/10"
+                style={{
+                  left: Math.min(textDraft.x, 0.26) * 100 + "%",
+                  top: Math.min(textDraft.y, 0.88) * 100 + "%",
+                }}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  setTextDraft((current) => current ? { ...current, text: value } : current);
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+                onBlur={() => commitTextDraft()}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setTextDraft(null);
+                    setBoardMessage("已取消文本框。");
+                  } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                    event.preventDefault();
+                    commitTextDraft();
+                  }
+                }}
+              />
+            ) : null}
+            {flowLabelDraft && editingFlowNode ? (
+              <input
+                autoFocus
+                value={flowLabelDraft.text}
+                maxLength={MAX_FLOW_LABEL_LENGTH}
+                aria-label="流程图节点文字"
+                className="absolute z-20 h-11 min-w-36 rounded-md border-2 border-[#4262ff] bg-white/95 px-3 text-center text-small font-semibold text-[#1c1c1e] shadow-xl outline-none ring-4 ring-[#4262ff]/10"
+                style={{
+                  left: editingFlowNode.x * 100 + "%",
+                  top: (editingFlowNode.y + editingFlowNode.height / 2) * 100 + "%",
+                  width: editingFlowNode.width * 100 + "%",
+                  transform: "translateY(-50%)",
+                }}
+                onChange={(event) => {
+                  const text = event.currentTarget.value;
+                  setFlowLabelDraft((current) => current ? { ...current, text } : current);
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+                onBlur={commitFlowLabelDraft}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setFlowLabelDraft(null);
+                    setBoardMessage("已取消流程节点文字编辑。");
+                  } else if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitFlowLabelDraft();
+                  }
+                }}
+              />
+            ) : null}
+          </div>
         </div>
 
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/10 bg-white/80 px-3 py-2 text-tiny text-zinc-500 dark:border-white/10 dark:bg-zinc-900/90 dark:text-zinc-400">
+        {isExpanded ? (
+          <>
+            <aside
+              className="absolute bottom-2 left-2 top-2 z-30 flex w-16 flex-col items-center gap-2 overflow-y-auto rounded-2xl border border-black/10 bg-white/95 p-1.5 shadow-2xl backdrop-blur-xl dark:border-white/15 dark:bg-zinc-950/95"
+              aria-label="全屏白板工具栏"
+            >
+              <div className="flex flex-col items-center gap-1" role="toolbar" aria-label="白板工具">
+                <WhiteboardToolButton compact tool="pan" label="移动" activeTool={selectedTool} onSelect={selectTool} />
+                <WhiteboardToolButton compact tool="select" label="选择" activeTool={selectedTool} onSelect={selectTool} />
+                <WhiteboardToolButton compact tool="pen" label="画笔" activeTool={selectedTool} onSelect={selectTool} />
+                <WhiteboardToolButton compact tool="eraser" label="橡皮" activeTool={selectedTool} onSelect={selectTool} />
+                <WhiteboardToolButton compact tool="text" label="文本" activeTool={selectedTool} onSelect={selectTool} />
+                <WhiteboardToolButton compact tool="rectangle" label="矩形" activeTool={selectedTool} onSelect={selectTool} />
+                <WhiteboardToolButton compact tool="ellipse" label="圆形" activeTool={selectedTool} onSelect={selectTool} />
+                <WhiteboardToolButton compact tool="arrow" label="箭头" activeTool={selectedTool} onSelect={selectTool} />
+                <button
+                  type="button"
+                  aria-expanded={isFlowchartOpen}
+                  className={
+                    "flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[#4262ff] "
+                    + (isFlowchartOpen
+                      ? "bg-[#ffd02f] text-[#1c1c1e] shadow-sm"
+                      : "text-zinc-700 hover:bg-[#fff4c4] dark:text-zinc-200 dark:hover:bg-[#ffd02f]/15")
+                  }
+                  onClick={() => setIsFlowchartOpen((value) => !value)}
+                >
+                  <ToolGlyph name="flow" />
+                  流程图
+                </button>
+                <button
+                  type="button"
+                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-cyan-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-cyan-300/10"
+                  onClick={() => imageInputRef.current?.click()}
+                  disabled={isImportingImage}
+                >
+                  <ToolGlyph name="image" />
+                  {isImportingImage ? "处理中" : "图片"}
+                </button>
+              </div>
+
+              <div className="h-px w-10 shrink-0 bg-black/10 dark:bg-white/10" />
+              <div className="grid grid-cols-2 gap-1" aria-label="画笔颜色">
+                {WHITEBOARD_COLORS.map((color) => (
+                  <button
+                    key={color.value}
+                    type="button"
+                    aria-label={"选择" + color.label}
+                    title={color.label}
+                    onClick={() => {
+                      setSelectedColor(color.value);
+                      if (selectedTool === "eraser") {
+                        setSelectedTool("pen");
+                      }
+                    }}
+                    className={
+                      "h-5 w-5 rounded-full border transition-transform focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                      + (selectedColor === color.value && selectedTool !== "eraser"
+                        ? "scale-110 border-zinc-950 ring-2 ring-cyan-400 dark:border-white"
+                        : "border-black/15 dark:border-white/20")
+                    }
+                    style={{ backgroundColor: color.value }}
+                  />
+                ))}
+              </div>
+              <div className="grid grid-cols-2 gap-1" aria-label="线条宽度">
+                {WHITEBOARD_WIDTHS.map((width) => (
+                  <button
+                    key={width.value}
+                    type="button"
+                    aria-label={width.label + "线条"}
+                    title={width.label + "线条"}
+                    onClick={() => setSelectedWidth(width.value)}
+                    className={
+                      "flex h-7 w-7 items-center justify-center rounded-md transition focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                      + (selectedWidth === width.value
+                        ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
+                        : "bg-black/5 text-zinc-700 dark:bg-white/10 dark:text-zinc-200")
+                    }
+                  >
+                    <span className="block w-4 rounded-full bg-current" style={{ height: Math.max(2, width.value / 2) }} />
+                  </button>
+                ))}
+              </div>
+            </aside>
+
+            {isFlowchartOpen ? (
+              <FlowchartPanel
+                className="absolute left-[4.75rem] top-2 z-40 max-h-[calc(100dvh-1rem)] w-[min(18rem,calc(100vw-5.5rem))] overflow-y-auto shadow-2xl"
+                selectedNode={selectedFlowNode}
+                onInsertNode={insertFlowNode}
+                onInsertTemplate={insertFlowTemplate}
+                onSelectConnector={() => {
+                  selectTool("arrow");
+                  setBoardMessage("连接线已就绪，在画布上拖动绘制带箭头的连线。");
+                }}
+                onEditNode={startFlowNodeEdit}
+              />
+            ) : null}
+
+            <aside
+              className={
+                "absolute right-2 top-2 z-30 w-[min(15rem,calc(100vw-5.5rem))] rounded-2xl border border-black/10 bg-white/95 p-3 shadow-2xl backdrop-blur-xl dark:border-white/15 dark:bg-zinc-950/95 "
+                + (isFlowchartOpen ? "max-sm:hidden" : "")
+              }
+              aria-label="全屏白板状态"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-small font-semibold text-zinc-950 dark:text-white">同步白板</div>
+                  <div className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">当前状态与操作提示</div>
+                </div>
+                <button
+                  type="button"
+                  className="flex h-8 shrink-0 items-center gap-1 rounded-md bg-black/5 px-2 text-[10px] font-medium text-zinc-700 transition hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15"
+                  onClick={() => setIsExpanded(false)}
+                >
+                  <ToolGlyph name="collapse" />
+                  退出
+                </button>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
+                  {isConnected ? "实时同步" : "本地绘制"}
+                </Chip>
+                <Chip size="sm" radius="sm" variant="flat">{totalPeers} 台</Chip>
+                <Chip size="sm" radius="sm" variant="flat">{boardCountLabel}</Chip>
+              </div>
+              <div className="mt-2 rounded-lg border border-cyan-500/15 bg-cyan-500/[0.08] px-2.5 py-2 text-[11px] leading-5 text-zinc-700 dark:text-zinc-200">
+                {boardMessage}
+              </div>
+              <div className="mt-2 text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">
+                H 移动 · V 选择 · P 画笔 · T 文本<br />
+                可滚动画布 · {WHITEBOARD_SURFACE_MIN_WIDTH} × {WHITEBOARD_SURFACE_HEIGHT}
+              </div>
+              <div className="mt-2 grid grid-cols-3 gap-1.5 border-t border-black/5 pt-2 dark:border-white/10">
+                <Button size="sm" radius="sm" variant="flat" className="min-w-0 px-1" onPress={undoLastLocalElement} isDisabled={!localElementExists}>
+                  撤销
+                </Button>
+                <Button
+                  size="sm"
+                  radius="sm"
+                  variant="flat"
+                  className="min-w-0 px-1"
+                  isDisabled={!selectedObjectId}
+                  onPress={() => selectedObjectId && removeObject(selectedObjectId)}
+                >
+                  删除
+                </Button>
+                <Button
+                  size="sm"
+                  radius="sm"
+                  color="danger"
+                  variant="flat"
+                  className="min-w-0 px-1"
+                  onPress={clearBoard}
+                  isDisabled={strokes.length === 0 && objects.length === 0}
+                >
+                  清空
+                </Button>
+              </div>
+            </aside>
+          </>
+        ) : null}
+
+        {!isExpanded ? <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/10 bg-white/80 px-3 py-2 text-tiny text-zinc-500 dark:border-white/10 dark:bg-zinc-900/90 dark:text-zinc-400">
           <span>{boardMessage}</span>
-          <span className="hidden font-mono text-[10px] sm:inline">V 选择 · P 画笔 · T 文本 · Delete 删除</span>
-        </div>
+          <span className="hidden font-mono text-[10px] sm:inline">H 移动 · V 选择 · P 画笔 · T 文本 · Delete 删除</span>
+        </div> : null}
       </div>
     </section>
   );
@@ -1165,11 +1585,13 @@ function WhiteboardToolButton({
   label,
   activeTool,
   onSelect,
+  compact = false,
 }: {
   tool: WhiteboardTool;
   label: string;
   activeTool: WhiteboardTool;
   onSelect: (tool: WhiteboardTool) => void;
+  compact?: boolean;
 }) {
   const active = tool === activeTool;
   return (
@@ -1177,7 +1599,10 @@ function WhiteboardToolButton({
       type="button"
       aria-pressed={active}
       className={
-        "flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+        "flex shrink-0 items-center rounded-md font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+        + (compact
+          ? "h-11 w-12 flex-col justify-center gap-0.5 px-1 text-[9px] leading-none "
+          : "h-10 gap-1.5 px-2.5 text-tiny ")
         + (active
           ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
           : "text-zinc-700 hover:bg-cyan-50 hover:text-cyan-900 dark:text-zinc-200 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100")
@@ -1190,7 +1615,98 @@ function WhiteboardToolButton({
   );
 }
 
-function ToolGlyph({ name }: { name: WhiteboardTool | "image" | "fullscreen" | "collapse" }) {
+function FlowchartPanel({
+  className = "",
+  selectedNode,
+  onInsertNode,
+  onInsertTemplate,
+  onSelectConnector,
+  onEditNode,
+}: {
+  className?: string;
+  selectedNode?: WhiteboardFlowNodeObject;
+  onInsertNode: (nodeKind: WhiteboardFlowNodeKind, text: string) => void;
+  onInsertTemplate: () => void;
+  onSelectConnector: () => void;
+  onEditNode: (objectId: string) => void;
+}) {
+  return (
+    <div
+      className={
+        "flex flex-wrap items-center gap-2 rounded-xl border border-[#fcb900]/60 bg-[#fff8e0]/95 p-2.5 backdrop-blur-xl dark:border-[#ffd02f]/25 dark:bg-zinc-950/95 "
+        + className
+      }
+      aria-label="流程图模块"
+    >
+      <span className="w-full px-1 text-tiny font-semibold text-[#746019] dark:text-[#fff4c4]">流程节点</span>
+      <FlowchartPaletteButton nodeKind="start" label="开始" onClick={() => onInsertNode("start", "开始")} />
+      <FlowchartPaletteButton nodeKind="process" label="处理" onClick={() => onInsertNode("process", "处理步骤")} />
+      <FlowchartPaletteButton nodeKind="decision" label="判断" onClick={() => onInsertNode("decision", "判断条件")} />
+      <FlowchartPaletteButton nodeKind="end" label="结束" onClick={() => onInsertNode("end", "结束")} />
+      <button
+        type="button"
+        className="flex h-9 items-center gap-1.5 rounded-md border border-[#e0e2e8] bg-white px-2.5 text-tiny font-medium text-[#1c1c1e] transition hover:border-[#4262ff] hover:text-[#2a41b6] dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-100"
+        onClick={onSelectConnector}
+      >
+        <ToolGlyph name="arrow" />
+        连接线
+      </button>
+      <button
+        type="button"
+        className="h-9 rounded-md bg-[#1c1c1e] px-3 text-tiny font-medium text-white transition hover:bg-[#2c2c34] dark:bg-[#ffd02f] dark:text-[#1c1c1e]"
+        onClick={onInsertTemplate}
+      >
+        一键基础流程
+      </button>
+      <button
+        type="button"
+        className="h-9 rounded-md border border-[#c7cad5] bg-white px-3 text-tiny font-medium text-[#1c1c1e] transition hover:border-[#4262ff] disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-100"
+        disabled={!selectedNode}
+        onClick={() => selectedNode && onEditNode(selectedNode.objectId)}
+      >
+        编辑所选节点
+      </button>
+      <span className="w-full px-1 text-[11px] text-[#6b6f7e] dark:text-zinc-400">双击节点也可修改文字</span>
+    </div>
+  );
+}
+
+function FlowchartPaletteButton({
+  nodeKind,
+  label,
+  onClick,
+}: {
+  nodeKind: WhiteboardFlowNodeKind;
+  label: string;
+  onClick: () => void;
+}) {
+  const tone = nodeKind === "start"
+    ? "bg-[#fff4c4] border-[#fcb900]"
+    : nodeKind === "process"
+      ? "bg-[#c3faf5] border-[#0fbcb0]"
+      : nodeKind === "decision"
+        ? "bg-[#fde0f0] border-[#ff9999]"
+        : "bg-[#ffe6cd] border-[#ea580c]";
+  return (
+    <button
+      type="button"
+      className="flex h-9 items-center gap-2 rounded-md border border-[#e0e2e8] bg-white px-2.5 text-tiny font-medium text-[#1c1c1e] transition hover:border-[#4262ff] hover:shadow-sm dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-100"
+      onClick={onClick}
+    >
+      <span
+        className={
+          "block h-4 w-6 border " + tone
+          + (nodeKind === "start" || nodeKind === "end" ? " rounded-full" : " rounded-[3px]")
+          + (nodeKind === "decision" ? " rotate-45" : "")
+        }
+        aria-hidden
+      />
+      {label}
+    </button>
+  );
+}
+
+function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "fullscreen" | "collapse" }) {
   const common = {
     className: "h-4 w-4 shrink-0",
     fill: "none",
@@ -1201,6 +1717,9 @@ function ToolGlyph({ name }: { name: WhiteboardTool | "image" | "fullscreen" | "
     viewBox: "0 0 24 24",
     "aria-hidden": true,
   };
+  if (name === "pan") {
+    return <svg {...common}><path d="M8 11V6a1.5 1.5 0 013 0v4-6a1.5 1.5 0 013 0v6-4a1.5 1.5 0 013 0v5-2a1.5 1.5 0 013 0v5c0 4-2.5 7-7 7h-1c-2.5 0-4.2-1-5.5-2.8L3 14a1.7 1.7 0 012.6-2.1L8 14" /></svg>;
+  }
   if (name === "select") {
     return <svg {...common}><path d="M5 3l12 9-6 1.5L8.5 20 5 3z" /></svg>;
   }
@@ -1221,6 +1740,9 @@ function ToolGlyph({ name }: { name: WhiteboardTool | "image" | "fullscreen" | "
   }
   if (name === "arrow") {
     return <svg {...common}><path d="M4 17L19 6M13 6h6v6" /></svg>;
+  }
+  if (name === "flow") {
+    return <svg {...common}><rect x="4" y="3" width="7" height="5" rx="2" /><path d="M7.5 8v3m0 0h9m-9 0v3m9-3v3" /><rect x="4" y="14" width="7" height="6" rx="1" /><path d="M16.5 14l3.5 3-3.5 3-3.5-3 3.5-3z" /></svg>;
   }
   if (name === "image") {
     return <svg {...common}><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8" cy="9" r="1.5" /><path d="M4 17l5-5 4 4 3-3 5 5" /></svg>;
@@ -1279,6 +1801,30 @@ function pointFromEvent(event: React.PointerEvent<HTMLCanvasElement>): Whiteboar
   };
 }
 
+function pointFromMouseEvent(event: React.MouseEvent<HTMLCanvasElement>): WhiteboardPoint | null {
+  const rect = event.currentTarget.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+  return {
+    x: clamp((event.clientX - rect.left) / rect.width, 0, 1),
+    y: clamp((event.clientY - rect.top) / rect.height, 0, 1),
+  };
+}
+
+function canvasViewportCenter(
+  canvas: HTMLCanvasElement | null,
+  viewport: HTMLDivElement | null,
+): WhiteboardPoint {
+  if (!canvas || !viewport || canvas.clientWidth <= 0 || canvas.clientHeight <= 0) {
+    return { x: 0.5, y: 0.25 };
+  }
+  return {
+    x: clamp((viewport.scrollLeft + viewport.clientWidth / 2) / canvas.clientWidth, 0, 1),
+    y: clamp((viewport.scrollTop + viewport.clientHeight / 2) / canvas.clientHeight, 0, 1),
+  };
+}
+
 function createWhiteboardId(peerId: string, kind: string) {
   return peerId + "-" + kind + "-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 }
@@ -1302,6 +1848,86 @@ function createShapeObject(
     color,
     strokeWidth,
     updatedAt: Date.now(),
+  };
+}
+
+function createFlowNodeObject(
+  peerId: string,
+  nodeKind: WhiteboardFlowNodeKind,
+  text: string,
+  center: WhiteboardPoint,
+  color: string,
+  strokeWidth: number,
+  updatedAt = Date.now(),
+): WhiteboardFlowNodeObject {
+  const size = flowNodeSize(nodeKind);
+  return {
+    objectId: createWhiteboardId(peerId, "flow-" + nodeKind),
+    sourcePeerId: peerId,
+    kind: "flow-node",
+    nodeKind,
+    text,
+    x: clamp(center.x - size.width / 2, 0, 1 - size.width),
+    y: clamp(center.y - size.height / 2, 0, 1 - size.height),
+    width: size.width,
+    height: size.height,
+    color,
+    strokeWidth,
+    updatedAt,
+  };
+}
+
+function flowNodeSize(nodeKind: WhiteboardFlowNodeKind) {
+  if (nodeKind === "start" || nodeKind === "end") {
+    return { width: 0.18, height: 0.07 };
+  }
+  if (nodeKind === "decision") {
+    return { width: 0.22, height: 0.11 };
+  }
+  return { width: 0.22, height: 0.085 };
+}
+
+function createFlowchartTemplate(
+  peerId: string,
+  visibleCenter: WhiteboardPoint,
+  color: string,
+  strokeWidth: number,
+): WhiteboardObject[] {
+  const centerX = clamp(visibleCenter.x, 0.14, 0.86);
+  const baseY = clamp(visibleCenter.y - 0.24, 0.025, 0.445);
+  const createdAt = Date.now();
+  const start = createFlowNodeObject(peerId, "start", "开始", { x: centerX, y: baseY + 0.035 }, color, strokeWidth, createdAt);
+  const process = createFlowNodeObject(peerId, "process", "处理步骤", { x: centerX, y: baseY + 0.1825 }, color, strokeWidth, createdAt + 1);
+  const decision = createFlowNodeObject(peerId, "decision", "判断条件", { x: centerX, y: baseY + 0.335 }, color, strokeWidth, createdAt + 2);
+  const end = createFlowNodeObject(peerId, "end", "结束", { x: centerX, y: baseY + 0.505 }, color, strokeWidth, createdAt + 3);
+  const arrows = [
+    createFlowArrow(peerId, { x: centerX, y: baseY + 0.07 }, { x: centerX, y: baseY + 0.14 }, color, strokeWidth, createdAt + 4),
+    createFlowArrow(peerId, { x: centerX, y: baseY + 0.225 }, { x: centerX, y: baseY + 0.28 }, color, strokeWidth, createdAt + 5),
+    createFlowArrow(peerId, { x: centerX, y: baseY + 0.39 }, { x: centerX, y: baseY + 0.47 }, color, strokeWidth, createdAt + 6),
+  ];
+  return [start, arrows[0], process, arrows[1], decision, arrows[2], end];
+}
+
+function createFlowArrow(
+  peerId: string,
+  start: WhiteboardPoint,
+  end: WhiteboardPoint,
+  color: string,
+  strokeWidth: number,
+  updatedAt: number,
+): WhiteboardShapeObject {
+  return {
+    objectId: createWhiteboardId(peerId, "flow-arrow"),
+    sourcePeerId: peerId,
+    kind: "shape",
+    shapeKind: "arrow",
+    x: start.x,
+    y: start.y,
+    width: end.x - start.x || 0.0001,
+    height: end.y - start.y || 0.0001,
+    color,
+    strokeWidth,
+    updatedAt,
   };
 }
 
@@ -1486,6 +2112,8 @@ function drawBoardObject(
     drawShape(context, object, width, height);
   } else if (object.kind === "text") {
     drawTextObject(context, object, width, height);
+  } else if (object.kind === "flow-node") {
+    drawFlowNode(context, object, width, height);
   } else {
     drawImageObject(context, object, width, height, imageCache, onImageReady);
   }
@@ -1570,6 +2198,64 @@ function drawTextObject(
   lines.slice(0, maxLines).forEach((line, index) => {
     const suffix = index === maxLines - 1 && lines.length > maxLines ? "…" : "";
     context.fillText(line + suffix, x + padding, y + padding + index * lineHeight, boxWidth - padding * 2);
+  });
+  context.restore();
+}
+
+function drawFlowNode(
+  context: CanvasRenderingContext2D,
+  object: WhiteboardFlowNodeObject,
+  width: number,
+  height: number,
+) {
+  const x = object.x * width;
+  const y = object.y * height;
+  const boxWidth = Math.max(100, object.width * width);
+  const boxHeight = Math.max(60, object.height * height);
+  const fillColor = object.nodeKind === "start"
+    ? "#fff4c4"
+    : object.nodeKind === "process"
+      ? "#c3faf5"
+      : object.nodeKind === "decision"
+        ? "#fde0f0"
+        : "#ffe6cd";
+
+  context.save();
+  context.fillStyle = fillColor;
+  context.strokeStyle = object.color;
+  context.lineWidth = Math.max(1.5, object.strokeWidth);
+  context.lineJoin = "round";
+  context.shadowColor = "rgba(5, 0, 56, 0.12)";
+  context.shadowBlur = 10;
+  context.shadowOffsetY = 3;
+  context.beginPath();
+  if (object.nodeKind === "decision") {
+    context.moveTo(x + boxWidth / 2, y);
+    context.lineTo(x + boxWidth, y + boxHeight / 2);
+    context.lineTo(x + boxWidth / 2, y + boxHeight);
+    context.lineTo(x, y + boxHeight / 2);
+    context.closePath();
+  } else {
+    const radius = object.nodeKind === "start" || object.nodeKind === "end"
+      ? boxHeight / 2
+      : Math.min(12, boxHeight / 4);
+    context.roundRect(x, y, boxWidth, boxHeight, radius);
+  }
+  context.fill();
+  context.shadowColor = "transparent";
+  context.stroke();
+
+  const fontSize = clamp(boxHeight * 0.2, 14, 18);
+  const textWidth = boxWidth * (object.nodeKind === "decision" ? 0.58 : 0.82);
+  context.fillStyle = "#1c1c1e";
+  context.font = "600 " + fontSize + "px Inter, system-ui, sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  const lines = wrapCanvasText(context, object.text, textWidth).slice(0, 3);
+  const lineHeight = fontSize * 1.25;
+  const startY = y + boxHeight / 2 - ((lines.length - 1) * lineHeight) / 2;
+  lines.forEach((line, index) => {
+    context.fillText(line, x + boxWidth / 2, startY + index * lineHeight, textWidth);
   });
   context.restore();
 }
@@ -1790,6 +2476,15 @@ function isWhiteboardObject(value: unknown): value is WhiteboardObject {
   }
   if (value.width <= 0 || value.height <= 0 || value.x + value.width > 1 || value.y + value.height > 1) {
     return false;
+  }
+  if (value.kind === "flow-node") {
+    return (value.nodeKind === "start"
+        || value.nodeKind === "process"
+        || value.nodeKind === "decision"
+        || value.nodeKind === "end")
+      && typeof value.text === "string"
+      && value.text.length > 0
+      && value.text.length <= MAX_FLOW_LABEL_LENGTH;
   }
   if (value.kind === "text") {
     return typeof value.text === "string"
