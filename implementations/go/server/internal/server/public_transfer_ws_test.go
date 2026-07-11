@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -79,6 +80,44 @@ func TestPublicTransferDiscoveryIsolationRosterAndTargetedSignal(t *testing.T) {
 	if got := len(isolatedRoster["peers"].([]any)); got != 1 {
 		t.Fatalf("public-IP room leaked peers: %d", got)
 	}
+}
+
+func TestPublicTransferDiscoveryRejectsDuplicatePeerIDInSameGroup(t *testing.T) {
+	hub := newPublicTransferDiscoveryHub(config.PublicTransferConfig{
+		MaxDiscoveryPeersPerRoom:               4,
+		DiscoveryMessageRateLimitPerConnection: 10,
+		DiscoveryMessageRateLimitWindowSeconds: 60,
+	})
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	baseURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/?roomId=duplicate-room&roomToken=secret"
+
+	first := dialDiscovery(t, baseURL+"&peerId=reused", "198.51.100.1")
+	defer first.CloseNow()
+	readDiscoveryType(t, first, "hello")
+	readDiscoveryType(t, first, "roster")
+
+	duplicate := dialDiscovery(t, baseURL+"&peerId=reused", "203.0.113.2")
+	defer duplicate.CloseNow()
+	errorMessage := readDiscoveryType(t, duplicate, "error")
+	if errorMessage["error"] != "peer id is already connected" {
+		t.Fatalf("unexpected duplicate-peer error: %#v", errorMessage)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, err := duplicate.Read(ctx)
+	if status := websocket.CloseStatus(err); status != websocket.StatusPolicyViolation {
+		t.Fatalf("duplicate-peer close status = %d err=%v, want %d", status, err, websocket.StatusPolicyViolation)
+	}
+	var closeError websocket.CloseError
+	if !errors.As(err, &closeError) || closeError.Reason != "peer id is already connected" {
+		t.Fatalf("duplicate-peer close reason = %#v, want %q", closeError.Reason, "peer id is already connected")
+	}
+
+	otherGroup := dialDiscovery(t, baseURL+"-other&peerId=reused", "192.0.2.3")
+	defer otherGroup.CloseNow()
+	readDiscoveryType(t, otherGroup, "hello")
+	readDiscoveryType(t, otherGroup, "roster")
 }
 
 func TestPublicTransferDiscoveryRateLimitAndTrustedAddress(t *testing.T) {

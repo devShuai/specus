@@ -41,6 +41,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final Map<String, Participant> participantsBySession = new ConcurrentHashMap<>();
     private final Map<String, RateWindow> messageWindowsBySession = new ConcurrentHashMap<>();
+    private final Object participantJoinLock = new Object();
     private final ObjectMapper objectMapper = new ObjectMapper()
             .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
@@ -57,14 +58,23 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
         session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
         Participant participant = Participant.from(session);
-        if (roomPeerCount(participant) >= Math.max(1, properties.getMaxDiscoveryPeersPerRoom())) {
-            send(session, Map.of("type", "error", "error", "room is full"));
+        String joinError = null;
+        synchronized (participantJoinLock) {
+            if (hasConnectedPeerId(participant)) {
+                joinError = "peer id is already connected";
+            } else if (roomPeerCount(participant) >= Math.max(1, properties.getMaxDiscoveryPeersPerRoom())) {
+                joinError = "room is full";
+            } else {
+                sessions.add(session);
+                participantsBySession.put(session.getId(), participant);
+                messageWindowsBySession.put(session.getId(), new RateWindow(System.currentTimeMillis()));
+            }
+        }
+        if (joinError != null) {
+            send(session, Map.of("type", "error", "error", joinError));
             closeQuietly(session, CloseStatus.POLICY_VIOLATION);
             return;
         }
-        sessions.add(session);
-        participantsBySession.put(session.getId(), participant);
-        messageWindowsBySession.put(session.getId(), new RateWindow(System.currentTimeMillis()));
         send(session, Map.of(
                 "type", "hello",
                 "peerId", participant.peerId(),
@@ -173,6 +183,11 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         return participantsBySession.values().stream()
                 .filter(peer -> peer.sameGroup(group))
                 .count();
+    }
+
+    private boolean hasConnectedPeerId(Participant participant) {
+        return participantsBySession.values().stream()
+                .anyMatch(peer -> peer.sameGroup(participant) && peer.peerId().equals(participant.peerId()));
     }
 
     private boolean allowMessage(WebSocketSession session) {

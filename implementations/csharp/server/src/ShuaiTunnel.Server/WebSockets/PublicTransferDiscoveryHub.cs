@@ -13,12 +13,14 @@ public sealed class PublicTransferDiscoveryHub
 {
     private const int MaxMessageChars = 64 * 1024;
     private const int MaxMessageUtf8Bytes = MaxMessageChars * 3;
+    private const string DuplicatePeerIdError = "peer id is already connected";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
 
     private readonly ConcurrentDictionary<Guid, Participant> _participants = new();
+    private readonly object _participantsGate = new();
     private readonly PublicTransferOptions _options;
     private readonly ILogger<PublicTransferDiscoveryHub> _logger;
 
@@ -39,18 +41,17 @@ public sealed class PublicTransferDiscoveryHub
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
         var participant = Participant.From(context, socket);
-        if (_participants.Values.Count(peer => peer.SameGroup(participant))
-            >= Math.Max(1, _options.MaxDiscoveryPeersPerRoom))
+        var registrationError = Register(participant);
+        if (registrationError is not null)
         {
-            await participant.SendAsync(new { type = "error", error = "room is full" },
+            await participant.SendAsync(new { type = "error", error = registrationError },
                 context.RequestAborted).ConfigureAwait(false);
-            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "room is full")
+            await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, registrationError)
                 .ConfigureAwait(false);
             participant.Dispose();
             return;
         }
 
-        _participants[participant.Id] = participant;
         try
         {
             await participant.SendAsync(new
@@ -95,11 +96,38 @@ public sealed class PublicTransferDiscoveryHub
         }
         finally
         {
-            _participants.TryRemove(participant.Id, out _);
+            RemoveParticipant(participant.Id);
             await BroadcastRosterAsync(participant, CancellationToken.None).ConfigureAwait(false);
             await CloseQuietlyAsync(socket, WebSocketCloseStatus.NormalClosure, "bye")
                 .ConfigureAwait(false);
             participant.Dispose();
+        }
+    }
+
+    private string? Register(Participant participant)
+    {
+        lock (_participantsGate)
+        {
+            var group = _participants.Values.Where(peer => peer.SameGroup(participant)).ToArray();
+            if (group.Any(peer => string.Equals(peer.PeerId, participant.PeerId,
+                    StringComparison.Ordinal)))
+            {
+                return DuplicatePeerIdError;
+            }
+            if (group.Length >= Math.Max(1, _options.MaxDiscoveryPeersPerRoom))
+            {
+                return "room is full";
+            }
+            _participants[participant.Id] = participant;
+            return null;
+        }
+    }
+
+    private void RemoveParticipant(Guid participantId)
+    {
+        lock (_participantsGate)
+        {
+            _participants.TryRemove(participantId, out _);
         }
     }
 
@@ -200,7 +228,7 @@ public sealed class PublicTransferDiscoveryHub
         catch (Exception ex) when (ex is WebSocketException or ObjectDisposedException
             or OperationCanceledException)
         {
-            _participants.TryRemove(peer.Id, out _);
+            RemoveParticipant(peer.Id);
             _logger.LogDebug(ex, "public transfer discovery send failed: peer={Peer}", peer.PeerId);
         }
     }

@@ -22,6 +22,7 @@ import (
 const (
 	maxDiscoveryMessageChars     = 64 * 1024
 	maxDiscoveryMessageUTF8Bytes = maxDiscoveryMessageChars * 3
+	duplicateDiscoveryPeerError  = "peer id is already connected"
 )
 
 type discoveryParticipant struct {
@@ -80,9 +81,9 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 	} else {
 		participant.roomKey = "public:" + participant.publicAddress
 	}
-	if !h.register(participant) {
-		_ = socket.write(map[string]any{"type": "error", "error": "room is full"})
-		_ = conn.Close(websocket.StatusPolicyViolation, "room is full")
+	if registrationError := h.register(participant); registrationError != "" {
+		_ = socket.write(map[string]any{"type": "error", "error": registrationError})
+		_ = conn.Close(websocket.StatusPolicyViolation, registrationError)
 		return
 	}
 	defer func() {
@@ -120,7 +121,7 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func (h *publicTransferDiscoveryHub) register(participant discoveryParticipant) bool {
+func (h *publicTransferDiscoveryHub) register(participant discoveryParticipant) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	limit := h.cfg.MaxDiscoveryPeersPerRoom
@@ -130,14 +131,17 @@ func (h *publicTransferDiscoveryHub) register(participant discoveryParticipant) 
 	count := 0
 	for _, existing := range h.participants {
 		if existing.sameGroup(participant) {
+			if existing.peerID == participant.peerID {
+				return duplicateDiscoveryPeerError
+			}
 			count++
 		}
 	}
 	if count >= limit {
-		return false
+		return "room is full"
 	}
 	h.participants[participant.socket] = participant
-	return true
+	return ""
 }
 
 func (h *publicTransferDiscoveryHub) unregister(socket *discoverySocket) {

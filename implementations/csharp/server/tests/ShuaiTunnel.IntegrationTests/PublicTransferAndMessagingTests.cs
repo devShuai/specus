@@ -56,6 +56,35 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task PublicDiscoveryRejectsDuplicatePeerIdInSameGroup()
+    {
+        var webSockets = _server!.Server.CreateWebSocketClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var uri = new Uri(
+            "ws://localhost/ws/public-transfer/discovery?roomId=duplicate-room&roomToken=secret&peerId=reused");
+
+        using var first = await webSockets.ConnectAsync(uri, cts.Token);
+        _ = await ReceiveTextAsync(first, cts.Token);
+        _ = await ReceiveTextAsync(first, cts.Token);
+
+        using var duplicate = await webSockets.ConnectAsync(uri, cts.Token);
+        using var error = JsonDocument.Parse(await ReceiveTextAsync(duplicate, cts.Token));
+        Assert.Equal("error", error.RootElement.GetProperty("type").GetString());
+        Assert.Equal("peer id is already connected", error.RootElement.GetProperty("error").GetString());
+
+        var close = await duplicate.ReceiveAsync(new byte[16], cts.Token);
+        Assert.Equal(WebSocketMessageType.Close, close.MessageType);
+        Assert.Equal(WebSocketCloseStatus.PolicyViolation, close.CloseStatus);
+        Assert.Equal("peer id is already connected", close.CloseStatusDescription);
+
+        using var otherGroup = await webSockets.ConnectAsync(new Uri(
+            "ws://localhost/ws/public-transfer/discovery?roomId=duplicate-room&roomToken=other&peerId=reused"),
+            cts.Token);
+        using var hello = JsonDocument.Parse(await ReceiveTextAsync(otherGroup, cts.Token));
+        Assert.Equal("hello", hello.RootElement.GetProperty("type").GetString());
+    }
+
+    [Fact]
     public async Task PublicDiscoveryUsesJavaUtf16CharacterLimitRatherThanUtf8ByteLimit()
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
