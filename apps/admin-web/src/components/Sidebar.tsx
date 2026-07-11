@@ -1,10 +1,11 @@
+import type { ReactNode } from "react";
 import { AppLogo } from "./AppLogo";
 
 export interface NavItem { key: string; title: string; }
 export interface NavGroup { label: string; items: NavItem[]; }
-export interface SidebarProps { groups: NavGroup[]; active: string; onSelect: (k: string) => void; variant?: "desktop" | "mobile"; onClose?: () => void; }
+export interface SidebarProps { groups: NavGroup[]; active: string; onSelect: (k: string) => void; variant?: "desktop" | "mobile"; onClose?: () => void; footer?: ReactNode; }
 
-export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose }: SidebarProps) {
+export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose, footer }: SidebarProps) {
   return <nav aria-label="主导航" className="flex h-full flex-col">
     {variant === "desktop" && <div className="flex h-16 shrink-0 items-center px-3"><AppLogo className="min-w-0" label="shuai-tunnel" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
     <div className="flex-1 overflow-y-auto px-2 py-3">
@@ -19,7 +20,7 @@ export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose
         </li>})}</ul>
       </div>)}
     </div>
-    {variant === "desktop" && <div className="shrink-0 px-3 py-3" />}
+    {variant === "desktop" && <div className="shrink-0 px-2 py-3">{footer}</div>}
   </nav>;
 }
 

@@ -102,23 +102,24 @@ function DashboardContent() {
     finally { setInitializing(false); }
   };
 
-  const renderActions = (cls: string) => <div className={cls}><UserMenu profile={profile} onLogout={logout} /></div>;
-
   return (
     <div className="flex min-h-screen">
       <aside className="hidden w-60 shrink-0 bg-background shadow-[1px_0_3px_rgba(0,0,0,0.04)] lg:fixed lg:inset-y-0 lg:left-0 lg:z-30 lg:flex lg:flex-col">
-        <Sidebar groups={visibleGroups} active={renderedPanel} onSelect={activatePanel} variant="desktop" />
+        <Sidebar
+          groups={visibleGroups}
+          active={renderedPanel}
+          onSelect={activatePanel}
+          variant="desktop"
+          footer={<UserMenu profile={profile} onLogout={logout} variant="block" />}
+        />
       </aside>
       <div className="flex min-w-0 flex-1 flex-col lg:ml-60">
-        <header className="bg-background/80 backdrop-blur">
-          <div className="flex items-center gap-2 px-3 py-2 sm:px-4 lg:hidden">
+        <header className="bg-background/80 backdrop-blur lg:hidden">
+          <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
             <Button isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
             <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
             <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
-            {renderActions("flex shrink-0 items-center gap-1.5")}
-          </div>
-          <div className="hidden h-16 w-full px-4 py-3 sm:px-6 lg:flex lg:items-center lg:justify-end lg:py-0">
-            {renderActions("flex shrink-0 items-center gap-3")}
+            <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
           </div>
         </header>
         <main className="mx-auto w-full min-w-0 max-w-[1440px] flex-1 p-3 sm:p-4">
@@ -150,16 +151,26 @@ function MobileNav({ open, groups, active, onSelect, onClose }: { open: boolean;
 function HamburgerIcon() { return <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>; }
 function CloseIcon() { return <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M6 6l12 12M6 18L18 6" /></svg>; }
 
-function UserMenu({ profile, onLogout }: { profile: ReturnType<typeof useAuth>["profile"]; onLogout: () => void }) {
+function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType<typeof useAuth>["profile"]; onLogout: () => void; variant?: "icon" | "block" }) {
   const name = profile?.username || "user";
   const initials = name.slice(0, 1).toUpperCase();
   const { theme, setTheme, resetToSystem, userOverride } = useTheme();
   return (
-    <Dropdown placement="bottom-end" shouldBlockScroll={false}>
+    <Dropdown placement={variant === "block" ? "top-start" : "bottom-end"} shouldBlockScroll={false}>
       <DropdownTrigger>
-        <Button isIconOnly aria-label="个人菜单" className="h-10 w-10 min-w-10 rounded-full" radius="full" variant="flat">
-          <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
-        </Button>
+        {variant === "block" ? (
+          <Button aria-label="个人菜单" className="h-auto w-full justify-start gap-2.5 px-2.5 py-2" radius="sm" variant="light">
+            <Avatar className="h-8 w-8 shrink-0 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
+            <span className="flex min-w-0 flex-col items-start">
+              <span className="w-full truncate text-left text-small font-medium text-foreground">{name}</span>
+              <span className="w-full truncate text-left text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"}</span>
+            </span>
+          </Button>
+        ) : (
+          <Button isIconOnly aria-label="个人菜单" className="h-10 w-10 min-w-10 rounded-full" radius="full" variant="flat">
+            <Avatar className="h-7 w-7 bg-primary-500 text-primary-foreground" name={initials} size="sm" />
+          </Button>
+        )}
       </DropdownTrigger>
       <DropdownMenu aria-label="个人菜单" onAction={(key) => {
         if (key === "logout") onLogout();
