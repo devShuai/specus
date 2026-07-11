@@ -86,8 +86,7 @@ const semanticColors = {
   },
 };
 
-// default = zinc 色阶（中性边框/底纹用）。DEFAULT/foreground 按深浅反转：浅色实底按钮=深、暗色实底按钮=浅，
-// 与 HeroUI 默认中性按钮语义一致。色阶共用，DEFAULT/foreground 分主题给。
+// default = zinc 色阶（中性边框/底纹用）。浅色主题沿用标准 zinc。
 const zincScale = {
   50: "#fafafa",
   100: "#f4f4f5",
@@ -99,6 +98,21 @@ const zincScale = {
   700: "#3f3f46",
   800: "#27272a",
   900: "#18181b",
+};
+
+// Linear 风格的暗色层级：深色表面在前、可读文字在后。HeroUI 的暗色语义色阶必须
+// 与浅色相反，否则 text-default-600 会落成深灰，bg/border-default-* 也会反向失真。
+const linearDarkScale = {
+  50: "#0f1011",
+  100: "#141516",
+  200: "#23252a",
+  300: "#34343a",
+  400: "#8a8f98",
+  500: "#a8adb6",
+  600: "#d0d6e0",
+  700: "#e0e4ea",
+  800: "#eef0f3",
+  900: "#f7f8f8",
 };
 
 export default {
@@ -154,13 +168,14 @@ export default {
         dark: {
           colors: {
             ...semanticColors,
-            default: { ...zincScale, DEFAULT: "#fafafa", foreground: "#18181b" },
-            background: "#09090b",
-            foreground: "#f4f4f5",
-            content1: "#18181b",
-            content2: "#27272a",
-            content3: "#3f3f46",
-            divider: "#27272a",
+            default: { ...linearDarkScale, DEFAULT: "#34343a", foreground: "#f7f8f8" },
+            background: "#010102",
+            foreground: { ...linearDarkScale, DEFAULT: "#f7f8f8" },
+            content1: { DEFAULT: "#0f1011", foreground: "#f7f8f8" },
+            content2: { DEFAULT: "#141516", foreground: "#d0d6e0" },
+            content3: { DEFAULT: "#18191a", foreground: "#d0d6e0" },
+            content4: { DEFAULT: "#23252a", foreground: "#d0d6e0" },
+            divider: "#23252a",
             focus: "#22d3ee",
           },
         },

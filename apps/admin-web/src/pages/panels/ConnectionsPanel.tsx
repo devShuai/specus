@@ -32,6 +32,9 @@ import { useAuth } from "../../auth/AuthContext";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 
 const PAGE_SIZE = 50;
+const FILTER_POPOVER_CLASS_NAMES = {
+  content: "border border-default-200 bg-content1 text-foreground shadow-large",
+} as const;
 
 export function ConnectionsPanel() {
   const { expireSession } = useAuth();
@@ -284,7 +287,7 @@ export function ConnectionsPanel() {
 
       {/* desktop: 表格 + 搜索条件在表头 */}
       <div className="hidden min-w-0 xl:block">
-      <Card shadow="none" className="rounded-md border border-default-200">
+      <Card shadow="none" className="overflow-visible rounded-lg border border-default-200 bg-content1">
         <CardBody className="p-3">
         <div className="mb-2 flex justify-end gap-2">
             <Button className="h-9" size="sm" variant="flat" onPress={reset}>重置</Button>
@@ -293,7 +296,11 @@ export function ConnectionsPanel() {
         <Table
           key={tableCollectionKey}
           aria-label="连接记录"
-          classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
+          classNames={{
+            table: "w-full table-fixed",
+            th: "h-10 bg-content2 px-2 text-tiny font-semibold text-default-600",
+            td: "border-b border-divider/70 px-2 py-2.5 align-middle text-small text-default-700",
+          }}
           isHeaderSticky
           removeWrapper
         >
@@ -360,7 +367,7 @@ export function ConnectionsPanel() {
       </Card>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-small text-default-500">
+        <span className="text-small text-default-600">
           {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
         </span>
         <Pagination
@@ -392,7 +399,7 @@ function ConnectionClientFilterHeader({
 
   return (
     <TableFilterHeader label={label} active={Boolean(selectedClientId)} title="筛选客户端">
-      <Dropdown placement="bottom-start" shouldBlockScroll={false}>
+      <Dropdown classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
         <DropdownTrigger>
           <Button
             isIconOnly
@@ -436,7 +443,7 @@ function ConnectionResultFilterHeader({
 
   return (
     <TableFilterHeader label={label} active={Boolean(selectedResult)} title="筛选结果">
-      <Dropdown placement="bottom-start" shouldBlockScroll={false}>
+      <Dropdown classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
         <DropdownTrigger>
           <Button
             isIconOnly
@@ -480,7 +487,7 @@ function ConnectionDateFilterHeader({
 
   return (
     <TableFilterHeader label={label} active={active} title="筛选连接时间">
-      <Popover placement="bottom-start" shouldBlockScroll={false}>
+      <Popover classNames={FILTER_POPOVER_CLASS_NAMES} placement="bottom-start" shouldBlockScroll={false}>
         <PopoverTrigger>
           <Button
             isIconOnly
@@ -496,7 +503,7 @@ function ConnectionDateFilterHeader({
         </PopoverTrigger>
         <PopoverContent className="w-64 p-3">
           <div className="flex w-full flex-col gap-3">
-            <div className="text-small font-semibold">连接时间范围</div>
+            <div className="text-small font-semibold text-foreground">连接时间范围</div>
             <Input label="开始日期" size="sm" type="date" value={fromDate} onValueChange={onFromChange} />
             <Input label="结束日期" size="sm" type="date" value={toDate} onValueChange={onToChange} />
             <Button size="sm" variant="flat" onPress={() => { onFromChange(""); onToChange(""); }}>
@@ -522,7 +529,7 @@ function TableFilterHeader({
 }) {
   return (
     <div className="flex min-w-0 items-center gap-1">
-      <span className="truncate" title={label}>
+      <span className={`truncate ${active ? "text-foreground" : "text-default-600"}`} title={label}>
         {label}
       </span>
       <span title={title}>{children}</span>
