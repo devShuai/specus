@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button, Chip } from "@heroui/react";
+import {
+  fitWhiteboardImageDataUrl,
+  MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH,
+} from "../lib/whiteboardImageCompression";
 
 export interface WhiteboardPoint {
   x: number;
@@ -161,7 +165,6 @@ const MAX_OBJECTS = 80;
 const MAX_SYNC_OBJECTS = 32;
 const MAX_TEXT_LENGTH = 500;
 const MAX_IMAGE_SOURCE_BYTES = 15 * 1024 * 1024;
-const MAX_IMAGE_DATA_URL_LENGTH = 48 * 1024;
 const ERASER_COLOR = "#ffffff";
 
 export function SyncedWhiteboard({
@@ -1801,7 +1804,7 @@ function isWhiteboardObject(value: unknown): value is WhiteboardObject {
       && value.fileName.length > 0
       && value.fileName.length <= 120
       && typeof value.dataUrl === "string"
-      && value.dataUrl.length <= MAX_IMAGE_DATA_URL_LENGTH
+      && value.dataUrl.length <= MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH
       && /^data:image\/jpeg;base64,[a-zA-Z0-9+/=]+$/.test(value.dataUrl);
   }
   return false;
@@ -1846,33 +1849,25 @@ async function compressWhiteboardImage(file: File) {
   if (sourceWidth <= 0 || sourceHeight <= 0) {
     throw new Error("无法读取图片尺寸");
   }
-  let scale = Math.min(1, 1200 / Math.max(sourceWidth, sourceHeight));
-  let quality = 0.82;
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
   if (!context) {
     throw new Error("当前浏览器无法处理图片");
   }
-  for (let attempt = 0; attempt < 14; attempt += 1) {
-    const width = Math.max(1, Math.round(sourceWidth * scale));
-    const height = Math.max(1, Math.round(sourceHeight * scale));
-    canvas.width = width;
-    canvas.height = height;
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, width, height);
-    context.drawImage(image, 0, 0, width, height);
-    const dataUrl = canvas.toDataURL("image/jpeg", quality);
-    if (dataUrl.length <= MAX_IMAGE_DATA_URL_LENGTH) {
-      return { dataUrl, width, height };
+  let renderedWidth = 0;
+  let renderedHeight = 0;
+  return fitWhiteboardImageDataUrl(sourceWidth, sourceHeight, (width, height, quality) => {
+    if (width !== renderedWidth || height !== renderedHeight) {
+      canvas.width = width;
+      canvas.height = height;
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(image, 0, 0, width, height);
+      renderedWidth = width;
+      renderedHeight = height;
     }
-    if (quality > 0.42) {
-      quality -= 0.1;
-    } else {
-      scale *= 0.78;
-      quality = 0.72;
-    }
-  }
-  throw new Error("图片内容过于复杂，压缩后仍无法通过白板同步通道");
+    return canvas.toDataURL("image/jpeg", quality);
+  });
 }
 
 function loadImageFile(file: File) {
