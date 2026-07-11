@@ -1209,7 +1209,7 @@ function PublicTransferPageContent() {
       <div className="landing-grid" aria-hidden="true" />
       <div className="landing-scanline" aria-hidden="true" />
 
-      <header className="relative z-10 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
+      <header className="relative z-10 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
         <AppLogo label="shuai-tunnel" subtitle="互传" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="flex shrink-0 items-center gap-2">
           <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
@@ -1219,7 +1219,7 @@ function PublicTransferPageContent() {
         </div>
       </header>
 
-      <section className="relative z-10 mx-auto grid w-full max-w-[1120px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <section className="relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 xl:grid-cols-[minmax(0,1fr)_320px]">
         <div className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-6">
           <div className="flex flex-col gap-2">
             <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">互传</div>
@@ -1513,7 +1513,7 @@ function PublicTransferPageContent() {
           </div>
         </div>
 
-        <aside className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5">
+        <aside className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5 xl:sticky xl:top-5 xl:self-start">
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold">发送给谁</h2>
@@ -1772,7 +1772,7 @@ function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClo
 
   return (
     <Modal isOpen={Boolean(target)} onClose={onClose} size="5xl" scrollBehavior="inside">
-      <ModalContent className="max-w-[min(96vw,1180px)]">
+      <ModalContent className="max-w-[min(96vw,1480px)]">
         {target && (
           <>
             <ModalHeader className="flex min-w-0 flex-col gap-2 pr-12">
