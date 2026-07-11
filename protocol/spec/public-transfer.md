@@ -276,8 +276,16 @@ DataChannel 打开后再次发送同一事件。具有事件标识的应用 payl
 `clipboard` WebSocket envelope。
 
 同步白板使用 `messageType: "whiteboard"` 或 WebSocket `type: "whiteboard"`，payload 版本标记为 `STWB1`。
-当前定义的白板事件种类为 `stroke-start`、`stroke-points`、`stroke-end`、`remove-stroke`、`clear` 和 `snapshot`。
-白板笔画、快照和去重状态只保存在参与浏览器的当前内存中，发现服务端只做临时转发，不持久化白板内容。
+当前定义的白板事件种类为 `stroke-start`、`stroke-points`、`stroke-end`、`remove-stroke`、`object-upsert`、
+`remove-object`、`clear` 和 `snapshot`。`object-upsert` 用于新增或更新文本框、矩形、椭圆、箭头与图片对象；对象坐标和尺寸
+使用 `0..1` 的画布归一化值，接收端必须拒绝越界对象。`remove-object` 使用对象 ID 删除对应对象，重复接收应保持幂等。
+
+白板图片在发送前必须缩放并编码为 JPEG data URL，完整 `dataUrl` 不超过 `48 KiB` 个 UTF-16 code unit，为 WebSocket
+回退 envelope 和对象元数据预留第 2.5 节的消息空间。接收端只能接受 `data:image/jpeg;base64,`，不得加载远程图片 URL。
+新成员加入时，现有成员可先发送笔画 `snapshot`，再以独立 `object-upsert` 事件补发最近的对象，避免多张内联图片合并后
+超过单消息上限。未知对象种类或未知事件种类必须忽略，以兼容只支持笔画的旧页面。
+
+白板笔画、对象、快照和去重状态只保存在参与浏览器的当前内存中，发现服务端只做临时转发，不持久化白板内容。
 
 #### 2.4.2 剪贴板文本 `STCLIP1`
 
