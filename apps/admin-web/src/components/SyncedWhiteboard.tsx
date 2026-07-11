@@ -63,6 +63,7 @@ interface SyncedWhiteboardProps {
   peerId: string;
   peerCount: number;
   isConnected: boolean;
+  isActive?: boolean;
   events: WhiteboardInboundEvent[];
   onSend: (payload: WhiteboardPayload) => void;
 }
@@ -94,6 +95,7 @@ export function SyncedWhiteboard({
   peerId,
   peerCount,
   isConnected,
+  isActive = true,
   events,
   onSend,
 }: SyncedWhiteboardProps) {
@@ -113,11 +115,9 @@ export function SyncedWhiteboard({
   const totalPeers = peerCount + 1;
 
   const updateStrokes = useCallback((updater: (current: WhiteboardStroke[]) => WhiteboardStroke[]) => {
-    setStrokes((current) => {
-      const next = updater(current).slice(-MAX_STROKES);
-      strokesRef.current = next;
-      return next;
-    });
+    const next = updater(strokesRef.current).slice(-MAX_STROKES);
+    strokesRef.current = next;
+    setStrokes(next);
   }, []);
 
   const redraw = useCallback(() => {
@@ -162,6 +162,14 @@ export function SyncedWhiteboard({
     redraw();
     return () => observer.disconnect();
   }, [redraw]);
+
+  useEffect(() => {
+    if (!isActive) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(redraw);
+    return () => window.cancelAnimationFrame(frame);
+  }, [isActive, redraw]);
 
   useEffect(() => {
     strokesRef.current = [];
@@ -213,8 +221,22 @@ export function SyncedWhiteboard({
     }
     if (payload.kind === "stroke-start") {
       updateStrokes((current) => {
-        if (current.some((stroke) => stroke.strokeId === payload.strokeId)) {
-          return current;
+        const index = current.findIndex((stroke) => stroke.strokeId === payload.strokeId);
+        if (index >= 0) {
+          const next = [...current];
+          const stroke = next[index];
+          const points = stroke.points.length > 0 && shouldKeepPoint(payload.point, stroke.points[0])
+            ? [payload.point, ...stroke.points]
+            : stroke.points.length > 0 ? stroke.points : [payload.point];
+          next[index] = {
+            ...stroke,
+            sourcePeerId: event.sourcePeerId,
+            color: payload.color,
+            width: payload.width,
+            points: trimStrokePoints(points),
+            updatedAt: Math.max(stroke.updatedAt, payload.createdAt),
+          };
+          return next;
         }
         return [
           ...current,
@@ -287,17 +309,30 @@ export function SyncedWhiteboard({
       pendingPointsRef.current = [];
       return;
     }
-    const points = pendingPointsRef.current.splice(0, MAX_EVENT_POINTS);
-    if (points.length === 0 && kind === "stroke-points") {
+    if (pendingPointsRef.current.length === 0 && kind === "stroke-points") {
       return;
     }
-    onSend({
-      type: "STWB1",
-      kind,
-      strokeId,
-      points,
-      createdAt: Date.now(),
-    });
+    let batchIndex = 0;
+    while (pendingPointsRef.current.length > 0) {
+      const points = pendingPointsRef.current.splice(0, MAX_EVENT_POINTS);
+      onSend({
+        type: "STWB1",
+        kind: kind === "stroke-end" && pendingPointsRef.current.length === 0 ? "stroke-end" : "stroke-points",
+        strokeId,
+        points,
+        createdAt: Date.now() + batchIndex,
+      });
+      batchIndex += 1;
+    }
+    if (kind === "stroke-end" && batchIndex === 0) {
+      onSend({
+        type: "STWB1",
+        kind: "stroke-end",
+        strokeId,
+        points: [],
+        createdAt: Date.now(),
+      });
+    }
   }, [onSend]);
 
   const scheduleFlush = useCallback(() => {
@@ -413,7 +448,7 @@ export function SyncedWhiteboard({
   const strokeCountLabel = useMemo(() => `${strokes.length} 笔`, [strokes.length]);
 
   return (
-    <section className="mt-5 rounded-lg glass glass-border border p-4">
+    <section className={`mt-5 rounded-lg glass glass-border border p-4 ${isActive ? "" : "hidden"}`} aria-hidden={!isActive}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步白板</h2>

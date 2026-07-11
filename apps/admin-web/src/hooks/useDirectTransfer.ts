@@ -55,6 +55,7 @@ export interface DirectTransferResult {
 type DirectTransferPhase = "connecting" | "waiting" | "direct";
 
 interface DirectIncomingState {
+  scopeKey: string;
   transferId: string;
   sourcePeerId: string;
   fileName: string;
@@ -66,12 +67,16 @@ interface DirectIncomingState {
 }
 
 interface DirectAckWaiter {
+  targetPeerId: string;
+  channel: RTCDataChannel;
+  scopeKey: string;
   resolve: () => void;
   reject: (error: Error) => void;
   timer: number;
 }
 
 interface DirectPendingRequest extends DirectPendingTransfer {
+  scopeKey: string;
   expectedSha256?: string | null;
   channel: RTCDataChannel;
   timer?: number;
@@ -79,6 +84,7 @@ interface DirectPendingRequest extends DirectPendingTransfer {
 
 interface UseDirectTransferOptions {
   selfPeerId?: string;
+  connectionScopeKey?: string;
   iceConfig: PublicTransferIceConfig | null;
   peers: DirectTransferPeer[];
   directMemoryLimitBytes: number;
@@ -100,9 +106,16 @@ const DEFAULT_RECEIVING_TRANSFER_LIMIT = 10;
 export function useDirectTransfer(options: UseDirectTransferOptions) {
   const optionsRef = useRef(options);
   const iceConfigRef = useRef<PublicTransferIceConfig | null>(options.iceConfig);
+  const activePeerIdsRef = useRef<Set<string>>(new Set(options.peers.map((peer) => peer.peerId)));
+  const connectionScopeRef = useRef(options.connectionScopeKey ?? "default");
+  const resetScopeRef = useRef(options.connectionScopeKey ?? "default");
+  const manualResetCounterRef = useRef(0);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const peerConnectionScopesRef = useRef<WeakMap<RTCPeerConnection, string>>(new WeakMap());
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
+  const dataChannelScopesRef = useRef<WeakMap<RTCDataChannel, string>>(new WeakMap());
   const openingChannelsRef = useRef<Map<string, Promise<RTCDataChannel>>>(new Map());
+  const openingChannelScopesRef = useRef<Map<string, string>>(new Map());
   const directIncomingRef = useRef<Map<string, DirectIncomingState>>(new Map());
   const directChannelTransfersRef = useRef<Map<RTCDataChannel, string>>(new Map());
   const pendingDirectRequestsRef = useRef<Map<string, DirectPendingRequest>>(new Map());
@@ -114,41 +127,130 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
 
   optionsRef.current = options;
   iceConfigRef.current = options.iceConfig;
+  activePeerIdsRef.current = new Set(options.peers.map((peer) => peer.peerId));
+  connectionScopeRef.current = options.connectionScopeKey ?? "default";
 
-  useEffect(() => () => {
-    for (const connection of peerConnectionsRef.current.values()) {
-      connection.close();
-    }
-    for (const waiter of directAckWaitersRef.current.values()) {
-      window.clearTimeout(waiter.timer);
-      waiter.reject(new Error("page closed"));
-    }
-    for (const request of pendingDirectRequestsRef.current.values()) {
-      if (request.timer !== undefined) {
-        window.clearTimeout(request.timer);
+  const isCurrentDataChannel = useCallback((peerId: string, channel: RTCDataChannel, scopeKey: string) => (
+    connectionScopeRef.current === scopeKey
+    && activePeerIdsRef.current.has(peerId)
+    && dataChannelScopesRef.current.get(channel) === scopeKey
+    && dataChannelsRef.current.get(peerId) === channel
+  ), []);
+
+  const isCurrentPeerConnection = useCallback((peerId: string, connection: RTCPeerConnection, scopeKey: string) => (
+    connectionScopeRef.current === scopeKey
+    && activePeerIdsRef.current.has(peerId)
+    && peerConnectionScopesRef.current.get(connection) === scopeKey
+    && peerConnectionsRef.current.get(peerId) === connection
+  ), []);
+
+  const rejectDirectAckWaiters = useCallback((
+    predicate: (waiter: DirectAckWaiter) => boolean,
+    reason: string,
+  ) => {
+    for (const [transferId, waiter] of directAckWaitersRef.current) {
+      if (!predicate(waiter)) {
+        continue;
       }
+      directAckWaitersRef.current.delete(transferId);
+      window.clearTimeout(waiter.timer);
+      waiter.reject(new Error(reason));
     }
+  }, []);
+
+  const resetDirectState = useCallback((reason: string, updateView: boolean) => {
+    const connections = [...peerConnectionsRef.current.values()];
+    const channels = new Set([
+      ...dataChannelsRef.current.values(),
+      ...directChannelTransfersRef.current.keys(),
+      ...pendingChannelTransfersRef.current.keys(),
+      ...[...directAckWaitersRef.current.values()].map((waiter) => waiter.channel),
+    ]);
+    const waiters = [...directAckWaitersRef.current.values()];
+    const pendingRequests = [...pendingDirectRequestsRef.current.values()];
     peerConnectionsRef.current.clear();
     dataChannelsRef.current.clear();
     openingChannelsRef.current.clear();
+    openingChannelScopesRef.current.clear();
     directIncomingRef.current.clear();
     directChannelTransfersRef.current.clear();
     pendingDirectRequestsRef.current.clear();
     pendingChannelTransfersRef.current.clear();
     receivingProgressRef.current.clear();
     directAckWaitersRef.current.clear();
+    peerConnectionScopesRef.current = new WeakMap();
+    dataChannelScopesRef.current = new WeakMap();
+    for (const channel of channels) {
+      channel.onmessage = null;
+      channel.onclose = null;
+      channel.close();
+    }
+    for (const connection of connections) {
+      connection.onicecandidate = null;
+      connection.ondatachannel = null;
+      connection.onconnectionstatechange = null;
+      connection.close();
+    }
+    for (const waiter of waiters) {
+      window.clearTimeout(waiter.timer);
+      waiter.reject(new Error(reason));
+    }
+    for (const request of pendingRequests) {
+      if (request.timer !== undefined) {
+        window.clearTimeout(request.timer);
+      }
+    }
+    if (updateView) {
+      setPendingTransfers([]);
+      setReceivingTransfers([]);
+    }
   }, []);
+
+  useEffect(() => () => resetDirectState("page closed", false), [resetDirectState]);
+
+  useEffect(() => {
+    const scopeKey = options.connectionScopeKey ?? "default";
+    if (resetScopeRef.current === scopeKey) {
+      return;
+    }
+    resetScopeRef.current = scopeKey;
+    resetDirectState("room changed", true);
+  }, [options.connectionScopeKey, resetDirectState]);
+
+  const invalidateConnections = useCallback(() => {
+    manualResetCounterRef.current += 1;
+    connectionScopeRef.current = `invalidated:${manualResetCounterRef.current}`;
+    activePeerIdsRef.current.clear();
+    resetDirectState("room changed", true);
+  }, [resetDirectState]);
 
   const sendSignal = useCallback((targetPeerId: string, payload: DirectTransferSignalPayload) => {
     optionsRef.current.sendSignal(targetPeerId, payload);
   }, []);
 
-  const waitForDirectAck = useCallback((transferId: string, timeoutMs: number, timeoutMessage = "直连确认超时") => new Promise<void>((resolve, reject) => {
+  const waitForDirectAck = useCallback((
+    targetPeerId: string,
+    channel: RTCDataChannel,
+    scopeKey: string,
+    transferId: string,
+    timeoutMs: number,
+    timeoutMessage = "直连确认超时",
+  ) => new Promise<void>((resolve, reject) => {
+    let waiter: DirectAckWaiter;
     const timer = window.setTimeout(() => {
-      directAckWaitersRef.current.delete(transferId);
+      if (directAckWaitersRef.current.get(transferId) === waiter) {
+        directAckWaitersRef.current.delete(transferId);
+      }
       reject(new Error(timeoutMessage));
     }, timeoutMs);
-    directAckWaitersRef.current.set(transferId, { resolve, reject, timer });
+    waiter = { targetPeerId, channel, scopeKey, resolve, reject, timer };
+    const previous = directAckWaitersRef.current.get(transferId);
+    if (previous) {
+      directAckWaitersRef.current.delete(transferId);
+      window.clearTimeout(previous.timer);
+      previous.reject(new Error("transfer acknowledgement superseded"));
+    }
+    directAckWaitersRef.current.set(transferId, waiter);
   }), []);
 
   const sendDirectReject = useCallback((channel: RTCDataChannel, transferId: string, reason: string) => {
@@ -168,6 +270,66 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     }
     setPendingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== key));
   }, []);
+
+  const closeDataChannel = useCallback((
+    peerId: string,
+    channel: RTCDataChannel,
+    reason: string,
+    closeChannel: boolean,
+  ) => {
+    if (dataChannelsRef.current.get(peerId) === channel) {
+      dataChannelsRef.current.delete(peerId);
+    }
+    dataChannelScopesRef.current.delete(channel);
+    rejectDirectAckWaiters((waiter) => waiter.channel === channel, reason);
+
+    const activeTransferKey = directChannelTransfersRef.current.get(channel);
+    directChannelTransfersRef.current.delete(channel);
+    if (activeTransferKey) {
+      directIncomingRef.current.delete(activeTransferKey);
+      receivingProgressRef.current.delete(activeTransferKey);
+      setReceivingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== activeTransferKey));
+    }
+    const pendingTransferKey = pendingChannelTransfersRef.current.get(channel);
+    if (pendingTransferKey) {
+      removePendingTransfer(pendingTransferKey);
+    }
+
+    if (closeChannel && channel.readyState !== "closed") {
+      channel.onmessage = null;
+      channel.onclose = null;
+      channel.close();
+    }
+  }, [rejectDirectAckWaiters, removePendingTransfer]);
+
+  useEffect(() => {
+    const activePeerIds = new Set(options.peers.map((peer) => peer.peerId));
+    for (const [targetPeerId, channel] of dataChannelsRef.current) {
+      if (!activePeerIds.has(targetPeerId)) {
+        closeDataChannel(targetPeerId, channel, "peer is no longer online", true);
+      }
+    }
+    for (const [targetPeerId, connection] of peerConnectionsRef.current) {
+      if (!activePeerIds.has(targetPeerId)) {
+        peerConnectionsRef.current.delete(targetPeerId);
+        peerConnectionScopesRef.current.delete(connection);
+        connection.onicecandidate = null;
+        connection.ondatachannel = null;
+        connection.onconnectionstatechange = null;
+        connection.close();
+      }
+    }
+    for (const targetPeerId of openingChannelsRef.current.keys()) {
+      if (!activePeerIds.has(targetPeerId)) {
+        openingChannelsRef.current.delete(targetPeerId);
+        openingChannelScopesRef.current.delete(targetPeerId);
+      }
+    }
+    rejectDirectAckWaiters(
+      (waiter) => !activePeerIds.has(waiter.targetPeerId),
+      "peer is no longer online",
+    );
+  }, [closeDataChannel, options.peers, rejectDirectAckWaiters]);
 
   const updateReceivingTransfer = useCallback((incomingState: DirectIncomingState) => {
     const key = receivingTransferKey(incomingState);
@@ -193,13 +355,15 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   }, []);
 
   const startIncomingTransfer = useCallback((request: DirectPendingRequest, transferKey: string) => {
-    if (request.channel.readyState !== "open") {
+    if (request.channel.readyState !== "open"
+      || !isCurrentDataChannel(request.sourcePeerId, request.channel, request.scopeKey)) {
       removePendingTransfer(transferKey);
       optionsRef.current.onError("直连通道已断开，请让对方重新发送");
       return;
     }
     removePendingTransfer(transferKey);
     const incomingState: DirectIncomingState = {
+      scopeKey: request.scopeKey,
       transferId: request.transferId,
       sourcePeerId: request.sourcePeerId,
       fileName: request.fileName,
@@ -213,7 +377,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     directChannelTransfersRef.current.set(request.channel, transferKey);
     updateReceivingTransfer(incomingState);
     request.channel.send(JSON.stringify({ kind: "file-ready", transferId: request.transferId }));
-  }, [removePendingTransfer, updateReceivingTransfer]);
+  }, [isCurrentDataChannel, removePendingTransfer, updateReceivingTransfer]);
 
   const acceptIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
@@ -237,7 +401,9 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   const completeDirectIncoming = useCallback(async (sourcePeerId: string, channel: RTCDataChannel, transferId: string) => {
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
     const incomingState = directIncomingRef.current.get(transferKey);
-    if (!incomingState) {
+    if (!incomingState
+      || directChannelTransfersRef.current.get(channel) !== transferKey
+      || !isCurrentDataChannel(sourcePeerId, channel, incomingState.scopeKey)) {
       return;
     }
     directIncomingRef.current.delete(transferKey);
@@ -249,11 +415,18 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     const blob = new Blob(incomingState.chunks, { type: mimeType });
     if (incomingState.expectedSha256) {
       const actualSha256 = await sha256Blob(blob);
+      if (!isCurrentDataChannel(sourcePeerId, channel, incomingState.scopeKey)) {
+        return;
+      }
       if (!actualSha256 || actualSha256 !== incomingState.expectedSha256) {
         sendDirectReject(channel, transferId, "文件完整性校验失败");
         optionsRef.current.onError("直连文件完整性校验失败，已拒绝接收");
         return;
       }
+    }
+
+    if (!isCurrentDataChannel(sourcePeerId, channel, incomingState.scopeKey)) {
+      return;
     }
 
     const previewUrl = URL.createObjectURL(blob);
@@ -278,9 +451,17 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     if (channel.readyState === "open") {
       channel.send(JSON.stringify({ kind: "file-ack", transferId }));
     }
-  }, [sendDirectReject]);
+  }, [isCurrentDataChannel, sendDirectReject]);
 
-  const handleDirectControlMessage = useCallback((sourcePeerId: string, channel: RTCDataChannel, data: string) => {
+  const handleDirectControlMessage = useCallback((
+    sourcePeerId: string,
+    channel: RTCDataChannel,
+    data: string,
+    scopeKey: string,
+  ) => {
+    if (!isCurrentDataChannel(sourcePeerId, channel, scopeKey)) {
+      return;
+    }
     let message: {
       kind?: string;
       transferId?: string;
@@ -332,6 +513,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         return;
       }
       const request: DirectPendingRequest = {
+        scopeKey,
         transferId: message.transferId,
         sourcePeerId,
         fileName,
@@ -363,12 +545,20 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       return;
     }
     if (message.kind === "file-complete" && message.transferId) {
-      void completeDirectIncoming(sourcePeerId, channel, message.transferId);
+      void completeDirectIncoming(sourcePeerId, channel, message.transferId).catch(() => {
+        if (isCurrentDataChannel(sourcePeerId, channel, scopeKey)) {
+          sendDirectReject(channel, message.transferId!, "文件完整性校验失败");
+          optionsRef.current.onError("直连文件完整性校验失败，已拒绝接收");
+        }
+      });
       return;
     }
     if ((message.kind === "file-ready" || message.kind === "file-ack") && message.transferId) {
       const waiter = directAckWaitersRef.current.get(message.transferId);
-      if (waiter) {
+      if (waiter
+        && waiter.targetPeerId === sourcePeerId
+        && waiter.channel === channel
+        && waiter.scopeKey === scopeKey) {
         window.clearTimeout(waiter.timer);
         directAckWaitersRef.current.delete(message.transferId);
         waiter.resolve();
@@ -377,23 +567,29 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     }
     if (message.kind === "file-reject" && message.transferId) {
       const waiter = directAckWaitersRef.current.get(message.transferId);
-      if (waiter) {
+      if (waiter
+        && waiter.targetPeerId === sourcePeerId
+        && waiter.channel === channel
+        && waiter.scopeKey === scopeKey) {
         window.clearTimeout(waiter.timer);
         directAckWaitersRef.current.delete(message.transferId);
         waiter.reject(new Error(message.reason || "对方拒绝接收"));
       }
     }
-  }, [completeDirectIncoming, removePendingTransfer, sendDirectReject, startIncomingTransfer]);
+  }, [completeDirectIncoming, isCurrentDataChannel, removePendingTransfer, sendDirectReject, startIncomingTransfer]);
 
-  const handleDataChannelMessage = useCallback((sourcePeerId: string, channel: RTCDataChannel, data: unknown) => {
+  const handleDataChannelMessage = useCallback((sourcePeerId: string, channel: RTCDataChannel, data: unknown, scopeKey: string) => {
+    if (!isCurrentDataChannel(sourcePeerId, channel, scopeKey)) {
+      return;
+    }
     if (typeof data === "string") {
-      handleDirectControlMessage(sourcePeerId, channel, data);
+      handleDirectControlMessage(sourcePeerId, channel, data, scopeKey);
       return;
     }
     if (data instanceof ArrayBuffer) {
       const activeTransferKey = directChannelTransfersRef.current.get(channel);
       const current = activeTransferKey ? directIncomingRef.current.get(activeTransferKey) : null;
-      if (current) {
+      if (current && current.scopeKey === scopeKey && current.sourcePeerId === sourcePeerId) {
         if (current.receivedBytes + data.byteLength > current.sizeBytes) {
           sendDirectReject(channel, current.transferId, "文件大小与声明不一致");
           directIncomingRef.current.delete(activeTransferKey!);
@@ -410,39 +606,52 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       return;
     }
     if (data instanceof Blob) {
-      void data.arrayBuffer().then((buffer) => handleDataChannelMessage(sourcePeerId, channel, buffer));
+      void data.arrayBuffer()
+        .then((buffer) => handleDataChannelMessage(sourcePeerId, channel, buffer, scopeKey))
+        .catch(() => {
+          // A channel can close while a Blob-backed message is being converted.
+        });
     }
-  }, [handleDirectControlMessage, sendDirectReject, updateReceivingTransfer]);
+  }, [handleDirectControlMessage, isCurrentDataChannel, sendDirectReject, updateReceivingTransfer]);
 
   const setupDataChannel = useCallback((sourcePeerId: string, channel: RTCDataChannel) => {
+    const scopeKey = connectionScopeRef.current;
+    const previous = dataChannelsRef.current.get(sourcePeerId);
+    if (previous && previous !== channel) {
+      closeDataChannel(sourcePeerId, previous, "direct channel replaced", true);
+    }
     channel.binaryType = "arraybuffer";
+    dataChannelScopesRef.current.set(channel, scopeKey);
     dataChannelsRef.current.set(sourcePeerId, channel);
-    channel.onmessage = (event) => handleDataChannelMessage(sourcePeerId, channel, event.data);
+    channel.onmessage = (event) => handleDataChannelMessage(sourcePeerId, channel, event.data, scopeKey);
     channel.onclose = () => {
-      if (dataChannelsRef.current.get(sourcePeerId) === channel) {
-        dataChannelsRef.current.delete(sourcePeerId);
-      }
-      openingChannelsRef.current.delete(sourcePeerId);
-      const activeTransferKey = directChannelTransfersRef.current.get(channel);
-      directChannelTransfersRef.current.delete(channel);
-      if (activeTransferKey) {
-        directIncomingRef.current.delete(activeTransferKey);
-        receivingProgressRef.current.delete(activeTransferKey);
-        setReceivingTransfers((items) => items.filter((item) => receivingTransferKey(item) !== activeTransferKey));
-      }
-      const pendingTransferKey = pendingChannelTransfersRef.current.get(channel);
-      if (pendingTransferKey) {
-        removePendingTransfer(pendingTransferKey);
-      }
+      closeDataChannel(sourcePeerId, channel, "direct channel closed", false);
     };
-  }, [handleDataChannelMessage, removePendingTransfer]);
+  }, [closeDataChannel, handleDataChannelMessage]);
 
   const createPeerConnection = useCallback((targetPeerId: string) => {
     const existing = peerConnectionsRef.current.get(targetPeerId);
-    if (existing && existing.connectionState !== "failed" && existing.connectionState !== "closed") {
+    const scopeKey = connectionScopeRef.current;
+    if (existing
+      && peerConnectionScopesRef.current.get(existing) === scopeKey
+      && existing.connectionState !== "failed"
+      && existing.connectionState !== "closed") {
       return existing;
     }
-    existing?.close();
+    if (existing) {
+      if (peerConnectionsRef.current.get(targetPeerId) === existing) {
+        peerConnectionsRef.current.delete(targetPeerId);
+      }
+      peerConnectionScopesRef.current.delete(existing);
+      existing.onicecandidate = null;
+      existing.ondatachannel = null;
+      existing.onconnectionstatechange = null;
+      existing.close();
+      const existingChannel = dataChannelsRef.current.get(targetPeerId);
+      if (existingChannel) {
+        closeDataChannel(targetPeerId, existingChannel, "direct connection replaced", true);
+      }
+    }
     const connection = new RTCPeerConnection({
       iceServers: iceConfigRef.current?.iceServers.map((server) => ({
         urls: server.urls,
@@ -450,77 +659,148 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         credential: server.credential || undefined,
       })) ?? [],
     });
+    peerConnectionScopesRef.current.set(connection, scopeKey);
     peerConnectionsRef.current.set(targetPeerId, connection);
     connection.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (isCurrentPeerConnection(targetPeerId, connection, scopeKey) && event.candidate) {
         sendSignal(targetPeerId, { signalType: "ice", candidate: event.candidate.toJSON() });
       }
     };
-    connection.ondatachannel = (event) => setupDataChannel(targetPeerId, event.channel);
+    connection.ondatachannel = (event) => {
+      if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)) {
+        event.channel.close();
+        return;
+      }
+      setupDataChannel(targetPeerId, event.channel);
+    };
     connection.onconnectionstatechange = () => {
-      if (connection.connectionState === "failed" || connection.connectionState === "closed") {
-        dataChannelsRef.current.delete(targetPeerId);
+      if ((connection.connectionState === "failed" || connection.connectionState === "closed")
+        && peerConnectionsRef.current.get(targetPeerId) === connection) {
+        peerConnectionsRef.current.delete(targetPeerId);
+        peerConnectionScopesRef.current.delete(connection);
+        const channel = dataChannelsRef.current.get(targetPeerId);
+        if (channel) {
+          closeDataChannel(targetPeerId, channel, "direct connection closed", true);
+        } else {
+          rejectDirectAckWaiters((waiter) => waiter.targetPeerId === targetPeerId, "direct connection closed");
+        }
       }
     };
     return connection;
-  }, [sendSignal, setupDataChannel]);
+  }, [closeDataChannel, isCurrentPeerConnection, rejectDirectAckWaiters, sendSignal, setupDataChannel]);
 
   const openDirectChannel = useCallback(async (targetPeerId: string, timeoutMs = 8000): Promise<RTCDataChannel> => {
+    const scopeKey = connectionScopeRef.current;
+    if (!activePeerIdsRef.current.has(targetPeerId)) {
+      throw new Error("peer is no longer online");
+    }
     const existing = dataChannelsRef.current.get(targetPeerId);
-    if (existing?.readyState === "open") {
+    const existingMatchesScope = existing && dataChannelScopesRef.current.get(existing) === scopeKey;
+    if (existing && !existingMatchesScope) {
+      closeDataChannel(targetPeerId, existing, "room changed", true);
+    }
+    if (existingMatchesScope && existing.readyState === "open") {
       return existing;
     }
-    if (existing?.readyState === "connecting") {
-      return waitForDataChannelOpen(existing, timeoutMs);
+    if (existingMatchesScope && existing.readyState === "connecting") {
+      const opened = await waitForDataChannelOpen(existing, timeoutMs);
+      if (!isCurrentDataChannel(targetPeerId, opened, scopeKey)) {
+        throw new Error("room changed");
+      }
+      return opened;
     }
     const opening = openingChannelsRef.current.get(targetPeerId);
-    if (opening) {
+    if (opening && openingChannelScopesRef.current.get(targetPeerId) === scopeKey) {
       return opening;
     }
+    openingChannelsRef.current.delete(targetPeerId);
+    openingChannelScopesRef.current.delete(targetPeerId);
     const connection = createPeerConnection(targetPeerId);
     const channel = connection.createDataChannel(`file-${Date.now()}`, { ordered: true });
     setupDataChannel(targetPeerId, channel);
-    const opened = waitForDataChannelOpen(channel, timeoutMs);
     const openingTask = (async () => {
       const offer = await connection.createOffer();
+      if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
+        || !isCurrentDataChannel(targetPeerId, channel, scopeKey)) {
+        throw new Error("room changed");
+      }
       await connection.setLocalDescription(offer);
+      if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
+        || !isCurrentDataChannel(targetPeerId, channel, scopeKey)) {
+        throw new Error("room changed");
+      }
       sendSignal(targetPeerId, { signalType: "offer", description: connection.localDescription ?? offer });
-      return opened;
+      const openedChannel = await waitForDataChannelOpen(channel, timeoutMs);
+      if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
+        || !isCurrentDataChannel(targetPeerId, openedChannel, scopeKey)) {
+        throw new Error("room changed");
+      }
+      return openedChannel;
     })();
     openingChannelsRef.current.set(targetPeerId, openingTask);
+    openingChannelScopesRef.current.set(targetPeerId, scopeKey);
     try {
       return await openingTask;
     } finally {
-      openingChannelsRef.current.delete(targetPeerId);
+      if (openingChannelsRef.current.get(targetPeerId) === openingTask) {
+        openingChannelsRef.current.delete(targetPeerId);
+        openingChannelScopesRef.current.delete(targetPeerId);
+      }
     }
-  }, [createPeerConnection, sendSignal, setupDataChannel]);
+  }, [closeDataChannel, createPeerConnection, isCurrentDataChannel, isCurrentPeerConnection, sendSignal, setupDataChannel]);
 
   const handleSignal = useCallback(async (sourcePeerId: string, payload: DirectTransferSignalPayload) => {
-    if (!payload.signalType) {
+    if (!payload.signalType || !activePeerIdsRef.current.has(sourcePeerId)) {
       return;
     }
+    const scopeKey = connectionScopeRef.current;
     const connection = createPeerConnection(sourcePeerId);
-    if (payload.signalType === "offer" && payload.description) {
-      await connection.setRemoteDescription(payload.description);
-      const answer = await connection.createAnswer();
-      await connection.setLocalDescription(answer);
-      sendSignal(sourcePeerId, { signalType: "answer", description: connection.localDescription ?? answer });
-      return;
-    }
-    if (payload.signalType === "answer" && payload.description) {
-      if (connection.signalingState !== "stable") {
+    try {
+      if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+        return;
+      }
+      if (payload.signalType === "offer" && payload.description) {
         await connection.setRemoteDescription(payload.description);
+        if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+          return;
+        }
+        const answer = await connection.createAnswer();
+        if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+          return;
+        }
+        await connection.setLocalDescription(answer);
+        if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+          return;
+        }
+        sendSignal(sourcePeerId, { signalType: "answer", description: connection.localDescription ?? answer });
+        return;
       }
-      return;
-    }
-    if (payload.signalType === "ice" && payload.candidate) {
-      try {
-        await connection.addIceCandidate(payload.candidate);
-      } catch {
-        // ICE candidates can race SDP on refresh; the next candidate usually repairs the path.
+      if (payload.signalType === "answer" && payload.description) {
+        if (connection.signalingState !== "stable") {
+          await connection.setRemoteDescription(payload.description);
+          if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+            return;
+          }
+        }
+        return;
       }
+      if (payload.signalType === "ice" && payload.candidate) {
+        try {
+          if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+            return;
+          }
+          await connection.addIceCandidate(payload.candidate);
+        } catch {
+          // ICE candidates can race SDP on refresh; the next candidate usually repairs the path.
+        }
+      }
+    } catch (error) {
+      if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+        return;
+      }
+      throw error;
     }
-  }, [createPeerConnection, sendSignal]);
+  }, [createPeerConnection, isCurrentPeerConnection, sendSignal]);
 
   useEffect(() => {
     if (!options.preconnectPeerChannels || !options.selfPeerId || typeof RTCPeerConnection === "undefined") {
@@ -540,13 +820,17 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     if (!targetPeerId || typeof RTCPeerConnection === "undefined") {
       return false;
     }
+    const scopeKey = connectionScopeRef.current;
     try {
       const channel = await openDirectChannel(targetPeerId, timeoutMs);
-      if (channel.readyState !== "open") {
+      if (!isCurrentDataChannel(targetPeerId, channel, scopeKey) || channel.readyState !== "open") {
         return false;
       }
       if (channel.bufferedAmount > 1024 * 1024) {
         await waitForBufferedAmountLow(channel);
+      }
+      if (!isCurrentDataChannel(targetPeerId, channel, scopeKey) || channel.readyState !== "open") {
+        return false;
       }
       channel.send(JSON.stringify({
         kind: "app-message",
@@ -557,7 +841,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     } catch {
       return false;
     }
-  }, [openDirectChannel]);
+  }, [isCurrentDataChannel, openDirectChannel]);
 
   const sendDirect = useCallback(async (targetPeerId: string, file: File): Promise<DirectTransferResult> => {
     const limitBytes = optionsRef.current.directMemoryLimitBytes;
@@ -569,11 +853,19 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     }
     optionsRef.current.onStateChange("connecting");
     optionsRef.current.onProgress(0);
+    const scopeKey = connectionScopeRef.current;
     const channel = await openDirectChannel(targetPeerId);
+    const ensureCurrentChannel = () => {
+      if (!isCurrentDataChannel(targetPeerId, channel, scopeKey) || channel.readyState !== "open") {
+        throw new Error("room or peer changed during direct transfer");
+      }
+    };
+    ensureCurrentChannel();
     const transferId = createTransferId();
     const fileName = file.name || "attachment";
     const mimeType = effectiveMimeType(fileName, file.type);
     const sha256 = await sha256Blob(file);
+    ensureCurrentChannel();
     optionsRef.current.onStateChange("waiting");
     channel.send(JSON.stringify({
       kind: "file-meta",
@@ -583,18 +875,19 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       sizeBytes: file.size,
       sha256,
     }));
-    await waitForDirectAck(transferId, 120000, "对方未确认接收");
+    await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 120000, "对方未确认接收");
+    ensureCurrentChannel();
     optionsRef.current.onStateChange("direct");
-    await sendFileChunks(channel, file, optionsRef.current.onProgress);
-    const ack = waitForDirectAck(transferId, 15000, "对方未确认完成");
+    await sendFileChunks(channel, file, optionsRef.current.onProgress, ensureCurrentChannel);
+    ensureCurrentChannel();
     channel.send(JSON.stringify({ kind: "file-complete", transferId }));
-    await ack;
+    await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 15000, "对方未确认完成");
 
     return {
       attachment: directAttachment(transferId, fileName, mimeType, file.size, sha256),
       previewUrl: URL.createObjectURL(file),
     };
-  }, [openDirectChannel, waitForDirectAck]);
+  }, [isCurrentDataChannel, openDirectChannel, waitForDirectAck]);
 
   return {
     pendingTransfers,
@@ -604,6 +897,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     handleSignal,
     acceptIncomingTransfer,
     rejectIncomingTransfer,
+    invalidateConnections,
   };
 }
 
@@ -661,8 +955,10 @@ async function sendFileChunks(
   channel: RTCDataChannel,
   file: File,
   onProgress: (value: number) => void,
+  ensureCurrentChannel: () => void,
 ) {
   const reportProgress = createProgressReporter(onProgress);
+  ensureCurrentChannel();
   if (file.size === 0) {
     reportProgress(100, true);
     return;
@@ -670,14 +966,18 @@ async function sendFileChunks(
   const chunkSize = 64 * 1024;
   channel.bufferedAmountLowThreshold = 1024 * 1024;
   for (let offset = 0; offset < file.size; offset += chunkSize) {
+    ensureCurrentChannel();
     if (channel.readyState !== "open") {
       throw new Error("DataChannel 已关闭");
     }
     while (channel.bufferedAmount > 4 * 1024 * 1024) {
       await waitForBufferedAmountLow(channel);
+      ensureCurrentChannel();
     }
     const end = Math.min(file.size, offset + chunkSize);
-    channel.send(await file.slice(offset, end).arrayBuffer());
+    const buffer = await file.slice(offset, end).arrayBuffer();
+    ensureCurrentChannel();
+    channel.send(buffer);
     reportProgress(Math.round((end / file.size) * 100), end >= file.size);
   }
 }

@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type {
+  ChangeEvent,
+  ClipboardEvent as ReactClipboardEvent,
+  DragEvent as ReactDragEvent,
+  ReactNode,
+} from "react";
 import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress, Switch } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { HeroRuntime } from "../components/HeroRuntime";
+import { SyncedClipboard } from "../components/SyncedClipboard";
 import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhiteboard";
 import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
 import {
@@ -18,6 +24,13 @@ import { createQrMatrix } from "../lib/qr";
 import { sha256Blob } from "../lib/sha256";
 import { effectiveMimeType, mediaKind, previewKindLabel, shortMimeLabel } from "../lib/transferPreview";
 import {
+  clipboardSyncEventKey,
+  isClipboardSyncPayload,
+  serializeClipboardRelayEnvelope,
+  type ClipboardInboundEvent,
+  type ClipboardSyncPayload,
+} from "../lib/clipboardSync";
+import {
   DEFAULT_DIRECT_MEMORY_LIMIT_BYTES,
   receivingTransferKey,
   useDirectTransfer,
@@ -27,6 +40,8 @@ import {
 } from "../hooks/useDirectTransfer";
 
 type UploadState = "idle" | "connecting" | "waiting" | "direct" | "presigning" | "uploading" | "completing" | "done" | "failed";
+type TransferToolMode = "files" | "clipboard" | "whiteboard";
+const TRANSFER_TOOL_MODES: TransferToolMode[] = ["files", "clipboard", "whiteboard"];
 
 interface UploadRecord {
   file: File;
@@ -66,9 +81,30 @@ interface PreviewTarget {
   blob?: Blob | null;
 }
 
+interface FileTransferTask {
+  id: number;
+  roomEpoch: number;
+  roomGeneration: number;
+  roomId: string;
+  roomToken: string;
+  targetPeerId: string;
+  abortController: AbortController;
+}
+
+class FileTransferRoomChangedError extends Error {
+  constructor() {
+    super("房间已变化，本次文件发送已取消");
+    this.name = "FileTransferRoomChangedError";
+  }
+}
+
 const INCOMING_ITEM_LIMIT = 20;
 const DIRECT_MEMORY_LIMIT_BYTES = DEFAULT_DIRECT_MEMORY_LIMIT_BYTES;
 const STREAM_DOWNLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
+const CLIPBOARD_EVENT_LIMIT = 20;
+const CLIPBOARD_SEEN_EVENT_LIMIT = 200;
+const CLIPBOARD_SEQUENCE_STATE_LIMIT = 200;
+const CLIPBOARD_SEEN_EVENT_TTL_MS = 10 * 60 * 1000;
 
 export function PublicTransferPage() {
   return (
@@ -82,7 +118,17 @@ function PublicTransferPageContent() {
   const discoverySocketRef = useRef<WebSocket | null>(null);
   const loadedSharedAttachmentRef = useRef("");
   const directPreviewUrlsRef = useRef<Set<string>>(new Set());
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const fileDragDepthRef = useRef(0);
+  const uploadInFlightRef = useRef<FileTransferTask | null>(null);
+  const fileTransferTaskSequenceRef = useRef(0);
+  const clipboardSeenEventsRef = useRef<Map<string, number>>(new Map());
+  const clipboardHighestSequencesRef = useRef<Map<string, { sequence: number; seenAt: number }>>(new Map());
+  const currentRoomPeerIdsRef = useRef<Set<string>>(new Set());
+  const roomEpochRef = useRef(0);
+  const roomGenerationRef = useRef(0);
   const [peerId] = useState(() => loadOrCreatePeerId());
+  const [roomGeneration, setRoomGeneration] = useState(0);
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
   const [receiveConfirmationRequired, setReceiveConfirmationRequired] = useState(() => loadReceiveConfirmationRequired());
@@ -100,13 +146,30 @@ function PublicTransferPageContent() {
   const [record, setRecord] = useState<UploadRecord | null>(null);
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [iceConfig, setIceConfig] = useState<PublicTransferIceConfig | null>(null);
+  const [isFileDragActive, setFileDragActive] = useState(false);
+  const [activeTool, setActiveTool] = useState<TransferToolMode>("files");
+  const [clipboardFocusRequest, setClipboardFocusRequest] = useState(0);
+  const [clipboardSyncEnabled, setClipboardSyncEnabled] = useState(false);
+  const [clipboardEvents, setClipboardEvents] = useState<ClipboardInboundEvent[]>([]);
   const [whiteboardEvents, setWhiteboardEvents] = useState<WhiteboardInboundEvent[]>([]);
 
   usePageSeo({
-    title: "免登录文件互传 · shuai-tunnel",
-    description: "打开同一个房间链接，在电脑和手机之间快速互传文件。",
+    title: "互传 · shuai-tunnel",
+    description: "打开同一个房间链接，在电脑和手机之间互传文件、同步剪贴板和共享白板。",
     canonical: "https://tunnel.devshuai.com/#/transfer",
   });
+  const transferRoomScopeKey = `${normalizeRoomId(roomId)}:${sharedDiscoveryEnabled ? roomToken.trim() : "nearby"}:${roomGeneration}`;
+
+  const isFileTransferTaskCurrent = (task: FileTransferTask) => uploadInFlightRef.current === task
+    && roomEpochRef.current === task.roomEpoch
+    && roomGenerationRef.current === task.roomGeneration
+    && !task.abortController.signal.aborted;
+
+  const assertFileTransferTaskCurrent = (task: FileTransferTask) => {
+    if (!isFileTransferTaskCurrent(task)) {
+      throw new FileTransferRoomChangedError();
+    }
+  };
 
   const rememberPreviewUrl = (url?: string | null) => {
     if (url?.startsWith("blob:")) {
@@ -155,7 +218,7 @@ function PublicTransferPageContent() {
   }, []);
 
   const pushWhiteboardEvent = useCallback((sourcePeerId: string, payload: WhiteboardPayload) => {
-    if (!sourcePeerId || sourcePeerId === peerId) {
+    if (!sourcePeerId || sourcePeerId === peerId || !currentRoomPeerIdsRef.current.has(sourcePeerId)) {
       return;
     }
     const eventId = whiteboardEventKey(sourcePeerId, payload);
@@ -170,6 +233,61 @@ function PublicTransferPageContent() {
     ]);
   }, [peerId]);
 
+  const pushClipboardEvent = useCallback((sourcePeerId: string, payload: ClipboardSyncPayload) => {
+    if (!sourcePeerId || sourcePeerId === peerId || !currentRoomPeerIdsRef.current.has(sourcePeerId)) {
+      return;
+    }
+    const receivedAt = Date.now();
+    const eventId = clipboardSyncEventKey(sourcePeerId, payload);
+    const seenEvents = clipboardSeenEventsRef.current;
+    for (const [seenEventId, seenAt] of seenEvents) {
+      if (receivedAt - seenAt > CLIPBOARD_SEEN_EVENT_TTL_MS) {
+        seenEvents.delete(seenEventId);
+      }
+    }
+    if (seenEvents.has(eventId)) {
+      return;
+    }
+    seenEvents.set(eventId, receivedAt);
+    while (seenEvents.size > CLIPBOARD_SEEN_EVENT_LIMIT) {
+      const oldestEventId = seenEvents.keys().next().value as string | undefined;
+      if (!oldestEventId) {
+        break;
+      }
+      seenEvents.delete(oldestEventId);
+    }
+
+    const sequenceStates = clipboardHighestSequencesRef.current;
+    for (const [seenSequenceKey, state] of sequenceStates) {
+      if (receivedAt - state.seenAt > CLIPBOARD_SEEN_EVENT_TTL_MS) {
+        sequenceStates.delete(seenSequenceKey);
+      }
+    }
+    const sequenceKey = JSON.stringify([sourcePeerId, payload.sessionId]);
+    const highestSequence = sequenceStates.get(sequenceKey)?.sequence ?? -1;
+    if (payload.sequence <= highestSequence) {
+      return;
+    }
+    sequenceStates.delete(sequenceKey);
+    sequenceStates.set(sequenceKey, { sequence: payload.sequence, seenAt: receivedAt });
+    while (sequenceStates.size > CLIPBOARD_SEQUENCE_STATE_LIMIT) {
+      const oldestSequenceKey = sequenceStates.keys().next().value as string | undefined;
+      if (!oldestSequenceKey) {
+        break;
+      }
+      sequenceStates.delete(oldestSequenceKey);
+    }
+    setClipboardEvents((items) => [
+      ...items.slice(-(CLIPBOARD_EVENT_LIMIT - 1)),
+      {
+        eventId,
+        sourcePeerId,
+        payload,
+        receivedAt,
+      },
+    ]);
+  }, [peerId]);
+
   const {
     pendingTransfers,
     receivingTransfers,
@@ -178,8 +296,10 @@ function PublicTransferPageContent() {
     handleSignal,
     acceptIncomingTransfer,
     rejectIncomingTransfer,
+    invalidateConnections,
   } = useDirectTransfer({
     selfPeerId: peerId,
+    connectionScopeKey: transferRoomScopeKey,
     iceConfig,
     peers,
     directMemoryLimitBytes: DIRECT_MEMORY_LIMIT_BYTES,
@@ -189,6 +309,8 @@ function PublicTransferPageContent() {
     onPeerMessage: (sourcePeerId, message) => {
       if (message.messageType === "whiteboard" && isWhiteboardPayload(message.payload)) {
         pushWhiteboardEvent(sourcePeerId, message.payload);
+      } else if (message.messageType === "clipboard" && isClipboardSyncPayload(message.payload)) {
+        pushClipboardEvent(sourcePeerId, message.payload);
       }
     },
     onIncoming: (item) => {
@@ -300,6 +422,7 @@ function PublicTransferPageContent() {
           type?: string;
           error?: string;
           sourcePeerId?: string;
+          targetPeerId?: string;
           peers?: DiscoveryPeer[];
           payload?: unknown;
         };
@@ -309,9 +432,13 @@ function PublicTransferPageContent() {
           setError(message.error);
         } else if (message.type === "roster" && Array.isArray(message.peers)) {
           const visiblePeers = message.peers.filter((peer) => peer.peerId !== peerId);
+          currentRoomPeerIdsRef.current = new Set(visiblePeers.map((peer) => peer.peerId));
           setPeers(visiblePeers);
           setSelectedPeerId((current) => current && visiblePeers.some((peer) => peer.peerId === current) ? current : visiblePeers[0]?.peerId ?? "");
-        } else if (message.type === "attachment") {
+        } else if (message.type === "attachment"
+          && message.sourcePeerId
+          && message.targetPeerId === peerId
+          && currentRoomPeerIdsRef.current.has(message.sourcePeerId)) {
           const attachmentPayload = message.payload;
           if (isAttachmentDiscoveryPayload(attachmentPayload)) {
             setIncoming((items) => limitIncomingItems([
@@ -325,10 +452,24 @@ function PublicTransferPageContent() {
               ...items,
             ]));
           }
-        } else if (message.type === "whiteboard" && message.sourcePeerId && isWhiteboardPayload(message.payload)) {
+        } else if (message.type === "whiteboard"
+          && message.sourcePeerId
+          && message.targetPeerId === peerId
+          && isWhiteboardPayload(message.payload)) {
           pushWhiteboardEvent(message.sourcePeerId, message.payload);
-        } else if (message.type === "signal" && message.sourcePeerId && message.payload) {
-          void handleSignal(message.sourcePeerId, message.payload as DirectTransferSignalPayload);
+        } else if (message.type === "clipboard"
+          && message.sourcePeerId
+          && message.targetPeerId === peerId
+          && isClipboardSyncPayload(message.payload)) {
+          pushClipboardEvent(message.sourcePeerId, message.payload);
+        } else if (message.type === "signal"
+          && message.sourcePeerId
+          && message.targetPeerId === peerId
+          && currentRoomPeerIdsRef.current.has(message.sourcePeerId)
+          && message.payload) {
+          void handleSignal(message.sourcePeerId, message.payload as DirectTransferSignalPayload).catch(() => {
+            // The room or peer can change while an asynchronous SDP operation is in flight.
+          });
         }
       } catch {
         // Ignore malformed discovery messages; the page can keep working through manual copy.
@@ -343,11 +484,20 @@ function PublicTransferPageContent() {
       const socket = new WebSocket(url);
       discoverySocketRef.current = socket;
       socket.onopen = () => {
+        if (!active || discoverySocketRef.current !== socket) {
+          socket.close();
+          return;
+        }
         reconnectAttempt = 0;
         lastPongAt = Date.now();
         startHeartbeat(socket);
       };
-      socket.onmessage = handleMessage;
+      socket.onmessage = (event) => {
+        if (!active || discoverySocketRef.current !== socket) {
+          return;
+        }
+        handleMessage(event);
+      };
       socket.onerror = () => {
         socket.close();
       };
@@ -380,7 +530,7 @@ function PublicTransferPageContent() {
         socket.close();
       }
     };
-  }, [handleSignal, peerId, pushWhiteboardEvent, roomId, roomToken, sharedDiscoveryEnabled]);
+  }, [handleSignal, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken, sharedDiscoveryEnabled]);
 
   useEffect(() => {
     return () => {
@@ -391,6 +541,11 @@ function PublicTransferPageContent() {
   }, [record?.previewUrl]);
 
   useEffect(() => () => {
+    const activeFileTransfer = uploadInFlightRef.current;
+    if (activeFileTransfer) {
+      uploadInFlightRef.current = null;
+      activeFileTransfer.abortController.abort();
+    }
     for (const url of directPreviewUrlsRef.current) {
       URL.revokeObjectURL(url);
     }
@@ -416,11 +571,73 @@ function PublicTransferPageContent() {
     : selectedFiles.length === 1
       ? `${formatBytes(selectedFiles[0].size)} · ${selectedFiles[0].type || "未知类型"}`
       : `${formatBytes(selectedFilesSize)} · 批量顺序发送`;
-  const uploadButtonLabel = selectedFiles.length > 1
-    ? selectedPeer ? "发送多个文件" : "生成多个链接"
-    : selectedPeer ? "发送给对方" : "生成分享链接";
+  const isTransferBusy = state === "connecting"
+    || state === "waiting"
+    || state === "direct"
+    || state === "presigning"
+    || state === "uploading"
+    || state === "completing";
+  const fileDropzoneTitle = isFileDragActive
+    ? "松开即可发送"
+    : isTransferBusy
+      ? "文件正在发送"
+      : "粘贴文件、拖到这里，或点击选择";
+  const fileDropzoneDetail = selectedFiles.length > 0
+    ? `${selectedFileTitle} · ${selectedFileDetail}`
+    : selectedPeer
+      ? `选择后立即发送给 ${selectedPeer.displayName || selectedPeer.peerId}`
+      : "选择后立即上传并生成分享链接";
+  const fileActivityCount = incoming.length + receivingTransfers.length + pendingTransfers.length;
+
+  const resetTransferRoomState = (preserveCompletedFile = false) => {
+    roomEpochRef.current += 1;
+    roomGenerationRef.current += 1;
+    setRoomGeneration(roomGenerationRef.current);
+    const activeFileTransfer = uploadInFlightRef.current;
+    if (activeFileTransfer) {
+      uploadInFlightRef.current = null;
+      activeFileTransfer.abortController.abort();
+    }
+    invalidateConnections();
+    const socket = discoverySocketRef.current;
+    if (socket) {
+      discoverySocketRef.current = null;
+      socket.close();
+    }
+    currentRoomPeerIdsRef.current.clear();
+    clipboardSeenEventsRef.current.clear();
+    clipboardHighestSequencesRef.current.clear();
+    setClipboardEvents([]);
+    setWhiteboardEvents([]);
+    setClipboardSyncEnabled(false);
+    setPeers([]);
+    setSelectedPeerId("");
+    setSelectedFiles([]);
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    setProgress(0);
+    setState("idle");
+    if (!preserveCompletedFile) {
+      setRecord((current) => {
+        if (current?.previewUrl) {
+          URL.revokeObjectURL(current.previewUrl);
+        }
+        return null;
+      });
+    }
+  };
+
+  const updateRoomId = (value: string) => {
+    if (value !== roomId) {
+      resetTransferRoomState();
+    }
+    setRoomId(value);
+  };
 
   const updateRoomToken = (value: string) => {
+    if (value !== roomToken) {
+      resetTransferRoomState();
+    }
     setRoomToken(value);
     sessionStorage.setItem("public-transfer-room-token", value);
   };
@@ -431,6 +648,9 @@ function PublicTransferPageContent() {
   };
 
   const enableSharedDiscovery = () => {
+    if (!sharedDiscoveryEnabled) {
+      resetTransferRoomState(true);
+    }
     setSharedDiscoveryEnabled(true);
     window.history.replaceState({}, "", roomShareUrl(roomId, roomToken));
   };
@@ -438,6 +658,7 @@ function PublicTransferPageContent() {
   const createNewRoom = () => {
     const nextRoom = `room-${createRoomToken().slice(0, 8)}`;
     const nextToken = createRoomToken();
+    resetTransferRoomState();
     setRoomId(nextRoom);
     updateRoomToken(nextToken);
     setSharedDiscoveryEnabled(true);
@@ -465,7 +686,7 @@ function PublicTransferPageContent() {
       enableSharedDiscovery();
       await shareOrCopy(
         {
-          title: "加入 shuai-tunnel 文件互传房间",
+          title: "加入 shuai-tunnel 互传房间",
           text: `房间：${roomId || "nearby"}`,
           url,
         },
@@ -568,12 +789,13 @@ function PublicTransferPageContent() {
     }
   };
 
-  const upload = async () => {
-    if (selectedFiles.length === 0) {
+  const uploadFiles = async (files: File[], task: FileTransferTask) => {
+    assertFileTransferTaskCurrent(task);
+    if (files.length === 0) {
       setError("请选择要发送的文件");
       return;
     }
-    if (!roomToken.trim()) {
+    if (!task.roomToken.trim()) {
       setError("请输入房间口令");
       return;
     }
@@ -586,16 +808,19 @@ function PublicTransferPageContent() {
     }
     setRecord(null);
 
-    const files = [...selectedFiles];
-    const targetPeerId = selectedPeerId;
     for (let index = 0; index < files.length; index += 1) {
+      assertFileTransferTaskCurrent(task);
       const file = files[index];
       if (files.length > 1) {
         setNotice(`正在发送 ${index + 1}/${files.length}：${file.name || "attachment"}`);
       }
-      if (targetPeerId && typeof RTCPeerConnection !== "undefined") {
+      if (task.targetPeerId && typeof RTCPeerConnection !== "undefined") {
         try {
-          const direct = await sendDirect(targetPeerId, file);
+          const direct = await sendDirect(task.targetPeerId, file);
+          if (!isFileTransferTaskCurrent(task)) {
+            URL.revokeObjectURL(direct.previewUrl);
+            throw new FileTransferRoomChangedError();
+          }
           setRecord({
             file,
             previewUrl: direct.previewUrl,
@@ -608,6 +833,7 @@ function PublicTransferPageContent() {
           setState("done");
           continue;
         } catch (err) {
+          assertFileTransferTaskCurrent(task);
           const directError = err instanceof Error ? err.message : "unknown";
           if (directError.includes("拒绝接收")) {
             setError(directError);
@@ -617,34 +843,155 @@ function PublicTransferPageContent() {
           setError(`直接发送未完成，正在改用分享链接：${directError}`);
         }
       }
-      await uploadViaOss(file, targetPeerId);
+      assertFileTransferTaskCurrent(task);
+      await uploadViaOss(file, task);
     }
+    assertFileTransferTaskCurrent(task);
     if (files.length > 1) {
       setNotice(`已处理 ${files.length} 个文件`);
     }
   };
 
-  const uploadViaOss = async (file: File, targetPeerId = selectedPeerId) => {
+  const acceptFiles = (files: File[]) => {
+    if (files.length === 0) {
+      return;
+    }
+    if (uploadInFlightRef.current) {
+      setError("当前文件仍在发送，请稍后再添加");
+      return;
+    }
+    const task: FileTransferTask = {
+      id: fileTransferTaskSequenceRef.current += 1,
+      roomEpoch: roomEpochRef.current,
+      roomGeneration,
+      roomId,
+      roomToken,
+      targetPeerId: selectedPeerId,
+      abortController: new AbortController(),
+    };
+    uploadInFlightRef.current = task;
+    setSelectedFiles(files);
+    void uploadFiles(files, task)
+      .catch((err) => {
+        if (err instanceof FileTransferRoomChangedError) {
+          return;
+        }
+        if (!isFileTransferTaskCurrent(task)) {
+          return;
+        }
+        setState("failed");
+        setError(err instanceof Error ? err.message : "上传失败");
+      })
+      .finally(() => {
+        if (uploadInFlightRef.current === task) {
+          uploadInFlightRef.current = null;
+        }
+      });
+  };
+
+  const openFilePicker = () => {
+    if (uploadInFlightRef.current || isTransferBusy) {
+      setError("当前文件仍在发送，请稍后再添加");
+      return;
+    }
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = "";
+    acceptFiles(files);
+  };
+
+  const handleFileDragEnter = (event: ReactDragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    if (!hasDraggedFiles(event.dataTransfer)) {
+      return;
+    }
+    fileDragDepthRef.current += 1;
+    if (!uploadInFlightRef.current) {
+      setFileDragActive(true);
+    }
+  };
+
+  const handleFileDragOver = (event: ReactDragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    if (hasDraggedFiles(event.dataTransfer)) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+  };
+
+  const handleFileDragLeave = (event: ReactDragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) {
+      setFileDragActive(false);
+    }
+  };
+
+  const handleFileDrop = (event: ReactDragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    const files = Array.from(event.dataTransfer.files ?? []);
+    if (files.length === 0) {
+      setError("没有检测到可发送的文件");
+      return;
+    }
+    acceptFiles(files);
+  };
+
+  const handlePagePaste = (event: ReactClipboardEvent<HTMLElement>) => {
+    if (activeTool !== "files") {
+      return;
+    }
+    if (isEditablePasteTarget(event.target)) {
+      return;
+    }
+    const files = filesFromClipboard(event.clipboardData);
+    if (files.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    acceptFiles(files);
+  };
+
+  const uploadViaOss = async (file: File, task: FileTransferTask) => {
+    assertFileTransferTaskCurrent(task);
     setState("presigning");
     setProgress(0);
     try {
       const mimeType = effectiveMimeType(file.name || "attachment", file.type);
       const sha256 = await sha256Blob(file);
+      assertFileTransferTaskCurrent(task);
       const presign = await publicPresignAttachmentUpload({
         fileName: file.name || "attachment",
         mimeType,
         sizeBytes: file.size,
         sha256,
-        roomId,
-        roomToken,
+        roomId: task.roomId,
+        roomToken: task.roomToken,
       });
+      assertFileTransferTaskCurrent(task);
 
       setState("uploading");
-      await putObject(presign.uploadUrl, file, presign.uploadHeaders, setProgress);
+      await putObject(
+        presign.uploadUrl,
+        file,
+        presign.uploadHeaders,
+        (value) => {
+          if (isFileTransferTaskCurrent(task)) {
+            setProgress(value);
+          }
+        },
+        task.abortController.signal,
+      );
+      assertFileTransferTaskCurrent(task);
 
       setState("completing");
-      const attachment = await publicCompleteAttachment(presign.attachmentId, { roomToken });
-      publishAttachmentEnvelope(targetPeerId, presign.objectId, attachment);
+      const attachment = await publicCompleteAttachment(presign.attachmentId, { roomToken: task.roomToken });
+      assertFileTransferTaskCurrent(task);
+      publishAttachmentEnvelope(task, presign.objectId, attachment);
       setRecord({
         file,
         previewUrl: URL.createObjectURL(file),
@@ -656,6 +1003,9 @@ function PublicTransferPageContent() {
       });
       setState("done");
     } catch (err) {
+      if (err instanceof FileTransferRoomChangedError || !isFileTransferTaskCurrent(task)) {
+        throw new FileTransferRoomChangedError();
+      }
       setState("failed");
       setError(err instanceof Error ? err.message : "上传失败");
     }
@@ -758,14 +1108,18 @@ function PublicTransferPageContent() {
     setIncoming((items) => items.map((current) => incomingItemKey(current) === key ? { ...current, ...patch } : current));
   };
 
-  const publishAttachmentEnvelope = (targetPeerId: string, objectId: string, attachment: TransferAttachment) => {
+  const publishAttachmentEnvelope = (task: FileTransferTask, objectId: string, attachment: TransferAttachment) => {
     const socket = discoverySocketRef.current;
-    if (!targetPeerId || !socket || socket.readyState !== WebSocket.OPEN) {
-      return;
+    if (!isFileTransferTaskCurrent(task)
+      || !task.targetPeerId
+      || !currentRoomPeerIdsRef.current.has(task.targetPeerId)
+      || !socket
+      || socket.readyState !== WebSocket.OPEN) {
+      return false;
     }
     socket.send(JSON.stringify({
       type: "attachment",
-      targetPeerId,
+      targetPeerId: task.targetPeerId,
       payload: {
         type: "STMSG2",
         messageType: "attachment",
@@ -773,11 +1127,16 @@ function PublicTransferPageContent() {
         attachment,
       },
     }));
+    return true;
   };
 
-  const publishWhiteboardEnvelope = useCallback((targetPeerId: string, payload: WhiteboardPayload) => {
+  const publishWhiteboardEnvelope = useCallback((targetPeerId: string, payload: WhiteboardPayload, expectedRoomEpoch: number) => {
     const socket = discoverySocketRef.current;
-    if (!targetPeerId || !socket || socket.readyState !== WebSocket.OPEN) {
+    if (roomEpochRef.current !== expectedRoomEpoch
+      || !currentRoomPeerIdsRef.current.has(targetPeerId)
+      || !targetPeerId
+      || !socket
+      || socket.readyState !== WebSocket.OPEN) {
       return;
     }
     socket.send(JSON.stringify({
@@ -791,22 +1150,67 @@ function PublicTransferPageContent() {
     if (peers.length === 0) {
       return;
     }
+    const sendRoomEpoch = roomEpochRef.current;
     for (const peer of peers) {
       void sendPeerMessage(peer.peerId, { messageType: "whiteboard", payload }, 1600).then((sentDirect) => {
-        if (!sentDirect) {
-          publishWhiteboardEnvelope(peer.peerId, payload);
+        if (!sentDirect
+          && roomEpochRef.current === sendRoomEpoch
+          && currentRoomPeerIdsRef.current.has(peer.peerId)) {
+          publishWhiteboardEnvelope(peer.peerId, payload, sendRoomEpoch);
         }
       });
     }
   }, [peers, publishWhiteboardEnvelope, sendPeerMessage]);
 
+  const publishClipboardEnvelope = useCallback((targetPeerId: string, serializedEnvelope: string, expectedRoomEpoch: number) => {
+    const socket = discoverySocketRef.current;
+    if (roomEpochRef.current !== expectedRoomEpoch
+      || !currentRoomPeerIdsRef.current.has(targetPeerId)
+      || !targetPeerId
+      || !socket
+      || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    socket.send(serializedEnvelope);
+    return true;
+  }, []);
+
+  const sendClipboardPayload = useCallback(async (payload: ClipboardSyncPayload) => {
+    const target = peers.find((peer) => peer.peerId === selectedPeerId);
+    if (!target) {
+      throw new Error("请选择一台在线设备后再同步剪贴板");
+    }
+    const sendRoomEpoch = roomEpochRef.current;
+    const sentDirect = await sendPeerMessage(target.peerId, { messageType: "clipboard", payload }, 1600);
+    if (roomEpochRef.current !== sendRoomEpoch || !currentRoomPeerIdsRef.current.has(target.peerId)) {
+      throw new Error("房间或目标设备已变化，本次剪贴板同步已取消");
+    }
+    if (sentDirect) {
+      return;
+    }
+    const serializedEnvelope = serializeClipboardRelayEnvelope(target.peerId, payload);
+    if (!publishClipboardEnvelope(target.peerId, serializedEnvelope, sendRoomEpoch)) {
+      throw new Error("互传通道暂时不可用，请确认对方仍在线");
+    }
+  }, [peers, publishClipboardEnvelope, selectedPeerId, sendPeerMessage]);
+
+  const selectTransferTool = useCallback((mode: TransferToolMode, focusContent = false) => {
+    setActiveTool(mode);
+    if (mode === "clipboard" && focusContent) {
+      setClipboardFocusRequest((value) => value + 1);
+    }
+  }, []);
+
   return (
-    <main className="landing-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
+    <main
+      className="landing-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white"
+      onPaste={handlePagePaste}
+    >
       <div className="landing-grid" aria-hidden="true" />
       <div className="landing-scanline" aria-hidden="true" />
 
       <header className="relative z-10 mx-auto flex w-full max-w-[1120px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
-        <AppLogo label="shuai-tunnel" subtitle="传文件" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
+        <AppLogo label="shuai-tunnel" subtitle="互传" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="flex shrink-0 items-center gap-2">
           <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
           <Button as="a" href="/" radius="sm" variant="flat" className="glass-chip text-zinc-950 dark:text-white">
@@ -818,10 +1222,10 @@ function PublicTransferPageContent() {
       <section className="relative z-10 mx-auto grid w-full max-w-[1120px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 lg:grid-cols-[minmax(0,1fr)_360px]">
         <div className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-6">
           <div className="flex flex-col gap-2">
-            <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">文件互传</div>
-            <h1 className="text-display-md font-semibold sm:text-display-lg">把文件发给另一台设备</h1>
+            <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">互传</div>
+            <h1 className="text-display-md font-semibold sm:text-display-lg">文件、剪贴板和白板，一处互传</h1>
             <p className="max-w-2xl text-small leading-6 text-zinc-700 dark:text-zinc-300">
-              选文件，邀请对方加入，点发送。手机和电脑都可以直接打开这个页面。
+              邀请对方加入后，可切换文件传输、剪贴板同步和同步白板。手机和电脑都可以直接打开这个页面。
             </p>
           </div>
 
@@ -866,7 +1270,7 @@ function PublicTransferPageContent() {
                 radius="sm"
                 variant="bordered"
                 value={roomId}
-                onValueChange={setRoomId}
+                onValueChange={updateRoomId}
                 maxLength={120}
               />
               <Input
@@ -927,43 +1331,87 @@ function PublicTransferPageContent() {
             </div>
           )}
 
-          <div className="mt-5 rounded-lg glass border border-dashed border-zinc-300 p-4 dark:border-white/15">
+          <div className="mt-5 grid grid-cols-3 gap-1.5 rounded-lg border border-black/10 bg-white/45 p-1 dark:border-white/10 dark:bg-white/[0.04]" role="tablist" aria-label="互传功能切换">
+            <ToolModeButton
+              mode="files"
+              activeMode={activeTool}
+              label="文件传输"
+              detail={fileActivityCount > 0 ? `${fileActivityCount} 项` : "发送和接收"}
+              onSelect={selectTransferTool}
+            />
+            <ToolModeButton
+              mode="clipboard"
+              activeMode={activeTool}
+              label="同步剪贴板"
+              detail={clipboardSyncEnabled ? "已开启" : clipboardEvents.length > 0 ? "有新内容" : "定向同步"}
+              onSelect={selectTransferTool}
+            />
+            <ToolModeButton
+              mode="whiteboard"
+              activeMode={activeTool}
+              label="同步白板"
+              detail={peers.length > 0 ? `${peers.length + 1} 台` : "本地绘制"}
+              onSelect={selectTransferTool}
+            />
+          </div>
+
+          <div
+            id="transfer-panel-files"
+            role="tabpanel"
+            aria-labelledby="transfer-tab-files"
+            hidden={activeTool !== "files"}
+          >
             <input
+              ref={fileInputRef}
               id="public-transfer-file-input"
               type="file"
               multiple
-              className="sr-only"
-              onClick={(event) => {
-                event.currentTarget.value = "";
-              }}
-              onChange={(event) => setSelectedFiles(Array.from(event.target.files ?? []))}
+              hidden
+              tabIndex={-1}
+              onChange={handleFileInputChange}
             />
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="min-w-0">
-                <div className="text-tiny font-medium uppercase tracking-[0.12em] text-zinc-500 dark:text-zinc-400">选择文件</div>
-                <div className="mt-1 truncate text-small font-medium text-zinc-900 dark:text-white">
-                  {selectedFileTitle}
-                </div>
-                <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                  {selectedFileDetail}
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0">
-                <label
-                  htmlFor="public-transfer-file-input"
-                  className="inline-flex h-10 min-w-20 w-full cursor-pointer items-center justify-center rounded-small bg-default-100 px-4 text-small font-normal text-foreground transition-colors hover:bg-default-200 sm:w-auto"
-                >
-                  选择文件
-                </label>
-                <Button color="primary" radius="sm" className="w-full sm:w-auto" isLoading={state === "connecting" || state === "waiting" || state === "direct" || state === "presigning" || state === "uploading" || state === "completing"} onPress={() => void upload()}>
-                  {uploadButtonLabel}
-                </Button>
-              </div>
-            </div>
+            <button
+              type="button"
+              data-testid="public-transfer-file-dropzone"
+              aria-label="粘贴文件、拖到这里，或点击选择；选择后立即发送"
+              aria-describedby="public-transfer-file-dropzone-detail"
+              aria-busy={isTransferBusy}
+              aria-disabled={isTransferBusy}
+              onClick={openFilePicker}
+              onDragEnter={handleFileDragEnter}
+              onDragOver={handleFileDragOver}
+              onDragLeave={handleFileDragLeave}
+              onDrop={handleFileDrop}
+              className={`group relative mt-5 flex min-h-44 w-full flex-col items-center justify-center overflow-hidden rounded-xl border-2 border-dashed px-5 py-8 text-center outline-none transition duration-200 motion-reduce:transition-none ${
+                isFileDragActive
+                  ? "border-cyan-400 bg-cyan-50/90 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.18),0_18px_50px_-32px_rgba(8,145,178,0.8)] dark:border-cyan-300 dark:bg-cyan-300/10"
+                  : isTransferBusy
+                    ? "cursor-wait border-cyan-400/45 bg-cyan-50/55 dark:border-cyan-300/30 dark:bg-cyan-300/[0.07]"
+                    : "cursor-pointer border-zinc-300 bg-white/35 hover:border-cyan-500/55 hover:bg-cyan-50/55 focus-visible:border-cyan-500 focus-visible:ring-4 focus-visible:ring-cyan-500/15 dark:border-white/15 dark:bg-white/[0.035] dark:hover:border-cyan-300/50 dark:hover:bg-cyan-300/[0.07] dark:focus-visible:border-cyan-300"
+              }`}
+            >
+              <span aria-hidden="true" className="absolute left-3 top-3 h-4 w-4 border-l border-t border-cyan-500/35 dark:border-cyan-300/30" />
+              <span aria-hidden="true" className="absolute right-3 top-3 h-4 w-4 border-r border-t border-cyan-500/35 dark:border-cyan-300/30" />
+              <span aria-hidden="true" className="absolute bottom-3 left-3 h-4 w-4 border-b border-l border-cyan-500/35 dark:border-cyan-300/30" />
+              <span aria-hidden="true" className="absolute bottom-3 right-3 h-4 w-4 border-b border-r border-cyan-500/35 dark:border-cyan-300/30" />
+              <span className="rounded-full border border-cyan-500/20 bg-cyan-500/10 px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-800 dark:border-cyan-300/20 dark:bg-cyan-300/10 dark:text-cyan-100">
+                {isFileDragActive ? "Drop to send" : "Paste · Drop · Click"}
+              </span>
+              <span className="mt-3 text-base font-semibold text-zinc-950 dark:text-white">
+                {fileDropzoneTitle}
+              </span>
+              <span
+                id="public-transfer-file-dropzone-detail"
+                aria-live="polite"
+                className="mt-1.5 w-full min-w-0 max-w-xl [overflow-wrap:anywhere] text-tiny leading-5 text-zinc-500 dark:text-zinc-400"
+              >
+                {fileDropzoneDetail}
+              </span>
+            </button>
           </div>
 
           {state !== "idle" && (
-            <div className="mt-4">
+            <div className={activeTool === "files" ? "mt-4" : "hidden"} aria-hidden={activeTool !== "files"}>
               <Progress
                 aria-label="上传进度"
                 value={state === "done" ? 100 : progress}
@@ -988,58 +1436,81 @@ function PublicTransferPageContent() {
             </div>
           )}
 
-          <SyncedWhiteboard
-            boardKey={`${roomId}:${sharedDiscoveryEnabled ? roomToken : "nearby"}`}
-            peerId={peerId}
+          <SyncedClipboard
+            syncKey={transferRoomScopeKey}
+            isActive={activeTool === "clipboard"}
+            focusRequest={clipboardFocusRequest}
+            isEnabled={clipboardSyncEnabled}
             peerCount={peers.length}
-            isConnected={peers.length > 0}
-            events={whiteboardEvents}
-            onSend={sendWhiteboardPayload}
+            targetPeerId={selectedPeer?.peerId ?? ""}
+            targetPeerLabel={selectedPeer?.displayName || selectedPeer?.peerId || ""}
+            events={clipboardEvents}
+            onEnabledChange={setClipboardSyncEnabled}
+            onSend={sendClipboardPayload}
           />
 
-          <IncomingFilesPanel
-            pendingTransfers={pendingTransfers}
-            receivingTransfers={receivingTransfers}
-            incoming={incoming}
-            onAcceptDirect={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
-            onRejectDirect={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
-            onShare={shareIncomingFile}
-            onDownload={downloadIncoming}
-            onPreview={setPreviewTarget}
-          />
+          <div
+            id="transfer-panel-whiteboard"
+            role="tabpanel"
+            aria-labelledby="transfer-tab-whiteboard"
+            hidden={activeTool !== "whiteboard"}
+          >
+            <SyncedWhiteboard
+              boardKey={transferRoomScopeKey}
+              peerId={peerId}
+              peerCount={peers.length}
+              isConnected={peers.length > 0}
+              isActive={activeTool === "whiteboard"}
+              events={whiteboardEvents}
+              onSend={sendWhiteboardPayload}
+            />
+          </div>
 
-          {record && (
-            <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
-              <div className="rounded-lg glass glass-border border p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="text-base font-semibold text-zinc-950 dark:text-white">
-                      {record.direct ? "已发送给对方" : selectedPeer ? "已通知对方接收" : "分享链接已准备好"}
+          <div className={activeTool === "files" ? "" : "hidden"} aria-hidden={activeTool !== "files"}>
+            <IncomingFilesPanel
+              pendingTransfers={pendingTransfers}
+              receivingTransfers={receivingTransfers}
+              incoming={incoming}
+              onAcceptDirect={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
+              onRejectDirect={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
+              onShare={shareIncomingFile}
+              onDownload={downloadIncoming}
+              onPreview={setPreviewTarget}
+            />
+
+            {record && (
+              <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
+                <div className="rounded-lg glass glass-border border p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-base font-semibold text-zinc-950 dark:text-white">
+                        {record.direct ? "已发送给对方" : selectedPeer ? "已通知对方接收" : "分享链接已准备好"}
+                      </div>
+                      <div className="mt-1 truncate text-small font-medium text-zinc-700 dark:text-zinc-200">{record.attachment.fileName}</div>
+                      <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
+                        {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "同房间成员可下载 · 可复制链接发给别人"}
+                      </div>
                     </div>
-                    <div className="mt-1 truncate text-small font-medium text-zinc-700 dark:text-zinc-200">{record.attachment.fileName}</div>
-                    <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                      {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "同房间成员可下载 · 可复制链接发给别人"}
-                    </div>
+                    <Chip size="sm" color="success" variant="flat">
+                      完成
+                    </Chip>
                   </div>
-                  <Chip size="sm" color="success" variant="flat">
-                    完成
-                  </Chip>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button radius="sm" color="primary" variant="flat" onPress={() => void shareRecordFile()}>
+                      分享
+                    </Button>
+                    <Button radius="sm" variant="flat" onPress={() => void copyRecordFileLink()}>
+                      复制链接
+                    </Button>
+                    <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
+                      保存到本机
+                    </Button>
+                  </div>
                 </div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <Button radius="sm" color="primary" variant="flat" onPress={() => void shareRecordFile()}>
-                    分享
-                  </Button>
-                  <Button radius="sm" variant="flat" onPress={() => void copyRecordFileLink()}>
-                    复制链接
-                  </Button>
-                  <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
-                    保存到本机
-                  </Button>
-                </div>
+                <Preview record={record} onPreview={setPreviewTarget} />
               </div>
-              <Preview record={record} onPreview={setPreviewTarget} />
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         <aside className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5">
@@ -1088,6 +1559,64 @@ function PublicTransferPageContent() {
       </section>
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
     </main>
+  );
+}
+
+function ToolModeButton({
+  mode,
+  activeMode,
+  label,
+  detail,
+  onSelect,
+}: {
+  mode: TransferToolMode;
+  activeMode: TransferToolMode;
+  label: string;
+  detail: string;
+  onSelect: (mode: TransferToolMode, focusContent?: boolean) => void;
+}) {
+  const active = mode === activeMode;
+  const selectAndFocus = (nextMode: TransferToolMode) => {
+    onSelect(nextMode, false);
+    window.requestAnimationFrame(() => document.getElementById(`transfer-tab-${nextMode}`)?.focus());
+  };
+  return (
+    <button
+      id={`transfer-tab-${mode}`}
+      type="button"
+      role="tab"
+      aria-selected={active}
+      aria-controls={`transfer-panel-${mode}`}
+      tabIndex={active ? 0 : -1}
+      className={`min-w-0 rounded-md px-3 py-2 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
+        active
+          ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-400 dark:text-zinc-950"
+          : "text-zinc-600 hover:bg-cyan-50 hover:text-cyan-900 dark:text-zinc-300 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100"
+      }`}
+      onClick={() => onSelect(mode, true)}
+      onKeyDown={(event) => {
+        const currentIndex = TRANSFER_TOOL_MODES.indexOf(mode);
+        let nextMode: TransferToolMode | null = null;
+        if (event.key === "ArrowRight") {
+          nextMode = TRANSFER_TOOL_MODES[(currentIndex + 1) % TRANSFER_TOOL_MODES.length];
+        } else if (event.key === "ArrowLeft") {
+          nextMode = TRANSFER_TOOL_MODES[(currentIndex - 1 + TRANSFER_TOOL_MODES.length) % TRANSFER_TOOL_MODES.length];
+        } else if (event.key === "Home") {
+          nextMode = TRANSFER_TOOL_MODES[0];
+        } else if (event.key === "End") {
+          nextMode = TRANSFER_TOOL_MODES[TRANSFER_TOOL_MODES.length - 1];
+        }
+        if (nextMode) {
+          event.preventDefault();
+          selectAndFocus(nextMode);
+        }
+      }}
+    >
+      <span className="block truncate text-small font-semibold">{label}</span>
+      <span className={`mt-0.5 block truncate text-[11px] ${active ? "text-white/80 dark:text-zinc-950/70" : "text-zinc-500 dark:text-zinc-400"}`}>
+        {detail}
+      </span>
+    </button>
   );
 }
 
@@ -1462,6 +1991,9 @@ function TransferFaq({ iceConfig }: { iceConfig: PublicTransferIceConfig | null 
         <FaqItem title="文件会怎么传？">
           页面会优先让两端直接传；如果网络不适合直连，会自动换成临时安全链接完成传输。
         </FaqItem>
+        <FaqItem title="剪贴板为什么有时需要点一下复制？">
+          浏览器可能阻止网页在后台改写系统剪贴板。内容仍会保留在页面里，点击“复制到本机”即可完成写入。
+        </FaqItem>
         <FaqItem title="谁能看到我发的文件？">
           分享到房间的文件，同一个房间里的成员都能看到并下载。只想发给某一台设备时，先在右侧点选对方再发送，会走两端直连、不进房间共享。
         </FaqItem>
@@ -1531,10 +2063,25 @@ function putObject(
   file: File,
   headers: Record<string, string>,
   onProgress: (value: number) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const reportProgress = createProgressReporter(onProgress);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener("abort", abortUpload);
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const abortUpload = () => {
+      xhr.abort();
+      finish(() => reject(new Error("文件发送已取消")));
+    };
     xhr.open("PUT", url, true);
     for (const [key, value] of Object.entries(headers)) {
       xhr.setRequestHeader(key, value);
@@ -1547,12 +2094,18 @@ function putObject(
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         reportProgress(100, true);
-        resolve();
+        finish(resolve);
       } else {
-        reject(new Error(`文件发送失败：HTTP ${xhr.status}`));
+        finish(() => reject(new Error(`文件发送失败：HTTP ${xhr.status}`)));
       }
     };
-    xhr.onerror = () => reject(new Error("文件发送失败，请检查网络后重试"));
+    xhr.onerror = () => finish(() => reject(new Error("文件发送失败，请检查网络后重试")));
+    xhr.onabort = () => finish(() => reject(new Error("文件发送已取消")));
+    signal?.addEventListener("abort", abortUpload, { once: true });
+    if (signal?.aborted) {
+      abortUpload();
+      return;
+    }
     xhr.send(file);
   });
 }
@@ -1803,6 +2356,26 @@ function fileShareUrl(attachment: TransferAttachment, roomId: string, roomToken:
   const url = new URL(roomShareUrl(roomId, roomToken));
   url.searchParams.set("attachmentId", String(attachment.attachmentId));
   return url.toString();
+}
+
+function hasDraggedFiles(dataTransfer: DataTransfer) {
+  return Array.from(dataTransfer.types ?? []).includes("Files");
+}
+
+function filesFromClipboard(dataTransfer: DataTransfer) {
+  const itemFiles = Array.from(dataTransfer.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+  return itemFiles.length > 0 ? itemFiles : Array.from(dataTransfer.files ?? []);
+}
+
+function isEditablePasteTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  return target.matches("input, textarea, select, [contenteditable='true'], [role='textbox']")
+    || Boolean(target.closest("[contenteditable='true'], [role='textbox']"));
 }
 
 async function copyText(value: string) {

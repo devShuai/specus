@@ -149,7 +149,7 @@ function LoginPageContent() {
           <div className="grid w-full grid-cols-[2.25rem_repeat(3,minmax(0,1fr))] gap-2 sm:flex sm:w-auto sm:items-center">
             <LandingThemeToggleButton />
             <a href="#/transfer" className="landing-ghost-button landing-nav-button">
-              文件互传
+              互传
             </a>
             <a href="#/nat-detect" className="landing-ghost-button landing-nav-button">
               NAT 检测

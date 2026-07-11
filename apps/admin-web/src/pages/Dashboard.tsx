@@ -28,7 +28,7 @@ const navGroups: NavGroup[] = [
   { label: "接入", items: [
     { key: "clients" as const, title: "客户端" },
     { key: "messages" as const, title: "消息" },
-    { key: "transfer" as const, title: "文件互传" },
+    { key: "transfer" as const, title: "互传" },
     { key: "tunnels" as const, title: "端口映射" },
     { key: "http-routes" as const, title: "HTTP 路由" },
     { key: "downloads" as const, title: "客户端下载" },
