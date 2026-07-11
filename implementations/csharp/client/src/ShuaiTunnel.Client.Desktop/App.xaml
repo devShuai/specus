@@ -61,29 +61,29 @@
             <Setter Property="FontSize" Value="12" />
         </Style>
 
-        <!-- 圆角统一两档：外层面板/卡片/日志 16，控件/表格外壳/信息条 12，内层可选项 8 -->
+        <!-- 紧凑布局圆角统一两档：外层面板/卡片/日志/表格外壳 10，控件/信息条/内层可选项 8 -->
         <Style x:Key="SurfacePanelStyle" TargetType="Border">
             <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="16" />
-            <Setter Property="Padding" Value="16" />
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="Padding" Value="12" />
         </Style>
 
         <Style x:Key="MetricCardStyle" TargetType="Border">
             <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="16" />
-            <Setter Property="Padding" Value="14" />
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="Padding" Value="10,7" />
         </Style>
 
         <Style x:Key="InfoStripStyle" TargetType="Border">
             <Setter Property="Background" Value="{DynamicResource PrimarySoftBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource InfoStripBorderBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="12" />
-            <Setter Property="Padding" Value="14" />
+            <Setter Property="CornerRadius" Value="8" />
+            <Setter Property="Padding" Value="10,6" />
         </Style>
 
         <!-- RoundedClip 把裁剪应用到 Child（DataGrid），表头等方角内容随外壳圆角，
@@ -92,10 +92,10 @@
             <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
             <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="CornerRadius" Value="12" />
+            <Setter Property="CornerRadius" Value="10" />
             <Setter Property="Padding" Value="1" />
             <Setter Property="SnapsToDevicePixels" Value="True" />
-            <Setter Property="desktop:RoundedClip.CornerRadius" Value="12" />
+            <Setter Property="desktop:RoundedClip.CornerRadius" Value="10" />
         </Style>
 
         <Style x:Key="GridCellSelectableTextBoxStyle" TargetType="TextBox">
@@ -224,8 +224,8 @@
 
         <Style TargetType="TextBox">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
-            <Setter Property="Padding" Value="12,8" />
-            <Setter Property="MinHeight" Value="40" />
+            <Setter Property="Padding" Value="10,5" />
+            <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
             <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
@@ -239,7 +239,7 @@
                                 Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                CornerRadius="12"
+                                CornerRadius="8"
                                 SnapsToDevicePixels="True">
                             <ScrollViewer x:Name="PART_ContentHost"
                                           Margin="{TemplateBinding Padding}" />
@@ -264,8 +264,8 @@
 
         <Style TargetType="PasswordBox">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
-            <Setter Property="Padding" Value="12,8" />
-            <Setter Property="MinHeight" Value="40" />
+            <Setter Property="Padding" Value="10,5" />
+            <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
             <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
@@ -279,7 +279,7 @@
                                 Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                CornerRadius="12"
+                                CornerRadius="8"
                                 SnapsToDevicePixels="True">
                             <ScrollViewer x:Name="PART_ContentHost"
                                           Margin="{TemplateBinding Padding}" />
@@ -328,8 +328,8 @@
 
         <Style TargetType="ComboBox">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
-            <Setter Property="Padding" Value="12,8" />
-            <Setter Property="MinHeight" Value="40" />
+            <Setter Property="Padding" Value="10,5" />
+            <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource ControlBrush}" />
             <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="BorderBrush" Value="{DynamicResource PanelStrokeBrush}" />
@@ -352,7 +352,7 @@
                                                 Background="{TemplateBinding Background}"
                                                 BorderBrush="{TemplateBinding BorderBrush}"
                                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                                CornerRadius="12" />
+                                                CornerRadius="8" />
                                         <ControlTemplate.Triggers>
                                             <Trigger Property="IsMouseOver" Value="True">
                                                 <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource ControlHoverBrush}" />
@@ -371,7 +371,7 @@
                             </ToggleButton>
 
                             <ContentPresenter x:Name="ContentSite"
-                                              Margin="12,0,38,0"
+                                              Margin="10,0,32,0"
                                               HorizontalAlignment="Left"
                                               VerticalAlignment="Center"
                                               Content="{TemplateBinding SelectionBoxItem}"
@@ -382,7 +382,7 @@
 
                             <TextBox x:Name="PART_EditableTextBox"
                                      Style="{StaticResource ComboBoxEditableTextBoxStyle}"
-                                     Margin="12,0,38,0"
+                                     Margin="10,0,32,0"
                                      HorizontalAlignment="Stretch"
                                      VerticalAlignment="Center"
                                      Visibility="Hidden"
@@ -391,7 +391,7 @@
                             <Path x:Name="Arrow"
                                   Width="10"
                                   Height="6"
-                                  Margin="0,0,15,0"
+                                  Margin="0,0,12,0"
                                   HorizontalAlignment="Right"
                                   VerticalAlignment="Center"
                                   Fill="{DynamicResource TextSecondaryBrush}"
@@ -408,10 +408,10 @@
                                 <Border Background="{DynamicResource SurfaceRaisedBrush}"
                                         BorderBrush="{DynamicResource PanelStrokeStrongBrush}"
                                         BorderThickness="1"
-                                        CornerRadius="12"
+                                        CornerRadius="10"
                                         MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
                                         MaxHeight="{TemplateBinding MaxDropDownHeight}"
-                                        Padding="5">
+                                        Padding="4">
                                     <ScrollViewer CanContentScroll="True"
                                                   VerticalScrollBarVisibility="Auto"
                                                   HorizontalScrollBarVisibility="Disabled">
@@ -442,7 +442,7 @@
         <Style TargetType="ComboBoxItem">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
             <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-            <Setter Property="Padding" Value="10,8" />
+            <Setter Property="Padding" Value="8,5" />
             <Setter Property="Margin" Value="0,1" />
             <Setter Property="FocusVisualStyle" Value="{x:Null}" />
             <Setter Property="Template">
@@ -474,8 +474,8 @@
 
         <Style TargetType="Button">
             <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
-            <Setter Property="Padding" Value="14,8" />
-            <Setter Property="MinHeight" Value="38" />
+            <Setter Property="Padding" Value="12,5" />
+            <Setter Property="MinHeight" Value="32" />
             <Setter Property="Background" Value="{DynamicResource SecondaryBrush}" />
             <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
             <Setter Property="BorderThickness" Value="1" />
@@ -488,7 +488,7 @@
                                 Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                CornerRadius="12"
+                                CornerRadius="8"
                                 Padding="{TemplateBinding Padding}"
                                 SnapsToDevicePixels="True">
                             <ContentPresenter HorizontalAlignment="Center"
@@ -547,7 +547,7 @@
                                             Panel.ZIndex="1"
                                             HorizontalAlignment="Left" />
                             <ContentPresenter Grid.Row="1"
-                                              Margin="0,14,0,0"
+                                              Margin="0,10,0,0"
                                               ContentSource="SelectedContent" />
                         </Grid>
                     </ControlTemplate>
@@ -560,10 +560,10 @@
             <Setter Property="FontSize" Value="13" />
             <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-            <Setter Property="Padding" Value="18,9" />
-            <Setter Property="Margin" Value="0,0,14,0" />
-            <Setter Property="MinHeight" Value="36" />
-            <Setter Property="MinWidth" Value="148" />
+            <Setter Property="Padding" Value="14,6" />
+            <Setter Property="Margin" Value="0,0,8,0" />
+            <Setter Property="MinHeight" Value="30" />
+            <Setter Property="MinWidth" Value="96" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="TabItem">
@@ -611,8 +611,8 @@
             <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto" />
             <Setter Property="EnableRowVirtualization" Value="True" />
             <Setter Property="EnableColumnVirtualization" Value="True" />
-            <Setter Property="RowHeight" Value="42" />
-            <Setter Property="ColumnHeaderHeight" Value="42" />
+            <Setter Property="RowHeight" Value="30" />
+            <Setter Property="ColumnHeaderHeight" Value="32" />
             <Setter Property="RowBackground" Value="{DynamicResource SurfaceBrush}" />
             <Setter Property="AlternatingRowBackground" Value="{DynamicResource SurfaceAltBrush}" />
             <Setter Property="SelectionMode" Value="Single" />
@@ -625,7 +625,7 @@
                         <Setter Property="FontWeight" Value="SemiBold" />
                         <Setter Property="BorderThickness" Value="0,0,0,1" />
                         <Setter Property="BorderBrush" Value="{DynamicResource TableLineBrush}" />
-                        <Setter Property="Padding" Value="14,0" />
+                        <Setter Property="Padding" Value="10,0" />
                         <Setter Property="HorizontalContentAlignment" Value="Left" />
                         <Setter Property="SeparatorBrush" Value="{DynamicResource TableLineBrush}" />
                     </Style>
@@ -635,8 +635,8 @@
                 <Setter.Value>
                     <Style TargetType="DataGridCell">
                         <Setter Property="BorderThickness" Value="0" />
-                        <Setter Property="Padding" Value="14,0" />
-                        <Setter Property="MinHeight" Value="42" />
+                        <Setter Property="Padding" Value="10,0" />
+                        <Setter Property="MinHeight" Value="30" />
                         <Setter Property="VerticalContentAlignment" Value="Center" />
                         <Setter Property="HorizontalContentAlignment" Value="Stretch" />
                         <Setter Property="FocusVisualStyle" Value="{x:Null}" />
@@ -669,7 +669,7 @@
                 <Setter.Value>
                     <Style TargetType="DataGridRow">
                         <Setter Property="SnapsToDevicePixels" Value="True" />
-                        <Setter Property="Margin" Value="0,1" />
+                        <Setter Property="Margin" Value="0" />
                         <Style.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
                                 <Setter Property="Background" Value="{DynamicResource TableRowHoverBrush}" />
