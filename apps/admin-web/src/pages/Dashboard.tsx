@@ -117,8 +117,7 @@ function DashboardContent() {
             <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
             {renderActions("flex shrink-0 items-center gap-1.5")}
           </div>
-          <div className="hidden h-16 w-full px-4 py-3 sm:px-6 lg:flex lg:items-center lg:justify-between lg:py-0">
-            <h2 className="text-lg font-semibold text-foreground">{activeTitle}</h2>
+          <div className="hidden h-16 w-full px-4 py-3 sm:px-6 lg:flex lg:items-center lg:justify-end lg:py-0">
             {renderActions("flex shrink-0 items-center gap-3")}
           </div>
         </header>
