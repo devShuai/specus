@@ -203,6 +203,14 @@ export function SyncedWhiteboard({
   const activeColor = selectedTool === "eraser" ? ERASER_COLOR : selectedColor;
   const totalPeers = peerCount + 1;
 
+  const selectTool = useCallback((tool: WhiteboardTool) => {
+    setSelectedTool(tool);
+    if (tool === "text") {
+      setTextDraft((current) => current ?? { x: 0.18, y: 0.18, text: "" });
+      setBoardMessage("输入文本，按 Ctrl/⌘ + Enter 插入，Esc 取消；也可以点击画布调整位置。");
+    }
+  }, []);
+
   const selectObject = useCallback((objectId: string | null) => {
     selectedObjectIdRef.current = objectId;
     setSelectedObjectId(objectId);
@@ -645,11 +653,12 @@ export function SyncedWhiteboard({
       return;
     }
     if (selectedTool === "text") {
-      setTextDraft({
+      event.preventDefault();
+      setTextDraft((current) => ({
         x: clamp(point.x, 0.02, 0.7),
         y: clamp(point.y, 0.02, 0.78),
-        text: "",
-      });
+        text: current?.text ?? "",
+      }));
       setBoardMessage("输入文本，按 Ctrl/⌘ + Enter 插入，Esc 取消。");
       return;
     }
@@ -934,7 +943,7 @@ export function SyncedWhiteboard({
     };
     if (shortcuts[shortcut]) {
       event.preventDefault();
-      setSelectedTool(shortcuts[shortcut]);
+      selectTool(shortcuts[shortcut]);
     }
   };
 
@@ -996,14 +1005,14 @@ export function SyncedWhiteboard({
       >
         <div className="shrink-0 border-b border-black/10 bg-white/80 p-2.5 dark:border-white/10 dark:bg-zinc-900/90">
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1" role="toolbar" aria-label="白板工具">
-            <WhiteboardToolButton tool="select" label="选择" activeTool={selectedTool} onSelect={setSelectedTool} />
-            <WhiteboardToolButton tool="pen" label="画笔" activeTool={selectedTool} onSelect={setSelectedTool} />
-            <WhiteboardToolButton tool="eraser" label="橡皮" activeTool={selectedTool} onSelect={setSelectedTool} />
+            <WhiteboardToolButton tool="select" label="选择" activeTool={selectedTool} onSelect={selectTool} />
+            <WhiteboardToolButton tool="pen" label="画笔" activeTool={selectedTool} onSelect={selectTool} />
+            <WhiteboardToolButton tool="eraser" label="橡皮" activeTool={selectedTool} onSelect={selectTool} />
             <span className="mx-1 h-8 w-px shrink-0 bg-black/10 dark:bg-white/10" aria-hidden />
-            <WhiteboardToolButton tool="text" label="文本" activeTool={selectedTool} onSelect={setSelectedTool} />
-            <WhiteboardToolButton tool="rectangle" label="矩形" activeTool={selectedTool} onSelect={setSelectedTool} />
-            <WhiteboardToolButton tool="ellipse" label="圆形" activeTool={selectedTool} onSelect={setSelectedTool} />
-            <WhiteboardToolButton tool="arrow" label="箭头" activeTool={selectedTool} onSelect={setSelectedTool} />
+            <WhiteboardToolButton tool="text" label="文本" activeTool={selectedTool} onSelect={selectTool} />
+            <WhiteboardToolButton tool="rectangle" label="矩形" activeTool={selectedTool} onSelect={selectTool} />
+            <WhiteboardToolButton tool="ellipse" label="圆形" activeTool={selectedTool} onSelect={selectTool} />
+            <WhiteboardToolButton tool="arrow" label="箭头" activeTool={selectedTool} onSelect={selectTool} />
             <button
               type="button"
               className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium text-zinc-700 transition hover:bg-cyan-50 hover:text-cyan-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100"
@@ -1114,7 +1123,10 @@ export function SyncedWhiteboard({
               placeholder="输入文本..."
               aria-label="白板文本框内容"
               className="absolute z-20 h-28 w-[min(18rem,72%)] resize-none rounded-lg border-2 border-cyan-500 bg-white/95 p-3 text-small text-zinc-950 shadow-xl outline-none ring-4 ring-cyan-500/10"
-              style={{ left: textDraft.x * 100 + "%", top: textDraft.y * 100 + "%" }}
+              style={{
+                left: Math.min(textDraft.x, 0.26) * 100 + "%",
+                top: Math.min(textDraft.y, 0.64) * 100 + "%",
+              }}
               onChange={(event) => {
                 const value = event.currentTarget.value;
                 setTextDraft((current) => current ? { ...current, text: value } : current);
