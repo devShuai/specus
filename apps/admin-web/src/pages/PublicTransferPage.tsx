@@ -1219,7 +1219,11 @@ function PublicTransferPageContent() {
         </div>
       </header>
 
-      <section className="relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <section
+        className={`relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 ${
+          activeTool === "whiteboard" ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_320px]"
+        }`}
+      >
         <div className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-6">
           <div className="flex flex-col gap-2">
             <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">互传</div>
@@ -1513,7 +1517,7 @@ function PublicTransferPageContent() {
           </div>
         </div>
 
-        <aside className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5 xl:sticky xl:top-5 xl:self-start">
+        <aside className={`${activeTool === "whiteboard" ? "hidden" : ""} min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5 xl:sticky xl:top-5 xl:self-start`}>
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold">发送给谁</h2>
@@ -2208,6 +2212,12 @@ function whiteboardEventKey(sourcePeerId: string, payload: WhiteboardPayload) {
   }
   if (payload.kind === "remove-stroke") {
     return `${sourcePeerId}:remove:${payload.strokeId}:${payload.createdAt}`;
+  }
+  if (payload.kind === "object-upsert") {
+    return `${sourcePeerId}:object:${payload.object.objectId}:${payload.object.updatedAt}:${payload.createdAt}`;
+  }
+  if (payload.kind === "remove-object") {
+    return `${sourcePeerId}:remove-object:${payload.objectId}:${payload.createdAt}`;
   }
   if (payload.kind === "clear") {
     return `${sourcePeerId}:clear:${payload.clearId}:${payload.createdAt}`;
