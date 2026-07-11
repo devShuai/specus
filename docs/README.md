@@ -14,9 +14,9 @@
 * [peer-mesh-java-client-audit-fixes.md](peer-mesh/peer-mesh-java-client-audit-fixes.md) — Java 客户端打洞审计与修复记录(2026-07),含成功率观测方法。
 * [direct-connect-hole-punching-research.md](peer-mesh/direct-connect-hole-punching-research.md) — P2P 直连打洞历史调研（基线 `57f1a67`）。
 
-## transfer/ — 免登录文件互传
+## transfer/ — 免登录互传
 
-* [public-file-transfer-audit.md](transfer/public-file-transfer-audit.md) — 免登录文件互传当前实现与审计清单(2026-07)；“接收前确认”默认关闭（自动接收），开启后才要求接收/拒绝，拒绝不回退 OSS。
+* 互传模块支持文件传输、剪贴板同步和同步白板；[public-file-transfer-audit.md](transfer/public-file-transfer-audit.md) 记录其中的文件传输实现与审计清单(2026-07)。“接收前确认”默认关闭（自动接收），开启后才要求接收/拒绝，拒绝不回退 OSS。
 
 ## cross-language/ — 多语言移植与一致性
 

@@ -1,14 +1,16 @@
 # 公共互传协议
 
-本文定义免登录公共文件互传的服务端协议，包括公共 ICE 配置、发现信令、附件 REST、对象存储和滥用防护。
+本文定义免登录公共互传的浏览器与服务端协议，覆盖文件附件、剪贴板文本和同步白板，包括公共 ICE 配置、发现信令、
+浏览器应用消息、附件 REST、对象存储和滥用防护。
 Java server 是语义基准；Go、.NET server 的完整实现必须保持一致。文中的“必须”“应当”“可以”分别对应
 MUST、SHOULD、MAY。
 
-公共互传由三条相互独立但可组合的路径构成：
+公共互传由以下相互独立但可组合的路径构成：
 
 1. `GET /api/public/transfer/ice-config` 提供 STUN/TURN 候选；
-2. `/ws/public-transfer/discovery` 负责浏览器发现、roster 和定向信令；
-3. 附件 REST 返回短期预签名 URL，文件内容由客户端直接上传/下载对象存储。
+2. `/ws/public-transfer/discovery` 负责浏览器发现、roster、定向信令，以及 DataChannel 不可用时的应用消息回退；
+3. WebRTC `RTCDataChannel` 优先承载剪贴板和白板等浏览器应用消息；
+4. 附件 REST 返回短期预签名 URL，文件内容由客户端直接上传/下载对象存储。
 
 发现 WebSocket 和公开附件接口均无需管理 JWT。它们不是安全边界：共享房间的安全性来自高熵
 `roomToken`，附近房间的隔离来自可信反向代理提供的来源 IP。
@@ -135,6 +137,16 @@ roomToken 为空: roomKey = "public:" + publicAddress
 
 ### 2.3 加入、hello 与 roster
 
+同一分组（相同 `roomId` 和内部 `roomKey`）内的 `peerId` 必须唯一。新连接的 `peerId` 已被同组连接占用时，
+服务端先发送：
+
+```json
+{"type":"error","error":"peer id is already connected"}
+```
+
+随后以 WebSocket close code `1008` 关闭，不加入该连接，也不触发 roster 更新。该重复检查先于房间容量检查；不同分组
+可以复用相同 `peerId`。
+
 每个分组最多允许 `max(1, max-discovery-peers-per-room)` 个连接，默认 `32`。房间已满时服务端先发送：
 
 ```json
@@ -179,7 +191,7 @@ roomToken 为空: roomKey = "public:" + publicAddress
 
 `peers` 按 `connectedAt` 升序排列。
 
-### 2.4 ping 与信令转发
+### 2.4 ping、信令与应用消息转发
 
 客户端发送：
 
@@ -219,6 +231,108 @@ roomToken 为空: roomKey = "public:" + publicAddress
 有非空 `targetPeerId` 时仅投递给同组目标；目标不存在时静默丢弃。未给目标时广播给同组其他连接，不回送来源连接。
 无效 JSON 返回 `{"type":"error","error":"invalid message"}`，连接保持打开。
 
+#### 2.4.1 浏览器应用消息
+
+浏览器间的同步白板和剪贴板同步复用发现 WebSocket，但应用消息应当优先通过已经建立的 WebRTC
+`RTCDataChannel` 发送。承载应用消息的 DataChannel 必须使用有序、可靠传输；DataChannel 的远端连接身份即为接收处理
+时使用的 `sourcePeerId`。DataChannel 上的文本帧使用以下应用 envelope：
+
+```json
+{
+  "kind": "app-message",
+  "messageType": "clipboard",
+  "payload": {}
+}
+```
+
+DataChannel 的对端即为应用消息的隐含目标。对本协议而言，“DataChannel 发送成功”只表示通道处于 `open` 状态且
+本地 `send()` 调用未抛出异常，不表示对端已经收到或处理；没有应用层确认时，发送端不得显示“对方已收到”。
+等待通道打开的超时时间可以由客户端实现决定，但一旦某个事件对某个目标决定走 WebSocket 回退路径，就不得在迟到的
+DataChannel 打开后再次发送同一事件。具有事件标识的应用 payload 应按其自身协议定义去重；`STCLIP1` 的事件身份和
+顺序规则见第 2.4.2 节。
+
+当 `roomId`、`roomToken` 或是否使用共享房间发生变化，使当前房间分组作用域改变时，客户端必须关闭旧作用域的全部
+`RTCDataChannel`、`RTCPeerConnection` 和发现 WebSocket，取消仍在打开或等待中的直连任务，并取消尚未执行或尚未
+完成的 WebSocket 回退任务。异步任务和入站回调执行时必须重新核对其创建时的房间作用域或连接 generation；旧作用域
+事件不得通过新房间的发现 WebSocket 发出，旧 socket 迟到的入站消息也必须忽略。客户端还必须清空旧作用域的剪贴板
+事件、白板事件、笔画和快照，不能让它们在新房间重放或参与新快照。
+
+当 DataChannel 未建立、已关闭或在客户端规定的等待时间内不可用时，发送方可以回退到发现 WebSocket。回退消息使用
+第 2.4 节的通用 envelope，客户端发送 `type`、非空 `targetPeerId` 和 `payload`，服务端补入可信的
+`sourcePeerId` 后仅转发给同组目标。例如：
+
+```json
+{
+  "type": "clipboard",
+  "targetPeerId": "web-87654321",
+  "payload": {}
+}
+```
+
+`whiteboard` 与 `clipboard` 应用消息必须定向发送；需要同步给多台设备时，发送方必须为每个目标分别发送一条消息，
+不得省略 `targetPeerId` 使用房间广播。DataChannel 发送成功后不得再发送同一事件的 WebSocket 回退消息。旧客户端必须
+忽略不认识的 `messageType`、`type` 或 payload 版本，以保持向后兼容。发现服务端保持第 2.4 节的通用转发行为，
+不会按应用类型拒绝缺少目标的消息；因此接收端必须忽略 `targetPeerId` 为空或不等于自身 peer ID 的 `whiteboard`、
+`clipboard` WebSocket envelope。
+
+同步白板使用 `messageType: "whiteboard"` 或 WebSocket `type: "whiteboard"`，payload 版本标记为 `STWB1`。
+当前定义的白板事件种类为 `stroke-start`、`stroke-points`、`stroke-end`、`remove-stroke`、`clear` 和 `snapshot`。
+白板笔画、快照和去重状态只保存在参与浏览器的当前内存中，发现服务端只做临时转发，不持久化白板内容。
+
+#### 2.4.2 剪贴板文本 `STCLIP1`
+
+剪贴板同步只传输用户在已开启的剪贴板模块中主动粘贴的 `text/plain`，或者用户输入、编辑文本后明确点击“同步”触发的
+内容；普通输入事件不得自动发送。除读取用户触发的 paste 事件所携带数据外，客户端不得在后台轮询、监听或主动读取
+系统剪贴板，也不得把 `text/html` 剪贴板格式作为富文本同步；纯文本中即使包含标记，也必须按普通文本安全展示。
+DataChannel 使用 `messageType: "clipboard"`，WebSocket 回退使用
+`type: "clipboard"`。`STCLIP1` payload 为：
+
+```json
+{
+  "type": "STCLIP1",
+  "kind": "text",
+  "id": "clip-7f2e4c6a",
+  "sessionId": "67f33d8c-52c0-4e52-92f8-5166e5511052",
+  "sequence": 1,
+  "text": "需要同步的文本",
+  "createdAt": 1780000000000
+}
+```
+
+字段语义：
+
+| 字段 | 规则 |
+| --- | --- |
+| `type` | 必须为 `STCLIP1`；未知版本必须忽略 |
+| `kind` | 当前必须为 `text` |
+| `id` | 发送方生成的字符串事件 ID，长度为 `1..128` 个 UTF-16 code unit，且 JavaScript `trim()` 后必须保持不变；在同一发送方和 `sessionId` 内必须唯一 |
+| `sessionId` | 当前浏览器房间会话的字符串 ID，适用与 `id` 相同的 `1..128` 长度和首尾空白规则；切换房间时必须重新生成 |
+| `sequence` | 非负 JavaScript 安全整数；发送方在同一 `sessionId` 内必须单调递增 |
+| `text` | 原样同步的非空纯文本；必须同时满足不超过 `16,384` 个 UTF-16 code unit，且 UTF-8 编码不超过 `32 KiB` |
+| `createdAt` | 非负 JavaScript 安全整数，表示发送方生成事件时的 Unix epoch 毫秒数；只用于展示，不作为授权或可信排序依据 |
+
+payload 必须是普通 JSON object，且必须恰好包含上述七个字段；缺少字段或存在未知附加字段都视为不合规事件。接收方
+必须校验每个字段的 JSON 类型和约束，按 `(sourcePeerId, sessionId, id)` 去重，并为每个 `(sourcePeerId, sessionId)`
+记录已接受的最高 `sequence`；`sequence` 小于或等于该值的迟到或重放事件必须忽略。未来增加字段时必须使用新的
+payload `type` 版本，不得在 `STCLIP1` 中直接追加字段。上述括号表达的是无歧义 tuple；协议不规定用冒号拼接成字符串，
+实现选择字符串 event key 时必须使用不会因字段内容产生碰撞的编码。
+
+发送方必须在发送前执行两项 `text` 大小检查；任一超限都不得发送。接收方必须重复校验 payload 类型和两项大小上限，
+不合规事件应静默忽略。`16,384` code unit 与 `32 KiB` 是原始 `text` 的剪贴板应用层限制，用于为 JSON 和转发
+envelope 预留空间，但不替代第 2.5 节的完整消息上限。控制字符等内容经 JSON 转义后可能膨胀；使用 WebSocket 回退前，
+发送方还必须确认完整序列化消息不超过 `65,536` 个 UTF-16 code unit，超限时不得走 WebSocket 回退路径。
+
+接收端只有在用户为当前会话开启剪贴板同步后，才可以尝试调用 `navigator.clipboard.writeText(text)` 自动写入系统剪贴板。
+自动写入是 best-effort：它要求安全上下文，并且浏览器仍可能因为权限或缺少瞬时用户操作而拒绝。客户端必须等待写入
+`Promise` 成功后才能显示“已同步到剪贴板”；失败时必须保留一条内存态收件记录并提供由用户点击触发的“复制”操作，
+不得把“消息已收到”表述为“已写入剪贴板”。API 不存在、调用同步抛出异常或 `Promise` rejection 都属于自动写入失败。
+客户端可以把长时间未 settle 的写入视为超时失败，但必须解除本地写入占用、停止自动重试同一事件，并允许用户重新点击
+“复制”；由于 Clipboard API 不支持取消，迟到完成的旧写入不得最终覆盖客户端随后已成功写入的更新内容。
+
+剪贴板事件、收件历史、写入状态和去重集合只能保存在浏览器当前内存中，刷新页面或切换房间时必须清空；不得写入
+`localStorage`、`sessionStorage`、`IndexedDB` 或附件存储。发现服务端只在处理消息时短暂持有并转发 payload，不把
+剪贴板内容写入数据库、对象存储或任何级别的应用日志。
+
 ### 2.5 消息大小与限流
 
 应用层单条文本上限为 `65,536` 个 Java UTF-16 code unit；超过上限以 close code `1009` 关闭。Java WebSocket
@@ -226,8 +340,9 @@ session 的文本/二进制容器 limit 显式设为 `65,536`；按 UTF-8 字节
 （当前 Go/.NET 使用 `3 × 65,536` 字节），解码后再按 UTF-16 code unit 执行同一应用层检查。本端点只定义 JSON
 文本消息；二进制消息不是协议输入，必须像 Java `TextWebSocketHandler` 一样以 close code `1003` 拒绝。
 
-每连接使用进程内固定窗口限流，默认每 `60` 秒 `120` 条，配置值都按至少 `1` 处理。`ping`、无效 JSON 和普通信令
-都先计数。超限时发送：
+每连接使用进程内固定窗口限流，默认每 `60` 秒 `360` 条，配置值都按至少 `1` 处理。`ping`、无效 JSON 和普通信令
+以及经发现 WebSocket 回退的 `whiteboard`、`clipboard` 应用消息都先计数；DataChannel 应用消息不经过服务端，
+不计入该窗口。超限时发送：
 
 ```json
 {"type":"error","error":"rate limited"}

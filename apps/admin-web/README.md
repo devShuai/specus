@@ -72,7 +72,7 @@ npm run typecheck    # tsc --noEmit
 
 - 登录:用户名/密码 + OIDC(PKCE S256);token 存 `sessionStorage`,密码登录自动续期,401 统一登出。
 - 概览、客户端/凭证、端口映射、HTTP 路由、客户端应用包下载和系统管理。
-- 客户端消息与附件、免登录房间文件互传（WebRTC 直连优先、OSS 分享兜底）。
+- 客户端消息与附件、免登录房间互传（文件、剪贴板、同步白板；文件传送优先 WebRTC 直连、OSS 分享兜底）。
 - 连接记录:筛选 + 分页 + WebSocket 实时(created/updated)+ 活动连接 1Hz 时长刷新。
 - 流量观测:客户端 / TCP 映射 / HTTP 路由聚合，HTTP 协议记录和 TCP 数据帧分页查看。
 - HTTP 协议详情:请求/响应两列展示，Header 支持表单与 Raw 切换，常见 Header 带中文说明和规范链接。
