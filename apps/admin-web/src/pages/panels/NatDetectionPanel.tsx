@@ -12,6 +12,7 @@ import {
 import { AppLogo } from "../../components/AppLogo";
 import { ThemeToggleButton } from "../../components/ThemeToggleButton";
 import { HeroRuntime } from "../../components/HeroRuntime";
+import { PublicToolsMenu } from "../../components/PublicToolsMenu";
 import { notify } from "../../components/toast";
 import { fetchPublicPeerStunConfig } from "../../api/client";
 import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
@@ -289,6 +290,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         <header className="relative z-10 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8">
           <AppLogo label="shuai-tunnel" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
           <div className="flex items-center gap-2">
+            <PublicToolsMenu active="nat-detect" />
             <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
             <Button as="a" href="/" radius="sm" variant="flat" className="glass-chip text-zinc-950 dark:text-white">
               进入控制台

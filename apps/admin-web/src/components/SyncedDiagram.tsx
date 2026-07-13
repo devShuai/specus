@@ -125,7 +125,7 @@ interface SyncedDiagramProps {
   isActive?: boolean;
   events: WhiteboardInboundEvent[];
   onSend: (payload: DiagramPayload) => void;
-  onSwitchToWhiteboard: () => void;
+  onSwitchToWhiteboard?: () => void;
 }
 
 interface DiagramRuntime {
@@ -1020,6 +1020,7 @@ export function SyncedDiagram({
   }, []);
 
   const switchToWhiteboard = useCallback(() => {
+    if (!onSwitchToWhiteboard) return;
     if (graphSyncTimerRef.current !== null) {
       window.clearTimeout(graphSyncTimerRef.current);
       graphSyncTimerRef.current = null;
@@ -2345,18 +2346,20 @@ export function SyncedDiagram({
                   <h2 className="text-sm font-semibold tracking-tight text-zinc-950 dark:text-white">专业流程图</h2>
                   <p className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">{activePageName} · 实时协作工作区</p>
                 </div>
-                <div className="flex rounded-lg border border-black/[0.07] bg-white/70 p-0.5 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
-                  <button
-                    type="button"
-                    className="rounded-md px-2.5 py-1 text-[10px] font-medium text-zinc-500 transition hover:bg-black/[0.04] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
-                    onClick={switchToWhiteboard}
-                  >
-                    自由白板
-                  </button>
-                  <button type="button" className="rounded-md bg-zinc-950 px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
-                    专业流程图
-                  </button>
-                </div>
+                {onSwitchToWhiteboard ? (
+                  <div className="flex rounded-lg border border-black/[0.07] bg-white/70 p-0.5 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                    <button
+                      type="button"
+                      className="rounded-md px-2.5 py-1 text-[10px] font-medium text-zinc-500 transition hover:bg-black/[0.04] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
+                      onClick={switchToWhiteboard}
+                    >
+                      自由白板
+                    </button>
+                    <button type="button" className="rounded-md bg-zinc-950 px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
+                      专业流程图
+                    </button>
+                  </div>
+                ) : null}
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white/70 px-2 py-1 text-[10px] font-medium text-zinc-600 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-zinc-300">
                   <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.12)]" : "bg-zinc-400"}`} />
                   {isConnected ? "实时同步" : "本地编辑"}
@@ -2388,10 +2391,12 @@ export function SyncedDiagram({
           </div>
           {isExpanded ? (
             <>
-              <DiagramToolbarButton label="白板" onClick={() => {
-                setIsExpanded(false);
-                switchToWhiteboard();
-              }} />
+              {onSwitchToWhiteboard ? (
+                <DiagramToolbarButton label="白板" onClick={() => {
+                  setIsExpanded(false);
+                  switchToWhiteboard();
+                }} />
+              ) : null}
               <DiagramToolbarButton label="退出全屏" onClick={() => setIsExpanded(false)} />
               <span className="mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
             </>

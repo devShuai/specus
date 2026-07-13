@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
+import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 import { usePageSeo } from "../lib/seo";
 import { useTheme } from "../theme/ThemeContext";
@@ -146,14 +147,9 @@ function LoginPageContent() {
       <section className="relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
         <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <AppLogo className="w-full sm:w-auto" label="shuai-tunnel" subtitle="内网服务接入控制面" />
-          <div className="grid w-full grid-cols-[2.25rem_repeat(3,minmax(0,1fr))] gap-2 sm:flex sm:w-auto sm:items-center">
+          <div className="grid w-full grid-cols-[2.25rem_repeat(2,minmax(0,1fr))] gap-2 sm:flex sm:w-auto sm:items-center">
             <LandingThemeToggleButton />
-            <a href="#/transfer" className="landing-ghost-button landing-nav-button">
-              互传
-            </a>
-            <a href="#/nat-detect" className="landing-ghost-button landing-nav-button">
-              NAT 检测
-            </a>
+            <PublicToolsMenu />
             <button type="button" className="landing-ghost-button landing-nav-button" onClick={focusLogin}>
               进入控制台
             </button>

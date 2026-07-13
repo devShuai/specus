@@ -28,10 +28,13 @@ const navGroups: NavGroup[] = [
   { label: "接入", items: [
     { key: "clients" as const, title: "客户端" },
     { key: "messages" as const, title: "消息" },
-    { key: "transfer" as const, title: "互传" },
     { key: "tunnels" as const, title: "端口映射" },
     { key: "http-routes" as const, title: "HTTP 路由" },
     { key: "downloads" as const, title: "客户端下载" },
+  ]},
+  { label: "工具", items: [
+    { key: "transfer" as const, title: "互传" },
+    { key: "diagram" as const, title: "专业流程图" },
   ]},
   { label: "流量", items: [
     { key: "traffic" as const, title: "流量使用" },
@@ -64,6 +67,10 @@ function DashboardContent() {
 
   const activatePanel = useCallback((panel: PanelKey) => {
     setActivePanel(panel); setMobileNavOpen(false);
+    if (panel === "transfer" || panel === "diagram") {
+      window.location.hash = "/" + panel;
+      return;
+    }
     if (window.location.hash !== "#/" + panel) window.location.hash = "/" + panel;
   }, []);
 

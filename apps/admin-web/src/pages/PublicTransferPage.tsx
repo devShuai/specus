@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type {
   ChangeEvent,
   ClipboardEvent as ReactClipboardEvent,
@@ -8,6 +8,7 @@ import type {
 import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress, Switch } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
+import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { SyncedClipboard } from "../components/SyncedClipboard";
 import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhiteboard";
@@ -58,8 +59,13 @@ import {
   type DirectTransferSignalPayload,
 } from "../hooks/useDirectTransfer";
 
+const LazySyncedDiagram = lazy(() =>
+  import("../components/SyncedDiagram").then((module) => ({ default: module.SyncedDiagram })),
+);
+
 type UploadState = "idle" | "connecting" | "waiting" | "direct" | "presigning" | "uploading" | "completing" | "done" | "failed";
 type TransferToolMode = "files" | "clipboard" | "whiteboard";
+export type PublicTransferWorkspace = "transfer" | "diagram";
 const TRANSFER_TOOL_MODES: TransferToolMode[] = ["files", "clipboard", "whiteboard"];
 
 interface UploadRecord {
@@ -144,14 +150,18 @@ const WHITEBOARD_TURN_TIMEOUT_MS = 5000;
 const WHITEBOARD_TRANSPORT_RETRY_MS = 15_000;
 
 export function PublicTransferPage() {
+  return <PublicTransferWorkspacePage workspace="transfer" />;
+}
+
+export function PublicTransferWorkspacePage({ workspace }: { workspace: PublicTransferWorkspace }) {
   return (
     <HeroRuntime>
-      <PublicTransferPageContent />
+      <PublicTransferPageContent workspace={workspace} />
     </HeroRuntime>
   );
 }
 
-function PublicTransferPageContent() {
+function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWorkspace }) {
   const discoverySocketRef = useRef<WebSocket | null>(null);
   const loadedSharedAttachmentRef = useRef("");
   const directPreviewUrlsRef = useRef<Set<string>>(new Set());
@@ -200,11 +210,14 @@ function PublicTransferPageContent() {
   const [clipboardSyncEnabled, setClipboardSyncEnabled] = useState(false);
   const [clipboardEvents, setClipboardEvents] = useState<ClipboardInboundEvent[]>([]);
   const [whiteboardEvents, setWhiteboardEvents] = useState<WhiteboardInboundEvent[]>([]);
+  const isDiagramWorkspace = workspace === "diagram";
 
   usePageSeo({
-    title: "互传 · shuai-tunnel",
-    description: "打开同一个房间链接，在电脑和手机之间互传文件、同步剪贴板和共享白板。",
-    canonical: "https://tunnel.devshuai.com/#/transfer",
+    title: isDiagramWorkspace ? "专业流程图 · shuai-tunnel" : "互传 · shuai-tunnel",
+    description: isDiagramWorkspace
+      ? "支持实时协作、draw.io 图形库、多页文档和多格式导入导出的专业流程图工具。"
+      : "打开同一个房间链接，在电脑和手机之间互传文件、同步剪贴板和共享白板。",
+    canonical: `https://tunnel.devshuai.com/#/${workspace}`,
   });
   const isInternetMode = networkMode === "internet";
   const effectiveRoomRole: PublicTransferRoomRole = isInternetMode ? roomRole ?? "VIEWER" : "EDITOR";
@@ -643,8 +656,8 @@ function PublicTransferPageContent() {
   }, []);
 
   const roomJoinUrl = useMemo(
-    () => roomShareUrl(roomId, roomToken, networkMode),
-    [networkMode, roomId, roomToken],
+    () => roomShareUrl(roomId, roomToken, networkMode, `/${workspace}`),
+    [networkMode, roomId, roomToken, workspace],
   );
   const selectedPeer = useMemo(
     () => peers.find((peer) => peer.peerId === selectedPeerId) ?? null,
@@ -838,7 +851,7 @@ function PublicTransferPageContent() {
     try {
       await shareOrCopy(
         {
-          title: "加入 shuai-tunnel 互传房间",
+          title: isDiagramWorkspace ? "加入 shuai-tunnel 流程图房间" : "加入 shuai-tunnel 互传房间",
           text: `${isInternetMode ? "外网" : "内网"}房间：${roomId || "nearby"}`,
           url,
         },
@@ -1168,7 +1181,7 @@ function PublicTransferPageContent() {
   };
 
   const handlePagePaste = (event: ReactClipboardEvent<HTMLElement>) => {
-    if (activeTool !== "files") {
+    if (isDiagramWorkspace || activeTool !== "files") {
       return;
     }
     if (isEditablePasteTarget(event.target)) {
@@ -1525,8 +1538,9 @@ function PublicTransferPageContent() {
       <div className="landing-scanline" aria-hidden="true" />
 
       <header className="relative z-10 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
-        <AppLogo label="shuai-tunnel" subtitle="互传" markClassName="h-8 w-8 sm:h-9 sm:w-9" />
+        <AppLogo label="shuai-tunnel" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="flex shrink-0 items-center gap-2">
+          <PublicToolsMenu active={workspace} />
           <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
           <Button as="a" href="/" radius="sm" variant="flat" className="glass-chip text-zinc-950 dark:text-white">
             控制台
@@ -1536,21 +1550,27 @@ function PublicTransferPageContent() {
 
       <section
         className={`relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 ${
-          activeTool === "whiteboard" ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_320px]"
+          isDiagramWorkspace || activeTool === "whiteboard" ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_320px]"
         }`}
       >
         <div className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-6">
           <div className="flex flex-col gap-2">
-            <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">互传</div>
-            <h1 className="text-display-md font-semibold sm:text-display-lg">文件、剪贴板和白板，一处互传</h1>
+            <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">
+              {isDiagramWorkspace ? "工具 · 专业流程图" : "工具 · 互传"}
+            </div>
+            <h1 className="text-display-md font-semibold sm:text-display-lg">
+              {isDiagramWorkspace ? "专业流程图协作工作区" : "文件、剪贴板和白板，一处互传"}
+            </h1>
             <p className="max-w-2xl text-small leading-6 text-zinc-700 dark:text-zinc-300">
-              邀请对方加入后，可切换文件传输、剪贴板同步和同步白板。手机和电脑都可以直接打开这个页面。
+              {isDiagramWorkspace
+                ? "创建独立流程图房间，使用完整 draw.io 图形分类、多页画布和专业编辑工具与其他设备实时协作。"
+                : "邀请对方加入后，可切换文件传输、剪贴板同步和同步白板。手机和电脑都可以直接打开这个页面。"}
             </p>
           </div>
 
           <div className="mt-4 rounded-lg border border-black/10 bg-white/40 p-2 dark:border-white/10 dark:bg-white/[0.035]">
             <div className="flex items-center justify-between gap-3 px-1 pb-2">
-              <div className="text-small font-semibold text-zinc-900 dark:text-white">传输网络</div>
+              <div className="text-small font-semibold text-zinc-900 dark:text-white">{isDiagramWorkspace ? "协作网络" : "传输网络"}</div>
               <Chip size="sm" radius="sm" variant="flat" color={isInternetMode ? "secondary" : "success"}>
                 {isInternetMode ? "外网模式" : "内网模式 · 默认"}
               </Chip>
@@ -1697,7 +1717,7 @@ function PublicTransferPageContent() {
                 </div>
               </div>
             ) : null}
-            <div className="mt-3 rounded-lg glass glass-border border p-3">
+            {!isDiagramWorkspace ? <div className="mt-3 rounded-lg glass glass-border border p-3">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
                   <div className="text-small font-medium text-zinc-900 dark:text-white">接收前确认</div>
@@ -1713,7 +1733,7 @@ function PublicTransferPageContent() {
                   {receiveConfirmationRequired ? "手动确认" : "直接接收"}
                 </Switch>
               </div>
-            </div>
+            </div> : null}
           </details>
 
           {qrVisible && (
@@ -1743,6 +1763,7 @@ function PublicTransferPageContent() {
             </div>
           )}
 
+          {!isDiagramWorkspace ? <>
           <div className="mt-5 grid grid-cols-3 gap-1.5 rounded-lg border border-black/10 bg-white/45 p-1 dark:border-white/10 dark:bg-white/[0.04]" role="tablist" aria-label="互传功能切换">
             <ToolModeButton
               mode="files"
@@ -1829,6 +1850,7 @@ function PublicTransferPageContent() {
               <TransferProgress state={state} store={progressStore} />
             </div>
           )}
+          </> : null}
 
           {notice && (
             <div className="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-small text-emerald-800 dark:border-emerald-400/30 dark:bg-emerald-500/10 dark:text-emerald-100">
@@ -1842,6 +1864,7 @@ function PublicTransferPageContent() {
             </div>
           )}
 
+          {!isDiagramWorkspace ? <>
           <SyncedClipboard
             syncKey={transferRoomScopeKey}
             isActive={activeTool === "clipboard"}
@@ -1863,8 +1886,6 @@ function PublicTransferPageContent() {
           >
             <SyncedWhiteboard
               boardKey={transferRoomScopeKey}
-              roomId={roomId}
-              roomToken={isInternetMode ? roomToken : ""}
               roomRole={effectiveRoomRole}
               peerId={peerId}
               peerCount={peers.length}
@@ -1920,9 +1941,24 @@ function PublicTransferPageContent() {
               </div>
             )}
           </div>
+          </> : (
+            <Suspense fallback={<DiagramWorkspaceLoading />}>
+              <LazySyncedDiagram
+                boardKey={transferRoomScopeKey}
+                roomId={roomId}
+                roomToken={isInternetMode ? roomToken : ""}
+                roomRole={effectiveRoomRole}
+                peerId={peerId}
+                peerCount={peers.length}
+                isConnected={peers.length > 0}
+                events={whiteboardEvents}
+                onSend={sendWhiteboardPayload}
+              />
+            </Suspense>
+          )}
         </div>
 
-        <aside className={`${activeTool === "whiteboard" ? "hidden" : ""} min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5 xl:sticky xl:top-5 xl:self-start`}>
+        {!isDiagramWorkspace ? <aside className={`${activeTool === "whiteboard" ? "hidden" : ""} min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5 xl:sticky xl:top-5 xl:self-start`}>
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold">发送给谁</h2>
@@ -1968,7 +2004,7 @@ function PublicTransferPageContent() {
           </div>
 
           <TransferFaq iceConfig={iceConfig} networkMode={networkMode} />
-        </aside>
+        </aside> : null}
       </section>
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
     </main>
@@ -2007,6 +2043,17 @@ function NetworkModeButton({
       </span>
       <span className="mt-1 block text-tiny leading-5 text-zinc-500 dark:text-zinc-400">{detail}</span>
     </button>
+  );
+}
+
+function DiagramWorkspaceLoading() {
+  return (
+    <section className="mt-5 grid min-h-[520px] place-items-center rounded-2xl border border-black/[0.07] bg-zinc-50/70 dark:border-white/[0.08] dark:bg-zinc-950/55">
+      <div className="flex flex-col items-center gap-3 text-center">
+        <span className="h-8 w-8 animate-spin rounded-full border-2 border-cyan-500/25 border-t-cyan-500" aria-hidden="true" />
+        <span className="text-small font-semibold text-zinc-900 dark:text-white">正在加载专业流程图工具</span>
+      </div>
+    </section>
   );
 }
 
@@ -2890,8 +2937,13 @@ function normalizeRoomId(value: string | null) {
   return text.length > 120 ? text.substring(0, 120) : text;
 }
 
-function roomShareUrl(roomId: string, roomToken: string, networkMode: TransferNetworkMode) {
-  const url = new URL("/transfer", window.location.origin);
+function roomShareUrl(
+  roomId: string,
+  roomToken: string,
+  networkMode: TransferNetworkMode,
+  workspacePath = activeWorkspacePath(),
+) {
+  const url = new URL(workspacePath, window.location.origin);
   url.searchParams.set("mode", networkMode);
   url.searchParams.set("room", normalizeRoomId(roomId));
   if (networkMode === "internet" && roomToken.trim()) {
@@ -2901,9 +2953,15 @@ function roomShareUrl(roomId: string, roomToken: string, networkMode: TransferNe
 }
 
 function fileShareUrl(attachment: TransferAttachment, roomId: string, roomToken: string) {
-  const url = new URL(roomShareUrl(roomId, roomToken, "internet"));
+  const url = new URL(roomShareUrl(roomId, roomToken, "internet", "/transfer"));
   url.searchParams.set("attachmentId", String(attachment.attachmentId));
   return url.toString();
+}
+
+function activeWorkspacePath() {
+  const hashRoute = window.location.hash.replace(/^#\/?/, "").split(/[/?#]/, 1)[0];
+  const pathRoute = window.location.pathname.replace(/^\/+/, "").split(/[/?#]/, 1)[0];
+  return hashRoute === "diagram" || pathRoute === "diagram" ? "/diagram" : "/transfer";
 }
 
 function hasDraggedFiles(dataTransfer: DataTransfer) {

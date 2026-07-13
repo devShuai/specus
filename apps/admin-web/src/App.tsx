@@ -11,6 +11,9 @@ const LazyNatDetectionPanel = lazy(() =>
 const LazyPublicTransferPage = lazy(() =>
   import("./pages/PublicTransferPage").then((module) => ({ default: module.PublicTransferPage })),
 );
+const LazyPublicDiagramPage = lazy(() =>
+  import("./pages/PublicDiagramPage").then((module) => ({ default: module.PublicDiagramPage })),
+);
 
 function readPublicRoute() {
   const hash = window.location.hash.replace(/^#\/?/, "").split(/[/?#]/, 1)[0];
@@ -21,6 +24,9 @@ function readPublicRoute() {
   }
   if (hash === "transfer" || path === "transfer" || queryPanel === "transfer") {
     return "transfer";
+  }
+  if (hash === "diagram" || path === "diagram" || queryPanel === "diagram") {
+    return "diagram";
   }
   return null;
 }
@@ -56,6 +62,14 @@ export function App() {
     return (
       <Suspense fallback={<FullScreenLoading />}>
         <LazyPublicTransferPage />
+      </Suspense>
+    );
+  }
+
+  if (publicRoute === "diagram") {
+    return (
+      <Suspense fallback={<FullScreenLoading />}>
+        <LazyPublicDiagramPage />
       </Suspense>
     );
   }

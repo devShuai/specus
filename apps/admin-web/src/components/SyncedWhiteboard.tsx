@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button, Chip } from "@heroui/react";
 import {
@@ -22,11 +22,6 @@ import { formatBytes } from "../lib/format";
 import { isDiagramPayload } from "../lib/diagramDocument";
 import type { DiagramPayload } from "../lib/diagramDocument";
 import type { PublicTransferRoomRole } from "../api/types";
-
-const SyncedDiagram = lazy(async () => {
-  const module = await import("./SyncedDiagram");
-  return { default: module.SyncedDiagram };
-});
 
 export interface WhiteboardPoint {
   x: number;
@@ -139,8 +134,6 @@ export interface WhiteboardInboundEvent {
 
 interface SyncedWhiteboardProps {
   boardKey: string;
-  roomId: string;
-  roomToken: string;
   roomRole: PublicTransferRoomRole;
   peerId: string;
   peerCount: number;
@@ -268,8 +261,6 @@ const DARK_BOARD_THEME: WhiteboardRenderTheme = {
 
 export function SyncedWhiteboard({
   boardKey,
-  roomId,
-  roomToken,
   roomRole,
   peerId,
   peerCount,
@@ -311,7 +302,6 @@ export function SyncedWhiteboard({
   const [flowLabelDraft, setFlowLabelDraft] = useState<FlowLabelDraft | null>(null);
   const [isFlowchartOpen, setIsFlowchartOpen] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
-  const [workspaceMode, setWorkspaceMode] = useState<"whiteboard" | "diagram">("whiteboard");
   const [isStatusPanelCollapsed, setIsStatusPanelCollapsed] = useState(false);
   const [isImportingImage, setIsImportingImage] = useState(false);
   const [isImportingDocument, setIsImportingDocument] = useState(false);
@@ -1402,26 +1392,6 @@ export function SyncedWhiteboard({
         ? "cursor-text"
         : "cursor-crosshair";
 
-  if (workspaceMode === "diagram") {
-    return (
-      <Suspense fallback={<DiagramLoadingState onBack={() => setWorkspaceMode("whiteboard")} />}>
-        <SyncedDiagram
-          boardKey={boardKey}
-          roomId={roomId}
-          roomToken={roomToken}
-          roomRole={roomRole}
-          peerId={peerId}
-          peerCount={peerCount}
-          isConnected={isConnected}
-          isActive={isActive}
-          events={events}
-          onSend={onSend}
-          onSwitchToWhiteboard={() => setWorkspaceMode("whiteboard")}
-        />
-      </Suspense>
-    );
-  }
-
   const board = (
     <section
       className={
@@ -1446,18 +1416,6 @@ export function SyncedWhiteboard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步白板</h2>
-            <div className="flex rounded-lg border border-black/10 bg-black/[0.035] p-0.5 dark:border-white/10 dark:bg-white/[0.05]">
-              <button type="button" className="rounded-md bg-white px-2.5 py-1 text-tiny font-semibold text-cyan-800 shadow-sm dark:bg-zinc-800 dark:text-cyan-200">
-                自由白板
-              </button>
-              <button
-                type="button"
-                className="rounded-md px-2.5 py-1 text-tiny font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
-                onClick={() => setWorkspaceMode("diagram")}
-              >
-                专业流程图
-              </button>
-            </div>
             <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
               {isConnected ? "实时同步" : "本地绘制"}
             </Chip>
@@ -1971,21 +1929,6 @@ export function SyncedWhiteboard({
     </section>
   );
   return isExpanded ? createPortal(board, document.body) : board;
-}
-
-function DiagramLoadingState({ onBack }: { onBack: () => void }) {
-  return (
-    <section className="mt-5 rounded-xl glass glass-border border p-4">
-      <div className="flex min-h-48 flex-col items-center justify-center gap-3 text-center">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-cyan-500/25 border-t-cyan-500" aria-hidden />
-        <div>
-          <div className="text-small font-semibold text-zinc-900 dark:text-white">正在加载专业流程图引擎</div>
-          <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">首次进入按需加载，之后切换会直接复用浏览器缓存。</div>
-        </div>
-        <Button size="sm" radius="sm" variant="light" onPress={onBack}>返回自由白板</Button>
-      </div>
-    </section>
-  );
 }
 
 function WhiteboardToolButton({
