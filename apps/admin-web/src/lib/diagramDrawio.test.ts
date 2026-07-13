@@ -102,8 +102,25 @@ describe("draw.io diagram compatibility", () => {
     </root></mxGraphModel>`;
     const imported = parseDrawioDocument(xml, parser);
 
-    expect(imported.nodes.map((node) => node.kind)).toEqual(["decision", "process"]);
+    expect(imported.nodes.map((node) => node.kind)).toEqual(["decision", "ellipse"]);
     expect(imported.edges[0]).toMatchObject({ sourcePort: "east", targetPort: "west" });
+  });
+
+  it("round-trips an official draw.io stencil reference", () => {
+    const stencilNode: DiagramNode = {
+      ...processNode,
+      id: "cloud-icon",
+      kind: "rectangle",
+      stencilName: "mxgraph.aws4.lambda_function",
+      stencilLibrary: "aws4.xml",
+      parentId: undefined,
+    };
+    const document = createDiagramDocument([stencilNode], [], { width: 2400, height: 1600, gridSize: 10 });
+    const xml = exportDrawioDocument(document);
+    const imported = parseDrawioDocument(xml, parser);
+
+    expect(xml).toContain("shape=mxgraph.aws4.lambda_function");
+    expect(imported.nodes[0]).toEqual(document.nodes[0]);
   });
 
   it("exports each application page as a draw.io diagram page", () => {

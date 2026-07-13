@@ -1,6 +1,7 @@
 import { inflateRaw } from "pako";
 import {
   createDiagramDocument,
+  DIAGRAM_NODE_KINDS,
   isDiagramGraphState,
   MAX_DIAGRAM_DOCUMENT_BYTES,
   MAX_DIAGRAM_PAGES,
@@ -135,12 +136,15 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
     }
     const style = parseStyle(cell.getAttribute("style") ?? "");
     let kind = nodeKindFromStyle(style, cleanLabel(cell.getAttribute("value") ?? ""));
+    const stencilName = style.get("shuaiStencil")?.trim();
+    const stencilLibrary = style.get("shuaiStencilLibrary")?.trim();
     if (originalId && parentReferences.has(originalId) && kind !== "swimlane" && kind !== "lane") {
       kind = "container";
     }
     nodes.push({
       id,
       kind,
+      ...(stencilName && stencilLibrary ? { stencilName, stencilLibrary } : {}),
       label: cleanLabel(cell.getAttribute("value") ?? ""),
       x: finiteAttribute(geometry, "x", 0),
       y: finiteAttribute(geometry, "y", 0),
@@ -236,7 +240,7 @@ function drawioEdgeXml(edge: DiagramEdge) {
 }
 
 function nodeStyle(node: DiagramNode) {
-  const shape = drawioShape(node.kind);
+  const shape = node.stencilName ? `shape=${node.stencilName}` : drawioShape(node.kind);
   const style = [
     `shuaiKind=${node.kind}`,
     `shuaiZ=${node.zIndex}`,
@@ -250,6 +254,9 @@ function nodeStyle(node: DiagramNode) {
     `fontColor=${node.style.fontColor}`,
     `strokeWidth=${node.style.strokeWidth}`,
   ];
+  if (node.stencilName && node.stencilLibrary) {
+    style.push(`shuaiStencil=${node.stencilName}`, `shuaiStencilLibrary=${node.stencilLibrary}`);
+  }
   if (node.locked) style.push("shuaiLocked=1");
   if (node.style.fontSize !== undefined) style.push(`fontSize=${node.style.fontSize}`);
   if (node.style.bold !== undefined || node.style.italic !== undefined) style.push(`fontStyle=${(node.style.bold === false ? 0 : 1) + (node.style.italic ? 2 : 0)}`);
@@ -286,9 +293,11 @@ function edgeStyle(edge: DiagramEdge) {
 }
 
 function drawioShape(kind: DiagramNodeKind) {
-  if (kind === "start" || kind === "end") return "ellipse";
-  if (kind === "decision") return "rhombus";
-  if (kind === "document") return "shape=document";
+  if (kind === "ellipse" || kind === "circle" || kind === "start" || kind === "end" || kind === "connector" || kind === "umlUseCase" || kind === "erAttribute" || kind === "router") return "ellipse";
+  if (kind === "diamond" || kind === "decision" || kind === "bpmnGateway" || kind === "erRelationship") return "rhombus";
+  if (kind === "triangle") return "triangle";
+  if (kind === "hexagon" || kind === "manualInput" || kind === "service") return "shape=hexagon;perimeter=hexagonPerimeter2";
+  if (kind === "document" || kind === "bpmnDataObject") return "shape=document";
   if (kind === "database") return "shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=15";
   if (kind === "actor") return "shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top";
   if (kind === "note") return "shape=note;size=16";
@@ -298,9 +307,10 @@ function drawioShape(kind: DiagramNodeKind) {
   if (kind === "cloud") return "shape=cloud";
   if (kind === "swimlane") return "swimlane;horizontal=1;startSize=32;container=1;collapsible=1";
   if (kind === "lane") return "swimlane;horizontal=1;startSize=28;container=1;collapsible=0;recursiveResize=0";
-  if (kind === "bpmnEvent") return "ellipse;double=1";
-  if (kind === "bpmnGateway") return "rhombus";
+  if (kind === "bpmnEvent" || kind === "umlInterface") return "ellipse;double=1";
   if (kind === "umlClass") return "rounded=0;verticalAlign=top;spacingTop=8";
+  if (kind === "umlPackage") return "shape=folder;tabWidth=60;tabHeight=20;tabPosition=left";
+  if (kind === "umlComponent") return "shape=component";
   if (kind === "entity") return "rounded=0;verticalAlign=top;spacingTop=8";
   if (kind === "server") return "shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=12";
   if (kind === "queue") return "shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=8;direction=south";
@@ -404,6 +414,8 @@ function nodeKindFromStyle(style: Map<string, string>, label: string): DiagramNo
   if (style.get("container") === "1") return "container";
   if (style.get("double") === "1") return "subprocess";
   if (shape === "rhombus") return "decision";
+  if (shape === "triangle") return "triangle";
+  if (shape === "hexagon") return "hexagon";
   if (shape === "document") return "document";
   if (shape === "cylinder" || shape === "cylinder3") return "database";
   if (shape === "umlActor" || shape === "actor") return "actor";
@@ -413,6 +425,7 @@ function nodeKindFromStyle(style: Map<string, string>, label: string): DiagramNo
   if (shape === "cloud") return "cloud";
   if (shape === "ellipse" && /^(开始|start)$/i.test(label)) return "start";
   if (shape === "ellipse" && /^(结束|end)$/i.test(label)) return "end";
+  if (shape === "ellipse") return "ellipse";
   return "process";
 }
 
@@ -454,7 +467,7 @@ function parseWaypoints(geometry: Element) {
 }
 
 function isNodeKind(value: string): value is DiagramNodeKind {
-  return ["start", "process", "decision", "end", "document", "database", "actor", "note", "subprocess", "data", "delay", "cloud", "container", "swimlane", "lane", "bpmnEvent", "bpmnGateway", "umlClass", "entity", "server", "queue"].includes(value);
+  return (DIAGRAM_NODE_KINDS as readonly string[]).includes(value);
 }
 
 function normalizeParentId(value: string | null) {

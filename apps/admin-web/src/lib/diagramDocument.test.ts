@@ -4,6 +4,7 @@ import {
   createDiagramDocument,
   decodeDiagramUpdate,
   DIAGRAM_DOCUMENT_FORMAT,
+  DIAGRAM_NODE_KINDS,
   encodeDiagramUpdate,
   isDiagramPayload,
   MAX_DIAGRAM_DOCUMENT_BYTES,
@@ -70,6 +71,23 @@ const edges: DiagramEdge[] = [
 ];
 
 describe("diagram document", () => {
+  it("accepts every professional palette node kind", () => {
+    const paletteNodes = DIAGRAM_NODE_KINDS
+      .filter((kind) => kind !== "lane")
+      .map((kind, index): DiagramNode => ({
+        ...nodes[1],
+        id: `palette-${kind}`,
+        kind,
+        x: (index % 8) * 180,
+        y: Math.floor(index / 8) * 110,
+        zIndex: index,
+      }));
+    const exported = createDiagramDocument(paletteNodes, [], { width: 2400, height: 1600, gridSize: 10 });
+
+    expect(parseDiagramDocument(JSON.stringify(exported)).nodes.map((node) => node.kind))
+      .toEqual(DIAGRAM_NODE_KINDS.filter((kind) => kind !== "lane"));
+  });
+
   it("round-trips an editable graph document", () => {
     const exported = createDiagramDocument(
       nodes,
@@ -199,6 +217,26 @@ describe("diagram document", () => {
     const imported = parseDiagramDocument(source);
     expect(imported.nodes).toHaveLength(MAX_DIAGRAM_NODES);
     expect(imported.edges).toHaveLength(MAX_DIAGRAM_EDGES);
+  });
+
+  it("preserves a draw.io stencil reference as part of a synchronized node", () => {
+    const stencilNode: DiagramNode = {
+      ...nodes[1],
+      id: "aws-lambda",
+      kind: "rectangle",
+      stencilName: "mxgraph.aws4.lambda_function",
+      stencilLibrary: "aws4.xml",
+    };
+    const document = createDiagramDocument([stencilNode], [], { width: 2400, height: 1600, gridSize: 10 });
+
+    expect(parseDiagramDocument(JSON.stringify(document)).nodes[0]).toMatchObject({
+      stencilName: "mxgraph.aws4.lambda_function",
+      stencilLibrary: "aws4.xml",
+    });
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...document,
+      nodes: [{ ...stencilNode, stencilLibrary: "../aws4.xml" }],
+    }))).toThrow("包含无效");
   });
 
   it("encodes Yjs updates for JSON transport", () => {

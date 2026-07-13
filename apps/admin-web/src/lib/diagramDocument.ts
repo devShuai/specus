@@ -9,28 +9,53 @@ export const MAX_DIAGRAM_EDGES = 2_000;
 export const MAX_DIAGRAM_PAGES = 50;
 export const MAX_DIAGRAM_COMMENTS = 2_000;
 
-export type DiagramNodeKind =
-  | "start"
-  | "process"
-  | "decision"
-  | "end"
-  | "document"
-  | "database"
-  | "actor"
-  | "note"
-  | "subprocess"
-  | "data"
-  | "delay"
-  | "cloud"
-  | "container"
-  | "swimlane"
-  | "lane"
-  | "bpmnEvent"
-  | "bpmnGateway"
-  | "umlClass"
-  | "entity"
-  | "server"
-  | "queue";
+export const DIAGRAM_NODE_KINDS = [
+  "rectangle",
+  "roundedRectangle",
+  "ellipse",
+  "circle",
+  "diamond",
+  "triangle",
+  "hexagon",
+  "text",
+  "start",
+  "process",
+  "decision",
+  "end",
+  "document",
+  "database",
+  "note",
+  "subprocess",
+  "data",
+  "delay",
+  "manualInput",
+  "connector",
+  "bpmnTask",
+  "bpmnEvent",
+  "bpmnGateway",
+  "bpmnDataObject",
+  "actor",
+  "umlUseCase",
+  "umlClass",
+  "umlInterface",
+  "umlPackage",
+  "umlComponent",
+  "entity",
+  "erRelationship",
+  "erAttribute",
+  "server",
+  "client",
+  "router",
+  "firewall",
+  "cloud",
+  "queue",
+  "service",
+  "container",
+  "swimlane",
+  "lane",
+] as const;
+
+export type DiagramNodeKind = typeof DIAGRAM_NODE_KINDS[number];
 
 export type DiagramPort = "north" | "east" | "south" | "west";
 export type DiagramEdgeType = "orthogonal" | "straight" | "elbow" | "curved";
@@ -72,6 +97,8 @@ export interface DiagramEdgeStyle {
 export interface DiagramNode {
   id: string;
   kind: DiagramNodeKind;
+  stencilName?: string;
+  stencilLibrary?: string;
   label: string;
   x: number;
   y: number;
@@ -346,6 +373,9 @@ export function isDiagramNode(value: unknown): value is DiagramNode {
   return isRecord(value)
     && isIdentifier(value.id)
     && isDiagramNodeKind(value.kind)
+    && (value.stencilName === undefined || isStencilName(value.stencilName))
+    && (value.stencilLibrary === undefined || isStencilLibrary(value.stencilLibrary))
+    && ((value.stencilName === undefined) === (value.stencilLibrary === undefined))
     && isLabel(value.label)
     && isFiniteNumber(value.x)
     && isFiniteNumber(value.y)
@@ -422,27 +452,20 @@ function cloneDiagramEdge(edge: DiagramEdge): DiagramEdge {
 }
 
 function isDiagramNodeKind(value: unknown): value is DiagramNodeKind {
-  return value === "start"
-    || value === "process"
-    || value === "decision"
-    || value === "end"
-    || value === "document"
-    || value === "database"
-    || value === "actor"
-    || value === "note"
-    || value === "subprocess"
-    || value === "data"
-    || value === "delay"
-    || value === "cloud"
-    || value === "container"
-    || value === "swimlane"
-    || value === "lane"
-    || value === "bpmnEvent"
-    || value === "bpmnGateway"
-    || value === "umlClass"
-    || value === "entity"
-    || value === "server"
-    || value === "queue";
+  return typeof value === "string" && (DIAGRAM_NODE_KINDS as readonly string[]).includes(value);
+}
+
+function isStencilName(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= 256
+    && /^mxgraph\.[a-z0-9_()., -]+$/i.test(value);
+}
+
+function isStencilLibrary(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= 256
+    && !value.includes("..")
+    && /^[a-z0-9_./-]+\.xml$/i.test(value);
 }
 
 function isDiagramEdgeType(value: unknown): value is DiagramEdgeType {

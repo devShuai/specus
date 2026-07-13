@@ -214,8 +214,8 @@ function documentPages(document: DiagramDocumentV1): DiagramPage[] {
 
 function mermaidNodeShape(node: DiagramNode) {
   const label = `"${escapeText(node.label || node.kind)}"`;
-  if (node.kind === "decision" || node.kind === "bpmnGateway") return `{${label}}`;
-  if (node.kind === "start" || node.kind === "end" || node.kind === "bpmnEvent") return `([${label}])`;
+  if (node.kind === "diamond" || node.kind === "decision" || node.kind === "bpmnGateway" || node.kind === "erRelationship") return `{${label}}`;
+  if (["ellipse", "circle", "start", "end", "connector", "bpmnEvent", "umlUseCase", "umlInterface", "erAttribute", "router"].includes(node.kind)) return `([${label}])`;
   if (node.kind === "database" || node.kind === "queue") return `[(${label})]`;
   return `[${label}]`;
 }
@@ -227,6 +227,9 @@ function plantUmlKeyword(kind: DiagramNodeKind) {
   if (kind === "queue") return "queue";
   if (kind === "server") return "node";
   if (kind === "umlClass") return "class";
+  if (kind === "umlInterface") return "interface";
+  if (kind === "umlPackage") return "package";
+  if (kind === "umlComponent") return "component";
   return "rectangle";
 }
 
@@ -237,20 +240,23 @@ function plantUmlKind(keyword: string): DiagramNodeKind {
   if (value === "cloud") return "cloud";
   if (value === "queue") return "queue";
   if (value === "class") return "umlClass";
+  if (value === "interface") return "umlInterface";
+  if (value === "package") return "umlPackage";
+  if (value === "component") return "umlComponent";
   if (value === "entity") return "entity";
   if (value === "node" || value === "artifact") return "server";
   return "process";
 }
 
 function nodeSize(kind: DiagramNodeKind): [number, number] {
-  if (kind === "start" || kind === "end" || kind === "bpmnEvent") return [84, 84];
-  if (kind === "decision" || kind === "bpmnGateway") return [110, 110];
+  if (["circle", "start", "end", "connector", "bpmnEvent", "umlInterface"].includes(kind)) return [84, 84];
+  if (["diamond", "decision", "bpmnGateway", "erRelationship"].includes(kind)) return [110, 110];
   if (kind === "database" || kind === "queue") return [160, 92];
   return [180, 82];
 }
 
 function nodeStyle(kind: DiagramNodeKind) {
-  const decision = kind === "decision" || kind === "bpmnGateway";
+  const decision = kind === "diamond" || kind === "decision" || kind === "bpmnGateway" || kind === "erRelationship";
   return {
     fillColor: decision ? "#fef3c7" : "#dbeafe",
     strokeColor: decision ? "#d97706" : "#2563eb",
