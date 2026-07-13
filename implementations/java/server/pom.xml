@@ -31,7 +31,7 @@
                         </goals>
                         <configuration>
                             <skip>${tunnel.server.web.skip}</skip>
-                            <workingDirectory>${project.basedir}/../../../apps/admin-web</workingDirectory>
+                            <workingDirectory>${maven.multiModuleProjectDirectory}/apps/admin-web</workingDirectory>
                             <executable>${npm.executable}</executable>
                             <arguments>
                                 <argument>run</argument>

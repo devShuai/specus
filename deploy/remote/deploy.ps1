@@ -70,6 +70,37 @@ function Require-Command {
     throw "Required command not found: $($Names -join ' or ')"
 }
 
+function Test-AdminWebDependenciesCurrent {
+    param([string]$AdminWebRoot)
+    $packageLock = Join-Path $AdminWebRoot "package-lock.json"
+    $nodeModulesLock = Join-Path $AdminWebRoot "node_modules/.package-lock.json"
+    if (-not (Test-Path $packageLock) -or -not (Test-Path $nodeModulesLock)) {
+        return $false
+    }
+    return (Get-Item $nodeModulesLock).LastWriteTimeUtc -ge (Get-Item $packageLock).LastWriteTimeUtc
+}
+
+function Sync-AdminWebDependencies {
+    param(
+        [string]$AdminWebRoot,
+        [string]$NpmCommand
+    )
+    $npmCache = Join-Path $AdminWebRoot ".npm-cache"
+    New-Item -ItemType Directory -Force -Path $npmCache | Out-Null
+    $env:npm_config_cache = $npmCache
+    if (Test-AdminWebDependenciesCurrent $AdminWebRoot) {
+        Write-DeployLog "admin-web dependencies are current"
+        return
+    }
+    Write-DeployLog "syncing admin-web dependencies"
+    Push-Location $AdminWebRoot
+    try {
+        Invoke-DeployCommand $NpmCommand @("ci", "--cache", $npmCache, "--prefer-offline")
+    } finally {
+        Pop-Location
+    }
+}
+
 Push-Location $RepoRoot
 try {
     $git = Require-Command @("git.exe", "git")
@@ -129,13 +160,14 @@ try {
     }
 
     if (-not $DryRun -and -not $Yes) {
-        $answer = Read-Host "Continue deploying $Mode to $HostName? [y/N]"
+        $answer = Read-Host "Continue deploying $Mode to ${HostName}? [y/N]"
         if ($answer -notin @("y", "Y", "yes", "YES")) {
             Write-DeployLog "cancelled"
             return
         }
     }
 
+    $adminWebRoot = Join-Path $RepoRoot "apps/admin-web"
     $npm = "npm"
     $maven = "mvn"
     $ssh = "ssh"
@@ -148,6 +180,9 @@ try {
         }
         if ($deployServer) {
             $maven = Require-Command @("mvn.cmd", "mvn.exe", "mvn")
+        }
+        if ($deployFrontend -or $deployServer) {
+            Sync-AdminWebDependencies $adminWebRoot $npm
         }
     }
 
@@ -175,7 +210,7 @@ try {
     }
 
     if ($deployFrontend) {
-        Push-Location (Join-Path $RepoRoot "apps/admin-web")
+        Push-Location $adminWebRoot
         try {
             Invoke-DeployCommand $npm @("run", "build:openresty")
         } finally {
