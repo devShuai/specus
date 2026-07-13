@@ -128,12 +128,15 @@ TURN 长期认证的 realm、nonce、401/438 challenge 和 `MESSAGE-INTEGRITY` �
 房间分组键同时包含 `roomId` 和内部 `roomKey`：
 
 ```text
-roomToken 非空: roomKey = "token:"  + lowercaseHex(SHA-256(UTF8(trim(roomToken))))
+roomToken 非空: roomKey = "room:"   + persistentRoomId
 roomToken 为空: roomKey = "public:" + publicAddress
 ```
 
-因此相同 token 但不同 `roomId` 仍是不同房间；未提供 token 的参与者只有在 `roomId` 与来源地址都相同时才能互见。
-`sharedRoom` 表示是否使用 token 房间。
+首次使用某个 `roomId + roomToken` 时，Java server 创建持久房间，并把该 Token 的 SHA-256 哈希登记为房主凭证；
+明文 Token 不持久化。以后房主 Token 解析为 `OWNER`，房主签发且未撤销的邀请 Token 按其记录解析为 `EDITOR` 或
+`VIEWER`，三者都通过相同 `persistentRoomId` 加入同一分组。未知 Token 仍按旧协议语义创建独立房间，因此升级前已有的
+房间链接无需迁移，且相同房间名配不同旧 Token 仍彼此隔离。未提供 Token 的参与者只有在 `roomId` 与来源地址都相同时
+才能互见。`sharedRoom` 表示是否使用 Token 房间。
 
 ### 2.3 加入、hello 与 roster
 
@@ -164,6 +167,7 @@ roomToken 为空: roomKey = "public:" + publicAddress
   "roomId": "nearby",
   "publicAddress": "203.0.113.10",
   "sharedRoom": false,
+  "roomRole": "EDITOR",
   "connectedAt": "2026-07-10T00:00:00Z"
 }
 ```
@@ -183,6 +187,7 @@ roomToken 为空: roomKey = "public:" + publicAddress
       "roomId": "nearby",
       "publicAddress": "203.0.113.10",
       "sharedRoom": false,
+      "roomRole": "EDITOR",
       "connectedAt": "2026-07-10T00:00:00Z"
     }
   ]
@@ -190,6 +195,31 @@ roomToken 为空: roomKey = "public:" + publicAddress
 ```
 
 `peers` 按 `connectedAt` 升序排列。
+
+### 2.3.1 房间角色与邀请
+
+Token 房间角色如下：
+
+| 角色 | 文件/剪贴板/白板写入 | 创建或恢复流程图版本 | 删除版本 | 管理邀请 |
+| --- | --- | --- | --- | --- |
+| `OWNER` | 允许 | 允许 | 允许 | 允许 |
+| `EDITOR` | 允许 | 允许 | 不允许 | 不允许 |
+| `VIEWER` | 不允许 | 不允许 | 不允许 | 不允许 |
+
+发现 WebSocket 必须拒绝 VIEWER 发出的 `attachment`、`clipboard` 和 `whiteboard` 消息，并返回
+`{"type":"error","error":"viewer is read-only"}`。`signal` 和 `ping` 仍允许，以便 VIEWER 建立接收通道。
+浏览器也必须在文件选择、剪贴板、自由白板和专业流程图入口执行只读限制；仅依赖 WebSocket 拒绝不足以约束已经建立的
+DataChannel。撤销邀请后，新连接和重连必须失败；已经连接的会话可以持续到断开。
+
+房主邀请接口均为免管理 JWT 的 POST，`roomId`、`roomToken` 和 `peerId` 放在 JSON body，不能把 Token 放入 URL：
+
+```text
+POST /api/public/transfer/rooms/access-tokens/list
+POST /api/public/transfer/rooms/access-tokens
+POST /api/public/transfer/rooms/access-tokens/{accessId}/revoke
+```
+
+每个房间最多保留 20 个未撤销邀请。服务端只保存邀请 Token 的 SHA-256 哈希；创建响应是唯一返回明文 Token 的时机。
 
 ### 2.4 ping、信令与应用消息转发
 
@@ -249,7 +279,7 @@ DataChannel 的对端即为应用消息的隐含目标。对本协议而言，�
 本地 `send()` 调用未抛出异常，不表示对端已经收到或处理；没有应用层确认时，发送端不得显示“对方已收到”。
 等待通道打开的超时时间可以由客户端实现决定，但一旦某个事件对某个目标决定走 WebSocket 回退路径，就不得在迟到的
 DataChannel 打开后再次发送同一事件。具有事件标识的应用 payload 应按其自身协议定义去重；`STCLIP1` 的事件身份和
-顺序规则见第 2.4.2 节。
+顺序规则见第 2.4.3 节。
 
 当 `roomId`、`roomToken` 或是否使用共享房间发生变化，使当前房间分组作用域改变时，客户端必须关闭旧作用域的全部
 `RTCDataChannel`、`RTCPeerConnection` 和发现 WebSocket，取消仍在打开或等待中的直连任务，并取消尚未执行或尚未
@@ -285,9 +315,25 @@ DataChannel 打开后再次发送同一事件。具有事件标识的应用 payl
 新成员加入时，现有成员可先发送笔画 `snapshot`，再以独立 `object-upsert` 事件补发最近的对象，避免多张内联图片合并后
 超过单消息上限。未知对象种类或未知事件种类必须忽略，以兼容只支持笔画的旧页面。
 
-白板笔画、对象、快照和去重状态只保存在参与浏览器的当前内存中，发现服务端只做临时转发，不持久化白板内容。
+白板笔画、对象、实时 Yjs 更新和去重状态只保存在参与浏览器的当前内存中，发现服务端只做临时转发。专业流程图可以由
+OWNER 或 EDITOR 显式创建持久版本，但服务端不会自动持久化每次实时编辑。
 
-#### 2.4.2 剪贴板文本 `STCLIP1`
+#### 2.4.2 专业流程图版本
+
+Token 房间通过以下 POST 接口管理专业流程图 Yjs 全量快照；`roomId`、`roomToken` 和 `peerId` 同样放在 JSON body：
+
+```text
+POST /api/public/transfer/rooms/diagram/versions/list
+POST /api/public/transfer/rooms/diagram/versions
+POST /api/public/transfer/rooms/diagram/versions/{versionId}
+POST /api/public/transfer/rooms/diagram/versions/{versionId}/delete
+```
+
+列表只返回元数据，恢复时才按 `versionId` 拉取 Base64 `update`。单个解码后快照不得超过 3 MiB，每个房间最多保留
+50 个版本，超出时删除最旧版本。OWNER 和 EDITOR 可以创建、读取和恢复版本；VIEWER 只能读取版本元数据与内容但不能
+恢复为当前文档；只有 OWNER 可以删除版本。无 Token 的内网房间继续使用浏览器会话内快照，最多 20 个。
+
+#### 2.4.3 剪贴板文本 `STCLIP1`
 
 剪贴板同步只传输用户在已开启的剪贴板模块中主动粘贴的 `text/plain`，或者用户输入、编辑文本后明确点击“同步”触发的
 内容；普通输入事件不得自动发送。除读取用户触发的 paste 事件所携带数据外，客户端不得在后台轮询、监听或主动读取
@@ -401,6 +447,10 @@ session 的文本/二进制容器 limit 显式设为 `65,536`；按 UTF-8 字节
 
 附件 `roomId` 的缺省值是 `default`，与发现 WebSocket 的 `nearby` 不同；调用方需要同一展示分组时应显式传值。
 管理权限要求 tenant 完全相等；管理员可访问同 tenant 的客户端，普通用户还必须与 `ownerUsername` 完全相等。
+
+新建公开附件时，服务端把附件关联到解析后的持久房间 ID：OWNER 和 EDITOR 可以创建及确认上传，VIEWER 不得上传；
+同一持久房间的 OWNER、EDITOR 和 VIEWER 都可以凭各自 Token 下载已完成附件。待上传配额按持久房间 ID 汇总，不能通过
+签发多个邀请 Token 绕过。升级前已存在且没有持久房间 ID 的附件继续按上传时 `roomToken` 哈希精确匹配，以保持旧链接可用。
 
 #### 3.2.1 `fileName` 规范化
 

@@ -13,6 +13,7 @@ import lombok.Setter;
         indexes = {
                 @Index(name = "idx_transfer_attachment_tenant", columnList = "tenant_id, scope, id"),
                 @Index(name = "idx_transfer_attachment_room", columnList = "scope, room_id, id"),
+                @Index(name = "idx_transfer_attachment_public_room", columnList = "scope, public_transfer_room_id, id"),
                 @Index(name = "idx_transfer_attachment_expires", columnList = "expires_at, status")
         })
 @Getter
@@ -32,6 +33,9 @@ public class TransferAttachment {
 
     @Column(name = "room_token_hash", length = 64)
     private String roomTokenHash;
+
+    @Column(name = "public_transfer_room_id")
+    private Long publicTransferRoomId;
 
     @Column(name = "owner_username", length = 80)
     private String ownerUsername;

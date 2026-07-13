@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.RoomAccess;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,8 +38,10 @@ import java.util.concurrent.ConcurrentHashMap;
 public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(PublicTransferDiscoveryWebSocketHandler.class);
     private static final int MAX_MESSAGE_CHARS = 64 * 1024;
+    private static final Set<String> VIEWER_WRITE_MESSAGE_TYPES = Set.of("attachment", "clipboard", "whiteboard");
 
     private final PublicTransferProperties properties;
+    private final PublicTransferRoomService roomService;
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final Map<String, Participant> participantsBySession = new ConcurrentHashMap<>();
     private final Map<String, RateWindow> messageWindowsBySession = new ConcurrentHashMap<>();
@@ -46,8 +50,10 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
 
-    public PublicTransferDiscoveryWebSocketHandler(PublicTransferProperties properties) {
+    public PublicTransferDiscoveryWebSocketHandler(PublicTransferProperties properties,
+                                                   PublicTransferRoomService roomService) {
         this.properties = properties;
+        this.roomService = roomService;
     }
 
     @Override
@@ -58,6 +64,19 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
         session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
         Participant participant = Participant.from(session);
+        if (participant.sharedRoom()) {
+            try {
+                RoomAccess roomAccess = roomService.resolve(
+                        participant.roomId(), participant.roomToken(), participant.peerId());
+                participant = participant.withRoomAccess(roomAccess);
+            } catch (RuntimeException exception) {
+                log.debug("public transfer room authorization failed: room={} peer={} error={}",
+                        participant.roomId(), participant.peerId(), exception.toString());
+                send(session, Map.of("type", "error", "error", "room authorization failed"));
+                closeQuietly(session, CloseStatus.POLICY_VIOLATION);
+                return;
+            }
+        }
         String joinError = null;
         synchronized (participantJoinLock) {
             if (hasConnectedPeerId(participant)) {
@@ -81,6 +100,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 "roomId", participant.roomId(),
                 "publicAddress", participant.publicAddress(),
                 "sharedRoom", participant.sharedRoom(),
+                "roomRole", participant.roomRole(),
                 "connectedAt", participant.connectedAt()
         ));
         broadcastRoster(participant);
@@ -110,10 +130,16 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 send(session, Map.of("type", "pong", "ts", Instant.now().toString()));
                 return;
             }
+            String messageType = text(node, "type", "signal");
+            if ("VIEWER".equals(source.roomRole()) && VIEWER_WRITE_MESSAGE_TYPES.contains(messageType)) {
+                send(session, Map.of("type", "error", "error", "viewer is read-only"));
+                return;
+            }
             String targetPeerId = text(node, "targetPeerId");
             Map<String, Object> envelope = new LinkedHashMap<>();
-            envelope.put("type", text(node, "type", "signal"));
+            envelope.put("type", messageType);
             envelope.put("sourcePeerId", source.peerId());
+            envelope.put("sourceRole", source.roomRole());
             envelope.put("targetPeerId", StringUtils.hasText(targetPeerId) ? targetPeerId : null);
             envelope.put("roomId", source.roomId());
             envelope.put("publicAddress", source.publicAddress());
@@ -165,6 +191,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                     view.put("roomId", peer.roomId());
                     view.put("publicAddress", peer.publicAddress());
                     view.put("sharedRoom", peer.sharedRoom());
+                    view.put("roomRole", peer.roomRole());
                     view.put("connectedAt", peer.connectedAt());
                     return view;
                 })
@@ -259,6 +286,8 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             String roomId,
             String publicAddress,
             String roomKey,
+            String roomToken,
+            String roomRole,
             boolean sharedRoom,
             String connectedAt
     ) {
@@ -271,8 +300,25 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                     stringAttr(attrs, "roomId", "nearby"),
                     stringAttr(attrs, "publicAddress", "unknown"),
                     stringAttr(attrs, "roomKey", "public:unknown"),
+                    stringAttr(attrs, "roomToken", ""),
+                    "EDITOR",
                     Boolean.TRUE.equals(attrs.get("sharedRoom")),
                     Instant.now().toString()
+            );
+        }
+
+        private Participant withRoomAccess(RoomAccess access) {
+            return new Participant(
+                    sessionId,
+                    peerId,
+                    displayName,
+                    roomId,
+                    publicAddress,
+                    "room:" + access.roomId(),
+                    roomToken,
+                    access.role().name(),
+                    sharedRoom,
+                    connectedAt
             );
         }
 
@@ -323,6 +369,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             boolean sharedRoom = StringUtils.hasText(roomToken);
             attributes.put("publicAddress", publicAddress);
             attributes.put("sharedRoom", sharedRoom);
+            attributes.put("roomToken", roomToken);
             attributes.put("roomKey", sharedRoom ? "token:" + sha256(roomToken) : "public:" + publicAddress);
             return true;
         }

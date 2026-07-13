@@ -6,6 +6,8 @@ import com.theshuai.tunnelserver.management.model.TransferAttachment;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentRepository;
 import com.theshuai.tunnelserver.management.storage.object.ObjectStorageService;
 import com.theshuai.tunnelserver.management.storage.object.PresignedObjectUrl;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.Role;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.RoomAccess;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -25,6 +27,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -39,6 +42,7 @@ class TransferAttachmentServiceTests {
     @Mock private TransferAttachmentRepository repository;
     @Mock private ObjectStorageService objectStorageService;
     @Mock private ClientAccountService clientAccountService;
+    @Mock private PublicTransferRoomService publicTransferRoomService;
 
     private final ObjectStorageProperties storageProperties = new ObjectStorageProperties();
     private final PublicTransferProperties publicTransferProperties = new PublicTransferProperties();
@@ -51,20 +55,23 @@ class TransferAttachmentServiceTests {
         storageProperties.setRetentionHours(72);
         storageProperties.setMaxAttachmentBytes(1024);
         publicTransferProperties.setMaxPendingUploadsPerRoom(2);
+        lenient().when(publicTransferRoomService.resolve(any(), any(), any()))
+                .thenReturn(new RoomAccess(42L, Role.OWNER, "room-a"));
         service = new TransferAttachmentService(
                 repository,
                 objectStorageService,
                 storageProperties,
                 publicTransferProperties,
-                clientAccountService
+                clientAccountService,
+                publicTransferRoomService
         );
     }
 
     @Test
     void createPublicUploadRejectsWhenRoomPendingQuotaIsFull() {
-        when(repository.countByScopeAndRoomTokenHashAndStatus(
+        when(repository.countByScopeAndPublicTransferRoomIdAndStatus(
                 eq(TransferAttachmentService.SCOPE_PUBLIC_TRANSFER),
-                any(),
+                eq(42L),
                 eq(TransferAttachmentService.STATUS_PENDING)
         )).thenReturn(2L);
 
@@ -76,9 +83,21 @@ class TransferAttachmentServiceTests {
     }
 
     @Test
+    void viewerCannotCreatePublicUpload() {
+        when(publicTransferRoomService.resolve(any(), any(), any()))
+                .thenReturn(new RoomAccess(42L, Role.VIEWER, "room-a"));
+
+        assertThatThrownBy(() -> service.createPublicUpload(publicRequest(10)))
+                .isInstanceOf(org.springframework.web.server.ResponseStatusException.class)
+                .hasMessageContaining("访客不能上传文件");
+
+        verifyNoInteractions(objectStorageService);
+    }
+
+    @Test
     void createPublicUploadNormalizesMetadataAndPresignsClientPut() {
         mockEnabledStorage();
-        when(repository.countByScopeAndRoomTokenHashAndStatus(any(), any(), any())).thenReturn(0L);
+        when(repository.countByScopeAndPublicTransferRoomIdAndStatus(any(), any(), any())).thenReturn(0L);
         when(repository.existsById(anyLong())).thenReturn(false);
         when(repository.saveAndFlush(any(TransferAttachment.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(objectStorageService.presignUpload(any(), eq("text/plain"), any()))
@@ -99,6 +118,7 @@ class TransferAttachmentServiceTests {
         TransferAttachment saved = captor.getValue();
         assertThat(saved.getFileName()).isEqualTo("hello.txt");
         assertThat(saved.getRoomId()).isEqualTo("room-a");
+        assertThat(saved.getPublicTransferRoomId()).isEqualTo(42L);
         assertThat(saved.getSha256()).isEqualTo(SHA256);
         assertThat(saved.getStatus()).isEqualTo(TransferAttachmentService.STATUS_PENDING);
         assertThat(saved.getObjectKey()).contains("/public-transfer/").endsWith("/hello.txt");
@@ -109,7 +129,7 @@ class TransferAttachmentServiceTests {
     @Test
     void fileNameNormalizationUsesUnicodeCodePointsAndSafeLengthBoundaries() {
         mockEnabledStorage();
-        when(repository.countByScopeAndRoomTokenHashAndStatus(any(), any(), any())).thenReturn(0L);
+        when(repository.countByScopeAndPublicTransferRoomIdAndStatus(any(), any(), any())).thenReturn(0L);
         when(repository.existsById(anyLong())).thenReturn(false);
         when(repository.saveAndFlush(any(TransferAttachment.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(objectStorageService.presignUpload(any(), any(), any()))
@@ -151,7 +171,7 @@ class TransferAttachmentServiceTests {
     @Test
     void createPublicUploadRetriesWhenSaveHitsIdCollision() {
         mockEnabledStorage();
-        when(repository.countByScopeAndRoomTokenHashAndStatus(any(), any(), any())).thenReturn(0L);
+        when(repository.countByScopeAndPublicTransferRoomIdAndStatus(any(), any(), any())).thenReturn(0L);
         when(repository.existsById(anyLong())).thenReturn(false);
         when(objectStorageService.presignUpload(any(), any(), any()))
                 .thenReturn(new PresignedObjectUrl("https://oss/first", Map.of(), Instant.now().plusSeconds(900).toString()))
@@ -179,6 +199,24 @@ class TransferAttachmentServiceTests {
                 .hasMessageContaining("not uploaded");
 
         verifyNoInteractions(objectStorageService);
+    }
+
+    @Test
+    void invitedViewerCanDownloadAttachmentFromPersistentRoom() {
+        TransferAttachment attachment = uploadedFixture(123L);
+        attachment.setPublicTransferRoomId(42L);
+        when(repository.findByIdAndScope(123L, TransferAttachmentService.SCOPE_PUBLIC_TRANSFER))
+                .thenReturn(Optional.of(attachment));
+        when(publicTransferRoomService.authenticate("room-a", "viewer-token", "attachment-access"))
+                .thenReturn(new RoomAccess(42L, Role.VIEWER, "room-a"));
+        when(objectStorageService.presignDownload(any(), any()))
+                .thenReturn(new PresignedObjectUrl(
+                        "https://oss/download", Map.of(), Instant.now().plusSeconds(600).toString()));
+
+        var response = service.createPublicDownload(
+                123L, new TransferAttachmentService.PresignDownloadRequest("viewer-token"));
+
+        assertThat(response.downloadUrl()).isEqualTo("https://oss/download");
     }
 
     @Test

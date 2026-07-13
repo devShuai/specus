@@ -8,11 +8,14 @@ import com.theshuai.tunnelserver.management.repository.TransferAttachmentReposit
 import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.storage.object.ObjectStorageService;
 import com.theshuai.tunnelserver.management.storage.object.PresignedObjectUrl;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.RoomAccess;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -44,31 +47,41 @@ public class TransferAttachmentService {
     private final ObjectStorageProperties properties;
     private final PublicTransferProperties publicTransferProperties;
     private final ClientAccountService clientAccountService;
+    private final PublicTransferRoomService publicTransferRoomService;
 
     public TransferAttachmentService(TransferAttachmentRepository repository,
                                      ObjectStorageService objectStorageService,
                                      ObjectStorageProperties properties,
                                      PublicTransferProperties publicTransferProperties,
-                                     ClientAccountService clientAccountService) {
+                                     ClientAccountService clientAccountService,
+                                     PublicTransferRoomService publicTransferRoomService) {
         this.repository = repository;
         this.objectStorageService = objectStorageService;
         this.properties = properties;
         this.publicTransferProperties = publicTransferProperties;
         this.clientAccountService = clientAccountService;
+        this.publicTransferRoomService = publicTransferRoomService;
     }
 
     @Transactional
     public PresignUploadResponse createPublicUpload(PresignUploadRequest request) {
+        String roomId = normalizeRoomId(request.roomId());
+        RoomAccess access = publicTransferRoomService.resolve(roomId, request.roomToken(), "attachment-upload");
+        if (!access.role().canEdit()) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "访客不能上传文件");
+        }
         String roomTokenHash = roomTokenHash(requireText(request.roomToken(), "roomToken"));
         int maxPending = Math.max(1, publicTransferProperties.getMaxPendingUploadsPerRoom());
-        if (repository.countByScopeAndRoomTokenHashAndStatus(SCOPE_PUBLIC_TRANSFER, roomTokenHash, STATUS_PENDING) >= maxPending) {
+        if (repository.countByScopeAndPublicTransferRoomIdAndStatus(
+                SCOPE_PUBLIC_TRANSFER, access.roomId(), STATUS_PENDING) >= maxPending) {
             throw new RateLimitedException("当前房间待上传文件过多,请稍后再试");
         }
         return createUpload(
                 SCOPE_PUBLIC_TRANSFER,
                 null,
-                normalizeRoomId(request.roomId()),
+                roomId,
                 roomTokenHash,
+                access.roomId(),
                 null,
                 null,
                 request
@@ -89,6 +102,7 @@ public class TransferAttachmentService {
                 context.tenant().tenantId(),
                 null,
                 null,
+                null,
                 context.username(),
                 targetClientId,
                 request
@@ -99,7 +113,7 @@ public class TransferAttachmentService {
     public TransferAttachmentView completePublic(long attachmentId, CompleteAttachmentRequest request) {
         TransferAttachment attachment = repository.findByIdAndScope(attachmentId, SCOPE_PUBLIC_TRANSFER)
                 .orElseThrow(() -> new IllegalArgumentException("attachment not found: " + attachmentId));
-        requireMatchingRoomToken(attachment, request.roomToken());
+        requireRoomAccess(attachment, request.roomToken(), true);
         return complete(attachment);
     }
 
@@ -116,7 +130,7 @@ public class TransferAttachmentService {
     public PresignDownloadResponse createPublicDownload(long attachmentId, PresignDownloadRequest request) {
         TransferAttachment attachment = repository.findByIdAndScope(attachmentId, SCOPE_PUBLIC_TRANSFER)
                 .orElseThrow(() -> new IllegalArgumentException("attachment not found: " + attachmentId));
-        requireMatchingRoomToken(attachment, request.roomToken());
+        requireRoomAccess(attachment, request.roomToken(), false);
         return createDownload(attachment);
     }
 
@@ -155,6 +169,7 @@ public class TransferAttachmentService {
                                                String tenantId,
                                                String roomId,
                                                String roomTokenHash,
+                                               Long publicTransferRoomId,
                                                String ownerUsername,
                                                Long targetClientId,
                                                PresignUploadRequest request) {
@@ -176,6 +191,7 @@ public class TransferAttachmentService {
             attachment.setScope(scope);
             attachment.setRoomId(roomId);
             attachment.setRoomTokenHash(roomTokenHash);
+            attachment.setPublicTransferRoomId(publicTransferRoomId);
             attachment.setOwnerUsername(ownerUsername);
             attachment.setTargetClientId(targetClientId);
             attachment.setObjectKey(objectKey(scope, attachment.getId(), fileName, now));
@@ -295,6 +311,19 @@ public class TransferAttachmentService {
         String expected = attachment.getRoomTokenHash();
         if (!StringUtils.hasText(expected) || !Objects.equals(expected, roomTokenHash(requireText(roomToken, "roomToken")))) {
             throw new IllegalArgumentException("roomToken is invalid");
+        }
+    }
+
+    private void requireRoomAccess(TransferAttachment attachment, String roomToken, boolean requireEdit) {
+        if (attachment.getPublicTransferRoomId() == null) {
+            requireMatchingRoomToken(attachment, roomToken);
+            return;
+        }
+        RoomAccess access = publicTransferRoomService.authenticate(
+                attachment.getRoomId(), roomToken, "attachment-access");
+        if (access.roomId() != attachment.getPublicTransferRoomId()
+                || (requireEdit && !access.role().canEdit())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "房间凭证无效");
         }
     }
 

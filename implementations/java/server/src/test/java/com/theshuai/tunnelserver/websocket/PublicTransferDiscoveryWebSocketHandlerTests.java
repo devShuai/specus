@@ -3,6 +3,9 @@ package com.theshuai.tunnelserver.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.Role;
+import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.RoomAccess;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -38,8 +41,10 @@ class PublicTransferDiscoveryWebSocketHandlerTests {
 
     @Test
     void duplicatePeerIdInSameGroupIsRejectedBeforeJoin() throws Exception {
+        PublicTransferRoomService roomService = mock(PublicTransferRoomService.class);
+        when(roomService.resolve(any(), any(), any())).thenReturn(new RoomAccess(42L, Role.OWNER, "room-a"));
         PublicTransferDiscoveryWebSocketHandler handler = new PublicTransferDiscoveryWebSocketHandler(
-                new PublicTransferProperties());
+                new PublicTransferProperties(), roomService);
         WebSocketSession first = session("session-1", "web-duplicate", "room-a", "token:room-a");
         WebSocketSession duplicate = session("session-2", "web-duplicate", "room-a", "token:room-a");
 
@@ -57,6 +62,25 @@ class PublicTransferDiscoveryWebSocketHandlerTests {
         verify(first, never()).close(any(CloseStatus.class));
     }
 
+    @Test
+    void viewerCannotRelayWhiteboardUpdates() throws Exception {
+        PublicTransferRoomService roomService = mock(PublicTransferRoomService.class);
+        when(roomService.resolve(any(), any(), any())).thenReturn(new RoomAccess(42L, Role.VIEWER, "room-a"));
+        PublicTransferDiscoveryWebSocketHandler handler = new PublicTransferDiscoveryWebSocketHandler(
+                new PublicTransferProperties(), roomService);
+        WebSocketSession viewer = session("session-viewer", "web-viewer", "room-a", "token:room-a");
+
+        handler.afterConnectionEstablished(viewer);
+        clearInvocations(viewer);
+        handler.handleTextMessage(viewer, new TextMessage("{\"type\":\"whiteboard\",\"payload\":{}}"));
+
+        var errorMessage = org.mockito.ArgumentCaptor.forClass(TextMessage.class);
+        verify(viewer).sendMessage(errorMessage.capture());
+        JsonNode error = new ObjectMapper().readTree(errorMessage.getValue().getPayload());
+        assertEquals("error", error.path("type").asText());
+        assertEquals("viewer is read-only", error.path("error").asText());
+    }
+
     private static WebSocketSession session(String sessionId, String peerId, String roomId, String roomKey) {
         WebSocketSession session = mock(WebSocketSession.class);
         when(session.getId()).thenReturn(sessionId);
@@ -67,6 +91,7 @@ class PublicTransferDiscoveryWebSocketHandlerTests {
                 "roomId", roomId,
                 "publicAddress", "203.0.113.10",
                 "roomKey", roomKey,
+                "roomToken", "owner-token",
                 "sharedRoom", true
         ));
         return session;
