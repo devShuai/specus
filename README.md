@@ -45,6 +45,7 @@ flowchart TD
 | `implementations/java/client` | Java 内网客户端，连接服务端，并将隧道数据转发至目标内网服务，Maven artifact 为 `tunnel-client` |
 | `apps/admin-web` | 管理后台前端(React + HeroUI)，构建产物供各服务端静态托管 |
 | `deploy/java-server` | Java server 的 systemd 安装、更新脚本和环境变量模板 |
+| `deploy/remote` | 从 macOS/Linux 或 Windows 将当前 Java server 与 OpenResty 前端一键构建、上传、更新并验收 |
 | `protocol/spec` | 跨语言协议说明、数据面/控制面规范入口 |
 | `implementations/go/server` | Go 服务端移植，与 Java 服务端线协议字节兼容，支持多库(sqlite/pg/mysql) |
 | `implementations/go/client` | Go 内网客户端，与 Java 客户端使用相同配置和紧凑二进制协议 |
