@@ -1529,6 +1529,210 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   }, []);
 
+  if (isDiagramWorkspace) {
+    const collaborationPanel = (
+      <div className="space-y-4 text-zinc-950 dark:text-white">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Button as="a" href="#/transfer" size="sm" radius="sm" variant="flat">互传</Button>
+            <Button as="a" href="/" size="sm" radius="sm" variant="light">控制台</Button>
+          </div>
+          <ThemeToggleButton className="text-zinc-700 dark:text-zinc-200" />
+        </div>
+
+        <section className="rounded-xl border border-black/[0.07] bg-white p-3 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.035]">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-small font-semibold">当前协作</div>
+              <div className="mt-1 truncate font-mono text-tiny text-zinc-500 dark:text-zinc-400">{roomId}</div>
+            </div>
+            <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "success" : "default"}>
+              {peers.length > 0 ? `${peers.length + 1} 人在线` : "仅本机"}
+            </Chip>
+          </div>
+          <div className="mt-3 flex items-center justify-between gap-2 text-tiny text-zinc-500 dark:text-zinc-400">
+            <span>{isInternetMode ? "外网 Token 房间" : "内网直连房间"}</span>
+            <Chip size="sm" radius="sm" variant="flat" color={effectiveRoomRole === "OWNER" ? "primary" : effectiveRoomRole === "EDITOR" ? "success" : "default"}>
+              {effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读访客"}
+            </Chip>
+          </div>
+        </section>
+
+        <section>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h3 className="text-small font-semibold">连接方式</h3>
+            <span className="text-tiny text-zinc-400">默认内网</span>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="流程图协作网络模式">
+            <NetworkModeButton
+              mode="lan"
+              activeMode={networkMode}
+              label="内网"
+              detail="同一网络发现，仅设备直连"
+              onSelect={updateNetworkMode}
+            />
+            <NetworkModeButton
+              mode="internet"
+              activeMode={networkMode}
+              label="外网"
+              detail="Token 隔离，支持中继兜底"
+              onSelect={updateNetworkMode}
+            />
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-black/[0.07] bg-white p-3 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.035]">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-small font-semibold">房间设置</h3>
+            <button
+              type="button"
+              className="max-w-48 truncate rounded-md bg-black/[0.035] px-2 py-1 font-mono text-[10px] text-zinc-500 hover:text-cyan-700 dark:bg-white/[0.05] dark:text-zinc-400 dark:hover:text-cyan-200"
+              onClick={() => void copyText(peerId).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
+            >
+              {peerId}
+            </button>
+          </div>
+          <div className="mt-3 space-y-3">
+            <Input
+              label="房间名"
+              radius="sm"
+              variant="bordered"
+              value={roomIdDraft}
+              onValueChange={updateRoomIdDraft}
+              maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
+              isInvalid={Boolean(roomSettingsErrors.roomId)}
+              errorMessage={roomSettingsErrors.roomId}
+            />
+            <Input
+              label="房间 Token"
+              radius="sm"
+              variant="bordered"
+              value={roomTokenDraft}
+              onValueChange={updateRoomTokenDraft}
+              maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH}
+              isDisabled={!isInternetMode}
+              isInvalid={Boolean(roomSettingsErrors.roomToken)}
+              errorMessage={roomSettingsErrors.roomToken}
+              description={isInternetMode ? "外网设备凭此 Token 加入隔离房间" : "内网模式不使用 Token"}
+              endContent={
+                <Button size="sm" variant="light" isDisabled={!isInternetMode} onPress={() => updateRoomTokenDraft(createRoomToken())}>
+                  生成
+                </Button>
+              }
+            />
+          </div>
+          <div className="mt-3 flex justify-end gap-2">
+            <Button size="sm" radius="sm" variant="light" onPress={resetRoomSettingsDraft}>恢复</Button>
+            <Button size="sm" radius="sm" color="primary" variant="flat" onPress={applyRoomSettings}>应用设置</Button>
+          </div>
+        </section>
+
+        <section>
+          <h3 className="text-small font-semibold">邀请协作者</h3>
+          <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+            {isInternetMode ? "邀请链接会携带当前 Token，可跨网络加入。" : "邀请设备需连接同一内网，链接不包含 Token。"}
+          </p>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <Button size="sm" color="primary" radius="sm" variant="flat" onPress={() => void shareRoom()}>系统分享</Button>
+            <Button size="sm" radius="sm" variant="flat" onPress={() => void copyRoomLink()}>复制链接</Button>
+            <Button size="sm" color={qrVisible ? "default" : "secondary"} radius="sm" variant="flat" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
+              {qrVisible ? "收起二维码" : "显示二维码"}
+            </Button>
+            <Button size="sm" radius="sm" variant="flat" onPress={createNewRoom}>新房间</Button>
+          </div>
+          {qrVisible ? (
+            <div className="mt-3 rounded-xl border border-cyan-500/20 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-300/[0.06]">
+              <RoomQrCode value={roomJoinUrl} />
+              <div className="mt-2 break-all text-center font-mono text-[9px] leading-4 text-zinc-500 dark:text-zinc-400">{roomJoinUrl}</div>
+            </div>
+          ) : null}
+        </section>
+
+        {isInternetMode && roomRole === "OWNER" ? (
+          <section className="rounded-xl border border-violet-500/20 bg-violet-50/60 p-3 dark:border-violet-300/20 dark:bg-violet-300/[0.06]">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-small font-semibold">角色邀请</h3>
+                <p className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">分别分配编辑或只读权限</p>
+              </div>
+              <div className="flex gap-1.5">
+                <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("EDITOR")}>编辑者</Button>
+                <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("VIEWER")}>访客</Button>
+              </div>
+            </div>
+            {createdRoomAccess ? (
+              <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-50/80 p-2.5 dark:border-amber-300/20 dark:bg-amber-300/10">
+                <div className="text-tiny text-amber-900 dark:text-amber-100">{createdRoomAccess.access.label} · 明文 Token 仅显示一次</div>
+                <Button className="mt-2" size="sm" radius="sm" color="warning" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制邀请链接</Button>
+              </div>
+            ) : null}
+            <div className="mt-3 space-y-1.5">
+              {roomAccessTokens.length === 0 ? (
+                <div className="text-tiny text-zinc-400">{roomAccessLoading ? "正在加载邀请…" : "暂无角色邀请"}</div>
+              ) : roomAccessTokens.map((access) => (
+                <div key={access.id} className="flex items-center justify-between gap-2 rounded-lg border border-black/10 bg-white/60 px-2.5 py-2 dark:border-white/10 dark:bg-black/10">
+                  <div className="min-w-0">
+                    <div className="truncate text-tiny font-medium">{access.label}</div>
+                    <div className="mt-0.5 text-[10px] text-zinc-400">{access.role === "EDITOR" ? "可编辑" : "只读"} · {access.revokedAt ? "已撤销" : "有效"}</div>
+                  </div>
+                  <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>
+                    {access.revokedAt ? "已撤销" : "撤销"}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        <section>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-small font-semibold">在线成员</h3>
+            <Chip size="sm" radius="sm" variant="flat">{peers.length + 1} 人</Chip>
+          </div>
+          <div className="mt-2 space-y-1.5">
+            <div className="rounded-lg border border-cyan-500/20 bg-cyan-50/70 px-3 py-2 dark:border-cyan-300/20 dark:bg-cyan-300/[0.06]">
+              <div className="text-tiny font-medium">当前设备</div>
+              <div className="mt-0.5 truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-400">{peerId}</div>
+            </div>
+            {peers.map((peer) => (
+              <div key={peer.peerId} className="rounded-lg border border-black/[0.07] bg-white px-3 py-2 dark:border-white/[0.08] dark:bg-white/[0.035]">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate text-tiny font-medium">{peer.displayName || peer.peerId}</span>
+                  <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-label="在线" />
+                </div>
+                <div className="mt-0.5 truncate font-mono text-[10px] text-zinc-400">{peer.peerId}</div>
+              </div>
+            ))}
+            {peers.length === 0 ? <div className="py-2 text-center text-tiny text-zinc-400">暂无其他协作者</div> : null}
+          </div>
+        </section>
+
+        {notice ? <div className="rounded-lg border border-emerald-500/20 bg-emerald-50 px-3 py-2 text-tiny text-emerald-800 dark:border-emerald-300/20 dark:bg-emerald-300/10 dark:text-emerald-100">{notice}</div> : null}
+        {error ? <div className="rounded-lg border border-red-500/20 bg-red-50 px-3 py-2 text-tiny text-red-700 dark:border-red-300/20 dark:bg-red-300/10 dark:text-red-100">{error}</div> : null}
+      </div>
+    );
+
+    return (
+      <main className="h-[100dvh] overflow-hidden bg-zinc-100 text-zinc-950 dark:bg-zinc-950 dark:text-white">
+        <Suspense fallback={<DiagramWorkspaceLoading fullscreen />}>
+          <LazySyncedDiagram
+            standalone
+            collaborationPanel={collaborationPanel}
+            boardKey={transferRoomScopeKey}
+            roomId={roomId}
+            roomToken={isInternetMode ? roomToken : ""}
+            roomRole={effectiveRoomRole}
+            peerId={peerId}
+            peerCount={peers.length}
+            isConnected={peers.length > 0}
+            events={whiteboardEvents}
+            onSend={sendWhiteboardPayload}
+          />
+        </Suspense>
+      </main>
+    );
+  }
+
   return (
     <main
       className="landing-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white"
@@ -2046,9 +2250,12 @@ function NetworkModeButton({
   );
 }
 
-function DiagramWorkspaceLoading() {
+function DiagramWorkspaceLoading({ fullscreen = false }: { fullscreen?: boolean }) {
   return (
-    <section className="mt-5 grid min-h-[520px] place-items-center rounded-2xl border border-black/[0.07] bg-zinc-50/70 dark:border-white/[0.08] dark:bg-zinc-950/55">
+    <section className={fullscreen
+      ? "fixed inset-0 grid h-[100dvh] place-items-center bg-zinc-100 dark:bg-zinc-950"
+      : "mt-5 grid min-h-[520px] place-items-center rounded-2xl border border-black/[0.07] bg-zinc-50/70 dark:border-white/[0.08] dark:bg-zinc-950/55"}
+    >
       <div className="flex flex-col items-center gap-3 text-center">
         <span className="h-8 w-8 animate-spin rounded-full border-2 border-cyan-500/25 border-t-cyan-500" aria-hidden="true" />
         <span className="text-small font-semibold text-zinc-900 dark:text-white">正在加载专业流程图工具</span>

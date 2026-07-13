@@ -126,6 +126,8 @@ interface SyncedDiagramProps {
   events: WhiteboardInboundEvent[];
   onSend: (payload: DiagramPayload) => void;
   onSwitchToWhiteboard?: () => void;
+  standalone?: boolean;
+  collaborationPanel?: ReactNode;
 }
 
 interface DiagramRuntime {
@@ -338,6 +340,8 @@ export function SyncedDiagram({
   events,
   onSend,
   onSwitchToWhiteboard,
+  standalone = false,
+  collaborationPanel,
 }: SyncedDiagramProps) {
   const { theme } = useTheme();
   const graphContainerRef = useRef<HTMLDivElement | null>(null);
@@ -369,6 +373,8 @@ export function SyncedDiagram({
   onSendRef.current = onSend;
 
   const [isExpanded, setIsExpanded] = useState(false);
+  const [showCollaborationPanel, setShowCollaborationPanel] = useState(false);
+  const isFullViewport = standalone || isExpanded;
   const [documentEpoch, setDocumentEpoch] = useState(0);
   const [runtimeEpoch, setRuntimeEpoch] = useState(0);
   const [selection, setSelection] = useState<DiagramSelection>(EMPTY_SELECTION);
@@ -402,6 +408,27 @@ export function SyncedDiagram({
   const usesServerVersions = Boolean(roomToken.trim());
   const isRoleReadOnly = roomRole === "VIEWER";
   const isReadOnly = isRoleReadOnly || localReadOnly;
+
+  useEffect(() => {
+    if (!isFullViewport) return;
+    const previousOverflow = window.document.body.style.overflow;
+    const previousOverscrollBehavior = window.document.body.style.overscrollBehavior;
+    window.document.body.style.overflow = "hidden";
+    window.document.body.style.overscrollBehavior = "none";
+    return () => {
+      window.document.body.style.overflow = previousOverflow;
+      window.document.body.style.overscrollBehavior = previousOverscrollBehavior;
+    };
+  }, [isFullViewport]);
+
+  useEffect(() => {
+    if (!showCollaborationPanel) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowCollaborationPanel(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [showCollaborationPanel]);
 
   const stencilSearchResults = useMemo(() => {
     const query = paletteQuery.trim().toLowerCase();
@@ -904,7 +931,7 @@ export function SyncedDiagram({
       container.removeEventListener("pointermove", presencePointerListener);
       graph.destroy();
     };
-  }, [activePageId, boardKey, documentEpoch, ensureStencilLibraryLoaded, isExpanded, isReadOnly, peerId, scheduleDocumentRender, sendPresence]);
+  }, [activePageId, boardKey, documentEpoch, ensureStencilLibraryLoaded, isFullViewport, isReadOnly, peerId, scheduleDocumentRender, sendPresence]);
 
   useEffect(() => {
     if (!showMinimap) {
@@ -2314,7 +2341,7 @@ export function SyncedDiagram({
 
   const diagram = (
     <section
-      className={(isExpanded
+      className={(isFullViewport
         ? "fixed inset-0 z-[90] h-[100dvh] overflow-hidden bg-zinc-100 dark:bg-zinc-950"
         : "mt-5 rounded-2xl border border-black/[0.07] bg-zinc-50/70 p-3 shadow-[0_18px_60px_-36px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-zinc-950/55 sm:p-4") + (isActive ? "" : " hidden")}
       aria-hidden={!isActive}
@@ -2332,7 +2359,7 @@ export function SyncedDiagram({
           }
         }}
       />
-      {!isExpanded ? (
+      {!isFullViewport ? (
         <div className="flex flex-wrap items-center justify-between gap-4 px-1 pb-1">
           <div className="flex min-w-0 items-center gap-3">
             <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-950 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
@@ -2375,7 +2402,7 @@ export function SyncedDiagram({
         </div>
       ) : null}
 
-      <div className={isExpanded
+      <div className={isFullViewport
         ? "absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-zinc-100 dark:bg-[#090c11]"
         : "mt-3 flex h-[min(78dvh,680px)] min-h-[540px] min-w-0 flex-col overflow-hidden rounded-xl border border-black/[0.09] bg-white shadow-[0_24px_70px_-38px_rgba(15,23,42,0.55)] dark:border-white/[0.09] dark:bg-[#0c1016] sm:h-[680px] md:h-[720px] lg:h-[760px] xl:h-[820px]"}
       >
@@ -2389,7 +2416,7 @@ export function SyncedDiagram({
               <span className="block text-[9px] text-zinc-400">专业流程图</span>
             </span>
           </div>
-          {isExpanded ? (
+          {isFullViewport ? (
             <>
               {onSwitchToWhiteboard ? (
                 <DiagramToolbarButton label="白板" onClick={() => {
@@ -2397,7 +2424,7 @@ export function SyncedDiagram({
                   switchToWhiteboard();
                 }} />
               ) : null}
-              <DiagramToolbarButton label="退出全屏" onClick={() => setIsExpanded(false)} />
+              {!standalone ? <DiagramToolbarButton label="退出全屏" onClick={() => setIsExpanded(false)} /> : null}
               <span className="mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
             </>
           ) : null}
@@ -2473,11 +2500,13 @@ export function SyncedDiagram({
           <DiagramToolbarMenu
             label="协作"
             items={[
+              ...(collaborationPanel ? [{ key: "room", label: "房间与协作" }] : []),
               { key: "comment", label: "添加评论", disabled: isReadOnly },
               { key: "version", label: isVersionLoading ? "版本处理中" : "创建版本", disabled: isRoleReadOnly || isVersionLoading },
             ]}
             onAction={(key) => {
-              if (key === "comment") addComment();
+              if (key === "room") setShowCollaborationPanel(true);
+              else if (key === "comment") addComment();
               else if (key === "version") void createVersion();
             }}
           />
@@ -3140,6 +3169,41 @@ export function SyncedDiagram({
           </aside>
         </div>
 
+        {showCollaborationPanel && collaborationPanel ? (
+          <div className="absolute inset-0 z-[70] flex justify-end" role="presentation">
+            <button
+              type="button"
+              className="absolute inset-0 bg-zinc-950/45 backdrop-blur-[2px]"
+              aria-label="关闭房间与协作面板"
+              onClick={() => setShowCollaborationPanel(false)}
+            />
+            <aside
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="diagram-collaboration-title"
+              className="relative z-10 flex h-full w-full max-w-[440px] flex-col border-l border-black/10 bg-zinc-50 shadow-2xl dark:border-white/10 dark:bg-[#0f141c] sm:w-[min(92vw,440px)]"
+            >
+              <div className="flex h-14 shrink-0 items-center justify-between border-b border-black/[0.07] px-4 dark:border-white/[0.08]">
+                <div>
+                  <h2 id="diagram-collaboration-title" className="text-sm font-semibold text-zinc-950 dark:text-white">房间与协作</h2>
+                  <p className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">管理连接方式、邀请权限与在线成员</p>
+                </div>
+                <button
+                  type="button"
+                  className="grid h-9 w-9 place-items-center rounded-lg text-zinc-500 transition hover:bg-black/[0.05] hover:text-zinc-900 dark:hover:bg-white/[0.06] dark:hover:text-white"
+                  aria-label="关闭房间与协作面板"
+                  onClick={() => setShowCollaborationPanel(false)}
+                >
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto p-4 overscroll-contain">
+                {collaborationPanel}
+              </div>
+            </aside>
+          </div>
+        ) : null}
+
         <div className="flex h-8 shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/[0.07] bg-white/95 px-3 text-[9px] text-zinc-500 dark:border-white/[0.08] dark:bg-[#11161e]/95 dark:text-zinc-400">
           <span className="flex min-w-0 items-center gap-2 truncate"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} />{status}</span>
           <span className="hidden shrink-0 items-center gap-3 font-mono sm:flex"><span>{activePageName}</span><span>{nodeCount} nodes</span><span>{edgeCount} edges{selectedCountLabel}</span></span>
@@ -3148,7 +3212,7 @@ export function SyncedDiagram({
     </section>
   );
 
-  return isExpanded ? createPortal(diagram, window.document.body) : diagram;
+  return isFullViewport ? createPortal(diagram, window.document.body) : diagram;
 }
 
 function readGraphDocument(graph: Graph, pageId = DEFAULT_PAGE_ID): Pick<DiagramDocumentV1, "nodes" | "edges"> {
