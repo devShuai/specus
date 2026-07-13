@@ -19,6 +19,29 @@ body {
   color: hsl(var(--heroui-foreground));
 }
 
+/* HeroUI Modal 默认关闭按钮统一使用红底，覆盖浅色与深色主题。 */
+[role="dialog"] button[aria-label="Close"] {
+  color: #fff !important;
+  background-color: #dc2626 !important;
+  opacity: 1 !important;
+}
+
+[role="dialog"] button[aria-label="Close"]:hover,
+[role="dialog"] button[aria-label="Close"][data-hover="true"] {
+  background-color: #b91c1c !important;
+}
+
+[role="dialog"] button[aria-label="Close"]:active,
+[role="dialog"] button[aria-label="Close"][data-pressed="true"] {
+  background-color: #991b1b !important;
+}
+
+[role="dialog"] button[aria-label="Close"]:focus-visible,
+[role="dialog"] button[aria-label="Close"][data-focus-visible="true"] {
+  outline: 2px solid #fca5a5 !important;
+  outline-offset: 2px;
+}
+
 @supports (overflow: clip) {
   body {
     overflow-x: clip;
