@@ -6,6 +6,7 @@ import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.service.PeerMeshService;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.jspecify.annotations.NonNull;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -42,8 +43,6 @@ public class StunTurnServer implements ApplicationRunner {
     private final Map<String, String> allocationByEndpoint = new ConcurrentHashMap<>();
     private DatagramSocket primarySocket;
     private DatagramSocket alternateSocket;
-    private Thread primaryThread;
-    private Thread alternateThread;
     private ExecutorService relayExecutor;
     private volatile boolean running;
 
@@ -56,7 +55,7 @@ public class StunTurnServer implements ApplicationRunner {
     }
 
     @Override
-    public void run(ApplicationArguments args) {
+    public void run(@NonNull ApplicationArguments args) {
         if (!properties.isEnabled()) {
             return;
         }
@@ -64,7 +63,7 @@ public class StunTurnServer implements ApplicationRunner {
             primarySocket = new DatagramSocket(properties.getStunTurnPort());
             relayExecutor = createRelayExecutor();
             running = true;
-            primaryThread = new Thread(
+            Thread primaryThread = new Thread(
                     () -> receiveLoop(primarySocket, "primary"),
                     "peer-mesh-stun-turn");
             primaryThread.setDaemon(true);
@@ -84,7 +83,7 @@ public class StunTurnServer implements ApplicationRunner {
         }
         try {
             alternateSocket = new DatagramSocket(alternatePort);
-            alternateThread = new Thread(
+            Thread alternateThread = new Thread(
                     () -> receiveLoop(alternateSocket, "alternate"),
                     "peer-mesh-stun-probe-alt");
             alternateThread.setDaemon(true);
@@ -201,15 +200,15 @@ public class StunTurnServer implements ApplicationRunner {
     }
 
     private DatagramSocket bindRelaySocket() throws Exception {
-        int min = Math.max(1, Math.min(65_535, properties.getRelayMinPort()));
-        int max = Math.max(1, Math.min(65_535, properties.getRelayMaxPort()));
+        int min = Math.clamp(properties.getRelayMinPort(), 1, 65_535);
+        int max = Math.clamp(properties.getRelayMaxPort(), 1, 65_535);
         if (min > max) {
             int tmp = min;
             min = max;
             max = tmp;
         }
         int capacity = max - min + 1;
-        int attempts = Math.min(128, Math.max(16, capacity));
+        int attempts = Math.clamp(capacity, 16, 128);
         int start = min + ThreadLocalRandom.current().nextInt(capacity);
         Exception last = null;
         for (int i = 0; i < attempts; i++) {
@@ -332,7 +331,7 @@ public class StunTurnServer implements ApplicationRunner {
         }
         InetSocketAddress peer = indication.xorPeerAddress().orElse(null);
         byte[] payload = indication.data().orElse(null);
-        if (peer == null || payload == null || !hasPermission(allocation, peer)) {
+        if (peer == null || payload == null || hasNotPermission(allocation, peer)) {
             return;
         }
         PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
@@ -349,7 +348,7 @@ public class StunTurnServer implements ApplicationRunner {
             try {
                 allocation.relaySocket.receive(packet);
                 InetSocketAddress peer = new InetSocketAddress(packet.getAddress(), packet.getPort());
-                if (!hasPermission(allocation, peer)) {
+                if (hasNotPermission(allocation, peer)) {
                     continue;
                 }
                 byte[] payload = java.util.Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength());
@@ -402,9 +401,9 @@ public class StunTurnServer implements ApplicationRunner {
         return allocation;
     }
 
-    private boolean hasPermission(Allocation allocation, InetSocketAddress peer) {
+    private boolean hasNotPermission(Allocation allocation, InetSocketAddress peer) {
         Instant expiresAt = allocation.permissions.get(permissionKey(peer));
-        return expiresAt != null && expiresAt.isAfter(Instant.now());
+        return expiresAt == null || !expiresAt.isAfter(Instant.now());
     }
 
     private void sendStun(DatagramSocket socket, InetSocketAddress remote, StunMessage message) throws Exception {
@@ -441,7 +440,6 @@ public class StunTurnServer implements ApplicationRunner {
 
     private int errorType(int requestType) {
         return switch (requestType) {
-            case StunMessage.BINDING_REQUEST -> StunMessage.BINDING_ERROR;
             case StunMessage.ALLOCATE_REQUEST -> StunMessage.ALLOCATE_ERROR;
             case StunMessage.REFRESH_REQUEST -> StunMessage.REFRESH_ERROR;
             case StunMessage.CREATE_PERMISSION_REQUEST -> StunMessage.CREATE_PERMISSION_ERROR;
@@ -537,13 +535,13 @@ public class StunTurnServer implements ApplicationRunner {
         int configuredThreads = properties.getRelayWorkerThreads();
         int workers = configuredThreads > 0
                 ? configuredThreads
-                : Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+                : Math.clamp(Runtime.getRuntime().availableProcessors(), 2, 8);
         int queueCapacity = Math.max(1, properties.getRelayWorkerQueueCapacity());
         ThreadFactory threadFactory = new ThreadFactory() {
             private int index;
 
             @Override
-            public Thread newThread(Runnable runnable) {
+            public Thread newThread(@NonNull Runnable runnable) {
                 Thread thread = new Thread(runnable, "peer-mesh-relay-" + (++index));
                 thread.setDaemon(true);
                 return thread;
