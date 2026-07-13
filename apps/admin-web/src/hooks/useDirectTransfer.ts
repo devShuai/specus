@@ -928,6 +928,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     targetPeerId: string,
     file: File,
     mode: PeerTransportMode = "auto",
+    signal?: AbortSignal,
   ): Promise<DirectTransferResult> => {
     const limitBytes = optionsRef.current.directMemoryLimitBytes;
     if (typeof RTCPeerConnection === "undefined") {
@@ -949,7 +950,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     const transferId = createTransferId();
     const fileName = file.name || "attachment";
     const mimeType = effectiveMimeType(fileName, file.type);
-    const sha256 = await sha256Blob(file);
+    const sha256 = await sha256Blob(file, signal);
     ensureCurrentChannel();
     optionsRef.current.onStateChange("waiting");
     channel.send(JSON.stringify({

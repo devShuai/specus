@@ -13,4 +13,13 @@ describe("sha256Blob", () => {
       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     );
   });
+
+  it("stops hashing when the operation is cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(sha256Blob(new Blob(["cancelled"]), controller.signal)).rejects.toMatchObject({
+      name: "AbortError",
+    });
+  });
 });

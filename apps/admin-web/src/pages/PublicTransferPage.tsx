@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type {
   ChangeEvent,
   ClipboardEvent as ReactClipboardEvent,
@@ -99,6 +99,13 @@ interface PreviewTarget {
   mimeType?: string | null;
   url?: string | null;
   blob?: Blob | null;
+  sizeBytes?: number;
+}
+
+interface TransferProgressStore {
+  getSnapshot: () => number;
+  set: (value: number) => void;
+  subscribe: (listener: () => void) => () => void;
 }
 
 interface FileTransferTask {
@@ -127,6 +134,7 @@ class FileTransferRoomChangedError extends Error {
 const INCOMING_ITEM_LIMIT = 20;
 const DIRECT_MEMORY_LIMIT_BYTES = DEFAULT_DIRECT_MEMORY_LIMIT_BYTES;
 const STREAM_DOWNLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
+const AUTO_PREVIEW_LIMIT_BYTES = 8 * 1024 * 1024;
 const CLIPBOARD_EVENT_LIMIT = 20;
 const CLIPBOARD_SEEN_EVENT_LIMIT = 200;
 const CLIPBOARD_SEQUENCE_STATE_LIMIT = 200;
@@ -179,7 +187,8 @@ function PublicTransferPageContent() {
   const [peers, setPeers] = useState<DiscoveryPeer[]>([]);
   const [incoming, setIncoming] = useState<IncomingAttachment[]>([]);
   const [state, setState] = useState<UploadState>("idle");
-  const [progress, setProgress] = useState(0);
+  const progressStore = useMemo(() => createTransferProgressStore(), []);
+  const setProgress = useCallback((value: number) => progressStore.set(value), [progressStore]);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [record, setRecord] = useState<UploadRecord | null>(null);
@@ -1016,6 +1025,7 @@ function PublicTransferPageContent() {
             task.targetPeerId,
             file,
             task.networkMode === "lan" ? "direct" : "auto",
+            task.abortController.signal,
           );
           if (!isFileTransferTaskCurrent(task)) {
             URL.revokeObjectURL(direct.previewUrl);
@@ -1178,7 +1188,7 @@ function PublicTransferPageContent() {
     setProgress(0);
     try {
       const mimeType = effectiveMimeType(file.name || "attachment", file.type);
-      const sha256 = await sha256Blob(file);
+      const sha256 = await sha256Blob(file, task.abortController.signal);
       assertFileTransferTaskCurrent(task);
       const presign = await publicPresignAttachmentUpload({
         fileName: file.name || "attachment",
@@ -1816,15 +1826,7 @@ function PublicTransferPageContent() {
 
           {state !== "idle" && (
             <div className={activeTool === "files" ? "mt-4" : "hidden"} aria-hidden={activeTool !== "files"}>
-              <Progress
-                aria-label="上传进度"
-                value={state === "done" ? 100 : progress}
-                color={state === "failed" ? "danger" : "primary"}
-                size="sm"
-              />
-              <div className="mt-2 text-tiny text-zinc-500 dark:text-zinc-400">
-                {stateLabel(state, progress)}
-              </div>
+              <TransferProgress state={state} store={progressStore} />
             </div>
           )}
 
@@ -2167,6 +2169,7 @@ function IncomingFilesPanel({
                   mimeType={item.attachment.mimeType}
                   url={previewUrl}
                   blob={item.blob}
+                  sizeBytes={item.attachment.sizeBytes}
                   compact
                   onPreview={onPreview}
                 />
@@ -2200,6 +2203,23 @@ function IncomingFilesPanel({
   );
 }
 
+function TransferProgress({ state, store }: { state: UploadState; store: TransferProgressStore }) {
+  const progress = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  return (
+    <>
+      <Progress
+        aria-label="上传进度"
+        value={state === "done" ? 100 : progress}
+        color={state === "failed" ? "danger" : "primary"}
+        size="sm"
+      />
+      <div className="mt-2 text-tiny text-zinc-500 dark:text-zinc-400">
+        {stateLabel(state, progress)}
+      </div>
+    </>
+  );
+}
+
 function Preview({ record, onPreview }: { record: UploadRecord; onPreview: (target: PreviewTarget) => void }) {
   return (
     <FilePreview
@@ -2207,6 +2227,7 @@ function Preview({ record, onPreview }: { record: UploadRecord; onPreview: (targ
       mimeType={record.attachment.mimeType}
       url={record.previewUrl}
       blob={record.file}
+      sizeBytes={record.attachment.sizeBytes}
       onPreview={onPreview}
     />
   );
@@ -2238,6 +2259,7 @@ function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClo
                 mimeType={target.mimeType}
                 url={target.url}
                 blob={target.blob}
+                sizeBytes={target.sizeBytes}
                 expanded
               />
             </ModalBody>
@@ -2253,6 +2275,7 @@ function FilePreview({
   mimeType,
   url,
   blob,
+  sizeBytes,
   compact = false,
   expanded = false,
   onPreview,
@@ -2261,11 +2284,13 @@ function FilePreview({
   mimeType?: string | null;
   url?: string | null;
   blob?: Blob | null;
+  sizeBytes?: number;
   compact?: boolean;
   expanded?: boolean;
   onPreview?: (target: PreviewTarget) => void;
 }) {
   const kind = mediaKind(fileName, mimeType);
+  const previewSizeBytes = sizeBytes ?? blob?.size ?? 0;
   const [previewFailed, setPreviewFailed] = useState(false);
   useEffect(() => {
     setPreviewFailed(false);
@@ -2279,7 +2304,7 @@ function FilePreview({
         variant="flat"
         className="h-8"
         aria-label={`放大预览 ${fileName}`}
-        onPress={() => onPreview?.({ fileName, mimeType, url, blob })}
+        onPress={() => onPreview?.({ fileName, mimeType, url, blob, sizeBytes: previewSizeBytes })}
       >
         {compact ? "放大" : "放大预览"}
       </Button>
@@ -2303,6 +2328,23 @@ function FilePreview({
     : compact
       ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded glass glass-border border p-3 text-center"
       : "flex h-64 flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center";
+
+  const deferHeavyPreview = !expanded
+    && Boolean(onPreview)
+    && previewSizeBytes > AUTO_PREVIEW_LIMIT_BYTES
+    && (kind === "image" || kind === "pdf");
+  if (deferHeavyPreview) {
+    return (
+      <>
+        <div className={fallbackClass}>
+          <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
+          <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
+          <div className="mt-1 text-tiny text-zinc-500">文件较大，已暂停自动预览以保持页面流畅</div>
+        </div>
+        {previewAction}
+      </>
+    );
+  }
 
   if (url && kind === "image" && !previewFailed) {
     return (
@@ -2584,6 +2626,26 @@ function createProgressReporter(onProgress: (value: number) => void, minInterval
       lastValue = nextValue;
       onProgress(nextValue);
     }
+  };
+}
+
+function createTransferProgressStore(): TransferProgressStore {
+  let value = 0;
+  const listeners = new Set<() => void>();
+  return {
+    getSnapshot: () => value,
+    set: (nextValue) => {
+      const normalized = Math.max(0, Math.min(100, Math.round(nextValue)));
+      if (normalized === value) {
+        return;
+      }
+      value = normalized;
+      listeners.forEach((listener) => listener());
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
   };
 }
 

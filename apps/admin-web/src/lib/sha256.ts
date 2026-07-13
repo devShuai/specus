@@ -20,23 +20,118 @@ const SHA256_INITIAL = new Uint32Array([
   0x5be0cd19,
 ]);
 
-export async function sha256Blob(blob: Blob): Promise<string> {
+const MAIN_THREAD_YIELD_BYTES = 2 * 1024 * 1024;
+
+export async function sha256Blob(blob: Blob, signal?: AbortSignal): Promise<string> {
+  throwIfAborted(signal);
+  if (typeof document !== "undefined" && typeof Worker !== "undefined") {
+    try {
+      return await sha256BlobInWorker(blob, signal);
+    } catch (error) {
+      if (signal?.aborted || isAbortError(error)) {
+        throw error;
+      }
+      // CSP or older embedded browsers can reject module workers. Keep a cooperative
+      // main-thread fallback so file transfer still works without freezing the page.
+    }
+  }
+  return sha256BlobOnCurrentThread(blob, signal);
+}
+
+export async function sha256BlobOnCurrentThread(blob: Blob, signal?: AbortSignal): Promise<string> {
   const hasher = new Sha256();
+  let bytesSinceYield = 0;
+  const shouldYield = typeof document !== "undefined";
   if (typeof blob.stream === "function") {
     const reader = blob.stream().getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+    try {
+      while (true) {
+        throwIfAborted(signal);
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value) {
+          hasher.update(value);
+          bytesSinceYield += value.byteLength;
+        }
+        if (shouldYield && bytesSinceYield >= MAIN_THREAD_YIELD_BYTES) {
+          bytesSinceYield = 0;
+          await yieldToMainThread();
+        }
       }
-      if (value) {
-        hasher.update(value);
+    } finally {
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => undefined);
       }
     }
   } else {
+    throwIfAborted(signal);
     hasher.update(new Uint8Array(await blob.arrayBuffer()));
   }
+  throwIfAborted(signal);
   return hasher.digestHex();
+}
+
+function sha256BlobInWorker(blob: Blob, signal?: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./sha256.worker.ts", import.meta.url), { type: "module" });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const cleanup = () => {
+      signal?.removeEventListener("abort", handleAbort);
+      worker.terminate();
+    };
+    const handleAbort = () => {
+      cleanup();
+      reject(createAbortError());
+    };
+    worker.onmessage = (event: MessageEvent<{ digest?: string; error?: string }>) => {
+      cleanup();
+      if (event.data.digest) {
+        resolve(event.data.digest);
+      } else {
+        reject(new Error(event.data.error || "文件校验失败"));
+      }
+    };
+    worker.onerror = (event) => {
+      cleanup();
+      reject(new Error(event.message || "文件校验线程启动失败"));
+    };
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    if (signal?.aborted) {
+      handleAbort();
+      return;
+    }
+    worker.postMessage(blob);
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+function createAbortError() {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException("文件校验已取消", "AbortError");
+  }
+  const error = new Error("文件校验已取消");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function yieldToMainThread() {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
 class Sha256 {
