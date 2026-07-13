@@ -18,6 +18,13 @@ import {
 import type { CellStyle, FitPlugin } from "@maxgraph/core";
 import * as Y from "yjs";
 import "@maxgraph/core/css/common.css";
+import {
+  publicCreateTransferDiagramVersion,
+  publicDeleteTransferDiagramVersion,
+  publicGetTransferDiagramVersion,
+  publicListTransferDiagramVersions,
+} from "../api/client";
+import type { PublicTransferDiagramVersion, PublicTransferRoomRole } from "../api/types";
 import type { WhiteboardInboundEvent } from "./SyncedWhiteboard";
 import {
   createDiagramDocument,
@@ -74,6 +81,9 @@ import { useTheme } from "../theme/ThemeContext";
 
 interface SyncedDiagramProps {
   boardKey: string;
+  roomId: string;
+  roomToken: string;
+  roomRole: PublicTransferRoomRole;
   peerId: string;
   peerCount: number;
   isConnected: boolean;
@@ -129,9 +139,12 @@ interface RemoteDiagramPresence {
 
 interface DiagramVersionSnapshot {
   id: string;
+  serverId?: number;
   name: string;
   createdAt: number;
-  update: Uint8Array;
+  update?: Uint8Array;
+  authorPeerId?: string;
+  sizeBytes?: number;
 }
 
 type DiagramCellStyle = CellStyle & {
@@ -198,6 +211,9 @@ const diagramStateCache = new Map<string, Uint8Array>();
 
 export function SyncedDiagram({
   boardKey,
+  roomId,
+  roomToken,
+  roomRole,
   peerId,
   peerCount,
   isConnected,
@@ -249,9 +265,13 @@ export function SyncedDiagram({
   const [remotePresences, setRemotePresences] = useState<Record<string, RemoteDiagramPresence>>({});
   const [comments, setComments] = useState<DiagramComment[]>([]);
   const [versions, setVersions] = useState<DiagramVersionSnapshot[]>([]);
-  const [isReadOnly, setIsReadOnly] = useState(false);
+  const [localReadOnly, setLocalReadOnly] = useState(false);
+  const [isVersionLoading, setIsVersionLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<DiagramContextMenu | null>(null);
   const [status, setStatus] = useState("专业流程图已就绪，从左侧插入节点后拖动蓝色端口连线。");
+  const usesServerVersions = Boolean(roomToken.trim());
+  const isRoleReadOnly = roomRole === "VIEWER";
+  const isReadOnly = isRoleReadOnly || localReadOnly;
 
   const refreshUndoState = useCallback(() => {
     const manager = undoManagerRef.current;
@@ -390,6 +410,28 @@ export function SyncedDiagram({
       }
     };
   }, [boardKey, refreshUndoState, scheduleDocumentRender, sendYUpdate]);
+
+  useEffect(() => {
+    if (!usesServerVersions) return;
+    let active = true;
+    setIsVersionLoading(true);
+    publicListTransferDiagramVersions(roomId, { roomToken, peerId })
+      .then((items) => {
+        if (!active) return;
+        const snapshots = items.slice().reverse().map(toDiagramVersionSnapshot);
+        versionsRef.current = snapshots;
+        setVersions(snapshots);
+      })
+      .catch((error) => {
+        if (active) setStatus(error instanceof Error ? error.message : "加载流程图版本失败");
+      })
+      .finally(() => {
+        if (active) setIsVersionLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [peerId, roomId, roomToken, usesServerVersions]);
 
   useEffect(() => {
     const container = graphContainerRef.current;
@@ -1802,25 +1844,46 @@ export function SyncedDiagram({
     }, comment.pageId === activePageId ? 0 : 60);
   }, [activePageId]);
 
-  const createVersion = useCallback(() => {
+  const createVersion = useCallback(async () => {
+    if (isRoleReadOnly) return;
     flushGraphRef.current();
     const document = yDocRef.current;
     if (!document) return;
     const createdAt = Date.now();
     const name = window.prompt("版本名称", `版本 ${versionsRef.current.length + 1}`)?.trim();
     if (!name) return;
-    const snapshot: DiagramVersionSnapshot = {
-      id: createDiagramId(peerId, "version"),
-      name: name.slice(0, 80),
-      createdAt,
-      update: Y.encodeStateAsUpdate(document),
-    };
-    versionsRef.current = [...versionsRef.current.slice(-19), snapshot];
-    setVersions(versionsRef.current);
-    setStatus(`已创建版本“${snapshot.name}”。`);
-  }, [peerId]);
+    const update = Y.encodeStateAsUpdate(document);
+    setIsVersionLoading(true);
+    try {
+      let snapshot: DiagramVersionSnapshot;
+      if (usesServerVersions) {
+        const created = await publicCreateTransferDiagramVersion(
+          roomId,
+          { roomToken, peerId },
+          name.slice(0, 80),
+          encodeDiagramUpdate(update),
+        );
+        snapshot = toDiagramVersionSnapshot(created);
+        versionsRef.current = [...versionsRef.current.slice(-49), snapshot];
+      } else {
+        snapshot = {
+          id: createDiagramId(peerId, "version"),
+          name: name.slice(0, 80),
+          createdAt,
+          update,
+        };
+        versionsRef.current = [...versionsRef.current.slice(-19), snapshot];
+      }
+      setVersions(versionsRef.current);
+      setStatus(`已创建版本“${snapshot.name}”。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "创建流程图版本失败");
+    } finally {
+      setIsVersionLoading(false);
+    }
+  }, [isRoleReadOnly, peerId, roomId, roomToken, usesServerVersions]);
 
-  const restoreVersion = useCallback((snapshot: DiagramVersionSnapshot) => {
+  const restoreVersion = useCallback(async (snapshot: DiagramVersionSnapshot) => {
     if (isReadOnly || !window.confirm(`恢复到“${snapshot.name}”会替换当前流程图，是否继续？`)) return;
     const document = yDocRef.current;
     const nodes = nodesMapRef.current;
@@ -1829,8 +1892,19 @@ export function SyncedDiagram({
     const commentsMap = commentsMapRef.current;
     if (!document || !nodes || !edges || !pageMap || !commentsMap) return;
     const probe = new Y.Doc();
+    setIsVersionLoading(true);
     try {
-      Y.applyUpdate(probe, snapshot.update);
+      let update = snapshot.update;
+      if (!update && snapshot.serverId !== undefined) {
+        const detail = await publicGetTransferDiagramVersion(
+          roomId,
+          snapshot.serverId,
+          { roomToken, peerId },
+        );
+        update = decodeDiagramUpdate(detail.update);
+      }
+      if (!update) throw new Error("版本数据不存在");
+      Y.applyUpdate(probe, update);
       const nextNodes = Array.from(probe.getMap<DiagramNode>(NODES_MAP).values());
       const nextEdges = Array.from(probe.getMap<DiagramEdge>(EDGES_MAP).values());
       const nextPages = Array.from(probe.getMap<DiagramPage>(PAGES_MAP).values());
@@ -1852,8 +1926,25 @@ export function SyncedDiagram({
       setStatus(error instanceof Error ? error.message : "版本恢复失败");
     } finally {
       probe.destroy();
+      setIsVersionLoading(false);
     }
-  }, [isReadOnly]);
+  }, [isReadOnly, peerId, roomId, roomToken]);
+
+  const deleteVersion = useCallback(async (snapshot: DiagramVersionSnapshot) => {
+    if (roomRole !== "OWNER" || snapshot.serverId === undefined) return;
+    if (!window.confirm(`删除版本“${snapshot.name}”后无法恢复，是否继续？`)) return;
+    setIsVersionLoading(true);
+    try {
+      await publicDeleteTransferDiagramVersion(roomId, snapshot.serverId, { roomToken, peerId });
+      versionsRef.current = versionsRef.current.filter((version) => version.id !== snapshot.id);
+      setVersions(versionsRef.current);
+      setStatus(`已删除版本“${snapshot.name}”。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "删除流程图版本失败");
+    } finally {
+      setIsVersionLoading(false);
+    }
+  }, [peerId, roomId, roomRole, roomToken]);
 
   const openContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -2018,13 +2109,13 @@ export function SyncedDiagram({
               <span className="mx-1 h-7 w-px shrink-0 bg-black/10 dark:bg-white/10" />
             </>
           ) : null}
-          <DiagramToolbarButton label={isReadOnly ? "只读预览" : "编辑模式"} onClick={() => {
-            setIsReadOnly((value) => !value);
+          <DiagramToolbarButton label={isRoleReadOnly ? "访客只读" : localReadOnly ? "只读预览" : "编辑模式"} disabled={isRoleReadOnly} onClick={() => {
+            setLocalReadOnly((value) => !value);
             setContextMenu(null);
             setStatus(isReadOnly ? "已恢复编辑模式。" : "已进入本地只读预览，协作更新仍会继续接收。");
           }} />
           <DiagramToolbarButton label="评论" disabled={isReadOnly} onClick={addComment} />
-          <DiagramToolbarButton label="创建版本" onClick={createVersion} />
+          <DiagramToolbarButton label={isVersionLoading ? "版本处理中" : "创建版本"} disabled={isRoleReadOnly || isVersionLoading} onClick={() => void createVersion()} />
           <span className="mx-1 h-7 w-px shrink-0 bg-black/10 dark:bg-white/10" />
           <DiagramToolbarButton label="撤销" shortcut="⌘Z" disabled={isReadOnly || !canUndo} onClick={() => {
             undoManagerRef.current?.undo();
@@ -2414,9 +2505,9 @@ export function SyncedDiagram({
             <div className="mt-5 border-t border-black/10 pt-4 dark:border-white/10">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-tiny font-semibold text-zinc-900 dark:text-zinc-100">版本 · {versions.length}</span>
-                <button type="button" className="rounded-md px-2 py-1 text-[10px] font-semibold text-cyan-700 hover:bg-cyan-50 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={createVersion}>+ 快照</button>
+                <button type="button" disabled={isRoleReadOnly || isVersionLoading} className="rounded-md px-2 py-1 text-[10px] font-semibold text-cyan-700 hover:bg-cyan-50 disabled:opacity-35 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => void createVersion()}>+ 快照</button>
               </div>
-              <p className="mt-1 text-[9px] leading-4 text-zinc-400">版本快照保存在本次浏览器会话，最多保留 20 个。</p>
+              <p className="mt-1 text-[9px] leading-4 text-zinc-400">{usesServerVersions ? "版本保存在房间服务端，最多保留 50 个。" : "版本快照保存在本次浏览器会话，最多保留 20 个。"}</p>
               <div className="mt-2 space-y-1.5">
                 {versions.slice().reverse().map((version) => (
                   <div key={version.id} className="flex items-center justify-between gap-2 rounded-md border border-black/10 p-2 dark:border-white/10">
@@ -2424,7 +2515,12 @@ export function SyncedDiagram({
                       <span className="block truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{version.name}</span>
                       <span className="block text-[9px] text-zinc-400">{new Date(version.createdAt).toLocaleString()}</span>
                     </span>
-                    <button type="button" disabled={isReadOnly} className="shrink-0 rounded px-1.5 py-1 text-[9px] text-cyan-700 hover:bg-cyan-50 disabled:opacity-35 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => restoreVersion(version)}>恢复</button>
+                    <span className="flex shrink-0 gap-1">
+                      <button type="button" disabled={isReadOnly || isVersionLoading} className="rounded px-1.5 py-1 text-[9px] text-cyan-700 hover:bg-cyan-50 disabled:opacity-35 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => void restoreVersion(version)}>恢复</button>
+                      {roomRole === "OWNER" && version.serverId !== undefined ? (
+                        <button type="button" disabled={isVersionLoading} className="rounded px-1.5 py-1 text-[9px] text-red-500 hover:bg-red-50 disabled:opacity-35 dark:text-red-300 dark:hover:bg-red-400/10" onClick={() => void deleteVersion(version)}>删除</button>
+                      ) : null}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -2525,6 +2621,18 @@ function readGraphDocument(graph: Graph, pageId = DEFAULT_PAGE_ID): Pick<Diagram
     }];
   });
   return { nodes, edges };
+}
+
+function toDiagramVersionSnapshot(version: PublicTransferDiagramVersion): DiagramVersionSnapshot {
+  const parsedCreatedAt = Date.parse(version.createdAt);
+  return {
+    id: `server-${version.id}`,
+    serverId: version.id,
+    name: version.name,
+    createdAt: Number.isFinite(parsedCreatedAt) ? parsedCreatedAt : Date.now(),
+    authorPeerId: version.authorPeerId,
+    sizeBytes: version.sizeBytes,
+  };
 }
 
 function replaceYMapForPage<T extends { id: string; pageId?: string }>(map: Y.Map<T>, values: T[], pageId: string) {

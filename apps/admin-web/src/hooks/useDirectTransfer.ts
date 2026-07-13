@@ -107,6 +107,7 @@ interface UseDirectTransferOptions {
   preconnectPeerChannels?: boolean;
   receivingTransferLimit?: number;
   sendSignal: (targetPeerId: string, payload: DirectTransferSignalPayload) => void;
+  canReceiveFromPeer?: (sourcePeerId: string, messageType: "file" | "clipboard" | "whiteboard" | string) => boolean;
   onPeerMessage?: (sourcePeerId: string, message: DirectPeerMessage) => void;
   onIncoming: (item: DirectIncomingAttachment) => void;
   onPreviewUrl: (url: string) => void;
@@ -501,6 +502,9 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       return;
     }
     if (message.kind === "app-message" && typeof message.messageType === "string") {
+      if (optionsRef.current.canReceiveFromPeer?.(sourcePeerId, message.messageType) === false) {
+        return;
+      }
       optionsRef.current.onPeerMessage?.(sourcePeerId, {
         messageType: message.messageType,
         payload: message.payload,
@@ -508,6 +512,10 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       return;
     }
     if (message.kind === "file-meta" && message.transferId) {
+      if (optionsRef.current.canReceiveFromPeer?.(sourcePeerId, "file") === false) {
+        sendDirectReject(channel, message.transferId, "对方在当前房间没有发送权限");
+        return;
+      }
       const sizeBytes = Number(message.sizeBytes || 0);
       if (!Number.isFinite(sizeBytes) || sizeBytes < 0) {
         sendDirectReject(channel, message.transferId, "文件大小无效");

@@ -464,6 +464,39 @@ export interface DatabaseInitResult {
   clients: number;
 }
 
+export type PublicTransferRoomRole = "OWNER" | "EDITOR" | "VIEWER";
+
+export interface PublicTransferRoomCredential {
+  roomToken: string;
+  peerId: string;
+}
+
+export interface PublicTransferRoomAccessToken {
+  id: number;
+  role: Exclude<PublicTransferRoomRole, "OWNER">;
+  label: string;
+  createdAt: string;
+  revokedAt: string | null;
+}
+
+export interface PublicTransferCreatedAccessToken {
+  access: PublicTransferRoomAccessToken;
+  token: string;
+}
+
+export interface PublicTransferDiagramVersion {
+  id: number;
+  name: string;
+  authorPeerId: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
+export interface PublicTransferDiagramVersionDetail {
+  version: PublicTransferDiagramVersion;
+  update: string;
+}
+
 export type ManagementRole = "ADMIN" | "USER";
 
 export interface ManagementUser {

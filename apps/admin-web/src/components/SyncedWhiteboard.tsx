@@ -21,6 +21,7 @@ import {
 import { formatBytes } from "../lib/format";
 import { isDiagramPayload } from "../lib/diagramDocument";
 import type { DiagramPayload } from "../lib/diagramDocument";
+import type { PublicTransferRoomRole } from "../api/types";
 
 const SyncedDiagram = lazy(async () => {
   const module = await import("./SyncedDiagram");
@@ -138,6 +139,9 @@ export interface WhiteboardInboundEvent {
 
 interface SyncedWhiteboardProps {
   boardKey: string;
+  roomId: string;
+  roomToken: string;
+  roomRole: PublicTransferRoomRole;
   peerId: string;
   peerCount: number;
   isConnected: boolean;
@@ -264,6 +268,9 @@ const DARK_BOARD_THEME: WhiteboardRenderTheme = {
 
 export function SyncedWhiteboard({
   boardKey,
+  roomId,
+  roomToken,
+  roomRole,
   peerId,
   peerCount,
   isConnected,
@@ -308,6 +315,7 @@ export function SyncedWhiteboard({
   const [isStatusPanelCollapsed, setIsStatusPanelCollapsed] = useState(false);
   const [isImportingImage, setIsImportingImage] = useState(false);
   const [isImportingDocument, setIsImportingDocument] = useState(false);
+  const isReadOnly = roomRole === "VIEWER";
   const [boardMessage, setBoardMessage] = useState("画笔已就绪，可直接在画布上绘制。");
 
   const activeColor = selectedTool === "eraser" ? ERASER_COLOR : selectedColor;
@@ -711,6 +719,7 @@ export function SyncedWhiteboard({
   }, [flowLabelDraft, sendObject, updateObjects]);
 
   const insertFlowNode = useCallback((nodeKind: WhiteboardFlowNodeKind, text: string) => {
+    if (isReadOnly) return;
     const visibleCenter = getVisibleCanvasCenter();
     const flowNodeCount = objectsRef.current.filter((object) => object.kind === "flow-node").length;
     const offset = (flowNodeCount % 5) * 0.018;
@@ -729,9 +738,10 @@ export function SyncedWhiteboard({
     setFlowLabelDraft({ objectId: object.objectId, text: object.text });
     setSelectedTool("select");
     setBoardMessage("流程节点已插入，输入名称后按 Enter 保存。");
-  }, [getVisibleCanvasCenter, peerId, selectObject, selectedColor, selectedWidth, sendObject, updateObjects]);
+  }, [getVisibleCanvasCenter, isReadOnly, peerId, selectObject, selectedColor, selectedWidth, sendObject, updateObjects]);
 
   const insertFlowTemplate = useCallback(() => {
+    if (isReadOnly) return;
     const flowObjects = createFlowchartTemplate(
       peerId,
       getVisibleCanvasCenter(),
@@ -745,9 +755,10 @@ export function SyncedWhiteboard({
     selectObject(flowObjects[0]?.objectId ?? null);
     setSelectedTool("select");
     setBoardMessage("基础流程已插入，节点和连接线已同步，可逐个编辑文字。");
-  }, [getVisibleCanvasCenter, peerId, selectObject, selectedColor, selectedWidth, sendObject, updateObjects]);
+  }, [getVisibleCanvasCenter, isReadOnly, peerId, selectObject, selectedColor, selectedWidth, sendObject, updateObjects]);
 
   const removeObject = useCallback((objectId: string) => {
+    if (isReadOnly) return;
     updateObjects((current) => current.filter((object) => object.objectId !== objectId));
     setFlowLabelDraft((current) => current?.objectId === objectId ? null : current);
     if (selectedObjectIdRef.current === objectId) {
@@ -759,7 +770,7 @@ export function SyncedWhiteboard({
       objectId,
       createdAt: Date.now(),
     });
-  }, [onSend, selectObject, updateObjects]);
+  }, [isReadOnly, onSend, selectObject, updateObjects]);
 
   const startStroke = useCallback((
     event: React.PointerEvent<HTMLCanvasElement>,
@@ -852,6 +863,7 @@ export function SyncedWhiteboard({
   }, [updateObjects]);
 
   const handlePointerDown = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (isReadOnly) return;
     if (event.button !== 0 && event.pointerType === "mouse") {
       return;
     }
@@ -924,7 +936,7 @@ export function SyncedWhiteboard({
     }
     selectObject(null);
     startStroke(event, point);
-  }, [peerId, removeObject, selectObject, selectedColor, selectedTool, selectedWidth, startStroke, updateObjects]);
+  }, [isReadOnly, peerId, removeObject, selectObject, selectedColor, selectedTool, selectedWidth, startStroke, updateObjects]);
 
   const handlePointerMove = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
     const pan = canvasPanRef.current;
@@ -1025,6 +1037,7 @@ export function SyncedWhiteboard({
   }, [selectObject]);
 
   const handleCanvasDoubleClick = useCallback((event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (isReadOnly) return;
     const point = pointFromMouseEvent(event);
     if (!point) {
       return;
@@ -1037,7 +1050,7 @@ export function SyncedWhiteboard({
       event.preventDefault();
       startTextEdit(object.objectId);
     }
-  }, [startFlowNodeEdit, startTextEdit]);
+  }, [isReadOnly, startFlowNodeEdit, startTextEdit]);
 
   const commitTextDraft = useCallback(() => {
     if (!textDraft) {
@@ -1156,7 +1169,7 @@ export function SyncedWhiteboard({
   const handleImageInput = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
-    if (file) {
+    if (file && !isReadOnly) {
       void importImage(file);
     }
   };
@@ -1272,12 +1285,13 @@ export function SyncedWhiteboard({
   const handleDocumentInput = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
-    if (file) {
+    if (file && !isReadOnly) {
       void importBoardDocument(file);
     }
   };
 
   const handleBoardPaste = (event: React.ClipboardEvent<HTMLElement>) => {
+    if (isReadOnly) return;
     if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement) {
       return;
     }
@@ -1293,6 +1307,7 @@ export function SyncedWhiteboard({
   };
 
   const handleImageDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    if (isReadOnly) return;
     const file = Array.from(event.dataTransfer.files).find((item) => item.type.startsWith("image/"));
     if (!file) {
       return;
@@ -1303,6 +1318,7 @@ export function SyncedWhiteboard({
   };
 
   const clearBoard = () => {
+    if (isReadOnly) return;
     updateStrokes(() => []);
     updateObjects(() => []);
     selectObject(null);
@@ -1316,6 +1332,7 @@ export function SyncedWhiteboard({
   };
 
   const undoLastLocalElement = () => {
+    if (isReadOnly) return;
     const lastStroke = [...strokesRef.current].reverse().find((stroke) => stroke.sourcePeerId === peerId);
     const lastObject = [...objectsRef.current].reverse().find((object) => object.sourcePeerId === peerId);
     if (!lastStroke && !lastObject) {
@@ -1339,6 +1356,7 @@ export function SyncedWhiteboard({
   };
 
   const handleCanvasKeyDown = (event: React.KeyboardEvent<HTMLCanvasElement>) => {
+    if (isReadOnly) return;
     if ((event.key === "Delete" || event.key === "Backspace") && selectedObjectIdRef.current) {
       event.preventDefault();
       removeObject(selectedObjectIdRef.current);
@@ -1389,6 +1407,9 @@ export function SyncedWhiteboard({
       <Suspense fallback={<DiagramLoadingState onBack={() => setWorkspaceMode("whiteboard")} />}>
         <SyncedDiagram
           boardKey={boardKey}
+          roomId={roomId}
+          roomToken={roomToken}
+          roomRole={roomRole}
           peerId={peerId}
           peerCount={peerCount}
           isConnected={isConnected}
@@ -1412,12 +1433,13 @@ export function SyncedWhiteboard({
       aria-hidden={!isActive}
       onPaste={handleBoardPaste}
     >
-      <input ref={imageInputRef} type="file" accept="image/*" hidden onChange={handleImageInput} />
+      <input ref={imageInputRef} type="file" accept="image/*" hidden disabled={isReadOnly} onChange={handleImageInput} />
       <input
         ref={documentInputRef}
         type="file"
         accept=".stwb,.json,application/json,application/vnd.shuai-tunnel.whiteboard,application/vnd.shuai-tunnel.whiteboard+json"
         hidden
+        disabled={isReadOnly}
         onChange={handleDocumentInput}
       />
       {!isExpanded ? <div className="flex shrink-0 flex-wrap items-start justify-between gap-3">
@@ -1442,6 +1464,7 @@ export function SyncedWhiteboard({
             <Chip size="sm" radius="sm" variant="flat">
               {totalPeers} 台 · {boardCountLabel}
             </Chip>
+            {isReadOnly ? <Chip size="sm" radius="sm" variant="flat" color="warning">访客只读</Chip> : null}
           </div>
           <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
             可滚动画布支持文本、图片、图形和流程图，可导入导出可编辑白板文件。
@@ -1627,8 +1650,9 @@ export function SyncedWhiteboard({
           >
             <canvas
               ref={canvasRef}
-              className={"block h-full w-full touch-none bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 " + cursorClass}
+              className={"block h-full w-full bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 " + (isReadOnly ? "pointer-events-none " : "touch-none ") + cursorClass}
               aria-label="同步白板画布"
+              aria-readonly={isReadOnly}
               tabIndex={0}
               onKeyDown={handleCanvasKeyDown}
               onDoubleClick={handleCanvasDoubleClick}

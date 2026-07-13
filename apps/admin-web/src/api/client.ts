@@ -35,6 +35,12 @@ import type {
   PeerMeshSession,
   PeerMeshStatus,
   PublicTransferIceConfig,
+  PublicTransferCreatedAccessToken,
+  PublicTransferDiagramVersion,
+  PublicTransferDiagramVersionDetail,
+  PublicTransferRoomAccessToken,
+  PublicTransferRoomCredential,
+  PublicTransferRoomRole,
   PublicPeerStunConfig,
   ResourceTrafficType,
   ResourceTrafficUsage,
@@ -481,4 +487,64 @@ export function publicPresignAttachmentDownload(
     `/api/public/transfer/attachments/${attachmentId}/presign-download`,
     body,
   );
+}
+
+function publicTransferRoomPath(suffix: string): string {
+  return `/api/public/transfer/rooms/${suffix}`;
+}
+
+export function publicListTransferRoomAccessTokens(
+  roomId: string,
+  credential: PublicTransferRoomCredential,
+): Promise<PublicTransferRoomAccessToken[]> {
+  return publicJsonRequest(publicTransferRoomPath("access-tokens/list"), { roomId, ...credential });
+}
+
+export function publicCreateTransferRoomAccessToken(
+  roomId: string,
+  credential: PublicTransferRoomCredential,
+  role: Exclude<PublicTransferRoomRole, "OWNER">,
+  label: string,
+): Promise<PublicTransferCreatedAccessToken> {
+  return publicJsonRequest(publicTransferRoomPath("access-tokens"), { roomId, ...credential, role, label });
+}
+
+export function publicRevokeTransferRoomAccessToken(
+  roomId: string,
+  accessId: number,
+  credential: PublicTransferRoomCredential,
+): Promise<PublicTransferRoomAccessToken> {
+  return publicJsonRequest(publicTransferRoomPath(`access-tokens/${accessId}/revoke`), { roomId, ...credential });
+}
+
+export function publicListTransferDiagramVersions(
+  roomId: string,
+  credential: PublicTransferRoomCredential,
+): Promise<PublicTransferDiagramVersion[]> {
+  return publicJsonRequest(publicTransferRoomPath("diagram/versions/list"), { roomId, ...credential });
+}
+
+export function publicCreateTransferDiagramVersion(
+  roomId: string,
+  credential: PublicTransferRoomCredential,
+  name: string,
+  update: string,
+): Promise<PublicTransferDiagramVersion> {
+  return publicJsonRequest(publicTransferRoomPath("diagram/versions"), { roomId, ...credential, name, update });
+}
+
+export function publicGetTransferDiagramVersion(
+  roomId: string,
+  versionId: number,
+  credential: PublicTransferRoomCredential,
+): Promise<PublicTransferDiagramVersionDetail> {
+  return publicJsonRequest(publicTransferRoomPath(`diagram/versions/${versionId}`), { roomId, ...credential });
+}
+
+export function publicDeleteTransferDiagramVersion(
+  roomId: string,
+  versionId: number,
+  credential: PublicTransferRoomCredential,
+): Promise<null> {
+  return publicJsonRequest(publicTransferRoomPath(`diagram/versions/${versionId}/delete`), { roomId, ...credential });
 }

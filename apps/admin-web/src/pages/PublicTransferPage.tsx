@@ -14,11 +14,21 @@ import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhite
 import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
 import {
   fetchPublicTransferIceConfig,
+  publicCreateTransferRoomAccessToken,
   publicCompleteAttachment,
+  publicListTransferRoomAccessTokens,
   publicPresignAttachmentDownload,
   publicPresignAttachmentUpload,
+  publicRevokeTransferRoomAccessToken,
 } from "../api/client";
-import type { AttachmentPresignUploadResponse, PublicTransferIceConfig, TransferAttachment } from "../api/types";
+import type {
+  AttachmentPresignUploadResponse,
+  PublicTransferCreatedAccessToken,
+  PublicTransferIceConfig,
+  PublicTransferRoomAccessToken,
+  PublicTransferRoomRole,
+  TransferAttachment,
+} from "../api/types";
 import { usePageSeo } from "../lib/seo";
 import { createQrMatrix } from "../lib/qr";
 import { sha256Blob } from "../lib/sha256";
@@ -67,6 +77,7 @@ interface DiscoveryPeer {
   displayName: string;
   publicAddress: string;
   connectedAt: string;
+  roomRole?: PublicTransferRoomRole;
 }
 
 interface IncomingAttachment {
@@ -145,6 +156,7 @@ function PublicTransferPageContent() {
   const whiteboardSendQueuesRef = useRef<Map<string, Promise<void>>>(new Map());
   const whiteboardTransportRetryRef = useRef<Map<string, WhiteboardTransportRetryState>>(new Map());
   const currentRoomPeerIdsRef = useRef<Set<string>>(new Set());
+  const currentRoomPeerRolesRef = useRef<Map<string, PublicTransferRoomRole>>(new Map());
   const roomEpochRef = useRef(0);
   const roomGenerationRef = useRef(0);
   const [peerId] = useState(() => loadOrCreatePeerId());
@@ -154,6 +166,10 @@ function PublicTransferPageContent() {
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
   const [roomIdDraft, setRoomIdDraft] = useState(roomId);
   const [roomTokenDraft, setRoomTokenDraft] = useState(roomToken);
+  const [roomRole, setRoomRole] = useState<PublicTransferRoomRole | null>(null);
+  const [roomAccessTokens, setRoomAccessTokens] = useState<PublicTransferRoomAccessToken[]>([]);
+  const [createdRoomAccess, setCreatedRoomAccess] = useState<PublicTransferCreatedAccessToken | null>(null);
+  const [roomAccessLoading, setRoomAccessLoading] = useState(false);
   const [roomSettingsErrors, setRoomSettingsErrors] = useState<TransferRoomSettingsErrors>({});
   const [receiveConfirmationRequired, setReceiveConfirmationRequired] = useState(() => loadReceiveConfirmationRequired());
   const [qrVisible, setQrVisible] = useState(false);
@@ -182,6 +198,8 @@ function PublicTransferPageContent() {
     canonical: "https://tunnel.devshuai.com/#/transfer",
   });
   const isInternetMode = networkMode === "internet";
+  const effectiveRoomRole: PublicTransferRoomRole = isInternetMode ? roomRole ?? "VIEWER" : "EDITOR";
+  const isRoomReadOnly = isInternetMode && effectiveRoomRole === "VIEWER";
   const transferRoomScopeKey = `${networkMode}:${normalizeRoomId(roomId)}:${isInternetMode ? roomToken.trim() : "lan"}:${roomGeneration}`;
 
   const isFileTransferTaskCurrent = (task: FileTransferTask) => uploadInFlightRef.current === task
@@ -242,7 +260,10 @@ function PublicTransferPageContent() {
   }, []);
 
   const pushWhiteboardEvent = useCallback((sourcePeerId: string, payload: WhiteboardPayload) => {
-    if (!sourcePeerId || sourcePeerId === peerId || !currentRoomPeerIdsRef.current.has(sourcePeerId)) {
+    if (!sourcePeerId
+      || sourcePeerId === peerId
+      || !currentRoomPeerIdsRef.current.has(sourcePeerId)
+      || currentRoomPeerRolesRef.current.get(sourcePeerId) === "VIEWER") {
       return;
     }
     const eventId = whiteboardEventKey(sourcePeerId, payload);
@@ -258,7 +279,10 @@ function PublicTransferPageContent() {
   }, [peerId]);
 
   const pushClipboardEvent = useCallback((sourcePeerId: string, payload: ClipboardSyncPayload) => {
-    if (!sourcePeerId || sourcePeerId === peerId || !currentRoomPeerIdsRef.current.has(sourcePeerId)) {
+    if (!sourcePeerId
+      || sourcePeerId === peerId
+      || !currentRoomPeerIdsRef.current.has(sourcePeerId)
+      || currentRoomPeerRolesRef.current.get(sourcePeerId) === "VIEWER") {
       return;
     }
     const receivedAt = Date.now();
@@ -331,6 +355,7 @@ function PublicTransferPageContent() {
     receiveConfirmationRequired,
     preconnectPeerChannels: true,
     sendSignal: sendDiscoverySignal,
+    canReceiveFromPeer: (sourcePeerId) => currentRoomPeerRolesRef.current.get(sourcePeerId) !== "VIEWER",
     onPeerMessage: (sourcePeerId, message) => {
       if (message.messageType === "whiteboard" && isWhiteboardPayload(message.payload)) {
         pushWhiteboardEvent(sourcePeerId, message.payload);
@@ -416,6 +441,7 @@ function PublicTransferPageContent() {
     let heartbeatTimer: number | null = null;
     let reconnectAttempt = 0;
     let lastPongAt = Date.now();
+    setRoomRole(isInternetMode ? null : "EDITOR");
 
     const clearHeartbeat = () => {
       if (heartbeatTimer !== null) {
@@ -449,21 +475,28 @@ function PublicTransferPageContent() {
           sourcePeerId?: string;
           targetPeerId?: string;
           peers?: DiscoveryPeer[];
+          roomRole?: PublicTransferRoomRole;
           payload?: unknown;
         };
         if (message.type === "pong") {
           lastPongAt = Date.now();
+        } else if (message.type === "hello" && message.roomRole) {
+          setRoomRole(message.roomRole);
         } else if (message.type === "error" && message.error) {
           setError(message.error);
         } else if (message.type === "roster" && Array.isArray(message.peers)) {
           const visiblePeers = message.peers.filter((peer) => peer.peerId !== peerId);
           currentRoomPeerIdsRef.current = new Set(visiblePeers.map((peer) => peer.peerId));
+          currentRoomPeerRolesRef.current = new Map(
+            visiblePeers.flatMap((peer) => peer.roomRole ? [[peer.peerId, peer.roomRole] as const] : []),
+          );
           setPeers(visiblePeers);
           setSelectedPeerId((current) => current && visiblePeers.some((peer) => peer.peerId === current) ? current : visiblePeers[0]?.peerId ?? "");
         } else if (message.type === "attachment"
           && message.sourcePeerId
           && message.targetPeerId === peerId
-          && currentRoomPeerIdsRef.current.has(message.sourcePeerId)) {
+          && currentRoomPeerIdsRef.current.has(message.sourcePeerId)
+          && currentRoomPeerRolesRef.current.get(message.sourcePeerId) !== "VIEWER") {
           const attachmentPayload = message.payload;
           if (isAttachmentDiscoveryPayload(attachmentPayload)) {
             setIncoming((items) => limitIncomingItems([
@@ -558,6 +591,29 @@ function PublicTransferPageContent() {
   }, [handleSignal, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
 
   useEffect(() => {
+    if (!isInternetMode || roomRole !== "OWNER") {
+      setRoomAccessTokens([]);
+      setCreatedRoomAccess(null);
+      return;
+    }
+    let active = true;
+    setRoomAccessLoading(true);
+    publicListTransferRoomAccessTokens(roomId, { roomToken, peerId })
+      .then((items) => {
+        if (active) setRoomAccessTokens(items);
+      })
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : "加载房间邀请失败");
+      })
+      .finally(() => {
+        if (active) setRoomAccessLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isInternetMode, peerId, roomId, roomRole, roomToken]);
+
+  useEffect(() => {
     return () => {
       if (record?.previewUrl) {
         URL.revokeObjectURL(record.previewUrl);
@@ -639,6 +695,7 @@ function PublicTransferPageContent() {
       socket.close();
     }
     currentRoomPeerIdsRef.current.clear();
+    currentRoomPeerRolesRef.current.clear();
     clipboardSeenEventsRef.current.clear();
     clipboardHighestSequencesRef.current.clear();
     whiteboardSendQueuesRef.current.clear();
@@ -791,6 +848,56 @@ function PublicTransferPageContent() {
       ? "二维码已生成，扫码加入外网 Token 房间"
       : "二维码已生成，请使用同一内网设备扫码");
     setError(null);
+  };
+
+  const createRoomAccess = async (role: "EDITOR" | "VIEWER") => {
+    const defaultLabel = role === "EDITOR" ? "编辑者邀请" : "只读访客邀请";
+    const label = window.prompt("邀请名称", defaultLabel)?.trim();
+    if (!label) return;
+    setRoomAccessLoading(true);
+    try {
+      const created = await publicCreateTransferRoomAccessToken(
+        roomId,
+        { roomToken, peerId },
+        role,
+        label,
+      );
+      setCreatedRoomAccess(created);
+      setRoomAccessTokens((items) => [created.access, ...items]);
+      setNotice(`已创建${role === "EDITOR" ? "编辑者" : "只读访客"}邀请，请立即复制链接。`);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "创建房间邀请失败");
+    } finally {
+      setRoomAccessLoading(false);
+    }
+  };
+
+  const revokeRoomAccess = async (access: PublicTransferRoomAccessToken) => {
+    if (!window.confirm(`撤销“${access.label}”后，该邀请将在下次连接时失效，是否继续？`)) return;
+    setRoomAccessLoading(true);
+    try {
+      const revoked = await publicRevokeTransferRoomAccessToken(roomId, access.id, { roomToken, peerId });
+      setRoomAccessTokens((items) => items.map((item) => item.id === revoked.id ? revoked : item));
+      if (createdRoomAccess?.access.id === revoked.id) setCreatedRoomAccess(null);
+      setNotice("邀请已撤销");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "撤销房间邀请失败");
+    } finally {
+      setRoomAccessLoading(false);
+    }
+  };
+
+  const copyCreatedRoomAccessLink = async () => {
+    if (!createdRoomAccess) return;
+    try {
+      await copyText(roomShareUrl(roomId, createdRoomAccess.token, "internet"));
+      setNotice("邀请链接已复制");
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "复制邀请链接失败");
+    }
   };
 
   const shareRecordFile = async () => {
@@ -953,6 +1060,10 @@ function PublicTransferPageContent() {
   };
 
   const acceptFiles = (files: File[]) => {
+    if (isRoomReadOnly) {
+      setError("当前为只读访客，不能向房间发送文件");
+      return;
+    }
     if (files.length === 0) {
       return;
     }
@@ -991,6 +1102,10 @@ function PublicTransferPageContent() {
   };
 
   const openFilePicker = () => {
+    if (isRoomReadOnly) {
+      setError("当前为只读访客，不能向房间发送文件");
+      return;
+    }
     if (uploadInFlightRef.current || isTransferBusy) {
       setError("当前文件仍在发送，请稍后再添加");
       return;
@@ -1258,6 +1373,7 @@ function PublicTransferPageContent() {
   }, []);
 
   const sendWhiteboardPayload = useCallback((payload: WhiteboardPayload) => {
+    if (isRoomReadOnly) return;
     if (peers.length === 0) {
       return;
     }
@@ -1338,7 +1454,7 @@ function PublicTransferPageContent() {
         }
       });
     }
-  }, [isPeerMessageTransportReady, networkMode, peers, publishWhiteboardEnvelope, sendPeerMessage]);
+  }, [isPeerMessageTransportReady, isRoomReadOnly, networkMode, peers, publishWhiteboardEnvelope, sendPeerMessage]);
 
   const publishClipboardEnvelope = useCallback((targetPeerId: string, serializedEnvelope: string, expectedRoomEpoch: number) => {
     const socket = discoverySocketRef.current;
@@ -1354,6 +1470,9 @@ function PublicTransferPageContent() {
   }, []);
 
   const sendClipboardPayload = useCallback(async (payload: ClipboardSyncPayload) => {
+    if (isRoomReadOnly) {
+      throw new Error("当前为只读访客，不能同步剪贴板");
+    }
     const target = peers.find((peer) => peer.peerId === selectedPeerId);
     if (!target) {
       throw new Error("请选择一台在线设备后再同步剪贴板");
@@ -1378,7 +1497,7 @@ function PublicTransferPageContent() {
     if (!publishClipboardEnvelope(target.peerId, serializedEnvelope, sendRoomEpoch)) {
       throw new Error("互传通道暂时不可用，请确认对方仍在线");
     }
-  }, [networkMode, peers, publishClipboardEnvelope, selectedPeerId, sendPeerMessage]);
+  }, [isRoomReadOnly, networkMode, peers, publishClipboardEnvelope, selectedPeerId, sendPeerMessage]);
 
   const selectTransferTool = useCallback((mode: TransferToolMode, focusContent = false) => {
     setActiveTool(mode);
@@ -1448,6 +1567,11 @@ function PublicTransferPageContent() {
             <div className="min-w-0">
               <div className="text-small font-semibold text-cyan-950 dark:text-cyan-100">
                 {isInternetMode ? "邀请外网设备加入" : "连接同一内网设备"}
+              </div>
+              <div className="mt-1">
+                <Chip size="sm" radius="sm" variant="flat" color={effectiveRoomRole === "OWNER" ? "primary" : effectiveRoomRole === "EDITOR" ? "success" : "default"}>
+                  {effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读访客"}
+                </Chip>
               </div>
               <div className="mt-1 text-tiny leading-5 text-cyan-800/80 dark:text-cyan-100/70">
                 {isInternetMode
@@ -1530,6 +1654,39 @@ function PublicTransferPageContent() {
                 </Button>
               </div>
             </div>
+            {isInternetMode && roomRole === "OWNER" ? (
+              <div className="mt-3 rounded-lg border border-violet-500/20 bg-violet-50/60 p-3 dark:border-violet-300/20 dark:bg-violet-400/10">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-small font-medium text-zinc-900 dark:text-white">角色邀请</div>
+                    <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">邀请 Token 仅保存哈希；明文链接只在创建时显示。</div>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("EDITOR")}>邀请编辑者</Button>
+                    <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("VIEWER")}>邀请访客</Button>
+                  </div>
+                </div>
+                {createdRoomAccess ? (
+                  <div className="mt-3 flex flex-col gap-2 rounded-md border border-amber-500/25 bg-amber-50/80 p-2.5 dark:border-amber-300/20 dark:bg-amber-300/10 sm:flex-row sm:items-center sm:justify-between">
+                    <span className="min-w-0 text-tiny text-amber-900 dark:text-amber-100">{createdRoomAccess.access.label} · 明文 Token 离开页面后无法再次查看</span>
+                    <Button size="sm" radius="sm" color="warning" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制邀请链接</Button>
+                  </div>
+                ) : null}
+                <div className="mt-3 space-y-1.5">
+                  {roomAccessTokens.length === 0 ? (
+                    <div className="text-tiny text-zinc-400">{roomAccessLoading ? "正在加载邀请…" : "暂无角色邀请"}</div>
+                  ) : roomAccessTokens.map((access) => (
+                    <div key={access.id} className="flex items-center justify-between gap-2 rounded-md border border-black/10 bg-white/60 px-2.5 py-2 dark:border-white/10 dark:bg-black/10">
+                      <div className="min-w-0">
+                        <div className="truncate text-tiny font-medium text-zinc-800 dark:text-zinc-200">{access.label}</div>
+                        <div className="mt-0.5 text-[10px] text-zinc-400">{access.role === "EDITOR" ? "可编辑" : "只读"} · {access.revokedAt ? "已撤销" : new Date(access.createdAt).toLocaleString()}</div>
+                      </div>
+                      <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>{access.revokedAt ? "已撤销" : "撤销"}</Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <div className="mt-3 rounded-lg glass glass-border border p-3">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
@@ -1612,6 +1769,7 @@ function PublicTransferPageContent() {
               type="file"
               multiple
               hidden
+              disabled={isRoomReadOnly}
               tabIndex={-1}
               onChange={handleFileInputChange}
             />
@@ -1621,7 +1779,8 @@ function PublicTransferPageContent() {
               aria-label="粘贴文件、拖到这里，或点击选择；选择后立即发送"
               aria-describedby="public-transfer-file-dropzone-detail"
               aria-busy={isTransferBusy}
-              aria-disabled={isTransferBusy}
+              aria-disabled={isTransferBusy || isRoomReadOnly}
+              disabled={isRoomReadOnly}
               onClick={openFilePicker}
               onDragEnter={handleFileDragEnter}
               onDragOver={handleFileDragOver}
@@ -1685,12 +1844,12 @@ function PublicTransferPageContent() {
             syncKey={transferRoomScopeKey}
             isActive={activeTool === "clipboard"}
             focusRequest={clipboardFocusRequest}
-            isEnabled={clipboardSyncEnabled}
+            isEnabled={clipboardSyncEnabled && !isRoomReadOnly}
             peerCount={peers.length}
             targetPeerId={selectedPeer?.peerId ?? ""}
             targetPeerLabel={selectedPeer?.displayName || selectedPeer?.peerId || ""}
             events={clipboardEvents}
-            onEnabledChange={setClipboardSyncEnabled}
+            onEnabledChange={(enabled) => setClipboardSyncEnabled(isRoomReadOnly ? false : enabled)}
             onSend={sendClipboardPayload}
           />
 
@@ -1702,6 +1861,9 @@ function PublicTransferPageContent() {
           >
             <SyncedWhiteboard
               boardKey={transferRoomScopeKey}
+              roomId={roomId}
+              roomToken={isInternetMode ? roomToken : ""}
+              roomRole={effectiveRoomRole}
               peerId={peerId}
               peerCount={peers.length}
               isConnected={peers.length > 0}
