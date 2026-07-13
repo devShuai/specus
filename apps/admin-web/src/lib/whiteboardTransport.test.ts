@@ -1,67 +1,63 @@
-import { describe, expect, it } from "vitest";
-import type { WhiteboardPayload } from "../components/SyncedWhiteboard";
-import { shouldPreferWhiteboardRelay } from "./whiteboardTransport";
+import { describe, expect, it, vi } from "vitest";
+import { sendWhiteboardWithFallback, WHITEBOARD_TRANSPORT_ORDER } from "./whiteboardTransport";
 
-describe("shouldPreferWhiteboardRelay", () => {
-  it("uses the reliable relay for durable object mutations", () => {
-    const payloads: WhiteboardPayload[] = [
-      {
-        type: "STWB1",
-        kind: "object-upsert",
-        object: {
-          objectId: "text-1",
-          sourcePeerId: "peer-a",
-          kind: "text",
-          x: 0.1,
-          y: 0.1,
-          width: 0.3,
-          height: 0.2,
-          color: "#172033",
-          strokeWidth: 2,
-          text: "同步文本",
-          fontSize: 22,
-          updatedAt: 100,
-        },
-        createdAt: 100,
-      },
-      { type: "STWB1", kind: "remove-object", objectId: "text-1", createdAt: 101 },
-      { type: "STWB1", kind: "clear", clearId: "clear-1", createdAt: 102 },
-    ];
+describe("sendWhiteboardWithFallback", () => {
+  it("uses Direct first and stops after a successful send", async () => {
+    const direct = vi.fn().mockResolvedValue(true);
+    const turn = vi.fn().mockResolvedValue(true);
+    const websocket = vi.fn().mockReturnValue(true);
 
-    for (const payload of payloads) {
-      expect(shouldPreferWhiteboardRelay(payload)).toBe(true);
-    }
+    await expect(sendWhiteboardWithFallback({ direct, turn, websocket })).resolves.toBe("direct");
+    expect(direct).toHaveBeenCalledOnce();
+    expect(turn).not.toHaveBeenCalled();
+    expect(websocket).not.toHaveBeenCalled();
   });
 
-  it("keeps high-frequency stroke traffic on the direct channel", () => {
-    const payloads: WhiteboardPayload[] = [
-      {
-        type: "STWB1",
-        kind: "stroke-start",
-        strokeId: "stroke-1",
-        color: "#172033",
-        width: 6,
-        point: { x: 0.1, y: 0.1 },
-        createdAt: 100,
-      },
-      {
-        type: "STWB1",
-        kind: "stroke-points",
-        strokeId: "stroke-1",
-        points: [{ x: 0.2, y: 0.2 }],
-        createdAt: 101,
-      },
-      {
-        type: "STWB1",
-        kind: "stroke-end",
-        strokeId: "stroke-1",
-        points: [],
-        createdAt: 102,
-      },
-    ];
+  it("falls back from Direct to TURN before WebSocket", async () => {
+    const calls: string[] = [];
 
-    for (const payload of payloads) {
-      expect(shouldPreferWhiteboardRelay(payload)).toBe(false);
-    }
+    await expect(sendWhiteboardWithFallback({
+      direct: async () => {
+        calls.push("direct");
+        return false;
+      },
+      turn: async () => {
+        calls.push("turn");
+        return true;
+      },
+      websocket: () => {
+        calls.push("websocket");
+        return true;
+      },
+    })).resolves.toBe("turn");
+    expect(calls).toEqual(["direct", "turn"]);
+  });
+
+  it("uses WebSocket only after Direct and TURN both fail", async () => {
+    const calls: string[] = [];
+
+    await expect(sendWhiteboardWithFallback({
+      direct: async () => {
+        calls.push("direct");
+        throw new Error("direct failed");
+      },
+      turn: () => {
+        calls.push("turn");
+        return false;
+      },
+      websocket: () => {
+        calls.push("websocket");
+        return true;
+      },
+    })).resolves.toBe("websocket");
+    expect(calls).toEqual(WHITEBOARD_TRANSPORT_ORDER);
+  });
+
+  it("returns null when every path is unavailable", async () => {
+    await expect(sendWhiteboardWithFallback({
+      direct: () => false,
+      turn: () => false,
+      websocket: () => false,
+    })).resolves.toBeNull();
   });
 });
