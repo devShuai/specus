@@ -6,6 +6,7 @@
   "description": "shuai-tunnel 管理后台前端 (React + HeroUI)",
   "scripts": {
     "dev": "vite",
+    "sync:drawio-stencils": "node scripts/sync-drawio-stencils.mjs",
     "sync:schemas": "node scripts/sync-schemas.mjs",
     "build": "npm run sync:schemas && tsc --noEmit && vite build",
     "build:openresty": "npm run build && node scripts/precompress.mjs",
