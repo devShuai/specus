@@ -1,7 +1,9 @@
-export const MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH = 48 * 1024;
+// dataURL 上限受 websocket 兜底通道约束：服务端 discovery 单消息上限 64K 字符，
+// 需给 STWB1 信封字段留出余量，因此图片本体压到 60K 以内。
+export const MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH = 60 * 1024;
 
 const JPEG_DATA_URL_PREFIX = "data:image/jpeg;base64,";
-const MAX_IMAGE_DIMENSION = 1200;
+const MAX_IMAGE_DIMENSION = 2048;
 const MAX_RESIZE_PASSES = 12;
 const QUALITY_STEPS = [0.82, 0.66, 0.5, 0.34, 0.22] as const;
 

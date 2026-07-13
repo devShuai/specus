@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { encodeDiagramUpdate } from "../lib/diagramDocument";
+import { MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH } from "../lib/whiteboardImageCompression";
 import { isWhiteboardPayload } from "./SyncedWhiteboard";
 
 const baseObject = {
@@ -66,6 +68,22 @@ describe("isWhiteboardPayload", () => {
     })).toBe(true);
   });
 
+  it("accepts document import snapshot batches", () => {
+    expect(isWhiteboardPayload({
+      type: "STWB1",
+      kind: "snapshot",
+      strokes: [{
+        strokeId: "import-stroke-1",
+        sourcePeerId: "peer-a",
+        color: "#2563eb",
+        width: 6,
+        points: [{ x: 0.1, y: 0.2 }, { x: 0.3, y: 0.4 }],
+        updatedAt: 106,
+      }],
+      createdAt: 107,
+    })).toBe(true);
+  });
+
   it("rejects objects outside the normalized board", () => {
     expect(isWhiteboardPayload({
       type: "STWB1",
@@ -84,6 +102,21 @@ describe("isWhiteboardPayload", () => {
     });
 
     expect(isWhiteboardPayload(payload("data:image/png;base64,AA=="))).toBe(false);
-    expect(isWhiteboardPayload(payload("data:image/jpeg;base64," + "A".repeat(49 * 1024)))).toBe(false);
+    expect(isWhiteboardPayload(payload("data:image/jpeg;base64," + "A".repeat(MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH + 1)))).toBe(false);
+  });
+
+  it("accepts professional diagram updates and sync requests", () => {
+    expect(isWhiteboardPayload({
+      type: "STDG1",
+      kind: "diagram-update",
+      update: encodeDiagramUpdate(new Uint8Array([1, 2, 3])),
+      createdAt: 108,
+    })).toBe(true);
+    expect(isWhiteboardPayload({
+      type: "STDG1",
+      kind: "diagram-sync-request",
+      requestId: "peer-a-sync-1",
+      createdAt: 109,
+    })).toBe(true);
   });
 });

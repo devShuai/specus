@@ -1,10 +1,31 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Button, Chip } from "@heroui/react";
 import {
   fitWhiteboardImageDataUrl,
-  MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH,
 } from "../lib/whiteboardImageCompression";
+import { useTheme } from "../theme/ThemeContext";
+import {
+  createWhiteboardDocument,
+  decodeWhiteboardDocument,
+  encodeWhiteboardDocumentBinary,
+  isWhiteboardObject,
+  isWhiteboardStroke,
+  MAX_WHITEBOARD_DOCUMENT_BYTES,
+  MAX_WHITEBOARD_DOCUMENT_OBJECTS,
+  MAX_WHITEBOARD_DOCUMENT_POINTS,
+  MAX_WHITEBOARD_DOCUMENT_STROKES,
+  WHITEBOARD_FILE_EXTENSION,
+  WHITEBOARD_FILE_MIME,
+} from "../lib/whiteboardDocument";
+import { formatBytes } from "../lib/format";
+import { isDiagramPayload } from "../lib/diagramDocument";
+import type { DiagramPayload } from "../lib/diagramDocument";
+
+const SyncedDiagram = lazy(async () => {
+  const module = await import("./SyncedDiagram");
+  return { default: module.SyncedDiagram };
+});
 
 export interface WhiteboardPoint {
   x: number;
@@ -105,7 +126,8 @@ export type WhiteboardPayload =
       kind: "snapshot";
       strokes: WhiteboardStroke[];
       createdAt: number;
-    };
+    }
+  | DiagramPayload;
 
 export interface WhiteboardInboundEvent {
   eventId: string;
@@ -154,6 +176,8 @@ interface TextDraft {
   x: number;
   y: number;
   text: string;
+  /** 有值表示在编辑已有文本对象，提交时原地更新而不是新建。 */
+  objectId?: string;
 }
 
 interface FlowLabelDraft {
@@ -176,12 +200,13 @@ const WHITEBOARD_WIDTHS = [
 ];
 const WHITEBOARD_SYNC_INTERVAL_MS = 220;
 const MIN_POINT_DISTANCE = 0.0025;
-const MAX_STROKES = 120;
-const MAX_POINTS_PER_STROKE = 900;
+const MAX_STROKES = MAX_WHITEBOARD_DOCUMENT_STROKES;
+const MAX_POINTS_PER_STROKE = MAX_WHITEBOARD_DOCUMENT_POINTS;
 const MAX_EVENT_POINTS = 160;
 const MAX_SNAPSHOT_STROKES = 24;
 const MAX_SNAPSHOT_POINTS = 120;
-const MAX_OBJECTS = 80;
+const MAX_IMPORT_SNAPSHOT_STROKES = 6;
+const MAX_OBJECTS = MAX_WHITEBOARD_DOCUMENT_OBJECTS;
 const MAX_SYNC_OBJECTS = 32;
 const MAX_TEXT_LENGTH = 500;
 const MAX_FLOW_LABEL_LENGTH = 120;
@@ -190,6 +215,52 @@ const WHITEBOARD_SURFACE_MIN_WIDTH = 720;
 const WHITEBOARD_SURFACE_HEIGHT = 1280;
 const MAX_CANVAS_PIXEL_COUNT = 8 * 1024 * 1024;
 const ERASER_COLOR = "#ffffff";
+
+/**
+ * 画布渲染主题。笔迹/对象在同步数据里始终存原始颜色（跨端主题可以不同），
+ * 仅在本地渲染时按主题映射：深色纸面把深墨映射为浅墨，橡皮擦映射为纸面色。
+ */
+interface WhiteboardRenderTheme {
+  paper: string;
+  grid: string;
+  textCardFill: string;
+  imageCardFill: string;
+  imagePlaceholderText: string;
+  ink: (color: string) => string;
+}
+
+const DARK_INK_BY_LIGHT: Record<string, string> = {
+  "#172033": "#e2e8f0",
+  "#2563eb": "#60a5fa",
+  "#059669": "#34d399",
+  "#ea580c": "#fb923c",
+  "#dc2626": "#f87171",
+};
+
+const LIGHT_BOARD_THEME: WhiteboardRenderTheme = {
+  paper: "#ffffff",
+  grid: "rgba(14, 116, 144, 0.08)",
+  textCardFill: "rgba(255, 255, 255, 0.94)",
+  imageCardFill: "#f4f4f5",
+  imagePlaceholderText: "#71717a",
+  ink: (color) => color,
+};
+
+const DARK_BOARD_PAPER = "#15181f";
+const DARK_BOARD_THEME: WhiteboardRenderTheme = {
+  paper: DARK_BOARD_PAPER,
+  grid: "rgba(148, 163, 184, 0.1)",
+  textCardFill: "rgba(24, 28, 36, 0.94)",
+  imageCardFill: "#1d222b",
+  imagePlaceholderText: "#8b94a3",
+  ink: (color) => {
+    const normalized = color.toLowerCase();
+    if (normalized === ERASER_COLOR) {
+      return DARK_BOARD_PAPER;
+    }
+    return DARK_INK_BY_LIGHT[normalized] ?? color;
+  },
+};
 
 export function SyncedWhiteboard({
   boardKey,
@@ -200,9 +271,14 @@ export function SyncedWhiteboard({
   events,
   onSend,
 }: SyncedWhiteboardProps) {
+  const { theme } = useTheme();
+  const boardTheme = theme === "dark" ? DARK_BOARD_THEME : LIGHT_BOARD_THEME;
+  const boardThemeRef = useRef(boardTheme);
+  boardThemeRef.current = boardTheme;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasViewportRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const documentInputRef = useRef<HTMLInputElement | null>(null);
   const strokesRef = useRef<WhiteboardStroke[]>([]);
   const objectsRef = useRef<WhiteboardObject[]>([]);
   const activeStrokeIdRef = useRef<string | null>(null);
@@ -228,7 +304,10 @@ export function SyncedWhiteboard({
   const [flowLabelDraft, setFlowLabelDraft] = useState<FlowLabelDraft | null>(null);
   const [isFlowchartOpen, setIsFlowchartOpen] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<"whiteboard" | "diagram">("whiteboard");
+  const [isStatusPanelCollapsed, setIsStatusPanelCollapsed] = useState(false);
   const [isImportingImage, setIsImportingImage] = useState(false);
+  const [isImportingDocument, setIsImportingDocument] = useState(false);
   const [boardMessage, setBoardMessage] = useState("画笔已就绪，可直接在画布上绘制。");
 
   const activeColor = selectedTool === "eraser" ? ERASER_COLOR : selectedColor;
@@ -289,12 +368,13 @@ export function SyncedWhiteboard({
     }
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, width, height);
-    drawPaper(context, width, height);
+    const renderTheme = boardThemeRef.current;
+    drawPaper(context, width, height, renderTheme);
     for (const stroke of strokesRef.current) {
-      drawStroke(context, stroke, width, height);
+      drawStroke(context, stroke, width, height, renderTheme);
     }
     for (const object of objectsRef.current) {
-      drawBoardObject(context, object, width, height, imageCacheRef.current, () => redrawRef.current());
+      drawBoardObject(context, object, width, height, imageCacheRef.current, () => redrawRef.current(), renderTheme);
     }
     const selected = objectsRef.current.find((object) => object.objectId === selectedObjectIdRef.current);
     if (selected) {
@@ -308,6 +388,10 @@ export function SyncedWhiteboard({
     objectsRef.current = objects;
     redraw();
   }, [objects, redraw, selectedObjectId, strokes]);
+
+  useEffect(() => {
+    redraw();
+  }, [redraw, theme]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -413,7 +497,7 @@ export function SyncedWhiteboard({
 
   const applyRemotePayload = useCallback((event: WhiteboardInboundEvent) => {
     const payload = event.payload;
-    if (event.sourcePeerId === peerId) {
+    if (event.sourcePeerId === peerId || payload.type !== "STWB1") {
       return;
     }
     if (payload.kind === "stroke-start") {
@@ -929,6 +1013,17 @@ export function SyncedWhiteboard({
     }
   }, [flushPendingPoints, moveStroke, sendObject, updateObjectDrag, updateObjectResize, updateObjects, updateShapeDraft]);
 
+  const startTextEdit = useCallback((objectId: string) => {
+    const object = objectsRef.current.find((item) => item.objectId === objectId);
+    if (!object || object.kind !== "text") {
+      return;
+    }
+    setFlowLabelDraft(null);
+    selectObject(objectId);
+    setTextDraft({ objectId, x: object.x, y: object.y, text: object.text });
+    setBoardMessage("正在编辑文本框，失焦或 Ctrl+Enter 保存，Esc 取消。");
+  }, [selectObject]);
+
   const handleCanvasDoubleClick = useCallback((event: React.MouseEvent<HTMLCanvasElement>) => {
     const point = pointFromMouseEvent(event);
     if (!point) {
@@ -938,14 +1033,47 @@ export function SyncedWhiteboard({
     if (object?.kind === "flow-node") {
       event.preventDefault();
       startFlowNodeEdit(object.objectId);
+    } else if (object?.kind === "text") {
+      event.preventDefault();
+      startTextEdit(object.objectId);
     }
-  }, [startFlowNodeEdit]);
+  }, [startFlowNodeEdit, startTextEdit]);
 
   const commitTextDraft = useCallback(() => {
     if (!textDraft) {
       return;
     }
     const text = textDraft.text.trim();
+
+    if (textDraft.objectId) {
+      const existing = objectsRef.current.find((item) => item.objectId === textDraft.objectId);
+      setTextDraft(null);
+      if (!existing || existing.kind !== "text") {
+        setBoardMessage("文本框已不存在，未保存修改。");
+        return;
+      }
+      if (!text) {
+        setBoardMessage("文本不能为空，已保留原内容。");
+        return;
+      }
+      if (text === existing.text) {
+        setBoardMessage("文本未变化。");
+        return;
+      }
+      const measuredHeight = clamp(0.1 + Math.ceil(text.length / 24) * 0.035, 0.12, 0.32);
+      const updated: WhiteboardTextObject = {
+        ...existing,
+        text,
+        height: clamp(Math.max(existing.height, measuredHeight), 0.12, 1 - existing.y),
+        updatedAt: Date.now(),
+      };
+      updateObjects((current) => current.map((item) => (item.objectId === updated.objectId ? updated : item)));
+      selectObject(updated.objectId);
+      sendObject(updated);
+      setBoardMessage("文本框已更新。");
+      return;
+    }
+
     if (!text) {
       setTextDraft(null);
       setBoardMessage("已取消空文本框。");
@@ -972,7 +1100,7 @@ export function SyncedWhiteboard({
     sendObject(object);
     setTextDraft(null);
     setSelectedTool("select");
-    setBoardMessage("文本框已插入，可使用选择工具拖动。");
+    setBoardMessage("文本框已插入，选择工具可拖动，双击可再编辑。");
   }, [peerId, selectObject, selectedColor, sendObject, textDraft, updateObjects]);
 
   const importImage = useCallback(async (file: File) => {
@@ -1030,6 +1158,122 @@ export function SyncedWhiteboard({
     event.currentTarget.value = "";
     if (file) {
       void importImage(file);
+    }
+  };
+
+  const exportBoardDocument = useCallback(async () => {
+    const exported = createWhiteboardDocument(
+      strokesRef.current,
+      objectsRef.current,
+      { width: WHITEBOARD_SURFACE_MIN_WIDTH, height: WHITEBOARD_SURFACE_HEIGHT },
+    );
+    let encoded: Uint8Array<ArrayBuffer>;
+    try {
+      encoded = await encodeWhiteboardDocumentBinary(exported);
+    } catch (error) {
+      setBoardMessage(error instanceof Error ? error.message : "白板导出失败");
+      return;
+    }
+    const blob = new Blob([encoded], { type: WHITEBOARD_FILE_MIME });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = whiteboardExportFileName(new Date());
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setBoardMessage(`已导出 ${exported.strokes.length} 笔和 ${exported.objects.length} 个对象（压缩后 ${formatBytes(blob.size)}）。`);
+  }, []);
+
+  const importBoardDocument = useCallback(async (file: File) => {
+    if (file.size > MAX_WHITEBOARD_DOCUMENT_BYTES) {
+      setBoardMessage("白板文件超过 16 MB，无法导入。");
+      return;
+    }
+    setIsImportingDocument(true);
+    setBoardMessage("正在校验白板文件...");
+    try {
+      const imported = await decodeWhiteboardDocument(new Uint8Array(await file.arrayBuffer()));
+      if ((strokesRef.current.length > 0 || objectsRef.current.length > 0)
+        && !window.confirm("导入将替换当前白板，并同步给房间内的设备。是否继续？")) {
+        setBoardMessage("已取消导入，当前白板未发生变化。");
+        return;
+      }
+
+      const importedAt = Date.now();
+      const importedStrokes: WhiteboardStroke[] = imported.strokes.map((stroke, index) => ({
+        ...stroke,
+        strokeId: createWhiteboardId(peerId, "import-stroke"),
+        sourcePeerId: peerId,
+        points: stroke.points.map((point) => ({ ...point })),
+        updatedAt: importedAt + index + 1,
+      }));
+      const objectTimestamp = importedAt + importedStrokes.length + 1;
+      const importedObjects: WhiteboardObject[] = imported.objects.map((object, index) => ({
+        ...object,
+        objectId: createWhiteboardId(peerId, `import-${object.kind}`),
+        sourcePeerId: peerId,
+        updatedAt: objectTimestamp + index,
+      }));
+
+      if (flushTimerRef.current !== null) {
+        window.clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+      activeStrokeIdRef.current = null;
+      pendingPointsRef.current = [];
+      objectDragRef.current = null;
+      objectResizeRef.current = null;
+      shapeDraftRef.current = null;
+      canvasPanRef.current = null;
+      setTextDraft(null);
+      setFlowLabelDraft(null);
+      selectObject(null);
+      setSelectedTool("select");
+      imageCacheRef.current.clear();
+      updateStrokes(() => importedStrokes);
+      updateObjects(() => importedObjects);
+      if (canvasViewportRef.current) {
+        canvasViewportRef.current.scrollLeft = 0;
+        canvasViewportRef.current.scrollTop = 0;
+      }
+
+      onSend({
+        type: "STWB1",
+        kind: "clear",
+        clearId: createWhiteboardId(peerId, "import-clear"),
+        createdAt: importedAt,
+      });
+      for (let offset = 0, chunkIndex = 0; offset < importedStrokes.length; offset += MAX_IMPORT_SNAPSHOT_STROKES, chunkIndex += 1) {
+        onSend({
+          type: "STWB1",
+          kind: "snapshot",
+          strokes: compactSnapshot(importedStrokes.slice(offset, offset + MAX_IMPORT_SNAPSHOT_STROKES)),
+          createdAt: importedAt + chunkIndex + 1,
+        });
+      }
+      importedObjects.forEach((object) => {
+        onSend({
+          type: "STWB1",
+          kind: "object-upsert",
+          object,
+          createdAt: object.updatedAt,
+        });
+      });
+      setBoardMessage(`已导入 ${importedStrokes.length} 笔和 ${importedObjects.length} 个对象，并同步到当前房间。`);
+    } catch (error) {
+      setBoardMessage(error instanceof Error ? error.message : "白板文件导入失败");
+    } finally {
+      setIsImportingDocument(false);
+    }
+  }, [onSend, peerId, selectObject, updateObjects, updateStrokes]);
+
+  const handleDocumentInput = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (file) {
+      void importBoardDocument(file);
     }
   };
 
@@ -1140,6 +1384,23 @@ export function SyncedWhiteboard({
         ? "cursor-text"
         : "cursor-crosshair";
 
+  if (workspaceMode === "diagram") {
+    return (
+      <Suspense fallback={<DiagramLoadingState onBack={() => setWorkspaceMode("whiteboard")} />}>
+        <SyncedDiagram
+          boardKey={boardKey}
+          peerId={peerId}
+          peerCount={peerCount}
+          isConnected={isConnected}
+          isActive={isActive}
+          events={events}
+          onSend={onSend}
+          onSwitchToWhiteboard={() => setWorkspaceMode("whiteboard")}
+        />
+      </Suspense>
+    );
+  }
+
   const board = (
     <section
       className={
@@ -1152,10 +1413,29 @@ export function SyncedWhiteboard({
       onPaste={handleBoardPaste}
     >
       <input ref={imageInputRef} type="file" accept="image/*" hidden onChange={handleImageInput} />
+      <input
+        ref={documentInputRef}
+        type="file"
+        accept=".stwb,.json,application/json,application/vnd.shuai-tunnel.whiteboard,application/vnd.shuai-tunnel.whiteboard+json"
+        hidden
+        onChange={handleDocumentInput}
+      />
       {!isExpanded ? <div className="flex shrink-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步白板</h2>
+            <div className="flex rounded-lg border border-black/10 bg-black/[0.035] p-0.5 dark:border-white/10 dark:bg-white/[0.05]">
+              <button type="button" className="rounded-md bg-white px-2.5 py-1 text-tiny font-semibold text-cyan-800 shadow-sm dark:bg-zinc-800 dark:text-cyan-200">
+                自由白板
+              </button>
+              <button
+                type="button"
+                className="rounded-md px-2.5 py-1 text-tiny font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white"
+                onClick={() => setWorkspaceMode("diagram")}
+              >
+                专业流程图
+              </button>
+            </div>
             <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
               {isConnected ? "实时同步" : "本地绘制"}
             </Chip>
@@ -1164,7 +1444,7 @@ export function SyncedWhiteboard({
             </Chip>
           </div>
           <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-            可滚动画布支持文本、图片、图形和流程图，所有对象都会同步给房间设备。
+            可滚动画布支持文本、图片、图形和流程图，可导入导出可编辑白板文件。
           </div>
         </div>
         <Button
@@ -1220,6 +1500,27 @@ export function SyncedWhiteboard({
               <ToolGlyph name="image" />
               {isImportingImage ? "处理中" : "图片"}
             </button>
+            <span className="mx-1 h-8 w-px shrink-0 bg-black/10 dark:bg-white/10" aria-hidden />
+            <button
+              type="button"
+              className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium text-zinc-700 transition hover:bg-violet-50 hover:text-violet-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10 dark:hover:text-violet-100"
+              onClick={() => documentInputRef.current?.click()}
+              disabled={isImportingDocument}
+              title="导入可编辑白板文件"
+            >
+              <ToolGlyph name="import" />
+              {isImportingDocument ? "导入中" : "导入"}
+            </button>
+            <button
+              type="button"
+              className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium text-zinc-700 transition hover:bg-violet-50 hover:text-violet-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10 dark:hover:text-violet-100"
+              onClick={() => void exportBoardDocument()}
+              disabled={strokes.length === 0 && objects.length === 0}
+              title="导出可编辑白板文件"
+            >
+              <ToolGlyph name="export" />
+              导出
+            </button>
           </div>
 
           {isFlowchartOpen ? (
@@ -1263,22 +1564,25 @@ export function SyncedWhiteboard({
             <span className="mx-0.5 h-6 w-px bg-black/10 dark:bg-white/10" aria-hidden />
             <div className="flex items-center gap-1">
               {WHITEBOARD_WIDTHS.map((width) => (
-                <Button
+                <button
                   key={width.value}
-                  size="sm"
-                  radius="sm"
-                  className="h-8 min-w-9 px-2"
-                  variant={selectedWidth === width.value ? "solid" : "light"}
-                  color={selectedWidth === width.value ? "primary" : "default"}
+                  type="button"
+                  aria-pressed={selectedWidth === width.value}
+                  className={
+                    "flex h-8 min-w-9 items-center justify-center rounded-md px-2 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+                    + (selectedWidth === width.value
+                      ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
+                      : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15")
+                  }
                   title={width.label + "线条"}
-                  onPress={() => setSelectedWidth(width.value)}
+                  onClick={() => setSelectedWidth(width.value)}
                 >
                   <span
                     className="block w-5 rounded-full bg-current"
                     style={{ height: Math.max(2, width.value / 2) }}
                     aria-hidden
                   />
-                </Button>
+                </button>
               ))}
             </div>
             <div className="min-w-2 flex-1" />
@@ -1339,7 +1643,7 @@ export function SyncedWhiteboard({
                 }
               }}
             />
-            {!isExpanded ? <div className="pointer-events-none absolute right-3 top-3 rounded-full border border-[#e0e2e8] bg-white/90 px-2.5 py-1 text-[10px] font-medium text-[#6b6f7e] shadow-sm">
+            {!isExpanded ? <div className="pointer-events-none absolute right-3 top-3 rounded-full border border-[#e0e2e8] bg-white/90 px-2.5 py-1 text-[10px] font-medium text-[#6b6f7e] shadow-sm dark:border-white/10 dark:bg-zinc-900/90 dark:text-zinc-400">
               可滚动画布 · {WHITEBOARD_SURFACE_MIN_WIDTH} × {WHITEBOARD_SURFACE_HEIGHT}
             </div> : null}
             {textDraft ? (
@@ -1349,7 +1653,7 @@ export function SyncedWhiteboard({
                 maxLength={MAX_TEXT_LENGTH}
                 placeholder="输入文本..."
                 aria-label="白板文本框内容"
-                className="absolute z-20 h-28 w-[min(18rem,72%)] resize-none rounded-lg border-2 border-cyan-500 bg-white/95 p-3 text-small text-zinc-950 shadow-xl outline-none ring-4 ring-cyan-500/10"
+                className="absolute z-20 h-28 w-[min(18rem,72%)] resize-none rounded-lg border-2 border-cyan-500 bg-white/95 p-3 text-small text-zinc-950 shadow-xl outline-none ring-4 ring-cyan-500/10 dark:bg-zinc-900/95 dark:text-zinc-100"
                 style={{
                   left: Math.min(textDraft.x, 0.26) * 100 + "%",
                   top: Math.min(textDraft.y, 0.88) * 100 + "%",
@@ -1363,8 +1667,9 @@ export function SyncedWhiteboard({
                 onKeyDown={(event) => {
                   if (event.key === "Escape") {
                     event.preventDefault();
+                    const wasEditing = Boolean(textDraft.objectId);
                     setTextDraft(null);
-                    setBoardMessage("已取消文本框。");
+                    setBoardMessage(wasEditing ? "已取消编辑，文本未变化。" : "已取消文本框。");
                   } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                     event.preventDefault();
                     commitTextDraft();
@@ -1378,7 +1683,7 @@ export function SyncedWhiteboard({
                 value={flowLabelDraft.text}
                 maxLength={MAX_FLOW_LABEL_LENGTH}
                 aria-label="流程图节点文字"
-                className="absolute z-20 h-11 min-w-36 rounded-md border-2 border-[#4262ff] bg-white/95 px-3 text-center text-small font-semibold text-[#1c1c1e] shadow-xl outline-none ring-4 ring-[#4262ff]/10"
+                className="absolute z-20 h-11 min-w-36 rounded-md border-2 border-[#4262ff] bg-white/95 px-3 text-center text-small font-semibold text-[#1c1c1e] shadow-xl outline-none ring-4 ring-[#4262ff]/10 dark:bg-zinc-900/95 dark:text-zinc-100"
                 style={{
                   left: editingFlowNode.x * 100 + "%",
                   top: (editingFlowNode.y + editingFlowNode.height / 2) * 100 + "%",
@@ -1444,6 +1749,26 @@ export function SyncedWhiteboard({
                   <ToolGlyph name="image" />
                   {isImportingImage ? "处理中" : "图片"}
                 </button>
+                <button
+                  type="button"
+                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10"
+                  onClick={() => documentInputRef.current?.click()}
+                  disabled={isImportingDocument}
+                  title="导入可编辑白板文件"
+                >
+                  <ToolGlyph name="import" />
+                  {isImportingDocument ? "导入中" : "导入"}
+                </button>
+                <button
+                  type="button"
+                  className="flex h-11 w-12 shrink-0 flex-col items-center justify-center gap-0.5 rounded-md px-1 text-[9px] font-medium leading-none text-zinc-700 transition hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10"
+                  onClick={() => void exportBoardDocument()}
+                  disabled={strokes.length === 0 && objects.length === 0}
+                  title="导出可编辑白板文件"
+                >
+                  <ToolGlyph name="export" />
+                  导出
+                </button>
               </div>
 
               <div className="h-px w-10 shrink-0 bg-black/10 dark:bg-white/10" />
@@ -1505,6 +1830,38 @@ export function SyncedWhiteboard({
               />
             ) : null}
 
+            {isStatusPanelCollapsed ? (
+              <div
+                className={
+                  "absolute right-2 top-2 z-30 flex items-center gap-0.5 rounded-xl border border-black/10 bg-white/95 p-1 shadow-2xl backdrop-blur-xl dark:border-white/15 dark:bg-zinc-950/95 "
+                  + (isFlowchartOpen ? "max-sm:hidden" : "")
+                }
+                aria-label="全屏白板状态（已收起）"
+              >
+                <button
+                  type="button"
+                  title={"展开状态栏 · " + (isConnected ? "实时同步" : "本地绘制") + " · " + totalPeers + " 台"}
+                  aria-expanded={false}
+                  className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2 text-[11px] font-medium text-zinc-700 transition hover:bg-black/5 dark:text-zinc-200 dark:hover:bg-white/10"
+                  onClick={() => setIsStatusPanelCollapsed(false)}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={"h-2 w-2 rounded-full " + (isConnected ? "bg-emerald-500" : "bg-zinc-400 dark:bg-zinc-500")}
+                  />
+                  {totalPeers} 台
+                  <PanelChevronGlyph direction="down" />
+                </button>
+                <button
+                  type="button"
+                  title="退出全屏"
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-700 transition hover:bg-black/5 dark:text-zinc-200 dark:hover:bg-white/10"
+                  onClick={() => setIsExpanded(false)}
+                >
+                  <ToolGlyph name="collapse" />
+                </button>
+              </div>
+            ) : (
             <aside
               className={
                 "absolute right-2 top-2 z-30 w-[min(15rem,calc(100vw-5.5rem))] rounded-2xl border border-black/10 bg-white/95 p-3 shadow-2xl backdrop-blur-xl dark:border-white/15 dark:bg-zinc-950/95 "
@@ -1517,14 +1874,25 @@ export function SyncedWhiteboard({
                   <div className="text-small font-semibold text-zinc-950 dark:text-white">同步白板</div>
                   <div className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">当前状态与操作提示</div>
                 </div>
-                <button
-                  type="button"
-                  className="flex h-8 shrink-0 items-center gap-1 rounded-md bg-black/5 px-2 text-[10px] font-medium text-zinc-700 transition hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15"
-                  onClick={() => setIsExpanded(false)}
-                >
-                  <ToolGlyph name="collapse" />
-                  退出
-                </button>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button
+                    type="button"
+                    title="收起状态栏"
+                    aria-expanded={true}
+                    className="flex h-8 w-8 items-center justify-center rounded-md bg-black/5 text-zinc-700 transition hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15"
+                    onClick={() => setIsStatusPanelCollapsed(true)}
+                  >
+                    <PanelChevronGlyph direction="up" />
+                  </button>
+                  <button
+                    type="button"
+                    className="flex h-8 items-center gap-1 rounded-md bg-black/5 px-2 text-[10px] font-medium text-zinc-700 transition hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15"
+                    onClick={() => setIsExpanded(false)}
+                  >
+                    <ToolGlyph name="collapse" />
+                    退出
+                  </button>
+                </div>
               </div>
               <div className="mt-2 flex flex-wrap gap-1.5">
                 <Chip size="sm" radius="sm" variant="flat" color={isConnected ? "success" : "default"}>
@@ -1567,6 +1935,7 @@ export function SyncedWhiteboard({
                 </Button>
               </div>
             </aside>
+            )}
           </>
         ) : null}
 
@@ -1578,6 +1947,21 @@ export function SyncedWhiteboard({
     </section>
   );
   return isExpanded ? createPortal(board, document.body) : board;
+}
+
+function DiagramLoadingState({ onBack }: { onBack: () => void }) {
+  return (
+    <section className="mt-5 rounded-xl glass glass-border border p-4">
+      <div className="flex min-h-48 flex-col items-center justify-center gap-3 text-center">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-cyan-500/25 border-t-cyan-500" aria-hidden />
+        <div>
+          <div className="text-small font-semibold text-zinc-900 dark:text-white">正在加载专业流程图引擎</div>
+          <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">首次进入按需加载，之后切换会直接复用浏览器缓存。</div>
+        </div>
+        <Button size="sm" radius="sm" variant="light" onPress={onBack}>返回自由白板</Button>
+      </div>
+    </section>
+  );
 }
 
 function WhiteboardToolButton({
@@ -1706,7 +2090,24 @@ function FlowchartPaletteButton({
   );
 }
 
-function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "fullscreen" | "collapse" }) {
+function PanelChevronGlyph({ direction }: { direction: "up" | "down" }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className="h-3.5 w-3.5"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {direction === "up" ? <polyline points="6 15 12 9 18 15" /> : <polyline points="6 9 12 15 18 9" />}
+    </svg>
+  );
+}
+
+function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "import" | "export" | "fullscreen" | "collapse" }) {
   const common = {
     className: "h-4 w-4 shrink-0",
     fill: "none",
@@ -1747,6 +2148,12 @@ function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "fullsc
   if (name === "image") {
     return <svg {...common}><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8" cy="9" r="1.5" /><path d="M4 17l5-5 4 4 3-3 5 5" /></svg>;
   }
+  if (name === "import") {
+    return <svg {...common}><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 16v4h14v-4" /></svg>;
+  }
+  if (name === "export") {
+    return <svg {...common}><path d="M12 16V4m0 0L8 8m4-4l4 4M5 15v5h14v-5" /></svg>;
+  }
   if (name === "collapse") {
     return <svg {...common}><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /></svg>;
   }
@@ -1754,6 +2161,9 @@ function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "fullsc
 }
 
 export function isWhiteboardPayload(value: unknown): value is WhiteboardPayload {
+  if (isDiagramPayload(value)) {
+    return true;
+  }
   if (!isRecord(value) || value.type !== "STWB1" || typeof value.kind !== "string") {
     return false;
   }
@@ -1784,7 +2194,7 @@ export function isWhiteboardPayload(value: unknown): value is WhiteboardPayload 
   if (value.kind === "snapshot") {
     return Array.isArray(value.strokes)
       && value.strokes.length <= MAX_SNAPSHOT_STROKES
-      && value.strokes.every(isStroke)
+      && value.strokes.every((stroke) => isWhiteboardStroke(stroke, MAX_SNAPSHOT_POINTS))
       && typeof value.createdAt === "number";
   }
   return false;
@@ -1827,6 +2237,11 @@ function canvasViewportCenter(
 
 function createWhiteboardId(peerId: string, kind: string) {
   return peerId + "-" + kind + "-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+function whiteboardExportFileName(date: Date) {
+  const timestamp = date.toISOString().replace(/\D/g, "").slice(0, 14);
+  return `shuai-tunnel-whiteboard-${timestamp}${WHITEBOARD_FILE_EXTENSION}`;
 }
 
 function createShapeObject(
@@ -2054,11 +2469,11 @@ function distanceToSegment(point: WhiteboardPoint, start: WhiteboardPoint, end: 
   return Math.hypot(point.x - (start.x + ratio * dx), point.y - (start.y + ratio * dy));
 }
 
-function drawPaper(context: CanvasRenderingContext2D, width: number, height: number) {
-  context.fillStyle = "#ffffff";
+function drawPaper(context: CanvasRenderingContext2D, width: number, height: number, theme: WhiteboardRenderTheme) {
+  context.fillStyle = theme.paper;
   context.fillRect(0, 0, width, height);
   context.save();
-  context.strokeStyle = "rgba(14, 116, 144, 0.08)";
+  context.strokeStyle = theme.grid;
   context.lineWidth = 1;
   const grid = 24;
   for (let x = grid; x < width; x += grid) {
@@ -2076,12 +2491,12 @@ function drawPaper(context: CanvasRenderingContext2D, width: number, height: num
   context.restore();
 }
 
-function drawStroke(context: CanvasRenderingContext2D, stroke: WhiteboardStroke, width: number, height: number) {
+function drawStroke(context: CanvasRenderingContext2D, stroke: WhiteboardStroke, width: number, height: number, theme: WhiteboardRenderTheme) {
   if (stroke.points.length === 0) {
     return;
   }
   context.save();
-  context.strokeStyle = stroke.color;
+  context.strokeStyle = theme.ink(stroke.color);
   context.lineWidth = stroke.width;
   context.lineCap = "round";
   context.lineJoin = "round";
@@ -2107,15 +2522,16 @@ function drawBoardObject(
   height: number,
   imageCache: Map<string, HTMLImageElement>,
   onImageReady: () => void,
+  theme: WhiteboardRenderTheme,
 ) {
   if (object.kind === "shape") {
-    drawShape(context, object, width, height);
+    drawShape(context, object, width, height, theme);
   } else if (object.kind === "text") {
-    drawTextObject(context, object, width, height);
+    drawTextObject(context, object, width, height, theme);
   } else if (object.kind === "flow-node") {
-    drawFlowNode(context, object, width, height);
+    drawFlowNode(context, object, width, height, theme);
   } else {
-    drawImageObject(context, object, width, height, imageCache, onImageReady);
+    drawImageObject(context, object, width, height, imageCache, onImageReady, theme);
   }
 }
 
@@ -2124,14 +2540,16 @@ function drawShape(
   object: WhiteboardShapeObject,
   width: number,
   height: number,
+  theme: WhiteboardRenderTheme,
 ) {
   const x = object.x * width;
   const y = object.y * height;
   const objectWidth = object.width * width;
   const objectHeight = object.height * height;
+  const ink = theme.ink(object.color);
   context.save();
-  context.strokeStyle = object.color;
-  context.fillStyle = colorWithAlpha(object.color, 0.1);
+  context.strokeStyle = ink;
+  context.fillStyle = colorWithAlpha(ink, 0.1);
   context.lineWidth = object.strokeWidth;
   context.lineJoin = "round";
   context.lineCap = "round";
@@ -2175,21 +2593,23 @@ function drawTextObject(
   object: WhiteboardTextObject,
   width: number,
   height: number,
+  theme: WhiteboardRenderTheme,
 ) {
   const x = object.x * width;
   const y = object.y * height;
   const boxWidth = Math.max(80, object.width * width);
   const boxHeight = Math.max(50, object.height * height);
   const padding = 12;
+  const ink = theme.ink(object.color);
   context.save();
-  context.fillStyle = "rgba(255, 255, 255, 0.94)";
-  context.strokeStyle = colorWithAlpha(object.color, 0.55);
+  context.fillStyle = theme.textCardFill;
+  context.strokeStyle = colorWithAlpha(ink, 0.55);
   context.lineWidth = Math.max(1, object.strokeWidth);
   context.beginPath();
   context.roundRect(x, y, boxWidth, boxHeight, 10);
   context.fill();
   context.stroke();
-  context.fillStyle = object.color;
+  context.fillStyle = ink;
   context.font = "600 " + object.fontSize + "px Inter, system-ui, sans-serif";
   context.textBaseline = "top";
   const lineHeight = object.fontSize * 1.35;
@@ -2207,11 +2627,13 @@ function drawFlowNode(
   object: WhiteboardFlowNodeObject,
   width: number,
   height: number,
+  theme: WhiteboardRenderTheme,
 ) {
   const x = object.x * width;
   const y = object.y * height;
   const boxWidth = Math.max(100, object.width * width);
   const boxHeight = Math.max(60, object.height * height);
+  // 节点底色保持便签式浅色，深浅主题都可读；文字固定深墨。
   const fillColor = object.nodeKind === "start"
     ? "#fff4c4"
     : object.nodeKind === "process"
@@ -2222,7 +2644,7 @@ function drawFlowNode(
 
   context.save();
   context.fillStyle = fillColor;
-  context.strokeStyle = object.color;
+  context.strokeStyle = theme.ink(object.color);
   context.lineWidth = Math.max(1.5, object.strokeWidth);
   context.lineJoin = "round";
   context.shadowColor = "rgba(5, 0, 56, 0.12)";
@@ -2267,14 +2689,15 @@ function drawImageObject(
   height: number,
   imageCache: Map<string, HTMLImageElement>,
   onImageReady: () => void,
+  theme: WhiteboardRenderTheme,
 ) {
   const x = object.x * width;
   const y = object.y * height;
   const boxWidth = Math.max(60, object.width * width);
   const boxHeight = Math.max(50, object.height * height);
   context.save();
-  context.fillStyle = "#f4f4f5";
-  context.strokeStyle = colorWithAlpha(object.color, 0.45);
+  context.fillStyle = theme.imageCardFill;
+  context.strokeStyle = colorWithAlpha(theme.ink(object.color), 0.45);
   context.lineWidth = Math.max(1, object.strokeWidth);
   context.beginPath();
   context.roundRect(x, y, boxWidth, boxHeight, 10);
@@ -2299,7 +2722,7 @@ function drawImageObject(
       renderHeight,
     );
   } else {
-    context.fillStyle = "#71717a";
+    context.fillStyle = theme.imagePlaceholderText;
     context.font = "500 13px Inter, system-ui, sans-serif";
     context.textAlign = "center";
     context.textBaseline = "middle";
@@ -2307,7 +2730,7 @@ function drawImageObject(
   }
   context.restore();
   context.save();
-  context.strokeStyle = colorWithAlpha(object.color, 0.45);
+  context.strokeStyle = colorWithAlpha(theme.ink(object.color), 0.45);
   context.lineWidth = Math.max(1, object.strokeWidth);
   context.beginPath();
   context.roundRect(x, y, boxWidth, boxHeight, 10);
@@ -2427,82 +2850,6 @@ function mergeSnapshot(current: WhiteboardStroke[], snapshot: WhiteboardStroke[]
     }
   }
   return Array.from(byId.values()).sort((a, b) => a.updatedAt - b.updatedAt).slice(-MAX_STROKES);
-}
-
-function isStroke(value: unknown): value is WhiteboardStroke {
-  return isRecord(value)
-    && typeof value.strokeId === "string"
-    && typeof value.sourcePeerId === "string"
-    && isColor(value.color)
-    && isWidth(value.width)
-    && isPointArray(value.points, MAX_SNAPSHOT_POINTS)
-    && typeof value.updatedAt === "number";
-}
-
-function isWhiteboardObject(value: unknown): value is WhiteboardObject {
-  if (!isRecord(value)
-    || !isIdentifier(value.objectId)
-    || !isIdentifier(value.sourcePeerId)
-    || typeof value.x !== "number"
-    || !Number.isFinite(value.x)
-    || value.x < 0
-    || value.x > 1
-    || typeof value.y !== "number"
-    || !Number.isFinite(value.y)
-    || value.y < 0
-    || value.y > 1
-    || typeof value.width !== "number"
-    || !Number.isFinite(value.width)
-    || typeof value.height !== "number"
-    || !Number.isFinite(value.height)
-    || !isColor(value.color)
-    || !isWidth(value.strokeWidth)
-    || typeof value.updatedAt !== "number") {
-    return false;
-  }
-  if (value.kind === "shape") {
-    if (value.shapeKind !== "rectangle" && value.shapeKind !== "ellipse" && value.shapeKind !== "arrow") {
-      return false;
-    }
-    const endX = value.x + value.width;
-    const endY = value.y + value.height;
-    return value.width !== 0
-      && value.height !== 0
-      && endX >= 0
-      && endX <= 1
-      && endY >= 0
-      && endY <= 1
-      && (value.shapeKind === "arrow" || (value.width > 0 && value.height > 0));
-  }
-  if (value.width <= 0 || value.height <= 0 || value.x + value.width > 1 || value.y + value.height > 1) {
-    return false;
-  }
-  if (value.kind === "flow-node") {
-    return (value.nodeKind === "start"
-        || value.nodeKind === "process"
-        || value.nodeKind === "decision"
-        || value.nodeKind === "end")
-      && typeof value.text === "string"
-      && value.text.length > 0
-      && value.text.length <= MAX_FLOW_LABEL_LENGTH;
-  }
-  if (value.kind === "text") {
-    return typeof value.text === "string"
-      && value.text.length > 0
-      && value.text.length <= MAX_TEXT_LENGTH
-      && typeof value.fontSize === "number"
-      && value.fontSize >= 12
-      && value.fontSize <= 64;
-  }
-  if (value.kind === "image") {
-    return typeof value.fileName === "string"
-      && value.fileName.length > 0
-      && value.fileName.length <= 120
-      && typeof value.dataUrl === "string"
-      && value.dataUrl.length <= MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH
-      && /^data:image\/jpeg;base64,[a-zA-Z0-9+/=]+$/.test(value.dataUrl);
-  }
-  return false;
 }
 
 function isIdentifier(value: unknown) {

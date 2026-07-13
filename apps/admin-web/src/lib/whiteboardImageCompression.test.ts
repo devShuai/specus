@@ -16,8 +16,8 @@ describe("fitWhiteboardImageDataUrl", () => {
       jpegDataUrlOfLength(JPEG_PREFIX.length + Math.ceil(width * height * quality * 0.02))
     ));
 
-    expect(result.width).toBe(1200);
-    expect(result.height).toBe(800);
+    expect(result.width).toBe(2048);
+    expect(result.height).toBe(1365);
     expect(result.quality).toBe(0.82);
     expect(result.dataUrl.length).toBeLessThanOrEqual(MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH);
   });

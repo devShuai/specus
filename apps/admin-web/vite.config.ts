@@ -39,6 +39,17 @@ export default defineConfig(({ mode }) => {
               return undefined;
             }
 
+            if (normalized.includes("/node_modules/@maxgraph/core/")) {
+              return "diagram-engine";
+            }
+            if (
+              normalized.includes("/node_modules/yjs/")
+              || normalized.includes("/node_modules/lib0/")
+              || normalized.includes("/node_modules/isomorphic.js/")
+            ) {
+              return "diagram-collaboration";
+            }
+
             if (
               normalized.includes("/node_modules/react/") ||
               normalized.includes("/node_modules/react-dom/") ||
