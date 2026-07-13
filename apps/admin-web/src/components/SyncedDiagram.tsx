@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Button, Chip } from "@heroui/react";
+import {
+  Button,
+  Chip,
+  Dropdown,
+  DropdownItem,
+  DropdownMenu,
+  DropdownTrigger,
+} from "@heroui/react";
 import {
   Cell,
   Clipboard,
@@ -2098,7 +2105,7 @@ export function SyncedDiagram({
         ? "absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-zinc-100 dark:bg-zinc-950"
         : "mt-3 flex min-h-0 flex-col overflow-hidden rounded-xl border border-black/10 bg-white/80 shadow-sm dark:border-white/10 dark:bg-zinc-950/70"}
       >
-        <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-black/10 bg-white/90 p-2 dark:border-white/10 dark:bg-zinc-900/95" role="toolbar" aria-label="流程图操作">
+        <div className="flex shrink-0 flex-wrap items-center gap-1 border-b border-black/10 bg-white/90 p-2 dark:border-white/10 dark:bg-zinc-900/95" role="toolbar" aria-label="流程图操作">
           {isExpanded ? (
             <>
               <DiagramToolbarButton label="白板" onClick={() => {
@@ -2114,8 +2121,6 @@ export function SyncedDiagram({
             setContextMenu(null);
             setStatus(isReadOnly ? "已恢复编辑模式。" : "已进入本地只读预览，协作更新仍会继续接收。");
           }} />
-          <DiagramToolbarButton label="评论" disabled={isReadOnly} onClick={addComment} />
-          <DiagramToolbarButton label={isVersionLoading ? "版本处理中" : "创建版本"} disabled={isRoleReadOnly || isVersionLoading} onClick={() => void createVersion()} />
           <span className="mx-1 h-7 w-px shrink-0 bg-black/10 dark:bg-white/10" />
           <DiagramToolbarButton label="撤销" shortcut="⌘Z" disabled={isReadOnly || !canUndo} onClick={() => {
             undoManagerRef.current?.undo();
@@ -2125,66 +2130,161 @@ export function SyncedDiagram({
             undoManagerRef.current?.redo();
             refreshUndoState();
           }} />
-          <DiagramToolbarButton label="复制" shortcut="⌘C" disabled={selection.ids.length === 0} onClick={copySelection} />
-          <DiagramToolbarButton label="粘贴" shortcut="⌘V" disabled={isReadOnly} onClick={pasteSelection} />
-          <DiagramToolbarButton label="副本" shortcut="⌘D" disabled={isReadOnly || selection.ids.length === 0} onClick={duplicateSelection} />
-          <DiagramToolbarButton label="复制格式" disabled={selection.ids.length !== 1} onClick={copyFormat} />
-          <DiagramToolbarButton label="应用格式" disabled={isReadOnly || !hasCopiedFormat || selection.ids.length === 0} onClick={applyFormat} />
-          <DiagramToolbarButton label="删除" shortcut="Del" danger disabled={isReadOnly || selection.ids.length === 0} onClick={removeSelection} />
           <span className="mx-1 h-7 w-px shrink-0 bg-black/10 dark:bg-white/10" />
-          <DiagramToolbarButton label="组合" disabled={isReadOnly || selection.ids.length < 2} onClick={groupSelection} />
-          <DiagramToolbarButton label="取消组合" disabled={isReadOnly || !selection.isNode} onClick={ungroupSelection} />
-          <DiagramToolbarButton label="水平分布" disabled={isReadOnly || selection.ids.length < 3} onClick={() => distributeSelection("horizontal")} />
-          <DiagramToolbarButton label="垂直分布" disabled={isReadOnly || selection.ids.length < 3} onClick={() => distributeSelection("vertical")} />
-          <span className="mx-1 h-7 w-px shrink-0 bg-black/10 dark:bg-white/10" />
-          <DiagramToolbarButton label="上→下布局" disabled={isReadOnly} onClick={() => runLayout("north")} />
-          <DiagramToolbarButton label="左→右布局" disabled={isReadOnly} onClick={() => runLayout("east")} />
-          <DiagramToolbarButton label="左对齐" disabled={isReadOnly || selection.ids.length < 2} onClick={() => alignSelection("left")} />
-          <DiagramToolbarButton label="水平居中" disabled={isReadOnly || selection.ids.length < 2} onClick={() => alignSelection("center")} />
-          <span className="mx-1 h-7 w-px shrink-0 bg-black/10 dark:bg-white/10" />
-          <DiagramToolbarButton label="放大" onClick={() => withGraph((graph) => graph.zoomIn())} />
-          <DiagramToolbarButton label="缩小" onClick={() => withGraph((graph) => graph.zoomOut())} />
-          <DiagramToolbarButton label="适应" onClick={() => withGraph((graph) => graph.getPlugin<FitPlugin>("fit")?.fitCenter({ margin: 28 }))} />
-          <DiagramToolbarButton label="100%" onClick={() => withGraph((graph) => graph.zoomActual())} />
-          <span className="mx-1 h-7 w-px shrink-0 bg-black/10 dark:bg-white/10" />
-          <DiagramToolbarButton label={isImporting ? "导入中" : "导入"} disabled={isReadOnly || isImporting} onClick={() => importInputRef.current?.click()} />
-          <DiagramToolbarButton label="导出 .stdg" disabled={nodeCount === 0 && edgeCount === 0} onClick={exportDiagram} />
-          <DiagramToolbarButton label="导出 draw.io" disabled={nodeCount === 0 && edgeCount === 0} onClick={exportDrawio} />
-          <DiagramToolbarButton label="SVG" disabled={nodeCount === 0 && edgeCount === 0} onClick={exportSvg} />
-          <DiagramToolbarButton label="PNG" disabled={nodeCount === 0 && edgeCount === 0} onClick={() => void exportPng()} />
-          <DiagramToolbarButton label="PDF" disabled={(nodesMapRef.current?.size ?? 0) === 0} onClick={() => void exportPdf()} />
-          <DiagramToolbarButton label="Mermaid" disabled={(nodesMapRef.current?.size ?? 0) === 0} onClick={exportMermaid} />
-          <DiagramToolbarButton label="PlantUML" disabled={(nodesMapRef.current?.size ?? 0) === 0} onClick={exportPlantUml} />
-          <DiagramToolbarButton label="Visio VDX" disabled={(nodesMapRef.current?.size ?? 0) === 0} onClick={exportVisio} />
-          <DiagramToolbarButton label={showMinimap ? "隐藏小地图" : "显示小地图"} onClick={() => setShowMinimap((value) => !value)} />
-          <DiagramToolbarButton label="清空" danger disabled={isReadOnly || (nodeCount === 0 && edgeCount === 0)} onClick={clearDiagram} />
+          <DiagramToolbarMenu
+            label={selection.ids.length > 0 ? `编辑 · ${selection.ids.length}` : "编辑"}
+            items={[
+              { key: "copy", label: "复制", shortcut: "⌘C", disabled: selection.ids.length === 0 },
+              { key: "paste", label: "粘贴", shortcut: "⌘V", disabled: isReadOnly },
+              { key: "duplicate", label: "创建副本", shortcut: "⌘D", disabled: isReadOnly || selection.ids.length === 0 },
+              { key: "copy-format", label: "复制格式", disabled: selection.ids.length !== 1 },
+              { key: "apply-format", label: "应用格式", disabled: isReadOnly || !hasCopiedFormat || selection.ids.length === 0 },
+              { key: "delete", label: "删除", shortcut: "Del", disabled: isReadOnly || selection.ids.length === 0, danger: true },
+            ]}
+            onAction={(key) => {
+              if (key === "copy") copySelection();
+              else if (key === "paste") pasteSelection();
+              else if (key === "duplicate") duplicateSelection();
+              else if (key === "copy-format") copyFormat();
+              else if (key === "apply-format") applyFormat();
+              else if (key === "delete") removeSelection();
+            }}
+          />
+          <DiagramToolbarMenu
+            label="排列"
+            items={[
+              { key: "group", label: "组合", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "ungroup", label: "取消组合", disabled: isReadOnly || !selection.isNode },
+              { key: "bring-front", label: "置于顶层", disabled: isReadOnly || selection.ids.length === 0 },
+              { key: "send-back", label: "置于底层", disabled: isReadOnly || selection.ids.length === 0 },
+              { key: "distribute-horizontal", label: "水平等距分布", disabled: isReadOnly || selection.ids.length < 3 },
+              { key: "distribute-vertical", label: "垂直等距分布", disabled: isReadOnly || selection.ids.length < 3 },
+              { key: "align-left", label: "左对齐", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "align-center", label: "水平居中", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "align-right", label: "右对齐", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "align-top", label: "顶部对齐", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "align-middle", label: "垂直居中", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "align-bottom", label: "底部对齐", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "layout-north", label: "自动布局：上到下", disabled: isReadOnly },
+              { key: "layout-east", label: "自动布局：左到右", disabled: isReadOnly },
+            ]}
+            onAction={(key) => {
+              if (key === "group") groupSelection();
+              else if (key === "ungroup") ungroupSelection();
+              else if (key === "bring-front") withGraph((graph) => graph.orderCells(false));
+              else if (key === "send-back") withGraph((graph) => graph.orderCells(true));
+              else if (key === "distribute-horizontal") distributeSelection("horizontal");
+              else if (key === "distribute-vertical") distributeSelection("vertical");
+              else if (key === "align-left") alignSelection("left");
+              else if (key === "align-center") alignSelection("center");
+              else if (key === "align-right") alignSelection("right");
+              else if (key === "align-top") alignSelection("top");
+              else if (key === "align-middle") alignSelection("middle");
+              else if (key === "align-bottom") alignSelection("bottom");
+              else if (key === "layout-north") runLayout("north");
+              else if (key === "layout-east") runLayout("east");
+            }}
+          />
+          <DiagramToolbarMenu
+            label="协作"
+            items={[
+              { key: "comment", label: "添加评论", disabled: isReadOnly },
+              { key: "version", label: isVersionLoading ? "版本处理中" : "创建版本", disabled: isRoleReadOnly || isVersionLoading },
+            ]}
+            onAction={(key) => {
+              if (key === "comment") addComment();
+              else if (key === "version") void createVersion();
+            }}
+          />
+          <DiagramToolbarMenu
+            label="视图"
+            items={[
+              { key: "zoom-in", label: "放大" },
+              { key: "zoom-out", label: "缩小" },
+              { key: "fit", label: "适应画布" },
+              { key: "actual", label: "实际大小 100%" },
+              { key: "minimap", label: showMinimap ? "隐藏小地图" : "显示小地图" },
+            ]}
+            onAction={(key) => {
+              if (key === "zoom-in") withGraph((graph) => graph.zoomIn());
+              else if (key === "zoom-out") withGraph((graph) => graph.zoomOut());
+              else if (key === "fit") withGraph((graph) => graph.getPlugin<FitPlugin>("fit")?.fitCenter({ margin: 28 }));
+              else if (key === "actual") withGraph((graph) => graph.zoomActual());
+              else if (key === "minimap") setShowMinimap((value) => !value);
+            }}
+          />
+          <DiagramToolbarMenu
+            label="文件"
+            items={[
+              { key: "import", label: isImporting ? "导入中" : "导入文件", disabled: isReadOnly || isImporting },
+              { key: "export-stdg", label: "导出 shuai-tunnel (.stdg)", disabled: nodeCount === 0 && edgeCount === 0 },
+              { key: "export-drawio", label: "导出 draw.io", disabled: nodeCount === 0 && edgeCount === 0 },
+              { key: "export-svg", label: "导出 SVG", disabled: nodeCount === 0 && edgeCount === 0 },
+              { key: "export-png", label: "导出 PNG", disabled: nodeCount === 0 && edgeCount === 0 },
+              { key: "export-pdf", label: "导出 PDF", disabled: (nodesMapRef.current?.size ?? 0) === 0 },
+              { key: "export-mermaid", label: "导出 Mermaid", disabled: (nodesMapRef.current?.size ?? 0) === 0 },
+              { key: "export-plantuml", label: "导出 PlantUML", disabled: (nodesMapRef.current?.size ?? 0) === 0 },
+              { key: "export-visio", label: "导出 Visio VDX", disabled: (nodesMapRef.current?.size ?? 0) === 0 },
+              { key: "clear", label: "清空当前流程图", disabled: isReadOnly || (nodeCount === 0 && edgeCount === 0), danger: true },
+            ]}
+            onAction={(key) => {
+              if (key === "import") importInputRef.current?.click();
+              else if (key === "export-stdg") exportDiagram();
+              else if (key === "export-drawio") exportDrawio();
+              else if (key === "export-svg") exportSvg();
+              else if (key === "export-png") void exportPng();
+              else if (key === "export-pdf") void exportPdf();
+              else if (key === "export-mermaid") exportMermaid();
+              else if (key === "export-plantuml") exportPlantUml();
+              else if (key === "export-visio") exportVisio();
+              else if (key === "clear") clearDiagram();
+            }}
+          />
         </div>
 
-        <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-black/10 bg-zinc-50/95 px-2 py-1.5 dark:border-white/10 dark:bg-zinc-950/95" aria-label="流程图页面">
-          {pages.map((page) => (
-            <button
-              key={page.id}
-              type="button"
-              aria-pressed={page.id === activePageId}
-              className={`h-8 shrink-0 rounded-md border px-3 text-tiny font-medium transition ${page.id === activePageId
-                ? "border-cyan-400 bg-cyan-50 text-cyan-900 dark:bg-cyan-300/10 dark:text-cyan-100"
-                : "border-black/10 bg-white text-zinc-600 hover:border-cyan-300 dark:border-white/10 dark:bg-white/[0.04] dark:text-zinc-300"}`}
-              onClick={() => {
-                if (page.id !== activePageId) {
-                  flushGraphRef.current();
-                  setActivePageId(page.id);
-                  setStatus(`已切换到“${page.name}”。`);
-                }
+        <div className="flex shrink-0 items-center border-b border-black/10 bg-zinc-50/95 dark:border-white/10 dark:bg-zinc-950/95" aria-label="流程图页面">
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto px-2 py-1.5">
+            <span className="shrink-0 px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400">页面</span>
+            {pages.map((page) => (
+              <button
+                key={page.id}
+                type="button"
+                aria-pressed={page.id === activePageId}
+                className={`h-8 shrink-0 rounded-md border px-3 text-tiny font-medium transition ${page.id === activePageId
+                  ? "border-cyan-400 bg-cyan-50 text-cyan-900 dark:bg-cyan-300/10 dark:text-cyan-100"
+                  : "border-black/10 bg-white text-zinc-600 hover:border-cyan-300 dark:border-white/10 dark:bg-white/[0.04] dark:text-zinc-300"}`}
+                onClick={() => {
+                  if (page.id !== activePageId) {
+                    flushGraphRef.current();
+                    setActivePageId(page.id);
+                    setStatus(`已切换到“${page.name}”。`);
+                  }
+                }}
+                onDoubleClick={!isReadOnly && page.id === activePageId ? renamePage : undefined}
+              >
+                {page.name}
+              </button>
+            ))}
+          </div>
+          <div className="shrink-0 border-l border-black/10 px-1.5 dark:border-white/10">
+            <DiagramToolbarMenu
+              label={`${pages.length} 页`}
+              compact
+              placement="bottom-end"
+              items={[
+                { key: "add", label: "新增页面", disabled: isReadOnly },
+                { key: "rename", label: "重命名当前页", disabled: isReadOnly },
+                { key: "duplicate", label: "复制当前页", disabled: isReadOnly },
+                { key: "delete", label: "删除当前页", disabled: isReadOnly || pages.length <= 1, danger: true },
+              ]}
+              onAction={(key) => {
+                if (key === "add") addPage();
+                else if (key === "rename") renamePage();
+                else if (key === "duplicate") duplicatePage();
+                else if (key === "delete") deletePage();
               }}
-              onDoubleClick={!isReadOnly && page.id === activePageId ? renamePage : undefined}
-            >
-              {page.name}
-            </button>
-          ))}
-          <button type="button" disabled={isReadOnly} className="h-8 shrink-0 rounded-md border border-dashed border-cyan-400 px-2.5 text-tiny font-semibold text-cyan-800 disabled:opacity-35 dark:text-cyan-200" onClick={addPage}>+ 页面</button>
-          <button type="button" disabled={isReadOnly} className="h-8 shrink-0 rounded-md px-2 text-tiny text-zinc-500 hover:bg-black/5 disabled:opacity-35 dark:text-zinc-400 dark:hover:bg-white/5" onClick={renamePage}>重命名</button>
-          <button type="button" disabled={isReadOnly} className="h-8 shrink-0 rounded-md px-2 text-tiny text-zinc-500 hover:bg-black/5 disabled:opacity-35 dark:text-zinc-400 dark:hover:bg-white/5" onClick={duplicatePage}>复制页</button>
-          <button type="button" disabled={isReadOnly} className="h-8 shrink-0 rounded-md px-2 text-tiny text-red-500 hover:bg-red-50 disabled:opacity-35 dark:text-red-300 dark:hover:bg-red-400/10" onClick={deletePage}>删除页</button>
+            />
+          </div>
         </div>
 
         <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[176px_minmax(0,1fr)_224px]">
@@ -3224,6 +3324,63 @@ async function svgToPng(svg: string, requestedScale: number, background: string)
   } finally {
     URL.revokeObjectURL(source);
   }
+}
+
+interface DiagramToolbarMenuItem {
+  key: string;
+  label: string;
+  shortcut?: string;
+  disabled?: boolean;
+  danger?: boolean;
+}
+
+function DiagramToolbarMenu({
+  label,
+  items,
+  compact = false,
+  placement = "bottom-start",
+  onAction,
+}: {
+  label: string;
+  items: DiagramToolbarMenuItem[];
+  compact?: boolean;
+  placement?: "bottom-start" | "bottom-end";
+  onAction: (key: string) => void;
+}) {
+  return (
+    <Dropdown placement={placement} shouldBlockScroll={false}>
+      <DropdownTrigger>
+        <button
+          type="button"
+          className={`flex shrink-0 items-center gap-1.5 rounded-md text-tiny font-medium text-zinc-700 transition hover:bg-cyan-50 hover:text-cyan-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100 ${compact ? "h-8 px-2" : "h-9 px-2.5"}`}
+          aria-label={`${label}菜单`}
+        >
+          {label}
+          <svg className="h-3 w-3 text-zinc-400" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="m4 6 4 4 4-4" />
+          </svg>
+        </button>
+      </DropdownTrigger>
+      <DropdownMenu
+        aria-label={`${label}菜单`}
+        items={items}
+        disabledKeys={items.filter((item) => item.disabled).map((item) => item.key)}
+        onAction={(key) => onAction(String(key))}
+      >
+        {(item) => (
+          <DropdownItem
+            key={item.key}
+            textValue={item.label}
+            color={item.danger ? "danger" : "default"}
+            className={item.danger ? "text-danger" : undefined}
+            endContent={item.shortcut ? <span className="text-[10px] text-zinc-400">{item.shortcut}</span> : null}
+          >
+            {item.label}
+          </DropdownItem>
+        )}
+      </DropdownMenu>
+    </Dropdown>
+  );
 }
 
 function DiagramToolbarButton({
