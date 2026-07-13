@@ -7,9 +7,11 @@ import {
   encodeDiagramUpdate,
   isDiagramPayload,
   MAX_DIAGRAM_DOCUMENT_BYTES,
+  MAX_DIAGRAM_EDGES,
+  MAX_DIAGRAM_NODES,
   parseDiagramDocument,
 } from "./diagramDocument";
-import type { DiagramEdge, DiagramNode } from "./diagramDocument";
+import type { DiagramComment, DiagramEdge, DiagramNode } from "./diagramDocument";
 
 const nodes: DiagramNode[] = [
   {
@@ -54,11 +56,15 @@ const edges: DiagramEdge[] = [
     targetId: "node-process",
     sourcePort: "south",
     targetPort: "north",
+    waypoints: [{ x: 140, y: 130 }],
     zIndex: 0,
     style: {
       strokeColor: "#64748b",
       fontColor: "#334155",
       strokeWidth: 2,
+      edgeType: "orthogonal",
+      startArrow: "oval",
+      endArrow: "block",
     },
   },
 ];
@@ -95,6 +101,71 @@ describe("diagram document", () => {
       ...exported,
       edges: [{ ...edges[0], targetId: "missing" }],
     }))).toThrow("无效、重复或超出限制");
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      edges: [{ ...edges[0], waypoints: [{ x: Number.NaN, y: 20 }] }],
+    }))).toThrow("无效、重复或超出限制");
+  });
+
+  it("accepts nested containers and rejects invalid or cyclic parents", () => {
+    const container: DiagramNode = {
+      ...nodes[0],
+      id: "container-1",
+      kind: "container",
+      label: "业务域",
+      width: 480,
+      height: 320,
+    };
+    const nested = { ...nodes[1], parentId: container.id };
+    const exported = createDiagramDocument([container, nested], [], { width: 2400, height: 1600, gridSize: 10 });
+
+    expect(parseDiagramDocument(JSON.stringify(exported)).nodes[1].parentId).toBe(container.id);
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      nodes: [container, { ...nested, parentId: "missing" }],
+    }))).toThrow("无效、重复或超出限制");
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      nodes: [{ ...container, parentId: nested.id }, { ...nested, kind: "container" }],
+    }))).toThrow("无效、重复或超出限制");
+
+    const pool: DiagramNode = { ...container, id: "pool-1", kind: "swimlane" };
+    const lane: DiagramNode = { ...container, id: "lane-1", kind: "lane", parentId: pool.id };
+    const laneNode: DiagramNode = { ...nodes[1], parentId: lane.id };
+    const swimlaneDocument = createDiagramDocument([pool, lane, laneNode], [], { width: 2400, height: 1600, gridSize: 10 });
+    expect(parseDiagramDocument(JSON.stringify(swimlaneDocument)).nodes.map((node) => node.kind))
+      .toEqual(["swimlane", "lane", "process"]);
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...swimlaneDocument,
+      nodes: [container, { ...lane, parentId: container.id }, laneNode],
+    }))).toThrow("无效、重复或超出限制");
+  });
+
+  it("round-trips multi-page metadata and rejects unknown page references", () => {
+    const pages = [
+      { id: "page-a", name: "主流程", order: 0 },
+      { id: "page-b", name: "异常流程", order: 1 },
+    ];
+    const pagedNodes = [
+      { ...nodes[0], pageId: pages[0].id, locked: true, rotation: 90, style: { ...nodes[0].style, fontSize: 18, italic: true, align: "left" as const } },
+      { ...nodes[1], pageId: pages[1].id },
+    ];
+    const comments: DiagramComment[] = [{ id: "comment-1", pageId: pages[1].id, cellId: pagedNodes[1].id, author: "peer-a", text: "检查异常分支", createdAt: 1_700_000_000_000, resolved: false }];
+    const exported = createDiagramDocument(pagedNodes, [], { width: 2400, height: 1600, gridSize: 10 }, new Date(), pages, pages[1].id, comments);
+    const imported = parseDiagramDocument(JSON.stringify(exported));
+
+    expect(imported.pages).toEqual(pages);
+    expect(imported.activePageId).toBe(pages[1].id);
+    expect(imported.nodes).toEqual(pagedNodes);
+    expect(imported.comments).toEqual(comments);
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      nodes: [{ ...pagedNodes[0], pageId: "missing" }],
+    }))).toThrow("无效、重复或超出限制");
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      comments: [{ ...comments[0], pageId: "missing" }],
+    }))).toThrow("无效、重复或超出限制");
   });
 
   it("rejects malformed, unsupported, and oversized files", () => {
@@ -103,6 +174,31 @@ describe("diagram document", () => {
       .toThrow("不支持的流程图文件格式或版本");
     expect(() => parseDiagramDocument("x".repeat(MAX_DIAGRAM_DOCUMENT_BYTES + 1)))
       .toThrow("流程图文件超过 2 MB");
+  });
+
+  it("round-trips the maximum supported graph size", () => {
+    const largeNodes: DiagramNode[] = Array.from({ length: MAX_DIAGRAM_NODES }, (_, index) => ({
+      ...nodes[1],
+      id: `node-${index}`,
+      label: `节点 ${index}`,
+      x: (index % 40) * 180,
+      y: Math.floor(index / 40) * 96,
+      zIndex: index,
+    }));
+    const largeEdges: DiagramEdge[] = Array.from({ length: MAX_DIAGRAM_EDGES }, (_, index) => ({
+      ...edges[0],
+      id: `edge-${index}`,
+      sourceId: largeNodes[index % largeNodes.length].id,
+      targetId: largeNodes[(index + 1) % largeNodes.length].id,
+      zIndex: index,
+    }));
+    const document = createDiagramDocument(largeNodes, largeEdges, { width: 10000, height: 10000, gridSize: 10 });
+    const source = JSON.stringify(document);
+
+    expect(new TextEncoder().encode(source).length).toBeLessThan(MAX_DIAGRAM_DOCUMENT_BYTES);
+    const imported = parseDiagramDocument(source);
+    expect(imported.nodes).toHaveLength(MAX_DIAGRAM_NODES);
+    expect(imported.edges).toHaveLength(MAX_DIAGRAM_EDGES);
   });
 
   it("encodes Yjs updates for JSON transport", () => {
@@ -136,6 +232,24 @@ describe("diagram document", () => {
       kind: "diagram-sync-request",
       requestId: "",
       createdAt: 1,
+    })).toBe(false);
+  });
+
+  it("validates collaborative presence updates", () => {
+    expect(isDiagramPayload({
+      type: "STDG1",
+      kind: "diagram-presence",
+      pageId: "page-1",
+      selectedIds: ["node-1"],
+      cursor: { x: 120, y: 80 },
+      createdAt: Date.now(),
+    })).toBe(true);
+    expect(isDiagramPayload({
+      type: "STDG1",
+      kind: "diagram-presence",
+      pageId: "page-1",
+      selectedIds: Array.from({ length: 101 }, (_, index) => `node-${index}`),
+      createdAt: Date.now(),
     })).toBe(false);
   });
 

@@ -49,6 +49,27 @@ export default defineConfig(({ mode }) => {
             ) {
               return "diagram-collaboration";
             }
+            if (normalized.includes("/node_modules/pako/")) {
+              return "diagram-compression";
+            }
+            if (
+              normalized.includes("/node_modules/jspdf/")
+              || normalized.includes("/node_modules/fflate/")
+              || normalized.includes("/node_modules/fast-png/")
+              || normalized.includes("/node_modules/canvg/")
+              || normalized.includes("/node_modules/html2canvas/")
+              || normalized.includes("/node_modules/dompurify/")
+              || normalized.includes("/node_modules/core-js/")
+              || normalized.includes("/node_modules/regenerator-runtime/")
+              || normalized.includes("/node_modules/raf/")
+              || normalized.includes("/node_modules/rgbcolor/")
+              || normalized.includes("/node_modules/stackblur-canvas/")
+              || normalized.includes("/node_modules/svg-pathdata/")
+              || normalized.includes("/node_modules/css-line-break/")
+              || normalized.includes("/node_modules/text-segmentation/")
+            ) {
+              return "diagram-pdf";
+            }
 
             if (
               normalized.includes("/node_modules/react/") ||

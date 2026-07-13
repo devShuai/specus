@@ -6,6 +6,8 @@ export const MAX_DIAGRAM_DOCUMENT_BYTES = 2 * 1024 * 1024;
 export const MAX_DIAGRAM_UPDATE_BASE64_LENGTH = 4 * 1024 * 1024;
 export const MAX_DIAGRAM_NODES = 1_000;
 export const MAX_DIAGRAM_EDGES = 2_000;
+export const MAX_DIAGRAM_PAGES = 50;
+export const MAX_DIAGRAM_COMMENTS = 2_000;
 
 export type DiagramNodeKind =
   | "start"
@@ -15,9 +17,31 @@ export type DiagramNodeKind =
   | "document"
   | "database"
   | "actor"
-  | "note";
+  | "note"
+  | "subprocess"
+  | "data"
+  | "delay"
+  | "cloud"
+  | "container"
+  | "swimlane"
+  | "lane"
+  | "bpmnEvent"
+  | "bpmnGateway"
+  | "umlClass"
+  | "entity"
+  | "server"
+  | "queue";
 
 export type DiagramPort = "north" | "east" | "south" | "west";
+export type DiagramEdgeType = "orthogonal" | "straight" | "elbow" | "curved";
+export type DiagramArrowType = "none" | "classic" | "block" | "open" | "oval" | "diamond";
+export type DiagramTextAlign = "left" | "center" | "right";
+export type DiagramSwimlaneDirection = "horizontal" | "vertical";
+
+export interface DiagramPoint {
+  x: number;
+  y: number;
+}
 
 export interface DiagramNodeStyle {
   fillColor: string;
@@ -25,6 +49,13 @@ export interface DiagramNodeStyle {
   fontColor: string;
   strokeWidth: number;
   dashed?: boolean;
+  fontSize?: number;
+  bold?: boolean;
+  italic?: boolean;
+  align?: DiagramTextAlign;
+  opacity?: number;
+  shadow?: boolean;
+  rounded?: boolean;
 }
 
 export interface DiagramEdgeStyle {
@@ -32,6 +63,10 @@ export interface DiagramEdgeStyle {
   fontColor: string;
   strokeWidth: number;
   dashed?: boolean;
+  edgeType?: DiagramEdgeType;
+  startArrow?: DiagramArrowType;
+  endArrow?: DiagramArrowType;
+  opacity?: number;
 }
 
 export interface DiagramNode {
@@ -43,6 +78,11 @@ export interface DiagramNode {
   width: number;
   height: number;
   zIndex: number;
+  pageId?: string;
+  parentId?: string;
+  locked?: boolean;
+  rotation?: number;
+  swimlaneDirection?: DiagramSwimlaneDirection;
   style: DiagramNodeStyle;
 }
 
@@ -53,8 +93,26 @@ export interface DiagramEdge {
   targetId: string;
   sourcePort?: DiagramPort;
   targetPort?: DiagramPort;
+  waypoints?: DiagramPoint[];
   zIndex: number;
+  pageId?: string;
   style: DiagramEdgeStyle;
+}
+
+export interface DiagramPage {
+  id: string;
+  name: string;
+  order: number;
+}
+
+export interface DiagramComment {
+  id: string;
+  pageId: string;
+  cellId?: string;
+  author: string;
+  text: string;
+  createdAt: number;
+  resolved: boolean;
 }
 
 export interface DiagramDocumentV1 {
@@ -68,6 +126,9 @@ export interface DiagramDocumentV1 {
   };
   nodes: DiagramNode[];
   edges: DiagramEdge[];
+  pages?: DiagramPage[];
+  activePageId?: string;
+  comments?: DiagramComment[];
 }
 
 export type DiagramPayload =
@@ -82,6 +143,14 @@ export type DiagramPayload =
       kind: "diagram-sync-request";
       requestId: string;
       createdAt: number;
+    }
+  | {
+      type: "STDG1";
+      kind: "diagram-presence";
+      pageId: string;
+      selectedIds: string[];
+      cursor?: DiagramPoint;
+      createdAt: number;
     };
 
 export function createDiagramDocument(
@@ -89,6 +158,9 @@ export function createDiagramDocument(
   edges: DiagramEdge[],
   canvas: { width: number; height: number; gridSize: number },
   exportedAt = new Date(),
+  pages?: DiagramPage[],
+  activePageId?: string,
+  comments?: DiagramComment[],
 ): DiagramDocumentV1 {
   return {
     format: DIAGRAM_DOCUMENT_FORMAT,
@@ -101,6 +173,9 @@ export function createDiagramDocument(
     },
     nodes: nodes.slice(0, MAX_DIAGRAM_NODES).map(cloneDiagramNode),
     edges: edges.slice(0, MAX_DIAGRAM_EDGES).map(cloneDiagramEdge),
+    ...(pages?.length ? { pages: pages.slice(0, MAX_DIAGRAM_PAGES).map((page) => ({ ...page })) } : {}),
+    ...(activePageId ? { activePageId } : {}),
+    ...(comments?.length ? { comments: comments.slice(0, MAX_DIAGRAM_COMMENTS).map((comment) => ({ ...comment })) } : {}),
   };
 }
 
@@ -137,6 +212,13 @@ export function isDiagramPayload(value: unknown): value is DiagramPayload {
   }
   if (value.kind === "diagram-sync-request") {
     return isIdentifier(value.requestId);
+  }
+  if (value.kind === "diagram-presence") {
+    return isIdentifier(value.pageId)
+      && Array.isArray(value.selectedIds)
+      && value.selectedIds.length <= 100
+      && value.selectedIds.every(isIdentifier)
+      && (value.cursor === undefined || isDiagramPoint(value.cursor));
   }
   return false;
 }
@@ -186,6 +268,33 @@ function isDiagramDocument(value: unknown): value is DiagramDocumentV1 {
     return false;
   }
 
+  if (value.comments !== undefined
+    && (!Array.isArray(value.comments)
+      || value.comments.length > MAX_DIAGRAM_COMMENTS
+      || !value.comments.every(isDiagramComment)
+      || new Set(value.comments.map((comment) => comment.id)).size !== value.comments.length)) {
+    return false;
+  }
+
+  if (value.pages !== undefined) {
+    if (!Array.isArray(value.pages)
+      || value.pages.length === 0
+      || value.pages.length > MAX_DIAGRAM_PAGES
+      || !value.pages.every(isDiagramPage)) {
+      return false;
+    }
+    const pageIds = new Set(value.pages.map((page) => page.id));
+    if (pageIds.size !== value.pages.length
+      || (value.activePageId !== undefined && (!isIdentifier(value.activePageId) || !pageIds.has(value.activePageId)))
+      || value.nodes.some((node) => node.pageId !== undefined && !pageIds.has(node.pageId))
+      || value.edges.some((edge) => edge.pageId !== undefined && !pageIds.has(edge.pageId))
+      || (value.comments !== undefined && value.comments.some((comment) => !pageIds.has(comment.pageId)))) {
+      return false;
+    }
+  } else if (value.activePageId !== undefined) {
+    return false;
+  }
+
   return true;
 }
 
@@ -199,6 +308,7 @@ export function isDiagramGraphState(nodes: unknown[], edges: unknown[]): boolean
   const typedNodes = nodes as DiagramNode[];
   const typedEdges = edges as DiagramEdge[];
   const nodeIds = new Set(typedNodes.map((node) => node.id));
+  const nodesById = new Map(typedNodes.map((node) => [node.id, node]));
   const edgeIds = new Set(typedEdges.map((edge) => edge.id));
   if (nodeIds.size !== typedNodes.length || edgeIds.size !== typedEdges.length) {
     return false;
@@ -206,6 +316,27 @@ export function isDiagramGraphState(nodes: unknown[], edges: unknown[]): boolean
   for (const edge of typedEdges) {
     if (!nodeIds.has(edge.sourceId) || !nodeIds.has(edge.targetId)) {
       return false;
+    }
+  }
+  for (const node of typedNodes) {
+    if (!node.parentId) {
+      continue;
+    }
+    const parent = nodesById.get(node.parentId);
+    if (!parent
+      || parent.id === node.id
+      || (parent.kind !== "container" && parent.kind !== "swimlane" && parent.kind !== "lane")
+      || (node.kind === "lane" && parent.kind !== "swimlane")) {
+      return false;
+    }
+    const visited = new Set([node.id]);
+    let ancestor: DiagramNode | undefined = parent;
+    while (ancestor) {
+      if (visited.has(ancestor.id)) {
+        return false;
+      }
+      visited.add(ancestor.id);
+      ancestor = ancestor.parentId ? nodesById.get(ancestor.parentId) : undefined;
     }
   }
   return true;
@@ -225,6 +356,11 @@ export function isDiagramNode(value: unknown): value is DiagramNode {
     && value.width <= 100_000
     && value.height <= 100_000
     && Number.isSafeInteger(value.zIndex)
+    && (value.pageId === undefined || isIdentifier(value.pageId))
+    && (value.parentId === undefined || isIdentifier(value.parentId))
+    && (value.locked === undefined || typeof value.locked === "boolean")
+    && (value.rotation === undefined || (isFiniteNumber(value.rotation) && value.rotation >= -360 && value.rotation <= 360))
+    && (value.swimlaneDirection === undefined || value.swimlaneDirection === "horizontal" || value.swimlaneDirection === "vertical")
     && isNodeStyle(value.style);
 }
 
@@ -236,7 +372,11 @@ export function isDiagramEdge(value: unknown): value is DiagramEdge {
     && isIdentifier(value.targetId)
     && (value.sourcePort === undefined || isDiagramPort(value.sourcePort))
     && (value.targetPort === undefined || isDiagramPort(value.targetPort))
+    && (value.waypoints === undefined || (Array.isArray(value.waypoints)
+      && value.waypoints.length <= 128
+      && value.waypoints.every(isDiagramPoint)))
     && Number.isSafeInteger(value.zIndex)
+    && (value.pageId === undefined || isIdentifier(value.pageId))
     && isEdgeStyle(value.style);
 }
 
@@ -246,7 +386,15 @@ function isNodeStyle(value: unknown): value is DiagramNodeStyle {
     && isColor(value.strokeColor)
     && isColor(value.fontColor)
     && isStrokeWidth(value.strokeWidth)
-    && (value.dashed === undefined || typeof value.dashed === "boolean");
+    && (value.dashed === undefined || typeof value.dashed === "boolean")
+    && (value.fontSize === undefined || (isFiniteNumber(value.fontSize) && value.fontSize >= 8 && value.fontSize <= 96))
+    && (value.bold === undefined || typeof value.bold === "boolean")
+    && (value.italic === undefined || typeof value.italic === "boolean")
+    && (value.align === undefined || value.align === "left" || value.align === "center" || value.align === "right")
+    && (value.opacity === undefined || (isFiniteNumber(value.opacity) && value.opacity >= 10 && value.opacity <= 100))
+    && (value.shadow === undefined || typeof value.shadow === "boolean")
+    && (value.rounded === undefined || typeof value.rounded === "boolean")
+    && value.edgeType === undefined;
 }
 
 function isEdgeStyle(value: unknown): value is DiagramEdgeStyle {
@@ -254,7 +402,11 @@ function isEdgeStyle(value: unknown): value is DiagramEdgeStyle {
     && isColor(value.strokeColor)
     && isColor(value.fontColor)
     && isStrokeWidth(value.strokeWidth)
-    && (value.dashed === undefined || typeof value.dashed === "boolean");
+    && (value.dashed === undefined || typeof value.dashed === "boolean")
+    && (value.edgeType === undefined || isDiagramEdgeType(value.edgeType))
+    && (value.startArrow === undefined || isDiagramArrowType(value.startArrow))
+    && (value.endArrow === undefined || isDiagramArrowType(value.endArrow))
+    && (value.opacity === undefined || (isFiniteNumber(value.opacity) && value.opacity >= 10 && value.opacity <= 100));
 }
 
 function cloneDiagramNode(node: DiagramNode): DiagramNode {
@@ -262,7 +414,11 @@ function cloneDiagramNode(node: DiagramNode): DiagramNode {
 }
 
 function cloneDiagramEdge(edge: DiagramEdge): DiagramEdge {
-  return { ...edge, style: { ...edge.style } };
+  return {
+    ...edge,
+    ...(edge.waypoints ? { waypoints: edge.waypoints.map((point) => ({ ...point })) } : {}),
+    style: { ...edge.style },
+  };
 }
 
 function isDiagramNodeKind(value: unknown): value is DiagramNodeKind {
@@ -273,7 +429,64 @@ function isDiagramNodeKind(value: unknown): value is DiagramNodeKind {
     || value === "document"
     || value === "database"
     || value === "actor"
-    || value === "note";
+    || value === "note"
+    || value === "subprocess"
+    || value === "data"
+    || value === "delay"
+    || value === "cloud"
+    || value === "container"
+    || value === "swimlane"
+    || value === "lane"
+    || value === "bpmnEvent"
+    || value === "bpmnGateway"
+    || value === "umlClass"
+    || value === "entity"
+    || value === "server"
+    || value === "queue";
+}
+
+function isDiagramEdgeType(value: unknown): value is DiagramEdgeType {
+  return value === "orthogonal" || value === "straight" || value === "elbow" || value === "curved";
+}
+
+function isDiagramArrowType(value: unknown): value is DiagramArrowType {
+  return value === "none"
+    || value === "classic"
+    || value === "block"
+    || value === "open"
+    || value === "oval"
+    || value === "diamond";
+}
+
+function isDiagramPoint(value: unknown): value is DiagramPoint {
+  return isRecord(value)
+    && isFiniteNumber(value.x)
+    && isFiniteNumber(value.y)
+    && Math.abs(value.x) <= 100_000
+    && Math.abs(value.y) <= 100_000;
+}
+
+export function isDiagramPage(value: unknown): value is DiagramPage {
+  return isRecord(value)
+    && isIdentifier(value.id)
+    && typeof value.name === "string"
+    && value.name.trim().length > 0
+    && value.name.length <= 80
+    && typeof value.order === "number"
+    && Number.isSafeInteger(value.order)
+    && value.order >= 0
+    && value.order < MAX_DIAGRAM_PAGES;
+}
+
+export function isDiagramComment(value: unknown): value is DiagramComment {
+  if (!isRecord(value)) return false;
+  return isIdentifier(value.id)
+    && isIdentifier(value.pageId)
+    && (value.cellId === undefined || isIdentifier(value.cellId))
+    && typeof value.author === "string" && value.author.length > 0 && value.author.length <= 200
+    && typeof value.text === "string" && value.text.length > 0 && value.text.length <= 500
+    && isFiniteNumber(value.createdAt)
+    && typeof value.resolved === "boolean";
 }
 
 function isDiagramPort(value: unknown): value is DiagramPort {

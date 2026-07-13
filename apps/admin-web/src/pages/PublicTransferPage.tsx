@@ -2495,6 +2495,9 @@ function whiteboardEventKey(sourcePeerId: string, payload: WhiteboardPayload) {
     if (payload.kind === "diagram-update") {
       return `${sourcePeerId}:diagram-update:${payload.createdAt}:${payload.update.length}:${payload.update.slice(0, 20)}`;
     }
+    if (payload.kind === "diagram-presence") {
+      return `${sourcePeerId}:diagram-presence:${payload.createdAt}`;
+    }
     return `${sourcePeerId}:diagram-sync:${payload.requestId}:${payload.createdAt}`;
   }
   if (payload.kind === "stroke-start") {
