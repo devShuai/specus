@@ -518,7 +518,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
 - Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun / macOS utun、同用户默认互通、`PEER_CONTROL` 信令、标准 STUN/TURN、公共 STUN 候选补充、UDP direct、server relay、NAT 类型探测、链路和会话展示
 - 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
-- 免登录房间互传：支持文件传输、剪贴板同步和同步白板；文件接收默认关闭“接收前确认”，收到文件元数据后自动开始接收；仅在会话内开启该开关后才显示接收/拒绝，拒绝后发送端不会绕过拒绝回退 OSS
+- 免登录房间互传：支持文件传输、剪贴板同步和同步白板；专业流程图基于 maxGraph + Yjs，支持多页面、分类图形库与模板、动态泳池/泳道、容器与组合、智能参考线、小地图、自动布局、格式刷、高级样式、评论、协作光标、会话版本快照和只读预览；支持 `.stdg`、多页 `.drawio`、Mermaid、PlantUML、Visio `.vsdx` 导入，以及 `.stdg`、`.drawio`、Mermaid、PlantUML、Visio `.vdx`、SVG、PNG、全页 PDF 导出；文件接收默认关闭“接收前确认”，收到文件元数据后自动开始接收；仅在会话内开启该开关后才显示接收/拒绝，拒绝后发送端不会绕过拒绝回退 OSS
 - 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
 - Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled` 管理字段以及 HTTP 路由的 `pathRewriteEnabled` 配置和回包路径改写行为
 - Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
