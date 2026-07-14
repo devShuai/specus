@@ -106,6 +106,22 @@ describe("draw.io diagram compatibility", () => {
     expect(imported.edges[0]).toMatchObject({ sourcePort: "east", targetPort: "west" });
   });
 
+  it("preserves the manual input symbol instead of exporting it as a hexagon", () => {
+    const manualInput: DiagramNode = {
+      ...processNode,
+      id: "manual-input",
+      kind: "manualInput",
+      label: "人工录入",
+      parentId: undefined,
+    };
+    const document = createDiagramDocument([manualInput], [], { width: 1200, height: 800, gridSize: 10 });
+    const xml = exportDrawioDocument(document);
+
+    expect(xml).toContain("shape=manualInput");
+    expect(xml).not.toContain("shape=hexagon");
+    expect(parseDrawioDocument(xml, parser).nodes[0].kind).toBe("manualInput");
+  });
+
   it("round-trips an official draw.io stencil reference", () => {
     const stencilNode: DiagramNode = {
       ...processNode,

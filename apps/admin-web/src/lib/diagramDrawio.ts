@@ -296,7 +296,8 @@ function drawioShape(kind: DiagramNodeKind) {
   if (kind === "ellipse" || kind === "circle" || kind === "start" || kind === "end" || kind === "connector" || kind === "umlUseCase" || kind === "erAttribute" || kind === "router") return "ellipse";
   if (kind === "diamond" || kind === "decision" || kind === "bpmnGateway" || kind === "erRelationship") return "rhombus";
   if (kind === "triangle") return "triangle";
-  if (kind === "hexagon" || kind === "manualInput" || kind === "service") return "shape=hexagon;perimeter=hexagonPerimeter2";
+  if (kind === "hexagon" || kind === "service") return "shape=hexagon;perimeter=hexagonPerimeter2";
+  if (kind === "manualInput") return "shape=manualInput";
   if (kind === "document" || kind === "bpmnDataObject") return "shape=document";
   if (kind === "database") return "shape=cylinder3;boundedLbl=1;backgroundOutline=1;size=15";
   if (kind === "actor") return "shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top";
@@ -416,6 +417,7 @@ function nodeKindFromStyle(style: Map<string, string>, label: string): DiagramNo
   if (shape === "rhombus") return "decision";
   if (shape === "triangle") return "triangle";
   if (shape === "hexagon") return "hexagon";
+  if (shape === "manualInput") return "manualInput";
   if (shape === "document") return "document";
   if (shape === "cylinder" || shape === "cylinder3") return "database";
   if (shape === "umlActor" || shape === "actor") return "actor";
