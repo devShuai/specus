@@ -7,6 +7,7 @@ import type {
   ClientDownloadLink,
   ClientDownloadLinkMutation,
   ClientMutation,
+  ClientNameAvailability,
   ConnectionPage,
   AttachmentCompleteRequest,
   AttachmentPresignDownloadRequest,
@@ -35,6 +36,7 @@ import type {
   PeerMeshSession,
   PeerMeshStatus,
   PublicTransferIceConfig,
+  PublicTransferClientNameAvailability,
   PublicTransferCreatedAccessToken,
   PublicTransferDiagramVersion,
   PublicTransferDiagramVersionDetail,
@@ -239,6 +241,13 @@ export const adminApi = {
     request<ClientResult>("/clients", { method: "POST", body: JSON.stringify(body) }),
   updateClient: (id: number, body: ClientMutation) =>
     request<ClientResult>(`/clients/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  checkClientNameAvailability: (clientName: string, excludeClientId?: number) => {
+    const params = new URLSearchParams({ clientName });
+    if (excludeClientId != null) {
+      params.set("excludeClientId", String(excludeClientId));
+    }
+    return request<ClientNameAvailability>(`/clients/name-availability?${params}`);
+  },
   deleteClient: (id: number) => request<null>(`/clients/${id}`, { method: "DELETE" }),
   pushNatControl: (id: number) => request<NatControlResult>(`/clients/${id}/nat-control`, { method: "POST" }),
   getClient: (id: number) => request<ClientDetail>(`/clients/${id}`),
@@ -461,6 +470,23 @@ export async function fetchPublicTransferIceConfig(): Promise<PublicTransferIceC
   } catch {
     return null;
   }
+}
+
+export async function publicCheckTransferClientNameAvailability(
+  clientName: string,
+  excludePeerId?: string,
+): Promise<PublicTransferClientNameAvailability> {
+  const params = new URLSearchParams({ clientName });
+  if (excludePeerId) {
+    params.set("excludePeerId", excludePeerId);
+  }
+  const response = await fetch(`/api/public/transfer/clients/name-availability?${params}`);
+  const text = await response.text();
+  const body = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new ApiError(body?.error || response.statusText);
+  }
+  return body as PublicTransferClientNameAvailability;
 }
 
 export function publicPresignAttachmentUpload(

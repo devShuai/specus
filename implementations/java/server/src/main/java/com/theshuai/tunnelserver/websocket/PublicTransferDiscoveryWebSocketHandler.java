@@ -21,6 +21,7 @@ import org.springframework.web.socket.server.HandshakeInterceptor;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -38,6 +39,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(PublicTransferDiscoveryWebSocketHandler.class);
     private static final int MAX_MESSAGE_CHARS = 64 * 1024;
+    private static final int MAX_DISPLAY_NAME_LENGTH = 120;
     private static final Set<String> VIEWER_WRITE_MESSAGE_TYPES = Set.of("attachment", "clipboard", "whiteboard");
 
     private final PublicTransferProperties properties;
@@ -64,6 +66,13 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         session.setTextMessageSizeLimit(MAX_MESSAGE_CHARS);
         session.setBinaryMessageSizeLimit(MAX_MESSAGE_CHARS);
         Participant participant = Participant.from(session);
+        try {
+            participant = participant.withDisplayName(normalizeDisplayName(participant.displayName()));
+        } catch (IllegalArgumentException exception) {
+            send(session, Map.of("type", "error", "error", exception.getMessage()));
+            closeQuietly(session, CloseStatus.POLICY_VIOLATION);
+            return;
+        }
         if (participant.sharedRoom()) {
             try {
                 RoomAccess roomAccess = roomService.resolve(
@@ -81,6 +90,8 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         synchronized (participantJoinLock) {
             if (hasConnectedPeerId(participant)) {
                 joinError = "peer id is already connected";
+            } else if (hasConnectedDisplayName(participant.displayName())) {
+                joinError = "client name is already in use";
             } else if (roomPeerCount(participant) >= Math.max(1, properties.getMaxDiscoveryPeersPerRoom())) {
                 joinError = "room is full";
             } else {
@@ -97,6 +108,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         send(session, Map.of(
                 "type", "hello",
                 "peerId", participant.peerId(),
+                "displayName", participant.displayName(),
                 "roomId", participant.roomId(),
                 "publicAddress", participant.publicAddress(),
                 "sharedRoom", participant.sharedRoom(),
@@ -217,6 +229,37 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 .anyMatch(peer -> peer.sameGroup(participant) && peer.peerId().equals(participant.peerId()));
     }
 
+    private boolean hasConnectedDisplayName(String displayName) {
+        return participantsBySession.values().stream()
+                .anyMatch(peer -> peer.displayName().equalsIgnoreCase(displayName));
+    }
+
+    public ClientNameAvailability checkClientNameAvailability(String requestedClientName, String excludePeerId) {
+        String clientName = normalizeDisplayName(requestedClientName);
+        String excluded = StringUtils.hasText(excludePeerId) ? excludePeerId.trim() : "";
+        boolean available;
+        synchronized (participantJoinLock) {
+            available = participantsBySession.values().stream()
+                    .filter(peer -> excluded.isEmpty() || !peer.peerId().equals(excluded))
+                    .noneMatch(peer -> peer.displayName().equalsIgnoreCase(clientName));
+        }
+        return new ClientNameAvailability(clientName, available);
+    }
+
+    private static String normalizeDisplayName(String requestedClientName) {
+        if (!StringUtils.hasText(requestedClientName)) {
+            throw new IllegalArgumentException("client name is required");
+        }
+        String clientName = requestedClientName.trim();
+        if (clientName.length() > MAX_DISPLAY_NAME_LENGTH) {
+            throw new IllegalArgumentException("client name is too long");
+        }
+        if (clientName.codePoints().anyMatch(Character::isISOControl)) {
+            throw new IllegalArgumentException("client name contains invalid characters");
+        }
+        return clientName;
+    }
+
     private boolean allowMessage(WebSocketSession session) {
         int limit = Math.max(1, properties.getDiscoveryMessageRateLimitPerConnection());
         long windowMillis = Math.max(1L, properties.getDiscoveryMessageRateLimitWindowSeconds()) * 1000L;
@@ -322,6 +365,21 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             );
         }
 
+        private Participant withDisplayName(String normalizedDisplayName) {
+            return new Participant(
+                    sessionId,
+                    peerId,
+                    normalizedDisplayName,
+                    roomId,
+                    publicAddress,
+                    roomKey,
+                    roomToken,
+                    roomRole,
+                    sharedRoom,
+                    connectedAt
+            );
+        }
+
         private boolean sameGroup(Participant other) {
             return roomId.equals(other.roomId) && roomKey.equals(other.roomKey);
         }
@@ -363,7 +421,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                     .getQueryParams();
             attributes.put("roomId", query(params, "roomId", "nearby", 120));
             attributes.put("peerId", query(params, "peerId", "", 120));
-            attributes.put("displayName", query(params, "displayName", "web", 120));
+            attributes.put("displayName", query(params, "displayName", "web", MAX_DISPLAY_NAME_LENGTH + 1));
             String publicAddress = publicAddress(request);
             String roomToken = query(params, "roomToken", "", 512);
             boolean sharedRoom = StringUtils.hasText(roomToken);
@@ -386,7 +444,15 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             if (!StringUtils.hasText(value)) {
                 return fallback;
             }
-            String normalized = value.trim();
+            String normalized;
+            try {
+                normalized = URLDecoder.decode(value, StandardCharsets.UTF_8).trim();
+            } catch (IllegalArgumentException exception) {
+                return fallback;
+            }
+            if (!StringUtils.hasText(normalized)) {
+                return fallback;
+            }
             return truncateUtf16WithoutSplittingSurrogate(normalized, maxLength);
         }
 
@@ -442,5 +508,8 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 throw new IllegalStateException("failed to hash room token", e);
             }
         }
+    }
+
+    public record ClientNameAvailability(String clientName, boolean available) {
     }
 }

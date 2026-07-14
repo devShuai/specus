@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.management.model.HttpRouteMapping;
 import com.theshuai.tunnelserver.management.model.TunnelMapping;
 import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.ClientAccountService.ClientMutation;
+import com.theshuai.tunnelserver.management.service.ClientAccountService.ClientNameAvailability;
 import com.theshuai.tunnelserver.management.service.ClientAccountService.ClientResult;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
@@ -53,6 +54,14 @@ public class ClientResource {
     public List<ClientAccountView> listClients(@AuthenticationPrincipal Jwt jwt) {
         trafficUsageService.flush();
         return clientAccountService.listClients(contextResolver.resolve(jwt));
+    }
+
+    @GetMapping("/name-availability")
+    public ClientNameAvailability checkClientNameAvailability(@AuthenticationPrincipal Jwt jwt,
+                                                              @RequestParam String clientName,
+                                                              @RequestParam(required = false) Long excludeClientId) {
+        return clientAccountService.checkClientNameAvailability(
+                contextResolver.resolve(jwt), clientName, excludeClientId);
     }
 
     /** S3.2 单客户端聚合详情 */

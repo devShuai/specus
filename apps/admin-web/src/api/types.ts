@@ -52,6 +52,11 @@ export interface ClientResult {
   client: Client;
 }
 
+export interface ClientNameAvailability {
+  clientName: string;
+  available: boolean;
+}
+
 export interface ClientDetail {
   client: Client;
   tunnels: Tunnel[];
@@ -469,6 +474,11 @@ export type PublicTransferRoomRole = "OWNER" | "EDITOR" | "VIEWER";
 export interface PublicTransferRoomCredential {
   roomToken: string;
   peerId: string;
+}
+
+export interface PublicTransferClientNameAvailability {
+  clientName: string;
+  available: boolean;
 }
 
 export interface PublicTransferRoomAccessToken {

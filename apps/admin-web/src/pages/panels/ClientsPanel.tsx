@@ -186,7 +186,7 @@ export function ClientsPanel() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
-            <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret，clientName 由服务端按机器自动分配。</p>
+            <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret；名称首次连接时自动生成，之后可在实例列表中修改。</p>
           </div>
           <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
             刷新
@@ -285,7 +285,7 @@ export function ClientsPanel() {
       <section className="min-w-0 space-y-3">
         <div>
           <h2 className="text-lg font-semibold text-foreground">客户端实例</h2>
-          <p className="text-small text-default-500">实例由客户端首次登录后注册，名称由机器指纹和系统用户生成。</p>
+          <p className="text-small text-default-500">实例首次登录后自动注册并生成名称；可在编辑窗口中自定义，名称在全局范围内不可重复。</p>
         </div>
 
         {/* mobile: 卡片 */}
@@ -493,28 +493,80 @@ interface EditClientModalProps {
 }
 
 function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) {
+  const [clientName, setClientName] = useState("");
+  const [nameStatus, setNameStatus] = useState<"idle" | "checking" | "available" | "unavailable" | "error">("idle");
   const [rate, setRate] = useState("30");
   const [enabled, setEnabled] = useState(true);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (client) {
+      setClientName(client.clientName);
+      setNameStatus("available");
       setRate(String(client.connectionRateLimitPerMinute));
       setEnabled(client.enabled);
     }
   }, [client]);
 
+  const normalizedClientName = clientName.trim();
+  const localNameError = !normalizedClientName
+    ? "客户端名称不能为空"
+    : normalizedClientName.length > 120
+      ? "客户端名称不能超过 120 个字符"
+      : "";
+  const nameError = localNameError
+    || (nameStatus === "unavailable" ? "该名称已被其他客户端使用" : "")
+    || (nameStatus === "error" ? "暂时无法校验名称，请稍后重试" : "");
+
+  useEffect(() => {
+    if (!client || localNameError) {
+      setNameStatus("idle");
+      return;
+    }
+    if (normalizedClientName === client.clientName) {
+      setNameStatus("available");
+      return;
+    }
+
+    let active = true;
+    setNameStatus("checking");
+    const timer = window.setTimeout(() => {
+      void adminApi.checkClientNameAvailability(normalizedClientName, client.id)
+        .then((result) => {
+          if (active) {
+            setNameStatus(result.available ? "available" : "unavailable");
+          }
+        })
+        .catch(() => {
+          if (active) {
+            setNameStatus("error");
+          }
+        });
+    }, 300);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [client, localNameError, normalizedClientName]);
+
   const save = async () => {
-    if (!client) {
+    if (!client || localNameError) {
       return;
     }
     setSaving(true);
     try {
+      const availability = await adminApi.checkClientNameAvailability(normalizedClientName, client.id);
+      if (!availability.available) {
+        setNameStatus("unavailable");
+        return;
+      }
+      const renamed = normalizedClientName !== client.clientName;
       await adminApi.updateClient(client.id, {
+        clientName: normalizedClientName,
         enabled,
         connectionRateLimitPerMinute: Number(rate) || 0,
       });
-      notify("客户端实例已更新");
+      notify(renamed ? "客户端名称已更新，在线实例将自动重连" : "客户端实例已更新");
       disclosure.onClose();
       onSaved();
     } catch (error) {
@@ -532,6 +584,20 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
             <ModalHeader>编辑客户端实例「{client?.clientName}」</ModalHeader>
             <ModalBody className="gap-3">
               <Input
+                label="客户端名称"
+                value={clientName}
+                onValueChange={setClientName}
+                maxLength={120}
+                isRequired
+                isInvalid={Boolean(nameError)}
+                errorMessage={nameError}
+                description={nameStatus === "checking"
+                  ? "正在检查全局唯一性…"
+                  : nameStatus === "available" && !localNameError
+                    ? "名称可用；修改后在线实例会重新连接"
+                    : "所有租户和用户之间不可重名"}
+              />
+              <Input
                 type="number"
                 label="每分钟连接上限（0 = 不限）"
                 value={rate}
@@ -547,7 +613,12 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
               <Button variant="flat" onPress={onClose}>
                 取消
               </Button>
-              <Button color="primary" isLoading={saving} onPress={() => void save()}>
+              <Button
+                color="primary"
+                isDisabled={Boolean(localNameError) || nameStatus === "checking" || nameStatus === "unavailable"}
+                isLoading={saving}
+                onPress={() => void save()}
+              >
                 保存
               </Button>
             </ModalFooter>

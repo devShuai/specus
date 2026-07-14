@@ -6,6 +6,7 @@ import com.theshuai.tunnelserver.management.model.ClientAccountView;
 import com.theshuai.tunnelserver.management.model.ClientSession;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
+import com.theshuai.tunnelserver.management.repository.ClientNameReferenceRepository;
 import com.theshuai.tunnelserver.management.repository.ClientSessionRepository;
 import com.theshuai.tunnelserver.management.repository.TrafficTotal;
 import com.theshuai.tunnelserver.management.repository.TrafficUsageRepository;
@@ -46,13 +47,16 @@ public class ClientAccountService {
     private final ClientAccountRepository clientAccountRepository;
     private final TrafficUsageRepository trafficUsageRepository;
     private final ClientSessionRepository clientSessionRepository;
+    private final ClientNameReferenceRepository clientNameReferenceRepository;
 
     public ClientAccountService(ClientAccountRepository clientAccountRepository,
                                 TrafficUsageRepository trafficUsageRepository,
-                                ClientSessionRepository clientSessionRepository) {
+                                ClientSessionRepository clientSessionRepository,
+                                ClientNameReferenceRepository clientNameReferenceRepository) {
         this.clientAccountRepository = clientAccountRepository;
         this.trafficUsageRepository = trafficUsageRepository;
         this.clientSessionRepository = clientSessionRepository;
+        this.clientNameReferenceRepository = clientNameReferenceRepository;
     }
 
     @Transactional(readOnly = true)
@@ -148,6 +152,18 @@ public class ClientAccountService {
         return updateClient(context.tenant(), account, request);
     }
 
+    @Transactional(readOnly = true)
+    public ClientNameAvailability checkClientNameAvailability(ManagementContext context,
+                                                              String requestedClientName,
+                                                              Long excludeClientId) {
+        String clientName = requireClientName(requestedClientName);
+        ClientAccount excluded = excludeClientId == null ? null : findClientById(context, excludeClientId);
+        boolean available = clientAccountRepository.findByClientName(clientName)
+                .map(existing -> excluded != null && existing.getId().equals(excluded.getId()))
+                .orElse(true);
+        return new ClientNameAvailability(clientName, available);
+    }
+
     private ClientResult updateClient(TenantContext tenant, ClientAccount account, ClientMutation request) {
         String originalClientName = account.getClientName();
         String newClientName = StringUtils.hasText(request.clientName())
@@ -166,12 +182,16 @@ public class ClientAccountService {
                 request.connectionRateLimitPerMinute(),
                 account.getConnectionRateLimitPerMinute()
         ));
-        account.setUpdatedAt(Instant.now().toString());
+        String updatedAt = Instant.now().toString();
+        account.setUpdatedAt(updatedAt);
         invalidateNameCache(originalClientName);
         if (!newClientName.equals(originalClientName)) {
             invalidateNameCache(newClientName);
         }
-        clientAccountRepository.save(account);
+        clientAccountRepository.saveAndFlush(account);
+        if (!newClientName.equals(originalClientName)) {
+            clientNameReferenceRepository.rename(account.getId(), newClientName, updatedAt);
+        }
         if (!account.isEnabled() || !account.getClientName().equals(originalClientName)) {
             // 优先用"停用"作为原因（更直接），若只是改名则用 ADMIN_RENAMED。
             DisconnectReason reason = !account.isEnabled()
@@ -367,5 +387,8 @@ public class ClientAccountService {
     }
 
     public record ClientResult(ClientAccountView client) {
+    }
+
+    public record ClientNameAvailability(String clientName, boolean available) {
     }
 }
