@@ -5,7 +5,21 @@ import type {
   DragEvent as ReactDragEvent,
   ReactNode,
 } from "react";
-import { Button, Chip, Input, Modal, ModalBody, ModalContent, ModalHeader, Progress, Switch } from "@heroui/react";
+import {
+  Button,
+  Chip,
+  Dropdown,
+  DropdownItem,
+  DropdownMenu,
+  DropdownTrigger,
+  Input,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalHeader,
+  Progress,
+  Switch,
+} from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
@@ -15,6 +29,7 @@ import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhite
 import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
 import {
   fetchPublicTransferIceConfig,
+  publicCheckTransferClientNameAvailability,
   publicCreateTransferRoomAccessToken,
   publicCompleteAttachment,
   publicListTransferRoomAccessTokens,
@@ -43,6 +58,7 @@ import {
   type TransferRoomSettingsErrors,
 } from "../lib/transferRoom";
 import { sendWhiteboardWithFallback } from "../lib/whiteboardTransport";
+import { decodeLegacyPeerDisplayName } from "../lib/peerDisplayName";
 import {
   clipboardSyncEventKey,
   isClipboardSyncPayload,
@@ -65,6 +81,8 @@ const LazySyncedDiagram = lazy(() =>
 
 type UploadState = "idle" | "connecting" | "waiting" | "direct" | "presigning" | "uploading" | "completing" | "done" | "failed";
 type TransferToolMode = "files" | "clipboard" | "whiteboard";
+type ClientNameStatus = "idle" | "checking" | "available" | "unavailable" | "error";
+type TransferInviteRole = Exclude<PublicTransferRoomRole, "OWNER">;
 export type PublicTransferWorkspace = "transfer" | "diagram";
 const TRANSFER_TOOL_MODES: TransferToolMode[] = ["files", "clipboard", "whiteboard"];
 
@@ -148,6 +166,17 @@ const CLIPBOARD_SEEN_EVENT_TTL_MS = 10 * 60 * 1000;
 const WHITEBOARD_DIRECT_TIMEOUT_MS = 2500;
 const WHITEBOARD_TURN_TIMEOUT_MS = 5000;
 const WHITEBOARD_TRANSPORT_RETRY_MS = 15_000;
+const MAX_TRANSFER_CLIENT_NAME_LENGTH = 120;
+const TRANSFER_CLIENT_NAME_STORAGE_KEY = "public-transfer-client-name";
+const TRANSFER_PEER_ID_STORAGE_KEY = "public-transfer-peer-id";
+const TRANSFER_PEER_LEASE_PREFIX = "public-transfer-peer-lease:";
+const TRANSFER_PEER_LEASE_TTL_MS = 15_000;
+const TRANSFER_PEER_LEASE_REFRESH_MS = 5_000;
+
+type TransferPeerIdentity = {
+  peerId: string;
+  leaseOwner: string;
+};
 
 export function PublicTransferPage() {
   return <PublicTransferWorkspacePage workspace="transfer" />;
@@ -175,16 +204,26 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const whiteboardTransportRetryRef = useRef<Map<string, WhiteboardTransportRetryState>>(new Map());
   const currentRoomPeerIdsRef = useRef<Set<string>>(new Set());
   const currentRoomPeerRolesRef = useRef<Map<string, PublicTransferRoomRole>>(new Map());
+  const currentRoomPeerNamesRef = useRef<Map<string, string>>(new Map());
   const roomEpochRef = useRef(0);
   const roomGenerationRef = useRef(0);
-  const [peerId] = useState(() => loadOrCreatePeerId());
+  const [peerIdentity] = useState(() => claimTransferPeerIdentity());
+  const peerId = peerIdentity.peerId;
+  const [displayName, setDisplayName] = useState(() => loadTransferClientName(peerId));
+  const [displayNameDraft, setDisplayNameDraft] = useState(displayName);
+  const [clientNameStatus, setClientNameStatus] = useState<ClientNameStatus>("available");
+  const [clientNameSaving, setClientNameSaving] = useState(false);
+  const [clientNameConnectionGeneration, setClientNameConnectionGeneration] = useState(0);
+  const [roomSettingsOpen, setRoomSettingsOpen] = useState(false);
   const [roomGeneration, setRoomGeneration] = useState(0);
   const [networkMode, setNetworkMode] = useState<TransferNetworkMode>(() => readInitialNetworkMode());
+  const [networkModeTransitionId, setNetworkModeTransitionId] = useState(0);
   const [roomId, setRoomId] = useState(() => readInitialRoomId());
   const [roomToken, setRoomToken] = useState(() => loadOrCreateRoomToken(readInitialRoomToken()));
   const [roomIdDraft, setRoomIdDraft] = useState(roomId);
   const [roomTokenDraft, setRoomTokenDraft] = useState(roomToken);
   const [roomRole, setRoomRole] = useState<PublicTransferRoomRole | null>(null);
+  const [roomInviteRole, setRoomInviteRole] = useState<TransferInviteRole>("EDITOR");
   const [roomAccessTokens, setRoomAccessTokens] = useState<PublicTransferRoomAccessToken[]>([]);
   const [createdRoomAccess, setCreatedRoomAccess] = useState<PublicTransferCreatedAccessToken | null>(null);
   const [roomAccessLoading, setRoomAccessLoading] = useState(false);
@@ -207,10 +246,22 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [isFileDragActive, setFileDragActive] = useState(false);
   const [activeTool, setActiveTool] = useState<TransferToolMode>("files");
   const [clipboardFocusRequest, setClipboardFocusRequest] = useState(0);
-  const [clipboardSyncEnabled, setClipboardSyncEnabled] = useState(false);
   const [clipboardEvents, setClipboardEvents] = useState<ClipboardInboundEvent[]>([]);
   const [whiteboardEvents, setWhiteboardEvents] = useState<WhiteboardInboundEvent[]>([]);
   const isDiagramWorkspace = workspace === "diagram";
+
+  useEffect(() => maintainTransferPeerIdentityLease(peerIdentity), [peerIdentity]);
+
+  useEffect(() => {
+    if (networkModeTransitionId === 0) {
+      return undefined;
+    }
+    const transitionId = networkModeTransitionId;
+    const timer = window.setTimeout(() => {
+      setNetworkModeTransitionId((current) => current === transitionId ? 0 : current);
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [networkModeTransitionId]);
 
   usePageSeo({
     title: isDiagramWorkspace ? "专业流程图 · shuai-tunnel" : "互传 · shuai-tunnel",
@@ -223,6 +274,71 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const effectiveRoomRole: PublicTransferRoomRole = isInternetMode ? roomRole ?? "VIEWER" : "EDITOR";
   const isRoomReadOnly = isInternetMode && effectiveRoomRole === "VIEWER";
   const transferRoomScopeKey = `${networkMode}:${normalizeRoomId(roomId)}:${isInternetMode ? roomToken.trim() : "lan"}:${roomGeneration}`;
+  const normalizedDisplayNameDraft = displayNameDraft.trim();
+  const clientNameLocalError = !normalizedDisplayNameDraft
+    ? "客户端名称不能为空"
+    : normalizedDisplayNameDraft.length > MAX_TRANSFER_CLIENT_NAME_LENGTH
+      ? `客户端名称不能超过 ${MAX_TRANSFER_CLIENT_NAME_LENGTH} 个字符`
+      : /[\u0000-\u001f\u007f-\u009f]/.test(normalizedDisplayNameDraft)
+        ? "客户端名称不能包含控制字符"
+        : "";
+
+  useEffect(() => {
+    if (clientNameLocalError) {
+      setClientNameStatus("idle");
+      return;
+    }
+    if (normalizedDisplayNameDraft === displayName) {
+      setClientNameStatus("available");
+      return;
+    }
+
+    let active = true;
+    setClientNameStatus("checking");
+    const timer = window.setTimeout(() => {
+      void publicCheckTransferClientNameAvailability(normalizedDisplayNameDraft, peerId)
+        .then((result) => {
+          if (active) {
+            setClientNameStatus(result.available ? "available" : "unavailable");
+          }
+        })
+        .catch(() => {
+          if (active) {
+            setClientNameStatus("error");
+          }
+        });
+    }, 300);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [clientNameLocalError, displayName, normalizedDisplayNameDraft, peerId]);
+
+  const applyClientName = async () => {
+    if (clientNameLocalError) {
+      return;
+    }
+    setClientNameSaving(true);
+    try {
+      const result = await publicCheckTransferClientNameAvailability(normalizedDisplayNameDraft, peerId);
+      if (!result.available) {
+        setClientNameStatus("unavailable");
+        return;
+      }
+      storeTransferClientName(peerId, result.clientName);
+      setDisplayNameDraft(result.clientName);
+      setDisplayName(result.clientName);
+      setClientNameConnectionGeneration((generation) => generation + 1);
+      setClientNameStatus("available");
+      setError(null);
+      setNotice("客户端名称已更新");
+    } catch (err) {
+      setClientNameStatus("error");
+      setError(err instanceof Error ? err.message : "客户端名称校验失败");
+    } finally {
+      setClientNameSaving(false);
+    }
+  };
 
   const isFileTransferTaskCurrent = (task: FileTransferTask) => uploadInFlightRef.current === task
     && roomEpochRef.current === task.roomEpoch
@@ -352,6 +468,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       {
         eventId,
         sourcePeerId,
+        sourceDisplayName: currentRoomPeerNamesRef.current.get(sourcePeerId) ?? "未命名设备",
         payload,
         receivedAt,
       },
@@ -462,6 +579,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     let reconnectTimer: number | null = null;
     let heartbeatTimer: number | null = null;
     let reconnectAttempt = 0;
+    let blockedByNameConflict = false;
     let lastPongAt = Date.now();
     setRoomRole(isInternetMode ? null : "EDITOR");
 
@@ -503,14 +621,30 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         if (message.type === "pong") {
           lastPongAt = Date.now();
         } else if (message.type === "hello" && message.roomRole) {
+          setClientNameStatus("available");
           setRoomRole(message.roomRole);
         } else if (message.type === "error" && message.error) {
-          setError(message.error);
+          if (message.error === "client name is already in use") {
+            blockedByNameConflict = true;
+            setClientNameStatus("unavailable");
+            setError("客户端名称已被其他在线设备使用，请修改后重试");
+          } else if (message.error === "client name is required"
+            || message.error === "client name is too long"
+            || message.error === "client name contains invalid characters") {
+            blockedByNameConflict = true;
+            setClientNameStatus("error");
+            setError("客户端名称无效，请修改后重试");
+          } else {
+            setError(message.error);
+          }
         } else if (message.type === "roster" && Array.isArray(message.peers)) {
           const visiblePeers = message.peers.filter((peer) => peer.peerId !== peerId);
           currentRoomPeerIdsRef.current = new Set(visiblePeers.map((peer) => peer.peerId));
           currentRoomPeerRolesRef.current = new Map(
             visiblePeers.flatMap((peer) => peer.roomRole ? [[peer.peerId, peer.roomRole] as const] : []),
+          );
+          currentRoomPeerNamesRef.current = new Map(
+            visiblePeers.map((peer) => [peer.peerId, discoveryPeerDisplayName(peer)]),
           );
           setPeers(visiblePeers);
           setSelectedPeerId((current) => current && visiblePeers.some((peer) => peer.peerId === current) ? current : visiblePeers[0]?.peerId ?? "");
@@ -560,7 +694,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       if (!active) {
         return;
       }
-      const url = discoveryWebSocketUrl(roomId, peerId, isInternetMode ? roomToken : "", peerId);
+      const url = discoveryWebSocketUrl(roomId, peerId, isInternetMode ? roomToken : "", displayName);
       const socket = new WebSocket(url);
       discoverySocketRef.current = socket;
       socket.onopen = () => {
@@ -587,7 +721,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         }
         discoverySocketRef.current = null;
         clearHeartbeat();
-        if (!active) {
+        if (!active || blockedByNameConflict) {
           return;
         }
         const delayMs = Math.min(1000 * (2 ** Math.min(reconnectAttempt, 4)), 10000);
@@ -610,7 +744,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         socket.close();
       }
     };
-  }, [handleSignal, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
+  }, [clientNameConnectionGeneration, displayName, handleSignal, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
 
   useEffect(() => {
     if (!isInternetMode || roomRole !== "OWNER") {
@@ -674,7 +808,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       : `${selectedFiles.length} 个文件`;
   const selectedFileDetail = selectedFiles.length === 0
     ? selectedPeer
-      ? `将发送给 ${selectedPeer.displayName || selectedPeer.peerId}`
+      ? `将发送给 ${discoveryPeerDisplayName(selectedPeer)}`
       : isInternetMode
         ? "未选择对方时会先生成分享链接"
         : "内网模式需先选择在线设备"
@@ -695,7 +829,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const fileDropzoneDetail = selectedFiles.length > 0
     ? `${selectedFileTitle} · ${selectedFileDetail}`
     : selectedPeer
-      ? `选择后立即发送给 ${selectedPeer.displayName || selectedPeer.peerId}`
+      ? `选择后立即发送给 ${discoveryPeerDisplayName(selectedPeer)}`
       : isInternetMode
         ? "选择后立即上传并生成分享链接"
         : "请先从设备列表选择一台内网设备";
@@ -718,13 +852,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
     currentRoomPeerIdsRef.current.clear();
     currentRoomPeerRolesRef.current.clear();
+    currentRoomPeerNamesRef.current.clear();
     clipboardSeenEventsRef.current.clear();
     clipboardHighestSequencesRef.current.clear();
     whiteboardSendQueuesRef.current.clear();
     whiteboardTransportRetryRef.current.clear();
     setClipboardEvents([]);
     setWhiteboardEvents([]);
-    setClipboardSyncEnabled(false);
     setPeers([]);
     setSelectedPeerId("");
     setSelectedFiles([]);
@@ -765,6 +899,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     resetTransferRoomState();
     clearIncomingItems();
     setNetworkMode(nextMode);
+    setNetworkModeTransitionId((current) => current + 1);
     setRoomToken(nextToken);
     setRoomTokenDraft(nextToken);
     setRoomSettingsErrors({});
@@ -1534,7 +1669,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       <div className="space-y-4 text-zinc-950 dark:text-white">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <Button as="a" href="#/transfer" size="sm" radius="sm" variant="flat">互传</Button>
+            <Button as="a" href="/transfer" size="sm" radius="sm" variant="flat">互传</Button>
             <Button as="a" href="/" size="sm" radius="sm" variant="light">控制台</Button>
           </div>
           <ThemeToggleButton className="text-zinc-700 dark:text-zinc-200" />
@@ -1587,12 +1722,21 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             <button
               type="button"
               className="max-w-48 truncate rounded-md bg-black/[0.035] px-2 py-1 font-mono text-[10px] text-zinc-500 hover:text-cyan-700 dark:bg-white/[0.05] dark:text-zinc-400 dark:hover:text-cyan-200"
-              onClick={() => void copyText(peerId).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
+              onClick={() => void copyText(displayName).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
             >
-              {peerId}
+              {displayName}
             </button>
           </div>
           <div className="mt-3 space-y-3">
+            <ClientNameSettings
+              inputId="diagram-client-name-input"
+              value={displayNameDraft}
+              onValueChange={setDisplayNameDraft}
+              status={clientNameStatus}
+              localError={clientNameLocalError}
+              isSaving={clientNameSaving}
+              onApply={() => void applyClientName()}
+            />
             <Input
               label="房间名"
               radius="sm"
@@ -1619,6 +1763,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   生成
                 </Button>
               }
+            />
+            <RoomPermissionSetting
+              networkMode={networkMode}
+              currentRole={effectiveRoomRole}
+              inviteRole={roomInviteRole}
+              canManage={isInternetMode && roomRole === "OWNER"}
+              isLoading={roomAccessLoading}
+              onInviteRoleChange={setRoomInviteRole}
+              onCreateInvite={() => void createRoomAccess(roomInviteRole)}
             />
           </div>
           <div className="mt-3 flex justify-end gap-2">
@@ -1652,12 +1805,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           <section className="rounded-xl border border-violet-500/20 bg-violet-50/60 p-3 dark:border-violet-300/20 dark:bg-violet-300/[0.06]">
             <div className="flex items-center justify-between gap-2">
               <div>
-                <h3 className="text-small font-semibold">角色邀请</h3>
-                <p className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">分别分配编辑或只读权限</p>
-              </div>
-              <div className="flex gap-1.5">
-                <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("EDITOR")}>编辑者</Button>
-                <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("VIEWER")}>访客</Button>
+                <h3 className="text-small font-semibold">权限邀请记录</h3>
+                <p className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">管理已经生成的编辑或只读邀请</p>
               </div>
             </div>
             {createdRoomAccess ? (
@@ -1692,15 +1841,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           <div className="mt-2 space-y-1.5">
             <div className="rounded-lg border border-cyan-500/20 bg-cyan-50/70 px-3 py-2 dark:border-cyan-300/20 dark:bg-cyan-300/[0.06]">
               <div className="text-tiny font-medium">当前设备</div>
-              <div className="mt-0.5 truncate font-mono text-[10px] text-zinc-500 dark:text-zinc-400">{peerId}</div>
+              <div className="mt-0.5 truncate text-tiny text-zinc-500 dark:text-zinc-400">{displayName}</div>
             </div>
             {peers.map((peer) => (
               <div key={peer.peerId} className="rounded-lg border border-black/[0.07] bg-white px-3 py-2 dark:border-white/[0.08] dark:bg-white/[0.035]">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-tiny font-medium">{peer.displayName || peer.peerId}</span>
+                  <span className="min-w-0 truncate text-tiny font-medium">{discoveryPeerDisplayName(peer)}</span>
                   <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-label="在线" />
                 </div>
-                <div className="mt-0.5 truncate font-mono text-[10px] text-zinc-400">{peer.peerId}</div>
               </div>
             ))}
             {peers.length === 0 ? <div className="py-2 text-center text-tiny text-zinc-400">暂无其他协作者</div> : null}
@@ -1735,31 +1883,32 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   return (
     <main
-      className="landing-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white"
+      className="app-apple-tool transfer-mode-shell relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white"
+      data-network-mode={networkMode}
       onPaste={handlePagePaste}
     >
-      <div className="landing-grid" aria-hidden="true" />
-      <div className="landing-scanline" aria-hidden="true" />
-
-      <header className="relative z-10 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
+      {networkModeTransitionId > 0 ? (
+        <div key={networkModeTransitionId} className="transfer-mode-transition" aria-hidden="true" />
+      ) : null}
+      <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1480px] flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
         <AppLogo label="shuai-tunnel" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="public-header-actions flex shrink-0 items-center gap-2">
           <PublicToolsMenu active={workspace} />
-          <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
-          <Button as="a" href="/" radius="sm" variant="flat" className="glass-chip text-zinc-950 dark:text-white">
+          <a href="/" className="public-header-button">
             控制台
-          </Button>
+          </a>
+          <ThemeToggleButton className="public-header-theme-button" />
         </div>
       </header>
 
       <section
-        className={`relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 ${
+        className={`app-apple-tool-content relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 ${
           isDiagramWorkspace || activeTool === "whiteboard" ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_320px]"
         }`}
       >
-        <div className="min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-6">
+        <div className="app-apple-tool-workspace min-w-0 p-1 sm:p-2">
           <div className="flex flex-col gap-2">
-            <div className="text-tiny font-semibold uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-200">
+            <div className="text-small font-semibold text-primary-700 dark:text-primary-400">
               {isDiagramWorkspace ? "工具 · 专业流程图" : "工具 · 互传"}
             </div>
             <h1 className="text-display-md font-semibold sm:text-display-lg">
@@ -1772,76 +1921,75 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             </p>
           </div>
 
-          <div className="mt-4 rounded-lg border border-black/10 bg-white/40 p-2 dark:border-white/10 dark:bg-white/[0.035]">
-            <div className="flex items-center justify-between gap-3 px-1 pb-2">
-              <div className="text-small font-semibold text-zinc-900 dark:text-white">{isDiagramWorkspace ? "协作网络" : "传输网络"}</div>
-              <Chip size="sm" radius="sm" variant="flat" color={isInternetMode ? "secondary" : "success"}>
-                {isInternetMode ? "外网模式" : "内网模式 · 默认"}
-              </Chip>
-            </div>
-            <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="传输网络模式">
-              <NetworkModeButton
-                mode="lan"
-                activeMode={networkMode}
-                label="内网"
-                detail="同一网络发现，仅设备直连，不上传云端"
-                onSelect={updateNetworkMode}
-              />
-              <NetworkModeButton
-                mode="internet"
-                activeMode={networkMode}
-                label="外网"
-                detail="Token 隔离，直连优先并允许中继与云端兜底"
-                onSelect={updateNetworkMode}
-              />
-            </div>
-          </div>
-
-          <div className="mt-3 flex flex-col gap-3 rounded-lg border border-cyan-500/20 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10 sm:flex-row sm:items-center sm:justify-between">
-            <div className="min-w-0">
-              <div className="text-small font-semibold text-cyan-950 dark:text-cyan-100">
-                {isInternetMode ? "邀请外网设备加入" : "连接同一内网设备"}
-              </div>
-              <div className="mt-1">
+          <section className="app-apple-tool-surface transfer-room-hub mt-5 p-3">
+            <div className="transfer-room-compact flex flex-wrap items-center gap-3">
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                <span className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">房间</span>
+                <strong className="max-w-44 truncate text-base text-zinc-950 dark:text-white">{roomId || "nearby"}</strong>
                 <Chip size="sm" radius="sm" variant="flat" color={effectiveRoomRole === "OWNER" ? "primary" : effectiveRoomRole === "EDITOR" ? "success" : "default"}>
-                  {effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读访客"}
+                  {effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读"}
                 </Chip>
-              </div>
-              <div className="mt-1 text-tiny leading-5 text-cyan-800/80 dark:text-cyan-100/70">
-                {isInternetMode
-                  ? "邀请链接包含房间 Token，设备可从不同网络加入。"
-                  : "设备需使用同一内网或公网出口；邀请链接不包含 Token。"}
-              </div>
-              <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 text-tiny text-cyan-800/80 dark:text-cyan-100/70">
-                <span>我的名称</span>
                 <button
                   type="button"
-                  className="max-w-full truncate rounded glass-chip px-1.5 py-0.5 font-mono underline-offset-2 hover:underline"
-                  onClick={() => void copyText(peerId).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
+                  className="max-w-48 truncate rounded px-1.5 py-1 font-mono text-tiny text-zinc-500 hover:bg-black/5 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-white"
+                  title="点击复制设备名称"
+                  onClick={() => void copyText(displayName).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
                 >
-                  {peerId}
+                  {displayName}
                 </button>
               </div>
+              <div className="transfer-room-controls flex shrink-0 items-center gap-2">
+                <NetworkModeToggle activeMode={networkMode} onSelect={updateNetworkMode} />
+                <Dropdown placement="bottom-end" shouldBlockScroll={false}>
+                  <DropdownTrigger>
+                    <Button size="sm" radius="sm" color="primary" variant="flat" endContent={<ChevronDownIcon />}>
+                      邀请
+                    </Button>
+                  </DropdownTrigger>
+                  <DropdownMenu
+                    aria-label="邀请加入房间"
+                    onAction={(key) => {
+                      if (key === "share") {
+                        void shareRoom();
+                      } else if (key === "qr") {
+                        qrVisible ? setQrVisible(false) : showRoomQr();
+                      } else if (key === "copy") {
+                        void copyRoomLink();
+                      }
+                    }}
+                  >
+                    <DropdownItem key="share">系统分享</DropdownItem>
+                    <DropdownItem key="qr">{qrVisible ? "收起二维码" : "显示二维码"}</DropdownItem>
+                    <DropdownItem key="copy">复制邀请链接</DropdownItem>
+                  </DropdownMenu>
+                </Dropdown>
+                <Button size="sm" radius="sm" variant="light" onPress={() => setRoomSettingsOpen((open) => !open)}>
+                  {roomSettingsOpen ? "收起" : "设置"}
+                </Button>
+              </div>
             </div>
-            <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:shrink-0 sm:flex-wrap">
-              <Button color="primary" radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => void shareRoom()}>
-                邀请设备
-              </Button>
-              <Button color={qrVisible ? "default" : "secondary"} radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
-                {qrVisible ? "收起二维码" : "手机扫码"}
-              </Button>
-              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={() => void copyRoomLink()}>
-                复制链接
-              </Button>
-              <Button radius="sm" variant="flat" className="w-full sm:w-auto" onPress={createNewRoom}>
-                新房间
-              </Button>
-            </div>
-          </div>
 
-          <details className="mt-3 rounded-lg glass glass-border border p-3 text-small">
-            <summary className="cursor-pointer font-medium text-zinc-900 dark:text-white">房间设置</summary>
+            {roomSettingsOpen ? (
+            <div className="transfer-room-settings mt-3 border-t border-black/10 pt-3 text-small dark:border-white/10">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="font-semibold text-zinc-900 dark:text-white">房间设置</div>
+                <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">调整设备名称、房间标识、成员权限和接收方式。</div>
+              </div>
+              <Button size="sm" radius="sm" variant="flat" onPress={createNewRoom}>新房间</Button>
+            </div>
             <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+              <div className="sm:col-span-2">
+                <ClientNameSettings
+                  inputId="transfer-client-name-input"
+                  value={displayNameDraft}
+                  onValueChange={setDisplayNameDraft}
+                  status={clientNameStatus}
+                  localError={clientNameLocalError}
+                  isSaving={clientNameSaving}
+                  onApply={() => void applyClientName()}
+                />
+              </div>
               <Input
                 label="房间名"
                 radius="sm"
@@ -1872,6 +2020,17 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   </Button>
                 }
               />
+              <div className="sm:col-span-2">
+                <RoomPermissionSetting
+                  networkMode={networkMode}
+                  currentRole={effectiveRoomRole}
+                  inviteRole={roomInviteRole}
+                  canManage={isInternetMode && roomRole === "OWNER"}
+                  isLoading={roomAccessLoading}
+                  onInviteRoleChange={setRoomInviteRole}
+                  onCreateInvite={() => void createRoomAccess(roomInviteRole)}
+                />
+              </div>
             </div>
             <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div className="text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
@@ -1892,12 +2051,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               <div className="mt-3 rounded-lg border border-violet-500/20 bg-violet-50/60 p-3 dark:border-violet-300/20 dark:bg-violet-400/10">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <div className="text-small font-medium text-zinc-900 dark:text-white">角色邀请</div>
+                    <div className="text-small font-medium text-zinc-900 dark:text-white">权限邀请记录</div>
                     <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">邀请 Token 仅保存哈希；明文链接只在创建时显示。</div>
-                  </div>
-                  <div className="flex gap-2">
-                    <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("EDITOR")}>邀请编辑者</Button>
-                    <Button size="sm" radius="sm" variant="flat" isLoading={roomAccessLoading} onPress={() => void createRoomAccess("VIEWER")}>邀请访客</Button>
                   </div>
                 </div>
                 {createdRoomAccess ? (
@@ -1938,10 +2093,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 </Switch>
               </div>
             </div> : null}
-          </details>
+            </div>
+            ) : null}
 
           {qrVisible && (
-            <div className="mt-3 flex flex-col gap-3 rounded-lg glass border border-cyan-500/20 p-3 dark:border-cyan-300/20 sm:flex-row sm:items-center">
+            <div className="transfer-room-qr mt-3 flex flex-col gap-3 border-t border-black/10 pt-3 dark:border-white/10 sm:flex-row sm:items-center">
               <RoomQrCode value={roomJoinUrl} />
               <div className="min-w-0 flex-1">
                 <div className="text-small font-semibold text-zinc-900 dark:text-white">
@@ -1967,8 +2123,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             </div>
           )}
 
-          {!isDiagramWorkspace ? <>
-          <div className="mt-5 grid grid-cols-3 gap-1.5 rounded-lg border border-black/10 bg-white/45 p-1 dark:border-white/10 dark:bg-white/[0.04]" role="tablist" aria-label="互传功能切换">
+          <div className="transfer-room-tools mt-3 grid grid-cols-3 gap-1 border-t border-black/10 pt-2.5 dark:border-white/10" role="tablist" aria-label="互传功能切换">
             <ToolModeButton
               mode="files"
               activeMode={activeTool}
@@ -1980,7 +2135,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               mode="clipboard"
               activeMode={activeTool}
               label="同步剪贴板"
-              detail={clipboardSyncEnabled ? "已开启" : clipboardEvents.length > 0 ? "有新内容" : "定向同步"}
+              detail={clipboardEvents.length > 0 ? "有新内容" : "粘贴即发送"}
               onSelect={selectTransferTool}
             />
             <ToolModeButton
@@ -1991,7 +2146,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               onSelect={selectTransferTool}
             />
           </div>
+          </section>
 
+          {!isDiagramWorkspace ? <>
           <div
             id="transfer-panel-files"
             role="tabpanel"
@@ -2021,22 +2178,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               onDragOver={handleFileDragOver}
               onDragLeave={handleFileDragLeave}
               onDrop={handleFileDrop}
-              className={`group relative mt-5 flex min-h-44 w-full flex-col items-center justify-center overflow-hidden rounded-xl border-2 border-dashed px-5 py-8 text-center outline-none transition duration-200 motion-reduce:transition-none ${
-                isFileDragActive
-                  ? "border-cyan-400 bg-cyan-50/90 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.18),0_18px_50px_-32px_rgba(8,145,178,0.8)] dark:border-cyan-300 dark:bg-cyan-300/10"
-                  : isTransferBusy
-                    ? "cursor-wait border-cyan-400/45 bg-cyan-50/55 dark:border-cyan-300/30 dark:bg-cyan-300/[0.07]"
-                    : "cursor-pointer border-zinc-300 bg-white/35 hover:border-cyan-500/55 hover:bg-cyan-50/55 focus-visible:border-cyan-500 focus-visible:ring-4 focus-visible:ring-cyan-500/15 dark:border-white/15 dark:bg-white/[0.035] dark:hover:border-cyan-300/50 dark:hover:bg-cyan-300/[0.07] dark:focus-visible:border-cyan-300"
+              className={`app-apple-tool-dropzone transfer-file-stage group relative mt-4 flex min-h-[320px] w-full flex-col items-center justify-center overflow-hidden px-5 py-10 text-center outline-none transition duration-200 motion-reduce:transition-none sm:min-h-[360px] ${
+                isFileDragActive ? "is-active" : isTransferBusy ? "is-busy" : ""
               }`}
             >
-              <span aria-hidden="true" className="absolute left-3 top-3 h-4 w-4 border-l border-t border-cyan-500/35 dark:border-cyan-300/30" />
-              <span aria-hidden="true" className="absolute right-3 top-3 h-4 w-4 border-r border-t border-cyan-500/35 dark:border-cyan-300/30" />
-              <span aria-hidden="true" className="absolute bottom-3 left-3 h-4 w-4 border-b border-l border-cyan-500/35 dark:border-cyan-300/30" />
-              <span aria-hidden="true" className="absolute bottom-3 right-3 h-4 w-4 border-b border-r border-cyan-500/35 dark:border-cyan-300/30" />
-              <span className="rounded-full border border-cyan-500/20 bg-cyan-500/10 px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-800 dark:border-cyan-300/20 dark:bg-cyan-300/10 dark:text-cyan-100">
+              <span className="transfer-file-add" aria-hidden="true">+</span>
+              <span className="app-apple-tool-kicker px-2.5 py-1 font-mono text-[10px] font-semibold">
                 {isFileDragActive ? "Drop to send" : "Paste · Drop · Click"}
               </span>
-              <span className="mt-3 text-base font-semibold text-zinc-950 dark:text-white">
+              <span className="mt-4 text-xl font-semibold text-zinc-950 dark:text-white">
                 {fileDropzoneTitle}
               </span>
               <span
@@ -2050,7 +2200,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           </div>
 
           {state !== "idle" && (
-            <div className={activeTool === "files" ? "mt-4" : "hidden"} aria-hidden={activeTool !== "files"}>
+            <div className={activeTool === "whiteboard" ? "hidden" : "mt-4"} aria-hidden={activeTool === "whiteboard"}>
               <TransferProgress state={state} store={progressStore} />
             </div>
           )}
@@ -2073,13 +2223,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             syncKey={transferRoomScopeKey}
             isActive={activeTool === "clipboard"}
             focusRequest={clipboardFocusRequest}
-            isEnabled={clipboardSyncEnabled && !isRoomReadOnly}
+            canSend={!isRoomReadOnly}
             peerCount={peers.length}
+            fileTargetRequired={networkMode === "lan"}
             targetPeerId={selectedPeer?.peerId ?? ""}
-            targetPeerLabel={selectedPeer?.displayName || selectedPeer?.peerId || ""}
+            targetPeerLabel={selectedPeer ? discoveryPeerDisplayName(selectedPeer) : ""}
             events={clipboardEvents}
-            onEnabledChange={(enabled) => setClipboardSyncEnabled(isRoomReadOnly ? false : enabled)}
             onSend={sendClipboardPayload}
+            onFiles={acceptFiles}
           />
 
           <div
@@ -2100,7 +2251,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             />
           </div>
 
-          <div className={activeTool === "files" ? "" : "hidden"} aria-hidden={activeTool !== "files"}>
+          <div className={activeTool === "whiteboard" ? "hidden" : ""} aria-hidden={activeTool === "whiteboard"}>
             <IncomingFilesPanel
               pendingTransfers={pendingTransfers}
               receivingTransfers={receivingTransfers}
@@ -2162,7 +2313,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           )}
         </div>
 
-        {!isDiagramWorkspace ? <aside className={`${activeTool === "whiteboard" ? "hidden" : ""} min-w-0 rounded-xl glass glass-border border p-4 shadow-sm sm:p-5 xl:sticky xl:top-5 xl:self-start`}>
+        {!isDiagramWorkspace ? <aside className={`${activeTool === "whiteboard" ? "hidden" : ""} app-apple-tool-aside min-w-0 p-4 sm:p-5 xl:sticky xl:top-5 xl:self-start`}>
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold">发送给谁</h2>
@@ -2188,21 +2339,16 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 key={peer.peerId}
                 type="button"
                 onClick={() => setSelectedPeerId(peer.peerId)}
-                className={`rounded-lg border px-3 py-2 text-left text-small transition-colors ${
-                  selectedPeerId === peer.peerId
-                    ? "border-cyan-400 bg-cyan-50 text-cyan-900 dark:border-cyan-300/40 dark:bg-cyan-400/10 dark:text-cyan-100"
-                    : "glass glass-border text-zinc-700 hover:border-black/20 dark:text-zinc-200"
-                }`}
+                className={`app-apple-tool-peer px-3 py-2 text-left text-small transition-colors ${selectedPeerId === peer.peerId ? "is-selected" : ""}`}
               >
                 <div className="flex items-center justify-between gap-2">
-                  <div className="min-w-0 truncate font-medium">{peer.displayName || peer.peerId}</div>
+                  <div className="min-w-0 truncate font-medium">{discoveryPeerDisplayName(peer)}</div>
                   {selectedPeerId === peer.peerId && (
                     <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-700 dark:text-cyan-100">
                       已选
                     </span>
                   )}
                 </div>
-                <div className="mt-0.5 truncate font-mono text-tiny opacity-70">{peer.peerId}</div>
               </button>
             ))}
           </div>
@@ -2212,6 +2358,153 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       </section>
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
     </main>
+  );
+}
+
+function ClientNameSettings({
+  inputId,
+  value,
+  onValueChange,
+  status,
+  localError,
+  isSaving,
+  onApply,
+}: {
+  inputId: string;
+  value: string;
+  onValueChange: (value: string) => void;
+  status: ClientNameStatus;
+  localError: string;
+  isSaving: boolean;
+  onApply: () => void;
+}) {
+  const errorMessage = localError
+    || (status === "unavailable" ? "该名称已被其他在线设备使用" : "")
+    || (status === "error" ? "暂时无法校验名称，请稍后重试" : "");
+  const description = status === "checking"
+    ? "正在检查名称是否可用…"
+    : status === "available" && !localError
+      ? "名称可用，保存后立即更新"
+      : "在线名称全局唯一，每个标签页可以设置不同名称";
+
+  return (
+    <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+      <Input
+        id={inputId}
+        label="我的客户端名称"
+        radius="sm"
+        variant="bordered"
+        value={value}
+        onValueChange={onValueChange}
+        maxLength={MAX_TRANSFER_CLIENT_NAME_LENGTH}
+        isRequired
+        isInvalid={Boolean(errorMessage)}
+        errorMessage={errorMessage}
+        description={description}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !localError && status !== "checking" && status !== "unavailable") {
+            onApply();
+          }
+        }}
+      />
+      <Button
+        className="sm:mt-2"
+        color="primary"
+        radius="sm"
+        variant="flat"
+        isDisabled={Boolean(localError) || status === "checking" || status === "unavailable"}
+        isLoading={isSaving}
+        onPress={onApply}
+      >
+        保存名称
+      </Button>
+    </div>
+  );
+}
+
+function RoomPermissionSetting({
+  networkMode,
+  currentRole,
+  inviteRole,
+  canManage,
+  isLoading,
+  onInviteRoleChange,
+  onCreateInvite,
+}: {
+  networkMode: TransferNetworkMode;
+  currentRole: PublicTransferRoomRole;
+  inviteRole: TransferInviteRole;
+  canManage: boolean;
+  isLoading: boolean;
+  onInviteRoleChange: (role: TransferInviteRole) => void;
+  onCreateInvite: () => void;
+}) {
+  const isInternetMode = networkMode === "internet";
+  const currentRoleLabel = currentRole === "OWNER" ? "房主" : currentRole === "EDITOR" ? "可编辑" : "只读";
+  const displayedRole = canManage ? inviteRole : currentRole === "VIEWER" ? "VIEWER" : "EDITOR";
+  const description = !isInternetMode
+    ? "内网房间默认允许编辑；切换到外网模式后，可以为邀请链接设置可编辑或只读权限。"
+    : canManage
+      ? "此设置作用于新生成的邀请链接，不会改变房主自身权限。"
+      : "当前权限由加入房间时使用的邀请链接决定，只有房主可以生成不同权限的链接。";
+
+  return (
+    <div className="rounded-lg border border-black/10 bg-black/[0.018] p-3 dark:border-white/10 dark:bg-white/[0.025]">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-small font-medium text-zinc-900 dark:text-white">房间权限</div>
+          <div className="mt-0.5 text-tiny text-zinc-500 dark:text-zinc-400">设置新成员加入后可以执行的操作</div>
+        </div>
+        <Chip size="sm" radius="sm" variant="flat" color={currentRole === "VIEWER" ? "default" : "success"}>
+          当前：{currentRoleLabel}
+        </Chip>
+      </div>
+
+      <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div
+          className="grid min-w-0 flex-1 grid-cols-2 rounded-md border border-black/10 bg-white/60 p-1 dark:border-white/10 dark:bg-black/15"
+          role="radiogroup"
+          aria-label="新成员房间权限"
+        >
+          <button
+            type="button"
+            role="radio"
+            aria-checked={displayedRole === "EDITOR"}
+            disabled={!canManage}
+            className={`rounded px-3 py-2 text-left transition-colors ${displayedRole === "EDITOR" ? "bg-white text-zinc-950 shadow-sm dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
+            onClick={() => onInviteRoleChange("EDITOR")}
+          >
+            <span className="block text-small font-semibold">可编辑</span>
+            <span className="mt-0.5 block text-[10px] leading-4 opacity-75">发送文件、剪贴板和白板</span>
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={displayedRole === "VIEWER"}
+            disabled={!canManage}
+            className={`rounded px-3 py-2 text-left transition-colors ${displayedRole === "VIEWER" ? "bg-white text-zinc-950 shadow-sm dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
+            onClick={() => onInviteRoleChange("VIEWER")}
+          >
+            <span className="block text-small font-semibold">只读</span>
+            <span className="mt-0.5 block text-[10px] leading-4 opacity-75">仅查看和接收房间内容</span>
+          </button>
+        </div>
+        {canManage ? (
+          <Button
+            className="shrink-0"
+            size="sm"
+            radius="sm"
+            color="primary"
+            variant="flat"
+            isLoading={isLoading}
+            onPress={onCreateInvite}
+          >
+            生成邀请链接
+          </Button>
+        ) : null}
+      </div>
+      <p className="mt-2 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">{description}</p>
+    </div>
   );
 }
 
@@ -2234,19 +2527,46 @@ function NetworkModeButton({
       type="button"
       role="radio"
       aria-checked={active}
-      className={`rounded-md border px-3 py-2.5 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
-        active
-          ? "border-cyan-400 bg-cyan-50 text-cyan-950 shadow-sm dark:border-cyan-300/40 dark:bg-cyan-300/10 dark:text-cyan-100"
-          : "border-black/10 bg-white/45 text-zinc-700 hover:border-cyan-400/50 hover:bg-cyan-50/60 dark:border-white/10 dark:bg-white/[0.035] dark:text-zinc-300 dark:hover:bg-cyan-300/[0.07]"
-      }`}
+      className={`app-apple-tool-choice px-3 py-2.5 text-left transition-colors ${active ? "is-active" : ""}`}
       onClick={() => onSelect(mode)}
     >
       <span className="flex items-center justify-between gap-2 text-small font-semibold">
         {label}
-        {active && <span className="text-[10px] uppercase tracking-wider text-cyan-700 dark:text-cyan-200">当前</span>}
+        {active && <span className="text-[10px] text-primary-700 dark:text-primary-400">当前</span>}
       </span>
       <span className="mt-1 block text-tiny leading-5 text-zinc-500 dark:text-zinc-400">{detail}</span>
     </button>
+  );
+}
+
+function NetworkModeToggle({
+  activeMode,
+  onSelect,
+}: {
+  activeMode: TransferNetworkMode;
+  onSelect: (mode: TransferNetworkMode) => void;
+}) {
+  const isInternetMode = activeMode === "internet";
+  return (
+    <div className="transfer-network-toggle">
+      <span className={!isInternetMode ? "is-active" : ""}>内网</span>
+      <Switch
+        size="sm"
+        color="primary"
+        aria-label="切换内网或外网模式"
+        isSelected={isInternetMode}
+        onValueChange={(selected) => onSelect(selected ? "internet" : "lan")}
+      />
+      <span className={isInternetMode ? "is-active" : ""}>外网</span>
+    </div>
+  );
+}
+
+function ChevronDownIcon() {
+  return (
+    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 16 16">
+      <path d="m4 6 4 4 4-4" />
+    </svg>
   );
 }
 
@@ -2290,11 +2610,7 @@ function ToolModeButton({
       aria-selected={active}
       aria-controls={`transfer-panel-${mode}`}
       tabIndex={active ? 0 : -1}
-      className={`min-w-0 rounded-md px-3 py-2 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
-        active
-          ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-400 dark:text-zinc-950"
-          : "text-zinc-600 hover:bg-cyan-50 hover:text-cyan-900 dark:text-zinc-300 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100"
-      }`}
+      className={`app-apple-tool-tab min-w-0 px-3 py-2 text-left transition-colors ${active ? "is-active" : ""}`}
       onClick={() => onSelect(mode, true)}
       onKeyDown={(event) => {
         const currentIndex = TRANSFER_TOOL_MODES.indexOf(mode);
@@ -2315,7 +2631,7 @@ function ToolModeButton({
       }}
     >
       <span className="block truncate text-small font-semibold">{label}</span>
-      <span className={`mt-0.5 block truncate text-[11px] ${active ? "text-white/80 dark:text-zinc-950/70" : "text-zinc-500 dark:text-zinc-400"}`}>
+      <span className="app-apple-tool-tab-detail mt-0.5 block truncate text-[11px]">
         {detail}
       </span>
     </button>
@@ -2746,8 +3062,8 @@ function TransferFaq({
             ? "优先设备直传；失败时会使用临时安全链接完成传输。"
             : "只通过设备间 WebRTC 直连传输；失败后不会使用 TURN 或上传云端。"}
         </FaqItem>
-        <FaqItem title="剪贴板为什么有时需要点一下复制？">
-          浏览器可能阻止网页在后台改写系统剪贴板。内容仍会保留在页面里，点击“复制到本机”即可完成写入。
+        <FaqItem title="为什么有时需要手动写入系统剪贴板？">
+          浏览器可能阻止网页在后台改写系统剪贴板。内容仍会保留在页面里，点击“写入系统剪贴板”即可重试。
         </FaqItem>
         <FaqItem title="谁能看到我发的文件？">
           {isInternetMode
@@ -3226,14 +3542,141 @@ function createRoomToken() {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function loadOrCreatePeerId() {
-  const existing = sessionStorage.getItem("public-transfer-peer-id");
-  if (existing) {
-    return existing;
+function claimTransferPeerIdentity(): TransferPeerIdentity {
+  const leaseOwner = createRoomToken();
+  const now = Date.now();
+  let peerId = "";
+  try {
+    const storedPeerId = sessionStorage.getItem(TRANSFER_PEER_ID_STORAGE_KEY)?.trim() ?? "";
+    if (isValidTransferPeerId(storedPeerId) && !isTransferPeerLeaseActive(storedPeerId, now)) {
+      peerId = storedPeerId;
+    }
+  } catch {
+    // Restrictive storage modes fall back to a fresh page identity.
   }
-  const next = `web-${createRoomToken().slice(0, 10)}`;
-  sessionStorage.setItem("public-transfer-peer-id", next);
-  return next;
+
+  if (!peerId) {
+    peerId = `web-${createRoomToken().slice(0, 10)}`;
+  }
+  try {
+    sessionStorage.setItem(TRANSFER_PEER_ID_STORAGE_KEY, peerId);
+  } catch {
+    // The in-memory identity still keeps this page distinct.
+  }
+
+  const identity = { peerId, leaseOwner };
+  writeTransferPeerLease(identity, now);
+  return identity;
+}
+
+function maintainTransferPeerIdentityLease(identity: TransferPeerIdentity) {
+  const refresh = () => writeTransferPeerLease(identity, Date.now());
+  const release = () => {
+    try {
+      const current = readTransferPeerLease(identity.peerId);
+      if (current?.owner === identity.leaseOwner) {
+        localStorage.removeItem(`${TRANSFER_PEER_LEASE_PREFIX}${identity.peerId}`);
+      }
+    } catch {
+      // The short lease expires automatically when storage cannot be updated.
+    }
+  };
+
+  refresh();
+  const interval = window.setInterval(refresh, TRANSFER_PEER_LEASE_REFRESH_MS);
+  window.addEventListener("pagehide", release);
+  return () => {
+    window.clearInterval(interval);
+    window.removeEventListener("pagehide", release);
+    release();
+  };
+}
+
+function isTransferPeerLeaseActive(peerId: string, now: number) {
+  const lease = readTransferPeerLease(peerId);
+  return Boolean(lease && now - lease.updatedAt < TRANSFER_PEER_LEASE_TTL_MS);
+}
+
+function readTransferPeerLease(peerId: string): { owner: string; updatedAt: number } | null {
+  try {
+    const raw = localStorage.getItem(`${TRANSFER_PEER_LEASE_PREFIX}${peerId}`);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as { owner?: unknown; updatedAt?: unknown };
+    return typeof parsed.owner === "string" && typeof parsed.updatedAt === "number"
+      ? { owner: parsed.owner, updatedAt: parsed.updatedAt }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeTransferPeerLease(identity: TransferPeerIdentity, updatedAt: number) {
+  try {
+    localStorage.setItem(
+      `${TRANSFER_PEER_LEASE_PREFIX}${identity.peerId}`,
+      JSON.stringify({ owner: identity.leaseOwner, updatedAt }),
+    );
+  } catch {
+    // A random peer id still avoids collisions for the current page load.
+  }
+}
+
+function isValidTransferPeerId(peerId: string) {
+  return /^web-[a-f0-9]{10}$/.test(peerId);
+}
+
+function loadTransferClientName(peerId: string) {
+  try {
+    const scopedName = sessionStorage.getItem(transferClientNameStorageKey(peerId))?.trim() ?? "";
+    if (isValidTransferClientName(scopedName)) {
+      return scopedName;
+    }
+
+    const preferredName = localStorage.getItem(TRANSFER_CLIENT_NAME_STORAGE_KEY)?.trim() ?? "";
+    if (isValidTransferClientName(preferredName)) {
+      return uniqueDefaultTransferClientName(preferredName, peerId);
+    }
+  } catch {
+    // Storage can be unavailable in restrictive browser modes.
+  }
+  return uniqueDefaultTransferClientName("网页设备", peerId);
+}
+
+function storeTransferClientName(peerId: string, clientName: string) {
+  try {
+    sessionStorage.setItem(transferClientNameStorageKey(peerId), clientName);
+    localStorage.setItem(TRANSFER_CLIENT_NAME_STORAGE_KEY, clientName);
+  } catch {
+    // Keep the name for the current page even when persistence is unavailable.
+  }
+}
+
+function transferClientNameStorageKey(peerId: string) {
+  return `${TRANSFER_CLIENT_NAME_STORAGE_KEY}:${peerId}`;
+}
+
+function isValidTransferClientName(clientName: string) {
+  return Boolean(clientName
+    && clientName.length <= MAX_TRANSFER_CLIENT_NAME_LENGTH
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(clientName));
+}
+
+function uniqueDefaultTransferClientName(preferredName: string, peerId: string) {
+  const suffix = ` · ${peerId.slice(-4)}`;
+  const base = preferredName.slice(0, Math.max(1, MAX_TRANSFER_CLIENT_NAME_LENGTH - suffix.length)).trim();
+  return `${base || "网页设备"}${suffix}`;
+}
+
+function discoveryPeerDisplayName(peer: Pick<DiscoveryPeer, "peerId" | "displayName">) {
+  const displayName = decodeLegacyPeerDisplayName(
+    typeof peer.displayName === "string" ? peer.displayName : "",
+  );
+  if (!displayName || displayName === peer.peerId || /^web-[a-f0-9-]+$/i.test(displayName)) {
+    return "未命名设备";
+  }
+  return displayName;
 }
 
 function discoveryWebSocketUrl(roomId: string, peerId: string, roomToken: string, displayName: string) {

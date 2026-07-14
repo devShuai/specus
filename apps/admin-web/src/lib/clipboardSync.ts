@@ -1,11 +1,12 @@
-export const CLIPBOARD_TEXT_MAX_CHARS = 16_384;
-export const CLIPBOARD_TEXT_MAX_UTF8_BYTES = 32 * 1024;
+export const CLIPBOARD_TEXT_MAX_CHARS = 32_768;
+export const CLIPBOARD_TEXT_MAX_UTF8_BYTES = 48 * 1024;
 export const CLIPBOARD_DISCOVERY_MESSAGE_MAX_CHARS = 64 * 1024;
 
 const CLIPBOARD_PROTOCOL_TYPE = "STCLIP1";
+const CLIPBOARD_RICH_PROTOCOL_TYPE = "STCLIP2";
 const CLIPBOARD_PAYLOAD_KIND = "text";
 const CLIPBOARD_ID_MAX_CHARS = 128;
-const CLIPBOARD_PAYLOAD_KEYS = [
+const CLIPBOARD_LEGACY_PAYLOAD_KEYS = [
   "type",
   "kind",
   "id",
@@ -14,8 +15,14 @@ const CLIPBOARD_PAYLOAD_KEYS = [
   "text",
   "createdAt",
 ] as const;
+const CLIPBOARD_RICH_PAYLOAD_KEYS = [
+  ...CLIPBOARD_LEGACY_PAYLOAD_KEYS,
+  "html",
+] as const;
 
-export interface ClipboardSyncPayload {
+export type ClipboardContentKind = "text" | "html" | "link";
+
+export interface LegacyClipboardSyncPayload {
   type: "STCLIP1";
   kind: "text";
   id: string;
@@ -25,9 +32,23 @@ export interface ClipboardSyncPayload {
   createdAt: number;
 }
 
+export interface RichClipboardSyncPayload {
+  type: "STCLIP2";
+  kind: ClipboardContentKind;
+  id: string;
+  sessionId: string;
+  sequence: number;
+  text: string;
+  createdAt: number;
+  html: string | null;
+}
+
+export type ClipboardSyncPayload = LegacyClipboardSyncPayload | RichClipboardSyncPayload;
+
 export interface ClipboardInboundEvent {
   eventId: string;
   sourcePeerId: string;
+  sourceDisplayName?: string;
   payload: ClipboardSyncPayload;
   receivedAt: number;
 }
@@ -40,16 +61,24 @@ export function createClipboardSyncPayload(
   text: string,
   sessionId: string,
   sequence: number,
+  content: { kind?: ClipboardContentKind; html?: string | null } = {},
 ): ClipboardSyncPayload {
-  const payload: ClipboardSyncPayload = {
-    type: CLIPBOARD_PROTOCOL_TYPE,
-    kind: CLIPBOARD_PAYLOAD_KIND,
+  const kind = content.kind ?? CLIPBOARD_PAYLOAD_KIND;
+  const common = {
     id: createCompatibleUuid(),
     sessionId,
     sequence,
     text,
     createdAt: Date.now(),
   };
+  const payload: ClipboardSyncPayload = kind === CLIPBOARD_PAYLOAD_KIND && !content.html
+    ? { type: CLIPBOARD_PROTOCOL_TYPE, kind: CLIPBOARD_PAYLOAD_KIND, ...common }
+    : {
+        type: CLIPBOARD_RICH_PROTOCOL_TYPE,
+        kind,
+        html: kind === "html" ? content.html ?? null : null,
+        ...common,
+      };
   if (!isClipboardSyncPayload(payload)) {
     throw new RangeError("剪贴板同步内容或标识不符合协议限制");
   }
@@ -80,28 +109,70 @@ export function isClipboardSyncPayload(value: unknown): value is ClipboardSyncPa
     return false;
   }
   const keys = Object.keys(value);
-  if (keys.length !== CLIPBOARD_PAYLOAD_KEYS.length
-    || !CLIPBOARD_PAYLOAD_KEYS.every((key) => Object.hasOwn(value, key))) {
-    return false;
-  }
   try {
-    return value.type === CLIPBOARD_PROTOCOL_TYPE
-      && value.kind === CLIPBOARD_PAYLOAD_KIND
-      && isProtocolId(value.id)
+    if (typeof value.text !== "string") {
+      return false;
+    }
+    const text = value.text;
+    const commonValid = isProtocolId(value.id)
       && isProtocolId(value.sessionId)
       && isNonNegativeSafeInteger(value.sequence)
-      && typeof value.text === "string"
-      && value.text.length > 0
-      && isClipboardTextWithinLimits(value.text)
+      && text.length > 0
       && isNonNegativeSafeInteger(value.createdAt);
+    if (!commonValid) {
+      return false;
+    }
+    if (keys.length === CLIPBOARD_LEGACY_PAYLOAD_KEYS.length
+      && CLIPBOARD_LEGACY_PAYLOAD_KEYS.every((key) => Object.hasOwn(value, key))) {
+      return value.type === CLIPBOARD_PROTOCOL_TYPE
+      && value.kind === CLIPBOARD_PAYLOAD_KIND
+      && isClipboardTextWithinLimits(text);
+    }
+    if (keys.length !== CLIPBOARD_RICH_PAYLOAD_KEYS.length
+      || !CLIPBOARD_RICH_PAYLOAD_KEYS.every((key) => Object.hasOwn(value, key))) {
+      return false;
+    }
+    if (value.type !== CLIPBOARD_RICH_PROTOCOL_TYPE
+      || !isClipboardContentKind(value.kind)
+      || (typeof value.html !== "string" && value.html !== null)) {
+      return false;
+    }
+    const html = typeof value.html === "string" ? value.html : "";
+    return (value.kind === "html" ? html.length > 0 : value.html === null)
+      && isClipboardContentWithinLimits(text, html)
+      && (value.kind !== "link" || isHttpUrl(text));
   } catch {
     return false;
   }
 }
 
+export function clipboardPayloadHtml(payload: ClipboardSyncPayload) {
+  return payload.type === CLIPBOARD_RICH_PROTOCOL_TYPE && payload.kind === "html"
+    ? payload.html ?? ""
+    : "";
+}
+
 function isClipboardTextWithinLimits(text: string) {
   return text.length <= CLIPBOARD_TEXT_MAX_CHARS
     && new TextEncoder().encode(text).byteLength <= CLIPBOARD_TEXT_MAX_UTF8_BYTES;
+}
+
+function isClipboardContentWithinLimits(text: string, html: string) {
+  return text.length + html.length <= CLIPBOARD_TEXT_MAX_CHARS
+    && new TextEncoder().encode(text).byteLength + new TextEncoder().encode(html).byteLength <= CLIPBOARD_TEXT_MAX_UTF8_BYTES;
+}
+
+function isClipboardContentKind(value: unknown): value is ClipboardContentKind {
+  return value === "text" || value === "html" || value === "link";
+}
+
+function isHttpUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function isProtocolId(value: unknown): value is string {

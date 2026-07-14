@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CLIPBOARD_TEXT_MAX_CHARS,
   CLIPBOARD_TEXT_MAX_UTF8_BYTES,
+  clipboardPayloadHtml,
   clipboardSyncEventKey,
   createClipboardSessionId,
   createClipboardSyncPayload,
@@ -39,6 +40,37 @@ describe("clipboard sync payload", () => {
     expect(isClipboardSyncPayload(payload)).toBe(true);
   });
 
+  it("creates rich-text and link payloads with STCLIP2", () => {
+    const sessionId = createClipboardSessionId();
+    const rich = createClipboardSyncPayload("Hello", sessionId, 1, {
+      kind: "html",
+      html: "<p><strong>Hello</strong></p>",
+    });
+    const link = createClipboardSyncPayload("https://example.com/docs", sessionId, 2, { kind: "link" });
+
+    expect(rich).toMatchObject({ type: "STCLIP2", kind: "html", text: "Hello" });
+    expect(clipboardPayloadHtml(rich)).toBe("<p><strong>Hello</strong></p>");
+    expect(isClipboardSyncPayload(rich)).toBe(true);
+    expect(link).toMatchObject({ type: "STCLIP2", kind: "link", html: null });
+    expect(isClipboardSyncPayload(link)).toBe(true);
+  });
+
+  it("rejects unsafe links and oversized combined rich content", () => {
+    const sessionId = createClipboardSessionId();
+    expect(() => createClipboardSyncPayload(
+      "javascript:alert(1)",
+      sessionId,
+      1,
+      { kind: "link" },
+    )).toThrow(RangeError);
+    expect(() => createClipboardSyncPayload(
+      "a".repeat(CLIPBOARD_TEXT_MAX_UTF8_BYTES / 2),
+      sessionId,
+      2,
+      { kind: "html", html: "b".repeat(CLIPBOARD_TEXT_MAX_UTF8_BYTES / 2 + 1) },
+    )).toThrow(RangeError);
+  });
+
   it("falls back to getRandomValues when randomUUID is unavailable", () => {
     vi.stubGlobal("crypto", {
       getRandomValues<T extends ArrayBufferView>(array: T) {
@@ -55,9 +87,10 @@ describe("clipboard sync payload", () => {
 
   it("accepts values exactly at both text limits", () => {
     const asciiBoundary = validPayload("a".repeat(CLIPBOARD_TEXT_MAX_CHARS));
-    const emojiBoundary = validPayload("😀".repeat(CLIPBOARD_TEXT_MAX_CHARS / 2));
+    const emojiBoundary = validPayload("😀".repeat(CLIPBOARD_TEXT_MAX_UTF8_BYTES / 4));
 
     expect(new TextEncoder().encode(emojiBoundary.text)).toHaveLength(CLIPBOARD_TEXT_MAX_UTF8_BYTES);
+    expect(emojiBoundary.text.length).toBeLessThanOrEqual(CLIPBOARD_TEXT_MAX_CHARS);
     expect(isClipboardSyncPayload(asciiBoundary)).toBe(true);
     expect(isClipboardSyncPayload(emojiBoundary)).toBe(true);
   });

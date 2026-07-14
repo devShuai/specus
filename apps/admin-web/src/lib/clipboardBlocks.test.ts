@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CLIPBOARD_TEXT_BLOCK_LIMIT,
   createInboundClipboardTextBlocks,
   createLocalClipboardTextBlock,
   prependClipboardTextBlocks,
@@ -43,6 +44,32 @@ describe("clipboard text blocks", () => {
       replacement,
       second,
     ]);
+  });
+
+  it("preserves rich clipboard content and readable source names", () => {
+    const event = inboundEvent("event-rich", "peer-a", "Hello", 3);
+    event.sourceDisplayName = "会议室电脑";
+    event.payload = {
+      ...event.payload,
+      type: "STCLIP2",
+      kind: "html",
+      html: "<strong>Hello</strong>",
+    };
+
+    expect(createInboundClipboardTextBlocks([event])).toMatchObject([{
+      kind: "html",
+      html: "<strong>Hello</strong>",
+      sourceDisplayName: "会议室电脑",
+    }]);
+  });
+
+  it("keeps an expanded clipboard history", () => {
+    const blocks = Array.from({ length: CLIPBOARD_TEXT_BLOCK_LIMIT + 1 }, (_, index) => (
+      createLocalClipboardTextBlock(String(index), index, `local:${index}`)
+    ));
+
+    expect(prependClipboardTextBlocks([], blocks)).toHaveLength(CLIPBOARD_TEXT_BLOCK_LIMIT);
+    expect(CLIPBOARD_TEXT_BLOCK_LIMIT).toBe(80);
   });
 });
 
