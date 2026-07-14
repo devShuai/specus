@@ -6,25 +6,29 @@ export interface NavGroup { label: string; items: NavItem[]; }
 export interface SidebarProps { groups: NavGroup[]; active: string; onSelect: (k: string) => void; variant?: "desktop" | "mobile"; onClose?: () => void; footer?: ReactNode; }
 
 export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose, footer }: SidebarProps) {
-  return <nav aria-label="主导航" className="flex h-full flex-col">
-    {variant === "desktop" && <div className="flex h-16 shrink-0 items-center px-3"><AppLogo className="min-w-0" label="shuai-tunnel" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
-    <div className="flex-1 overflow-y-auto px-2 py-3">
-      {groups.map((g, gi) => <div key={g.label} className={gi === 0 ? "mb-3" : "mt-3 mb-3"}>
-        <div className="mb-1 px-3 text-small font-semibold text-default-400">{g.label}</div>
+  return <nav aria-label="主导航" className="app-apple-nav flex h-full flex-col">
+    {variant === "desktop" && <div className="app-apple-nav-brand flex h-14 shrink-0 items-center px-3"><AppLogo className="min-w-0" label="shuai-tunnel" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
+    <div className="app-apple-nav-scroll flex-1 overflow-y-auto px-2.5 py-2.5">
+      {groups.map((g) => <div key={g.label} className="app-apple-nav-group mb-2.5">
+        <div className="app-apple-nav-heading mb-1 px-2 text-small font-semibold text-default-400">{g.label}</div>
         <ul className="flex flex-col gap-0.5">{g.items.map(item => { const isActive = item.key === active; return <li key={item.key}>
-          <button className={["flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-small transition-colors", isActive ? "border-l-2 border-primary bg-primary-50 font-semibold text-primary-700 rounded-l-none pl-2.5 dark:bg-primary-400/10 dark:text-primary-400" : "text-default-600 hover:bg-default-100 hover:text-foreground"].join(" ")} type="button" onClick={() => { onSelect(item.key); onClose?.(); }}>
-            <span className={isActive ? "text-primary dark:text-primary-400" : "text-default-400"}>{Icon(item.key)}</span>
-            <span className="flex-1">{item.title}</span>
-            {isActive && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-hidden="true" />}
+          <button
+            aria-current={isActive ? "page" : undefined}
+            className={["app-apple-nav-item flex w-full items-center gap-2 px-2 py-1.5 text-left text-small transition-colors", isActive ? "app-apple-nav-item-active" : ""].join(" ")}
+            type="button"
+            onClick={() => { onSelect(item.key); onClose?.(); }}
+          >
+            <span className="app-apple-nav-icon">{Icon(item.key)}</span>
+            <span className="min-w-0 flex-1 truncate">{item.title}</span>
           </button>
         </li>})}</ul>
       </div>)}
     </div>
-    {variant === "desktop" && <div className="shrink-0 px-2 py-3">{footer}</div>}
+    {variant === "desktop" && <div className="app-apple-nav-footer shrink-0 px-2.5 py-2.5">{footer}</div>}
   </nav>;
 }
 
-const C = "h-[18px] w-[18px]";
+const C = "h-4 w-4";
 const A = { fill:"none",stroke:"currentColor",strokeWidth:"1.6",strokeLinecap:"round" as const,strokeLinejoin:"round" as const };
 function Icon(k: string) {
   switch(k){

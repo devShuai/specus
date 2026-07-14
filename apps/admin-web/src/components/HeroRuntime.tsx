@@ -7,7 +7,7 @@ export function HeroRuntime({ children }: { children: ReactNode }) {
 
   return (
     <HeroUIProvider className={theme}>
-      <div className={`${theme} min-h-screen bg-background text-foreground`}>
+      <div className={`${theme} app-apple min-h-screen bg-background text-foreground`}>
         <ToastProvider placement="top-right" toastOffset={12} />
         {children}
       </div>

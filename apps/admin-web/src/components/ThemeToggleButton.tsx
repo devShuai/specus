@@ -1,4 +1,4 @@
-import { Button, Tooltip } from "@heroui/react";
+import { Button, Dropdown, DropdownItem, DropdownMenu, DropdownTrigger } from "@heroui/react";
 import { useTheme } from "../theme/ThemeContext";
 
 interface ThemeToggleButtonProps {
@@ -7,23 +7,53 @@ interface ThemeToggleButtonProps {
 }
 
 export function ThemeToggleButton({ className, size = "sm" }: ThemeToggleButtonProps) {
-  const { theme, toggleTheme } = useTheme();
-  const nextThemeLabel = theme === "dark" ? "切换到浅色模式" : "切换到深色模式";
+  const { theme, setTheme, userOverride, resetToSystem } = useTheme();
+  const mode = userOverride ? theme : "system";
+  const modeLabel = mode === "system" ? "跟随系统" : mode === "dark" ? "深色模式" : "浅色模式";
 
   return (
-    <Tooltip content={nextThemeLabel} placement="bottom">
-      <Button
-        isIconOnly
-        aria-label={nextThemeLabel}
-        className={className}
-        radius="sm"
-        size={size}
-        variant="flat"
-        onPress={toggleTheme}
+    <Dropdown placement="bottom-end" shouldBlockScroll={false}>
+      <DropdownTrigger>
+        <Button
+          isIconOnly
+          aria-label={`主题模式：${modeLabel}`}
+          className={`theme-toggle-button ${className ?? ""}`}
+          radius="full"
+          size={size}
+          title={`主题：${modeLabel}`}
+          variant="light"
+        >
+          {mode === "system" ? <SystemIcon /> : theme === "dark" ? <SunIcon /> : <MoonIcon />}
+        </Button>
+      </DropdownTrigger>
+      <DropdownMenu
+        aria-label="主题模式"
+        className="public-header-menu"
+        onAction={(key) => {
+          if (key === "system") resetToSystem();
+          else if (key === "light" || key === "dark") setTheme(key);
+        }}
       >
-        {theme === "dark" ? <SunIcon /> : <MoonIcon />}
-      </Button>
-    </Tooltip>
+        <DropdownItem key="system" startContent={<SystemIcon />} endContent={mode === "system" ? <CheckIcon /> : null}>
+          跟随系统
+        </DropdownItem>
+        <DropdownItem key="light" startContent={<SunIcon />} endContent={mode === "light" ? <CheckIcon /> : null}>
+          浅色模式
+        </DropdownItem>
+        <DropdownItem key="dark" startContent={<MoonIcon />} endContent={mode === "dark" ? <CheckIcon /> : null}>
+          深色模式
+        </DropdownItem>
+      </DropdownMenu>
+    </Dropdown>
+  );
+}
+
+function SystemIcon() {
+  return (
+    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+      <rect x="3" y="4" width="18" height="13" rx="2" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M8 21h8M12 17v4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
   );
 }
 
@@ -51,6 +81,14 @@ function MoonIcon() {
         strokeLinejoin="round"
         strokeWidth="1.8"
       />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg aria-hidden="true" className="h-4 w-4 text-primary" fill="none" viewBox="0 0 24 24">
+      <path d="m5 12 4 4L19 6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.2" />
     </svg>
   );
 }

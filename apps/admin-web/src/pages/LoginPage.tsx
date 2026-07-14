@@ -2,9 +2,9 @@ import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type R
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
+import { ThemeToggleButton } from "../components/ThemeToggleButton";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 import { usePageSeo } from "../lib/seo";
-import { useTheme } from "../theme/ThemeContext";
 
 const metrics = [
   { value: "TCP", label: "公网端口映射" },
@@ -139,49 +139,45 @@ function LoginPageContent() {
   };
 
   return (
-    <main className="landing-shell min-h-screen text-zinc-950 dark:text-white">
-      <SignalField />
-      <div className="landing-grid" aria-hidden="true" />
-      <div className="landing-scanline" aria-hidden="true" />
-
-      <section className="relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
-        <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
+      <section className="landing-apple-hero relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
+        <header className="landing-apple-header flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <AppLogo className="w-full sm:w-auto" label="shuai-tunnel" subtitle="内网服务接入控制面" />
-          <div className="grid w-full grid-cols-[2.25rem_repeat(2,minmax(0,1fr))] gap-2 sm:flex sm:w-auto sm:items-center">
-            <LandingThemeToggleButton />
+          <div className="public-header-actions grid w-full grid-cols-[repeat(2,minmax(0,1fr))_2.25rem] gap-2 sm:flex sm:w-auto sm:items-center">
             <PublicToolsMenu />
-            <button type="button" className="landing-ghost-button landing-nav-button" onClick={focusLogin}>
+            <button type="button" className="public-header-button" onClick={focusLogin}>
               进入控制台
             </button>
+            <ThemeToggleButton className="public-header-theme-button" />
           </div>
         </header>
 
-        <div className="grid flex-1 items-center gap-8 py-10 lg:grid-cols-[minmax(0,1fr)_420px]">
-          <div className="flex min-w-0 flex-col gap-7">
-            <span className="w-fit rounded-md border border-emerald-500/35 bg-emerald-300/15 px-2 py-1 text-small text-emerald-700 dark:border-emerald-300/35 dark:bg-emerald-300/10 dark:text-emerald-100">
+        <div className="landing-apple-hero-layout grid flex-1 items-center gap-10 py-10 lg:grid-cols-[minmax(0,1fr)_420px]">
+          <div className="landing-apple-copy flex min-w-0 flex-col gap-8">
+            <span className="landing-apple-eyebrow w-fit text-small font-semibold">
               Secure tunnel control plane
             </span>
 
             <div className="max-w-3xl">
-              <h1 className="text-display-lg font-semibold text-zinc-950 dark:text-white sm:text-display-xl">shuai-tunnel</h1>
-              <p className="mt-5 max-w-2xl text-lg leading-8 text-zinc-700 dark:text-zinc-300">
+              <h1 className="landing-apple-title font-semibold text-zinc-950 dark:text-white">shuai-tunnel</h1>
+              <p className="landing-apple-lead mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
                 把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测，TLS 开箱即用。
               </p>
             </div>
 
-            <div className="grid max-w-3xl grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="landing-apple-metrics grid max-w-3xl grid-cols-2 sm:grid-cols-4">
               {metrics.map((item) => (
-                <div key={item.label} className="glass glass-border rounded-md border p-3 shadow-sm dark:shadow-none">
-                  <p className="text-xl font-semibold text-cyan-700 dark:text-cyan-100">{item.value}</p>
+                <div key={item.label} className="landing-apple-metric py-3">
+                  <p className="text-xl font-semibold text-zinc-950 dark:text-white">{item.value}</p>
                   <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{item.label}</p>
                 </div>
               ))}
             </div>
 
-            <div className="glass glass-border flex max-w-3xl flex-col gap-3 rounded-md border p-4 shadow-sm dark:shadow-none sm:flex-row sm:items-center">
+            <div className="landing-apple-flow flex max-w-3xl flex-col gap-3 p-4 sm:flex-row sm:items-center">
               {flowNodes.map((node, index) => (
                 <div key={node} className="flex min-w-0 flex-1 items-center gap-3">
-                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-amber-500/35 bg-amber-300/20 text-small text-amber-800 dark:border-amber-300/30 dark:bg-amber-300/10 dark:text-amber-100">
+                  <span className="landing-apple-step flex h-8 w-8 shrink-0 items-center justify-center text-small">
                     {index + 1}
                   </span>
                   <span className="truncate text-small text-zinc-700 dark:text-zinc-200">{node}</span>
@@ -192,9 +188,9 @@ function LoginPageContent() {
           </div>
 
           <div ref={loginPanelRef} id="login-panel">
-            <div className="landing-card glass-strong glass-border rounded-md border text-zinc-950 dark:text-white">
+            <div className="app-apple-login-card landing-apple-login landing-card text-zinc-950 dark:text-white">
               <div className="flex flex-col items-start gap-2 px-5 pb-2 pt-5">
-                <span className="rounded-md bg-cyan-300/25 px-2 py-1 text-tiny text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100">
+                <span className="landing-apple-eyebrow text-tiny font-semibold">
                   管理台登录
                 </span>
                 <div>
@@ -270,7 +266,7 @@ function LoginPageContent() {
         </div>
       </section>
 
-      <section className="glass glass-border relative z-10 border-t px-5 py-10 sm:px-8">
+      <section className="landing-apple-content relative z-10 px-5 py-16 sm:px-8">
         <div className="mx-auto max-w-[1440px]">
           <div className="mb-6 max-w-2xl">
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">组网形态</h2>
@@ -292,7 +288,7 @@ function LoginPageContent() {
               badge="HTTP route"
               title="HTTP 路由：按 Host 与 Path 进入内网 Web 服务"
               description="请求先进 Server 的 HTTP 网关，管理端配置决定命中哪个租户、客户端和目标地址，再把请求沿客户端长连接送回内网。"
-              accent="cyan"
+              accent="blue"
             >
               <FlowDiagram nodes={httpRouteNodes} variant="http" />
               <div className="principle-note">
@@ -338,10 +334,10 @@ function LoginPageContent() {
             {featureCards.map((feature) => (
               <article
                 key={feature.title}
-                className="glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
+                className="app-apple-landing-surface landing-apple-feature text-zinc-950 dark:text-white"
               >
                 <div className="grid gap-3 p-4">
-                  <span className="w-fit rounded-md border border-cyan-500/25 bg-cyan-300/15 px-2 py-1 text-tiny text-cyan-700 dark:border-cyan-300/25 dark:bg-cyan-300/10 dark:text-cyan-100">
+                  <span className="landing-apple-kicker w-fit text-tiny font-semibold">
                     {feature.label}
                   </span>
                   <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{feature.title}</h3>
@@ -351,7 +347,7 @@ function LoginPageContent() {
             ))}
           </div>
 
-          <div className="glass glass-border mt-12 flex flex-col gap-3 rounded-md border p-5">
+          <div className="app-apple-landing-surface landing-apple-protocol mt-12 flex flex-col gap-3 p-5">
             <div className="flex flex-wrap items-center gap-3">
               <span className="text-base font-semibold text-zinc-950 dark:text-white">四种实现 · 一份协议</span>
               <span className="rounded-md border border-emerald-500/25 bg-emerald-300/15 px-2 py-0.5 text-tiny text-emerald-700 dark:border-emerald-300/25 dark:bg-emerald-300/10 dark:text-emerald-100">
@@ -364,7 +360,7 @@ function LoginPageContent() {
                   key={chip.name}
                   className="glass-chip glass-border inline-flex items-baseline gap-1.5 rounded-md border px-3 py-1.5 text-tiny text-zinc-700 dark:text-zinc-300"
                 >
-                  <span className="font-semibold text-cyan-700 dark:text-cyan-200">{chip.name}</span>
+                  <span className="font-semibold text-primary-700 dark:text-primary-400">{chip.name}</span>
                   <span className="text-zinc-500 dark:text-zinc-500">·</span>
                   <span>{chip.note}</span>
                 </span>
@@ -383,50 +379,11 @@ function LoginPageContent() {
     </main>
   );
 }
-
-function LandingThemeToggleButton() {
-  const { theme, toggleTheme } = useTheme();
-  const nextThemeLabel = theme === "dark" ? "切换到浅色模式" : "切换到深色模式";
-  return (
-    <button type="button" className="landing-icon-button" aria-label={nextThemeLabel} title={nextThemeLabel} onClick={toggleTheme}>
-      {theme === "dark" ? <SunIcon /> : <MoonIcon />}
-    </button>
-  );
-}
-
-function SunIcon() {
-  return (
-    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-      <path
-        d="M12 4V2M12 22v-2M4.93 4.93 3.52 3.52M20.48 20.48l-1.41-1.41M4 12H2M22 12h-2M4.93 19.07l-1.41 1.41M20.48 3.52l-1.41 1.41M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-    </svg>
-  );
-}
-
-function MoonIcon() {
-  return (
-    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-      <path
-        d="M20.25 14.15A7.75 7.75 0 0 1 9.85 3.75 8.5 8.5 0 1 0 20.25 14.15Z"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-    </svg>
-  );
-}
-
 /**
  * 拓扑总览图：左 公网用户 / 中 Server 控制面 / 右上 客户端 A / 右下 客户端 B。
  *
  * 视觉约定：
- *  - cyan 实线：经 Server 中继的反向隧道（HTTP/TCP 主路径）。
+ *  - Apple blue 实线：经 Server 中继的反向隧道（HTTP/TCP 主路径）。
  *  - emerald 虚线：客户端互联（信令 + 加密 frame 直连 / TURN 回退）。
  *
  * 暗色协调：节点 fill/stroke 走 CSS class `.topo-card-fill / .topo-card-stroke`，
@@ -445,12 +402,8 @@ function TopologyDiagram() {
         aria-label="组网形态：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连通道"
       >
         <defs>
-          <linearGradient id="topo-relay-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
-            <stop offset="0%" stopColor="rgb(6,182,212)" stopOpacity="0.92" />
-            <stop offset="100%" stopColor="rgb(20,184,166)" stopOpacity="0.82" />
-          </linearGradient>
-          <marker id="topo-arrow-cyan" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
-            <path d="M0,0 L12,6 L0,12 z" fill="rgb(6,182,212)" />
+          <marker id="topo-arrow-blue" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0,0 L12,6 L0,12 z" fill="var(--landing-action)" />
           </marker>
           <marker id="topo-arrow-emerald" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
             <path d="M0,0 L12,6 L0,12 z" fill="rgb(16,185,129)" />
@@ -467,7 +420,7 @@ function TopologyDiagram() {
 
         {/* 中节点：Server 控制面 (x: 420-660, y: 80-360, 宽 240, 高 280) */}
         <g>
-          <rect className="topo-server" x="420" y="80" width="240" height="280" rx="12" fill="url(#topo-relay-gradient)" />
+          <rect className="topo-server" x="420" y="80" width="240" height="280" rx="12" fill="var(--landing-action)" />
           <text x="540" y="122" textAnchor="middle" fontSize="15" fill="#ffffff" fontWeight="700">Server 控制面</text>
           <line x1="450" y1="138" x2="630" y2="138" stroke="rgba(255,255,255,0.35)" strokeWidth="1" />
           <text x="540" y="166" textAnchor="middle" fontSize="12" fill="#ffffff" opacity="0.92">7010 控制连接</text>
@@ -500,17 +453,17 @@ function TopologyDiagram() {
 
         {/* === 中继路径：公网用户 ↔ Server （上下分开，避免重合） === */}
         {/* 公网请求：左下 → Server 左上 */}
-        <line x1="232" y1="205" x2="418" y2="170" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
-        <text x="320" y="178" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" fontWeight="600">公网请求</text>
+        <line x1="232" y1="205" x2="418" y2="170" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
+        <text x="320" y="178" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" fontWeight="600">公网请求</text>
         {/* 响应：Server 左下 → 公网用户右下 */}
-        <line x1="418" y1="270" x2="232" y2="240" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.6" />
-        <text x="320" y="270" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" opacity="0.78" fontWeight="600">响应</text>
+        <line x1="418" y1="270" x2="232" y2="240" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
+        <text x="320" y="270" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" opacity="0.78" fontWeight="600">响应</text>
 
         {/* === 中继路径：Server ↔ 客户端 A === */}
-        <line x1="662" y1="160" x2="848" y2="130" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" />
-        <text x="755" y="135" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" fontWeight="600">下发 / 转发</text>
-        <line x1="848" y1="180" x2="662" y2="195" stroke="rgb(6,182,212)" strokeWidth="2" markerEnd="url(#topo-arrow-cyan)" className="topology-relay-flow" opacity="0.6" />
-        <text x="755" y="205" textAnchor="middle" fontSize="11.5" fill="rgb(6,182,212)" opacity="0.78" fontWeight="600">上行字节</text>
+        <line x1="662" y1="160" x2="848" y2="130" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
+        <text x="755" y="135" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" fontWeight="600">下发 / 转发</text>
+        <line x1="848" y1="180" x2="662" y2="195" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
+        <text x="755" y="205" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" opacity="0.78" fontWeight="600">上行字节</text>
 
         {/* === 信令路径：Server ↔ 客户端 B（emerald 虚线，label 放线上方留白处） === */}
         <line x1="662" y1="290" x2="848" y2="280" stroke="rgb(16,185,129)" strokeWidth="2" strokeDasharray="6 5" markerEnd="url(#topo-arrow-emerald)" className="topology-peer-flow" />
@@ -541,7 +494,7 @@ function TopologyDiagram() {
         <text x="950" y="226" textAnchor="middle" fontSize="11.5" fill="rgb(5,150,105)" fontWeight="700">Peer 直连</text>
       </svg>
       <p className="mt-3 text-tiny leading-5 text-zinc-600 dark:text-zinc-400">
-        实线（青）= 经 Server 中继的反向隧道，HTTP 路由与 TCP 端口映射走这条主路径；
+        实线（蓝）= 经 Server 中继的反向隧道，HTTP 路由与 TCP 端口映射走这条主路径；
         虚线（绿）= 客户端互联，控制面下发设备清单与会话凭证后，两端在 UDP 直连或 TURN 回退上跑加密 frame 数据面。
       </p>
     </div>
@@ -585,7 +538,7 @@ function MobileTopologyDiagram() {
       </div>
 
       <div className="topology-mobile-note">
-        青色表示公网访问经 Server 中继；绿色表示客户端之间的数据面直连，失败后回退 TURN。
+        蓝色表示公网访问经 Server 中继；绿色表示客户端之间的数据面直连，失败后回退 TURN。
       </div>
     </div>
   );
@@ -687,23 +640,23 @@ function ClientDownloadsSection() {
         {grouped.map(({ implementation, items }) => (
           <section
             key={implementation}
-            className="glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
+            className="app-apple-landing-surface glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none"
           >
             <div className="grid gap-3 p-4">
-              <span className="w-fit rounded-md bg-cyan-300/25 px-2 py-1 text-tiny text-cyan-800 dark:bg-cyan-300/15 dark:text-cyan-100">
+              <span className="w-fit rounded-md bg-primary-100 px-2 py-1 text-tiny text-primary-700 dark:bg-primary-500/15 dark:text-primary-300">
                 {IMPL_LABELS[implementation]}
               </span>
               <div className="flex flex-col gap-2">
                 {items.map((link) => (
                   <a
                     key={link.id}
-                    className="glass-chip glass-border group flex items-start justify-between gap-2 rounded-md border p-2.5 transition hover:border-cyan-500/40 hover:bg-white/85 dark:hover:bg-white/[0.08]"
+                    className="glass-chip glass-border group flex items-start justify-between gap-2 rounded-md border p-2.5 transition hover:border-primary-500/40 hover:bg-white/85 dark:hover:bg-white/[0.08]"
                     href={link.downloadUrl}
                     rel="noopener noreferrer"
                     target="_blank"
                   >
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-small font-medium text-zinc-950 group-hover:text-cyan-700 dark:text-white dark:group-hover:text-cyan-200">
+                      <div className="truncate text-small font-medium text-zinc-950 group-hover:text-primary-700 dark:text-white dark:group-hover:text-primary-400">
                         {link.displayName}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-1 text-tiny text-zinc-600 dark:text-zinc-400">
@@ -712,7 +665,7 @@ function ClientDownloadsSection() {
                         <span>{shortArch(link.arch)}</span>
                       </div>
                     </div>
-                    <span className="shrink-0 text-tiny text-zinc-500 group-hover:text-cyan-700 dark:group-hover:text-cyan-200">↗</span>
+                    <span className="shrink-0 text-tiny text-zinc-500 group-hover:text-primary-700 dark:group-hover:text-primary-400">↗</span>
                   </a>
                 ))}
               </div>
@@ -751,7 +704,7 @@ function PrincipleCard({
   preview,
   title,
 }: {
-  accent: "amber" | "cyan" | "emerald";
+  accent: "amber" | "blue" | "emerald";
   badge: string;
   children: ReactNode;
   description: string;
@@ -826,142 +779,4 @@ function FlowStep({
       )}
     </>
   );
-}
-
-function SignalField() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) {
-      return;
-    }
-
-    type SignalNode = {
-      x: number;
-      y: number;
-      phase: number;
-      size: number;
-    };
-
-    let width = 0;
-    let height = 0;
-    let frame = 0;
-    let raf = 0;
-    let running = false;
-    let visible = true;
-    let nodes: SignalNode[] = [];
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    // Android GPU 逐帧上传全 dpr 纹理会挤占合成器带宽（丢 tile 根因之一），钳到 1
-    const dprCap = /\bAndroid\b/i.test(window.navigator.userAgent) ? 1 : 2;
-
-    const rebuildNodes = () => {
-      const count = Math.max(20, Math.min(52, Math.floor((width * height) / 32000)));
-      nodes = Array.from({ length: count }, (_, index) => ({
-        x: (index * 0.61803398875) % 1,
-        y: (index * 0.41421356237 + 0.08) % 1,
-        phase: index * 0.77,
-        size: 2 + (index % 3),
-      }));
-    };
-
-    const resize = () => {
-      const rect = canvas.getBoundingClientRect();
-      const dpr = Math.min(window.devicePixelRatio || 1, dprCap);
-      width = rect.width;
-      height = rect.height;
-      canvas.width = Math.floor(width * dpr);
-      canvas.height = Math.floor(height * dpr);
-      context.setTransform(dpr, 0, 0, dpr, 0, 0);
-      rebuildNodes();
-    };
-
-    const nodePosition = (node: SignalNode) => {
-      const drift = reducedMotion ? 0 : frame * 0.008;
-      return {
-        x: node.x * width + Math.sin(drift + node.phase) * 24,
-        y: node.y * height + Math.cos(drift * 0.85 + node.phase) * 18,
-      };
-    };
-
-    const draw = () => {
-      if (width <= 0 || height <= 0) {
-        return;
-      }
-      context.clearRect(0, 0, width, height);
-      context.lineWidth = 1;
-
-      const points = nodes.map(nodePosition);
-      for (let i = 0; i < points.length; i += 1) {
-        for (let j = i + 1; j < points.length; j += 1) {
-          const dx = points[i].x - points[j].x;
-          const dy = points[i].y - points[j].y;
-          const distance = Math.sqrt(dx * dx + dy * dy);
-          if (distance < 190) {
-            const alpha = (1 - distance / 190) * 0.22;
-            context.strokeStyle = `rgba(34, 211, 238, ${alpha})`;
-            context.beginPath();
-            context.moveTo(points[i].x, points[i].y);
-            context.lineTo(points[j].x, points[j].y);
-            context.stroke();
-          }
-        }
-      }
-
-      nodes.forEach((node, index) => {
-        const point = points[index];
-        context.fillStyle = index % 4 === 0 ? "rgba(251, 191, 36, 0.78)" : "rgba(94, 234, 212, 0.78)";
-        context.fillRect(point.x - node.size / 2, point.y - node.size / 2, node.size, node.size);
-      });
-
-      for (let i = 0; i < 5; i += 1) {
-        const y = height * (0.18 + i * 0.16) + Math.sin(frame * 0.015 + i) * 16;
-        const x = ((frame * (0.85 + i * 0.12) + i * 180) % (width + 260)) - 260;
-        context.strokeStyle = i % 2 === 0 ? "rgba(45, 212, 191, 0.38)" : "rgba(251, 191, 36, 0.28)";
-        context.beginPath();
-        context.moveTo(x, y);
-        context.lineTo(x + 180, y + 26);
-        context.stroke();
-        context.fillStyle = "rgba(255, 255, 255, 0.72)";
-        context.fillRect(x + 180, y + 24, 5, 5);
-      }
-
-      if (!reducedMotion && visible) {
-        frame += 1;
-        raf = window.requestAnimationFrame(draw);
-        running = true;
-      } else {
-        running = false;
-      }
-    };
-
-    // canvas 只在视口内时才跑 rAF：滚到能力卡片区后完全停画，
-    // 不与卡片动画争抢 Android GPU 光栅化带宽。
-    const observer = new IntersectionObserver((entries) => {
-      visible = entries[0]?.isIntersecting ?? true;
-      if (!visible) {
-        window.cancelAnimationFrame(raf);
-        running = false;
-        return;
-      }
-      if (!running && !reducedMotion) {
-        running = true;
-        raf = window.requestAnimationFrame(draw);
-      }
-    });
-    observer.observe(canvas);
-
-    resize();
-    draw();
-    window.addEventListener("resize", resize);
-
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", resize);
-      window.cancelAnimationFrame(raf);
-    };
-  }, []);
-
-  return <canvas ref={canvasRef} className="landing-canvas" aria-hidden="true" />;
 }

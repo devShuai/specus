@@ -171,7 +171,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
           title: "在线 NAT 类型检测 · 浏览器 STUN 探测 · shuai-tunnel",
           description:
             "免登录在线检测当前网络的 NAT 类型：Symmetric NAT、Port Preserved NAT、Cone-like NAT、UDP 阻断。基于 WebRTC + STUN，无需安装客户端，支持 IPv4 / IPv6。",
-          canonical: "https://tunnel.devshuai.com/#/nat-detect",
+          canonical: "https://tunnel.devshuai.com/nat-detect",
           keywords:
             "NAT 检测,NAT 类型,Symmetric NAT,Full Cone NAT,Port Restricted NAT,STUN,WebRTC,在线 NAT 测试,UDP 打洞,P2P 直连,IPv6 NAT",
           jsonLd: [
@@ -179,7 +179,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
               "@context": "https://schema.org",
               "@type": "WebApplication",
               "name": "shuai-tunnel 在线 NAT 检测",
-              "url": "https://tunnel.devshuai.com/#/nat-detect",
+              "url": "https://tunnel.devshuai.com/nat-detect",
               "applicationCategory": "UtilitiesApplication",
               "browserRequirements": "需要支持 WebRTC 的现代浏览器 (Chrome / Edge / Firefox / Safari)",
               "operatingSystem": "Web",
@@ -225,7 +225,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
       : {
           title: "NAT 类型检测 · shuai-tunnel 管理后台",
           description: "管理员视图：浏览器侧检测当前所在网络的 NAT 类型与公网映射稳定性。",
-          canonical: "https://tunnel.devshuai.com/#/nat-detect",
+          canonical: "https://tunnel.devshuai.com/nat-detect",
         },
   );
 
@@ -283,22 +283,19 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
 
   if (publicPage) {
     return (
-      <main className="landing-shell relative min-h-screen overflow-hidden text-zinc-950 dark:text-white">
-        <div className="landing-grid" aria-hidden="true" />
-        <div className="landing-scanline" aria-hidden="true" />
-
-        <header className="relative z-10 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8">
+      <main className="app-apple-tool relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
+        <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] flex-wrap items-center justify-between gap-3 px-5 py-5 sm:px-8">
           <AppLogo label="shuai-tunnel" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
-          <div className="flex items-center gap-2">
+          <div className="public-header-actions flex items-center gap-2">
             <PublicToolsMenu active="nat-detect" />
-            <ThemeToggleButton className="glass-chip text-zinc-950 dark:text-white" />
-            <Button as="a" href="/" radius="sm" variant="flat" className="glass-chip text-zinc-950 dark:text-white">
+            <a href="/" className="public-header-button">
               进入控制台
-            </Button>
+            </a>
+            <ThemeToggleButton className="public-header-theme-button" />
           </div>
         </header>
 
-        <section className="relative z-10 mx-auto w-full max-w-[1080px] px-5 pb-16 sm:px-8">
+        <section className="app-apple-tool-content relative z-10 mx-auto w-full max-w-[1080px] px-5 pb-16 sm:px-8">
           <NatHero
             result={result}
             checking={checking}
@@ -372,13 +369,8 @@ function NatHero({
 
   return (
     <section
-      className={`relative overflow-hidden rounded-2xl border ${accent.border} ${accent.bg} ${embedded ? "p-5" : "p-7 sm:p-10"}`}
+      className={`app-apple-nat-hero relative overflow-hidden rounded-2xl border ${accent.border} ${accent.bg} ${embedded ? "p-5" : "p-7 sm:p-10"}`}
     >
-      <div
-        aria-hidden="true"
-        className={`pointer-events-none absolute -right-24 -top-24 h-64 w-64 rounded-full blur-3xl ${accent.glow}`}
-      />
-
       <div className="relative flex flex-col gap-5">
         <div className="flex flex-wrap items-center gap-2">
           <Chip
@@ -457,7 +449,7 @@ function NatHero({
             size={embedded ? "md" : "lg"}
             isLoading={checking}
             onPress={onRun}
-            className="bg-cyan-500 font-medium text-white hover:bg-cyan-600 dark:bg-cyan-400 dark:text-zinc-950 dark:hover:bg-cyan-300"
+            className="font-medium"
           >
             {checking ? "检测中…" : result ? "重新检测" : "开始检测"}
           </Button>
@@ -880,7 +872,6 @@ const ACCENTS: Record<
   {
     border: string;
     bg: string;
-    glow: string;
     chipBg: string;
     chipText: string;
     chipBorder: string;
@@ -889,23 +880,20 @@ const ACCENTS: Record<
   default: {
     border: "border-black/10 dark:border-white/10",
     bg: "bg-white/60 dark:bg-white/[0.03]",
-    glow: "bg-cyan-500/10 dark:bg-cyan-400/10",
     chipBg: "bg-zinc-200/70 dark:bg-white/10",
     chipText: "text-zinc-700 dark:text-zinc-200",
     chipBorder: "border-zinc-300/60 dark:border-white/10",
   },
   primary: {
-    border: "border-cyan-500/25 dark:border-cyan-300/25",
-    bg: "bg-cyan-500/[0.04] dark:bg-cyan-400/[0.06]",
-    glow: "bg-cyan-500/15 dark:bg-cyan-400/15",
-    chipBg: "bg-cyan-500/15 dark:bg-cyan-400/15",
-    chipText: "text-cyan-700 dark:text-cyan-100",
-    chipBorder: "border-cyan-500/30 dark:border-cyan-300/30",
+    border: "border-primary-500/25 dark:border-primary-300/25",
+    bg: "bg-primary-500/[0.04] dark:bg-primary-400/[0.06]",
+    chipBg: "bg-primary-500/15 dark:bg-primary-400/15",
+    chipText: "text-primary-700 dark:text-primary-300",
+    chipBorder: "border-primary-500/30 dark:border-primary-300/30",
   },
   success: {
     border: "border-emerald-500/25 dark:border-emerald-300/25",
     bg: "bg-emerald-500/[0.04] dark:bg-emerald-400/[0.06]",
-    glow: "bg-emerald-500/15 dark:bg-emerald-400/15",
     chipBg: "bg-emerald-500/15 dark:bg-emerald-400/15",
     chipText: "text-emerald-700 dark:text-emerald-100",
     chipBorder: "border-emerald-500/30 dark:border-emerald-300/30",
@@ -913,7 +901,6 @@ const ACCENTS: Record<
   warning: {
     border: "border-amber-500/25 dark:border-amber-300/25",
     bg: "bg-amber-500/[0.04] dark:bg-amber-400/[0.06]",
-    glow: "bg-amber-500/15 dark:bg-amber-400/15",
     chipBg: "bg-amber-500/15 dark:bg-amber-400/15",
     chipText: "text-amber-700 dark:text-amber-100",
     chipBorder: "border-amber-500/30 dark:border-amber-300/30",
@@ -921,7 +908,6 @@ const ACCENTS: Record<
   danger: {
     border: "border-rose-500/25 dark:border-rose-300/25",
     bg: "bg-rose-500/[0.04] dark:bg-rose-400/[0.06]",
-    glow: "bg-rose-500/15 dark:bg-rose-400/15",
     chipBg: "bg-rose-500/15 dark:bg-rose-400/15",
     chipText: "text-rose-700 dark:text-rose-100",
     chipBorder: "border-rose-500/30 dark:border-rose-300/30",
@@ -1011,7 +997,7 @@ function ConfidenceBars({ confidence }: { confidence: BrowserNatConfidence }) {
           key={height}
           className={`w-1 rounded-sm ${height} ${
             index < filled
-              ? "bg-cyan-500 dark:bg-cyan-300"
+              ? "bg-primary-500 dark:bg-primary-300"
               : "bg-zinc-300/80 dark:bg-white/15"
           }`}
         />
@@ -1048,7 +1034,7 @@ function natToneBg(tone: "default" | "primary" | "success" | "warning" | "danger
     case "success":
       return "bg-emerald-500";
     case "primary":
-      return "bg-cyan-500";
+      return "bg-primary-500";
     case "warning":
       return "bg-amber-500";
     case "danger":

@@ -1,42 +1,45 @@
 /** @type {import('tailwindcss').Config} */
 import { heroui } from "@heroui/react";
 
-// shuai-tunnel 品牌语义色：直接复用项目已有的 Tailwind 调色板 hex，保证 HeroUI 语义令牌
-// (color="primary" / bg-primary / border-default-200 …) 与散落的 bg-cyan-500 等工具类同色。
+// 全站语义色与专业流程图编辑器共用 Apple 风格色板，保证 HeroUI 组件和公开工具页一致。
 // 色阶 50–900 同时给出，HeroUI 的 flat/subtle 变体（Chip、Badge）依赖 -100/-200 底与 -600/-700 文字。
 // 配置写在 heroui() 插件里（extendTheme 的同形配置），由插件生成 CSS 变量与语义工具类；
 // 深浅主题靠 <html> 上的 .dark/.light 切换（见 ThemeContext.tsx），与 darkMode: "class" 一致。
 
-// 饱和语义色：light/dark 共用同一套色阶（HeroUI 组件自带深浅感知变体），仅 DEFAULT/foreground 固定。
+const appleBlueScale = {
+  50: "#f0f7ff",
+  100: "#e1efff",
+  200: "#bfddff",
+  300: "#8ec4ff",
+  400: "#5aa8ff",
+  500: "#2997ff",
+  600: "#0077ed",
+  700: "#0066cc",
+  800: "#0055aa",
+  900: "#00447f",
+};
+
+// 主色保持足够对比度，状态色继续使用各自语义色，避免界面退化成单色。
 const semanticColors = {
-  // primary = cyan（主色，对应现有 cyan-500 系）
+  // primary = Apple blue
   primary: {
-    50: "#ecfeff",
-    100: "#cffafe",
-    200: "#a5f3fc",
-    300: "#67e8f9",
-    400: "#22d3ee",
-    500: "#06b6d4",
-    600: "#0891b2",
-    700: "#0e7490",
-    800: "#155e75",
-    900: "#164e63",
-    DEFAULT: "#06b6d4",
+    ...appleBlueScale,
+    DEFAULT: "#0066cc",
     foreground: "#ffffff",
   },
-  // secondary = slate（低调中性灰，带轻微冷调，不抢 cyan 主色；与 zinc 中性可区分）
+  // secondary = Apple neutral（用于次级操作，不引入独立冷色系）
   secondary: {
-    50: "#f8fafc",
-    100: "#f1f5f9",
-    200: "#e2e8f0",
-    300: "#cbd5e1",
-    400: "#94a3b8",
-    500: "#64748b",
-    600: "#475569",
-    700: "#334155",
-    800: "#1e293b",
-    900: "#0f172a",
-    DEFAULT: "#64748b",
+    50: "#f5f5f7",
+    100: "#e8e8ed",
+    200: "#d2d2d7",
+    300: "#b8b8bd",
+    400: "#8e8e93",
+    500: "#6e6e73",
+    600: "#515154",
+    700: "#3a3a3c",
+    800: "#2c2c2e",
+    900: "#1d1d1f",
+    DEFAULT: "#6e6e73",
     foreground: "#ffffff",
   },
   // success = emerald
@@ -100,9 +103,9 @@ const zincScale = {
   900: "#18181b",
 };
 
-// Linear 风格的暗色层级：深色表面在前、可读文字在后。HeroUI 的暗色语义色阶必须
+// Apple 风格的暗色层级：深色表面在前、可读文字在后。HeroUI 的暗色语义色阶必须
 // 与浅色相反，否则 text-default-600 会落成深灰，bg/border-default-* 也会反向失真。
-const linearDarkScale = {
+const appleDarkScale = {
   50: "#0f1011",
   100: "#141516",
   200: "#23252a",
@@ -125,6 +128,10 @@ export default {
   ],
   theme: {
     extend: {
+      // 历史页面仍使用 cyan-* 工具类，在主题层映射为编辑器蓝以保留原有状态选择器。
+      colors: {
+        cyan: appleBlueScale,
+      },
       // Inter 变体字体 + CJK 系统回退（中文走系统字体，不内嵌巨型 CJK 字体）。
       fontFamily: {
         sans: [
@@ -139,12 +146,12 @@ export default {
           "sans-serif",
         ],
       },
-      // Vercel 风格 display 字阶：大字号配负字距，越小越松。用于 hero / 章节标题。
+      // 与专业编辑器一致，所有显示字号保持自然字距。
       fontSize: {
-        "display-xl": ["3rem", { lineHeight: "1.05", letterSpacing: "-0.04em" }],
-        "display-lg": ["2rem", { lineHeight: "1.1", letterSpacing: "-0.03em" }],
-        "display-md": ["1.5rem", { lineHeight: "1.15", letterSpacing: "-0.02em" }],
-        "display-sm": ["1.25rem", { lineHeight: "1.2", letterSpacing: "-0.01em" }],
+        "display-xl": ["3rem", { lineHeight: "1.05", letterSpacing: "0" }],
+        "display-lg": ["2rem", { lineHeight: "1.1", letterSpacing: "0" }],
+        "display-md": ["1.5rem", { lineHeight: "1.15", letterSpacing: "0" }],
+        "display-sm": ["1.25rem", { lineHeight: "1.2", letterSpacing: "0" }],
       },
     },
   },
@@ -155,28 +162,28 @@ export default {
         light: {
           colors: {
             ...semanticColors,
-            default: { ...zincScale, DEFAULT: "#18181b", foreground: "#fafafa" },
-            background: "#ffffff",
-            foreground: "#18181b",
+            default: { ...zincScale, DEFAULT: "#e8e8ed", foreground: "#1d1d1f" },
+            background: "#f5f5f7",
+            foreground: "#1d1d1f",
             content1: "#ffffff",
-            content2: "#fafafa",
-            content3: "#f4f4f5",
-            divider: "#e4e4e7",
-            focus: "#06b6d4",
+            content2: "#fbfbfd",
+            content3: "#f5f5f7",
+            divider: "#e5e5e7",
+            focus: "#0066cc",
           },
         },
         dark: {
           colors: {
             ...semanticColors,
-            default: { ...linearDarkScale, DEFAULT: "#34343a", foreground: "#f7f8f8" },
-            background: "#010102",
-            foreground: { ...linearDarkScale, DEFAULT: "#f7f8f8" },
-            content1: { DEFAULT: "#0f1011", foreground: "#f7f8f8" },
-            content2: { DEFAULT: "#141516", foreground: "#d0d6e0" },
-            content3: { DEFAULT: "#18191a", foreground: "#d0d6e0" },
-            content4: { DEFAULT: "#23252a", foreground: "#d0d6e0" },
-            divider: "#23252a",
-            focus: "#22d3ee",
+            default: { ...appleDarkScale, DEFAULT: "#34343a", foreground: "#f7f8f8" },
+            background: "#1d1d1f",
+            foreground: { ...appleDarkScale, DEFAULT: "#f5f5f7" },
+            content1: { DEFAULT: "#2c2c2e", foreground: "#f5f5f7" },
+            content2: { DEFAULT: "#242426", foreground: "#d1d1d6" },
+            content3: { DEFAULT: "#323234", foreground: "#d1d1d6" },
+            content4: { DEFAULT: "#3a3a3c", foreground: "#d1d1d6" },
+            divider: "#3a3a3c",
+            focus: "#2997ff",
           },
         },
       },

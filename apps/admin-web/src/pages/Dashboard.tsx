@@ -110,8 +110,8 @@ function DashboardContent() {
   };
 
   return (
-    <div className="flex min-h-screen">
-      <aside className="hidden w-60 shrink-0 bg-background shadow-[1px_0_3px_rgba(0,0,0,0.04)] lg:fixed lg:inset-y-0 lg:left-0 lg:z-30 lg:flex lg:flex-col">
+    <div className="app-apple app-apple-dashboard flex min-h-screen">
+      <aside className="app-apple-sidebar hidden w-56 shrink-0 bg-background lg:fixed lg:inset-y-0 lg:left-0 lg:z-30 lg:flex lg:flex-col">
         <Sidebar
           groups={visibleGroups}
           active={renderedPanel}
@@ -120,8 +120,8 @@ function DashboardContent() {
           footer={<UserMenu profile={profile} onLogout={logout} variant="block" />}
         />
       </aside>
-      <div className="flex min-w-0 flex-1 flex-col lg:ml-60">
-        <header className="bg-background/80 backdrop-blur lg:hidden">
+      <div className="flex min-w-0 flex-1 flex-col lg:ml-56">
+        <header className="app-apple-mobile-header bg-background/80 backdrop-blur lg:hidden">
           <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
             <Button isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
             <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
@@ -129,7 +129,7 @@ function DashboardContent() {
             <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
           </div>
         </header>
-        <main className="mx-auto w-full min-w-0 max-w-[1440px] flex-1 p-3 sm:p-4">
+        <main className="app-apple-main mr-auto w-full min-w-0 max-w-[1520px] flex-1 p-2 sm:p-3">
           <section className="min-w-0" key={renderedPanel}>
             <Suspense fallback={<PanelLoading />}>
               <ActivePanel panel={renderedPanel} initializing={initializing} onInitializeDatabase={initializeDatabase} />
@@ -145,8 +145,8 @@ function DashboardContent() {
 function MobileNav({ open, groups, active, onSelect, onClose }: { open: boolean; groups: NavGroup[]; active: PanelKey; onSelect: (p: PanelKey) => void; onClose: () => void }) {
   return (<>
     <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-sm transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
-    <aside className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[82vw] flex-col bg-background shadow-2xl transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}>
-      <div className="flex items-center justify-between gap-2 px-4 py-3">
+    <aside className={`app-apple-sidebar fixed inset-y-0 left-0 z-50 flex w-64 max-w-[86vw] flex-col bg-background transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}>
+      <div className="app-apple-nav-brand flex h-14 items-center justify-between gap-2 px-3">
         <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
         <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="sm" variant="light" onPress={onClose}><CloseIcon /></Button>
       </div>
