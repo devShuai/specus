@@ -70,6 +70,8 @@ client2.jsonc
 .dotnet/
 .dotnet-home/
 .m2/
+.npm-cache/
+**/.npm-cache/
 .nuget/
 .gocache/
 .gomodcache/
