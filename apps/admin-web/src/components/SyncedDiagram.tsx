@@ -97,6 +97,7 @@ import type {
   DrawioStencilLibrary,
   DrawioStencilShape,
 } from "../lib/drawioStencilCatalog";
+import { registerDiagramSemanticShapes, semanticShapeName } from "../lib/diagramSemanticShapes";
 import { useTheme } from "../theme/ThemeContext";
 
 VertexHandlerConfig.selectionColor = "#06b6d4";
@@ -113,6 +114,7 @@ StyleDefaultsConfig.shadowColor = "#0f172a";
 StyleDefaultsConfig.shadowOpacity = 0.16;
 StyleDefaultsConfig.shadowOffsetX = 0;
 StyleDefaultsConfig.shadowOffsetY = 4;
+registerDiagramSemanticShapes();
 
 interface SyncedDiagramProps {
   boardKey: string;
@@ -324,8 +326,8 @@ const STENCIL_COLLECTION_RULES: Array<{ id: string; name: string; pattern: RegEx
   { id: "web", name: "Web 图标与 Logo", pattern: /^web(?:icons|logos)$/ },
 ];
 
-const FILL_COLORS = ["#ffffff", "#eff6ff", "#ecfdf5", "#fffbeb", "#fdf2f8", "#f5f3ff"];
-const STROKE_COLORS = ["#64748b", "#3b82f6", "#10b981", "#f59e0b", "#ec4899", "#8b5cf6"];
+const FILL_COLORS = ["#ffffff", "#f5f5f7", "#e8f2ff", "#ecfdf5", "#fff7e6", "#fff1f2"];
+const STROKE_COLORS = ["#d2d2d7", "#86868b", "#0066cc", "#34c759", "#ff9f0a", "#ff3b30"];
 const diagramStateCache = new Map<string, Uint8Array>();
 
 export function SyncedDiagram({
@@ -461,7 +463,7 @@ export function SyncedDiagram({
         scheduleDocumentRender();
       })
       .catch((error) => {
-        if (active) setStatus(error instanceof Error ? error.message : "draw.io 图形库加载失败");
+        if (active) setStatus(error instanceof Error ? error.message : "扩展图形库加载失败");
       });
     return () => {
       active = false;
@@ -1673,7 +1675,30 @@ export function SyncedDiagram({
   const updateNodeFontSize = useCallback((fontSize: number) => {
     withGraph((graph) => {
       const cells = graph.getSelectionCells().filter((cell) => cell.isVertex());
-      graph.setCellStyles("fontSize", fontSize, cells);
+      graph.batchUpdate(() => {
+        cells.forEach((cell) => {
+          const style = cell.getClonedStyle() as DiagramCellStyle;
+          style.fontSize = fontSize;
+          graph.getDataModel().setStyle(cell, style);
+
+          const kind = style.diagramKind;
+          if (!kind || !isDiamondLikeKind(kind)) return;
+          const geometry = cell.getGeometry()?.clone();
+          if (!geometry) return;
+          const defaults = nodeDefaults(kind);
+          const scale = Math.max(1, fontSize / 14);
+          const minimumWidth = Math.round(defaults.width * scale);
+          const minimumHeight = Math.round(defaults.height * scale);
+          if (geometry.width >= minimumWidth && geometry.height >= minimumHeight) return;
+          const nextWidth = Math.max(geometry.width, minimumWidth);
+          const nextHeight = Math.max(geometry.height, minimumHeight);
+          geometry.x -= (nextWidth - geometry.width) / 2;
+          geometry.y -= (nextHeight - geometry.height) / 2;
+          geometry.width = nextWidth;
+          geometry.height = nextHeight;
+          graph.getDataModel().setGeometry(cell, geometry);
+        });
+      });
       updateSelection(graph, setSelection);
     });
   }, [withGraph]);
@@ -2336,14 +2361,25 @@ export function SyncedDiagram({
   const totalPeers = Math.max(1, peerCount + 1);
   const selectedCountLabel = selection.ids.length > 0 ? ` · 已选 ${selection.ids.length}` : "";
   const activePageName = pages.find((page) => page.id === activePageId)?.name ?? "页面 1";
-  const canvasBackground = theme === "dark" ? "#11151d" : "#f5f7fb";
-  const gridColor = theme === "dark" ? "rgba(148,163,184,.13)" : "rgba(100,116,139,.14)";
+  const canvasBackground = theme === "dark" ? "#272729" : "#f5f5f7";
+  const gridColor = theme === "dark" ? "rgba(255,255,255,.09)" : "rgba(29,29,31,.09)";
+  const paletteSearchQuery = paletteQuery.trim().toLowerCase();
+  const builtInPaletteResultCount = NODE_PALETTE.filter((item) => !paletteSearchQuery
+    || `${item.label} ${item.detail} ${item.category}`.toLowerCase().includes(paletteSearchQuery)).length;
+  const libraryResultIsLimited = Boolean(paletteSearchQuery && stencilSearchResults.length === STENCIL_SEARCH_LIMIT);
+  const libraryItemCount = paletteSearchQuery
+    ? builtInPaletteResultCount + (stencilCatalog ? stencilSearchResults.length : 0)
+    : NODE_PALETTE.length + (stencilCatalog?.shapeCount ?? 0);
+  const libraryCountLabel = `${libraryItemCount}${libraryResultIsLimited ? "+" : ""}`;
+  const librarySummaryLabel = paletteSearchQuery
+    ? `${libraryCountLabel} 个匹配`
+    : `${PALETTE_CATEGORIES.length + stencilCollections.length} 类 · ${libraryCountLabel} 个图形`;
 
   const diagram = (
     <section
-      className={(isFullViewport
-        ? "fixed inset-0 z-[90] h-[100dvh] overflow-hidden bg-zinc-100 dark:bg-zinc-950"
-        : "mt-5 rounded-2xl border border-black/[0.07] bg-zinc-50/70 p-3 shadow-[0_18px_60px_-36px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-zinc-950/55 sm:p-4") + (isActive ? "" : " hidden")}
+      className={`diagram-apple ${isFullViewport
+        ? "diagram-apple-full fixed inset-0 z-[90] h-[100dvh] overflow-hidden bg-zinc-100 dark:bg-zinc-950"
+        : "mt-5 rounded-2xl border border-black/[0.07] bg-zinc-50/70 p-3 shadow-[0_18px_60px_-36px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-zinc-950/55 sm:p-4"}${isActive ? "" : " hidden"}`}
       aria-hidden={!isActive}
     >
       <input
@@ -2360,9 +2396,9 @@ export function SyncedDiagram({
         }}
       />
       {!isFullViewport ? (
-        <div className="flex flex-wrap items-center justify-between gap-4 px-1 pb-1">
+        <div className="diagram-apple-intro flex flex-wrap items-center justify-between gap-4 px-1 pb-1">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-950 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
+            <div className="diagram-apple-intro-icon grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-950 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
               <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
                 <rect x="3" y="4" width="6" height="5" rx="1" /><rect x="15" y="15" width="6" height="5" rx="1" /><path d="M9 6.5h4a3 3 0 0 1 3 3V15M12 12H8a3 3 0 0 0-3 3v1" />
               </svg>
@@ -2374,20 +2410,20 @@ export function SyncedDiagram({
                   <p className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">{activePageName} · 实时协作工作区</p>
                 </div>
                 {onSwitchToWhiteboard ? (
-                  <div className="flex rounded-lg border border-black/[0.07] bg-white/70 p-0.5 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
+                  <div className="diagram-apple-mode-switch flex rounded-lg border border-black/[0.07] bg-white/70 p-0.5 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
                     <button
                       type="button"
-                      className="rounded-md px-2.5 py-1 text-[10px] font-medium text-zinc-500 transition hover:bg-black/[0.04] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
+                      className="diagram-apple-mode-option rounded-md px-2.5 py-1 text-[10px] font-medium text-zinc-500 transition hover:bg-black/[0.04] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
                       onClick={switchToWhiteboard}
                     >
                       自由白板
                     </button>
-                    <button type="button" className="rounded-md bg-zinc-950 px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
+                    <button type="button" className="diagram-apple-mode-option diagram-apple-mode-option-active rounded-md bg-zinc-950 px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
                       专业流程图
                     </button>
                   </div>
                 ) : null}
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white/70 px-2 py-1 text-[10px] font-medium text-zinc-600 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-zinc-300">
+                <span className="diagram-apple-pill inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white/70 px-2 py-1 text-[10px] font-medium text-zinc-600 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-zinc-300">
                   <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.12)]" : "bg-zinc-400"}`} />
                   {isConnected ? "实时同步" : "本地编辑"}
                 </span>
@@ -2395,7 +2431,7 @@ export function SyncedDiagram({
               </div>
             </div>
           </div>
-          <button type="button" className="inline-flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-tiny font-semibold text-zinc-700 shadow-sm transition hover:-translate-y-px hover:border-cyan-400 hover:text-cyan-800 dark:border-white/[0.1] dark:bg-white/[0.05] dark:text-zinc-200 dark:hover:border-cyan-300/50 dark:hover:text-cyan-100" onClick={() => setIsExpanded(true)}>
+          <button type="button" className="diagram-apple-primary-action inline-flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-tiny font-semibold text-zinc-700 shadow-sm transition hover:-translate-y-px hover:border-cyan-400 hover:text-cyan-800 dark:border-white/[0.1] dark:bg-white/[0.05] dark:text-zinc-200 dark:hover:border-cyan-300/50 dark:hover:text-cyan-100" onClick={() => setIsExpanded(true)}>
             <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H2v4M10 2h4v4M6 14H2v-4M10 14h4v-4" /></svg>
             全屏编辑
           </button>
@@ -2403,12 +2439,12 @@ export function SyncedDiagram({
       ) : null}
 
       <div className={isFullViewport
-        ? "absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-zinc-100 dark:bg-[#090c11]"
-        : "mt-3 flex h-[min(78dvh,680px)] min-h-[540px] min-w-0 flex-col overflow-hidden rounded-xl border border-black/[0.09] bg-white shadow-[0_24px_70px_-38px_rgba(15,23,42,0.55)] dark:border-white/[0.09] dark:bg-[#0c1016] sm:h-[680px] md:h-[720px] lg:h-[760px] xl:h-[820px]"}
+        ? "diagram-apple-shell absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-zinc-100 dark:bg-[#090c11]"
+        : "diagram-apple-shell mt-3 flex h-[min(78dvh,680px)] min-h-[540px] min-w-0 flex-col overflow-hidden rounded-xl border border-black/[0.09] bg-white shadow-[0_24px_70px_-38px_rgba(15,23,42,0.55)] dark:border-white/[0.09] dark:bg-[#0c1016] sm:h-[680px] md:h-[720px] lg:h-[760px] xl:h-[820px]"}
       >
-        <div className="flex shrink-0 flex-nowrap items-center gap-0.5 overflow-x-auto border-b border-black/[0.07] bg-white/95 px-1.5 py-1 backdrop-blur-xl [scrollbar-width:none] dark:border-white/[0.08] dark:bg-[#11161e]/95 sm:px-2 sm:py-1.5" role="toolbar" aria-label="流程图操作">
-          <div className="mr-1 flex h-8 shrink-0 items-center gap-2 border-r border-black/[0.07] pr-2 dark:border-white/[0.08] sm:mr-2 sm:pr-3">
-            <span className="grid h-6 w-6 place-items-center rounded-md bg-zinc-950 text-white dark:bg-cyan-300 dark:text-zinc-950">
+        <div className="diagram-apple-toolbar flex shrink-0 flex-nowrap items-center gap-0.5 overflow-x-auto border-b border-black/[0.07] bg-white/95 px-1.5 py-1 backdrop-blur-xl [scrollbar-width:none] dark:border-white/[0.08] dark:bg-[#11161e]/95 sm:px-2 sm:py-1.5" role="toolbar" aria-label="流程图操作">
+          <div className="diagram-apple-toolbar-brand mr-1 flex h-8 shrink-0 items-center gap-2 border-r border-black/[0.07] pr-2 dark:border-white/[0.08] sm:mr-2 sm:pr-3">
+            <span className="diagram-apple-toolbar-icon grid h-6 w-6 place-items-center rounded-md bg-zinc-950 text-white dark:bg-cyan-300 dark:text-zinc-950">
               <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2" width="4" height="3.5" rx=".7" /><rect x="10.5" y="10.5" width="4" height="3.5" rx=".7" /><path d="M5.5 3.7h2.2a2 2 0 0 1 2 2v4.8" /></svg>
             </span>
             <span className="hidden min-w-0 sm:block">
@@ -2425,7 +2461,7 @@ export function SyncedDiagram({
                 }} />
               ) : null}
               {!standalone ? <DiagramToolbarButton label="退出全屏" onClick={() => setIsExpanded(false)} /> : null}
-              <span className="mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
+              <span className="diagram-apple-separator mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
             </>
           ) : null}
           <DiagramToolbarButton label={isRoleReadOnly ? "访客只读" : localReadOnly ? "只读预览" : "编辑模式"} disabled={isRoleReadOnly} onClick={() => {
@@ -2433,7 +2469,7 @@ export function SyncedDiagram({
             setContextMenu(null);
             setStatus(isReadOnly ? "已恢复编辑模式。" : "已进入本地只读预览，协作更新仍会继续接收。");
           }} />
-          <span className="mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
+          <span className="diagram-apple-separator mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
           <DiagramToolbarButton label="撤销" shortcut="⌘Z" disabled={isReadOnly || !canUndo} onClick={() => {
             undoManagerRef.current?.undo();
             refreshUndoState();
@@ -2442,7 +2478,7 @@ export function SyncedDiagram({
             undoManagerRef.current?.redo();
             refreshUndoState();
           }} />
-          <span className="mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
+          <span className="diagram-apple-separator mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
           <DiagramToolbarMenu
             label={selection.ids.length > 0 ? `编辑 · ${selection.ids.length}` : "编辑"}
             items={[
@@ -2556,15 +2592,15 @@ export function SyncedDiagram({
           />
         </div>
 
-        <div className="flex h-10 shrink-0 items-end border-b border-black/[0.07] bg-zinc-50/90 px-2 dark:border-white/[0.08] dark:bg-[#0d1118]" aria-label="流程图页面">
+        <div className="diagram-apple-pages flex h-10 shrink-0 items-end border-b border-black/[0.07] bg-zinc-50/90 px-2 dark:border-white/[0.08] dark:bg-[#0d1118]" aria-label="流程图页面">
           <div className="flex min-w-0 flex-1 items-end gap-0.5 overflow-x-auto">
-            <span className="mb-2 mr-1 shrink-0 px-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-zinc-400">Pages</span>
+            <span className="diagram-apple-section-label mb-2 mr-1 shrink-0 px-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-zinc-400">Pages</span>
             {pages.map((page) => (
               <button
                 key={page.id}
                 type="button"
                 aria-pressed={page.id === activePageId}
-                className={`relative h-9 shrink-0 rounded-t-lg border border-b-0 px-4 text-[11px] font-medium transition ${page.id === activePageId
+                className={`diagram-apple-page-tab relative h-9 shrink-0 rounded-t-lg border border-b-0 px-4 text-[11px] font-medium transition ${page.id === activePageId
                   ? "border-black/[0.08] bg-white text-zinc-900 after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:bg-cyan-500 dark:border-white/[0.1] dark:bg-[#151b24] dark:text-white dark:after:bg-cyan-300"
                   : "border-transparent text-zinc-500 hover:bg-black/[0.035] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.04] dark:hover:text-zinc-100"}`}
                 onClick={() => {
@@ -2601,8 +2637,8 @@ export function SyncedDiagram({
           </div>
         </div>
 
-        <div className="flex h-11 shrink-0 items-center justify-between border-b border-black/[0.07] bg-white/95 px-2 dark:border-white/[0.08] dark:bg-[#11161e]/95 lg:hidden">
-          <div className="grid grid-cols-3 gap-1 rounded-lg bg-black/[0.035] p-1 dark:bg-white/[0.045]" role="toolbar" aria-label="移动端流程图面板">
+        <div className="diagram-apple-mobile-panel flex h-11 shrink-0 items-center justify-between border-b border-black/[0.07] bg-white/95 px-2 dark:border-white/[0.08] dark:bg-[#11161e]/95 lg:hidden">
+          <div className="diagram-apple-mobile-switch grid grid-cols-3 gap-1 rounded-lg bg-black/[0.035] p-1 dark:bg-white/[0.045]" role="toolbar" aria-label="移动端流程图面板">
             <CompactPanelButton label="图库" active={compactPanel === "library"} onClick={() => setCompactPanel((current) => current === "library" ? null : "library")}>
               <path d="M3 3h4v4H3zM9 3h4v4H9zM3 9h4v4H3zM9 9h4v4H9z" />
             </CompactPanelButton>
@@ -2616,7 +2652,7 @@ export function SyncedDiagram({
           <span className="min-w-0 truncate pl-2 text-right text-[9px] text-zinc-400">{nodeCount} 节点 · {edgeCount} 连线</span>
         </div>
 
-        <div className="relative grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[268px_minmax(0,1fr)_264px]">
+        <div className="diagram-apple-workspace relative grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[268px_minmax(0,1fr)_264px]">
           {compactPanel ? (
             <button
               type="button"
@@ -2625,14 +2661,14 @@ export function SyncedDiagram({
               onClick={() => setCompactPanel(null)}
             />
           ) : null}
-          <aside className={`${compactPanel === "library" ? "block" : "hidden"} absolute inset-y-0 left-0 z-30 w-[min(86vw,310px)] max-w-full overflow-y-auto border-r border-black/[0.07] bg-zinc-50 p-3 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none`}>
+          <aside className={`diagram-apple-library ${compactPanel === "library" ? "block" : "hidden"} absolute inset-y-0 left-0 z-30 w-[min(86vw,310px)] max-w-full overflow-y-auto border-r border-black/[0.07] bg-zinc-50 p-3 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none`}>
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">图形库</div>
-                <div className="mt-0.5 text-[9px] text-zinc-400">拖拽或点击添加</div>
+                <div className="mt-0.5 text-[10px] text-zinc-400">拖拽或点击添加</div>
               </div>
               <span className="flex items-center gap-1.5">
-                <span className="rounded-md bg-black/[0.04] px-1.5 py-0.5 font-mono text-[9px] text-zinc-400 dark:bg-white/[0.05]">{stencilCatalog?.shapeCount ? `${stencilCatalog.shapeCount + NODE_PALETTE.length}` : NODE_PALETTE.length}</span>
+                <span className="rounded-md bg-black/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-zinc-400 dark:bg-white/[0.05]">{libraryCountLabel}</span>
                 <button type="button" className="grid h-8 w-8 place-items-center rounded-lg text-zinc-400 hover:bg-black/[0.05] hover:text-zinc-700 dark:hover:bg-white/[0.06] dark:hover:text-zinc-100 lg:hidden" aria-label="关闭图形库" onClick={() => setCompactPanel(null)}>
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
                 </button>
@@ -2644,230 +2680,240 @@ export function SyncedDiagram({
                 value={paletteQuery}
                 placeholder="搜索图形"
                 aria-label="搜索图形"
-                className="h-9 w-full rounded-lg border border-black/[0.07] bg-white pl-8 pr-2.5 text-[11px] text-zinc-800 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/10 dark:border-white/[0.08] dark:bg-white/[0.035] dark:text-zinc-100"
+                className="diagram-apple-search h-9 w-full rounded-lg border border-black/[0.07] bg-white pl-8 pr-2.5 text-[11px] text-zinc-800 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/10 dark:border-white/[0.08] dark:bg-white/[0.035] dark:text-zinc-100"
                 onChange={(event) => setPaletteQuery(event.currentTarget.value)}
               />
             </label>
             <div className="mt-4 block">
-              <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-zinc-400">快速模板</div>
+              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400">快速模板</div>
               <div className="mt-2 grid grid-cols-3 gap-1.5">
                 {([['approval', '审批'], ['architecture', '架构'], ['er', 'ER']] as const).map(([id, label]) => (
                   <button
                     key={id}
                     type="button"
                     disabled={isReadOnly}
-                    className="group min-w-0 rounded-lg border border-cyan-500/20 bg-cyan-50/70 px-2 py-2 text-center transition hover:border-cyan-500/50 hover:bg-cyan-50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-cyan-300/15 dark:bg-cyan-300/[0.06] dark:hover:border-cyan-300/35 dark:hover:bg-cyan-300/[0.1]"
+                    className="diagram-apple-template-button group min-w-0 rounded-lg border border-cyan-500/20 bg-cyan-50/70 px-2 py-2 text-center transition hover:border-cyan-500/50 hover:bg-cyan-50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-cyan-300/15 dark:bg-cyan-300/[0.06] dark:hover:border-cyan-300/35 dark:hover:bg-cyan-300/[0.1]"
                     onClick={() => {
                       insertTemplate(id);
                       setCompactPanel(null);
                     }}
                   >
-                    <span className="block text-[10px] font-semibold text-cyan-800 dark:text-cyan-100">{label}</span>
-                    <span className="mt-0.5 block text-[8px] text-cyan-700/60 dark:text-cyan-200/50">模板</span>
+                    <span className="block text-[11px] font-semibold text-cyan-800 dark:text-cyan-100">{label}</span>
+                    <span className="mt-0.5 block text-[9px] text-cyan-700/60 dark:text-cyan-200/50">模板</span>
                   </button>
                 ))}
               </div>
             </div>
-            {PALETTE_CATEGORIES.map((category) => {
-              const query = paletteQuery.trim().toLowerCase();
-              const items = NODE_PALETTE.filter((item) => item.category === category
-                && (!query || `${item.label} ${item.detail} ${item.category}`.toLowerCase().includes(query)));
-              if (items.length === 0) return null;
-              const isCategoryOpen = Boolean(query) || openPaletteCategories.has(category);
-              return (
-                <div key={category} className="mt-2.5 block border-t border-black/[0.05] pt-2.5 dark:border-white/[0.06]">
-                  <button
-                    type="button"
-                    className="flex h-8 w-full items-center justify-between rounded-md px-1.5 text-left transition hover:bg-black/[0.035] dark:hover:bg-white/[0.04]"
-                    aria-expanded={isCategoryOpen}
-                    onClick={() => setOpenPaletteCategories((current) => {
-                      const next = new Set(current);
-                      if (next.has(category)) next.delete(category);
-                      else next.add(category);
-                      return next;
-                    })}
-                  >
-                    <span className="flex items-center gap-1.5 text-[10px] font-semibold text-zinc-600 dark:text-zinc-300">
-                      <svg className={`h-3 w-3 text-zinc-400 transition-transform ${isCategoryOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
-                      {category}
-                    </span>
-                    <span className="font-mono text-[8px] text-zinc-400">{items.length}</span>
-                  </button>
-                  <div className={`mt-2 grid-cols-3 gap-1 ${isCategoryOpen ? "grid" : "hidden"}`}>
-                    {items.map((item) => (
-                      <button
-                        key={item.kind}
-                        ref={(element) => {
-                          const id = `builtin:${item.kind}`;
-                          if (element) {
-                            paletteElementRefs.current.set(id, element);
-                            draggablePaletteItemsRef.current.set(id, item);
-                          } else {
-                            paletteElementRefs.current.delete(id);
-                            draggablePaletteItemsRef.current.delete(id);
-                          }
-                        }}
-                        type="button"
-                        disabled={isReadOnly}
-                        title={`${item.label} · ${item.detail}`}
-                        className="group flex min-h-[68px] min-w-0 flex-col items-center gap-1 rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center shadow-[0_1px_1px_rgba(15,23,42,0.03)] transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
-                        onClick={() => {
-                          insertNode(item.kind);
-                          setCompactPanel(null);
-                        }}
-                      >
-                        <DiagramNodeGlyph kind={item.kind} />
-                        <span className="min-w-0 w-full">
-                          <span className="block truncate text-[8px] font-semibold text-zinc-800 dark:text-zinc-100">{item.label}</span>
-                          <span className="block truncate text-[7px] text-zinc-400">{item.detail}</span>
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-            {paletteQuery.trim() && stencilCatalog ? (
-              <div className="mt-3 min-w-0 border-t border-black/[0.05] pt-3 dark:border-white/[0.06]">
-                <div className="mb-2 flex items-center justify-between px-1">
-                  <span className="text-[10px] font-semibold text-zinc-600 dark:text-zinc-300">draw.io 全库结果</span>
-                  <span className="font-mono text-[8px] text-zinc-400">{stencilSearchResults.length}{stencilSearchResults.length === STENCIL_SEARCH_LIMIT ? "+" : ""}</span>
-                </div>
-                {stencilSearchResults.length ? (
-                  <div className="grid grid-cols-3 gap-1">
-                    {stencilSearchResults.map(({ library, shape }) => {
-                      const item = stencilPaletteItem(library, shape);
-                      const dragId = `stencil-search:${shape.id}`;
-                      const isLoaded = loadedStencilLibraries.has(library.path);
-                      return (
-                        <button
-                          key={dragId}
-                          ref={(element) => {
-                            if (element && isLoaded) {
-                              paletteElementRefs.current.set(dragId, element);
-                              draggablePaletteItemsRef.current.set(dragId, item);
-                            } else {
-                              paletteElementRefs.current.delete(dragId);
-                              draggablePaletteItemsRef.current.delete(dragId);
-                            }
-                          }}
-                          type="button"
-                          disabled={isReadOnly}
-                          title={`${library.name} / ${shape.name}`}
-                          className="group flex min-h-[68px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
-                          onClick={() => {
-                            void insertStencilNode(library, shape);
-                            setCompactPanel(null);
-                          }}
-                        >
-                          <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
-                          <span className="mt-1 block w-full truncate text-[8px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
-                          <span className="block w-full truncate text-[6.5px] text-zinc-400">{library.name}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                ) : <div className="rounded-lg border border-dashed border-black/10 p-4 text-center text-[10px] text-zinc-400 dark:border-white/10">未找到 draw.io 图形</div>}
+            <div className="mt-3 min-w-0 border-t border-black/[0.05] pt-3 dark:border-white/[0.06]">
+              <div className="mb-2 flex items-center justify-between px-1">
+                <span className="diagram-apple-section-label text-[10px]">
+                  {paletteSearchQuery ? "搜索结果" : "完整图库"}
+                </span>
+                <span className="font-mono text-[9px] text-zinc-400">{librarySummaryLabel}</span>
               </div>
-            ) : null}
-            {!paletteQuery.trim() && stencilCatalog ? (
-              <div className="mt-3 min-w-0 border-t border-black/[0.05] pt-3 dark:border-white/[0.06]">
-                <div className="mb-1 flex items-center justify-between px-1">
-                  <span className="text-[9px] font-semibold uppercase tracking-[0.14em] text-zinc-400">draw.io 完整图库</span>
-                  <span className="font-mono text-[8px] text-zinc-400">{stencilCollections.length} 类 · {stencilCatalog.libraryCount} 库</span>
-                </div>
-                {stencilCatalog.groups.map((group) => {
-                  const collections = stencilCollections.filter((collection) => collection.group === group.id);
-                  if (!collections.length) return null;
-                  const isGroupOpen = openStencilGroups.has(group.id);
-                  return (
-                    <div key={group.id} className="mt-1.5 overflow-hidden rounded-lg border border-black/[0.06] bg-white/60 dark:border-white/[0.07] dark:bg-white/[0.02]">
-                      <button
-                        type="button"
-                        className="flex h-8 w-full items-center justify-between px-2 text-left transition hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
-                        aria-expanded={isGroupOpen}
-                        onClick={() => setOpenStencilGroups((current) => {
-                          const next = new Set(current);
-                          if (next.has(group.id)) next.delete(group.id);
-                          else next.add(group.id);
-                          return next;
-                        })}
-                      >
-                        <span className="flex min-w-0 items-center gap-1.5 text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">
-                          <svg className={`h-3 w-3 shrink-0 text-zinc-400 transition-transform ${isGroupOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
-                          <span className="truncate">{group.name}</span>
-                        </span>
-                        <span className="font-mono text-[8px] text-zinc-400">{collections.length}</span>
-                      </button>
-                      {isGroupOpen ? (
-                        <div className="border-t border-black/[0.05] p-1 dark:border-white/[0.06]">
-                          {collections.map((collection) => {
-                            const isActive = activeStencilCollectionId === collection.id;
-                            const visibleItems = collection.items.slice(0, stencilShapeLimit);
-                            return (
-                              <div key={collection.id} className="mt-0.5 first:mt-0">
-                                <button
-                                  type="button"
-                                  className={`flex h-7 w-full items-center justify-between rounded-md px-2 text-left transition ${isActive ? "bg-cyan-500/10 text-cyan-800 dark:text-cyan-100" : "text-zinc-600 hover:bg-black/[0.035] dark:text-zinc-300 dark:hover:bg-white/[0.04]"}`}
-                                  onClick={() => openStencilCollection(collection)}
-                                >
-                                  <span className="truncate text-[9px] font-medium">{collection.name}</span>
-                                  <span className="ml-2 shrink-0 font-mono text-[7px] text-zinc-400">{loadingStencilCollection === collection.id ? "加载中" : collection.libraryCount > 1 ? `${collection.shapeCount} · ${collection.libraryCount}库` : collection.shapeCount}</span>
-                                </button>
-                                {isActive ? (
-                                  <div className="mt-1.5 grid grid-cols-3 gap-1 px-1 pb-1.5">
-                                    {visibleItems.map(({ library, shape }) => {
-                                      const item = stencilPaletteItem(library, shape);
-                                      const dragId = `stencil:${shape.id}`;
-                                      const isLoaded = loadedStencilLibraries.has(library.path);
-                                      return (
-                                        <button
-                                          key={dragId}
-                                          ref={(element) => {
-                                            if (element && isLoaded) {
-                                              paletteElementRefs.current.set(dragId, element);
-                                              draggablePaletteItemsRef.current.set(dragId, item);
-                                            } else {
-                                              paletteElementRefs.current.delete(dragId);
-                                              draggablePaletteItemsRef.current.delete(dragId);
-                                            }
-                                          }}
-                                          type="button"
-                                          disabled={isReadOnly}
-                                          title={`${collection.name} / ${library.name} / ${shape.name}`}
-                                          className="group flex min-h-[68px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
-                                          onClick={() => {
-                                            void insertStencilNode(library, shape);
-                                            setCompactPanel(null);
-                                          }}
-                                        >
-                                          <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
-                                          <span className="mt-1 block w-full truncate text-[8px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
-                                          {collection.libraryCount > 1 ? <span className="block w-full truncate text-[6.5px] text-zinc-400">{library.name}</span> : null}
-                                        </button>
-                                      );
-                                    })}
-                                    {collection.shapeCount > stencilShapeLimit ? (
-                                      <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[9px] font-medium text-cyan-700 hover:bg-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 dark:border-white/10 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
-                                        加载更多 · {collection.shapeCount - stencilShapeLimit} 个
-                                      </button>
-                                    ) : null}
-                                  </div>
-                                ) : null}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : null}
+              {PALETTE_CATEGORIES.map((category) => {
+                const items = NODE_PALETTE.filter((item) => item.category === category
+                  && (!paletteSearchQuery || `${item.label} ${item.detail} ${item.category}`.toLowerCase().includes(paletteSearchQuery)));
+                if (items.length === 0) return null;
+                const isCategoryOpen = Boolean(paletteSearchQuery) || openPaletteCategories.has(category);
+                return (
+                  <div key={category} className="mt-1.5 block overflow-hidden rounded-lg border border-black/[0.06] bg-white/55 dark:border-white/[0.07] dark:bg-white/[0.02]">
+                    <button
+                      type="button"
+                      className="diagram-apple-collapse-row flex h-8 w-full items-center justify-between px-2 text-left transition hover:bg-black/[0.035] dark:hover:bg-white/[0.04]"
+                      aria-expanded={isCategoryOpen}
+                      onClick={() => setOpenPaletteCategories((current) => {
+                        const next = new Set(current);
+                        if (next.has(category)) next.delete(category);
+                        else next.add(category);
+                        return next;
+                      })}
+                    >
+                      <span className="flex min-w-0 items-center gap-1.5 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">
+                        <svg className={`h-3 w-3 shrink-0 text-zinc-400 transition-transform ${isCategoryOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
+                        <span className="truncate">{category}</span>
+                      </span>
+                      <span className="font-mono text-[9px] text-zinc-400">{items.length}</span>
+                    </button>
+                    <div className={`border-t border-black/[0.05] p-1 dark:border-white/[0.06] ${isCategoryOpen ? "block" : "hidden"}`}>
+                      <div className="grid grid-cols-3 gap-1">
+                        {items.map((item) => (
+                          <button
+                            key={item.kind}
+                            ref={(element) => {
+                              const id = `builtin:${item.kind}`;
+                              if (element) {
+                                paletteElementRefs.current.set(id, element);
+                                draggablePaletteItemsRef.current.set(id, item);
+                              } else {
+                                paletteElementRefs.current.delete(id);
+                                draggablePaletteItemsRef.current.delete(id);
+                              }
+                            }}
+                            type="button"
+                            disabled={isReadOnly}
+                            title={`${item.label} · ${item.detail}`}
+                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center gap-1 rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center shadow-[0_1px_1px_rgba(15,23,42,0.03)] transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
+                            onClick={() => {
+                              insertNode(item.kind);
+                              setCompactPanel(null);
+                            }}
+                          >
+                            <DiagramNodeGlyph kind={item.kind} />
+                            <span className="min-w-0 w-full">
+                              <span className="diagram-apple-palette-label block truncate text-[10px] font-semibold text-zinc-800 dark:text-zinc-100">{item.label}</span>
+                              <span className="diagram-apple-palette-detail block truncate text-[9px] text-zinc-400">{item.detail}</span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  );
-                })}
-              </div>
-            ) : null}
+                  </div>
+                );
+              })}
+              {paletteSearchQuery && stencilCatalog ? (
+                <div className="diagram-apple-collection mt-1.5 overflow-hidden rounded-lg border border-black/[0.06] bg-white/55 dark:border-white/[0.07] dark:bg-white/[0.02]">
+                  <div className="flex h-8 items-center justify-between px-2">
+                    <span className="truncate text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">更多匹配</span>
+                    <span className="font-mono text-[9px] text-zinc-400">{stencilSearchResults.length}{stencilSearchResults.length === STENCIL_SEARCH_LIMIT ? "+" : ""}</span>
+                  </div>
+                  {stencilSearchResults.length ? (
+                    <div className="border-t border-black/[0.05] p-1 dark:border-white/[0.06]">
+                      <div className="grid grid-cols-3 gap-1">
+                        {stencilSearchResults.map(({ library, shape }) => {
+                          const item = stencilPaletteItem(library, shape);
+                          const dragId = `stencil-search:${shape.id}`;
+                          const isLoaded = loadedStencilLibraries.has(library.path);
+                          return (
+                            <button
+                              key={dragId}
+                              ref={(element) => {
+                                if (element && isLoaded) {
+                                  paletteElementRefs.current.set(dragId, element);
+                                  draggablePaletteItemsRef.current.set(dragId, item);
+                                } else {
+                                  paletteElementRefs.current.delete(dragId);
+                                  draggablePaletteItemsRef.current.delete(dragId);
+                                }
+                              }}
+                              type="button"
+                              disabled={isReadOnly}
+                              title={`${library.name} / ${shape.name}`}
+                              className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
+                              onClick={() => {
+                                void insertStencilNode(library, shape);
+                                setCompactPanel(null);
+                              }}
+                            >
+                              <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
+                              <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
+                              <span className="diagram-apple-palette-detail block w-full truncate text-[9px] text-zinc-400">{library.name}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : <div className="border-t border-black/[0.05] p-4 text-center text-[10px] text-zinc-400 dark:border-white/[0.06]">未找到匹配图形</div>}
+                </div>
+              ) : null}
+              {!paletteSearchQuery && stencilCatalog ? (
+                <>
+                  {stencilCatalog.groups.map((group) => {
+                    const collections = stencilCollections.filter((collection) => collection.group === group.id);
+                    if (!collections.length) return null;
+                    const isGroupOpen = openStencilGroups.has(group.id);
+                    return (
+                      <div key={group.id} className="diagram-apple-collection mt-1.5 overflow-hidden rounded-lg border border-black/[0.06] bg-white/60 dark:border-white/[0.07] dark:bg-white/[0.02]">
+                        <button
+                          type="button"
+                          className="diagram-apple-collapse-row flex h-8 w-full items-center justify-between px-2 text-left transition hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+                          aria-expanded={isGroupOpen}
+                          onClick={() => setOpenStencilGroups((current) => {
+                            const next = new Set(current);
+                            if (next.has(group.id)) next.delete(group.id);
+                            else next.add(group.id);
+                            return next;
+                          })}
+                        >
+                          <span className="flex min-w-0 items-center gap-1.5 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">
+                            <svg className={`h-3 w-3 shrink-0 text-zinc-400 transition-transform ${isGroupOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
+                            <span className="truncate">{group.name}</span>
+                          </span>
+                          <span className="font-mono text-[9px] text-zinc-400">{collections.length}</span>
+                        </button>
+                        {isGroupOpen ? (
+                          <div className="border-t border-black/[0.05] p-1 dark:border-white/[0.06]">
+                            {collections.map((collection) => {
+                              const isActive = activeStencilCollectionId === collection.id;
+                              const visibleItems = collection.items.slice(0, stencilShapeLimit);
+                              return (
+                                <div key={collection.id} className="mt-0.5 first:mt-0">
+                                  <button
+                                    type="button"
+                                    className={`diagram-apple-collection-row flex h-8 w-full items-center justify-between rounded-md px-2 text-left transition ${isActive ? "bg-cyan-500/10 text-cyan-800 dark:text-cyan-100" : "text-zinc-600 hover:bg-black/[0.035] dark:text-zinc-300 dark:hover:bg-white/[0.04]"}`}
+                                    onClick={() => openStencilCollection(collection)}
+                                  >
+                                    <span className="truncate text-[10px] font-medium">{collection.name}</span>
+                                    <span className="ml-2 shrink-0 font-mono text-[9px] text-zinc-400">{loadingStencilCollection === collection.id ? "加载中" : collection.libraryCount > 1 ? `${collection.shapeCount} · ${collection.libraryCount}库` : collection.shapeCount}</span>
+                                  </button>
+                                  {isActive ? (
+                                    <div className="mt-1.5 grid grid-cols-3 gap-1 px-1 pb-1.5">
+                                      {visibleItems.map(({ library, shape }) => {
+                                        const item = stencilPaletteItem(library, shape);
+                                        const dragId = `stencil:${shape.id}`;
+                                        const isLoaded = loadedStencilLibraries.has(library.path);
+                                        return (
+                                          <button
+                                            key={dragId}
+                                            ref={(element) => {
+                                              if (element && isLoaded) {
+                                                paletteElementRefs.current.set(dragId, element);
+                                                draggablePaletteItemsRef.current.set(dragId, item);
+                                              } else {
+                                                paletteElementRefs.current.delete(dragId);
+                                                draggablePaletteItemsRef.current.delete(dragId);
+                                              }
+                                            }}
+                                            type="button"
+                                            disabled={isReadOnly}
+                                            title={`${collection.name} / ${library.name} / ${shape.name}`}
+                                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
+                                            onClick={() => {
+                                              void insertStencilNode(library, shape);
+                                              setCompactPanel(null);
+                                            }}
+                                          >
+                                            <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
+                                            <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
+                                            {collection.libraryCount > 1 ? <span className="diagram-apple-palette-detail block w-full truncate text-[9px] text-zinc-400">{library.name}</span> : null}
+                                          </button>
+                                        );
+                                      })}
+                                      {collection.shapeCount > stencilShapeLimit ? (
+                                        <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[10px] font-medium text-cyan-700 hover:bg-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 dark:border-white/10 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
+                                          加载更多 · {collection.shapeCount - stencilShapeLimit} 个
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </>
+              ) : null}
+              {paletteSearchQuery && builtInPaletteResultCount === 0 && (!stencilCatalog || stencilSearchResults.length === 0) ? (
+                <div className="mt-1.5 rounded-lg border border-dashed border-black/10 p-4 text-center text-[10px] text-zinc-400 dark:border-white/10">未找到匹配图形</div>
+              ) : null}
+            </div>
           </aside>
 
           <div
-            className="relative min-h-0 overflow-hidden bg-zinc-100 dark:bg-[#0b0f15]"
+            className="diagram-apple-canvas-wrap relative min-h-0 overflow-hidden bg-zinc-100 dark:bg-[#0b0f15]"
             onKeyDown={handleKeyDown}
             onPointerDown={() => {
               setContextMenu(null);
@@ -2877,7 +2923,7 @@ export function SyncedDiagram({
           >
             <div
               ref={graphContainerRef}
-              className="absolute inset-0 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400"
+              className="diagram-apple-canvas absolute inset-0 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400"
               tabIndex={0}
               role="application"
               aria-label="专业流程图画布"
@@ -2895,24 +2941,24 @@ export function SyncedDiagram({
               const left = ((presence.cursor?.x ?? 0) + translate.x) * scale - (container?.scrollLeft ?? 0);
               const top = ((presence.cursor?.y ?? 0) + translate.y) * scale - (container?.scrollTop ?? 0);
               return (
-                <div key={presence.peerId} className="pointer-events-none absolute z-30" style={{ left, top }}>
-                  <span className="block h-3 w-3 rotate-45 border-l-2 border-t-2 border-fuchsia-500" />
-                  <span className="ml-2 rounded bg-fuchsia-600 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow">{presence.peerId.slice(0, 12)} · {presence.selectedIds.length} selected</span>
+                <div key={presence.peerId} className="diagram-apple-remote-cursor pointer-events-none absolute z-30" style={{ left, top }}>
+                  <span className="block h-3 w-3 rotate-45 border-l-2 border-t-2 border-blue-600" />
+                  <span className="ml-2 rounded bg-blue-600 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow">{presence.peerId.slice(0, 12)} · {presence.selectedIds.length} selected</span>
                 </div>
               );
             })}
             {showMinimap ? (
-              <div className="absolute bottom-12 right-3 z-20 hidden h-28 w-40 overflow-hidden rounded-xl border border-black/[0.1] bg-white/95 shadow-[0_12px_35px_-12px_rgba(15,23,42,0.4)] backdrop-blur-xl dark:border-white/[0.12] dark:bg-[#151b24]/95 sm:block sm:h-32 sm:w-48">
+              <div className="diagram-apple-minimap absolute bottom-12 right-3 z-20 hidden h-28 w-40 overflow-hidden rounded-xl border border-black/[0.1] bg-white/95 shadow-[0_12px_35px_-12px_rgba(15,23,42,0.4)] backdrop-blur-xl dark:border-white/[0.12] dark:bg-[#151b24]/95 sm:block sm:h-32 sm:w-48">
                 <div ref={outlineContainerRef} className="h-full w-full" aria-label="流程图小地图" />
               </div>
             ) : null}
-            <div className="pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-black/[0.08] bg-white/85 px-2.5 py-1.5 text-[9px] text-zinc-500 shadow-sm backdrop-blur-xl dark:border-white/[0.09] dark:bg-[#151b24]/85 dark:text-zinc-400 sm:flex">
+            <div className="diagram-apple-canvas-hint pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-black/[0.08] bg-white/85 px-2.5 py-1.5 text-[9px] text-zinc-500 shadow-sm backdrop-blur-xl dark:border-white/[0.09] dark:bg-[#151b24]/85 dark:text-zinc-400 sm:flex">
               <span className="grid h-4 w-4 place-items-center rounded bg-cyan-500/10 text-[9px] font-bold text-cyan-700 dark:text-cyan-200">?</span>
               拖入节点 · 移动显示参考线 · Shift 点击连线增删折点
             </div>
             {contextMenu ? (
               <div
-                className="absolute z-30 w-44 rounded-lg border border-black/10 bg-white p-1.5 text-tiny text-zinc-700 shadow-xl dark:border-white/10 dark:bg-zinc-900 dark:text-zinc-200"
+                className="diagram-apple-context-menu absolute z-30 w-44 rounded-lg border border-black/10 bg-white p-1.5 text-tiny text-zinc-700 shadow-xl dark:border-white/10 dark:bg-zinc-900 dark:text-zinc-200"
                 style={{ left: contextMenu.x, top: contextMenu.y }}
                 role="menu"
                 onPointerDown={(event) => event.stopPropagation()}
@@ -2938,8 +2984,8 @@ export function SyncedDiagram({
             ) : null}
           </div>
 
-          <aside className={`${compactPanel === "inspector" ? "block" : "hidden"} absolute inset-y-0 right-0 z-30 w-[min(86vw,320px)] max-w-full overflow-y-auto border-l border-black/[0.07] bg-zinc-50 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none`}>
-            <div className="sticky top-0 z-10 flex h-12 items-center justify-between gap-2 border-b border-black/[0.06] bg-zinc-50/95 px-4 backdrop-blur-xl dark:border-white/[0.07] dark:bg-[#0f141c]/95">
+          <aside className={`diagram-apple-inspector ${compactPanel === "inspector" ? "block" : "hidden"} absolute inset-y-0 right-0 z-30 w-[min(86vw,320px)] max-w-full overflow-y-auto border-l border-black/[0.07] bg-zinc-50 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none`}>
+            <div className="diagram-apple-inspector-header sticky top-0 z-10 flex h-12 items-center justify-between gap-2 border-b border-black/[0.06] bg-zinc-50/95 px-4 backdrop-blur-xl dark:border-white/[0.07] dark:bg-[#0f141c]/95">
               <span>
                 <span className="block text-[11px] font-semibold text-zinc-900 dark:text-zinc-100">设计属性</span>
                 <span className="block text-[9px] text-zinc-400">样式与行为</span>
@@ -2954,7 +3000,7 @@ export function SyncedDiagram({
             <div className="p-3.5">
             <fieldset disabled={isReadOnly} className={isReadOnly ? "opacity-60" : undefined}>
             {selection.ids.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-black/[0.1] bg-white/60 px-4 py-6 text-center dark:border-white/[0.1] dark:bg-white/[0.025]">
+              <div className="diagram-apple-empty-state rounded-xl border border-dashed border-black/[0.1] bg-white/60 px-4 py-6 text-center dark:border-white/[0.1] dark:bg-white/[0.025]">
                 <div className="mx-auto grid h-9 w-9 place-items-center rounded-xl bg-zinc-100 text-zinc-400 dark:bg-white/[0.05]">
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 2 9 5-4 1.5L6.5 13z" /><path d="m9 9 3 4" /></svg>
                 </div>
@@ -2969,7 +3015,7 @@ export function SyncedDiagram({
                     <input
                       value={selection.label}
                       maxLength={500}
-                      className="mt-1 w-full rounded-md border border-black/10 bg-white px-2.5 py-2 text-tiny text-zinc-900 outline-none focus:border-cyan-400 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-100"
+                      className="diagram-apple-text-field mt-1 w-full rounded-md border border-black/10 bg-white px-2.5 py-2 text-tiny text-zinc-900 outline-none focus:border-cyan-400 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-100"
                       onChange={(event) => setSelection((current) => ({ ...current, label: event.currentTarget.value }))}
                       onBlur={(event) => commitSelectionLabel(event.currentTarget.value)}
                       onKeyDown={(event) => {
@@ -3181,9 +3227,9 @@ export function SyncedDiagram({
               role="dialog"
               aria-modal="true"
               aria-labelledby="diagram-collaboration-title"
-              className="relative z-10 flex h-full w-full max-w-[440px] flex-col border-l border-black/10 bg-zinc-50 shadow-2xl dark:border-white/10 dark:bg-[#0f141c] sm:w-[min(92vw,440px)]"
+              className="diagram-apple-collaboration relative z-10 flex h-full w-full max-w-[440px] flex-col border-l border-black/10 bg-zinc-50 shadow-2xl dark:border-white/10 dark:bg-[#0f141c] sm:w-[min(92vw,440px)]"
             >
-              <div className="flex h-14 shrink-0 items-center justify-between border-b border-black/[0.07] px-4 dark:border-white/[0.08]">
+              <div className="diagram-apple-collaboration-header flex h-14 shrink-0 items-center justify-between border-b border-black/[0.07] px-4 dark:border-white/[0.08]">
                 <div>
                   <h2 id="diagram-collaboration-title" className="text-sm font-semibold text-zinc-950 dark:text-white">房间与协作</h2>
                   <p className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">管理连接方式、邀请权限与在线成员</p>
@@ -3204,7 +3250,7 @@ export function SyncedDiagram({
           </div>
         ) : null}
 
-        <div className="flex h-8 shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/[0.07] bg-white/95 px-3 text-[9px] text-zinc-500 dark:border-white/[0.08] dark:bg-[#11161e]/95 dark:text-zinc-400">
+        <div className="diagram-apple-status flex h-8 shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/[0.07] bg-white/95 px-3 text-[9px] text-zinc-500 dark:border-white/[0.08] dark:bg-[#11161e]/95 dark:text-zinc-400">
           <span className="flex min-w-0 items-center gap-2 truncate"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} />{status}</span>
           <span className="hidden shrink-0 items-center gap-3 font-mono sm:flex"><span>{activePageName}</span><span>{nodeCount} nodes</span><span>{edgeCount} edges{selectedCountLabel}</span></span>
         </div>
@@ -3452,8 +3498,16 @@ function layoutLaneCells(graph: Graph, pool: Cell, orderedLanes = laneChildren(g
   graph.getDataModel().setGeometry(pool, poolGeometry);
 }
 
+function isDiamondLikeKind(kind: DiagramNodeKind): boolean {
+  return kind === "diamond"
+    || kind === "decision"
+    || kind === "bpmnGateway"
+    || kind === "erRelationship";
+}
+
 function nodeCellStyle(node: DiagramNode, optimizeLargeGraph = false): DiagramCellStyle {
   const isContainer = node.kind === "container" || node.kind === "swimlane" || node.kind === "lane";
+  const isDiamondLike = isDiamondLikeKind(node.kind);
   const usesRoundedCorners = node.kind === "process"
     || node.kind === "roundedRectangle"
     || node.kind === "subprocess"
@@ -3477,18 +3531,18 @@ function nodeCellStyle(node: DiagramNode, optimizeLargeGraph = false): DiagramCe
     overflow: "hidden",
     align: node.style.align ?? "center",
     verticalAlign: "middle",
-    spacing: 10,
-    fontFamily: "Inter, ui-sans-serif, system-ui",
+    spacing: isDiamondLike ? 22 : 10,
+    fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
     fontSize: node.style.fontSize ?? 13,
     fontStyle: (node.style.bold === false ? 0 : 1) + (node.style.italic ? 2 : 0),
     fillColor: node.style.fillColor,
-    gradientColor: isContainer || node.kind === "text" || node.stencilName ? "none" : mixHexColor(node.style.fillColor, "#ffffff", 0.62),
+    gradientColor: "none",
     gradientDirection: "north",
     strokeColor: node.style.strokeColor,
     fontColor: node.style.fontColor,
     strokeWidth: node.style.strokeWidth,
     dashed: Boolean(node.style.dashed),
-    shadow: !isContainer && !node.stencilName && !optimizeLargeGraph && (node.style.shadow ?? true),
+    shadow: !isContainer && !node.stencilName && !optimizeLargeGraph && Boolean(node.style.shadow),
     opacity: node.style.opacity ?? 100,
     rounded: node.style.rounded ?? usesRoundedCorners,
     rotation: node.rotation ?? 0,
@@ -3504,6 +3558,12 @@ function nodeCellStyle(node: DiagramNode, optimizeLargeGraph = false): DiagramCe
     base.fontStyle = node.style.bold ? 1 : 0;
     base.shadow = false;
   }
+  if (isDiamondLike) {
+    base.spacingLeft = 28;
+    base.spacingRight = 28;
+    base.spacingTop = 14;
+    base.spacingBottom = 14;
+  }
   if (node.kind === "umlClass" || node.kind === "entity") {
     base.verticalAlign = "top";
     base.spacingTop = 10;
@@ -3512,8 +3572,11 @@ function nodeCellStyle(node: DiagramNode, optimizeLargeGraph = false): DiagramCe
   if (node.kind === "umlPackage") {
     base.align = "left";
     base.verticalAlign = "top";
-    base.spacingTop = 14;
+    base.spacingTop = 28;
     base.spacingLeft = 12;
+  }
+  if (node.kind === "umlComponent") {
+    base.spacingLeft = 36;
   }
   if (node.kind === "container" || node.kind === "swimlane" || node.kind === "lane") {
     base.align = "left";
@@ -3612,10 +3675,10 @@ function stencilNodeDefaults(item: StencilPaletteItem): { label: string; width: 
     width: Math.max(52, Math.round(sourceWidth * scale)),
     height: Math.max(44, Math.round(sourceHeight * scale)),
     style: {
-      fillColor: "#f8fafc",
-      strokeColor: "#334155",
-      fontColor: "#1e293b",
-      strokeWidth: 1.4,
+      fillColor: "#ffffff",
+      strokeColor: "#d2d2d7",
+      fontColor: "#1d1d1f",
+      strokeWidth: 1.2,
       fontSize: 12,
       bold: false,
       shadow: false,
@@ -3624,141 +3687,162 @@ function stencilNodeDefaults(item: StencilPaletteItem): { label: string; width: 
 }
 
 function nodeDefaults(kind: DiagramNodeKind): { label: string; width: number; height: number; style: DiagramNodeStyle } {
-  const common = { fontColor: "#1e293b", strokeWidth: 1.5, fontSize: 13 };
+  const base: DiagramNodeStyle = {
+    fillColor: "#ffffff",
+    strokeColor: "#d2d2d7",
+    fontColor: "#1d1d1f",
+    strokeWidth: 1.2,
+    fontSize: 14,
+    bold: false,
+    shadow: false,
+  };
+  const style = (overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => ({ ...base, ...overrides });
+  const blue = (overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => style({
+    fillColor: "#e8f2ff",
+    strokeColor: "#0066cc",
+    bold: true,
+    ...overrides,
+  });
+  const neutral = (overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => style(overrides);
+  const system = (fillColor: string, strokeColor: string, overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => style({
+    fillColor,
+    strokeColor,
+    ...overrides,
+  });
   if (kind === "rectangle") {
-    return { label: "矩形", width: 168, height: 76, style: { ...common, fillColor: "#ffffff", strokeColor: "#64748b", bold: false } };
+    return { label: "矩形", width: 168, height: 76, style: neutral() };
   }
   if (kind === "roundedRectangle") {
-    return { label: "圆角矩形", width: 168, height: 76, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", rounded: true, bold: false } };
+    return { label: "圆角矩形", width: 168, height: 76, style: neutral({ fillColor: "#fbfbfd", rounded: true }) };
   }
   if (kind === "ellipse") {
-    return { label: "椭圆", width: 164, height: 92, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", bold: false } };
+    return { label: "椭圆", width: 164, height: 92, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "circle") {
-    return { label: "圆形", width: 96, height: 96, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", bold: false } };
+    return { label: "圆形", width: 96, height: 96, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "diamond") {
-    return { label: "菱形", width: 112, height: 112, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", bold: false } };
+    return { label: "菱形", width: 128, height: 128, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "triangle") {
-    return { label: "三角形", width: 120, height: 104, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", bold: false } };
+    return { label: "三角形", width: 120, height: 104, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "hexagon") {
-    return { label: "六边形", width: 164, height: 88, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", bold: false } };
+    return { label: "六边形", width: 164, height: 88, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "text") {
-    return { label: "双击编辑文本", width: 180, height: 52, style: { ...common, fillColor: "none", strokeColor: "none", strokeWidth: 0, bold: false, align: "left", shadow: false } };
+    return { label: "双击编辑文本", width: 180, height: 52, style: neutral({ fillColor: "none", strokeColor: "none", strokeWidth: 0, align: "left" }) };
   }
   if (kind === "start") {
-    return { label: "开始", width: 128, height: 48, style: { ...common, fillColor: "#ecfdf5", strokeColor: "#10b981" } };
+    return { label: "开始", width: 128, height: 48, style: blue() };
   }
   if (kind === "end") {
-    return { label: "结束", width: 128, height: 48, style: { ...common, fillColor: "#fff1f2", strokeColor: "#f43f5e" } };
+    return { label: "结束", width: 128, height: 48, style: blue() };
   }
   if (kind === "decision") {
-    return { label: "判断条件", width: 148, height: 100, style: { ...common, fillColor: "#fffbeb", strokeColor: "#f59e0b" } };
+    return { label: "判断条件", width: 176, height: 112, style: system("#fff7e6", "#ff9f0a", { bold: true }) };
   }
   if (kind === "database") {
-    return { label: "数据库", width: 148, height: 92, style: { ...common, fillColor: "#f5f3ff", strokeColor: "#8b5cf6" } };
+    return { label: "数据库", width: 148, height: 92, style: neutral({ fillColor: "#fbfbfd", strokeColor: "#86868b" }) };
   }
   if (kind === "document") {
-    return { label: "文档", width: 156, height: 86, style: { ...common, fillColor: "#eff6ff", strokeColor: "#3b82f6" } };
+    return { label: "文档", width: 156, height: 86, style: blue({ bold: false }) };
   }
   if (kind === "actor") {
-    return { label: "参与者", width: 116, height: 98, style: { ...common, fillColor: "#fdf2f8", strokeColor: "#ec4899" } };
+    return { label: "参与者", width: 116, height: 98, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "note") {
-    return { label: "补充说明", width: 176, height: 100, style: { ...common, fillColor: "#fefce8", strokeColor: "#eab308" } };
+    return { label: "补充说明", width: 176, height: 100, style: system("#fff7e6", "#d2d2d7", { align: "left" }) };
   }
   if (kind === "subprocess") {
-    return { label: "子流程", width: 184, height: 76, style: { ...common, fillColor: "#ecfeff", strokeColor: "#06b6d4" } };
+    return { label: "子流程", width: 184, height: 76, style: blue() };
   }
   if (kind === "data") {
-    return { label: "数据", width: 164, height: 76, style: { ...common, fillColor: "#f0fdf4", strokeColor: "#22c55e" } };
+    return { label: "数据", width: 164, height: 76, style: blue({ bold: false }) };
   }
   if (kind === "delay") {
-    return { label: "等待", width: 156, height: 76, style: { ...common, fillColor: "#fff7ed", strokeColor: "#f97316" } };
+    return { label: "等待", width: 156, height: 76, style: system("#fff7e6", "#ff9f0a") };
   }
   if (kind === "manualInput") {
-    return { label: "手动输入", width: 168, height: 76, style: { ...common, fillColor: "#fff7ed", strokeColor: "#f97316" } };
+    return { label: "手动输入", width: 168, height: 76, style: system("#fff7e6", "#ff9f0a") };
   }
   if (kind === "connector") {
-    return { label: "A", width: 56, height: 56, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b" } };
+    return { label: "A", width: 56, height: 56, style: blue({ fontSize: 12 }) };
   }
   if (kind === "bpmnTask") {
-    return { label: "业务任务", width: 172, height: 72, style: { ...common, fillColor: "#ecfeff", strokeColor: "#06b6d4", rounded: true } };
+    return { label: "业务任务", width: 172, height: 72, style: blue({ rounded: true }) };
   }
   if (kind === "cloud") {
-    return { label: "云服务", width: 176, height: 96, style: { ...common, fillColor: "#eef2ff", strokeColor: "#6366f1" } };
+    return { label: "云服务", width: 176, height: 96, style: blue({ bold: false }) };
   }
   if (kind === "container") {
-    return { label: "分组容器", width: 480, height: 320, style: { ...common, fillColor: "#f8fafc", strokeColor: "#94a3b8", dashed: true, shadow: false } };
+    return { label: "分组容器", width: 480, height: 320, style: neutral({ fillColor: "#f5f5f7", strokeColor: "#86868b", dashed: true }) };
   }
   if (kind === "swimlane") {
-    return { label: "职责泳道", width: 560, height: 300, style: { ...common, fillColor: "#f8fafc", strokeColor: "#06b6d4", shadow: false } };
+    return { label: "职责泳道", width: 560, height: 300, style: neutral({ fillColor: "#f5f5f7", strokeColor: "#0066cc" }) };
   }
   if (kind === "lane") {
-    return { label: "泳道", width: 560, height: 120, style: { ...common, fillColor: "#f8fafc", strokeColor: "#a5f3fc", shadow: false } };
+    return { label: "泳道", width: 560, height: 120, style: neutral({ fillColor: "#fbfbfd", strokeColor: "#d2d2d7" }) };
   }
   if (kind === "bpmnEvent") {
-    return { label: "中间事件", width: 76, height: 76, style: { ...common, fillColor: "#f0fdfa", strokeColor: "#14b8a6" } };
+    return { label: "中间事件", width: 76, height: 76, style: blue() };
   }
   if (kind === "bpmnGateway") {
-    return { label: "网关", width: 96, height: 96, style: { ...common, fillColor: "#fffbeb", strokeColor: "#f59e0b" } };
+    return { label: "网关", width: 112, height: 112, style: system("#fff7e6", "#ff9f0a", { bold: true }) };
   }
   if (kind === "bpmnDataObject") {
-    return { label: "数据对象", width: 124, height: 92, style: { ...common, fillColor: "#f0fdfa", strokeColor: "#14b8a6" } };
+    return { label: "数据对象", width: 124, height: 92, style: blue({ bold: false }) };
   }
   if (kind === "umlUseCase") {
-    return { label: "用户用例", width: 172, height: 84, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", bold: false } };
+    return { label: "用户用例", width: 172, height: 84, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "umlClass") {
-    return { label: "ClassName\n────────\n+ field: Type\n────────\n+ method()", width: 216, height: 154, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", align: "left" } };
+    return { label: "ClassName\n────────\n+ field: Type\n────────\n+ method()", width: 216, height: 154, style: neutral({ fillColor: "#fbfbfd", align: "left" }) };
   }
   if (kind === "umlInterface") {
-    return { label: "Interface", width: 104, height: 104, style: { ...common, fillColor: "#f8fafc", strokeColor: "#64748b", fontSize: 11, bold: false } };
+    return { label: "Interface", width: 104, height: 104, style: neutral({ fillColor: "#fbfbfd", fontSize: 11 }) };
   }
   if (kind === "umlPackage") {
-    return { label: "Package", width: 190, height: 112, style: { ...common, fillColor: "#fffbeb", strokeColor: "#f59e0b", align: "left" } };
+    return { label: "Package", width: 190, height: 112, style: neutral({ fillColor: "#f5f5f7", align: "left" }) };
   }
   if (kind === "umlComponent") {
-    return { label: "Component", width: 190, height: 100, style: { ...common, fillColor: "#eef2ff", strokeColor: "#6366f1" } };
+    return { label: "Component", width: 190, height: 100, style: blue({ bold: false }) };
   }
   if (kind === "entity") {
-    return { label: "Entity\n────────\nid: UUID\nname: VARCHAR", width: 204, height: 134, style: { ...common, fillColor: "#ecfeff", strokeColor: "#06b6d4", align: "left" } };
+    return { label: "Entity\n────────\nid: UUID\nname: VARCHAR", width: 204, height: 134, style: neutral({ fillColor: "#fbfbfd", align: "left" }) };
   }
   if (kind === "erRelationship") {
-    return { label: "关系", width: 132, height: 92, style: { ...common, fillColor: "#f5f3ff", strokeColor: "#8b5cf6" } };
+    return { label: "关系", width: 152, height: 104, style: blue({ bold: false }) };
   }
   if (kind === "erAttribute") {
-    return { label: "属性", width: 152, height: 72, style: { ...common, fillColor: "#fdf2f8", strokeColor: "#ec4899", bold: false } };
+    return { label: "属性", width: 152, height: 72, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "server") {
-    return { label: "应用服务器", width: 156, height: 104, style: { ...common, fillColor: "#eef2ff", strokeColor: "#6366f1" } };
+    return { label: "应用服务器", width: 156, height: 104, style: blue({ bold: false }) };
   }
   if (kind === "client") {
-    return { label: "客户端", width: 156, height: 88, style: { ...common, fillColor: "#eff6ff", strokeColor: "#3b82f6" } };
+    return { label: "客户端", width: 156, height: 88, style: blue({ bold: false }) };
   }
   if (kind === "router") {
-    return { label: "路由器", width: 128, height: 72, style: { ...common, fillColor: "#ecfeff", strokeColor: "#06b6d4" } };
+    return { label: "路由器", width: 128, height: 72, style: blue({ bold: false }) };
   }
   if (kind === "firewall") {
-    return { label: "防火墙", width: 160, height: 76, style: { ...common, fillColor: "#fff1f2", strokeColor: "#f43f5e" } };
+    return { label: "防火墙", width: 160, height: 76, style: system("#fff1f2", "#ff3b30", { bold: true }) };
   }
   if (kind === "queue") {
-    return { label: "消息队列", width: 164, height: 86, style: { ...common, fillColor: "#fdf2f8", strokeColor: "#ec4899" } };
+    return { label: "消息队列", width: 164, height: 86, style: neutral({ fillColor: "#fbfbfd" }) };
   }
   if (kind === "service") {
-    return { label: "应用服务", width: 168, height: 84, style: { ...common, fillColor: "#ecfdf5", strokeColor: "#10b981" } };
+    return { label: "应用服务", width: 168, height: 84, style: system("#ecfdf5", "#34c759", { bold: true }) };
   }
-  return { label: "处理步骤", width: 168, height: 68, style: { ...common, fillColor: "#f0f9ff", strokeColor: "#0ea5e9" } };
+  return { label: "处理步骤", width: 168, height: 68, style: blue() };
 }
 
 function defaultEdgeStyle(): DiagramEdgeStyle {
   return {
-    strokeColor: "#64748b",
-    fontColor: "#334155",
-    strokeWidth: 2,
+    strokeColor: "#0066cc",
+    fontColor: "#1d1d1f",
+    strokeWidth: 1.8,
     edgeType: "orthogonal",
     startArrow: "none",
     endArrow: "block",
@@ -3766,12 +3850,14 @@ function defaultEdgeStyle(): DiagramEdgeStyle {
 }
 
 function nodeShape(kind: DiagramNodeKind) {
+  const semanticShape = semanticShapeName(kind);
+  if (semanticShape) return semanticShape;
   if (kind === "ellipse" || kind === "circle" || kind === "start" || kind === "end" || kind === "connector" || kind === "umlUseCase" || kind === "erAttribute" || kind === "router") return "ellipse";
   if (kind === "diamond" || kind === "decision" || kind === "bpmnGateway" || kind === "erRelationship") return "rhombus";
   if (kind === "bpmnEvent" || kind === "umlInterface") return "doubleEllipse";
   if (kind === "triangle") return "triangle";
-  if (kind === "hexagon" || kind === "manualInput" || kind === "service") return "hexagon";
-  if (kind === "database" || kind === "server" || kind === "queue") return "cylinder";
+  if (kind === "hexagon" || kind === "service") return "hexagon";
+  if (kind === "database") return "cylinder";
   if (kind === "actor") return "actor";
   if (kind === "cloud") return "cloud";
   if (kind === "swimlane" || kind === "lane") return "swimlane";
@@ -3805,18 +3891,18 @@ function createNodeDragPreview(
   element.style.position = "relative";
   element.style.pointerEvents = "none";
   element.style.opacity = "0.96";
-  element.style.filter = "drop-shadow(0 10px 18px rgba(15, 23, 42, .22))";
+  element.style.filter = "none";
 
   const shape = window.document.createElement("div");
   shape.style.position = "absolute";
   shape.style.inset = isContainer ? "2px" : "1px";
   shape.style.boxSizing = "border-box";
   shape.style.background = isContainer
-    ? "rgba(248, 250, 252, .9)"
-    : `linear-gradient(180deg, ${mixHexColor(defaults.style.fillColor, "#ffffff", 0.72)}, ${defaults.style.fillColor})`;
+    ? "#f5f5f7"
+    : defaults.style.fillColor;
   shape.style.border = `${Math.max(1, defaults.style.strokeWidth)}px ${defaults.style.dashed ? "dashed" : "solid"} ${defaults.style.strokeColor}`;
   shape.style.borderRadius = "14px";
-  shape.style.boxShadow = isContainer ? "none" : "0 6px 16px rgba(15, 23, 42, .12)";
+  shape.style.boxShadow = "none";
 
   if (kind === "ellipse" || kind === "circle" || kind === "start" || kind === "end" || kind === "connector" || kind === "bpmnEvent" || kind === "umlUseCase" || kind === "umlInterface" || kind === "erAttribute" || kind === "router") {
     shape.style.borderRadius = "999px";
@@ -3824,16 +3910,22 @@ function createNodeDragPreview(
     shape.style.inset = "18%";
     shape.style.borderRadius = "8px";
     shape.style.transform = "rotate(45deg)";
-  } else if (kind === "database" || kind === "server" || kind === "queue") {
+  } else if (kind === "database") {
     shape.style.borderRadius = "50% / 18%";
-  } else if (kind === "hexagon" || kind === "manualInput" || kind === "service") {
+  } else if (kind === "hexagon" || kind === "service") {
     shape.style.clipPath = "polygon(14% 0, 86% 0, 100% 50%, 86% 100%, 14% 100%, 0 50%)";
   } else if (kind === "triangle") {
     shape.style.clipPath = "polygon(50% 0, 100% 100%, 0 100%)";
   } else if (kind === "data") {
     shape.style.clipPath = "polygon(14% 0, 100% 0, 86% 100%, 0 100%)";
-  } else if (kind === "note") {
+  } else if (kind === "manualInput") {
+    shape.style.clipPath = "polygon(0 20%, 100% 0, 100% 100%, 0 100%)";
+  } else if (kind === "note" || kind === "bpmnDataObject") {
     shape.style.clipPath = "polygon(0 0, 82% 0, 100% 22%, 100% 100%, 0 100%)";
+  } else if (kind === "delay") {
+    shape.style.borderRadius = "0 999px 999px 0";
+  } else if (kind === "umlPackage") {
+    shape.style.clipPath = "polygon(0 0, 42% 0, 42% 18%, 100% 18%, 100% 100%, 0 100%)";
   } else if (kind === "cloud") {
     shape.style.borderRadius = "48% 52% 46% 54% / 58% 48% 52% 42%";
   }
@@ -3842,6 +3934,21 @@ function createNodeDragPreview(
     element.style.filter = "none";
   }
   element.appendChild(shape);
+
+  if (kind === "subprocess" || kind === "server" || kind === "firewall" || kind === "umlClass" || kind === "entity") {
+    const overlay = window.document.createElement("div");
+    overlay.style.position = "absolute";
+    overlay.style.inset = "1px";
+    overlay.style.pointerEvents = "none";
+    if (kind === "subprocess") {
+      overlay.style.borderLeft = `2px solid ${defaults.style.strokeColor}`;
+      overlay.style.borderRight = `2px solid ${defaults.style.strokeColor}`;
+      overlay.style.marginInline = "10px";
+    } else {
+      overlay.style.background = `linear-gradient(to bottom, transparent 31%, ${defaults.style.strokeColor} 31%, ${defaults.style.strokeColor} 33%, transparent 33%, transparent 67%, ${defaults.style.strokeColor} 67%, ${defaults.style.strokeColor} 69%, transparent 69%)`;
+    }
+    element.appendChild(overlay);
+  }
 
   if (kind === "swimlane" || kind === "lane") {
     const header = window.document.createElement("div");
@@ -3862,7 +3969,7 @@ function createNodeDragPreview(
   label.style.alignItems = "center";
   label.style.justifyContent = isContainer ? "flex-start" : "center";
   label.style.color = defaults.style.fontColor;
-  label.style.fontFamily = "Inter, ui-sans-serif, system-ui";
+  label.style.fontFamily = "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
   label.style.fontSize = `${Math.max(10, Math.min(13, Math.round(13 * scale)))}px`;
   label.style.fontWeight = "650";
   label.style.lineHeight = "1.2";
@@ -4191,7 +4298,7 @@ function CompactPanelButton({
     <button
       type="button"
       aria-pressed={active}
-      className={`flex h-8 min-w-[64px] items-center justify-center gap-1.5 rounded-md px-2 text-[10px] font-semibold transition ${active
+      className={`diagram-apple-compact-button flex h-8 min-w-[64px] items-center justify-center gap-1.5 rounded-md px-2 text-[10px] font-semibold transition ${active
         ? "bg-white text-cyan-800 shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
         : "text-zinc-500 hover:bg-white/70 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"}`}
       onClick={onClick}
@@ -4222,7 +4329,7 @@ function DiagramToolbarMenu({
       <DropdownTrigger>
         <button
           type="button"
-          className={`flex shrink-0 items-center gap-1.5 rounded-lg text-[11px] font-medium text-zinc-600 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white ${compact ? "h-8 px-2" : "h-8 px-2.5"}`}
+          className={`diagram-apple-toolbar-menu flex shrink-0 items-center gap-1.5 rounded-lg text-[11px] font-medium text-zinc-600 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white ${compact ? "h-8 px-2" : "h-8 px-2.5"}`}
           aria-label={`${label}菜单`}
         >
           {label}
@@ -4271,7 +4378,7 @@ function DiagramToolbarButton({
       type="button"
       disabled={disabled}
       title={shortcut ? `${label} (${shortcut})` : label}
-      className={`flex h-8 shrink-0 items-center gap-1 rounded-lg px-2.5 text-[11px] font-medium transition disabled:cursor-not-allowed disabled:opacity-35 ${danger
+      className={`diagram-apple-toolbar-button flex h-8 shrink-0 items-center gap-1 rounded-lg px-2.5 text-[11px] font-medium transition disabled:cursor-not-allowed disabled:opacity-35 ${danger
         ? "text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-400/10"
         : "text-zinc-600 hover:bg-black/[0.045] hover:text-zinc-950 dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white"}`}
       onClick={onClick}
@@ -4299,7 +4406,7 @@ function DrawioStencilGlyph({ stencilName, loaded }: { stencilName: string; load
     }
   }, [loaded, stencilName]);
   return (
-    <span className="relative flex h-8 w-12 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-50 dark:bg-white/[0.04]">
+    <span className="diagram-apple-stencil-glyph relative flex h-8 w-12 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-50 dark:bg-white/[0.04]">
       <svg ref={svgRef} className={`h-full w-full overflow-visible ${rendered ? "block" : "hidden"}`} aria-hidden="true" />
       {!rendered ? <span className="h-5 w-8 rounded border border-cyan-500/60 bg-cyan-50 dark:bg-cyan-300/10" /> : null}
     </span>
@@ -4308,21 +4415,147 @@ function DrawioStencilGlyph({ stencilName, loaded }: { stencilName: string; load
 
 function DiagramNodeGlyph({ kind }: { kind: DiagramNodeKind }) {
   if (kind === "text") {
-    return <span className="flex h-8 w-11 shrink-0 items-center justify-center rounded-md bg-slate-50 text-sm font-semibold text-cyan-700 transition group-hover:bg-cyan-50 dark:bg-white/[0.04] dark:text-cyan-200 dark:group-hover:bg-cyan-300/[0.08]">T</span>;
+    return <span className="diagram-apple-node-glyph flex h-8 w-11 shrink-0 items-center justify-center rounded-md bg-slate-50 text-sm font-semibold text-cyan-700 transition group-hover:bg-cyan-50 dark:bg-white/[0.04] dark:text-cyan-200 dark:group-hover:bg-cyan-300/[0.08]">T</span>;
   }
-  const isEllipse = ["ellipse", "circle", "start", "end", "connector", "bpmnEvent", "umlUseCase", "umlInterface", "erAttribute", "router"].includes(kind);
-  const isDiamond = ["diamond", "decision", "bpmnGateway", "erRelationship"].includes(kind);
-  const clipPath = ["hexagon", "manualInput", "service"].includes(kind)
-    ? "polygon(14% 0, 86% 0, 100% 50%, 86% 100%, 14% 100%, 0 50%)"
-    : kind === "triangle" ? "polygon(50% 0, 100% 100%, 0 100%)" : undefined;
-  const shapeClass = isEllipse ? "rounded-full"
-    : isDiamond ? "rotate-45 rounded-sm"
-      : kind === "database" || kind === "server" || kind === "queue" ? "rounded-[50%/20%]"
-        : kind === "note" ? "rounded-sm rounded-tr-xl"
-          : "rounded-md";
+  let shape: ReactNode;
+  if (kind === "rectangle") {
+    shape = <rect x="2" y="4" width="44" height="28" />;
+  } else if (kind === "roundedRectangle") {
+    shape = <rect x="2" y="4" width="44" height="28" rx="7" />;
+  } else if (kind === "ellipse" || kind === "umlUseCase" || kind === "erAttribute") {
+    shape = <ellipse cx="24" cy="18" rx="22" ry="14" />;
+  } else if (kind === "circle" || kind === "connector") {
+    shape = <circle cx="24" cy="18" r="15" />;
+  } else if (kind === "start" || kind === "end") {
+    shape = <rect x="2" y="7" width="44" height="22" rx="11" />;
+  } else if (isDiamondLikeKind(kind)) {
+    shape = <path d="M24 2 46 18 24 34 2 18Z" />;
+  } else if (kind === "triangle") {
+    shape = <path d="M24 2 45 33H3Z" />;
+  } else if (kind === "hexagon" || kind === "service") {
+    shape = <path d="M10 3h28l8 15-8 15H10L2 18Z" />;
+  } else if (kind === "document") {
+    shape = <path d="M3 3h42v25c-8-5-14 6-23 1-7-4-12-1-19 2Z" />;
+  } else if (kind === "database") {
+    shape = (
+      <>
+        <path d="M5 8c0-4 38-4 38 0v20c0 4-38 4-38 0Z" />
+        <ellipse cx="24" cy="8" rx="19" ry="5" fill="none" />
+      </>
+    );
+  } else if (kind === "data") {
+    shape = <path d="M9 3h37l-7 30H2Z" />;
+  } else if (kind === "subprocess") {
+    shape = (
+      <>
+        <rect x="2" y="4" width="44" height="28" rx="5" />
+        <path d="M9 4v28M39 4v28" fill="none" />
+      </>
+    );
+  } else if (kind === "delay") {
+    shape = <path d="M3 3h20c14 0 22 6 22 15s-8 15-22 15H3Z" />;
+  } else if (kind === "manualInput") {
+    shape = <path d="m3 9 42-6v30H3Z" />;
+  } else if (kind === "note" || kind === "bpmnDataObject") {
+    shape = (
+      <>
+        <path d="M4 2h30l10 10v22H4Z" />
+        <path d="M34 2v10h10" fill="none" />
+      </>
+    );
+  } else if (kind === "bpmnTask" || kind === "process") {
+    shape = <rect x="2" y="4" width="44" height="28" rx={kind === "bpmnTask" ? 7 : 3} />;
+  } else if (kind === "bpmnEvent" || kind === "umlInterface") {
+    shape = (
+      <>
+        <circle cx="24" cy="18" r="15" />
+        <circle cx="24" cy="18" r="11" fill="none" />
+      </>
+    );
+  } else if (kind === "actor") {
+    shape = (
+      <>
+        <circle cx="24" cy="9" r="6" />
+        <path d="M9 33c1-10 6-15 15-15s14 5 15 15Z" />
+      </>
+    );
+  } else if (kind === "umlClass") {
+    shape = (
+      <>
+        <rect x="3" y="2" width="42" height="32" rx="2" />
+        <path d="M3 12h42M3 24h42" fill="none" />
+      </>
+    );
+  } else if (kind === "umlPackage") {
+    shape = <path d="M3 4h17v6h25v23H3Z" />;
+  } else if (kind === "umlComponent") {
+    shape = (
+      <>
+        <rect x="4" y="4" width="40" height="28" rx="4" />
+        <rect x="8" y="10" width="11" height="6" rx="1" />
+        <rect x="8" y="21" width="11" height="6" rx="1" />
+      </>
+    );
+  } else if (kind === "entity") {
+    shape = (
+      <>
+        <rect x="3" y="3" width="42" height="30" rx="2" />
+        <path d="M3 13h42" fill="none" />
+      </>
+    );
+  } else if (kind === "server") {
+    shape = (
+      <>
+        <rect x="5" y="3" width="38" height="30" rx="4" />
+        <path d="M5 13h38M5 23h38" fill="none" />
+        <circle cx="37" cy="8" r="1.5" fill="currentColor" stroke="none" />
+        <circle cx="37" cy="28" r="1.5" fill="currentColor" stroke="none" />
+      </>
+    );
+  } else if (kind === "client") {
+    shape = (
+      <>
+        <rect x="4" y="3" width="40" height="23" rx="4" />
+        <path d="M24 26v5M17 32h14" fill="none" />
+      </>
+    );
+  } else if (kind === "router") {
+    shape = <ellipse cx="24" cy="18" rx="21" ry="13" />;
+  } else if (kind === "firewall") {
+    shape = (
+      <>
+        <rect x="3" y="4" width="42" height="28" />
+        <path d="M3 12h42M3 24h42M14 4v8M33 4v8M22 24v8M39 24v8" fill="none" />
+      </>
+    );
+  } else if (kind === "cloud") {
+    shape = <path d="M13 30C4 30 1 22 7 17c-2-7 6-12 12-8 5-8 17-5 18 3 10 0 12 14 4 18Z" />;
+  } else if (kind === "queue") {
+    shape = (
+      <>
+        <path d="M10 4h28c10 0 10 28 0 28H10C0 32 0 4 10 4Z" />
+        <path d="M10 4c8 0 8 28 0 28" fill="none" />
+      </>
+    );
+  } else if (kind === "container") {
+    shape = <rect x="2" y="3" width="44" height="30" rx="4" strokeDasharray="4 3" />;
+  } else if (kind === "swimlane" || kind === "lane") {
+    shape = (
+      <>
+        <rect x="2" y="3" width="44" height="30" rx="4" />
+        <path d="M2 12h44" fill="none" />
+      </>
+    );
+  } else {
+    shape = <rect x="2" y="4" width="44" height="28" rx="4" />;
+  }
   return (
-    <span style={clipPath ? { clipPath } : undefined} className={`flex h-8 w-11 shrink-0 items-center justify-center border-[1.5px] border-cyan-600/80 bg-cyan-50 text-cyan-700 shadow-[0_1px_1px_rgba(8,145,178,0.08)] transition group-hover:border-cyan-600 group-hover:bg-cyan-100 dark:border-cyan-300/70 dark:bg-cyan-300/[0.08] dark:text-cyan-200 dark:group-hover:border-cyan-300 ${shapeClass}`}>
-      {kind === "actor" ? <span className="h-3 w-3 rounded-full border border-current" /> : null}
+    <span className="diagram-apple-node-glyph flex h-8 w-11 shrink-0 items-center justify-center text-cyan-700 transition dark:text-cyan-200" aria-hidden="true">
+      <svg className="h-full w-full overflow-visible" viewBox="0 0 48 36">
+        <g fill="var(--diagram-apple-glyph-fill)" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6">
+          {shape}
+        </g>
+      </svg>
     </span>
   );
 }
@@ -4338,9 +4571,14 @@ function ColorPicker({
   selected?: string;
   onSelect: (color: string) => void;
 }) {
+  const selectedColor = selected?.toLowerCase();
+  const customColor = colorPickerValue(selected, colors[0] ?? "#000000");
+  const customSelected = Boolean(selectedColor
+    && /^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(selectedColor)
+    && !colors.some((color) => color.toLowerCase() === selectedColor));
   return (
     <div>
-      <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400">{label}</span>
+      <span className="diagram-apple-field-label text-[10px] font-medium uppercase tracking-wider text-zinc-400">{label}</span>
       <div className="mt-1.5 flex flex-wrap gap-1.5">
         {colors.map((color) => (
           <button
@@ -4348,16 +4586,42 @@ function ColorPicker({
             type="button"
             aria-label={`${label} ${color}`}
             aria-pressed={selected?.toLowerCase() === color.toLowerCase()}
-            className={`h-7 w-7 rounded-full border shadow-sm transition ${selected?.toLowerCase() === color.toLowerCase()
+            className={`diagram-apple-color-swatch h-7 w-7 rounded-full border shadow-sm transition ${selected?.toLowerCase() === color.toLowerCase()
               ? "scale-110 border-cyan-500 ring-2 ring-cyan-400/40"
               : "border-black/15 dark:border-white/20"}`}
             style={{ backgroundColor: color }}
             onClick={() => onSelect(color)}
           />
         ))}
+        <label
+          className={`diagram-apple-custom-color relative grid h-7 w-7 cursor-pointer place-items-center rounded-full border transition focus-within:outline-none focus-within:ring-2 focus-within:ring-cyan-400/50 ${customSelected
+            ? "scale-110 border-cyan-500 ring-2 ring-cyan-400/40"
+            : "border-black/15 dark:border-white/20"}`}
+          title={`自定义${label}颜色`}
+        >
+          <input
+            type="color"
+            value={customColor}
+            aria-label={`自定义${label}颜色`}
+            className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+            onChange={(event) => onSelect(event.currentTarget.value)}
+          />
+          <span className="pointer-events-none h-5 w-5 rounded-full border border-black/10 dark:border-white/15" style={{ backgroundColor: customColor }} />
+          <span className="pointer-events-none absolute -bottom-0.5 -right-0.5 grid h-3.5 w-3.5 place-items-center rounded-full border border-white bg-zinc-900 text-[10px] font-semibold leading-none text-white shadow-sm dark:border-zinc-800 dark:bg-white dark:text-zinc-900">+</span>
+        </label>
       </div>
     </div>
   );
+}
+
+function colorPickerValue(value: string | undefined, fallback: string): string {
+  const source = value?.trim() ?? "";
+  if (/^#[0-9a-f]{6}$/i.test(source)) return source.toLowerCase();
+  if (/^#[0-9a-f]{3}$/i.test(source)) {
+    const [red, green, blue] = source.slice(1).split("");
+    return `#${red}${red}${green}${green}${blue}${blue}`.toLowerCase();
+  }
+  return /^#[0-9a-f]{6}$/i.test(fallback) ? fallback.toLowerCase() : "#000000";
 }
 
 function ArrowPicker({
@@ -4379,7 +4643,7 @@ function ArrowPicker({
   ];
   return (
     <div>
-      <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400">{label}</span>
+      <span className="diagram-apple-field-label text-[10px] font-medium uppercase tracking-wider text-zinc-400">{label}</span>
       <div className="mt-1.5 grid grid-cols-3 gap-1.5">
         {arrows.map(([arrow, text]) => (
           <InspectorAction
@@ -4410,7 +4674,7 @@ function InspectorAction({
       type="button"
       disabled={disabled}
       aria-pressed={active}
-      className={`rounded-lg border px-2 py-1.5 text-[10px] font-medium transition hover:border-cyan-400 hover:text-cyan-800 disabled:opacity-35 dark:hover:text-cyan-200 ${active
+      className={`diagram-apple-inspector-action rounded-lg border px-2 py-1.5 text-[10px] font-medium transition hover:border-cyan-400 hover:text-cyan-800 disabled:opacity-35 dark:hover:text-cyan-200 ${active
         ? "border-cyan-400 bg-cyan-50 text-cyan-900 shadow-sm dark:bg-cyan-300/10 dark:text-cyan-100"
         : "border-black/[0.08] bg-white/70 text-zinc-600 dark:border-white/[0.09] dark:bg-white/[0.025] dark:text-zinc-300"}`}
       onClick={onClick}
@@ -4436,7 +4700,7 @@ function ContextMenuAction({
       type="button"
       role="menuitem"
       disabled={disabled}
-      className={`block w-full rounded-md px-2.5 py-2 text-left transition disabled:opacity-35 ${danger
+      className={`diagram-apple-context-action block w-full rounded-md px-2.5 py-2 text-left transition disabled:opacity-35 ${danger
         ? "text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-400/10"
         : "hover:bg-cyan-50 hover:text-cyan-900 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100"}`}
       onClick={onClick}

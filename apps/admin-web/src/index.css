@@ -1755,3 +1755,398 @@ body {
     --flow-cycle: 0s;
   }
 }
+
+/* Apple-style skin for the professional synced diagram editor. */
+.diagram-apple {
+  --diagram-apple-blue: #0066cc;
+  --diagram-apple-blue-soft: rgba(0, 102, 204, 0.1);
+  --diagram-apple-ink: #1d1d1f;
+  --diagram-apple-muted: #515154;
+  --diagram-apple-subtle: #6e6e73;
+  --diagram-apple-line: rgba(29, 29, 31, 0.1);
+  --diagram-apple-line-strong: rgba(29, 29, 31, 0.16);
+  --diagram-apple-page: #f5f5f7;
+  --diagram-apple-surface: #ffffff;
+  --diagram-apple-surface-soft: #fbfbfd;
+  --diagram-apple-panel: rgba(255, 255, 255, 0.86);
+  --diagram-apple-glyph-fill: #e8f2ff;
+  color: var(--diagram-apple-ink);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.diagram-apple,
+.diagram-apple * {
+  letter-spacing: 0 !important;
+}
+
+.dark .diagram-apple {
+  --diagram-apple-blue: #2997ff;
+  --diagram-apple-blue-soft: rgba(41, 151, 255, 0.16);
+  --diagram-apple-ink: #f5f5f7;
+  --diagram-apple-muted: #d1d1d6;
+  --diagram-apple-subtle: #b8b8bd;
+  --diagram-apple-line: rgba(245, 245, 247, 0.1);
+  --diagram-apple-line-strong: rgba(245, 245, 247, 0.18);
+  --diagram-apple-page: #1d1d1f;
+  --diagram-apple-surface: #2c2c2e;
+  --diagram-apple-surface-soft: #242426;
+  --diagram-apple-panel: rgba(44, 44, 46, 0.84);
+  --diagram-apple-glyph-fill: #20364d;
+}
+
+.diagram-apple:not(.diagram-apple-full) {
+  background: var(--diagram-apple-page) !important;
+  border-color: var(--diagram-apple-line) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-full {
+  background: var(--diagram-apple-page) !important;
+}
+
+.diagram-apple-shell {
+  background: var(--diagram-apple-surface) !important;
+  border-color: var(--diagram-apple-line-strong) !important;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.45) inset !important;
+}
+
+.dark .diagram-apple-shell {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.035) inset !important;
+}
+
+.diagram-apple-full .diagram-apple-shell {
+  border-radius: 0;
+  box-shadow: none !important;
+}
+
+.diagram-apple-intro h2,
+.diagram-apple-toolbar-brand .font-semibold,
+.diagram-apple-inspector-header .font-semibold,
+.diagram-apple-collaboration-header h2 {
+  color: var(--diagram-apple-ink) !important;
+  font-weight: 700;
+}
+
+.diagram-apple-intro p,
+.diagram-apple-toolbar-brand .text-\[9px\],
+.diagram-apple .text-zinc-400 {
+  color: var(--diagram-apple-subtle) !important;
+}
+
+.diagram-apple-intro-icon,
+.diagram-apple-toolbar-icon {
+  background: var(--diagram-apple-ink) !important;
+  color: var(--diagram-apple-surface) !important;
+  box-shadow: none !important;
+}
+
+.dark .diagram-apple-intro-icon,
+.dark .diagram-apple-toolbar-icon {
+  background: var(--diagram-apple-blue) !important;
+  color: #000000 !important;
+}
+
+.diagram-apple-pill,
+.diagram-apple-mode-switch,
+.diagram-apple-mobile-switch {
+  background: var(--diagram-apple-panel) !important;
+  border-color: var(--diagram-apple-line) !important;
+  box-shadow: none !important;
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+
+.diagram-apple-mode-option,
+.diagram-apple-toolbar-button,
+.diagram-apple-toolbar-menu,
+.diagram-apple-compact-button,
+.diagram-apple-primary-action,
+.diagram-apple-inspector-action,
+.diagram-apple-context-action {
+  border-radius: 999px !important;
+}
+
+.diagram-apple-mode-option-active,
+.diagram-apple-compact-button[aria-pressed="true"] {
+  background: var(--diagram-apple-surface) !important;
+  color: var(--diagram-apple-blue) !important;
+  box-shadow: 0 0 0 1px var(--diagram-apple-line) !important;
+}
+
+.diagram-apple-primary-action {
+  border-color: var(--diagram-apple-blue) !important;
+  background: var(--diagram-apple-blue) !important;
+  color: #ffffff !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-primary-action:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.04);
+}
+
+.diagram-apple-toolbar,
+.diagram-apple-pages,
+.diagram-apple-mobile-panel,
+.diagram-apple-status,
+.diagram-apple-inspector-header,
+.diagram-apple-collaboration-header {
+  background: var(--diagram-apple-panel) !important;
+  border-color: var(--diagram-apple-line) !important;
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+
+.diagram-apple-toolbar-brand,
+.diagram-apple-separator,
+.diagram-apple-pages > div:last-child {
+  border-color: var(--diagram-apple-line) !important;
+}
+
+.diagram-apple-toolbar-button,
+.diagram-apple-toolbar-menu,
+.diagram-apple-compact-button {
+  color: var(--diagram-apple-muted) !important;
+}
+
+.diagram-apple-toolbar-button:hover,
+.diagram-apple-toolbar-menu:hover,
+.diagram-apple-compact-button:hover,
+.diagram-apple-mode-option:hover,
+.diagram-apple-collapse-row:hover,
+.diagram-apple-collection-row:hover {
+  background: var(--diagram-apple-blue-soft) !important;
+  color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-toolbar-button:focus-visible,
+.diagram-apple-toolbar-menu:focus-visible,
+.diagram-apple-compact-button:focus-visible,
+.diagram-apple-primary-action:focus-visible,
+.diagram-apple-search:focus,
+.diagram-apple-text-field:focus,
+.diagram-apple-inspector-action:focus-visible,
+.diagram-apple-context-action:focus-visible {
+  outline: 2px solid var(--diagram-apple-blue) !important;
+  outline-offset: 2px;
+  box-shadow: none !important;
+}
+
+.diagram-apple-section-label,
+.diagram-apple-field-label {
+  color: var(--diagram-apple-muted) !important;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.diagram-apple-page-tab {
+  border-color: transparent !important;
+  color: var(--diagram-apple-muted) !important;
+}
+
+.diagram-apple-page-tab[aria-pressed="true"] {
+  background: var(--diagram-apple-surface) !important;
+  border-color: var(--diagram-apple-line) !important;
+  color: var(--diagram-apple-ink) !important;
+}
+
+.diagram-apple-page-tab[aria-pressed="true"]::after {
+  background: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-library,
+.diagram-apple-inspector,
+.diagram-apple-collaboration {
+  background: var(--diagram-apple-surface-soft) !important;
+  border-color: var(--diagram-apple-line) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-search,
+.diagram-apple-text-field {
+  min-height: 36px;
+  border-color: var(--diagram-apple-line-strong) !important;
+  background: var(--diagram-apple-surface) !important;
+  color: var(--diagram-apple-ink) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-search::placeholder {
+  color: var(--diagram-apple-subtle);
+}
+
+.diagram-apple-template-button,
+.diagram-apple-palette-card,
+.diagram-apple-collection,
+.diagram-apple-empty-state,
+.diagram-apple-minimap,
+.diagram-apple-context-menu {
+  background: var(--diagram-apple-surface) !important;
+  border-color: var(--diagram-apple-line) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-template-button {
+  color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-template-button span:first-child {
+  color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-template-button span:last-child {
+  color: var(--diagram-apple-muted) !important;
+}
+
+.diagram-apple-palette-card {
+  color: var(--diagram-apple-ink) !important;
+}
+
+.diagram-apple-palette-label {
+  color: var(--diagram-apple-ink) !important;
+  font-size: 10px !important;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.diagram-apple-palette-detail {
+  color: var(--diagram-apple-muted) !important;
+  font-size: 9px !important;
+  line-height: 1.2;
+}
+
+.diagram-apple-template-button:hover,
+.diagram-apple-palette-card:hover {
+  border-color: var(--diagram-apple-blue) !important;
+  background: var(--diagram-apple-blue-soft) !important;
+  transform: translateY(-1px);
+}
+
+.diagram-apple-stencil-glyph {
+  border-color: var(--diagram-apple-blue) !important;
+  background: var(--diagram-apple-blue-soft) !important;
+  color: var(--diagram-apple-blue) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-node-glyph {
+  background: transparent !important;
+  border: 0 !important;
+  color: var(--diagram-apple-blue) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-palette-card:hover .diagram-apple-node-glyph {
+  filter: brightness(1.04);
+  transform: scale(1.04);
+}
+
+.diagram-apple-canvas-wrap {
+  background: var(--diagram-apple-page) !important;
+}
+
+.diagram-apple-canvas {
+  caret-color: var(--diagram-apple-blue);
+}
+
+.diagram-apple-canvas:focus-visible {
+  outline: 2px solid var(--diagram-apple-blue) !important;
+  outline-offset: -2px;
+  box-shadow: none !important;
+}
+
+.diagram-apple-remote-cursor > span:first-child {
+  border-color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-remote-cursor > span:last-child {
+  background: var(--diagram-apple-blue) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-canvas-hint {
+  background: var(--diagram-apple-panel) !important;
+  border-color: var(--diagram-apple-line) !important;
+  color: var(--diagram-apple-muted) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-canvas-hint span {
+  background: var(--diagram-apple-blue-soft) !important;
+  color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-context-menu {
+  color: var(--diagram-apple-ink) !important;
+}
+
+.diagram-apple-context-action:hover {
+  background: var(--diagram-apple-blue-soft) !important;
+  color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-inspector-action {
+  min-height: 32px;
+  border-color: var(--diagram-apple-line) !important;
+  background: var(--diagram-apple-surface) !important;
+  color: var(--diagram-apple-muted) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-inspector-action:hover,
+.diagram-apple-inspector-action[aria-pressed="true"] {
+  border-color: var(--diagram-apple-blue) !important;
+  background: var(--diagram-apple-blue-soft) !important;
+  color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-color-swatch {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55) !important;
+}
+
+.diagram-apple-custom-color {
+  background: var(--diagram-apple-surface) !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45) !important;
+}
+
+.diagram-apple-color-swatch[aria-pressed="true"] {
+  border-color: var(--diagram-apple-blue) !important;
+  box-shadow:
+    0 0 0 2px var(--diagram-apple-surface),
+    0 0 0 4px var(--diagram-apple-blue) !important;
+}
+
+.diagram-apple-status .font-mono,
+.diagram-apple .font-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+  .diagram-apple:not(.diagram-apple-full) {
+    padding: 10px !important;
+    border-radius: 14px !important;
+  }
+
+  .diagram-apple-intro {
+    gap: 10px;
+  }
+
+  .diagram-apple-intro-icon {
+    width: 36px;
+    height: 36px;
+  }
+
+  .diagram-apple-primary-action {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .diagram-apple-toolbar {
+    min-height: 42px;
+    padding-inline: 6px !important;
+  }
+
+  .diagram-apple-page-tab {
+    padding-inline: 12px !important;
+  }
+}
