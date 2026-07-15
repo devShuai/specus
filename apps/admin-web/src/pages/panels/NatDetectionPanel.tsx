@@ -284,11 +284,11 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
   if (publicPage) {
     return (
       <main className="app-apple-tool relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
-        <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] flex-wrap items-center justify-between gap-3 px-5 py-5 sm:px-8">
-          <AppLogo label="shuai-tunnel" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
-          <div className="public-header-actions flex items-center gap-2">
+        <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8">
+          <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
+          <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu active="nat-detect" />
-            <a href="/" className="public-header-button">
+            <a href="/" className="public-header-button public-header-console">
               进入控制台
             </a>
             <ThemeToggleButton className="public-header-theme-button" />

@@ -1890,11 +1890,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       {networkModeTransitionId > 0 ? (
         <div key={networkModeTransitionId} className="transfer-mode-transition" aria-hidden="true" />
       ) : null}
-      <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1480px] flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
-        <AppLogo label="shuai-tunnel" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
+      <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
+        <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="public-header-actions flex shrink-0 items-center gap-2">
           <PublicToolsMenu active={workspace} />
-          <a href="/" className="public-header-button">
+          <a href="/" className="public-header-button public-header-console">
             控制台
           </a>
           <ThemeToggleButton className="public-header-theme-button" />
@@ -1970,130 +1970,129 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             </div>
 
             {roomSettingsOpen ? (
-            <div className="transfer-room-settings mt-3 border-t border-black/10 pt-3 text-small dark:border-white/10">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="font-semibold text-zinc-900 dark:text-white">房间设置</div>
-                <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">调整设备名称、房间标识、成员权限和接收方式。</div>
-              </div>
-              <Button size="sm" radius="sm" variant="flat" onPress={createNewRoom}>新房间</Button>
-            </div>
-            <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-              <div className="sm:col-span-2">
-                <ClientNameSettings
-                  inputId="transfer-client-name-input"
-                  value={displayNameDraft}
-                  onValueChange={setDisplayNameDraft}
-                  status={clientNameStatus}
-                  localError={clientNameLocalError}
-                  isSaving={clientNameSaving}
-                  onApply={() => void applyClientName()}
-                />
-              </div>
-              <Input
-                label="房间名"
-                radius="sm"
-                variant="bordered"
-                value={roomIdDraft}
-                onValueChange={updateRoomIdDraft}
-                maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
-                isInvalid={Boolean(roomSettingsErrors.roomId)}
-                errorMessage={roomSettingsErrors.roomId}
-              />
-              <Input
-                label="房间 Token"
-                radius="sm"
-                variant="bordered"
-                value={roomTokenDraft}
-                onValueChange={updateRoomTokenDraft}
-                maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH}
-                isDisabled={!isInternetMode}
-                isInvalid={Boolean(roomSettingsErrors.roomToken)}
-                errorMessage={roomSettingsErrors.roomToken}
-                description={isInternetMode ? "外网设备凭此 Token 加入隔离房间" : "内网模式不发送 Token"}
-                endContent={
-                  <Button size="sm" variant="light" isDisabled={!isInternetMode} onPress={() => {
-                    const next = createRoomToken();
-                    updateRoomTokenDraft(next);
-                  }}>
-                    生成
-                  </Button>
-                }
-              />
-              <div className="sm:col-span-2">
-                <RoomPermissionSetting
-                  networkMode={networkMode}
-                  currentRole={effectiveRoomRole}
-                  inviteRole={roomInviteRole}
-                  canManage={isInternetMode && roomRole === "OWNER"}
-                  isLoading={roomAccessLoading}
-                  onInviteRoleChange={setRoomInviteRole}
-                  onCreateInvite={() => void createRoomAccess(roomInviteRole)}
-                />
-              </div>
-            </div>
-            <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div className="text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-                {isInternetMode
-                  ? "编辑不会中断当前连接，点击应用后切换房间。Token 会包含在外网邀请链接中。"
-                  : "内网房间按房间名和网络出口隔离，仅应用房间名；Token 不参与发现。"}
-              </div>
-              <div className="flex shrink-0 gap-2">
-                <Button size="sm" radius="sm" variant="light" onPress={resetRoomSettingsDraft}>
-                  恢复
-                </Button>
-                <Button size="sm" radius="sm" color="primary" variant="flat" onPress={applyRoomSettings}>
-                  应用设置
-                </Button>
-              </div>
-            </div>
-            {isInternetMode && roomRole === "OWNER" ? (
-              <div className="mt-3 rounded-lg border border-violet-500/20 bg-violet-50/60 p-3 dark:border-violet-300/20 dark:bg-violet-400/10">
+              <div className="transfer-room-settings mt-3 border-t border-black/10 pt-2.5 text-small dark:border-white/10">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <div className="text-small font-medium text-zinc-900 dark:text-white">权限邀请记录</div>
-                    <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">邀请 Token 仅保存哈希；明文链接只在创建时显示。</div>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <div className="font-semibold text-zinc-900 dark:text-white">房间设置</div>
+                    <Chip size="sm" radius="sm" variant="flat">
+                      {isInternetMode ? "外网 Token" : "内网发现"}
+                    </Chip>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button size="sm" radius="sm" variant="light" onPress={createNewRoom}>新房间</Button>
+                    <Button size="sm" radius="sm" variant="light" onPress={resetRoomSettingsDraft}>恢复</Button>
+                    <Button size="sm" radius="sm" color="primary" variant="flat" onPress={applyRoomSettings}>应用</Button>
                   </div>
                 </div>
-                {createdRoomAccess ? (
-                  <div className="mt-3 flex flex-col gap-2 rounded-md border border-amber-500/25 bg-amber-50/80 p-2.5 dark:border-amber-300/20 dark:bg-amber-300/10 sm:flex-row sm:items-center sm:justify-between">
-                    <span className="min-w-0 text-tiny text-amber-900 dark:text-amber-100">{createdRoomAccess.access.label} · 明文 Token 离开页面后无法再次查看</span>
-                    <Button size="sm" radius="sm" color="warning" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制邀请链接</Button>
+
+                <div className="mt-2 grid gap-2 md:grid-cols-2 xl:grid-cols-12">
+                  <div className="md:col-span-2 xl:col-span-5">
+                    <ClientNameSettings
+                      compact
+                      inputId="transfer-client-name-input"
+                      value={displayNameDraft}
+                      onValueChange={setDisplayNameDraft}
+                      status={clientNameStatus}
+                      localError={clientNameLocalError}
+                      isSaving={clientNameSaving}
+                      onApply={() => void applyClientName()}
+                    />
+                  </div>
+                  <Input
+                    className="xl:col-span-3"
+                    size="sm"
+                    label="房间名"
+                    radius="sm"
+                    variant="bordered"
+                    value={roomIdDraft}
+                    onValueChange={updateRoomIdDraft}
+                    maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
+                    isInvalid={Boolean(roomSettingsErrors.roomId)}
+                    errorMessage={roomSettingsErrors.roomId}
+                  />
+                  <Input
+                    className="xl:col-span-4"
+                    size="sm"
+                    label="房间 Token"
+                    radius="sm"
+                    variant="bordered"
+                    value={roomTokenDraft}
+                    onValueChange={updateRoomTokenDraft}
+                    maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH}
+                    isDisabled={!isInternetMode}
+                    isInvalid={Boolean(roomSettingsErrors.roomToken)}
+                    errorMessage={roomSettingsErrors.roomToken}
+                    endContent={
+                      <Button size="sm" variant="light" isDisabled={!isInternetMode} onPress={() => updateRoomTokenDraft(createRoomToken())}>
+                        生成
+                      </Button>
+                    }
+                  />
+                </div>
+
+                <div className="mt-2 border-t border-black/[0.07] pt-2 dark:border-white/[0.08]">
+                  <RoomPermissionSetting
+                    compact
+                    networkMode={networkMode}
+                    currentRole={effectiveRoomRole}
+                    inviteRole={roomInviteRole}
+                    canManage={isInternetMode && roomRole === "OWNER"}
+                    isLoading={roomAccessLoading}
+                    onInviteRoleChange={setRoomInviteRole}
+                    onCreateInvite={() => void createRoomAccess(roomInviteRole)}
+                  />
+                </div>
+
+                {!isDiagramWorkspace ? (
+                  <div className="mt-2 flex items-center justify-between gap-3 border-t border-black/[0.07] pt-2 dark:border-white/[0.08]">
+                    <div className="min-w-0">
+                      <div className="text-tiny font-medium text-zinc-800 dark:text-zinc-200">接收前确认</div>
+                      <div className="truncate text-[10px] text-zinc-500 dark:text-zinc-400">
+                        {receiveConfirmationRequired ? "收到文件后手动确认" : "房间文件直接开始接收"}
+                      </div>
+                    </div>
+                    <Switch
+                      size="sm"
+                      aria-label="切换接收前确认"
+                      isSelected={receiveConfirmationRequired}
+                      onValueChange={updateReceiveConfirmationRequired}
+                    />
                   </div>
                 ) : null}
-                <div className="mt-3 space-y-1.5">
-                  {roomAccessTokens.length === 0 ? (
-                    <div className="text-tiny text-zinc-400">{roomAccessLoading ? "正在加载邀请…" : "暂无角色邀请"}</div>
-                  ) : roomAccessTokens.map((access) => (
-                    <div key={access.id} className="flex items-center justify-between gap-2 rounded-md border border-black/10 bg-white/60 px-2.5 py-2 dark:border-white/10 dark:bg-black/10">
-                      <div className="min-w-0">
-                        <div className="truncate text-tiny font-medium text-zinc-800 dark:text-zinc-200">{access.label}</div>
-                        <div className="mt-0.5 text-[10px] text-zinc-400">{access.role === "EDITOR" ? "可编辑" : "只读"} · {access.revokedAt ? "已撤销" : new Date(access.createdAt).toLocaleString()}</div>
+
+                {isInternetMode && roomRole === "OWNER" ? (
+                  <div className="mt-2 border-t border-black/[0.07] pt-2 dark:border-white/[0.08]">
+                    {createdRoomAccess ? (
+                      <div className="mb-2 flex flex-col gap-2 rounded-md border border-amber-500/25 bg-amber-50/80 px-2.5 py-2 dark:border-amber-300/20 dark:bg-amber-300/10 sm:flex-row sm:items-center sm:justify-between">
+                        <span className="min-w-0 truncate text-tiny text-amber-900 dark:text-amber-100">{createdRoomAccess.access.label} · 明文链接仅显示一次</span>
+                        <Button size="sm" radius="sm" color="warning" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制链接</Button>
                       </div>
-                      <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>{access.revokedAt ? "已撤销" : "撤销"}</Button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            {!isDiagramWorkspace ? <div className="mt-3 rounded-lg glass glass-border border p-3">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div className="min-w-0">
-                  <div className="text-small font-medium text-zinc-900 dark:text-white">接收前确认</div>
-                  <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-                    默认关闭，房间内设备发来的直连文件会自动开始接收。
+                    ) : null}
+                    <details className="group">
+                      <summary className="flex min-h-8 cursor-pointer list-none items-center justify-between gap-2 rounded-md px-1 text-tiny text-zinc-600 outline-none hover:text-zinc-950 focus-visible:ring-2 focus-visible:ring-[var(--app-apple-blue)] dark:text-zinc-300 dark:hover:text-white [&::-webkit-details-marker]:hidden">
+                        <span className="flex items-center gap-2">
+                          <span className="font-medium">权限邀请记录</span>
+                          <Chip size="sm" radius="sm" variant="flat">{roomAccessTokens.length}</Chip>
+                        </span>
+                        <span className="transition-transform group-open:rotate-180"><ChevronDownIcon /></span>
+                      </summary>
+                      <div className="grid gap-1.5 pt-2 md:grid-cols-2">
+                        {roomAccessTokens.length === 0 ? (
+                          <div className="text-tiny text-zinc-400">{roomAccessLoading ? "正在加载邀请…" : "暂无角色邀请"}</div>
+                        ) : roomAccessTokens.map((access) => (
+                          <div key={access.id} className="flex min-h-10 items-center justify-between gap-2 rounded-md border border-black/[0.07] px-2.5 py-1.5 dark:border-white/[0.08]">
+                            <div className="min-w-0">
+                              <div className="truncate text-tiny font-medium text-zinc-800 dark:text-zinc-200">{access.label}</div>
+                              <div className="truncate text-[10px] text-zinc-400">{access.role === "EDITOR" ? "可编辑" : "只读"} · {access.revokedAt ? "已撤销" : new Date(access.createdAt).toLocaleString()}</div>
+                            </div>
+                            <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>{access.revokedAt ? "已撤销" : "撤销"}</Button>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
                   </div>
-                </div>
-                <Switch
-                  size="sm"
-                  isSelected={receiveConfirmationRequired}
-                  onValueChange={updateReceiveConfirmationRequired}
-                >
-                  {receiveConfirmationRequired ? "手动确认" : "直接接收"}
-                </Switch>
+                ) : null}
               </div>
-            </div> : null}
-            </div>
             ) : null}
 
           {qrVisible && (
@@ -2362,6 +2361,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 }
 
 function ClientNameSettings({
+  compact = false,
   inputId,
   value,
   onValueChange,
@@ -2370,6 +2370,7 @@ function ClientNameSettings({
   isSaving,
   onApply,
 }: {
+  compact?: boolean;
   inputId: string;
   value: string;
   onValueChange: (value: string) => void;
@@ -2388,10 +2389,11 @@ function ClientNameSettings({
       : "在线名称全局唯一，每个标签页可以设置不同名称";
 
   return (
-    <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+    <div className={`grid gap-1.5 ${compact ? "grid-cols-[minmax(0,1fr)_auto] items-start" : "sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start"}`}>
       <Input
         id={inputId}
-        label="我的客户端名称"
+        size={compact ? "sm" : "md"}
+        label={compact ? "客户端名称" : "我的客户端名称"}
         radius="sm"
         variant="bordered"
         value={value}
@@ -2400,7 +2402,12 @@ function ClientNameSettings({
         isRequired
         isInvalid={Boolean(errorMessage)}
         errorMessage={errorMessage}
-        description={description}
+        description={compact ? undefined : description}
+        endContent={compact && !errorMessage ? (
+          <span className={`whitespace-nowrap text-[10px] ${status === "available" ? "text-emerald-600 dark:text-emerald-400" : "text-zinc-400"}`}>
+            {status === "checking" ? "校验中" : status === "available" ? "可用" : ""}
+          </span>
+        ) : undefined}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !localError && status !== "checking" && status !== "unavailable") {
             onApply();
@@ -2408,7 +2415,8 @@ function ClientNameSettings({
         }}
       />
       <Button
-        className="sm:mt-2"
+        className={compact ? "mt-1" : "sm:mt-2"}
+        size={compact ? "sm" : "md"}
         color="primary"
         radius="sm"
         variant="flat"
@@ -2416,13 +2424,14 @@ function ClientNameSettings({
         isLoading={isSaving}
         onPress={onApply}
       >
-        保存名称
+        {compact ? "保存" : "保存名称"}
       </Button>
     </div>
   );
 }
 
 function RoomPermissionSetting({
+  compact = false,
   networkMode,
   currentRole,
   inviteRole,
@@ -2431,6 +2440,7 @@ function RoomPermissionSetting({
   onInviteRoleChange,
   onCreateInvite,
 }: {
+  compact?: boolean;
   networkMode: TransferNetworkMode;
   currentRole: PublicTransferRoomRole;
   inviteRole: TransferInviteRole;
@@ -2447,6 +2457,54 @@ function RoomPermissionSetting({
     : canManage
       ? "此设置作用于新生成的邀请链接，不会改变房主自身权限。"
       : "当前权限由加入房间时使用的邀请链接决定，只有房主可以生成不同权限的链接。";
+
+  if (compact) {
+    return (
+      <div
+        className="grid gap-2 sm:grid-cols-[auto_minmax(220px,1fr)_auto] sm:items-center"
+        title={description}
+      >
+        <div className="flex items-center gap-2">
+          <span className="whitespace-nowrap text-tiny font-medium text-zinc-800 dark:text-zinc-200">邀请权限</span>
+          <Chip size="sm" radius="sm" variant="flat" color={currentRole === "VIEWER" ? "default" : "success"}>
+            {currentRoleLabel}
+          </Chip>
+        </div>
+        <div
+          className="grid min-w-0 grid-cols-2 rounded-md border border-black/[0.07] bg-black/[0.018] p-0.5 dark:border-white/[0.08] dark:bg-white/[0.025]"
+          role="radiogroup"
+          aria-label="新成员房间权限"
+        >
+          {([['EDITOR', '可编辑'], ['VIEWER', '只读']] as const).map(([role, label]) => (
+            <button
+              key={role}
+              type="button"
+              role="radio"
+              aria-checked={displayedRole === role}
+              disabled={!canManage}
+              className={`h-7 rounded px-2 text-tiny font-medium transition-colors ${displayedRole === role ? "bg-white text-zinc-950 shadow-sm dark:bg-white/10 dark:text-white" : "text-zinc-500 dark:text-zinc-400"} disabled:cursor-not-allowed`}
+              onClick={() => onInviteRoleChange(role)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {canManage ? (
+          <Button
+            className="shrink-0"
+            size="sm"
+            radius="sm"
+            color="primary"
+            variant="flat"
+            isLoading={isLoading}
+            onPress={onCreateInvite}
+          >
+            生成邀请
+          </Button>
+        ) : null}
+      </div>
+    );
+  }
 
   return (
     <div className="rounded-lg border border-black/10 bg-black/[0.018] p-3 dark:border-white/10 dark:bg-white/[0.025]">

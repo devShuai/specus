@@ -141,11 +141,11 @@ function LoginPageContent() {
   return (
     <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
       <section className="landing-apple-hero relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
-        <header className="landing-apple-header flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <AppLogo className="w-full sm:w-auto" label="shuai-tunnel" subtitle="内网服务接入控制面" />
-          <div className="public-header-actions grid w-full grid-cols-[repeat(2,minmax(0,1fr))_2.25rem] gap-2 sm:flex sm:w-auto sm:items-center">
+        <header className="landing-apple-header flex items-center justify-between gap-3">
+          <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle="内网服务接入控制面" />
+          <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu />
-            <button type="button" className="public-header-button" onClick={focusLogin}>
+            <button type="button" className="public-header-button public-header-console" onClick={focusLogin}>
               进入控制台
             </button>
             <ThemeToggleButton className="public-header-theme-button" />

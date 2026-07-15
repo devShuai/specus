@@ -3067,17 +3067,49 @@ body {
 }
 
 @media (max-width: 639px) {
-  .app-apple-tool-header > :last-child {
-    width: 100%;
-    justify-content: flex-end;
-  }
-
   .app-apple-tool-content {
     padding-top: 0;
   }
 
   .app-apple-tool-workspace {
     padding-inline: 0 !important;
+  }
+}
+
+@media (max-width: 1023px) {
+  .landing-apple-header,
+  .app-apple-tool-header {
+    flex-flow: row nowrap !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+  }
+
+  .landing-apple-header > :first-child,
+  .app-apple-tool-header > :first-child {
+    width: auto !important;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .public-header-actions {
+    width: auto !important;
+    flex: 0 0 auto;
+    display: flex !important;
+    grid-template-columns: none !important;
+    gap: 4px !important;
+  }
+
+  .public-header-console,
+  .public-tools-label,
+  .public-tools-chevron {
+    display: none !important;
+  }
+
+  .public-tools-trigger {
+    width: 36px !important;
+    min-width: 36px !important;
+    height: 36px !important;
+    padding: 0 !important;
   }
 }
 
@@ -3423,22 +3455,6 @@ body {
   border-color: var(--diagram-apple-blue) !important;
   background: var(--diagram-apple-blue-soft) !important;
   color: var(--diagram-apple-blue) !important;
-}
-
-.diagram-apple-color-swatch {
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55) !important;
-}
-
-.diagram-apple-custom-color {
-  background: var(--diagram-apple-surface) !important;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45) !important;
-}
-
-.diagram-apple-color-swatch[aria-pressed="true"] {
-  border-color: var(--diagram-apple-blue) !important;
-  box-shadow:
-    0 0 0 2px var(--diagram-apple-surface),
-    0 0 0 4px var(--diagram-apple-blue) !important;
 }
 
 .diagram-apple-status .font-mono,
