@@ -1,6 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ButtonHTMLAttributes } from "react";
 import { createPortal } from "react-dom";
-import { Button, Chip } from "@heroui/react";
+import {
+  Button,
+  Chip,
+  Dropdown,
+  DropdownItem,
+  DropdownMenu,
+  DropdownTrigger,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@heroui/react";
 import {
   fitWhiteboardImageDataUrl,
 } from "../lib/whiteboardImageCompression";
@@ -1379,6 +1390,24 @@ export function SyncedWhiteboard({
   const selectedFlowNode = objects.find((object): object is WhiteboardFlowNodeObject => (
     object.objectId === selectedObjectId && object.kind === "flow-node"
   ));
+  const selectedColorOption = WHITEBOARD_COLORS.find((color) => color.value === selectedColor) ?? WHITEBOARD_COLORS[0];
+  const selectedWidthOption = WHITEBOARD_WIDTHS.find((width) => width.value === selectedWidth) ?? WHITEBOARD_WIDTHS[1];
+  const insertMenuLabel = isFlowchartOpen
+    ? "流程图"
+    : selectedTool === "text"
+      ? "文本"
+      : selectedTool === "rectangle"
+        ? "矩形"
+        : selectedTool === "ellipse"
+          ? "圆形"
+          : selectedTool === "arrow"
+            ? "箭头"
+            : "插入";
+  const isInsertMenuActive = isFlowchartOpen
+    || selectedTool === "text"
+    || selectedTool === "rectangle"
+    || selectedTool === "ellipse"
+    || selectedTool === "arrow";
   const editingFlowNode = flowLabelDraft
     ? objects.find((object): object is WhiteboardFlowNodeObject => (
         object.objectId === flowLabelDraft.objectId && object.kind === "flow-node"
@@ -1447,61 +1476,197 @@ export function SyncedWhiteboard({
             : "mt-3 flex min-h-0 flex-col overflow-hidden rounded-xl border border-black/10 bg-white/70 shadow-sm dark:border-white/10 dark:bg-white/[0.04]")
         }
       >
-        {!isExpanded ? <div className="shrink-0 border-b border-black/10 bg-white/80 p-2.5 dark:border-white/10 dark:bg-zinc-900/90">
-          <div className="flex items-center gap-1.5 overflow-x-auto pb-1" role="toolbar" aria-label="白板工具">
+        {!isExpanded ? <div className="shrink-0 border-b border-black/10 bg-white/80 p-2 dark:border-white/10 dark:bg-zinc-900/90 sm:p-2.5">
+          <div className="flex items-center gap-0.5 overflow-x-auto [scrollbar-width:none]" role="toolbar" aria-label="白板工具">
             <WhiteboardToolButton tool="pan" label="移动" activeTool={selectedTool} onSelect={selectTool} />
             <WhiteboardToolButton tool="select" label="选择" activeTool={selectedTool} onSelect={selectTool} />
             <WhiteboardToolButton tool="pen" label="画笔" activeTool={selectedTool} onSelect={selectTool} />
             <WhiteboardToolButton tool="eraser" label="橡皮" activeTool={selectedTool} onSelect={selectTool} />
-            <span className="mx-1 h-8 w-px shrink-0 bg-black/10 dark:bg-white/10" aria-hidden />
-            <WhiteboardToolButton tool="text" label="文本" activeTool={selectedTool} onSelect={selectTool} />
-            <WhiteboardToolButton tool="rectangle" label="矩形" activeTool={selectedTool} onSelect={selectTool} />
-            <WhiteboardToolButton tool="ellipse" label="圆形" activeTool={selectedTool} onSelect={selectTool} />
-            <WhiteboardToolButton tool="arrow" label="箭头" activeTool={selectedTool} onSelect={selectTool} />
-            <button
-              type="button"
-              aria-expanded={isFlowchartOpen}
-              className={
-                "flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[#4262ff] "
-                + (isFlowchartOpen
-                  ? "bg-[#ffd02f] text-[#1c1c1e] shadow-sm"
-                  : "text-zinc-700 hover:bg-[#fff4c4] hover:text-[#1c1c1e] dark:text-zinc-200 dark:hover:bg-[#ffd02f]/15 dark:hover:text-[#fff4c4]")
-              }
-              onClick={() => setIsFlowchartOpen((value) => !value)}
-            >
-              <ToolGlyph name="flow" />
-              流程图
-            </button>
-            <button
-              type="button"
-              className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium text-zinc-700 transition hover:bg-cyan-50 hover:text-cyan-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100"
-              onClick={() => imageInputRef.current?.click()}
-              disabled={isImportingImage}
-            >
-              <ToolGlyph name="image" />
-              {isImportingImage ? "处理中" : "图片"}
-            </button>
-            <span className="mx-1 h-8 w-px shrink-0 bg-black/10 dark:bg-white/10" aria-hidden />
-            <button
-              type="button"
-              className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium text-zinc-700 transition hover:bg-violet-50 hover:text-violet-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10 dark:hover:text-violet-100"
-              onClick={() => documentInputRef.current?.click()}
-              disabled={isImportingDocument}
-              title="导入可编辑白板文件"
-            >
-              <ToolGlyph name="import" />
-              {isImportingDocument ? "导入中" : "导入"}
-            </button>
-            <button
-              type="button"
-              className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-tiny font-medium text-zinc-700 transition hover:bg-violet-50 hover:text-violet-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 disabled:opacity-50 dark:text-zinc-200 dark:hover:bg-violet-300/10 dark:hover:text-violet-100"
-              onClick={() => void exportBoardDocument()}
-              disabled={strokes.length === 0 && objects.length === 0}
-              title="导出可编辑白板文件"
-            >
-              <ToolGlyph name="export" />
-              导出
-            </button>
+            <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
+
+            <Dropdown placement="bottom-start" shouldBlockScroll={false}>
+              <DropdownTrigger>
+                <WhiteboardMenuTrigger icon="insert" label={insertMenuLabel} active={isInsertMenuActive} />
+              </DropdownTrigger>
+              <DropdownMenu
+                aria-label="插入内容"
+                disabledKeys={isReadOnly
+                  ? ["text", "rectangle", "ellipse", "arrow", "flow", "image"]
+                  : isImportingImage
+                    ? ["image"]
+                    : []}
+                onAction={(key) => {
+                  const action = String(key);
+                  if (action === "flow") {
+                    setIsFlowchartOpen((value) => !value);
+                    return;
+                  }
+                  setIsFlowchartOpen(false);
+                  if (action === "image") {
+                    imageInputRef.current?.click();
+                    return;
+                  }
+                  selectTool(action as WhiteboardTool);
+                }}
+              >
+                <DropdownItem key="text" startContent={<ToolGlyph name="text" />}>文本</DropdownItem>
+                <DropdownItem key="rectangle" startContent={<ToolGlyph name="rectangle" />}>矩形</DropdownItem>
+                <DropdownItem key="ellipse" startContent={<ToolGlyph name="ellipse" />}>圆形</DropdownItem>
+                <DropdownItem key="arrow" startContent={<ToolGlyph name="arrow" />}>箭头</DropdownItem>
+                <DropdownItem key="flow" startContent={<ToolGlyph name="flow" />}>流程图组件</DropdownItem>
+                <DropdownItem key="image" startContent={<ToolGlyph name="image" />}>
+                  {isImportingImage ? "图片处理中" : "插入图片"}
+                </DropdownItem>
+              </DropdownMenu>
+            </Dropdown>
+
+            <Popover placement="bottom-start" shouldBlockScroll={false}>
+              <PopoverTrigger>
+                <button
+                  type="button"
+                  className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium text-zinc-700 transition hover:bg-black/5 hover:text-zinc-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white sm:px-2.5"
+                  aria-label={`样式：${selectedColorOption.label}，${selectedWidthOption.label}线条`}
+                  title="颜色与线条粗细"
+                >
+                  <span
+                    className="h-4 w-4 rounded-full border border-black/15 shadow-sm dark:border-white/20"
+                    style={{ backgroundColor: selectedColor }}
+                    aria-hidden
+                  />
+                  <span className="hidden sm:inline">样式</span>
+                  <span className="flex h-4 w-5 items-center justify-center" aria-hidden>
+                    <span
+                      className="block w-4 rounded-full bg-current"
+                      style={{ height: Math.max(2, selectedWidth / 2) }}
+                    />
+                  </span>
+                  <MenuChevronGlyph />
+                </button>
+              </PopoverTrigger>
+              <PopoverContent className="w-64 p-3">
+                <div className="w-full space-y-4">
+                  <div>
+                    <div className="mb-2 flex items-center justify-between text-tiny font-semibold text-zinc-800 dark:text-zinc-100">
+                      <span>颜色</span>
+                      <span className="font-normal text-zinc-500 dark:text-zinc-400">{selectedColorOption.label}</span>
+                    </div>
+                    <div className="flex items-center gap-2" aria-label="画笔颜色">
+                      {WHITEBOARD_COLORS.map((color) => (
+                        <button
+                          key={color.value}
+                          type="button"
+                          aria-label={"选择" + color.label}
+                          title={color.label}
+                          onClick={() => {
+                            setSelectedColor(color.value);
+                            if (selectedTool === "eraser") {
+                              setSelectedTool("pen");
+                            }
+                          }}
+                          className={
+                            "h-8 w-8 rounded-full border transition-transform focus:outline-none focus:ring-2 focus:ring-cyan-400 "
+                            + (selectedColor === color.value && selectedTool !== "eraser"
+                              ? "scale-110 border-zinc-950 ring-2 ring-cyan-400 dark:border-white"
+                              : "border-black/15 dark:border-white/20")
+                          }
+                          style={{ backgroundColor: color.value }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="mb-2 flex items-center justify-between text-tiny font-semibold text-zinc-800 dark:text-zinc-100">
+                      <span>线条粗细</span>
+                      <span className="font-normal text-zinc-500 dark:text-zinc-400">{selectedWidthOption.label}</span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-1.5" aria-label="线条宽度">
+                      {WHITEBOARD_WIDTHS.map((width) => (
+                        <button
+                          key={width.value}
+                          type="button"
+                          aria-pressed={selectedWidth === width.value}
+                          className={
+                            "flex h-9 items-center justify-center rounded-md transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
+                            + (selectedWidth === width.value
+                              ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
+                              : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15")
+                          }
+                          title={width.label + "线条"}
+                          onClick={() => setSelectedWidth(width.value)}
+                        >
+                          <span
+                            className="block w-6 rounded-full bg-current"
+                            style={{ height: Math.max(2, width.value / 2) }}
+                            aria-hidden
+                          />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </PopoverContent>
+            </Popover>
+
+            <span className="mx-1 hidden h-7 w-px shrink-0 bg-black/10 dark:bg-white/10 sm:block" aria-hidden />
+
+            <Dropdown placement="bottom-end" shouldBlockScroll={false}>
+              <DropdownTrigger>
+                <WhiteboardMenuTrigger icon="file" label="文件" />
+              </DropdownTrigger>
+              <DropdownMenu
+                aria-label="白板文件"
+                disabledKeys={[
+                  ...(isReadOnly || isImportingDocument ? ["import"] : []),
+                  ...(strokes.length === 0 && objects.length === 0 ? ["export"] : []),
+                ]}
+                onAction={(key) => {
+                  if (String(key) === "import") {
+                    documentInputRef.current?.click();
+                  } else {
+                    void exportBoardDocument();
+                  }
+                }}
+              >
+                <DropdownItem key="import" startContent={<ToolGlyph name="import" />}>
+                  {isImportingDocument ? "正在导入" : "导入白板"}
+                </DropdownItem>
+                <DropdownItem key="export" startContent={<ToolGlyph name="export" />}>导出白板</DropdownItem>
+              </DropdownMenu>
+            </Dropdown>
+
+            <Dropdown placement="bottom-end" shouldBlockScroll={false}>
+              <DropdownTrigger>
+                <WhiteboardMenuTrigger icon="edit" label="编辑" />
+              </DropdownTrigger>
+              <DropdownMenu
+                aria-label="编辑白板"
+                disabledKeys={[
+                  ...(!localElementExists || isReadOnly ? ["undo"] : []),
+                  ...(!selectedObjectId || isReadOnly ? ["delete"] : []),
+                  ...((strokes.length === 0 && objects.length === 0) || isReadOnly ? ["clear"] : []),
+                ]}
+                onAction={(key) => {
+                  const action = String(key);
+                  if (action === "undo") {
+                    undoLastLocalElement();
+                  } else if (action === "delete") {
+                    if (selectedObjectId) removeObject(selectedObjectId);
+                  } else {
+                    clearBoard();
+                  }
+                }}
+              >
+                <DropdownItem key="undo" startContent={<ToolGlyph name="undo" />} endContent={<span className="text-[10px] text-zinc-400">Ctrl Z</span>}>
+                  撤销
+                </DropdownItem>
+                <DropdownItem key="delete" startContent={<ToolGlyph name="delete" />} endContent={<span className="text-[10px] text-zinc-400">Delete</span>}>
+                  删除所选
+                </DropdownItem>
+                <DropdownItem key="clear" color="danger" className="text-danger" startContent={<ToolGlyph name="clear" />}>
+                  清空白板
+                </DropdownItem>
+              </DropdownMenu>
+            </Dropdown>
           </div>
 
           {isFlowchartOpen ? (
@@ -1518,71 +1683,6 @@ export function SyncedWhiteboard({
             />
           ) : null}
 
-          <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-black/5 pt-2 dark:border-white/5">
-            <div className="flex items-center gap-1.5" aria-label="画笔颜色">
-              {WHITEBOARD_COLORS.map((color) => (
-                <button
-                  key={color.value}
-                  type="button"
-                  aria-label={"选择" + color.label}
-                  title={color.label}
-                  onClick={() => {
-                    setSelectedColor(color.value);
-                    if (selectedTool === "eraser") {
-                      setSelectedTool("pen");
-                    }
-                  }}
-                  className={
-                    "h-7 w-7 rounded-full border transition-transform focus:outline-none focus:ring-2 focus:ring-cyan-400 "
-                    + (selectedColor === color.value && selectedTool !== "eraser"
-                      ? "scale-110 border-zinc-950 ring-2 ring-cyan-400 dark:border-white"
-                      : "border-black/15 dark:border-white/20")
-                  }
-                  style={{ backgroundColor: color.value }}
-                />
-              ))}
-            </div>
-            <span className="mx-0.5 h-6 w-px bg-black/10 dark:bg-white/10" aria-hidden />
-            <div className="flex items-center gap-1">
-              {WHITEBOARD_WIDTHS.map((width) => (
-                <button
-                  key={width.value}
-                  type="button"
-                  aria-pressed={selectedWidth === width.value}
-                  className={
-                    "flex h-8 min-w-9 items-center justify-center rounded-md px-2 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
-                    + (selectedWidth === width.value
-                      ? "bg-cyan-500 text-white dark:bg-cyan-300 dark:text-zinc-950"
-                      : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15")
-                  }
-                  title={width.label + "线条"}
-                  onClick={() => setSelectedWidth(width.value)}
-                >
-                  <span
-                    className="block w-5 rounded-full bg-current"
-                    style={{ height: Math.max(2, width.value / 2) }}
-                    aria-hidden
-                  />
-                </button>
-              ))}
-            </div>
-            <div className="min-w-2 flex-1" />
-            <Button size="sm" radius="sm" variant="light" onPress={undoLastLocalElement} isDisabled={!localElementExists}>
-              撤销
-            </Button>
-            <Button
-              size="sm"
-              radius="sm"
-              variant="light"
-              isDisabled={!selectedObjectId}
-              onPress={() => selectedObjectId && removeObject(selectedObjectId)}
-            >
-              删除所选
-            </Button>
-            <Button size="sm" radius="sm" color="danger" variant="flat" onPress={clearBoard} isDisabled={strokes.length === 0 && objects.length === 0}>
-              清空
-            </Button>
-          </div>
         </div> : null}
 
         <div
@@ -1949,6 +2049,8 @@ function WhiteboardToolButton({
     <button
       type="button"
       aria-pressed={active}
+      aria-label={label}
+      title={label}
       className={
         "flex shrink-0 items-center rounded-md font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
         + (compact
@@ -1961,10 +2063,44 @@ function WhiteboardToolButton({
       onClick={() => onSelect(tool)}
     >
       <ToolGlyph name={tool} />
-      {label}
+      {compact ? label : <span className="hidden sm:inline">{label}</span>}
     </button>
   );
 }
+
+interface WhiteboardMenuTriggerProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  icon: "insert" | "file" | "edit";
+  label: string;
+  active?: boolean;
+}
+
+const WhiteboardMenuTrigger = forwardRef<HTMLButtonElement, WhiteboardMenuTriggerProps>(function WhiteboardMenuTrigger({
+  icon,
+  label,
+  active = false,
+  className = "",
+  ...buttonProps
+}, ref) {
+  return (
+    <button
+      {...buttonProps}
+      ref={ref}
+      type="button"
+      aria-label={label + "菜单"}
+      className={
+        "flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 sm:px-2.5 "
+        + (active
+          ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
+          : "text-zinc-700 hover:bg-black/5 hover:text-zinc-950 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white")
+        + (className ? " " + className : "")
+      }
+    >
+      <ToolGlyph name={icon} />
+      <span className="hidden sm:inline">{label}</span>
+      <MenuChevronGlyph />
+    </button>
+  );
+});
 
 function FlowchartPanel({
   className = "",
@@ -2074,7 +2210,24 @@ function PanelChevronGlyph({ direction }: { direction: "up" | "down" }) {
   );
 }
 
-function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "import" | "export" | "fullscreen" | "collapse" }) {
+function MenuChevronGlyph() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="hidden h-3 w-3 shrink-0 opacity-60 sm:block"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="m4 6 4 4 4-4" />
+    </svg>
+  );
+}
+
+function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "import" | "export" | "fullscreen" | "collapse" | "insert" | "file" | "edit" | "undo" | "delete" | "clear" }) {
   const common = {
     className: "h-4 w-4 shrink-0",
     fill: "none",
@@ -2120,6 +2273,24 @@ function ToolGlyph({ name }: { name: WhiteboardTool | "flow" | "image" | "import
   }
   if (name === "export") {
     return <svg {...common}><path d="M12 16V4m0 0L8 8m4-4l4 4M5 15v5h14v-5" /></svg>;
+  }
+  if (name === "insert") {
+    return <svg {...common}><path d="M12 5v14M5 12h14" /></svg>;
+  }
+  if (name === "file") {
+    return <svg {...common}><path d="M3.5 7.5h17v10a2 2 0 01-2 2h-13a2 2 0 01-2-2v-10zM3.5 7.5V6a2 2 0 012-2h4l2 2h7a2 2 0 012 2" /></svg>;
+  }
+  if (name === "edit") {
+    return <svg {...common}><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6" /></svg>;
+  }
+  if (name === "undo") {
+    return <svg {...common}><path d="M8 7H4v-4M4 7c2-2.5 4.5-3.5 7.5-3 4 .7 7 4.1 7 8.2 0 4.3-3.5 7.8-7.8 7.8H6" /></svg>;
+  }
+  if (name === "delete") {
+    return <svg {...common}><path d="M4 7h16M9 3h6l1 4M7 7l1 14h8l1-14M10 11v6M14 11v6" /></svg>;
+  }
+  if (name === "clear") {
+    return <svg {...common}><path d="M7 18l-3-3 8-10a2 2 0 013 0l4 4a2 2 0 010 3l-6 6H7zM10 18h10" /></svg>;
   }
   if (name === "collapse") {
     return <svg {...common}><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /></svg>;
