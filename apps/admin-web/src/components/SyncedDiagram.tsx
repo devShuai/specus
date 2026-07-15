@@ -276,6 +276,7 @@ interface DiagramRuntime {
 }
 
 interface DiagramSelection {
+  count: number;
   ids: string[];
   label: string;
   isNode: boolean;
@@ -403,6 +404,7 @@ const MAX_DRAWIO_DOCUMENT_BYTES = 8 * 1024 * 1024;
 const STENCIL_PAGE_SIZE = 180;
 const STENCIL_SEARCH_LIMIT = 240;
 const EMPTY_SELECTION: DiagramSelection = {
+  count: 0,
   ids: [],
   label: "",
   isNode: false,
@@ -1060,6 +1062,21 @@ export function SyncedDiagram({
     }
     const connectionHandler = graph.getPlugin<ConnectionHandler>(ConnectionHandler.pluginId);
     if (connectionHandler) {
+      const defaultInsertEdge = connectionHandler.insertEdge.bind(connectionHandler);
+      connectionHandler.insertEdge = (parent, id, value, source, target, style) => {
+        const edgeId = id || createDiagramId(peerId, "edge");
+        const defaults = defaultEdgeStyle();
+        const nextStyle = edgeCellStyle({
+          id: edgeId,
+          label: String(value ?? ""),
+          sourceId: source?.getId() ?? "",
+          targetId: target?.getId() ?? "",
+          zIndex: graph.getChildEdges(parent).length,
+          pageId: activePageId,
+          style: defaults,
+        }, source ?? undefined, target ?? undefined);
+        return defaultInsertEdge(parent, edgeId, value, source, target, { ...nextStyle, ...style });
+      };
       const defaultIsConnectableCell = connectionHandler.isConnectableCell.bind(connectionHandler);
       connectionHandler.isConnectableCell = (cell) => Boolean(connectionHandler.first) && defaultIsConnectableCell(cell);
       connectionHandler.isStartEvent = () => Boolean(
@@ -2724,8 +2741,8 @@ export function SyncedDiagram({
   const addComment = useCallback(async () => {
     if (isReadOnly) return;
     const text = (await requestText({
-      title: selection.ids.length === 1 ? "评论选中元素" : "评论当前页面",
-      message: selection.ids.length === 1
+      title: selection.count === 1 ? "评论选中元素" : "评论当前页面",
+      message: selection.count === 1
         ? "评论会关联到选中的模块或连线，其他协作者可快速定位。"
         : "未选中单个元素，本条评论会关联到当前页面。",
       inputLabel: "评论内容",
@@ -2740,15 +2757,15 @@ export function SyncedDiagram({
     const comment: DiagramComment = {
       id: createDiagramId(peerId, "comment"),
       pageId: activePageId,
-      cellId: selection.ids.length === 1 ? selection.ids[0] : undefined,
+      cellId: selection.count === 1 ? selection.ids[0] : undefined,
       author: peerId,
       text: text.slice(0, 500),
       createdAt: Date.now(),
       resolved: false,
     };
     document.transact(() => map.set(comment.id, comment), GRAPH_ORIGIN);
-    setStatus(selection.ids.length === 1 ? "已为选中元素添加评论。" : "已为当前页面添加评论。");
-  }, [activePageId, isReadOnly, peerId, requestText, selection.ids]);
+    setStatus(selection.count === 1 ? "已为选中元素添加评论。" : "已为当前页面添加评论。");
+  }, [activePageId, isReadOnly, peerId, requestText, selection.count, selection.ids]);
 
   const toggleComment = useCallback((comment: DiagramComment) => {
     if (isReadOnly) return;
@@ -2993,10 +3010,10 @@ export function SyncedDiagram({
   }, [copySelection, duplicateSelection, isReadOnly, pasteSelection, refreshUndoState, removeSelection]);
 
   const totalPeers = Math.max(1, peerCount + 1);
-  const selectedCountLabel = selection.ids.length > 0 ? ` · 已选 ${selection.ids.length}` : "";
+  const selectedCountLabel = selection.count > 0 ? ` · 已选 ${selection.count}` : "";
   const selectionOnlyNodes = selection.isNode && !selection.isEdge;
   const selectionOnlyEdges = selection.isEdge && !selection.isNode;
-  const isSingleNode = selectionOnlyNodes && selection.ids.length === 1;
+  const isSingleNode = selectionOnlyNodes && selection.count === 1;
   const activePageName = pages.find((page) => page.id === activePageId)?.name ?? "页面 1";
   const canvasBackground = theme === "dark" ? "#272729" : "#f5f5f7";
   const gridColor = theme === "dark" ? "rgba(255,255,255,.09)" : "rgba(29,29,31,.09)";
@@ -3117,14 +3134,14 @@ export function SyncedDiagram({
           }} />
           <span className="diagram-apple-separator mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
           <DiagramToolbarMenu
-            label={selection.ids.length > 0 ? `编辑 · ${selection.ids.length}` : "编辑"}
+            label={selection.count > 0 ? `编辑 · ${selection.count}` : "编辑"}
             items={[
-              { key: "copy", label: "复制", shortcut: "⌘C", disabled: selection.ids.length === 0 },
+              { key: "copy", label: "复制", shortcut: "⌘C", disabled: selection.count === 0 },
               { key: "paste", label: "粘贴", shortcut: "⌘V", disabled: isReadOnly },
-              { key: "duplicate", label: "创建副本", shortcut: "⌘D", disabled: isReadOnly || selection.ids.length === 0 },
-              { key: "copy-format", label: "复制格式", disabled: selection.ids.length !== 1 },
-              { key: "apply-format", label: "应用格式", disabled: isReadOnly || !hasCopiedFormat || selection.ids.length === 0 },
-              { key: "delete", label: "删除", shortcut: "Del", disabled: isReadOnly || selection.ids.length === 0, danger: true },
+              { key: "duplicate", label: "创建副本", shortcut: "⌘D", disabled: isReadOnly || selection.count === 0 },
+              { key: "copy-format", label: "复制格式", disabled: selection.count !== 1 },
+              { key: "apply-format", label: "应用格式", disabled: isReadOnly || !hasCopiedFormat || selection.count === 0 },
+              { key: "delete", label: "删除", shortcut: "Del", disabled: isReadOnly || selection.count === 0, danger: true },
             ]}
             onAction={(key) => {
               if (key === "copy") copySelection();
@@ -3138,18 +3155,18 @@ export function SyncedDiagram({
           <DiagramToolbarMenu
             label="排列"
             items={[
-              { key: "group", label: "组合", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "group", label: "组合", disabled: isReadOnly || selection.count < 2 },
               { key: "ungroup", label: "取消组合", disabled: isReadOnly || !selection.isNode },
-              { key: "bring-front", label: "置于顶层", disabled: isReadOnly || selection.ids.length === 0 },
-              { key: "send-back", label: "置于底层", disabled: isReadOnly || selection.ids.length === 0 },
-              { key: "distribute-horizontal", label: "水平等距分布", disabled: isReadOnly || selection.ids.length < 3 },
-              { key: "distribute-vertical", label: "垂直等距分布", disabled: isReadOnly || selection.ids.length < 3 },
-              { key: "align-left", label: "左对齐", disabled: isReadOnly || selection.ids.length < 2 },
-              { key: "align-center", label: "水平居中", disabled: isReadOnly || selection.ids.length < 2 },
-              { key: "align-right", label: "右对齐", disabled: isReadOnly || selection.ids.length < 2 },
-              { key: "align-top", label: "顶部对齐", disabled: isReadOnly || selection.ids.length < 2 },
-              { key: "align-middle", label: "垂直居中", disabled: isReadOnly || selection.ids.length < 2 },
-              { key: "align-bottom", label: "底部对齐", disabled: isReadOnly || selection.ids.length < 2 },
+              { key: "bring-front", label: "置于顶层", disabled: isReadOnly || selection.count === 0 },
+              { key: "send-back", label: "置于底层", disabled: isReadOnly || selection.count === 0 },
+              { key: "distribute-horizontal", label: "水平等距分布", disabled: isReadOnly || selection.count < 3 },
+              { key: "distribute-vertical", label: "垂直等距分布", disabled: isReadOnly || selection.count < 3 },
+              { key: "align-left", label: "左对齐", disabled: isReadOnly || selection.count < 2 },
+              { key: "align-center", label: "水平居中", disabled: isReadOnly || selection.count < 2 },
+              { key: "align-right", label: "右对齐", disabled: isReadOnly || selection.count < 2 },
+              { key: "align-top", label: "顶部对齐", disabled: isReadOnly || selection.count < 2 },
+              { key: "align-middle", label: "垂直居中", disabled: isReadOnly || selection.count < 2 },
+              { key: "align-bottom", label: "底部对齐", disabled: isReadOnly || selection.count < 2 },
               { key: "layout-north", label: "自动布局：上到下", disabled: isReadOnly },
               { key: "layout-east", label: "自动布局：左到右", disabled: isReadOnly },
             ]}
@@ -3613,23 +3630,23 @@ export function SyncedDiagram({
                 role="menu"
                 onPointerDown={(event) => event.stopPropagation()}
               >
-                <ContextMenuAction label="编辑文字" disabled={isReadOnly || selection.ids.length !== 1} onClick={() => {
+                <ContextMenuAction label="编辑文字" disabled={isReadOnly || selection.count !== 1} onClick={() => {
                   withGraph((graph) => graph.startEditingAtCell(graph.getSelectionCell()));
                   setContextMenu(null);
                 }} />
-                <ContextMenuAction label="复制" disabled={selection.ids.length === 0} onClick={() => { copySelection(); setContextMenu(null); }} />
-                <ContextMenuAction label="创建副本" disabled={isReadOnly || selection.ids.length === 0} onClick={() => { duplicateSelection(); setContextMenu(null); }} />
-                <ContextMenuAction label="组合" disabled={isReadOnly || selection.ids.length < 2} onClick={() => { groupSelection(); setContextMenu(null); }} />
+                <ContextMenuAction label="复制" disabled={selection.count === 0} onClick={() => { copySelection(); setContextMenu(null); }} />
+                <ContextMenuAction label="创建副本" disabled={isReadOnly || selection.count === 0} onClick={() => { duplicateSelection(); setContextMenu(null); }} />
+                <ContextMenuAction label="组合" disabled={isReadOnly || selection.count < 2} onClick={() => { groupSelection(); setContextMenu(null); }} />
                 <ContextMenuAction label="取消组合" disabled={isReadOnly || !selection.isNode} onClick={() => { ungroupSelection(); setContextMenu(null); }} />
-                <ContextMenuAction label="置于顶层" disabled={isReadOnly || selection.ids.length === 0} onClick={() => {
+                <ContextMenuAction label="置于顶层" disabled={isReadOnly || selection.count === 0} onClick={() => {
                   withGraph((graph) => graph.orderCells(false));
                   setContextMenu(null);
                 }} />
-                <ContextMenuAction label="置于底层" disabled={isReadOnly || selection.ids.length === 0} onClick={() => {
+                <ContextMenuAction label="置于底层" disabled={isReadOnly || selection.count === 0} onClick={() => {
                   withGraph((graph) => graph.orderCells(true));
                   setContextMenu(null);
                 }} />
-                <ContextMenuAction label="删除" danger disabled={isReadOnly || selection.ids.length === 0} onClick={() => { removeSelection(); setContextMenu(null); }} />
+                <ContextMenuAction label="删除" danger disabled={isReadOnly || selection.count === 0} onClick={() => { removeSelection(); setContextMenu(null); }} />
               </div>
             ) : null}
           </div>
@@ -3647,7 +3664,7 @@ export function SyncedDiagram({
               <span className="flex items-center gap-1.5">
                 <span className="rounded-md bg-black/[0.04] px-1.5 py-1 text-[9px] font-medium text-zinc-500 dark:bg-white/[0.05] dark:text-zinc-400">
                   {inspectorTab === "design"
-                    ? (selection.ids.length > 0 ? `${selection.ids.length} 个元素` : "未选择")
+                    ? (selection.count > 0 ? `${selection.count} 个元素` : "未选择")
                     : inspectorTab === "comments"
                       ? `${comments.filter((comment) => comment.pageId === activePageId).length} 条`
                       : `${versions.length} 个`}
@@ -3664,7 +3681,7 @@ export function SyncedDiagram({
             </div>
             <div className="p-3.5">
             {inspectorTab === "design" ? <fieldset disabled={isReadOnly} className={isReadOnly ? "opacity-60" : undefined}>
-            {selection.ids.length === 0 ? (
+            {selection.count === 0 ? (
               <div className="diagram-apple-empty-state rounded-xl border border-dashed border-black/[0.1] bg-white/60 px-4 py-6 text-center dark:border-white/[0.1] dark:bg-white/[0.025]">
                 <div className="mx-auto grid h-9 w-9 place-items-center rounded-xl bg-zinc-100 text-zinc-400 dark:bg-white/[0.05]">
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 2 9 5-4 1.5L6.5 13z" /><path d="m9 9 3 4" /></svg>
@@ -3674,7 +3691,7 @@ export function SyncedDiagram({
               </div>
             ) : (
               <div className="divide-y divide-black/[0.07] dark:divide-white/[0.08]">
-                {selection.ids.length === 1 ? (
+                {selection.count === 1 ? (
                   <InspectorSection title="内容">
                     <label className="block">
                       <span className="sr-only">元素文字</span>
@@ -4272,6 +4289,7 @@ function updateSelection(graph: Graph, update: (selection: DiagramSelection) => 
   const fontStyle = styleNumber(style.fontStyle, 0);
   const firstKind = isDiagramNodeKind(style.diagramKind) ? style.diagramKind : undefined;
   update({
+    count: cells.length,
     ids: cells.map((cell) => cell.getId()).filter((id): id is string => Boolean(id)),
     label: cells.length === 1 ? String(first.getValue() ?? "") : "",
     isNode: cells.some((cell) => cell.isVertex()),
