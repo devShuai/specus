@@ -2,18 +2,32 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
+  Button,
   Dropdown,
   DropdownItem,
   DropdownMenu,
   DropdownTrigger,
+  Input,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  Textarea,
 } from "@heroui/react";
 import {
   Cell,
   Clipboard,
   ConnectionConstraint,
+  ConnectionHandler,
+  ConnectorShape,
+  EdgeHandler,
+  EllipseShape,
   Graph,
+  getDefaultPlugins,
   gestureUtils,
   HierarchicalLayout,
+  ImageBox,
   ImageExport,
   EdgeHandlerConfig,
   HandleConfig,
@@ -21,12 +35,22 @@ import {
   Outline,
   Point,
   Rectangle,
+  RubberBandHandler,
   SelectionHandler,
+  ShapeRegistry,
   StyleDefaultsConfig,
   SvgCanvas2D,
+  VertexHandler,
   VertexHandlerConfig,
+  VertexHandle,
 } from "@maxgraph/core";
-import type { CellStyle, FitPlugin } from "@maxgraph/core";
+import type {
+  AbstractCanvas2D,
+  CellState,
+  CellStyle,
+  FitPlugin,
+  InternalMouseEvent,
+} from "@maxgraph/core";
 import * as Y from "yjs";
 import "@maxgraph/core/css/common.css";
 import {
@@ -104,16 +128,125 @@ import type {
 import { registerDiagramSemanticShapes, semanticShapeName } from "../lib/diagramSemanticShapes";
 import { useTheme } from "../theme/ThemeContext";
 
-VertexHandlerConfig.selectionColor = "#06b6d4";
+const DIAGRAM_CUBIC_EDGE_SHAPE = "diagramCubicConnector";
+const CUBIC_CONTROL_DEFAULTS = {
+  control1T: 1 / 3,
+  control1N: 0.18,
+  control2T: 2 / 3,
+  control2N: 0.18,
+};
+
+class DiagramCubicConnectorShape extends ConnectorShape {
+  override paintEdgeShape(canvas: AbstractCanvas2D, points: Point[]) {
+    const start = points[0];
+    const end = points[points.length - 1];
+    if (!start || !end) return;
+    const [control1, control2] = cubicControlPointsFromStyle(start, end, this.style);
+    super.paintEdgeShape(canvas, [start, control1, control2, end]);
+  }
+
+  override paintCurvedLine(canvas: AbstractCanvas2D, points: Point[]) {
+    const start = points[0];
+    const control1 = points[1];
+    const control2 = points[points.length - 2];
+    const end = points[points.length - 1];
+    if (!start || !control1 || !control2 || !end) return;
+    canvas.begin();
+    canvas.moveTo(start.x, start.y);
+    canvas.curveTo(control1.x, control1.y, control2.x, control2.y, end.x, end.y);
+    canvas.stroke();
+  }
+}
+
+class DiagramCubicControlHandle extends VertexHandle {
+  controlIndex: 0 | 1;
+
+  constructor(state: CellState, controlIndex: 0 | 1) {
+    super(
+      state,
+      "move",
+      null,
+      new EllipseShape(new Rectangle(0, 0, 11, 11), "#0066cc", "#ffffff", 2),
+    );
+    this.controlIndex = controlIndex;
+  }
+
+  override getPosition(_bounds: Rectangle | null) {
+    const [start, end] = cubicEdgeModelEndpoints(this.state);
+    return cubicControlPointsFromStyle(start, end, this.state.style)[this.controlIndex];
+  }
+
+  override setPosition(_bounds: Rectangle | null, point: Point, _event: InternalMouseEvent) {
+    const [start, end] = cubicEdgeModelEndpoints(this.state);
+    const { t, n } = cubicFactorsForPoint(start, end, point);
+    const style = this.state.style as DiagramCellStyle;
+    if (this.controlIndex === 0) {
+      style.diagramCubicControl1T = t;
+      style.diagramCubicControl1N = n;
+    } else {
+      style.diagramCubicControl2T = t;
+      style.diagramCubicControl2N = n;
+    }
+  }
+
+  override execute(_event: InternalMouseEvent) {
+    const transientStyle = this.state.style as DiagramCellStyle;
+    const style = this.state.cell.getClonedStyle() as DiagramCellStyle;
+    if (this.controlIndex === 0) {
+      style.diagramCubicControl1T = transientStyle.diagramCubicControl1T;
+      style.diagramCubicControl1N = transientStyle.diagramCubicControl1N;
+    } else {
+      style.diagramCubicControl2T = transientStyle.diagramCubicControl2T;
+      style.diagramCubicControl2N = transientStyle.diagramCubicControl2N;
+    }
+    this.graph.getDataModel().setStyle(this.state.cell, style);
+  }
+}
+
+class DiagramCubicEdgeHandler extends EdgeHandler {
+  override isVirtualBendsEnabled() {
+    return false;
+  }
+
+  override isHandleVisible(index: number) {
+    return index === 0 || index === this.abspoints.length - 1;
+  }
+
+  override isAddPointEvent(_event: MouseEvent) {
+    return false;
+  }
+
+  override isRemovePointEvent(_event: MouseEvent) {
+    return false;
+  }
+
+  override createCustomHandles() {
+    return [
+      new DiagramCubicControlHandle(this.state, 0),
+      new DiagramCubicControlHandle(this.state, 1),
+    ];
+  }
+}
+
+ShapeRegistry.add(DIAGRAM_CUBIC_EDGE_SHAPE, DiagramCubicConnectorShape);
+
+VertexHandlerConfig.selectionColor = "#0066cc";
 VertexHandlerConfig.selectionDashed = false;
 VertexHandlerConfig.selectionStrokeWidth = 1.5;
-EdgeHandlerConfig.selectionColor = "#06b6d4";
+VertexHandlerConfig.cursorMovable = "grab";
+VertexHandlerConfig.rotationEnabled = true;
+EdgeHandlerConfig.selectionColor = "#0066cc";
 EdgeHandlerConfig.selectionDashed = false;
 EdgeHandlerConfig.selectionStrokeWidth = 2;
-HandleConfig.size = 7;
+EdgeHandlerConfig.addBendOnShiftClickEnabled = true;
+EdgeHandlerConfig.removeBendOnShiftClickEnabled = true;
+EdgeHandlerConfig.virtualBendsEnabled = true;
+EdgeHandlerConfig.virtualBendOpacity = 36;
+EdgeHandlerConfig.handleShape = "circle";
+HandleConfig.size = 8;
 HandleConfig.fillColor = "#ffffff";
-HandleConfig.strokeColor = "#0891b2";
-HandleConfig.labelFillColor = "#22d3ee";
+HandleConfig.strokeColor = "#0066cc";
+HandleConfig.labelFillColor = "#2997ff";
 StyleDefaultsConfig.shadowColor = "#0f172a";
 StyleDefaultsConfig.shadowOpacity = 0.16;
 StyleDefaultsConfig.shadowOffsetX = 0;
@@ -186,6 +319,22 @@ interface DiagramContextMenu {
   y: number;
 }
 
+type DiagramDialogResult = string | true | null;
+
+interface DiagramDialogRequest {
+  id: number;
+  kind: "confirm" | "text";
+  title: string;
+  message?: string;
+  inputLabel?: string;
+  initialValue?: string;
+  placeholder?: string;
+  maxLength?: number;
+  multiline?: boolean;
+  confirmLabel?: string;
+  tone?: "default" | "danger";
+}
+
 type DiagramEditableStyleKey =
   | "fillColor"
   | "strokeColor"
@@ -229,6 +378,10 @@ type DiagramCellStyle = CellStyle & {
   collapsible?: boolean;
   recursiveResize?: boolean;
   diagramLocked?: boolean;
+  diagramCubicControl1T?: number;
+  diagramCubicControl1N?: number;
+  diagramCubicControl2T?: number;
+  diagramCubicControl2N?: number;
 };
 
 const GRAPH_ORIGIN = Symbol("diagram-graph");
@@ -244,6 +397,7 @@ const DIAGRAM_CANVAS = { width: 2_400, height: 1_600, gridSize: 10 };
 const DIAGRAM_CANVAS_GROWTH = { width: 480, height: 320 };
 const DIAGRAM_CANVAS_PADDING = { width: 280, height: 220 };
 const MAX_DIAGRAM_CANVAS_SIZE = 100_000;
+const DIAGRAM_PORT_IMAGE = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.5" fill="#fff" stroke="#0066cc" stroke-width="2"/></svg>')}`;
 const MAX_DRAWIO_DOCUMENT_BYTES = 8 * 1024 * 1024;
 const STENCIL_PAGE_SIZE = 180;
 const STENCIL_SEARCH_LIMIT = 240;
@@ -505,6 +659,8 @@ export function SyncedDiagram({
   const suppressGraphSyncRef = useRef(false);
   const seenEventsRef = useRef(new Set<string>());
   const lastPeerCountRef = useRef(peerCount);
+  const dialogSequenceRef = useRef(0);
+  const dialogResolverRef = useRef<((result: DiagramDialogResult) => void) | null>(null);
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
 
@@ -541,10 +697,43 @@ export function SyncedDiagram({
   const [localReadOnly, setLocalReadOnly] = useState(false);
   const [isVersionLoading, setIsVersionLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<DiagramContextMenu | null>(null);
+  const [dialogRequest, setDialogRequest] = useState<DiagramDialogRequest | null>(null);
   const [status, setStatus] = useState("专业流程图已就绪，从左侧插入节点后拖动蓝色端口连线。");
   const usesServerVersions = Boolean(roomToken.trim());
   const isRoleReadOnly = roomRole === "VIEWER";
   const isReadOnly = isRoleReadOnly || localReadOnly;
+
+  const openEditorDialog = useCallback((request: Omit<DiagramDialogRequest, "id">) => (
+    new Promise<DiagramDialogResult>((resolve) => {
+      dialogResolverRef.current?.(null);
+      dialogResolverRef.current = resolve;
+      dialogSequenceRef.current += 1;
+      setDialogRequest({ ...request, id: dialogSequenceRef.current });
+    })
+  ), []);
+
+  const resolveEditorDialog = useCallback((result: DiagramDialogResult) => {
+    const resolve = dialogResolverRef.current;
+    dialogResolverRef.current = null;
+    setDialogRequest(null);
+    resolve?.(result);
+  }, []);
+
+  const requestConfirmation = useCallback(async (
+    request: Omit<DiagramDialogRequest, "id" | "kind">,
+  ) => (await openEditorDialog({ ...request, kind: "confirm" })) === true, [openEditorDialog]);
+
+  const requestText = useCallback(async (
+    request: Omit<DiagramDialogRequest, "id" | "kind">,
+  ) => {
+    const result = await openEditorDialog({ ...request, kind: "text" });
+    return typeof result === "string" ? result : null;
+  }, [openEditorDialog]);
+
+  useEffect(() => () => {
+    dialogResolverRef.current?.(null);
+    dialogResolverRef.current = null;
+  }, []);
 
   useEffect(() => {
     canvasSizeRef.current = { ...DIAGRAM_CANVAS };
@@ -842,7 +1031,7 @@ export function SyncedDiagram({
       return;
     }
 
-    const graph = new Graph(container);
+    const graph = new Graph(container, undefined, [...getDefaultPlugins(), RubberBandHandler]);
     graph.getDataModel().prefix = `${peerId}-${Math.random().toString(36).slice(2, 9)}-auto-`;
     graph.setConnectable(!isReadOnly);
     graph.setAllowDanglingEdges(false);
@@ -863,6 +1052,68 @@ export function SyncedDiagram({
     graph.centerZoom = true;
     graph.keepSelectionVisibleOnZoom = true;
     graph.setMinimumGraphSize(new Rectangle(0, 0, canvasSizeRef.current.width, canvasSizeRef.current.height));
+    const rubberBandHandler = graph.getPlugin<RubberBandHandler>(RubberBandHandler.pluginId);
+    if (rubberBandHandler) {
+      rubberBandHandler.defaultOpacity = 14;
+      rubberBandHandler.fadeOut = true;
+    }
+    const connectionHandler = graph.getPlugin<ConnectionHandler>(ConnectionHandler.pluginId);
+    if (connectionHandler) {
+      const defaultIsConnectableCell = connectionHandler.isConnectableCell.bind(connectionHandler);
+      connectionHandler.isConnectableCell = (cell) => Boolean(connectionHandler.first) && defaultIsConnectableCell(cell);
+      connectionHandler.isStartEvent = () => Boolean(
+        connectionHandler.constraintHandler.currentFocus
+        && connectionHandler.constraintHandler.currentConstraint,
+      );
+      connectionHandler.cursorConnect = "crosshair";
+      connectionHandler.livePreview = true;
+      connectionHandler.movePreviewAway = true;
+      connectionHandler.outlineConnect = false;
+      const constraintHandler = connectionHandler.constraintHandler;
+      constraintHandler.pointImage = new ImageBox(DIAGRAM_PORT_IMAGE, 12, 12);
+      const defaultConstraintTolerance = constraintHandler.getTolerance.bind(constraintHandler);
+      constraintHandler.getTolerance = (event) => Math.max(9, defaultConstraintTolerance(event));
+      const defaultSetConstraintFocus = constraintHandler.setFocus.bind(constraintHandler);
+      constraintHandler.setFocus = (event, state, source) => {
+        defaultSetConstraintFocus(event, state, source);
+        constraintHandler.focusIcons.forEach((icon) => {
+          icon.node.style.cursor = "crosshair";
+        });
+      };
+    }
+    const defaultGetCursorForCell = graph.getCursorForCell.bind(graph);
+    graph.getCursorForCell = (cell) => (
+      cell.isVertex() && graph.isCellMovable(cell) ? "grab" : defaultGetCursorForCell(cell)
+    );
+    const defaultCreateHandler = graph.createHandler.bind(graph);
+    graph.createHandler = (state) => {
+      const handler = state.cell.isEdge() && state.style.shape === DIAGRAM_CUBIC_EDGE_SHAPE
+        ? new DiagramCubicEdgeHandler(state)
+        : defaultCreateHandler(state);
+      if (handler instanceof VertexHandler && handler.sizers.length >= 8) {
+        const resizeHandle = handler.sizers[7];
+        const rotationHandle = handler.rotationShape;
+        handler.sizers.forEach((sizer) => {
+          if (sizer !== resizeHandle && sizer !== rotationHandle) sizer.destroy();
+        });
+        handler.sizers = rotationHandle ? [resizeHandle, rotationHandle] : [resizeHandle];
+        handler.labelShape = null;
+        handler.singleSizer = true;
+        handler.manageSizers = false;
+        handler.livePreview = true;
+        handler.movePreviewToFront = true;
+        handler.rotationHandleVSpacing = -24;
+        handler.tolerance = 4;
+        if (rotationHandle) {
+          rotationHandle.fill = "#0066cc";
+          rotationHandle.stroke = "#ffffff";
+          rotationHandle.strokeWidth = 2;
+          rotationHandle.setCursor("grab");
+        }
+        handler.redraw();
+      }
+      return handler;
+    };
     const selectionHandler = graph.getPlugin<SelectionHandler>(SelectionHandler.pluginId);
     if (selectionHandler) {
       selectionHandler.guidesEnabled = true;
@@ -877,9 +1128,14 @@ export function SyncedDiagram({
     };
     const defaultIsCellMovable = graph.isCellMovable.bind(graph);
     const defaultIsCellResizable = graph.isCellResizable.bind(graph);
+    const defaultIsCellRotatable = graph.isCellRotatable.bind(graph);
     const defaultIsCellEditable = graph.isCellEditable.bind(graph);
     graph.isCellMovable = (cell) => !isReadOnly && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellMovable(cell);
     graph.isCellResizable = (cell) => !isReadOnly && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellResizable(cell);
+    graph.isCellRotatable = (cell) => graph.getSelectionCount() === 1
+      && !isReadOnly
+      && !(cell.getStyle() as DiagramCellStyle).diagramLocked
+      && defaultIsCellRotatable(cell);
     graph.isCellEditable = (cell) => !isReadOnly && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellEditable(cell);
 
     let canvasExpansionFrame: number | null = null;
@@ -1020,12 +1276,13 @@ export function SyncedDiagram({
               value: edge.label,
               source,
               target,
-              style: edgeCellStyle(edge),
+              style: edgeCellStyle(edge, source, target),
             });
-            if (edge.waypoints?.length) {
+            const waypoints = edgeWaypointsForGraph(edge);
+            if (waypoints?.length) {
               const geometry = edgeCell.getGeometry()?.clone();
               if (geometry) {
-                geometry.points = edge.waypoints.map((point) => new Point(point.x, point.y));
+                geometry.points = waypoints;
                 graph.getDataModel().setGeometry(edgeCell, geometry);
               }
             }
@@ -1114,6 +1371,49 @@ export function SyncedDiagram({
       graph.destroy();
     };
   }, [activePageId, boardKey, documentEpoch, ensureStencilLibraryLoaded, isFullViewport, isReadOnly, peerId, scheduleDocumentRender, sendPresence]);
+
+  useEffect(() => {
+    const graph = runtimeRef.current?.graph;
+    if (!graph) return;
+    const curvedEdges = graph.getChildEdges(graph.getDefaultParent())
+      .filter((edge) => edgeTypeFromCellStyle(edge.getStyle()) === "curved");
+    if (curvedEdges.length === 0) return;
+    graph.batchUpdate(() => {
+      for (const edge of curvedEdges) {
+        const style = edge.getClonedStyle() as DiagramCellStyle;
+        const geometry = edge.getGeometry()?.clone();
+        const source = edge.getTerminal(true);
+        const target = edge.getTerminal(false);
+        if (!geometry || !source || !target) continue;
+        const existing = geometry.points ?? [];
+        const currentControls = {
+          diagramCubicControl1T: style.diagramCubicControl1T,
+          diagramCubicControl1N: style.diagramCubicControl1N,
+          diagramCubicControl2T: style.diagramCubicControl2T,
+          diagramCubicControl2N: style.diagramCubicControl2N,
+        };
+        const hasCurrentControls = Object.values(currentControls).every((value) => (
+          typeof value === "number" && Number.isFinite(value)
+        ));
+        if (style.shape === DIAGRAM_CUBIC_EDGE_SHAPE && hasCurrentControls && existing.length === 0) {
+          continue;
+        }
+        Object.assign(style, edgeRoutingStyle("curved"));
+        if (hasCurrentControls) {
+          Object.assign(style, currentControls);
+        } else if (existing.length >= 2) {
+          Object.assign(style, cubicControlStyleFromPoints(
+            absoluteCellCenter(source),
+            absoluteCellCenter(target),
+            [existing[0], existing[existing.length - 1]],
+          ));
+        }
+        geometry.points = null;
+        graph.getDataModel().setStyle(edge, style);
+        graph.getDataModel().setGeometry(edge, geometry);
+      }
+    });
+  }, [runtimeEpoch]);
 
   useEffect(() => {
     if (!showMinimap) {
@@ -1263,7 +1563,7 @@ export function SyncedDiagram({
     setStatus(`${page.name}已创建。`);
   }, [isReadOnly, peerId]);
 
-  const renamePage = useCallback(() => {
+  const renamePage = useCallback(async () => {
     if (isReadOnly) return;
     const document = yDocRef.current;
     const pageMap = pagesMapRef.current;
@@ -1271,13 +1571,20 @@ export function SyncedDiagram({
     if (!document || !pageMap || !page) {
       return;
     }
-    const name = window.prompt("页面名称", page.name)?.trim().slice(0, 80);
+    const name = (await requestText({
+      title: "重命名页面",
+      message: "页面名称会同步给当前房间内的协作者。",
+      inputLabel: "页面名称",
+      initialValue: page.name,
+      maxLength: 80,
+      confirmLabel: "保存",
+    }))?.trim().slice(0, 80);
     if (!name || name === page.name) {
       return;
     }
     document.transact(() => pageMap.set(page.id, { ...page, name }), GRAPH_ORIGIN);
     setStatus(`页面已重命名为“${name}”。`);
-  }, [activePageId, isReadOnly]);
+  }, [activePageId, isReadOnly, requestText]);
 
   const duplicatePage = useCallback(() => {
     if (isReadOnly) return;
@@ -1323,7 +1630,7 @@ export function SyncedDiagram({
     setStatus(`已复制页面“${sourcePage.name}”。`);
   }, [activePageId, isReadOnly, peerId]);
 
-  const deletePage = useCallback(() => {
+  const deletePage = useCallback(async () => {
     if (isReadOnly) return;
     const document = yDocRef.current;
     const pageMap = pagesMapRef.current;
@@ -1338,7 +1645,12 @@ export function SyncedDiagram({
       setStatus("流程图至少需要保留一个页面。可使用清空删除页面内容。");
       return;
     }
-    if (!window.confirm(`确定删除页面“${page.name}”及其中全部内容吗？`)) {
+    if (!await requestConfirmation({
+      title: "删除页面",
+      message: `“${page.name}”中的模块、连线和评论都会一并删除。`,
+      confirmLabel: "删除页面",
+      tone: "danger",
+    })) {
       return;
     }
     const nextPage = pages.find((candidate) => candidate.id !== activePageId);
@@ -1356,7 +1668,7 @@ export function SyncedDiagram({
     }, GRAPH_ORIGIN);
     setActivePageId(nextPage?.id ?? DEFAULT_PAGE_ID);
     setStatus(`页面“${page.name}”已删除。`);
-  }, [activePageId, isReadOnly, pages]);
+  }, [activePageId, isReadOnly, pages, requestConfirmation]);
 
   const insertNodeIntoGraph = useCallback((
     graph: Graph,
@@ -1560,7 +1872,7 @@ export function SyncedDiagram({
               targetPort: definition.targetPort,
               zIndex: currentNodeCount + template.nodes.length + index,
               style,
-            }),
+            }, source, target),
           });
           graph.setConnectionConstraint(edge, source, true, constraintForPort(definition.sourcePort));
           graph.setConnectionConstraint(edge, target, false, constraintForPort(definition.targetPort));
@@ -1704,18 +2016,44 @@ export function SyncedDiagram({
       }
       graph.batchUpdate(() => {
         for (const edge of edges) {
-          const style = edge.getClonedStyle();
+          const style = edge.getClonedStyle() as DiagramCellStyle;
           delete style.edgeStyle;
           delete style.elbow;
           delete style.curved;
           delete style.orthogonalLoop;
           delete style.jettySize;
+          delete style.noEdgeStyle;
+          if (style.shape === DIAGRAM_CUBIC_EDGE_SHAPE) delete style.shape;
+          delete style.diagramCubicControl1T;
+          delete style.diagramCubicControl1N;
+          delete style.diagramCubicControl2T;
+          delete style.diagramCubicControl2N;
           Object.assign(style, edgeRoutingStyle(edgeType));
+          if (edgeType === "curved") {
+            const geometry = edge.getGeometry()?.clone();
+            const source = edge.getTerminal(true);
+            const target = edge.getTerminal(false);
+            if (geometry && source && target) {
+              const existing = geometry.points ?? [];
+              const controls = existing.length >= 2
+                ? [existing[0], existing[existing.length - 1]]
+                : defaultCubicControlPoints(graph, source, target);
+              Object.assign(style, cubicControlStyleFromPoints(
+                absoluteCellCenter(source),
+                absoluteCellCenter(target),
+                controls,
+              ));
+              geometry.points = null;
+              graph.getDataModel().setGeometry(edge, geometry);
+            }
+          }
           graph.getDataModel().setStyle(edge, style);
         }
       });
       updateSelection(graph, setSelection);
-      setStatus(`已切换 ${edges.length} 条连线的路由样式。`);
+      setStatus(edgeType === "curved"
+        ? `已切换 ${edges.length} 条连线为三阶贝塞尔曲线。`
+        : `已切换 ${edges.length} 条连线的路由样式。`);
     });
   }, [withGraph]);
 
@@ -1750,6 +2088,18 @@ export function SyncedDiagram({
           const sourceCenter = absoluteCellCenter(source);
           const targetCenter = absoluteCellCenter(target);
           const existing = geometry.points?.slice() ?? [];
+          if (edgeTypeFromCellStyle(edge.getStyle()) === "curved") {
+            const style = edge.getClonedStyle() as DiagramCellStyle;
+            Object.assign(style, cubicControlStyleFromPoints(
+              sourceCenter,
+              targetCenter,
+              defaultCubicControlPoints(graph, source, target),
+            ));
+            geometry.points = null;
+            graph.getDataModel().setStyle(edge, style);
+            graph.getDataModel().setGeometry(edge, geometry);
+            continue;
+          }
           const previous = existing[existing.length - 1] ?? sourceCenter;
           existing.push(new Point(
             graph.snap((previous.x + targetCenter.x) / 2),
@@ -1759,7 +2109,9 @@ export function SyncedDiagram({
           graph.getDataModel().setGeometry(edge, geometry);
         }
       });
-      setStatus("已添加可拖动折点；也可按住 Shift 点击连线添加或删除折点。");
+      setStatus(edges.every((edge) => edgeTypeFromCellStyle(edge.getStyle()) === "curved")
+        ? "已重置三阶贝塞尔的两个控制点。"
+        : "已添加可拖动折点；也可按住 Shift 点击连线添加或删除折点。");
     });
   }, [withGraph]);
 
@@ -1769,13 +2121,21 @@ export function SyncedDiagram({
       graph.batchUpdate(() => {
         for (const edge of edges) {
           const geometry = edge.getGeometry()?.clone();
+          if (edgeTypeFromCellStyle(edge.getStyle()) === "curved") {
+            const style = edge.getClonedStyle() as DiagramCellStyle;
+            style.diagramCubicControl1T = CUBIC_CONTROL_DEFAULTS.control1T;
+            style.diagramCubicControl1N = 0;
+            style.diagramCubicControl2T = CUBIC_CONTROL_DEFAULTS.control2T;
+            style.diagramCubicControl2N = 0;
+            graph.getDataModel().setStyle(edge, style);
+          }
           if (geometry) {
             geometry.points = null;
             graph.getDataModel().setGeometry(edge, geometry);
           }
         }
       });
-      setStatus(`已清除 ${edges.length} 条连线的手动折点。`);
+      setStatus(`已清除 ${edges.length} 条连线的控制点。`);
     });
   }, [withGraph]);
 
@@ -2049,16 +2409,25 @@ export function SyncedDiagram({
     });
   }, [withGraph]);
 
-  const removeLane = useCallback(() => {
+  const removeLane = useCallback(async () => {
+    const currentGraph = runtimeRef.current?.graph;
+    const selectedLane = currentGraph?.getSelectionCell();
+    const laneId = selectedLane?.getId();
+    if (!currentGraph || !selectedLane || !laneId
+      || (selectedLane.getStyle() as DiagramCellStyle).diagramKind !== "lane") return;
+    const childCount = currentGraph.getChildVertices(selectedLane).length;
+    if (!await requestConfirmation({
+      title: "删除泳道",
+      message: childCount > 0
+        ? `该泳道包含 ${childCount} 个模块，删除泳道会同时删除这些模块。`
+        : "当前泳道将从流程图中移除。",
+      confirmLabel: "删除泳道",
+      tone: "danger",
+    })) return;
     withGraph((graph) => {
-      const lane = graph.getSelectionCell();
+      const lane = graph.getDataModel().getCell(laneId);
       if (!lane || (lane.getStyle() as DiagramCellStyle).diagramKind !== "lane") return;
       const pool = lane.getParent();
-      const childCount = graph.getChildVertices(lane).length;
-      const message = childCount > 0
-        ? `该泳道包含 ${childCount} 个节点，删除后节点也会删除。是否继续？`
-        : "确定删除当前泳道吗？";
-      if (!window.confirm(message)) return;
       graph.batchUpdate(() => {
         graph.removeCells([lane], true);
         if (pool) layoutLaneCells(graph, pool);
@@ -2066,7 +2435,7 @@ export function SyncedDiagram({
       updateSelection(graph, setSelection);
       setStatus("泳道已删除。");
     });
-  }, [withGraph]);
+  }, [requestConfirmation, withGraph]);
 
   const commitSelectionLabel = useCallback((label: string) => {
     withGraph((graph) => {
@@ -2080,13 +2449,22 @@ export function SyncedDiagram({
     });
   }, [withGraph]);
 
-  const clearDiagram = useCallback(() => {
+  const clearDiagram = useCallback(async () => {
+    const currentGraph = runtimeRef.current?.graph;
+    const currentParent = currentGraph?.getDefaultParent();
+    const currentCells = currentGraph && currentParent
+      ? [...currentGraph.getChildEdges(currentParent), ...currentGraph.getChildVertices(currentParent)]
+      : [];
+    if (currentCells.length === 0 || !await requestConfirmation({
+      title: "清空当前页面",
+      message: "当前页面中的全部模块、连线和评论都会被清除。此操作可以撤销。",
+      confirmLabel: "清空页面",
+      tone: "danger",
+    })) return;
     withGraph((graph) => {
       const parent = graph.getDefaultParent();
       const cells = [...graph.getChildEdges(parent), ...graph.getChildVertices(parent)];
-      if (cells.length === 0 || !window.confirm("确定清空当前流程图吗？此操作可以撤销。")) {
-        return;
-      }
+      if (cells.length === 0) return;
       graph.removeCells(cells, true);
       const document = yDocRef.current;
       const commentsMap = commentsMapRef.current;
@@ -2099,7 +2477,7 @@ export function SyncedDiagram({
       }
       setStatus("流程图已清空，可使用撤销恢复。");
     });
-  }, [activePageId, withGraph]);
+  }, [activePageId, requestConfirmation, withGraph]);
 
   const exportDiagram = useCallback(() => {
     flushGraphRef.current();
@@ -2291,7 +2669,12 @@ export function SyncedDiagram({
         else imported = parseDiagramDocument(source);
       }
       if ((nodeCount > 0 || edgeCount > 0)
-        && !window.confirm("导入将替换当前流程图并同步给房间内设备。是否继续？")) {
+        && !await requestConfirmation({
+          title: "替换当前流程图",
+          message: `导入“${file.name}”会替换当前流程图，并立即同步给房间内设备。`,
+          confirmLabel: "导入并替换",
+          tone: "danger",
+        })) {
         setStatus("已取消导入，当前流程图未变化。");
         return;
       }
@@ -2333,11 +2716,21 @@ export function SyncedDiagram({
     } finally {
       setIsImporting(false);
     }
-  }, [edgeCount, isReadOnly, nodeCount, refreshUndoState]);
+  }, [edgeCount, isReadOnly, nodeCount, refreshUndoState, requestConfirmation]);
 
-  const addComment = useCallback(() => {
+  const addComment = useCallback(async () => {
     if (isReadOnly) return;
-    const text = window.prompt("输入评论内容（最多 500 字）")?.trim();
+    const text = (await requestText({
+      title: selection.ids.length === 1 ? "评论选中元素" : "评论当前页面",
+      message: selection.ids.length === 1
+        ? "评论会关联到选中的模块或连线，其他协作者可快速定位。"
+        : "未选中单个元素，本条评论会关联到当前页面。",
+      inputLabel: "评论内容",
+      placeholder: "写下问题、建议或待确认事项",
+      maxLength: 500,
+      multiline: true,
+      confirmLabel: "添加评论",
+    }))?.trim();
     const map = commentsMapRef.current;
     const document = yDocRef.current;
     if (!text || !map || !document) return;
@@ -2352,7 +2745,7 @@ export function SyncedDiagram({
     };
     document.transact(() => map.set(comment.id, comment), GRAPH_ORIGIN);
     setStatus(selection.ids.length === 1 ? "已为选中元素添加评论。" : "已为当前页面添加评论。");
-  }, [activePageId, isReadOnly, peerId, selection.ids]);
+  }, [activePageId, isReadOnly, peerId, requestText, selection.ids]);
 
   const toggleComment = useCallback((comment: DiagramComment) => {
     if (isReadOnly) return;
@@ -2388,12 +2781,19 @@ export function SyncedDiagram({
 
   const createVersion = useCallback(async () => {
     if (isRoleReadOnly) return;
+    const createdAt = Date.now();
+    const name = (await requestText({
+      title: "创建版本快照",
+      message: "保存当前全部页面，之后可从版本列表恢复。",
+      inputLabel: "版本名称",
+      initialValue: `版本 ${versionsRef.current.length + 1}`,
+      maxLength: 80,
+      confirmLabel: "创建快照",
+    }))?.trim();
+    if (!name) return;
     flushGraphRef.current();
     const document = yDocRef.current;
     if (!document) return;
-    const createdAt = Date.now();
-    const name = window.prompt("版本名称", `版本 ${versionsRef.current.length + 1}`)?.trim();
-    if (!name) return;
     const update = Y.encodeStateAsUpdate(document);
     setIsVersionLoading(true);
     try {
@@ -2423,10 +2823,15 @@ export function SyncedDiagram({
     } finally {
       setIsVersionLoading(false);
     }
-  }, [isRoleReadOnly, peerId, roomId, roomToken, usesServerVersions]);
+  }, [isRoleReadOnly, peerId, requestText, roomId, roomToken, usesServerVersions]);
 
   const restoreVersion = useCallback(async (snapshot: DiagramVersionSnapshot) => {
-    if (isReadOnly || !window.confirm(`恢复到“${snapshot.name}”会替换当前流程图，是否继续？`)) return;
+    if (isReadOnly || !await requestConfirmation({
+      title: "恢复流程图版本",
+      message: `恢复到“${snapshot.name}”会替换当前流程图中的全部页面。`,
+      confirmLabel: "恢复版本",
+      tone: "danger",
+    })) return;
     const document = yDocRef.current;
     const nodes = nodesMapRef.current;
     const edges = edgesMapRef.current;
@@ -2470,11 +2875,16 @@ export function SyncedDiagram({
       probe.destroy();
       setIsVersionLoading(false);
     }
-  }, [isReadOnly, peerId, roomId, roomToken]);
+  }, [isReadOnly, peerId, requestConfirmation, roomId, roomToken]);
 
   const deleteVersion = useCallback(async (snapshot: DiagramVersionSnapshot) => {
     if (roomRole !== "OWNER" || snapshot.serverId === undefined) return;
-    if (!window.confirm(`删除版本“${snapshot.name}”后无法恢复，是否继续？`)) return;
+    if (!await requestConfirmation({
+      title: "删除版本快照",
+      message: `“${snapshot.name}”删除后无法恢复。`,
+      confirmLabel: "删除版本",
+      tone: "danger",
+    })) return;
     setIsVersionLoading(true);
     try {
       await publicDeleteTransferDiagramVersion(roomId, snapshot.serverId, { roomToken, peerId });
@@ -2486,7 +2896,7 @@ export function SyncedDiagram({
     } finally {
       setIsVersionLoading(false);
     }
-  }, [peerId, roomId, roomRole, roomToken]);
+  }, [peerId, requestConfirmation, roomId, roomRole, roomToken]);
 
   const openContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -3388,7 +3798,7 @@ export function SyncedDiagram({
                       <InspectorSelectField
                         label="路由方式"
                         value={selection.edgeType ?? "orthogonal"}
-                        options={[{ value: "orthogonal", label: "正交" }, { value: "straight", label: "直线" }, { value: "elbow", label: "折线" }, { value: "curved", label: "曲线" }]}
+                        options={[{ value: "orthogonal", label: "正交" }, { value: "straight", label: "直线" }, { value: "elbow", label: "折线" }, { value: "curved", label: "三阶贝塞尔" }]}
                         onChange={updateEdgeType}
                       />
                       <div className="grid grid-cols-2 gap-2">
@@ -3408,8 +3818,8 @@ export function SyncedDiagram({
                         <InspectorNumberField label="终点大小" value={selection.endSize} min={4} max={40} suffix="px" onCommit={(value) => updateSelectedStyle("endSize", value)} />
                       </div>
                       <div className="grid grid-cols-2 gap-1.5 pt-1">
-                        <InspectorAction label="新增折点" onClick={addEdgeWaypoint} />
-                        <InspectorAction label="清除折点" onClick={clearEdgeWaypoints} />
+                        <InspectorAction label={selection.edgeType === "curved" ? "重置控制点" : "新增折点"} onClick={addEdgeWaypoint} />
+                        <InspectorAction label={selection.edgeType === "curved" ? "拉直曲线" : "清除折点"} onClick={clearEdgeWaypoints} />
                       </div>
                     </div>
                   </InspectorSection>
@@ -3521,6 +3931,14 @@ export function SyncedDiagram({
           </div>
         ) : null}
 
+        {dialogRequest ? (
+          <DiagramEditorDialog
+            key={dialogRequest.id}
+            request={dialogRequest}
+            onResolve={resolveEditorDialog}
+          />
+        ) : null}
+
         <div className="diagram-apple-status flex h-8 shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/[0.07] bg-white/95 px-3 text-[9px] text-zinc-500 dark:border-white/[0.08] dark:bg-[#11161e]/95 dark:text-zinc-400">
           <span className="flex min-w-0 items-center gap-2 truncate"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} />{status}</span>
           <span className="hidden shrink-0 items-center gap-3 font-mono sm:flex"><span>{activePageName}</span><span>{nodeCount} nodes</span><span>{edgeCount} edges{selectedCountLabel}</span></span>
@@ -3530,6 +3948,129 @@ export function SyncedDiagram({
   );
 
   return isFullViewport ? createPortal(diagram, window.document.body) : diagram;
+}
+
+function DiagramEditorDialog({
+  request,
+  onResolve,
+}: {
+  request: DiagramDialogRequest;
+  onResolve: (result: DiagramDialogResult) => void;
+}) {
+  const [value, setValue] = useState(request.initialValue ?? "");
+  const canSubmit = request.kind === "confirm" || value.trim().length > 0;
+  const submit = () => {
+    if (!canSubmit) return;
+    onResolve(request.kind === "text" ? value : true);
+  };
+
+  return (
+    <Modal
+      isOpen
+      backdrop="blur"
+      placement="center"
+      scrollBehavior="inside"
+      onClose={() => onResolve(null)}
+      classNames={{
+        wrapper: "!z-[220] px-4 py-6",
+        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+        base: "diagram-apple-dialog max-h-[min(86dvh,620px)] max-w-[440px] overflow-hidden rounded-2xl border border-black/[0.10] bg-white/95 text-zinc-950 shadow-[0_28px_80px_rgba(15,23,42,0.28)] backdrop-blur-2xl dark:border-white/[0.12] dark:bg-[#171c24]/95 dark:text-zinc-50",
+        closeButton: "text-zinc-500 dark:text-zinc-300",
+      }}
+    >
+      <ModalContent>
+        <form onSubmit={(event) => { event.preventDefault(); submit(); }}>
+          <ModalHeader className="flex flex-col gap-1 border-b border-black/[0.07] px-5 pb-4 pt-5 dark:border-white/[0.08]">
+            <span className={`text-[10px] font-semibold uppercase ${request.tone === "danger"
+              ? "text-red-600 dark:text-red-300"
+              : "text-[#0066cc] dark:text-[#2997ff]"}`}>专业编辑器</span>
+            <span className="pr-8 text-[17px] font-semibold text-zinc-950 dark:text-white">{request.title}</span>
+          </ModalHeader>
+          <ModalBody className="gap-4 px-5 py-5">
+            {request.message ? (
+              <p className="text-[13px] leading-5 text-zinc-600 dark:text-zinc-300">{request.message}</p>
+            ) : null}
+            {request.kind === "text" ? (
+              <div>
+                {request.multiline ? (
+                  <Textarea
+                    autoFocus
+                    label={request.inputLabel}
+                    labelPlacement="outside"
+                    placeholder={request.placeholder}
+                    value={value}
+                    minRows={4}
+                    maxRows={9}
+                    maxLength={request.maxLength}
+                    radius="sm"
+                    variant="bordered"
+                    classNames={{
+                      label: "pb-1 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200",
+                      input: "text-[13px] leading-5 text-zinc-950 dark:text-zinc-50",
+                      inputWrapper: "border-black/[0.12] bg-zinc-50/80 shadow-none data-[focus=true]:border-[#0066cc] dark:border-white/[0.14] dark:bg-black/20 dark:data-[focus=true]:border-[#2997ff]",
+                    }}
+                    onValueChange={setValue}
+                    onKeyDown={(event) => {
+                      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                        event.preventDefault();
+                        submit();
+                      }
+                    }}
+                  />
+                ) : (
+                  <Input
+                    autoFocus
+                    label={request.inputLabel}
+                    labelPlacement="outside"
+                    placeholder={request.placeholder}
+                    value={value}
+                    maxLength={request.maxLength}
+                    radius="sm"
+                    variant="bordered"
+                    classNames={{
+                      label: "pb-1 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200",
+                      input: "text-[13px] text-zinc-950 dark:text-zinc-50",
+                      inputWrapper: "border-black/[0.12] bg-zinc-50/80 shadow-none data-[focus=true]:border-[#0066cc] dark:border-white/[0.14] dark:bg-black/20 dark:data-[focus=true]:border-[#2997ff]",
+                    }}
+                    onValueChange={setValue}
+                  />
+                )}
+                {request.maxLength ? (
+                  <p className="mt-1.5 text-right font-mono text-[9px] text-zinc-400" aria-live="polite">
+                    {value.length}/{request.maxLength}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+          </ModalBody>
+          <ModalFooter className="gap-2 border-t border-black/[0.07] bg-zinc-50/70 px-5 py-3 dark:border-white/[0.08] dark:bg-black/15">
+            <Button
+              type="button"
+              size="sm"
+              radius="sm"
+              variant="light"
+              className="font-semibold text-zinc-600 hover:bg-black/[0.05] dark:text-zinc-300 dark:hover:bg-white/[0.07]"
+              onPress={() => onResolve(null)}
+            >
+              取消
+            </Button>
+            <Button
+              type="submit"
+              size="sm"
+              radius="sm"
+              color={request.tone === "danger" ? "danger" : "primary"}
+              isDisabled={!canSubmit}
+              className={request.tone === "danger"
+                ? "font-semibold shadow-none"
+                : "bg-[#0066cc] font-semibold text-white shadow-none hover:bg-[#005bb5] dark:bg-[#2997ff] dark:text-[#07111e] dark:hover:bg-[#58aaff]"}
+            >
+              {request.confirmLabel ?? (request.kind === "text" ? "确定" : "继续")}
+            </Button>
+          </ModalFooter>
+        </form>
+      </ModalContent>
+    </Modal>
+  );
 }
 
 function readGraphDocument(graph: Graph, pageId = DEFAULT_PAGE_ID): Pick<DiagramDocumentV1, "nodes" | "edges"> {
@@ -3596,12 +4137,22 @@ function readGraphDocument(graph: Graph, pageId = DEFAULT_PAGE_ID): Pick<Diagram
   const nodeIds = new Set(nodes.map((node) => node.id));
   const edges = edgeCells.flatMap(({ cell, zIndex }): DiagramEdge[] => {
     const id = cell.getId();
-    const sourceId = cell.getTerminal(true)?.getId();
-    const targetId = cell.getTerminal(false)?.getId();
+    const sourceCell = cell.getTerminal(true);
+    const targetCell = cell.getTerminal(false);
+    const sourceId = sourceCell?.getId();
+    const targetId = targetCell?.getId();
     if (!id || !sourceId || !targetId || !nodeIds.has(sourceId) || !nodeIds.has(targetId)) {
       return [];
     }
-    const style = cell.getStyle();
+    const style = cell.getStyle() as DiagramCellStyle;
+    const edgeType = edgeTypeFromCellStyle(style);
+    const controlPoints = edgeType === "curved" && sourceCell && targetCell
+      ? cubicControlPointsFromStyle(
+        new Point(absoluteCellCenter(sourceCell).x, absoluteCellCenter(sourceCell).y),
+        new Point(absoluteCellCenter(targetCell).x, absoluteCellCenter(targetCell).y),
+        style,
+      )
+      : cell.getGeometry()?.points?.slice(0, 128) ?? [];
     return [{
       id,
       label: String(cell.getValue() ?? "").slice(0, 500),
@@ -3609,8 +4160,8 @@ function readGraphDocument(graph: Graph, pageId = DEFAULT_PAGE_ID): Pick<Diagram
       targetId,
       sourcePort: portFromStyle(style, true),
       targetPort: portFromStyle(style, false),
-      ...(cell.getGeometry()?.points?.length ? {
-        waypoints: cell.getGeometry()!.points!.slice(0, 128).map((point) => ({ x: point.x, y: point.y })),
+      ...(controlPoints.length ? {
+        waypoints: controlPoints.map((point) => ({ x: point.x, y: point.y })),
       } : {}),
       zIndex,
       pageId,
@@ -3623,7 +4174,7 @@ function readGraphDocument(graph: Graph, pageId = DEFAULT_PAGE_ID): Pick<Diagram
         strokeWidth: styleNumber(style.strokeWidth, 2),
         dashed: Boolean(style.dashed),
         linePattern: linePatternFromStyle(style),
-        edgeType: edgeTypeFromCellStyle(style),
+        edgeType,
         startArrow: arrowTypeFromStyle(style.startArrow, "none"),
         endArrow: arrowTypeFromStyle(style.endArrow, "block"),
         startSize: clampNumber(styleNumber(style.startSize, 8), 4, 40),
@@ -3913,11 +4464,14 @@ function nodeCellStyle(node: DiagramNode, optimizeLargeGraph = false): DiagramCe
   return base;
 }
 
-function edgeCellStyle(edge: DiagramEdge): CellStyle {
-  const source = portCoordinates(edge.sourcePort);
-  const target = portCoordinates(edge.targetPort);
+function edgeCellStyle(edge: DiagramEdge, sourceCell?: Cell, targetCell?: Cell): CellStyle {
+  const sourcePort = portCoordinates(edge.sourcePort);
+  const targetPort = portCoordinates(edge.targetPort);
   return {
     ...edgeRoutingStyle(edge.style.edgeType ?? "orthogonal"),
+    ...(edge.style.edgeType === "curved"
+      ? cubicControlStyleForEdge(edge, sourceCell, targetCell)
+      : {}),
     rounded: true,
     orthogonalLoop: true,
     jettySize: "auto",
@@ -3938,11 +4492,11 @@ function edgeCellStyle(edge: DiagramEdge): CellStyle {
     dashPattern: dashPatternForLinePattern(edge.style.linePattern),
     opacity: edge.style.opacity ?? 100,
     labelBackgroundColor: edge.style.labelBackgroundColor ?? "#ffffff",
-    exitX: source?.x,
-    exitY: source?.y,
+    exitX: sourcePort?.x,
+    exitY: sourcePort?.y,
     exitPerimeter: true,
-    entryX: target?.x,
-    entryY: target?.y,
+    entryX: targetPort?.x,
+    entryY: targetPort?.y,
     entryPerimeter: true,
   };
 }
@@ -4314,7 +4868,15 @@ function createNodeDragPreview(
 function edgeRoutingStyle(type: DiagramEdgeType): CellStyle {
   if (type === "straight") return { edgeStyle: "none", curved: false };
   if (type === "elbow") return { edgeStyle: "elbowEdgeStyle", elbow: "horizontal", curved: false };
-  if (type === "curved") return { edgeStyle: "orthogonalEdgeStyle", curved: true };
+  if (type === "curved") return {
+    edgeStyle: "none",
+    curved: true,
+    shape: DIAGRAM_CUBIC_EDGE_SHAPE,
+    diagramCubicControl1T: CUBIC_CONTROL_DEFAULTS.control1T,
+    diagramCubicControl1N: CUBIC_CONTROL_DEFAULTS.control1N,
+    diagramCubicControl2T: CUBIC_CONTROL_DEFAULTS.control2T,
+    diagramCubicControl2N: CUBIC_CONTROL_DEFAULTS.control2N,
+  } as DiagramCellStyle;
   return { edgeStyle: "orthogonalEdgeStyle", orthogonalLoop: true, jettySize: "auto", curved: false };
 }
 
@@ -4373,6 +4935,98 @@ function absoluteCellCenter(cell: Cell) {
     x: origin.x + (geometry?.width ?? 0) / 2,
     y: origin.y + (geometry?.height ?? 0) / 2,
   };
+}
+
+function cubicControlPointsFromStyle(
+  start: Point,
+  end: Point,
+  style?: CellStyle | null,
+) {
+  const cubicStyle = style as DiagramCellStyle | undefined;
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const point = (t: number, n: number) => new Point(
+    start.x + deltaX * t - deltaY * n,
+    start.y + deltaY * t + deltaX * n,
+  );
+  return [
+    point(
+      styleNumber(cubicStyle?.diagramCubicControl1T, CUBIC_CONTROL_DEFAULTS.control1T),
+      styleNumber(cubicStyle?.diagramCubicControl1N, CUBIC_CONTROL_DEFAULTS.control1N),
+    ),
+    point(
+      styleNumber(cubicStyle?.diagramCubicControl2T, CUBIC_CONTROL_DEFAULTS.control2T),
+      styleNumber(cubicStyle?.diagramCubicControl2N, CUBIC_CONTROL_DEFAULTS.control2N),
+    ),
+  ];
+}
+
+function cubicFactorsForPoint(start: Point, end: Point, point: Point) {
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const lengthSquared = Math.max(1, deltaX * deltaX + deltaY * deltaY);
+  const relativeX = point.x - start.x;
+  const relativeY = point.y - start.y;
+  return {
+    t: clampNumber((relativeX * deltaX + relativeY * deltaY) / lengthSquared, -4, 4),
+    n: clampNumber((-relativeX * deltaY + relativeY * deltaX) / lengthSquared, -4, 4),
+  };
+}
+
+function cubicControlStyleFromPoints(start: { x: number; y: number }, end: { x: number; y: number }, points: Point[]) {
+  const first = cubicFactorsForPoint(new Point(start.x, start.y), new Point(end.x, end.y), points[0]);
+  const second = cubicFactorsForPoint(new Point(start.x, start.y), new Point(end.x, end.y), points[1]);
+  return {
+    diagramCubicControl1T: first.t,
+    diagramCubicControl1N: first.n,
+    diagramCubicControl2T: second.t,
+    diagramCubicControl2N: second.n,
+  } satisfies Partial<DiagramCellStyle>;
+}
+
+function cubicControlStyleForEdge(edge: DiagramEdge, source?: Cell, target?: Cell) {
+  if (source && target && edge.waypoints && edge.waypoints.length >= 2) {
+    return cubicControlStyleFromPoints(
+      absoluteCellCenter(source),
+      absoluteCellCenter(target),
+      [
+        new Point(edge.waypoints[0].x, edge.waypoints[0].y),
+        new Point(edge.waypoints[edge.waypoints.length - 1].x, edge.waypoints[edge.waypoints.length - 1].y),
+      ],
+    );
+  }
+  return {
+    diagramCubicControl1T: CUBIC_CONTROL_DEFAULTS.control1T,
+    diagramCubicControl1N: CUBIC_CONTROL_DEFAULTS.control1N,
+    diagramCubicControl2T: CUBIC_CONTROL_DEFAULTS.control2T,
+    diagramCubicControl2N: CUBIC_CONTROL_DEFAULTS.control2N,
+  } satisfies Partial<DiagramCellStyle>;
+}
+
+function cubicEdgeModelEndpoints(state: CellState): [Point, Point] {
+  const scale = Math.max(0.0001, state.view.scale);
+  const translate = state.view.translate;
+  const first = state.absolutePoints[0] ?? new Point(state.x, state.y);
+  const last = state.absolutePoints[state.absolutePoints.length - 1] ?? new Point(state.x + state.width, state.y + state.height);
+  return [
+    new Point(first.x / scale - translate.x, first.y / scale - translate.y),
+    new Point(last.x / scale - translate.x, last.y / scale - translate.y),
+  ];
+}
+
+function edgeWaypointsForGraph(edge: DiagramEdge) {
+  if (edge.style.edgeType === "curved") return undefined;
+  return edge.waypoints?.map((point) => new Point(point.x, point.y));
+}
+
+function defaultCubicControlPoints(graph: Graph, source: Cell, target: Cell) {
+  const sourceCenter = absoluteCellCenter(source);
+  const targetCenter = absoluteCellCenter(target);
+  return cubicControlPointsFromStyle(
+    new Point(sourceCenter.x, sourceCenter.y),
+    new Point(targetCenter.x, targetCenter.y),
+    edgeRoutingStyle("curved"),
+  ).map((point) => new Point(graph.snap(point.x), graph.snap(point.y)));
 }
 
 function constraintForPort(port?: DiagramPort) {
@@ -4588,12 +5242,13 @@ function renderDiagramPageSvg(nodes: DiagramNode[], edges: DiagramEdge[], pageId
           value: edge.label,
           source,
           target,
-          style: edgeCellStyle(edge),
+          style: edgeCellStyle(edge, source, target),
         });
-        if (edge.waypoints?.length) {
+        const waypoints = edgeWaypointsForGraph(edge);
+        if (waypoints?.length) {
           const geometry = edgeCell.getGeometry()?.clone();
           if (geometry) {
-            geometry.points = edge.waypoints.map((point) => new Point(point.x, point.y));
+            geometry.points = waypoints;
             graph.getDataModel().setGeometry(edgeCell, geometry);
           }
         }

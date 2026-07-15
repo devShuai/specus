@@ -3406,6 +3406,13 @@ body {
   caret-color: var(--diagram-apple-blue);
 }
 
+.diagram-apple-canvas > div.mxRubberband {
+  border: 1px solid color-mix(in srgb, var(--diagram-apple-blue) 78%, transparent) !important;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--diagram-apple-blue) 24%, transparent) !important;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--diagram-apple-surface) 50%, transparent);
+}
+
 .diagram-apple-canvas:focus-visible {
   outline: 2px solid var(--diagram-apple-blue) !important;
   outline-offset: -2px;
