@@ -103,6 +103,55 @@ describe("diagram document", () => {
     expect(imported.edges).toEqual(edges);
   });
 
+  it("round-trips the complete inspector style set", () => {
+    const styledNode: DiagramNode = {
+      ...nodes[1],
+      style: {
+        ...nodes[1].style,
+        fillColor: "none",
+        labelBackgroundColor: "#fff7e6",
+        linePattern: "dotted",
+        dashed: true,
+        fontSize: 21,
+        fontFamily: "rounded",
+        bold: false,
+        italic: true,
+        underline: true,
+        align: "right",
+        verticalAlign: "bottom",
+        spacing: 18,
+        opacity: 72,
+        shadow: true,
+        rounded: true,
+        flipH: true,
+        flipV: false,
+      },
+    };
+    const styledEdge: DiagramEdge = {
+      ...edges[0],
+      style: {
+        ...edges[0].style,
+        labelBackgroundColor: "none",
+        linePattern: "dashed",
+        dashed: true,
+        startSize: 12,
+        endSize: 18,
+        fontSize: 16,
+        fontFamily: "mono",
+        bold: true,
+        italic: true,
+        underline: true,
+        align: "left",
+        opacity: 64,
+      },
+    };
+    const exported = createDiagramDocument([styledNode, nodes[0]], [styledEdge], { width: 2400, height: 1600, gridSize: 10 });
+    const imported = parseDiagramDocument(JSON.stringify(exported));
+
+    expect(imported.nodes[0]).toEqual(styledNode);
+    expect(imported.edges[0]).toEqual(styledEdge);
+  });
+
   it("rejects duplicate ids, invalid geometry, and dangling edges", () => {
     const exported = createDiagramDocument(nodes, edges, { width: 2400, height: 1600, gridSize: 10 });
 
@@ -122,6 +171,15 @@ describe("diagram document", () => {
     expect(() => parseDiagramDocument(JSON.stringify({
       ...exported,
       edges: [{ ...edges[0], waypoints: [{ x: Number.NaN, y: 20 }] }],
+    }))).toThrow("无效、重复或超出限制");
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      nodes: [{ ...nodes[0], style: { ...nodes[0].style, fontFamily: "comic", spacing: 90 } }],
+      edges: [],
+    }))).toThrow("无效、重复或超出限制");
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      edges: [{ ...edges[0], style: { ...edges[0].style, startSize: 80 } }],
     }))).toThrow("无效、重复或超出限制");
   });
 

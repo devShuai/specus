@@ -61,6 +61,9 @@ export type DiagramPort = "north" | "east" | "south" | "west";
 export type DiagramEdgeType = "orthogonal" | "straight" | "elbow" | "curved";
 export type DiagramArrowType = "none" | "classic" | "block" | "open" | "oval" | "diamond";
 export type DiagramTextAlign = "left" | "center" | "right";
+export type DiagramVerticalAlign = "top" | "middle" | "bottom";
+export type DiagramFontFamily = "system" | "rounded" | "serif" | "mono";
+export type DiagramLinePattern = "solid" | "dashed" | "dotted";
 export type DiagramSwimlaneDirection = "horizontal" | "vertical";
 
 export interface DiagramPoint {
@@ -72,25 +75,43 @@ export interface DiagramNodeStyle {
   fillColor: string;
   strokeColor: string;
   fontColor: string;
+  labelBackgroundColor?: string;
   strokeWidth: number;
   dashed?: boolean;
+  linePattern?: DiagramLinePattern;
   fontSize?: number;
+  fontFamily?: DiagramFontFamily;
   bold?: boolean;
   italic?: boolean;
+  underline?: boolean;
   align?: DiagramTextAlign;
+  verticalAlign?: DiagramVerticalAlign;
+  spacing?: number;
   opacity?: number;
   shadow?: boolean;
   rounded?: boolean;
+  flipH?: boolean;
+  flipV?: boolean;
 }
 
 export interface DiagramEdgeStyle {
   strokeColor: string;
   fontColor: string;
+  labelBackgroundColor?: string;
   strokeWidth: number;
   dashed?: boolean;
+  linePattern?: DiagramLinePattern;
   edgeType?: DiagramEdgeType;
   startArrow?: DiagramArrowType;
   endArrow?: DiagramArrowType;
+  startSize?: number;
+  endSize?: number;
+  fontSize?: number;
+  fontFamily?: DiagramFontFamily;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  align?: DiagramTextAlign;
   opacity?: number;
 }
 
@@ -415,15 +436,23 @@ function isNodeStyle(value: unknown): value is DiagramNodeStyle {
     && isColor(value.fillColor)
     && isColor(value.strokeColor)
     && isColor(value.fontColor)
+    && (value.labelBackgroundColor === undefined || isColor(value.labelBackgroundColor))
     && isStrokeWidth(value.strokeWidth)
     && (value.dashed === undefined || typeof value.dashed === "boolean")
+    && (value.linePattern === undefined || isDiagramLinePattern(value.linePattern))
     && (value.fontSize === undefined || (isFiniteNumber(value.fontSize) && value.fontSize >= 8 && value.fontSize <= 96))
+    && (value.fontFamily === undefined || isDiagramFontFamily(value.fontFamily))
     && (value.bold === undefined || typeof value.bold === "boolean")
     && (value.italic === undefined || typeof value.italic === "boolean")
+    && (value.underline === undefined || typeof value.underline === "boolean")
     && (value.align === undefined || value.align === "left" || value.align === "center" || value.align === "right")
+    && (value.verticalAlign === undefined || value.verticalAlign === "top" || value.verticalAlign === "middle" || value.verticalAlign === "bottom")
+    && (value.spacing === undefined || (isFiniteNumber(value.spacing) && value.spacing >= 0 && value.spacing <= 60))
     && (value.opacity === undefined || (isFiniteNumber(value.opacity) && value.opacity >= 10 && value.opacity <= 100))
     && (value.shadow === undefined || typeof value.shadow === "boolean")
     && (value.rounded === undefined || typeof value.rounded === "boolean")
+    && (value.flipH === undefined || typeof value.flipH === "boolean")
+    && (value.flipV === undefined || typeof value.flipV === "boolean")
     && value.edgeType === undefined;
 }
 
@@ -431,12 +460,30 @@ function isEdgeStyle(value: unknown): value is DiagramEdgeStyle {
   return isRecord(value)
     && isColor(value.strokeColor)
     && isColor(value.fontColor)
+    && (value.labelBackgroundColor === undefined || isColor(value.labelBackgroundColor))
     && isStrokeWidth(value.strokeWidth)
     && (value.dashed === undefined || typeof value.dashed === "boolean")
+    && (value.linePattern === undefined || isDiagramLinePattern(value.linePattern))
     && (value.edgeType === undefined || isDiagramEdgeType(value.edgeType))
     && (value.startArrow === undefined || isDiagramArrowType(value.startArrow))
     && (value.endArrow === undefined || isDiagramArrowType(value.endArrow))
+    && (value.startSize === undefined || (isFiniteNumber(value.startSize) && value.startSize >= 4 && value.startSize <= 40))
+    && (value.endSize === undefined || (isFiniteNumber(value.endSize) && value.endSize >= 4 && value.endSize <= 40))
+    && (value.fontSize === undefined || (isFiniteNumber(value.fontSize) && value.fontSize >= 8 && value.fontSize <= 96))
+    && (value.fontFamily === undefined || isDiagramFontFamily(value.fontFamily))
+    && (value.bold === undefined || typeof value.bold === "boolean")
+    && (value.italic === undefined || typeof value.italic === "boolean")
+    && (value.underline === undefined || typeof value.underline === "boolean")
+    && (value.align === undefined || value.align === "left" || value.align === "center" || value.align === "right")
     && (value.opacity === undefined || (isFiniteNumber(value.opacity) && value.opacity >= 10 && value.opacity <= 100));
+}
+
+function isDiagramFontFamily(value: unknown): value is DiagramFontFamily {
+  return value === "system" || value === "rounded" || value === "serif" || value === "mono";
+}
+
+function isDiagramLinePattern(value: unknown): value is DiagramLinePattern {
+  return value === "solid" || value === "dashed" || value === "dotted";
 }
 
 function cloneDiagramNode(node: DiagramNode): DiagramNode {
@@ -525,7 +572,7 @@ function isIdentifier(value: unknown): value is string {
 }
 
 function isColor(value: unknown): value is string {
-  return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
+  return value === "none" || (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value));
 }
 
 function isStrokeWidth(value: unknown): value is number {

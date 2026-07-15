@@ -11,6 +11,8 @@ import type {
   DiagramArrowType,
   DiagramEdge,
   DiagramEdgeType,
+  DiagramFontFamily,
+  DiagramLinePattern,
   DiagramNode,
   DiagramNodeKind,
   DiagramPage,
@@ -162,17 +164,33 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
         fillColor: styleColor(style.get("fillColor"), kind === "container" || kind === "swimlane" || kind === "lane" ? "#f8fafc" : "#ffffff"),
         strokeColor: styleColor(style.get("strokeColor"), "#475569"),
         fontColor: styleColor(style.get("fontColor"), "#172033"),
+        ...(style.has("labelBackgroundColor")
+          ? { labelBackgroundColor: styleColor(style.get("labelBackgroundColor"), "none") }
+          : {}),
         strokeWidth: boundedNumber(style.get("strokeWidth"), 2, 1, 12),
         ...(style.get("dashed") === "1" ? { dashed: true } : {}),
+        ...(linePatternFromDrawioStyle(style) ? { linePattern: linePatternFromDrawioStyle(style) } : {}),
         ...(style.has("fontSize") ? { fontSize: boundedNumber(style.get("fontSize"), 13, 8, 96) } : {}),
+        ...(fontFamilyFromDrawioStyle(style) ? { fontFamily: fontFamilyFromDrawioStyle(style) } : {}),
         ...(style.has("fontStyle") ? {
           bold: (safeInteger(style.get("fontStyle"), 1) & 1) === 1,
           italic: (safeInteger(style.get("fontStyle"), 1) & 2) === 2,
         } : {}),
-        ...(style.has("shuaiAlign") ? { align: textAlign(style.get("shuaiAlign")) } : {}),
+        ...(style.has("shuaiUnderline") || (safeInteger(style.get("fontStyle"), 0) & 4) === 4
+          ? { underline: style.has("shuaiUnderline") ? style.get("shuaiUnderline") === "1" : true }
+          : {}),
+        ...(style.has("shuaiAlign") || style.get("align") === "left" || style.get("align") === "right"
+          ? { align: textAlign(style.get("shuaiAlign") ?? style.get("align")) }
+          : {}),
+        ...(style.has("shuaiVerticalAlign") || style.get("verticalAlign") === "top" || style.get("verticalAlign") === "bottom"
+          ? { verticalAlign: verticalAlign(style.get("shuaiVerticalAlign") ?? style.get("verticalAlign")) }
+          : {}),
+        ...(style.has("spacing") ? { spacing: boundedNumber(style.get("spacing"), 10, 0, 60) } : {}),
         ...(style.has("opacity") ? { opacity: boundedNumber(style.get("opacity"), 100, 10, 100) } : {}),
         ...(style.has("shadow") ? { shadow: style.get("shadow") === "1" } : {}),
         ...(style.has("rounded") ? { rounded: style.get("rounded") === "1" } : {}),
+        ...(style.has("flipH") ? { flipH: style.get("flipH") === "1" } : {}),
+        ...(style.has("flipV") ? { flipV: style.get("flipV") === "1" } : {}),
       },
     });
   }
@@ -215,11 +233,29 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
       style: {
         strokeColor: styleColor(style.get("strokeColor"), "#64748b"),
         fontColor: styleColor(style.get("fontColor"), "#334155"),
+        ...(style.has("labelBackgroundColor")
+          ? { labelBackgroundColor: styleColor(style.get("labelBackgroundColor"), "none") }
+          : {}),
         strokeWidth: boundedNumber(style.get("strokeWidth"), 2, 1, 12),
         ...(style.get("dashed") === "1" ? { dashed: true } : {}),
+        ...(linePatternFromDrawioStyle(style) ? { linePattern: linePatternFromDrawioStyle(style) } : {}),
         edgeType: edgeTypeFromStyle(style),
         startArrow: arrowTypeFromStyle(style.get("startArrow"), "none"),
         endArrow: arrowTypeFromStyle(style.get("endArrow"), "block"),
+        ...(style.has("startSize") ? { startSize: boundedNumber(style.get("startSize"), 8, 4, 40) } : {}),
+        ...(style.has("endSize") ? { endSize: boundedNumber(style.get("endSize"), 8, 4, 40) } : {}),
+        ...(style.has("fontSize") ? { fontSize: boundedNumber(style.get("fontSize"), 12, 8, 96) } : {}),
+        ...(fontFamilyFromDrawioStyle(style) ? { fontFamily: fontFamilyFromDrawioStyle(style) } : {}),
+        ...(style.has("fontStyle") ? {
+          bold: (safeInteger(style.get("fontStyle"), 0) & 1) === 1,
+          italic: (safeInteger(style.get("fontStyle"), 0) & 2) === 2,
+        } : {}),
+        ...(style.has("shuaiUnderline") || (safeInteger(style.get("fontStyle"), 0) & 4) === 4
+          ? { underline: style.has("shuaiUnderline") ? style.get("shuaiUnderline") === "1" : true }
+          : {}),
+        ...(style.has("shuaiAlign") || style.get("align") === "left" || style.get("align") === "right"
+          ? { align: textAlign(style.get("shuaiAlign") ?? style.get("align")) }
+          : {}),
         ...(style.has("opacity") ? { opacity: boundedNumber(style.get("opacity"), 100, 10, 100) } : {}),
       },
     });
@@ -247,8 +283,8 @@ function nodeStyle(node: DiagramNode) {
     shape,
     "whiteSpace=wrap",
     "html=1",
-    "align=center",
-    "verticalAlign=middle",
+    `align=${node.style.align ?? "center"}`,
+    `verticalAlign=${node.style.verticalAlign ?? "middle"}`,
     `fillColor=${node.style.fillColor}`,
     `strokeColor=${node.style.strokeColor}`,
     `fontColor=${node.style.fontColor}`,
@@ -259,14 +295,23 @@ function nodeStyle(node: DiagramNode) {
   }
   if (node.locked) style.push("shuaiLocked=1");
   if (node.style.fontSize !== undefined) style.push(`fontSize=${node.style.fontSize}`);
-  if (node.style.bold !== undefined || node.style.italic !== undefined) style.push(`fontStyle=${(node.style.bold === false ? 0 : 1) + (node.style.italic ? 2 : 0)}`);
+  if (node.style.fontFamily !== undefined) style.push(`shuaiFontFamily=${node.style.fontFamily}`, `fontFamily=${drawioFontFamily(node.style.fontFamily)}`);
+  if (node.style.bold !== undefined || node.style.italic !== undefined || node.style.underline !== undefined) {
+    style.push(`fontStyle=${(node.style.bold === false ? 0 : 1) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0)}`);
+  }
+  if (node.style.underline !== undefined) style.push(`shuaiUnderline=${node.style.underline ? 1 : 0}`);
   if (node.style.align !== undefined) style.push(`shuaiAlign=${node.style.align}`, `align=${node.style.align}`);
+  if (node.style.verticalAlign !== undefined) style.push(`shuaiVerticalAlign=${node.style.verticalAlign}`, `verticalAlign=${node.style.verticalAlign}`);
+  if (node.style.spacing !== undefined) style.push(`spacing=${node.style.spacing}`);
+  if (node.style.labelBackgroundColor !== undefined) style.push(`labelBackgroundColor=${node.style.labelBackgroundColor}`);
   if (node.rotation !== undefined) style.push(`rotation=${node.rotation}`);
   if (node.style.opacity !== undefined) style.push(`opacity=${node.style.opacity}`);
   if (node.style.shadow !== undefined) style.push(`shadow=${node.style.shadow ? 1 : 0}`);
   if (node.style.rounded !== undefined) style.push(`rounded=${node.style.rounded ? 1 : 0}`);
+  if (node.style.flipH !== undefined) style.push(`flipH=${node.style.flipH ? 1 : 0}`);
+  if (node.style.flipV !== undefined) style.push(`flipV=${node.style.flipV ? 1 : 0}`);
   if (node.kind === "swimlane" && node.swimlaneDirection) style.push(`shuaiDirection=${node.swimlaneDirection}`, `horizontal=${node.swimlaneDirection === "vertical" ? 0 : 1}`);
-  if (node.style.dashed) style.push("dashed=1");
+  appendLinePattern(style, node.style.linePattern, node.style.dashed);
   return style.filter(Boolean).join(";") + ";";
 }
 
@@ -283,11 +328,21 @@ function edgeStyle(edge: DiagramEdge) {
     `fontColor=${edge.style.fontColor}`,
     `strokeWidth=${edge.style.strokeWidth}`,
   ];
+  if (edge.style.startSize !== undefined) style.push(`startSize=${edge.style.startSize}`);
+  if (edge.style.endSize !== undefined) style.push(`endSize=${edge.style.endSize}`);
+  if (edge.style.fontSize !== undefined) style.push(`fontSize=${edge.style.fontSize}`);
+  if (edge.style.fontFamily !== undefined) style.push(`shuaiFontFamily=${edge.style.fontFamily}`, `fontFamily=${drawioFontFamily(edge.style.fontFamily)}`);
+  if (edge.style.bold !== undefined || edge.style.italic !== undefined || edge.style.underline !== undefined) {
+    style.push(`fontStyle=${(edge.style.bold ? 1 : 0) + (edge.style.italic ? 2 : 0) + (edge.style.underline ? 4 : 0)}`);
+  }
+  if (edge.style.underline !== undefined) style.push(`shuaiUnderline=${edge.style.underline ? 1 : 0}`);
+  if (edge.style.align !== undefined) style.push(`shuaiAlign=${edge.style.align}`, `align=${edge.style.align}`);
+  if (edge.style.labelBackgroundColor !== undefined) style.push(`labelBackgroundColor=${edge.style.labelBackgroundColor}`);
   const source = portCoordinates(edge.sourcePort);
   const target = portCoordinates(edge.targetPort);
   if (source) style.push(`exitX=${source.x}`, `exitY=${source.y}`, "exitPerimeter=1");
   if (target) style.push(`entryX=${target.x}`, `entryY=${target.y}`, "entryPerimeter=1");
-  if (edge.style.dashed) style.push("dashed=1");
+  appendLinePattern(style, edge.style.linePattern, edge.style.dashed);
   if (edge.style.opacity !== undefined) style.push(`opacity=${edge.style.opacity}`);
   return style.filter(Boolean).join(";") + ";";
 }
@@ -443,6 +498,42 @@ function textAlign(value?: string): "left" | "center" | "right" {
   return value === "left" || value === "right" ? value : "center";
 }
 
+function verticalAlign(value?: string): "top" | "middle" | "bottom" {
+  return value === "top" || value === "bottom" ? value : "middle";
+}
+
+function linePatternFromDrawioStyle(style: Map<string, string>): DiagramLinePattern | undefined {
+  const custom = style.get("shuaiLinePattern");
+  if (custom === "solid" || custom === "dashed" || custom === "dotted") return custom;
+  if (style.get("dashed") !== "1") return undefined;
+  return /^\s*1(?:\s|$)/.test(style.get("dashPattern") ?? "") ? "dotted" : "dashed";
+}
+
+function fontFamilyFromDrawioStyle(style: Map<string, string>): DiagramFontFamily | undefined {
+  const custom = style.get("shuaiFontFamily");
+  if (custom === "system" || custom === "rounded" || custom === "serif" || custom === "mono") return custom;
+  const family = (style.get("fontFamily") ?? "").toLowerCase();
+  if (!family) return undefined;
+  if (family.includes("mono") || family.includes("menlo") || family.includes("consolas")) return "mono";
+  if (family.includes("rounded")) return "rounded";
+  if ((family.includes("georgia") || family.includes("times") || family.endsWith("serif")) && !family.includes("sans-serif")) return "serif";
+  return "system";
+}
+
+function drawioFontFamily(fontFamily: DiagramFontFamily) {
+  if (fontFamily === "rounded") return "Arial Rounded MT Bold";
+  if (fontFamily === "serif") return "Georgia";
+  if (fontFamily === "mono") return "Courier New";
+  return "Helvetica";
+}
+
+function appendLinePattern(target: string[], pattern?: DiagramLinePattern, dashed?: boolean) {
+  const resolved = pattern ?? (dashed ? "dashed" : "solid");
+  if (pattern) target.push(`shuaiLinePattern=${resolved}`);
+  if (resolved === "solid") return;
+  target.push("dashed=1", `dashPattern=${resolved === "dotted" ? "1 4" : "8 4"}`);
+}
+
 function arrowTypeFromStyle(value: string | undefined, fallback: DiagramArrowType): DiagramArrowType {
   if (value === "none" || value === "classic" || value === "block" || value === "open" || value === "oval" || value === "diamond") {
     return value;
@@ -509,7 +600,8 @@ function cleanLabel(value: string) {
 }
 
 function styleColor(value: string | undefined, fallback: string) {
-  return value && /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback;
+  if (value === "none" || (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value))) return value;
+  return fallback;
 }
 
 function finiteAttribute(element: Element, name: string, fallback: number) {
