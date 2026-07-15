@@ -2223,7 +2223,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             isActive={activeTool === "clipboard"}
             focusRequest={clipboardFocusRequest}
             canSend={!isRoomReadOnly}
-            peerCount={peers.length}
             fileTargetRequired={networkMode === "lan"}
             targetPeerId={selectedPeer?.peerId ?? ""}
             targetPeerLabel={selectedPeer ? discoveryPeerDisplayName(selectedPeer) : ""}

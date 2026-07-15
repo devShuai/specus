@@ -34,7 +34,6 @@ interface SyncedClipboardProps {
   isActive: boolean;
   focusRequest: number;
   canSend: boolean;
-  peerCount: number;
   fileTargetRequired: boolean;
   targetPeerId: string;
   targetPeerLabel: string;
@@ -55,7 +54,6 @@ export function SyncedClipboard({
   isActive,
   focusRequest,
   canSend,
-  peerCount,
   fileTargetRequired,
   targetPeerId,
   targetPeerLabel,
@@ -551,57 +549,38 @@ export function SyncedClipboard({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步剪贴板</h2>
-            <Chip size="sm" radius="sm" variant="flat" color={canSend ? "success" : "default"}>
-              {canSend ? "粘贴即发送" : "只读"}
+            <Chip size="sm" radius="sm" variant="flat" color={canSend && targetPeerId ? "success" : "default"}>
+              {canSend ? (targetPeerId ? "粘贴即发送" : "等待设备") : "只读"}
             </Chip>
             <Chip size="sm" radius="sm" variant="flat">
               {blocks.length} 项内容
             </Chip>
           </div>
-          <p className="mt-0.5 max-w-2xl text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-            从系统剪贴板读取，或直接粘贴；内容会立即发送给当前目标设备。
+          <p aria-live="polite" className="mt-0.5 max-w-2xl text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+            {!canSend
+              ? "可查看和复制收到的内容；当前房间为只读。"
+              : targetPeerId
+                ? <>粘贴或读取内容后，将立即同步到 <span title={targetLabel} className="font-medium text-zinc-700 [overflow-wrap:anywhere] dark:text-zinc-200">{targetLabel}</span>。</>
+                : "粘贴或读取内容后，选择一台在线设备即可同步。"}
           </p>
         </div>
       </div>
 
       <div className="px-3 py-3">
-        <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 border-b border-black/[0.07] px-1 pb-2.5 dark:border-white/[0.08]">
-          <div className="min-w-0">
-            <div className="text-[10px] text-zinc-500 dark:text-zinc-400">系统剪贴板</div>
-            <div className="truncate text-small font-semibold text-zinc-900 dark:text-white">本机</div>
-          </div>
-          <div className="flex items-center gap-1.5 text-primary-600 dark:text-primary-300" aria-hidden="true">
-            <span className={`h-2 w-2 rounded-full ${canSend ? "animate-pulse bg-emerald-500 motion-reduce:animate-none" : "bg-zinc-400"}`} />
-            <span className="h-px w-5 bg-current sm:w-9" />
-            <span className="text-sm">→</span>
-          </div>
-          <div className="min-w-0 text-right">
-            <div className="text-[10px] text-zinc-500 dark:text-zinc-400">目标设备</div>
-            <div className="truncate text-small font-semibold text-zinc-900 dark:text-white">{targetLabel}</div>
-          </div>
-        </div>
-
-        <div className="mt-2.5 border-b border-black/[0.07] pb-3 dark:border-white/[0.08]">
+        <div className="border-b border-black/[0.07] pb-3 dark:border-white/[0.08]">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <label htmlFor="public-transfer-clipboard-text" className="block text-tiny font-semibold text-zinc-700 dark:text-zinc-200">
-                添加剪贴板内容
-              </label>
-            </div>
-            <div className="flex flex-wrap items-center justify-end gap-2">
-              <span className="text-tiny text-zinc-500 dark:text-zinc-400">
-                {peerCount > 0 ? `${peerCount} 台在线` : "等待设备"}
-              </span>
-              <Button
-                radius="sm"
-                size="sm"
-                variant="flat"
-                isLoading={isSystemClipboardReading}
-                onPress={readSystemClipboard}
-              >
-                读取系统剪贴板
-              </Button>
-            </div>
+            <label htmlFor="public-transfer-clipboard-text" className="block text-tiny font-semibold text-zinc-700 dark:text-zinc-200">
+              添加剪贴板内容
+            </label>
+            <Button
+              radius="sm"
+              size="sm"
+              variant="flat"
+              isLoading={isSystemClipboardReading}
+              onPress={readSystemClipboard}
+            >
+              读取系统剪贴板
+            </Button>
           </div>
           <textarea
             ref={textareaRef}
