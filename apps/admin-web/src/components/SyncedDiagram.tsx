@@ -36,6 +36,7 @@ import {
   Point,
   Rectangle,
   RubberBandHandler,
+  SelectionCellsHandler,
   SelectionHandler,
   ShapeRegistry,
   StyleDefaultsConfig,
@@ -1087,7 +1088,7 @@ export function SyncedDiagram({
     );
     const defaultCreateHandler = graph.createHandler.bind(graph);
     graph.createHandler = (state) => {
-      const handler = state.cell.isEdge() && state.style.shape === DIAGRAM_CUBIC_EDGE_SHAPE
+      const handler = state.cell.isEdge() && edgeTypeFromCellStyle(state.style) === "curved"
         ? new DiagramCubicEdgeHandler(state)
         : defaultCreateHandler(state);
       if (handler instanceof VertexHandler && handler.sizers.length >= 8) {
@@ -1413,6 +1414,7 @@ export function SyncedDiagram({
         graph.getDataModel().setGeometry(edge, geometry);
       }
     });
+    recreateSelectionHandlers(graph, curvedEdges);
   }, [runtimeEpoch]);
 
   useEffect(() => {
@@ -2050,6 +2052,7 @@ export function SyncedDiagram({
           graph.getDataModel().setStyle(edge, style);
         }
       });
+      recreateSelectionHandlers(graph, edges);
       updateSelection(graph, setSelection);
       setStatus(edgeType === "curved"
         ? `已切换 ${edges.length} 条连线为三阶贝塞尔曲线。`
@@ -4885,6 +4888,20 @@ function edgeTypeFromCellStyle(style: CellStyle): DiagramEdgeType {
   if (!style.edgeStyle || style.edgeStyle === "none") return "straight";
   if (String(style.edgeStyle).toLowerCase().includes("elbow")) return "elbow";
   return "orthogonal";
+}
+
+function recreateSelectionHandlers(graph: Graph, cells: Cell[]) {
+  const selectionCellsHandler = graph.getPlugin<SelectionCellsHandler>(SelectionCellsHandler.pluginId);
+  if (!selectionCellsHandler) return;
+  for (const cell of cells) {
+    graph.getView().invalidate(cell);
+  }
+  graph.getView().validate();
+  for (const cell of cells) {
+    if (!graph.isCellSelected(cell)) continue;
+    const state = graph.getView().getState(cell);
+    if (state) selectionCellsHandler.updateHandler(state);
+  }
 }
 
 function arrowTypeFromStyle(value: unknown, fallback: DiagramArrowType): DiagramArrowType {
