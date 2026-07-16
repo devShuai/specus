@@ -2,7 +2,7 @@
 
 Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网络。每个客户端分配一个虚拟 IP，客户端之间优先通过 UDP direct 通信；direct 不通时使用服务端内置 TURN relay。服务端负责身份、授权、虚拟 IP、候选交换、session 管理和 relay 授权；业务 IP 包在客户端之间端到端加密，服务端 relay 不解密明文。
 
-当前 Java 实现为实验性能力，默认关闭。
+当前跨语言实现仍属于实验性能力，默认关闭。
 
 ## 配置
 
@@ -14,7 +14,13 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `tunnel.peer-mesh.cidr` | `TUNNEL_PEER_MESH_CIDR` | `100.96.0.0/11` | 虚拟网段 |
 | `tunnel.peer-mesh.public-address` | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | 空 | UDP 探测和 relay 对外地址 |
 | `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | 标准 STUN/TURN UDP 主端口 |
+| `tunnel.peer-mesh.standalone-stun-address` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS` | 空 | 独立 STUN 域名或 IP；配置后 STUN 与 TURN 使用不同入口 |
+| `tunnel.peer-mesh.standalone-stun-port` | `TUNNEL_PEER_MESH_STANDALONE_STUN_PORT` | `3478` | 独立 STUN 入口端口 |
 | `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `3479` | NAT 辅助探测端口；显式设为 `0` 时使用主端口 + 1 |
+| `tunnel.peer-mesh.stun-primary-bind-address` | `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` | 空 | RFC 5780 主地址 A1 的本机绑定 IP |
+| `tunnel.peer-mesh.stun-alternate-bind-address` | `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` | 空 | RFC 5780 备用地址 A2 的本机绑定 IP |
+| `tunnel.peer-mesh.stun-alternate-public-address` | `TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS` | 空 | RFC 5780 备用公网 IP A2；A1 使用 `public-address` |
+| `tunnel.peer-mesh.stun-behavior-strict` | `TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT` | `false` | 四端点配置不完整时是否拒绝启动内置 STUN/TURN |
 | `tunnel.peer-mesh.public-stun-servers` | `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | 空 | 额外公共 STUN server，逗号分隔，只补充 `srflx` candidate |
 | `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
 | `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation 有效期 |
@@ -85,7 +91,7 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `clientId` / `clientName` | 当前客户端身份 |
 | `virtualIp` | 当前客户端虚拟 IP |
 | `cidr` | Mesh 虚拟网段 |
-| `stunHost` / `stunPort` | 标准 STUN 端点 |
+| `stunHost` / `stunPort` | 标准 STUN 端点；可以指向独立部署的 RFC 5780 STUN |
 | `turnHost` / `turnPort` | 标准 TURN relay 端点 |
 | `publicStunServers` | 额外公共 STUN server 列表，只用于补充 `srflx` candidate |
 | `iceUsername` / `iceCredential` | TURN 长期凭证认证使用的临时用户名和 credential |
@@ -252,9 +258,18 @@ relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不
   "virtualDeviceStatus": "UP",
   "virtualDeviceError": "",
   "natType": "SYMMETRIC_NAT",
+  "natMappingBehavior": "ADDRESS_AND_PORT_DEPENDENT",
+  "natFilteringBehavior": "ADDRESS_AND_PORT_DEPENDENT",
+  "natBehaviorDiscovery": "RFC5780",
   "lastEndpoint": "58.41.26.74:1132"
 }
 ```
+
+`natMappingBehavior` / `natFilteringBehavior` 使用
+`ENDPOINT_INDEPENDENT`、`ADDRESS_DEPENDENT`、
+`ADDRESS_AND_PORT_DEPENDENT`、`UNKNOWN`；过滤探测还可能上报
+`UNSUPPORTED`。`natBehaviorDiscovery` 为 `RFC5780` 或 `BASIC`。
+`natType` 保留为旧客户端和路径策略使用的兼容标签。
 
 ### `close`
 
@@ -283,16 +298,19 @@ STUN/TURN 控制消息使用标准的二进制 STUN 头、magic cookie、transac
 
 - 线格式使用 20 字节 STUN header、magic cookie `0x2112A442`、12 字节 transaction ID；message length
   不含 header，attribute 按 4 字节补齐。基础头和 XOR 地址遵循 STUN RFC 5389/8489 兼容格式，
-  `RESPONSE-ORIGIN` / `OTHER-ADDRESS` 用于 RFC 5780 风格的辅助观测，relay 方法采用 TURN RFC 5766/8656
-  兼容的本项目子集。
+  `MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 与 `OTHER-ADDRESS` 使用普通 MAPPED-ADDRESS 地址格式，
+  relay 方法采用 TURN RFC 5766/8656 兼容的本项目子集。
+- 完整 RFC 5780 模式要求 A1:P1、A1:P2、A2:P1、A2:P2 四个 UDP 端点，并支持
+  `CHANGE-REQUEST` 的 change IP / change port 组合。TURN 只在 A1:P1 处理，其他端点只接受 Binding。
 - 当前 codec 能编码 IPv4/IPv6 XOR 地址，但 Peer Mesh 业务数据面和虚拟路由只支持 IPv4；这不构成 IPv6
   Mesh 能力声明。
-- 客户端不会对单个 STUN transaction 做 RFC 定时重传；未响应项在 15 秒后视为过期，并由 30 秒维护循环
-  清理，后续维护轮次会重新发起探测或 allocation 刷新。因此外部实现不能依赖本项目客户端的逐包重传行为。
+- RFC 5780 行为探测会在单个 transaction 内按约 `250ms`、`750ms` 重试，并在约 `1600ms` 后判定超时；
+  独立 STUN 探测周期与 TURN allocation 维护周期分开，后续维护轮次会重新探测或刷新 relay。
 
 | 方法 / indication | 方向 | 关键 attribute / 说明 |
 | --- | --- | --- |
-| Binding Request / Success | client <-> server | `XOR-MAPPED-ADDRESS`；内置 server 还返回 `RESPONSE-ORIGIN`，有备用端口时返回 `OTHER-ADDRESS` |
+| Binding Request / Success | client <-> server | 返回 `MAPPED-ADDRESS`、`XOR-MAPPED-ADDRESS` 和 `RESPONSE-ORIGIN`；完整四端点模式同时返回 `OTHER-ADDRESS` |
+| Binding + `CHANGE-REQUEST` | client <-> server | 按 change IP / change port 从对应端点回包；缺少第二公网 IP 时返回 `420 Unknown Attribute` |
 | Allocate Request / Success | client <-> server | `REQUESTED-TRANSPORT=UDP`、`XOR-RELAYED-ADDRESS`、`XOR-MAPPED-ADDRESS`、`LIFETIME` |
 | Refresh Request / Success | client <-> server | 刷新或释放 allocation |
 | Create Permission Request / Success | client <-> server | 为目标 relay endpoint 建立短期 permission |
@@ -338,15 +356,21 @@ session、token、目标 client ID 和时间窗口。
 
 ### NAT 类型判断
 
-主端口的 Binding Success 在备用 socket 可用时返回 `RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`。客户端收到后，
-主动向 `OTHER-ADDRESS` 再发送一个标准 Binding Request；服务端不会把主请求“主动改端口回包”，也未实现
-`CHANGE-REQUEST`。客户端比较主端口、备用端口和可选公共 STUN 观察到的映射：
+完整 RFC 5780 服务使用两个公网 IP 和同一对 UDP 端口：
 
-- 映射端点不同：倾向判断为 `Symmetric NAT`。
-- 主、备用观察相同：只能保守展示为 `NAT` 或端口保持类结果，不能据此严格区分 cone 类型。
-- 历史 `changed-port` 观察若存在，才会辅助展示为 `Full cone / Restricted NAT`；现行标准 Binding 流程不主动生成该观察。
+- 映射行为：客户端从同一个本地 socket 分别向 A1:P1、A2:P1、A2:P2 发送 Binding，比较
+  `XOR-MAPPED-ADDRESS`，区分 Endpoint-Independent、Address-Dependent 和
+  Address-and-Port-Dependent Mapping。
+- 过滤行为：客户端先向 A1:P1 发送普通 Binding，再分别发送 change IP + change port、
+  change port 的 `CHANGE-REQUEST`，根据是否收到来自 A2:P2、A1:P2 的响应判断
+  Endpoint-Independent、Address-Dependent 和 Address-and-Port-Dependent Filtering。
+- `RESPONSE-ORIGIN` 必须等于实际响应源；`OTHER-ADDRESS` 始终是相对请求目标的另一 IP + 另一端口，
+  不随 `CHANGE-REQUEST` 标志改变。
 
-在只有一个公网 IP 和两个 UDP 端口的部署中，无法严格区分所有 NAT 类型。
+只有一个公网 IP 时，服务端不插入 `OTHER-ADDRESS`，并对 `CHANGE-REQUEST` 返回
+`420 Unknown Attribute`。项目兼容模式仍可用双端口收集额外映射观察，但不能据此宣称完整 RFC 5780 分类。
+独立 STUN 进程的构建和部署见 `implementations/java/stun-server` 与
+`deploy/stun-server/systemd`。
 
 ## 数据面加密帧
 
@@ -438,6 +462,8 @@ peer 离线、从 roster 消失或虚拟设备停止时会移除对应路由。�
 ## 当前限制
 
 - 内置 STUN/TURN server 只实现本项目使用的方法和 attribute，不等同于完整 coturn 功能集。
+- RFC 5780 当前实现 `CHANGE-REQUEST`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；可选的
+  `RESPONSE-PORT`、`PADDING` 尚未实现。
 - Java、Go、.NET client 的 macOS `utun` 数据面仍属于实验性能力。
 - `noop` 模式不会创建虚拟网卡，因此无法通过系统 `ping` / `curl` 访问虚拟 IP。
 - direct 路径依赖双方 UDP 可达；对称 NAT 或严格防火墙下通常会走 relay。

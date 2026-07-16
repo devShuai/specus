@@ -130,12 +130,13 @@ public sealed class PeerMeshService
     {
         var servers = new List<string>();
         var selfHosted = string.Empty;
-        if (Enabled)
+        if (Enabled || HasStandaloneStun())
         {
-            var host = ResolvePeerHost(requestHost);
-            if (!string.IsNullOrWhiteSpace(host) && _options.StunTurnPort > 0)
+            var host = ResolveStunHost(requestHost);
+            var port = StunPort();
+            if (!string.IsNullOrWhiteSpace(host) && port > 0)
             {
-                selfHosted = $"stun:{BracketIpv6(host)}:{_options.StunTurnPort}";
+                selfHosted = $"stun:{BracketIpv6(host)}:{port}";
                 servers.Add(selfHosted);
             }
         }
@@ -610,9 +611,9 @@ public sealed class PeerMeshService
         }
         config.Enabled = device.Enabled;
         config.VirtualIp = device.VirtualIp;
-        config.StunHost = ResolvePeerHost(requestServerName);
-        config.TurnHost = config.StunHost;
-        config.StunPort = _options.StunTurnPort;
+        config.StunHost = ResolveStunHost(requestServerName);
+        config.TurnHost = ResolvePeerHost(requestServerName);
+        config.StunPort = StunPort();
         config.TurnPort = _options.StunTurnPort;
         config.PublicStunServers = _options.PublicStunServers
             .Where(value => !string.IsNullOrWhiteSpace(value))
@@ -861,6 +862,12 @@ public sealed class PeerMeshService
             device.VirtualDeviceUpdatedAt = now;
         }
         if (report.NatType is not null) device.NatType = Limit(report.NatType, 80);
+        if (report.NatMappingBehavior is not null)
+            device.NatMappingBehavior = Limit(report.NatMappingBehavior, 80);
+        if (report.NatFilteringBehavior is not null)
+            device.NatFilteringBehavior = Limit(report.NatFilteringBehavior, 80);
+        if (report.NatBehaviorDiscovery is not null)
+            device.NatBehaviorDiscovery = Limit(report.NatBehaviorDiscovery, 40);
         if (report.LastEndpoint is not null) device.LastEndpoint = Limit(report.LastEndpoint, 255);
         device.LastSeenAt = now;
         device.UpdatedAt = now;
@@ -1283,7 +1290,8 @@ public sealed class PeerMeshService
     private PeerMeshDeviceView DeviceView(PeerMeshDevice device) => new(
         device.Id, device.ClientId, device.ClientName, device.OwnerUsername, device.Enabled,
         _sessions.Find(device.ClientName) is not null, device.VirtualIp, device.Cidr, device.PublicKey,
-        device.NatType, device.LastEndpoint, device.VirtualDeviceMode, device.VirtualDeviceName,
+        device.NatType, device.NatMappingBehavior, device.NatFilteringBehavior,
+        device.NatBehaviorDiscovery, device.LastEndpoint, device.VirtualDeviceMode, device.VirtualDeviceName,
         device.VirtualDeviceStatus, device.VirtualDeviceError, Iso(device.VirtualDeviceUpdatedAt),
         Iso(device.LastSeenAt), Iso(device.UpdatedAt)!);
 
@@ -1322,6 +1330,18 @@ public sealed class PeerMeshService
         }
         return NormalizeHost(requestServerName);
     }
+
+    private string ResolveStunHost(string? requestServerName) =>
+        HasStandaloneStun()
+            ? NormalizeHost(_options.StandaloneStunAddress)
+            : ResolvePeerHost(requestServerName);
+
+    private int StunPort() =>
+        HasStandaloneStun() ? _options.StandaloneStunPort : _options.StunTurnPort;
+
+    private bool HasStandaloneStun() =>
+        !string.IsNullOrWhiteSpace(_options.StandaloneStunAddress)
+        && _options.StandaloneStunPort > 0;
 
     private static string NormalizeStunUrl(string value)
     {
@@ -1493,6 +1513,9 @@ public sealed record PeerMeshDeviceView(
     string Cidr,
     string? PublicKey,
     string? NatType,
+    string? NatMappingBehavior,
+    string? NatFilteringBehavior,
+    string? NatBehaviorDiscovery,
     string? LastEndpoint,
     string? VirtualDeviceMode,
     string? VirtualDeviceName,
@@ -1647,6 +1670,15 @@ public sealed class PeerControlMessage
 
     [JsonPropertyName("natType")]
     public string? NatType { get; set; }
+
+    [JsonPropertyName("natMappingBehavior")]
+    public string? NatMappingBehavior { get; set; }
+
+    [JsonPropertyName("natFilteringBehavior")]
+    public string? NatFilteringBehavior { get; set; }
+
+    [JsonPropertyName("natBehaviorDiscovery")]
+    public string? NatBehaviorDiscovery { get; set; }
 
     [JsonPropertyName("lastEndpoint")]
     public string? LastEndpoint { get; set; }

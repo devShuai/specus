@@ -42,6 +42,9 @@ const (
 
 	peerPendingPacketTTL          = 30 * time.Second
 	peerPendingTurnRequestTTL     = 15 * time.Second
+	peerStunRequestInterval       = 60 * time.Second
+	peerBehaviorDiscoveryInterval = 60 * time.Second
+	peerBehaviorProbeTimeout      = 1600 * time.Millisecond
 	peerMaxPendingPackets         = 32
 	peerPathPrepareMinInterval    = 2 * time.Second
 	peerPortMappingRetry          = 30 * time.Second
@@ -65,39 +68,47 @@ type peerMeshClient struct {
 	config Config
 	logger *log.Logger
 
-	mu                   sync.Mutex
-	runtime              RuntimeConfig
-	conn                 net.Conn
-	sender               peerControlSender
-	udp                  *net.UDPConn
-	stopCh               chan struct{}
-	peers                map[int64]*peerMeshPeer
-	sessions             map[int64]*peerMeshSession
-	sessionsByID         map[int64]*peerMeshSession
-	pending              map[string]pendingPeerProbe
-	pendingStun          map[string]pendingStunBinding
-	pendingTurn          map[string]pendingTurnRequest
-	packets              map[int64][]pendingPeerPacket
-	prepared             map[int64]time.Time
-	srflx                *peerCandidate
-	srflxCandidates      map[string]peerCandidate
-	relay                *peerCandidate
-	relayID              string
-	relayTTL             time.Time
-	portMap              *peerCandidate
-	portMapping          *natPortMapping
-	portMappingService   *natPortMappingService
-	lastPortMapAttempt   time.Time
-	lastRelayRequest     time.Time
-	lastAlternateRequest time.Time
-	natByRole            map[string]string
-	turnPermissions      map[string]time.Time
-	localKey             *ecdh.PrivateKey
-	device               peerVirtualDevice
-	runtimeConfigKey     string
-	ignoredPacketLogAt   map[string]time.Time
-	messageHandler       func(ClientMessage)
-	turnAuth             turnAuthCredentials
+	mu                    sync.Mutex
+	runtime               RuntimeConfig
+	conn                  net.Conn
+	sender                peerControlSender
+	udp                   *net.UDPConn
+	stopCh                chan struct{}
+	peers                 map[int64]*peerMeshPeer
+	sessions              map[int64]*peerMeshSession
+	sessionsByID          map[int64]*peerMeshSession
+	pending               map[string]pendingPeerProbe
+	pendingStun           map[string]pendingStunBinding
+	pendingTurn           map[string]pendingTurnRequest
+	packets               map[int64][]pendingPeerPacket
+	prepared              map[int64]time.Time
+	srflx                 *peerCandidate
+	srflxCandidates       map[string]peerCandidate
+	relay                 *peerCandidate
+	relayID               string
+	relayTTL              time.Time
+	portMap               *peerCandidate
+	portMapping           *natPortMapping
+	portMappingService    *natPortMappingService
+	lastPortMapAttempt    time.Time
+	lastStunRequest       time.Time
+	lastRelayRequest      time.Time
+	lastAlternateRequest  time.Time
+	lastBehaviorDiscovery time.Time
+	natByRole             map[string]string
+	natBehavior           *natBehaviorDiscovery
+	natType               string
+	natMappingBehavior    string
+	natFilteringBehavior  string
+	natBehaviorDiscovery  string
+	lastEndpoint          string
+	turnPermissions       map[string]time.Time
+	localKey              *ecdh.PrivateKey
+	device                peerVirtualDevice
+	runtimeConfigKey      string
+	ignoredPacketLogAt    map[string]time.Time
+	messageHandler        func(ClientMessage)
+	turnAuth              turnAuthCredentials
 }
 
 type peerMeshPeer struct {
@@ -120,36 +131,39 @@ type peerCandidate struct {
 }
 
 type peerControlMessage struct {
-	Type                string          `json:"type"`
-	SourceClientID      int64           `json:"sourceClientId,omitempty"`
-	SourceClientName    string          `json:"sourceClientName,omitempty"`
-	SourceVirtualIP     string          `json:"sourceVirtualIp,omitempty"`
-	SourcePublicKey     string          `json:"sourcePublicKey,omitempty"`
-	TargetClientID      int64           `json:"targetClientId,omitempty"`
-	TargetClientName    string          `json:"targetClientName,omitempty"`
-	TargetVirtualIP     string          `json:"targetVirtualIp,omitempty"`
-	TargetPublicKey     string          `json:"targetPublicKey,omitempty"`
-	SessionID           *int64          `json:"sessionId,omitempty"`
-	Token               string          `json:"token,omitempty"`
-	ExpiresAt           string          `json:"expiresAt,omitempty"`
-	PathType            string          `json:"pathType,omitempty"`
-	Status              string          `json:"status,omitempty"`
-	RTTMillis           *int64          `json:"rttMillis,omitempty"`
-	LocalEndpoint       string          `json:"localEndpoint,omitempty"`
-	RemoteEndpoint      string          `json:"remoteEndpoint,omitempty"`
-	DirectBytes         int64           `json:"directBytes,omitempty"`
-	RelayBytes          int64           `json:"relayBytes,omitempty"`
-	NatType             string          `json:"natType,omitempty"`
-	LastEndpoint        string          `json:"lastEndpoint,omitempty"`
-	VirtualDeviceMode   string          `json:"virtualDeviceMode,omitempty"`
-	VirtualDeviceName   string          `json:"virtualDeviceName,omitempty"`
-	VirtualDeviceStatus string          `json:"virtualDeviceStatus,omitempty"`
-	VirtualDeviceError  string          `json:"virtualDeviceError,omitempty"`
-	PeerMesh            *PeerMeshConfig `json:"peerMesh,omitempty"`
-	Peers               []peerMeshPeer  `json:"peers,omitempty"`
-	Candidates          []peerCandidate `json:"candidates,omitempty"`
-	Reason              string          `json:"reason,omitempty"`
-	CreatedAtMillis     int64           `json:"createdAtMillis,omitempty"`
+	Type                 string          `json:"type"`
+	SourceClientID       int64           `json:"sourceClientId,omitempty"`
+	SourceClientName     string          `json:"sourceClientName,omitempty"`
+	SourceVirtualIP      string          `json:"sourceVirtualIp,omitempty"`
+	SourcePublicKey      string          `json:"sourcePublicKey,omitempty"`
+	TargetClientID       int64           `json:"targetClientId,omitempty"`
+	TargetClientName     string          `json:"targetClientName,omitempty"`
+	TargetVirtualIP      string          `json:"targetVirtualIp,omitempty"`
+	TargetPublicKey      string          `json:"targetPublicKey,omitempty"`
+	SessionID            *int64          `json:"sessionId,omitempty"`
+	Token                string          `json:"token,omitempty"`
+	ExpiresAt            string          `json:"expiresAt,omitempty"`
+	PathType             string          `json:"pathType,omitempty"`
+	Status               string          `json:"status,omitempty"`
+	RTTMillis            *int64          `json:"rttMillis,omitempty"`
+	LocalEndpoint        string          `json:"localEndpoint,omitempty"`
+	RemoteEndpoint       string          `json:"remoteEndpoint,omitempty"`
+	DirectBytes          int64           `json:"directBytes,omitempty"`
+	RelayBytes           int64           `json:"relayBytes,omitempty"`
+	NatType              string          `json:"natType,omitempty"`
+	NatMappingBehavior   string          `json:"natMappingBehavior,omitempty"`
+	NatFilteringBehavior string          `json:"natFilteringBehavior,omitempty"`
+	NatBehaviorDiscovery string          `json:"natBehaviorDiscovery,omitempty"`
+	LastEndpoint         string          `json:"lastEndpoint,omitempty"`
+	VirtualDeviceMode    string          `json:"virtualDeviceMode,omitempty"`
+	VirtualDeviceName    string          `json:"virtualDeviceName,omitempty"`
+	VirtualDeviceStatus  string          `json:"virtualDeviceStatus,omitempty"`
+	VirtualDeviceError   string          `json:"virtualDeviceError,omitempty"`
+	PeerMesh             *PeerMeshConfig `json:"peerMesh,omitempty"`
+	Peers                []peerMeshPeer  `json:"peers,omitempty"`
+	Candidates           []peerCandidate `json:"candidates,omitempty"`
+	Reason               string          `json:"reason,omitempty"`
+	CreatedAtMillis      int64           `json:"createdAtMillis,omitempty"`
 }
 
 type peerMeshSession struct {
@@ -197,8 +211,13 @@ type pendingPeerProbe struct {
 }
 
 type pendingStunBinding struct {
-	Role   string
-	SentAt time.Time
+	Role                     string
+	TargetEndpoint           *net.UDPAddr
+	ExpectedResponseEndpoint *net.UDPAddr
+	Request                  stunMessage
+	BehaviorProbe            natBehaviorProbe
+	BehaviorGeneration       int
+	SentAt                   time.Time
 }
 
 type pendingTurnRequest struct {
@@ -312,6 +331,12 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.prepared = make(map[int64]time.Time)
 	mesh.srflxCandidates = make(map[string]peerCandidate)
 	mesh.natByRole = make(map[string]string)
+	mesh.natBehavior = &natBehaviorDiscovery{}
+	mesh.natType = ""
+	mesh.natMappingBehavior = ""
+	mesh.natFilteringBehavior = ""
+	mesh.natBehaviorDiscovery = ""
+	mesh.lastEndpoint = ""
 	mesh.turnPermissions = make(map[string]time.Time)
 	mesh.ignoredPacketLogAt = make(map[string]time.Time)
 	mesh.localKey = localKey
@@ -391,9 +416,17 @@ func (mesh *peerMeshClient) stopLocked() {
 	mesh.portMap = nil
 	mesh.portMapping = nil
 	mesh.lastPortMapAttempt = time.Time{}
+	mesh.lastStunRequest = time.Time{}
 	mesh.lastRelayRequest = time.Time{}
 	mesh.lastAlternateRequest = time.Time{}
+	mesh.lastBehaviorDiscovery = time.Time{}
 	mesh.natByRole = nil
+	mesh.natBehavior = nil
+	mesh.natType = ""
+	mesh.natMappingBehavior = ""
+	mesh.natFilteringBehavior = ""
+	mesh.natBehaviorDiscovery = ""
+	mesh.lastEndpoint = ""
 	mesh.turnPermissions = nil
 	mesh.ignoredPacketLogAt = nil
 	mesh.localKey = nil
@@ -542,6 +575,8 @@ func (mesh *peerMeshClient) handleStunTurnMessage(message stunMessage, remote *n
 	switch message.Type {
 	case stunBindingSuccess:
 		mesh.handleStunBindingSuccess(message, remote)
+	case stunBindingError:
+		mesh.handleStunBindingError(message, remote)
 	case stunAllocateSuccess:
 		mesh.completeTurnRequest(message, remote)
 		mesh.handleTurnAllocated(message, remote)
@@ -647,19 +682,35 @@ func sameUDPEndpoint(expected, actual *net.UDPAddr) bool {
 
 func (mesh *peerMeshClient) handleStunBindingSuccess(message stunMessage, observedRemote *net.UDPAddr) {
 	mapped, ok := message.xorMappedAddress()
+	if !ok {
+		mapped, ok = message.mappedAddress()
+	}
 	if !ok || mapped == nil || mapped.IP == nil || mapped.Port <= 0 {
 		return
 	}
-	role := peerRelayProbePrimary
 	tx := stunTransactionHex(message.TransactionID)
 	mesh.mu.Lock()
-	if binding, ok := mesh.pendingStun[tx]; ok {
-		role = binding.Role
-		delete(mesh.pendingStun, tx)
+	binding, pending := mesh.pendingStun[tx]
+	if !pending {
+		mesh.mu.Unlock()
+		if mesh.logger != nil {
+			mesh.logger.Printf("Peer Mesh STUN Binding response ignored without pending transaction: tx=%s", tx)
+		}
+		return
 	}
+	if !sameUDPEndpoint(binding.ExpectedResponseEndpoint, observedRemote) {
+		mesh.mu.Unlock()
+		if mesh.logger != nil {
+			mesh.logger.Printf("Peer Mesh STUN Binding response source mismatch: role=%s expected=%v actual=%v",
+				binding.Role, binding.ExpectedResponseEndpoint, observedRemote)
+		}
+		return
+	}
+	delete(mesh.pendingStun, tx)
 	if mesh.srflxCandidates == nil {
 		mesh.srflxCandidates = make(map[string]peerCandidate)
 	}
+	role := binding.Role
 	publicStun := strings.HasPrefix(role, publicStunRolePrefix)
 	endpoint := endpointKeyUDP(mapped)
 	candidate := peerCandidate{
@@ -680,23 +731,199 @@ func (mesh *peerMeshClient) handleStunBindingSuccess(message stunMessage, observ
 		previousPrimary = candidateEndpointKey(*mesh.srflx)
 	}
 	mesh.srflxCandidates[candidateKey] = candidate
-	if !publicStun {
+	behaviorProbe := binding.BehaviorProbe
+	discovery := mesh.natBehavior
+	natType := ""
+	if !publicStun && behaviorProbe == "" {
 		mesh.natByRole[role] = endpoint
+		mesh.srflx = &candidate
+		natType = mesh.natTypeLocked()
+		mesh.natType = natType
+		mesh.lastEndpoint = endpoint
+		if mesh.natBehaviorDiscovery != natDiscoveryRFC5780 || mesh.natMappingBehavior == "" {
+			mesh.natMappingBehavior = ""
+			mesh.natFilteringBehavior = ""
+			mesh.natBehaviorDiscovery = natDiscoveryBasic
+		}
+	} else if !publicStun {
 		mesh.srflx = &candidate
 	}
 	announce := !candidateKnown || (!publicStun && previousPrimary != candidateKey)
-	natType := mesh.natTypeLocked()
 	mesh.mu.Unlock()
 
-	if !publicStun {
+	if behaviorProbe != "" {
+		if discovery != nil {
+			mesh.handleNatBehaviorTransition(discovery.succeeded(
+				binding.BehaviorGeneration,
+				behaviorProbe,
+				mapped))
+		}
+	} else if !publicStun {
 		mesh.reportDevice(nil, nil, mesh.deviceStatus(), mesh.deviceError(), natType, endpoint)
-		if other, ok := message.otherAddress(); ok {
-			mesh.requestAlternateProbe(role, other, observedRemote)
+		if role == peerRelayProbePrimary {
+			if other, standard := resolveStandardOtherAddress(message, observedRemote); standard {
+				mesh.startNatBehaviorDiscovery(observedRemote, mapped, other)
+			} else if other, available := resolveOtherAddress(message, observedRemote); available {
+				mesh.requestAlternateProbe(role, other, observedRemote)
+			}
 		}
 	}
 	if announce {
 		mesh.announceCandidates()
 	}
+}
+
+func (mesh *peerMeshClient) handleStunBindingError(message stunMessage, observedRemote *net.UDPAddr) {
+	tx := stunTransactionHex(message.TransactionID)
+	mesh.mu.Lock()
+	binding, ok := mesh.pendingStun[tx]
+	if !ok || !sameUDPEndpoint(binding.TargetEndpoint, observedRemote) {
+		mesh.mu.Unlock()
+		return
+	}
+	delete(mesh.pendingStun, tx)
+	discovery := mesh.natBehavior
+	mesh.mu.Unlock()
+
+	if binding.BehaviorProbe == "" || discovery == nil {
+		if mesh.logger != nil {
+			mesh.logger.Printf("Peer Mesh STUN Binding request failed: role=%s code=%d",
+				binding.Role, message.errorCode())
+		}
+		return
+	}
+	unknown := message.unknownAttributes()
+	unsupported := message.errorCode() == 420 &&
+		(len(unknown) == 0 || containsUint16(unknown, stunAttrChangeRequest))
+	mesh.handleNatBehaviorTransition(discovery.failed(
+		binding.BehaviorGeneration,
+		binding.BehaviorProbe,
+		unsupported))
+}
+
+func (mesh *peerMeshClient) startNatBehaviorDiscovery(
+	primaryEndpoint *net.UDPAddr,
+	mappedEndpoint *net.UDPAddr,
+	otherEndpoint *net.UDPAddr,
+) {
+	now := time.Now()
+	mesh.mu.Lock()
+	if !mesh.lastBehaviorDiscovery.IsZero() &&
+		now.Sub(mesh.lastBehaviorDiscovery) < peerBehaviorDiscoveryInterval {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.lastBehaviorDiscovery = now
+	discovery := mesh.natBehavior
+	if discovery == nil {
+		discovery = &natBehaviorDiscovery{}
+		mesh.natBehavior = discovery
+	}
+	mesh.mu.Unlock()
+
+	transition, err := discovery.begin(primaryEndpoint, mappedEndpoint, otherEndpoint)
+	if err != nil {
+		if mesh.logger != nil {
+			mesh.logger.Printf("Peer Mesh RFC 5780 topology ignored: %v", err)
+		}
+		return
+	}
+	mesh.handleNatBehaviorTransition(transition)
+}
+
+func (mesh *peerMeshClient) handleNatBehaviorTransition(transition natBehaviorTransition) {
+	if !transition.Accepted {
+		return
+	}
+	if transition.Snapshot.Complete {
+		mesh.reportNatBehavior(transition.Snapshot)
+	}
+	if transition.NextProbe != nil {
+		mesh.sendBehaviorProbe(*transition.NextProbe)
+	}
+}
+
+func (mesh *peerMeshClient) reportNatBehavior(snapshot natBehaviorSnapshot) {
+	if !snapshot.Complete || snapshot.MappedEndpoint == nil {
+		return
+	}
+	endpoint := endpointKeyUDP(snapshot.MappedEndpoint)
+	mesh.mu.Lock()
+	natType := mesh.compatibleNatTypeLocked(snapshot)
+	mesh.natType = natType
+	mesh.natMappingBehavior = snapshot.MappingBehavior
+	mesh.natFilteringBehavior = snapshot.FilteringBehavior
+	mesh.natBehaviorDiscovery = snapshot.Discovery
+	mesh.lastEndpoint = endpoint
+	mesh.mu.Unlock()
+	mesh.reportDevice(nil, nil, mesh.deviceStatus(), mesh.deviceError(), natType, endpoint)
+}
+
+func (mesh *peerMeshClient) compatibleNatTypeLocked(snapshot natBehaviorSnapshot) string {
+	if snapshot.MappedEndpoint != nil && mesh.isNoNatLocked(endpointKeyUDP(snapshot.MappedEndpoint)) {
+		return peerNatTypeNoNat
+	}
+	switch snapshot.MappingBehavior {
+	case natBehaviorAddressDependent, natBehaviorAddressAndPortDependent:
+		return peerNatTypeSymmetric
+	case natBehaviorEndpointIndependent:
+		switch snapshot.FilteringBehavior {
+		case natBehaviorAddressAndPortDependent:
+			return peerNatTypePortRestricted
+		case natBehaviorEndpointIndependent, natBehaviorAddressDependent:
+			return peerNatTypeFullConeOrRestricted
+		}
+	}
+	fallback := mesh.natTypeLocked()
+	if fallback != "" {
+		return fallback
+	}
+	return peerNatTypeNat
+}
+
+func resolveStandardOtherAddress(
+	message stunMessage,
+	observedRemote *net.UDPAddr,
+) (*net.UDPAddr, bool) {
+	if observedRemote == nil || observedRemote.IP == nil {
+		return nil, false
+	}
+	origin, originOK := message.responseOrigin()
+	other, otherOK := message.otherAddress()
+	if !originOK || !otherOK ||
+		!sameUDPEndpoint(origin, observedRemote) ||
+		other == nil ||
+		other.IP == nil ||
+		other.IP.Equal(observedRemote.IP) ||
+		other.Port == observedRemote.Port {
+		return nil, false
+	}
+	return other, true
+}
+
+func resolveOtherAddress(
+	message stunMessage,
+	observedRemote *net.UDPAddr,
+) (*net.UDPAddr, bool) {
+	if other, ok := resolveStandardOtherAddress(message, observedRemote); ok {
+		return other, true
+	}
+	if origin, ok := message.legacyXorResponseOrigin(); ok &&
+		sameUDPEndpoint(origin, observedRemote) {
+		if other, otherOK := message.legacyXorOtherAddress(); otherOK {
+			return other, true
+		}
+	}
+	return message.otherAddress()
+}
+
+func containsUint16(values []uint16, expected uint16) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func (mesh *peerMeshClient) handleTurnAllocated(message stunMessage, remote *net.UDPAddr) {
@@ -2059,7 +2286,31 @@ func (mesh *peerMeshClient) renewPortMappingIfNeeded() {
 	mesh.mu.Unlock()
 }
 
+func (mesh *peerMeshClient) requestStunCandidates() {
+	endpoint := mesh.stunEndpoint()
+	mesh.mu.Lock()
+	hasPublicStun := len(mesh.runtime.PeerMesh.PublicStunServers) > 0
+	now := time.Now()
+	if endpoint == nil && !hasPublicStun {
+		mesh.mu.Unlock()
+		return
+	}
+	if !mesh.lastStunRequest.IsZero() &&
+		now.Sub(mesh.lastStunRequest) < peerStunRequestInterval {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.lastStunRequest = now
+	mesh.mu.Unlock()
+
+	if endpoint != nil {
+		mesh.sendStunBinding(endpoint, peerRelayProbePrimary)
+	}
+	mesh.requestPublicStunBindings()
+}
+
 func (mesh *peerMeshClient) requestRelayCandidates() {
+	mesh.requestStunCandidates()
 	endpoint := mesh.relayEndpoint()
 	if endpoint == nil {
 		return
@@ -2079,8 +2330,6 @@ func (mesh *peerMeshClient) requestRelayCandidates() {
 	}
 	mesh.lastRelayRequest = now
 	mesh.mu.Unlock()
-	mesh.sendStunBinding(endpoint, peerRelayProbePrimary)
-	mesh.requestPublicStunBindings()
 	if allocationFresh {
 		mesh.sendStunRequest(newStunMessage(stunRefreshRequest, newStunTransactionID(),
 			stunAttrLifetimeValue(runtimeSessionTTL(sessionTTL))), endpoint)
@@ -2143,13 +2392,123 @@ func (mesh *peerMeshClient) removePublicStunCandidatesLocked() {
 
 func (mesh *peerMeshClient) sendStunBinding(endpoint *net.UDPAddr, role string) {
 	tx := newStunTransactionID()
+	request := newStunMessage(
+		stunBindingRequest,
+		tx,
+		stunAttrSoftwareValue("shuai-tunnel-peer-client"))
 	mesh.mu.Lock()
 	if mesh.pendingStun == nil {
 		mesh.pendingStun = make(map[string]pendingStunBinding)
 	}
-	mesh.pendingStun[stunTransactionHex(tx)] = pendingStunBinding{Role: role, SentAt: time.Now()}
+	mesh.pendingStun[stunTransactionHex(tx)] = pendingStunBinding{
+		Role:                     role,
+		TargetEndpoint:           cloneUDPAddr(endpoint),
+		ExpectedResponseEndpoint: cloneUDPAddr(endpoint),
+		Request:                  request,
+		SentAt:                   time.Now(),
+	}
 	mesh.mu.Unlock()
-	mesh.sendStunRequest(newStunMessage(stunBindingRequest, tx, stunAttrSoftwareValue("shuai-tunnel-peer-client")), endpoint)
+	mesh.sendStunRequest(request, endpoint)
+}
+
+func (mesh *peerMeshClient) sendBehaviorProbe(probe natBehaviorProbeRequest) {
+	if probe.TargetEndpoint == nil || probe.ExpectedResponseEndpoint == nil {
+		return
+	}
+	tx := newStunTransactionID()
+	attributes := []stunAttribute{stunAttrSoftwareValue("shuai-tunnel-peer-client")}
+	if probe.ChangeIP || probe.ChangePort {
+		attributes = append(attributes, stunAttrChangeRequestValue(probe.ChangeIP, probe.ChangePort))
+	}
+	request := newStunMessage(stunBindingRequest, tx, attributes...)
+	pending := pendingStunBinding{
+		Role:                     string(probe.Probe),
+		TargetEndpoint:           cloneUDPAddr(probe.TargetEndpoint),
+		ExpectedResponseEndpoint: cloneUDPAddr(probe.ExpectedResponseEndpoint),
+		Request:                  request,
+		BehaviorProbe:            probe.Probe,
+		BehaviorGeneration:       probe.Generation,
+		SentAt:                   time.Now(),
+	}
+	transactionKey := stunTransactionHex(tx)
+	mesh.mu.Lock()
+	if mesh.pendingStun == nil || mesh.udp == nil {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.pendingStun[transactionKey] = pending
+	stopCh := mesh.stopCh
+	mesh.mu.Unlock()
+	mesh.sendStunRequest(request, probe.TargetEndpoint)
+
+	go func() {
+		started := time.Now()
+		for _, retryAt := range []time.Duration{250 * time.Millisecond, 750 * time.Millisecond} {
+			if !waitPeerTimer(stopCh, retryAt-time.Since(started)) {
+				return
+			}
+			mesh.retryBehaviorProbe(transactionKey, pending)
+		}
+		if !waitPeerTimer(stopCh, peerBehaviorProbeTimeout-time.Since(started)) {
+			return
+		}
+		mesh.timeoutBehaviorProbe(transactionKey, pending)
+	}()
+}
+
+func (mesh *peerMeshClient) retryBehaviorProbe(
+	transactionKey string,
+	expected pendingStunBinding,
+) {
+	mesh.mu.Lock()
+	current, ok := mesh.pendingStun[transactionKey]
+	active := ok &&
+		current.BehaviorProbe == expected.BehaviorProbe &&
+		current.BehaviorGeneration == expected.BehaviorGeneration
+	mesh.mu.Unlock()
+	if active {
+		mesh.sendStunRequest(expected.Request, expected.TargetEndpoint)
+	}
+}
+
+func (mesh *peerMeshClient) timeoutBehaviorProbe(
+	transactionKey string,
+	expected pendingStunBinding,
+) {
+	mesh.mu.Lock()
+	current, ok := mesh.pendingStun[transactionKey]
+	if !ok ||
+		current.BehaviorProbe != expected.BehaviorProbe ||
+		current.BehaviorGeneration != expected.BehaviorGeneration {
+		mesh.mu.Unlock()
+		return
+	}
+	delete(mesh.pendingStun, transactionKey)
+	discovery := mesh.natBehavior
+	mesh.mu.Unlock()
+	if discovery != nil {
+		mesh.handleNatBehaviorTransition(discovery.timedOut(
+			expected.BehaviorGeneration,
+			expected.BehaviorProbe))
+	}
+}
+
+func waitPeerTimer(stopCh <-chan struct{}, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	if stopCh == nil {
+		<-timer.C
+		return true
+	}
+	select {
+	case <-stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (mesh *peerMeshClient) sendStunRequest(message stunMessage, endpoint *net.UDPAddr) {
@@ -2313,6 +2672,28 @@ func (mesh *peerMeshClient) ensureTurnPermission(peer *net.UDPAddr) {
 		newStunAttrXorPeerAddress(peer, tx)), endpoint)
 }
 
+func (mesh *peerMeshClient) stunEndpoint() *net.UDPAddr {
+	mesh.mu.Lock()
+	runtime := mesh.runtime
+	mesh.mu.Unlock()
+	host := firstNonEmpty(runtime.PeerMesh.StunHost, runtime.PeerMesh.TurnHost)
+	port := runtime.PeerMesh.StunPort
+	if port <= 0 {
+		port = runtime.PeerMesh.TurnPort
+	}
+	if host == "" || port <= 0 {
+		return nil
+	}
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
+	if err != nil {
+		if mesh.logger != nil {
+			mesh.logger.Printf("Peer Mesh STUN endpoint resolve failed: %s:%d %v", host, port, err)
+		}
+		return nil
+	}
+	return addr
+}
+
 func (mesh *peerMeshClient) relayEndpoint() *net.UDPAddr {
 	mesh.mu.Lock()
 	runtime := mesh.runtime
@@ -2342,23 +2723,35 @@ func (mesh *peerMeshClient) reportDevice(conn net.Conn, sender peerControlSender
 		sender = mesh.sender
 	}
 	runtime := mesh.runtime
+	if natType == "" {
+		natType = mesh.natType
+	}
+	if endpoint == "" {
+		endpoint = mesh.lastEndpoint
+	}
+	natMappingBehavior := mesh.natMappingBehavior
+	natFilteringBehavior := mesh.natFilteringBehavior
+	natBehaviorDiscovery := mesh.natBehaviorDiscovery
 	mesh.mu.Unlock()
 	if conn == nil || sender == nil || runtime.PeerMesh.ClientID <= 0 {
 		return
 	}
 	message := peerControlMessage{
-		Type:                peerControlTypeDeviceReport,
-		SourceClientID:      runtime.PeerMesh.ClientID,
-		SourceClientName:    runtime.PeerMesh.ClientName,
-		SourceVirtualIP:     runtime.PeerMesh.VirtualIP,
-		SourcePublicKey:     runtime.PeerMesh.ClientPublicKey,
-		VirtualDeviceMode:   mesh.config.PeerMeshDevice,
-		VirtualDeviceName:   mesh.config.PeerMeshTunName,
-		VirtualDeviceStatus: status,
-		VirtualDeviceError:  errText,
-		NatType:             natType,
-		LastEndpoint:        endpoint,
-		CreatedAtMillis:     time.Now().UnixMilli(),
+		Type:                 peerControlTypeDeviceReport,
+		SourceClientID:       runtime.PeerMesh.ClientID,
+		SourceClientName:     runtime.PeerMesh.ClientName,
+		SourceVirtualIP:      runtime.PeerMesh.VirtualIP,
+		SourcePublicKey:      runtime.PeerMesh.ClientPublicKey,
+		VirtualDeviceMode:    mesh.config.PeerMeshDevice,
+		VirtualDeviceName:    mesh.config.PeerMeshTunName,
+		VirtualDeviceStatus:  status,
+		VirtualDeviceError:   errText,
+		NatType:              natType,
+		NatMappingBehavior:   natMappingBehavior,
+		NatFilteringBehavior: natFilteringBehavior,
+		NatBehaviorDiscovery: natBehaviorDiscovery,
+		LastEndpoint:         endpoint,
+		CreatedAtMillis:      time.Now().UnixMilli(),
 	}
 	if sendErr := sender(conn, "", message); sendErr != nil {
 		mesh.logger.Printf("Peer Mesh device report failed: %v", sendErr)

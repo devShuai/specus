@@ -42,6 +42,9 @@ public class PeerControlMessage {
     private String virtualDeviceStatus;
     private String virtualDeviceError;
     private String natType;
+    private String natMappingBehavior;
+    private String natFilteringBehavior;
+    private String natBehaviorDiscovery;
     private String lastEndpoint;
     private long createdAtMillis;
     private ClientAuthLoginResponse.PeerMeshConfig peerMesh;

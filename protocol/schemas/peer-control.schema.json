@@ -557,6 +557,15 @@
             "natType": {
               "type": "string"
             },
+            "natMappingBehavior": {
+              "type": "string"
+            },
+            "natFilteringBehavior": {
+              "type": "string"
+            },
+            "natBehaviorDiscovery": {
+              "type": "string"
+            },
             "lastEndpoint": {
               "type": "string"
             }

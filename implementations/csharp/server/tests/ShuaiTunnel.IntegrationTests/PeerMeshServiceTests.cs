@@ -35,6 +35,100 @@ public sealed class PeerMeshServiceTests
     }
 
     [Fact]
+    public async Task RuntimeConfigUsesIndependentStandaloneStunEndpoint()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync(
+            publicAddress: "turn.example.com",
+            standaloneStunAddress: "stun.example.com",
+            standaloneStunPort: 5349);
+        var account = fixture.AddClient(1001, "tenant-a", "alice", "alice-laptop");
+        fixture.AddDevice(account, "100.96.0.10", "public-key");
+        await fixture.SaveChangesAsync();
+
+        var config = await fixture.Service.BuildRuntimeConfigAsync(account, CancellationToken.None);
+        var publicStun = fixture.Service.PublicStunConfig("ignored.example.com");
+
+        Assert.Equal("stun.example.com", config.StunHost);
+        Assert.Equal(5349, config.StunPort);
+        Assert.Equal("turn.example.com", config.TurnHost);
+        Assert.Equal(3478, config.TurnPort);
+        Assert.Equal("stun:stun.example.com:5349", publicStun.SelfHostedStunServer);
+        Assert.Equal(3478, publicStun.StunTurnPort);
+    }
+
+    [Fact]
+    public async Task PublicStunConfigSupportsIndependentDeploymentAndLegacyFallback()
+    {
+        await using var standalone = await PeerMeshFixture.CreateAsync(
+            enabled: false,
+            publicAddress: "turn.example.com",
+            stunTurnPort: 4444,
+            standaloneStunAddress: "stun.example.com",
+            standaloneStunPort: 5349);
+
+        var standaloneConfig = standalone.Service.PublicStunConfig("ignored.example.com");
+
+        Assert.False(standaloneConfig.PeerMeshEnabled);
+        Assert.Equal("stun:stun.example.com:5349", standaloneConfig.SelfHostedStunServer);
+        Assert.Single(standaloneConfig.StunServers, standaloneConfig.SelfHostedStunServer);
+        Assert.Equal(4444, standaloneConfig.StunTurnPort);
+
+        await using var legacy = await PeerMeshFixture.CreateAsync(
+            publicAddress: "relay.example.com",
+            stunTurnPort: 4444,
+            standaloneStunPort: 5349);
+
+        var legacyConfig = legacy.Service.PublicStunConfig("ignored.example.com");
+
+        Assert.Equal("stun:relay.example.com:4444", legacyConfig.SelfHostedStunServer);
+        Assert.Equal(4444, legacyConfig.StunTurnPort);
+
+        await using var partial = await PeerMeshFixture.CreateAsync(
+            publicAddress: "relay.example.com",
+            stunTurnPort: 4444,
+            standaloneStunAddress: "stun.example.com",
+            standaloneStunPort: 0);
+
+        var partialConfig = partial.Service.PublicStunConfig("ignored.example.com");
+
+        Assert.Equal("stun:relay.example.com:4444", partialConfig.SelfHostedStunServer);
+    }
+
+    [Fact]
+    public async Task DeviceReportPersistsNatBehaviorFields()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var account = fixture.AddClient(1002, "tenant-a", "alice", "alice-phone");
+        fixture.AddDevice(account, "100.96.0.11", "public-key");
+        await fixture.SaveChangesAsync();
+
+        await fixture.Service.HandleSignalAsync(new MessageRequestPacket
+        {
+            Message = JsonSerializer.Serialize(new PeerControlMessage
+            {
+                Type = "device-report",
+                NatType = "PORT_RESTRICTED_NAT",
+                NatMappingBehavior = "ENDPOINT_INDEPENDENT",
+                NatFilteringBehavior = "ADDRESS_AND_PORT_DEPENDENT",
+                NatBehaviorDiscovery = "RFC5780",
+                LastEndpoint = "198.51.100.20:52000",
+            }),
+        }, account.ClientName, CancellationToken.None);
+
+        fixture.Db.ChangeTracker.Clear();
+        var stored = await fixture.Db.PeerMeshDevices.SingleAsync(d => d.ClientId == account.Id);
+        var view = Assert.Single(await fixture.Service.ListDevicesAsync(
+            new ManagementContext("tenant-a", "alice", ManagementRole.User, false),
+            CancellationToken.None));
+        Assert.Equal("ENDPOINT_INDEPENDENT", stored.NatMappingBehavior);
+        Assert.Equal("ADDRESS_AND_PORT_DEPENDENT", stored.NatFilteringBehavior);
+        Assert.Equal("RFC5780", stored.NatBehaviorDiscovery);
+        Assert.Equal(stored.NatMappingBehavior, view.NatMappingBehavior);
+        Assert.Equal(stored.NatFilteringBehavior, view.NatFilteringBehavior);
+        Assert.Equal(stored.NatBehaviorDiscovery, view.NatBehaviorDiscovery);
+    }
+
+    [Fact]
     public async Task DirectionalAclAndExactTenantOwnerMatchingFollowJava()
     {
         await using var fixture = await PeerMeshFixture.CreateAsync();
@@ -519,7 +613,11 @@ public sealed class PeerMeshServiceTests
 
         public static async Task<PeerMeshFixture> CreateAsync(
             string publicAddress = "203.0.113.10",
-            IReadOnlyList<string>? publicStunServers = null)
+            IReadOnlyList<string>? publicStunServers = null,
+            string standaloneStunAddress = "",
+            int standaloneStunPort = 3478,
+            bool enabled = true,
+            int stunTurnPort = 3478)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -531,10 +629,12 @@ public sealed class PeerMeshServiceTests
             var registry = new SessionRegistry(NullLogger<SessionRegistry>.Instance);
             var service = new PeerMeshService(db, registry, Options.Create(new PeerMeshOptions
             {
-                Enabled = true,
+                Enabled = enabled,
                 Cidr = "100.96.0.0/11",
                 PublicAddress = publicAddress,
-                StunTurnPort = 3478,
+                StunTurnPort = stunTurnPort,
+                StandaloneStunAddress = standaloneStunAddress,
+                StandaloneStunPort = standaloneStunPort,
                 PublicStunServers = publicStunServers?.ToList() ?? [],
                 SessionTtlSeconds = 3600,
             }), NullLogger<PeerMeshService>.Instance);

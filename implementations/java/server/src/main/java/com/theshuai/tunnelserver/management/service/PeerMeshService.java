@@ -122,9 +122,9 @@ public class PeerMeshService {
         }
         config.setEnabled(device.isEnabled());
         config.setVirtualIp(device.getVirtualIp());
-        config.setStunHost(resolvePeerHost(requestServerName));
+        config.setStunHost(resolveStunHost(requestServerName));
         config.setTurnHost(resolvePeerHost(requestServerName));
-        config.setStunPort(properties.getStunTurnPort());
+        config.setStunPort(resolveStunPort());
         config.setTurnPort(properties.getStunTurnPort());
         TurnCredentialService.TurnCredential turnCredential =
                 turnCredentialService.issue("pm-" + account.getId());
@@ -379,6 +379,15 @@ public class PeerMeshService {
         }
         if (report.getNatType() != null) {
             device.setNatType(limit(report.getNatType(), 80));
+        }
+        if (report.getNatMappingBehavior() != null) {
+            device.setNatMappingBehavior(limit(report.getNatMappingBehavior(), 80));
+        }
+        if (report.getNatFilteringBehavior() != null) {
+            device.setNatFilteringBehavior(limit(report.getNatFilteringBehavior(), 80));
+        }
+        if (report.getNatBehaviorDiscovery() != null) {
+            device.setNatBehaviorDiscovery(limit(report.getNatBehaviorDiscovery(), 40));
         }
         if (report.getLastEndpoint() != null) {
             device.setLastEndpoint(limit(report.getLastEndpoint(), 255));
@@ -810,6 +819,9 @@ public class PeerMeshService {
                 device.getCidr(),
                 device.getPublicKey(),
                 device.getNatType(),
+                device.getNatMappingBehavior(),
+                device.getNatFilteringBehavior(),
+                device.getNatBehaviorDiscovery(),
                 device.getLastEndpoint(),
                 device.getVirtualDeviceMode(),
                 device.getVirtualDeviceName(),
@@ -876,6 +888,24 @@ public class PeerMeshService {
             return properties.getPublicAddress().trim();
         }
         return StringUtils.hasText(requestServerName) ? requestServerName.trim() : "";
+    }
+
+    private String resolveStunHost(String requestServerName) {
+        if (hasStandaloneStun()) {
+            return properties.getStandaloneStunAddress().trim();
+        }
+        return resolvePeerHost(requestServerName);
+    }
+
+    private int resolveStunPort() {
+        return hasStandaloneStun()
+                ? properties.getStandaloneStunPort()
+                : properties.getStunTurnPort();
+    }
+
+    private boolean hasStandaloneStun() {
+        return StringUtils.hasText(properties.getStandaloneStunAddress())
+                && properties.getStandaloneStunPort() > 0;
     }
 
     private List<String> publicStunServers() {

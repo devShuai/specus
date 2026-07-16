@@ -161,6 +161,9 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"tunnel_client_session", "message_attachments_capable", clientCapabilityBoolType},
 		{"tunnel_client_session", "message_media_preview_capable", clientCapabilityBoolType},
 		{"tunnel_client_session", "message_max_attachment_bytes", "BIGINT NOT NULL DEFAULT 0"},
+		{"peer_mesh_device", "nat_mapping_behavior", "VARCHAR(80)"},
+		{"peer_mesh_device", "nat_filtering_behavior", "VARCHAR(80)"},
+		{"peer_mesh_device", "nat_behavior_discovery", "VARCHAR(40)"},
 		{"peer_mesh_acl", "direction", "VARCHAR(16) NOT NULL DEFAULT 'OUTBOUND'"},
 	}
 	for _, column := range columns {

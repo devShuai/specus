@@ -44,7 +44,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan PathPrepareMinInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan RelayFreshRequestInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan RelayExpiringRequestInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan StunCandidateRequestInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan AlternateProbeMinInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan BehaviorDiscoveryMinInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan BehaviorProbeTimeout = TimeSpan.FromMilliseconds(1600);
     private static readonly TimeSpan TurnPermissionTtl = TimeSpan.FromMinutes(4);
     private static readonly TimeSpan PortMappingRetryInterval = TimeSpan.FromSeconds(30);
     private const int PortMappingLeaseSeconds = 7200;
@@ -88,6 +91,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly Dictionary<string, DateTimeOffset> _ignoredPacketLogAt = new(StringComparer.Ordinal);
     private readonly NatPortMappingService _portMappingService;
     private readonly TurnLongTermAuthenticator _turnAuthenticator = new();
+    private readonly NatBehaviorDiscovery _natBehaviorDiscovery = new();
 
     private CancellationTokenSource? _cts;
     private UdpClient? _udp;
@@ -101,8 +105,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private DateTimeOffset _relayTtl;
     private NatPortMapping? _portMapping;
     private DateTimeOffset _lastPortMapAttempt;
+    private DateTimeOffset _lastStunCandidateRequest;
     private DateTimeOffset _lastRelayCandidateRequest;
     private DateTimeOffset _lastAlternateProbeRequest;
+    private DateTimeOffset _lastBehaviorDiscoveryStarted;
+    private string _natType = "";
+    private string _natMappingBehavior = "";
+    private string _natFilteringBehavior = "";
+    private string _natBehaviorDiscoveryMode = "";
+    private string _lastEndpoint = "";
     private PeerKeyMaterial? _keyMaterial;
     private IPeerVirtualDevice? _device;
 
@@ -202,10 +213,17 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _portMap = null;
             _portMapping = null;
             _lastPortMapAttempt = DateTimeOffset.MinValue;
+            _lastStunCandidateRequest = DateTimeOffset.MinValue;
             _relayId = null;
             _relayTtl = DateTimeOffset.MinValue;
             _lastRelayCandidateRequest = DateTimeOffset.MinValue;
             _lastAlternateProbeRequest = DateTimeOffset.MinValue;
+            _lastBehaviorDiscoveryStarted = DateTimeOffset.MinValue;
+            _natType = "";
+            _natMappingBehavior = "";
+            _natFilteringBehavior = "";
+            _natBehaviorDiscoveryMode = "";
+            _lastEndpoint = "";
         }
 
         var device = PeerVirtualDevices.Create(_config, runtime.PeerMesh, _logger);
@@ -547,6 +565,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             case StunMessage.BindingSuccess:
                 await HandleStunBindingSuccessAsync(message, remote).ConfigureAwait(false);
                 break;
+            case StunMessage.BindingError:
+                await HandleStunBindingErrorAsync(message, remote).ConfigureAwait(false);
+                break;
             case StunMessage.AllocateSuccess:
                 CompleteTurnRequest(message, remote);
                 await HandleTurnAllocatedAsync(message).ConfigureAwait(false);
@@ -630,41 +651,41 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private async Task HandleStunBindingSuccessAsync(StunMessage message, IPEndPoint remote)
     {
-        var mapped = message.XorMappedAddress();
+        var mapped = message.XorMappedAddress() ?? message.MappedAddress();
         if (mapped is null)
         {
             return;
         }
+        PendingStunBinding pending;
         string role;
-        lock (_sync)
-        {
-            role = _pendingStun.Remove(message.TransactionIdHex, out var pendingRole)
-                ? pendingRole.Role
-                : RelayProbePrimary;
-        }
-        var publicStun = IsPublicStunRole(role);
-        var endpoint = EndpointKey(mapped);
-        if (!publicStun)
-        {
-            lock (_sync)
-            {
-                _natByRole[NormalizeProbeRole(role)] = endpoint;
-            }
-            await ReportDeviceAsync(DeviceStatus(), "", NatType(), endpoint).ConfigureAwait(false);
-            await RequestAlternateProbeAsync(role, message.OtherAddress(), remote).ConfigureAwait(false);
-        }
-
-        var candidate = new PeerCandidate(
-            "srflx",
-            "udp",
-            mapped.Address.ToString(),
-            mapped.Port,
-            800,
-            publicStun ? "public-stun" : "standard-stun",
-            "");
+        bool publicStun;
         bool announce;
+        string natType = "";
         lock (_sync)
         {
+            if (!_pendingStun.TryGetValue(message.TransactionIdHex, out var pendingValue)
+                || !SameEndpoint(pendingValue.ExpectedResponseEndpoint, remote))
+            {
+                _logger.LogDebug(
+                    "Peer Mesh STUN Binding response ignored: tx={TransactionId}, expected={Expected}, actual={Actual}",
+                    message.TransactionIdHex,
+                    pendingValue?.ExpectedResponseEndpoint,
+                    remote);
+                return;
+            }
+            pending = pendingValue;
+            _pendingStun.Remove(message.TransactionIdHex);
+            role = pending.Role;
+            publicStun = IsPublicStunRole(role);
+            var endpoint = EndpointKey(mapped);
+            var candidate = new PeerCandidate(
+                "srflx",
+                "udp",
+                mapped.Address.ToString(),
+                mapped.Port,
+                800,
+                publicStun ? "public-stun" : "standard-stun",
+                "");
             var key = CandidateEndpointKey(candidate);
             announce = !_srflxCandidates.ContainsKey(key)
                 || (!publicStun && (_srflx is null || CandidateEndpointKey(_srflx) != key));
@@ -672,6 +693,51 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             if (!publicStun)
             {
                 _srflx = candidate;
+                if (pending.BehaviorProbe is null)
+                {
+                    _natByRole[NormalizeProbeRole(role)] = endpoint;
+                    natType = NatTypeLocked();
+                    _natType = natType;
+                    _lastEndpoint = endpoint;
+                    if (!string.Equals(
+                            _natBehaviorDiscoveryMode,
+                            NatBehavior.DiscoveryRfc5780,
+                            StringComparison.Ordinal)
+                        || string.IsNullOrWhiteSpace(_natMappingBehavior))
+                    {
+                        _natMappingBehavior = "";
+                        _natFilteringBehavior = "";
+                        _natBehaviorDiscoveryMode = NatBehavior.DiscoveryBasic;
+                    }
+                }
+            }
+        }
+
+        if (pending.BehaviorProbe is { } behaviorProbe)
+        {
+            await HandleNatBehaviorTransitionAsync(_natBehaviorDiscovery.Succeeded(
+                pending.BehaviorGeneration,
+                behaviorProbe,
+                mapped)).ConfigureAwait(false);
+        }
+        else if (!publicStun)
+        {
+            await ReportDeviceAsync(DeviceStatus(), "", natType, EndpointKey(mapped)).ConfigureAwait(false);
+            if (string.Equals(
+                    NormalizeProbeRole(role),
+                    RelayProbePrimary,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                var standardOther = ResolveStandardOtherAddress(message, remote);
+                if (standardOther is not null)
+                {
+                    await StartNatBehaviorDiscoveryAsync(remote, mapped, standardOther).ConfigureAwait(false);
+                }
+                else
+                {
+                    await RequestAlternateProbeAsync(role, ResolveOtherAddress(message, remote), remote)
+                        .ConfigureAwait(false);
+                }
             }
         }
         if (announce)
@@ -679,6 +745,175 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             await AnnounceCandidatesAsync().ConfigureAwait(false);
         }
     }
+
+    private async Task HandleStunBindingErrorAsync(StunMessage message, IPEndPoint remote)
+    {
+        PendingStunBinding? pending;
+        lock (_sync)
+        {
+            if (!_pendingStun.TryGetValue(message.TransactionIdHex, out pending)
+                || !SameEndpoint(pending.TargetEndpoint, remote))
+            {
+                return;
+            }
+            _pendingStun.Remove(message.TransactionIdHex);
+        }
+        if (pending.BehaviorProbe is not { } behaviorProbe)
+        {
+            _logger.LogDebug(
+                "Peer Mesh STUN Binding request failed: role={Role}, code={Code}",
+                pending.Role,
+                message.ErrorCode());
+            return;
+        }
+        var unknown = message.UnknownAttributes();
+        var unsupported = message.ErrorCode() == 420
+            && (unknown.Count == 0 || unknown.Contains(StunMessage.AttrChangeRequest));
+        await HandleNatBehaviorTransitionAsync(_natBehaviorDiscovery.Failed(
+            pending.BehaviorGeneration,
+            behaviorProbe,
+            unsupported)).ConfigureAwait(false);
+    }
+
+    private async Task StartNatBehaviorDiscoveryAsync(
+        IPEndPoint primaryEndpoint,
+        IPEndPoint mappedEndpoint,
+        IPEndPoint otherEndpoint)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_sync)
+        {
+            if (_lastBehaviorDiscoveryStarted != DateTimeOffset.MinValue
+                && now - _lastBehaviorDiscoveryStarted < BehaviorDiscoveryMinInterval)
+            {
+                return;
+            }
+            _lastBehaviorDiscoveryStarted = now;
+        }
+        try
+        {
+            await HandleNatBehaviorTransitionAsync(_natBehaviorDiscovery.Begin(
+                primaryEndpoint,
+                mappedEndpoint,
+                otherEndpoint)).ConfigureAwait(false);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogDebug(ex, "Peer Mesh RFC 5780 topology ignored");
+        }
+    }
+
+    private async Task HandleNatBehaviorTransitionAsync(NatBehaviorTransition transition)
+    {
+        if (!transition.Accepted)
+        {
+            return;
+        }
+        if (transition.Snapshot.Complete)
+        {
+            await ReportNatBehaviorAsync(transition.Snapshot).ConfigureAwait(false);
+        }
+        if (transition.NextProbe is not null)
+        {
+            await SendBehaviorProbeAsync(transition.NextProbe).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ReportNatBehaviorAsync(NatBehaviorSnapshot snapshot)
+    {
+        if (!snapshot.Complete || snapshot.MappedEndpoint is null)
+        {
+            return;
+        }
+        var endpoint = EndpointKey(snapshot.MappedEndpoint);
+        string natType;
+        lock (_sync)
+        {
+            natType = CompatibleNatTypeLocked(snapshot);
+            _natType = natType;
+            _natMappingBehavior = snapshot.MappingBehavior;
+            _natFilteringBehavior = snapshot.FilteringBehavior;
+            _natBehaviorDiscoveryMode = snapshot.Discovery;
+            _lastEndpoint = endpoint;
+        }
+        await ReportDeviceAsync(DeviceStatus(), "", natType, endpoint).ConfigureAwait(false);
+    }
+
+    private string CompatibleNatTypeLocked(NatBehaviorSnapshot snapshot)
+    {
+        if (snapshot.MappedEndpoint is not null
+            && IsPortPreservedLocked(snapshot.MappedEndpoint)
+            && IsLocalAddress(snapshot.MappedEndpoint.Address))
+        {
+            return NatTypeNoNat;
+        }
+        if (string.Equals(snapshot.MappingBehavior, NatBehavior.AddressDependent, StringComparison.Ordinal)
+            || string.Equals(
+                snapshot.MappingBehavior,
+                NatBehavior.AddressAndPortDependent,
+                StringComparison.Ordinal))
+        {
+            return NatTypeSymmetric;
+        }
+        if (string.Equals(snapshot.MappingBehavior, NatBehavior.EndpointIndependent, StringComparison.Ordinal))
+        {
+            if (string.Equals(
+                    snapshot.FilteringBehavior,
+                    NatBehavior.AddressAndPortDependent,
+                    StringComparison.Ordinal))
+            {
+                return NatTypePortRestricted;
+            }
+            if (string.Equals(
+                    snapshot.FilteringBehavior,
+                    NatBehavior.EndpointIndependent,
+                    StringComparison.Ordinal)
+                || string.Equals(
+                    snapshot.FilteringBehavior,
+                    NatBehavior.AddressDependent,
+                    StringComparison.Ordinal))
+            {
+                return NatTypeFullConeOrRestricted;
+            }
+        }
+        return FirstNonEmpty(_natType, NatTypeLocked(), NatTypeNat);
+    }
+
+    private static IPEndPoint? ResolveStandardOtherAddress(StunMessage message, IPEndPoint remote)
+    {
+        var origin = message.ResponseOrigin();
+        var other = message.OtherAddress();
+        if (origin is null
+            || other is null
+            || !SameEndpoint(origin, remote)
+            || other.Address.Equals(remote.Address)
+            || other.Port == remote.Port)
+        {
+            return null;
+        }
+        return other;
+    }
+
+    private static IPEndPoint? ResolveOtherAddress(StunMessage message, IPEndPoint remote)
+    {
+        var standard = ResolveStandardOtherAddress(message, remote);
+        if (standard is not null)
+        {
+            return standard;
+        }
+        var legacyOrigin = message.LegacyXorResponseOrigin();
+        if (legacyOrigin is not null && SameEndpoint(legacyOrigin, remote))
+        {
+            return message.LegacyXorOtherAddress();
+        }
+        return message.OtherAddress();
+    }
+
+    private static bool SameEndpoint(IPEndPoint? first, IPEndPoint? second) =>
+        first is not null
+        && second is not null
+        && first.Port == second.Port
+        && first.Address.Equals(second.Address);
 
     private async Task HandleTurnAllocatedAsync(StunMessage message)
     {
@@ -2194,8 +2429,35 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
     }
 
+    private async Task RequestStunCandidatesAsync()
+    {
+        var endpoint = StunEndpoint();
+        var runtime = Runtime();
+        var hasPublicStun = runtime?.PeerMesh.PublicStunServers is { Count: > 0 };
+        var now = DateTimeOffset.UtcNow;
+        lock (_sync)
+        {
+            if (endpoint is null && !hasPublicStun)
+            {
+                return;
+            }
+            if (_lastStunCandidateRequest != DateTimeOffset.MinValue
+                && now - _lastStunCandidateRequest < StunCandidateRequestInterval)
+            {
+                return;
+            }
+            _lastStunCandidateRequest = now;
+        }
+        if (endpoint is not null)
+        {
+            await SendStunBindingAsync(endpoint, RelayProbePrimary).ConfigureAwait(false);
+        }
+        await RequestPublicStunBindingsAsync().ConfigureAwait(false);
+    }
+
     private async Task RequestRelayCandidatesAsync()
     {
+        await RequestStunCandidatesAsync().ConfigureAwait(false);
         var endpoint = RelayEndpoint();
         if (endpoint is null)
         {
@@ -2217,8 +2479,6 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             _lastRelayCandidateRequest = now;
         }
-        await SendStunBindingAsync(endpoint, RelayProbePrimary).ConfigureAwait(false);
-        await RequestPublicStunBindingsAsync().ConfigureAwait(false);
         if (fresh)
         {
             await SendStunRequestAsync(StunMessage.Of(
@@ -2238,16 +2498,121 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private async Task SendStunBindingAsync(IPEndPoint endpoint, string role)
     {
         var transactionId = StunMessage.NewTransactionId();
+        var request = StunMessage.Of(
+            StunMessage.BindingRequest,
+            transactionId,
+            StunMessage.Software("shuai-tunnel-peer-client"));
         lock (_sync)
         {
             _pendingStun[Convert.ToHexString(transactionId).ToLowerInvariant()] =
-                new PendingStunBinding(BindingProbeRole(role), DateTimeOffset.UtcNow);
+                new PendingStunBinding(
+                    BindingProbeRole(role),
+                    endpoint,
+                    endpoint,
+                    request,
+                    null,
+                    0,
+                    DateTimeOffset.UtcNow);
         }
-        await SendStunRequestAsync(StunMessage.Of(
-            StunMessage.BindingRequest,
-            transactionId,
-            StunMessage.Software("shuai-tunnel-peer-client")),
-            endpoint).ConfigureAwait(false);
+        await SendStunRequestAsync(request, endpoint).ConfigureAwait(false);
+    }
+
+    private async Task SendBehaviorProbeAsync(NatBehaviorProbeRequest probe)
+    {
+        var transactionId = StunMessage.NewTransactionId();
+        var attributes = new List<StunAttribute>
+        {
+            StunMessage.Software("shuai-tunnel-peer-client"),
+        };
+        if (probe.ChangeIp || probe.ChangePort)
+        {
+            attributes.Add(StunMessage.ChangeRequest(probe.ChangeIp, probe.ChangePort));
+        }
+        var request = new StunMessage(StunMessage.BindingRequest, transactionId, attributes);
+        var pending = new PendingStunBinding(
+            BehaviorProbeRole(probe.Probe),
+            probe.TargetEndpoint,
+            probe.ExpectedResponseEndpoint,
+            request,
+            probe.Probe,
+            probe.Generation,
+            DateTimeOffset.UtcNow);
+        CancellationToken cancellationToken;
+        lock (_sync)
+        {
+            if (_udp is null || _cts is null)
+            {
+                return;
+            }
+            _pendingStun[request.TransactionIdHex] = pending;
+            cancellationToken = _cts.Token;
+        }
+        await SendStunRequestAsync(request, probe.TargetEndpoint).ConfigureAwait(false);
+        _ = Task.Run(
+            () => RunBehaviorProbeTimerAsync(request.TransactionIdHex, pending, cancellationToken),
+            CancellationToken.None);
+    }
+
+    private async Task RunBehaviorProbeTimerAsync(
+        string transactionKey,
+        PendingStunBinding pending,
+        CancellationToken cancellationToken)
+    {
+        var started = DateTimeOffset.UtcNow;
+        try
+        {
+            foreach (var retryAt in new[] { TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(750) })
+            {
+                var delay = retryAt - (DateTimeOffset.UtcNow - started);
+                if (delay > TimeSpan.Zero)
+                {
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+                await RetryBehaviorProbeAsync(transactionKey, pending).ConfigureAwait(false);
+            }
+            var timeoutDelay = BehaviorProbeTimeout - (DateTimeOffset.UtcNow - started);
+            if (timeoutDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(timeoutDelay, cancellationToken).ConfigureAwait(false);
+            }
+            await TimeoutBehaviorProbeAsync(transactionKey, pending).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal Peer Mesh shutdown.
+        }
+    }
+
+    private async Task RetryBehaviorProbeAsync(string transactionKey, PendingStunBinding expected)
+    {
+        lock (_sync)
+        {
+            if (!_pendingStun.TryGetValue(transactionKey, out var current)
+                || !ReferenceEquals(current, expected))
+            {
+                return;
+            }
+        }
+        await SendStunRequestAsync(expected.Request, expected.TargetEndpoint).ConfigureAwait(false);
+    }
+
+    private async Task TimeoutBehaviorProbeAsync(string transactionKey, PendingStunBinding expected)
+    {
+        lock (_sync)
+        {
+            if (!_pendingStun.TryGetValue(transactionKey, out var current)
+                || !ReferenceEquals(current, expected))
+            {
+                return;
+            }
+            _pendingStun.Remove(transactionKey);
+        }
+        if (expected.BehaviorProbe is { } behaviorProbe)
+        {
+            await HandleNatBehaviorTransitionAsync(_natBehaviorDiscovery.TimedOut(
+                expected.BehaviorGeneration,
+                behaviorProbe)).ConfigureAwait(false);
+        }
     }
 
     private async Task RequestPublicStunBindingsAsync()
@@ -2434,6 +2799,33 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             turnServer).ConfigureAwait(false);
     }
 
+    private IPEndPoint? StunEndpoint()
+    {
+        var runtime = Runtime();
+        if (runtime is null)
+        {
+            return null;
+        }
+        var host = FirstNonEmpty(runtime.PeerMesh.StunHost, runtime.PeerMesh.TurnHost);
+        var port = runtime.PeerMesh.StunPort > 0 ? runtime.PeerMesh.StunPort : runtime.PeerMesh.TurnPort;
+        if (string.IsNullOrWhiteSpace(host) || port <= 0)
+        {
+            return null;
+        }
+        if (!IPAddress.TryParse(host, out var ip))
+        {
+            try
+            {
+                ip = Dns.GetHostAddresses(host).FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork);
+            }
+            catch (SocketException ex)
+            {
+                _logger.LogDebug(ex, "Peer Mesh STUN endpoint resolve failed: {Host}:{Port}", host, port);
+            }
+        }
+        return ip is null ? null : new IPEndPoint(ip, port);
+    }
+
     private IPEndPoint? RelayEndpoint()
     {
         var runtime = Runtime();
@@ -2580,6 +2972,16 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static string BindingProbeRole(string? role) =>
         IsPublicStunRole(role) ? role!.Trim() : NormalizeProbeRole(role);
 
+    private static string BehaviorProbeRole(NatBehaviorProbe probe) =>
+        probe switch
+        {
+            NatBehaviorProbe.FilterChangeIpAndPort => "rfc5780-filter-change-ip-port",
+            NatBehaviorProbe.FilterChangePort => "rfc5780-filter-change-port",
+            NatBehaviorProbe.MappingAlternateIp => "rfc5780-mapping-alternate-ip",
+            NatBehaviorProbe.MappingAlternateIpAndPort => "rfc5780-mapping-alternate-ip-port",
+            _ => throw new ArgumentOutOfRangeException(nameof(probe)),
+        };
+
     private static bool IsPublicStunRole(string? role) =>
         !string.IsNullOrWhiteSpace(role) && role.StartsWith(PublicStunRolePrefix, StringComparison.OrdinalIgnoreCase);
 
@@ -2602,6 +3004,17 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private async Task ReportDeviceAsync(TunnelRuntimeState runtime, FrameWriter writer, string status, string error, string natType, string endpoint, CancellationToken cancellationToken)
     {
+        string natMappingBehavior;
+        string natFilteringBehavior;
+        string natBehaviorDiscovery;
+        lock (_sync)
+        {
+            natType = FirstNonEmpty(natType, _natType);
+            endpoint = FirstNonEmpty(endpoint, _lastEndpoint);
+            natMappingBehavior = _natMappingBehavior;
+            natFilteringBehavior = _natFilteringBehavior;
+            natBehaviorDiscovery = _natBehaviorDiscoveryMode;
+        }
         await SendPeerControlAsync("", new PeerControlMessage
         {
             Type = TypeDeviceReport,
@@ -2614,6 +3027,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             VirtualDeviceStatus = status,
             VirtualDeviceError = error,
             NatType = natType,
+            NatMappingBehavior = natMappingBehavior,
+            NatFilteringBehavior = natFilteringBehavior,
+            NatBehaviorDiscovery = natBehaviorDiscovery,
             LastEndpoint = endpoint,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         }, writer, runtime, cancellationToken).ConfigureAwait(false);
@@ -2756,7 +3172,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     {
         lock (_sync)
         {
-            return NatTypeLocked();
+            return FirstNonEmpty(_natType, NatTypeLocked());
         }
     }
 
@@ -3032,10 +3448,17 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _portMap = null;
             _portMapping = null;
             _lastPortMapAttempt = DateTimeOffset.MinValue;
+            _lastStunCandidateRequest = DateTimeOffset.MinValue;
             _relayId = null;
             _relayTtl = DateTimeOffset.MinValue;
             _lastRelayCandidateRequest = DateTimeOffset.MinValue;
             _lastAlternateProbeRequest = DateTimeOffset.MinValue;
+            _lastBehaviorDiscoveryStarted = DateTimeOffset.MinValue;
+            _natType = "";
+            _natMappingBehavior = "";
+            _natFilteringBehavior = "";
+            _natBehaviorDiscoveryMode = "";
+            _lastEndpoint = "";
             _keyMaterial = null;
         }
         foreach (var pending in pendingMessageAcks)
@@ -3189,7 +3612,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
 
     private sealed record PendingProbe(long SessionId, long PeerId, DateTimeOffset SentAt, bool Relay, string? RelayId);
 
-    private sealed record PendingStunBinding(string Role, DateTimeOffset SentAt);
+    private sealed record PendingStunBinding(
+        string Role,
+        IPEndPoint TargetEndpoint,
+        IPEndPoint ExpectedResponseEndpoint,
+        StunMessage Request,
+        NatBehaviorProbe? BehaviorProbe,
+        int BehaviorGeneration,
+        DateTimeOffset SentAt);
 
     private sealed record PendingTurnRequest(
         ushort RequestType,
@@ -3304,6 +3734,12 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public long RelayBytes { get; set; }
         [JsonPropertyName("natType")]
         public string? NatType { get; set; }
+        [JsonPropertyName("natMappingBehavior")]
+        public string? NatMappingBehavior { get; set; }
+        [JsonPropertyName("natFilteringBehavior")]
+        public string? NatFilteringBehavior { get; set; }
+        [JsonPropertyName("natBehaviorDiscovery")]
+        public string? NatBehaviorDiscovery { get; set; }
         [JsonPropertyName("lastEndpoint")]
         public string? LastEndpoint { get; set; }
         [JsonPropertyName("virtualDeviceMode")]

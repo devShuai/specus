@@ -216,6 +216,8 @@ public sealed class PeerMeshOptions
     public string Cidr { get; set; } = "100.96.0.0/11";
     public string PublicAddress { get; set; } = string.Empty;
     public int StunTurnPort { get; set; } = 3478;
+    public string StandaloneStunAddress { get; set; } = string.Empty;
+    public int StandaloneStunPort { get; set; } = 3478;
     public int NatProbeAlternatePort { get; set; } = 3479;
     public List<string> PublicStunServers { get; set; } = [];
     public long SessionTtlSeconds { get; set; } = 3600;

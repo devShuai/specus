@@ -968,6 +968,21 @@ namespace ShuaiTunnel.Server.Data.Postgres.Migrations
                         .HasColumnType("character varying(40)")
                         .HasColumnName("last_seen_at");
 
+                    b.Property<string>("NatBehaviorDiscovery")
+                        .HasMaxLength(40)
+                        .HasColumnType("character varying(40)")
+                        .HasColumnName("nat_behavior_discovery");
+
+                    b.Property<string>("NatFilteringBehavior")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("nat_filtering_behavior");
+
+                    b.Property<string>("NatMappingBehavior")
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)")
+                        .HasColumnName("nat_mapping_behavior");
+
                     b.Property<string>("NatType")
                         .HasMaxLength(80)
                         .HasColumnType("character varying(80)")

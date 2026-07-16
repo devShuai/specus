@@ -169,6 +169,8 @@ type PeerMeshConfig struct {
 	CIDR                        string   `json:"cidr"`
 	PublicAddress               string   `json:"publicAddress"`
 	StunTurnPort                int      `json:"stunTurnPort"`
+	StandaloneStunAddress       string   `json:"standaloneStunAddress"`
+	StandaloneStunPort          int      `json:"standaloneStunPort"`
 	NatProbeAlternatePort       int      `json:"natProbeAlternatePort"`
 	PublicStunServers           []string `json:"publicStunServers"`
 	SessionTTLSeconds           int64    `json:"sessionTtlSeconds"`
@@ -292,6 +294,7 @@ func Default() Config {
 			Enabled:                     false,
 			CIDR:                        "100.96.0.0/11",
 			StunTurnPort:                3478,
+			StandaloneStunPort:          3478,
 			NatProbeAlternatePort:       3479,
 			SessionTTLSeconds:           3600,
 			AllocationTTLSeconds:        300,
@@ -473,6 +476,8 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("TUNNEL_PEER_MESH_CIDR", &cfg.PeerMesh.CIDR)
 	setStr("TUNNEL_PEER_MESH_PUBLIC_ADDRESS", &cfg.PeerMesh.PublicAddress)
 	setInt("TUNNEL_PEER_MESH_STUN_TURN_PORT", &cfg.PeerMesh.StunTurnPort)
+	setStr("TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS", &cfg.PeerMesh.StandaloneStunAddress)
+	setInt("TUNNEL_PEER_MESH_STANDALONE_STUN_PORT", &cfg.PeerMesh.StandaloneStunPort)
 	setInt("TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", &cfg.PeerMesh.NatProbeAlternatePort)
 	setStrSlice("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", &cfg.PeerMesh.PublicStunServers)
 	setInt64("TUNNEL_PEER_MESH_SESSION_TTL_SECONDS", &cfg.PeerMesh.SessionTTLSeconds)

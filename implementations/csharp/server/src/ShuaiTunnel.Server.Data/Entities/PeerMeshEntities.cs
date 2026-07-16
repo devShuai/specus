@@ -11,6 +11,9 @@ public sealed class PeerMeshDevice
     public string Cidr { get; set; } = string.Empty;
     public string? PublicKey { get; set; }
     public string? NatType { get; set; }
+    public string? NatMappingBehavior { get; set; }
+    public string? NatFilteringBehavior { get; set; }
+    public string? NatBehaviorDiscovery { get; set; }
     public string? LastEndpoint { get; set; }
     public string? VirtualDeviceMode { get; set; }
     public string? VirtualDeviceName { get; set; }

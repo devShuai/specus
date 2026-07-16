@@ -478,6 +478,79 @@ func TestPeerMeshRequestRelayCandidatesIsThrottledLikeJava(t *testing.T) {
 	}
 }
 
+func TestPeerMeshUsesIndependentStunAndTurnEndpoints(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen client udp: %v", err)
+	}
+	defer udp.Close()
+	stunServer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen STUN udp: %v", err)
+	}
+	defer stunServer.Close()
+	turnServer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen TURN udp: %v", err)
+	}
+	defer turnServer.Close()
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	mesh := &peerMeshClient{
+		udp:             udp,
+		stopCh:          stopCh,
+		logger:          log.New(io.Discard, "", 0),
+		pendingStun:     make(map[string]pendingStunBinding),
+		srflxCandidates: make(map[string]peerCandidate),
+		natByRole:       make(map[string]string),
+		natBehavior:     &natBehaviorDiscovery{},
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			StunHost: "127.0.0.1",
+			StunPort: stunServer.LocalAddr().(*net.UDPAddr).Port,
+			TurnHost: "127.0.0.1",
+			TurnPort: turnServer.LocalAddr().(*net.UDPAddr).Port,
+		}},
+	}
+
+	mesh.requestRelayCandidates()
+	binding := readStunMessages(t, stunServer, 1)
+	allocate := readStunMessages(t, turnServer, 1)
+	if len(binding) != 1 || binding[0].Type != stunBindingRequest {
+		t.Fatalf("STUN endpoint messages = %+v, want binding", binding)
+	}
+	if len(allocate) != 1 || allocate[0].Type != stunAllocateRequest {
+		t.Fatalf("TURN endpoint messages = %+v, want allocate", allocate)
+	}
+	if extra := readStunMessages(t, turnServer, 1); len(extra) != 0 {
+		t.Fatalf("TURN endpoint received unexpected STUN binding: %+v", extra)
+	}
+
+	primary := stunServer.LocalAddr().(*net.UDPAddr)
+	otherPort := primary.Port + 1
+	if otherPort > 65535 {
+		otherPort = primary.Port - 1
+	}
+	other := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: otherPort}
+	mapped := &net.UDPAddr{IP: net.ParseIP("198.51.100.20"), Port: 52000}
+	success := newStunMessage(
+		stunBindingSuccess,
+		binding[0].TransactionID,
+		stunAttribute{Type: stunAttrXorMappedAddress, Value: encodeStunXorAddress(mapped, binding[0].TransactionID)},
+		stunAttrResponseOriginValue(primary),
+		stunAttrOtherAddressValue(other))
+	mesh.handleStunTurnMessage(success, primary)
+
+	filterProbe := readStunMessages(t, stunServer, 1)
+	if len(filterProbe) != 1 || filterProbe[0].Type != stunBindingRequest {
+		t.Fatalf("filter probe = %+v", filterProbe)
+	}
+	changeIP, changePort, ok := filterProbe[0].changeRequest()
+	if !ok || !changeIP || !changePort {
+		t.Fatalf("filter probe change request = ip:%v port:%v ok:%v", changeIP, changePort, ok)
+	}
+}
+
 func TestPeerMeshRequestRelayRefreshIsThrottledLikeJava(t *testing.T) {
 	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {

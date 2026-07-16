@@ -122,6 +122,8 @@ func TestLoadFromEnvMapsJavaTrafficCaptureQueueOptions(t *testing.T) {
 
 func TestLoadFromEnvMapsJavaPeerMeshStunAndRelayOptions(t *testing.T) {
 	t.Setenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", "stun:stun1.example.com:3478, stun2.example.com:5349")
+	t.Setenv("TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun.example.com")
+	t.Setenv("TUNNEL_PEER_MESH_STANDALONE_STUN_PORT", "5349")
 	t.Setenv("TUNNEL_PEER_MESH_RELAY_MIN_PORT", "50000")
 	t.Setenv("TUNNEL_PEER_MESH_RELAY_MAX_PORT", "50100")
 	t.Setenv("TUNNEL_PEER_MESH_RELAY_WORKER_THREADS", "4")
@@ -135,6 +137,10 @@ func TestLoadFromEnvMapsJavaPeerMeshStunAndRelayOptions(t *testing.T) {
 
 	if len(cfg.PeerMesh.PublicStunServers) != 2 {
 		t.Fatalf("public stun servers = %#v, want 2 entries", cfg.PeerMesh.PublicStunServers)
+	}
+	if cfg.PeerMesh.StandaloneStunAddress != "stun.example.com" || cfg.PeerMesh.StandaloneStunPort != 5349 {
+		t.Fatalf("standalone STUN = %s:%d, want stun.example.com:5349",
+			cfg.PeerMesh.StandaloneStunAddress, cfg.PeerMesh.StandaloneStunPort)
 	}
 	if cfg.PeerMesh.RelayMinPort != 50000 || cfg.PeerMesh.RelayMaxPort != 50100 {
 		t.Fatalf("relay port range = %d-%d, want 50000-50100", cfg.PeerMesh.RelayMinPort, cfg.PeerMesh.RelayMaxPort)

@@ -30,6 +30,8 @@ import { EmptyState } from "../../components/EmptyState";
 import { useNowTick } from "../../hooks/useNowTick";
 import {
   NAT_TYPE_PROFILES,
+  natBehaviorDiscoveryLabel,
+  natBehaviorLabel,
   natReachabilityWeight,
   natTypeColor,
   natTypeLabel,
@@ -132,6 +134,9 @@ export function PeerMeshPanel() {
           device.virtualIp,
           device.lastEndpoint,
           device.natType,
+          device.natMappingBehavior,
+          device.natFilteringBehavior,
+          device.natBehaviorDiscovery,
           device.virtualDeviceName,
         ]
           .filter(Boolean)
@@ -352,8 +357,9 @@ export function PeerMeshPanel() {
                     {
                       label: "NAT",
                       value: (
-                        <div className="flex flex-col">
+                        <div className="flex flex-col gap-0.5">
                           <span>{natTypeLabel(device.natType)}</span>
+                          <PeerNatBehaviorLine device={device} />
                           <span className="break-all text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
                         </div>
                       ),
@@ -434,8 +440,9 @@ export function PeerMeshPanel() {
                   </div>
                 </TableCell>
                 <TableCell>
-                  <div className="flex max-w-72 flex-col break-all text-small">
+                  <div className="flex max-w-72 flex-col gap-0.5 break-all text-small">
                     <span>{natTypeLabel(device.natType)}</span>
+                    <PeerNatBehaviorLine device={device} />
                     <span className="text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
                   </div>
                 </TableCell>
@@ -881,6 +888,9 @@ function PeerNatInsight({
                           fields={[
                             { label: "虚拟 IP", value: <span className="font-mono">{device.virtualIp || "-"}</span> },
                             { label: "Endpoint", value: <span className="break-all font-mono">{device.lastEndpoint || "-"}</span> },
+                            { label: "映射行为", value: natBehaviorLabel(device.natMappingBehavior) },
+                            { label: "过滤行为", value: natBehaviorLabel(device.natFilteringBehavior) },
+                            { label: "探测方式", value: natBehaviorDiscoveryLabel(device.natBehaviorDiscovery) },
                             { label: "路径建议", value: profile.reachabilityLabel },
                             { label: "最后上报", value: formatDateTime(peerNatLastReportAt(device)) },
                           ]}
@@ -898,14 +908,14 @@ function PeerNatInsight({
                     removeWrapper
                   >
                     <TableHeader>
-                      <TableColumn className="w-[24%]">
+                      <TableColumn className="w-[22%]">
                         <PeerNatKeywordHeader keyword={keyword} onKeywordChange={onKeywordChange} />
                       </TableColumn>
-                      <TableColumn className="w-[16%]">
+                      <TableColumn className="w-[24%]">
                         <PeerNatTypeFilterHeader filter={filter} onFilterChange={onFilterChange} />
                       </TableColumn>
-                      <TableColumn className="w-[22%]">Endpoint</TableColumn>
-                      <TableColumn className="w-[24%]">建议</TableColumn>
+                      <TableColumn className="w-[18%]">Endpoint</TableColumn>
+                      <TableColumn className="w-[22%]">建议</TableColumn>
                       <TableColumn className="w-[14%]">上报</TableColumn>
                     </TableHeader>
                     <TableBody items={devices} isLoading={loading} emptyContent="暂无客户端 NAT 检测结果">
@@ -920,9 +930,12 @@ function PeerNatInsight({
                               </div>
                             </TableCell>
                             <TableCell>
-                              <Chip className="w-fit" size="sm" color={profile.tone} variant="flat">
-                                {profile.label}
-                              </Chip>
+                              <div className="flex min-w-0 flex-col gap-1">
+                                <Chip className="w-fit" size="sm" color={profile.tone} variant="flat">
+                                  {profile.label}
+                                </Chip>
+                                <PeerNatBehaviorLine device={device} />
+                              </div>
                             </TableCell>
                             <TableCell>
                               <span className="block truncate font-mono text-tiny" title={device.lastEndpoint || "-"}>{device.lastEndpoint || "-"}</span>
@@ -986,6 +999,22 @@ function PeerNatInsight({
         </Card>
       </div>
     </section>
+  );
+}
+
+function PeerNatBehaviorLine({ device }: { device: PeerMeshDevice }) {
+  const hasBehavior = Boolean(device.natMappingBehavior || device.natFilteringBehavior);
+  if (!hasBehavior && !device.natBehaviorDiscovery) {
+    return null;
+  }
+  const discovery = natBehaviorDiscoveryLabel(device.natBehaviorDiscovery);
+  const detail = hasBehavior
+    ? `映射 ${natBehaviorLabel(device.natMappingBehavior)} · 过滤 ${natBehaviorLabel(device.natFilteringBehavior)}`
+    : `${discovery} · 行为未细分`;
+  return (
+    <span className="truncate text-tiny text-default-500" title={hasBehavior ? `${discovery} · ${detail}` : detail}>
+      {detail}
+    </span>
   );
 }
 

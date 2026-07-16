@@ -6,6 +6,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -216,6 +217,39 @@ public class PeerMeshProtocolTest {
         assertNotNull(secondMessage);
         assertEquals(peer, firstMessage.xorPeerAddress());
         assertEquals(peer, secondMessage.xorPeerAddress());
+    }
+
+    @Test
+    public void stunRfc5780AttributesRoundTrip() throws Exception {
+        byte[] transactionId = transactionId(50);
+        InetSocketAddress mapped = new InetSocketAddress(
+                InetAddress.getByName("198.51.100.20"), 52000);
+        InetSocketAddress origin = new InetSocketAddress(
+                InetAddress.getByName("203.0.113.10"), 3478);
+        InetSocketAddress other = new InetSocketAddress(
+                InetAddress.getByName("203.0.113.11"), 3479);
+        PeerMeshEngine.StunMessage parsed = PeerMeshEngine.StunMessage.parse(
+                PeerMeshEngine.StunMessage.of(
+                        PeerMeshEngine.StunMessage.BINDING_SUCCESS,
+                        transactionId,
+                        PeerMeshEngine.StunMessage.xorMappedAddress(mapped, transactionId),
+                        PeerMeshEngine.StunMessage.responseOrigin(origin),
+                        PeerMeshEngine.StunMessage.otherAddress(other),
+                        PeerMeshEngine.StunMessage.changeRequest(true, true),
+                        PeerMeshEngine.StunMessage.unknownAttributes(
+                                PeerMeshEngine.StunMessage.ATTR_CHANGE_REQUEST)).toBytes());
+
+        assertNotNull(parsed);
+        assertEquals(mapped, parsed.xorMappedAddress());
+        assertEquals(origin, parsed.responseOrigin());
+        assertEquals(other, parsed.otherAddress());
+        PeerMeshEngine.StunMessage.ChangeRequest change = parsed.changeRequest();
+        assertNotNull(change);
+        assertTrue(change.changeIp);
+        assertTrue(change.changePort);
+        assertEquals(
+                List.of(PeerMeshEngine.StunMessage.ATTR_CHANGE_REQUEST),
+                parsed.unknownAttributes());
     }
 
     private static byte[] transactionId(int start) {

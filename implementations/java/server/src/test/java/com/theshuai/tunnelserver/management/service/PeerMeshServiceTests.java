@@ -100,6 +100,92 @@ class PeerMeshServiceTests {
     }
 
     @Test
+    void loginConfigCanAdvertiseStandaloneStunSeparatelyFromTurn() {
+        properties.setEnabled(true);
+        properties.setPublicAddress("turn.example.com");
+        properties.setStandaloneStunAddress("stun.example.com");
+        properties.setStandaloneStunPort(5349);
+        PeerMeshDevice device = new PeerMeshDevice();
+        device.setId(10L);
+        device.setClientId(1L);
+        device.setClientName("a");
+        device.setOwnerUsername("alice");
+        device.setVirtualIp("100.96.0.10");
+        device.setCidr("100.96.0.0/11");
+        device.setEnabled(true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.of(device));
+        when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(turnCredentialService.issue(any())).thenReturn(new TurnCredentialService.TurnCredential(
+                "ice-user", "ice-cred", "shuai-tunnel", "nonce", Instant.now().plusSeconds(3600)));
+
+        ClientAuthLoginResponse.PeerMeshConfig config =
+                service.buildLoginConfig(client(1, "alice", "a"), new ClientEnvironmentInfo(), "request.example.com");
+
+        assertThat(config.getStunHost()).isEqualTo("stun.example.com");
+        assertThat(config.getStunPort()).isEqualTo(5349);
+        assertThat(config.getTurnHost()).isEqualTo("turn.example.com");
+        assertThat(config.getTurnPort()).isEqualTo(3478);
+    }
+
+    @Test
+    void incompleteStandaloneStunFallsBackToEmbeddedEndpoint() {
+        properties.setEnabled(true);
+        properties.setPublicAddress("relay.example.com");
+        properties.setStunTurnPort(4444);
+        properties.setStandaloneStunAddress("stun.example.com");
+        properties.setStandaloneStunPort(0);
+        PeerMeshDevice device = new PeerMeshDevice();
+        device.setId(10L);
+        device.setClientId(1L);
+        device.setClientName("a");
+        device.setOwnerUsername("alice");
+        device.setVirtualIp("100.96.0.10");
+        device.setCidr("100.96.0.0/11");
+        device.setEnabled(true);
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.of(device));
+        when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        when(turnCredentialService.issue(any())).thenReturn(new TurnCredentialService.TurnCredential(
+                "ice-user", "ice-cred", "shuai-tunnel", "nonce", Instant.now().plusSeconds(3600)));
+
+        ClientAuthLoginResponse.PeerMeshConfig config =
+                service.buildLoginConfig(client(1, "alice", "a"), new ClientEnvironmentInfo(), "request.example.com");
+
+        assertThat(config.getStunHost()).isEqualTo("relay.example.com");
+        assertThat(config.getStunPort()).isEqualTo(4444);
+    }
+
+    @Test
+    void deviceReportPersistsRfc5780BehaviorFields() {
+        PeerMeshDevice device = new PeerMeshDevice();
+        device.setId(10L);
+        device.setTenantId("tenant-a");
+        device.setClientId(1L);
+        device.setClientName("a");
+        device.setOwnerUsername("alice");
+        device.setVirtualIp("100.96.0.10");
+        device.setCidr("100.96.0.0/11");
+        device.setCreatedAt(Instant.now().toString());
+        device.setUpdatedAt(Instant.now().toString());
+        when(deviceRepository.findByTenantIdAndClientId("tenant-a", 1L)).thenReturn(Optional.of(device));
+        when(deviceRepository.save(any(PeerMeshDevice.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PeerControlMessage report = new PeerControlMessage();
+        report.setNatType("PORT_RESTRICTED_NAT");
+        report.setNatMappingBehavior("ENDPOINT_INDEPENDENT");
+        report.setNatFilteringBehavior("ADDRESS_AND_PORT_DEPENDENT");
+        report.setNatBehaviorDiscovery("RFC5780");
+        report.setLastEndpoint("198.51.100.20:52000");
+
+        var view = service.reportDevice(client(1, "alice", "a"), report);
+
+        assertThat(view.natType()).isEqualTo("PORT_RESTRICTED_NAT");
+        assertThat(view.natMappingBehavior()).isEqualTo("ENDPOINT_INDEPENDENT");
+        assertThat(view.natFilteringBehavior()).isEqualTo("ADDRESS_AND_PORT_DEPENDENT");
+        assertThat(view.natBehaviorDiscovery()).isEqualTo("RFC5780");
+        assertThat(view.lastEndpoint()).isEqualTo("198.51.100.20:52000");
+    }
+
+    @Test
     void trafficReportAccumulatesDirectAndRelayBytes() {
         PeerMeshSession session = activeSession();
         when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));

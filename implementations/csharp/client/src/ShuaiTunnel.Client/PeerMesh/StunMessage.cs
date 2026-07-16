@@ -27,9 +27,12 @@ internal sealed class StunMessage
     public const ushort SendIndication = 0x0016;
     public const ushort DataIndication = 0x0017;
 
+    public const ushort AttrMappedAddress = 0x0001;
+    public const ushort AttrChangeRequest = 0x0003;
     public const ushort AttrUsername = 0x0006;
     public const ushort AttrMessageIntegrity = 0x0008;
     public const ushort AttrErrorCode = 0x0009;
+    public const ushort AttrUnknownAttributes = 0x000A;
     public const ushort AttrLifetime = 0x000D;
     public const ushort AttrXorPeerAddress = 0x0012;
     public const ushort AttrData = 0x0013;
@@ -169,10 +172,40 @@ internal sealed class StunMessage
         return (value[2] & 0x07) * 100 + value[3];
     }
 
+    public IReadOnlyList<ushort> UnknownAttributes()
+    {
+        var value = First(AttrUnknownAttributes)?.Value;
+        if (value is not { Length: >= 2 })
+        {
+            return [];
+        }
+        var result = new List<ushort>(value.Length / 2);
+        for (var offset = 0; offset + 2 <= value.Length; offset += 2)
+        {
+            result.Add(BinaryPrimitives.ReadUInt16BigEndian(value.AsSpan(offset, 2)));
+        }
+        return result;
+    }
+
+    public StunChangeRequest? ChangeRequest()
+    {
+        var value = First(AttrChangeRequest)?.Value;
+        if (value is not { Length: 4 })
+        {
+            return null;
+        }
+        var flags = BinaryPrimitives.ReadUInt32BigEndian(value);
+        return new StunChangeRequest((flags & 0x04) != 0, (flags & 0x02) != 0);
+    }
+
+    public IPEndPoint? MappedAddress() => DecodeAddress(First(AttrMappedAddress)?.Value);
     public IPEndPoint? XorMappedAddress() => DecodeXorAddress(First(AttrXorMappedAddress)?.Value);
     public IPEndPoint? XorRelayedAddress() => DecodeXorAddress(First(AttrXorRelayedAddress)?.Value);
     public IPEndPoint? XorPeerAddress() => DecodeXorAddress(First(AttrXorPeerAddress)?.Value);
-    public IPEndPoint? OtherAddress() => DecodeXorAddress(First(AttrOtherAddress)?.Value);
+    public IPEndPoint? ResponseOrigin() => DecodeAddress(First(AttrResponseOrigin)?.Value);
+    public IPEndPoint? OtherAddress() => DecodeAddress(First(AttrOtherAddress)?.Value);
+    public IPEndPoint? LegacyXorResponseOrigin() => DecodeXorAddress(First(AttrResponseOrigin)?.Value);
+    public IPEndPoint? LegacyXorOtherAddress() => DecodeXorAddress(First(AttrOtherAddress)?.Value);
     public byte[]? Data() => First(AttrData)?.Value.ToArray();
 
     public long LifetimeSeconds(long fallback)
@@ -196,11 +229,33 @@ internal sealed class StunMessage
     public static StunAttribute XorPeerAddress(IPEndPoint endpoint, byte[] transactionId) =>
         new(AttrXorPeerAddress, EncodeXorAddress(endpoint, transactionId));
 
+    public static StunAttribute MappedAddress(IPEndPoint endpoint) =>
+        new(AttrMappedAddress, EncodeAddress(endpoint));
+
     public static StunAttribute OtherAddress(IPEndPoint endpoint, byte[] transactionId) =>
-        new(AttrOtherAddress, EncodeXorAddress(endpoint, transactionId));
+        new(AttrOtherAddress, EncodeAddress(endpoint));
 
     public static StunAttribute ResponseOrigin(IPEndPoint endpoint, byte[] transactionId) =>
-        new(AttrResponseOrigin, EncodeXorAddress(endpoint, transactionId));
+        new(AttrResponseOrigin, EncodeAddress(endpoint));
+
+    public static StunAttribute ChangeRequest(bool changeIp, bool changePort)
+    {
+        var flags = (changeIp ? 0x04u : 0u) | (changePort ? 0x02u : 0u);
+        var value = new byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(value, flags);
+        return new StunAttribute(AttrChangeRequest, value);
+    }
+
+    public static StunAttribute UnknownAttributes(params ushort[] types)
+    {
+        var normalized = types ?? [];
+        var value = new byte[normalized.Length * 2];
+        for (var index = 0; index < normalized.Length; index++)
+        {
+            BinaryPrimitives.WriteUInt16BigEndian(value.AsSpan(index * 2, 2), normalized[index]);
+        }
+        return new StunAttribute(AttrUnknownAttributes, value);
+    }
 
     public static StunAttribute Data(byte[] payload) => new(AttrData, payload);
 
@@ -237,6 +292,24 @@ internal sealed class StunMessage
         value[3] = (byte)number;
         reasonBytes.CopyTo(value.AsSpan(4));
         return new StunAttribute(AttrErrorCode, value);
+    }
+
+    private static IPEndPoint? DecodeAddress(byte[]? value)
+    {
+        if (value is null || (value.Length != 8 && value.Length != 20))
+        {
+            return null;
+        }
+        var port = BinaryPrimitives.ReadUInt16BigEndian(value.AsSpan(2, 2));
+        if (value[1] == 0x01 && value.Length == 8)
+        {
+            return new IPEndPoint(new IPAddress(value.AsSpan(4, 4)), port);
+        }
+        if (value[1] == 0x02 && value.Length == 20)
+        {
+            return new IPEndPoint(new IPAddress(value.AsSpan(4, 16)), port);
+        }
+        return null;
     }
 
     private IPEndPoint? DecodeXorAddress(byte[]? value)
@@ -301,6 +374,18 @@ internal sealed class StunMessage
         return result;
     }
 
+    private static byte[] EncodeAddress(IPEndPoint endpoint)
+    {
+        var address = endpoint.Address.AddressFamily == AddressFamily.InterNetworkV6
+            ? endpoint.Address.GetAddressBytes()
+            : endpoint.Address.MapToIPv4().GetAddressBytes();
+        var result = new byte[address.Length == 4 ? 8 : 20];
+        result[1] = address.Length == 4 ? (byte)0x01 : (byte)0x02;
+        BinaryPrimitives.WriteUInt16BigEndian(result.AsSpan(2, 2), (ushort)endpoint.Port);
+        address.CopyTo(result.AsSpan(4));
+        return result;
+    }
+
     private static byte[] NormalizeTransactionId(byte[]? transactionId)
     {
         if (transactionId is { Length: TransactionIdBytes })
@@ -317,3 +402,5 @@ internal sealed record StunAttribute(ushort Type, byte[] Value)
 {
     public byte[] Value { get; init; } = Value.ToArray();
 }
+
+internal sealed record StunChangeRequest(bool ChangeIp, bool ChangePort);

@@ -14,6 +14,19 @@ export interface NatTypeProfile {
   recommendation: string;
 }
 
+const NAT_BEHAVIOR_LABELS: Record<string, string> = {
+  ENDPOINT_INDEPENDENT: "端点无关",
+  ADDRESS_DEPENDENT: "地址相关",
+  ADDRESS_AND_PORT_DEPENDENT: "地址和端口相关",
+  UNKNOWN: "未知",
+  UNSUPPORTED: "服务不支持",
+};
+
+const NAT_DISCOVERY_LABELS: Record<string, string> = {
+  RFC5780: "RFC 5780",
+  BASIC: "基础 STUN",
+};
+
 export const NAT_TRAVERSAL_REFERENCE = {
   title: "How NAT traversal works",
   author: "Tailscale",
@@ -169,4 +182,18 @@ export function natReachabilityWeight(natType?: string | null): number {
     default:
       return 0;
   }
+}
+
+export function natBehaviorLabel(behavior?: string | null): string {
+  if (!behavior) {
+    return "未检测";
+  }
+  return NAT_BEHAVIOR_LABELS[behavior] ?? behavior;
+}
+
+export function natBehaviorDiscoveryLabel(discovery?: string | null): string {
+  if (!discovery) {
+    return "未上报";
+  }
+  return NAT_DISCOVERY_LABELS[discovery] ?? discovery;
 }

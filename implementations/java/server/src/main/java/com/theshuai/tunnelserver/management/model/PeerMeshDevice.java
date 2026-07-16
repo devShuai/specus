@@ -49,6 +49,15 @@ public class PeerMeshDevice {
     @Column(name = "nat_type", length = 80)
     private String natType;
 
+    @Column(name = "nat_mapping_behavior", length = 80)
+    private String natMappingBehavior;
+
+    @Column(name = "nat_filtering_behavior", length = 80)
+    private String natFilteringBehavior;
+
+    @Column(name = "nat_behavior_discovery", length = 40)
+    private String natBehaviorDiscovery;
+
     @Column(name = "last_endpoint", length = 255)
     private String lastEndpoint;
 

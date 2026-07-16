@@ -1,6 +1,6 @@
 # Peer Mesh 私有组网落地说明
 
-本文记录当前 Java `tunnel-server` / `tunnel-client` 的 peer mesh 实现状态、部署开关、客户端启用方式和验收步骤。peer mesh 是并行能力，不改变现有公网 TCP 映射、HTTP route 和流量观测语义。
+本文记录当前跨语言 peer mesh 实现状态、部署开关、客户端启用方式和验收步骤。peer mesh 是并行能力，不改变现有公网 TCP 映射、HTTP route 和流量观测语义。
 
 ## 当前实现状态
 
@@ -12,6 +12,8 @@
 * 客户端登录响应下发 `peerMesh` 配置，包括虚拟 IP、CIDR、标准 STUN/TURN 地址、公共 STUN 列表、会话 TTL 和设备公钥相关信息。
 * 控制协议通过现有控制长连接承载 `PEER_CONTROL` JSON 信令，不破坏现有 NAT / HTTP 协议。
 * Java / Go / .NET 服务端内置标准 UDP STUN/TURN：支持 Binding、Allocate、Refresh、CreatePermission、Send Indication 和 Data Indication；relay 转发使用独立 UDP allocation 端口。
+* Java STUN 核心支持 RFC 5780 四端点、`CHANGE-REQUEST`、标准 `MAPPED-ADDRESS` / `XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；同一核心可由独立 `stun-server.jar` 部署。
+* Java / Go / .NET / Android 客户端可使用独立 STUN 入口执行 RFC 5780 映射与过滤行为探测，并上报 `natMappingBehavior`、`natFilteringBehavior` 和探测模式。
 * relay 转发前会校验 session 是否存在、是否 ACTIVE、是否过期、source/target 是否匹配，拒绝未授权 relay frame。
 * 客户端已实现 UDP host candidate、relay candidate、connectivity check、path nominated、direct 优先、relay fallback。
 * 客户端数据面使用 X25519 + HKDF + AES-GCM，加密后的 IP packet 通过 UDP frame 传输；server relay 不解密业务明文。
@@ -27,7 +29,7 @@
 * Go server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；过期 allocation 按 Java 语义清理并由新 Allocate 重建。
 * .NET server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；同时提供公开 `/api/public/peer-mesh/stun-config` 用于 NAT 检测页面和外部探测。
 * Go client 已支持 Linux TUN、随包 Windows Wintun、macOS utun、Java 兼容 X25519/HKDF/AES-GCM frame、direct UDP 与标准 TURN relay data indication。
-* .NET client 已补 X25519 key 上报、Java 兼容 AES-GCM frame codec、replay window、标准 STUN/TURN UDP 控制面、公共 STUN 候选，以及随包 Windows Wintun / Linux TUN / macOS utun packet 读写；当前仍需要真实 Windows/Linux/macOS 双机环境做 ping、HTTP 和 relay fallback 手工验收。
+* .NET client 已补 X25519 key 上报、Java 兼容 AES-GCM frame codec、replay window、标准 STUN/TURN UDP 控制面、公共 STUN 候选，以及随包 Windows Wintun / Linux TUN / macOS utun packet 读写；Go / .NET / Android 均已补齐 RFC 5780 行为探测与设备上报，当前仍需要真实 Windows/Linux/macOS/Android 双机环境做 ping、HTTP 和 relay fallback 手工验收。
 
 需要真实环境手工验收：
 
@@ -45,7 +47,11 @@ TUNNEL_PEER_MESH_ENABLED=false
 TUNNEL_PEER_MESH_CIDR=100.96.0.0/11
 TUNNEL_PEER_MESH_PUBLIC_ADDRESS=tunnel.example.com
 TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
-TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT=0
+TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT=3479
+#TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS=10.0.0.10
+#TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS=10.0.0.11
+#TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11
+#TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT=true
 TUNNEL_PEER_MESH_SESSION_TTL_SECONDS=3600
 TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 ```
@@ -54,9 +60,15 @@ TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 
 * `TUNNEL_PEER_MESH_ENABLED`：总开关，生产默认保持 `false`，需要灰度时再启用。
 * `TUNNEL_PEER_MESH_CIDR`：mesh 虚拟网段，默认 `100.96.0.0/11`。
-* `TUNNEL_PEER_MESH_PUBLIC_ADDRESS`：UDP 探测和 relay 对外地址。服务器在 NAT 后面时必须显式配置。
+* `TUNNEL_PEER_MESH_PUBLIC_ADDRESS`：UDP 探测和 relay 对外地址。完整 RFC 5780 模式下必须填写主公网 IP A1。
 * `TUNNEL_PEER_MESH_STUN_TURN_PORT`：内置标准 STUN/TURN UDP 主端口，默认 `3478`。
-* `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：NAT 类型辅助探测 UDP 端口。默认 `0` 表示使用 `STUN/TURN 端口 + 1`，即 `3479`。备用端口只用于 Binding 探测，不承载 relay allocation。
+* `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS`：可选独立 STUN 域名或 IP；配置后客户端 STUN 探测使用该地址，认证 TURN 仍使用 `PUBLIC_ADDRESS`。
+* `TUNNEL_PEER_MESH_STANDALONE_STUN_PORT`：独立 STUN 入口端口，默认 `3478`。
+* `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：第二个 STUN UDP 端口 P2，默认 `3479`。备用端口只用于 Binding，不承载 TURN allocation。
+* `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS`：主地址 A1 的本机绑定 IP。
+* `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS`：备用地址 A2 的本机绑定 IP。
+* `TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS`：与 A2 对应的备用公网 IP。
+* `TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT`：开启后必须提供完整 A1/A2 和 P1/P2 配置，否则内置 STUN/TURN 不启动。
 * `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS`：peer session 授权有效期。
 * `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS`：relay allocation 有效期，客户端会提前 refresh。
 
@@ -68,13 +80,18 @@ sudo firewall-cmd --add-port=3479/udp --permanent
 sudo firewall-cmd --reload
 ```
 
-NAT 类型探测说明：
+NAT 行为探测说明：
 
-* 客户端先向主端口发送 binding，服务端返回映射地址和备用探测端口。
-* 服务端会从备用端口向同一个客户端映射主动回包，客户端也会主动向备用端口再发送一次 binding。
-* 如果主端口和备用端口看到的映射端点不同，页面展示为 `Symmetric NAT`。
-* 如果映射端点相同且能收到备用端口主动回包，页面展示为 `Full cone / Restricted NAT`。在只有一个公网 IP 的部署里，无法严格拆分 Full Cone 与 Address-Restricted NAT。
-* 如果映射端点相同但收不到备用端口主动回包，页面展示为 `Port Restricted NAT` 或更保守的 `NAT`。
+* 完整模式监听 A1:P1、A1:P2、A2:P1、A2:P2。Binding Success 同时返回 `MAPPED-ADDRESS` 和 `XOR-MAPPED-ADDRESS`。
+* `RESPONSE-ORIGIN` 表示实际回包端点；`OTHER-ADDRESS` 始终表示相对请求目标的另一 IP + 另一端口。
+* `CHANGE-REQUEST(change IP/change port)` 决定回包源端点，可用于探测 Endpoint-Independent、Address-Dependent 与 Address-and-Port-Dependent Filtering。
+* 客户端分别向 A1:P1、A2:P1 和 A2:P2 发起 Binding，可比较映射地址，区分 Endpoint-Independent、Address-Dependent 与 Address-and-Port-Dependent Mapping。
+* 只有一个公网 IP 时，服务端不返回标准 `OTHER-ADDRESS`，收到 `CHANGE-REQUEST` 返回 `420 Unknown Attribute`；此时只能做普通 Binding 和保守分类。
+
+如果 STUN 不应与业务服务共进程，构建并部署
+[`implementations/java/stun-server`](../../implementations/java/stun-server)；systemd 文件、DNS 和双公网 IP
+示例见 [`deploy/stun-server/systemd`](../../deploy/stun-server/systemd/README.md)。独立服务不包含 TURN，
+tunnel-server 的认证 TURN 仍可单独作为直连失败后的备用通道。
 
 ## 客户端配置
 

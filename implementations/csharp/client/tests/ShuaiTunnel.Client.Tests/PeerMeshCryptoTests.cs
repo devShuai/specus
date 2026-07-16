@@ -201,6 +201,55 @@ public sealed class PeerMeshCryptoTests
     }
 
     [Fact]
+    public async Task IndependentStunEndpointStartsRfc5780FilteringProbe()
+    {
+        using var udp = new UdpClient(AddressFamily.InterNetwork);
+        udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+        using var stun = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var turn = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var cancellation = new CancellationTokenSource();
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        SetPrivateField(client, "_udp", udp);
+        SetPrivateField(client, "_cts", cancellation);
+        SetPrivateField(client, "_runtime", new TunnelRuntimeState
+        {
+            PeerMesh = new PeerMeshConfig
+            {
+                StunHost = "127.0.0.1",
+                StunPort = ((IPEndPoint)stun.Client.LocalEndPoint!).Port,
+                TurnHost = "127.0.0.1",
+                TurnPort = ((IPEndPoint)turn.Client.LocalEndPoint!).Port,
+            },
+        });
+
+        await InvokePrivateAsync(client, "RequestRelayCandidatesAsync");
+        var binding = Assert.Single(await ReadStunMessagesAsync(stun, 1));
+        var allocate = Assert.Single(await ReadStunMessagesAsync(turn, 1));
+        Assert.Equal(StunMessage.BindingRequest, binding.Type);
+        Assert.Equal(StunMessage.AllocateRequest, allocate.Type);
+        Assert.Empty(await ReadStunMessagesAsync(turn, 1));
+
+        var primary = (IPEndPoint)stun.Client.LocalEndPoint!;
+        var otherPort = primary.Port == 65535 ? primary.Port - 1 : primary.Port + 1;
+        var mapped = new IPEndPoint(IPAddress.Parse("198.51.100.20"), 52000);
+        var success = StunMessage.Of(
+            StunMessage.BindingSuccess,
+            binding.TransactionId,
+            StunMessage.XorMappedAddress(mapped, binding.TransactionId),
+            StunMessage.ResponseOrigin(primary, binding.TransactionId),
+            StunMessage.OtherAddress(
+                new IPEndPoint(IPAddress.Parse("127.0.0.2"), otherPort),
+                binding.TransactionId));
+        await InvokePrivateAsync(client, "HandleStunTurnMessageAsync", success, primary);
+
+        var filter = Assert.Single(await ReadStunMessagesAsync(stun, 1));
+        var change = Assert.IsType<StunChangeRequest>(filter.ChangeRequest());
+        Assert.True(change.ChangeIp);
+        Assert.True(change.ChangePort);
+        await cancellation.CancelAsync();
+    }
+
+    [Fact]
     public async Task AlternateProbeRequestIsThrottledLikeJava()
     {
         using var udp = new UdpClient(AddressFamily.InterNetwork);
@@ -232,6 +281,29 @@ public sealed class PeerMeshCryptoTests
 
         Assert.Equal(new IPEndPoint(IPAddress.Parse("203.0.113.20"), 3480), decoded.XorMappedAddress());
         Assert.Equal(new IPEndPoint(IPAddress.Parse("203.0.113.10"), 3479), decoded.OtherAddress());
+    }
+
+    [Fact]
+    public void StunRfc5780AttributesRoundTrip()
+    {
+        var transactionId = StunMessage.NewTransactionId();
+        var origin = new IPEndPoint(IPAddress.Parse("203.0.113.10"), 3478);
+        var other = new IPEndPoint(IPAddress.Parse("203.0.113.11"), 3479);
+        var message = StunMessage.Of(
+            StunMessage.BindingError,
+            transactionId,
+            StunMessage.ResponseOrigin(origin, transactionId),
+            StunMessage.OtherAddress(other, transactionId),
+            StunMessage.ChangeRequest(true, true),
+            StunMessage.UnknownAttributes(StunMessage.AttrChangeRequest));
+        var decoded = StunMessage.Parse(message.ToBytes())!;
+
+        Assert.Equal(origin, decoded.ResponseOrigin());
+        Assert.Equal(other, decoded.OtherAddress());
+        var change = Assert.IsType<StunChangeRequest>(decoded.ChangeRequest());
+        Assert.True(change.ChangeIp);
+        Assert.True(change.ChangePort);
+        Assert.Equal([StunMessage.AttrChangeRequest], decoded.UnknownAttributes());
     }
 
     [Fact]

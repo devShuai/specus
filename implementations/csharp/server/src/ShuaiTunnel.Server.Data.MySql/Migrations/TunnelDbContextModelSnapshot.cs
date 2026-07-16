@@ -959,6 +959,21 @@ namespace ShuaiTunnel.Server.Data.MySql.Migrations
                         .HasColumnType("varchar(40)")
                         .HasColumnName("last_seen_at");
 
+                    b.Property<string>("NatBehaviorDiscovery")
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("nat_behavior_discovery");
+
+                    b.Property<string>("NatFilteringBehavior")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("nat_filtering_behavior");
+
+                    b.Property<string>("NatMappingBehavior")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("nat_mapping_behavior");
+
                     b.Property<string>("NatType")
                         .HasMaxLength(80)
                         .HasColumnType("varchar(80)")

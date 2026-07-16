@@ -30,6 +30,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -55,6 +56,7 @@ public class PeerMeshClient implements AutoCloseable {
     private final AtomicBoolean directSuppressedLogged = new AtomicBoolean(false);
     private final SecureRandom secureRandom = new SecureRandom();
     private final TurnLongTermAuthenticator turnAuthenticator = new TurnLongTermAuthenticator();
+    private final NatBehaviorDiscovery natBehaviorDiscovery = new NatBehaviorDiscovery();
     private final ControlSender controlSender;
     private final PeerKeyStore.KeyMaterial keyMaterial;
     private final PeerVirtualDeviceOptions virtualDeviceOptions;
@@ -73,11 +75,16 @@ public class PeerMeshClient implements AutoCloseable {
     private volatile long lastPortMapAttemptMillis;
     private final NatPortMappingService natPortMappingService = new NatPortMappingService();
     private volatile String natType = "";
+    private volatile String natMappingBehavior = "";
+    private volatile String natFilteringBehavior = "";
+    private volatile String natBehaviorDiscoveryMode = "";
     private volatile String lastEndpoint = "";
     private volatile String relayAllocationId;
     private volatile long relayAllocationExpiresAtMillis;
+    private volatile long lastStunCandidateRequestMillis;
     private volatile long lastRelayCandidateRequestMillis;
     private volatile long lastAlternateNatProbeRequestMillis;
+    private volatile long lastBehaviorDiscoveryStartedMillis;
     private volatile ScheduledExecutorService maintenanceExecutor;
     private static final long MAX_SESSION_REFRESH_WINDOW_MILLIS = 120_000;
     private static final long MIN_SESSION_REFRESH_WINDOW_MILLIS = 10_000;
@@ -93,6 +100,10 @@ public class PeerMeshClient implements AutoCloseable {
     private static final long NAT_PROBE_STALE_MILLIS = 120_000;
     private static final long SRFLX_OBSERVATION_TTL_MILLIS = 180_000;
     private static final long ALTERNATE_NAT_PROBE_MIN_INTERVAL_MILLIS = 15_000;
+    private static final long STUN_CANDIDATE_REQUEST_INTERVAL_MILLIS = 60_000;
+    private static final long BEHAVIOR_DISCOVERY_MIN_INTERVAL_MILLIS = 60_000;
+    private static final long BEHAVIOR_PROBE_TIMEOUT_MILLIS = 1_600;
+    private static final long[] BEHAVIOR_PROBE_RETRY_DELAYS_MILLIS = {250, 750};
     private static final long TURN_PERMISSION_TTL_MILLIS = 240_000;
     private static final String PUBLIC_STUN_ROLE_PREFIX = "public-stun:";
     private static final int MAX_ADAPTIVE_PREDICTED_PORTS = 16;
@@ -151,12 +162,17 @@ public class PeerMeshClient implements AutoCloseable {
             relayCandidate = null;
             releasePortMapping();
             natType = "";
+            natMappingBehavior = "";
+            natFilteringBehavior = "";
+            natBehaviorDiscoveryMode = "";
             lastEndpoint = "";
             directSuppressedLogged.set(false);
             relayAllocationId = null;
             relayAllocationExpiresAtMillis = 0;
+            lastStunCandidateRequestMillis = 0;
             lastRelayCandidateRequestMillis = 0;
             lastAlternateNatProbeRequestMillis = 0;
+            lastBehaviorDiscoveryStartedMillis = 0;
             stopMaintenance();
             stopUdpSocket();
             closeVirtualDevice();
@@ -172,6 +188,17 @@ public class PeerMeshClient implements AutoCloseable {
             log.debug("Peer mesh 配置未变化，已执行轻量刷新: client={}, virtualIp={}",
                     nextConfig.getClientName(), nextConfig.getVirtualIp());
             return;
+        }
+        if (!sameRuntimeConfig) {
+            pendingStunBindings.clear();
+            natProbeObservations.clear();
+            lastStunCandidateRequestMillis = 0;
+            lastRelayCandidateRequestMillis = 0;
+            lastAlternateNatProbeRequestMillis = 0;
+            lastBehaviorDiscoveryStartedMillis = 0;
+            natMappingBehavior = "";
+            natFilteringBehavior = "";
+            natBehaviorDiscoveryMode = "";
         }
         running = true;
         runtimeConfigKey = nextRuntimeConfigKey;
@@ -700,11 +727,25 @@ public class PeerMeshClient implements AutoCloseable {
         if (!running || config == null) {
             return;
         }
+        InetSocketAddress stunEndpoint = stunEndpoint();
         InetSocketAddress relayEndpoint = relayEndpoint();
-        if (relayEndpoint == null) {
+        boolean hasPublicStun = config.getPublicStunServers() != null
+                && !config.getPublicStunServers().isEmpty();
+        if (stunEndpoint == null && relayEndpoint == null && !hasPublicStun) {
             return;
         }
         long now = System.currentTimeMillis();
+        if (now - lastStunCandidateRequestMillis >= STUN_CANDIDATE_REQUEST_INTERVAL_MILLIS) {
+            lastStunCandidateRequestMillis = now;
+            if (stunEndpoint != null) {
+                sendStunBinding(stunEndpoint, PeerRelayMessage.PROBE_PRIMARY);
+            }
+            requestPublicStunBindings();
+        }
+        if (relayEndpoint == null) {
+            return;
+        }
+
         boolean allocationExpiring = relayAllocationId == null || relayAllocationExpiresAtMillis - now <= 60_000;
         if (!allocationExpiring && now - lastRelayCandidateRequestMillis < 60_000) {
             return;
@@ -713,8 +754,6 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         lastRelayCandidateRequestMillis = now;
-        sendStunBinding(relayEndpoint, PeerRelayMessage.PROBE_PRIMARY);
-        requestPublicStunBindings();
 
         if (relayAllocationId != null && relayAllocationExpiresAtMillis - now > 60_000) {
             sendStunRequest(StunMessage.of(
@@ -731,12 +770,78 @@ public class PeerMeshClient implements AutoCloseable {
 
     private void sendStunBinding(InetSocketAddress endpoint, String probeRole) {
         byte[] transactionId = StunMessage.newTransactionId();
-        pendingStunBindings.put(StunMessage.hex(transactionId),
-                new PendingStunBinding(bindingProbeRole(probeRole), System.currentTimeMillis()));
-        sendStunRequest(StunMessage.of(
+        StunMessage request = StunMessage.of(
                 StunMessage.BINDING_REQUEST,
                 transactionId,
-                StunMessage.software("shuai-tunnel-peer-client")), endpoint);
+                StunMessage.software("shuai-tunnel-peer-client"));
+        pendingStunBindings.put(StunMessage.hex(transactionId), new PendingStunBinding(
+                bindingProbeRole(probeRole),
+                endpoint,
+                endpoint,
+                request,
+                null,
+                0,
+                System.currentTimeMillis()));
+        sendStunRequest(request, endpoint);
+    }
+
+    private void sendBehaviorProbe(NatBehaviorDiscovery.ProbeRequest probeRequest) {
+        if (!running || probeRequest == null) {
+            return;
+        }
+        byte[] transactionId = StunMessage.newTransactionId();
+        StunMessage request = probeRequest.changeIp() || probeRequest.changePort()
+                ? StunMessage.of(
+                        StunMessage.BINDING_REQUEST,
+                        transactionId,
+                        StunMessage.software("shuai-tunnel-peer-client"),
+                        StunMessage.changeRequest(probeRequest.changeIp(), probeRequest.changePort()))
+                : StunMessage.of(
+                        StunMessage.BINDING_REQUEST,
+                        transactionId,
+                        StunMessage.software("shuai-tunnel-peer-client"));
+        PendingStunBinding pending = new PendingStunBinding(
+                probeRequest.probe().role(),
+                probeRequest.targetEndpoint(),
+                probeRequest.expectedResponseEndpoint(),
+                request,
+                probeRequest.probe(),
+                probeRequest.generation(),
+                System.currentTimeMillis());
+        String transactionKey = request.transactionIdHex();
+        pendingStunBindings.put(transactionKey, pending);
+        sendStunRequest(request, probeRequest.targetEndpoint());
+
+        ScheduledExecutorService executor = maintenanceExecutor;
+        if (executor == null || executor.isShutdown()) {
+            return;
+        }
+        for (long delayMillis : BEHAVIOR_PROBE_RETRY_DELAYS_MILLIS) {
+            executor.schedule(
+                    () -> retryBehaviorProbe(transactionKey, pending),
+                    delayMillis,
+                    TimeUnit.MILLISECONDS);
+        }
+        executor.schedule(
+                () -> timeoutBehaviorProbe(transactionKey, pending),
+                BEHAVIOR_PROBE_TIMEOUT_MILLIS,
+                TimeUnit.MILLISECONDS);
+    }
+
+    private void retryBehaviorProbe(String transactionKey, PendingStunBinding expected) {
+        if (!running || pendingStunBindings.get(transactionKey) != expected) {
+            return;
+        }
+        sendStunRequest(expected.request(), expected.targetEndpoint());
+    }
+
+    private void timeoutBehaviorProbe(String transactionKey, PendingStunBinding expected) {
+        if (!pendingStunBindings.remove(transactionKey, expected) || expected.behaviorProbe() == null) {
+            return;
+        }
+        handleNatBehaviorTransition(natBehaviorDiscovery.timedOut(
+                expected.behaviorGeneration(),
+                expected.behaviorProbe()));
     }
 
     private void requestPublicStunBindings() {
@@ -1332,6 +1437,9 @@ public class PeerMeshClient implements AutoCloseable {
         report.setVirtualDeviceStatus(status);
         report.setVirtualDeviceError(limit(error, 512));
         report.setNatType(natType);
+        report.setNatMappingBehavior(natMappingBehavior);
+        report.setNatFilteringBehavior(natFilteringBehavior);
+        report.setNatBehaviorDiscovery(natBehaviorDiscoveryMode);
         report.setLastEndpoint(lastEndpoint);
         report.setCreatedAtMillis(System.currentTimeMillis());
         try {
@@ -1364,28 +1472,117 @@ public class PeerMeshClient implements AutoCloseable {
         if (!StringUtils.hasText(observedNatType) || !StringUtils.hasText(endpoint)) {
             return;
         }
-        if (observedNatType.equals(natType) && endpoint.equals(lastEndpoint)) {
+        if (NatBehaviorDiscovery.DISCOVERY_RFC5780.equals(natBehaviorDiscoveryMode)
+                && StringUtils.hasText(natMappingBehavior)) {
             return;
         }
-        natType = observedNatType;
-        lastEndpoint = endpoint;
+        reportNatState(
+                observedNatType,
+                endpoint,
+                natMappingBehavior,
+                natFilteringBehavior,
+                natBehaviorDiscoveryMode);
+    }
+
+    private void reportNatBehavior(NatBehaviorDiscovery.Snapshot snapshot) {
+        if (snapshot == null || !snapshot.complete() || snapshot.mappedEndpoint() == null) {
+            return;
+        }
+        String endpoint = endpointKey(snapshot.mappedEndpoint());
+        String compatibleNatType = compatibleNatType(snapshot);
+        reportNatState(
+                compatibleNatType,
+                endpoint,
+                snapshot.mappingBehavior(),
+                snapshot.filteringBehavior(),
+                snapshot.discovery());
+    }
+
+    private void reportBasicNatDiscovery() {
+        NatProbeResult fallback = classifyNat();
+        reportNatState(
+                StringUtils.hasText(fallback.natType()) ? fallback.natType() : natType,
+                StringUtils.hasText(fallback.endpoint()) ? fallback.endpoint() : lastEndpoint,
+                "",
+                "",
+                NatBehaviorDiscovery.DISCOVERY_BASIC);
+    }
+
+    private void reportNatState(String observedNatType,
+                                String endpoint,
+                                String mappingBehavior,
+                                String filteringBehavior,
+                                String discoveryMode) {
+        String nextNatType = normalizeValue(observedNatType);
+        String nextEndpoint = normalizeValue(endpoint);
+        String nextMapping = normalizeValue(mappingBehavior);
+        String nextFiltering = normalizeValue(filteringBehavior);
+        String nextDiscovery = normalizeValue(discoveryMode);
+        if (Objects.equals(nextNatType, natType)
+                && Objects.equals(nextEndpoint, lastEndpoint)
+                && Objects.equals(nextMapping, natMappingBehavior)
+                && Objects.equals(nextFiltering, natFilteringBehavior)
+                && Objects.equals(nextDiscovery, natBehaviorDiscoveryMode)) {
+            return;
+        }
+        natType = nextNatType;
+        lastEndpoint = nextEndpoint;
+        natMappingBehavior = nextMapping;
+        natFilteringBehavior = nextFiltering;
+        natBehaviorDiscoveryMode = nextDiscovery;
         if (!shouldAvoidDirectPath()) {
             directSuppressedLogged.set(false);
         }
-        log.info("Peer mesh NAT 探测结果: type={}, mapped={}", observedNatType, endpoint);
+        log.info(
+                "Peer mesh NAT 探测结果: type={}, mapping={}, filtering={}, discovery={}, mapped={}",
+                nextNatType,
+                nextMapping,
+                nextFiltering,
+                nextDiscovery,
+                nextEndpoint);
         if (!running || controlSender == null) {
             return;
         }
         PeerControlMessage report = new PeerControlMessage();
         report.setType(PeerControlMessage.TYPE_DEVICE_REPORT);
-        report.setNatType(observedNatType);
-        report.setLastEndpoint(endpoint);
+        report.setNatType(nextNatType);
+        report.setNatMappingBehavior(nextMapping);
+        report.setNatFilteringBehavior(nextFiltering);
+        report.setNatBehaviorDiscovery(nextDiscovery);
+        report.setLastEndpoint(nextEndpoint);
         report.setCreatedAtMillis(System.currentTimeMillis());
         try {
             controlSender.send(null, JsonUtil.objectToString(report));
         } catch (Exception e) {
             log.debug("Peer mesh NAT 状态上报失败: {}", e.getMessage());
         }
+    }
+
+    private String compatibleNatType(NatBehaviorDiscovery.Snapshot snapshot) {
+        InetSocketAddress mappedEndpoint = snapshot.mappedEndpoint();
+        if (mappedEndpoint != null
+                && isPortPreserved(mappedEndpoint.getPort())
+                && isLocalAddress(mappedEndpoint.getAddress().getHostAddress())) {
+            return "NO_NAT";
+        }
+        if (NatBehaviorDiscovery.ADDRESS_DEPENDENT.equals(snapshot.mappingBehavior())
+                || NatBehaviorDiscovery.ADDRESS_AND_PORT_DEPENDENT.equals(snapshot.mappingBehavior())) {
+            return "SYMMETRIC_NAT";
+        }
+        if (NatBehaviorDiscovery.ENDPOINT_INDEPENDENT.equals(snapshot.mappingBehavior())) {
+            if (NatBehaviorDiscovery.ADDRESS_AND_PORT_DEPENDENT.equals(snapshot.filteringBehavior())) {
+                return "PORT_RESTRICTED_NAT";
+            }
+            if (NatBehaviorDiscovery.ENDPOINT_INDEPENDENT.equals(snapshot.filteringBehavior())
+                    || NatBehaviorDiscovery.ADDRESS_DEPENDENT.equals(snapshot.filteringBehavior())) {
+                return "FULL_CONE_OR_RESTRICTED_NAT";
+            }
+        }
+        return StringUtils.hasText(natType) ? natType : "NAT";
+    }
+
+    private String normalizeValue(String value) {
+        return value == null ? "" : value.trim();
     }
 
     private NatProbeResult classifyNat() {
@@ -1430,9 +1627,13 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private boolean isPortPreserved(NatProbeObservation observation) {
+        return observation != null && isPortPreserved(observation.mappedPort());
+    }
+
+    private boolean isPortPreserved(int mappedPort) {
         DatagramSocket socket = udpSocket;
         int localPort = socket == null || socket.isClosed() ? -1 : socket.getLocalPort();
-        return localPort > 0 && observation.mappedPort() == localPort;
+        return localPort > 0 && mappedPort == localPort;
     }
 
     private String normalizeProbeRole(String role) {
@@ -1539,6 +1740,7 @@ public class PeerMeshClient implements AutoCloseable {
     private void handleStunTurnMessage(StunMessage message, InetSocketAddress observedRemote) {
         switch (message.type()) {
             case StunMessage.BINDING_SUCCESS -> handleStunBindingSuccess(message, observedRemote);
+            case StunMessage.BINDING_ERROR -> handleStunBindingError(message, observedRemote);
             case StunMessage.ALLOCATE_SUCCESS -> {
                 completeTurnRequest(message, observedRemote);
                 handleTurnAllocated(message);
@@ -1572,24 +1774,52 @@ public class PeerMeshClient implements AutoCloseable {
         if (mapped == null) {
             return;
         }
-        PendingStunBinding pendingBinding = pendingStunBindings.remove(message.transactionIdHex());
-        String role = pendingBinding == null ? null : pendingBinding.role();
-        if (!StringUtils.hasText(role)) {
-            role = PeerRelayMessage.PROBE_PRIMARY;
+        String transactionKey = message.transactionIdHex();
+        PendingStunBinding pendingBinding = pendingStunBindings.get(transactionKey);
+        if (pendingBinding == null) {
+            log.trace("Peer mesh STUN Binding response has no pending transaction: tx={}", transactionKey);
+            return;
         }
+        if (!sameEndpoint(pendingBinding.expectedResponseEndpoint(), observedRemote)) {
+            log.debug(
+                    "Peer mesh STUN Binding response source mismatch: role={}, expected={}, actual={}",
+                    pendingBinding.role(),
+                    pendingBinding.expectedResponseEndpoint(),
+                    observedRemote);
+            return;
+        }
+        if (!pendingStunBindings.remove(transactionKey, pendingBinding)) {
+            return;
+        }
+
+        String role = pendingBinding.role();
         boolean publicStun = isPublicStunRole(role);
-        if (!publicStun) {
+        if (pendingBinding.behaviorProbe() != null) {
+            handleNatBehaviorTransition(natBehaviorDiscovery.succeeded(
+                    pendingBinding.behaviorGeneration(),
+                    pendingBinding.behaviorProbe(),
+                    mapped));
+        } else if (!publicStun) {
             PeerRelayMessage observation = new PeerRelayMessage();
             observation.setType(PeerRelayMessage.TYPE_BINDING_RESPONSE);
             observation.setProbeRole(role);
             observation.setMappedAddress(mapped.getAddress().getHostAddress());
             observation.setMappedPort(mapped.getPort());
-            message.otherAddress().ifPresent(other -> {
+            resolveOtherAddress(message, observedRemote).ifPresent(other -> {
                 observation.setAlternateAddress(other.getAddress().getHostAddress());
                 observation.setAlternatePort(other.getPort());
             });
             recordNatObservation(observation, observedRemote);
-            requestAlternateNatProbe(observation, observedRemote);
+            if (PeerRelayMessage.PROBE_PRIMARY.equals(normalizeProbeRole(role))) {
+                Optional<InetSocketAddress> standardOther =
+                        resolveStandardOtherAddress(message, observedRemote);
+                if (standardOther.isPresent()) {
+                    startNatBehaviorDiscovery(observedRemote, mapped, standardOther.get());
+                } else {
+                    reportBasicNatDiscovery();
+                    requestAlternateNatProbe(observation, observedRemote);
+                }
+            }
         }
 
         PeerCandidate candidate = new PeerCandidate();
@@ -1614,6 +1844,46 @@ public class PeerMeshClient implements AutoCloseable {
         if (candidateChanged) {
             announceCandidatesToOnlinePeers();
         }
+    }
+
+    private void handleStunBindingError(StunMessage message, InetSocketAddress observedRemote) {
+        String transactionKey = message.transactionIdHex();
+        PendingStunBinding pendingBinding = pendingStunBindings.get(transactionKey);
+        if (pendingBinding == null) {
+            return;
+        }
+        // RFC 5780 errors are sent by the request target, not by the changed
+        // response endpoint requested for a successful Binding response.
+        if (!sameEndpoint(pendingBinding.targetEndpoint(), observedRemote)) {
+            log.debug(
+                    "Peer mesh STUN Binding error source mismatch: role={}, expected={}, actual={}",
+                    pendingBinding.role(),
+                    pendingBinding.targetEndpoint(),
+                    observedRemote);
+            return;
+        }
+        if (!pendingStunBindings.remove(transactionKey, pendingBinding)) {
+            return;
+        }
+        if (pendingBinding.behaviorProbe() == null) {
+            log.debug(
+                    "Peer mesh STUN Binding request failed: role={}, code={}",
+                    pendingBinding.role(),
+                    message.errorCode());
+            return;
+        }
+        boolean unsupported = message.errorCode() == 420
+                && (message.unknownAttributes().isEmpty()
+                || message.unknownAttributes().contains(StunMessage.ATTR_CHANGE_REQUEST));
+        log.debug(
+                "Peer mesh RFC 5780 probe failed: probe={}, code={}, unsupported={}",
+                pendingBinding.behaviorProbe(),
+                message.errorCode(),
+                unsupported);
+        handleNatBehaviorTransition(natBehaviorDiscovery.failed(
+                pendingBinding.behaviorGeneration(),
+                pendingBinding.behaviorProbe(),
+                unsupported));
     }
 
     private void recordSrflxObservation(String role, InetSocketAddress stunServer, InetSocketAddress mapped) {
@@ -1688,6 +1958,67 @@ public class PeerMeshClient implements AutoCloseable {
         lastAlternateNatProbeRequestMillis = now;
         sendStunBinding(new InetSocketAddress(alternateAddress, response.getAlternatePort()),
                 PeerRelayMessage.PROBE_ALTERNATE);
+    }
+
+    private void startNatBehaviorDiscovery(InetSocketAddress primaryEndpoint,
+                                           InetSocketAddress mappedEndpoint,
+                                           InetSocketAddress otherEndpoint) {
+        long now = System.currentTimeMillis();
+        if (now - lastBehaviorDiscoveryStartedMillis < BEHAVIOR_DISCOVERY_MIN_INTERVAL_MILLIS) {
+            return;
+        }
+        lastBehaviorDiscoveryStartedMillis = now;
+        try {
+            handleNatBehaviorTransition(natBehaviorDiscovery.begin(
+                    primaryEndpoint,
+                    mappedEndpoint,
+                    otherEndpoint));
+        } catch (IllegalArgumentException e) {
+            log.debug("Peer mesh RFC 5780 topology ignored: {}", e.getMessage());
+            reportBasicNatDiscovery();
+        }
+    }
+
+    private void handleNatBehaviorTransition(NatBehaviorDiscovery.Transition transition) {
+        if (transition == null || !transition.accepted()) {
+            return;
+        }
+        if (transition.snapshot().complete()) {
+            reportNatBehavior(transition.snapshot());
+        }
+        if (transition.nextProbe() != null) {
+            sendBehaviorProbe(transition.nextProbe());
+        }
+    }
+
+    private Optional<InetSocketAddress> resolveStandardOtherAddress(StunMessage message,
+                                                                    InetSocketAddress observedRemote) {
+        Optional<InetSocketAddress> standardOrigin = message.responseOrigin();
+        Optional<InetSocketAddress> otherAddress = message.otherAddress();
+        if (standardOrigin.isEmpty()
+                || otherAddress.isEmpty()
+                || !sameEndpoint(standardOrigin.get(), observedRemote)
+                || otherAddress.get().getAddress() == null
+                || observedRemote == null
+                || observedRemote.getAddress() == null
+                || otherAddress.get().getAddress().equals(observedRemote.getAddress())
+                || otherAddress.get().getPort() == observedRemote.getPort()) {
+            return Optional.empty();
+        }
+        return otherAddress;
+    }
+
+    private Optional<InetSocketAddress> resolveOtherAddress(StunMessage message,
+                                                            InetSocketAddress observedRemote) {
+        Optional<InetSocketAddress> standardOther = resolveStandardOtherAddress(message, observedRemote);
+        if (standardOther.isPresent()) {
+            return standardOther;
+        }
+        Optional<InetSocketAddress> legacyOrigin = message.legacyXorResponseOrigin();
+        if (legacyOrigin.isPresent() && sameEndpoint(legacyOrigin.get(), observedRemote)) {
+            return message.legacyXorOtherAddress();
+        }
+        return message.otherAddress();
     }
 
     private boolean isUnspecifiedAddress(String address) {
@@ -1994,7 +2325,18 @@ public class PeerMeshClient implements AutoCloseable {
         pendingProbes.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
         // STUN binding 响应正常在亚秒级到达；entry 只在成功响应时移除，
         // STUN 服务器不可达时会以每 60s × N 个 server 的速度永久累积。
-        pendingStunBindings.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
+        for (Map.Entry<String, PendingStunBinding> entry : pendingStunBindings.entrySet()) {
+            PendingStunBinding pending = entry.getValue();
+            if (now - pending.sentAtMillis() <= PENDING_PROBE_TTL_MILLIS
+                    || !pendingStunBindings.remove(entry.getKey(), pending)) {
+                continue;
+            }
+            if (pending.behaviorProbe() != null) {
+                handleNatBehaviorTransition(natBehaviorDiscovery.timedOut(
+                        pending.behaviorGeneration(),
+                        pending.behaviorProbe()));
+            }
+        }
         pendingTurnRequests.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
     }
 
@@ -2622,6 +2964,13 @@ public class PeerMeshClient implements AutoCloseable {
         return new InetSocketAddress(config.getTurnHost(), config.getTurnPort());
     }
 
+    private InetSocketAddress stunEndpoint() {
+        if (config == null || !StringUtils.hasText(config.getStunHost()) || config.getStunPort() <= 0) {
+            return null;
+        }
+        return new InetSocketAddress(config.getStunHost(), config.getStunPort());
+    }
+
     private String endpointKey(InetSocketAddress endpoint) {
         if (endpoint == null || endpoint.getAddress() == null) {
             return "";
@@ -2994,6 +3343,11 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private record PendingStunBinding(String role,
+                                      InetSocketAddress targetEndpoint,
+                                      InetSocketAddress expectedResponseEndpoint,
+                                      StunMessage request,
+                                      NatBehaviorDiscovery.Probe behaviorProbe,
+                                      int behaviorGeneration,
                                       long sentAtMillis) {
     }
 

@@ -193,6 +193,9 @@ type PeerMeshDevice struct {
 	CIDR                   string
 	PublicKey              *string
 	NatType                *string
+	NatMappingBehavior     *string
+	NatFilteringBehavior   *string
+	NatBehaviorDiscovery   *string
 	LastEndpoint           *string
 	VirtualDeviceMode      *string
 	VirtualDeviceName      *string

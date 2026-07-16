@@ -156,6 +156,136 @@ func TestPushOnLoginRefreshesRosterForTenantPeers(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigUsesIndependentStandaloneStunEndpoint(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := New(config.PeerMeshConfig{
+		Enabled:               true,
+		CIDR:                  "100.96.0.0/11",
+		PublicAddress:         "turn.example.com",
+		StunTurnPort:          3478,
+		StandaloneStunAddress: "stun.example.com",
+		StandaloneStunPort:    5349,
+		SessionTTLSeconds:     3600,
+	}, db, session.NewRegistry(), nil)
+	account := insertPeerClient(t, db, 1151, "tenant-a", "alice", "alice-tablet")
+	insertPeerDevice(t, db, account, "100.96.0.18", "public-key")
+
+	runtimeConfig, err := service.BuildRuntimeConfig(ctx, account)
+	if err != nil {
+		t.Fatalf("build runtime config: %v", err)
+	}
+	if runtimeConfig.StunHost != "stun.example.com" || runtimeConfig.StunPort != 5349 {
+		t.Fatalf("runtime STUN endpoint = %s:%d, want stun.example.com:5349",
+			runtimeConfig.StunHost, runtimeConfig.StunPort)
+	}
+	if runtimeConfig.TurnHost != "turn.example.com" || runtimeConfig.TurnPort != 3478 {
+		t.Fatalf("runtime TURN endpoint = %s:%d, want turn.example.com:3478",
+			runtimeConfig.TurnHost, runtimeConfig.TurnPort)
+	}
+
+	publicConfig := service.PublicStunConfig("ignored.example.com")
+	if publicConfig.SelfHostedStunServer != "stun:stun.example.com:5349" {
+		t.Fatalf("public self-hosted STUN = %q", publicConfig.SelfHostedStunServer)
+	}
+	if publicConfig.StunTurnPort != 3478 {
+		t.Fatalf("legacy stunTurnPort = %d, want TURN port 3478", publicConfig.StunTurnPort)
+	}
+}
+
+func TestPublicStunConfigSupportsIndependentDeploymentAndLegacyFallback(t *testing.T) {
+	standalone := New(config.PeerMeshConfig{
+		Enabled:               false,
+		PublicAddress:         "turn.example.com",
+		StunTurnPort:          4444,
+		StandaloneStunAddress: "stun.example.com",
+		StandaloneStunPort:    5349,
+	}, nil, nil, nil).PublicStunConfig("ignored.example.com")
+	if standalone.PeerMeshEnabled {
+		t.Fatal("standalone STUN config unexpectedly enabled peer mesh")
+	}
+	if standalone.SelfHostedStunServer != "stun:stun.example.com:5349" ||
+		len(standalone.StunServers) != 1 || standalone.StunServers[0] != standalone.SelfHostedStunServer {
+		t.Fatalf("standalone STUN was not published while peer mesh was disabled: %+v", standalone)
+	}
+	if standalone.StunTurnPort != 4444 {
+		t.Fatalf("standalone response changed legacy TURN port: %+v", standalone)
+	}
+
+	legacy := New(config.PeerMeshConfig{
+		Enabled:            true,
+		PublicAddress:      "relay.example.com",
+		StunTurnPort:       4444,
+		StandaloneStunPort: 5349,
+	}, nil, nil, nil).PublicStunConfig("ignored.example.com")
+	if legacy.SelfHostedStunServer != "stun:relay.example.com:4444" {
+		t.Fatalf("legacy endpoint did not retain stunTurnPort: %+v", legacy)
+	}
+
+	partial := New(config.PeerMeshConfig{
+		Enabled:               true,
+		PublicAddress:         "relay.example.com",
+		StunTurnPort:          4444,
+		StandaloneStunAddress: "stun.example.com",
+		StandaloneStunPort:    0,
+	}, nil, nil, nil).PublicStunConfig("ignored.example.com")
+	if partial.SelfHostedStunServer != "stun:relay.example.com:4444" {
+		t.Fatalf("incomplete standalone endpoint did not fall back as a unit: %+v", partial)
+	}
+}
+
+func TestDeviceReportPersistsNatBehaviorFields(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := newPeerMeshTestService(db)
+	account := insertPeerClient(t, db, 1171, "tenant-a", "alice", "alice-phone")
+	insertPeerDevice(t, db, account, "100.96.0.19", "public-key")
+	natType := "PORT_RESTRICTED_NAT"
+	mapping := "ENDPOINT_INDEPENDENT"
+	filtering := "ADDRESS_AND_PORT_DEPENDENT"
+	discovery := "RFC5780"
+	endpoint := "198.51.100.20:52000"
+
+	view, err := service.ReportDevice(ctx, account, ControlMessage{
+		NatType:              &natType,
+		NatMappingBehavior:   &mapping,
+		NatFilteringBehavior: &filtering,
+		NatBehaviorDiscovery: &discovery,
+		LastEndpoint:         &endpoint,
+	})
+	if err != nil {
+		t.Fatalf("report device: %v", err)
+	}
+	if view.NatMappingBehavior == nil || *view.NatMappingBehavior != mapping ||
+		view.NatFilteringBehavior == nil || *view.NatFilteringBehavior != filtering ||
+		view.NatBehaviorDiscovery == nil || *view.NatBehaviorDiscovery != discovery {
+		t.Fatalf("reported device view lost NAT behavior fields: %+v", view)
+	}
+
+	stored, err := db.FindPeerMeshDeviceByClientID(ctx, account.TenantID, account.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("reload reported device: device=%+v err=%v", stored, err)
+	}
+	if stored.NatMappingBehavior == nil || *stored.NatMappingBehavior != mapping ||
+		stored.NatFilteringBehavior == nil || *stored.NatFilteringBehavior != filtering ||
+		stored.NatBehaviorDiscovery == nil || *stored.NatBehaviorDiscovery != discovery {
+		t.Fatalf("stored device lost NAT behavior fields: %+v", stored)
+	}
+
+	devices, err := service.ListDevices(ctx, AccessContext{
+		Username: account.OwnerUsername,
+		TenantID: account.TenantID,
+	})
+	if err != nil || len(devices) != 1 {
+		t.Fatalf("list devices: devices=%+v err=%v", devices, err)
+	}
+	if devices[0].NatMappingBehavior == nil || *devices[0].NatMappingBehavior != mapping ||
+		devices[0].NatFilteringBehavior == nil || *devices[0].NatFilteringBehavior != filtering ||
+		devices[0].NatBehaviorDiscovery == nil || *devices[0].NatBehaviorDiscovery != discovery {
+		t.Fatalf("management device view lost NAT behavior fields: %+v", devices[0])
+	}
+}
+
 func TestCanPeerMatchesJavaCaseSensitiveIdentityAndDirectionalACLs(t *testing.T) {
 	ctx := context.Background()
 	db := openPeerMeshTestDB(t)

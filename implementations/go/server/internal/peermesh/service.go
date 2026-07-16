@@ -86,6 +86,9 @@ type DeviceView struct {
 	CIDR                   string  `json:"cidr"`
 	PublicKey              *string `json:"publicKey,omitempty"`
 	NatType                *string `json:"natType,omitempty"`
+	NatMappingBehavior     *string `json:"natMappingBehavior,omitempty"`
+	NatFilteringBehavior   *string `json:"natFilteringBehavior,omitempty"`
+	NatBehaviorDiscovery   *string `json:"natBehaviorDiscovery,omitempty"`
 	LastEndpoint           *string `json:"lastEndpoint,omitempty"`
 	VirtualDeviceMode      *string `json:"virtualDeviceMode,omitempty"`
 	VirtualDeviceName      *string `json:"virtualDeviceName,omitempty"`
@@ -201,36 +204,39 @@ type Candidate struct {
 }
 
 type ControlMessage struct {
-	Type                string       `json:"type"`
-	SourceClientID      int64        `json:"sourceClientId,omitempty"`
-	SourceClientName    string       `json:"sourceClientName,omitempty"`
-	SourceVirtualIP     string       `json:"sourceVirtualIp,omitempty"`
-	SourcePublicKey     *string      `json:"sourcePublicKey,omitempty"`
-	TargetClientID      int64        `json:"targetClientId,omitempty"`
-	TargetClientName    string       `json:"targetClientName,omitempty"`
-	TargetVirtualIP     string       `json:"targetVirtualIp,omitempty"`
-	TargetPublicKey     *string      `json:"targetPublicKey,omitempty"`
-	SessionID           *int64       `json:"sessionId,omitempty"`
-	Token               string       `json:"token,omitempty"`
-	ExpiresAt           string       `json:"expiresAt,omitempty"`
-	PathType            string       `json:"pathType,omitempty"`
-	Status              string       `json:"status,omitempty"`
-	RTTMillis           *int64       `json:"rttMillis,omitempty"`
-	LocalEndpoint       *string      `json:"localEndpoint,omitempty"`
-	RemoteEndpoint      *string      `json:"remoteEndpoint,omitempty"`
-	DirectBytes         int64        `json:"directBytes,omitempty"`
-	RelayBytes          int64        `json:"relayBytes,omitempty"`
-	NatType             *string      `json:"natType,omitempty"`
-	LastEndpoint        *string      `json:"lastEndpoint,omitempty"`
-	VirtualDeviceMode   *string      `json:"virtualDeviceMode,omitempty"`
-	VirtualDeviceName   *string      `json:"virtualDeviceName,omitempty"`
-	VirtualDeviceStatus *string      `json:"virtualDeviceStatus,omitempty"`
-	VirtualDeviceError  *string      `json:"virtualDeviceError,omitempty"`
-	PeerMesh            *LoginConfig `json:"peerMesh,omitempty"`
-	Candidates          []Candidate  `json:"candidates,omitempty"`
-	Peers               []RosterItem `json:"peers,omitempty"`
-	Reason              string       `json:"reason,omitempty"`
-	CreatedAtMillis     int64        `json:"createdAtMillis,omitempty"`
+	Type                 string       `json:"type"`
+	SourceClientID       int64        `json:"sourceClientId,omitempty"`
+	SourceClientName     string       `json:"sourceClientName,omitempty"`
+	SourceVirtualIP      string       `json:"sourceVirtualIp,omitempty"`
+	SourcePublicKey      *string      `json:"sourcePublicKey,omitempty"`
+	TargetClientID       int64        `json:"targetClientId,omitempty"`
+	TargetClientName     string       `json:"targetClientName,omitempty"`
+	TargetVirtualIP      string       `json:"targetVirtualIp,omitempty"`
+	TargetPublicKey      *string      `json:"targetPublicKey,omitempty"`
+	SessionID            *int64       `json:"sessionId,omitempty"`
+	Token                string       `json:"token,omitempty"`
+	ExpiresAt            string       `json:"expiresAt,omitempty"`
+	PathType             string       `json:"pathType,omitempty"`
+	Status               string       `json:"status,omitempty"`
+	RTTMillis            *int64       `json:"rttMillis,omitempty"`
+	LocalEndpoint        *string      `json:"localEndpoint,omitempty"`
+	RemoteEndpoint       *string      `json:"remoteEndpoint,omitempty"`
+	DirectBytes          int64        `json:"directBytes,omitempty"`
+	RelayBytes           int64        `json:"relayBytes,omitempty"`
+	NatType              *string      `json:"natType,omitempty"`
+	NatMappingBehavior   *string      `json:"natMappingBehavior,omitempty"`
+	NatFilteringBehavior *string      `json:"natFilteringBehavior,omitempty"`
+	NatBehaviorDiscovery *string      `json:"natBehaviorDiscovery,omitempty"`
+	LastEndpoint         *string      `json:"lastEndpoint,omitempty"`
+	VirtualDeviceMode    *string      `json:"virtualDeviceMode,omitempty"`
+	VirtualDeviceName    *string      `json:"virtualDeviceName,omitempty"`
+	VirtualDeviceStatus  *string      `json:"virtualDeviceStatus,omitempty"`
+	VirtualDeviceError   *string      `json:"virtualDeviceError,omitempty"`
+	PeerMesh             *LoginConfig `json:"peerMesh,omitempty"`
+	Candidates           []Candidate  `json:"candidates,omitempty"`
+	Peers                []RosterItem `json:"peers,omitempty"`
+	Reason               string       `json:"reason,omitempty"`
+	CreatedAtMillis      int64        `json:"createdAtMillis,omitempty"`
 }
 
 type DeviceMutation struct {
@@ -408,9 +414,9 @@ func (s *Service) buildConfig(account store.ClientAccount, device *store.PeerMes
 	}
 	cfg.Enabled = device.Enabled
 	cfg.VirtualIP = device.VirtualIP
-	cfg.StunHost = s.resolvePeerHost(requestHost)
-	cfg.TurnHost = cfg.StunHost
-	cfg.StunPort = s.cfg.StunTurnPort
+	cfg.StunHost = s.resolveStunHost(requestHost)
+	cfg.TurnHost = s.resolvePeerHost(requestHost)
+	cfg.StunPort = s.stunPort()
 	cfg.TurnPort = s.cfg.StunTurnPort
 	cfg.PublicStunServers = s.publicStunServers()
 	credential := s.turnCredentials.issue("pm-" + strconv.FormatInt(account.ID, 10))
@@ -432,7 +438,7 @@ func (s *Service) PublicStunConfig(requestHost string) PublicStunConfig {
 	servers := make([]string, 0, 1+len(s.cfg.PublicStunServers))
 	seen := make(map[string]struct{})
 	selfHosted := ""
-	if s.Enabled() {
+	if s.Enabled() || s.hasStandaloneStun() {
 		selfHosted = s.selfHostedStunServer(requestHost)
 		if selfHosted != "" {
 			servers = appendUnique(servers, seen, selfHosted)
@@ -1103,6 +1109,15 @@ func (s *Service) ReportDevice(ctx context.Context, reporter store.ClientAccount
 	if report.NatType != nil {
 		device.NatType = capStringPtr(report.NatType, 80)
 	}
+	if report.NatMappingBehavior != nil {
+		device.NatMappingBehavior = capStringPtr(report.NatMappingBehavior, 80)
+	}
+	if report.NatFilteringBehavior != nil {
+		device.NatFilteringBehavior = capStringPtr(report.NatFilteringBehavior, 80)
+	}
+	if report.NatBehaviorDiscovery != nil {
+		device.NatBehaviorDiscovery = capStringPtr(report.NatBehaviorDiscovery, 40)
+	}
 	if report.LastEndpoint != nil {
 		device.LastEndpoint = capStringPtr(report.LastEndpoint, 255)
 	}
@@ -1561,7 +1576,9 @@ func (s *Service) deviceView(device store.PeerMeshDevice) DeviceView {
 		ID: device.ID, ClientID: device.ClientID, ClientName: device.ClientName,
 		OwnerUsername: device.OwnerUsername, Enabled: device.Enabled, Online: online,
 		VirtualIP: device.VirtualIP, CIDR: device.CIDR, PublicKey: device.PublicKey,
-		NatType: device.NatType, LastEndpoint: device.LastEndpoint,
+		NatType: device.NatType, NatMappingBehavior: device.NatMappingBehavior,
+		NatFilteringBehavior: device.NatFilteringBehavior,
+		NatBehaviorDiscovery: device.NatBehaviorDiscovery, LastEndpoint: device.LastEndpoint,
 		VirtualDeviceMode: device.VirtualDeviceMode, VirtualDeviceName: device.VirtualDeviceName,
 		VirtualDeviceStatus: device.VirtualDeviceStatus, VirtualDeviceError: device.VirtualDeviceError,
 		VirtualDeviceUpdatedAt: timePtrString(device.VirtualDeviceUpdatedAt),
@@ -1622,13 +1639,32 @@ func (s *Service) resolvePeerHost(requestHost string) string {
 	return strings.TrimSpace(requestHost)
 }
 
+func (s *Service) resolveStunHost(requestHost string) string {
+	if s.hasStandaloneStun() {
+		return strings.TrimSpace(s.cfg.StandaloneStunAddress)
+	}
+	return s.resolvePeerHost(requestHost)
+}
+
+func (s *Service) stunPort() int {
+	if s.hasStandaloneStun() {
+		return s.cfg.StandaloneStunPort
+	}
+	return s.cfg.StunTurnPort
+}
+
+func (s *Service) hasStandaloneStun() bool {
+	return strings.TrimSpace(s.cfg.StandaloneStunAddress) != "" && s.cfg.StandaloneStunPort > 0
+}
+
 func (s *Service) selfHostedStunServer(requestHost string) string {
-	host := s.resolvePeerHost(requestHost)
+	host := s.resolveStunHost(requestHost)
 	host = normalizeStunHost(host)
-	if host == "" || s.cfg.StunTurnPort <= 0 {
+	port := s.stunPort()
+	if host == "" || port <= 0 {
 		return ""
 	}
-	return "stun:" + bracketIPv6(host) + ":" + strconv.Itoa(s.cfg.StunTurnPort)
+	return "stun:" + bracketIPv6(host) + ":" + strconv.Itoa(port)
 }
 
 func (s *Service) publicStunServers() []string {

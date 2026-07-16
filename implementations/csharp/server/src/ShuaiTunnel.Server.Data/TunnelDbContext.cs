@@ -387,6 +387,9 @@ public sealed class TunnelDbContext : DbContext
             b.Property(x => x.Cidr).HasColumnName("cidr").HasMaxLength(64).IsRequired();
             b.Property(x => x.PublicKey).HasColumnName("public_key").HasMaxLength(256);
             b.Property(x => x.NatType).HasColumnName("nat_type").HasMaxLength(80);
+            b.Property(x => x.NatMappingBehavior).HasColumnName("nat_mapping_behavior").HasMaxLength(80);
+            b.Property(x => x.NatFilteringBehavior).HasColumnName("nat_filtering_behavior").HasMaxLength(80);
+            b.Property(x => x.NatBehaviorDiscovery).HasColumnName("nat_behavior_discovery").HasMaxLength(40);
             b.Property(x => x.LastEndpoint).HasColumnName("last_endpoint").HasMaxLength(255);
             b.Property(x => x.VirtualDeviceMode).HasColumnName("virtual_device_mode").HasMaxLength(80);
             b.Property(x => x.VirtualDeviceName).HasColumnName("virtual_device_name").HasMaxLength(80);

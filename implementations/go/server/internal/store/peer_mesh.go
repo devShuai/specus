@@ -12,7 +12,8 @@ import (
 
 func (db *DB) FindPeerMeshDeviceByClientID(ctx context.Context, tenantID string, clientID int64) (*PeerMeshDevice, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, client_id, client_name, virtual_ip, cidr,
-		public_key, nat_type, last_endpoint, virtual_device_mode, virtual_device_name,
+		public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior,
+		nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
 		virtual_device_status, virtual_device_error, virtual_device_updated_at, enabled,
 		last_seen_at, created_at, updated_at FROM peer_mesh_device
 		WHERE tenant_id = ? AND client_id = ?`)
@@ -29,7 +30,8 @@ func (db *DB) FindPeerMeshDeviceByClientID(ctx context.Context, tenantID string,
 
 func (db *DB) FindPeerMeshDeviceByVirtualIP(ctx context.Context, tenantID, virtualIP string) (*PeerMeshDevice, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, client_id, client_name, virtual_ip, cidr,
-		public_key, nat_type, last_endpoint, virtual_device_mode, virtual_device_name,
+		public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior,
+		nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
 		virtual_device_status, virtual_device_error, virtual_device_updated_at, enabled,
 		last_seen_at, created_at, updated_at FROM peer_mesh_device
 		WHERE tenant_id = ? AND virtual_ip = ?`)
@@ -46,7 +48,8 @@ func (db *DB) FindPeerMeshDeviceByVirtualIP(ctx context.Context, tenantID, virtu
 
 func (db *DB) ListPeerMeshDevicesByTenant(ctx context.Context, tenantID string) ([]PeerMeshDevice, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, client_id, client_name, virtual_ip, cidr,
-		public_key, nat_type, last_endpoint, virtual_device_mode, virtual_device_name,
+		public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior,
+		nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
 		virtual_device_status, virtual_device_error, virtual_device_updated_at, enabled,
 		last_seen_at, created_at, updated_at FROM peer_mesh_device
 		WHERE tenant_id = ? ORDER BY client_name ASC`)
@@ -55,7 +58,8 @@ func (db *DB) ListPeerMeshDevicesByTenant(ctx context.Context, tenantID string) 
 
 func (db *DB) ListPeerMeshDevicesByOwner(ctx context.Context, tenantID, ownerUsername string) ([]PeerMeshDevice, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, client_id, client_name, virtual_ip, cidr,
-		public_key, nat_type, last_endpoint, virtual_device_mode, virtual_device_name,
+		public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior,
+		nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
 		virtual_device_status, virtual_device_error, virtual_device_updated_at, enabled,
 		last_seen_at, created_at, updated_at FROM peer_mesh_device
 		WHERE tenant_id = ? AND owner_username = ? ORDER BY client_name ASC`)
@@ -64,7 +68,8 @@ func (db *DB) ListPeerMeshDevicesByOwner(ctx context.Context, tenantID, ownerUse
 
 func (db *DB) ListEnabledPeerMeshDevicesByOwner(ctx context.Context, tenantID, ownerUsername string) ([]PeerMeshDevice, error) {
 	query := db.rebind(`SELECT id, tenant_id, owner_username, client_id, client_name, virtual_ip, cidr,
-		public_key, nat_type, last_endpoint, virtual_device_mode, virtual_device_name,
+		public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior,
+		nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
 		virtual_device_status, virtual_device_error, virtual_device_updated_at, enabled,
 		last_seen_at, created_at, updated_at FROM peer_mesh_device
 		WHERE tenant_id = ? AND owner_username = ? AND enabled = 1 ORDER BY client_name ASC`)
@@ -91,14 +96,16 @@ func (db *DB) listPeerMeshDevices(ctx context.Context, query string, args ...any
 func (db *DB) InsertPeerMeshDevice(ctx context.Context, device PeerMeshDevice) error {
 	query := db.rebind(`INSERT INTO peer_mesh_device
 		(id, tenant_id, owner_username, client_id, client_name, virtual_ip, cidr,
-		 public_key, nat_type, last_endpoint, virtual_device_mode, virtual_device_name,
+		 public_key, nat_type, nat_mapping_behavior, nat_filtering_behavior,
+		 nat_behavior_discovery, last_endpoint, virtual_device_mode, virtual_device_name,
 		 virtual_device_status, virtual_device_error, virtual_device_updated_at, enabled,
 		 last_seen_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query,
 		device.ID, defaultTenant(device.TenantID), defaultOwner(device.OwnerUsername),
 		device.ClientID, device.ClientName, device.VirtualIP, device.CIDR,
-		device.PublicKey, device.NatType, device.LastEndpoint, device.VirtualDeviceMode,
+		device.PublicKey, device.NatType, device.NatMappingBehavior, device.NatFilteringBehavior,
+		device.NatBehaviorDiscovery, device.LastEndpoint, device.VirtualDeviceMode,
 		device.VirtualDeviceName, device.VirtualDeviceStatus, device.VirtualDeviceError,
 		nullableTime(device.VirtualDeviceUpdatedAt), boolToInt(device.Enabled),
 		nullableTime(device.LastSeenAt), formatTime(device.CreatedAt), formatTime(device.UpdatedAt))
@@ -107,13 +114,15 @@ func (db *DB) InsertPeerMeshDevice(ctx context.Context, device PeerMeshDevice) e
 
 func (db *DB) UpdatePeerMeshDevice(ctx context.Context, device PeerMeshDevice) error {
 	query := db.rebind(`UPDATE peer_mesh_device SET owner_username = ?, client_name = ?, virtual_ip = ?,
-		cidr = ?, public_key = ?, nat_type = ?, last_endpoint = ?, virtual_device_mode = ?,
+		cidr = ?, public_key = ?, nat_type = ?, nat_mapping_behavior = ?,
+		nat_filtering_behavior = ?, nat_behavior_discovery = ?, last_endpoint = ?, virtual_device_mode = ?,
 		virtual_device_name = ?, virtual_device_status = ?, virtual_device_error = ?,
 		virtual_device_updated_at = ?, enabled = ?, last_seen_at = ?, updated_at = ?
 		WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query,
 		defaultOwner(device.OwnerUsername), device.ClientName, device.VirtualIP, device.CIDR,
-		device.PublicKey, device.NatType, device.LastEndpoint, device.VirtualDeviceMode,
+		device.PublicKey, device.NatType, device.NatMappingBehavior, device.NatFilteringBehavior,
+		device.NatBehaviorDiscovery, device.LastEndpoint, device.VirtualDeviceMode,
 		device.VirtualDeviceName, device.VirtualDeviceStatus, device.VirtualDeviceError,
 		nullableTime(device.VirtualDeviceUpdatedAt), boolToInt(device.Enabled),
 		nullableTime(device.LastSeenAt), formatTime(device.UpdatedAt), device.ID)
@@ -485,24 +494,29 @@ type scanner interface {
 
 func scanPeerMeshDevice(scanner scanner) (PeerMeshDevice, error) {
 	var (
-		device              PeerMeshDevice
-		publicKey, natType  sql.NullString
-		lastEndpoint        sql.NullString
-		mode, name, status  sql.NullString
-		deviceError         sql.NullString
-		deviceUpdated, seen sql.NullString
-		created, updated    string
-		enabled             int
+		device                                 PeerMeshDevice
+		publicKey, natType                     sql.NullString
+		natMapping, natFiltering, natDiscovery sql.NullString
+		lastEndpoint                           sql.NullString
+		mode, name, status                     sql.NullString
+		deviceError                            sql.NullString
+		deviceUpdated, seen                    sql.NullString
+		created, updated                       string
+		enabled                                int
 	)
 	err := scanner.Scan(&device.ID, &device.TenantID, &device.OwnerUsername, &device.ClientID,
 		&device.ClientName, &device.VirtualIP, &device.CIDR, &publicKey, &natType,
-		&lastEndpoint, &mode, &name, &status, &deviceError, &deviceUpdated, &enabled,
+		&natMapping, &natFiltering, &natDiscovery, &lastEndpoint, &mode, &name,
+		&status, &deviceError, &deviceUpdated, &enabled,
 		&seen, &created, &updated)
 	if err != nil {
 		return PeerMeshDevice{}, err
 	}
 	device.PublicKey = nullStringPtr(publicKey)
 	device.NatType = nullStringPtr(natType)
+	device.NatMappingBehavior = nullStringPtr(natMapping)
+	device.NatFilteringBehavior = nullStringPtr(natFiltering)
+	device.NatBehaviorDiscovery = nullStringPtr(natDiscovery)
 	device.LastEndpoint = nullStringPtr(lastEndpoint)
 	device.VirtualDeviceMode = nullStringPtr(mode)
 	device.VirtualDeviceName = nullStringPtr(name)
