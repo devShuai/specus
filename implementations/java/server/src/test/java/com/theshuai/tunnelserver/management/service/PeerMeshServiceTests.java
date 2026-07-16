@@ -326,6 +326,18 @@ class PeerMeshServiceTests {
         var natUnknown = natAggregate(null, 2);
         var natSymmetric = natAggregate("SYMMETRIC_NAT", 1);
         when(deviceRepository.aggregateNatTypes("tenant-a")).thenReturn(List.of(natUnknown, natSymmetric));
+        var classifiedBehavior = natBehaviorAggregate(
+                "ENDPOINT_INDEPENDENT",
+                "ADDRESS_AND_PORT_DEPENDENT",
+                "RFC5780",
+                1);
+        var incompleteBehavior = natBehaviorAggregate(
+                "ADDRESS_DEPENDENT",
+                "UNSUPPORTED",
+                "BASIC",
+                1);
+        when(deviceRepository.aggregateNatBehaviors("tenant-a"))
+                .thenReturn(List.of(classifiedBehavior, incompleteBehavior));
 
         var stats = service.pathStats(new ManagementContext(new TenantContext("tenant-a"), "admin", true));
 
@@ -342,6 +354,19 @@ class PeerMeshServiceTests {
                         org.assertj.core.groups.Tuple.tuple("UNKNOWN", 2L),
                         org.assertj.core.groups.Tuple.tuple("SYMMETRIC_NAT", 1L)
                 );
+        assertThat(stats.natBehaviorDevices()).isEqualTo(2);
+        assertThat(stats.natBehaviorClassifiedDevices()).isEqualTo(1);
+        assertThat(stats.natBehaviorSuccessRatio()).isEqualTo(0.5);
+        assertThat(stats.natMappingBehaviors())
+                .extracting("behavior", "devices")
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple("ENDPOINT_INDEPENDENT", 1L),
+                        org.assertj.core.groups.Tuple.tuple("ADDRESS_DEPENDENT", 1L));
+        assertThat(stats.natFilteringBehaviors())
+                .extracting("behavior", "devices")
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple("ADDRESS_AND_PORT_DEPENDENT", 1L),
+                        org.assertj.core.groups.Tuple.tuple("UNSUPPORTED", 1L));
     }
 
     private ClientAccount client(long id, String owner, String name) {
@@ -400,6 +425,20 @@ class PeerMeshServiceTests {
     private PeerMeshDeviceRepository.NatTypeAggregate natAggregate(String natType, long devices) {
         PeerMeshDeviceRepository.NatTypeAggregate aggregate = mock(PeerMeshDeviceRepository.NatTypeAggregate.class);
         when(aggregate.getNatType()).thenReturn(natType);
+        when(aggregate.getDevices()).thenReturn(devices);
+        return aggregate;
+    }
+
+    private PeerMeshDeviceRepository.NatBehaviorAggregate natBehaviorAggregate(
+            String mapping,
+            String filtering,
+            String discovery,
+            long devices) {
+        PeerMeshDeviceRepository.NatBehaviorAggregate aggregate =
+                mock(PeerMeshDeviceRepository.NatBehaviorAggregate.class);
+        when(aggregate.getMappingBehavior()).thenReturn(mapping);
+        when(aggregate.getFilteringBehavior()).thenReturn(filtering);
+        when(aggregate.getDiscovery()).thenReturn(discovery);
         when(aggregate.getDevices()).thenReturn(devices);
         return aggregate;
     }

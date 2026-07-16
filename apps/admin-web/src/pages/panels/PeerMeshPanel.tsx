@@ -698,8 +698,14 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
     return null;
   }
   const ratioPercent = stats.activeDirectRatio == null ? null : Math.round(stats.activeDirectRatio * 100);
+  const behaviorRatioPercent = stats.natBehaviorSuccessRatio == null
+    ? null
+    : Math.round(stats.natBehaviorSuccessRatio * 100);
   const pathTypeRows = [...stats.pathTypes].sort((a, b) => b.sessions - a.sessions);
   const natTypeRows = [...stats.natTypes].sort((a, b) => b.devices - a.devices);
+  const mappingRows = [...(stats.natMappingBehaviors ?? [])].sort((a, b) => b.devices - a.devices);
+  const filteringRows = [...(stats.natFilteringBehaviors ?? [])].sort((a, b) => b.devices - a.devices);
+  const discoveryRows = [...(stats.natBehaviorDiscoveries ?? [])].sort((a, b) => b.devices - a.devices);
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
       <CardBody className="gap-3 p-3">
@@ -728,6 +734,38 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
             <span>Relay {stats.activeRelaySessions}</span>
           </div>
         </div>
+
+        {(stats.natBehaviorDevices ?? 0) > 0 && (
+          <div className="flex flex-col gap-2 border-t border-default-200 pt-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-tiny text-default-500">
+              <span>NAT 行为完整分类率</span>
+              <span className="text-small font-semibold text-foreground">
+                {behaviorRatioPercent == null ? "-" : `${behaviorRatioPercent}%`}
+                <span className="ml-1 font-normal text-default-500">
+                  ({stats.natBehaviorClassifiedDevices}/{stats.natBehaviorDevices})
+                </span>
+              </span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-default-200">
+              <div
+                className="h-full rounded-full bg-primary transition-[width] duration-500"
+                style={{ width: `${behaviorRatioPercent ?? 0}%` }}
+              />
+            </div>
+            <NatBehaviorDistribution
+              label="映射"
+              items={mappingRows.map((item) => ({ ...item, label: natBehaviorLabel(item.behavior) }))}
+            />
+            <NatBehaviorDistribution
+              label="过滤"
+              items={filteringRows.map((item) => ({ ...item, label: natBehaviorLabel(item.behavior) }))}
+            />
+            <NatBehaviorDistribution
+              label="方式"
+              items={discoveryRows.map((item) => ({ ...item, label: natBehaviorDiscoveryLabel(item.behavior) }))}
+            />
+          </div>
+        )}
 
         {pathTypeRows.length > 0 && (
           <div className="min-w-0 overflow-x-auto">
@@ -1015,6 +1053,33 @@ function PeerNatBehaviorLine({ device }: { device: PeerMeshDevice }) {
     <span className="truncate text-tiny text-default-500" title={hasBehavior ? `${discovery} · ${detail}` : detail}>
       {detail}
     </span>
+  );
+}
+
+function NatBehaviorDistribution({
+  label,
+  items,
+}: {
+  label: string;
+  items: Array<{ behavior: string; devices: number; label: string }>;
+}) {
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className="w-8 shrink-0 text-tiny text-default-500">{label}</span>
+      {items.map((item) => (
+        <Chip
+          key={`${label}-${item.behavior}`}
+          size="sm"
+          variant="flat"
+          color={["UNKNOWN", "UNSUPPORTED"].includes(item.behavior.toUpperCase()) ? "warning" : "default"}
+        >
+          {item.label} · {item.devices}
+        </Chip>
+      ))}
+    </div>
   );
 }
 

@@ -506,7 +506,13 @@ func TestPathStatsAggregatesDirectRatioReportedSessionsAndNatTypes(t *testing.T)
 		t.Fatalf("find source peer device: %v", err)
 	}
 	natType := "PORT_RESTRICTED_NAT"
+	mapping := "ENDPOINT_INDEPENDENT"
+	filtering := "ADDRESS_AND_PORT_DEPENDENT"
+	discovery := "RFC5780"
 	sourceDevice.NatType = &natType
+	sourceDevice.NatMappingBehavior = &mapping
+	sourceDevice.NatFilteringBehavior = &filtering
+	sourceDevice.NatBehaviorDiscovery = &discovery
 	if err := db.UpdatePeerMeshDevice(ctx, *sourceDevice); err != nil {
 		t.Fatalf("update source peer device: %v", err)
 	}
@@ -590,6 +596,15 @@ func TestPathStatsAggregatesDirectRatioReportedSessionsAndNatTypes(t *testing.T)
 	if findNatTypeStat(stats.NatTypes, "PORT_RESTRICTED_NAT") != 1 ||
 		findNatTypeStat(stats.NatTypes, "UNKNOWN") != 1 {
 		t.Fatalf("nat type aggregate mismatch: %+v", stats.NatTypes)
+	}
+	if stats.NatBehaviorDevices != 1 || stats.NatBehaviorClassifiedDevices != 1 ||
+		stats.NatBehaviorSuccessRatio == nil || *stats.NatBehaviorSuccessRatio != 1 {
+		t.Fatalf("nat behavior success mismatch: %+v", stats)
+	}
+	if findNatBehaviorStat(stats.NatMappingBehaviors, mapping) != 1 ||
+		findNatBehaviorStat(stats.NatFilteringBehaviors, filtering) != 1 ||
+		findNatBehaviorStat(stats.NatBehaviorDiscoveries, discovery) != 1 {
+		t.Fatalf("nat behavior aggregates mismatch: %+v", stats)
 	}
 }
 
@@ -910,6 +925,15 @@ func findPathTypeStat(items []PathTypeStat, pathType, status string) *PathTypeSt
 func findNatTypeStat(items []NatTypeStat, natType string) int64 {
 	for _, item := range items {
 		if item.NatType == natType {
+			return item.Devices
+		}
+	}
+	return 0
+}
+
+func findNatBehaviorStat(items []NatBehaviorStat, behavior string) int64 {
+	for _, item := range items {
+		if item.Behavior == behavior {
 			return item.Devices
 		}
 	}

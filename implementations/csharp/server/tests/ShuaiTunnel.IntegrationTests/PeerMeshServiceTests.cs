@@ -343,7 +343,11 @@ public sealed class PeerMeshServiceTests
         var target = fixture.AddClient(2502, "tenant-a", "alice", "alice-nas");
         fixture.AddDevice(source, "100.96.0.30", "source-key");
         fixture.AddDevice(target, "100.96.0.31", "target-key");
-        fixture.Db.PeerMeshDevices.Local.Single(d => d.ClientId == source.Id).NatType = "PORT_RESTRICTED_NAT";
+        var sourceDevice = fixture.Db.PeerMeshDevices.Local.Single(d => d.ClientId == source.Id);
+        sourceDevice.NatType = "PORT_RESTRICTED_NAT";
+        sourceDevice.NatMappingBehavior = "ENDPOINT_INDEPENDENT";
+        sourceDevice.NatFilteringBehavior = "ADDRESS_AND_PORT_DEPENDENT";
+        sourceDevice.NatBehaviorDiscovery = "RFC5780";
         var now = DateTimeOffset.UtcNow;
         fixture.Db.PeerMeshSessions.AddRange(
             new PeerMeshSession
@@ -419,6 +423,18 @@ public sealed class PeerMeshServiceTests
         Assert.Equal(0, directNegotiating.ReportedSessions);
         Assert.Contains(stats.NatTypes, item => item.NatType == "PORT_RESTRICTED_NAT" && item.Devices == 1);
         Assert.Contains(stats.NatTypes, item => item.NatType == "UNKNOWN" && item.Devices == 1);
+        Assert.Equal(1, stats.NatBehaviorDevices);
+        Assert.Equal(1, stats.NatBehaviorClassifiedDevices);
+        Assert.Equal(1, stats.NatBehaviorSuccessRatio);
+        Assert.Contains(
+            stats.NatMappingBehaviors,
+            item => item.Behavior == "ENDPOINT_INDEPENDENT" && item.Devices == 1);
+        Assert.Contains(
+            stats.NatFilteringBehaviors,
+            item => item.Behavior == "ADDRESS_AND_PORT_DEPENDENT" && item.Devices == 1);
+        Assert.Contains(
+            stats.NatBehaviorDiscoveries,
+            item => item.Behavior == "RFC5780" && item.Devices == 1);
     }
 
     [Fact]

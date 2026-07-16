@@ -587,15 +587,20 @@ public class PeerMeshService {
         expireIfStale();
         List<PeerMeshSessionRepository.PathTypeAggregate> aggregates;
         List<PeerMeshDeviceRepository.NatTypeAggregate> natAggregates;
+        List<PeerMeshDeviceRepository.NatBehaviorAggregate> natBehaviorAggregates;
         if (context.isAdmin()) {
             aggregates = sessionRepository.aggregatePathTypes(context.tenant().tenantId());
             natAggregates = deviceRepository.aggregateNatTypes(context.tenant().tenantId());
+            natBehaviorAggregates =
+                    deviceRepository.aggregateNatBehaviors(context.tenant().tenantId());
         } else {
             List<Long> visible = visibleClientIds(context);
             aggregates = visible.isEmpty()
                     ? List.of()
                     : sessionRepository.aggregateVisiblePathTypes(context.tenant().tenantId(), visible);
             natAggregates = deviceRepository.aggregateNatTypesByOwner(
+                    context.tenant().tenantId(), context.username());
+            natBehaviorAggregates = deviceRepository.aggregateNatBehaviorsByOwner(
                     context.tenant().tenantId(), context.username());
         }
         long total = 0;
@@ -633,6 +638,29 @@ public class PeerMeshService {
         List<PeerMeshPathStatsView.NatTypeStat> natTypes = natCounts.entrySet().stream()
                 .map(entry -> new PeerMeshPathStatsView.NatTypeStat(entry.getKey(), entry.getValue()))
                 .toList();
+        long natBehaviorDevices = 0;
+        long natBehaviorClassifiedDevices = 0;
+        Map<String, Long> mappingCounts = new LinkedHashMap<>();
+        Map<String, Long> filteringCounts = new LinkedHashMap<>();
+        Map<String, Long> discoveryCounts = new LinkedHashMap<>();
+        for (PeerMeshDeviceRepository.NatBehaviorAggregate item : natBehaviorAggregates) {
+            if (!StringUtils.hasText(item.getMappingBehavior())
+                    && !StringUtils.hasText(item.getFilteringBehavior())
+                    && !StringUtils.hasText(item.getDiscovery())) {
+                continue;
+            }
+            long devices = item.getDevices();
+            natBehaviorDevices += devices;
+            String mapping = normalizeNatBehavior(item.getMappingBehavior());
+            String filtering = normalizeNatBehavior(item.getFilteringBehavior());
+            String discovery = normalizeNatBehavior(item.getDiscovery());
+            mappingCounts.merge(mapping, devices, Long::sum);
+            filteringCounts.merge(filtering, devices, Long::sum);
+            discoveryCounts.merge(discovery, devices, Long::sum);
+            if (isClassifiedNatBehavior(mapping) && isClassifiedNatBehavior(filtering)) {
+                natBehaviorClassifiedDevices += devices;
+            }
+        }
         return new PeerMeshPathStatsView(
                 total,
                 reported,
@@ -641,7 +669,34 @@ public class PeerMeshService {
                 activeRelay,
                 active == 0 ? null : (double) activeDirect / active,
                 pathTypes,
-                natTypes);
+                natTypes,
+                natBehaviorDevices,
+                natBehaviorClassifiedDevices,
+                natBehaviorDevices == 0
+                        ? null
+                        : (double) natBehaviorClassifiedDevices / natBehaviorDevices,
+                natBehaviorStats(mappingCounts),
+                natBehaviorStats(filteringCounts),
+                natBehaviorStats(discoveryCounts));
+    }
+
+    private List<PeerMeshPathStatsView.NatBehaviorStat> natBehaviorStats(
+            Map<String, Long> counts) {
+        return counts.entrySet().stream()
+                .map(entry -> new PeerMeshPathStatsView.NatBehaviorStat(
+                        entry.getKey(),
+                        entry.getValue()))
+                .toList();
+    }
+
+    private String normalizeNatBehavior(String value) {
+        return StringUtils.hasText(value) ? value.trim() : "UNKNOWN";
+    }
+
+    private boolean isClassifiedNatBehavior(String value) {
+        return StringUtils.hasText(value)
+                && !"UNKNOWN".equalsIgnoreCase(value)
+                && !"UNSUPPORTED".equalsIgnoreCase(value);
     }
 
     private List<Long> visibleClientIds(ManagementContext context) {

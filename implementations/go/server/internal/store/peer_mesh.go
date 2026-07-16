@@ -444,6 +444,13 @@ type PeerMeshNatTypeAggregate struct {
 	Devices int64
 }
 
+type PeerMeshNatBehaviorAggregate struct {
+	MappingBehavior   *string
+	FilteringBehavior *string
+	Discovery         *string
+	Devices           int64
+}
+
 func (db *DB) AggregatePeerMeshNatTypes(ctx context.Context, tenantID, ownerUsername string, filterOwner bool) ([]PeerMeshNatTypeAggregate, error) {
 	args := []any{defaultTenant(tenantID)}
 	where := ` WHERE tenant_id = ?`
@@ -466,6 +473,37 @@ func (db *DB) AggregatePeerMeshNatTypes(ctx context.Context, tenantID, ownerUser
 			return nil, err
 		}
 		item.NatType = nullStringPtr(natType)
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (db *DB) AggregatePeerMeshNatBehaviors(ctx context.Context, tenantID, ownerUsername string, filterOwner bool) ([]PeerMeshNatBehaviorAggregate, error) {
+	args := []any{defaultTenant(tenantID)}
+	where := ` WHERE tenant_id = ?`
+	if filterOwner {
+		where += ` AND owner_username = ?`
+		args = append(args, defaultOwner(ownerUsername))
+	}
+	query := db.rebind(`SELECT nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery,
+			COUNT(*) AS devices
+		FROM peer_mesh_device` + where +
+		` GROUP BY nat_mapping_behavior, nat_filtering_behavior, nat_behavior_discovery`)
+	rows, err := db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PeerMeshNatBehaviorAggregate
+	for rows.Next() {
+		var item PeerMeshNatBehaviorAggregate
+		var mapping, filtering, discovery sql.NullString
+		if err := rows.Scan(&mapping, &filtering, &discovery, &item.Devices); err != nil {
+			return nil, err
+		}
+		item.MappingBehavior = nullStringPtr(mapping)
+		item.FilteringBehavior = nullStringPtr(filtering)
+		item.Discovery = nullStringPtr(discovery)
 		items = append(items, item)
 	}
 	return items, rows.Err()

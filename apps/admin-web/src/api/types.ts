@@ -453,6 +453,11 @@ export interface PeerMeshNatTypeStat {
   devices: number;
 }
 
+export interface PeerMeshNatBehaviorStat {
+  behavior: string;
+  devices: number;
+}
+
 export interface PeerMeshPathStats {
   totalSessions: number;
   reportedSessions: number;
@@ -463,6 +468,14 @@ export interface PeerMeshPathStats {
   activeDirectRatio: number | null;
   pathTypes: PeerMeshPathTypeStat[];
   natTypes: PeerMeshNatTypeStat[];
+  /** 至少上报映射、过滤或探测方式之一的设备数 */
+  natBehaviorDevices: number;
+  /** 同时得到有效映射行为和过滤行为分类的设备数 */
+  natBehaviorClassifiedDevices: number;
+  natBehaviorSuccessRatio: number | null;
+  natMappingBehaviors: PeerMeshNatBehaviorStat[];
+  natFilteringBehaviors: PeerMeshNatBehaviorStat[];
+  natBehaviorDiscoveries: PeerMeshNatBehaviorStat[];
 }
 
 export interface DatabaseInitResult {

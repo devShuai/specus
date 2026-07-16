@@ -24,6 +24,16 @@ public interface PeerMeshDeviceRepository extends JpaRepository<PeerMeshDevice, 
         long getDevices();
     }
 
+    interface NatBehaviorAggregate {
+        String getMappingBehavior();
+
+        String getFilteringBehavior();
+
+        String getDiscovery();
+
+        long getDevices();
+    }
+
     @Query("""
             select d.natType as natType, count(d) as devices
             from PeerMeshDevice d
@@ -40,4 +50,29 @@ public interface PeerMeshDeviceRepository extends JpaRepository<PeerMeshDevice, 
             group by d.natType
             """)
     List<NatTypeAggregate> aggregateNatTypesByOwner(String tenantId, String ownerUsername);
+
+    @Query("""
+            select d.natMappingBehavior as mappingBehavior,
+                   d.natFilteringBehavior as filteringBehavior,
+                   d.natBehaviorDiscovery as discovery,
+                   count(d) as devices
+            from PeerMeshDevice d
+            where d.tenantId = :tenantId
+            group by d.natMappingBehavior, d.natFilteringBehavior, d.natBehaviorDiscovery
+            """)
+    List<NatBehaviorAggregate> aggregateNatBehaviors(String tenantId);
+
+    @Query("""
+            select d.natMappingBehavior as mappingBehavior,
+                   d.natFilteringBehavior as filteringBehavior,
+                   d.natBehaviorDiscovery as discovery,
+                   count(d) as devices
+            from PeerMeshDevice d
+            where d.tenantId = :tenantId
+              and d.ownerUsername = :ownerUsername
+            group by d.natMappingBehavior, d.natFilteringBehavior, d.natBehaviorDiscovery
+            """)
+    List<NatBehaviorAggregate> aggregateNatBehaviorsByOwner(
+            String tenantId,
+            String ownerUsername);
 }

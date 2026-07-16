@@ -519,6 +519,22 @@ public sealed class PeerMeshService
             .Select(g => new { NatType = g.Key, Devices = g.LongCount() })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+        var natBehaviorRows = await natQuery
+            .GroupBy(d => new
+            {
+                Mapping = d.NatMappingBehavior,
+                Filtering = d.NatFilteringBehavior,
+                Discovery = d.NatBehaviorDiscovery,
+            })
+            .Select(g => new
+            {
+                g.Key.Mapping,
+                g.Key.Filtering,
+                g.Key.Discovery,
+                Devices = g.LongCount(),
+            })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
         long total = 0;
         long reported = 0;
@@ -554,10 +570,65 @@ public sealed class PeerMeshService
             natCounts[key] += row.Devices;
         }
         var natTypes = natCounts.Select(item => new PeerMeshNatTypeStat(item.Key, item.Value)).ToList();
+        long natBehaviorDevices = 0;
+        long natBehaviorClassifiedDevices = 0;
+        var mappingCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+        var filteringCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+        var discoveryCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var row in natBehaviorRows)
+        {
+            if (string.IsNullOrWhiteSpace(row.Mapping)
+                && string.IsNullOrWhiteSpace(row.Filtering)
+                && string.IsNullOrWhiteSpace(row.Discovery))
+            {
+                continue;
+            }
+            natBehaviorDevices += row.Devices;
+            var mapping = NormalizeNatBehavior(row.Mapping);
+            var filtering = NormalizeNatBehavior(row.Filtering);
+            var discovery = NormalizeNatBehavior(row.Discovery);
+            MergeNatBehavior(mappingCounts, mapping, row.Devices);
+            MergeNatBehavior(filteringCounts, filtering, row.Devices);
+            MergeNatBehavior(discoveryCounts, discovery, row.Devices);
+            if (IsClassifiedNatBehavior(mapping) && IsClassifiedNatBehavior(filtering))
+            {
+                natBehaviorClassifiedDevices += row.Devices;
+            }
+        }
         double? ratio = active == 0 ? null : (double)activeDirect / active;
         return new PeerMeshPathStatsView(total, reported, active, activeDirect, activeRelay, ratio,
-            pathTypes, natTypes);
+            pathTypes,
+            natTypes,
+            natBehaviorDevices,
+            natBehaviorClassifiedDevices,
+            natBehaviorDevices == 0
+                ? null
+                : (double)natBehaviorClassifiedDevices / natBehaviorDevices,
+            NatBehaviorStats(mappingCounts),
+            NatBehaviorStats(filteringCounts),
+            NatBehaviorStats(discoveryCounts));
     }
+
+    private static void MergeNatBehavior(
+        IDictionary<string, long> counts,
+        string behavior,
+        long devices)
+    {
+        counts.TryAdd(behavior, 0);
+        counts[behavior] += devices;
+    }
+
+    private static IReadOnlyList<PeerMeshNatBehaviorStat> NatBehaviorStats(
+        IEnumerable<KeyValuePair<string, long>> counts) =>
+        counts.Select(item => new PeerMeshNatBehaviorStat(item.Key, item.Value)).ToList();
+
+    private static string NormalizeNatBehavior(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? "UNKNOWN" : value.Trim();
+
+    private static bool IsClassifiedNatBehavior(string value) =>
+        !string.IsNullOrWhiteSpace(value)
+        && !string.Equals(value, "UNKNOWN", StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(value, "UNSUPPORTED", StringComparison.OrdinalIgnoreCase);
 
     public async Task<PeerMeshSessionView> ForceCloseAsync(ManagementContext context, long sessionId,
         CancellationToken cancellationToken)
@@ -1570,7 +1641,13 @@ public sealed record PeerMeshPathStatsView(
     long ActiveRelaySessions,
     double? ActiveDirectRatio,
     IReadOnlyList<PeerMeshPathTypeStat> PathTypes,
-    IReadOnlyList<PeerMeshNatTypeStat> NatTypes);
+    IReadOnlyList<PeerMeshNatTypeStat> NatTypes,
+    long NatBehaviorDevices,
+    long NatBehaviorClassifiedDevices,
+    double? NatBehaviorSuccessRatio,
+    IReadOnlyList<PeerMeshNatBehaviorStat> NatMappingBehaviors,
+    IReadOnlyList<PeerMeshNatBehaviorStat> NatFilteringBehaviors,
+    IReadOnlyList<PeerMeshNatBehaviorStat> NatBehaviorDiscoveries);
 
 public sealed record PeerMeshPathTypeStat(
     string PathType,
@@ -1582,6 +1659,8 @@ public sealed record PeerMeshPathTypeStat(
     long RelayBytes);
 
 public sealed record PeerMeshNatTypeStat(string NatType, long Devices);
+
+public sealed record PeerMeshNatBehaviorStat(string Behavior, long Devices);
 
 public sealed record PeerMeshDeviceMutation(bool? Enabled);
 

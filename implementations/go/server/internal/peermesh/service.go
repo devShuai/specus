@@ -140,14 +140,20 @@ type SessionPage struct {
 }
 
 type PathStatsView struct {
-	TotalSessions        int64          `json:"totalSessions"`
-	ReportedSessions     int64          `json:"reportedSessions"`
-	ActiveSessions       int64          `json:"activeSessions"`
-	ActiveDirectSessions int64          `json:"activeDirectSessions"`
-	ActiveRelaySessions  int64          `json:"activeRelaySessions"`
-	ActiveDirectRatio    *float64       `json:"activeDirectRatio"`
-	PathTypes            []PathTypeStat `json:"pathTypes"`
-	NatTypes             []NatTypeStat  `json:"natTypes"`
+	TotalSessions                int64             `json:"totalSessions"`
+	ReportedSessions             int64             `json:"reportedSessions"`
+	ActiveSessions               int64             `json:"activeSessions"`
+	ActiveDirectSessions         int64             `json:"activeDirectSessions"`
+	ActiveRelaySessions          int64             `json:"activeRelaySessions"`
+	ActiveDirectRatio            *float64          `json:"activeDirectRatio"`
+	PathTypes                    []PathTypeStat    `json:"pathTypes"`
+	NatTypes                     []NatTypeStat     `json:"natTypes"`
+	NatBehaviorDevices           int64             `json:"natBehaviorDevices"`
+	NatBehaviorClassifiedDevices int64             `json:"natBehaviorClassifiedDevices"`
+	NatBehaviorSuccessRatio      *float64          `json:"natBehaviorSuccessRatio"`
+	NatMappingBehaviors          []NatBehaviorStat `json:"natMappingBehaviors"`
+	NatFilteringBehaviors        []NatBehaviorStat `json:"natFilteringBehaviors"`
+	NatBehaviorDiscoveries       []NatBehaviorStat `json:"natBehaviorDiscoveries"`
 }
 
 type PathTypeStat struct {
@@ -163,6 +169,11 @@ type PathTypeStat struct {
 type NatTypeStat struct {
 	NatType string `json:"natType"`
 	Devices int64  `json:"devices"`
+}
+
+type NatBehaviorStat struct {
+	Behavior string `json:"behavior"`
+	Devices  int64  `json:"devices"`
 }
 
 type PublicStunConfig struct {
@@ -853,6 +864,15 @@ func (s *Service) PathStats(ctx context.Context, access AccessContext) (PathStat
 	if err != nil {
 		return PathStatsView{}, err
 	}
+	natBehaviorAggregates, err := s.db.AggregatePeerMeshNatBehaviors(
+		ctx,
+		access.TenantID,
+		access.Username,
+		!access.Admin,
+	)
+	if err != nil {
+		return PathStatsView{}, err
+	}
 	var total, reported, active, activeDirect, activeRelay int64
 	pathTypes := make([]PathTypeStat, 0, len(pathAggregates))
 	for _, item := range pathAggregates {
@@ -893,21 +913,87 @@ func (s *Service) PathStats(ctx context.Context, access AccessContext) (PathStat
 	for _, key := range natOrder {
 		natTypes = append(natTypes, NatTypeStat{NatType: key, Devices: natCounts[key]})
 	}
+	var natBehaviorDevices, natBehaviorClassifiedDevices int64
+	mappingCounts := make(map[string]int64)
+	filteringCounts := make(map[string]int64)
+	discoveryCounts := make(map[string]int64)
+	mappingOrder := make([]string, 0)
+	filteringOrder := make([]string, 0)
+	discoveryOrder := make([]string, 0)
+	for _, item := range natBehaviorAggregates {
+		if !hasNatBehavior(item.MappingBehavior) &&
+			!hasNatBehavior(item.FilteringBehavior) &&
+			!hasNatBehavior(item.Discovery) {
+			continue
+		}
+		natBehaviorDevices += item.Devices
+		mapping := normalizeNatBehavior(item.MappingBehavior)
+		filtering := normalizeNatBehavior(item.FilteringBehavior)
+		discovery := normalizeNatBehavior(item.Discovery)
+		mergeNatBehavior(mappingCounts, &mappingOrder, mapping, item.Devices)
+		mergeNatBehavior(filteringCounts, &filteringOrder, filtering, item.Devices)
+		mergeNatBehavior(discoveryCounts, &discoveryOrder, discovery, item.Devices)
+		if classifiedNatBehavior(mapping) && classifiedNatBehavior(filtering) {
+			natBehaviorClassifiedDevices += item.Devices
+		}
+	}
 	var directRatio *float64
 	if active > 0 {
 		value := float64(activeDirect) / float64(active)
 		directRatio = &value
 	}
+	var natBehaviorSuccessRatio *float64
+	if natBehaviorDevices > 0 {
+		value := float64(natBehaviorClassifiedDevices) / float64(natBehaviorDevices)
+		natBehaviorSuccessRatio = &value
+	}
 	return PathStatsView{
-		TotalSessions:        total,
-		ReportedSessions:     reported,
-		ActiveSessions:       active,
-		ActiveDirectSessions: activeDirect,
-		ActiveRelaySessions:  activeRelay,
-		ActiveDirectRatio:    directRatio,
-		PathTypes:            pathTypes,
-		NatTypes:             natTypes,
+		TotalSessions:                total,
+		ReportedSessions:             reported,
+		ActiveSessions:               active,
+		ActiveDirectSessions:         activeDirect,
+		ActiveRelaySessions:          activeRelay,
+		ActiveDirectRatio:            directRatio,
+		PathTypes:                    pathTypes,
+		NatTypes:                     natTypes,
+		NatBehaviorDevices:           natBehaviorDevices,
+		NatBehaviorClassifiedDevices: natBehaviorClassifiedDevices,
+		NatBehaviorSuccessRatio:      natBehaviorSuccessRatio,
+		NatMappingBehaviors:          natBehaviorStats(mappingCounts, mappingOrder),
+		NatFilteringBehaviors:        natBehaviorStats(filteringCounts, filteringOrder),
+		NatBehaviorDiscoveries:       natBehaviorStats(discoveryCounts, discoveryOrder),
 	}, nil
+}
+
+func hasNatBehavior(value *string) bool {
+	return value != nil && strings.TrimSpace(*value) != ""
+}
+
+func normalizeNatBehavior(value *string) string {
+	if !hasNatBehavior(value) {
+		return "UNKNOWN"
+	}
+	return strings.TrimSpace(*value)
+}
+
+func classifiedNatBehavior(value string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(value))
+	return normalized != "" && normalized != "UNKNOWN" && normalized != "UNSUPPORTED"
+}
+
+func mergeNatBehavior(counts map[string]int64, order *[]string, key string, devices int64) {
+	if _, ok := counts[key]; !ok {
+		*order = append(*order, key)
+	}
+	counts[key] += devices
+}
+
+func natBehaviorStats(counts map[string]int64, order []string) []NatBehaviorStat {
+	result := make([]NatBehaviorStat, 0, len(order))
+	for _, key := range order {
+		result = append(result, NatBehaviorStat{Behavior: key, Devices: counts[key]})
+	}
+	return result
 }
 
 func (s *Service) ForceClose(ctx context.Context, access AccessContext, sessionID int64) (SessionView, error) {
