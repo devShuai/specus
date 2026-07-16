@@ -40,11 +40,10 @@ import { notifyError } from "../../components/toast";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import {
   aggregateResources,
-  desktopFilterControlClass,
   HTTP_EXCHANGE_PAGE_SIZE,
   HTTP_RESPONSE_BODY_TYPES,
   HTTP_SEARCH_FIELDS,
-  httpResponseTypeColor,
+  httpResponseTypeChipClass,
   httpResponseTypeLabel,
   httpResponseTypeOption,
   httpSearchFieldOption,
@@ -53,6 +52,7 @@ import {
   normalizeHttpSearchField,
   TCP_FRAME_PAGE_SIZE,
   TCP_STREAM_PAGE_SIZE,
+  trafficFilterControlClass,
   TRAFFIC_MODAL_CLASS_NAMES,
   TRAFFIC_VIEW_TABS,
   type BodyPreviewTarget,
@@ -710,7 +710,7 @@ function HttpExchangeTable({
   const rangeEnd = Math.min(total, (page + 1) * pageSize);
   const searchFieldOption = httpSearchFieldOption(searchField);
   const activeSearchFieldOption = httpSearchFieldOption(activeSearchField);
-  const activeResponseTypeOption = httpResponseTypeOption(activeResponseType);
+  const hasActiveFilters = Boolean(activeSearch || activeSearchField !== "summary" || activeResponseType);
   const tableScopeKey = useMemo(
     () => `${page}:${pageSize}:${activeSearchField}:${activeSearch}:${activeResponseType}`,
     [activeResponseType, activeSearch, activeSearchField, page, pageSize],
@@ -742,11 +742,11 @@ function HttpExchangeTable({
             <h3 className="text-small font-semibold">HTTP 协议记录</h3>
             <p className="text-tiny text-default-500">请求行、响应状态、headers 与 body 预览</p>
           </div>
-          <div className="flex flex-wrap items-end gap-2 xl:hidden">
+          <div className="flex flex-wrap items-end gap-2 xl:hidden" aria-label="HTTP 协议记录筛选">
             <label className="flex min-w-[6.5rem] flex-1 flex-col gap-1 sm:flex-none sm:w-32">
               <span className="text-tiny text-default-500">搜索字段</span>
               <select
-                className="h-9 rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+                className={trafficFilterControlClass}
                 value={searchField}
                 onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
               >
@@ -760,7 +760,7 @@ function HttpExchangeTable({
             <label className="flex min-w-[6rem] flex-1 flex-col gap-1 sm:flex-none sm:w-28">
               <span className="text-tiny text-default-500">返回类型</span>
               <select
-                className="h-9 rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
+                className={trafficFilterControlClass}
                 value={responseType}
                 onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
               >
@@ -795,7 +795,7 @@ function HttpExchangeTable({
             </div>
           </div>
         </div>
-        {(activeSearch || activeSearchField !== "summary" || activeResponseType) && (
+        {hasActiveFilters && (
           <div className="flex flex-wrap items-center gap-2 text-tiny text-default-500">
             <span>当前搜索</span>
             <Chip size="sm" variant="flat">
@@ -807,9 +807,7 @@ function HttpExchangeTable({
               </Chip>
             )}
             {activeResponseType && (
-              <Chip color="secondary" size="sm" variant="flat">
-                {activeResponseTypeOption.label}
-              </Chip>
+              <HttpResponseTypeChip value={activeResponseType} contentType={null} bytes={0} />
             )}
           </div>
         )}
@@ -844,13 +842,11 @@ function HttpExchangeTable({
                       <Chip color={httpStatusColor(row)} size="sm" variant="flat">
                         {row.statusCode}
                       </Chip>
-                      <Chip
-                        color={httpResponseTypeColor(row.responseBodyType, row.responseContentType, row.responseBytes)}
-                        size="sm"
-                        variant="flat"
-                      >
-                        {httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
-                      </Chip>
+                      <HttpResponseTypeChip
+                        value={row.responseBodyType}
+                        contentType={row.responseContentType}
+                        bytes={row.responseBytes}
+                      />
                     </>
                   }
                   fields={[
@@ -882,7 +878,6 @@ function HttpExchangeTable({
 
         <div className="hidden min-w-0 xl:block">
         <Table
-          key={tableCollectionKey}
           aria-label="HTTP 协议记录"
           classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
           isHeaderSticky
@@ -918,7 +913,21 @@ function HttpExchangeTable({
             <TableColumn className="w-[6%]">耗时</TableColumn>
             <TableColumn className="w-[8%]">协议详情</TableColumn>
           </TableHeader>
-          <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent="暂无 HTTP 协议记录">
+          <TableBody
+            key={tableCollectionKey}
+            items={tableRows}
+            isLoading={loading}
+            emptyContent={
+              <div className="flex flex-col items-center gap-2 py-3">
+                <span>{hasActiveFilters ? "当前筛选没有匹配的 HTTP 协议记录" : "暂无 HTTP 协议记录"}</span>
+                {hasActiveFilters && (
+                  <Button size="sm" variant="light" onPress={onResetSearch}>
+                    重置筛选
+                  </Button>
+                )}
+              </div>
+            }
+          >
             {(row) => (
               <TableRow key={row.tableKey}>
                 <TableCell>
@@ -939,13 +948,11 @@ function HttpExchangeTable({
                   </Chip>
                 </TableCell>
                 <TableCell>
-                  <Chip
-                    color={httpResponseTypeColor(row.responseBodyType, row.responseContentType, row.responseBytes)}
-                    size="sm"
-                    variant="flat"
-                  >
-                    {httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
-                  </Chip>
+                  <HttpResponseTypeChip
+                    value={row.responseBodyType}
+                    contentType={row.responseContentType}
+                    bytes={row.responseBytes}
+                  />
                 </TableCell>
                 <TableCell>
                   <div className="flex min-w-0 flex-col">
@@ -1034,7 +1041,7 @@ function HttpSearchFilterHeader({
             <label className="flex flex-col gap-1">
               <span className="text-tiny text-default-500">搜索字段</span>
               <select
-                className={desktopFilterControlClass}
+                className={trafficFilterControlClass}
                 value={searchField}
                 onChange={(event) => onSearchFieldChange(normalizeHttpSearchField(event.target.value))}
               >
@@ -1110,7 +1117,7 @@ function HttpResponseTypeFilterHeader({
             <label className="flex flex-col gap-1">
               <span className="text-tiny text-default-500">返回类型</span>
               <select
-                className={desktopFilterControlClass}
+                className={trafficFilterControlClass}
                 value={responseType}
                 onChange={(event) => onResponseTypeChange(normalizeHttpResponseType(event.target.value))}
               >
@@ -1152,7 +1159,7 @@ function TrafficTableFilterHeader({
       <span className="truncate" title={label}>
         {label}
       </span>
-      <span title={title}>{children}</span>
+      <span className="relative z-10" title={title}>{children}</span>
       {active ? <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden /> : null}
     </div>
   );
@@ -1163,6 +1170,26 @@ function TrafficFilterIcon() {
     <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24">
       <path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" />
     </svg>
+  );
+}
+
+function HttpResponseTypeChip({
+  bytes,
+  contentType,
+  value,
+}: {
+  bytes: number;
+  contentType: string | null | undefined;
+  value: string | null | undefined;
+}) {
+  return (
+    <Chip
+      className={httpResponseTypeChipClass(value, contentType, bytes)}
+      size="sm"
+      variant="flat"
+    >
+      {httpResponseTypeLabel(value, contentType, bytes)}
+    </Chip>
   );
 }
 

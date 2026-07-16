@@ -64,6 +64,9 @@ export function OverviewPanel() {
     ? `${Math.round((overview.successfulConnections / totalConnections) * 100)}%`
     : "0%";
   const totalTrafficBytes = overview ? overview.uploadBytes + overview.downloadBytes : 0;
+  const downloadRate = totalTrafficBytes > 0 && overview
+    ? `${Math.round(Math.min(1, Math.max(0, overview.downloadBytes / totalTrafficBytes)) * 100)}%`
+    : "0%";
 
   const cards: MetricCard[] = overview
     ? [
@@ -128,7 +131,8 @@ export function OverviewPanel() {
                 primaryLabel="成功"
                 secondaryLabel="失败"
                 primaryText={successRate}
-                secondaryText={`${overview.failedConnections} 次失败`}
+                primaryDetail={`${overview.successfulConnections} 次`}
+                secondaryDetail={`${overview.failedConnections} 次`}
               />
             </ChartPanel>
 
@@ -138,8 +142,9 @@ export function OverviewPanel() {
                 primaryValue={overview.downloadBytes}
                 primaryLabel="下载"
                 secondaryLabel="上传"
-                primaryText={formatBytes(overview.downloadBytes)}
-                secondaryText={`上传 ${formatBytes(overview.uploadBytes)}`}
+                primaryText={downloadRate}
+                primaryDetail={formatBytes(overview.downloadBytes)}
+                secondaryDetail={formatBytes(overview.uploadBytes)}
                 primaryColor="hsl(var(--heroui-secondary))"
                 secondaryColor="hsl(var(--heroui-primary))"
               />
@@ -264,7 +269,8 @@ function DonutChart({
   primaryLabel,
   secondaryLabel,
   primaryText,
-  secondaryText,
+  primaryDetail,
+  secondaryDetail,
   primaryColor = "hsl(var(--heroui-success))",
   secondaryColor = "hsl(var(--heroui-danger))",
 }: {
@@ -273,7 +279,8 @@ function DonutChart({
   primaryLabel: string;
   secondaryLabel: string;
   primaryText: string;
-  secondaryText: string;
+  primaryDetail: string;
+  secondaryDetail: string;
   primaryColor?: string;
   secondaryColor?: string;
 }) {
@@ -284,8 +291,13 @@ function DonutChart({
   const primaryStroke = circumference * primaryRatio;
 
   return (
-    <div className="flex min-h-40 items-center gap-4">
-      <svg aria-label={`${primaryLabel}与${secondaryLabel}占比`} className="h-32 w-32 shrink-0" role="img" viewBox="0 0 140 140">
+    <div className="flex min-h-40 flex-wrap items-center justify-center gap-3">
+      <svg
+        aria-label={`${primaryLabel} ${primaryDetail}，${secondaryLabel} ${secondaryDetail}，${primaryLabel}占比 ${primaryText}`}
+        className="h-28 w-28 shrink-0"
+        role="img"
+        viewBox="0 0 140 140"
+      >
         <circle
           cx="70"
           cy="70"
@@ -314,10 +326,9 @@ function DonutChart({
           {primaryLabel}
         </text>
       </svg>
-      <div className="flex min-w-0 flex-col gap-2 text-small">
-        <Legend color={primaryColor} label={primaryLabel} />
-        <Legend color={secondaryColor} label={secondaryLabel} />
-        <p className="text-default-500">{secondaryText}</p>
+      <div className="flex min-w-28 flex-1 flex-col gap-2 text-small">
+        <DonutLegendRow color={primaryColor} label={primaryLabel} value={primaryDetail} />
+        <DonutLegendRow color={secondaryColor} label={secondaryLabel} value={secondaryDetail} />
       </div>
     </div>
   );
@@ -367,6 +378,20 @@ function Legend({ color, label }: { color: string; label: string }) {
       <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
       {label}
     </span>
+  );
+}
+
+function DonutLegendRow({ color, label, value }: { color: string; label: string; value: string }) {
+  return (
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+      <Legend color={color} label={label} />
+      <span
+        title={value}
+        className="min-w-0 max-w-32 text-right text-tiny font-medium tabular-nums text-default-600 [overflow-wrap:anywhere]"
+      >
+        {value}
+      </span>
+    </div>
   );
 }
 
