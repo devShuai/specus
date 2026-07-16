@@ -12,6 +12,23 @@ go build ./cmd/shuai-tunnel-server
 ./shuai-tunnel-server -config cfg.json
 ```
 
+独立 RFC 5780 STUN（不启动业务 server、数据库或 TURN）：
+
+```bash
+go test ./internal/stunserver
+go build -o shuai-stun-server ./cmd/shuai-stun-server
+STUN_PRIMARY_BIND_ADDRESS=10.0.0.10 \
+STUN_PRIMARY_PUBLIC_ADDRESS=203.0.113.10 \
+STUN_ALTERNATE_BIND_ADDRESS=10.0.0.11 \
+STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
+./shuai-stun-server
+```
+
+独立 STUN 与 Java/.NET 版本共用 `STUN_*` 环境变量，支持四端点
+`CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、全局/单源限流和
+`127.0.0.1:9108/metrics`。完整配置与 systemd 模板见
+[`deploy/stun-server/systemd`](../../../deploy/stun-server/systemd/README.md)。
+
 - 控制通道(Netty 等价)默认监听 `7010`,Java/Go/.NET/Android client 连这里。
 - 管理后台 + Direct HTTP + WebSocket 默认监听 `:8088`,浏览器访问 `http://127.0.0.1:8088/`。
 - 默认 seed 演示客户端账号 `Demo client` 和启动凭证 `apiKey=demo-client / secret=test1234`(可关)。

@@ -12,7 +12,8 @@
 * 客户端登录响应下发 `peerMesh` 配置，包括虚拟 IP、CIDR、标准 STUN/TURN 地址、公共 STUN 列表、会话 TTL 和设备公钥相关信息。
 * 控制协议通过现有控制长连接承载 `PEER_CONTROL` JSON 信令，不破坏现有 NAT / HTTP 协议。
 * Java / Go / .NET 服务端内置标准 UDP STUN/TURN：支持 Binding、Allocate、Refresh、CreatePermission、Send Indication 和 Data Indication；relay 转发使用独立 UDP allocation 端口。
-* Java STUN 核心支持 RFC 5780 四端点、`CHANGE-REQUEST`、标准 `MAPPED-ADDRESS` / `XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；同一核心可由独立 `stun-server.jar` 部署。
+* Java STUN 核心支持 RFC 5780 四端点、`CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、标准 `MAPPED-ADDRESS` / `XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；同一核心可由独立 `stun-server.jar` 部署。
+* Go 提供 `cmd/shuai-stun-server`，.NET 提供 `ShuaiTunnel.StunServer`；两者与 Java 使用同一套四端点、限流、防放大和 Prometheus 指标契约，可脱离业务 server 独立部署。
 * Java / Go / .NET / Android 客户端可使用独立 STUN 入口执行 RFC 5780 映射与过滤行为探测，并上报 `natMappingBehavior`、`natFilteringBehavior` 和探测模式。
 * relay 转发前会校验 session 是否存在、是否 ACTIVE、是否过期、source/target 是否匹配，拒绝未授权 relay frame。
 * 客户端已实现 UDP host candidate、relay candidate、connectivity check、path nominated、direct 优先、relay fallback。
@@ -21,7 +22,7 @@
 * Linux TUN：支持 `/dev/net/tun`，配置虚拟 IP、MTU，并只为当前 roster 中的在线 peer 同步 `/32` host route。
 * Windows Wintun：Java / Go / .NET 客户端均支持随包携带 `wintun.dll`，配置虚拟 IP、MTU，并同步在线 peer 的 `/32` host route。
 * macOS utun：Java / Go / .NET 客户端均可创建 utun，并同步在线 peer 的 `/32` host route。
-* 管理页“私有组网”展示设备、虚拟 IP、在线状态、NAT 类型、ACL、active session、direct/relay 路径、RTT 和流量。
+* 管理页“私有组网”展示设备、虚拟 IP、在线状态、NAT 类型、ACL、active session、direct/relay 路径、RTT 和流量；路径统计还展示 NAT 行为完整分类率及映射、过滤、探测方式分布。
 
 多语言实现当前状态：
 
@@ -85,11 +86,14 @@ NAT 行为探测说明：
 * 完整模式监听 A1:P1、A1:P2、A2:P1、A2:P2。Binding Success 同时返回 `MAPPED-ADDRESS` 和 `XOR-MAPPED-ADDRESS`。
 * `RESPONSE-ORIGIN` 表示实际回包端点；`OTHER-ADDRESS` 始终表示相对请求目标的另一 IP + 另一端口。
 * `CHANGE-REQUEST(change IP/change port)` 决定回包源端点，可用于探测 Endpoint-Independent、Address-Dependent 与 Address-and-Port-Dependent Filtering。
+* `RESPONSE-PORT` 可把响应发往请求源 IP 的另一个 UDP 端口；`PADDING` 用于分片行为探测。两者同时出现时返回 `400`，PADDING 回包受配置上限约束以避免放大。
 * 客户端分别向 A1:P1、A2:P1 和 A2:P2 发起 Binding，可比较映射地址，区分 Endpoint-Independent、Address-Dependent 与 Address-and-Port-Dependent Mapping。
 * 只有一个公网 IP 时，服务端不返回标准 `OTHER-ADDRESS`，收到 `CHANGE-REQUEST` 返回 `420 Unknown Attribute`；此时只能做普通 Binding 和保守分类。
 
-如果 STUN 不应与业务服务共进程，构建并部署
-[`implementations/java/stun-server`](../../implementations/java/stun-server)；systemd 文件、DNS 和双公网 IP
+如果 STUN 不应与业务服务共进程，可选择 Java
+[`implementations/java/stun-server`](../../implementations/java/stun-server)、Go
+`implementations/go/server/cmd/shuai-stun-server` 或 .NET
+`implementations/csharp/server/src/ShuaiTunnel.StunServer`。systemd、限流、指标、DNS 和双公网 IP
 示例见 [`deploy/stun-server/systemd`](../../deploy/stun-server/systemd/README.md)。独立服务不包含 TURN，
 tunnel-server 的认证 TURN 仍可单独作为直连失败后的备用通道。
 

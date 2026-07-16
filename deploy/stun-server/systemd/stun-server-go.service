@@ -1,5 +1,5 @@
 [Unit]
-Description=Shuai Tunnel Standalone RFC 5780 STUN Server
+Description=Shuai Tunnel Standalone RFC 5780 STUN Server (Go)
 Documentation=https://github.com/devShuai/shuai-tunnel
 After=network-online.target
 Wants=network-online.target
@@ -9,22 +9,19 @@ Type=simple
 User=stun
 Group=stun
 WorkingDirectory=/var/lib/shuai-stun-server
-
-Environment=JAVA_OPTS=
 EnvironmentFile=/etc/shuai-stun-server/stun-server.env
 
-ExecStartPre=/usr/bin/java $JAVA_OPTS -jar /opt/shuai-stun-server/stun-server.jar --check-config
-ExecStart=/usr/bin/java $JAVA_OPTS -jar /opt/shuai-stun-server/stun-server.jar
+ExecStartPre=/opt/shuai-stun-server/shuai-stun-server --check-config
+ExecStart=/opt/shuai-stun-server/shuai-stun-server
 
 KillSignal=SIGTERM
 TimeoutStopSec=10
-SuccessExitStatus=143
 Restart=on-failure
 RestartSec=3s
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=shuai-stun-server
+SyslogIdentifier=shuai-stun-server-go
 
 NoNewPrivileges=true
 PrivateTmp=true

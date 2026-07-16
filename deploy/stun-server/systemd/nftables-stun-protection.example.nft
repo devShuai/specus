@@ -1,0 +1,16 @@
+# Add these rules to the existing inet/filter input chain. Do not load this
+# file as a complete firewall ruleset: it intentionally has no table/chain
+# declaration and does not open the ports by itself.
+#
+# Keep the kernel limits comfortably above the application limits so normal
+# clients reach the STUN process, while obvious floods are discarded before
+# socket allocation and parsing.
+
+udp dport { 3478, 3479 } ct state invalid drop
+
+# IPv4 and IPv6 source-IP meters. Port rotation does not evade these limits.
+udp dport { 3478, 3479 } ip saddr 0.0.0.0/0 meter stun_ipv4_sources { ip saddr timeout 30s limit rate over 500/second burst 1000 packets } drop
+udp dport { 3478, 3479 } ip6 saddr ::/0 meter stun_ipv6_sources { ip6 saddr timeout 30s limit rate over 500/second burst 1000 packets } drop
+
+# Aggregate ceiling for the host. Tune this to NIC/CPU capacity.
+udp dport { 3478, 3479 } limit rate over 50000/second burst 100000 packets drop

@@ -43,16 +43,16 @@ flowchart TD
 | `implementations/java/common` | Java 公共协议、编解码器、登录鉴权、心跳、会话、消息和同步 HTTP 请求能力，Maven artifact 为 `tunnel-common` |
 | `implementations/java/server` | 公网服务端（Java 参考实现），监听控制连接，并为已注册映射创建公网 TCP 监听端口，Maven artifact 为 `tunnel-server` |
 | `implementations/java/client` | Java 内网客户端，连接服务端，并将隧道数据转发至目标内网服务，Maven artifact 为 `tunnel-client` |
-| `implementations/java/stun-server` | 可独立部署的 RFC 5780 STUN Binding 服务，支持双公网 IP、双 UDP 端口和 `CHANGE-REQUEST`，Maven artifact 为 `stun-server` |
+| `implementations/java/stun-server` | Java 独立 RFC 5780 STUN 服务，支持四端点、限流、指标、`CHANGE-REQUEST`、`RESPONSE-PORT` 和 `PADDING` |
 | `apps/admin-web` | 管理后台前端(React + HeroUI)，构建产物供各服务端静态托管 |
 | `deploy/java-server` | Java server 的 systemd 安装、更新脚本和环境变量模板 |
 | `deploy/stun-server` | 独立 STUN server 的 systemd 安装、更新脚本和四端点配置模板 |
 | `deploy/remote` | 从 macOS/Linux 或 Windows 将当前 Java server 与 OpenResty 前端一键构建、上传、更新并验收 |
 | `protocol/spec` | 跨语言协议说明、数据面/控制面规范入口 |
-| `implementations/go/server` | Go 服务端移植，与 Java 服务端线协议字节兼容，支持多库(sqlite/pg/mysql) |
+| `implementations/go/server` | Go 服务端移植；同时提供独立 `cmd/shuai-stun-server` 单文件 STUN 二进制 |
 | `implementations/go/client` | Go 内网客户端，与 Java 客户端使用相同配置和紧凑二进制协议 |
 | `implementations/csharp/protocol` | .NET 协议库，server/client 共同 ProjectReference 复用 |
-| `implementations/csharp/server` | .NET 服务端移植(EF Core,多库) |
+| `implementations/csharp/server` | .NET 服务端移植(EF Core,多库)；包含独立 `ShuaiTunnel.StunServer` 项目 |
 | `implementations/csharp/client` | .NET 内网客户端（CLI + Windows WPF 桌面客户端），与 Java/Go 客户端字节兼容 |
 | `implementations/android/client` | Android 图形客户端，提供运行控制台、JSONC 配置、前台服务、TCP/HTTP 隧道、VpnService 和 Peer Mesh 基础数据面 |
 | `implementations/c/server` | C 服务端轻量移植 |
@@ -61,6 +61,8 @@ flowchart TD
 
 - 服务端(Java)：`implementations/java/server/src/main/java/com/theshuai/tunnelserver/TunnelServerApplication.java`
 - 独立 STUN(Java)：`implementations/java/stun-server/src/main/java/com/theshuai/stunserver/StunServerApplication.java`
+- 独立 STUN(Go)：`implementations/go/server/cmd/shuai-stun-server/main.go`
+- 独立 STUN(.NET)：`implementations/csharp/server/src/ShuaiTunnel.StunServer/Program.cs`
 - 服务端(Go)：`implementations/go/server/cmd/shuai-tunnel-server/main.go`
 - 客户端(Java)：`implementations/java/client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`
 - 客户端(Go)：`implementations/go/client/cmd/shuai-tunnel-client/main.go`
@@ -93,6 +95,16 @@ mvn clean install
 ```bash
 mvn -pl :stun-server -am clean package
 # implementations/java/stun-server/target/stun-server.jar
+```
+
+Go 与 .NET 独立 STUN：
+
+```bash
+cd implementations/go/server
+go build ./cmd/shuai-stun-server
+
+dotnet build \
+  implementations/csharp/server/src/ShuaiTunnel.StunServer/ShuaiTunnel.StunServer.csproj
 ```
 
 `tunnel-server` 的 Maven 构建会在 `generate-resources` 阶段执行 `apps/admin-web` 的 `npm run deploy:java`：先构建 React 管理后台，再把 `dist/` 只同步到 Java server 的 `src/main/resources/static/`。首次构建前请在 `apps/admin-web` 下执行一次 `npm ci` 安装依赖。
@@ -350,7 +362,7 @@ curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 
 Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端会被分配 `100.96.0.0/11` 内的虚拟 IP，并通过 `shuai0` 这类虚拟网卡互访。控制面仍走现有 Netty 连接，服务端通过 `PEER_CONTROL` 下发设备列表、候选地址、session 授权和启停状态；数据面优先走客户端之间的加密 UDP direct，direct 失效或不可达时回退到服务端标准 TURN relay。服务端 relay 只校验会话授权和 frame 头，不解密业务 IP 包明文。
 
-当前实现同时使用自建 STUN/TURN 和可配置公共 STUN。客户端登录后会拿到彼此独立的 `stunHost/stunPort`、`turnHost/turnPort`、公共 STUN 列表和 ICE 凭证；自建 STUN 负责 NAT 探测，TURN 负责 relay，公共 STUN 只用于补充 server-reflexive 候选地址。Java STUN 核心支持 RFC 5780 的四端点拓扑与 `CHANGE-REQUEST`，既可嵌入 tunnel-server，也可由独立 `stun-server.jar` 部署；Java、Go、.NET 与 Android 客户端会分别上报映射行为、过滤行为和兼容 NAT 标签，并在 direct path 过期后主动触发重新探测和 relay fallback。
+当前实现同时使用自建 STUN/TURN 和可配置公共 STUN。客户端登录后会拿到彼此独立的 `stunHost/stunPort`、`turnHost/turnPort`、公共 STUN 列表和 ICE 凭证；自建 STUN 负责 NAT 探测，TURN 负责 relay，公共 STUN 只用于补充 server-reflexive 候选地址。Java、Go、.NET 均可独立运行完整 RFC 5780 四端点 STUN，支持 `CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、双层请求限流、来源表上限和 Prometheus 指标；Java、Go、.NET 与 Android 客户端会分别上报映射行为、过滤行为和兼容 NAT 标签，并在 direct path 过期后主动触发重新探测和 relay fallback。
 
 服务端相关配置：
 
@@ -384,7 +396,7 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 
 客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；Java / Go / .NET 客户端均支持 `utun` 接入 macOS utun，其中 Java 可使用 `mac-utun` / `utun`，`auto` 会按系统选择；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
 
-管理后台的「私有组网」页面展示设备虚拟 IP、在线状态、虚拟网卡状态、NAT 类型、候选 Endpoint、链路和活跃会话，并支持启停设备、配置 ACL、分页查看会话、清理活跃会话和链路。公开的浏览器 NAT 检测页会调用 `/api/public/peer-mesh/stun-config` 获取自建 STUN，再结合配置的公共 STUN 进行 WebRTC 探测。
+管理后台的「私有组网」页面展示设备虚拟 IP、在线状态、虚拟网卡状态、NAT 类型、候选 Endpoint、链路和活跃会话，并支持启停设备、配置 ACL、分页查看会话、清理活跃会话和链路。路径统计同时展示 NAT 行为探测设备数、完整分类率，以及映射行为、过滤行为和探测方式分布。公开的浏览器 NAT 检测页会调用 `/api/public/peer-mesh/stun-config` 获取自建 STUN，再结合配置的公共 STUN 进行 WebRTC 探测。
 
 ## 公共互传与对象存储
 

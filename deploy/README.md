@@ -3,7 +3,7 @@
 Deployment files are organized by runtime target.
 
 - `java-server/systemd`: production-style Linux systemd install/update scripts for the Java reference server.
-- `stun-server/systemd`: standalone RFC 5780 STUN server with four UDP endpoints and no business-server dependencies.
+- `stun-server/systemd`: Java/Go/.NET standalone RFC 5780 STUN server templates with four UDP endpoints, rate limiting, firewall guidance and Prometheus alerts.
 - `go-server/systemd`: Linux systemd install/update scripts for the Go server.
 - `csharp-server/systemd`: Linux systemd install/update scripts for the framework-dependent .NET server publish output.
 - `openresty`: OpenResty configuration and helper script for serving the admin web as cached,

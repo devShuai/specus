@@ -1,5 +1,5 @@
 [Unit]
-Description=Shuai Tunnel Standalone RFC 5780 STUN Server
+Description=Shuai Tunnel Standalone RFC 5780 STUN Server (.NET)
 Documentation=https://github.com/devShuai/shuai-tunnel
 After=network-online.target
 Wants=network-online.target
@@ -9,22 +9,21 @@ Type=simple
 User=stun
 Group=stun
 WorkingDirectory=/var/lib/shuai-stun-server
-
-Environment=JAVA_OPTS=
 EnvironmentFile=/etc/shuai-stun-server/stun-server.env
 
-ExecStartPre=/usr/bin/java $JAVA_OPTS -jar /opt/shuai-stun-server/stun-server.jar --check-config
-ExecStart=/usr/bin/java $JAVA_OPTS -jar /opt/shuai-stun-server/stun-server.jar
+# A self-contained single-file publish can replace both commands with the
+# published ShuaiTunnel.StunServer executable.
+ExecStartPre=/usr/bin/dotnet /opt/shuai-stun-server/dotnet/ShuaiTunnel.StunServer.dll --check-config
+ExecStart=/usr/bin/dotnet /opt/shuai-stun-server/dotnet/ShuaiTunnel.StunServer.dll
 
 KillSignal=SIGTERM
 TimeoutStopSec=10
-SuccessExitStatus=143
 Restart=on-failure
 RestartSec=3s
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=shuai-stun-server
+SyslogIdentifier=shuai-stun-server-dotnet
 
 NoNewPrivileges=true
 PrivateTmp=true
@@ -39,8 +38,8 @@ RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/lib/shuai-stun-server
 UMask=0027
 LimitNOFILE=4096
-TasksMax=64
-MemoryMax=256M
+TasksMax=96
+MemoryMax=384M
 
 [Install]
 WantedBy=multi-user.target

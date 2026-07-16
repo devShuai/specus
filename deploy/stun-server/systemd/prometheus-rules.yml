@@ -1,0 +1,48 @@
+groups:
+  - name: shuai-stun
+    rules:
+      - alert: ShuaiStunMetricsDown
+        expr: up{job="shuai-stun"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Shuai STUN metrics endpoint is unavailable"
+
+      - alert: ShuaiStunNoSuccessfulResponses
+        expr: |
+          sum(rate(stun_packets_received_total[5m])) > 1
+          and sum(rate(stun_responses_total{code="200"}[5m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "STUN receives traffic but sends no successful Binding responses"
+
+      - alert: ShuaiStunHighRateLimitDropRatio
+        expr: |
+          sum(rate(stun_packets_dropped_total{reason=~"(global|source)_rate_limit|source_table_full"}[5m]))
+          / clamp_min(sum(rate(stun_packets_received_total[5m])), 1) > 0.20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 20% of STUN traffic is being rate limited"
+
+      - alert: ShuaiStunMalformedTrafficSpike
+        expr: |
+          sum(rate(stun_packets_dropped_total{reason="malformed"}[5m]))
+          / clamp_min(sum(rate(stun_packets_received_total[5m])), 1) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Malformed STUN traffic exceeds 10%"
+
+      - alert: ShuaiStunSourceTableNearCapacity
+        expr: stun_tracked_sources > 60000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "STUN source limiter table is near its default capacity"
