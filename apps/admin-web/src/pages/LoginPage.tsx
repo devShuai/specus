@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
@@ -86,7 +86,6 @@ function LoginPageContent() {
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
-  const loginPanelRef = useRef<HTMLDivElement>(null);
 
   usePageSeo({
     title: "shuai-tunnel · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
@@ -134,10 +133,6 @@ function LoginPageContent() {
     }
   };
 
-  const focusLogin = () => {
-    loginPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-  };
-
   return (
     <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
       <section className="landing-apple-hero relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
@@ -145,9 +140,6 @@ function LoginPageContent() {
           <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle="内网服务接入控制面" />
           <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu />
-            <button type="button" className="public-header-button public-header-console" onClick={focusLogin}>
-              进入控制台
-            </button>
             <ThemeToggleButton className="public-header-theme-button" />
           </div>
         </header>
@@ -187,7 +179,7 @@ function LoginPageContent() {
             </div>
           </div>
 
-          <div ref={loginPanelRef} id="login-panel">
+          <div id="login-panel">
             <div className="app-apple-login-card landing-apple-login landing-card text-zinc-950 dark:text-white">
               <div className="flex flex-col items-start gap-2 px-5 pb-2 pt-5">
                 <span className="landing-apple-eyebrow text-tiny font-semibold">

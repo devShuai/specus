@@ -38,6 +38,11 @@ class SecurityRulesTests {
     }
 
     @Test
+    void cloudDiagramApiRequiresAuthentication() throws Exception {
+        assertThat(get("/api/admin/diagrams", null).statusCode()).isEqualTo(401);
+    }
+
+    @Test
     void httpRouteApiRequiresAuthentication() throws Exception {
         // /api/admin/http-routes 走同一套 Spring Security 规则——确保新加的 HttpRouteResource
         // 没有被意外标记为 permitAll
@@ -75,6 +80,42 @@ class SecurityRulesTests {
     }
 
     @Test
+    void authenticatedAccountCanManageItsCloudDiagram() throws Exception {
+        HttpResponse<String> login = postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"admin\"}");
+        String token = JsonUtil.readString(login.body()).path("accessToken").asText();
+
+        HttpResponse<String> created = sendJson(
+                "POST",
+                "/api/admin/diagrams",
+                "{\"name\":\"云端架构图\",\"update\":\"AQID\"}",
+                token
+        );
+        assertThat(created.statusCode()).isEqualTo(201);
+        JsonNode createdBody = JsonUtil.readString(created.body());
+        long id = createdBody.path("id").asLong();
+        long revision = createdBody.path("revision").asLong();
+
+        HttpResponse<String> listed = get("/api/admin/diagrams", token);
+        assertThat(listed.statusCode()).isEqualTo(200);
+        assertThat(listed.body()).contains("云端架构图");
+
+        HttpResponse<String> detail = get("/api/admin/diagrams/" + id, token);
+        assertThat(detail.statusCode()).isEqualTo(200);
+        assertThat(detail.body()).contains("\"update\":\"AQID\"");
+
+        HttpResponse<String> updated = sendJson(
+                "PUT",
+                "/api/admin/diagrams/" + id,
+                "{\"name\":\"云端架构图 v2\",\"update\":\"BAUG\",\"revision\":" + revision + "}",
+                token
+        );
+        assertThat(updated.statusCode()).isEqualTo(200);
+        assertThat(JsonUtil.readString(updated.body()).path("revision").asLong()).isGreaterThan(revision);
+
+        assertThat(delete("/api/admin/diagrams/" + id, token).statusCode()).isEqualTo(204);
+    }
+
+    @Test
     void wrongPasswordIsRejected() throws Exception {
         assertThat(postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"nope\"}").statusCode()).isEqualTo(401);
     }
@@ -88,10 +129,24 @@ class SecurityRulesTests {
     }
 
     private HttpResponse<String> postJson(String path, String json) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+        return sendJson("POST", path, json, null);
+    }
+
+    private HttpResponse<String> sendJson(String method, String path, String json, String bearer) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(json))
-                .build();
-        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                .method(method, HttpRequest.BodyPublishers.ofString(json));
+        if (bearer != null) {
+            builder.header("Authorization", "Bearer " + bearer);
+        }
+        return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> delete(String path, String bearer) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).DELETE();
+        if (bearer != null) {
+            builder.header("Authorization", "Bearer " + bearer);
+        }
+        return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }
 }

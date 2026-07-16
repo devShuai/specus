@@ -370,6 +370,9 @@ export interface PeerMeshDevice {
   cidr: string;
   publicKey: string | null;
   natType: string | null;
+  natMappingBehavior?: string | null;
+  natFilteringBehavior?: string | null;
+  natBehaviorDiscovery?: string | null;
   lastEndpoint: string | null;
   virtualDeviceMode: string | null;
   virtualDeviceName: string | null;
@@ -505,6 +508,26 @@ export interface PublicTransferDiagramVersion {
 export interface PublicTransferDiagramVersionDetail {
   version: PublicTransferDiagramVersion;
   update: string;
+}
+
+export interface UserDiagramDocument {
+  id: number;
+  name: string;
+  sizeBytes: number;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UserDiagramDocumentDetail {
+  document: UserDiagramDocument;
+  update: string;
+}
+
+export interface UserDiagramDocumentMutation {
+  name: string;
+  update: string;
+  revision?: number;
 }
 
 export type ManagementRole = "ADMIN" | "USER";

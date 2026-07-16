@@ -115,14 +115,24 @@ export function drawioStencilShapeName(namespace: string, shapeName: string): st
   return `${namespace}.${shapeName.replace(/ /g, "_")}`.toLowerCase();
 }
 
-export function createDrawioStencilPreviewShape(stencilName: string): Shape | undefined {
+export interface DrawioStencilPreviewColors {
+  stroke?: string;
+  fill?: string;
+}
+
+export function createDrawioStencilPreviewShape(
+  stencilName: string,
+  colors?: DrawioStencilPreviewColors,
+): Shape | undefined {
   const stencil = StencilShapeRegistry.get(stencilName);
   if (!stencil) {
     return undefined;
   }
   const shape = new Shape(stencil);
-  shape.fill = "#f8fafc";
-  shape.stroke = "#334155";
+  // Colours default to a light-theme palette but callers pass theme-aware values so the preview
+  // stays legible on the dark library panel (a fixed dark stroke was invisible there).
+  shape.fill = colors?.fill ?? "#f8fafc";
+  shape.stroke = colors?.stroke ?? "#334155";
   shape.strokeWidth = 1.4;
   shape.opacity = 100;
   shape.fillOpacity = 100;
@@ -134,11 +144,12 @@ export function createDrawioStencilPreviewShape(stencilName: string): Shape | un
 export function renderDrawioStencilPreview(
   svg: SVGSVGElement,
   stencilName: string,
+  colors?: DrawioStencilPreviewColors,
   width = 64,
   height = 42,
 ): boolean {
   const stencil = StencilShapeRegistry.get(stencilName);
-  const shape = createDrawioStencilPreviewShape(stencilName);
+  const shape = createDrawioStencilPreviewShape(stencilName, colors);
   if (!stencil || !shape) {
     return false;
   }

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Button,
@@ -32,8 +32,10 @@ import {
   EdgeHandlerConfig,
   HandleConfig,
   InternalEvent,
+  mathUtils,
   Outline,
   Point,
+  PolylineShape,
   Rectangle,
   RubberBandHandler,
   SelectionCellsHandler,
@@ -49,18 +51,25 @@ import type {
   AbstractCanvas2D,
   CellState,
   CellStyle,
+  EventSource,
   FitPlugin,
   InternalMouseEvent,
 } from "@maxgraph/core";
 import * as Y from "yjs";
 import "@maxgraph/core/css/common.css";
 import {
+  adminApi,
   publicCreateTransferDiagramVersion,
   publicDeleteTransferDiagramVersion,
   publicGetTransferDiagramVersion,
   publicListTransferDiagramVersions,
 } from "../api/client";
-import type { PublicTransferDiagramVersion, PublicTransferRoomRole } from "../api/types";
+import type {
+  PublicTransferDiagramVersion,
+  PublicTransferRoomRole,
+  UserDiagramDocument,
+} from "../api/types";
+import { useAuth } from "../auth/AuthContext";
 import type { WhiteboardInboundEvent } from "./SyncedWhiteboard";
 import {
   createDiagramDocument,
@@ -108,6 +117,7 @@ import {
   parsePlantUmlDocument,
   PLANTUML_FILE_EXTENSIONS,
 } from "../lib/diagramTextFormats";
+import { signedRotationDelta } from "../lib/diagramRotation";
 import {
   exportVisioVdx,
   parseVisioVdx,
@@ -136,6 +146,9 @@ const CUBIC_CONTROL_DEFAULTS = {
   control2T: 2 / 3,
   control2N: 0.18,
 };
+const DIAGRAM_ROTATION_HANDLE_SIZE = 18;
+const DIAGRAM_ROTATION_HANDLE_FILL = "transparent";
+const DIAGRAM_ROTATION_HANDLE_ACCENT = "var(--diagram-apple-blue)";
 
 class DiagramCubicConnectorShape extends ConnectorShape {
   override paintEdgeShape(canvas: AbstractCanvas2D, points: Point[]) {
@@ -170,6 +183,8 @@ class DiagramCubicControlHandle extends VertexHandle {
       new EllipseShape(new Rectangle(0, 0, 11, 11), "#0066cc", "#ffffff", 2),
     );
     this.controlIndex = controlIndex;
+    this.shape?.node.classList.add("diagram-cubic-control-handle");
+    this.shape?.node.setAttribute("data-control-index", String(controlIndex + 1));
   }
 
   override getPosition(_bounds: Rectangle | null) {
@@ -204,7 +219,189 @@ class DiagramCubicControlHandle extends VertexHandle {
   }
 }
 
+class DiagramRotationHandleShape extends EllipseShape {
+  override init(container: HTMLElement | SVGElement) {
+    super.init(container);
+    this.node.classList.add("diagram-rotation-handle");
+    this.node.setAttribute("data-diagram-handle", "rotation");
+  }
+
+  override paintVertexShape(canvas: AbstractCanvas2D, x: number, y: number, width: number, height: number) {
+    const centerX = x + width / 2;
+    const centerY = y + height / 2;
+
+    // Keep a generous drag target while showing only the familiar rotate glyph.
+    canvas.setFillColor("transparent");
+    canvas.setStrokeColor("transparent");
+    canvas.ellipse(x, y, width, height);
+    canvas.fillAndStroke();
+
+    const radius = Math.min(width, height) * 0.27;
+    canvas.setStrokeColor(DIAGRAM_ROTATION_HANDLE_ACCENT);
+    canvas.setStrokeWidth(1.7);
+    canvas.setLineCap("round");
+    canvas.setLineJoin("round");
+    canvas.begin();
+    canvas.moveTo(centerX + radius * 0.62, centerY - radius * 0.68);
+    canvas.curveTo(
+      centerX + radius * 0.2,
+      centerY - radius,
+      centerX - radius * 0.38,
+      centerY - radius,
+      centerX - radius * 0.76,
+      centerY - radius * 0.62,
+    );
+    canvas.curveTo(
+      centerX - radius * 1.22,
+      centerY - radius * 0.16,
+      centerX - radius * 1.08,
+      centerY + radius * 0.62,
+      centerX - radius * 0.5,
+      centerY + radius * 0.92,
+    );
+    canvas.curveTo(
+      centerX + radius * 0.08,
+      centerY + radius * 1.22,
+      centerX + radius * 0.82,
+      centerY + radius * 0.9,
+      centerX + radius,
+      centerY + radius * 0.28,
+    );
+    canvas.stroke();
+    canvas.begin();
+    canvas.moveTo(centerX + radius * 0.72, centerY - radius);
+    canvas.lineTo(centerX + radius * 0.72, centerY - radius * 0.48);
+    canvas.lineTo(centerX + radius * 0.2, centerY - radius * 0.48);
+    canvas.stroke();
+  }
+}
+
+class DiagramVertexHandler extends VertexHandler {
+  rotateSingleSizer = false;
+  private previousRotationPointerAngle: number | null = null;
+  private accumulatedRotation = 0;
+
+  override isRotationEnabled() {
+    return true;
+  }
+
+  override start(x: number, y: number, index: number) {
+    super.start(x, y, index);
+    if (index === InternalEvent.ROTATION_HANDLE) {
+      this.previousRotationPointerAngle = pointerAngleDegrees(this.state, x, y);
+      this.accumulatedRotation = styleNumber(this.state.style.rotation, 0);
+    } else {
+      this.previousRotationPointerAngle = null;
+    }
+  }
+
+  override rotateVertex(event: InternalMouseEvent) {
+    const point = new Point(event.getGraphX(), event.getGraphY());
+    const pointerAngle = pointerAngleDegrees(this.state, point.x, point.y);
+    if (this.previousRotationPointerAngle === null) {
+      this.previousRotationPointerAngle = pointerAngle;
+      this.accumulatedRotation = styleNumber(this.state.style.rotation, 0);
+    } else {
+      this.accumulatedRotation += signedRotationDelta(this.previousRotationPointerAngle, pointerAngle);
+      this.previousRotationPointerAngle = pointerAngle;
+    }
+
+    let rotation = this.accumulatedRotation;
+    if (this.rotationRaster && this.graph.isGridEnabledEvent(event.getEvent())) {
+      const dx = point.x - this.state.getCenterX();
+      const dy = point.y - this.state.getCenterY();
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const raster = distance - this.startDist < 2 ? 15 : distance - this.startDist < 25 ? 5 : 1;
+      rotation = Math.round(rotation / raster) * raster;
+    } else {
+      rotation = this.roundAngle(rotation);
+    }
+
+    this.currentAlpha = rotation;
+    this.selectionBorder.rotation = rotation;
+    this.selectionBorder.redraw();
+    if (this.livePreviewActive) this.redrawHandles();
+  }
+
+  override redrawHandles() {
+    super.redrawHandles();
+    const resizeHandle = this.sizers[0];
+    if (!this.rotateSingleSizer || !this.singleSizer || !resizeHandle) return;
+
+    const bounds = this.getSizerBounds();
+    const radians = mathUtils.toRadians(this.currentAlpha ?? this.state.style.rotation ?? 0);
+    const center = new Point(bounds.getCenterX(), bounds.getCenterY());
+    const position = mathUtils.getRotatedPoint(
+      new Point(bounds.x + bounds.width, bounds.y + bounds.height),
+      Math.cos(radians),
+      Math.sin(radians),
+      center,
+    );
+    this.moveSizerTo(resizeHandle, position.x, position.y);
+
+    const cursors = [
+      "nw-resize",
+      "n-resize",
+      "ne-resize",
+      "e-resize",
+      "se-resize",
+      "s-resize",
+      "sw-resize",
+      "w-resize",
+    ];
+    const cursorOffset = Math.round((radians * 4) / Math.PI);
+    resizeHandle.setCursor(cursors[mathUtils.mod(4 + cursorOffset, cursors.length)]);
+  }
+
+  ensureRotationHandle() {
+    if (this.rotationShape) return;
+    this.rotationShape = this.createSizer(
+      this.rotationCursor,
+      InternalEvent.ROTATION_HANDLE,
+      DIAGRAM_ROTATION_HANDLE_SIZE,
+      DIAGRAM_ROTATION_HANDLE_FILL,
+    );
+    this.sizers.push(this.rotationShape);
+  }
+
+  override createSizerShape(bounds: Rectangle, index: number, fillColor = HandleConfig.fillColor) {
+    if (index === InternalEvent.ROTATION_HANDLE) {
+      return new DiagramRotationHandleShape(
+        new Rectangle(bounds.x, bounds.y, DIAGRAM_ROTATION_HANDLE_SIZE, DIAGRAM_ROTATION_HANDLE_SIZE),
+        DIAGRAM_ROTATION_HANDLE_FILL,
+        DIAGRAM_ROTATION_HANDLE_ACCENT,
+        1.5,
+      );
+    }
+    return super.createSizerShape(bounds, index, fillColor);
+  }
+}
+
 class DiagramCubicEdgeHandler extends EdgeHandler {
+  private controlGuides?: [PolylineShape, PolylineShape];
+
+  constructor(state: CellState) {
+    super(state);
+    const overlayPane = this.graph.getView().getOverlayPane();
+    const createGuide = () => {
+      const guide = new PolylineShape([], "#2997ff", 1);
+      guide.dialect = "svg";
+      guide.isDashed = true;
+      guide.opacity = 68;
+      guide.pointerEvents = false;
+      guide.init(overlayPane);
+      guide.node.classList.add("diagram-cubic-control-guide");
+      guide.node.setAttribute("aria-hidden", "true");
+      guide.node.style.pointerEvents = "none";
+      if (this.shape.node.parentNode === overlayPane) {
+        overlayPane.insertBefore(guide.node, this.shape.node);
+      }
+      return guide;
+    };
+    this.controlGuides = [createGuide(), createGuide()];
+    this.redrawControlGuides();
+  }
+
   override isVirtualBendsEnabled() {
     return false;
   }
@@ -226,6 +423,49 @@ class DiagramCubicEdgeHandler extends EdgeHandler {
       new DiagramCubicControlHandle(this.state, 0),
       new DiagramCubicControlHandle(this.state, 1),
     ];
+  }
+
+  override mouseMove(sender: EventSource, event: InternalMouseEvent) {
+    super.mouseMove(sender, event);
+    this.redrawControlGuides();
+  }
+
+  override redraw(ignoreHandles?: boolean) {
+    super.redraw(ignoreHandles);
+    this.redrawControlGuides();
+  }
+
+  override setHandlesVisible(visible: boolean) {
+    super.setHandlesVisible(visible);
+    this.controlGuides?.forEach((guide) => {
+      guide.node.style.display = visible ? "" : "none";
+    });
+  }
+
+  override onDestroy() {
+    this.controlGuides?.forEach((guide) => guide.destroy());
+    this.controlGuides = undefined;
+    super.onDestroy();
+  }
+
+  private redrawControlGuides() {
+    if (!this.controlGuides || this.isDestroyed()) return;
+    const [start, end] = cubicEdgeModelEndpoints(this.state);
+    const [control1, control2] = cubicControlPointsFromStyle(start, end, this.state.style);
+    const { scale, translate } = this.state.view;
+    const toViewPoint = (point: Point) => new Point(
+      (point.x + translate.x) * scale,
+      (point.y + translate.y) * scale,
+    );
+    const startPoint = this.state.absolutePoints[0] ?? toViewPoint(start);
+    const endPoint = this.state.absolutePoints[this.state.absolutePoints.length - 1] ?? toViewPoint(end);
+    const visible = !this.graph.isEditing() && this.graph.getSelectionCount() === 1;
+    this.controlGuides[0].points = [startPoint, toViewPoint(control1)];
+    this.controlGuides[1].points = [endPoint, toViewPoint(control2)];
+    this.controlGuides.forEach((guide) => {
+      guide.node.style.visibility = visible ? "" : "hidden";
+      guide.redraw();
+    });
   }
 }
 
@@ -398,6 +638,7 @@ const DEFAULT_PAGE_ID = "page-1";
 const DIAGRAM_CANVAS = { width: 2_400, height: 1_600, gridSize: 10 };
 const DIAGRAM_CANVAS_GROWTH = { width: 480, height: 320 };
 const DIAGRAM_CANVAS_PADDING = { width: 280, height: 220 };
+const DIAGRAM_CANVAS_VIEWPORT_INSET = 2;
 const MAX_DIAGRAM_CANVAS_SIZE = 100_000;
 const DIAGRAM_PORT_IMAGE = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.5" fill="#fff" stroke="#0066cc" stroke-width="2"/></svg>')}`;
 const MAX_DRAWIO_DOCUMENT_BYTES = 8 * 1024 * 1024;
@@ -635,7 +876,18 @@ export function SyncedDiagram({
   standalone = false,
   collaborationPanel,
 }: SyncedDiagramProps) {
-  const { theme } = useTheme();
+  const {
+    theme,
+    setTheme,
+    userOverride: hasThemeOverride,
+    resetToSystem,
+  } = useTheme();
+  const {
+    ready: authReady,
+    authed,
+    profile,
+    logout,
+  } = useAuth();
   const graphContainerRef = useRef<HTMLDivElement | null>(null);
   const outlineContainerRef = useRef<HTMLDivElement | null>(null);
   const paletteElementRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -653,6 +905,8 @@ export function SyncedDiagram({
   const pagesMapRef = useRef<Y.Map<DiagramPage> | null>(null);
   const commentsMapRef = useRef<Y.Map<DiagramComment> | null>(null);
   const versionsRef = useRef<DiagramVersionSnapshot[]>([]);
+  const cloudDocumentRef = useRef<UserDiagramDocument | null>(null);
+  const cloudChangeSequenceRef = useRef(0);
   const undoManagerRef = useRef<Y.UndoManager | null>(null);
   const renderGraphRef = useRef<() => void>(() => undefined);
   const flushGraphRef = useRef<() => void>(() => undefined);
@@ -692,6 +946,7 @@ export function SyncedDiagram({
   const [loadedStencilLibraries, setLoadedStencilLibraries] = useState<Set<string>>(() => new Set());
   const [loadingStencilCollection, setLoadingStencilCollection] = useState<string | null>(null);
   const [compactPanel, setCompactPanel] = useState<"library" | "inspector" | null>(null);
+  const [isInspectorVisible, setIsInspectorVisible] = useState(true);
   const [inspectorTab, setInspectorTab] = useState<"design" | "comments" | "versions">("design");
   const [hasCopiedFormat, setHasCopiedFormat] = useState(false);
   const [remotePresences, setRemotePresences] = useState<Record<string, RemoteDiagramPresence>>({});
@@ -699,6 +954,11 @@ export function SyncedDiagram({
   const [versions, setVersions] = useState<DiagramVersionSnapshot[]>([]);
   const [localReadOnly, setLocalReadOnly] = useState(false);
   const [isVersionLoading, setIsVersionLoading] = useState(false);
+  const [cloudDocument, setCloudDocument] = useState<UserDiagramDocument | null>(null);
+  const [cloudDocuments, setCloudDocuments] = useState<UserDiagramDocument[]>([]);
+  const [cloudDirty, setCloudDirty] = useState(false);
+  const [cloudDialog, setCloudDialog] = useState<"login" | "documents" | null>(null);
+  const [isCloudBusy, setIsCloudBusy] = useState(false);
   const [contextMenu, setContextMenu] = useState<DiagramContextMenu | null>(null);
   const [dialogRequest, setDialogRequest] = useState<DiagramDialogRequest | null>(null);
   const [status, setStatus] = useState("专业流程图已就绪，从左侧插入节点后拖动蓝色端口连线。");
@@ -733,6 +993,19 @@ export function SyncedDiagram({
     return typeof result === "string" ? result : null;
   }, [openEditorDialog]);
 
+  const selectCloudDocument = useCallback((document: UserDiagramDocument | null, dirty = false) => {
+    cloudDocumentRef.current = document;
+    setCloudDocument(document);
+    setCloudDirty(dirty);
+  }, []);
+
+  useEffect(() => {
+    if (authed) return;
+    selectCloudDocument(null);
+    setCloudDocuments([]);
+    if (cloudDialog === "documents") setCloudDialog(null);
+  }, [authed, cloudDialog, selectCloudDocument]);
+
   useEffect(() => () => {
     dialogResolverRef.current?.(null);
     dialogResolverRef.current = null;
@@ -742,17 +1015,26 @@ export function SyncedDiagram({
     canvasSizeRef.current = { ...DIAGRAM_CANVAS };
   }, [boardKey]);
 
-  useEffect(() => {
-    if (!isFullViewport) return;
-    const previousOverflow = window.document.body.style.overflow;
-    const previousOverscrollBehavior = window.document.body.style.overscrollBehavior;
-    window.document.body.style.overflow = "hidden";
-    window.document.body.style.overscrollBehavior = "none";
+  useLayoutEffect(() => {
+    if (!isFullViewport || !isActive || standalone) return;
+    const root = window.document.documentElement;
+    const body = window.document.body;
+    const previousRootOverflow = root.style.overflow;
+    const previousScrollbarGutter = root.style.getPropertyValue("scrollbar-gutter");
+    const previousBodyOverflow = body.style.overflow;
+    const previousOverscrollBehavior = body.style.overscrollBehavior;
+    root.style.overflow = "hidden";
+    root.style.setProperty("scrollbar-gutter", "auto");
+    body.style.overflow = "hidden";
+    body.style.overscrollBehavior = "none";
     return () => {
-      window.document.body.style.overflow = previousOverflow;
-      window.document.body.style.overscrollBehavior = previousOverscrollBehavior;
+      root.style.overflow = previousRootOverflow;
+      if (previousScrollbarGutter) root.style.setProperty("scrollbar-gutter", previousScrollbarGutter);
+      else root.style.removeProperty("scrollbar-gutter");
+      body.style.overflow = previousBodyOverflow;
+      body.style.overscrollBehavior = previousOverscrollBehavior;
     };
-  }, [isFullViewport]);
+  }, [isActive, isFullViewport, standalone]);
 
   useEffect(() => {
     if (!showCollaborationPanel) return;
@@ -936,7 +1218,9 @@ export function SyncedDiagram({
     undoManagerRef.current = undoManager;
     seenEventsRef.current.clear();
     lastPeerCountRef.current = 0;
+    cloudChangeSequenceRef.current = 0;
     setSelection(EMPTY_SELECTION);
+    selectCloudDocument(null);
     setNodeCount(0);
     setEdgeCount(0);
     setPages([{ id: DEFAULT_PAGE_ID, name: "页面 1", order: 0 }]);
@@ -970,6 +1254,10 @@ export function SyncedDiagram({
 
     const handleUpdate = (update: Uint8Array, origin: unknown) => {
       refreshPages();
+      cloudChangeSequenceRef.current += 1;
+      if (cloudDocumentRef.current) {
+        setCloudDirty(true);
+      }
       if (origin === REMOTE_ORIGIN) {
         scheduleDocumentRender();
         refreshUndoState();
@@ -1002,7 +1290,7 @@ export function SyncedDiagram({
         undoManagerRef.current = null;
       }
     };
-  }, [boardKey, refreshUndoState, scheduleDocumentRender, sendYUpdate]);
+  }, [boardKey, refreshUndoState, scheduleDocumentRender, selectCloudDocument, sendYUpdate]);
 
   useEffect(() => {
     if (!usesServerVersions) return;
@@ -1054,7 +1342,15 @@ export function SyncedDiagram({
     graph.setAllowNegativeCoordinates(false);
     graph.centerZoom = true;
     graph.keepSelectionVisibleOnZoom = true;
-    graph.setMinimumGraphSize(new Rectangle(0, 0, canvasSizeRef.current.width, canvasSizeRef.current.height));
+    const initialCanvasSize = expandedDiagramCanvasSize(
+      canvasSizeRef.current,
+      null,
+      container.clientWidth,
+      container.clientHeight,
+      1,
+    );
+    canvasSizeRef.current = { ...initialCanvasSize, gridSize: DIAGRAM_CANVAS.gridSize };
+    graph.setMinimumGraphSize(new Rectangle(0, 0, initialCanvasSize.width, initialCanvasSize.height));
     const rubberBandHandler = graph.getPlugin<RubberBandHandler>(RubberBandHandler.pluginId);
     if (rubberBandHandler) {
       rubberBandHandler.defaultOpacity = 14;
@@ -1107,7 +1403,16 @@ export function SyncedDiagram({
     graph.createHandler = (state) => {
       const handler = state.cell.isEdge() && edgeTypeFromCellStyle(state.style) === "curved"
         ? new DiagramCubicEdgeHandler(state)
-        : defaultCreateHandler(state);
+        : state.cell.isVertex()
+          ? new DiagramVertexHandler(state)
+          : defaultCreateHandler(state);
+      if (
+        handler instanceof DiagramVertexHandler
+        && !isReadOnly
+        && !(state.style as DiagramCellStyle).diagramLocked
+      ) {
+        handler.ensureRotationHandle();
+      }
       if (handler instanceof VertexHandler && handler.sizers.length >= 8) {
         const resizeHandle = handler.sizers[7];
         const rotationHandle = handler.rotationShape;
@@ -1117,15 +1422,16 @@ export function SyncedDiagram({
         handler.sizers = rotationHandle ? [resizeHandle, rotationHandle] : [resizeHandle];
         handler.labelShape = null;
         handler.singleSizer = true;
+        if (handler instanceof DiagramVertexHandler) handler.rotateSingleSizer = true;
         handler.manageSizers = false;
         handler.livePreview = true;
         handler.movePreviewToFront = true;
-        handler.rotationHandleVSpacing = -24;
+        handler.rotationHandleVSpacing = -23;
         handler.tolerance = 4;
         if (rotationHandle) {
-          rotationHandle.fill = "#0066cc";
-          rotationHandle.stroke = "#ffffff";
-          rotationHandle.strokeWidth = 2;
+          rotationHandle.fill = DIAGRAM_ROTATION_HANDLE_FILL;
+          rotationHandle.stroke = DIAGRAM_ROTATION_HANDLE_ACCENT;
+          rotationHandle.strokeWidth = 0;
           rotationHandle.setCursor("grab");
         }
         handler.redraw();
@@ -1173,11 +1479,14 @@ export function SyncedDiagram({
         canvasSizeRef.current = { ...nextSize, gridSize: DIAGRAM_CANVAS.gridSize };
       }
       const minimumSize = graph.getMinimumGraphSize();
-      if (sizeChanged || minimumSize?.width !== nextSize.width || minimumSize?.height !== nextSize.height) {
+      const minimumSizeChanged = sizeChanged
+        || minimumSize?.width !== nextSize.width
+        || minimumSize?.height !== nextSize.height;
+      if (minimumSizeChanged) {
         graph.setMinimumGraphSize(new Rectangle(0, 0, nextSize.width, nextSize.height));
+        graph.sizeDidChange();
+        outlineRef.current?.update(true);
       }
-      graph.sizeDidChange();
-      outlineRef.current?.update(true);
     };
     const scheduleCanvasExpansion = () => {
       if (canvasExpansionFrame !== null) return;
@@ -1329,6 +1638,7 @@ export function SyncedDiagram({
     const modelListener = () => {
       scheduleGraphSync();
       scheduleCanvasExpansion();
+      updateSelection(graph, setSelection);
     };
     const selectionListener = () => {
       updateSelection(graph, setSelection);
@@ -2799,6 +3109,42 @@ export function SyncedDiagram({
     }, comment.pageId === activePageId ? 0 : 60);
   }, [activePageId]);
 
+  const replaceDiagramWithUpdate = useCallback((update: Uint8Array) => {
+    const document = yDocRef.current;
+    const nodes = nodesMapRef.current;
+    const edges = edgesMapRef.current;
+    const pageMap = pagesMapRef.current;
+    const commentsMap = commentsMapRef.current;
+    if (!document || !nodes || !edges || !pageMap || !commentsMap) {
+      throw new Error("流程图尚未就绪");
+    }
+    const probe = new Y.Doc();
+    try {
+      Y.applyUpdate(probe, update);
+      const nextNodes = Array.from(probe.getMap<DiagramNode>(NODES_MAP).values());
+      const nextEdges = Array.from(probe.getMap<DiagramEdge>(EDGES_MAP).values());
+      const nextPages = Array.from(probe.getMap<DiagramPage>(PAGES_MAP).values());
+      const nextComments = Array.from(probe.getMap<DiagramComment>(COMMENTS_MAP).values()).filter(isDiagramComment);
+      if (!isDiagramGraphState(nextNodes, nextEdges) || nextPages.length === 0 || !nextPages.every(isDiagramPage)) {
+        throw new Error("流程图数据无效");
+      }
+      document.transact(() => {
+        nodes.clear();
+        edges.clear();
+        pageMap.clear();
+        commentsMap.clear();
+        nextNodes.forEach((node) => nodes.set(node.id, cloneNode(node)));
+        nextEdges.forEach((edge) => edges.set(edge.id, cloneEdge(edge)));
+        nextPages.forEach((page) => pageMap.set(page.id, { ...page }));
+        nextComments.forEach((comment) => commentsMap.set(comment.id, { ...comment }));
+      }, IMPORT_ORIGIN);
+      setActivePageId(nextPages[0].id);
+      undoManagerRef.current?.clear();
+    } finally {
+      probe.destroy();
+    }
+  }, []);
+
   const createVersion = useCallback(async () => {
     if (isRoleReadOnly) return;
     const createdAt = Date.now();
@@ -2852,13 +3198,6 @@ export function SyncedDiagram({
       confirmLabel: "恢复版本",
       tone: "danger",
     })) return;
-    const document = yDocRef.current;
-    const nodes = nodesMapRef.current;
-    const edges = edgesMapRef.current;
-    const pageMap = pagesMapRef.current;
-    const commentsMap = commentsMapRef.current;
-    if (!document || !nodes || !edges || !pageMap || !commentsMap) return;
-    const probe = new Y.Doc();
     setIsVersionLoading(true);
     try {
       let update = snapshot.update;
@@ -2871,31 +3210,14 @@ export function SyncedDiagram({
         update = decodeDiagramUpdate(detail.update);
       }
       if (!update) throw new Error("版本数据不存在");
-      Y.applyUpdate(probe, update);
-      const nextNodes = Array.from(probe.getMap<DiagramNode>(NODES_MAP).values());
-      const nextEdges = Array.from(probe.getMap<DiagramEdge>(EDGES_MAP).values());
-      const nextPages = Array.from(probe.getMap<DiagramPage>(PAGES_MAP).values());
-      const nextComments = Array.from(probe.getMap<DiagramComment>(COMMENTS_MAP).values()).filter(isDiagramComment);
-      if (!isDiagramGraphState(nextNodes, nextEdges) || nextPages.length === 0 || !nextPages.every(isDiagramPage)) {
-        throw new Error("版本数据无效");
-      }
-      document.transact(() => {
-        nodes.clear(); edges.clear(); pageMap.clear(); commentsMap.clear();
-        nextNodes.forEach((node) => nodes.set(node.id, cloneNode(node)));
-        nextEdges.forEach((edge) => edges.set(edge.id, cloneEdge(edge)));
-        nextPages.forEach((page) => pageMap.set(page.id, { ...page }));
-        nextComments.forEach((comment) => commentsMap.set(comment.id, { ...comment }));
-      }, IMPORT_ORIGIN);
-      setActivePageId(nextPages[0].id);
-      undoManagerRef.current?.clear();
+      replaceDiagramWithUpdate(update);
       setStatus(`已恢复版本“${snapshot.name}”。`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "版本恢复失败");
     } finally {
-      probe.destroy();
       setIsVersionLoading(false);
     }
-  }, [isReadOnly, peerId, requestConfirmation, roomId, roomToken]);
+  }, [isReadOnly, peerId, replaceDiagramWithUpdate, requestConfirmation, roomId, roomToken]);
 
   const deleteVersion = useCallback(async (snapshot: DiagramVersionSnapshot) => {
     if (roomRole !== "OWNER" || snapshot.serverId === undefined) return;
@@ -2917,6 +3239,172 @@ export function SyncedDiagram({
       setIsVersionLoading(false);
     }
   }, [peerId, requestConfirmation, roomId, roomRole, roomToken]);
+
+  const encodeCurrentCloudSnapshot = useCallback(() => {
+    if (graphSyncTimerRef.current !== null) {
+      window.clearTimeout(graphSyncTimerRef.current);
+      graphSyncTimerRef.current = null;
+    }
+    flushGraphRef.current();
+    const document = yDocRef.current;
+    if (!document) throw new Error("流程图尚未就绪");
+    const update = encodeDiagramUpdate(Y.encodeStateAsUpdate(document));
+    if (update.length > MAX_DIAGRAM_UPDATE_BASE64_LENGTH) {
+      throw new Error("流程图超过 3 MB 云端保存限制，请导出后精简文档");
+    }
+    return update;
+  }, []);
+
+  const refreshCloudDocuments = useCallback(async () => {
+    if (!authed) return;
+    setIsCloudBusy(true);
+    try {
+      setCloudDocuments(await adminApi.listDiagrams());
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "读取云端流程图失败");
+    } finally {
+      setIsCloudBusy(false);
+    }
+  }, [authed]);
+
+  useEffect(() => {
+    if (cloudDialog === "documents" && authed) {
+      void refreshCloudDocuments();
+    }
+  }, [authed, cloudDialog, refreshCloudDocuments]);
+
+  const saveDiagramAsCloud = useCallback(async () => {
+    if (!authed) {
+      setCloudDialog("login");
+      setStatus("登录后可将当前流程图保存到云端。");
+      return;
+    }
+    const current = cloudDocumentRef.current;
+    const name = (await requestText({
+      title: current ? "另存为云端文件" : "保存到云端",
+      message: "输入在账号文件列表中显示的名称。",
+      inputLabel: "文件名称",
+      initialValue: current ? `${current.name} 副本` : "未命名流程图",
+      maxLength: 120,
+      confirmLabel: "保存",
+    }))?.trim();
+    if (!name) return;
+    setIsCloudBusy(true);
+    try {
+      const update = encodeCurrentCloudSnapshot();
+      const savedSequence = cloudChangeSequenceRef.current;
+      const created = await adminApi.createDiagram({
+        name: name.slice(0, 120),
+        update,
+      });
+      const hasNewChanges = cloudChangeSequenceRef.current !== savedSequence;
+      selectCloudDocument(created, hasNewChanges);
+      setCloudDocuments((documents) => [created, ...documents.filter((item) => item.id !== created.id)]);
+      setStatus(hasNewChanges
+        ? `“${created.name}”已保存；保存期间的新修改尚未保存。`
+        : `“${created.name}”已保存到云端。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "保存云端流程图失败");
+    } finally {
+      setIsCloudBusy(false);
+    }
+  }, [authed, encodeCurrentCloudSnapshot, requestText, selectCloudDocument]);
+
+  const saveDiagramToCloud = useCallback(async () => {
+    if (!authed) {
+      setCloudDialog("login");
+      setStatus("登录后可将当前流程图保存到云端。");
+      return;
+    }
+    const current = cloudDocumentRef.current;
+    if (!current) {
+      await saveDiagramAsCloud();
+      return;
+    }
+    setIsCloudBusy(true);
+    try {
+      const update = encodeCurrentCloudSnapshot();
+      const savedSequence = cloudChangeSequenceRef.current;
+      const saved = await adminApi.updateDiagram(current.id, {
+        name: current.name,
+        update,
+        revision: current.revision,
+      });
+      const hasNewChanges = cloudChangeSequenceRef.current !== savedSequence;
+      selectCloudDocument(saved, hasNewChanges);
+      setCloudDocuments((documents) => [saved, ...documents.filter((item) => item.id !== saved.id)]);
+      setStatus(hasNewChanges
+        ? `“${saved.name}”已保存；保存期间的新修改尚未保存。`
+        : `“${saved.name}”已保存。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "保存云端流程图失败");
+    } finally {
+      setIsCloudBusy(false);
+    }
+  }, [authed, encodeCurrentCloudSnapshot, saveDiagramAsCloud, selectCloudDocument]);
+
+  const openCloudDocument = useCallback(async (item: UserDiagramDocument) => {
+    if (isReadOnly) {
+      setStatus("请先切换到编辑模式再打开云端文件。");
+      return;
+    }
+    if ((nodeCount > 0 || edgeCount > 0) && !await requestConfirmation({
+      title: "打开云端文件",
+      message: `打开“${item.name}”会替换当前画布中的全部页面。`,
+      confirmLabel: "打开文件",
+      tone: "danger",
+    })) return;
+    setIsCloudBusy(true);
+    try {
+      const detail = await adminApi.getDiagram(item.id);
+      replaceDiagramWithUpdate(decodeDiagramUpdate(detail.update));
+      selectCloudDocument(detail.document);
+      setCloudDocuments((documents) => documents.map((document) => (
+        document.id === detail.document.id ? detail.document : document
+      )));
+      setCloudDialog(null);
+      setStatus(`已打开云端文件“${detail.document.name}”。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "打开云端流程图失败");
+    } finally {
+      setIsCloudBusy(false);
+    }
+  }, [edgeCount, isReadOnly, nodeCount, replaceDiagramWithUpdate, requestConfirmation, selectCloudDocument]);
+
+  const deleteCloudDocument = useCallback(async (item: UserDiagramDocument) => {
+    if (!await requestConfirmation({
+      title: "删除云端文件",
+      message: `“${item.name}”删除后无法恢复。`,
+      confirmLabel: "删除文件",
+      tone: "danger",
+    })) return;
+    setIsCloudBusy(true);
+    try {
+      await adminApi.deleteDiagram(item.id);
+      setCloudDocuments((documents) => documents.filter((document) => document.id !== item.id));
+      if (cloudDocumentRef.current?.id === item.id) selectCloudDocument(null);
+      setStatus(`已删除云端文件“${item.name}”。`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "删除云端流程图失败");
+    } finally {
+      setIsCloudBusy(false);
+    }
+  }, [requestConfirmation, selectCloudDocument]);
+
+  const openCloudDocuments = useCallback(() => {
+    setCloudDialog(authed ? "documents" : "login");
+  }, [authed]);
+
+  const logoutFromDiagram = useCallback(async () => {
+    if (cloudDirty && !await requestConfirmation({
+      title: "退出账号",
+      message: "当前云端文件有尚未保存的修改。",
+      confirmLabel: "退出账号",
+      tone: "danger",
+    })) return;
+    logout();
+    setStatus("已退出账号，当前画布仍可继续本地编辑。");
+  }, [cloudDirty, logout, requestConfirmation]);
 
   const openContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -2948,6 +3436,11 @@ export function SyncedDiagram({
     }
     const modifier = event.metaKey || event.ctrlKey;
     const key = event.key.toLowerCase();
+    if (modifier && key === "s") {
+      event.preventDefault();
+      void saveDiagramToCloud();
+      return;
+    }
     if (modifier && key === "c") {
       event.preventDefault();
       copySelection();
@@ -3007,9 +3500,16 @@ export function SyncedDiagram({
             : [0, distance];
       graph.moveCells(graph.getSelectionCells(), delta[0], delta[1]);
     }
-  }, [copySelection, duplicateSelection, isReadOnly, pasteSelection, refreshUndoState, removeSelection]);
+  }, [copySelection, duplicateSelection, isReadOnly, pasteSelection, refreshUndoState, removeSelection, saveDiagramToCloud]);
 
   const totalPeers = Math.max(1, peerCount + 1);
+  const cloudMenuLabel = !authReady
+    ? "账号"
+    : !authed
+      ? "登录保存"
+      : cloudDocument
+        ? `${cloudDocument.name.length > 12 ? `${cloudDocument.name.slice(0, 12)}…` : cloudDocument.name}${cloudDirty ? " · 未保存" : ""}`
+        : `账号 · ${profile?.username ?? "已登录"}`;
   const selectedCountLabel = selection.count > 0 ? ` · 已选 ${selection.count}` : "";
   const selectionOnlyNodes = selection.isNode && !selection.isEdge;
   const selectionOnlyEdges = selection.isEdge && !selection.isNode;
@@ -3028,6 +3528,12 @@ export function SyncedDiagram({
   const librarySummaryLabel = paletteSearchQuery
     ? `${libraryCountLabel} 个匹配`
     : `${PALETTE_CATEGORIES.length + stencilCollections.length} 类 · ${libraryCountLabel} 个图形`;
+  const toggleInspectorVisibility = () => {
+    const nextVisible = !isInspectorVisible;
+    setIsInspectorVisible(nextVisible);
+    setCompactPanel(nextVisible && !window.matchMedia("(min-width: 1024px)").matches ? "inspector" : null);
+    if (nextVisible) setInspectorTab("design");
+  };
 
   const diagram = (
     <section
@@ -3096,16 +3602,29 @@ export function SyncedDiagram({
         ? "diagram-apple-shell absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-zinc-100 dark:bg-[#090c11]"
         : "diagram-apple-shell mt-3 flex h-[min(78dvh,680px)] min-h-[540px] min-w-0 flex-col overflow-hidden rounded-xl border border-black/[0.09] bg-white shadow-[0_24px_70px_-38px_rgba(15,23,42,0.55)] dark:border-white/[0.09] dark:bg-[#0c1016] sm:h-[680px] md:h-[720px] lg:h-[760px] xl:h-[820px]"}
       >
-        <div className="diagram-apple-toolbar flex shrink-0 flex-nowrap items-center gap-0.5 overflow-x-auto border-b border-black/[0.07] bg-white/95 px-1.5 py-1 backdrop-blur-xl [scrollbar-width:none] dark:border-white/[0.08] dark:bg-[#11161e]/95 sm:px-2 sm:py-1.5" role="toolbar" aria-label="流程图操作">
-          <div className="diagram-apple-toolbar-brand mr-1 flex h-8 shrink-0 items-center gap-2 border-r border-black/[0.07] pr-2 dark:border-white/[0.08] sm:mr-2 sm:pr-3">
-            <span className="diagram-apple-toolbar-icon grid h-6 w-6 place-items-center rounded-md bg-zinc-950 text-white dark:bg-cyan-300 dark:text-zinc-950">
-              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2" width="4" height="3.5" rx=".7" /><rect x="10.5" y="10.5" width="4" height="3.5" rx=".7" /><path d="M5.5 3.7h2.2a2 2 0 0 1 2 2v4.8" /></svg>
-            </span>
-            <span className="hidden min-w-0 sm:block">
-              <span className="block max-w-28 truncate text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">{activePageName}</span>
-              <span className="block text-[9px] text-zinc-400">专业流程图</span>
-            </span>
+        <div className="diagram-apple-titlebar diagram-apple-topbar flex h-11 shrink-0 items-center gap-1 border-b border-black/[0.07] bg-white/95 px-2 backdrop-blur-xl dark:border-white/[0.08] dark:bg-[#11161e]/95">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <a
+              href="/"
+              className="diagram-apple-icon-control grid h-8 w-8 shrink-0 place-items-center rounded-full text-zinc-500 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-none dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white"
+              aria-label="返回控制台"
+              title="返回控制台"
+            >
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m9.5 3-5 5 5 5M5 8h7" />
+              </svg>
+            </a>
+            <div className="diagram-apple-toolbar-brand flex h-8 min-w-0 items-center gap-2">
+              <span className="diagram-apple-toolbar-icon grid h-6 w-6 place-items-center rounded-md bg-zinc-950 text-white dark:bg-cyan-300 dark:text-zinc-950">
+                <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2" width="4" height="3.5" rx=".7" /><rect x="10.5" y="10.5" width="4" height="3.5" rx=".7" /><path d="M5.5 3.7h2.2a2 2 0 0 1 2 2v4.8" /></svg>
+              </span>
+              <span className="min-w-0">
+                <span className="block max-w-44 truncate text-[11px] font-semibold text-zinc-800 dark:text-zinc-100 sm:max-w-64">{cloudDocument?.name ?? "未命名流程图"}</span>
+                <span className="hidden text-[9px] text-zinc-400 sm:block">{cloudDirty ? "有未保存更改" : "专业流程图"}</span>
+              </span>
+            </div>
           </div>
+          <div className="diagram-apple-toolbar flex h-full min-w-0 flex-1 flex-nowrap items-center gap-0.5 overflow-x-auto px-1 py-0 backdrop-blur-xl [scrollbar-width:none] sm:px-1.5" role="toolbar" aria-label="流程图操作">
           {isFullViewport ? (
             <>
               {onSwitchToWhiteboard ? (
@@ -3124,18 +3643,11 @@ export function SyncedDiagram({
             setStatus(isReadOnly ? "已恢复编辑模式。" : "已进入本地只读预览，协作更新仍会继续接收。");
           }} />
           <span className="diagram-apple-separator mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
-          <DiagramToolbarButton label="撤销" shortcut="⌘Z" disabled={isReadOnly || !canUndo} onClick={() => {
-            undoManagerRef.current?.undo();
-            refreshUndoState();
-          }} />
-          <DiagramToolbarButton label="重做" shortcut="⇧⌘Z" disabled={isReadOnly || !canRedo} onClick={() => {
-            undoManagerRef.current?.redo();
-            refreshUndoState();
-          }} />
-          <span className="diagram-apple-separator mx-1 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
           <DiagramToolbarMenu
             label={selection.count > 0 ? `编辑 · ${selection.count}` : "编辑"}
             items={[
+              { key: "undo", label: "撤销", shortcut: "⌘Z", disabled: isReadOnly || !canUndo },
+              { key: "redo", label: "重做", shortcut: "⇧⌘Z", disabled: isReadOnly || !canRedo },
               { key: "copy", label: "复制", shortcut: "⌘C", disabled: selection.count === 0 },
               { key: "paste", label: "粘贴", shortcut: "⌘V", disabled: isReadOnly },
               { key: "duplicate", label: "创建副本", shortcut: "⌘D", disabled: isReadOnly || selection.count === 0 },
@@ -3144,7 +3656,13 @@ export function SyncedDiagram({
               { key: "delete", label: "删除", shortcut: "Del", disabled: isReadOnly || selection.count === 0, danger: true },
             ]}
             onAction={(key) => {
-              if (key === "copy") copySelection();
+              if (key === "undo") {
+                undoManagerRef.current?.undo();
+                refreshUndoState();
+              } else if (key === "redo") {
+                undoManagerRef.current?.redo();
+                refreshUndoState();
+              } else if (key === "copy") copySelection();
               else if (key === "paste") pasteSelection();
               else if (key === "duplicate") duplicateSelection();
               else if (key === "copy-format") copyFormat();
@@ -3198,10 +3716,12 @@ export function SyncedDiagram({
               if (key === "room") setShowCollaborationPanel(true);
               else if (key === "comment") {
                 setInspectorTab("comments");
+                setIsInspectorVisible(true);
                 setCompactPanel("inspector");
                 addComment();
               } else if (key === "version") {
                 setInspectorTab("versions");
+                setIsInspectorVisible(true);
                 setCompactPanel("inspector");
                 void createVersion();
               }
@@ -3215,6 +3735,10 @@ export function SyncedDiagram({
               { key: "fit", label: "适应画布" },
               { key: "actual", label: "实际大小 100%" },
               { key: "minimap", label: showMinimap ? "隐藏小地图" : "显示小地图" },
+              { key: "inspector", label: isInspectorVisible ? "隐藏设计属性" : "显示设计属性", selected: isInspectorVisible },
+              { key: "theme-system", label: "主题：跟随系统", selected: !hasThemeOverride },
+              { key: "theme-light", label: "主题：浅色模式", selected: hasThemeOverride && theme === "light" },
+              { key: "theme-dark", label: "主题：深色模式", selected: hasThemeOverride && theme === "dark" },
             ]}
             onAction={(key) => {
               if (key === "zoom-in") withGraph((graph) => graph.zoomIn());
@@ -3222,6 +3746,10 @@ export function SyncedDiagram({
               else if (key === "fit") withGraph((graph) => graph.getPlugin<FitPlugin>("fit")?.fitCenter({ margin: 28 }));
               else if (key === "actual") withGraph((graph) => graph.zoomActual());
               else if (key === "minimap") setShowMinimap((value) => !value);
+              else if (key === "inspector") toggleInspectorVisibility();
+              else if (key === "theme-system") resetToSystem();
+              else if (key === "theme-light") setTheme("light");
+              else if (key === "theme-dark") setTheme("dark");
             }}
           />
           <DiagramToolbarMenu
@@ -3251,51 +3779,43 @@ export function SyncedDiagram({
               else if (key === "clear") clearDiagram();
             }}
           />
-        </div>
-
-        <div className="diagram-apple-pages flex h-10 shrink-0 items-end border-b border-black/[0.07] bg-zinc-50/90 px-2 dark:border-white/[0.08] dark:bg-[#0d1118]" aria-label="流程图页面">
-          <div className="flex min-w-0 flex-1 items-end gap-0.5 overflow-x-auto">
-            <span className="diagram-apple-section-label mb-2 mr-1 shrink-0 px-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-zinc-400">Pages</span>
-            {pages.map((page) => (
-              <button
-                key={page.id}
-                type="button"
-                aria-pressed={page.id === activePageId}
-                className={`diagram-apple-page-tab relative h-9 shrink-0 rounded-t-lg border border-b-0 px-4 text-[11px] font-medium transition ${page.id === activePageId
-                  ? "border-black/[0.08] bg-white text-zinc-900 after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:bg-cyan-500 dark:border-white/[0.1] dark:bg-[#151b24] dark:text-white dark:after:bg-cyan-300"
-                  : "border-transparent text-zinc-500 hover:bg-black/[0.035] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.04] dark:hover:text-zinc-100"}`}
-                onClick={() => {
-                  if (page.id !== activePageId) {
-                    flushGraphRef.current();
-                    setActivePageId(page.id);
-                    setStatus(`已切换到“${page.name}”。`);
-                  }
-                }}
-                onDoubleClick={!isReadOnly && page.id === activePageId ? renamePage : undefined}
-              >
-                {page.name}
-              </button>
-            ))}
+          <span className="ml-auto h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
+          <DiagramToolbarMenu
+            label={cloudMenuLabel}
+            placement="bottom-end"
+            items={!authReady
+              ? [{ key: "auth-loading", label: "正在读取账号", disabled: true }]
+              : authed
+                ? [
+                    { key: "cloud-save", label: cloudDocument ? "保存到云端" : "保存为云端文件", shortcut: "⌘S", disabled: isCloudBusy },
+                    { key: "cloud-save-as", label: "另存为云端文件", disabled: isCloudBusy },
+                    { key: "cloud-files", label: "我的云端文件", disabled: isCloudBusy },
+                    { key: "logout", label: "退出账号", danger: true },
+                  ]
+                : [{ key: "login", label: "登录账号" }]}
+            onAction={(key) => {
+              if (key === "login") setCloudDialog("login");
+              else if (key === "cloud-save") void saveDiagramToCloud();
+              else if (key === "cloud-save-as") void saveDiagramAsCloud();
+              else if (key === "cloud-files") openCloudDocuments();
+              else if (key === "logout") void logoutFromDiagram();
+            }}
+          />
           </div>
-          <div className="mb-1 ml-2 shrink-0 border-l border-black/[0.07] pl-1.5 dark:border-white/[0.08]">
-            <DiagramToolbarMenu
-              label={`${pages.length} 页`}
-              compact
-              placement="bottom-end"
-              items={[
-                { key: "add", label: "新增页面", disabled: isReadOnly },
-                { key: "rename", label: "重命名当前页", disabled: isReadOnly },
-                { key: "duplicate", label: "复制当前页", disabled: isReadOnly },
-                { key: "delete", label: "删除当前页", disabled: isReadOnly || pages.length <= 1, danger: true },
-              ]}
-              onAction={(key) => {
-                if (key === "add") addPage();
-                else if (key === "rename") renamePage();
-                else if (key === "duplicate") duplicatePage();
-                else if (key === "delete") deletePage();
-              }}
-            />
-          </div>
+          <span className="diagram-apple-separator ml-1 hidden h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08] lg:block" />
+          <button
+            type="button"
+            aria-label={isInspectorVisible ? "隐藏设计属性" : "显示设计属性"}
+            aria-pressed={isInspectorVisible}
+            title={isInspectorVisible ? "隐藏设计属性" : "显示设计属性"}
+            className="diagram-apple-icon-control hidden shrink-0 place-items-center lg:grid"
+            onClick={toggleInspectorVisibility}
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="1.75" y="2.25" width="12.5" height="11.5" rx="2" />
+              <path d="M10 2.5v11M11.7 5h.8M11.7 8h.8M11.7 11h.8" />
+            </svg>
+          </button>
         </div>
 
         <div className="diagram-apple-mobile-panel flex h-11 shrink-0 items-center justify-between border-b border-black/[0.07] bg-white/95 px-2 dark:border-white/[0.08] dark:bg-[#11161e]/95 lg:hidden">
@@ -3306,18 +3826,23 @@ export function SyncedDiagram({
             <CompactPanelButton label="画布" active={compactPanel === null} onClick={() => setCompactPanel(null)}>
               <path d="M2.5 3.5h11v9h-11zM5 6h6M5 8.5h4" />
             </CompactPanelButton>
-            <CompactPanelButton label="属性" active={compactPanel === "inspector"} onClick={() => setCompactPanel((current) => {
-              if (current === "inspector") return null;
-              setInspectorTab("design");
-              return "inspector";
-            })}>
+            <CompactPanelButton label="属性" active={compactPanel === "inspector"} onClick={() => {
+              setIsInspectorVisible(true);
+              setCompactPanel((current) => {
+                if (current === "inspector") return null;
+                setInspectorTab("design");
+                return "inspector";
+              });
+            }}>
               <path d="M3 4h10M3 8h10M3 12h10M6 2.5v3M10 6.5v3M7 10.5v3" />
             </CompactPanelButton>
           </div>
           <span className="min-w-0 truncate pl-2 text-right text-[9px] text-zinc-400">{nodeCount} 节点 · {edgeCount} 连线</span>
         </div>
 
-        <div className="diagram-apple-workspace relative grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)_300px]">
+        <div className={`diagram-apple-workspace relative grid min-h-0 flex-1 grid-cols-1 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none ${isInspectorVisible
+          ? "lg:grid-cols-[260px_minmax(0,1fr)_300px]"
+          : "lg:grid-cols-[260px_minmax(0,1fr)]"}`}>
           {compactPanel ? (
             <button
               type="button"
@@ -3651,7 +4176,7 @@ export function SyncedDiagram({
             ) : null}
           </div>
 
-          <aside className={`diagram-apple-inspector ${compactPanel === "inspector" ? "block" : "hidden"} absolute inset-y-0 right-0 z-30 w-[min(90vw,340px)] max-w-full overflow-y-auto border-l border-black/[0.07] bg-zinc-50 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none`}>
+          <aside className={`diagram-apple-inspector ${compactPanel === "inspector" ? "block" : "hidden"} absolute inset-y-0 right-0 z-30 w-[min(90vw,340px)] max-w-full overflow-y-auto border-l border-black/[0.07] bg-zinc-50 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] ${isInspectorVisible ? "lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none" : "lg:hidden"}`}>
             <div className="diagram-apple-inspector-header sticky top-0 z-10 flex h-12 items-center justify-between gap-2 border-b border-black/[0.06] bg-zinc-50/95 px-4 backdrop-blur-xl dark:border-white/[0.07] dark:bg-[#0f141c]/95">
               <span>
                 <span className="block text-[11px] font-semibold text-zinc-900 dark:text-zinc-100">
@@ -3669,7 +4194,13 @@ export function SyncedDiagram({
                       ? `${comments.filter((comment) => comment.pageId === activePageId).length} 条`
                       : `${versions.length} 个`}
                 </span>
-                <button type="button" className="grid h-8 w-8 place-items-center rounded-lg text-zinc-400 hover:bg-black/[0.05] hover:text-zinc-700 dark:hover:bg-white/[0.06] dark:hover:text-zinc-100 lg:hidden" aria-label="关闭设计属性" onClick={() => setCompactPanel(null)}>
+                <button
+                  type="button"
+                  className="diagram-apple-icon-control grid h-8 w-8 place-items-center rounded-full text-zinc-400 hover:bg-black/[0.05] hover:text-zinc-700 dark:hover:bg-white/[0.06] dark:hover:text-zinc-100"
+                  aria-label="隐藏设计栏"
+                  title="隐藏设计栏"
+                  onClick={toggleInspectorVisibility}
+                >
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
                 </button>
               </span>
@@ -3928,28 +4459,52 @@ export function SyncedDiagram({
               role="dialog"
               aria-modal="true"
               aria-labelledby="diagram-collaboration-title"
-              className="diagram-apple-collaboration relative z-10 flex h-full w-full max-w-[440px] flex-col border-l border-black/10 bg-zinc-50 shadow-2xl dark:border-white/10 dark:bg-[#0f141c] sm:w-[min(92vw,440px)]"
+              className="diagram-apple-collaboration relative z-10 flex h-full w-full max-w-[420px] flex-col border-l border-black/10 bg-zinc-50 shadow-2xl dark:border-white/10 dark:bg-[#0f141c] sm:w-[min(92vw,420px)]"
             >
-              <div className="diagram-apple-collaboration-header flex h-14 shrink-0 items-center justify-between border-b border-black/[0.07] px-4 dark:border-white/[0.08]">
+              <div className="diagram-apple-collaboration-header flex h-12 shrink-0 items-center justify-between border-b border-black/[0.07] px-3.5 dark:border-white/[0.08]">
                 <div>
                   <h2 id="diagram-collaboration-title" className="text-sm font-semibold text-zinc-950 dark:text-white">房间与协作</h2>
-                  <p className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">管理连接方式、邀请权限与在线成员</p>
+                  <p className="text-[10px] text-zinc-500 dark:text-zinc-400">房间、邀请与在线成员</p>
                 </div>
                 <button
                   type="button"
-                  className="grid h-9 w-9 place-items-center rounded-lg text-zinc-500 transition hover:bg-black/[0.05] hover:text-zinc-900 dark:hover:bg-white/[0.06] dark:hover:text-white"
+                  className="diagram-apple-icon-control grid h-8 w-8 place-items-center text-zinc-500 transition"
                   aria-label="关闭房间与协作面板"
                   onClick={() => setShowCollaborationPanel(false)}
                 >
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
                 </button>
               </div>
-              <div className="min-h-0 flex-1 overflow-y-auto p-4 overscroll-contain">
+              <div className="min-h-0 flex-1 overflow-y-auto px-3.5 py-3 overscroll-contain">
                 {collaborationPanel}
               </div>
             </aside>
           </div>
         ) : null}
+
+        <DiagramAccountDialog
+          isOpen={cloudDialog === "login"}
+          onClose={() => setCloudDialog(null)}
+          onLoggedIn={() => {
+            setCloudDialog(null);
+            setStatus("已登录，现在可以保存到云端。");
+          }}
+        />
+
+        <DiagramCloudDocumentsDialog
+          isOpen={cloudDialog === "documents"}
+          busy={isCloudBusy}
+          currentId={cloudDocument?.id ?? null}
+          documents={cloudDocuments}
+          onClose={() => setCloudDialog(null)}
+          onDelete={(item) => void deleteCloudDocument(item)}
+          onOpen={(item) => void openCloudDocument(item)}
+          onRefresh={() => void refreshCloudDocuments()}
+          onSaveAs={() => {
+            setCloudDialog(null);
+            void saveDiagramAsCloud();
+          }}
+        />
 
         {dialogRequest ? (
           <DiagramEditorDialog
@@ -3959,15 +4514,297 @@ export function SyncedDiagram({
           />
         ) : null}
 
-        <div className="diagram-apple-status flex h-8 shrink-0 flex-wrap items-center justify-between gap-2 border-t border-black/[0.07] bg-white/95 px-3 text-[9px] text-zinc-500 dark:border-white/[0.08] dark:bg-[#11161e]/95 dark:text-zinc-400">
-          <span className="flex min-w-0 items-center gap-2 truncate"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} />{status}</span>
-          <span className="hidden shrink-0 items-center gap-3 font-mono sm:flex"><span>{activePageName}</span><span>{nodeCount} nodes</span><span>{edgeCount} edges{selectedCountLabel}</span></span>
+        <div className="diagram-apple-footer flex h-9 shrink-0 items-center gap-2 border-t border-black/[0.07] bg-white/95 px-2 text-[9px] text-zinc-500 backdrop-blur-xl dark:border-white/[0.08] dark:bg-[#11161e]/95 dark:text-zinc-400">
+          <div className="diagram-apple-pages diagram-apple-pages-bottom flex min-w-0 flex-[1_1_48%] items-center" aria-label="流程图页面">
+            <span className="diagram-apple-section-label mr-1 hidden shrink-0 px-1 text-[9px] font-semibold text-zinc-400 sm:inline">页面</span>
+            <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
+              {pages.map((page) => (
+                <button
+                  key={page.id}
+                  type="button"
+                  aria-pressed={page.id === activePageId}
+                  className={`diagram-apple-page-tab relative h-7 max-w-44 shrink-0 truncate rounded-lg border px-3 text-[11px] font-medium transition ${page.id === activePageId
+                    ? "border-black/[0.08] bg-white text-zinc-900 dark:border-white/[0.1] dark:bg-[#151b24] dark:text-white"
+                    : "border-transparent text-zinc-500 hover:bg-black/[0.035] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.04] dark:hover:text-zinc-100"}`}
+                  title={page.name}
+                  onClick={() => {
+                    if (page.id !== activePageId) {
+                      flushGraphRef.current();
+                      setActivePageId(page.id);
+                      setStatus(`已切换到“${page.name}”。`);
+                    }
+                  }}
+                  onDoubleClick={!isReadOnly && page.id === activePageId ? renamePage : undefined}
+                >
+                  {page.name}
+                </button>
+              ))}
+            </div>
+            <div className="ml-1 shrink-0 border-l border-black/[0.07] pl-1 dark:border-white/[0.08]">
+              <DiagramToolbarMenu
+                label={`${pages.length} 页`}
+                compact
+                placement="top-end"
+                items={[
+                  { key: "add", label: "新增页面", disabled: isReadOnly },
+                  { key: "rename", label: "重命名当前页", disabled: isReadOnly },
+                  { key: "duplicate", label: "复制当前页", disabled: isReadOnly },
+                  { key: "delete", label: "删除当前页", disabled: isReadOnly || pages.length <= 1, danger: true },
+                ]}
+                onAction={(key) => {
+                  if (key === "add") addPage();
+                  else if (key === "rename") renamePage();
+                  else if (key === "duplicate") duplicatePage();
+                  else if (key === "delete") deletePage();
+                }}
+              />
+            </div>
+          </div>
+          <span className="hidden h-5 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08] md:block" />
+          <span className="diagram-apple-status hidden min-w-0 flex-1 items-center gap-2 truncate md:flex">
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} />
+            <span className="truncate">{status}</span>
+          </span>
+          <span className={`h-1.5 w-1.5 shrink-0 rounded-full md:hidden ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} title={status} />
+          <span className="hidden shrink-0 items-center gap-3 font-mono lg:flex"><span>{activePageName}</span><span>{nodeCount} nodes</span><span>{edgeCount} edges{selectedCountLabel}</span></span>
         </div>
       </div>
     </section>
   );
 
   return isFullViewport ? createPortal(diagram, window.document.body) : diagram;
+}
+
+function DiagramAccountDialog({
+  isOpen,
+  onClose,
+  onLoggedIn,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  onLoggedIn: () => void;
+}) {
+  const {
+    oidcConfig,
+    loginHint,
+    passwordLogin,
+    startOidcLogin,
+  } = useAuth();
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const passwordEnabled = oidcConfig?.passwordLoginEnabled ?? true;
+  const oidcEnabled = oidcConfig?.configured ?? false;
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    try {
+      await passwordLogin(username, password);
+      setPassword("");
+      onLoggedIn();
+    } catch (loginError) {
+      setError(loginError instanceof Error ? loginError.message : "登录失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      placement="center"
+      size="sm"
+      backdrop="blur"
+      onOpenChange={(open) => {
+        if (!open && !submitting) onClose();
+      }}
+      classNames={{
+        wrapper: "!z-[220] px-4 py-6",
+        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+        base: "border border-black/[0.08] bg-white text-zinc-950 shadow-2xl dark:border-white/[0.1] dark:bg-[#151b24] dark:text-white",
+      }}
+    >
+      <ModalContent>
+        <ModalHeader className="flex flex-col gap-1 px-5 pb-1 pt-5">
+          <span className="text-base font-semibold">登录账号</span>
+          <span className="text-[11px] font-normal text-zinc-500 dark:text-zinc-400">{loginHint}</span>
+        </ModalHeader>
+        <ModalBody className="gap-3 px-5 py-4">
+          {passwordEnabled ? (
+            <form id="diagram-account-form" className="grid gap-3" onSubmit={(event) => void submit(event)}>
+              <Input
+                label="用户名"
+                value={username}
+                autoComplete="username"
+                isDisabled={submitting}
+                onValueChange={setUsername}
+              />
+              <Input
+                label="密码"
+                type="password"
+                value={password}
+                autoComplete="current-password"
+                isDisabled={submitting}
+                onValueChange={setPassword}
+              />
+            </form>
+          ) : null}
+          {error ? (
+            <div className="rounded-lg border border-red-500/20 bg-red-50 px-3 py-2 text-[11px] text-red-700 dark:border-red-300/20 dark:bg-red-300/10 dark:text-red-100">
+              {error}
+            </div>
+          ) : null}
+          {!passwordEnabled && !oidcEnabled ? (
+            <div className="rounded-lg border border-amber-500/20 bg-amber-50 px-3 py-2 text-[11px] text-amber-800 dark:border-amber-300/20 dark:bg-amber-300/10 dark:text-amber-100">
+              当前服务端未启用登录方式。
+            </div>
+          ) : null}
+        </ModalBody>
+        <ModalFooter className="gap-2 border-t border-black/[0.07] px-5 py-3 dark:border-white/[0.08]">
+          <Button size="sm" radius="sm" variant="light" isDisabled={submitting} onPress={onClose}>
+            取消
+          </Button>
+          {oidcEnabled ? (
+            <Button size="sm" radius="sm" variant="flat" isDisabled={submitting} onPress={() => void startOidcLogin()}>
+              OIDC 登录
+            </Button>
+          ) : null}
+          {passwordEnabled ? (
+            <Button
+              form="diagram-account-form"
+              type="submit"
+              size="sm"
+              radius="sm"
+              color="primary"
+              isLoading={submitting}
+              isDisabled={!username.trim() || !password}
+            >
+              登录
+            </Button>
+          ) : null}
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
+  );
+}
+
+function DiagramCloudDocumentsDialog({
+  isOpen,
+  busy,
+  currentId,
+  documents,
+  onClose,
+  onDelete,
+  onOpen,
+  onRefresh,
+  onSaveAs,
+}: {
+  isOpen: boolean;
+  busy: boolean;
+  currentId: number | null;
+  documents: UserDiagramDocument[];
+  onClose: () => void;
+  onDelete: (document: UserDiagramDocument) => void;
+  onOpen: (document: UserDiagramDocument) => void;
+  onRefresh: () => void;
+  onSaveAs: () => void;
+}) {
+  return (
+    <Modal
+      isOpen={isOpen}
+      placement="center"
+      size="2xl"
+      scrollBehavior="inside"
+      backdrop="blur"
+      onOpenChange={(open) => {
+        if (!open && !busy) onClose();
+      }}
+      classNames={{
+        wrapper: "!z-[220] px-4 py-6",
+        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
+        base: "max-h-[min(78dvh,720px)] border border-black/[0.08] bg-zinc-50 text-zinc-950 shadow-2xl dark:border-white/[0.1] dark:bg-[#11161e] dark:text-white",
+      }}
+    >
+      <ModalContent>
+        <ModalHeader className="flex items-center justify-between gap-3 px-5 pb-3 pt-5">
+          <span className="min-w-0">
+            <span className="block text-base font-semibold">我的云端文件</span>
+            <span className="mt-0.5 block text-[10px] font-normal text-zinc-500 dark:text-zinc-400">{documents.length} 个文件</span>
+          </span>
+          <span className="flex shrink-0 gap-2 pr-7">
+            <Button size="sm" radius="sm" variant="light" isDisabled={busy} onPress={onRefresh}>刷新</Button>
+            <Button size="sm" radius="sm" color="primary" variant="flat" isDisabled={busy} onPress={onSaveAs}>保存当前</Button>
+          </span>
+        </ModalHeader>
+        <ModalBody className="px-5 pb-5 pt-1">
+          {busy && documents.length === 0 ? (
+            <div className="grid min-h-40 place-items-center text-small text-zinc-500 dark:text-zinc-400">正在读取云端文件…</div>
+          ) : documents.length === 0 ? (
+            <div className="grid min-h-40 place-items-center rounded-lg border border-dashed border-black/[0.1] bg-white/70 text-small text-zinc-500 dark:border-white/[0.1] dark:bg-white/[0.025] dark:text-zinc-400">
+              还没有云端文件
+            </div>
+          ) : (
+            <div className="grid gap-2">
+              {documents.map((document) => {
+                const isCurrent = currentId === document.id;
+                return (
+                  <div
+                    key={document.id}
+                    className={`flex flex-col gap-3 rounded-lg border px-3.5 py-3 sm:flex-row sm:items-center ${isCurrent
+                      ? "border-blue-500/30 bg-blue-50/70 dark:border-blue-300/25 dark:bg-blue-300/[0.07]"
+                      : "border-black/[0.07] bg-white dark:border-white/[0.08] dark:bg-white/[0.035]"}`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="truncate text-small font-semibold text-zinc-900 dark:text-zinc-100">{document.name}</span>
+                        {isCurrent ? <span className="shrink-0 rounded bg-blue-500/10 px-1.5 py-0.5 text-[9px] font-semibold text-blue-700 dark:text-blue-200">当前</span> : null}
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-x-2 text-[10px] text-zinc-500 dark:text-zinc-400">
+                        <span>{formatCloudDiagramDate(document.updatedAt)}</span>
+                        <span>{formatCloudDiagramBytes(document.sizeBytes)}</span>
+                        <span>修订 {document.revision}</span>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <Button size="sm" radius="sm" color="primary" variant="flat" isDisabled={busy || isCurrent} onPress={() => onOpen(document)}>
+                        {isCurrent ? "已打开" : "打开"}
+                      </Button>
+                      <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={busy} onPress={() => onDelete(document)}>
+                        删除
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </ModalBody>
+        <ModalFooter className="border-t border-black/[0.07] px-5 py-3 dark:border-white/[0.08]">
+          <Button size="sm" radius="sm" variant="light" isDisabled={busy} onPress={onClose}>关闭</Button>
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
+  );
+}
+
+function formatCloudDiagramDate(value: string) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(timestamp);
+}
+
+function formatCloudDiagramBytes(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function DiagramEditorDialog({
@@ -4784,8 +5621,10 @@ function createNodeDragPreview(
   element.style.boxSizing = "border-box";
   element.style.position = "relative";
   element.style.pointerEvents = "none";
-  element.style.opacity = "0.96";
-  element.style.filter = "none";
+  element.style.opacity = "0.98";
+  // Soft, layered elevation so the shape reads as a card being lifted onto the canvas.
+  // drop-shadow (not box-shadow) follows the clip-path silhouette of non-rectangular kinds.
+  element.style.filter = "drop-shadow(0 14px 30px rgba(15, 23, 42, 0.26)) drop-shadow(0 3px 8px rgba(15, 23, 42, 0.14))";
 
   const shape = window.document.createElement("div");
   shape.style.position = "absolute";
@@ -4796,7 +5635,8 @@ function createNodeDragPreview(
     : defaults.style.fillColor;
   shape.style.border = `${Math.max(1, defaults.style.strokeWidth)}px ${defaults.style.dashed ? "dashed" : "solid"} ${defaults.style.strokeColor}`;
   shape.style.borderRadius = "14px";
-  shape.style.boxShadow = "none";
+  // Faint top highlight for a soft, dimensional finish (clipped to the shape for non-rect kinds).
+  shape.style.boxShadow = "inset 0 1px 0 rgba(255, 255, 255, 0.5)";
 
   if (kind === "ellipse" || kind === "circle" || kind === "start" || kind === "end" || kind === "connector" || kind === "bpmnEvent" || kind === "umlUseCase" || kind === "umlInterface" || kind === "erAttribute" || kind === "router") {
     shape.style.borderRadius = "999px";
@@ -4871,17 +5711,27 @@ function createNodeDragPreview(
   label.style.whiteSpace = "nowrap";
   element.appendChild(label);
 
-  const dropIndicator = window.document.createElement("div");
-  dropIndicator.style.position = "absolute";
-  dropIndicator.style.right = "-4px";
-  dropIndicator.style.bottom = "-4px";
-  dropIndicator.style.width = "12px";
-  dropIndicator.style.height = "12px";
-  dropIndicator.style.border = "3px solid white";
-  dropIndicator.style.borderRadius = "999px";
-  dropIndicator.style.background = "#06b6d4";
-  dropIndicator.style.boxShadow = "0 2px 6px rgba(8, 145, 178, .35)";
-  element.appendChild(dropIndicator);
+  // "Add" affordance in the diagram accent blue with a white ring — reads as an intentional badge
+  // rather than the previous stray cyan dot, and matches the editor's blue accent language.
+  const addBadge = window.document.createElement("div");
+  addBadge.style.position = "absolute";
+  addBadge.style.top = "-7px";
+  addBadge.style.right = "-7px";
+  addBadge.style.display = "flex";
+  addBadge.style.alignItems = "center";
+  addBadge.style.justifyContent = "center";
+  addBadge.style.width = "18px";
+  addBadge.style.height = "18px";
+  addBadge.style.borderRadius = "999px";
+  addBadge.style.background = "#0066cc";
+  addBadge.style.color = "#ffffff";
+  addBadge.style.fontFamily = "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+  addBadge.style.fontSize = "13px";
+  addBadge.style.fontWeight = "700";
+  addBadge.style.lineHeight = "1";
+  addBadge.style.boxShadow = "0 0 0 2px #ffffff, 0 4px 10px rgba(0, 102, 204, 0.42)";
+  addBadge.textContent = "+";
+  element.appendChild(addBadge);
 
   return { element, width, height };
 }
@@ -4938,6 +5788,10 @@ function textAlignFromStyle(value: unknown): "left" | "center" | "right" {
 
 function normalizeRotation(value: number) {
   return ((Math.round(value) % 360) + 360) % 360;
+}
+
+function pointerAngleDegrees(state: CellState, x: number, y: number) {
+  return (Math.atan2(y - state.getCenterY(), x - state.getCenterX()) * 180) / Math.PI;
 }
 
 function portCoordinates(port?: DiagramPort) {
@@ -5100,24 +5954,22 @@ function expandedDiagramCanvasSize(
   viewportHeight: number,
   scale: number,
 ) {
-  const safeScale = Math.max(1, Number.isFinite(scale) ? scale : 1);
+  const safeScale = Math.max(0.05, Number.isFinite(scale) ? scale : 1);
+  const viewportCanvasWidth = Math.max(1, (viewportWidth - DIAGRAM_CANVAS_VIEWPORT_INSET) / safeScale);
+  const viewportCanvasHeight = Math.max(1, (viewportHeight - DIAGRAM_CANVAS_VIEWPORT_INSET) / safeScale);
   const contentRight = contentBounds ? Math.max(0, contentBounds.x + contentBounds.width) : 0;
   const contentBottom = contentBounds ? Math.max(0, contentBounds.y + contentBounds.height) : 0;
-  const targetWidth = Math.max(
-    DIAGRAM_CANVAS.width,
-    current.width,
-    viewportWidth / safeScale,
-    contentRight + DIAGRAM_CANVAS_PADDING.width,
-  );
-  const targetHeight = Math.max(
-    DIAGRAM_CANVAS.height,
-    current.height,
-    viewportHeight / safeScale,
-    contentBottom + DIAGRAM_CANVAS_PADDING.height,
-  );
+  const requiredWidth = contentBounds ? contentRight + DIAGRAM_CANVAS_PADDING.width : 0;
+  const requiredHeight = contentBounds ? contentBottom + DIAGRAM_CANVAS_PADDING.height : 0;
+  const targetWidth = requiredWidth <= viewportCanvasWidth
+    ? viewportCanvasWidth
+    : Math.ceil(Math.max(current.width, requiredWidth) / DIAGRAM_CANVAS_GROWTH.width) * DIAGRAM_CANVAS_GROWTH.width;
+  const targetHeight = requiredHeight <= viewportCanvasHeight
+    ? viewportCanvasHeight
+    : Math.ceil(Math.max(current.height, requiredHeight) / DIAGRAM_CANVAS_GROWTH.height) * DIAGRAM_CANVAS_GROWTH.height;
   return {
-    width: Math.min(MAX_DIAGRAM_CANVAS_SIZE, Math.ceil(targetWidth / DIAGRAM_CANVAS_GROWTH.width) * DIAGRAM_CANVAS_GROWTH.width),
-    height: Math.min(MAX_DIAGRAM_CANVAS_SIZE, Math.ceil(targetHeight / DIAGRAM_CANVAS_GROWTH.height) * DIAGRAM_CANVAS_GROWTH.height),
+    width: Math.min(MAX_DIAGRAM_CANVAS_SIZE, targetWidth),
+    height: Math.min(MAX_DIAGRAM_CANVAS_SIZE, targetHeight),
   };
 }
 
@@ -5354,6 +6206,7 @@ interface DiagramToolbarMenuItem {
   shortcut?: string;
   disabled?: boolean;
   danger?: boolean;
+  selected?: boolean;
 }
 
 function CompactPanelButton({
@@ -5394,7 +6247,7 @@ function DiagramToolbarMenu({
   label: string;
   items: DiagramToolbarMenuItem[];
   compact?: boolean;
-  placement?: "bottom-start" | "bottom-end";
+  placement?: "bottom-start" | "bottom-end" | "top-end";
   onAction: (key: string) => void;
 }) {
   return (
@@ -5423,7 +6276,11 @@ function DiagramToolbarMenu({
             textValue={item.label}
             color={item.danger ? "danger" : "default"}
             className={item.danger ? "text-danger" : undefined}
-            endContent={item.shortcut ? <span className="text-[10px] text-zinc-400">{item.shortcut}</span> : null}
+            endContent={item.selected ? (
+              <svg className="h-3.5 w-3.5 text-primary" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m3 8 3 3 7-7" />
+              </svg>
+            ) : item.shortcut ? <span className="text-[10px] text-zinc-400">{item.shortcut}</span> : null}
           >
             {item.label}
           </DropdownItem>
@@ -5465,19 +6322,27 @@ function DiagramToolbarButton({
 function DrawioStencilGlyph({ stencilName, loaded }: { stencilName: string; loaded: boolean }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [rendered, setRendered] = useState(false);
+  const { theme } = useTheme();
   useEffect(() => {
     const svg = svgRef.current;
     if (!svg || !loaded) {
       setRendered(false);
       return;
     }
+    // Resolve the shared diagram tokens so the stencil preview matches the built-in node glyphs
+    // and stays legible in both themes (a fixed dark stroke disappeared on the dark panel).
+    const tokens = getComputedStyle(svg);
+    const stroke = tokens.getPropertyValue("--diagram-apple-blue").trim()
+      || (theme === "dark" ? "#2997ff" : "#0066cc");
+    const fill = tokens.getPropertyValue("--diagram-apple-glyph-fill").trim()
+      || (theme === "dark" ? "#20364d" : "#e8f2ff");
     try {
-      setRendered(renderDrawioStencilPreview(svg, stencilName));
+      setRendered(renderDrawioStencilPreview(svg, stencilName, { stroke, fill }));
     } catch {
       svg.replaceChildren();
       setRendered(false);
     }
-  }, [loaded, stencilName]);
+  }, [loaded, stencilName, theme]);
   return (
     <span className="diagram-apple-stencil-glyph relative flex h-8 w-12 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-50 dark:bg-white/[0.04]">
       <svg ref={svgRef} className={`h-full w-full overflow-visible ${rendered ? "block" : "hidden"}`} aria-hidden="true" />

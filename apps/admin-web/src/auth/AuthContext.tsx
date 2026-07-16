@@ -21,6 +21,7 @@ import { codeChallenge, randomToken } from "../lib/pkce";
 
 const PKCE_VERIFIER_KEY = "pkce_verifier";
 const OIDC_STATE_KEY = "oidc_state";
+const AUTH_RETURN_PATH_KEY = "auth_return_path";
 const REFRESH_INTERVAL_MS = 60_000;
 const REFRESH_WINDOW_MS = 5 * 60_000;
 
@@ -134,6 +135,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const state = randomToken();
     sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
     sessionStorage.setItem(OIDC_STATE_KEY, state);
+    sessionStorage.setItem(
+      AUTH_RETURN_PATH_KEY,
+      `${window.location.pathname}${window.location.search}${window.location.hash}`,
+    );
     const challenge = await codeChallenge(verifier);
     const url = new URL(oidcConfig.authorizationEndpoint);
     url.searchParams.set("response_type", "code");
@@ -214,18 +219,30 @@ async function completeOidcRedirect(
     cleanUrl();
     return;
   }
+  let completed = false;
   try {
     const verifier = sessionStorage.getItem(PKCE_VERIFIER_KEY) || "";
     const data = await oidcExchange(params.get("code") as string, verifier);
     tokenStore.save(data.accessToken, data.expiresIn, "oidc");
     await onSuccess();
+    completed = true;
   } catch (error) {
     setHint(error instanceof Error ? error.message : "登录失败");
   } finally {
     sessionStorage.removeItem(PKCE_VERIFIER_KEY);
     sessionStorage.removeItem(OIDC_STATE_KEY);
+    const returnPath = safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY));
+    sessionStorage.removeItem(AUTH_RETURN_PATH_KEY);
+    if (completed && returnPath && returnPath !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+      window.location.replace(returnPath);
+      return;
+    }
     cleanUrl();
   }
+}
+
+function safeAuthReturnPath(value: string | null): string | null {
+  return value && value.startsWith("/") && !value.startsWith("//") ? value : null;
 }
 
 function cleanUrl(): void {

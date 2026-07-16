@@ -2599,6 +2599,20 @@ body {
   background: var(--landing-action-soft, var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1))) !important;
 }
 
+.public-tools-trigger {
+  width: 36px !important;
+  min-width: 36px !important;
+  height: 36px !important;
+  padding: 0 !important;
+  color: var(--landing-ink, var(--app-apple-ink, #1d1d1f)) !important;
+}
+
+.public-tools-trigger:hover,
+.public-tools-trigger[aria-expanded="true"] {
+  color: var(--landing-action, var(--app-apple-blue, #0066cc)) !important;
+  background: var(--landing-action-soft, var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1))) !important;
+}
+
 .public-header-button:active {
   transform: scale(0.97);
 }
@@ -2641,6 +2655,53 @@ body {
 
 .public-header-menu [data-key] {
   border-radius: 8px;
+}
+
+.public-tools-menu {
+  min-width: 252px;
+  padding: 6px;
+}
+
+.public-tools-menu-item {
+  min-height: 54px;
+  padding: 7px 8px !important;
+  color: #1d1d1f;
+}
+
+.dark .public-tools-menu-item {
+  color: #f5f5f7;
+}
+
+.public-tools-menu-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  border: 1px solid rgba(29, 29, 31, 0.08);
+  border-radius: 8px;
+  color: #515154;
+  background: rgba(29, 29, 31, 0.035);
+  transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease;
+}
+
+.dark .public-tools-menu-icon {
+  border-color: rgba(245, 245, 247, 0.1);
+  color: #d1d1d6;
+  background: rgba(245, 245, 247, 0.055);
+}
+
+.public-tools-menu-item:hover .public-tools-menu-icon,
+.public-tools-menu-item:focus .public-tools-menu-icon,
+.public-tools-menu-item-active .public-tools-menu-icon {
+  border-color: color-mix(in srgb, var(--app-apple-blue, #0066cc) 24%, transparent);
+  color: var(--app-apple-blue, #0066cc);
+  background: var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1));
+}
+
+.public-tools-menu-item-active {
+  color: var(--app-apple-blue, #0066cc) !important;
+  background: var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1)) !important;
 }
 
 /* Apple-style public tools: NAT detection and device transfer share one quiet workspace shell. */
@@ -3242,10 +3303,12 @@ body {
   filter: brightness(1.04);
 }
 
+.diagram-apple-titlebar,
 .diagram-apple-toolbar,
 .diagram-apple-pages,
 .diagram-apple-mobile-panel,
 .diagram-apple-status,
+.diagram-apple-footer,
 .diagram-apple-inspector-header,
 .diagram-apple-collaboration-header {
   background: var(--diagram-apple-panel) !important;
@@ -3260,10 +3323,38 @@ body {
   border-color: var(--diagram-apple-line) !important;
 }
 
+.diagram-apple-topbar .diagram-apple-toolbar,
+.diagram-apple-footer .diagram-apple-pages,
+.diagram-apple-footer .diagram-apple-status {
+  border: 0 !important;
+  background: transparent !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
 .diagram-apple-toolbar-button,
 .diagram-apple-toolbar-menu,
 .diagram-apple-compact-button {
   color: var(--diagram-apple-muted) !important;
+}
+
+.diagram-apple-icon-control,
+.diagram-apple-theme-toggle {
+  width: 32px !important;
+  min-width: 32px !important;
+  height: 32px !important;
+  border: 0 !important;
+  border-radius: 999px !important;
+  background: transparent !important;
+  color: var(--diagram-apple-muted) !important;
+  box-shadow: none !important;
+}
+
+.diagram-apple-icon-control:hover,
+.diagram-apple-theme-toggle:hover,
+.diagram-apple-icon-control[aria-pressed="true"] {
+  background: var(--diagram-apple-blue-soft) !important;
+  color: var(--diagram-apple-blue) !important;
 }
 
 .diagram-apple-toolbar-button:hover,
@@ -3279,6 +3370,8 @@ body {
 .diagram-apple-toolbar-button:focus-visible,
 .diagram-apple-toolbar-menu:focus-visible,
 .diagram-apple-compact-button:focus-visible,
+.diagram-apple-icon-control:focus-visible,
+.diagram-apple-theme-toggle:focus-visible,
 .diagram-apple-primary-action:focus-visible,
 .diagram-apple-search:focus,
 .diagram-apple-text-field:focus,
@@ -3311,12 +3404,364 @@ body {
   background: var(--diagram-apple-blue) !important;
 }
 
+.diagram-apple-pages-bottom .diagram-apple-page-tab[aria-pressed="true"] {
+  background: var(--diagram-apple-blue-soft) !important;
+  border-color: color-mix(in srgb, var(--diagram-apple-blue) 22%, transparent) !important;
+  color: var(--diagram-apple-blue) !important;
+  box-shadow: none !important;
+}
+
 .diagram-apple-library,
 .diagram-apple-inspector,
 .diagram-apple-collaboration {
   background: var(--diagram-apple-surface-soft) !important;
   border-color: var(--diagram-apple-line) !important;
   box-shadow: none !important;
+}
+
+.diagram-collaboration-panel {
+  color: var(--diagram-apple-ink);
+}
+
+.diagram-collaboration-overview {
+  display: flex;
+  min-height: 54px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 11px;
+  border: 1px solid var(--diagram-apple-line);
+  border-radius: 8px;
+  background: var(--diagram-apple-surface);
+}
+
+.diagram-collaboration-status-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 2px solid var(--diagram-apple-surface);
+  border-radius: 999px;
+  background: var(--diagram-apple-subtle);
+  box-shadow: 0 0 0 1px var(--diagram-apple-line-strong);
+}
+
+.diagram-collaboration-status-dot.is-connected,
+.diagram-collaboration-online-dot {
+  background: #30a46c;
+}
+
+.diagram-collaboration-role,
+.diagram-collaboration-count {
+  display: inline-flex;
+  min-height: 20px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--diagram-apple-blue) 18%, transparent);
+  border-radius: 999px;
+  background: var(--diagram-apple-blue-soft);
+  color: var(--diagram-apple-blue);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.diagram-collaboration-role {
+  padding: 0 7px;
+}
+
+.diagram-collaboration-count {
+  min-width: 38px;
+  padding: 0 8px;
+}
+
+.diagram-collaboration-section {
+  padding: 11px 1px;
+  border-bottom: 1px solid var(--diagram-apple-line);
+}
+
+.diagram-collaboration-section:last-of-type {
+  border-bottom: 0;
+  padding-bottom: 2px;
+}
+
+.diagram-collaboration-section-heading {
+  display: flex;
+  min-height: 20px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.diagram-collaboration-section-heading h3 {
+  color: var(--diagram-apple-ink);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.diagram-collaboration-section-heading > span {
+  color: var(--diagram-apple-subtle);
+  font-size: 10px;
+  line-height: 1.25;
+}
+
+.diagram-collaboration-network {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  margin-top: 7px;
+  padding: 3px;
+  border: 1px solid var(--diagram-apple-line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--diagram-apple-page) 72%, transparent);
+}
+
+.diagram-collaboration-network button {
+  display: flex;
+  min-width: 0;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--diagram-apple-muted);
+  background: transparent;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.diagram-collaboration-network button span {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.diagram-collaboration-network button small {
+  overflow: hidden;
+  color: var(--diagram-apple-subtle);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagram-collaboration-network button:hover,
+.diagram-collaboration-network button.is-active {
+  border-color: color-mix(in srgb, var(--diagram-apple-blue) 18%, var(--diagram-apple-line));
+  background: var(--diagram-apple-surface);
+  color: var(--diagram-apple-blue);
+}
+
+.diagram-collaboration-network button.is-active {
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--diagram-apple-ink) 8%, transparent);
+}
+
+.diagram-collaboration-network button:focus-visible,
+.diagram-collaboration-panel button:focus-visible {
+  outline: 2px solid var(--diagram-apple-blue) !important;
+  outline-offset: 1px;
+}
+
+.diagram-collaboration-input,
+.diagram-collaboration-client-name [data-slot="input-wrapper"] {
+  min-height: 38px !important;
+  border-color: var(--diagram-apple-line-strong) !important;
+  background: var(--diagram-apple-surface) !important;
+  color: var(--diagram-apple-ink) !important;
+  box-shadow: none !important;
+}
+
+.diagram-collaboration-panel [data-slot="label"],
+.diagram-collaboration-panel [data-slot="input"],
+.diagram-collaboration-panel input {
+  color: var(--diagram-apple-ink) !important;
+}
+
+.diagram-collaboration-panel [data-slot="label"] {
+  font-size: 10px !important;
+}
+
+.diagram-collaboration-panel [data-slot="helper-wrapper"] {
+  padding-top: 2px !important;
+  font-size: 9px !important;
+  line-height: 1.3 !important;
+}
+
+.diagram-collaboration-action,
+.diagram-collaboration-inline-action,
+.diagram-collaboration-client-name button,
+.diagram-collaboration-permissions > div > button {
+  min-width: 0 !important;
+  min-height: 30px !important;
+  height: 30px !important;
+  padding-inline: 10px !important;
+  border: 1px solid var(--diagram-apple-line) !important;
+  border-radius: 999px !important;
+  background: var(--diagram-apple-surface) !important;
+  color: var(--diagram-apple-muted) !important;
+  font-size: 10px !important;
+  box-shadow: none !important;
+}
+
+.diagram-collaboration-inline-action {
+  min-height: 26px !important;
+  height: 26px !important;
+  padding-inline: 7px !important;
+}
+
+.diagram-collaboration-action:hover,
+.diagram-collaboration-action.is-active,
+.diagram-collaboration-inline-action:hover,
+.diagram-collaboration-client-name button:hover,
+.diagram-collaboration-permissions > div > button:hover {
+  border-color: color-mix(in srgb, var(--diagram-apple-blue) 30%, var(--diagram-apple-line)) !important;
+  background: var(--diagram-apple-blue-soft) !important;
+  color: var(--diagram-apple-blue) !important;
+}
+
+.diagram-collaboration-action.is-primary,
+.diagram-collaboration-client-name button,
+.diagram-collaboration-permissions > div > button {
+  border-color: var(--diagram-apple-blue) !important;
+  background: var(--diagram-apple-blue) !important;
+  color: #ffffff !important;
+}
+
+.diagram-collaboration-permissions > div {
+  grid-template-columns: auto minmax(112px, 1fr) auto !important;
+  gap: 6px !important;
+}
+
+.diagram-collaboration-permissions [role="radiogroup"] {
+  border-color: var(--diagram-apple-line) !important;
+  background: color-mix(in srgb, var(--diagram-apple-page) 72%, transparent) !important;
+}
+
+.diagram-collaboration-permissions [role="radio"] {
+  color: var(--diagram-apple-subtle) !important;
+  font-size: 10px !important;
+  box-shadow: none !important;
+}
+
+.diagram-collaboration-permissions [role="radio"][aria-checked="true"] {
+  background: var(--diagram-apple-surface) !important;
+  color: var(--diagram-apple-blue) !important;
+  box-shadow: 0 0 0 1px var(--diagram-apple-line) !important;
+}
+
+.diagram-collaboration-qr {
+  display: grid;
+  justify-items: center;
+  padding: 10px;
+  border: 1px solid var(--diagram-apple-line);
+  border-radius: 8px;
+  background: var(--diagram-apple-surface);
+}
+
+.diagram-collaboration-created-access,
+.diagram-collaboration-access-row,
+.diagram-collaboration-member {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.diagram-collaboration-created-access {
+  min-height: 38px;
+  justify-content: space-between;
+  padding: 4px 5px 4px 9px;
+  border: 1px solid color-mix(in srgb, #d97706 26%, var(--diagram-apple-line));
+  border-radius: 8px;
+  background: color-mix(in srgb, #f59e0b 8%, var(--diagram-apple-surface));
+  color: var(--diagram-apple-muted);
+  font-size: 10px;
+}
+
+.diagram-collaboration-access-list,
+.diagram-collaboration-members {
+  overflow: hidden;
+  border: 1px solid var(--diagram-apple-line);
+  border-radius: 8px;
+  background: var(--diagram-apple-surface);
+}
+
+.diagram-collaboration-access-row,
+.diagram-collaboration-member {
+  min-height: 42px;
+  justify-content: space-between;
+  padding: 5px 8px;
+}
+
+.diagram-collaboration-access-row + .diagram-collaboration-access-row,
+.diagram-collaboration-member + .diagram-collaboration-member {
+  border-top: 1px solid var(--diagram-apple-line);
+}
+
+.diagram-collaboration-member.is-current {
+  background: var(--diagram-apple-blue-soft);
+}
+
+.diagram-collaboration-avatar {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--diagram-apple-line);
+  border-radius: 999px;
+  background: var(--diagram-apple-surface-soft);
+  color: var(--diagram-apple-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.diagram-collaboration-member.is-current .diagram-collaboration-avatar {
+  border-color: color-mix(in srgb, var(--diagram-apple-blue) 20%, transparent);
+  background: var(--diagram-apple-blue);
+  color: #ffffff;
+}
+
+.diagram-collaboration-online-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #30a46c 14%, transparent);
+}
+
+.diagram-collaboration-feedback {
+  margin-top: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--diagram-apple-line);
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.diagram-collaboration-feedback.is-success {
+  border-color: color-mix(in srgb, #30a46c 30%, var(--diagram-apple-line));
+  background: color-mix(in srgb, #30a46c 8%, var(--diagram-apple-surface));
+  color: color-mix(in srgb, #15803d 82%, var(--diagram-apple-ink));
+}
+
+.diagram-collaboration-feedback.is-error {
+  border-color: color-mix(in srgb, #dc2626 30%, var(--diagram-apple-line));
+  background: color-mix(in srgb, #dc2626 7%, var(--diagram-apple-surface));
+  color: color-mix(in srgb, #b91c1c 82%, var(--diagram-apple-ink));
+}
+
+@media (max-width: 420px) {
+  .diagram-collaboration-panel .diagram-collaboration-action {
+    padding-inline: 6px !important;
+  }
+
+  .diagram-collaboration-permissions > div {
+    grid-template-columns: auto minmax(96px, 1fr) !important;
+  }
+
+  .diagram-collaboration-permissions > div > button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
 }
 
 .diagram-apple-search,
@@ -3404,6 +3849,63 @@ body {
 
 .diagram-apple-canvas {
   caret-color: var(--diagram-apple-blue);
+}
+
+.diagram-apple :where(.diagram-apple-canvas, .diagram-apple-library, .diagram-apple-inspector, .diagram-apple-collaboration) {
+  scrollbar-color: color-mix(in srgb, var(--diagram-apple-muted) 42%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+.diagram-apple :where(.diagram-apple-canvas, .diagram-apple-library, .diagram-apple-inspector, .diagram-apple-collaboration)::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.diagram-apple :where(.diagram-apple-canvas, .diagram-apple-library, .diagram-apple-inspector, .diagram-apple-collaboration)::-webkit-scrollbar-track,
+.diagram-apple :where(.diagram-apple-canvas, .diagram-apple-library, .diagram-apple-inspector, .diagram-apple-collaboration)::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.diagram-apple :where(.diagram-apple-canvas, .diagram-apple-library, .diagram-apple-inspector, .diagram-apple-collaboration)::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--diagram-apple-muted) 42%, transparent);
+  background-clip: content-box;
+}
+
+.diagram-apple *::-webkit-scrollbar-button,
+.diagram-apple *::-webkit-scrollbar-button:single-button {
+  display: none;
+  width: 0;
+  height: 0;
+  -webkit-appearance: none;
+}
+
+.diagram-cubic-control-guide,
+.diagram-cubic-control-guide * {
+  pointer-events: none !important;
+}
+
+.diagram-cubic-control-guide path {
+  vector-effect: non-scaling-stroke;
+}
+
+.diagram-cubic-control-handle {
+  filter: drop-shadow(0 1px 2px rgba(15, 23, 42, 0.24));
+}
+
+.diagram-rotation-handle {
+  opacity: 0.78;
+  transition: opacity 120ms ease;
+}
+
+.diagram-rotation-handle:hover {
+  opacity: 1;
+}
+
+.diagram-rotation-handle ellipse,
+.diagram-rotation-handle path:not([visibility="hidden"]) {
+  vector-effect: non-scaling-stroke;
 }
 
 .diagram-apple-canvas > div.mxRubberband {
@@ -3496,5 +3998,93 @@ body {
 
   .diagram-apple-page-tab {
     padding-inline: 12px !important;
+  }
+}
+
+/* NAT detection keeps its motion budget in one place: the browser/STUN probe orb. */
+.nat-detect-orb {
+  border-color: color-mix(in srgb, var(--app-apple-blue) 42%, var(--app-apple-line));
+  color: var(--app-apple-blue);
+  background:
+    radial-gradient(circle at 34% 26%, rgba(255, 255, 255, 0.92), transparent 34%),
+    color-mix(in srgb, var(--app-apple-blue) 10%, var(--app-apple-surface));
+  box-shadow:
+    0 18px 46px color-mix(in srgb, var(--app-apple-blue) 18%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+.dark .nat-detect-orb {
+  background:
+    radial-gradient(circle at 34% 26%, rgba(255, 255, 255, 0.13), transparent 35%),
+    color-mix(in srgb, var(--app-apple-blue) 14%, var(--app-apple-surface));
+  box-shadow:
+    0 20px 52px color-mix(in srgb, var(--app-apple-blue) 20%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.nat-detect-orb[data-state="checking"] {
+  border-color: var(--app-apple-blue);
+  box-shadow:
+    0 0 0 8px var(--app-apple-blue-soft),
+    0 18px 48px color-mix(in srgb, var(--app-apple-blue) 24%, transparent);
+}
+
+.nat-detect-orbit {
+  animation: nat-orbit-breathe 2.6s cubic-bezier(0.22, 1, 0.36, 1) 2;
+}
+
+.nat-detect-orbit-secondary {
+  animation: nat-orbit-counter 5.2s linear 2;
+}
+
+.nat-detect-orb[data-state="checking"] .nat-detect-orbit {
+  animation: nat-orbit-spin 2.8s linear infinite;
+}
+
+.nat-detect-orb[data-state="checking"] .nat-detect-orbit-secondary {
+  animation: nat-orbit-counter 4.6s linear infinite;
+}
+
+.nat-detect-progress-indeterminate {
+  animation: nat-progress-spin 1.35s linear infinite;
+}
+
+.nat-result-reveal {
+  animation: nat-result-reveal 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes nat-orbit-breathe {
+  0%, 100% { opacity: 0.34; transform: scale(0.96); }
+  48% { opacity: 0.86; transform: scale(1.035); }
+}
+
+@keyframes nat-orbit-spin {
+  from { opacity: 0.44; transform: rotate(0deg); }
+  50% { opacity: 0.86; }
+  to { opacity: 0.44; transform: rotate(360deg); }
+}
+
+@keyframes nat-orbit-counter {
+  from { opacity: 0.28; transform: rotate(360deg) scale(0.98); }
+  50% { opacity: 0.62; }
+  to { opacity: 0.28; transform: rotate(0deg) scale(1.02); }
+}
+
+@keyframes nat-progress-spin {
+  from { transform: rotate(-90deg); }
+  to { transform: rotate(270deg); }
+}
+
+@keyframes nat-result-reveal {
+  from { opacity: 0; transform: translateY(8px) scale(0.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nat-detect-orbit,
+  .nat-detect-orbit-secondary,
+  .nat-detect-progress-indeterminate,
+  .nat-result-reveal {
+    animation: none !important;
   }
 }

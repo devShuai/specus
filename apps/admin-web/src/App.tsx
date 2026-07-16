@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useState } from "react";
 import { useAuth } from "./auth/AuthContext";
 import { tokenStore } from "./api/client";
 
@@ -49,6 +49,27 @@ export function App() {
       window.removeEventListener("popstate", syncPublicRoute);
     };
   }, []);
+
+  useLayoutEffect(() => {
+    if (publicRoute !== "diagram") return;
+    const root = window.document.documentElement;
+    const body = window.document.body;
+    const previousRootOverflow = root.style.overflow;
+    const previousScrollbarGutter = root.style.getPropertyValue("scrollbar-gutter");
+    const previousBodyOverflow = body.style.overflow;
+    const previousOverscrollBehavior = body.style.overscrollBehavior;
+    root.style.overflow = "hidden";
+    root.style.setProperty("scrollbar-gutter", "auto");
+    body.style.overflow = "hidden";
+    body.style.overscrollBehavior = "none";
+    return () => {
+      root.style.overflow = previousRootOverflow;
+      if (previousScrollbarGutter) root.style.setProperty("scrollbar-gutter", previousScrollbarGutter);
+      else root.style.removeProperty("scrollbar-gutter");
+      body.style.overflow = previousBodyOverflow;
+      body.style.overscrollBehavior = previousOverscrollBehavior;
+    };
+  }, [publicRoute]);
 
   if (publicRoute === "nat-detect") {
     return (

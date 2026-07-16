@@ -54,6 +54,9 @@ import type {
   TrafficUsage,
   Tunnel,
   TunnelMutation,
+  UserDiagramDocument,
+  UserDiagramDocumentDetail,
+  UserDiagramDocumentMutation,
 } from "./types";
 
 const ADMIN_PREFIX = "/api/admin";
@@ -235,6 +238,14 @@ export const adminApi = {
   updateUser: (username: string, body: ManagementUserMutation) =>
     request<ManagementUser>(`/users/${encodeURIComponent(username)}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteUser: (username: string) => request<null>(`/users/${encodeURIComponent(username)}`, { method: "DELETE" }),
+
+  listDiagrams: () => request<UserDiagramDocument[]>("/diagrams"),
+  getDiagram: (id: number) => request<UserDiagramDocumentDetail>(`/diagrams/${id}`),
+  createDiagram: (body: UserDiagramDocumentMutation) =>
+    request<UserDiagramDocument>("/diagrams", { method: "POST", body: JSON.stringify(body) }),
+  updateDiagram: (id: number, body: UserDiagramDocumentMutation) =>
+    request<UserDiagramDocument>(`/diagrams/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteDiagram: (id: number) => request<null>(`/diagrams/${id}`, { method: "DELETE" }),
 
   listClients: () => request<Client[]>("/clients"),
   createClient: (body: ClientMutation) =>
@@ -484,7 +495,7 @@ export async function publicCheckTransferClientNameAvailability(
   const text = await response.text();
   const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new ApiError(body?.error || response.statusText);
+    throw new ApiError(body?.error || body?.detail || body?.message || response.statusText);
   }
   return body as PublicTransferClientNameAvailability;
 }

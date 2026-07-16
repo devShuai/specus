@@ -1665,79 +1665,72 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   }, []);
 
   if (isDiagramWorkspace) {
+    const collaborationRoleLabel = effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读";
+    const collaboratorCount = peers.length + 1;
     const collaborationPanel = (
-      <div className="space-y-4 text-zinc-950 dark:text-white">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <Button as="a" href="/transfer" size="sm" radius="sm" variant="flat">互传</Button>
-            <Button as="a" href="/" size="sm" radius="sm" variant="light">控制台</Button>
-          </div>
-          <ThemeToggleButton className="text-zinc-700 dark:text-zinc-200" />
-        </div>
-
-        <section className="rounded-xl border border-black/[0.07] bg-white p-3 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.035]">
-          <div className="flex items-start justify-between gap-3">
+      <div className="diagram-collaboration-panel text-zinc-950 dark:text-white">
+        <section className="diagram-collaboration-overview" aria-label="当前协作状态">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <span
+              className={`diagram-collaboration-status-dot ${peers.length > 0 ? "is-connected" : ""}`}
+              aria-hidden="true"
+            />
             <div className="min-w-0">
-              <div className="text-small font-semibold">当前协作</div>
-              <div className="mt-1 truncate font-mono text-tiny text-zinc-500 dark:text-zinc-400">{roomId}</div>
+              <div className="flex min-w-0 items-center gap-2">
+                <strong className="truncate text-[13px] font-semibold">{roomId}</strong>
+                <span className="diagram-collaboration-role">{collaborationRoleLabel}</span>
+              </div>
+              <div className="mt-0.5 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
+                {isInternetMode ? "外网协作房间" : "内网协作房间"} · {peers.length > 0 ? "协作者在线" : "等待协作者加入"}
+              </div>
             </div>
-            <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "success" : "default"}>
-              {peers.length > 0 ? `${peers.length + 1} 人在线` : "仅本机"}
-            </Chip>
           </div>
-          <div className="mt-3 flex items-center justify-between gap-2 text-tiny text-zinc-500 dark:text-zinc-400">
-            <span>{isInternetMode ? "外网 Token 房间" : "内网直连房间"}</span>
-            <Chip size="sm" radius="sm" variant="flat" color={effectiveRoomRole === "OWNER" ? "primary" : effectiveRoomRole === "EDITOR" ? "success" : "default"}>
-              {effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读访客"}
-            </Chip>
-          </div>
+          <span className="diagram-collaboration-count">{collaboratorCount} 人</span>
         </section>
 
-        <section>
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <h3 className="text-small font-semibold">连接方式</h3>
-            <span className="text-tiny text-zinc-400">默认内网</span>
+        <section className="diagram-collaboration-section">
+          <div className="diagram-collaboration-section-heading">
+            <h3>连接与房间</h3>
+            <span>{isInternetMode ? "外网" : "内网"}</span>
           </div>
-          <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="流程图协作网络模式">
-            <NetworkModeButton
-              mode="lan"
-              activeMode={networkMode}
-              label="内网"
-              detail="同一网络发现，仅设备直连"
-              onSelect={updateNetworkMode}
-            />
-            <NetworkModeButton
-              mode="internet"
-              activeMode={networkMode}
-              label="外网"
-              detail="Token 隔离，支持中继兜底"
-              onSelect={updateNetworkMode}
-            />
+          <div className="diagram-collaboration-network" role="radiogroup" aria-label="流程图协作网络模式">
+            {([
+              ["lan", "内网", "同网协作"],
+              ["internet", "外网", "跨网协作"],
+            ] as const).map(([mode, label, detail]) => {
+              const active = networkMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  className={active ? "is-active" : ""}
+                  onClick={() => updateNetworkMode(mode)}
+                >
+                  <span>{label}</span>
+                  <small>{detail}</small>
+                </button>
+              );
+            })}
           </div>
-        </section>
-
-        <section className="rounded-xl border border-black/[0.07] bg-white p-3 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.035]">
-          <div className="flex items-center justify-between gap-2">
-            <h3 className="text-small font-semibold">房间设置</h3>
-            <button
-              type="button"
-              className="max-w-48 truncate rounded-md bg-black/[0.035] px-2 py-1 font-mono text-[10px] text-zinc-500 hover:text-cyan-700 dark:bg-white/[0.05] dark:text-zinc-400 dark:hover:text-cyan-200"
-              onClick={() => void copyText(displayName).then(() => setNotice("客户端名称已复制")).catch((err) => setError(err instanceof Error ? err.message : "复制客户端名称失败"))}
-            >
-              {displayName}
-            </button>
-          </div>
-          <div className="mt-3 space-y-3">
-            <ClientNameSettings
-              inputId="diagram-client-name-input"
-              value={displayNameDraft}
-              onValueChange={setDisplayNameDraft}
-              status={clientNameStatus}
-              localError={clientNameLocalError}
-              isSaving={clientNameSaving}
-              onApply={() => void applyClientName()}
-            />
+          <div className="mt-2.5 space-y-2.5">
+            <div className="diagram-collaboration-client-name">
+              <ClientNameSettings
+                compact
+                inputId="diagram-client-name-input"
+                value={displayNameDraft}
+                onValueChange={setDisplayNameDraft}
+                status={clientNameStatus}
+                localError={clientNameLocalError}
+                isSaving={clientNameSaving}
+                onApply={() => void applyClientName()}
+              />
+            </div>
             <Input
+              className="diagram-collaboration-input-root"
+              classNames={{ inputWrapper: "diagram-collaboration-input" }}
+              size="sm"
               label="房间名"
               radius="sm"
               variant="bordered"
@@ -1747,54 +1740,61 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               isInvalid={Boolean(roomSettingsErrors.roomId)}
               errorMessage={roomSettingsErrors.roomId}
             />
-            <Input
-              label="房间 Token"
-              radius="sm"
-              variant="bordered"
-              value={roomTokenDraft}
-              onValueChange={updateRoomTokenDraft}
-              maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH}
-              isDisabled={!isInternetMode}
-              isInvalid={Boolean(roomSettingsErrors.roomToken)}
-              errorMessage={roomSettingsErrors.roomToken}
-              description={isInternetMode ? "外网设备凭此 Token 加入隔离房间" : "内网模式不使用 Token"}
-              endContent={
-                <Button size="sm" variant="light" isDisabled={!isInternetMode} onPress={() => updateRoomTokenDraft(createRoomToken())}>
-                  生成
-                </Button>
-              }
-            />
-            <RoomPermissionSetting
-              networkMode={networkMode}
-              currentRole={effectiveRoomRole}
-              inviteRole={roomInviteRole}
-              canManage={isInternetMode && roomRole === "OWNER"}
-              isLoading={roomAccessLoading}
-              onInviteRoleChange={setRoomInviteRole}
-              onCreateInvite={() => void createRoomAccess(roomInviteRole)}
-            />
+            {isInternetMode ? (
+              <Input
+                className="diagram-collaboration-input-root"
+                classNames={{ inputWrapper: "diagram-collaboration-input" }}
+                size="sm"
+                label="房间 Token"
+                radius="sm"
+                variant="bordered"
+                value={roomTokenDraft}
+                onValueChange={updateRoomTokenDraft}
+                maxLength={MAX_TRANSFER_ROOM_TOKEN_LENGTH}
+                isInvalid={Boolean(roomSettingsErrors.roomToken)}
+                errorMessage={roomSettingsErrors.roomToken}
+                endContent={
+                  <Button className="diagram-collaboration-inline-action" size="sm" variant="light" onPress={() => updateRoomTokenDraft(createRoomToken())}>
+                    生成
+                  </Button>
+                }
+              />
+            ) : null}
+            <div className="diagram-collaboration-permissions">
+              <RoomPermissionSetting
+                compact
+                context="diagram"
+                networkMode={networkMode}
+                currentRole={effectiveRoomRole}
+                inviteRole={roomInviteRole}
+                canManage={isInternetMode && roomRole === "OWNER"}
+                isLoading={roomAccessLoading}
+                onInviteRoleChange={setRoomInviteRole}
+                onCreateInvite={() => void createRoomAccess(roomInviteRole)}
+              />
+            </div>
           </div>
-          <div className="mt-3 flex justify-end gap-2">
-            <Button size="sm" radius="sm" variant="light" onPress={resetRoomSettingsDraft}>恢复</Button>
-            <Button size="sm" radius="sm" color="primary" variant="flat" onPress={applyRoomSettings}>应用设置</Button>
+          <div className="mt-2.5 flex justify-end gap-1.5">
+            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="light" onPress={resetRoomSettingsDraft}>恢复</Button>
+            <Button className="diagram-collaboration-action is-primary" size="sm" radius="sm" color="primary" variant="flat" onPress={applyRoomSettings}>应用设置</Button>
           </div>
         </section>
 
-        <section>
-          <h3 className="text-small font-semibold">邀请协作者</h3>
-          <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-            {isInternetMode ? "邀请链接会携带当前 Token，可跨网络加入。" : "邀请设备需连接同一内网，链接不包含 Token。"}
-          </p>
-          <div className="mt-3 grid grid-cols-2 gap-2">
-            <Button size="sm" color="primary" radius="sm" variant="flat" onPress={() => void shareRoom()}>系统分享</Button>
-            <Button size="sm" radius="sm" variant="flat" onPress={() => void copyRoomLink()}>复制链接</Button>
-            <Button size="sm" color={qrVisible ? "default" : "secondary"} radius="sm" variant="flat" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
-              {qrVisible ? "收起二维码" : "显示二维码"}
+        <section className="diagram-collaboration-section">
+          <div className="diagram-collaboration-section-heading">
+            <h3>邀请协作者</h3>
+            <span>{isInternetMode ? "可跨网络加入" : "限同一内网"}</span>
+          </div>
+          <div className="mt-2 grid grid-cols-4 gap-1.5">
+            <Button className="diagram-collaboration-action is-primary" size="sm" color="primary" radius="sm" variant="flat" onPress={() => void shareRoom()}>分享</Button>
+            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="flat" onPress={() => void copyRoomLink()}>复制链接</Button>
+            <Button className={`diagram-collaboration-action ${qrVisible ? "is-active" : ""}`} size="sm" radius="sm" variant="flat" onPress={() => qrVisible ? setQrVisible(false) : showRoomQr()}>
+              {qrVisible ? "收起二维码" : "二维码"}
             </Button>
-            <Button size="sm" radius="sm" variant="flat" onPress={createNewRoom}>新房间</Button>
+            <Button className="diagram-collaboration-action" size="sm" radius="sm" variant="flat" onPress={createNewRoom}>新房间</Button>
           </div>
           {qrVisible ? (
-            <div className="mt-3 rounded-xl border border-cyan-500/20 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-300/[0.06]">
+            <div className="diagram-collaboration-qr mt-2.5">
               <RoomQrCode value={roomJoinUrl} />
               <div className="mt-2 break-all text-center font-mono text-[9px] leading-4 text-zinc-500 dark:text-zinc-400">{roomJoinUrl}</div>
             </div>
@@ -1802,29 +1802,27 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         </section>
 
         {isInternetMode && roomRole === "OWNER" ? (
-          <section className="rounded-xl border border-violet-500/20 bg-violet-50/60 p-3 dark:border-violet-300/20 dark:bg-violet-300/[0.06]">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <h3 className="text-small font-semibold">权限邀请记录</h3>
-                <p className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">管理已经生成的编辑或只读邀请</p>
-              </div>
+          <section className="diagram-collaboration-section">
+            <div className="diagram-collaboration-section-heading">
+              <h3>权限链接</h3>
+              <span>{roomAccessTokens.length} 个</span>
             </div>
             {createdRoomAccess ? (
-              <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-50/80 p-2.5 dark:border-amber-300/20 dark:bg-amber-300/10">
-                <div className="text-tiny text-amber-900 dark:text-amber-100">{createdRoomAccess.access.label} · 明文 Token 仅显示一次</div>
-                <Button className="mt-2" size="sm" radius="sm" color="warning" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制邀请链接</Button>
+              <div className="diagram-collaboration-created-access mt-2">
+                <span className="min-w-0 truncate">{createdRoomAccess.access.label} · Token 仅显示一次</span>
+                <Button className="diagram-collaboration-action shrink-0" size="sm" radius="sm" variant="flat" onPress={() => void copyCreatedRoomAccessLink()}>复制</Button>
               </div>
             ) : null}
-            <div className="mt-3 space-y-1.5">
+            <div className="diagram-collaboration-access-list mt-1.5">
               {roomAccessTokens.length === 0 ? (
-                <div className="text-tiny text-zinc-400">{roomAccessLoading ? "正在加载邀请…" : "暂无角色邀请"}</div>
+                <div className="py-2 text-tiny text-zinc-400">{roomAccessLoading ? "正在加载邀请…" : "暂无权限链接"}</div>
               ) : roomAccessTokens.map((access) => (
-                <div key={access.id} className="flex items-center justify-between gap-2 rounded-lg border border-black/10 bg-white/60 px-2.5 py-2 dark:border-white/10 dark:bg-black/10">
+                <div key={access.id} className="diagram-collaboration-access-row">
                   <div className="min-w-0">
                     <div className="truncate text-tiny font-medium">{access.label}</div>
                     <div className="mt-0.5 text-[10px] text-zinc-400">{access.role === "EDITOR" ? "可编辑" : "只读"} · {access.revokedAt ? "已撤销" : "有效"}</div>
                   </div>
-                  <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>
+                  <Button className="diagram-collaboration-action shrink-0" size="sm" radius="sm" color="danger" variant="light" isDisabled={Boolean(access.revokedAt) || roomAccessLoading} onPress={() => void revokeRoomAccess(access)}>
                     {access.revokedAt ? "已撤销" : "撤销"}
                   </Button>
                 </div>
@@ -1833,30 +1831,36 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           </section>
         ) : null}
 
-        <section>
-          <div className="flex items-center justify-between gap-2">
-            <h3 className="text-small font-semibold">在线成员</h3>
-            <Chip size="sm" radius="sm" variant="flat">{peers.length + 1} 人</Chip>
+        <section className="diagram-collaboration-section">
+          <div className="diagram-collaboration-section-heading">
+            <h3>在线成员</h3>
+            <span>{collaboratorCount} 人</span>
           </div>
-          <div className="mt-2 space-y-1.5">
-            <div className="rounded-lg border border-cyan-500/20 bg-cyan-50/70 px-3 py-2 dark:border-cyan-300/20 dark:bg-cyan-300/[0.06]">
-              <div className="text-tiny font-medium">当前设备</div>
-              <div className="mt-0.5 truncate text-tiny text-zinc-500 dark:text-zinc-400">{displayName}</div>
+          <div className="diagram-collaboration-members mt-1.5">
+            <div className="diagram-collaboration-member is-current">
+              <span className="diagram-collaboration-avatar">我</span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-tiny font-medium">{displayName}</div>
+                <div className="text-[10px] text-zinc-500 dark:text-zinc-400">当前设备</div>
+              </div>
+              <span className="diagram-collaboration-online-dot" aria-label="在线" />
             </div>
             {peers.map((peer) => (
-              <div key={peer.peerId} className="rounded-lg border border-black/[0.07] bg-white px-3 py-2 dark:border-white/[0.08] dark:bg-white/[0.035]">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-tiny font-medium">{discoveryPeerDisplayName(peer)}</span>
-                  <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-label="在线" />
+              <div key={peer.peerId} className="diagram-collaboration-member">
+                <span className="diagram-collaboration-avatar">{discoveryPeerDisplayName(peer).slice(0, 1).toUpperCase()}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-tiny font-medium">{discoveryPeerDisplayName(peer)}</div>
+                  <div className="text-[10px] text-zinc-500 dark:text-zinc-400">协作者</div>
                 </div>
+                <span className="diagram-collaboration-online-dot" aria-label="在线" />
               </div>
             ))}
-            {peers.length === 0 ? <div className="py-2 text-center text-tiny text-zinc-400">暂无其他协作者</div> : null}
+            {peers.length === 0 ? <div className="py-2 text-center text-[10px] text-zinc-400">暂无其他协作者</div> : null}
           </div>
         </section>
 
-        {notice ? <div className="rounded-lg border border-emerald-500/20 bg-emerald-50 px-3 py-2 text-tiny text-emerald-800 dark:border-emerald-300/20 dark:bg-emerald-300/10 dark:text-emerald-100">{notice}</div> : null}
-        {error ? <div className="rounded-lg border border-red-500/20 bg-red-50 px-3 py-2 text-tiny text-red-700 dark:border-red-300/20 dark:bg-red-300/10 dark:text-red-100">{error}</div> : null}
+        {notice ? <div className="diagram-collaboration-feedback is-success">{notice}</div> : null}
+        {error ? <div className="diagram-collaboration-feedback is-error">{error}</div> : null}
       </div>
     );
 
@@ -1894,9 +1898,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="public-header-actions flex shrink-0 items-center gap-2">
           <PublicToolsMenu active={workspace} />
-          <a href="/" className="public-header-button public-header-console">
-            控制台
-          </a>
           <ThemeToggleButton className="public-header-theme-button" />
         </div>
       </header>
@@ -2431,6 +2432,7 @@ function ClientNameSettings({
 
 function RoomPermissionSetting({
   compact = false,
+  context = "transfer",
   networkMode,
   currentRole,
   inviteRole,
@@ -2440,6 +2442,7 @@ function RoomPermissionSetting({
   onCreateInvite,
 }: {
   compact?: boolean;
+  context?: "transfer" | "diagram";
   networkMode: TransferNetworkMode;
   currentRole: PublicTransferRoomRole;
   inviteRole: TransferInviteRole;
@@ -2451,6 +2454,8 @@ function RoomPermissionSetting({
   const isInternetMode = networkMode === "internet";
   const currentRoleLabel = currentRole === "OWNER" ? "房主" : currentRole === "EDITOR" ? "可编辑" : "只读";
   const displayedRole = canManage ? inviteRole : currentRole === "VIEWER" ? "VIEWER" : "EDITOR";
+  const editorRoleDetail = context === "diagram" ? "编辑画布、评论和版本" : "发送文件、剪贴板和白板";
+  const viewerRoleDetail = context === "diagram" ? "查看画布和协作更新" : "仅查看和接收房间内容";
   const description = !isInternetMode
     ? "内网房间默认允许编辑；切换到外网模式后，可以为邀请链接设置可编辑或只读权限。"
     : canManage
@@ -2532,7 +2537,7 @@ function RoomPermissionSetting({
             onClick={() => onInviteRoleChange("EDITOR")}
           >
             <span className="block text-small font-semibold">可编辑</span>
-            <span className="mt-0.5 block text-[10px] leading-4 opacity-75">发送文件、剪贴板和白板</span>
+            <span className="mt-0.5 block text-[10px] leading-4 opacity-75">{editorRoleDetail}</span>
           </button>
           <button
             type="button"
@@ -2543,7 +2548,7 @@ function RoomPermissionSetting({
             onClick={() => onInviteRoleChange("VIEWER")}
           >
             <span className="block text-small font-semibold">只读</span>
-            <span className="mt-0.5 block text-[10px] leading-4 opacity-75">仅查看和接收房间内容</span>
+            <span className="mt-0.5 block text-[10px] leading-4 opacity-75">{viewerRoleDetail}</span>
           </button>
         </div>
         {canManage ? (
@@ -2562,37 +2567,6 @@ function RoomPermissionSetting({
       </div>
       <p className="mt-2 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">{description}</p>
     </div>
-  );
-}
-
-function NetworkModeButton({
-  mode,
-  activeMode,
-  label,
-  detail,
-  onSelect,
-}: {
-  mode: TransferNetworkMode;
-  activeMode: TransferNetworkMode;
-  label: string;
-  detail: string;
-  onSelect: (mode: TransferNetworkMode) => void;
-}) {
-  const active = mode === activeMode;
-  return (
-    <button
-      type="button"
-      role="radio"
-      aria-checked={active}
-      className={`app-apple-tool-choice px-3 py-2.5 text-left transition-colors ${active ? "is-active" : ""}`}
-      onClick={() => onSelect(mode)}
-    >
-      <span className="flex items-center justify-between gap-2 text-small font-semibold">
-        {label}
-        {active && <span className="text-[10px] text-primary-700 dark:text-primary-400">当前</span>}
-      </span>
-      <span className="mt-1 block text-tiny leading-5 text-zinc-500 dark:text-zinc-400">{detail}</span>
-    </button>
   );
 }
 
