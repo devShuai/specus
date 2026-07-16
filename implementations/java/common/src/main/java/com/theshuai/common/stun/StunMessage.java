@@ -34,9 +34,11 @@ public final class StunMessage {
     public static final int DATA_INDICATION = 0x0017;
 
     public static final int ATTR_MAPPED_ADDRESS = 0x0001;
+    public static final int ATTR_CHANGE_REQUEST = 0x0003;
     public static final int ATTR_USERNAME = 0x0006;
     public static final int ATTR_MESSAGE_INTEGRITY = 0x0008;
     public static final int ATTR_ERROR_CODE = 0x0009;
+    public static final int ATTR_UNKNOWN_ATTRIBUTES = 0x000A;
     public static final int ATTR_LIFETIME = 0x000D;
     public static final int ATTR_XOR_PEER_ADDRESS = 0x0012;
     public static final int ATTR_DATA = 0x0013;
@@ -221,8 +223,16 @@ public final class StunMessage {
         return attributes.stream().filter(attribute -> attribute.type() == type).findFirst();
     }
 
+    public boolean hasAttribute(int type) {
+        return attributes.stream().anyMatch(attribute -> attribute.type() == type);
+    }
+
     public List<Attribute> all(int type) {
         return attributes.stream().filter(attribute -> attribute.type() == type).toList();
+    }
+
+    public Optional<InetSocketAddress> mappedAddress() {
+        return first(ATTR_MAPPED_ADDRESS).flatMap(this::decodeAddress);
     }
 
     public Optional<InetSocketAddress> xorMappedAddress() {
@@ -237,8 +247,53 @@ public final class StunMessage {
         return first(ATTR_XOR_PEER_ADDRESS).flatMap(this::decodeXorAddress);
     }
 
+    public Optional<InetSocketAddress> responseOrigin() {
+        return first(ATTR_RESPONSE_ORIGIN).flatMap(this::decodeAddress);
+    }
+
     public Optional<InetSocketAddress> otherAddress() {
+        return first(ATTR_OTHER_ADDRESS).flatMap(this::decodeAddress);
+    }
+
+    public Optional<InetSocketAddress> legacyXorResponseOrigin() {
+        return first(ATTR_RESPONSE_ORIGIN).flatMap(this::decodeXorAddress);
+    }
+
+    public Optional<InetSocketAddress> legacyXorOtherAddress() {
         return first(ATTR_OTHER_ADDRESS).flatMap(this::decodeXorAddress);
+    }
+
+    public Optional<ChangeRequest> changeRequest() {
+        return first(ATTR_CHANGE_REQUEST)
+                .filter(attribute -> attribute.value().length == Integer.BYTES)
+                .map(attribute -> {
+                    int flags = ByteBuffer.wrap(attribute.value()).getInt();
+                    return new ChangeRequest((flags & 0x04) != 0, (flags & 0x02) != 0);
+                });
+    }
+
+    public int errorCode() {
+        return first(ATTR_ERROR_CODE)
+                .filter(attribute -> attribute.value().length >= 4)
+                .map(attribute -> {
+                    byte[] value = attribute.value();
+                    return (value[2] & 0x07) * 100 + (value[3] & 0xFF);
+                })
+                .orElse(-1);
+    }
+
+    public List<Integer> unknownAttributes() {
+        return first(ATTR_UNKNOWN_ATTRIBUTES)
+                .map(attribute -> {
+                    byte[] value = attribute.value();
+                    List<Integer> result = new ArrayList<>(value.length / Short.BYTES);
+                    ByteBuffer buffer = ByteBuffer.wrap(value);
+                    while (buffer.remaining() >= Short.BYTES) {
+                        result.add(Short.toUnsignedInt(buffer.getShort()));
+                    }
+                    return List.copyOf(result);
+                })
+                .orElseGet(List::of);
     }
 
     public Optional<byte[]> data() {
@@ -302,6 +357,32 @@ public final class StunMessage {
         }
     }
 
+    private Optional<InetSocketAddress> decodeAddress(Attribute attribute) {
+        byte[] value = attribute.value();
+        if (value.length != 8 && value.length != 20) {
+            return Optional.empty();
+        }
+        int family = value[1] & 0xFF;
+        int port = Short.toUnsignedInt(ByteBuffer.wrap(value, 2, Short.BYTES).getShort());
+        try {
+            byte[] address;
+            if (family == 0x01 && value.length == 8) {
+                address = Arrays.copyOfRange(value, 4, 8);
+            } else if (family == 0x02 && value.length == 20) {
+                address = Arrays.copyOfRange(value, 4, 20);
+            } else {
+                return Optional.empty();
+            }
+            return Optional.of(new InetSocketAddress(InetAddress.getByAddress(address), port));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    public static Attribute mappedAddress(InetSocketAddress address) {
+        return new Attribute(ATTR_MAPPED_ADDRESS, encodeAddress(address));
+    }
+
     public static Attribute xorMappedAddress(InetSocketAddress address, byte[] transactionId) {
         return new Attribute(ATTR_XOR_MAPPED_ADDRESS, encodeXorAddress(address, transactionId));
     }
@@ -314,8 +395,26 @@ public final class StunMessage {
         return new Attribute(ATTR_XOR_PEER_ADDRESS, encodeXorAddress(address, transactionId));
     }
 
-    public static Attribute otherAddress(InetSocketAddress address, byte[] transactionId) {
-        return new Attribute(ATTR_OTHER_ADDRESS, encodeXorAddress(address, transactionId));
+    public static Attribute responseOrigin(InetSocketAddress address) {
+        return new Attribute(ATTR_RESPONSE_ORIGIN, encodeAddress(address));
+    }
+
+    public static Attribute otherAddress(InetSocketAddress address) {
+        return new Attribute(ATTR_OTHER_ADDRESS, encodeAddress(address));
+    }
+
+    public static Attribute changeRequest(boolean changeIp, boolean changePort) {
+        int flags = (changeIp ? 0x04 : 0) | (changePort ? 0x02 : 0);
+        return new Attribute(ATTR_CHANGE_REQUEST, ByteBuffer.allocate(Integer.BYTES).putInt(flags).array());
+    }
+
+    public static Attribute unknownAttributes(int... types) {
+        int[] normalized = types == null ? new int[0] : types;
+        ByteBuffer buffer = ByteBuffer.allocate(normalized.length * Short.BYTES);
+        for (int type : normalized) {
+            buffer.putShort((short) (type & 0xFFFF));
+        }
+        return new Attribute(ATTR_UNKNOWN_ATTRIBUTES, buffer.array());
     }
 
     public static Attribute data(byte[] payload) {
@@ -359,6 +458,24 @@ public final class StunMessage {
         buffer.put((byte) number);
         buffer.put(reasonBytes);
         return new Attribute(ATTR_ERROR_CODE, buffer.array());
+    }
+
+    public static byte[] encodeAddress(InetSocketAddress address) {
+        if (address == null || address.getAddress() == null) {
+            throw new IllegalArgumentException("address is required");
+        }
+        byte[] raw = address.getAddress().getAddress();
+        byte family = switch (raw.length) {
+            case 4 -> 0x01;
+            case 16 -> 0x02;
+            default -> throw new IllegalArgumentException("unsupported address family");
+        };
+        ByteBuffer buffer = ByteBuffer.allocate(raw.length == 4 ? 8 : 20);
+        buffer.put((byte) 0);
+        buffer.put(family);
+        buffer.putShort((short) address.getPort());
+        buffer.put(raw);
+        return buffer.array();
     }
 
     public static byte[] encodeXorAddress(InetSocketAddress address, byte[] transactionId) {
@@ -430,5 +547,9 @@ public final class StunMessage {
         public Attribute {
             value = value == null ? new byte[0] : Arrays.copyOf(value, value.length);
         }
+    }
+
+    public record ChangeRequest(boolean changeIp, boolean changePort) {
+        public static final ChangeRequest NONE = new ChangeRequest(false, false);
     }
 }

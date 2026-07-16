@@ -25,7 +25,9 @@ public class PublicPeerMeshResource {
     @GetMapping("/api/public/peer-mesh/stun-config")
     public PublicStunConfig stunConfig(HttpServletRequest request) {
         LinkedHashSet<String> servers = new LinkedHashSet<>();
-        String selfHosted = properties.isEnabled() ? selfHostedStunServer(request) : "";
+        String selfHosted = properties.isEnabled() || hasStandaloneStun()
+                ? selfHostedStunServer(request)
+                : "";
         if (StringUtils.hasText(selfHosted)) {
             servers.add(selfHosted);
         }
@@ -80,7 +82,10 @@ public class PublicPeerMeshResource {
     }
 
     private String selfHostedStunServer(HttpServletRequest request) {
-        String host = properties.getPublicAddress();
+        String host = hasStandaloneStun() ? properties.getStandaloneStunAddress() : "";
+        if (!StringUtils.hasText(host)) {
+            host = properties.getPublicAddress();
+        }
         if (!StringUtils.hasText(host)) {
             host = forwardedHost(request);
         }
@@ -88,10 +93,22 @@ public class PublicPeerMeshResource {
             host = request.getServerName();
         }
         host = normalizeHost(host);
-        if (!StringUtils.hasText(host) || properties.getStunTurnPort() <= 0) {
+        int port = selfHostedStunPort();
+        if (!StringUtils.hasText(host) || port <= 0) {
             return "";
         }
-        return "stun:" + bracketIpv6(host) + ":" + properties.getStunTurnPort();
+        return "stun:" + bracketIpv6(host) + ":" + port;
+    }
+
+    private boolean hasStandaloneStun() {
+        return StringUtils.hasText(properties.getStandaloneStunAddress())
+                && properties.getStandaloneStunPort() > 0;
+    }
+
+    private int selfHostedStunPort() {
+        return hasStandaloneStun()
+                ? properties.getStandaloneStunPort()
+                : properties.getStunTurnPort();
     }
 
     private String forwardedHost(HttpServletRequest request) {

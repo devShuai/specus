@@ -30,7 +30,7 @@ GET /api/public/transfer/ice-config
   "peerMeshEnabled": true,
   "iceServers": [
     {
-      "urls": "stun:tunnel.example.com:3478",
+      "urls": "stun:stun.example.com:3478",
       "username": "",
       "credential": ""
     },
@@ -49,25 +49,32 @@ GET /api/public/transfer/ice-config
 
 | 字段 | 语义 |
 | --- | --- |
-| `peerMeshEnabled` | `tunnel.peer-mesh.enabled` 的值；为 `false` 时不生成自托管 STUN/TURN 项 |
+| `peerMeshEnabled` | `tunnel.peer-mesh.enabled` 的值；控制 Peer Mesh 和自托管 TURN，不关闭显式配置的独立 STUN |
 | `iceServers` | WebRTC 风格的有序 ICE server 列表；每项的 `urls` 是单个字符串，不是数组 |
 | `turnAuthRequired` | TURN listener 是否要求长期凭证 |
-| `stunTurnPort` | 对外公布的 STUN/TURN UDP 端口 |
+| `stunTurnPort` | 兼容字段，表示业务服务的 STUN/TURN 主端口；独立 STUN 的实际端口以 `iceServers[].urls` 为准 |
 
 列表顺序必须为：自托管 STUN（若可用）、配置的公共 STUN（保持配置顺序并去重）、自托管 TURN（若可用）。
-配置的公共 STUN 在 `peerMeshEnabled=false` 时仍保留，只有自托管 STUN/TURN 受 enabled 开关控制。
+配置的公共 STUN 在 `peerMeshEnabled=false` 时仍保留。显式配置
+`tunnel.peer-mesh.standalone-stun-address` 后，独立 STUN 也不受 enabled 开关控制；自托管 TURN 仍只在
+`peerMeshEnabled=true` 时生成。
 STUN 项必须返回空 `username` 和空 `credential`；TURN 项返回临时凭证。
 Java 即使在 `turnAuthRequired=false` 时也会给 TURN 项签发非空 username/credential；跨语言实现不得据此删掉字段，
 客户端可以在认证关闭时忽略它们。
 
 ### 1.2 地址选择与规范化
 
-Java 按以下顺序选择自托管地址：
+Java 按以下顺序选择自托管 STUN 地址：
 
-1. `tunnel.peer-mesh.public-address`；
-2. `X-Forwarded-Host` 第一项；
-3. `Host` 第一项；
-4. servlet `serverName`。
+1. `tunnel.peer-mesh.standalone-stun-address`；
+2. `tunnel.peer-mesh.public-address`；
+3. `X-Forwarded-Host` 第一项；
+4. `Host` 第一项；
+5. servlet `serverName`。
+
+只有独立 STUN 地址非空且端口大于 `0` 时才启用独立入口；部分配置会整体回退原入口。启用后使用
+`tunnel.peer-mesh.standalone-stun-port`，否则使用 `tunnel.peer-mesh.stun-turn-port`。TURN 地址不使用
+独立 STUN 配置，仍从 `public-address` 或请求 Host 解析，并始终使用 `stun-turn-port`。
 
 主机名必须去除 scheme、路径和单个 `:port`。IPv6 地址必须用方括号包围。端口必须在
 `1..65535`，配置的公共 STUN 地址未给出有效端口时使用 `3478`。输入 `stun://host`、

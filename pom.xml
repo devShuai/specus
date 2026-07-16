@@ -17,6 +17,7 @@
         <module>implementations/java/common</module>
         <module>implementations/java/client</module>
         <module>implementations/java/server</module>
+        <module>implementations/java/stun-server</module>
     </modules>
 
     <properties>

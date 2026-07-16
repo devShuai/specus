@@ -15,7 +15,13 @@ public class PeerMeshProperties {
     private String cidr = "100.96.0.0/11";
     private String publicAddress = "";
     private int stunTurnPort = 3478;
+    private String standaloneStunAddress = "";
+    private int standaloneStunPort = 3478;
     private int natProbeAlternatePort = 3479;
+    private String stunPrimaryBindAddress = "";
+    private String stunAlternateBindAddress = "";
+    private String stunAlternatePublicAddress = "";
+    private boolean stunBehaviorStrict = false;
     private List<String> publicStunServers = new ArrayList<>();
     private long sessionTtlSeconds = 3600;
     private long allocationTtlSeconds = 300;

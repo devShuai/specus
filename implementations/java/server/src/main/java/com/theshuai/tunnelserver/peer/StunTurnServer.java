@@ -1,6 +1,8 @@
 package com.theshuai.tunnelserver.peer;
 
 import com.theshuai.common.peermesh.PeerDataFrameHeader;
+import com.theshuai.common.stun.StunBindingService;
+import com.theshuai.common.stun.StunEndpointTopology;
 import com.theshuai.common.stun.StunMessage;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.service.PeerMeshService;
@@ -41,8 +43,12 @@ public class StunTurnServer implements ApplicationRunner {
     private final TurnCredentialService turnCredentialService;
     private final Map<String, Allocation> allocations = new ConcurrentHashMap<>();
     private final Map<String, String> allocationByEndpoint = new ConcurrentHashMap<>();
+    private final Map<StunEndpointTopology.EndpointId, DatagramSocket> stunSockets = new ConcurrentHashMap<>();
     private DatagramSocket primarySocket;
-    private DatagramSocket alternateSocket;
+    private StunEndpointTopology stunTopology;
+    private StunBindingService stunBindingService;
+    private InetAddress turnBindAddress;
+    private InetAddress turnAdvertisedAddress;
     private ExecutorService relayExecutor;
     private volatile boolean running;
 
@@ -60,47 +66,116 @@ public class StunTurnServer implements ApplicationRunner {
             return;
         }
         try {
-            primarySocket = new DatagramSocket(properties.getStunTurnPort());
+            configureStunSockets();
             relayExecutor = createRelayExecutor();
             running = true;
-            Thread primaryThread = new Thread(
-                    () -> receiveLoop(primarySocket, "primary"),
-                    "peer-mesh-stun-turn");
-            primaryThread.setDaemon(true);
-            primaryThread.start();
-            startAlternateSocket();
-            log.info("[peer-mesh] standard STUN/TURN UDP server listening on {}", properties.getStunTurnPort());
+            startStunThreads();
+            log.info("[peer-mesh] standard STUN/TURN UDP server listening on {}, rfc5780={}",
+                    stunTopology.endpoints().stream()
+                            .map(endpoint -> endpoint.advertisedAddress().toString())
+                            .toList(),
+                    stunTopology.supportsRfc5780());
         } catch (Exception e) {
+            closeStunSockets();
             log.warn("[peer-mesh] standard STUN/TURN UDP server failed to start on {}: {}",
                     properties.getStunTurnPort(), e.getMessage());
         }
     }
 
-    private void startAlternateSocket() {
+    private void configureStunSockets() throws Exception {
+        int primaryPort = properties.getStunTurnPort();
         int alternatePort = natProbeAlternatePort();
-        if (alternatePort <= 0 || alternatePort == properties.getStunTurnPort()) {
-            return;
+        InetAddress primaryBind = resolveBindAddress(properties.getStunPrimaryBindAddress());
+        InetAddress primaryPublic = resolvePrimaryAdvertisedAddress(primaryBind);
+        boolean alternateRequested = hasText(properties.getStunAlternateBindAddress())
+                || hasText(properties.getStunAlternatePublicAddress());
+        boolean fullConfiguration = hasText(properties.getStunPrimaryBindAddress())
+                && hasText(properties.getStunAlternateBindAddress())
+                && hasText(properties.getStunAlternatePublicAddress())
+                && hasText(properties.getPublicAddress())
+                && alternatePort > 0
+                && alternatePort != primaryPort;
+
+        if (properties.isStunBehaviorStrict() && !fullConfiguration) {
+            throw new IllegalStateException(
+                    "strict RFC 5780 mode requires primary/alternate bind addresses, two public addresses and two ports");
         }
+        if (alternateRequested && !fullConfiguration) {
+            log.warn("[peer-mesh] incomplete RFC 5780 endpoint configuration; falling back to single-IP compatibility mode");
+        }
+
+        if (fullConfiguration) {
+            InetAddress alternateBind = InetAddress.getByName(properties.getStunAlternateBindAddress().trim());
+            InetAddress alternatePublic = InetAddress.getByName(properties.getStunAlternatePublicAddress().trim());
+            stunTopology = StunEndpointTopology.rfc5780(
+                    endpoint(StunEndpointTopology.PRIMARY, primaryBind, primaryPublic, primaryPort),
+                    endpoint(StunEndpointTopology.PRIMARY_ALTERNATE_PORT,
+                            primaryBind, primaryPublic, alternatePort),
+                    endpoint(StunEndpointTopology.ALTERNATE_PRIMARY_PORT,
+                            alternateBind, alternatePublic, primaryPort),
+                    endpoint(StunEndpointTopology.ALTERNATE,
+                            alternateBind, alternatePublic, alternatePort));
+        } else {
+            StunEndpointTopology.Endpoint alternateEndpoint =
+                    alternatePort > 0 && alternatePort != primaryPort
+                            ? endpoint(StunEndpointTopology.PRIMARY_ALTERNATE_PORT,
+                            primaryBind, primaryPublic, alternatePort)
+                            : null;
+            stunTopology = StunEndpointTopology.basic(
+                    endpoint(StunEndpointTopology.PRIMARY, primaryBind, primaryPublic, primaryPort),
+                    alternateEndpoint);
+        }
+
         try {
-            alternateSocket = new DatagramSocket(alternatePort);
-            Thread alternateThread = new Thread(
-                    () -> receiveLoop(alternateSocket, "alternate"),
-                    "peer-mesh-stun-probe-alt");
-            alternateThread.setDaemon(true);
-            alternateThread.start();
-            log.info("[peer-mesh] standard STUN alternate UDP port listening on {}", alternatePort);
+            for (StunEndpointTopology.Endpoint endpoint : stunTopology.endpoints()) {
+                DatagramSocket socket = new DatagramSocket(null);
+                socket.bind(endpoint.bindAddress());
+                stunSockets.put(endpoint.id(), socket);
+            }
         } catch (Exception e) {
-            log.warn("[peer-mesh] standard STUN alternate UDP port {} unavailable: {}", alternatePort, e.getMessage());
+            closeStunSockets();
+            throw e;
+        }
+
+        primarySocket = stunSockets.get(StunEndpointTopology.PRIMARY);
+        turnBindAddress = stunTopology.endpoint(StunEndpointTopology.PRIMARY).bindAddress().getAddress();
+        turnAdvertisedAddress = stunTopology.endpoint(StunEndpointTopology.PRIMARY)
+                .advertisedAddress()
+                .getAddress();
+        stunBindingService = new StunBindingService(
+                stunTopology,
+                SOFTWARE,
+                !stunTopology.supportsRfc5780());
+    }
+
+    private StunEndpointTopology.Endpoint endpoint(StunEndpointTopology.EndpointId id,
+                                                   InetAddress bindAddress,
+                                                   InetAddress advertisedAddress,
+                                                   int port) {
+        return new StunEndpointTopology.Endpoint(
+                id,
+                new InetSocketAddress(bindAddress, port),
+                new InetSocketAddress(advertisedAddress, port));
+    }
+
+    private void startStunThreads() {
+        for (StunEndpointTopology.Endpoint endpoint : stunTopology.endpoints()) {
+            Thread thread = new Thread(
+                    () -> receiveLoop(endpoint.id()),
+                    "peer-mesh-stun-" + endpoint.id());
+            thread.setDaemon(true);
+            thread.start();
         }
     }
 
-    private void receiveLoop(DatagramSocket receiveSocket, String probeRole) {
+    private void receiveLoop(StunEndpointTopology.EndpointId endpointId) {
+        DatagramSocket receiveSocket = stunSockets.get(endpointId);
         byte[] buffer = new byte[65_507];
         while (running && receiveSocket != null && !receiveSocket.isClosed()) {
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             try {
                 receiveSocket.receive(packet);
-                handle(packet, receiveSocket, probeRole);
+                handle(packet, endpointId);
             } catch (Exception e) {
                 if (running) {
                     log.debug("[peer-mesh] STUN/TURN receive failed: {}", e.toString());
@@ -109,45 +184,33 @@ public class StunTurnServer implements ApplicationRunner {
         }
     }
 
-    private void handle(DatagramPacket packet, DatagramSocket receiveSocket, String probeRole) throws Exception {
+    private void handle(DatagramPacket packet,
+                        StunEndpointTopology.EndpointId incomingEndpoint) throws Exception {
+        DatagramSocket receiveSocket = stunSockets.get(incomingEndpoint);
         InetSocketAddress remote = new InetSocketAddress(packet.getAddress(), packet.getPort());
         StunMessage message = StunMessage.parse(packet.getData(), packet.getOffset(), packet.getLength());
         if (message == null) {
             return;
         }
+        if (message.type() == StunMessage.BINDING_REQUEST) {
+            StunBindingService.BindingResult result =
+                    stunBindingService.process(message, remote, incomingEndpoint);
+            sendStun(stunSockets.get(result.responseEndpoint()), remote, result.response());
+            log.trace("[peer-mesh] STUN binding incoming={} outgoing={} remote={}",
+                    incomingEndpoint, result.responseEndpoint(), remote);
+            return;
+        }
+        if (!StunEndpointTopology.PRIMARY.equals(incomingEndpoint)) {
+            sendError(receiveSocket, remote, message, errorType(message.type()), 400, "unsupported-endpoint");
+            return;
+        }
         switch (message.type()) {
-            case StunMessage.BINDING_REQUEST -> binding(message, remote, receiveSocket, probeRole);
             case StunMessage.ALLOCATE_REQUEST -> allocate(message, packet, remote);
             case StunMessage.REFRESH_REQUEST -> refresh(message, packet, remote);
             case StunMessage.CREATE_PERMISSION_REQUEST -> createPermission(message, packet, remote);
             case StunMessage.SEND_INDICATION -> sendIndication(message, remote);
             default -> sendError(receiveSocket, remote, message, errorType(message.type()), 400, "unsupported-method");
         }
-    }
-
-    private void binding(StunMessage request,
-                         InetSocketAddress remote,
-                         DatagramSocket receiveSocket,
-                         String probeRole) throws Exception {
-        InetSocketAddress responseOrigin = advertisedSocketAddress(receiveSocket);
-        StunMessage response = alternateSocket != null && !alternateSocket.isClosed()
-                ? StunMessage.of(
-                StunMessage.BINDING_SUCCESS,
-                request.transactionId(),
-                StunMessage.xorMappedAddress(remote, request.transactionId()),
-                StunMessage.software(SOFTWARE),
-                new StunMessage.Attribute(StunMessage.ATTR_RESPONSE_ORIGIN,
-                        StunMessage.encodeXorAddress(responseOrigin, request.transactionId())),
-                StunMessage.otherAddress(advertisedSocketAddress(alternateSocket), request.transactionId()))
-                : StunMessage.of(
-                StunMessage.BINDING_SUCCESS,
-                request.transactionId(),
-                StunMessage.xorMappedAddress(remote, request.transactionId()),
-                StunMessage.software(SOFTWARE),
-                new StunMessage.Attribute(StunMessage.ATTR_RESPONSE_ORIGIN,
-                        StunMessage.encodeXorAddress(responseOrigin, request.transactionId())));
-        sendStun(receiveSocket, remote, response);
-        log.trace("[peer-mesh] STUN binding role={} remote={}", probeRole, remote);
     }
 
     private void allocate(StunMessage request, DatagramPacket packet, InetSocketAddress remote) throws Exception {
@@ -214,7 +277,9 @@ public class StunTurnServer implements ApplicationRunner {
         for (int i = 0; i < attempts; i++) {
             int port = min + ((start - min + i) % capacity);
             try {
-                return new DatagramSocket(port);
+                DatagramSocket socket = new DatagramSocket(null);
+                socket.bind(new InetSocketAddress(turnBindAddress, port));
+                return socket;
             } catch (Exception e) {
                 last = e;
             }
@@ -222,7 +287,9 @@ public class StunTurnServer implements ApplicationRunner {
         if (last != null) {
             throw last;
         }
-        return new DatagramSocket(0);
+        DatagramSocket socket = new DatagramSocket(null);
+        socket.bind(new InetSocketAddress(turnBindAddress, 0));
+        return socket;
     }
 
     private void refresh(StunMessage request, DatagramPacket packet, InetSocketAddress remote) throws Exception {
@@ -461,18 +528,23 @@ public class StunTurnServer implements ApplicationRunner {
     @PreDestroy
     public void stop() {
         running = false;
-        if (primarySocket != null) {
-            primarySocket.close();
-        }
-        if (alternateSocket != null) {
-            alternateSocket.close();
-        }
+        closeStunSockets();
         for (Allocation allocation : allocations.values()) {
             closeAllocation(allocation);
         }
         if (relayExecutor != null) {
             relayExecutor.shutdownNow();
         }
+    }
+
+    private void closeStunSockets() {
+        for (DatagramSocket socket : stunSockets.values()) {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+        stunSockets.clear();
+        primarySocket = null;
     }
 
     private void closeAllocation(Allocation allocation) {
@@ -518,6 +590,9 @@ public class StunTurnServer implements ApplicationRunner {
     }
 
     private InetAddress advertisedAddress(DatagramSocket socket) {
+        if (turnAdvertisedAddress != null) {
+            return turnAdvertisedAddress;
+        }
         try {
             if (properties.getPublicAddress() != null && !properties.getPublicAddress().isBlank()) {
                 return InetAddress.getByName(properties.getPublicAddress().trim());
@@ -529,6 +604,27 @@ public class StunTurnServer implements ApplicationRunner {
         } catch (Exception e) {
             throw new IllegalStateException("cannot resolve advertised TURN address", e);
         }
+    }
+
+    private InetAddress resolveBindAddress(String configured) throws Exception {
+        if (hasText(configured)) {
+            return InetAddress.getByName(configured.trim());
+        }
+        return InetAddress.getByName("0.0.0.0");
+    }
+
+    private InetAddress resolvePrimaryAdvertisedAddress(InetAddress bindAddress) throws Exception {
+        if (hasText(properties.getPublicAddress())) {
+            return InetAddress.getByName(properties.getPublicAddress().trim());
+        }
+        if (bindAddress != null && !bindAddress.isAnyLocalAddress()) {
+            return bindAddress;
+        }
+        return InetAddress.getLocalHost();
+    }
+
+    private boolean hasText(String value) {
+        return value != null && !value.isBlank();
     }
 
     private ExecutorService createRelayExecutor() {

@@ -43,8 +43,10 @@ flowchart TD
 | `implementations/java/common` | Java 公共协议、编解码器、登录鉴权、心跳、会话、消息和同步 HTTP 请求能力，Maven artifact 为 `tunnel-common` |
 | `implementations/java/server` | 公网服务端（Java 参考实现），监听控制连接，并为已注册映射创建公网 TCP 监听端口，Maven artifact 为 `tunnel-server` |
 | `implementations/java/client` | Java 内网客户端，连接服务端，并将隧道数据转发至目标内网服务，Maven artifact 为 `tunnel-client` |
+| `implementations/java/stun-server` | 可独立部署的 RFC 5780 STUN Binding 服务，支持双公网 IP、双 UDP 端口和 `CHANGE-REQUEST`，Maven artifact 为 `stun-server` |
 | `apps/admin-web` | 管理后台前端(React + HeroUI)，构建产物供各服务端静态托管 |
 | `deploy/java-server` | Java server 的 systemd 安装、更新脚本和环境变量模板 |
+| `deploy/stun-server` | 独立 STUN server 的 systemd 安装、更新脚本和四端点配置模板 |
 | `deploy/remote` | 从 macOS/Linux 或 Windows 将当前 Java server 与 OpenResty 前端一键构建、上传、更新并验收 |
 | `protocol/spec` | 跨语言协议说明、数据面/控制面规范入口 |
 | `implementations/go/server` | Go 服务端移植，与 Java 服务端线协议字节兼容，支持多库(sqlite/pg/mysql) |
@@ -58,6 +60,7 @@ flowchart TD
 主要入口：
 
 - 服务端(Java)：`implementations/java/server/src/main/java/com/theshuai/tunnelserver/TunnelServerApplication.java`
+- 独立 STUN(Java)：`implementations/java/stun-server/src/main/java/com/theshuai/stunserver/StunServerApplication.java`
 - 服务端(Go)：`implementations/go/server/cmd/shuai-tunnel-server/main.go`
 - 客户端(Java)：`implementations/java/client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`
 - 客户端(Go)：`implementations/go/client/cmd/shuai-tunnel-client/main.go`
@@ -83,6 +86,13 @@ flowchart TD
 
 ```bash
 mvn clean install
+```
+
+只构建独立 STUN server：
+
+```bash
+mvn -pl :stun-server -am clean package
+# implementations/java/stun-server/target/stun-server.jar
 ```
 
 `tunnel-server` 的 Maven 构建会在 `generate-resources` 阶段执行 `apps/admin-web` 的 `npm run deploy:java`：先构建 React 管理后台，再把 `dist/` 只同步到 Java server 的 `src/main/resources/static/`。首次构建前请在 `apps/admin-web` 下执行一次 `npm ci` 安装依赖。
@@ -340,7 +350,7 @@ curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 
 Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端会被分配 `100.96.0.0/11` 内的虚拟 IP，并通过 `shuai0` 这类虚拟网卡互访。控制面仍走现有 Netty 连接，服务端通过 `PEER_CONTROL` 下发设备列表、候选地址、session 授权和启停状态；数据面优先走客户端之间的加密 UDP direct，direct 失效或不可达时回退到服务端标准 TURN relay。服务端 relay 只校验会话授权和 frame 头，不解密业务 IP 包明文。
 
-当前实现同时使用自建 STUN/TURN 和可配置公共 STUN。客户端登录后会拿到 `stunHost/stunPort`、`turnHost/turnPort`、公共 STUN 列表和 ICE 凭证；自建 STUN/TURN 负责 NAT 探测、候选交换和 relay，公共 STUN 只用于补充 server-reflexive 候选地址，不提供 relay。客户端会保存多个公网映射观测值，按端口变化做自适应预测，并在 direct path 过期后主动触发重新探测和 relay fallback。
+当前实现同时使用自建 STUN/TURN 和可配置公共 STUN。客户端登录后会拿到彼此独立的 `stunHost/stunPort`、`turnHost/turnPort`、公共 STUN 列表和 ICE 凭证；自建 STUN 负责 NAT 探测，TURN 负责 relay，公共 STUN 只用于补充 server-reflexive 候选地址。Java STUN 核心支持 RFC 5780 的四端点拓扑与 `CHANGE-REQUEST`，既可嵌入 tunnel-server，也可由独立 `stun-server.jar` 部署；Java、Go、.NET 与 Android 客户端会分别上报映射行为、过滤行为和兼容 NAT 标签，并在 direct path 过期后主动触发重新探测和 relay fallback。
 
 服务端相关配置：
 
@@ -350,7 +360,13 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `tunnel.peer-mesh.cidr` | `TUNNEL_PEER_MESH_CIDR` | `100.96.0.0/11` | 虚拟网段 |
 | `tunnel.peer-mesh.public-address` | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | （空） | 对客户端公布的 STUN/TURN 地址；为空时回退登录请求域名 |
 | `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | 标准 STUN/TURN UDP 主端口 |
+| `tunnel.peer-mesh.standalone-stun-address` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS` | （空） | 独立 STUN 域名或 IP；配置后只替换 `stunHost`，TURN 地址保持不变 |
+| `tunnel.peer-mesh.standalone-stun-port` | `TUNNEL_PEER_MESH_STANDALONE_STUN_PORT` | `3478` | 独立 STUN 入口端口 |
 | `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `3479` | NAT 探测备用 UDP 端口，用于更准确地区分端口映射行为 |
+| `tunnel.peer-mesh.stun-primary-bind-address` | `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` | （空） | RFC 5780 主地址 A1 的本机绑定 IP；完整模式必须显式配置 |
+| `tunnel.peer-mesh.stun-alternate-bind-address` | `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` | （空） | RFC 5780 备用地址 A2 的本机绑定 IP |
+| `tunnel.peer-mesh.stun-alternate-public-address` | `TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS` | （空） | RFC 5780 备用公网 IP A2；主公网 IP A1 使用 `public-address` |
+| `tunnel.peer-mesh.stun-behavior-strict` | `TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT` | `false` | 为 `true` 时四端点配置不完整会阻止内置 STUN/TURN 启动 |
 | `tunnel.peer-mesh.public-stun-servers` | `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | （空） | 额外公共 STUN 服务器，多个地址用英文逗号分隔，支持 `host:port` / `stun:host:port` |
 | `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
 | `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation TTL |
@@ -364,7 +380,7 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `tunnel.peer-mesh.turn-shared-secret` | `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` | （空） | 临时 credential HMAC-SHA1 密钥；为空时使用进程内随机密钥，重启后旧凭证失效 |
 | `tunnel.peer-mesh.turn-credential-ttl-seconds` | `TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | 临时 TURN credential 有效期，最小 60 秒 |
 
-公网安全组 / 防火墙需要放行 `3478/udp`、`3479/udp` 和 relay 分配端口范围（默认 `49152-65535/udp`）。如果不希望开放完整高端口范围，可以把 `relay-min-port` / `relay-max-port` 收窄到可控区间，并同步开放该区间。
+公网安全组 / 防火墙需要放行 `3478/udp`、`3479/udp` 和 relay 分配端口范围（默认 `49152-65535/udp`）。完整 RFC 5780 模式要在 A1、A2 两个公网 IP 上同时放行两个 STUN 端口；TURN 仍只在 A1:P1 处理。独立部署说明见 [`deploy/stun-server/systemd`](deploy/stun-server/systemd/README.md)。如果不希望开放完整高端口范围，可以把 `relay-min-port` / `relay-max-port` 收窄到可控区间，并同步开放该区间。
 
 客户端侧 `peerMeshDevice` 决定虚拟网卡实现：`linux-tun` 使用 `/dev/net/tun`，需要 root 或 `CAP_NET_ADMIN`；`windows-wintun` / `wintun` 使用随客户端分发的 Wintun 动态库；Java / Go / .NET 客户端均支持 `utun` 接入 macOS utun，其中 Java 可使用 `mac-utun` / `utun`，`auto` 会按系统选择；`noop` 只保留控制面，不创建虚拟网卡。更完整的信令、加密帧和 NAT 探测说明见 [protocol/spec/peer-mesh.md](protocol/spec/peer-mesh.md)。
 
