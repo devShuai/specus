@@ -65,6 +65,16 @@ public final class StunServerApplication {
                   STUN_SOFTWARE                      SOFTWARE attribute value
                   STUN_LEGACY_SINGLE_IP_OTHER_ADDRESS
                                                      Emit legacy single-IP alternate attributes
+                  STUN_RATE_LIMIT_PER_SECOND         Per-source sustained request rate (default 100)
+                  STUN_RATE_LIMIT_BURST              Per-source token burst (default 200)
+                  STUN_GLOBAL_RATE_LIMIT_PER_SECOND  Global sustained request rate (default 10000)
+                  STUN_GLOBAL_RATE_LIMIT_BURST       Global token burst (default 20000)
+                  STUN_MAX_TRACKED_SOURCES           Bounded source token table (default 65536)
+                  STUN_SOURCE_IDLE_SECONDS           Source token idle expiry (default 300)
+                  STUN_MAX_PACKET_BYTES              Accepted UDP payload bytes (default 65507)
+                  STUN_MAX_PADDING_RESPONSE_BYTES    Maximum returned PADDING value (default 1472)
+                  STUN_METRICS_BIND_ADDRESS          Prometheus bind address (default 127.0.0.1)
+                  STUN_METRICS_PORT                  Prometheus port (default 9108; 0 disables)
 
                 Full RFC 5780 mode requires explicit A1/A2 bind addresses, two distinct
                 advertised public IPs, and the same P1/P2 port pair on both addresses.

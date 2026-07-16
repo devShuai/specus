@@ -93,6 +93,52 @@ class StunBindingServiceTests {
         assertEquals(400, result.response().errorCode());
     }
 
+    @Test
+    void routesResponseToRequestedPort() {
+        StunBindingService service = new StunBindingService(topology(), "test-stun", false);
+        StunMessage request = StunMessage.of(
+                StunMessage.BINDING_REQUEST,
+                StunMessage.newTransactionId(),
+                StunMessage.responsePort(54_321));
+
+        StunBindingService.BindingResult result =
+                service.process(request, REMOTE, StunEndpointTopology.PRIMARY);
+
+        assertEquals(address("198.51.100.25", 54_321), result.responseTarget());
+        assertEquals(StunMessage.BINDING_SUCCESS, result.response().type());
+    }
+
+    @Test
+    void echoesBoundedPaddingAndRejectsResponsePortCombination() {
+        StunBindingService service = new StunBindingService(topology(), "test-stun", false, 64);
+        StunMessage padded = StunMessage.of(
+                StunMessage.BINDING_REQUEST,
+                StunMessage.newTransactionId(),
+                StunMessage.padding(256));
+
+        StunBindingService.BindingResult paddedResult =
+                service.process(
+                        padded,
+                        REMOTE,
+                        StunEndpointTopology.PRIMARY,
+                        padded.toBytes().length);
+
+        assertEquals(
+                64,
+                paddedResult.response().paddingValue().orElseThrow().length);
+
+        StunMessage invalid = StunMessage.of(
+                StunMessage.BINDING_REQUEST,
+                StunMessage.newTransactionId(),
+                StunMessage.responsePort(54_321),
+                StunMessage.padding(32));
+        StunBindingService.BindingResult invalidResult =
+                service.process(invalid, REMOTE, StunEndpointTopology.PRIMARY);
+
+        assertEquals(400, invalidResult.response().errorCode());
+        assertEquals(REMOTE, invalidResult.responseTarget());
+    }
+
     private void assertResponse(
             StunBindingService service,
             boolean changeIp,

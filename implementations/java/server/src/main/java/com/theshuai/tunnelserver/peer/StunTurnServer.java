@@ -194,8 +194,15 @@ public class StunTurnServer implements ApplicationRunner {
         }
         if (message.type() == StunMessage.BINDING_REQUEST) {
             StunBindingService.BindingResult result =
-                    stunBindingService.process(message, remote, incomingEndpoint);
-            sendStun(stunSockets.get(result.responseEndpoint()), remote, result.response());
+                    stunBindingService.process(
+                            message,
+                            remote,
+                            incomingEndpoint,
+                            packet.getLength());
+            sendStun(
+                    stunSockets.get(result.responseEndpoint()),
+                    result.responseTarget(),
+                    result.response());
             log.trace("[peer-mesh] STUN binding incoming={} outgoing={} remote={}",
                     incomingEndpoint, result.responseEndpoint(), remote);
             return;

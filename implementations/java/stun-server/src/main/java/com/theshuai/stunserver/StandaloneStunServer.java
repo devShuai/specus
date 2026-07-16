@@ -23,6 +23,9 @@ public final class StandaloneStunServer implements AutoCloseable {
 
     private final StandaloneStunServerConfig config;
     private final StunBindingService bindingService;
+    private final StunRequestLimiter requestLimiter;
+    private final StunServerMetrics metrics = new StunServerMetrics();
+    private final StunMetricsHttpServer metricsHttpServer;
     private final Map<StunEndpointTopology.EndpointId, DatagramSocket> sockets =
             new ConcurrentHashMap<>();
     private final List<Thread> workers = new ArrayList<>();
@@ -35,7 +38,12 @@ public final class StandaloneStunServer implements AutoCloseable {
         this.bindingService = new StunBindingService(
                 config.topology(),
                 config.software(),
-                config.legacySingleIpOtherAddress());
+                config.legacySingleIpOtherAddress(),
+                config.protection().maxPaddingResponseBytes());
+        this.requestLimiter = new StunRequestLimiter(config.protection());
+        this.metricsHttpServer = new StunMetricsHttpServer(
+                config.metrics(),
+                () -> metrics.render(requestLimiter::trackedSources));
     }
 
     public synchronized void start() throws IOException {
@@ -44,6 +52,7 @@ public final class StandaloneStunServer implements AutoCloseable {
         }
         try {
             bindAllEndpoints();
+            metricsHttpServer.start();
             running.set(true);
             for (StunEndpointTopology.Endpoint endpoint : config.topology().endpoints()) {
                 Thread worker = new Thread(
@@ -56,6 +65,7 @@ public final class StandaloneStunServer implements AutoCloseable {
             LOG.log(System.Logger.Level.INFO, "STUN server started: " + config.describe());
         } catch (IOException | RuntimeException e) {
             running.set(false);
+            metricsHttpServer.close();
             closeSockets();
             stopped.countDown();
             throw e;
@@ -90,7 +100,11 @@ public final class StandaloneStunServer implements AutoCloseable {
 
     private void receiveLoop(StunEndpointTopology.EndpointId incomingEndpoint) {
         DatagramSocket receiveSocket = sockets.get(incomingEndpoint);
-        byte[] buffer = new byte[MAX_UDP_PACKET_BYTES];
+        int configuredMax = config.protection().maxPacketBytes();
+        int receiveBytes = configuredMax >= MAX_UDP_PACKET_BYTES
+                ? MAX_UDP_PACKET_BYTES
+                : configuredMax + 1;
+        byte[] buffer = new byte[receiveBytes];
         while (running.get() && receiveSocket != null && !receiveSocket.isClosed()) {
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             try {
@@ -113,29 +127,75 @@ public final class StandaloneStunServer implements AutoCloseable {
     private void process(
             DatagramPacket packet,
             StunEndpointTopology.EndpointId incomingEndpoint) throws IOException {
+        metrics.recordPacket(packet.getLength());
+        if (packet.getLength() > config.protection().maxPacketBytes()) {
+            metrics.recordDrop("packet_too_large");
+            return;
+        }
+        StunRequestLimiter.Decision decision = requestLimiter.allow(packet.getAddress());
+        if (decision != StunRequestLimiter.Decision.ALLOWED) {
+            metrics.recordDrop(switch (decision) {
+                case GLOBAL_RATE_LIMIT -> "global_rate_limit";
+                case SOURCE_RATE_LIMIT -> "source_rate_limit";
+                case SOURCE_TABLE_FULL -> "source_table_full";
+                case ALLOWED -> "unknown";
+            });
+            return;
+        }
         StunMessage request = StunMessage.parse(
                 packet.getData(),
                 packet.getOffset(),
                 packet.getLength());
-        if (request == null || request.type() != StunMessage.BINDING_REQUEST) {
+        if (request == null) {
+            metrics.recordDrop("malformed");
             return;
+        }
+        if (request.type() != StunMessage.BINDING_REQUEST) {
+            metrics.recordDrop("unsupported_method");
+            return;
+        }
+        metrics.recordAcceptedRequest();
+        if (request.hasAttribute(StunMessage.ATTR_CHANGE_REQUEST)) {
+            metrics.recordFeature("change_request");
+        }
+        if (request.hasAttribute(StunMessage.ATTR_RESPONSE_PORT)) {
+            metrics.recordFeature("response_port");
+        }
+        if (request.hasAttribute(StunMessage.ATTR_PADDING)) {
+            metrics.recordFeature("padding");
         }
 
         InetSocketAddress remote = new InetSocketAddress(packet.getAddress(), packet.getPort());
         StunBindingService.BindingResult result =
-                bindingService.process(request, remote, incomingEndpoint);
+                bindingService.process(
+                        request,
+                        remote,
+                        incomingEndpoint,
+                        packet.getLength());
         DatagramSocket responseSocket = sockets.get(result.responseEndpoint());
         if (responseSocket == null || responseSocket.isClosed()) {
             throw new SocketException(
                     "response endpoint is unavailable: " + result.responseEndpoint());
         }
         byte[] response = result.response().toBytes();
-        responseSocket.send(new DatagramPacket(response, response.length, remote));
+        if (response.length > MAX_UDP_PACKET_BYTES) {
+            metrics.recordDrop("response_too_large");
+            return;
+        }
+        responseSocket.send(new DatagramPacket(
+                response,
+                response.length,
+                result.responseTarget()));
+        int responseCode = result.response().type() == StunMessage.BINDING_SUCCESS
+                ? 200
+                : result.response().errorCode();
+        metrics.recordResponse(responseCode, response.length);
     }
 
     @Override
     public synchronized void close() {
         running.set(false);
+        metricsHttpServer.close();
         closeSockets();
         for (Thread worker : workers) {
             worker.interrupt();

@@ -18,6 +18,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\ShuaiTunnel.StunServer\ShuaiTunnel.StunServer.csproj" />
     <ProjectReference Include="..\..\src\ShuaiTunnel.Server\ShuaiTunnel.Server.csproj" />
     <ProjectReference Include="..\..\src\ShuaiTunnel.Server.Data\ShuaiTunnel.Server.Data.csproj" />
     <!-- Referenced so MultiProviderModelTests can construct the Npgsql/MySQL contexts and load

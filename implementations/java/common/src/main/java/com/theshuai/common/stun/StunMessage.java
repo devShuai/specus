@@ -12,6 +12,7 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 public final class StunMessage {
     public static final int MAGIC_COOKIE = 0x2112A442;
@@ -47,6 +48,8 @@ public final class StunMessage {
     public static final int ATTR_XOR_RELAYED_ADDRESS = 0x0016;
     public static final int ATTR_REQUESTED_TRANSPORT = 0x0019;
     public static final int ATTR_XOR_MAPPED_ADDRESS = 0x0020;
+    public static final int ATTR_PADDING = 0x0026;
+    public static final int ATTR_RESPONSE_PORT = 0x0027;
     public static final int ATTR_SOFTWARE = 0x8022;
     public static final int ATTR_RESPONSE_ORIGIN = 0x802B;
     public static final int ATTR_OTHER_ADDRESS = 0x802C;
@@ -114,7 +117,7 @@ public final class StunMessage {
             }
             byte[] value = new byte[attrLength];
             buffer.get(value);
-            int padding = padding(attrLength);
+            int padding = alignmentPadding(attrLength);
             if (padding > 0) {
                 if (padding > end - buffer.position()) {
                     return null;
@@ -133,7 +136,7 @@ public final class StunMessage {
     public byte[] toBytes(byte[] messageIntegrityKey) {
         int attributeBytes = 0;
         for (Attribute attribute : attributes) {
-            attributeBytes += 4 + attribute.value().length + padding(attribute.value().length);
+            attributeBytes += 4 + attribute.value().length + alignmentPadding(attribute.value().length);
         }
         if (messageIntegrityKey != null && messageIntegrityKey.length > 0) {
             byte[] beforeIntegrity = serialize(attributeBytes + 24, attributes);
@@ -151,7 +154,7 @@ public final class StunMessage {
     private byte[] serialize(int declaredAttributeBytes, List<Attribute> serializedAttributes) {
         int actualAttributeBytes = 0;
         for (Attribute attribute : serializedAttributes) {
-            actualAttributeBytes += 4 + attribute.value().length + padding(attribute.value().length);
+            actualAttributeBytes += 4 + attribute.value().length + alignmentPadding(attribute.value().length);
         }
         ByteBuffer buffer = ByteBuffer.allocate(HEADER_BYTES + actualAttributeBytes);
         buffer.putShort((short) type);
@@ -162,7 +165,7 @@ public final class StunMessage {
             buffer.putShort((short) attribute.type());
             buffer.putShort((short) attribute.value().length);
             buffer.put(attribute.value());
-            for (int i = 0; i < padding(attribute.value().length); i++) {
+            for (int i = 0; i < alignmentPadding(attribute.value().length); i++) {
                 buffer.put((byte) 0);
             }
         }
@@ -183,7 +186,7 @@ public final class StunMessage {
             int attrType = Short.toUnsignedInt(ByteBuffer.wrap(packet, position, Short.BYTES).getShort());
             int attrLength = Short.toUnsignedInt(ByteBuffer.wrap(packet, position + 2, Short.BYTES).getShort());
             int valueOffset = position + 4;
-            int next = valueOffset + attrLength + padding(attrLength);
+            int next = valueOffset + attrLength + alignmentPadding(attrLength);
             if (attrLength > end - valueOffset || next > end) {
                 return false;
             }
@@ -270,6 +273,20 @@ public final class StunMessage {
                     int flags = ByteBuffer.wrap(attribute.value()).getInt();
                     return new ChangeRequest((flags & 0x04) != 0, (flags & 0x02) != 0);
                 });
+    }
+
+    public OptionalInt responsePort() {
+        Optional<Attribute> attribute = first(ATTR_RESPONSE_PORT);
+        if (attribute.isEmpty() || attribute.get().value().length != Short.BYTES) {
+            return OptionalInt.empty();
+        }
+        return OptionalInt.of(Short.toUnsignedInt(
+                ByteBuffer.wrap(attribute.get().value()).getShort()));
+    }
+
+    public Optional<byte[]> paddingValue() {
+        return first(ATTR_PADDING)
+                .map(attribute -> Arrays.copyOf(attribute.value(), attribute.value().length));
     }
 
     public int errorCode() {
@@ -408,6 +425,28 @@ public final class StunMessage {
         return new Attribute(ATTR_CHANGE_REQUEST, ByteBuffer.allocate(Integer.BYTES).putInt(flags).array());
     }
 
+    public static Attribute responsePort(int port) {
+        if (port < 0 || port > 65_535) {
+            throw new IllegalArgumentException("response port must be between 0 and 65535");
+        }
+        return new Attribute(
+                ATTR_RESPONSE_PORT,
+                ByteBuffer.allocate(Short.BYTES).putShort((short) port).array());
+    }
+
+    public static Attribute padding(byte[] value) {
+        return new Attribute(
+                ATTR_PADDING,
+                value == null ? new byte[0] : Arrays.copyOf(value, value.length));
+    }
+
+    public static Attribute padding(int length) {
+        if (length < 0 || length > 65_503) {
+            throw new IllegalArgumentException("padding length must be between 0 and 65503");
+        }
+        return padding(new byte[length]);
+    }
+
     public static Attribute unknownAttributes(int... types) {
         int[] normalized = types == null ? new int[0] : types;
         ByteBuffer buffer = ByteBuffer.allocate(normalized.length * Short.BYTES);
@@ -521,7 +560,7 @@ public final class StunMessage {
         return Arrays.copyOf(transactionId, transactionId.length);
     }
 
-    private static int padding(int length) {
+    private static int alignmentPadding(int length) {
         return (4 - (length % 4)) % 4;
     }
 

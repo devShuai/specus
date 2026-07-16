@@ -1,6 +1,7 @@
 package com.theshuai.stunserver;
 
 import com.theshuai.common.stun.StunEndpointTopology;
+import com.theshuai.common.stun.StunMessage;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -11,12 +12,32 @@ import java.util.stream.Collectors;
 public record StandaloneStunServerConfig(
         StunEndpointTopology topology,
         String software,
-        boolean legacySingleIpOtherAddress) {
+        boolean legacySingleIpOtherAddress,
+        StandaloneStunProtectionConfig protection,
+        StandaloneStunMetricsConfig metrics) {
     public static final String DEFAULT_SOFTWARE = "shuai-tunnel-rfc5780-stun";
 
     public StandaloneStunServerConfig {
         Objects.requireNonNull(topology, "topology");
         software = software == null || software.isBlank() ? DEFAULT_SOFTWARE : software.trim();
+        protection = protection == null
+                ? StandaloneStunProtectionConfig.defaults()
+                : protection;
+        metrics = metrics == null
+                ? StandaloneStunMetricsConfig.disabled()
+                : metrics;
+    }
+
+    public StandaloneStunServerConfig(
+            StunEndpointTopology topology,
+            String software,
+            boolean legacySingleIpOtherAddress) {
+        this(
+                topology,
+                software,
+                legacySingleIpOtherAddress,
+                StandaloneStunProtectionConfig.defaults(),
+                StandaloneStunMetricsConfig.disabled());
     }
 
     public static StandaloneStunServerConfig fromEnvironment(Map<String, String> environment) {
@@ -77,7 +98,21 @@ public record StandaloneStunServerConfig(
         return new StandaloneStunServerConfig(
                 topology,
                 value(env, "STUN_SOFTWARE", DEFAULT_SOFTWARE),
-                bool(env, "STUN_LEGACY_SINGLE_IP_OTHER_ADDRESS", false));
+                bool(env, "STUN_LEGACY_SINGLE_IP_OTHER_ADDRESS", false),
+                new StandaloneStunProtectionConfig(
+                        integer(env, "STUN_RATE_LIMIT_PER_SECOND", 100, 1, 1_000_000),
+                        integer(env, "STUN_RATE_LIMIT_BURST", 200, 1, 2_000_000),
+                        integer(env, "STUN_GLOBAL_RATE_LIMIT_PER_SECOND", 10_000, 1, 10_000_000),
+                        integer(env, "STUN_GLOBAL_RATE_LIMIT_BURST", 20_000, 1, 20_000_000),
+                        integer(env, "STUN_MAX_TRACKED_SOURCES", 65_536, 1, 1_000_000),
+                        integer(env, "STUN_SOURCE_IDLE_SECONDS", 300, 1, 86_400),
+                        integer(env, "STUN_MAX_PACKET_BYTES", 65_507, StunMessage.HEADER_BYTES, 65_507),
+                        integer(env, "STUN_MAX_PADDING_RESPONSE_BYTES", 1_472, 0, 65_503)),
+                new StandaloneStunMetricsConfig(
+                        address(
+                                "STUN_METRICS_BIND_ADDRESS",
+                                value(env, "STUN_METRICS_BIND_ADDRESS", "127.0.0.1")),
+                        port(env, "STUN_METRICS_PORT", 9_108, true)));
     }
 
     public String describe() {
@@ -88,7 +123,9 @@ public record StandaloneStunServerConfig(
                 .collect(Collectors.joining(", "));
         return "mode=" + (topology.supportsRfc5780() ? "rfc5780" : "basic")
                 + ", software=" + software
-                + ", endpoints=" + endpoints;
+                + ", endpoints=" + endpoints
+                + ", protection=" + protection.describe()
+                + ", metrics=" + metrics.describe();
     }
 
     private static StunEndpointTopology.Endpoint endpoint(
@@ -139,6 +176,25 @@ public record StandaloneStunServerConfig(
             case "0", "false", "no", "off" -> false;
             default -> throw new IllegalArgumentException(name + " must be true or false: " + raw);
         };
+    }
+
+    private static int integer(
+            Map<String, String> environment,
+            String name,
+            int fallback,
+            int minimum,
+            int maximum) {
+        String raw = value(environment, name, Integer.toString(fallback));
+        try {
+            int parsed = Integer.parseInt(raw);
+            if (parsed < minimum || parsed > maximum) {
+                throw new IllegalArgumentException(
+                        name + " must be between " + minimum + " and " + maximum);
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(name + " must be an integer: " + raw, e);
+        }
     }
 
     private static String value(Map<String, String> environment, String name, String fallback) {
