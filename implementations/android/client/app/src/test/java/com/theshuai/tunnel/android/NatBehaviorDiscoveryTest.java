@@ -88,6 +88,53 @@ public class NatBehaviorDiscoveryTest {
         assertEquals(NatBehaviorDiscovery.UNSUPPORTED, completed.filteringBehavior());
     }
 
+    @Test
+    public void classifiesAddressAndPortDependentMappingAndFiltering() {
+        NatBehaviorDiscovery discovery = new NatBehaviorDiscovery();
+        NatBehaviorDiscovery.ProbeRequest filterBoth = requireProbe(
+                discovery.begin(PRIMARY, MAPPED, OTHER),
+                NatBehaviorDiscovery.Probe.FILTER_CHANGE_IP_AND_PORT);
+        NatBehaviorDiscovery.ProbeRequest filterPort = requireProbe(
+                discovery.timedOut(filterBoth.generation(), filterBoth.probe()),
+                NatBehaviorDiscovery.Probe.FILTER_CHANGE_PORT);
+        NatBehaviorDiscovery.ProbeRequest mappingIp = requireProbe(
+                discovery.timedOut(filterPort.generation(), filterPort.probe()),
+                NatBehaviorDiscovery.Probe.MAPPING_ALTERNATE_IP);
+        NatBehaviorDiscovery.ProbeRequest mappingIpPort = requireProbe(
+                discovery.succeeded(
+                        mappingIp.generation(),
+                        mappingIp.probe(),
+                        endpoint("198.51.100.20", 52010)),
+                NatBehaviorDiscovery.Probe.MAPPING_ALTERNATE_IP_AND_PORT);
+        NatBehaviorDiscovery.Snapshot completed = discovery.succeeded(
+                mappingIpPort.generation(),
+                mappingIpPort.probe(),
+                endpoint("198.51.100.20", 52020)).snapshot();
+
+        assertEquals(NatBehaviorDiscovery.ADDRESS_AND_PORT_DEPENDENT, completed.mappingBehavior());
+        assertEquals(NatBehaviorDiscovery.ADDRESS_AND_PORT_DEPENDENT, completed.filteringBehavior());
+    }
+
+    @Test
+    public void doesNotTrustNegativeFilteringWhenAlternateEndpointValidationFails() {
+        NatBehaviorDiscovery discovery = new NatBehaviorDiscovery();
+        NatBehaviorDiscovery.ProbeRequest filterBoth = requireProbe(
+                discovery.begin(PRIMARY, MAPPED, OTHER),
+                NatBehaviorDiscovery.Probe.FILTER_CHANGE_IP_AND_PORT);
+        NatBehaviorDiscovery.ProbeRequest filterPort = requireProbe(
+                discovery.timedOut(filterBoth.generation(), filterBoth.probe()),
+                NatBehaviorDiscovery.Probe.FILTER_CHANGE_PORT);
+        NatBehaviorDiscovery.ProbeRequest mappingIp = requireProbe(
+                discovery.succeeded(filterPort.generation(), filterPort.probe(), MAPPED),
+                NatBehaviorDiscovery.Probe.MAPPING_ALTERNATE_IP);
+        NatBehaviorDiscovery.Snapshot completed = discovery.timedOut(
+                mappingIp.generation(),
+                mappingIp.probe()).snapshot();
+
+        assertEquals(NatBehaviorDiscovery.UNKNOWN, completed.mappingBehavior());
+        assertEquals(NatBehaviorDiscovery.UNKNOWN, completed.filteringBehavior());
+    }
+
     private static NatBehaviorDiscovery.ProbeRequest requireProbe(
             NatBehaviorDiscovery.Transition transition,
             NatBehaviorDiscovery.Probe expected) {

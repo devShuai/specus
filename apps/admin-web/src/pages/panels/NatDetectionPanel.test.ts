@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   browserNatOutcome,
   classifyBrowserNatResult,
+  defaultStunServers,
   type BrowserNatResult,
 } from "./NatDetectionPanel";
 
@@ -18,6 +19,10 @@ function result(overrides: Partial<BrowserNatResult>): BrowserNatResult {
     evidence: "test evidence",
     summary: "test summary",
     recommendation: "test recommendation",
+    verificationMethod: "MULTI_STUN_WEBRTC",
+    mappingBehavior: "UNKNOWN",
+    filteringBehavior: "UNKNOWN",
+    endpointChecks: [],
     ...overrides,
   };
 }
@@ -48,11 +53,18 @@ function probe(server: string, candidates: ReturnType<typeof srflx>[]) {
 }
 
 describe("browser NAT result presentation", () => {
+  it("uses the self-hosted primary and backup STUN endpoints by default", () => {
+    expect(defaultStunServers()).toEqual([
+      "stun:stun1.tunnel.devshuai.com:34780",
+      "stun:stun2.tunnel.devshuai.com:34780",
+    ]);
+  });
+
   it.each([
     ["NO_NAT", "公网直连型", 1, "联机条件优秀"],
     ["PORT_PRESERVED_NAT", "端口保持型 NAT", 2, "多数联机场景友好"],
-    ["CONE_LIKE_NAT", "稳定映射型 NAT", 3, "联机可用但受对端影响"],
-    ["SYMMETRIC_NAT", "对称映射型 NAT", 4, "直连联机更易受限"],
+    ["CONE_LIKE_NAT", "端点无关映射 NAT", 3, "联机可用但受对端影响"],
+    ["SYMMETRIC_NAT", "目标相关映射 NAT", 4, "直连联机更易受限"],
   ] as const)("maps %s to its user-facing impact", (natType, title, level, gameVerdict) => {
     const outcome = browserNatOutcome(result({ natType }));
 
@@ -138,5 +150,94 @@ describe("browser NAT evidence thresholds", () => {
 
     expect(classified.natType).toBe("SYMMETRIC_NAT");
     expect(classified.confidence).toBe("medium");
+  });
+
+  it("uses four reachable RFC 5780 endpoints to confirm a deduplicated EIM candidate", () => {
+    const endpoints = ["A1P1", "A1P2", "A2P1", "A2P2"].map((id, index) => ({
+      id,
+      addressSlot: id.slice(0, 2),
+      portSlot: id.slice(2),
+      host: index < 2 ? "stun-a.example" : "stun-b.example",
+      port: index % 2 === 0 ? 3478 : 3479,
+      url: `stun:${index < 2 ? "stun-a.example" : "stun-b.example"}:${index % 2 === 0 ? 3478 : 3479}`,
+    }));
+    const probeConfig = {
+      available: true,
+      protocol: "RFC8489",
+      discoveryMethod: "RFC5780",
+      endpoints,
+      capabilities: {
+        binding: true,
+        changeRequest: true,
+        responseOrigin: true,
+        otherAddress: true,
+        responsePort: true,
+        padding: true,
+        browserMappingObservation: true,
+        browserFilteringObservation: false,
+      },
+    } as const;
+    const endpointChecks = endpoints.map((endpoint) => ({
+      endpoint,
+      reachable: true,
+      mappedEndpoint: "198.51.100.10:50000",
+      elapsedMs: 20,
+      error: null,
+    }));
+
+    const classified = classifyBrowserNatResult(
+      1,
+      [probe(endpoints[0].url, [srflx("198.51.100.10", 50000, "192.168.1.10", 40000)])],
+      { probeConfig, endpointChecks },
+    );
+
+    expect(classified.natType).toBe("CONE_LIKE_NAT");
+    expect(classified.mappingBehavior).toBe("ENDPOINT_INDEPENDENT");
+    expect(classified.filteringBehavior).toBe("BROWSER_NOT_OBSERVABLE");
+    expect(classified.confidence).toBe("medium");
+  });
+
+  it("does not infer EIM when one RFC 5780 endpoint fails preflight", () => {
+    const endpoints = ["A1P1", "A1P2", "A2P1", "A2P2"].map((id, index) => ({
+      id,
+      addressSlot: id.slice(0, 2),
+      portSlot: id.slice(2),
+      host: index < 2 ? "stun-a.example" : "stun-b.example",
+      port: index % 2 === 0 ? 3478 : 3479,
+      url: `stun:${index < 2 ? "stun-a.example" : "stun-b.example"}:${index % 2 === 0 ? 3478 : 3479}`,
+    }));
+    const probeConfig = {
+      available: true,
+      protocol: "RFC8489",
+      discoveryMethod: "RFC5780",
+      endpoints,
+      capabilities: {
+        binding: true,
+        changeRequest: true,
+        responseOrigin: true,
+        otherAddress: true,
+        responsePort: true,
+        padding: true,
+        browserMappingObservation: true,
+        browserFilteringObservation: false,
+      },
+    } as const;
+    const endpointChecks = endpoints.map((endpoint, index) => ({
+      endpoint,
+      reachable: index !== 3,
+      mappedEndpoint: index === 3 ? null : "198.51.100.10:50000",
+      elapsedMs: 20,
+      error: index === 3 ? "timeout" : null,
+    }));
+
+    const classified = classifyBrowserNatResult(
+      1,
+      [probe(endpoints[0].url, [srflx("198.51.100.10", 50000, "192.168.1.10", 40000)])],
+      { probeConfig, endpointChecks },
+    );
+
+    expect(classified.natType).toBe("NAT");
+    expect(classified.mappingBehavior).toBe("UNKNOWN");
+    expect(classified.summary).toContain("暂时无法判断");
   });
 });

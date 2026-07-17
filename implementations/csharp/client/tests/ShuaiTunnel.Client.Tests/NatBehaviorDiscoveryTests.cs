@@ -104,6 +104,25 @@ public sealed class NatBehaviorDiscoveryTests
         Assert.Equal(NatBehavior.Unsupported, completed.FilteringBehavior);
     }
 
+    [Fact]
+    public void DoesNotTrustNegativeFilteringWhenAlternateEndpointValidationFails()
+    {
+        var discovery = new NatBehaviorDiscovery();
+        var filterBoth = RequireProbe(
+            discovery.Begin(Primary, Mapped, Other),
+            NatBehaviorProbe.FilterChangeIpAndPort);
+        var filterPort = RequireProbe(
+            discovery.TimedOut(filterBoth.Generation, filterBoth.Probe),
+            NatBehaviorProbe.FilterChangePort);
+        var mappingIp = RequireProbe(
+            discovery.Succeeded(filterPort.Generation, filterPort.Probe, Mapped),
+            NatBehaviorProbe.MappingAlternateIp);
+        var completed = discovery.TimedOut(mappingIp.Generation, mappingIp.Probe).Snapshot;
+
+        Assert.Equal(NatBehavior.Unknown, completed.MappingBehavior);
+        Assert.Equal(NatBehavior.Unknown, completed.FilteringBehavior);
+    }
+
     private static NatBehaviorProbeRequest RequireProbe(
         NatBehaviorTransition transition,
         NatBehaviorProbe expected)

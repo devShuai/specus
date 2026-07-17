@@ -43,6 +43,7 @@ import type {
   PublicTransferRoomAccessToken,
   PublicTransferRoomCredential,
   PublicTransferRoomRole,
+  PublicNatProbeConfig,
   PublicPeerStunConfig,
   ResourceTrafficType,
   ResourceTrafficUsage,
@@ -451,6 +452,19 @@ export async function fetchPublicPeerStunConfig(): Promise<PublicPeerStunConfig 
     }
     const body = (await response.json()) as PublicPeerStunConfig;
     return body && Array.isArray(body.stunServers) ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchPublicNatProbeConfig(): Promise<PublicNatProbeConfig | null> {
+  try {
+    const response = await fetch(`/api/public/peer-mesh/nat-probe-config`);
+    if (!response.ok) {
+      return null;
+    }
+    const body = (await response.json()) as PublicNatProbeConfig;
+    return body && Array.isArray(body.endpoints) && body.capabilities ? body : null;
   } catch {
     return null;
   }

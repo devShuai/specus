@@ -29,13 +29,13 @@ import { MobileListCard, MobileListCardList } from "../../components/MobileListC
 import { EmptyState } from "../../components/EmptyState";
 import { useNowTick } from "../../hooks/useNowTick";
 import {
-  NAT_TYPE_PROFILES,
+  NAT_BEHAVIOR_AXES,
   natBehaviorDiscoveryLabel,
-  natBehaviorLabel,
-  natReachabilityWeight,
+  natClassificationProfile,
+  natFilteringBehaviorLabel,
+  natMappingBehaviorLabel,
   natTypeColor,
   natTypeLabel,
-  natTypeProfile,
 } from "../../lib/nat";
 
 const peerNatFilterOptions = [
@@ -229,7 +229,9 @@ export function PeerMeshPanel() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-foreground">私有组网</h2>
-          <p className="text-small text-default-500">同一用户下客户端分配虚拟 IP，优先直连，失败后切到内置 relay。</p>
+          <p className="text-small text-default-500">
+            设备通过虚拟 IP 互联；RFC 5780 双轴结果辅助选路，直连失败后切换认证 TURN。
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button
@@ -263,7 +265,7 @@ export function PeerMeshPanel() {
       {!status?.enabled && (
         <Card shadow="none" className="rounded-md border border-warning-200 bg-warning-50 dark:border-warning-400/30 dark:bg-warning-500/10">
           <CardBody className="p-3 text-small text-warning-700 dark:text-warning-200">
-            server 当前未启用 peer mesh。设置 TUNNEL_PEER_MESH_ENABLED=true 后，客户端下次登录会收到虚拟 IP、STUN/TURN 与 ICE 凭证。
+            server 当前未启用 peer mesh。设置 TUNNEL_PEER_MESH_ENABLED=true 后，客户端下次登录会收到虚拟 IP、独立 STUN 拓扑和 TURN/ICE 凭证。
           </CardBody>
         </Card>
       )}
@@ -358,7 +360,7 @@ export function PeerMeshPanel() {
                       label: "NAT",
                       value: (
                         <div className="flex flex-col gap-0.5">
-                          <span>{natTypeLabel(device.natType)}</span>
+                          <span>{peerNatProfile(device).label}</span>
                           <PeerNatBehaviorLine device={device} />
                           <span className="break-all text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
                         </div>
@@ -441,7 +443,7 @@ export function PeerMeshPanel() {
                 </TableCell>
                 <TableCell>
                   <div className="flex max-w-72 flex-col gap-0.5 break-all text-small">
-                    <span>{natTypeLabel(device.natType)}</span>
+                    <span>{peerNatProfile(device).label}</span>
                     <PeerNatBehaviorLine device={device} />
                     <span className="text-tiny text-default-400">{device.lastEndpoint || "-"}</span>
                   </div>
@@ -738,7 +740,7 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
         {(stats.natBehaviorDevices ?? 0) > 0 && (
           <div className="flex flex-col gap-2 border-t border-default-200 pt-3">
             <div className="flex flex-wrap items-center justify-between gap-2 text-tiny text-default-500">
-              <span>NAT 行为完整分类率</span>
+              <span>RFC 5780 双轴完整分类率</span>
               <span className="text-small font-semibold text-foreground">
                 {behaviorRatioPercent == null ? "-" : `${behaviorRatioPercent}%`}
                 <span className="ml-1 font-normal text-default-500">
@@ -754,11 +756,11 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
             </div>
             <NatBehaviorDistribution
               label="映射"
-              items={mappingRows.map((item) => ({ ...item, label: natBehaviorLabel(item.behavior) }))}
+              items={mappingRows.map((item) => ({ ...item, label: natMappingBehaviorLabel(item.behavior) }))}
             />
             <NatBehaviorDistribution
               label="过滤"
-              items={filteringRows.map((item) => ({ ...item, label: natBehaviorLabel(item.behavior) }))}
+              items={filteringRows.map((item) => ({ ...item, label: natFilteringBehaviorLabel(item.behavior) }))}
             />
             <NatBehaviorDistribution
               label="方式"
@@ -806,7 +808,7 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
 
         {natTypeRows.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-tiny text-default-500">设备 NAT 分布：</span>
+            <span className="text-tiny text-default-500">兼容 NAT 标签：</span>
             {natTypeRows.map((item) => (
               <Chip key={item.natType} size="sm" variant="flat" color={natTypeColor(item.natType)}>
                 {natTypeLabel(item.natType)} · {item.devices}
@@ -842,10 +844,10 @@ function PeerNatInsight({
     <section className="flex flex-col gap-3">
       <div className="flex min-w-0 flex-col gap-3">
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-5">
-          <PeerNatMetric label="NAT 已检测" value={`${stats.reported} / ${devicesTotal}`} tone={stats.reported > 0 ? "success" : "default"} />
+          <PeerNatMetric label="行为已上报" value={`${stats.reported} / ${devicesTotal}`} tone={stats.reported > 0 ? "success" : "default"} />
           <PeerNatMetric label="在线设备" value={String(stats.online)} tone={stats.online > 0 ? "success" : "default"} />
           <PeerNatMetric label="直连友好" value={String(stats.directFriendly)} tone={stats.directFriendly > 0 ? "success" : "default"} />
-          <PeerNatMetric label="建议 Relay" value={String(stats.relayPreferred)} tone={stats.relayPreferred > 0 ? "danger" : "default"} />
+          <PeerNatMetric label="Relay 优先" value={String(stats.relayPreferred)} tone={stats.relayPreferred > 0 ? "danger" : "default"} />
           <PeerNatMetric label="新鲜上报" value={String(stats.fresh)} tone={stats.fresh > 0 ? "success" : "default"} />
         </div>
 
@@ -855,7 +857,7 @@ function PeerNatInsight({
               <div>
                 <h3 className="text-base font-semibold">客户端 NAT 探测</h3>
                 <p className="text-small text-default-500">
-                  这里展示 tunnel-client 上报的标准 STUN/TURN 子集探测结果，用于判断 Peer Mesh direct / relay 选择。
+                  原生客户端使用业务 UDP socket 执行 RFC 5780，分别上报映射和过滤行为；兼容 NAT 标签仅用于旧版本识别。
                 </p>
               </div>
               <Chip size="sm" variant="flat">
@@ -904,7 +906,7 @@ function PeerNatInsight({
                     emptyContent="暂无客户端 NAT 检测结果"
                     renderCard={(raw) => {
                       const device = raw as PeerMeshDevice;
-                      const profile = natTypeProfile(device.natType);
+                      const profile = peerNatProfile(device);
                       return (
                         <MobileListCard
                           key={device.clientId}
@@ -926,8 +928,9 @@ function PeerNatInsight({
                           fields={[
                             { label: "虚拟 IP", value: <span className="font-mono">{device.virtualIp || "-"}</span> },
                             { label: "Endpoint", value: <span className="break-all font-mono">{device.lastEndpoint || "-"}</span> },
-                            { label: "映射行为", value: natBehaviorLabel(device.natMappingBehavior) },
-                            { label: "过滤行为", value: natBehaviorLabel(device.natFilteringBehavior) },
+                            { label: "映射行为", value: natMappingBehaviorLabel(device.natMappingBehavior) },
+                            { label: "过滤行为", value: natFilteringBehaviorLabel(device.natFilteringBehavior) },
+                            { label: "兼容标签", value: natTypeLabel(device.natType) },
                             { label: "探测方式", value: natBehaviorDiscoveryLabel(device.natBehaviorDiscovery) },
                             { label: "路径建议", value: profile.reachabilityLabel },
                             { label: "最后上报", value: formatDateTime(peerNatLastReportAt(device)) },
@@ -958,7 +961,7 @@ function PeerNatInsight({
                     </TableHeader>
                     <TableBody items={devices} isLoading={loading} emptyContent="暂无客户端 NAT 检测结果">
                       {(device) => {
-                        const profile = natTypeProfile(device.natType);
+                        const profile = peerNatProfile(device);
                         return (
                           <TableRow key={device.clientId}>
                             <TableCell>
@@ -1007,8 +1010,8 @@ function PeerNatInsight({
           <CardBody className="gap-3 p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h3 className="text-base font-semibold">NAT 类型</h3>
-                <p className="text-small text-default-500">点击类型跳转帮助文档查看详细说明与建议路径。</p>
+                <h3 className="text-base font-semibold">NAT 行为分类</h3>
+                <p className="text-small text-default-500">映射与过滤是相互独立的两个轴，路径选择以实际 ICE 连通性为最终依据。</p>
               </div>
               <Button
                 as="a"
@@ -1019,18 +1022,25 @@ function PeerNatInsight({
                 查看详细文档
               </Button>
             </div>
-            <div className="flex flex-wrap gap-2">
-              {Object.values(NAT_TYPE_PROFILES).map((profile) => (
-                <a
-                  key={profile.key}
-                  href="#/help/peer-mesh#nat-types"
-                  title={profile.summary}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-default-200 bg-default-50 px-2.5 py-1 text-tiny transition-colors hover:border-primary-300 hover:bg-default-100 dark:bg-default-100/10 dark:hover:bg-default-200/10"
-                >
-                  <span className={`inline-block h-2 w-2 rounded-full ${peerNatBarColor(profile.tone)}`} />
-                  <span className="font-medium text-foreground">{profile.label}</span>
-                  <span className="text-default-500">· {profile.reachabilityLabel}</span>
-                </a>
+            <div className="grid gap-4 lg:grid-cols-2">
+              {NAT_BEHAVIOR_AXES.map((axis) => (
+                <div key={axis.title} className="min-w-0">
+                  <div className="mb-2">
+                    <div className="text-small font-semibold">{axis.title}</div>
+                    <div className="text-tiny text-default-500">{axis.subtitle}</div>
+                  </div>
+                  <div className="divide-y divide-default-200 border-y border-default-200">
+                    {axis.items.map((item) => (
+                      <div key={item.code} className="grid grid-cols-[56px_minmax(0,1fr)] gap-2 py-2 text-small">
+                        <span className="font-mono font-semibold text-primary">{item.code}</span>
+                        <span className="min-w-0">
+                          <span className="font-medium">{item.label}</span>
+                          <span className="ml-1 text-default-500">{item.detail}</span>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
           </CardBody>
@@ -1047,7 +1057,7 @@ function PeerNatBehaviorLine({ device }: { device: PeerMeshDevice }) {
   }
   const discovery = natBehaviorDiscoveryLabel(device.natBehaviorDiscovery);
   const detail = hasBehavior
-    ? `映射 ${natBehaviorLabel(device.natMappingBehavior)} · 过滤 ${natBehaviorLabel(device.natFilteringBehavior)}`
+    ? `映射 ${natMappingBehaviorLabel(device.natMappingBehavior)} · 过滤 ${natFilteringBehaviorLabel(device.natFilteringBehavior)}`
     : `${discovery} · 行为未细分`;
   return (
     <span className="truncate text-tiny text-default-500" title={hasBehavior ? `${discovery} · ${detail}` : detail}>
@@ -1143,7 +1153,7 @@ function PeerNatTypeFilterHeader({
 }) {
   const active = filter !== "all";
   const activeOption = peerNatFilterOptions.find((option) => option.key === filter) ?? peerNatFilterOptions[0];
-  const label = active ? `NAT: ${activeOption.label}` : "NAT 类型";
+  const label = active ? `状态: ${activeOption.label}` : "NAT 状态";
 
   return (
     <div className="flex min-w-0 items-center gap-1">
@@ -1154,11 +1164,11 @@ function PeerNatTypeFilterHeader({
         <PopoverTrigger>
           <Button
             isIconOnly
-            aria-label="筛选 NAT 类型"
+            aria-label="筛选 NAT 状态"
             className="h-7 min-w-7 text-default-500"
             color={active ? "primary" : "default"}
             size="sm"
-            title="筛选 NAT 类型"
+            title="筛选 NAT 状态"
             variant={active ? "flat" : "light"}
           >
             <PeerNatFilterIcon />
@@ -1166,7 +1176,7 @@ function PeerNatTypeFilterHeader({
         </PopoverTrigger>
         <PopoverContent className="w-56 p-3">
           <div className="flex w-full flex-col gap-3">
-            <div className="text-small font-semibold">NAT 类型筛选</div>
+            <div className="text-small font-semibold">NAT 状态筛选</div>
             <select
               className="h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small outline-none transition-colors hover:border-default-300 focus:border-primary"
               value={filter}
@@ -1195,16 +1205,17 @@ function PeerNatFilterIcon() {
 }
 
 function buildPeerNatStats(devices: PeerMeshDevice[]) {
-  const distributionMap = new Map<string, number>();
+  const distributionMap = new Map<string, { profile: ReturnType<typeof natClassificationProfile>; count: number }>();
   let directFriendly = 0;
   let relayPreferred = 0;
   let reported = 0;
   let fresh = 0;
 
   for (const device of devices) {
-    const profile = natTypeProfile(device.natType);
-    distributionMap.set(profile.key, (distributionMap.get(profile.key) ?? 0) + 1);
-    if (device.natType) {
+    const profile = peerNatProfile(device);
+    const current = distributionMap.get(profile.key);
+    distributionMap.set(profile.key, { profile, count: (current?.count ?? 0) + 1 });
+    if (device.natType || device.natMappingBehavior || device.natFilteringBehavior || device.natBehaviorDiscovery) {
       reported += 1;
     }
     if (profile.reachability === "direct" || profile.reachability === "likely") {
@@ -1218,12 +1229,11 @@ function buildPeerNatStats(devices: PeerMeshDevice[]) {
     }
   }
 
-  const distribution = Array.from(distributionMap.entries())
-    .map(([key, count]) => ({ profile: natTypeProfile(key === "UNKNOWN" ? null : key), count }))
+  const distribution = Array.from(distributionMap.values())
     .sort(
       (left, right) =>
         right.count - left.count ||
-        natReachabilityWeight(right.profile.key) - natReachabilityWeight(left.profile.key),
+        natProfileReachabilityWeight(right.profile) - natProfileReachabilityWeight(left.profile),
     );
 
   return {
@@ -1240,7 +1250,7 @@ function PeerNatDistributionRow({
   item,
   total,
 }: {
-  item: { profile: ReturnType<typeof natTypeProfile>; count: number };
+  item: { profile: ReturnType<typeof natClassificationProfile>; count: number };
   total: number;
 }) {
   const percent = Math.round((item.count / total) * 100);
@@ -1285,7 +1295,7 @@ function PeerNatMetric({
 }
 
 function matchPeerNatFilter(device: PeerMeshDevice, filter: PeerNatFilterKey) {
-  const profile = natTypeProfile(device.natType);
+  const profile = peerNatProfile(device);
   switch (filter) {
     case "online":
       return device.online;
@@ -1294,7 +1304,7 @@ function matchPeerNatFilter(device: PeerMeshDevice, filter: PeerNatFilterKey) {
     case "relay":
       return profile.reachability === "relay";
     case "unknown":
-      return !device.natType;
+      return !device.natType && !device.natMappingBehavior && !device.natFilteringBehavior;
     default:
       return true;
   }
@@ -1303,9 +1313,32 @@ function matchPeerNatFilter(device: PeerMeshDevice, filter: PeerNatFilterKey) {
 function comparePeerNatDevice(left: PeerMeshDevice, right: PeerMeshDevice) {
   return (
     Number(right.online) - Number(left.online) ||
-    natReachabilityWeight(right.natType) - natReachabilityWeight(left.natType) ||
+    natProfileReachabilityWeight(peerNatProfile(right)) - natProfileReachabilityWeight(peerNatProfile(left)) ||
     Date.parse(peerNatLastReportAt(right) || "") - Date.parse(peerNatLastReportAt(left) || "")
   );
+}
+
+function peerNatProfile(device: PeerMeshDevice) {
+  return natClassificationProfile(
+    device.natType,
+    device.natMappingBehavior,
+    device.natFilteringBehavior,
+  );
+}
+
+function natProfileReachabilityWeight(profile: ReturnType<typeof natClassificationProfile>) {
+  switch (profile.reachability) {
+    case "direct":
+      return 4;
+    case "likely":
+      return 3;
+    case "conditional":
+      return 2;
+    case "relay":
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 function peerNatLastReportAt(device: PeerMeshDevice) {
@@ -1437,7 +1470,7 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
               </div>
               <div className="mt-2 flex flex-wrap gap-1 text-tiny text-default-500">
                 <span>{device.ownerUsername || "-"}</span>
-                <span>{natTypeLabel(device.natType)}</span>
+                <span>{peerNatProfile(device).shortLabel}</span>
               </div>
             </div>
           ))}

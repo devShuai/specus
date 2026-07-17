@@ -13,14 +13,14 @@ import { ThemeToggleButton } from "../../components/ThemeToggleButton";
 import { HeroRuntime } from "../../components/HeroRuntime";
 import { PublicToolsMenu } from "../../components/PublicToolsMenu";
 import { notify } from "../../components/toast";
-import { fetchPublicPeerStunConfig } from "../../api/client";
+import { fetchPublicNatProbeConfig, fetchPublicPeerStunConfig } from "../../api/client";
+import type { PublicNatProbeConfig, PublicNatProbeEndpoint } from "../../api/types";
 import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
 import { usePageSeo } from "../../lib/seo";
 
-const FALLBACK_SELF_HOSTED_STUN_HOST = "tunnel.devshuai.com";
-const PUBLIC_STUN_SERVERS = [
-  "stun:stun.miwifi.com:3478",
-  "stun:stun.chat.bilibili.com:3478",
+export const DEFAULT_NAT_STUN_SERVERS = [
+  "stun:stun1.tunnel.devshuai.com:34780",
+  "stun:stun2.tunnel.devshuai.com:34780",
 ];
 const UNASSIGNED_STUN_SERVER = "未归属 ICE candidate";
 const MIN_CHECKING_DISPLAY_MS = 900;
@@ -32,28 +32,8 @@ async function waitForMinimumCheckingDisplay(startedAt: number): Promise<void> {
   }
 }
 
-function defaultStunServers(): string[] {
-  return uniqueStunServers([selfHostedStunServerFromLocation(), ...PUBLIC_STUN_SERVERS]);
-}
-
-function selfHostedStunServerFromLocation(): string {
-  if (typeof window === "undefined") {
-    return `stun:${FALLBACK_SELF_HOSTED_STUN_HOST}:3478`;
-  }
-  const host = window.location.hostname;
-  const normalizedHost = host && !isLocalBrowserHost(host) ? host : FALLBACK_SELF_HOSTED_STUN_HOST;
-  return `stun:${bracketIpv6(normalizedHost)}:3478`;
-}
-
-function isLocalBrowserHost(host: string): boolean {
-  return host === "localhost"
-    || host === "127.0.0.1"
-    || host === "::1"
-    || host.endsWith(".local");
-}
-
-function bracketIpv6(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+export function defaultStunServers(): string[] {
+  return uniqueStunServers(DEFAULT_NAT_STUN_SERVERS);
 }
 
 function uniqueStunServers(values: Array<string | null | undefined>): string[] {
@@ -82,6 +62,31 @@ function normalizeStunUrl(value: string | null | undefined): string {
     return trimmed.replace(/^stun:\/\//i, "stun:");
   }
   return `stun:${trimmed}`;
+}
+
+function rfc5780ProbeEndpoints(config: PublicNatProbeConfig | null): PublicNatProbeEndpoint[] {
+  if (!config?.available || config.discoveryMethod !== "RFC5780") {
+    return [];
+  }
+  const endpoints = config.endpoints.filter((endpoint) =>
+    ["A1P1", "A1P2", "A2P1", "A2P2"].includes(endpoint.id)
+      && Boolean(normalizeStunUrl(endpoint.url)),
+  );
+  return new Set(endpoints.map((endpoint) => endpoint.id)).size === 4 ? endpoints : [];
+}
+
+function activeRfc5780ProbeConfig(
+  config: PublicNatProbeConfig | null,
+  selectedServers: string[],
+): PublicNatProbeConfig | null {
+  const endpoints = rfc5780ProbeEndpoints(config);
+  if (!config || endpoints.length !== 4) {
+    return null;
+  }
+  const selected = new Set(selectedServers.map((server) => normalizeStunUrl(server).toLowerCase()));
+  return endpoints.every((endpoint) => selected.has(normalizeStunUrl(endpoint.url).toLowerCase()))
+    ? { ...config, endpoints }
+    : null;
 }
 
 type BrowserNatKind =
@@ -116,6 +121,24 @@ interface StunProbeResult {
   sourceKnown: boolean;
 }
 
+interface StunEndpointCheck {
+  endpoint: PublicNatProbeEndpoint;
+  reachable: boolean;
+  mappedEndpoint: string | null;
+  elapsedMs: number;
+  error: string | null;
+}
+
+type BrowserNatVerificationMethod = "RFC5780_WEBRTC_MAPPING" | "MULTI_STUN_WEBRTC";
+type BrowserNatMappingBehavior =
+  | "NO_NAT"
+  | "ENDPOINT_INDEPENDENT"
+  | "ADDRESS_DEPENDENT"
+  | "ADDRESS_AND_PORT_DEPENDENT"
+  | "TARGET_DEPENDENT"
+  | "UNKNOWN";
+type BrowserNatFilteringBehavior = "BROWSER_NOT_OBSERVABLE" | "UNKNOWN";
+
 interface AttributedSrflxObservation {
   server: string;
   candidate: BrowserIceCandidate;
@@ -133,9 +156,13 @@ export interface BrowserNatResult {
   evidence: string;
   summary: string;
   recommendation: string;
+  verificationMethod: BrowserNatVerificationMethod;
+  mappingBehavior: BrowserNatMappingBehavior;
+  filteringBehavior: BrowserNatFilteringBehavior;
+  endpointChecks: StunEndpointCheck[];
 }
 
-type NatCheckProgressPhase = "idle" | "preparing" | "probing" | "analyzing" | "complete";
+type NatCheckProgressPhase = "idle" | "preparing" | "validating" | "probing" | "analyzing" | "complete";
 
 interface NatCheckProgress {
   phase: NatCheckProgressPhase;
@@ -205,8 +232,8 @@ const BROWSER_NAT_CLASSIFICATIONS: Record<BrowserNatLevel, BrowserNatOutcome> = 
   },
   3: {
     level: 3,
-    title: "稳定映射型 NAT",
-    description: "多个 STUN 目标看到同一个公网端点，但端口已被改写。浏览器无法继续区分 Full Cone、Restricted 或 Port Restricted。",
+    title: "端点无关映射 NAT",
+    description: "A1/A2、P1/P2 四端点共享探测未观察到公网映射随目标变化，但公网端口已被改写。它更接近现代术语 EIM；过滤行为仍需原生 RFC 5780 探测。",
     reachability: "条件直连",
     tone: "warning",
     frameClass: "border-amber-500/40 bg-amber-500/[0.08] dark:border-amber-400/35 dark:bg-amber-400/[0.1]",
@@ -223,8 +250,8 @@ const BROWSER_NAT_CLASSIFICATIONS: Record<BrowserNatLevel, BrowserNatOutcome> = 
   },
   4: {
     level: 4,
-    title: "对称映射型 NAT",
-    description: "同一个本机连接访问不同目标时得到不同公网映射，属于目标相关映射，外部节点较难提前获知可用端点。",
+    title: "目标相关映射 NAT",
+    description: "同一个本机 UDP 基址访问不同地址或端口时得到不同公网映射，属于 ADM / APDM，传统工具通常称为 Symmetric NAT。",
     reachability: "建议 Relay",
     tone: "danger",
     frameClass: "border-rose-500/40 bg-rose-500/[0.07] dark:border-rose-400/35 dark:bg-rose-400/[0.1]",
@@ -254,6 +281,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
   const initialServers = useMemo(() => defaultStunServers(), []);
   const [defaultServers, setDefaultServers] = useState(initialServers);
   const [selfHostedStunServer, setSelfHostedStunServer] = useState(initialServers[0] ?? "");
+  const [natProbeConfig, setNatProbeConfig] = useState<PublicNatProbeConfig | null>(null);
   const [serversText, setServersText] = useState(initialServers.join("\n"));
   const [timeoutMs, setTimeoutMs] = useState("9000");
   const [result, setResult] = useState<BrowserNatResult | null>(null);
@@ -274,20 +302,27 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
 
   useEffect(() => {
     let active = true;
-    void fetchPublicPeerStunConfig().then((config) => {
-      if (!active || !config) {
+    void Promise.all([
+      fetchPublicPeerStunConfig(),
+      fetchPublicNatProbeConfig(),
+    ]).then(([config, probeConfig]) => {
+      if (!active) {
         return;
       }
-      const nextServers = uniqueStunServers([
-        config.selfHostedStunServer,
-        ...config.stunServers,
-        ...PUBLIC_STUN_SERVERS,
-      ]);
+      setNatProbeConfig(probeConfig);
+      const topologyServers = rfc5780ProbeEndpoints(probeConfig).map((endpoint) => endpoint.url);
+      const nextServers = topologyServers.length === 4
+        ? uniqueStunServers(topologyServers)
+        : uniqueStunServers([
+            config?.selfHostedStunServer,
+            ...(config?.stunServers ?? []),
+            ...DEFAULT_NAT_STUN_SERVERS,
+          ]);
       if (nextServers.length === 0) {
         return;
       }
       const previousDefaultText = defaultStunServers().join("\n");
-      setSelfHostedStunServer(config.selfHostedStunServer || nextServers[0] || "");
+      setSelfHostedStunServer(config?.selfHostedStunServer || nextServers[0] || "");
       setDefaultServers(nextServers);
       setServersText((current) => (current === previousDefaultText ? nextServers.join("\n") : current));
     });
@@ -301,10 +336,10 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
       ? {
           title: "在线 NAT 类型检测 · 浏览器 STUN 探测 · shuai-tunnel",
           description:
-            "免登录在线检测当前网络的 NAT 类型：Symmetric NAT、Port Preserved NAT、Cone-like NAT、UDP 阻断。基于 WebRTC + STUN，无需安装客户端，支持 IPv4 / IPv6。",
+            "免登录在线检测当前网络的 NAT 映射行为：使用 RFC 5780 四端点预检与共享 WebRTC ICE 探测，识别 EIM、ADM、APDM、端口保持与 UDP 阻断。",
           canonical: "https://tunnel.devshuai.com/nat-detect",
           keywords:
-            "NAT 检测,NAT 类型,Symmetric NAT,Full Cone NAT,Port Restricted NAT,STUN,WebRTC,在线 NAT 测试,UDP 打洞,P2P 直连,IPv6 NAT",
+            "NAT 检测,NAT 类型,EIM,ADM,APDM,Symmetric NAT,RFC 5780,RFC 8489,STUN,WebRTC,在线 NAT 测试,UDP 打洞,P2P 直连",
           jsonLd: [
             {
               "@context": "https://schema.org",
@@ -315,7 +350,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
               "browserRequirements": "需要支持 WebRTC 的现代浏览器 (Chrome / Edge / Firefox / Safari)",
               "operatingSystem": "Web",
               "description":
-                "免登录在线检测当前网络的 NAT 类型与公网映射稳定性，基于 WebRTC RTCPeerConnection + 标准 STUN 协议，识别 Symmetric NAT / Port Preserved NAT / Cone-like NAT 与 UDP 阻断。",
+                "免登录在线检测当前网络的 NAT 映射行为与公网映射稳定性，基于 RFC 5780 四端点和 WebRTC 共享 ICE socket，识别 EIM、ADM、APDM、端口保持与 UDP 阻断。",
               "isAccessibleForFree": true,
             },
             {
@@ -324,20 +359,20 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
               "mainEntity": [
                 {
                   "@type": "Question",
-                  "name": "什么是 Symmetric NAT？为什么打洞会失败？",
+                  "name": "什么是目标相关映射？为什么打洞更困难？",
                   "acceptedAnswer": {
                     "@type": "Answer",
                     "text":
-                      "Symmetric NAT 会根据目标地址或端口生成不同的公网映射端点。同一本机 socket 向 STUN A 与 STUN B 发送 binding 时，得到的公网 IP:Port 不同。打洞依赖对端用我们告知的公网端点回包，因此通常难以成功；客户端仍会尝试 direct candidate，失败后通常回退 relay。",
+                      "地址相关映射 ADM 或地址和端口相关映射 APDM 会根据目标地址或端口生成不同公网端点，传统工具常统称为 Symmetric NAT。一次 STUN 结果难以预测访问另一个目标时的端点，因此 UDP 打洞更困难，应保留 TURN 或 Relay 回退。",
                   },
                 },
                 {
                   "@type": "Question",
-                  "name": "浏览器为什么不能区分 Full Cone / Restricted / Port Restricted？",
+                  "name": "浏览器能完整判断 NAT 的映射和过滤行为吗？",
                   "acceptedAnswer": {
                     "@type": "Answer",
                     "text":
-                      "区分这三类需要让 STUN 服务端从备用 IP / 备用端口主动给浏览器发包，看浏览器能否接收。WebRTC RTCPeerConnection 没有暴露这种回调接口，所以浏览器侧只能合并这三类为 Cone-like NAT。",
+                      "浏览器可用同一个 WebRTC ICE socket 访问 A1/A2、P1/P2 四端点来观察映射是否随目标变化，但页面不能构造 RFC 5780 CHANGE-REQUEST，因此不能完整区分 EIF、ADF、APDF 过滤行为。过滤轴需要原生客户端验证。",
                   },
                 },
                 {
@@ -346,7 +381,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
                   "acceptedAnswer": {
                     "@type": "Answer",
                     "text":
-                      "检测完全在本地浏览器内进行，不向 shuai-tunnel 后端上传任何数据。浏览器会创建一个空的 WebRTC data channel，触发 ICE candidate 收集，并向你配置的多个 STUN 服务器发送 binding 请求。",
+                      "页面只从 shuai-tunnel 接口读取 STUN 拓扑，不上传检测结果。浏览器会创建一个空的 WebRTC data channel，触发 ICE candidate 收集，并向配置的 STUN 端点发送 Binding 请求；不会读取摄像头或麦克风。",
                   },
                 },
               ],
@@ -374,6 +409,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
       ? Math.min(15000, Math.max(3000, numericTimeout))
       : 7000;
     const selectedServers = servers.length > 0 ? servers : defaultServers;
+    const activeProbeConfig = activeRfc5780ProbeConfig(natProbeConfig, selectedServers);
     activeProbeRef.current?.abort();
     const controller = new AbortController();
     activeProbeRef.current = controller;
@@ -403,6 +439,10 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
           evidence: "浏览器不支持 RTCPeerConnection",
           summary: "当前浏览器不支持 WebRTC RTCPeerConnection，无法在页面内执行 STUN 探测。",
           recommendation: "换用 Chrome、Edge、Firefox 等支持 WebRTC 的浏览器，或使用客户端侧 NAT 探测结果。",
+          verificationMethod: activeProbeConfig ? "RFC5780_WEBRTC_MAPPING" : "MULTI_STUN_WEBRTC",
+          mappingBehavior: "UNKNOWN",
+          filteringBehavior: "UNKNOWN",
+          endpointChecks: [],
         };
         setProgress({
           phase: "analyzing",
@@ -428,6 +468,31 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         return;
       }
 
+      let endpointChecks: StunEndpointCheck[] = [];
+      if (activeProbeConfig) {
+        setProgress({
+          phase: "validating",
+          percent: 12,
+          responded: 0,
+          total: activeProbeConfig.endpoints.length,
+          unattributedMapping: false,
+          label: "正在验证 RFC 5780 四端点",
+        });
+        endpointChecks = await validateStunEndpoints(
+          activeProbeConfig.endpoints,
+          Math.min(probeTimeoutMs, 7000),
+          controller.signal,
+        );
+        const reachable = endpointChecks.filter((check) => check.reachable).length;
+        setProgress({
+          phase: "probing",
+          percent: 30,
+          responded: reachable,
+          total: endpointChecks.length,
+          unattributedMapping: false,
+          label: `四端点预检 ${reachable}/${endpointChecks.length} 可达，正在共享映射探测`,
+        });
+      }
       const probes = await probeStunServers(selectedServers, probeTimeoutMs, setProgress, controller.signal);
       if (controller.signal.aborted) {
         return;
@@ -444,7 +509,10 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         unattributedMapping,
         label: "正在分析公网映射特征",
       });
-      const nextResult = classifyBrowserNatResult(startedAt, probes);
+      const nextResult = classifyBrowserNatResult(startedAt, probes, {
+        probeConfig: activeProbeConfig,
+        endpointChecks,
+      });
       await waitForMinimumCheckingDisplay(startedAt);
       if (controller.signal.aborted) {
         return;
@@ -474,6 +542,10 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         evidence: "检测流程异常",
         summary: error instanceof Error ? error.message : "浏览器 NAT 检测失败。",
         recommendation: "检查浏览器是否允许 WebRTC，或尝试更换 STUN 服务地址。",
+        verificationMethod: activeProbeConfig ? "RFC5780_WEBRTC_MAPPING" : "MULTI_STUN_WEBRTC",
+        mappingBehavior: "UNKNOWN",
+        filteringBehavior: "UNKNOWN",
+        endpointChecks: [],
       };
       await waitForMinimumCheckingDisplay(startedAt);
       if (controller.signal.aborted) {
@@ -518,12 +590,14 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
             timeoutMs={timeoutMs}
             onTimeoutChange={setTimeoutMs}
             selfHostedStunServer={selfHostedStunServer}
+            natProbeConfig={natProbeConfig}
             onResetServers={() => setServersText(defaultServers.join("\n"))}
           />
 
           {result && <NatResultDetails result={result} />}
 
-          <NatTips />
+          <NatTypeGuide probeConfig={natProbeConfig} />
+          <NatTips probeConfig={natProbeConfig} />
         </section>
       </main>
     );
@@ -543,9 +617,11 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         timeoutMs={timeoutMs}
         onTimeoutChange={setTimeoutMs}
         selfHostedStunServer={selfHostedStunServer}
+        natProbeConfig={natProbeConfig}
         onResetServers={() => setServersText(defaultServers.join("\n"))}
       />
       {result && <NatResultDetails result={result} />}
+      <NatTypeGuide probeConfig={natProbeConfig} compact />
     </div>
   );
 }
@@ -561,6 +637,7 @@ interface NatHeroProps {
   timeoutMs: string;
   onTimeoutChange: (value: string) => void;
   selfHostedStunServer: string;
+  natProbeConfig: PublicNatProbeConfig | null;
   onResetServers: () => void;
 }
 
@@ -575,6 +652,7 @@ function NatHero({
   timeoutMs,
   onTimeoutChange,
   selfHostedStunServer,
+  natProbeConfig,
   onResetServers,
 }: NatHeroProps) {
   const profile = browserNatProfile(checking ? "checking" : result?.kind ?? "idle");
@@ -623,6 +701,9 @@ function NatHero({
                   耗时 {Math.max(0, result.finishedAt - result.startedAt)} ms
                 </span>
               )}
+              <span className="rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium text-zinc-600 dark:text-zinc-300">
+                {rfc5780ProbeEndpoints(natProbeConfig).length === 4 ? "RFC 5780 四端点" : "WebRTC 多 STUN"}
+              </span>
               {result && (
                 <span className="flex items-center gap-1.5 rounded-md glass-chip px-2 py-0.5 text-tiny text-zinc-600 dark:text-zinc-300">
                   <ConfidenceBars confidence={result.confidence} />
@@ -670,14 +751,16 @@ function NatHero({
           </summary>
           <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
             <Textarea
-              label="STUN 服务（每行一个，默认中国节点）"
+              label="STUN 服务（每行一个，默认主备节点）"
               size="sm"
               variant="bordered"
               radius="sm"
               minRows={2}
               value={serversText}
               onValueChange={onServersTextChange}
-              description={`默认优先使用自建 STUN${selfHostedStunServer ? `（${selfHostedStunServer}）` : ""}，再使用国内公共 STUN。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
+              description={rfc5780ProbeEndpoints(natProbeConfig).length === 4
+                ? "默认使用自建 A1/A2、P1/P2 四端点。页面先逐一验证可达性，再用同一 ICE socket 对比映射；不会使用 TURN relay。"
+                : `默认使用 shuai-tunnel 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
             />
             <Input
               label="单服务超时"
@@ -849,6 +932,15 @@ function NatOutcomeCard({
         {outcome.description}
       </p>
 
+      <div className="mt-4 grid gap-px overflow-hidden rounded-lg border border-black/[0.07] bg-black/[0.07] dark:border-white/10 dark:bg-white/10 sm:grid-cols-3">
+        <NatEvidenceFact label="映射行为" value={mappingBehaviorText(result.mappingBehavior)} />
+        <NatEvidenceFact
+          label="过滤行为"
+          value={result.filteringBehavior === "BROWSER_NOT_OBSERVABLE" ? "需原生 RFC 5780 验证" : "本轮未知"}
+        />
+        <NatEvidenceFact label="验证方法" value={verificationMethodLabel(result.verificationMethod)} />
+      </div>
+
       <div className="mt-5 grid gap-3 sm:grid-cols-2">
         <NatImpactCard title="游戏联机" experience={outcome.game} />
         <NatImpactCard title="P2P / 语音视频" experience={outcome.p2p} />
@@ -879,6 +971,19 @@ function NatOutcomeCard({
       </div>
     </article>
   );
+}
+
+function NatEvidenceFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-white/55 px-3 py-2.5 dark:bg-zinc-950/55">
+      <p className="text-tiny text-zinc-500 dark:text-zinc-400">{label}</p>
+      <p className="mt-0.5 text-small font-semibold text-zinc-900 dark:text-zinc-100">{value}</p>
+    </div>
+  );
+}
+
+function verificationMethodLabel(method: BrowserNatVerificationMethod): string {
+  return method === "RFC5780_WEBRTC_MAPPING" ? "四端点 + 共享 ICE" : "多 STUN 共享 ICE";
 }
 
 function NatImpactCard({ title, experience }: { title: string; experience: BrowserNatExperience }) {
@@ -984,19 +1089,23 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
   ).length;
   const items = [
     {
-      label: "STUN 服务",
-      value: result ? `${respondedCount}/${knownProbes.length}` : "—",
-      hint: "返回公网映射的 STUN 服务数 / 参与探测的总数。返回数越多，NAT 类型结论越可靠。",
+      label: result?.endpointChecks.length ? "四端点预检" : "STUN 服务",
+      value: result?.endpointChecks.length
+        ? `${result.endpointChecks.filter((check) => check.reachable).length}/${result.endpointChecks.length}`
+        : result ? `${respondedCount}/${knownProbes.length}` : "—",
+      hint: result?.endpointChecks.length
+        ? "先分别验证 A1:P1、A1:P2、A2:P1、A2:P2 可达，防止把服务端点不可达误判成 NAT 行为。"
+        : "返回公网映射的 STUN 服务数 / 参与探测的总数。返回数越多，映射结论越可靠。",
+    },
+    {
+      label: "映射行为",
+      value: result ? mappingBehaviorShortLabel(result.mappingBehavior) : "—",
+      hint: "EIM 表示映射不随目标变化；ADM/APDM 表示映射依赖目标地址或端口。映射和过滤是两个独立维度。",
     },
     {
       label: "公网映射端点",
       value: result ? String(result.mappedEndpoints.length) : "—",
-      hint: "NAT 分配给本机的公网 IP:Port（server-reflexive）。同一地址族出现多个不同端点，通常意味着 Symmetric NAT。",
-    },
-    {
-      label: "本地候选",
-      value: result ? String(result.hostCandidates.length) : "—",
-      hint: "本机网卡上收集到的 host candidate 数量，包含内网 IPv4 / IPv6 地址或浏览器的 mDNS 混淆地址。",
+      hint: "NAT 分配给本机的公网 IP:Port。同一 UDP 基址因目标变化出现多个端点，表示目标相关映射。",
     },
     {
       label: "总耗时",
@@ -1027,9 +1136,27 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
   );
 }
 
+function mappingBehaviorShortLabel(mapping: BrowserNatMappingBehavior): string {
+  switch (mapping) {
+    case "ENDPOINT_INDEPENDENT":
+      return "EIM";
+    case "ADDRESS_DEPENDENT":
+      return "ADM";
+    case "ADDRESS_AND_PORT_DEPENDENT":
+      return "APDM";
+    case "TARGET_DEPENDENT":
+      return "目标相关";
+    case "NO_NAT":
+      return "无 NAT";
+    default:
+      return "未知";
+  }
+}
+
 function NatResultDetails({ result }: { result: BrowserNatResult }) {
   return (
     <div className="mt-6 flex flex-col gap-4">
+      {result.endpointChecks.length > 0 && <Rfc5780EndpointCard checks={result.endpointChecks} />}
       <MappedEndpointsCard result={result} />
       <StunProbesCard result={result} />
       <CandidateTableCard result={result} />
@@ -1091,11 +1218,17 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
   const respondedCount = knownProbes.filter((probe) =>
     probe.candidates.some((candidate) => candidate.type === "srflx"),
   ).length;
-  const headDotClass = respondedCount === 0
-    ? "text-rose-500"
-    : respondedCount < knownProbes.length
-      ? "text-amber-500"
-      : "text-emerald-500";
+  const allTopologyEndpointsReachable = result.endpointChecks.length >= 4
+    && result.endpointChecks.every((check) => check.reachable);
+  const sharedCandidateDeduplicated = result.mappingBehavior === "ENDPOINT_INDEPENDENT"
+    && allTopologyEndpointsReachable;
+  const headDotClass = sharedCandidateDeduplicated
+    ? "text-emerald-500"
+    : respondedCount === 0
+      ? "text-rose-500"
+      : respondedCount < knownProbes.length
+        ? "text-amber-500"
+        : "text-emerald-500";
 
   return (
     <Card shadow="none" className="rounded-xl border glass glass-border">
@@ -1103,15 +1236,27 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <span className="flex items-center gap-2">
             <DotIcon className={headDotClass} />
-            <h2 className="text-base font-semibold">STUN 服务状态</h2>
+            <h2 className="text-base font-semibold">共享 ICE 映射归属</h2>
           </span>
           <span className="text-tiny text-zinc-500 dark:text-zinc-400">
-            每个 STUN 服务是否返回公网映射，以及它看到的端点
+            浏览器可能合并多个端点返回的相同公网候选
           </span>
         </div>
+        {sharedCandidateDeduplicated && (
+          <p className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2 text-tiny leading-5 text-emerald-800 dark:border-emerald-300/20 dark:bg-emerald-300/[0.08] dark:text-emerald-100">
+            四端点均已通过独立预检。共享 ICE 只暴露一个相同公网映射，其余端点标记为候选去重，不代表服务不可达。
+          </p>
+        )}
         <div className="flex flex-col gap-2">
           {result.probes.map((probe) => {
-            const status = probeStatus(probe);
+            const preflightCheck = result.endpointChecks.find(
+              (check) => normalizeStunUrl(check.endpoint.url).toLowerCase()
+                === normalizeStunUrl(probe.server).toLowerCase(),
+            );
+            const candidateDeduplicated = sharedCandidateDeduplicated
+              && Boolean(preflightCheck?.reachable)
+              && !probe.candidates.some((candidate) => candidate.type === "srflx");
+            const status = probeStatus(probe, candidateDeduplicated);
             const endpoints = Array.from(
               new Set(
                 probe.candidates
@@ -1142,7 +1287,7 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
                     ))}
                   </span>
                 )}
-                {probe.error && (
+                {probe.error && !candidateDeduplicated && (
                   <p className={`w-full text-tiny ${probe.sourceKnown ? "text-danger" : "text-zinc-500 dark:text-zinc-400"}`}>
                     {probe.error}
                   </p>
@@ -1156,7 +1301,7 @@ function StunProbesCard({ result }: { result: BrowserNatResult }) {
   );
 }
 
-function probeStatus(probe: StunProbeResult): {
+function probeStatus(probe: StunProbeResult, candidateDeduplicated = false): {
   color: "success" | "warning" | "danger" | "default";
   label: string;
 } {
@@ -1165,6 +1310,9 @@ function probeStatus(probe: StunProbeResult): {
   }
   if (probe.candidates.some((candidate) => candidate.type === "srflx")) {
     return { color: "success", label: "已返回映射" };
+  }
+  if (candidateDeduplicated) {
+    return { color: "default", label: "预检可达 · 候选去重" };
   }
   if (probe.error) {
     return { color: "danger", label: "超时/失败" };
@@ -1285,11 +1433,143 @@ function CandidateTableCard({ result }: { result: BrowserNatResult }) {
   );
 }
 
-function NatTips() {
+const NAT_LEVEL_GUIDE = [
+  {
+    level: 1,
+    title: "公网直连型",
+    modern: "未观察到 NAT 转换",
+    signal: "公网候选地址和端口与本地 UDP 基址一致。",
+    detail: "这通常表示设备直接持有公网地址，但不代表入站一定开放；本机防火墙、云安全组或运营商策略仍可能拦截数据。",
+    impact: "直连条件最好，仍应通过 ICE 连通性检查确认真实路径。",
+    tone: "border-emerald-500/35 text-emerald-700 dark:border-emerald-300/35 dark:text-emerald-200",
+  },
+  {
+    level: 2,
+    title: "端口保持型 NAT",
+    modern: "EIM + 端口保持",
+    signal: "四端点共享映射稳定，公网端口与本地源端口相同。",
+    detail: "端口保持是端口分配特征，不是独立的 cone 类型。它让对端更容易预测候选端口，但过滤策略仍可能很严格。",
+    impact: "通常利于 UDP 打洞，遇到严格过滤或目标相关映射对端时仍可能中继。",
+    tone: "border-blue-500/35 text-blue-700 dark:border-blue-300/35 dark:text-blue-200",
+  },
+  {
+    level: 3,
+    title: "端点无关映射 NAT",
+    modern: "Endpoint-Independent Mapping",
+    signal: "访问 A1/A2、P1/P2 时公网映射不变，但端口发生转换。",
+    detail: "它可能对应旧称 Full Cone、Restricted Cone 或 Port Restricted Cone；三者的差别在过滤轴，浏览器页面不能用 ICE candidate 完整区分。",
+    impact: "映射侧对直连友好，实际成功率取决于双方过滤行为和防火墙。",
+    tone: "border-amber-500/40 text-amber-800 dark:border-amber-300/40 dark:text-amber-100",
+  },
+  {
+    level: 4,
+    title: "目标相关映射 NAT",
+    modern: "ADM / APDM，旧称 Symmetric NAT",
+    signal: "同一 UDP 基址因目标 IP 或端口不同而获得不同公网映射。",
+    detail: "ADM 依赖目标地址，APDM 同时依赖目标地址和端口。对端难以通过一次 STUN 结果预测后续目标可用的公网端点。",
+    impact: "直连可预测性最低，应并行尝试候选并快速准备 TURN / Relay。",
+    tone: "border-rose-500/40 text-rose-700 dark:border-rose-300/40 dark:text-rose-200",
+  },
+] as const;
+
+function NatTypeGuide({
+  probeConfig,
+  compact = false,
+}: {
+  probeConfig: PublicNatProbeConfig | null;
+  compact?: boolean;
+}) {
+  const topologyAvailable = rfc5780ProbeEndpoints(probeConfig).length === 4;
+  const capabilities = probeConfig?.capabilities;
+
+  return (
+    <section className={compact ? "mt-4" : "mt-10"} aria-labelledby="nat-type-guide-title">
+      <div className="flex flex-wrap items-end justify-between gap-3 border-b border-black/10 pb-4 dark:border-white/10">
+        <div className="max-w-3xl">
+          <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">NAT1-4 直连难度分级</p>
+          <h2 id="nat-type-guide-title" className="mt-1 text-xl font-semibold text-zinc-950 dark:text-white sm:text-2xl">
+            映射决定端点是否可预测，过滤决定谁能回包
+          </h2>
+          <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-300">
+            NAT1-4 是本页面为了直观展示而使用的分级，不是 IETF 标准类型。现代诊断应把映射行为和过滤行为分开记录。
+          </p>
+        </div>
+        <Chip size="sm" radius="sm" variant="flat" color={topologyAvailable ? "success" : "warning"}>
+          {topologyAvailable ? "RFC 5780 拓扑已下发" : "基础 STUN 兼容模式"}
+        </Chip>
+      </div>
+
+      <div className="grid border-b border-black/10 dark:border-white/10 md:grid-cols-2">
+        <div className="py-4 pr-0 md:pr-6">
+          <p className="text-small font-semibold text-zinc-900 dark:text-white">映射行为 Mapping</p>
+          <p className="mt-1 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+            EIM 不随目标变化；ADM 随目标 IP 变化；APDM 同时随目标 IP 和端口变化。本页面用共享 ICE socket 对四端点进行这一轴的观察。
+          </p>
+        </div>
+        <div className="border-t border-black/10 py-4 md:border-l md:border-t-0 md:pl-6 dark:border-white/10">
+          <p className="text-small font-semibold text-zinc-900 dark:text-white">过滤行为 Filtering</p>
+          <p className="mt-1 text-small leading-6 text-zinc-600 dark:text-zinc-400">
+            EIF 接受任意来源；ADF 要求先联系过来源 IP；APDF 要求先联系过来源 IP:Port。完整判断需要原生客户端发送 CHANGE-REQUEST。
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        {NAT_LEVEL_GUIDE.map((item) => (
+          <article key={item.level} className={`rounded-lg border-l-4 border-y border-r border-black/10 bg-white/45 p-4 dark:border-y-white/10 dark:border-r-white/10 dark:bg-white/[0.025] ${item.tone}`}>
+            <div className="flex items-start gap-3">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-current/25 font-mono text-small font-semibold">
+                {item.level}
+              </span>
+              <div className="min-w-0">
+                <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{item.title}</h3>
+                <p className="mt-0.5 font-mono text-tiny font-medium">{item.modern}</p>
+              </div>
+            </div>
+            <dl className="mt-3 grid gap-2 text-small leading-6">
+              <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">判断依据：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.signal}</dd></div>
+              <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">含义：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.detail}</dd></div>
+              <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">直连影响：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.impact}</dd></div>
+            </dl>
+          </article>
+        ))}
+      </div>
+
+      {!compact && (
+        <div className="mt-6 border-y border-black/10 py-4 dark:border-white/10">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold text-zinc-950 dark:text-white">当前验证链路</h3>
+              <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">
+                端点预检 → 同一 ICE socket 比对映射 → 原生客户端 CHANGE-REQUEST 补全过滤行为。
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                ["Binding", capabilities?.binding],
+                ["CHANGE-REQUEST", capabilities?.changeRequest],
+                ["RESPONSE-ORIGIN", capabilities?.responseOrigin],
+                ["OTHER-ADDRESS", capabilities?.otherAddress],
+                ["RESPONSE-PORT", capabilities?.responsePort],
+                ["PADDING", capabilities?.padding],
+              ].map(([label, enabled]) => (
+                <Chip key={String(label)} size="sm" radius="sm" variant="flat" color={enabled ? "success" : "default"}>
+                  {label}
+                </Chip>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function NatTips({ probeConfig }: { probeConfig: PublicNatProbeConfig | null }) {
   const tips = [
-    { title: "可以判断", text: "UDP/STUN 是否可达；浏览器能否获得公网映射；多 STUN 映射是否一致。" },
-    { title: "不能完全判断", text: "Full Cone / Restricted / Port Restricted 需服务端多 IP/多端口配合测试。" },
-    { title: "与控制台 NAT 类型不同", text: "这里检测的是当前浏览器所在网络；客户端 NAT 数据来自 tunnel-client 上报。" },
+    { title: "这是即时快照", text: "RFC 5780 描述当前路径和当前端口的可观察行为。网关可能随负载、VPN、网络切换或映射超时改变结果。" },
+    { title: "浏览器只验证映射轴", text: "WebRTC 不允许页面构造 CHANGE-REQUEST，因此过滤轴不会用超时猜测；原生客户端可完成 EIF / ADF / APDF 分类。" },
+    { title: "类型不等于最终路径", text: "ICE 会交换真实候选并执行连通性检查。即使 NAT4 也应尝试直连，同时准备经过认证的 TURN / Relay。" },
   ];
 
   return (
@@ -1303,23 +1583,16 @@ function NatTips() {
           <p className="mt-1.5 text-small leading-6 text-zinc-600 dark:text-zinc-400">{tip.text}</p>
         </div>
       ))}
-      <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/[0.05] p-4 dark:border-cyan-300/20 dark:bg-cyan-300/[0.05] sm:col-span-3">
+      <div className="rounded-lg border glass glass-border p-4 sm:col-span-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-small text-zinc-700 dark:text-zinc-300">
-            想看 Tailscale 关于 NAT 类型和打洞的原文？
+            当前接口：{probeConfig?.protocol ?? "RFC8489"} / {probeConfig?.discoveryMethod ?? "BASIC_STUN"}。标准原文和实践说明可用于核对术语边界。
           </div>
-          <Button
-            as="a"
-            href={NAT_TRAVERSAL_REFERENCE.url}
-            rel="noreferrer"
-            target="_blank"
-            size="sm"
-            radius="sm"
-            variant="flat"
-            className="glass-chip text-zinc-950 dark:text-white"
-          >
-            阅读 Tailscale NAT traversal
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button as="a" href="https://www.rfc-editor.org/rfc/rfc5780" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 5780</Button>
+            <Button as="a" href="https://www.rfc-editor.org/rfc/rfc8489" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 8489</Button>
+            <Button as="a" href={NAT_TRAVERSAL_REFERENCE.url} rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">NAT traversal</Button>
+          </div>
         </div>
       </div>
     </section>
@@ -1514,6 +1787,40 @@ function confidenceLabel(confidence: BrowserNatConfidence): string {
   }
 }
 
+async function validateStunEndpoints(
+  endpoints: PublicNatProbeEndpoint[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<StunEndpointCheck[]> {
+  return Promise.all(endpoints.map(async (endpoint) => {
+    const startedAt = performance.now();
+    try {
+      const probes = await probeStunServers([endpoint.url], timeoutMs, undefined, signal);
+      const candidate = probes
+        .flatMap((probe) => probe.candidates)
+        .find((item) => item.type === "srflx");
+      return {
+        endpoint,
+        reachable: Boolean(candidate),
+        mappedEndpoint: candidate ? endpointOf(candidate) : null,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: candidate ? null : probes[0]?.error ?? "未返回公网映射",
+      };
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+        throw error;
+      }
+      return {
+        endpoint,
+        reachable: false,
+        mappedEndpoint: null,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: error instanceof Error ? error.message : "端点验证失败",
+      };
+    }
+  }));
+}
+
 /**
  * 同一个 RTCPeerConnection 同时挂多个 STUN 服务器，让所有 STUN 都从同一组本机
  * UDP socket 出去。只有这样浏览器返回的多个 srflx 才可比对：
@@ -1549,7 +1856,7 @@ async function probeStunServers(
     onProgress?.({
       phase: "probing",
       percent: responded > 0 && servers.length > 0
-        ? Math.min(88, 20 + Math.round((responded / servers.length) * 68))
+        ? Math.min(88, 36 + Math.round((responded / servers.length) * 52))
         : null,
       responded,
       total: servers.length,
@@ -1569,8 +1876,8 @@ async function probeStunServers(
   });
 
   onProgress?.({
-    phase: "preparing",
-    percent: null,
+    phase: "probing",
+    percent: 34,
     responded: 0,
     total: servers.length,
     unattributedMapping: false,
@@ -1671,6 +1978,9 @@ async function probeStunServers(
         } else {
           candidatesUnassigned.push(parsed);
         }
+      } else if (parsed.type === "srflx" && servers.length === 1) {
+        candidatesByServer.get(servers[0])!.push(parsed);
+        attributedServer = servers[0];
       } else {
         candidatesUnassigned.push(parsed);
       }
@@ -1724,8 +2034,36 @@ function findServerByUrl(url: string, servers: string[]): string | null {
   return servers.find((server) => normalize(server) === target) ?? null;
 }
 
-export function classifyBrowserNatResult(startedAt: number, probes: StunProbeResult[]): BrowserNatResult {
+interface BrowserNatClassificationContext {
+  probeConfig?: PublicNatProbeConfig | null;
+  endpointChecks?: StunEndpointCheck[];
+}
+
+interface NatGroupAssessment {
+  natType: string | null;
+  mappingBehavior: BrowserNatMappingBehavior;
+  stunCount: number;
+}
+
+export function classifyBrowserNatResult(
+  startedAt: number,
+  probes: StunProbeResult[],
+  context: BrowserNatClassificationContext = {},
+): BrowserNatResult {
   const finishedAt = Date.now();
+  const probeConfig = context.probeConfig ?? null;
+  const endpointChecks = context.endpointChecks ?? [];
+  const topologyEndpoints = rfc5780ProbeEndpoints(probeConfig);
+  const topologyReady = topologyEndpoints.length === 4
+    && topologyEndpoints.every((endpoint) => endpointChecks.some(
+      (check) => check.endpoint.id === endpoint.id && check.reachable,
+    ));
+  const verificationMethod: BrowserNatVerificationMethod = topologyEndpoints.length === 4
+    ? "RFC5780_WEBRTC_MAPPING"
+    : "MULTI_STUN_WEBRTC";
+  const filteringBehavior: BrowserNatFilteringBehavior = topologyEndpoints.length === 4
+    ? "BROWSER_NOT_OBSERVABLE"
+    : "UNKNOWN";
   const knownProbes = probes.filter((probe) => probe.sourceKnown);
   const unknownProbes = probes.filter((probe) => !probe.sourceKnown);
   const knownSrflxObservations = knownProbes.flatMap((probe) =>
@@ -1749,8 +2087,11 @@ export function classifyBrowserNatResult(startedAt: number, probes: StunProbeRes
   const knownSrflxByServer = knownProbes.filter((probe) =>
     probe.candidates.some((candidate) => candidate.type === "srflx"),
   );
-  const comparableGroups = groupComparableSrflxMappings(knownSrflxObservations);
-  const groupAssessments = comparableGroups.map((group) => {
+  const comparableGroups = groupComparableSrflxMappings(
+    knownSrflxObservations,
+    topologyReady ? 1 : 2,
+  );
+  const groupAssessments: NatGroupAssessment[] = comparableGroups.map((group) => {
     const candidates = group.map((observation) => observation.candidate);
     const sample = candidates[0];
     const hosts = isIpv4Candidate(sample)
@@ -1758,8 +2099,13 @@ export function classifyBrowserNatResult(startedAt: number, probes: StunProbeRes
       : isIpv6Candidate(sample)
         ? hostAll.filter(isIpv6Candidate)
         : hostAll;
+    const mappingBehavior = topologyReady && probeConfig
+      ? inferRfc5780MappingBehavior(group, probeConfig, endpointChecks)
+      : inferGenericMappingBehavior(candidates);
+    const stableType = inferNatTypeForGroup(candidates, hosts);
     return {
-      natType: inferNatTypeForGroup(candidates, hosts),
+      natType: isTargetDependentMapping(mappingBehavior) ? "SYMMETRIC_NAT" : stableType,
+      mappingBehavior,
       stunCount: new Set(group.map((observation) => observation.server)).size,
     };
   });
@@ -1769,8 +2115,19 @@ export function classifyBrowserNatResult(startedAt: number, probes: StunProbeRes
     (max, assessment) => assessment.natType === natType ? Math.max(max, assessment.stunCount) : max,
     0,
   );
-  const enoughKnownStunEvidence = comparableGroups.length > 0;
-  const evidence = `${knownSrflxByServer.length} 个 STUN 返回可归属公网映射，${comparableGroups.length} 组本地映射可跨 STUN 比较，${unknownSrflxAll.length} 个公网映射未归属来源`;
+  const mappingBehavior = pickMostRestrictiveMappingBehavior(
+    ...groupAssessments
+      .filter((assessment) => assessment.natType === natType)
+      .map((assessment) => assessment.mappingBehavior),
+  );
+  const enoughKnownStunEvidence = groupAssessments.some(
+    (assessment) => assessment.mappingBehavior !== "UNKNOWN",
+  );
+  const reachableEndpoints = endpointChecks.filter((check) => check.reachable).length;
+  const topologyEvidence = endpointChecks.length > 0
+    ? `，RFC 5780 端点预检 ${reachableEndpoints}/${endpointChecks.length} 可达`
+    : "";
+  const evidence = `${knownSrflxByServer.length} 个共享 ICE 映射可归属，${comparableGroups.length} 组本地 UDP 基址可比较，${unknownSrflxAll.length} 个映射未归属来源${topologyEvidence}`;
 
   if (srflxAll.length === 0) {
     return {
@@ -1785,6 +2142,10 @@ export function classifyBrowserNatResult(startedAt: number, probes: StunProbeRes
       evidence,
       summary: "没有拿到 server-reflexive candidate。当前浏览器网络可能阻断 UDP/STUN，或浏览器策略禁用了 WebRTC candidate 暴露。",
       recommendation: "如果 Peer Mesh 要在这个网络下直连，建议检查防火墙和 UDP 出站策略；业务上应准备 relay 回退。",
+      verificationMethod,
+      mappingBehavior: "UNKNOWN",
+      filteringBehavior,
+      endpointChecks,
     };
   }
 
@@ -1804,7 +2165,13 @@ export function classifyBrowserNatResult(startedAt: number, probes: StunProbeRes
       summary: `已获得公网映射，${knownCount} 个 STUN 返回可归属结果，但没有足够的同一本地 UDP 映射可跨 STUN 比较，暂时无法判断映射是否随目标变化。`,
       recommendation: unknownCount > 0 && knownCount === 0
         ? "浏览器没有暴露 candidate.url，暂时不能细分 NAT 类型。建议保留 relay 回退，或更换浏览器/网络后复测。"
-        : "建议继续使用更多 STUN 复测；业务策略上可先尝试 direct，但必须保留 relay 回退。",
+        : topologyEndpoints.length === 4 && !topologyReady
+          ? "四端点没有全部通过预检，本轮不能把缺失响应当作 NAT 行为。请检查 A1/A2 的 P1/P2 UDP 放行后重测。"
+          : "建议继续使用更多 STUN 复测；业务策略上可先尝试 direct，但必须保留 relay 回退。",
+      verificationMethod,
+      mappingBehavior: "UNKNOWN",
+      filteringBehavior,
+      endpointChecks,
     };
   }
 
@@ -1817,12 +2184,22 @@ export function classifyBrowserNatResult(startedAt: number, probes: StunProbeRes
       probes,
       mappedEndpoints,
       hostCandidates: hostAll,
-      confidence: comparableStunCountForResult >= 3 ? "high" : "medium",
+      confidence: topologyReady && comparableStunCountForResult >= 2
+        ? "high"
+        : comparableStunCountForResult >= 2 ? "medium" : "low",
       evidence,
-      summary: "同一个本机 socket 在不同 STUN 服务看到了不同的公网映射端点，说明 NAT 的映射依赖目标地址或目标端口，符合 Symmetric NAT 行为。",
-      recommendation: "这种网络下 UDP 打洞通常失败，Peer Mesh 应直接走 relay；只有对端是 Endpoint-Independent 类 NAT 时才有机会打洞。",
+      summary: `同一个本机 UDP 基址访问四端点时出现不同公网映射，属于${mappingBehaviorText(mappingBehavior)}。传统工具通常把这类结果统称为 Symmetric NAT。`,
+      recommendation: "目标相关映射会降低 UDP 打洞可预测性，应并行尝试 direct，并准备快速切换到 TURN / Relay。",
+      verificationMethod,
+      mappingBehavior,
+      filteringBehavior,
+      endpointChecks,
     };
   }
+
+  const reportedMappingBehavior: BrowserNatMappingBehavior = natType === "NO_NAT"
+    ? "NO_NAT"
+    : mappingBehavior;
 
   return {
     kind: "mapping-stable",
@@ -1832,32 +2209,39 @@ export function classifyBrowserNatResult(startedAt: number, probes: StunProbeRes
     probes,
     mappedEndpoints,
     hostCandidates: hostAll,
-    confidence: comparableStunCountForResult >= 3 ? "high" : "medium",
+    confidence: topologyReady
+      ? "medium"
+      : comparableStunCountForResult >= 3 ? "high" : "medium",
     evidence,
     summary: natType === "NO_NAT"
       ? "公网地址端口与本机一致，没有 NAT，直接是公网出口。"
       : natType === "PORT_PRESERVED_NAT"
         ? "多个 STUN 看到的公网端点一致，且 NAT 保留了本机源端口（端口保持 NAT）。"
-        : "多个 STUN 看到的公网端点一致，但端口被 NAT 改写（锥形 NAT，浏览器无法再细分 Full Cone / Restricted）。",
-    recommendation: "对 direct path 比较友好。仍需注意对端 NAT、防火墙和运营商 UDP 策略，失败时继续使用 relay 回退。",
+        : "四端点共享探测未观察到目标相关映射，但公网端口被改写，符合端点无关映射。过滤行为需要原生 RFC 5780 CHANGE-REQUEST 才能继续区分。",
+    recommendation: "端点无关映射通常有利于打洞；是否能接收陌生来源回包仍取决于过滤行为，因此必须保留 TURN / Relay 回退。",
+    verificationMethod,
+    mappingBehavior: reportedMappingBehavior,
+    filteringBehavior,
+    endpointChecks,
   };
 }
 
 /**
  * 基于浏览器 ICE 观测推断 NAT 类型，分类与 NAT_TYPE_PROFILES 对齐。
  *
- * <p>浏览器侧没有"服务端备用 IP 主动回包"能力，所以无法区分 Full Cone / Restricted /
- * Port Restricted，都统一展示为 cone-like。只输出能在浏览器侧严格证伪的几类：
+ * <p>浏览器无法构造 RFC 5780 CHANGE-REQUEST，因此这里只判断映射轴，不能从响应超时
+ * 推断 EIF / ADF / APDF 过滤行为。只输出浏览器侧有充分证据的几类：
  *
  * <ul>
- *   <li>多个 STUN 看到不同公网端点（同一 PC 共享 socket）→ SYMMETRIC_NAT</li>
+ *   <li>四端点看到不同公网端点（同一 PC 共享 socket）→ ADM / APDM</li>
  *   <li>srflx 公网地址端口完全等于 host → NO_NAT</li>
  *   <li>srflx 公网端口 == 本机源端口 → PORT_PRESERVED_NAT</li>
- *   <li>其它 → CONE_LIKE_NAT（cone 系，但无法再细分）</li>
+ *   <li>其它 → CONE_LIKE_NAT（兼容键，页面展示为 EIM NAT）</li>
  * </ul>
  */
 function groupComparableSrflxMappings(
   observations: AttributedSrflxObservation[],
+  minimumServerCount = 2,
 ): AttributedSrflxObservation[][] {
   const groups = new Map<string, AttributedSrflxObservation[]>();
   for (const observation of observations) {
@@ -1876,8 +2260,120 @@ function groupComparableSrflxMappings(
     groups.set(key, group);
   }
   return Array.from(groups.values()).filter(
-    (group) => new Set(group.map((observation) => observation.server)).size >= 2,
+    (group) => new Set(group.map((observation) => observation.server)).size >= minimumServerCount,
   );
+}
+
+function Rfc5780EndpointCard({ checks }: { checks: StunEndpointCheck[] }) {
+  return (
+    <section className="rounded-xl border glass glass-border p-5">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <div>
+          <h2 className="text-base font-semibold">RFC 5780 四端点预检</h2>
+          <p className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
+            A1/A2 是两个公网地址，P1/P2 是两个 UDP 端口。预检只确认端点可达，不跨不同浏览器 socket 比较映射。
+          </p>
+        </div>
+        <Chip size="sm" variant="flat" color={checks.every((check) => check.reachable) ? "success" : "warning"}>
+          {checks.filter((check) => check.reachable).length}/{checks.length} 可达
+        </Chip>
+      </div>
+      <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {checks.map((check) => (
+          <div key={check.endpoint.id} className="min-w-0 rounded-lg border glass-chip glass-border p-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-mono text-small font-semibold">{check.endpoint.id}</span>
+              <span className={`h-2 w-2 rounded-full ${check.reachable ? "bg-emerald-500" : "bg-rose-500"}`} aria-hidden="true" />
+            </div>
+            <code className="mt-2 block break-all font-mono text-[11px] leading-5 text-zinc-600 dark:text-zinc-300">
+              {check.endpoint.url}
+            </code>
+            <p className="mt-1 truncate text-tiny text-zinc-500 dark:text-zinc-400" title={check.mappedEndpoint ?? check.error ?? ""}>
+              {check.mappedEndpoint ?? check.error ?? "未返回映射"} · {check.elapsedMs} ms
+            </p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function inferRfc5780MappingBehavior(
+  observations: AttributedSrflxObservation[],
+  config: PublicNatProbeConfig,
+  endpointChecks: StunEndpointCheck[],
+): BrowserNatMappingBehavior {
+  const endpointByUrl = new Map(
+    rfc5780ProbeEndpoints(config).map((endpoint) => [
+      normalizeStunUrl(endpoint.url).toLowerCase(),
+      endpoint,
+    ]),
+  );
+  const mappedById = new Map<string, string>();
+  for (const observation of observations) {
+    const endpoint = endpointByUrl.get(normalizeStunUrl(observation.server).toLowerCase());
+    if (endpoint) {
+      mappedById.set(endpoint.id, endpointOf(observation.candidate));
+    }
+  }
+  const mappings = new Set(mappedById.values());
+  const allReachable = rfc5780ProbeEndpoints(config).every((endpoint) =>
+    endpointChecks.some((check) => check.endpoint.id === endpoint.id && check.reachable),
+  );
+  if (mappings.size === 1 && allReachable) {
+    return "ENDPOINT_INDEPENDENT";
+  }
+  if (mappings.size <= 1) {
+    return "UNKNOWN";
+  }
+
+  const addressSlots = ["A1", "A2"];
+  for (const slot of addressSlots) {
+    const values = [mappedById.get(`${slot}P1`), mappedById.get(`${slot}P2`)]
+      .filter((value): value is string => Boolean(value));
+    if (new Set(values).size > 1) {
+      return "ADDRESS_AND_PORT_DEPENDENT";
+    }
+  }
+
+  const primaryMapping = mappedById.get("A1P1") ?? mappedById.get("A1P2");
+  const alternateMapping = mappedById.get("A2P1") ?? mappedById.get("A2P2");
+  if (primaryMapping && alternateMapping && primaryMapping !== alternateMapping) {
+    return allReachable ? "ADDRESS_DEPENDENT" : "TARGET_DEPENDENT";
+  }
+  return "TARGET_DEPENDENT";
+}
+
+function inferGenericMappingBehavior(candidates: BrowserIceCandidate[]): BrowserNatMappingBehavior {
+  if (candidates.length === 0) {
+    return "UNKNOWN";
+  }
+  return new Set(candidates.map(endpointOf)).size > 1
+    ? "TARGET_DEPENDENT"
+    : "ENDPOINT_INDEPENDENT";
+}
+
+function isTargetDependentMapping(mapping: BrowserNatMappingBehavior): boolean {
+  return mapping === "ADDRESS_DEPENDENT"
+    || mapping === "ADDRESS_AND_PORT_DEPENDENT"
+    || mapping === "TARGET_DEPENDENT";
+}
+
+function mappingBehaviorText(mapping: BrowserNatMappingBehavior): string {
+  switch (mapping) {
+    case "NO_NAT":
+      return "无 NAT 映射";
+    case "ENDPOINT_INDEPENDENT":
+      return "端点无关映射（EIM）";
+    case "ADDRESS_DEPENDENT":
+      return "地址相关映射（ADM）";
+    case "ADDRESS_AND_PORT_DEPENDENT":
+      return "地址和端口相关映射（APDM）";
+    case "TARGET_DEPENDENT":
+      return "目标相关映射";
+    default:
+      return "映射行为未知";
+  }
 }
 
 function inferNatTypeForGroup(
@@ -1930,6 +2426,23 @@ function pickWorstNatType(...types: Array<string | null>): string | null {
     }
   }
   return worst;
+}
+
+const MAPPING_BEHAVIOR_SEVERITY: Record<BrowserNatMappingBehavior, number> = {
+  NO_NAT: 0,
+  ENDPOINT_INDEPENDENT: 1,
+  ADDRESS_DEPENDENT: 2,
+  TARGET_DEPENDENT: 3,
+  ADDRESS_AND_PORT_DEPENDENT: 4,
+  UNKNOWN: -1,
+};
+
+function pickMostRestrictiveMappingBehavior(
+  ...behaviors: BrowserNatMappingBehavior[]
+): BrowserNatMappingBehavior {
+  return behaviors.reduce<BrowserNatMappingBehavior>((worst, current) =>
+    MAPPING_BEHAVIOR_SEVERITY[current] > MAPPING_BEHAVIOR_SEVERITY[worst] ? current : worst,
+  "UNKNOWN");
 }
 
 function uniqueCandidates(list: BrowserIceCandidate[]): BrowserIceCandidate[] {

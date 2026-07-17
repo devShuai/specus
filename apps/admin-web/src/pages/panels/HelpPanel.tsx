@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Button, Card, CardBody, CardHeader, Chip, Tab, Tabs } from "@heroui/react";
 import { notify } from "../../components/toast";
-import { NAT_TRAVERSAL_REFERENCE, NAT_TYPE_PROFILES } from "../../lib/nat";
+import { NAT_BEHAVIOR_AXES, NAT_TRAVERSAL_REFERENCE } from "../../lib/nat";
 
 const HELP_TABS = [
   "quickstart",
@@ -16,6 +16,39 @@ type HelpTabKey = (typeof HELP_TABS)[number];
 const HELP_TAB_SET = new Set<HelpTabKey>(HELP_TABS);
 
 export const HELP_NAT_TYPES_ANCHOR = "nat-types";
+
+const NAT_PATH_GUIDANCE = [
+  {
+    label: "EIM + EIF",
+    path: "直连优先",
+    tone: "success",
+    detail: "映射稳定且回包限制最少，优先建立 direct，保留 relay 兜底。",
+  },
+  {
+    label: "EIM + ADF",
+    path: "直连较友好",
+    tone: "primary",
+    detail: "双方并行发包通常可以打洞，超时后自动切换 relay。",
+  },
+  {
+    label: "EIM + APDF",
+    path: "条件直连",
+    tone: "warning",
+    detail: "必须向准确 IP:Port 同时打洞，不应长时间等待 direct。",
+  },
+  {
+    label: "ADM / APDM",
+    path: "Relay 优先",
+    tone: "danger",
+    detail: "映射随目标变化，直连端点难复用；并行探测时提前准备 TURN。",
+  },
+  {
+    label: "UNKNOWN / UNSUPPORTED",
+    path: "实际验证",
+    tone: "default",
+    detail: "探测证据不完整时不做强结论，以 ICE 连通性检查选择最终路径。",
+  },
+] as const;
 
 function readHelpTabFromLocation(): HelpTabKey {
   // hash 形如 #/help/peer-mesh 或 #/help/peer-mesh#nat-types
@@ -250,29 +283,34 @@ function PeerMeshSection() {
       <DocCard title="UDP 端口">
         <ul className="ml-5 list-disc space-y-1 text-small">
           <li>
-            <Inline>3478/udp</Inline>：内置标准 STUN/TURN 子集主端口，承载 binding、relay allocation 和 relay 数据。
+            <Inline>3478/udp</Inline>：tunnel-server 的认证 TURN 控制端口，承载 allocation、permission 和 relay 数据入口。
           </li>
           <li>
-            <Inline>3479/udp</Inline>：NAT 类型辅助探测端口。默认由
-            <Inline>TUNNEL_PEER_MESH_STUN_TURN_PORT + 1</Inline> 得到，可用
-            <Inline>TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT</Inline> 显式覆盖。
+            <Inline>34780-34781/udp</Inline>：独立 RFC 5780 STUN 的 P1/P2；主、备服务器分别提供 A1/A2，四个组合均需可达。
+          </li>
+          <li>
+            <Inline>49152-65535/udp</Inline>：TURN relay 默认分配范围，可用服务端 relay min/max 配置收窄。
           </li>
         </ul>
-        <CodeBlock language="bash" code={`sudo firewall-cmd --add-port=3478/udp --permanent
-sudo firewall-cmd --add-port=3479/udp --permanent
+        <CodeBlock language="bash" code={`# tunnel-server
+sudo firewall-cmd --add-port=3478/udp --permanent
+sudo firewall-cmd --add-port=49152-65535/udp --permanent
+
+# stun1 / stun2 两台独立 STUN 主机
+sudo firewall-cmd --add-port=34780-34781/udp --permanent
 sudo firewall-cmd --reload`} />
       </DocCard>
 
       <DocCard title="检测链路">
         <p className="mb-2 text-small text-default-500">
-          客户端使用 UDP 主端口和辅助端口判断公网映射行为。四步组成一次完整的 NAT 类型探测：
+          原生客户端复用 peer mesh 业务 UDP socket 执行 RFC 5780，避免独立探测 socket 得到与真实数据面不一致的映射：
         </p>
         <div className="grid gap-2">
           {[
-            ["1", "Binding", "客户端向标准 STUN/TURN 子集主端口发送探测包。"],
-            ["2", "Mapped Endpoint", "服务端记录公网 IP:Port 并回传。"],
-            ["3", "Alternate Port", "向辅助 UDP 端口探测，比较映射是否变化。"],
-            ["4", "Path Policy", "所有 NAT 结论都先尝试 direct candidate，失败后再回退 relay。"],
+            ["1", "发现拓扑", "向 A1:P1 Binding，从 RESPONSE-ORIGIN 与 OTHER-ADDRESS 获取 RFC 5780 四端点。"],
+            ["2", "过滤测试", "依次请求变更 IP+端口、仅变更端口，分类 EIF、ADF 或 APDF。"],
+            ["3", "映射测试", "向 A2:P1、A2:P2 普通 Binding，比较映射并分类 EIM、ADM 或 APDM。"],
+            ["4", "上报与选路", "分别上报 mapping/filtering/discovery；ICE 实测直连失败后使用认证 TURN。"],
           ].map(([index, title, text]) => (
             <div
               key={index}
@@ -290,32 +328,44 @@ sudo firewall-cmd --reload`} />
         </div>
       </DocCard>
 
-      <DocCard title={<span id={HELP_NAT_TYPES_ANCHOR}>NAT 类型速查</span>}>
+      <DocCard title={<span id={HELP_NAT_TYPES_ANCHOR}>NAT 行为速查</span>}>
         <p className="mb-2 text-small text-default-500">
-          下表用于解释「私有组网」面板里客户端 NAT 探测结果和路径建议。
+          RFC 5780 将 NAT 分成映射与过滤两个独立轴；控制台优先展示双轴结果，再给出路径建议。
         </p>
-        <div className="grid gap-2 md:grid-cols-2">
-          {Object.values(NAT_TYPE_PROFILES).map((profile) => (
-            <div
-              key={profile.key}
-              className="rounded-md border border-default-200 bg-default-50 p-3 dark:bg-default-100/10"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-small font-semibold">{profile.label}</span>
-                <Chip size="sm" color={profile.tone} variant="flat">
-                  {profile.reachabilityLabel}
-                </Chip>
+        <div className="grid gap-4 lg:grid-cols-2">
+          {NAT_BEHAVIOR_AXES.map((axis) => (
+            <section key={axis.key} className="min-w-0">
+              <div className="mb-2">
+                <h4 className="text-small font-semibold">{axis.title}</h4>
+                <p className="text-tiny text-default-500">{axis.subtitle}</p>
               </div>
-              <p className="mt-1 text-tiny leading-5 text-default-500">{profile.summary}</p>
-              <p className="mt-1 text-tiny leading-5 text-default-400">
-                <span className="text-default-500">建议：</span>
-                {profile.recommendation}
-              </p>
+              <div className="divide-y divide-default-200 border-y border-default-200">
+                {axis.items.map((item) => (
+                  <div key={item.code} className="grid grid-cols-[56px_minmax(0,1fr)] gap-2 py-2 text-small">
+                    <span className="font-mono font-semibold text-primary">{item.code}</span>
+                    <span className="min-w-0">
+                      <span className="font-medium text-foreground">{item.label}</span>
+                      <span className="ml-1 text-default-500">{item.detail}</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+        <div className="mt-4 divide-y divide-default-200 border-y border-default-200">
+          {NAT_PATH_GUIDANCE.map((item) => (
+            <div key={item.label} className="grid gap-2 py-2 sm:grid-cols-[150px_110px_minmax(0,1fr)] sm:items-center">
+              <span className="font-mono text-small font-semibold text-foreground">{item.label}</span>
+              <Chip className="w-fit" size="sm" color={item.tone} variant="flat">
+                {item.path}
+              </Chip>
+              <span className="text-tiny text-default-500">{item.detail}</span>
             </div>
           ))}
         </div>
         <p className="mt-3 text-tiny text-default-500">
-          只有一个公网 IP 时，不能严格拆分 Full Cone 与 Address-Restricted NAT，所以页面合并展示。
+          <Inline>natType</Inline> 仅保留给旧客户端和旧界面兼容；路径策略以 mapping/filtering 字段及实际 ICE 连通性为准。
         </p>
       </DocCard>
 
@@ -372,12 +422,14 @@ function ProtocolSection() {
           </li>
           <li>各「端口映射」自定义的公网监听端口（如 9000）。</li>
           <li>
-            <Inline>3478/udp</Inline> — peer mesh 标准 STUN/TURN 子集主端口。
+            <Inline>3478/udp</Inline> — tunnel-server 的认证 TURN 控制端口。
             通过环境变量 <Inline>TUNNEL_PEER_MESH_STUN_TURN_PORT</Inline> 覆盖。
           </li>
           <li>
-            <Inline>3479/udp</Inline> — peer mesh NAT 类型辅助探测端口，默认是主端口 + 1。
-            通过环境变量 <Inline>TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT</Inline> 覆盖。
+            <Inline>34780-34781/udp</Inline> — 独立 RFC 5780 STUN 的 P1/P2，需在 A1/A2 两个公网地址同时开放。
+          </li>
+          <li>
+            <Inline>49152-65535/udp</Inline> — TURN relay 默认分配范围。
           </li>
         </ul>
       </DocCard>
@@ -454,9 +506,10 @@ function FaqSection() {
       <DocCard title="私有组网一直显示 NAT 未知">
         <ul className="ml-5 list-disc space-y-1 text-small">
           <li>确认服务端已启用 <Inline>TUNNEL_PEER_MESH_ENABLED=true</Inline>，并且客户端在「私有组网」页面已启用。</li>
-          <li>确认 UDP <Inline>3478</Inline> 可达；如果要更细分类 NAT，还需要放行备用 UDP 端口，默认 <Inline>3479</Inline>。</li>
-          <li>如果服务器在 NAT 后面，设置 <Inline>TUNNEL_PEER_MESH_PUBLIC_ADDRESS</Inline> 为公网域名或 IP。</li>
-          <li>客户端需要升级到支持 <Inline>probeRole</Inline> 和备用端口探测的版本。</li>
+          <li>确认 <Inline>A1:P1</Inline>、<Inline>A1:P2</Inline>、<Inline>A2:P1</Inline>、<Inline>A2:P2</Inline> 四个独立 STUN 端点都可达。</li>
+          <li>确认 A1:P1 的 Binding Success 同时返回 <Inline>RESPONSE-ORIGIN</Inline> 与 <Inline>OTHER-ADDRESS</Inline>。</li>
+          <li>确认 tunnel-server 已配置独立 STUN 主、备地址和端口，并在客户端登录响应中下发。</li>
+          <li>客户端需支持并上报 <Inline>natBehaviorDiscovery=RFC5780</Inline>；只有基础结果时会显示兼容标签。</li>
         </ul>
       </DocCard>
     </div>

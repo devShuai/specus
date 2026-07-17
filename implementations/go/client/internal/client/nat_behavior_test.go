@@ -111,6 +111,24 @@ func TestNatBehaviorDiscoveryUnsupportedFilteringStillMaps(t *testing.T) {
 	}
 }
 
+func TestNatBehaviorDiscoveryDoesNotTrustNegativeFilteringWhenAlternateEndpointFails(t *testing.T) {
+	discovery := &natBehaviorDiscovery{}
+	started, _ := discovery.begin(natPrimaryEndpoint, natMappedEndpoint, natOtherEndpoint)
+	filterBoth := requireNextNatProbe(t, started, natProbeFilterChangeIPAndPort)
+	filterPort := requireNextNatProbe(t,
+		discovery.timedOut(filterBoth.Generation, filterBoth.Probe),
+		natProbeFilterChangePort)
+	mappingIP := requireNextNatProbe(t,
+		discovery.succeeded(filterPort.Generation, filterPort.Probe, natMappedEndpoint),
+		natProbeMappingAlternateIP)
+	completed := discovery.timedOut(mappingIP.Generation, mappingIP.Probe).Snapshot
+
+	if completed.MappingBehavior != natBehaviorUnknown ||
+		completed.FilteringBehavior != natBehaviorUnknown {
+		t.Fatalf("unexpected snapshot: %+v", completed)
+	}
+}
+
 func requireNextNatProbe(
 	t *testing.T,
 	transition natBehaviorTransition,

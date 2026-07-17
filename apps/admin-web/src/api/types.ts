@@ -298,6 +298,34 @@ export interface PublicPeerStunConfig {
   stunTurnPort: number;
 }
 
+export interface PublicNatProbeEndpoint {
+  id: "A1P1" | "A1P2" | "A2P1" | "A2P2" | string;
+  url: string;
+  host: string;
+  port: number;
+  addressSlot: "PRIMARY" | "ALTERNATE" | string;
+  portSlot: "PRIMARY" | "ALTERNATE" | string;
+}
+
+export interface PublicNatProbeCapabilities {
+  binding: boolean;
+  changeRequest: boolean;
+  responseOrigin: boolean;
+  otherAddress: boolean;
+  responsePort: boolean;
+  padding: boolean;
+  browserMappingObservation: boolean;
+  browserFilteringObservation: boolean;
+}
+
+export interface PublicNatProbeConfig {
+  available: boolean;
+  protocol: "RFC8489" | string;
+  discoveryMethod: "RFC5780" | "BASIC_STUN" | string;
+  endpoints: PublicNatProbeEndpoint[];
+  capabilities: PublicNatProbeCapabilities;
+}
+
 export interface PublicIceServer {
   urls: string;
   username: string;
