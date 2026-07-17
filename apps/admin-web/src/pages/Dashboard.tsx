@@ -129,7 +129,7 @@ function DashboardContent() {
             <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
           </div>
         </header>
-        <main className="app-apple-main mr-auto w-full min-w-0 max-w-[1520px] flex-1 p-2 sm:p-3 lg:pl-5">
+        <main className="app-apple-main mx-auto w-full min-w-0 max-w-[1520px] flex-1 p-2 sm:p-3 lg:px-5">
           <section className="min-w-0" key={renderedPanel}>
             <Suspense fallback={<PanelLoading />}>
               <ActivePanel panel={renderedPanel} initializing={initializing} onInitializeDatabase={initializeDatabase} />
