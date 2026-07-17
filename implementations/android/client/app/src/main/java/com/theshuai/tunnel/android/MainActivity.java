@@ -13,9 +13,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
-import android.text.Editable;
 import android.text.InputType;
-import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -23,40 +21,57 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONObject;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
+import java.util.Date;
 import java.util.Deque;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 4208;
+    private static final int FILE_REQUEST = 4209;
+    private static final int MAX_BUBBLES = 100;
     private static final int COLOR_INK = Color.rgb(18, 30, 38);
     private static final int COLOR_MUTED = Color.rgb(99, 116, 126);
-    private static final int COLOR_PAGE = Color.rgb(236, 242, 245);
+    private static final int COLOR_PAGE = Color.rgb(240, 244, 246);
     private static final int COLOR_PANEL = Color.rgb(255, 255, 255);
+    private static final int COLOR_LINE = Color.rgb(219, 228, 233);
     private static final int COLOR_MESH = Color.rgb(29, 119, 109);
-    private static final int COLOR_MESH_DARK = Color.rgb(17, 91, 85);
-    private static final int COLOR_WARN = Color.rgb(201, 126, 44);
+    private static final int COLOR_BUBBLE_OUT = Color.rgb(29, 119, 109);
     private static final int COLOR_DANGER = Color.rgb(176, 62, 71);
     private static final int COLOR_CODE = Color.rgb(15, 24, 31);
 
-    private TextView statusPill;
+    private View statusDot;
     private TextView statusTitle;
     private TextView statusDetail;
-    private TextView serverValue;
-    private TextView credentialValue;
-    private TextView meshValue;
-    private TextView mtuValue;
-    private TextView eventLogView;
+    private Button toggleButton;
+    private boolean tunnelRunning;
+
+    private EditText targetEditor;
+    private LinearLayout chatContainer;
+    private ScrollView chatScroll;
+    private EditText messageEditor;
+
+    private LinearLayout settingsBody;
+    private TextView settingsChevron;
+    private EditText serverEditor;
+    private EditText apiKeyEditor;
+    private EditText secretEditor;
+    private Switch meshSwitch;
+
+    private LinearLayout advancedBody;
+    private TextView advancedChevron;
     private EditText configEditor;
-    private EditText messageTargetEditor;
-    private EditText messageBodyEditor;
+    private TextView eventLogView;
 
     private final Deque<String> eventLog = new ArrayDeque<>();
+    private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.ROOT);
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -64,10 +79,25 @@ public class MainActivity extends Activity {
             if (!StatusEvents.ACTION_STATUS.equals(intent.getAction())) {
                 return;
             }
-            String status = intent.getStringExtra(StatusEvents.EXTRA_STATUS);
-            String detail = intent.getStringExtra(StatusEvents.EXTRA_DETAIL);
-            boolean running = intent.getBooleanExtra(StatusEvents.EXTRA_RUNNING, false);
-            updateStatus(status, detail, running);
+            updateStatus(
+                    intent.getStringExtra(StatusEvents.EXTRA_STATUS),
+                    intent.getStringExtra(StatusEvents.EXTRA_DETAIL),
+                    intent.getBooleanExtra(StatusEvents.EXTRA_RUNNING, false));
+        }
+    };
+
+    private final BroadcastReceiver chatReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!ChatEvents.ACTION_CHAT.equals(intent.getAction())) {
+                return;
+            }
+            addBubble(
+                    intent.getStringExtra(ChatEvents.EXTRA_DIRECTION),
+                    intent.getStringExtra(ChatEvents.EXTRA_KIND),
+                    intent.getStringExtra(ChatEvents.EXTRA_PEER),
+                    intent.getStringExtra(ChatEvents.EXTRA_TEXT),
+                    intent.getLongExtra(ChatEvents.EXTRA_TIMESTAMP, System.currentTimeMillis()));
         }
     };
 
@@ -76,25 +106,29 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         maybeRequestNotifications();
         setContentView(buildContent());
-        configEditor.setText(ConfigStorage.loadConfig(this));
-        updateConfigSummary();
-        updateStatus("Ready", "", false);
+        fillSettingsFromConfig();
+        targetEditor.setText(ConfigStorage.loadLastTarget(this));
+        updateStatus("就绪", "未连接", false);
     }
 
     @Override
     protected void onStart() {
         super.onStart();
-        IntentFilter filter = new IntentFilter(StatusEvents.ACTION_STATUS);
+        IntentFilter statusFilter = new IntentFilter(StatusEvents.ACTION_STATUS);
+        IntentFilter chatFilter = new IntentFilter(ChatEvents.ACTION_CHAT);
         if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(statusReceiver, statusFilter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(chatReceiver, chatFilter, Context.RECEIVER_NOT_EXPORTED);
         } else {
-            registerReceiver(statusReceiver, filter);
+            registerReceiver(statusReceiver, statusFilter);
+            registerReceiver(chatReceiver, chatFilter);
         }
     }
 
     @Override
     protected void onStop() {
         unregisterReceiver(statusReceiver);
+        unregisterReceiver(chatReceiver);
         super.onStop();
     }
 
@@ -105,254 +139,328 @@ public class MainActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(16), dp(16), dp(18));
+        root.setPadding(dp(10), dp(10), dp(10), dp(12));
         scroll.addView(root, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        root.addView(buildCommandPanel());
-        root.addView(space(14));
-        root.addView(buildMessagePanel());
-        root.addView(space(14));
-        root.addView(buildConfigPanel());
-        root.addView(space(14));
-        root.addView(buildLogPanel());
+        root.addView(buildStatusCard());
+        root.addView(space(8));
+        root.addView(buildChatCard());
+        root.addView(space(8));
+        root.addView(buildSettingsCard());
+        root.addView(space(8));
+        root.addView(buildAdvancedCard());
         return scroll;
     }
 
-    private View buildCommandPanel() {
-        LinearLayout panel = panel(COLOR_INK, 18, 0);
-        panel.setPadding(dp(18), dp(18), dp(18), dp(18));
-        panel.setMinimumHeight(dp(210));
-        if (Build.VERSION.SDK_INT >= 21) {
-            panel.setElevation(dp(3));
-        }
+    private View buildStatusCard() {
+        LinearLayout panel = panel(COLOR_PANEL, 14, COLOR_LINE);
+        panel.setPadding(dp(12), dp(10), dp(12), dp(10));
 
-        LinearLayout top = new LinearLayout(this);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        panel.addView(top, matchWrap());
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        panel.addView(row, matchWrap());
 
-        LinearLayout titleBlock = new LinearLayout(this);
-        titleBlock.setOrientation(LinearLayout.VERTICAL);
-        top.addView(titleBlock, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        statusDot = new View(this);
+        statusDot.setBackground(round(Color.rgb(84, 98, 108), 999));
+        row.addView(statusDot, new LinearLayout.LayoutParams(dp(10), dp(10)));
+        row.addView(space(8, 1));
 
-        TextView eyebrow = label("SHUAI TUNNEL", Color.rgb(153, 220, 209), 11, Typeface.BOLD);
-        titleBlock.addView(eyebrow);
+        statusTitle = label("未连接", COLOR_INK, 15, Typeface.BOLD);
+        row.addView(statusTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        TextView title = label("Tunnel console", Color.WHITE, 24, Typeface.BOLD);
-        title.setPadding(0, dp(2), 0, 0);
-        titleBlock.addView(title);
+        toggleButton = actionButton("启动", COLOR_MESH, Color.WHITE);
+        toggleButton.setOnClickListener(v -> onToggleClicked());
+        row.addView(toggleButton, new LinearLayout.LayoutParams(dp(84), dp(36)));
 
-        statusPill = label("STOPPED", Color.WHITE, 11, Typeface.BOLD);
-        statusPill.setGravity(Gravity.CENTER);
-        statusPill.setPadding(dp(10), dp(6), dp(10), dp(6));
-        statusPill.setBackground(round(Color.rgb(84, 98, 108), 999));
-        top.addView(statusPill);
-
-        statusTitle = label("Ready", Color.WHITE, 20, Typeface.BOLD);
-        statusTitle.setPadding(0, dp(22), 0, 0);
-        panel.addView(statusTitle, matchWrap());
-
-        statusDetail = label("No active tunnel", Color.rgb(182, 198, 206), 14, Typeface.NORMAL);
-        statusDetail.setPadding(0, dp(6), 0, dp(16));
+        statusDetail = label("", COLOR_MUTED, 12, Typeface.NORMAL);
+        statusDetail.setPadding(dp(18), dp(2), 0, 0);
+        statusDetail.setSingleLine(true);
         panel.addView(statusDetail, matchWrap());
-
-        LinearLayout summary = new LinearLayout(this);
-        summary.setOrientation(LinearLayout.VERTICAL);
-        summary.setPadding(dp(14), dp(12), dp(14), dp(12));
-        summary.setBackground(stroke(Color.rgb(25, 41, 51), Color.rgb(52, 78, 89), 1, 14));
-        panel.addView(summary, matchWrap());
-
-        serverValue = addSummaryRow(summary, "Server", "-");
-        credentialValue = addSummaryRow(summary, "Credential", "-");
-        meshValue = addSummaryRow(summary, "Peer mesh", "-");
-        mtuValue = addSummaryRow(summary, "MTU", "-");
-
-        LinearLayout actions = new LinearLayout(this);
-        actions.setGravity(Gravity.CENTER_VERTICAL);
-        actions.setPadding(0, dp(16), 0, 0);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        panel.addView(actions, matchWrap());
-
-        Button startButton = actionButton("Start", COLOR_MESH, Color.WHITE);
-        startButton.setOnClickListener(v -> {
-            ConfigStorage.saveConfig(this, configEditor.getText().toString());
-            updateConfigSummary();
-            requestVpnThenStart();
-        });
-        actions.addView(startButton, new LinearLayout.LayoutParams(0, dp(48), 1.35f));
-
-        actions.addView(space(10, 1));
-
-        Button stopButton = actionButton("Stop", Color.TRANSPARENT, Color.rgb(239, 214, 216));
-        stopButton.setBackground(stroke(Color.TRANSPARENT, Color.rgb(126, 65, 74), 1, 12));
-        stopButton.setOnClickListener(v -> startService(new Intent(this, TunnelForegroundService.class)
-                .setAction(TunnelForegroundService.ACTION_STOP)));
-        actions.addView(stopButton, new LinearLayout.LayoutParams(0, dp(48), 1f));
-
         return panel;
     }
 
-    private View buildMessagePanel() {
-        LinearLayout panel = panel(COLOR_PANEL, 16, Color.rgb(219, 228, 233));
-        panel.setPadding(dp(16), dp(16), dp(16), dp(16));
+    private View buildChatCard() {
+        LinearLayout panel = panel(COLOR_PANEL, 14, COLOR_LINE);
+        panel.setPadding(dp(12), dp(10), dp(12), dp(10));
 
-        TextView title = label("Client messages", COLOR_INK, 18, Typeface.BOLD);
-        panel.addView(title);
+        LinearLayout targetRow = new LinearLayout(this);
+        targetRow.setGravity(Gravity.CENTER_VERTICAL);
+        targetRow.setOrientation(LinearLayout.HORIZONTAL);
+        panel.addView(targetRow, matchWrap());
 
-        messageTargetEditor = messageInput("Target client", false);
-        panel.addView(space(12));
-        panel.addView(messageTargetEditor, new LinearLayout.LayoutParams(
+        TextView targetLabel = label("发送给", COLOR_MUTED, 12, Typeface.BOLD);
+        targetRow.addView(targetLabel, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        targetRow.addView(space(8, 1));
+
+        targetEditor = input("对方客户端名称", false);
+        targetRow.addView(targetEditor, new LinearLayout.LayoutParams(0, dp(38), 1f));
+
+        chatScroll = new ScrollView(this);
+        chatContainer = new LinearLayout(this);
+        chatContainer.setOrientation(LinearLayout.VERTICAL);
+        chatContainer.setPadding(0, dp(4), 0, dp(4));
+        chatScroll.addView(chatContainer, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(48)));
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(300));
+        scrollParams.setMargins(0, dp(8), 0, dp(8));
+        chatScroll.setBackground(stroke(Color.rgb(247, 250, 251), COLOR_LINE, 1, 10));
+        panel.addView(chatScroll, scrollParams);
 
-        messageBodyEditor = messageInput("Message", true);
-        panel.addView(space(10));
-        panel.addView(messageBodyEditor, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(112)));
+        LinearLayout inputRow = new LinearLayout(this);
+        inputRow.setGravity(Gravity.CENTER_VERTICAL);
+        inputRow.setOrientation(LinearLayout.HORIZONTAL);
+        panel.addView(inputRow, matchWrap());
 
-        Button sendButton = actionButton("Send", COLOR_MESH, Color.WHITE);
-        sendButton.setOnClickListener(v -> sendClientMessage());
-        panel.addView(space(12));
-        panel.addView(sendButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(46)));
+        Button attachButton = actionButton("文件", Color.rgb(232, 240, 243), COLOR_INK);
+        attachButton.setTextSize(13);
+        attachButton.setOnClickListener(v -> pickFile());
+        inputRow.addView(attachButton, new LinearLayout.LayoutParams(dp(56), dp(38)));
+        inputRow.addView(space(6, 1));
+
+        messageEditor = input("输入消息", false);
+        inputRow.addView(messageEditor, new LinearLayout.LayoutParams(0, dp(38), 1f));
+        inputRow.addView(space(6, 1));
+
+        Button sendButton = actionButton("发送", COLOR_MESH, Color.WHITE);
+        sendButton.setOnClickListener(v -> sendMessage());
+        inputRow.addView(sendButton, new LinearLayout.LayoutParams(dp(64), dp(38)));
         return panel;
     }
 
-    private View buildConfigPanel() {
-        LinearLayout panel = panel(COLOR_PANEL, 16, Color.rgb(219, 228, 233));
-        panel.setPadding(dp(16), dp(16), dp(16), dp(16));
+    private View buildSettingsCard() {
+        LinearLayout panel = panel(COLOR_PANEL, 14, COLOR_LINE);
+        panel.setPadding(dp(12), dp(10), dp(12), dp(12));
 
-        LinearLayout head = new LinearLayout(this);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        panel.addView(head, matchWrap());
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        panel.addView(header, matchWrap());
 
-        TextView title = label("Client config", COLOR_INK, 18, Typeface.BOLD);
-        head.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView title = label("连接设置", COLOR_INK, 14, Typeface.BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        Button resetButton = smallButton("Reset");
-        resetButton.setOnClickListener(v -> {
-            configEditor.setText(ConfigStorage.defaultConfig());
-            updateConfigSummary();
-            Toast.makeText(this, "Example restored", Toast.LENGTH_SHORT).show();
-        });
-        head.addView(resetButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+        settingsChevron = label("▶", COLOR_MUTED, 12, Typeface.NORMAL);
+        header.addView(settingsChevron, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        settingsBody = new LinearLayout(this);
+        settingsBody.setOrientation(LinearLayout.VERTICAL);
+        settingsBody.setVisibility(View.GONE);
+        panel.addView(settingsBody, matchWrap());
+
+        header.setOnClickListener(v -> toggleSection(settingsBody, settingsChevron, this::fillSettingsFromConfig));
+
+        serverEditor = settingsField("服务地址", "https://tunnel.devshuai.com");
+        apiKeyEditor = settingsField("API Key", "demo-client");
+        secretEditor = settingsField("Secret", "", true);
+
+        LinearLayout meshRow = new LinearLayout(this);
+        meshRow.setGravity(Gravity.CENTER_VERTICAL);
+        meshRow.setOrientation(LinearLayout.HORIZONTAL);
+        meshRow.setPadding(0, dp(8), 0, 0);
+        settingsBody.addView(meshRow, matchWrap());
+
+        TextView meshLabel = label("私有组网（Peer Mesh）", COLOR_INK, 13, Typeface.NORMAL);
+        meshRow.addView(meshLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        meshSwitch = new Switch(this);
+        meshRow.addView(meshSwitch, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        Button saveButton = actionButton("保存设置", COLOR_INK, Color.WHITE);
+        saveButton.setOnClickListener(v -> saveSettings());
+        LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(40));
+        saveParams.setMargins(0, dp(10), 0, 0);
+        settingsBody.addView(saveButton, saveParams);
+        return panel;
+    }
+
+    private EditText settingsField(String caption, String hint) {
+        return settingsField(caption, hint, false);
+    }
+
+    private EditText settingsField(String caption, String hint, boolean password) {
+        TextView labelView = label(caption, COLOR_MUTED, 12, Typeface.BOLD);
+        labelView.setPadding(0, dp(8), 0, dp(4));
+        settingsBody.addView(labelView, matchWrap());
+
+        EditText editor = input(hint, false);
+        if (password) {
+            editor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        }
+        settingsBody.addView(editor, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(38)));
+        return editor;
+    }
+
+    private View buildAdvancedCard() {
+        LinearLayout panel = panel(COLOR_PANEL, 14, COLOR_LINE);
+        panel.setPadding(dp(12), dp(10), dp(12), dp(12));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        panel.addView(header, matchWrap());
+
+        TextView title = label("高级", COLOR_INK, 14, Typeface.BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        advancedChevron = label("▶", COLOR_MUTED, 12, Typeface.NORMAL);
+        header.addView(advancedChevron, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        advancedBody = new LinearLayout(this);
+        advancedBody.setOrientation(LinearLayout.VERTICAL);
+        advancedBody.setVisibility(View.GONE);
+        panel.addView(advancedBody, matchWrap());
+
+        header.setOnClickListener(v -> toggleSection(advancedBody, advancedChevron, () ->
+                configEditor.setText(ConfigStorage.loadConfig(this))));
+
+        TextView configCaption = label("原始配置（JSONC）", COLOR_MUTED, 12, Typeface.BOLD);
+        configCaption.setPadding(0, dp(8), 0, dp(4));
+        advancedBody.addView(configCaption, matchWrap());
 
         configEditor = new EditText(this);
         configEditor.setGravity(Gravity.START | Gravity.TOP);
-        configEditor.setMinLines(16);
-        configEditor.setTextSize(13);
+        configEditor.setMinLines(10);
+        configEditor.setTextSize(12);
         configEditor.setTextColor(Color.rgb(226, 238, 241));
         configEditor.setHintTextColor(Color.rgb(116, 139, 148));
         configEditor.setTypeface(Typeface.MONOSPACE);
         configEditor.setSingleLine(false);
-        configEditor.setHorizontallyScrolling(false);
-        configEditor.setPadding(dp(14), dp(14), dp(14), dp(14));
-        configEditor.setBackground(round(COLOR_CODE, 14));
+        configEditor.setPadding(dp(12), dp(12), dp(12), dp(12));
+        configEditor.setBackground(round(COLOR_CODE, 10));
         configEditor.setInputType(InputType.TYPE_CLASS_TEXT
                 | InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        configEditor.addTextChangedListener(new TextWatcher() {
-            @Override
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-            }
+        advancedBody.addView(configEditor, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(240)));
 
-            @Override
-            public void onTextChanged(CharSequence s, int start, int before, int count) {
-                updateConfigSummary();
-            }
+        LinearLayout configActions = new LinearLayout(this);
+        configActions.setGravity(Gravity.END);
+        configActions.setPadding(0, dp(8), 0, 0);
+        configActions.setOrientation(LinearLayout.HORIZONTAL);
+        advancedBody.addView(configActions, matchWrap());
 
-            @Override
-            public void afterTextChanged(Editable s) {
-            }
+        Button resetButton = smallButton("重置示例");
+        resetButton.setOnClickListener(v -> {
+            configEditor.setText(ConfigStorage.defaultConfig());
+            Toast.makeText(this, "已恢复示例", Toast.LENGTH_SHORT).show();
         });
+        configActions.addView(resetButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
+        configActions.addView(space(8, 1));
 
-        panel.addView(space(12));
-        panel.addView(configEditor, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(360)));
-
-        LinearLayout actions = new LinearLayout(this);
-        actions.setGravity(Gravity.END);
-        actions.setPadding(0, dp(14), 0, 0);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        panel.addView(actions, matchWrap());
-
-        Button saveButton = actionButton("Save changes", COLOR_INK, Color.WHITE);
-        saveButton.setOnClickListener(v -> {
+        Button saveConfigButton = actionButton("保存配置", COLOR_INK, Color.WHITE);
+        saveConfigButton.setOnClickListener(v -> {
             ConfigStorage.saveConfig(this, configEditor.getText().toString());
-            updateConfigSummary();
-            Toast.makeText(this, "Config saved", Toast.LENGTH_SHORT).show();
+            fillSettingsFromConfig();
+            Toast.makeText(this, "配置已保存", Toast.LENGTH_SHORT).show();
         });
-        actions.addView(saveButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)));
-        return panel;
-    }
+        configActions.addView(saveConfigButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
 
-    private View buildLogPanel() {
-        LinearLayout panel = panel(COLOR_PANEL, 16, Color.rgb(219, 228, 233));
-        panel.setPadding(dp(16), dp(16), dp(16), dp(16));
+        TextView logCaption = label("运行事件", COLOR_MUTED, 12, Typeface.BOLD);
+        logCaption.setPadding(0, dp(12), 0, dp(4));
+        advancedBody.addView(logCaption, matchWrap());
 
-        TextView title = label("Runtime events", COLOR_INK, 18, Typeface.BOLD);
-        panel.addView(title);
-
-        eventLogView = label("Waiting for tunnel activity", COLOR_MUTED, 13, Typeface.NORMAL);
+        eventLogView = label("暂无事件", COLOR_MUTED, 12, Typeface.NORMAL);
         eventLogView.setLineSpacing(dp(2), 1f);
-        eventLogView.setPadding(0, dp(10), 0, 0);
-        panel.addView(eventLogView, matchWrap());
+        advancedBody.addView(eventLogView, matchWrap());
         return panel;
     }
 
-    private void updateStatus(String status, String detail, boolean running) {
-        String primary = status == null || status.trim().isEmpty() ? (running ? "Running" : "Ready") : status.trim();
-        String secondary = detail == null || detail.trim().isEmpty() ? (running ? "Tunnel service active" : "No active tunnel") : detail.trim();
-        statusTitle.setText(primary);
-        statusDetail.setText(secondary);
-        statusPill.setText(running ? "RUNNING" : "STOPPED");
-        statusPill.setBackground(round(running ? COLOR_MESH : Color.rgb(84, 98, 108), 999));
-        addEvent((running ? "RUNNING" : "STOPPED") + "  " + primary
-                + (secondary.trim().isEmpty() ? "" : " - " + secondary));
+    private void toggleSection(LinearLayout body, TextView chevron, Runnable onExpand) {
+        boolean show = body.getVisibility() != View.VISIBLE;
+        body.setVisibility(show ? View.VISIBLE : View.GONE);
+        chevron.setText(show ? "▼" : "▶");
+        if (show && onExpand != null) {
+            onExpand.run();
+        }
     }
 
-    private void updateConfigSummary() {
-        if (serverValue == null || configEditor == null) {
+    private void fillSettingsFromConfig() {
+        try {
+            JSONObject json = ConfigStorage.parseConfig(ConfigStorage.loadConfig(this));
+            serverEditor.setText(json.optString("serverBaseUrl", ""));
+            apiKeyEditor.setText(json.optString("apiKey", ""));
+            secretEditor.setText(json.optString("secret", ""));
+            String device = json.optString("peerMeshDevice", "noop");
+            meshSwitch.setChecked(!device.trim().isEmpty() && !"noop".equalsIgnoreCase(device.trim()));
+        } catch (Exception ignored) {
+            meshSwitch.setChecked(false);
+        }
+    }
+
+    private void saveSettings() {
+        try {
+            ConfigStorage.updateBasicConfig(this,
+                    serverEditor.getText().toString(),
+                    apiKeyEditor.getText().toString(),
+                    secretEditor.getText().toString(),
+                    meshSwitch.isChecked());
+            Toast.makeText(this, "设置已保存", Toast.LENGTH_SHORT).show();
+        } catch (Exception error) {
+            Toast.makeText(this, "保存失败：配置格式错误", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void onToggleClicked() {
+        if (tunnelRunning) {
+            startService(new Intent(this, TunnelForegroundService.class)
+                    .setAction(TunnelForegroundService.ACTION_STOP));
             return;
         }
         try {
-            JSONObject json = new JSONObject(toJson(configEditor.getText().toString()));
-            serverValue.setText(compact(json.optString("serverBaseUrl", "-"), 44));
-            String apiKey = json.optString("apiKey", "");
-            credentialValue.setText(apiKey.trim().isEmpty() ? "Missing" : compact(apiKey, 24));
-            String peerMode = json.optString("peerMeshDevice", "noop");
-            meshValue.setText(peerMode + ("noop".equalsIgnoreCase(peerMode) ? "" : " enabled"));
-            mtuValue.setText(String.format(Locale.ROOT, "%d", json.optInt("peerMeshMtu", 1280)));
-        } catch (Exception e) {
-            serverValue.setText("Invalid JSONC");
-            credentialValue.setText("-");
-            meshValue.setText("-");
-            mtuValue.setText("-");
-        }
-    }
-
-    private void addEvent(String text) {
-        if (text == null || text.trim().isEmpty()) {
+            ConfigStorage.updateBasicConfig(this,
+                    serverEditor.getText().toString(),
+                    apiKeyEditor.getText().toString(),
+                    secretEditor.getText().toString(),
+                    meshSwitch.isChecked());
+        } catch (Exception error) {
+            Toast.makeText(this, "配置格式错误，请检查高级配置", Toast.LENGTH_SHORT).show();
             return;
         }
-        eventLog.addFirst(text);
-        while (eventLog.size() > 6) {
-            eventLog.removeLast();
+        requestVpnThenStart();
+    }
+
+    private void sendMessage() {
+        String target = targetEditor.getText().toString().trim();
+        String message = messageEditor.getText().toString().trim();
+        if (target.isEmpty()) {
+            Toast.makeText(this, "请填写对方客户端名称", Toast.LENGTH_SHORT).show();
+            return;
         }
-        StringBuilder builder = new StringBuilder();
-        for (String item : eventLog) {
-            if (builder.length() > 0) {
-                builder.append('\n');
-            }
-            builder.append(item);
+        if (message.isEmpty()) {
+            return;
         }
-        eventLogView.setText(builder.toString());
+        ConfigStorage.saveLastTarget(this, target);
+        startService(new Intent(this, TunnelForegroundService.class)
+                .setAction(TunnelForegroundService.ACTION_SEND_MESSAGE)
+                .putExtra(TunnelForegroundService.EXTRA_TO_CLIENT_NAME, target)
+                .putExtra(TunnelForegroundService.EXTRA_MESSAGE, message));
+        addBubble(ChatEvents.DIRECTION_OUT, ChatEvents.KIND_TEXT, target, message, System.currentTimeMillis());
+        messageEditor.setText("");
+    }
+
+    private void pickFile() {
+        String target = targetEditor.getText().toString().trim();
+        if (target.isEmpty()) {
+            Toast.makeText(this, "请先填写对方客户端名称", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*");
+        startActivityForResult(intent, FILE_REQUEST);
     }
 
     @Override
@@ -362,8 +470,17 @@ public class MainActivity extends Activity {
             if (resultCode == RESULT_OK) {
                 startTunnelService();
             } else {
-                Toast.makeText(this, "VPN permission denied", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "已取消 VPN 授权", Toast.LENGTH_SHORT).show();
             }
+            return;
+        }
+        if (requestCode == FILE_REQUEST && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            String target = targetEditor.getText().toString().trim();
+            ConfigStorage.saveLastTarget(this, target);
+            startService(new Intent(this, TunnelForegroundService.class)
+                    .setAction(TunnelForegroundService.ACTION_SEND_FILE)
+                    .putExtra(TunnelForegroundService.EXTRA_TO_CLIENT_NAME, target)
+                    .putExtra(TunnelForegroundService.EXTRA_FILE_URI, data.getData().toString()));
         }
     }
 
@@ -386,24 +503,72 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void sendClientMessage() {
-        String target = messageTargetEditor == null ? "" : messageTargetEditor.getText().toString().trim();
-        String message = messageBodyEditor == null ? "" : messageBodyEditor.getText().toString().trim();
-        if (target.isEmpty()) {
-            Toast.makeText(this, "Target client is required", Toast.LENGTH_SHORT).show();
+    private void updateStatus(String status, String detail, boolean running) {
+        tunnelRunning = running;
+        String primary = status == null || status.trim().isEmpty() ? (running ? "运行中" : "就绪") : status.trim();
+        String secondary = detail == null ? "" : detail.trim();
+        statusTitle.setText(primary);
+        statusDetail.setText(secondary);
+        statusDetail.setVisibility(secondary.isEmpty() ? View.GONE : View.VISIBLE);
+        statusDot.setBackground(round(running ? COLOR_MESH : Color.rgb(84, 98, 108), 999));
+        toggleButton.setText(running ? "停止" : "启动");
+        toggleButton.setBackground(round(running ? COLOR_DANGER : COLOR_MESH, 12));
+        addEvent((running ? "RUNNING" : "STOPPED") + "  " + primary
+                + (secondary.isEmpty() ? "" : " - " + secondary));
+    }
+
+    private void addBubble(String direction, String kind, String peer, String text, long timestamp) {
+        boolean outgoing = ChatEvents.DIRECTION_OUT.equals(direction);
+        String safeText = text == null || text.trim().isEmpty() ? "(空消息)" : text.trim();
+
+        TextView caption = label(
+                (outgoing ? "我 → " + peer : (peer == null || peer.isEmpty() ? "对方" : peer))
+                        + " · " + timeFormat.format(new Date(timestamp)),
+                COLOR_MUTED, 10, Typeface.NORMAL);
+        caption.setGravity(outgoing ? Gravity.END : Gravity.START);
+        caption.setPadding(dp(4), dp(6), dp(4), 0);
+        chatContainer.addView(caption, matchWrap());
+
+        TextView bubble = label(safeText,
+                outgoing ? Color.WHITE : COLOR_INK, 14, Typeface.NORMAL);
+        bubble.setPadding(dp(12), dp(8), dp(12), dp(8));
+        bubble.setBackground(outgoing
+                ? round(COLOR_BUBBLE_OUT, 12)
+                : stroke(Color.WHITE, COLOR_LINE, 1, 12));
+        LinearLayout bubbleRow = new LinearLayout(this);
+        bubbleRow.setOrientation(LinearLayout.HORIZONTAL);
+        bubbleRow.setGravity(outgoing ? Gravity.END : Gravity.START);
+        bubbleRow.setPadding(0, dp(2), 0, 0);
+        LinearLayout.LayoutParams bubbleParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bubbleRow.addView(bubble, bubbleParams);
+        chatContainer.addView(bubbleRow, matchWrap());
+
+        while (chatContainer.getChildCount() > MAX_BUBBLES * 2) {
+            chatContainer.removeViewAt(0);
+            if (chatContainer.getChildCount() > 0) {
+                chatContainer.removeViewAt(0);
+            }
+        }
+        chatScroll.post(() -> chatScroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    private void addEvent(String text) {
+        if (text == null || text.trim().isEmpty()) {
             return;
         }
-        if (message.isEmpty()) {
-            Toast.makeText(this, "Message is required", Toast.LENGTH_SHORT).show();
-            return;
+        eventLog.addFirst(text);
+        while (eventLog.size() > 8) {
+            eventLog.removeLast();
         }
-        Intent intent = new Intent(this, TunnelForegroundService.class)
-                .setAction(TunnelForegroundService.ACTION_SEND_MESSAGE)
-                .putExtra(TunnelForegroundService.EXTRA_TO_CLIENT_NAME, target)
-                .putExtra(TunnelForegroundService.EXTRA_MESSAGE, message);
-        startService(intent);
-        addEvent("OUT  " + target + " - " + compact(message, 72));
-        messageBodyEditor.setText("");
+        StringBuilder builder = new StringBuilder();
+        for (String item : eventLog) {
+            if (builder.length() > 0) {
+                builder.append('\n');
+            }
+            builder.append(item);
+        }
+        eventLogView.setText(builder.toString());
     }
 
     private void maybeRequestNotifications() {
@@ -411,22 +576,6 @@ public class MainActivity extends Activity {
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1001);
         }
-    }
-
-    private TextView addSummaryRow(LinearLayout parent, String label, String value) {
-        LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, dp(4), 0, dp(4));
-        parent.addView(row, matchWrap());
-
-        TextView left = label(label, Color.rgb(136, 156, 166), 12, Typeface.BOLD);
-        row.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.8f));
-
-        TextView right = label(value, Color.rgb(230, 241, 245), 13, Typeface.BOLD);
-        right.setGravity(Gravity.END);
-        row.addView(right, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.4f));
-        return right;
     }
 
     private LinearLayout panel(int color, int radius, int strokeColor) {
@@ -455,39 +604,29 @@ public class MainActivity extends Activity {
         button.setTextColor(foreground);
         button.setMinHeight(0);
         button.setMinWidth(0);
-        button.setPadding(dp(12), 0, dp(12), 0);
+        button.setPadding(dp(10), 0, dp(10), 0);
         button.setBackground(round(background, 12));
         return button;
-    }
-
-    private EditText messageInput(String hint, boolean multiLine) {
-        EditText input = new EditText(this);
-        input.setTextSize(14);
-        input.setTextColor(COLOR_INK);
-        input.setHintTextColor(COLOR_MUTED);
-        input.setSingleLine(!multiLine);
-        input.setGravity(multiLine ? (Gravity.START | Gravity.TOP) : Gravity.CENTER_VERTICAL);
-        input.setPadding(dp(12), 0, dp(12), 0);
-        input.setHint(hint);
-        input.setBackground(stroke(Color.rgb(248, 251, 252), Color.rgb(206, 218, 225), 1, 12));
-        if (multiLine) {
-            input.setMinLines(3);
-            input.setPadding(dp(12), dp(10), dp(12), dp(10));
-            input.setInputType(InputType.TYPE_CLASS_TEXT
-                    | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                    | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
-        } else {
-            input.setInputType(InputType.TYPE_CLASS_TEXT
-                    | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        }
-        return input;
     }
 
     private Button smallButton(String text) {
         Button button = actionButton(text, Color.rgb(232, 240, 243), COLOR_INK);
         button.setTextSize(13);
-        button.setPadding(dp(12), 0, dp(12), 0);
         return button;
+    }
+
+    private EditText input(String hint, boolean multiLine) {
+        EditText editor = new EditText(this);
+        editor.setTextSize(14);
+        editor.setTextColor(COLOR_INK);
+        editor.setHintTextColor(COLOR_MUTED);
+        editor.setSingleLine(!multiLine);
+        editor.setGravity(multiLine ? (Gravity.START | Gravity.TOP) : Gravity.CENTER_VERTICAL);
+        editor.setPadding(dp(10), 0, dp(10), 0);
+        editor.setHint(hint);
+        editor.setBackground(stroke(Color.rgb(248, 251, 252), Color.rgb(206, 218, 225), 1, 10));
+        editor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        return editor;
     }
 
     private GradientDrawable round(int color, int radiusDp) {
@@ -519,105 +658,6 @@ public class MainActivity extends Activity {
         View view = new View(this);
         view.setLayoutParams(new LinearLayout.LayoutParams(dp(width), dp(height)));
         return view;
-    }
-
-    private String compact(String value, int max) {
-        if (value == null) {
-            return "-";
-        }
-        String trimmed = value.trim();
-        if (trimmed.length() <= max) {
-            return trimmed;
-        }
-        return trimmed.substring(0, Math.max(0, max - 3)) + "...";
-    }
-
-    private String toJson(String jsonc) {
-        return removeTrailingCommas(stripComments(jsonc == null ? "" : jsonc));
-    }
-
-    private String stripComments(String input) {
-        StringBuilder out = new StringBuilder(input.length());
-        boolean string = false;
-        boolean escape = false;
-        for (int i = 0; i < input.length(); i++) {
-            char c = input.charAt(i);
-            if (string) {
-                out.append(c);
-                if (escape) {
-                    escape = false;
-                } else if (c == '\\') {
-                    escape = true;
-                } else if (c == '"') {
-                    string = false;
-                }
-                continue;
-            }
-            if (c == '"') {
-                string = true;
-                out.append(c);
-                continue;
-            }
-            if (c == '/' && i + 1 < input.length()) {
-                char next = input.charAt(i + 1);
-                if (next == '/') {
-                    i += 2;
-                    while (i < input.length() && input.charAt(i) != '\n' && input.charAt(i) != '\r') {
-                        i++;
-                    }
-                    if (i < input.length()) {
-                        out.append(input.charAt(i));
-                    }
-                    continue;
-                }
-                if (next == '*') {
-                    i += 2;
-                    while (i + 1 < input.length() && !(input.charAt(i) == '*' && input.charAt(i + 1) == '/')) {
-                        i++;
-                    }
-                    i++;
-                    continue;
-                }
-            }
-            out.append(c);
-        }
-        return out.toString();
-    }
-
-    private String removeTrailingCommas(String input) {
-        StringBuilder out = new StringBuilder(input.length());
-        boolean string = false;
-        boolean escape = false;
-        for (int i = 0; i < input.length(); i++) {
-            char c = input.charAt(i);
-            if (string) {
-                out.append(c);
-                if (escape) {
-                    escape = false;
-                } else if (c == '\\') {
-                    escape = true;
-                } else if (c == '"') {
-                    string = false;
-                }
-                continue;
-            }
-            if (c == '"') {
-                string = true;
-                out.append(c);
-                continue;
-            }
-            if (c == ',') {
-                int j = i + 1;
-                while (j < input.length() && Character.isWhitespace(input.charAt(j))) {
-                    j++;
-                }
-                if (j < input.length() && (input.charAt(j) == '}' || input.charAt(j) == ']')) {
-                    continue;
-                }
-            }
-            out.append(c);
-        }
-        return out.toString();
     }
 
     private int dp(int value) {

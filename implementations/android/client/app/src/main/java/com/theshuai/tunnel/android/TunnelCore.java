@@ -74,6 +74,10 @@ public final class TunnelCore {
         void onStatus(String status, String detail, boolean running);
     }
 
+    interface AppMessageListener {
+        void onAppMessage(String fromClientName, String body);
+    }
+
     public interface VpnPacketHandler {
         void onPacket(byte[] packet);
     }
@@ -102,12 +106,21 @@ public final class TunnelCore {
             return thread;
         });
         private volatile ControlConnection connection;
+        private volatile AppMessageListener appMessageListener;
 
         Runtime(Context context, String configText, StatusListener listener, VpnPlatform vpnPlatform) {
             this.context = context.getApplicationContext();
             this.configText = configText;
             this.listener = listener;
             this.vpnPlatform = vpnPlatform;
+        }
+
+        void setAppMessageListener(AppMessageListener appMessageListener) {
+            this.appMessageListener = appMessageListener;
+            ControlConnection current = connection;
+            if (current != null) {
+                current.setAppMessageListener(appMessageListener);
+            }
         }
 
         public boolean isRunning() {
@@ -156,6 +169,7 @@ public final class TunnelCore {
                                     return refreshed;
                                 });
                         connection = next;
+                        next.setAppMessageListener(appMessageListener);
                         next.runBlocking();
                         if (running.get()) {
                             publish("Disconnected", "control channel closed", true);
@@ -817,6 +831,7 @@ public final class TunnelCore {
         private volatile OutputStream output;
         private volatile boolean httpRoutesReported;
         private volatile boolean loginSucceeded;
+        private volatile AppMessageListener appMessageListener;
         private volatile ControlExitAction exitAction = ControlExitAction.RETRY_WITH_BACKOFF;
         private volatile String exitReason = "control channel closed";
         private final OkHttpClient webSocketClient;
@@ -831,7 +846,19 @@ public final class TunnelCore {
             this.vpnPlatform = vpnPlatform;
             this.sessionRefresher = sessionRefresher;
             this.webSocketClient = WebSocketSupport.newClient(this::protect);
-            this.peerMeshEngine = new PeerMeshEngine(session, vpnPlatform, ioPool, this::sendPeerControl, status::publish);
+            this.peerMeshEngine = new PeerMeshEngine(session, vpnPlatform, ioPool, this::sendPeerControl, status::publish,
+                    this::dispatchAppMessage);
+        }
+
+        void setAppMessageListener(AppMessageListener appMessageListener) {
+            this.appMessageListener = appMessageListener;
+        }
+
+        private void dispatchAppMessage(String fromClientName, String body) {
+            AppMessageListener listener = appMessageListener;
+            if (listener != null) {
+                listener.onAppMessage(fromClientName, body);
+            }
         }
 
         void runBlocking() throws Exception {
@@ -923,7 +950,22 @@ public final class TunnelCore {
             } else if (packet.messageType == MessageType.CLIENT_TO_CLIENT) {
                 status.publish("Message received",
                         firstText(packet.clientName, "server") + ": " + clientMessageText(packet.message), true);
+                dispatchClientMessage(packet);
             }
+        }
+
+        private void dispatchClientMessage(MessageResponse packet) {
+            String from = firstText(packet.clientName, "server");
+            String body = packet.message == null ? "" : packet.message;
+            PeerAppMessageCodec.PeerAppMessage envelope =
+                    PeerAppMessageCodec.decode(body.getBytes(StandardCharsets.UTF_8));
+            if (envelope != null) {
+                from = firstText(envelope.fromClientName, from);
+                body = envelope.attachment == null
+                        ? envelope.message
+                        : PeerAppMessageCodec.displayText(envelope);
+            }
+            dispatchAppMessage(from, body);
         }
 
         private String clientMessageText(String body) {
@@ -2616,7 +2658,7 @@ public final class TunnelCore {
         }
     }
 
-    private static final class Jsonc {
+    static final class Jsonc {
         static String toJson(String jsonc) {
             return removeTrailingCommas(stripComments(jsonc == null ? "" : jsonc));
         }

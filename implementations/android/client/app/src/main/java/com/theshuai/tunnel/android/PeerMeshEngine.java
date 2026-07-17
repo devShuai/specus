@@ -65,11 +65,16 @@ final class PeerMeshEngine implements Closeable {
     private static final long APP_MESSAGE_SESSION_WAIT_MS = 1_500L;
     private static final long APP_MESSAGE_ACK_WAIT_MS = 1_500L;
 
+    interface AppMessageSink {
+        void onAppMessage(String fromClientName, String body);
+    }
+
     private final TunnelCore.TunnelSession tunnelSession;
     private final TunnelCore.VpnPlatform vpnPlatform;
     private final ExecutorService ioPool;
     private final ControlSender controlSender;
     private final StatusPublisher status;
+    private final AppMessageSink appMessageSink;
     private final KeyStore.KeyMaterial keyMaterial;
     private final SecureRandom secureRandom = new SecureRandom();
     private final AtomicBoolean enabled = new AtomicBoolean(false);
@@ -105,12 +110,14 @@ final class PeerMeshEngine implements Closeable {
                    TunnelCore.VpnPlatform vpnPlatform,
                    ExecutorService ioPool,
                    ControlSender controlSender,
-                   StatusPublisher status) {
+                   StatusPublisher status,
+                   AppMessageSink appMessageSink) {
         this.tunnelSession = tunnelSession;
         this.vpnPlatform = vpnPlatform;
         this.ioPool = ioPool;
         this.controlSender = controlSender;
         this.status = status;
+        this.appMessageSink = appMessageSink;
         this.keyMaterial = KeyStore.keyMaterial();
     }
 
@@ -759,6 +766,11 @@ final class PeerMeshEngine implements Closeable {
         String from = firstText(message.fromClientName,
                 peer == null ? String.valueOf(session.peerId) : peer.clientName);
         publish("Message received", from + ": " + peerAppMessageText(message));
+        if (appMessageSink != null) {
+            appMessageSink.onAppMessage(from, message.attachment == null
+                    ? message.message
+                    : PeerAppMessageCodec.displayText(message));
+        }
         sendPeerClientMessageAck(message, session, current);
         return true;
     }

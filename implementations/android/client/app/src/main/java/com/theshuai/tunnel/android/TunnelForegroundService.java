@@ -4,6 +4,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.VpnService;
@@ -25,8 +26,10 @@ public class TunnelForegroundService extends VpnService implements TunnelCore.Vp
     static final String ACTION_START = "com.theshuai.tunnel.android.START";
     static final String ACTION_STOP = "com.theshuai.tunnel.android.STOP";
     static final String ACTION_SEND_MESSAGE = "com.theshuai.tunnel.android.SEND_MESSAGE";
+    static final String ACTION_SEND_FILE = "com.theshuai.tunnel.android.SEND_FILE";
     static final String EXTRA_TO_CLIENT_NAME = "toClientName";
     static final String EXTRA_MESSAGE = "message";
+    static final String EXTRA_FILE_URI = "fileUri";
 
     private static final String CHANNEL_ID = "shuai_tunnel_client";
     private static final int NOTIFICATION_ID = 4207;
@@ -76,6 +79,11 @@ public class TunnelForegroundService extends VpnService implements TunnelCore.Vp
             TunnelCore.Runtime active = runtime;
             return active != null && active.isRunning() ? START_STICKY : START_NOT_STICKY;
         }
+        if (ACTION_SEND_FILE.equals(action)) {
+            sendFile(intent);
+            TunnelCore.Runtime active = runtime;
+            return active != null && active.isRunning() ? START_STICKY : START_NOT_STICKY;
+        }
         startForeground(NOTIFICATION_ID, notification("Starting"));
         startRuntime();
         return START_STICKY;
@@ -115,6 +123,13 @@ public class TunnelForegroundService extends VpnService implements TunnelCore.Vp
         }
         String configText = ConfigStorage.loadConfig(this);
         runtime = new TunnelCore.Runtime(getApplicationContext(), configText, this::onRuntimeStatus, this);
+        runtime.setAppMessageListener((from, body) -> {
+            Context appContext = getApplicationContext();
+            if (FileTransferManager.get().onIncomingMessage(appContext, from, body)) {
+                return;
+            }
+            ChatEvents.send(appContext, ChatEvents.DIRECTION_IN, ChatEvents.KIND_TEXT, from, body);
+        });
         executor.submit(runtime::run);
     }
 
@@ -149,6 +164,26 @@ public class TunnelForegroundService extends VpnService implements TunnelCore.Vp
                         : error.getMessage(), active.isRunning());
             }
         });
+    }
+
+    private void sendFile(Intent intent) {
+        String toClientName = intent == null ? "" : intent.getStringExtra(EXTRA_TO_CLIENT_NAME);
+        String uriText = intent == null ? "" : intent.getStringExtra(EXTRA_FILE_URI);
+        TunnelCore.Runtime active = runtime;
+        if (active == null || !active.isRunning()) {
+            ChatEvents.send(getApplicationContext(), ChatEvents.DIRECTION_OUT, ChatEvents.KIND_FILE,
+                    toClientName, "文件未发送 · 隧道未运行");
+            stopSelf();
+            return;
+        }
+        ExecutorService worker = messageExecutor;
+        if (worker == null || worker.isShutdown()) {
+            ChatEvents.send(getApplicationContext(), ChatEvents.DIRECTION_OUT, ChatEvents.KIND_FILE,
+                    toClientName, "文件未发送 · 发送线程不可用");
+            return;
+        }
+        android.net.Uri uri = android.net.Uri.parse(uriText);
+        worker.submit(() -> FileTransferManager.get().sendFile(getApplicationContext(), active, toClientName, uri));
     }
 
     private void onRuntimeStatus(String status, String detail, boolean running) {
