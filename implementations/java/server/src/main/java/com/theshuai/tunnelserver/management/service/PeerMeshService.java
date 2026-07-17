@@ -37,6 +37,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -964,15 +965,25 @@ public class PeerMeshService {
     }
 
     private List<String> publicStunServers() {
-        if (properties.getPublicStunServers() == null || properties.getPublicStunServers().isEmpty()) {
-            return List.of();
+        LinkedHashSet<String> servers = new LinkedHashSet<>();
+        if (StringUtils.hasText(properties.getStandaloneStunAlternateAddress())
+                && resolveStunPort() > 0) {
+            String host = properties.getStandaloneStunAlternateAddress().trim();
+            servers.add("stun:" + bracketIpv6(host) + ":" + resolveStunPort());
         }
-        return properties.getPublicStunServers().stream()
-                .filter(StringUtils::hasText)
-                .map(String::trim)
-                .distinct()
+        if (properties.getPublicStunServers() != null) {
+            properties.getPublicStunServers().stream()
+                    .filter(StringUtils::hasText)
+                    .map(String::trim)
+                    .forEach(servers::add);
+        }
+        return servers.stream()
                 .limit(16)
                 .toList();
+    }
+
+    private String bracketIpv6(String host) {
+        return host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
     }
 
     private PeerMeshSession findReportableSession(ClientAccount reporter, long sessionId) {

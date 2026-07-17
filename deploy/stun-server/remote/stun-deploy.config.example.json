@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "deployment": {
+    "remoteTempRoot": "/tmp",
+    "sshConnectTimeoutSeconds": 10,
+    "serviceActiveTimeoutSeconds": 25,
+    "backupKeep": 5
+  },
+  "defaults": {
+    "primaryPublicAddress": "203.0.113.10",
+    "alternatePublicAddress": "198.51.100.10",
+    "primaryPort": 3478,
+    "alternatePort": 3479,
+    "distributedEnabled": true,
+    "distributedStunBindAddress": "0.0.0.0",
+    "distributedControlPort": 3480,
+    "distributedPeerControlPort": 3480,
+    "distributedSharedSecret": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+    "distributedMaxClockSkewSeconds": 30,
+    "distributedReplayCacheSize": 65536,
+    "distributedMaxForwardPacketBytes": 4096,
+    "distributedForwardRatePerSecond": 10000,
+    "distributedForwardBurst": 20000,
+    "software": "shuai-tunnel-rfc5780-stun",
+    "legacySingleIpOtherAddress": false,
+    "rateLimitPerSecond": 100,
+    "rateLimitBurst": 200,
+    "globalRateLimitPerSecond": 10000,
+    "globalRateLimitBurst": 20000,
+    "maxTrackedSources": 65536,
+    "sourceIdleSeconds": 300,
+    "maxPacketBytes": 65507,
+    "maxPaddingResponseBytes": 1472,
+    "metricsBindAddress": "127.0.0.1",
+    "metricsPort": 9108,
+    "javaOpts": "-Xms32m -Xmx128m -XX:+UseG1GC -Dfile.encoding=UTF-8"
+  },
+  "nodes": [
+    {
+      "name": "primary",
+      "role": "primary",
+      "enabled": true,
+      "sshHost": "ali2",
+      "distributedLocalAddressSlot": "primary",
+      "distributedControlBindAddress": "10.0.0.10",
+      "distributedPeerControlAddress": "10.0.1.10"
+    },
+    {
+      "name": "standby",
+      "role": "standby",
+      "enabled": true,
+      "sshHost": "ali",
+      "distributedLocalAddressSlot": "alternate",
+      "distributedControlBindAddress": "10.0.1.10",
+      "distributedPeerControlAddress": "10.0.0.10"
+    }
+  ]
+}

@@ -26,12 +26,14 @@ public final class StandaloneStunServer implements AutoCloseable {
     private final StunRequestLimiter requestLimiter;
     private final StunServerMetrics metrics = new StunServerMetrics();
     private final StunMetricsHttpServer metricsHttpServer;
+    private final DistributedStunForwarder distributedForwarder;
     private final Map<StunEndpointTopology.EndpointId, DatagramSocket> sockets =
             new ConcurrentHashMap<>();
     private final List<Thread> workers = new ArrayList<>();
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean running = new AtomicBoolean();
     private final CountDownLatch stopped = new CountDownLatch(1);
+    private DatagramSocket distributedControlSocket;
 
     public StandaloneStunServer(StandaloneStunServerConfig config) {
         this.config = config;
@@ -44,6 +46,9 @@ public final class StandaloneStunServer implements AutoCloseable {
         this.metricsHttpServer = new StunMetricsHttpServer(
                 config.metrics(),
                 () -> metrics.render(requestLimiter::trackedSources));
+        this.distributedForwarder = config.distribution().enabled()
+                ? new DistributedStunForwarder(config.distribution())
+                : null;
     }
 
     public synchronized void start() throws IOException {
@@ -52,15 +57,24 @@ public final class StandaloneStunServer implements AutoCloseable {
         }
         try {
             bindAllEndpoints();
+            bindDistributedControl();
             metricsHttpServer.start();
             running.set(true);
-            for (StunEndpointTopology.Endpoint endpoint : config.topology().endpoints()) {
+            for (StunEndpointTopology.Endpoint endpoint : config.localEndpoints()) {
                 Thread worker = new Thread(
                         () -> receiveLoop(endpoint.id()),
                         "standalone-stun-" + endpoint.id());
                 worker.setDaemon(false);
                 workers.add(worker);
                 worker.start();
+            }
+            if (distributedControlSocket != null) {
+                Thread controlWorker = new Thread(
+                        this::distributedControlLoop,
+                        "standalone-stun-distributed-control");
+                controlWorker.setDaemon(false);
+                workers.add(controlWorker);
+                controlWorker.start();
             }
             LOG.log(System.Logger.Level.INFO, "STUN server started: " + config.describe());
         } catch (IOException | RuntimeException e) {
@@ -84,7 +98,7 @@ public final class StandaloneStunServer implements AutoCloseable {
     }
 
     private void bindAllEndpoints() throws SocketException {
-        for (StunEndpointTopology.Endpoint endpoint : config.topology().endpoints()) {
+        for (StunEndpointTopology.Endpoint endpoint : config.localEndpoints()) {
             DatagramSocket socket = new DatagramSocket(null);
             try {
                 socket.bind(endpoint.bindAddress());
@@ -95,6 +109,23 @@ public final class StandaloneStunServer implements AutoCloseable {
                         "cannot bind " + endpoint.id() + " to " + endpoint.bindAddress()
                                 + ": " + e.getMessage());
             }
+        }
+    }
+
+    private void bindDistributedControl() throws SocketException {
+        if (!config.distribution().enabled()) {
+            return;
+        }
+        DatagramSocket socket = new DatagramSocket(null);
+        try {
+            socket.bind(config.distribution().controlBindAddress());
+            distributedControlSocket = socket;
+        } catch (SocketException e) {
+            socket.close();
+            throw new SocketException(
+                    "cannot bind distributed STUN control socket to "
+                            + config.distribution().controlBindAddress()
+                            + ": " + e.getMessage());
         }
     }
 
@@ -122,6 +153,67 @@ public final class StandaloneStunServer implements AutoCloseable {
                 }
             }
         }
+    }
+
+    private void distributedControlLoop() {
+        DatagramSocket controlSocket = distributedControlSocket;
+        int configuredMax = config.distribution().maxForwardPacketBytes();
+        int receiveBytes = configuredMax >= MAX_UDP_PACKET_BYTES
+                ? MAX_UDP_PACKET_BYTES
+                : configuredMax + 1;
+        byte[] buffer = new byte[receiveBytes];
+        while (running.get() && controlSocket != null && !controlSocket.isClosed()) {
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            try {
+                controlSocket.receive(packet);
+                processDistributedControl(packet);
+            } catch (SocketException e) {
+                if (running.get()) {
+                    LOG.log(System.Logger.Level.WARNING,
+                            "distributed STUN control receive failed: " + e.getMessage());
+                }
+            } catch (Exception e) {
+                if (running.get()) {
+                    metrics.recordDistributed("processing_failed");
+                    LOG.log(System.Logger.Level.DEBUG,
+                            "distributed STUN control processing failed", e);
+                }
+            }
+        }
+    }
+
+    private void processDistributedControl(DatagramPacket packet) throws IOException {
+        if (packet.getLength() > config.distribution().maxForwardPacketBytes()) {
+            metrics.recordDistributed("packet_too_large");
+            return;
+        }
+        DistributedStunForwarder.DecodeResult result = distributedForwarder.decode(packet);
+        if (!result.accepted()) {
+            metrics.recordDistributed(result.rejectionReason());
+            return;
+        }
+        DistributedStunForwarder.ForwardedResponse forwarded = result.response();
+        DatagramSocket responseSocket = sockets.get(forwarded.responseEndpoint());
+        if (responseSocket == null || responseSocket.isClosed()) {
+            metrics.recordDistributed("endpoint_unavailable");
+            return;
+        }
+        byte[] response = forwarded.response();
+        try {
+            responseSocket.send(new DatagramPacket(
+                    response,
+                    response.length,
+                    forwarded.responseTarget()));
+        } catch (IOException e) {
+            metrics.recordDistributed("response_send_failed");
+            throw e;
+        }
+        StunMessage message = StunMessage.parse(response, 0, response.length);
+        int responseCode = message != null && message.type() == StunMessage.BINDING_SUCCESS
+                ? 200
+                : message == null ? -1 : message.errorCode();
+        metrics.recordResponse(responseCode, response.length);
+        metrics.recordDistributed("received");
     }
 
     private void process(
@@ -173,23 +265,51 @@ public final class StandaloneStunServer implements AutoCloseable {
                         incomingEndpoint,
                         packet.getLength());
         DatagramSocket responseSocket = sockets.get(result.responseEndpoint());
-        if (responseSocket == null || responseSocket.isClosed()) {
-            throw new SocketException(
-                    "response endpoint is unavailable: " + result.responseEndpoint());
-        }
         byte[] response = result.response().toBytes();
         if (response.length > MAX_UDP_PACKET_BYTES) {
             metrics.recordDrop("response_too_large");
             return;
         }
-        responseSocket.send(new DatagramPacket(
-                response,
-                response.length,
-                result.responseTarget()));
-        int responseCode = result.response().type() == StunMessage.BINDING_SUCCESS
+        if (config.distribution().enabled()
+                && !config.distribution().isLocal(result.responseEndpoint())) {
+            DatagramSocket controlSocket = distributedControlSocket;
+            if (controlSocket == null || controlSocket.isClosed()) {
+                metrics.recordDrop("distributed_control_unavailable");
+                metrics.recordDistributed("control_unavailable");
+                return;
+            }
+            try {
+                byte[] forwardPacket = distributedForwarder.encode(
+                        result.responseEndpoint(),
+                        result.responseTarget(),
+                        response);
+                controlSocket.send(new DatagramPacket(
+                        forwardPacket,
+                        forwardPacket.length,
+                        config.distribution().peerControlAddress()));
+                metrics.recordDistributed("sent");
+            } catch (IOException e) {
+                metrics.recordDistributed("send_failed");
+                throw e;
+            } catch (RuntimeException e) {
+                metrics.recordDistributed("encode_failed");
+                throw e;
+            }
+            return;
+        }
+        if (responseSocket == null || responseSocket.isClosed()) {
+            throw new SocketException(
+                    "response endpoint is unavailable: " + result.responseEndpoint());
+        }
+        responseSocket.send(new DatagramPacket(response, response.length, result.responseTarget()));
+        recordResponse(result.response(), response.length);
+    }
+
+    private void recordResponse(StunMessage response, int bytes) {
+        int responseCode = response.type() == StunMessage.BINDING_SUCCESS
                 ? 200
-                : result.response().errorCode();
-        metrics.recordResponse(responseCode, response.length);
+                : response.errorCode();
+        metrics.recordResponse(responseCode, bytes);
     }
 
     @Override
@@ -213,6 +333,10 @@ public final class StandaloneStunServer implements AutoCloseable {
     }
 
     private void closeSockets() {
+        if (distributedControlSocket != null) {
+            distributedControlSocket.close();
+            distributedControlSocket = null;
+        }
         for (DatagramSocket socket : sockets.values()) {
             socket.close();
         }

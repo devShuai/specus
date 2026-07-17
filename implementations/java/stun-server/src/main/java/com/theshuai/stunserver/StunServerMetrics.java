@@ -14,6 +14,7 @@ final class StunServerMetrics {
     private final Map<String, LongAdder> drops = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> responses = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> features = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> distributed = new ConcurrentHashMap<>();
 
     void recordPacket(int bytes) {
         packetsReceived.increment();
@@ -37,6 +38,10 @@ final class StunServerMetrics {
         increment(features, feature);
     }
 
+    void recordDistributed(String event) {
+        increment(distributed, event);
+    }
+
     String render(IntSupplier trackedSources) {
         StringBuilder result = new StringBuilder(2_048);
         appendCounter(result, "stun_packets_received_total",
@@ -53,6 +58,8 @@ final class StunServerMetrics {
                 "STUN Binding responses sent by response code.", "code", responses);
         appendLabelCounters(result, "stun_feature_requests_total",
                 "Accepted Binding requests using RFC 5780 features.", "feature", features);
+        appendLabelCounters(result, "stun_distributed_forward_total",
+                "Authenticated inter-node STUN forwarding events.", "event", distributed);
         result.append("# HELP stun_tracked_sources Current source IP token buckets.\n")
                 .append("# TYPE stun_tracked_sources gauge\n")
                 .append("stun_tracked_sources ")

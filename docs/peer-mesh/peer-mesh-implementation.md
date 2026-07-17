@@ -12,7 +12,7 @@
 * 客户端登录响应下发 `peerMesh` 配置，包括虚拟 IP、CIDR、标准 STUN/TURN 地址、公共 STUN 列表、会话 TTL 和设备公钥相关信息。
 * 控制协议通过现有控制长连接承载 `PEER_CONTROL` JSON 信令，不破坏现有 NAT / HTTP 协议。
 * Java / Go / .NET 服务端内置标准 UDP STUN/TURN：支持 Binding、Allocate、Refresh、CreatePermission、Send Indication 和 Data Indication；relay 转发使用独立 UDP allocation 端口。
-* Java STUN 核心支持 RFC 5780 四端点、`CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、标准 `MAPPED-ADDRESS` / `XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；同一核心可由独立 `stun-server.jar` 部署。
+* Java STUN 核心支持 RFC 5780 四端点、`CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、标准 `MAPPED-ADDRESS` / `XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；同一核心可由独立 `stun-server.jar` 部署，也可把 A1/A2 拆到两台内网互通的服务器，通过 HMAC 鉴权控制通道协同回包。
 * Go 提供 `cmd/shuai-stun-server`，.NET 提供 `ShuaiTunnel.StunServer`；两者与 Java 使用同一套四端点、限流、防放大和 Prometheus 指标契约，可脱离业务 server 独立部署。
 * Java / Go / .NET / Android 客户端可使用独立 STUN 入口执行 RFC 5780 映射与过滤行为探测，并上报 `natMappingBehavior`、`natFilteringBehavior` 和探测模式。
 * relay 转发前会校验 session 是否存在、是否 ACTIVE、是否过期、source/target 是否匹配，拒绝未授权 relay frame。
@@ -48,6 +48,10 @@ TUNNEL_PEER_MESH_ENABLED=false
 TUNNEL_PEER_MESH_CIDR=100.96.0.0/11
 TUNNEL_PEER_MESH_PUBLIC_ADDRESS=tunnel.example.com
 TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
+TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS=stun1.tunnel.devshuai.com
+TUNNEL_PEER_MESH_STANDALONE_STUN_PORT=34780
+TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS=stun2.tunnel.devshuai.com
+TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT=34781
 TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT=3479
 #TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS=10.0.0.10
 #TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS=10.0.0.11
@@ -63,8 +67,10 @@ TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 * `TUNNEL_PEER_MESH_CIDR`：mesh 虚拟网段，默认 `100.96.0.0/11`。
 * `TUNNEL_PEER_MESH_PUBLIC_ADDRESS`：UDP 探测和 relay 对外地址。完整 RFC 5780 模式下必须填写主公网 IP A1。
 * `TUNNEL_PEER_MESH_STUN_TURN_PORT`：内置标准 STUN/TURN UDP 主端口，默认 `3478`。
-* `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS`：可选独立 STUN 域名或 IP；配置后客户端 STUN 探测使用该地址，认证 TURN 仍使用 `PUBLIC_ADDRESS`。
+* `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS`：可选独立 STUN 主域名或 IP；配置后客户端 STUN 探测优先使用该地址，认证 TURN 仍使用 `PUBLIC_ADDRESS`。
 * `TUNNEL_PEER_MESH_STANDALONE_STUN_PORT`：独立 STUN 入口端口，默认 `3478`。
+* `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS`：独立 RFC 5780 拓扑的第二公网地址 A2；A2:P1 自动作为客户端备用 STUN，下发给网页和已登录客户端。
+* `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT`：独立 RFC 5780 拓扑的第二 UDP 端口 P2。示例双节点部署使用 `34781`。
 * `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：第二个 STUN UDP 端口 P2，默认 `3479`。备用端口只用于 Binding，不承载 TURN allocation。
 * `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS`：主地址 A1 的本机绑定 IP。
 * `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS`：备用地址 A2 的本机绑定 IP。
@@ -90,11 +96,48 @@ NAT 行为探测说明：
 * 客户端分别向 A1:P1、A2:P1 和 A2:P2 发起 Binding，可比较映射地址，区分 Endpoint-Independent、Address-Dependent 与 Address-and-Port-Dependent Mapping。
 * 只有一个公网 IP 时，服务端不返回标准 `OTHER-ADDRESS`，收到 `CHANGE-REQUEST` 返回 `420 Unknown Attribute`；此时只能做普通 Binding 和保守分类。
 
+网页通过无需登录的 `GET /api/public/peer-mesh/nat-probe-config` 获取探测拓扑。完整配置会返回：
+
+```json
+{
+  "available": true,
+  "protocol": "RFC8489",
+  "discoveryMethod": "RFC5780",
+  "endpoints": [
+    { "id": "A1P1", "url": "stun:stun1.tunnel.devshuai.com:34780" },
+    { "id": "A1P2", "url": "stun:stun1.tunnel.devshuai.com:34781" },
+    { "id": "A2P1", "url": "stun:stun2.tunnel.devshuai.com:34780" },
+    { "id": "A2P2", "url": "stun:stun2.tunnel.devshuai.com:34781" }
+  ],
+  "capabilities": {
+    "binding": true,
+    "changeRequest": true,
+    "responseOrigin": true,
+    "otherAddress": true,
+    "responsePort": true,
+    "padding": true,
+    "browserMappingObservation": true,
+    "browserFilteringObservation": false
+  }
+}
+```
+
+网页先分别预检四端点，再让同一个 WebRTC ICE socket 访问四端点并比较公网映射。
+浏览器 API 不能构造 `CHANGE-REQUEST`，因此网页只报告映射行为；EIF / ADF / APDF
+过滤行为必须由 Java / Go / .NET / Android 原生探针补全。若 A2/P2 未配置或任一端点
+预检失败，页面会降级到基础多 STUN 模式，不会把超时误判为过滤类型。
+
+生产环境中，`stun1.tunnel.devshuai.com` 必须只解析到 A1（ali2，
+`47.103.154.117`），`stun2.tunnel.devshuai.com` 必须只解析到 A2（ali，
+`101.133.236.111`）。两个域名解析到同一公网 IP 时不能完成 RFC 5780 跨地址探测。
+
 如果 STUN 不应与业务服务共进程，可选择 Java
 [`implementations/java/stun-server`](../../implementations/java/stun-server)、Go
 `implementations/go/server/cmd/shuai-stun-server` 或 .NET
 `implementations/csharp/server/src/ShuaiTunnel.StunServer`。systemd、限流、指标、DNS 和双公网 IP
-示例见 [`deploy/stun-server/systemd`](../../deploy/stun-server/systemd/README.md)。独立服务不包含 TURN，
+示例见 [`deploy/stun-server/systemd`](../../deploy/stun-server/systemd/README.md)。Java
+实现还支持两台单公网 IP 服务器组成完整 RFC 5780 拓扑；部署入口见
+[`deploy/stun-server/remote`](../../deploy/stun-server/remote/README.md)。独立服务不包含 TURN，
 tunnel-server 的认证 TURN 仍可单独作为直连失败后的备用通道。
 
 ## 客户端配置

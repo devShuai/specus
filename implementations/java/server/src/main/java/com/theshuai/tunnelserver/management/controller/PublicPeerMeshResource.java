@@ -31,6 +31,10 @@ public class PublicPeerMeshResource {
         if (StringUtils.hasText(selfHosted)) {
             servers.add(selfHosted);
         }
+        String standaloneAlternate = standaloneAlternateStunServer();
+        if (StringUtils.hasText(standaloneAlternate)) {
+            servers.add(standaloneAlternate);
+        }
         if (properties.getPublicStunServers() != null) {
             properties.getPublicStunServers().stream()
                     .filter(StringUtils::hasText)
@@ -66,6 +70,47 @@ public class PublicPeerMeshResource {
         );
     }
 
+    @GetMapping("/api/public/peer-mesh/nat-probe-config")
+    public PublicNatProbeConfig natProbeConfig(HttpServletRequest request) {
+        String primaryHost = selfHostedStunHost(request);
+        int primaryPort = selfHostedStunPort();
+        String alternateHost = standaloneAlternateStunHost();
+        int alternatePort = standaloneAlternateStunPort();
+        boolean rfc5780 = StringUtils.hasText(primaryHost)
+                && StringUtils.hasText(alternateHost)
+                && !primaryHost.equalsIgnoreCase(alternateHost)
+                && primaryPort > 0
+                && alternatePort > 0
+                && primaryPort != alternatePort;
+
+        List<NatProbeEndpoint> endpoints = new ArrayList<>();
+        if (StringUtils.hasText(primaryHost) && primaryPort > 0) {
+            endpoints.add(natProbeEndpoint("A1P1", primaryHost, primaryPort, "PRIMARY", "PRIMARY"));
+        }
+        if (rfc5780) {
+            endpoints.add(natProbeEndpoint("A1P2", primaryHost, alternatePort, "PRIMARY", "ALTERNATE"));
+            endpoints.add(natProbeEndpoint("A2P1", alternateHost, primaryPort, "ALTERNATE", "PRIMARY"));
+            endpoints.add(natProbeEndpoint("A2P2", alternateHost, alternatePort, "ALTERNATE", "ALTERNATE"));
+        }
+
+        return new PublicNatProbeConfig(
+                !endpoints.isEmpty(),
+                "RFC8489",
+                rfc5780 ? "RFC5780" : "BASIC_STUN",
+                endpoints,
+                new NatProbeCapabilities(
+                        true,
+                        rfc5780,
+                        rfc5780,
+                        rfc5780,
+                        rfc5780,
+                        rfc5780,
+                        true,
+                        false
+                )
+        );
+    }
+
     private String selfHostedTurnServer(HttpServletRequest request) {
         String host = properties.getPublicAddress();
         if (!StringUtils.hasText(host)) {
@@ -82,6 +127,24 @@ public class PublicPeerMeshResource {
     }
 
     private String selfHostedStunServer(HttpServletRequest request) {
+        String host = selfHostedStunHost(request);
+        int port = selfHostedStunPort();
+        if (!StringUtils.hasText(host) || port <= 0) {
+            return "";
+        }
+        return "stun:" + bracketIpv6(host) + ":" + port;
+    }
+
+    private String standaloneAlternateStunServer() {
+        String host = standaloneAlternateStunHost();
+        int port = selfHostedStunPort();
+        if (!StringUtils.hasText(host) || port <= 0) {
+            return "";
+        }
+        return "stun:" + bracketIpv6(host) + ":" + port;
+    }
+
+    private String selfHostedStunHost(HttpServletRequest request) {
         String host = hasStandaloneStun() ? properties.getStandaloneStunAddress() : "";
         if (!StringUtils.hasText(host)) {
             host = properties.getPublicAddress();
@@ -92,12 +155,37 @@ public class PublicPeerMeshResource {
         if (!StringUtils.hasText(host)) {
             host = request.getServerName();
         }
-        host = normalizeHost(host);
-        int port = selfHostedStunPort();
-        if (!StringUtils.hasText(host) || port <= 0) {
-            return "";
+        return normalizeHost(host);
+    }
+
+    private String standaloneAlternateStunHost() {
+        String host = properties.getStandaloneStunAlternateAddress();
+        if (!StringUtils.hasText(host)) {
+            host = properties.getStunAlternatePublicAddress();
         }
-        return "stun:" + bracketIpv6(host) + ":" + port;
+        return normalizeHost(host);
+    }
+
+    private int standaloneAlternateStunPort() {
+        if (properties.getStandaloneStunAlternatePort() > 0) {
+            return properties.getStandaloneStunAlternatePort();
+        }
+        return properties.getNatProbeAlternatePort();
+    }
+
+    private NatProbeEndpoint natProbeEndpoint(String id,
+                                              String host,
+                                              int port,
+                                              String addressSlot,
+                                              String portSlot) {
+        return new NatProbeEndpoint(
+                id,
+                "stun:" + bracketIpv6(host) + ":" + port,
+                host,
+                port,
+                addressSlot,
+                portSlot
+        );
     }
 
     private boolean hasStandaloneStun() {
@@ -211,6 +299,31 @@ public class PublicPeerMeshResource {
                                   List<IceServer> iceServers,
                                   boolean turnAuthRequired,
                                   int stunTurnPort) {
+    }
+
+    public record PublicNatProbeConfig(boolean available,
+                                       String protocol,
+                                       String discoveryMethod,
+                                       List<NatProbeEndpoint> endpoints,
+                                       NatProbeCapabilities capabilities) {
+    }
+
+    public record NatProbeEndpoint(String id,
+                                   String url,
+                                   String host,
+                                   int port,
+                                   String addressSlot,
+                                   String portSlot) {
+    }
+
+    public record NatProbeCapabilities(boolean binding,
+                                       boolean changeRequest,
+                                       boolean responseOrigin,
+                                       boolean otherAddress,
+                                       boolean responsePort,
+                                       boolean padding,
+                                       boolean browserMappingObservation,
+                                       boolean browserFilteringObservation) {
     }
 
     public record IceServer(String urls,

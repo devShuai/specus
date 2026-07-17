@@ -41,6 +41,23 @@ public final class StunEndpointTopology {
                                                 Endpoint primaryAlternatePort,
                                                 Endpoint alternatePrimaryPort,
                                                 Endpoint alternate) {
+        return rfc5780(primary, primaryAlternatePort, alternatePrimaryPort, alternate, true);
+    }
+
+    public static StunEndpointTopology distributedRfc5780(
+            Endpoint primary,
+            Endpoint primaryAlternatePort,
+            Endpoint alternatePrimaryPort,
+            Endpoint alternate) {
+        return rfc5780(primary, primaryAlternatePort, alternatePrimaryPort, alternate, false);
+    }
+
+    private static StunEndpointTopology rfc5780(
+            Endpoint primary,
+            Endpoint primaryAlternatePort,
+            Endpoint alternatePrimaryPort,
+            Endpoint alternate,
+            boolean requireDistinctBindAddresses) {
         requireId(primary, PRIMARY);
         requireId(primaryAlternatePort, PRIMARY_ALTERNATE_PORT);
         requireId(alternatePrimaryPort, ALTERNATE_PRIMARY_PORT);
@@ -51,7 +68,7 @@ public final class StunEndpointTopology {
         endpoints.put(primaryAlternatePort.id(), primaryAlternatePort);
         endpoints.put(alternatePrimaryPort.id(), alternatePrimaryPort);
         endpoints.put(alternate.id(), alternate);
-        validateRfc5780(endpoints);
+        validateRfc5780(endpoints, requireDistinctBindAddresses);
         return new StunEndpointTopology(endpoints, true);
     }
 
@@ -105,7 +122,9 @@ public final class StunEndpointTopology {
         }
     }
 
-    private static void validateRfc5780(Map<EndpointId, Endpoint> endpoints) {
+    private static void validateRfc5780(
+            Map<EndpointId, Endpoint> endpoints,
+            boolean requireDistinctBindAddresses) {
         Endpoint a1p1 = endpoints.get(PRIMARY);
         Endpoint a1p2 = endpoints.get(PRIMARY_ALTERNATE_PORT);
         Endpoint a2p1 = endpoints.get(ALTERNATE_PRIMARY_PORT);
@@ -115,12 +134,14 @@ public final class StunEndpointTopology {
         validateAddressSlot(a2p1, a2p2, "alternate");
         validatePortSlot(a1p1, a2p1, "primary");
         validatePortSlot(a1p2, a2p2, "alternate");
-        if (a1p1.bindAddress().getAddress().isAnyLocalAddress()
-                || a2p1.bindAddress().getAddress().isAnyLocalAddress()) {
-            throw new IllegalArgumentException("RFC 5780 requires two explicit bind IP addresses");
-        }
-        if (sameAddress(a1p1.bindAddress(), a2p1.bindAddress())) {
-            throw new IllegalArgumentException("RFC 5780 requires two distinct bind IP addresses");
+        if (requireDistinctBindAddresses) {
+            if (a1p1.bindAddress().getAddress().isAnyLocalAddress()
+                    || a2p1.bindAddress().getAddress().isAnyLocalAddress()) {
+                throw new IllegalArgumentException("RFC 5780 requires two explicit bind IP addresses");
+            }
+            if (sameAddress(a1p1.bindAddress(), a2p1.bindAddress())) {
+                throw new IllegalArgumentException("RFC 5780 requires two distinct bind IP addresses");
+            }
         }
         if (sameAddress(a1p1.advertisedAddress(), a2p1.advertisedAddress())) {
             throw new IllegalArgumentException("RFC 5780 requires two distinct advertised IP addresses");

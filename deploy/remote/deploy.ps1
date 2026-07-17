@@ -7,7 +7,8 @@ param(
     [switch]$Yes,
     [switch]$DryRun,
     [switch]$NoClean,
-    [switch]$KeepRemoteTemp
+    [switch]$KeepRemoteTemp,
+    [switch]$IncludeStun
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,6 +102,40 @@ function Sync-AdminWebDependencies {
     }
 }
 
+function Invoke-StunDeployment {
+    param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+    if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+        throw "STUN deployment script not found: $ScriptPath"
+    }
+
+    $parameters = @{
+        Target = "All"
+        Yes = $true
+    }
+    $arguments = @("-Target", "All", "-Yes")
+    if ($DryRun) {
+        $parameters.DryRun = $true
+        $arguments += "-DryRun"
+    }
+    if ($NoClean) {
+        $parameters.NoClean = $true
+        $arguments += "-NoClean"
+    }
+    if ($KeepRemoteTemp) {
+        $parameters.KeepRemoteTemp = $true
+        $arguments += "-KeepRemoteTemp"
+    }
+
+    Write-DeployLog "deploying standalone STUN nodes before tunnel-server"
+    $display = @($ScriptPath) + @($arguments | ForEach-Object { Format-CommandArgument $_ })
+    Write-Host ("+ & " + ($display -join " "))
+    & $ScriptPath @parameters
+    if (-not $?) {
+        throw "STUN deployment failed: $ScriptPath"
+    }
+}
+
 Push-Location $RepoRoot
 try {
     $git = Require-Command @("git.exe", "git")
@@ -148,6 +183,7 @@ try {
     Write-Host "  mode:       $Mode"
     Write-Host "  host:       $HostName"
     Write-Host "  site:       $SiteUrl"
+    Write-Host "  STUN:       $(if ($IncludeStun) { 'all nodes, before tunnel-server' } else { 'not included' })"
     Write-Host "  git branch: $branch"
     if ($changedPaths.Count -gt 0) {
         Write-Host "  workspace changes ($($changedPaths.Count)):"
@@ -160,11 +196,17 @@ try {
     }
 
     if (-not $DryRun -and -not $Yes) {
-        $answer = Read-Host "Continue deploying $Mode to ${HostName}? [y/N]"
+        $deploymentScope = if ($IncludeStun) { "$Mode plus STUN" } else { $Mode }
+        $answer = Read-Host "Continue deploying $deploymentScope to ${HostName}? [y/N]"
         if ($answer -notin @("y", "Y", "yes", "YES")) {
             Write-DeployLog "cancelled"
             return
         }
+    }
+
+    if ($IncludeStun) {
+        $stunDeployScript = Join-Path $RepoRoot "deploy/stun-server/remote/deploy.ps1"
+        Invoke-StunDeployment $stunDeployScript
     }
 
     $adminWebRoot = Join-Path $RepoRoot "apps/admin-web"

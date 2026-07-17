@@ -64,6 +64,8 @@ tunnel:
     stun-turn-port: ${TUNNEL_PEER_MESH_STUN_TURN_PORT:3478}
     standalone-stun-address: ${TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS:}
     standalone-stun-port: ${TUNNEL_PEER_MESH_STANDALONE_STUN_PORT:3478}
+    standalone-stun-alternate-address: ${TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS:}
+    standalone-stun-alternate-port: ${TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT:0}
     nat-probe-alternate-port: ${TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT:3479}
     stun-primary-bind-address: ${TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS:}
     stun-alternate-bind-address: ${TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS:}

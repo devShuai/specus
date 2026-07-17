@@ -44,6 +44,7 @@ shuai-tunnel.db-journal
 
 ### Local server config ###
 /implementations/java/server/config/
+/deploy/stun-server/remote/stun-deploy.config.json
 
 ### Local client credentials ###
 tunnelClientConfig.json

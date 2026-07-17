@@ -46,3 +46,24 @@ groups:
           severity: warning
         annotations:
           summary: "STUN source limiter table is near its default capacity"
+
+      - alert: ShuaiStunDistributedControlRejected
+        expr: |
+          sum(rate(stun_distributed_forward_total{
+            event!~"sent|received"
+          }[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Distributed STUN control packets are being rejected"
+
+      - alert: ShuaiStunDistributedPeerUnavailable
+        expr: |
+          sum(rate(stun_distributed_forward_total{event="sent"}[5m])) > 0.1
+          and sum(rate(stun_distributed_forward_total{event="received"}[5m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Distributed STUN forwards are sent but none reach the peer"

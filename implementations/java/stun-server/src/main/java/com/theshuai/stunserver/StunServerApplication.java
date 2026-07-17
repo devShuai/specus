@@ -65,6 +65,25 @@ public final class StunServerApplication {
                   STUN_SOFTWARE                      SOFTWARE attribute value
                   STUN_LEGACY_SINGLE_IP_OTHER_ADDRESS
                                                      Emit legacy single-IP alternate attributes
+                  STUN_DISTRIBUTED_ENABLED           Split A1/A2 across two authenticated nodes
+                  STUN_DISTRIBUTED_LOCAL_ADDRESS_SLOT
+                                                     primary/A1 or alternate/A2
+                  STUN_DISTRIBUTED_STUN_BIND_ADDRESS Local wildcard or interface address for P1/P2
+                  STUN_DISTRIBUTED_CONTROL_BIND_ADDRESS
+                                                     Private control-channel bind IP
+                  STUN_DISTRIBUTED_CONTROL_PORT      Private UDP control port (default 3480)
+                  STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS
+                                                     Peer private control-channel IP
+                  STUN_DISTRIBUTED_PEER_CONTROL_PORT Peer control port (defaults to local port)
+                  STUN_DISTRIBUTED_SHARED_SECRET     Base64 HMAC-SHA256 secret, at least 32 bytes
+                  STUN_DISTRIBUTED_MAX_CLOCK_SKEW_SECONDS
+                                                     Forward timestamp window (default 30)
+                  STUN_DISTRIBUTED_REPLAY_CACHE_SIZE Forward nonce cache (default 65536)
+                  STUN_DISTRIBUTED_MAX_FORWARD_PACKET_BYTES
+                                                     Private control datagram cap (default 4096)
+                  STUN_DISTRIBUTED_FORWARD_RATE_PER_SECOND
+                                                     Authenticated control rate (default 10000)
+                  STUN_DISTRIBUTED_FORWARD_BURST     Control-channel burst (default 20000)
                   STUN_RATE_LIMIT_PER_SECOND         Per-source sustained request rate (default 100)
                   STUN_RATE_LIMIT_BURST              Per-source token burst (default 200)
                   STUN_GLOBAL_RATE_LIMIT_PER_SECOND  Global sustained request rate (default 10000)
@@ -78,6 +97,8 @@ public final class StunServerApplication {
 
                 Full RFC 5780 mode requires explicit A1/A2 bind addresses, two distinct
                 advertised public IPs, and the same P1/P2 port pair on both addresses.
+                Distributed mode keeps the same public topology while each node binds one
+                address slot and forwards changed-IP responses over a private HMAC channel.
                 """);
     }
 }

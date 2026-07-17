@@ -17,6 +17,8 @@ public class PeerMeshProperties {
     private int stunTurnPort = 3478;
     private String standaloneStunAddress = "";
     private int standaloneStunPort = 3478;
+    private String standaloneStunAlternateAddress = "";
+    private int standaloneStunAlternatePort = 0;
     private int natProbeAlternatePort = 3479;
     private String stunPrimaryBindAddress = "";
     private String stunAlternateBindAddress = "";

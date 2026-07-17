@@ -13,6 +13,7 @@ ASSUME_YES="false"
 DRY_RUN="false"
 NO_CLEAN="false"
 KEEP_REMOTE_TEMP="false"
+INCLUDE_STUN="false"
 
 usage() {
   cat <<'EOF'
@@ -33,6 +34,7 @@ Options:
   --dry-run           Print the plan and commands without building or uploading.
   --no-clean          Use Maven package without clean (explicit fallback only).
   --keep-remote-temp  Keep the successful upload directory under /tmp.
+  --include-stun      Deploy both standalone STUN nodes before tunnel-server.
   -h, --help          Show this help.
 
 Environment:
@@ -107,6 +109,10 @@ while (($# > 0)); do
       KEEP_REMOTE_TEMP="true"
       shift
       ;;
+    --include-stun)
+      INCLUDE_STUN="true"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -139,6 +145,27 @@ run() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+deploy_stun() {
+  local script="${REPO_ROOT}/deploy/stun-server/remote/deploy.ps1"
+  [[ -f "$script" ]] || die "STUN deployment script not found: $script"
+  require_command pwsh
+
+  local -a args=(-NoLogo -NoProfile -File "$script" -Target All -Yes)
+  if [[ "$DRY_RUN" == "true" ]]; then
+    args+=(-DryRun)
+  fi
+  if [[ "$NO_CLEAN" == "true" ]]; then
+    args+=(-NoClean)
+  fi
+  if [[ "$KEEP_REMOTE_TEMP" == "true" ]]; then
+    args+=(-KeepRemoteTemp)
+  fi
+
+  log "deploying standalone STUN nodes before tunnel-server"
+  print_command pwsh "${args[@]}"
+  pwsh "${args[@]}"
 }
 
 cd "$REPO_ROOT"
@@ -203,6 +230,11 @@ branch="$(git branch --show-current 2>/dev/null || true)"
 printf '  mode:       %s\n' "$MODE"
 printf '  host:       %s\n' "$DEPLOY_HOST"
 printf '  site:       %s\n' "$SITE_URL"
+if [[ "$INCLUDE_STUN" == "true" ]]; then
+  printf '  STUN:       all nodes, before tunnel-server\n'
+else
+  printf '  STUN:       not included\n'
+fi
 printf '  git branch: %s\n' "$branch"
 
 if ((${#CHANGED_PATHS[@]} > 0)); then
@@ -221,7 +253,11 @@ else
 fi
 
 if [[ "$DRY_RUN" != "true" && "$ASSUME_YES" != "true" ]]; then
-  printf 'Continue deploying %s to %s? [y/N] ' "$MODE" "$DEPLOY_HOST"
+  deployment_scope="$MODE"
+  if [[ "$INCLUDE_STUN" == "true" ]]; then
+    deployment_scope="${MODE} plus STUN"
+  fi
+  printf 'Continue deploying %s to %s? [y/N] ' "$deployment_scope" "$DEPLOY_HOST"
   read -r answer
   case "$answer" in
     y|Y|yes|YES)
@@ -231,6 +267,10 @@ if [[ "$DRY_RUN" != "true" && "$ASSUME_YES" != "true" ]]; then
       exit 0
       ;;
   esac
+fi
+
+if [[ "$INCLUDE_STUN" == "true" ]]; then
+  deploy_stun
 fi
 
 if [[ "$DRY_RUN" != "true" ]]; then

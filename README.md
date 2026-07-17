@@ -374,6 +374,8 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | 标准 STUN/TURN UDP 主端口 |
 | `tunnel.peer-mesh.standalone-stun-address` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS` | （空） | 独立 STUN 域名或 IP；配置后只替换 `stunHost`，TURN 地址保持不变 |
 | `tunnel.peer-mesh.standalone-stun-port` | `TUNNEL_PEER_MESH_STANDALONE_STUN_PORT` | `3478` | 独立 STUN 入口端口 |
+| `tunnel.peer-mesh.standalone-stun-alternate-address` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS` | （空） | 独立 STUN 备用域名或 IP；使用主端口加入备用 STUN 列表，同时作为 RFC 5780 的 A2 |
+| `tunnel.peer-mesh.standalone-stun-alternate-port` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT` | `0` | 独立 RFC 5780 的第二端口 P2；`0` 时回退 NAT 探测备用端口 |
 | `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `3479` | NAT 探测备用 UDP 端口，用于更准确地区分端口映射行为 |
 | `tunnel.peer-mesh.stun-primary-bind-address` | `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` | （空） | RFC 5780 主地址 A1 的本机绑定 IP；完整模式必须显式配置 |
 | `tunnel.peer-mesh.stun-alternate-bind-address` | `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` | （空） | RFC 5780 备用地址 A2 的本机绑定 IP |

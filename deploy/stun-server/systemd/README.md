@@ -1,11 +1,13 @@
 # 独立 RFC 5780 STUN Server 部署
 
-独立服务提供 Java、Go、.NET 三种等价运行时，只处理 UDP STUN Binding 与
-RFC 5780 行为探测，不启动 tunnel-server、数据库、业务 HTTP、WebSocket 或 TURN。
-三种实现共用同一套 `STUN_*` 环境变量、四端点语义、限流默认值和 Prometheus
-指标名，可按目标机器运行时与发布方式任选其一。
+独立服务提供 Java、Go、.NET 三种运行时，只处理 UDP STUN Binding 与 RFC 5780
+行为探测，不启动 tunnel-server、数据库、业务 HTTP、WebSocket 或 TURN。三种
+实现共用单机四端点、限流、防放大和 Prometheus 指标契约。Java 另外支持把 A1/A2
+拆到两台内网互通、各只有一个公网 IP 的服务器。
 
 ## 1. 网络拓扑
+
+### 1.1 单机四端点
 
 完整区分 NAT 映射和过滤行为需要四个端点：
 
@@ -19,6 +21,29 @@ RFC 5780 行为探测，不启动 tunnel-server、数据库、业务 HTTP、WebS
 两张本地地址必须同时存在于运行服务的主机。云环境可以给两张私网 IP
 分别绑定一个 EIP，要求出站源地址也保持对应的 1:1 映射。两个公网 IP
 都要放行 `3478/udp` 和 `3479/udp`。
+
+### 1.2 Java 双节点四端点
+
+两台服务器各有一个公网 IP 且内网互通时，可把地址槽拆开：
+
+| 节点 | 本地职责 | 公网端点 | 内网控制端点 |
+| --- | --- | --- | --- |
+| A1 节点 | `primary` 地址槽 | A1:P1、A1:P2 | `10.0.0.10:3480` |
+| A2 节点 | `alternate` 地址槽 | A2:P1、A2:P2 | `10.0.1.10:3480` |
+
+收到请求的节点仍在本地完成 STUN 解析、限流和 Binding Response 构造。如果
+`CHANGE-REQUEST` 指定的源地址属于另一节点，本机通过私网控制通道发送完整响应和
+目标地址，对端再从正确的 P1/P2 socket 回包。控制报文使用 HMAC-SHA256、时间戳、
+nonce 防重放、固定对端地址校验、长度限制和独立 token bucket。
+
+公网只开放两台机器各自的 `3478/udp`、`3479/udp`。内网 `3480/udp` 必须只允许
+另一台节点的私网 IP，禁止公网访问。两台机器还必须保持时钟同步；默认允许 30 秒
+偏差。Java 一键部署示例见
+[`deploy/stun-server/remote`](../remote/README.md)。
+
+端口号可以配置。若独立服务与 `tunnel-server` 同机，必须避开后者已有的
+STUN/TURN 端口，例如让独立 STUN 使用 `34780/udp`、`34781/udp`，继续保留
+`3478/udp` 给认证 TURN。安装和更新脚本会在替换文件前检查端口占用。
 
 ## 2. 构建
 
@@ -97,8 +122,37 @@ sudo journalctl -u stun-server -f
 sudo ss -lunp | grep -E ':(3478|3479)\b'
 ```
 
-`ExecStartPre` 每次启动都会执行一次 `--check-config`。如果四端点缺失、
-两个公网 IP 相同、端口重复或地址族不一致，systemd 会在监听前直接失败。
+若已经准备好节点环境文件，可把它作为第二个参数传入。脚本会在安装前校验配置，
+安装后直接 enable/start，并检查 systemd 和 Prometheus 指标：
+
+```bash
+sudo bash deploy/stun-server/systemd/install.sh \
+  /tmp/stun-server.jar /tmp/stun-server.env
+```
+
+`ExecStartPre` 每次启动都会执行一次 `--check-config`。如果四端点缺失、两个
+公网 IP 相同、端口重复、地址族不一致，或者双节点控制配置不完整，systemd 会在
+监听前直接失败。
+
+双节点模式的 A1 环境文件核心配置：
+
+```env
+STUN_PRIMARY_PUBLIC_ADDRESS=203.0.113.10
+STUN_ALTERNATE_PUBLIC_ADDRESS=198.51.100.10
+STUN_PRIMARY_PORT=3478
+STUN_ALTERNATE_PORT=3479
+STUN_DISTRIBUTED_ENABLED=true
+STUN_DISTRIBUTED_LOCAL_ADDRESS_SLOT=primary
+STUN_DISTRIBUTED_STUN_BIND_ADDRESS=0.0.0.0
+STUN_DISTRIBUTED_CONTROL_BIND_ADDRESS=10.0.0.10
+STUN_DISTRIBUTED_CONTROL_PORT=3480
+STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS=10.0.1.10
+STUN_DISTRIBUTED_PEER_CONTROL_PORT=3480
+STUN_DISTRIBUTED_SHARED_SECRET=BASE64_SECRET_AT_LEAST_32_BYTES
+```
+
+A2 使用相同公网地址、端口和密钥，把 `LOCAL_ADDRESS_SLOT` 改为 `alternate`，
+并交换本机/对端控制地址。此模式目前仅由 Java 独立 STUN 二进制实现。
 
 ### Go
 
@@ -136,16 +190,30 @@ _stun-behavior._udp.example.com. 300 IN SRV 0 0 3478 stun.example.com.
 也可以让同一域名同时返回 A1/A2；服务对四个端点均可接收请求，并会以请求
 实际到达的 IP/端口为基准计算 `OTHER-ADDRESS`。
 
+双节点模式下通常仍让域名只指向 A1。A2 不是休眠备用机，而是完整行为探测必须
+在线的第二地址槽。任一节点故障时，存活节点仍可提供普通 Binding，但无法完成
+跨地址的完整映射和过滤行为分类。
+
 在 tunnel-server 中把原生客户端和公开 NAT 检测页指向该独立入口：
 
 ```env
-TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS=stun.example.com
-TUNNEL_PEER_MESH_STANDALONE_STUN_PORT=3478
+TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS=stun1.tunnel.devshuai.com
+TUNNEL_PEER_MESH_STANDALONE_STUN_PORT=34780
+TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS=stun2.tunnel.devshuai.com
+TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT=34781
 ```
 
-这只替换登录配置中的 `stunHost/stunPort`。认证 TURN 继续使用
+主地址和主端口替换登录配置中的 `stunHost/stunPort`；备用地址会以主端口 P1
+自动加入登录配置和公开 ICE 配置的备用 STUN 列表。四个变量共同为
+`GET /api/public/peer-mesh/nat-probe-config` 生成 A1:P1、A1:P2、A2:P1、A2:P2，
+供网页执行端点预检和共享 ICE 映射观测。认证 TURN 继续使用
 `TUNNEL_PEER_MESH_PUBLIC_ADDRESS:TUNNEL_PEER_MESH_STUN_TURN_PORT`，
 因此 STUN 与 TURN 可以独立扩容、独立部署和独立维护。
+
+生产域名 `stun1.tunnel.devshuai.com` 解析到 A1（ali2，`47.103.154.117`），
+`stun2.tunnel.devshuai.com` 解析到 A2（ali，`101.133.236.111`）。两个域名必须
+解析到不同公网 IP。STUN 响应中的 `RESPONSE-ORIGIN`、`OTHER-ADDRESS` 以及
+双节点服务自身配置仍使用 A1/A2 的真实公网 IP。
 
 ## 5. 单公网 IP 兼容模式
 
@@ -164,8 +232,27 @@ server 使用。此模式不会返回 `OTHER-ADDRESS`，收到 `CHANGE-REQUEST`
 sudo bash deploy/stun-server/systemd/update.sh /tmp/stun-server.jar
 ```
 
-脚本会保留最近 5 个 JAR 备份；新进程不能通过配置校验或无法绑定四个
-UDP 端点时会自动恢复上一版。
+只传 JAR 时继续复用服务器现有配置。需要让程序和配置作为同一个版本更新时：
+
+```bash
+sudo bash deploy/stun-server/systemd/update.sh \
+  /tmp/stun-server.jar /tmp/stun-server.env
+```
+
+脚本默认保留最近 5 个完整备份；每个备份同时包含 JAR、环境文件和 systemd
+unit。新进程不能通过配置校验、无法绑定 UDP 端点或指标检查失败时，会恢复整套
+上一版。可通过 `STUN_BACKUP_KEEP` 和 `STUN_ACTIVE_TIMEOUT_SEC` 调整保留数量与
+启动等待时间。
+
+首次安装和更新也可统一调用：
+
+```bash
+sudo bash deploy/stun-server/systemd/deploy.sh \
+  /tmp/stun-server.jar /tmp/stun-server.env
+```
+
+Windows 本地一键构建并部署 `ali2` 主节点和 `ali` 备用节点，见
+[`deploy/stun-server/remote`](../remote/README.md)。
 
 Go 和 .NET 建议采用相同流程：先运行新产物的 `--check-config`，停止服务，
 原子替换产物，启动后检查 systemd active 状态和 `/metrics`，失败则恢复备份。
@@ -214,10 +301,12 @@ Go 和 .NET 建议采用相同流程：先运行新产物的 `--check-config`，
 * `stun_feature_requests_total{feature="change_request|response_port|padding"}`
 * `stun_bytes_received_total`、`stun_bytes_sent_total`
 * `stun_tracked_sources`、`stun_uptime_seconds`
+* `stun_distributed_forward_total{event="sent|received|..."}`，仅 Java 双节点模式
 
 不要直接把指标端口暴露到公网；由本机 Prometheus agent 抓取，或经认证反向代理
 访问。可直接加载 [`prometheus-rules.yml`](prometheus-rules.yml) 监控服务失联、
-有请求无成功响应、限流比例、畸形报文和来源表容量。
+有请求无成功响应、限流比例、畸形报文、来源表容量、控制报文拒绝和节点间转发
+中断。
 
 业务侧 `/api/admin/peer-mesh/stats` 额外返回
 `natBehaviorDevices`、`natBehaviorClassifiedDevices`、

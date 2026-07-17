@@ -105,6 +105,7 @@ class PeerMeshServiceTests {
         properties.setPublicAddress("turn.example.com");
         properties.setStandaloneStunAddress("stun.example.com");
         properties.setStandaloneStunPort(5349);
+        properties.setStandaloneStunAlternateAddress("stun-backup.example.com");
         PeerMeshDevice device = new PeerMeshDevice();
         device.setId(10L);
         device.setClientId(1L);
@@ -123,6 +124,8 @@ class PeerMeshServiceTests {
 
         assertThat(config.getStunHost()).isEqualTo("stun.example.com");
         assertThat(config.getStunPort()).isEqualTo(5349);
+        assertThat(config.getPublicStunServers())
+                .containsExactly("stun:stun-backup.example.com:5349");
         assertThat(config.getTurnHost()).isEqualTo("turn.example.com");
         assertThat(config.getTurnPort()).isEqualTo(3478);
     }
