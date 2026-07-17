@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>流程图编辑器嵌入示例</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #f4f4f5; color: #18181b; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 16px; background: #fff; border-bottom: 1px solid #e4e4e7; }
+  header h1 { font-size: 15px; margin: 0 12px 0 0; }
+  button { padding: 6px 14px; border: 1px solid #d4d4d8; border-radius: 8px; background: #fff; cursor: pointer; font-size: 13px; }
+  button:hover { background: #f4f4f5; }
+  #status { margin-left: auto; font-size: 12px; color: #71717a; }
+  iframe { display: block; width: 100%; height: calc(100vh - 53px - 96px); border: 0; }
+  #log { height: 96px; overflow-y: auto; margin: 0; padding: 8px 16px; background: #18181b; color: #a1a1aa; font: 11px/1.7 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>嵌入式流程图编辑器 Demo</h1>
+  <button id="save">保存到本地</button>
+  <button id="load">载入已保存</button>
+  <button id="export-svg">导出 SVG</button>
+  <button id="export-png">导出 PNG</button>
+  <span id="status">等待编辑器初始化…</span>
+</header>
+<iframe id="editor" title="流程图编辑器"></iframe>
+<pre id="log"></pre>
+<script>
+  const STORAGE_KEY = "diagram-embed-demo:document";
+  const frame = document.getElementById("editor");
+  const statusEl = document.getElementById("status");
+  const logEl = document.getElementById("log");
+  const editorOrigin = window.location.origin;
+  frame.src = editorOrigin + "/diagram-embed?origin=" + encodeURIComponent(window.location.origin);
+
+  let requestSequence = 0;
+  const pending = new Map();
+
+  function log(direction, payload) {
+    const text = JSON.stringify(payload);
+    logEl.textContent += direction + " " + (text.length > 300 ? text.slice(0, 300) + "…(" + text.length + " chars)" : text) + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function send(message, onReply) {
+    const id = ++requestSequence;
+    if (onReply) pending.set(id, onReply);
+    const payload = Object.assign({ id }, message);
+    log("→", payload);
+    frame.contentWindow.postMessage(payload, editorOrigin);
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.origin !== editorOrigin || event.source !== frame.contentWindow) return;
+    const data = event.data;
+    if (!data || data.source !== "shuai-diagram-embed") return;
+    log("←", data);
+    if (data.event === "init") {
+      statusEl.textContent = "编辑器已就绪";
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) send({ action: "load", update: saved });
+      return;
+    }
+    if (data.event === "change") {
+      statusEl.textContent = "文档有未保存的改动";
+      return;
+    }
+    const handler = pending.get(data.id);
+    if (handler) {
+      pending.delete(data.id);
+      handler(data);
+    }
+  });
+
+  document.getElementById("save").onclick = () => send({ action: "save" }, (data) => {
+    if (data.event !== "save") { statusEl.textContent = "保存失败：" + data.message; return; }
+    localStorage.setItem(STORAGE_KEY, data.update);
+    statusEl.textContent = "已保存（" + data.update.length + " chars base64）";
+  });
+
+  document.getElementById("load").onclick = () => {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (!saved) { statusEl.textContent = "本地没有保存过的文档"; return; }
+    send({ action: "load", update: saved }, (data) => {
+      statusEl.textContent = data.event === "load" ? "已载入本地文档" : "载入失败：" + data.message;
+    });
+  };
+
+  function downloadExport(data) {
+    if (data.event !== "export") { statusEl.textContent = "导出失败：" + data.message; return; }
+    const link = document.createElement("a");
+    link.href = data.format === "png" ? data.data : URL.createObjectURL(new Blob([data.data], { type: "image/svg+xml" }));
+    link.download = "diagram." + data.format;
+    link.click();
+    statusEl.textContent = "已导出 " + data.format.toUpperCase();
+  }
+
+  document.getElementById("export-svg").onclick = () => send({ action: "export", format: "svg" }, downloadExport);
+  document.getElementById("export-png").onclick = () => send({ action: "export", format: "png" }, downloadExport);
+</script>
+</body>
+</html>

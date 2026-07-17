@@ -14,6 +14,9 @@ const LazyPublicTransferPage = lazy(() =>
 const LazyPublicDiagramPage = lazy(() =>
   import("./pages/PublicDiagramPage").then((module) => ({ default: module.PublicDiagramPage })),
 );
+const LazyDiagramEmbedPage = lazy(() =>
+  import("./pages/DiagramEmbedPage").then((module) => ({ default: module.DiagramEmbedPage })),
+);
 
 function readPublicRoute() {
   const hash = window.location.hash.replace(/^#\/?/, "").split(/[/?#]/, 1)[0];
@@ -24,6 +27,9 @@ function readPublicRoute() {
   }
   if (hash === "transfer" || path === "transfer" || queryPanel === "transfer") {
     return "transfer";
+  }
+  if (hash === "diagram-embed" || path === "diagram-embed" || queryPanel === "diagram-embed") {
+    return "diagram-embed";
   }
   if (hash === "diagram" || path === "diagram" || queryPanel === "diagram") {
     return "diagram";
@@ -51,7 +57,7 @@ export function App() {
   }, []);
 
   useLayoutEffect(() => {
-    if (publicRoute !== "diagram") return;
+    if (publicRoute !== "diagram" && publicRoute !== "diagram-embed") return;
     const root = window.document.documentElement;
     const body = window.document.body;
     const previousRootOverflow = root.style.overflow;
@@ -91,6 +97,14 @@ export function App() {
     return (
       <Suspense fallback={<FullScreenLoading />}>
         <LazyPublicDiagramPage />
+      </Suspense>
+    );
+  }
+
+  if (publicRoute === "diagram-embed") {
+    return (
+      <Suspense fallback={<FullScreenLoading />}>
+        <LazyDiagramEmbedPage />
       </Suspense>
     );
   }

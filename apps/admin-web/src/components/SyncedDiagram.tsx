@@ -494,6 +494,13 @@ StyleDefaultsConfig.shadowOffsetX = 0;
 StyleDefaultsConfig.shadowOffsetY = 4;
 registerDiagramSemanticShapes();
 
+export interface DiagramEmbedApi {
+  getSnapshot: () => string;
+  loadSnapshot: (encoded: string) => void;
+  exportSvg: () => string;
+  exportPng: () => Promise<Blob>;
+}
+
 interface SyncedDiagramProps {
   boardKey: string;
   roomId: string;
@@ -508,6 +515,8 @@ interface SyncedDiagramProps {
   onSwitchToWhiteboard?: () => void;
   standalone?: boolean;
   collaborationPanel?: ReactNode;
+  onEmbedApiChange?: (api: DiagramEmbedApi | null) => void;
+  onLocalChange?: () => void;
 }
 
 interface DiagramRuntime {
@@ -875,6 +884,8 @@ export function SyncedDiagram({
   onSwitchToWhiteboard,
   standalone = false,
   collaborationPanel,
+  onEmbedApiChange,
+  onLocalChange,
 }: SyncedDiagramProps) {
   const {
     theme,
@@ -920,6 +931,8 @@ export function SyncedDiagram({
   const dialogResolverRef = useRef<((result: DiagramDialogResult) => void) | null>(null);
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
+  const onLocalChangeRef = useRef(onLocalChange);
+  onLocalChangeRef.current = onLocalChange;
 
   const [isExpanded, setIsExpanded] = useState(false);
   const [showCollaborationPanel, setShowCollaborationPanel] = useState(false);
@@ -1266,6 +1279,7 @@ export function SyncedDiagram({
       if (origin !== GRAPH_ORIGIN) {
         scheduleDocumentRender();
       }
+      onLocalChangeRef.current?.();
       sendYUpdate(update);
       refreshUndoState();
     };
@@ -1758,6 +1772,28 @@ export function SyncedDiagram({
     outline.updateOnPan = true;
     outline.labelsVisible = false;
     outline.border = 16;
+    // 默认布局把内容锚在左上角，蓝色视口框的描边会压在容器边缘、被小地图外框
+    // 裁掉。居中并保证四周至少 border/2 的边距，视口框才能完整可见。
+    outline.getOutlineOffset = (scale = 1) => {
+      const source = outline.source;
+      const host = outline.outline?.container;
+      if (!source?.container || !host || scale <= 0) return new Point(0, 0);
+      const sourceScale = source.view.scale;
+      const scaledGraphBounds = outline.getSourceGraphBounds();
+      const union = new Rectangle(
+        scaledGraphBounds.x / sourceScale + source.panDx,
+        scaledGraphBounds.y / sourceScale + source.panDy,
+        scaledGraphBounds.width / sourceScale,
+        scaledGraphBounds.height / sourceScale,
+      );
+      union.add(new Rectangle(0, 0, source.container.clientWidth / sourceScale, source.container.clientHeight / sourceScale));
+      const size = outline.getSourceContainerSize();
+      const completeWidth = Math.max(size.width / sourceScale, union.width);
+      const completeHeight = Math.max(size.height / sourceScale, union.height);
+      const marginX = Math.max(outline.border / 2, (host.clientWidth - completeWidth * scale) / 2);
+      const marginY = Math.max(outline.border / 2, (host.clientHeight - completeHeight * scale) / 2);
+      return new Point(marginX / scale, marginY / scale);
+    };
     outline.setZoomEnabled(false);
     outline.update(true);
     const resizeObserver = new ResizeObserver(() => outline.update(true));
@@ -3254,6 +3290,28 @@ export function SyncedDiagram({
     }
     return update;
   }, []);
+
+  useEffect(() => {
+    if (!onEmbedApiChange) return;
+    const resolveGraph = () => {
+      const graph = runtimeRef.current?.graph;
+      if (!graph) throw new Error("流程图尚未就绪");
+      return graph;
+    };
+    const background = theme === "dark" ? "#15181f" : "#ffffff";
+    onEmbedApiChange({
+      getSnapshot: () => {
+        flushGraphRef.current();
+        const document = yDocRef.current;
+        if (!document) throw new Error("流程图尚未就绪");
+        return encodeDiagramUpdate(Y.encodeStateAsUpdate(document));
+      },
+      loadSnapshot: (encoded) => replaceDiagramWithUpdate(decodeDiagramUpdate(encoded)),
+      exportSvg: () => renderGraphSvg(resolveGraph(), background),
+      exportPng: () => svgToPng(renderGraphSvg(resolveGraph(), background), 2, background),
+    });
+    return () => onEmbedApiChange(null);
+  }, [onEmbedApiChange, replaceDiagramWithUpdate, theme]);
 
   const refreshCloudDocuments = useCallback(async () => {
     if (!authed) return;
