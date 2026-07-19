@@ -32,6 +32,7 @@ public partial class MainWindow : Window
     private const string ThemeModeDarkIcon = "M20,14.5 A8.5,8.5 0 0 1 9.5,4 A7,7 0 1 0 20,14.5 Z";
 
     private readonly UiTunnelObserver _observer;
+    private readonly FileTransferManager _transferManager = FileTransferManager.Instance;
     private CancellationTokenSource? _clientCts;
     private TunnelControlClient? _client;
     private Task? _clientTask;
@@ -66,22 +67,24 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = this;
         _observer = new UiTunnelObserver(this);
+        _transferManager.TransferEvent += OnTransferEvent;
         SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
         LoadSettingsIntoForm();
         ApplyConfiguredTheme();
         UpdateStoppedUi("未连接", "填写连接信息后启动客户端");
     }
 
+    protected override void OnClosed(EventArgs e)
+    {
+        SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+        _transferManager.TransferEvent -= OnTransferEvent;
+        base.OnClosed(e);
+    }
+
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
         ApplyTitleBar(_effectiveDarkTheme);
-    }
-
-    protected override void OnClosed(EventArgs e)
-    {
-        SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
-        base.OnClosed(e);
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -197,6 +200,84 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void SendFileButton_Click(object sender, RoutedEventArgs e)
+    {
+        var client = _client;
+        if (client is null)
+        {
+            return;
+        }
+        var target = ResolveMessageTarget();
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            MessageBox.Show(this, "请先选择或填写目标客户端。", "发送文件", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        if (!IsKnownMessageTarget(target))
+        {
+            MessageBox.Show(this, "请选择在线且支持接收消息的客户端。", "发送文件", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var dialog = new OpenFileDialog
+        {
+            Title = "选择要发送的文件（≤ 8 MB）",
+            CheckFileExists = true,
+            Multiselect = false,
+        };
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        var filePath = dialog.FileName;
+        var cancellationToken = _clientCts?.Token ?? CancellationToken.None;
+        AppendLog(LogLevel.Information, "desktop", $"文件发送开始: {Path.GetFileName(filePath)} -> {target}", null);
+        try
+        {
+            await _transferManager.SendFileAsync(
+                target,
+                filePath,
+                (to, body, ct) => client.SendClientMessageAsync(to, body, ct, publishLocalEcho: false),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppendLog(LogLevel.Error, "desktop", "文件发送异常", ex);
+            _ = Dispatcher.BeginInvoke(new Action(() =>
+                MessageBox.Show(this, ex.Message, "发送文件失败", MessageBoxButton.OK, MessageBoxImage.Error)));
+        }
+    }
+
+    private bool HandleRawClientMessage(string fromClientName, string body)
+    {
+        return _transferManager.OnIncomingMessage(fromClientName, body);
+    }
+
+    private void OnTransferEvent(string direction, string peer, string text)
+    {
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            var outbound = string.Equals(direction, "OUT", StringComparison.OrdinalIgnoreCase);
+            ClientMessages.Add(new ClientMessageLine
+            {
+                CreatedAtText = DateTime.Now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+                DirectionText = outbound ? "发送" : "接收",
+                Peer = peer,
+                TransportText = "文件",
+                StatusText = "",
+                Message = text,
+            });
+            while (ClientMessages.Count > 300)
+            {
+                ClientMessages.RemoveAt(0);
+            }
+        }));
+    }
+
     /// <summary>
     /// 把日志面板从右侧内容区底部挪到根网格并铺满两列，覆盖整个窗口。
     /// WPF 元素不能同时挂两处，放大/还原通过重挂载实现，日志内容与滚动位置保持不变。
@@ -273,6 +354,7 @@ public partial class MainWindow : Window
             SetInputsEnabled(false);
             ConnectButton.Content = "断开";
             UpdateStatusText("启动中", "正在启动客户端运行时");
+            SetSidebarStatusDot("WarningBrush");
         });
 
         _clientCts = new CancellationTokenSource();
@@ -331,6 +413,7 @@ public partial class MainWindow : Window
         await Dispatcher.InvokeAsync(() =>
         {
             UpdateStatusText("停止中", reason);
+            SetSidebarStatusDot("WarningBrush");
             ConnectButton.IsEnabled = false;
         });
 
@@ -658,6 +741,7 @@ public partial class MainWindow : Window
     private void ApplyStatus(TunnelClientStatusSnapshot snapshot)
     {
         UpdateStatusText(StatusTitle(snapshot), snapshot.Detail);
+        SetSidebarStatusDot(snapshot.LoggedIn ? "SuccessBrush" : "WarningBrush");
         RuntimeSummaryText.Text = snapshot.ClientName is null
             ? "连接后显示客户端、控制端和 Peer Mesh 信息"
             : $"{snapshot.ClientName} · {snapshot.TunnelEndpoint} · Peer Mesh {(snapshot.PeerMeshEnabled ? "启用" : "关闭")} · {snapshot.VirtualIp ?? "-"}";
@@ -715,7 +799,9 @@ public partial class MainWindow : Window
 
     private void UpdateMessageSendState()
     {
-        SendMessageButton.IsEnabled = _running && !_stopping && _clientLoggedIn;
+        var canSend = _running && !_stopping && _clientLoggedIn;
+        SendMessageButton.IsEnabled = canSend;
+        SendFileButton.IsEnabled = canSend;
     }
 
     private bool IsKnownMessageTarget(string target)
@@ -766,6 +852,7 @@ public partial class MainWindow : Window
         ConnectButton.IsEnabled = true;
         SetInputsEnabled(true);
         UpdateStatusText(phase, detail);
+        SetSidebarStatusDot("TextMutedBrush");
         RuntimeSummaryText.Text = "连接后显示客户端、控制端和 Peer Mesh 信息";
         _peerMeshEnabled = false;
         _clientLoggedIn = false;
@@ -778,6 +865,11 @@ public partial class MainWindow : Window
     {
         StatusPhaseText.Text = phase;
         StatusDetailText.Text = detail;
+    }
+
+    private void SetSidebarStatusDot(string brushKey)
+    {
+        SidebarStatusDot.Background = (Brush)FindResource(brushKey);
     }
 
     private void SetInputsEnabled(bool enabled)
@@ -915,6 +1007,11 @@ public partial class MainWindow : Window
         public void OnClientMessage(ClientMessageSnapshot snapshot)
         {
             _window.Dispatcher.BeginInvoke(new Action(() => _window.ApplyClientMessage(snapshot)));
+        }
+
+        public bool OnRawClientMessage(string fromClientName, string body)
+        {
+            return _window.HandleRawClientMessage(fromClientName, body);
         }
     }
 
