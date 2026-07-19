@@ -148,7 +148,7 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
             {
                 try
                 {
-                    await RunCommandAsync(cancellationToken, "ip", "route", "replace", $"{routeIp}/32", "dev", Name)
+                    await RunCommandAsync(_logger, cancellationToken, "ip", "route", "replace", $"{routeIp}/32", "dev", Name)
                         .ConfigureAwait(false);
                     _syncedPeerRoutes.Add(routeIp);
                 }
@@ -224,8 +224,8 @@ internal sealed class LinuxTunPeerVirtualDevice : IPeerVirtualDevice
 
     private async Task ConfigureAsync(CancellationToken cancellationToken)
     {
-        await RunCommandAsync(cancellationToken, "ip", "addr", "replace", $"{_peerMesh.VirtualIp}/32", "dev", Name).ConfigureAwait(false);
-        await RunCommandAsync(cancellationToken, "ip", "link", "set", "dev", Name, "mtu", _config.PeerMeshMtu.ToString(System.Globalization.CultureInfo.InvariantCulture), "up").ConfigureAwait(false);
+        await RunCommandAsync(_logger, cancellationToken, "ip", "addr", "replace", $"{_peerMesh.VirtualIp}/32", "dev", Name).ConfigureAwait(false);
+        await RunCommandAsync(_logger, cancellationToken, "ip", "link", "set", "dev", Name, "mtu", _config.PeerMeshMtu.ToString(System.Globalization.CultureInfo.InvariantCulture), "up").ConfigureAwait(false);
         if (!string.IsNullOrWhiteSpace(_peerMesh.Cidr))
         {
             await RunCommandQuietAsync(_logger, cancellationToken, "ip", "route", "del", _peerMesh.Cidr!, "dev", Name).ConfigureAwait(false);
@@ -344,7 +344,7 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
                     .ConfigureAwait(false);
                 try
                 {
-                    await RunCommandAsync(cancellationToken, "route", "-n", "add", "-host", routeIp, "-interface", Name)
+                    await RunCommandAsync(_logger, cancellationToken, "route", "-n", "add", "-host", routeIp, "-interface", Name)
                         .ConfigureAwait(false);
                     _syncedPeerRoutes.Add(routeIp);
                 }
@@ -453,7 +453,7 @@ internal sealed class DarwinUtunPeerVirtualDevice : IPeerVirtualDevice
     private async Task ConfigureAsync(CancellationToken cancellationToken)
     {
         var mtu = _config.PeerMeshMtu <= 0 ? TunnelClientConfig.DefaultPeerMeshMtu : _config.PeerMeshMtu;
-        await RunCommandAsync(cancellationToken,
+        await RunCommandAsync(_logger, cancellationToken,
             "ifconfig", Name, "inet", _peerMesh.VirtualIp!, _peerMesh.VirtualIp!, "netmask", IPv4Mask(32), "mtu",
             mtu.ToString(System.Globalization.CultureInfo.InvariantCulture), "up").ConfigureAwait(false);
         if (!string.IsNullOrWhiteSpace(_peerMesh.Cidr))
@@ -572,7 +572,12 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
         var openError = Marshal.GetLastWin32Error();
         if (_adapter == IntPtr.Zero)
         {
+            _logger.LogInformation("Peer Mesh Wintun adapter not found, creating: name={Name}", Name);
             _adapter = _api.CreateAdapter(Name, "shuai-tunnel", IntPtr.Zero);
+        }
+        else
+        {
+            _logger.LogInformation("Peer Mesh Wintun adapter opened: name={Name}", Name);
         }
         var createError = Marshal.GetLastWin32Error();
         if (_adapter == IntPtr.Zero)
@@ -589,7 +594,10 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
             throw new InvalidOperationException(
                 $"Wintun session start failed; name={Name}, lastError={sessionError}");
         }
+        _logger.LogInformation("Peer Mesh Wintun session started: name={Name}, virtualIp={VirtualIp}",
+            Name, _peerMesh.VirtualIp);
         await ConfigureAsync(cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation("Peer Mesh Wintun adapter configured: name={Name}, mtu={Mtu}", Name, _config.PeerMeshMtu);
         Status = "UP";
         Error = "";
         _readTask = Task.Run(() => ReadLoopAsync(outboundHandler, cancellationToken), CancellationToken.None);
@@ -613,7 +621,7 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
                     $"{routeIp}/32", Name, "store=active").ConfigureAwait(false);
                 try
                 {
-                    await RunCommandAsync(cancellationToken, "netsh", "interface", "ipv4", "add", "route",
+                    await RunCommandAsync(_logger, cancellationToken, "netsh", "interface", "ipv4", "add", "route",
                         $"{routeIp}/32", Name, "store=active").ConfigureAwait(false);
                     _syncedPeerRoutes.Add(routeIp);
                 }
@@ -705,9 +713,9 @@ internal sealed class WindowsWintunPeerVirtualDevice : IPeerVirtualDevice
 
     private async Task ConfigureAsync(CancellationToken cancellationToken)
     {
-        await RunCommandAsync(cancellationToken, "netsh", "interface", "ip", "set", "address",
+        await RunCommandAsync(_logger, cancellationToken, "netsh", "interface", "ip", "set", "address",
             $"name={Name}", "static", _peerMesh.VirtualIp!, IPv4Mask(32)).ConfigureAwait(false);
-        await RunCommandAsync(cancellationToken, "netsh", "interface", "ipv4", "set", "subinterface",
+        await RunCommandAsync(_logger, cancellationToken, "netsh", "interface", "ipv4", "set", "subinterface",
             Name, $"mtu={_config.PeerMeshMtu}", "store=active").ConfigureAwait(false);
         if (!string.IsNullOrWhiteSpace(_peerMesh.Cidr))
         {
@@ -887,11 +895,14 @@ internal static class PeerVirtualDeviceHelpers
         return true;
     }
 
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+    private static readonly Encoding FallbackOemEncoding = ResolveFallbackOemEncoding();
+
     public static async Task<bool> RunCommandQuietAsync(ILogger logger, CancellationToken cancellationToken, params string[] command)
     {
         try
         {
-            await RunCommandAsync(cancellationToken, command).ConfigureAwait(false);
+            await RunCommandAsync(logger, LogLevel.Debug, cancellationToken, command).ConfigureAwait(false);
             return true;
         }
         catch (Exception ex)
@@ -901,8 +912,12 @@ internal static class PeerVirtualDeviceHelpers
         }
     }
 
-    public static async Task RunCommandAsync(CancellationToken cancellationToken, params string[] command)
+    public static Task RunCommandAsync(ILogger logger, CancellationToken cancellationToken, params string[] command)
+        => RunCommandAsync(logger, LogLevel.Information, cancellationToken, command);
+
+    private static async Task RunCommandAsync(ILogger logger, LogLevel execLogLevel, CancellationToken cancellationToken, params string[] command)
     {
+        logger.Log(execLogLevel, "Peer Mesh exec: {Command}", string.Join(' ', command));
         var process = new Process
         {
             StartInfo = new ProcessStartInfo
@@ -911,6 +926,7 @@ internal static class PeerVirtualDeviceHelpers
                 RedirectStandardError = true,
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
+                CreateNoWindow = true,
             },
         };
         foreach (var argument in command.Skip(1))
@@ -920,14 +936,63 @@ internal static class PeerVirtualDeviceHelpers
         process.Start();
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(10));
-        var outputTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
-        var errorTask = process.StandardError.ReadToEndAsync(timeout.Token);
+        var outputTask = ReadAllBytesAsync(process.StandardOutput.BaseStream, timeout.Token);
+        var errorTask = ReadAllBytesAsync(process.StandardError.BaseStream, timeout.Token);
         await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-        var output = await outputTask.ConfigureAwait(false);
-        var error = await errorTask.ConfigureAwait(false);
+        var output = DecodeConsoleOutput(await outputTask.ConfigureAwait(false));
+        var error = DecodeConsoleOutput(await errorTask.ConfigureAwait(false));
         if (process.ExitCode != 0)
         {
+            logger.LogWarning("Peer Mesh command failed ({ExitCode}): {Command}: {Output}",
+                process.ExitCode, string.Join(' ', command), $"{output} {error}".Trim());
             throw new InvalidOperationException($"{string.Join(' ', command)} failed ({process.ExitCode}): {output} {error}".Trim());
+        }
+        var combined = $"{output} {error}".Trim();
+        if (!string.IsNullOrWhiteSpace(combined))
+        {
+            logger.Log(execLogLevel, "Peer Mesh exec output: {Output}", combined);
+        }
+    }
+
+    private static async Task<byte[]> ReadAllBytesAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        var buffer = new MemoryStream();
+        await stream.CopyToAsync(buffer, cancellationToken).ConfigureAwait(false);
+        return buffer.ToArray();
+    }
+
+    private static string DecodeConsoleOutput(byte[] bytes)
+    {
+        if (bytes.Length == 0)
+        {
+            return "";
+        }
+        // 现代 Windows 的 netsh 等工具输出 UTF-8，旧系统/旧工具按 OEM 代码页输出；
+        // GBK 等 OEM 字节几乎不可能通过严格 UTF-8 校验，先严格 UTF-8，失败再回退 OEM。
+        try
+        {
+            return StrictUtf8.GetString(bytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            return FallbackOemEncoding.GetString(bytes);
+        }
+    }
+
+    private static Encoding ResolveFallbackOemEncoding()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return Encoding.UTF8;
+        }
+        try
+        {
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            return Encoding.GetEncoding(System.Globalization.CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+        }
+        catch
+        {
+            return Encoding.UTF8;
         }
     }
 }
