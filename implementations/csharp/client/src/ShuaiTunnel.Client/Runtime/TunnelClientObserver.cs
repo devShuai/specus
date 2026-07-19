@@ -11,6 +11,13 @@ public interface ITunnelClientObserver
     void OnPeerMeshChanged(TunnelPeerMeshSnapshot snapshot) { }
 
     void OnClientMessage(ClientMessageSnapshot snapshot) { }
+
+    /// <summary>
+    /// Receives the raw client message body before display transformation
+    /// (STMSG envelopes are already unwrapped). Return true to consume the
+    /// message (e.g. file transfer frames) and suppress the normal chat entry.
+    /// </summary>
+    bool OnRawClientMessage(string fromClientName, string body) => false;
 }
 
 public sealed class TunnelClientStatusSnapshot

@@ -1568,11 +1568,21 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             return true;
         }
 
+        var from = FirstNonEmpty(message.FromClientName, session.PeerName, session.PeerId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var rawBody = message.Attachment is null
+            ? message.Message ?? ""
+            : PeerAppMessageCodec.DisplayText(message);
+        if (_observer?.OnRawClientMessage(from, rawBody) == true)
+        {
+            await SendPeerClientMessageAckAsync(message, session, runtime).ConfigureAwait(false);
+            return true;
+        }
+
         _observer?.OnClientMessage(new ClientMessageSnapshot
         {
             Id = FirstNonEmpty(message.Id, Guid.NewGuid().ToString("N")),
             Direction = "IN",
-            FromClientName = FirstNonEmpty(message.FromClientName, session.PeerName, session.PeerId.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            FromClientName = from,
             ToClientName = FirstNonEmpty(message.ToClientName, runtime.PeerMesh.ClientName),
             Message = PeerAppMessageText(message),
             Transport = PeerTransport(session, relayFrom),

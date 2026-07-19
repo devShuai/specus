@@ -63,7 +63,8 @@ public sealed class TunnelControlClient : IAsyncDisposable
     public async Task<ClientMessageSendResult> SendClientMessageAsync(
         string toClientName,
         string message,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool publishLocalEcho = true)
     {
         var target = toClientName.Trim();
         var body = message.Trim();
@@ -88,17 +89,20 @@ public sealed class TunnelControlClient : IAsyncDisposable
                 .ConfigureAwait(false);
             if (peerResult is not null)
             {
-                PublishClientMessage(new ClientMessageSnapshot
+                if (publishLocalEcho)
                 {
-                    Id = peerResult.MessageId,
-                    Direction = "OUT",
-                    FromClientName = runtime.ClientName,
-                    ToClientName = target,
-                    Message = body,
-                    Transport = peerResult.Transport,
-                    Status = "sent",
-                    CreatedAt = DateTimeOffset.Now,
-                });
+                    PublishClientMessage(new ClientMessageSnapshot
+                    {
+                        Id = peerResult.MessageId,
+                        Direction = "OUT",
+                        FromClientName = runtime.ClientName,
+                        ToClientName = target,
+                        Message = body,
+                        Transport = peerResult.Transport,
+                        Status = "sent",
+                        CreatedAt = DateTimeOffset.Now,
+                    });
+                }
                 return new ClientMessageSendResult
                 {
                     MessageId = peerResult.MessageId,
@@ -130,17 +134,20 @@ public sealed class TunnelControlClient : IAsyncDisposable
             Message = body,
         }, linkedCts.Token).ConfigureAwait(false);
 
-        PublishClientMessage(new ClientMessageSnapshot
+        if (publishLocalEcho)
         {
-            Id = messageId,
-            Direction = "OUT",
-            FromClientName = runtime.ClientName,
-            ToClientName = target,
-            Message = body,
-            Transport = "server",
-            Status = "submitted",
-            CreatedAt = DateTimeOffset.Now,
-        });
+            PublishClientMessage(new ClientMessageSnapshot
+            {
+                Id = messageId,
+                Direction = "OUT",
+                FromClientName = runtime.ClientName,
+                ToClientName = target,
+                Message = body,
+                Transport = "server",
+                Status = "submitted",
+                CreatedAt = DateTimeOffset.Now,
+            });
+        }
         return new ClientMessageSendResult
         {
             MessageId = messageId,
@@ -485,12 +492,26 @@ public sealed class TunnelControlClient : IAsyncDisposable
     private void ApplyClientMessage(MessageResponsePacket message)
     {
         var runtime = _runtime;
+        var from = FirstNonEmpty(message.ClientName, "server");
+        var rawBody = message.Message ?? "";
+        var bytes = System.Text.Encoding.UTF8.GetBytes(rawBody);
+        if (PeerAppMessageCodec.LooksLike(bytes) && PeerAppMessageCodec.TryDecode(bytes, out var envelope))
+        {
+            from = FirstNonEmpty(envelope.FromClientName, from);
+            rawBody = envelope.Attachment is null
+                ? envelope.Message ?? ""
+                : PeerAppMessageCodec.DisplayText(envelope);
+        }
+        if (_observer?.OnRawClientMessage(from, rawBody) == true)
+        {
+            return;
+        }
         var body = DisplayClientMessage(message.Message ?? "");
         PublishClientMessage(new ClientMessageSnapshot
         {
             Id = Guid.NewGuid().ToString("N"),
             Direction = "IN",
-            FromClientName = FirstNonEmpty(message.ClientName, "server"),
+            FromClientName = from,
             ToClientName = FirstNonEmpty(message.ToClientName, runtime?.ClientName),
             Message = body,
             Transport = "server",
