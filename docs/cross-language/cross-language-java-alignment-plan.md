@@ -193,7 +193,7 @@
 
 状态：Go server 与 .NET server 的运行时主路径已对齐；C server 只提供可验证的兼容/禁用响应，Android client 已补客户端消息和控制通道边界。
 
-- Go server 与 .NET server 已实现 Java 的 6 个附件 REST 接口、Aliyun OSS v1 预签名 PUT/GET/HEAD/DELETE、HEAD 完成校验、附件过期清理、公开来源 IP 与房间待上传限流，以及 `/ws/public-transfer/discovery` 的 roomToken 哈希隔离、同公网 IP 附近房间、人数/消息限流、roster 和定向 signal。
+- Go server 与 .NET server 已实现 Java 的 6 个附件 REST 接口、Aliyun OSS V4 预签名 PUT/GET/HEAD/DELETE、一次性下载授权、HEAD 完成校验、附件过期清理、公开来源 IP 与房间待上传限流，以及 `/ws/public-transfer/discovery` 的 roomToken 哈希隔离、同公网 IP 附近房间、人数/消息限流、roster 和定向 signal。
 - Go server 与 .NET server 已实现 `/ws/client-messages`：管理 JWT 鉴权失败返回 `403 + X-Auth-Reason`，按 tenant/owner 严格区分大小写授权，检查所有 `NETTY_ONLINE` session 的接收能力，并支持 admin 到 client 与 client 到 admin/client 的 Java `CLIENT_TO_CLIENT` fallback。
 - Go/.NET 登录会持久化 `clientMessageCapabilities` 并投影到管理客户端和 Peer Mesh roster；各客户端只声明真实能力，尚无附件/媒体预览数据面的客户端不会虚报 `attachments`、`mediaPreview` 或非零 `maxAttachmentBytes`。
 - Go/.NET 的公开 ICE 配置和 TURN 服务已补 Java 临时 HMAC-SHA1 credential、realm/nonce、MESSAGE-INTEGRITY、401/438 challenge；Java、Go、.NET 与 Android 客户端会按 transaction 与 TURN endpoint 跟踪受保护请求，更新 challenge 后换新 transaction 最多重试一次；STUN URL 归一化覆盖 `stun://`、显式端口和 IPv6。

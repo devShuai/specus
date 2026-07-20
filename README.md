@@ -301,7 +301,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 
 ### 用户名/密码登录
 
-页面提交用户名和密码到 `POST /auth/login`，校验通过后服务端用 HS256 密钥签发一个短期 JWT，页面像 OIDC 令牌一样作为 `Authorization: Bearer` 使用。默认 `admin / admin`，**暴露前务必修改**；把密码设为空即可关闭该登录方式。
+页面提交用户名和密码到 `POST /auth/login`，校验通过后服务端用 HS256 密钥签发一个短期 JWT，页面像 OIDC 令牌一样作为 `Authorization: Bearer` 使用。启用注册时，访客还可以通过 `POST /auth/register` 创建默认租户的普通用户账号并直接登录。默认 `admin / admin`，**暴露前务必修改**；把密码设为空即可关闭该登录方式。
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -309,6 +309,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | `TUNNEL_AUTH_PASSWORD` | `admin` | 管理密码；留空则禁用密码登录 |
 | `TUNNEL_AUTH_TENANT_ID` | `default` | 本地密码登录和内置 admin 使用的默认租户 |
 | `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | 是否启用密码登录 |
+| `TUNNEL_AUTH_REGISTRATION_ENABLED` | `true` | 是否允许访客自助注册默认租户的普通用户；依赖密码登录 |
 | `TUNNEL_AUTH_JWT_SECRET` | （空） | HS256 签名密钥；留空则启动时随机生成（重启后旧令牌失效，需重新登录） |
 | `TUNNEL_AUTH_TOKEN_TTL_SECONDS` | `28800` | 密码登录令牌有效期（秒），默认 8 小时 |
 
@@ -402,20 +403,23 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 
 ## 公共互传与对象存储
 
-公共发现信令使用 `/ws/public-transfer/discovery`；附件由服务端签发短期 URL，浏览器直接 PUT/GET 私有 Aliyun OSS，业务服务只保存元数据；存储启用时 complete 用 HEAD 校验实际大小。对象存储默认关闭，新 presign 在通过来源 IP/房间配额检查后返回 `409`，不会返回占位 URL；运行中关闭存储后，已有 `PENDING` 记录的 complete 会按 Java 语义跳过 HEAD。完整 payload、隔离和错误语义见 [public-transfer.md](protocol/spec/public-transfer.md)。
+公共发现信令使用 `/ws/public-transfer/discovery`；附件使用 Aliyun OSS V4 签名，浏览器直接 PUT/GET 私有 OSS，业务服务只保存元数据。可选上传回调由 OSS 在 PUT 成功后签名通知服务端，客户端 complete 保留为 HEAD 兜底。下载申请返回只能消费一次的站内授权，首次访问并成功领取跳转时按附件大小扣除月用量，再 `302` 到 30 秒 OSS 地址；未访问不扣，再次访问返回 `410`。对象存储默认关闭，新 presign 在通过来源 IP/房间配额检查后返回 `409`，不会返回占位 URL。完整 payload、隔离和错误语义见 [public-transfer.md](protocol/spec/public-transfer.md)。
 
 | 配置 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `tunnel.object-storage.provider` | `TUNNEL_OBJECT_STORAGE_PROVIDER` | `disabled` | `disabled` 或 `aliyun-oss` |
 | `tunnel.object-storage.endpoint` / `.bucket` | `TUNNEL_OBJECT_STORAGE_ENDPOINT` / `TUNNEL_OBJECT_STORAGE_BUCKET` | （空） | OSS endpoint 与私有 bucket |
+| `tunnel.object-storage.region` | `TUNNEL_OBJECT_STORAGE_REGION` | （自动） | OSS V4 region；标准 `oss-<region>` endpoint 可自动推导，CNAME 必须显式配置 |
 | `tunnel.object-storage.access-key-id` / `.access-key-secret` | `TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID` / `TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET` | （空） | OSS 访问凭证 |
 | `tunnel.object-storage.object-prefix` | `TUNNEL_OBJECT_STORAGE_PREFIX` | `shuai-tunnel/attachments` | object key 前缀 |
+| `tunnel.object-storage.upload-callback-url` | `TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL` | （空） | OSS 上传成功回调地址；例如 `https://tunnel.devshuai.com/api/public/transfer/oss-callback` |
 | `tunnel.object-storage.upload-url-ttl-seconds` | `TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS` | `900` | 上传预签名 URL TTL |
-| `tunnel.object-storage.download-url-ttl-seconds` | `TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS` | `600` | 下载预签名 URL TTL |
+| `tunnel.object-storage.download-url-ttl-seconds` | `TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS` | `600` | 一次性下载授权领取期限 |
+| `tunnel.object-storage.download-object-url-ttl-seconds` | `TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS` | `30` | 首次消费后签发的 OSS V4 直达 URL TTL |
 | `tunnel.object-storage.retention-hours` | `TUNNEL_OBJECT_STORAGE_RETENTION_HOURS` | `72` | 附件保留小时数；实现最小按 1 小时处理 |
 | `tunnel.object-storage.max-attachment-bytes` | `TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES` | `536870912` | 声明与 HEAD 实际大小上限 |
 | `tunnel.object-storage.per-user-storage-quota-bytes` | `TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES` | `1073741824` | 每个登录账号的有效附件存储额度（1 GiB） |
-| `tunnel.object-storage.per-user-monthly-download-quota-bytes` | `TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `1073741824` | 每个登录账号按 UTC 自然月计算的 OSS 下载签名流量额度（1 GiB） |
+| `tunnel.object-storage.per-user-monthly-download-quota-bytes` | `TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES` | `1073741824` | 每个登录账号按 UTC 自然月计算的下载跳转流量额度（1 GiB） |
 | `tunnel.object-storage.expiration-scan-interval-ms` | `TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS` | `3600000` | 过期扫描间隔 |
 | `tunnel.public-transfer.presign-rate-limit-per-ip` | `TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP` | `30` | 单来源 IP 每窗口公开 presign-upload 次数 |
 | `tunnel.public-transfer.presign-rate-limit-window-seconds` | `TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS` | `300` | presign 固定窗口秒数 |

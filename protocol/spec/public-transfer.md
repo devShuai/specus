@@ -433,7 +433,7 @@ session 的文本/二进制容器 limit 显式设为 `65,536`；按 UTF-8 字节
 
 ## 3. 附件 REST
 
-### 3.1 六个端点
+### 3.1 附件与下载授权端点
 
 | 作用域 | 方法与路径 | 鉴权 | 请求体 |
 | --- | --- | --- | --- |
@@ -443,9 +443,11 @@ session 的文本/二进制容器 limit 显式设为 `65,536`；按 UTF-8 字节
 | 管理创建上传 | `POST /api/admin/client-messages/attachments/presign-upload` | Bearer JWT | `PresignUploadRequest` |
 | 管理确认上传 | `POST /api/admin/client-messages/attachments/{attachmentId}/complete` | Bearer JWT | 无 |
 | 管理创建下载 | `POST /api/admin/client-messages/attachments/{attachmentId}/presign-download` | Bearer JWT | 无 |
+| OSS 上传回调 | `POST /api/public/transfer/oss-callback` | OSS RSA/MD5 签名 | OSS callback JSON |
+| 消费下载授权 | `GET /api/public/transfer/downloads/{token}` | 匿名 bearer grant | 无 |
 
 公开作用域为 `PUBLIC_TRANSFER`；管理作用域为 `ADMIN_CLIENT_MESSAGE`。两个作用域的 ID 不得相互访问。公开作用域中的
-“公开”表示服务端无需管理端租户资源权限即可按房间授权，不表示允许匿名访问 OSS；三个公开附件端点必须先通过 Bearer
+“公开”表示服务端无需管理端租户资源权限即可按房间授权，不表示允许匿名访问 OSS；面向用户的三个公开附件端点必须先通过 Bearer
 认证，再执行房间角色和 `roomToken` 校验。
 
 ### 3.2 创建上传请求
@@ -525,7 +527,7 @@ Java 的检查顺序是来源 IP 限流、房间 `PENDING` 配额、对象存储
   "objectId": "123",
   "objectKey": "shuai-tunnel/attachments/public-transfer/20260710/123/photo.jpg",
   "uploadUrl": "https://bucket.endpoint/...",
-  "uploadHeaders": {"Content-Type":"image/jpeg"},
+  "uploadHeaders": {"Content-Type":"image/jpeg","x-oss-callback":"<base64-json>"},
   "expiresAt": "2026-07-10T00:15:00Z",
   "attachment": {
     "attachmentId": 123,
@@ -547,10 +549,21 @@ Java 的检查顺序是来源 IP 限流、房间 `PENDING` 配额、对象存储
 <normalized-prefix>/<scope-lowercase-with-hyphens>/<UTC-yyyyMMdd>/<attachmentId>/<normalized-fileName>
 ```
 
+当 `upload-callback-url` 非空时，`uploadHeaders` 额外包含已参与 V4 签名的 `x-oss-callback`。客户端必须逐项原样带入
+PUT 请求；OSS 成功保存对象后调用 `POST /api/public/transfer/oss-callback`。回调端点不要求 JWT，但必须验证
+`Authorization` 与 `x-oss-pub-key-url`：签名算法为 RSA PKCS#1 v1.5 + MD5，签名内容为
+`url_decode(path) + raw_query + "\n" + raw_body`。公钥 URL 只允许 `gosspublic.alicdn.com/callback_pub_key*`，
+加载时强制升级 HTTPS、禁止重定向并缓存公钥。
+
+签名通过后还必须校验 callback bucket 等于配置 bucket、object key 已由服务端分配且位于配置 prefix、size 非负且
+不超过附件上限，再把记录转为 `UPLOADED`。上传回调与客户端 complete 均为幂等路径：回调成功后客户端继续调用
+complete 会直接得到已有记录；OSS 回调失败不会重试且不会删除已上传对象，因此客户端 complete 必须保留为 HEAD 兜底。
+callback 服务应在 5 秒内返回 JSON `200`，例如 `{"Status":"OK"}`。
+
 ### 3.4 状态机、complete 与下载
 
 ```text
-PENDING --complete--> UPLOADED --expiration scan--> EXPIRED
+PENDING --complete / verified OSS callback--> UPLOADED --expiration scan--> EXPIRED
     \------------------retention expiration------------/
 ```
 
@@ -565,7 +578,8 @@ PENDING --complete--> UPLOADED --expiration scan--> EXPIRED
 4. HEAD 的实际大小不得超过 `max-attachment-bytes`。
 
 预签名 PUT 不绑定 `Content-Length`，请求中的 `sizeBytes` 不可信。HEAD 返回有效长度时必须覆盖声明值；实际大小超限时
-必须先删除对象，再以参数错误拒绝 complete。成功后设置 `UPLOADED`、`uploadedAt` 和 `updatedAt`。
+必须先删除对象，再以参数错误拒绝 complete。已验证的 OSS callback 以签名 body 中的 `size` 代替 HEAD；成功后设置
+`UPLOADED`、`uploadedAt` 和 `updatedAt`。
 
 Java 当前只在对象存储启用时执行 complete 的 HEAD；若运行中关闭存储，已存在的 `PENDING` 记录会跳过 HEAD 后转为
 `UPLOADED`。这是现有状态机的兼容边界，不代表禁用实现具有附件数据面；C server 仍按第 6 节对六个路径明确返回 `409`。
@@ -576,7 +590,7 @@ Java 当前只在对象存储启用时执行 complete 的 HEAD；若运行中关
 {
   "attachmentId": 123,
   "objectId": "123",
-  "downloadUrl": "https://bucket.endpoint/...",
+  "downloadUrl": "/api/public/transfer/downloads/opaque-single-use-token",
   "downloadHeaders": {},
   "expiresAt": "2026-07-10T00:10:00Z",
   "attachment": {
@@ -592,6 +606,14 @@ Java 当前只在对象存储启用时执行 complete 的 HEAD；若运行中关
 }
 ```
 
+`downloadUrl` 不是 OSS 地址，而是站内一次性 bearer grant。服务端数据库只保存 token 的 SHA-256。首次 GET 必须用
+条件更新原子写入 `consumedAt`，成功后返回 `302 Location` 到短期 OSS V4 地址；并发或后续 GET 返回 `410 Gone`。
+grant 过期、附件过期、对象存储关闭或附件不再是 `UPLOADED` 时同样不得生成跳转。
+`HEAD` 探测必须返回 `405 Method Not Allowed` 且不得消费 grant，避免下载器先探测再 GET 时误用掉唯一授权。
+
+为保留客户端直连，`302` 的目标仍是 bearer 型 OSS URL；它在极短 TTL 内可被持有该 `Location` 的客户端再次请求。
+要做到 OSS 端每个 HTTP 请求也严格只能一次，必须由业务服务代理文件体或增加受控下载网关，这不属于当前直传架构。
+
 后台按 `expiration-scan-interval-ms` 扫描，每批最多取 100 条但必须循环直至为空。对象存储启用时先删除对象，再把记录标为
 `EXPIRED`。扫描范围也包含一直未 complete 的过期 `PENDING` 记录。
 
@@ -606,7 +628,7 @@ Java 仅支持 `aliyun-oss`。以下条件必须同时满足才视为启用：
 
 默认 provider 为 `disabled`。完整实现不得在未启用时返回伪造的成功 URL。
 
-### 4.2 Aliyun OSS v1 签名
+### 4.2 Aliyun OSS V4 签名
 
 对象 URL 使用 virtual-hosted 形式：
 
@@ -614,51 +636,70 @@ Java 仅支持 `aliyun-oss`。以下条件必须同时满足才视为启用：
 <scheme>://<bucket>.<endpoint-host>[:port]/<percent-encoded-object-key>
 ```
 
-endpoint 未带 scheme 时默认 `https`。预签名 PUT/GET 使用 OSS v1 query 参数
-`OSSAccessKeyId`、`Expires`、`Signature`。签名为标准 Base64 HMAC-SHA1，canonical resource 为
-`/<bucket>/<objectKey>`；PUT 的 canonical Content-Type 必须与返回的 `uploadHeaders.Content-Type` 一致。
+endpoint 未带 scheme 时默认 `https`。预签名 PUT/GET 使用 `OSS4-HMAC-SHA256`，query 至少包含
+`x-oss-signature-version`、`x-oss-credential`、`x-oss-date`、`x-oss-expires`、
+`x-oss-additional-headers=host` 和 `x-oss-signature`。下载直达 URL还签入 `x-st-grant=<grantId>` 作为日志关联标记，
+不得放入可反推 bearer token 的值。canonical URI 为 `/<bucket>/<objectKey>`，payload 为 `UNSIGNED-PAYLOAD`；
+PUT 的 canonical Content-Type 必须与返回的 `uploadHeaders.Content-Type` 一致；启用上传回调时，canonical headers 还必须
+包含返回的 `x-oss-callback`，浏览器 PUT 必须发送完全相同的值。
 
-complete 的 HEAD 和过期清理的 DELETE 使用 `Date` 与 `Authorization: OSS <keyId>:<signature>`。HEAD `404`
+签名 scope 为 `<UTC-yyyyMMdd>/<region>/oss/aliyun_v4_request`，密钥依次对日期、region、`oss` 和
+`aliyun_v4_request` 做 HMAC-SHA256 派生。标准 `oss-<region>[...].aliyuncs.com` endpoint 可自动推导 region；
+CNAME、加速 endpoint 或无法识别的 host 必须显式配置 `region`。
+
+complete 的 HEAD 和过期清理的 DELETE 使用 V4 `Authorization`、`x-oss-date` 与
+`x-oss-content-sha256: UNSIGNED-PAYLOAD`。HEAD `404`
 表示对象不存在；其他 `>=400` 是存储状态冲突。DELETE `404` 按幂等成功处理。该内部 HTTP client 不自动跟随
 重定向；除上述特殊 `404` 外，`<400` 按成功处理，避免在跳转后把带原 host/resource 签名的请求发送到另一端点。
 
 object key 必须非空、不得以 `/` 开头，不得含反斜杠、`..`、`//` 或控制字符，并且必须位于配置的 prefix 下。
+网页直传 bucket 的 CORS 至少需要允许站点 Origin、`PUT` 方法，以及 `Content-Type`、`x-oss-callback` 请求头；否则启用
+回调后浏览器会在预检阶段失败。callback URL 必须公网可达，反向代理不得改写回调路径或原始 query。
 
 ### 4.3 配置值的精确语义
 
 | 配置 | 默认值 | Java 语义 |
 | --- | ---: | --- |
-| `upload-url-ttl-seconds` | 900 | 原值传给签名器；不自动替换或钳制 |
-| `download-url-ttl-seconds` | 600 | 原值传给签名器；不自动替换或钳制 |
+| `upload-callback-url` | 空 | OSS 上传成功回调 URL；空值禁用回调并保留客户端 complete + HEAD 流程 |
+| `upload-url-ttl-seconds` | 900 | OSS V4 上传 URL TTL；签名器钳制到 1..604800 秒 |
+| `download-url-ttl-seconds` | 600 | 一次性站内下载授权有效期；按至少 1 秒处理 |
+| `download-object-url-ttl-seconds` | 30 | grant 首次消费后生成的 OSS V4 URL TTL；签名器钳制到 1..604800 秒 |
 | `retention-hours` | 72 | 创建附件时按至少 1 小时处理 |
 | `max-attachment-bytes` | 536870912 | 原值用于声明大小和 HEAD 实际大小上限 |
 | `per-user-storage-quota-bytes` | 1073741824 | 每个登录账号最多占用 1 GiB 有效附件存储；非正值回退到默认值 |
-| `per-user-monthly-download-quota-bytes` | 1073741824 | 每个登录账号每个 UTC 自然月最多签发 1 GiB OSS 下载流量；非正值回退到默认值 |
+| `per-user-monthly-download-quota-bytes` | 1073741824 | 每个登录账号每个 UTC 自然月最多领取 1 GiB OSS 下载跳转；非正值回退到默认值 |
 | `expiration-scan-interval-ms` | 3600000 | 后台扫描间隔 |
 
-因此 URL TTL 为 `0` 或负数会生成当前或过去的过期时间；`max-attachment-bytes <= 0` 会拒绝所有正大小附件。
-除两项账号额度对非正值显式回退到 1 GiB 外，跨语言实现不得把这些显式配置静默替换成默认值。
+OSS V4 签名协议要求 TTL 为正数且最长 7 天，因此上传和直达下载签名器统一钳制到 1..604800 秒；
+`max-attachment-bytes <= 0` 会拒绝所有正大小附件。除签名协议范围、grant 最短 1 秒及两项账号额度对非正值显式
+回退到 1 GiB 外，跨语言实现不得把显式配置静默替换成默认值。
 
 ### 4.4 登录账号额度
 
-六个附件端点都要求 Bearer 登录。公开互传上传记录也必须写入当前 JWT 对应的 `tenantId/username`，与管理端消息附件
+六个创建/确认端点都要求 Bearer 登录；一次性 grant 的 GET 自身就是匿名 bearer 凭据。公开互传上传记录也必须写入当前 JWT 对应的 `tenantId/username`，与管理端消息附件
 共用账号额度：
 
 - 存储额度统计尚在上传 URL 有效期内的 `PENDING` 声明大小，以及尚未过期的 `UPLOADED` 实际大小；创建上传时先按
   声明大小预留，complete 后以 HEAD 实际大小重新校验并回写。实际大小导致超额时删除对象并拒绝 complete。
-- 下载流量按服务端成功签发预签名 GET 时的附件完整大小扣减，而不是按 OSS 实际传输字节扣减；重复申请下载 URL 会
-  重复计费。这是客户端直连私有 OSS、业务服务不代理文件体时可审计的保守口径。
+- 创建一次性下载 grant 只做额度预检，不扣用量。首次 GET 在同一事务中原子消费 grant 并按附件完整大小写入用量，
+  写入成功后才返回 `302`；未访问的 grant 不计费，并发或重复 GET 不重复计费。重新申请并实际消费新 grant 会再次计费。
+- 该口径记录的是成功领取 OSS 跳转的附件大小，不是 OSS 实际传输字节。业务服务不代理文件体，无法判断客户端在
+  `302` 之后是否完整下载；需要精确实传流量时应接入 OSS 日志/计量数据或受控下载网关。
 - 下载流量按 UTC 的 `yyyy-MM` 自然月隔离；存储额度跨公开互传和管理端消息附件合并统计。
 
 ## 5. HTTP 状态与错误
 
-附件 REST 的成功状态为 `200`。Java 的稳定错误契约是 HTTP 状态和 `error` 字段，不定义稳定的通用符号 `code`：
+创建/确认端点和 OSS callback 成功状态为 `200`，一次性下载成功为 `302`。Java 的稳定错误契约是 HTTP 状态和
+`error` 字段，不定义稳定的通用符号 `code`：
 
 | HTTP | JSON | 场景 |
 | ---: | --- | --- |
 | 400 | `{"error":"..."}` | 缺字段、格式/大小错误、token 错误、附件不存在、目标无权访问 |
 | 401 | Bearer challenge | 任一附件端点缺少或使用无效 JWT |
+| 403 | `{"error":"..."}` | OSS callback 签名无效，或 callback bucket/object 不匹配 |
 | 409 | `{"error":"..."}` | 存储未配置、状态不是 `PENDING/UPLOADED`、URL/附件过期、HEAD/DELETE/签名失败 |
+| 410 | `{"error":"..."}` | 一次性下载授权不存在、已过期、已消费或附件不再可下载 |
+| 413 | `{"error":"..."}` | OSS callback 请求体超过 64 KiB |
 | 429 | `{"error":"..."}` | 公开来源 IP 超限、来源表已满、房间 `PENDING` 配额、账号存储或月下载流量额度超限 |
 
 客户端必须按 HTTP 状态处理，不得依赖自然语言 `error` 文本。实现可以增加机器可读 `code`，但不得改变上述状态语义。
@@ -690,7 +731,7 @@ C server 不是本协议的数据面完整实现：
 | ICE REST 与地址规范化 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/PublicPeerMeshResource.java` |
 | TURN 临时凭证 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/peer/TurnCredentialService.java` |
 | 发现 WebSocket | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/websocket/PublicTransferDiscoveryWebSocketHandler.java` |
-| 六个附件 REST | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/TransferAttachmentResource.java` |
+| 附件与一次性下载 REST | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/TransferAttachmentResource.java` |
 | 附件状态机 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/TransferAttachmentService.java` |
 | 公开限流 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/PublicTransferRateLimiter.java` |
 | Aliyun OSS | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/storage/object/AliyunOssObjectStorageService.java` |
