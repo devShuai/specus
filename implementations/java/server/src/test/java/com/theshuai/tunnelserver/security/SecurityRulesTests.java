@@ -43,6 +43,37 @@ class SecurityRulesTests {
     }
 
     @Test
+    void publicTransferObjectStorageRequiresAuthentication() throws Exception {
+        HttpResponse<String> response = sendJson(
+                "POST",
+                "/api/public/transfer/attachments/presign-upload",
+                "{\"fileName\":\"note.txt\",\"mimeType\":\"text/plain\",\"sizeBytes\":4,"
+                        + "\"roomId\":\"security-test\",\"roomToken\":\"security-test-token\"}",
+                null
+        );
+
+        assertThat(response.statusCode()).isEqualTo(401);
+    }
+
+    @Test
+    void authenticatedAccountCanReachPublicTransferObjectStorage() throws Exception {
+        HttpResponse<String> login = postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"admin\"}");
+        String token = JsonUtil.readString(login.body()).path("accessToken").asText();
+
+        HttpResponse<String> response = sendJson(
+                "POST",
+                "/api/public/transfer/attachments/presign-upload",
+                "{\"fileName\":\"note.txt\",\"mimeType\":\"text/plain\",\"sizeBytes\":4,"
+                        + "\"roomId\":\"security-test\",\"roomToken\":\"security-test-token\"}",
+                token
+        );
+
+        assertThat(response.statusCode())
+                .as("authenticated request should reach the disabled object-storage boundary: %s", response.body())
+                .isEqualTo(409);
+    }
+
+    @Test
     void httpRouteApiRequiresAuthentication() throws Exception {
         // /api/admin/http-routes 走同一套 Spring Security 规则——确保新加的 HttpRouteResource
         // 没有被意外标记为 permitAll

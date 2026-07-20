@@ -14,6 +14,8 @@ import lombok.Setter;
                 @Index(name = "idx_transfer_attachment_tenant", columnList = "tenant_id, scope, id"),
                 @Index(name = "idx_transfer_attachment_room", columnList = "scope, room_id, id"),
                 @Index(name = "idx_transfer_attachment_public_room", columnList = "scope, public_transfer_room_id, id"),
+                @Index(name = "idx_transfer_attachment_owner_status",
+                        columnList = "tenant_id, owner_username, status, expires_at"),
                 @Index(name = "idx_transfer_attachment_expires", columnList = "expires_at, status")
         })
 @Getter

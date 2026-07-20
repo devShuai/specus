@@ -9,24 +9,30 @@ public static class TransferAttachmentEndpoints
     {
         app.MapPost("/api/public/transfer/attachments/presign-upload",
             async (HttpContext context, PresignUploadRequest request,
-                PublicTransferRateLimiter rateLimiter, TransferAttachmentService service,
+                IOptions<AuthOptions> auth, PublicTransferRateLimiter rateLimiter,
+                TransferAttachmentService service,
                 CancellationToken cancellationToken) =>
             {
                 rateLimiter.CheckPresignUpload(ClientIp(context));
-                return Results.Ok(await service.CreatePublicUploadAsync(request, cancellationToken)
+                return Results.Ok(await service.CreatePublicUploadAsync(
+                    ManagementContext.From(context, auth.Value), request, cancellationToken)
                     .ConfigureAwait(false));
             });
 
         app.MapPost("/api/public/transfer/attachments/{attachmentId:long}/complete",
-            async (long attachmentId, CompleteAttachmentRequest request,
-                TransferAttachmentService service, CancellationToken cancellationToken) =>
-                Results.Ok(await service.CompletePublicAsync(attachmentId, request, cancellationToken)
-                    .ConfigureAwait(false)));
+            async (HttpContext context, long attachmentId, CompleteAttachmentRequest request,
+                IOptions<AuthOptions> auth, TransferAttachmentService service,
+                CancellationToken cancellationToken) =>
+                Results.Ok(await service.CompletePublicAsync(
+                    ManagementContext.From(context, auth.Value), attachmentId, request,
+                    cancellationToken).ConfigureAwait(false)));
 
         app.MapPost("/api/public/transfer/attachments/{attachmentId:long}/presign-download",
-            async (long attachmentId, PresignDownloadRequest request,
-                TransferAttachmentService service, CancellationToken cancellationToken) =>
-                Results.Ok(await service.CreatePublicDownloadAsync(attachmentId, request,
+            async (HttpContext context, long attachmentId, PresignDownloadRequest request,
+                IOptions<AuthOptions> auth, TransferAttachmentService service,
+                CancellationToken cancellationToken) =>
+                Results.Ok(await service.CreatePublicDownloadAsync(
+                    ManagementContext.From(context, auth.Value), attachmentId, request,
                     cancellationToken).ConfigureAwait(false)));
 
         app.MapPost("/api/admin/client-messages/attachments/presign-upload",

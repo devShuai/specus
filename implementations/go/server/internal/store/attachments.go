@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -49,6 +50,38 @@ func (db *DB) CountPendingTransferAttachments(ctx context.Context, scope, roomTo
 	var count int64
 	err := db.sql.QueryRowContext(ctx, query, scope, roomTokenHash, status).Scan(&count)
 	return count, err
+}
+
+func (db *DB) SumActiveTransferStorageBytes(ctx context.Context, tenantID, ownerUsername string,
+	excludedAttachmentID int64, now time.Time) (int64, error) {
+	query := db.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM transfer_attachment
+		WHERE tenant_id = ? AND owner_username = ? AND id <> ?
+		AND ((status = ? AND upload_expires_at > ?) OR (status = ? AND expires_at > ?))`)
+	var total int64
+	nowValue := formatTime(now)
+	err := db.sql.QueryRowContext(ctx, query, defaultTenant(tenantID), strings.TrimSpace(ownerUsername),
+		excludedAttachmentID, "PENDING", nowValue, "UPLOADED", nowValue).Scan(&total)
+	return total, err
+}
+
+func (db *DB) SumTransferDownloadUsageBytes(ctx context.Context, tenantID, username,
+	usageMonth string) (int64, error) {
+	query := db.rebind(`SELECT COALESCE(SUM(size_bytes), 0) FROM transfer_attachment_download_usage
+		WHERE tenant_id = ? AND username = ? AND usage_month = ?`)
+	var total int64
+	err := db.sql.QueryRowContext(ctx, query, defaultTenant(tenantID), strings.TrimSpace(username),
+		usageMonth).Scan(&total)
+	return total, err
+}
+
+func (db *DB) InsertTransferDownloadUsage(ctx context.Context, id int64, tenantID, username string,
+	attachmentID, sizeBytes int64, usageMonth string, createdAt time.Time) error {
+	query := db.rebind(`INSERT INTO transfer_attachment_download_usage
+		(id, tenant_id, username, attachment_id, size_bytes, usage_month, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	_, err := db.sql.ExecContext(ctx, query, id, defaultTenant(tenantID), strings.TrimSpace(username),
+		attachmentID, sizeBytes, usageMonth, formatTime(createdAt))
+	return err
 }
 
 func (db *DB) ListExpiredTransferAttachments(ctx context.Context, before time.Time, expiredStatus string, limit int) ([]TransferAttachment, error) {

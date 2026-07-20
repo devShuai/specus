@@ -47,7 +47,7 @@ func TestPublicAttachmentLifecycleValidatesObjectWithHead(t *testing.T) {
 	})}
 
 	size := int64(10)
-	upload, err := service.CreatePublicUpload(context.Background(), PresignUploadRequest{
+	upload, err := service.CreatePublicUpload(context.Background(), "default", "alice", PresignUploadRequest{
 		FileName: "../my 图片.png", MimeType: "image/png", SizeBytes: &size,
 		SHA256: strings.Repeat("A", 64), RoomID: "room-a", RoomToken: "secret-room-token",
 	})
@@ -65,17 +65,17 @@ func TestPublicAttachmentLifecycleValidatesObjectWithHead(t *testing.T) {
 		upload.UploadHeaders["Content-Type"] != "image/png" {
 		t.Fatalf("unexpected presign response: %+v", upload)
 	}
-	if _, err := service.CompletePublic(context.Background(), upload.AttachmentID, "wrong-token"); err == nil {
+	if _, err := service.CompletePublic(context.Background(), upload.AttachmentID, "wrong-token", "default", "alice"); err == nil {
 		t.Fatal("completion accepted a mismatched room token")
 	}
-	completed, err := service.CompletePublic(context.Background(), upload.AttachmentID, "secret-room-token")
+	completed, err := service.CompletePublic(context.Background(), upload.AttachmentID, "secret-room-token", "default", "alice")
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	if completed.Status != StatusUploaded || completed.SizeBytes != 13 {
 		t.Fatalf("HEAD content length was not persisted: %+v", completed)
 	}
-	download, err := service.CreatePublicDownload(context.Background(), upload.AttachmentID, "secret-room-token")
+	download, err := service.CreatePublicDownload(context.Background(), upload.AttachmentID, "secret-room-token", "default", "alice")
 	if err != nil {
 		t.Fatalf("presign download: %v", err)
 	}
@@ -155,11 +155,81 @@ func TestPublicAttachmentRateAndPendingLimits(t *testing.T) {
 	}
 	size := int64(1)
 	request := PresignUploadRequest{FileName: "a.txt", SizeBytes: &size, RoomToken: "same-room"}
-	if _, err := service.CreatePublicUpload(context.Background(), request); err != nil {
+	if _, err := service.CreatePublicUpload(context.Background(), "default", "alice", request); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.CreatePublicUpload(context.Background(), request); !errors.Is(err, ErrRateLimited) {
+	if _, err := service.CreatePublicUpload(context.Background(), "default", "alice", request); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("second pending upload was not limited: %v", err)
+	}
+}
+
+func TestAttachmentStorageQuotaIsScopedToAuthenticatedAccount(t *testing.T) {
+	db, err := store.Open("sqlite", filepath.Join(t.TempDir(), "storage-quota.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service := NewService(db, config.ObjectStorageConfig{
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
+		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
+		PerUserStorageQuotaBytes: 10,
+	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 10})
+	firstSize := int64(5)
+	if _, err := service.CreatePublicUpload(context.Background(), "default", "alice",
+		PresignUploadRequest{FileName: "first.bin", SizeBytes: &firstSize, RoomToken: "room"}); err != nil {
+		t.Fatal(err)
+	}
+	secondSize := int64(6)
+	if _, err := service.CreatePublicUpload(context.Background(), "default", "alice",
+		PresignUploadRequest{FileName: "second.bin", SizeBytes: &secondSize, RoomToken: "room"}); !errors.Is(err, ErrRateLimited) || !strings.Contains(err.Error(), "存储额度不足") {
+		t.Fatalf("storage quota was not enforced: %v", err)
+	}
+	if _, err := service.CreatePublicUpload(context.Background(), "default", "bob",
+		PresignUploadRequest{FileName: "second.bin", SizeBytes: &secondSize, RoomToken: "other-room"}); err != nil {
+		t.Fatalf("another account incorrectly shared alice's quota: %v", err)
+	}
+}
+
+func TestAttachmentDownloadQuotaCountsEachPresignedFileSize(t *testing.T) {
+	db, err := store.Open("sqlite", filepath.Join(t.TempDir(), "download-quota.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service := NewService(db, config.ObjectStorageConfig{
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
+		UploadURLTTLSeconds: 60, DownloadURLTTLSeconds: 60, RetentionHours: 1,
+		MaxAttachmentBytes: 100, PerUserStorageQuotaBytes: 100,
+		PerUserMonthlyDownloadQuotaBytes: 10,
+	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 10})
+	service.storage.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		if request.Method == http.MethodHead {
+			header.Set("Content-Length", "6")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: header,
+			Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+	})}
+	size := int64(6)
+	upload, err := service.CreatePublicUpload(context.Background(), "default", "alice",
+		PresignUploadRequest{FileName: "file.bin", SizeBytes: &size, RoomToken: "room"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompletePublic(context.Background(), upload.AttachmentID, "room",
+		"default", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreatePublicDownload(context.Background(), upload.AttachmentID, "room",
+		"default", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreatePublicDownload(context.Background(), upload.AttachmentID, "room",
+		"default", "alice"); !errors.Is(err, ErrRateLimited) ||
+		!strings.Contains(err.Error(), "下载流量额度不足") {
+		t.Fatalf("download quota was not enforced: %v", err)
 	}
 }
 
@@ -187,13 +257,13 @@ func TestCompleteRejectsAndDeletesObjectWhoseActualSizeExceedsLimit(t *testing.T
 			Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
 	})}
 	size := int64(4)
-	upload, err := service.CreatePublicUpload(context.Background(), PresignUploadRequest{
+	upload, err := service.CreatePublicUpload(context.Background(), "default", "alice", PresignUploadRequest{
 		FileName: "large.bin", SizeBytes: &size, RoomToken: "room-token",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.CompletePublic(context.Background(), upload.AttachmentID, "room-token"); err == nil || !strings.Contains(err.Error(), "too large") {
+	if _, err := service.CompletePublic(context.Background(), upload.AttachmentID, "room-token", "default", "alice"); err == nil || !strings.Contains(err.Error(), "too large") {
 		t.Fatalf("oversized object was accepted: %v", err)
 	}
 	if !deleted {
@@ -289,7 +359,7 @@ func TestRetentionHoursKeepsJavaMinimumOfOneHour(t *testing.T) {
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 2})
 	size := int64(1)
 	before := time.Now().Add(59 * time.Minute)
-	upload, err := service.CreatePublicUpload(context.Background(), PresignUploadRequest{
+	upload, err := service.CreatePublicUpload(context.Background(), "default", "alice", PresignUploadRequest{
 		FileName: "a.txt", SizeBytes: &size, RoomToken: "token",
 	})
 	if err != nil {
@@ -359,7 +429,7 @@ func TestCompleteSkipsHeadWhenObjectStorageIsDisabledLikeJava(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := NewService(db, config.ObjectStorageConfig{Provider: "disabled"}, config.PublicTransferConfig{})
-	completed, err := service.CompletePublic(context.Background(), item.ID, "room-token")
+	completed, err := service.CompletePublic(context.Background(), item.ID, "room-token", "default", "alice")
 	if err != nil {
 		t.Fatalf("complete with disabled storage: %v", err)
 	}

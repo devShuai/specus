@@ -93,6 +93,7 @@ public sealed class ObjectStorageServiceTests
         };
         await using var fixture = await StartEndpointFixtureAsync(storage, maxAttachmentBytes: 100);
         using var client = fixture.CreateClient();
+        await AuthenticateAsync(client);
         var attachmentId = await PresignPublicUploadAsync(client);
 
         using var response = await client.PostAsJsonAsync(
@@ -112,6 +113,7 @@ public sealed class ObjectStorageServiceTests
         };
         await using var fixture = await StartEndpointFixtureAsync(storage, maxAttachmentBytes: 100);
         using var client = fixture.CreateClient();
+        await AuthenticateAsync(client);
         var attachmentId = await PresignPublicUploadAsync(client);
 
         using var response = await client.PostAsJsonAsync(
@@ -148,6 +150,19 @@ public sealed class ObjectStorageServiceTests
         response.EnsureSuccessStatusCode();
         using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return json.RootElement.GetProperty("attachmentId").GetInt64();
+    }
+
+    private static async Task AuthenticateAsync(HttpClient client)
+    {
+        using var response = await client.PostAsJsonAsync("/auth/login", new
+        {
+            username = "admin",
+            password = "admin",
+        });
+        response.EnsureSuccessStatusCode();
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        client.DefaultRequestHeaders.Authorization = new(
+            "Bearer", json.RootElement.GetProperty("accessToken").GetString());
     }
 
     private static AliyunOssObjectStorageService CreateStorage(HttpClient client) => new(

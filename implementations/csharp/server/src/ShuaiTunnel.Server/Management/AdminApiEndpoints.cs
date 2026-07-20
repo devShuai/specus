@@ -44,7 +44,7 @@ public static class AdminApiEndpoints
     {
         app.Use(async (context, next) =>
         {
-            if (!RequiresAdminAuth(context.Request.Path))
+            if (!RequiresBearerAuth(context.Request.Path))
             {
                 await next().ConfigureAwait(false);
                 return;
@@ -514,13 +514,13 @@ public static class AdminApiEndpoints
         return string.IsNullOrWhiteSpace(forwarded) ? context.Request.Host.ToString() : forwarded.Split(',', 2)[0].Trim();
     }
 
-    private static bool RequiresAdminAuth(PathString path) =>
+    private static bool RequiresBearerAuth(PathString path) =>
         path.StartsWithSegments("/api/admin", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/api/public/transfer/attachments",
+            StringComparison.OrdinalIgnoreCase)
         || path.Equals("/auth/refresh", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsAdminSurface(PathString path) =>
-        RequiresAdminAuth(path)
-        || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase)
-        || path.StartsWithSegments("/api/public/transfer/attachments",
-            StringComparison.OrdinalIgnoreCase);
+        RequiresBearerAuth(path)
+        || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase);
 }

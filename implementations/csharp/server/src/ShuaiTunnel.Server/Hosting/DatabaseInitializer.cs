@@ -246,8 +246,28 @@ public sealed class DatabaseInitializer
             "tenant_id, scope, id", cancellationToken).ConfigureAwait(false);
         await EnsureIndexAsync(db, "idx_transfer_attachment_room", "transfer_attachment",
             "scope, room_id, id", cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_transfer_attachment_owner_status", "transfer_attachment",
+            "tenant_id, owner_username, status, expires_at", cancellationToken).ConfigureAwait(false);
         await EnsureIndexAsync(db, "idx_transfer_attachment_expires", "transfer_attachment",
             "expires_at, status", cancellationToken).ConfigureAwait(false);
+
+        await ExecuteSchemaSqlAsync(db, $"""
+            CREATE TABLE IF NOT EXISTS transfer_attachment_download_usage (
+              id {idType},
+              tenant_id VARCHAR(80) NOT NULL,
+              username VARCHAR(80) NOT NULL,
+              attachment_id BIGINT NOT NULL,
+              size_bytes BIGINT NOT NULL,
+              usage_month VARCHAR(7) NOT NULL,
+              created_at VARCHAR(40) NOT NULL
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_attachment_download_usage_account_month",
+            "transfer_attachment_download_usage", "tenant_id, username, usage_month",
+            cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_attachment_download_usage_attachment",
+            "transfer_attachment_download_usage", "attachment_id, created_at",
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static Task BackfillConnectionStatTenantAsync(TunnelDbContext db, CancellationToken cancellationToken)

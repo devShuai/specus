@@ -1551,7 +1551,59 @@ namespace ShuaiTunnel.Server.Data.MySql.Migrations
                     b.HasIndex("TenantId", "Scope", "Id")
                         .HasDatabaseName("idx_transfer_attachment_tenant");
 
+                    b.HasIndex("TenantId", "OwnerUsername", "Status", "ExpiresAt")
+                        .HasDatabaseName("idx_transfer_attachment_owner_status");
+
                     b.ToTable("transfer_attachment", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.TransferAttachmentDownloadUsage", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    b.Property<long>("AttachmentId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("attachment_id");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("bigint")
+                        .HasColumnName("size_bytes");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("UsageMonth")
+                        .IsRequired()
+                        .HasMaxLength(7)
+                        .HasColumnType("varchar(7)")
+                        .HasColumnName("usage_month");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("username");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AttachmentId", "CreatedAt")
+                        .HasDatabaseName("idx_attachment_download_usage_attachment");
+
+                    b.HasIndex("TenantId", "Username", "UsageMonth")
+                        .HasDatabaseName("idx_attachment_download_usage_account_month");
+
+                    b.ToTable("transfer_attachment_download_usage", (string)null);
                 });
 
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.TunnelMapping", b =>

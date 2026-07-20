@@ -156,10 +156,21 @@ func TestPublicAttachmentHTTPStatusMatchesJavaExceptionMapping(t *testing.T) {
 	cfg.PublicTransfer.PresignRateLimitPerIP = 1
 	app, ts := newAPIServerWithConfig(t, cfg)
 	body := `{"fileName":"a.txt","sizeBytes":1,"roomToken":"room-secret"}`
+	unauthenticated, err := http.Post(ts.URL+"/api/public/transfer/attachments/presign-upload",
+		"application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthenticated.Body.Close()
+	if unauthenticated.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous attachment upload status = %d, want 401", unauthenticated.StatusCode)
+	}
+	token := adminToken(t, ts)
 	request := func() *http.Response {
 		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/public/transfer/attachments/presign-upload", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Real-IP", "203.0.113.10")
+		req.Header.Set("Authorization", "Bearer "+token)
 		response, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -191,8 +202,12 @@ func TestPublicAttachmentHTTPStatusMatchesJavaExceptionMapping(t *testing.T) {
 	if err := app.db.InsertTransferAttachment(context.Background(), item); err != nil {
 		t.Fatal(err)
 	}
-	response, err := http.Post(ts.URL+"/api/public/transfer/attachments/880001/presign-download",
-		"application/json", strings.NewReader(`{"roomToken":"room-secret"}`))
+	req, _ := http.NewRequest(http.MethodPost,
+		ts.URL+"/api/public/transfer/attachments/880001/presign-download",
+		strings.NewReader(`{"roomToken":"room-secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

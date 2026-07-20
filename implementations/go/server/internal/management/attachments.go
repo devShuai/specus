@@ -12,6 +12,11 @@ import (
 )
 
 func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
 	var request transfer.PresignUploadRequest
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request) != nil {
 		writeError(w, http.StatusBadRequest, "请求体无效")
@@ -21,7 +26,8 @@ func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http
 		a.failAttachment(w, err)
 		return
 	}
-	response, err := a.attachments.CreatePublicUpload(r.Context(), request)
+	response, err := a.attachments.CreatePublicUpload(r.Context(), principal.TenantID,
+		principal.Username, request)
 	if err != nil {
 		a.failAttachment(w, err)
 		return
@@ -30,6 +36,11 @@ func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http
 }
 
 func (a *API) handlePublicAttachmentComplete(w http.ResponseWriter, r *http.Request) {
+	principal, authenticated := principalFromContext(r)
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
 	id, ok := attachmentID(w, r)
 	if !ok {
 		return
@@ -39,7 +50,8 @@ func (a *API) handlePublicAttachmentComplete(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	response, err := a.attachments.CompletePublic(r.Context(), id, request.RoomToken)
+	response, err := a.attachments.CompletePublic(r.Context(), id, request.RoomToken,
+		principal.TenantID, principal.Username)
 	if err != nil {
 		a.failAttachment(w, err)
 		return
@@ -48,6 +60,11 @@ func (a *API) handlePublicAttachmentComplete(w http.ResponseWriter, r *http.Requ
 }
 
 func (a *API) handlePublicAttachmentPresignDownload(w http.ResponseWriter, r *http.Request) {
+	principal, authenticated := principalFromContext(r)
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
 	id, ok := attachmentID(w, r)
 	if !ok {
 		return
@@ -57,7 +74,8 @@ func (a *API) handlePublicAttachmentPresignDownload(w http.ResponseWriter, r *ht
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	response, err := a.attachments.CreatePublicDownload(r.Context(), id, request.RoomToken)
+	response, err := a.attachments.CreatePublicDownload(r.Context(), id, request.RoomToken,
+		principal.TenantID, principal.Username)
 	if err != nil {
 		a.failAttachment(w, err)
 		return
@@ -106,7 +124,8 @@ func (a *API) handleAdminAttachmentComplete(w http.ResponseWriter, r *http.Reque
 	if !a.canAccessAdminAttachment(w, r, principal, id) {
 		return
 	}
-	response, err := a.attachments.CompleteAdmin(r.Context(), id, principal.TenantID)
+	response, err := a.attachments.CompleteAdmin(r.Context(), id, principal.TenantID,
+		principal.Username)
 	if err != nil {
 		a.failAttachment(w, err)
 		return
@@ -127,7 +146,8 @@ func (a *API) handleAdminAttachmentPresignDownload(w http.ResponseWriter, r *htt
 	if !a.canAccessAdminAttachment(w, r, principal, id) {
 		return
 	}
-	response, err := a.attachments.CreateAdminDownload(r.Context(), id, principal.TenantID)
+	response, err := a.attachments.CreateAdminDownload(r.Context(), id, principal.TenantID,
+		principal.Username)
 	if err != nil {
 		a.failAttachment(w, err)
 		return

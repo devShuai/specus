@@ -3,9 +3,13 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.tunnelserver.config.ObjectStorageProperties;
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
 import com.theshuai.tunnelserver.management.model.TransferAttachment;
+import com.theshuai.tunnelserver.management.model.TransferAttachmentDownloadUsage;
+import com.theshuai.tunnelserver.management.repository.TransferAttachmentDownloadUsageRepository;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentRepository;
+import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.storage.object.ObjectStorageService;
 import com.theshuai.tunnelserver.management.storage.object.PresignedObjectUrl;
+import com.theshuai.tunnelserver.management.tenant.TenantContext;
 import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.Role;
 import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.RoomAccess;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,8 +42,11 @@ class TransferAttachmentServiceTests {
 
     private static final String ROOM_TOKEN = "room-token";
     private static final String SHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    private static final ManagementContext ACCOUNT =
+            new ManagementContext(new TenantContext("default"), "alice", false);
 
     @Mock private TransferAttachmentRepository repository;
+    @Mock private TransferAttachmentDownloadUsageRepository downloadUsageRepository;
     @Mock private ObjectStorageService objectStorageService;
     @Mock private ClientAccountService clientAccountService;
     @Mock private PublicTransferRoomService publicTransferRoomService;
@@ -59,6 +66,7 @@ class TransferAttachmentServiceTests {
                 .thenReturn(new RoomAccess(42L, Role.OWNER, "room-a"));
         service = new TransferAttachmentService(
                 repository,
+                downloadUsageRepository,
                 objectStorageService,
                 storageProperties,
                 publicTransferProperties,
@@ -75,7 +83,7 @@ class TransferAttachmentServiceTests {
                 eq(TransferAttachmentService.STATUS_PENDING)
         )).thenReturn(2L);
 
-        assertThatThrownBy(() -> service.createPublicUpload(publicRequest(10)))
+        assertThatThrownBy(() -> service.createPublicUpload(ACCOUNT, publicRequest(10)))
                 .isInstanceOf(RateLimitedException.class)
                 .hasMessageContaining("待上传文件过多");
 
@@ -87,7 +95,7 @@ class TransferAttachmentServiceTests {
         when(publicTransferRoomService.resolve(any(), any(), any()))
                 .thenReturn(new RoomAccess(42L, Role.VIEWER, "room-a"));
 
-        assertThatThrownBy(() -> service.createPublicUpload(publicRequest(10)))
+        assertThatThrownBy(() -> service.createPublicUpload(ACCOUNT, publicRequest(10)))
                 .isInstanceOf(org.springframework.web.server.ResponseStatusException.class)
                 .hasMessageContaining("访客不能上传文件");
 
@@ -103,7 +111,7 @@ class TransferAttachmentServiceTests {
         when(objectStorageService.presignUpload(any(), eq("text/plain"), any()))
                 .thenReturn(new PresignedObjectUrl("https://oss/upload", Map.of("Content-Type", "text/plain"), Instant.now().plusSeconds(900).toString()));
 
-        TransferAttachmentService.PresignUploadResponse response = service.createPublicUpload(new TransferAttachmentService.PresignUploadRequest(
+        TransferAttachmentService.PresignUploadResponse response = service.createPublicUpload(ACCOUNT, new TransferAttachmentService.PresignUploadRequest(
                 "../hello.txt",
                 "text/plain",
                 10L,
@@ -119,11 +127,28 @@ class TransferAttachmentServiceTests {
         assertThat(saved.getFileName()).isEqualTo("hello.txt");
         assertThat(saved.getRoomId()).isEqualTo("room-a");
         assertThat(saved.getPublicTransferRoomId()).isEqualTo(42L);
+        assertThat(saved.getTenantId()).isEqualTo("default");
+        assertThat(saved.getOwnerUsername()).isEqualTo("alice");
         assertThat(saved.getSha256()).isEqualTo(SHA256);
         assertThat(saved.getStatus()).isEqualTo(TransferAttachmentService.STATUS_PENDING);
         assertThat(saved.getObjectKey()).contains("/public-transfer/").endsWith("/hello.txt");
         assertThat(response.uploadUrl()).isEqualTo("https://oss/upload");
         assertThat(response.attachment().sha256()).isEqualTo(SHA256);
+    }
+
+    @Test
+    void createUploadRejectsWhenAccountStorageQuotaWouldBeExceeded() {
+        mockEnabledStorage();
+        storageProperties.setPerUserStorageQuotaBytes(10);
+        when(repository.countByScopeAndPublicTransferRoomIdAndStatus(any(), any(), any())).thenReturn(0L);
+        when(repository.sumActiveStorageBytes(eq("default"), eq("alice"), anyLong(), any(), any(), any()))
+                .thenReturn(5L);
+
+        assertThatThrownBy(() -> service.createPublicUpload(ACCOUNT, publicRequest(6)))
+                .isInstanceOf(RateLimitedException.class)
+                .hasMessageContaining("存储额度不足");
+
+        verify(objectStorageService, times(0)).presignUpload(any(), any(), any());
     }
 
     @Test
@@ -148,7 +173,7 @@ class TransferAttachmentServiceTests {
                 Map.entry("  photo .png  ", "_photo_.png_")
         );
         cases.forEach((input, expected) -> {
-            var response = service.createPublicUpload(new TransferAttachmentService.PresignUploadRequest(
+            var response = service.createPublicUpload(ACCOUNT, new TransferAttachmentService.PresignUploadRequest(
                     input, "application/octet-stream", 10L, null, "room-a", ROOM_TOKEN, null));
             assertThat(response.attachment().fileName()).as("input %s", input).isEqualTo(expected);
             assertThat(response.objectKey()).doesNotContain("..").endsWith("/" + expected);
@@ -162,7 +187,7 @@ class TransferAttachmentServiceTests {
                 "x".repeat(181), "x".repeat(180)
         );
         longCases.forEach((input, expected) -> {
-            var response = service.createPublicUpload(new TransferAttachmentService.PresignUploadRequest(
+            var response = service.createPublicUpload(ACCOUNT, new TransferAttachmentService.PresignUploadRequest(
                     input, "application/octet-stream", 10L, null, "room-a", ROOM_TOKEN, null));
             assertThat(response.attachment().fileName()).as("long input").isEqualTo(expected).hasSize(180);
         });
@@ -180,7 +205,7 @@ class TransferAttachmentServiceTests {
                 .thenThrow(new DataIntegrityViolationException("duplicate id"))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
-        TransferAttachmentService.PresignUploadResponse response = service.createPublicUpload(publicRequest(10));
+        TransferAttachmentService.PresignUploadResponse response = service.createPublicUpload(ACCOUNT, publicRequest(10));
 
         verify(repository, times(2)).saveAndFlush(any(TransferAttachment.class));
         verify(objectStorageService, atLeastOnce()).presignUpload(any(), any(), any());
@@ -194,7 +219,7 @@ class TransferAttachmentServiceTests {
         when(repository.findByIdAndScope(123L, TransferAttachmentService.SCOPE_PUBLIC_TRANSFER))
                 .thenReturn(Optional.of(attachment));
 
-        assertThatThrownBy(() -> service.createPublicDownload(123L, new TransferAttachmentService.PresignDownloadRequest(ROOM_TOKEN)))
+        assertThatThrownBy(() -> service.createPublicDownload(ACCOUNT, 123L, new TransferAttachmentService.PresignDownloadRequest(ROOM_TOKEN)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("not uploaded");
 
@@ -214,9 +239,33 @@ class TransferAttachmentServiceTests {
                         "https://oss/download", Map.of(), Instant.now().plusSeconds(600).toString()));
 
         var response = service.createPublicDownload(
-                123L, new TransferAttachmentService.PresignDownloadRequest("viewer-token"));
+                ACCOUNT, 123L, new TransferAttachmentService.PresignDownloadRequest("viewer-token"));
 
         assertThat(response.downloadUrl()).isEqualTo("https://oss/download");
+        ArgumentCaptor<TransferAttachmentDownloadUsage> usageCaptor =
+                ArgumentCaptor.forClass(TransferAttachmentDownloadUsage.class);
+        verify(downloadUsageRepository).saveAndFlush(usageCaptor.capture());
+        assertThat(usageCaptor.getValue().getTenantId()).isEqualTo("default");
+        assertThat(usageCaptor.getValue().getUsername()).isEqualTo("alice");
+        assertThat(usageCaptor.getValue().getSizeBytes()).isEqualTo(10L);
+    }
+
+    @Test
+    void createDownloadRejectsWhenMonthlyTrafficQuotaWouldBeExceeded() {
+        TransferAttachment attachment = uploadedFixture(123L);
+        attachment.setSizeBytes(6L);
+        storageProperties.setPerUserMonthlyDownloadQuotaBytes(10L);
+        when(repository.findByIdAndScope(123L, TransferAttachmentService.SCOPE_PUBLIC_TRANSFER))
+                .thenReturn(Optional.of(attachment));
+        when(downloadUsageRepository.sumBytesByAccountAndMonth(eq("default"), eq("alice"), any()))
+                .thenReturn(5L);
+
+        assertThatThrownBy(() -> service.createPublicDownload(
+                ACCOUNT, 123L, new TransferAttachmentService.PresignDownloadRequest(ROOM_TOKEN)))
+                .isInstanceOf(RateLimitedException.class)
+                .hasMessageContaining("下载流量额度不足");
+
+        verify(objectStorageService, times(0)).presignDownload(any(), any());
     }
 
     @Test
@@ -228,7 +277,7 @@ class TransferAttachmentServiceTests {
         when(objectStorageService.statObject("object/key.txt"))
                 .thenReturn(new ObjectStorageService.ObjectStat(false, -1));
 
-        assertThatThrownBy(() -> service.completePublic(123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN)))
+        assertThatThrownBy(() -> service.completePublic(ACCOUNT, 123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("was not uploaded");
 
@@ -245,7 +294,7 @@ class TransferAttachmentServiceTests {
         when(objectStorageService.statObject("object/key.txt"))
                 .thenReturn(new ObjectStorageService.ObjectStat(true, 11));
 
-        assertThatThrownBy(() -> service.completePublic(123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN)))
+        assertThatThrownBy(() -> service.completePublic(ACCOUNT, 123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("too large");
 
@@ -261,13 +310,33 @@ class TransferAttachmentServiceTests {
                 .thenReturn(Optional.of(attachment));
         when(objectStorageService.statObject("object/key.txt"))
                 .thenReturn(new ObjectStorageService.ObjectStat(true, 9));
-        when(repository.save(any(TransferAttachment.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
-        var view = service.completePublic(123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN));
+        var view = service.completePublic(ACCOUNT, 123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN));
 
         assertThat(view.sizeBytes()).isEqualTo(9);
         assertThat(view.status()).isEqualTo(TransferAttachmentService.STATUS_UPLOADED);
         assertThat(attachment.getUploadedAt()).isNotBlank();
+    }
+
+    @Test
+    void completeDeletesObjectWhenActualSizeWouldExceedStorageQuota() {
+        mockEnabledStorage();
+        storageProperties.setPerUserStorageQuotaBytes(10L);
+        TransferAttachment attachment = pendingFixture(123L, 5L);
+        when(repository.findByIdAndScope(123L, TransferAttachmentService.SCOPE_PUBLIC_TRANSFER))
+                .thenReturn(Optional.of(attachment));
+        when(objectStorageService.statObject("object/key.txt"))
+                .thenReturn(new ObjectStorageService.ObjectStat(true, 7L));
+        when(repository.sumActiveStorageBytes(eq("default"), eq("alice"), eq(123L), any(), any(), any()))
+                .thenReturn(4L);
+
+        assertThatThrownBy(() -> service.completePublic(
+                ACCOUNT, 123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN)))
+                .isInstanceOf(RateLimitedException.class)
+                .hasMessageContaining("存储额度不足");
+
+        verify(objectStorageService).deleteObject("object/key.txt");
+        assertThat(attachment.getStatus()).isEqualTo(TransferAttachmentService.STATUS_PENDING);
     }
 
     @Test

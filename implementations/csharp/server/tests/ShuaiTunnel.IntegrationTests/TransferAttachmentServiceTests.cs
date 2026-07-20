@@ -3,12 +3,15 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Data;
+using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Management;
 
 namespace ShuaiTunnel.IntegrationTests;
 
 public sealed class TransferAttachmentServiceTests
 {
+    private static readonly ManagementContext Account = new("default", "alice", ManagementRole.User, false);
+
     [Fact]
     public void PublicPresignLimiterPurgesExpiredIpWindowsEveryTenMinutes()
     {
@@ -30,22 +33,22 @@ public sealed class TransferAttachmentServiceTests
     public async Task PublicAttachmentRequiresRoomTokenAndUsesActualUploadedSize()
     {
         await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 1024);
-        var upload = await fixture.Service.CreatePublicUploadAsync(new PresignUploadRequest(
+        var upload = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
             "../photo.png", "image/png", 10, new string('a', 64), "room-a", "secret", null),
             CancellationToken.None);
         Assert.Equal("photo.png", upload.Attachment.FileName);
         Assert.Equal(TransferAttachmentService.StatusPending, upload.Attachment.Status);
 
         await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.CompletePublicAsync(
-            upload.AttachmentId, new CompleteAttachmentRequest("wrong"), CancellationToken.None));
+            Account, upload.AttachmentId, new CompleteAttachmentRequest("wrong"), CancellationToken.None));
 
         fixture.Storage.Stat = new ObjectStat(true, 42);
-        var completed = await fixture.Service.CompletePublicAsync(upload.AttachmentId,
+        var completed = await fixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
             new CompleteAttachmentRequest("secret"), CancellationToken.None);
         Assert.Equal(42, completed.SizeBytes);
         Assert.Equal(TransferAttachmentService.StatusUploaded, completed.Status);
 
-        var download = await fixture.Service.CreatePublicDownloadAsync(upload.AttachmentId,
+        var download = await fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
             new PresignDownloadRequest("secret"), CancellationToken.None);
         Assert.Equal("https://storage.test/download", download.DownloadUrl);
     }
@@ -54,13 +57,51 @@ public sealed class TransferAttachmentServiceTests
     public async Task CompleteDeletesObjectWhenActualSizeExceedsLimit()
     {
         await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100);
-        var upload = await fixture.Service.CreatePublicUploadAsync(new PresignUploadRequest(
+        var upload = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
             "big.bin", null, 10, null, "room", "secret", null), CancellationToken.None);
         fixture.Storage.Stat = new ObjectStat(true, 101);
 
         await Assert.ThrowsAsync<ArgumentException>(() => fixture.Service.CompletePublicAsync(
-            upload.AttachmentId, new CompleteAttachmentRequest("secret"), CancellationToken.None));
+            Account, upload.AttachmentId, new CompleteAttachmentRequest("secret"), CancellationToken.None));
         Assert.Equal(upload.ObjectKey, Assert.Single(fixture.Storage.DeletedKeys));
+    }
+
+    [Fact]
+    public async Task StorageQuotaIsScopedToAuthenticatedAccount()
+    {
+        await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100,
+            storageQuotaBytes: 10);
+        _ = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
+            "first.bin", null, 5, null, "room", "secret", null), CancellationToken.None);
+
+        var error = await Assert.ThrowsAsync<RateLimitedException>(() =>
+            fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
+                "second.bin", null, 6, null, "room", "secret", null), CancellationToken.None));
+        Assert.Contains("存储额度不足", error.Message, StringComparison.Ordinal);
+
+        var bob = Account with { Username = "bob" };
+        _ = await fixture.Service.CreatePublicUploadAsync(bob, new PresignUploadRequest(
+            "second.bin", null, 6, null, "other-room", "other-secret", null), CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task DownloadQuotaCountsEachPresignedFileSize()
+    {
+        await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100,
+            storageQuotaBytes: 100, monthlyDownloadQuotaBytes: 10);
+        var upload = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
+            "file.bin", null, 6, null, "room", "secret", null), CancellationToken.None);
+        fixture.Storage.Stat = new ObjectStat(true, 6);
+        _ = await fixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
+            new CompleteAttachmentRequest("secret"), CancellationToken.None);
+        _ = await fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
+            new PresignDownloadRequest("secret"), CancellationToken.None);
+
+        var error = await Assert.ThrowsAsync<RateLimitedException>(() =>
+            fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
+                new PresignDownloadRequest("secret"), CancellationToken.None));
+        Assert.Contains("下载流量额度不足", error.Message, StringComparison.Ordinal);
+        Assert.Single(fixture.Db.TransferAttachmentDownloadUsages);
     }
 
     [Fact]
@@ -68,7 +109,7 @@ public sealed class TransferAttachmentServiceTests
     {
         await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100);
 
-        var upload = await fixture.Service.CreatePublicUploadAsync(new PresignUploadRequest(
+        var upload = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
             "中文图.png", "image/png", 10, null, "room", "secret", null), CancellationToken.None);
 
         Assert.Equal("_.png", upload.Attachment.FileName);
@@ -90,7 +131,7 @@ public sealed class TransferAttachmentServiceTests
     {
         await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100);
 
-        var upload = await fixture.Service.CreatePublicUploadAsync(new PresignUploadRequest(
+        var upload = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
             input, null, 10, null, "room", "secret", null), CancellationToken.None);
 
         Assert.Equal(expected, upload.Attachment.FileName);
@@ -113,7 +154,7 @@ public sealed class TransferAttachmentServiceTests
 
         foreach (var (input, expected) in cases)
         {
-            var upload = await fixture.Service.CreatePublicUploadAsync(new PresignUploadRequest(
+            var upload = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
                 input, null, 10, null, "room", "secret", null), CancellationToken.None);
             Assert.Equal(expected, upload.Attachment.FileName);
             Assert.Equal(180, upload.Attachment.FileName.Length);
@@ -126,18 +167,18 @@ public sealed class TransferAttachmentServiceTests
         await using (var uploadFixture = await AttachmentFixture.CreateAsync(
                          maxBytes: 100, uploadTtlSeconds: 0))
         {
-            _ = await uploadFixture.Service.CreatePublicUploadAsync(new PresignUploadRequest(
+            _ = await uploadFixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
                 "zero-upload.bin", null, 10, null, "room", "secret", null), CancellationToken.None);
             Assert.Equal(TimeSpan.Zero, uploadFixture.Storage.LastUploadTtl);
         }
 
         await using var downloadFixture = await AttachmentFixture.CreateAsync(
             maxBytes: 100, downloadTtlSeconds: 0);
-        var upload = await downloadFixture.Service.CreatePublicUploadAsync(new PresignUploadRequest(
+        var upload = await downloadFixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
             "zero-download.bin", null, 10, null, "room", "secret", null), CancellationToken.None);
-        _ = await downloadFixture.Service.CompletePublicAsync(upload.AttachmentId,
+        _ = await downloadFixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
             new CompleteAttachmentRequest("secret"), CancellationToken.None);
-        _ = await downloadFixture.Service.CreatePublicDownloadAsync(upload.AttachmentId,
+        _ = await downloadFixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
             new PresignDownloadRequest("secret"), CancellationToken.None);
         Assert.Equal(TimeSpan.Zero, downloadFixture.Storage.LastDownloadTtl);
     }
@@ -160,7 +201,9 @@ public sealed class TransferAttachmentServiceTests
         public TransferAttachmentService Service { get; }
 
         public static async Task<AttachmentFixture> CreateAsync(long maxBytes,
-            long uploadTtlSeconds = 900, long downloadTtlSeconds = 600)
+            long uploadTtlSeconds = 900, long downloadTtlSeconds = 600,
+            long storageQuotaBytes = 1024L * 1024 * 1024,
+            long monthlyDownloadQuotaBytes = 1024L * 1024 * 1024)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -177,6 +220,8 @@ public sealed class TransferAttachmentServiceTests
                 AccessKeyId = "key",
                 AccessKeySecret = "secret",
                 MaxAttachmentBytes = maxBytes,
+                PerUserStorageQuotaBytes = storageQuotaBytes,
+                PerUserMonthlyDownloadQuotaBytes = monthlyDownloadQuotaBytes,
                 UploadUrlTtlSeconds = uploadTtlSeconds,
                 DownloadUrlTtlSeconds = downloadTtlSeconds,
             });

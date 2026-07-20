@@ -33,6 +33,8 @@ public sealed class TunnelDbContext : DbContext
     public DbSet<PeerMeshSession> PeerMeshSessions => Set<PeerMeshSession>();
     public DbSet<ConnectionStat> ConnectionStats => Set<ConnectionStat>();
     public DbSet<TransferAttachment> TransferAttachments => Set<TransferAttachment>();
+    public DbSet<TransferAttachmentDownloadUsage> TransferAttachmentDownloadUsages =>
+        Set<TransferAttachmentDownloadUsage>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -521,8 +523,28 @@ public sealed class TunnelDbContext : DbContext
                 .HasDatabaseName("idx_transfer_attachment_tenant");
             b.HasIndex(x => new { x.Scope, x.RoomId, x.Id })
                 .HasDatabaseName("idx_transfer_attachment_room");
+            b.HasIndex(x => new { x.TenantId, x.OwnerUsername, x.Status, x.ExpiresAt })
+                .HasDatabaseName("idx_transfer_attachment_owner_status");
             b.HasIndex(x => new { x.ExpiresAt, x.Status })
                 .HasDatabaseName("idx_transfer_attachment_expires");
+        });
+
+        modelBuilder.Entity<TransferAttachmentDownloadUsage>(b =>
+        {
+            b.ToTable("transfer_attachment_download_usage");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.AttachmentId).HasColumnName("attachment_id").IsRequired();
+            b.Property(x => x.SizeBytes).HasColumnName("size_bytes").IsRequired();
+            b.Property(x => x.UsageMonth).HasColumnName("usage_month").HasMaxLength(7).IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => new { x.TenantId, x.Username, x.UsageMonth })
+                .HasDatabaseName("idx_attachment_download_usage_account_month");
+            b.HasIndex(x => new { x.AttachmentId, x.CreatedAt })
+                .HasDatabaseName("idx_attachment_download_usage_attachment");
         });
     }
 }

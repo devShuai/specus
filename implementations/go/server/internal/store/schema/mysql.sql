@@ -130,7 +130,20 @@ CREATE TABLE IF NOT EXISTS transfer_attachment (
   UNIQUE KEY uk_transfer_attachment_object_key (object_key),
   KEY idx_transfer_attachment_tenant (tenant_id, scope, id),
   KEY idx_transfer_attachment_room (scope, room_id, id),
+  KEY idx_transfer_attachment_owner_status (tenant_id, owner_username, status, expires_at),
   KEY idx_transfer_attachment_expires (expires_at, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS transfer_attachment_download_usage (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  username VARCHAR(80) NOT NULL,
+  attachment_id BIGINT NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  usage_month VARCHAR(7) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  KEY idx_attachment_download_usage_account_month (tenant_id, username, usage_month),
+  KEY idx_attachment_download_usage_attachment (attachment_id, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (

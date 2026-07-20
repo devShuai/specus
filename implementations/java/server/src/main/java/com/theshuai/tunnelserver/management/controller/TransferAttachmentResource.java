@@ -34,9 +34,10 @@ public class TransferAttachmentResource {
 
     @PostMapping("/api/public/transfer/attachments/presign-upload")
     public PresignUploadResponse publicPresignUpload(HttpServletRequest httpRequest,
+                                                     @AuthenticationPrincipal Jwt jwt,
                                                      @RequestBody PresignUploadRequest request) {
         rateLimiter.checkPresignUpload(clientIp(httpRequest));
-        return service.createPublicUpload(request);
+        return service.createPublicUpload(contextResolver.resolve(jwt), request);
     }
 
     /**
@@ -61,14 +62,16 @@ public class TransferAttachmentResource {
 
     @PostMapping("/api/public/transfer/attachments/{attachmentId}/complete")
     public TransferAttachmentView publicComplete(@PathVariable long attachmentId,
+                                                 @AuthenticationPrincipal Jwt jwt,
                                                  @RequestBody CompleteAttachmentRequest request) {
-        return service.completePublic(attachmentId, request);
+        return service.completePublic(contextResolver.resolve(jwt), attachmentId, request);
     }
 
     @PostMapping("/api/public/transfer/attachments/{attachmentId}/presign-download")
     public PresignDownloadResponse publicPresignDownload(@PathVariable long attachmentId,
+                                                         @AuthenticationPrincipal Jwt jwt,
                                                          @RequestBody PresignDownloadRequest request) {
-        return service.createPublicDownload(attachmentId, request);
+        return service.createPublicDownload(contextResolver.resolve(jwt), attachmentId, request);
     }
 
     @PostMapping("/api/admin/client-messages/attachments/presign-upload")

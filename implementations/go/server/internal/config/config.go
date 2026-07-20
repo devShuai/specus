@@ -190,17 +190,19 @@ type PeerMeshConfig struct {
 // ObjectStorageConfig mirrors tunnel.object-storage. Attachments are uploaded directly
 // to a private Aliyun OSS bucket through short-lived presigned URLs.
 type ObjectStorageConfig struct {
-	Provider                 string `json:"provider"`
-	Endpoint                 string `json:"endpoint"`
-	Bucket                   string `json:"bucket"`
-	AccessKeyID              string `json:"accessKeyId"`
-	AccessKeySecret          string `json:"accessKeySecret"`
-	ObjectPrefix             string `json:"objectPrefix"`
-	UploadURLTTLSeconds      int64  `json:"uploadUrlTtlSeconds"`
-	DownloadURLTTLSeconds    int64  `json:"downloadUrlTtlSeconds"`
-	RetentionHours           int64  `json:"retentionHours"`
-	MaxAttachmentBytes       int64  `json:"maxAttachmentBytes"`
-	ExpirationScanIntervalMs int64  `json:"expirationScanIntervalMs"`
+	Provider                         string `json:"provider"`
+	Endpoint                         string `json:"endpoint"`
+	Bucket                           string `json:"bucket"`
+	AccessKeyID                      string `json:"accessKeyId"`
+	AccessKeySecret                  string `json:"accessKeySecret"`
+	ObjectPrefix                     string `json:"objectPrefix"`
+	UploadURLTTLSeconds              int64  `json:"uploadUrlTtlSeconds"`
+	DownloadURLTTLSeconds            int64  `json:"downloadUrlTtlSeconds"`
+	RetentionHours                   int64  `json:"retentionHours"`
+	MaxAttachmentBytes               int64  `json:"maxAttachmentBytes"`
+	PerUserStorageQuotaBytes         int64  `json:"perUserStorageQuotaBytes"`
+	PerUserMonthlyDownloadQuotaBytes int64  `json:"perUserMonthlyDownloadQuotaBytes"`
+	ExpirationScanIntervalMs         int64  `json:"expirationScanIntervalMs"`
 }
 
 // PublicTransferConfig mirrors tunnel.public-transfer abuse-protection limits.
@@ -308,13 +310,15 @@ func Default() Config {
 			TurnCredentialTTLSeconds:    3600,
 		},
 		ObjectStorage: ObjectStorageConfig{
-			Provider:                 "disabled",
-			ObjectPrefix:             "shuai-tunnel/attachments",
-			UploadURLTTLSeconds:      900,
-			DownloadURLTTLSeconds:    600,
-			RetentionHours:           72,
-			MaxAttachmentBytes:       512 * 1024 * 1024,
-			ExpirationScanIntervalMs: 3600000,
+			Provider:                         "disabled",
+			ObjectPrefix:                     "shuai-tunnel/attachments",
+			UploadURLTTLSeconds:              900,
+			DownloadURLTTLSeconds:            600,
+			RetentionHours:                   72,
+			MaxAttachmentBytes:               512 * 1024 * 1024,
+			PerUserStorageQuotaBytes:         1024 * 1024 * 1024,
+			PerUserMonthlyDownloadQuotaBytes: 1024 * 1024 * 1024,
+			ExpirationScanIntervalMs:         3600000,
 		},
 		PublicTransfer: PublicTransferConfig{
 			PresignRateLimitPerIP:                  30,
@@ -503,6 +507,8 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt64("TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS", &cfg.ObjectStorage.DownloadURLTTLSeconds)
 	setInt64("TUNNEL_OBJECT_STORAGE_RETENTION_HOURS", &cfg.ObjectStorage.RetentionHours)
 	setInt64("TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", &cfg.ObjectStorage.MaxAttachmentBytes)
+	setInt64("TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES", &cfg.ObjectStorage.PerUserStorageQuotaBytes)
+	setInt64("TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES", &cfg.ObjectStorage.PerUserMonthlyDownloadQuotaBytes)
 	setInt64("TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS", &cfg.ObjectStorage.ExpirationScanIntervalMs)
 
 	setInt("TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP", &cfg.PublicTransfer.PresignRateLimitPerIP)

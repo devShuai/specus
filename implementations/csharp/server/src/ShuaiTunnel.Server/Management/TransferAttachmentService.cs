@@ -105,9 +105,13 @@ public sealed class TransferAttachmentService
     public const string StatusPending = "PENDING";
     public const string StatusUploaded = "UPLOADED";
     public const string StatusExpired = "EXPIRED";
+    private const long DefaultPerUserQuotaBytes = 1024L * 1024 * 1024;
 
     private static readonly Regex Sha256Pattern = new("^[a-fA-F0-9]{64}$",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly SemaphoreSlim[] QuotaLocks = Enumerable.Range(0, 64)
+        .Select(_ => new SemaphoreSlim(1, 1))
+        .ToArray();
 
     private readonly TunnelDbContext _db;
     private readonly IObjectStorageService _storage;
@@ -123,8 +127,8 @@ public sealed class TransferAttachmentService
         _publicOptions = publicOptions.Value;
     }
 
-    public async Task<PresignUploadResponse> CreatePublicUploadAsync(PresignUploadRequest request,
-        CancellationToken cancellationToken)
+    public async Task<PresignUploadResponse> CreatePublicUploadAsync(ManagementContext context,
+        PresignUploadRequest request, CancellationToken cancellationToken)
     {
         var roomTokenHash = RoomTokenHash(RequireText(request.RoomToken, "roomToken"));
         var pending = await _db.TransferAttachments.AsNoTracking()
@@ -136,8 +140,18 @@ public sealed class TransferAttachmentService
         {
             throw new RateLimitedException("当前房间待上传文件过多,请稍后再试");
         }
-        return await CreateUploadAsync(ScopePublicTransfer, null, NormalizeRoomId(request.RoomId),
-            roomTokenHash, null, null, request, cancellationToken).ConfigureAwait(false);
+        var quotaLock = QuotaLock(context.TenantId, context.Username);
+        await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await CreateUploadAsync(ScopePublicTransfer, context.TenantId,
+                NormalizeRoomId(request.RoomId), roomTokenHash, context.Username, null, request,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            quotaLock.Release();
+        }
     }
 
     public async Task<PresignUploadResponse> CreateAdminUploadAsync(ManagementContext context,
@@ -148,16 +162,33 @@ public sealed class TransferAttachmentService
             throw new ArgumentException("targetClientId is required");
         }
         await RequireClientAccessAsync(context, targetClientId, cancellationToken).ConfigureAwait(false);
-        return await CreateUploadAsync(ScopeAdminClientMessage, context.TenantId, null, null,
-            context.Username, targetClientId, request, cancellationToken).ConfigureAwait(false);
+        var quotaLock = QuotaLock(context.TenantId, context.Username);
+        await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await CreateUploadAsync(ScopeAdminClientMessage, context.TenantId, null, null,
+                context.Username, targetClientId, request, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            quotaLock.Release();
+        }
     }
 
-    public async Task<TransferAttachmentView> CompletePublicAsync(long attachmentId,
-        CompleteAttachmentRequest request, CancellationToken cancellationToken)
+    public async Task<TransferAttachmentView> CompletePublicAsync(ManagementContext context,
+        long attachmentId, CompleteAttachmentRequest request, CancellationToken cancellationToken)
     {
         var attachment = await FindAsync(attachmentId, ScopePublicTransfer, null, cancellationToken)
             .ConfigureAwait(false);
         RequireMatchingRoomToken(attachment, request.RoomToken);
+        if (string.IsNullOrWhiteSpace(attachment.TenantId))
+        {
+            attachment.TenantId = context.TenantId;
+        }
+        if (string.IsNullOrWhiteSpace(attachment.OwnerUsername))
+        {
+            attachment.OwnerUsername = context.Username;
+        }
         return await CompleteAsync(attachment, cancellationToken).ConfigureAwait(false);
     }
 
@@ -168,16 +199,24 @@ public sealed class TransferAttachmentService
             cancellationToken).ConfigureAwait(false);
         await RequireClientAccessAsync(context, attachment.TargetClientId, cancellationToken)
             .ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(attachment.TenantId))
+        {
+            attachment.TenantId = context.TenantId;
+        }
+        if (string.IsNullOrWhiteSpace(attachment.OwnerUsername))
+        {
+            attachment.OwnerUsername = context.Username;
+        }
         return await CompleteAsync(attachment, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<PresignDownloadResponse> CreatePublicDownloadAsync(long attachmentId,
-        PresignDownloadRequest request, CancellationToken cancellationToken)
+    public async Task<PresignDownloadResponse> CreatePublicDownloadAsync(ManagementContext context,
+        long attachmentId, PresignDownloadRequest request, CancellationToken cancellationToken)
     {
         var attachment = await FindAsync(attachmentId, ScopePublicTransfer, null, cancellationToken)
             .ConfigureAwait(false);
         RequireMatchingRoomToken(attachment, request.RoomToken);
-        return CreateDownload(attachment);
+        return await CreateDownloadAsync(context, attachment, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<PresignDownloadResponse> CreateAdminDownloadAsync(ManagementContext context,
@@ -187,7 +226,7 @@ public sealed class TransferAttachmentService
             cancellationToken).ConfigureAwait(false);
         await RequireClientAccessAsync(context, attachment.TargetClientId, cancellationToken)
             .ConfigureAwait(false);
-        return CreateDownload(attachment);
+        return await CreateDownloadAsync(context, attachment, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task ExpireOldAsync(CancellationToken cancellationToken)
@@ -229,6 +268,8 @@ public sealed class TransferAttachmentService
         var fileName = NormalizeFileName(request.FileName);
         var mimeType = NormalizeMimeType(request.MimeType);
         var sizeBytes = NormalizeSize(request.SizeBytes);
+        await EnsureStorageQuotaAsync(tenantId, ownerUsername, sizeBytes, long.MinValue,
+            cancellationToken).ConfigureAwait(false);
         var sha256 = NormalizeSha256(request.Sha256);
         var now = DateTimeOffset.UtcNow;
         var uploadExpiresAt = now.AddSeconds(_options.UploadUrlTtlSeconds);
@@ -283,6 +324,24 @@ public sealed class TransferAttachmentService
     private async Task<TransferAttachmentView> CompleteAsync(TransferAttachment attachment,
         CancellationToken cancellationToken)
     {
+        var tenantId = RequireAccountText(attachment.TenantId, "tenantId");
+        var ownerUsername = RequireAccountText(attachment.OwnerUsername, "ownerUsername");
+        var quotaLock = QuotaLock(tenantId, ownerUsername);
+        await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await CompleteWithinQuotaAsync(attachment, tenantId, ownerUsername,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            quotaLock.Release();
+        }
+    }
+
+    private async Task<TransferAttachmentView> CompleteWithinQuotaAsync(TransferAttachment attachment,
+        string tenantId, string ownerUsername, CancellationToken cancellationToken)
+    {
         var now = DateTimeOffset.UtcNow;
         if (attachment.Status != StatusPending)
         {
@@ -309,6 +368,19 @@ public sealed class TransferAttachmentService
                 attachment.SizeBytes = stat.ContentLength;
             }
         }
+        try
+        {
+            await EnsureStorageQuotaAsync(tenantId, ownerUsername, attachment.SizeBytes,
+                attachment.Id, cancellationToken).ConfigureAwait(false);
+        }
+        catch (RateLimitedException)
+        {
+            if (_storage.Enabled)
+            {
+                await _storage.DeleteAsync(attachment.ObjectKey, cancellationToken).ConfigureAwait(false);
+            }
+            throw;
+        }
         attachment.Status = StatusUploaded;
         attachment.UploadedAt = now;
         attachment.UpdatedAt = now;
@@ -316,7 +388,8 @@ public sealed class TransferAttachmentService
         return ToView(attachment);
     }
 
-    private PresignDownloadResponse CreateDownload(TransferAttachment attachment)
+    private async Task<PresignDownloadResponse> CreateDownloadAsync(ManagementContext context,
+        TransferAttachment attachment, CancellationToken cancellationToken)
     {
         if (attachment.Status != StatusUploaded)
         {
@@ -326,12 +399,104 @@ public sealed class TransferAttachmentService
         {
             throw new InvalidOperationException("attachment is expired");
         }
-        var download = _storage.PresignDownload(attachment.ObjectKey,
-            TimeSpan.FromSeconds(_options.DownloadUrlTtlSeconds));
-        return new PresignDownloadResponse(attachment.Id,
-            attachment.Id.ToString(CultureInfo.InvariantCulture), download.Url, download.Headers,
-            download.ExpiresAt, ToView(attachment));
+        var tenantId = RequireAccountText(context.TenantId, "tenantId");
+        var username = RequireAccountText(context.Username, "username");
+        var quotaLock = QuotaLock(tenantId, username);
+        await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var usageMonth = DateTimeOffset.UtcNow.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+            var usedBytes = await _db.TransferAttachmentDownloadUsages.AsNoTracking()
+                .Where(usage => usage.TenantId == tenantId && usage.Username == username
+                    && usage.UsageMonth == usageMonth)
+                .SumAsync(usage => (long?)usage.SizeBytes, cancellationToken)
+                .ConfigureAwait(false) ?? 0L;
+            EnsureWithinQuota(usedBytes, attachment.SizeBytes,
+                _options.PerUserMonthlyDownloadQuotaBytes,
+                "本月 OSS 下载流量额度不足");
+
+            var download = _storage.PresignDownload(attachment.ObjectKey,
+                TimeSpan.FromSeconds(_options.DownloadUrlTtlSeconds));
+            await RecordDownloadUsageAsync(tenantId, username, usageMonth, attachment,
+                cancellationToken).ConfigureAwait(false);
+            return new PresignDownloadResponse(attachment.Id,
+                attachment.Id.ToString(CultureInfo.InvariantCulture), download.Url, download.Headers,
+                download.ExpiresAt, ToView(attachment));
+        }
+        finally
+        {
+            quotaLock.Release();
+        }
     }
+
+    private async Task EnsureStorageQuotaAsync(string? tenantId, string? ownerUsername,
+        long requestedBytes, long excludedAttachmentId, CancellationToken cancellationToken)
+    {
+        var normalizedTenant = RequireAccountText(tenantId, "tenantId");
+        var normalizedOwner = RequireAccountText(ownerUsername, "ownerUsername");
+        var now = DateTimeOffset.UtcNow;
+        var usedBytes = await _db.TransferAttachments.AsNoTracking()
+            .Where(attachment => attachment.TenantId == normalizedTenant
+                && attachment.OwnerUsername == normalizedOwner
+                && attachment.Id != excludedAttachmentId
+                && ((attachment.Status == StatusPending && attachment.UploadExpiresAt > now)
+                    || (attachment.Status == StatusUploaded && attachment.ExpiresAt > now)))
+            .SumAsync(attachment => (long?)attachment.SizeBytes, cancellationToken)
+            .ConfigureAwait(false) ?? 0L;
+        EnsureWithinQuota(usedBytes, requestedBytes, _options.PerUserStorageQuotaBytes,
+            "OSS 存储额度不足");
+    }
+
+    private static void EnsureWithinQuota(long usedBytes, long requestedBytes, long limitBytes,
+        string message)
+    {
+        var normalizedLimit = limitBytes > 0L ? limitBytes : DefaultPerUserQuotaBytes;
+        if (requestedBytes < 0L || usedBytes > normalizedLimit - requestedBytes)
+        {
+            throw new RateLimitedException(message);
+        }
+    }
+
+    private async Task RecordDownloadUsageAsync(string tenantId, string username, string usageMonth,
+        TransferAttachment attachment, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var usage = new TransferAttachmentDownloadUsage
+            {
+                Id = ClientIdGenerator.NewId(),
+                TenantId = tenantId,
+                Username = username,
+                AttachmentId = attachment.Id,
+                SizeBytes = attachment.SizeBytes,
+                UsageMonth = usageMonth,
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+            _db.TransferAttachmentDownloadUsages.Add(usage);
+            try
+            {
+                await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (DbUpdateException) when (attempt < 7)
+            {
+                _db.Entry(usage).State = EntityState.Detached;
+            }
+        }
+        throw new InvalidOperationException("failed to record download usage");
+    }
+
+    private static SemaphoreSlim QuotaLock(string? tenantId, string? username)
+    {
+        var hash = HashCode.Combine(tenantId?.Trim(), username?.Trim());
+        var index = (int)(Math.Abs((long)hash) % QuotaLocks.Length);
+        return QuotaLocks[index];
+    }
+
+    private static string RequireAccountText(string? value, string field) =>
+        !string.IsNullOrWhiteSpace(value)
+            ? value.Trim()
+            : throw new InvalidOperationException(field + " is missing from authenticated account");
 
     private async Task<TransferAttachment> FindAsync(long attachmentId, string scope,
         string? tenantId, CancellationToken cancellationToken)

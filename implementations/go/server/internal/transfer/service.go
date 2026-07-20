@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strings"
 	"sync"
@@ -18,12 +19,13 @@ import (
 )
 
 const (
-	ScopePublicTransfer     = "PUBLIC_TRANSFER"
-	ScopeAdminClientMessage = "ADMIN_CLIENT_MESSAGE"
-	StatusPending           = "PENDING"
-	StatusUploaded          = "UPLOADED"
-	StatusExpired           = "EXPIRED"
-	maxTrackedRateSources   = 100_000
+	ScopePublicTransfer            = "PUBLIC_TRANSFER"
+	ScopeAdminClientMessage        = "ADMIN_CLIENT_MESSAGE"
+	StatusPending                  = "PENDING"
+	StatusUploaded                 = "UPLOADED"
+	StatusExpired                  = "EXPIRED"
+	maxTrackedRateSources          = 100_000
+	defaultPerUserQuotaBytes int64 = 1024 * 1024 * 1024
 )
 
 var (
@@ -116,6 +118,7 @@ type Service struct {
 	rateMu            sync.Mutex
 	rateByIP          map[string]rateWindow
 	maxTrackedSources int
+	quotaLocks        [64]sync.Mutex
 }
 
 func NewService(db *store.DB, objectCfg config.ObjectStorageConfig, publicCfg config.PublicTransferConfig) *Service {
@@ -154,7 +157,12 @@ func (s *Service) CheckPresignIP(ip string) error {
 	return nil
 }
 
-func (s *Service) CreatePublicUpload(ctx context.Context, request PresignUploadRequest) (PresignUploadResponse, error) {
+func (s *Service) CreatePublicUpload(ctx context.Context, tenantID, username string,
+	request PresignUploadRequest) (PresignUploadResponse, error) {
+	tenantID, username, err := normalizeAccount(tenantID, username)
+	if err != nil {
+		return PresignUploadResponse{}, err
+	}
 	roomToken, err := requireText(request.RoomToken, "roomToken")
 	if err != nil {
 		return PresignUploadResponse{}, err
@@ -175,18 +183,28 @@ func (s *Service) CreatePublicUpload(ctx context.Context, request PresignUploadR
 	if err != nil {
 		return PresignUploadResponse{}, err
 	}
-	return s.createUpload(ctx, ScopePublicTransfer, nil, &roomID, &hash, nil, nil, request)
+	lock := s.quotaLock(tenantID, username)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.createUpload(ctx, ScopePublicTransfer, &tenantID, &roomID, &hash, &username, nil, request)
 }
 
 func (s *Service) CreateAdminUpload(ctx context.Context, tenantID, username string, targetClientID int64,
 	request PresignUploadRequest) (PresignUploadResponse, error) {
 	request.TargetClientID = &targetClientID
-	tenantID = strings.TrimSpace(tenantID)
-	username = strings.TrimSpace(username)
+	var err error
+	tenantID, username, err = normalizeAccount(tenantID, username)
+	if err != nil {
+		return PresignUploadResponse{}, err
+	}
+	lock := s.quotaLock(tenantID, username)
+	lock.Lock()
+	defer lock.Unlock()
 	return s.createUpload(ctx, ScopeAdminClientMessage, &tenantID, nil, nil, &username, &targetClientID, request)
 }
 
-func (s *Service) CompletePublic(ctx context.Context, id int64, roomToken string) (AttachmentView, error) {
+func (s *Service) CompletePublic(ctx context.Context, id int64, roomToken, tenantID,
+	username string) (AttachmentView, error) {
 	item, err := s.db.GetTransferAttachment(ctx, id, ScopePublicTransfer)
 	if err != nil || item == nil {
 		return AttachmentView{}, attachmentNotFound(id, err)
@@ -194,18 +212,33 @@ func (s *Service) CompletePublic(ctx context.Context, id int64, roomToken string
 	if err := matchingRoomToken(*item, roomToken); err != nil {
 		return AttachmentView{}, err
 	}
-	return s.complete(ctx, *item)
-}
-
-func (s *Service) CompleteAdmin(ctx context.Context, id int64, tenantID string) (AttachmentView, error) {
-	item, err := s.db.GetTenantTransferAttachment(ctx, id, tenantID, ScopeAdminClientMessage)
-	if err != nil || item == nil {
-		return AttachmentView{}, attachmentNotFound(id, err)
+	tenantID, username, err = normalizeAccount(tenantID, username)
+	if err != nil {
+		return AttachmentView{}, err
+	}
+	if item.TenantID == nil || strings.TrimSpace(*item.TenantID) == "" {
+		item.TenantID = &tenantID
+	}
+	if item.OwnerUsername == nil || strings.TrimSpace(*item.OwnerUsername) == "" {
+		item.OwnerUsername = &username
 	}
 	return s.complete(ctx, *item)
 }
 
-func (s *Service) CreatePublicDownload(ctx context.Context, id int64, roomToken string) (PresignDownloadResponse, error) {
+func (s *Service) CompleteAdmin(ctx context.Context, id int64, tenantID, username string) (AttachmentView, error) {
+	item, err := s.db.GetTenantTransferAttachment(ctx, id, tenantID, ScopeAdminClientMessage)
+	if err != nil || item == nil {
+		return AttachmentView{}, attachmentNotFound(id, err)
+	}
+	if item.OwnerUsername == nil || strings.TrimSpace(*item.OwnerUsername) == "" {
+		username = strings.TrimSpace(username)
+		item.OwnerUsername = &username
+	}
+	return s.complete(ctx, *item)
+}
+
+func (s *Service) CreatePublicDownload(ctx context.Context, id int64, roomToken, tenantID,
+	username string) (PresignDownloadResponse, error) {
 	item, err := s.db.GetTransferAttachment(ctx, id, ScopePublicTransfer)
 	if err != nil || item == nil {
 		return PresignDownloadResponse{}, attachmentNotFound(id, err)
@@ -213,15 +246,16 @@ func (s *Service) CreatePublicDownload(ctx context.Context, id int64, roomToken 
 	if err := matchingRoomToken(*item, roomToken); err != nil {
 		return PresignDownloadResponse{}, err
 	}
-	return s.createDownload(*item)
+	return s.createDownload(ctx, *item, tenantID, username)
 }
 
-func (s *Service) CreateAdminDownload(ctx context.Context, id int64, tenantID string) (PresignDownloadResponse, error) {
+func (s *Service) CreateAdminDownload(ctx context.Context, id int64, tenantID,
+	username string) (PresignDownloadResponse, error) {
 	item, err := s.db.GetTenantTransferAttachment(ctx, id, tenantID, ScopeAdminClientMessage)
 	if err != nil || item == nil {
 		return PresignDownloadResponse{}, attachmentNotFound(id, err)
 	}
-	return s.createDownload(*item)
+	return s.createDownload(ctx, *item, tenantID, username)
 }
 
 func (s *Service) GetAdminAttachment(ctx context.Context, id int64, tenantID string) (*store.TransferAttachment, error) {
@@ -315,6 +349,12 @@ func (s *Service) createUpload(ctx context.Context, scope string, tenantID, room
 	if err != nil {
 		return PresignUploadResponse{}, err
 	}
+	if tenantID == nil || ownerUsername == nil {
+		return PresignUploadResponse{}, internalError(errors.New("authenticated account is missing"))
+	}
+	if err := s.ensureStorageQuota(ctx, *tenantID, *ownerUsername, sizeBytes, -1); err != nil {
+		return PresignUploadResponse{}, err
+	}
 	shaValue, err := normalizeSHA256(request.SHA256)
 	if err != nil {
 		return PresignUploadResponse{}, err
@@ -350,6 +390,12 @@ func (s *Service) createUpload(ctx context.Context, scope string, tenantID, room
 }
 
 func (s *Service) complete(ctx context.Context, item store.TransferAttachment) (AttachmentView, error) {
+	if item.TenantID == nil || item.OwnerUsername == nil {
+		return AttachmentView{}, internalError(errors.New("attachment owner is missing"))
+	}
+	lock := s.quotaLock(*item.TenantID, *item.OwnerUsername)
+	lock.Lock()
+	defer lock.Unlock()
 	now := time.Now().UTC()
 	if item.Status != StatusPending {
 		return AttachmentView{}, conflict("attachment is not pending")
@@ -376,6 +422,14 @@ func (s *Service) complete(ctx context.Context, item store.TransferAttachment) (
 			item.SizeBytes = stat.ContentLength
 		}
 	}
+	if err := s.ensureStorageQuota(ctx, *item.TenantID, *item.OwnerUsername, item.SizeBytes, item.ID); err != nil {
+		if s.storage.Enabled() {
+			if deleteErr := s.storage.Delete(ctx, item.ObjectKey); deleteErr != nil {
+				return AttachmentView{}, conflict(deleteErr.Error())
+			}
+		}
+		return AttachmentView{}, err
+	}
 	item.Status = StatusUploaded
 	item.UpdatedAt = now
 	item.UploadedAt = &now
@@ -385,7 +439,8 @@ func (s *Service) complete(ctx context.Context, item store.TransferAttachment) (
 	return attachmentView(item), nil
 }
 
-func (s *Service) createDownload(item store.TransferAttachment) (PresignDownloadResponse, error) {
+func (s *Service) createDownload(ctx context.Context, item store.TransferAttachment, tenantID,
+	username string) (PresignDownloadResponse, error) {
 	now := time.Now()
 	if item.Status != StatusUploaded {
 		return PresignDownloadResponse{}, conflict("attachment is not uploaded")
@@ -393,14 +448,85 @@ func (s *Service) createDownload(item store.TransferAttachment) (PresignDownload
 	if item.ExpiresAt.Before(now) {
 		return PresignDownloadResponse{}, conflict("attachment is expired")
 	}
+	tenantID, username, err := normalizeAccount(tenantID, username)
+	if err != nil {
+		return PresignDownloadResponse{}, err
+	}
+	lock := s.quotaLock(tenantID, username)
+	lock.Lock()
+	defer lock.Unlock()
+	usageMonth := time.Now().UTC().Format("2006-01")
+	usedBytes, err := s.db.SumTransferDownloadUsageBytes(ctx, tenantID, username, usageMonth)
+	if err != nil {
+		return PresignDownloadResponse{}, internalError(err)
+	}
+	if err := ensureWithinQuota(usedBytes, item.SizeBytes,
+		s.objectCfg.PerUserMonthlyDownloadQuotaBytes,
+		"本月 OSS 下载流量额度不足"); err != nil {
+		return PresignDownloadResponse{}, err
+	}
 	ttl := time.Duration(s.objectCfg.DownloadURLTTLSeconds) * time.Second
 	presigned, err := s.storage.PresignDownload(item.ObjectKey, ttl)
 	if err != nil {
 		return PresignDownloadResponse{}, conflict(err.Error())
 	}
+	if err := s.recordDownloadUsage(ctx, tenantID, username, usageMonth, item); err != nil {
+		return PresignDownloadResponse{}, err
+	}
 	return PresignDownloadResponse{AttachmentID: item.ID, ObjectID: fmt.Sprint(item.ID),
 		DownloadURL: presigned.URL, DownloadHeaders: presigned.Headers,
 		ExpiresAt: presigned.ExpiresAt.Format(time.RFC3339Nano), Attachment: attachmentView(item)}, nil
+}
+
+func (s *Service) ensureStorageQuota(ctx context.Context, tenantID, username string,
+	requestedBytes, excludedAttachmentID int64) error {
+	usedBytes, err := s.db.SumActiveTransferStorageBytes(ctx, tenantID, username,
+		excludedAttachmentID, time.Now().UTC())
+	if err != nil {
+		return internalError(err)
+	}
+	return ensureWithinQuota(usedBytes, requestedBytes, s.objectCfg.PerUserStorageQuotaBytes,
+		"OSS 存储额度不足")
+}
+
+func ensureWithinQuota(usedBytes, requestedBytes, limitBytes int64, message string) error {
+	if limitBytes < 1 {
+		limitBytes = defaultPerUserQuotaBytes
+	}
+	if requestedBytes < 0 || usedBytes > limitBytes-requestedBytes {
+		return rateLimited(message)
+	}
+	return nil
+}
+
+func (s *Service) recordDownloadUsage(ctx context.Context, tenantID, username,
+	usageMonth string, item store.TransferAttachment) error {
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		lastErr = s.db.InsertTransferDownloadUsage(ctx, auth.NewClientID(), tenantID, username,
+			item.ID, item.SizeBytes, usageMonth, time.Now().UTC())
+		if lastErr == nil {
+			return nil
+		}
+	}
+	return internalError(fmt.Errorf("failed to record download usage: %w", lastErr))
+}
+
+func (s *Service) quotaLock(tenantID, username string) *sync.Mutex {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(strings.TrimSpace(tenantID)))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(strings.TrimSpace(username)))
+	return &s.quotaLocks[int(hash.Sum32())%len(s.quotaLocks)]
+}
+
+func normalizeAccount(tenantID, username string) (string, string, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	username = strings.TrimSpace(username)
+	if tenantID == "" || username == "" {
+		return "", "", internalError(errors.New("authenticated account is missing"))
+	}
+	return tenantID, username, nil
 }
 
 func (s *Service) normalizeSize(value *int64) (int64, error) {

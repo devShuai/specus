@@ -3,7 +3,9 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.tunnelserver.config.ObjectStorageProperties;
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
 import com.theshuai.tunnelserver.management.model.TransferAttachment;
+import com.theshuai.tunnelserver.management.model.TransferAttachmentDownloadUsage;
 import com.theshuai.tunnelserver.management.model.TransferAttachmentView;
+import com.theshuai.tunnelserver.management.repository.TransferAttachmentDownloadUsageRepository;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentRepository;
 import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.management.storage.object.ObjectStorageService;
@@ -21,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.YearMonth;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.HexFormat;
@@ -41,30 +44,37 @@ public class TransferAttachmentService {
     private static final Pattern SHA256_PATTERN = Pattern.compile("^[a-fA-F0-9]{64}$");
     private static final DateTimeFormatter OBJECT_DATE =
             DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC);
+    private static final long DEFAULT_PER_USER_QUOTA_BYTES = 1024L * 1024L * 1024L;
 
     private final TransferAttachmentRepository repository;
+    private final TransferAttachmentDownloadUsageRepository downloadUsageRepository;
     private final ObjectStorageService objectStorageService;
     private final ObjectStorageProperties properties;
     private final PublicTransferProperties publicTransferProperties;
     private final ClientAccountService clientAccountService;
     private final PublicTransferRoomService publicTransferRoomService;
+    private final Object[] quotaLocks = new Object[64];
 
     public TransferAttachmentService(TransferAttachmentRepository repository,
+                                     TransferAttachmentDownloadUsageRepository downloadUsageRepository,
                                      ObjectStorageService objectStorageService,
                                      ObjectStorageProperties properties,
                                      PublicTransferProperties publicTransferProperties,
                                      ClientAccountService clientAccountService,
                                      PublicTransferRoomService publicTransferRoomService) {
         this.repository = repository;
+        this.downloadUsageRepository = downloadUsageRepository;
         this.objectStorageService = objectStorageService;
         this.properties = properties;
         this.publicTransferProperties = publicTransferProperties;
         this.clientAccountService = clientAccountService;
         this.publicTransferRoomService = publicTransferRoomService;
+        for (int i = 0; i < quotaLocks.length; i++) {
+            quotaLocks[i] = new Object();
+        }
     }
 
-    @Transactional
-    public PresignUploadResponse createPublicUpload(PresignUploadRequest request) {
+    public PresignUploadResponse createPublicUpload(ManagementContext context, PresignUploadRequest request) {
         String roomId = normalizeRoomId(request.roomId());
         RoomAccess access = publicTransferRoomService.resolve(roomId, request.roomToken(), "attachment-upload");
         if (!access.role().canEdit()) {
@@ -76,19 +86,20 @@ public class TransferAttachmentService {
                 SCOPE_PUBLIC_TRANSFER, access.roomId(), STATUS_PENDING) >= maxPending) {
             throw new RateLimitedException("当前房间待上传文件过多,请稍后再试");
         }
-        return createUpload(
-                SCOPE_PUBLIC_TRANSFER,
-                null,
-                roomId,
-                roomTokenHash,
-                access.roomId(),
-                null,
-                null,
-                request
-        );
+        synchronized (quotaLock(context.tenant().tenantId(), context.username())) {
+            return createUpload(
+                    SCOPE_PUBLIC_TRANSFER,
+                    context.tenant().tenantId(),
+                    roomId,
+                    roomTokenHash,
+                    access.roomId(),
+                    context.username(),
+                    null,
+                    request
+            );
+        }
     }
 
-    @Transactional
     public PresignUploadResponse createAdminUpload(ManagementContext context, PresignUploadRequest request) {
         Long targetClientId = request.targetClientId();
         if (targetClientId == null) {
@@ -97,50 +108,51 @@ public class TransferAttachmentService {
         if (!clientAccountService.canAccessClient(context, targetClientId)) {
             throw new IllegalArgumentException("target client is not accessible");
         }
-        return createUpload(
-                SCOPE_ADMIN_CLIENT_MESSAGE,
-                context.tenant().tenantId(),
-                null,
-                null,
-                null,
-                context.username(),
-                targetClientId,
-                request
-        );
+        synchronized (quotaLock(context.tenant().tenantId(), context.username())) {
+            return createUpload(
+                    SCOPE_ADMIN_CLIENT_MESSAGE,
+                    context.tenant().tenantId(),
+                    null,
+                    null,
+                    null,
+                    context.username(),
+                    targetClientId,
+                    request
+            );
+        }
     }
 
-    @Transactional
-    public TransferAttachmentView completePublic(long attachmentId, CompleteAttachmentRequest request) {
+    public TransferAttachmentView completePublic(ManagementContext context, long attachmentId,
+                                                 CompleteAttachmentRequest request) {
         TransferAttachment attachment = repository.findByIdAndScope(attachmentId, SCOPE_PUBLIC_TRANSFER)
                 .orElseThrow(() -> new IllegalArgumentException("attachment not found: " + attachmentId));
         requireRoomAccess(attachment, request.roomToken(), true);
-        return complete(attachment);
+        assignOwnerWhenMissing(attachment, context);
+        return completeWithinQuota(attachment);
     }
 
-    @Transactional
     public TransferAttachmentView completeAdmin(ManagementContext context, long attachmentId) {
         TransferAttachment attachment = repository
                 .findByIdAndTenantIdAndScope(attachmentId, context.tenant().tenantId(), SCOPE_ADMIN_CLIENT_MESSAGE)
                 .orElseThrow(() -> new IllegalArgumentException("attachment not found: " + attachmentId));
         requireAdminClientAccess(context, attachment);
-        return complete(attachment);
+        return completeWithinQuota(attachment);
     }
 
-    @Transactional(readOnly = true)
-    public PresignDownloadResponse createPublicDownload(long attachmentId, PresignDownloadRequest request) {
+    public PresignDownloadResponse createPublicDownload(ManagementContext context, long attachmentId,
+                                                        PresignDownloadRequest request) {
         TransferAttachment attachment = repository.findByIdAndScope(attachmentId, SCOPE_PUBLIC_TRANSFER)
                 .orElseThrow(() -> new IllegalArgumentException("attachment not found: " + attachmentId));
         requireRoomAccess(attachment, request.roomToken(), false);
-        return createDownload(attachment);
+        return createDownload(context, attachment);
     }
 
-    @Transactional(readOnly = true)
     public PresignDownloadResponse createAdminDownload(ManagementContext context, long attachmentId) {
         TransferAttachment attachment = repository
                 .findByIdAndTenantIdAndScope(attachmentId, context.tenant().tenantId(), SCOPE_ADMIN_CLIENT_MESSAGE)
                 .orElseThrow(() -> new IllegalArgumentException("attachment not found: " + attachmentId));
         requireAdminClientAccess(context, attachment);
-        return createDownload(attachment);
+        return createDownload(context, attachment);
     }
 
     @Scheduled(fixedDelayString = "${tunnel.object-storage.expiration-scan-interval-ms:3600000}")
@@ -179,6 +191,7 @@ public class TransferAttachmentService {
         String fileName = normalizeFileName(request.fileName());
         String mimeType = normalizeMimeType(request.mimeType());
         long sizeBytes = normalizeSize(request.sizeBytes());
+        ensureStorageQuota(tenantId, ownerUsername, sizeBytes, Long.MIN_VALUE);
         String sha256 = normalizeSha256(request.sha256());
         Instant now = Instant.now();
         Instant uploadExpiresAt = now.plusSeconds(properties.getUploadUrlTtlSeconds());
@@ -241,6 +254,12 @@ public class TransferAttachmentService {
         throw new IllegalStateException("failed to allocate attachment id");
     }
 
+    private TransferAttachmentView completeWithinQuota(TransferAttachment attachment) {
+        synchronized (quotaLock(attachment.getTenantId(), attachment.getOwnerUsername())) {
+            return complete(attachment);
+        }
+    }
+
     private TransferAttachmentView complete(TransferAttachment attachment) {
         Instant now = Instant.now();
         if (!STATUS_PENDING.equals(attachment.getStatus())) {
@@ -250,10 +269,19 @@ public class TransferAttachmentService {
             throw new IllegalStateException("attachment upload URL is expired");
         }
         verifyUploadedObject(attachment);
+        try {
+            ensureStorageQuota(attachment.getTenantId(), attachment.getOwnerUsername(),
+                    attachment.getSizeBytes(), attachment.getId());
+        } catch (RateLimitedException exception) {
+            if (objectStorageService.isEnabled()) {
+                objectStorageService.deleteObject(attachment.getObjectKey());
+            }
+            throw exception;
+        }
         attachment.setStatus(STATUS_UPLOADED);
         attachment.setUploadedAt(now.toString());
         attachment.setUpdatedAt(now.toString());
-        repository.save(attachment);
+        repository.saveAndFlush(attachment);
         return toView(attachment);
     }
 
@@ -279,7 +307,7 @@ public class TransferAttachmentService {
         }
     }
 
-    private PresignDownloadResponse createDownload(TransferAttachment attachment) {
+    private PresignDownloadResponse createDownload(ManagementContext context, TransferAttachment attachment) {
         Instant now = Instant.now();
         if (!STATUS_UPLOADED.equals(attachment.getStatus())) {
             throw new IllegalStateException("attachment is not uploaded");
@@ -287,18 +315,96 @@ public class TransferAttachmentService {
         if (Instant.parse(attachment.getExpiresAt()).isBefore(now)) {
             throw new IllegalStateException("attachment is expired");
         }
-        PresignedObjectUrl download = objectStorageService.presignDownload(
-                attachment.getObjectKey(),
-                Duration.ofSeconds(properties.getDownloadUrlTtlSeconds())
+        String tenantId = requireAccountText(context.tenant().tenantId(), "tenantId");
+        String username = requireAccountText(context.username(), "username");
+        synchronized (quotaLock(tenantId, username)) {
+            String usageMonth = YearMonth.now(ZoneOffset.UTC).toString();
+            long usedBytes = downloadUsageRepository.sumBytesByAccountAndMonth(
+                    tenantId, username, usageMonth);
+            ensureWithinQuota(usedBytes, attachment.getSizeBytes(),
+                    properties.getPerUserMonthlyDownloadQuotaBytes(),
+                    "本月 OSS 下载流量额度不足");
+
+            PresignedObjectUrl download = objectStorageService.presignDownload(
+                    attachment.getObjectKey(),
+                    Duration.ofSeconds(properties.getDownloadUrlTtlSeconds())
+            );
+            recordDownloadUsage(tenantId, username, usageMonth, attachment);
+            return new PresignDownloadResponse(
+                    attachment.getId(),
+                    String.valueOf(attachment.getId()),
+                    download.url(),
+                    download.headers(),
+                    download.expiresAt(),
+                    toView(attachment)
+            );
+        }
+    }
+
+    private void ensureStorageQuota(String tenantId, String ownerUsername, long requestedBytes,
+                                    long excludedAttachmentId) {
+        String normalizedTenant = requireAccountText(tenantId, "tenantId");
+        String normalizedOwner = requireAccountText(ownerUsername, "ownerUsername");
+        long usedBytes = repository.sumActiveStorageBytes(
+                normalizedTenant,
+                normalizedOwner,
+                excludedAttachmentId,
+                STATUS_PENDING,
+                STATUS_UPLOADED,
+                Instant.now().toString()
         );
-        return new PresignDownloadResponse(
-                attachment.getId(),
-                String.valueOf(attachment.getId()),
-                download.url(),
-                download.headers(),
-                download.expiresAt(),
-                toView(attachment)
-        );
+        ensureWithinQuota(usedBytes, requestedBytes, properties.getPerUserStorageQuotaBytes(),
+                "OSS 存储额度不足");
+    }
+
+    private void ensureWithinQuota(long usedBytes, long requestedBytes, long limitBytes, String message) {
+        long normalizedLimit = limitBytes > 0L ? limitBytes : DEFAULT_PER_USER_QUOTA_BYTES;
+        if (requestedBytes < 0L || usedBytes > normalizedLimit - requestedBytes) {
+            throw new RateLimitedException(message);
+        }
+    }
+
+    private void recordDownloadUsage(String tenantId, String username, String usageMonth,
+                                     TransferAttachment attachment) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            TransferAttachmentDownloadUsage usage = new TransferAttachmentDownloadUsage();
+            usage.setId(ClientIdGenerator.newId());
+            usage.setTenantId(tenantId);
+            usage.setUsername(username);
+            usage.setAttachmentId(attachment.getId());
+            usage.setSizeBytes(attachment.getSizeBytes());
+            usage.setUsageMonth(usageMonth);
+            usage.setCreatedAt(Instant.now().toString());
+            try {
+                downloadUsageRepository.saveAndFlush(usage);
+                return;
+            } catch (DataIntegrityViolationException exception) {
+                if (attempt == 7) {
+                    throw exception;
+                }
+            }
+        }
+    }
+
+    private void assignOwnerWhenMissing(TransferAttachment attachment, ManagementContext context) {
+        if (!StringUtils.hasText(attachment.getTenantId())) {
+            attachment.setTenantId(context.tenant().tenantId());
+        }
+        if (!StringUtils.hasText(attachment.getOwnerUsername())) {
+            attachment.setOwnerUsername(context.username());
+        }
+    }
+
+    private Object quotaLock(String tenantId, String username) {
+        int index = Math.floorMod(Objects.hash(tenantId, username), quotaLocks.length);
+        return quotaLocks[index];
+    }
+
+    private String requireAccountText(String value, String field) {
+        if (!StringUtils.hasText(value)) {
+            throw new IllegalStateException(field + " is missing from authenticated account");
+        }
+        return value.trim();
     }
 
     private void requireAdminClientAccess(ManagementContext context, TransferAttachment attachment) {

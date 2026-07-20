@@ -244,9 +244,31 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task PublicAttachmentUploadReturnsConflictWhenStorageDisabled()
+    public async Task PublicAttachmentUploadRequiresLoginThenReturnsConflictWhenStorageDisabled()
     {
         using var client = _server!.CreateClient();
+        var anonymousResponse = await client.PostAsJsonAsync(
+            "/api/public/transfer/attachments/presign-upload",
+            new
+            {
+                fileName = "photo.png",
+                mimeType = "image/png",
+                sizeBytes = 10,
+                roomId = "room-a",
+                roomToken = "secret",
+            });
+        Assert.Equal(HttpStatusCode.Unauthorized, anonymousResponse.StatusCode);
+
+        var login = await client.PostAsJsonAsync("/auth/login", new
+        {
+            username = "admin",
+            password = "admin",
+        });
+        login.EnsureSuccessStatusCode();
+        using var loginJson = JsonDocument.Parse(await login.Content.ReadAsStringAsync());
+        client.DefaultRequestHeaders.Authorization = new(
+            "Bearer", loginJson.RootElement.GetProperty("accessToken").GetString());
+
         var response = await client.PostAsJsonAsync(
             "/api/public/transfer/attachments/presign-upload",
             new

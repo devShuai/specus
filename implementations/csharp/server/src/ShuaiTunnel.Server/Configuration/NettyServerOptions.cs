@@ -205,6 +205,8 @@ public sealed class ObjectStorageOptions
     public long DownloadUrlTtlSeconds { get; set; } = 600;
     public long RetentionHours { get; set; } = 72;
     public long MaxAttachmentBytes { get; set; } = 512L * 1024 * 1024;
+    public long PerUserStorageQuotaBytes { get; set; } = 1024L * 1024 * 1024;
+    public long PerUserMonthlyDownloadQuotaBytes { get; set; } = 1024L * 1024 * 1024;
     public long ExpirationScanIntervalMs { get; set; } = 3_600_000;
 }
 

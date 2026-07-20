@@ -134,7 +134,23 @@ CREATE TABLE IF NOT EXISTS transfer_attachment (
 
 CREATE INDEX IF NOT EXISTS idx_transfer_attachment_tenant ON transfer_attachment (tenant_id, scope, id);
 CREATE INDEX IF NOT EXISTS idx_transfer_attachment_room ON transfer_attachment (scope, room_id, id);
+CREATE INDEX IF NOT EXISTS idx_transfer_attachment_owner_status ON transfer_attachment (tenant_id, owner_username, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_transfer_attachment_expires ON transfer_attachment (expires_at, status);
+
+CREATE TABLE IF NOT EXISTS transfer_attachment_download_usage (
+  id INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  attachment_id INTEGER NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  usage_month TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachment_download_usage_account_month
+  ON transfer_attachment_download_usage (tenant_id, username, usage_month);
+CREATE INDEX IF NOT EXISTS idx_attachment_download_usage_attachment
+  ON transfer_attachment_download_usage (attachment_id, created_at);
 
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

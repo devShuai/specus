@@ -18,4 +18,6 @@ public class ObjectStorageProperties {
     private long downloadUrlTtlSeconds = 600;
     private long retentionHours = 72;
     private long maxAttachmentBytes = 512L * 1024L * 1024L;
+    private long perUserStorageQuotaBytes = 1024L * 1024L * 1024L;
+    private long perUserMonthlyDownloadQuotaBytes = 1024L * 1024L * 1024L;
 }

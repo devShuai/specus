@@ -33,10 +33,11 @@ import java.util.Base64;
 import java.util.List;
 
 /**
- * Locks down the management API with bearer JWTs and leaves everything else open (static page, OIDC
- * and auth helper endpoints, the public {@code /http/**} tunnel ingress). The admin API accepts two
- * token kinds, routed by the JWT {@code alg} header: RS256 from the OIDC gateway (verified via
- * JWKS) and HS256 minted by local username/password login. Only applies in a servlet web context.
+ * Locks down the management API and public OSS transfer endpoints with bearer JWTs, while leaving
+ * the static page, OIDC helpers, Direct/TURN discovery and public {@code /http/**} tunnel ingress
+ * open. Two token kinds are routed by the JWT {@code alg} header: RS256 from the OIDC gateway
+ * (verified via JWKS) and HS256 minted by local username/password login. Only applies in a servlet
+ * web context.
  */
 @Configuration
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
@@ -57,8 +58,10 @@ public class SecurityConfig {
                         // 这里放行避免被 Spring Security 当 REST 一样要求 Authorization 头（浏览器
                         // 原生 WebSocket 无法塞自定义 header，token 走 query 串）。
                         .requestMatchers("/ws/**").permitAll()
-                        // 公开 API：无需 JWT，登录页和未登录用户也能读取。当前用于
-                        // 客户端下载链接展示（GET /api/public/client-downloads）。
+                        // 对象存储会产生持久化与公网流量成本，公开互传页只有登录用户
+                        // 可以申请 OSS 上传/下载；房间发现、ICE 和实时 Direct/TURN 仍免登录。
+                        .requestMatchers("/api/public/transfer/attachments/**").authenticated()
+                        // 其余公开 API 无需 JWT，登录页和未登录用户也能读取。
                         .requestMatchers("/api/public/**").permitAll()
                         .requestMatchers("/api/admin/**", "/auth/refresh").authenticated()
                         .anyRequest().permitAll())
@@ -72,7 +75,8 @@ public class SecurityConfig {
                 /*
                  * CSP：管理后台为 React + HeroUI 构建产物,脚本是同源外部 bundle(/assets/*.js)。
                  * - script-src 'self' + googletagmanager.com:外部模块脚本同源 + GA 主 loader
-                 *     额外放行 GA 初始化的内联脚本 sha256 hash（同时保留在 /gtag-init.js 作 fallback）。
+                 *     额外放行 GA 初始化的内联脚本 sha256 hash（同时保留在 /gtag-init.js 作 fallback）；
+                 *     该内联 config 显式使用无 query/hash 的 page_location 与 page_path，避免上报房间凭据。
                  *     如果修改 index.html 中的内联 gtag 片段，需要重算 sha256 并同步这里。
                  * - style-src 'self' 'unsafe-inline':HeroUI/framer-motion 会写内联 style 属性
                  * - img-src 允许 blob:/data: 供直连文件预览与内联图片;额外允许 GA pixel beacon 域
@@ -88,7 +92,7 @@ public class SecurityConfig {
                 .headers(headers -> headers
                         .contentSecurityPolicy(csp -> csp.policyDirectives(
                                 "default-src 'self'; "
-                                + "script-src 'self' https://www.googletagmanager.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE='; "
+                                + "script-src 'self' https://www.googletagmanager.com 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
                                 + "style-src 'self' 'unsafe-inline'; "
                                 + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; "
                                 + "media-src 'self' blob: data:" + ossSuffix + "; "
@@ -111,7 +115,9 @@ public class SecurityConfig {
 
     private boolean shouldAuthenticateBearer(HttpServletRequest request) {
         String path = request.getRequestURI().substring(request.getContextPath().length());
-        return path.startsWith("/api/admin/") || "/auth/refresh".equals(path);
+        return path.startsWith("/api/admin/")
+                || path.startsWith("/api/public/transfer/attachments/")
+                || "/auth/refresh".equals(path);
     }
 
     /**
