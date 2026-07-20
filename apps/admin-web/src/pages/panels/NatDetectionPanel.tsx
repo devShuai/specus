@@ -9,7 +9,7 @@ import {
   Tooltip,
 } from "@heroui/react";
 import { AppLogo } from "../../components/AppLogo";
-import { ThemeToggleButton } from "../../components/ThemeToggleButton";
+import { UserMenuButton } from "../../components/UserMenuButton";
 import { HeroRuntime } from "../../components/HeroRuntime";
 import { PublicToolsMenu } from "../../components/PublicToolsMenu";
 import { notify } from "../../components/toast";
@@ -575,7 +575,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
           <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
           <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu active="nat-detect" />
-            <ThemeToggleButton className="public-header-theme-button" />
+            <UserMenuButton className="public-header-theme-button" />
           </div>
         </header>
 

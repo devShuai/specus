@@ -18,7 +18,7 @@ import {
 } from "@heroui/react";
 import { AppLogo } from "../components/AppLogo";
 import { useAuth } from "../auth/AuthContext";
-import { ThemeToggleButton } from "../components/ThemeToggleButton";
+import { UserMenuButton } from "../components/UserMenuButton";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { SyncedClipboard } from "../components/SyncedClipboard";
@@ -80,6 +80,7 @@ import {
   type DirectPendingTransfer,
   type DirectReceivingTransfer,
   type DirectTransferSignalPayload,
+  type PeerTransportPath,
 } from "../hooks/useDirectTransfer";
 
 const LazySyncedDiagram = lazy(() =>
@@ -528,6 +529,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const {
     pendingTransfers,
     receivingTransfers,
+    peerTransportPaths,
     sendDirect,
     sendPeerMessage,
     isPeerMessageTransportReady,
@@ -1778,13 +1780,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       const response = record.downloadUrl
         ? { downloadUrl: record.downloadUrl, downloadHeaders: {}, expiresAt: record.downloadExpiresAt ?? "" }
         : await publicPresignAttachmentDownload(record.attachment.attachmentId, { roomToken });
-      if (!record.downloadUrl && !record.direct && "attachment" in response) {
-        setRecord({
-          ...record,
-          downloadUrl: response.downloadUrl,
-          downloadExpiresAt: response.expiresAt,
-        });
-      }
+      setRecord((current) => current?.attachment.attachmentId === record.attachment.attachmentId
+        ? { ...current, downloadUrl: null, downloadExpiresAt: null }
+        : current);
       if (record.attachment.sizeBytes > STREAM_DOWNLOAD_THRESHOLD_BYTES && !hasRequestHeaders(response.downloadHeaders)) {
         triggerUrlDownload(response.downloadUrl, record.attachment.fileName);
         setNotice(`已开始下载：${record.attachment.fileName}`);
@@ -1827,7 +1825,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         throw new Error("下载地址不可用");
       }
       setIncoming((items) => items.map((current) => incomingItemKey(current) === key
-        ? { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt }
+        ? { ...current, downloadUrl: null, downloadExpiresAt: null }
         : current));
       if (item.attachment.sizeBytes > STREAM_DOWNLOAD_THRESHOLD_BYTES && !hasRequestHeaders(response.downloadHeaders)) {
         triggerUrlDownload(response.downloadUrl, item.attachment.fileName);
@@ -1846,7 +1844,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           return current;
         }
         revokePreviewUrl(current.previewUrl);
-        return { ...current, downloadUrl: response.downloadUrl, downloadExpiresAt: response.expiresAt, previewUrl, blob };
+        return { ...current, downloadUrl: null, downloadExpiresAt: null, previewUrl, blob };
       }));
       setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
       setNotice(`已保存：${item.attachment.fileName}`);
@@ -2289,7 +2287,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="public-header-actions flex shrink-0 items-center gap-2">
           <PublicToolsMenu active={workspace} />
-          <ThemeToggleButton className="public-header-theme-button" />
+          <UserMenuButton className="public-header-theme-button" />
         </div>
       </header>
 
@@ -2338,11 +2336,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 >
                   {!authReady ? "账号检测中" : ossFallbackEnabled ? "OSS 兜底可用" : "仅 Direct/TURN"}
                 </Chip>
-                {authReady && !authed ? (
-                  <Button size="sm" radius="sm" variant="light" onPress={openLogin}>
-                    登录
-                  </Button>
-                ) : null}
               </div>
               <div className="transfer-room-controls flex shrink-0 items-center gap-2">
                 <NetworkModeToggle activeMode={networkMode} onSelect={updateNetworkMode} />
@@ -2559,7 +2552,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
           {state !== "idle" && (
             <div className={activeTool === "whiteboard" ? "hidden" : "mt-4"} aria-hidden={activeTool === "whiteboard"}>
-              <TransferProgress state={state} store={progressStore} />
+              <TransferProgress
+                state={state}
+                store={progressStore}
+                transportPath={
+                  uploadInFlightRef.current?.targetPeerId
+                    ? peerTransportPaths[uploadInFlightRef.current.targetPeerId]
+                    : undefined
+                }
+              />
             </div>
           )}
           </> : null}
@@ -2612,6 +2613,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             <IncomingFilesPanel
               pendingTransfers={pendingTransfers}
               receivingTransfers={receivingTransfers}
+              peerTransportPaths={peerTransportPaths}
               incoming={incoming}
               cloudTransferEnabled={ossFallbackEnabled}
               onAcceptDirect={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
@@ -2702,11 +2704,24 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0 truncate font-medium">{discoveryPeerDisplayName(peer)}</div>
-                  {selectedPeerId === peer.peerId && (
-                    <span className="shrink-0 rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-700 dark:text-cyan-100">
-                      已选
-                    </span>
-                  )}
+                  <div className="flex shrink-0 items-center gap-1">
+                    {peerTransportPaths[peer.peerId] && (
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                          peerTransportPaths[peer.peerId] === "turn"
+                            ? "bg-amber-500/15 text-amber-700 dark:text-amber-200"
+                            : "bg-emerald-500/15 text-emerald-700 dark:text-emerald-200"
+                        }`}
+                      >
+                        {transportPathLabel(peerTransportPaths[peer.peerId])}
+                      </span>
+                    )}
+                    {selectedPeerId === peer.peerId && (
+                      <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-700 dark:text-cyan-100">
+                        已选
+                      </span>
+                    )}
+                  </div>
                 </div>
               </button>
             ))}
@@ -3063,6 +3078,7 @@ function ToolModeButton({
 function IncomingFilesPanel({
   pendingTransfers,
   receivingTransfers,
+  peerTransportPaths,
   incoming,
   cloudTransferEnabled,
   onAcceptDirect,
@@ -3074,6 +3090,7 @@ function IncomingFilesPanel({
 }: {
   pendingTransfers: DirectPendingTransfer[];
   receivingTransfers: DirectReceivingTransfer[];
+  peerTransportPaths: Record<string, PeerTransportPath>;
   incoming: IncomingAttachment[];
   cloudTransferEnabled: boolean;
   onAcceptDirect: (item: DirectPendingTransfer) => void;
@@ -3133,11 +3150,12 @@ function IncomingFilesPanel({
         <div className="mt-3 grid gap-2 md:grid-cols-2">
           {receivingTransfers.map((item) => {
             const percent = transferProgress(item.receivedBytes, item.sizeBytes);
+            const pathLabel = transportPathLabel(peerTransportPaths[item.sourcePeerId]);
             return (
               <div key={receivingTransferKey(item)} className="rounded-lg border border-cyan-400/30 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10">
                 <div className="truncate text-small font-medium text-cyan-950 dark:text-cyan-100">{item.fileName}</div>
                 <div className="mt-1 text-tiny text-cyan-800/75 dark:text-cyan-100/70">
-                  来自 {item.sourcePeerId} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}
+                  来自 {item.sourcePeerId} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}{pathLabel ? ` · ${pathLabel}` : ""}
                 </div>
                 <Progress className="mt-2" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
               </div>
@@ -3152,7 +3170,7 @@ function IncomingFilesPanel({
             暂无附件消息。对方发送文件后会出现在这里。
           </div>
         ) : incoming.map((item) => {
-          const previewUrl = item.previewUrl || item.downloadUrl;
+          const previewUrl = item.previewUrl;
           const cloudLoginRequired = !item.direct && !cloudTransferEnabled;
           return (
             <div key={incomingItemKey(item)} className="rounded-lg glass glass-border border p-3">
@@ -3200,8 +3218,17 @@ function IncomingFilesPanel({
   );
 }
 
-function TransferProgress({ state, store }: { state: UploadState; store: TransferProgressStore }) {
+function TransferProgress({
+  state,
+  store,
+  transportPath,
+}: {
+  state: UploadState;
+  store: TransferProgressStore;
+  transportPath?: PeerTransportPath;
+}) {
   const progress = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const pathLabel = state === "direct" || state === "waiting" ? transportPathLabel(transportPath) : null;
   return (
     <>
       <Progress
@@ -3210,8 +3237,19 @@ function TransferProgress({ state, store }: { state: UploadState; store: Transfe
         color={state === "failed" ? "danger" : "primary"}
         size="sm"
       />
-      <div className="mt-2 text-tiny text-zinc-500 dark:text-zinc-400">
-        {stateLabel(state, progress)}
+      <div className="mt-2 flex items-center gap-1.5 text-tiny text-zinc-500 dark:text-zinc-400">
+        <span>{stateLabel(state, progress)}</span>
+        {pathLabel && (
+          <span
+            className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+              transportPath === "turn"
+                ? "bg-amber-500/15 text-amber-700 dark:text-amber-200"
+                : "bg-emerald-500/15 text-emerald-700 dark:text-emerald-200"
+            }`}
+          >
+            {pathLabel}
+          </span>
+        )}
       </div>
     </>
   );
@@ -3725,7 +3763,7 @@ function TransferFaq({
             : "文件只发送给你点选的内网设备，不创建云端副本或公开下载链接。"}
         </FaqItem>
         <FaqItem title="云端额度是多少？">
-          登录账号最多占用 1 GiB 有效附件存储，每个 UTC 自然月可签发 1 GiB OSS 下载流量。每次生成下载链接按文件完整大小计入流量。
+          登录账号最多占用 1 GiB 有效附件存储，每个 UTC 自然月可领取 1 GiB OSS 下载流量。生成链接不扣额度；首次打开并成功跳转时按文件完整大小计入，链接只能打开一次。
         </FaqItem>
         <FaqItem title="更多说明">
           {isInternetMode
@@ -3878,6 +3916,10 @@ function createTransferProgressStore(): TransferProgressStore {
 
 function hasRequestHeaders(headers: Record<string, string>) {
   return Object.keys(headers).length > 0;
+}
+
+function transportPathLabel(path: PeerTransportPath | undefined) {
+  return path === "turn" ? "TURN 中继" : path === "direct" ? "P2P 直连" : null;
 }
 
 function stateLabel(state: UploadState, progress: number) {

@@ -26,6 +26,8 @@ export interface DirectTransferPeer {
   displayName: string;
 }
 
+export type PeerTransportPath = "direct" | "turn";
+
 export interface DirectReceivingTransfer {
   transferId: string;
   sourcePeerId: string;
@@ -140,6 +142,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   const directAckWaitersRef = useRef<Map<string, DirectAckWaiter>>(new Map());
   const [pendingTransfers, setPendingTransfers] = useState<DirectPendingTransfer[]>([]);
   const [receivingTransfers, setReceivingTransfers] = useState<DirectReceivingTransfer[]>([]);
+  const [peerTransportPaths, setPeerTransportPaths] = useState<Record<string, PeerTransportPath>>({});
 
   optionsRef.current = options;
   iceConfigRef.current = options.iceConfig;
@@ -153,6 +156,17 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       && metadata?.peerId === peerId
       && metadata.scopeKey === scopeKey
       && dataChannelsRef.current.get(metadata.key) === channel;
+  }, []);
+
+  const clearPeerTransportPath = useCallback((peerId: string) => {
+    setPeerTransportPaths((current) => {
+      if (!(peerId in current)) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[peerId];
+      return next;
+    });
   }, []);
 
   const isCurrentPeerConnection = useCallback((peerId: string, connection: RTCPeerConnection, scopeKey: string) => {
@@ -223,6 +237,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     if (updateView) {
       setPendingTransfers([]);
       setReceivingTransfers([]);
+      setPeerTransportPaths({});
     }
   }, []);
 
@@ -644,6 +659,17 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     }
   }, [handleDirectControlMessage, isCurrentDataChannel, sendDirectReject, updateReceivingTransfer]);
 
+  const recordTransportPath = useCallback((peerId: string, connection: RTCPeerConnection, scopeKey: string) => {
+    void detectPeerTransportPath(connection).then((path) => {
+      if (!path
+        || connectionScopeRef.current !== scopeKey
+        || !isCurrentPeerConnection(peerId, connection, scopeKey)) {
+        return;
+      }
+      setPeerTransportPaths((current) => current[peerId] === path ? current : { ...current, [peerId]: path });
+    });
+  }, [isCurrentPeerConnection]);
+
   const setupDataChannel = useCallback((
     sourcePeerId: string,
     channel: RTCDataChannel,
@@ -720,6 +746,10 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       setupDataChannel(targetPeerId, event.channel, mode);
     };
     connection.onconnectionstatechange = () => {
+      if (connection.connectionState === "connected"
+        && isCurrentPeerConnection(targetPeerId, connection, scopeKey)) {
+        recordTransportPath(targetPeerId, connection, scopeKey);
+      }
       if ((connection.connectionState === "failed" || connection.connectionState === "closed")
         && peerConnectionsRef.current.get(key) === connection) {
         peerConnectionsRef.current.delete(key);
@@ -728,10 +758,15 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         if (channel) {
           closeDataChannel(targetPeerId, channel, `${mode} connection closed`, true);
         }
+        const hasLiveConnection = [...peerConnectionsRef.current.values()]
+          .some((candidate) => peerConnectionMetadataRef.current.get(candidate)?.peerId === targetPeerId);
+        if (!hasLiveConnection) {
+          clearPeerTransportPath(targetPeerId);
+        }
       }
     };
     return connection;
-  }, [closeDataChannel, isCurrentPeerConnection, sendSignal, setupDataChannel]);
+  }, [clearPeerTransportPath, closeDataChannel, isCurrentPeerConnection, recordTransportPath, sendSignal, setupDataChannel]);
 
   const openDirectChannel = useCallback(async (
     targetPeerId: string,
@@ -941,6 +976,10 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     optionsRef.current.onProgress(0);
     const scopeKey = connectionScopeRef.current;
     const channel = await openDirectChannel(targetPeerId, 8000, mode);
+    const usedConnection = peerConnectionsRef.current.get(peerTransportKey(targetPeerId, mode));
+    if (usedConnection) {
+      recordTransportPath(targetPeerId, usedConnection, scopeKey);
+    }
     const ensureCurrentChannel = () => {
       if (!isCurrentDataChannel(targetPeerId, channel, scopeKey) || channel.readyState !== "open") {
         throw new Error("room or peer changed during direct transfer");
@@ -973,11 +1012,12 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       attachment: directAttachment(transferId, fileName, mimeType, file.size, sha256),
       previewUrl: URL.createObjectURL(file),
     };
-  }, [isCurrentDataChannel, openDirectChannel, waitForDirectAck]);
+  }, [isCurrentDataChannel, openDirectChannel, recordTransportPath, waitForDirectAck]);
 
   return {
     pendingTransfers,
     receivingTransfers,
+    peerTransportPaths,
     sendDirect,
     sendPeerMessage,
     isPeerMessageTransportReady,
@@ -994,6 +1034,43 @@ export function receivingTransferKey(item: Pick<DirectReceivingTransfer, "source
 
 function peerTransportKey(peerId: string, mode: PeerTransportMode) {
   return JSON.stringify([peerId, mode]);
+}
+
+async function detectPeerTransportPath(connection: RTCPeerConnection): Promise<PeerTransportPath | null> {
+  try {
+    const stats = await connection.getStats();
+    const reports = new Map<string, Record<string, unknown>>();
+    stats.forEach((report) => reports.set(report.id, report as unknown as Record<string, unknown>));
+    let selectedPair: Record<string, unknown> | undefined;
+    for (const report of reports.values()) {
+      if (report.type === "transport" && typeof report.selectedCandidatePairId === "string") {
+        selectedPair = reports.get(report.selectedCandidatePairId);
+        if (selectedPair) {
+          break;
+        }
+      }
+    }
+    if (!selectedPair) {
+      // Firefox 不上报 transport.selectedCandidatePairId，退回 nominated 成功的候选对。
+      for (const report of reports.values()) {
+        if (report.type === "candidate-pair" && report.state === "succeeded" && report.nominated === true) {
+          selectedPair = report;
+          break;
+        }
+      }
+    }
+    if (!selectedPair) {
+      return null;
+    }
+    const local = typeof selectedPair.localCandidateId === "string" ? reports.get(selectedPair.localCandidateId) : undefined;
+    const remote = typeof selectedPair.remoteCandidateId === "string" ? reports.get(selectedPair.remoteCandidateId) : undefined;
+    if (!local && !remote) {
+      return null;
+    }
+    return local?.candidateType === "relay" || remote?.candidateType === "relay" ? "turn" : "direct";
+  } catch {
+    return null;
+  }
 }
 
 function peerTransportConfigurationKey(config: PublicTransferIceConfig | null, mode: PeerTransportMode) {

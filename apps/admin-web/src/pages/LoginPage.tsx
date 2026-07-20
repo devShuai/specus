@@ -1,8 +1,8 @@
-import { useEffect, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
-import { ThemeToggleButton } from "../components/ThemeToggleButton";
+import { UserMenuButton } from "../components/UserMenuButton";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
 import { usePageSeo } from "../lib/seo";
 
@@ -81,11 +81,7 @@ export function LoginPage() {
 }
 
 function LoginPageContent() {
-  const { oidcConfig, loginHint, passwordLogin, startOidcLogin } = useAuth();
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [loginError, setLoginError] = useState<string | null>(null);
+  const { oidcConfig, openLogin } = useAuth();
 
   usePageSeo({
     title: "shuai-tunnel · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
@@ -108,30 +104,8 @@ function LoginPageContent() {
     },
   });
 
-  const passwordEnabled = oidcConfig?.passwordLoginEnabled ?? true;
-  const oidcEnabled = oidcConfig?.configured ?? false;
-
-  const onSubmit = async (event: FormEvent) => {
-    event.preventDefault();
-    setSubmitting(true);
-    setLoginError(null);
-    try {
-      await passwordLogin(username, password);
-    } catch (error) {
-      setLoginError(error instanceof Error ? error.message : "登录失败");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const loginWithOidc = async () => {
-    setLoginError(null);
-    try {
-      await startOidcLogin();
-    } catch (error) {
-      setLoginError(error instanceof Error ? error.message : "OIDC 登录失败");
-    }
-  };
+  const registrationEnabled = (oidcConfig?.registrationEnabled ?? false)
+    && (oidcConfig?.passwordLoginEnabled ?? true);
 
   return (
     <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
@@ -140,11 +114,11 @@ function LoginPageContent() {
           <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle="内网服务接入控制面" />
           <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu />
-            <ThemeToggleButton className="public-header-theme-button" />
+            <UserMenuButton className="public-header-theme-button" />
           </div>
         </header>
 
-        <div className="landing-apple-hero-layout grid flex-1 items-center gap-10 py-10 lg:grid-cols-[minmax(0,1fr)_420px]">
+        <div className="landing-apple-hero-layout grid flex-1 items-center gap-10 py-10">
           <div className="landing-apple-copy flex min-w-0 flex-col gap-8">
             <span className="landing-apple-eyebrow w-fit text-small font-semibold">
               Secure tunnel control plane
@@ -155,6 +129,17 @@ function LoginPageContent() {
               <p className="landing-apple-lead mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
                 把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测，TLS 开箱即用。
               </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
+                登录管理台
+              </button>
+              {registrationEnabled && (
+                <button type="button" className="landing-secondary-button" onClick={() => openLogin("register")}>
+                  注册账号
+                </button>
+              )}
             </div>
 
             <div className="landing-apple-metrics grid max-w-3xl grid-cols-2 sm:grid-cols-4">
@@ -179,82 +164,6 @@ function LoginPageContent() {
             </div>
           </div>
 
-          <div id="login-panel">
-            <div className="app-apple-login-card landing-apple-login landing-card text-zinc-950 dark:text-white">
-              <div className="flex flex-col items-start gap-2 px-5 pb-2 pt-5">
-                <span className="landing-apple-eyebrow text-tiny font-semibold">
-                  管理台登录
-                </span>
-                <div>
-                  <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">进入控制台</h2>
-                  <p className="mt-1 text-small text-zinc-600 dark:text-zinc-400">{loginHint}</p>
-                </div>
-              </div>
-              <div className="flex flex-col gap-4 px-5 pb-5">
-                {passwordEnabled && (
-                  <form className="flex flex-col gap-3" onSubmit={onSubmit}>
-                    <label className="grid gap-1.5 text-small text-zinc-700 dark:text-zinc-300">
-                      <span>用户名 <span className="text-danger">*</span></span>
-                      <input
-                        className="landing-form-input"
-                        value={username}
-                        onChange={(event) => setUsername(event.target.value)}
-                        autoComplete="username"
-                        required
-                      />
-                    </label>
-                    <label className="grid gap-1.5 text-small text-zinc-700 dark:text-zinc-300">
-                      <span>密码 <span className="text-danger">*</span></span>
-                      <input
-                        className="landing-form-input"
-                        type="password"
-                        value={password}
-                        onChange={(event) => setPassword(event.target.value)}
-                        autoComplete="current-password"
-                        required
-                      />
-                    </label>
-                    {loginError && (
-                      <p className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-small text-danger-700 dark:text-danger-200">
-                        {loginError}
-                      </p>
-                    )}
-                    <button
-                      type="submit"
-                      className="landing-primary-button"
-                      disabled={submitting || !username || !password}
-                    >
-                      {submitting ? "登录中..." : "登录管理台"}
-                    </button>
-                  </form>
-                )}
-
-                {passwordEnabled && oidcEnabled && (
-                  <div className="flex items-center gap-3 text-tiny text-zinc-500 dark:text-zinc-500">
-                    <span className="h-px flex-1 bg-black/10 dark:bg-white/10" />
-                    <span>或</span>
-                    <span className="h-px flex-1 bg-black/10 dark:bg-white/10" />
-                  </div>
-                )}
-
-                {oidcEnabled && (
-                  <button
-                    type="button"
-                    className="landing-secondary-button"
-                    onClick={() => void loginWithOidc()}
-                  >
-                    使用 OIDC 登录
-                  </button>
-                )}
-
-                {!passwordEnabled && !oidcEnabled && (
-                  <p className="rounded-md border border-danger/40 bg-danger/10 p-3 text-small text-danger-100">
-                    未配置任何登录方式：请设置用户名/密码或 OIDC
-                  </p>
-                )}
-              </div>
-            </div>
-          </div>
         </div>
       </section>
 

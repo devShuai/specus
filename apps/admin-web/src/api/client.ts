@@ -172,6 +172,19 @@ export async function passwordLogin(username: string, password: string): Promise
   return body;
 }
 
+export async function registerAccount(username: string, password: string): Promise<TokenResponse> {
+  const response = await fetch("/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  const body = (await response.json()) as TokenResponse;
+  if (!response.ok) {
+    throw new ApiError(body?.error || "注册失败");
+  }
+  return body;
+}
+
 export async function refreshToken(): Promise<TokenResponse> {
   const token = tokenStore.get();
   const response = await fetch("/auth/refresh", {

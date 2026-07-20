@@ -271,6 +271,12 @@ export function AdminMessagesPanel() {
     }
   };
 
+  const consumeAttachmentDownload = (messageId: string) => {
+    setMessages((items) => items.map((item) => item.id === messageId
+      ? { ...item, downloadUrl: undefined, downloadExpiresAt: undefined }
+      : item));
+  };
+
   const onComposerKeyDown = (event: KeyboardEvent) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
@@ -353,7 +359,12 @@ export function AdminMessagesPanel() {
             ) : (
               <div className="flex flex-col gap-3">
                 {messages.map((message) => (
-                  <MessageBubble key={message.id} message={message} onDownload={() => void downloadAttachment(message)} />
+                  <MessageBubble
+                    key={message.id}
+                    message={message}
+                    onDownload={() => void downloadAttachment(message)}
+                    onOpen={() => consumeAttachmentDownload(message.id)}
+                  />
                 ))}
               </div>
             )}
@@ -403,7 +414,11 @@ export function AdminMessagesPanel() {
   );
 }
 
-function MessageBubble({ message, onDownload }: { message: ChatMessage; onDownload: () => void }) {
+function MessageBubble({ message, onDownload, onOpen }: {
+  message: ChatMessage;
+  onDownload: () => void;
+  onOpen: () => void;
+}) {
   const mine = message.direction === "out";
   const attachment = message.attachment;
   return (
@@ -444,7 +459,8 @@ function MessageBubble({ message, onDownload }: { message: ChatMessage; onDownlo
             {message.downloadUrl && (
               <div className="mt-2 flex items-center justify-between gap-2 text-tiny text-default-500">
                 <span className="truncate">有效期 {formatDateTime(message.downloadExpiresAt)}</span>
-                <Button as="a" size="sm" color="success" variant="flat" href={message.downloadUrl} target="_blank" rel="noreferrer">
+                <Button as="a" size="sm" color="success" variant="flat" href={message.downloadUrl}
+                  target="_blank" rel="noreferrer" onClick={onOpen}>
                   打开
                 </Button>
               </div>

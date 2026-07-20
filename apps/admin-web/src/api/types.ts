@@ -3,6 +3,7 @@
 export interface OidcConfig {
   configured: boolean;
   passwordLoginEnabled: boolean;
+  registrationEnabled?: boolean;
   authorizationEndpoint: string;
   endSessionEndpoint: string;
   clientId: string;

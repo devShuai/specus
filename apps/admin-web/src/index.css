@@ -2419,6 +2419,16 @@ body {
   background: var(--landing-action-soft) !important;
 }
 
+@media (min-width: 640px) {
+  .landing-apple-hero .landing-primary-button,
+  .landing-apple-hero .landing-secondary-button {
+    width: auto;
+    min-height: 48px;
+    padding-inline: 2rem;
+    font-size: 1rem;
+  }
+}
+
 .landing-apple-content {
   border-top: 0;
   color: var(--landing-ink);

@@ -13,6 +13,7 @@ import {
   oidcExchange,
   passwordLogin as apiPasswordLogin,
   refreshToken,
+  registerAccount as apiRegisterAccount,
   setUnauthorizedHandler,
   tokenStore,
 } from "../api/client";
@@ -31,11 +32,17 @@ interface AuthState {
   profile: ManagementUser | null;
   oidcConfig: OidcConfig | null;
   loginHint: string;
+  /** 全局登录/注册弹窗是否打开（由 openLogin/closeLogin 控制）。 */
+  loginOpen: boolean;
+  /** 弹窗打开时的初始页签。 */
+  loginInitialTab: "login" | "register";
   expireSession: () => void;
   reloadProfile: () => Promise<ManagementUser>;
   passwordLogin: (username: string, password: string) => Promise<void>;
+  register: (username: string, password: string) => Promise<void>;
   startOidcLogin: () => Promise<void>;
-  openLogin: () => void;
+  openLogin: (initialTab?: "login" | "register") => void;
+  closeLogin: () => void;
   logout: () => void;
 }
 
@@ -47,6 +54,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<ManagementUser | null>(null);
   const [oidcConfig, setOidcConfig] = useState<OidcConfig | null>(null);
   const [loginHint, setLoginHint] = useState("请登录");
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginInitialTab, setLoginInitialTab] = useState<"login" | "register">("login");
   const refreshTimer = useRef<number | null>(null);
   const initialized = useRef(false);
   const sessionExpired = useRef(false);
@@ -110,19 +119,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setLoginHint("已退出登录");
   }, [oidcConfig, stopRefresh]);
 
-  const passwordLogin = useCallback(
-    async (username: string, password: string) => {
+  const completePasswordAuth = useCallback(
+    async (data: { accessToken: string; expiresIn: number }) => {
       try {
-        const data = await apiPasswordLogin(username, password);
         tokenStore.save(data.accessToken, data.expiresIn, "password");
         await reloadProfile();
         sessionExpired.current = false;
         setAuthed(true);
+        setLoginOpen(false);
         startRefresh();
-        const returnPath = takeAuthReturnPath();
-        if (returnPath) {
-          window.location.replace(returnPath);
-        }
       } catch (error) {
         tokenStore.clear();
         setProfile(null);
@@ -130,6 +135,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     },
     [reloadProfile, startRefresh],
+  );
+
+  const passwordLogin = useCallback(
+    async (username: string, password: string) => {
+      await completePasswordAuth(await apiPasswordLogin(username, password));
+    },
+    [completePasswordAuth],
+  );
+
+  const register = useCallback(
+    async (username: string, password: string) => {
+      await completePasswordAuth(await apiRegisterAccount(username, password));
+    },
+    [completePasswordAuth],
   );
 
   const startOidcLogin = useCallback(async () => {
@@ -158,13 +177,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     window.location.href = url.toString();
   }, [oidcConfig]);
 
-  const openLogin = useCallback(() => {
-    const returnPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    if (safeAuthReturnPath(returnPath)) {
-      sessionStorage.setItem(AUTH_RETURN_PATH_KEY, returnPath);
-    }
-    window.location.assign("/#login-panel");
+  // onPress={openLogin} 之类的调用会把事件对象当第一个参数传进来，所以只认字面量 "register"。
+  const openLogin = useCallback((initialTab?: unknown) => {
+    setLoginInitialTab(initialTab === "register" ? "register" : "login");
+    setLoginOpen(true);
   }, []);
+  const closeLogin = useCallback(() => setLoginOpen(false), []);
 
   useEffect(() => {
     if (initialized.current) {
@@ -214,11 +232,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     profile,
     oidcConfig,
     loginHint,
+    loginOpen,
+    loginInitialTab,
     expireSession: handleUnauthorized,
     reloadProfile,
     passwordLogin,
+    register,
     startOidcLogin,
     openLogin,
+    closeLogin,
     logout,
   };
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -259,12 +281,6 @@ async function completeOidcRedirect(
 
 function safeAuthReturnPath(value: string | null): string | null {
   return value && value.startsWith("/") && !value.startsWith("//") ? value : null;
-}
-
-function takeAuthReturnPath(): string | null {
-  const returnPath = safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY));
-  sessionStorage.removeItem(AUTH_RETURN_PATH_KEY);
-  return returnPath;
 }
 
 function cleanUrl(): void {

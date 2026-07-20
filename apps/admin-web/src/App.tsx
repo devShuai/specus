@@ -1,6 +1,7 @@
-import { lazy, Suspense, useEffect, useLayoutEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useState, type ReactNode } from "react";
 import { useAuth } from "./auth/AuthContext";
 import { tokenStore } from "./api/client";
+import { AuthDialog } from "./components/AuthDialog";
 
 const LazyLoginPage = lazy(() => import("./pages/LoginPage").then((module) => ({ default: module.LoginPage })));
 const LazyDashboard = lazy(() => import("./pages/Dashboard").then((module) => ({ default: module.Dashboard })));
@@ -77,46 +78,28 @@ export function App() {
     };
   }, [publicRoute]);
 
+  let content: ReactNode;
   if (publicRoute === "nat-detect") {
-    return (
-      <Suspense fallback={<FullScreenLoading />}>
-        <LazyNatDetectionPanel publicPage />
-      </Suspense>
-    );
+    content = <LazyNatDetectionPanel publicPage />;
+  } else if (publicRoute === "transfer") {
+    content = <LazyPublicTransferPage />;
+  } else if (publicRoute === "diagram") {
+    content = <LazyPublicDiagramPage />;
+  } else if (publicRoute === "diagram-embed") {
+    content = <LazyDiagramEmbedPage />;
+  } else {
+    const canShowGuestShell = !ready && !tokenStore.valid() && !hasOidcCallback();
+    if (!ready && !canShowGuestShell) {
+      return <FullScreenLoading />;
+    }
+    content = authed ? <LazyDashboard /> : <LazyLoginPage />;
   }
 
-  if (publicRoute === "transfer") {
-    return (
-      <Suspense fallback={<FullScreenLoading />}>
-        <LazyPublicTransferPage />
-      </Suspense>
-    );
-  }
-
-  if (publicRoute === "diagram") {
-    return (
-      <Suspense fallback={<FullScreenLoading />}>
-        <LazyPublicDiagramPage />
-      </Suspense>
-    );
-  }
-
-  if (publicRoute === "diagram-embed") {
-    return (
-      <Suspense fallback={<FullScreenLoading />}>
-        <LazyDiagramEmbedPage />
-      </Suspense>
-    );
-  }
-
-  const canShowGuestShell = !ready && !tokenStore.valid() && !hasOidcCallback();
-  if (!ready && !canShowGuestShell) {
-    return <FullScreenLoading />;
-  }
   return (
-    <Suspense fallback={<FullScreenLoading />}>
-      {authed ? <LazyDashboard /> : <LazyLoginPage />}
-    </Suspense>
+    <>
+      <Suspense fallback={<FullScreenLoading />}>{content}</Suspense>
+      <AuthDialog />
+    </>
   );
 }
 
