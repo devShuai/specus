@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -231,6 +232,9 @@ public sealed class TransferAttachmentService
 
     public async Task ExpireOldAsync(CancellationToken cancellationToken)
     {
+        await _db.TransferAttachmentDownloadGrants
+            .Where(grant => grant.ExpiresAt < DateTimeOffset.UtcNow)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
         while (!cancellationToken.IsCancellationRequested)
         {
             var now = DateTimeOffset.UtcNow;
@@ -272,7 +276,6 @@ public sealed class TransferAttachmentService
             cancellationToken).ConfigureAwait(false);
         var sha256 = NormalizeSha256(request.Sha256);
         var now = DateTimeOffset.UtcNow;
-        var uploadExpiresAt = now.AddSeconds(_options.UploadUrlTtlSeconds);
         var expiresAt = now.AddHours(Math.Max(1L, _options.RetentionHours));
         for (var attempt = 0; attempt < 8; attempt++)
         {
@@ -298,13 +301,14 @@ public sealed class TransferAttachmentService
                 Status = StatusPending,
                 CreatedAt = now,
                 UpdatedAt = now,
-                UploadExpiresAt = uploadExpiresAt,
                 ExpiresAt = expiresAt,
             };
             attachment.ObjectKey = ObjectKey(scope, id, fileName, now);
             _storage.ValidateObjectKey(attachment.ObjectKey);
             var upload = _storage.PresignUpload(attachment.ObjectKey, mimeType,
                 TimeSpan.FromSeconds(_options.UploadUrlTtlSeconds));
+            attachment.UploadExpiresAt = DateTimeOffset.Parse(upload.ExpiresAt,
+                CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
             _db.TransferAttachments.Add(attachment);
             try
             {
@@ -331,7 +335,7 @@ public sealed class TransferAttachmentService
         try
         {
             return await CompleteWithinQuotaAsync(attachment, tenantId, ownerUsername,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, false).ConfigureAwait(false);
         }
         finally
         {
@@ -340,9 +344,14 @@ public sealed class TransferAttachmentService
     }
 
     private async Task<TransferAttachmentView> CompleteWithinQuotaAsync(TransferAttachment attachment,
-        string tenantId, string ownerUsername, CancellationToken cancellationToken)
+        string tenantId, string ownerUsername, CancellationToken cancellationToken,
+        bool objectVerifiedByCallback)
     {
         var now = DateTimeOffset.UtcNow;
+        if (attachment.Status == StatusUploaded)
+        {
+            return ToView(attachment);
+        }
         if (attachment.Status != StatusPending)
         {
             throw new InvalidOperationException("attachment is not pending");
@@ -351,7 +360,7 @@ public sealed class TransferAttachmentService
         {
             throw new InvalidOperationException("attachment upload URL is expired");
         }
-        if (_storage.Enabled)
+        if (_storage.Enabled && !objectVerifiedByCallback)
         {
             var stat = await _storage.StatAsync(attachment.ObjectKey, cancellationToken).ConfigureAwait(false);
             if (!stat.Exists)
@@ -388,6 +397,74 @@ public sealed class TransferAttachmentService
         return ToView(attachment);
     }
 
+    public async Task<TransferAttachmentView> CompleteUploadCallbackAsync(string requestTarget,
+        byte[] body, string? authorization, string? publicKeyUrl,
+        CancellationToken cancellationToken)
+    {
+        if (!await _storage.VerifyUploadCallbackAsync(requestTarget, body, authorization,
+                publicKeyUrl, cancellationToken).ConfigureAwait(false))
+        {
+            throw new UnauthorizedAccessException("invalid OSS upload callback signature");
+        }
+        OssUploadCallback? callback;
+        try
+        {
+            callback = JsonSerializer.Deserialize<OssUploadCallback>(body,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+        catch (JsonException exception)
+        {
+            throw new ArgumentException("invalid OSS upload callback body", exception);
+        }
+        if (callback is null || string.IsNullOrWhiteSpace(callback.Bucket)
+            || string.IsNullOrWhiteSpace(callback.Object) || callback.Size is null
+            || callback.Size < 0)
+        {
+            throw new ArgumentException("invalid OSS upload callback body");
+        }
+        if (!string.Equals(callback.Bucket, _options.Bucket, StringComparison.Ordinal))
+        {
+            throw new UnauthorizedAccessException("OSS callback bucket mismatch");
+        }
+        var objectKey = callback.Object.Trim();
+        _storage.ValidateObjectKey(objectKey);
+        var attachment = await _db.TransferAttachments
+            .FirstOrDefaultAsync(row => row.ObjectKey == objectKey, cancellationToken)
+            .ConfigureAwait(false)
+            ?? throw new ArgumentException("attachment object was not allocated");
+        if (!string.Equals(attachment.ObjectKey, objectKey, StringComparison.Ordinal))
+        {
+            throw new UnauthorizedAccessException("OSS callback object mismatch");
+        }
+        if (attachment.Status == StatusUploaded)
+        {
+            return ToView(attachment);
+        }
+        if (attachment.Status != StatusPending)
+        {
+            throw new InvalidOperationException("attachment is not pending");
+        }
+        if (callback.Size > _options.MaxAttachmentBytes)
+        {
+            await _storage.DeleteAsync(objectKey, cancellationToken).ConfigureAwait(false);
+            throw new ArgumentException("attachment is too large");
+        }
+        attachment.SizeBytes = callback.Size.Value;
+        var tenantId = RequireAccountText(attachment.TenantId, "tenantId");
+        var ownerUsername = RequireAccountText(attachment.OwnerUsername, "ownerUsername");
+        var quotaLock = QuotaLock(tenantId, ownerUsername);
+        await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await CompleteWithinQuotaAsync(attachment, tenantId, ownerUsername,
+                cancellationToken, true).ConfigureAwait(false);
+        }
+        finally
+        {
+            quotaLock.Release();
+        }
+    }
+
     private async Task<PresignDownloadResponse> CreateDownloadAsync(ManagementContext context,
         TransferAttachment attachment, CancellationToken cancellationToken)
     {
@@ -398,6 +475,10 @@ public sealed class TransferAttachmentService
         if (attachment.ExpiresAt < DateTimeOffset.UtcNow)
         {
             throw new InvalidOperationException("attachment is expired");
+        }
+        if (!_storage.Enabled)
+        {
+            throw new InvalidOperationException("object storage is not configured");
         }
         var tenantId = RequireAccountText(context.TenantId, "tenantId");
         var username = RequireAccountText(context.Username, "username");
@@ -415,13 +496,109 @@ public sealed class TransferAttachmentService
                 _options.PerUserMonthlyDownloadQuotaBytes,
                 "本月 OSS 下载流量额度不足");
 
-            var download = _storage.PresignDownload(attachment.ObjectKey,
-                TimeSpan.FromSeconds(_options.DownloadUrlTtlSeconds));
-            await RecordDownloadUsageAsync(tenantId, username, usageMonth, attachment,
+            var (grant, token) = await CreateDownloadGrantAsync(tenantId, username, attachment.Id,
                 cancellationToken).ConfigureAwait(false);
             return new PresignDownloadResponse(attachment.Id,
-                attachment.Id.ToString(CultureInfo.InvariantCulture), download.Url, download.Headers,
-                download.ExpiresAt, ToView(attachment));
+                attachment.Id.ToString(CultureInfo.InvariantCulture),
+                "/api/public/transfer/downloads/" + token,
+                new Dictionary<string, string>(), grant.ExpiresAt.ToString("O"), ToView(attachment));
+        }
+        finally
+        {
+            quotaLock.Release();
+        }
+    }
+
+    private async Task<(TransferAttachmentDownloadGrant Grant, string Token)> CreateDownloadGrantAsync(
+        string tenantId, string username, long attachmentId, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var expiresAt = now.AddSeconds(Math.Max(1L, _options.DownloadUrlTtlSeconds));
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+            var grant = new TransferAttachmentDownloadGrant
+            {
+                Id = ClientIdGenerator.NewId(),
+                TokenHash = RoomTokenHash(token),
+                TenantId = tenantId,
+                Username = username,
+                AttachmentId = attachmentId,
+                CreatedAt = now,
+                ExpiresAt = expiresAt,
+            };
+            _db.TransferAttachmentDownloadGrants.Add(grant);
+            try
+            {
+                await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                return (grant, token);
+            }
+            catch (DbUpdateException) when (attempt < 7)
+            {
+                _db.Entry(grant).State = EntityState.Detached;
+            }
+        }
+        throw new InvalidOperationException("failed to allocate download grant");
+    }
+
+    public async Task<string?> ConsumeDownloadGrantAsync(string? token,
+        CancellationToken cancellationToken)
+    {
+        token = token?.Trim();
+        if (string.IsNullOrEmpty(token) || token.Length > 512)
+        {
+            return null;
+        }
+        var tokenHash = RoomTokenHash(token);
+        var now = DateTimeOffset.UtcNow;
+        var grant = await _db.TransferAttachmentDownloadGrants.AsNoTracking()
+            .FirstOrDefaultAsync(row => row.TokenHash == tokenHash, cancellationToken)
+            .ConfigureAwait(false);
+        if (grant is null || grant.ConsumedAt is not null || grant.ExpiresAt <= now)
+        {
+            return null;
+        }
+        var attachment = await _db.TransferAttachments.AsNoTracking()
+            .FirstOrDefaultAsync(row => row.Id == grant.AttachmentId, cancellationToken)
+            .ConfigureAwait(false);
+        if (attachment is null || attachment.Status != StatusUploaded || attachment.ExpiresAt <= now
+            || !_storage.Enabled)
+        {
+            return null;
+        }
+        var quotaLock = QuotaLock(grant.TenantId, grant.Username);
+        await quotaLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var usageMonth = now.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+            var usedBytes = await _db.TransferAttachmentDownloadUsages.AsNoTracking()
+                .Where(usage => usage.TenantId == grant.TenantId && usage.Username == grant.Username
+                    && usage.UsageMonth == usageMonth)
+                .SumAsync(usage => (long?)usage.SizeBytes, cancellationToken)
+                .ConfigureAwait(false) ?? 0L;
+            EnsureWithinQuota(usedBytes, attachment.SizeBytes,
+                _options.PerUserMonthlyDownloadQuotaBytes,
+                "本月 OSS 下载流量额度不足");
+            var direct = _storage.PresignDownload(attachment.ObjectKey,
+                TimeSpan.FromSeconds(_options.DownloadObjectUrlTtlSeconds),
+                grant.Id.ToString(CultureInfo.InvariantCulture));
+            await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var consumed = await _db.TransferAttachmentDownloadGrants
+                .Where(row => row.Id == grant.Id && row.TokenHash == tokenHash
+                    && row.ConsumedAt == null && row.ExpiresAt > now)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(row => row.ConsumedAt, now),
+                    cancellationToken).ConfigureAwait(false);
+            if (consumed != 1)
+            {
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                return null;
+            }
+            await RecordDownloadUsageAsync(grant.TenantId, grant.Username, usageMonth, attachment,
+                cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return direct.Url;
         }
         finally
         {
@@ -735,3 +912,5 @@ public sealed record PresignUploadResponse(long AttachmentId, string ObjectId, s
 public sealed record PresignDownloadResponse(long AttachmentId, string ObjectId, string DownloadUrl,
     IReadOnlyDictionary<string, string> DownloadHeaders, string ExpiresAt,
     TransferAttachmentView Attachment);
+public sealed record OssUploadCallback(string? Bucket, string? Object, long? Size,
+    string? MimeType, string? ETag);

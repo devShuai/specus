@@ -13,6 +13,8 @@ public interface TransferAttachmentRepository extends JpaRepository<TransferAtta
 
     Optional<TransferAttachment> findByIdAndTenantIdAndScope(Long id, String tenantId, String scope);
 
+    Optional<TransferAttachment> findByObjectKey(String objectKey);
+
     long countByScopeAndPublicTransferRoomIdAndStatus(String scope, Long publicTransferRoomId, String status);
 
     @Query("""

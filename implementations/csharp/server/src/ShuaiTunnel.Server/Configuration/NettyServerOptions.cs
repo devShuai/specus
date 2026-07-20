@@ -197,12 +197,15 @@ public sealed class ObjectStorageOptions
 
     public string Provider { get; set; } = "disabled";
     public string Endpoint { get; set; } = string.Empty;
+    public string Region { get; set; } = string.Empty;
     public string Bucket { get; set; } = string.Empty;
     public string AccessKeyId { get; set; } = string.Empty;
     public string AccessKeySecret { get; set; } = string.Empty;
     public string ObjectPrefix { get; set; } = "shuai-tunnel/attachments";
+    public string UploadCallbackUrl { get; set; } = string.Empty;
     public long UploadUrlTtlSeconds { get; set; } = 900;
     public long DownloadUrlTtlSeconds { get; set; } = 600;
+    public long DownloadObjectUrlTtlSeconds { get; set; } = 30;
     public long RetentionHours { get; set; } = 72;
     public long MaxAttachmentBytes { get; set; } = 512L * 1024 * 1024;
     public long PerUserStorageQuotaBytes { get; set; } = 1024L * 1024 * 1024;

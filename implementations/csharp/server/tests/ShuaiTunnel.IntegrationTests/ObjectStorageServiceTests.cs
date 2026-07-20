@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -11,6 +13,101 @@ namespace ShuaiTunnel.IntegrationTests;
 
 public sealed class ObjectStorageServiceTests
 {
+    [Fact]
+    public void PresignedDownloadUsesV4AndSignsGrantMarker()
+    {
+        using var client = new HttpClient(new RecordingHandler(
+            new HttpResponseMessage(HttpStatusCode.OK)));
+        var storage = new AliyunOssObjectStorageService(new ObjectStorageOptions
+        {
+            Provider = "aliyun-oss",
+            Endpoint = "https://oss-cn-hangzhou.aliyuncs.com",
+            Bucket = "examplebucket",
+            AccessKeyId = "test-access-key",
+            AccessKeySecret = "test-secret-key",
+            ObjectPrefix = "prefix",
+        }, client, new FixedTimeProvider(DateTimeOffset.Parse("2024-12-03T03:44:20Z")));
+
+        var result = storage.PresignDownload("prefix/example.txt", TimeSpan.FromSeconds(600),
+            "grant-123");
+
+        Assert.Contains("x-oss-signature-version=OSS4-HMAC-SHA256", result.Url,
+            StringComparison.Ordinal);
+        Assert.Contains("x-oss-credential=test-access-key%2F20241203%2Fcn-hangzhou%2Foss%2Faliyun_v4_request",
+            result.Url, StringComparison.Ordinal);
+        Assert.Contains("x-oss-date=20241203T034420Z", result.Url, StringComparison.Ordinal);
+        Assert.Contains("x-oss-expires=600", result.Url, StringComparison.Ordinal);
+        Assert.Contains("x-st-grant=grant-123", result.Url, StringComparison.Ordinal);
+        Assert.Contains("x-oss-signature=c2fae9c2ac1a8e6ec5d0ef73e0ac015f40deaf92c3ec5626139a7cacb71225ac",
+            result.Url, StringComparison.Ordinal);
+        Assert.DoesNotContain("OSSAccessKeyId=", result.Url, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PresignedUploadIncludesSignedOssCallbackHeader()
+    {
+        using var client = new HttpClient(new RecordingHandler(
+            new HttpResponseMessage(HttpStatusCode.OK)));
+        var storage = new AliyunOssObjectStorageService(new ObjectStorageOptions
+        {
+            Provider = "aliyun-oss",
+            Endpoint = "https://oss-cn-hangzhou.aliyuncs.com",
+            Bucket = "examplebucket",
+            AccessKeyId = "test-access-key",
+            AccessKeySecret = "test-secret-key",
+            ObjectPrefix = "prefix",
+            UploadCallbackUrl = "https://tunnel.example/api/public/transfer/oss-callback",
+        }, client, TimeProvider.System);
+
+        var result = storage.PresignUpload("prefix/example.txt", "text/plain",
+            TimeSpan.FromMinutes(10));
+
+        var encoded = result.Headers["x-oss-callback"];
+        using var callback = JsonDocument.Parse(Convert.FromBase64String(encoded));
+        Assert.Equal("https://tunnel.example/api/public/transfer/oss-callback",
+            callback.RootElement.GetProperty("callbackUrl").GetString());
+        Assert.Equal("application/json",
+            callback.RootElement.GetProperty("callbackBodyType").GetString());
+        Assert.True(callback.RootElement.GetProperty("callbackSNI").GetBoolean());
+        Assert.Contains("${object}", callback.RootElement.GetProperty("callbackBody").GetString(),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task OssUploadCallbackVerificationUsesPinnedAliyunPublicKeyHost()
+    {
+        using var key = RSA.Create(2048);
+        var publicKey = key.ExportSubjectPublicKeyInfoPem();
+        var handler = new RecordingHandler(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(publicKey, Encoding.ASCII, "application/x-pem-file"),
+        });
+        using var client = new HttpClient(handler);
+        var storage = new AliyunOssObjectStorageService(new ObjectStorageOptions
+        {
+            Provider = "aliyun-oss",
+            Endpoint = "https://oss-cn-hangzhou.aliyuncs.com",
+            Bucket = "examplebucket",
+            AccessKeyId = "test-access-key",
+            AccessKeySecret = "test-secret-key",
+            ObjectPrefix = "prefix",
+            UploadCallbackUrl = "https://tunnel.example/api/public/transfer/oss-callback",
+        }, client, TimeProvider.System);
+        const string target = "/api/public/transfer/oss-callback";
+        var body = Encoding.UTF8.GetBytes("{\"bucket\":\"examplebucket\"}");
+        var signature = Convert.ToBase64String(key.SignData(
+            Encoding.UTF8.GetBytes(target + "\n" + Encoding.UTF8.GetString(body)),
+            HashAlgorithmName.MD5, RSASignaturePadding.Pkcs1));
+        var publicKeyUrl = Convert.ToBase64String(Encoding.UTF8.GetBytes(
+            "http://gosspublic.alicdn.com/callback_pub_key_v1.pem"));
+
+        Assert.True(await storage.VerifyUploadCallbackAsync(target, body, signature, publicKeyUrl,
+            CancellationToken.None));
+        Assert.False(await storage.VerifyUploadCallbackAsync(target, body, signature + "invalid",
+            publicKeyUrl, CancellationToken.None));
+        Assert.Equal(1, handler.RequestCount);
+    }
+
     [Fact]
     public void OssHttpClientHandlerDisablesAutomaticRedirects()
     {
@@ -123,6 +220,47 @@ public sealed class ObjectStorageServiceTests
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
     }
 
+    [Fact]
+    public async Task UnknownOneTimeDownloadGrantIsAnonymousAndGone()
+    {
+        var storage = new EndpointStorage();
+        await using var fixture = await StartEndpointFixtureAsync(storage, maxAttachmentBytes: 100);
+        using var client = fixture.CreateClient();
+
+        using var response = await client.GetAsync(
+            "/api/public/transfer/downloads/not-a-real-token");
+
+        Assert.Equal(HttpStatusCode.Gone, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task OneTimeDownloadGrantRejectsHeadWithoutConsumingIt()
+    {
+        var storage = new EndpointStorage();
+        await using var fixture = await StartEndpointFixtureAsync(storage, maxAttachmentBytes: 100);
+        using var client = fixture.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Head,
+            "/api/public/transfer/downloads/not-a-real-token");
+
+        using var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+        Assert.Contains("GET", response.Content.Headers.Allow);
+    }
+
+    [Fact]
+    public async Task OssUploadCallbackIsAnonymousButRejectsInvalidSignature()
+    {
+        var storage = new EndpointStorage();
+        await using var fixture = await StartEndpointFixtureAsync(storage, maxAttachmentBytes: 100);
+        using var client = fixture.CreateClient();
+
+        using var response = await client.PostAsJsonAsync(
+            "/api/public/transfer/oss-callback", new { });
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
     private static Task<TestServerFixture> StartEndpointFixtureAsync(EndpointStorage storage,
         long maxAttachmentBytes) => TestServerFixture.StartAsync(
         new Dictionary<string, string?>
@@ -170,12 +308,18 @@ public sealed class ObjectStorageServiceTests
         {
             Provider = "aliyun-oss",
             Endpoint = "https://oss.example.com",
+            Region = "cn-hangzhou",
             Bucket = "bucket",
             AccessKeyId = "access-key",
             AccessKeySecret = "access-secret",
             ObjectPrefix = "attachments",
         }),
         new SingleClientFactory(client));
+
+    private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => value;
+    }
 
     private sealed class SingleClientFactory(HttpClient client) : IHttpClientFactory
     {

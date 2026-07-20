@@ -12,6 +12,8 @@ import org.springframework.stereotype.Component;
 @ConfigurationProperties(prefix = "tunnel.auth")
 public class AuthProperties {
     private boolean passwordLoginEnabled = true;
+    /** Allow visitors to self-register USER-role accounts in the default tenant. */
+    private boolean registrationEnabled = true;
     private String username = "admin";
     private String password = "admin";
     /** Default tenant used by local password-login and existing default-tenant data. */
@@ -26,6 +28,14 @@ public class AuthProperties {
 
     public void setPasswordLoginEnabled(boolean passwordLoginEnabled) {
         this.passwordLoginEnabled = passwordLoginEnabled;
+    }
+
+    public boolean isRegistrationEnabled() {
+        return registrationEnabled;
+    }
+
+    public void setRegistrationEnabled(boolean registrationEnabled) {
+        this.registrationEnabled = registrationEnabled;
     }
 
     public String getUsername() {

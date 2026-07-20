@@ -136,6 +136,18 @@ type TransferAttachment struct {
 	UploadedAt      *time.Time
 }
 
+// TransferAttachmentDownloadGrant stores only the hash of a single-use download token.
+type TransferAttachmentDownloadGrant struct {
+	ID           int64
+	TokenHash    string
+	TenantID     string
+	Username     string
+	AttachmentID int64
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+	ConsumedAt   *time.Time
+}
+
 // ClientIdentity mirrors tunnel_client_identity.
 type ClientIdentity struct {
 	ID                 int64

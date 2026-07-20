@@ -45,6 +45,9 @@ public sealed class TunnelEnvironmentVariablesTests
             ["TUNNEL_PEER_MESH_TURN_SHARED_SECRET"] = "test-secret",
             ["TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS"] = "3600",
             ["TUNNEL_OBJECT_STORAGE_PROVIDER"] = "aliyun-oss",
+            ["TUNNEL_OBJECT_STORAGE_REGION"] = "cn-shanghai",
+            ["TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL"] = "https://tunnel.example/api/public/transfer/oss-callback",
+            ["TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS"] = "45",
             ["TUNNEL_OBJECT_STORAGE_PREFIX"] = "files",
             ["TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES"] = "1073741824",
             ["TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES"] = "1073741824",
@@ -92,6 +95,10 @@ public sealed class TunnelEnvironmentVariablesTests
         Assert.Equal("test-secret", mapped["Tunnel:PeerMesh:TurnSharedSecret"]);
         Assert.Equal("3600", mapped["Tunnel:PeerMesh:TurnCredentialTtlSeconds"]);
         Assert.Equal("aliyun-oss", mapped["Tunnel:ObjectStorage:Provider"]);
+        Assert.Equal("cn-shanghai", mapped["Tunnel:ObjectStorage:Region"]);
+        Assert.Equal("https://tunnel.example/api/public/transfer/oss-callback",
+            mapped["Tunnel:ObjectStorage:UploadCallbackUrl"]);
+        Assert.Equal("45", mapped["Tunnel:ObjectStorage:DownloadObjectUrlTtlSeconds"]);
         Assert.Equal("files", mapped["Tunnel:ObjectStorage:ObjectPrefix"]);
         Assert.Equal("1073741824", mapped["Tunnel:ObjectStorage:PerUserStorageQuotaBytes"]);
         Assert.Equal("1073741824", mapped["Tunnel:ObjectStorage:PerUserMonthlyDownloadQuotaBytes"]);

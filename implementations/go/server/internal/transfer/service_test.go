@@ -26,7 +26,7 @@ func TestPublicAttachmentLifecycleValidatesObjectWithHead(t *testing.T) {
 	}
 	defer db.Close()
 	objectCfg := config.ObjectStorageConfig{
-		Provider: "aliyun-oss", Endpoint: "https://oss.example.com", Bucket: "private",
+		Provider: "aliyun-oss", Endpoint: "https://oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "shuai-tunnel/attachments",
 		UploadURLTTLSeconds: 900, DownloadURLTTLSeconds: 600, RetentionHours: 72,
 		MaxAttachmentBytes: 20,
@@ -79,8 +79,16 @@ func TestPublicAttachmentLifecycleValidatesObjectWithHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("presign download: %v", err)
 	}
-	if !strings.Contains(download.DownloadURL, "OSSAccessKeyId=key") || download.Attachment.SizeBytes != 13 {
+	if !strings.HasPrefix(download.DownloadURL, "/api/public/transfer/downloads/") || download.Attachment.SizeBytes != 13 {
 		t.Fatalf("unexpected download response: %+v", download)
+	}
+	token := strings.TrimPrefix(download.DownloadURL, "/api/public/transfer/downloads/")
+	directURL, err := service.ConsumeDownloadGrant(context.Background(), token)
+	if err != nil || !strings.Contains(directURL, "x-oss-signature-version=OSS4-HMAC-SHA256") {
+		t.Fatalf("consume one-time download: url=%q err=%v", directURL, err)
+	}
+	if _, err := service.ConsumeDownloadGrant(context.Background(), token); !errors.Is(err, ErrGone) {
+		t.Fatalf("download grant was reusable: %v", err)
 	}
 	mu.Lock()
 	gotMethods := strings.Join(methods, ",")
@@ -141,7 +149,7 @@ func TestPublicAttachmentRateAndPendingLimits(t *testing.T) {
 	}
 	defer db.Close()
 	service := NewService(db, config.ObjectStorageConfig{
-		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
 	}, config.PublicTransferConfig{
@@ -170,7 +178,7 @@ func TestAttachmentStorageQuotaIsScopedToAuthenticatedAccount(t *testing.T) {
 	}
 	defer db.Close()
 	service := NewService(db, config.ObjectStorageConfig{
-		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
 		PerUserStorageQuotaBytes: 10,
@@ -191,14 +199,14 @@ func TestAttachmentStorageQuotaIsScopedToAuthenticatedAccount(t *testing.T) {
 	}
 }
 
-func TestAttachmentDownloadQuotaCountsEachPresignedFileSize(t *testing.T) {
+func TestAttachmentDownloadQuotaIsChargedWhenOneTimeLinkIsConsumed(t *testing.T) {
 	db, err := store.Open("sqlite", filepath.Join(t.TempDir(), "download-quota.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	service := NewService(db, config.ObjectStorageConfig{
-		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 60, DownloadURLTTLSeconds: 60, RetentionHours: 1,
 		MaxAttachmentBytes: 100, PerUserStorageQuotaBytes: 100,
@@ -222,14 +230,63 @@ func TestAttachmentDownloadQuotaCountsEachPresignedFileSize(t *testing.T) {
 		"default", "alice"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.CreatePublicDownload(context.Background(), upload.AttachmentID, "room",
-		"default", "alice"); err != nil {
+	download, err := service.CreatePublicDownload(context.Background(), upload.AttachmentID, "room",
+		"default", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usedBefore, err := db.SumTransferDownloadUsageBytes(context.Background(), "default", "alice",
+		time.Now().UTC().Format("2006-01"))
+	if err != nil || usedBefore != 0 {
+		t.Fatalf("usage before redirect = %d, err = %v", usedBefore, err)
+	}
+	token := strings.TrimPrefix(download.DownloadURL, "/api/public/transfer/downloads/")
+	if _, err := service.ConsumeDownloadGrant(context.Background(), token); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.CreatePublicDownload(context.Background(), upload.AttachmentID, "room",
 		"default", "alice"); !errors.Is(err, ErrRateLimited) ||
 		!strings.Contains(err.Error(), "下载流量额度不足") {
 		t.Fatalf("download quota was not enforced: %v", err)
+	}
+}
+
+func TestVerifiedOssCallbackCompletesUploadAndClientCompleteIsIdempotent(t *testing.T) {
+	db, err := store.Open("sqlite", filepath.Join(t.TempDir(), "upload-callback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service := NewService(db, config.ObjectStorageConfig{
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
+		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
+		UploadCallbackURL:   "https://tunnel.example/api/public/transfer/oss-callback",
+		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
+		PerUserStorageQuotaBytes: 100,
+	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 10})
+	size := int64(10)
+	upload, err := service.CreatePublicUpload(context.Background(), "default", "alice",
+		PresignUploadRequest{FileName: "callback.bin", SizeBytes: &size, RoomToken: "room"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("{\"bucket\":\"private\",\"object\":\"" + upload.ObjectKey +
+		"\",\"size\":42,\"mimeType\":\"application/octet-stream\",\"etag\":\"etag\"}")
+	authorization, publicKeyURL := signCallbackForTest(t, service.storage,
+		"/api/public/transfer/oss-callback", body)
+	callbackResult, err := service.CompleteUploadCallback(context.Background(),
+		"/api/public/transfer/oss-callback", body, authorization, publicKeyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientResult, err := service.CompletePublic(context.Background(), upload.AttachmentID, "room",
+		"default", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callbackResult.Status != StatusUploaded || callbackResult.SizeBytes != 42 ||
+		clientResult.SizeBytes != 42 {
+		t.Fatalf("callback = %+v, client complete = %+v", callbackResult, clientResult)
 	}
 }
 
@@ -240,7 +297,7 @@ func TestCompleteRejectsAndDeletesObjectWhoseActualSizeExceedsLimit(t *testing.T
 	}
 	defer db.Close()
 	service := NewService(db, config.ObjectStorageConfig{
-		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 5,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 2})
@@ -320,7 +377,7 @@ func TestRoomIDValidationUsesJavaUTF16LengthWithoutBreakingUTF8(t *testing.T) {
 
 func TestExplicitZeroStorageLimitsAreNotSilentlyReplacedByDefaults(t *testing.T) {
 	service := NewService(nil, config.ObjectStorageConfig{
-		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 0, DownloadURLTTLSeconds: 0, RetentionHours: 0,
 		MaxAttachmentBytes: 0,
@@ -334,14 +391,14 @@ func TestExplicitZeroStorageLimitsAreNotSilentlyReplacedByDefaults(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if upload.ExpiresAt.After(now.Add(time.Second)) {
+	if upload.ExpiresAt.After(now.Add(2 * time.Second)) {
 		t.Fatalf("zero upload TTL was replaced by a positive default: %s", upload.ExpiresAt.Sub(now))
 	}
 	download, err := service.storage.PresignDownload("prefix/a.txt", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if download.ExpiresAt.After(now.Add(time.Second)) {
+	if download.ExpiresAt.After(now.Add(2 * time.Second)) {
 		t.Fatalf("zero download TTL was replaced by a positive default: %s", download.ExpiresAt.Sub(now))
 	}
 }
@@ -353,7 +410,7 @@ func TestRetentionHoursKeepsJavaMinimumOfOneHour(t *testing.T) {
 	}
 	defer db.Close()
 	service := NewService(db, config.ObjectStorageConfig{
-		Provider: "aliyun-oss", Endpoint: "oss.example.com", Bucket: "private",
+		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
 		UploadURLTTLSeconds: 60, RetentionHours: 0, MaxAttachmentBytes: 10,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 2})

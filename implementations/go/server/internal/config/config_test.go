@@ -172,6 +172,9 @@ func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
 	t.Setenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET", "shared")
 	t.Setenv("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", "7200")
 	t.Setenv("TUNNEL_OBJECT_STORAGE_PROVIDER", "aliyun-oss")
+	t.Setenv("TUNNEL_OBJECT_STORAGE_REGION", "cn-shanghai")
+	t.Setenv("TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL", "https://tunnel.example/api/public/transfer/oss-callback")
+	t.Setenv("TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS", "45")
 	t.Setenv("TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", "12345")
 	t.Setenv("TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES", "23456")
 	t.Setenv("TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES", "34567")
@@ -186,7 +189,9 @@ func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
 		cfg.PeerMesh.TurnSharedSecret != "shared" || cfg.PeerMesh.TurnCredentialTTLSeconds != 7200 {
 		t.Fatalf("TURN env mapping mismatch: %+v", cfg.PeerMesh)
 	}
-	if cfg.ObjectStorage.Provider != "aliyun-oss" || cfg.ObjectStorage.MaxAttachmentBytes != 12345 ||
+	if cfg.ObjectStorage.Provider != "aliyun-oss" || cfg.ObjectStorage.Region != "cn-shanghai" ||
+		cfg.ObjectStorage.UploadCallbackURL != "https://tunnel.example/api/public/transfer/oss-callback" ||
+		cfg.ObjectStorage.DownloadObjectURLTTLSeconds != 45 || cfg.ObjectStorage.MaxAttachmentBytes != 12345 ||
 		cfg.ObjectStorage.PerUserStorageQuotaBytes != 23456 ||
 		cfg.ObjectStorage.PerUserMonthlyDownloadQuotaBytes != 34567 ||
 		cfg.PublicTransfer.MaxPendingUploadsPerRoom != 7 || cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 9 {
@@ -200,7 +205,8 @@ func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
 		cfg.PeerMesh.TurnCredentialTTLSeconds != 3600 {
 		t.Fatalf("TURN defaults mismatch: %+v", cfg.PeerMesh)
 	}
-	if cfg.ObjectStorage.Provider != "disabled" || cfg.ObjectStorage.MaxAttachmentBytes != 512*1024*1024 ||
+	if cfg.ObjectStorage.Provider != "disabled" || cfg.ObjectStorage.DownloadObjectURLTTLSeconds != 30 ||
+		cfg.ObjectStorage.MaxAttachmentBytes != 512*1024*1024 ||
 		cfg.ObjectStorage.PerUserStorageQuotaBytes != 1024*1024*1024 ||
 		cfg.ObjectStorage.PerUserMonthlyDownloadQuotaBytes != 1024*1024*1024 ||
 		cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 32 {

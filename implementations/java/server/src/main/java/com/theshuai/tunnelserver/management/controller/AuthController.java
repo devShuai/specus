@@ -1,5 +1,6 @@
 package com.theshuai.tunnelserver.management.controller;
 
+import com.theshuai.tunnelserver.config.AuthProperties;
 import com.theshuai.tunnelserver.management.model.ManagementRole;
 import com.theshuai.tunnelserver.management.service.ManagementUserService;
 import com.theshuai.tunnelserver.management.service.ManagementUserService.LoginUser;
@@ -24,11 +25,14 @@ import java.util.Map;
 public class AuthController {
     private final LocalTokenService localTokenService;
     private final ManagementUserService managementUserService;
+    private final AuthProperties authProperties;
 
     public AuthController(LocalTokenService localTokenService,
-                          ManagementUserService managementUserService) {
+                          ManagementUserService managementUserService,
+                          AuthProperties authProperties) {
         this.localTokenService = localTokenService;
         this.managementUserService = managementUserService;
+        this.authProperties = authProperties;
     }
 
     @PostMapping("/auth/login")
@@ -40,6 +44,22 @@ public class AuthController {
                 .<ResponseEntity<?>>map(user -> ResponseEntity.ok(buildTokenBody(user)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                         .body(Map.of("error", "用户名或密码错误")));
+    }
+
+    /**
+     * 自助注册：创建默认租户的 USER 账号并直接签发 token 完成登录。
+     * 需要 {@code tunnel.auth.registration-enabled} 且密码登录开启。
+     */
+    @PostMapping("/auth/register")
+    public ResponseEntity<?> register(@RequestBody(required = false) LoginRequest request) {
+        if (!authProperties.isRegistrationEnabled() || !localTokenService.isPasswordLoginEnabled()) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "当前未开放注册"));
+        }
+        if (request == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "请求体无效"));
+        }
+        LoginUser user = managementUserService.registerUser(request.username(), request.password());
+        return ResponseEntity.ok(buildTokenBody(user));
     }
 
     /**

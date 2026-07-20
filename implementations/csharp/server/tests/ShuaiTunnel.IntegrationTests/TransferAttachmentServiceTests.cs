@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using System.Text;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
@@ -50,7 +51,12 @@ public sealed class TransferAttachmentServiceTests
 
         var download = await fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
             new PresignDownloadRequest("secret"), CancellationToken.None);
-        Assert.Equal("https://storage.test/download", download.DownloadUrl);
+        Assert.StartsWith("/api/public/transfer/downloads/", download.DownloadUrl,
+            StringComparison.Ordinal);
+        var token = download.DownloadUrl["/api/public/transfer/downloads/".Length..];
+        Assert.Equal("https://storage.test/download", await fixture.Service
+            .ConsumeDownloadGrantAsync(token, CancellationToken.None));
+        Assert.Null(await fixture.Service.ConsumeDownloadGrantAsync(token, CancellationToken.None));
     }
 
     [Fact]
@@ -85,7 +91,7 @@ public sealed class TransferAttachmentServiceTests
     }
 
     [Fact]
-    public async Task DownloadQuotaCountsEachPresignedFileSize()
+    public async Task DownloadQuotaIsChargedWhenOneTimeLinkIsConsumed()
     {
         await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100,
             storageQuotaBytes: 100, monthlyDownloadQuotaBytes: 10);
@@ -94,14 +100,40 @@ public sealed class TransferAttachmentServiceTests
         fixture.Storage.Stat = new ObjectStat(true, 6);
         _ = await fixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
             new CompleteAttachmentRequest("secret"), CancellationToken.None);
-        _ = await fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
+        var firstDownload = await fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
             new PresignDownloadRequest("secret"), CancellationToken.None);
+        Assert.Empty(fixture.Db.TransferAttachmentDownloadUsages);
+        var token = firstDownload.DownloadUrl["/api/public/transfer/downloads/".Length..];
+        _ = await fixture.Service.ConsumeDownloadGrantAsync(token, CancellationToken.None);
 
         var error = await Assert.ThrowsAsync<RateLimitedException>(() =>
             fixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
                 new PresignDownloadRequest("secret"), CancellationToken.None));
         Assert.Contains("下载流量额度不足", error.Message, StringComparison.Ordinal);
         Assert.Single(fixture.Db.TransferAttachmentDownloadUsages);
+    }
+
+    [Fact]
+    public async Task VerifiedOssCallbackCompletesUploadAndClientCompleteIsIdempotent()
+    {
+        await using var fixture = await AttachmentFixture.CreateAsync(maxBytes: 100);
+        var upload = await fixture.Service.CreatePublicUploadAsync(Account, new PresignUploadRequest(
+            "callback.bin", null, 10, null, "room", "secret", null), CancellationToken.None);
+        fixture.Storage.CallbackValid = true;
+        var body = Encoding.UTF8.GetBytes($$"""
+            {"bucket":"bucket","object":"{{upload.ObjectKey}}","size":42,"mimeType":"application/octet-stream","etag":"etag"}
+            """);
+
+        var callbackResult = await fixture.Service.CompleteUploadCallbackAsync(
+            "/api/public/transfer/oss-callback", body, "signature", "public-key-url",
+            CancellationToken.None);
+        var clientResult = await fixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
+            new CompleteAttachmentRequest("secret"), CancellationToken.None);
+
+        Assert.Equal(TransferAttachmentService.StatusUploaded, callbackResult.Status);
+        Assert.Equal(42, callbackResult.SizeBytes);
+        Assert.Equal(42, clientResult.SizeBytes);
+        Assert.Equal(0, fixture.Storage.StatCalls);
     }
 
     [Fact]
@@ -162,7 +194,7 @@ public sealed class TransferAttachmentServiceTests
     }
 
     [Fact]
-    public async Task ZeroPresignTtlIsPassedThroughLikeJava()
+    public async Task ZeroGrantTtlClampsAndDirectUrlUsesDedicatedTtl()
     {
         await using (var uploadFixture = await AttachmentFixture.CreateAsync(
                          maxBytes: 100, uploadTtlSeconds: 0))
@@ -178,9 +210,14 @@ public sealed class TransferAttachmentServiceTests
             "zero-download.bin", null, 10, null, "room", "secret", null), CancellationToken.None);
         _ = await downloadFixture.Service.CompletePublicAsync(Account, upload.AttachmentId,
             new CompleteAttachmentRequest("secret"), CancellationToken.None);
-        _ = await downloadFixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
+        var before = DateTimeOffset.UtcNow;
+        var download = await downloadFixture.Service.CreatePublicDownloadAsync(Account, upload.AttachmentId,
             new PresignDownloadRequest("secret"), CancellationToken.None);
-        Assert.Equal(TimeSpan.Zero, downloadFixture.Storage.LastDownloadTtl);
+        var expiresAt = DateTimeOffset.Parse(download.ExpiresAt);
+        Assert.InRange(expiresAt, before, before.AddSeconds(2));
+        var token = download.DownloadUrl["/api/public/transfer/downloads/".Length..];
+        _ = await downloadFixture.Service.ConsumeDownloadGrantAsync(token, CancellationToken.None);
+        Assert.Equal(TimeSpan.FromSeconds(30), downloadFixture.Storage.LastDownloadTtl);
     }
 
     private sealed class AttachmentFixture : IAsyncDisposable
@@ -224,6 +261,7 @@ public sealed class TransferAttachmentServiceTests
                 PerUserMonthlyDownloadQuotaBytes = monthlyDownloadQuotaBytes,
                 UploadUrlTtlSeconds = uploadTtlSeconds,
                 DownloadUrlTtlSeconds = downloadTtlSeconds,
+                DownloadObjectUrlTtlSeconds = 30,
             });
             var service = new TransferAttachmentService(db, storage, objectOptions,
                 Options.Create(new PublicTransferOptions()));
@@ -244,6 +282,8 @@ public sealed class TransferAttachmentServiceTests
         public List<string> DeletedKeys { get; } = [];
         public TimeSpan? LastUploadTtl { get; private set; }
         public TimeSpan? LastDownloadTtl { get; private set; }
+        public bool CallbackValid { get; set; }
+        public int StatCalls { get; private set; }
 
         public void ValidateObjectKey(string objectKey)
         {
@@ -267,7 +307,17 @@ public sealed class TransferAttachmentServiceTests
         }
 
         public Task<ObjectStat> StatAsync(string objectKey, CancellationToken cancellationToken) =>
-            Task.FromResult(Stat);
+            Task.FromResult(RecordStatCall());
+
+        public Task<bool> VerifyUploadCallbackAsync(string requestTarget, byte[] body,
+            string? authorization, string? publicKeyUrl, CancellationToken cancellationToken) =>
+            Task.FromResult(CallbackValid);
+
+        private ObjectStat RecordStatCall()
+        {
+            StatCalls++;
+            return Stat;
+        }
 
         public Task DeleteAsync(string objectKey, CancellationToken cancellationToken)
         {

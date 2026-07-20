@@ -152,6 +152,22 @@ CREATE INDEX IF NOT EXISTS idx_attachment_download_usage_account_month
 CREATE INDEX IF NOT EXISTS idx_attachment_download_usage_attachment
   ON transfer_attachment_download_usage (attachment_id, created_at);
 
+CREATE TABLE IF NOT EXISTS transfer_attachment_download_grant (
+  id INTEGER PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  tenant_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  attachment_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachment_download_grant_attachment
+  ON transfer_attachment_download_grant (attachment_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_attachment_download_grant_expiry
+  ON transfer_attachment_download_grant (expires_at, consumed_at);
+
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT,

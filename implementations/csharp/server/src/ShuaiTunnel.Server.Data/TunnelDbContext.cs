@@ -35,6 +35,8 @@ public sealed class TunnelDbContext : DbContext
     public DbSet<TransferAttachment> TransferAttachments => Set<TransferAttachment>();
     public DbSet<TransferAttachmentDownloadUsage> TransferAttachmentDownloadUsages =>
         Set<TransferAttachmentDownloadUsage>();
+    public DbSet<TransferAttachmentDownloadGrant> TransferAttachmentDownloadGrants =>
+        Set<TransferAttachmentDownloadGrant>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -545,6 +547,28 @@ public sealed class TunnelDbContext : DbContext
                 .HasDatabaseName("idx_attachment_download_usage_account_month");
             b.HasIndex(x => new { x.AttachmentId, x.CreatedAt })
                 .HasDatabaseName("idx_attachment_download_usage_attachment");
+        });
+
+        modelBuilder.Entity<TransferAttachmentDownloadGrant>(b =>
+        {
+            b.ToTable("transfer_attachment_download_grant");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
+            b.Property(x => x.TokenHash).HasColumnName("token_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.AttachmentId).HasColumnName("attachment_id").IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ConsumedAt).HasColumnName("consumed_at").HasMaxLength(40)
+                .HasConversion(isoNullable);
+            b.HasIndex(x => x.TokenHash).IsUnique();
+            b.HasIndex(x => new { x.AttachmentId, x.CreatedAt })
+                .HasDatabaseName("idx_attachment_download_grant_attachment");
+            b.HasIndex(x => new { x.ExpiresAt, x.ConsumedAt })
+                .HasDatabaseName("idx_attachment_download_grant_expiry");
         });
     }
 }

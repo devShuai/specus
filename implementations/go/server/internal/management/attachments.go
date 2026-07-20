@@ -3,6 +3,7 @@ package management
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -10,6 +11,46 @@ import (
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
 )
+
+func (a *API) handlePublicAttachmentUploadCallback(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeError(w, http.StatusRequestEntityTooLarge, "OSS 回调请求体过大")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "OSS 回调请求体无效")
+		return
+	}
+	attachment, err := a.attachments.CompleteUploadCallback(r.Context(), r.URL.RequestURI(), body,
+		r.Header.Get("Authorization"), r.Header.Get("x-oss-pub-key-url"))
+	if err != nil {
+		a.failAttachment(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Status": "OK", "attachmentId": attachment.AttachmentID, "objectId": attachment.ObjectID,
+	})
+}
+
+func (a *API) handlePublicAttachmentDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.Header().Set("Cache-Control", "no-store")
+		writeError(w, http.StatusMethodNotAllowed, "仅支持 GET 下载")
+		return
+	}
+	directURL, err := a.attachments.ConsumeDownloadGrant(r.Context(), r.PathValue("token"))
+	if err != nil {
+		a.failAttachment(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	http.Redirect(w, r, directURL, http.StatusFound)
+}
 
 func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
@@ -179,6 +220,10 @@ func (a *API) failAttachment(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusTooManyRequests, err.Error())
 	case errors.Is(err, transfer.ErrConflict):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, transfer.ErrForbidden):
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, transfer.ErrGone):
+		writeError(w, http.StatusGone, err.Error())
 	case errors.Is(err, transfer.ErrInternal):
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 	default:

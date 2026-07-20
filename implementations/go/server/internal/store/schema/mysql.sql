@@ -146,6 +146,20 @@ CREATE TABLE IF NOT EXISTS transfer_attachment_download_usage (
   KEY idx_attachment_download_usage_attachment (attachment_id, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS transfer_attachment_download_grant (
+  id BIGINT NOT NULL PRIMARY KEY,
+  token_hash VARCHAR(64) NOT NULL,
+  tenant_id VARCHAR(80) NOT NULL,
+  username VARCHAR(120) NOT NULL,
+  attachment_id BIGINT NOT NULL,
+  created_at VARCHAR(64) NOT NULL,
+  expires_at VARCHAR(64) NOT NULL,
+  consumed_at VARCHAR(64),
+  UNIQUE KEY uk_attachment_download_grant_token (token_hash),
+  KEY idx_attachment_download_grant_attachment (attachment_id, created_at),
+  KEY idx_attachment_download_grant_expiry (expires_at, consumed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80),

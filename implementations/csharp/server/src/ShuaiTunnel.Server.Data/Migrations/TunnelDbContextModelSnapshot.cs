@@ -1555,6 +1555,65 @@ namespace ShuaiTunnel.Server.Data.Migrations
                     b.ToTable("transfer_attachment", (string)null);
                 });
 
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.TransferAttachmentDownloadGrant", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("id");
+
+                    b.Property<long>("AttachmentId")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("attachment_id");
+
+                    b.Property<string>("ConsumedAt")
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("consumed_at");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("TokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("token_hash");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("username");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TokenHash")
+                        .IsUnique();
+
+                    b.HasIndex("AttachmentId", "CreatedAt")
+                        .HasDatabaseName("idx_attachment_download_grant_attachment");
+
+                    b.HasIndex("ExpiresAt", "ConsumedAt")
+                        .HasDatabaseName("idx_attachment_download_grant_expiry");
+
+                    b.ToTable("transfer_attachment_download_grant", (string)null);
+                });
+
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.TransferAttachmentDownloadUsage", b =>
                 {
                     b.Property<long>("Id")

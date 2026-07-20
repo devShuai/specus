@@ -52,8 +52,10 @@ The model now contains Java-aligned resource traffic and HTTP/TCP detail entitie
 `transfer_attachment`（公开房间或管理消息作用域、tenant/owner/target、object key、上传/保留时间和状态）。
 SQLite、PostgreSQL、MySQL 都有对应的 `AddClientMessagingAndTransfer` migration 与同步 snapshot；三种 provider
 的 `HasPendingModelChanges` 检查均应保持无漂移。
-`AddTransferAttachmentQuota` 进一步增加账号活跃附件索引和 `transfer_attachment_download_usage` 月度下载签名
-计费表，用于执行每账号 1 GiB 存储与 1 GiB/月下载流量额度。
+`AddTransferAttachmentQuota` 进一步增加账号活跃附件索引和 `transfer_attachment_download_usage` 月度下载跳转
+计费表，用于执行每账号 1 GiB 存储与 1 GiB/月下载流量额度；用量在一次性 grant 首次消费时写入。
+`AddSingleUseDownloadGrant` 增加 `transfer_attachment_download_grant`，只持久化随机下载授权的 SHA-256，
+并通过原子消费字段保证同一业务下载链接最多换取一次短期 OSS V4 地址。
 Peer Mesh ACL 的 `direction` 由三套 `AddPeerMeshAclDirection` migration 补齐，缺省 `OUTBOUND`；启动兼容 SQL
 也会为旧库幂等补列并回填空值，保证正向/反向 ACL 判定可直接使用。
 

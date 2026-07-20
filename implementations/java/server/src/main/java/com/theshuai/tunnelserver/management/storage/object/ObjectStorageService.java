@@ -11,6 +11,15 @@ public interface ObjectStorageService {
 
     PresignedObjectUrl presignDownload(String objectKey, Duration ttl);
 
+    default PresignedObjectUrl presignDownload(String objectKey, Duration ttl, String downloadGrantId) {
+        return presignDownload(objectKey, ttl);
+    }
+
+    default boolean verifyUploadCallback(String requestTarget, byte[] body,
+                                         String authorization, String publicKeyUrl) {
+        return false;
+    }
+
     void deleteObject(String objectKey);
 
     /**

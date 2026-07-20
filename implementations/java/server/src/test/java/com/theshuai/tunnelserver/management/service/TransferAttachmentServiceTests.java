@@ -3,7 +3,10 @@ package com.theshuai.tunnelserver.management.service;
 import com.theshuai.tunnelserver.config.ObjectStorageProperties;
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
 import com.theshuai.tunnelserver.management.model.TransferAttachment;
+import com.theshuai.tunnelserver.management.model.TransferAttachmentDownloadGrant;
 import com.theshuai.tunnelserver.management.model.TransferAttachmentDownloadUsage;
+import com.theshuai.tunnelserver.management.model.TransferAttachmentView;
+import com.theshuai.tunnelserver.management.repository.TransferAttachmentDownloadGrantRepository;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentDownloadUsageRepository;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentRepository;
 import com.theshuai.tunnelserver.management.security.ManagementContext;
@@ -46,6 +49,7 @@ class TransferAttachmentServiceTests {
             new ManagementContext(new TenantContext("default"), "alice", false);
 
     @Mock private TransferAttachmentRepository repository;
+    @Mock private TransferAttachmentDownloadGrantRepository downloadGrantRepository;
     @Mock private TransferAttachmentDownloadUsageRepository downloadUsageRepository;
     @Mock private ObjectStorageService objectStorageService;
     @Mock private ClientAccountService clientAccountService;
@@ -59,6 +63,8 @@ class TransferAttachmentServiceTests {
     void setUp() {
         storageProperties.setUploadUrlTtlSeconds(900);
         storageProperties.setDownloadUrlTtlSeconds(600);
+        storageProperties.setDownloadObjectUrlTtlSeconds(30);
+        storageProperties.setBucket("private");
         storageProperties.setRetentionHours(72);
         storageProperties.setMaxAttachmentBytes(1024);
         publicTransferProperties.setMaxPendingUploadsPerRoom(2);
@@ -66,6 +72,7 @@ class TransferAttachmentServiceTests {
                 .thenReturn(new RoomAccess(42L, Role.OWNER, "room-a"));
         service = new TransferAttachmentService(
                 repository,
+                downloadGrantRepository,
                 downloadUsageRepository,
                 objectStorageService,
                 storageProperties,
@@ -234,20 +241,18 @@ class TransferAttachmentServiceTests {
                 .thenReturn(Optional.of(attachment));
         when(publicTransferRoomService.authenticate("room-a", "viewer-token", "attachment-access"))
                 .thenReturn(new RoomAccess(42L, Role.VIEWER, "room-a"));
-        when(objectStorageService.presignDownload(any(), any()))
-                .thenReturn(new PresignedObjectUrl(
-                        "https://oss/download", Map.of(), Instant.now().plusSeconds(600).toString()));
+        when(objectStorageService.isEnabled()).thenReturn(true);
 
         var response = service.createPublicDownload(
                 ACCOUNT, 123L, new TransferAttachmentService.PresignDownloadRequest("viewer-token"));
 
-        assertThat(response.downloadUrl()).isEqualTo("https://oss/download");
-        ArgumentCaptor<TransferAttachmentDownloadUsage> usageCaptor =
-                ArgumentCaptor.forClass(TransferAttachmentDownloadUsage.class);
-        verify(downloadUsageRepository).saveAndFlush(usageCaptor.capture());
-        assertThat(usageCaptor.getValue().getTenantId()).isEqualTo("default");
-        assertThat(usageCaptor.getValue().getUsername()).isEqualTo("alice");
-        assertThat(usageCaptor.getValue().getSizeBytes()).isEqualTo(10L);
+        assertThat(response.downloadUrl()).startsWith("/api/public/transfer/downloads/");
+        ArgumentCaptor<TransferAttachmentDownloadGrant> grantCaptor =
+                ArgumentCaptor.forClass(TransferAttachmentDownloadGrant.class);
+        verify(downloadGrantRepository).saveAndFlush(grantCaptor.capture());
+        assertThat(grantCaptor.getValue().getTokenHash()).hasSize(64);
+        assertThat(grantCaptor.getValue().getAttachmentId()).isEqualTo(123L);
+        verify(downloadUsageRepository, times(0)).saveAndFlush(any());
     }
 
     @Test
@@ -255,6 +260,7 @@ class TransferAttachmentServiceTests {
         TransferAttachment attachment = uploadedFixture(123L);
         attachment.setSizeBytes(6L);
         storageProperties.setPerUserMonthlyDownloadQuotaBytes(10L);
+        when(objectStorageService.isEnabled()).thenReturn(true);
         when(repository.findByIdAndScope(123L, TransferAttachmentService.SCOPE_PUBLIC_TRANSFER))
                 .thenReturn(Optional.of(attachment));
         when(downloadUsageRepository.sumBytesByAccountAndMonth(eq("default"), eq("alice"), any()))
@@ -265,7 +271,65 @@ class TransferAttachmentServiceTests {
                 .isInstanceOf(RateLimitedException.class)
                 .hasMessageContaining("下载流量额度不足");
 
-        verify(objectStorageService, times(0)).presignDownload(any(), any());
+        verify(downloadGrantRepository, times(0)).saveAndFlush(any());
+    }
+
+    @Test
+    void downloadGrantCanOnlyBeConsumedOnce() {
+        String token = "single-use-download-token";
+        TransferAttachment attachment = uploadedFixture(123L);
+        TransferAttachmentDownloadGrant grant = new TransferAttachmentDownloadGrant();
+        grant.setId(456L);
+        grant.setTokenHash(sha256(token));
+        grant.setTenantId("default");
+        grant.setUsername("alice");
+        grant.setAttachmentId(attachment.getId());
+        grant.setExpiresAt(Instant.now().plusSeconds(600).toString());
+        when(downloadGrantRepository.findByTokenHash(sha256(token)))
+                .thenReturn(Optional.of(grant));
+        when(repository.findById(attachment.getId())).thenReturn(Optional.of(attachment));
+        when(downloadGrantRepository.consume(eq(456L), eq(sha256(token)), any(), any()))
+                .thenReturn(1, 0);
+        when(objectStorageService.isEnabled()).thenReturn(true);
+        when(objectStorageService.presignDownload(eq("object/key.txt"), any(), eq("456")))
+                .thenReturn(new PresignedObjectUrl(
+                        "https://oss/download", Map.of(), Instant.now().plusSeconds(30).toString()));
+
+        assertThat(service.consumeDownloadGrant(token)).contains("https://oss/download");
+        assertThat(service.consumeDownloadGrant(token)).isEmpty();
+
+        verify(objectStorageService, times(1))
+                .presignDownload(eq("object/key.txt"), any(), eq("456"));
+        ArgumentCaptor<TransferAttachmentDownloadUsage> usageCaptor =
+                ArgumentCaptor.forClass(TransferAttachmentDownloadUsage.class);
+        verify(downloadUsageRepository).saveAndFlush(usageCaptor.capture());
+        assertThat(usageCaptor.getValue().getTenantId()).isEqualTo("default");
+        assertThat(usageCaptor.getValue().getUsername()).isEqualTo("alice");
+        assertThat(usageCaptor.getValue().getSizeBytes()).isEqualTo(10L);
+    }
+
+    @Test
+    void verifiedOssCallbackCompletesUploadAndClientCompleteIsIdempotent() {
+        TransferAttachment attachment = pendingFixture(123L, 10L);
+        attachment.setTenantId("default");
+        attachment.setOwnerUsername("alice");
+        when(objectStorageService.verifyUploadCallback(any(), any(), any(), any())).thenReturn(true);
+        when(repository.findByObjectKey("object/key.txt")).thenReturn(Optional.of(attachment));
+        when(repository.findByIdAndScope(123L, TransferAttachmentService.SCOPE_PUBLIC_TRANSFER))
+                .thenReturn(Optional.of(attachment));
+
+        byte[] body = "{\"bucket\":\"private\",\"object\":\"object/key.txt\",\"size\":42,"
+                .concat("\"mimeType\":\"text/plain\",\"etag\":\"etag\"}")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        TransferAttachmentView callbackResult = service.completeUploadCallback(
+                "/api/public/transfer/oss-callback", body, "signature", "public-key-url");
+        TransferAttachmentView clientResult = service.completePublic(
+                ACCOUNT, 123L, new TransferAttachmentService.CompleteAttachmentRequest(ROOM_TOKEN));
+
+        assertThat(callbackResult.status()).isEqualTo(TransferAttachmentService.STATUS_UPLOADED);
+        assertThat(callbackResult.sizeBytes()).isEqualTo(42L);
+        assertThat(clientResult.sizeBytes()).isEqualTo(42L);
+        verify(objectStorageService, times(0)).statObject(any());
     }
 
     @Test

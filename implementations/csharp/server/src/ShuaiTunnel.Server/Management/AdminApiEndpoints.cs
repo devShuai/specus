@@ -522,5 +522,8 @@ public static class AdminApiEndpoints
 
     private static bool IsAdminSurface(PathString path) =>
         RequiresBearerAuth(path)
+        || path.StartsWithSegments("/api/public/transfer/downloads",
+            StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/api/public/transfer/oss-callback", StringComparison.OrdinalIgnoreCase)
         || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase);
 }

@@ -1,10 +1,13 @@
 package com.theshuai.tunnelserver.management.service;
 
+import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelserver.config.ObjectStorageProperties;
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
 import com.theshuai.tunnelserver.management.model.TransferAttachment;
+import com.theshuai.tunnelserver.management.model.TransferAttachmentDownloadGrant;
 import com.theshuai.tunnelserver.management.model.TransferAttachmentDownloadUsage;
 import com.theshuai.tunnelserver.management.model.TransferAttachmentView;
+import com.theshuai.tunnelserver.management.repository.TransferAttachmentDownloadGrantRepository;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentDownloadUsageRepository;
 import com.theshuai.tunnelserver.management.repository.TransferAttachmentRepository;
 import com.theshuai.tunnelserver.management.security.ManagementContext;
@@ -21,16 +24,19 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.YearMonth;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.regex.Pattern;
 
 @Service
@@ -47,6 +53,7 @@ public class TransferAttachmentService {
     private static final long DEFAULT_PER_USER_QUOTA_BYTES = 1024L * 1024L * 1024L;
 
     private final TransferAttachmentRepository repository;
+    private final TransferAttachmentDownloadGrantRepository downloadGrantRepository;
     private final TransferAttachmentDownloadUsageRepository downloadUsageRepository;
     private final ObjectStorageService objectStorageService;
     private final ObjectStorageProperties properties;
@@ -54,8 +61,10 @@ public class TransferAttachmentService {
     private final ClientAccountService clientAccountService;
     private final PublicTransferRoomService publicTransferRoomService;
     private final Object[] quotaLocks = new Object[64];
+    private final SecureRandom secureRandom = new SecureRandom();
 
     public TransferAttachmentService(TransferAttachmentRepository repository,
+                                     TransferAttachmentDownloadGrantRepository downloadGrantRepository,
                                      TransferAttachmentDownloadUsageRepository downloadUsageRepository,
                                      ObjectStorageService objectStorageService,
                                      ObjectStorageProperties properties,
@@ -63,6 +72,7 @@ public class TransferAttachmentService {
                                      ClientAccountService clientAccountService,
                                      PublicTransferRoomService publicTransferRoomService) {
         this.repository = repository;
+        this.downloadGrantRepository = downloadGrantRepository;
         this.downloadUsageRepository = downloadUsageRepository;
         this.objectStorageService = objectStorageService;
         this.properties = properties;
@@ -155,6 +165,88 @@ public class TransferAttachmentService {
         return createDownload(context, attachment);
     }
 
+    @Transactional
+    public Optional<String> consumeDownloadGrant(String token) {
+        if (!StringUtils.hasText(token) || token.length() > 128) {
+            return Optional.empty();
+        }
+        String tokenHash = sha256Hex(token.trim());
+        TransferAttachmentDownloadGrant grant = downloadGrantRepository.findByTokenHash(tokenHash)
+                .orElse(null);
+        Instant now = Instant.now();
+        if (grant == null || StringUtils.hasText(grant.getConsumedAt())
+                || !Instant.parse(grant.getExpiresAt()).isAfter(now)) {
+            return Optional.empty();
+        }
+        TransferAttachment attachment = repository.findById(grant.getAttachmentId()).orElse(null);
+        if (attachment == null || !STATUS_UPLOADED.equals(attachment.getStatus())
+                || !Instant.parse(attachment.getExpiresAt()).isAfter(now)
+                || !objectStorageService.isEnabled()) {
+            return Optional.empty();
+        }
+
+        String tenantId = requireAccountText(grant.getTenantId(), "tenantId");
+        String username = requireAccountText(grant.getUsername(), "username");
+        synchronized (quotaLock(tenantId, username)) {
+            String usageMonth = YearMonth.now(ZoneOffset.UTC).toString();
+            long usedBytes = downloadUsageRepository.sumBytesByAccountAndMonth(
+                    tenantId, username, usageMonth);
+            ensureWithinQuota(usedBytes, attachment.getSizeBytes(),
+                    properties.getPerUserMonthlyDownloadQuotaBytes(),
+                    "本月 OSS 下载流量额度不足");
+
+            String consumedAt = now.toString();
+            if (downloadGrantRepository.consume(grant.getId(), tokenHash, consumedAt, consumedAt) != 1) {
+                return Optional.empty();
+            }
+            PresignedObjectUrl direct = objectStorageService.presignDownload(
+                    attachment.getObjectKey(),
+                    Duration.ofSeconds(Math.max(1L, properties.getDownloadObjectUrlTtlSeconds())),
+                    String.valueOf(grant.getId())
+            );
+            recordDownloadUsage(tenantId, username, usageMonth, attachment);
+            return Optional.of(direct.url());
+        }
+    }
+
+    @Transactional
+    public TransferAttachmentView completeUploadCallback(String requestTarget, byte[] body,
+                                                         String authorization, String publicKeyUrl) {
+        if (!objectStorageService.verifyUploadCallback(
+                requestTarget, body, authorization, publicKeyUrl)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "invalid OSS upload callback signature");
+        }
+        OssUploadCallback callback = JsonUtil.stringToObject(
+                new String(body, StandardCharsets.UTF_8), OssUploadCallback.class);
+        if (callback == null || !StringUtils.hasText(callback.bucket())
+                || !StringUtils.hasText(callback.object()) || callback.size() == null
+                || callback.size() < 0L) {
+            throw new IllegalArgumentException("invalid OSS upload callback body");
+        }
+        if (!callback.bucket().equals(properties.getBucket())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "OSS callback bucket mismatch");
+        }
+        String objectKey = callback.object().trim();
+        objectStorageService.validateObjectKey(objectKey);
+        TransferAttachment attachment = repository.findByObjectKey(objectKey)
+                .orElseThrow(() -> new IllegalArgumentException("attachment object was not allocated"));
+        if (!attachment.getObjectKey().equals(objectKey)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "OSS callback object mismatch");
+        }
+        if (STATUS_UPLOADED.equals(attachment.getStatus())) {
+            return toView(attachment);
+        }
+        if (!STATUS_PENDING.equals(attachment.getStatus())) {
+            throw new IllegalStateException("attachment is not pending");
+        }
+        if (callback.size() > properties.getMaxAttachmentBytes()) {
+            objectStorageService.deleteObject(objectKey);
+            throw new IllegalArgumentException("attachment is too large");
+        }
+        attachment.setSizeBytes(callback.size());
+        return completeWithinQuota(attachment, true);
+    }
+
     @Scheduled(fixedDelayString = "${tunnel.object-storage.expiration-scan-interval-ms:3600000}")
     @Transactional
     public void expireOldAttachments() {
@@ -194,7 +286,6 @@ public class TransferAttachmentService {
         ensureStorageQuota(tenantId, ownerUsername, sizeBytes, Long.MIN_VALUE);
         String sha256 = normalizeSha256(request.sha256());
         Instant now = Instant.now();
-        Instant uploadExpiresAt = now.plusSeconds(properties.getUploadUrlTtlSeconds());
         Instant expiresAt = now.plusSeconds(Math.max(1L, properties.getRetentionHours()) * 3600L);
 
         for (int attempt = 0; attempt < 8; attempt++) {
@@ -215,7 +306,6 @@ public class TransferAttachmentService {
             attachment.setStatus(STATUS_PENDING);
             attachment.setCreatedAt(now.toString());
             attachment.setUpdatedAt(now.toString());
-            attachment.setUploadExpiresAt(uploadExpiresAt.toString());
             attachment.setExpiresAt(expiresAt.toString());
 
             objectStorageService.validateObjectKey(attachment.getObjectKey());
@@ -224,6 +314,7 @@ public class TransferAttachmentService {
                     mimeType,
                     Duration.ofSeconds(properties.getUploadUrlTtlSeconds())
             );
+            attachment.setUploadExpiresAt(upload.expiresAt());
             try {
                 repository.saveAndFlush(attachment);
                 return new PresignUploadResponse(
@@ -255,20 +346,37 @@ public class TransferAttachmentService {
     }
 
     private TransferAttachmentView completeWithinQuota(TransferAttachment attachment) {
+        return completeWithinQuota(attachment, false);
+    }
+
+    private TransferAttachmentView completeWithinQuota(TransferAttachment attachment,
+                                                        boolean objectVerifiedByCallback) {
         synchronized (quotaLock(attachment.getTenantId(), attachment.getOwnerUsername())) {
-            return complete(attachment);
+            return complete(attachment, objectVerifiedByCallback);
         }
     }
 
-    private TransferAttachmentView complete(TransferAttachment attachment) {
+    @Scheduled(fixedDelayString = "${tunnel.object-storage.expiration-scan-interval-ms:3600000}")
+    @Transactional
+    public void purgeExpiredDownloadGrants() {
+        downloadGrantRepository.deleteByExpiresAtBefore(Instant.now().toString());
+    }
+
+    private TransferAttachmentView complete(TransferAttachment attachment,
+                                            boolean objectVerifiedByCallback) {
         Instant now = Instant.now();
+        if (STATUS_UPLOADED.equals(attachment.getStatus())) {
+            return toView(attachment);
+        }
         if (!STATUS_PENDING.equals(attachment.getStatus())) {
             throw new IllegalStateException("attachment is not pending");
         }
         if (Instant.parse(attachment.getUploadExpiresAt()).isBefore(now)) {
             throw new IllegalStateException("attachment upload URL is expired");
         }
-        verifyUploadedObject(attachment);
+        if (!objectVerifiedByCallback) {
+            verifyUploadedObject(attachment);
+        }
         try {
             ensureStorageQuota(attachment.getTenantId(), attachment.getOwnerUsername(),
                     attachment.getSizeBytes(), attachment.getId());
@@ -315,6 +423,9 @@ public class TransferAttachmentService {
         if (Instant.parse(attachment.getExpiresAt()).isBefore(now)) {
             throw new IllegalStateException("attachment is expired");
         }
+        if (!objectStorageService.isEnabled()) {
+            throw new IllegalStateException("object storage is not configured");
+        }
         String tenantId = requireAccountText(context.tenant().tenantId(), "tenantId");
         String username = requireAccountText(context.username(), "username");
         synchronized (quotaLock(tenantId, username)) {
@@ -325,20 +436,43 @@ public class TransferAttachmentService {
                     properties.getPerUserMonthlyDownloadQuotaBytes(),
                     "本月 OSS 下载流量额度不足");
 
-            PresignedObjectUrl download = objectStorageService.presignDownload(
-                    attachment.getObjectKey(),
-                    Duration.ofSeconds(properties.getDownloadUrlTtlSeconds())
-            );
-            recordDownloadUsage(tenantId, username, usageMonth, attachment);
+            DownloadGrantValue grant = createDownloadGrant(tenantId, username, attachment, now);
             return new PresignDownloadResponse(
                     attachment.getId(),
                     String.valueOf(attachment.getId()),
-                    download.url(),
-                    download.headers(),
-                    download.expiresAt(),
+                    "/api/public/transfer/downloads/" + grant.token(),
+                    Map.of(),
+                    grant.expiresAt(),
                     toView(attachment)
             );
         }
+    }
+
+    private DownloadGrantValue createDownloadGrant(String tenantId, String username,
+                                                   TransferAttachment attachment, Instant now) {
+        Instant expiresAt = now.plusSeconds(Math.max(1L, properties.getDownloadUrlTtlSeconds()));
+        for (int attempt = 0; attempt < 8; attempt++) {
+            byte[] tokenBytes = new byte[32];
+            secureRandom.nextBytes(tokenBytes);
+            String token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+            TransferAttachmentDownloadGrant grant = new TransferAttachmentDownloadGrant();
+            grant.setId(ClientIdGenerator.newId());
+            grant.setTokenHash(sha256Hex(token));
+            grant.setTenantId(tenantId);
+            grant.setUsername(username);
+            grant.setAttachmentId(attachment.getId());
+            grant.setCreatedAt(now.toString());
+            grant.setExpiresAt(expiresAt.toString());
+            try {
+                downloadGrantRepository.saveAndFlush(grant);
+                return new DownloadGrantValue(grant.getId(), token, grant.getExpiresAt());
+            } catch (DataIntegrityViolationException exception) {
+                if (attempt == 7) {
+                    throw exception;
+                }
+            }
+        }
+        throw new IllegalStateException("failed to allocate download grant");
     }
 
     private void ensureStorageQuota(String tenantId, String ownerUsername, long requestedBytes,
@@ -565,12 +699,19 @@ public class TransferAttachmentService {
     }
 
     private String roomTokenHash(String token) {
+        return sha256Hex(token);
+    }
+
+    private String sha256Hex(String value) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(token.getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
         } catch (Exception e) {
-            throw new IllegalStateException("failed to hash room token", e);
+            throw new IllegalStateException("failed to hash token", e);
         }
+    }
+
+    private record DownloadGrantValue(long id, String token, String expiresAt) {
     }
 
     public record PresignUploadRequest(
@@ -608,6 +749,15 @@ public class TransferAttachmentService {
             Map<String, String> downloadHeaders,
             String expiresAt,
             TransferAttachmentView attachment
+    ) {
+    }
+
+    public record OssUploadCallback(
+            String bucket,
+            String object,
+            Long size,
+            String mimeType,
+            String etag
     ) {
     }
 }

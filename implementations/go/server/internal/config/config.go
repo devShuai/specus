@@ -60,6 +60,7 @@ type DatabaseConfig struct {
 // AuthConfig mirrors Tunnel:Auth.
 type AuthConfig struct {
 	PasswordLoginEnabled bool   `json:"passwordLoginEnabled"`
+	RegistrationEnabled  bool   `json:"registrationEnabled"`
 	Username             string `json:"username"`
 	Password             string `json:"password"`
 	TenantID             string `json:"tenantId"`
@@ -192,12 +193,15 @@ type PeerMeshConfig struct {
 type ObjectStorageConfig struct {
 	Provider                         string `json:"provider"`
 	Endpoint                         string `json:"endpoint"`
+	Region                           string `json:"region"`
 	Bucket                           string `json:"bucket"`
 	AccessKeyID                      string `json:"accessKeyId"`
 	AccessKeySecret                  string `json:"accessKeySecret"`
 	ObjectPrefix                     string `json:"objectPrefix"`
+	UploadCallbackURL                string `json:"uploadCallbackUrl"`
 	UploadURLTTLSeconds              int64  `json:"uploadUrlTtlSeconds"`
 	DownloadURLTTLSeconds            int64  `json:"downloadUrlTtlSeconds"`
+	DownloadObjectURLTTLSeconds      int64  `json:"downloadObjectUrlTtlSeconds"`
 	RetentionHours                   int64  `json:"retentionHours"`
 	MaxAttachmentBytes               int64  `json:"maxAttachmentBytes"`
 	PerUserStorageQuotaBytes         int64  `json:"perUserStorageQuotaBytes"`
@@ -256,6 +260,7 @@ func Default() Config {
 		Database: DatabaseConfig{Provider: "sqlite", SeedDemoClient: true},
 		Auth: AuthConfig{
 			PasswordLoginEnabled: true,
+			RegistrationEnabled:  true,
 			Username:             "admin",
 			Password:             "admin",
 			TenantID:             "default",
@@ -314,6 +319,7 @@ func Default() Config {
 			ObjectPrefix:                     "shuai-tunnel/attachments",
 			UploadURLTTLSeconds:              900,
 			DownloadURLTTLSeconds:            600,
+			DownloadObjectURLTTLSeconds:      30,
 			RetentionHours:                   72,
 			MaxAttachmentBytes:               512 * 1024 * 1024,
 			PerUserStorageQuotaBytes:         1024 * 1024 * 1024,
@@ -440,6 +446,7 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setBool("TUNNEL_DB_SEED_DEMO_CLIENT", &cfg.Database.SeedDemoClient)
 
 	setBool("TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED", &cfg.Auth.PasswordLoginEnabled)
+	setBool("TUNNEL_AUTH_REGISTRATION_ENABLED", &cfg.Auth.RegistrationEnabled)
 	setStr("TUNNEL_AUTH_USERNAME", &cfg.Auth.Username)
 	setStr("TUNNEL_AUTH_PASSWORD", &cfg.Auth.Password)
 	setStr("TUNNEL_AUTH_TENANT_ID", &cfg.Auth.TenantID)
@@ -499,12 +506,15 @@ func (cfg *Config) applyEnv(env map[string]string) {
 
 	setStr("TUNNEL_OBJECT_STORAGE_PROVIDER", &cfg.ObjectStorage.Provider)
 	setStr("TUNNEL_OBJECT_STORAGE_ENDPOINT", &cfg.ObjectStorage.Endpoint)
+	setStr("TUNNEL_OBJECT_STORAGE_REGION", &cfg.ObjectStorage.Region)
 	setStr("TUNNEL_OBJECT_STORAGE_BUCKET", &cfg.ObjectStorage.Bucket)
 	setStr("TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID", &cfg.ObjectStorage.AccessKeyID)
 	setStr("TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET", &cfg.ObjectStorage.AccessKeySecret)
 	setStr("TUNNEL_OBJECT_STORAGE_PREFIX", &cfg.ObjectStorage.ObjectPrefix)
+	setStr("TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL", &cfg.ObjectStorage.UploadCallbackURL)
 	setInt64("TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS", &cfg.ObjectStorage.UploadURLTTLSeconds)
 	setInt64("TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS", &cfg.ObjectStorage.DownloadURLTTLSeconds)
+	setInt64("TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS", &cfg.ObjectStorage.DownloadObjectURLTTLSeconds)
 	setInt64("TUNNEL_OBJECT_STORAGE_RETENTION_HOURS", &cfg.ObjectStorage.RetentionHours)
 	setInt64("TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", &cfg.ObjectStorage.MaxAttachmentBytes)
 	setInt64("TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES", &cfg.ObjectStorage.PerUserStorageQuotaBytes)

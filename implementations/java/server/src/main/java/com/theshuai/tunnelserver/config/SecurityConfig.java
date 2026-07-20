@@ -5,6 +5,7 @@ import com.theshuai.tunnelserver.security.LocalTokenService;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -60,6 +61,7 @@ public class SecurityConfig {
                         .requestMatchers("/ws/**").permitAll()
                         // 对象存储会产生持久化与公网流量成本，公开互传页只有登录用户
                         // 可以申请 OSS 上传/下载；房间发现、ICE 和实时 Direct/TURN 仍免登录。
+                        .requestMatchers(HttpMethod.GET, "/api/public/transfer/downloads/**").permitAll()
                         .requestMatchers("/api/public/transfer/attachments/**").authenticated()
                         // 其余公开 API 无需 JWT，登录页和未登录用户也能读取。
                         .requestMatchers("/api/public/**").permitAll()

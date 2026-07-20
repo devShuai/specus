@@ -57,12 +57,15 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 // Register attaches all auth and admin routes to mux.
 func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /auth/login", a.handleLogin)
+	mux.HandleFunc("POST /auth/register", a.handleRegister)
 	mux.HandleFunc("POST /auth/refresh", a.requireAuth(a.handleRefresh))
 	mux.HandleFunc("GET /oidc-config", a.handleOidcConfig)
 	mux.HandleFunc("POST /oidc/token", a.handleOidcToken)
 	mux.HandleFunc("GET /api/public/client-downloads", a.handlePublicClientDownloads)
 	mux.HandleFunc("GET /api/public/peer-mesh/stun-config", a.handlePublicPeerMeshStunConfig)
 	mux.HandleFunc("GET /api/public/transfer/ice-config", a.handlePublicTransferIceConfig)
+	mux.HandleFunc("GET /api/public/transfer/downloads/{token}", a.handlePublicAttachmentDownload)
+	mux.HandleFunc("POST /api/public/transfer/oss-callback", a.handlePublicAttachmentUploadCallback)
 	mux.HandleFunc("POST /api/public/transfer/attachments/presign-upload", a.requireAuth(a.handlePublicAttachmentPresignUpload))
 	mux.HandleFunc("POST /api/public/transfer/attachments/{attachmentId}/complete", a.requireAuth(a.handlePublicAttachmentComplete))
 	mux.HandleFunc("POST /api/public/transfer/attachments/{attachmentId}/presign-download", a.requireAuth(a.handlePublicAttachmentPresignDownload))
@@ -182,6 +185,61 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
 }
 
+// handleRegister lets a visitor self-register a USER-role account in the default tenant and logs
+// the new user in by issuing a token. Available only when auth.registrationEnabled and password
+// login are both on.
+func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if !a.registrationEnabled() {
+		writeError(w, http.StatusForbidden, "当前未开放注册")
+		return
+	}
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	username, err := normalizeUsername(req.Username)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if strings.EqualFold(username, a.adminUsername()) {
+		a.fail(w, validation("该用户名不可用"))
+		return
+	}
+	password, err := requirePassword(req.Password)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if existing, err := a.db.FindManagementUserByUsername(r.Context(), username); err != nil {
+		a.fail(w, err)
+		return
+	} else if existing != nil {
+		a.fail(w, validation("用户名已存在: "+username))
+		return
+	}
+	now := time.Now()
+	user := store.ManagementUser{
+		Username:     username,
+		TenantID:     a.defaultTenant(),
+		PasswordHash: auth.HashPassword(password),
+		Role:         store.ManagementRoleUser,
+		Enabled:      true,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := a.db.InsertManagementUser(r.Context(), user); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(user.Username, user.TenantID, user.Role))
+}
+
+func (a *API) registrationEnabled() bool {
+	return a.authConfig.RegistrationEnabled && a.tokens.PasswordLoginEnabled()
+}
+
 func (a *API) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
 	if !ok {
@@ -235,6 +293,7 @@ func (a *API) handleOidcConfig(w http.ResponseWriter, r *http.Request) {
 		"redirectUri":           a.oidc.RedirectURI,
 		"scope":                 a.oidc.Scope,
 		"passwordLoginEnabled":  a.tokens.PasswordLoginEnabled(),
+		"registrationEnabled":   a.registrationEnabled(),
 	})
 }
 

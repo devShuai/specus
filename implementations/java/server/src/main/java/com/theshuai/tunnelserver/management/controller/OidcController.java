@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.management.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.util.JsonUtil;
+import com.theshuai.tunnelserver.config.AuthProperties;
 import com.theshuai.tunnelserver.config.OidcProperties;
 import com.theshuai.tunnelserver.security.LocalTokenService;
 import lombok.extern.slf4j.Slf4j;
@@ -38,13 +39,16 @@ import java.util.Map;
 public class OidcController {
     private final OidcProperties properties;
     private final LocalTokenService localTokenService;
+    private final AuthProperties authProperties;
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    public OidcController(OidcProperties properties, LocalTokenService localTokenService) {
+    public OidcController(OidcProperties properties, LocalTokenService localTokenService,
+                          AuthProperties authProperties) {
         this.properties = properties;
         this.localTokenService = localTokenService;
+        this.authProperties = authProperties;
     }
 
     @GetMapping("/oidc-config")
@@ -57,6 +61,8 @@ public class OidcController {
         config.put("redirectUri", properties.getRedirectUri());
         config.put("scope", properties.getScope());
         config.put("passwordLoginEnabled", localTokenService.isPasswordLoginEnabled());
+        config.put("registrationEnabled",
+                authProperties.isRegistrationEnabled() && localTokenService.isPasswordLoginEnabled());
         return config;
     }
 

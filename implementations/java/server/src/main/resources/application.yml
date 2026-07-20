@@ -88,12 +88,15 @@ tunnel:
     # clients upload/download directly to the private bucket.
     provider: ${TUNNEL_OBJECT_STORAGE_PROVIDER:disabled}
     endpoint: ${TUNNEL_OBJECT_STORAGE_ENDPOINT:}
+    region: ${TUNNEL_OBJECT_STORAGE_REGION:}
     bucket: ${TUNNEL_OBJECT_STORAGE_BUCKET:}
     access-key-id: ${TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID:}
     access-key-secret: ${TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET:}
     object-prefix: ${TUNNEL_OBJECT_STORAGE_PREFIX:shuai-tunnel/attachments}
+    upload-callback-url: ${TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL:}
     upload-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS:900}
     download-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS:600}
+    download-object-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS:30}
     retention-hours: ${TUNNEL_OBJECT_STORAGE_RETENTION_HOURS:72}
     max-attachment-bytes: ${TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES:536870912}
     per-user-storage-quota-bytes: ${TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES:1073741824}
@@ -120,6 +123,9 @@ tunnel:
     # mints a short-lived HS256 JWT the admin API accepts alongside the OIDC tokens. Change the
     # default admin/admin before exposing the server. Set password to blank to disable this login.
     password-login-enabled: ${TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED:true}
+    # Allow visitors to self-register USER-role accounts in the default tenant from the login
+    # dialog. Requires password login. Disable on deployments that only want admin-managed users.
+    registration-enabled: ${TUNNEL_AUTH_REGISTRATION_ENABLED:true}
     username: ${TUNNEL_AUTH_USERNAME:admin}
     password: ${TUNNEL_AUTH_PASSWORD:admin}
     tenant-id: ${TUNNEL_AUTH_TENANT_ID:default}

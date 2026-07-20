@@ -40,6 +40,17 @@ func (db *DB) GetTransferAttachment(ctx context.Context, id int64, scope string)
 	return scanTransferAttachmentOrNil(db.sql.QueryRowContext(ctx, query, id, scope))
 }
 
+func (db *DB) GetTransferAttachmentByID(ctx context.Context, id int64) (*TransferAttachment, error) {
+	query := db.rebind(transferAttachmentSelect + ` WHERE id = ?`)
+	return scanTransferAttachmentOrNil(db.sql.QueryRowContext(ctx, query, id))
+}
+
+func (db *DB) GetTransferAttachmentByObjectKey(ctx context.Context,
+	objectKey string) (*TransferAttachment, error) {
+	query := db.rebind(transferAttachmentSelect + ` WHERE object_key = ?`)
+	return scanTransferAttachmentOrNil(db.sql.QueryRowContext(ctx, query, strings.TrimSpace(objectKey)))
+}
+
 func (db *DB) GetTenantTransferAttachment(ctx context.Context, id int64, tenantID, scope string) (*TransferAttachment, error) {
 	query := db.rebind(transferAttachmentSelect + ` WHERE id = ? AND tenant_id = ? AND scope = ?`)
 	return scanTransferAttachmentOrNil(db.sql.QueryRowContext(ctx, query, id, defaultTenant(tenantID), scope))
@@ -74,13 +85,91 @@ func (db *DB) SumTransferDownloadUsageBytes(ctx context.Context, tenantID, usern
 	return total, err
 }
 
-func (db *DB) InsertTransferDownloadUsage(ctx context.Context, id int64, tenantID, username string,
-	attachmentID, sizeBytes int64, usageMonth string, createdAt time.Time) error {
-	query := db.rebind(`INSERT INTO transfer_attachment_download_usage
+func (db *DB) InsertTransferDownloadGrant(ctx context.Context, grant TransferAttachmentDownloadGrant) error {
+	query := db.rebind(`INSERT INTO transfer_attachment_download_grant
+		(id, token_hash, tenant_id, username, attachment_id, created_at, expires_at, consumed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := db.sql.ExecContext(ctx, query, grant.ID, grant.TokenHash, defaultTenant(grant.TenantID),
+		strings.TrimSpace(grant.Username), grant.AttachmentID, formatTime(grant.CreatedAt),
+		formatTime(grant.ExpiresAt), nullableTime(grant.ConsumedAt))
+	return err
+}
+
+func (db *DB) GetTransferDownloadGrantByTokenHash(ctx context.Context,
+	tokenHash string) (*TransferAttachmentDownloadGrant, error) {
+	query := db.rebind(`SELECT id, token_hash, tenant_id, username, attachment_id,
+		created_at, expires_at, consumed_at
+		FROM transfer_attachment_download_grant WHERE token_hash = ?`)
+	var grant TransferAttachmentDownloadGrant
+	var createdAt, expiresAt string
+	var consumedAt sql.NullString
+	err := db.sql.QueryRowContext(ctx, query, tokenHash).Scan(&grant.ID, &grant.TokenHash,
+		&grant.TenantID, &grant.Username, &grant.AttachmentID, &createdAt, &expiresAt, &consumedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	grant.CreatedAt = parseTime(createdAt)
+	grant.ExpiresAt = parseTime(expiresAt)
+	grant.ConsumedAt = nullTimePtr(consumedAt)
+	return &grant, nil
+}
+
+func (db *DB) ConsumeTransferDownloadGrant(ctx context.Context, id int64, tokenHash string,
+	now time.Time) (bool, error) {
+	query := db.rebind(`UPDATE transfer_attachment_download_grant SET consumed_at = ?
+		WHERE id = ? AND token_hash = ? AND consumed_at IS NULL AND expires_at > ?`)
+	result, err := db.sql.ExecContext(ctx, query, formatTime(now), id, tokenHash, formatTime(now))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
+func (db *DB) ConsumeTransferDownloadGrantAndInsertUsage(ctx context.Context, grantID int64,
+	tokenHash string, consumedAt time.Time, usageID int64, tenantID, username string,
+	attachmentID, sizeBytes int64, usageMonth string) (bool, error) {
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	update := db.rebind(`UPDATE transfer_attachment_download_grant SET consumed_at = ?
+		WHERE id = ? AND token_hash = ? AND consumed_at IS NULL AND expires_at > ?`)
+	result, err := tx.ExecContext(ctx, update, formatTime(consumedAt), grantID, tokenHash,
+		formatTime(consumedAt))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return false, err
+	}
+	insert := db.rebind(`INSERT INTO transfer_attachment_download_usage
 		(id, tenant_id, username, attachment_id, size_bytes, usage_month, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`)
-	_, err := db.sql.ExecContext(ctx, query, id, defaultTenant(tenantID), strings.TrimSpace(username),
-		attachmentID, sizeBytes, usageMonth, formatTime(createdAt))
+	if _, err = tx.ExecContext(ctx, insert, usageID, defaultTenant(tenantID), strings.TrimSpace(username),
+		attachmentID, sizeBytes, usageMonth, formatTime(consumedAt)); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (db *DB) DeleteTransferDownloadGrant(ctx context.Context, id int64) error {
+	_, err := db.sql.ExecContext(ctx,
+		db.rebind(`DELETE FROM transfer_attachment_download_grant WHERE id = ?`), id)
+	return err
+}
+
+func (db *DB) DeleteExpiredTransferDownloadGrants(ctx context.Context, before time.Time) error {
+	_, err := db.sql.ExecContext(ctx,
+		db.rebind(`DELETE FROM transfer_attachment_download_grant WHERE expires_at < ?`), formatTime(before))
 	return err
 }
 

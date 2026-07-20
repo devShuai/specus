@@ -39,6 +39,39 @@ func newHTTPTestServer(t *testing.T, app *App) (*App, *httptest.Server) {
 	return app, ts
 }
 
+func TestOneTimeDownloadGrantRejectsHeadWithoutConsumingIt(t *testing.T) {
+	_, ts := newAPIServer(t)
+	request, err := http.NewRequest(http.MethodHead,
+		ts.URL+"/api/public/transfer/downloads/not-a-real-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", response.StatusCode)
+	}
+	if response.Header.Get("Allow") != http.MethodGet {
+		t.Fatalf("Allow = %q, want GET", response.Header.Get("Allow"))
+	}
+}
+
+func TestOSSUploadCallbackIsAnonymousButRejectsInvalidSignature(t *testing.T) {
+	_, ts := newAPIServer(t)
+	response, err := http.Post(ts.URL+"/api/public/transfer/oss-callback",
+		"application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", response.StatusCode)
+	}
+}
+
 func TestPublicPeerMeshStunConfigMatchesJavaShape(t *testing.T) {
 	cfg := config.Default()
 	cfg.PeerMesh.Enabled = true

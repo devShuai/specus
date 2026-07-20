@@ -2,8 +2,11 @@ package transfer
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -31,6 +34,8 @@ const (
 var (
 	ErrRateLimited = errors.New("rate limited")
 	ErrConflict    = errors.New("conflict")
+	ErrForbidden   = errors.New("forbidden")
+	ErrGone        = errors.New("gone")
 	ErrInternal    = errors.New("internal")
 	sha256Pattern  = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 )
@@ -49,6 +54,14 @@ func rateLimited(message string) error {
 
 func conflict(message string) error {
 	return &categorizedError{category: ErrConflict, message: message}
+}
+
+func forbidden(message string) error {
+	return &categorizedError{category: ErrForbidden, message: message}
+}
+
+func gone(message string) error {
+	return &categorizedError{category: ErrGone, message: message}
 }
 
 func internalError(err error) error {
@@ -84,6 +97,14 @@ type CompleteAttachmentRequest struct {
 }
 type PresignDownloadRequest struct {
 	RoomToken string `json:"roomToken"`
+}
+
+type OSSUploadCallback struct {
+	Bucket   string `json:"bucket"`
+	Object   string `json:"object"`
+	Size     *int64 `json:"size"`
+	MimeType string `json:"mimeType"`
+	ETag     string `json:"etag"`
 }
 
 type PresignUploadResponse struct {
@@ -222,7 +243,7 @@ func (s *Service) CompletePublic(ctx context.Context, id int64, roomToken, tenan
 	if item.OwnerUsername == nil || strings.TrimSpace(*item.OwnerUsername) == "" {
 		item.OwnerUsername = &username
 	}
-	return s.complete(ctx, *item)
+	return s.complete(ctx, *item, false)
 }
 
 func (s *Service) CompleteAdmin(ctx context.Context, id int64, tenantID, username string) (AttachmentView, error) {
@@ -234,7 +255,7 @@ func (s *Service) CompleteAdmin(ctx context.Context, id int64, tenantID, usernam
 		username = strings.TrimSpace(username)
 		item.OwnerUsername = &username
 	}
-	return s.complete(ctx, *item)
+	return s.complete(ctx, *item, false)
 }
 
 func (s *Service) CreatePublicDownload(ctx context.Context, id int64, roomToken, tenantID,
@@ -283,6 +304,7 @@ func (s *Service) RunExpiration(ctx context.Context) {
 			_ = s.expire(ctx)
 		case now := <-purgeTicker.C:
 			s.PurgeExpiredRateWindows(now)
+			_ = s.db.DeleteExpiredTransferDownloadGrants(ctx, now.UTC())
 		}
 	}
 }
@@ -389,7 +411,51 @@ func (s *Service) createUpload(ctx context.Context, scope string, tenantID, room
 	return PresignUploadResponse{}, internalError(fmt.Errorf("failed to allocate attachment id: %w", lastErr))
 }
 
-func (s *Service) complete(ctx context.Context, item store.TransferAttachment) (AttachmentView, error) {
+func (s *Service) CompleteUploadCallback(ctx context.Context, requestTarget string, body []byte,
+	authorization, publicKeyURL string) (AttachmentView, error) {
+	if !s.storage.VerifyUploadCallback(ctx, requestTarget, body, authorization, publicKeyURL) {
+		return AttachmentView{}, forbidden("invalid OSS upload callback signature")
+	}
+	var callback OSSUploadCallback
+	if err := json.Unmarshal(body, &callback); err != nil || strings.TrimSpace(callback.Bucket) == "" ||
+		strings.TrimSpace(callback.Object) == "" || callback.Size == nil || *callback.Size < 0 {
+		return AttachmentView{}, errors.New("invalid OSS upload callback body")
+	}
+	if callback.Bucket != strings.TrimSpace(s.objectCfg.Bucket) {
+		return AttachmentView{}, forbidden("OSS callback bucket mismatch")
+	}
+	objectKey := strings.TrimSpace(callback.Object)
+	if err := s.storage.validateObjectKey(objectKey); err != nil {
+		return AttachmentView{}, err
+	}
+	item, err := s.db.GetTransferAttachmentByObjectKey(ctx, objectKey)
+	if err != nil {
+		return AttachmentView{}, internalError(err)
+	}
+	if item == nil {
+		return AttachmentView{}, errors.New("attachment object was not allocated")
+	}
+	if item.ObjectKey != objectKey {
+		return AttachmentView{}, forbidden("OSS callback object mismatch")
+	}
+	if item.Status == StatusUploaded {
+		return attachmentView(*item), nil
+	}
+	if item.Status != StatusPending {
+		return AttachmentView{}, conflict("attachment is not pending")
+	}
+	if *callback.Size > s.objectCfg.MaxAttachmentBytes {
+		if err := s.storage.Delete(ctx, objectKey); err != nil {
+			return AttachmentView{}, conflict(err.Error())
+		}
+		return AttachmentView{}, errors.New("attachment is too large")
+	}
+	item.SizeBytes = *callback.Size
+	return s.complete(ctx, *item, true)
+}
+
+func (s *Service) complete(ctx context.Context, item store.TransferAttachment,
+	objectVerifiedByCallback bool) (AttachmentView, error) {
 	if item.TenantID == nil || item.OwnerUsername == nil {
 		return AttachmentView{}, internalError(errors.New("attachment owner is missing"))
 	}
@@ -397,13 +463,16 @@ func (s *Service) complete(ctx context.Context, item store.TransferAttachment) (
 	lock.Lock()
 	defer lock.Unlock()
 	now := time.Now().UTC()
+	if item.Status == StatusUploaded {
+		return attachmentView(item), nil
+	}
 	if item.Status != StatusPending {
 		return AttachmentView{}, conflict("attachment is not pending")
 	}
 	if item.UploadExpiresAt.Before(now) {
 		return AttachmentView{}, conflict("attachment upload URL is expired")
 	}
-	if s.storage.Enabled() {
+	if s.storage.Enabled() && !objectVerifiedByCallback {
 		stat, err := s.storage.Stat(ctx, item.ObjectKey)
 		if err != nil {
 			return AttachmentView{}, conflict(err.Error())
@@ -448,6 +517,9 @@ func (s *Service) createDownload(ctx context.Context, item store.TransferAttachm
 	if item.ExpiresAt.Before(now) {
 		return PresignDownloadResponse{}, conflict("attachment is expired")
 	}
+	if !s.storage.Enabled() {
+		return PresignDownloadResponse{}, conflict("object storage is not configured")
+	}
 	tenantID, username, err := normalizeAccount(tenantID, username)
 	if err != nil {
 		return PresignDownloadResponse{}, err
@@ -465,17 +537,98 @@ func (s *Service) createDownload(ctx context.Context, item store.TransferAttachm
 		"本月 OSS 下载流量额度不足"); err != nil {
 		return PresignDownloadResponse{}, err
 	}
-	ttl := time.Duration(s.objectCfg.DownloadURLTTLSeconds) * time.Second
-	presigned, err := s.storage.PresignDownload(item.ObjectKey, ttl)
+	grant, token, err := s.createDownloadGrant(ctx, tenantID, username, item.ID, now.UTC())
 	if err != nil {
-		return PresignDownloadResponse{}, conflict(err.Error())
-	}
-	if err := s.recordDownloadUsage(ctx, tenantID, username, usageMonth, item); err != nil {
 		return PresignDownloadResponse{}, err
 	}
 	return PresignDownloadResponse{AttachmentID: item.ID, ObjectID: fmt.Sprint(item.ID),
-		DownloadURL: presigned.URL, DownloadHeaders: presigned.Headers,
-		ExpiresAt: presigned.ExpiresAt.Format(time.RFC3339Nano), Attachment: attachmentView(item)}, nil
+		DownloadURL: "/api/public/transfer/downloads/" + token, DownloadHeaders: map[string]string{},
+		ExpiresAt: grant.ExpiresAt.Format(time.RFC3339Nano), Attachment: attachmentView(item)}, nil
+}
+
+func (s *Service) createDownloadGrant(ctx context.Context, tenantID, username string,
+	attachmentID int64, now time.Time) (store.TransferAttachmentDownloadGrant, string, error) {
+	ttlSeconds := s.objectCfg.DownloadURLTTLSeconds
+	if ttlSeconds < 1 {
+		ttlSeconds = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		rawToken := make([]byte, 32)
+		if _, err := rand.Read(rawToken); err != nil {
+			return store.TransferAttachmentDownloadGrant{}, "", internalError(err)
+		}
+		token := base64.RawURLEncoding.EncodeToString(rawToken)
+		grant := store.TransferAttachmentDownloadGrant{
+			ID: auth.NewClientID(), TokenHash: tokenHash(token), TenantID: tenantID,
+			Username: username, AttachmentID: attachmentID, CreatedAt: now,
+			ExpiresAt: now.Add(time.Duration(ttlSeconds) * time.Second),
+		}
+		if err := s.db.InsertTransferDownloadGrant(ctx, grant); err == nil {
+			return grant, token, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return store.TransferAttachmentDownloadGrant{}, "",
+		internalError(fmt.Errorf("failed to allocate download grant: %w", lastErr))
+}
+
+// ConsumeDownloadGrant atomically consumes a bearer grant and returns a very short-lived
+// direct OSS URL. The grant itself can never produce a second redirect.
+func (s *Service) ConsumeDownloadGrant(ctx context.Context, token string) (string, error) {
+	token = strings.TrimSpace(token)
+	if token == "" || len(token) > 512 {
+		return "", gone("download link is expired or already used")
+	}
+	hash := tokenHash(token)
+	grant, err := s.db.GetTransferDownloadGrantByTokenHash(ctx, hash)
+	if err != nil {
+		return "", internalError(err)
+	}
+	now := time.Now().UTC()
+	if grant == nil || grant.ConsumedAt != nil || !grant.ExpiresAt.After(now) {
+		return "", gone("download link is expired or already used")
+	}
+	item, err := s.db.GetTransferAttachmentByID(ctx, grant.AttachmentID)
+	if err != nil {
+		return "", internalError(err)
+	}
+	if item == nil || item.Status != StatusUploaded || !item.ExpiresAt.After(now) || !s.storage.Enabled() {
+		return "", gone("download link is no longer available")
+	}
+	lock := s.quotaLock(grant.TenantID, grant.Username)
+	lock.Lock()
+	defer lock.Unlock()
+	usageMonth := now.Format("2006-01")
+	usedBytes, err := s.db.SumTransferDownloadUsageBytes(ctx, grant.TenantID, grant.Username, usageMonth)
+	if err != nil {
+		return "", internalError(err)
+	}
+	if err := ensureWithinQuota(usedBytes, item.SizeBytes,
+		s.objectCfg.PerUserMonthlyDownloadQuotaBytes,
+		"本月 OSS 下载流量额度不足"); err != nil {
+		return "", err
+	}
+	directTTL := time.Duration(s.objectCfg.DownloadObjectURLTTLSeconds) * time.Second
+	presigned, err := s.storage.PresignDownload(item.ObjectKey, directTTL, fmt.Sprint(grant.ID))
+	if err != nil {
+		return "", conflict(err.Error())
+	}
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		consumed, consumeErr := s.db.ConsumeTransferDownloadGrantAndInsertUsage(
+			ctx, grant.ID, hash, now, auth.NewClientID(), grant.TenantID, grant.Username,
+			item.ID, item.SizeBytes, usageMonth)
+		if consumeErr == nil {
+			if !consumed {
+				return "", gone("download link is expired or already used")
+			}
+			return presigned.URL, nil
+		}
+		lastErr = consumeErr
+	}
+	return "", internalError(fmt.Errorf("failed to consume download grant and record usage: %w", lastErr))
 }
 
 func (s *Service) ensureStorageQuota(ctx context.Context, tenantID, username string,
@@ -497,19 +650,6 @@ func ensureWithinQuota(usedBytes, requestedBytes, limitBytes int64, message stri
 		return rateLimited(message)
 	}
 	return nil
-}
-
-func (s *Service) recordDownloadUsage(ctx context.Context, tenantID, username,
-	usageMonth string, item store.TransferAttachment) error {
-	var lastErr error
-	for attempt := 0; attempt < 8; attempt++ {
-		lastErr = s.db.InsertTransferDownloadUsage(ctx, auth.NewClientID(), tenantID, username,
-			item.ID, item.SizeBytes, usageMonth, time.Now().UTC())
-		if lastErr == nil {
-			return nil
-		}
-	}
-	return internalError(fmt.Errorf("failed to record download usage: %w", lastErr))
 }
 
 func (s *Service) quotaLock(tenantID, username string) *sync.Mutex {

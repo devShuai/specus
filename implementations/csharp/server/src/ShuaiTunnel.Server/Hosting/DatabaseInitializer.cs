@@ -268,6 +268,28 @@ public sealed class DatabaseInitializer
         await EnsureIndexAsync(db, "idx_attachment_download_usage_attachment",
             "transfer_attachment_download_usage", "attachment_id, created_at",
             cancellationToken).ConfigureAwait(false);
+
+        await ExecuteSchemaSqlAsync(db, $"""
+            CREATE TABLE IF NOT EXISTS transfer_attachment_download_grant (
+              id {idType},
+              token_hash VARCHAR(64) NOT NULL,
+              tenant_id VARCHAR(80) NOT NULL,
+              username VARCHAR(80) NOT NULL,
+              attachment_id BIGINT NOT NULL,
+              created_at VARCHAR(40) NOT NULL,
+              expires_at VARCHAR(40) NOT NULL,
+              consumed_at VARCHAR(40)
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await EnsureUniqueIndexAsync(db, "IX_transfer_attachment_download_grant_token_hash",
+            "transfer_attachment_download_grant", "token_hash", cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_attachment_download_grant_attachment",
+            "transfer_attachment_download_grant", "attachment_id, created_at",
+            cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_attachment_download_grant_expiry",
+            "transfer_attachment_download_grant", "expires_at, consumed_at",
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static Task BackfillConnectionStatTenantAsync(TunnelDbContext db, CancellationToken cancellationToken)
@@ -549,6 +571,19 @@ public sealed class DatabaseInitializer
 
         await ExecuteSchemaSqlAsync(db,
                 $"CREATE INDEX {indexName} ON {table} ({columns})", cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static async Task EnsureUniqueIndexAsync(TunnelDbContext db, string indexName,
+        string table, string columns, CancellationToken cancellationToken)
+    {
+        if (await IndexExistsAsync(db, table, indexName, cancellationToken).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        await ExecuteSchemaSqlAsync(db,
+                $"CREATE UNIQUE INDEX {indexName} ON {table} ({columns})", cancellationToken)
             .ConfigureAwait(false);
     }
 

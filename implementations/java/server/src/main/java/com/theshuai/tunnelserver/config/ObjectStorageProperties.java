@@ -10,12 +10,15 @@ import org.springframework.stereotype.Component;
 public class ObjectStorageProperties {
     private String provider = "disabled";
     private String endpoint = "";
+    private String region = "";
     private String bucket = "";
     private String accessKeyId = "";
     private String accessKeySecret = "";
     private String objectPrefix = "shuai-tunnel/attachments";
+    private String uploadCallbackUrl = "";
     private long uploadUrlTtlSeconds = 900;
     private long downloadUrlTtlSeconds = 600;
+    private long downloadObjectUrlTtlSeconds = 30;
     private long retentionHours = 72;
     private long maxAttachmentBytes = 512L * 1024L * 1024L;
     private long perUserStorageQuotaBytes = 1024L * 1024L * 1024L;

@@ -56,6 +56,30 @@ class SecurityRulesTests {
     }
 
     @Test
+    void oneTimeDownloadGrantIsPublicButUnknownTokenIsGone() throws Exception {
+        assertThat(get("/api/public/transfer/downloads/not-a-real-token", null).statusCode())
+                .isEqualTo(410);
+    }
+
+    @Test
+    void oneTimeDownloadGrantRejectsHeadWithoutConsumingIt() throws Exception {
+        assertThat(head("/api/public/transfer/downloads/not-a-real-token").statusCode())
+                .isEqualTo(405);
+    }
+
+    @Test
+    void ossUploadCallbackIsAnonymousButRejectsInvalidSignature() throws Exception {
+        HttpResponse<String> response = sendJson(
+                "POST",
+                "/api/public/transfer/oss-callback",
+                "{}",
+                null
+        );
+
+        assertThat(response.statusCode()).isEqualTo(403);
+    }
+
+    @Test
     void authenticatedAccountCanReachPublicTransferObjectStorage() throws Exception {
         HttpResponse<String> login = postJson("/auth/login", "{\"username\":\"admin\",\"password\":\"admin\"}");
         String token = JsonUtil.readString(login.body()).path("accessToken").asText();
@@ -171,6 +195,13 @@ class SecurityRulesTests {
             builder.header("Authorization", "Bearer " + bearer);
         }
         return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> head(String path) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                .build();
+        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> delete(String path, String bearer) throws Exception {
