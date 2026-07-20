@@ -96,6 +96,8 @@ tunnel:
     download-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS:600}
     retention-hours: ${TUNNEL_OBJECT_STORAGE_RETENTION_HOURS:72}
     max-attachment-bytes: ${TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES:536870912}
+    per-user-storage-quota-bytes: ${TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES:1073741824}
+    per-user-monthly-download-quota-bytes: ${TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES:1073741824}
     expiration-scan-interval-ms: ${TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS:3600000}
   public-transfer:
     # 免登录文件互传的滥用防护。presign-upload 无鉴权,按来源 IP 固定窗口限流,
@@ -106,6 +108,9 @@ tunnel:
     max-discovery-peers-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM:32}
     discovery-message-rate-limit-per-connection: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION:360}
     discovery-message-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS:60}
+    pairing-code-ttl-seconds: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS:300}
+    pairing-code-redeem-rate-limit-per-ip: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP:10}
+    pairing-code-redeem-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS:300}
   client-auth:
     default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
     per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}

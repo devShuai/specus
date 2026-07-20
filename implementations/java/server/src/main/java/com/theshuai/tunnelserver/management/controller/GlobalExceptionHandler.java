@@ -4,8 +4,10 @@ import com.theshuai.tunnelserver.management.service.RateLimitedException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.util.Map;
 
@@ -22,6 +24,12 @@ import java.util.Map;
  */
 @RestControllerAdvice(basePackages = "com.theshuai.tunnelserver.management.controller")
 public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResponseStatusException.class)
+    public ResponseEntity<Map<String, String>> handleResponseStatus(ResponseStatusException exception) {
+        String message = StringUtils.hasText(exception.getReason()) ? exception.getReason() : "请求失败";
+        return ResponseEntity.status(exception.getStatusCode()).body(Map.of("error", message));
+    }
 
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> handleIllegalArgument(IllegalArgumentException exception) {

@@ -31,4 +31,13 @@ public class PublicTransferProperties {
 
     /** 发现 WebSocket 消息限流时间窗长度(秒)。 */
     private long discoveryMessageRateLimitWindowSeconds = 60;
+
+    /** 八位数字配对码的有效期(秒);服务端会限制在 60-900 秒。 */
+    private long pairingCodeTtlSeconds = 300;
+
+    /** 单个来源 IP 在配对码兑换时间窗内允许尝试的次数。 */
+    private int pairingCodeRedeemRateLimitPerIp = 10;
+
+    /** 配对码兑换限流时间窗长度(秒)。 */
+    private long pairingCodeRedeemRateLimitWindowSeconds = 300;
 }
