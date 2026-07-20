@@ -2293,7 +2293,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
       <section
         className={`app-apple-tool-content relative z-10 mx-auto grid w-full max-w-[1480px] gap-5 px-4 pb-10 sm:px-8 sm:pb-14 ${
-          isDiagramWorkspace || activeTool === "whiteboard" ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_320px]"
+          isDiagramWorkspace ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_320px]"
         }`}
       >
         <div className="app-apple-tool-workspace min-w-0 p-1 sm:p-2">
@@ -2674,7 +2674,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           )}
         </div>
 
-        {!isDiagramWorkspace ? <aside className={`${activeTool === "whiteboard" ? "hidden" : ""} app-apple-tool-aside min-w-0 p-4 sm:p-5 xl:sticky xl:top-5 xl:self-start`}>
+        {!isDiagramWorkspace ? <aside className="min-w-0 p-4 sm:p-5 xl:sticky xl:top-5 xl:self-start">
           <div className="flex items-start justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold">发送给谁</h2>
