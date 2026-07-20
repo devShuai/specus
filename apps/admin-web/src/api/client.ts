@@ -38,6 +38,8 @@ import type {
   PublicTransferIceConfig,
   PublicTransferClientNameAvailability,
   PublicTransferCreatedAccessToken,
+  PublicTransferPairingCode,
+  PublicTransferRedeemedPairingCode,
   PublicTransferDiagramVersion,
   PublicTransferDiagramVersionDetail,
   PublicTransferRoomAccessToken,
@@ -426,7 +428,7 @@ export const adminApi = {
     }),
 };
 
-// ---- public API（无需 Bearer，登录页和未登录上下文可用）-------------------------------
+// ---- public API（默认免登录；公开互传附件单独要求 Bearer）-----------------------------
 
 /**
  * 公开下载列表。任何端点失败/异常都返回空数组（登录页应静默降级，不打扰未登录用户）。
@@ -479,7 +481,35 @@ async function publicJsonRequest<T>(path: string, body?: unknown): Promise<T> {
   const text = await response.text();
   const parsed = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new ApiError(parsed?.error || response.statusText);
+    throw new ApiError(parsed?.detail || parsed?.message || parsed?.error || response.statusText);
+  }
+  return parsed as T;
+}
+
+async function authenticatedPublicJsonRequest<T>(path: string, body?: unknown): Promise<T> {
+  const token = tokenStore.get();
+  if (!token || !tokenStore.valid()) {
+    throw new ApiError("登录后才可使用云端中转");
+  }
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (response.status === 401) {
+    if (!unauthorizedHandled) {
+      unauthorizedHandled = true;
+      unauthorizedHandler?.();
+    }
+    throw new ApiError("登录已过期，请重新登录");
+  }
+  const text = await response.text();
+  const parsed = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new ApiError(parsed?.detail || parsed?.message || parsed?.error || response.statusText);
   }
   return parsed as T;
 }
@@ -517,14 +547,17 @@ export async function publicCheckTransferClientNameAvailability(
 export function publicPresignAttachmentUpload(
   body: AttachmentPresignUploadRequest,
 ): Promise<AttachmentPresignUploadResponse> {
-  return publicJsonRequest<AttachmentPresignUploadResponse>("/api/public/transfer/attachments/presign-upload", body);
+  return authenticatedPublicJsonRequest<AttachmentPresignUploadResponse>(
+    "/api/public/transfer/attachments/presign-upload",
+    body,
+  );
 }
 
 export function publicCompleteAttachment(
   attachmentId: number,
   body: AttachmentCompleteRequest,
 ): Promise<AttachmentPresignUploadResponse["attachment"]> {
-  return publicJsonRequest<AttachmentPresignUploadResponse["attachment"]>(
+  return authenticatedPublicJsonRequest<AttachmentPresignUploadResponse["attachment"]>(
     `/api/public/transfer/attachments/${attachmentId}/complete`,
     body,
   );
@@ -534,7 +567,7 @@ export function publicPresignAttachmentDownload(
   attachmentId: number,
   body: AttachmentPresignDownloadRequest,
 ): Promise<AttachmentPresignDownloadResponse> {
-  return publicJsonRequest<AttachmentPresignDownloadResponse>(
+  return authenticatedPublicJsonRequest<AttachmentPresignDownloadResponse>(
     `/api/public/transfer/attachments/${attachmentId}/presign-download`,
     body,
   );
@@ -556,8 +589,38 @@ export function publicCreateTransferRoomAccessToken(
   credential: PublicTransferRoomCredential,
   role: Exclude<PublicTransferRoomRole, "OWNER">,
   label: string,
+  expiresInSeconds?: number,
 ): Promise<PublicTransferCreatedAccessToken> {
-  return publicJsonRequest(publicTransferRoomPath("access-tokens"), { roomId, ...credential, role, label });
+  return publicJsonRequest(publicTransferRoomPath("access-tokens"), {
+    roomId,
+    ...credential,
+    role,
+    label,
+    ...(expiresInSeconds ? { expiresInSeconds } : {}),
+  });
+}
+
+export function publicCreateTransferPairingCode(
+  roomId: string,
+  credential: PublicTransferRoomCredential,
+  role: Exclude<PublicTransferRoomRole, "OWNER">,
+  label: string,
+  maxUses = 1,
+): Promise<PublicTransferPairingCode> {
+  return publicJsonRequest(publicTransferRoomPath("pairing-codes"), {
+    roomId,
+    ...credential,
+    role,
+    label,
+    maxUses,
+  });
+}
+
+export function publicRedeemTransferPairingCode(
+  code: string,
+  peerId: string,
+): Promise<PublicTransferRedeemedPairingCode> {
+  return publicJsonRequest(publicTransferRoomPath("pairing-codes/redeem"), { code, peerId });
 }
 
 export function publicRevokeTransferRoomAccessToken(

@@ -35,6 +35,7 @@ interface AuthState {
   reloadProfile: () => Promise<ManagementUser>;
   passwordLogin: (username: string, password: string) => Promise<void>;
   startOidcLogin: () => Promise<void>;
+  openLogin: () => void;
   logout: () => void;
 }
 
@@ -118,6 +119,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         sessionExpired.current = false;
         setAuthed(true);
         startRefresh();
+        const returnPath = takeAuthReturnPath();
+        if (returnPath) {
+          window.location.replace(returnPath);
+        }
       } catch (error) {
         tokenStore.clear();
         setProfile(null);
@@ -135,10 +140,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const state = randomToken();
     sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
     sessionStorage.setItem(OIDC_STATE_KEY, state);
-    sessionStorage.setItem(
-      AUTH_RETURN_PATH_KEY,
-      `${window.location.pathname}${window.location.search}${window.location.hash}`,
-    );
+    if (!safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY))) {
+      sessionStorage.setItem(
+        AUTH_RETURN_PATH_KEY,
+        `${window.location.pathname}${window.location.search}${window.location.hash}`,
+      );
+    }
     const challenge = await codeChallenge(verifier);
     const url = new URL(oidcConfig.authorizationEndpoint);
     url.searchParams.set("response_type", "code");
@@ -150,6 +157,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     url.searchParams.set("state", state);
     window.location.href = url.toString();
   }, [oidcConfig]);
+
+  const openLogin = useCallback(() => {
+    const returnPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (safeAuthReturnPath(returnPath)) {
+      sessionStorage.setItem(AUTH_RETURN_PATH_KEY, returnPath);
+    }
+    window.location.assign("/#login-panel");
+  }, []);
 
   useEffect(() => {
     if (initialized.current) {
@@ -203,6 +218,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     reloadProfile,
     passwordLogin,
     startOidcLogin,
+    openLogin,
     logout,
   };
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -243,6 +259,12 @@ async function completeOidcRedirect(
 
 function safeAuthReturnPath(value: string | null): string | null {
   return value && value.startsWith("/") && !value.startsWith("//") ? value : null;
+}
+
+function takeAuthReturnPath(): string | null {
+  const returnPath = safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY));
+  sessionStorage.removeItem(AUTH_RETURN_PATH_KEY);
+  return returnPath;
 }
 
 function cleanUrl(): void {

@@ -530,12 +530,31 @@ export interface PublicTransferRoomAccessToken {
   role: Exclude<PublicTransferRoomRole, "OWNER">;
   label: string;
   createdAt: string;
+  expiresAt: string | null;
   revokedAt: string | null;
 }
 
 export interface PublicTransferCreatedAccessToken {
   access: PublicTransferRoomAccessToken;
   token: string;
+}
+
+export interface PublicTransferPairingCode {
+  id: number;
+  code: string;
+  role: Exclude<PublicTransferRoomRole, "OWNER">;
+  label: string;
+  createdAt: string;
+  expiresAt: string;
+  maxUses: number;
+  usedCount: number;
+}
+
+export interface PublicTransferRedeemedPairingCode {
+  roomId: string;
+  role: Exclude<PublicTransferRoomRole, "OWNER">;
+  roomToken: string;
+  expiresAt: string;
 }
 
 export interface PublicTransferDiagramVersion {
