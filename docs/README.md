@@ -18,6 +18,7 @@
 
 * 互传模块支持文件传输、剪贴板同步和同步白板；[public-file-transfer-audit.md](transfer/public-file-transfer-audit.md) 记录其中的文件传输实现与审计清单(2026-07)。“接收前确认”默认关闭（自动接收），开启后才要求接收/拒绝，拒绝不回退 OSS。
 * [professional-diagram-complete-plan.md](transfer/professional-diagram-complete-plan.md) — 专业流程图完整改造说明，统一记录目标架构、当前已实现能力、明确边界、未实现功能、实施顺序和完成验收标准。
+* [professional-diagram-audit-2026-07.md](transfer/professional-diagram-audit-2026-07.md) — 专业流程图页面审查清单(2026-07)：交互、功能、界面美化三维度问题、优先级总览与建议修复顺序，兼作修复进度清单。
 
 ## cross-language/ — 多语言移植与一致性
 
