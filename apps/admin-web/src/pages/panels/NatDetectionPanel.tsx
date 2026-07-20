@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Button,
   Card,
@@ -679,7 +679,7 @@ function NatHero({
     <section
       className={embedded
         ? `app-apple-nat-hero relative overflow-hidden rounded-xl border ${accent.border} ${accent.bg} p-5`
-        : "relative py-6 sm:py-8"}
+        : "nat-hero-glow relative py-6 sm:py-8"}
     >
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {liveAnnouncement}
@@ -739,7 +739,11 @@ function NatHero({
           />
         )}
 
-        {!embedded && result && <MetricStrip result={result} />}
+        {!embedded && result && (
+          <div className="nat-result-reveal" style={{ animationDelay: "90ms" }}>
+            <MetricStrip result={result} />
+          </div>
+        )}
 
         <details className="group rounded-lg border glass glass-border px-3 py-2 text-small">
           <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-zinc-700 transition-colors hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-white">
@@ -783,6 +787,85 @@ function NatHero({
   );
 }
 
+function useSmoothedPercent(target: number | null, active: boolean): number | null {
+  const [display, setDisplay] = useState<number | null>(target);
+  const displayRef = useRef<number | null>(target);
+
+  useEffect(() => {
+    if (!active || target == null) {
+      displayRef.current = target;
+      setDisplay(target);
+      return;
+    }
+    if (displayRef.current == null) {
+      displayRef.current = target;
+    }
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      const current = displayRef.current ?? target;
+      let next = current + (target - current) * Math.min(1, dt * 3.4);
+      // 两次上报之间缓慢向前爬升，避免进度环长时间停在一个值上
+      const creepCap = Math.min(target + 6, 96);
+      if (next < creepCap) {
+        next += dt * 1.8;
+      }
+      next = Math.min(100, Math.max(0, next));
+      displayRef.current = next;
+      setDisplay(next);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target, active]);
+
+  return display;
+}
+
+const NAT_CHECK_STEPS: Array<{ phase: NatCheckProgressPhase; label: string }> = [
+  { phase: "preparing", label: "准备探针" },
+  { phase: "validating", label: "验证端点" },
+  { phase: "probing", label: "映射探测" },
+  { phase: "analyzing", label: "分析特征" },
+];
+
+const NAT_PHASE_ORDER: Record<NatCheckProgressPhase, number> = {
+  idle: -1,
+  preparing: 0,
+  validating: 1,
+  probing: 2,
+  analyzing: 3,
+  complete: NAT_CHECK_STEPS.length,
+};
+
+function NatCheckSteps({ phase }: { phase: NatCheckProgressPhase }) {
+  const current = NAT_PHASE_ORDER[phase];
+  return (
+    <ol className="nat-steps" aria-hidden="true">
+      {NAT_CHECK_STEPS.map((step, index) => {
+        const state = index < current ? "done" : index === current ? "active" : "pending";
+        return (
+          <li key={step.phase} className={`nat-step nat-step-${state}`}>
+            <span className="nat-step-dot">
+              {state === "done" ? (
+                <svg viewBox="0 0 12 12" fill="none" className="h-2.5 w-2.5">
+                  <path d="m2.5 6 2.5 2.5 4.5-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+                </svg>
+              ) : (
+                index + 1
+              )}
+            </span>
+            <span className="nat-step-label">{step.label}</span>
+            {index < NAT_CHECK_STEPS.length - 1 && <span className="nat-step-line" />}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 function NatDetectionOrb({
   embedded,
   checking,
@@ -799,19 +882,17 @@ function NatDetectionOrb({
   const radius = 46;
   const circumference = 2 * Math.PI * radius;
   const determinate = checking && progress.percent != null;
-  const progressOffset = determinate
-    ? circumference * (1 - Math.min(100, Math.max(0, progress.percent ?? 0)) / 100)
-    : 0;
+  const smoothPercent = useSmoothedPercent(progress.percent, checking);
+  const ringPercent = determinate ? Math.min(100, Math.max(0, smoothPercent ?? 0)) : 0;
+  const progressOffset = circumference * (1 - ringPercent / 100);
   const state = checking ? "checking" : result ? "complete" : "idle";
   const privacyId = embedded ? "embedded-nat-check-privacy" : "public-nat-check-privacy";
   const centerText = checking
-    ? progress.percent != null
-      ? `${progress.percent}%`
-      : progress.responded > 0 && progress.total > 0
-        ? `${progress.responded}/${progress.total}`
-        : progress.unattributedMapping
-          ? "已映射"
-          : "检测中"
+    ? progress.responded > 0 && progress.total > 0
+      ? `${progress.responded}/${progress.total}`
+      : progress.unattributedMapping
+        ? "已映射"
+        : "检测中"
     : result
       ? "再测一次"
       : "点我检测";
@@ -825,7 +906,7 @@ function NatDetectionOrb({
           aria-label="NAT 检测进度"
           aria-valuemin={0}
           aria-valuemax={100}
-          aria-valuenow={progress.percent ?? undefined}
+          aria-valuenow={determinate ? Math.round(ringPercent) : undefined}
           aria-valuetext={progress.label}
         />
       )}
@@ -844,6 +925,12 @@ function NatDetectionOrb({
         <span className="nat-detect-orbit absolute -inset-3 rounded-full border border-primary-500/20 dark:border-primary-300/20" aria-hidden="true" />
         <span className="nat-detect-orbit-secondary absolute -inset-6 rounded-full border border-dashed border-primary-500/10 dark:border-primary-300/10" aria-hidden="true" />
         {checking && (
+          <>
+            <span className="nat-detect-ripple" aria-hidden="true" />
+            <span className="nat-detect-ripple nat-detect-ripple-delay" aria-hidden="true" />
+          </>
+        )}
+        {checking && (
           <svg aria-hidden="true" className={`absolute inset-0 h-full w-full -rotate-90 ${determinate ? "" : "nat-detect-progress-indeterminate"}`} viewBox="0 0 100 100">
             <circle cx="50" cy="50" r={radius} fill="none" stroke="currentColor" strokeWidth="3" className="text-primary-500/15 dark:text-primary-300/15" />
             <circle
@@ -856,8 +943,17 @@ function NatDetectionOrb({
               strokeWidth="3"
               strokeDasharray={determinate ? circumference : `72 ${circumference - 72}`}
               strokeDashoffset={determinate ? progressOffset : 0}
-              className="text-primary-600 transition-[stroke-dashoffset] duration-300 dark:text-primary-300 motion-reduce:transition-none"
+              className="text-primary-600 dark:text-primary-300"
             />
+            {determinate && (
+              <circle
+                cx={50 + radius * Math.cos((ringPercent / 100) * 2 * Math.PI)}
+                cy={50 + radius * Math.sin((ringPercent / 100) * 2 * Math.PI)}
+                r="3.4"
+                fill="currentColor"
+                className="nat-detect-progress-head text-primary-600 dark:text-primary-300"
+              />
+            )}
           </svg>
         )}
         <span className="relative z-10 flex max-w-[82%] flex-col items-center gap-1">
@@ -869,7 +965,7 @@ function NatDetectionOrb({
             </svg>
           )}
           <span className={`${checking ? "text-xl tabular-nums" : embedded ? "text-sm" : "text-base"} font-semibold text-zinc-950 dark:text-white`}>
-            {centerText}
+            {checking && determinate ? `${Math.round(ringPercent)}%` : centerText}
           </span>
           <span className="text-[10px] font-medium tracking-wide text-zinc-500 dark:text-zinc-400">
             {checking ? "STUN 探测" : result ? "更新检测结果" : "浏览器直测"}
@@ -892,6 +988,9 @@ function NatDetectionOrb({
           <span id={privacyId}>无需安装，不读取摄像头或麦克风</span>
         )}
       </div>
+      <div className="flex h-7 items-center">
+        {checking && <NatCheckSteps phase={progress.phase} />}
+      </div>
     </div>
   );
 }
@@ -908,11 +1007,11 @@ function NatOutcomeCard({
   result: BrowserNatResult;
 }) {
   return (
-    <article className={`nat-result-reveal relative overflow-hidden rounded-2xl border-2 p-5 shadow-lg sm:p-6 ${outcome.frameClass}`}>
-      <span className={`absolute inset-x-0 top-0 h-1.5 ${natToneBg(outcome.tone)}`} aria-hidden="true" />
+    <article className={`nat-result-reveal relative overflow-hidden rounded-2xl border p-5 shadow-sm sm:p-6 ${outcome.frameClass}`}>
+      <span className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}`} aria-hidden="true" />
       <div className="flex flex-wrap items-start gap-4 pt-1">
         <div
-          className={`flex h-14 w-14 shrink-0 items-center justify-center rounded-xl text-base font-semibold shadow-sm ${outcome.markerClass}`}
+          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center rounded-xl text-base font-semibold shadow-sm ${outcome.markerClass}`}
           aria-hidden="true"
         >
           {outcome.level ? `${outcome.level}/4` : <StatusGlyph color={outcome.tone} className="h-6 w-6" />}
@@ -1082,17 +1181,50 @@ function unavailableNatOutcome(title: string, description: string, action: strin
   };
 }
 
+function useCountUp(target: number, duration = 720): number {
+  const [value, setValue] = useState(0);
+
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setValue(target);
+      return;
+    }
+    let raf = 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / duration);
+      setValue(Math.round(target * (1 - (1 - t) ** 3)));
+      if (t < 1) {
+        raf = requestAnimationFrame(tick);
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target, duration]);
+
+  return value;
+}
+
 function MetricStrip({ result }: { result: BrowserNatResult | null }) {
   const knownProbes = result?.probes.filter((probe) => probe.sourceKnown) ?? [];
   const respondedCount = knownProbes.filter((probe) =>
     probe.candidates.some((candidate) => candidate.type === "srflx"),
   ).length;
+  const endpointTotal = result?.endpointChecks.length ?? 0;
+  const reachableCount = result?.endpointChecks.filter((check) => check.reachable).length ?? 0;
+  const mappedCount = result?.mappedEndpoints.length ?? 0;
+  const elapsedMs = result ? Math.max(0, result.finishedAt - result.startedAt) : 0;
+  const animatedFirst = useCountUp(endpointTotal > 0 ? reachableCount : respondedCount);
+  const animatedMapped = useCountUp(mappedCount);
+  const animatedElapsed = useCountUp(elapsedMs);
   const items = [
     {
       label: result?.endpointChecks.length ? "四端点预检" : "STUN 服务",
-      value: result?.endpointChecks.length
-        ? `${result.endpointChecks.filter((check) => check.reachable).length}/${result.endpointChecks.length}`
-        : result ? `${respondedCount}/${knownProbes.length}` : "—",
+      value: result
+        ? endpointTotal > 0
+          ? `${animatedFirst}/${endpointTotal}`
+          : `${animatedFirst}/${knownProbes.length}`
+        : "—",
       hint: result?.endpointChecks.length
         ? "先分别验证 A1:P1、A1:P2、A2:P1、A2:P2 可达，防止把服务端点不可达误判成 NAT 行为。"
         : "返回公网映射的 STUN 服务数 / 参与探测的总数。返回数越多，映射结论越可靠。",
@@ -1104,12 +1236,12 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
     },
     {
       label: "公网映射端点",
-      value: result ? String(result.mappedEndpoints.length) : "—",
+      value: result ? String(animatedMapped) : "—",
       hint: "NAT 分配给本机的公网 IP:Port。同一 UDP 基址因目标变化出现多个端点，表示目标相关映射。",
     },
     {
       label: "总耗时",
-      value: result ? `${Math.max(0, result.finishedAt - result.startedAt)} ms` : "—",
+      value: result ? `${animatedElapsed} ms` : "—",
       hint: "从发起检测到 ICE 收集结束的总时间，受「单服务超时」设置影响。",
     },
   ];
@@ -1121,7 +1253,7 @@ function MetricStrip({ result }: { result: BrowserNatResult | null }) {
           placement="bottom"
           content={<div className="max-w-60 py-0.5 text-tiny">{item.hint}</div>}
         >
-          <div className="cursor-help rounded-lg border glass glass-border px-3 py-2">
+          <div className="cursor-help rounded-lg border glass glass-border px-3 py-2 transition duration-200 hover:-translate-y-0.5 hover:border-primary-500/30 hover:shadow-sm motion-reduce:transform-none motion-reduce:transition-none">
             <div className="flex items-center gap-1 text-tiny text-zinc-500 dark:text-zinc-400">
               <span>{item.label}</span>
               <InfoIcon className="h-3 w-3 shrink-0 opacity-60" />
@@ -1154,12 +1286,22 @@ function mappingBehaviorShortLabel(mapping: BrowserNatMappingBehavior): string {
 }
 
 function NatResultDetails({ result }: { result: BrowserNatResult }) {
+  const cards: Array<{ id: string; node: ReactNode }> = [];
+  if (result.endpointChecks.length > 0) {
+    cards.push({ id: "rfc5780", node: <Rfc5780EndpointCard checks={result.endpointChecks} /> });
+  }
+  cards.push(
+    { id: "mapped-endpoints", node: <MappedEndpointsCard result={result} /> },
+    { id: "stun-probes", node: <StunProbesCard result={result} /> },
+    { id: "candidates", node: <CandidateTableCard result={result} /> },
+  );
   return (
     <div className="mt-6 flex flex-col gap-4">
-      {result.endpointChecks.length > 0 && <Rfc5780EndpointCard checks={result.endpointChecks} />}
-      <MappedEndpointsCard result={result} />
-      <StunProbesCard result={result} />
-      <CandidateTableCard result={result} />
+      {cards.map((card, index) => (
+        <div key={card.id} className="nat-result-reveal" style={{ animationDelay: `${140 + index * 90}ms` }}>
+          {card.node}
+        </div>
+      ))}
     </div>
   );
 }
@@ -1442,6 +1584,7 @@ const NAT_LEVEL_GUIDE = [
     detail: "这通常表示设备直接持有公网地址，但不代表入站一定开放；本机防火墙、云安全组或运营商策略仍可能拦截数据。",
     impact: "直连条件最好，仍应通过 ICE 连通性检查确认真实路径。",
     tone: "border-emerald-500/35 text-emerald-700 dark:border-emerald-300/35 dark:text-emerald-200",
+    badge: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:border-emerald-300/30 dark:bg-emerald-300/10 dark:text-emerald-200",
   },
   {
     level: 2,
@@ -1451,6 +1594,7 @@ const NAT_LEVEL_GUIDE = [
     detail: "端口保持是端口分配特征，不是独立的 cone 类型。它让对端更容易预测候选端口，但过滤策略仍可能很严格。",
     impact: "通常利于 UDP 打洞，遇到严格过滤或目标相关映射对端时仍可能中继。",
     tone: "border-blue-500/35 text-blue-700 dark:border-blue-300/35 dark:text-blue-200",
+    badge: "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:border-blue-300/30 dark:bg-blue-300/10 dark:text-blue-200",
   },
   {
     level: 3,
@@ -1460,6 +1604,7 @@ const NAT_LEVEL_GUIDE = [
     detail: "它可能对应旧称 Full Cone、Restricted Cone 或 Port Restricted Cone；三者的差别在过滤轴，浏览器页面不能用 ICE candidate 完整区分。",
     impact: "映射侧对直连友好，实际成功率取决于双方过滤行为和防火墙。",
     tone: "border-amber-500/40 text-amber-800 dark:border-amber-300/40 dark:text-amber-100",
+    badge: "border-amber-500/30 bg-amber-500/10 text-amber-800 dark:border-amber-300/30 dark:bg-amber-300/10 dark:text-amber-100",
   },
   {
     level: 4,
@@ -1469,6 +1614,7 @@ const NAT_LEVEL_GUIDE = [
     detail: "ADM 依赖目标地址，APDM 同时依赖目标地址和端口。对端难以通过一次 STUN 结果预测后续目标可用的公网端点。",
     impact: "直连可预测性最低，应并行尝试候选并快速准备 TURN / Relay。",
     tone: "border-rose-500/40 text-rose-700 dark:border-rose-300/40 dark:text-rose-200",
+    badge: "border-rose-500/30 bg-rose-500/10 text-rose-700 dark:border-rose-300/30 dark:bg-rose-300/10 dark:text-rose-200",
   },
 ] as const;
 
@@ -1516,9 +1662,9 @@ function NatTypeGuide({
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         {NAT_LEVEL_GUIDE.map((item) => (
-          <article key={item.level} className={`rounded-lg border-l-4 border-y border-r border-black/10 bg-white/45 p-4 dark:border-y-white/10 dark:border-r-white/10 dark:bg-white/[0.025] ${item.tone}`}>
+          <article key={item.level} className={`rounded-lg border-l-4 border-y border-r border-black/10 bg-white/45 p-4 transition duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transform-none motion-reduce:transition-none dark:border-y-white/10 dark:border-r-white/10 dark:bg-white/[0.025] dark:hover:shadow-black/40 ${item.tone}`}>
             <div className="flex items-start gap-3">
-              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-current/25 font-mono text-small font-semibold">
+              <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md border font-mono text-small font-semibold ${item.badge}`}>
                 {item.level}
               </span>
               <div className="min-w-0">
@@ -1577,7 +1723,7 @@ function NatTips({ probeConfig }: { probeConfig: PublicNatProbeConfig | null }) 
       {tips.map((tip) => (
         <div
           key={tip.title}
-          className="rounded-xl border glass glass-border p-4"
+          className="rounded-xl border glass glass-border p-4 transition duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transform-none motion-reduce:transition-none dark:hover:shadow-black/40"
         >
           <div className="text-small font-semibold text-zinc-900 dark:text-white">{tip.title}</div>
           <p className="mt-1.5 text-small leading-6 text-zinc-600 dark:text-zinc-400">{tip.text}</p>

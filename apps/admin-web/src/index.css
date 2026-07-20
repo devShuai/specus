@@ -4243,6 +4243,23 @@ body {
 }
 
 /* NAT detection keeps its motion budget in one place: the browser/STUN probe orb. */
+.nat-hero-glow::before {
+  position: absolute;
+  inset: -120px -60px auto;
+  height: 460px;
+  content: "";
+  pointer-events: none;
+  background:
+    radial-gradient(560px 300px at 84% 6%, color-mix(in srgb, var(--app-apple-blue) 11%, transparent), transparent 70%),
+    radial-gradient(420px 260px at 8% 0%, color-mix(in srgb, var(--app-apple-blue) 6%, transparent), transparent 70%);
+}
+
+.dark .nat-hero-glow::before {
+  background:
+    radial-gradient(560px 300px at 84% 6%, color-mix(in srgb, var(--app-apple-blue) 20%, transparent), transparent 70%),
+    radial-gradient(420px 260px at 8% 0%, color-mix(in srgb, var(--app-apple-blue) 10%, transparent), transparent 70%);
+}
+
 .nat-detect-orb {
   border-color: color-mix(in srgb, var(--app-apple-blue) 42%, var(--app-apple-line));
   color: var(--app-apple-blue);
@@ -4271,11 +4288,11 @@ body {
 }
 
 .nat-detect-orbit {
-  animation: nat-orbit-breathe 2.6s cubic-bezier(0.22, 1, 0.36, 1) 2;
+  animation: nat-orbit-breathe 2.6s cubic-bezier(0.22, 1, 0.36, 1) infinite;
 }
 
 .nat-detect-orbit-secondary {
-  animation: nat-orbit-counter 5.2s linear 2;
+  animation: nat-orbit-counter 5.2s linear infinite;
 }
 
 .nat-detect-orb[data-state="checking"] .nat-detect-orbit {
@@ -4290,8 +4307,54 @@ body {
   animation: nat-progress-spin 1.35s linear infinite;
 }
 
+.nat-detect-progress-head {
+  filter: drop-shadow(0 0 5px currentColor);
+}
+
+.nat-detect-ripple {
+  position: absolute;
+  inset: 0;
+  border: 1px solid color-mix(in srgb, var(--app-apple-blue, #0066cc) 42%, transparent);
+  border-radius: 999px;
+  opacity: 0;
+  pointer-events: none;
+  animation: nat-ripple 2.4s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+.nat-detect-ripple-delay {
+  animation-delay: 1.2s;
+}
+
+@keyframes nat-ripple {
+  0% { opacity: 0; transform: scale(1); }
+  16% { opacity: 0.72; }
+  100% { opacity: 0; transform: scale(1.72); }
+}
+
 .nat-result-reveal {
   animation: nat-result-reveal 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.nat-outcome-marker {
+  animation: nat-outcome-pop 480ms cubic-bezier(0.34, 1.56, 0.64, 1) 140ms both;
+}
+
+@keyframes nat-outcome-pop {
+  from { opacity: 0; transform: scale(0.6); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.nat-outcome-bar::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.75), transparent);
+  transform: translateX(-100%);
+  animation: nat-bar-sweep 1.05s ease-out 380ms both;
+}
+
+@keyframes nat-bar-sweep {
+  to { transform: translateX(100%); }
 }
 
 @keyframes nat-orbit-breathe {
@@ -4321,11 +4384,103 @@ body {
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
+.nat-steps {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nat-step {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.nat-step-dot {
+  display: grid;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  place-items: center;
+  border-radius: 999px;
+  font-size: 9px;
+  transition:
+    background-color 240ms ease,
+    color 240ms ease,
+    box-shadow 240ms ease;
+}
+
+.nat-step-pending {
+  color: var(--app-apple-subtle, #6e6e73);
+}
+
+.nat-step-pending .nat-step-dot {
+  border: 1px solid var(--app-apple-line-strong, rgba(29, 29, 31, 0.2));
+  color: var(--app-apple-subtle, #6e6e73);
+}
+
+.nat-step-active {
+  color: var(--app-apple-blue, #0066cc);
+}
+
+.nat-step-active .nat-step-dot {
+  color: #ffffff;
+  background: var(--app-apple-blue, #0066cc);
+  animation: nat-step-dot-pulse 1.4s ease-in-out infinite;
+}
+
+.nat-step-done {
+  color: var(--app-apple-muted, #515154);
+}
+
+.nat-step-done .nat-step-dot {
+  color: #ffffff;
+  background: color-mix(in srgb, var(--app-apple-blue, #0066cc) 72%, transparent);
+}
+
+.nat-step-done .nat-step-dot svg path {
+  stroke-dasharray: 12;
+  stroke-dashoffset: 12;
+  animation: nat-step-check 300ms ease-out 80ms forwards;
+}
+
+@keyframes nat-step-check {
+  to { stroke-dashoffset: 0; }
+}
+
+.nat-step-line {
+  width: 14px;
+  height: 1px;
+  margin-inline: 2px;
+  background: var(--app-apple-line, rgba(29, 29, 31, 0.12));
+}
+
+.nat-step-done .nat-step-line {
+  background: color-mix(in srgb, var(--app-apple-blue, #0066cc) 45%, transparent);
+}
+
+@keyframes nat-step-dot-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1)); }
+  50% { box-shadow: 0 0 0 4px var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1)); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .nat-detect-orbit,
   .nat-detect-orbit-secondary,
   .nat-detect-progress-indeterminate,
-  .nat-result-reveal {
+  .nat-detect-ripple,
+  .nat-result-reveal,
+  .nat-outcome-marker,
+  .nat-outcome-bar::after,
+  .nat-step-done .nat-step-dot svg path,
+  .nat-step-active .nat-step-dot {
     animation: none !important;
   }
 }
