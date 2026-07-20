@@ -1,14 +1,9 @@
-import { Button, Dropdown, DropdownItem, DropdownMenu, DropdownSection, DropdownTrigger } from "@heroui/react";
 import { useAuth } from "../auth/AuthContext";
 import { useTheme } from "../theme/ThemeContext";
-
-interface UserMenuButtonProps {
-  className?: string;
-  size?: "sm" | "md" | "lg";
-}
+import { HeaderMenu } from "./HeaderMenu";
 
 /** 公共页头的账号 + 主题合并菜单按钮，替代原先分开的登录按钮和主题切换按钮。 */
-export function UserMenuButton({ className, size = "sm" }: UserMenuButtonProps) {
+export function UserMenuButton({ className }: { className?: string }) {
   const { ready, authed, profile, openLogin, logout } = useAuth();
   const { theme, setTheme, userOverride, resetToSystem } = useTheme();
   const mode = userOverride ? theme : "system";
@@ -17,68 +12,54 @@ export function UserMenuButton({ className, size = "sm" }: UserMenuButtonProps) 
   const accountLabel = authed ? `已登录：${name}` : "未登录";
 
   return (
-    <Dropdown placement="bottom-end" shouldBlockScroll={false}>
-      <DropdownTrigger>
-        <Button
-          isIconOnly
-          aria-label={`账号与主题：${accountLabel}，主题${modeLabel}`}
-          className={`theme-toggle-button ${className ?? ""}`}
-          radius="full"
-          size={size}
-          title={`${accountLabel} · 主题：${modeLabel}`}
-          variant="light"
-        >
-          {authed ? (
-            <span className="grid h-5 w-5 place-items-center rounded-full bg-primary-500 text-[10px] font-semibold leading-none text-primary-foreground">
-              {name.slice(0, 1).toUpperCase() || "U"}
-            </span>
-          ) : (
-            <UserIcon />
-          )}
-        </Button>
-      </DropdownTrigger>
-      <DropdownMenu
-        aria-label="账号与主题"
-        className="public-header-menu"
-        onAction={(key) => {
-          if (key === "login") openLogin();
-          else if (key === "logout") logout();
-          else if (key === "system") resetToSystem();
-          else if (key === "light" || key === "dark") setTheme(key);
-        }}
-      >
-        <DropdownSection aria-label="账号" showDivider>
-          {authed ? (
-            <DropdownItem key="profile" isReadOnly textValue="账号信息">
-              <div className="space-y-0.5 py-0.5">
-                <div className="text-small font-semibold text-foreground">{name}</div>
-                <div className="text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"} · 已登录</div>
-              </div>
-            </DropdownItem>
-          ) : (
-            <DropdownItem key="login" isDisabled={!ready} startContent={<UserIcon />} textValue="登录">
-              {ready ? "登录" : "账号检测中…"}
-            </DropdownItem>
-          )}
-          {authed ? (
-            <DropdownItem key="logout" className="text-danger" color="danger" textValue="退出登录">
-              退出登录
-            </DropdownItem>
-          ) : null}
-        </DropdownSection>
-        <DropdownSection aria-label="主题">
-          <DropdownItem key="system" startContent={<SystemIcon />} endContent={mode === "system" ? <CheckIcon /> : null}>
-            跟随系统
-          </DropdownItem>
-          <DropdownItem key="light" startContent={<SunIcon />} endContent={mode === "light" ? <CheckIcon /> : null}>
-            浅色模式
-          </DropdownItem>
-          <DropdownItem key="dark" startContent={<MoonIcon />} endContent={mode === "dark" ? <CheckIcon /> : null}>
-            深色模式
-          </DropdownItem>
-        </DropdownSection>
-      </DropdownMenu>
-    </Dropdown>
+    <HeaderMenu
+      label={`账号与主题：${accountLabel}，主题${modeLabel}`}
+      menuClassName="public-header-menu"
+      title={`${accountLabel} · 主题：${modeLabel}`}
+      triggerClassName={`theme-toggle-button ${className ?? ""}`}
+      trigger={
+        authed ? (
+          <span className="grid h-5 w-5 place-items-center rounded-full bg-primary-500 text-[10px] font-semibold leading-none text-primary-foreground">
+            {name.slice(0, 1).toUpperCase() || "U"}
+          </span>
+        ) : (
+          <UserIcon />
+        )
+      }
+    >
+      {authed ? (
+        <>
+          <div className="header-menu-static space-y-0.5">
+            <div className="text-small font-semibold text-foreground">{name}</div>
+            <div className="text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"} · 已登录</div>
+          </div>
+          <button type="button" className="header-menu-item header-menu-item-danger" role="menuitem" onClick={() => logout()}>
+            退出登录
+          </button>
+        </>
+      ) : (
+        <button type="button" className="header-menu-item" disabled={!ready} role="menuitem" onClick={() => openLogin()}>
+          <UserIcon />
+          <span className="flex-1">{ready ? "登录" : "账号检测中…"}</span>
+        </button>
+      )}
+      <div className="header-menu-divider" role="separator" />
+      <button type="button" className="header-menu-item" role="menuitem" onClick={() => resetToSystem()}>
+        <SystemIcon />
+        <span className="flex-1">跟随系统</span>
+        {mode === "system" ? <CheckIcon /> : null}
+      </button>
+      <button type="button" className="header-menu-item" role="menuitem" onClick={() => setTheme("light")}>
+        <SunIcon />
+        <span className="flex-1">浅色模式</span>
+        {mode === "light" ? <CheckIcon /> : null}
+      </button>
+      <button type="button" className="header-menu-item" role="menuitem" onClick={() => setTheme("dark")}>
+        <MoonIcon />
+        <span className="flex-1">深色模式</span>
+        {mode === "dark" ? <CheckIcon /> : null}
+      </button>
+    </HeaderMenu>
   );
 }
 

@@ -1,3 +1,13 @@
+/* Inter 变量字体仅打包 latin 子集（中英文混排下 CJK 走系统字体栈，其余子集按需无意义） */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("../node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+2000-206F, U+2190-21FF, U+2200-22FF;
+}
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -2773,6 +2783,7 @@ body {
   height: 36px !important;
   border: 0 !important;
   border-radius: 999px !important;
+  padding: 0 !important;
   color: var(--landing-ink, var(--app-apple-ink, #1d1d1f)) !important;
   background: transparent !important;
   box-shadow: none !important;
@@ -2781,6 +2792,101 @@ body {
 .public-header-theme-button:hover {
   color: var(--landing-action, var(--app-apple-blue, #0066cc)) !important;
   background: var(--landing-action-soft, var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1))) !important;
+}
+
+.header-menu {
+  position: relative;
+}
+
+.header-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.header-menu-trigger svg {
+  display: block;
+  flex: none;
+}
+
+.header-menu-panel {
+  position: absolute;
+  z-index: 70;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 208px;
+  border: 1px solid var(--landing-hairline, var(--app-apple-line, rgba(29, 29, 31, 0.12)));
+  border-radius: 12px;
+  padding: 6px;
+  color: var(--landing-ink, var(--app-apple-ink, #1d1d1f));
+  background: var(--landing-surface, var(--app-apple-surface, #ffffff));
+  box-shadow: 0 12px 32px rgba(29, 29, 31, 0.14);
+  animation: header-menu-in 160ms ease;
+}
+
+.dark .header-menu-panel {
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+@keyframes header-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.header-menu-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: inherit;
+  background: transparent;
+  font-size: 0.875rem;
+  line-height: 1.35;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.header-menu-item:hover,
+.header-menu-item:focus-visible {
+  background: var(--landing-action-soft, var(--app-apple-row-hover, rgba(0, 102, 204, 0.055)));
+  outline: none;
+}
+
+.header-menu-item:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.header-menu-item-danger {
+  color: var(--app-apple-danger, #c9343a);
+}
+
+.header-menu-divider {
+  height: 1px;
+  margin: 6px 4px;
+  background: var(--landing-hairline, var(--app-apple-line, rgba(29, 29, 31, 0.12)));
+}
+
+.header-menu-static {
+  padding: 8px 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .header-menu-panel {
+    animation: none;
+  }
 }
 
 .public-header-menu {

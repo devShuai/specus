@@ -1,4 +1,4 @@
-import { Button, Dropdown, DropdownItem, DropdownMenu, DropdownTrigger } from "@heroui/react";
+import { HeaderMenu } from "./HeaderMenu";
 
 export type PublicToolKey = "transfer" | "diagram" | "nat-detect";
 
@@ -13,41 +13,32 @@ const PUBLIC_TOOLS: Array<{ key: PublicToolIconName; label: string; detail: stri
 
 export function PublicToolsMenu({ active, className = "" }: { active?: PublicToolKey; className?: string }) {
   return (
-    <Dropdown placement="bottom-end" shouldBlockScroll={false}>
-      <DropdownTrigger>
-        <Button
-          isIconOnly
-          aria-label="打开工具菜单"
-          className={`public-header-button public-tools-trigger ${className}`}
-          radius="full"
-          size="sm"
-          title="工具"
-          variant="light"
+    <HeaderMenu
+      label="打开工具菜单"
+      menuClassName="public-header-menu public-tools-menu"
+      title="工具"
+      trigger={<ToolsLauncherIcon />}
+      triggerClassName={`public-header-button public-tools-trigger ${className}`}
+    >
+      {PUBLIC_TOOLS.map((tool) => (
+        <a
+          key={tool.key}
+          aria-current={active === tool.key ? "page" : undefined}
+          className={`header-menu-item public-tools-menu-item ${active === tool.key ? "public-tools-menu-item-active" : ""}`}
+          href={tool.key === "console" ? "/" : `/${tool.key}`}
+          role="menuitem"
         >
-          <ToolsLauncherIcon />
-        </Button>
-      </DropdownTrigger>
-      <DropdownMenu aria-label="公共工具" className="public-header-menu public-tools-menu">
-        {PUBLIC_TOOLS.map((tool) => (
-          <DropdownItem
-            key={tool.key}
-            href={tool.key === "console" ? "/" : `/${tool.key}`}
-            aria-current={active === tool.key ? "page" : undefined}
-            className={`public-tools-menu-item ${active === tool.key ? "public-tools-menu-item-active" : ""}`}
-            startContent={
-              <span className="public-tools-menu-icon" aria-hidden="true">
-                <PublicToolIcon name={tool.key} />
-              </span>
-            }
-            endContent={active === tool.key ? <CurrentIcon /> : <NavigateIcon />}
-            textValue={`${tool.label}，${tool.detail}`}
-          >
+          <span className="public-tools-menu-icon" aria-hidden="true">
+            <PublicToolIcon name={tool.key} />
+          </span>
+          <span className="min-w-0 flex-1">
             <span className="block text-[13px] font-semibold leading-5">{tool.label}</span>
             <span className="block text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">{tool.detail}</span>
-          </DropdownItem>
-        ))}
-      </DropdownMenu>
-    </Dropdown>
+          </span>
+          {active === tool.key ? <CurrentIcon /> : <NavigateIcon />}
+        </a>
+      ))}
+    </HeaderMenu>
   );
 }
 
