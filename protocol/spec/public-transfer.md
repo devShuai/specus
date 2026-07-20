@@ -10,10 +10,11 @@ MUST、SHOULD、MAY。
 1. `GET /api/public/transfer/ice-config` 提供 STUN/TURN 候选；
 2. `/ws/public-transfer/discovery` 负责浏览器发现、roster、定向信令，以及 DataChannel 不可用时的应用消息回退；
 3. WebRTC `RTCDataChannel` 优先承载剪贴板和白板等浏览器应用消息；
-4. 附件 REST 返回短期预签名 URL，文件内容由客户端直接上传/下载对象存储。
+4. 登录用户可通过附件 REST 获取短期预签名 URL，文件内容由客户端直接上传/下载对象存储。
 
-发现 WebSocket 和公开附件接口均无需管理 JWT。它们不是安全边界：共享房间的安全性来自高熵
-`roomToken`，附近房间的隔离来自可信反向代理提供的来源 IP。
+ICE 配置、发现 WebSocket、WebRTC Direct 和 TURN 均无需管理 JWT。公开附件接口用于 OSS 数据面，必须同时提供
+有效的管理账号 Bearer JWT 和房间凭据；因此匿名用户只能使用 Direct/TURN，不得申请、完成或下载 OSS 附件。
+共享房间仍由高熵 `roomToken` 隔离，附近房间由可信反向代理提供的来源 IP 隔离。
 
 ## 1. 公共 ICE 配置
 
@@ -141,9 +142,10 @@ roomToken 为空: roomKey = "public:" + publicAddress
 
 首次使用某个 `roomId + roomToken` 时，Java server 创建持久房间，并把该 Token 的 SHA-256 哈希登记为房主凭证；
 明文 Token 不持久化。以后房主 Token 解析为 `OWNER`，房主签发且未撤销的邀请 Token 按其记录解析为 `EDITOR` 或
-`VIEWER`，三者都通过相同 `persistentRoomId` 加入同一分组。未知 Token 仍按旧协议语义创建独立房间，因此升级前已有的
-房间链接无需迁移，且相同房间名配不同旧 Token 仍彼此隔离。未提供 Token 的参与者只有在 `roomId` 与来源地址都相同时
-才能互见。`sharedRoom` 表示是否使用 Token 房间。
+`VIEWER`，三者都通过相同 `persistentRoomId` 加入同一分组。已撤销或已过期的邀请必须返回 `403`，不能回退为新房间的
+房主。普通未知高熵 Token 仍按旧协议语义创建独立房间，因此升级前已有的房间链接无需迁移，且相同房间名配不同旧 Token
+仍彼此隔离；但未知的 `st-editor-` 或 `st-viewer-` 前缀 Token 必须返回 `403`，防止被删除的邀请创建“影子房主”房间。
+未提供 Token 的参与者只有在 `roomId` 与来源地址都相同时才能互见。`sharedRoom` 表示是否使用 Token 房间。
 
 ### 2.3 加入、hello 与 roster
 
@@ -227,6 +229,24 @@ POST /api/public/transfer/rooms/access-tokens/{accessId}/revoke
 ```
 
 每个房间最多保留 20 个未撤销邀请。服务端只保存邀请 Token 的 SHA-256 哈希；创建响应是唯一返回明文 Token 的时机。
+创建请求可以提供 `expiresInSeconds`，有效范围为 `300..604800`；省略时保留历史上的长期 Token 语义。网页的快捷邀请必须
+使用 24 小时 `EDITOR` 或 `VIEWER` Token，不能复制、分享或生成包含 `OWNER` Token 的二维码。邀请 Token 只允许放在页面
+URL fragment 中；页面读取后必须立即从地址栏清除，统计脚本也不得上报 query 或 fragment。
+
+房主还可以创建短时配对码，访客无需先取得房间名或 Token：
+
+```text
+POST /api/public/transfer/rooms/pairing-codes
+POST /api/public/transfer/rooms/pairing-codes/redeem
+```
+
+创建接口要求 `OWNER` 房间凭据，并接受 `role=EDITOR|VIEWER`、`label` 和 `maxUses`。`maxUses` 默认为 `1`，最大为 `5`；
+返回 8 位数字明文码、角色和过期时间，并设置 `Cache-Control: no-store`。服务端只能持久化带域分隔的 HMAC-SHA256 摘要，
+不得保存明文码。有效期由 `pairing-code-ttl-seconds` 控制，Java 会约束在 `60..900` 秒内，默认 300 秒。
+
+兑换接口只接受 `code` 与 `peerId`。消费必须以数据库条件更新原子执行，同时验证未撤销、未过期且未超过使用次数；默认
+一次性码的并发兑换只能有一个成功。成功后签发相同角色的 24 小时访问 Token，并返回 `roomId`、`role`、明文 Token 和
+过期时间；失败统一返回 `400`“配对码无效或已过期”，不泄露码是否曾存在。兑换按来源 IP 独立限流，默认每 300 秒 10 次。
 
 ### 2.4 ping、信令与应用消息转发
 
@@ -417,14 +437,16 @@ session 的文本/二进制容器 limit 显式设为 `65,536`；按 UTF-8 字节
 
 | 作用域 | 方法与路径 | 鉴权 | 请求体 |
 | --- | --- | --- | --- |
-| 公开创建上传 | `POST /api/public/transfer/attachments/presign-upload` | 无 | `PresignUploadRequest` |
-| 公开确认上传 | `POST /api/public/transfer/attachments/{attachmentId}/complete` | 无 | `{"roomToken":"..."}` |
-| 公开创建下载 | `POST /api/public/transfer/attachments/{attachmentId}/presign-download` | 无 | `{"roomToken":"..."}` |
+| 公开创建上传 | `POST /api/public/transfer/attachments/presign-upload` | Bearer JWT + 房间权限 | `PresignUploadRequest` |
+| 公开确认上传 | `POST /api/public/transfer/attachments/{attachmentId}/complete` | Bearer JWT + 房间权限 | `{"roomToken":"..."}` |
+| 公开创建下载 | `POST /api/public/transfer/attachments/{attachmentId}/presign-download` | Bearer JWT + 房间权限 | `{"roomToken":"..."}` |
 | 管理创建上传 | `POST /api/admin/client-messages/attachments/presign-upload` | Bearer JWT | `PresignUploadRequest` |
 | 管理确认上传 | `POST /api/admin/client-messages/attachments/{attachmentId}/complete` | Bearer JWT | 无 |
 | 管理创建下载 | `POST /api/admin/client-messages/attachments/{attachmentId}/presign-download` | Bearer JWT | 无 |
 
-公开作用域为 `PUBLIC_TRANSFER`；管理作用域为 `ADMIN_CLIENT_MESSAGE`。两个作用域的 ID 不得相互访问。
+公开作用域为 `PUBLIC_TRANSFER`；管理作用域为 `ADMIN_CLIENT_MESSAGE`。两个作用域的 ID 不得相互访问。公开作用域中的
+“公开”表示服务端无需管理端租户资源权限即可按房间授权，不表示允许匿名访问 OSS；三个公开附件端点必须先通过 Bearer
+认证，再执行房间角色和 `roomToken` 校验。
 
 ### 3.2 创建上传请求
 
@@ -610,10 +632,23 @@ object key 必须非空、不得以 `/` 开头，不得含反斜杠、`..`、`//
 | `download-url-ttl-seconds` | 600 | 原值传给签名器；不自动替换或钳制 |
 | `retention-hours` | 72 | 创建附件时按至少 1 小时处理 |
 | `max-attachment-bytes` | 536870912 | 原值用于声明大小和 HEAD 实际大小上限 |
+| `per-user-storage-quota-bytes` | 1073741824 | 每个登录账号最多占用 1 GiB 有效附件存储；非正值回退到默认值 |
+| `per-user-monthly-download-quota-bytes` | 1073741824 | 每个登录账号每个 UTC 自然月最多签发 1 GiB OSS 下载流量；非正值回退到默认值 |
 | `expiration-scan-interval-ms` | 3600000 | 后台扫描间隔 |
 
 因此 URL TTL 为 `0` 或负数会生成当前或过去的过期时间；`max-attachment-bytes <= 0` 会拒绝所有正大小附件。
-跨语言实现不得把这些显式配置静默替换成默认值。
+除两项账号额度对非正值显式回退到 1 GiB 外，跨语言实现不得把这些显式配置静默替换成默认值。
+
+### 4.4 登录账号额度
+
+六个附件端点都要求 Bearer 登录。公开互传上传记录也必须写入当前 JWT 对应的 `tenantId/username`，与管理端消息附件
+共用账号额度：
+
+- 存储额度统计尚在上传 URL 有效期内的 `PENDING` 声明大小，以及尚未过期的 `UPLOADED` 实际大小；创建上传时先按
+  声明大小预留，complete 后以 HEAD 实际大小重新校验并回写。实际大小导致超额时删除对象并拒绝 complete。
+- 下载流量按服务端成功签发预签名 GET 时的附件完整大小扣减，而不是按 OSS 实际传输字节扣减；重复申请下载 URL 会
+  重复计费。这是客户端直连私有 OSS、业务服务不代理文件体时可审计的保守口径。
+- 下载流量按 UTC 的 `yyyy-MM` 自然月隔离；存储额度跨公开互传和管理端消息附件合并统计。
 
 ## 5. HTTP 状态与错误
 
@@ -622,9 +657,9 @@ object key 必须非空、不得以 `/` 开头，不得含反斜杠、`..`、`//
 | HTTP | JSON | 场景 |
 | ---: | --- | --- |
 | 400 | `{"error":"..."}` | 缺字段、格式/大小错误、token 错误、附件不存在、目标无权访问 |
-| 401 | Bearer challenge | 管理附件端点缺少或使用无效 JWT |
+| 401 | Bearer challenge | 任一附件端点缺少或使用无效 JWT |
 | 409 | `{"error":"..."}` | 存储未配置、状态不是 `PENDING/UPLOADED`、URL/附件过期、HEAD/DELETE/签名失败 |
-| 429 | `{"error":"..."}` | 公开来源 IP 超限、来源表已满或房间 `PENDING` 配额超限 |
+| 429 | `{"error":"..."}` | 公开来源 IP 超限、来源表已满、房间 `PENDING` 配额、账号存储或月下载流量额度超限 |
 
 客户端必须按 HTTP 状态处理，不得依赖自然语言 `error` 文本。实现可以增加机器可读 `code`，但不得改变上述状态语义。
 
