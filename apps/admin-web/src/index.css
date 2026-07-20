@@ -2504,22 +2504,33 @@ body {
   background: var(--landing-action-soft);
 }
 
-.landing-apple .principle-card::before,
 .landing-apple .principle-flowgrid::before,
 .landing-apple .principle-node::after {
   display: none;
 }
 
-.landing-apple .principle-card-blue,
-.landing-apple .principle-card-amber,
-.landing-apple .principle-card-emerald {
+.landing-apple .principle-card-blue {
   --principle-accent: 0, 102, 204;
 }
 
-.dark .landing-apple .principle-card-blue,
-.dark .landing-apple .principle-card-amber,
-.dark .landing-apple .principle-card-emerald {
+.landing-apple .principle-card-amber {
+  --principle-accent: 180, 83, 9;
+}
+
+.landing-apple .principle-card-emerald {
+  --principle-accent: 4, 120, 87;
+}
+
+.dark .landing-apple .principle-card-blue {
   --principle-accent: 41, 151, 255;
+}
+
+.dark .landing-apple .principle-card-amber {
+  --principle-accent: 251, 191, 36;
+}
+
+.dark .landing-apple .principle-card-emerald {
+  --principle-accent: 52, 211, 153;
 }
 
 .landing-apple .principle-flowgrid {
@@ -2540,6 +2551,120 @@ body {
 .landing-apple .principle-node::before {
   border-color: rgba(var(--principle-accent), 0.5);
   box-shadow: none;
+}
+
+.landing-apple .principle-card {
+  transition:
+    transform 240ms ease,
+    border-color 240ms ease,
+    box-shadow 240ms ease;
+}
+
+.landing-apple .principle-card:hover {
+  transform: translateY(-4px);
+  border-color: rgba(var(--principle-accent), 0.45) !important;
+  box-shadow: 0 16px 40px rgba(var(--principle-accent), 0.12) !important;
+}
+
+.landing-apple .principle-card::before {
+  display: block;
+  inset: 0;
+  width: auto;
+  height: auto;
+  background: radial-gradient(
+    420px circle at var(--spotlight-x, 50%) var(--spotlight-y, 0%),
+    rgba(var(--principle-accent), 0.12),
+    transparent 70%
+  );
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+
+.landing-apple .principle-card:hover::before {
+  opacity: 1;
+}
+
+.principle-card-accent {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 3px;
+  border-radius: 11px 11px 0 0;
+  background: linear-gradient(90deg, rgba(var(--principle-accent), 0.85), rgba(var(--principle-accent), 0.12));
+  pointer-events: none;
+}
+
+.principle-card-index {
+  position: absolute;
+  z-index: 1;
+  top: 14px;
+  right: 18px;
+  color: rgba(var(--principle-accent), 0.13);
+  font-family: "SF Pro Display", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 3.25rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  pointer-events: none;
+  user-select: none;
+}
+
+.landing-apple .principle-badge {
+  border-color: transparent;
+  color: #ffffff;
+  background: rgb(var(--principle-accent));
+}
+
+.dark .landing-apple .principle-card-amber .principle-badge {
+  color: #1d1d1f;
+}
+
+.dark .landing-apple .principle-card-amber .principle-node-first .principle-node-eyebrow,
+.dark .landing-apple .principle-card-amber .principle-node-first strong,
+.dark .landing-apple .principle-card-amber .principle-node-first .principle-node-meta,
+.dark .landing-apple .principle-card-amber .principle-node-first .principle-node-index {
+  color: #1d1d1f;
+}
+
+.dark .landing-apple .principle-card-amber .principle-node-first .principle-node-index {
+  border-color: rgba(29, 29, 31, 0.42);
+  background: rgba(29, 29, 31, 0.12);
+}
+
+.landing-apple .principle-node-first {
+  border-color: rgb(var(--principle-accent));
+  background: rgb(var(--principle-accent));
+}
+
+.landing-apple .principle-node-first .principle-node-eyebrow,
+.landing-apple .principle-node-first strong,
+.landing-apple .principle-node-first .principle-node-meta {
+  color: #ffffff;
+}
+
+.landing-apple .principle-node-first .principle-node-meta {
+  opacity: 0.82;
+}
+
+.landing-apple .principle-node-first .principle-node-index {
+  border-color: rgba(255, 255, 255, 0.42);
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.landing-apple .principle-node-last {
+  border-style: dashed;
+  border-color: rgba(var(--principle-accent), 0.55);
+  background: var(--landing-surface-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-apple .principle-card,
+  .landing-apple .principle-card::before {
+    transition: none;
+  }
 }
 
 .landing-apple .principle-edge::before {

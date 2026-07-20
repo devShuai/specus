@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
@@ -119,19 +119,19 @@ function LoginPageContent() {
         </header>
 
         <div className="landing-apple-hero-layout grid flex-1 items-center gap-10 py-10">
-          <div className="landing-apple-copy flex min-w-0 flex-col gap-8">
+          <div className="landing-apple-copy flex min-w-0 flex-col items-center gap-8 text-center">
             <span className="landing-apple-eyebrow w-fit text-small font-semibold">
               Secure tunnel control plane
             </span>
 
             <div className="max-w-3xl">
-              <h1 className="landing-apple-title font-semibold text-zinc-950 dark:text-white">shuai-tunnel</h1>
-              <p className="landing-apple-lead mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
+              <h1 className="landing-apple-title mx-auto font-semibold text-zinc-950 dark:text-white">shuai-tunnel</h1>
+              <p className="landing-apple-lead mx-auto mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
                 把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测，TLS 开箱即用。
               </p>
             </div>
 
-            <div className="flex flex-wrap items-center gap-3">
+            <div className="flex flex-wrap items-center justify-center gap-3">
               <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
                 登录管理台
               </button>
@@ -142,7 +142,7 @@ function LoginPageContent() {
               )}
             </div>
 
-            <div className="landing-apple-metrics grid max-w-3xl grid-cols-2 sm:grid-cols-4">
+            <div className="landing-apple-metrics mx-auto grid w-full max-w-3xl grid-cols-2 sm:grid-cols-4">
               {metrics.map((item) => (
                 <div key={item.label} className="landing-apple-metric py-3">
                   <p className="text-xl font-semibold text-zinc-950 dark:text-white">{item.value}</p>
@@ -151,7 +151,7 @@ function LoginPageContent() {
               ))}
             </div>
 
-            <div className="landing-apple-flow flex max-w-3xl flex-col gap-3 p-4 sm:flex-row sm:items-center">
+            <div className="landing-apple-flow mx-auto flex w-full max-w-3xl flex-col gap-3 p-4 sm:flex-row sm:items-center">
               {flowNodes.map((node, index) => (
                 <div key={node} className="flex min-w-0 flex-1 items-center gap-3">
                   <span className="landing-apple-step flex h-8 w-8 shrink-0 items-center justify-center text-small">
@@ -187,6 +187,7 @@ function LoginPageContent() {
           <div className="mb-10 grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
             <PrincipleCard
               badge="HTTP route"
+              index="01"
               title="HTTP 路由：按 Host 与 Path 进入内网 Web 服务"
               description="请求先进 Server 的 HTTP 网关，管理端配置决定命中哪个租户、客户端和目标地址，再把请求沿客户端长连接送回内网。"
               accent="blue"
@@ -200,6 +201,8 @@ function LoginPageContent() {
 
             <PrincipleCard
               badge="Port mapping"
+              className="2xl:mt-12"
+              index="02"
               title="公网端口映射：按监听端口进入内网 TCP 服务"
               description="Server 先占用公网端口，外部连接到来后查找端口映射，把字节流封装进客户端隧道，再落到指定内网 IP 和端口。"
               accent="amber"
@@ -213,6 +216,7 @@ function LoginPageContent() {
 
             <PrincipleCard
               badge="Peer mesh"
+              index="03"
               title="客户端互联：受控对端之间的直连通道"
               description="客户端登录时上报 X25519 公钥并接收 roster；控制面校验 ACL 后撮合两端通过 PEER_CONTROL 通道协商身份与会话凭证。"
               accent="emerald"
@@ -601,21 +605,34 @@ function PrincipleCard({
   accent,
   badge,
   children,
+  className = "",
   description,
+  index,
   preview,
   title,
 }: {
   accent: "amber" | "blue" | "emerald";
   badge: string;
   children: ReactNode;
+  className?: string;
   description: string;
+  index: string;
   preview?: boolean;
   title: string;
 }) {
+  const handleMouseMove = (event: ReactMouseEvent<HTMLElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    event.currentTarget.style.setProperty("--spotlight-x", `${event.clientX - rect.left}px`);
+    event.currentTarget.style.setProperty("--spotlight-y", `${event.clientY - rect.top}px`);
+  };
+
   return (
     <article
-      className={`principle-card principle-card-${accent} glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none`}
+      className={`principle-card principle-card-${accent} glass glass-border rounded-md border text-zinc-950 shadow-sm dark:text-white dark:shadow-none ${className}`}
+      onMouseMove={handleMouseMove}
     >
+      <span className="principle-card-accent" aria-hidden="true" />
+      <span className="principle-card-index" aria-hidden="true">{index}</span>
       <div className="principle-card-body grid gap-5 p-5">
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
@@ -641,7 +658,14 @@ function FlowDiagram({
   return (
     <div className={`principle-flowgrid principle-flowgrid-${variant}`} aria-label={`${variant} 转发流程`}>
       {nodes.map((node, index) => (
-        <FlowStep key={node.title} index={index} node={node} showEdge={index < nodes.length - 1} />
+        <FlowStep
+          key={node.title}
+          index={index}
+          isFirst={index === 0}
+          isLast={index === nodes.length - 1}
+          node={node}
+          showEdge={index < nodes.length - 1}
+        />
       ))}
     </div>
   );
@@ -649,19 +673,24 @@ function FlowDiagram({
 
 function FlowStep({
   index,
+  isFirst,
+  isLast,
   node,
   showEdge,
 }: {
   index: number;
+  isFirst: boolean;
+  isLast: boolean;
   node: { eyebrow: string; title: string; meta: string };
   showEdge: boolean;
 }) {
   const nodeStyle = { "--node-delay": `${index * 1.55}s` } as CSSProperties;
   const edgeStyle = { "--edge-delay": `${index * 1.55 + 0.55}s` } as CSSProperties;
+  const nodeClass = `principle-node${isFirst ? " principle-node-first" : ""}${isLast ? " principle-node-last" : ""}`;
 
   return (
     <>
-      <div className="principle-node" style={nodeStyle}>
+      <div className={nodeClass} style={nodeStyle}>
         <span className="principle-node-android-glow" aria-hidden="true" />
         <span className="principle-node-index">{index + 1}</span>
         <span className="principle-node-eyebrow">{node.eyebrow}</span>
