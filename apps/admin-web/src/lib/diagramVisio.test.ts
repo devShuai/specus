@@ -44,4 +44,11 @@ describe("Visio diagram compatibility", () => {
   it("rejects damaged VSDX archives", () => {
     expect(() => parseVisioVsdx(new Uint8Array([1, 2, 3]), parser)).toThrow(/VSDX/);
   });
+
+  it("rejects VSDX entries whose inflated size exceeds the safety limit", () => {
+    const archive = zipSync({
+      "visio/pages/page1.xml": new Uint8Array(8 * 1024 * 1024 + 1),
+    }, { level: 9 });
+    expect(() => parseVisioVsdx(archive, parser)).toThrow("解压内容超过安全上限");
+  });
 });

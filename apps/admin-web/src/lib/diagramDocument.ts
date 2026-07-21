@@ -8,6 +8,7 @@ export const MAX_DIAGRAM_NODES = 1_000;
 export const MAX_DIAGRAM_EDGES = 2_000;
 export const MAX_DIAGRAM_PAGES = 50;
 export const MAX_DIAGRAM_COMMENTS = 2_000;
+export const MAX_DIAGRAM_PAGE_ORDER = 1_000_000;
 
 export const DIAGRAM_NODE_KINDS = [
   "rectangle",
@@ -545,7 +546,7 @@ export function isDiagramPage(value: unknown): value is DiagramPage {
     && typeof value.order === "number"
     && Number.isSafeInteger(value.order)
     && value.order >= 0
-    && value.order < MAX_DIAGRAM_PAGES;
+    && value.order <= MAX_DIAGRAM_PAGE_ORDER;
 }
 
 export function isDiagramComment(value: unknown): value is DiagramComment {

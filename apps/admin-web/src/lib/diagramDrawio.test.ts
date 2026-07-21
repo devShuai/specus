@@ -3,7 +3,7 @@ import { deflateRaw } from "pako";
 import { describe, expect, it } from "vitest";
 import { createDiagramDocument } from "./diagramDocument";
 import type { DiagramEdge, DiagramNode } from "./diagramDocument";
-import { exportDrawioDocument, parseDrawioDocument } from "./diagramDrawio";
+import { exportDrawioDocument, inflateRawWithLimit, parseDrawioDocument } from "./diagramDrawio";
 
 const container: DiagramNode = {
   id: "container-1",
@@ -135,7 +135,21 @@ describe("draw.io diagram compatibility", () => {
     const imported = parseDrawioDocument(xml, parser);
 
     expect(imported.nodes.map((node) => node.kind)).toEqual(["decision", "ellipse"]);
+    expect(imported.nodes.every((node) => node.style.bold === undefined)).toBe(true);
     expect(imported.edges[0]).toMatchObject({ sourcePort: "east", targetPort: "west" });
+  });
+
+  it("does not turn an unspecified bold style into bold during export", () => {
+    const regularItalic: DiagramNode = {
+      ...processNode,
+      id: "regular-italic",
+      parentId: undefined,
+      style: { ...processNode.style, bold: undefined, italic: true, underline: false },
+    };
+    const xml = exportDrawioDocument(createDiagramDocument([regularItalic], [], { width: 800, height: 600, gridSize: 10 }));
+
+    expect(xml).toContain("fontStyle=2");
+    expect(parseDrawioDocument(xml, parser).nodes[0].style.bold).toBe(false);
   });
 
   it("preserves the manual input symbol instead of exporting it as a hexagon", () => {
@@ -230,5 +244,10 @@ describe("draw.io diagram compatibility", () => {
     expect(() => parseDrawioDocument("<mxfile>", parser)).toThrow("不是有效的 XML");
     expect(() => parseDrawioDocument("<mxfile><diagram>bad</diagram></mxfile>", parser))
       .toThrow("压缩图页解码失败");
+  });
+
+  it("stops inflating compressed content at the configured output limit", () => {
+    const compressed = deflateRaw("x".repeat(4096));
+    expect(() => inflateRawWithLimit(compressed, 1024)).toThrow("解压后超过 1 KB");
   });
 });

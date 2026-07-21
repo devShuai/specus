@@ -10,6 +10,7 @@ import {
   MAX_DIAGRAM_DOCUMENT_BYTES,
   MAX_DIAGRAM_EDGES,
   MAX_DIAGRAM_NODES,
+  MAX_DIAGRAM_PAGE_ORDER,
   parseDiagramDocument,
 } from "./diagramDocument";
 import type { DiagramComment, DiagramEdge, DiagramNode } from "./diagramDocument";
@@ -241,6 +242,27 @@ describe("diagram document", () => {
     expect(() => parseDiagramDocument(JSON.stringify({
       ...exported,
       comments: [{ ...comments[0], pageId: "missing" }],
+    }))).toThrow("无效、重复或超出限制");
+  });
+
+  it("accepts monotonic page orders beyond the page count and rejects unsafe values", () => {
+    const pages = [
+      { id: "page-a", name: "主流程", order: 40 },
+      { id: "page-b", name: "后续流程", order: 41 },
+    ];
+    const exported = createDiagramDocument(
+      [{ ...nodes[0], pageId: pages[0].id }],
+      [],
+      { width: 2400, height: 1600, gridSize: 10 },
+      new Date(),
+      pages,
+      pages[0].id,
+    );
+
+    expect(parseDiagramDocument(JSON.stringify(exported)).pages).toEqual(pages);
+    expect(() => parseDiagramDocument(JSON.stringify({
+      ...exported,
+      pages: [{ ...pages[0], order: MAX_DIAGRAM_PAGE_ORDER + 1 }, pages[1]],
     }))).toThrow("无效、重复或超出限制");
   });
 

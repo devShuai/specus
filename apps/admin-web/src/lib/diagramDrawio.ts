@@ -1,4 +1,4 @@
-import { inflateRaw } from "pako";
+import { Inflate } from "pako";
 import {
   createDiagramDocument,
   DIAGRAM_NODE_KINDS,
@@ -22,6 +22,7 @@ import type {
 export const DRAWIO_FILE_EXTENSION = ".drawio";
 export const DRAWIO_FILE_MIME = "application/vnd.jgraph.mxfile";
 const MAX_DRAWIO_SOURCE_BYTES = MAX_DIAGRAM_DOCUMENT_BYTES * 4;
+const MAX_DRAWIO_INFLATED_BYTES = MAX_DRAWIO_SOURCE_BYTES * 3;
 
 interface XmlParser {
   parseFromString(source: string, mimeType: string): Document;
@@ -297,7 +298,7 @@ function nodeStyle(node: DiagramNode) {
   if (node.style.fontSize !== undefined) style.push(`fontSize=${node.style.fontSize}`);
   if (node.style.fontFamily !== undefined) style.push(`shuaiFontFamily=${node.style.fontFamily}`, `fontFamily=${drawioFontFamily(node.style.fontFamily)}`);
   if (node.style.bold !== undefined || node.style.italic !== undefined || node.style.underline !== undefined) {
-    style.push(`fontStyle=${(node.style.bold === false ? 0 : 1) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0)}`);
+    style.push(`fontStyle=${(node.style.bold === true ? 1 : 0) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0)}`);
   }
   if (node.style.underline !== undefined) style.push(`shuaiUnderline=${node.style.underline ? 1 : 0}`);
   if (node.style.align !== undefined) style.push(`shuaiAlign=${node.style.align}`, `align=${node.style.align}`);
@@ -401,10 +402,52 @@ function decodeCompressedDiagram(encoded: string) {
     for (let index = 0; index < binary.length; index += 1) {
       bytes[index] = binary.charCodeAt(index);
     }
-    return decodeURIComponent(new TextDecoder().decode(inflateRaw(bytes)));
-  } catch {
+    const inflated = inflateRawWithLimit(bytes, MAX_DRAWIO_INFLATED_BYTES);
+    const decoded = decodeURIComponent(new TextDecoder().decode(inflated));
+    if (new TextEncoder().encode(decoded).length > MAX_DRAWIO_SOURCE_BYTES) {
+      throw new Error("draw.io 图页解压后超过 8 MB，已拒绝导入");
+    }
+    return decoded;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("解压后超过")) throw error;
     throw new Error("draw.io 压缩图页解码失败，文件可能已损坏");
   }
+}
+
+export function inflateRawWithLimit(bytes: Uint8Array, maximumBytes: number) {
+  const chunks: Uint8Array[] = [];
+  let outputBytes = 0;
+  let exceeded = false;
+  const inflater = new Inflate({ raw: true, chunkSize: 64 * 1024 });
+  inflater.onData = (chunk) => {
+    const value = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+    outputBytes += value.byteLength;
+    if (outputBytes > maximumBytes) {
+      exceeded = true;
+      throw new Error(`draw.io 图页解压后超过 ${formatByteLimit(maximumBytes)}，已拒绝导入`);
+    }
+    chunks.push(value.slice());
+  };
+  try {
+    const completed = inflater.push(bytes, true);
+    if (!completed || inflater.err) throw new Error(inflater.msg || "inflate failed");
+  } catch (error) {
+    if (exceeded) throw new Error(`draw.io 图页解压后超过 ${formatByteLimit(maximumBytes)}，已拒绝导入`);
+    throw error;
+  }
+  const result = new Uint8Array(outputBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function formatByteLimit(bytes: number) {
+  if (bytes % (1024 * 1024) === 0) return `${bytes / 1024 / 1024} MB`;
+  if (bytes % 1024 === 0) return `${bytes / 1024} KB`;
+  return `${bytes} B`;
 }
 
 function graphModelFromDiagram(diagram: Element, parser: XmlParser) {

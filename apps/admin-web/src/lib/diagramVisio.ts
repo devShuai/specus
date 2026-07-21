@@ -12,6 +12,8 @@ export const VISIO_VSDX_FILE_EXTENSION = ".vsdx";
 export const VISIO_VDX_FILE_EXTENSION = ".vdx";
 export const VISIO_VDX_MIME = "application/vnd.visio";
 const MAX_VISIO_BYTES = 16 * 1024 * 1024;
+const MAX_VISIO_ENTRY_BYTES = 8 * 1024 * 1024;
+const MAX_VISIO_INFLATED_BYTES = 32 * 1024 * 1024;
 const PIXELS_PER_INCH = 96;
 
 interface XmlParser {
@@ -27,11 +29,26 @@ interface VisioPageSource {
 export function parseVisioVsdx(bytes: Uint8Array, parser?: XmlParser): DiagramDocumentV1 {
   if (bytes.byteLength > MAX_VISIO_BYTES) throw new Error("Visio VSDX 文件超过 16 MB，无法导入");
   let archive: Record<string, Uint8Array>;
+  let inflatedBytes = 0;
+  let rejectedForSize = false;
   try {
-    archive = unzipSync(bytes, { filter: (file) => file.name.startsWith("visio/pages/") });
+    archive = unzipSync(bytes, {
+      filter: (file) => {
+        if (!file.name.startsWith("visio/pages/")) return false;
+        if (file.originalSize > MAX_VISIO_ENTRY_BYTES
+          || inflatedBytes + file.originalSize > MAX_VISIO_INFLATED_BYTES) {
+          rejectedForSize = true;
+          return false;
+        }
+        inflatedBytes += file.originalSize;
+        return true;
+      },
+    });
   } catch {
+    if (rejectedForSize) throw new Error("Visio VSDX 解压内容超过安全上限，已拒绝导入");
     throw new Error("Visio VSDX 文件损坏或不是有效的 ZIP 文档");
   }
+  if (rejectedForSize) throw new Error("Visio VSDX 解压内容超过安全上限，已拒绝导入");
   const xmlParser = parser ?? defaultXmlParser();
   const pageEntries = Object.keys(archive).filter((name) => /^visio\/pages\/page\d+\.xml$/i.test(name)).sort(naturalSort);
   if (pageEntries.length === 0) throw new Error("Visio VSDX 文件不包含可识别的页面");
