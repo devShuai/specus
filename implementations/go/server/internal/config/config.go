@@ -59,13 +59,41 @@ type DatabaseConfig struct {
 
 // AuthConfig mirrors Tunnel:Auth.
 type AuthConfig struct {
-	PasswordLoginEnabled bool   `json:"passwordLoginEnabled"`
-	RegistrationEnabled  bool   `json:"registrationEnabled"`
-	Username             string `json:"username"`
-	Password             string `json:"password"`
-	TenantID             string `json:"tenantId"`
-	JwtSecret            string `json:"jwtSecret"`
-	TokenTTLSeconds      int64  `json:"tokenTtlSeconds"`
+	PasswordLoginEnabled bool                    `json:"passwordLoginEnabled"`
+	RegistrationEnabled  bool                    `json:"registrationEnabled"`
+	Username             string                  `json:"username"`
+	Password             string                  `json:"password"`
+	TenantID             string                  `json:"tenantId"`
+	JwtSecret            string                  `json:"jwtSecret"`
+	TokenTTLSeconds      int64                   `json:"tokenTtlSeconds"`
+	Turnstile            TurnstileConfig         `json:"turnstile"`
+	EmailVerification    EmailVerificationConfig `json:"emailVerification"`
+}
+
+type TurnstileConfig struct {
+	Enabled          bool     `json:"enabled"`
+	SiteKey          string   `json:"siteKey"`
+	SecretKey        string   `json:"secretKey"`
+	VerifyURL        string   `json:"verifyUrl"`
+	AllowedHostnames []string `json:"allowedHostnames"`
+}
+
+type EmailVerificationConfig struct {
+	Enabled               bool   `json:"enabled"`
+	FromAddress           string `json:"fromAddress"`
+	FromName              string `json:"fromName"`
+	Subject               string `json:"subject"`
+	CodeTTLSeconds        int64  `json:"codeTtlSeconds"`
+	MaxAttempts           int    `json:"maxAttempts"`
+	ResendCooldownSeconds int64  `json:"resendCooldownSeconds"`
+	CleanupIntervalMs     int64  `json:"cleanupIntervalMs"`
+	SMTPHost              string `json:"smtpHost"`
+	SMTPPort              int    `json:"smtpPort"`
+	SMTPUsername          string `json:"smtpUsername"`
+	SMTPPassword          string `json:"smtpPassword"`
+	SMTPStartTLS          bool   `json:"smtpStartTls"`
+	SMTPStartTLSRequired  bool   `json:"smtpStartTlsRequired"`
+	SMTPSSL               bool   `json:"smtpSsl"`
 }
 
 // ClientAuthConfig mirrors Tunnel:ClientAuth.
@@ -265,6 +293,20 @@ func Default() Config {
 			Password:             "admin",
 			TenantID:             "default",
 			TokenTTLSeconds:      28800,
+			Turnstile: TurnstileConfig{
+				VerifyURL: "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+			},
+			EmailVerification: EmailVerificationConfig{
+				FromName:              "shuai-tunnel",
+				Subject:               "shuai-tunnel 注册验证码",
+				CodeTTLSeconds:        600,
+				MaxAttempts:           5,
+				ResendCooldownSeconds: 60,
+				CleanupIntervalMs:     3600000,
+				SMTPPort:              587,
+				SMTPStartTLS:          true,
+				SMTPStartTLSRequired:  true,
+			},
 		},
 		ClientAuth: ClientAuthConfig{
 			DefaultMaxOnlineInstances:  2,
@@ -452,6 +494,26 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("TUNNEL_AUTH_TENANT_ID", &cfg.Auth.TenantID)
 	setStr("TUNNEL_AUTH_JWT_SECRET", &cfg.Auth.JwtSecret)
 	setInt64("TUNNEL_AUTH_TOKEN_TTL_SECONDS", &cfg.Auth.TokenTTLSeconds)
+	setBool("TUNNEL_AUTH_TURNSTILE_ENABLED", &cfg.Auth.Turnstile.Enabled)
+	setStr("TUNNEL_AUTH_TURNSTILE_SITE_KEY", &cfg.Auth.Turnstile.SiteKey)
+	setStr("TUNNEL_AUTH_TURNSTILE_SECRET_KEY", &cfg.Auth.Turnstile.SecretKey)
+	setStr("TUNNEL_AUTH_TURNSTILE_VERIFY_URL", &cfg.Auth.Turnstile.VerifyURL)
+	setStrSlice("TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES", &cfg.Auth.Turnstile.AllowedHostnames)
+	setBool("TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED", &cfg.Auth.EmailVerification.Enabled)
+	setStr("TUNNEL_AUTH_EMAIL_FROM_ADDRESS", &cfg.Auth.EmailVerification.FromAddress)
+	setStr("TUNNEL_AUTH_EMAIL_FROM_NAME", &cfg.Auth.EmailVerification.FromName)
+	setStr("TUNNEL_AUTH_EMAIL_SUBJECT", &cfg.Auth.EmailVerification.Subject)
+	setInt64("TUNNEL_AUTH_EMAIL_CODE_TTL_SECONDS", &cfg.Auth.EmailVerification.CodeTTLSeconds)
+	setInt("TUNNEL_AUTH_EMAIL_MAX_ATTEMPTS", &cfg.Auth.EmailVerification.MaxAttempts)
+	setInt64("TUNNEL_AUTH_EMAIL_RESEND_COOLDOWN_SECONDS", &cfg.Auth.EmailVerification.ResendCooldownSeconds)
+	setInt64("TUNNEL_AUTH_EMAIL_CLEANUP_INTERVAL_MS", &cfg.Auth.EmailVerification.CleanupIntervalMs)
+	setStr("TUNNEL_AUTH_SMTP_HOST", &cfg.Auth.EmailVerification.SMTPHost)
+	setInt("TUNNEL_AUTH_SMTP_PORT", &cfg.Auth.EmailVerification.SMTPPort)
+	setStr("TUNNEL_AUTH_SMTP_USERNAME", &cfg.Auth.EmailVerification.SMTPUsername)
+	setStr("TUNNEL_AUTH_SMTP_PASSWORD", &cfg.Auth.EmailVerification.SMTPPassword)
+	setBool("TUNNEL_AUTH_SMTP_STARTTLS", &cfg.Auth.EmailVerification.SMTPStartTLS)
+	setBool("TUNNEL_AUTH_SMTP_STARTTLS_REQUIRED", &cfg.Auth.EmailVerification.SMTPStartTLSRequired)
+	setBool("TUNNEL_AUTH_SMTP_SSL", &cfg.Auth.EmailVerification.SMTPSSL)
 
 	setInt("TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES", &cfg.ClientAuth.DefaultMaxOnlineInstances)
 	setInt("TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES", &cfg.ClientAuth.PerMachineUserMaxInstances)

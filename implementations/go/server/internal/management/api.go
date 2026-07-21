@@ -40,6 +40,8 @@ type API struct {
 	seedDemo     func(ctx context.Context) error
 	peerMesh     *peermesh.Service
 	attachments  *transfer.Service
+	turnstile    *security.TurnstileVerifier
+	registration *registrationService
 }
 
 // NewAPI builds the admin API.
@@ -48,16 +50,20 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 	oidc config.OidcConfig, authConfig config.AuthConfig, clientAuth config.ClientAuthConfig,
 	traffic config.TrafficConfig, trafficUsage *nat.TrafficService,
 	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service, attachments *transfer.Service) *API {
+	turnstile := security.NewTurnstileVerifier(authConfig.Turnstile)
+	registration := newRegistrationService(db, tokens, turnstile, authConfig,
+		newSMTPRegistrationMailer(authConfig.EmailVerification))
 	return &API{db: db, sessions: sessions, tokens: tokens, oidcAuth: oidcAuth, natControl: natControl,
 		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
-		peerMesh: peerMesh, attachments: attachments}
+		peerMesh: peerMesh, attachments: attachments, turnstile: turnstile, registration: registration}
 }
 
 // Register attaches all auth and admin routes to mux.
 func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /auth/login", a.handleLogin)
 	mux.HandleFunc("POST /auth/register", a.handleRegister)
+	mux.HandleFunc("POST /auth/register/verify", a.handleVerifyRegistration)
 	mux.HandleFunc("POST /auth/refresh", a.requireAuth(a.handleRefresh))
 	mux.HandleFunc("GET /oidc-config", a.handleOidcConfig)
 	mux.HandleFunc("POST /oidc/token", a.handleOidcToken)
@@ -173,6 +179,10 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
+	if err := a.turnstile.Verify(r.Context(), req.TurnstileToken, security.TurnstileActionLogin); err != nil {
+		a.failTurnstile(w, err)
+		return
+	}
 	principal, ok, err := a.authenticatePassword(r.Context(), req.Username, req.Password)
 	if err != nil {
 		a.fail(w, err)
@@ -185,51 +195,37 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.tokens.IssueBodyForUser(principal.Username, principal.TenantID, principal.Role))
 }
 
-// handleRegister lets a visitor self-register a USER-role account in the default tenant and logs
-// the new user in by issuing a token. Available only when auth.registrationEnabled and password
-// login are both on.
+// handleRegister starts email verification. No account is created before the code is verified.
 func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !a.registrationEnabled() {
 		writeError(w, http.StatusForbidden, "当前未开放注册")
 		return
 	}
-	var req loginRequest
+	var req registrationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	username, err := normalizeUsername(req.Username)
+	if err := a.turnstile.Verify(r.Context(), req.TurnstileToken, security.TurnstileActionRegister); err != nil {
+		a.failTurnstile(w, err)
+		return
+	}
+	challenge, err := a.registration.Request(r.Context(), req.Username, req.Email, req.Password)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	if strings.EqualFold(username, a.adminUsername()) {
-		a.fail(w, validation("该用户名不可用"))
+	writeJSON(w, http.StatusAccepted, challenge)
+}
+
+func (a *API) handleVerifyRegistration(w http.ResponseWriter, r *http.Request) {
+	var req registrationVerificationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	password, err := requirePassword(req.Password)
+	user, err := a.registration.Verify(r.Context(), req.RegistrationID, req.Code)
 	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	if existing, err := a.db.FindManagementUserByUsername(r.Context(), username); err != nil {
-		a.fail(w, err)
-		return
-	} else if existing != nil {
-		a.fail(w, validation("用户名已存在: "+username))
-		return
-	}
-	now := time.Now()
-	user := store.ManagementUser{
-		Username:     username,
-		TenantID:     a.defaultTenant(),
-		PasswordHash: auth.HashPassword(password),
-		Role:         store.ManagementRoleUser,
-		Enabled:      true,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	if err := a.db.InsertManagementUser(r.Context(), user); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -237,7 +233,13 @@ func (a *API) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) registrationEnabled() bool {
-	return a.authConfig.RegistrationEnabled && a.tokens.PasswordLoginEnabled()
+	return a.registration != nil && a.registration.Available()
+}
+
+func (a *API) RunRegistrationCleanup(ctx context.Context) {
+	if a.registration != nil {
+		a.registration.RunCleanup(ctx)
+	}
 }
 
 func (a *API) handleRefresh(w http.ResponseWriter, r *http.Request) {
@@ -285,15 +287,23 @@ func (a *API) authenticatePassword(ctx context.Context, username, password strin
 
 func (a *API) handleOidcConfig(w http.ResponseWriter, r *http.Request) {
 	configured := strings.TrimSpace(a.oidc.ClientID) != ""
+	turnstileEnabled := a.turnstile.Enabled() && a.turnstile.Configured()
+	turnstileSiteKey := ""
+	if turnstileEnabled {
+		turnstileSiteKey = a.turnstile.SiteKey()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"configured":            configured,
-		"authorizationEndpoint": a.oidc.AuthorizationEndpoint,
-		"endSessionEndpoint":    a.oidc.EndSessionEndpoint,
-		"clientId":              a.oidc.ClientID,
-		"redirectUri":           a.oidc.RedirectURI,
-		"scope":                 a.oidc.Scope,
-		"passwordLoginEnabled":  a.tokens.PasswordLoginEnabled(),
-		"registrationEnabled":   a.registrationEnabled(),
+		"configured":                configured,
+		"authorizationEndpoint":     a.oidc.AuthorizationEndpoint,
+		"endSessionEndpoint":        a.oidc.EndSessionEndpoint,
+		"clientId":                  a.oidc.ClientID,
+		"redirectUri":               a.oidc.RedirectURI,
+		"scope":                     a.oidc.Scope,
+		"passwordLoginEnabled":      a.tokens.PasswordLoginEnabled(),
+		"registrationEnabled":       a.registrationEnabled(),
+		"emailVerificationRequired": a.registrationEnabled(),
+		"turnstileEnabled":          turnstileEnabled,
+		"turnstileSiteKey":          turnstileSiteKey,
 	})
 }
 
@@ -2061,8 +2071,23 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrForbidden):
 		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, ErrRateLimited):
+		writeError(w, http.StatusTooManyRequests, err.Error())
+	case errors.Is(err, ErrUnavailable):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "资源不存在")
+	default:
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
+	}
+}
+
+func (a *API) failTurnstile(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, security.ErrTurnstileRejected):
+		writeError(w, http.StatusBadRequest, "人机验证失败，请重试")
+	case errors.Is(err, security.ErrTurnstileUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "人机验证服务暂不可用")
 	default:
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 	}
@@ -2513,9 +2538,11 @@ func normalizeDownloadDescription(value string) *string {
 	return &trimmed
 }
 
-func validation(message string) error { return wrap(ErrValidation, message) }
-func conflict(message string) error   { return wrap(ErrConflict, message) }
-func forbidden(message string) error  { return wrap(ErrForbidden, message) }
+func validation(message string) error  { return wrap(ErrValidation, message) }
+func conflict(message string) error    { return wrap(ErrConflict, message) }
+func forbidden(message string) error   { return wrap(ErrForbidden, message) }
+func rateLimited(message string) error { return wrap(ErrRateLimited, message) }
+func unavailable(message string) error { return wrap(ErrUnavailable, message) }
 
 func wrap(sentinel error, message string) error {
 	return &apiError{sentinel: sentinel, message: message}

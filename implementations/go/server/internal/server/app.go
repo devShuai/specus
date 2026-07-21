@@ -256,6 +256,7 @@ func (a *App) Run(ctx context.Context) error {
 	go a.peerMesh.Run(ctx)
 	go a.peerMesh.RunStunTurn(ctx)
 	go a.attachments.RunExpiration(ctx)
+	go a.api.RunRegistrationCleanup(ctx)
 	go a.db.RunTrafficDetailFlush(ctx,
 		time.Duration(a.cfg.Traffic.CaptureFlushIntervalMs)*time.Millisecond,
 		func(err error) { a.logger.Error("traffic detail flush failed", "err", err) })
@@ -348,11 +349,11 @@ func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig
 		ossSuffix = " " + origin
 	}
 	policy := "default-src 'self'; " +
-		"script-src 'self' https://www.googletagmanager.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE='; " +
+		"script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE='; " +
 		"style-src 'self' 'unsafe-inline'; " +
 		"img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"media-src 'self' blob: data:" + ossSuffix + "; " +
-		"object-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; " +
+		"object-src 'self' blob:; frame-src 'self' blob: https://challenges.cloudflare.com; font-src 'self' data:; " +
 		"connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

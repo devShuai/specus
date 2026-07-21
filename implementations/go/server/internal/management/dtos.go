@@ -6,9 +6,11 @@ import "errors"
 
 // Sentinel errors mapped to HTTP status codes by the handlers.
 var (
-	ErrValidation = errors.New("validation error") // -> 400
-	ErrConflict   = errors.New("conflict")         // -> 409
-	ErrForbidden  = errors.New("forbidden")        // -> 403
+	ErrValidation  = errors.New("validation error") // -> 400
+	ErrConflict    = errors.New("conflict")         // -> 409
+	ErrForbidden   = errors.New("forbidden")        // -> 403
+	ErrRateLimited = errors.New("rate limited")     // -> 429
+	ErrUnavailable = errors.New("unavailable")      // -> 503
 )
 
 // ManagementUserView is the JSON representation of a management UI user.
@@ -299,8 +301,21 @@ type httpRouteMutation struct {
 
 // loginRequest is the admin login body.
 type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	TurnstileToken string `json:"turnstileToken"`
+}
+
+type registrationRequest struct {
+	Username       string `json:"username"`
+	Email          string `json:"email"`
+	Password       string `json:"password"`
+	TurnstileToken string `json:"turnstileToken"`
+}
+
+type registrationVerificationRequest struct {
+	RegistrationID string `json:"registrationId"`
+	Code           string `json:"code"`
 }
 
 type userMutation struct {

@@ -99,6 +99,27 @@ type ManagementUser struct {
 	UpdatedAt    time.Time
 }
 
+type ManagementUserEmail struct {
+	Username   string
+	Email      string
+	VerifiedAt time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+type ManagementRegistrationChallenge struct {
+	RegistrationID    string
+	Username          string
+	Email             string
+	PasswordHash      string
+	CodeHash          string
+	AttemptsRemaining int
+	ExpiresAt         time.Time
+	ResendAvailableAt time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
 // ClientDownloadLink mirrors client_download_link.
 type ClientDownloadLink struct {
 	ID             int64

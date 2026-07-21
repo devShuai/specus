@@ -51,11 +51,17 @@ The same `TUNNEL_*` naming as Java server. Key variables:
 | `TUNNEL_CONNECTIONSTRINGS_TUNNEL` | `host=...` | Database connection string |
 | `TUNNEL_PEER_MESH_ENABLED` | `true` | Peer mesh toggle |
 | `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | Enable or disable local password login |
+| `TUNNEL_AUTH_REGISTRATION_ENABLED` | `false` in deploy template | Enable verified self-registration after Turnstile and SMTP are configured |
 | `TUNNEL_AUTH_USERNAME` | `admin` | Management UI local-login username |
 | `TUNNEL_AUTH_PASSWORD` | `change-me` | Management UI local-login plaintext password; protect the env file and change it before exposure |
 | `TUNNEL_AUTH_TENANT_ID` | `default` | Tenant id for the built-in administrator |
 | `TUNNEL_AUTH_JWT_SECRET` | long random value | Stable HS256 signing secret; if omitted, a random in-memory key invalidates tokens after every restart |
 | `TUNNEL_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management JWT lifetime |
+| `TUNNEL_AUTH_TURNSTILE_ENABLED` | `false` | Require Cloudflare Turnstile for local password login; must be enabled for self-registration |
+| `TUNNEL_AUTH_TURNSTILE_SITE_KEY` / `TUNNEL_AUTH_TURNSTILE_SECRET_KEY` | provider values | Browser site key and server-only verification secret |
+| `TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES` | deployment hostnames | Required hostname allowlist checked after Siteverify |
+| `TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED` | `false` | Require a one-time email code before creating a self-registered account |
+| `TUNNEL_AUTH_SMTP_HOST` / `TUNNEL_AUTH_SMTP_PORT` | provider values | SMTP endpoint used to send registration codes |
 | `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | Default online-instance limit per client credential |
 | `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | Online-instance limit for the same machine fingerprint and OS user |
 | `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` | Client runtime token lifetime |

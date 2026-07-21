@@ -48,7 +48,9 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 | `TUNNEL_DB_SEED_DEMO_CLIENT` | 是否 seed 演示客户端 | true |
 | `TUNNEL_AUTH_USERNAME` / `TUNNEL_AUTH_PASSWORD` | 管理后台账号 | admin / admin |
 | `TUNNEL_AUTH_TENANT_ID` | 本地密码登录默认租户 | default |
-| `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` / `TUNNEL_AUTH_REGISTRATION_ENABLED` | 密码登录 / 访客自助注册开关 | true / true |
+| `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` / `TUNNEL_AUTH_REGISTRATION_ENABLED` | 密码登录 / 访客自助注册总开关；注册还要求 Turnstile 与 SMTP | true / true（验证配置默认关闭） |
+| `TUNNEL_AUTH_TURNSTILE_*` | Cloudflare Turnstile site key、secret、Siteverify 地址与 hostname 白名单 | disabled |
+| `TUNNEL_AUTH_EMAIL_*` / `TUNNEL_AUTH_SMTP_*` | 注册邮箱验证码与 SMTP 参数 | disabled |
 | `TUNNEL_AUTH_JWT_SECRET` | 本地 JWT 签名密钥(空则随机,重启失效) | - |
 | `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | 客户端 HTTP 启动登录签发的 runtime token 有效期 | 28800 |
 | `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | 创建客户端凭证时默认最大在线实例数 | 2 |

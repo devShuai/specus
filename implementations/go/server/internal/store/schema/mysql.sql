@@ -92,6 +92,33 @@ CREATE TABLE IF NOT EXISTS tunnel_management_user (
   KEY idx_management_user_role (role)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS tunnel_management_user_email (
+  username VARCHAR(80) NOT NULL PRIMARY KEY,
+  email VARCHAR(254) NOT NULL UNIQUE,
+  verified_at VARCHAR(40) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  KEY idx_management_user_email_verified (verified_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS tunnel_management_registration_challenge (
+  registration_id VARCHAR(64) NOT NULL PRIMARY KEY,
+  username VARCHAR(80) NOT NULL,
+  email VARCHAR(254) NOT NULL,
+  password_hash VARCHAR(64) NOT NULL,
+  code_hash VARCHAR(64) NOT NULL,
+  attempts_remaining INT NOT NULL,
+  expires_at VARCHAR(40) NOT NULL,
+  resend_available_at VARCHAR(40) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  KEY idx_registration_challenge_username (username),
+  KEY idx_registration_challenge_email (email),
+	UNIQUE KEY uq_registration_challenge_username (username),
+	UNIQUE KEY uq_registration_challenge_email (email),
+  KEY idx_registration_challenge_expiry (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS client_download_link (
   id BIGINT NOT NULL PRIMARY KEY,
   implementation VARCHAR(32) NOT NULL,

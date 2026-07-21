@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"time"
@@ -65,6 +66,15 @@ func (s *LocalTokenService) TTLSeconds() int64 {
 // PasswordLoginEnabled reports whether username/password login is available.
 func (s *LocalTokenService) PasswordLoginEnabled() bool {
 	return s.auth.PasswordLoginEnabled && s.auth.Password != ""
+}
+
+// RegistrationCodeHash returns an HMAC digest for a short-lived email verification code.
+// Reusing the JWT signing key avoids introducing another required secret while keeping raw codes
+// out of persistent storage.
+func (s *LocalTokenService) RegistrationCodeHash(registrationID, code string) string {
+	mac := hmac.New(sha256.New, s.key)
+	_, _ = mac.Write([]byte(registrationID + ":" + code))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // Authenticate validates admin credentials in constant time.

@@ -94,6 +94,35 @@ CREATE TABLE IF NOT EXISTS tunnel_management_user (
 CREATE INDEX IF NOT EXISTS idx_management_user_tenant ON tunnel_management_user (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_management_user_role ON tunnel_management_user (role);
 
+CREATE TABLE IF NOT EXISTS tunnel_management_user_email (
+  username VARCHAR(80) PRIMARY KEY,
+  email VARCHAR(254) NOT NULL UNIQUE,
+  verified_at VARCHAR(40) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_management_user_email_verified ON tunnel_management_user_email (verified_at);
+
+CREATE TABLE IF NOT EXISTS tunnel_management_registration_challenge (
+  registration_id VARCHAR(64) PRIMARY KEY,
+  username VARCHAR(80) NOT NULL,
+  email VARCHAR(254) NOT NULL,
+  password_hash VARCHAR(64) NOT NULL,
+  code_hash VARCHAR(64) NOT NULL,
+  attempts_remaining INTEGER NOT NULL,
+  expires_at VARCHAR(40) NOT NULL,
+  resend_available_at VARCHAR(40) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_registration_challenge_username ON tunnel_management_registration_challenge (LOWER(username));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_registration_challenge_email ON tunnel_management_registration_challenge (LOWER(email));
+
+CREATE INDEX IF NOT EXISTS idx_registration_challenge_username ON tunnel_management_registration_challenge (username);
+CREATE INDEX IF NOT EXISTS idx_registration_challenge_email ON tunnel_management_registration_challenge (email);
+CREATE INDEX IF NOT EXISTS idx_registration_challenge_expiry ON tunnel_management_registration_challenge (expires_at);
+
 CREATE TABLE IF NOT EXISTS client_download_link (
   id BIGINT PRIMARY KEY,
   implementation VARCHAR(32) NOT NULL,

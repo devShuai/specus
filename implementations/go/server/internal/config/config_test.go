@@ -36,6 +36,32 @@ func TestLoadFromEnvMapsOidcTenantClaim(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvMapsRegistrationSecurityOptions(t *testing.T) {
+	t.Setenv("TUNNEL_AUTH_TURNSTILE_ENABLED", "true")
+	t.Setenv("TUNNEL_AUTH_TURNSTILE_SITE_KEY", "site-key")
+	t.Setenv("TUNNEL_AUTH_TURNSTILE_SECRET_KEY", "secret-key")
+	t.Setenv("TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES", "tunnel.example.com,admin.example.com")
+	t.Setenv("TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED", "true")
+	t.Setenv("TUNNEL_AUTH_EMAIL_FROM_ADDRESS", "no-reply@example.com")
+	t.Setenv("TUNNEL_AUTH_SMTP_HOST", "smtp.example.com")
+	t.Setenv("TUNNEL_AUTH_SMTP_PORT", "465")
+	t.Setenv("TUNNEL_AUTH_SMTP_SSL", "true")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Auth.Turnstile.Enabled || cfg.Auth.Turnstile.SiteKey != "site-key" ||
+		cfg.Auth.Turnstile.SecretKey != "secret-key" || len(cfg.Auth.Turnstile.AllowedHostnames) != 2 {
+		t.Fatalf("Turnstile env mapping mismatch: %+v", cfg.Auth.Turnstile)
+	}
+	if !cfg.Auth.EmailVerification.Enabled || cfg.Auth.EmailVerification.FromAddress != "no-reply@example.com" ||
+		cfg.Auth.EmailVerification.SMTPHost != "smtp.example.com" || cfg.Auth.EmailVerification.SMTPPort != 465 ||
+		!cfg.Auth.EmailVerification.SMTPSSL {
+		t.Fatalf("email verification env mapping mismatch: %+v", cfg.Auth.EmailVerification)
+	}
+}
+
 func TestLoadFromEnvMapsJavaClientAuthOptions(t *testing.T) {
 	t.Setenv("TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES", "5")
 	t.Setenv("TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES", "3")
