@@ -301,7 +301,9 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 
 ### 用户名/密码登录
 
-页面提交用户名和密码到 `POST /auth/login`，校验通过后服务端用 HS256 密钥签发一个短期 JWT，页面像 OIDC 令牌一样作为 `Authorization: Bearer` 使用。启用注册时，访客还可以通过 `POST /auth/register` 创建默认租户的普通用户账号并直接登录。默认 `admin / admin`，**暴露前务必修改**；把密码设为空即可关闭该登录方式。
+页面在提交用户名和密码前执行 Cloudflare Turnstile `login` action，再把短期 token 一并发到 `POST /auth/login`；服务端通过 Siteverify 校验 success、action 和 hostname 后才验证密码。注册分两步：`POST /auth/register` 通过 Turnstile `register` action 后发送邮箱验证码，`POST /auth/register/verify` 校验验证码并原子创建默认租户普通用户。验证码只保存 HMAC 摘要，验证前不会创建账号。Java、Go、C# 三套服务端遵循相同接口与安全校验。默认 `admin / admin`，**暴露前务必修改**；把密码设为空即可关闭该登录方式。
+
+自助注册只有在注册开关、Turnstile、hostname 白名单、邮箱验证、SMTP 和发件地址全部配置完成时才会显示。Turnstile secret 和 SMTP 密码只保留在服务端；浏览器只读取公开 site key。OIDC 登录由外部身份提供方完成，不经过本地密码登录端点。
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -309,9 +311,17 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | `TUNNEL_AUTH_PASSWORD` | `admin` | 管理密码；留空则禁用密码登录 |
 | `TUNNEL_AUTH_TENANT_ID` | `default` | 本地密码登录和内置 admin 使用的默认租户 |
 | `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` | `true` | 是否启用密码登录 |
-| `TUNNEL_AUTH_REGISTRATION_ENABLED` | `true` | 是否允许访客自助注册默认租户的普通用户；依赖密码登录 |
+| `TUNNEL_AUTH_REGISTRATION_ENABLED` | `true` | 自助注册总开关；还依赖密码登录、Turnstile、邮箱验证和 SMTP |
 | `TUNNEL_AUTH_JWT_SECRET` | （空） | HS256 签名密钥；留空则启动时随机生成（重启后旧令牌失效，需重新登录） |
 | `TUNNEL_AUTH_TOKEN_TTL_SECONDS` | `28800` | 密码登录令牌有效期（秒），默认 8 小时 |
+| `TUNNEL_AUTH_TURNSTILE_ENABLED` | `false` | 启用后本地密码登录必须通过 Cloudflare Turnstile；自助注册要求为 `true` |
+| `TUNNEL_AUTH_TURNSTILE_SITE_KEY` / `TUNNEL_AUTH_TURNSTILE_SECRET_KEY` | （空） | Turnstile 站点公钥 / 仅服务端保存的密钥 |
+| `TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES` | （空） | 必填，逗号分隔的站点域名白名单；服务端逐个精确匹配 |
+| `TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED` | `false` | 启用注册邮箱验证码 |
+| `TUNNEL_AUTH_EMAIL_FROM_ADDRESS` | （空） | 验证邮件发件地址 |
+| `TUNNEL_AUTH_EMAIL_CODE_TTL_SECONDS` / `TUNNEL_AUTH_EMAIL_MAX_ATTEMPTS` | `600` / `5` | 验证码有效期与最大尝试次数 |
+| `TUNNEL_AUTH_SMTP_HOST` / `TUNNEL_AUTH_SMTP_PORT` | （空） / `587` | SMTP 服务地址和端口 |
+| `TUNNEL_AUTH_SMTP_USERNAME` / `TUNNEL_AUTH_SMTP_PASSWORD` | （空） | SMTP 凭据，仅保存在服务端 env |
 
 ### OIDC 登录（授权码 + PKCE）
 
