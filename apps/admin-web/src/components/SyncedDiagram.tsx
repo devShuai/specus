@@ -24,6 +24,7 @@ import {
   EdgeHandler,
   EllipseShape,
   Graph,
+  Geometry,
   getDefaultPlugins,
   gestureUtils,
   HierarchicalLayout,
@@ -80,7 +81,9 @@ import {
   isDiagramComment,
   isDiagramGraphState,
   isDiagramPage,
+  MAX_DIAGRAM_COMMENTS,
   MAX_DIAGRAM_DOCUMENT_BYTES,
+  MAX_DIAGRAM_EDGES,
   MAX_DIAGRAM_NODES,
   MAX_DIAGRAM_PAGES,
   MAX_DIAGRAM_UPDATE_BASE64_LENGTH,
@@ -137,7 +140,9 @@ import type {
   DrawioStencilShape,
 } from "../lib/drawioStencilCatalog";
 import { registerDiagramSemanticShapes, semanticShapeName } from "../lib/diagramSemanticShapes";
+import { DiagramRemoteUpdateValidator } from "../lib/diagramYjsValidation";
 import { useTheme } from "../theme/ThemeContext";
+import { PublicToolsMenu } from "./PublicToolsMenu";
 
 const DIAGRAM_CUBIC_EDGE_SHAPE = "diagramCubicConnector";
 const CUBIC_CONTROL_DEFAULTS = {
@@ -508,10 +513,11 @@ interface SyncedDiagramProps {
   roomRole: PublicTransferRoomRole;
   peerId: string;
   peerCount: number;
+  peerDisplayNames?: Record<string, string>;
   isConnected: boolean;
   isActive?: boolean;
   events: WhiteboardInboundEvent[];
-  onSend: (payload: DiagramPayload) => void;
+  onSend: (payload: DiagramPayload) => boolean | Promise<boolean>;
   onSwitchToWhiteboard?: () => void;
   standalone?: boolean;
   collaborationPanel?: ReactNode;
@@ -554,6 +560,7 @@ interface DiagramSelection {
   verticalAlign?: DiagramVerticalAlign;
   spacing?: number;
   locked?: boolean;
+  lockedCount: number;
   rotation?: number;
   flipH?: boolean;
   flipV?: boolean;
@@ -571,6 +578,7 @@ interface DiagramContextMenu {
 }
 
 type DiagramDialogResult = string | true | null;
+type DiagramStatusTone = "info" | "success" | "error";
 
 interface DiagramDialogRequest {
   id: number;
@@ -611,6 +619,15 @@ interface RemoteDiagramPresence {
   updatedAt: number;
 }
 
+interface RemoteSelectionMarker {
+  key: string;
+  peerId: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 interface DiagramVersionSnapshot {
   id: string;
   serverId?: number;
@@ -639,6 +656,9 @@ const GRAPH_ORIGIN = Symbol("diagram-graph");
 const IMPORT_ORIGIN = Symbol("diagram-import");
 const REMOTE_ORIGIN = Symbol("diagram-remote");
 const DIAGRAM_CACHE_LIMIT = 8;
+const DIAGRAM_SESSION_VERSION_PREFIX = "shuai-diagram-session-versions:";
+const MAX_DIAGRAM_SESSION_VERSIONS = 20;
+const MAX_DIAGRAM_SESSION_VERSION_STORAGE_BYTES = 4 * 1024 * 1024;
 const NODES_MAP = "nodes";
 const EDGES_MAP = "edges";
 const PAGES_MAP = "pages";
@@ -661,6 +681,7 @@ const EMPTY_SELECTION: DiagramSelection = {
   isEdge: false,
   linePattern: "solid",
   strokeWidth: 2,
+  lockedCount: 0,
 };
 
 const PORT_CONSTRAINTS = [
@@ -877,6 +898,7 @@ export function SyncedDiagram({
   roomRole,
   peerId,
   peerCount,
+  peerDisplayNames = {},
   isConnected,
   isActive = true,
   events,
@@ -900,6 +922,7 @@ export function SyncedDiagram({
     logout,
   } = useAuth();
   const graphContainerRef = useRef<HTMLDivElement | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const outlineContainerRef = useRef<HTMLDivElement | null>(null);
   const paletteElementRefs = useRef(new Map<string, HTMLButtonElement>());
   const draggablePaletteItemsRef = useRef(new Map<string, DraggablePaletteItem>());
@@ -915,6 +938,7 @@ export function SyncedDiagram({
   const edgesMapRef = useRef<Y.Map<DiagramEdge> | null>(null);
   const pagesMapRef = useRef<Y.Map<DiagramPage> | null>(null);
   const commentsMapRef = useRef<Y.Map<DiagramComment> | null>(null);
+  const remoteUpdateValidatorRef = useRef<DiagramRemoteUpdateValidator | null>(null);
   const versionsRef = useRef<DiagramVersionSnapshot[]>([]);
   const cloudDocumentRef = useRef<UserDiagramDocument | null>(null);
   const cloudChangeSequenceRef = useRef(0);
@@ -923,6 +947,10 @@ export function SyncedDiagram({
   const flushGraphRef = useRef<() => void>(() => undefined);
   const graphSyncTimerRef = useRef<number | null>(null);
   const graphRenderFrameRef = useRef<number | null>(null);
+  const syncRetryTimerRef = useRef<number | null>(null);
+  const syncRetryAttemptRef = useRef(0);
+  const syncDeliveryFailedRef = useRef(false);
+  const retryFullStateRef = useRef<() => void>(() => undefined);
   const canvasSizeRef = useRef({ ...DIAGRAM_CANVAS });
   const suppressGraphSyncRef = useRef(false);
   const seenEventsRef = useRef(new Set<string>());
@@ -933,12 +961,14 @@ export function SyncedDiagram({
   onSendRef.current = onSend;
   const onLocalChangeRef = useRef(onLocalChange);
   onLocalChangeRef.current = onLocalChange;
+  const isReadOnlyRef = useRef(false);
 
   const [isExpanded, setIsExpanded] = useState(false);
   const [showCollaborationPanel, setShowCollaborationPanel] = useState(false);
   const isFullViewport = standalone || isExpanded;
   const [documentEpoch, setDocumentEpoch] = useState(0);
   const [runtimeEpoch, setRuntimeEpoch] = useState(0);
+  const [viewEpoch, setViewEpoch] = useState(0);
   const [selection, setSelection] = useState<DiagramSelection>(EMPTY_SELECTION);
   const [nodeCount, setNodeCount] = useState(0);
   const [edgeCount, setEdgeCount] = useState(0);
@@ -974,10 +1004,17 @@ export function SyncedDiagram({
   const [isCloudBusy, setIsCloudBusy] = useState(false);
   const [contextMenu, setContextMenu] = useState<DiagramContextMenu | null>(null);
   const [dialogRequest, setDialogRequest] = useState<DiagramDialogRequest | null>(null);
-  const [status, setStatus] = useState("专业流程图已就绪，从左侧插入节点后拖动蓝色端口连线。");
+  const [status, setStatusMessage] = useState("专业流程图已就绪，从左侧插入节点后拖动蓝色端口连线。");
+  const [statusTone, setStatusTone] = useState<DiagramStatusTone>("info");
   const usesServerVersions = Boolean(roomToken.trim());
   const isRoleReadOnly = roomRole === "VIEWER";
   const isReadOnly = isRoleReadOnly || localReadOnly;
+  isReadOnlyRef.current = isReadOnly;
+
+  const setStatus = useCallback((message: string, tone = inferDiagramStatusTone(message)) => {
+    setStatusMessage(message);
+    setStatusTone(tone);
+  }, []);
 
   const openEditorDialog = useCallback((request: Omit<DiagramDialogRequest, "id">) => (
     new Promise<DiagramDialogResult>((resolve) => {
@@ -1048,15 +1085,6 @@ export function SyncedDiagram({
       body.style.overscrollBehavior = previousOverscrollBehavior;
     };
   }, [isActive, isFullViewport, standalone]);
-
-  useEffect(() => {
-    if (!showCollaborationPanel) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setShowCollaborationPanel(false);
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [showCollaborationPanel]);
 
   const stencilSearchResults = useMemo(() => {
     const query = paletteQuery.trim().toLowerCase();
@@ -1167,6 +1195,40 @@ export function SyncedDiagram({
     setCanRedo(Boolean(manager?.canRedo()));
   }, []);
 
+  const performHistoryAction = useCallback((action: "undo" | "redo") => {
+    flushGraphRef.current();
+    const manager = undoManagerRef.current;
+    const available = action === "undo" ? manager?.canUndo() : manager?.canRedo();
+    if (!manager || !available) {
+      setStatus(action === "undo" ? "当前没有可撤销的操作。" : "当前没有可重做的操作。");
+      return;
+    }
+    const before = diagramPageFingerprints(
+      nodesMapRef.current,
+      edgesMapRef.current,
+      pagesMapRef.current,
+      commentsMapRef.current,
+    );
+    if (action === "undo") manager.undo();
+    else manager.redo();
+    const after = diagramPageFingerprints(
+      nodesMapRef.current,
+      edgesMapRef.current,
+      pagesMapRef.current,
+      commentsMapRef.current,
+    );
+    const affectedPages = changedFingerprintKeys(before, after);
+    const visibleAffectedPage = affectedPages.find((pageId) => pagesMapRef.current?.has(pageId));
+    if (visibleAffectedPage && visibleAffectedPage !== activePageId) {
+      setActivePageId(visibleAffectedPage);
+      const pageName = pagesMapRef.current?.get(visibleAffectedPage)?.name ?? "其他页面";
+      setStatus(`${action === "undo" ? "已撤销" : "已重做"}“${pageName}”中的操作，并已切换到受影响页面。`);
+    } else {
+      setStatus(action === "undo" ? "已撤销上一步操作。" : "已重做上一步操作。");
+    }
+    refreshUndoState();
+  }, [activePageId, refreshUndoState]);
+
   const scheduleDocumentRender = useCallback(() => {
     if (graphRenderFrameRef.current !== null) return;
     graphRenderFrameRef.current = window.requestAnimationFrame(() => {
@@ -1175,28 +1237,82 @@ export function SyncedDiagram({
     });
   }, []);
 
-  const sendYUpdate = useCallback((update: Uint8Array) => {
+  const cancelPendingGraphSync = useCallback(() => {
+    if (graphSyncTimerRef.current === null) return false;
+    window.clearTimeout(graphSyncTimerRef.current);
+    graphSyncTimerRef.current = null;
+    return true;
+  }, []);
+
+  const flushPendingGraphSync = useCallback(() => {
+    if (!cancelPendingGraphSync()) return false;
+    flushGraphRef.current();
+    return true;
+  }, [cancelPendingGraphSync]);
+
+  const clearSyncRetry = useCallback(() => {
+    if (syncRetryTimerRef.current !== null) {
+      window.clearTimeout(syncRetryTimerRef.current);
+      syncRetryTimerRef.current = null;
+    }
+    syncRetryAttemptRef.current = 0;
+  }, []);
+
+  const handleDiagramDelivery = useCallback((delivered: boolean, fullState: boolean) => {
+    if (delivered) {
+      if (fullState && syncDeliveryFailedRef.current) {
+        syncDeliveryFailedRef.current = false;
+        clearSyncRetry();
+        setStatus("流程图同步已恢复，完整状态已重新发送。");
+      }
+      return;
+    }
+    syncDeliveryFailedRef.current = true;
+    setStatus("流程图同步中断，正在重新连接并重发完整状态。");
+    if (syncRetryTimerRef.current !== null) return;
+    const delay = Math.min(15_000, 1_000 * 2 ** Math.min(syncRetryAttemptRef.current, 4));
+    syncRetryAttemptRef.current += 1;
+    syncRetryTimerRef.current = window.setTimeout(() => {
+      syncRetryTimerRef.current = null;
+      retryFullStateRef.current();
+    }, delay);
+  }, [clearSyncRetry]);
+
+  const sendYUpdate = useCallback((update: Uint8Array, fullState = false) => {
     const encoded = encodeDiagramUpdate(update);
     if (encoded.length > MAX_DIAGRAM_UPDATE_BASE64_LENGTH) {
       setStatus("流程图同步数据超过 4 MB，请导出后精简文档再继续协作。");
       return false;
     }
-    onSendRef.current({
-      type: "STDG1",
-      kind: "diagram-update",
-      update: encoded,
-      createdAt: Date.now(),
-    });
+    try {
+      const delivery = onSendRef.current({
+        type: "STDG1",
+        kind: "diagram-update",
+        update: encoded,
+        createdAt: Date.now(),
+      });
+      void Promise.resolve(delivery).then(
+        (delivered) => handleDiagramDelivery(delivered, fullState),
+        () => handleDiagramDelivery(false, fullState),
+      );
+    } catch {
+      handleDiagramDelivery(false, fullState);
+    }
     return true;
-  }, []);
+  }, [handleDiagramDelivery]);
 
   const sendFullState = useCallback(() => {
     const document = yDocRef.current;
     if (!document) {
       return false;
     }
-    return sendYUpdate(Y.encodeStateAsUpdate(document));
+    return sendYUpdate(Y.encodeStateAsUpdate(document), true);
   }, [sendYUpdate]);
+  retryFullStateRef.current = () => {
+    sendFullState();
+  };
+
+  useEffect(() => () => clearSyncRetry(), [clearSyncRetry]);
 
   const sendPresence = useCallback((cursor?: { x: number; y: number }, force = false) => {
     const now = Date.now();
@@ -1256,17 +1372,30 @@ export function SyncedDiagram({
     if (pageMap.size === 0) {
       pageMap.set(DEFAULT_PAGE_ID, { id: DEFAULT_PAGE_ID, name: "页面 1", order: 0 });
     }
+    const remoteUpdateValidator = new DiagramRemoteUpdateValidator(document);
+    remoteUpdateValidatorRef.current = remoteUpdateValidator;
     const refreshPages = () => {
       const nextPages = Array.from(pageMap.values()).sort((left, right) => left.order - right.order);
-      setPages(nextPages);
-      setComments(Array.from(commentsMap.values()).filter(isDiagramComment).sort((a, b) => a.createdAt - b.createdAt));
+      const nextComments = Array.from(commentsMap.values()).filter(isDiagramComment).sort((a, b) => a.createdAt - b.createdAt);
+      setPages((current) => diagramRecordsEqual(current, nextPages) ? current : nextPages);
+      setComments((current) => diagramRecordsEqual(current, nextComments) ? current : nextComments);
       setActivePageId((current) => nextPages.some((page) => page.id === current) ? current : nextPages[0]?.id ?? DEFAULT_PAGE_ID);
     };
     refreshPages();
     setStatus(restoredFromCache ? "已恢复当前房间的本地流程图。" : "已切换到新的房间流程图。");
 
-    const handleUpdate = (update: Uint8Array, origin: unknown) => {
-      refreshPages();
+    const handleUpdate = (update: Uint8Array, origin: unknown, _source: Y.Doc, transaction: Y.Transaction) => {
+      if (origin !== REMOTE_ORIGIN) {
+        try {
+          remoteUpdateValidator.sync(update);
+        } catch {
+          remoteUpdateValidator.reset(document);
+        }
+      }
+      const changedTypes = transaction.changedParentTypes as Map<unknown, unknown>;
+      if (changedTypes.has(pageMap) || changedTypes.has(commentsMap)) {
+        refreshPages();
+      }
       cloudChangeSequenceRef.current += 1;
       if (cloudDocumentRef.current) {
         setCloudDirty(true);
@@ -1294,6 +1423,7 @@ export function SyncedDiagram({
       cacheDiagramState(boardKey, Y.encodeStateAsUpdate(document));
       document.off("update", handleUpdate);
       undoManager.destroy();
+      remoteUpdateValidator.destroy();
       document.destroy();
       if (yDocRef.current === document) {
         yDocRef.current = null;
@@ -1302,6 +1432,7 @@ export function SyncedDiagram({
         pagesMapRef.current = null;
         commentsMapRef.current = null;
         undoManagerRef.current = null;
+        remoteUpdateValidatorRef.current = null;
       }
     };
   }, [boardKey, refreshUndoState, scheduleDocumentRender, selectCloudDocument, sendYUpdate]);
@@ -1329,6 +1460,13 @@ export function SyncedDiagram({
   }, [peerId, roomId, roomToken, usesServerVersions]);
 
   useEffect(() => {
+    if (usesServerVersions) return;
+    const snapshots = readSessionDiagramVersions(boardKey);
+    versionsRef.current = snapshots;
+    setVersions(snapshots);
+  }, [boardKey, usesServerVersions]);
+
+  useEffect(() => {
     const container = graphContainerRef.current;
     const nodes = nodesMapRef.current;
     const edges = edgesMapRef.current;
@@ -1338,7 +1476,7 @@ export function SyncedDiagram({
 
     const graph = new Graph(container, undefined, [...getDefaultPlugins(), RubberBandHandler]);
     graph.getDataModel().prefix = `${peerId}-${Math.random().toString(36).slice(2, 9)}-auto-`;
-    graph.setConnectable(!isReadOnly);
+    graph.setConnectable(!isReadOnlyRef.current);
     graph.setAllowDanglingEdges(false);
     graph.setConnectableEdges(false);
     graph.setMultigraph(false);
@@ -1346,10 +1484,10 @@ export function SyncedDiagram({
     graph.setTooltips(true);
     graph.setGridEnabled(true);
     graph.setGridSize(DIAGRAM_CANVAS.gridSize);
-    graph.setCellsEditable(!isReadOnly);
-    graph.setCellsResizable(!isReadOnly);
+    graph.setCellsEditable(!isReadOnlyRef.current);
+    graph.setCellsResizable(!isReadOnlyRef.current);
     graph.setCellsBendable(true);
-    graph.setDropEnabled(!isReadOnly);
+    graph.setDropEnabled(!isReadOnlyRef.current);
     graph.setSwimlaneNesting(true);
     graph.setExtendParentsOnMove(true);
     graph.setHtmlLabels(false);
@@ -1422,7 +1560,7 @@ export function SyncedDiagram({
           : defaultCreateHandler(state);
       if (
         handler instanceof DiagramVertexHandler
-        && !isReadOnly
+        && !isReadOnlyRef.current
         && !(state.style as DiagramCellStyle).diagramLocked
       ) {
         handler.ensureRotationHandle();
@@ -1459,6 +1597,14 @@ export function SyncedDiagram({
     graph.getAllConnectionConstraints = (terminal) => (
       terminal?.cell.isVertex() ? PORT_CONSTRAINTS : null
     );
+    const defaultIsValidConnection = graph.isValidConnection.bind(graph);
+    graph.isValidConnection = (source, target) => {
+      if ((edgesMapRef.current?.size ?? 0) >= MAX_DIAGRAM_EDGES) {
+        setStatus(`流程图连线已达到 ${MAX_DIAGRAM_EDGES} 条上限。`);
+        return false;
+      }
+      return defaultIsValidConnection(source, target);
+    };
     const defaultIsValidDropTarget = graph.isValidDropTarget.bind(graph);
     graph.isValidDropTarget = (cell, cells, event) => {
       const kind = (cell.getStyle() as DiagramCellStyle).diagramKind;
@@ -1468,15 +1614,25 @@ export function SyncedDiagram({
     const defaultIsCellResizable = graph.isCellResizable.bind(graph);
     const defaultIsCellRotatable = graph.isCellRotatable.bind(graph);
     const defaultIsCellEditable = graph.isCellEditable.bind(graph);
-    graph.isCellMovable = (cell) => !isReadOnly && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellMovable(cell);
-    graph.isCellResizable = (cell) => !isReadOnly && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellResizable(cell);
+    const defaultIsCellDeletable = graph.isCellDeletable.bind(graph);
+    graph.isCellMovable = (cell) => !isReadOnlyRef.current && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellMovable(cell);
+    graph.isCellResizable = (cell) => !isReadOnlyRef.current && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellResizable(cell);
     graph.isCellRotatable = (cell) => graph.getSelectionCount() === 1
-      && !isReadOnly
+      && !isReadOnlyRef.current
       && !(cell.getStyle() as DiagramCellStyle).diagramLocked
       && defaultIsCellRotatable(cell);
-    graph.isCellEditable = (cell) => !isReadOnly && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellEditable(cell);
+    graph.isCellEditable = (cell) => !isReadOnlyRef.current && !(cell.getStyle() as DiagramCellStyle).diagramLocked && defaultIsCellEditable(cell);
+    graph.isCellDeletable = (cell) => !isReadOnlyRef.current && !isDiagramCellLocked(cell) && defaultIsCellDeletable(cell);
 
     let canvasExpansionFrame: number | null = null;
+    let viewRefreshFrame: number | null = null;
+    const scheduleViewRefresh = () => {
+      if (viewRefreshFrame !== null) return;
+      viewRefreshFrame = window.requestAnimationFrame(() => {
+        viewRefreshFrame = null;
+        setViewEpoch((value) => value + 1);
+      });
+    };
     const refreshCanvasExtent = () => {
       canvasExpansionFrame = null;
       const parent = graph.getDefaultParent();
@@ -1514,8 +1670,9 @@ export function SyncedDiagram({
       }
       const currentNodes = nodesMapRef.current;
       const currentEdges = edgesMapRef.current;
+      const currentPages = pagesMapRef.current;
       const document = yDocRef.current;
-      if (!currentNodes || !currentEdges || !document) {
+      if (!currentNodes || !currentEdges || !currentPages || !document || !currentPages.has(activePageId)) {
         return;
       }
       const snapshot = readGraph();
@@ -1547,8 +1704,14 @@ export function SyncedDiagram({
       if (!currentNodes || !currentEdges) {
         return;
       }
+      const nextNodes = Array.from(currentNodes.values())
+        .filter((node) => diagramPageId(node.pageId) === activePageId)
+        .sort((a, b) => a.zIndex - b.zIndex);
+      const nextEdges = Array.from(currentEdges.values())
+        .filter((edge) => diagramPageId(edge.pageId) === activePageId)
+        .sort((a, b) => a.zIndex - b.zIndex);
       const missingStencilPaths = new Set(
-        Array.from(currentNodes.values())
+        nextNodes
           .map((node) => node.stencilLibrary)
           .filter((path): path is string => typeof path === "string" && !loadedStencilLibrariesRef.current.has(path)),
       );
@@ -1565,17 +1728,9 @@ export function SyncedDiagram({
       try {
         graph.batchUpdate(() => {
           const parent = graph.getDefaultParent();
-          const existing = [
-            ...graph.getChildEdges(parent),
-            ...graph.getChildVertices(parent),
-          ];
-          if (existing.length > 0) {
-            graph.removeCells(existing, true);
-          }
+          const existingVertices = descendantVertices(graph, parent);
+          const existingEdges = graph.getChildEdges(parent);
           const cells = new Map<string, Cell>();
-          const nextNodes = Array.from(currentNodes.values())
-            .filter((node) => diagramPageId(node.pageId) === activePageId)
-            .sort((a, b) => a.zIndex - b.zIndex);
           const optimizeLargeGraph = nextNodes.length >= 400;
           let pendingNodes = [...nextNodes];
           while (pendingNodes.length > 0) {
@@ -1586,14 +1741,31 @@ export function SyncedDiagram({
                 remaining.push(node);
                 continue;
               }
-              const cell = graph.insertVertex({
-                parent: nodeParent,
-                id: node.id,
-                value: node.label,
-                position: [node.x, node.y],
-                size: [node.width, node.height],
-                style: nodeCellStyle(node, optimizeLargeGraph),
-              });
+              const existing = graph.getDataModel().getCell(node.id);
+              const desiredStyle = nodeCellStyle(node, optimizeLargeGraph);
+              const cell = existing?.isVertex() ? existing : graph.insertVertex({
+                  parent: nodeParent,
+                  id: node.id,
+                  value: node.label,
+                  position: [node.x, node.y],
+                  size: [node.width, node.height],
+                  style: desiredStyle,
+                });
+              if (cell.getParent() !== nodeParent) graph.addCell(cell, nodeParent);
+              if (String(cell.getValue() ?? "") !== node.label) graph.getDataModel().setValue(cell, node.label);
+              const geometry = cell.getGeometry();
+              if (!geometry || geometry.x !== node.x || geometry.y !== node.y
+                || geometry.width !== node.width || geometry.height !== node.height) {
+                const nextGeometry = geometry?.clone() ?? new Geometry(node.x, node.y, node.width, node.height);
+                nextGeometry.x = node.x;
+                nextGeometry.y = node.y;
+                nextGeometry.width = node.width;
+                nextGeometry.height = node.height;
+                graph.getDataModel().setGeometry(cell, nextGeometry);
+              }
+              if (!cellStylesEqual(cell.getStyle(), desiredStyle)) {
+                graph.getDataModel().setStyle(cell, desiredStyle);
+              }
               cell.setConnectable(node.kind !== "container" && node.kind !== "swimlane" && node.kind !== "lane");
               cells.set(node.id, cell);
             }
@@ -1602,35 +1774,48 @@ export function SyncedDiagram({
             }
             pendingNodes = remaining;
           }
-          const nextEdges = Array.from(currentEdges.values())
-            .filter((edge) => diagramPageId(edge.pageId) === activePageId)
-            .sort((a, b) => a.zIndex - b.zIndex);
           for (const edge of nextEdges) {
             const source = cells.get(edge.sourceId);
             const target = cells.get(edge.targetId);
             if (!source || !target) {
               continue;
             }
-            const edgeCell = graph.insertEdge({
-              parent,
-              id: edge.id,
-              value: edge.label,
-              source,
-              target,
-              style: edgeCellStyle(edge, source, target),
-            });
+            const desiredStyle = edgeCellStyle(edge, source, target);
+            const existing = graph.getDataModel().getCell(edge.id);
+            const edgeCell = existing?.isEdge() ? existing : graph.insertEdge({
+                parent,
+                id: edge.id,
+                value: edge.label,
+                source,
+                target,
+                style: desiredStyle,
+              });
+            if (edgeCell.getParent() !== parent) graph.addCell(edgeCell, parent, null, source, target);
+            else {
+              if (edgeCell.getTerminal(true) !== source) graph.getDataModel().setTerminal(edgeCell, source, true);
+              if (edgeCell.getTerminal(false) !== target) graph.getDataModel().setTerminal(edgeCell, target, false);
+            }
+            if (String(edgeCell.getValue() ?? "") !== edge.label) graph.getDataModel().setValue(edgeCell, edge.label);
+            if (!cellStylesEqual(edgeCell.getStyle(), desiredStyle)) graph.getDataModel().setStyle(edgeCell, desiredStyle);
             const waypoints = edgeWaypointsForGraph(edge);
-            if (waypoints?.length) {
-              const geometry = edgeCell.getGeometry()?.clone();
-              if (geometry) {
-                geometry.points = waypoints;
-                graph.getDataModel().setGeometry(edgeCell, geometry);
-              }
+            const geometry = edgeCell.getGeometry();
+            if (geometry && !diagramPointsEqual(geometry.points, waypoints)) {
+              const nextGeometry = geometry.clone();
+              nextGeometry.points = waypoints?.length ? waypoints : null;
+              graph.getDataModel().setGeometry(edgeCell, nextGeometry);
             }
             graph.setConnectionConstraint(edgeCell, source, true, constraintForPort(edge.sourcePort));
             graph.setConnectionConstraint(edgeCell, target, false, constraintForPort(edge.targetPort));
             cells.set(edge.id, edgeCell);
           }
+          const desiredEdgeIds = new Set(nextEdges.map((edge) => edge.id));
+          const staleEdges = existingEdges.filter((cell) => !desiredEdgeIds.has(cell.getId() ?? ""));
+          if (staleEdges.length > 0) graph.removeCells(staleEdges, true);
+          const desiredNodeIds = new Set(nextNodes.map((node) => node.id));
+          const staleVertices = existingVertices.filter((cell) => !desiredNodeIds.has(cell.getId() ?? ""));
+          const staleVertexSet = new Set(staleVertices);
+          const staleRoots = staleVertices.filter((cell) => !cell.getParent() || !staleVertexSet.has(cell.getParent()!));
+          if (staleRoots.length > 0) graph.removeCells(staleRoots, true);
           const restoredSelection = Array.from(selectedIds)
             .map((id) => id ? cells.get(id) : undefined)
             .filter((cell): cell is Cell => Boolean(cell));
@@ -1641,8 +1826,8 @@ export function SyncedDiagram({
       } finally {
         suppressGraphSyncRef.current = false;
       }
-      setNodeCount(Array.from(currentNodes.values()).filter((node) => diagramPageId(node.pageId) === activePageId).length);
-      setEdgeCount(Array.from(currentEdges.values()).filter((edge) => diagramPageId(edge.pageId) === activePageId).length);
+      setNodeCount(nextNodes.length);
+      setEdgeCount(nextEdges.length);
       graph.setTooltips(currentNodes.size < 400);
       updateSelection(graph, setSelection);
       scheduleCanvasExpansion();
@@ -1669,7 +1854,19 @@ export function SyncedDiagram({
     };
     graph.getDataModel().addListener(InternalEvent.CHANGE, modelListener);
     graph.getSelectionModel().addListener(InternalEvent.CHANGE, selectionListener);
+    graph.getView().addListener(InternalEvent.SCALE, scheduleViewRefresh);
+    graph.getView().addListener(InternalEvent.TRANSLATE, scheduleViewRefresh);
+    graph.getView().addListener(InternalEvent.SCALE_AND_TRANSLATE, scheduleViewRefresh);
     container.addEventListener("pointermove", presencePointerListener, { passive: true });
+    container.addEventListener("scroll", scheduleViewRefresh, { passive: true });
+    const wheelZoomListener = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      if (event.deltaY < 0) graph.zoomIn();
+      else if (event.deltaY > 0) graph.zoomOut();
+      scheduleViewRefresh();
+    };
+    container.addEventListener("wheel", wheelZoomListener, { passive: false });
     const resizeObserver = new ResizeObserver(scheduleCanvasExpansion);
     resizeObserver.observe(container);
     runtimeRef.current = {
@@ -1679,10 +1876,17 @@ export function SyncedDiagram({
           window.cancelAnimationFrame(canvasExpansionFrame);
           canvasExpansionFrame = null;
         }
+        if (viewRefreshFrame !== null) {
+          window.cancelAnimationFrame(viewRefreshFrame);
+          viewRefreshFrame = null;
+        }
         resizeObserver.disconnect();
         graph.getDataModel().removeListener(modelListener);
         graph.getSelectionModel().removeListener(selectionListener);
+        graph.getView().removeListener(scheduleViewRefresh);
         container.removeEventListener("pointermove", presencePointerListener);
+        container.removeEventListener("scroll", scheduleViewRefresh);
+        container.removeEventListener("wheel", wheelZoomListener);
         graph.destroy();
       },
     };
@@ -1704,15 +1908,32 @@ export function SyncedDiagram({
         window.cancelAnimationFrame(canvasExpansionFrame);
         canvasExpansionFrame = null;
       }
+      if (viewRefreshFrame !== null) {
+        window.cancelAnimationFrame(viewRefreshFrame);
+        viewRefreshFrame = null;
+      }
       renderGraphRef.current = () => undefined;
       flushGraphRef.current = () => undefined;
       resizeObserver.disconnect();
       graph.getDataModel().removeListener(modelListener);
       graph.getSelectionModel().removeListener(selectionListener);
+      graph.getView().removeListener(scheduleViewRefresh);
       container.removeEventListener("pointermove", presencePointerListener);
+      container.removeEventListener("scroll", scheduleViewRefresh);
+      container.removeEventListener("wheel", wheelZoomListener);
       graph.destroy();
     };
-  }, [activePageId, boardKey, documentEpoch, ensureStencilLibraryLoaded, isFullViewport, isReadOnly, peerId, scheduleDocumentRender, sendPresence]);
+  }, [activePageId, boardKey, documentEpoch, ensureStencilLibraryLoaded, peerId, scheduleDocumentRender, sendPresence]);
+
+  useEffect(() => {
+    const graph = runtimeRef.current?.graph;
+    if (!graph) return;
+    graph.setConnectable(!isReadOnly);
+    graph.setCellsEditable(!isReadOnly);
+    graph.setCellsResizable(!isReadOnly);
+    graph.setDropEnabled(!isReadOnly);
+    recreateSelectionHandlers(graph, graph.getSelectionCells());
+  }, [isReadOnly, runtimeEpoch]);
 
   useEffect(() => {
     const graph = runtimeRef.current?.graph;
@@ -1842,19 +2063,21 @@ export function SyncedDiagram({
       }
       try {
         const update = decodeDiagramUpdate(payload.update);
-        if (!isSafeRemoteDiagramUpdate(document, update)) {
+        flushPendingGraphSync();
+        const validator = remoteUpdateValidatorRef.current;
+        if (!validator || !validator.validate(update, document)) {
           throw new Error("invalid diagram state");
         }
         Y.applyUpdate(document, update, REMOTE_ORIGIN);
-        setStatus(`已合并来自 ${event.sourcePeerId} 的流程图更新。`);
       } catch {
+        remoteUpdateValidatorRef.current?.reset(document);
         setStatus("收到的流程图同步数据无效，已忽略。");
       }
     }
     if (seenEventsRef.current.size > 1_000) {
       seenEventsRef.current = new Set(Array.from(seenEventsRef.current).slice(-600));
     }
-  }, [events, peerId, runtimeEpoch, sendFullState]);
+  }, [events, flushPendingGraphSync, peerId, runtimeEpoch, sendFullState]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1900,17 +2123,14 @@ export function SyncedDiagram({
 
   const switchToWhiteboard = useCallback(() => {
     if (!onSwitchToWhiteboard) return;
-    if (graphSyncTimerRef.current !== null) {
-      window.clearTimeout(graphSyncTimerRef.current);
-      graphSyncTimerRef.current = null;
-    }
+    cancelPendingGraphSync();
     flushGraphRef.current();
     const document = yDocRef.current;
     if (document) {
       cacheDiagramState(boardKey, Y.encodeStateAsUpdate(document));
     }
     onSwitchToWhiteboard();
-  }, [boardKey, onSwitchToWhiteboard]);
+  }, [boardKey, cancelPendingGraphSync, onSwitchToWhiteboard]);
 
   const addPage = useCallback(() => {
     if (isReadOnly) return;
@@ -1922,7 +2142,7 @@ export function SyncedDiagram({
     }
     flushGraphRef.current();
     const id = createDiagramId(peerId, "page");
-    const page: DiagramPage = { id, name: `页面 ${pageMap.size + 1}`, order: pageMap.size };
+    const page: DiagramPage = { id, name: `页面 ${pageMap.size + 1}`, order: nextDiagramPageOrder(pageMap) };
     document.transact(() => pageMap.set(id, page), GRAPH_ORIGIN);
     setActivePageId(id);
     setStatus(`${page.name}已创建。`);
@@ -1968,9 +2188,13 @@ export function SyncedDiagram({
       setStatus("复制页面会超过流程图节点数量上限。");
       return;
     }
+    if (edges.size + sourceEdges.length > MAX_DIAGRAM_EDGES) {
+      setStatus("复制页面会超过流程图连线数量上限。");
+      return;
+    }
     const pageId = createDiagramId(peerId, "page");
     const idMap = new Map(sourceNodes.map((node) => [node.id, createDiagramId(peerId, node.kind)]));
-    const page: DiagramPage = { id: pageId, name: `${sourcePage.name} 副本`, order: pageMap.size };
+    const page: DiagramPage = { id: pageId, name: `${sourcePage.name} 副本`, order: nextDiagramPageOrder(pageMap) };
     document.transact(() => {
       pageMap.set(page.id, page);
       sourceNodes.forEach((node) => {
@@ -2178,6 +2402,11 @@ export function SyncedDiagram({
         setStatus("节点数量不足以插入模板。");
         return;
       }
+      const currentEdgeCount = edgesMapRef.current?.size ?? 0;
+      if (currentEdgeCount + template.edges.length > MAX_DIAGRAM_EDGES) {
+        setStatus("连线数量不足以插入模板。");
+        return;
+      }
       const parent = graph.getDefaultParent();
       const scale = graph.getView().scale || 1;
       const translate = graph.getView().translate;
@@ -2251,19 +2480,37 @@ export function SyncedDiagram({
 
   const removeSelection = useCallback(() => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells();
+      const selected = graph.getSelectionCells();
+      const cells = graph.getDeletableCells(selected);
       if (cells.length > 0) {
         graph.removeCells(cells, true);
-        setStatus(`已删除 ${cells.length} 个选中元素。`);
+        const skipped = selected.length - cells.length;
+        setStatus(skipped > 0
+          ? `已删除 ${cells.length} 个元素，跳过 ${skipped} 个锁定元素。`
+          : `已删除 ${cells.length} 个选中元素。`);
+      } else if (selected.length > 0) {
+        setStatus("选中元素已锁定，请先解锁后再删除。");
       }
     });
   }, [withGraph]);
 
   const copySelection = useCallback(() => {
     withGraph((graph) => {
-      if (graph.getSelectionCells().length > 0) {
+      const cells = graph.getSelectionCells();
+      if (cells.length > 0) {
         Clipboard.copy(graph);
-        setStatus("已复制选中元素，可在流程图中粘贴副本。");
+        const plainText = cells
+          .map((cell) => String(cell.getValue() ?? "").trim())
+          .filter(Boolean)
+          .join("\n") || `${cells.length} 个流程图元素`;
+        if (navigator.clipboard?.writeText) {
+          void navigator.clipboard.writeText(plainText).then(
+            () => setStatus("已复制选中元素，并写入系统剪贴板。"),
+            () => setStatus("已复制到流程图剪贴板；浏览器未授予系统剪贴板权限。", "info"),
+          );
+        } else {
+          setStatus("已复制到流程图剪贴板；当前浏览器不支持系统剪贴板写入。", "info");
+        }
       }
     });
   }, [withGraph]);
@@ -2274,7 +2521,25 @@ export function SyncedDiagram({
       if (pasted && pasted.length > 0) {
         graph.setSelectionCells(pasted);
         setStatus(`已粘贴 ${pasted.length} 个元素。`);
+      } else {
+        setStatus("流程图剪贴板为空，请先复制或剪切元素。");
       }
+    });
+  }, [withGraph]);
+
+  const cutSelection = useCallback(() => {
+    withGraph((graph) => {
+      const selected = graph.getSelectionCells();
+      const cells = graph.getDeletableCells(selected);
+      if (cells.length === 0) {
+        setStatus(selected.length > 0 ? "选中元素已锁定，无法剪切。" : "请先选择要剪切的元素。");
+        return;
+      }
+      Clipboard.cut(graph, cells);
+      const skipped = selected.length - cells.length;
+      setStatus(skipped > 0
+        ? `已剪切 ${cells.length} 个元素，跳过 ${skipped} 个锁定元素。`
+        : `已剪切 ${cells.length} 个元素。`);
     });
   }, [withGraph]);
 
@@ -2294,7 +2559,7 @@ export function SyncedDiagram({
 
   const groupSelection = useCallback(() => {
     withGraph((graph) => {
-      const cells = graph.getCellsForGroup(graph.getSelectionCells().filter((cell) => cell.isVertex()));
+      const cells = graph.getCellsForGroup(graph.getMovableCells(graph.getSelectionCells().filter((cell) => cell.isVertex())));
       if (cells.length < 2) {
         setStatus("至少选择两个同级节点才能分组。");
         return;
@@ -2323,7 +2588,7 @@ export function SyncedDiagram({
 
   const ungroupSelection = useCallback(() => {
     withGraph((graph) => {
-      const groups = graph.getSelectionCells().filter((cell) => {
+      const groups = graph.getMovableCells(graph.getSelectionCells()).filter((cell) => {
         const kind = (cell.getStyle() as DiagramCellStyle).diagramKind;
         return cell.isVertex() && cell.getChildCount() > 0 && (kind === "container" || kind === "swimlane");
       });
@@ -2339,7 +2604,7 @@ export function SyncedDiagram({
 
   const distributeSelection = useCallback((axis: "horizontal" | "vertical") => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells().filter((cell) => cell.isVertex() && cell.getGeometry());
+      const cells = graph.getMovableCells(graph.getSelectionCells()).filter((cell) => cell.isVertex() && cell.getGeometry());
       if (cells.length < 3 || new Set(cells.map((cell) => cell.getParent())).size !== 1) {
         setStatus("等距分布需要至少三个同级节点。");
         return;
@@ -2507,7 +2772,12 @@ export function SyncedDiagram({
 
   const runLayout = useCallback((orientation: "north" | "east") => {
     withGraph((graph) => {
-      if (graph.getChildVertices(graph.getDefaultParent()).length < 2) {
+      const pageVertices = graph.getChildVertices(graph.getDefaultParent());
+      if (pageVertices.some(isDiagramCellLocked)) {
+        setStatus("当前页面包含锁定节点，请先解锁后再自动布局。");
+        return;
+      }
+      if (pageVertices.length < 2) {
         setStatus("至少需要两个节点才能自动布局。");
         return;
       }
@@ -2522,7 +2792,7 @@ export function SyncedDiagram({
 
   const alignSelection = useCallback((align: "left" | "center" | "right" | "top" | "middle" | "bottom") => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells().filter((cell) => cell.isVertex());
+      const cells = graph.getMovableCells(graph.getSelectionCells()).filter((cell) => cell.isVertex());
       if (cells.length < 2) {
         setStatus("至少选择两个节点才能对齐。");
         return;
@@ -2532,10 +2802,27 @@ export function SyncedDiagram({
     });
   }, [withGraph]);
 
+  const orderSelection = useCallback((back: boolean) => {
+    withGraph((graph) => {
+      const selected = graph.getSelectionCells();
+      const cells = graph.getMovableCells(selected);
+      if (cells.length === 0) {
+        setStatus("选中元素已锁定，请先解锁后再调整层级。");
+        return;
+      }
+      graph.orderCells(back, cells);
+      const skipped = selected.length - cells.length;
+      setStatus(skipped > 0
+        ? `已调整 ${cells.length} 个元素的层级，跳过 ${skipped} 个锁定元素。`
+        : (back ? "已置于底层。" : "已置于顶层。"));
+    });
+  }, [withGraph]);
+
   const updateSelectedStyle = useCallback((key: DiagramEditableStyleKey, value: string | boolean | number) => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells();
+      const cells = editableSelectionCells(graph);
       if (cells.length === 0) {
+        setStatus("选中元素已锁定，请先解锁后再修改属性。");
         return;
       }
       graph.setCellStyles(key, value, cells);
@@ -2559,7 +2846,7 @@ export function SyncedDiagram({
   const applyFormat = useCallback(() => {
     withGraph((graph) => {
       const copied = formatStyleRef.current;
-      const cells = graph.getSelectionCells().filter((cell) => copied && cell.isVertex() === copied.vertex);
+      const cells = editableSelectionCells(graph).filter((cell) => copied && cell.isVertex() === copied.vertex);
       if (!copied || cells.length === 0) {
         setStatus("请选择与格式来源同类型的元素。");
         return;
@@ -2585,7 +2872,7 @@ export function SyncedDiagram({
 
   const updateTextFontSize = useCallback((fontSize: number) => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells();
+      const cells = editableSelectionCells(graph);
       graph.batchUpdate(() => {
         cells.forEach((cell) => {
           const style = cell.getClonedStyle() as DiagramCellStyle;
@@ -2617,7 +2904,7 @@ export function SyncedDiagram({
 
   const updateLinePattern = useCallback((pattern: DiagramLinePattern) => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells();
+      const cells = editableSelectionCells(graph);
       graph.batchUpdate(() => {
         cells.forEach((cell) => {
           const style = cell.getClonedStyle();
@@ -2634,7 +2921,7 @@ export function SyncedDiagram({
 
   const toggleTextFontStyle = useCallback((mask: 1 | 2 | 4) => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells();
+      const cells = editableSelectionCells(graph);
       graph.batchUpdate(() => {
         cells.forEach((cell) => {
           const style = cell.getClonedStyle();
@@ -2648,14 +2935,14 @@ export function SyncedDiagram({
 
   const updateTextAlign = useCallback((align: "left" | "center" | "right") => {
     withGraph((graph) => {
-      graph.setCellStyles("align", align, graph.getSelectionCells());
+      graph.setCellStyles("align", align, editableSelectionCells(graph));
       updateSelection(graph, setSelection);
     });
   }, [withGraph]);
 
   const updateTextFontFamily = useCallback((fontFamily: DiagramFontFamily) => {
     withGraph((graph) => {
-      graph.setCellStyles("fontFamily", diagramFontFamilyCss(fontFamily), graph.getSelectionCells());
+      graph.setCellStyles("fontFamily", diagramFontFamilyCss(fontFamily), editableSelectionCells(graph));
       updateSelection(graph, setSelection);
     });
   }, [withGraph]);
@@ -2663,7 +2950,7 @@ export function SyncedDiagram({
   const updateNodeGeometry = useCallback((key: "x" | "y" | "width" | "height", value: number) => {
     withGraph((graph) => {
       const cell = graph.getSelectionCell();
-      if (!cell?.isVertex() || graph.getSelectionCells().length !== 1) return;
+      if (!cell?.isVertex() || graph.getSelectionCells().length !== 1 || isDiagramCellLocked(cell)) return;
       const geometry = cell.getGeometry()?.clone();
       if (!geometry) return;
       if (key === "x" || key === "y") geometry[key] = clampNumber(value, -100_000, 100_000);
@@ -2675,7 +2962,7 @@ export function SyncedDiagram({
 
   const updateNodeRotation = useCallback((degrees: number) => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells().filter((cell) => cell.isVertex());
+      const cells = graph.getMovableCells(graph.getSelectionCells()).filter((cell) => cell.isVertex());
       graph.setCellStyles("rotation", normalizeRotation(degrees), cells);
       updateSelection(graph, setSelection);
     });
@@ -2695,7 +2982,7 @@ export function SyncedDiagram({
 
   const toggleSwimlaneDirection = useCallback(() => {
     withGraph((graph) => {
-      const cells = graph.getSelectionCells().filter((cell) => (
+      const cells = graph.getMovableCells(graph.getSelectionCells()).filter((cell) => (
         cell.isVertex() && (cell.getStyle() as DiagramCellStyle).diagramKind === "swimlane"
       ));
       graph.batchUpdate(() => {
@@ -2721,6 +3008,7 @@ export function SyncedDiagram({
     withGraph((graph) => {
       const pool = graph.getSelectionCell();
       if (!pool || graph.getSelectionCells().length !== 1
+        || isDiagramCellLocked(pool)
         || (pool.getStyle() as DiagramCellStyle).diagramKind !== "swimlane") {
         setStatus("请先选择一个泳池再添加泳道。");
         return;
@@ -2760,7 +3048,7 @@ export function SyncedDiagram({
     withGraph((graph) => {
       const lane = graph.getSelectionCell();
       const pool = lane?.getParent();
-      if (!lane || !pool || (lane.getStyle() as DiagramCellStyle).diagramKind !== "lane") return;
+      if (!lane || !pool || isDiagramCellLocked(lane) || (lane.getStyle() as DiagramCellStyle).diagramKind !== "lane") return;
       const lanes = laneChildren(graph, pool);
       const index = lanes.indexOf(lane);
       const target = lanes[index + offset];
@@ -2780,6 +3068,7 @@ export function SyncedDiagram({
     const selectedLane = currentGraph?.getSelectionCell();
     const laneId = selectedLane?.getId();
     if (!currentGraph || !selectedLane || !laneId
+      || isDiagramCellLocked(selectedLane)
       || (selectedLane.getStyle() as DiagramCellStyle).diagramKind !== "lane") return;
     const childCount = currentGraph.getChildVertices(selectedLane).length;
     if (!await requestConfirmation({
@@ -2806,7 +3095,7 @@ export function SyncedDiagram({
   const commitSelectionLabel = useCallback((label: string) => {
     withGraph((graph) => {
       const cell = graph.getSelectionCell();
-      if (!cell || graph.getSelectionCells().length !== 1) {
+      if (!cell || graph.getSelectionCells().length !== 1 || !graph.isCellEditable(cell)) {
         return;
       }
       graph.getDataModel().setValue(cell, label.slice(0, 500));
@@ -2829,7 +3118,8 @@ export function SyncedDiagram({
     })) return;
     withGraph((graph) => {
       const parent = graph.getDefaultParent();
-      const cells = [...graph.getChildEdges(parent), ...graph.getChildVertices(parent)];
+      const selectedCells = [...graph.getChildEdges(parent), ...graph.getChildVertices(parent)];
+      const cells = graph.getDeletableCells(selectedCells);
       if (cells.length === 0) return;
       graph.removeCells(cells, true);
       const document = yDocRef.current;
@@ -2841,7 +3131,10 @@ export function SyncedDiagram({
           }
         }, GRAPH_ORIGIN);
       }
-      setStatus("流程图已清空，可使用撤销恢复。");
+      const skipped = selectedCells.length - cells.length;
+      setStatus(skipped > 0
+        ? `已清空可删除内容，保留 ${skipped} 个锁定元素。`
+        : "流程图已清空，可使用撤销恢复。");
     });
   }, [activePageId, requestConfirmation, withGraph]);
 
@@ -3052,6 +3345,7 @@ export function SyncedDiagram({
       if (!document || !nodes || !edges || !pageMap || !commentsMap) {
         throw new Error("流程图编辑器尚未就绪");
       }
+      cancelPendingGraphSync();
       const importedPages = imported.pages?.length
         ? imported.pages
         : [{ id: DEFAULT_PAGE_ID, name: "页面 1", order: 0 }];
@@ -3082,10 +3376,14 @@ export function SyncedDiagram({
     } finally {
       setIsImporting(false);
     }
-  }, [edgeCount, isReadOnly, nodeCount, refreshUndoState, requestConfirmation]);
+  }, [cancelPendingGraphSync, edgeCount, isReadOnly, nodeCount, refreshUndoState, requestConfirmation]);
 
   const addComment = useCallback(async () => {
     if (isReadOnly) return;
+    if ((commentsMapRef.current?.size ?? 0) >= MAX_DIAGRAM_COMMENTS) {
+      setStatus(`流程图评论已达到 ${MAX_DIAGRAM_COMMENTS} 条上限。`);
+      return;
+    }
     const text = (await requestText({
       title: selection.count === 1 ? "评论选中元素" : "评论当前页面",
       message: selection.count === 1
@@ -3130,17 +3428,27 @@ export function SyncedDiagram({
   }, [isReadOnly]);
 
   const focusComment = useCallback((comment: DiagramComment) => {
+    if (!pagesMapRef.current?.has(comment.pageId)) {
+      setStatus("评论关联的页面已被删除，无法定位。");
+      return;
+    }
     if (comment.pageId !== activePageId) {
       flushGraphRef.current();
       setActivePageId(comment.pageId);
     }
-    if (!comment.cellId) return;
+    if (!comment.cellId) {
+      setStatus("已定位到评论所在页面。", "success");
+      return;
+    }
     window.setTimeout(() => {
       const graph = runtimeRef.current?.graph;
       const cell = graph?.getDataModel().getCell(comment.cellId!);
       if (graph && cell) {
         graph.setSelectionCell(cell);
         graph.scrollCellToVisible(cell);
+        setStatus("已定位到评论关联的元素。", "success");
+      } else {
+        setStatus("评论关联的元素已被删除，无法定位。");
       }
     }, comment.pageId === activePageId ? 0 : 60);
   }, [activePageId]);
@@ -3154,6 +3462,7 @@ export function SyncedDiagram({
     if (!document || !nodes || !edges || !pageMap || !commentsMap) {
       throw new Error("流程图尚未就绪");
     }
+    cancelPendingGraphSync();
     const probe = new Y.Doc();
     try {
       Y.applyUpdate(probe, update);
@@ -3179,7 +3488,7 @@ export function SyncedDiagram({
     } finally {
       probe.destroy();
     }
-  }, []);
+  }, [cancelPendingGraphSync]);
 
   const createVersion = useCallback(async () => {
     if (isRoleReadOnly) return;
@@ -3216,7 +3525,13 @@ export function SyncedDiagram({
           createdAt,
           update,
         };
-        versionsRef.current = [...versionsRef.current.slice(-19), snapshot];
+        versionsRef.current = writeSessionDiagramVersions(
+          boardKey,
+          [...versionsRef.current.slice(-(MAX_DIAGRAM_SESSION_VERSIONS - 1)), snapshot],
+        );
+        if (!versionsRef.current.some((version) => version.id === snapshot.id)) {
+          throw new Error("版本快照超过浏览器会话存储配额，请删除内容或使用服务端版本。");
+        }
       }
       setVersions(versionsRef.current);
       setStatus(`已创建版本“${snapshot.name}”。`);
@@ -3225,7 +3540,7 @@ export function SyncedDiagram({
     } finally {
       setIsVersionLoading(false);
     }
-  }, [isRoleReadOnly, peerId, requestText, roomId, roomToken, usesServerVersions]);
+  }, [boardKey, isRoleReadOnly, peerId, requestText, roomId, roomToken, usesServerVersions]);
 
   const restoreVersion = useCallback(async (snapshot: DiagramVersionSnapshot) => {
     if (isReadOnly || !await requestConfirmation({
@@ -3277,10 +3592,7 @@ export function SyncedDiagram({
   }, [peerId, requestConfirmation, roomId, roomRole, roomToken]);
 
   const encodeCurrentCloudSnapshot = useCallback(() => {
-    if (graphSyncTimerRef.current !== null) {
-      window.clearTimeout(graphSyncTimerRef.current);
-      graphSyncTimerRef.current = null;
-    }
+    cancelPendingGraphSync();
     flushGraphRef.current();
     const document = yDocRef.current;
     if (!document) throw new Error("流程图尚未就绪");
@@ -3289,7 +3601,7 @@ export function SyncedDiagram({
       throw new Error("流程图超过 3 MB 云端保存限制，请导出后精简文档");
     }
     return update;
-  }, []);
+  }, [cancelPendingGraphSync]);
 
   useEffect(() => {
     if (!onEmbedApiChange) return;
@@ -3474,18 +3786,28 @@ export function SyncedDiagram({
     const cell = graph.getCellAt(point.x, point.y);
     if (cell && !graph.isCellSelected(cell)) {
       graph.setSelectionCell(cell);
+    } else if (!cell) {
+      graph.clearSelection();
     }
-    const bounds = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 184;
+    const menuHeight = 360;
     setContextMenu({
-      x: Math.min(event.clientX - bounds.left, Math.max(8, bounds.width - 176)),
-      y: Math.min(event.clientY - bounds.top, Math.max(8, bounds.height - 280)),
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
     });
-    graphContainerRef.current?.focus();
   }, []);
 
-  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+  useEffect(() => {
+    if (!contextMenu) return;
+    const frame = window.requestAnimationFrame(() => {
+      contextMenuRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [contextMenu]);
+
+  const handleKeyDown = useCallback((event: KeyboardEvent) => {
     const target = event.target as HTMLElement;
-    if (target.closest("input, textarea, [contenteditable='true']")) {
+    if (target.closest("input, textarea, select, [contenteditable='true'], [role='dialog'], [role='menu']")) {
       return;
     }
     const graph = runtimeRef.current?.graph;
@@ -3494,12 +3816,47 @@ export function SyncedDiagram({
     }
     const modifier = event.metaKey || event.ctrlKey;
     const key = event.key.toLowerCase();
+    if (event.key === "Escape") {
+      if (showCollaborationPanel) setShowCollaborationPanel(false);
+      else if (contextMenu) setContextMenu(null);
+      else if (compactPanel) setCompactPanel(null);
+      else if (graph.getSelectionCount() > 0) graph.clearSelection();
+      else if (isExpanded && !standalone) setIsExpanded(false);
+      else return;
+      event.preventDefault();
+      return;
+    }
+    if (modifier && (key === "=" || key === "+")) {
+      event.preventDefault();
+      graph.zoomIn();
+      setViewEpoch((value) => value + 1);
+      return;
+    }
+    if (modifier && key === "-") {
+      event.preventDefault();
+      graph.zoomOut();
+      setViewEpoch((value) => value + 1);
+      return;
+    }
+    if (modifier && key === "0") {
+      event.preventDefault();
+      graph.zoomActual();
+      setViewEpoch((value) => value + 1);
+      return;
+    }
+    if (event.shiftKey && event.code === "Digit1") {
+      event.preventDefault();
+      graph.getPlugin<FitPlugin>("fit")?.fitCenter({ margin: 28 });
+      setViewEpoch((value) => value + 1);
+      return;
+    }
     if (modifier && key === "s") {
       event.preventDefault();
       void saveDiagramToCloud();
       return;
     }
     if (modifier && key === "c") {
+      if (graph.getSelectionCount() === 0) return;
       event.preventDefault();
       copySelection();
       return;
@@ -3512,18 +3869,17 @@ export function SyncedDiagram({
     if (isReadOnly) return;
     if (modifier && key === "z") {
       event.preventDefault();
-      if (event.shiftKey) {
-        undoManagerRef.current?.redo();
-      } else {
-        undoManagerRef.current?.undo();
-      }
-      refreshUndoState();
+      performHistoryAction(event.shiftKey ? "redo" : "undo");
       return;
     }
     if (modifier && key === "y") {
       event.preventDefault();
-      undoManagerRef.current?.redo();
-      refreshUndoState();
+      performHistoryAction("redo");
+      return;
+    }
+    if (modifier && key === "x") {
+      event.preventDefault();
+      cutSelection();
       return;
     }
     if (modifier && key === "v") {
@@ -3543,7 +3899,7 @@ export function SyncedDiagram({
     }
     if (event.key === "Enter" || event.key === "F2") {
       const cell = graph.getSelectionCell();
-      if (cell) {
+      if (cell && graph.isCellEditable(cell)) {
         event.preventDefault();
         graph.startEditingAtCell(cell);
       }
@@ -3551,16 +3907,55 @@ export function SyncedDiagram({
     }
     if (event.key.startsWith("Arrow") && graph.getSelectionCells().length > 0) {
       event.preventDefault();
+      const movable = graph.getMovableCells(graph.getSelectionCells());
+      if (movable.length === 0) {
+        setStatus("选中元素已锁定，请先解锁后再移动。");
+        return;
+      }
       const distance = event.shiftKey ? 10 : 1;
       const delta = event.key === "ArrowLeft" ? [-distance, 0]
         : event.key === "ArrowRight" ? [distance, 0]
           : event.key === "ArrowUp" ? [0, -distance]
             : [0, distance];
-      graph.moveCells(graph.getSelectionCells(), delta[0], delta[1]);
+      graph.moveCells(movable, delta[0], delta[1]);
     }
-  }, [copySelection, duplicateSelection, isReadOnly, pasteSelection, refreshUndoState, removeSelection, saveDiagramToCloud]);
+  }, [compactPanel, contextMenu, copySelection, cutSelection, duplicateSelection, isExpanded, isReadOnly, pasteSelection, performHistoryAction, removeSelection, saveDiagramToCloud, showCollaborationPanel, standalone]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleKeyDown, isActive]);
+
+  const remoteSelectionMarkers = useMemo(() => {
+    const graph = runtimeRef.current?.graph;
+    const container = graphContainerRef.current;
+    if (!graph || !container) return [];
+    const markers: RemoteSelectionMarker[] = [];
+    for (const presence of Object.values(remotePresences)) {
+      if (presence.pageId !== activePageId) continue;
+      for (const cellId of presence.selectedIds.slice(0, 100)) {
+        const cell = graph.getDataModel().getCell(cellId);
+        const state = cell ? graph.getView().getState(cell) : null;
+        if (!state) continue;
+        markers.push({
+          key: `${presence.peerId}:${cellId}`,
+          peerId: presence.peerId,
+          left: state.x - container.scrollLeft - 3,
+          top: state.y - container.scrollTop - 3,
+          width: Math.max(8, state.width) + 6,
+          height: Math.max(8, state.height) + 6,
+        });
+      }
+    }
+    return markers;
+  }, [activePageId, remotePresences, viewEpoch]);
 
   const totalPeers = Math.max(1, peerCount + 1);
+  const usesCommandKey = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
+  const modifierLabel = usesCommandKey ? "⌘" : "Ctrl+";
+  const undoShortcut = `${modifierLabel}Z`;
+  const redoShortcut = usesCommandKey ? "⇧⌘Z" : "Ctrl+Shift+Z";
   const cloudMenuLabel = !authReady
     ? "账号"
     : !authed
@@ -3573,8 +3968,15 @@ export function SyncedDiagram({
   const selectionOnlyEdges = selection.isEdge && !selection.isNode;
   const isSingleNode = selectionOnlyNodes && selection.count === 1;
   const activePageName = pages.find((page) => page.id === activePageId)?.name ?? "页面 1";
-  const canvasBackground = theme === "dark" ? "#272729" : "#f5f5f7";
+  const canvasBackground = "var(--diagram-apple-canvas)";
   const gridColor = theme === "dark" ? "rgba(255,255,255,.09)" : "rgba(29,29,31,.09)";
+  const currentGraph = runtimeRef.current?.graph;
+  const currentViewScale = currentGraph?.getView().scale ?? 1;
+  const currentViewTranslate = currentGraph?.getView().translate ?? new Point();
+  const currentContainer = graphContainerRef.current;
+  const gridStep = Math.max(4, DIAGRAM_CANVAS.gridSize * currentViewScale);
+  const gridOffsetX = currentViewTranslate.x * currentViewScale - (currentContainer?.scrollLeft ?? 0);
+  const gridOffsetY = currentViewTranslate.y * currentViewScale - (currentContainer?.scrollTop ?? 0);
   const paletteSearchQuery = paletteQuery.trim().toLowerCase();
   const builtInPaletteResultCount = NODE_PALETTE.filter((item) => !paletteSearchQuery
     || `${item.label} ${item.detail} ${item.category}`.toLowerCase().includes(paletteSearchQuery)).length;
@@ -3586,6 +3988,11 @@ export function SyncedDiagram({
   const librarySummaryLabel = paletteSearchQuery
     ? `${libraryCountLabel} 个匹配`
     : `${PALETTE_CATEGORIES.length + stencilCollections.length} 类 · ${libraryCountLabel} 个图形`;
+  const statusDotClass = statusTone === "error"
+    ? "bg-[var(--diagram-apple-danger)]"
+    : statusTone === "success"
+      ? "bg-[var(--diagram-apple-success)]"
+      : isConnected ? "bg-[var(--diagram-apple-success)]" : "bg-zinc-400";
   const toggleInspectorVisibility = () => {
     const nextVisible = !isInspectorVisible;
     setIsInspectorVisible(nextVisible);
@@ -3616,7 +4023,7 @@ export function SyncedDiagram({
       {!isFullViewport ? (
         <div className="diagram-apple-intro flex flex-wrap items-center justify-between gap-4 px-1 pb-1">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="diagram-apple-intro-icon grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-950 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
+            <div className="diagram-apple-intro-icon grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-950 text-white shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
               <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" viewBox="0 0 24 24" aria-hidden="true">
                 <rect x="3" y="4" width="6" height="5" rx="1" /><rect x="15" y="15" width="6" height="5" rx="1" /><path d="M9 6.5h4a3 3 0 0 1 3 3V15M12 12H8a3 3 0 0 0-3 3v1" />
               </svg>
@@ -3624,7 +4031,7 @@ export function SyncedDiagram({
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2.5">
                 <div>
-                  <h2 className="text-sm font-semibold tracking-tight text-zinc-950 dark:text-white">专业流程图</h2>
+                  <h2 className="text-sm font-semibold text-zinc-950 dark:text-white">专业流程图</h2>
                   <p className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">{activePageName} · 实时协作工作区</p>
                 </div>
                 {onSwitchToWhiteboard ? (
@@ -3636,20 +4043,20 @@ export function SyncedDiagram({
                     >
                       自由白板
                     </button>
-                    <button type="button" className="diagram-apple-mode-option diagram-apple-mode-option-active rounded-md bg-zinc-950 px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950">
+                    <button type="button" className="diagram-apple-mode-option diagram-apple-mode-option-active rounded-md bg-zinc-950 px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
                       专业流程图
                     </button>
                   </div>
                 ) : null}
                 <span className="diagram-apple-pill inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white/70 px-2 py-1 text-[10px] font-medium text-zinc-600 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-zinc-300">
-                  <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.12)]" : "bg-zinc-400"}`} />
+                  <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-[var(--diagram-apple-success)] shadow-[0_0_0_3px_var(--diagram-apple-success-soft)]" : "bg-zinc-400"}`} />
                   {isConnected ? "实时同步" : "本地编辑"}
                 </span>
                 <span className="hidden text-[10px] text-zinc-400 xl:inline">{totalPeers} 位协作者 · {nodeCount} 个节点 · {edgeCount} 条连线</span>
               </div>
             </div>
           </div>
-          <button type="button" className="diagram-apple-primary-action inline-flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-tiny font-semibold text-zinc-700 shadow-sm transition hover:-translate-y-px hover:border-cyan-400 hover:text-cyan-800 dark:border-white/[0.1] dark:bg-white/[0.05] dark:text-zinc-200 dark:hover:border-cyan-300/50 dark:hover:text-cyan-100" onClick={() => setIsExpanded(true)}>
+          <button type="button" className="diagram-apple-primary-action inline-flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-tiny font-semibold text-zinc-700 shadow-sm transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:text-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-white/[0.05] dark:text-zinc-200" onClick={() => setIsExpanded(true)}>
             <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H2v4M10 2h4v4M6 14H2v-4M10 14h4v-4" /></svg>
             全屏编辑
           </button>
@@ -3657,10 +4064,10 @@ export function SyncedDiagram({
       ) : null}
 
       <div className={isFullViewport
-        ? "diagram-apple-shell absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-zinc-100 dark:bg-[#090c11]"
-        : "diagram-apple-shell mt-3 flex h-[min(78dvh,680px)] min-h-[540px] min-w-0 flex-col overflow-hidden rounded-xl border border-black/[0.09] bg-white shadow-[0_24px_70px_-38px_rgba(15,23,42,0.55)] dark:border-white/[0.09] dark:bg-[#0c1016] sm:h-[680px] md:h-[720px] lg:h-[760px] xl:h-[820px]"}
+        ? "diagram-apple-shell absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-[var(--diagram-apple-page)]"
+        : "diagram-apple-shell mt-3 flex h-[clamp(320px,78dvh,680px)] min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--diagram-apple-line-strong)] bg-[var(--diagram-apple-surface)] shadow-[0_24px_70px_-38px_rgba(15,23,42,0.55)]"}
       >
-        <div className="diagram-apple-titlebar diagram-apple-topbar flex h-11 shrink-0 items-center gap-1 border-b border-black/[0.07] bg-white/95 px-2 backdrop-blur-xl dark:border-white/[0.08] dark:bg-[#11161e]/95">
+        <div className="diagram-apple-titlebar diagram-apple-topbar flex h-11 shrink-0 items-center gap-1 border-b border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2 backdrop-blur-xl">
           <div className="flex min-w-0 items-center gap-1.5">
             <a
               href="/"
@@ -3673,12 +4080,12 @@ export function SyncedDiagram({
               </svg>
             </a>
             <div className="diagram-apple-toolbar-brand flex h-8 min-w-0 items-center gap-2">
-              <span className="diagram-apple-toolbar-icon grid h-6 w-6 place-items-center rounded-md bg-zinc-950 text-white dark:bg-cyan-300 dark:text-zinc-950">
+              <span className="diagram-apple-toolbar-icon grid h-6 w-6 place-items-center rounded-md bg-zinc-950 text-white dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
                 <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.7" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2" width="4" height="3.5" rx=".7" /><rect x="10.5" y="10.5" width="4" height="3.5" rx=".7" /><path d="M5.5 3.7h2.2a2 2 0 0 1 2 2v4.8" /></svg>
               </span>
               <span className="min-w-0">
                 <span className="block max-w-44 truncate text-[11px] font-semibold text-zinc-800 dark:text-zinc-100 sm:max-w-64">{cloudDocument?.name ?? "未命名流程图"}</span>
-                <span className="hidden text-[9px] text-zinc-400 sm:block">{cloudDirty ? "有未保存更改" : "专业流程图"}</span>
+                <span className="hidden text-[10px] text-zinc-400 sm:block">{cloudDirty ? "有未保存更改" : "专业流程图"}</span>
               </span>
             </div>
           </div>
@@ -3704,23 +4111,21 @@ export function SyncedDiagram({
           <DiagramToolbarMenu
             label={selection.count > 0 ? `编辑 · ${selection.count}` : "编辑"}
             items={[
-              { key: "undo", label: "撤销", shortcut: "⌘Z", disabled: isReadOnly || !canUndo },
-              { key: "redo", label: "重做", shortcut: "⇧⌘Z", disabled: isReadOnly || !canRedo },
-              { key: "copy", label: "复制", shortcut: "⌘C", disabled: selection.count === 0 },
-              { key: "paste", label: "粘贴", shortcut: "⌘V", disabled: isReadOnly },
-              { key: "duplicate", label: "创建副本", shortcut: "⌘D", disabled: isReadOnly || selection.count === 0 },
+              { key: "undo", label: "撤销", shortcut: undoShortcut, disabled: isReadOnly || !canUndo },
+              { key: "redo", label: "重做", shortcut: redoShortcut, disabled: isReadOnly || !canRedo },
+              { key: "copy", label: "复制", shortcut: `${modifierLabel}C`, disabled: selection.count === 0 },
+              { key: "cut", label: "剪切", shortcut: `${modifierLabel}X`, disabled: isReadOnly || selection.count === 0 || selection.lockedCount === selection.count },
+              { key: "paste", label: "粘贴", shortcut: `${modifierLabel}V`, disabled: isReadOnly },
+              { key: "duplicate", label: "创建副本", shortcut: `${modifierLabel}D`, disabled: isReadOnly || selection.count === 0 },
               { key: "copy-format", label: "复制格式", disabled: selection.count !== 1 },
               { key: "apply-format", label: "应用格式", disabled: isReadOnly || !hasCopiedFormat || selection.count === 0 },
               { key: "delete", label: "删除", shortcut: "Del", disabled: isReadOnly || selection.count === 0, danger: true },
             ]}
             onAction={(key) => {
-              if (key === "undo") {
-                undoManagerRef.current?.undo();
-                refreshUndoState();
-              } else if (key === "redo") {
-                undoManagerRef.current?.redo();
-                refreshUndoState();
-              } else if (key === "copy") copySelection();
+              if (key === "undo") performHistoryAction("undo");
+              else if (key === "redo") performHistoryAction("redo");
+              else if (key === "copy") copySelection();
+              else if (key === "cut") cutSelection();
               else if (key === "paste") pasteSelection();
               else if (key === "duplicate") duplicateSelection();
               else if (key === "copy-format") copyFormat();
@@ -3749,8 +4154,8 @@ export function SyncedDiagram({
             onAction={(key) => {
               if (key === "group") groupSelection();
               else if (key === "ungroup") ungroupSelection();
-              else if (key === "bring-front") withGraph((graph) => graph.orderCells(false));
-              else if (key === "send-back") withGraph((graph) => graph.orderCells(true));
+              else if (key === "bring-front") orderSelection(false);
+              else if (key === "send-back") orderSelection(true);
               else if (key === "distribute-horizontal") distributeSelection("horizontal");
               else if (key === "distribute-vertical") distributeSelection("vertical");
               else if (key === "align-left") alignSelection("left");
@@ -3788,10 +4193,10 @@ export function SyncedDiagram({
           <DiagramToolbarMenu
             label="视图"
             items={[
-              { key: "zoom-in", label: "放大" },
-              { key: "zoom-out", label: "缩小" },
-              { key: "fit", label: "适应画布" },
-              { key: "actual", label: "实际大小 100%" },
+              { key: "zoom-in", label: "放大", shortcut: `${modifierLabel}+` },
+              { key: "zoom-out", label: "缩小", shortcut: `${modifierLabel}-` },
+              { key: "fit", label: "适应画布", shortcut: "Shift+1" },
+              { key: "actual", label: "实际大小 100%", shortcut: `${modifierLabel}0` },
               { key: "minimap", label: showMinimap ? "隐藏小地图" : "显示小地图" },
               { key: "inspector", label: isInspectorVisible ? "隐藏设计属性" : "显示设计属性", selected: isInspectorVisible },
               { key: "theme-system", label: "主题：跟随系统", selected: !hasThemeOverride },
@@ -3837,28 +4242,33 @@ export function SyncedDiagram({
               else if (key === "clear") clearDiagram();
             }}
           />
-          <span className="ml-auto h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
-          <DiagramToolbarMenu
-            label={cloudMenuLabel}
-            placement="bottom-end"
-            items={!authReady
-              ? [{ key: "auth-loading", label: "正在读取账号", disabled: true }]
-              : authed
-                ? [
-                    { key: "cloud-save", label: cloudDocument ? "保存到云端" : "保存为云端文件", shortcut: "⌘S", disabled: isCloudBusy },
-                    { key: "cloud-save-as", label: "另存为云端文件", disabled: isCloudBusy },
-                    { key: "cloud-files", label: "我的云端文件", disabled: isCloudBusy },
-                    { key: "logout", label: "退出账号", danger: true },
-                  ]
-                : [{ key: "login", label: "登录账号" }]}
-            onAction={(key) => {
-              if (key === "login") setCloudDialog("login");
-              else if (key === "cloud-save") void saveDiagramToCloud();
-              else if (key === "cloud-save-as") void saveDiagramAsCloud();
-              else if (key === "cloud-files") openCloudDocuments();
-              else if (key === "logout") void logoutFromDiagram();
-            }}
-          />
+          </div>
+          <div className="flex shrink-0 items-center gap-0.5">
+            <span className="mx-0.5 h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08]" />
+            {standalone ? <PublicToolsMenu active="diagram" className="diagram-apple-icon-control" /> : null}
+            <DiagramToolbarMenu
+              label={cloudMenuLabel}
+              mobileLabel={authed ? "账号" : "登录"}
+              compact
+              placement="bottom-end"
+              items={!authReady
+                ? [{ key: "auth-loading", label: "正在读取账号", disabled: true }]
+                : authed
+                  ? [
+                      { key: "cloud-save", label: cloudDocument ? "保存到云端" : "保存为云端文件", shortcut: `${modifierLabel}S`, disabled: isCloudBusy },
+                      { key: "cloud-save-as", label: "另存为云端文件", disabled: isCloudBusy },
+                      { key: "cloud-files", label: "我的云端文件", disabled: isCloudBusy },
+                      { key: "logout", label: "退出账号", danger: true },
+                    ]
+                  : [{ key: "login", label: "登录账号" }]}
+              onAction={(key) => {
+                if (key === "login") setCloudDialog("login");
+                else if (key === "cloud-save") void saveDiagramToCloud();
+                else if (key === "cloud-save-as") void saveDiagramAsCloud();
+                else if (key === "cloud-files") openCloudDocuments();
+                else if (key === "logout") void logoutFromDiagram();
+              }}
+            />
           </div>
           <span className="diagram-apple-separator ml-1 hidden h-6 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08] lg:block" />
           <button
@@ -3876,7 +4286,7 @@ export function SyncedDiagram({
           </button>
         </div>
 
-        <div className="diagram-apple-mobile-panel flex h-11 shrink-0 items-center justify-between border-b border-black/[0.07] bg-white/95 px-2 dark:border-white/[0.08] dark:bg-[#11161e]/95 lg:hidden">
+        <div className="diagram-apple-mobile-panel flex h-11 shrink-0 items-center justify-between border-b border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2 lg:hidden">
           <div className="diagram-apple-mobile-switch grid grid-cols-3 gap-1 rounded-lg bg-black/[0.035] p-1 dark:bg-white/[0.045]" role="toolbar" aria-label="移动端流程图面板">
             <CompactPanelButton label="图库" active={compactPanel === "library"} onClick={() => setCompactPanel((current) => current === "library" ? null : "library")}>
               <path d="M3 3h4v4H3zM9 3h4v4H9zM3 9h4v4H3zM9 9h4v4H9z" />
@@ -3895,7 +4305,7 @@ export function SyncedDiagram({
               <path d="M3 4h10M3 8h10M3 12h10M6 2.5v3M10 6.5v3M7 10.5v3" />
             </CompactPanelButton>
           </div>
-          <span className="min-w-0 truncate pl-2 text-right text-[9px] text-zinc-400">{nodeCount} 节点 · {edgeCount} 连线</span>
+          <span className="min-w-0 truncate pl-2 text-right text-[10px] text-zinc-500 dark:text-zinc-400">{nodeCount} 节点 · {edgeCount} 连线</span>
         </div>
 
         <div className={`diagram-apple-workspace relative grid min-h-0 flex-1 grid-cols-1 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none ${isInspectorVisible
@@ -3909,14 +4319,14 @@ export function SyncedDiagram({
               onClick={() => setCompactPanel(null)}
             />
           ) : null}
-          <aside className={`diagram-apple-library ${compactPanel === "library" ? "block" : "hidden"} absolute inset-y-0 left-0 z-30 w-[min(86vw,310px)] max-w-full overflow-y-auto border-r border-black/[0.07] bg-zinc-50 p-3 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none`}>
+          <aside className={`diagram-apple-library ${compactPanel === "library" ? "block" : "hidden"} absolute inset-y-0 left-0 z-30 w-[min(86vw,260px)] max-w-full overflow-y-auto border-r border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] p-3 shadow-2xl lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none`}>
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">图形库</div>
                 <div className="mt-0.5 text-[10px] text-zinc-400">拖拽或点击添加</div>
               </div>
               <span className="flex items-center gap-1.5">
-                <span className="rounded-md bg-black/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-zinc-400 dark:bg-white/[0.05]">{libraryCountLabel}</span>
+                <span className="diagram-apple-count-badge">{libraryCountLabel}</span>
                 <button type="button" className="grid h-8 w-8 place-items-center rounded-lg text-zinc-400 hover:bg-black/[0.05] hover:text-zinc-700 dark:hover:bg-white/[0.06] dark:hover:text-zinc-100 lg:hidden" aria-label="关闭图形库" onClick={() => setCompactPanel(null)}>
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
                 </button>
@@ -3928,26 +4338,26 @@ export function SyncedDiagram({
                 value={paletteQuery}
                 placeholder="搜索图形"
                 aria-label="搜索图形"
-                className="diagram-apple-search h-9 w-full rounded-lg border border-black/[0.07] bg-white pl-8 pr-2.5 text-[11px] text-zinc-800 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/10 dark:border-white/[0.08] dark:bg-white/[0.035] dark:text-zinc-100"
+                className="diagram-apple-search h-9 w-full rounded-lg border border-black/[0.07] bg-white pl-8 pr-2.5 text-[11px] text-zinc-800 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-[var(--diagram-apple-blue)] focus:ring-2 focus:ring-[var(--diagram-apple-blue-soft)] dark:border-white/[0.08] dark:bg-white/[0.035] dark:text-zinc-100"
                 onChange={(event) => setPaletteQuery(event.currentTarget.value)}
               />
             </label>
             <div className="mt-4 block">
-              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400">快速模板</div>
+              <div className="text-[10px] font-semibold uppercase text-zinc-400">快速模板</div>
               <div className="mt-2 grid grid-cols-3 gap-1.5">
                 {(Object.entries(DIAGRAM_TEMPLATES) as Array<[DiagramTemplateId, DiagramTemplateDefinition]>).map(([id, template]) => (
                   <button
                     key={id}
                     type="button"
                     disabled={isReadOnly}
-                    className="diagram-apple-template-button group min-w-0 rounded-lg border border-cyan-500/20 bg-cyan-50/70 px-2 py-2 text-center transition hover:border-cyan-500/50 hover:bg-cyan-50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-cyan-300/15 dark:bg-cyan-300/[0.06] dark:hover:border-cyan-300/35 dark:hover:bg-cyan-300/[0.1]"
+                    className="diagram-apple-template-button group min-w-0 rounded-lg border border-[color-mix(in_srgb,var(--diagram-apple-blue)_20%,transparent)] bg-[var(--diagram-apple-blue-soft)] px-2 py-2 text-center transition hover:border-[var(--diagram-apple-blue)] disabled:cursor-not-allowed disabled:opacity-35"
                     onClick={() => {
                       insertTemplate(id);
                       setCompactPanel(null);
                     }}
                   >
-                    <span className="block text-[11px] font-semibold text-cyan-800 dark:text-cyan-100">{template.shortName}</span>
-                    <span className="mt-0.5 block truncate text-[9px] text-cyan-700/60 dark:text-cyan-200/50">{template.detail}</span>
+                    <span className="block text-[11px] font-semibold text-[var(--diagram-apple-blue)]">{template.shortName}</span>
+                    <span className="mt-0.5 block truncate text-[10px] text-[var(--diagram-apple-muted)]">{template.detail}</span>
                   </button>
                 ))}
               </div>
@@ -3957,7 +4367,7 @@ export function SyncedDiagram({
                 <span className="diagram-apple-section-label text-[10px]">
                   {paletteSearchQuery ? "搜索结果" : "完整图库"}
                 </span>
-                <span className="font-mono text-[9px] text-zinc-400">{librarySummaryLabel}</span>
+                <span className="font-mono text-[10px] text-zinc-400">{librarySummaryLabel}</span>
               </div>
               {PALETTE_CATEGORIES.map((category) => {
                 const items = NODE_PALETTE.filter((item) => item.category === category
@@ -3981,7 +4391,7 @@ export function SyncedDiagram({
                         <svg className={`h-3 w-3 shrink-0 text-zinc-400 transition-transform ${isCategoryOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
                         <span className="truncate">{category}</span>
                       </span>
-                      <span className="font-mono text-[9px] text-zinc-400">{items.length}</span>
+                      <span className="font-mono text-[10px] text-zinc-400">{items.length}</span>
                     </button>
                     <div className={`border-t border-black/[0.05] p-1 dark:border-white/[0.06] ${isCategoryOpen ? "block" : "hidden"}`}>
                       <div className="grid grid-cols-3 gap-1">
@@ -4001,7 +4411,7 @@ export function SyncedDiagram({
                             type="button"
                             disabled={isReadOnly}
                             title={`${item.label} · ${item.detail}`}
-                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center gap-1 rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center shadow-[0_1px_1px_rgba(15,23,42,0.03)] transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
+                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center gap-1 rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center shadow-[0_1px_1px_rgba(15,23,42,0.03)] transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:cursor-not-allowed disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
                             onClick={() => {
                               insertNode(item.kind);
                               setCompactPanel(null);
@@ -4010,7 +4420,7 @@ export function SyncedDiagram({
                             <DiagramNodeGlyph kind={item.kind} />
                             <span className="min-w-0 w-full">
                               <span className="diagram-apple-palette-label block truncate text-[10px] font-semibold text-zinc-800 dark:text-zinc-100">{item.label}</span>
-                              <span className="diagram-apple-palette-detail block truncate text-[9px] text-zinc-400">{item.detail}</span>
+                              <span className="diagram-apple-palette-detail block truncate text-[10px] text-zinc-400">{item.detail}</span>
                             </span>
                           </button>
                         ))}
@@ -4023,7 +4433,7 @@ export function SyncedDiagram({
                 <div className="diagram-apple-collection mt-1.5 overflow-hidden rounded-lg border border-black/[0.06] bg-white/55 dark:border-white/[0.07] dark:bg-white/[0.02]">
                   <div className="flex h-8 items-center justify-between px-2">
                     <span className="truncate text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">更多匹配</span>
-                    <span className="font-mono text-[9px] text-zinc-400">{stencilSearchResults.length}{stencilSearchResults.length === STENCIL_SEARCH_LIMIT ? "+" : ""}</span>
+                    <span className="font-mono text-[10px] text-zinc-400">{stencilSearchResults.length}{stencilSearchResults.length === STENCIL_SEARCH_LIMIT ? "+" : ""}</span>
                   </div>
                   {stencilSearchResults.length ? (
                     <div className="border-t border-black/[0.05] p-1 dark:border-white/[0.06]">
@@ -4047,7 +4457,7 @@ export function SyncedDiagram({
                               type="button"
                               disabled={isReadOnly}
                               title={`${library.name} / ${shape.name}`}
-                              className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
+                              className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
                               onClick={() => {
                                 void insertStencilNode(library, shape);
                                 setCompactPanel(null);
@@ -4055,13 +4465,13 @@ export function SyncedDiagram({
                             >
                               <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
                               <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
-                              <span className="diagram-apple-palette-detail block w-full truncate text-[9px] text-zinc-400">{library.name}</span>
+                              <span className="diagram-apple-palette-detail block w-full truncate text-[10px] text-zinc-400">{library.name}</span>
                             </button>
                           );
                         })}
                       </div>
                     </div>
-                  ) : <div className="border-t border-black/[0.05] p-4 text-center text-[10px] text-zinc-400 dark:border-white/[0.06]">未找到匹配图形</div>}
+                  ) : null}
                 </div>
               ) : null}
               {!paletteSearchQuery && stencilCatalog ? (
@@ -4087,7 +4497,7 @@ export function SyncedDiagram({
                             <svg className={`h-3 w-3 shrink-0 text-zinc-400 transition-transform ${isGroupOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
                             <span className="truncate">{group.name}</span>
                           </span>
-                          <span className="font-mono text-[9px] text-zinc-400">{collections.length}</span>
+                          <span className="font-mono text-[10px] text-zinc-400">{collections.length}</span>
                         </button>
                         {isGroupOpen ? (
                           <div className="border-t border-black/[0.05] p-1 dark:border-white/[0.06]">
@@ -4098,11 +4508,11 @@ export function SyncedDiagram({
                                 <div key={collection.id} className="mt-0.5 first:mt-0">
                                   <button
                                     type="button"
-                                    className={`diagram-apple-collection-row flex h-8 w-full items-center justify-between rounded-md px-2 text-left transition ${isActive ? "bg-cyan-500/10 text-cyan-800 dark:text-cyan-100" : "text-zinc-600 hover:bg-black/[0.035] dark:text-zinc-300 dark:hover:bg-white/[0.04]"}`}
+                                    className={`diagram-apple-collection-row flex h-8 w-full items-center justify-between rounded-md px-2 text-left transition ${isActive ? "bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)]" : "text-zinc-600 hover:bg-black/[0.035] dark:text-zinc-300 dark:hover:bg-white/[0.04]"}`}
                                     onClick={() => openStencilCollection(collection)}
                                   >
                                     <span className="truncate text-[10px] font-medium">{collection.name}</span>
-                                    <span className="ml-2 shrink-0 font-mono text-[9px] text-zinc-400">{loadingStencilCollection === collection.id ? "加载中" : collection.libraryCount > 1 ? `${collection.shapeCount} · ${collection.libraryCount}库` : collection.shapeCount}</span>
+                                    <span className="ml-2 shrink-0 font-mono text-[10px] text-zinc-400">{loadingStencilCollection === collection.id ? "加载中" : collection.libraryCount > 1 ? `${collection.shapeCount} · ${collection.libraryCount}库` : collection.shapeCount}</span>
                                   </button>
                                   {isActive ? (
                                     <div className="mt-1.5 grid grid-cols-3 gap-1 px-1 pb-1.5">
@@ -4125,7 +4535,7 @@ export function SyncedDiagram({
                                             type="button"
                                             disabled={isReadOnly}
                                             title={`${collection.name} / ${library.name} / ${shape.name}`}
-                                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-cyan-400 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:border-cyan-300/40 dark:hover:bg-cyan-300/[0.06]"
+                                            className="diagram-apple-palette-card group flex min-h-[76px] min-w-0 flex-col items-center justify-center rounded-lg border border-black/[0.07] bg-white px-1 py-1.5 text-center transition hover:-translate-y-px hover:border-[var(--diagram-apple-blue)] hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 disabled:opacity-35 dark:border-white/[0.08] dark:bg-white/[0.035] dark:hover:bg-[var(--diagram-apple-blue-soft)]"
                                             onClick={() => {
                                               void insertStencilNode(library, shape);
                                               setCompactPanel(null);
@@ -4133,12 +4543,12 @@ export function SyncedDiagram({
                                           >
                                             <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
                                             <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
-                                            {collection.libraryCount > 1 ? <span className="diagram-apple-palette-detail block w-full truncate text-[9px] text-zinc-400">{library.name}</span> : null}
+                                            {collection.libraryCount > 1 ? <span className="diagram-apple-palette-detail block w-full truncate text-[10px] text-zinc-400">{library.name}</span> : null}
                                           </button>
                                         );
                                       })}
                                       {collection.shapeCount > stencilShapeLimit ? (
-                                        <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[10px] font-medium text-cyan-700 hover:bg-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 dark:border-white/10 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
+                                        <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[10px] font-medium text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 dark:border-white/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
                                           加载更多 · {collection.shapeCount - stencilShapeLimit} 个
                                         </button>
                                       ) : null}
@@ -4161,8 +4571,7 @@ export function SyncedDiagram({
           </aside>
 
           <div
-            className="diagram-apple-canvas-wrap relative min-h-0 overflow-hidden bg-zinc-100 dark:bg-[#0b0f15]"
-            onKeyDown={handleKeyDown}
+            className="diagram-apple-canvas-wrap relative min-h-0 overflow-hidden bg-[var(--diagram-apple-page)]"
             onPointerDown={() => {
               setContextMenu(null);
               graphContainerRef.current?.focus();
@@ -4171,16 +4580,48 @@ export function SyncedDiagram({
           >
             <div
               ref={graphContainerRef}
-              className="diagram-apple-canvas absolute inset-0 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400"
+              data-view-epoch={viewEpoch}
+              className="diagram-apple-canvas absolute inset-0 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--diagram-apple-blue)]"
               tabIndex={0}
               role="application"
               aria-label="专业流程图画布"
               style={{
                 backgroundColor: canvasBackground,
                 backgroundImage: `radial-gradient(circle, ${gridColor} 1px, transparent 1px)`,
-                backgroundSize: `${DIAGRAM_CANVAS.gridSize * 2}px ${DIAGRAM_CANVAS.gridSize * 2}px`,
+                backgroundPosition: `${gridOffsetX}px ${gridOffsetY}px`,
+                backgroundSize: `${gridStep}px ${gridStep}px`,
               }}
             />
+            {statusTone === "error" ? (
+              <div
+                className="absolute left-1/2 top-3 z-40 flex w-[min(92%,560px)] -translate-x-1/2 items-start gap-2 rounded-lg border border-[color-mix(in_srgb,var(--diagram-apple-danger)_28%,transparent)] bg-[var(--diagram-apple-surface)] px-3 py-2.5 text-[11px] leading-5 text-[var(--diagram-apple-danger)] shadow-lg"
+                role="alert"
+              >
+                <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-[var(--diagram-apple-danger)]" aria-hidden="true" />
+                <span className="min-w-0 flex-1">{status}</span>
+                <button type="button" className="grid h-5 w-5 shrink-0 place-items-center rounded text-current hover:bg-[var(--diagram-apple-danger-soft)]" aria-label="关闭错误提示" onClick={() => setStatusTone("info")}>
+                  <svg className="h-3 w-3" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
+                </button>
+              </div>
+            ) : null}
+            {remoteSelectionMarkers.map((marker) => {
+              const colors = diagramPresenceColors(marker.peerId);
+              return (
+                <div
+                  key={marker.key}
+                  className="pointer-events-none absolute z-20 rounded-[5px] border-2"
+                  style={{
+                    left: marker.left,
+                    top: marker.top,
+                    width: marker.width,
+                    height: marker.height,
+                    borderColor: colors.solid,
+                    backgroundColor: colors.soft,
+                  }}
+                  aria-hidden="true"
+                />
+              );
+            })}
             {Object.values(remotePresences).filter((presence) => presence.pageId === activePageId && presence.cursor).map((presence) => {
               const graph = runtimeRef.current?.graph;
               const container = graphContainerRef.current;
@@ -4188,64 +4629,79 @@ export function SyncedDiagram({
               const translate = graph?.getView().translate ?? new Point();
               const left = ((presence.cursor?.x ?? 0) + translate.x) * scale - (container?.scrollLeft ?? 0);
               const top = ((presence.cursor?.y ?? 0) + translate.y) * scale - (container?.scrollTop ?? 0);
+              const colors = diagramPresenceColors(presence.peerId);
+              const displayName = peerDisplayNames[presence.peerId]?.trim() || "协作者";
               return (
                 <div key={presence.peerId} className="diagram-apple-remote-cursor pointer-events-none absolute z-30" style={{ left, top }}>
-                  <span className="block h-3 w-3 rotate-45 border-l-2 border-t-2 border-blue-600" />
-                  <span className="ml-2 rounded bg-blue-600 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow">{presence.peerId.slice(0, 12)} · {presence.selectedIds.length} selected</span>
+                  <span className="block h-3 w-3 rotate-45 border-l-2 border-t-2" style={{ borderColor: colors.solid }} />
+                  <span className="ml-2 rounded px-1.5 py-0.5 text-[10px] font-semibold text-white shadow" style={{ backgroundColor: colors.solid }}>
+                    {displayName}{presence.selectedIds.length > 0 ? ` · 已选 ${presence.selectedIds.length}` : ""}
+                  </span>
                 </div>
               );
             })}
             {showMinimap ? (
-              <div className="diagram-apple-minimap absolute bottom-12 right-3 z-20 hidden h-28 w-40 overflow-hidden rounded-xl border border-black/[0.1] bg-white/95 shadow-[0_12px_35px_-12px_rgba(15,23,42,0.4)] backdrop-blur-xl dark:border-white/[0.12] dark:bg-[#151b24]/95 sm:block sm:h-32 sm:w-48">
+              <div className="diagram-apple-minimap absolute bottom-12 right-3 z-20 hidden h-28 w-40 overflow-hidden rounded-xl border border-[var(--diagram-apple-line-strong)] bg-[var(--diagram-apple-surface)] shadow-[0_12px_35px_-12px_rgba(15,23,42,0.4)] backdrop-blur-xl sm:block sm:h-32 sm:w-48">
                 <div className="absolute inset-1.5 overflow-hidden rounded-lg">
                   <div ref={outlineContainerRef} className="h-full w-full" aria-label="流程图小地图" />
                 </div>
               </div>
             ) : null}
-            <div className="diagram-apple-canvas-hint pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-black/[0.08] bg-white/85 px-2.5 py-1.5 text-[9px] text-zinc-500 shadow-sm backdrop-blur-xl dark:border-white/[0.09] dark:bg-[#151b24]/85 dark:text-zinc-400 sm:flex">
-              <span className="grid h-4 w-4 place-items-center rounded bg-cyan-500/10 text-[9px] font-bold text-cyan-700 dark:text-cyan-200">?</span>
-              拖入节点 · 移动显示参考线 · Shift 点击连线增删折点
+            <div className="diagram-apple-canvas-hint pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2.5 py-1.5 text-[10px] text-zinc-500 shadow-sm backdrop-blur-xl dark:text-zinc-400 sm:flex">
+              <span className="grid h-4 w-4 place-items-center rounded bg-[var(--diagram-apple-blue-soft)] text-[10px] font-bold text-[var(--diagram-apple-blue)]">?</span>
+              Ctrl+Shift 拖动画布 · Ctrl+滚轮缩放 · Shift 点击连线增删折点
             </div>
-            {contextMenu ? (
+            {contextMenu ? createPortal(
               <div
-                className="diagram-apple-context-menu absolute z-30 w-44 rounded-lg border border-black/10 bg-white p-1.5 text-tiny text-zinc-700 shadow-xl dark:border-white/10 dark:bg-zinc-900 dark:text-zinc-200"
+                ref={contextMenuRef}
+                className="diagram-apple-context-menu fixed z-[160] max-h-[calc(100dvh-16px)] w-44 overflow-y-auto rounded-lg border border-black/10 bg-white p-1.5 text-tiny text-zinc-700 shadow-xl dark:border-white/10 dark:bg-zinc-900 dark:text-zinc-200"
                 style={{ left: contextMenu.x, top: contextMenu.y }}
                 role="menu"
+                tabIndex={-1}
                 onPointerDown={(event) => event.stopPropagation()}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setContextMenu(null);
+                    graphContainerRef.current?.focus();
+                  }
+                }}
               >
                 <ContextMenuAction label="编辑文字" disabled={isReadOnly || selection.count !== 1} onClick={() => {
                   withGraph((graph) => graph.startEditingAtCell(graph.getSelectionCell()));
                   setContextMenu(null);
                 }} />
                 <ContextMenuAction label="复制" disabled={selection.count === 0} onClick={() => { copySelection(); setContextMenu(null); }} />
+                <ContextMenuAction label="剪切" disabled={isReadOnly || selection.count === 0 || selection.lockedCount === selection.count} onClick={() => { cutSelection(); setContextMenu(null); }} />
                 <ContextMenuAction label="创建副本" disabled={isReadOnly || selection.count === 0} onClick={() => { duplicateSelection(); setContextMenu(null); }} />
                 <ContextMenuAction label="组合" disabled={isReadOnly || selection.count < 2} onClick={() => { groupSelection(); setContextMenu(null); }} />
                 <ContextMenuAction label="取消组合" disabled={isReadOnly || !selection.isNode} onClick={() => { ungroupSelection(); setContextMenu(null); }} />
                 <ContextMenuAction label="置于顶层" disabled={isReadOnly || selection.count === 0} onClick={() => {
-                  withGraph((graph) => graph.orderCells(false));
+                  orderSelection(false);
                   setContextMenu(null);
                 }} />
                 <ContextMenuAction label="置于底层" disabled={isReadOnly || selection.count === 0} onClick={() => {
-                  withGraph((graph) => graph.orderCells(true));
+                  orderSelection(true);
                   setContextMenu(null);
                 }} />
                 <ContextMenuAction label="删除" danger disabled={isReadOnly || selection.count === 0} onClick={() => { removeSelection(); setContextMenu(null); }} />
-              </div>
+              </div>,
+              window.document.body,
             ) : null}
           </div>
 
-          <aside className={`diagram-apple-inspector ${compactPanel === "inspector" ? "block" : "hidden"} absolute inset-y-0 right-0 z-30 w-[min(90vw,340px)] max-w-full overflow-y-auto border-l border-black/[0.07] bg-zinc-50 shadow-2xl dark:border-white/[0.08] dark:bg-[#0f141c] ${isInspectorVisible ? "lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none" : "lg:hidden"}`}>
-            <div className="diagram-apple-inspector-header sticky top-0 z-10 flex h-12 items-center justify-between gap-2 border-b border-black/[0.06] bg-zinc-50/95 px-4 backdrop-blur-xl dark:border-white/[0.07] dark:bg-[#0f141c]/95">
+          <aside className={`diagram-apple-inspector ${compactPanel === "inspector" ? "block" : "hidden"} absolute inset-y-0 right-0 z-30 w-[min(90vw,300px)] max-w-full overflow-y-auto border-l border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] shadow-2xl ${isInspectorVisible ? "lg:static lg:z-auto lg:block lg:w-auto lg:max-w-none lg:shadow-none" : "lg:hidden"}`}>
+            <div className="diagram-apple-inspector-header sticky top-0 z-10 flex h-12 items-center justify-between gap-2 border-b border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-4 backdrop-blur-xl">
               <span>
                 <span className="block text-[11px] font-semibold text-zinc-900 dark:text-zinc-100">
                   {inspectorTab === "design" ? "设计属性" : inspectorTab === "comments" ? "协作评论" : "版本历史"}
                 </span>
-                <span className="block text-[9px] text-zinc-400">
+                <span className="block text-[10px] text-zinc-500 dark:text-zinc-400">
                   {inspectorTab === "design" ? "样式、文字与几何" : inspectorTab === "comments" ? "页面与元素讨论" : "快照、恢复与回溯"}
                 </span>
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="rounded-md bg-black/[0.04] px-1.5 py-1 text-[9px] font-medium text-zinc-500 dark:bg-white/[0.05] dark:text-zinc-400">
+                <span className="diagram-apple-count-badge">
                   {inspectorTab === "design"
                     ? (selection.count > 0 ? `${selection.count} 个元素` : "未选择")
                     : inspectorTab === "comments"
@@ -4263,13 +4719,29 @@ export function SyncedDiagram({
                 </button>
               </span>
             </div>
-            <div className="sticky top-12 z-10 grid h-10 grid-cols-3 border-b border-black/[0.06] bg-zinc-50/95 px-2 backdrop-blur-xl dark:border-white/[0.07] dark:bg-[#0f141c]/95" role="tablist" aria-label="设计属性模块">
+            <div className="sticky top-12 z-10 grid h-10 grid-cols-3 border-b border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-2 backdrop-blur-xl" role="tablist" aria-label="设计属性模块">
               <InspectorTabButton label="设计" active={inspectorTab === "design"} onClick={() => setInspectorTab("design")} />
               <InspectorTabButton label={`评论 ${comments.filter((comment) => comment.pageId === activePageId).length}`} active={inspectorTab === "comments"} onClick={() => setInspectorTab("comments")} />
               <InspectorTabButton label={`版本 ${versions.length}`} active={inspectorTab === "versions"} onClick={() => setInspectorTab("versions")} />
             </div>
             <div className="p-3.5">
-            {inspectorTab === "design" ? <fieldset disabled={isReadOnly} className={isReadOnly ? "opacity-60" : undefined}>
+            {inspectorTab === "design" ? <div>
+            {selectionOnlyNodes && selection.count > 0 ? (
+              <div className="mb-3 rounded-lg border border-black/[0.07] bg-white/70 px-2.5 py-1.5 dark:border-white/[0.08] dark:bg-white/[0.025]">
+                <InspectorToggle
+                  label={selection.locked ? "节点已锁定" : "锁定节点"}
+                  checked={Boolean(selection.locked)}
+                  disabled={isReadOnly}
+                  onChange={toggleNodeLock}
+                />
+                {selection.lockedCount > 0 ? (
+                  <p className="pb-1 text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">
+                    {selection.lockedCount} 个节点受保护，解锁后可编辑、移动或删除。
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            <fieldset disabled={isReadOnly || selection.lockedCount > 0} className={isReadOnly || selection.lockedCount > 0 ? "opacity-60" : undefined}>
             {selection.count === 0 ? (
               <div className="diagram-apple-empty-state rounded-xl border border-dashed border-black/[0.1] bg-white/60 px-4 py-6 text-center dark:border-white/[0.1] dark:bg-white/[0.025]">
                 <div className="mx-auto grid h-9 w-9 place-items-center rounded-xl bg-zinc-100 text-zinc-400 dark:bg-white/[0.05]">
@@ -4282,20 +4754,11 @@ export function SyncedDiagram({
               <div className="divide-y divide-black/[0.07] dark:divide-white/[0.08]">
                 {selection.count === 1 ? (
                   <InspectorSection title="内容">
-                    <label className="block">
-                      <span className="sr-only">元素文字</span>
-                      <textarea
-                        value={selection.label}
-                        maxLength={500}
-                        rows={3}
-                        className="diagram-apple-text-field w-full resize-y rounded-md border border-black/10 bg-white px-2.5 py-2 text-[11px] leading-5 text-zinc-900 outline-none focus:border-cyan-400 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-100"
-                        onChange={(event) => setSelection((current) => ({ ...current, label: event.currentTarget.value }))}
-                        onBlur={(event) => commitSelectionLabel(event.currentTarget.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) event.currentTarget.blur();
-                        }}
-                      />
-                    </label>
+                    <InspectorTextArea
+                      selectionKey={selection.ids[0] ?? ""}
+                      value={selection.label}
+                      onCommit={commitSelectionLabel}
+                    />
                   </InspectorSection>
                 ) : null}
 
@@ -4314,7 +4777,6 @@ export function SyncedDiagram({
                   <InspectorSection title="变换">
                     <InspectorNumberField label="旋转角度" value={selection.rotation} min={0} max={359} suffix="°" onCommit={updateNodeRotation} />
                     <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2">
-                      <InspectorToggle label="锁定" checked={Boolean(selection.locked)} onChange={toggleNodeLock} />
                       <InspectorToggle label="水平翻转" checked={Boolean(selection.flipH)} onChange={() => updateSelectedStyle("flipH", !selection.flipH)} />
                       <InspectorToggle label="垂直翻转" checked={Boolean(selection.flipV)} onChange={() => updateSelectedStyle("flipV", !selection.flipV)} />
                     </div>
@@ -4435,16 +4897,14 @@ export function SyncedDiagram({
                 ) : null}
               </div>
             )}
-            </fieldset> : null}
+            </fieldset>
+            </div> : null}
             {inspectorTab === "comments" ? <div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-tiny font-semibold text-zinc-900 dark:text-zinc-100">
-                  评论 · {comments.filter((comment) => comment.pageId === activePageId).length}
-                </span>
+              <div className="flex justify-end">
                 <button
                   type="button"
                   disabled={isReadOnly}
-                  className="rounded-md px-2 py-1 text-[10px] font-semibold text-cyan-700 hover:bg-cyan-50 disabled:opacity-35 dark:text-cyan-200 dark:hover:bg-cyan-300/10"
+                  className="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35"
                   onClick={addComment}
                 >
                   + 评论
@@ -4461,16 +4921,16 @@ export function SyncedDiagram({
                     : "border-amber-300/60 bg-amber-50/70 dark:border-amber-300/20 dark:bg-amber-300/[0.06]"}`}>
                     <button type="button" className="block w-full text-left" onClick={() => focusComment(comment)}>
                       <span className="block text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">
-                        {comment.author.slice(0, 18)}{comment.cellId ? " · 已关联元素" : " · 页面评论"}
+                        {comment.author === peerId ? "我" : peerDisplayNames[comment.author]?.trim() || "协作者"}{comment.cellId ? " · 已关联元素" : " · 页面评论"}
                       </span>
                       <span className="mt-1 block whitespace-pre-wrap break-words text-tiny leading-5 text-zinc-600 dark:text-zinc-300">{comment.text}</span>
-                      <span className="mt-1 block text-[9px] text-zinc-400">{new Date(comment.createdAt).toLocaleString()}</span>
+                      <span className="mt-1 block text-[10px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(comment.createdAt)}</span>
                     </button>
                     <div className="mt-1.5 flex gap-1">
-                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[9px] text-cyan-700 hover:bg-cyan-100 disabled:opacity-35 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => toggleComment(comment)}>
+                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => toggleComment(comment)}>
                         {comment.resolved ? "重新打开" : "标记解决"}
                       </button>
-                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[9px] text-red-500 hover:bg-red-50 disabled:opacity-35 dark:text-red-300 dark:hover:bg-red-400/10" onClick={() => deleteComment(comment.id)}>
+                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => deleteComment(comment.id)}>
                         删除
                       </button>
                     </div>
@@ -4479,22 +4939,25 @@ export function SyncedDiagram({
               </div>
             </div> : null}
             {inspectorTab === "versions" ? <div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-tiny font-semibold text-zinc-900 dark:text-zinc-100">版本 · {versions.length}</span>
-                <button type="button" disabled={isRoleReadOnly || isVersionLoading} className="rounded-md px-2 py-1 text-[10px] font-semibold text-cyan-700 hover:bg-cyan-50 disabled:opacity-35 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => void createVersion()}>+ 快照</button>
+              <div className="flex justify-end">
+                <button type="button" disabled={isRoleReadOnly || isVersionLoading} className="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void createVersion()}>+ 快照</button>
               </div>
-              <p className="mt-1 text-[9px] leading-4 text-zinc-400">{usesServerVersions ? "版本保存在房间服务端，最多保留 50 个。" : "版本快照保存在本次浏览器会话，最多保留 20 个。"}</p>
+              <p className="mt-1 text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">{usesServerVersions ? "版本保存在房间服务端，最多保留 50 个。" : "版本快照保存在本次浏览器会话，最多保留 20 个。"}</p>
               <div className="mt-2 space-y-1.5">
-                {versions.slice().reverse().map((version) => (
+                {versions.length === 0 ? (
+                  <div className="rounded-md border border-dashed border-black/10 p-3 text-center text-[10px] leading-4 text-zinc-500 dark:border-white/10 dark:text-zinc-400">
+                    暂无版本快照
+                  </div>
+                ) : versions.slice().reverse().map((version) => (
                   <div key={version.id} className="flex items-center justify-between gap-2 rounded-md border border-black/10 p-2 dark:border-white/10">
                     <span className="min-w-0">
                       <span className="block truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{version.name}</span>
-                      <span className="block text-[9px] text-zinc-400">{new Date(version.createdAt).toLocaleString()}</span>
+                      <span className="block text-[10px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(version.createdAt)}</span>
                     </span>
                     <span className="flex shrink-0 gap-1">
-                      <button type="button" disabled={isReadOnly || isVersionLoading} className="rounded px-1.5 py-1 text-[9px] text-cyan-700 hover:bg-cyan-50 disabled:opacity-35 dark:text-cyan-200 dark:hover:bg-cyan-300/10" onClick={() => void restoreVersion(version)}>恢复</button>
+                      <button type="button" disabled={isReadOnly || isVersionLoading} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void restoreVersion(version)}>恢复</button>
                       {roomRole === "OWNER" && version.serverId !== undefined ? (
-                        <button type="button" disabled={isVersionLoading} className="rounded px-1.5 py-1 text-[9px] text-red-500 hover:bg-red-50 disabled:opacity-35 dark:text-red-300 dark:hover:bg-red-400/10" onClick={() => void deleteVersion(version)}>删除</button>
+                        <button type="button" disabled={isVersionLoading} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => void deleteVersion(version)}>删除</button>
                       ) : null}
                     </span>
                   </div>
@@ -4517,7 +4980,7 @@ export function SyncedDiagram({
               role="dialog"
               aria-modal="true"
               aria-labelledby="diagram-collaboration-title"
-              className="diagram-apple-collaboration relative z-10 flex h-full w-full max-w-[420px] flex-col border-l border-black/10 bg-zinc-50 shadow-2xl dark:border-white/10 dark:bg-[#0f141c] sm:w-[min(92vw,420px)]"
+              className="diagram-apple-collaboration relative z-10 flex h-full w-full max-w-[420px] flex-col border-l border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] shadow-2xl sm:w-[min(92vw,420px)]"
             >
               <div className="diagram-apple-collaboration-header flex h-12 shrink-0 items-center justify-between border-b border-black/[0.07] px-3.5 dark:border-white/[0.08]">
                 <div>
@@ -4572,9 +5035,9 @@ export function SyncedDiagram({
           />
         ) : null}
 
-        <div className="diagram-apple-footer flex h-9 shrink-0 items-center gap-2 border-t border-black/[0.07] bg-white/95 px-2 text-[9px] text-zinc-500 backdrop-blur-xl dark:border-white/[0.08] dark:bg-[#11161e]/95 dark:text-zinc-400">
+        <div className="diagram-apple-footer flex h-9 shrink-0 items-center gap-2 border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2 text-[10px] text-zinc-500 backdrop-blur-xl dark:text-zinc-400">
           <div className="diagram-apple-pages diagram-apple-pages-bottom flex min-w-0 flex-[1_1_48%] items-center" aria-label="流程图页面">
-            <span className="diagram-apple-section-label mr-1 hidden shrink-0 px-1 text-[9px] font-semibold text-zinc-400 sm:inline">页面</span>
+            <span className="diagram-apple-section-label mr-1 hidden shrink-0 px-1 text-[10px] font-semibold text-zinc-500 sm:inline">页面</span>
             <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
               {pages.map((page) => (
                 <button
@@ -4582,7 +5045,7 @@ export function SyncedDiagram({
                   type="button"
                   aria-pressed={page.id === activePageId}
                   className={`diagram-apple-page-tab relative h-7 max-w-44 shrink-0 truncate rounded-lg border px-3 text-[11px] font-medium transition ${page.id === activePageId
-                    ? "border-black/[0.08] bg-white text-zinc-900 dark:border-white/[0.1] dark:bg-[#151b24] dark:text-white"
+                    ? "border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] text-[var(--diagram-apple-ink)]"
                     : "border-transparent text-zinc-500 hover:bg-black/[0.035] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.04] dark:hover:text-zinc-100"}`}
                   title={page.name}
                   onClick={() => {
@@ -4619,18 +5082,17 @@ export function SyncedDiagram({
             </div>
           </div>
           <span className="hidden h-5 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08] md:block" />
-          <span className="diagram-apple-status hidden min-w-0 flex-1 items-center gap-2 truncate md:flex">
-            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} />
+          <span className={`diagram-apple-status flex min-w-0 flex-1 items-center gap-2 truncate text-[10px] ${statusTone === "error" ? "text-[var(--diagram-apple-danger)]" : statusTone === "success" ? "text-[var(--diagram-apple-success)]" : ""}`} aria-live="polite">
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass}`} />
             <span className="truncate">{status}</span>
           </span>
-          <span className={`h-1.5 w-1.5 shrink-0 rounded-full md:hidden ${isConnected ? "bg-emerald-500" : "bg-zinc-400"}`} title={status} />
-          <span className="hidden shrink-0 items-center gap-3 font-mono lg:flex"><span>{activePageName}</span><span>{nodeCount} nodes</span><span>{edgeCount} edges{selectedCountLabel}</span></span>
+          <span className="hidden shrink-0 items-center gap-3 font-mono lg:flex"><span>{activePageName}</span><span>{nodeCount} 节点</span><span>{edgeCount} 连线{selectedCountLabel}</span></span>
         </div>
       </div>
     </section>
   );
 
-  return isFullViewport ? createPortal(diagram, window.document.body) : diagram;
+  return diagram;
 }
 
 function DiagramAccountDialog({
@@ -4682,11 +5144,11 @@ function DiagramAccountDialog({
       classNames={{
         wrapper: "!z-[220] px-4 py-6",
         backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-        base: "border border-black/[0.08] bg-white text-zinc-950 shadow-2xl dark:border-white/[0.1] dark:bg-[#151b24] dark:text-white",
+        base: "diagram-apple-dialog overflow-hidden rounded-2xl border shadow-2xl",
       }}
     >
       <ModalContent>
-        <ModalHeader className="flex flex-col gap-1 px-5 pb-1 pt-5">
+        <ModalHeader className="flex flex-col gap-1 border-b border-[var(--diagram-apple-line)] px-5 pb-4 pt-5">
           <span className="text-base font-semibold">登录账号</span>
           <span className="text-[11px] font-normal text-zinc-500 dark:text-zinc-400">{loginHint}</span>
         </ModalHeader>
@@ -4711,7 +5173,7 @@ function DiagramAccountDialog({
             </form>
           ) : null}
           {error ? (
-            <div className="rounded-lg border border-red-500/20 bg-red-50 px-3 py-2 text-[11px] text-red-700 dark:border-red-300/20 dark:bg-red-300/10 dark:text-red-100">
+            <div className="rounded-lg border border-[var(--diagram-apple-danger)] bg-[var(--diagram-apple-danger-soft)] px-3 py-2 text-[11px] text-[var(--diagram-apple-danger)]">
               {error}
             </div>
           ) : null}
@@ -4721,7 +5183,7 @@ function DiagramAccountDialog({
             </div>
           ) : null}
         </ModalBody>
-        <ModalFooter className="gap-2 border-t border-black/[0.07] px-5 py-3 dark:border-white/[0.08]">
+        <ModalFooter className="gap-2 border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-5 py-3">
           <Button size="sm" radius="sm" variant="light" isDisabled={submitting} onPress={onClose}>
             取消
           </Button>
@@ -4783,11 +5245,11 @@ function DiagramCloudDocumentsDialog({
       classNames={{
         wrapper: "!z-[220] px-4 py-6",
         backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-        base: "max-h-[min(78dvh,720px)] border border-black/[0.08] bg-zinc-50 text-zinc-950 shadow-2xl dark:border-white/[0.1] dark:bg-[#11161e] dark:text-white",
+        base: "diagram-apple-dialog max-h-[min(78dvh,720px)] overflow-hidden rounded-2xl border shadow-2xl",
       }}
     >
       <ModalContent>
-        <ModalHeader className="flex items-center justify-between gap-3 px-5 pb-3 pt-5">
+        <ModalHeader className="flex items-center justify-between gap-3 border-b border-[var(--diagram-apple-line)] px-5 pb-4 pt-5">
           <span className="min-w-0">
             <span className="block text-base font-semibold">我的云端文件</span>
             <span className="mt-0.5 block text-[10px] font-normal text-zinc-500 dark:text-zinc-400">{documents.length} 个文件</span>
@@ -4799,7 +5261,10 @@ function DiagramCloudDocumentsDialog({
         </ModalHeader>
         <ModalBody className="px-5 pb-5 pt-1">
           {busy && documents.length === 0 ? (
-            <div className="grid min-h-40 place-items-center text-small text-zinc-500 dark:text-zinc-400">正在读取云端文件…</div>
+            <div className="flex min-h-40 items-center justify-center gap-2 text-small text-zinc-500 dark:text-zinc-400">
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--diagram-apple-blue-soft)] border-t-[var(--diagram-apple-blue)]" aria-hidden="true" />
+              正在读取云端文件…
+            </div>
           ) : documents.length === 0 ? (
             <div className="grid min-h-40 place-items-center rounded-lg border border-dashed border-black/[0.1] bg-white/70 text-small text-zinc-500 dark:border-white/[0.1] dark:bg-white/[0.025] dark:text-zinc-400">
               还没有云端文件
@@ -4812,13 +5277,13 @@ function DiagramCloudDocumentsDialog({
                   <div
                     key={document.id}
                     className={`flex flex-col gap-3 rounded-lg border px-3.5 py-3 sm:flex-row sm:items-center ${isCurrent
-                      ? "border-blue-500/30 bg-blue-50/70 dark:border-blue-300/25 dark:bg-blue-300/[0.07]"
+                      ? "border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)]"
                       : "border-black/[0.07] bg-white dark:border-white/[0.08] dark:bg-white/[0.035]"}`}
                   >
                     <div className="min-w-0 flex-1">
                       <div className="flex min-w-0 items-center gap-2">
                         <span className="truncate text-small font-semibold text-zinc-900 dark:text-zinc-100">{document.name}</span>
-                        {isCurrent ? <span className="shrink-0 rounded bg-blue-500/10 px-1.5 py-0.5 text-[9px] font-semibold text-blue-700 dark:text-blue-200">当前</span> : null}
+                        {isCurrent ? <span className="shrink-0 rounded bg-[var(--diagram-apple-blue-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--diagram-apple-blue)]">当前</span> : null}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-x-2 text-[10px] text-zinc-500 dark:text-zinc-400">
                         <span>{formatCloudDiagramDate(document.updatedAt)}</span>
@@ -4840,7 +5305,7 @@ function DiagramCloudDocumentsDialog({
             </div>
           )}
         </ModalBody>
-        <ModalFooter className="border-t border-black/[0.07] px-5 py-3 dark:border-white/[0.08]">
+        <ModalFooter className="border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-5 py-3">
           <Button size="sm" radius="sm" variant="light" isDisabled={busy} onPress={onClose}>关闭</Button>
         </ModalFooter>
       </ModalContent>
@@ -4849,8 +5314,12 @@ function DiagramCloudDocumentsDialog({
 }
 
 function formatCloudDiagramDate(value: string) {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return value;
+  return formatDiagramTimestamp(value);
+}
+
+function formatDiagramTimestamp(value: string | number) {
+  const timestamp = typeof value === "number" ? value : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return String(value);
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
     day: "2-digit",
@@ -4889,7 +5358,7 @@ function DiagramEditorDialog({
       classNames={{
         wrapper: "!z-[220] px-4 py-6",
         backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-        base: "diagram-apple-dialog max-h-[min(86dvh,620px)] max-w-[440px] overflow-hidden rounded-2xl border border-black/[0.10] bg-white/95 text-zinc-950 shadow-[0_28px_80px_rgba(15,23,42,0.28)] backdrop-blur-2xl dark:border-white/[0.12] dark:bg-[#171c24]/95 dark:text-zinc-50",
+        base: "diagram-apple-dialog max-h-[min(86dvh,620px)] max-w-[440px] overflow-hidden rounded-2xl border shadow-2xl",
         closeButton: "text-zinc-500 dark:text-zinc-300",
       }}
     >
@@ -4897,8 +5366,8 @@ function DiagramEditorDialog({
         <form onSubmit={(event) => { event.preventDefault(); submit(); }}>
           <ModalHeader className="flex flex-col gap-1 border-b border-black/[0.07] px-5 pb-4 pt-5 dark:border-white/[0.08]">
             <span className={`text-[10px] font-semibold uppercase ${request.tone === "danger"
-              ? "text-red-600 dark:text-red-300"
-              : "text-[#0066cc] dark:text-[#2997ff]"}`}>专业编辑器</span>
+              ? "text-[var(--diagram-apple-danger)]"
+              : "text-[var(--diagram-apple-blue)]"}`}>专业编辑器</span>
             <span className="pr-8 text-[17px] font-semibold text-zinc-950 dark:text-white">{request.title}</span>
           </ModalHeader>
           <ModalBody className="gap-4 px-5 py-5">
@@ -4922,9 +5391,10 @@ function DiagramEditorDialog({
                     classNames={{
                       label: "pb-1 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200",
                       input: "text-[13px] leading-5 text-zinc-950 dark:text-zinc-50",
-                      inputWrapper: "border-black/[0.12] bg-zinc-50/80 shadow-none data-[focus=true]:border-[#0066cc] dark:border-white/[0.14] dark:bg-black/20 dark:data-[focus=true]:border-[#2997ff]",
+                      inputWrapper: "border-[var(--diagram-apple-line-strong)] bg-[var(--diagram-apple-surface-soft)] shadow-none data-[focus=true]:border-[var(--diagram-apple-blue)]",
                     }}
                     onValueChange={setValue}
+                    onFocus={(event) => event.currentTarget.select()}
                     onKeyDown={(event) => {
                       if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
                         event.preventDefault();
@@ -4945,20 +5415,21 @@ function DiagramEditorDialog({
                     classNames={{
                       label: "pb-1 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200",
                       input: "text-[13px] text-zinc-950 dark:text-zinc-50",
-                      inputWrapper: "border-black/[0.12] bg-zinc-50/80 shadow-none data-[focus=true]:border-[#0066cc] dark:border-white/[0.14] dark:bg-black/20 dark:data-[focus=true]:border-[#2997ff]",
+                      inputWrapper: "border-[var(--diagram-apple-line-strong)] bg-[var(--diagram-apple-surface-soft)] shadow-none data-[focus=true]:border-[var(--diagram-apple-blue)]",
                     }}
                     onValueChange={setValue}
+                    onFocus={(event) => event.currentTarget.select()}
                   />
                 )}
                 {request.maxLength ? (
-                  <p className="mt-1.5 text-right font-mono text-[9px] text-zinc-400" aria-live="polite">
+                  <p className="mt-1.5 text-right font-mono text-[10px] text-zinc-400" aria-live="polite">
                     {value.length}/{request.maxLength}
                   </p>
                 ) : null}
               </div>
             ) : null}
           </ModalBody>
-          <ModalFooter className="gap-2 border-t border-black/[0.07] bg-zinc-50/70 px-5 py-3 dark:border-white/[0.08] dark:bg-black/15">
+          <ModalFooter className="gap-2 border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-5 py-3">
             <Button
               type="button"
               size="sm"
@@ -4977,7 +5448,7 @@ function DiagramEditorDialog({
               isDisabled={!canSubmit}
               className={request.tone === "danger"
                 ? "font-semibold shadow-none"
-                : "bg-[#0066cc] font-semibold text-white shadow-none hover:bg-[#005bb5] dark:bg-[#2997ff] dark:text-[#07111e] dark:hover:bg-[#58aaff]"}
+                : "bg-[var(--diagram-apple-blue)] font-semibold text-white shadow-none"}
             >
               {request.confirmLabel ?? (request.kind === "text" ? "确定" : "继续")}
             </Button>
@@ -5134,29 +5605,6 @@ function replaceYMapForPage<T extends { id: string; pageId?: string }>(map: Y.Ma
   }
 }
 
-function isSafeRemoteDiagramUpdate(document: Y.Doc, update: Uint8Array) {
-  const probe = new Y.Doc();
-  try {
-    Y.applyUpdate(probe, Y.encodeStateAsUpdate(document));
-    Y.applyUpdate(probe, update);
-    const nodes = Array.from(probe.getMap<unknown>(NODES_MAP).values());
-    const edges = Array.from(probe.getMap<unknown>(EDGES_MAP).values());
-    const pages = Array.from(probe.getMap<unknown>(PAGES_MAP).values());
-    const comments = Array.from(probe.getMap<unknown>(COMMENTS_MAP).values());
-    if (!isDiagramGraphState(nodes, edges) || !pages.every(isDiagramPage) || !comments.every(isDiagramComment)) {
-      return false;
-    }
-    const pageIds = new Set((pages as DiagramPage[]).map((page) => page.id));
-    return (nodes as DiagramNode[]).every((node) => !node.pageId || pageIds.has(node.pageId))
-      && (edges as DiagramEdge[]).every((edge) => !edge.pageId || pageIds.has(edge.pageId))
-      && (comments as DiagramComment[]).every((comment) => pageIds.has(comment.pageId));
-  } catch {
-    return false;
-  } finally {
-    probe.destroy();
-  }
-}
-
 function cacheDiagramState(boardKey: string, update: Uint8Array) {
   if (update.length * 4 / 3 > MAX_DIAGRAM_UPDATE_BASE64_LENGTH) {
     return;
@@ -5172,6 +5620,126 @@ function cacheDiagramState(boardKey: string, update: Uint8Array) {
   }
 }
 
+function sessionDiagramVersionKey(boardKey: string) {
+  return `${DIAGRAM_SESSION_VERSION_PREFIX}${encodeURIComponent(boardKey)}`;
+}
+
+function readSessionDiagramVersions(boardKey: string): DiagramVersionSnapshot[] {
+  try {
+    const raw = window.sessionStorage.getItem(sessionDiagramVersionKey(boardKey));
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const snapshots: DiagramVersionSnapshot[] = [];
+    for (const item of parsed.slice(-MAX_DIAGRAM_SESSION_VERSIONS)) {
+      if (!item || typeof item !== "object") continue;
+      const candidate = item as Record<string, unknown>;
+      if (typeof candidate.id !== "string"
+        || typeof candidate.name !== "string"
+        || typeof candidate.createdAt !== "number"
+        || typeof candidate.update !== "string"
+        || candidate.update.length > MAX_DIAGRAM_UPDATE_BASE64_LENGTH) continue;
+      try {
+        snapshots.push({
+          id: candidate.id,
+          name: candidate.name.slice(0, 80),
+          createdAt: candidate.createdAt,
+          update: decodeDiagramUpdate(candidate.update),
+        });
+      } catch {
+        // Ignore one damaged session snapshot without losing the remaining history.
+      }
+    }
+    return snapshots;
+  } catch {
+    return [];
+  }
+}
+
+function writeSessionDiagramVersions(boardKey: string, snapshots: DiagramVersionSnapshot[]) {
+  let candidates = snapshots
+    .filter((snapshot): snapshot is DiagramVersionSnapshot & { update: Uint8Array } => Boolean(snapshot.update))
+    .slice(-MAX_DIAGRAM_SESSION_VERSIONS);
+  const key = sessionDiagramVersionKey(boardKey);
+  while (candidates.length > 0) {
+    const serialized = JSON.stringify(candidates.map((snapshot) => ({
+      id: snapshot.id,
+      name: snapshot.name,
+      createdAt: snapshot.createdAt,
+      update: encodeDiagramUpdate(snapshot.update),
+    })));
+    if (serialized.length * 2 <= MAX_DIAGRAM_SESSION_VERSION_STORAGE_BYTES) {
+      try {
+        window.sessionStorage.setItem(key, serialized);
+        return candidates;
+      } catch {
+        // Browser quotas vary; remove the oldest snapshot and try the newest set again.
+      }
+    }
+    candidates = candidates.slice(1);
+  }
+  try {
+    window.sessionStorage.removeItem(key);
+  } catch {
+    // Session storage can be disabled by browser privacy settings.
+  }
+  return [];
+}
+
+function diagramPageFingerprints(
+  nodes: Y.Map<DiagramNode> | null,
+  edges: Y.Map<DiagramEdge> | null,
+  pages: Y.Map<DiagramPage> | null,
+  comments: Y.Map<DiagramComment> | null,
+) {
+  const pageIds = new Set<string>();
+  pages?.forEach((page) => pageIds.add(page.id));
+  nodes?.forEach((node) => pageIds.add(diagramPageId(node.pageId)));
+  edges?.forEach((edge) => pageIds.add(diagramPageId(edge.pageId)));
+  comments?.forEach((comment) => pageIds.add(comment.pageId));
+  const fingerprints = new Map<string, string>();
+  const sortedValues = <T extends { id: string }>(values: Iterable<T>) => (
+    Array.from(values).sort((left, right) => left.id.localeCompare(right.id))
+  );
+  for (const pageId of pageIds) {
+    fingerprints.set(pageId, JSON.stringify({
+      page: pages?.get(pageId) ?? null,
+      nodes: sortedValues(Array.from(nodes?.values() ?? []).filter((node) => diagramPageId(node.pageId) === pageId)),
+      edges: sortedValues(Array.from(edges?.values() ?? []).filter((edge) => diagramPageId(edge.pageId) === pageId)),
+      comments: sortedValues(Array.from(comments?.values() ?? []).filter((comment) => comment.pageId === pageId)),
+    }));
+  }
+  return fingerprints;
+}
+
+function changedFingerprintKeys(before: Map<string, string>, after: Map<string, string>) {
+  return Array.from(new Set([...before.keys(), ...after.keys()]))
+    .filter((key) => before.get(key) !== after.get(key));
+}
+
+function diagramRecordsEqual<T>(left: T[], right: T[]) {
+  return left.length === right.length
+    && left.every((value, index) => JSON.stringify(value) === JSON.stringify(right[index]));
+}
+
+function inferDiagramStatusTone(message: string): DiagramStatusTone {
+  if (/失败|错误|无效|中断|超过|无法|已忽略|已锁定|请先|至少需要|为空|不存在/.test(message)) return "error";
+  if (/^(已|流程图已|同步已恢复|页面.+已|.+已创建)/.test(message)) return "success";
+  return "info";
+}
+
+function diagramPresenceColors(peerId: string) {
+  let hash = 0;
+  for (let index = 0; index < peerId.length; index += 1) {
+    hash = Math.imul(hash ^ peerId.charCodeAt(index), 16_777_619);
+  }
+  const hue = Math.abs(hash) % 360;
+  return {
+    solid: `hsl(${hue} 68% 43%)`,
+    soft: `hsl(${hue} 76% 52% / 0.12)`,
+  };
+}
+
 function updateSelection(graph: Graph, update: (selection: DiagramSelection) => void) {
   const cells = graph.getSelectionCells();
   if (cells.length === 0) {
@@ -5183,6 +5751,8 @@ function updateSelection(graph: Graph, update: (selection: DiagramSelection) => 
   const geometry = first.getGeometry();
   const fontStyle = styleNumber(style.fontStyle, 0);
   const firstKind = isDiagramNodeKind(style.diagramKind) ? style.diagramKind : undefined;
+  const selectedVertices = cells.filter((cell) => cell.isVertex());
+  const lockedCount = selectedVertices.filter(isDiagramCellLocked).length;
   update({
     count: cells.length,
     ids: cells.map((cell) => cell.getId()).filter((id): id is string => Boolean(id)),
@@ -5212,7 +5782,8 @@ function updateSelection(graph: Graph, update: (selection: DiagramSelection) => 
     align: textAlignFromStyle(style.align),
     verticalAlign: first.isVertex() ? verticalAlignFromStyle(style.verticalAlign) : undefined,
     spacing: first.isVertex() ? styleNumber(style.spacing, 10) : undefined,
-    locked: first.isVertex() ? Boolean(style.diagramLocked) : undefined,
+    locked: selectedVertices.length > 0 ? lockedCount === selectedVertices.length : undefined,
+    lockedCount,
     rotation: first.isVertex() ? normalizeRotation(styleNumber(style.rotation, 0)) : undefined,
     flipH: first.isVertex() ? Boolean(style.flipH) : undefined,
     flipV: first.isVertex() ? Boolean(style.flipV) : undefined,
@@ -5223,6 +5794,14 @@ function updateSelection(graph: Graph, update: (selection: DiagramSelection) => 
     shadow: Boolean(style.shadow),
     rounded: Boolean(style.rounded),
   });
+}
+
+function isDiagramCellLocked(cell: Cell) {
+  return cell.isVertex() && Boolean((cell.getStyle() as DiagramCellStyle).diagramLocked);
+}
+
+function editableSelectionCells(graph: Graph) {
+  return graph.getSelectionCells().filter((cell) => !isDiagramCellLocked(cell));
 }
 
 function laneChildren(graph: Graph, pool: Cell) {
@@ -5310,7 +5889,7 @@ function nodeCellStyle(node: DiagramNode, optimizeLargeGraph = false): DiagramCe
     spacing: node.style.spacing ?? (isDiamondLike ? 22 : 10),
     fontFamily: diagramFontFamilyCss(node.style.fontFamily ?? defaultFontFamily),
     fontSize: node.style.fontSize ?? 13,
-    fontStyle: (node.style.bold === false ? 0 : 1) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0),
+    fontStyle: (node.style.bold === true ? 1 : 0) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0),
     fillColor: node.style.fillColor,
     gradientColor: "none",
     gradientDirection: "north",
@@ -5830,6 +6409,34 @@ function recreateSelectionHandlers(graph: Graph, cells: Cell[]) {
   }
 }
 
+function descendantVertices(graph: Graph, parent: Cell) {
+  const descendants: Cell[] = [];
+  const visit = (current: Cell) => {
+    for (const child of graph.getChildVertices(current)) {
+      descendants.push(child);
+      visit(child);
+    }
+  };
+  visit(parent);
+  return descendants;
+}
+
+function cellStylesEqual(left: CellStyle, right: CellStyle) {
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const keys = new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)]);
+  for (const key of keys) {
+    if (leftRecord[key] !== rightRecord[key]) return false;
+  }
+  return true;
+}
+
+function diagramPointsEqual(left?: Point[] | null, right?: Point[] | null) {
+  if (!left?.length && !right?.length) return true;
+  if (!left || !right || left.length !== right.length) return false;
+  return left.every((point, index) => point.x === right[index].x && point.y === right[index].y);
+}
+
 function arrowTypeFromStyle(value: unknown, fallback: DiagramArrowType): DiagramArrowType {
   return value === "none" || value === "classic" || value === "block" || value === "open" || value === "oval" || value === "diamond"
     ? value
@@ -5838,6 +6445,14 @@ function arrowTypeFromStyle(value: unknown, fallback: DiagramArrowType): Diagram
 
 function diagramPageId(pageId?: string) {
   return pageId ?? DEFAULT_PAGE_ID;
+}
+
+function nextDiagramPageOrder(pages: Y.Map<DiagramPage>) {
+  let maximum = -1;
+  pages.forEach((page) => {
+    maximum = Math.max(maximum, page.order);
+  });
+  return maximum + 1;
 }
 
 function textAlignFromStyle(value: unknown): "left" | "center" | "right" {
@@ -6283,7 +6898,7 @@ function CompactPanelButton({
       type="button"
       aria-pressed={active}
       className={`diagram-apple-compact-button flex h-8 min-w-[64px] items-center justify-center gap-1.5 rounded-md px-2 text-[10px] font-semibold transition ${active
-        ? "bg-white text-cyan-800 shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
+        ? "bg-white text-[var(--diagram-apple-blue)] shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950"
         : "text-zinc-500 hover:bg-white/70 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"}`}
       onClick={onClick}
     >
@@ -6299,24 +6914,33 @@ function DiagramToolbarMenu({
   label,
   items,
   compact = false,
+  mobileLabel,
   placement = "bottom-start",
   onAction,
 }: {
   label: string;
   items: DiagramToolbarMenuItem[];
   compact?: boolean;
+  mobileLabel?: string;
   placement?: "bottom-start" | "bottom-end" | "top-end";
   onAction: (key: string) => void;
 }) {
   return (
-    <Dropdown placement={placement} shouldBlockScroll={false}>
+    <Dropdown
+      placement={placement}
+      shouldBlockScroll={false}
+      classNames={{
+        content: "diagram-apple-context-menu min-w-48 rounded-lg border p-1.5 shadow-xl",
+      }}
+    >
       <DropdownTrigger>
         <button
           type="button"
-          className={`diagram-apple-toolbar-menu flex shrink-0 items-center gap-1.5 rounded-lg text-[11px] font-medium text-zinc-600 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white ${compact ? "h-8 px-2" : "h-8 px-2.5"}`}
+          className={`diagram-apple-toolbar-menu flex shrink-0 items-center gap-1.5 rounded-lg text-[11px] font-medium text-zinc-600 transition hover:bg-black/[0.045] hover:text-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)] dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white ${compact ? "h-8 px-2" : "h-8 px-2.5"}`}
           aria-label={`${label}菜单`}
         >
-          {label}
+          <span className={mobileLabel ? "hidden sm:inline" : undefined}>{label}</span>
+          {mobileLabel ? <span className="sm:hidden">{mobileLabel}</span> : null}
           <svg className="h-3 w-3 text-zinc-400" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true">
             <path d="m4 6 4 4 4-4" />
           </svg>
@@ -6333,7 +6957,7 @@ function DiagramToolbarMenu({
             key={item.key}
             textValue={item.label}
             color={item.danger ? "danger" : "default"}
-            className={item.danger ? "text-danger" : undefined}
+            className={`rounded-md px-2.5 py-2 text-[11px] data-[hover=true]:bg-[var(--diagram-apple-blue-soft)] data-[hover=true]:text-[var(--diagram-apple-blue)] ${item.danger ? "text-[var(--diagram-apple-danger)]" : "text-[var(--diagram-apple-ink)]"}`}
             endContent={item.selected ? (
               <svg className="h-3.5 w-3.5 text-primary" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true">
                 <path d="m3 8 3 3 7-7" />
@@ -6367,12 +6991,12 @@ function DiagramToolbarButton({
       disabled={disabled}
       title={shortcut ? `${label} (${shortcut})` : label}
       className={`diagram-apple-toolbar-button flex h-8 shrink-0 items-center gap-1 rounded-lg px-2.5 text-[11px] font-medium transition disabled:cursor-not-allowed disabled:opacity-35 ${danger
-        ? "text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-400/10"
+        ? "text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)]"
         : "text-zinc-600 hover:bg-black/[0.045] hover:text-zinc-950 dark:text-zinc-300 dark:hover:bg-white/[0.06] dark:hover:text-white"}`}
       onClick={onClick}
     >
       {label}
-      {shortcut ? <span className="hidden text-[9px] text-zinc-400 xl:inline">{shortcut}</span> : null}
+      {shortcut ? <span className="hidden text-[10px] text-zinc-400 xl:inline">{shortcut}</span> : null}
     </button>
   );
 }
@@ -6404,14 +7028,14 @@ function DrawioStencilGlyph({ stencilName, loaded }: { stencilName: string; load
   return (
     <span className="diagram-apple-stencil-glyph relative flex h-8 w-12 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-50 dark:bg-white/[0.04]">
       <svg ref={svgRef} className={`h-full w-full overflow-visible ${rendered ? "block" : "hidden"}`} aria-hidden="true" />
-      {!rendered ? <span className="h-5 w-8 rounded border border-cyan-500/60 bg-cyan-50 dark:bg-cyan-300/10" /> : null}
+      {!rendered ? <span className="h-5 w-8 rounded border border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)]" /> : null}
     </span>
   );
 }
 
 function DiagramNodeGlyph({ kind }: { kind: DiagramNodeKind }) {
   if (kind === "text") {
-    return <span className="diagram-apple-node-glyph flex h-8 w-11 shrink-0 items-center justify-center rounded-md bg-slate-50 text-sm font-semibold text-cyan-700 transition group-hover:bg-cyan-50 dark:bg-white/[0.04] dark:text-cyan-200 dark:group-hover:bg-cyan-300/[0.08]">T</span>;
+    return <span className="diagram-apple-node-glyph flex h-8 w-11 shrink-0 items-center justify-center rounded-md bg-slate-50 text-sm font-semibold text-[var(--diagram-apple-blue)] transition group-hover:bg-[var(--diagram-apple-blue-soft)] dark:bg-white/[0.04]">T</span>;
   }
   let shape: ReactNode;
   if (kind === "rectangle") {
@@ -6546,7 +7170,7 @@ function DiagramNodeGlyph({ kind }: { kind: DiagramNodeKind }) {
     shape = <rect x="2" y="4" width="44" height="28" rx="4" />;
   }
   return (
-    <span className="diagram-apple-node-glyph flex h-8 w-11 shrink-0 items-center justify-center text-cyan-700 transition dark:text-cyan-200" aria-hidden="true">
+    <span className="diagram-apple-node-glyph flex h-8 w-11 shrink-0 items-center justify-center text-[var(--diagram-apple-blue)] transition" aria-hidden="true">
       <svg className="h-full w-full overflow-visible" viewBox="0 0 48 36">
         <g fill="var(--diagram-apple-glyph-fill)" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6">
           {shape}
@@ -6582,7 +7206,54 @@ function InspectorSection({ title, children }: { title: string; children: ReactN
 }
 
 function InspectorFieldLabel({ children }: { children: ReactNode }) {
-  return <span className="diagram-apple-field-label block text-[9px] font-medium text-zinc-500 dark:text-zinc-400">{children}</span>;
+  return <span className="diagram-apple-field-label block text-[10px] font-medium text-zinc-500 dark:text-zinc-400">{children}</span>;
+}
+
+function InspectorTextArea({
+  selectionKey,
+  value,
+  onCommit,
+}: {
+  selectionKey: string;
+  value: string;
+  onCommit: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const editingRef = useRef(false);
+  const selectionKeyRef = useRef(selectionKey);
+  useEffect(() => {
+    if (selectionKeyRef.current !== selectionKey) {
+      selectionKeyRef.current = selectionKey;
+      editingRef.current = false;
+      setDraft(value);
+    } else if (!editingRef.current) {
+      setDraft(value);
+    }
+  }, [selectionKey, value]);
+  return (
+    <label className="block">
+      <span className="sr-only">元素文字</span>
+      <textarea
+        value={draft}
+        maxLength={500}
+        rows={3}
+        className="diagram-apple-text-field w-full resize-y rounded-md border border-black/10 bg-white px-2.5 py-2 text-[11px] leading-5 text-zinc-900 outline-none focus:border-[var(--diagram-apple-blue)] dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-100"
+        onFocus={() => { editingRef.current = true; }}
+        onChange={(event) => setDraft(event.currentTarget.value)}
+        onBlur={(event) => {
+          editingRef.current = false;
+          onCommit(event.currentTarget.value);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) event.currentTarget.blur();
+          if (event.key === "Escape") {
+            setDraft(value);
+            event.currentTarget.blur();
+          }
+        }}
+      />
+    </label>
+  );
 }
 
 function InspectorNumberField({
@@ -6604,7 +7275,10 @@ function InspectorNumberField({
 }) {
   const formattedValue = value === undefined ? "" : String(Math.round(value * 100) / 100);
   const [draft, setDraft] = useState(formattedValue);
-  useEffect(() => setDraft(formattedValue), [formattedValue]);
+  const editingRef = useRef(false);
+  useEffect(() => {
+    if (!editingRef.current) setDraft(formattedValue);
+  }, [formattedValue]);
   const commit = () => {
     const parsed = Number(draft);
     if (!Number.isFinite(parsed)) {
@@ -6626,8 +7300,15 @@ function InspectorNumberField({
           max={max}
           step={step}
           className="min-w-0 flex-1 bg-transparent px-2 text-[11px] text-zinc-800 outline-none dark:text-zinc-100"
+          onFocus={(event) => {
+            editingRef.current = true;
+            event.currentTarget.select();
+          }}
           onChange={(event) => setDraft(event.currentTarget.value)}
-          onBlur={commit}
+          onBlur={() => {
+            editingRef.current = false;
+            commit();
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter") event.currentTarget.blur();
             if (event.key === "Escape") {
@@ -6636,7 +7317,7 @@ function InspectorNumberField({
             }
           }}
         />
-        {suffix ? <span className="pr-2 text-[9px] text-zinc-400">{suffix}</span> : null}
+        {suffix ? <span className="pr-2 text-[10px] text-zinc-400">{suffix}</span> : null}
       </span>
     </label>
   );
@@ -6682,7 +7363,10 @@ function InspectorColorField({
 }) {
   const displayValue = value === "none" ? "none" : colorPickerValue(value, fallback);
   const [draft, setDraft] = useState(displayValue);
-  useEffect(() => setDraft(displayValue), [displayValue]);
+  const editingRef = useRef(false);
+  useEffect(() => {
+    if (!editingRef.current) setDraft(displayValue);
+  }, [displayValue]);
   const pickerValue = value === "none" ? colorPickerValue(fallback, "#000000") : colorPickerValue(value, fallback);
   const commit = () => {
     const normalized = draft.trim().toLowerCase();
@@ -6713,6 +7397,8 @@ function InspectorColorField({
             value={pickerValue}
             aria-label={`选择${label}`}
             className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+            onFocus={() => { editingRef.current = true; }}
+            onBlur={() => { editingRef.current = false; }}
             onChange={(event) => {
               setDraft(event.currentTarget.value);
               onCommit(event.currentTarget.value);
@@ -6724,8 +7410,15 @@ function InspectorColorField({
           inputMode="text"
           aria-label={`${label}色值`}
           className="h-8 min-w-0 flex-1 rounded-md border border-black/[0.09] bg-white px-2 font-mono text-[10px] uppercase text-zinc-700 outline-none focus:border-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-zinc-950 dark:text-zinc-200"
+          onFocus={(event) => {
+            editingRef.current = true;
+            event.currentTarget.select();
+          }}
           onChange={(event) => setDraft(event.currentTarget.value)}
-          onBlur={commit}
+          onBlur={() => {
+            editingRef.current = false;
+            commit();
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter") event.currentTarget.blur();
             if (event.key === "Escape") {
@@ -6788,9 +7481,19 @@ function InspectorRangeField({
   );
 }
 
-function InspectorToggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: () => void }) {
+function InspectorToggle({
+  label,
+  checked,
+  disabled = false,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: () => void;
+}) {
   return (
-    <button type="button" role="switch" aria-checked={checked} className="flex h-7 items-center justify-between gap-2 text-left text-[10px] font-medium text-zinc-600 dark:text-zinc-300" onClick={onChange}>
+    <button type="button" role="switch" aria-checked={checked} disabled={disabled} className="flex h-7 w-full items-center justify-between gap-2 text-left text-[10px] font-medium text-zinc-600 disabled:cursor-not-allowed disabled:opacity-45 dark:text-zinc-300" onClick={onChange}>
       <span>{label}</span>
       <span className={`relative h-5 w-9 shrink-0 rounded-full transition ${checked ? "bg-[var(--diagram-apple-blue)]" : "bg-zinc-300 dark:bg-zinc-700"}`} aria-hidden>
         <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-[18px] dark:bg-zinc-950" : "translate-x-0.5"}`} />
@@ -6890,8 +7593,8 @@ function InspectorAction({
       type="button"
       disabled={disabled}
       aria-pressed={active}
-      className={`diagram-apple-inspector-action rounded-lg border px-2 py-1.5 text-[10px] font-medium transition hover:border-cyan-400 hover:text-cyan-800 disabled:opacity-35 dark:hover:text-cyan-200 ${active
-        ? "border-cyan-400 bg-cyan-50 text-cyan-900 shadow-sm dark:bg-cyan-300/10 dark:text-cyan-100"
+      className={`diagram-apple-inspector-action rounded-lg border px-2 py-1.5 text-[10px] font-medium transition hover:border-[var(--diagram-apple-blue)] hover:text-[var(--diagram-apple-blue)] disabled:opacity-35 ${active
+        ? "border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)] shadow-sm"
         : "border-black/[0.08] bg-white/70 text-zinc-600 dark:border-white/[0.09] dark:bg-white/[0.025] dark:text-zinc-300"}`}
       onClick={onClick}
     >
@@ -6917,8 +7620,8 @@ function ContextMenuAction({
       role="menuitem"
       disabled={disabled}
       className={`diagram-apple-context-action block w-full rounded-md px-2.5 py-2 text-left transition disabled:opacity-35 ${danger
-        ? "text-red-600 hover:bg-red-50 dark:text-red-300 dark:hover:bg-red-400/10"
-        : "hover:bg-cyan-50 hover:text-cyan-900 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100"}`}
+        ? "text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)]"
+        : "hover:bg-[var(--diagram-apple-blue-soft)] hover:text-[var(--diagram-apple-blue)]"}`}
       onClick={onClick}
     >
       {label}

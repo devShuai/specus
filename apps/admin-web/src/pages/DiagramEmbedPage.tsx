@@ -32,6 +32,7 @@ const EMBED_EVENTS: WhiteboardInboundEvent[] = [];
 
 function noopSend() {
   // 嵌入模式没有协作房间，丢弃同步载荷。
+  return true;
 }
 
 function createEmbedPeerId() {
@@ -51,10 +52,11 @@ function blobToDataUrl(blob: Blob) {
 export function DiagramEmbedPage() {
   const config = useMemo(() => {
     const params = new URLSearchParams(window.location.search);
+    const requestedKey = params.get("key")?.trim();
     return {
       origin: params.get("origin")?.trim() || null,
       readOnly: params.get("readonly") === "1",
-      boardKey: `embed:${params.get("key")?.trim() || "default"}`,
+      boardKey: `embed:${requestedKey || createEmbedPeerId()}`,
     };
   }, []);
   const peerId = useMemo(createEmbedPeerId, []);

@@ -3786,8 +3786,8 @@ body {
   }
 }
 
-/* Apple-style skin for the professional synced diagram editor. */
-.diagram-apple {
+/* Portal-safe tokens for the professional diagram editor and its dialogs. */
+:root {
   --diagram-apple-blue: #0066cc;
   --diagram-apple-blue-soft: rgba(0, 102, 204, 0.1);
   --diagram-apple-ink: #1d1d1f;
@@ -3800,16 +3800,14 @@ body {
   --diagram-apple-surface-soft: #fbfbfd;
   --diagram-apple-panel: rgba(255, 255, 255, 0.86);
   --diagram-apple-glyph-fill: #e8f2ff;
-  color: var(--diagram-apple-ink);
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --diagram-apple-canvas: #f5f5f7;
+  --diagram-apple-success: #248a3d;
+  --diagram-apple-success-soft: rgba(36, 138, 61, 0.11);
+  --diagram-apple-danger: #c9343a;
+  --diagram-apple-danger-soft: rgba(201, 52, 58, 0.1);
 }
 
-.diagram-apple,
-.diagram-apple * {
-  letter-spacing: 0 !important;
-}
-
-.dark .diagram-apple {
+:root.dark {
   --diagram-apple-blue: #2997ff;
   --diagram-apple-blue-soft: rgba(41, 151, 255, 0.16);
   --diagram-apple-ink: #f5f5f7;
@@ -3822,6 +3820,58 @@ body {
   --diagram-apple-surface-soft: #242426;
   --diagram-apple-panel: rgba(44, 44, 46, 0.84);
   --diagram-apple-glyph-fill: #20364d;
+  --diagram-apple-canvas: #272729;
+  --diagram-apple-success: #32d74b;
+  --diagram-apple-success-soft: rgba(50, 215, 75, 0.13);
+  --diagram-apple-danger: #ff6961;
+  --diagram-apple-danger-soft: rgba(255, 105, 97, 0.14);
+}
+
+/* Apple-style skin for the professional synced diagram editor. */
+.diagram-apple {
+  --diagram-apple-blue: var(--app-apple-blue, #0066cc);
+  --diagram-apple-blue-soft: var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1));
+  --diagram-apple-ink: var(--app-apple-ink, #1d1d1f);
+  --diagram-apple-muted: var(--app-apple-muted, #515154);
+  --diagram-apple-subtle: var(--app-apple-subtle, #6e6e73);
+  --diagram-apple-line: var(--app-apple-line, rgba(29, 29, 31, 0.1));
+  --diagram-apple-line-strong: var(--app-apple-line-strong, rgba(29, 29, 31, 0.16));
+  --diagram-apple-page: var(--app-apple-page, #f5f5f7);
+  --diagram-apple-surface: var(--app-apple-surface, #ffffff);
+  --diagram-apple-surface-soft: var(--app-apple-surface-soft, #fbfbfd);
+  --diagram-apple-panel: var(--app-apple-panel, rgba(255, 255, 255, 0.86));
+  --diagram-apple-danger: var(--app-apple-danger, #c9343a);
+  --diagram-apple-danger-soft: var(--app-apple-danger-soft, rgba(201, 52, 58, 0.1));
+  color: var(--diagram-apple-ink);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.diagram-apple,
+.diagram-apple * {
+  letter-spacing: 0 !important;
+}
+
+.dark .diagram-apple {
+  --diagram-apple-blue: var(--app-apple-blue, #2997ff);
+  --diagram-apple-blue-soft: var(--app-apple-blue-soft, rgba(41, 151, 255, 0.16));
+  --diagram-apple-ink: var(--app-apple-ink, #f5f5f7);
+  --diagram-apple-muted: var(--app-apple-muted, #d1d1d6);
+  --diagram-apple-subtle: var(--app-apple-subtle, #b8b8bd);
+  --diagram-apple-line: var(--app-apple-line, rgba(245, 245, 247, 0.1));
+  --diagram-apple-line-strong: var(--app-apple-line-strong, rgba(245, 245, 247, 0.18));
+  --diagram-apple-page: var(--app-apple-page, #1d1d1f);
+  --diagram-apple-surface: var(--app-apple-surface, #2c2c2e);
+  --diagram-apple-surface-soft: var(--app-apple-surface-soft, #242426);
+  --diagram-apple-panel: var(--app-apple-panel, rgba(44, 44, 46, 0.84));
+  --diagram-apple-glyph-fill: #20364d;
+  --diagram-apple-danger: var(--app-apple-danger, #ff6961);
+  --diagram-apple-danger-soft: var(--app-apple-danger-soft, rgba(255, 105, 97, 0.14));
+}
+
+.diagram-apple-dialog {
+  border-color: var(--diagram-apple-line-strong) !important;
+  background: var(--diagram-apple-surface) !important;
+  color: var(--diagram-apple-ink) !important;
 }
 
 .diagram-apple:not(.diagram-apple-full) {
@@ -3891,8 +3941,7 @@ body {
 .diagram-apple-toolbar-menu,
 .diagram-apple-compact-button,
 .diagram-apple-primary-action,
-.diagram-apple-inspector-action,
-.diagram-apple-context-action {
+.diagram-apple-inspector-action {
   border-radius: 999px !important;
 }
 
@@ -4059,11 +4108,12 @@ body {
 
 .diagram-collaboration-status-dot.is-connected,
 .diagram-collaboration-online-dot {
-  background: #30a46c;
+  background: var(--diagram-apple-success);
 }
 
 .diagram-collaboration-role,
-.diagram-collaboration-count {
+.diagram-collaboration-count,
+.diagram-apple-count-badge {
   display: inline-flex;
   min-height: 20px;
   align-items: center;
@@ -4337,7 +4387,7 @@ body {
   height: 7px;
   flex: 0 0 auto;
   border-radius: 999px;
-  box-shadow: 0 0 0 2px color-mix(in srgb, #30a46c 14%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--diagram-apple-success) 14%, transparent);
 }
 
 .diagram-collaboration-feedback {
@@ -4350,15 +4400,15 @@ body {
 }
 
 .diagram-collaboration-feedback.is-success {
-  border-color: color-mix(in srgb, #30a46c 30%, var(--diagram-apple-line));
-  background: color-mix(in srgb, #30a46c 8%, var(--diagram-apple-surface));
+  border-color: color-mix(in srgb, var(--diagram-apple-success) 30%, var(--diagram-apple-line));
+  background: color-mix(in srgb, var(--diagram-apple-success) 8%, var(--diagram-apple-surface));
   color: color-mix(in srgb, #15803d 82%, var(--diagram-apple-ink));
 }
 
 .diagram-collaboration-feedback.is-error {
-  border-color: color-mix(in srgb, #dc2626 30%, var(--diagram-apple-line));
-  background: color-mix(in srgb, #dc2626 7%, var(--diagram-apple-surface));
-  color: color-mix(in srgb, #b91c1c 82%, var(--diagram-apple-ink));
+  border-color: color-mix(in srgb, var(--diagram-apple-danger) 30%, var(--diagram-apple-line));
+  background: color-mix(in srgb, var(--diagram-apple-danger) 7%, var(--diagram-apple-surface));
+  color: var(--diagram-apple-danger);
 }
 
 @media (max-width: 420px) {
@@ -4555,7 +4605,29 @@ body {
 }
 
 .diagram-apple-context-menu {
+  border-color: var(--diagram-apple-line-strong) !important;
+  background: var(--diagram-apple-surface) !important;
   color: var(--diagram-apple-ink) !important;
+}
+
+.diagram-apple-context-action {
+  border-radius: 6px !important;
+}
+
+.diagram-apple .public-tools-trigger {
+  color: var(--diagram-apple-ink) !important;
+}
+
+.diagram-apple .public-tools-trigger:hover,
+.diagram-apple .public-tools-trigger[aria-expanded="true"] {
+  color: var(--diagram-apple-blue) !important;
+  background: var(--diagram-apple-blue-soft) !important;
+}
+
+.diagram-apple .header-menu-panel {
+  border-color: var(--diagram-apple-line-strong);
+  color: var(--diagram-apple-ink);
+  background: var(--diagram-apple-surface);
 }
 
 .diagram-apple-context-action:hover {

@@ -271,6 +271,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [clipboardFocusRequest, setClipboardFocusRequest] = useState(0);
   const [clipboardEvents, setClipboardEvents] = useState<ClipboardInboundEvent[]>([]);
   const [whiteboardEvents, setWhiteboardEvents] = useState<WhiteboardInboundEvent[]>([]);
+  const [diagramEvents, setDiagramEvents] = useState<WhiteboardInboundEvent[]>([]);
   const isDiagramWorkspace = workspace === "diagram";
 
   useEffect(() => maintainTransferPeerIdentityLease(peerIdentity), [peerIdentity]);
@@ -303,6 +304,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   inviteRequestContextRef.current = inviteRequestContext;
   roomInviteRoleRef.current = roomInviteRole;
   const transferRoomScopeKey = `${networkMode}:${normalizeRoomId(roomId)}:${isInternetMode ? roomToken.trim() : "lan"}:${roomGeneration}`;
+  const diagramPeerDisplayNames = useMemo(() => Object.fromEntries(
+    peers.map((peer) => [peer.peerId, discoveryPeerDisplayName(peer)]),
+  ), [peers]);
   const normalizedDisplayNameDraft = displayNameDraft.trim();
   const clientNameLocalError = !normalizedDisplayNameDraft
     ? "客户端名称不能为空"
@@ -456,15 +460,17 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       return;
     }
     const eventId = whiteboardEventKey(sourcePeerId, payload);
-    setWhiteboardEvents((items) => [
-      ...items.slice(-299),
-      {
-        eventId,
-        sourcePeerId,
-        payload,
-        receivedAt: Date.now(),
-      },
-    ]);
+    const event = {
+      eventId,
+      sourcePeerId,
+      payload,
+      receivedAt: Date.now(),
+    };
+    if (payload.type === "STDG1") {
+      setDiagramEvents((items) => [...items.slice(-999), event]);
+    } else {
+      setWhiteboardEvents((items) => [...items.slice(-299), event]);
+    }
   }, [peerId]);
 
   const pushClipboardEvent = useCallback((sourcePeerId: string, payload: ClipboardSyncPayload) => {
@@ -943,6 +949,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     whiteboardTransportRetryRef.current.clear();
     setClipboardEvents([]);
     setWhiteboardEvents([]);
+    setDiagramEvents([]);
     setPeers([]);
     setSelectedPeerId("");
     setSelectedFiles([]);
@@ -1912,11 +1919,12 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   }, []);
 
   const sendWhiteboardPayload = useCallback((payload: WhiteboardPayload) => {
-    if (isRoomReadOnly) return;
+    if (isRoomReadOnly) return Promise.resolve(false);
     if (peers.length === 0) {
-      return;
+      return Promise.resolve(true);
     }
     const sendRoomEpoch = roomEpochRef.current;
+    const deliveries: Array<Promise<boolean>> = [];
     for (const peer of peers) {
       const targetPeerId = peer.peerId;
       // Keep payloads ordered while avoiding a new ICE negotiation for every stroke after a path fails.
@@ -1926,7 +1934,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         const isTargetCurrent = () => roomEpochRef.current === sendRoomEpoch
           && currentRoomPeerIdsRef.current.has(targetPeerId);
         if (!isTargetCurrent()) {
-          return;
+          return true;
         }
         const retryState = whiteboardTransportRetryRef.current.get(queueKey) ?? {
           directAfter: 0,
@@ -1952,14 +1960,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         };
 
         if (networkMode === "lan") {
-          await sendDirectMessage();
+          const sent = await sendDirectMessage();
           if (isTargetCurrent()) {
             whiteboardTransportRetryRef.current.set(queueKey, retryState);
           }
-          return;
+          return sent || !isTargetCurrent();
         }
 
-        await sendWhiteboardWithFallback({
+        const transport = await sendWhiteboardWithFallback({
           direct: sendDirectMessage,
           turn: async () => {
             if (!isTargetCurrent()) {
@@ -1984,15 +1992,19 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         if (isTargetCurrent()) {
           whiteboardTransportRetryRef.current.set(queueKey, retryState);
         }
+        return transport !== null || !isTargetCurrent();
       });
-      const settled = task.catch(() => undefined);
-      whiteboardSendQueuesRef.current.set(queueKey, settled);
-      void settled.finally(() => {
-        if (whiteboardSendQueuesRef.current.get(queueKey) === settled) {
+      const delivery = task.catch(() => false);
+      const queued = delivery.then(() => undefined);
+      deliveries.push(delivery);
+      whiteboardSendQueuesRef.current.set(queueKey, queued);
+      void queued.finally(() => {
+        if (whiteboardSendQueuesRef.current.get(queueKey) === queued) {
           whiteboardSendQueuesRef.current.delete(queueKey);
         }
       });
     }
+    return Promise.all(deliveries).then((results) => results.every(Boolean));
   }, [isPeerMessageTransportReady, isRoomReadOnly, networkMode, peers, publishWhiteboardEnvelope, sendPeerMessage]);
 
   const publishClipboardEnvelope = useCallback((targetPeerId: string, serializedEnvelope: string, expectedRoomEpoch: number) => {
@@ -2265,8 +2277,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             roomRole={effectiveRoomRole}
             peerId={peerId}
             peerCount={peers.length}
+            peerDisplayNames={diagramPeerDisplayNames}
             isConnected={peers.length > 0}
-            events={whiteboardEvents}
+            events={diagramEvents}
             onSend={sendWhiteboardPayload}
           />
         </Suspense>
@@ -2666,8 +2679,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 roomRole={effectiveRoomRole}
                 peerId={peerId}
                 peerCount={peers.length}
+                peerDisplayNames={diagramPeerDisplayNames}
                 isConnected={peers.length > 0}
-                events={whiteboardEvents}
+                events={diagramEvents}
                 onSend={sendWhiteboardPayload}
               />
             </Suspense>
@@ -3014,7 +3028,7 @@ function DiagramWorkspaceLoading({ fullscreen = false }: { fullscreen?: boolean 
       : "mt-5 grid min-h-[520px] place-items-center rounded-2xl border border-black/[0.07] bg-zinc-50/70 dark:border-white/[0.08] dark:bg-zinc-950/55"}
     >
       <div className="flex flex-col items-center gap-3 text-center">
-        <span className="h-8 w-8 animate-spin rounded-full border-2 border-cyan-500/25 border-t-cyan-500" aria-hidden="true" />
+        <span className="h-8 w-8 animate-spin rounded-full border-2 border-[var(--app-apple-blue-soft)] border-t-[var(--app-apple-blue)]" aria-hidden="true" />
         <span className="text-small font-semibold text-zinc-900 dark:text-white">正在加载专业流程图工具</span>
       </div>
     </section>
@@ -3986,7 +4000,7 @@ function isAttachmentDiscoveryPayload(value: unknown): value is { objectId?: str
 function whiteboardEventKey(sourcePeerId: string, payload: WhiteboardPayload) {
   if (payload.type === "STDG1") {
     if (payload.kind === "diagram-update") {
-      return `${sourcePeerId}:diagram-update:${payload.createdAt}:${payload.update.length}:${payload.update.slice(0, 20)}`;
+      return `${sourcePeerId}:diagram-update:${payload.createdAt}:${payload.update.length}:${hashEventPayload(payload.update)}`;
     }
     if (payload.kind === "diagram-presence") {
       return `${sourcePeerId}:diagram-presence:${payload.createdAt}`;
@@ -4025,6 +4039,15 @@ function whiteboardEventKey(sourcePeerId: string, payload: WhiteboardPayload) {
     return `${sourcePeerId}:snapshot:${payload.createdAt}:${payload.strokes.length}`;
   }
   return `${sourcePeerId}:whiteboard:${payload.createdAt}`;
+}
+
+function hashEventPayload(value: string) {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
