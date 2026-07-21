@@ -16,9 +16,11 @@ import {
   registerAccount as apiRegisterAccount,
   setUnauthorizedHandler,
   tokenStore,
+  verifyRegistration as apiVerifyRegistration,
 } from "../api/client";
-import type { ManagementUser, OidcConfig } from "../api/types";
+import type { ManagementUser, OidcConfig, RegistrationChallengeResponse } from "../api/types";
 import { codeChallenge, randomToken } from "../lib/pkce";
+import { executeTurnstile } from "../lib/turnstile";
 
 const PKCE_VERIFIER_KEY = "pkce_verifier";
 const OIDC_STATE_KEY = "oidc_state";
@@ -39,7 +41,8 @@ interface AuthState {
   expireSession: () => void;
   reloadProfile: () => Promise<ManagementUser>;
   passwordLogin: (username: string, password: string) => Promise<void>;
-  register: (username: string, password: string) => Promise<void>;
+  register: (username: string, email: string, password: string) => Promise<RegistrationChallengeResponse>;
+  verifyRegistration: (registrationId: string, code: string) => Promise<void>;
   startOidcLogin: () => Promise<void>;
   openLogin: (initialTab?: "login" | "register") => void;
   closeLogin: () => void;
@@ -139,14 +142,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const passwordLogin = useCallback(
     async (username: string, password: string) => {
-      await completePasswordAuth(await apiPasswordLogin(username, password));
+      const turnstileToken = await executeTurnstile(oidcConfig, "login");
+      await completePasswordAuth(await apiPasswordLogin(username, password, turnstileToken));
     },
-    [completePasswordAuth],
+    [completePasswordAuth, oidcConfig],
   );
 
   const register = useCallback(
-    async (username: string, password: string) => {
-      await completePasswordAuth(await apiRegisterAccount(username, password));
+    async (username: string, email: string, password: string) => {
+      const turnstileToken = await executeTurnstile(oidcConfig, "register");
+      return apiRegisterAccount(username, email, password, turnstileToken);
+    },
+    [oidcConfig],
+  );
+
+  const verifyRegistration = useCallback(
+    async (registrationId: string, code: string) => {
+      await completePasswordAuth(await apiVerifyRegistration(registrationId, code));
     },
     [completePasswordAuth],
   );
@@ -238,6 +250,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     reloadProfile,
     passwordLogin,
     register,
+    verifyRegistration,
     startOidcLogin,
     openLogin,
     closeLogin,

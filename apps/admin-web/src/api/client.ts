@@ -49,6 +49,7 @@ import type {
   PublicPeerStunConfig,
   ResourceTrafficType,
   ResourceTrafficUsage,
+  RegistrationChallengeResponse,
   TcpTrafficFrame,
   TcpTrafficFramePage,
   TcpTrafficStream,
@@ -159,11 +160,15 @@ export async function fetchOidcConfig(): Promise<OidcConfig | null> {
   }
 }
 
-export async function passwordLogin(username: string, password: string): Promise<TokenResponse> {
+export async function passwordLogin(
+  username: string,
+  password: string,
+  turnstileToken: string,
+): Promise<TokenResponse> {
   const response = await fetch("/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, turnstileToken }),
   });
   const body = (await response.json()) as TokenResponse;
   if (!response.ok) {
@@ -172,15 +177,33 @@ export async function passwordLogin(username: string, password: string): Promise
   return body;
 }
 
-export async function registerAccount(username: string, password: string): Promise<TokenResponse> {
+export async function registerAccount(
+  username: string,
+  email: string,
+  password: string,
+  turnstileToken: string,
+): Promise<RegistrationChallengeResponse> {
   const response = await fetch("/auth/register", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, email, password, turnstileToken }),
+  });
+  const body = (await response.json()) as RegistrationChallengeResponse & { error?: string };
+  if (!response.ok) {
+    throw new ApiError(body?.error || "注册失败");
+  }
+  return body;
+}
+
+export async function verifyRegistration(registrationId: string, code: string): Promise<TokenResponse> {
+  const response = await fetch("/auth/register/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ registrationId, code }),
   });
   const body = (await response.json()) as TokenResponse;
   if (!response.ok) {
-    throw new ApiError(body?.error || "注册失败");
+    throw new ApiError(body?.error || "邮箱验证失败");
   }
   return body;
 }

@@ -4,6 +4,9 @@ export interface OidcConfig {
   configured: boolean;
   passwordLoginEnabled: boolean;
   registrationEnabled?: boolean;
+  emailVerificationRequired?: boolean;
+  turnstileEnabled?: boolean;
+  turnstileSiteKey?: string;
   authorizationEndpoint: string;
   endSessionEndpoint: string;
   clientId: string;
@@ -17,6 +20,13 @@ export interface TokenResponse {
   expiresIn: number;
   error?: string;
   error_description?: string;
+}
+
+export interface RegistrationChallengeResponse {
+  registrationId: string;
+  emailMasked: string;
+  expiresAt: string;
+  resendAfterSeconds: number;
 }
 
 export interface Overview {
