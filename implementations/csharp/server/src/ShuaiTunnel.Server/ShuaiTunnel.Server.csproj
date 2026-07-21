@@ -23,6 +23,7 @@
   </Target>
 
   <ItemGroup>
+    <PackageReference Include="MailKit" Version="4.17.0" />
     <ProjectReference Include="..\..\..\protocol\src\ShuaiTunnel.Protocol\ShuaiTunnel.Protocol.csproj" />
     <ProjectReference Include="..\ShuaiTunnel.Server.Data\ShuaiTunnel.Server.Data.csproj" />
     <!-- Provider migration assemblies must be referenced so MigrationsAssembly(...) can load

@@ -20,6 +20,10 @@ public sealed class TunnelEnvironmentVariablesTests
             ["TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES"] = "6",
             ["TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES"] = "2",
             ["TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS"] = "1234",
+            ["TUNNEL_AUTH_REGISTRATION_ENABLED"] = "true",
+            ["TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES"] = "tunnel.example.com",
+            ["TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED"] = "true",
+            ["TUNNEL_AUTH_SMTP_STARTTLS_REQUIRED"] = "false",
             ["TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS"] = "7",
             ["TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS"] = "15000",
             ["TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING"] = "300",
@@ -69,6 +73,10 @@ public sealed class TunnelEnvironmentVariablesTests
         Assert.Equal("6", mapped["Tunnel:ClientAuth:DefaultMaxOnlineInstances"]);
         Assert.Equal("2", mapped["Tunnel:ClientAuth:PerMachineUserMaxInstances"]);
         Assert.Equal("1234", mapped["Tunnel:ClientAuth:TokenTtlSeconds"]);
+        Assert.Equal("true", mapped["Tunnel:Auth:RegistrationEnabled"]);
+        Assert.Equal("tunnel.example.com", mapped["Tunnel:Auth:TurnstileAllowedHostnames"]);
+        Assert.Equal("true", mapped["Tunnel:Auth:EmailVerificationEnabled"]);
+        Assert.Equal("false", mapped["Tunnel:Auth:SmtpStarttlsRequired"]);
         Assert.Equal("7", mapped["Tunnel:ConnectionRecord:DetailRetentionDays"]);
         Assert.Equal("15000", mapped["Tunnel:ConnectionRecord:ArchiveIntervalMs"]);
         Assert.Equal("300", mapped["Tunnel:Traffic:CaptureMaxPending"]);

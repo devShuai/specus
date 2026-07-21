@@ -45,6 +45,7 @@ public sealed class DatabaseInitializer
         var db = scope.ServiceProvider.GetRequiredService<TunnelDbContext>();
         await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
         await EnsureManagementUserTableAsync(db, cancellationToken).ConfigureAwait(false);
+        await EnsureManagementRegistrationTablesAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureClientDownloadLinkTableAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureClientMessageCapabilityColumnsAsync(db, cancellationToken).ConfigureAwait(false);
         await EnsureTransferAttachmentTableAsync(db, cancellationToken).ConfigureAwait(false);
@@ -130,6 +131,48 @@ public sealed class DatabaseInitializer
               updated_at VARCHAR(40) NOT NULL
             )
             """, cancellationToken);
+
+    private static async Task EnsureManagementRegistrationTablesAsync(TunnelDbContext db,
+        CancellationToken cancellationToken)
+    {
+        await ExecuteSchemaSqlAsync(db, """
+            CREATE TABLE IF NOT EXISTS tunnel_management_user_email (
+              username VARCHAR(80) PRIMARY KEY,
+              email VARCHAR(254) NOT NULL,
+              verified_at VARCHAR(40) NOT NULL,
+              created_at VARCHAR(40) NOT NULL,
+              updated_at VARCHAR(40) NOT NULL
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await EnsureUniqueIndexAsync(db, "uq_management_user_email", "tunnel_management_user_email",
+            "email", cancellationToken).ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_management_user_email_verified", "tunnel_management_user_email",
+            "verified_at", cancellationToken).ConfigureAwait(false);
+
+        await ExecuteSchemaSqlAsync(db, """
+            CREATE TABLE IF NOT EXISTS tunnel_management_registration_challenge (
+              registration_id VARCHAR(64) PRIMARY KEY,
+              username VARCHAR(80) NOT NULL,
+              email VARCHAR(254) NOT NULL,
+              password_hash VARCHAR(64) NOT NULL,
+              code_hash VARCHAR(64) NOT NULL,
+              attempts_remaining INTEGER NOT NULL,
+              expires_at VARCHAR(40) NOT NULL,
+              resend_available_at VARCHAR(40) NOT NULL,
+              created_at VARCHAR(40) NOT NULL,
+              updated_at VARCHAR(40) NOT NULL
+            )
+            """, cancellationToken).ConfigureAwait(false);
+        await EnsureUniqueIndexAsync(db, "uq_registration_challenge_username",
+            "tunnel_management_registration_challenge", "username", cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureUniqueIndexAsync(db, "uq_registration_challenge_email",
+            "tunnel_management_registration_challenge", "email", cancellationToken)
+            .ConfigureAwait(false);
+        await EnsureIndexAsync(db, "idx_registration_challenge_expiry",
+            "tunnel_management_registration_challenge", "expires_at", cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     private static async Task EnsureClientDownloadLinkTableAsync(TunnelDbContext db,
         CancellationToken cancellationToken)

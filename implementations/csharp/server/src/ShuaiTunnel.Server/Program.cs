@@ -96,6 +96,10 @@ builder.Services.AddScoped<NatControlService>();
 builder.Services.AddScoped<ManagementQueryService>();
 builder.Services.AddScoped<ManagementMutationService>();
 builder.Services.AddScoped<ManagementUserService>();
+builder.Services.AddScoped<RegistrationService>();
+builder.Services.AddSingleton<IRegistrationEmailSender, SmtpRegistrationEmailSender>();
+builder.Services.AddSingleton<ITurnstileVerifier, TurnstileVerifier>();
+builder.Services.AddHostedService<RegistrationChallengeCleanupService>();
 builder.Services.AddSingleton<TurnCredentialService>();
 builder.Services.AddScoped<PeerMeshService>();
 builder.Services.AddHostedService<StunTurnServer>();
@@ -109,6 +113,8 @@ builder.Services.AddHostedService<TransferAttachmentExpirationService>();
 builder.Services.AddSingleton<TrafficInspectionService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TrafficInspectionService>());
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient(nameof(TurnstileVerifier), client =>
+    client.Timeout = TimeSpan.FromSeconds(8));
 builder.Services.AddHttpClient(nameof(AliyunOssObjectStorageService))
     .ConfigurePrimaryHttpMessageHandler(AliyunOssObjectStorageService.CreateNoRedirectHandler);
 

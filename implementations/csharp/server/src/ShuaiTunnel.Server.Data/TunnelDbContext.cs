@@ -20,6 +20,9 @@ public sealed class TunnelDbContext : DbContext
     public DbSet<ClientIdentity> ClientIdentities => Set<ClientIdentity>();
     public DbSet<ClientSession> ClientSessions => Set<ClientSession>();
     public DbSet<ManagementUser> ManagementUsers => Set<ManagementUser>();
+    public DbSet<ManagementUserEmail> ManagementUserEmails => Set<ManagementUserEmail>();
+    public DbSet<ManagementRegistrationChallenge> ManagementRegistrationChallenges =>
+        Set<ManagementRegistrationChallenge>();
     public DbSet<ClientDownloadLink> ClientDownloadLinks => Set<ClientDownloadLink>();
     public DbSet<ConnectionRecord> ConnectionRecords => Set<ConnectionRecord>();
     public DbSet<TunnelMapping> TunnelMappings => Set<TunnelMapping>();
@@ -168,6 +171,47 @@ public sealed class TunnelDbContext : DbContext
                 .HasConversion(iso);
             b.HasIndex(x => x.TenantId).HasDatabaseName("idx_management_user_tenant");
             b.HasIndex(x => x.Role).HasDatabaseName("idx_management_user_role");
+        });
+
+        modelBuilder.Entity<ManagementUserEmail>(b =>
+        {
+            b.ToTable("tunnel_management_user_email");
+            b.HasKey(x => x.Username);
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Email).HasColumnName("email").HasMaxLength(254).IsRequired();
+            b.Property(x => x.VerifiedAt).HasColumnName("verified_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.Email).IsUnique().HasDatabaseName("uq_management_user_email");
+            b.HasIndex(x => x.VerifiedAt).HasDatabaseName("idx_management_user_email_verified");
+        });
+
+        modelBuilder.Entity<ManagementRegistrationChallenge>(b =>
+        {
+            b.ToTable("tunnel_management_registration_challenge");
+            b.HasKey(x => x.RegistrationId);
+            b.Property(x => x.RegistrationId).HasColumnName("registration_id").HasMaxLength(64)
+                .IsRequired();
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80).IsRequired();
+            b.Property(x => x.Email).HasColumnName("email").HasMaxLength(254).IsRequired();
+            b.Property(x => x.PasswordHash).HasColumnName("password_hash").HasMaxLength(64)
+                .IsRequired();
+            b.Property(x => x.CodeHash).HasColumnName("code_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.AttemptsRemaining).HasColumnName("attempts_remaining").IsRequired();
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ResendAvailableAt).HasColumnName("resend_available_at").HasMaxLength(40)
+                .IsRequired().HasConversion(iso);
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.UpdatedAt).HasColumnName("updated_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.Username).IsUnique().HasDatabaseName("uq_registration_challenge_username");
+            b.HasIndex(x => x.Email).IsUnique().HasDatabaseName("uq_registration_challenge_email");
+            b.HasIndex(x => x.ExpiresAt).HasDatabaseName("idx_registration_challenge_expiry");
         });
 
         modelBuilder.Entity<ClientDownloadLink>(b =>

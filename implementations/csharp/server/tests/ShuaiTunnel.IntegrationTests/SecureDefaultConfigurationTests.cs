@@ -22,8 +22,14 @@ public sealed class SecureDefaultConfigurationTests
             tunnel.GetProperty("Elasticsearch").GetProperty("Username").GetString());
         Assert.Equal(string.Empty,
             tunnel.GetProperty("Elasticsearch").GetProperty("Password").GetString());
-        Assert.False(tunnel.GetProperty("Auth").GetProperty("PasswordLoginEnabled").GetBoolean());
-        Assert.Equal(string.Empty, tunnel.GetProperty("Auth").GetProperty("Password").GetString());
+        var auth = tunnel.GetProperty("Auth");
+        Assert.False(auth.GetProperty("PasswordLoginEnabled").GetBoolean());
+        Assert.False(auth.GetProperty("RegistrationEnabled").GetBoolean());
+        Assert.False(auth.GetProperty("TurnstileEnabled").GetBoolean());
+        Assert.False(auth.GetProperty("EmailVerificationEnabled").GetBoolean());
+        Assert.Equal(string.Empty, auth.GetProperty("Password").GetString());
+        Assert.Equal(string.Empty, auth.GetProperty("TurnstileSecretKey").GetString());
+        Assert.Equal(string.Empty, auth.GetProperty("SmtpPassword").GetString());
 
         var raw = File.ReadAllText(path);
         Assert.DoesNotContain("192.168.", raw, StringComparison.Ordinal);
@@ -35,6 +41,9 @@ public sealed class SecureDefaultConfigurationTests
         var options = new AuthOptions();
 
         Assert.False(options.PasswordLoginEnabled);
+        Assert.False(options.RegistrationEnabled);
+        Assert.False(options.TurnstileEnabled);
+        Assert.False(options.EmailVerificationEnabled);
         Assert.Equal(string.Empty, options.Password);
     }
 }

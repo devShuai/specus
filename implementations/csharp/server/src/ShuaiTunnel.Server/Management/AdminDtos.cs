@@ -1,6 +1,14 @@
 namespace ShuaiTunnel.Server.Management;
 
-public sealed record AdminLoginRequest(string? Username, string? Password);
+public sealed record AdminLoginRequest(string? Username, string? Password, string? TurnstileToken = null);
+
+public sealed record RegistrationRequest(
+    string? Username,
+    string? Email,
+    string? Password,
+    string? TurnstileToken);
+
+public sealed record RegistrationVerificationRequest(string? RegistrationId, string? Code);
 
 public sealed record ManagementUserView(
     string Username,

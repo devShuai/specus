@@ -71,11 +71,37 @@ public sealed class AuthOptions
     public const string SectionName = "Tunnel:Auth";
 
     public bool PasswordLoginEnabled { get; set; } = false;
+    public bool RegistrationEnabled { get; set; } = false;
     public string Username { get; set; } = "admin";
     public string Password { get; set; } = string.Empty;
     public string TenantId { get; set; } = "default";
     public string? JwtSecret { get; set; }
     public int TokenTtlSeconds { get; set; } = 8 * 60 * 60;
+
+    public bool TurnstileEnabled { get; set; } = false;
+    public string TurnstileSiteKey { get; set; } = string.Empty;
+    public string TurnstileSecretKey { get; set; } = string.Empty;
+    public string TurnstileVerifyUrl { get; set; } =
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+    public string TurnstileAllowedHostnames { get; set; } = string.Empty;
+
+    public bool EmailVerificationEnabled { get; set; } = false;
+    public string EmailFromAddress { get; set; } = string.Empty;
+    public string EmailFromName { get; set; } = "shuai-tunnel";
+    public string EmailSubject { get; set; } = "shuai-tunnel 注册验证码";
+    public long EmailCodeTtlSeconds { get; set; } = 600;
+    public int EmailMaxAttempts { get; set; } = 5;
+    public long EmailResendCooldownSeconds { get; set; } = 60;
+    public long EmailCleanupIntervalMs { get; set; } = 3_600_000;
+
+    public string SmtpHost { get; set; } = string.Empty;
+    public int SmtpPort { get; set; } = 587;
+    public string SmtpUsername { get; set; } = string.Empty;
+    public string SmtpPassword { get; set; } = string.Empty;
+    public bool SmtpAuth { get; set; } = true;
+    public bool SmtpStartTls { get; set; } = true;
+    public bool SmtpStartTlsRequired { get; set; } = true;
+    public bool SmtpSsl { get; set; } = false;
 }
 
 public sealed class ClientAuthOptions

@@ -60,6 +60,8 @@ Start from [`tunnel-server.env.example`](./tunnel-server.env.example). Its check
 password login, Peer Mesh, and object storage disabled and contain no usable credential. To enable
 local management login, generate a unique password and JWT secret first, write both into the
 root-owned `0640` environment file, and only then set `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED=true`.
+Self-service registration additionally requires Cloudflare Turnstile, verified-email settings,
+and SMTP. The C# server supports implicit TLS on port 465 and STARTTLS on port 587 through MailKit.
 
 | Variable | Example | Description |
 |----------|---------|-------------|
@@ -71,11 +73,15 @@ root-owned `0640` environment file, and only then set `TUNNEL_AUTH_PASSWORD_LOGI
 | `TUNNEL_CONNECTIONSTRINGS_TUNNEL` | `host=...` | Database connection string |
 | `TUNNEL_PEER_MESH_ENABLED` | `true` | Peer mesh toggle |
 | `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` | `false` | Enable or disable local password login; template default is safe-off |
+| `TUNNEL_AUTH_REGISTRATION_ENABLED` | `false` | Enable verified-email self-service registration after all dependencies are configured |
 | `TUNNEL_AUTH_USERNAME` | `admin` | Management UI local-login username |
 | `TUNNEL_AUTH_PASSWORD` | `change-me` | Management UI local-login plaintext password; protect the env file and change it before exposure |
 | `TUNNEL_AUTH_TENANT_ID` | `default` | Tenant id for the built-in administrator |
 | `TUNNEL_AUTH_JWT_SECRET` | long random value | Stable HS256 signing secret; if omitted, a random in-memory key invalidates tokens after every restart |
 | `TUNNEL_AUTH_TOKEN_TTL_SECONDS` | `28800` | Local management JWT lifetime |
+| `TUNNEL_AUTH_TURNSTILE_*` | disabled | Cloudflare site key, server secret, Siteverify URL, and exact hostname allowlist |
+| `TUNNEL_AUTH_EMAIL_*` | disabled | Verification sender, code TTL, attempt limit, resend cooldown, and cleanup interval |
+| `TUNNEL_AUTH_SMTP_*` | disabled | SMTP endpoint, credentials, authentication, STARTTLS, or implicit TLS settings |
 | `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | Default online-instance limit per client credential |
 | `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | Online-instance limit for the same machine fingerprint and OS user |
 | `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` | Client runtime token lifetime |

@@ -21,6 +21,11 @@ public static class AdminApiEndpoints
                 context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
                 await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
             }
+            catch (AuthenticationDependencyUnavailableException ex) when (IsAdminSurface(context.Request.Path))
+            {
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                await context.Response.WriteAsJsonAsync(new { error = ex.Message }).ConfigureAwait(false);
+            }
             catch (ArgumentException ex) when (IsAdminSurface(context.Request.Path))
             {
                 context.Response.StatusCode = StatusCodes.Status400BadRequest;
@@ -73,18 +78,61 @@ public static class AdminApiEndpoints
     public static void MapAdminApi(this WebApplication app)
     {
         app.MapPost("/auth/login", async (AdminLoginRequest? request, LocalTokenService tokens,
-            ManagementUserService users, CancellationToken cancellationToken) =>
+            ManagementUserService users, ITurnstileVerifier turnstile,
+            CancellationToken cancellationToken) =>
         {
-            var user = request is null
-                ? null
-                : await users.AuthenticateAsync(request.Username, request.Password, cancellationToken)
-                    .ConfigureAwait(false);
+            if (request is null)
+            {
+                return Results.Json(new { error = "用户名或密码错误" },
+                    statusCode: StatusCodes.Status401Unauthorized);
+            }
+            await turnstile.VerifyAsync(request.TurnstileToken, TurnstileVerifier.LoginAction,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var user = await users.AuthenticateAsync(request.Username, request.Password, cancellationToken)
+                .ConfigureAwait(false);
             if (user is null)
             {
                 return Results.Json(new { error = "用户名或密码错误" },
                     statusCode: StatusCodes.Status401Unauthorized);
             }
 
+            return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
+        });
+
+        app.MapPost("/auth/register", async (RegistrationRequest? request,
+            RegistrationService registration, ITurnstileVerifier turnstile,
+            CancellationToken cancellationToken) =>
+        {
+            if (!registration.Available)
+            {
+                return Results.Json(new { error = "当前未开放注册" },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+            if (request is null)
+            {
+                return Results.BadRequest(new { error = "请求体无效" });
+            }
+            await turnstile.VerifyAsync(request.TurnstileToken, TurnstileVerifier.RegisterAction,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var challenge = await registration.RequestAsync(request.Username, request.Email,
+                    request.Password, cancellationToken)
+                .ConfigureAwait(false);
+            return Results.Json(challenge, statusCode: StatusCodes.Status202Accepted);
+        });
+
+        app.MapPost("/auth/register/verify", async (RegistrationVerificationRequest? request,
+            RegistrationService registration, LocalTokenService tokens,
+            CancellationToken cancellationToken) =>
+        {
+            if (request is null)
+            {
+                return Results.BadRequest(new { error = "请求体无效" });
+            }
+            var user = await registration.VerifyAsync(request.RegistrationId, request.Code,
+                    cancellationToken)
+                .ConfigureAwait(false);
             return Results.Ok(tokens.IssueTokenBody(user.Username, user.TenantId, user.Role));
         });
 
@@ -102,9 +150,11 @@ public static class AdminApiEndpoints
             return Results.Ok(tokens.IssueTokenBody(principal.Username, principal.TenantId, principal.Role));
         });
 
-        app.MapGet("/oidc-config", (IOptions<OidcOptions> options, LocalTokenService tokens) =>
+        app.MapGet("/oidc-config", (IOptions<OidcOptions> options, LocalTokenService tokens,
+            RegistrationService registration, ITurnstileVerifier turnstile) =>
         {
             var oidc = options.Value;
+            var turnstileAvailable = turnstile.Enabled && turnstile.Configured;
             return Results.Ok(new
             {
                 configured = !string.IsNullOrWhiteSpace(oidc.ClientId),
@@ -114,6 +164,10 @@ public static class AdminApiEndpoints
                 redirectUri = oidc.RedirectUri,
                 scope = oidc.Scope,
                 passwordLoginEnabled = tokens.IsPasswordLoginEnabled,
+                registrationEnabled = registration.Available,
+                emailVerificationRequired = registration.Available,
+                turnstileEnabled = turnstileAvailable,
+                turnstileSiteKey = turnstileAvailable ? turnstile.SiteKey : string.Empty,
             });
         });
 
@@ -525,5 +579,6 @@ public static class AdminApiEndpoints
         || path.StartsWithSegments("/api/public/transfer/downloads",
             StringComparison.OrdinalIgnoreCase)
         || path.Equals("/api/public/transfer/oss-callback", StringComparison.OrdinalIgnoreCase)
-        || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase);
+        || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/auth/register", StringComparison.OrdinalIgnoreCase);
 }

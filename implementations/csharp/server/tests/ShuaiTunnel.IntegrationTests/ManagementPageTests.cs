@@ -34,7 +34,9 @@ public sealed class ManagementPageTests : IAsyncLifetime
         var html = await index.Content.ReadAsStringAsync();
         Assert.Contains("自托管内网穿透控制面", html);
         Assert.Equal("nosniff", index.Headers.GetValues("X-Content-Type-Options").Single());
-        Assert.Contains("script-src 'self'", index.Headers.GetValues("Content-Security-Policy").Single());
+        var contentSecurityPolicy = index.Headers.GetValues("Content-Security-Policy").Single();
+        Assert.Contains("script-src 'self' https://challenges.cloudflare.com", contentSecurityPolicy);
+        Assert.Contains("frame-src 'self' https://challenges.cloudflare.com", contentSecurityPolicy);
 
         // The React build references hashed bundles under /assets/; fetch the JS bundle.
         var match = System.Text.RegularExpressions.Regex.Match(html, "/assets/[^\"']+\\.js");

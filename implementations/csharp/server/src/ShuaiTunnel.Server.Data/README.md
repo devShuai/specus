@@ -56,6 +56,9 @@ SQLite、PostgreSQL、MySQL 都有对应的 `AddClientMessagingAndTransfer` migr
 计费表，用于执行每账号 1 GiB 存储与 1 GiB/月下载流量额度；用量在一次性 grant 首次消费时写入。
 `AddSingleUseDownloadGrant` 增加 `transfer_attachment_download_grant`，只持久化随机下载授权的 SHA-256，
 并通过原子消费字段保证同一业务下载链接最多换取一次短期 OSS V4 地址。
+`AddManagementRegistration` 增加 `tunnel_management_user_email` 与
+`tunnel_management_registration_challenge`，用于邮箱唯一绑定和短期注册验证；验证码只保存由本地 JWT
+密钥派生的 HMAC-SHA256 摘要。SQLite、PostgreSQL、MySQL 三套迁移和快照保持同步。
 Peer Mesh ACL 的 `direction` 由三套 `AddPeerMeshAclDirection` migration 补齐，缺省 `OUTBOUND`；启动兼容 SQL
 也会为旧库幂等补列并回填空值，保证正向/反向 ACL 判定可直接使用。
 

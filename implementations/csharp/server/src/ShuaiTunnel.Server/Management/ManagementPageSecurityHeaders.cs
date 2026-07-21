@@ -10,10 +10,11 @@ public static class ManagementPageSecurityHeaders
 {
     private const string ContentSecurityPolicy =
         "default-src 'self'; "
-        + "script-src 'self'; "
+        + "script-src 'self' https://challenges.cloudflare.com; "
         + "style-src 'self' 'unsafe-inline'; "
         + "img-src 'self' data:; "
         + "font-src 'self' data:; "
+        + "frame-src 'self' https://challenges.cloudflare.com; "
         + "connect-src 'self' ws: wss:; "
         + "form-action 'self'; "
         + "frame-ancestors 'none'; "

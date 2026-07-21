@@ -788,6 +788,81 @@ namespace ShuaiTunnel.Server.Data.Migrations
                     b.ToTable("tunnel_http_traffic_exchange", (string)null);
                 });
 
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ManagementRegistrationChallenge", b =>
+                {
+                    b.Property<string>("RegistrationId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("registration_id");
+
+                    b.Property<int>("AttemptsRemaining")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("attempts_remaining");
+
+                    b.Property<string>("CodeHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("code_hash");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(254)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("email");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("expires_at");
+
+                    b.Property<string>("PasswordHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("password_hash");
+
+                    b.Property<string>("ResendAvailableAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("resend_available_at");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("Username")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("username");
+
+                    b.HasKey("RegistrationId");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("uq_registration_challenge_email");
+
+                    b.HasIndex("ExpiresAt")
+                        .HasDatabaseName("idx_registration_challenge_expiry");
+
+                    b.HasIndex("Username")
+                        .IsUnique()
+                        .HasDatabaseName("uq_registration_challenge_username");
+
+                    b.ToTable("tunnel_management_registration_challenge", (string)null);
+                });
+
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ManagementUser", b =>
                 {
                     b.Property<string>("Username")
@@ -838,6 +913,49 @@ namespace ShuaiTunnel.Server.Data.Migrations
                         .HasDatabaseName("idx_management_user_tenant");
 
                     b.ToTable("tunnel_management_user", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ManagementUserEmail", b =>
+                {
+                    b.Property<string>("Username")
+                        .HasMaxLength(80)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("username");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(254)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("email");
+
+                    b.Property<string>("UpdatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("VerifiedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("verified_at");
+
+                    b.HasKey("Username");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("uq_management_user_email");
+
+                    b.HasIndex("VerifiedAt")
+                        .HasDatabaseName("idx_management_user_email_verified");
+
+                    b.ToTable("tunnel_management_user_email", (string)null);
                 });
 
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.PeerMeshAcl", b =>

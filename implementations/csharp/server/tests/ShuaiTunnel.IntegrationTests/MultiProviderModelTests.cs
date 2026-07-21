@@ -18,6 +18,8 @@ public sealed class MultiProviderModelTests
         "tunnel_mapping",
         "http_route_mapping",
         "client_download_link",
+        "tunnel_management_user_email",
+        "tunnel_management_registration_challenge",
         "peer_mesh_acl",
         "tunnel_traffic_usage",
         "tunnel_connection_stat",

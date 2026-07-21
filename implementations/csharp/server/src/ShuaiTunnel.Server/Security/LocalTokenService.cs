@@ -73,6 +73,12 @@ public sealed class LocalTokenService
         return $"{signingInput}.{signature}";
     }
 
+    public string RegistrationCodeHash(string registrationId, string code)
+    {
+        var input = Encoding.UTF8.GetBytes($"{registrationId}:{code}");
+        return Convert.ToHexString(HMACSHA256.HashData(_key, input)).ToLowerInvariant();
+    }
+
     public ClaimsPrincipal? Validate(string? token)
     {
         if (string.IsNullOrWhiteSpace(token))
