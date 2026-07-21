@@ -1,11 +1,12 @@
 package com.theshuai.tunnelserver.management.controller;
 
-import com.theshuai.tunnelserver.config.AuthProperties;
 import com.theshuai.tunnelserver.management.model.ManagementRole;
 import com.theshuai.tunnelserver.management.service.ManagementUserService;
 import com.theshuai.tunnelserver.management.service.ManagementUserService.LoginUser;
+import com.theshuai.tunnelserver.management.service.RegistrationService;
 import com.theshuai.tunnelserver.management.tenant.TenantResolver;
 import com.theshuai.tunnelserver.security.LocalTokenService;
+import com.theshuai.tunnelserver.security.TurnstileVerifier;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -25,14 +26,17 @@ import java.util.Map;
 public class AuthController {
     private final LocalTokenService localTokenService;
     private final ManagementUserService managementUserService;
-    private final AuthProperties authProperties;
+    private final RegistrationService registrationService;
+    private final TurnstileVerifier turnstileVerifier;
 
     public AuthController(LocalTokenService localTokenService,
                           ManagementUserService managementUserService,
-                          AuthProperties authProperties) {
+                          RegistrationService registrationService,
+                          TurnstileVerifier turnstileVerifier) {
         this.localTokenService = localTokenService;
         this.managementUserService = managementUserService;
-        this.authProperties = authProperties;
+        this.registrationService = registrationService;
+        this.turnstileVerifier = turnstileVerifier;
     }
 
     @PostMapping("/auth/login")
@@ -40,6 +44,7 @@ public class AuthController {
         if (request == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "用户名或密码错误"));
         }
+        turnstileVerifier.verify(request.turnstileToken(), TurnstileVerifier.LOGIN_ACTION);
         return managementUserService.authenticate(request.username(), request.password())
                 .<ResponseEntity<?>>map(user -> ResponseEntity.ok(buildTokenBody(user)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED)
@@ -47,18 +52,28 @@ public class AuthController {
     }
 
     /**
-     * 自助注册：创建默认租户的 USER 账号并直接签发 token 完成登录。
-     * 需要 {@code tunnel.auth.registration-enabled} 且密码登录开启。
+     * 自助注册第一阶段：通过 Turnstile 后发送邮箱验证码，账号尚未创建。
      */
     @PostMapping("/auth/register")
-    public ResponseEntity<?> register(@RequestBody(required = false) LoginRequest request) {
-        if (!authProperties.isRegistrationEnabled() || !localTokenService.isPasswordLoginEnabled()) {
+    public ResponseEntity<?> register(@RequestBody(required = false) RegistrationRequest request) {
+        if (!registrationService.isAvailable()) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "当前未开放注册"));
         }
         if (request == null) {
             return ResponseEntity.badRequest().body(Map.of("error", "请求体无效"));
         }
-        LoginUser user = managementUserService.registerUser(request.username(), request.password());
+        turnstileVerifier.verify(request.turnstileToken(), TurnstileVerifier.REGISTER_ACTION);
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(
+                registrationService.requestRegistration(request.username(), request.email(), request.password()));
+    }
+
+    /** 自助注册第二阶段：校验邮件验证码，原子创建账号并签发登录 token。 */
+    @PostMapping("/auth/register/verify")
+    public ResponseEntity<?> verifyRegistration(@RequestBody(required = false) RegistrationVerificationRequest request) {
+        if (request == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "请求体无效"));
+        }
+        LoginUser user = registrationService.verifyRegistration(request.registrationId(), request.code());
         return ResponseEntity.ok(buildTokenBody(user));
     }
 
@@ -88,7 +103,13 @@ public class AuthController {
         return body;
     }
 
-    public record LoginRequest(String username, String password) {
+    public record LoginRequest(String username, String password, String turnstileToken) {
+    }
+
+    public record RegistrationRequest(String username, String email, String password, String turnstileToken) {
+    }
+
+    public record RegistrationVerificationRequest(String registrationId, String code) {
     }
 
     private static String claimAsString(Jwt jwt, String claimName) {

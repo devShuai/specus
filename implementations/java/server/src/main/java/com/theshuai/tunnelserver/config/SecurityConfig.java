@@ -94,12 +94,12 @@ public class SecurityConfig {
                 .headers(headers -> headers
                         .contentSecurityPolicy(csp -> csp.policyDirectives(
                                 "default-src 'self'; "
-                                + "script-src 'self' https://www.googletagmanager.com 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
+                                + "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
                                 + "style-src 'self' 'unsafe-inline'; "
                                 + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; "
                                 + "media-src 'self' blob: data:" + ossSuffix + "; "
                                 + "object-src 'self' blob:; "
-                                + "frame-src 'self' blob:; "
+                                + "frame-src 'self' blob: https://challenges.cloudflare.com; "
                                 + "font-src 'self' data:; "
                                 + "connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; "
                                 + "form-action 'self'; "

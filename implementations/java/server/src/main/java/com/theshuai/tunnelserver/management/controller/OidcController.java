@@ -2,9 +2,10 @@ package com.theshuai.tunnelserver.management.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.util.JsonUtil;
-import com.theshuai.tunnelserver.config.AuthProperties;
 import com.theshuai.tunnelserver.config.OidcProperties;
+import com.theshuai.tunnelserver.management.service.RegistrationService;
 import com.theshuai.tunnelserver.security.LocalTokenService;
+import com.theshuai.tunnelserver.security.TurnstileVerifier;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -39,16 +40,19 @@ import java.util.Map;
 public class OidcController {
     private final OidcProperties properties;
     private final LocalTokenService localTokenService;
-    private final AuthProperties authProperties;
+    private final RegistrationService registrationService;
+    private final TurnstileVerifier turnstileVerifier;
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
     public OidcController(OidcProperties properties, LocalTokenService localTokenService,
-                          AuthProperties authProperties) {
+                          RegistrationService registrationService,
+                          TurnstileVerifier turnstileVerifier) {
         this.properties = properties;
         this.localTokenService = localTokenService;
-        this.authProperties = authProperties;
+        this.registrationService = registrationService;
+        this.turnstileVerifier = turnstileVerifier;
     }
 
     @GetMapping("/oidc-config")
@@ -61,8 +65,11 @@ public class OidcController {
         config.put("redirectUri", properties.getRedirectUri());
         config.put("scope", properties.getScope());
         config.put("passwordLoginEnabled", localTokenService.isPasswordLoginEnabled());
-        config.put("registrationEnabled",
-                authProperties.isRegistrationEnabled() && localTokenService.isPasswordLoginEnabled());
+        config.put("registrationEnabled", registrationService.isAvailable());
+        config.put("emailVerificationRequired", registrationService.isAvailable());
+        boolean turnstileAvailable = turnstileVerifier.isEnabled() && turnstileVerifier.isConfigured();
+        config.put("turnstileEnabled", turnstileAvailable);
+        config.put("turnstileSiteKey", turnstileAvailable ? turnstileVerifier.getSiteKey() : "");
         return config;
     }
 

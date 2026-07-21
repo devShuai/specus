@@ -98,14 +98,14 @@ openssl rand -base64 48
 
 ```env
 TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED=true
-TUNNEL_AUTH_REGISTRATION_ENABLED=true
+TUNNEL_AUTH_REGISTRATION_ENABLED=false
 TUNNEL_AUTH_USERNAME=admin
 TUNNEL_AUTH_PASSWORD=YourStrongAdminPassword
 TUNNEL_AUTH_JWT_SECRET=粘贴上一步生成的随机值
 TUNNEL_AUTH_TENANT_ID=default
 ```
 
-`TUNNEL_AUTH_REGISTRATION_ENABLED=true` 允许访客注册默认租户的普通用户账号；仅管理员创建账号时应设为 `false`。
+注册采用“Cloudflare Turnstile + 邮箱验证码”两阶段流程。先在 Turnstile 控制台创建 widget 的 site key/secret 并限制允许的 hostname，再准备 SMTP 账号；然后配置模板中的 `TUNNEL_AUTH_TURNSTILE_*`、`TUNNEL_AUTH_EMAIL_*`、`TUNNEL_AUTH_SMTP_*`，最后把 `TUNNEL_AUTH_REGISTRATION_ENABLED`、`TUNNEL_AUTH_TURNSTILE_ENABLED`、`TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED` 同时设为 `true`。缺少任一密钥、hostname 白名单或 SMTP 参数时，服务端不会开放注册入口。
 
 ### 4.3 客户端在线限制（可选）
 

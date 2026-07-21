@@ -36,6 +36,19 @@ spring:
     elasticsearch:
       repositories:
         enabled: false
+  mail:
+    host: ${TUNNEL_AUTH_SMTP_HOST:}
+    port: ${TUNNEL_AUTH_SMTP_PORT:587}
+    username: ${TUNNEL_AUTH_SMTP_USERNAME:}
+    password: ${TUNNEL_AUTH_SMTP_PASSWORD:}
+    properties:
+      mail.smtp.auth: ${TUNNEL_AUTH_SMTP_AUTH:true}
+      mail.smtp.starttls.enable: ${TUNNEL_AUTH_SMTP_STARTTLS:true}
+      mail.smtp.starttls.required: ${TUNNEL_AUTH_SMTP_STARTTLS_REQUIRED:true}
+      mail.smtp.ssl.enable: ${TUNNEL_AUTH_SMTP_SSL:false}
+      mail.smtp.connectiontimeout: ${TUNNEL_AUTH_SMTP_CONNECT_TIMEOUT_MS:5000}
+      mail.smtp.timeout: ${TUNNEL_AUTH_SMTP_READ_TIMEOUT_MS:10000}
+      mail.smtp.writetimeout: ${TUNNEL_AUTH_SMTP_WRITE_TIMEOUT_MS:10000}
 
 tunnel:
   database:
@@ -131,6 +144,23 @@ tunnel:
     tenant-id: ${TUNNEL_AUTH_TENANT_ID:default}
     jwt-secret: ${TUNNEL_AUTH_JWT_SECRET:}
     token-ttl-seconds: ${TUNNEL_AUTH_TOKEN_TTL_SECONDS:28800}
+    turnstile:
+      # Cloudflare Turnstile. The service validates success, action and hostname server-side.
+      enabled: ${TUNNEL_AUTH_TURNSTILE_ENABLED:false}
+      site-key: ${TUNNEL_AUTH_TURNSTILE_SITE_KEY:}
+      secret-key: ${TUNNEL_AUTH_TURNSTILE_SECRET_KEY:}
+      verify-url: ${TUNNEL_AUTH_TURNSTILE_VERIFY_URL:https://challenges.cloudflare.com/turnstile/v0/siteverify}
+      allowed-hostnames: ${TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES:}
+    email-verification:
+      # Self-registration is advertised only when this switch, SMTP and from-address are ready.
+      enabled: ${TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED:false}
+      from-address: ${TUNNEL_AUTH_EMAIL_FROM_ADDRESS:}
+      from-name: ${TUNNEL_AUTH_EMAIL_FROM_NAME:shuai-tunnel}
+      subject: ${TUNNEL_AUTH_EMAIL_SUBJECT:shuai-tunnel 注册验证码}
+      code-ttl-seconds: ${TUNNEL_AUTH_EMAIL_CODE_TTL_SECONDS:600}
+      max-attempts: ${TUNNEL_AUTH_EMAIL_MAX_ATTEMPTS:5}
+      resend-cooldown-seconds: ${TUNNEL_AUTH_EMAIL_RESEND_COOLDOWN_SECONDS:60}
+      cleanup-interval-ms: ${TUNNEL_AUTH_EMAIL_CLEANUP_INTERVAL_MS:3600000}
   oidc:
     # The management UI logs in via OIDC (Authorization Code + PKCE) and the admin API validates
     # the resulting JWT. Defaults target the project gateway; set client-id (and register the

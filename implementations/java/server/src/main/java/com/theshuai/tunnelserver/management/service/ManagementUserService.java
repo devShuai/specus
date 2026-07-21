@@ -104,31 +104,33 @@ public class ManagementUserService {
                 .toList();
     }
 
-    /**
-     * 自助注册：无需管理员，注册到默认租户并固定为 USER 角色。开关校验由调用方（AuthController）负责。
-     */
-    @Transactional
-    public LoginUser registerUser(String rawUsername, String rawPassword) {
+    LoginUser registerVerifiedUser(String rawUsername, String passwordHash) {
         String username = normalizeUsername(rawUsername);
-        if (username.equalsIgnoreCase(authProperties.getUsername())) {
+        if (isReservedUsername(username)) {
             throw new IllegalArgumentException("该用户名不可用");
         }
         if (repository.existsByUsernameIgnoreCase(username)) {
             throw new IllegalArgumentException("用户名已存在: " + username);
         }
-        String password = requirePassword(rawPassword);
+        if (!StringUtils.hasText(passwordHash) || !passwordHash.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("密码摘要无效");
+        }
         String tenantId = TenantContext.normalize(authProperties.getTenantId());
         String now = Instant.now().toString();
         ManagementUser user = new ManagementUser();
         user.setUsername(username);
         user.setTenantId(tenantId);
-        user.setPasswordHash(PasswordService.hash(password));
+        user.setPasswordHash(passwordHash);
         user.setRole(ManagementRole.USER);
         user.setEnabled(true);
         user.setCreatedAt(now);
         user.setUpdatedAt(now);
         ManagementUser saved = repository.save(user);
         return new LoginUser(saved.getUsername(), saved.getTenantId(), saved.getRole(), false);
+    }
+
+    boolean isReservedUsername(String username) {
+        return StringUtils.hasText(username) && username.trim().equalsIgnoreCase(authProperties.getUsername());
     }
 
     @Transactional
@@ -211,7 +213,7 @@ public class ManagementUserService {
                 user.getUpdatedAt());
     }
 
-    private String normalizeUsername(String username) {
+    String normalizeUsername(String username) {
         if (!StringUtils.hasText(username)) {
             throw new IllegalArgumentException("username cannot be blank");
         }
@@ -222,7 +224,7 @@ public class ManagementUserService {
         return normalized;
     }
 
-    private String requirePassword(String password) {
+    String requirePassword(String password) {
         if (!StringUtils.hasText(password)) {
             throw new IllegalArgumentException("password cannot be blank");
         }
