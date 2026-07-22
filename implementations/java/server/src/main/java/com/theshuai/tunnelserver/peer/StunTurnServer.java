@@ -51,6 +51,10 @@ public class StunTurnServer implements ApplicationRunner {
     private final TurnCredentialService turnCredentialService;
     private final Counter relayQueueDropped;
     private final Counter relaySendFailed;
+    private final Counter generalRelayQuotaRejected;
+    private final Counter generalRelayForbiddenDestination;
+    private final Counter generalRelayBytes;
+    private final Counter generalRelayRateLimited;
     private final AtomicInteger relayQueueHighWater = new AtomicInteger();
     private final Map<String, Allocation> allocations = new ConcurrentHashMap<>();
     private final Map<String, String> allocationByEndpoint = new ConcurrentHashMap<>();
@@ -76,6 +80,18 @@ public class StunTurnServer implements ApplicationRunner {
                 .register(meterRegistry);
         this.relaySendFailed = Counter.builder("tunnel.peer_mesh.turn.relay.send.failures")
                 .description("TURN relay datagrams that failed during send")
+                .register(meterRegistry);
+        this.generalRelayQuotaRejected = Counter.builder("tunnel.peer_mesh.turn.general_relay.quota.rejected")
+                .description("General TURN relay allocations rejected by quota")
+                .register(meterRegistry);
+        this.generalRelayForbiddenDestination = Counter.builder("tunnel.peer_mesh.turn.general_relay.destination.forbidden")
+                .description("General TURN relay permissions rejected by the destination policy")
+                .register(meterRegistry);
+        this.generalRelayBytes = Counter.builder("tunnel.peer_mesh.turn.general_relay.bytes")
+                .description("Bytes relayed on behalf of general TURN allocations")
+                .register(meterRegistry);
+        this.generalRelayRateLimited = Counter.builder("tunnel.peer_mesh.turn.general_relay.rate.limited")
+                .description("General TURN relay datagrams dropped by rate or byte quota")
                 .register(meterRegistry);
         Gauge.builder("tunnel.peer_mesh.turn.relay.queue.depth", this, StunTurnServer::relayQueueDepth)
                 .description("Current TURN relay worker queue depth")
@@ -266,9 +282,26 @@ public class StunTurnServer implements ApplicationRunner {
                 ? allocations.get(allocationByEndpoint.get(endpointKey))
                 : null;
         if (allocation == null || allocation.isExpired(Instant.now())
-                || !allocation.matchesClient(auth.clientId())) {
+                || !allocation.matchesClient(auth.clientId())
+                || allocation.generalRelay != auth.generalRelay()) {
+            if (auth.generalRelay()) {
+                String rejection = generalRelayQuotaRejection(remote, allocation);
+                if (rejection != null) {
+                    generalRelayQuotaRejected.increment();
+                    // 审计：通用中继由公开 ICE 配置驱动，配额拒绝必须可追溯
+                    log.warn("[peer-mesh][audit] general TURN allocation rejected: client={}, reason={}",
+                            remote, rejection);
+                    sendError(primarySocket, remote, request,
+                            StunMessage.ALLOCATE_ERROR, 486, rejection);
+                    return;
+                }
+            }
             closeAllocation(allocation);
-            allocation = createAllocation(remote, auth.clientId());
+            allocation = createAllocation(remote, auth.clientId(), auth.generalRelay());
+            if (auth.generalRelay()) {
+                log.info("[peer-mesh][audit] general TURN allocation created: client={}, relay={}, active={}",
+                        remote, allocation.relayAddress, countGeneralRelayAllocations(null));
+            }
         } else {
             allocation.expiresAt = Instant.now().plusSeconds(properties.getAllocationTtlSeconds());
         }
@@ -283,7 +316,68 @@ public class StunTurnServer implements ApplicationRunner {
         sendStun(primarySocket, remote, response, auth.messageIntegrityKey());
     }
 
-    private Allocation createAllocation(InetSocketAddress remote, long clientId) throws Exception {
+    /**
+     * 通用中继 allocation 的准入配额。返回非 null 表示拒绝原因。
+     *
+     * <p>{@code current} 是同一来源端点上待替换的旧 allocation，计数时需要排除它，
+     * 否则同一客户端的正常重建会被自己占用的名额挡住。
+     */
+    private String generalRelayQuotaRejection(InetSocketAddress remote, Allocation current) {
+        int maxTotal = properties.getGeneralRelayMaxAllocations();
+        if (maxTotal <= 0) {
+            return "general-relay-disabled";
+        }
+        if (countGeneralRelayAllocations(current) >= maxTotal) {
+            return "general-relay-allocation-quota";
+        }
+        int maxPerAddress = properties.getGeneralRelayMaxAllocationsPerAddress();
+        if (maxPerAddress > 0 && remote != null && remote.getAddress() != null) {
+            long sameAddress = allocations.values().stream()
+                    .filter(item -> item.generalRelay && item != current && !item.closed)
+                    .filter(item -> item.clientRemote != null
+                            && item.clientRemote.getAddress() != null
+                            && item.clientRemote.getAddress().equals(remote.getAddress()))
+                    .count();
+            if (sameAddress >= maxPerAddress) {
+                return "general-relay-address-quota";
+            }
+        }
+        return null;
+    }
+
+    private long countGeneralRelayAllocations(Allocation exclude) {
+        return allocations.values().stream()
+                .filter(item -> item.generalRelay && item != exclude && !item.closed)
+                .count();
+    }
+
+    /**
+     * 通用中继的转发配额：令牌桶限速 + 生命周期总字节上限。
+     * Peer Mesh 专用 allocation 不受此约束（其目的地址与身份已被严格限定）。
+     */
+    private boolean allowGeneralRelayTraffic(Allocation allocation, int bytes) {
+        if (allocation == null || !allocation.generalRelay) {
+            return true;
+        }
+        long maxBytes = properties.getGeneralRelayMaxBytes();
+        long total = allocation.relayedBytes.addAndGet(bytes);
+        if (maxBytes > 0 && total > maxBytes) {
+            generalRelayRateLimited.increment();
+            if (allocation.quotaLogged.compareAndSet(false, true)) {
+                log.warn("[peer-mesh][audit] general TURN byte quota exhausted: client={}, bytes={}",
+                        allocation.clientRemote, total);
+            }
+            return false;
+        }
+        if (!allocation.rateLimiter.tryConsume(bytes, properties.getGeneralRelayRateBytesPerSecond())) {
+            generalRelayRateLimited.increment();
+            return false;
+        }
+        generalRelayBytes.increment(bytes);
+        return true;
+    }
+
+    private Allocation createAllocation(InetSocketAddress remote, long clientId, boolean generalRelay) throws Exception {
         DatagramSocket relaySocket = bindRelaySocket();
         Allocation allocation = new Allocation(
                 UUID.randomUUID().toString(),
@@ -291,7 +385,8 @@ public class StunTurnServer implements ApplicationRunner {
                 relaySocket,
                 advertisedSocketAddress(relaySocket),
                 Instant.now().plusSeconds(properties.getAllocationTtlSeconds()),
-                clientId
+                clientId,
+                generalRelay
         );
         allocations.put(allocation.id, allocation);
         allocationByEndpoint.put(endpointKey(remote), allocation.id);
@@ -374,9 +469,24 @@ public class StunTurnServer implements ApplicationRunner {
         }
         Instant expiresAt = Instant.now().plusSeconds(PERMISSION_TTL_SECONDS);
         for (StunMessage.Attribute attribute : request.all(StunMessage.ATTR_XOR_PEER_ADDRESS)) {
-            new StunMessage(request.type(), request.transactionId(), java.util.List.of(attribute))
+            InetSocketAddress address = new StunMessage(
+                    request.type(), request.transactionId(), java.util.List.of(attribute))
                     .xorPeerAddress()
-                    .ifPresent(address -> allocation.permissions.put(permissionKey(address), expiresAt));
+                    .orElse(null);
+            if (address == null) {
+                continue;
+            }
+            if (auth.generalRelay() && !isRelayableDestination(address)) {
+                generalRelayForbiddenDestination.increment();
+                log.warn("[peer-mesh][audit] general TURN permission refused: client={}, peer={}",
+                        remote, address);
+                // 通用 TURN 模式下目的地址由客户端指定，必须拒绝内网/回环/组播等目标，
+                // 否则中继会变成打向服务端内网的跳板。
+                sendError(primarySocket, remote, request,
+                        StunMessage.CREATE_PERMISSION_ERROR, 403, "forbidden-peer-address");
+                return;
+            }
+            allocation.permissions.put(permissionKey(address), expiresAt);
         }
         StunMessage response = StunMessage.of(
                 StunMessage.CREATE_PERMISSION_SUCCESS,
@@ -384,6 +494,40 @@ public class StunTurnServer implements ApplicationRunner {
                 StunMessage.software(SOFTWARE)
         );
         sendStun(primarySocket, remote, response, auth.messageIntegrityKey());
+    }
+
+    /**
+     * 中继目的地址白名单策略：只允许公网单播地址。
+     *
+     * <p>只对通用 TURN 模式（公开互传）生效：其目的地址完全由浏览器指定，若不加限制，
+     * 任何拿到公开 ICE 配置的人都能把中继当作打向服务端内网的跳板。Peer Mesh 专用模式的
+     * 目的地址必然是本服务端的另一个 relay 端点，且本地/私网部署会用到回环与站点本地地址，
+     * 因此不施加该策略。
+     */
+    boolean isRelayableDestination(InetSocketAddress address) {
+        if (address == null || address.getAddress() == null || address.getPort() <= 0) {
+            return false;
+        }
+        InetAddress host = address.getAddress();
+        if (host.isAnyLocalAddress()
+                || host.isLoopbackAddress()
+                || host.isLinkLocalAddress()
+                || host.isSiteLocalAddress()
+                || host.isMulticastAddress()) {
+            return false;
+        }
+        // 100.64.0.0/10（CGNAT，Peer Mesh 虚拟网段也落在其中）与 IPv6 ULA 同样禁止
+        byte[] raw = host.getAddress();
+        if (raw.length == 4) {
+            int first = raw[0] & 0xFF;
+            int second = raw[1] & 0xFF;
+            if (first == 100 && second >= 64 && second <= 127) {
+                return false;
+            }
+        } else if (raw.length == 16 && (raw[0] & 0xFE) == 0xFC) {
+            return false;
+        }
+        return true;
     }
 
     private void channelBind(StunMessage request, DatagramPacket packet, InetSocketAddress remote) throws Exception {
@@ -400,6 +544,14 @@ public class StunTurnServer implements ApplicationRunner {
         }
         if (channelNumber < TurnChannelData.MIN_CHANNEL || peer == null) {
             sendError(primarySocket, remote, request, StunMessage.CHANNEL_BIND_ERROR, 400, "bad-channel-bind");
+            return;
+        }
+        if (auth.generalRelay() && !isRelayableDestination(peer)) {
+            generalRelayForbiddenDestination.increment();
+            log.warn("[peer-mesh][audit] general TURN channel bind refused: client={}, peer={}",
+                    remote, peer);
+            // ChannelBind 同样会隐式创建 permission，必须执行与 CreatePermission 一致的目的地址策略
+            sendError(primarySocket, remote, request, StunMessage.CHANNEL_BIND_ERROR, 403, "forbidden-peer-address");
             return;
         }
         Instant now = Instant.now();
@@ -443,6 +595,9 @@ public class StunTurnServer implements ApplicationRunner {
 		if (!authorizeRelayPayload(payload, allocation, target, true)) {
             return;
         }
+        if (!allowGeneralRelayTraffic(allocation, payload.length)) {
+            return;
+        }
         submitRelayTask(() -> {
             try {
                 allocation.relaySocket.send(new DatagramPacket(payload, payload.length, binding.peer()));
@@ -484,7 +639,10 @@ public class StunTurnServer implements ApplicationRunner {
             sendTurnAuthError(remote, request, responseType, 401, "bad-message-integrity");
             return TurnAuth.denied();
         }
-        return TurnAuth.allowed(key, turnCredentialService.peerMeshClientId(username));
+        return TurnAuth.allowed(
+                key,
+                turnCredentialService.peerMeshClientId(username),
+                turnCredentialService.isGeneralRelaySubject(username));
     }
 
     private void sendTurnAuthError(InetSocketAddress remote,
@@ -517,6 +675,9 @@ public class StunTurnServer implements ApplicationRunner {
 		if (!authorizeRelayPayload(payload, allocation, target, true)) {
             return;
         }
+        if (!allowGeneralRelayTraffic(allocation, payload.length)) {
+            return;
+        }
         submitRelayTask(() -> {
             try {
                 allocation.relaySocket.send(new DatagramPacket(payload, payload.length, peer));
@@ -531,16 +692,33 @@ public class StunTurnServer implements ApplicationRunner {
                                         Allocation source,
                                         Allocation target,
                                         boolean account) {
-        if (source == null || target == null || source.clientId <= 0 || target.clientId <= 0) {
+        // 通用 TURN 模式（公开互传的浏览器 WebRTC）：转发的是 DTLS/SRTP/SCTP 与 STUN 连通性
+        // 检查，既不是 SPM2 帧也不是本项目的 probe JSON，无法走 Peer Mesh 专用校验。
+        // 这类 allocation 按标准 TURN 语义放行——身份在 Allocate 阶段、目的地址在
+        // CreatePermission/ChannelBind 阶段都已校验，调用方也已确认 permission。
+        // 出站时本端是 source，入站时本端是 target，任一侧标记为通用中继即放行。
+        if ((source != null && source.generalRelay) || (target != null && target.generalRelay)) {
+            return true;
+        }
+        if (source == null || target == null) {
             return false;
         }
+        // TURN 认证关闭时 allocation 上没有 clientId（凭证里本就没有身份），此时按 0 传下去，
+        // 由 PeerMeshService 退化为"仅校验 session 存在且未关闭"。若这里坚持要求 clientId>0，
+        // 关闭认证会让全部中继载荷（连探针也包括）被拒，中继完全不可用。
+        boolean identified = turnCredentialService.authRequired();
+        if (identified && (source.clientId <= 0 || target.clientId <= 0)) {
+            return false;
+        }
+        long sourceClientId = identified ? source.clientId : 0L;
+        long targetClientId = identified ? target.clientId : 0L;
         PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
         if (header != null) {
 			return account
 					? peerMeshService.authorizeRelayFrameForRelay(
-                            header, source.clientId, target.clientId, payload.length)
+                            header, sourceClientId, targetClientId, payload.length)
 					: peerMeshService.validateRelayFrameForRelay(
-                            header, source.clientId, target.clientId);
+                            header, sourceClientId, targetClientId);
         }
         if (payload == null
                 || payload.length < 16
@@ -553,9 +731,10 @@ public class StunTurnServer implements ApplicationRunner {
         return probe != null
                 && PeerUdpProbe.MAGIC.equals(probe.getMagic())
                 && probe.getFromClientId() != null
-                && probe.getFromClientId() == source.clientId
                 && probe.getToClientId() != null
-                && probe.getToClientId() == target.clientId
+                && (!identified
+                        || (probe.getFromClientId() == sourceClientId
+                                && probe.getToClientId() == targetClientId))
                 && peerMeshService.authorizeRelayProbeForRelay(probe);
     }
 
@@ -574,6 +753,9 @@ public class StunTurnServer implements ApplicationRunner {
 				if (!authorizeRelayPayload(payload, source, allocation, false)) {
 					continue;
 				}
+                if (!allowGeneralRelayTraffic(allocation, payload.length)) {
+                    continue;
+                }
                 dispatchPeerData(allocation, peer, payload);
             } catch (Exception e) {
                 if (running && !allocation.closed) {
@@ -893,6 +1075,14 @@ public class StunTurnServer implements ApplicationRunner {
         private final Map<String, ChannelBinding> channelsByPeer = new ConcurrentHashMap<>();
         private volatile Instant expiresAt;
         private final long clientId;
+        /** true 表示按标准 TURN 语义转发任意载荷（公开互传的浏览器 WebRTC） */
+        private final boolean generalRelay;
+        /** 通用中继配额计数：生命周期累计转发字节与令牌桶 */
+        private final java.util.concurrent.atomic.AtomicLong relayedBytes =
+                new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicBoolean quotaLogged =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        private final TokenBucket rateLimiter = new TokenBucket();
         private volatile Thread relayThread;
         private volatile boolean closed;
 
@@ -901,13 +1091,15 @@ public class StunTurnServer implements ApplicationRunner {
                            DatagramSocket relaySocket,
                            InetSocketAddress relayAddress,
                            Instant expiresAt,
-                           long clientId) {
+                           long clientId,
+                           boolean generalRelay) {
             this.id = Objects.requireNonNull(id, "id");
             this.clientRemote = clientRemote;
             this.relaySocket = relaySocket;
             this.relayAddress = relayAddress;
             this.expiresAt = expiresAt;
             this.clientId = clientId;
+            this.generalRelay = generalRelay;
         }
 
         private boolean isExpired(Instant now) {
@@ -919,23 +1111,53 @@ public class StunTurnServer implements ApplicationRunner {
         }
     }
 
+    /**
+     * 简单令牌桶：容量为 1 秒的额度，按纳秒时间补充。只用于通用中继，
+     * 并发调用通过 synchronized 串行化——通用中继的 pps 远低于 Peer Mesh 数据面，
+     * 这里选择实现简单而不是无锁。
+     */
+    static final class TokenBucket {
+        private double tokens;
+        private long lastRefillNanos;
+
+        synchronized boolean tryConsume(int bytes, long ratePerSecond) {
+            if (ratePerSecond <= 0) {
+                return true;
+            }
+            long now = System.nanoTime();
+            if (lastRefillNanos == 0) {
+                tokens = ratePerSecond;
+                lastRefillNanos = now;
+            } else {
+                double elapsedSeconds = (now - lastRefillNanos) / 1_000_000_000.0d;
+                tokens = Math.min(ratePerSecond, tokens + elapsedSeconds * ratePerSecond);
+                lastRefillNanos = now;
+            }
+            if (tokens < bytes) {
+                return false;
+            }
+            tokens -= bytes;
+            return true;
+        }
+    }
+
     private record ChannelBinding(int channelNumber, InetSocketAddress peer, Instant expiresAt) {
         private boolean activeAt(Instant now) {
             return expiresAt != null && expiresAt.isAfter(now);
         }
     }
 
-    private record TurnAuth(boolean allowed, byte[] messageIntegrityKey, long clientId) {
+    private record TurnAuth(boolean allowed, byte[] messageIntegrityKey, long clientId, boolean generalRelay) {
         private static TurnAuth none() {
-            return new TurnAuth(true, null, 0);
+            return new TurnAuth(true, null, 0, false);
         }
 
         private static TurnAuth denied() {
-            return new TurnAuth(false, null, 0);
+            return new TurnAuth(false, null, 0, false);
         }
 
-        private static TurnAuth allowed(byte[] messageIntegrityKey, long clientId) {
-            return new TurnAuth(true, messageIntegrityKey, clientId);
+        private static TurnAuth allowed(byte[] messageIntegrityKey, long clientId, boolean generalRelay) {
+            return new TurnAuth(true, messageIntegrityKey, clientId, generalRelay);
         }
     }
 }

@@ -81,6 +81,24 @@ public class TurnCredentialService {
         return md5(text.getBytes(StandardCharsets.UTF_8));
     }
 
+    /** 公开互传（浏览器 WebRTC）凭证的 subject 前缀；这类 allocation 走通用 TURN 语义 */
+    public static final String GENERAL_SUBJECT_PREFIX = "public-transfer";
+
+    /**
+     * 判断该 TURN 用户名是否属于通用中继用途（当前只有公开互传）。
+     *
+     * <p>浏览器经 TURN 转发的是 DTLS/SRTP/SCTP 与 STUN 连通性检查，既不是 SPM2 帧也不是
+     * 本项目的 probe JSON，无法通过 Peer Mesh 专用校验；这类 allocation 必须按标准 TURN 放行，
+     * 并由独立的目的地址策略和配额约束。
+     */
+    public boolean isGeneralRelaySubject(String username) {
+        if (!StringUtils.hasText(username)) {
+            return false;
+        }
+        String[] parts = username.split(":", 3);
+        return parts.length == 3 && parts[1].startsWith(GENERAL_SUBJECT_PREFIX);
+    }
+
     public long peerMeshClientId(String username) {
         if (!StringUtils.hasText(username)) {
             return 0;

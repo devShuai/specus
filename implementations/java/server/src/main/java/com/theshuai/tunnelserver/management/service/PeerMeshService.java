@@ -465,7 +465,7 @@ public class PeerMeshService {
                                                long fromClientId,
                                                long toClientId,
                                                long bytes) {
-        if (header == null || fromClientId <= 0 || toClientId <= 0 || bytes <= 0) {
+        if (header == null || !validRelayPeers(fromClientId, toClientId) || bytes <= 0) {
             return false;
         }
 		return authorizeRelayFrameForRelay(header, fromClientId, toClientId, bytes, true);
@@ -474,9 +474,17 @@ public class PeerMeshService {
 	public boolean validateRelayFrameForRelay(PeerDataFrameHeader header,
                                             long fromClientId,
                                             long toClientId) {
-		return header != null && fromClientId > 0 && toClientId > 0
+		return header != null && validRelayPeers(fromClientId, toClientId)
                 && authorizeRelayFrameForRelay(header, fromClientId, toClientId, 0L, false);
 	}
+
+    /**
+     * 允许两种取值：双方都有身份（TURN 认证开启），或双方都是 0（认证关闭，调用方无法确定身份）。
+     * 只有一侧为 0 属于调用方错误，一律拒绝。
+     */
+    private boolean validRelayPeers(long fromClientId, long toClientId) {
+        return (fromClientId > 0 && toClientId > 0) || (fromClientId == 0 && toClientId == 0);
+    }
 
 	private boolean authorizeRelayFrameForRelay(PeerDataFrameHeader header,
                                                long fromClientId,
@@ -573,8 +581,32 @@ public class PeerMeshService {
             pendingRelayBytes.remove(header.sessionId());
             return false;
         }
+        if (!matchesSessionPeers(session, fromClientId, toClientId)) {
+            relayAuthorizationCache.remove(header.sessionId());
+            return false;
+        }
+        // 首个通过身份校验的中继业务帧隐式激活 NEGOTIATING 会话。
+        //
+        // 探针在 NEGOTIATING 就放行，业务帧却要求 ACTIVE，而 ACTIVE 只能由客户端的
+        // path-report 经控制连接异步写入。两者之间必然存在时间窗：客户端探测成功后会立刻
+        // flush 待发数据，这些帧会先于 path-report 到达并被丢弃；peer 应用消息没有重传，
+        // 一帧丢失就表现为"中继已连通但文件发送失败"。会话身份（双方 clientId + 未过期 +
+        // 未关闭）此时已完成校验，等待一条状态上报并不能提供额外安全性，只会制造竞态。
+        if (!STATUS_ACTIVE.equals(session.getStatus())) {
+            if (STATUS_CLOSED.equals(session.getStatus())) {
+                relayAuthorizationCache.remove(header.sessionId());
+                return false;
+            }
+            session.setStatus(STATUS_ACTIVE);
+            session.setPathType(PATH_RELAY);
+            session.setUpdatedAt(now.toString());
+            session.setLastKeepaliveAt(now.toString());
+            sessionRepository.save(session);
+            log.debug("[peer-mesh] relay frame activated session {}: {} -> {}",
+                    session.getId(), STATUS_NEGOTIATING, STATUS_ACTIVE);
+        }
         RelayAuthorization authorization = RelayAuthorization.from(session, nowNanos + RELAY_AUTH_CACHE_TTL_NANOS);
-        if (!authorization.active() || !authorization.matches(fromClientId, toClientId)) {
+        if (!authorization.active()) {
             relayAuthorizationCache.remove(header.sessionId());
             return false;
         }
@@ -583,6 +615,24 @@ public class PeerMeshService {
 			pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new AtomicLong()).addAndGet(bytes);
 		}
         return true;
+    }
+
+    /**
+     * 校验帧的双向身份是否与 session 匹配。
+     *
+     * <p>{@code fromClientId}/{@code toClientId} 为 0 表示调用方无法确定身份（TURN 认证关闭
+     * 时 allocation 上没有 clientId）。该模式本身已放弃对端身份保证，这里退化为只校验
+     * session 存在且未关闭/未过期，而不是一律拒绝——否则关闭认证会让中继完全不可用。
+     */
+    private boolean matchesSessionPeers(PeerMeshSession session, long fromClientId, long toClientId) {
+        if (fromClientId <= 0 && toClientId <= 0) {
+            return true;
+        }
+        boolean forward = fromClientId == session.getSourceClientId()
+                && toClientId == session.getTargetClientId();
+        boolean reverse = fromClientId == session.getTargetClientId()
+                && toClientId == session.getSourceClientId();
+        return forward || reverse;
     }
 
     @Transactional
@@ -1385,7 +1435,11 @@ public class PeerMeshService {
                     && (sessionExpiresAtMillis <= 0 || sessionExpiresAtMillis > nowMillis);
         }
 
+        /** 0/0 表示调用方无法确定身份（TURN 认证关闭），与慢路径保持一致的降级语义。 */
         private boolean matches(long fromClientId, long toClientId) {
+            if (fromClientId <= 0 && toClientId <= 0) {
+                return true;
+            }
             boolean forward = fromClientId == sourceClientId && toClientId == targetClientId;
             boolean reverse = fromClientId == targetClientId && toClientId == sourceClientId;
             return forward || reverse;

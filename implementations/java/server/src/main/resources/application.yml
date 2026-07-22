@@ -115,6 +115,11 @@ tunnel:
     turn-realm: ${TUNNEL_PEER_MESH_TURN_REALM:shuai-tunnel}
     turn-shared-secret: ${TUNNEL_PEER_MESH_TURN_SHARED_SECRET:}
     turn-credential-ttl-seconds: ${TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS:3600}
+    # 通用中继（公开互传浏览器 WebRTC）配额；max-allocations 设为 0 可关闭通用中继
+    general-relay-max-allocations: ${TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS:256}
+    general-relay-max-allocations-per-address: ${TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS:4}
+    general-relay-rate-bytes-per-second: ${TUNNEL_PEER_MESH_GENERAL_RELAY_RATE_BYTES_PER_SECOND:2097152}
+    general-relay-max-bytes: ${TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_BYTES:536870912}
   object-storage:
     # disabled | aliyun-oss. Attachments use server-generated short-lived presigned URLs;
     # clients upload/download directly to the private bucket.

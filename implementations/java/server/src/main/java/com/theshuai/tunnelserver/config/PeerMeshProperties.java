@@ -38,4 +38,17 @@ public class PeerMeshProperties {
     private String turnRealm = "shuai-tunnel";
     private String turnSharedSecret = "";
     private long turnCredentialTtlSeconds = 3600;
+
+    // ── 通用中继（公开互传的浏览器 WebRTC）配额 ────────────────────────────────
+    // 这类 allocation 按标准 TURN 语义转发任意载荷，目的地址由浏览器指定，
+    // 因此必须有独立于 Peer Mesh 的配额上限，避免被当作开放中继刷带宽。
+
+    /** 通用中继并发 allocation 总数上限；<=0 表示禁用通用中继 */
+    private int generalRelayMaxAllocations = 256;
+    /** 同一来源 IP 的通用中继并发 allocation 上限 */
+    private int generalRelayMaxAllocationsPerAddress = 4;
+    /** 单个通用中继 allocation 的转发速率上限（字节/秒）；<=0 表示不限速 */
+    private long generalRelayRateBytesPerSecond = 2L * 1024 * 1024;
+    /** 单个通用中继 allocation 生命周期内可转发的总字节数；<=0 表示不限 */
+    private long generalRelayMaxBytes = 512L * 1024 * 1024;
 }

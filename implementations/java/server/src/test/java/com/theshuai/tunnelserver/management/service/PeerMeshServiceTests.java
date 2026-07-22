@@ -327,6 +327,59 @@ class PeerMeshServiceTests {
     }
 
     @Test
+    void relayHotPathActivatesNegotiatingSessionOnFirstFrame() {
+        // 探针在 NEGOTIATING 就放行，业务帧却等 path-report 才被授权，两者之间的时间窗会
+        // 丢掉客户端探测成功后立刻 flush 的数据帧——表现为"中继已连通但文件发送失败"。
+        // 身份校验通过后应直接激活会话，而不是丢帧等待一条状态上报。
+        PeerMeshSession session = activeSession();
+        session.setStatus(PeerMeshService.STATUS_NEGOTIATING);
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        boolean allowed = service.authorizeRelayFrameForRelay(
+                new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512);
+        service.flushRelayTraffic();
+
+        assertThat(allowed).isTrue();
+        assertThat(session.getStatus()).isEqualTo(PeerMeshService.STATUS_ACTIVE);
+        assertThat(session.getPathType()).isEqualTo(PeerMeshService.PATH_RELAY);
+        assertThat(session.getRelayBytes()).isEqualTo(512);
+    }
+
+    @Test
+    void relayHotPathRejectsClosedSessionAndMismatchedClients() {
+        PeerMeshSession closed = activeSession();
+        closed.setStatus(PeerMeshService.STATUS_CLOSED);
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(closed));
+
+        assertThat(service.authorizeRelayFrameForRelay(
+                new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512)).isFalse();
+
+        PeerMeshSession negotiating = activeSession();
+        negotiating.setStatus(PeerMeshService.STATUS_NEGOTIATING);
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(negotiating));
+
+        // 身份不匹配的帧不得激活会话
+        assertThat(service.authorizeRelayFrameForRelay(
+                new PeerDataFrameHeader(100L, 7L), 1L, 99L, 512)).isFalse();
+        assertThat(negotiating.getStatus()).isEqualTo(PeerMeshService.STATUS_NEGOTIATING);
+    }
+
+    @Test
+    void relayHotPathAllowsUnidentifiedPeersWhenTurnAuthDisabled() {
+        // TURN 认证关闭时 allocation 上没有 clientId，调用方传 0/0；此时若坚持要求身份匹配，
+        // 全部中继载荷都会被拒，中继完全不可用。
+        PeerMeshSession session = activeSession();
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        boolean allowed = service.authorizeRelayFrameForRelay(
+                new PeerDataFrameHeader(100L, 7L), 0L, 0L, 256);
+
+        assertThat(allowed).isTrue();
+    }
+
+    @Test
     void relayHotPathUsesExplicitTransactionAndFlushesTraffic() {
         PeerMeshSession session = activeSession();
         when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
