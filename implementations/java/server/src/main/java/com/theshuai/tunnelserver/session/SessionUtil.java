@@ -21,19 +21,41 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 public final class SessionUtil {
 
-    private static final Map<String, Channel> clientChannelMap = new ConcurrentHashMap<>();
+    private static final Map<String, Channel> controlChannels = new ConcurrentHashMap<>();
+    private static final Map<String, Channel> dataChannels = new ConcurrentHashMap<>();
 
     private SessionUtil() {
     }
 
     public static void bindSession(Session session, Channel channel) {
-        Channel oldChannel = clientChannelMap.put(session.getClientName(), channel);
+        bindControlSession(session, channel);
+    }
+
+    public static void bindControlSession(Session session, Channel channel) {
+        Channel oldChannel = controlChannels.put(session.getClientName(), channel);
         if (oldChannel != null && oldChannel != channel) {
             oldChannel.attr(ServerAttributes.SESSION).set(null);
             // 让 channelInactive 能识别本次关闭是"被新登录替换"，而不是默认的 CLIENT_CLOSED。
             DisconnectReason.markIfAbsent(oldChannel, DisconnectReason.REPLACED_BY_NEW_LOGIN);
             oldChannel.close();
             log.info("{} 旧连接已替换", session.getClientName());
+        }
+        Channel oldData = dataChannels.remove(session.getClientName());
+        if (oldData != null && oldData != channel) {
+            DisconnectReason.markIfAbsent(oldData, DisconnectReason.REPLACED_BY_NEW_LOGIN);
+            oldData.close();
+        }
+        channel.attr(ServerAttributes.SESSION).set(session);
+        channel.closeFuture().addListener(future -> unBindSession(channel));
+    }
+
+    public static void bindDataSession(Session session, Channel channel) {
+        Channel oldChannel = dataChannels.put(session.getClientName(), channel);
+        if (oldChannel != null && oldChannel != channel) {
+            oldChannel.attr(ServerAttributes.SESSION).set(null);
+            DisconnectReason.markIfAbsent(oldChannel, DisconnectReason.REPLACED_BY_NEW_LOGIN);
+            oldChannel.close();
+            log.info("{} 旧数据连接已替换", session.getClientName());
         }
         channel.attr(ServerAttributes.SESSION).set(session);
         channel.closeFuture().addListener(future -> unBindSession(channel));
@@ -44,14 +66,34 @@ public final class SessionUtil {
         if (session == null) {
             return;
         }
-        clientChannelMap.remove(session.getClientName(), channel);
+        controlChannels.remove(session.getClientName(), channel);
+        dataChannels.remove(session.getClientName(), channel);
         channel.attr(ServerAttributes.SESSION).set(null);
         channel.attr(ServerAttributes.TENANT_ID).set(null);
         log.info("{} 退出登录", session.getClientName());
     }
 
     public static Channel getChannel(String clientName) {
-        return clientChannelMap.get(clientName);
+        return controlChannels.get(clientName);
+    }
+
+    public static Channel getDataChannel(String clientName) {
+        return dataChannels.get(clientName);
+    }
+
+    public static boolean hasMatchingControl(String clientName, Long clientSessionId) {
+        Channel channel = controlChannels.get(clientName);
+        return channel != null
+                && channel.isActive()
+                && clientSessionId != null
+                && clientSessionId.equals(channel.attr(ServerAttributes.CLIENT_SESSION_ID).get());
+    }
+
+    public static void closeDataSession(String clientName) {
+        Channel channel = dataChannels.remove(clientName);
+        if (channel != null) {
+            channel.close();
+        }
     }
 
     public static boolean hasLogin(Channel channel) {

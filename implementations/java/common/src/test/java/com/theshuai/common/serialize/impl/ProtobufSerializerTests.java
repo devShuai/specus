@@ -1,7 +1,8 @@
 package com.theshuai.common.serialize.impl;
 
-import com.theshuai.common.protocol.Packet;
 import com.theshuai.common.protocol.PacketCodec;
+import com.theshuai.common.protocol.ProtocolException;
+import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.serialize.Serializer;
 import io.netty.buffer.ByteBuf;
@@ -9,7 +10,7 @@ import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ProtobufSerializerTests {
 
@@ -24,14 +25,13 @@ class ProtobufSerializerTests {
     }
 
     @Test
-    void shouldEncodeAndDecodePacket() throws Exception {
+    void shouldRejectProtobufOnControlProtocolV2() {
         ByteBuf byteBuf = Unpooled.buffer();
         try {
-            PacketCodec.INSTANCE.encode(byteBuf, createPacket(), Serializer.PROTOBUF);
-
-            Packet packet = PacketCodec.INSTANCE.decode(byteBuf);
-
-            assertLoginPacket(assertInstanceOf(LoginRequestPacket.class, packet));
+            ProtocolException exception = assertThrows(
+                    ProtocolException.class,
+                    () -> PacketCodec.INSTANCE.encode(byteBuf, createPacket(), Serializer.PROTOBUF));
+            assertEquals(ProtocolException.Reason.UNSUPPORTED_SERIALIZER, exception.getReason());
         } finally {
             byteBuf.release();
         }
@@ -42,6 +42,7 @@ class ProtobufSerializerTests {
         packet.setClientName("Demo client");
         packet.setClientSessionId(123456789L);
         packet.setAccessToken("cs_test_access_token");
+        packet.setConnectionRole(ConnectionRole.CONTROL);
         return packet;
     }
 
@@ -49,5 +50,6 @@ class ProtobufSerializerTests {
         assertEquals("Demo client", packet.getClientName());
         assertEquals(123456789L, packet.getClientSessionId());
         assertEquals("cs_test_access_token", packet.getAccessToken());
+        assertEquals(ConnectionRole.CONTROL, packet.getConnectionRole());
     }
 }

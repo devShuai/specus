@@ -75,6 +75,10 @@
             <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.lettuce</groupId>
+            <artifactId>lettuce-core</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.brotli</groupId>
             <artifactId>dec</artifactId>
             <version>0.1.2</version>

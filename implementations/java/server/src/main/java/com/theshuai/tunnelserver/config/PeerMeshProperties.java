@@ -31,6 +31,9 @@ public class PeerMeshProperties {
     private int relayMaxPort = 65535;
     private int relayWorkerThreads = 0;
     private int relayWorkerQueueCapacity = 10000;
+    private int udpReceiveBufferBytes = 4 * 1024 * 1024;
+    private int udpSendBufferBytes = 4 * 1024 * 1024;
+    private int udpTrafficClass = 0x10;
     private boolean turnAuthRequired = true;
     private String turnRealm = "shuai-tunnel";
     private String turnSharedSecret = "";

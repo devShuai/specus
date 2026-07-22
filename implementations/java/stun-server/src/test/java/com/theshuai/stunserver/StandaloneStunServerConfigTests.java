@@ -102,7 +102,8 @@ class StandaloneStunServerConfigTests {
                         Map.entry("STUN_DISTRIBUTED_STUN_BIND_ADDRESS", "0.0.0.0"),
                         Map.entry("STUN_DISTRIBUTED_CONTROL_BIND_ADDRESS", "10.0.1.10"),
                         Map.entry("STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS", "10.0.0.10"),
-                        Map.entry("STUN_DISTRIBUTED_SHARED_SECRET", secret),
+                        Map.entry("STUN_DISTRIBUTED_CURRENT_KEY_ID", "7"),
+                        Map.entry("STUN_DISTRIBUTED_CURRENT_SECRET", secret),
                         Map.entry("STUN_PRIMARY_PUBLIC_ADDRESS", "203.0.113.10"),
                         Map.entry("STUN_ALTERNATE_PUBLIC_ADDRESS", "203.0.113.11"),
                         Map.entry("STUN_PRIMARY_PORT", "3478"),
@@ -132,7 +133,8 @@ class StandaloneStunServerConfigTests {
                                 Map.entry("STUN_DISTRIBUTED_LOCAL_ADDRESS_SLOT", "primary"),
                                 Map.entry("STUN_DISTRIBUTED_CONTROL_BIND_ADDRESS", "10.0.0.10"),
                                 Map.entry("STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS", "10.0.1.10"),
-                                Map.entry("STUN_DISTRIBUTED_SHARED_SECRET", secret),
+                                Map.entry("STUN_DISTRIBUTED_CURRENT_KEY_ID", "7"),
+                                Map.entry("STUN_DISTRIBUTED_CURRENT_SECRET", secret),
                                 Map.entry("STUN_PRIMARY_PUBLIC_ADDRESS", "203.0.113.10"),
                                 Map.entry("STUN_ALTERNATE_PUBLIC_ADDRESS", "203.0.113.11"))));
 
@@ -153,7 +155,8 @@ class StandaloneStunServerConfigTests {
                                 Map.entry("STUN_DISTRIBUTED_CONTROL_PORT", "3478"),
                                 Map.entry("STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS", "10.0.1.10"),
                                 Map.entry("STUN_DISTRIBUTED_PEER_CONTROL_PORT", "3478"),
-                                Map.entry("STUN_DISTRIBUTED_SHARED_SECRET", secret),
+                                Map.entry("STUN_DISTRIBUTED_CURRENT_KEY_ID", "7"),
+                                Map.entry("STUN_DISTRIBUTED_CURRENT_SECRET", secret),
                                 Map.entry("STUN_PRIMARY_PUBLIC_ADDRESS", "203.0.113.10"),
                                 Map.entry("STUN_ALTERNATE_PUBLIC_ADDRESS", "203.0.113.11"))));
 
@@ -172,7 +175,8 @@ class StandaloneStunServerConfigTests {
                                 Map.entry("STUN_DISTRIBUTED_LOCAL_ADDRESS_SLOT", "primary"),
                                 Map.entry("STUN_DISTRIBUTED_CONTROL_BIND_ADDRESS", "10.0.0.10"),
                                 Map.entry("STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS", "10.0.0.10"),
-                                Map.entry("STUN_DISTRIBUTED_SHARED_SECRET", secret),
+                                Map.entry("STUN_DISTRIBUTED_CURRENT_KEY_ID", "7"),
+                                Map.entry("STUN_DISTRIBUTED_CURRENT_SECRET", secret),
                                 Map.entry("STUN_PRIMARY_PUBLIC_ADDRESS", "203.0.113.10"),
                                 Map.entry("STUN_ALTERNATE_PUBLIC_ADDRESS", "203.0.113.11"))));
 

@@ -50,11 +50,26 @@ spring:
       mail.smtp.timeout: ${TUNNEL_AUTH_SMTP_READ_TIMEOUT_MS:10000}
       mail.smtp.writetimeout: ${TUNNEL_AUTH_SMTP_WRITE_TIMEOUT_MS:10000}
 
+logging:
+  # Linux systemd sets TUNNEL_LOG_FILE to /var/log/tunnel-server/tunnel-server.log.
+  # Keeping the default empty preserves console-only logging for local development and tests.
+  file:
+    name: ${TUNNEL_LOG_FILE:}
+  charset:
+    file: UTF-8
+  logback:
+    rollingpolicy:
+      max-file-size: ${TUNNEL_LOG_MAX_FILE_SIZE:50MB}
+      max-history: ${TUNNEL_LOG_MAX_HISTORY:30}
+      total-size-cap: ${TUNNEL_LOG_TOTAL_SIZE_CAP:2GB}
+      clean-history-on-start: ${TUNNEL_LOG_CLEAN_HISTORY_ON_START:true}
+
 tunnel:
   database:
     seed-demo-client: ${TUNNEL_DB_SEED_DEMO_CLIENT:true}
   netty:
     port: ${TUNNEL_NETTY_PORT:7010}
+    bind-address: ${TUNNEL_NETTY_BIND_ADDRESS:0.0.0.0}
     boss-threads: ${TUNNEL_NETTY_BOSS_THREADS:1}
     worker-threads: ${TUNNEL_NETTY_WORKER_THREADS:0}
     remote-boss-threads: ${TUNNEL_NETTY_REMOTE_BOSS_THREADS:1}
@@ -66,6 +81,7 @@ tunnel:
     write-buffer-low-water-mark: ${TUNNEL_NETTY_WRITE_BUFFER_LOW_WATER_MARK:32768}
     write-buffer-high-water-mark: ${TUNNEL_NETTY_WRITE_BUFFER_HIGH_WATER_MARK:65536}
     max-frame-size: ${TUNNEL_NETTY_MAX_FRAME_SIZE:33554432}
+    pre-auth-max-frame-size: ${TUNNEL_NETTY_PRE_AUTH_MAX_FRAME_SIZE:16384}
     max-external-connections: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS:10000}
     max-external-connections-per-client: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT:10000}
     max-external-connections-per-port: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT:10000}
@@ -91,6 +107,9 @@ tunnel:
     relay-max-port: ${TUNNEL_PEER_MESH_RELAY_MAX_PORT:65535}
     relay-worker-threads: ${TUNNEL_PEER_MESH_RELAY_WORKER_THREADS:0}
     relay-worker-queue-capacity: ${TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY:10000}
+    udp-receive-buffer-bytes: ${TUNNEL_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES:4194304}
+    udp-send-buffer-bytes: ${TUNNEL_PEER_MESH_UDP_SEND_BUFFER_BYTES:4194304}
+    udp-traffic-class: ${TUNNEL_PEER_MESH_UDP_TRAFFIC_CLASS:16}
     relay-traffic-flush-interval-ms: ${TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS:5000}
     turn-auth-required: ${TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED:true}
     turn-realm: ${TUNNEL_PEER_MESH_TURN_REALM:shuai-tunnel}
@@ -117,13 +136,20 @@ tunnel:
     expiration-scan-interval-ms: ${TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS:3600000}
   public-transfer:
     # 免登录文件互传的滥用防护。presign-upload 无鉴权,按来源 IP 固定窗口限流,
-    # 并对单房间(按 roomToken 哈希)的 PENDING 附件数设上限。进程内计数,多实例部署时按实例数放大。
+    # 并对单房间(按 roomToken 哈希)的 PENDING 附件数设上限。cluster-enabled=true 时
+    # presence、房间修订、WS 转发和公开入口限流由 Redis 统一协调。
     presign-rate-limit-per-ip: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP:30}
     presign-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS:300}
     max-pending-uploads-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM:50}
     max-discovery-peers-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM:32}
     discovery-message-rate-limit-per-connection: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION:360}
     discovery-message-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS:60}
+    cluster-enabled: ${TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED:false}
+    redis-uri: ${TUNNEL_PUBLIC_TRANSFER_REDIS_URI:}
+    redis-key-prefix: ${TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX:shuai-tunnel:v2:public-transfer}
+    presence-lease-seconds: ${TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS:30}
+    presence-refresh-interval-ms: ${TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS:10000}
+    redis-command-timeout-ms: ${TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS:2000}
     pairing-code-ttl-seconds: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS:300}
     pairing-code-redeem-rate-limit-per-ip: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP:10}
     pairing-code-redeem-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS:300}
@@ -208,16 +234,21 @@ tunnel:
     timeout-ms: ${TUNNEL_HTTP_TIMEOUT_MS:30000}
     max-request-body-size: ${TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE:16777216}
     route-cache-ttl-ms: ${TUNNEL_HTTP_ROUTE_CACHE_TTL_MS:2000}
+    rewrite:
+      # HTTP 路由开启路径改写时，单次可改写响应体的最大字节数（默认 10 MiB）。
+      max-body-bytes: ${TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES:10485760}
   login:
     executor:
       core-size: ${TUNNEL_LOGIN_EXECUTOR_CORE:8}
       max-size: ${TUNNEL_LOGIN_EXECUTOR_MAX:32}
       queue-capacity: ${TUNNEL_LOGIN_EXECUTOR_QUEUE:20000}
   tls:
-    # disabled: control channel is plain TCP (legacy)
+    # disabled: local-development plaintext only; production startup validation rejects public binds
     # file: load keystore/truststore from disk (production)
     # self-signed: generate a transient self-signed cert (dev/test)
     mode: ${TUNNEL_TLS_MODE:disabled}
     keystore: ${TUNNEL_TLS_KEYSTORE:}
     keystore-password: ${TUNNEL_TLS_KEYSTORE_PASSWORD:}
     key-password: ${TUNNEL_TLS_KEY_PASSWORD:}
+    require-encryption: ${TUNNEL_TLS_REQUIRE_ENCRYPTION:false}
+    terminated-upstream: ${TUNNEL_TLS_TERMINATED_UPSTREAM:false}

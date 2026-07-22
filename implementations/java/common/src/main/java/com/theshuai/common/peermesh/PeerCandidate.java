@@ -11,4 +11,5 @@ public class PeerCandidate {
     private long priority;
     private String foundation;
     private String relayId;
+    private String addressFamily;
 }

@@ -21,7 +21,7 @@ class PeerReplayWindowTests {
         PeerReplayWindow window = new PeerReplayWindow();
 
         assertTrue(window.accept(1));
-        assertTrue(window.accept(80));
+        assertTrue(window.accept(5000));
         assertFalse(window.accept(1));
     }
 

@@ -110,7 +110,7 @@ class SecurityRulesTests {
 
         assertThat(response.statusCode())
                 .as("foreign upstream bearer token must reach HTTP proxy instead of resource-server validation")
-                .isEqualTo(503);
+                .isEqualTo(502);
         assertThat(response.body()).contains("客户端不在线");
     }
 

@@ -31,6 +31,9 @@ public final class StunMessage {
     public static final int CREATE_PERMISSION_REQUEST = 0x0008;
     public static final int CREATE_PERMISSION_SUCCESS = 0x0108;
     public static final int CREATE_PERMISSION_ERROR = 0x0118;
+    public static final int CHANNEL_BIND_REQUEST = 0x0009;
+    public static final int CHANNEL_BIND_SUCCESS = 0x0109;
+    public static final int CHANNEL_BIND_ERROR = 0x0119;
     public static final int SEND_INDICATION = 0x0016;
     public static final int DATA_INDICATION = 0x0017;
 
@@ -40,6 +43,7 @@ public final class StunMessage {
     public static final int ATTR_MESSAGE_INTEGRITY = 0x0008;
     public static final int ATTR_ERROR_CODE = 0x0009;
     public static final int ATTR_UNKNOWN_ATTRIBUTES = 0x000A;
+    public static final int ATTR_CHANNEL_NUMBER = 0x000C;
     public static final int ATTR_LIFETIME = 0x000D;
     public static final int ATTR_XOR_PEER_ADDRESS = 0x0012;
     public static final int ATTR_DATA = 0x0013;
@@ -87,7 +91,7 @@ public final class StunMessage {
         }
         int declaredLength = Short.toUnsignedInt(ByteBuffer.wrap(packet, offset + 2, Short.BYTES).getShort());
         int cookie = ByteBuffer.wrap(packet, offset + 4, Integer.BYTES).getInt();
-        return cookie == MAGIC_COOKIE && declaredLength + HEADER_BYTES <= length;
+		return cookie == MAGIC_COOKIE && declaredLength + HEADER_BYTES == length;
     }
 
     public static StunMessage parse(byte[] packet, int offset, int length) {
@@ -98,7 +102,7 @@ public final class StunMessage {
         int type = Short.toUnsignedInt(buffer.getShort());
         int messageLength = Short.toUnsignedInt(buffer.getShort());
         int cookie = buffer.getInt();
-        if (cookie != MAGIC_COOKIE || messageLength + HEADER_BYTES > length) {
+		if (cookie != MAGIC_COOKIE || messageLength + HEADER_BYTES != length) {
             return null;
         }
         byte[] transactionId = new byte[TRANSACTION_ID_BYTES];
@@ -317,6 +321,18 @@ public final class StunMessage {
         return first(ATTR_DATA).map(attribute -> Arrays.copyOf(attribute.value(), attribute.value().length));
     }
 
+    public OptionalInt channelNumber() {
+        Optional<Attribute> attribute = first(ATTR_CHANNEL_NUMBER);
+        if (attribute.isEmpty() || attribute.get().value().length != Integer.BYTES) {
+            return OptionalInt.empty();
+        }
+        byte[] value = attribute.get().value();
+        int channel = Short.toUnsignedInt(ByteBuffer.wrap(value, 0, Short.BYTES).getShort());
+        return channel >= TurnChannelData.MIN_CHANNEL && channel <= TurnChannelData.MAX_CHANNEL
+                ? OptionalInt.of(channel)
+                : OptionalInt.empty();
+    }
+
     public Optional<String> username() {
         return textAttribute(ATTR_USERNAME);
     }
@@ -458,6 +474,15 @@ public final class StunMessage {
 
     public static Attribute data(byte[] payload) {
         return new Attribute(ATTR_DATA, payload == null ? new byte[0] : Arrays.copyOf(payload, payload.length));
+    }
+
+    public static Attribute channelNumber(int channelNumber) {
+        if (channelNumber < TurnChannelData.MIN_CHANNEL || channelNumber > TurnChannelData.MAX_CHANNEL) {
+            throw new IllegalArgumentException("TURN channel number must be between 0x4000 and 0x7FFF");
+        }
+        return new Attribute(
+                ATTR_CHANNEL_NUMBER,
+                ByteBuffer.allocate(Integer.BYTES).putShort((short) channelNumber).putShort((short) 0).array());
     }
 
     public static Attribute lifetime(long seconds) {

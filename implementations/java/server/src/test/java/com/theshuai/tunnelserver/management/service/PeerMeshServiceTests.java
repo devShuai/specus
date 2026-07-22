@@ -17,7 +17,10 @@ import com.theshuai.tunnelserver.management.repository.PeerMeshSessionRepository
 import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.peer.TurnCredentialService;
 import com.theshuai.tunnelserver.management.tenant.TenantContext;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
 
 import java.time.Instant;
 import java.util.List;
@@ -26,6 +29,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -40,6 +44,7 @@ class PeerMeshServiceTests {
     private final TurnCredentialService turnCredentialService = mock(TurnCredentialService.class);
     private final ClientSessionRepository clientSessionRepository = mock(ClientSessionRepository.class);
     private final PeerMeshProperties properties = new PeerMeshProperties();
+    private final PlatformTransactionManager transactionManager = transactionManager();
     private final PeerMeshService service = new PeerMeshService(
             properties,
             deviceRepository,
@@ -47,7 +52,9 @@ class PeerMeshServiceTests {
             sessionRepository,
             clientAccountRepository,
             turnCredentialService,
-            clientSessionRepository
+            clientSessionRepository,
+            transactionManager,
+            new SimpleMeterRegistry()
     );
 
     @Test
@@ -272,7 +279,8 @@ class PeerMeshServiceTests {
         when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
         when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
-        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 2L, 7L), 512);
+        boolean allowed = service.authorizeRelayFrame(
+                new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512);
 
         assertThat(allowed).isTrue();
         assertThat(session.getRelayBytes()).isEqualTo(512);
@@ -283,7 +291,8 @@ class PeerMeshServiceTests {
         PeerMeshSession session = activeSession();
         when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
 
-        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 99L, 7L), 512);
+        boolean allowed = service.authorizeRelayFrame(
+                new PeerDataFrameHeader(100L, 7L), 1L, 99L, 512);
 
         assertThat(allowed).isFalse();
         assertThat(session.getRelayBytes()).isZero();
@@ -296,7 +305,8 @@ class PeerMeshServiceTests {
         when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
         when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
-        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 2L, 7L), 512);
+        boolean allowed = service.authorizeRelayFrame(
+                new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512);
 
         assertThat(allowed).isFalse();
         assertThat(session.getStatus()).isEqualTo(PeerMeshService.STATUS_CLOSED);
@@ -309,10 +319,64 @@ class PeerMeshServiceTests {
         session.setStatus(PeerMeshService.STATUS_NEGOTIATING);
         when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
 
-        boolean allowed = service.authorizeRelayFrame(new PeerDataFrameHeader(100L, 1L, 2L, 7L), 512);
+        boolean allowed = service.authorizeRelayFrame(
+                new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512);
 
         assertThat(allowed).isFalse();
         assertThat(session.getRelayBytes()).isZero();
+    }
+
+    @Test
+    void relayHotPathUsesExplicitTransactionAndFlushesTraffic() {
+        PeerMeshSession session = activeSession();
+        when(sessionRepository.findById(100L)).thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        clearInvocations(transactionManager);
+
+        boolean allowed = service.authorizeRelayFrameForRelay(
+                new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512);
+        service.flushRelayTraffic();
+
+        assertThat(allowed).isTrue();
+        assertThat(session.getRelayBytes()).isEqualTo(512);
+        verify(transactionManager, times(2)).getTransaction(any());
+        verify(transactionManager, times(2)).commit(any());
+    }
+
+    @Test
+    void relayTrafficFlushRestoresBatchAfterRepositoryFailure() {
+        PeerMeshSession session = activeSession();
+        when(sessionRepository.findById(100L))
+                .thenReturn(Optional.of(session))
+                .thenThrow(new IllegalStateException("database unavailable"))
+                .thenReturn(Optional.of(session));
+        when(sessionRepository.save(any(PeerMeshSession.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        PeerMeshService retryingService = new PeerMeshService(
+                properties,
+                deviceRepository,
+                aclRepository,
+                sessionRepository,
+                clientAccountRepository,
+                turnCredentialService,
+                clientSessionRepository,
+                transactionManager(),
+                meterRegistry);
+
+        assertThat(retryingService.authorizeRelayFrameForRelay(
+                new PeerDataFrameHeader(100L, 7L), 1L, 2L, 512)).isTrue();
+        retryingService.flushRelayTraffic();
+
+        assertThat(meterRegistry.get("tunnel.peer_mesh.relay.traffic.flush.failures").counter().count())
+                .isEqualTo(1);
+        assertThat(meterRegistry.get("tunnel.peer_mesh.relay.traffic.pending.bytes").gauge().value())
+                .isEqualTo(512);
+
+        retryingService.flushRelayTraffic();
+
+        assertThat(session.getRelayBytes()).isEqualTo(512);
+        assertThat(meterRegistry.get("tunnel.peer_mesh.relay.traffic.pending.bytes").gauge().value())
+                .isZero();
     }
 
     @Test
@@ -326,6 +390,12 @@ class PeerMeshServiceTests {
         var relayActive = pathAggregate(PeerMeshService.PATH_RELAY, PeerMeshService.STATUS_ACTIVE, 1, 1, 80.0, 10, 400);
         var directClosed = pathAggregate(PeerMeshService.PATH_DIRECT, PeerMeshService.STATUS_CLOSED, 1, 0, null, 0, 0);
         when(sessionRepository.aggregatePathTypes("tenant-a")).thenReturn(List.of(directActive, relayActive, directClosed));
+        var ipv4Active = addressFamilyAggregate("IPv4", PeerMeshService.STATUS_ACTIVE,
+                PeerMeshService.PATH_DIRECT, 2, 2);
+        var ipv6Active = addressFamilyAggregate("IPv6", PeerMeshService.STATUS_ACTIVE,
+                PeerMeshService.PATH_RELAY, 1, 1);
+        when(sessionRepository.aggregateAddressFamilies("tenant-a"))
+                .thenReturn(List.of(ipv4Active, ipv6Active));
         var natUnknown = natAggregate(null, 2);
         var natSymmetric = natAggregate("SYMMETRIC_NAT", 1);
         when(deviceRepository.aggregateNatTypes("tenant-a")).thenReturn(List.of(natUnknown, natSymmetric));
@@ -351,6 +421,13 @@ class PeerMeshServiceTests {
         assertThat(stats.activeRelaySessions()).isEqualTo(1);
         assertThat(stats.activeDirectRatio()).isEqualTo(0.75);
         assertThat(stats.pathTypes()).hasSize(3);
+        assertThat(stats.addressFamilies())
+                .extracting("addressFamily", "status", "pathType", "sessions", "reportedSessions")
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.groups.Tuple.tuple(
+                                "IPv4", PeerMeshService.STATUS_ACTIVE, PeerMeshService.PATH_DIRECT, 2L, 2L),
+                        org.assertj.core.groups.Tuple.tuple(
+                                "IPv6", PeerMeshService.STATUS_ACTIVE, PeerMeshService.PATH_RELAY, 1L, 1L));
         assertThat(stats.natTypes())
                 .extracting("natType", "devices")
                 .containsExactlyInAnyOrder(
@@ -425,11 +502,33 @@ class PeerMeshServiceTests {
         return aggregate;
     }
 
+    private PeerMeshSessionRepository.AddressFamilyAggregate addressFamilyAggregate(
+            String addressFamily,
+            String status,
+            String pathType,
+            long sessions,
+            long reportedSessions) {
+        PeerMeshSessionRepository.AddressFamilyAggregate aggregate =
+                mock(PeerMeshSessionRepository.AddressFamilyAggregate.class);
+        when(aggregate.getAddressFamily()).thenReturn(addressFamily);
+        when(aggregate.getStatus()).thenReturn(status);
+        when(aggregate.getPathType()).thenReturn(pathType);
+        when(aggregate.getSessions()).thenReturn(sessions);
+        when(aggregate.getReportedSessions()).thenReturn(reportedSessions);
+        return aggregate;
+    }
+
     private PeerMeshDeviceRepository.NatTypeAggregate natAggregate(String natType, long devices) {
         PeerMeshDeviceRepository.NatTypeAggregate aggregate = mock(PeerMeshDeviceRepository.NatTypeAggregate.class);
         when(aggregate.getNatType()).thenReturn(natType);
         when(aggregate.getDevices()).thenReturn(devices);
         return aggregate;
+    }
+
+    private static PlatformTransactionManager transactionManager() {
+        PlatformTransactionManager manager = mock(PlatformTransactionManager.class);
+        when(manager.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
+        return manager;
     }
 
     private PeerMeshDeviceRepository.NatBehaviorAggregate natBehaviorAggregate(

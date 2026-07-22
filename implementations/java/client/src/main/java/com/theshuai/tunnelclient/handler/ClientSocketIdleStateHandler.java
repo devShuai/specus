@@ -3,6 +3,7 @@ package com.theshuai.tunnelclient.handler;
 import com.theshuai.common.handler.AbstractIdleHeartbeatHandler;
 import com.theshuai.common.protocol.Packet;
 import com.theshuai.common.protocol.request.HeartBeatRequestPacket;
+import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.tunnelclient.client.NettyClient;
 import io.netty.channel.ChannelHandlerContext;
 import lombok.extern.slf4j.Slf4j;
@@ -19,10 +20,16 @@ public class ClientSocketIdleStateHandler extends AbstractIdleHeartbeatHandler {
     private static final int WRITE_IDLE_TIME = 5;
 
     private final NettyClient nettyClient;
+    private final String connectionRole;
 
     public ClientSocketIdleStateHandler(NettyClient nettyClient) {
+        this(nettyClient, ConnectionRole.CONTROL);
+    }
+
+    public ClientSocketIdleStateHandler(NettyClient nettyClient, String connectionRole) {
         super(READER_IDLE_TIME, WRITE_IDLE_TIME);
         this.nettyClient = nettyClient;
+        this.connectionRole = connectionRole;
     }
 
     @Override
@@ -44,7 +51,7 @@ public class ClientSocketIdleStateHandler extends AbstractIdleHeartbeatHandler {
             log.debug("控制连接因令牌刷新而断开, 等待刷新完成后重连");
             return;
         }
-        log.info("控制连接断开, 安排重连...");
-        nettyClient.scheduleReconnect();
+        log.info("{}连接断开", connectionRole);
+        nettyClient.onConnectionInactive(connectionRole);
     }
 }

@@ -49,6 +49,28 @@ public class JsonUtil {
         return null;
     }
 
+    public static <T> T bytesToObjectStrict(byte[] bytes, TypeReference<T> typeReference) {
+        if (bytes == null || typeReference == null) {
+            throw new IllegalArgumentException("bytes and typeReference are required");
+        }
+        try {
+            return objectMapper.readValue(bytes, typeReference);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("invalid JSON payload", e);
+        }
+    }
+
+    public static <T> T bytesToObjectQuietly(byte[] bytes, int offset, int length, Class<T> clazz) {
+        if (bytes == null || clazz == null || offset < 0 || length < 0 || offset > bytes.length - length) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(bytes, offset, length, clazz);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     public static <T> T stringToObject(String message, Class<T> clazz) {
         try {
             return objectMapper.readValue(message, clazz);

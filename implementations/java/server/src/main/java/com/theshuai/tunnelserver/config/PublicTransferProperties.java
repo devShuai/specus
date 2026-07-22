@@ -8,7 +8,8 @@ import org.springframework.stereotype.Component;
  * 免登录文件互传的滥用防护参数。公开的 presign-upload 无鉴权,需要按来源 IP 限流,
  * 并对单房间待上传(PENDING)附件数设上限,避免刷预签名 URL 灌 OSS 产生存储/流量账单。
  *
- * <p>限流为进程内计数,多实例部署时上限按实例数放大;作为一线滥用缓解足够,精确全局配额需外置存储。
+ * <p>默认单实例使用进程内状态。启用 clusterEnabled 后，presence、转发、房间修订和公开入口限流
+ * 统一使用 Redis；集群模式不允许在 Redis 不可用时退回本地状态。
  */
 @Component
 @ConfigurationProperties(prefix = "tunnel.public-transfer")
@@ -31,6 +32,24 @@ public class PublicTransferProperties {
 
     /** 发现 WebSocket 消息限流时间窗长度(秒)。 */
     private long discoveryMessageRateLimitWindowSeconds = 60;
+
+    /** 是否启用公共互传多实例协调；启用后 redisUri 必填。 */
+    private boolean clusterEnabled = false;
+
+    /** Redis URI，例如 redis://user:password@redis.internal:6379/0。 */
+    private String redisUri = "";
+
+    /** Redis key/channel 前缀；多个环境共用 Redis 时必须不同。 */
+    private String redisKeyPrefix = "shuai-tunnel:v2:public-transfer";
+
+    /** presence 租约 TTL；需显著大于刷新间隔。 */
+    private long presenceLeaseSeconds = 30;
+
+    /** 本实例刷新本地 WebSocket presence 的间隔。 */
+    private long presenceRefreshIntervalMs = 10_000;
+
+    /** 单次 Redis 操作超时。 */
+    private long redisCommandTimeoutMs = 2_000;
 
     /** 八位数字配对码的有效期(秒);服务端会限制在 60-900 秒。 */
     private long pairingCodeTtlSeconds = 300;

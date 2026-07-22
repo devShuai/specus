@@ -1,6 +1,7 @@
 package com.theshuai.tunnelclient.handler;
 
 import com.theshuai.common.protocol.response.LoginResponsePacket;
+import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.tunnelclient.client.NettyClient;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -10,9 +11,15 @@ import lombok.extern.slf4j.Slf4j;
 public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginResponsePacket> {
 
     private final NettyClient nettyClient;
+    private final String connectionRole;
 
     public LoginResponseHandler(NettyClient nettyClient) {
+        this(nettyClient, ConnectionRole.CONTROL);
+    }
+
+    public LoginResponseHandler(NettyClient nettyClient, String connectionRole) {
         this.nettyClient = nettyClient;
+        this.connectionRole = connectionRole;
     }
 
     @Override
@@ -21,7 +28,7 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
         if (loginResponsePacket.isSuccess()) {
             log.info("[{}]登录成功", clientName);
             // 通知 NettyClient 重置退避计数；TCP 通了不算成功，登录通了才算。
-            nettyClient.onLoginSuccess();
+            nettyClient.onLoginSuccess(connectionRole, ctx.channel());
             // Do NOT touch SessionUtil here. SessionUtil.clientChannelMap is the
             // server-side routing table. Server-side ManagedLoginRequestHandler
             // already calls bindSession on the same channel; if the client also
@@ -56,7 +63,7 @@ public class LoginResponseHandler extends SimpleChannelInboundHandler<LoginRespo
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        log.info("客户端连接被关闭");
+        log.info("客户端{}连接被关闭", connectionRole);
         // Do NOT unbind either — see the comment in channelRead0.
     }
 }

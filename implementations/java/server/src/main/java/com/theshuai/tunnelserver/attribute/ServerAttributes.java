@@ -20,6 +20,9 @@ public final class ServerAttributes {
     /** HTTP 登录产生的客户端会话 ID，仅新 token 登录路径有值。 */
     public static final AttributeKey<Long> CLIENT_SESSION_ID = AttributeKey.valueOf("clientSessionId");
 
+    /** Mandatory v2 role: {@code control} or {@code data}. */
+    public static final AttributeKey<String> CONNECTION_ROLE = AttributeKey.valueOf("connectionRole");
+
     /** 已登录会话上下文。绑定 = 已登录；移除 = 未登录。 */
     public static final AttributeKey<Session> SESSION = AttributeKey.valueOf("session");
 }

@@ -88,7 +88,8 @@ final class TurnLongTermAuthenticator {
     static boolean requiresAuthentication(int messageType) {
         return messageType == StunMessage.ALLOCATE_REQUEST
                 || messageType == StunMessage.REFRESH_REQUEST
-                || messageType == StunMessage.CREATE_PERMISSION_REQUEST;
+                || messageType == StunMessage.CREATE_PERMISSION_REQUEST
+                || messageType == StunMessage.CHANNEL_BIND_REQUEST;
     }
 
     static int errorCode(StunMessage response) {

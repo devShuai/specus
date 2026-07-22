@@ -6,6 +6,8 @@ import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.handler.HeartbeatRequestHandler;
 import com.theshuai.common.handler.SocketIdleStateHandler;
 import com.theshuai.tunnelserver.handler.AuthHandler;
+import com.theshuai.tunnelserver.handler.ControlProtocolMetricsHandler;
+import com.theshuai.tunnelserver.handler.ConnectionRoleHandler;
 import com.theshuai.tunnelserver.handler.LogoutRequestHandler;
 import com.theshuai.tunnelserver.handler.ServerMessageHandler;
 import com.theshuai.tunnelserver.config.NettyServerProperties;
@@ -31,12 +33,19 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import jakarta.annotation.PreDestroy;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
 
 import lombok.extern.slf4j.Slf4j;
+
+import java.net.InetAddress;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Component
 @Slf4j
@@ -47,10 +56,13 @@ public class NettyServer implements ApplicationRunner {
     private final TrafficInspectionService trafficInspectionService;
     private final RemotePortServerManager remotePortServerManager;
     private final TlsProperties tlsProperties;
-    private final com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler;
     private final WebSocketStreamRegistry webSocketStreamRegistry;
     private final WebSocketTunnelHandler webSocketTunnelHandler;
     private final ServerMessageHandler serverMessageHandler;
+    private final ControlProtocolMetricsHandler controlProtocolMetricsHandler;
+    private final Environment environment;
+    private final Counter plaintextDeploymentRejected;
+    private final AtomicLong certificateExpiryEpochSeconds = new AtomicLong();
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel channel;
@@ -61,20 +73,31 @@ public class NettyServer implements ApplicationRunner {
                        TrafficInspectionService trafficInspectionService,
                        RemotePortServerManager remotePortServerManager,
                        TlsProperties tlsProperties,
-                       com.theshuai.tunnelserver.http.DirectHttpResponseHandler directHttpResponseHandler,
                        WebSocketStreamRegistry webSocketStreamRegistry,
                        WebSocketTunnelHandler webSocketTunnelHandler,
-                       ServerMessageHandler serverMessageHandler) {
+                       ServerMessageHandler serverMessageHandler,
+                       ControlProtocolMetricsHandler controlProtocolMetricsHandler,
+                       Environment environment,
+                       io.micrometer.core.instrument.MeterRegistry meterRegistry) {
         this.nettyProperties = nettyProperties;
         this.managedLoginRequestHandler = managedLoginRequestHandler;
         this.trafficUsageService = trafficUsageService;
         this.trafficInspectionService = trafficInspectionService;
         this.remotePortServerManager = remotePortServerManager;
         this.tlsProperties = tlsProperties;
-        this.directHttpResponseHandler = directHttpResponseHandler;
         this.webSocketStreamRegistry = webSocketStreamRegistry;
         this.webSocketTunnelHandler = webSocketTunnelHandler;
         this.serverMessageHandler = serverMessageHandler;
+        this.controlProtocolMetricsHandler = controlProtocolMetricsHandler;
+        this.environment = environment;
+        this.plaintextDeploymentRejected = Counter.builder("tunnel.control.plaintext.deployment.rejected")
+                .register(meterRegistry);
+        Gauge.builder("tunnel.control.tls.certificate.expiry.epoch.seconds", certificateExpiryEpochSeconds, AtomicLong::get)
+                .register(meterRegistry);
+        Gauge.builder("tunnel.control.tls.mode", () -> 1.0D)
+                .tag("mode", effectiveTlsMode())
+                .strongReference(true)
+                .register(meterRegistry);
     }
 
     @Override
@@ -83,6 +106,7 @@ public class NettyServer implements ApplicationRunner {
     }
 
     public void start() {
+        validateConfiguration();
         bossGroup = newEventLoopGroup(nettyProperties.getBossThreads());
         workerGroup = newEventLoopGroup(nettyProperties.getWorkerThreads());
 
@@ -96,8 +120,13 @@ public class NettyServer implements ApplicationRunner {
         );
         if (sslContext != null) {
             log.info("[tls] control channel is encrypted (mode={})", tlsProperties.getMode());
+            if (tlsProperties.resolveMode() == TlsContextFactory.Mode.FILE) {
+                certificateExpiryEpochSeconds.set(TlsContextFactory.certificateExpiryEpochSeconds(
+                        tlsProperties.getKeystore(), tlsProperties.getKeystorePassword()));
+            }
         } else {
-            log.info("[tls] control channel is PLAIN (TLS disabled)");
+            log.warn("[tls] control channel is PLAIN (TLS disabled, upstreamTermination={})",
+                    tlsProperties.isTerminatedUpstream());
         }
 
         final ServerBootstrap serverBootstrap = new ServerBootstrap();
@@ -123,10 +152,14 @@ public class NettyServer implements ApplicationRunner {
                             ch.pipeline().addFirst(sslHandler);
                         }
                         ch.pipeline().addLast(new SocketIdleStateHandler());
-                        ch.pipeline().addLast(new Spliter(nettyProperties.getMaxFrameSize()));
+                        ch.pipeline().addLast(
+                                Spliter.PRE_AUTH_HANDLER_NAME,
+                                new Spliter(nettyProperties.getPreAuthMaxFrameSize()));
                         ch.pipeline().addLast(PacketCodecHandler.INSTANCE);
+                        ch.pipeline().addLast(controlProtocolMetricsHandler);
                         ch.pipeline().addLast(managedLoginRequestHandler);
                         ch.pipeline().addLast(AuthHandler.INSTANCE);
+                        ch.pipeline().addLast(ConnectionRoleHandler.INSTANCE);
                         ch.pipeline().addLast(HeartbeatRequestHandler.INSTANCE);
                         ch.pipeline().addLast(new NatServerHandler(
                                 trafficUsageService,
@@ -136,7 +169,6 @@ public class NettyServer implements ApplicationRunner {
                                 webSocketStreamRegistry,
                                 webSocketTunnelHandler
                         ));
-                        ch.pipeline().addLast(directHttpResponseHandler);
                         ch.pipeline().addLast(serverMessageHandler);
                         ch.pipeline().addLast(LogoutRequestHandler.INSTANCE);
                     }
@@ -146,7 +178,7 @@ public class NettyServer implements ApplicationRunner {
 
     private void bind(final ServerBootstrap serverBootstrap) {
         int port = nettyProperties.getPort();
-        ChannelFuture channelFuture = serverBootstrap.bind(port);
+        ChannelFuture channelFuture = serverBootstrap.bind(nettyProperties.getBindAddress(), port);
         channelFuture.addListener((ChannelFuture future) -> {
             if (future.isSuccess()) {
                 channel = future.channel();
@@ -190,5 +222,46 @@ public class NettyServer implements ApplicationRunner {
             return new MultiThreadIoEventLoopGroup(threads, NioIoHandler.newFactory());
         }
         return new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+    }
+
+    private void validateConfiguration() {
+        if (nettyProperties.getPreAuthMaxFrameSize() < com.theshuai.common.protocol.PacketCodec.HEADER_SIZE
+                || nettyProperties.getPreAuthMaxFrameSize() > nettyProperties.getMaxFrameSize()) {
+            throw new IllegalStateException("pre-auth frame size must be between the protocol header and max frame size");
+        }
+        boolean production = tlsProperties.isRequireEncryption()
+                || Arrays.stream(environment.getActiveProfiles())
+                .anyMatch(profile -> profile.equalsIgnoreCase("prod") || profile.equalsIgnoreCase("production"));
+        if (!production) {
+            return;
+        }
+        TlsContextFactory.Mode mode = tlsProperties.resolveMode();
+        if (mode == TlsContextFactory.Mode.SELF_SIGNED) {
+            plaintextDeploymentRejected.increment();
+            throw new IllegalStateException("production control channel cannot use a self-signed certificate");
+        }
+        if (mode == TlsContextFactory.Mode.DISABLED
+                && (!tlsProperties.isTerminatedUpstream() || !isPrivateBindAddress(nettyProperties.getBindAddress()))) {
+            plaintextDeploymentRejected.increment();
+            throw new IllegalStateException(
+                    "production control channel requires TLS, or trusted upstream TLS with a private/loopback bind address");
+        }
+    }
+
+    private String effectiveTlsMode() {
+        if (tlsProperties.resolveMode() != TlsContextFactory.Mode.DISABLED) {
+            return tlsProperties.resolveMode().name().toLowerCase();
+        }
+        return tlsProperties.isTerminatedUpstream() ? "terminated_upstream" : "disabled";
+    }
+
+    private boolean isPrivateBindAddress(String value) {
+        try {
+            InetAddress address = InetAddress.getByName(value);
+            return !address.isAnyLocalAddress()
+                    && (address.isLoopbackAddress() || address.isSiteLocalAddress() || address.isLinkLocalAddress());
+        } catch (Exception e) {
+            return false;
+        }
     }
 }

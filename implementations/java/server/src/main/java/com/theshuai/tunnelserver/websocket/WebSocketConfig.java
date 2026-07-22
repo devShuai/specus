@@ -1,9 +1,7 @@
 package com.theshuai.tunnelserver.websocket;
 
-import com.theshuai.tunnelserver.management.security.ManagementContextResolver;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.web.socket.config.annotation.EnableWebSocket;
 import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
@@ -14,7 +12,7 @@ import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry
  * <p>挂在 {@code /ws/connections}：
  * <ul>
  *   <li>handler：{@link ConnectionEventsWebSocketHandler}（推送 {@link ConnectionEvent}）</li>
- *   <li>握手鉴权：{@link JwtHandshakeInterceptor}（query 串 token）</li>
+ *   <li>握手鉴权：45 秒、单用途 WebSocket ticket</li>
  *   <li>允许同源访问；前端在 SecurityConfig 的 CSP {@code connect-src 'self'} 内</li>
  * </ul>
  *
@@ -33,32 +31,32 @@ public class WebSocketConfig implements WebSocketConfigurer {
     private final ConnectionEventsWebSocketHandler connectionEventsHandler;
     private final PublicTransferDiscoveryWebSocketHandler publicTransferDiscoveryHandler;
     private final ClientMessagesWebSocketHandler clientMessagesHandler;
-    private final JwtDecoder jwtDecoder;
-    private final ManagementContextResolver contextResolver;
+    private final WebSocketTicketService ticketService;
 
     public WebSocketConfig(ConnectionEventsWebSocketHandler connectionEventsHandler,
                            PublicTransferDiscoveryWebSocketHandler publicTransferDiscoveryHandler,
                            ClientMessagesWebSocketHandler clientMessagesHandler,
-                           JwtDecoder jwtDecoder,
-                           ManagementContextResolver contextResolver) {
+                           WebSocketTicketService ticketService) {
         this.connectionEventsHandler = connectionEventsHandler;
         this.publicTransferDiscoveryHandler = publicTransferDiscoveryHandler;
         this.clientMessagesHandler = clientMessagesHandler;
-        this.jwtDecoder = jwtDecoder;
-        this.contextResolver = contextResolver;
+        this.ticketService = ticketService;
     }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         registry.addHandler(connectionEventsHandler, "/ws/connections")
-                .addInterceptors(new JwtHandshakeInterceptor(jwtDecoder, contextResolver))
+                .addInterceptors(new WebSocketTicketHandshakeInterceptor(
+                        ticketService, WebSocketTicketService.Scope.CONNECTIONS, true))
                 // 默认 '*' 同源；显式写出来以示意，不引入 CORS 漏洞
                 .setAllowedOriginPatterns("*");
         registry.addHandler(publicTransferDiscoveryHandler, "/ws/public-transfer/discovery")
-                .addInterceptors(new PublicTransferDiscoveryWebSocketHandler.PublicTransferDiscoveryHandshakeInterceptor())
+                .addInterceptors(new WebSocketTicketHandshakeInterceptor(
+                        ticketService, WebSocketTicketService.Scope.PUBLIC_TRANSFER, true))
                 .setAllowedOriginPatterns("*");
         registry.addHandler(clientMessagesHandler, "/ws/client-messages")
-                .addInterceptors(new JwtHandshakeInterceptor(jwtDecoder, contextResolver))
+                .addInterceptors(new WebSocketTicketHandshakeInterceptor(
+                        ticketService, WebSocketTicketService.Scope.CLIENT_MESSAGES, true))
                 .setAllowedOriginPatterns("*");
     }
 }

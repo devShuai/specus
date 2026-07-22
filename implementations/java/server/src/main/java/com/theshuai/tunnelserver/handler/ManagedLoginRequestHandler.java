@@ -2,6 +2,8 @@ package com.theshuai.tunnelserver.handler;
 
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.response.LoginResponsePacket;
+import com.theshuai.common.protocol.ConnectionRole;
+import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.session.Session;
 import com.theshuai.tunnelserver.session.SessionUtil;
 import com.theshuai.tunnelserver.management.model.DisconnectReason;
@@ -10,6 +12,7 @@ import com.theshuai.tunnelserver.management.service.ClientAuthService;
 import com.theshuai.tunnelserver.management.service.ConnectionRecordService;
 import com.theshuai.tunnelserver.management.service.NatControlService;
 import com.theshuai.tunnelserver.management.service.PeerSignalService;
+import com.theshuai.tunnelserver.config.NettyServerProperties;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -27,27 +30,38 @@ import java.util.concurrent.RejectedExecutionException;
 @Slf4j
 public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<LoginRequestPacket> {
     private static final AttributeKey<Long> CONNECTION_RECORD_ID = AttributeKey.valueOf("connectionRecordId");
+    private static final AttributeKey<Boolean> LOGIN_STARTED = AttributeKey.valueOf("loginStarted");
 
     private final ClientAuthService clientAuthService;
     private final ConnectionRecordService connectionRecordService;
     private final NatControlService natControlService;
     private final PeerSignalService peerSignalService;
     private final ExecutorService loginExecutor;
+    private final NettyServerProperties nettyProperties;
 
     public ManagedLoginRequestHandler(ClientAuthService clientAuthService,
                                       ConnectionRecordService connectionRecordService,
                                       NatControlService natControlService,
                                       PeerSignalService peerSignalService,
+                                      NettyServerProperties nettyProperties,
                                       @Qualifier("loginExecutor") ExecutorService loginExecutor) {
         this.clientAuthService = clientAuthService;
         this.connectionRecordService = connectionRecordService;
         this.natControlService = natControlService;
         this.peerSignalService = peerSignalService;
+        this.nettyProperties = nettyProperties;
         this.loginExecutor = loginExecutor;
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, LoginRequestPacket packet) {
+        if (ctx.channel().attr(LOGIN_STARTED).setIfAbsent(Boolean.TRUE) != null) {
+            log.warn("duplicate login rejected: channel={} client={}",
+                    ctx.channel().id().asLongText(), packet.getClientName());
+            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
+            ctx.close();
+            return;
+        }
         // The decoded packet is a plain POJO (not reference-counted), so it stays valid after this
         // method returns and is safe to hand to a worker thread. Keep the event loop free of DB work.
         try {
@@ -63,44 +77,67 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
 
     private void handleLogin(ChannelHandlerContext ctx, LoginRequestPacket packet) {
         try {
-            AuthenticationResult authentication = StringUtils.hasText(packet.getAccessToken())
+            boolean validRole = ConnectionRole.isValid(packet.getConnectionRole());
+            boolean dataConnection = ConnectionRole.DATA.equals(packet.getConnectionRole());
+            AuthenticationResult authentication = validRole && StringUtils.hasText(packet.getAccessToken())
                     ? clientAuthService.authenticateNetty(
                     packet,
                     ctx.channel().id().asLongText(),
-                    String.valueOf(ctx.channel().remoteAddress()))
-                    : AuthenticationResult.failure(null, "客户端必须先通过 HTTP 登录获取访问令牌");
-            long connectionRecordId = connectionRecordService.recordConnection(
-                    authentication,
-                    packet,
-                    ctx.channel().id().asLongText(),
-                    String.valueOf(ctx.channel().remoteAddress())
-            );
+                    String.valueOf(ctx.channel().remoteAddress()),
+                    dataConnection)
+                    : AuthenticationResult.failure(null, validRole
+                    ? "客户端必须先通过 HTTP 登录获取访问令牌"
+                    : "登录包缺少有效 connectionRole");
+            if (authentication.success() && dataConnection
+                    && !SessionUtil.hasMatchingControl(packet.getClientName(), authentication.clientSessionId())) {
+                authentication = AuthenticationResult.failure(authentication.account(), "数据连接未找到匹配的控制连接");
+            }
+            AuthenticationResult finalAuthentication = authentication;
+            long connectionRecordId = dataConnection ? 0L : connectionRecordService.recordConnection(
+                    finalAuthentication, packet, ctx.channel().id().asLongText(),
+                    String.valueOf(ctx.channel().remoteAddress()));
 
             LoginResponsePacket response = new LoginResponsePacket();
             response.setVersion(packet.getVersion());
             response.setClientName(packet.getClientName());
-            response.setSuccess(authentication.success());
-            response.setReason(authentication.reason());
+            response.setSuccess(finalAuthentication.success());
+            response.setReason(finalAuthentication.reason());
 
             // Channel-affecting work (attribute, session bind, write) must run on the channel's
             // event loop so it stays ordered relative to other I/O on this connection.
             ctx.channel().eventLoop().execute(() -> {
-                if (authentication.success()) {
-                    ctx.channel().attr(CONNECTION_RECORD_ID).set(connectionRecordId);
+                if (finalAuthentication.success()) {
+                    if (ctx.pipeline().context(Spliter.PRE_AUTH_HANDLER_NAME) != null) {
+                        ctx.pipeline().replace(
+                                Spliter.PRE_AUTH_HANDLER_NAME,
+                                Spliter.AUTHENTICATED_HANDLER_NAME,
+                                new Spliter(nettyProperties.getMaxFrameSize()));
+                    }
+                    if (connectionRecordId > 0) {
+                        ctx.channel().attr(CONNECTION_RECORD_ID).set(connectionRecordId);
+                    }
                     ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.LOGIN_TIME_MS).set(System.currentTimeMillis());
                     ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.TENANT_ID).set(
-                            authentication.account().getTenantId());
-                    if (authentication.clientSessionId() != null) {
+                            finalAuthentication.account().getTenantId());
+                    ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.CONNECTION_ROLE).set(
+                            packet.getConnectionRole());
+                    if (finalAuthentication.clientSessionId() != null) {
                         ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.CLIENT_SESSION_ID).set(
-                                authentication.clientSessionId());
+                                finalAuthentication.clientSessionId());
                     }
-                    SessionUtil.bindSession(new Session(packet.getClientName()), ctx.channel());
+                    if (dataConnection) {
+                        SessionUtil.bindDataSession(new Session(packet.getClientName()), ctx.channel());
+                    } else {
+                        SessionUtil.bindControlSession(new Session(packet.getClientName()), ctx.channel());
+                    }
                 }
                 io.netty.channel.ChannelFuture writeFuture = ctx.writeAndFlush(response);
-                if (authentication.success()) {
-                    // pushOnLogin reads the DB; run it off the event loop, after the session is bound.
-                    submit(() -> natControlService.pushOnLogin(packet.getClientName()));
-                    submit(() -> peerSignalService.pushOnLogin(authentication.account()));
+                if (finalAuthentication.success()) {
+                    if (!dataConnection) {
+                        // pushOnLogin reads the DB; run it off the event loop, after the session is bound.
+                        submit(() -> natControlService.pushOnLogin(packet.getClientName()));
+                        submit(() -> peerSignalService.pushOnLogin(finalAuthentication.account()));
+                    }
                 } else {
                     // 登录失败必须主动关连接，否则客户端心跳会让 server 端 reader idle 一直不超时，
                     // 形成"无 session 但保活"的僵尸连接，浪费资源也阻塞合法重连。
@@ -119,6 +156,9 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        String role = ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.CONNECTION_ROLE)
+                .getAndSet(null);
+        boolean dataConnection = ConnectionRole.DATA.equals(role);
         Long connectionRecordId = ctx.channel().attr(CONNECTION_RECORD_ID).getAndSet(null);
         Long clientSessionId = ctx.channel().attr(com.theshuai.tunnelserver.attribute.ServerAttributes.CLIENT_SESSION_ID)
                 .getAndSet(null);
@@ -129,8 +169,12 @@ public class ManagedLoginRequestHandler extends SimpleChannelInboundHandler<Logi
             DisconnectReason reason = marked == null ? DisconnectReason.CLIENT_CLOSED : marked;
             submit(() -> connectionRecordService.recordDisconnect(recordId, reason));
         }
-        if (clientSessionId != null) {
+        if (clientSessionId != null && !dataConnection) {
             submit(() -> clientAuthService.markNettyDisconnected(clientSessionId));
+        }
+        Session session = SessionUtil.getSession(ctx.channel());
+        if (!dataConnection && session != null) {
+            SessionUtil.closeDataSession(session.getClientName());
         }
         SessionUtil.unBindSession(ctx.channel());
         super.channelInactive(ctx);

@@ -2,6 +2,7 @@ package com.theshuai.tunnelserver.handler;
 
 import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
+import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.tunnelserver.handler.ChannelAttributes.EndpointSnapshot;
@@ -16,17 +17,21 @@ public class RemoteTunnelHandler extends NatCommonHandler {
 
     private final NatServerHandler tunnelHandler;
 
+    private final int streamId;
+
     private final int port;
     private final String clientName;
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
 
     public RemoteTunnelHandler(NatServerHandler tunnelHandler,
+                               int streamId,
                                int port,
                                String clientName,
                                TrafficUsageService trafficUsageService,
                                TrafficInspectionService trafficInspectionService) {
         this.tunnelHandler = tunnelHandler;
+        this.streamId = streamId;
         this.port = port;
         this.clientName = clientName;
         this.trafficUsageService = trafficUsageService;
@@ -44,9 +49,11 @@ public class RemoteTunnelHandler extends NatCommonHandler {
         // 之后 channelRead 每帧不再触发 asLongText + getHostAddress。
         ChannelAttributes.initHotPath(ctx.channel());
         String channelId = ChannelAttributes.channelId(ctx.channel());
+        StreamFlowController.get(controlCtx.channel()).open(streamId, ctx.channel());
 
         NatMessagePacket message = new NatMessagePacket();
-        message.setNatMessageType(NatMessageType.CONNECTED);
+        message.setNatMessageType(NatMessageType.OPEN);
+        message.setStreamId(streamId);
         // 元数据只有 2 个 key，给一个匹配大小的 HashMap 容量，避免默认 16 桶的浪费
         Map<String, Object> metaData = new HashMap<>(4, 0.75f);
         metaData.put("channelId", channelId);
@@ -60,14 +67,9 @@ public class RemoteTunnelHandler extends NatCommonHandler {
         String channelId = ChannelAttributes.channelId(ctx.channel());
         trafficInspectionService.releaseTcpStream(channelId);
 
-        NatMessagePacket message = new NatMessagePacket();
-        message.setNatMessageType(NatMessageType.DISCONNECTED);
-        Map<String, Object> metaData = new HashMap<>(2, 0.75f);
-        metaData.put("channelId", channelId);
-        message.setMetaData(metaData);
         ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
         if (controlCtx != null && controlCtx.channel().isActive()) {
-            controlCtx.writeAndFlush(message);
+            StreamFlowController.get(controlCtx.channel()).finish(streamId);
         }
     }
 
@@ -93,19 +95,7 @@ public class RemoteTunnelHandler extends NatCommonHandler {
                 local.port(),
                 data);
 
-        NatMessagePacket message = new NatMessagePacket();
-        message.setNatMessageType(NatMessageType.DATA);
-        Map<String, Object> metaData = new HashMap<>(2, 0.75f);
-        metaData.put("channelId", channelId);
-        message.setMetaData(metaData);
-        message.setData(data);
-        // 用 attr-cached listener 实例，避免每帧 new lambda；listener 内部
-        // 关闭的是 future.channel()（写入端 = 控制连接）失败时；如果想关闭读取端
-        // （ctx.channel()），用 closeOnFailureOf(ctx.channel()) 拿到 channel-scoped 单例。
-        controlCtx.writeAndFlush(message).addListener(ChannelAttributes.closeOnFailureOf(ctx.channel()));
-        if (!controlCtx.channel().isWritable()) {
-            ChannelBackpressure.setAutoRead(ctx.channel(), false);
-        }
+        StreamFlowController.get(controlCtx.channel()).send(streamId, data, ctx.channel(), ctx::close);
     }
 
     @Override

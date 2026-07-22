@@ -5,6 +5,7 @@ import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.tunnelclient.bean.HttpTunnelConfig;
+import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.client.TcpConnection;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
@@ -20,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * NAT_CONTROL 到 client 的整合契约测试。覆盖：
  * <ul>
- *   <li>{@code httpTunnelConfigList} 出现时调用 {@link DirectHttpRequestHandler#applyRoutes}（即热更新）</li>
+ *   <li>{@code httpTunnelConfigList} 出现时替换 {@link NatClientHandler} 的 HTTP/WS 路由快照</li>
  *   <li>{@code httpTunnelConfigList} 缺省时**保留** HTTP 登录初始快照，不要误清空</li>
  *   <li>{@code httpTunnelConfigList} 为空数组时整体清空（接管态全部禁用/删除）</li>
  * </ul>
@@ -28,19 +29,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>这里直接拼装 NAT_CONTROL JSON，避开 server 端依赖；这是与 server
  * {@code NatControlService.sendNatControl} 的隐式契约——格式由 {@code TunnelBean} 这一侧驱动。
  *
- * <p>注意：HTTP_ROUTES_REPORT 在 {@link MessageResponseHandler} 中由
- * {@code addLast(NatClientHandler)} 触发，**先于** {@code applyRoutes} 调用，因此首次
- * NAT_CONTROL 中报告的 routes 反映的是 HTTP 登录初始快照；下次重连后才反映 push 后的最新值。
- * 本测试只断言路由表本身的状态，不再约束首次 report 内容。
  */
 class NatControlHotReloadTests {
 
     @Test
     void natControlHttpListReplacesRoutes() {
-        DirectHttpRequestHandler directHttp = new DirectHttpRequestHandler(List.of(
-                routeConfig("initial", "http://127.0.0.1:9999")
-        ));
-        EmbeddedChannel channel = new EmbeddedChannel(directHttp, new MessageResponseHandler(new TcpConnection()));
+        NatClientHandler nat = natHandlerWithInitialRoute();
+        EmbeddedChannel channel = new EmbeddedChannel(nat, new MessageResponseHandler(new TcpConnection()));
         try {
             // server 下发：tcp 一个端口 + http 整体替换为新的 web/api 两条
             String json = """
@@ -58,21 +53,15 @@ class NatControlHotReloadTests {
             channel.writeInbound(natControl(json));
 
             // applyRoutes 已被触发：initial 不复存在，新两条已生效
-            Map<String, String> snapshot = directHttp.getCurrentRoutes();
+            Map<String, String> snapshot = nat.getCurrentHttpRoutes();
             assertEquals(2, snapshot.size());
             assertEquals("http://127.0.0.1:8080", snapshot.get("web"));
             assertEquals("https://api.example.com", snapshot.get("api"));
 
-            // NatClientHandler 由 NAT_CONTROL 路径动态加入 pipeline；handlerAdded 后会先发 REGISTER，
-            // 再发 HTTP_ROUTES_REPORT。两条都应到达 outbound 队列；至于 report 的 metaData，
-            // 由于 addLast 早于 applyRoutes，反映的是初始快照，这里仅断言 frame 类型。
+            // NatClientHandler 由 NAT_CONTROL 路径动态加入 pipeline，并发送 TCP REGISTER。
             NatMessagePacket register = readNatMessage(channel);
             assertNotNull(register);
             assertEquals(NatMessageType.REGISTER, register.getNatMessageType());
-            NatMessagePacket report = readNatMessage(channel);
-            assertNotNull(report);
-            assertEquals(NatMessageType.HTTP_ROUTES_REPORT, report.getNatMessageType());
-            assertNotNull(report.getMetaData().get("routes"));
         } finally {
             channel.finishAndReleaseAll();
         }
@@ -80,10 +69,8 @@ class NatControlHotReloadTests {
 
     @Test
     void natControlWithoutHttpListPreservesInitialRoutes() {
-        DirectHttpRequestHandler directHttp = new DirectHttpRequestHandler(List.of(
-                routeConfig("initial", "http://127.0.0.1:9999")
-        ));
-        EmbeddedChannel channel = new EmbeddedChannel(directHttp, new MessageResponseHandler(new TcpConnection()));
+        NatClientHandler nat = natHandlerWithInitialRoute();
+        EmbeddedChannel channel = new EmbeddedChannel(nat, new MessageResponseHandler(new TcpConnection()));
         try {
             // 本次 NAT_CONTROL 不下发 httpTunnelConfigList 字段；客户端必须保留初始快照
             String json = """
@@ -96,7 +83,7 @@ class NatControlHotReloadTests {
                     """;
             channel.writeInbound(natControl(json));
 
-            assertEquals(Map.of("initial", "http://127.0.0.1:9999"), directHttp.getCurrentRoutes());
+            assertEquals(Map.of("initial", "http://127.0.0.1:9999"), nat.getCurrentHttpRoutes());
         } finally {
             channel.finishAndReleaseAll();
         }
@@ -104,10 +91,8 @@ class NatControlHotReloadTests {
 
     @Test
     void natControlEmptyHttpListClearsInitialRoutes() {
-        DirectHttpRequestHandler directHttp = new DirectHttpRequestHandler(List.of(
-                routeConfig("initial", "http://127.0.0.1:9999")
-        ));
-        EmbeddedChannel channel = new EmbeddedChannel(directHttp, new MessageResponseHandler(new TcpConnection()));
+        NatClientHandler nat = natHandlerWithInitialRoute();
+        EmbeddedChannel channel = new EmbeddedChannel(nat, new MessageResponseHandler(new TcpConnection()));
         try {
             // 服务端"接管态但全部禁用/删除"——下发空数组，客户端整体替换为空
             String json = """
@@ -121,8 +106,8 @@ class NatControlHotReloadTests {
                     """;
             channel.writeInbound(natControl(json));
 
-            assertFalse(directHttp.getCurrentRoutes().containsKey("initial"));
-            assertTrue(directHttp.getCurrentRoutes().isEmpty());
+            assertFalse(nat.getCurrentHttpRoutes().containsKey("initial"));
+            assertTrue(nat.getCurrentHttpRoutes().isEmpty());
         } finally {
             channel.finishAndReleaseAll();
         }
@@ -140,6 +125,15 @@ class NatControlHotReloadTests {
         config.setRoute(route);
         config.setTargetBaseUrl(targetBaseUrl);
         return config;
+    }
+
+    private static NatClientHandler natHandlerWithInitialRoute() {
+        TunnelBean bean = new TunnelBean();
+        bean.setClientName("unit");
+        bean.setRemoteAddress("127.0.0.1");
+        bean.setTunnelConfigList(List.of());
+        bean.setHttpTunnelConfigList(List.of(routeConfig("initial", "http://127.0.0.1:9999")));
+        return new NatClientHandler(bean, new TcpConnection());
     }
 
     /** 跳过非 NatMessagePacket（ByteBuf 等）只取我们关心的协议帧。 */

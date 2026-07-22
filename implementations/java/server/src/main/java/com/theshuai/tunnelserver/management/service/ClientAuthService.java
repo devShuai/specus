@@ -56,6 +56,7 @@ public class ClientAuthService {
     private final TunnelMappingRepository tunnelMappingRepository;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
     private final PeerMeshService peerMeshService;
+    private final ClientAuthNonceService nonceService;
     private final ClientAuthProperties properties;
     private final NettyServerProperties nettyProperties;
     private final String publicAddress;
@@ -68,6 +69,7 @@ public class ClientAuthService {
                              TunnelMappingRepository tunnelMappingRepository,
                              HttpRouteMappingRepository httpRouteMappingRepository,
                              PeerMeshService peerMeshService,
+                             ClientAuthNonceService nonceService,
                              ClientAuthProperties properties,
                              NettyServerProperties nettyProperties,
                              @Value("${tunnel.public-address:}") String publicAddress) {
@@ -79,6 +81,7 @@ public class ClientAuthService {
         this.tunnelMappingRepository = tunnelMappingRepository;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
         this.peerMeshService = peerMeshService;
+        this.nonceService = nonceService;
         this.properties = properties;
         this.nettyProperties = nettyProperties;
         this.publicAddress = StringUtils.hasText(publicAddress) ? publicAddress.trim() : "";
@@ -149,6 +152,12 @@ public class ClientAuthService {
 
     @Transactional
     public AuthenticationResult authenticateNetty(LoginRequestPacket packet, String channelId, String remoteAddress) {
+        return authenticateNetty(packet, channelId, remoteAddress, false);
+    }
+
+    @Transactional
+    public AuthenticationResult authenticateNetty(LoginRequestPacket packet, String channelId,
+                                                   String remoteAddress, boolean dataConnection) {
         if (packet == null || !StringUtils.hasText(packet.getAccessToken())) {
             return AuthenticationResult.failure(null, "缺少客户端访问令牌");
         }
@@ -172,6 +181,14 @@ public class ClientAuthService {
         }
         if (!credential.isEnabled() || !account.isEnabled()) {
             return AuthenticationResult.failure(account, "客户端已停用");
+        }
+        if (dataConnection && !STATUS_NETTY_ONLINE.equals(session.getStatus())) {
+            return AuthenticationResult.failure(account, "数据连接要求控制连接先登录");
+        }
+        if (dataConnection) {
+            packet.setClientName(account.getClientName());
+            packet.setClientSessionId(session.getId());
+            return AuthenticationResult.success(account, session.getId());
         }
         if (hasExceededRateLimit(account)) {
             return AuthenticationResult.failure(account, "连接频率超过限制");
@@ -219,6 +236,9 @@ public class ClientAuthService {
                 .orElseThrow(() -> new IllegalArgumentException("客户端凭证不存在"));
         if (!hasValidApiKeySignature(request, credential)) {
             throw new IllegalArgumentException("客户端签名无效或已过期");
+        }
+        if (!nonceService.consume(apiKey, request.getNonce())) {
+            throw new IllegalArgumentException("客户端签名 nonce 已使用");
         }
         return credential;
     }

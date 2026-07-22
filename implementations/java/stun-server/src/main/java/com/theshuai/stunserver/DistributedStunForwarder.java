@@ -13,28 +13,31 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.util.Arrays;
-import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 
 final class DistributedStunForwarder {
     private static final byte[] MAGIC =
             new byte[]{'S', 'T', 'F', 'W', 'D', '2', '\r', '\n'};
-    private static final int VERSION = 1;
-    private static final int NONCE_BYTES = 16;
+    private static final int VERSION = 2;
     private static final int HMAC_BYTES = 32;
     private static final int MIN_PACKET_BYTES =
-            MAGIC.length + 1 + 1 + Long.BYTES + NONCE_BYTES + 1
+            MAGIC.length + 1 + 1 + 1 + Integer.BYTES
+                    + Long.BYTES + Long.BYTES + Long.BYTES + 1
                     + Short.BYTES + 4 + Short.BYTES
                     + StunMessage.HEADER_BYTES + HMAC_BYTES;
+    private static final int MAX_TRACKED_EPOCHS = 64;
 
     private final StandaloneStunDistributionConfig config;
     private final Clock clock;
-    private final SecureRandom random;
-    private final ReplayWindow replayWindow;
+    private final long senderEpoch;
+    private final AtomicLong nextSequence = new AtomicLong(1);
+    private final EpochReplayWindow replayWindow;
     private final TokenBucket rateLimiter;
+    private final Map<Integer, ThreadLocal<Mac>> macs;
 
     DistributedStunForwarder(StandaloneStunDistributionConfig config) {
         this(config, Clock.systemUTC(), new SecureRandom());
@@ -49,11 +52,22 @@ final class DistributedStunForwarder {
             throw new IllegalArgumentException("distributed forwarding is disabled");
         }
         this.clock = Objects.requireNonNull(clock, "clock");
-        this.random = Objects.requireNonNull(random, "random");
-        this.replayWindow = new ReplayWindow(
-                config.replayCacheSize(),
-                config.maxClockSkewSeconds() * 1_000L);
+        SecureRandom epochRandom = Objects.requireNonNull(random, "random");
+        long epoch;
+        do {
+            epoch = epochRandom.nextLong() & Long.MAX_VALUE;
+        } while (epoch == 0);
+        this.senderEpoch = epoch;
+        this.replayWindow = new EpochReplayWindow(
+                config.replayWindowSize(),
+                config.maxClockSkewSeconds() * 2_000L);
         this.rateLimiter = new TokenBucket(config.forwardBurst(), clock.millis());
+        Map<Integer, ThreadLocal<Mac>> configuredMacs = new LinkedHashMap<>();
+        configuredMacs.put(config.currentKey().keyId(), mac(config.currentKey()));
+        if (config.previousKey() != null) {
+            configuredMacs.put(config.previousKey().keyId(), mac(config.previousKey()));
+        }
+        this.macs = Map.copyOf(configuredMacs);
     }
 
     byte[] encode(
@@ -73,7 +87,8 @@ final class DistributedStunForwarder {
             case 16 -> 2;
             default -> throw new IllegalArgumentException("unsupported target address family");
         };
-        int unsignedBytes = MAGIC.length + 1 + 1 + Long.BYTES + NONCE_BYTES
+        int unsignedBytes = MAGIC.length + 1 + 1 + 1 + Integer.BYTES
+                + Long.BYTES + Long.BYTES + Long.BYTES
                 + 1 + Short.BYTES + targetAddress.length + Short.BYTES + response.length;
         int packetBytes = unsignedBytes + HMAC_BYTES;
         if (packetBytes > config.maxForwardPacketBytes()) {
@@ -81,21 +96,26 @@ final class DistributedStunForwarder {
                     "distributed forward packet exceeds configured maximum");
         }
 
-        byte[] nonce = new byte[NONCE_BYTES];
-        random.nextBytes(nonce);
+        long sequence = nextSequence.getAndIncrement();
+        if (sequence <= 0) {
+            throw new IllegalStateException("distributed STUN sequence exhausted; restart to create a fresh epoch");
+        }
         ByteBuffer buffer = ByteBuffer.allocate(packetBytes);
         buffer.put(MAGIC);
         buffer.put((byte) VERSION);
+        buffer.put((byte) 0);
         buffer.put((byte) endpointCode(responseEndpoint));
+        buffer.putInt(config.currentKey().keyId());
+        buffer.putLong(senderEpoch);
+        buffer.putLong(sequence);
         buffer.putLong(clock.millis());
-        buffer.put(nonce);
         buffer.put((byte) family);
         buffer.putShort((short) responseTarget.getPort());
         buffer.put(targetAddress);
         buffer.putShort((short) response.length);
         buffer.put(response);
         byte[] unsigned = Arrays.copyOf(buffer.array(), unsignedBytes);
-        buffer.put(hmac(config.sharedSecret(), unsigned));
+        buffer.put(hmac(config.currentKey().keyId(), unsigned));
         return buffer.array();
     }
 
@@ -128,7 +148,25 @@ final class DistributedStunForwarder {
                 bytes,
                 offset + signedLength,
                 offset + length);
-        byte[] expectedHmac = hmac(config.sharedSecret(), signed);
+        int keyId;
+        try {
+            ByteBuffer header = ByteBuffer.wrap(signed);
+            byte[] magic = new byte[MAGIC.length];
+            header.get(magic);
+            if (!Arrays.equals(MAGIC, magic)
+                    || Byte.toUnsignedInt(header.get()) != VERSION
+                    || Byte.toUnsignedInt(header.get()) != 0) {
+                return DecodeResult.rejected("bad_magic");
+            }
+            header.get();
+            keyId = header.getInt();
+        } catch (RuntimeException exception) {
+            return DecodeResult.rejected("malformed");
+        }
+        if (!macs.containsKey(keyId)) {
+            return DecodeResult.rejected("unknown_key");
+        }
+        byte[] expectedHmac = hmac(keyId, signed);
         if (!MessageDigest.isEqual(expectedHmac, actualHmac)) {
             return DecodeResult.rejected("bad_hmac");
         }
@@ -137,7 +175,9 @@ final class DistributedStunForwarder {
             ByteBuffer buffer = ByteBuffer.wrap(signed);
             byte[] magic = new byte[MAGIC.length];
             buffer.get(magic);
-            if (!Arrays.equals(MAGIC, magic) || Byte.toUnsignedInt(buffer.get()) != VERSION) {
+            if (!Arrays.equals(MAGIC, magic)
+                    || Byte.toUnsignedInt(buffer.get()) != VERSION
+                    || Byte.toUnsignedInt(buffer.get()) != 0) {
                 return DecodeResult.rejected("bad_magic");
             }
             StunEndpointTopology.EndpointId endpoint =
@@ -145,13 +185,17 @@ final class DistributedStunForwarder {
             if (endpoint == null || !config.isLocal(endpoint)) {
                 return DecodeResult.rejected("bad_endpoint");
             }
+            if (buffer.getInt() != keyId) {
+                return DecodeResult.rejected("malformed");
+            }
+            long epoch = buffer.getLong();
+            long sequence = buffer.getLong();
             long timestamp = buffer.getLong();
             long skewMillis = config.maxClockSkewSeconds() * 1_000L;
-            if (timestamp < now - skewMillis || timestamp > now + skewMillis) {
+            if (epoch <= 0 || sequence <= 0
+                    || timestamp < now - skewMillis || timestamp > now + skewMillis) {
                 return DecodeResult.rejected("stale");
             }
-            byte[] nonce = new byte[NONCE_BYTES];
-            buffer.get(nonce);
             int family = Byte.toUnsignedInt(buffer.get());
             int addressBytes = switch (family) {
                 case 1 -> 4;
@@ -177,7 +221,7 @@ final class DistributedStunForwarder {
             byte[] response = new byte[responseBytes];
             buffer.get(response);
             validateResponse(response);
-            if (!replayWindow.accept(nonce, now)) {
+            if (!replayWindow.accept(epoch, sequence, now)) {
                 return DecodeResult.rejected("replay");
             }
             return DecodeResult.accepted(
@@ -235,13 +279,28 @@ final class DistributedStunForwarder {
         };
     }
 
-    private static byte[] hmac(byte[] secret, byte[] payload) {
+    private byte[] hmac(int keyId, byte[] payload) {
+        ThreadLocal<Mac> local = macs.get(keyId);
+        if (local == null) {
+            throw new IllegalArgumentException("unknown distributed STUN key");
+        }
+        Mac mac = local.get();
+        mac.reset();
+        return mac.doFinal(payload);
+    }
+
+    private static ThreadLocal<Mac> mac(StandaloneStunDistributionConfig.ForwardKey key) {
+        byte[] secret = key.secret();
+        return ThreadLocal.withInitial(() -> newMac(secret));
+    }
+
+    private static Mac newMac(byte[] secret) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(secret, "HmacSHA256"));
-            return mac.doFinal(payload);
+            return mac;
         } catch (Exception e) {
-            throw new IllegalStateException("cannot compute distributed STUN HMAC", e);
+            throw new IllegalStateException("cannot initialize distributed STUN HMAC", e);
         }
     }
 
@@ -275,37 +334,71 @@ final class DistributedStunForwarder {
         }
     }
 
-    private static final class ReplayWindow {
-        private final int capacity;
-        private final long ttlMillis;
-        private final LinkedHashMap<String, Long> nonces = new LinkedHashMap<>();
+    private static final class EpochReplayWindow {
+        private final int windowSize;
+        private final long retentionMillis;
+        private final LinkedHashMap<Long, EpochState> epochs = new LinkedHashMap<>(16, 0.75F, true);
 
-        private ReplayWindow(int capacity, long ttlMillis) {
-            this.capacity = capacity;
-            this.ttlMillis = ttlMillis;
+        private EpochReplayWindow(int windowSize, long retentionMillis) {
+            this.windowSize = windowSize;
+            this.retentionMillis = retentionMillis;
         }
 
-        private synchronized boolean accept(byte[] nonce, long now) {
-            Iterator<Map.Entry<String, Long>> iterator = nonces.entrySet().iterator();
+        private synchronized boolean accept(long epoch, long sequence, long now) {
+            Iterator<Map.Entry<Long, EpochState>> iterator = epochs.entrySet().iterator();
             while (iterator.hasNext()) {
-                if (iterator.next().getValue() >= now) {
-                    break;
+                if (iterator.next().getValue().expiresAt < now) {
+                    iterator.remove();
                 }
-                iterator.remove();
             }
-            String key = HexFormat.of().formatHex(nonce);
-            if (nonces.containsKey(key)) {
+            EpochState state = epochs.get(epoch);
+            if (state == null) {
+                while (epochs.size() >= MAX_TRACKED_EPOCHS) {
+                    Iterator<Long> keys = epochs.keySet().iterator();
+                    keys.next();
+                    keys.remove();
+                }
+                state = new EpochState(new SequenceWindow(windowSize), now + retentionMillis);
+                epochs.put(epoch, state);
+            }
+            if (!state.window.accept(sequence)) {
                 return false;
             }
-            while (nonces.size() >= capacity) {
-                Iterator<String> keys = nonces.keySet().iterator();
-                if (!keys.hasNext()) {
-                    break;
-                }
-                keys.next();
-                keys.remove();
+            state.expiresAt = now + retentionMillis;
+            return true;
+        }
+    }
+
+    private static final class EpochState {
+        private final SequenceWindow window;
+        private long expiresAt;
+
+        private EpochState(SequenceWindow window, long expiresAt) {
+            this.window = window;
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    private static final class SequenceWindow {
+        private final long[] slots;
+        private long highest;
+
+        private SequenceWindow(int size) {
+            this.slots = new long[size];
+        }
+
+        private boolean accept(long sequence) {
+            if (sequence <= highest && highest - sequence >= slots.length) {
+                return false;
             }
-            nonces.put(key, now + ttlMillis);
+            int slot = (int) (sequence % slots.length);
+            if (slots[slot] == sequence) {
+                return false;
+            }
+            slots[slot] = sequence;
+            if (sequence > highest) {
+                highest = sequence;
+            }
             return true;
         }
     }

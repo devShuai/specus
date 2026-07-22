@@ -8,6 +8,8 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class Spliter extends LengthFieldBasedFrameDecoder {
     public static final int DEFAULT_MAX_FRAME_SIZE = 32 * 1024 * 1024;
+    public static final String PRE_AUTH_HANDLER_NAME = "preauth-frame-decoder";
+    public static final String AUTHENTICATED_HANDLER_NAME = "authenticated-frame-decoder";
     private static final int LENGTH_FIELD_OFFSET = 7;
     private static final int LENGTH_FIELD_LENGTH = 4;
 
@@ -16,7 +18,7 @@ public class Spliter extends LengthFieldBasedFrameDecoder {
     }
 
     public Spliter(int maxFrameSize) {
-        super(validateMaxFrameSize(maxFrameSize), LENGTH_FIELD_OFFSET, LENGTH_FIELD_LENGTH);
+        super(validateMaxFrameSize(maxFrameSize), LENGTH_FIELD_OFFSET, LENGTH_FIELD_LENGTH, 0, 0, true);
     }
 
     @Override

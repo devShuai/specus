@@ -20,13 +20,13 @@ import java.util.List;
 /**
  * HTTP 路由（{@link HttpRouteMapping}）的 CRUD 服务。每次 mutation 之后都调用
  * {@link NatControlService#pushSnapshotIfOnline(ClientAccount)} 把"当前权威全集"推到在线客户端，
- * 由 {@code DirectHttpRequestHandler.applyRoutes} 热替换其内存路由表。
+ * 由 {@code NatClientHandler.applyHttpRoutes} 热替换其内存路由表。
  *
  * <p>校验规则：
  * <ul>
  *   <li>{@code route}：非空，trim 后长度 1~60，禁止包含 {@code /}（前端做精确匹配，路径段以 {@code /} 分隔）</li>
  *   <li>{@code targetBaseUrl}：非空，trim 后长度 ≤ 512，必须为合法绝对 URL（http/https），
- *       由 {@code DirectHttpForwarder} 进一步校验 scheme/host/port</li>
+ *       由 {@code HttpRouteTargetResolver} 进一步校验 scheme/host/port</li>
  *   <li>同一 clientId 下 route 唯一（{@code uk_http_route_client_route}），DB 层会兜底）</li>
  * </ul>
  */

@@ -4,6 +4,7 @@ import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.common.peermesh.PeerControlMessage;
 import com.theshuai.common.peermesh.PeerDataFrameHeader;
+import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.security.HmacSigner;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
@@ -24,15 +25,23 @@ import com.theshuai.tunnelserver.management.security.ManagementContext;
 import com.theshuai.tunnelserver.peer.TurnCredentialService;
 import com.theshuai.tunnelserver.security.PasswordService;
 import com.theshuai.tunnelserver.session.SessionUtil;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
@@ -43,10 +52,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 @Service
+@Slf4j
 public class PeerMeshService {
     public static final String PATH_DIRECT = "DIRECT";
     public static final String PATH_RELAY = "RELAY";
@@ -63,8 +73,11 @@ public class PeerMeshService {
     private final TurnCredentialService turnCredentialService;
     private final ClientSessionRepository clientSessionRepository;
     private final Map<Long, RelayAuthorization> relayAuthorizationCache = new ConcurrentHashMap<>();
-    private final Map<Long, LongAdder> pendingRelayBytes = new ConcurrentHashMap<>();
+    private final Map<Long, AtomicLong> pendingRelayBytes = new ConcurrentHashMap<>();
     private final Map<Long, String> sessionTokenCache = new ConcurrentHashMap<>();
+    private final TransactionTemplate transactionTemplate;
+    private final Counter relayTrafficFlushFailures;
+    private final AtomicLong lastRelayTrafficFlushSuccessMillis = new AtomicLong();
     private volatile long lastExpireMillis;
 
     public PeerMeshService(PeerMeshProperties properties,
@@ -73,7 +86,9 @@ public class PeerMeshService {
                            PeerMeshSessionRepository sessionRepository,
                            ClientAccountRepository clientAccountRepository,
                            TurnCredentialService turnCredentialService,
-                           ClientSessionRepository clientSessionRepository) {
+                           ClientSessionRepository clientSessionRepository,
+                           PlatformTransactionManager transactionManager,
+                           MeterRegistry meterRegistry) {
         this.properties = properties;
         this.deviceRepository = deviceRepository;
         this.aclRepository = aclRepository;
@@ -81,6 +96,19 @@ public class PeerMeshService {
         this.clientAccountRepository = clientAccountRepository;
         this.turnCredentialService = turnCredentialService;
         this.clientSessionRepository = clientSessionRepository;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.relayTrafficFlushFailures = Counter.builder("tunnel.peer_mesh.relay.traffic.flush.failures")
+                .description("Relay traffic batches restored after a persistence failure")
+                .register(meterRegistry);
+        Gauge.builder("tunnel.peer_mesh.relay.traffic.pending.bytes", this, PeerMeshService::pendingRelayByteCount)
+                .description("Relay traffic bytes waiting to be persisted")
+                .register(meterRegistry);
+        Gauge.builder("tunnel.peer_mesh.relay.traffic.flush.lag.seconds", lastRelayTrafficFlushSuccessMillis,
+                        lastSuccess -> lastSuccess.get() <= 0
+                                ? 0
+                                : Math.max(0, System.currentTimeMillis() - lastSuccess.get()) / 1000.0)
+                .description("Seconds since the last successful relay traffic flush")
+                .register(meterRegistry);
     }
 
     public boolean isEnabled() {
@@ -420,53 +448,141 @@ public class PeerMeshService {
     }
 
     @Transactional
-    public boolean authorizeRelayFrame(PeerDataFrameHeader header, long bytes) {
-        if (header == null || bytes <= 0) {
+    public boolean authorizeRelayFrame(PeerDataFrameHeader header,
+                                       long fromClientId,
+                                       long toClientId,
+                                       long bytes) {
+        if (header == null || fromClientId <= 0 || toClientId <= 0 || bytes <= 0) {
             return false;
         }
         return sessionRepository.findById(header.sessionId())
-                .map(session -> authorizeRelayFrame(session, header, bytes, Instant.now()))
+                .map(session -> authorizeRelayFrame(
+                        session, fromClientId, toClientId, bytes, Instant.now()))
                 .orElse(false);
     }
 
-    public boolean authorizeRelayFrameForRelay(PeerDataFrameHeader header, long bytes) {
-        if (header == null || bytes <= 0) {
+    public boolean authorizeRelayFrameForRelay(PeerDataFrameHeader header,
+                                               long fromClientId,
+                                               long toClientId,
+                                               long bytes) {
+        if (header == null || fromClientId <= 0 || toClientId <= 0 || bytes <= 0) {
             return false;
         }
+		return authorizeRelayFrameForRelay(header, fromClientId, toClientId, bytes, true);
+	}
+
+	public boolean validateRelayFrameForRelay(PeerDataFrameHeader header,
+                                            long fromClientId,
+                                            long toClientId) {
+		return header != null && fromClientId > 0 && toClientId > 0
+                && authorizeRelayFrameForRelay(header, fromClientId, toClientId, 0L, false);
+	}
+
+	private boolean authorizeRelayFrameForRelay(PeerDataFrameHeader header,
+                                               long fromClientId,
+                                               long toClientId,
+                                               long bytes,
+                                               boolean account) {
         long nowNanos = System.nanoTime();
         long nowMillis = System.currentTimeMillis();
         RelayAuthorization cached = relayAuthorizationCache.get(header.sessionId());
         if (cached != null && cached.validAt(nowNanos, nowMillis)) {
-            if (!cached.matches(header)) {
+            if (!cached.matches(fromClientId, toClientId)) {
                 return false;
             }
-            pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new LongAdder()).add(bytes);
+			if (account) {
+				pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new AtomicLong()).addAndGet(bytes);
+			}
             return true;
         }
-        return authorizeRelayFrameForRelaySlow(header, bytes, nowNanos);
+		return authorizeRelayFrameForRelaySlow(
+                header, fromClientId, toClientId, bytes, nowNanos, account);
     }
 
-    @Transactional
-    protected boolean authorizeRelayFrameForRelaySlow(PeerDataFrameHeader header, long bytes, long nowNanos) {
-        return sessionRepository.findById(header.sessionId())
-                .map(session -> {
-                    Instant now = Instant.now();
-                    if (closeIfExpired(session, now)) {
-                        sessionRepository.save(session);
-                        relayAuthorizationCache.remove(header.sessionId());
-                        pendingRelayBytes.remove(header.sessionId());
-                        return false;
-                    }
-                    RelayAuthorization authorization = RelayAuthorization.from(session, nowNanos + RELAY_AUTH_CACHE_TTL_NANOS);
-                    if (!authorization.active() || !authorization.matches(header)) {
-                        relayAuthorizationCache.remove(header.sessionId());
-                        return false;
-                    }
-                    relayAuthorizationCache.put(header.sessionId(), authorization);
-                    pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new LongAdder()).add(bytes);
-                    return true;
-                })
-                .orElse(false);
+    public boolean authorizeRelayProbeForRelay(PeerUdpProbe probe) {
+        if (probe == null
+                || probe.getSessionId() == null
+                || probe.getSessionId() <= 0
+                || probe.getFromClientId() == null
+                || probe.getFromClientId() <= 0
+                || probe.getToClientId() == null
+                || probe.getToClientId() <= 0
+                || !StringUtils.hasText(probe.getToken())
+                || !(PeerUdpProbe.TYPE_CHECK.equals(probe.getType())
+                || PeerUdpProbe.TYPE_CHECK_RESPONSE.equals(probe.getType()))) {
+            return false;
+        }
+        Boolean allowed = transactionTemplate.execute(status -> sessionRepository.findById(probe.getSessionId())
+                .map(session -> authorizeRelayProbe(session, probe, Instant.now()))
+                .orElse(false));
+        return Boolean.TRUE.equals(allowed);
+    }
+
+    private boolean authorizeRelayProbe(PeerMeshSession session, PeerUdpProbe probe, Instant now) {
+        if (closeIfExpired(session, now)) {
+            sessionRepository.save(session);
+            return false;
+        }
+        boolean forward = probe.getFromClientId() == session.getSourceClientId()
+                && probe.getToClientId() == session.getTargetClientId();
+        boolean reverse = probe.getFromClientId() == session.getTargetClientId()
+                && probe.getToClientId() == session.getSourceClientId();
+        if ((!forward && !reverse) || STATUS_CLOSED.equals(session.getStatus())) {
+            return false;
+        }
+        String expected = session.getTokenHash();
+        String actual = HexFormat.of().formatHex(HmacSigner.sha256(probe.getToken()));
+        return StringUtils.hasText(expected) && MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.US_ASCII),
+                actual.getBytes(StandardCharsets.US_ASCII));
+    }
+
+	protected boolean authorizeRelayFrameForRelaySlow(PeerDataFrameHeader header,
+                                                     long fromClientId,
+                                                     long toClientId,
+                                                     long bytes,
+                                                     long nowNanos) {
+		return authorizeRelayFrameForRelaySlow(
+                header, fromClientId, toClientId, bytes, nowNanos, true);
+	}
+
+	private boolean authorizeRelayFrameForRelaySlow(PeerDataFrameHeader header,
+                                                   long fromClientId,
+                                                   long toClientId,
+                                                   long bytes,
+                                                   long nowNanos,
+												 boolean account) {
+        Boolean allowed = transactionTemplate.execute(status -> sessionRepository.findById(header.sessionId())
+				.map(session -> authorizeRelayFrameForRelaySlow(
+                        session, header, fromClientId, toClientId, bytes, nowNanos, account))
+                .orElse(false));
+        return Boolean.TRUE.equals(allowed);
+    }
+
+    private boolean authorizeRelayFrameForRelaySlow(PeerMeshSession session,
+                                                     PeerDataFrameHeader header,
+                                                     long fromClientId,
+                                                     long toClientId,
+                                                     long bytes,
+													 long nowNanos,
+													 boolean account) {
+        Instant now = Instant.now();
+        if (closeIfExpired(session, now)) {
+            sessionRepository.save(session);
+            relayAuthorizationCache.remove(header.sessionId());
+            pendingRelayBytes.remove(header.sessionId());
+            return false;
+        }
+        RelayAuthorization authorization = RelayAuthorization.from(session, nowNanos + RELAY_AUTH_CACHE_TTL_NANOS);
+        if (!authorization.active() || !authorization.matches(fromClientId, toClientId)) {
+            relayAuthorizationCache.remove(header.sessionId());
+            return false;
+        }
+        relayAuthorizationCache.put(header.sessionId(), authorization);
+		if (account) {
+			pendingRelayBytes.computeIfAbsent(header.sessionId(), ignored -> new AtomicLong()).addAndGet(bytes);
+		}
+        return true;
     }
 
     @Transactional
@@ -587,10 +703,13 @@ public class PeerMeshService {
     public PeerMeshPathStatsView pathStats(ManagementContext context) {
         expireIfStale();
         List<PeerMeshSessionRepository.PathTypeAggregate> aggregates;
+        List<PeerMeshSessionRepository.AddressFamilyAggregate> addressFamilyAggregates;
         List<PeerMeshDeviceRepository.NatTypeAggregate> natAggregates;
         List<PeerMeshDeviceRepository.NatBehaviorAggregate> natBehaviorAggregates;
         if (context.isAdmin()) {
             aggregates = sessionRepository.aggregatePathTypes(context.tenant().tenantId());
+            addressFamilyAggregates = sessionRepository.aggregateAddressFamilies(
+                    context.tenant().tenantId());
             natAggregates = deviceRepository.aggregateNatTypes(context.tenant().tenantId());
             natBehaviorAggregates =
                     deviceRepository.aggregateNatBehaviors(context.tenant().tenantId());
@@ -599,6 +718,10 @@ public class PeerMeshService {
             aggregates = visible.isEmpty()
                     ? List.of()
                     : sessionRepository.aggregateVisiblePathTypes(context.tenant().tenantId(), visible);
+            addressFamilyAggregates = visible.isEmpty()
+                    ? List.of()
+                    : sessionRepository.aggregateVisibleAddressFamilies(
+                            context.tenant().tenantId(), visible);
             natAggregates = deviceRepository.aggregateNatTypesByOwner(
                     context.tenant().tenantId(), context.username());
             natBehaviorAggregates = deviceRepository.aggregateNatBehaviorsByOwner(
@@ -662,6 +785,14 @@ public class PeerMeshService {
                 natBehaviorClassifiedDevices += devices;
             }
         }
+        List<PeerMeshPathStatsView.AddressFamilyStat> addressFamilies = addressFamilyAggregates.stream()
+                .map(item -> new PeerMeshPathStatsView.AddressFamilyStat(
+                        item.getAddressFamily(),
+                        item.getStatus(),
+                        item.getPathType(),
+                        item.getSessions(),
+                        item.getReportedSessions()))
+                .toList();
         return new PeerMeshPathStatsView(
                 total,
                 reported,
@@ -670,6 +801,7 @@ public class PeerMeshService {
                 activeRelay,
                 active == 0 ? null : (double) activeDirect / active,
                 pathTypes,
+                addressFamilies,
                 natTypes,
                 natBehaviorDevices,
                 natBehaviorClassifiedDevices,
@@ -715,29 +847,67 @@ public class PeerMeshService {
     }
 
     @Scheduled(fixedDelayString = "${tunnel.peer-mesh.relay-traffic-flush-interval-ms:5000}")
-    @Transactional
     public void flushRelayTraffic() {
         if (pendingRelayBytes.isEmpty()) {
             return;
         }
-        Instant now = Instant.now();
         pendingRelayBytes.forEach((sessionId, counter) -> {
-            long bytes = counter.sumThenReset();
+            long bytes = counter.getAndSet(0);
             if (bytes <= 0) {
                 return;
             }
-            sessionRepository.findById(sessionId).ifPresentOrElse(session -> {
-                if (!closeIfExpired(session, now)) {
-                    applyTraffic(session, 0, bytes, now);
-                } else {
+            try {
+                RelayTrafficFlushResult result = transactionTemplate.execute(status ->
+                        persistRelayTrafficBatch(sessionId, bytes, Instant.now()));
+                if (result == null) {
+                    throw new IllegalStateException("relay traffic transaction returned no result");
+                }
+                lastRelayTrafficFlushSuccessMillis.set(System.currentTimeMillis());
+                if (result == RelayTrafficFlushResult.MISSING) {
+                    relayAuthorizationCache.remove(sessionId);
+                    pendingRelayBytes.remove(sessionId, counter);
+                } else if (result == RelayTrafficFlushResult.CLOSED) {
                     relayAuthorizationCache.remove(sessionId);
                 }
-                sessionRepository.save(session);
-            }, () -> {
-                relayAuthorizationCache.remove(sessionId);
-                pendingRelayBytes.remove(sessionId);
-            });
+            } catch (RuntimeException e) {
+                restoreRelayTrafficBatch(sessionId, bytes);
+                relayTrafficFlushFailures.increment();
+                log.warn("Peer mesh relay traffic flush failed: session={}, bytes={}, reason={}",
+                        sessionId, bytes, e.getMessage());
+            }
         });
+    }
+
+    private RelayTrafficFlushResult persistRelayTrafficBatch(long sessionId, long bytes, Instant now) {
+        Optional<PeerMeshSession> found = sessionRepository.findById(sessionId);
+        if (found.isEmpty()) {
+            return RelayTrafficFlushResult.MISSING;
+        }
+        PeerMeshSession session = found.get();
+        boolean expired = closeIfExpired(session, now);
+        applyTraffic(session, 0, bytes, now);
+        sessionRepository.save(session);
+        return expired ? RelayTrafficFlushResult.CLOSED : RelayTrafficFlushResult.PERSISTED;
+    }
+
+    private void restoreRelayTrafficBatch(long sessionId, long bytes) {
+        pendingRelayBytes.compute(sessionId, (ignored, current) -> {
+            AtomicLong counter = current == null ? new AtomicLong() : current;
+            counter.addAndGet(bytes);
+            return counter;
+        });
+    }
+
+    private double pendingRelayByteCount() {
+        long total = 0;
+        for (AtomicLong counter : pendingRelayBytes.values()) {
+            long value = counter.get();
+            if (value > Long.MAX_VALUE - total) {
+                return Long.MAX_VALUE;
+            }
+            total += value;
+        }
+        return total;
     }
 
     @Transactional(readOnly = true)
@@ -1029,7 +1199,11 @@ public class PeerMeshService {
         session.setUpdatedAt(now.toString());
     }
 
-    private boolean authorizeRelayFrame(PeerMeshSession session, PeerDataFrameHeader header, long bytes, Instant now) {
+    private boolean authorizeRelayFrame(PeerMeshSession session,
+                                        long fromClientId,
+                                        long toClientId,
+                                        long bytes,
+                                        Instant now) {
         if (closeIfExpired(session, now)) {
             sessionRepository.save(session);
             return false;
@@ -1037,10 +1211,10 @@ public class PeerMeshService {
         if (!STATUS_ACTIVE.equals(session.getStatus())) {
             return false;
         }
-        boolean forward = header.fromClientId() == session.getSourceClientId()
-                && header.toClientId() == session.getTargetClientId();
-        boolean reverse = header.fromClientId() == session.getTargetClientId()
-                && header.toClientId() == session.getSourceClientId();
+        boolean forward = fromClientId == session.getSourceClientId()
+                && toClientId == session.getTargetClientId();
+        boolean reverse = fromClientId == session.getTargetClientId()
+                && toClientId == session.getSourceClientId();
         if (!forward && !reverse) {
             return false;
         }
@@ -1185,6 +1359,12 @@ public class PeerMeshService {
     public record PeerIdentity(String virtualIp, String publicKey) {
     }
 
+    private enum RelayTrafficFlushResult {
+        PERSISTED,
+        CLOSED,
+        MISSING
+    }
+
     private record RelayAuthorization(long sourceClientId,
                                       long targetClientId,
                                       boolean active,
@@ -1205,9 +1385,9 @@ public class PeerMeshService {
                     && (sessionExpiresAtMillis <= 0 || sessionExpiresAtMillis > nowMillis);
         }
 
-        private boolean matches(PeerDataFrameHeader header) {
-            boolean forward = header.fromClientId() == sourceClientId && header.toClientId() == targetClientId;
-            boolean reverse = header.fromClientId() == targetClientId && header.toClientId() == sourceClientId;
+        private boolean matches(long fromClientId, long toClientId) {
+            boolean forward = fromClientId == sourceClientId && toClientId == targetClientId;
+            boolean reverse = fromClientId == targetClientId && toClientId == sourceClientId;
             return forward || reverse;
         }
 

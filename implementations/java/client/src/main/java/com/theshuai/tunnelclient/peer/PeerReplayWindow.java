@@ -1,42 +1,34 @@
 package com.theshuai.tunnelclient.peer;
 
 final class PeerReplayWindow {
-    private static final int WINDOW_SIZE = Long.SIZE;
+    static final int WINDOW_SIZE = 4096;
+    private static final int WINDOW_MASK = WINDOW_SIZE - 1;
 
-    private long highestSequence = -1;
-    private long receivedBits;
+    private long highestSequence;
+    private final long[] receivedSequences = new long[WINDOW_SIZE];
 
     synchronized boolean accept(long sequence) {
         if (sequence <= 0) {
             return false;
         }
-        if (highestSequence < 0) {
-            highestSequence = sequence;
-            receivedBits = 1L;
-            return true;
+        if (highestSequence != 0 && sequence <= highestSequence - WINDOW_SIZE) {
+            return false;
         }
+        int slot = (int) sequence & WINDOW_MASK;
+        if (receivedSequences[slot] == sequence) {
+            return false;
+        }
+        receivedSequences[slot] = sequence;
         if (sequence > highestSequence) {
-            long shift = sequence - highestSequence;
-            receivedBits = shift >= WINDOW_SIZE ? 1L : (receivedBits << shift) | 1L;
             highestSequence = sequence;
-            return true;
         }
-        long delta = highestSequence - sequence;
-        if (delta >= WINDOW_SIZE) {
-            return false;
-        }
-        long bit = 1L << delta;
-        if ((receivedBits & bit) != 0) {
-            return false;
-        }
-        receivedBits |= bit;
         return true;
     }
 
     synchronized PeerReplayWindow copy() {
         PeerReplayWindow copy = new PeerReplayWindow();
         copy.highestSequence = highestSequence;
-        copy.receivedBits = receivedBits;
+        System.arraycopy(receivedSequences, 0, copy.receivedSequences, 0, receivedSequences.length);
         return copy;
     }
 }

@@ -33,8 +33,8 @@ public class PacketCodecHandler extends MessageToMessageCodec<ByteBuf, Packet> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("[packet-codec] channelId={} error={}",
-                ctx.channel().id().asLongText(), errorMessage(cause), cause);
+        log.debug("[packet-codec] channelId={} error={}",
+                ctx.channel().id().asLongText(), errorMessage(cause));
         ctx.fireExceptionCaught(cause);
     }
 

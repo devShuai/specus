@@ -8,62 +8,97 @@ import com.theshuai.common.peermesh.PeerRelayMessage;
 import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import com.theshuai.common.stun.StunMessage;
+import com.theshuai.common.stun.TurnChannelData;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelclient.peer.portmap.NatPortMapping;
 import com.theshuai.tunnelclient.peer.portmap.NatPortMappingService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.StringUtils;
 
+import javax.crypto.spec.SecretKeySpec;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.Inet6Address;
+import java.net.Inet4Address;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Deque;
 import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 public class PeerMeshClient implements AutoCloseable {
-    private final Map<Long, PeerInfo> peers = new ConcurrentHashMap<>();
+    private volatile PeerIndex peerIndex = PeerIndex.empty();
     private final Map<Long, PeerSession> sessions = new ConcurrentHashMap<>();
     private final Map<Long, PeerSession> sessionsById = new ConcurrentHashMap<>();
     private final Map<String, PendingProbe> pendingProbes = new ConcurrentHashMap<>();
     private final Map<String, NatProbeObservation> natProbeObservations = new ConcurrentHashMap<>();
     private final Map<String, Long> payloadDropLogMillis = new ConcurrentHashMap<>();
     private final Map<String, Long> packetTraceLogMillis = new ConcurrentHashMap<>();
-    private final Map<Long, List<PendingVirtualPacket>> pendingVirtualPackets = new ConcurrentHashMap<>();
+    private final Map<Long, Deque<PendingVirtualPacket>> pendingVirtualPackets = new ConcurrentHashMap<>();
     private final Map<Long, Long> pathPrepareMillis = new ConcurrentHashMap<>();
+    /** H-1 候选回礼节流状态：peerId -> 上次回发时间 */
+    private final Map<Long, Long> candidateReciprocateMillis = new ConcurrentHashMap<>();
+    /** H-2 密集重试状态：sessionId -> 已调度的打洞重试轮次，避免同一 session 重复排程 */
+    private final Map<Long, Boolean> holePunchRetryScheduled = new ConcurrentHashMap<>();
     private final Map<String, PendingStunBinding> pendingStunBindings = new ConcurrentHashMap<>();
     private final Map<String, PendingTurnRequest> pendingTurnRequests = new ConcurrentHashMap<>();
     private final Map<String, Long> turnPermissions = new ConcurrentHashMap<>();
+    private final Map<String, TurnChannelBinding> turnChannelsByPeer = new ConcurrentHashMap<>();
+    private final Map<Integer, TurnChannelBinding> turnChannelsByNumber = new ConcurrentHashMap<>();
     private final Map<String, SrflxObservation> srflxObservations = new ConcurrentHashMap<>();
+    private final Map<String, CachedPathMtu> pathMtuCache = new ConcurrentHashMap<>();
     private final AtomicBoolean directSuppressedLogged = new AtomicBoolean(false);
     private final SecureRandom secureRandom = new SecureRandom();
     private final TurnLongTermAuthenticator turnAuthenticator = new TurnLongTermAuthenticator();
     private final NatBehaviorDiscovery natBehaviorDiscovery = new NatBehaviorDiscovery();
+    private final PeerUdpProbeRateLimiter udpProbeRateLimiter = new PeerUdpProbeRateLimiter();
+    private final AtomicLong invalidUdpPackets = new AtomicLong();
+    private final AtomicLong udpProbeRateLimited = new AtomicLong();
+    private final AtomicLong dataWorkerRejected = new AtomicLong();
+    private final AtomicLong dataDecryptRejected = new AtomicLong();
+    private final AtomicLong tunWriteCount = new AtomicLong();
+    private final AtomicLong tunWriteNanos = new AtomicLong();
+    private final AtomicLong dataWorkerQueueHighWater = new AtomicLong();
+    private final Object tunWriteLock = new Object();
     private final ControlSender controlSender;
     private final PeerKeyStore.KeyMaterial keyMaterial;
+    /**
+     * 本次运行实例的 SPM2 key epoch。进程内固定、重启后必然变化，是 AES-GCM nonce 唯一性的锚点：
+     * sessionId/token 会在服务端 TTL 内被复用，X25519 私钥又持久化在磁盘，只有 epoch 能保证
+     * 重启后 sequence 从 1 重新开始时不会落回同一段 nonce 空间。
+     */
+    private final String localKeyEpoch = newKeyEpoch();
     private final PeerVirtualDeviceOptions virtualDeviceOptions;
     private volatile ClientAuthLoginResponse.PeerMeshConfig config;
     private volatile boolean running;
     private volatile DatagramSocket udpSocket;
     private volatile Thread receiverThread;
+    private volatile DataPlaneWorker[] dataPlaneWorkers = new DataPlaneWorker[0];
     private volatile PeerVirtualDevice virtualDevice = new NoopPeerVirtualDevice();
     private volatile String virtualDeviceKey = "noop";
     private volatile String runtimeConfigKey = "";
@@ -96,7 +131,18 @@ public class PeerMeshClient implements AutoCloseable {
     private static final int RTT_EWMA_NEW_WEIGHT = 1;
     private static final long PENDING_PACKET_TTL_MILLIS = 30_000;
     private static final int MAX_PENDING_PACKETS_PER_PEER = 32;
+    private static final int MAX_LOG_RATE_KEYS = 4_096;
+    private static final long LOG_RATE_KEY_TTL_MILLIS = 60_000;
+    private static final int DATA_WORKER_QUEUE_CAPACITY = 2_048;
+    private static final int DATA_FRAME_VERSION = 2;
     private static final long ON_DEMAND_PREPARE_INTERVAL_MILLIS = 2_000;
+    /** H-1 候选回礼节流，防止两端互相触发形成信令循环 */
+    private static final long CANDIDATE_RECIPROCATE_INTERVAL_MILLIS = 2_000;
+    /**
+     * H-2 打洞收敛：session 建立后前若干秒做密集重试，而不是等 30s maintenance tick。
+     * 退避序列覆盖约 15 秒，之后交给 30s 周期兜底。
+     */
+    private static final long[] HOLE_PUNCH_RETRY_DELAYS_MILLIS = {1_000, 2_000, 4_000, 8_000};
     private static final long NAT_PROBE_STALE_MILLIS = 120_000;
     private static final long SRFLX_OBSERVATION_TTL_MILLIS = 180_000;
     private static final long ALTERNATE_NAT_PROBE_MIN_INTERVAL_MILLIS = 15_000;
@@ -105,7 +151,10 @@ public class PeerMeshClient implements AutoCloseable {
     private static final long BEHAVIOR_PROBE_TIMEOUT_MILLIS = 1_600;
     private static final long[] BEHAVIOR_PROBE_RETRY_DELAYS_MILLIS = {250, 750};
     private static final long TURN_PERMISSION_TTL_MILLIS = 240_000;
+    private static final long TURN_CHANNEL_TTL_MILLIS = 540_000;
+    private static final long TURN_CHANNEL_PENDING_MILLIS = 10_000;
     private static final String PUBLIC_STUN_ROLE_PREFIX = "public-stun:";
+    private static final String SUPPLEMENTAL_STUN_ROLE_PREFIX = "family-stun:";
     private static final int MAX_ADAPTIVE_PREDICTED_PORTS = 16;
     private static final int MAX_ADAPTIVE_PORT_DELTA = 512;
     private static final long CONNECTIVITY_CHECK_PACING_MILLIS = 20;
@@ -144,7 +193,7 @@ public class PeerMeshClient implements AutoCloseable {
             }
             running = false;
             runtimeConfigKey = "";
-            peers.clear();
+            peerIndex = PeerIndex.empty();
             sessions.clear();
             sessionsById.clear();
             pendingProbes.clear();
@@ -153,10 +202,15 @@ public class PeerMeshClient implements AutoCloseable {
             packetTraceLogMillis.clear();
             pendingVirtualPackets.clear();
             pathPrepareMillis.clear();
+            candidateReciprocateMillis.clear();
+            holePunchRetryScheduled.clear();
             pendingStunBindings.clear();
             pendingTurnRequests.clear();
             turnPermissions.clear();
+            turnChannelsByPeer.clear();
+            turnChannelsByNumber.clear();
             srflxObservations.clear();
+            pathMtuCache.clear();
             serverReflexiveCandidate = null;
             serverReflexiveCandidates.clear();
             relayCandidate = null;
@@ -277,8 +331,8 @@ public class PeerMeshClient implements AutoCloseable {
         // roster 只带身份与在线状态，不带 candidates。保留旧 entry 已学到的候选，
         // 否则每次 roster 推送（任意客户端上下线都会触发）都会清空全部对端候选，
         // probeKnownCandidates 失效，必须等下一轮候选交换才能恢复直连探测。
-        Map<Long, PeerInfo> previous = Map.copyOf(peers);
-        peers.clear();
+        Map<Long, PeerInfo> previous = peerIndex.byId();
+        Map<Long, PeerInfo> nextPeers = new HashMap<>();
         if (peerNodes != null && peerNodes.isArray()) {
             for (JsonNode node : peerNodes) {
                 long clientId = node.path("clientId").asLong(0);
@@ -286,17 +340,20 @@ public class PeerMeshClient implements AutoCloseable {
                     continue;
                 }
                 PeerInfo existing = previous.get(clientId);
-                peers.put(clientId, new PeerInfo(
+                nextPeers.put(clientId, new PeerInfo(
                         clientId,
                         node.path("clientName").asText(""),
                         node.path("virtualIp").asText(""),
                         node.path("publicKey").asText(""),
+                        // roster 不携带 key epoch，只能由对端 candidates 信令学习；保留已学到的值
+                        existing == null ? "" : existing.keyEpoch(),
                         node.path("online").asBoolean(false),
                         existing == null ? List.of() : existing.candidates()
                 ));
             }
         }
-        log.info("Peer mesh 可互联客户端刷新: {} 个", peers.size());
+        peerIndex = PeerIndex.of(nextPeers);
+        log.info("Peer mesh 可互联客户端刷新: {} 个", nextPeers.size());
         syncVirtualDeviceRoutes();
         refreshSessionKeys();
         announceCandidatesToOnlinePeers();
@@ -334,7 +391,7 @@ public class PeerMeshClient implements AutoCloseable {
         if (device == null || current == null) {
             return;
         }
-        List<String> routeIps = peers.values().stream()
+        List<String> routeIps = peerIndex.byId().values().stream()
                 .filter(PeerInfo::online)
                 .map(PeerInfo::virtualIp)
                 .filter(StringUtils::hasText)
@@ -355,7 +412,7 @@ public class PeerMeshClient implements AutoCloseable {
     public void close() {
         running = false;
         runtimeConfigKey = "";
-        peers.clear();
+        peerIndex = PeerIndex.empty();
         sessions.clear();
         sessionsById.clear();
         pendingProbes.clear();
@@ -364,10 +421,15 @@ public class PeerMeshClient implements AutoCloseable {
         packetTraceLogMillis.clear();
         pendingVirtualPackets.clear();
         pathPrepareMillis.clear();
+        candidateReciprocateMillis.clear();
+        holePunchRetryScheduled.clear();
         pendingStunBindings.clear();
         pendingTurnRequests.clear();
         turnPermissions.clear();
+        turnChannelsByPeer.clear();
+        turnChannelsByNumber.clear();
         srflxObservations.clear();
+        pathMtuCache.clear();
         serverReflexiveCandidate = null;
         serverReflexiveCandidates.clear();
         // 先释放 port mapping（best-effort 通知路由器撤销），再停 socket。
@@ -434,6 +496,7 @@ public class PeerMeshClient implements AutoCloseable {
         // 比 STUN srflx (800) 高，因为这是路由器**显式承诺**的映射，比通过 STUN 推断的更可靠。
         candidate.setPriority(900);
         candidate.setFoundation("port-map-" + mapping.protocol().name().toLowerCase());
+        candidate.setAddressFamily(addressFamily(mapping.externalAddress()));
         PeerCandidate previousPortMap = portMapCandidate;
         portMapCandidate = candidate;
         portMapping = mapping;
@@ -504,15 +567,60 @@ public class PeerMeshClient implements AutoCloseable {
         mergePeer(peer, control.getCandidates());
         rememberSession(control);
 
-        // Hairpin 检测：双方 STUN 公网地址相同，优先 LAN host；但保留 relay，避免 CGNAT
-        // 共享出口 IP 或 NAT 不支持 hairpin 时被错误剪掉兜底路径。
+        // H-6 Hairpin：双方 STUN 公网地址相同时优先 LAN host，但只降权不剪除。
+        // 同 NAT 下 host 未必可达（AP 隔离、同 NAT 不同子网），而支持 hairpin 的 NAT 上
+        // srflx 反而能通；直接剪掉会把这条可用路径永久丢弃。
         if (hasSameNatAddress(control.getCandidates()) && hasUsableHostCandidate(control.getCandidates())) {
-            control.setCandidates(control.getCandidates().stream()
-                    .filter(candidate -> !isSameNatReflexiveCandidate(candidate))
-                    .toList());
+            control.setCandidates(demoteSameNatReflexiveCandidates(control.getCandidates()));
         }
 
         sendConnectivityChecks(control);
+        // H-1 候选回礼：port-restricted 组合下打洞要求双方几乎同时互射。对端已经在向我们打洞，
+        // 若此时本端还没有健康 direct 路径，立刻回发一份自身候选，让对端马上开始反向探测，
+        // 把两端 burst 窗口从"最坏等一个 30s maintenance tick"压到一个信令 RTT 内对齐。
+        reciprocateCandidates(peer);
+    }
+
+    /**
+     * H-1：向刚发来候选的对端回发本端候选。带节流，避免两端互相触发形成信令循环。
+     */
+    private void reciprocateCandidates(PeerInfo peer) {
+        if (peer == null || config == null || !peer.online()) {
+            return;
+        }
+        PeerSession session = sessions.get(peer.clientId());
+        long now = System.currentTimeMillis();
+        if (session != null && session.hasHealthyDirect(now)) {
+            return;
+        }
+        Long previous = candidateReciprocateMillis.get(peer.clientId());
+        if (previous != null && now - previous < CANDIDATE_RECIPROCATE_INTERVAL_MILLIS) {
+            return;
+        }
+        candidateReciprocateMillis.put(peer.clientId(), now);
+        sendCandidatesToPeer(peer, session == null ? reusableSession(peer.clientId()) : session, null);
+    }
+
+    /** H-6：把同 NAT 的 reflexive 候选降到最低优先级，而不是从候选集中删除 */
+    private List<PeerCandidate> demoteSameNatReflexiveCandidates(List<PeerCandidate> candidates) {
+        List<PeerCandidate> adjusted = new ArrayList<>(candidates.size());
+        for (PeerCandidate candidate : candidates) {
+            if (candidate != null && isSameNatReflexiveCandidate(candidate)) {
+                PeerCandidate demoted = new PeerCandidate();
+                demoted.setType(candidate.getType());
+                demoted.setTransport(candidate.getTransport());
+                demoted.setAddress(candidate.getAddress());
+                demoted.setPort(candidate.getPort());
+                demoted.setFoundation(candidate.getFoundation());
+                demoted.setRelayId(candidate.getRelayId());
+                demoted.setAddressFamily(candidate.getAddressFamily());
+                demoted.setPriority(1);
+                adjusted.add(demoted);
+                continue;
+            }
+            adjusted.add(candidate);
+        }
+        return sortedCandidates(adjusted);
     }
 
     /** 同 NAT 检测：对端 srflx/端口映射地址与本端 STUN 观测公网地址相同 */
@@ -555,11 +663,16 @@ public class PeerMeshClient implements AutoCloseable {
         if (control.getSessionId() == null || control.getSessionId() <= 0 || !StringUtils.hasText(control.getToken())) {
             return;
         }
+        if (control.getDataFrameVersion() != DATA_FRAME_VERSION) {
+            log.warn("Peer mesh session rejected: required dataFrameVersion={}, received={}",
+                    DATA_FRAME_VERSION, control.getDataFrameVersion());
+            return;
+        }
         long peerId = peerId(control);
         if (peerId <= 0) {
             return;
         }
-        PeerInfo peer = peers.get(peerId);
+        PeerInfo peer = peerIndex.byId().get(peerId);
         String peerPublicKey = peer == null ? "" : peer.publicKey();
         PeerSession next = new PeerSession(
                 control.getSessionId(),
@@ -568,6 +681,12 @@ public class PeerMeshClient implements AutoCloseable {
                 control.getExpiresAt(),
                 deriveSessionKey(control, peerId, peerPublicKey)
         );
+        next.setLocalKeyEpoch(localKeyEpoch);
+        // 对端 epoch 优先取本条信令携带的值，否则回退到 roster/candidates 已学到的值
+        String signalEpoch = control.getSourceKeyEpoch();
+        next.applyRemoteKeyEpoch(StringUtils.hasText(signalEpoch) && !isLocalClient(control.getSourceClientId())
+                ? signalEpoch
+                : (peer == null ? "" : peer.keyEpoch()));
         PeerSession previous = sessions.put(peerId, next);
         if (previous != null) {
             sessionsById.remove(previous.sessionId(), previous);
@@ -577,7 +696,12 @@ public class PeerMeshClient implements AutoCloseable {
             boolean sameSession = previous.sessionId().equals(next.sessionId());
             if (sameSession) {
                 next.outboundSequence.set(previous.outboundSequence.get());
-                next.inboundReplayWindow = previous.inboundReplayWindow.copy();
+                previous.copyInboundStateTo(next);
+                // 本条信令没带 epoch 时，继承上一份 session 已学到的值；
+                // 带了新 epoch（对端重启）时必须保留新值，不能被旧值覆盖
+                if (!StringUtils.hasText(next.remoteKeyEpoch())) {
+                    next.applyRemoteKeyEpoch(previous.remoteKeyEpoch());
+                }
             }
             next.remoteEndpoint = previous.remoteEndpoint;
             next.relayTargetAllocationId = previous.relayTargetAllocationId;
@@ -602,7 +726,7 @@ public class PeerMeshClient implements AutoCloseable {
             if (session.aesKey() != null) {
                 continue;
             }
-            PeerInfo peer = peers.get(entry.getKey());
+            PeerInfo peer = peerIndex.byId().get(entry.getKey());
             if (peer == null || !StringUtils.hasText(peer.publicKey())) {
                 continue;
             }
@@ -616,6 +740,8 @@ public class PeerMeshClient implements AutoCloseable {
             byte[] aesKey = deriveSessionKey(control, session.peerId(), peer.publicKey());
             if (aesKey != null) {
                 PeerSession next = session.withAesKey(aesKey);
+                next.setLocalKeyEpoch(localKeyEpoch);
+                next.applyRemoteKeyEpoch(peer.keyEpoch());
                 replaceSession(entry.getKey(), session, next);
             }
         }
@@ -647,7 +773,7 @@ public class PeerMeshClient implements AutoCloseable {
         long peerId = peerId(control);
         if (peerId > 0) {
             removeSession(peerId);
-            PeerInfo peer = peers.get(peerId);
+            PeerInfo peer = peerIndex.byId().get(peerId);
             if (peer != null && peer.online()) {
                 pathPrepareMillis.remove(peerId);
                 preparePathForPeer(peer, null);
@@ -665,7 +791,7 @@ public class PeerMeshClient implements AutoCloseable {
             log.debug("Peer mesh 没有可上报的 host candidate");
             return;
         }
-        for (PeerInfo peer : peers.values()) {
+        for (PeerInfo peer : peerIndex.byId().values()) {
             if (!peer.online() || !StringUtils.hasText(peer.clientName())) {
                 continue;
             }
@@ -693,6 +819,8 @@ public class PeerMeshClient implements AutoCloseable {
         message.setSourceClientName(config.getClientName());
         message.setSourceVirtualIp(config.getVirtualIp());
         message.setSourcePublicKey(keyMaterial.publicKeyBase64());
+        // candidates 是唯一的 peer->peer 信令通道，SPM2 key epoch 随它传播
+        message.setSourceKeyEpoch(localKeyEpoch);
         message.setTargetClientId(peer.clientId());
         message.setTargetClientName(peer.clientName());
         message.setTargetVirtualIp(peer.virtualIp());
@@ -703,6 +831,7 @@ public class PeerMeshClient implements AutoCloseable {
             message.setExpiresAt(session.expiresAt());
         }
         message.setCreatedAtMillis(System.currentTimeMillis());
+        message.setDataFrameVersion(DATA_FRAME_VERSION);
         message.setCandidates(outboundCandidates);
         controlSender.send(peer.clientName(), JsonUtil.objectToString(message));
     }
@@ -727,18 +856,22 @@ public class PeerMeshClient implements AutoCloseable {
         if (!running || config == null) {
             return;
         }
-        InetSocketAddress stunEndpoint = stunEndpoint();
+        List<InetSocketAddress> stunEndpoints = stunEndpoints();
         InetSocketAddress relayEndpoint = relayEndpoint();
         boolean hasPublicStun = config.getPublicStunServers() != null
                 && !config.getPublicStunServers().isEmpty();
-        if (stunEndpoint == null && relayEndpoint == null && !hasPublicStun) {
+        if (stunEndpoints.isEmpty() && relayEndpoint == null && !hasPublicStun) {
             return;
         }
         long now = System.currentTimeMillis();
         if (now - lastStunCandidateRequestMillis >= STUN_CANDIDATE_REQUEST_INTERVAL_MILLIS) {
             lastStunCandidateRequestMillis = now;
-            if (stunEndpoint != null) {
-                sendStunBinding(stunEndpoint, PeerRelayMessage.PROBE_PRIMARY);
+            for (int index = 0; index < stunEndpoints.size(); index++) {
+                InetSocketAddress endpoint = stunEndpoints.get(index);
+                String role = index == 0
+                        ? PeerRelayMessage.PROBE_PRIMARY
+                        : SUPPLEMENTAL_STUN_ROLE_PREFIX + endpointKey(endpoint);
+                sendStunBinding(endpoint, role);
             }
             requestPublicStunBindings();
         }
@@ -853,16 +986,14 @@ public class PeerMeshClient implements AutoCloseable {
         removePublicStunCandidates();
         List<String> sent = new ArrayList<>();
         for (String item : current.getPublicStunServers()) {
-            InetSocketAddress endpoint = parseStunServer(item);
-            if (endpoint == null) {
-                continue;
+            for (InetSocketAddress endpoint : parseStunServers(item)) {
+                String key = endpointKey(endpoint);
+                if (sent.contains(key)) {
+                    continue;
+                }
+                sent.add(key);
+                sendStunBinding(endpoint, PUBLIC_STUN_ROLE_PREFIX + key);
             }
-            String key = endpoint.getHostString() + ":" + endpoint.getPort();
-            if (sent.contains(key)) {
-                continue;
-            }
-            sent.add(key);
-            sendStunBinding(endpoint, PUBLIC_STUN_ROLE_PREFIX + key);
         }
     }
 
@@ -891,6 +1022,7 @@ public class PeerMeshClient implements AutoCloseable {
         if (authenticatedTurnRequest) {
             pending = new PendingTurnRequest(
                     message.type(),
+                    message.transactionId(),
                     message.attributes(),
                     relayEndpoint,
                     authenticationAttempt,
@@ -955,8 +1087,9 @@ public class PeerMeshClient implements AutoCloseable {
                         candidate.setTransport("udp");
                         candidate.setAddress(address.getHostAddress());
                         candidate.setPort(port);
-                        candidate.setPriority(address.isLoopbackAddress() ? 100 : 1000);
+                        candidate.setPriority(address instanceof Inet6Address ? 1_200 : 1_000);
                         candidate.setFoundation(networkInterface.getName());
+                        candidate.setAddressFamily(address instanceof Inet6Address ? "IPv6" : "IPv4");
                         candidates.add(candidate);
                     }
                 }
@@ -987,7 +1120,7 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         long delayMillis = 0;
-        for (PeerCandidate candidate : control.getCandidates()) {
+        for (PeerCandidate candidate : sortedCandidates(control.getCandidates())) {
             if (!"udp".equalsIgnoreCase(candidate.getTransport())
                     || !StringUtils.hasText(candidate.getAddress())
                     || candidate.getPort() <= 0
@@ -1006,10 +1139,71 @@ public class PeerMeshClient implements AutoCloseable {
                 predicted.setPort(predictedPort);
                 predicted.setTransport("udp");
                 predicted.setFoundation("adaptive-port-predict");
+                predicted.setAddressFamily(candidate.getAddressFamily());
                 sendUdpProbePaced(session, predicted, delayMillis);
                 delayMillis += CONNECTIVITY_CHECK_PACING_MILLIS;
             }
         }
+        scheduleHolePunchRetries(session);
+    }
+
+    /**
+     * H-2：session 首次发起连通性检查后，在前约 15 秒内按 1s/2s/4s/8s 退避重试，
+     * 而不是等 30s maintenance tick。已建立健康 direct 路径时自动停止。
+     *
+     * <p>这不改变最终成功率，但把"打洞成功前的丢包窗口"从最坏 30-60s 压缩到数秒，
+     * 也让 {@code pendingVirtualPackets} 的 30s TTL 有机会在路径就绪前不被耗尽。
+     */
+    private void scheduleHolePunchRetries(PeerSession session) {
+        Long sessionId = session.sessionId();
+        if (sessionId == null || holePunchRetryScheduled.putIfAbsent(sessionId, Boolean.TRUE) != null) {
+            return;
+        }
+        ScheduledExecutorService executor = maintenanceExecutor;
+        if (executor == null || executor.isShutdown()) {
+            holePunchRetryScheduled.remove(sessionId);
+            return;
+        }
+        try {
+            for (long delay : HOLE_PUNCH_RETRY_DELAYS_MILLIS) {
+                executor.schedule(() -> retryHolePunch(sessionId), delay, TimeUnit.MILLISECONDS);
+            }
+            // 本轮结束后释放标记，路径后续失效时可以重新进入密集重试
+            long lastDelay = HOLE_PUNCH_RETRY_DELAYS_MILLIS[HOLE_PUNCH_RETRY_DELAYS_MILLIS.length - 1];
+            executor.schedule(() -> holePunchRetryScheduled.remove(sessionId),
+                    lastDelay + 1_000, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException e) {
+            holePunchRetryScheduled.remove(sessionId);
+            log.debug("Peer mesh 打洞重试排程失败: session={}, reason={}", sessionId, e.getMessage());
+        }
+    }
+
+    private void retryHolePunch(long sessionId) {
+        if (!running) {
+            return;
+        }
+        PeerSession session = sessionsById.get(sessionId);
+        long now = System.currentTimeMillis();
+        if (session == null || session.isExpired(now)) {
+            holePunchRetryScheduled.remove(sessionId);
+            return;
+        }
+        if (session.hasHealthyDirect(now)) {
+            // 已经打通，剩余轮次不必再发
+            holePunchRetryScheduled.remove(sessionId);
+            return;
+        }
+        PeerInfo peer = peerIndex.byId().get(session.peerId());
+        if (peer == null || !peer.online() || peer.candidates().isEmpty()) {
+            return;
+        }
+        PeerControlMessage control = new PeerControlMessage();
+        control.setSourceClientId(config == null ? null : config.getClientId());
+        control.setTargetClientId(peer.clientId());
+        control.setSessionId(session.sessionId());
+        control.setToken(session.token());
+        control.setCandidates(peer.candidates());
+        sendConnectivityChecks(control);
     }
 
     /**
@@ -1246,7 +1440,7 @@ public class PeerMeshClient implements AutoCloseable {
 
     private void fallbackStaleDirectPaths() {
         long now = System.currentTimeMillis();
-        for (PeerInfo peer : peers.values()) {
+        for (PeerInfo peer : peerIndex.byId().values()) {
             PeerSession session = sessions.get(peer.clientId());
             if (session == null
                     || session.isExpired(now)
@@ -1255,7 +1449,7 @@ public class PeerMeshClient implements AutoCloseable {
                 continue;
             }
             session.remoteEndpoint = null;
-            PeerInfo currentPeer = peers.get(session.peerId());
+            PeerInfo currentPeer = peerIndex.byId().get(session.peerId());
             if (currentPeer != null && currentPeer.online()) {
                 log.debug("Peer mesh direct path stale, probing fallback: session={}, peer={}",
                         session.sessionId(), session.peerId());
@@ -1315,13 +1509,54 @@ public class PeerMeshClient implements AutoCloseable {
         try {
             DatagramSocket next = new DatagramSocket(0);
             next.setReuseAddress(true);
+            configureUdpSocket(next);
+            startDataPlaneWorkers();
             udpSocket = next;
             Thread thread = new Thread(this::receiveLoop, "peer-mesh-udp");
             thread.setDaemon(true);
             receiverThread = thread;
             thread.start();
         } catch (Exception e) {
+            stopDataPlaneWorkers();
             log.warn("Peer mesh UDP socket 启动失败: {}", e.getMessage());
+        }
+    }
+
+    private void configureUdpSocket(DatagramSocket socket) {
+        try {
+            socket.setReceiveBufferSize(4 * 1024 * 1024);
+        } catch (Exception e) {
+            log.debug("Peer mesh UDP receive buffer 配置失败: {}", e.getMessage());
+        }
+        try {
+            socket.setSendBufferSize(4 * 1024 * 1024);
+        } catch (Exception e) {
+            log.debug("Peer mesh UDP send buffer 配置失败: {}", e.getMessage());
+        }
+        try {
+            socket.setTrafficClass(0x10);
+        } catch (Exception e) {
+            log.debug("Peer mesh UDP traffic class 不受当前平台支持: {}", e.getMessage());
+        }
+    }
+
+    private synchronized void startDataPlaneWorkers() {
+        if (dataPlaneWorkers.length > 0) {
+            return;
+        }
+        int workerCount = Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors()));
+        DataPlaneWorker[] workers = new DataPlaneWorker[workerCount];
+        for (int index = 0; index < workerCount; index++) {
+            workers[index] = new DataPlaneWorker(index, DATA_WORKER_QUEUE_CAPACITY);
+        }
+        dataPlaneWorkers = workers;
+    }
+
+    private synchronized void stopDataPlaneWorkers() {
+        DataPlaneWorker[] workers = dataPlaneWorkers;
+        dataPlaneWorkers = new DataPlaneWorker[0];
+        for (DataPlaneWorker worker : workers) {
+            worker.close();
         }
     }
 
@@ -1336,6 +1571,7 @@ public class PeerMeshClient implements AutoCloseable {
         if (thread != null) {
             thread.interrupt();
         }
+        stopDataPlaneWorkers();
     }
 
     private synchronized void startMaintenance() {
@@ -1356,6 +1592,8 @@ public class PeerMeshClient implements AutoCloseable {
                     removeExpiredSessions();
                     cleanupPendingProbes();
                     cleanupPendingVirtualPackets();
+                    cleanupRateLimitState();
+                    reportDataPlaneMetrics();
                     requestPeerServerCandidates();
                     renewPortMappingIfNeeded();
                     announceCandidatesToOnlinePeers();
@@ -1466,6 +1704,53 @@ public class PeerMeshClient implements AutoCloseable {
         natProbeObservations.put(role, observation);
         NatProbeResult result = classifyNat();
         reportNatObservation(result.natType(), result.endpoint());
+    }
+
+    public DataPlaneStats dataPlaneStats() {
+        DataPlaneWorker[] workers = dataPlaneWorkers;
+        int queueDepth = 0;
+        for (DataPlaneWorker worker : workers) {
+            queueDepth += worker.queueSize();
+        }
+        long writes = tunWriteCount.get();
+        long writeNanos = tunWriteNanos.get();
+        return new DataPlaneStats(
+                invalidUdpPackets.get(),
+                udpProbeRateLimited.get(),
+                dataWorkerRejected.get(),
+                dataDecryptRejected.get(),
+                queueDepth,
+                dataWorkerQueueHighWater.get(),
+                writes,
+                writes == 0 ? 0 : writeNanos / writes);
+    }
+
+    private void reportDataPlaneMetrics() {
+        DataPlaneStats stats = dataPlaneStats();
+        if (stats.invalidUdpPackets() == 0
+                && stats.udpProbeRateLimited() == 0
+                && stats.workerRejected() == 0
+                && stats.decryptRejected() == 0
+                && stats.tunWrites() == 0) {
+            return;
+        }
+        log.info("Peer mesh data-plane stats: invalidUdp={}, probeRateLimited={}, workerRejected={}, "
+                        + "decryptRejected={}, queueDepth={}, queueHighWater={}, tunWrites={}, avgTunWriteNanos={}",
+                stats.invalidUdpPackets(),
+                stats.udpProbeRateLimited(),
+                stats.workerRejected(),
+                stats.decryptRejected(),
+                stats.queueDepth(),
+                stats.queueHighWater(),
+                stats.tunWrites(),
+                stats.averageTunWriteNanos());
+    }
+
+    private void cleanupRateLimitState() {
+        long now = System.currentTimeMillis();
+        udpProbeRateLimiter.cleanup(now);
+        packetTraceLogMillis.entrySet().removeIf(entry -> now - entry.getValue() > LOG_RATE_KEY_TTL_MILLIS);
+        payloadDropLogMillis.entrySet().removeIf(entry -> now - entry.getValue() > LOG_RATE_KEY_TTL_MILLIS);
     }
 
     private void reportNatObservation(String observedNatType, String endpoint) {
@@ -1652,7 +1937,9 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private boolean isPublicStunRole(String role) {
-        return StringUtils.hasText(role) && role.startsWith(PUBLIC_STUN_ROLE_PREFIX);
+        return StringUtils.hasText(role)
+                && (role.startsWith(PUBLIC_STUN_ROLE_PREFIX)
+                || role.startsWith(SUPPLEMENTAL_STUN_ROLE_PREFIX));
     }
 
     private boolean isLocalAddress(String mappedAddress) {
@@ -1727,14 +2014,37 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private void handleUdpPacket(DatagramPacket packet) {
-        byte[] payload = Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength());
         InetSocketAddress observedRemote = new InetSocketAddress(packet.getAddress(), packet.getPort());
+        TurnChannelData.Frame channelData = TurnChannelData.parse(
+                packet.getData(), packet.getOffset(), packet.getLength());
+        if (channelData != null) {
+            TurnChannelBinding binding = turnChannelsByNumber.get(channelData.channelNumber());
+            if (binding != null && binding.activeAt(System.currentTimeMillis())) {
+                byte[] inner = channelData.payload();
+                handleUdpPayload(
+                        inner,
+                        0,
+                        inner.length,
+                        observedRemote,
+                        endpointKey(binding.peer),
+                        binding.peer.getAddress(),
+                        true);
+            }
+            return;
+        }
         StunMessage stun = StunMessage.parse(packet.getData(), packet.getOffset(), packet.getLength());
         if (stun != null) {
             handleStunTurnMessage(stun, observedRemote);
             return;
         }
-        handleUdpPayload(payload, observedRemote, null);
+        handleUdpPayload(
+                packet.getData(),
+                packet.getOffset(),
+                packet.getLength(),
+                observedRemote,
+                null,
+                packet.getAddress(),
+                false);
     }
 
     private void handleStunTurnMessage(StunMessage message, InetSocketAddress observedRemote) {
@@ -1754,14 +2064,17 @@ public class PeerMeshClient implements AutoCloseable {
                 completeTurnRequest(message, observedRemote);
                 log.trace("Peer mesh TURN permission created: tx={}", message.transactionIdHex());
             }
+            case StunMessage.CHANNEL_BIND_SUCCESS -> activateTurnChannel(
+                    completeTurnRequest(message, observedRemote), message);
             case StunMessage.ALLOCATE_ERROR,
                  StunMessage.REFRESH_ERROR,
-                 StunMessage.CREATE_PERMISSION_ERROR -> handleTurnError(message, observedRemote);
+                 StunMessage.CREATE_PERMISSION_ERROR,
+                 StunMessage.CHANNEL_BIND_ERROR -> handleTurnError(message, observedRemote);
             case StunMessage.DATA_INDICATION -> {
                 InetSocketAddress peer = message.xorPeerAddress().orElse(null);
                 byte[] inner = message.data().orElse(null);
                 if (peer != null && inner != null) {
-                    handleUdpPayload(inner, observedRemote, endpointKey(peer));
+                    handleUdpPayload(inner, 0, inner.length, observedRemote, endpointKey(peer), peer.getAddress(), true);
                 }
             }
             default -> log.trace("Peer mesh STUN/TURN message ignored: type=0x{}",
@@ -1827,8 +2140,9 @@ public class PeerMeshClient implements AutoCloseable {
         candidate.setTransport("udp");
         candidate.setAddress(mapped.getAddress().getHostAddress());
         candidate.setPort(mapped.getPort());
-        candidate.setPriority(800);
+        candidate.setPriority(mapped.getAddress() instanceof Inet6Address ? 900 : 800);
         candidate.setFoundation(publicStun ? "public-stun" : "standard-stun");
+        candidate.setAddressFamily(mapped.getAddress() instanceof Inet6Address ? "IPv6" : "IPv4");
         String candidateKey = candidateEndpointKey(candidate);
         recordSrflxObservation(role, observedRemote, mapped);
         // key 含 addr:port，put 返回 null ⇔ 观测到新映射。同一映射被周期性 STUN 反复确认
@@ -1926,6 +2240,7 @@ public class PeerMeshClient implements AutoCloseable {
         candidate.setPriority(100);
         candidate.setFoundation("standard-turn");
         candidate.setRelayId(endpointKey(relayed));
+        candidate.setAddressFamily(turnServer.getAddress() instanceof Inet6Address ? "IPv6" : "IPv4");
         PeerCandidate previous = relayCandidate;
         relayCandidate = candidate;
         // relay 端点没变（同一 allocation 被重复确认）就不必广播
@@ -2027,18 +2342,28 @@ public class PeerMeshClient implements AutoCloseable {
                 || "0:0:0:0:0:0:0:0".equals(address);
     }
 
-    private void handleUdpPayload(byte[] payload, InetSocketAddress observedRemote, String relayFromAllocationId) {
-        if (PeerDataFrameCodec.looksLikeDataFrame(payload, 0, payload.length)) {
-            handleDataFrame(payload, observedRemote, relayFromAllocationId);
+    private void handleUdpPayload(byte[] payload,
+                                  int offset,
+                                  int length,
+                                  InetSocketAddress observedRemote,
+                                  String relayFromAllocationId,
+                                  InetAddress sourceAddress,
+                                  boolean ownedBuffer) {
+        if (PeerDataFrameCodec.looksLikeDataFrame(payload, offset, length)) {
+            dispatchDataFrame(payload, offset, length, observedRemote, relayFromAllocationId, ownedBuffer);
             return;
         }
-        String raw = new String(payload, StandardCharsets.UTF_8);
-        PeerUdpProbe probe = JsonUtil.stringToObject(raw, PeerUdpProbe.class);
+        long now = System.currentTimeMillis();
+        if (!udpProbeRateLimiter.tryAcquire(sourceAddress, now)) {
+            udpProbeRateLimited.incrementAndGet();
+            return;
+        }
+        PeerUdpProbe probe = PeerUdpProbeCodec.decode(payload, offset, length);
         if (probe == null
-                || !PeerUdpProbe.MAGIC.equals(probe.getMagic())
                 || config == null
                 || probe.getToClientId() == null
                 || !probe.getToClientId().equals(config.getClientId())) {
+            invalidUdpPackets.incrementAndGet();
             return;
         }
         if (!StringUtils.hasText(relayFromAllocationId) && shouldAvoidDirectPath()) {
@@ -2058,21 +2383,21 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         if (!StringUtils.hasText(relayFromAllocationId) && isMeshAddress(observedRemote)) {
-            log.debug("Peer mesh 忽略来自虚拟网段的加密 frame，避免 overlay 递归: remote={}", observedRemote);
+            dataDecryptRejected.incrementAndGet();
             return;
         }
         Long frameSessionId = PeerDataFrameCodec.sessionId(raw);
         if (frameSessionId == null) {
-            log.debug("Peer mesh encrypted frame 头部无效: remote={}", observedRemote);
+            dataDecryptRejected.incrementAndGet();
             return;
         }
         PeerSession session = sessionsById.get(frameSessionId);
         if (session == null) {
-            log.debug("Peer mesh encrypted frame 未匹配 session: session={}, remote={}", frameSessionId, observedRemote);
+            dataDecryptRejected.incrementAndGet();
             return;
         }
-        if (session.aesKey() == null) {
-            log.debug("Peer mesh encrypted frame session 密钥未就绪: session={}, remote={}", frameSessionId, observedRemote);
+        if (session.aesKeySpec() == null) {
+            dataDecryptRejected.incrementAndGet();
             return;
         }
         if (session.isExpired(System.currentTimeMillis())) {
@@ -2080,13 +2405,15 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         PeerDataFrame frame = PeerDataFrameCodec.decode(
-                session.aesKey(),
+                session.inboundTrafficKey(currentConfig.getClientId()),
                 raw,
-                session.sessionId(),
-                currentConfig.getClientId()
-        );
-        if (frame == null || frame.fromClientId() != session.peerId() || !session.acceptInboundSequence(frame.sequence())) {
-            log.debug("Peer mesh encrypted frame 无法解密或 replay 拒绝: session={}, remote={}", frameSessionId, observedRemote);
+                session.sessionId());
+        if (frame == null) {
+            dataDecryptRejected.incrementAndGet();
+            return;
+        }
+        if (!session.acceptInboundSequence(frame.sequence())) {
+            dataDecryptRejected.incrementAndGet();
             return;
         }
         if (StringUtils.hasText(relayFromAllocationId)) {
@@ -2101,25 +2428,35 @@ public class PeerMeshClient implements AutoCloseable {
             session.relayTargetAllocationId = null;
             session.addDirectBytes(raw.length);
         }
-        log.debug("Peer mesh encrypted frame 收到: session={}, from={}, bytes={}",
-                frame.sessionId(), frame.fromClientId(), frame.plaintext().length);
-        handlePlainPacket(frame);
+        log.trace("Peer mesh encrypted frame 收到: session={}, from={}, bytes={}",
+                frame.sessionId(), session.peerId(), frame.plaintext().length);
+        handlePlainPacket(frame, session);
     }
 
-    private void handlePlainPacket(PeerDataFrame frame) {
+    private void handlePlainPacket(PeerDataFrame frame, PeerSession session) {
+        if (PeerPathMtu.looksLike(frame.plaintext())) {
+            handlePathMtuMessage(frame.plaintext(), session);
+            return;
+        }
         if (PeerAppMessageCodec.looksLike(frame.plaintext())) {
-            handlePeerAppMessage(frame);
+            handlePeerAppMessage(frame, session);
             return;
         }
 
         PeerVirtualDevice device = virtualDevice;
         if (device != null && !(device instanceof NoopPeerVirtualDevice)) {
+            long writeStartedNanos = System.nanoTime();
             try {
                 tracePacket("inbound-to-tun", frame.plaintext());
-                device.writePacket(frame.plaintext());
+                synchronized (tunWriteLock) {
+                    device.writePacket(frame.plaintext());
+                }
             } catch (Exception e) {
                 log.warn("Peer mesh 写入虚拟网卡失败: session={}, packet={}, reason={}",
                         frame.sessionId(), PeerIpPacket.describe(frame.plaintext()), e.getMessage());
+            } finally {
+                tunWriteNanos.addAndGet(System.nanoTime() - writeStartedNanos);
+                tunWriteCount.incrementAndGet();
             }
             return;
         }
@@ -2137,12 +2474,60 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
-    private void completeTurnRequest(StunMessage response, InetSocketAddress observedRemote) {
+    private void dispatchDataFrame(byte[] payload,
+                                   int offset,
+                                   int length,
+                                   InetSocketAddress observedRemote,
+                                   String relayFromAllocationId,
+                                   boolean ownedBuffer) {
+        Long frameSessionId = PeerDataFrameCodec.sessionId(payload, offset, length);
+        PeerSession session = frameSessionId == null ? null : sessionsById.get(frameSessionId);
+        if (session == null || session.aesKeySpec() == null || session.isExpired(System.currentTimeMillis())) {
+            dataDecryptRejected.incrementAndGet();
+            return;
+        }
+        byte[] frame = ownedBuffer && offset == 0 && length == payload.length
+                ? payload
+                : Arrays.copyOfRange(payload, offset, offset + length);
+        DataPlaneWorker[] workers = dataPlaneWorkers;
+        if (workers.length == 0) {
+            handleDataFrame(frame, observedRemote, relayFromAllocationId);
+            return;
+        }
+        DataPlaneWorker worker = workers[Math.floorMod(Long.hashCode(frameSessionId), workers.length)];
+        if (!worker.submit(() -> handleDataFrame(frame, observedRemote, relayFromAllocationId))) {
+            dataWorkerRejected.incrementAndGet();
+            return;
+        }
+        dataWorkerQueueHighWater.accumulateAndGet(worker.queueSize(), Math::max);
+    }
+
+    private PendingTurnRequest completeTurnRequest(StunMessage response, InetSocketAddress observedRemote) {
         String transactionKey = response.transactionIdHex();
         PendingTurnRequest pending = pendingTurnRequests.get(transactionKey);
         if (pending != null && sameEndpoint(pending.endpoint(), observedRemote)) {
             pendingTurnRequests.remove(transactionKey, pending);
+            return pending;
         }
+        return null;
+    }
+
+    private void activateTurnChannel(PendingTurnRequest pending, StunMessage response) {
+        if (pending == null || pending.requestType() != StunMessage.CHANNEL_BIND_REQUEST) {
+            return;
+        }
+        StunMessage request = new StunMessage(
+                pending.requestType(), pending.transactionId(), pending.attributes());
+        int channelNumber = request.channelNumber().orElse(-1);
+        InetSocketAddress peer = request.xorPeerAddress().orElse(null);
+        TurnChannelBinding binding = peer == null ? null : turnChannelsByPeer.get(endpointKey(peer));
+        if (binding == null || binding.channelNumber != channelNumber) {
+            return;
+        }
+        binding.active = true;
+        binding.expiresAtMillis = System.currentTimeMillis() + TURN_CHANNEL_TTL_MILLIS;
+        log.trace("Peer mesh TURN channel bound: channel=0x{}, peer={}",
+                Integer.toHexString(channelNumber), peer);
     }
 
     private void handleTurnError(StunMessage response, InetSocketAddress observedRemote) {
@@ -2157,18 +2542,53 @@ public class PeerMeshClient implements AutoCloseable {
         if ((errorCode != 401 && errorCode != 438)
                 || pending.authenticationAttempt() >= 1
                 || !turnAuthenticator.applyChallenge(response)) {
+            if (pending.requestType() == StunMessage.CHANNEL_BIND_REQUEST) {
+                removePendingTurnChannel(pending);
+            }
             log.debug("Peer mesh TURN request failed: type=0x{}, code={}, authAttempt={}",
                     Integer.toHexString(pending.requestType()), errorCode, pending.authenticationAttempt());
             return;
         }
 
+        byte[] retryTransactionId = StunMessage.newTransactionId();
         StunMessage retry = new StunMessage(
                 pending.requestType(),
-                StunMessage.newTransactionId(),
-                pending.attributes());
+                retryTransactionId,
+                retryAttributes(pending, retryTransactionId));
         log.debug("Peer mesh TURN auth challenge received, retrying once: type=0x{}, code={}",
                 Integer.toHexString(pending.requestType()), errorCode);
         sendStunRequest(retry, pending.endpoint(), pending.authenticationAttempt() + 1);
+    }
+
+    private List<StunMessage.Attribute> retryAttributes(PendingTurnRequest pending, byte[] retryTransactionId) {
+        List<StunMessage.Attribute> result = new ArrayList<>(pending.attributes().size());
+        for (StunMessage.Attribute attribute : pending.attributes()) {
+            if (attribute.type() != StunMessage.ATTR_XOR_PEER_ADDRESS) {
+                result.add(attribute);
+                continue;
+            }
+            StunMessage original = new StunMessage(
+                    pending.requestType(), pending.transactionId(), List.of(attribute));
+            original.xorPeerAddress()
+                    .map(peer -> StunMessage.xorPeerAddress(peer, retryTransactionId))
+                    .ifPresent(result::add);
+        }
+        return result;
+    }
+
+    private void removePendingTurnChannel(PendingTurnRequest pending) {
+        StunMessage request = new StunMessage(
+                pending.requestType(), pending.transactionId(), pending.attributes());
+        int channelNumber = request.channelNumber().orElse(-1);
+        InetSocketAddress peer = request.xorPeerAddress().orElse(null);
+        if (peer == null) {
+            return;
+        }
+        TurnChannelBinding binding = turnChannelsByPeer.get(endpointKey(peer));
+        if (binding != null && binding.channelNumber == channelNumber && !binding.active) {
+            turnChannelsByPeer.remove(endpointKey(peer), binding);
+            turnChannelsByNumber.remove(channelNumber, binding);
+        }
     }
 
     private boolean sameEndpoint(InetSocketAddress expected, InetSocketAddress actual) {
@@ -2181,11 +2601,14 @@ public class PeerMeshClient implements AutoCloseable {
         return expected.getHostString().equalsIgnoreCase(actual.getHostString());
     }
 
-    private void handlePeerAppMessage(PeerDataFrame frame) {
+    private void handlePeerAppMessage(PeerDataFrame frame, PeerSession session) {
         PeerAppMessageCodec.PeerAppMessage message = PeerAppMessageCodec.decode(frame.plaintext());
         if (message == null) {
             log.debug("Peer mesh app message decode failed: session={}, from={}",
-                    frame.sessionId(), frame.fromClientId());
+                    frame.sessionId(), session.peerId());
+            return;
+        }
+        if (message.getFromClientId() != 0 && message.getFromClientId() != session.peerId()) {
             return;
         }
         if (PeerAppMessageCodec.TYPE_ACK.equalsIgnoreCase(message.getType())) {
@@ -2203,17 +2626,17 @@ public class PeerMeshClient implements AutoCloseable {
 
         String fromName = StringUtils.hasText(message.getFromClientName())
                 ? message.getFromClientName()
-                : String.valueOf(frame.fromClientId());
+                : String.valueOf(session.peerId());
         log.info("Peer message from {}: {}", fromName, message.getMessage());
-        sendPeerAppMessageAck(frame, message);
+        sendPeerAppMessageAck(session, message);
     }
 
-    private void sendPeerAppMessageAck(PeerDataFrame frame, PeerAppMessageCodec.PeerAppMessage message) {
+    private void sendPeerAppMessageAck(PeerSession session, PeerAppMessageCodec.PeerAppMessage message) {
         ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
         if (currentConfig == null || !StringUtils.hasText(message.getId())) {
             return;
         }
-        PeerInfo peer = peers.get(frame.fromClientId());
+        PeerInfo peer = peerIndex.byId().get(session.peerId());
         if (peer == null || !StringUtils.hasText(peer.virtualIp())) {
             return;
         }
@@ -2223,7 +2646,7 @@ public class PeerMeshClient implements AutoCloseable {
         ack.setId(message.getId());
         ack.setFromClientId(currentConfig.getClientId());
         ack.setFromClientName(currentConfig.getClientName());
-        ack.setToClientId(frame.fromClientId());
+        ack.setToClientId(session.peerId());
         ack.setToClientName(StringUtils.hasText(message.getFromClientName()) ? message.getFromClientName() : peer.clientName());
         ack.setCreatedAtMillis(System.currentTimeMillis());
         sendEncryptedPayload(peer.virtualIp(), PeerAppMessageCodec.encode(ack), false);
@@ -2243,7 +2666,7 @@ public class PeerMeshClient implements AutoCloseable {
 
         // P1-5 触发式双向探针：收到入站探针时，若 direct 路径尚未建立则再扫一轮对端端口
         if (!session.hasHealthyDirect(System.currentTimeMillis())) {
-            PeerInfo peerInfo = peers.get(session.peerId());
+            PeerInfo peerInfo = peerIndex.byId().get(session.peerId());
             if (peerInfo != null && !peerInfo.candidates().isEmpty()) {
                 PeerControlMessage trigger = new PeerControlMessage();
                 trigger.setSessionId(session.sessionId());
@@ -2337,7 +2760,16 @@ public class PeerMeshClient implements AutoCloseable {
                         pending.behaviorProbe()));
             }
         }
-        pendingTurnRequests.entrySet().removeIf(entry -> now - entry.getValue().sentAtMillis() > PENDING_PROBE_TTL_MILLIS);
+        for (Map.Entry<String, PendingTurnRequest> entry : pendingTurnRequests.entrySet()) {
+            PendingTurnRequest pending = entry.getValue();
+            if (now - pending.sentAtMillis() > PENDING_PROBE_TTL_MILLIS
+                    && pendingTurnRequests.remove(entry.getKey(), pending)
+                    && pending.requestType() == StunMessage.CHANNEL_BIND_REQUEST) {
+                removePendingTurnChannel(pending);
+            }
+        }
+        turnChannelsByNumber.entrySet().removeIf(entry -> entry.getValue().expiresAtMillis <= now);
+        turnChannelsByPeer.entrySet().removeIf(entry -> entry.getValue().expiresAtMillis <= now);
     }
 
     private void probeKnownCandidates() {
@@ -2345,7 +2777,7 @@ public class PeerMeshClient implements AutoCloseable {
             return;
         }
         long now = System.currentTimeMillis();
-        for (PeerInfo peer : peers.values()) {
+        for (PeerInfo peer : peerIndex.byId().values()) {
             if (!peer.online() || peer.candidates().isEmpty()) {
                 continue;
             }
@@ -2499,7 +2931,7 @@ public class PeerMeshClient implements AutoCloseable {
         report.setSourceVirtualIp(config.getVirtualIp());
         report.setSourcePublicKey(keyMaterial.publicKeyBase64());
         report.setTargetClientId(session.peerId());
-        PeerInfo peer = peers.get(session.peerId());
+        PeerInfo peer = peerIndex.byId().get(session.peerId());
         report.setTargetClientName(peer == null ? "" : peer.clientName());
         report.setTargetVirtualIp(peer == null ? "" : peer.virtualIp());
         report.setTargetPublicKey(peer == null ? "" : peer.publicKey());
@@ -2529,7 +2961,7 @@ public class PeerMeshClient implements AutoCloseable {
             report.setSourceVirtualIp(config.getVirtualIp());
             report.setSourcePublicKey(keyMaterial.publicKeyBase64());
             report.setTargetClientId(session.peerId());
-            PeerInfo peer = peers.get(session.peerId());
+            PeerInfo peer = peerIndex.byId().get(session.peerId());
             report.setTargetClientName(peer == null ? "" : peer.clientName());
             report.setTargetVirtualIp(peer == null ? "" : peer.virtualIp());
             report.setTargetPublicKey(peer == null ? "" : peer.publicKey());
@@ -2540,17 +2972,41 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     public boolean sendEncryptedPayload(String targetVirtualIp, byte[] payload) {
-        return sendEncryptedPayload(targetVirtualIp, payload, true);
+        Integer targetIp = PeerIpPacket.ipv4ToInt(targetVirtualIp);
+        PeerInfo peer = targetIp == null ? null : peerIndex.byVirtualIpv4().get(targetIp);
+        return sendEncryptedPayload(peer, targetVirtualIp, payload, 0, payload == null ? 0 : payload.length, true);
     }
 
     private boolean sendEncryptedPayload(String targetVirtualIp, byte[] payload, boolean allowPendingQueue) {
         if (!running || !StringUtils.hasText(targetVirtualIp) || payload == null) {
             return false;
         }
-        PeerInfo peer = peers.values().stream()
-                .filter(item -> targetVirtualIp.equals(item.virtualIp()))
-                .findFirst()
-                .orElse(null);
+        Integer targetIp = PeerIpPacket.ipv4ToInt(targetVirtualIp);
+        PeerInfo peer = targetIp == null ? null : peerIndex.byVirtualIpv4().get(targetIp);
+        return sendEncryptedPayload(peer, targetVirtualIp, payload, 0, payload.length, allowPendingQueue);
+    }
+
+    private boolean sendEncryptedPayload(PeerInfo peer,
+                                         String targetVirtualIp,
+                                         byte[] payload,
+                                         boolean allowPendingQueue) {
+        return sendEncryptedPayload(
+                peer, targetVirtualIp, payload, 0, payload == null ? 0 : payload.length, allowPendingQueue);
+    }
+
+    private boolean sendEncryptedPayload(PeerInfo peer,
+                                         String targetVirtualIp,
+                                         byte[] payload,
+                                         int offset,
+                                         int length,
+                                         boolean allowPendingQueue) {
+        if (!running
+                || payload == null
+                || offset < 0
+                || length <= 0
+                || offset > payload.length - length) {
+            return false;
+        }
         if (peer == null) {
             logPayloadDrop(targetVirtualIp, "peer-not-found");
             return false;
@@ -2558,7 +3014,7 @@ public class PeerMeshClient implements AutoCloseable {
         PeerSession session = sessions.get(peer.clientId());
         if (session == null || !session.canSend()) {
             if (allowPendingQueue) {
-                queuePendingPacket(peer, payload);
+                queuePendingPacket(peer, payload, offset, length);
                 preparePathForPeer(peer, session);
             }
             logPayloadDrop(targetVirtualIp, session == null ? "session-not-found" : session.blockedReason());
@@ -2569,24 +3025,13 @@ public class PeerMeshClient implements AutoCloseable {
             logPayloadDrop(targetVirtualIp, "udp-socket-not-ready");
             return false;
         }
-        long sequence = session.nextOutboundSequence();
-        byte[] frame = PeerDataFrameCodec.encode(
-                session.aesKey(),
-                session.sessionId(),
-                config.getClientId(),
-                peer.clientId(),
-                sequence,
-                payload
-        );
-        try {
-            if (StringUtils.hasText(session.relayTargetAllocationId)) {
-                return sendRelayPayload(session.relayTargetAllocationId, frame);
-            }
+        boolean relay = StringUtils.hasText(session.relayTargetAllocationId);
+        if (!relay) {
             long now = System.currentTimeMillis();
             if ("DIRECT".equals(session.currentPathType) && !session.hasHealthyDirect(now)) {
                 session.remoteEndpoint = null;
                 if (allowPendingQueue) {
-                    queuePendingPacket(peer, payload);
+                    queuePendingPacket(peer, payload, offset, length);
                     preparePathForPeer(peer, session);
                 }
                 logPayloadDrop(targetVirtualIp, "direct-stale-waiting-relay");
@@ -2594,7 +3039,7 @@ public class PeerMeshClient implements AutoCloseable {
             }
             if (shouldAvoidDirectPath()) {
                 if (allowPendingQueue) {
-                    queuePendingPacket(peer, payload);
+                    queuePendingPacket(peer, payload, offset, length);
                     preparePathForPeer(peer, session);
                 }
                 logDirectSuppressed("send-direct-data-frame");
@@ -2608,6 +3053,39 @@ public class PeerMeshClient implements AutoCloseable {
                 logPayloadDrop(targetVirtualIp, "recursive-remote-endpoint");
                 return false;
             }
+        }
+        ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
+        if (currentConfig == null) {
+            return false;
+        }
+        ensurePathMtuDiscovery(session);
+        if (PeerIpPacket.destinationIpv4Int(payload, offset, length) != null) {
+            int pathMtu = session.pathMtu.effectiveMtu(virtualDeviceOptions.mtu());
+            byte[] packet = offset == 0 && length == payload.length
+                    ? payload
+                    : Arrays.copyOfRange(payload, offset, offset + length);
+            packet = PeerIpPacket.clampTcpMss(packet, pathMtu);
+            if (packet.length > pathMtu) {
+                injectPacketTooBig(packet, pathMtu);
+                logPayloadDrop(targetVirtualIp, "path-mtu-" + pathMtu);
+                return true;
+            }
+            payload = packet;
+            offset = 0;
+            length = packet.length;
+        }
+        try {
+            long sequence = session.nextOutboundSequence();
+            byte[] frame = PeerDataFrameCodec.encode(
+                    session.outboundTrafficKey(currentConfig.getClientId()),
+                    session.sessionId(),
+                    sequence,
+                    payload,
+                    offset,
+                    length);
+            if (relay) {
+                return sendRelayPayload(session.relayTargetAllocationId, frame);
+            }
             socket.send(new DatagramPacket(frame, frame.length, session.remoteEndpoint));
             session.addDirectBytes(frame.length);
             return true;
@@ -2618,46 +3096,169 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
+    private void ensurePathMtuDiscovery(PeerSession session) {
+        String pathKey = pathMtuPathKey(session);
+        if (!StringUtils.hasText(pathKey)) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        CachedPathMtu cached = pathMtuCache.get(pathKey);
+        if (cached != null && cached.validUntilMillis() <= now) {
+            pathMtuCache.remove(pathKey, cached);
+            cached = null;
+        }
+        PeerPathMtu.Transition transition = session.pathMtu.activate(
+                pathKey,
+                virtualDeviceOptions.mtu(),
+                cached == null ? null : cached.innerMtu(),
+                cached == null ? 0 : cached.validUntilMillis(),
+                now,
+                secureRandom::nextLong);
+        applyPathMtuTransition(session, transition);
+    }
+
+    private void handlePathMtuMessage(byte[] payload, PeerSession session) {
+        PeerPathMtu.Message message = PeerPathMtu.decode(payload);
+        if (message == null) {
+            return;
+        }
+        if (message.probe()) {
+            sendRawEncryptedPayload(session, PeerPathMtu.ack(message.nonce(), message.innerMtu()));
+            return;
+        }
+        PeerPathMtu.Transition transition = session.pathMtu.acknowledge(
+                message.nonce(), message.innerMtu(), System.currentTimeMillis(), secureRandom::nextLong);
+        applyPathMtuTransition(session, transition);
+    }
+
+    private void applyPathMtuTransition(PeerSession session, PeerPathMtu.Transition transition) {
+        if (transition == null) {
+            return;
+        }
+        if (transition.completedMtu() != null && StringUtils.hasText(session.pathMtu.pathKey())) {
+            pathMtuCache.put(session.pathMtu.pathKey(), new CachedPathMtu(
+                    transition.completedMtu(), System.currentTimeMillis() + PeerPathMtu.CACHE_TTL_MILLIS));
+            log.debug("Peer mesh path MTU discovered: session={}, peer={}, path={}, mtu={}",
+                    session.sessionId(), session.peerId(), session.pathMtu.pathKey(), transition.completedMtu());
+        }
+        if (transition.probe() != null) {
+            sendPathMtuProbe(session, transition.probe());
+        }
+    }
+
+    private void sendPathMtuProbe(PeerSession session, PeerPathMtu.Probe probe) {
+        if (session == null || probe == null) {
+            return;
+        }
+        sendRawEncryptedPayload(session, PeerPathMtu.probe(probe.nonce(), probe.innerMtu()));
+        ScheduledExecutorService executor = maintenanceExecutor;
+        if (executor == null || executor.isShutdown()) {
+            return;
+        }
+        executor.schedule(
+                () -> onPathMtuProbeTimeout(session.sessionId(), probe.nonce()),
+                PeerPathMtu.PROBE_TIMEOUT_MILLIS,
+                TimeUnit.MILLISECONDS);
+    }
+
+    private void onPathMtuProbeTimeout(Long sessionId, long nonce) {
+        PeerSession session = sessionsById.get(sessionId);
+        if (session == null || session.isExpired(System.currentTimeMillis())) {
+            return;
+        }
+        applyPathMtuTransition(session, session.pathMtu.timeout(
+                nonce, System.currentTimeMillis(), secureRandom::nextLong));
+    }
+
+    private boolean sendRawEncryptedPayload(PeerSession session, byte[] payload) {
+        DatagramSocket socket = udpSocket;
+        ClientAuthLoginResponse.PeerMeshConfig currentConfig = config;
+        if (session == null || payload == null || socket == null || socket.isClosed()
+                || currentConfig == null || sessions.get(session.peerId()) != session || !session.canSend()) {
+            return false;
+        }
+        try {
+            byte[] frame = PeerDataFrameCodec.encode(
+                    session.outboundTrafficKey(currentConfig.getClientId()),
+                    session.sessionId(),
+                    session.nextOutboundSequence(),
+                    payload);
+            if (StringUtils.hasText(session.relayTargetAllocationId)) {
+                return sendRelayPayload(session.relayTargetAllocationId, frame);
+            }
+            socket.send(new DatagramPacket(frame, frame.length, session.remoteEndpoint));
+            session.addDirectBytes(frame.length);
+            return true;
+        } catch (Exception e) {
+            log.trace("Peer mesh path MTU frame send failed: session={}, reason={}",
+                    session.sessionId(), e.getMessage());
+            return false;
+        }
+    }
+
+    private String pathMtuPathKey(PeerSession session) {
+        if (session == null) {
+            return "";
+        }
+        if (StringUtils.hasText(session.relayTargetAllocationId)) {
+            return "relay|" + session.relayTargetAllocationId;
+        }
+        return session.remoteEndpoint == null ? "" : "direct|" + endpointKey(session.remoteEndpoint);
+    }
+
+    private void injectPacketTooBig(byte[] packet, int pathMtu) {
+        byte[] response = PeerIpPacket.icmpFragmentationNeededFor(packet, pathMtu);
+        PeerVirtualDevice device = virtualDevice;
+        if (response == null || device == null || device instanceof NoopPeerVirtualDevice) {
+            return;
+        }
+        try {
+            synchronized (tunWriteLock) {
+                device.writePacket(response);
+            }
+        } catch (Exception e) {
+            log.debug("Peer mesh ICMP fragmentation-needed injection failed: {}", e.getMessage());
+        }
+    }
+
     public boolean sendVirtualPacket(byte[] ipv4Packet) {
-        String targetVirtualIp = PeerIpPacket.destinationIpv4(ipv4Packet);
-        if (!StringUtils.hasText(targetVirtualIp)) {
+        return sendVirtualPacket(ipv4Packet, 0, ipv4Packet == null ? 0 : ipv4Packet.length);
+    }
+
+    private boolean sendVirtualPacket(byte[] ipv4Packet, int offset, int length) {
+        Integer targetVirtualIpv4 = PeerIpPacket.destinationIpv4Int(ipv4Packet, offset, length);
+        if (targetVirtualIpv4 == null) {
             log.trace("Peer mesh 忽略非 IPv4 或无效 IP 包");
             return false;
         }
-        if (shouldIgnoreVirtualPacketTarget(targetVirtualIp)) {
+        String targetVirtualIp = PeerIpPacket.ipv4ToString(targetVirtualIpv4);
+        if (shouldIgnoreVirtualPacketTarget(targetVirtualIpv4)) {
             logIgnoredVirtualPacket(targetVirtualIp, "non-peer-unicast");
             return false;
         }
-        if (!isKnownOnlinePeerVirtualIp(targetVirtualIp)) {
+        PeerInfo peer = peerIndex.byVirtualIpv4().get(targetVirtualIpv4);
+        if (peer == null || !peer.online()) {
             logIgnoredVirtualPacket(targetVirtualIp, "unknown-peer-route");
             return false;
         }
-        tracePacket("outbound-from-tun", ipv4Packet);
-        return sendEncryptedPayload(targetVirtualIp, ipv4Packet);
+        tracePacket("outbound-from-tun", ipv4Packet, offset, length);
+        return sendEncryptedPayload(peer, peer.virtualIp(), ipv4Packet, offset, length, true);
     }
 
-    private boolean isKnownOnlinePeerVirtualIp(String targetVirtualIp) {
-        return peers.values().stream()
-                .anyMatch(peer -> peer.online() && targetVirtualIp.equals(peer.virtualIp()));
-    }
-
-    private boolean shouldIgnoreVirtualPacketTarget(String targetVirtualIp) {
-        Long ip = ipv4ToLong(targetVirtualIp);
-        if (ip == null) {
-            return true;
-        }
-        int firstOctet = (int) ((ip >>> 24) & 0xFF);
-        if (firstOctet >= 224 || firstOctet == 0 || targetVirtualIp.equals("255.255.255.255")) {
+    private boolean shouldIgnoreVirtualPacketTarget(int targetVirtualIp) {
+        int firstOctet = (targetVirtualIp >>> 24) & 0xFF;
+        if (firstOctet >= 224 || firstOctet == 0 || targetVirtualIp == -1) {
             return true;
         }
         ClientAuthLoginResponse.PeerMeshConfig current = config;
-        if (current != null && targetVirtualIp.equals(current.getVirtualIp())) {
+        Integer localVirtualIp = current == null ? null : PeerIpPacket.ipv4ToInt(current.getVirtualIp());
+        if (localVirtualIp != null && targetVirtualIp == localVirtualIp) {
             return true;
         }
         return isMeshBoundaryAddress(targetVirtualIp);
     }
 
-    private boolean isMeshBoundaryAddress(String targetVirtualIp) {
+    private boolean isMeshBoundaryAddress(int targetVirtualIp) {
         ClientAuthLoginResponse.PeerMeshConfig current = config;
         if (current == null || !StringUtils.hasText(current.getCidr())) {
             return false;
@@ -2666,9 +3267,8 @@ public class PeerMeshClient implements AutoCloseable {
         if (parts.length != 2) {
             return false;
         }
-        Long ip = ipv4ToLong(targetVirtualIp);
-        Long base = ipv4ToLong(parts[0]);
-        if (ip == null || base == null) {
+        Integer baseValue = PeerIpPacket.ipv4ToInt(parts[0]);
+        if (baseValue == null) {
             return false;
         }
         int prefix;
@@ -2681,23 +3281,29 @@ public class PeerMeshClient implements AutoCloseable {
             return false;
         }
         long mask = prefix == 0 ? 0 : (0xFFFF_FFFFL << (32 - prefix)) & 0xFFFF_FFFFL;
+        long ip = Integer.toUnsignedLong(targetVirtualIp);
+        long base = Integer.toUnsignedLong(baseValue);
         long network = base & mask;
         long broadcast = network | (~mask & 0xFFFF_FFFFL);
         return ip == network || ip == broadcast;
     }
 
-    private void queuePendingPacket(PeerInfo peer, byte[] payload) {
-        if (peer == null || payload == null || payload.length == 0) {
+    private void queuePendingPacket(PeerInfo peer, byte[] payload, int offset, int length) {
+        if (peer == null
+                || payload == null
+                || offset < 0
+                || length <= 0
+                || offset > payload.length - length) {
             return;
         }
         long now = System.currentTimeMillis();
-        List<PendingVirtualPacket> queue = pendingVirtualPackets.computeIfAbsent(peer.clientId(), ignored -> new ArrayList<>());
+        Deque<PendingVirtualPacket> queue = pendingVirtualPackets.computeIfAbsent(peer.clientId(), ignored -> new ArrayDeque<>());
         synchronized (queue) {
             queue.removeIf(item -> now - item.createdAtMillis() > PENDING_PACKET_TTL_MILLIS);
             while (queue.size() >= MAX_PENDING_PACKETS_PER_PEER) {
-                queue.remove(0);
+                queue.removeFirst();
             }
-            queue.add(new PendingVirtualPacket(Arrays.copyOf(payload, payload.length), now));
+            queue.addLast(new PendingVirtualPacket(Arrays.copyOfRange(payload, offset, offset + length), now));
         }
     }
 
@@ -2732,7 +3338,7 @@ public class PeerMeshClient implements AutoCloseable {
         if (session == null || !session.canSend()) {
             return;
         }
-        List<PendingVirtualPacket> queue = pendingVirtualPackets.remove(session.peerId());
+        Deque<PendingVirtualPacket> queue = pendingVirtualPackets.remove(session.peerId());
         if (queue == null || queue.isEmpty()) {
             return;
         }
@@ -2743,8 +3349,8 @@ public class PeerMeshClient implements AutoCloseable {
                 if (now - item.createdAtMillis() > PENDING_PACKET_TTL_MILLIS) {
                     continue;
                 }
-                String targetVirtualIp = PeerIpPacket.destinationIpv4(item.packet());
-                if (sendEncryptedPayload(targetVirtualIp, item.packet(), false)) {
+                PeerInfo peer = peerIndex.byId().get(session.peerId());
+                if (peer != null && sendEncryptedPayload(peer, peer.virtualIp(), item.packet(), false)) {
                     flushed++;
                 }
             }
@@ -2757,7 +3363,7 @@ public class PeerMeshClient implements AutoCloseable {
     private void cleanupPendingVirtualPackets() {
         long now = System.currentTimeMillis();
         pendingVirtualPackets.entrySet().removeIf(entry -> {
-            List<PendingVirtualPacket> queue = entry.getValue();
+            Deque<PendingVirtualPacket> queue = entry.getValue();
             synchronized (queue) {
                 queue.removeIf(item -> now - item.createdAtMillis() > PENDING_PACKET_TTL_MILLIS);
                 return queue.isEmpty();
@@ -2766,43 +3372,65 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private void tracePacket(String direction, byte[] packet) {
-        int protocol = PeerIpPacket.protocol(packet);
+        tracePacket(direction, packet, 0, packet == null ? 0 : packet.length);
+    }
+
+    private void tracePacket(String direction, byte[] packet, int offset, int length) {
+        if (!log.isDebugEnabled()) {
+            return;
+        }
+        if (packet == null || offset < 0 || length <= 0 || offset > packet.length - length) {
+            return;
+        }
+        byte[] inspected = offset == 0 && length == packet.length
+                ? packet
+                : Arrays.copyOfRange(packet, offset, offset + length);
+        int protocol = PeerIpPacket.protocol(inspected);
         if (protocol != 6 && protocol != 17) {
             return;
         }
         long now = System.currentTimeMillis();
-        String key = direction + "|" + PeerIpPacket.flowKey(packet);
-        Long previous = packetTraceLogMillis.get(key);
-        if (previous != null && now - previous < 10_000) {
+        String key = direction + "|" + PeerIpPacket.flowKey(inspected);
+        if (!allowRateLimitedLog(packetTraceLogMillis, key, now, 10_000)) {
             return;
         }
-        packetTraceLogMillis.put(key, now);
         log.debug("Peer mesh packet {}: {} bytes={}",
-                direction, PeerIpPacket.describe(packet), packet == null ? 0 : packet.length);
+                direction, PeerIpPacket.describe(inspected), length);
     }
 
     private void logPayloadDrop(String targetVirtualIp, String reason) {
         long now = System.currentTimeMillis();
         String key = targetVirtualIp + "|" + reason;
-        Long previous = payloadDropLogMillis.get(key);
-        if (previous != null && now - previous < 10_000) {
+        if (!allowRateLimitedLog(payloadDropLogMillis, key, now, 10_000)) {
             return;
         }
-        payloadDropLogMillis.put(key, now);
         log.warn("Peer mesh 虚拟包未发送: target={}, reason={}, peers={}, sessions={}",
-                targetVirtualIp, reason, peers.size(), sessions.size());
+                targetVirtualIp, reason, peerIndex.byId().size(), sessions.size());
     }
 
     private void logIgnoredVirtualPacket(String targetVirtualIp, String reason) {
         long now = System.currentTimeMillis();
         String key = "ignored|" + targetVirtualIp + "|" + reason;
-        Long previous = payloadDropLogMillis.get(key);
-        if (previous != null && now - previous < 30_000) {
+        if (!allowRateLimitedLog(payloadDropLogMillis, key, now, 30_000)) {
             return;
         }
-        payloadDropLogMillis.put(key, now);
         log.debug("Peer mesh 忽略非对端虚拟包: target={}, reason={}, peers={}, sessions={}",
-                targetVirtualIp, reason, peers.size(), sessions.size());
+                targetVirtualIp, reason, peerIndex.byId().size(), sessions.size());
+    }
+
+    private boolean allowRateLimitedLog(Map<String, Long> timestamps,
+                                        String key,
+                                        long nowMillis,
+                                        long intervalMillis) {
+        Long previous = timestamps.get(key);
+        if (previous != null && nowMillis - previous < intervalMillis) {
+            return false;
+        }
+        if (previous == null && timestamps.size() >= MAX_LOG_RATE_KEYS) {
+            return false;
+        }
+        timestamps.put(key, nowMillis);
+        return true;
     }
 
     private String localEndpoint() {
@@ -2923,6 +3551,12 @@ public class PeerMeshClient implements AutoCloseable {
         }
         try {
             ensureTurnPermission(peer);
+            TurnChannelBinding binding = ensureTurnChannel(peer);
+            if (binding != null && binding.activeAt(System.currentTimeMillis())) {
+                byte[] bytes = TurnChannelData.encode(binding.channelNumber, payload);
+                socket.send(new DatagramPacket(bytes, bytes.length, turnServer));
+                return true;
+            }
             byte[] transactionId = StunMessage.newTransactionId();
             StunMessage indication = StunMessage.of(
                     StunMessage.SEND_INDICATION,
@@ -2964,18 +3598,72 @@ public class PeerMeshClient implements AutoCloseable {
         return new InetSocketAddress(config.getTurnHost(), config.getTurnPort());
     }
 
-    private InetSocketAddress stunEndpoint() {
-        if (config == null || !StringUtils.hasText(config.getStunHost()) || config.getStunPort() <= 0) {
+    private synchronized TurnChannelBinding ensureTurnChannel(InetSocketAddress peer) {
+        InetSocketAddress turnServer = relayEndpoint();
+        if (peer == null || turnServer == null) {
             return null;
         }
-        return new InetSocketAddress(config.getStunHost(), config.getStunPort());
+        long now = System.currentTimeMillis();
+        String peerKey = endpointKey(peer);
+        TurnChannelBinding existing = turnChannelsByPeer.get(peerKey);
+        if (existing != null
+                && ((existing.active && existing.expiresAtMillis - now > 60_000)
+                || (!existing.active && existing.expiresAtMillis > now))) {
+            return existing;
+        }
+        if (existing != null) {
+            turnChannelsByPeer.remove(peerKey, existing);
+            turnChannelsByNumber.remove(existing.channelNumber, existing);
+        }
+        int channelNumber = allocateTurnChannelNumber();
+        if (channelNumber < 0) {
+            return null;
+        }
+        TurnChannelBinding binding = new TurnChannelBinding(
+                channelNumber,
+                peer,
+                now + TURN_CHANNEL_PENDING_MILLIS);
+        turnChannelsByPeer.put(peerKey, binding);
+        turnChannelsByNumber.put(channelNumber, binding);
+        byte[] transactionId = StunMessage.newTransactionId();
+        sendStunRequest(StunMessage.of(
+                StunMessage.CHANNEL_BIND_REQUEST,
+                transactionId,
+                StunMessage.channelNumber(channelNumber),
+                StunMessage.xorPeerAddress(peer, transactionId)), turnServer);
+        return binding;
+    }
+
+    private int allocateTurnChannelNumber() {
+        for (int channel = TurnChannelData.MIN_CHANNEL; channel <= TurnChannelData.MAX_CHANNEL; channel++) {
+            TurnChannelBinding existing = turnChannelsByNumber.get(channel);
+            if (existing == null || !existing.activeAt(System.currentTimeMillis())) {
+                return channel;
+            }
+        }
+        return -1;
+    }
+
+    private InetSocketAddress stunEndpoint() {
+        List<InetSocketAddress> endpoints = stunEndpoints();
+        return endpoints.isEmpty() ? null : endpoints.getFirst();
+    }
+
+    private List<InetSocketAddress> stunEndpoints() {
+        if (config == null || !StringUtils.hasText(config.getStunHost()) || config.getStunPort() <= 0) {
+            return List.of();
+        }
+        return resolveEndpoints(config.getStunHost(), config.getStunPort());
     }
 
     private String endpointKey(InetSocketAddress endpoint) {
         if (endpoint == null || endpoint.getAddress() == null) {
             return "";
         }
-        return endpoint.getAddress().getHostAddress() + ":" + endpoint.getPort();
+        String address = endpoint.getAddress().getHostAddress();
+        return address.contains(":")
+                ? "[" + address + "]:" + endpoint.getPort()
+                : address + ":" + endpoint.getPort();
     }
 
     private InetSocketAddress parseEndpoint(String value) {
@@ -2986,22 +3674,22 @@ public class PeerMeshClient implements AutoCloseable {
         if (normalized.startsWith("turn:")) {
             normalized = normalized.substring("turn:".length());
         }
-        int colon = normalized.lastIndexOf(':');
-        if (colon <= 0 || colon >= normalized.length() - 1) {
+        HostPort hostPort = parseHostPort(normalized, -1);
+        if (hostPort == null || hostPort.port() <= 0) {
             return null;
         }
-        try {
-            String host = normalized.substring(0, colon);
-            int port = Integer.parseInt(normalized.substring(colon + 1));
-            return new InetSocketAddress(host, port);
-        } catch (Exception e) {
-            return null;
-        }
+        List<InetSocketAddress> endpoints = resolveEndpoints(hostPort.host(), hostPort.port());
+        return endpoints.isEmpty() ? null : endpoints.getFirst();
     }
 
     private InetSocketAddress parseStunServer(String value) {
+        List<InetSocketAddress> endpoints = parseStunServers(value);
+        return endpoints.isEmpty() ? null : endpoints.getFirst();
+    }
+
+    private List<InetSocketAddress> parseStunServers(String value) {
         if (!StringUtils.hasText(value)) {
-            return null;
+            return List.of();
         }
         String normalized = value.trim();
         String lower = normalized.toLowerCase();
@@ -3015,31 +3703,64 @@ public class PeerMeshClient implements AutoCloseable {
             normalized = normalized.substring(0, slash);
         }
         if (!StringUtils.hasText(normalized)) {
+            return List.of();
+        }
+        HostPort hostPort = parseHostPort(normalized, 3478);
+        if (hostPort == null) {
+            return List.of();
+        }
+        return resolveEndpoints(hostPort.host(), hostPort.port());
+    }
+
+    private HostPort parseHostPort(String value, int defaultPort) {
+        if (!StringUtils.hasText(value)) {
             return null;
         }
-        String host = normalized;
-        int port = 3478;
-        if (normalized.startsWith("[")) {
-            int close = normalized.indexOf(']');
+        String host = value.trim();
+        int port = defaultPort;
+        if (host.startsWith("[")) {
+            int close = host.indexOf(']');
             if (close <= 1) {
                 return null;
             }
-            host = normalized.substring(1, close);
-            if (close + 1 < normalized.length() && normalized.charAt(close + 1) == ':') {
-                port = parsePort(normalized.substring(close + 2), 3478);
+            String suffix = host.substring(close + 1);
+            String address = host.substring(1, close);
+            if (!suffix.isEmpty()) {
+                if (!suffix.startsWith(":") || suffix.length() == 1) {
+                    return null;
+                }
+                port = parsePort(suffix.substring(1), -1);
             }
+            host = address;
         } else {
-            int firstColon = normalized.indexOf(':');
-            int lastColon = normalized.lastIndexOf(':');
-            if (firstColon > 0 && firstColon == lastColon && lastColon < normalized.length() - 1) {
-                host = normalized.substring(0, lastColon);
-                port = parsePort(normalized.substring(lastColon + 1), 3478);
+            int firstColon = host.indexOf(':');
+            int lastColon = host.lastIndexOf(':');
+            if (firstColon > 0 && firstColon == lastColon) {
+                port = parsePort(host.substring(lastColon + 1), -1);
+                host = host.substring(0, lastColon);
+            } else if (firstColon < 0 && defaultPort < 0) {
+                return null;
             }
         }
-        if (!StringUtils.hasText(host) || port <= 0 || port > 65535) {
+        if (!StringUtils.hasText(host) || port <= 0 || port > 65_535) {
             return null;
         }
-        return new InetSocketAddress(host.trim(), port);
+        return new HostPort(host.trim(), port);
+    }
+
+    private List<InetSocketAddress> resolveEndpoints(String host, int port) {
+        try {
+            return Arrays.stream(InetAddress.getAllByName(host))
+                    .filter(address -> address instanceof Inet4Address || address instanceof Inet6Address)
+                    .sorted(Comparator.comparingInt((InetAddress address) -> address instanceof Inet4Address ? 0 : 1)
+                            .thenComparing(InetAddress::getHostAddress))
+                    .map(address -> new InetSocketAddress(address, port))
+                    .distinct()
+                    .toList();
+        } catch (Exception e) {
+            log.debug("Peer mesh endpoint 解析失败: host={}, reason={}", host, e.getMessage());
+            return List.of();
+        }
     }
 
     private int parsePort(String value, int fallback) {
@@ -3057,6 +3778,17 @@ public class PeerMeshClient implements AutoCloseable {
         return candidate.getType() + ":" + candidate.getAddress() + ":" + candidate.getPort();
     }
 
+    private static String addressFamily(String address) {
+        if (!StringUtils.hasText(address)) {
+            return "";
+        }
+        try {
+            return InetAddress.getByName(address) instanceof Inet6Address ? "IPv6" : "IPv4";
+        } catch (Exception ignored) {
+            return address.contains(":") ? "IPv6" : "IPv4";
+        }
+    }
+
     private void mergePeerFromSignal(PeerControlMessage control, List<PeerCandidate> candidates) {
         PeerInfo peer = peerFromSignal(control);
         if (peer != null) {
@@ -3064,24 +3796,55 @@ public class PeerMeshClient implements AutoCloseable {
         }
     }
 
-    private void mergePeer(PeerInfo peer, List<PeerCandidate> candidates) {
+    private synchronized void mergePeer(PeerInfo peer, List<PeerCandidate> candidates) {
         if (peer == null || peer.clientId() <= 0) {
             return;
         }
-        peers.compute(peer.clientId(), (id, current) -> {
-            List<PeerCandidate> nextCandidates = candidates == null
-                    ? (current == null ? peer.candidates() : current.candidates())
-                    : List.copyOf(candidates);
-            return new PeerInfo(
-                    peer.clientId(),
-                    firstText(peer.clientName(), current == null ? "" : current.clientName()),
-                    firstText(peer.virtualIp(), current == null ? "" : current.virtualIp()),
-                    firstText(peer.publicKey(), current == null ? "" : current.publicKey()),
-                    peer.online() || (current != null && current.online()),
-                    nextCandidates
-            );
-        });
+        Map<Long, PeerInfo> nextPeers = new HashMap<>(peerIndex.byId());
+        PeerInfo current = nextPeers.get(peer.clientId());
+        List<PeerCandidate> nextCandidates = candidates == null
+                ? (current == null ? peer.candidates() : current.candidates())
+                : sortedCandidates(candidates);
+        // 对端上报的 epoch 非空时必须覆盖旧值：对端重启后 epoch 变化，继续用旧 epoch 派生的
+        // inbound key 无法解密新帧。为空（roster 或本端发起的信令）时保留已学到的值。
+        String nextKeyEpoch = firstText(peer.keyEpoch(), current == null ? "" : current.keyEpoch());
+        nextPeers.put(peer.clientId(), new PeerInfo(
+                peer.clientId(),
+                firstText(peer.clientName(), current == null ? "" : current.clientName()),
+                firstText(peer.virtualIp(), current == null ? "" : current.virtualIp()),
+                firstText(peer.publicKey(), current == null ? "" : current.publicKey()),
+                nextKeyEpoch,
+                peer.online() || (current != null && current.online()),
+                nextCandidates
+        ));
+        peerIndex = PeerIndex.of(nextPeers);
+        applyRemoteKeyEpoch(peer.clientId(), nextKeyEpoch);
         syncVirtualDeviceRoutes();
+    }
+
+    /**
+     * 把对端最新 epoch 应用到已建立的 session。epoch 变化意味着对端重启并从 sequence=1 重新发送，
+     * 因此必须同时丢弃 inbound traffic key 缓存和 replay window，否则新帧会被旧窗口当作重放拒绝。
+     */
+    private void applyRemoteKeyEpoch(long peerId, String keyEpoch) {
+        if (!StringUtils.hasText(keyEpoch)) {
+            return;
+        }
+        PeerSession session = sessions.get(peerId);
+        if (session != null && session.applyRemoteKeyEpoch(keyEpoch)) {
+            log.info("Peer mesh 对端 key epoch 更新，已重置 inbound 解密状态: peer={}, epoch={}", peerId, keyEpoch);
+        }
+    }
+
+    private List<PeerCandidate> sortedCandidates(List<PeerCandidate> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return List.of();
+        }
+        return candidates.stream()
+                .filter(Objects::nonNull)
+                .sorted(Comparator.comparingLong(PeerCandidate::getPriority).reversed()
+                        .thenComparing(PeerCandidate::getType, Comparator.nullsLast(String::compareTo)))
+                .toList();
     }
 
     private String firstText(String first, String fallback) {
@@ -3095,21 +3858,25 @@ public class PeerMeshClient implements AutoCloseable {
             return null;
         }
         if (sourceId != null && !sourceId.equals(config.getClientId())) {
+            // source 是对端：sourceKeyEpoch 就是对端 epoch
             return new PeerInfo(
                     sourceId,
                     control.getSourceClientName(),
                     control.getSourceVirtualIp(),
                     control.getSourcePublicKey(),
+                    control.getSourceKeyEpoch() == null ? "" : control.getSourceKeyEpoch(),
                     true,
                     List.of()
             );
         }
         if (targetId != null && !targetId.equals(config.getClientId())) {
+            // target 是对端：此时 sourceKeyEpoch 是本端自己的 epoch，不能当作对端 epoch
             return new PeerInfo(
                     targetId,
                     control.getTargetClientName(),
                     control.getTargetVirtualIp(),
                     control.getTargetPublicKey(),
+                    "",
                     true,
                     List.of()
             );
@@ -3133,6 +3900,18 @@ public class PeerMeshClient implements AutoCloseable {
     private String newNonce() {
         byte[] bytes = new byte[12];
         secureRandom.nextBytes(bytes);
+        return HexFormat.of().formatHex(bytes);
+    }
+
+    private boolean isLocalClient(Long clientId) {
+        ClientAuthLoginResponse.PeerMeshConfig current = config;
+        return clientId != null && current != null && clientId.equals(current.getClientId());
+    }
+
+    /** 128 bit 随机 epoch，碰撞概率可忽略；用静态方法是因为它在字段初始化阶段就要就绪 */
+    private static String newKeyEpoch() {
+        byte[] bytes = new byte[16];
+        new SecureRandom().nextBytes(bytes);
         return HexFormat.of().formatHex(bytes);
     }
 
@@ -3161,24 +3940,100 @@ public class PeerMeshClient implements AutoCloseable {
         void send(String toClientName, String message);
     }
 
+    public record DataPlaneStats(long invalidUdpPackets,
+                                 long udpProbeRateLimited,
+                                 long workerRejected,
+                                 long decryptRejected,
+                                 int queueDepth,
+                                 long queueHighWater,
+                                 long tunWrites,
+                                 long averageTunWriteNanos) {
+    }
+
+    private static final class DataPlaneWorker implements AutoCloseable {
+        private final ThreadPoolExecutor executor;
+
+        private DataPlaneWorker(int index, int queueCapacity) {
+            executor = new ThreadPoolExecutor(
+                    1,
+                    1,
+                    0L,
+                    TimeUnit.MILLISECONDS,
+                    new ArrayBlockingQueue<>(queueCapacity),
+                    runnable -> {
+                        Thread thread = new Thread(runnable, "peer-mesh-data-" + index);
+                        thread.setDaemon(true);
+                        return thread;
+                    },
+                    new ThreadPoolExecutor.AbortPolicy());
+        }
+
+        private boolean submit(Runnable task) {
+            try {
+                executor.execute(task);
+                return true;
+            } catch (RuntimeException ignored) {
+                return false;
+            }
+        }
+
+        private int queueSize() {
+            return executor.getQueue().size();
+        }
+
+        @Override
+        public void close() {
+            executor.shutdownNow();
+        }
+    }
+
     private record PeerInfo(long clientId,
                             String clientName,
                             String virtualIp,
                             String publicKey,
+                            String keyEpoch,
                             boolean online,
                             List<PeerCandidate> candidates) {
     }
 
-    private static final class PeerSession {
+    private record PeerIndex(Map<Long, PeerInfo> byId, Map<Integer, PeerInfo> byVirtualIpv4) {
+        private static PeerIndex empty() {
+            return new PeerIndex(Map.of(), Map.of());
+        }
+
+        private static PeerIndex of(Map<Long, PeerInfo> source) {
+            if (source == null || source.isEmpty()) {
+                return empty();
+            }
+            Map<Long, PeerInfo> byId = Map.copyOf(source);
+            Map<Integer, PeerInfo> byVirtualIpv4 = new HashMap<>();
+            for (PeerInfo peer : byId.values()) {
+                Integer address = PeerIpPacket.ipv4ToInt(peer.virtualIp());
+                if (address != null) {
+                    byVirtualIpv4.put(address, peer);
+                }
+            }
+            return new PeerIndex(byId, Map.copyOf(byVirtualIpv4));
+        }
+    }
+
+    static final class PeerSession {
         private final Long sessionId;
         private final long peerId;
         private final String token;
         private final String expiresAt;
         private final byte[] aesKey;
+        private final SecretKeySpec aesKeySpec;
         private final long createdAtMillis;
         private final AtomicLong outboundSequence = new AtomicLong();
         private final AtomicLong directBytesSinceReport = new AtomicLong();
         private volatile PeerReplayWindow inboundReplayWindow = new PeerReplayWindow();
+        private volatile PeerDataFrameCodec.TrafficKey outboundTrafficKey;
+        private volatile PeerDataFrameCodec.TrafficKey inboundTrafficKey;
+        /** 本端本次运行实例的 key epoch；出站 traffic key 绑定它 */
+        private volatile String localKeyEpoch = "";
+        /** 对端最近上报的 key epoch；入站 traffic key 绑定它，未知时无法解密 */
+        private volatile String remoteKeyEpoch = "";
         private volatile long lastDirectSuccessMillis;
         private volatile long lastRelaySuccessMillis;
         private volatile long lastDirectKeepaliveMillis;
@@ -3195,8 +4050,9 @@ public class PeerMeshClient implements AutoCloseable {
         private volatile long endpointRtt = Long.MAX_VALUE;
         private volatile InetSocketAddress remoteEndpoint;
         private volatile String relayTargetAllocationId;
+        private final PeerPathMtu.Discovery pathMtu = new PeerPathMtu.Discovery();
 
-        private PeerSession(Long sessionId, long peerId, String token, String expiresAt, byte[] aesKey) {
+        PeerSession(Long sessionId, long peerId, String token, String expiresAt, byte[] aesKey) {
             this(sessionId, peerId, token, expiresAt, aesKey, System.currentTimeMillis());
         }
 
@@ -3206,6 +4062,7 @@ public class PeerMeshClient implements AutoCloseable {
             this.token = token;
             this.expiresAt = expiresAt;
             this.aesKey = aesKey;
+            this.aesKeySpec = aesKey == null ? null : new SecretKeySpec(aesKey.clone(), "AES");
             this.createdAtMillis = createdAtMillis;
         }
 
@@ -3214,7 +4071,11 @@ public class PeerMeshClient implements AutoCloseable {
             next.outboundSequence.set(outboundSequence.get());
             next.directBytesSinceReport.set(directBytesSinceReport.get());
             next.remoteEndpoint = remoteEndpoint;
-            next.inboundReplayWindow = inboundReplayWindow.copy();
+            // epoch 必须随 session 迁移：同一 sessionId 下 outboundSequence 是延续的，
+            // 换 epoch 会让 sequence 与 key 的对应关系错乱
+            next.localKeyEpoch = localKeyEpoch;
+            next.remoteKeyEpoch = remoteKeyEpoch;
+            copyInboundStateTo(next);
             next.relayTargetAllocationId = relayTargetAllocationId;
             next.endpointSuccessMillis = endpointSuccessMillis;
             next.endpointRtt = endpointRtt;
@@ -3249,6 +4110,59 @@ public class PeerMeshClient implements AutoCloseable {
             return aesKey;
         }
 
+        SecretKeySpec aesKeySpec() {
+            return aesKeySpec;
+        }
+
+        synchronized PeerDataFrameCodec.TrafficKey outboundTrafficKey(long localClientId) {
+            if (aesKeySpec == null || !StringUtils.hasText(localKeyEpoch)) {
+                return null;
+            }
+            if (outboundTrafficKey == null) {
+                outboundTrafficKey = PeerDataFrameCodec.trafficKey(
+                        aesKeySpec, sessionId, localClientId, peerId, localKeyEpoch);
+            }
+            return outboundTrafficKey;
+        }
+
+        synchronized PeerDataFrameCodec.TrafficKey inboundTrafficKey(long localClientId) {
+            if (aesKeySpec == null || !StringUtils.hasText(remoteKeyEpoch)) {
+                return null;
+            }
+            if (inboundTrafficKey == null) {
+                inboundTrafficKey = PeerDataFrameCodec.trafficKey(
+                        aesKeySpec, sessionId, peerId, localClientId, remoteKeyEpoch);
+            }
+            return inboundTrafficKey;
+        }
+
+        synchronized void setLocalKeyEpoch(String epoch) {
+            if (!StringUtils.hasText(epoch) || epoch.equals(localKeyEpoch)) {
+                return;
+            }
+            localKeyEpoch = epoch;
+            outboundTrafficKey = null;
+        }
+
+        /**
+         * @return true 表示 epoch 确实发生了变化（对端重启），此时 inbound key 与 replay window 已重置
+         */
+        synchronized boolean applyRemoteKeyEpoch(String epoch) {
+            if (!StringUtils.hasText(epoch) || epoch.equals(remoteKeyEpoch)) {
+                return false;
+            }
+            boolean changed = StringUtils.hasText(remoteKeyEpoch);
+            remoteKeyEpoch = epoch;
+            inboundTrafficKey = null;
+            // 对端从 sequence=1 重新开始，旧窗口会把新帧全部当作重放拒绝
+            inboundReplayWindow = new PeerReplayWindow();
+            return changed;
+        }
+
+        synchronized String remoteKeyEpoch() {
+            return remoteKeyEpoch;
+        }
+
         boolean canSend() {
             return aesKey != null && remoteEndpoint != null && !isExpired(System.currentTimeMillis());
         }
@@ -3270,8 +4184,12 @@ public class PeerMeshClient implements AutoCloseable {
             return outboundSequence.incrementAndGet();
         }
 
-        boolean acceptInboundSequence(long sequence) {
+        synchronized boolean acceptInboundSequence(long sequence) {
             return inboundReplayWindow.accept(sequence);
+        }
+
+        synchronized void copyInboundStateTo(PeerSession target) {
+            target.inboundReplayWindow = inboundReplayWindow.copy();
         }
 
         void addDirectBytes(long bytes) {
@@ -3342,6 +4260,12 @@ public class PeerMeshClient implements AutoCloseable {
                                         long createdAtMillis) {
     }
 
+    private record CachedPathMtu(int innerMtu, long validUntilMillis) {
+    }
+
+    private record HostPort(String host, int port) {
+    }
+
     private record PendingStunBinding(String role,
                                       InetSocketAddress targetEndpoint,
                                       InetSocketAddress expectedResponseEndpoint,
@@ -3352,12 +4276,36 @@ public class PeerMeshClient implements AutoCloseable {
     }
 
     private record PendingTurnRequest(int requestType,
+                                      byte[] transactionId,
                                       List<StunMessage.Attribute> attributes,
                                       InetSocketAddress endpoint,
                                       int authenticationAttempt,
                                       long sentAtMillis) {
         private PendingTurnRequest {
+            transactionId = transactionId == null ? new byte[0] : transactionId.clone();
             attributes = attributes == null ? List.of() : List.copyOf(attributes);
+        }
+
+        @Override
+        public byte[] transactionId() {
+            return transactionId.clone();
+        }
+    }
+
+    private static final class TurnChannelBinding {
+        private final int channelNumber;
+        private final InetSocketAddress peer;
+        private volatile long expiresAtMillis;
+        private volatile boolean active;
+
+        private TurnChannelBinding(int channelNumber, InetSocketAddress peer, long expiresAtMillis) {
+            this.channelNumber = channelNumber;
+            this.peer = peer;
+            this.expiresAtMillis = expiresAtMillis;
+        }
+
+        private boolean activeAt(long nowMillis) {
+            return active && expiresAtMillis > nowMillis;
         }
     }
 

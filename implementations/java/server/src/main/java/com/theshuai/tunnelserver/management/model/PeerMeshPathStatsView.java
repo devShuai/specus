@@ -18,6 +18,7 @@ public record PeerMeshPathStatsView(
         long activeRelaySessions,
         Double activeDirectRatio,
         List<PathTypeStat> pathTypes,
+        List<AddressFamilyStat> addressFamilies,
         List<NatTypeStat> natTypes,
         long natBehaviorDevices,
         long natBehaviorClassifiedDevices,
@@ -37,6 +38,14 @@ public record PeerMeshPathStatsView(
     }
 
     public record NatTypeStat(String natType, long devices) {
+    }
+
+    public record AddressFamilyStat(
+            String addressFamily,
+            String status,
+            String pathType,
+            long sessions,
+            long reportedSessions) {
     }
 
     public record NatBehaviorStat(String behavior, long devices) {

@@ -52,8 +52,8 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
         send(session, Map.of(
                 "type", "hello",
                 "channel", "client-messages",
-                "username", attr(session, JwtHandshakeInterceptor.ATTR_USER),
-                "tenantId", attr(session, JwtHandshakeInterceptor.ATTR_TENANT_ID)));
+                "username", attr(session, WebSocketTicketHandshakeInterceptor.ATTR_USER),
+                "tenantId", attr(session, WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID)));
     }
 
     @Override
@@ -106,22 +106,32 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
         }
 
         MessageResponsePacket packet = new MessageResponsePacket();
-        packet.setClientName("admin:" + attr(session, JwtHandshakeInterceptor.ATTR_USER));
+        packet.setClientName("admin:" + attr(session, WebSocketTicketHandshakeInterceptor.ATTR_USER));
         packet.setToClientName(target.getClientName());
         packet.setMessageType(MessageType.CLIENT_TO_CLIENT);
         packet.setMessage(body);
         channel.writeAndFlush(packet).addListener(future -> {
-            if (!future.isSuccess()) {
+            try {
+                if (future.isSuccess()) {
+                    send(session, Map.of(
+                            "type", "written",
+                            "messageId", command.messageId() == null ? "" : command.messageId(),
+                            "toClientName", target.getClientName(),
+                            "message", body));
+                    return;
+                }
                 log.warn("admin client-message delivery failed: target={}, reason={}",
                         target.getClientName(),
                         future.cause() == null ? "unknown" : future.cause().getMessage());
+                send(session, Map.of(
+                        "type", "failed",
+                        "messageId", command.messageId() == null ? "" : command.messageId(),
+                        "error", "target-write-failed"));
+            } catch (Exception e) {
+                log.debug("admin client-message status write failed: target={}, reason={}",
+                        target.getClientName(), e.getMessage());
             }
         });
-        send(session, Map.of(
-                "type", "sent",
-                "messageId", command.messageId() == null ? "" : command.messageId(),
-                "toClientName", target.getClientName(),
-                "message", body));
     }
 
     public boolean deliverFromClient(ClientAccount source, String targetAdminName, String body) {
@@ -166,9 +176,9 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
     }
 
     private boolean canAccess(WebSocketSession session, ClientAccount target) {
-        String tenantId = attr(session, JwtHandshakeInterceptor.ATTR_TENANT_ID);
-        boolean admin = Boolean.TRUE.equals(session.getAttributes().get(JwtHandshakeInterceptor.ATTR_ADMIN));
-        String username = attr(session, JwtHandshakeInterceptor.ATTR_USER);
+        String tenantId = attr(session, WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID);
+        boolean admin = Boolean.TRUE.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_ADMIN));
+        String username = attr(session, WebSocketTicketHandshakeInterceptor.ATTR_USER);
         if (!target.getTenantId().equals(tenantId)) {
             return false;
         }
@@ -204,8 +214,8 @@ public class ClientMessagesWebSocketHandler extends TextWebSocketHandler {
 
     private static String adminSessionKey(WebSocketSession session) {
         return adminSessionKey(
-                attr(session, JwtHandshakeInterceptor.ATTR_TENANT_ID),
-                attr(session, JwtHandshakeInterceptor.ATTR_USER));
+                attr(session, WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID),
+                attr(session, WebSocketTicketHandshakeInterceptor.ATTR_USER));
     }
 
     private static String adminSessionKey(String tenantId, String username) {

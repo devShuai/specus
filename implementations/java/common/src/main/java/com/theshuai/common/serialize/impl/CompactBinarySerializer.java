@@ -2,14 +2,10 @@ package com.theshuai.common.serialize.impl;
 
 import com.theshuai.common.protocol.MessageType;
 import com.theshuai.common.protocol.request.HeartBeatRequestPacket;
-import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
-import com.theshuai.common.protocol.request.HttpRequestPacket;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.request.LogoutRequestPacket;
 import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.common.protocol.response.HeartBeatResponsePacket;
-import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
-import com.theshuai.common.protocol.response.HttpResponsePacket;
 import com.theshuai.common.protocol.response.LoginResponsePacket;
 import com.theshuai.common.protocol.response.LogoutResponsePacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
@@ -26,28 +22,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.zip.DataFormatException;
-import java.util.zip.Deflater;
-import java.util.zip.Inflater;
 
 public class CompactBinarySerializer implements Serializer {
-    private static final int RAW_PAYLOAD = 0;
-    private static final int DEFLATED_PAYLOAD = 1;
-    private static final int COMPRESSION_THRESHOLD = 64;
-    private static final int MAX_INFLATED_SIZE = 16 * 1024 * 1024;
-
     private static final ValueCodec STRING = new StringCodec();
     private static final ValueCodec BOOLEAN = new BooleanCodec();
-    private static final ValueCodec INTEGER = new IntegerCodec();
     private static final ValueCodec LONG = new LongCodec();
-    private static final ValueCodec BYTE_ARRAY = new ByteArrayCodec();
     private static final ValueCodec NUMERIC_STRING = new NumericStringCodec();
     private static final ValueCodec MD5_STRING = new FixedHexStringCodec(16);
     private static final ValueCodec UUID_STRING = new UuidStringCodec();
     private static final ValueCodec HTTP_METHOD = new HttpMethodCodec();
-    private static final ValueCodec MESSAGE_TYPE = new EnumCodec<>(MessageType.class);
+    private static final ValueCodec MESSAGE_TYPE = new MessageTypeCodec();
     private static final ValueCodec STRING_MAP = new StringMapCodec();
-    private static final ValueCodec STRING_LIST = new StringListCodec();
 
     private static final Map<Class<?>, ObjectSchema<?>> SCHEMAS = createSchemas();
 
@@ -62,18 +47,7 @@ public class CompactBinarySerializer implements Serializer {
             throw new IllegalArgumentException("object cannot be null");
         }
 
-        return encodePayload(getSchema(object.getClass()).serialize(object));
-    }
-
-    public static byte[] encodePayload(byte[] rawPayload) {
-        if (rawPayload == null) {
-            throw new IllegalArgumentException("rawPayload cannot be null");
-        }
-        byte[] compressedPayload = rawPayload.length >= COMPRESSION_THRESHOLD ? deflate(rawPayload) : rawPayload;
-        if (compressedPayload.length < rawPayload.length) {
-            return withPayloadType(DEFLATED_PAYLOAD, compressedPayload);
-        }
-        return withPayloadType(RAW_PAYLOAD, rawPayload);
+        return getSchema(object.getClass()).serialize(object);
     }
 
     @Override
@@ -81,25 +55,11 @@ public class CompactBinarySerializer implements Serializer {
         if (clazz == null) {
             throw new IllegalArgumentException("clazz cannot be null");
         }
-        if (bytes == null || bytes.length == 0) {
-            throw new IllegalArgumentException("bytes cannot be empty");
+        if (bytes == null) {
+            throw new IllegalArgumentException("bytes cannot be null");
         }
 
-        return getSchema(clazz).deserialize(decodePayload(bytes));
-    }
-
-    public static byte[] decodePayload(byte[] bytes) {
-        if (bytes == null || bytes.length == 0) {
-            throw new IllegalArgumentException("bytes cannot be empty");
-        }
-
-        byte[] payload = Arrays.copyOfRange(bytes, 1, bytes.length);
-        if (bytes[0] == DEFLATED_PAYLOAD) {
-            payload = inflate(payload);
-        } else if (bytes[0] != RAW_PAYLOAD) {
-            throw new IllegalArgumentException("unknown payload type: " + bytes[0]);
-        }
-        return payload;
+        return getSchema(clazz).deserialize(bytes);
     }
 
     private static Map<Class<?>, ObjectSchema<?>> createSchemas() {
@@ -107,7 +67,8 @@ public class CompactBinarySerializer implements Serializer {
         register(schemas, schema(LoginRequestPacket.class,
                 field("clientName", STRING),
                 field("clientSessionId", LONG),
-                field("accessToken", STRING)));
+                field("accessToken", STRING),
+                field("connectionRole", STRING)));
         register(schemas, schema(LoginResponsePacket.class,
                 field("clientName", STRING),
                 field("success", BOOLEAN),
@@ -128,34 +89,6 @@ public class CompactBinarySerializer implements Serializer {
                 field("reason", STRING)));
         register(schemas, schema(HeartBeatRequestPacket.class));
         register(schemas, schema(HeartBeatResponsePacket.class));
-        register(schemas, schema(HttpRequestPacket.class,
-                field("clientName", STRING),
-                field("toClientName", STRING),
-                field("requestId", UUID_STRING),
-                field("requestMethod", HTTP_METHOD),
-                field("requestUrl", STRING),
-                field("headerMap", STRING_MAP),
-                field("paramMap", STRING_MAP),
-                field("body", STRING)));
-        register(schemas, schema(HttpResponsePacket.class,
-                field("clientName", STRING),
-                field("toClientName", STRING),
-                field("requestId", UUID_STRING),
-                field("response", STRING)));
-        register(schemas, schema(DirectHttpRequestPacket.class,
-                field("requestId", UUID_STRING),
-                field("requestMethod", HTTP_METHOD),
-                field("route", STRING),
-                field("relativePath", STRING),
-                field("rawQuery", STRING),
-                field("headers", STRING_LIST),
-                field("body", BYTE_ARRAY)));
-        register(schemas, schema(DirectHttpResponsePacket.class,
-                field("requestId", UUID_STRING),
-                field("statusCode", INTEGER),
-                field("headers", STRING_LIST),
-                field("body", BYTE_ARRAY),
-                field("error", STRING)));
         return schemas;
     }
 
@@ -178,54 +111,6 @@ public class CompactBinarySerializer implements Serializer {
             throw new IllegalArgumentException("unsupported compact binary type: " + type.getName());
         }
         return (ObjectSchema<T>) schema;
-    }
-
-    private static byte[] withPayloadType(int payloadType, byte[] payload) {
-        byte[] result = new byte[payload.length + 1];
-        result[0] = (byte) payloadType;
-        System.arraycopy(payload, 0, result, 1, payload.length);
-        return result;
-    }
-
-    private static byte[] deflate(byte[] bytes) {
-        Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION, true);
-        try {
-            deflater.setInput(bytes);
-            deflater.finish();
-            ByteArrayOutputStream output = new ByteArrayOutputStream(bytes.length);
-            byte[] buffer = new byte[256];
-            while (!deflater.finished()) {
-                int length = deflater.deflate(buffer);
-                output.write(buffer, 0, length);
-            }
-            return output.toByteArray();
-        } finally {
-            deflater.end();
-        }
-    }
-
-    private static byte[] inflate(byte[] bytes) {
-        Inflater inflater = new Inflater(true);
-        try {
-            inflater.setInput(bytes);
-            ByteArrayOutputStream output = new ByteArrayOutputStream(bytes.length * 2);
-            byte[] buffer = new byte[256];
-            while (!inflater.finished()) {
-                int length = inflater.inflate(buffer);
-                if (length == 0) {
-                    throw new IllegalArgumentException("invalid deflated payload");
-                }
-                output.write(buffer, 0, length);
-                if (output.size() > MAX_INFLATED_SIZE) {
-                    throw new IllegalArgumentException("inflated payload exceeds limit");
-                }
-            }
-            return output.toByteArray();
-        } catch (DataFormatException e) {
-            throw new IllegalArgumentException("invalid deflated payload", e);
-        } finally {
-            inflater.end();
-        }
     }
 
     private static class ObjectSchema<T> {
@@ -532,28 +417,23 @@ public class CompactBinarySerializer implements Serializer {
         }
     }
 
-    private static class EnumCodec<T extends Enum<T>> implements ValueCodec {
-        private final T[] constants;
-
-        private EnumCodec(Class<T> enumType) {
-            constants = enumType.getEnumConstants();
-        }
-
+    private static class MessageTypeCodec implements ValueCodec {
         @Override
         public void write(CompactOutput output, Object value) {
-            output.writeVarInt(value == null ? 0 : ((Enum<?>) value).ordinal() + 1);
+            output.writeVarInt(value == null ? 0 : ((MessageType) value).getWireId());
         }
 
         @Override
         public Object read(CompactInput input) {
-            int ordinal = input.readVarInt() - 1;
-            if (ordinal == -1) {
+            int wireId = input.readVarInt();
+            if (wireId == 0) {
                 return null;
             }
-            if (ordinal < 0 || ordinal >= constants.length) {
-                throw new IllegalArgumentException("invalid enum ordinal: " + ordinal);
+            MessageType value = MessageType.fromWireId(wireId);
+            if (value == null) {
+                throw new IllegalArgumentException("invalid message type wire id: " + wireId);
             }
-            return constants[ordinal];
+            return value;
         }
     }
 

@@ -1,6 +1,8 @@
 package com.theshuai.tunnelserver.management.service;
 
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
+import com.theshuai.tunnelserver.websocket.PublicTransferCoordinationService;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
@@ -10,10 +12,10 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 免登录 presign-upload 的进程内固定窗口限流:按来源 IP 计数,超过窗口内上限即抛 {@link RateLimitedException}。
+ * 免登录公开入口的固定窗口限流。单实例使用有界进程内计数；公共互传集群启用后使用 Redis 原子计数。
  *
  * <p>固定窗口实现简单、内存可控;窗口边界处存在两倍突发的理论上限,对滥用缓解场景可接受。
- * 多实例部署时限额按实例数放大,精确全局限流需外置(如 Redis)。
+ * Redis 不可用时集群模式失败关闭，不退回本地计数。
  */
 @Component
 public class PublicTransferRateLimiter {
@@ -21,23 +23,31 @@ public class PublicTransferRateLimiter {
     private static final int MAX_TRACKED_SOURCES = 100_000;
 
     private final PublicTransferProperties properties;
+    private final PublicTransferCoordinationService coordination;
     private final Map<String, Window> presignWindows = new ConcurrentHashMap<>();
     private final Map<String, Window> pairingRedeemWindows = new ConcurrentHashMap<>();
 
-    public PublicTransferRateLimiter(PublicTransferProperties properties) {
+    @Autowired
+    public PublicTransferRateLimiter(PublicTransferProperties properties,
+                                     PublicTransferCoordinationService coordination) {
         this.properties = properties;
+        this.coordination = coordination;
+    }
+
+    public PublicTransferRateLimiter(PublicTransferProperties properties) {
+        this(properties, new PublicTransferCoordinationService(properties));
     }
 
     /** 校验来源 IP 是否可再发起一次 presign-upload;超限抛 {@link RateLimitedException}。 */
     public void checkPresignUpload(String clientIp) {
-        check(clientIp, presignWindows,
+        check("presign-upload", clientIp, presignWindows,
                 properties.getPresignRateLimitPerIp(),
                 properties.getPresignRateLimitWindowSeconds());
     }
 
     /** 校验来源 IP 是否可尝试兑换八位配对码。此计数与 OSS presign 限流互不影响。 */
     public void checkPairingCodeRedeem(String clientIp) {
-        check(clientIp, pairingRedeemWindows,
+        check("pairing-code-redeem", clientIp, pairingRedeemWindows,
                 properties.getPairingCodeRedeemRateLimitPerIp(),
                 properties.getPairingCodeRedeemRateLimitWindowSeconds());
     }
@@ -50,10 +60,23 @@ public class PublicTransferRateLimiter {
         purge(pairingRedeemWindows, properties.getPairingCodeRedeemRateLimitWindowSeconds(), now);
     }
 
-    private void check(String clientIp, Map<String, Window> windows, int configuredLimit, long configuredWindowSeconds) {
+    private void check(String bucket, String clientIp, Map<String, Window> windows,
+                       int configuredLimit, long configuredWindowSeconds) {
         String key = StringUtils.hasText(clientIp) ? clientIp.trim() : "unknown";
         int limit = Math.max(1, configuredLimit);
         long windowSeconds = Math.max(1L, configuredWindowSeconds);
+        if (coordination.enabled()) {
+            try {
+                if (!coordination.allowRate(bucket, key, limit, windowSeconds)) {
+                    throw new RateLimitedException("请求过于频繁,请稍后再试");
+                }
+                return;
+            } catch (RateLimitedException exception) {
+                throw exception;
+            } catch (IllegalStateException exception) {
+                throw new RateLimitedException("服务暂时不可用,请稍后再试");
+            }
+        }
         long now = Instant.now().getEpochSecond();
 
         if (windows.size() >= MAX_TRACKED_SOURCES && !windows.containsKey(key)) {

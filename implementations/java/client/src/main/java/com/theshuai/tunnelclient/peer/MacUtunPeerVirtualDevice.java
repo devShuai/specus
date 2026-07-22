@@ -275,7 +275,7 @@ final class MacUtunPeerVirtualDevice implements PeerVirtualDevice {
             }
             int read = read(current, buffer, buffer.length);
             if (read > 4) {
-                outboundHandler.handle(Arrays.copyOfRange(buffer, 4, read));
+                outboundHandler.handle(buffer, 4, read - 4);
             } else if (running.get()) {
                 log.debug("Peer mesh macOS utun read returned {}", read);
             }

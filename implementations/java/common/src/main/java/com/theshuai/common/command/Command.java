@@ -9,9 +9,5 @@ public interface Command {
     Byte LOGOUT_RESPONSE = -3;
     Byte HEARTBEAT_REQUEST = 4;
     Byte HEARTBEAT_RESPONSE = -4;
-    Byte HTTP_REQUEST = 5;
-    Byte HTTP_RESPONSE = -5;
     Byte NAT_MESSAGE = 6;
-    Byte DIRECT_HTTP_REQUEST = 7;
-    Byte DIRECT_HTTP_RESPONSE = -7;
 }

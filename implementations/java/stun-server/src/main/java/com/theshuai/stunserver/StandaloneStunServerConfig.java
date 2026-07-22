@@ -137,14 +137,30 @@ public record StandaloneStunServerConfig(
             InetAddress peerControl = address(
                     "STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS",
                     required(env, "STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS"));
+            StandaloneStunDistributionConfig.ForwardKey currentKey =
+                    new StandaloneStunDistributionConfig.ForwardKey(
+                            requiredInteger(env, "STUN_DISTRIBUTED_CURRENT_KEY_ID", 1, Integer.MAX_VALUE),
+                            base64Secret(env, "STUN_DISTRIBUTED_CURRENT_SECRET"));
+            String previousKeyId = value(env, "STUN_DISTRIBUTED_PREVIOUS_KEY_ID", "");
+            String previousSecret = value(env, "STUN_DISTRIBUTED_PREVIOUS_SECRET", "");
+            if (previousKeyId.isBlank() != previousSecret.isBlank()) {
+                throw new IllegalArgumentException(
+                        "STUN_DISTRIBUTED_PREVIOUS_KEY_ID and STUN_DISTRIBUTED_PREVIOUS_SECRET must be set together");
+            }
+            StandaloneStunDistributionConfig.ForwardKey previousKey = previousKeyId.isBlank()
+                    ? null
+                    : new StandaloneStunDistributionConfig.ForwardKey(
+                            requiredInteger(env, "STUN_DISTRIBUTED_PREVIOUS_KEY_ID", 1, Integer.MAX_VALUE),
+                            base64Secret(env, "STUN_DISTRIBUTED_PREVIOUS_SECRET"));
             distribution = new StandaloneStunDistributionConfig(
                     true,
                     localSlot,
                     new InetSocketAddress(controlBind, controlPort),
                     new InetSocketAddress(peerControl, peerControlPort),
-                    base64Secret(env, "STUN_DISTRIBUTED_SHARED_SECRET"),
+                    currentKey,
+                    previousKey,
                     integer(env, "STUN_DISTRIBUTED_MAX_CLOCK_SKEW_SECONDS", 30, 1, 300),
-                    integer(env, "STUN_DISTRIBUTED_REPLAY_CACHE_SIZE", 65_536, 1, 1_000_000),
+                    integer(env, "STUN_DISTRIBUTED_REPLAY_WINDOW_SIZE", 4_096, 64, 1_048_576),
                     integer(env, "STUN_DISTRIBUTED_MAX_FORWARD_PACKET_BYTES", 4_096, 512, 65_507),
                     integer(env, "STUN_DISTRIBUTED_FORWARD_RATE_PER_SECOND", 10_000, 1, 10_000_000),
                     integer(env, "STUN_DISTRIBUTED_FORWARD_BURST", 20_000, 1, 20_000_000));
@@ -327,6 +343,24 @@ public record StandaloneStunServerConfig(
             int minimum,
             int maximum) {
         String raw = value(environment, name, Integer.toString(fallback));
+        try {
+            int parsed = Integer.parseInt(raw);
+            if (parsed < minimum || parsed > maximum) {
+                throw new IllegalArgumentException(
+                        name + " must be between " + minimum + " and " + maximum);
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(name + " must be an integer: " + raw, e);
+        }
+    }
+
+    private static int requiredInteger(
+            Map<String, String> environment,
+            String name,
+            int minimum,
+            int maximum) {
+        String raw = required(environment, name);
         try {
             int parsed = Integer.parseInt(raw);
             if (parsed < minimum || parsed > maximum) {

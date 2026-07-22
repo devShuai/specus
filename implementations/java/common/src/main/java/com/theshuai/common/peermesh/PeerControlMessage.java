@@ -3,7 +3,6 @@ package com.theshuai.common.peermesh;
 import com.theshuai.common.clientauth.ClientAuthLoginResponse;
 import lombok.Data;
 
-import java.util.ArrayList;
 import java.util.List;
 
 @Data
@@ -23,6 +22,11 @@ public class PeerControlMessage {
     private String sourceClientName;
     private String sourceVirtualIp;
     private String sourcePublicKey;
+    /**
+     * 发送方本次运行实例的随机 key epoch，用于 SPM2 单向 traffic key 派生。
+     * 客户端重启后必须变化，否则复用的 session/token 会导致 AES-GCM nonce 重用。
+     */
+    private String sourceKeyEpoch;
     private Long targetClientId;
     private String targetClientName;
     private String targetVirtualIp;
@@ -48,6 +52,7 @@ public class PeerControlMessage {
     private String lastEndpoint;
     private long createdAtMillis;
     private ClientAuthLoginResponse.PeerMeshConfig peerMesh;
-    private List<PeerCandidate> candidates = new ArrayList<>();
-    private List<?> peers = new ArrayList<>();
+    private int dataFrameVersion = 2;
+    private List<PeerCandidate> candidates = List.of();
+    private List<?> peers = List.of();
 }

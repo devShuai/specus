@@ -4,6 +4,7 @@ import com.theshuai.common.codec.PacketDecoder;
 import com.theshuai.common.codec.PacketEncoder;
 import com.theshuai.common.codec.Spliter;
 import com.theshuai.common.protocol.MessageType;
+import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.request.MessageRequestPacket;
 import com.theshuai.tunnelclient.bean.TunnelBean;
@@ -57,7 +58,8 @@ public class NettyClient {
     private volatile String host;
     private volatile int port;
     private final TunnelBean tunnelBean;
-    private final Bootstrap bootstrap = new Bootstrap();
+    private final Bootstrap controlBootstrap = new Bootstrap();
+    private final Bootstrap dataBootstrap = new Bootstrap();
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
     private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
@@ -69,6 +71,7 @@ public class NettyClient {
     private volatile TcpConnection localConnection;
     private final SslContext sslContext;
     private final AtomicReference<Channel> controlChannel = new AtomicReference<>();
+    private final AtomicReference<Channel> dataChannel = new AtomicReference<>();
     private final PeerMeshClient peerMeshClient;
 
     /** 退避上限：连续 5 次失败后稳定到一分钟一次，长期网络故障可自愈。 */
@@ -119,7 +122,7 @@ public class NettyClient {
         }
         scheduleProactiveRefresh();
         TcpConnection sharedLocalConnection = localConnection;
-        bootstrap.group(workerGroup)
+        controlBootstrap.group(workerGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
@@ -133,15 +136,36 @@ public class NettyClient {
                             SslHandler sslHandler = sslContext.newHandler(ch.alloc(), host, port);
                             ch.pipeline().addFirst(sslHandler);
                         }
-                        ch.pipeline().addLast(new ClientSocketIdleStateHandler(NettyClient.this));
+                        ch.pipeline().addLast(new ClientSocketIdleStateHandler(NettyClient.this, ConnectionRole.CONTROL));
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
-                        ch.pipeline().addLast(new LoginResponseHandler(NettyClient.this));
-                        ch.pipeline().addLast(new MessageResponseHandler(sharedLocalConnection, peerMeshClient));
-                        ch.pipeline().addLast(new DirectHttpRequestHandler(tunnelBean.getHttpTunnelConfigList()));
+                        ch.pipeline().addLast(new LoginResponseHandler(NettyClient.this, ConnectionRole.CONTROL));
+                        ch.pipeline().addLast(new MessageResponseHandler(
+                                sharedLocalConnection, peerMeshClient, NettyClient.this));
                         ch.pipeline().addLast(new LogoutResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());
                         // 心跳由 ClientSocketIdleStateHandler 在 5 秒写空闲时触发，不再需要单独的定时器。
+                    }
+                });
+        dataBootstrap.group(workerGroup)
+                .channel(NioSocketChannel.class)
+                .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
+                .option(ChannelOption.SO_KEEPALIVE, true)
+                .option(ChannelOption.TCP_NODELAY, true)
+                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(32 * 1024, 64 * 1024))
+                .handler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    public void initChannel(SocketChannel ch) {
+                        if (sslContext != null) {
+                            ch.pipeline().addFirst(sslContext.newHandler(ch.alloc(), host, port));
+                        }
+                        ch.pipeline().addLast(new ClientSocketIdleStateHandler(NettyClient.this, ConnectionRole.DATA));
+                        ch.pipeline().addLast(new Spliter());
+                        ch.pipeline().addLast(new PacketDecoder());
+                        ch.pipeline().addLast(new LoginResponseHandler(NettyClient.this, ConnectionRole.DATA));
+                        ch.pipeline().addLast(new LogoutResponseHandler());
+                        ch.pipeline().addLast(new PacketEncoder());
                     }
                 });
         connect();
@@ -188,7 +212,7 @@ public class NettyClient {
         if (shouldStopConnecting()) return;
         String connectHost = host;
         int connectPort = port;
-        bootstrap.connect(connectHost, connectPort).addListener((ChannelFutureListener) future -> {
+        controlBootstrap.connect(connectHost, connectPort).addListener((ChannelFutureListener) future -> {
             if (shouldStopConnecting()) {
                 if (future.isSuccess()) future.channel().close();
                 return;
@@ -199,9 +223,20 @@ public class NettyClient {
                 if (previous != null && previous != channel && previous.isOpen()) {
                     previous.close();
                 }
-                channel.closeFuture().addListener(closeFuture -> controlChannel.compareAndSet(channel, null));
+                Channel previousData = dataChannel.getAndSet(null);
+                if (previousData != null && previousData.isOpen()) {
+                    previousData.close();
+                }
+                channel.closeFuture().addListener(closeFuture -> {
+                    if (controlChannel.compareAndSet(channel, null)) {
+                        Channel data = dataChannel.getAndSet(null);
+                        if (data != null && data.isOpen()) {
+                            data.close();
+                        }
+                    }
+                });
                 log.info("Connected to {}:{} (awaiting login response)", connectHost, connectPort);
-                sendLoginRequest(channel);
+                sendLoginRequest(channel, ConnectionRole.CONTROL);
             } else {
                 log.warn("Connect to {}:{} failed: {}", connectHost, connectPort,
                         future.cause() == null ? "unknown" : future.cause().getMessage());
@@ -210,11 +245,12 @@ public class NettyClient {
         });
     }
 
-    private void sendLoginRequest(Channel channel) {
+    private void sendLoginRequest(Channel channel, String connectionRole) {
         LoginRequestPacket loginRequestPacket = new LoginRequestPacket();
         loginRequestPacket.setClientName(clientName);
         loginRequestPacket.setClientSessionId(clientSessionId);
         loginRequestPacket.setAccessToken(accessToken);
+        loginRequestPacket.setConnectionRole(connectionRole);
         channel.writeAndFlush(loginRequestPacket);
     }
 
@@ -238,8 +274,52 @@ public class NettyClient {
         });
     }
 
-    /** 由 {@link LoginResponseHandler} 在收到 success=true 时回调，重置退避计数。 */
-    public void onLoginSuccess() {
+    private void connectData() {
+        if (shouldStopConnecting()) {
+            return;
+        }
+        Channel control = controlChannel.get();
+        if (control == null || !control.isActive()) {
+            return;
+        }
+        dataBootstrap.connect(host, port).addListener((ChannelFutureListener) future -> {
+            if (!future.isSuccess()) {
+                log.warn("Data connection to {}:{} failed: {}", host, port,
+                        future.cause() == null ? "unknown" : future.cause().getMessage());
+                control.close();
+                return;
+            }
+            Channel channel = future.channel();
+            Channel previous = dataChannel.getAndSet(channel);
+            if (previous != null && previous != channel && previous.isOpen()) {
+                previous.close();
+            }
+            channel.closeFuture().addListener(closeFuture -> {
+                if (dataChannel.compareAndSet(channel, null)) {
+                    Channel activeControl = controlChannel.get();
+                    if (activeControl != null && activeControl.isOpen()) {
+                        activeControl.close();
+                    }
+                }
+            });
+            log.info("Data connection established to {}:{} (awaiting login response)", host, port);
+            sendLoginRequest(channel, ConnectionRole.DATA);
+        });
+    }
+
+    /** 由 {@link LoginResponseHandler} 在收到 success=true 时回调。 */
+    public void onLoginSuccess(String connectionRole, Channel channel) {
+        if (ConnectionRole.DATA.equals(connectionRole)) {
+            if (dataChannel.get() != channel) {
+                channel.close();
+                return;
+            }
+            if (channel.pipeline().get(NatClientHandler.class) == null) {
+                channel.pipeline().addLast(new NatClientHandler(tunnelBean, localConnection));
+            }
+            log.info("Dedicated data channel is ready");
+            return;
+        }
         int prior = reconnectAttempts.getAndSet(0);
         if (prior > 0) {
             log.info("Login succeeded, reconnect backoff reset (was attempt #{})", prior);
@@ -252,6 +332,50 @@ public class NettyClient {
         } else {
             log.debug("Skip cached disabled peer mesh config after control login; waiting for server runtime config");
         }
+        connectData();
+    }
+
+    /** Test-facing control-login callback. */
+    public void onLoginSuccess() {
+        onLoginSuccess(ConnectionRole.CONTROL, controlChannel.get());
+    }
+
+    public void applyNatControl(TunnelBean updated) {
+        if (updated == null) {
+            return;
+        }
+        tunnelBean.setTunnelConfigList(nonNullList(updated.getTunnelConfigList()));
+        if (updated.getHttpTunnelConfigList() != null) {
+            tunnelBean.setHttpTunnelConfigList(nonNullList(updated.getHttpTunnelConfigList()));
+        }
+        Channel data = dataChannel.get();
+        if (data == null || !data.isActive()) {
+            return;
+        }
+        data.eventLoop().execute(() -> {
+            NatClientHandler handler = data.pipeline().get(NatClientHandler.class);
+            if (handler != null) {
+                handler.applyConfig(updated);
+                if (updated.getHttpTunnelConfigList() != null) {
+                    handler.applyHttpRoutes(updated.getHttpTunnelConfigList());
+                }
+            }
+        });
+    }
+
+    public void onConnectionInactive(String connectionRole) {
+        if (isShuttingDown() || isReconnectSuppressed() || isAuthRefreshInProgress()) {
+            return;
+        }
+        if (ConnectionRole.DATA.equals(connectionRole)) {
+            Channel control = controlChannel.get();
+            if (control != null && control.isOpen()) {
+                log.info("数据连接断开，关闭控制连接并重建连接对");
+                control.close();
+            }
+            return;
+        }
+        scheduleReconnect();
     }
 
     public void stopReconnecting(String reason) {
@@ -373,6 +497,10 @@ public class NettyClient {
         Channel channel = controlChannel.getAndSet(null);
         if (channel != null) {
             channel.close().awaitUninterruptibly(5, TimeUnit.SECONDS);
+        }
+        Channel data = dataChannel.getAndSet(null);
+        if (data != null) {
+            data.close().awaitUninterruptibly(5, TimeUnit.SECONDS);
         }
         if (localConnection != null) {
             localConnection.close();

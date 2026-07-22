@@ -4,21 +4,17 @@ import com.theshuai.common.protocol.Packet;
 import com.theshuai.common.protocol.PacketCodec;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
-import com.theshuai.common.protocol.request.HttpRequestPacket;
-import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
-import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import com.theshuai.common.protocol.MessageType;
+import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.serialize.Serializer;
+import com.theshuai.common.serialize.SerializerAlgorithm;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
-import java.util.List;
-import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -40,26 +36,6 @@ class CompactBinarySerializerTests {
     }
 
     @Test
-    void shouldCompressLargeHttpBody() {
-        HttpRequestPacket packet = new HttpRequestPacket();
-        packet.setClientName("Demo client");
-        packet.setToClientName("server");
-        packet.setRequestId(UUID.randomUUID().toString());
-        packet.setRequestMethod("POST");
-        packet.setRequestUrl("http://127.0.0.1:8080/api/demo");
-        packet.setHeaderMap(Map.of("Content-Type", "application/json"));
-        packet.setParamMap(Map.of("source", "tunnel"));
-        packet.setBody("{\"message\":\"" + "compact-binary-serializer-".repeat(100) + "\"}");
-
-        byte[] compactBytes = Serializer.COMPACT_BINARY.serialize(packet);
-        byte[] jsonBytes = Serializer.FASTJSON.serialize(packet);
-        HttpRequestPacket result = Serializer.COMPACT_BINARY.deserialize(HttpRequestPacket.class, compactBytes);
-
-        assertEquals(packet, result);
-        assertTrue(compactBytes.length < jsonBytes.length / 2);
-    }
-
-    @Test
     void shouldEncodeAndDecodePacketWithCompactBinaryByDefault() throws Exception {
         ByteBuf byteBuf = Unpooled.buffer();
         try {
@@ -75,78 +51,38 @@ class CompactBinarySerializerTests {
     }
 
     @Test
-    void shouldKeepSmallPayloadRaw() {
-        byte[] payload = {1, 2, 3, 4};
-
-        byte[] encoded = CompactBinarySerializer.encodePayload(payload);
-
-        assertEquals(0, encoded[0]);
-        assertArrayEquals(payload, CompactBinarySerializer.decodePayload(encoded));
-    }
-
-    @Test
-    void shouldCompressNatTunnelDataWhenBeneficial() throws Exception {
+    void shouldKeepNatTunnelDataRawWithExplicitLengths() throws Exception {
         NatMessagePacket expected = new NatMessagePacket();
         expected.setNatMessageType(NatMessageType.DATA);
-        expected.setMetaData(Map.of("channelId", "demo-channel"));
+        expected.setStreamId(1);
         expected.setData("compact-tunnel-data-".repeat(100).getBytes(StandardCharsets.UTF_8));
 
         ByteBuf byteBuf = Unpooled.buffer();
         try {
             PacketCodec.INSTANCE.encode(byteBuf, expected);
-            assertTrue(byteBuf.readableBytes() < expected.getData().length);
+            ByteBuf frame = byteBuf.duplicate();
+            assertEquals(PacketCodec.MAGIC_NUMBER, frame.readInt());
+            assertEquals(PacketCodec.PROTOCOL_VERSION, frame.readByte());
+            assertEquals(SerializerAlgorithm.BIN, frame.readByte());
+            frame.skipBytes(1);
+            assertEquals(frame.readableBytes() - Integer.BYTES, frame.readInt());
+            assertEquals(NatMessageType.DATA.getCode(), frame.readUnsignedByte());
+            assertEquals(0, frame.readUnsignedByte());
+            int metadataLength = frame.readUnsignedShort();
+            assertEquals(0, metadataLength);
+            assertEquals(1, frame.readInt());
+            assertEquals(0, frame.readInt());
+            assertEquals(expected.getData().length, frame.readInt());
+            frame.skipBytes(metadataLength);
+            byte[] wireData = new byte[frame.readableBytes()];
+            frame.readBytes(wireData);
+            assertArrayEquals(expected.getData(), wireData);
 
             NatMessagePacket result = assertInstanceOf(NatMessagePacket.class, PacketCodec.INSTANCE.decode(byteBuf));
 
             assertEquals(expected.getNatMessageType(), result.getNatMessageType());
-            assertEquals(expected.getMetaData(), result.getMetaData());
+            assertTrue(result.getMetaData().isEmpty());
             assertArrayEquals(expected.getData(), result.getData());
-        } finally {
-            byteBuf.release();
-        }
-    }
-
-    @Test
-    void shouldRoundTripDirectHttpPacketsWithBinaryBodies() {
-        DirectHttpRequestPacket request = new DirectHttpRequestPacket();
-        request.setRequestId(UUID.randomUUID().toString());
-        request.setRequestMethod("PATCH");
-        request.setRoute("web");
-        request.setRelativePath("/api/files/demo.bin");
-        request.setRawQuery("download=true");
-        request.setHeaders(List.of("Content-Type:application/octet-stream", "X-Demo:first", "X-Demo:second"));
-        request.setBody(new byte[]{0, 1, 2, 3, -1});
-
-        DirectHttpResponsePacket response = new DirectHttpResponsePacket();
-        response.setRequestId(request.getRequestId());
-        response.setStatusCode(206);
-        response.setHeaders(List.of("Content-Type:application/octet-stream", "Set-Cookie:a=1", "Set-Cookie:b=2"));
-        response.setBody(new byte[]{9, 8, 7, 6});
-
-        assertEquals(request, Serializer.COMPACT_BINARY.deserialize(
-                DirectHttpRequestPacket.class,
-                Serializer.COMPACT_BINARY.serialize(request)
-        ));
-        assertEquals(response, Serializer.COMPACT_BINARY.deserialize(
-                DirectHttpResponsePacket.class,
-                Serializer.COMPACT_BINARY.serialize(response)
-        ));
-    }
-
-    @Test
-    void shouldEncodeAndDecodeDirectHttpPacket() throws Exception {
-        DirectHttpRequestPacket expected = new DirectHttpRequestPacket();
-        expected.setRequestId(UUID.randomUUID().toString());
-        expected.setRequestMethod("POST");
-        expected.setRoute("web");
-        expected.setRelativePath("/api/upload");
-        expected.setHeaders(List.of("Content-Type:application/octet-stream"));
-        expected.setBody(new byte[]{1, 2, 3});
-
-        ByteBuf byteBuf = Unpooled.buffer();
-        try {
-            PacketCodec.INSTANCE.encode(byteBuf, expected);
-            assertEquals(expected, assertInstanceOf(DirectHttpRequestPacket.class, PacketCodec.INSTANCE.decode(byteBuf)));
         } finally {
             byteBuf.release();
         }
@@ -178,6 +114,7 @@ class CompactBinarySerializerTests {
         packet.setClientName("Demo client");
         packet.setClientSessionId(1748620800000L);
         packet.setAccessToken("cs_compact_binary_fixture_token");
+        packet.setConnectionRole(ConnectionRole.CONTROL);
         return packet;
     }
 }

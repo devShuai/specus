@@ -105,6 +105,18 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
         long getRelayBytes();
     }
 
+    interface AddressFamilyAggregate {
+        String getAddressFamily();
+
+        String getStatus();
+
+        String getPathType();
+
+        long getSessions();
+
+        long getReportedSessions();
+    }
+
     @Query("""
             select case
                      when s.relayBytes > s.directBytes then 'RELAY'
@@ -149,4 +161,65 @@ public interface PeerMeshSessionRepository extends JpaRepository<PeerMeshSession
                      s.status
             """)
     List<PathTypeAggregate> aggregateVisiblePathTypes(String tenantId, List<Long> clientIds);
+
+    @Query("""
+            select case
+                     when s.remoteEndpoint is null or trim(s.remoteEndpoint) = '' then 'UNKNOWN'
+                     when s.remoteEndpoint like '[%' then 'IPv6'
+                     else 'IPv4'
+                   end as addressFamily,
+                   s.status as status,
+                   case
+                     when s.relayBytes > s.directBytes then 'RELAY'
+                     when s.directBytes > s.relayBytes then 'DIRECT'
+                     else s.pathType
+                   end as pathType,
+                   count(s) as sessions,
+                   count(s.rttMillis) as reportedSessions
+            from PeerMeshSession s
+            where s.tenantId = :tenantId
+            group by case
+                       when s.remoteEndpoint is null or trim(s.remoteEndpoint) = '' then 'UNKNOWN'
+                       when s.remoteEndpoint like '[%' then 'IPv6'
+                       else 'IPv4'
+                     end,
+                     s.status,
+                     case
+                       when s.relayBytes > s.directBytes then 'RELAY'
+                       when s.directBytes > s.relayBytes then 'DIRECT'
+                       else s.pathType
+                     end
+            """)
+    List<AddressFamilyAggregate> aggregateAddressFamilies(String tenantId);
+
+    @Query("""
+            select case
+                     when s.remoteEndpoint is null or trim(s.remoteEndpoint) = '' then 'UNKNOWN'
+                     when s.remoteEndpoint like '[%' then 'IPv6'
+                     else 'IPv4'
+                   end as addressFamily,
+                   s.status as status,
+                   case
+                     when s.relayBytes > s.directBytes then 'RELAY'
+                     when s.directBytes > s.relayBytes then 'DIRECT'
+                     else s.pathType
+                   end as pathType,
+                   count(s) as sessions,
+                   count(s.rttMillis) as reportedSessions
+            from PeerMeshSession s
+            where s.tenantId = :tenantId
+              and (s.sourceClientId in :clientIds or s.targetClientId in :clientIds)
+            group by case
+                       when s.remoteEndpoint is null or trim(s.remoteEndpoint) = '' then 'UNKNOWN'
+                       when s.remoteEndpoint like '[%' then 'IPv6'
+                       else 'IPv4'
+                     end,
+                     s.status,
+                     case
+                       when s.relayBytes > s.directBytes then 'RELAY'
+                       when s.directBytes > s.relayBytes then 'DIRECT'
+                       else s.pathType
+                     end
+            """)
+    List<AddressFamilyAggregate> aggregateVisibleAddressFamilies(String tenantId, List<Long> clientIds);
 }

@@ -159,7 +159,8 @@ final class WindowsWintunPeerVirtualDevice implements PeerVirtualDevice {
             try {
                 int size = packetSize.getValue();
                 if (size > 0) {
-                    outboundHandler.handle(packet.getByteArray(0, size));
+                    byte[] bytes = packet.getByteArray(0, size);
+                    outboundHandler.handle(bytes, 0, bytes.length);
                 }
             } finally {
                 api.WintunReleaseReceivePacket(currentSession, packet);

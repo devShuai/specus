@@ -1,6 +1,7 @@
 package com.theshuai.tunnelserver.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.theshuai.tunnelserver.management.repository.ClientAccountRepository;
 import org.slf4j.Logger;
@@ -35,15 +36,19 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(ConnectionEventsWebSocketHandler.class);
 
     private final ClientAccountRepository clientAccountRepository;
+    private final PublicTransferCoordinationService coordination;
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final ObjectMapper objectMapper = new ObjectMapper()
             // null 字段省略，前端不需要看到全是 null 的列；体积也更小
             .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
-            // 默认 false，但显式声明：未知字段不抛异常（防御性，目前 DTO 都是 record）
+            .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
 
-    public ConnectionEventsWebSocketHandler(ClientAccountRepository clientAccountRepository) {
+    public ConnectionEventsWebSocketHandler(ClientAccountRepository clientAccountRepository,
+                                            PublicTransferCoordinationService coordination) {
         this.clientAccountRepository = clientAccountRepository;
+        this.coordination = coordination;
+        coordination.addListener(this::handleClusterEvent);
     }
 
     @Override
@@ -67,19 +72,51 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
 
     /** 把 {@code payload} 序列化为 JSON，推给当前租户所有在线 session。 */
     public void broadcast(String tenantId, Object payload) {
-        if (sessions.isEmpty()) {
-            return;
-        }
-        String json;
+        byte[] json;
         try {
-            json = objectMapper.writeValueAsString(payload);
+            json = objectMapper.writeValueAsBytes(payload);
         } catch (Exception e) {
             log.warn("serialize websocket payload failed: {}", e.toString());
             return;
         }
+
+        if (coordination.enabled() && payload instanceof ConnectionEvent) {
+            try {
+                coordination.publishManagement(tenantId, json);
+                return;
+            } catch (RuntimeException exception) {
+                log.warn("publish management connection event failed; using local delivery: {}",
+                        exception.toString());
+            }
+        }
+        broadcastLocal(tenantId, payload, json);
+    }
+
+    private void handleClusterEvent(PublicTransferClusterFrame.Event clusterEvent) {
+        if (clusterEvent.kind() != PublicTransferClusterFrame.KIND_MANAGEMENT) {
+            return;
+        }
+        try {
+            ConnectionEvent event = objectMapper.readValue(clusterEvent.payload(), ConnectionEvent.class);
+            if (event.tenantId() == null
+                    || !clusterEvent.groupId().equals(
+                    PublicTransferCoordinationService.managementGroupId(event.tenantId()))) {
+                log.warn("discarding management cluster event with invalid tenant binding");
+                return;
+            }
+            broadcastLocal(event.tenantId(), event, clusterEvent.payload());
+        } catch (Exception exception) {
+            log.warn("discarding invalid management cluster event: {}", exception.getMessage());
+        }
+    }
+
+    private void broadcastLocal(String tenantId, Object payload, byte[] json) {
+        if (sessions.isEmpty()) {
+            return;
+        }
         TextMessage message = new TextMessage(json);
         for (WebSocketSession session : sessions) {
-            Object sessionTenantId = session.getAttributes().get(JwtHandshakeInterceptor.ATTR_TENANT_ID);
+            Object sessionTenantId = session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_TENANT_ID);
             if (!tenantId.equals(sessionTenantId)) {
                 continue;
             }
@@ -112,14 +149,14 @@ public class ConnectionEventsWebSocketHandler extends TextWebSocketHandler {
     }
 
     private boolean canReceive(WebSocketSession session, String tenantId, Object payload) {
-        if (Boolean.TRUE.equals(session.getAttributes().get(JwtHandshakeInterceptor.ATTR_ADMIN))) {
+        if (Boolean.TRUE.equals(session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_ADMIN))) {
             return true;
         }
         if (!(payload instanceof ConnectionEvent event) || event.connection() == null) {
             return false;
         }
         Long clientId = event.connection().clientId();
-        Object username = session.getAttributes().get(JwtHandshakeInterceptor.ATTR_USER);
+        Object username = session.getAttributes().get(WebSocketTicketHandshakeInterceptor.ATTR_USER);
         return clientId != null
                 && username instanceof String owner
                 && clientAccountRepository

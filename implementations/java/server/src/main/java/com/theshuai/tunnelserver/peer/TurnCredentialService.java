@@ -81,6 +81,22 @@ public class TurnCredentialService {
         return md5(text.getBytes(StandardCharsets.UTF_8));
     }
 
+    public long peerMeshClientId(String username) {
+        if (!StringUtils.hasText(username)) {
+            return 0;
+        }
+        String[] parts = username.split(":", 3);
+        if (parts.length != 3 || !parts[1].startsWith("pm-")) {
+            return 0;
+        }
+        try {
+            long clientId = Long.parseLong(parts[1].substring(3));
+            return clientId > 0 ? clientId : 0;
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
     private long parseExpiresAt(String username) {
         int colon = username.indexOf(':');
         String prefix = colon < 0 ? username : username.substring(0, colon);

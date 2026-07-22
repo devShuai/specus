@@ -59,9 +59,19 @@ public class SmtpRegistrationEmailSender implements RegistrationEmailSender {
                     + "验证码在 " + minutes + " 分钟内有效，请勿转发给他人。\n"
                     + "如果不是你发起的注册，请忽略此邮件。\n", false);
             mailSender.send(message);
+            log.info("[registration-email] SMTP accepted recipientDomain={} messageId={}",
+                    recipientDomain(email), message.getMessageID());
         } catch (Exception exception) {
-            log.warn("[registration-email] failed to send verification message: {}", exception.getMessage());
+            log.warn("[registration-email] failed recipientDomain={}: {}",
+                    recipientDomain(email), exception.getMessage(), exception);
             throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "验证码邮件发送失败，请稍后重试");
         }
+    }
+
+    private static String recipientDomain(String email) {
+        int separator = email == null ? -1 : email.lastIndexOf('@');
+        return separator >= 0 && separator < email.length() - 1
+                ? email.substring(separator + 1).toLowerCase(java.util.Locale.ROOT)
+                : "invalid";
     }
 }

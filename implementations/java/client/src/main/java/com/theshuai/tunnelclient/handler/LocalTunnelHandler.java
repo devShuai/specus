@@ -2,21 +2,28 @@ package com.theshuai.tunnelclient.handler;
 
 import com.theshuai.common.handler.ChannelBackpressure;
 import com.theshuai.common.handler.NatCommonHandler;
+import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
 import io.netty.channel.ChannelHandlerContext;
 
-import java.util.HashMap;
-import java.util.Map;
-
 public class LocalTunnelHandler extends NatCommonHandler {
 
     private final NatClientHandler tunnelHandler;
-    private final String remoteChannelId;
+    private final int streamId;
 
-    public LocalTunnelHandler(NatClientHandler tunnelHandler, String remoteChannelId) {
+    public LocalTunnelHandler(NatClientHandler tunnelHandler, int streamId) {
         this.tunnelHandler = tunnelHandler;
-        this.remoteChannelId = remoteChannelId;
+        this.streamId = streamId;
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        super.channelActive(ctx);
+        ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
+        if (controlCtx != null && controlCtx.channel().isActive()) {
+            StreamFlowController.get(controlCtx.channel()).open(streamId, ctx.channel());
+        }
     }
 
     @Override
@@ -27,33 +34,15 @@ public class LocalTunnelHandler extends NatCommonHandler {
             ctx.close();
             return;
         }
-        NatMessagePacket message = new NatMessagePacket();
-        message.setNatMessageType(NatMessageType.DATA);
-        message.setData(data);
-        Map<String, Object> metaData = new HashMap<>();
-        metaData.put("channelId", remoteChannelId);
-        message.setMetaData(metaData);
-        controlCtx.writeAndFlush(message).addListener(future -> {
-            if (!future.isSuccess()) {
-                ctx.close();
-            }
-        });
-        if (!controlCtx.channel().isWritable()) {
-            ChannelBackpressure.setAutoRead(ctx.channel(), false);
-        }
+        StreamFlowController.get(controlCtx.channel()).send(streamId, data, ctx.channel(), ctx::close);
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        tunnelHandler.removeLocalHandler(remoteChannelId, this);
-        NatMessagePacket message = new NatMessagePacket();
-        message.setNatMessageType(NatMessageType.DISCONNECTED);
-        Map<String, Object> metaData = new HashMap<>();
-        metaData.put("channelId", remoteChannelId);
-        message.setMetaData(metaData);
+        tunnelHandler.removeLocalHandler(streamId, this);
         ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
         if (controlCtx != null && controlCtx.channel().isActive()) {
-            controlCtx.writeAndFlush(message);
+            StreamFlowController.get(controlCtx.channel()).finish(streamId);
         }
     }
 

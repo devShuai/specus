@@ -7,7 +7,7 @@ import com.theshuai.common.clientauth.ClientAuthSigner;
 import com.theshuai.common.clientauth.ClientEnvironmentInfo;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.client.NettyClient;
-import com.theshuai.tunnelclient.handler.DirectHttpRequestHandler;
+import com.theshuai.tunnelclient.handler.NatClientHandler;
 import com.theshuai.tunnelserver.TunnelServerApplication;
 import com.theshuai.tunnelserver.management.repository.ConnectionRecordRepository;
 import com.theshuai.tunnelserver.management.service.ClientAuthService;
@@ -160,7 +160,7 @@ class EndToEndTunnelIT {
         // —— HTTP 路由热下发 ——
         // 客户端启动时 httpTunnelConfigList 为空；服务端通过 HttpRouteService 写入第一条
         // 后会触发 NatControlService.pushSnapshotIfOnline，沿 NAT_CONTROL 推到客户端的
-        // DirectHttpRequestHandler.applyRoutes，整个链路在线热替换。
+        // NatClientHandler.applyHttpRoutes，整个链路在线热替换。
         httpRouteService.createRoute(clientId, new HttpRouteService.RouteMutation(
                 "web", "http://127.0.0.1:" + backendPort, true
         ));
@@ -214,7 +214,7 @@ class EndToEndTunnelIT {
 
     /**
      * 反射读取 NettyClient.controlChannel 当前 pipeline 中
-     * DirectHttpRequestHandler 的当前路由。返回 null 表示客户端还没建立连接 / 已断开。
+     * NatClientHandler 的当前路由。返回 null 表示客户端还没建立连接 / 已断开。
      *
      * <p>用反射是因为 {@code controlChannel} 是私有字段——为测试新增 getter 会污染
      * 生产代码 API。
@@ -231,11 +231,18 @@ class EndToEndTunnelIT {
             if (!(channel instanceof Channel ch)) {
                 return null;
             }
-            DirectHttpRequestHandler handler = ch.pipeline().get(DirectHttpRequestHandler.class);
+            NatClientHandler handler = ch.pipeline().get(NatClientHandler.class);
             if (handler == null) {
                 return null;
             }
-            return handler.getCurrentRoutes();
+            var routesField = NatClientHandler.class.getDeclaredField("httpRoutes");
+            routesField.setAccessible(true);
+            Object routes = routesField.get(handler);
+            return routes instanceof Map<?, ?> map
+                    ? map.entrySet().stream().collect(java.util.stream.Collectors.toUnmodifiableMap(
+                            entry -> String.valueOf(entry.getKey()),
+                            entry -> String.valueOf(entry.getValue())))
+                    : null;
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("failed to read client routes via reflection", e);
         }

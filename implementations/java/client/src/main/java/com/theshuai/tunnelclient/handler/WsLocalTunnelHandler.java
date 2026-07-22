@@ -1,18 +1,16 @@
 package com.theshuai.tunnelclient.handler;
 
 import com.theshuai.common.handler.ChannelBackpressure;
+import com.theshuai.common.handler.StreamFlowController;
 import com.theshuai.common.protocol.NatMessagePacket;
 import com.theshuai.common.protocol.NatMessageType;
+import com.theshuai.common.protocol.WebSocketTunnelFrame;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
-import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
-import io.netty.handler.codec.http.websocketx.WebSocketClientProtocolHandler;
-import io.netty.handler.codec.http.websocketx.WebSocketFrame;
+import io.netty.handler.codec.http.websocketx.*;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.nio.charset.StandardCharsets;
 
 /**
  * 客户端侧本地 WebSocket 隧道 handler：把本地 WS 服务的入站帧封装成 NAT {@code DATA} 帧写回
@@ -29,24 +27,23 @@ import java.util.Map;
  * 事件感知，完成后把自己注册进 {@link NatClientHandler} 的 wsLocalChannels，让后续 DATA 帧能路由进来。
  */
 public class WsLocalTunnelHandler extends ChannelInboundHandlerAdapter {
-    /** WS 帧的 {@code data[0]} 类型前缀，与服务端一致。 */
-    static final byte FRAME_TEXT = 0x01;
-    static final byte FRAME_BINARY = 0x02;
-
     private final NatClientHandler tunnelHandler;
+    private final int streamId;
     private final String remoteChannelId;
     private volatile boolean registered;
 
-    public WsLocalTunnelHandler(NatClientHandler tunnelHandler, String remoteChannelId) {
+    public WsLocalTunnelHandler(NatClientHandler tunnelHandler, int streamId, String remoteChannelId) {
         this.tunnelHandler = tunnelHandler;
+        this.streamId = streamId;
         this.remoteChannelId = remoteChannelId;
     }
 
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
         if (evt == WebSocketClientProtocolHandler.ClientHandshakeStateEvent.HANDSHAKE_COMPLETE) {
-            registered = tunnelHandler.registerWsLocalChannel(remoteChannelId, ctx);
+            registered = tunnelHandler.registerWsLocalChannel(streamId, ctx);
             if (registered) {
+                StreamFlowController.get(tunnelHandler.getCtx().channel()).open(streamId, ctx.channel());
                 tunnelHandler.syncLocalReadWithControl(ctx.channel());
             } else {
                 // 控制连接已断开，关掉本地 WS
@@ -69,35 +66,18 @@ public class WsLocalTunnelHandler extends ChannelInboundHandlerAdapter {
             ctx.close();
             return;
         }
-        byte frameType;
-        if (frame instanceof TextWebSocketFrame) {
-            frameType = FRAME_TEXT;
-        } else if (frame instanceof BinaryWebSocketFrame) {
-            frameType = FRAME_BINARY;
-        } else {
-            // Ping/Pong/Close 由本地 WS 栈处理，不透传
-            return;
-        }
+        int opcode = opcode(frame);
         ByteBuf payload = frame.content();
-        byte[] data = new byte[payload.readableBytes() + 1];
-        data[0] = frameType;
-        payload.getBytes(payload.readerIndex(), data, 1, payload.readableBytes());
-
-        NatMessagePacket message = new NatMessagePacket();
-        message.setNatMessageType(NatMessageType.DATA);
-        message.setData(data);
-        Map<String, Object> metaData = new HashMap<>();
-        metaData.put("channelId", remoteChannelId);
-        metaData.put("source", "ws");
-        message.setMetaData(metaData);
-        controlCtx.writeAndFlush(message).addListener(future -> {
-            if (!future.isSuccess()) {
-                ctx.close();
-            }
-        });
-        if (!controlCtx.channel().isWritable()) {
-            ChannelBackpressure.setAutoRead(ctx.channel(), false);
+        byte[] data;
+        int closeCode = 0;
+        if (frame instanceof CloseWebSocketFrame close) {
+            closeCode = Math.max(0, close.statusCode());
+            data = close.reasonText().getBytes(StandardCharsets.UTF_8);
+        } else {
+            data = new byte[payload.readableBytes()];
+            payload.getBytes(payload.readerIndex(), data);
         }
+        sendChunked(controlCtx, ctx, opcode, frame.isFinalFragment(), frame.rsv(), closeCode, data);
     }
 
     @Override
@@ -105,16 +85,10 @@ public class WsLocalTunnelHandler extends ChannelInboundHandlerAdapter {
         // 只有握手成功注册过的流才需要通知服务端 DISCONNECTED；握手未完成就断开时，
         // NatClientHandler.processWsConnected 已经发过 DISCONNECTED。
         if (registered) {
-            tunnelHandler.removeWsLocalHandler(remoteChannelId, this);
-            NatMessagePacket message = new NatMessagePacket();
-            message.setNatMessageType(NatMessageType.DISCONNECTED);
-            Map<String, Object> metaData = new HashMap<>();
-            metaData.put("channelId", remoteChannelId);
-            metaData.put("source", "ws");
-            message.setMetaData(metaData);
+            tunnelHandler.removeWsLocalHandler(streamId, this);
             ChannelHandlerContext controlCtx = tunnelHandler.getCtx();
             if (controlCtx != null && controlCtx.channel().isActive()) {
-                controlCtx.writeAndFlush(message);
+                StreamFlowController.get(controlCtx.channel()).finish(streamId);
             }
         }
     }
@@ -127,22 +101,63 @@ public class WsLocalTunnelHandler extends ChannelInboundHandlerAdapter {
 
     /** 由 {@link NatClientHandler#processData} 调用：服务端回送的 DATA 帧还原成 WS 帧写本地 Channel。 */
     public void writeFrame(ChannelHandlerContext localCtx, byte[] payload) {
-        if (payload == null || payload.length == 0) {
-            return;
+        try {
+            WebSocketTunnelFrame tunnelFrame = WebSocketTunnelFrame.decode(payload);
+            ByteBuf buf = localCtx.alloc().buffer(tunnelFrame.payload().length);
+            buf.writeBytes(tunnelFrame.payload());
+            WebSocketFrame frame = switch (tunnelFrame.opcode()) {
+                case WebSocketTunnelFrame.OPCODE_TEXT ->
+                        new TextWebSocketFrame(tunnelFrame.finalFragment(), tunnelFrame.rsv(), buf);
+                case WebSocketTunnelFrame.OPCODE_BINARY ->
+                        new BinaryWebSocketFrame(tunnelFrame.finalFragment(), tunnelFrame.rsv(), buf);
+                case WebSocketTunnelFrame.OPCODE_CONTINUATION ->
+                        new ContinuationWebSocketFrame(tunnelFrame.finalFragment(), tunnelFrame.rsv(), buf);
+                case WebSocketTunnelFrame.OPCODE_PING -> new PingWebSocketFrame(buf);
+                case WebSocketTunnelFrame.OPCODE_PONG -> new PongWebSocketFrame(buf);
+                case WebSocketTunnelFrame.OPCODE_CLOSE -> {
+                    buf.release();
+                    yield new CloseWebSocketFrame(tunnelFrame.finalFragment(), tunnelFrame.rsv(),
+                            tunnelFrame.closeCode(), new String(tunnelFrame.payload(), StandardCharsets.UTF_8));
+                }
+                default -> throw new IllegalArgumentException("unsupported SWS2 opcode");
+            };
+            localCtx.writeAndFlush(frame).addListener(future -> {
+                if (!future.isSuccess()) {
+                    localCtx.close();
+                }
+            });
+        } catch (RuntimeException error) {
+            localCtx.close();
         }
-        byte frameType = payload[0];
-        ByteBuf buf = localCtx.alloc().buffer(payload.length - 1);
-        buf.writeBytes(payload, 1, payload.length - 1);
-        WebSocketFrame frame;
-        if (frameType == FRAME_TEXT) {
-            frame = new TextWebSocketFrame(buf);
-        } else {
-            frame = new BinaryWebSocketFrame(buf);
-        }
-        localCtx.writeAndFlush(frame).addListener(future -> {
-            if (!future.isSuccess()) {
-                localCtx.close();
-            }
-        });
+    }
+
+    private void sendChunked(ChannelHandlerContext controlCtx, ChannelHandlerContext localCtx,
+                             int opcode, boolean finalFragment, int rsv, int closeCode, byte[] payload) {
+        int offset = 0;
+        boolean first = true;
+        do {
+            int length = Math.min(WebSocketTunnelFrame.MAX_PAYLOAD_BYTES, payload.length - offset);
+            byte[] chunk = new byte[length];
+            System.arraycopy(payload, offset, chunk, 0, length);
+            offset += length;
+            boolean last = offset == payload.length;
+            int chunkOpcode = first ? opcode : WebSocketTunnelFrame.OPCODE_CONTINUATION;
+            WebSocketTunnelFrame encoded = new WebSocketTunnelFrame(
+                    chunkOpcode, finalFragment && last, first ? rsv : 0,
+                    first ? closeCode : 0, chunk);
+            StreamFlowController.get(controlCtx.channel()).send(
+                    streamId, encoded.encode(), localCtx.channel(), localCtx::close);
+            first = false;
+        } while (offset < payload.length);
+    }
+
+    private static int opcode(WebSocketFrame frame) {
+        if (frame instanceof TextWebSocketFrame) return WebSocketTunnelFrame.OPCODE_TEXT;
+        if (frame instanceof BinaryWebSocketFrame) return WebSocketTunnelFrame.OPCODE_BINARY;
+        if (frame instanceof ContinuationWebSocketFrame) return WebSocketTunnelFrame.OPCODE_CONTINUATION;
+        if (frame instanceof CloseWebSocketFrame) return WebSocketTunnelFrame.OPCODE_CLOSE;
+        if (frame instanceof PingWebSocketFrame) return WebSocketTunnelFrame.OPCODE_PING;
+        if (frame instanceof PongWebSocketFrame) return WebSocketTunnelFrame.OPCODE_PONG;
+        throw new IllegalArgumentException("unsupported WebSocket frame: " + frame.getClass().getSimpleName());
     }
 }

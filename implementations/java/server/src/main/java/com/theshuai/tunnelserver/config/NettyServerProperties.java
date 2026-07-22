@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 @Data
 public class NettyServerProperties {
     private int port = 7010;
+    private String bindAddress = "0.0.0.0";
     private int bossThreads = 1;
     private int workerThreads = 0;
     private int remoteBossThreads = 1;
@@ -21,6 +22,7 @@ public class NettyServerProperties {
     private int writeBufferLowWaterMark = 32 * 1024;
     private int writeBufferHighWaterMark = 64 * 1024;
     private int maxFrameSize = 32 * 1024 * 1024;
+    private int preAuthMaxFrameSize = 16 * 1024;
     private int maxExternalConnections = 10_000;
     private int maxExternalConnectionsPerClient = 10_000;
     private int maxExternalConnectionsPerPort = 10_000;

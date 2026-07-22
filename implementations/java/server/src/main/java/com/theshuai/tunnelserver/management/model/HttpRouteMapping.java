@@ -13,7 +13,7 @@ import lombok.Setter;
  * 后台维护的"客户端 HTTP 路由"记录。一行对应客户端
  * {@code client.jsonc:httpTunnelConfigList} 中的一项，但服务端为权威来源：
  * 客户端登录或后台 CRUD 时通过 {@code NAT_CONTROL} 全量下发，由
- * {@code DirectHttpRequestHandler} 热替换内存路由表。
+ * {@code NatClientHandler} 热替换内存路由表。
  *
  * <p>唯一性：同一客户端的同名 route 唯一；跨客户端可重名（{@code uk_http_route_client_route}）。
  *
@@ -51,7 +51,7 @@ public class HttpRouteMapping {
     private String clientName;
 
     /**
-     * 客户端 {@code DirectHttpRequestHandler} 用 {@code routes.get(route)} 精确匹配；
+     * 客户端 {@code NatClientHandler} 用 {@code routes.get(route)} 精确匹配；
      * 长度约束 60 字符，避免恶意长字符串撑爆 URL。
      */
     @Column(nullable = false, length = 60)
@@ -59,7 +59,7 @@ public class HttpRouteMapping {
 
     /**
      * 客户端转发目标 URL，例如 {@code http://127.0.0.1:8080}。允许带 path 前缀，
-     * {@code DirectHttpForwarder} 会做 scheme/host/port + basePath 越界校验。
+     * {@code HttpRouteTargetResolver} 会做 scheme/host/port + basePath 越界校验。
      */
     @Column(name = "target_base_url", nullable = false, length = 512)
     private String targetBaseUrl;

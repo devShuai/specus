@@ -10,7 +10,7 @@ import java.util.Arrays;
 final class PeerAppMessageCodec {
     static final String TYPE_MESSAGE = "message";
     static final String TYPE_ACK = "ack";
-    private static final byte[] PREFIX = "STMSG1\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] PREFIX = "STMSG2\n".getBytes(StandardCharsets.US_ASCII);
 
     private PeerAppMessageCodec() {
     }

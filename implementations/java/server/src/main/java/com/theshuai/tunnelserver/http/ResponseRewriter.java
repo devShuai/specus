@@ -158,6 +158,15 @@ public class ResponseRewriter {
         return contentType != null && REWRITABLE_CONTENT_TYPES.contains(contentType);
     }
 
+    public boolean isRewritableContentType(List<String> headers) {
+        String contentType = extractContentType(headers);
+        return contentType != null && REWRITABLE_CONTENT_TYPES.contains(contentType);
+    }
+
+    public int maxBodyBytes() {
+        return maxBodyBytes;
+    }
+
     /**
      * 在 HTML 的 {@code <head>} 后注入一段运行时 polyfill。脚本在浏览器执行时拦截：
      * <ul>

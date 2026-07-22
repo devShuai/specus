@@ -1,15 +1,28 @@
 package com.theshuai.common.protocol;
 
 public enum MessageType {
-    SERVER_TO_CLIENT(0),
-    CLIENT_TO_SERVER(1),
-    CLIENT_TO_CLIENT(2),
-    NAT_CONTROL(3),
-    PEER_CONTROL(4);
+    SERVER_TO_CLIENT(1),
+    CLIENT_TO_SERVER(2),
+    CLIENT_TO_CLIENT(3),
+    NAT_CONTROL(4),
+    PEER_CONTROL(5);
 
-    private int value;
+    private final int wireId;
 
-    private MessageType(int value) {
-        this.value = value;
+    MessageType(int wireId) {
+        this.wireId = wireId;
+    }
+
+    public int getWireId() {
+        return wireId;
+    }
+
+    public static MessageType fromWireId(int wireId) {
+        for (MessageType value : values()) {
+            if (value.wireId == wireId) {
+                return value;
+            }
+        }
+        return null;
     }
 }

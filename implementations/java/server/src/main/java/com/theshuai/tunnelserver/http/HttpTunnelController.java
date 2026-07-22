@@ -1,34 +1,42 @@
 package com.theshuai.tunnelserver.http;
 
-import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
-import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
-import com.theshuai.tunnelserver.http.DirectHttpDispatcher.DirectHttpTunnelException;
+import com.theshuai.tunnelserver.handler.NatServerHandler;
+import com.theshuai.tunnelserver.handler.TunnelStreamIds;
 import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.HttpRouteMapping;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.tunnelserver.management.service.ClientAccountService;
 import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
+import com.theshuai.tunnelserver.session.SessionUtil;
+import io.netty.channel.Channel;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatusCode;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @RestController
 @RequestMapping("/http")
@@ -39,7 +47,6 @@ public class HttpTunnelController {
             "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
     );
 
-    private final DirectHttpDispatcher dispatcher;
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
     private final ResponseRewriter responseRewriter;
@@ -50,8 +57,7 @@ public class HttpTunnelController {
     private final long routeCacheTtlMillis;
     private final ConcurrentMap<String, RewriteDecision> rewriteDecisionCache = new ConcurrentHashMap<>();
 
-    public HttpTunnelController(DirectHttpDispatcher dispatcher,
-                                TrafficUsageService trafficUsageService,
+    public HttpTunnelController(TrafficUsageService trafficUsageService,
                                 TrafficInspectionService trafficInspectionService,
                                 ResponseRewriter responseRewriter,
                                 ClientAccountService clientAccountService,
@@ -59,7 +65,6 @@ public class HttpTunnelController {
                                 @Value("${tunnel.http.timeout-ms:30000}") long timeoutMillis,
                                 @Value("${tunnel.http.max-request-body-size:16777216}") int maxRequestBodySize,
                                 @Value("${tunnel.http.route-cache-ttl-ms:2000}") long routeCacheTtlMillis) {
-        this.dispatcher = dispatcher;
         this.trafficUsageService = trafficUsageService;
         this.trafficInspectionService = trafficInspectionService;
         this.responseRewriter = responseRewriter;
@@ -71,88 +76,156 @@ public class HttpTunnelController {
     }
 
     @RequestMapping("/{clientName}/{route}/**")
-    public ResponseEntity<byte[]> forward(@PathVariable String clientName,
-                                          @PathVariable String route,
-                                          @RequestBody(required = false) byte[] body,
-                                          HttpServletRequest request) {
-        byte[] requestBody = body == null ? new byte[0] : body;
+    public void forward(@PathVariable String clientName,
+                        @PathVariable String route,
+                        HttpServletRequest request,
+                        HttpServletResponse response) throws IOException {
         long startedAt = System.currentTimeMillis();
         String relativePath = relativePath(request);
         List<String> forwardedHeaders = requestHeaders(request);
-        log.debug("[http-direct][server-ingress] clientName={} method={} route={} path={} queryPresent={} bodyBytes={}",
-                clientName, request.getMethod(), route, relativePath,
-                request.getQueryString() != null, requestBody.length);
-        if (requestBody.length > maxRequestBodySize) {
-            log.warn("[http-direct][server-ingress] clientName={} method={} route={} rejected=body-too-large bodyBytes={} maxBodyBytes={}",
-                    clientName, request.getMethod(), route, requestBody.length, maxRequestBodySize);
-            ResponseEntity<byte[]> errorResponse = error(413, "HTTP 请求体超过限制");
-            trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
-                    request.getQueryString(), forwardedHeaders, requestBody, 413, plainErrorHeaders(),
-                    errorResponse.getBody(), startedAt, remoteAddress(request), "HTTP 请求体超过限制");
-            return errorResponse;
-        }
-
-        DirectHttpRequestPacket packet = new DirectHttpRequestPacket();
-        packet.setRequestMethod(request.getMethod());
-        packet.setRoute(route);
-        packet.setRelativePath(relativePath);
-        packet.setRawQuery(request.getQueryString());
-        packet.setHeaders(forwardedHeaders);
-        packet.setBody(requestBody);
-
+        BoundedCapture requestCapture = new BoundedCapture(64 * 1024);
+        BoundedCapture responseCapture = new BoundedCapture(64 * 1024);
+        long requestBytes = 0;
+        long responseBytes = 0;
+        int statusCode = 502;
+        List<String> responseHeaders = plainErrorHeaders();
+        String failure = null;
+        NatServerHandler natHandler = null;
+        HttpStreamExchange exchange = null;
+        boolean opened = false;
         try {
-            DirectHttpResponsePacket response = dispatcher.forward(clientName, packet, timeoutMillis);
-            trafficUsageService.recordHttpUpload(clientName, route, requestBody.length);
-            byte[] responseBody = response.getBody() == null ? new byte[0] : response.getBody();
-            trafficUsageService.recordHttpDownload(clientName, route, responseBody.length);
-            if (response.getError() != null) {
-                log.warn("[http-direct][server-egress] requestId={} clientName={} status={} error={} elapsedMs={}",
-                        response.getRequestId(), clientName, response.getStatusCode(), response.getError(),
-                        System.currentTimeMillis() - startedAt);
-                int statusCode = response.getStatusCode() > 0 ? response.getStatusCode() : 502;
-                ResponseEntity<byte[]> errorResponse = error(statusCode, response.getError());
-                trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
-                        request.getQueryString(), forwardedHeaders, requestBody, statusCode, plainErrorHeaders(),
-                        errorResponse.getBody(), startedAt, remoteAddress(request), response.getError());
-                return errorResponse;
+            Channel control = SessionUtil.getDataChannel(clientName);
+            natHandler = control == null ? null : control.pipeline().get(NatServerHandler.class);
+            if (natHandler == null || !control.isActive()) {
+                throw new HttpForwardFailure(502, "客户端不在线");
             }
+            int streamId = TunnelStreamIds.next();
+            exchange = new HttpStreamExchange(streamId);
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("source", "http");
+            metadata.put("phase", "request");
+            metadata.put("requestId", Integer.toUnsignedString(streamId));
+            metadata.put("method", request.getMethod());
+            metadata.put("route", route);
+            metadata.put("relativePath", relativePath);
+            metadata.put("rawQuery", request.getQueryString());
+            metadata.put("headers", forwardedHeaders);
+            if (request.getContentLengthLong() >= 0) {
+                metadata.put("contentLength", request.getContentLengthLong());
+            }
+            if (!natHandler.openHttpStream(exchange, metadata)) {
+                throw new HttpForwardFailure(502, "HTTP 流创建失败");
+            }
+            opened = true;
 
-            HttpHeaders headers = new HttpHeaders();
-            // 路径改写：仅当路由开启时生效。改写成功后需要剥离 Content-Encoding/Content-Length，
-            // 让 Spring/Tomcat 按实际字节重新计算 Content-Length（Tomcat 不会主动重压缩）。
-            List<String> responseHeaders = response.getHeaders();
-            boolean rewriteCandidate = responseRewriter.mayRewrite(responseBody, responseHeaders);
-            boolean rewriteEnabled = rewriteCandidate && isPathRewriteEnabled(clientName, route);
-            boolean rewritten = false;
-            log.debug("[http-direct][rewrite-check] requestId={} clientName={} route={} rewriteCandidate={} pathRewriteEnabled={} contentType={}",
-                    response.getRequestId(), clientName, route, rewriteCandidate, rewriteEnabled,
-                    findHeaderValue(responseHeaders, "content-type"));
-            if (rewriteEnabled) {
-                Optional<byte[]> maybeRewritten = responseRewriter.rewrite(responseBody, clientName, route, responseHeaders);
-                if (maybeRewritten.isPresent()) {
-                    responseBody = maybeRewritten.get();
-                    responseHeaders = stripEncodingHeaders(responseHeaders);
-                    rewritten = true;
+            byte[] chunk = new byte[64 * 1024];
+            try (InputStream input = request.getInputStream()) {
+                for (int read; (read = input.read(chunk)) >= 0; ) {
+                    if (read == 0) continue;
+                    requestBytes += read;
+                    if (requestBytes > maxRequestBodySize) {
+                        throw new HttpForwardFailure(413, "HTTP 请求体超过限制");
+                    }
+                    byte[] payload = java.util.Arrays.copyOf(chunk, read);
+                    requestCapture.append(payload);
+                    natHandler.sendHttpData(streamId, payload).get(timeoutMillis, TimeUnit.MILLISECONDS);
                 }
             }
-            copyHeaders(responseHeaders, headers);
-            log.debug("[http-direct][server-egress] requestId={} clientName={} status={} bodyBytes={} rewritten={} elapsedMs={}",
-                    response.getRequestId(), clientName, response.getStatusCode(), responseBody.length, rewritten,
+            natHandler.finishHttpRequest(streamId, flattenTrailers(request.getTrailerFields()))
+                    .get(timeoutMillis, TimeUnit.MILLISECONDS);
+
+            HttpStreamExchange.ResponseHead head = exchange.awaitResponseHead(timeoutMillis);
+            statusCode = head.statusCode();
+            responseHeaders = head.headers();
+            response.setStatus(statusCode);
+            HttpStreamExchange finalExchange = exchange;
+            response.setTrailerFields(() -> trailerMap(finalExchange.trailers()));
+
+            boolean rewriteBuffered = responseRewriter.isRewritableContentType(responseHeaders)
+                    && isPathRewriteEnabled(clientName, route)
+                    && responseRewriter.maxBodyBytes() > 0;
+            ByteArrayOutputStream rewriteBuffer = rewriteBuffered
+                    ? new ByteArrayOutputStream(Math.min(64 * 1024, responseRewriter.maxBodyBytes())) : null;
+            boolean headersApplied = false;
+            if (!rewriteBuffered) {
+                copyHeaders(responseHeaders, response);
+                headersApplied = true;
+            }
+            OutputStream output = response.getOutputStream();
+            boolean headRequest = "HEAD".equalsIgnoreCase(request.getMethod());
+            while (true) {
+                HttpStreamExchange.Event event = exchange.take();
+                if (event instanceof HttpStreamExchange.Data data) {
+                    byte[] bytes = data.bytes();
+                    responseBytes += bytes.length;
+                    if (responseBytes > 64L * 1024L * 1024L) {
+                        throw new HttpForwardFailure(502, "HTTP 响应体超过限制");
+                    }
+                    responseCapture.append(bytes);
+                    if (!headRequest) {
+                        if (rewriteBuffer != null
+                                && rewriteBuffer.size() + bytes.length <= responseRewriter.maxBodyBytes()) {
+                            rewriteBuffer.write(bytes);
+                        } else {
+                            if (rewriteBuffer != null) {
+                                copyHeaders(responseHeaders, response);
+                                headersApplied = true;
+                                rewriteBuffer.writeTo(output);
+                                rewriteBuffer = null;
+                            }
+                            output.write(bytes);
+                            output.flush();
+                        }
+                    }
+                    natHandler.consumeHttpResponseData(streamId, bytes.length);
+                } else if (event instanceof HttpStreamExchange.Reset reset) {
+                    throw new HttpForwardFailure(502, reset.reason());
+                } else {
+                    break;
+                }
+            }
+            if (rewriteBuffer != null && !headRequest) {
+                byte[] original = rewriteBuffer.toByteArray();
+                Optional<byte[]> rewritten = responseRewriter.rewrite(original, clientName, route, responseHeaders);
+                List<String> finalHeaders = rewritten.isPresent()
+                        ? stripEncodingHeaders(responseHeaders) : responseHeaders;
+                copyHeaders(finalHeaders, response);
+                headersApplied = true;
+                output.write(rewritten.orElse(original));
+            }
+            if (!headersApplied) {
+                copyHeaders(responseHeaders, response);
+            }
+            output.flush();
+            log.debug("[http-stream-v2][server-egress] stream={} clientName={} status={} uploadBytes={} downloadBytes={} elapsedMs={}",
+                    Integer.toUnsignedString(streamId), clientName, statusCode, requestBytes, responseBytes,
                     System.currentTimeMillis() - startedAt);
-            trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
-                    request.getQueryString(), forwardedHeaders, requestBody, response.getStatusCode(),
-                    response.getHeaders(), responseBody, startedAt, remoteAddress(request), null);
-            return ResponseEntity.status(response.getStatusCode()).headers(headers).body(responseBody);
-        } catch (DirectHttpTunnelException e) {
-            log.warn("[http-direct][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
-                    clientName, request.getMethod(), route, e.getStatusCode(), e.getMessage(),
+        } catch (Exception error) {
+            Throwable cause = unwrap(error);
+            int errorStatus = cause instanceof HttpForwardFailure typed ? typed.statusCode :
+                    cause instanceof TimeoutException ? 504 : 502;
+            failure = cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
+            statusCode = errorStatus;
+            responseHeaders = plainErrorHeaders();
+            responseCapture.append(failure.getBytes(StandardCharsets.UTF_8));
+            if (opened && natHandler != null && exchange != null) {
+                natHandler.cancelHttpStream(exchange.streamId(), failure);
+            }
+            if (!response.isCommitted()) {
+                writeError(response, errorStatus, failure);
+            }
+            log.warn("[http-stream-v2][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
+                    clientName, request.getMethod(), route, errorStatus, failure,
                     System.currentTimeMillis() - startedAt);
-            int statusCode = e.getStatusCode() > 0 ? e.getStatusCode() : 502;
-            ResponseEntity<byte[]> errorResponse = error(statusCode, e.getMessage());
+        } finally {
+            if (natHandler != null && exchange != null) {
+                natHandler.unregisterHttpStream(exchange.streamId());
+            }
+            trafficUsageService.recordHttpUpload(clientName, route, requestBytes);
+            trafficUsageService.recordHttpDownload(clientName, route, responseBytes);
             trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
-                    request.getQueryString(), forwardedHeaders, requestBody, statusCode, plainErrorHeaders(),
-                    errorResponse.getBody(), startedAt, remoteAddress(request), e.getMessage());
-            return errorResponse;
+                    request.getQueryString(), forwardedHeaders, requestCapture.bytes(), statusCode,
+                    responseHeaders, responseCapture.bytes(), startedAt, remoteAddress(request), failure);
         }
     }
 
@@ -179,7 +252,7 @@ public class HttpTunnelController {
         return headers;
     }
 
-    private void copyHeaders(List<String> source, HttpHeaders target) {
+    private void copyHeaders(List<String> source, HttpServletResponse target) {
         if (source == null) {
             return;
         }
@@ -188,7 +261,7 @@ public class HttpTunnelController {
             if (separator > 0) {
                 String name = header.substring(0, separator);
                 if (shouldForward(name)) {
-                    target.add(name, header.substring(separator + 1));
+                    target.addHeader(name, header.substring(separator + 1));
                 }
             }
         }
@@ -206,10 +279,43 @@ public class HttpTunnelController {
         return request.getRemoteAddr() + ":" + request.getRemotePort();
     }
 
-    private ResponseEntity<byte[]> error(int statusCode, String message) {
-        return ResponseEntity.status(HttpStatusCode.valueOf(statusCode))
-                .header(HttpHeaders.CONTENT_TYPE, "text/plain;charset=UTF-8")
-                .body(message.getBytes(StandardCharsets.UTF_8));
+    private void writeError(HttpServletResponse response, int statusCode, String message) throws IOException {
+        response.resetBuffer();
+        response.setStatus(statusCode);
+        response.setContentType("text/plain;charset=UTF-8");
+        response.getOutputStream().write(message.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static List<String> flattenTrailers(Map<String, String> trailers) {
+        if (trailers == null || trailers.isEmpty()) {
+            return List.of();
+        }
+        List<String> result = new ArrayList<>(trailers.size());
+        trailers.forEach((name, value) -> result.add(name + ":" + value));
+        return result;
+    }
+
+    private Map<String, String> trailerMap(List<String> trailers) {
+        Map<String, String> result = new LinkedHashMap<>();
+        if (trailers == null) {
+            return result;
+        }
+        for (String trailer : trailers) {
+            int separator = trailer.indexOf(':');
+            if (separator > 0 && shouldForward(trailer.substring(0, separator))) {
+                result.merge(trailer.substring(0, separator), trailer.substring(separator + 1),
+                        (left, right) -> left + "," + right);
+            }
+        }
+        return result;
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        Throwable current = error;
+        while (current instanceof ExecutionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
     }
 
     /**
@@ -295,5 +401,35 @@ public class HttpTunnelController {
     }
 
     private record RewriteDecision(boolean enabled, long expiresAtMillis) {
+    }
+
+    private static final class BoundedCapture {
+        private final int limit;
+        private final ByteArrayOutputStream output;
+
+        private BoundedCapture(int limit) {
+            this.limit = limit;
+            this.output = new ByteArrayOutputStream(Math.min(limit, 8192));
+        }
+
+        private void append(byte[] bytes) {
+            int length = Math.min(bytes.length, limit - output.size());
+            if (length > 0) {
+                output.write(bytes, 0, length);
+            }
+        }
+
+        private byte[] bytes() {
+            return output.toByteArray();
+        }
+    }
+
+    private static final class HttpForwardFailure extends Exception {
+        private final int statusCode;
+
+        private HttpForwardFailure(int statusCode, String message) {
+            super(message);
+            this.statusCode = statusCode;
+        }
     }
 }

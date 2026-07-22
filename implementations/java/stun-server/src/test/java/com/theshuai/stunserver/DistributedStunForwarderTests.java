@@ -1,9 +1,13 @@
 package com.theshuai.stunserver;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.stun.StunEndpointTopology;
 import com.theshuai.common.stun.StunMessage;
+import com.theshuai.common.util.JsonUtil;
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -12,6 +16,9 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.HexFormat;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -23,6 +30,51 @@ class DistributedStunForwarderTests {
             Clock.fixed(Instant.parse("2026-07-16T12:00:00Z"), ZoneOffset.UTC);
     private static final byte[] SECRET =
             "0123456789abcdef0123456789abcdef".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+    @Test
+    void matchesCentralStfwd2Vector() throws Exception {
+        JsonNode vector = JsonUtil.readString(Files.readString(findVector()));
+        long epoch = vector.path("senderEpoch").asLong();
+        Clock vectorClock = Clock.fixed(
+                Instant.ofEpochMilli(vector.path("timestampMillis").asLong()), ZoneOffset.UTC);
+        StandaloneStunDistributionConfig primary = distribution(
+                StunEndpointTopology.AddressSlot.PRIMARY, "127.0.0.1", "127.0.0.2");
+        StandaloneStunDistributionConfig alternate = distribution(
+                StunEndpointTopology.AddressSlot.ALTERNATE, "127.0.0.2", "127.0.0.1");
+        SecureRandom fixedEpoch = new SecureRandom() {
+            @Override
+            public long nextLong() {
+                return epoch;
+            }
+        };
+        DistributedStunForwarder sender =
+                new DistributedStunForwarder(primary, vectorClock, fixedEpoch);
+        byte[] response = HexFormat.of().parseHex(vector.path("stunResponseHex").asText());
+        byte[] expected = HexFormat.of().parseHex(vector.path("packetHex").asText());
+
+        byte[] encoded = sender.encode(
+                StunEndpointTopology.ALTERNATE,
+                address(vector.path("targetAddress").asText(), vector.path("targetPort").asInt()),
+                response);
+        assertArrayEquals(expected, encoded);
+
+        DistributedStunForwarder receiver =
+                new DistributedStunForwarder(alternate, vectorClock, new SecureRandom());
+        DistributedStunForwarder.DecodeResult decoded =
+                receiver.decode(packetFrom(expected, primary.controlBindAddress()));
+        assertTrue(decoded.accepted());
+        assertEquals(StunEndpointTopology.ALTERNATE, decoded.response().responseEndpoint());
+        assertArrayEquals(response, decoded.response().response());
+
+        byte[] tampered = expected.clone();
+        JsonNode mutation = vector.path("tamper");
+        int offset = tampered.length - mutation.path("offsetFromEnd").asInt();
+        tampered[offset] ^= (byte) mutation.path("value").asInt();
+        assertEquals(mutation.path("expectedRejection").asText(),
+                new DistributedStunForwarder(alternate, vectorClock, new SecureRandom())
+                        .decode(packetFrom(tampered, primary.controlBindAddress()))
+                        .rejectionReason());
+    }
 
     @Test
     void authenticatesForwardedResponseAndRejectsReplay() throws Exception {
@@ -101,16 +153,64 @@ class DistributedStunForwarderTests {
         assertEquals("stale", stale.rejectionReason());
     }
 
+    @Test
+    void acceptsPreviousRotationKeyAndUsesBoundedSequenceWindow() throws Exception {
+        byte[] nextSecret =
+                "abcdef0123456789abcdef0123456789".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        StandaloneStunDistributionConfig primary = distribution(
+                StunEndpointTopology.AddressSlot.PRIMARY, "127.0.0.1", "127.0.0.2",
+                new StandaloneStunDistributionConfig.ForwardKey(7, SECRET), null);
+        StandaloneStunDistributionConfig rotatingAlternate = distribution(
+                StunEndpointTopology.AddressSlot.ALTERNATE, "127.0.0.2", "127.0.0.1",
+                new StandaloneStunDistributionConfig.ForwardKey(8, nextSecret),
+                new StandaloneStunDistributionConfig.ForwardKey(7, SECRET));
+        DistributedStunForwarder sender = new DistributedStunForwarder(primary, CLOCK, new SecureRandom());
+        DistributedStunForwarder receiver =
+                new DistributedStunForwarder(rotatingAlternate, CLOCK, new SecureRandom());
+        StunMessage response = StunMessage.of(
+                StunMessage.BINDING_SUCCESS, StunMessage.newTransactionId(), StunMessage.software("test"));
+        List<byte[]> frames = new ArrayList<>();
+        for (int index = 0; index < 130; index++) {
+            frames.add(sender.encode(StunEndpointTopology.ALTERNATE,
+                    address("198.51.100.25", 54_321), response.toBytes()));
+        }
+
+        assertTrue(receiver.decode(packetFrom(frames.get(129), primary.controlBindAddress())).accepted());
+        assertTrue(receiver.decode(packetFrom(frames.get(128), primary.controlBindAddress())).accepted());
+        DistributedStunForwarder.DecodeResult outsideWindow =
+                receiver.decode(packetFrom(frames.get(0), primary.controlBindAddress()));
+        assertEquals("replay", outsideWindow.rejectionReason());
+
+        StandaloneStunDistributionConfig noPrevious = distribution(
+                StunEndpointTopology.AddressSlot.ALTERNATE, "127.0.0.2", "127.0.0.1",
+                new StandaloneStunDistributionConfig.ForwardKey(8, nextSecret), null);
+        DistributedStunForwarder unknownKeyReceiver =
+                new DistributedStunForwarder(noPrevious, CLOCK, new SecureRandom());
+        assertEquals("unknown_key", unknownKeyReceiver
+                .decode(packetFrom(frames.get(1), primary.controlBindAddress())).rejectionReason());
+    }
+
     private static StandaloneStunDistributionConfig distribution(
             StunEndpointTopology.AddressSlot slot,
             String bind,
             String peer) throws Exception {
+        return distribution(slot, bind, peer,
+                new StandaloneStunDistributionConfig.ForwardKey(7, SECRET), null);
+    }
+
+    private static StandaloneStunDistributionConfig distribution(
+            StunEndpointTopology.AddressSlot slot,
+            String bind,
+            String peer,
+            StandaloneStunDistributionConfig.ForwardKey currentKey,
+            StandaloneStunDistributionConfig.ForwardKey previousKey) throws Exception {
         return new StandaloneStunDistributionConfig(
                 true,
                 slot,
                 address(bind, 3480),
                 address(peer, 3480),
-                SECRET,
+                currentKey,
+                previousKey,
                 30,
                 128,
                 4_096,
@@ -124,5 +224,16 @@ class DistributedStunForwarderTests {
 
     private static InetSocketAddress address(String host, int port) throws Exception {
         return new InetSocketAddress(InetAddress.getByName(host), port);
+    }
+
+    private static Path findVector() {
+        Path current = Path.of("").toAbsolutePath();
+        for (int depth = 0; current != null && depth < 8; depth++, current = current.getParent()) {
+            Path candidate = current.resolve("protocol/test-vectors/stun-forward-stfwd2.json");
+            if (Files.isRegularFile(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("cannot locate STFWD2 vector");
     }
 }

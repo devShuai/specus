@@ -18,6 +18,8 @@ import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+import java.util.Enumeration;
 import java.util.Objects;
 
 /**
@@ -78,18 +80,46 @@ public final class TlsContextFactory {
 
     private static KeyManagerFactory loadKeyManagerFactory(File keystoreFile, char[] storePassword, char[] keyPassword) throws CertificateException {
         try (InputStream in = new FileInputStream(keystoreFile)) {
-            String type = keystoreFile.getName().toLowerCase().endsWith(".p12")
-                    || keystoreFile.getName().toLowerCase().endsWith(".pfx")
-                    ? "PKCS12"
-                    : KeyStore.getDefaultType();
-            KeyStore keyStore = KeyStore.getInstance(type);
-            keyStore.load(in, storePassword);
+            KeyStore keyStore = loadKeyStore(keystoreFile, storePassword, in);
             KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
             kmf.init(keyStore, keyPassword);
             return kmf;
         } catch (IOException | KeyStoreException | NoSuchAlgorithmException | UnrecoverableKeyException e) {
             throw new IllegalStateException("Failed to load keystore " + keystoreFile.getAbsolutePath() + ": " + e.getMessage(), e);
         }
+    }
+
+    public static long certificateExpiryEpochSeconds(String keystorePath, String keystorePassword) {
+        if (keystorePath == null || keystorePath.isBlank()) {
+            return 0;
+        }
+        File keystoreFile = new File(keystorePath);
+        char[] password = keystorePassword == null ? new char[0] : keystorePassword.toCharArray();
+        try (InputStream in = new FileInputStream(keystoreFile)) {
+            KeyStore keyStore = loadKeyStore(keystoreFile, password, in);
+            long earliest = Long.MAX_VALUE;
+            Enumeration<String> aliases = keyStore.aliases();
+            while (aliases.hasMoreElements()) {
+                java.security.cert.Certificate certificate = keyStore.getCertificate(aliases.nextElement());
+                if (certificate instanceof X509Certificate x509) {
+                    earliest = Math.min(earliest, x509.getNotAfter().toInstant().getEpochSecond());
+                }
+            }
+            return earliest == Long.MAX_VALUE ? 0 : earliest;
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to inspect TLS certificate expiry", e);
+        }
+    }
+
+    private static KeyStore loadKeyStore(File file, char[] password, InputStream input)
+            throws KeyStoreException, IOException, NoSuchAlgorithmException, CertificateException {
+        String type = file.getName().toLowerCase().endsWith(".p12")
+                || file.getName().toLowerCase().endsWith(".pfx")
+                ? "PKCS12"
+                : KeyStore.getDefaultType();
+        KeyStore keyStore = KeyStore.getInstance(type);
+        keyStore.load(input, password);
+        return keyStore;
     }
 
     private static javax.net.ssl.TrustManagerFactory loadTrustManagerFactory(File truststoreFile, String password) throws CertificateException {

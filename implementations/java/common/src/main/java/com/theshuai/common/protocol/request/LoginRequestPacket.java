@@ -14,6 +14,7 @@ public class LoginRequestPacket extends Packet {
     private String clientName;
     private Long clientSessionId;
     private String accessToken;
+    private String connectionRole;
 
     @Override
     public Byte getCommand() {

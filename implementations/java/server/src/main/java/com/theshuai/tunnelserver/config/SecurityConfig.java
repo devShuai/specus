@@ -55,9 +55,8 @@ public class SecurityConfig {
         String ossSuffix = ossOrigin.isEmpty() ? "" : " " + ossOrigin;
         http
                 .authorizeHttpRequests(authorize -> authorize
-                        // /ws/** 由 JwtHandshakeInterceptor 在握手阶段单独鉴权，
-                        // 这里放行避免被 Spring Security 当 REST 一样要求 Authorization 头（浏览器
-                        // 原生 WebSocket 无法塞自定义 header，token 走 query 串）。
+                        // /ws/** 只接受由 HTTPS POST 换取的短期单用途 ticket。
+                        // 浏览器原生 WebSocket 无法附加 Authorization header，因此升级路径单独放行。
                         .requestMatchers("/ws/**").permitAll()
                         // 对象存储会产生持久化与公网流量成本，公开互传页只有登录用户
                         // 可以申请 OSS 上传/下载；房间发现、ICE 和实时 Direct/TURN 仍免登录。

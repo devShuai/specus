@@ -1,11 +1,17 @@
 package com.theshuai.tunnelserver.peer;
 
 import com.theshuai.common.peermesh.PeerDataFrameHeader;
+import com.theshuai.common.peermesh.PeerUdpProbe;
 import com.theshuai.common.stun.StunBindingService;
 import com.theshuai.common.stun.StunEndpointTopology;
 import com.theshuai.common.stun.StunMessage;
+import com.theshuai.common.stun.TurnChannelData;
+import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelserver.config.PeerMeshProperties;
 import com.theshuai.tunnelserver.management.service.PeerMeshService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.NonNull;
@@ -26,38 +32,57 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
 @Slf4j
 public class StunTurnServer implements ApplicationRunner {
     private static final String SOFTWARE = "shuai-tunnel-standard-stun-turn";
     private static final long PERMISSION_TTL_SECONDS = 300;
+    private static final long CHANNEL_TTL_SECONDS = 600;
+    private static final int MAX_PROBE_BYTES = 2_048;
 
     private final PeerMeshProperties properties;
     private final PeerMeshService peerMeshService;
     private final TurnCredentialService turnCredentialService;
+    private final Counter relayQueueDropped;
+    private final Counter relaySendFailed;
+    private final AtomicInteger relayQueueHighWater = new AtomicInteger();
     private final Map<String, Allocation> allocations = new ConcurrentHashMap<>();
     private final Map<String, String> allocationByEndpoint = new ConcurrentHashMap<>();
+    private final Map<String, String> allocationByRelayEndpoint = new ConcurrentHashMap<>();
     private final Map<StunEndpointTopology.EndpointId, DatagramSocket> stunSockets = new ConcurrentHashMap<>();
     private DatagramSocket primarySocket;
     private StunEndpointTopology stunTopology;
     private StunBindingService stunBindingService;
     private InetAddress turnBindAddress;
     private InetAddress turnAdvertisedAddress;
-    private ExecutorService relayExecutor;
+    private ThreadPoolExecutor relayExecutor;
     private volatile boolean running;
 
     public StunTurnServer(PeerMeshProperties properties,
                           PeerMeshService peerMeshService,
-                          TurnCredentialService turnCredentialService) {
+                          TurnCredentialService turnCredentialService,
+                          MeterRegistry meterRegistry) {
         this.properties = properties;
         this.peerMeshService = peerMeshService;
         this.turnCredentialService = turnCredentialService;
+        this.relayQueueDropped = Counter.builder("tunnel.peer_mesh.turn.relay.queue.dropped")
+                .description("TURN relay tasks rejected by the bounded worker queue")
+                .register(meterRegistry);
+        this.relaySendFailed = Counter.builder("tunnel.peer_mesh.turn.relay.send.failures")
+                .description("TURN relay datagrams that failed during send")
+                .register(meterRegistry);
+        Gauge.builder("tunnel.peer_mesh.turn.relay.queue.depth", this, StunTurnServer::relayQueueDepth)
+                .description("Current TURN relay worker queue depth")
+                .register(meterRegistry);
+        Gauge.builder("tunnel.peer_mesh.turn.relay.queue.high.water", relayQueueHighWater, AtomicInteger::get)
+                .description("Maximum observed TURN relay worker queue depth")
+                .register(meterRegistry);
     }
 
     @Override
@@ -129,6 +154,7 @@ public class StunTurnServer implements ApplicationRunner {
         try {
             for (StunEndpointTopology.Endpoint endpoint : stunTopology.endpoints()) {
                 DatagramSocket socket = new DatagramSocket(null);
+                configureUdpSocket(socket);
                 socket.bind(endpoint.bindAddress());
                 stunSockets.put(endpoint.id(), socket);
             }
@@ -188,6 +214,11 @@ public class StunTurnServer implements ApplicationRunner {
                         StunEndpointTopology.EndpointId incomingEndpoint) throws Exception {
         DatagramSocket receiveSocket = stunSockets.get(incomingEndpoint);
         InetSocketAddress remote = new InetSocketAddress(packet.getAddress(), packet.getPort());
+        if (StunEndpointTopology.PRIMARY.equals(incomingEndpoint)
+                && TurnChannelData.looksLike(packet.getData(), packet.getOffset(), packet.getLength())) {
+            handleChannelData(packet, remote);
+            return;
+        }
         StunMessage message = StunMessage.parse(packet.getData(), packet.getOffset(), packet.getLength());
         if (message == null) {
             return;
@@ -215,6 +246,7 @@ public class StunTurnServer implements ApplicationRunner {
             case StunMessage.ALLOCATE_REQUEST -> allocate(message, packet, remote);
             case StunMessage.REFRESH_REQUEST -> refresh(message, packet, remote);
             case StunMessage.CREATE_PERMISSION_REQUEST -> createPermission(message, packet, remote);
+            case StunMessage.CHANNEL_BIND_REQUEST -> channelBind(message, packet, remote);
             case StunMessage.SEND_INDICATION -> sendIndication(message, remote);
             default -> sendError(receiveSocket, remote, message, errorType(message.type()), 400, "unsupported-method");
         }
@@ -233,8 +265,10 @@ public class StunTurnServer implements ApplicationRunner {
         Allocation allocation = allocationByEndpoint.containsKey(endpointKey)
                 ? allocations.get(allocationByEndpoint.get(endpointKey))
                 : null;
-        if (allocation == null || allocation.isExpired(Instant.now())) {
-            allocation = createAllocation(remote);
+        if (allocation == null || allocation.isExpired(Instant.now())
+                || !allocation.matchesClient(auth.clientId())) {
+            closeAllocation(allocation);
+            allocation = createAllocation(remote, auth.clientId());
         } else {
             allocation.expiresAt = Instant.now().plusSeconds(properties.getAllocationTtlSeconds());
         }
@@ -249,22 +283,24 @@ public class StunTurnServer implements ApplicationRunner {
         sendStun(primarySocket, remote, response, auth.messageIntegrityKey());
     }
 
-    private Allocation createAllocation(InetSocketAddress remote) throws Exception {
+    private Allocation createAllocation(InetSocketAddress remote, long clientId) throws Exception {
         DatagramSocket relaySocket = bindRelaySocket();
         Allocation allocation = new Allocation(
                 UUID.randomUUID().toString(),
                 remote,
                 relaySocket,
                 advertisedSocketAddress(relaySocket),
-                Instant.now().plusSeconds(properties.getAllocationTtlSeconds())
+                Instant.now().plusSeconds(properties.getAllocationTtlSeconds()),
+                clientId
         );
         allocations.put(allocation.id, allocation);
         allocationByEndpoint.put(endpointKey(remote), allocation.id);
+        allocationByRelayEndpoint.put(endpointKey(allocation.relayAddress), allocation.id);
 
-        Thread thread = new Thread(() -> relayReceiveLoop(allocation), "peer-turn-relay-" + relaySocket.getLocalPort());
-        thread.setDaemon(true);
+        Thread thread = Thread.ofVirtual()
+                .name("peer-turn-relay-" + relaySocket.getLocalPort())
+                .start(() -> relayReceiveLoop(allocation));
         allocation.relayThread = thread;
-        thread.start();
         log.info("[peer-mesh] TURN allocation created: client={}, relay={}", remote, allocation.relayAddress);
         return allocation;
     }
@@ -285,6 +321,7 @@ public class StunTurnServer implements ApplicationRunner {
             int port = min + ((start - min + i) % capacity);
             try {
                 DatagramSocket socket = new DatagramSocket(null);
+                configureUdpSocket(socket);
                 socket.bind(new InetSocketAddress(turnBindAddress, port));
                 return socket;
             } catch (Exception e) {
@@ -295,6 +332,7 @@ public class StunTurnServer implements ApplicationRunner {
             throw last;
         }
         DatagramSocket socket = new DatagramSocket(null);
+        configureUdpSocket(socket);
         socket.bind(new InetSocketAddress(turnBindAddress, 0));
         return socket;
     }
@@ -305,7 +343,7 @@ public class StunTurnServer implements ApplicationRunner {
             return;
         }
         Allocation allocation = allocationForRemote(remote);
-        if (allocation == null) {
+        if (allocation == null || !allocation.matchesClient(auth.clientId())) {
             sendError(primarySocket, remote, request, StunMessage.REFRESH_ERROR, 437, "allocation-mismatch");
             return;
         }
@@ -330,7 +368,7 @@ public class StunTurnServer implements ApplicationRunner {
             return;
         }
         Allocation allocation = allocationForRemote(remote);
-        if (allocation == null) {
+        if (allocation == null || !allocation.matchesClient(auth.clientId())) {
             sendError(primarySocket, remote, request, StunMessage.CREATE_PERMISSION_ERROR, 437, "allocation-mismatch");
             return;
         }
@@ -346,6 +384,73 @@ public class StunTurnServer implements ApplicationRunner {
                 StunMessage.software(SOFTWARE)
         );
         sendStun(primarySocket, remote, response, auth.messageIntegrityKey());
+    }
+
+    private void channelBind(StunMessage request, DatagramPacket packet, InetSocketAddress remote) throws Exception {
+        TurnAuth auth = authenticate(request, packet, remote, StunMessage.CHANNEL_BIND_ERROR);
+        if (!auth.allowed()) {
+            return;
+        }
+        Allocation allocation = allocationForRemote(remote);
+        int channelNumber = request.channelNumber().orElse(-1);
+        InetSocketAddress peer = request.xorPeerAddress().orElse(null);
+        if (allocation == null || !allocation.matchesClient(auth.clientId())) {
+            sendError(primarySocket, remote, request, StunMessage.CHANNEL_BIND_ERROR, 437, "allocation-mismatch");
+            return;
+        }
+        if (channelNumber < TurnChannelData.MIN_CHANNEL || peer == null) {
+            sendError(primarySocket, remote, request, StunMessage.CHANNEL_BIND_ERROR, 400, "bad-channel-bind");
+            return;
+        }
+        Instant now = Instant.now();
+        ChannelBinding occupied = allocation.channelsByNumber.get(channelNumber);
+        if (occupied != null && occupied.activeAt(now) && !sameEndpoint(occupied.peer(), peer)) {
+            sendError(primarySocket, remote, request, StunMessage.CHANNEL_BIND_ERROR, 400, "channel-in-use");
+            return;
+        }
+
+        String peerKey = endpointKey(peer);
+        ChannelBinding previous = allocation.channelsByPeer.put(
+                peerKey,
+                new ChannelBinding(channelNumber, peer, now.plusSeconds(CHANNEL_TTL_SECONDS)));
+        if (previous != null && previous.channelNumber() != channelNumber) {
+            allocation.channelsByNumber.remove(previous.channelNumber(), previous);
+        }
+        allocation.channelsByNumber.put(channelNumber, allocation.channelsByPeer.get(peerKey));
+        allocation.permissions.put(permissionKey(peer), now.plusSeconds(PERMISSION_TTL_SECONDS));
+        sendStun(
+                primarySocket,
+                remote,
+                StunMessage.of(
+                        StunMessage.CHANNEL_BIND_SUCCESS,
+                        request.transactionId(),
+                        StunMessage.software(SOFTWARE)),
+                auth.messageIntegrityKey());
+    }
+
+    private void handleChannelData(DatagramPacket packet, InetSocketAddress remote) {
+        Allocation allocation = allocationForRemote(remote);
+        TurnChannelData.Frame frame = TurnChannelData.parse(packet.getData(), packet.getOffset(), packet.getLength());
+        if (allocation == null || frame == null) {
+            return;
+        }
+        ChannelBinding binding = allocation.channelsByNumber.get(frame.channelNumber());
+        if (binding == null || !binding.activeAt(Instant.now()) || hasNotPermission(allocation, binding.peer())) {
+            return;
+        }
+        Allocation target = allocationForRelayEndpoint(binding.peer());
+        byte[] payload = frame.payload();
+		if (!authorizeRelayPayload(payload, allocation, target, true)) {
+            return;
+        }
+        submitRelayTask(() -> {
+            try {
+                allocation.relaySocket.send(new DatagramPacket(payload, payload.length, binding.peer()));
+            } catch (Exception e) {
+                relaySendFailed.increment();
+                log.debug("[peer-mesh] TURN ChannelData relay failed: {}", e.toString());
+            }
+        });
     }
 
     private TurnAuth authenticate(StunMessage request,
@@ -379,7 +484,7 @@ public class StunTurnServer implements ApplicationRunner {
             sendTurnAuthError(remote, request, responseType, 401, "bad-message-integrity");
             return TurnAuth.denied();
         }
-        return TurnAuth.allowed(key);
+        return TurnAuth.allowed(key, turnCredentialService.peerMeshClientId(username));
     }
 
     private void sendTurnAuthError(InetSocketAddress remote,
@@ -408,11 +513,50 @@ public class StunTurnServer implements ApplicationRunner {
         if (peer == null || payload == null || hasNotPermission(allocation, peer)) {
             return;
         }
-        PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
-        if (header != null && !peerMeshService.authorizeRelayFrameForRelay(header, payload.length)) {
+        Allocation target = allocationForRelayEndpoint(peer);
+		if (!authorizeRelayPayload(payload, allocation, target, true)) {
             return;
         }
-        allocation.relaySocket.send(new DatagramPacket(payload, payload.length, peer));
+        submitRelayTask(() -> {
+            try {
+                allocation.relaySocket.send(new DatagramPacket(payload, payload.length, peer));
+            } catch (Exception e) {
+                relaySendFailed.increment();
+                log.debug("[peer-mesh] TURN send indication relay failed: {}", e.toString());
+            }
+        });
+    }
+
+	private boolean authorizeRelayPayload(byte[] payload,
+                                        Allocation source,
+                                        Allocation target,
+                                        boolean account) {
+        if (source == null || target == null || source.clientId <= 0 || target.clientId <= 0) {
+            return false;
+        }
+        PeerDataFrameHeader header = PeerDataFrameHeader.parse(payload);
+        if (header != null) {
+			return account
+					? peerMeshService.authorizeRelayFrameForRelay(
+                            header, source.clientId, target.clientId, payload.length)
+					: peerMeshService.validateRelayFrameForRelay(
+                            header, source.clientId, target.clientId);
+        }
+        if (payload == null
+                || payload.length < 16
+                || payload.length > MAX_PROBE_BYTES
+                || payload[0] != '{'
+                || payload[payload.length - 1] != '}') {
+            return false;
+        }
+        PeerUdpProbe probe = JsonUtil.bytesToObjectQuietly(payload, 0, payload.length, PeerUdpProbe.class);
+        return probe != null
+                && PeerUdpProbe.MAGIC.equals(probe.getMagic())
+                && probe.getFromClientId() != null
+                && probe.getFromClientId() == source.clientId
+                && probe.getToClientId() != null
+                && probe.getToClientId() == target.clientId
+                && peerMeshService.authorizeRelayProbeForRelay(probe);
     }
 
     private void relayReceiveLoop(Allocation allocation) {
@@ -426,7 +570,11 @@ public class StunTurnServer implements ApplicationRunner {
                     continue;
                 }
                 byte[] payload = java.util.Arrays.copyOfRange(packet.getData(), packet.getOffset(), packet.getOffset() + packet.getLength());
-                dispatchDataIndication(allocation, peer, payload);
+                Allocation source = allocationForRelayEndpoint(peer);
+				if (!authorizeRelayPayload(payload, source, allocation, false)) {
+					continue;
+				}
+                dispatchPeerData(allocation, peer, payload);
             } catch (Exception e) {
                 if (running && !allocation.closed) {
                     log.debug("[peer-mesh] TURN relay receive failed: {}", e.toString());
@@ -435,10 +583,15 @@ public class StunTurnServer implements ApplicationRunner {
         }
     }
 
-    private void dispatchDataIndication(Allocation allocation, InetSocketAddress peer, byte[] payload) {
-        ExecutorService executor = relayExecutor;
+    private void dispatchPeerData(Allocation allocation, InetSocketAddress peer, byte[] payload) {
         Runnable task = () -> {
             try {
+                ChannelBinding binding = allocation.channelsByPeer.get(endpointKey(peer));
+                if (binding != null && binding.activeAt(Instant.now())) {
+                    byte[] channelData = TurnChannelData.encode(binding.channelNumber(), payload);
+                    primarySocket.send(new DatagramPacket(channelData, channelData.length, allocation.clientRemote));
+                    return;
+                }
                 byte[] transactionId = StunMessage.newTransactionId();
                 StunMessage data = StunMessage.of(
                         StunMessage.DATA_INDICATION,
@@ -448,16 +601,24 @@ public class StunTurnServer implements ApplicationRunner {
                 );
                 sendStun(primarySocket, allocation.clientRemote, data);
             } catch (Exception e) {
+                relaySendFailed.increment();
                 log.debug("[peer-mesh] TURN data indication failed: {}", e.toString());
             }
         };
+        submitRelayTask(task);
+    }
+
+    private void submitRelayTask(Runnable task) {
+        ThreadPoolExecutor executor = relayExecutor;
         if (executor == null) {
             task.run();
             return;
         }
         try {
             executor.execute(task);
+            relayQueueHighWater.accumulateAndGet(executor.getQueue().size(), Math::max);
         } catch (RuntimeException e) {
+            relayQueueDropped.increment();
             log.debug("[peer-mesh] TURN data indication dropped: {}", e.toString());
         }
     }
@@ -517,6 +678,7 @@ public class StunTurnServer implements ApplicationRunner {
             case StunMessage.ALLOCATE_REQUEST -> StunMessage.ALLOCATE_ERROR;
             case StunMessage.REFRESH_REQUEST -> StunMessage.REFRESH_ERROR;
             case StunMessage.CREATE_PERMISSION_REQUEST -> StunMessage.CREATE_PERMISSION_ERROR;
+            case StunMessage.CHANNEL_BIND_REQUEST -> StunMessage.CHANNEL_BIND_ERROR;
             default -> StunMessage.BINDING_ERROR;
         };
     }
@@ -526,6 +688,8 @@ public class StunTurnServer implements ApplicationRunner {
         Instant now = Instant.now();
         for (Allocation allocation : allocations.values()) {
             allocation.permissions.entrySet().removeIf(entry -> entry.getValue().isBefore(now));
+            allocation.channelsByNumber.entrySet().removeIf(entry -> !entry.getValue().activeAt(now));
+            allocation.channelsByPeer.entrySet().removeIf(entry -> !entry.getValue().activeAt(now));
             if (allocation.isExpired(now)) {
                 closeAllocation(allocation);
             }
@@ -561,6 +725,7 @@ public class StunTurnServer implements ApplicationRunner {
         allocation.closed = true;
         allocations.remove(allocation.id);
         allocationByEndpoint.remove(endpointKey(allocation.clientRemote), allocation.id);
+        allocationByRelayEndpoint.remove(endpointKey(allocation.relayAddress), allocation.id);
         if (allocation.relaySocket != null) {
             allocation.relaySocket.close();
         }
@@ -576,11 +741,34 @@ public class StunTurnServer implements ApplicationRunner {
         return remote.getAddress().getHostAddress() + ":" + remote.getPort();
     }
 
+    private Allocation allocationForRelayEndpoint(InetSocketAddress remote) {
+        if (remote == null) {
+            return null;
+        }
+        String id = allocationByRelayEndpoint.get(endpointKey(remote));
+        Allocation exact = id == null ? null : allocations.get(id);
+        Instant now = Instant.now();
+        if (exact != null && !exact.isExpired(now)) {
+            return exact;
+        }
+        for (Allocation candidate : allocations.values()) {
+            if (!candidate.isExpired(now)
+                    && candidate.relayAddress.getPort() == remote.getPort()) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
     private String permissionKey(InetSocketAddress remote) {
         if (remote == null || remote.getAddress() == null) {
             return "";
         }
         return remote.getAddress().getHostAddress();
+    }
+
+    private boolean sameEndpoint(InetSocketAddress left, InetSocketAddress right) {
+        return Objects.equals(endpointKey(left), endpointKey(right));
     }
 
     private int natProbeAlternatePort() {
@@ -634,7 +822,7 @@ public class StunTurnServer implements ApplicationRunner {
         return value != null && !value.isBlank();
     }
 
-    private ExecutorService createRelayExecutor() {
+    ThreadPoolExecutor createRelayExecutor() {
         int configuredThreads = properties.getRelayWorkerThreads();
         int workers = configuredThreads > 0
                 ? configuredThreads
@@ -657,7 +845,42 @@ public class StunTurnServer implements ApplicationRunner {
                 TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity),
                 threadFactory,
-                new ThreadPoolExecutor.DiscardPolicy());
+                (task, executor) -> {
+                    relayQueueDropped.increment();
+                    relayQueueHighWater.accumulateAndGet(executor.getQueue().size(), Math::max);
+                });
+    }
+
+    private void configureUdpSocket(DatagramSocket socket) {
+        int receiveBufferBytes = properties.getUdpReceiveBufferBytes();
+        if (receiveBufferBytes > 0) {
+            try {
+                socket.setReceiveBufferSize(Math.max(65_507, receiveBufferBytes));
+            } catch (Exception e) {
+                log.warn("[peer-mesh] unable to configure UDP receive buffer: {}", e.getMessage());
+            }
+        }
+        int sendBufferBytes = properties.getUdpSendBufferBytes();
+        if (sendBufferBytes > 0) {
+            try {
+                socket.setSendBufferSize(Math.max(65_507, sendBufferBytes));
+            } catch (Exception e) {
+                log.warn("[peer-mesh] unable to configure UDP send buffer: {}", e.getMessage());
+            }
+        }
+        int trafficClass = properties.getUdpTrafficClass();
+        if (trafficClass >= 0 && trafficClass <= 255) {
+            try {
+                socket.setTrafficClass(trafficClass);
+            } catch (Exception e) {
+                log.debug("[peer-mesh] UDP traffic class is not supported: {}", e.getMessage());
+            }
+        }
+    }
+
+    private double relayQueueDepth() {
+        ThreadPoolExecutor executor = relayExecutor;
+        return executor == null ? 0 : executor.getQueue().size();
     }
 
     private static final class Allocation {
@@ -666,7 +889,10 @@ public class StunTurnServer implements ApplicationRunner {
         private final DatagramSocket relaySocket;
         private final InetSocketAddress relayAddress;
         private final Map<String, Instant> permissions = new ConcurrentHashMap<>();
+        private final Map<Integer, ChannelBinding> channelsByNumber = new ConcurrentHashMap<>();
+        private final Map<String, ChannelBinding> channelsByPeer = new ConcurrentHashMap<>();
         private volatile Instant expiresAt;
+        private final long clientId;
         private volatile Thread relayThread;
         private volatile boolean closed;
 
@@ -674,30 +900,42 @@ public class StunTurnServer implements ApplicationRunner {
                            InetSocketAddress clientRemote,
                            DatagramSocket relaySocket,
                            InetSocketAddress relayAddress,
-                           Instant expiresAt) {
+                           Instant expiresAt,
+                           long clientId) {
             this.id = Objects.requireNonNull(id, "id");
             this.clientRemote = clientRemote;
             this.relaySocket = relaySocket;
             this.relayAddress = relayAddress;
             this.expiresAt = expiresAt;
+            this.clientId = clientId;
         }
 
         private boolean isExpired(Instant now) {
             return closed || expiresAt == null || !expiresAt.isAfter(now);
         }
+
+        private boolean matchesClient(long authenticatedClientId) {
+            return clientId == authenticatedClientId;
+        }
     }
 
-    private record TurnAuth(boolean allowed, byte[] messageIntegrityKey) {
+    private record ChannelBinding(int channelNumber, InetSocketAddress peer, Instant expiresAt) {
+        private boolean activeAt(Instant now) {
+            return expiresAt != null && expiresAt.isAfter(now);
+        }
+    }
+
+    private record TurnAuth(boolean allowed, byte[] messageIntegrityKey, long clientId) {
         private static TurnAuth none() {
-            return new TurnAuth(true, null);
+            return new TurnAuth(true, null, 0);
         }
 
         private static TurnAuth denied() {
-            return new TurnAuth(false, null);
+            return new TurnAuth(false, null, 0);
         }
 
-        private static TurnAuth allowed(byte[] messageIntegrityKey) {
-            return new TurnAuth(true, messageIntegrityKey);
+        private static TurnAuth allowed(byte[] messageIntegrityKey, long clientId) {
+            return new TurnAuth(true, messageIntegrityKey, clientId);
         }
     }
 }

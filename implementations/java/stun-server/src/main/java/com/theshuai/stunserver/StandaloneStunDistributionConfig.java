@@ -12,9 +12,10 @@ public record StandaloneStunDistributionConfig(
         StunEndpointTopology.AddressSlot localAddressSlot,
         InetSocketAddress controlBindAddress,
         InetSocketAddress peerControlAddress,
-        byte[] sharedSecret,
+        ForwardKey currentKey,
+        ForwardKey previousKey,
         int maxClockSkewSeconds,
-        int replayCacheSize,
+        int replayWindowSize,
         int maxForwardPacketBytes,
         int forwardRatePerSecond,
         int forwardBurst) {
@@ -25,9 +26,10 @@ public record StandaloneStunDistributionConfig(
             localAddressSlot = null;
             controlBindAddress = null;
             peerControlAddress = null;
-            sharedSecret = new byte[0];
+            currentKey = null;
+            previousKey = null;
             maxClockSkewSeconds = 30;
-            replayCacheSize = 65_536;
+            replayWindowSize = 4_096;
             maxForwardPacketBytes = 4_096;
             forwardRatePerSecond = 10_000;
             forwardBurst = 20_000;
@@ -44,15 +46,18 @@ public record StandaloneStunDistributionConfig(
                 throw new IllegalArgumentException(
                         "distributed control endpoints must be distinct");
             }
-            sharedSecret = sharedSecret == null
-                    ? new byte[0]
-                    : Arrays.copyOf(sharedSecret, sharedSecret.length);
-            if (sharedSecret.length < MIN_SECRET_BYTES || sharedSecret.length > 256) {
-                throw new IllegalArgumentException(
-                        "distributed shared secret must contain between 32 and 256 bytes");
+            Objects.requireNonNull(currentKey, "currentKey");
+            currentKey = new ForwardKey(currentKey.keyId(), currentKey.secret());
+            if (previousKey != null) {
+                previousKey = new ForwardKey(previousKey.keyId(), previousKey.secret());
+                if (previousKey.keyId() == currentKey.keyId()) {
+                    throw new IllegalArgumentException("distributed forward key IDs must differ");
+                }
             }
             positive(maxClockSkewSeconds, "maxClockSkewSeconds");
-            positive(replayCacheSize, "replayCacheSize");
+            if (replayWindowSize < 64 || replayWindowSize > 1_048_576) {
+                throw new IllegalArgumentException("replayWindowSize must be between 64 and 1048576");
+            }
             if (maxForwardPacketBytes < 512 || maxForwardPacketBytes > 65_507) {
                 throw new IllegalArgumentException(
                         "maxForwardPacketBytes must be between 512 and 65507");
@@ -69,16 +74,19 @@ public record StandaloneStunDistributionConfig(
                 null,
                 null,
                 null,
+                null,
                 30,
-                65_536,
+                4_096,
                 4_096,
                 10_000,
                 20_000);
     }
 
-    @Override
-    public byte[] sharedSecret() {
-        return Arrays.copyOf(sharedSecret, sharedSecret.length);
+    public ForwardKey key(int keyId) {
+        if (currentKey != null && currentKey.keyId() == keyId) {
+            return currentKey;
+        }
+        return previousKey != null && previousKey.keyId() == keyId ? previousKey : null;
     }
 
     public boolean isLocal(StunEndpointTopology.EndpointId endpointId) {
@@ -94,7 +102,9 @@ public record StandaloneStunDistributionConfig(
                 + ", controlBind=" + controlBindAddress
                 + ", peerControl=" + peerControlAddress
                 + ", clockSkew=" + maxClockSkewSeconds + "s"
-                + ", replayCache=" + replayCacheSize
+                + ", currentKeyId=" + currentKey.keyId()
+                + (previousKey == null ? "" : ", previousKeyId=" + previousKey.keyId())
+                + ", replayWindow=" + replayWindowSize
                 + ", maxPacket=" + maxForwardPacketBytes
                 + ", rate=" + forwardRatePerSecond + "/s burst=" + forwardBurst;
     }
@@ -116,6 +126,24 @@ public record StandaloneStunDistributionConfig(
     private static void positive(int value, String name) {
         if (value <= 0) {
             throw new IllegalArgumentException(name + " must be positive");
+        }
+    }
+
+    public record ForwardKey(int keyId, byte[] secret) {
+        public ForwardKey {
+            if (keyId <= 0) {
+                throw new IllegalArgumentException("distributed forward key ID must be positive");
+            }
+            secret = secret == null ? new byte[0] : Arrays.copyOf(secret, secret.length);
+            if (secret.length < MIN_SECRET_BYTES || secret.length > 256) {
+                throw new IllegalArgumentException(
+                        "distributed forward secret must contain between 32 and 256 bytes");
+            }
+        }
+
+        @Override
+        public byte[] secret() {
+            return Arrays.copyOf(secret, secret.length);
         }
     }
 }

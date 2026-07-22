@@ -5,15 +5,12 @@ import com.theshuai.common.protocol.NatMessageType;
 import com.theshuai.common.protocol.Packet;
 import com.theshuai.common.protocol.PacketCodec;
 import com.theshuai.common.protocol.MessageType;
-import com.theshuai.common.protocol.request.DirectHttpRequestPacket;
+import com.theshuai.common.protocol.ConnectionRole;
 import com.theshuai.common.protocol.request.HeartBeatRequestPacket;
-import com.theshuai.common.protocol.request.HttpRequestPacket;
 import com.theshuai.common.protocol.request.LoginRequestPacket;
 import com.theshuai.common.protocol.request.LogoutRequestPacket;
 import com.theshuai.common.protocol.request.MessageRequestPacket;
-import com.theshuai.common.protocol.response.DirectHttpResponsePacket;
 import com.theshuai.common.protocol.response.HeartBeatResponsePacket;
-import com.theshuai.common.protocol.response.HttpResponsePacket;
 import com.theshuai.common.protocol.response.LoginResponsePacket;
 import com.theshuai.common.protocol.response.LogoutResponsePacket;
 import com.theshuai.common.protocol.response.MessageResponsePacket;
@@ -24,22 +21,21 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Emits canonical encoded bytes for every packet type to <c>tests/fixtures/*.bin</c> in the
- * csharp project. Run with:
+ * Emits canonical control-protocol v2 frames into the repository-wide test-vector directory.
+ * Run with:
  * <pre>
  *   mvn -pl :tunnel-common test-compile exec:java \
  *       -Dexec.mainClass=com.theshuai.common.tools.WireFixtureGenerator \
  *       -Dexec.classpathScope=test \
- *       -Dexec.args="implementations/csharp/protocol/tests/fixtures"
+ *       -Dexec.args="protocol/test-vectors/control-v2/frames"
  * </pre>
  *
- * <p>The C# tests load these as expected-bytes fixtures — see
+ * <p>Every language loads these as expected-bytes fixtures. The C# entry point is
  * <c>implementations/csharp/protocol/tests/ShuaiTunnel.Protocol.Tests/PacketCodecFixtureTests.cs</c>.
  *
  * <p>Each fixture is named after the packet kind (e.g. <c>login_request.bin</c>) plus optional
@@ -48,7 +44,7 @@ import java.util.Map;
 public final class WireFixtureGenerator {
 
     public static void main(String[] args) throws IOException {
-        Path outputDir = Paths.get(args.length > 0 ? args[0] : "implementations/csharp/protocol/tests/fixtures").toAbsolutePath();
+        Path outputDir = Paths.get(args.length > 0 ? args[0] : "protocol/test-vectors/control-v2/frames").toAbsolutePath();
         Files.createDirectories(outputDir);
         new Fixtures(outputDir).emit();
         System.out.println("wrote fixtures to " + outputDir);
@@ -66,6 +62,7 @@ public final class WireFixtureGenerator {
             login.setClientName("Demo client");
             login.setClientSessionId(1700000000000L);
             login.setAccessToken("cs_fixture_access_token");
+            login.setConnectionRole(ConnectionRole.CONTROL);
             write("login_request.bin", login);
 
             LoginResponsePacket loginResp = new LoginResponsePacket();
@@ -104,46 +101,6 @@ public final class WireFixtureGenerator {
             msgResp.setMessage("{\"clientName\":\"Demo client\",\"remotePort\":7010}");
             write("message_response.bin", msgResp);
 
-            // HttpRequest covers UUID, HTTP_METHOD enum, STRING_MAP, and a small body.
-            HttpRequestPacket http = new HttpRequestPacket();
-            http.setClientName("Demo client");
-            http.setToClientName("upstream");
-            http.setRequestId("123e4567-e89b-12d3-a456-426614174000");
-            http.setRequestMethod("POST");
-            http.setRequestUrl("http://127.0.0.1:8080/api/demo");
-            http.setHeaderMap(orderedStringMap(
-                    "Content-Type", "application/json",
-                    "X-Request-Id", "fixture-1"));
-            http.setParamMap(orderedStringMap("limit", "10"));
-            http.setBody("{\"hello\":\"world\"}");
-            write("http_request.bin", http);
-
-            HttpResponsePacket httpResp = new HttpResponsePacket();
-            httpResp.setClientName("upstream");
-            httpResp.setToClientName("Demo client");
-            httpResp.setRequestId("123e4567-e89b-12d3-a456-426614174000");
-            httpResp.setResponse("{\"ok\":true}");
-            write("http_response.bin", httpResp);
-
-            // Direct HTTP — exercises STRING_LIST and BYTE_ARRAY together.
-            DirectHttpRequestPacket direct = new DirectHttpRequestPacket();
-            direct.setRequestId("11111111-2222-3333-4444-555555555555");
-            direct.setRequestMethod("GET");
-            direct.setRoute("api");
-            direct.setRelativePath("/v1/items");
-            direct.setRawQuery("limit=10&page=1");
-            direct.setHeaders(List.of("accept: application/json", "x-fixture: 1"));
-            direct.setBody(new byte[0]);
-            write("direct_http_request.bin", direct);
-
-            DirectHttpResponsePacket directResp = new DirectHttpResponsePacket();
-            directResp.setRequestId("11111111-2222-3333-4444-555555555555");
-            directResp.setStatusCode(200);
-            directResp.setHeaders(List.of("content-type: application/json"));
-            directResp.setBody("{\"ok\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            directResp.setError(null);
-            write("direct_http_response.bin", directResp);
-
             // NAT_MESSAGE — one fixture per type. Metadata layouts mirror what the server emits.
             write("nat_register.bin", natPacket(NatMessageType.REGISTER, orderedMap(
                     "clientName", "Demo client",
@@ -153,31 +110,109 @@ public final class WireFixtureGenerator {
             write("nat_register_result.bin", natPacket(NatMessageType.REGISTER_RESULT, orderedMap(
                     "port", 18080,
                     "success", true), null));
-            write("nat_connected.bin", natPacket(NatMessageType.CONNECTED, orderedMap(
+            write("nat_open.bin", natPacket(NatMessageType.OPEN, 1, 0, orderedMap(
                     "channelId", "00010203-aaaa-bbbb-cccc-ddddeeeeffff",
                     "port", 18080), null));
-            write("nat_disconnected.bin", natPacket(NatMessageType.DISCONNECTED, orderedMap(
-                    "channelId", "00010203-aaaa-bbbb-cccc-ddddeeeeffff"), null));
+            write("nat_fin.bin", natPacket(NatMessageType.FIN, 1, 0, null, null));
+            write("nat_rst.bin", natPacket(NatMessageType.RST, 1, 7,
+                    orderedMap("reason", "upstream reset"), null));
+            write("nat_window_update.bin", natPacket(NatMessageType.WINDOW_UPDATE, 1, 65536,
+                    null, null));
             write("nat_keepalive.bin", natPacket(NatMessageType.KEEPALIVE, new LinkedHashMap<>(), null));
             write("nat_unregister.bin", natPacket(NatMessageType.UNREGISTER, orderedMap("port", 18080), null));
 
-            // Small DATA packet — under the 64-byte threshold, raw payload prefix.
+            // DATA payload is always raw in control protocol v2.
             byte[] tinyPayload = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            write("nat_data_small.bin", natPacket(NatMessageType.DATA, orderedMap(
-                    "channelId", "00010203-aaaa-bbbb-cccc-ddddeeeeffff"), tinyPayload));
+            write("nat_data_small.bin", natPacket(NatMessageType.DATA, 1, 0, null, tinyPayload));
 
-            // Large DATA packet — repeating bytes to exercise the deflate path. Note: the exact
-            // deflated bytes depend on the underlying zlib implementation, so the C# tests treat
-            // this fixture as decode-only (they don't compare encode output byte-for-byte).
+            // Large DATA packet verifies exact lengths and raw payload interoperability.
             byte[] largePayload = new byte[256];
-            Arrays.fill(largePayload, (byte) 'A');
-            write("nat_data_large_deflated.bin", natPacket(NatMessageType.DATA, orderedMap(
-                    "channelId", "00010203-aaaa-bbbb-cccc-ddddeeeeffff"), largePayload));
+            java.util.Arrays.fill(largePayload, (byte) 'A');
+            write("nat_data_large.bin", natPacket(NatMessageType.DATA, 1, 0, null, largePayload));
+
+            write("http_stream_request_open.bin", natPacket(NatMessageType.OPEN, 101, 0, orderedMap(
+                    "source", "http",
+                    "phase", "request",
+                    "method", "POST",
+                    "route", "api",
+                    "relativePath", "/v2/items",
+                    "rawQuery", "limit=10",
+                    "headers", List.of("Content-Type:application/json", "X-Fixture:1"),
+                    "contentLength", 14,
+                    "trailerNames", List.of()), null));
+            write("http_stream_request_data.bin", natPacket(NatMessageType.DATA, 101, 0, null,
+                    "{\"hello\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            write("http_stream_request_fin.bin", natPacket(NatMessageType.FIN, 101, 0,
+                    orderedMap("trailers", List.of()), null));
+            write("http_stream_response_open.bin", natPacket(NatMessageType.OPEN, 101, 0, orderedMap(
+                    "source", "http",
+                    "phase", "response",
+                    "statusCode", 200,
+                    "headers", List.of("Content-Type:application/json"),
+                    "trailerNames", List.of("Digest")), null));
+            write("http_stream_response_data.bin", natPacket(NatMessageType.DATA, 101, 0, null,
+                    "{\"ok\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            write("http_stream_response_fin.bin", natPacket(NatMessageType.FIN, 101, 0,
+                    orderedMap("trailers", List.of("Digest:sha-256=fixture")), null));
+
+            emitMalformedFrames();
+        }
+
+        private void emitMalformedFrames() throws IOException {
+            byte[] heartbeat = Files.readAllBytes(outputDir.resolve("heartbeat_request.bin"));
+
+            byte[] badMagic = heartbeat.clone();
+            badMagic[0] ^= 0x01;
+            writeRaw("invalid_bad_magic.bin", badMagic);
+
+            byte[] oldVersion = heartbeat.clone();
+            oldVersion[4] = 1;
+            writeRaw("invalid_version_v1.bin", oldVersion);
+
+            byte[] badSerializer = heartbeat.clone();
+            badSerializer[5] = 1;
+            writeRaw("invalid_serializer.bin", badSerializer);
+
+            byte[] unknownCommand = heartbeat.clone();
+            unknownCommand[6] = 99;
+            writeRaw("invalid_unknown_command.bin", unknownCommand);
+
+            writeRaw("invalid_truncated_header.bin", java.util.Arrays.copyOf(heartbeat, 10));
+
+            byte[] truncatedBody = Files.readAllBytes(outputDir.resolve("login_request.bin"));
+            writeRaw("invalid_truncated_body.bin", java.util.Arrays.copyOf(truncatedBody, truncatedBody.length - 1));
+
+            byte[] trailingBody = java.util.Arrays.copyOf(heartbeat, heartbeat.length + 1);
+            trailingBody[trailingBody.length - 1] = 0x2a;
+            writeRaw("invalid_trailing_body.bin", trailingBody);
+
+            byte[] nonEmptyHeartbeat = java.util.Arrays.copyOf(heartbeat, heartbeat.length + 1);
+            nonEmptyHeartbeat[7] = 0;
+            nonEmptyHeartbeat[8] = 0;
+            nonEmptyHeartbeat[9] = 0;
+            nonEmptyHeartbeat[10] = 1;
+            nonEmptyHeartbeat[11] = 0;
+            writeRaw("invalid_heartbeat_body.bin", nonEmptyHeartbeat);
+
+            byte[] oversized = heartbeat.clone();
+            int oversizedBody = 32 * 1024 * 1024;
+            oversized[7] = (byte) (oversizedBody >>> 24);
+            oversized[8] = (byte) (oversizedBody >>> 16);
+            oversized[9] = (byte) (oversizedBody >>> 8);
+            oversized[10] = (byte) oversizedBody;
+            writeRaw("invalid_oversized_length.bin", oversized);
         }
 
         private NatMessagePacket natPacket(NatMessageType type, Map<String, Object> meta, byte[] data) {
+            return natPacket(type, 0, 0, meta, data);
+        }
+
+        private NatMessagePacket natPacket(NatMessageType type, int streamId, long value,
+                                           Map<String, Object> meta, byte[] data) {
             NatMessagePacket packet = new NatMessagePacket();
             packet.setNatMessageType(type);
+            packet.setStreamId(streamId);
+            packet.setValue(value);
             packet.setMetaData(meta);
             packet.setData(data);
             return packet;
@@ -197,18 +232,14 @@ public final class WireFixtureGenerator {
             }
         }
 
+        private void writeRaw(String name, byte[] bytes) throws IOException {
+            Files.write(outputDir.resolve(name), bytes);
+        }
+
         private static Map<String, Object> orderedMap(Object... kvPairs) {
             Map<String, Object> map = new LinkedHashMap<>();
             for (int i = 0; i < kvPairs.length; i += 2) {
                 map.put((String) kvPairs[i], kvPairs[i + 1]);
-            }
-            return map;
-        }
-
-        private static Map<String, String> orderedStringMap(String... kvPairs) {
-            Map<String, String> map = new LinkedHashMap<>();
-            for (int i = 0; i < kvPairs.length; i += 2) {
-                map.put(kvPairs[i], kvPairs[i + 1]);
             }
             return map;
         }

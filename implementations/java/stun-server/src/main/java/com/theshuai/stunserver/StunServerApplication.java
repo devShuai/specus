@@ -75,10 +75,13 @@ public final class StunServerApplication {
                   STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS
                                                      Peer private control-channel IP
                   STUN_DISTRIBUTED_PEER_CONTROL_PORT Peer control port (defaults to local port)
-                  STUN_DISTRIBUTED_SHARED_SECRET     Base64 HMAC-SHA256 secret, at least 32 bytes
+                  STUN_DISTRIBUTED_CURRENT_KEY_ID    Positive signing-key ID
+                  STUN_DISTRIBUTED_CURRENT_SECRET    Base64 HMAC-SHA256 secret, at least 32 bytes
+                  STUN_DISTRIBUTED_PREVIOUS_KEY_ID   Optional previous signing-key ID during rotation
+                  STUN_DISTRIBUTED_PREVIOUS_SECRET   Optional previous Base64 secret during rotation
                   STUN_DISTRIBUTED_MAX_CLOCK_SKEW_SECONDS
                                                      Forward timestamp window (default 30)
-                  STUN_DISTRIBUTED_REPLAY_CACHE_SIZE Forward nonce cache (default 65536)
+                  STUN_DISTRIBUTED_REPLAY_WINDOW_SIZE Per-epoch sequence window (default 4096)
                   STUN_DISTRIBUTED_MAX_FORWARD_PACKET_BYTES
                                                      Private control datagram cap (default 4096)
                   STUN_DISTRIBUTED_FORWARD_RATE_PER_SECOND

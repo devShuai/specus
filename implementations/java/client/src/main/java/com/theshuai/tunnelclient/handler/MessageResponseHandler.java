@@ -4,6 +4,7 @@ import com.theshuai.common.protocol.response.MessageResponsePacket;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.tunnelclient.bean.TunnelBean;
 import com.theshuai.tunnelclient.client.TcpConnection;
+import com.theshuai.tunnelclient.client.NettyClient;
 import com.theshuai.tunnelclient.peer.PeerMeshClient;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -13,18 +14,25 @@ import lombok.extern.slf4j.Slf4j;
 public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageResponsePacket> {
     private final TcpConnection localConnection;
     private final PeerMeshClient peerMeshClient;
+    private final NettyClient nettyClient;
 
     public MessageResponseHandler() {
         this(new TcpConnection());
     }
 
     public MessageResponseHandler(TcpConnection localConnection) {
-        this(localConnection, null);
+        this(localConnection, null, null);
     }
 
     public MessageResponseHandler(TcpConnection localConnection, PeerMeshClient peerMeshClient) {
+        this(localConnection, peerMeshClient, null);
+    }
+
+    public MessageResponseHandler(TcpConnection localConnection, PeerMeshClient peerMeshClient,
+                                  NettyClient nettyClient) {
         this.localConnection = localConnection;
         this.peerMeshClient = peerMeshClient;
+        this.nettyClient = nettyClient;
     }
 
     @Override
@@ -46,6 +54,10 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
 
             case NAT_CONTROL: {
                 TunnelBean tunnelBean = JsonUtil.stringToObject(messageResponsePacket.getMessage(), TunnelBean.class);
+                if (nettyClient != null) {
+                    nettyClient.applyNatControl(tunnelBean);
+                    break;
+                }
                 NatClientHandler natClientHandler = ctx.pipeline().get(NatClientHandler.class);
                 if (natClientHandler == null) {
                     ctx.pipeline().addLast(new NatClientHandler(tunnelBean, localConnection));
@@ -55,13 +67,6 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
                 // HTTP 路由热更新：服务端权威全集（管理态时才下发该字段）。null 表示本次
                 // NAT_CONTROL 不更新 HTTP 路由，此时客户端继续使用 HTTP 登录时拿到的初始快照。
                 if (tunnelBean.getHttpTunnelConfigList() != null) {
-                    DirectHttpRequestHandler directHttp = ctx.pipeline().get(DirectHttpRequestHandler.class);
-                    if (directHttp != null) {
-                        directHttp.applyRoutes(tunnelBean.getHttpTunnelConfigList());
-                    } else {
-                        log.warn("NAT_CONTROL carried httpTunnelConfigList but DirectHttpRequestHandler not in pipeline");
-                    }
-                    // 同步给 NatClientHandler：WS 隧道 CONNECTED 帧到达时按 route 查本地 ws:// 目标
                     NatClientHandler nat = ctx.pipeline().get(NatClientHandler.class);
                     if (nat != null) {
                         nat.applyHttpRoutes(tunnelBean.getHttpTunnelConfigList());

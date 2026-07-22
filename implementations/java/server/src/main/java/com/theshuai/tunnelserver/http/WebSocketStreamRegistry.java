@@ -32,19 +32,36 @@ import java.util.concurrent.ConcurrentHashMap;
 public class WebSocketStreamRegistry {
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, String> sessionClientNames = new ConcurrentHashMap<>();
+    private final Map<Integer, String> streamChannels = new ConcurrentHashMap<>();
 
-    public void register(String channelId, WebSocketSession session, String clientName) {
+    public void register(int streamId, String channelId, WebSocketSession session, String clientName) {
         sessions.put(channelId, session);
         sessionClientNames.put(channelId, clientName);
+        streamChannels.put(streamId, channelId);
     }
 
     public WebSocketSession get(String channelId) {
         return sessions.get(channelId);
     }
 
+    public WebSocketSession getByStreamId(int streamId) {
+        String channelId = streamChannels.get(streamId);
+        return channelId == null ? null : sessions.get(channelId);
+    }
+
+    public String channelIdOf(int streamId) {
+        return streamChannels.get(streamId);
+    }
+
     public WebSocketSession remove(String channelId) {
         sessionClientNames.remove(channelId);
+        streamChannels.entrySet().removeIf(entry -> channelId.equals(entry.getValue()));
         return sessions.remove(channelId);
+    }
+
+    public WebSocketSession removeByStreamId(int streamId) {
+        String channelId = streamChannels.remove(streamId);
+        return channelId == null ? null : remove(channelId);
     }
 
     public String clientNameOf(String channelId) {
@@ -59,6 +76,7 @@ public class WebSocketStreamRegistry {
             if (clientName == null || clientName.equals(boundClient)) {
                 WebSocketSession session = sessions.remove(channelId);
                 sessionClientNames.remove(channelId);
+                streamChannels.entrySet().removeIf(stream -> channelId.equals(stream.getValue()));
                 if (session != null && session.isOpen()) {
                     try {
                         session.close(CloseStatus.GOING_AWAY);

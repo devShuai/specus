@@ -6,9 +6,8 @@ import org.springframework.stereotype.Component;
 /**
  * Type-safe binding for the {@code tunnel.tls.*} block in application.yml.
  *
- * <p>Defaults to {@code disabled} so existing deployments without TLS continue
- * to work until operators opt in by setting {@code tunnel.tls.mode=file} or
- * {@code tunnel.tls.mode=self-signed}.
+ * <p>Defaults to {@code disabled} for local development. Production profiles and deployments
+ * with {@code requireEncryption=true} reject plaintext public listeners at startup.
  */
 @Component
 @ConfigurationProperties(prefix = "tunnel.tls")
@@ -29,6 +28,12 @@ public class TlsProperties {
 
     /** Password for the key inside the keystore; if null, falls back to keystorePassword. */
     private String keyPassword;
+
+    /** Reject a production control listener unless it is encrypted or explicitly behind trusted TLS. */
+    private boolean requireEncryption;
+
+    /** TLS is terminated by a trusted L4 proxy and this process only binds loopback/private address space. */
+    private boolean terminatedUpstream;
 
     public String getMode() {
         return mode;
@@ -60,6 +65,22 @@ public class TlsProperties {
 
     public void setKeyPassword(String keyPassword) {
         this.keyPassword = keyPassword;
+    }
+
+    public boolean isRequireEncryption() {
+        return requireEncryption;
+    }
+
+    public void setRequireEncryption(boolean requireEncryption) {
+        this.requireEncryption = requireEncryption;
+    }
+
+    public boolean isTerminatedUpstream() {
+        return terminatedUpstream;
+    }
+
+    public void setTerminatedUpstream(boolean terminatedUpstream) {
+        this.terminatedUpstream = terminatedUpstream;
     }
 
     public TlsContextFactory.Mode resolveMode() {

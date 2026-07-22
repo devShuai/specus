@@ -4,58 +4,58 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.theshuai.tunnelserver.config.PublicTransferProperties;
-import com.theshuai.tunnelserver.management.service.PublicTransferRoomService;
-import com.theshuai.tunnelserver.management.service.PublicTransferRoomService.RoomAccess;
-import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.server.ServerHttpRequest;
-import org.springframework.http.server.ServletServerHttpRequest;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
+import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
-import org.springframework.web.socket.handler.TextWebSocketHandler;
-import org.springframework.web.socket.server.HandshakeInterceptor;
-import org.springframework.web.util.UriComponentsBuilder;
+import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
 import java.io.IOException;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Component
-public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandler {
+public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHandler {
     private static final Logger log = LoggerFactory.getLogger(PublicTransferDiscoveryWebSocketHandler.class);
     private static final int MAX_MESSAGE_CHARS = 64 * 1024;
     private static final int MAX_DISPLAY_NAME_LENGTH = 120;
     private static final Set<String> VIEWER_WRITE_MESSAGE_TYPES = Set.of("attachment", "clipboard", "whiteboard");
 
     private final PublicTransferProperties properties;
-    private final PublicTransferRoomService roomService;
+    private final PublicTransferCoordinationService coordination;
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final Map<String, Participant> participantsBySession = new ConcurrentHashMap<>();
     private final Map<String, RateWindow> messageWindowsBySession = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> localRosterRevisions = new ConcurrentHashMap<>();
     private final Object participantJoinLock = new Object();
     private final ObjectMapper objectMapper = new ObjectMapper()
             .setSerializationInclusion(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
             .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
 
+    @Autowired
     public PublicTransferDiscoveryWebSocketHandler(PublicTransferProperties properties,
-                                                   PublicTransferRoomService roomService) {
+                                                   PublicTransferCoordinationService coordination) {
         this.properties = properties;
-        this.roomService = roomService;
+        this.coordination = coordination;
+        coordination.addListener(this::handleCoordinationEvent);
+    }
+
+    PublicTransferDiscoveryWebSocketHandler(PublicTransferProperties properties) {
+        this(properties, new PublicTransferCoordinationService(properties));
     }
 
     @Override
@@ -73,31 +73,34 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             closeQuietly(session, CloseStatus.POLICY_VIOLATION);
             return;
         }
-        if (participant.sharedRoom()) {
-            try {
-                RoomAccess roomAccess = roomService.resolve(
-                        participant.roomId(), participant.roomToken(), participant.peerId());
-                participant = participant.withRoomAccess(roomAccess);
-            } catch (RuntimeException exception) {
-                log.debug("public transfer room authorization failed: room={} peer={} error={}",
-                        participant.roomId(), participant.peerId(), exception.toString());
-                send(session, Map.of("type", "error", "error", "room authorization failed"));
-                closeQuietly(session, CloseStatus.POLICY_VIOLATION);
-                return;
-            }
-        }
         String joinError = null;
-        synchronized (participantJoinLock) {
-            if (hasConnectedPeerId(participant)) {
-                joinError = "peer id is already connected";
-            } else if (hasConnectedDisplayName(participant.displayName())) {
-                joinError = "client name is already in use";
-            } else if (roomPeerCount(participant) >= Math.max(1, properties.getMaxDiscoveryPeersPerRoom())) {
-                joinError = "room is full";
-            } else {
-                sessions.add(session);
-                participantsBySession.put(session.getId(), participant);
-                messageWindowsBySession.put(session.getId(), new RateWindow(System.currentTimeMillis()));
+        long rosterRevision = 0;
+        if (coordination.enabled()) {
+            try {
+                PublicTransferCoordinationService.Registration registration = coordination.register(
+                        participant.coordinationParticipant(),
+                        properties.getMaxDiscoveryPeersPerRoom());
+                joinError = registration.error();
+                rosterRevision = registration.revision();
+                if (registration.accepted()) {
+                    addLocalParticipant(session, participant);
+                }
+            } catch (IllegalStateException exception) {
+                log.warn("public transfer cluster registration failed: {}", exception.toString());
+                joinError = "coordination unavailable";
+            }
+        } else {
+            synchronized (participantJoinLock) {
+                if (hasConnectedPeerId(participant)) {
+                    joinError = "peer id is already connected";
+                } else if (hasConnectedDisplayName(participant.displayName())) {
+                    joinError = "client name is already in use";
+                } else if (roomPeerCount(participant) >= Math.max(1, properties.getMaxDiscoveryPeersPerRoom())) {
+                    joinError = "room is full";
+                } else {
+                    addLocalParticipant(session, participant);
+                    rosterRevision = nextLocalRosterRevision(participant.groupId());
+                }
             }
         }
         if (joinError != null) {
@@ -113,9 +116,10 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 "publicAddress", participant.publicAddress(),
                 "sharedRoom", participant.sharedRoom(),
                 "roomRole", participant.roomRole(),
+                "rosterRevision", rosterRevision,
                 "connectedAt", participant.connectedAt()
         ));
-        broadcastRoster(participant);
+        broadcastRoster(participant, rosterRevision);
         log.debug("public transfer discovery joined: peer={} room={} publicAddress={}",
                 participant.peerId(), participant.roomId(), participant.publicAddress());
     }
@@ -131,7 +135,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             closeQuietly(session, CloseStatus.TOO_BIG_TO_PROCESS);
             return;
         }
-        if (!allowMessage(session)) {
+        if (!allowMessage(session, source)) {
             send(session, Map.of("type", "error", "error", "rate limited"));
             closeQuietly(session, CloseStatus.POLICY_VIOLATION);
             return;
@@ -167,12 +171,49 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
     }
 
     @Override
+    protected void handleBinaryMessage(WebSocketSession session, BinaryMessage message) {
+        Participant source = participantsBySession.get(session.getId());
+        if (source == null) {
+            return;
+        }
+        if (!allowMessage(session, source)) {
+            send(session, Map.of("type", "error", "error", "rate limited"));
+            closeQuietly(session, CloseStatus.POLICY_VIOLATION);
+            return;
+        }
+        try {
+            PublicTransferRelayFrame.ClientFrame frame =
+                    PublicTransferRelayFrame.decodeClient(message.getPayload());
+            if ("VIEWER".equals(source.roomRole())
+                    && frame.appType() != PublicTransferRelayFrame.APP_TYPE_ACK) {
+                send(session, Map.of("type", "error", "error", "viewer is read-only"));
+                return;
+            }
+            sendBinaryToPeer(source, frame);
+        } catch (IllegalArgumentException exception) {
+            send(session, Map.of("type", "error", "error", "invalid binary relay frame"));
+            closeQuietly(session, CloseStatus.POLICY_VIOLATION);
+        }
+    }
+
+    @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         sessions.remove(session);
         Participant removed = participantsBySession.remove(session.getId());
         messageWindowsBySession.remove(session.getId());
         if (removed != null) {
-            broadcastRoster(removed);
+            if (coordination.enabled()) {
+                try {
+                    long revision = coordination.unregister(removed.coordinationParticipant());
+                    if (revision > 0) {
+                        coordination.publishRoster(removed.groupId(), revision);
+                    }
+                } catch (IllegalStateException exception) {
+                    log.warn("public transfer cluster unregister failed: {}", exception.toString());
+                }
+            } else {
+                broadcastRoster(removed, nextLocalRosterRevision(removed.groupId()));
+            }
         }
     }
 
@@ -182,7 +223,143 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
                 exception == null ? "null" : exception.toString());
     }
 
+    @Scheduled(fixedDelayString = "${tunnel.public-transfer.presence-refresh-interval-ms:10000}")
+    public void refreshClusterPresence() {
+        if (!coordination.enabled() || participantsBySession.isEmpty()) {
+            return;
+        }
+        Set<String> groups = ConcurrentHashMap.newKeySet();
+        try {
+            for (Map.Entry<String, Participant> entry : List.copyOf(participantsBySession.entrySet())) {
+                Participant participant = entry.getValue();
+                groups.add(participant.groupId());
+                if (!coordination.refresh(participant.coordinationParticipant())) {
+                    WebSocketSession session = sessions.stream()
+                            .filter(candidate -> candidate.getId().equals(entry.getKey()))
+                            .findFirst()
+                            .orElse(null);
+                    if (session != null) {
+                        dropLocal(session, CloseStatus.SERVER_ERROR);
+                    }
+                }
+            }
+            groups.forEach(coordination::sweep);
+        } catch (IllegalStateException exception) {
+            log.warn("public transfer Redis coordination unavailable; closing local discovery sockets: {}",
+                    exception.toString());
+            List.copyOf(sessions).forEach(session -> dropLocal(session, CloseStatus.SERVER_ERROR));
+        }
+    }
+
+    private void handleCoordinationEvent(PublicTransferClusterFrame.Event event) {
+        Participant group = participantsBySession.values().stream()
+                .filter(participant -> participant.groupId().equals(event.groupId()))
+                .findFirst()
+                .orElse(null);
+        if (group == null) {
+            return;
+        }
+        try {
+            switch (event.kind()) {
+                case PublicTransferClusterFrame.KIND_ROSTER -> emitRoster(group, event.revision());
+                case PublicTransferClusterFrame.KIND_TEXT -> {
+                    JsonNode payload = objectMapper.readTree(event.payload());
+                    deliverClusterText(group, event, payload);
+                }
+                case PublicTransferClusterFrame.KIND_BINARY -> deliverClusterBinary(group, event);
+                default -> throw new IllegalArgumentException("unsupported cluster event kind");
+            }
+        } catch (Exception exception) {
+            log.warn("discarding public transfer cluster event: {}", exception.toString());
+        }
+    }
+
+    private void deliverClusterText(Participant group,
+                                    PublicTransferClusterFrame.Event event,
+                                    JsonNode payload) {
+        for (WebSocketSession session : sessions) {
+            Participant target = participantsBySession.get(session.getId());
+            if (target == null || !target.groupId().equals(event.groupId())) {
+                continue;
+            }
+            if (StringUtils.hasText(event.targetPeerId())
+                    && !target.peerId().equals(event.targetPeerId())) {
+                continue;
+            }
+            if (event.excludeSource() && target.leaseId().equals(event.sourceLeaseId())) {
+                continue;
+            }
+            send(session, payload);
+        }
+    }
+
+    private void deliverClusterBinary(Participant group, PublicTransferClusterFrame.Event event) {
+        for (WebSocketSession session : sessions) {
+            Participant target = participantsBySession.get(session.getId());
+            if (target != null
+                    && target.groupId().equals(event.groupId())
+                    && target.peerId().equals(event.targetPeerId())) {
+                sendBinary(session, event.payload());
+                return;
+            }
+        }
+    }
+
+    private void addLocalParticipant(WebSocketSession session, Participant participant) {
+        sessions.add(session);
+        participantsBySession.put(session.getId(), participant);
+        messageWindowsBySession.put(session.getId(), new RateWindow(System.currentTimeMillis()));
+    }
+
+    private void dropLocal(WebSocketSession session, CloseStatus status) {
+        sessions.remove(session);
+        participantsBySession.remove(session.getId());
+        messageWindowsBySession.remove(session.getId());
+        closeQuietly(session, status);
+    }
+
+    private long nextLocalRosterRevision(String groupId) {
+        return localRosterRevisions.computeIfAbsent(groupId, ignored -> new AtomicLong()).incrementAndGet();
+    }
+
+    private byte[] encodeJson(Object payload) {
+        try {
+            return objectMapper.writeValueAsBytes(payload);
+        } catch (IOException exception) {
+            throw new IllegalArgumentException("could not encode discovery message", exception);
+        }
+    }
+
+    private Map<String, Object> participantView(Participant peer) {
+        return participantView(peer.peerId(), peer.displayName(), peer.roomId(), peer.publicAddress(),
+                peer.sharedRoom(), peer.roomRole(), peer.connectedAt());
+    }
+
+    private Map<String, Object> participantView(PublicTransferCoordinationService.Participant peer) {
+        return participantView(peer.peerId(), peer.displayName(), peer.roomId(), peer.publicAddress(),
+                peer.sharedRoom(), peer.roomRole(), peer.connectedAt());
+    }
+
+    private Map<String, Object> participantView(String peerId, String displayName, String roomId,
+                                                String publicAddress, boolean sharedRoom,
+                                                String roomRole, String connectedAt) {
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("peerId", peerId);
+        view.put("displayName", displayName);
+        view.put("roomId", roomId);
+        view.put("publicAddress", publicAddress);
+        view.put("sharedRoom", sharedRoom);
+        view.put("roomRole", roomRole);
+        view.put("connectedAt", connectedAt);
+        return view;
+    }
+
     private void sendToPeer(Participant source, String targetPeerId, Object payload) {
+        if (coordination.enabled()) {
+            coordination.publishText(source.groupId(), targetPeerId, source.leaseId(), false,
+                    encodeJson(payload));
+            return;
+        }
         for (WebSocketSession session : sessions) {
             Participant target = participantsBySession.get(session.getId());
             if (target != null && target.sameGroup(source) && target.peerId().equals(targetPeerId)) {
@@ -192,30 +369,52 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         }
     }
 
-    private void broadcastRoster(Participant group) {
-        List<Map<String, Object>> peers = participantsBySession.values().stream()
-                .filter(peer -> peer.sameGroup(group))
-                .sorted(Comparator.comparing(Participant::connectedAt))
-                .map(peer -> {
-                    Map<String, Object> view = new LinkedHashMap<>();
-                    view.put("peerId", peer.peerId());
-                    view.put("displayName", peer.displayName());
-                    view.put("roomId", peer.roomId());
-                    view.put("publicAddress", peer.publicAddress());
-                    view.put("sharedRoom", peer.sharedRoom());
-                    view.put("roomRole", peer.roomRole());
-                    view.put("connectedAt", peer.connectedAt());
-                    return view;
-                })
-                .toList();
-        Map<String, Object> payload = Map.of(
-                "type", "roster",
-                "roomId", group.roomId(),
-                "publicAddress", group.publicAddress(),
-                "sharedRoom", group.sharedRoom(),
-                "peers", peers
-        );
-        broadcastToGroup(group, payload, false);
+    private void sendBinaryToPeer(Participant source, PublicTransferRelayFrame.ClientFrame frame) {
+        byte[] envelope = PublicTransferRelayFrame.encodeServer(
+                frame.targetPeerId(), source.peerId(), frame.appFrame());
+        if (coordination.enabled()) {
+            coordination.publishBinary(source.groupId(), frame.targetPeerId(), envelope);
+            return;
+        }
+        for (WebSocketSession session : sessions) {
+            Participant target = participantsBySession.get(session.getId());
+            if (target != null && target.sameGroup(source) && target.peerId().equals(frame.targetPeerId())) {
+                sendBinary(session, envelope);
+                return;
+            }
+        }
+    }
+
+    private void broadcastRoster(Participant group, long revision) {
+        if (coordination.enabled()) {
+            coordination.publishRoster(group.groupId(), revision);
+            return;
+        }
+        emitRoster(group, revision);
+    }
+
+    private void emitRoster(Participant group, long eventRevision) {
+        List<Map<String, Object>> peers;
+        long revision = eventRevision;
+        if (coordination.enabled()) {
+            PublicTransferCoordinationService.Roster roster = coordination.roster(group.groupId());
+            revision = roster.revision();
+            peers = roster.participants().stream().map(this::participantView).toList();
+        } else {
+            peers = participantsBySession.values().stream()
+                    .filter(peer -> peer.sameGroup(group))
+                    .sorted(Comparator.comparing(Participant::connectedAt))
+                    .map(this::participantView)
+                    .toList();
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", "roster");
+        payload.put("roomId", group.roomId());
+        payload.put("publicAddress", group.publicAddress());
+        payload.put("sharedRoom", group.sharedRoom());
+        payload.put("rosterRevision", revision);
+        payload.put("peers", peers);
+        broadcastLocal(group, payload, false, "");
     }
 
     private long roomPeerCount(Participant group) {
@@ -238,10 +437,14 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         String clientName = normalizeDisplayName(requestedClientName);
         String excluded = StringUtils.hasText(excludePeerId) ? excludePeerId.trim() : "";
         boolean available;
-        synchronized (participantJoinLock) {
-            available = participantsBySession.values().stream()
-                    .filter(peer -> excluded.isEmpty() || !peer.peerId().equals(excluded))
-                    .noneMatch(peer -> peer.displayName().equalsIgnoreCase(clientName));
+        if (coordination.enabled()) {
+            available = coordination.isClientNameAvailable(clientName, excluded);
+        } else {
+            synchronized (participantJoinLock) {
+                available = participantsBySession.values().stream()
+                        .filter(peer -> excluded.isEmpty() || !peer.peerId().equals(excluded))
+                        .noneMatch(peer -> peer.displayName().equalsIgnoreCase(clientName));
+            }
         }
         return new ClientNameAvailability(clientName, available);
     }
@@ -260,9 +463,22 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         return clientName;
     }
 
-    private boolean allowMessage(WebSocketSession session) {
+    private boolean allowMessage(WebSocketSession session, Participant participant) {
         int limit = Math.max(1, properties.getDiscoveryMessageRateLimitPerConnection());
-        long windowMillis = Math.max(1L, properties.getDiscoveryMessageRateLimitWindowSeconds()) * 1000L;
+        long windowSeconds = Math.max(1L, properties.getDiscoveryMessageRateLimitWindowSeconds());
+        if (coordination.enabled()) {
+            try {
+                return coordination.allowRate(
+                        "discovery-message",
+                        participant.groupId() + "\n" + participant.peerId(),
+                        limit,
+                        windowSeconds);
+            } catch (IllegalStateException exception) {
+                log.warn("public transfer cluster rate limit failed: {}", exception.toString());
+                return false;
+            }
+        }
+        long windowMillis = windowSeconds * 1000L;
         RateWindow window = messageWindowsBySession.computeIfAbsent(
                 session.getId(),
                 ignored -> new RateWindow(System.currentTimeMillis())
@@ -271,10 +487,21 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
     }
 
     private void broadcastToGroup(Participant group, Object payload, boolean excludeSource) {
+        if (coordination.enabled()) {
+            coordination.publishText(group.groupId(), "", group.leaseId(), excludeSource,
+                    encodeJson(payload));
+            return;
+        }
+        broadcastLocal(group, payload, excludeSource, group.leaseId());
+    }
+
+    private void broadcastLocal(Participant group, Object payload, boolean excludeSource,
+                                String sourceLeaseId) {
         List<WebSocketSession> dead = new ArrayList<>();
         for (WebSocketSession session : sessions) {
             Participant peer = participantsBySession.get(session.getId());
-            if (peer == null || !peer.sameGroup(group) || (excludeSource && peer.sessionId().equals(group.sessionId()))) {
+            if (peer == null || !peer.sameGroup(group)
+                    || (excludeSource && peer.leaseId().equals(sourceLeaseId))) {
                 continue;
             }
             if (!send(session, payload)) {
@@ -305,6 +532,21 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
         }
     }
 
+    private boolean sendBinary(WebSocketSession session, byte[] payload) {
+        if (!session.isOpen()) {
+            return false;
+        }
+        try {
+            synchronized (session) {
+                session.sendMessage(new BinaryMessage(payload));
+            }
+            return true;
+        } catch (IOException | IllegalStateException exception) {
+            log.debug("public transfer discovery binary send failed: {}", exception.toString());
+            return false;
+        }
+    }
+
     private void closeQuietly(WebSocketSession session, CloseStatus status) {
         try {
             session.close(status);
@@ -324,12 +566,12 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
 
     private record Participant(
             String sessionId,
+            String leaseId,
             String peerId,
             String displayName,
             String roomId,
             String publicAddress,
             String roomKey,
-            String roomToken,
             String roomRole,
             boolean sharedRoom,
             String connectedAt
@@ -338,42 +580,27 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             Map<String, Object> attrs = session.getAttributes();
             return new Participant(
                     session.getId(),
+                    UUID.randomUUID().toString(),
                     stringAttr(attrs, "peerId", "web-" + UUID.randomUUID().toString().substring(0, 8)),
                     stringAttr(attrs, "displayName", "web"),
                     stringAttr(attrs, "roomId", "nearby"),
                     stringAttr(attrs, "publicAddress", "unknown"),
                     stringAttr(attrs, "roomKey", "public:unknown"),
-                    stringAttr(attrs, "roomToken", ""),
-                    "EDITOR",
+                    stringAttr(attrs, "roomRole", "EDITOR"),
                     Boolean.TRUE.equals(attrs.get("sharedRoom")),
                     Instant.now().toString()
-            );
-        }
-
-        private Participant withRoomAccess(RoomAccess access) {
-            return new Participant(
-                    sessionId,
-                    peerId,
-                    displayName,
-                    roomId,
-                    publicAddress,
-                    "room:" + access.roomId(),
-                    roomToken,
-                    access.role().name(),
-                    sharedRoom,
-                    connectedAt
             );
         }
 
         private Participant withDisplayName(String normalizedDisplayName) {
             return new Participant(
                     sessionId,
+                    leaseId,
                     peerId,
                     normalizedDisplayName,
                     roomId,
                     publicAddress,
                     roomKey,
-                    roomToken,
                     roomRole,
                     sharedRoom,
                     connectedAt
@@ -382,6 +609,23 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
 
         private boolean sameGroup(Participant other) {
             return roomId.equals(other.roomId) && roomKey.equals(other.roomKey);
+        }
+
+        private String groupId() {
+            return PublicTransferCoordinationService.groupId(roomId, roomKey);
+        }
+
+        private PublicTransferCoordinationService.Participant coordinationParticipant() {
+            return new PublicTransferCoordinationService.Participant(
+                    leaseId,
+                    peerId,
+                    displayName,
+                    roomId,
+                    publicAddress,
+                    roomKey,
+                    roomRole,
+                    sharedRoom,
+                    connectedAt);
         }
 
         private static String stringAttr(Map<String, Object> attrs, String key, String fallback) {
@@ -408,105 +652,6 @@ public class PublicTransferDiscoveryWebSocketHandler extends TextWebSocketHandle
             }
             count += 1;
             return count <= limit;
-        }
-    }
-
-    public static final class PublicTransferDiscoveryHandshakeInterceptor implements HandshakeInterceptor {
-        @Override
-        public boolean beforeHandshake(ServerHttpRequest request, org.springframework.http.server.ServerHttpResponse response,
-                                       org.springframework.web.socket.WebSocketHandler wsHandler,
-                                       Map<String, Object> attributes) {
-            Map<String, List<String>> params = UriComponentsBuilder.fromUri(request.getURI())
-                    .build()
-                    .getQueryParams();
-            attributes.put("roomId", query(params, "roomId", "nearby", 120));
-            attributes.put("peerId", query(params, "peerId", "", 120));
-            attributes.put("displayName", query(params, "displayName", "web", MAX_DISPLAY_NAME_LENGTH + 1));
-            String publicAddress = publicAddress(request);
-            String roomToken = query(params, "roomToken", "", 512);
-            boolean sharedRoom = StringUtils.hasText(roomToken);
-            attributes.put("publicAddress", publicAddress);
-            attributes.put("sharedRoom", sharedRoom);
-            attributes.put("roomToken", roomToken);
-            attributes.put("roomKey", sharedRoom ? "token:" + sha256(roomToken) : "public:" + publicAddress);
-            return true;
-        }
-
-        @Override
-        public void afterHandshake(ServerHttpRequest request, org.springframework.http.server.ServerHttpResponse response,
-                                   org.springframework.web.socket.WebSocketHandler wsHandler, Exception exception) {
-            // no-op
-        }
-
-        private static String query(Map<String, List<String>> params, String name, String fallback, int maxLength) {
-            List<String> values = params.get(name);
-            String value = values == null || values.isEmpty() ? fallback : values.get(0);
-            if (!StringUtils.hasText(value)) {
-                return fallback;
-            }
-            String normalized;
-            try {
-                normalized = URLDecoder.decode(value, StandardCharsets.UTF_8).trim();
-            } catch (IllegalArgumentException exception) {
-                return fallback;
-            }
-            if (!StringUtils.hasText(normalized)) {
-                return fallback;
-            }
-            return truncateUtf16WithoutSplittingSurrogate(normalized, maxLength);
-        }
-
-        static String truncateUtf16WithoutSplittingSurrogate(String value, int maxLength) {
-            if (value == null || value.length() <= maxLength) {
-                return value;
-            }
-            int end = Math.max(0, maxLength);
-            if (end > 0
-                    && end < value.length()
-                    && Character.isHighSurrogate(value.charAt(end - 1))
-                    && Character.isLowSurrogate(value.charAt(end))) {
-                end--;
-            }
-            return value.substring(0, end);
-        }
-
-        private static String publicAddress(ServerHttpRequest request) {
-            if (request instanceof ServletServerHttpRequest servletRequest) {
-                HttpServletRequest raw = servletRequest.getServletRequest();
-                // X-Real-IP 由可信反代覆写(nginx: proxy_set_header X-Real-IP $remote_addr),
-                // 客户端无法伪造,优先采信。
-                String realIp = raw.getHeader("X-Real-IP");
-                if (StringUtils.hasText(realIp)) {
-                    return realIp.trim();
-                }
-                // 退而取 X-Forwarded-For 末位:反代用 $proxy_add_x_forwarded_for 追加,
-                // 末段是紧邻的可信来源;取首段会被客户端自带的 XFF 头伪造,借以冒充他人 IP
-                // 加入其 public:<ip> 房间(绕过"附近设备"隔离)。
-                String forwarded = lastForwarded(raw.getHeader("X-Forwarded-For"));
-                if (StringUtils.hasText(forwarded)) {
-                    return forwarded;
-                }
-            }
-            return request.getRemoteAddress() == null
-                    ? "unknown"
-                    : request.getRemoteAddress().getAddress().getHostAddress();
-        }
-
-        private static String lastForwarded(String value) {
-            if (!StringUtils.hasText(value)) {
-                return "";
-            }
-            String[] parts = value.split(",");
-            return parts.length == 0 ? "" : parts[parts.length - 1].trim();
-        }
-
-        private static String sha256(String value) {
-            try {
-                MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                return HexFormat.of().formatHex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
-            } catch (Exception e) {
-                throw new IllegalStateException("failed to hash room token", e);
-            }
         }
     }
 

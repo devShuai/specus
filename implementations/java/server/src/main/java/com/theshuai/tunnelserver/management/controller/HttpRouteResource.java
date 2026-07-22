@@ -14,7 +14,7 @@ import java.util.List;
 
 /**
  * HTTP 路由（{@code httpTunnelConfigList}）管理资源。服务端持久化为权威来源，每次
- * mutation 都会触发 {@code NAT_CONTROL} 全量下发，由客户端 {@code DirectHttpRequestHandler}
+ * mutation 都会触发 {@code NAT_CONTROL} 全量下发，由客户端 {@code NatClientHandler}
  * 热替换内存路由表（无需重启）。
  *
  * <ul>

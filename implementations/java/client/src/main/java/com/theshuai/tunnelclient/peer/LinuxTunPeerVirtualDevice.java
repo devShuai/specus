@@ -194,7 +194,7 @@ final class LinuxTunPeerVirtualDevice implements PeerVirtualDevice {
             }
             int read = read(current, buffer, buffer.length);
             if (read > 0) {
-                outboundHandler.handle(Arrays.copyOf(buffer, read));
+                outboundHandler.handle(buffer, 0, read);
             } else if (running.get()) {
                 log.debug("Peer mesh Linux TUN read returned {}", read);
             }

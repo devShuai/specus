@@ -18,6 +18,6 @@ public interface PeerVirtualDevice extends AutoCloseable {
 
     @FunctionalInterface
     interface PacketHandler {
-        void handle(byte[] packet);
+        void handle(byte[] packet, int offset, int length);
     }
 }
