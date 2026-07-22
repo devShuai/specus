@@ -336,14 +336,14 @@ func (s *Service) Enabled() bool {
 }
 
 func (s *Service) AuthorizeRelayFrame(ctx context.Context, header DataFrameHeader, fromClientID, toClientID, bytes int64) bool {
-	if s == nil || fromClientID <= 0 || toClientID <= 0 || bytes <= 0 {
+	if s == nil || !validRelayPeers(fromClientID, toClientID) || bytes <= 0 {
 		return false
 	}
 	return s.authorizeRelayFrame(ctx, header, fromClientID, toClientID, bytes, true)
 }
 
 func (s *Service) ValidateRelayFrame(ctx context.Context, header DataFrameHeader, fromClientID, toClientID int64) bool {
-	if s == nil || fromClientID <= 0 || toClientID <= 0 {
+	if s == nil || !validRelayPeers(fromClientID, toClientID) {
 		return false
 	}
 	return s.authorizeRelayFrame(ctx, header, fromClientID, toClientID, 0, false)
@@ -366,20 +366,49 @@ func (s *Service) authorizeRelayFrame(ctx context.Context, header DataFrameHeade
 		_ = s.db.UpdatePeerMeshSession(ctx, *item)
 		return false
 	}
-	if item.Status != StatusActive {
-		return false
-	}
-	forward := fromClientID == item.SourceClientID && toClientID == item.TargetClientID
-	reverse := fromClientID == item.TargetClientID && toClientID == item.SourceClientID
-	if !forward && !reverse {
+	if item.Status == StatusClosed {
 		s.removeRelaySession(header.SessionID)
 		return false
+	}
+	if !matchesSessionPeers(*item, fromClientID, toClientID) {
+		s.removeRelaySession(header.SessionID)
+		return false
+	}
+	// 首个通过身份校验的中继业务帧隐式激活 NEGOTIATING 会话。探针在 NEGOTIATING 就放行，
+	// 业务帧却要求 ACTIVE，而 ACTIVE 只能由客户端 path-report 异步写入；客户端探测成功后会
+	// 立即 flush 待发数据，这些帧会先于上报到达并被丢弃，peer 应用消息又没有重传，
+	// 于是表现为"中继已连通但文件发送失败"。会话身份此时已校验完毕，等待状态上报只会制造竞态。
+	if item.Status != StatusActive {
+		item.Status = StatusActive
+		item.PathType = PathRelay
+		item.UpdatedAt = now
+		if err := s.db.UpdatePeerMeshSession(ctx, *item); err != nil {
+			return false
+		}
 	}
 	s.cacheRelayAuthorization(*item, now)
 	if account {
 		s.addPendingRelayBytes(header.SessionID, bytes)
 	}
 	return true
+}
+
+// validRelayPeers allows either both identities to be known (TURN auth enabled) or both to be
+// zero (auth disabled, the caller cannot determine identity). A single zero is a caller bug.
+func validRelayPeers(fromClientID, toClientID int64) bool {
+	return (fromClientID > 0 && toClientID > 0) || (fromClientID == 0 && toClientID == 0)
+}
+
+// matchesSessionPeers mirrors the Java implementation: 0/0 means the caller could not determine
+// the peer identities (TURN auth disabled), which degrades to "session exists and is not closed"
+// instead of rejecting everything and making the relay unusable.
+func matchesSessionPeers(item store.PeerMeshSession, fromClientID, toClientID int64) bool {
+	if fromClientID <= 0 && toClientID <= 0 {
+		return true
+	}
+	forward := fromClientID == item.SourceClientID && toClientID == item.TargetClientID
+	reverse := fromClientID == item.TargetClientID && toClientID == item.SourceClientID
+	return forward || reverse
 }
 
 func (s *Service) AuthorizeRelayProbe(ctx context.Context, probe relayProbe) bool {
@@ -1728,7 +1757,11 @@ func (a relayAuthorization) validAt(now time.Time) bool {
 	return a.active && a.cacheExpiresAt.After(now) && (a.sessionExpiresAt.IsZero() || a.sessionExpiresAt.After(now))
 }
 
+// matches accepts 0/0 as "identity unknown" (TURN auth disabled), consistent with the slow path.
 func (a relayAuthorization) matches(fromClientID, toClientID int64) bool {
+	if fromClientID <= 0 && toClientID <= 0 {
+		return true
+	}
 	forward := fromClientID == a.sourceClientID && toClientID == a.targetClientID
 	reverse := fromClientID == a.targetClientID && toClientID == a.sourceClientID
 	return forward || reverse

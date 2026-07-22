@@ -707,7 +707,11 @@ func TestAuthorizeRelayFrameRejectsExpiredSessionAndClosesIt(t *testing.T) {
 	}
 }
 
-func TestAuthorizeRelayFrameRejectsNegotiatingSession(t *testing.T) {
+func TestAuthorizeRelayFrameActivatesNegotiatingSession(t *testing.T) {
+	// Probes are allowed while NEGOTIATING but business frames used to require ACTIVE, which is
+	// only written by an asynchronous path-report. Clients flush queued data immediately after a
+	// successful probe, so those frames raced ahead of the report and were dropped; peer app
+	// messages have no retransmission, so this showed up as "relay connected but file send fails".
 	ctx := context.Background()
 	db := openPeerMeshTestDB(t)
 	service := newPeerMeshTestService(db)
@@ -720,13 +724,53 @@ func TestAuthorizeRelayFrameRejectsNegotiatingSession(t *testing.T) {
 		SessionID: 9104,
 		Sequence:  7,
 	}, source.ID, target.ID, 512)
-	if allowed {
-		t.Fatalf("AuthorizeRelayFrame negotiating session = true, want false")
+	if !allowed {
+		t.Fatalf("AuthorizeRelayFrame negotiating session = false, want true")
 	}
 
 	stored := getPeerSession(t, db, 9104)
-	if stored.RelayBytes != 0 || stored.LastTrafficAt != nil || stored.Status != StatusNegotiating {
-		t.Fatalf("negotiating session should not mutate traffic/lifecycle: %+v", stored)
+	if stored.Status != StatusActive || stored.PathType != PathRelay {
+		t.Fatalf("first authorized relay frame should activate the session: %+v", stored)
+	}
+}
+
+func TestAuthorizeRelayFrameRejectsClosedSessionAndMismatchedPeers(t *testing.T) {
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := newPeerMeshTestService(db)
+
+	source := insertPeerClient(t, db, 3311, "tenant-a", "alice", "alice-laptop-2")
+	target := insertPeerClient(t, db, 3312, "tenant-a", "alice", "alice-nas-2")
+	insertPeerSession(t, db, 9114, source, target, StatusClosed, time.Now().UTC().Add(time.Hour))
+
+	if service.AuthorizeRelayFrame(ctx, DataFrameHeader{SessionID: 9114, Sequence: 7},
+		source.ID, target.ID, 512) {
+		t.Fatalf("closed session must not be authorized")
+	}
+
+	insertPeerSession(t, db, 9115, source, target, StatusNegotiating, time.Now().UTC().Add(time.Hour))
+	if service.AuthorizeRelayFrame(ctx, DataFrameHeader{SessionID: 9115, Sequence: 7},
+		source.ID, 999999, 512) {
+		t.Fatalf("mismatched peers must not be authorized")
+	}
+	if stored := getPeerSession(t, db, 9115); stored.Status != StatusNegotiating {
+		t.Fatalf("mismatched peers must not activate the session: %+v", stored)
+	}
+}
+
+func TestAuthorizeRelayFrameAllowsUnidentifiedPeersWhenTurnAuthDisabled(t *testing.T) {
+	// With TURN auth disabled the allocation carries no clientID; the caller passes 0/0.
+	// Rejecting that outright would make the relay unusable in that mode.
+	ctx := context.Background()
+	db := openPeerMeshTestDB(t)
+	service := newPeerMeshTestService(db)
+
+	source := insertPeerClient(t, db, 3321, "tenant-a", "alice", "alice-laptop-3")
+	target := insertPeerClient(t, db, 3322, "tenant-a", "alice", "alice-nas-3")
+	insertPeerSession(t, db, 9124, source, target, StatusActive, time.Now().UTC().Add(time.Hour))
+
+	if !service.AuthorizeRelayFrame(ctx, DataFrameHeader{SessionID: 9124, Sequence: 7}, 0, 0, 256) {
+		t.Fatalf("unidentified peers should be authorized when TURN auth is disabled")
 	}
 }
 

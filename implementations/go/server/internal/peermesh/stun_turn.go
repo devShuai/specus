@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/big"
 	"net"
 	"runtime"
@@ -46,6 +47,13 @@ type relayAllocation struct {
 	Relay            *net.UDPConn
 	RelayAddr        *net.UDPAddr
 	ClientID         int64
+	// GeneralRelay marks allocations that forward arbitrary payloads with standard TURN
+	// semantics (public transfer / browser WebRTC) instead of the Peer Mesh specific checks.
+	GeneralRelay     bool
+	RelayedBytes     int64
+	QuotaLogged      bool
+	RateTokens       float64
+	RateRefilledAt   time.Time
 	ExpiresAt        time.Time
 	Closed           bool
 	Permission       map[string]time.Time
@@ -66,9 +74,10 @@ type stunTurnServer struct {
 }
 
 type turnAuth struct {
-	allowed  bool
-	key      []byte
-	clientID int64
+	allowed      bool
+	key          []byte
+	clientID     int64
+	generalRelay bool
 }
 
 func (s *Service) RunStunTurn(ctx context.Context) {
@@ -198,7 +207,15 @@ func (s *stunTurnServer) allocateRequest(ctx context.Context, request stunMessag
 	if !request.requestedUDPTransport() {
 		return s.sendError(s.primary, remote, request, stunAllocateError, 442, "unsupported-transport")
 	}
-	allocation, err := s.allocateForClient(ctx, remote, auth.clientID)
+	if auth.generalRelay {
+		if reason := s.generalRelayQuotaRejection(remote); reason != "" {
+			// Audit: general relay is driven by a public ICE config, quota rejections must be traceable.
+			s.logger.Warn("[peer-mesh][audit] general TURN allocation rejected",
+				"client", remote.String(), "reason", reason)
+			return s.sendError(s.primary, remote, request, stunAllocateError, 486, reason)
+		}
+	}
+	allocation, err := s.allocateForClient(ctx, remote, auth.clientID, auth.generalRelay)
 	if err != nil {
 		return s.sendError(s.primary, remote, request, stunAllocateError, 508, "insufficient-capacity")
 	}
@@ -211,15 +228,16 @@ func (s *stunTurnServer) allocateRequest(ctx context.Context, request stunMessag
 }
 
 func (s *stunTurnServer) allocate(ctx context.Context, remote *net.UDPAddr) (*relayAllocation, error) {
-	return s.allocateForClient(ctx, remote, 0)
+	return s.allocateForClient(ctx, remote, 0, false)
 }
 
-func (s *stunTurnServer) allocateForClient(ctx context.Context, remote *net.UDPAddr, clientID int64) (*relayAllocation, error) {
+func (s *stunTurnServer) allocateForClient(ctx context.Context, remote *net.UDPAddr, clientID int64, generalRelay bool) (*relayAllocation, error) {
 	var stale *relayAllocation
 	s.mu.Lock()
 	if id, ok := s.allocationByEndpoint[endpointKey(remote)]; ok {
 		if existing := s.allocations[id]; existing != nil && !existing.Closed {
-			if time.Now().Before(existing.ExpiresAt) && existing.ClientID == clientID {
+			if time.Now().Before(existing.ExpiresAt) && existing.ClientID == clientID &&
+				existing.GeneralRelay == generalRelay {
 				existing.Client = cloneUDPAddr(remote)
 				existing.ExpiresAt = time.Now().Add(time.Duration(s.service.cfg.AllocationTTLSeconds) * time.Second)
 				s.mu.Unlock()
@@ -247,6 +265,7 @@ func (s *stunTurnServer) allocateForClient(ctx context.Context, remote *net.UDPA
 		Relay:            relay,
 		RelayAddr:        s.advertisedSocketAddress(relay),
 		ClientID:         clientID,
+		GeneralRelay:     generalRelay,
 		ExpiresAt:        time.Now().Add(time.Duration(s.service.cfg.AllocationTTLSeconds) * time.Second),
 		Permission:       make(map[string]time.Time),
 		ChannelsByNumber: make(map[uint16]turnChannelBinding),
@@ -319,12 +338,22 @@ func (s *stunTurnServer) createPermission(request stunMessage, remote *net.UDPAd
 		return s.sendError(s.primary, remote, request, stunCreatePermissionError, 437, "allocation-mismatch")
 	}
 	expires := time.Now().Add(turnPermissionTTL)
-	s.mu.Lock()
+	peers := make([]*net.UDPAddr, 0, 4)
 	for _, attr := range request.all(stunAttrXorPeerAddress) {
 		peer, ok := decodeStunXorAddress(attr.Value, request.TransactionID)
-		if ok {
-			allocation.Permission[permissionKey(peer)] = expires
+		if !ok {
+			continue
 		}
+		if auth.generalRelay && !isRelayableDestination(peer) {
+			s.logger.Warn("[peer-mesh][audit] general TURN permission refused",
+				"client", remote.String(), "peer", peer.String())
+			return s.sendError(s.primary, remote, request, stunCreatePermissionError, 403, "forbidden-peer-address")
+		}
+		peers = append(peers, peer)
+	}
+	s.mu.Lock()
+	for _, peer := range peers {
+		allocation.Permission[permissionKey(peer)] = expires
 	}
 	s.mu.Unlock()
 	response := newStunMessage(stunCreatePermissionSuccess, request.TransactionID, stunAttrSoftwareValue(stunTurnSoftware))
@@ -344,6 +373,12 @@ func (s *stunTurnServer) channelBind(request stunMessage, remote *net.UDPAddr) e
 	peer, okPeer := request.xorPeerAddress()
 	if !okChannel || !okPeer {
 		return s.sendError(s.primary, remote, request, stunChannelBindError, 400, "invalid-channel-bind")
+	}
+	if auth.generalRelay && !isRelayableDestination(peer) {
+		// ChannelBind implicitly creates a permission, so it needs the same destination policy.
+		s.logger.Warn("[peer-mesh][audit] general TURN channel bind refused",
+			"client", remote.String(), "peer", peer.String())
+		return s.sendError(s.primary, remote, request, stunChannelBindError, 403, "forbidden-peer-address")
 	}
 	now := time.Now()
 	binding := turnChannelBinding{Channel: channel, Peer: cloneUDPAddr(peer), ExpiresAt: now.Add(turnChannelTTL)}
@@ -391,7 +426,12 @@ func (s *stunTurnServer) authenticate(request stunMessage, remote *net.UDPAddr, 
 		_ = s.sendTurnAuthError(remote, request, responseType, 401, "bad-message-integrity")
 		return turnAuth{}
 	}
-	return turnAuth{allowed: true, key: key, clientID: credentials.peerMeshClientID(username)}
+	return turnAuth{
+		allowed:      true,
+		key:          key,
+		clientID:     credentials.peerMeshClientID(username),
+		generalRelay: credentials.isGeneralRelaySubject(username),
+	}
 }
 
 func (s *stunTurnServer) sendTurnAuthError(remote *net.UDPAddr, request stunMessage, typ uint16, code int, reason string) error {
@@ -417,6 +457,9 @@ func (s *stunTurnServer) sendIndication(ctx context.Context, indication stunMess
 		return nil
 	}
 	target := s.allocationForRelayEndpoint(peer)
+	if !s.allowGeneralRelayTraffic(allocation, len(payload)) {
+		return nil
+	}
 	if !s.authorizeRelayPayload(ctx, payload, allocation, target, true) {
 		return nil
 	}
@@ -439,6 +482,7 @@ func (s *stunTurnServer) handleChannelData(ctx context.Context, packet []byte, r
 	s.mu.Unlock()
 	target := s.allocationForRelayEndpoint(binding.Peer)
 	if !ok || !binding.ExpiresAt.After(now) || !s.hasPermission(allocation, binding.Peer) ||
+		!s.allowGeneralRelayTraffic(allocation, len(frame.Payload)) ||
 		!s.authorizeRelayPayload(ctx, frame.Payload, allocation, target, true) {
 		return nil
 	}
@@ -446,24 +490,132 @@ func (s *stunTurnServer) handleChannelData(ctx context.Context, packet []byte, r
 	return err
 }
 
+// generalRelayQuotaRejection returns a non-empty reason when the general relay admission quota
+// is exhausted. Callers hold no lock; the counters are read under s.mu.
+func (s *stunTurnServer) generalRelayQuotaRejection(remote *net.UDPAddr) string {
+	cfg := s.service.cfg
+	if cfg.GeneralRelayMaxAllocations <= 0 {
+		return "general-relay-disabled"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	sameAddress := 0
+	existingID := s.allocationByEndpoint[endpointKey(remote)]
+	for id, item := range s.allocations {
+		if item == nil || item.Closed || !item.GeneralRelay || id == existingID {
+			continue
+		}
+		total++
+		if remote != nil && item.Client != nil && item.Client.IP.Equal(remote.IP) {
+			sameAddress++
+		}
+	}
+	if total >= cfg.GeneralRelayMaxAllocations {
+		return "general-relay-allocation-quota"
+	}
+	if cfg.GeneralRelayMaxAllocationsPerAddr > 0 && sameAddress >= cfg.GeneralRelayMaxAllocationsPerAddr {
+		return "general-relay-address-quota"
+	}
+	return ""
+}
+
+// allowGeneralRelayTraffic enforces the per-allocation byte cap and token-bucket rate limit.
+// Peer Mesh allocations are unaffected: their destinations and identities are already pinned.
+func (s *stunTurnServer) allowGeneralRelayTraffic(allocation *relayAllocation, bytes int) bool {
+	if allocation == nil || !allocation.GeneralRelay {
+		return true
+	}
+	cfg := s.service.cfg
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allocation.RelayedBytes += int64(bytes)
+	if cfg.GeneralRelayMaxBytes > 0 && allocation.RelayedBytes > cfg.GeneralRelayMaxBytes {
+		if !allocation.QuotaLogged {
+			allocation.QuotaLogged = true
+			s.logger.Warn("[peer-mesh][audit] general TURN byte quota exhausted",
+				"client", allocation.Client.String(), "bytes", allocation.RelayedBytes)
+		}
+		return false
+	}
+	rate := cfg.GeneralRelayRateBytesPerSecond
+	if rate <= 0 {
+		return true
+	}
+	now := time.Now()
+	if allocation.RateRefilledAt.IsZero() {
+		allocation.RateTokens = float64(rate)
+	} else {
+		elapsed := now.Sub(allocation.RateRefilledAt).Seconds()
+		allocation.RateTokens = math.Min(float64(rate), allocation.RateTokens+elapsed*float64(rate))
+	}
+	allocation.RateRefilledAt = now
+	if allocation.RateTokens < float64(bytes) {
+		return false
+	}
+	allocation.RateTokens -= float64(bytes)
+	return true
+}
+
+// isRelayableDestination restricts general relay destinations to public unicast addresses so
+// the relay cannot be used as a jump host into the server's private network. Peer Mesh mode is
+// exempt: local/private deployments legitimately use loopback and site-local relay addresses.
+func isRelayableDestination(addr *net.UDPAddr) bool {
+	if addr == nil || addr.IP == nil || addr.Port <= 0 {
+		return false
+	}
+	ip := addr.IP
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsPrivate() {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// 100.64.0.0/10 (CGNAT, also the Peer Mesh virtual range)
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return false
+		}
+		return true
+	}
+	// IPv6 ULA fc00::/7
+	return len(ip) == net.IPv6len && ip[0]&0xFE != 0xFC
+}
+
 func (s *stunTurnServer) authorizeRelayPayload(ctx context.Context, payload []byte,
 	source, target *relayAllocation, account bool) bool {
-	if source == nil || target == nil || source.ClientID <= 0 || target.ClientID <= 0 {
+	// General TURN mode (public transfer): the payload is DTLS/SRTP/SCTP or a STUN
+	// connectivity check, none of which can pass the Peer Mesh specific checks. Identity was
+	// verified at Allocate and the destination at CreatePermission/ChannelBind, and the caller
+	// already confirmed the permission, so forward with standard TURN semantics. Outbound the
+	// local allocation is source, inbound it is target.
+	if (source != nil && source.GeneralRelay) || (target != nil && target.GeneralRelay) {
+		return true
+	}
+	if source == nil || target == nil {
 		return false
+	}
+	identified := s.service.turnCredentials != nil && s.service.turnCredentials.authRequired()
+	if identified && (source.ClientID <= 0 || target.ClientID <= 0) {
+		return false
+	}
+	sourceClientID, targetClientID := int64(0), int64(0)
+	if identified {
+		sourceClientID, targetClientID = source.ClientID, target.ClientID
 	}
 	if header, ok := ParseDataFrameHeader(payload); ok {
 		if account {
 			return s.service.AuthorizeRelayFrame(
-				ctx, header, source.ClientID, target.ClientID, int64(len(payload)))
+				ctx, header, sourceClientID, targetClientID, int64(len(payload)))
 		}
-		return s.service.ValidateRelayFrame(ctx, header, source.ClientID, target.ClientID)
+		return s.service.ValidateRelayFrame(ctx, header, sourceClientID, targetClientID)
 	}
 	if len(payload) < 2 || len(payload) > peerProbeMaxBytes || payload[0] != '{' || payload[len(payload)-1] != '}' {
 		return false
 	}
 	var probe relayProbe
-	if err := json.Unmarshal(payload, &probe); err != nil || probe.Magic != peerProbeMagic ||
-		probe.FromClientID != source.ClientID || probe.ToClientID != target.ClientID {
+	if err := json.Unmarshal(payload, &probe); err != nil || probe.Magic != peerProbeMagic {
+		return false
+	}
+	if identified && (probe.FromClientID != sourceClientID || probe.ToClientID != targetClientID) {
 		return false
 	}
 	return s.service.AuthorizeRelayProbe(ctx, probe)
@@ -484,6 +636,9 @@ func (s *stunTurnServer) relayReceiveLoop(ctx context.Context, allocation *relay
 		}
 		payload := append([]byte(nil), buf[:n]...)
 		source := s.allocationForRelayEndpoint(peer)
+		if !s.allowGeneralRelayTraffic(allocation, len(payload)) {
+			continue
+		}
 		if !s.authorizeRelayPayload(ctx, payload, source, allocation, false) {
 			continue
 		}

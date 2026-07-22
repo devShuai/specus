@@ -107,6 +107,17 @@ func (s *turnCredentialService) longTermKey(username, credential string) []byte 
 	return digest[:]
 }
 
+// generalRelaySubjectPrefix marks credentials issued for public transfer (browser WebRTC).
+const generalRelaySubjectPrefix = "public-transfer"
+
+// isGeneralRelaySubject reports whether the credential belongs to the general relay mode.
+// Browser WebRTC relays DTLS/SRTP and cannot pass the Peer Mesh specific checks, so those
+// allocations must be forwarded with standard TURN semantics under their own quotas.
+func (s *turnCredentialService) isGeneralRelaySubject(username string) bool {
+	parts := strings.SplitN(strings.TrimSpace(username), ":", 3)
+	return len(parts) == 3 && strings.HasPrefix(parts[1], generalRelaySubjectPrefix)
+}
+
 func (s *turnCredentialService) peerMeshClientID(username string) int64 {
 	parts := strings.SplitN(strings.TrimSpace(username), ":", 3)
 	if len(parts) != 3 || !strings.HasPrefix(parts[1], "pm-") {

@@ -214,6 +214,14 @@ type PeerMeshConfig struct {
 	TurnRealm                   string   `json:"turnRealm"`
 	TurnSharedSecret            string   `json:"turnSharedSecret"`
 	TurnCredentialTTLSeconds    int64    `json:"turnCredentialTtlSeconds"`
+
+	// General relay quotas. Browser WebRTC relays DTLS/SRTP, which cannot pass the Peer Mesh
+	// specific checks, so those allocations are forwarded with standard TURN semantics and
+	// need their own resource limits. GeneralRelayMaxAllocations <= 0 disables general relay.
+	GeneralRelayMaxAllocations          int   `json:"generalRelayMaxAllocations"`
+	GeneralRelayMaxAllocationsPerAddr   int   `json:"generalRelayMaxAllocationsPerAddress"`
+	GeneralRelayRateBytesPerSecond      int64 `json:"generalRelayRateBytesPerSecond"`
+	GeneralRelayMaxBytes                int64 `json:"generalRelayMaxBytes"`
 }
 
 // ObjectStorageConfig mirrors tunnel.object-storage. Attachments are uploaded directly
@@ -361,6 +369,11 @@ func Default() Config {
 			TurnAuthRequired:            true,
 			TurnRealm:                   "shuai-tunnel",
 			TurnCredentialTTLSeconds:    3600,
+
+			GeneralRelayMaxAllocations:        256,
+			GeneralRelayMaxAllocationsPerAddr: 4,
+			GeneralRelayRateBytesPerSecond:    2 * 1024 * 1024,
+			GeneralRelayMaxBytes:              512 * 1024 * 1024,
 		},
 		ObjectStorage: ObjectStorageConfig{
 			Provider:                         "disabled",
@@ -582,6 +595,10 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("TUNNEL_PEER_MESH_TURN_REALM", &cfg.PeerMesh.TurnRealm)
 	setStr("TUNNEL_PEER_MESH_TURN_SHARED_SECRET", &cfg.PeerMesh.TurnSharedSecret)
 	setInt64("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", &cfg.PeerMesh.TurnCredentialTTLSeconds)
+	setInt("TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", &cfg.PeerMesh.GeneralRelayMaxAllocations)
+	setInt("TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS", &cfg.PeerMesh.GeneralRelayMaxAllocationsPerAddr)
+	setInt64("TUNNEL_PEER_MESH_GENERAL_RELAY_RATE_BYTES_PER_SECOND", &cfg.PeerMesh.GeneralRelayRateBytesPerSecond)
+	setInt64("TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_BYTES", &cfg.PeerMesh.GeneralRelayMaxBytes)
 
 	setStr("TUNNEL_OBJECT_STORAGE_PROVIDER", &cfg.ObjectStorage.Provider)
 	setStr("TUNNEL_OBJECT_STORAGE_ENDPOINT", &cfg.ObjectStorage.Endpoint)

@@ -356,3 +356,29 @@ func testPeerDataFrame(sessionID, fromClientID, toClientID int64) []byte {
 	binary.BigEndian.PutUint64(frame[12:20], 1)
 	return frame
 }
+
+func TestGeneralRelayDestinationPolicy(t *testing.T) {
+	// General relay destinations come straight from the browser, so anything pointing back into
+	// the server's own network must be refused.
+	allowed := []string{"203.0.113.10", "2001:db8::10"}
+	for _, host := range allowed {
+		addr := &net.UDPAddr{IP: net.ParseIP(host), Port: 50000}
+		if !isRelayableDestination(addr) {
+			t.Fatalf("isRelayableDestination(%s) = false, want true", host)
+		}
+	}
+	refused := []string{"127.0.0.1", "0.0.0.0", "192.168.1.10", "10.0.0.5",
+		"169.254.1.10", "239.1.1.1", "100.96.0.2", "fd00::1"}
+	for _, host := range refused {
+		addr := &net.UDPAddr{IP: net.ParseIP(host), Port: 50000}
+		if isRelayableDestination(addr) {
+			t.Fatalf("isRelayableDestination(%s) = true, want false", host)
+		}
+	}
+	if isRelayableDestination(&net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 0}) {
+		t.Fatalf("zero port must be refused")
+	}
+	if isRelayableDestination(nil) {
+		t.Fatalf("nil address must be refused")
+	}
+}
