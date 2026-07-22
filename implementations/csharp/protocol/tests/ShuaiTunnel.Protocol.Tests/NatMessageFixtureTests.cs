@@ -36,11 +36,12 @@ public class NatMessageFixtureTests
     }
 
     [Fact]
-    public void Connected_Roundtrips()
+    public void Open_Roundtrips()
     {
-        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_connected.bin", p =>
+        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_open.bin", p =>
         {
-            Assert.Equal(NatMessageType.Connected, p.NatMessageType);
+            Assert.Equal(NatMessageType.Open, p.NatMessageType);
+            Assert.Equal(1U, p.StreamId);
             Assert.Equal("00010203-aaaa-bbbb-cccc-ddddeeeeffff", (string?)p.MetaData!["channelId"]);
             Assert.Equal(18080L, (long?)p.MetaData!["port"]);
             Assert.Null(p.Data);
@@ -48,12 +49,37 @@ public class NatMessageFixtureTests
     }
 
     [Fact]
-    public void Disconnected_Roundtrips()
+    public void Fin_Roundtrips()
     {
-        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_disconnected.bin", p =>
+        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_fin.bin", p =>
         {
-            Assert.Equal(NatMessageType.Disconnected, p.NatMessageType);
-            Assert.Equal("00010203-aaaa-bbbb-cccc-ddddeeeeffff", (string?)p.MetaData!["channelId"]);
+            Assert.Equal(NatMessageType.Fin, p.NatMessageType);
+            Assert.Equal(1U, p.StreamId);
+            Assert.Empty(p.MetaData!);
+        });
+    }
+
+    [Fact]
+    public void Rst_Roundtrips()
+    {
+        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_rst.bin", p =>
+        {
+            Assert.Equal(NatMessageType.Rst, p.NatMessageType);
+            Assert.Equal(1U, p.StreamId);
+            Assert.Equal(7U, p.Value);
+            Assert.Equal("upstream reset", (string?)p.MetaData!["reason"]);
+        });
+    }
+
+    [Fact]
+    public void WindowUpdate_Roundtrips()
+    {
+        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_window_update.bin", p =>
+        {
+            Assert.Equal(NatMessageType.WindowUpdate, p.NatMessageType);
+            Assert.Equal(1U, p.StreamId);
+            Assert.Equal(65536U, p.Value);
+            Assert.Empty(p.MetaData!);
         });
     }
 
@@ -85,31 +111,23 @@ public class NatMessageFixtureTests
         Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_data_small.bin", p =>
         {
             Assert.Equal(NatMessageType.Data, p.NatMessageType);
-            Assert.Equal("00010203-aaaa-bbbb-cccc-ddddeeeeffff", (string?)p.MetaData!["channelId"]);
+            Assert.Equal(1U, p.StreamId);
+            Assert.Empty(p.MetaData!);
             Assert.NotNull(p.Data);
             Assert.Equal("hello", System.Text.Encoding.UTF8.GetString(p.Data!));
         });
     }
 
-    /// <summary>
-    /// Decode-only check for the deflated DATA path. .NET's <c>DeflateStream</c> and Java's
-    /// <c>Deflater</c> with <c>BEST_COMPRESSION</c> emit slightly different byte sequences for
-    /// the same input, so byte equality on the encoded form would be brittle. The contract is
-    /// that the inflated payload is identical, which is what we assert here.
-    /// </summary>
     [Fact]
-    public void Data_Large_DeflatedFromJava_DecodesCorrectly()
+    public void Data_Large_RawFromJava_Roundtrips()
     {
-        var bytes = Fixtures.Read("nat_data_large_deflated.bin");
-        Assert.True(PacketCodec.TryDecode(bytes, out var decoded, out _));
-        var packet = Assert.IsType<NatMessagePacket>(decoded);
-        Assert.Equal(NatMessageType.Data, packet.NatMessageType);
-        Assert.NotNull(packet.Data);
-        Assert.Equal(256, packet.Data!.Length);
-        foreach (var b in packet.Data!)
+        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("nat_data_large.bin", packet =>
         {
-            Assert.Equal((byte)'A', b);
-        }
+            Assert.Equal(NatMessageType.Data, packet.NatMessageType);
+            Assert.NotNull(packet.Data);
+            Assert.Equal(256, packet.Data!.Length);
+            Assert.All(packet.Data, value => Assert.Equal((byte)'A', value));
+        });
     }
 
     [Fact]
@@ -120,10 +138,7 @@ public class NatMessageFixtureTests
         var packet = new NatMessagePacket
         {
             NatMessageType = NatMessageType.Data,
-            MetaData = new Dictionary<string, object?>
-            {
-                ["channelId"] = "00010203-aaaa-bbbb-cccc-ddddeeeeffff",
-            },
+            StreamId = 1,
             Data = payload,
         };
 
@@ -132,5 +147,27 @@ public class NatMessageFixtureTests
         Assert.Equal(encoded.Length, consumed);
         var roundtrip = Assert.IsType<NatMessagePacket>(decoded);
         Assert.Equal(payload, roundtrip.Data);
+    }
+
+    [Fact]
+    public void HttpStream_ResponseHeadAndTrailers_RoundtripAcrossLanguages()
+    {
+        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("http_stream_response_open.bin", packet =>
+        {
+            Assert.Equal(NatMessageType.Open, packet.NatMessageType);
+            Assert.Equal(101U, packet.StreamId);
+            Assert.Equal("http", packet.MetaData!["source"]);
+            Assert.Equal("response", packet.MetaData["phase"]);
+            Assert.Equal(200L, packet.MetaData["statusCode"]);
+            var names = Assert.IsAssignableFrom<IEnumerable<object?>>(packet.MetaData["trailerNames"]);
+            Assert.Equal("Digest", Assert.Single(names));
+        });
+
+        Fixtures.DecodeAndAssertRoundtrip<NatMessagePacket>("http_stream_response_fin.bin", packet =>
+        {
+            Assert.Equal(NatMessageType.Fin, packet.NatMessageType);
+            var trailers = Assert.IsAssignableFrom<IEnumerable<object?>>(packet.MetaData!["trailers"]);
+            Assert.Equal("Digest:sha-256=fixture", Assert.Single(trailers));
+        });
     }
 }

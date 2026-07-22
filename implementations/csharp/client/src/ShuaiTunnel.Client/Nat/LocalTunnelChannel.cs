@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Client.Control;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
+using ShuaiTunnel.Protocol.Flow;
 
 namespace ShuaiTunnel.Client.Nat;
 
@@ -22,12 +23,15 @@ internal sealed class LocalTunnelChannel : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly Action<LocalTunnelChannel> _onClosed;
     private readonly CancellationTokenSource _cts = new();
+    private readonly StreamSendWindow _sendWindow = new();
 
     public string ChannelId { get; }
+    public uint StreamId { get; }
     public int Port { get; }
     private readonly ManualResetEventSlim _writableGate = new(initialState: true);
 
     public LocalTunnelChannel(
+        uint streamId,
         string channelId,
         int port,
         TcpClient tcp,
@@ -35,6 +39,7 @@ internal sealed class LocalTunnelChannel : IAsyncDisposable
         ILogger logger,
         Action<LocalTunnelChannel> onClosed)
     {
+        StreamId = streamId;
         ChannelId = channelId;
         Port = port;
         _tcp = tcp;
@@ -79,10 +84,14 @@ internal sealed class LocalTunnelChannel : IAsyncDisposable
                 }
                 var payload = new byte[read];
                 Buffer.BlockCopy(buffer, 0, payload, 0, read);
+                if (!await _sendWindow.ConsumeAsync(payload.Length, token).ConfigureAwait(false))
+                {
+                    break;
+                }
                 var packet = new NatMessagePacket
                 {
                     NatMessageType = NatMessageType.Data,
-                    MetaData = new Dictionary<string, object?> { ["channelId"] = ChannelId },
+                    StreamId = StreamId,
                     Data = payload,
                 };
                 try
@@ -122,11 +131,14 @@ internal sealed class LocalTunnelChannel : IAsyncDisposable
 
     public void Close()
     {
+        _sendWindow.Close();
         try { _cts.Cancel(); }
         catch (ObjectDisposedException) { }
         try { _tcp.Close(); }
         catch { /* best effort */ }
     }
+
+    public bool AddSendCredit(uint credit) => _sendWindow.Add(credit);
 
     public async ValueTask DisposeAsync()
     {

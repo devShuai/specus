@@ -10,7 +10,7 @@ namespace ShuaiTunnel.Protocol.Packets;
 /// </summary>
 public abstract class Packet
 {
-    public byte Version { get; set; } = 1;
+    public byte Version { get; set; } = Codec.PacketCodec.ProtocolVersion;
 
     public abstract sbyte Command { get; }
 }

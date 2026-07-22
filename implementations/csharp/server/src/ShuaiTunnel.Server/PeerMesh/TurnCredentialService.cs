@@ -64,6 +64,17 @@ public sealed class TurnCredentialService
     public byte[] LongTermKey(string username, string credential) =>
         MD5.HashData(Encoding.UTF8.GetBytes($"{username}:{Realm}:{credential}"));
 
+    public long PeerMeshClientId(string? username)
+    {
+        var parts = username?.Trim().Split(':', 3);
+        return parts is { Length: 3 }
+            && parts[1].StartsWith("pm-", StringComparison.Ordinal)
+            && long.TryParse(parts[1].AsSpan(3), out var clientId)
+            && clientId > 0
+                ? clientId
+                : 0;
+    }
+
     private byte[] Secret() => string.IsNullOrWhiteSpace(_options.TurnSharedSecret)
         ? _runtimeSecret
         : Encoding.UTF8.GetBytes(_options.TurnSharedSecret.Trim());

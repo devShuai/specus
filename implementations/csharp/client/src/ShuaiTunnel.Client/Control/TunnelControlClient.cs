@@ -243,7 +243,94 @@ public sealed class TunnelControlClient : IAsyncDisposable
         PublishStatus("HTTP_LOGIN_OK", "HTTP 登录成功，准备建立控制连接", running: true, controlConnected: false, loggedIn: false);
         PublishRoutes(runtime.TunnelConfigList, runtime.HttpTunnelConfigList);
 
-        using var tcp = new TcpClient { NoDelay = true };
+        _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var sessionCts = _sessionCts;
+        var session = sessionCts.Token;
+        try
+        {
+        using var controlTcp = await ConnectAsync(runtime, ConnectionRole.Control, session).ConfigureAwait(false);
+        await using var controlStream = controlTcp.GetStream();
+        await using var controlWriter = new FrameWriter(controlStream);
+        var controlReader = PipeReader.Create(controlStream);
+        await using var controlWatchdog = CreateWatchdog(controlWriter, ConnectionRole.Control, session);
+
+        await SendLoginAsync(controlWriter, ConnectionRole.Control, session).ConfigureAwait(false);
+        var controlLogin = await ReadLoginResponseAsync(controlReader, controlWatchdog, session).ConfigureAwait(false);
+        EnsureLoginSucceeded(controlLogin, ConnectionRole.Control);
+        _activeWriter = controlWriter;
+        await _peerMesh.StartAsync(runtime, controlWriter, session).ConfigureAwait(false);
+
+        using var dataTcp = await ConnectAsync(runtime, ConnectionRole.Data, session).ConfigureAwait(false);
+        await using var dataStream = dataTcp.GetStream();
+        await using var dataWriter = new FrameWriter(dataStream);
+        var dataReader = PipeReader.Create(dataStream);
+        await using var dataWatchdog = CreateWatchdog(dataWriter, ConnectionRole.Data, session);
+        var directHttp = new DirectHttpHandler(
+            runtime.HttpTunnelConfigList, dataWriter, _httpForwarder, _loggerFactory.CreateLogger<DirectHttpHandler>());
+        await using var nat = new NatClientHandler(
+            runtime.TunnelConfigList, runtime.ClientName,
+            dataWriter, directHttp, _loggerFactory.CreateLogger<NatClientHandler>());
+        nat.Bind(session);
+        dataWriter.WritabilityChanged += writable => nat.SetControlWritable(writable);
+
+        await SendLoginAsync(dataWriter, ConnectionRole.Data, session).ConfigureAwait(false);
+        var dataLogin = await ReadLoginResponseAsync(dataReader, dataWatchdog, session).ConfigureAwait(false);
+        EnsureLoginSucceeded(dataLogin, ConnectionRole.Data);
+        await nat.RegisterAllAsync().ConfigureAwait(false);
+        _backoffAttempts = 0;
+        _loggedIn = true;
+        PublishStatus("RUNNING", $"控制与数据通道登录成功：{controlLogin.ClientName}",
+            running: true, controlConnected: true, loggedIn: true);
+
+        var refreshLoop = RefreshRuntimeLoopAsync(controlWriter, nat, directHttp, session);
+        var controlLoop = ReadControlLoopAsync(controlReader, controlWatchdog, controlWriter, nat, directHttp, session);
+        var dataLoop = ReadDataLoopAsync(dataReader, dataWatchdog, nat, session);
+        try
+        {
+            var completed = await Task.WhenAny(controlLoop, dataLoop).ConfigureAwait(false);
+            await completed.ConfigureAwait(false);
+        }
+        finally
+        {
+            sessionCts.Cancel();
+            try
+            {
+                await refreshLoop.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            try
+            {
+                await Task.WhenAll(controlLoop, dataLoop).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch
+            {
+                // The first loop failure is already propagated by the try block.
+            }
+            await controlReader.CompleteAsync().ConfigureAwait(false);
+            await dataReader.CompleteAsync().ConfigureAwait(false);
+        }
+        }
+        finally
+        {
+            _activeWriter = null;
+            _loggedIn = false;
+            sessionCts.Cancel();
+            await _peerMesh.DisposeAsync().ConfigureAwait(false);
+            PublishStatus("SESSION_CLOSED", "控制会话已关闭", running: true, controlConnected: false, loggedIn: false);
+            sessionCts.Dispose();
+            _sessionCts = null;
+        }
+    }
+
+    private async Task<TcpClient> ConnectAsync(
+        TunnelRuntimeState runtime, string role, CancellationToken cancellationToken)
+    {
+        var tcp = new TcpClient { NoDelay = true };
         tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
         using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connectCts.CancelAfter(ConnectTimeoutMs);
@@ -254,76 +341,64 @@ public sealed class TunnelControlClient : IAsyncDisposable
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            tcp.Dispose();
             throw new TimeoutException(
-                $"connect to {runtime.NettyHost}:{runtime.NettyPort} timed out after {ConnectTimeoutMs} ms");
+                $"connect {role} to {runtime.NettyHost}:{runtime.NettyPort} timed out after {ConnectTimeoutMs} ms");
         }
-        _logger.LogInformation("connected to {addr}:{port}", runtime.NettyHost, runtime.NettyPort);
-        PublishStatus("CONTROL_CONNECTED", $"已连接控制端 {runtime.NettyHost}:{runtime.NettyPort}", running: true, controlConnected: true, loggedIn: false);
-
-        await using var stream = tcp.GetStream();
-        await using var writer = new FrameWriter(stream);
-        _activeWriter = writer;
-        _loggedIn = false;
-        _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var sessionCts = _sessionCts;
-        var session = sessionCts.Token;
-
-        var directHttp = new DirectHttpHandler(
-            runtime.HttpTunnelConfigList, writer, _httpForwarder, _loggerFactory.CreateLogger<DirectHttpHandler>());
-        var nat = new NatClientHandler(
-            runtime.TunnelConfigList, runtime.ClientName,
-            writer, directHttp, _loggerFactory.CreateLogger<NatClientHandler>());
-        nat.Bind(session);
-        writer.WritabilityChanged += writable => nat.SetControlWritable(writable);
-
-        await using var watchdog = new HeartbeatWatchdog(writer, _logger, reason =>
+        catch
         {
-            _logger.LogWarning("control channel closing: {reason}", reason);
+            tcp.Dispose();
+            throw;
+        }
+        _logger.LogInformation("{role} connection established to {addr}:{port}",
+            role, runtime.NettyHost, runtime.NettyPort);
+        if (role == ConnectionRole.Control)
+        {
+            PublishStatus("CONTROL_CONNECTED", $"已连接控制端 {runtime.NettyHost}:{runtime.NettyPort}",
+                running: true, controlConnected: true, loggedIn: false);
+        }
+        return tcp;
+    }
+
+    private HeartbeatWatchdog CreateWatchdog(
+        FrameWriter writer, string role, CancellationToken cancellationToken)
+    {
+        var watchdog = new HeartbeatWatchdog(writer, _logger, reason =>
+        {
+            _logger.LogWarning("{role} channel closing: {reason}", role, reason);
             _sessionCts?.Cancel();
         });
-        watchdog.Start(session);
+        watchdog.Start(cancellationToken);
+        return watchdog;
+    }
 
-        await SendLoginAsync(writer, session).ConfigureAwait(false);
-        var refreshLoop = RefreshRuntimeLoopAsync(writer, nat, directHttp, session);
-
-        var reader = PipeReader.Create(stream);
-        try
+    private static async Task<LoginResponsePacket> ReadLoginResponseAsync(
+        PipeReader reader, HeartbeatWatchdog watchdog, CancellationToken cancellationToken)
+    {
+        var packet = await FrameReader.ReadFrameAsync(reader, PacketCodec.PreAuthMaxFrameSize, cancellationToken)
+            .ConfigureAwait(false);
+        if (packet is not LoginResponsePacket response)
         {
-            while (!session.IsCancellationRequested)
-            {
-                var packet = await FrameReader.ReadFrameAsync(reader, MaxFrameSize, session)
-                    .ConfigureAwait(false);
-                if (packet is null)
-                {
-                    _logger.LogInformation("server closed control connection");
-                    break;
-                }
-                watchdog.MarkRead();
-                await DispatchAsync(packet, writer, nat, directHttp, session).ConfigureAwait(false);
-            }
+            throw new InvalidDataException("only LOGIN_RESPONSE is allowed before authentication");
         }
-        finally
+        watchdog.MarkRead();
+        return response;
+    }
+
+    private static void EnsureLoginSucceeded(LoginResponsePacket response, string role)
+    {
+        if (!response.Success)
         {
-            _activeWriter = null;
-            _loggedIn = false;
-            sessionCts.Cancel();
-            try
-            {
-                await refreshLoop.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            await reader.CompleteAsync().ConfigureAwait(false);
-            await nat.DisposeAsync().ConfigureAwait(false);
-            await _peerMesh.DisposeAsync().ConfigureAwait(false);
-            PublishStatus("SESSION_CLOSED", "控制会话已关闭", running: true, controlConnected: false, loggedIn: false);
-            sessionCts.Dispose();
-            _sessionCts = null;
+            throw ControlLoginRejectedException.FromReason(response.Reason);
+        }
+        if (string.IsNullOrWhiteSpace(response.ClientName))
+        {
+            throw new InvalidDataException($"{role} login response omitted client name");
         }
     }
 
-    private async Task SendLoginAsync(FrameWriter writer, CancellationToken cancellationToken)
+    private async Task SendLoginAsync(FrameWriter writer, string connectionRole,
+        CancellationToken cancellationToken)
     {
         var runtime = _runtime ?? throw new InvalidOperationException("client runtime is not initialized");
         var packet = new LoginRequestPacket
@@ -331,10 +406,11 @@ public sealed class TunnelControlClient : IAsyncDisposable
             ClientName = runtime.ClientName,
             ClientSessionId = runtime.ClientSessionId,
             AccessToken = runtime.AccessToken,
+            ConnectionRole = connectionRole,
         };
         await writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
-        _logger.LogDebug("sent login request for {client}, session={session}",
-            runtime.ClientName, runtime.ClientSessionId);
+        _logger.LogDebug("sent {role} login request for {client}, session={session}",
+            connectionRole, runtime.ClientName, runtime.ClientSessionId);
     }
 
     private async Task RefreshRuntimeLoopAsync(
@@ -392,7 +468,6 @@ public sealed class TunnelControlClient : IAsyncDisposable
             await nat.ApplyConfigAsync(refreshed.TunnelConfigList).ConfigureAwait(false);
             directHttp.ApplyRoutes(refreshed.HttpTunnelConfigList);
             PublishRoutes(refreshed.TunnelConfigList, refreshed.HttpTunnelConfigList);
-            await nat.ReportHttpRoutesAsync(force: true).ConfigureAwait(false);
             await _peerMesh.StartAsync(refreshed, writer, cancellationToken).ConfigureAwait(false);
             _logger.LogInformation("客户端访问令牌刷新成功: client={client}, session={session}",
                 refreshed.ClientName, refreshed.ClientSessionId);
@@ -426,29 +501,56 @@ public sealed class TunnelControlClient : IAsyncDisposable
         return tenth > TokenRefreshMaxLead ? TokenRefreshMaxLead : tenth;
     }
 
-    private async Task DispatchAsync(
+    private async Task ReadControlLoopAsync(
+        PipeReader reader, HeartbeatWatchdog watchdog, FrameWriter writer,
+        NatClientHandler nat, DirectHttpHandler directHttp, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var packet = await FrameReader.ReadFrameAsync(reader, MaxFrameSize, cancellationToken)
+                .ConfigureAwait(false)
+                ?? throw new IOException("server closed control connection");
+            watchdog.MarkRead();
+            await DispatchControlAsync(packet, writer, nat, directHttp, cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private async Task ReadDataLoopAsync(
+        PipeReader reader, HeartbeatWatchdog watchdog, NatClientHandler nat,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var packet = await FrameReader.ReadFrameAsync(reader, MaxFrameSize, cancellationToken)
+                .ConfigureAwait(false)
+                ?? throw new IOException("server closed data connection");
+            watchdog.MarkRead();
+            switch (packet)
+            {
+                case NatMessagePacket natMessage:
+                    await nat.HandleAsync(natMessage).ConfigureAwait(false);
+                    break;
+                case HeartbeatResponsePacket:
+                case HeartbeatRequestPacket:
+                    break;
+                case LogoutRequestPacket:
+                    throw new IOException("server requested data connection logout");
+                default:
+                    throw new InvalidDataException(
+                        $"packet {packet.Command} is not allowed on the data connection");
+            }
+        }
+    }
+
+    private async Task DispatchControlAsync(
         Packet packet, FrameWriter writer, NatClientHandler nat,
         DirectHttpHandler directHttp, CancellationToken cancellationToken)
     {
         switch (packet)
         {
             case LoginResponsePacket response:
-                if (response.Success)
-                {
-                    _logger.LogInformation("[{client}] 登录成功", response.ClientName);
-                    _backoffAttempts = 0;
-                    _loggedIn = true;
-                    PublishStatus("RUNNING", $"控制通道登录成功：{response.ClientName}", running: true, controlConnected: true, loggedIn: true);
-                    await nat.RegisterAllAsync().ConfigureAwait(false);
-                    await nat.ReportHttpRoutesAsync().ConfigureAwait(false);
-                    await _peerMesh.StartAsync(_runtime ?? throw new InvalidOperationException("runtime missing"), writer, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    throw ControlLoginRejectedException.FromReason(response.Reason);
-                }
-                break;
+                throw new InvalidDataException("duplicate LOGIN_RESPONSE on authenticated control connection");
 
             case HeartbeatResponsePacket:
             case HeartbeatRequestPacket:
@@ -468,12 +570,8 @@ public sealed class TunnelControlClient : IAsyncDisposable
                 break;
 
             case NatMessagePacket natMessage:
-                await nat.HandleAsync(natMessage).ConfigureAwait(false);
-                break;
-
-            case DirectHttpRequestPacket http:
-                directHttp.Dispatch(http, cancellationToken);
-                break;
+                throw new InvalidDataException(
+                    $"NAT packet {natMessage.NatMessageType} received on control connection");
 
             case LogoutRequestPacket:
                 _logger.LogInformation("收到服务端 logout 指令, 关闭控制连接");

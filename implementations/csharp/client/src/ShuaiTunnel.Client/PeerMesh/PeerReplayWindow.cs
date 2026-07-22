@@ -2,8 +2,10 @@ namespace ShuaiTunnel.Client.PeerMesh;
 
 internal sealed class PeerReplayWindow
 {
+    internal const int WindowSize = 4096;
+    private const int WindowMask = WindowSize - 1;
+    private readonly ulong[] _sequences = new ulong[WindowSize];
     private ulong _highest;
-    private ulong _bits;
 
     public bool Accept(long sequence)
     {
@@ -12,30 +14,20 @@ internal sealed class PeerReplayWindow
             return false;
         }
         var value = (ulong)sequence;
-        if (_highest == 0)
+        if (_highest >= WindowSize && value <= _highest - WindowSize)
         {
-            _highest = value;
-            _bits = 1;
-            return true;
+            return false;
         }
+        var slot = (int)value & WindowMask;
+        if (_sequences[slot] == value)
+        {
+            return false;
+        }
+        _sequences[slot] = value;
         if (value > _highest)
         {
-            var shift = value - _highest;
-            _bits = shift >= 64 ? 1 : (_bits << (int)shift) | 1;
             _highest = value;
-            return true;
         }
-        var offset = _highest - value;
-        if (offset >= 64)
-        {
-            return false;
-        }
-        var mask = 1UL << (int)offset;
-        if ((_bits & mask) != 0)
-        {
-            return false;
-        }
-        _bits |= mask;
         return true;
     }
 }

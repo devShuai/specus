@@ -16,7 +16,8 @@ namespace ShuaiTunnel.Server.Sessions;
 /// </summary>
 public sealed class SessionRegistry
 {
-    private readonly ConcurrentDictionary<string, TunnelConnectionContext> _byName = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, TunnelConnectionContext> _controls = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, TunnelConnectionContext> _data = new(StringComparer.Ordinal);
     private readonly ILogger<SessionRegistry> _logger;
 
     public SessionRegistry(ILogger<SessionRegistry> logger)
@@ -25,7 +26,10 @@ public sealed class SessionRegistry
     }
 
     public TunnelConnectionContext? Find(string clientName) =>
-        _byName.TryGetValue(clientName, out var context) ? context : null;
+        _controls.TryGetValue(clientName, out var context) ? context : null;
+
+    public TunnelConnectionContext? FindData(string clientName) =>
+        _data.TryGetValue(clientName, out var context) ? context : null;
 
     /// <summary>
     /// Race-free swap that returns whatever it displaces. The displaced context is stamped
@@ -35,7 +39,7 @@ public sealed class SessionRegistry
     public TunnelConnectionContext? Replace(string clientName, TunnelConnectionContext newContext)
     {
         TunnelConnectionContext? prior = null;
-        _byName.AddOrUpdate(clientName,
+        _controls.AddOrUpdate(clientName,
             _ => newContext,
             (_, existing) =>
             {
@@ -52,14 +56,35 @@ public sealed class SessionRegistry
         return null;
     }
 
+    public TunnelConnectionContext? ReplaceData(string clientName, TunnelConnectionContext newContext)
+    {
+        TunnelConnectionContext? prior = null;
+        _data.AddOrUpdate(clientName,
+            _ => newContext,
+            (_, existing) =>
+            {
+                prior = existing;
+                return newContext;
+            });
+        if (prior is not null && !ReferenceEquals(prior, newContext))
+        {
+            prior.MarkDisconnectIfAbsent(DisconnectReason.ReplacedByNewLogin);
+            return prior;
+        }
+        return null;
+    }
+
     /// <summary>Drop the binding only if it still points at the given context. Avoids dropping a
     /// fresh login that has already replaced this one.</summary>
     public void Unbind(string clientName, TunnelConnectionContext context)
     {
         // ConcurrentDictionary.TryRemove with a value-equality overload requires .NET 5+; works on net10.
-        _byName.TryRemove(new KeyValuePair<string, TunnelConnectionContext>(clientName, context));
+        _controls.TryRemove(new KeyValuePair<string, TunnelConnectionContext>(clientName, context));
+        _data.TryRemove(new KeyValuePair<string, TunnelConnectionContext>(clientName, context));
     }
 
     public bool HasLogin(TunnelConnectionContext context) =>
-        context.ClientName is { } name && _byName.TryGetValue(name, out var bound) && ReferenceEquals(bound, context);
+        context.ClientName is { } name
+        && ((_controls.TryGetValue(name, out var control) && ReferenceEquals(control, context))
+            || (_data.TryGetValue(name, out var data) && ReferenceEquals(data, context)));
 }

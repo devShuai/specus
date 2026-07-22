@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
+using ShuaiTunnel.Protocol.Flow;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Management;
@@ -22,15 +23,17 @@ internal sealed class ExternalConnection : IAsyncDisposable
     private readonly ILogger _logger;
     private readonly ReadGate _readGate;
     private readonly WriteBackpressureGate _writeBackpressure;
+    private readonly StreamSendWindow _sendWindow = new();
     private int _closed;
 
-    public ExternalConnection(Socket socket, int port, string clientName,
+    public ExternalConnection(Socket socket, uint streamId, int port, string clientName,
         TunnelConnectionContext control, TrafficUsageService traffic,
         TrafficInspectionService inspection, NettyServerOptions options, ILogger logger)
     {
         _socket = socket;
         _stream = new NetworkStream(socket, ownsSocket: false);
         Port = port;
+        StreamId = streamId;
         ClientName = clientName;
         _control = control;
         _traffic = traffic;
@@ -43,6 +46,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
     }
 
     public int Port { get; }
+    public uint StreamId { get; }
     public string ClientName { get; }
     public string ChannelId { get; }
     public ReadGate ReadGate => _readGate;
@@ -52,7 +56,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
     {
         try
         {
-            await SendControlAsync(NatMessageType.Connected, new Dictionary<string, object?>
+            await SendControlAsync(NatMessageType.Open, new Dictionary<string, object?>
             {
                 ["channelId"] = ChannelId,
                 ["port"] = Port,
@@ -77,6 +81,10 @@ internal sealed class ExternalConnection : IAsyncDisposable
                 }
 
                 var payload = buffer.AsSpan(0, read).ToArray();
+                if (!await _sendWindow.ConsumeAsync(payload.Length, cancellationToken).ConfigureAwait(false))
+                {
+                    break;
+                }
                 _traffic.RecordTcpDownload(ClientName, Port, payload.Length);
                 var (sourceAddress, sourcePort) = Endpoint(_socket.RemoteEndPoint);
                 var (destinationAddress, destinationPort) = Endpoint(_socket.LocalEndPoint);
@@ -91,10 +99,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
                         destinationPort,
                         payload), cancellationToken)
                     .ConfigureAwait(false);
-                await SendControlAsync(NatMessageType.Data, new Dictionary<string, object?>
-                {
-                    ["channelId"] = ChannelId,
-                }, payload, cancellationToken).ConfigureAwait(false);
+                await SendControlAsync(NatMessageType.Data, null, payload, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException
@@ -105,7 +110,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
         finally
         {
             await DisposeAsync().ConfigureAwait(false);
-            await TrySendDisconnectedAsync(CancellationToken.None).ConfigureAwait(false);
+            await TrySendFinAsync(CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -152,13 +157,14 @@ internal sealed class ExternalConnection : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _closed, 1) == 0)
         {
+            _sendWindow.Close();
             try { _stream.Dispose(); } catch { /* already gone */ }
             try { _socket.Close(); } catch { /* already gone */ }
         }
         await ValueTask.CompletedTask;
     }
 
-    private async Task TrySendDisconnectedAsync(CancellationToken cancellationToken)
+    private async Task TrySendFinAsync(CancellationToken cancellationToken)
     {
         if (_control.Lifetime.IsCancellationRequested)
         {
@@ -167,10 +173,7 @@ internal sealed class ExternalConnection : IAsyncDisposable
 
         try
         {
-            await SendControlAsync(NatMessageType.Disconnected, new Dictionary<string, object?>
-            {
-                ["channelId"] = ChannelId,
-            }, null, cancellationToken).ConfigureAwait(false);
+            await SendControlAsync(NatMessageType.Fin, null, null, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException
             or OperationCanceledException)
@@ -179,17 +182,20 @@ internal sealed class ExternalConnection : IAsyncDisposable
         }
     }
 
-    private ValueTask SendControlAsync(NatMessageType type, Dictionary<string, object?> meta,
+    private ValueTask SendControlAsync(NatMessageType type, Dictionary<string, object?>? meta,
         byte[]? data, CancellationToken cancellationToken)
     {
         var message = new NatMessagePacket
         {
             NatMessageType = type,
+            StreamId = StreamId,
             MetaData = meta,
             Data = data,
         };
         return _control.Writer.WriteAsync(message, cancellationToken);
     }
+
+    public bool AddSendCredit(uint credit) => _sendWindow.Add(credit);
 
     private static (string? Address, int? Port) Endpoint(EndPoint? endpoint)
     {

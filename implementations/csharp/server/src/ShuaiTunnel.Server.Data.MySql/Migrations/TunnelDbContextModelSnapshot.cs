@@ -80,6 +80,38 @@ namespace ShuaiTunnel.Server.Data.MySql.Migrations
                     b.ToTable("tunnel_client_account", (string)null);
                 });
 
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ClientAuthNonce", b =>
+                {
+                    b.Property<string>("ApiKeyHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)")
+                        .HasColumnName("api_key_hash");
+
+                    b.Property<string>("NonceHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)")
+                        .HasColumnName("nonce_hash");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("expires_at");
+
+                    b.HasKey("ApiKeyHash", "NonceHash");
+
+                    b.HasIndex("ExpiresAt")
+                        .HasDatabaseName("idx_client_auth_nonce_expiry");
+
+                    b.ToTable("tunnel_client_auth_nonce", (string)null);
+                });
+
             modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.ClientCredential", b =>
                 {
                     b.Property<long>("Id")
@@ -1840,6 +1872,83 @@ namespace ShuaiTunnel.Server.Data.MySql.Migrations
                         .IsUnique();
 
                     b.ToTable("tunnel_mapping", (string)null);
+                });
+
+            modelBuilder.Entity("ShuaiTunnel.Server.Data.Entities.WebSocketTicket", b =>
+                {
+                    b.Property<string>("TokenHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)")
+                        .HasColumnName("token_hash");
+
+                    b.Property<string>("CreatedAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("DisplayName")
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("display_name");
+
+                    b.Property<string>("ExpiresAt")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("expires_at");
+
+                    b.Property<bool>("IsAdmin")
+                        .HasColumnType("tinyint(1)")
+                        .HasColumnName("is_admin");
+
+                    b.Property<string>("PeerId")
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("peer_id");
+
+                    b.Property<string>("RemoteAddressHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)")
+                        .HasColumnName("remote_address_hash");
+
+                    b.Property<string>("RoomId")
+                        .HasMaxLength(120)
+                        .HasColumnType("varchar(120)")
+                        .HasColumnName("room_id");
+
+                    b.Property<string>("RoomKey")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("room_key");
+
+                    b.Property<string>("Scope")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("varchar(40)")
+                        .HasColumnName("scope");
+
+                    b.Property<bool>("SharedRoom")
+                        .HasColumnType("tinyint(1)")
+                        .HasColumnName("shared_room");
+
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("tenant_id");
+
+                    b.Property<string>("Username")
+                        .HasMaxLength(80)
+                        .HasColumnType("varchar(80)")
+                        .HasColumnName("username");
+
+                    b.HasKey("TokenHash");
+
+                    b.HasIndex("ExpiresAt")
+                        .HasDatabaseName("idx_websocket_ticket_expiry");
+
+                    b.ToTable("tunnel_websocket_ticket", (string)null);
                 });
 #pragma warning restore 612, 618
         }

@@ -116,6 +116,17 @@ public sealed class ClientAccountService
 
     public async Task<AuthenticationResult> AuthenticateAsync(
         LoginRequestPacket packet, string channelId, string? remoteAddress, CancellationToken cancellationToken)
+        => await AuthenticateCoreAsync(packet, channelId, remoteAddress, dataConnection: false, cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<AuthenticationResult> AuthenticateDataAsync(
+        LoginRequestPacket packet, string channelId, string? remoteAddress, CancellationToken cancellationToken)
+        => await AuthenticateCoreAsync(packet, channelId, remoteAddress, dataConnection: true, cancellationToken)
+            .ConfigureAwait(false);
+
+    private async Task<AuthenticationResult> AuthenticateCoreAsync(
+        LoginRequestPacket packet, string channelId, string? remoteAddress,
+        bool dataConnection, CancellationToken cancellationToken)
     {
         var session = _sessionStore.Find(packet.ClientSessionId, packet.AccessToken);
         if (session is null)
@@ -146,25 +157,34 @@ public sealed class ClientAccountService
         {
             return AuthenticationResult.Fail(account, "客户端已停用");
         }
-        if (await ExceedsRateLimitAsync(account.Id, account.ConnectionRateLimitPerMinute, cancellationToken).ConfigureAwait(false))
+        if (dataConnection && session.Status != ClientAuthSessionStatus.NettyOnline)
+        {
+            return AuthenticationResult.Fail(account, "数据连接要求控制连接先登录");
+        }
+        if (!dataConnection && await ExceedsRateLimitAsync(
+                account.Id, account.ConnectionRateLimitPerMinute, cancellationToken).ConfigureAwait(false))
         {
             return AuthenticationResult.Fail(account, "连接频率超过限制");
         }
-        if (_sessionStore.CountOnlineByMachineUser(
+        if (!dataConnection && _sessionStore.CountOnlineByMachineUser(
                 session.CredentialId, session.MachineFingerprint, session.OsUser) >= PerMachineUserMaxInstances)
         {
             return AuthenticationResult.Fail(account, "同一台机器和用户已经有在线实例");
         }
-        if (_sessionStore.CountOnlineByCredential(session.CredentialId) >= credential.MaxOnlineInstances)
+        if (!dataConnection
+            && _sessionStore.CountOnlineByCredential(session.CredentialId) >= credential.MaxOnlineInstances)
         {
             return AuthenticationResult.Fail(account, "在线实例数已达上限");
         }
 
         packet.ClientName = account.ClientName;
         packet.ClientSessionId = session.Id;
-        _sessionStore.MarkOnline(session, channelId, remoteAddress);
-        await MarkSessionOnlineAsync(session, channelId, remoteAddress, cancellationToken)
-            .ConfigureAwait(false);
+        if (!dataConnection)
+        {
+            _sessionStore.MarkOnline(session, channelId, remoteAddress);
+            await MarkSessionOnlineAsync(session, channelId, remoteAddress, cancellationToken)
+                .ConfigureAwait(false);
+        }
         return AuthenticationResult.Pass(account);
     }
 
@@ -217,7 +237,43 @@ public sealed class ClientAccountService
         {
             throw new ArgumentException("客户端签名无效或已过期");
         }
+        await ConsumeNonceAsync(apiKey, request.Nonce!, cancellationToken).ConfigureAwait(false);
         return credential;
+    }
+
+    private async Task ConsumeNonceAsync(string apiKey, string nonce,
+        CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        await _db.ClientAuthNonces.Where(item => item.ExpiresAt <= now)
+            .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        var row = new ClientAuthNonce
+        {
+            ApiKeyHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey)))
+                .ToLowerInvariant(),
+            NonceHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(nonce)))
+                .ToLowerInvariant(),
+            CreatedAt = now,
+            ExpiresAt = now.AddMinutes(2),
+        };
+        _db.ClientAuthNonces.Add(row);
+        try
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException)
+        {
+            _db.Entry(row).State = EntityState.Detached;
+            var duplicate = await _db.ClientAuthNonces.AsNoTracking()
+                .AnyAsync(item => item.ApiKeyHash == row.ApiKeyHash
+                    && item.NonceHash == row.NonceHash, cancellationToken)
+                .ConfigureAwait(false);
+            if (duplicate)
+            {
+                throw new ArgumentException("客户端 nonce 已使用");
+            }
+            throw;
+        }
     }
 
     private static bool HasValidApiKeySignature(ClientAuthLoginRequest request, string secretHashHex)

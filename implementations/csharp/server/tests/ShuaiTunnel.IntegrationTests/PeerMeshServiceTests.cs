@@ -361,6 +361,7 @@ public sealed class PeerMeshServiceTests
                 PathType = PeerMeshService.PathDirect,
                 Status = PeerMeshService.StatusActive,
                 RttMillis = 10,
+                RemoteEndpoint = "198.51.100.20:41000",
                 DirectBytes = 100,
                 RelayBytes = 5,
                 StartedAt = now.AddMinutes(-2),
@@ -378,6 +379,7 @@ public sealed class PeerMeshServiceTests
                 PathType = PeerMeshService.PathRelay,
                 Status = PeerMeshService.StatusActive,
                 RttMillis = 30,
+                RemoteEndpoint = "[2001:db8::20]:42000",
                 DirectBytes = 0,
                 RelayBytes = 200,
                 StartedAt = now.AddMinutes(-2),
@@ -410,6 +412,21 @@ public sealed class PeerMeshServiceTests
         Assert.Equal(1, stats.ActiveDirectSessions);
         Assert.Equal(1, stats.ActiveRelaySessions);
         Assert.Equal(0.5, stats.ActiveDirectRatio);
+        Assert.Contains(stats.AddressFamilies, item => item.AddressFamily == "IPv4"
+            && item.Status == PeerMeshService.StatusActive
+            && item.PathType == PeerMeshService.PathDirect
+            && item.Sessions == 1
+            && item.ReportedSessions == 1);
+        Assert.Contains(stats.AddressFamilies, item => item.AddressFamily == "IPv6"
+            && item.Status == PeerMeshService.StatusActive
+            && item.PathType == PeerMeshService.PathRelay
+            && item.Sessions == 1
+            && item.ReportedSessions == 1);
+        Assert.Contains(stats.AddressFamilies, item => item.AddressFamily == "UNKNOWN"
+            && item.Status == PeerMeshService.StatusNegotiating
+            && item.PathType == PeerMeshService.PathDirect
+            && item.Sessions == 1
+            && item.ReportedSessions == 0);
         var directActive = Assert.Single(stats.PathTypes,
             item => item.PathType == PeerMeshService.PathDirect && item.Status == PeerMeshService.StatusActive);
         Assert.Equal(1, directActive.Sessions);
@@ -587,12 +604,13 @@ public sealed class PeerMeshServiceTests
             headerType,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            args: [sessionId, fromClientId, toClientId, sequence],
+            args: [sessionId, sequence],
             culture: null)!;
         var method = typeof(PeerMeshService).GetMethod(
             "AuthorizeRelayFrameAsync", BindingFlags.Instance | BindingFlags.NonPublic)
             ?? throw new InvalidOperationException("AuthorizeRelayFrameAsync not found");
-        var task = (Task<bool>)method.Invoke(service, [header, bytes, CancellationToken.None])!;
+        var task = (Task<bool>)method.Invoke(
+            service, [header, fromClientId, toClientId, bytes, CancellationToken.None])!;
         return await task.ConfigureAwait(false);
     }
 

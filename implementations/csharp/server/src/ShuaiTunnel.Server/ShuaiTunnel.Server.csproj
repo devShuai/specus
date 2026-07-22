@@ -11,11 +11,8 @@
     <DefaultItemExcludes>$(DefaultItemExcludes);wwwroot\**\*</DefaultItemExcludes>
   </PropertyGroup>
 
-  <Target Name="BuildAndSyncAdminWeb"
-          BeforeTargets="ResolveStaticWebAssetsInputs;AssignTargetPaths"
-          Condition="'$(TunnelServerWebSkip)' != 'true' and '$(DesignTimeBuild)' != 'true'">
-    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)..\..\..\..\..\apps\admin-web"
-          Command="npm run deploy:csharp" />
+  <Target Name="BuildAndSyncAdminWeb" BeforeTargets="ResolveStaticWebAssetsInputs;AssignTargetPaths" Condition="'$(TunnelServerWebSkip)' != 'true' and '$(DesignTimeBuild)' != 'true'">
+    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)..\..\..\..\..\apps\admin-web" Command="npm run deploy:csharp" />
     <ItemGroup>
       <Content Remove="wwwroot\**\*" />
       <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
@@ -24,6 +21,7 @@
 
   <ItemGroup>
     <PackageReference Include="MailKit" Version="4.17.0" />
+    <PackageReference Include="StackExchange.Redis" Version="3.0.17" />
     <ProjectReference Include="..\..\..\protocol\src\ShuaiTunnel.Protocol\ShuaiTunnel.Protocol.csproj" />
     <ProjectReference Include="..\ShuaiTunnel.Server.Data\ShuaiTunnel.Server.Data.csproj" />
     <!-- Provider migration assemblies must be referenced so MigrationsAssembly(...) can load

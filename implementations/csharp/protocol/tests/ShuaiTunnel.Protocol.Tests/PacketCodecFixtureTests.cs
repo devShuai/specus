@@ -6,6 +6,30 @@ namespace ShuaiTunnel.Protocol.Tests;
 
 public class PacketCodecFixtureTests
 {
+    private static readonly string[] MalformedFixtures =
+    [
+        "invalid_bad_magic.bin",
+        "invalid_version_v1.bin",
+        "invalid_serializer.bin",
+        "invalid_unknown_command.bin",
+        "invalid_truncated_header.bin",
+        "invalid_truncated_body.bin",
+        "invalid_trailing_body.bin",
+        "invalid_heartbeat_body.bin",
+        "invalid_oversized_length.bin",
+    ];
+
+    [Theory]
+    [MemberData(nameof(GetMalformedFixtures))]
+    public void MalformedCanonicalFrame_IsRejected(string fixtureName)
+    {
+        var bytes = Fixtures.Read(fixtureName);
+        Assert.Throws<InvalidDataException>(() => PacketCodec.DecodeExact(bytes));
+    }
+
+    public static IEnumerable<object[]> GetMalformedFixtures() =>
+        MalformedFixtures.Select(name => new object[] { name });
+
     [Fact]
     public void LoginRequest_Roundtrips()
     {
@@ -14,6 +38,7 @@ public class PacketCodecFixtureTests
             ClientName = "Demo client",
             ClientSessionId = 123456789L,
             AccessToken = "cs_fixture_token",
+            ConnectionRole = ConnectionRole.Control,
         };
 
         var encoded = PacketCodec.Encode(packet);
@@ -25,6 +50,19 @@ public class PacketCodecFixtureTests
         Assert.Equal(packet.ClientName, decoded!.ClientName);
         Assert.Equal(packet.ClientSessionId, decoded.ClientSessionId);
         Assert.Equal(packet.AccessToken, decoded.AccessToken);
+        Assert.Equal(packet.ConnectionRole, decoded.ConnectionRole);
+    }
+
+    [Fact]
+    public void CanonicalLoginRequest_IncludesMandatoryControlRole()
+    {
+        Fixtures.DecodeAndAssertRoundtrip<LoginRequestPacket>("login_request.bin", packet =>
+        {
+            Assert.Equal("Demo client", packet.ClientName);
+            Assert.Equal(1700000000000L, packet.ClientSessionId);
+            Assert.Equal("cs_fixture_access_token", packet.AccessToken);
+            Assert.Equal(ConnectionRole.Control, packet.ConnectionRole);
+        });
     }
 
     [Fact]
@@ -35,10 +73,11 @@ public class PacketCodecFixtureTests
             ClientName = "csharp-client",
             ClientSessionId = 0,
             AccessToken = "token",
+            ConnectionRole = ConnectionRole.Control,
         };
 
         var encoded = PacketCodec.Encode(packet);
-        var raw = CompactBinarySerializer.DecodePayload(encoded[PacketCodec.HeaderSize..]);
+        var raw = encoded[PacketCodec.HeaderSize..];
         var nameLengthMarker = raw[0];
         var sessionMarkerIndex = 1 + nameLengthMarker - 1;
 
@@ -166,156 +205,16 @@ public class PacketCodecFixtureTests
         Assert.Equal(packet.Message, decoded.Message);
     }
 
-    [Fact]
-    public void HttpRequest_Roundtrips()
+    [Theory]
+    [InlineData((sbyte)5)]
+    [InlineData((sbyte)-5)]
+    [InlineData((sbyte)7)]
+    [InlineData((sbyte)-7)]
+    public void RemovedHttpCommands_AreRejected(sbyte removedCommand)
     {
-        Fixtures.DecodeAndAssertRoundtrip<HttpRequestPacket>("http_request.bin", p =>
-        {
-            Assert.Equal("Demo client", p.ClientName);
-            Assert.Equal("upstream", p.ToClientName);
-            Assert.Equal("123e4567-e89b-12d3-a456-426614174000", p.RequestId);
-            Assert.Equal("POST", p.RequestMethod);
-            Assert.Equal("http://127.0.0.1:8080/api/demo", p.RequestUrl);
-            Assert.NotNull(p.HeaderMap);
-            Assert.Equal(2, p.HeaderMap!.Count);
-            Assert.Equal("application/json", p.HeaderMap["Content-Type"]);
-            Assert.Equal("fixture-1", p.HeaderMap["X-Request-Id"]);
-            Assert.NotNull(p.ParamMap);
-            Assert.Equal("10", p.ParamMap!["limit"]);
-            Assert.Equal("{\"hello\":\"world\"}", p.Body);
-        });
-    }
+        var frame = PacketCodec.Encode(new HeartbeatRequestPacket());
+        frame[6] = unchecked((byte)removedCommand);
 
-    [Fact]
-    public void HttpResponse_Roundtrips()
-    {
-        Fixtures.DecodeAndAssertRoundtrip<HttpResponsePacket>("http_response.bin", p =>
-        {
-            Assert.Equal("upstream", p.ClientName);
-            Assert.Equal("Demo client", p.ToClientName);
-            Assert.Equal("123e4567-e89b-12d3-a456-426614174000", p.RequestId);
-            Assert.Equal("{\"ok\":true}", p.Response);
-        });
-    }
-
-    [Fact]
-    public void DirectHttpRequest_Roundtrips()
-    {
-        Fixtures.DecodeAndAssertRoundtrip<DirectHttpRequestPacket>("direct_http_request.bin", p =>
-        {
-            Assert.Equal("11111111-2222-3333-4444-555555555555", p.RequestId);
-            Assert.Equal("GET", p.RequestMethod);
-            Assert.Equal("api", p.Route);
-            Assert.Equal("/v1/items", p.RelativePath);
-            Assert.Equal("limit=10&page=1", p.RawQuery);
-            Assert.NotNull(p.Headers);
-            Assert.Collection(p.Headers!,
-                h => Assert.Equal("accept: application/json", h),
-                h => Assert.Equal("x-fixture: 1", h));
-            Assert.NotNull(p.Body);
-            Assert.Empty(p.Body!);
-        });
-    }
-
-    [Fact]
-    public void DirectHttpResponse_Roundtrips()
-    {
-        Fixtures.DecodeAndAssertRoundtrip<DirectHttpResponsePacket>("direct_http_response.bin", p =>
-        {
-            Assert.Equal("11111111-2222-3333-4444-555555555555", p.RequestId);
-            Assert.Equal(200, p.StatusCode);
-            Assert.NotNull(p.Headers);
-            Assert.Single(p.Headers!);
-            Assert.Equal("content-type: application/json", p.Headers![0]);
-            Assert.NotNull(p.Body);
-            Assert.Equal("{\"ok\":true}", System.Text.Encoding.UTF8.GetString(p.Body!));
-            Assert.Null(p.Error);
-        });
-    }
-
-    [Fact]
-    public void DirectHttpResponseEmptyErrorPreservesNonNullStringLikeJava()
-    {
-        var packet = new DirectHttpResponsePacket
-        {
-            RequestId = "8b284fef-0987-4948-ac66-7f2059336989",
-            StatusCode = 502,
-            Headers = new List<string>(),
-            Body = Array.Empty<byte>(),
-            Error = "",
-        };
-
-        var encoded = PacketCodec.Encode(packet);
-        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
-        Assert.Equal(encoded.Length, consumed);
-        var decoded = Assert.IsType<DirectHttpResponsePacket>(decodedPacket);
-
-        Assert.NotNull(decoded.Error);
-        Assert.Equal("", decoded.Error);
-    }
-
-    [Fact]
-    public void UuidCodec_PreservesNonCanonicalCaseLikeJava()
-    {
-        var packet = new DirectHttpResponsePacket
-        {
-            RequestId = "8B284FEF-0987-4948-AC66-7F2059336989",
-            StatusCode = 204,
-            Headers = new List<string>(),
-            Body = Array.Empty<byte>(),
-            Error = null,
-        };
-
-        var encoded = PacketCodec.Encode(packet);
-        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
-        Assert.Equal(encoded.Length, consumed);
-        var decoded = Assert.IsType<DirectHttpResponsePacket>(decodedPacket);
-
-        Assert.Equal(packet.RequestId, decoded.RequestId);
-    }
-
-    [Fact]
-    public void HttpMethodCodec_PreservesNonCanonicalCaseLikeJava()
-    {
-        var packet = new DirectHttpRequestPacket
-        {
-            RequestId = "8b284fef-0987-4948-ac66-7f2059336989",
-            RequestMethod = "get",
-            Route = "api",
-            RelativePath = "/socket",
-            RawQuery = "",
-            Headers = new List<string>(),
-            Body = Array.Empty<byte>(),
-        };
-
-        var encoded = PacketCodec.Encode(packet);
-        Assert.True(PacketCodec.TryDecode(encoded, out var decodedPacket, out var consumed));
-        Assert.Equal(encoded.Length, consumed);
-        var decoded = Assert.IsType<DirectHttpRequestPacket>(decodedPacket);
-
-        Assert.Equal(packet.RequestMethod, decoded.RequestMethod);
-    }
-
-    [Fact]
-    public void EmptyUuidAndHttpMethod_EncodeAsStringsLikeJava()
-    {
-        var packet = new DirectHttpRequestPacket
-        {
-            RequestId = "",
-            RequestMethod = "",
-            Route = "api",
-            RelativePath = "/socket",
-            RawQuery = "",
-            Headers = new List<string>(),
-            Body = Array.Empty<byte>(),
-        };
-
-        var encoded = PacketCodec.Encode(packet);
-        var raw = CompactBinarySerializer.DecodePayload(encoded[PacketCodec.HeaderSize..]);
-
-        Assert.Equal(2, raw[0]);
-        Assert.Equal(1, raw[1]);
-        Assert.Equal(5, raw[2]);
-        Assert.Equal(1, raw[3]);
+        Assert.Throws<InvalidDataException>(() => PacketCodec.DecodeExact(frame));
     }
 }

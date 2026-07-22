@@ -215,6 +215,12 @@ public sealed class PublicTransferOptions
     public int MaxDiscoveryPeersPerRoom { get; set; } = 32;
     public int DiscoveryMessageRateLimitPerConnection { get; set; } = 360;
     public long DiscoveryMessageRateLimitWindowSeconds { get; set; } = 60;
+    public bool ClusterEnabled { get; set; }
+    public string RedisUri { get; set; } = string.Empty;
+    public string RedisKeyPrefix { get; set; } = "shuai-tunnel:v2:public-transfer";
+    public long PresenceLeaseSeconds { get; set; } = 30;
+    public long PresenceRefreshIntervalMs { get; set; } = 10_000;
+    public long RedisCommandTimeoutMs { get; set; } = 2_000;
 }
 
 public sealed class ObjectStorageOptions

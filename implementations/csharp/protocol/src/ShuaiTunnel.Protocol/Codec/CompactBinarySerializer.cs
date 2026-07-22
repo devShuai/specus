@@ -1,4 +1,3 @@
-using System.IO.Compression;
 using System.Reflection;
 using ShuaiTunnel.Protocol.Packets;
 
@@ -11,11 +10,6 @@ namespace ShuaiTunnel.Protocol.Codec;
 /// </summary>
 public static class CompactBinarySerializer
 {
-    private const byte RawPayload = 0;
-    private const byte DeflatedPayload = 1;
-    private const int CompressionThreshold = 64;
-    private const int MaxInflatedSize = 16 * 1024 * 1024;
-
     private static readonly IValueCodec StringCodec = new StringValueCodec();
     private static readonly IValueCodec BooleanCodec = new BooleanValueCodec();
     private static readonly IValueCodec IntegerCodec = new IntegerValueCodec();
@@ -25,15 +19,7 @@ public static class CompactBinarySerializer
     private static readonly IValueCodec UuidStringCodec = new UuidStringValueCodec();
     private static readonly IValueCodec HttpMethodCodec = new HttpMethodValueCodec();
 
-    private static readonly IValueCodec MessageTypeCodec = new EnumValueCodec<MessageType>(new[]
-    {
-        // Mirror Java enum declaration order (ordinal sequence).
-        MessageType.ServerToClient,
-        MessageType.ClientToServer,
-        MessageType.ClientToClient,
-        MessageType.NatControl,
-        MessageType.PeerControl,
-    });
+    private static readonly IValueCodec MessageTypeCodec = new MessageTypeValueCodec();
 
     private static readonly IValueCodec StringMapCodec = new StringMapValueCodec();
     private static readonly IValueCodec StringListCodec = new StringListValueCodec();
@@ -50,20 +36,20 @@ public static class CompactBinarySerializer
         {
             throw new ArgumentException($"unsupported compact binary type: {packet.GetType().FullName}");
         }
-        return EncodePayload(schema.Serialize(packet));
+        return schema.Serialize(packet);
     }
 
     public static T Deserialize<T>(byte[] bytes) where T : Packet, new()
     {
-        if (bytes is null || bytes.Length == 0)
+        if (bytes is null)
         {
-            throw new ArgumentException("bytes cannot be empty", nameof(bytes));
+            throw new ArgumentNullException(nameof(bytes));
         }
         if (!Schemas.TryGetValue(typeof(T), out var schema))
         {
             throw new ArgumentException($"unsupported compact binary type: {typeof(T).FullName}");
         }
-        return (T)schema.Deserialize(DecodePayload(bytes));
+        return (T)schema.Deserialize(bytes);
     }
 
     public static Packet Deserialize(Type type, byte[] bytes)
@@ -72,78 +58,7 @@ public static class CompactBinarySerializer
         {
             throw new ArgumentException($"unsupported compact binary type: {type.FullName}");
         }
-        return schema.Deserialize(DecodePayload(bytes));
-    }
-
-    public static byte[] EncodePayload(byte[] rawPayload)
-    {
-        if (rawPayload is null)
-        {
-            throw new ArgumentNullException(nameof(rawPayload));
-        }
-        var compressed = rawPayload.Length >= CompressionThreshold ? Deflate(rawPayload) : rawPayload;
-        if (compressed.Length < rawPayload.Length)
-        {
-            return WithPayloadType(DeflatedPayload, compressed);
-        }
-        return WithPayloadType(RawPayload, rawPayload);
-    }
-
-    public static byte[] DecodePayload(byte[] bytes)
-    {
-        if (bytes is null || bytes.Length == 0)
-        {
-            throw new ArgumentException("bytes cannot be empty", nameof(bytes));
-        }
-        var payload = bytes.AsSpan(1).ToArray();
-        return bytes[0] switch
-        {
-            RawPayload => payload,
-            DeflatedPayload => Inflate(payload),
-            _ => throw new InvalidDataException($"unknown payload type: {bytes[0]}"),
-        };
-    }
-
-    private static byte[] WithPayloadType(byte type, byte[] payload)
-    {
-        var result = new byte[payload.Length + 1];
-        result[0] = type;
-        Buffer.BlockCopy(payload, 0, result, 1, payload.Length);
-        return result;
-    }
-
-    private static byte[] Deflate(byte[] bytes)
-    {
-        using var output = new MemoryStream();
-        using (var deflate = new DeflateStream(output, CompressionLevel.SmallestSize, leaveOpen: true))
-        {
-            deflate.Write(bytes, 0, bytes.Length);
-        }
-        return output.ToArray();
-    }
-
-    private static byte[] Inflate(byte[] bytes)
-    {
-        // DeflateStream historically treats input EOF as a successful end even
-        // when the raw DEFLATE stream never reached a final block. Java checks
-        // Inflater.finished(), while Go reports io.ErrUnexpectedEOF. Validate
-        // the block structure first so all implementations reject truncation
-        // and streams that were only flushed but never finished.
-        RawDeflateValidator.EnsureFinished(bytes);
-        using var input = new MemoryStream(bytes);
-        using var deflate = new DeflateStream(input, CompressionMode.Decompress);
-        using var output = new MemoryStream(bytes.Length * 2);
-        var buffer = new byte[256];
-        int read;
-        while ((read = deflate.Read(buffer, 0, buffer.Length)) > 0)
-        {
-            output.Write(buffer, 0, read);
-            if (output.Length > MaxInflatedSize)
-            {
-                throw new InvalidDataException("inflated payload exceeds limit");
-            }
-        }
-        return output.ToArray();
+        return schema.Deserialize(bytes);
     }
 
     private static Dictionary<Type, ObjectSchema> BuildSchemas()
@@ -152,7 +67,8 @@ public static class CompactBinarySerializer
         Register(schemas, ObjectSchema.Build<LoginRequestPacket>(
             Field<LoginRequestPacket>(nameof(LoginRequestPacket.ClientName), StringCodec),
             Field<LoginRequestPacket>(nameof(LoginRequestPacket.ClientSessionId), LongCodec),
-            Field<LoginRequestPacket>(nameof(LoginRequestPacket.AccessToken), StringCodec)));
+            Field<LoginRequestPacket>(nameof(LoginRequestPacket.AccessToken), StringCodec),
+            Field<LoginRequestPacket>(nameof(LoginRequestPacket.ConnectionRole), StringCodec)));
         Register(schemas, ObjectSchema.Build<LoginResponsePacket>(
             Field<LoginResponsePacket>(nameof(LoginResponsePacket.ClientName), StringCodec),
             Field<LoginResponsePacket>(nameof(LoginResponsePacket.Success), BooleanCodec),
@@ -173,34 +89,6 @@ public static class CompactBinarySerializer
             Field<LogoutResponsePacket>(nameof(LogoutResponsePacket.Reason), StringCodec)));
         Register(schemas, ObjectSchema.Build<HeartbeatRequestPacket>());
         Register(schemas, ObjectSchema.Build<HeartbeatResponsePacket>());
-        Register(schemas, ObjectSchema.Build<HttpRequestPacket>(
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.ClientName), StringCodec),
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.ToClientName), StringCodec),
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.RequestId), UuidStringCodec),
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.RequestMethod), HttpMethodCodec),
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.RequestUrl), StringCodec),
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.HeaderMap), StringMapCodec),
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.ParamMap), StringMapCodec),
-            Field<HttpRequestPacket>(nameof(HttpRequestPacket.Body), StringCodec)));
-        Register(schemas, ObjectSchema.Build<HttpResponsePacket>(
-            Field<HttpResponsePacket>(nameof(HttpResponsePacket.ClientName), StringCodec),
-            Field<HttpResponsePacket>(nameof(HttpResponsePacket.ToClientName), StringCodec),
-            Field<HttpResponsePacket>(nameof(HttpResponsePacket.RequestId), UuidStringCodec),
-            Field<HttpResponsePacket>(nameof(HttpResponsePacket.Response), StringCodec)));
-        Register(schemas, ObjectSchema.Build<DirectHttpRequestPacket>(
-            Field<DirectHttpRequestPacket>(nameof(DirectHttpRequestPacket.RequestId), UuidStringCodec),
-            Field<DirectHttpRequestPacket>(nameof(DirectHttpRequestPacket.RequestMethod), HttpMethodCodec),
-            Field<DirectHttpRequestPacket>(nameof(DirectHttpRequestPacket.Route), StringCodec),
-            Field<DirectHttpRequestPacket>(nameof(DirectHttpRequestPacket.RelativePath), StringCodec),
-            Field<DirectHttpRequestPacket>(nameof(DirectHttpRequestPacket.RawQuery), StringCodec),
-            Field<DirectHttpRequestPacket>(nameof(DirectHttpRequestPacket.Headers), StringListCodec),
-            Field<DirectHttpRequestPacket>(nameof(DirectHttpRequestPacket.Body), ByteArrayCodec)));
-        Register(schemas, ObjectSchema.Build<DirectHttpResponsePacket>(
-            Field<DirectHttpResponsePacket>(nameof(DirectHttpResponsePacket.RequestId), UuidStringCodec),
-            Field<DirectHttpResponsePacket>(nameof(DirectHttpResponsePacket.StatusCode), IntegerCodec),
-            Field<DirectHttpResponsePacket>(nameof(DirectHttpResponsePacket.Headers), StringListCodec),
-            Field<DirectHttpResponsePacket>(nameof(DirectHttpResponsePacket.Body), ByteArrayCodec),
-            Field<DirectHttpResponsePacket>(nameof(DirectHttpResponsePacket.Error), StringCodec)));
         return schemas;
     }
 

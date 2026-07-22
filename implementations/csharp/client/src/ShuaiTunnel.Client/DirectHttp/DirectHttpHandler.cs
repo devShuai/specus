@@ -1,21 +1,14 @@
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Client.Configuration;
 using ShuaiTunnel.Client.Control;
-using ShuaiTunnel.Protocol.Packets;
 
 namespace ShuaiTunnel.Client.DirectHttp;
 
 /// <summary>
-/// Receives <see cref="DirectHttpRequestPacket"/> from the control channel, runs the
-/// forwarder on the thread pool (so the read loop is never blocked on upstream HTTP), and
-/// writes the resulting <see cref="DirectHttpResponsePacket"/> back through the writer.
-/// Holds the route map (volatile snapshot) and supports server-pushed hot reload.
+/// Holds the HTTP route snapshot used by mandatory NAT stream v2 exchanges.
 /// </summary>
 internal sealed class DirectHttpHandler
 {
-    private readonly FrameWriter _writer;
-    private readonly DirectHttpForwarder _forwarder;
-    private readonly ILogger _logger;
     private volatile IReadOnlyDictionary<string, string> _routes;
 
     public DirectHttpHandler(
@@ -24,11 +17,13 @@ internal sealed class DirectHttpHandler
         DirectHttpForwarder forwarder,
         ILogger logger)
     {
-        _writer = writer;
-        _forwarder = forwarder;
-        _logger = logger;
+        Forwarder = forwarder;
+        _ = writer;
+        _ = logger;
         _routes = BuildMap(initialRoutes);
     }
+
+    public DirectHttpForwarder Forwarder { get; }
 
     public IReadOnlyDictionary<string, string> SnapshotRoutes() => _routes;
 
@@ -43,37 +38,6 @@ internal sealed class DirectHttpHandler
             return;
         }
         _routes = BuildMap(next);
-    }
-
-    public void Dispatch(DirectHttpRequestPacket packet, CancellationToken cancellationToken)
-    {
-        var routes = _routes;
-        _ = Task.Run(async () =>
-        {
-            DirectHttpResponsePacket response;
-            try
-            {
-                response = await _forwarder.ForwardAsync(packet, routes, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "direct-http forward {requestId} crashed", packet.RequestId);
-                response = new DirectHttpResponsePacket
-                {
-                    RequestId = packet.RequestId,
-                    StatusCode = DirectHttpForwarder.FailureStatus,
-                    Error = ex.Message,
-                };
-            }
-            try
-            {
-                await _writer.WriteAsync(response, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogDebug(ex, "write direct-http response failed");
-            }
-        }, cancellationToken);
     }
 
     private static IReadOnlyDictionary<string, string> BuildMap(IEnumerable<HttpTunnelConfigEntry>? source)

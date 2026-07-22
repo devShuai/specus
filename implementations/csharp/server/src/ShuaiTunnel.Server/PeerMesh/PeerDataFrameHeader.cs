@@ -4,29 +4,27 @@ namespace ShuaiTunnel.Server.PeerMesh;
 
 internal sealed record PeerDataFrameHeader(
     long SessionId,
-    long FromClientId,
-    long ToClientId,
     long Sequence)
 {
-    private const uint Magic = 0x53504d31;
-    private const byte Version = 1;
-    private const byte TypeData = 1;
-    private const int HeaderBytes = 50;
+    private const uint Magic = 0x53504d32; // SPM2
+    private const int HeaderBytes = 20;
+    private const int TagBytes = 16;
+    private const int MaxFrameBytes = 65535;
+
+    public static bool LooksLikeDataFrame(ReadOnlySpan<byte> frame) =>
+        frame.Length >= 4 && BinaryPrimitives.ReadUInt32BigEndian(frame[..4]) == Magic;
 
     public static PeerDataFrameHeader? Parse(ReadOnlySpan<byte> frame)
     {
-        if (frame.Length < HeaderBytes || BinaryPrimitives.ReadUInt32BigEndian(frame[..4]) != Magic)
+        if (frame.Length < HeaderBytes + TagBytes || frame.Length > MaxFrameBytes || !LooksLikeDataFrame(frame))
         {
             return null;
         }
-        if (frame[4] != Version || frame[5] != TypeData)
-        {
-            return null;
-        }
-        return new PeerDataFrameHeader(
-            (long)BinaryPrimitives.ReadUInt64BigEndian(frame.Slice(6, 8)),
-            (long)BinaryPrimitives.ReadUInt64BigEndian(frame.Slice(14, 8)),
-            (long)BinaryPrimitives.ReadUInt64BigEndian(frame.Slice(22, 8)),
-            (long)BinaryPrimitives.ReadUInt64BigEndian(frame.Slice(30, 8)));
+        var sequence = (long)BinaryPrimitives.ReadUInt64BigEndian(frame.Slice(12, 8));
+        return sequence > 0
+            ? new PeerDataFrameHeader(
+                (long)BinaryPrimitives.ReadUInt64BigEndian(frame.Slice(4, 8)),
+                sequence)
+            : null;
     }
 }

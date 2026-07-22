@@ -23,11 +23,13 @@ internal sealed class NatClientSession : IAsyncDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<NatClientSession> _logger;
     private readonly ConcurrentDictionary<int, RemotePortBinding> _bindings = new();
-    private readonly ConcurrentDictionary<string, ExternalConnection> _externalChannels = new();
+    private readonly ConcurrentDictionary<uint, ExternalConnection> _externalChannels = new();
+    private readonly ConcurrentDictionary<uint, HttpTunnelStream> _httpStreams = new();
     private readonly object _admissionLock = new();
     private readonly Dictionary<int, int> _portExternalCounts = new();
 
     private int _activeClientExternalChannels;
+    private int _nextStreamId;
     private volatile bool _registered;
 
     public NatClientSession(TunnelConnectionContext context,
@@ -59,20 +61,100 @@ internal sealed class NatClientSession : IAsyncDisposable
                 await ProcessUnregisterAsync(packet).ConfigureAwait(false);
                 return;
             case NatMessageType.Keepalive:
-            case NatMessageType.HttpRoutesReport:
                 return;
-            case NatMessageType.Data when _registered:
-                await ProcessDataAsync(packet).ConfigureAwait(false);
-                return;
-            case NatMessageType.Disconnected when _registered:
-                await ProcessDisconnectedAsync(packet).ConfigureAwait(false);
-                return;
-            default:
-                _logger.LogWarning("dropping {Type} before REGISTER on channel {ChannelId}",
-                    packet.NatMessageType, _context.ChannelId);
+            case NatMessageType.Open:
+                if (HandleHttpResponseHead(packet))
+                {
+                    return;
+                }
+                break;
+            case NatMessageType.Data:
+                if (_httpStreams.TryGetValue(packet.StreamId, out var httpData))
+                {
+                    if (!httpData.OnResponseData(packet.Data))
+                    {
+                        ProtocolViolation("invalid HTTP DATA");
+                    }
+                    return;
+                }
+                if (_registered)
+                {
+                    await ProcessDataAsync(packet).ConfigureAwait(false);
+                    return;
+                }
+                break;
+            case NatMessageType.Fin:
+            case NatMessageType.Rst:
+                if (_httpStreams.TryGetValue(packet.StreamId, out var httpEnd))
+                {
+                    var valid = packet.NatMessageType == NatMessageType.Rst
+                        ? httpEnd.OnReset(AsString(packet.MetaData, "reason"))
+                        : httpEnd.OnResponseEnd(packet.MetaData);
+                    if (!valid)
+                    {
+                        ProtocolViolation("invalid HTTP terminal frame");
+                    }
+                    return;
+                }
+                if (_registered)
+                {
+                    await ProcessClosedAsync(packet).ConfigureAwait(false);
+                    return;
+                }
+                break;
+            case NatMessageType.WindowUpdate:
+                if (_httpStreams.TryGetValue(packet.StreamId, out var httpFlow))
+                {
+                    if (!httpFlow.AddSendCredit(packet.Value))
+                    {
+                        ProtocolViolation("invalid HTTP WINDOW_UPDATE");
+                    }
+                    return;
+                }
+                if (!_registered)
+                {
+                    break;
+                }
+                if (!_externalChannels.TryGetValue(packet.StreamId, out var flow)
+                    || flow.AddSendCredit(packet.Value))
+                {
+                    return;
+                }
+                _logger.LogWarning("invalid WINDOW_UPDATE stream={StreamId} credit={Credit}",
+                    packet.StreamId, packet.Value);
                 _context.MarkDisconnectIfAbsent(DisconnectReason.ProtocolViolation);
                 _context.CloseAsync();
                 return;
+            default:
+                break;
+        }
+        ProtocolViolation($"invalid NAT frame {packet.NatMessageType}");
+    }
+
+    internal async Task<HttpTunnelStream> OpenHttpStreamAsync(
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+    {
+        var streamId = AllocateStreamId();
+        var stream = new HttpTunnelStream(_context, streamId, RemoveHttpStream);
+        if (!_httpStreams.TryAdd(streamId, stream))
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+            throw new InvalidOperationException("HTTP stream id collision");
+        }
+        try
+        {
+            await _context.Writer.WriteAsync(new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Open,
+                StreamId = streamId,
+                MetaData = metadata,
+            }, cancellationToken).ConfigureAwait(false);
+            return stream;
+        }
+        catch
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+            throw;
         }
     }
 
@@ -88,13 +170,18 @@ internal sealed class NatClientSession : IAsyncDisposable
 
         foreach (var (_, external) in _externalChannels.ToArray())
         {
-            if (_externalChannels.TryRemove(external.ChannelId, out var removed))
+            if (_externalChannels.TryRemove(external.StreamId, out var removed))
             {
                 removed.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
                 await removed.DisposeAsync().ConfigureAwait(false);
             }
         }
         _externalChannels.Clear();
+        foreach (var stream in _httpStreams.Values)
+        {
+            stream.OnReset("control channel closed");
+        }
+        _httpStreams.Clear();
     }
 
     private async Task ProcessRegisterAsync(NatMessagePacket packet)
@@ -191,26 +278,38 @@ internal sealed class NatClientSession : IAsyncDisposable
         {
             return;
         }
-        var channelId = AsString(packet.MetaData, "channelId");
-        if (channelId is null || !_externalChannels.TryGetValue(channelId, out var external))
+        if (!_externalChannels.TryGetValue(packet.StreamId, out var external))
         {
             return;
         }
 
         await external.WriteFromClientAsync(data, _context.Lifetime).ConfigureAwait(false);
+        await _context.Writer.WritePriorityAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.WindowUpdate,
+            StreamId = packet.StreamId,
+            Value = checked((uint)data.Length),
+        }, _context.Lifetime).ConfigureAwait(false);
+        if ((packet.Flags & NatMessagePacket.FlagEndStream) != 0)
+        {
+            await ProcessClosedAsync(new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Fin,
+                StreamId = packet.StreamId,
+            }).ConfigureAwait(false);
+        }
     }
 
-    private async Task ProcessDisconnectedAsync(NatMessagePacket packet)
+    private async Task ProcessClosedAsync(NatMessagePacket packet)
     {
-        var channelId = AsString(packet.MetaData, "channelId");
-        if (channelId is null || !_externalChannels.TryRemove(channelId, out var external))
+        if (!_externalChannels.TryRemove(packet.StreamId, out var external))
         {
             return;
         }
 
         external.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
         await external.DisposeAsync().ConfigureAwait(false);
-        _inspection.ReleaseTcpStream(channelId);
+        _inspection.ReleaseTcpStream(external.ChannelId);
         UpdateControlReadForWritability();
     }
 
@@ -225,7 +324,8 @@ internal sealed class NatClientSession : IAsyncDisposable
         ExternalConnection? external = null;
         try
         {
-            external = new ExternalConnection(socket, port, _context.ClientName!,
+            var streamId = AllocateStreamId();
+            external = new ExternalConnection(socket, streamId, port, _context.ClientName!,
                 _context, _traffic, _inspection, _options, _loggerFactory.CreateLogger<ExternalConnection>());
             external.WriteBackpressure.BackpressureChanged += OnExternalWriteBackpressureChanged;
 
@@ -237,7 +337,7 @@ internal sealed class NatClientSession : IAsyncDisposable
                 external.ReadGate.Pause();
             }
 
-            _externalChannels[external.ChannelId] = external;
+            _externalChannels[external.StreamId] = external;
             UpdateControlReadForWritability();
             await external.RunAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -246,7 +346,7 @@ internal sealed class NatClientSession : IAsyncDisposable
             if (external is not null)
             {
                 external.WriteBackpressure.BackpressureChanged -= OnExternalWriteBackpressureChanged;
-                _externalChannels.TryRemove(external.ChannelId, out _);
+                _externalChannels.TryRemove(external.StreamId, out _);
                 _inspection.ReleaseTcpStream(external.ChannelId);
                 UpdateControlReadForWritability();
             }
@@ -351,6 +451,44 @@ internal sealed class NatClientSession : IAsyncDisposable
     }
 
     private static bool ReachedLimit(int current, int max) => max > 0 && current >= max;
+
+    private uint AllocateStreamId()
+    {
+        while (true)
+        {
+            var streamId = unchecked((uint)Interlocked.Increment(ref _nextStreamId));
+            if (streamId != 0 && !_externalChannels.ContainsKey(streamId)
+                              && !_httpStreams.ContainsKey(streamId))
+            {
+                return streamId;
+            }
+        }
+    }
+
+    private bool HandleHttpResponseHead(NatMessagePacket packet)
+    {
+        if (!string.Equals(AsString(packet.MetaData, "source"), "http", StringComparison.Ordinal)
+            || !string.Equals(AsString(packet.MetaData, "phase"), "response", StringComparison.Ordinal)
+            || !_httpStreams.TryGetValue(packet.StreamId, out var stream))
+        {
+            return false;
+        }
+        if (!stream.OnResponseHead(packet.MetaData))
+        {
+            ProtocolViolation("duplicate HTTP response OPEN");
+        }
+        return true;
+    }
+
+    private void RemoveHttpStream(uint streamId, HttpTunnelStream expected) =>
+        _httpStreams.TryRemove(new KeyValuePair<uint, HttpTunnelStream>(streamId, expected));
+
+    private void ProtocolViolation(string reason)
+    {
+        _logger.LogWarning("{Reason} on channel {ChannelId}", reason, _context.ChannelId);
+        _context.MarkDisconnectIfAbsent(DisconnectReason.ProtocolViolation);
+        _context.CloseAsync();
+    }
 
     private ValueTask WriteRegisterResultAsync(Dictionary<string, object?> metaData)
     {

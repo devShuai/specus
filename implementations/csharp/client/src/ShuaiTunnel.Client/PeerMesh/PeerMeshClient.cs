@@ -49,6 +49,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan BehaviorDiscoveryMinInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan BehaviorProbeTimeout = TimeSpan.FromMilliseconds(1600);
     private static readonly TimeSpan TurnPermissionTtl = TimeSpan.FromMinutes(4);
+	private static readonly TimeSpan TurnChannelActiveTtl = TimeSpan.FromMinutes(9);
     private static readonly TimeSpan PortMappingRetryInterval = TimeSpan.FromSeconds(30);
     private const int PortMappingLeaseSeconds = 7200;
     private const int ProbeBurstCount = 3;
@@ -60,6 +61,19 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private static readonly TimeSpan DirectKeepaliveInterval = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan DirectStaleInterval = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan ConnectivityCheckPacing = TimeSpan.FromMilliseconds(20);
+    // H-2：session 首次发起连通性检查后的密集退避重试节奏，对齐 Java
+    // HOLE_PUNCH_RETRY_DELAYS_MILLIS={1k,2k,4k,8k}。把"打洞成功前的丢包窗口"从最坏 15s
+    // maintenance tick 压缩到数秒，不改变最终成功率。打通或过期即停。
+    private static readonly TimeSpan[] HolePunchRetryDelays =
+    {
+        TimeSpan.FromSeconds(1),
+        TimeSpan.FromSeconds(2),
+        TimeSpan.FromSeconds(4),
+        TimeSpan.FromSeconds(8),
+    };
+    // H-1：候选回礼节流间隔，避免两端互相触发形成信令循环，对齐 Java
+    // CANDIDATE_RECIPROCATE_INTERVAL_MILLIS=2000。
+    private static readonly TimeSpan CandidateReciprocateInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan PeerMessageSessionWaitTimeout = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan PeerMessageAckTimeout = TimeSpan.FromMilliseconds(1500);
     private static readonly TimeSpan PendingTurnRequestTtl = TimeSpan.FromSeconds(15);
@@ -76,19 +90,34 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private readonly ILogger<PeerMeshClient> _logger;
     private readonly ITunnelClientObserver? _observer;
     private readonly object _sync = new();
+    /// <summary>
+    /// This process instance's random SPM2 key epoch. It anchors AES-GCM nonce uniqueness:
+    /// sessionId/token are reused within the server session TTL and X25519 keys are persisted
+    /// on disk, so only a fresh epoch keeps a restarted client out of the same nonce space
+    /// once its sequence restarts at 1.
+    /// </summary>
+    private readonly string _localKeyEpoch = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+    private readonly Dictionary<long, string> _peerKeyEpochs = new();
     private readonly Dictionary<long, PeerMeshPeer> _peers = new();
     private readonly Dictionary<long, PeerMeshSession> _sessions = new();
     private readonly Dictionary<long, PeerMeshSession> _sessionsById = new();
     private readonly Dictionary<string, PendingProbe> _pending = new(StringComparer.Ordinal);
     private readonly Dictionary<long, List<PendingVirtualPacket>> _pendingPackets = new();
     private readonly Dictionary<long, DateTimeOffset> _pathPreparedAt = new();
+    // H-2：记录已排程密集退避重试的 peer，防止重复排程；本轮结束后释放以便路径失效后重新进入。
+    private readonly Dictionary<long, bool> _holePunchRetryScheduled = new();
+    // H-1：记录每个 peer 最近一次候选回礼时间，2s 节流防信令循环。
+    private readonly Dictionary<long, DateTimeOffset> _candidateReciprocateAt = new();
     private readonly Dictionary<string, string> _natByRole = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PendingStunBinding> _pendingStun = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PendingTurnRequest> _pendingTurn = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PeerCandidate> _srflxCandidates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _turnPermissions = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, TurnChannelBinding> _turnChannelsByPeer = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<ushort, TurnChannelBinding> _turnChannelsByNumber = new();
     private readonly Dictionary<string, PendingClientMessageAck> _pendingMessageAcks = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> _ignoredPacketLogAt = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PeerPathMtu.CacheEntry> _pathMtuCache = new(StringComparer.Ordinal);
     private readonly NatPortMappingService _portMappingService;
     private readonly TurnLongTermAuthenticator _turnAuthenticator = new();
     private readonly NatBehaviorDiscovery _natBehaviorDiscovery = new();
@@ -116,6 +145,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private string _lastEndpoint = "";
     private PeerKeyMaterial? _keyMaterial;
     private IPeerVirtualDevice? _device;
+	private ushort _nextTurnChannel = TurnChannelData.MinChannel;
 
     public PeerMeshClient(TunnelClientConfig config, ILogger<PeerMeshClient> logger, ITunnelClientObserver? observer = null)
     {
@@ -166,8 +196,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         UdpClient udp;
         try
         {
-            udp = new UdpClient(AddressFamily.InterNetwork);
-            udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+            udp = CreatePeerUdpClient();
         }
         catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
         {
@@ -207,7 +236,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pendingTurn.Clear();
             _srflxCandidates.Clear();
             _turnPermissions.Clear();
+			_turnChannelsByPeer.Clear();
+			_turnChannelsByNumber.Clear();
+			_nextTurnChannel = TurnChannelData.MinChannel;
             _ignoredPacketLogAt.Clear();
+            _pathMtuCache.Clear();
             _srflx = null;
             _relay = null;
             _portMap = null;
@@ -270,6 +303,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         lock (_sync)
         {
             _pendingTurn.Clear();
+			_turnChannelsByPeer.Clear();
+			_turnChannelsByNumber.Clear();
+			_nextTurnChannel = TurnChannelData.MinChannel;
         }
     }
 
@@ -420,6 +456,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     MergeSession(message);
                     await SyncVirtualDeviceRoutesAsync().ConfigureAwait(false);
                     await SendConnectivityChecksAsync(message).ConfigureAwait(false);
+                    // H-1 候选回礼：port-restricted 组合下打洞要求双方几乎同时互射，本端无健康 direct
+                    // 路径时立刻回发自身候选，把双端 burst 窗口对齐到一个信令 RTT 内。
+                    await ReciprocateCandidatesAsync(PeerIdFromControl(message)).ConfigureAwait(false);
                     break;
                 case TypeClose:
                     CloseSession(message);
@@ -500,7 +539,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 _logger.LogWarning(ex, "Peer Mesh UDP receive failed");
                 return;
             }
-            await HandleUdpAsync(result.Buffer, result.RemoteEndPoint).ConfigureAwait(false);
+            await HandleUdpAsync(result.Buffer, NormalizePeerEndpoint(result.RemoteEndPoint)).ConfigureAwait(false);
         }
     }
 
@@ -540,7 +579,25 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        var stun = StunMessage.Parse(payload);
+		var channelData = TurnChannelData.Parse(payload);
+		if (channelData is not null)
+		{
+			TurnChannelBinding? binding;
+			lock (_sync)
+			{
+				_turnChannelsByNumber.TryGetValue(channelData.Channel, out binding);
+				if (binding is null || !binding.Active || binding.ExpiresAt <= DateTimeOffset.UtcNow)
+				{
+					binding = null;
+				}
+			}
+			if (binding is not null && SameEndpoint(RelayEndpoint(), remote))
+			{
+				await HandleUdpPayloadAsync(channelData.Payload, remote, EndpointKey(binding.Peer)).ConfigureAwait(false);
+			}
+			return;
+		}
+		var stun = StunMessage.Parse(payload);
         if (stun is not null)
         {
             await HandleStunTurnMessageAsync(stun, remote).ConfigureAwait(false);
@@ -583,6 +640,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 CompleteTurnRequest(message, remote);
                 _logger.LogTrace("Peer Mesh TURN permission created: tx={TransactionId}", message.TransactionIdHex);
                 break;
+			case StunMessage.ChannelBindSuccess:
+				var channelPending = CompleteTurnRequest(message, remote);
+				if (channelPending is not null)
+				{
+					ActivateTurnChannel(channelPending);
+				}
+				break;
             case StunMessage.DataIndication:
                 var peer = message.XorPeerAddress();
                 var inner = message.Data();
@@ -594,18 +658,37 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             case StunMessage.AllocateError:
             case StunMessage.RefreshError:
             case StunMessage.CreatePermissionError:
+			case StunMessage.ChannelBindError:
                 await HandleTurnErrorAsync(message, remote).ConfigureAwait(false);
                 break;
         }
     }
 
-    private void CompleteTurnRequest(StunMessage response, IPEndPoint remote)
+	private PendingTurnRequest? CompleteTurnRequest(StunMessage response, IPEndPoint remote)
     {
         lock (_sync)
         {
-            _pendingTurn.Remove(TurnRequestKey(response.TransactionIdHex, remote));
+			_pendingTurn.Remove(TurnRequestKey(response.TransactionIdHex, remote), out var pending);
+			return pending;
         }
     }
+
+	private void ActivateTurnChannel(PendingTurnRequest pending)
+	{
+		if (pending.RequestType != StunMessage.ChannelBindRequest || pending.Channel is null || pending.Peer is null)
+		{
+			return;
+		}
+		lock (_sync)
+		{
+			if (_turnChannelsByNumber.TryGetValue(pending.Channel.Value, out var binding)
+				&& SameEndpoint(binding.Peer, pending.Peer))
+			{
+				binding.Active = true;
+				binding.ExpiresAt = DateTimeOffset.UtcNow.Add(TurnChannelActiveTtl);
+			}
+		}
+	}
 
     private async Task HandleTurnErrorAsync(StunMessage response, IPEndPoint remote)
     {
@@ -629,6 +712,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             || pending.AuthenticationAttempt >= 1
             || !_turnAuthenticator.ApplyChallenge(response))
         {
+			lock (_sync)
+			{
+				RemoveFailedTurnChannelLocked(pending);
+			}
             _logger.LogWarning(
                 "Peer Mesh TURN request failed: type=0x{Type:x}, code={Code}, attempt={Attempt}",
                 pending.RequestType,
@@ -637,10 +724,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             return;
         }
 
-        var retry = new StunMessage(
+		var retryTransactionId = StunMessage.NewTransactionId();
+		var retry = new StunMessage(
             pending.RequestType,
-            StunMessage.NewTransactionId(),
-            pending.Attributes);
+			retryTransactionId,
+			RemapTransactionAttributes(pending.Attributes, pending.OriginalTransactionId, retryTransactionId));
         _logger.LogDebug(
             "Peer Mesh TURN auth challenge received, retrying once: type=0x{Type:x}, code={Code}",
             pending.RequestType,
@@ -648,6 +736,34 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         await SendStunRequestAsync(retry, pending.Endpoint, pending.AuthenticationAttempt + 1)
             .ConfigureAwait(false);
     }
+
+	private void RemoveFailedTurnChannelLocked(PendingTurnRequest pending)
+	{
+		if (pending.RequestType != StunMessage.ChannelBindRequest || pending.Channel is null)
+		{
+			return;
+		}
+		if (_turnChannelsByNumber.Remove(pending.Channel.Value, out var binding))
+		{
+			_turnChannelsByPeer.Remove(EndpointKey(binding.Peer));
+		}
+	}
+
+	private static IReadOnlyList<StunAttribute> RemapTransactionAttributes(
+		IReadOnlyList<StunAttribute> attributes, byte[] oldTransactionId, byte[] newTransactionId)
+	{
+		return attributes.Select(attribute =>
+		{
+			if (attribute.Type != StunMessage.AttrXorPeerAddress)
+			{
+				return new StunAttribute(attribute.Type, attribute.Value);
+			}
+			var peer = new StunMessage(0, oldTransactionId, [attribute]).XorPeerAddress();
+			return peer is null
+				? new StunAttribute(attribute.Type, attribute.Value)
+				: StunMessage.XorPeerAddress(peer, newTransactionId);
+		}).ToList();
+	}
 
     private async Task HandleStunBindingSuccessAsync(StunMessage message, IPEndPoint remote)
     {
@@ -683,9 +799,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 "udp",
                 mapped.Address.ToString(),
                 mapped.Port,
-                800,
+                mapped.Address.AddressFamily == AddressFamily.InterNetworkV6 ? 900 : 800,
                 publicStun ? "public-stun" : "standard-stun",
-                "");
+                "",
+                AddressFamilyName(mapped.Address));
             var key = CandidateEndpointKey(candidate);
             announce = !_srflxCandidates.ContainsKey(key)
                 || (!publicStun && (_srflx is null || CandidateEndpointKey(_srflx) != key));
@@ -941,7 +1058,15 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 turnServer.Port,
                 100,
                 "standard-turn",
-                relayId);
+                relayId,
+                AddressFamilyName(turnServer.Address));
+			if (announce)
+			{
+				_turnPermissions.Clear();
+				_turnChannelsByPeer.Clear();
+				_turnChannelsByNumber.Clear();
+				_nextTurnChannel = TurnChannelData.MinChannel;
+			}
         }
         if (announce)
         {
@@ -1005,7 +1130,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             await SendRelayPayloadAsync(relayFrom, body).ConfigureAwait(false);
             return;
         }
-        await udp.SendAsync(body, remote).ConfigureAwait(false);
+        await SendPeerUdpAsync(udp, body, remote).ConfigureAwait(false);
     }
 
     private async Task MarkPathFromInboundCheckAsync(PeerMeshSession session, IPEndPoint remote, string relayFrom)
@@ -1268,24 +1393,43 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _logger.LogDebug("Peer Mesh session has no data key: session={Session} peer={Peer}", session.Id, session.PeerId);
             return false;
         }
+        await EnsurePathMtuDiscoveryAsync(session).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(PeerIpPacket.DestinationIPv4(payload)))
+        {
+            var pathMtu = session.PathMtu.EffectiveMtu(_config.PeerMeshMtu);
+            payload = PeerIpPacket.ClampTcpMss(payload, pathMtu);
+            if (payload.Length > pathMtu)
+            {
+                await InjectPacketTooBigAsync(payload, pathMtu).ConfigureAwait(false);
+                return true;
+            }
+        }
         var useRelay = !string.IsNullOrWhiteSpace(session.RelayTargetAllocationId);
         if (!useRelay && (session.RemoteEndpoint is null || avoidDirect || IsMeshEndpoint(session.RemoteEndpoint)))
         {
             return false;
         }
-        session.Sequence++;
-        var frame = PeerDataFrameCodec.Encode(
-            session.AesKey,
-            session.Id,
-            runtime.PeerMesh.ClientId,
-            session.PeerId,
-            session.Sequence,
-            payload);
+        long sequence;
+        PeerDataFrameCodec.TrafficCodec outboundCodec;
+        lock (_sync)
+        {
+            if (!_sessions.TryGetValue(peerId, out var current) || !ReferenceEquals(current, session))
+            {
+                return false;
+            }
+            if (!current.EnsureTrafficCodecs(runtime.PeerMesh.ClientId))
+            {
+                return false;
+            }
+            sequence = ++current.Sequence;
+            outboundCodec = current.OutboundCodec!;
+        }
+        var frame = outboundCodec.Encode(session.Id, sequence, payload);
         if (useRelay)
         {
             return await SendRelayPayloadAsync(session.RelayTargetAllocationId, frame).ConfigureAwait(false);
         }
-        await udp.SendAsync(frame, session.RemoteEndpoint).ConfigureAwait(false);
+        await SendPeerUdpAsync(udp, frame, session.RemoteEndpoint!).ConfigureAwait(false);
         lock (_sync)
         {
             if (_sessions.TryGetValue(peerId, out var current))
@@ -1294,6 +1438,186 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
         }
         return true;
+    }
+
+    private async Task EnsurePathMtuDiscoveryAsync(PeerMeshSession session)
+    {
+        string pathKey;
+        PeerPathMtu.CacheEntry? cached = null;
+        var now = DateTimeOffset.UtcNow;
+        lock (_sync)
+        {
+            if (!_sessions.TryGetValue(session.PeerId, out var current) || !ReferenceEquals(current, session))
+            {
+                return;
+            }
+            pathKey = PathMtuKey(session);
+            if (_pathMtuCache.TryGetValue(pathKey, out var item))
+            {
+                if (now < item.ValidUntil)
+                {
+                    cached = item;
+                }
+                else
+                {
+                    _pathMtuCache.Remove(pathKey);
+                }
+            }
+        }
+        if (string.IsNullOrWhiteSpace(pathKey))
+        {
+            return;
+        }
+        await ApplyPathMtuTransitionAsync(
+            session, session.PathMtu.Activate(pathKey, _config.PeerMeshMtu, cached, now)).ConfigureAwait(false);
+    }
+
+    private async Task<bool> HandlePathMtuMessageAsync(byte[] payload, PeerMeshSession session)
+    {
+        if (!PeerPathMtu.LooksLike(payload))
+        {
+            return false;
+        }
+        var message = PeerPathMtu.Decode(payload);
+        if (message is null)
+        {
+            return true;
+        }
+        if (message.IsProbe)
+        {
+            await SendRawPeerPayloadAsync(session, PeerPathMtu.EncodeAck(message.Nonce, message.InnerMtu))
+                .ConfigureAwait(false);
+            return true;
+        }
+        await ApplyPathMtuTransitionAsync(
+            session, session.PathMtu.Acknowledge(message.Nonce, message.InnerMtu, DateTimeOffset.UtcNow))
+            .ConfigureAwait(false);
+        return true;
+    }
+
+    private async Task ApplyPathMtuTransitionAsync(PeerMeshSession session, PeerPathMtu.Transition transition)
+    {
+        if (transition.CompletedMtu is { } completed)
+        {
+            var pathKey = session.PathMtu.PathKey;
+            if (!string.IsNullOrWhiteSpace(pathKey))
+            {
+                lock (_sync)
+                {
+                    _pathMtuCache[pathKey] = new PeerPathMtu.CacheEntry(
+                        completed, DateTimeOffset.UtcNow + PeerPathMtu.CacheTtl);
+                }
+                _logger.LogDebug(
+                    "Peer Mesh path MTU discovered: session={Session} peer={Peer} path={Path} mtu={Mtu}",
+                    session.Id, session.PeerId, pathKey, completed);
+            }
+        }
+        if (transition.NextProbe is not null)
+        {
+            await SendPathMtuProbeAsync(session, transition.NextProbe).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SendPathMtuProbeAsync(PeerMeshSession session, PeerPathMtu.Probe probe)
+    {
+        await SendRawPeerPayloadAsync(session, PeerPathMtu.EncodeProbe(probe.Nonce, probe.InnerMtu))
+            .ConfigureAwait(false);
+        var sessionId = session.Id;
+        var nonce = probe.Nonce;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(PeerPathMtu.ProbeTimeout).ConfigureAwait(false);
+                PeerMeshSession? current;
+                lock (_sync)
+                {
+                    _sessionsById.TryGetValue(sessionId, out current);
+                }
+                if (current is null || DateTimeOffset.UtcNow > current.ExpiresAt)
+                {
+                    return;
+                }
+                await ApplyPathMtuTransitionAsync(
+                    current, current.PathMtu.Timeout(nonce, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is SocketException or ObjectDisposedException or CryptographicException)
+            {
+                _logger.LogTrace(ex, "Peer Mesh path MTU retry failed");
+            }
+        });
+    }
+
+    private async Task<bool> SendRawPeerPayloadAsync(PeerMeshSession session, byte[] payload)
+    {
+        UdpClient? udp;
+        TunnelRuntimeState? runtime;
+        IPEndPoint? remote;
+        string? relayTarget;
+        long sequence;
+        PeerDataFrameCodec.TrafficCodec outboundCodec;
+        lock (_sync)
+        {
+            udp = _udp;
+            runtime = _runtime;
+            if (udp is null || runtime is null
+                || !_sessions.TryGetValue(session.PeerId, out var current)
+                || !ReferenceEquals(current, session)
+                || DateTimeOffset.UtcNow > current.ExpiresAt
+                || current.AesKey.Length != 32)
+            {
+                return false;
+            }
+            if (!current.EnsureTrafficCodecs(runtime.PeerMesh.ClientId))
+            {
+                return false;
+            }
+            sequence = ++current.Sequence;
+            remote = current.RemoteEndpoint;
+            relayTarget = current.RelayTargetAllocationId;
+            outboundCodec = current.OutboundCodec!;
+        }
+        var frame = outboundCodec.Encode(session.Id, sequence, payload);
+        if (!string.IsNullOrWhiteSpace(relayTarget))
+        {
+            return await SendRelayPayloadAsync(relayTarget, frame).ConfigureAwait(false);
+        }
+        if (remote is null || IsMeshEndpoint(remote))
+        {
+            return false;
+        }
+        await SendPeerUdpAsync(udp, frame, remote).ConfigureAwait(false);
+        lock (_sync)
+        {
+            if (_sessions.TryGetValue(session.PeerId, out var current))
+            {
+                current.DirectBytesPending += frame.Length;
+            }
+        }
+        return true;
+    }
+
+    private static string PathMtuKey(PeerMeshSession session)
+    {
+        if (!string.IsNullOrWhiteSpace(session.RelayTargetAllocationId))
+        {
+            return "relay|" + session.RelayTargetAllocationId;
+        }
+        return session.RemoteEndpoint is null ? "" : "direct|" + EndpointKey(session.RemoteEndpoint);
+    }
+
+    private async Task InjectPacketTooBigAsync(byte[] packet, int pathMtu)
+    {
+        var response = PeerIpPacket.IcmpFragmentationNeededFor(packet, pathMtu);
+        IPeerVirtualDevice? device;
+        lock (_sync)
+        {
+            device = _device;
+        }
+        if (response is not null && device is not null)
+        {
+            await device.WritePacketAsync(response, CancellationToken.None).ConfigureAwait(false);
+        }
     }
 
     private void QueuePendingPacket(long peerId, byte[] packet)
@@ -1442,28 +1766,32 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         PeerMeshSession? session;
         IPeerVirtualDevice? device;
         TunnelRuntimeState? runtime;
+        PeerDataFrameCodec.TrafficCodec? inboundCodec;
         lock (_sync)
         {
             _sessionsById.TryGetValue(frameSessionId.Value, out session);
             device = _device;
             runtime = _runtime;
+            if (session is not null && runtime is not null)
+            {
+                _ = session.EnsureTrafficCodecs(runtime.PeerMesh.ClientId);
+            }
+            inboundCodec = session?.InboundCodec;
         }
-        if (device is null || runtime is null || session is null || session.AesKey.Length != 32)
+        if (device is null || runtime is null || session is null || inboundCodec is null)
         {
             return;
         }
         PeerDataFrame frame;
         try
         {
-            frame = PeerDataFrameCodec.Decode(session.AesKey, payload);
+            frame = inboundCodec.Decode(session.Id, payload);
         }
-        catch (CryptographicException)
+        catch (Exception ex) when (ex is CryptographicException or ObjectDisposedException)
         {
             return;
         }
-        if (frame.SessionId != session.Id
-            || frame.FromClientId != session.PeerId
-            || frame.ToClientId != runtime.PeerMesh.ClientId)
+        if (frame.SessionId != session.Id)
         {
             return;
         }
@@ -1473,7 +1801,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             if (!_sessionsById.TryGetValue(frame.SessionId, out var current)
                 || current.PeerId != session.PeerId
                 || DateTimeOffset.UtcNow > current.ExpiresAt
-                || !current.Replay.Accept(frame.Sequence))
+                || !current.AcceptInboundFrame(frame))
             {
                 return;
             }
@@ -1499,6 +1827,11 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         if (ready is not null)
         {
             await FlushPendingPacketsAsync(ready).ConfigureAwait(false);
+        }
+        if (ready is not null
+            && await HandlePathMtuMessageAsync(frame.Payload, ready).ConfigureAwait(false))
+        {
+            return;
         }
         if (ready is not null
             && await HandlePeerAppMessageAsync(frame.Payload, ready, relayFrom, runtime).ConfigureAwait(false))
@@ -1551,6 +1884,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _logger.LogDebug("Peer Mesh app message decode failed: session={Session} peer={Peer}",
                 session.Id,
                 session.PeerId);
+            return true;
+        }
+        if (message.FromClientId != 0 && message.FromClientId != session.PeerId)
+        {
             return true;
         }
 
@@ -1727,6 +2064,21 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     };
             }
             _peers[peer.ClientId] = peer;
+            // Only the source side carries its own epoch; when we are the source the field
+            // holds our local epoch and must not be recorded as the peer's.
+            if (!string.IsNullOrWhiteSpace(message.SourceKeyEpoch)
+                && message.SourceClientId == peer.ClientId)
+            {
+                _peerKeyEpochs[peer.ClientId] = message.SourceKeyEpoch!;
+                if (_sessions.TryGetValue(peer.ClientId, out var session)
+                    && session.ApplyRemoteKeyEpoch(message.SourceKeyEpoch!))
+                {
+                    _logger.LogInformation(
+                        "Peer mesh remote key epoch changed, inbound state reset: peer={PeerId}",
+                        peer.ClientId);
+                    _ = session.EnsureTrafficCodecs(runtime.PeerMesh.ClientId);
+                }
+            }
         }
         PublishPeerMeshSnapshot();
     }
@@ -1743,6 +2095,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         _sessions.Remove(peerId);
         _sessionsById.Remove(session.Id);
+        session.DisposeTrafficCodecs();
         return null;
     }
 
@@ -1751,6 +2104,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         var runtime = Runtime();
         if (runtime is null || message.SessionId is null || message.SessionId <= 0 || string.IsNullOrWhiteSpace(message.Token))
         {
+            return;
+        }
+        if (message.DataFrameVersion != 2)
+        {
+            _logger.LogWarning(
+                "Peer Mesh session rejected: required dataFrameVersion=2 received={Version}",
+                message.DataFrameVersion);
             return;
         }
         var peerId = message.TargetClientId;
@@ -1817,10 +2177,27 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             {
                 session.PathType = message.PathType;
             }
-            session.AesKey = DeriveSessionKey(peerPublicKey, session.Id, session.Token, runtime.PeerMesh.ClientId, peerId);
+            session.LocalKeyEpoch = _localKeyEpoch;
+            if (!string.IsNullOrWhiteSpace(message.SourceKeyEpoch)
+                && message.SourceClientId == peerId)
+            {
+                _peerKeyEpochs[peerId] = message.SourceKeyEpoch!;
+            }
+            if (_peerKeyEpochs.TryGetValue(peerId, out var knownEpoch))
+            {
+                session.ApplyRemoteKeyEpoch(knownEpoch);
+            }
+            session.SetDataKey(
+                DeriveSessionKey(peerPublicKey, session.Id, session.Token,
+                    runtime.PeerMesh.ClientId, peerId),
+                runtime.PeerMesh.ClientId);
             if (previous is not null)
             {
                 _sessionsById.Remove(previous.Id);
+                if (!ReferenceEquals(previous, session))
+                {
+                    previous.DisposeTrafficCodecs();
+                }
             }
             _sessions[peerId] = session;
             _sessionsById[session.Id] = session;
@@ -1856,8 +2233,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             foreach (var peerId in _sessions.Where(item => item.Value.Id == message.SessionId).Select(item => item.Key).ToList())
             {
-                _sessionsById.Remove(_sessions[peerId].Id);
+                var session = _sessions[peerId];
+                _sessionsById.Remove(session.Id);
                 _sessions.Remove(peerId);
+                session.DisposeTrafficCodecs();
             }
         }
     }
@@ -1898,6 +2277,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 SourceClientName = runtime.PeerMesh.ClientName,
                 SourceVirtualIp = runtime.PeerMesh.VirtualIp,
                 SourcePublicKey = runtime.PeerMesh.ClientPublicKey,
+            SourceKeyEpoch = _localKeyEpoch,
                 TargetClientId = item.Peer.ClientId,
                 TargetClientName = item.Peer.ClientName,
                 TargetVirtualIp = item.Peer.VirtualIp,
@@ -1906,6 +2286,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 Token = item.Session?.Token,
                 ExpiresAt = item.Session?.ExpiresAt.ToString("O"),
                 Candidates = candidates,
+                DataFrameVersion = 2,
                 CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             }).ConfigureAwait(false);
         }
@@ -1928,7 +2309,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return;
         }
-        var candidates = NormalizeCandidates(message.Candidates);
+        // H-3 + H-6：先做同 NAT reflexive 降权（priority=1），再按 priority 降序排序，让 host/port-map
+        // 高优先级候选先命中，被降权的同 NAT reflexive 候选自然排到末尾（不剪除，保留 hairpin 可能性）。
+        var candidates = SortedConnectivityCandidates(NormalizeCandidates(message.Candidates));
         var delay = TimeSpan.Zero;
         foreach (var candidate in candidates.Where(x =>
             string.Equals(x.Transport, "udp", StringComparison.OrdinalIgnoreCase)
@@ -1952,6 +2335,237 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 delay += ConnectivityCheckPacing;
             }
         }
+        ScheduleHolePunchRetries(session);
+    }
+
+    /// <summary>
+    /// H-3 + H-6：先做同 NAT reflexive 降权（priority=1，不剪除），再按 priority 降序排序。
+    /// 降权在前保证被降权的候选自然排到末尾，与 Java demoteSameNatReflexiveCandidates ->
+    /// sortedCandidates 的顺序一致。抽成独立方法便于单测。
+    /// </summary>
+    private List<PeerCandidate> SortedConnectivityCandidates(List<PeerCandidate> candidates)
+    {
+        var demoted = DemoteSameNatReflexiveCandidates(candidates);
+        return [.. demoted.OrderByDescending(c => c.Priority)];
+    }
+
+    /// <summary>
+    /// H-6：把与本地 STUN 观测公网地址相同的对端 reflexive 候选（srflx 或 port-map）降到
+    /// priority=1，而不是从候选集中删除。同 NAT 下 host 未必可达（AP 隔离、同 NAT 不同子网），
+    /// 而支持 hairpin 的 NAT 上 srflx 反而能通；直接剪除会把这条可用路径永久丢弃。
+    /// 对齐 Java demoteSameNatReflexiveCandidates。
+    /// </summary>
+    private List<PeerCandidate> DemoteSameNatReflexiveCandidates(List<PeerCandidate> candidates)
+    {
+        if (candidates.Count == 0)
+        {
+            return candidates;
+        }
+        HashSet<string> localAddresses;
+        lock (_sync)
+        {
+            localAddresses = new HashSet<string>(StringComparer.Ordinal);
+            if (_srflx is { } srflx && !string.IsNullOrWhiteSpace(srflx.Address))
+            {
+                localAddresses.Add(srflx.Address);
+            }
+            foreach (var candidate in _srflxCandidates.Values)
+            {
+                if (!string.IsNullOrWhiteSpace(candidate.Address))
+                {
+                    localAddresses.Add(candidate.Address);
+                }
+            }
+        }
+        if (localAddresses.Count == 0)
+        {
+            return candidates;
+        }
+        var result = new List<PeerCandidate>(candidates.Count);
+        foreach (var candidate in candidates)
+        {
+            if (IsReflexiveCandidate(candidate)
+                && !string.IsNullOrWhiteSpace(candidate.Address)
+                && localAddresses.Contains(candidate.Address))
+            {
+                result.Add(candidate with { Priority = 1 });
+            }
+            else
+            {
+                result.Add(candidate);
+            }
+        }
+        return result;
+    }
+
+    /// <summary>判断候选是否为反射型（srflx 或端口映射），同 NAT 检测只针对这类候选。</summary>
+    private static bool IsReflexiveCandidate(PeerCandidate candidate) =>
+        string.Equals(candidate.Type, "srflx", StringComparison.OrdinalIgnoreCase)
+        || (candidate.Foundation?.StartsWith("port-map-", StringComparison.Ordinal) ?? false);
+
+    /// <summary>
+    /// H-2：session 首次发起连通性检查后按 1s/2s/4s/8s 退避重试，而不是等 15s maintenance tick。
+    /// 已建立健康 direct 路径时自动停止。本轮结束后释放标记，路径后续失效时可以重新进入密集重试。
+    /// 对齐 Java scheduleHolePunchRetries。
+    /// </summary>
+    private void ScheduleHolePunchRetries(PeerMeshSession? session)
+    {
+        if (session is null)
+        {
+            return;
+        }
+        var peerId = session.PeerId;
+        var sessionId = session.Id;
+        lock (_sync)
+        {
+            if (_holePunchRetryScheduled.TryGetValue(peerId, out var scheduled) && scheduled)
+            {
+                return;
+            }
+            _holePunchRetryScheduled[peerId] = true;
+        }
+        foreach (var delay in HolePunchRetryDelays)
+        {
+            var capturedDelay = delay;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(capturedDelay).ConfigureAwait(false);
+                    await RetryHolePunch(peerId, sessionId).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogTrace(ex, "Peer Mesh hole-punch retry failed: peer={PeerId}", peerId);
+                }
+            });
+        }
+        // 本轮结束后释放标记，路径后续失效时可以重新进入密集重试。
+        var lastDelay = HolePunchRetryDelays[^1] + TimeSpan.FromSeconds(1);
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(lastDelay).ConfigureAwait(false);
+            lock (_sync)
+            {
+                _holePunchRetryScheduled.Remove(peerId);
+            }
+        });
+    }
+
+    /// <summary>H-2 退避重试的实际执行体：重新查找 session，过期或已打通则停止。</summary>
+    private async Task RetryHolePunch(long peerId, long sessionId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        PeerMeshSession? session;
+        List<PeerCandidate>? candidates;
+        lock (_sync)
+        {
+            if (!_sessions.TryGetValue(peerId, out session) || session.Id != sessionId)
+            {
+                _holePunchRetryScheduled.Remove(peerId);
+                return;
+            }
+            if (now > session.ExpiresAt || session.HasHealthyDirect(now))
+            {
+                _holePunchRetryScheduled.Remove(peerId);
+                return;
+            }
+            if (!_peers.TryGetValue(peerId, out var peer) || !peer.Online)
+            {
+                return;
+            }
+            candidates = NormalizeCandidates(peer.Candidates);
+        }
+        await SendConnectivityChecksAsync(new PeerControlMessage
+        {
+            Type = TypeCandidates,
+            SourceClientId = peerId,
+            Candidates = candidates,
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>从控制消息中解析对端 clientId：本端是 source 时取 target，否则取 source。</summary>
+    private long PeerIdFromControl(PeerControlMessage message)
+    {
+        var runtime = Runtime();
+        var selfId = runtime?.PeerMesh.ClientId ?? 0;
+        return message.SourceClientId == selfId ? message.TargetClientId : message.SourceClientId;
+    }
+
+    /// <summary>
+    /// H-1 候选回礼：收到对端候选后，若本端尚无健康 direct 路径，立即回发自身候选，把双端打洞
+    /// 窗口从最坏 15s maintenance tick 压到一个信令 RTT 内对齐。带 2s 节流防两端互触发形成信令
+    /// 循环。对齐 Java reciprocateCandidates。
+    /// </summary>
+    private async Task ReciprocateCandidatesAsync(long peerId)
+    {
+        if (peerId <= 0)
+        {
+            return;
+        }
+        var now = DateTimeOffset.UtcNow;
+        lock (_sync)
+        {
+            if (_sessions.TryGetValue(peerId, out var session) && session.HasHealthyDirect(now))
+            {
+                return;
+            }
+            if (_candidateReciprocateAt.TryGetValue(peerId, out var previous) && now - previous < CandidateReciprocateInterval)
+            {
+                return;
+            }
+            _candidateReciprocateAt[peerId] = now;
+        }
+        await AnnounceCandidatesToPeerAsync(peerId).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 向单个 peer 回发本端候选，是 AnnounceCandidatesAsync 的单 peer 版本，供 H-1 候选回礼复用，
+    /// 避免向所有在线 peer 广播。
+    /// </summary>
+    private async Task AnnounceCandidatesToPeerAsync(long peerId)
+    {
+        var candidates = GatherCandidates();
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+        TunnelRuntimeState? runtime;
+        PeerMeshPeer? peer;
+        PeerMeshSession? session;
+        var now = DateTimeOffset.UtcNow;
+        lock (_sync)
+        {
+            runtime = _runtime;
+            if (!_peers.TryGetValue(peerId, out peer) || !peer.Online || string.IsNullOrWhiteSpace(peer.ClientName))
+            {
+                return;
+            }
+            session = ReusableSessionLocked(peerId, now);
+        }
+        if (runtime is null || peer is null)
+        {
+            return;
+        }
+        await SendPeerControlAsync(FirstNonEmpty(peer.ClientName), new PeerControlMessage
+        {
+            Type = TypeCandidates,
+            SourceClientId = runtime.PeerMesh.ClientId,
+            SourceClientName = runtime.PeerMesh.ClientName,
+            SourceVirtualIp = runtime.PeerMesh.VirtualIp,
+            SourcePublicKey = runtime.PeerMesh.ClientPublicKey,
+            SourceKeyEpoch = _localKeyEpoch,
+            TargetClientId = peer.ClientId,
+            TargetClientName = peer.ClientName,
+            TargetVirtualIp = peer.VirtualIp,
+            TargetPublicKey = peer.PublicKey,
+            SessionId = session?.Id,
+            Token = session?.Token,
+            ExpiresAt = session?.ExpiresAt.ToString("O"),
+            Candidates = candidates,
+            DataFrameVersion = 2,
+            CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        }).ConfigureAwait(false);
     }
 
     private async Task ProbeKnownCandidatesAsync()
@@ -2076,7 +2690,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         if (IPAddress.TryParse(candidate.Address, out var ip))
         {
             var remote = new IPEndPoint(ip, candidate.Port);
-            await udp.SendAsync(body, remote).ConfigureAwait(false);
+            await SendPeerUdpAsync(udp, body, remote).ConfigureAwait(false);
             ScheduleProbeBurst(udp, body, remote, nonce);
         }
     }
@@ -2110,7 +2724,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         }
         try
         {
-            await udp.SendAsync(body, remote).ConfigureAwait(false);
+            await SendPeerUdpAsync(udp, body, remote).ConfigureAwait(false);
             ScheduleProbeBurst(udp, body, remote, nonce);
         }
         catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
@@ -2142,7 +2756,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                             return;
                         }
                     }
-                    await udp.SendAsync(body, remote).ConfigureAwait(false);
+                    await SendPeerUdpAsync(udp, body, remote).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (ex is SocketException or ObjectDisposedException or InvalidOperationException)
                 {
@@ -2304,11 +2918,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                 }
                 foreach (var address in networkInterface.GetIPProperties().UnicastAddresses.Select(x => x.Address))
                 {
-                    if (address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(address) || InCidr(address, runtime.PeerMesh.Cidr))
+                    if (!IsUsablePeerHostAddress(address, runtime.PeerMesh.Cidr))
                     {
                         continue;
                     }
-                    candidates.Add(new PeerCandidate("host", "udp", address.ToString(), port, 1000, networkInterface.Name, ""));
+                    var family = address.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4";
+                    var priority = family == "IPv6" ? 1200 : 1000;
+                    candidates.Add(new PeerCandidate("host", "udp", address.ToString(), port,
+                        priority, networkInterface.Name, "", family));
                 }
             }
         }
@@ -2369,7 +2986,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     mapping.ExternalPort,
                     900,
                     "port-map-" + mapping.Protocol.ToString().ToLowerInvariant(),
-                    "");
+                    "",
+                    AddressFamilyName(mapping.ExternalAddress));
                 lock (_sync)
                 {
                     if (_udp is null)
@@ -2434,8 +3052,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _portMapping = renewed;
             _portMap = _portMap is null
                 ? new PeerCandidate("srflx", "udp", renewed.ExternalAddress, renewed.ExternalPort, 900,
-                    "port-map-" + renewed.Protocol.ToString().ToLowerInvariant(), "")
-                : _portMap with { Address = renewed.ExternalAddress, Port = renewed.ExternalPort };
+                    "port-map-" + renewed.Protocol.ToString().ToLowerInvariant(), "",
+                    AddressFamilyName(renewed.ExternalAddress))
+                : _portMap with
+                {
+                    Address = renewed.ExternalAddress,
+                    Port = renewed.ExternalPort,
+                    AddressFamily = AddressFamilyName(renewed.ExternalAddress),
+                };
         }
     }
 
@@ -2716,7 +3340,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             pending = new PendingTurnRequest(
                 message.Type,
                 message.Attributes.Select(attribute => new StunAttribute(attribute.Type, attribute.Value)).ToList(),
+				message.TransactionId,
                 endpoint,
+				message.ChannelNumber(),
+				message.XorPeerAddress(),
                 authenticationAttempt,
                 DateTimeOffset.UtcNow);
             lock (_sync)
@@ -2727,7 +3354,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         try
         {
             var body = _turnAuthenticator.Encode(message);
-            await udp.SendAsync(body, endpoint).ConfigureAwait(false);
+            await SendPeerUdpAsync(udp, body, endpoint).ConfigureAwait(false);
         }
         catch
         {
@@ -2774,6 +3401,19 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             return false;
         }
         await EnsureTurnPermissionAsync(peer).ConfigureAwait(false);
+		var binding = await EnsureTurnChannelAsync(peer).ConfigureAwait(false);
+		UdpClient? udp;
+		var useChannelData = false;
+		lock (_sync)
+		{
+			udp = _udp;
+			useChannelData = binding is { Active: true } && binding.ExpiresAt > DateTimeOffset.UtcNow;
+		}
+		if (useChannelData && udp is not null && binding is not null)
+		{
+			await SendPeerUdpAsync(udp, TurnChannelData.Encode(binding.Channel, payload), endpoint).ConfigureAwait(false);
+			return true;
+		}
         var transactionId = StunMessage.NewTransactionId();
         await SendStunRequestAsync(StunMessage.Of(
             StunMessage.SendIndication,
@@ -2783,6 +3423,61 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             endpoint).ConfigureAwait(false);
         return true;
     }
+
+	private async Task<TurnChannelBinding?> EnsureTurnChannelAsync(IPEndPoint peer)
+	{
+		var turnServer = RelayEndpoint();
+		if (turnServer is null)
+		{
+			return null;
+		}
+		TurnChannelBinding binding;
+		lock (_sync)
+		{
+			var now = DateTimeOffset.UtcNow;
+			var peerKey = EndpointKey(peer);
+			if (_turnChannelsByPeer.TryGetValue(peerKey, out var existing)
+				&& existing.ExpiresAt - now > TimeSpan.FromSeconds(30))
+			{
+				return existing;
+			}
+			var channel = AllocateTurnChannelLocked(now);
+			if (channel is null)
+			{
+				return null;
+			}
+			binding = new TurnChannelBinding(channel.Value, peer, now.Add(PendingTurnRequestTtl));
+			_turnChannelsByPeer[peerKey] = binding;
+			_turnChannelsByNumber[channel.Value] = binding;
+		}
+		var transactionId = StunMessage.NewTransactionId();
+		await SendStunRequestAsync(StunMessage.Of(
+			StunMessage.ChannelBindRequest,
+			transactionId,
+			StunMessage.ChannelNumber(binding.Channel),
+			StunMessage.XorPeerAddress(peer, transactionId)), turnServer).ConfigureAwait(false);
+		return binding;
+	}
+
+	private ushort? AllocateTurnChannelLocked(DateTimeOffset now)
+	{
+		var start = _nextTurnChannel is >= TurnChannelData.MinChannel and <= TurnChannelData.MaxChannel
+			? _nextTurnChannel
+			: TurnChannelData.MinChannel;
+		var channel = start;
+		do
+		{
+			if (!_turnChannelsByNumber.TryGetValue(channel, out var binding) || binding.ExpiresAt <= now)
+			{
+				_nextTurnChannel = channel == TurnChannelData.MaxChannel
+					? TurnChannelData.MinChannel
+					: (ushort)(channel + 1);
+				return channel;
+			}
+			channel = channel == TurnChannelData.MaxChannel ? TurnChannelData.MinChannel : (ushort)(channel + 1);
+		} while (channel != start);
+		return null;
+	}
 
     private async Task EnsureTurnPermissionAsync(IPEndPoint peer)
     {
@@ -2822,16 +3517,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return null;
         }
-        if (!IPAddress.TryParse(host, out var ip))
+        IPAddress? ip = null;
+        try
         {
-            try
-            {
-                ip = Dns.GetHostAddresses(host).FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork);
-            }
-            catch (SocketException ex)
-            {
-                _logger.LogDebug(ex, "Peer Mesh STUN endpoint resolve failed: {Host}:{Port}", host, port);
-            }
+            ip = ResolvePeerAddress(host);
+        }
+        catch (SocketException ex)
+        {
+            _logger.LogDebug(ex, "Peer Mesh STUN endpoint resolve failed: {Host}:{Port}", host, port);
         }
         return ip is null ? null : new IPEndPoint(ip, port);
     }
@@ -2849,16 +3542,14 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return null;
         }
-        if (!IPAddress.TryParse(host, out var ip))
+        IPAddress? ip = null;
+        try
         {
-            try
-            {
-                ip = Dns.GetHostAddresses(host).FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork);
-            }
-            catch (SocketException ex)
-            {
-                _logger.LogWarning(ex, "Peer Mesh relay endpoint resolve failed: {Host}:{Port}", host, port);
-            }
+            ip = ResolvePeerAddress(host);
+        }
+        catch (SocketException ex)
+        {
+            _logger.LogWarning(ex, "Peer Mesh relay endpoint resolve failed: {Host}:{Port}", host, port);
         }
         return ip is null ? null : new IPEndPoint(ip, port);
     }
@@ -2925,19 +3616,39 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         {
             return null;
         }
-        if (!IPAddress.TryParse(host, out var ip))
+        IPAddress? ip = null;
+        try
         {
-            try
-            {
-                ip = Dns.GetHostAddresses(host).FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork);
-            }
-            catch (SocketException ex)
-            {
-                _logger.LogDebug(ex, "Peer Mesh STUN endpoint resolve failed: {Host}:{Port}", host, port);
-            }
+            ip = ResolvePeerAddress(host);
+        }
+        catch (SocketException ex)
+        {
+            _logger.LogDebug(ex, "Peer Mesh STUN endpoint resolve failed: {Host}:{Port}", host, port);
         }
         return ip is null ? null : new IPEndPoint(ip, port);
     }
+
+    private IPAddress? ResolvePeerAddress(string host)
+    {
+        var socketFamily = _udp?.Client.AddressFamily ?? AddressFamily.InterNetwork;
+        var supportsIPv6 = socketFamily == AddressFamily.InterNetworkV6;
+        if (IPAddress.TryParse(host, out var literal))
+        {
+            return literal.AddressFamily == AddressFamily.InterNetwork || supportsIPv6 ? literal : null;
+        }
+        return Dns.GetHostAddresses(host)
+            .Where(address => address.AddressFamily == AddressFamily.InterNetwork
+                || supportsIPv6 && address.AddressFamily == AddressFamily.InterNetworkV6)
+            .OrderByDescending(address => supportsIPv6 && address.AddressFamily == AddressFamily.InterNetworkV6)
+            .FirstOrDefault();
+    }
+
+    private static string AddressFamilyName(IPAddress address) =>
+        address.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4";
+
+    private static string AddressFamilyName(string address) =>
+        IPAddress.TryParse(address, out var parsed) ? AddressFamilyName(parsed)
+            : address.Contains(':') ? "IPv6" : "IPv4";
 
     private static IPEndPoint? ParseEndpoint(string? value)
     {
@@ -2962,7 +3673,13 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         return IPAddress.TryParse(normalized[..colon], out var ip) ? new IPEndPoint(ip, port) : null;
     }
 
-    private static string EndpointKey(IPEndPoint endpoint) => $"{endpoint.Address}:{endpoint.Port}";
+    private static string EndpointKey(IPEndPoint endpoint)
+    {
+        var address = endpoint.Address.IsIPv4MappedToIPv6
+            ? endpoint.Address.MapToIPv4().ToString()
+            : endpoint.Address.ToString();
+        return address.Contains(':') ? $"[{address}]:{endpoint.Port}" : $"{address}:{endpoint.Port}";
+    }
 
     private static string TurnRequestKey(string transactionIdHex, IPEndPoint endpoint) =>
         $"{transactionIdHex}@{EndpointKey(endpoint)}";
@@ -3032,6 +3749,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             SourceClientName = runtime.PeerMesh.ClientName,
             SourceVirtualIp = runtime.PeerMesh.VirtualIp,
             SourcePublicKey = runtime.PeerMesh.ClientPublicKey,
+            SourceKeyEpoch = _localKeyEpoch,
             VirtualDeviceMode = _config.PeerMeshDevice,
             VirtualDeviceName = _config.PeerMeshTunName,
             VirtualDeviceStatus = status,
@@ -3060,6 +3778,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             SourceClientName = runtime.PeerMesh.ClientName,
             SourceVirtualIp = runtime.PeerMesh.VirtualIp,
             SourcePublicKey = runtime.PeerMesh.ClientPublicKey,
+            SourceKeyEpoch = _localKeyEpoch,
             TargetClientId = session.PeerId,
             TargetClientName = session.PeerName,
             TargetVirtualIp = session.PeerVirtualIp,
@@ -3097,6 +3816,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
                     SourceClientName = runtime.PeerMesh.ClientName,
                     SourceVirtualIp = runtime.PeerMesh.VirtualIp,
                     SourcePublicKey = runtime.PeerMesh.ClientPublicKey,
+                    SourceKeyEpoch = _localKeyEpoch,
                     TargetClientId = session.PeerId,
                     TargetClientName = session.PeerName,
                     TargetVirtualIp = session.PeerVirtualIp,
@@ -3150,12 +3870,22 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             foreach (var key in _pendingTurn.Where(item => now - item.Value.SentAt > PendingTurnRequestTtl).Select(item => item.Key).ToList())
             {
-                _pendingTurn.Remove(key);
+				if (_pendingTurn.Remove(key, out var pending))
+				{
+					RemoveFailedTurnChannelLocked(pending);
+				}
             }
+			foreach (var binding in _turnChannelsByNumber.Values.Where(item => item.ExpiresAt <= now).ToList())
+			{
+				_turnChannelsByNumber.Remove(binding.Channel);
+				_turnChannelsByPeer.Remove(EndpointKey(binding.Peer));
+			}
             foreach (var key in _sessions.Where(item => now > item.Value.ExpiresAt).Select(item => item.Key).ToList())
             {
-                _sessionsById.Remove(_sessions[key].Id);
+                var session = _sessions[key];
+                _sessionsById.Remove(session.Id);
                 _sessions.Remove(key);
+                session.DisposeTrafficCodecs();
             }
         }
         PublishPeerMeshSnapshot();
@@ -3395,7 +4125,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             }
             foreach (var candidate in networkInterface.GetIPProperties().UnicastAddresses.Select(item => item.Address))
             {
-                if (candidate.AddressFamily == AddressFamily.InterNetwork && candidate.Equals(address))
+                if (candidate.Equals(address)
+                    || candidate.IsIPv4MappedToIPv6 && candidate.MapToIPv4().Equals(address)
+                    || address.IsIPv4MappedToIPv6 && address.MapToIPv4().Equals(candidate))
                 {
                     return true;
                 }
@@ -3427,6 +4159,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         IPeerVirtualDevice? device;
         NatPortMapping? portMapping;
         List<PendingClientMessageAck> pendingMessageAcks;
+        List<PeerMeshSession> sessions;
         lock (_sync)
         {
             cts = _cts;
@@ -3434,6 +4167,7 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             device = _device;
             portMapping = _portMapping;
             pendingMessageAcks = [.. _pendingMessageAcks.Values];
+            sessions = [.. _sessions.Values.Distinct()];
             _cts = null;
             _udp = null;
             _device = null;
@@ -3451,8 +4185,12 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _pendingTurn.Clear();
             _srflxCandidates.Clear();
             _turnPermissions.Clear();
+			_turnChannelsByPeer.Clear();
+			_turnChannelsByNumber.Clear();
+			_nextTurnChannel = TurnChannelData.MinChannel;
             _pendingMessageAcks.Clear();
             _ignoredPacketLogAt.Clear();
+            _pathMtuCache.Clear();
             _srflx = null;
             _relay = null;
             _portMap = null;
@@ -3470,6 +4208,10 @@ internal sealed class PeerMeshClient : IAsyncDisposable
             _natBehaviorDiscoveryMode = "";
             _lastEndpoint = "";
             _keyMaterial = null;
+        }
+        foreach (var session in sessions)
+        {
+            session.DisposeTrafficCodecs();
         }
         foreach (var pending in pendingMessageAcks)
         {
@@ -3554,6 +4296,74 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         observer.OnPeerMeshChanged(snapshot);
     }
 
+    internal static UdpClient CreatePeerUdpClient()
+    {
+        if (Socket.OSSupportsIPv6)
+        {
+            UdpClient? dualStack = null;
+            try
+            {
+                dualStack = new UdpClient(AddressFamily.InterNetworkV6);
+                dualStack.Client.DualMode = true;
+                dualStack.Client.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
+                return dualStack;
+            }
+            catch (Exception exception) when (exception is SocketException or NotSupportedException)
+            {
+                dualStack?.Dispose();
+            }
+        }
+        var ipv4 = new UdpClient(AddressFamily.InterNetwork);
+        ipv4.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+        return ipv4;
+    }
+
+    internal static bool IsUsablePeerHostAddress(IPAddress address, string? meshCidr)
+    {
+        if (IPAddress.IsLoopback(address)
+            || address.Equals(IPAddress.Any)
+            || address.Equals(IPAddress.IPv6Any)
+            || address.IsIPv6Multicast
+            || address.IsIPv6LinkLocal
+            || InCidr(address, meshCidr))
+        {
+            return false;
+        }
+        if (address.AddressFamily == AddressFamily.InterNetwork)
+        {
+            var bytes = address.GetAddressBytes();
+            return bytes[0] != 169 || bytes[1] != 254;
+        }
+        if (address.AddressFamily != AddressFamily.InterNetworkV6 || address.IsIPv4MappedToIPv6)
+        {
+            return false;
+        }
+        var ipv6 = address.GetAddressBytes();
+        return (ipv6[0] & 0xfe) != 0xfc;
+    }
+
+    private static Task<int> SendPeerUdpAsync(UdpClient udp, byte[] payload, IPEndPoint endpoint)
+        => udp.SendAsync(payload, payload.Length, EndpointForSocket(udp, endpoint));
+
+    private static IPEndPoint EndpointForSocket(UdpClient udp, IPEndPoint endpoint)
+    {
+        var family = udp.Client.AddressFamily;
+        if (family == AddressFamily.InterNetworkV6 && endpoint.AddressFamily == AddressFamily.InterNetwork)
+        {
+            return new IPEndPoint(endpoint.Address.MapToIPv6(), endpoint.Port);
+        }
+        if (family == AddressFamily.InterNetwork && endpoint.Address.IsIPv4MappedToIPv6)
+        {
+            return new IPEndPoint(endpoint.Address.MapToIPv4(), endpoint.Port);
+        }
+        return endpoint;
+    }
+
+    private static IPEndPoint NormalizePeerEndpoint(IPEndPoint endpoint)
+        => endpoint.Address.IsIPv4MappedToIPv6
+            ? new IPEndPoint(endpoint.Address.MapToIPv4(), endpoint.Port)
+            : endpoint;
+
     private static bool InCidr(IPAddress address, string? cidr)
     {
         if (string.IsNullOrWhiteSpace(cidr))
@@ -3564,15 +4374,29 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         if (parts.Length != 2
             || !IPAddress.TryParse(parts[0], out var network)
             || !int.TryParse(parts[1], out var prefix)
-            || prefix < 0
-            || prefix > 32)
+            || network.AddressFamily != address.AddressFamily)
         {
             return false;
         }
-        var value = BitConverter.ToUInt32(address.GetAddressBytes().Reverse().ToArray());
-        var networkValue = BitConverter.ToUInt32(network.GetAddressBytes().Reverse().ToArray());
-        var mask = prefix == 0 ? 0u : uint.MaxValue << (32 - prefix);
-        return (value & mask) == (networkValue & mask);
+        var maxBits = address.AddressFamily == AddressFamily.InterNetwork ? 32 : 128;
+        if (prefix < 0 || prefix > maxBits)
+        {
+            return false;
+        }
+        var value = address.GetAddressBytes();
+        var networkValue = network.GetAddressBytes();
+        var fullBytes = prefix / 8;
+        var remainingBits = prefix % 8;
+        if (!value.AsSpan(0, fullBytes).SequenceEqual(networkValue.AsSpan(0, fullBytes)))
+        {
+            return false;
+        }
+        if (remainingBits == 0)
+        {
+            return true;
+        }
+        var mask = (byte)(0xff << (8 - remainingBits));
+        return (value[fullBytes] & mask) == (networkValue[fullBytes] & mask);
     }
 
     private static string RandomHex(int bytes)
@@ -3634,9 +4458,20 @@ internal sealed class PeerMeshClient : IAsyncDisposable
     private sealed record PendingTurnRequest(
         ushort RequestType,
         IReadOnlyList<StunAttribute> Attributes,
+		byte[] OriginalTransactionId,
         IPEndPoint Endpoint,
+		ushort? Channel,
+		IPEndPoint? Peer,
         int AuthenticationAttempt,
         DateTimeOffset SentAt);
+
+	private sealed class TurnChannelBinding(ushort channel, IPEndPoint peer, DateTimeOffset expiresAt)
+	{
+		public ushort Channel { get; } = channel;
+		public IPEndPoint Peer { get; } = peer;
+		public DateTimeOffset ExpiresAt { get; set; } = expiresAt;
+		public bool Active { get; set; }
+	}
 
     private sealed record PendingVirtualPacket(byte[] Packet, DateTimeOffset CreatedAt);
 
@@ -3668,9 +4503,83 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public long BestDirectRttMillis { get; set; }
         public long BestRelayRttMillis { get; set; }
         public byte[] AesKey { get; set; } = [];
-        public PeerReplayWindow Replay { get; } = new();
+        /// <summary>This process instance's SPM2 key epoch; binds the outbound traffic key.</summary>
+        public string LocalKeyEpoch { get; set; } = string.Empty;
+        /// <summary>The peer's most recently announced epoch; binds the inbound traffic key.</summary>
+        public string RemoteKeyEpoch { get; private set; } = string.Empty;
+        public PeerDataFrameCodec.TrafficCodec? OutboundCodec { get; private set; }
+        public PeerDataFrameCodec.TrafficCodec? InboundCodec { get; private set; }
+        public PeerReplayWindow Replay { get; set; } = new();
+        public PeerPathMtu.Discovery PathMtu { get; } = new();
         public long Sequence { get; set; }
         public long DirectBytesPending { get; set; }
+
+        public bool AcceptInboundFrame(PeerDataFrame frame) => Replay.Accept(frame.Sequence);
+
+        /// <summary>
+        /// Applies the peer's latest epoch. A change means the peer restarted and resumed at
+        /// sequence 1, so the cached inbound codec and the replay window must both be dropped.
+        /// </summary>
+        public bool ApplyRemoteKeyEpoch(string epoch)
+        {
+            if (string.IsNullOrWhiteSpace(epoch) || epoch == RemoteKeyEpoch)
+            {
+                return false;
+            }
+            var changed = !string.IsNullOrWhiteSpace(RemoteKeyEpoch);
+            RemoteKeyEpoch = epoch;
+            InboundCodec?.Dispose();
+            InboundCodec = null;
+            Replay = new PeerReplayWindow();
+            return changed;
+        }
+
+        public bool EnsureTrafficCodecs(long localClientId)
+        {
+            if (AesKey.Length != 32
+                || string.IsNullOrWhiteSpace(LocalKeyEpoch)
+                || string.IsNullOrWhiteSpace(RemoteKeyEpoch))
+            {
+                return false;
+            }
+            if (OutboundCodec is not null && InboundCodec is not null)
+            {
+                return true;
+            }
+            try
+            {
+                var outbound = PeerDataFrameCodec.CreateTrafficCodec(
+                    AesKey, Id, localClientId, PeerId, LocalKeyEpoch);
+                var inbound = PeerDataFrameCodec.CreateTrafficCodec(
+                    AesKey, Id, PeerId, localClientId, RemoteKeyEpoch);
+                OutboundCodec = outbound;
+                InboundCodec = inbound;
+                return true;
+            }
+            catch (CryptographicException)
+            {
+                DisposeTrafficCodecs();
+                return false;
+            }
+        }
+
+        public void SetDataKey(byte[] key, long localClientId)
+        {
+            if (!AesKey.AsSpan().SequenceEqual(key))
+            {
+                DisposeTrafficCodecs();
+                AesKey = key;
+            }
+            _ = EnsureTrafficCodecs(localClientId);
+        }
+
+        public void DisposeTrafficCodecs()
+        {
+            OutboundCodec?.Dispose();
+            InboundCodec?.Dispose();
+            OutboundCodec = null;
+            InboundCodec = null;
+        }
 
         public bool HasHealthyDirect(DateTimeOffset now) =>
             string.Equals(PathType, "DIRECT", StringComparison.OrdinalIgnoreCase)
@@ -3698,7 +4607,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         [property: JsonPropertyName("port")] int Port,
         [property: JsonPropertyName("priority")] long Priority,
         [property: JsonPropertyName("foundation")] string? Foundation,
-        [property: JsonPropertyName("relayId")] string? RelayId);
+        [property: JsonPropertyName("relayId")] string? RelayId,
+        [property: JsonPropertyName("addressFamily")] string? AddressFamily = null);
 
     private sealed class PeerControlMessage
     {
@@ -3713,6 +4623,9 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public string? SourceVirtualIp { get; set; }
         [JsonPropertyName("sourcePublicKey")]
         public string? SourcePublicKey { get; set; }
+        /// <summary>Sender's per-process SPM2 key epoch; required for nonce uniqueness.</summary>
+        [JsonPropertyName("sourceKeyEpoch")]
+        public string? SourceKeyEpoch { get; set; }
         [JsonPropertyName("targetClientId")]
         [JsonConverter(typeof(NullToZeroInt64Converter))]
         public long TargetClientId { get; set; }
@@ -3766,6 +4679,8 @@ internal sealed class PeerMeshClient : IAsyncDisposable
         public List<PeerMeshPeer>? Peers { get; set; }
         [JsonPropertyName("candidates")]
         public List<PeerCandidate> Candidates { get; set; } = [];
+        [JsonPropertyName("dataFrameVersion")]
+        public int DataFrameVersion { get; set; } = 2;
         [JsonPropertyName("createdAtMillis")]
         public long CreatedAtMillis { get; set; }
     }

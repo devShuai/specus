@@ -1,99 +1,35 @@
-using System.Collections.Concurrent;
-using Microsoft.Extensions.Options;
-using ShuaiTunnel.Protocol.Packets;
-using ShuaiTunnel.Server.Configuration;
-using ShuaiTunnel.Server.Sessions;
+using ShuaiTunnel.Server.Nat;
 
 namespace ShuaiTunnel.Server.Http;
 
+/// <summary>Opens mandatory NAT stream v2 HTTP exchanges for the public HTTP ingress.</summary>
 public sealed class DirectHttpDispatcher
 {
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<DirectHttpResponsePacket>> _pending = new();
-    private readonly SessionRegistry _sessions;
-    private readonly DirectHttpOptions _options;
-    private readonly ILogger<DirectHttpDispatcher> _logger;
+    private readonly NatServerHandler _nat;
 
-    public DirectHttpDispatcher(SessionRegistry sessions, IOptions<DirectHttpOptions> options,
-        ILogger<DirectHttpDispatcher> logger)
+    public DirectHttpDispatcher(NatServerHandler nat)
     {
-        _sessions = sessions;
-        _options = options.Value;
-        _logger = logger;
+        _nat = nat;
     }
 
-    public async Task<DirectHttpResponsePacket> ForwardAsync(string clientName,
-        DirectHttpRequestPacket packet, CancellationToken cancellationToken)
+    internal async Task<HttpTunnelStream> OpenAsync(string clientName,
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
     {
-        var context = _sessions.Find(clientName);
-        if (context is null || !_sessions.HasLogin(context))
-        {
-            throw new DirectHttpTunnelException(StatusCodes.Status503ServiceUnavailable,
-                $"客户端不在线: {clientName}");
-        }
-
-        var requestId = Guid.NewGuid().ToString();
-        packet.RequestId = requestId;
-        var tcs = new TaskCompletionSource<DirectHttpResponsePacket>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[requestId] = tcs;
-
         try
         {
-            try
-            {
-                await context.Writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "[http-direct] request {RequestId} write failed", requestId);
-                return new DirectHttpResponsePacket
-                {
-                    RequestId = requestId,
-                    StatusCode = StatusCodes.Status502BadGateway,
-                    Error = "HTTP 转发请求发送失败",
-                };
-            }
-
-            return await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(Math.Max(1, _options.TimeoutMs)),
-                    cancellationToken)
+            return await _nat.OpenHttpStreamAsync(clientName, metadata, cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch (TimeoutException)
+        catch (InvalidOperationException ex)
         {
-            throw new DirectHttpTunnelException(StatusCodes.Status504GatewayTimeout, "HTTP 转发请求超时");
+            throw new DirectHttpTunnelException(StatusCodes.Status503ServiceUnavailable,
+                $"客户端不在线: {clientName}", ex);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            throw;
+            throw new DirectHttpTunnelException(StatusCodes.Status502BadGateway,
+                "HTTP 转发请求发送失败", ex);
         }
-        catch (DirectHttpTunnelException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "[http-direct] request {RequestId} failed", requestId);
-            throw new DirectHttpTunnelException(StatusCodes.Status502BadGateway, "HTTP 转发请求失败", ex);
-        }
-        finally
-        {
-            _pending.TryRemove(requestId, out _);
-        }
-    }
-
-    public void Ack(DirectHttpResponsePacket packet)
-    {
-        if (packet.RequestId is null || !_pending.TryGetValue(packet.RequestId, out var tcs))
-        {
-            _logger.LogWarning("[http-direct] dropped response for unknown request {RequestId}", packet.RequestId);
-            return;
-        }
-
-        tcs.TrySetResult(packet);
     }
 }
 

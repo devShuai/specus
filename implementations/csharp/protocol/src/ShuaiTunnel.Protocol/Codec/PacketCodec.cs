@@ -1,92 +1,72 @@
-using System.Collections.Frozen;
 using System.Buffers.Binary;
+using System.Collections.Frozen;
 using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using ShuaiTunnel.Protocol.Packets;
 
 namespace ShuaiTunnel.Protocol.Codec;
 
 /// <summary>
-/// Wire-format codec — see <c>com.theshuai.common.protocol.PacketCodec</c>. Frame layout:
-/// <code>
-/// +-------+--------+------------+---------+--------+----------+
-/// | magic | ver=1  | serializer | command | length | body     |
-/// |  4B   |  1B    |    1B      |   1B    |  4B BE | N bytes  |
-/// +-------+--------+------------+---------+--------+----------+
-/// </code>
-/// All multi-byte integers in the header are big-endian. Default <c>serializer</c> is
-/// <see cref="SerializerAlgorithm.CompactBinary"/> = 4; NAT_MESSAGE uses <see cref="SerializerAlgorithm.FastJson"/> = 1
-/// for the metadata, but the wrapping frame still records FastJson — the body has its own custom layout.
+/// Strict control protocol v2 codec. The frame header is
+/// magic(4), version(1), serializer(1), command(1), bodyLength(4), all integers big-endian.
+/// CompactBinary (wire id 4) is the sole serializer. NAT data is never compressed.
 /// </summary>
 public static class PacketCodec
 {
     public const int MagicNumber = 0x14353565;
+    public const byte ProtocolVersion = 2;
     public const int HeaderSize = 11;
+    public const int MaxFrameSize = 32 * 1024 * 1024;
+    public const int PreAuthMaxFrameSize = 16 * 1024;
+    public const int MaxMessageBodySize = 1024 * 1024;
+    public const int MaxNatMetadataSize = ushort.MaxValue;
+
+    public const int NatBodyHeaderSize = 16;
+    public const byte NatFlagEndStream = 1;
 
     private static readonly FrozenDictionary<sbyte, Func<byte[], Packet>> CommandToDecoder =
         new Dictionary<sbyte, Func<byte[], Packet>>
-    {
-        [Command.LoginRequest] = bytes => CompactBinarySerializer.Deserialize<LoginRequestPacket>(bytes),
-        [Command.LoginResponse] = bytes => CompactBinarySerializer.Deserialize<LoginResponsePacket>(bytes),
-        [Command.MessageRequest] = bytes => CompactBinarySerializer.Deserialize<MessageRequestPacket>(bytes),
-        [Command.MessageResponse] = bytes => CompactBinarySerializer.Deserialize<MessageResponsePacket>(bytes),
-        [Command.LogoutRequest] = bytes => CompactBinarySerializer.Deserialize<LogoutRequestPacket>(bytes),
-        [Command.LogoutResponse] = bytes => CompactBinarySerializer.Deserialize<LogoutResponsePacket>(bytes),
-        [Command.HeartbeatRequest] = bytes => CompactBinarySerializer.Deserialize<HeartbeatRequestPacket>(bytes),
-        [Command.HeartbeatResponse] = bytes => CompactBinarySerializer.Deserialize<HeartbeatResponsePacket>(bytes),
-        [Command.HttpRequest] = bytes => CompactBinarySerializer.Deserialize<HttpRequestPacket>(bytes),
-        [Command.HttpResponse] = bytes => CompactBinarySerializer.Deserialize<HttpResponsePacket>(bytes),
-        [Command.DirectHttpRequest] = bytes => CompactBinarySerializer.Deserialize<DirectHttpRequestPacket>(bytes),
-        [Command.DirectHttpResponse] = bytes => CompactBinarySerializer.Deserialize<DirectHttpResponsePacket>(bytes),
-    }.ToFrozenDictionary();
+        {
+            [Command.LoginRequest] = CompactBinarySerializer.Deserialize<LoginRequestPacket>,
+            [Command.LoginResponse] = CompactBinarySerializer.Deserialize<LoginResponsePacket>,
+            [Command.MessageRequest] = CompactBinarySerializer.Deserialize<MessageRequestPacket>,
+            [Command.MessageResponse] = CompactBinarySerializer.Deserialize<MessageResponsePacket>,
+            [Command.LogoutRequest] = CompactBinarySerializer.Deserialize<LogoutRequestPacket>,
+            [Command.LogoutResponse] = CompactBinarySerializer.Deserialize<LogoutResponsePacket>,
+            [Command.HeartbeatRequest] = CompactBinarySerializer.Deserialize<HeartbeatRequestPacket>,
+            [Command.HeartbeatResponse] = CompactBinarySerializer.Deserialize<HeartbeatResponsePacket>,
+        }.ToFrozenDictionary();
 
-    /// <summary>
-    /// Encodes a single packet into a fresh byte array suitable for direct writing to a stream.
-    /// </summary>
     public static byte[] Encode(Packet packet)
     {
-        if (packet is null)
+        ArgumentNullException.ThrowIfNull(packet);
+        if (packet.Version != ProtocolVersion)
         {
-            throw new ArgumentNullException(nameof(packet));
+            throw new InvalidDataException($"unsupported protocol version: {packet.Version}");
+        }
+        if (!IsKnownCommand(packet.Command))
+        {
+            throw new InvalidDataException($"unknown command byte: {packet.Command}");
         }
 
-        using var ms = new MemoryStream();
-        // Reserve 11-byte header for fixup.
-        ms.Write(new byte[HeaderSize], 0, HeaderSize);
+        var body = packet is NatMessagePacket nat
+            ? EncodeNatBody(nat)
+            : CompactBinarySerializer.Serialize(packet);
+        ValidateBodyLength(packet.Command, body.Length);
 
-        byte serializer;
-        int bodyLen;
-
-        if (packet is NatMessagePacket nat)
-        {
-            // NAT_MESSAGE serializer byte mirrors Java: forced to FASTJSON regardless of caller's choice.
-            serializer = SerializerAlgorithm.FastJson;
-            bodyLen = WriteNatBody(ms, nat);
-        }
-        else
-        {
-            serializer = SerializerAlgorithm.CompactBinary;
-            var bodyBytes = CompactBinarySerializer.Serialize(packet);
-            ms.Write(bodyBytes, 0, bodyBytes.Length);
-            bodyLen = bodyBytes.Length;
-        }
-
-        var buffer = ms.GetBuffer();
-        BinaryPrimitives.WriteInt32BigEndian(buffer.AsSpan(0, 4), MagicNumber);
-        buffer[4] = packet.Version;
-        buffer[5] = serializer;
-        buffer[6] = (byte)(sbyte)packet.Command;
-        BinaryPrimitives.WriteInt32BigEndian(buffer.AsSpan(7, 4), bodyLen);
-
-        var result = new byte[HeaderSize + bodyLen];
-        Buffer.BlockCopy(buffer, 0, result, 0, HeaderSize + bodyLen);
+        var result = new byte[HeaderSize + body.Length];
+        BinaryPrimitives.WriteInt32BigEndian(result.AsSpan(0, 4), MagicNumber);
+        result[4] = ProtocolVersion;
+        result[5] = SerializerAlgorithm.CompactBinary;
+        result[6] = unchecked((byte)packet.Command);
+        BinaryPrimitives.WriteInt32BigEndian(result.AsSpan(7, 4), body.Length);
+        body.CopyTo(result.AsSpan(HeaderSize));
         return result;
     }
 
     /// <summary>
-    /// Tries to decode one full frame from <paramref name="input"/>. Returns <c>false</c> if more
-    /// bytes are needed; on a malformed magic number throws <see cref="InvalidDataException"/>.
+    /// Decodes the first complete frame in <paramref name="input"/>. Additional bytes belong to
+    /// the next stream frame and are reported through <paramref name="consumed"/>.
     /// </summary>
     public static bool TryDecode(ReadOnlySpan<byte> input, out Packet? packet, out int consumed)
     {
@@ -96,121 +76,223 @@ public static class PacketCodec
         {
             return false;
         }
-        var magic = BinaryPrimitives.ReadInt32BigEndian(input[..4]);
-        if (magic != MagicNumber)
-        {
-            throw new InvalidDataException($"bad magic: 0x{magic:X8}");
-        }
-        // version at [4] is reserved — currently always 1, ignored on read.
-        var serializer = input[5];
-        var command = (sbyte)input[6];
-        var length = BinaryPrimitives.ReadInt32BigEndian(input.Slice(7, 4));
-        if (length < 0)
-        {
-            throw new InvalidDataException("negative frame length");
-        }
+        var (command, length) = DecodeHeader(input[..HeaderSize]);
         if (input.Length < HeaderSize + length)
         {
             return false;
         }
 
         var body = input.Slice(HeaderSize, length).ToArray();
-        packet = command == Command.NatMessage
-            ? DecodeNatBody(body)
-            : DecodeRegularBody(command, serializer, body);
+        try
+        {
+            packet = command == Command.NatMessage
+                ? DecodeNatBody(body)
+                : CommandToDecoder[command](body);
+        }
+        catch (InvalidDataException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            throw new InvalidDataException($"malformed body for command {command}", exception);
+        }
+        packet.Version = ProtocolVersion;
         consumed = HeaderSize + length;
         return true;
     }
 
-    private static Packet DecodeRegularBody(sbyte command, byte serializer, byte[] body)
+    /// <summary>Decodes exactly one frame and rejects truncation or trailing bytes.</summary>
+    public static Packet DecodeExact(ReadOnlySpan<byte> input)
     {
-        if (serializer != SerializerAlgorithm.CompactBinary)
+        if (!TryDecode(input, out var packet, out var consumed))
         {
-            // Server-side we only implement CompactBinary — Jackson/FastJson/Protobuf are not on
-            // the wire by default and would require porting those Java codecs as well. Reject loudly.
-            throw new NotSupportedException(
-                $"unsupported serializer for command {command}: {serializer}; only CompactBinary (4) is implemented");
+            throw new InvalidDataException("frame is truncated");
         }
-        if (!CommandToDecoder.TryGetValue(command, out var decoder))
+        if (consumed != input.Length)
+        {
+            throw new InvalidDataException("frame has trailing bytes");
+        }
+        return packet ?? throw new InvalidDataException("frame did not contain a packet");
+    }
+
+    public static (sbyte Command, int BodyLength) DecodeHeader(ReadOnlySpan<byte> header)
+    {
+        if (header.Length < HeaderSize)
+        {
+            throw new InvalidDataException("frame header is truncated");
+        }
+        var magic = BinaryPrimitives.ReadInt32BigEndian(header[..4]);
+        if (magic != MagicNumber)
+        {
+            throw new InvalidDataException($"bad magic: 0x{magic:X8}");
+        }
+        if (header[4] != ProtocolVersion)
+        {
+            throw new InvalidDataException($"unsupported protocol version: {header[4]}");
+        }
+        if (header[5] != SerializerAlgorithm.CompactBinary)
+        {
+            throw new InvalidDataException($"unsupported serializer: {header[5]}");
+        }
+        var command = unchecked((sbyte)header[6]);
+        if (!IsKnownCommand(command))
         {
             throw new InvalidDataException($"unknown command byte: {command}");
         }
-        return decoder(body);
+        var length = BinaryPrimitives.ReadInt32BigEndian(header.Slice(7, 4));
+        ValidateBodyLength(command, length);
+        return (command, length);
     }
 
-    private static int WriteNatBody(MemoryStream ms, NatMessagePacket nat)
+    public static void ValidateBodyLength(sbyte command, int length)
     {
-        var bodyStart = ms.Position;
-
-        // int32 type (BE)
-        Span<byte> intBuf = stackalloc byte[4];
-        BinaryPrimitives.WriteInt32BigEndian(intBuf, nat.NatMessageType.Code());
-        ms.Write(intBuf);
-
-        // metadata: utf-8 JSON of the metaData map. Java side serializes via FastJson; we use
-        // System.Text.Json with no extra knobs. Java only treats this as a Map<String,Object> on
-        // both sides so trivially-shaped JSON round-trips correctly.
-        var metaJson = SerializeMeta(nat.MetaData);
-        BinaryPrimitives.WriteInt32BigEndian(intBuf, metaJson.Length);
-        ms.Write(intBuf);
-        ms.Write(metaJson, 0, metaJson.Length);
-
-        // optional payload — if Data present, wrap with the same 2-byte payload-type prefix +
-        // optional deflate that the per-class compact-binary codec uses for whole-packet bodies.
-        if (nat.Data is { Length: > 0 } data)
+        var maximum = command switch
         {
-            var encoded = CompactBinarySerializer.EncodePayload(data);
-            ms.Write(encoded, 0, encoded.Length);
+            Command.LoginRequest or Command.LoginResponse => PreAuthMaxFrameSize - HeaderSize,
+            Command.MessageRequest or Command.MessageResponse => MaxMessageBodySize,
+            _ => MaxFrameSize - HeaderSize,
+        };
+        if (length < 0 || length > maximum)
+        {
+            throw new InvalidDataException($"command {command} body exceeds limit: {length}/{maximum}");
         }
-
-        return (int)(ms.Position - bodyStart);
     }
 
-    private static NatMessagePacket DecodeNatBody(byte[] body)
+    private static byte[] EncodeNatBody(NatMessagePacket nat)
     {
-        if (body.Length < 8)
+        if (NatMessageTypeExtensions.FromCode(nat.NatMessageType.Code()) is null)
+        {
+            throw new InvalidDataException($"unknown NAT message type: {(int)nat.NatMessageType}");
+        }
+        var metadata = SerializeMeta(nat.MetaData ?? new Dictionary<string, object?>());
+        if (nat.MetaData is null or { Count: 0 })
+        {
+            metadata = Array.Empty<byte>();
+        }
+        if (metadata.Length > MaxNatMetadataSize)
+        {
+            throw new InvalidDataException("NAT metadata exceeds limit");
+        }
+        var data = nat.Data ?? Array.Empty<byte>();
+        ValidateNatSemantics(nat.NatMessageType, nat.Flags, nat.StreamId, nat.Value, metadata.Length, data.Length);
+        if ((long)NatBodyHeaderSize + metadata.Length + data.Length > MaxFrameSize - HeaderSize)
+        {
+            throw new InvalidDataException("NAT body exceeds frame limit");
+        }
+        var body = new byte[NatBodyHeaderSize + metadata.Length + data.Length];
+        body[0] = checked((byte)nat.NatMessageType.Code());
+        body[1] = nat.Flags;
+        BinaryPrimitives.WriteUInt16BigEndian(body.AsSpan(2, 2), checked((ushort)metadata.Length));
+        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(4, 4), nat.StreamId);
+        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(8, 4), nat.Value);
+        BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(12, 4), checked((uint)data.Length));
+        metadata.CopyTo(body.AsSpan(NatBodyHeaderSize));
+        data.CopyTo(body.AsSpan(NatBodyHeaderSize + metadata.Length));
+        return body;
+    }
+
+    private static NatMessagePacket DecodeNatBody(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < NatBodyHeaderSize)
         {
             throw new InvalidDataException("NAT_MESSAGE body too short");
         }
-        var type = BinaryPrimitives.ReadInt32BigEndian(body.AsSpan(0, 4));
-        var natType = NatMessageTypeExtensions.FromCode(type)
-            ?? throw new InvalidDataException($"unknown NAT message type: {type}");
-
-        var metaLen = BinaryPrimitives.ReadInt32BigEndian(body.AsSpan(4, 4));
-        if (metaLen < 0 || 8 + metaLen > body.Length)
+        var natType = NatMessageTypeExtensions.FromCode(body[0])
+            ?? throw new InvalidDataException($"unknown NAT message type: {body[0]}");
+        var flags = body[1];
+        if ((flags & ~NatFlagEndStream) != 0)
         {
-            throw new InvalidDataException("NAT_MESSAGE metadata length out of range");
+            throw new InvalidDataException($"unknown NAT flags: {flags}");
         }
-        var metaJson = body.AsSpan(8, metaLen);
-        var metaData = DeserializeMeta(metaJson);
-
-        byte[]? payload = null;
-        if (8 + metaLen < body.Length)
+        var metadataLength = BinaryPrimitives.ReadUInt16BigEndian(body.Slice(2, 2));
+        var streamId = BinaryPrimitives.ReadUInt32BigEndian(body.Slice(4, 4));
+        var value = BinaryPrimitives.ReadUInt32BigEndian(body.Slice(8, 4));
+        var dataLength = BinaryPrimitives.ReadUInt32BigEndian(body.Slice(12, 4));
+        var expectedLength = (long)NatBodyHeaderSize + metadataLength + dataLength;
+        if (expectedLength != body.Length)
         {
-            var trailing = body.AsSpan(8 + metaLen).ToArray();
-            payload = CompactBinarySerializer.DecodePayload(trailing);
+            throw new InvalidDataException("NAT_MESSAGE metadata/data length mismatch");
         }
-
+        var metadata = metadataLength == 0
+            ? new Dictionary<string, object?>()
+            : DeserializeMeta(body.Slice(NatBodyHeaderSize, metadataLength))
+                ?? throw new InvalidDataException("NAT metadata must be a JSON object");
+        var data = dataLength == 0
+            ? null
+            : body.Slice(NatBodyHeaderSize + metadataLength, checked((int)dataLength)).ToArray();
+        ValidateNatSemantics(natType, flags, streamId, value, metadataLength, checked((int)dataLength));
         return new NatMessagePacket
         {
             NatMessageType = natType,
-            MetaData = metaData,
-            Data = payload,
+            Flags = flags,
+            StreamId = streamId,
+            Value = value,
+            MetaData = metadata,
+            Data = data,
         };
     }
 
-    private static byte[] SerializeMeta(Dictionary<string, object?>? metaData)
+    private static void ValidateNatSemantics(
+        NatMessageType type,
+        byte flags,
+        uint streamId,
+        uint value,
+        int metadataLength,
+        int dataLength)
     {
-        // Empty map (not null) — Java FastJson with default config emits "{}" for null too,
-        // but we mirror exact behavior: null map emits "null".
-        if (metaData is null)
+        var streamFrame = type is NatMessageType.Open or NatMessageType.Fin or NatMessageType.Data
+            or NatMessageType.Rst or NatMessageType.WindowUpdate;
+        if (streamFrame == (streamId == 0))
         {
-            return Encoding.UTF8.GetBytes("null");
+            throw new InvalidDataException(streamFrame
+                ? "stream frame requires a non-zero stream id"
+                : "connection frame requires stream id zero");
         }
-        var node = new JsonObject();
-        foreach (var kv in metaData)
+        if (type != NatMessageType.Data && flags != 0)
         {
-            node[kv.Key] = ToJsonNode(kv.Value);
+            throw new InvalidDataException("flags are only valid on DATA");
+        }
+        if (type == NatMessageType.Data && (metadataLength != 0 || value != 0))
+        {
+            throw new InvalidDataException("DATA cannot carry metadata/value");
+        }
+        if (type == NatMessageType.Fin && (dataLength != 0 || flags != 0))
+        {
+            throw new InvalidDataException("FIN cannot carry binary data/flags");
+        }
+        if (type == NatMessageType.WindowUpdate &&
+            (metadataLength != 0 || dataLength != 0 || flags != 0))
+        {
+            throw new InvalidDataException("WINDOW_UPDATE cannot carry payload");
+        }
+        if (type == NatMessageType.WindowUpdate && value == 0)
+        {
+            throw new InvalidDataException("WINDOW_UPDATE credit must be positive");
+        }
+        if (type == NatMessageType.Fin && value != 0)
+        {
+            throw new InvalidDataException("FIN value must be zero");
+        }
+        if (type == NatMessageType.Rst && dataLength != 0)
+        {
+            throw new InvalidDataException("RST cannot carry binary data");
+        }
+        if (!streamFrame && (value != 0 || flags != 0 || dataLength != 0))
+        {
+            throw new InvalidDataException("connection control frame cannot carry stream value/data");
+        }
+    }
+
+    private static bool IsKnownCommand(sbyte command) =>
+        command == Command.NatMessage || CommandToDecoder.ContainsKey(command);
+
+    private static byte[] SerializeMeta(Dictionary<string, object?> metaData)
+    {
+        var node = new JsonObject();
+        foreach (var (key, value) in metaData)
+        {
+            node[key] = ToJsonNode(value);
         }
         return Encoding.UTF8.GetBytes(node.ToJsonString());
     }
@@ -218,36 +300,37 @@ public static class PacketCodec
     private static JsonNode? ToJsonNode(object? value) => value switch
     {
         null => null,
-        string s => JsonValue.Create(s),
-        bool b => JsonValue.Create(b),
-        int i => JsonValue.Create(i),
-        long l => JsonValue.Create(l),
-        double d => JsonValue.Create(d),
-        float f => JsonValue.Create(f),
-        decimal m => JsonValue.Create(m),
-        JsonNode n => n.DeepClone(),
+        string text => JsonValue.Create(text),
+        bool boolean => JsonValue.Create(boolean),
+        int integer => JsonValue.Create(integer),
+        long longValue => JsonValue.Create(longValue),
+        double doubleValue => JsonValue.Create(doubleValue),
+        float floatValue => JsonValue.Create(floatValue),
+        decimal decimalValue => JsonValue.Create(decimalValue),
+        JsonNode jsonNode => jsonNode.DeepClone(),
+        IEnumerable<string> strings => new JsonArray(strings
+            .Select(static item => (JsonNode?)JsonValue.Create(item)).ToArray()),
+        IEnumerable<object?> objects => new JsonArray(objects.Select(ToJsonNode).ToArray()),
+        IReadOnlyDictionary<string, object?> map => new JsonObject(
+            map.Select(static pair => KeyValuePair.Create(pair.Key, ToJsonNode(pair.Value)))),
         _ => JsonValue.Create(value.ToString()),
     };
 
     private static Dictionary<string, object?>? DeserializeMeta(ReadOnlySpan<byte> json)
     {
-        if (json.Length == 0)
+        if (json.IsEmpty)
         {
-            return null;
+            throw new InvalidDataException("NAT JSON metadata is empty");
         }
         var node = JsonNode.Parse(Encoding.UTF8.GetString(json));
-        if (node is null)
+        if (node is not JsonObject obj)
         {
             return null;
         }
-        if (node is not JsonObject obj)
-        {
-            throw new InvalidDataException("NAT metadata is not a JSON object");
-        }
         var map = new Dictionary<string, object?>(obj.Count);
-        foreach (var kv in obj)
+        foreach (var (key, value) in obj)
         {
-            map[kv.Key] = FromJsonNode(kv.Value);
+            map[key] = FromJsonNode(value);
         }
         return map;
     }
@@ -260,25 +343,22 @@ public static class PacketCodec
         }
         if (node is JsonValue value)
         {
-            // Probe the underlying primitive — JsonValue boxes one of: bool, string, numerics.
-            // We unwrap to the matching CLR type so callers can do `(string?)map["k"]` etc.
-            if (value.TryGetValue<bool>(out var b))
-            {
-                return b;
-            }
-            if (value.TryGetValue<long>(out var l))
-            {
-                return l;
-            }
-            if (value.TryGetValue<double>(out var d))
-            {
-                return d;
-            }
-            if (value.TryGetValue<string>(out var s))
-            {
-                return s;
-            }
+            if (value.TryGetValue<bool>(out var boolean)) return boolean;
+            if (value.TryGetValue<long>(out var integer)) return integer;
+            if (value.TryGetValue<double>(out var number)) return number;
+            if (value.TryGetValue<string>(out var text)) return text;
         }
-        return node;
+        if (node is JsonArray array)
+        {
+            return array.Select(FromJsonNode).ToList();
+        }
+        if (node is JsonObject obj)
+        {
+            return obj.ToDictionary(
+                static pair => pair.Key,
+                static pair => FromJsonNode(pair.Value),
+                StringComparer.Ordinal);
+        }
+        throw new InvalidDataException("unsupported NAT metadata JSON value");
     }
 }

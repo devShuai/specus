@@ -1,6 +1,7 @@
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
@@ -39,6 +40,9 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
     private readonly Stream _stream;
     private readonly PipeReader _reader;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly Channel<QueuedFrame> _priorityWrites = Channel.CreateBounded<QueuedFrame>(
+        new BoundedChannelOptions(256) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
+    private readonly Task _priorityWriterTask;
     private readonly CancellationTokenSource _lifetimeCts;
     private readonly ILogger _logger;
     private readonly int _maxFrameSize;
@@ -67,9 +71,11 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
         var writeBackpressure = new WriteBackpressureGate(
             options.WriteBufferLowWaterMark, options.WriteBufferHighWaterMark);
         Context = new TunnelConnectionContext(channelId, remote, this, _lifetimeCts.Token,
-            closeCallback: () => _lifetimeCts.Cancel(),
+            closeCallback: CloseTransport,
             readGate: readGate,
             writeBackpressure: writeBackpressure);
+
+        _priorityWriterTask = Task.Run(PriorityWriterLoopAsync);
 
         var now = Environment.TickCount64;
         _lastReadTicks = now;
@@ -98,8 +104,14 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
                 Packet? packet;
                 try
                 {
-                    packet = await FrameReader.ReadFrameAsync(_reader, _maxFrameSize, _lifetimeCts.Token)
+                    var preAuth = Context.ClientName is null;
+                    var frameLimit = preAuth ? PacketCodec.PreAuthMaxFrameSize : _maxFrameSize;
+                    packet = await FrameReader.ReadFrameAsync(_reader, frameLimit, _lifetimeCts.Token)
                         .ConfigureAwait(false);
+                    if (Context.ClientName is null && packet is not null && packet is not LoginRequestPacket)
+                    {
+                        throw new InvalidDataException("only LOGIN_REQUEST is allowed before authentication");
+                    }
                 }
                 catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
                 {
@@ -207,35 +219,100 @@ internal sealed class TunnelConnection : IFrameWriter, IAsyncDisposable
     {
         var bytes = PacketCodec.Encode(packet);
         var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
-        var lockTaken = false;
-        // Synchronize per-connection — multiple producers (read loop + idle timer + dispatcher
-        // callbacks) can race here. The encode is cheap so we hold the lock through it too.
         try
         {
-            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            lockTaken = true;
+            await WriteEncodedAsync(bytes, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Context.WriteBackpressure.ReleasePending(trackedBytes);
+        }
+    }
+
+    public async ValueTask WritePriorityAsync(Packet packet, CancellationToken cancellationToken = default)
+    {
+        var bytes = PacketCodec.Encode(packet);
+        var trackedBytes = Context.WriteBackpressure.AddPending(bytes.Length);
+        try
+        {
+            await _priorityWrites.Writer.WriteAsync(new QueuedFrame(bytes, trackedBytes), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            Context.WriteBackpressure.ReleasePending(trackedBytes);
+            throw;
+        }
+    }
+
+    private async Task WriteEncodedAsync(byte[] bytes, CancellationToken cancellationToken)
+    {
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
             await _stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
             await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             Volatile.Write(ref _lastWriteTicks, Environment.TickCount64);
         }
         finally
         {
-            if (lockTaken)
-            {
-                _writeLock.Release();
-            }
-            Context.WriteBackpressure.ReleasePending(trackedBytes);
+            _writeLock.Release();
         }
     }
 
-    public ValueTask DisposeAsync()
+    private async Task PriorityWriterLoopAsync()
     {
+        try
+        {
+            await foreach (var queued in _priorityWrites.Reader.ReadAllAsync(_lifetimeCts.Token)
+                               .ConfigureAwait(false))
+            {
+                try
+                {
+                    await WriteEncodedAsync(queued.Bytes, _lifetimeCts.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    Context.WriteBackpressure.ReleasePending(queued.TrackedBytes);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+        {
+            Context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
+            _logger.LogDebug(ex, "[{ChannelId}] priority write failed", Context.ChannelId);
+            CloseTransport();
+        }
+        finally
+        {
+            while (_priorityWrites.Reader.TryRead(out var queued))
+            {
+                Context.WriteBackpressure.ReleasePending(queued.TrackedBytes);
+            }
+        }
+    }
+
+    private void CloseTransport()
+    {
+        _lifetimeCts.Cancel();
+        try { _socket.Dispose(); } catch { }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _priorityWrites.Writer.TryComplete();
+        CloseTransport();
+        try { await _priorityWriterTask.ConfigureAwait(false); } catch { }
         _writeLock.Dispose();
         try { _stream.Dispose(); } catch { /* swallow — already gone */ }
         try { _socket.Close(); } catch { /* same */ }
         _lifetimeCts.Dispose();
-        return ValueTask.CompletedTask;
     }
+
+    private readonly record struct QueuedFrame(byte[] Bytes, long TrackedBytes);
 }
 
 /// <summary>

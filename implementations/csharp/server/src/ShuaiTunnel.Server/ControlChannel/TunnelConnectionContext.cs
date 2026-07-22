@@ -54,6 +54,8 @@ public sealed class TunnelConnectionContext
 
     public long? ClientSessionId { get; private set; }
 
+    public string? ConnectionRole { get; private set; }
+
     /// <summary>Audit row id populated only on a successful login. Null → close path skips DB write.</summary>
     public long? ConnectionRecordId { get; set; }
 
@@ -70,11 +72,13 @@ public sealed class TunnelConnectionContext
         WriteBackpressure = writeBackpressure;
     }
 
-    public void OnLoginSuccess(string clientName, long loginTimeMs, long? clientSessionId = null)
+    public void OnLoginSuccess(string clientName, long loginTimeMs, long? clientSessionId = null,
+        string connectionRole = ShuaiTunnel.Protocol.ConnectionRole.Control)
     {
         ClientName = clientName;
         LoginTimeMs = loginTimeMs;
         ClientSessionId = clientSessionId;
+        ConnectionRole = connectionRole;
     }
 
     /// <summary>Returns true on the FIRST stamp; subsequent attempts are silently ignored so

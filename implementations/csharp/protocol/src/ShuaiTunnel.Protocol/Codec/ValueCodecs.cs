@@ -333,17 +333,8 @@ internal sealed class HttpMethodValueCodec : IValueCodec
     }
 }
 
-internal sealed class EnumValueCodec<TEnum> : IValueCodec where TEnum : struct, Enum
+internal sealed class MessageTypeValueCodec : IValueCodec
 {
-    private readonly TEnum[] _ordinalToValue;
-
-    /// <param name="declarationOrder">Values listed in the order of the Java enum declaration —
-    /// the codec writes <c>ordinal + 1</c>, so the array index <i>is</i> the ordinal.</param>
-    internal EnumValueCodec(TEnum[] declarationOrder)
-    {
-        _ordinalToValue = declarationOrder;
-    }
-
     public void Write(CompactWriter writer, object? value)
     {
         if (value is null)
@@ -351,27 +342,24 @@ internal sealed class EnumValueCodec<TEnum> : IValueCodec where TEnum : struct, 
             writer.WriteVarInt(0);
             return;
         }
-        var enumValue = (TEnum)value;
-        var ordinal = Array.IndexOf(_ordinalToValue, enumValue);
-        if (ordinal < 0)
+        var type = (MessageType)value;
+        if (!Enum.IsDefined(type))
         {
-            throw new InvalidDataException($"enum value {enumValue} not in declaration table");
+            throw new InvalidDataException($"unknown message type: {(int)type}");
         }
-        writer.WriteVarInt(ordinal + 1);
+        writer.WriteVarInt((int)type);
     }
 
     public object? Read(CompactReader reader)
     {
-        var ordinal = reader.ReadVarInt() - 1;
-        if (ordinal == -1)
+        var wireId = reader.ReadVarInt();
+        if (wireId == 0)
         {
             return null;
         }
-        if (ordinal < 0 || ordinal >= _ordinalToValue.Length)
-        {
-            throw new InvalidDataException($"invalid enum ordinal: {ordinal}");
-        }
-        return _ordinalToValue[ordinal];
+        return Enum.IsDefined(typeof(MessageType), wireId)
+            ? (MessageType)wireId
+            : throw new InvalidDataException($"unknown message type wire id: {wireId}");
     }
 }
 

@@ -11,6 +11,8 @@ namespace ShuaiTunnel.Server.Nat;
 public sealed class NatServerHandler
 {
     private readonly ConcurrentDictionary<TunnelConnectionContext, NatClientSession> _sessions = new();
+    private readonly ConcurrentDictionary<string, NatClientSession> _sessionsByName =
+        new(StringComparer.Ordinal);
     private readonly RemotePortServerManager _remotePorts;
     private readonly TrafficUsageService _traffic;
     private readonly TrafficInspectionService _inspection;
@@ -32,14 +34,40 @@ public sealed class NatServerHandler
 
     public Task HandleAsync(TunnelConnectionContext context, NatMessagePacket packet)
     {
-        var session = _sessions.GetOrAdd(context, CreateSession);
+        var session = GetOrAttach(context);
         return session.HandleAsync(packet);
+    }
+
+    public void Attach(TunnelConnectionContext context) => GetOrAttach(context);
+
+    private NatClientSession GetOrAttach(TunnelConnectionContext context)
+    {
+        var session = _sessions.GetOrAdd(context, CreateSession);
+        if (!string.IsNullOrWhiteSpace(context.ClientName))
+        {
+            _sessionsByName[context.ClientName] = session;
+        }
+        return session;
+    }
+
+    internal Task<HttpTunnelStream> OpenHttpStreamAsync(string clientName,
+        Dictionary<string, object?> metadata, CancellationToken cancellationToken)
+    {
+        if (!_sessionsByName.TryGetValue(clientName, out var session))
+        {
+            throw new InvalidOperationException($"client is offline: {clientName}");
+        }
+        return session.OpenHttpStreamAsync(metadata, cancellationToken);
     }
 
     public async Task OnConnectionClosedAsync(TunnelConnectionContext context)
     {
         if (_sessions.TryRemove(context, out var session))
         {
+            if (context.ClientName is { } name)
+            {
+                _sessionsByName.TryRemove(new KeyValuePair<string, NatClientSession>(name, session));
+            }
             await session.DisposeAsync().ConfigureAwait(false);
         }
     }

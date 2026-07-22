@@ -13,7 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="..\fixtures\*.bin">
+    <None Include="..\..\..\..\..\protocol\test-vectors\control-v2\frames\*.bin">
       <Link>fixtures\%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

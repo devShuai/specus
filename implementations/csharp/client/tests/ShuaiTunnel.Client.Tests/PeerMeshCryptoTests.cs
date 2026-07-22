@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using ShuaiTunnel.Client.Configuration;
@@ -14,18 +15,39 @@ namespace ShuaiTunnel.Client.Tests;
 
 public sealed class PeerMeshCryptoTests
 {
+    [Theory]
+    [InlineData("192.0.2.20", true)]
+    [InlineData("100.96.0.20", false)]
+    [InlineData("2001:db8::20", true)]
+    [InlineData("fd00::20", false)]
+    [InlineData("fe80::20", false)]
+    public void HostCandidateFilteringSupportsGlobalIpv6(string address, bool expected)
+    {
+        Assert.Equal(expected,
+            PeerMeshClient.IsUsablePeerHostAddress(IPAddress.Parse(address), "100.96.0.0/11"));
+    }
+
+    [Fact]
+    public void PeerUdpSocketUsesDualStackWhenAvailable()
+    {
+        using var udp = PeerMeshClient.CreatePeerUdpClient();
+        Assert.NotNull(udp.Client.LocalEndPoint);
+        if (Socket.OSSupportsIPv6 && udp.Client.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            Assert.True(udp.Client.DualMode);
+        }
+    }
+
     [Fact]
     public void DataFrameRoundTrips()
     {
         var key = Enumerable.Repeat((byte)7, 32).ToArray();
-        var frame = PeerDataFrameCodec.Encode(key, 1001, 1, 2, 1, "hello peer mesh"u8);
+        var frame = PeerDataFrameCodec.Encode(key, 1001, 1, 2, "epoch-a", 1, "hello peer mesh"u8);
 
-        var decoded = PeerDataFrameCodec.Decode(key, frame);
+        var decoded = PeerDataFrameCodec.Decode(key, 1, 2, "epoch-a", frame);
 
         Assert.Equal(1001, PeerDataFrameCodec.SessionId(frame));
         Assert.Equal(1001, decoded.SessionId);
-        Assert.Equal(1, decoded.FromClientId);
-        Assert.Equal(2, decoded.ToClientId);
         Assert.Equal(1, decoded.Sequence);
         Assert.Equal("hello peer mesh"u8.ToArray(), decoded.Payload);
     }
@@ -33,10 +55,68 @@ public sealed class PeerMeshCryptoTests
     [Fact]
     public void DataFrameRejectsWrongKey()
     {
-        var frame = PeerDataFrameCodec.Encode(Enumerable.Repeat((byte)7, 32).ToArray(), 1001, 1, 2, 1, "payload"u8);
+        var frame = PeerDataFrameCodec.Encode(Enumerable.Repeat((byte)7, 32).ToArray(), 1001, 1, 2, "epoch-a", 1, "payload"u8);
 
         Assert.ThrowsAny<CryptographicException>(() =>
-            PeerDataFrameCodec.Decode(Enumerable.Repeat((byte)8, 32).ToArray(), frame));
+            PeerDataFrameCodec.Decode(Enumerable.Repeat((byte)8, 32).ToArray(), 1, 2, "epoch-a", frame));
+    }
+
+    [Fact]
+    public void DataFrameRejectsTrailingBytes()
+    {
+        var key = Enumerable.Repeat((byte)7, 32).ToArray();
+        var frame = PeerDataFrameCodec.Encode(key, 1001, 1, 2, "epoch-a", 1, "payload"u8);
+
+        Assert.ThrowsAny<CryptographicException>(() =>
+            PeerDataFrameCodec.Decode(key, 1, 2, "epoch-a", [.. frame, 0]));
+    }
+
+    [Fact]
+    public void DataFrameMatchesCanonicalVectorWithDirectionalKey()
+    {
+        var vector = ProtocolVectorTestHelper.Read<PeerMeshVector>(
+            "protocol/test-vectors/peer-mesh-spm2.json");
+        var key = Convert.FromHexString(vector.SessionKeyHex);
+        var frame = PeerDataFrameCodec.Encode(
+            key,
+            vector.SessionId,
+            vector.FromClientId,
+            vector.ToClientId,
+            vector.SenderKeyEpoch,
+            vector.Sequence,
+            Encoding.UTF8.GetBytes(vector.PlaintextUtf8));
+
+        Assert.Equal(Convert.FromHexString(vector.FrameHex), frame);
+        var decoded = PeerDataFrameCodec.Decode(key, vector.FromClientId, vector.ToClientId, vector.SenderKeyEpoch, frame);
+
+        Assert.True(PeerDataFrameCodec.LooksLikeDataFrame(frame));
+        Assert.Equal(vector.SessionId, PeerDataFrameCodec.SessionId(frame));
+        Assert.Equal(vector.Sequence, decoded.Sequence);
+        Assert.Equal(Encoding.UTF8.GetBytes(vector.PlaintextUtf8), decoded.Payload);
+
+        Assert.ThrowsAny<CryptographicException>(() =>
+            PeerDataFrameCodec.Decode(key, vector.ToClientId, vector.FromClientId, vector.SenderKeyEpoch, frame));
+        Assert.ThrowsAny<CryptographicException>(() =>
+            PeerDataFrameCodec.Encode(
+                key, vector.SessionId, vector.FromClientId, vector.ToClientId,
+                vector.SenderKeyEpoch, 0, ReadOnlySpan<byte>.Empty));
+    }
+
+    [Fact]
+    public void KeyEpochIsolatesNonceSpaceAcrossRestarts()
+    {
+        // A restarted client may be handed back the same sessionId/token while its sequence
+        // restarts at 1. The epoch must change the traffic key, otherwise the same nonce space
+        // is replayed under the same AES-GCM key.
+        var key = Enumerable.Repeat((byte)7, 32).ToArray();
+        var before = PeerDataFrameCodec.Encode(key, 1001, 1, 2, "epoch-before-restart", 1, "payload"u8);
+        var after = PeerDataFrameCodec.Encode(key, 1001, 1, 2, "epoch-after-restart", 1, "payload"u8);
+
+        Assert.NotEqual(before, after);
+        Assert.ThrowsAny<CryptographicException>(() =>
+            PeerDataFrameCodec.Decode(key, 1, 2, "epoch-after-restart", before));
+        Assert.ThrowsAny<CryptographicException>(() =>
+            PeerDataFrameCodec.Encode(key, 1001, 1, 2, "  ", 1, "payload"u8));
     }
 
     [Fact]
@@ -54,7 +134,7 @@ public sealed class PeerMeshCryptoTests
         Assert.False(window.Accept(10));
         Assert.True(window.Accept(9));
         Assert.False(window.Accept(9));
-        Assert.True(window.Accept(80));
+        Assert.True(window.Accept(5000));
         Assert.False(window.Accept(15));
     }
 
@@ -83,6 +163,41 @@ public sealed class PeerMeshCryptoTests
         Assert.Equal((ushort)0, PeerIpPacket.Checksum(reply.AsSpan(0, 20)));
         Assert.Equal((ushort)0, PeerIpPacket.Checksum(reply.AsSpan(20)));
         Assert.Null(PeerIpPacket.IcmpEchoReplyFor(request, "100.112.186.106"));
+    }
+
+    [Fact]
+    public void TcpSynMssIsClampedToPathMtu()
+    {
+        var packet = TcpSynWithMss("100.103.117.15", 51000, "100.112.186.105", 8006, 1460);
+
+        var clamped = PeerIpPacket.ClampTcpMss(packet, 1280);
+
+        Assert.NotSame(packet, clamped);
+        Assert.Equal((ushort)1240, BinaryPrimitives.ReadUInt16BigEndian(clamped.AsSpan(42, 2)));
+        Assert.Equal(
+            BinaryPrimitives.ReadUInt16BigEndian(clamped.AsSpan(36, 2)),
+            TcpChecksum(clamped));
+    }
+
+    [Fact]
+    public void OversizedIpv4PacketProducesIcmpFragmentationNeeded()
+    {
+        var packet = new byte[1400];
+        packet[0] = 0x45;
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)packet.Length);
+        packet[8] = 64;
+        packet[9] = 17;
+        IPAddress.Parse("100.103.117.15").GetAddressBytes().CopyTo(packet.AsSpan(12, 4));
+        IPAddress.Parse("100.112.186.105").GetAddressBytes().CopyTo(packet.AsSpan(16, 4));
+
+        var response = PeerIpPacket.IcmpFragmentationNeededFor(packet, 1280);
+
+        Assert.NotNull(response);
+        Assert.Equal(3, response[20]);
+        Assert.Equal(4, response[21]);
+        Assert.Equal((ushort)1280, BinaryPrimitives.ReadUInt16BigEndian(response.AsSpan(26, 2)));
+        Assert.Equal((ushort)0, PeerIpPacket.Checksum(response.AsSpan(0, 20)));
+        Assert.Equal((ushort)0, PeerIpPacket.Checksum(response.AsSpan(20)));
     }
 
     [Fact]
@@ -330,12 +445,14 @@ public sealed class PeerMeshCryptoTests
         var sent = await InvokePrivateAsync<bool>(client, "SendEncryptedPayloadAsync", 2L, "payload"u8.ToArray());
 
         Assert.True(sent);
-        var relayMessages = await ReadStunMessagesAsync(relay, 2);
-        Assert.Equal(2, relayMessages.Count);
+        var relayMessages = await ReadStunMessagesAsync(relay, 3);
+        Assert.Equal(3, relayMessages.Count);
         Assert.Equal(StunMessage.CreatePermissionRequest, relayMessages[0].Type);
         Assert.Equal(ParseEndpoint(peerRelay), relayMessages[0].XorPeerAddress());
-        Assert.Equal(StunMessage.SendIndication, relayMessages[1].Type);
+        Assert.Equal(StunMessage.ChannelBindRequest, relayMessages[1].Type);
         Assert.Equal(ParseEndpoint(peerRelay), relayMessages[1].XorPeerAddress());
+        Assert.Equal(StunMessage.SendIndication, relayMessages[2].Type);
+        Assert.Equal(ParseEndpoint(peerRelay), relayMessages[2].XorPeerAddress());
         Assert.Empty(await ReadUdpPayloadsAsync(direct, 1));
     }
 
@@ -488,6 +605,10 @@ public sealed class PeerMeshCryptoTests
         SetProperty(session, "RelayTargetAllocationId", relayTargetAllocationId);
         SetProperty(session, "PathType", pathType);
         SetProperty(session, "LastDirectSuccess", lastDirectSuccess);
+        SetProperty(session, "LocalKeyEpoch", "epoch-local");
+        session.GetType()
+            .GetMethod("ApplyRemoteKeyEpoch", BindingFlags.Instance | BindingFlags.Public)!
+            .Invoke(session, ["epoch-remote"]);
         SetProperty(session, "AesKey", "0123456789abcdef0123456789abcdef"u8.ToArray());
         return session;
     }
@@ -535,6 +656,7 @@ public sealed class PeerMeshCryptoTests
         {
             PeerMesh = new PeerMeshConfig
             {
+                ClientId = 1,
                 TurnHost = "127.0.0.1",
                 TurnPort = ((IPEndPoint)relay.Client.LocalEndPoint!).Port,
             },
@@ -610,6 +732,44 @@ public sealed class PeerMeshCryptoTests
         return packet;
     }
 
+    private static byte[] TcpSynWithMss(
+        string source,
+        ushort sourcePort,
+        string target,
+        ushort targetPort,
+        ushort mss)
+    {
+        var packet = new byte[44];
+        packet[0] = 0x45;
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2, 2), (ushort)packet.Length);
+        packet[8] = 64;
+        packet[9] = 6;
+        IPAddress.Parse(source).GetAddressBytes().CopyTo(packet.AsSpan(12, 4));
+        IPAddress.Parse(target).GetAddressBytes().CopyTo(packet.AsSpan(16, 4));
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(20, 2), sourcePort);
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(22, 2), targetPort);
+        packet[32] = 0x60;
+        packet[33] = 0x02;
+        packet[40] = 2;
+        packet[41] = 4;
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(42, 2), mss);
+        BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(36, 2), TcpChecksum(packet));
+        return packet;
+    }
+
+    private static ushort TcpChecksum(byte[] packet)
+    {
+        var copy = packet.ToArray();
+        copy[36] = 0;
+        copy[37] = 0;
+        var pseudo = new byte[12 + copy.Length - 20];
+        copy.AsSpan(12, 8).CopyTo(pseudo);
+        pseudo[9] = 6;
+        BinaryPrimitives.WriteUInt16BigEndian(pseudo.AsSpan(10, 2), (ushort)(copy.Length - 20));
+        copy.AsSpan(20).CopyTo(pseudo.AsSpan(12));
+        return PeerIpPacket.Checksum(pseudo);
+    }
+
     private static byte[] MinimalIcmpEchoRequest(string source, string target)
     {
         var packet = new byte[32];
@@ -627,5 +787,187 @@ public sealed class PeerMeshCryptoTests
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(22, 2), PeerIpPacket.Checksum(packet.AsSpan(20)));
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(10, 2), PeerIpPacket.Checksum(packet.AsSpan(0, 20)));
         return packet;
+    }
+
+    /// <summary>通过反射构造私有嵌套 record PeerCandidate（8 个位置参数全部显式传入）。</summary>
+    private static object NewPeerCandidate(
+        string type, string transport, string address, int port, long priority, string foundation)
+        => NewNested(typeof(PeerMeshClient), "PeerCandidate", type, transport, address, port, priority, foundation, "", null);
+
+    /// <summary>读取 PeerCandidate 的 Priority 属性。</summary>
+    private static long CandidatePriority(object candidate)
+        => Property<long>(candidate, "Priority");
+
+    /// <summary>读取 PeerCandidate 的 Address 属性。</summary>
+    private static string? CandidateAddress(object candidate)
+        => Property<string?>(candidate, "Address");
+
+    /// <summary>调用私有方法 SortedConnectivityCandidates 并返回结果列表。</summary>
+    private static IList InvokeSortedConnectivityCandidates(PeerMeshClient client, IList candidates)
+    {
+        var candidateType = typeof(PeerMeshClient).GetNestedType("PeerCandidate", BindingFlags.NonPublic)!;
+        var listType = typeof(List<>).MakeGenericType(candidateType);
+        var typedInput = (IList)Activator.CreateInstance(listType)!;
+        foreach (var c in candidates)
+        {
+            typedInput.Add(c);
+        }
+        var result = typeof(PeerMeshClient)
+            .GetMethod("SortedConnectivityCandidates", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(client, [typedInput])!;
+        return (IList)result;
+    }
+
+    [Fact]
+    public void SendConnectivityChecksSortsCandidatesByPriorityDescendingLikeJava()
+    {
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        var input = new ArrayList
+        {
+            NewPeerCandidate("srflx", "udp", "203.0.113.10", 30001, 800, "standard-stun"),
+            NewPeerCandidate("host", "udp", "192.168.1.5", 40000, 1000, "host"),
+            NewPeerCandidate("srflx", "udp", "203.0.113.20", 30002, 900, "public-stun"),
+        };
+        var sorted = InvokeSortedConnectivityCandidates(client, input);
+        Assert.Equal(3, sorted.Count);
+        // 期望顺序：1000 (host) -> 900 (public-stun) -> 800 (srflx)
+        Assert.Equal(1000, CandidatePriority(sorted[0]!));
+        Assert.Equal(900, CandidatePriority(sorted[1]!));
+        Assert.Equal(800, CandidatePriority(sorted[2]!));
+    }
+
+    [Fact]
+    public void SameNatReflexiveCandidatesAreDemotedNotPrunedLikeJava()
+    {
+        var localAddr = "203.0.113.42";
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        var localSrflx = NewPeerCandidate("srflx", "udp", localAddr, 34567, 800, "standard-stun");
+        SetPrivateField(client, "_srflx", localSrflx);
+        var input = new ArrayList
+        {
+            // 同 NAT 的 srflx：应被降权到 priority=1
+            NewPeerCandidate("srflx", "udp", localAddr, 34567, 800, "standard-stun"),
+            // 不同地址的 srflx：保持原 priority
+            NewPeerCandidate("srflx", "udp", "203.0.113.99", 35000, 800, "public-stun"),
+            // host 候选：不受影响
+            NewPeerCandidate("host", "udp", "192.168.1.5", 40000, 1000, "host"),
+        };
+        var sorted = InvokeSortedConnectivityCandidates(client, input);
+        // 降权不剪除：数量不变
+        Assert.Equal(3, sorted.Count);
+        // 期望顺序：1000 (host) -> 800 (不同地址 srflx) -> 1 (同 NAT 被降权 srflx)
+        Assert.Equal(1000, CandidatePriority(sorted[0]!));
+        Assert.Equal(1, CandidatePriority(sorted[2]!));
+        Assert.Equal(localAddr, CandidateAddress(sorted[2]!));
+        // 不同地址的 srflx 必须保持原 priority=800
+        Assert.Equal(800, CandidatePriority(sorted[1]!));
+        Assert.Equal("203.0.113.99", CandidateAddress(sorted[1]!));
+    }
+
+    [Fact]
+    public void SameNatPortMapCandidatesAreDemotedLikeJava()
+    {
+        var localAddr = "203.0.113.42";
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        var localSrflx = NewPeerCandidate("srflx", "udp", localAddr, 34567, 900, "standard-stun");
+        SetPrivateField(client, "_srflx", localSrflx);
+        var input = new ArrayList
+        {
+            // port-map 候选与本地 srflx 同地址：应被降权到 priority=1
+            NewPeerCandidate("srflx", "udp", localAddr, 34567, 900, "port-map-1"),
+            NewPeerCandidate("host", "udp", "192.168.1.5", 40000, 1000, "host"),
+        };
+        var sorted = InvokeSortedConnectivityCandidates(client, input);
+        Assert.Equal(2, sorted.Count);
+        // host (1000) 排前，被降权的 port-map (1) 排后
+        Assert.Equal(1000, CandidatePriority(sorted[0]!));
+        Assert.Equal(1, CandidatePriority(sorted[1]!));
+    }
+
+    [Fact]
+    public async Task CandidateReciprocationThrottlesPerPeerLikeJava()
+    {
+        using var udp = new UdpClient(AddressFamily.InterNetwork);
+        udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+        using var cancellation = new CancellationTokenSource();
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        SetPrivateField(client, "_udp", udp);
+        SetPrivateField(client, "_cts", cancellation);
+        SetPrivateField(client, "_runtime", new TunnelRuntimeState
+        {
+            PeerMesh = new PeerMeshConfig { ClientId = 1, ClientName = "cs-a", VirtualIp = "100.96.0.1" },
+        });
+        SetPrivateField(client, "_srflx", NewPeerCandidate("srflx", "udp", "203.0.113.10", 34567, 800, "standard-stun"));
+
+        // 注入一个在线 peer，但无 session（无健康 direct 路径）-> 应触发回礼
+        var peer = NewNested(
+            typeof(PeerMeshClient),
+            "PeerMeshPeer",
+            2L,
+            "java-b",
+            "100.96.0.2",
+            "peer-key",
+            true,
+            false,
+            false,
+            false,
+            false,
+            0L,
+            null);
+        InvokePrivate(client, "MergeRoster", NewPeerList(peer));
+
+        // 第一次回礼：节流状态被记录（announceCandidatesToPeerAsync 无 writer 时静默返回，
+        // 但 candidateReciprocateAt 已记录时间戳）。第二次立即调用：2s 内应被节流跳过，
+        // 不会覆盖已记录的时间戳。
+        var before = DateTimeOffset.UtcNow;
+        await InvokePrivateAsync(client, "ReciprocateCandidatesAsync", 2L);
+        await InvokePrivateAsync(client, "ReciprocateCandidatesAsync", 2L);
+
+        // 验证节流：candidateReciprocateAt[2] 已记录，且时间戳是第一次（before 之后不久）
+        var reciprocateAt = PrivateField<IDictionary>(client, "_candidateReciprocateAt");
+        Assert.True(reciprocateAt.Contains(2L));
+        var recorded = (DateTimeOffset)reciprocateAt[2L]!;
+        Assert.InRange(recorded, before, before.AddSeconds(2));
+    }
+
+    [Fact]
+    public async Task HolePunchRetriesStopOnHealthyDirectLikeJava()
+    {
+        var client = new PeerMeshClient(new TunnelClientConfig(), NullLogger<PeerMeshClient>.Instance);
+        var session = NewPeerMeshSession(
+            id: 7001,
+            peerId: 2,
+            token: "tok",
+            remote: new IPEndPoint(IPAddress.Loopback, 9),
+            relayTargetAllocationId: "",
+            pathType: "",
+            lastDirectSuccess: DateTimeOffset.MinValue); // 无健康 direct
+        var sessionsById = PrivateField<IDictionary>(client, "_sessionsById");
+        sessionsById[7001L] = session;
+
+        // 无健康 direct：排程应成功标记
+        InvokePrivate(client, "ScheduleHolePunchRetries", session);
+        var scheduled = PrivateField<IDictionary>(client, "_holePunchRetryScheduled");
+        Assert.True(scheduled.Contains(2L));
+
+        // 建立健康 direct 路径后，RetryHolePunch 应清除标记并停止
+        SetProperty(session, "PathType", "DIRECT");
+        SetProperty(session, "LastDirectSuccess", DateTimeOffset.UtcNow);
+        await InvokePrivateAsync(client, "RetryHolePunch", 2L, 7001L);
+
+        scheduled = PrivateField<IDictionary>(client, "_holePunchRetryScheduled");
+        Assert.False(scheduled.Contains(2L));
+    }
+
+    private sealed class PeerMeshVector
+    {
+        public required string SessionKeyHex { get; init; }
+        public long SessionId { get; init; }
+        public long FromClientId { get; init; }
+        public long ToClientId { get; init; }
+        public required string SenderKeyEpoch { get; init; }
+        public long Sequence { get; init; }
+        public required string PlaintextUtf8 { get; init; }
+        public required string FrameHex { get; init; }
     }
 }

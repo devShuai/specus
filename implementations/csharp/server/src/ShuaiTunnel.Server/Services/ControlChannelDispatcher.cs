@@ -7,7 +7,6 @@ using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
-using ShuaiTunnel.Server.Http;
 using ShuaiTunnel.Server.Nat;
 using ShuaiTunnel.Server.PeerMesh;
 using ShuaiTunnel.Server.Sessions;
@@ -31,12 +30,11 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
     private readonly LoginExecutor _loginExecutor;
     private readonly SessionRegistry _sessions;
     private readonly NatServerHandler _nat;
-    private readonly DirectHttpDispatcher _directHttp;
     private readonly ClientMessagesHub _clientMessages;
     private readonly ILogger<ControlChannelDispatcher> _logger;
 
     public ControlChannelDispatcher(IServiceProvider services, LoginExecutor loginExecutor,
-        SessionRegistry sessions, NatServerHandler nat, DirectHttpDispatcher directHttp,
+        SessionRegistry sessions, NatServerHandler nat,
         ClientMessagesHub clientMessages,
         ILogger<ControlChannelDispatcher> logger)
     {
@@ -44,7 +42,6 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         _loginExecutor = loginExecutor;
         _sessions = sessions;
         _nat = nat;
-        _directHttp = directHttp;
         _clientMessages = clientMessages;
         _logger = logger;
     }
@@ -61,12 +58,22 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
         // Auth gate: every packet other than LoginRequest requires the connection to be logged
         // in. The Java AuthHandler removes itself after first success; here we just check the
         // session registry on every dispatch, which is O(1) and avoids pipeline mutation.
+        if (packet is LoginRequestPacket && context.ClientName is not null)
+        {
+            context.MarkDisconnectIfAbsent(DisconnectReason.ProtocolViolation);
+            throw new InvalidOperationException("duplicate login on authenticated channel");
+        }
         if (packet is not LoginRequestPacket && !_sessions.HasLogin(context))
         {
             context.MarkDisconnectIfAbsent(DisconnectReason.ProtocolViolation);
             _logger.LogWarning("[{ChannelId}] non-login packet on unauthenticated channel: {Cmd}",
                 context.ChannelId, packet.Command);
             throw new InvalidOperationException("packet on unauthenticated channel");
+        }
+        if (context.ClientName is not null && !PacketAllowedForRole(context.ConnectionRole, packet))
+        {
+            context.MarkDisconnectIfAbsent(DisconnectReason.ProtocolViolation);
+            throw new InvalidOperationException("packet is not allowed on this connection role");
         }
 
         switch (packet)
@@ -85,9 +92,6 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                 return;
             case NatMessagePacket nat:
                 await _nat.HandleAsync(context, nat).ConfigureAwait(false);
-                return;
-            case DirectHttpResponsePacket response:
-                _directHttp.Ack(response);
                 return;
             case MessageRequestPacket message when message.MessageType == MessageType.ClientToClient:
                 await HandleClientToClientAsync(context, message).ConfigureAwait(false);
@@ -108,6 +112,17 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
                     context.ChannelId, packet.Command);
                 return;
         }
+    }
+
+    private static bool PacketAllowedForRole(string? role, Packet packet)
+    {
+        if (role == ConnectionRole.Control)
+        {
+            return packet is not NatMessagePacket;
+        }
+        return role == ConnectionRole.Data
+               && packet is NatMessagePacket or HeartbeatRequestPacket
+                   or HeartbeatResponsePacket or LogoutRequestPacket;
     }
 
     private async Task HandleClientToClientAsync(TunnelConnectionContext context, MessageRequestPacket request)
@@ -198,11 +213,26 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
 
     public async Task OnConnectionClosedAsync(TunnelConnectionContext context)
     {
-        await _nat.OnConnectionClosedAsync(context).ConfigureAwait(false);
+        var dataConnection = context.ConnectionRole == ConnectionRole.Data;
+        if (dataConnection)
+        {
+            await _nat.OnConnectionClosedAsync(context).ConfigureAwait(false);
+        }
 
         if (context.ClientName is { } name)
         {
             _sessions.Unbind(name, context);
+        }
+
+        if (dataConnection)
+        {
+            return;
+        }
+        if (context.ClientName is { } controlName
+            && _sessions.FindData(controlName) is { } data
+            && data.ClientSessionId == context.ClientSessionId)
+        {
+            data.CloseAsync();
         }
 
         var reason = context.ReadDisconnectReason() ?? DisconnectReason.ClientClosed;
@@ -230,7 +260,18 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
 
     private async Task HandleLoginAsync(TunnelConnectionContext context, LoginRequestPacket packet)
     {
-        if (!_loginExecutor.TryEnqueue(() => ProcessLoginAsync(context, packet)))
+        context.ReadGate.Pause();
+        if (!_loginExecutor.TryEnqueue(async () =>
+            {
+                try
+                {
+                    await ProcessLoginAsync(context, packet).ConfigureAwait(false);
+                }
+                finally
+                {
+                    context.ReadGate.Resume();
+                }
+            }))
         {
             _logger.LogWarning("[{ChannelId}] login executor full — rejecting client={ClientName}",
                 context.ChannelId, packet.ClientName);
@@ -250,14 +291,28 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
     {
         await using var scope = _services.CreateAsyncScope();
         var clientService = scope.ServiceProvider.GetRequiredService<ClientAccountService>();
-        var records = scope.ServiceProvider.GetRequiredService<ConnectionRecordService>();
+        if (!ConnectionRole.IsValid(packet.ConnectionRole))
+        {
+            await SendThenCloseAsync(context, new LoginResponsePacket
+            {
+                ClientName = packet.ClientName,
+                Success = false,
+                Reason = "登录包缺少有效 connectionRole",
+            }).ConfigureAwait(false);
+            return;
+        }
+        var dataConnection = packet.ConnectionRole == ConnectionRole.Data;
 
         AuthenticationResult result;
         try
         {
-            result = await clientService.AuthenticateAsync(
-                    packet, context.ChannelId, context.RemoteAddress, context.Lifetime)
-                .ConfigureAwait(false);
+            result = dataConnection
+                ? await clientService.AuthenticateDataAsync(
+                        packet, context.ChannelId, context.RemoteAddress, context.Lifetime)
+                    .ConfigureAwait(false)
+                : await clientService.AuthenticateAsync(
+                        packet, context.ChannelId, context.RemoteAddress, context.Lifetime)
+                    .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -272,20 +327,33 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             return;
         }
 
-        long recordId;
-        try
+        if (result.Success && dataConnection)
         {
-            recordId = await records.RecordConnectionAsync(
-                    result, packet.ClientName ?? string.Empty, context.ChannelId,
-                    context.RemoteAddress, context.Lifetime)
-                .ConfigureAwait(false);
+            var control = _sessions.Find(packet.ClientName!);
+            if (control is null || control.ClientSessionId != packet.ClientSessionId)
+            {
+                result = AuthenticationResult.Fail(result.Account, "数据连接未找到匹配的控制连接");
+            }
         }
-        catch (Exception ex)
+
+        long? recordId = null;
+        if (!dataConnection)
         {
-            _logger.LogError(ex, "[{ChannelId}] failed to write connection record", context.ChannelId);
-            context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
-            context.CloseAsync();
-            return;
+            try
+            {
+                var records = scope.ServiceProvider.GetRequiredService<ConnectionRecordService>();
+                recordId = await records.RecordConnectionAsync(
+                        result, packet.ClientName ?? string.Empty, context.ChannelId,
+                        context.RemoteAddress, context.Lifetime)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[{ChannelId}] failed to write connection record", context.ChannelId);
+                context.MarkDisconnectIfAbsent(DisconnectReason.IoError);
+                context.CloseAsync();
+                return;
+            }
         }
 
         var response = new LoginResponsePacket
@@ -294,6 +362,23 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
             Success = result.Success,
             Reason = result.Reason,
         };
+
+        TunnelConnectionContext? displaced = null;
+        if (result.Success)
+        {
+            context.ConnectionRecordId = recordId;
+            context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                packet.ClientSessionId, packet.ConnectionRole!);
+            if (dataConnection)
+            {
+                displaced = _sessions.ReplaceData(packet.ClientName!, context);
+                _nat.Attach(context);
+            }
+            else
+            {
+                displaced = _sessions.Replace(packet.ClientName!, context);
+            }
+        }
 
         try
         {
@@ -309,14 +394,14 @@ public sealed class ControlChannelDispatcher : IControlChannelDispatcher
 
         if (result.Success)
         {
-            context.ConnectionRecordId = recordId;
-            context.OnLoginSuccess(packet.ClientName!, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                packet.ClientSessionId);
-
-            // Active replacement: if a prior session exists, close its socket so the new login
-            // takes its place. Mirrors Java's <c>SessionUtil.bindSession</c>.
-            var displaced = _sessions.Replace(packet.ClientName!, context);
             displaced?.CloseAsync();
+
+            if (dataConnection)
+            {
+                _logger.LogInformation("[{ChannelId}] dedicated data connection ready for {ClientName}",
+                    context.ChannelId, packet.ClientName);
+                return;
+            }
 
             try
             {

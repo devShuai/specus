@@ -1,22 +1,17 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Security;
-using ShuaiTunnel.Protocol.Packets;
 
 namespace ShuaiTunnel.Client.DirectHttp;
 
 /// <summary>
-/// Forwards <see cref="DirectHttpRequestPacket"/> calls to a configured upstream base URL,
-/// honoring the route-containment, header-filtering, HTTPS trust, body caps, and range bounding
-/// of the Java <c>DirectHttpForwarder</c>. Errors are translated to a <c>502</c>
-/// <see cref="DirectHttpResponsePacket"/> with the exception message in <c>Error</c>.
+/// Shared HTTP stream transport and route-containment/header utilities.
 /// </summary>
 public sealed class DirectHttpForwarder
 {
     public const int MaxRequestBodySize = 16 * 1024 * 1024;
     public const int MaxResponseBodySize = 64 * 1024 * 1024;
     public const int MaxBodySize = MaxRequestBodySize;
-    public const int FailureStatus = 502;
     private const long MaxRangeBytes = 8L * 1024 * 1024;
 
     // Hop-by-hop headers per RFC 7230; never forwarded in either direction.
@@ -38,7 +33,7 @@ public sealed class DirectHttpForwarder
     /// <summary>Builds a default <see cref="HttpClient"/> matching the Java client's timeouts.</summary>
     public static HttpClient BuildDefaultClient()
     {
-        return new HttpClient(BuildDefaultHandler()) { Timeout = TimeSpan.FromSeconds(20) };
+        return new HttpClient(BuildDefaultHandler()) { Timeout = Timeout.InfiniteTimeSpan };
     }
 
     public static SocketsHttpHandler BuildDefaultHandler()
@@ -60,69 +55,9 @@ public sealed class DirectHttpForwarder
         return handler;
     }
 
-    public async Task<DirectHttpResponsePacket> ForwardAsync(
-        DirectHttpRequestPacket request,
-        IReadOnlyDictionary<string, string> routes,
-        CancellationToken cancellationToken)
-    {
-        if (request.Body is { Length: > MaxRequestBodySize })
-        {
-            return Failure(request.RequestId, "HTTP 请求体超过限制");
-        }
-        if (string.IsNullOrWhiteSpace(request.Route) || !routes.TryGetValue(request.Route!, out var baseUrl))
-        {
-            return Failure(request.RequestId, "未配置 HTTP route");
-        }
-        if (!TryBuildTarget(baseUrl, request.RelativePath, request.RawQuery, out var target, out var buildError))
-        {
-            return Failure(request.RequestId, buildError);
-        }
-
-        using var message = new HttpRequestMessage(new HttpMethod(request.RequestMethod ?? "GET"), target);
-        if (request.Body is { Length: > 0 })
-        {
-            message.Content = new ByteArrayContent(request.Body);
-        }
-        var originalRange = FirstHeader(request.Headers, "range");
-        var boundedRange = BoundedRange(originalRange);
-        CopyRequestHeaders(request.Headers, message, skipRange: boundedRange is not null);
-        if (boundedRange is not null)
-        {
-            message.Headers.TryAddWithoutValidation("Range", boundedRange);
-        }
-
-        try
-        {
-            using var response = await _httpClient
-                .SendAsync(message, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-                .ConfigureAwait(false);
-            var body = await ReadBodyAsync(response, cancellationToken).ConfigureAwait(false);
-            return new DirectHttpResponsePacket
-            {
-                RequestId = request.RequestId,
-                StatusCode = (int)response.StatusCode,
-                Headers = CollectResponseHeaders(response),
-                Body = body,
-                Error = null,
-            };
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
-        {
-            return Failure(request.RequestId, ex.Message);
-        }
-    }
-
-    private static DirectHttpResponsePacket Failure(string? requestId, string message)
-    {
-        return new DirectHttpResponsePacket
-        {
-            RequestId = requestId,
-            StatusCode = FailureStatus,
-            Headers = null,
-            Body = null,
-            Error = message,
-        };
-    }
+    internal Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken) =>
+        _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
 
     /// <summary>
     /// Builds the upstream target URL with the same containment rules as the Java forwarder:
@@ -238,7 +173,7 @@ public sealed class DirectHttpForwarder
         return false;
     }
 
-    private static void CopyRequestHeaders(IReadOnlyList<string>? headers, HttpRequestMessage message, bool skipRange)
+    internal static void CopyRequestHeaders(IReadOnlyList<string>? headers, HttpRequestMessage message, bool skipRange)
     {
         if (headers is null)
         {
@@ -270,7 +205,7 @@ public sealed class DirectHttpForwarder
         }
     }
 
-    private static string? FirstHeader(IReadOnlyList<string>? headers, string headerName)
+    internal static string? FirstHeader(IReadOnlyList<string>? headers, string headerName)
     {
         if (headers is null)
         {
@@ -342,7 +277,7 @@ public sealed class DirectHttpForwarder
         return long.MaxValue - start < delta ? long.MaxValue : start + delta;
     }
 
-    private static List<string> CollectResponseHeaders(HttpResponseMessage response)
+    internal static List<string> CollectResponseHeaders(HttpResponseMessage response)
     {
         var headers = new List<string>();
         AppendHeaders(response.Headers, headers);
@@ -368,34 +303,4 @@ public sealed class DirectHttpForwarder
         }
     }
 
-    private static async Task<byte[]> ReadBodyAsync(HttpResponseMessage response, CancellationToken token)
-    {
-        if (response.Content is null)
-        {
-            return Array.Empty<byte>();
-        }
-        if (response.Content.Headers.ContentLength is long announced && announced > MaxResponseBodySize)
-        {
-            throw new InvalidOperationException("HTTP 响应体超过限制");
-        }
-        await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
-        using var memory = new MemoryStream();
-        var buffer = new byte[64 * 1024];
-        long total = 0;
-        while (true)
-        {
-            var read = await stream.ReadAsync(buffer, token).ConfigureAwait(false);
-            if (read <= 0)
-            {
-                break;
-            }
-            total += read;
-            if (total > MaxResponseBodySize)
-            {
-                throw new InvalidOperationException("HTTP 响应体超过限制");
-            }
-            memory.Write(buffer, 0, read);
-        }
-        return memory.ToArray();
-    }
 }

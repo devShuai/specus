@@ -40,9 +40,8 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var socket = await webSockets.ConnectAsync(new Uri(
-            "ws://localhost/ws/public-transfer/discovery?roomId=room-a&roomToken=secret&peerId=peer-a&displayName=A"),
-            cts.Token);
+        using var socket = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "room-a", "secret", "peer-a", "A");
 
         using var hello = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
         Assert.Equal("hello", hello.RootElement.GetProperty("type").GetString());
@@ -60,14 +59,13 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var uri = new Uri(
-            "ws://localhost/ws/public-transfer/discovery?roomId=duplicate-room&roomToken=secret&peerId=reused");
-
-        using var first = await webSockets.ConnectAsync(uri, cts.Token);
+        using var first = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "duplicate-room", "secret", "reused");
         _ = await ReceiveTextAsync(first, cts.Token);
         _ = await ReceiveTextAsync(first, cts.Token);
 
-        using var duplicate = await webSockets.ConnectAsync(uri, cts.Token);
+        using var duplicate = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "duplicate-room", "secret", "reused");
         using var error = JsonDocument.Parse(await ReceiveTextAsync(duplicate, cts.Token));
         Assert.Equal("error", error.RootElement.GetProperty("type").GetString());
         Assert.Equal("peer id is already connected", error.RootElement.GetProperty("error").GetString());
@@ -77,9 +75,8 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
         Assert.Equal(WebSocketCloseStatus.PolicyViolation, close.CloseStatus);
         Assert.Equal("peer id is already connected", close.CloseStatusDescription);
 
-        using var otherGroup = await webSockets.ConnectAsync(new Uri(
-            "ws://localhost/ws/public-transfer/discovery?roomId=duplicate-room&roomToken=other&peerId=reused"),
-            cts.Token);
+        using var otherGroup = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "duplicate-room", "other", "reused", "reused-other-group");
         using var hello = JsonDocument.Parse(await ReceiveTextAsync(otherGroup, cts.Token));
         Assert.Equal("hello", hello.RootElement.GetProperty("type").GetString());
     }
@@ -89,9 +86,8 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var socket = await webSockets.ConnectAsync(new Uri(
-            "ws://localhost/ws/public-transfer/discovery?roomId=room-unicode&peerId=peer-unicode"),
-            cts.Token);
+        using var socket = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "room-unicode", string.Empty, "peer-unicode");
         _ = await ReceiveTextAsync(socket, cts.Token);
         _ = await ReceiveTextAsync(socket, cts.Token);
 
@@ -109,15 +105,13 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var receiver = await webSockets.ConnectAsync(new Uri(
-            "ws://localhost/ws/public-transfer/discovery?roomId=json-shape&roomToken=secret&peerId=receiver"),
-            cts.Token);
+        using var receiver = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "json-shape", "secret", "receiver");
         _ = await ReceiveTextAsync(receiver, cts.Token);
         _ = await ReceiveTextAsync(receiver, cts.Token);
 
-        using var sender = await webSockets.ConnectAsync(new Uri(
-            "ws://localhost/ws/public-transfer/discovery?roomId=json-shape&roomToken=secret&peerId=sender"),
-            cts.Token);
+        using var sender = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "json-shape", "secret", "sender");
         _ = await ReceiveTextAsync(sender, cts.Token);
         _ = await ReceiveTextAsync(sender, cts.Token);
         _ = await ReceiveTextAsync(receiver, cts.Token);
@@ -168,21 +162,19 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     {
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        const string group = "roomId=numeric-target&roomToken=numeric-secret";
-
-        using var target = await webSockets.ConnectAsync(new Uri(
-            $"ws://localhost/ws/public-transfer/discovery?{group}&peerId=42"), cts.Token);
+        using var target = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "numeric-target", "numeric-secret", "42");
         _ = await ReceiveTextAsync(target, cts.Token);
         _ = await ReceiveTextAsync(target, cts.Token);
 
-        using var observer = await webSockets.ConnectAsync(new Uri(
-            $"ws://localhost/ws/public-transfer/discovery?{group}&peerId=observer"), cts.Token);
+        using var observer = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "numeric-target", "numeric-secret", "observer");
         _ = await ReceiveTextAsync(observer, cts.Token);
         _ = await ReceiveTextAsync(observer, cts.Token);
         _ = await ReceiveTextAsync(target, cts.Token);
 
-        using var sender = await webSockets.ConnectAsync(new Uri(
-            $"ws://localhost/ws/public-transfer/discovery?{group}&peerId=sender"), cts.Token);
+        using var sender = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "numeric-target", "numeric-secret", "sender");
         _ = await ReceiveTextAsync(sender, cts.Token);
         _ = await ReceiveTextAsync(sender, cts.Token);
         _ = await ReceiveTextAsync(target, cts.Token);
@@ -207,13 +199,10 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     {
         var splitAtBoundary = new string('p', 119) + "😀tail";
         var fitsAtBoundary = new string('d', 118) + "😀tail";
-        var uri = new Uri("ws://localhost/ws/public-transfer/discovery?roomId=surrogate-room"
-            + "&peerId=" + Uri.EscapeDataString(splitAtBoundary)
-            + "&displayName=" + Uri.EscapeDataString(fitsAtBoundary));
-
         var webSockets = _server!.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var socket = await webSockets.ConnectAsync(uri, cts.Token);
+        using var socket = await ConnectPublicDiscoveryAsync(webSockets, cts.Token,
+            "surrogate-room", string.Empty, splitAtBoundary, fitsAtBoundary);
         using var hello = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
         using var roster = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
 
@@ -345,7 +334,7 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ClientMessagesWebSocketUsesManagementToken()
+    public async Task ClientMessagesWebSocketUsesSingleUseTicket()
     {
         using var http = _server!.CreateClient();
         var login = await http.PostAsJsonAsync("/auth/login", new
@@ -360,8 +349,8 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
 
         var webSockets = _server.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var socket = await webSockets.ConnectAsync(new Uri(
-            "ws://localhost/ws/client-messages?token=" + Uri.EscapeDataString(token!)), cts.Token);
+        using var socket = await ConnectAdminWebSocketAsync(webSockets, cts.Token,
+            token!, WebSocketTicketService.ClientMessagesScope, "/ws/client-messages");
         using var hello = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
         Assert.Equal("hello", hello.RootElement.GetProperty("type").GetString());
         Assert.Equal("client-messages", hello.RootElement.GetProperty("channel").GetString());
@@ -369,7 +358,7 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ClientMessagesSupportsBearerFallbackAndJavaUtf16CharacterLimit()
+    public async Task ClientMessagesTicketSupportsJavaUtf16CharacterLimit()
     {
         using var http = _server!.CreateClient();
         var login = await http.PostAsJsonAsync("/auth/login", new
@@ -382,11 +371,9 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
         var token = loginJson.RootElement.GetProperty("accessToken").GetString();
 
         var webSockets = _server.Server.CreateWebSocketClient();
-        webSockets.ConfigureRequest = request =>
-            request.Headers.Authorization = "Bearer " + token;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var socket = await webSockets.ConnectAsync(
-            new Uri("ws://localhost/ws/client-messages"), cts.Token);
+        using var socket = await ConnectAdminWebSocketAsync(webSockets, cts.Token,
+            token!, WebSocketTicketService.ClientMessagesScope, "/ws/client-messages");
         _ = await ReceiveTextAsync(socket, cts.Token);
 
         var command = Encoding.UTF8.GetBytes(
@@ -428,8 +415,8 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
         var token = tokens.IssueToken("Alice", "default", ManagementRole.User);
         var webSockets = _server.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var socket = await webSockets.ConnectAsync(new Uri(
-            "ws://localhost/ws/client-messages?token=" + Uri.EscapeDataString(token)), cts.Token);
+        using var socket = await ConnectAdminWebSocketAsync(webSockets, cts.Token,
+            token, WebSocketTicketService.ClientMessagesScope, "/ws/client-messages");
         _ = await ReceiveTextAsync(socket, cts.Token);
 
         var command = JsonSerializer.SerializeToUtf8Bytes(new
@@ -448,7 +435,7 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ClientMessagesAcknowledgesBeforeControlWriteCompletesAndDoesNotReportAsyncFailure()
+    public async Task ClientMessagesReportsWriteFailureWithoutBlockingWebSocket()
     {
         ClientAccount target;
         await using (var scope = _server!.HostServices.CreateAsyncScope())
@@ -494,10 +481,19 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
         {
             var token = _server.HostServices.GetRequiredService<LocalTokenService>()
                 .IssueToken("admin", "default", ManagementRole.Admin);
-            var webSockets = _server.Server.CreateWebSocketClient();
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var http = _server.CreateClient();
+            http.DefaultRequestHeaders.Authorization = new("Bearer", token);
+            using var ticketResponse = await http.PostAsJsonAsync("/api/admin/ws-tickets",
+                new { endpoint = WebSocketTicketService.ClientMessagesScope }, cts.Token);
+            ticketResponse.EnsureSuccessStatusCode();
+            var ticket = await ticketResponse.Content.ReadFromJsonAsync<IssuedWebSocketTicket>(
+                cancellationToken: cts.Token);
+            Assert.NotNull(ticket);
+            var webSockets = _server.Server.CreateWebSocketClient();
             using var socket = await webSockets.ConnectAsync(new Uri(
-                "ws://localhost/ws/client-messages?token=" + Uri.EscapeDataString(token)), cts.Token);
+                "ws://localhost/ws/client-messages?ticket="
+                + Uri.EscapeDataString(ticket.Ticket)), cts.Token);
             _ = await ReceiveTextAsync(socket, cts.Token);
 
             await socket.SendAsync(JsonSerializer.SerializeToUtf8Bytes(new
@@ -508,20 +504,22 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
                 message = "hello",
             }, JsonOptions), WebSocketMessageType.Text, true, cts.Token);
 
-            using var sent = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
-            Assert.Equal("sent", sent.RootElement.GetProperty("type").GetString());
-            Assert.Equal("ack-before-flush", sent.RootElement.GetProperty("messageId").GetString());
+            await writer.Started.WaitAsync(cts.Token);
             Assert.False(writer.Completion.IsCompleted);
             var packet = Assert.IsType<MessageResponsePacket>(writer.Packet);
             Assert.Equal(MessageType.ClientToClient, packet.MessageType);
 
-            writer.Fail(new IOException("simulated asynchronous write failure"));
-            await Task.Delay(50, cts.Token);
             await socket.SendAsync(Encoding.UTF8.GetBytes("{\"type\":\"noop\"}"),
                 WebSocketMessageType.Text, true, cts.Token);
-            using var afterFailure = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
-            Assert.Equal("error", afterFailure.RootElement.GetProperty("type").GetString());
-            Assert.Equal("unsupported-type", afterFailure.RootElement.GetProperty("error").GetString());
+            using var next = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
+            Assert.Equal("error", next.RootElement.GetProperty("type").GetString());
+            Assert.Equal("unsupported-type", next.RootElement.GetProperty("error").GetString());
+
+            writer.Fail(new IOException("simulated asynchronous write failure"));
+            using var failed = JsonDocument.Parse(await ReceiveTextAsync(socket, cts.Token));
+            Assert.Equal("failed", failed.RootElement.GetProperty("type").GetString());
+            Assert.Equal("ack-before-flush", failed.RootElement.GetProperty("messageId").GetString());
+            Assert.Equal("target-write-failed", failed.RootElement.GetProperty("error").GetString());
         }
         finally
         {
@@ -546,17 +544,60 @@ public sealed class PublicTransferAndMessagingTests : IAsyncLifetime
         }
     }
 
+    private async Task<WebSocket> ConnectPublicDiscoveryAsync(WebSocketClient webSockets,
+        CancellationToken cancellationToken, string roomId, string roomToken, string peerId,
+        string? displayName = null)
+    {
+        using var http = _server!.CreateClient();
+        using var response = await http.PostAsJsonAsync("/api/public/transfer/ws-tickets", new
+        {
+            roomId,
+            roomToken,
+            peerId,
+            displayName = displayName ?? peerId,
+        }, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        var ticket = await response.Content.ReadFromJsonAsync<IssuedWebSocketTicket>(
+            cancellationToken: cancellationToken);
+        Assert.NotNull(ticket);
+        return await webSockets.ConnectAsync(new Uri(
+            "ws://localhost/ws/public-transfer/discovery?ticket="
+            + Uri.EscapeDataString(ticket!.Ticket)), cancellationToken);
+    }
+
+    private async Task<WebSocket> ConnectAdminWebSocketAsync(WebSocketClient webSockets,
+        CancellationToken cancellationToken, string bearerToken, string endpoint, string path)
+    {
+        using var http = _server!.CreateClient();
+        http.DefaultRequestHeaders.Authorization = new("Bearer", bearerToken);
+        using var response = await http.PostAsJsonAsync("/api/admin/ws-tickets", new
+        {
+            endpoint,
+        }, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        var ticket = await response.Content.ReadFromJsonAsync<IssuedWebSocketTicket>(
+            cancellationToken: cancellationToken);
+        Assert.NotNull(ticket);
+        return await webSockets.ConnectAsync(new Uri(
+            $"ws://localhost{path}?ticket={Uri.EscapeDataString(ticket!.Ticket)}"),
+            cancellationToken);
+    }
+
     private sealed class DelayedFailingFrameWriter : IFrameWriter
     {
         private readonly TaskCompletionSource<bool> _completion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _started = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Packet? Packet { get; private set; }
         public Task Completion => _completion.Task;
+        public Task Started => _started.Task;
 
         public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
         {
             Packet = packet;
+            _started.TrySetResult(true);
             return new ValueTask(_completion.Task);
         }
 

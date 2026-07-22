@@ -7,6 +7,7 @@ using Microsoft.EntityFrameworkCore;
 using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Authentication;
+using ShuaiTunnel.Server.ControlChannel;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Management;
@@ -32,17 +33,20 @@ public sealed class ClientMessagesHub
     private readonly ConcurrentDictionary<Guid, Subscription> _subscriptions = new();
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly SessionRegistry _sessions;
+    private readonly WebSocketTicketService _tickets;
     private readonly ILogger<ClientMessagesHub> _logger;
 
     public ClientMessagesHub(IServiceScopeFactory scopeFactory, SessionRegistry sessions,
+        WebSocketTicketService tickets,
         ILogger<ClientMessagesHub> logger)
     {
         _scopeFactory = scopeFactory;
         _sessions = sessions;
+        _tickets = tickets;
         _logger = logger;
     }
 
-    public async Task AcceptAsync(HttpContext context, AdminBearerTokenValidator tokens)
+    public async Task AcceptAsync(HttpContext context)
     {
         if (!context.WebSockets.IsWebSocketRequest)
         {
@@ -50,15 +54,17 @@ public sealed class ClientMessagesHub
             return;
         }
 
-        var token = AdminBearerTokenValidator.ExtractWebSocketToken(context.Request);
-        var principal = await tokens.ValidateAsync(token,
-            context.RequestAborted).ConfigureAwait(false);
-        if (principal is null)
+        var ticket = WebSocketTicketService.ExtractTicket(context.Request);
+        var claims = await _tickets.ConsumeAsync(ticket, WebSocketTicketService.ClientMessagesScope,
+            WebSocketTicketService.RequestAddress(context), context.RequestAborted).ConfigureAwait(false);
+        if (claims is null || string.IsNullOrWhiteSpace(claims.Username))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
-            context.Response.Headers["X-Auth-Reason"] = token is null ? "missing token" : "invalid token";
+            context.Response.Headers["X-Auth-Reason"] = ticket is null ? "missing ticket" : "invalid ticket";
             return;
         }
+
+        var principal = claims.ToPrincipal();
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
         var subscription = Subscription.Create(socket, principal);
@@ -206,42 +212,52 @@ public sealed class ClientMessagesHub
             return;
         }
 
-        try
-        {
-            var delivery = targetSession.Writer.WriteAsync(new MessageResponsePacket
-            {
-                ClientName = "admin:" + source.Username,
-                ToClientName = target.ClientName,
-                MessageType = MessageType.ClientToClient,
-                Message = body,
-            }, targetSession.Lifetime);
-            _ = ObserveDeliveryAsync(delivery, target.ClientName);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "admin client-message delivery failed: target={Target}",
-                target.ClientName);
-        }
-
-        await SendAsync(source, new
-        {
-            type = "sent",
-            messageId = command.MessageId ?? string.Empty,
-            toClientName = target.ClientName,
-            message = body,
-        }, cancellationToken).ConfigureAwait(false);
+        _ = DeliverAndReportAsync(source, targetSession, target.ClientName, body,
+            command.MessageId ?? string.Empty, cancellationToken);
     }
 
-    private async Task ObserveDeliveryAsync(ValueTask delivery, string targetClientName)
+    private async Task DeliverAndReportAsync(Subscription source,
+        TunnelConnectionContext targetSession, string targetClientName, string body,
+        string messageId, CancellationToken sourceCancellationToken)
     {
+        object status;
         try
         {
-            await delivery.ConfigureAwait(false);
+            await targetSession.Writer.WriteAsync(new MessageResponsePacket
+            {
+                ClientName = "admin:" + source.Username,
+                ToClientName = targetClientName,
+                MessageType = MessageType.ClientToClient,
+                Message = body,
+            }, targetSession.Lifetime).ConfigureAwait(false);
+            status = new
+            {
+                type = "written",
+                messageId,
+                toClientName = targetClientName,
+                message = body,
+            };
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "admin client-message delivery failed: target={Target}",
                 targetClientName);
+            status = new
+            {
+                type = "failed",
+                messageId,
+                error = "target-write-failed",
+            };
+        }
+
+        try
+        {
+            await SendAsync(source, status, sourceCancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "admin client-message status delivery failed: target={Target}", targetClientName);
         }
     }
 
@@ -374,6 +390,6 @@ public sealed class ClientMessagesHub
 public static class ClientMessagesWebSocketEndpoint
 {
     public static void MapClientMessagesWebSocket(this WebApplication app) =>
-        app.Map("/ws/client-messages", (HttpContext context, ClientMessagesHub hub,
-            AdminBearerTokenValidator tokens) => hub.AcceptAsync(context, tokens));
+        app.Map("/ws/client-messages", (HttpContext context, ClientMessagesHub hub) =>
+            hub.AcceptAsync(context));
 }

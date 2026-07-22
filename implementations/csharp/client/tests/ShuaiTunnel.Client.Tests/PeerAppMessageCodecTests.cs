@@ -6,7 +6,7 @@ namespace ShuaiTunnel.Client.Tests;
 public sealed class PeerAppMessageCodecTests
 {
     [Fact]
-    public void OrdinaryTextUsesJavaAndGoStmsg1WireFormat()
+    public void OrdinaryTextUsesMandatoryStmsg2WireFormat()
     {
         var message = new PeerAppMessage
         {
@@ -22,7 +22,7 @@ public sealed class PeerAppMessageCodecTests
 
         var payload = PeerAppMessageCodec.Encode(message);
 
-        Assert.Equal("STMSG1\n", Encoding.ASCII.GetString(payload, 0, 7));
+        Assert.Equal("STMSG2\n", Encoding.ASCII.GetString(payload, 0, 7));
         Assert.True(PeerAppMessageCodec.TryDecode(payload, out var decoded));
         Assert.Equal("message-1", decoded.Id);
         Assert.Equal("hello", decoded.Message);
@@ -62,26 +62,18 @@ public sealed class PeerAppMessageCodecTests
     }
 
     [Fact]
-    public void JavaAndGoStmsg1PayloadRemainsReadable()
+    public void RemovedStmsg1PayloadIsRejected()
     {
         var payload = Encoding.UTF8.GetBytes(
             "STMSG1\n{\"type\":\"message\",\"id\":\"old\",\"fromClientId\":7," +
             "\"fromClientName\":\"java-or-go\",\"toClientId\":8,\"toClientName\":\"csharp\"," +
             "\"message\":\"legacy\",\"createdAtMillis\":4567}");
 
-        Assert.True(PeerAppMessageCodec.TryDecode(payload, out var decoded));
-        Assert.Equal("old", decoded.Id);
-        Assert.Equal(7, decoded.FromClientId);
-        Assert.Equal("java-or-go", decoded.FromClientName);
-        Assert.Equal(8, decoded.ToClientId);
-        Assert.Equal("csharp", decoded.ToClientName);
-        Assert.Equal("legacy", decoded.Message);
-        Assert.Equal(4567, decoded.CreatedAtMillis);
-        Assert.Null(decoded.Attachment);
+        Assert.False(PeerAppMessageCodec.TryDecode(payload, out _));
     }
 
     [Fact]
-    public void AckAlwaysUsesStmsg1AndOmitsAttachmentExtension()
+    public void AckUsesStmsg2AndOmitsAttachmentExtension()
     {
         var ack = new PeerAppMessage
         {
@@ -94,7 +86,7 @@ public sealed class PeerAppMessageCodecTests
 
         var payload = PeerAppMessageCodec.Encode(ack);
 
-        Assert.Equal("STMSG1\n", Encoding.ASCII.GetString(payload, 0, 7));
+        Assert.Equal("STMSG2\n", Encoding.ASCII.GetString(payload, 0, 7));
         Assert.True(PeerAppMessageCodec.TryDecode(payload, out var decoded));
         Assert.Equal(PeerAppMessageCodec.TypeAck, decoded.Type);
         Assert.Equal("message-2", decoded.Id);

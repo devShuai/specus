@@ -17,6 +17,8 @@ public sealed class TunnelDbContext : DbContext
 
     public DbSet<ClientAccount> ClientAccounts => Set<ClientAccount>();
     public DbSet<ClientCredential> ClientCredentials => Set<ClientCredential>();
+    public DbSet<ClientAuthNonce> ClientAuthNonces => Set<ClientAuthNonce>();
+    public DbSet<WebSocketTicket> WebSocketTickets => Set<WebSocketTicket>();
     public DbSet<ClientIdentity> ClientIdentities => Set<ClientIdentity>();
     public DbSet<ClientSession> ClientSessions => Set<ClientSession>();
     public DbSet<ManagementUser> ManagementUsers => Set<ManagementUser>();
@@ -88,6 +90,42 @@ public sealed class TunnelDbContext : DbContext
             b.HasIndex(x => x.ApiKey).IsUnique().HasDatabaseName("uk_client_credential_api_key");
             b.HasIndex(x => x.TenantId).HasDatabaseName("idx_client_credential_tenant");
             b.HasIndex(x => new { x.TenantId, x.OwnerUsername }).HasDatabaseName("idx_client_credential_owner");
+        });
+
+        modelBuilder.Entity<ClientAuthNonce>(b =>
+        {
+            b.ToTable("tunnel_client_auth_nonce");
+            b.HasKey(x => new { x.ApiKeyHash, x.NonceHash });
+            b.Property(x => x.ApiKeyHash).HasColumnName("api_key_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.NonceHash).HasColumnName("nonce_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.ExpiresAt).HasDatabaseName("idx_client_auth_nonce_expiry");
+        });
+
+        modelBuilder.Entity<WebSocketTicket>(b =>
+        {
+            b.ToTable("tunnel_websocket_ticket");
+            b.HasKey(x => x.TokenHash);
+            b.Property(x => x.TokenHash).HasColumnName("token_hash").HasMaxLength(64).IsRequired();
+            b.Property(x => x.Scope).HasColumnName("scope").HasMaxLength(40).IsRequired();
+            b.Property(x => x.Username).HasColumnName("username").HasMaxLength(80);
+            b.Property(x => x.TenantId).HasColumnName("tenant_id").HasMaxLength(80);
+            b.Property(x => x.IsAdmin).HasColumnName("is_admin").IsRequired();
+            b.Property(x => x.RoomId).HasColumnName("room_id").HasMaxLength(120);
+            b.Property(x => x.RoomKey).HasColumnName("room_key").HasMaxLength(80);
+            b.Property(x => x.PeerId).HasColumnName("peer_id").HasMaxLength(120);
+            b.Property(x => x.DisplayName).HasColumnName("display_name").HasMaxLength(120);
+            b.Property(x => x.SharedRoom).HasColumnName("shared_room").IsRequired();
+            b.Property(x => x.RemoteAddressHash).HasColumnName("remote_address_hash").HasMaxLength(64)
+                .IsRequired();
+            b.Property(x => x.CreatedAt).HasColumnName("created_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.Property(x => x.ExpiresAt).HasColumnName("expires_at").HasMaxLength(40).IsRequired()
+                .HasConversion(iso);
+            b.HasIndex(x => x.ExpiresAt).HasDatabaseName("idx_websocket_ticket_expiry");
         });
 
         modelBuilder.Entity<ClientIdentity>(b =>

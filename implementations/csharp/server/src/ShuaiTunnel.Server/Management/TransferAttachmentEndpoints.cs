@@ -84,7 +84,8 @@ public static class TransferAttachmentEndpoints
                 TransferAttachmentService service,
                 CancellationToken cancellationToken) =>
             {
-                rateLimiter.CheckPresignUpload(ClientIp(context));
+                await rateLimiter.CheckPresignUploadAsync(ClientIp(context), cancellationToken)
+                    .ConfigureAwait(false);
                 return Results.Ok(await service.CreatePublicUploadAsync(
                     ManagementContext.From(context, auth.Value), request, cancellationToken)
                     .ConfigureAwait(false));

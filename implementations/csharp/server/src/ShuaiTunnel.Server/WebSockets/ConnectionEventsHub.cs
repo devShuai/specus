@@ -15,15 +15,21 @@ public sealed class ConnectionEventsHub
 
     private readonly ConcurrentDictionary<Guid, ConnectionEventSubscription> _sockets = new();
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly WebSocketTicketService _tickets;
+    private readonly PublicTransferCoordinationService _coordination;
     private readonly ILogger<ConnectionEventsHub> _logger;
 
-    public ConnectionEventsHub(IServiceScopeFactory scopeFactory, ILogger<ConnectionEventsHub> logger)
+    public ConnectionEventsHub(IServiceScopeFactory scopeFactory, WebSocketTicketService tickets,
+        PublicTransferCoordinationService coordination, ILogger<ConnectionEventsHub> logger)
     {
         _scopeFactory = scopeFactory;
+        _tickets = tickets;
+        _coordination = coordination;
         _logger = logger;
+        _coordination.AddListener(HandleClusterEventAsync);
     }
 
-    public async Task AcceptAsync(HttpContext context, AdminBearerTokenValidator tokens)
+    public async Task AcceptAsync(HttpContext context)
     {
         if (!context.WebSockets.IsWebSocketRequest)
         {
@@ -31,16 +37,17 @@ public sealed class ConnectionEventsHub
             return;
         }
 
-        var token = AdminBearerTokenValidator.ExtractWebSocketToken(context.Request);
-        var principal = await tokens.ValidateAsync(
-            token,
-            context.RequestAborted).ConfigureAwait(false);
-        if (principal is null)
+        var ticket = WebSocketTicketService.ExtractTicket(context.Request);
+        var claims = await _tickets.ConsumeAsync(ticket, WebSocketTicketService.ConnectionsScope,
+            WebSocketTicketService.RequestAddress(context), context.RequestAborted).ConfigureAwait(false);
+        if (claims is null || string.IsNullOrWhiteSpace(claims.Username))
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
-            context.Response.Headers["X-Auth-Reason"] = token is null ? "missing token" : "invalid token";
+            context.Response.Headers["X-Auth-Reason"] = ticket is null ? "missing ticket" : "invalid ticket";
             return;
         }
+
+        var principal = claims.ToPrincipal();
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
         var id = Guid.NewGuid();
@@ -82,12 +89,57 @@ public sealed class ConnectionEventsHub
 
     public async Task BroadcastAsync(ConnectionEvent connectionEvent)
     {
+        var payload = JsonSerializer.SerializeToUtf8Bytes(connectionEvent, JsonOptions);
+        if (_coordination.Enabled)
+        {
+            try
+            {
+                await _coordination.PublishManagementAsync(connectionEvent.TenantId ?? string.Empty,
+                    payload, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                _logger.LogWarning(exception,
+                    "publishing management connection event failed; using local delivery");
+            }
+        }
+        await BroadcastLocalAsync(connectionEvent, payload).ConfigureAwait(false);
+    }
+
+    private async Task HandleClusterEventAsync(PublicTransferClusterEvent clusterEvent)
+    {
+        if (clusterEvent.Kind != PublicTransferClusterFrame.KindManagement)
+        {
+            return;
+        }
+        try
+        {
+            var connectionEvent = JsonSerializer.Deserialize<ConnectionEvent>(clusterEvent.Payload,
+                JsonOptions);
+            if (connectionEvent is null || string.IsNullOrWhiteSpace(connectionEvent.TenantId)
+                || !string.Equals(clusterEvent.GroupId,
+                    PublicTransferCoordinationService.ManagementGroupId(connectionEvent.TenantId),
+                    StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "discarding management cluster event with invalid tenant binding");
+                return;
+            }
+            await BroadcastLocalAsync(connectionEvent, clusterEvent.Payload).ConfigureAwait(false);
+        }
+        catch (JsonException exception)
+        {
+            _logger.LogWarning(exception, "discarding invalid management cluster event");
+        }
+    }
+
+    private async Task BroadcastLocalAsync(ConnectionEvent connectionEvent, byte[] payload)
+    {
         if (_sockets.IsEmpty)
         {
             return;
         }
-
-        var payload = JsonSerializer.SerializeToUtf8Bytes(connectionEvent, JsonOptions);
         foreach (var (id, subscription) in _sockets.ToArray())
         {
             var socket = subscription.Socket;
@@ -166,7 +218,7 @@ public static class ConnectionEventsWebSocketEndpoint
     public static void MapConnectionEventsWebSocket(this WebApplication app)
     {
         app.UseWebSockets();
-        app.Map("/ws/connections", (HttpContext context, ConnectionEventsHub hub,
-            AdminBearerTokenValidator tokens) => hub.AcceptAsync(context, tokens));
+        app.Map("/ws/connections", (HttpContext context, ConnectionEventsHub hub) =>
+            hub.AcceptAsync(context));
     }
 }

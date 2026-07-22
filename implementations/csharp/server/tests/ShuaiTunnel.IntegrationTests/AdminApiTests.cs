@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using ShuaiTunnel.Protocol;
 using ShuaiTunnel.Protocol.Packets;
 using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.ControlChannel;
@@ -16,6 +17,8 @@ using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
 using ShuaiTunnel.Server.Http;
 using ShuaiTunnel.Server.Networking;
+using ShuaiTunnel.Server.Nat;
+using ShuaiTunnel.Server.Security;
 using ShuaiTunnel.Server.Sessions;
 
 namespace ShuaiTunnel.IntegrationTests;
@@ -614,6 +617,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         Assert.Equal("HTTP 请求体超过限制", row.ResponsePreviewText);
 
         var registry = _server!.HostServices.GetRequiredService<SessionRegistry>();
+        var nat = _server.HostServices.GetRequiredService<NatServerHandler>();
         using var lifetime = new CancellationTokenSource();
         var failingContext = new TunnelConnectionContext(
             "direct-http-write-failure-test",
@@ -626,6 +630,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         failingContext.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             clientSessionId: 1);
         registry.Replace(demo.ClientName, failingContext);
+        nat.Attach(failingContext);
         try
         {
             var writeFailed = await client.PostAsync(
@@ -645,12 +650,13 @@ public sealed class AdminApiTests : IAsyncLifetime
 
             await _server.FlushTrafficAsync();
             var totals = await _server.ReadTrafficTotalsAsync(demo.ClientName);
-            Assert.Equal(3, totals.Upload);
+            Assert.Equal(0, totals.Upload);
             Assert.Equal(0, totals.Download);
         }
         finally
         {
             registry.Unbind(demo.ClientName, failingContext);
+            await nat.OnConnectionClosedAsync(failingContext);
         }
     }
 
@@ -659,10 +665,10 @@ public sealed class AdminApiTests : IAsyncLifetime
     {
         using var admin = await AuthenticatedClientAsync();
         var demo = await ReadDemoClientAsync(admin);
-        var dispatcher = _server!.HostServices.GetRequiredService<DirectHttpDispatcher>();
+        var nat = _server!.HostServices.GetRequiredService<NatServerHandler>();
         var registry = _server.HostServices.GetRequiredService<SessionRegistry>();
         using var lifetime = new CancellationTokenSource();
-        var writer = new CapturingDirectHttpResponder(dispatcher);
+        var writer = new CapturingDirectHttpResponder(nat);
         var context = new TunnelConnectionContext(
             "direct-http-encoded-path-test",
             "127.0.0.1:12345",
@@ -672,7 +678,9 @@ public sealed class AdminApiTests : IAsyncLifetime
             new ReadGate(lifetime.Token),
             new WriteBackpressureGate(64 * 1024, 1024 * 1024));
         context.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), clientSessionId: 1);
+        writer.Context = context;
         registry.Replace(demo.ClientName, context);
+        nat.Attach(context);
 
         try
         {
@@ -682,12 +690,13 @@ public sealed class AdminApiTests : IAsyncLifetime
 
             response.EnsureSuccessStatusCode();
             Assert.NotNull(writer.Captured);
-            Assert.Equal("/%E4%BD%A0%2Fok", writer.Captured!.RelativePath);
-            Assert.Equal("x=%2F", writer.Captured.RawQuery);
+            Assert.Equal("/%E4%BD%A0%2Fok", writer.Captured!["relativePath"]);
+            Assert.Equal("x=%2F", writer.Captured["rawQuery"]);
         }
         finally
         {
             registry.Unbind(demo.ClientName, context);
+            await nat.OnConnectionClosedAsync(context);
         }
     }
 
@@ -706,10 +715,10 @@ public sealed class AdminApiTests : IAsyncLifetime
         });
         create.EnsureSuccessStatusCode();
 
-        var dispatcher = _server!.HostServices.GetRequiredService<DirectHttpDispatcher>();
+        var nat = _server!.HostServices.GetRequiredService<NatServerHandler>();
         var registry = _server.HostServices.GetRequiredService<SessionRegistry>();
         using var lifetime = new CancellationTokenSource();
-        var writer = new DirectHttpResponder(dispatcher);
+        var writer = new DirectHttpResponder(nat);
         var context = new TunnelConnectionContext(
             "direct-http-capture-test",
             "127.0.0.1:12345",
@@ -719,7 +728,9 @@ public sealed class AdminApiTests : IAsyncLifetime
             new ReadGate(lifetime.Token),
             new WriteBackpressureGate(64 * 1024, 1024 * 1024));
         context.OnLoginSuccess(demo.ClientName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), clientSessionId: 1);
+        writer.Context = context;
         registry.Replace(demo.ClientName, context);
+        nat.Attach(context);
 
         try
         {
@@ -750,6 +761,7 @@ public sealed class AdminApiTests : IAsyncLifetime
         finally
         {
             registry.Unbind(demo.ClientName, context);
+            await nat.OnConnectionClosedAsync(context);
         }
     }
 
@@ -758,10 +770,19 @@ public sealed class AdminApiTests : IAsyncLifetime
     {
         using var client = _server!.CreateClient();
         var token = await LoginAsync(client);
+        client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", token.AccessToken);
+        using var ticketResponse = await client.PostAsJsonAsync("/api/admin/ws-tickets",
+            new { endpoint = WebSocketTicketService.ConnectionsScope });
+        ticketResponse.EnsureSuccessStatusCode();
+        var ticket = await ticketResponse.Content.ReadFromJsonAsync<IssuedWebSocketTicket>(
+            JsonOptions);
+        Assert.NotNull(ticket);
         var wsClient = _server.Server.CreateWebSocketClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         using var socket = await wsClient.ConnectAsync(
-            new Uri($"ws://localhost/ws/connections?token={Uri.EscapeDataString(token.AccessToken)}"),
+            new Uri("ws://localhost/ws/connections?ticket="
+                + Uri.EscapeDataString(ticket!.Ticket)),
             cts.Token);
 
         long recordId;
@@ -966,57 +987,112 @@ public sealed class AdminApiTests : IAsyncLifetime
 
     private sealed class DirectHttpResponder : IFrameWriter
     {
-        private readonly DirectHttpDispatcher _dispatcher;
+        private readonly NatServerHandler _nat;
 
-        public DirectHttpResponder(DirectHttpDispatcher dispatcher)
+        public DirectHttpResponder(NatServerHandler nat)
         {
-            _dispatcher = dispatcher;
+            _nat = nat;
         }
 
-        public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        public TunnelConnectionContext Context { get; set; } = null!;
+
+        public async ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
         {
-            var request = Assert.IsType<DirectHttpRequestPacket>(packet);
-            Assert.False(string.IsNullOrWhiteSpace(request.RequestId));
-            var body = GzipText("<html><head></head><body><img src=\"/img/logo.png\"></body></html>");
-            _dispatcher.Ack(new DirectHttpResponsePacket
+            if (packet is not NatMessagePacket
+                {
+                    NatMessageType: NatMessageType.Open,
+                    MetaData: { } metadata,
+                } request
+                || !string.Equals(metadata["source"]?.ToString(), "http", StringComparison.Ordinal)
+                || !string.Equals(metadata["phase"]?.ToString(), "request", StringComparison.Ordinal))
             {
-                RequestId = request.RequestId,
-                StatusCode = StatusCodes.Status200OK,
-                Headers =
-                [
-                    "Content-Type:text/html;charset=UTF-8",
-                    "Content-Encoding:gzip",
-                    "Content-Length:999",
-                ],
-                Body = body,
+                return;
+            }
+
+            var body = GzipText("<html><head></head><body><img src=\"/img/logo.png\"></body></html>");
+            await _nat.HandleAsync(Context, new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Open,
+                StreamId = request.StreamId,
+                MetaData = new Dictionary<string, object?>
+                {
+                    ["source"] = "http",
+                    ["phase"] = "response",
+                    ["statusCode"] = StatusCodes.Status200OK,
+                    ["headers"] = new List<string>
+                    {
+                        "Content-Type:text/html;charset=UTF-8",
+                        "Content-Encoding:gzip",
+                        "Content-Length:999",
+                    },
+                    ["trailerNames"] = new List<string>(),
+                },
             });
-            return ValueTask.CompletedTask;
+            await _nat.HandleAsync(Context, new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Data,
+                StreamId = request.StreamId,
+                Data = body,
+            });
+            await _nat.HandleAsync(Context, new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Fin,
+                StreamId = request.StreamId,
+            });
         }
     }
 
     private sealed class CapturingDirectHttpResponder : IFrameWriter
     {
-        private readonly DirectHttpDispatcher _dispatcher;
+        private readonly NatServerHandler _nat;
 
-        public CapturingDirectHttpResponder(DirectHttpDispatcher dispatcher)
+        public CapturingDirectHttpResponder(NatServerHandler nat)
         {
-            _dispatcher = dispatcher;
+            _nat = nat;
         }
 
-        public DirectHttpRequestPacket? Captured { get; private set; }
+        public TunnelConnectionContext Context { get; set; } = null!;
 
-        public ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
+        public Dictionary<string, object?>? Captured { get; private set; }
+
+        public async ValueTask WriteAsync(Packet packet, CancellationToken cancellationToken = default)
         {
-            Captured = Assert.IsType<DirectHttpRequestPacket>(packet);
-            Assert.False(string.IsNullOrWhiteSpace(Captured.RequestId));
-            _dispatcher.Ack(new DirectHttpResponsePacket
+            if (packet is not NatMessagePacket
+                {
+                    NatMessageType: NatMessageType.Open,
+                    MetaData: { } metadata,
+                } request
+                || !string.Equals(metadata["source"]?.ToString(), "http", StringComparison.Ordinal)
+                || !string.Equals(metadata["phase"]?.ToString(), "request", StringComparison.Ordinal))
             {
-                RequestId = Captured.RequestId,
-                StatusCode = StatusCodes.Status200OK,
-                Headers = ["Content-Type:text/plain"],
-                Body = Encoding.UTF8.GetBytes("ok"),
+                return;
+            }
+
+            Captured = new Dictionary<string, object?>(metadata);
+            await _nat.HandleAsync(Context, new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Open,
+                StreamId = request.StreamId,
+                MetaData = new Dictionary<string, object?>
+                {
+                    ["source"] = "http",
+                    ["phase"] = "response",
+                    ["statusCode"] = StatusCodes.Status200OK,
+                    ["headers"] = new List<string> { "Content-Type:text/plain" },
+                    ["trailerNames"] = new List<string>(),
+                },
             });
-            return ValueTask.CompletedTask;
+            await _nat.HandleAsync(Context, new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Data,
+                StreamId = request.StreamId,
+                Data = Encoding.UTF8.GetBytes("ok"),
+            });
+            await _nat.HandleAsync(Context, new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Fin,
+                StreamId = request.StreamId,
+            });
         }
     }
 

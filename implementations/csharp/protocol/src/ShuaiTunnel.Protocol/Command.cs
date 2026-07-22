@@ -10,11 +10,7 @@ public static class Command
     public const sbyte LogoutResponse = -3;
     public const sbyte HeartbeatRequest = 4;
     public const sbyte HeartbeatResponse = -4;
-    public const sbyte HttpRequest = 5;
-    public const sbyte HttpResponse = -5;
     public const sbyte NatMessage = 6;
-    public const sbyte DirectHttpRequest = 7;
-    public const sbyte DirectHttpResponse = -7;
 }
 
 public static class SerializerAlgorithm

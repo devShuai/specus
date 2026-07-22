@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+	using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
 using ShuaiTunnel.Server.Configuration;
@@ -11,6 +12,9 @@ public sealed class StunTurnServer : BackgroundService
 {
     private const string SoftwareName = "shuai-tunnel-standard-stun-turn";
     private static readonly TimeSpan PermissionTtl = TimeSpan.FromSeconds(300);
+	private static readonly TimeSpan ChannelTtl = TimeSpan.FromSeconds(600);
+	private const int PeerProbeMaxBytes = 2048;
+	private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly PeerMeshOptions _options;
     private readonly IServiceScopeFactory _scopeFactory;
@@ -18,6 +22,7 @@ public sealed class StunTurnServer : BackgroundService
     private readonly TurnCredentialService _turnCredentials;
     private readonly ConcurrentDictionary<string, Allocation> _allocations = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _allocationByEndpoint = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, string> _allocationByRelayEndpoint = new(StringComparer.Ordinal);
     private UdpClient? _primary;
     private UdpClient? _alternate;
     private Channel<Func<CancellationToken, Task>>? _relayQueue;
@@ -181,6 +186,11 @@ public sealed class StunTurnServer : BackgroundService
     private async Task HandleAsync(byte[] payload, IPEndPoint remote, UdpClient receiveSocket, string probeRole,
         CancellationToken cancellationToken)
     {
+		if (TurnChannelData.LooksLike(payload))
+		{
+			await HandleChannelDataAsync(payload, remote, cancellationToken).ConfigureAwait(false);
+			return;
+		}
         var message = StunMessage.Parse(payload);
         if (message is null)
         {
@@ -201,6 +211,9 @@ public sealed class StunTurnServer : BackgroundService
             case StunMessage.CreatePermissionRequest:
                 await CreatePermissionAuthenticatedAsync(message, payload, remote).ConfigureAwait(false);
                 break;
+			case StunMessage.ChannelBindRequest:
+				await ChannelBindAuthenticatedAsync(message, payload, remote).ConfigureAwait(false);
+				break;
             case StunMessage.SendIndication:
                 await SendIndicationAsync(message, remote, cancellationToken).ConfigureAwait(false);
                 break;
@@ -230,7 +243,7 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private async Task AllocateRequestAsync(StunMessage request, IPEndPoint remote, CancellationToken cancellationToken)
-        => await AllocateRequestCoreAsync(request, remote, null, cancellationToken).ConfigureAwait(false);
+        => await AllocateRequestCoreAsync(request, remote, null, 0, cancellationToken).ConfigureAwait(false);
 
     private async Task AllocateRequestAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote,
         CancellationToken cancellationToken)
@@ -241,12 +254,13 @@ public sealed class StunTurnServer : BackgroundService
         {
             return;
         }
-        await AllocateRequestCoreAsync(request, remote, auth.MessageIntegrityKey, cancellationToken)
+        await AllocateRequestCoreAsync(
+                request, remote, auth.MessageIntegrityKey, auth.ClientId, cancellationToken)
             .ConfigureAwait(false);
     }
 
     private async Task AllocateRequestCoreAsync(StunMessage request, IPEndPoint remote,
-        byte[]? messageIntegrityKey, CancellationToken cancellationToken)
+        byte[]? messageIntegrityKey, long clientId, CancellationToken cancellationToken)
     {
         if (!request.RequestedUdpTransport())
         {
@@ -254,7 +268,7 @@ public sealed class StunTurnServer : BackgroundService
                 .ConfigureAwait(false);
             return;
         }
-        var allocation = Allocate(remote, cancellationToken);
+        var allocation = AllocateForClient(remote, clientId, cancellationToken);
         await SendStunAsync(_primary, remote, StunMessage.Of(
             StunMessage.AllocateSuccess,
             request.TransactionId,
@@ -265,13 +279,17 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private Allocation Allocate(IPEndPoint remote, CancellationToken cancellationToken = default)
+        => AllocateForClient(remote, 0, cancellationToken);
+
+    private Allocation AllocateForClient(IPEndPoint remote, long clientId,
+        CancellationToken cancellationToken = default)
     {
         var endpointKey = EndpointKey(remote);
         if (_allocationByEndpoint.TryGetValue(endpointKey, out var existingId)
             && _allocations.TryGetValue(existingId, out var existing)
             && !existing.Closed)
         {
-            if (!IsExpired(existing))
+            if (!IsExpired(existing) && existing.ClientId == clientId)
             {
                 existing.Remote = remote;
                 existing.ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(_options.AllocationTtlSeconds);
@@ -282,9 +300,11 @@ public sealed class StunTurnServer : BackgroundService
 
         var relay = BindRelaySocket();
         var allocation = new Allocation(Guid.NewGuid().ToString(), remote, relay,
-            AdvertisedSocketAddress(relay), DateTimeOffset.UtcNow.AddSeconds(_options.AllocationTtlSeconds));
+            AdvertisedSocketAddress(relay), DateTimeOffset.UtcNow.AddSeconds(_options.AllocationTtlSeconds),
+            clientId);
         _allocations[allocation.Id] = allocation;
         _allocationByEndpoint[endpointKey] = allocation.Id;
+        _allocationByRelayEndpoint[EndpointKey(allocation.RelayAddress)] = allocation.Id;
         _ = Task.Run(() => RelayReceiveLoopAsync(allocation, cancellationToken), CancellationToken.None);
         _logger.LogInformation("[peer-mesh] TURN allocation created: client={Client}, relay={Relay}",
             remote, allocation.RelayAddress);
@@ -313,7 +333,7 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private async Task RefreshAsync(StunMessage request, IPEndPoint remote)
-        => await RefreshCoreAsync(request, remote, null).ConfigureAwait(false);
+        => await RefreshCoreAsync(request, remote, null, 0).ConfigureAwait(false);
 
     private async Task RefreshAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote)
     {
@@ -323,13 +343,14 @@ public sealed class StunTurnServer : BackgroundService
         {
             return;
         }
-        await RefreshCoreAsync(request, remote, auth.MessageIntegrityKey).ConfigureAwait(false);
+        await RefreshCoreAsync(request, remote, auth.MessageIntegrityKey, auth.ClientId).ConfigureAwait(false);
     }
 
-    private async Task RefreshCoreAsync(StunMessage request, IPEndPoint remote, byte[]? messageIntegrityKey)
+    private async Task RefreshCoreAsync(StunMessage request, IPEndPoint remote,
+        byte[]? messageIntegrityKey, long clientId)
     {
         var allocation = AllocationForRemote(remote);
-        if (allocation is null)
+        if (allocation is null || allocation.ClientId != clientId)
         {
             await SendErrorAsync(_primary, remote, request, StunMessage.RefreshError, 437, "allocation-mismatch")
                 .ConfigureAwait(false);
@@ -352,7 +373,7 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private async Task CreatePermissionAsync(StunMessage request, IPEndPoint remote)
-        => await CreatePermissionCoreAsync(request, remote, null).ConfigureAwait(false);
+        => await CreatePermissionCoreAsync(request, remote, null, 0).ConfigureAwait(false);
 
     private async Task CreatePermissionAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote)
     {
@@ -362,14 +383,16 @@ public sealed class StunTurnServer : BackgroundService
         {
             return;
         }
-        await CreatePermissionCoreAsync(request, remote, auth.MessageIntegrityKey).ConfigureAwait(false);
+        await CreatePermissionCoreAsync(
+                request, remote, auth.MessageIntegrityKey, auth.ClientId)
+            .ConfigureAwait(false);
     }
 
     private async Task CreatePermissionCoreAsync(StunMessage request, IPEndPoint remote,
-        byte[]? messageIntegrityKey)
+        byte[]? messageIntegrityKey, long clientId)
     {
         var allocation = AllocationForRemote(remote);
-        if (allocation is null)
+        if (allocation is null || allocation.ClientId != clientId)
         {
             await SendErrorAsync(_primary, remote, request, StunMessage.CreatePermissionError, 437,
                 "allocation-mismatch").ConfigureAwait(false);
@@ -390,6 +413,52 @@ public sealed class StunTurnServer : BackgroundService
             StunMessage.Software(SoftwareName)), messageIntegrityKey).ConfigureAwait(false);
     }
 
+	private async Task ChannelBindAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote)
+	{
+		var auth = await AuthenticateAsync(request, packet, remote, StunMessage.ChannelBindError)
+			.ConfigureAwait(false);
+		if (!auth.Allowed)
+		{
+			return;
+		}
+		var allocation = AllocationForRemote(remote);
+		if (allocation is null || allocation.ClientId != auth.ClientId)
+		{
+			await SendErrorAsync(_primary, remote, request, StunMessage.ChannelBindError, 437,
+				"allocation-mismatch").ConfigureAwait(false);
+			return;
+		}
+		var channel = request.ChannelNumber();
+		var peer = request.XorPeerAddress();
+		if (channel is null || peer is null)
+		{
+			await SendErrorAsync(_primary, remote, request, StunMessage.ChannelBindError, 400,
+				"invalid-channel-bind").ConfigureAwait(false);
+			return;
+		}
+		var now = DateTimeOffset.UtcNow;
+		if (allocation.ChannelsByNumber.TryGetValue(channel.Value, out var occupied)
+			&& occupied.ExpiresAt > now && !SameEndpoint(occupied.Peer, peer))
+		{
+			await SendErrorAsync(_primary, remote, request, StunMessage.ChannelBindError, 400,
+				"channel-in-use").ConfigureAwait(false);
+			return;
+		}
+		var binding = new TurnChannelBinding(channel.Value, peer, now.Add(ChannelTtl));
+		if (allocation.ChannelsByPeer.TryGetValue(EndpointKey(peer), out var previous)
+			&& previous.Channel != channel.Value)
+		{
+			allocation.ChannelsByNumber.TryRemove(previous.Channel, out _);
+		}
+		allocation.ChannelsByNumber[channel.Value] = binding;
+		allocation.ChannelsByPeer[EndpointKey(peer)] = binding;
+		allocation.Permissions[PermissionKey(peer)] = now.Add(PermissionTtl);
+		await SendStunAsync(_primary, remote, StunMessage.Of(
+			StunMessage.ChannelBindSuccess,
+			request.TransactionId,
+			StunMessage.Software(SoftwareName)), auth.MessageIntegrityKey).ConfigureAwait(false);
+	}
+
     private async Task SendIndicationAsync(StunMessage request, IPEndPoint remote,
         CancellationToken cancellationToken)
     {
@@ -404,19 +473,76 @@ public sealed class StunTurnServer : BackgroundService
         {
             return;
         }
-        var header = PeerDataFrameHeader.Parse(payload);
-        if (header is not null)
-        {
-            await using var scope = _scopeFactory.CreateAsyncScope();
-            var peerMesh = scope.ServiceProvider.GetRequiredService<PeerMeshService>();
-            if (!await peerMesh.AuthorizeRelayFrameAsync(header, payload.Length, cancellationToken)
-                    .ConfigureAwait(false))
-            {
-                return;
-            }
-        }
+		var target = AllocationForRelayEndpoint(peer);
+		if (!await AuthorizeRelayPayloadAsync(
+                payload, allocation, target, true, cancellationToken).ConfigureAwait(false))
+		{
+			return;
+		}
         await allocation.Relay.SendAsync(payload, payload.Length, peer).ConfigureAwait(false);
     }
+
+	private async Task HandleChannelDataAsync(byte[] packet, IPEndPoint remote,
+		CancellationToken cancellationToken)
+	{
+		var frame = TurnChannelData.Parse(packet);
+		var allocation = AllocationForRemote(remote);
+		if (frame is null || allocation is null
+			|| !allocation.ChannelsByNumber.TryGetValue(frame.Channel, out var binding)
+			|| binding.ExpiresAt <= DateTimeOffset.UtcNow
+			|| !HasPermission(allocation, binding.Peer))
+		{
+			return;
+		}
+		var target = AllocationForRelayEndpoint(binding.Peer);
+		if (!await AuthorizeRelayPayloadAsync(
+                frame.Payload, allocation, target, true, cancellationToken).ConfigureAwait(false))
+		{
+			return;
+		}
+		await allocation.Relay.SendAsync(frame.Payload, binding.Peer, cancellationToken).ConfigureAwait(false);
+	}
+
+	private async Task<bool> AuthorizeRelayPayloadAsync(byte[] payload,
+        Allocation? source, Allocation? target, bool account,
+		CancellationToken cancellationToken)
+	{
+		if (source is null || target is null || source.ClientId <= 0 || target.ClientId <= 0)
+		{
+			return false;
+		}
+		var header = PeerDataFrameHeader.Parse(payload);
+		if (header is not null)
+		{
+			await using var frameScope = _scopeFactory.CreateAsyncScope();
+			var framePeerMesh = frameScope.ServiceProvider.GetRequiredService<PeerMeshService>();
+			return account
+				? await framePeerMesh.AuthorizeRelayFrameAsync(
+                    header, source.ClientId, target.ClientId, payload.Length, cancellationToken).ConfigureAwait(false)
+				: await framePeerMesh.ValidateRelayFrameAsync(
+                    header, source.ClientId, target.ClientId, cancellationToken).ConfigureAwait(false);
+		}
+		if (payload.Length is < 2 or > PeerProbeMaxBytes || payload[0] != (byte)'{' || payload[^1] != (byte)'}')
+		{
+			return false;
+		}
+		RelayProbe? probe;
+		try
+		{
+			probe = JsonSerializer.Deserialize<RelayProbe>(payload, JsonOptions);
+		}
+		catch (JsonException)
+		{
+			return false;
+		}
+		await using var probeScope = _scopeFactory.CreateAsyncScope();
+		var peerMesh = probeScope.ServiceProvider.GetRequiredService<PeerMeshService>();
+		return probe?.Magic == "shuai-peer-mesh"
+			&& probe.FromClientId == source.ClientId
+			&& probe.ToClientId == target.ClientId
+			&& await peerMesh.AuthorizeRelayProbeAsync(probe.SessionId, probe.FromClientId, probe.ToClientId,
+				probe.Token, probe.Type, cancellationToken).ConfigureAwait(false);
+	}
 
     private async Task RelayReceiveLoopAsync(Allocation allocation, CancellationToken cancellationToken)
     {
@@ -447,6 +573,12 @@ public sealed class StunTurnServer : BackgroundService
             {
                 continue;
             }
+			var source = AllocationForRelayEndpoint(result.RemoteEndPoint);
+			if (!await AuthorizeRelayPayloadAsync(
+                    result.Buffer, source, allocation, false, cancellationToken).ConfigureAwait(false))
+			{
+				continue;
+			}
             await DispatchDataIndicationAsync(allocation, result.RemoteEndPoint, result.Buffer).ConfigureAwait(false);
         }
     }
@@ -473,6 +605,16 @@ public sealed class StunTurnServer : BackgroundService
         {
             return;
         }
+		if (allocation.ChannelsByPeer.TryGetValue(EndpointKey(peer), out var binding)
+			&& binding.ExpiresAt > DateTimeOffset.UtcNow)
+		{
+			var channelData = TurnChannelData.Encode(binding.Channel, payload);
+			if (_primary is not null)
+			{
+				await _primary.SendAsync(channelData, allocation.Remote, cancellationToken).ConfigureAwait(false);
+			}
+			return;
+		}
         var tx = StunMessage.NewTransactionId();
         await SendStunAsync(_primary, allocation.Remote, StunMessage.Of(
             StunMessage.DataIndication,
@@ -496,6 +638,22 @@ public sealed class StunTurnServer : BackgroundService
         }
         allocation.Remote = remote;
         return allocation;
+    }
+
+    private Allocation? AllocationForRelayEndpoint(IPEndPoint? remote)
+    {
+        if (remote is null)
+        {
+            return null;
+        }
+        if (_allocationByRelayEndpoint.TryGetValue(EndpointKey(remote), out var allocationId)
+            && _allocations.TryGetValue(allocationId, out var exact)
+            && !exact.Closed && !IsExpired(exact))
+        {
+            return exact;
+        }
+        return _allocations.Values.FirstOrDefault(candidate =>
+            !candidate.Closed && !IsExpired(candidate) && candidate.RelayAddress.Port == remote.Port);
     }
 
     private static bool HasPermission(Allocation allocation, IPEndPoint peer) =>
@@ -566,7 +724,7 @@ public sealed class StunTurnServer : BackgroundService
                 .ConfigureAwait(false);
             return TurnAuth.Denied;
         }
-        return new TurnAuth(true, key);
+        return new TurnAuth(true, key, _turnCredentials.PeerMeshClientId(username));
     }
 
     private Task SendTurnAuthErrorAsync(IPEndPoint remote, StunMessage request, ushort responseType,
@@ -579,6 +737,7 @@ public sealed class StunTurnServer : BackgroundService
         StunMessage.AllocateRequest => StunMessage.AllocateError,
         StunMessage.RefreshRequest => StunMessage.RefreshError,
         StunMessage.CreatePermissionRequest => StunMessage.CreatePermissionError,
+		StunMessage.ChannelBindRequest => StunMessage.ChannelBindError,
         _ => StunMessage.BindingError,
     };
 
@@ -607,6 +766,12 @@ public sealed class StunTurnServer : BackgroundService
                 .Select(entry => entry.Key)
                 .ToList()
                 .ForEach(key => item.Value.Permissions.TryRemove(key, out _));
+			foreach (var binding in item.Value.ChannelsByNumber.Values
+				.Where(binding => binding.ExpiresAt <= DateTimeOffset.UtcNow).ToList())
+			{
+				item.Value.ChannelsByNumber.TryRemove(binding.Channel, out _);
+				item.Value.ChannelsByPeer.TryRemove(EndpointKey(binding.Peer), out _);
+			}
             if (IsExpired(item.Value))
             {
                 CloseAllocation(item.Value);
@@ -623,6 +788,7 @@ public sealed class StunTurnServer : BackgroundService
         allocation.Closed = true;
         _allocations.TryRemove(allocation.Id, out _);
         _allocationByEndpoint.TryRemove(EndpointKey(allocation.Remote), out _);
+        _allocationByRelayEndpoint.TryRemove(EndpointKey(allocation.RelayAddress), out _);
         allocation.Relay.Dispose();
     }
 
@@ -689,6 +855,9 @@ public sealed class StunTurnServer : BackgroundService
 
     private static string EndpointKey(IPEndPoint endpoint) => $"{endpoint.Address}:{endpoint.Port}";
 
+	private static bool SameEndpoint(IPEndPoint? first, IPEndPoint? second) =>
+		first is not null && second is not null && first.Port == second.Port && first.Address.Equals(second.Address);
+
     private static string PermissionKey(IPEndPoint endpoint) => endpoint.Address.ToString();
 
     private static int RelayWorkerCount(int configured)
@@ -710,27 +879,35 @@ public sealed class StunTurnServer : BackgroundService
     private sealed class Allocation
     {
         public Allocation(string id, IPEndPoint remote, UdpClient relay, IPEndPoint relayAddress,
-            DateTimeOffset expiresAt)
+            DateTimeOffset expiresAt, long clientId)
         {
             Id = id;
             Remote = remote;
             Relay = relay;
             RelayAddress = relayAddress;
             ExpiresAt = expiresAt;
+            ClientId = clientId;
         }
 
         public string Id { get; }
         public IPEndPoint Remote { get; set; }
         public UdpClient Relay { get; }
         public IPEndPoint RelayAddress { get; }
+        public long ClientId { get; }
         public DateTimeOffset ExpiresAt { get; set; }
         public ConcurrentDictionary<string, DateTimeOffset> Permissions { get; } = new(StringComparer.Ordinal);
+		public ConcurrentDictionary<ushort, TurnChannelBinding> ChannelsByNumber { get; } = new();
+		public ConcurrentDictionary<string, TurnChannelBinding> ChannelsByPeer { get; } = new(StringComparer.Ordinal);
         public bool Closed { get; set; }
     }
 
-    private sealed record TurnAuth(bool Allowed, byte[]? MessageIntegrityKey)
+	private sealed record TurnChannelBinding(ushort Channel, IPEndPoint Peer, DateTimeOffset ExpiresAt);
+	private sealed record RelayProbe(string? Magic, string? Type, long SessionId, long FromClientId,
+		long ToClientId, string? Token);
+
+    private sealed record TurnAuth(bool Allowed, byte[]? MessageIntegrityKey, long ClientId)
     {
-        public static TurnAuth Denied { get; } = new(false, null);
-        public static TurnAuth NoAuthentication { get; } = new(true, null);
+        public static TurnAuth Denied { get; } = new(false, null, 0);
+        public static TurnAuth NoAuthentication { get; } = new(true, null, 0);
     }
 }

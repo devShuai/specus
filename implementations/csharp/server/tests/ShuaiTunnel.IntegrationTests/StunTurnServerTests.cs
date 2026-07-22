@@ -86,7 +86,7 @@ public sealed class StunTurnServerTests
     }
 
     [Fact]
-    public async Task CreatePermissionAndSendIndicationForwardOpaquePayload()
+    public async Task CreatePermissionAndSendIndicationRejectOpaquePayload()
     {
         using var fixture = StunTurnFixture.Create();
         using var primary = ListenUdp();
@@ -99,8 +99,7 @@ public sealed class StunTurnServerTests
 
         await fixture.SendIndicationAsync(Remote(source), Remote(peer), "hello"u8.ToArray());
 
-        var result = await ReadBytesAsync(peer);
-        Assert.Equal("hello", Encoding.UTF8.GetString(result));
+        Assert.Null(await TryReadBytesAsync(peer));
     }
 
     [Fact]
@@ -119,7 +118,7 @@ public sealed class StunTurnServerTests
     }
 
     [Fact]
-    public async Task RelayReceiveDispatchesDataIndicationForPermittedPeer()
+    public async Task RelayReceiveRejectsOpaquePayloadForPermittedPeer()
     {
         using var fixture = StunTurnFixture.Create();
         using var primary = ListenUdp();
@@ -132,10 +131,7 @@ public sealed class StunTurnServerTests
 
         await peer.SendAsync("pong"u8.ToArray(), fixture.RelayLocalEndpoint(allocation));
 
-        var response = await ReadStunAsync(source);
-        Assert.Equal(StunMessage.DataIndication, response.Type);
-        Assert.Equal(Remote(peer), response.XorPeerAddress());
-        Assert.Equal("pong", Encoding.UTF8.GetString(response.Data()!));
+        Assert.Null(await TryReadBytesAsync(source));
     }
 
     private static UdpClient ListenUdp() => new(new IPEndPoint(IPAddress.Loopback, 0));

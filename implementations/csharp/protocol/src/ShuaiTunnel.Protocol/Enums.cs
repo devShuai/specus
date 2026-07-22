@@ -1,16 +1,15 @@
 namespace ShuaiTunnel.Protocol;
 
 /// <summary>
-/// Mirrors <c>com.theshuai.common.protocol.MessageType</c>. Order MUST match Java's enum
-/// declaration — the compact-binary codec writes <c>ordinal + 1</c> as a varint.
+/// Stable control-protocol wire IDs. Values must never be inferred from declaration order.
 /// </summary>
 public enum MessageType
 {
-    ServerToClient = 0,
-    ClientToServer = 1,
-    ClientToClient = 2,
-    NatControl = 3,
-    PeerControl = 4,
+    ServerToClient = 1,
+    ClientToServer = 2,
+    ClientToClient = 3,
+    NatControl = 4,
+    PeerControl = 5,
 }
 
 /// <summary>
@@ -21,12 +20,13 @@ public enum NatMessageType
 {
     Register = 1,
     RegisterResult = 2,
-    Connected = 3,
-    Disconnected = 4,
+    Open = 3,
+    Fin = 4,
     Data = 5,
     Keepalive = 6,
     Unregister = 7,
-    HttpRoutesReport = 8,
+    Rst = 8,
+    WindowUpdate = 9,
 }
 
 public static class NatMessageTypeExtensions

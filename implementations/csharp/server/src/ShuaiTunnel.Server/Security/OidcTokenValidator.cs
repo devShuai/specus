@@ -34,32 +34,6 @@ public sealed class AdminBearerTokenValidator
         return _oidcTokens.ValidateAsync(token, cancellationToken);
     }
 
-    /// <summary>
-    /// Matches Java's WebSocket handshake token lookup: query string first, then an
-    /// Authorization Bearer header for non-browser clients.
-    /// </summary>
-    public static string? ExtractWebSocketToken(HttpRequest request)
-    {
-        var queryToken = request.Query["token"].FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(queryToken))
-        {
-            return queryToken.Trim();
-        }
-
-        const string prefix = "Bearer ";
-        foreach (var header in request.Headers.Authorization)
-        {
-            if (header is not null && header.StartsWith(prefix, StringComparison.Ordinal))
-            {
-                var token = header[prefix.Length..].Trim();
-                if (token.Length > 0)
-                {
-                    return token;
-                }
-            }
-        }
-        return null;
-    }
 }
 
 public sealed class OidcTokenValidator

@@ -56,6 +56,12 @@ public sealed class TunnelEnvironmentVariablesTests
             ["TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES"] = "1073741824",
             ["TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES"] = "1073741824",
             ["TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM"] = "12",
+            ["TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED"] = "true",
+            ["TUNNEL_PUBLIC_TRANSFER_REDIS_URI"] = "redis://redis.internal:6379/4",
+            ["TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX"] = "test:transfer",
+            ["TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS"] = "45",
+            ["TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS"] = "12000",
+            ["TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS"] = "1500",
             ["TUNNEL_OIDC_JWK_SET_URI"] = "https://issuer.example/jwks",
             ["TUNNEL_OIDC_TENANT_CLAIM"] = "org_id",
             ["TUNNEL_TLS_KEYSTORE_PASSWORD"] = "changeit",
@@ -111,6 +117,12 @@ public sealed class TunnelEnvironmentVariablesTests
         Assert.Equal("1073741824", mapped["Tunnel:ObjectStorage:PerUserStorageQuotaBytes"]);
         Assert.Equal("1073741824", mapped["Tunnel:ObjectStorage:PerUserMonthlyDownloadQuotaBytes"]);
         Assert.Equal("12", mapped["Tunnel:PublicTransfer:MaxDiscoveryPeersPerRoom"]);
+        Assert.Equal("true", mapped["Tunnel:PublicTransfer:ClusterEnabled"]);
+        Assert.Equal("redis://redis.internal:6379/4", mapped["Tunnel:PublicTransfer:RedisUri"]);
+        Assert.Equal("test:transfer", mapped["Tunnel:PublicTransfer:RedisKeyPrefix"]);
+        Assert.Equal("45", mapped["Tunnel:PublicTransfer:PresenceLeaseSeconds"]);
+        Assert.Equal("12000", mapped["Tunnel:PublicTransfer:PresenceRefreshIntervalMs"]);
+        Assert.Equal("1500", mapped["Tunnel:PublicTransfer:RedisCommandTimeoutMs"]);
         Assert.Equal("https://issuer.example/jwks", mapped["Tunnel:Oidc:JwkSetUri"]);
         Assert.Equal("org_id", mapped["Tunnel:Oidc:TenantClaim"]);
         Assert.Equal("changeit", mapped["Tunnel:Tls:KeystorePassword"]);

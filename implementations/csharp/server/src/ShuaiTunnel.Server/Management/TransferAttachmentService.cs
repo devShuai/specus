@@ -10,6 +10,7 @@ using ShuaiTunnel.Server.Authentication;
 using ShuaiTunnel.Server.Configuration;
 using ShuaiTunnel.Server.Data;
 using ShuaiTunnel.Server.Data.Entities;
+using ShuaiTunnel.Server.WebSockets;
 
 namespace ShuaiTunnel.Server.Management;
 
@@ -20,12 +21,62 @@ public sealed class PublicTransferRateLimiter
     private const int MaxTrackedSources = 100_000;
     private readonly ConcurrentDictionary<string, Window> _windows = new(StringComparer.Ordinal);
     private readonly PublicTransferOptions _options;
+    private readonly PublicTransferCoordinationService? _coordination;
 
-    public PublicTransferRateLimiter(IOptions<PublicTransferOptions> options) => _options = options.Value;
+    public PublicTransferRateLimiter(IOptions<PublicTransferOptions> options,
+        PublicTransferCoordinationService coordination)
+    {
+        _options = options.Value;
+        _coordination = coordination;
+    }
+
+    public PublicTransferRateLimiter(IOptions<PublicTransferOptions> options)
+    {
+        _options = options.Value;
+    }
 
     public void CheckPresignUpload(string? clientIp)
     {
         var key = string.IsNullOrWhiteSpace(clientIp) ? "unknown" : clientIp.Trim();
+        if (_options.ClusterEnabled)
+        {
+            throw new InvalidOperationException(
+                "use CheckPresignUploadAsync when public transfer cluster mode is enabled");
+        }
+        CheckLocal(key);
+    }
+
+    public async Task CheckPresignUploadAsync(string? clientIp,
+        CancellationToken cancellationToken = default)
+    {
+        var key = string.IsNullOrWhiteSpace(clientIp) ? "unknown" : clientIp.Trim();
+        if (_options.ClusterEnabled)
+        {
+            try
+            {
+                if (_coordination is null || !await _coordination.AllowRateAsync(
+                        "presign-upload", key, _options.PresignRateLimitPerIp,
+                        _options.PresignRateLimitWindowSeconds, cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    throw new RateLimitedException("请求过于频繁,请稍后再试");
+                }
+                return;
+            }
+            catch (RateLimitedException)
+            {
+                throw;
+            }
+            catch (InvalidOperationException)
+            {
+                throw new RateLimitedException("服务暂时不可用,请稍后再试");
+            }
+        }
+        CheckLocal(key);
+    }
+
+    private void CheckLocal(string key)
+    {
         var now = DateTimeOffset.UtcNow;
         var duration = TimeSpan.FromSeconds(Math.Max(1L, _options.PresignRateLimitWindowSeconds));
         if (_windows.Count >= MaxTrackedSources && !_windows.ContainsKey(key))

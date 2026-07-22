@@ -578,6 +578,7 @@ public static class AdminApiEndpoints
         RequiresBearerAuth(path)
         || path.StartsWithSegments("/api/public/transfer/downloads",
             StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/api/public/transfer/ws-tickets", StringComparison.OrdinalIgnoreCase)
         || path.Equals("/api/public/transfer/oss-callback", StringComparison.OrdinalIgnoreCase)
         || path.Equals("/auth/login", StringComparison.OrdinalIgnoreCase)
         || path.StartsWithSegments("/auth/register", StringComparison.OrdinalIgnoreCase);

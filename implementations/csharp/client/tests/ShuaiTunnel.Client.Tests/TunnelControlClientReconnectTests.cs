@@ -64,36 +64,42 @@ public class TunnelControlClientReconnectTests
 
         try
         {
-            // --- First session ----------------------------------------------------
-            using (var session = await ServerSession.AcceptAsync(listener, cts.Token))
+            // --- First control/data session pair ---------------------------------
+            using (var controlSession = await ServerSession.AcceptAsync(listener, cts.Token))
             {
-                var login = (LoginRequestPacket)await session.ReadAsync(cts.Token);
+                var login = await controlSession.ReadUntilAsync<LoginRequestPacket>(cts.Token);
                 Assert.Equal("csharp-tester", login.ClientName);
                 Assert.True(login.ClientSessionId > 0);
                 Assert.Equal("cs-test-token", login.AccessToken);
-                await session.WriteAsync(new LoginResponsePacket
+                Assert.Equal(ConnectionRole.Control, login.ConnectionRole);
+                await controlSession.WriteAsync(new LoginResponsePacket
                 {
                     ClientName = login.ClientName, Success = true, Reason = null,
                 }, cts.Token);
 
-                var register = (NatMessagePacket)await session.ReadAsync(cts.Token);
+                using var dataSession = await ServerSession.AcceptAsync(listener, cts.Token);
+                var dataLogin = await dataSession.ReadUntilAsync<LoginRequestPacket>(cts.Token);
+                Assert.Equal(ConnectionRole.Data, dataLogin.ConnectionRole);
+                await dataSession.WriteAsync(new LoginResponsePacket
+                {
+                    ClientName = dataLogin.ClientName, Success = true,
+                }, cts.Token);
+
+                var register = await dataSession.ReadUntilAsync<NatMessagePacket>(cts.Token);
                 Assert.Equal(NatMessageType.Register, register.NatMessageType);
                 Assert.Equal(9999, Convert.ToInt32(register.MetaData!["port"]));
 
-                await session.WriteAsync(new NatMessagePacket
+                await dataSession.WriteAsync(new NatMessagePacket
                 {
                     NatMessageType = NatMessageType.RegisterResult,
                     MetaData = new Dictionary<string, object?> { ["port"] = 9999, ["success"] = true },
                 }, cts.Token);
 
-                // HTTP_ROUTES_REPORT is sent once per session.
-                var routes = (NatMessagePacket)await session.ReadAsync(cts.Token);
-                Assert.Equal(NatMessageType.HttpRoutesReport, routes.NatMessageType);
-
                 const string channelId = "abc123";
-                await session.WriteAsync(new NatMessagePacket
+                await dataSession.WriteAsync(new NatMessagePacket
                 {
-                    NatMessageType = NatMessageType.Connected,
+                    NatMessageType = NatMessageType.Open,
+                    StreamId = 1,
                     MetaData = new Dictionary<string, object?>
                     {
                         ["channelId"] = channelId, ["port"] = 9999,
@@ -101,34 +107,53 @@ public class TunnelControlClientReconnectTests
                 }, cts.Token);
 
                 var greeting = new byte[] { 0x01, 0x02, 0x03 };
-                await session.WriteAsync(new NatMessagePacket
+                await dataSession.WriteAsync(new NatMessagePacket
                 {
                     NatMessageType = NatMessageType.Data,
-                    MetaData = new Dictionary<string, object?> { ["channelId"] = channelId },
+                    StreamId = 1,
                     Data = greeting,
                 }, cts.Token);
 
-                var echoed = (NatMessagePacket)await session.ReadAsync(cts.Token);
+                var firstReply = await dataSession.ReadUntilAsync<NatMessagePacket>(cts.Token);
+                var secondReply = await dataSession.ReadUntilAsync<NatMessagePacket>(cts.Token);
+                var update = firstReply.NatMessageType == NatMessageType.WindowUpdate
+                    ? firstReply
+                    : secondReply;
+                var echoed = firstReply.NatMessageType == NatMessageType.Data
+                    ? firstReply
+                    : secondReply;
+                Assert.Equal(NatMessageType.WindowUpdate, update.NatMessageType);
+                Assert.Equal(1U, update.StreamId);
+                Assert.Equal((uint)greeting.Length, update.Value);
                 Assert.Equal(NatMessageType.Data, echoed.NatMessageType);
-                Assert.Equal(channelId, (string)echoed.MetaData!["channelId"]!);
+                Assert.Equal(1U, echoed.StreamId);
+                Assert.Empty(echoed.MetaData!);
                 Assert.Equal(greeting, echoed.Data);
 
                 // Drop the connection -- the client should reconnect.
             }
 
-            // --- Second session ---------------------------------------------------
-            using (var session = await ServerSession.AcceptAsync(listener, cts.Token))
+            // --- Second control/data session pair --------------------------------
+            using (var controlSession = await ServerSession.AcceptAsync(listener, cts.Token))
             {
-                var login = (LoginRequestPacket)await session.ReadAsync(cts.Token);
+                var login = await controlSession.ReadUntilAsync<LoginRequestPacket>(cts.Token);
                 Assert.Equal("csharp-tester", login.ClientName);
                 Assert.True(login.ClientSessionId > 0);
                 Assert.Equal("cs-test-token", login.AccessToken);
-                await session.WriteAsync(new LoginResponsePacket
+                Assert.Equal(ConnectionRole.Control, login.ConnectionRole);
+                await controlSession.WriteAsync(new LoginResponsePacket
                 {
                     ClientName = login.ClientName, Success = true,
                 }, cts.Token);
 
-                var register = (NatMessagePacket)await session.ReadAsync(cts.Token);
+                using var dataSession = await ServerSession.AcceptAsync(listener, cts.Token);
+                var dataLogin = await dataSession.ReadUntilAsync<LoginRequestPacket>(cts.Token);
+                Assert.Equal(ConnectionRole.Data, dataLogin.ConnectionRole);
+                await dataSession.WriteAsync(new LoginResponsePacket
+                {
+                    ClientName = dataLogin.ClientName, Success = true,
+                }, cts.Token);
+                var register = await dataSession.ReadUntilAsync<NatMessagePacket>(cts.Token);
                 Assert.Equal(NatMessageType.Register, register.NatMessageType);
             }
         }
@@ -236,6 +261,21 @@ public class TunnelControlClientReconnectTests
             var packet = await FrameReaderProxy.ReadFrameAsync(_reader, 32 * 1024 * 1024, ct);
             Assert.NotNull(packet);
             return packet!;
+        }
+
+        public async Task<TPacket> ReadUntilAsync<TPacket>(CancellationToken ct)
+            where TPacket : Packet
+        {
+            while (true)
+            {
+                var packet = await ReadAsync(ct);
+                if (packet is TPacket expected)
+                {
+                    return expected;
+                }
+                Assert.True(packet is HeartbeatRequestPacket or HeartbeatResponsePacket,
+                    $"unexpected packet {packet.Command} while waiting for {typeof(TPacket).Name}");
+            }
         }
 
         public async Task WriteAsync(Packet packet, CancellationToken ct)

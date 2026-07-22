@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Buffers.Binary;
 using System.IO.Pipelines;
 using ShuaiTunnel.Protocol.Codec;
 using ShuaiTunnel.Protocol.Packets;
@@ -57,12 +56,7 @@ internal static class FrameReader
         }
         Span<byte> header = stackalloc byte[PacketCodec.HeaderSize];
         buffer.Slice(0, PacketCodec.HeaderSize).CopyTo(header);
-        var magic = BinaryPrimitives.ReadInt32BigEndian(header[..4]);
-        if (magic != PacketCodec.MagicNumber)
-        {
-            throw new InvalidDataException($"invalid frame magic: 0x{magic:X8}");
-        }
-        var length = BinaryPrimitives.ReadInt32BigEndian(header.Slice(7, 4));
+        var (_, length) = PacketCodec.DecodeHeader(header);
         var total = (long)PacketCodec.HeaderSize + length;
         if (length < 0 || total > maxFrameSize)
         {

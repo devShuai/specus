@@ -14,8 +14,8 @@ namespace ShuaiTunnel.Client.Nat;
 
 /// <summary>
 /// Owns all NAT state for one control-channel session: tunnel registrations, per-channel
-/// local sockets, REGISTER/UNREGISTER diff on NAT_CONTROL hot reloads, and one-shot
-/// HTTP_ROUTES_REPORT upload. Mirrors the Java <c>NatClientHandler</c>.
+/// local sockets, REGISTER/UNREGISTER diffs on NAT_CONTROL hot reloads, and v2 HTTP/WebSocket
+/// stream dispatch. Mirrors the Java <c>NatClientHandler</c>.
 /// </summary>
 internal sealed class NatClientHandler : IAsyncDisposable
 {
@@ -27,9 +27,9 @@ internal sealed class NatClientHandler : IAsyncDisposable
     private readonly object _stateLock = new();
     private readonly Dictionary<int, TunnelConfigEntry> _tunnels = new();
     private readonly HashSet<int> _registered = new();
-    private readonly ConcurrentDictionary<string, LocalTunnelChannel> _channels = new();
-    private readonly ConcurrentDictionary<string, WebSocketTunnelChannel> _wsChannels = new();
-    private bool _httpRoutesReported;
+    private readonly ConcurrentDictionary<uint, LocalTunnelChannel> _channels = new();
+    private readonly ConcurrentDictionary<uint, WebSocketTunnelChannel> _wsChannels = new();
+    private readonly ConcurrentDictionary<uint, HttpStreamChannel> _httpChannels = new();
     private bool _controlWritable = true;
     private CancellationToken _cancellationToken;
 
@@ -70,43 +70,6 @@ internal sealed class NatClientHandler : IAsyncDisposable
         {
             await SendRegisterAsync(entry).ConfigureAwait(false);
         }
-    }
-
-    /// <summary>Single-shot HTTP_ROUTES_REPORT, mirroring the Java client's diagnostic upload.</summary>
-    public async Task ReportHttpRoutesAsync(bool force = false)
-    {
-        bool shouldSend;
-        lock (_stateLock)
-        {
-            if (force)
-            {
-                _httpRoutesReported = false;
-            }
-            shouldSend = !_httpRoutesReported;
-            _httpRoutesReported = true;
-        }
-        if (!shouldSend)
-        {
-            return;
-        }
-        var routes = _directHttp.SnapshotRoutes()
-            .Where(kv => !string.IsNullOrWhiteSpace(kv.Key))
-            .Select(kv => (object?)new Dictionary<string, object?>
-            {
-                ["route"] = kv.Key,
-                ["targetBaseUrl"] = kv.Value,
-            })
-            .ToList();
-        var packet = new NatMessagePacket
-        {
-            NatMessageType = NatMessageType.HttpRoutesReport,
-            MetaData = new Dictionary<string, object?>
-            {
-                ["clientName"] = _clientName,
-                ["routes"] = routes,
-            },
-        };
-        await _writer.WriteAsync(packet, _cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -158,17 +121,52 @@ internal sealed class NatClientHandler : IAsyncDisposable
             case NatMessageType.RegisterResult:
                 HandleRegisterResult(packet);
                 break;
-            case NatMessageType.Connected:
-                await HandleConnectedAsync(packet).ConfigureAwait(false);
+            case NatMessageType.Open:
+                await HandleOpenAsync(packet).ConfigureAwait(false);
                 break;
             case NatMessageType.Data:
                 await HandleDataAsync(packet).ConfigureAwait(false);
                 break;
-            case NatMessageType.Disconnected:
-                HandleDisconnected(packet);
+            case NatMessageType.Fin:
+                if (_httpChannels.TryGetValue(packet.StreamId, out var httpRequest))
+                {
+                    await httpRequest.FinishRequestAsync(packet.MetaData, _cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    HandleClosed(packet);
+                }
+                break;
+            case NatMessageType.Rst:
+                if (_httpChannels.TryRemove(packet.StreamId, out var resetHttp))
+                {
+                    resetHttp.Abort(AsString(packet.MetaData, "reason"));
+                }
+                else
+                {
+                    HandleClosed(packet);
+                }
                 break;
             case NatMessageType.Keepalive:
                 // ignore; reader-idle gets reset by the inbound bytes themselves
+                break;
+            case NatMessageType.WindowUpdate:
+                if (_httpChannels.TryGetValue(packet.StreamId, out var httpFlowChannel)
+                    && !httpFlowChannel.AddResponseCredit(packet.Value))
+                {
+                    throw new InvalidDataException("invalid HTTP WINDOW_UPDATE");
+                }
+                if (_channels.TryGetValue(packet.StreamId, out var flowChannel)
+                    && !flowChannel.AddSendCredit(packet.Value))
+                {
+                    throw new InvalidDataException("invalid stream WINDOW_UPDATE");
+                }
+                if (_wsChannels.TryGetValue(packet.StreamId, out var wsFlowChannel)
+                    && !wsFlowChannel.AddSendCredit(packet.Value))
+                {
+                    throw new InvalidDataException("invalid websocket WINDOW_UPDATE");
+                }
                 break;
             default:
                 _logger.LogDebug("NAT: unhandled message type {type}", packet.NatMessageType);
@@ -227,9 +225,14 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
     }
 
-    private async Task HandleConnectedAsync(NatMessagePacket packet)
+    private async Task HandleOpenAsync(NatMessagePacket packet)
     {
         var source = AsString(packet.MetaData, "source");
+        if (string.Equals(source, "http", StringComparison.Ordinal))
+        {
+            await HandleHttpOpenAsync(packet).ConfigureAwait(false);
+            return;
+        }
         if (string.Equals(source, "ws", StringComparison.Ordinal))
         {
             await HandleWebSocketConnectedAsync(packet).ConfigureAwait(false);
@@ -258,20 +261,41 @@ internal sealed class NatClientHandler : IAsyncDisposable
             var tcp = new TcpClient { NoDelay = true };
             await tcp.ConnectAsync(entry.TunnelAddress, entry.TunnelPort, _cancellationToken).ConfigureAwait(false);
             var channel = new LocalTunnelChannel(
-                channelId, port.Value, tcp, _writer, _logger, c => _channels.TryRemove(c.ChannelId, out _));
+                packet.StreamId, channelId, port.Value, tcp, _writer, _logger,
+                c => _channels.TryRemove(c.StreamId, out _));
             channel.SetControlWritable(_controlWritable);
-            _channels[channelId] = channel;
+            _channels[packet.StreamId] = channel;
             _ = Task.Run(async () =>
             {
                 await channel.PumpAsync(_cancellationToken).ConfigureAwait(false);
-                await SendDisconnectAsync(channelId).ConfigureAwait(false);
+                await SendFinAsync(packet.StreamId).ConfigureAwait(false);
             }, _cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "local dial {addr}:{port} failed", entry.TunnelAddress, entry.TunnelPort);
-            await SendDisconnectAsync(channelId).ConfigureAwait(false);
+            await SendResetAsync(packet.StreamId, 1, "local connect failed").ConfigureAwait(false);
         }
+    }
+
+    private Task HandleHttpOpenAsync(NatMessagePacket packet)
+    {
+        if (!string.Equals(AsString(packet.MetaData, "phase"), "request", StringComparison.Ordinal)
+            || packet.MetaData is null)
+        {
+            return SendResetAsync(packet.StreamId, 20, "invalid HTTP OPEN");
+        }
+        var channel = new HttpStreamChannel(packet.StreamId, packet.MetaData, _directHttp,
+            _writer, _logger, _cancellationToken,
+            closed => _httpChannels.TryRemove(
+                new KeyValuePair<uint, HttpStreamChannel>(closed.StreamId, closed)));
+        if (!_httpChannels.TryAdd(packet.StreamId, channel))
+        {
+            channel.Abort("duplicate HTTP stream");
+            return SendResetAsync(packet.StreamId, 21, "duplicate HTTP stream");
+        }
+        _ = Task.Run(channel.RunAsync, _cancellationToken);
+        return Task.CompletedTask;
     }
 
     private async Task HandleWebSocketConnectedAsync(NatMessagePacket packet)
@@ -283,7 +307,7 @@ internal sealed class NatClientHandler : IAsyncDisposable
             _logger.LogWarning("[ws-tunnel][client] CONNECTED missing channelId/route");
             if (!string.IsNullOrWhiteSpace(channelId))
             {
-                await SendDisconnectAsync(channelId, "ws").ConfigureAwait(false);
+                await SendResetAsync(packet.StreamId, 2, "invalid websocket open").ConfigureAwait(false);
             }
             return;
         }
@@ -292,7 +316,7 @@ internal sealed class NatClientHandler : IAsyncDisposable
         if (!routes.TryGetValue(route, out var targetBaseUrl) || string.IsNullOrWhiteSpace(targetBaseUrl))
         {
             _logger.LogWarning("[ws-tunnel][client] CONNECTED for unknown route {route}", route);
-            await SendDisconnectAsync(channelId, "ws").ConfigureAwait(false);
+            await SendResetAsync(packet.StreamId, 3, "unknown websocket route").ConfigureAwait(false);
             return;
         }
 
@@ -301,7 +325,7 @@ internal sealed class NatClientHandler : IAsyncDisposable
         if (!TryBuildWebSocketTarget(targetBaseUrl, relativePath, rawQuery, out var target, out var error))
         {
             _logger.LogWarning("[ws-tunnel][client] CONNECTED route={route} build-target-failed error={error}", route, error);
-            await SendDisconnectAsync(channelId, "ws").ConfigureAwait(false);
+            await SendResetAsync(packet.StreamId, 4, "invalid websocket target").ConfigureAwait(false);
             return;
         }
 
@@ -323,90 +347,114 @@ internal sealed class NatClientHandler : IAsyncDisposable
             }
 
             await socket.ConnectAsync(target, connectCts.Token).ConfigureAwait(false);
-            if (_wsChannels.TryRemove(channelId, out var previous))
+            if (_wsChannels.TryRemove(packet.StreamId, out var previous))
             {
                 await previous.DisposeAsync().ConfigureAwait(false);
             }
             var channel = new WebSocketTunnelChannel(
+                packet.StreamId,
                 channelId,
                 socket,
                 _writer,
                 _logger,
-                c => _wsChannels.TryRemove(c.ChannelId, out _));
+                c => _wsChannels.TryRemove(c.StreamId, out _));
             channel.SetControlWritable(_controlWritable);
-            _wsChannels[channelId] = channel;
+            _wsChannels[packet.StreamId] = channel;
             _logger.LogInformation("[ws-tunnel][client] ws handshake ok channelId={channelId} route={route} target={target}",
                 channelId, route, target.GetLeftPart(UriPartial.Path));
             _ = Task.Run(async () =>
             {
                 await channel.PumpAsync(_cancellationToken).ConfigureAwait(false);
-                await SendDisconnectAsync(channelId, "ws").ConfigureAwait(false);
+                await SendFinAsync(packet.StreamId).ConfigureAwait(false);
             }, _cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "[ws-tunnel][client] connect local ws failed channelId={channelId} route={route}", channelId, route);
-            await SendDisconnectAsync(channelId, "ws").ConfigureAwait(false);
+            await SendResetAsync(packet.StreamId, 5, "websocket connect failed").ConfigureAwait(false);
         }
     }
 
     private async Task HandleDataAsync(NatMessagePacket packet)
     {
-        var channelId = AsString(packet.MetaData, "channelId");
-        if (string.IsNullOrEmpty(channelId) || packet.Data is null || packet.Data.Length == 0)
+        if (packet.Data is null || packet.Data.Length == 0)
         {
             return;
         }
-        if (_wsChannels.TryGetValue(channelId, out var wsChannel))
+        if (_httpChannels.TryGetValue(packet.StreamId, out var httpChannel))
+        {
+            await httpChannel.OfferRequestDataAsync(packet.Data, _cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+        if (_wsChannels.TryGetValue(packet.StreamId, out var wsChannel))
         {
             await wsChannel.WriteAsync(packet.Data, _cancellationToken).ConfigureAwait(false);
+            await SendWindowUpdateAsync(packet.StreamId, packet.Data.Length).ConfigureAwait(false);
             return;
         }
-        if (_channels.TryGetValue(channelId!, out var channel))
+        if (_channels.TryGetValue(packet.StreamId, out var channel))
         {
             await channel.WriteAsync(packet.Data, _cancellationToken).ConfigureAwait(false);
+            await SendWindowUpdateAsync(packet.StreamId, packet.Data.Length).ConfigureAwait(false);
         }
     }
 
-    private void HandleDisconnected(NatMessagePacket packet)
+    private void HandleClosed(NatMessagePacket packet)
     {
-        var channelId = AsString(packet.MetaData, "channelId");
-        if (string.IsNullOrEmpty(channelId))
-        {
-            return;
-        }
-        if (_wsChannels.TryRemove(channelId!, out var wsChannel))
+        if (_wsChannels.TryRemove(packet.StreamId, out var wsChannel))
         {
             wsChannel.Close();
             return;
         }
-        if (_channels.TryRemove(channelId!, out var channel))
+        if (_channels.TryRemove(packet.StreamId, out var channel))
         {
             channel.Close();
         }
     }
 
-    private async Task SendDisconnectAsync(string channelId, string? source = null)
+    private async Task SendFinAsync(uint streamId)
     {
         try
         {
-            var meta = new Dictionary<string, object?> { ["channelId"] = channelId };
-            if (!string.IsNullOrWhiteSpace(source))
-            {
-                meta["source"] = source;
-            }
             var packet = new NatMessagePacket
             {
-                NatMessageType = NatMessageType.Disconnected,
-                MetaData = meta,
+                NatMessageType = NatMessageType.Fin,
+                StreamId = streamId,
             };
             await _writer.WriteAsync(packet, _cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogDebug(ex, "send DISCONNECTED({channelId}) failed", channelId);
+            _logger.LogDebug(ex, "send FIN({streamId}) failed", streamId);
         }
     }
+
+    private async Task SendResetAsync(uint streamId, uint errorCode, string reason)
+    {
+        try
+        {
+            await _writer.WriteAsync(new NatMessagePacket
+            {
+                NatMessageType = NatMessageType.Rst,
+                StreamId = streamId,
+                Value = errorCode,
+                MetaData = new Dictionary<string, object?> { ["reason"] = reason },
+            }, _cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "send RST({streamId}) failed", streamId);
+        }
+    }
+
+    private ValueTask SendWindowUpdateAsync(uint streamId, int credit) =>
+        _writer.WritePriorityAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.WindowUpdate,
+            StreamId = streamId,
+            Value = checked((uint)credit),
+        }, _cancellationToken);
 
     private static string? AsString(Dictionary<string, object?>? meta, string key)
     {
@@ -607,5 +655,10 @@ internal sealed class NatClientHandler : IAsyncDisposable
             await channel.DisposeAsync().ConfigureAwait(false);
         }
         _wsChannels.Clear();
+        foreach (var channel in _httpChannels.Values)
+        {
+            await channel.DisposeAsync().ConfigureAwait(false);
+        }
+        _httpChannels.Clear();
     }
 }

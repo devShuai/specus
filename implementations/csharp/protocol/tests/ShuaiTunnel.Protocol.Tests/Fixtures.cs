@@ -11,8 +11,7 @@ internal static class Fixtures
     internal static byte[] Read(string name) => File.ReadAllBytes(Path.Combine(FixtureDir, name));
 
     /// <summary>Decode + assert a packet, then re-encode and compare bytes when the fixture is
-    /// known to round-trip (no deflate involved). For deflated fixtures, callers should compare
-    /// the decoded packet only.</summary>
+    /// known to round-trip. All v2 fixtures use canonical raw CompactBinary bodies.</summary>
     internal static T DecodeAndAssertRoundtrip<T>(string fixtureName, Action<T> assertions, bool compareEncoded = true)
         where T : Packet
     {

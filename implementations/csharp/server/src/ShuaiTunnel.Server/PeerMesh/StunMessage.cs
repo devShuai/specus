@@ -24,6 +24,9 @@ public sealed class StunMessage
     public const ushort CreatePermissionRequest = 0x0008;
     public const ushort CreatePermissionSuccess = 0x0108;
     public const ushort CreatePermissionError = 0x0118;
+    public const ushort ChannelBindRequest = 0x0009;
+    public const ushort ChannelBindSuccess = 0x0109;
+    public const ushort ChannelBindError = 0x0119;
     public const ushort SendIndication = 0x0016;
     public const ushort DataIndication = 0x0017;
 
@@ -31,6 +34,7 @@ public sealed class StunMessage
     public const ushort AttrMessageIntegrity = 0x0008;
     public const ushort AttrErrorCode = 0x0009;
     public const ushort AttrLifetime = 0x000D;
+    public const ushort AttrChannelNumber = 0x000C;
     public const ushort AttrXorPeerAddress = 0x0012;
     public const ushort AttrData = 0x0013;
     public const ushort AttrRealm = 0x0014;
@@ -74,7 +78,7 @@ public sealed class StunMessage
         }
         var declaredLength = BinaryPrimitives.ReadUInt16BigEndian(packet[2..4]);
         var cookie = BinaryPrimitives.ReadUInt32BigEndian(packet[4..8]);
-        return cookie == MagicCookie && HeaderBytes + declaredLength <= packet.Length;
+        return cookie == MagicCookie && HeaderBytes + declaredLength == packet.Length;
     }
 
     public static StunMessage? Parse(ReadOnlySpan<byte> packet)
@@ -215,6 +219,17 @@ public sealed class StunMessage
         return value is { Length: > 0 } && value[0] == TransportUdp;
     }
 
+    public ushort? ChannelNumber()
+    {
+        var value = First(AttrChannelNumber)?.Value;
+        if (value is not { Length: 4 })
+        {
+            return null;
+        }
+        var channel = BinaryPrimitives.ReadUInt16BigEndian(value);
+        return channel is >= TurnChannelData.MinChannel and <= TurnChannelData.MaxChannel ? channel : null;
+    }
+
     public static StunAttribute XorMappedAddress(IPEndPoint endpoint, byte[] transactionId) =>
         new(AttrXorMappedAddress, EncodeXorAddress(endpoint, transactionId));
 
@@ -231,6 +246,13 @@ public sealed class StunMessage
         new(AttrResponseOrigin, EncodeXorAddress(endpoint, transactionId));
 
     public static StunAttribute Data(byte[] payload) => new(AttrData, payload);
+
+    public static StunAttribute ChannelNumber(ushort channel)
+    {
+        var value = new byte[4];
+        BinaryPrimitives.WriteUInt16BigEndian(value, channel);
+        return new StunAttribute(AttrChannelNumber, value);
+    }
 
     public static StunAttribute Lifetime(long seconds)
     {

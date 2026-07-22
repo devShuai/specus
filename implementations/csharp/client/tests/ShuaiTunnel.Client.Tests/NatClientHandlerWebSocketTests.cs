@@ -17,8 +17,8 @@ namespace ShuaiTunnel.Client.Tests;
 public class NatClientHandlerWebSocketTests
 {
     [Theory]
-    [MemberData(nameof(InvalidTcpConnectedMetadata))]
-    public async Task HandleConnectedAsync_ForInvalidTcpMapping_IgnoresLikeJava(Dictionary<string, object?> metadata)
+    [MemberData(nameof(InvalidTcpOpenMetadata))]
+    public async Task HandleOpenAsync_ForInvalidTcpMapping_IgnoresLikeJava(Dictionary<string, object?> metadata)
     {
         await using var stream = new MemoryStream();
         await using var writer = new FrameWriter(stream);
@@ -37,14 +37,15 @@ public class NatClientHandlerWebSocketTests
 
         await nat.HandleAsync(new NatMessagePacket
         {
-            NatMessageType = NatMessageType.Connected,
+            NatMessageType = NatMessageType.Open,
+            StreamId = 1,
             MetaData = metadata,
         });
 
         Assert.Equal(0, stream.Length);
     }
 
-    public static IEnumerable<object[]> InvalidTcpConnectedMetadata()
+    public static IEnumerable<object[]> InvalidTcpOpenMetadata()
     {
         yield return new object[] { new Dictionary<string, object?> { ["channelId"] = "channel-1" } };
         yield return new object[] { new Dictionary<string, object?> { ["port"] = 10022 } };
@@ -152,7 +153,7 @@ public class NatClientHandlerWebSocketTests
     }
 
     [Fact]
-    public async Task HandleConnectedAsync_ForWebSocketRoute_ForwardsLocalTextFrameToNatData()
+    public async Task HandleOpenAsync_ForWebSocketRoute_ForwardsLocalTextFrameToNatData()
     {
         using var wsListener = new TcpListener(IPAddress.Loopback, 0);
         wsListener.Start();
@@ -191,7 +192,8 @@ public class NatClientHandlerWebSocketTests
 
         await nat.HandleAsync(new NatMessagePacket
         {
-            NatMessageType = NatMessageType.Connected,
+            NatMessageType = NatMessageType.Open,
+            StreamId = 1,
             MetaData = new Dictionary<string, object?>
             {
                 ["channelId"] = "ws1",
@@ -207,14 +209,36 @@ public class NatClientHandlerWebSocketTests
             PipeReader.Create(controlServer.GetStream()), 32 * 1024 * 1024, cts.Token);
         var natData = Assert.IsType<NatMessagePacket>(packet);
         Assert.Equal(NatMessageType.Data, natData.NatMessageType);
-        Assert.Equal("ws1", (string)natData.MetaData!["channelId"]!);
-        Assert.Equal("ws", (string)natData.MetaData!["source"]!);
-        Assert.Equal(new byte[] { WebSocketTunnelChannel.FrameText, (byte)'h', (byte)'e', (byte)'l', (byte)'l', (byte)'o' }, natData.Data);
+        Assert.Equal(1U, natData.StreamId);
+        Assert.Empty(natData.MetaData!);
+        var frame = WebSocketTunnelFrame.Decode(natData.Data!);
+        Assert.Equal(WebSocketTunnelFrame.OpcodeText, frame.Opcode);
+        Assert.True(frame.FinalFragment);
+        Assert.Equal("hello", Encoding.UTF8.GetString(frame.Payload));
 
         cts.Cancel();
         wsListener.Stop();
         controlListener.Stop();
         try { await wsTask; } catch (OperationCanceledException) { }
+    }
+
+    [Fact]
+    public void WebSocketTunnelFrame_RejectsLegacyPrefix()
+    {
+        Assert.Throws<InvalidDataException>(() =>
+            WebSocketTunnelFrame.Decode(new byte[] { 0x01, (byte)'o', (byte)'l', (byte)'d' }));
+    }
+
+    [Fact]
+    public void WebSocketTunnelFrame_RoundTripsClose()
+    {
+        var encoded = new WebSocketTunnelFrame(
+            WebSocketTunnelFrame.OpcodeClose, true, 0, 1001, Encoding.UTF8.GetBytes("going away")).Encode();
+        var decoded = WebSocketTunnelFrame.Decode(encoded);
+
+        Assert.Equal(WebSocketTunnelFrame.OpcodeClose, decoded.Opcode);
+        Assert.Equal((ushort)1001, decoded.CloseCode);
+        Assert.Equal("going away", Encoding.UTF8.GetString(decoded.Payload));
     }
 
     private static async Task RunMinimalWebSocketServerAsync(TcpListener listener, CancellationToken ct)

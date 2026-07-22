@@ -60,15 +60,28 @@ public sealed class PeerMeshService
 
     public bool Enabled => _options.Enabled;
 
-    internal async Task<bool> AuthorizeRelayFrameAsync(PeerDataFrameHeader header, long bytes,
+    internal async Task<bool> AuthorizeRelayFrameAsync(PeerDataFrameHeader header,
+        long fromClientId, long toClientId, long bytes,
         CancellationToken cancellationToken)
     {
-        if (bytes <= 0)
+        if (fromClientId <= 0 || toClientId <= 0 || bytes <= 0)
         {
             return false;
         }
+		return await AuthorizeRelayFrameCoreAsync(
+            header, fromClientId, toClientId, bytes, true, cancellationToken).ConfigureAwait(false);
+	}
+
+	internal Task<bool> ValidateRelayFrameAsync(PeerDataFrameHeader header,
+        long fromClientId, long toClientId, CancellationToken cancellationToken) =>
+		AuthorizeRelayFrameCoreAsync(header, fromClientId, toClientId, 0, false, cancellationToken);
+
+	private async Task<bool> AuthorizeRelayFrameCoreAsync(PeerDataFrameHeader header,
+        long fromClientId, long toClientId, long bytes, bool account,
+		CancellationToken cancellationToken)
+	{
         var now = DateTimeOffset.UtcNow;
-        if (AuthorizeRelayFrameCached(header, bytes, now))
+        if (AuthorizeRelayFrameCached(header, fromClientId, toClientId, bytes, now, account))
         {
             return true;
         }
@@ -88,17 +101,60 @@ public sealed class PeerMeshService
         {
             return false;
         }
-        var forward = header.FromClientId == session.SourceClientId && header.ToClientId == session.TargetClientId;
-        var reverse = header.FromClientId == session.TargetClientId && header.ToClientId == session.SourceClientId;
+        var forward = fromClientId == session.SourceClientId && toClientId == session.TargetClientId;
+        var reverse = fromClientId == session.TargetClientId && toClientId == session.SourceClientId;
         if (!forward && !reverse)
         {
             RemoveRelaySession(header.SessionId);
             return false;
         }
         CacheRelayAuthorization(session, now);
-        AddPendingRelayBytes(header.SessionId, bytes);
+		if (account)
+		{
+			AddPendingRelayBytes(header.SessionId, bytes);
+		}
         return true;
     }
+
+	internal async Task<bool> AuthorizeRelayProbeAsync(long sessionId, long fromClientId, long toClientId,
+		string? token, string? type, CancellationToken cancellationToken)
+	{
+		if (sessionId <= 0 || fromClientId <= 0 || toClientId <= 0 || string.IsNullOrWhiteSpace(token)
+			|| type is not ("check" or "check-response"))
+		{
+			return false;
+		}
+		var session = await _db.PeerMeshSessions.FirstOrDefaultAsync(item => item.Id == sessionId, cancellationToken)
+			.ConfigureAwait(false);
+		if (session is null)
+		{
+			return false;
+		}
+		var now = DateTimeOffset.UtcNow;
+		if (CloseIfExpired(session, now))
+		{
+			await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+			return false;
+		}
+		var forward = fromClientId == session.SourceClientId && toClientId == session.TargetClientId;
+		var reverse = fromClientId == session.TargetClientId && toClientId == session.SourceClientId;
+		if ((!forward && !reverse) || string.Equals(session.Status, StatusClosed, StringComparison.Ordinal)
+			|| string.IsNullOrWhiteSpace(session.TokenHash))
+		{
+			return false;
+		}
+		byte[] expected;
+		try
+		{
+			expected = Convert.FromHexString(session.TokenHash);
+		}
+		catch (FormatException)
+		{
+			return false;
+		}
+		var actual = SHA256.HashData(Encoding.UTF8.GetBytes(token));
+		return expected.Length == actual.Length && CryptographicOperations.FixedTimeEquals(expected, actual);
+	}
 
     public async Task<PeerMeshConfig> BuildLoginConfigAsync(ClientAccount account, ClientEnvironmentInfo environment,
         string? requestServerName, CancellationToken cancellationToken)
@@ -507,6 +563,31 @@ public sealed class PeerMeshService
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+        var addressFamilyRows = await sessionQuery
+            .GroupBy(s => new
+            {
+                AddressFamily = string.IsNullOrEmpty(s.RemoteEndpoint)
+                    ? "UNKNOWN"
+                    : s.RemoteEndpoint.StartsWith("[")
+                        ? "IPv6"
+                        : "IPv4",
+                PathType = s.RelayBytes > s.DirectBytes
+                    ? PathRelay
+                    : s.DirectBytes > s.RelayBytes
+                        ? PathDirect
+                        : s.PathType,
+                s.Status,
+            })
+            .Select(g => new
+            {
+                g.Key.AddressFamily,
+                g.Key.Status,
+                g.Key.PathType,
+                Sessions = g.LongCount(),
+                ReportedSessions = g.LongCount(s => s.RttMillis != null),
+            })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
         IQueryable<PeerMeshDevice> natQuery = _db.PeerMeshDevices.AsNoTracking()
             .Where(d => d.TenantId == context.TenantId);
@@ -561,6 +642,12 @@ public sealed class PeerMeshService
             pathTypes.Add(new PeerMeshPathTypeStat(row.PathType, row.Status, row.Sessions,
                 row.ReportedSessions, row.AvgRttMillis, row.DirectBytes, row.RelayBytes));
         }
+        var addressFamilies = addressFamilyRows.Select(row => new PeerMeshAddressFamilyStat(
+            row.AddressFamily,
+            row.Status,
+            row.PathType,
+            row.Sessions,
+            row.ReportedSessions)).ToList();
 
         var natCounts = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var row in natRows)
@@ -598,6 +685,7 @@ public sealed class PeerMeshService
         double? ratio = active == 0 ? null : (double)activeDirect / active;
         return new PeerMeshPathStatsView(total, reported, active, activeDirect, activeRelay, ratio,
             pathTypes,
+            addressFamilies,
             natTypes,
             natBehaviorDevices,
             natBehaviorClassifiedDevices,
@@ -1084,6 +1172,7 @@ public sealed class PeerMeshService
             ExpiresAt = grant.Session.ExpiresAt,
             PathType = grant.Session.PathType,
             Status = grant.Session.Status,
+            DataFrameVersion = 2,
             CreatedAtMillis = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         };
         await FillSourceAsync(message, source, cancellationToken).ConfigureAwait(false);
@@ -1297,7 +1386,9 @@ public sealed class PeerMeshService
         session.UpdatedAt = now;
     }
 
-    private static bool AuthorizeRelayFrameCached(PeerDataFrameHeader header, long bytes, DateTimeOffset now)
+    private static bool AuthorizeRelayFrameCached(PeerDataFrameHeader header,
+        long fromClientId, long toClientId, long bytes, DateTimeOffset now,
+		bool account)
     {
         if (!RelayAuthorizations.TryGetValue(header.SessionId, out var authorization))
         {
@@ -1308,11 +1399,14 @@ public sealed class PeerMeshService
             RemoveRelaySession(header.SessionId);
             return false;
         }
-        if (!authorization.Matches(header))
+        if (!authorization.Matches(fromClientId, toClientId))
         {
             return false;
         }
-        AddPendingRelayBytes(header.SessionId, bytes);
+		if (account)
+		{
+			AddPendingRelayBytes(header.SessionId, bytes);
+		}
         return true;
     }
 
@@ -1548,10 +1642,10 @@ public sealed class PeerMeshService
         public bool ValidAt(DateTimeOffset now) =>
             Active && CacheExpiresAt > now && SessionExpiresAt > now;
 
-        public bool Matches(PeerDataFrameHeader header)
+        public bool Matches(long fromClientId, long toClientId)
         {
-            var forward = header.FromClientId == SourceClientId && header.ToClientId == TargetClientId;
-            var reverse = header.FromClientId == TargetClientId && header.ToClientId == SourceClientId;
+            var forward = fromClientId == SourceClientId && toClientId == TargetClientId;
+            var reverse = fromClientId == TargetClientId && toClientId == SourceClientId;
             return forward || reverse;
         }
     }
@@ -1641,6 +1735,7 @@ public sealed record PeerMeshPathStatsView(
     long ActiveRelaySessions,
     double? ActiveDirectRatio,
     IReadOnlyList<PeerMeshPathTypeStat> PathTypes,
+    IReadOnlyList<PeerMeshAddressFamilyStat> AddressFamilies,
     IReadOnlyList<PeerMeshNatTypeStat> NatTypes,
     long NatBehaviorDevices,
     long NatBehaviorClassifiedDevices,
@@ -1659,6 +1754,13 @@ public sealed record PeerMeshPathTypeStat(
     long RelayBytes);
 
 public sealed record PeerMeshNatTypeStat(string NatType, long Devices);
+
+public sealed record PeerMeshAddressFamilyStat(
+    string AddressFamily,
+    string Status,
+    string PathType,
+    long Sessions,
+    long ReportedSessions);
 
 public sealed record PeerMeshNatBehaviorStat(string Behavior, long Devices);
 
@@ -1686,7 +1788,8 @@ public sealed record PeerCandidate(
     [property: JsonPropertyName("port")] int Port,
     [property: JsonPropertyName("priority")] long Priority,
     [property: JsonPropertyName("foundation")] string? Foundation,
-    [property: JsonPropertyName("relayId")] string? RelayId);
+    [property: JsonPropertyName("relayId")] string? RelayId,
+    [property: JsonPropertyName("addressFamily")] string? AddressFamily = null);
 
 public sealed class PeerControlMessage
 {
@@ -1776,6 +1879,9 @@ public sealed class PeerControlMessage
 
     [JsonPropertyName("peerMesh")]
     public PeerMeshConfig? PeerMesh { get; set; }
+
+    [JsonPropertyName("dataFrameVersion")]
+    public int DataFrameVersion { get; set; } = 2;
 
     [JsonPropertyName("candidates")]
     public IReadOnlyList<PeerCandidate>? Candidates { get; set; }

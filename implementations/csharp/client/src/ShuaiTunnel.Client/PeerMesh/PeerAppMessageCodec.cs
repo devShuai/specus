@@ -9,8 +9,7 @@ internal static class PeerAppMessageCodec
     public const string TypeMessage = "message";
     public const string TypeAck = "ack";
 
-    private static readonly byte[] PrefixV1 = Encoding.ASCII.GetBytes("STMSG1\n");
-    private static readonly byte[] PrefixV2 = Encoding.ASCII.GetBytes("STMSG2\n");
+    private static readonly byte[] Prefix = Encoding.ASCII.GetBytes("STMSG2\n");
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -19,9 +18,8 @@ internal static class PeerAppMessageCodec
 
     public static bool LooksLike(byte[] payload)
     {
-        return payload.Length >= PrefixV1.Length
-            && (payload.AsSpan(0, PrefixV1.Length).SequenceEqual(PrefixV1)
-                || payload.AsSpan(0, PrefixV2.Length).SequenceEqual(PrefixV2));
+        return payload.Length >= Prefix.Length
+            && payload.AsSpan(0, Prefix.Length).SequenceEqual(Prefix);
     }
 
     public static bool TryDecode(byte[] payload, out PeerAppMessage message)
@@ -34,7 +32,7 @@ internal static class PeerAppMessageCodec
         try
         {
             var decoded = JsonSerializer.Deserialize<PeerAppMessage>(
-                payload.AsSpan(PrefixLength(payload)),
+                payload.AsSpan(Prefix.Length),
                 JsonOptions);
             if (decoded is null || string.IsNullOrWhiteSpace(decoded.Type))
             {
@@ -51,17 +49,12 @@ internal static class PeerAppMessageCodec
 
     public static byte[] Encode(PeerAppMessage message)
     {
-        // Java and Go only understand STMSG1. Keep ordinary text messages and
-        // ACKs on that envelope; STMSG2 is solely the optional attachment
-        // extension and must never leak attachment metadata into an ACK.
-        var attachmentV2 = string.Equals(message.Type, TypeMessage, StringComparison.OrdinalIgnoreCase)
-            && message.Attachment is not null;
-        var wireMessage = attachmentV2 ? message : WithoutAttachment(message);
-        var prefix = attachmentV2 ? PrefixV2 : PrefixV1;
+        var wireMessage = string.Equals(message.Type, TypeMessage, StringComparison.OrdinalIgnoreCase)
+            ? message : WithoutAttachment(message);
         var json = JsonSerializer.SerializeToUtf8Bytes(wireMessage, JsonOptions);
-        var payload = new byte[prefix.Length + json.Length];
-        prefix.CopyTo(payload, 0);
-        json.CopyTo(payload.AsSpan(prefix.Length));
+        var payload = new byte[Prefix.Length + json.Length];
+        Prefix.CopyTo(payload, 0);
+        json.CopyTo(payload.AsSpan(Prefix.Length));
         return payload;
     }
 
@@ -75,9 +68,6 @@ internal static class PeerAppMessageCodec
         var text = string.IsNullOrWhiteSpace(message.Message) ? "" : $"{message.Message} ";
         return $"{text}[附件] {FirstNonEmpty(message.Attachment.FileName, message.Attachment.ObjectId, "attachment")} · {FirstNonEmpty(message.Attachment.MimeType, "application/octet-stream")} · {size}";
     }
-
-    private static int PrefixLength(byte[] payload) =>
-        payload.AsSpan(0, PrefixV2.Length).SequenceEqual(PrefixV2) ? PrefixV2.Length : PrefixV1.Length;
 
     private static PeerAppMessage WithoutAttachment(PeerAppMessage message) => new()
     {

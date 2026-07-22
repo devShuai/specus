@@ -1,5 +1,6 @@
-using System.Buffers;
 using System.Collections.Frozen;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
@@ -47,27 +48,31 @@ public static class DirectHttpEndpoints
         IOptions<DirectHttpOptions> options, TunnelDbContext db, TrafficInspectionService inspection)
     {
         var startedAt = DateTimeOffset.UtcNow;
-        var bodyRead = await ReadBodyAsync(context.Request, options.Value.MaxRequestBodySize)
-            .ConfigureAwait(false);
-        var requestBody = bodyRead.Body;
         var relativePath = RelativePath(context, rest);
-        var packet = new DirectHttpRequestPacket
+        var requestHeaders = RequestHeaders(context.Request);
+        var requestCapture = new LimitedCapture(64 * 1024);
+        var responseCapture = new LimitedCapture(64 * 1024);
+        var requestMetadata = new Dictionary<string, object?>
         {
-            RequestMethod = context.Request.Method,
-            Route = route,
-            RelativePath = relativePath,
-            RawQuery = context.Request.QueryString.HasValue
+            ["source"] = "http",
+            ["phase"] = "request",
+            ["method"] = context.Request.Method,
+            ["route"] = route,
+            ["relativePath"] = relativePath,
+            ["rawQuery"] = context.Request.QueryString.HasValue
                 ? context.Request.QueryString.Value!.TrimStart('?')
                 : null,
-            Headers = RequestHeaders(context.Request),
-            Body = requestBody,
+            ["headers"] = requestHeaders,
+            ["contentLength"] = context.Request.ContentLength ?? -1L,
+            ["trailerNames"] = DeclaredRequestTrailers(context.Request),
         };
-        if (bodyRead.TooLarge)
+        if (context.Request.ContentLength > options.Value.MaxRequestBodySize)
         {
             const string message = "HTTP 请求体超过限制";
             var responseBody = Encoding.UTF8.GetBytes(message);
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
-                    packet.RequestMethod, packet.RelativePath, packet.RawQuery, packet.Headers, requestBody,
+                    context.Request.Method, relativePath, context.Request.QueryString.Value?.TrimStart('?'),
+                    requestHeaders, Array.Empty<byte>(),
                     StatusCodes.Status413PayloadTooLarge, PlainErrorHeaders(), responseBody, startedAt,
                     context.Connection.RemoteIpAddress?.ToString(), message), context.RequestAborted)
                 .ConfigureAwait(false);
@@ -78,49 +83,139 @@ public static class DirectHttpEndpoints
 
         try
         {
-            var response = await dispatcher.ForwardAsync(clientName, packet, context.RequestAborted)
-                .ConfigureAwait(false);
-            traffic.RecordHttpUpload(clientName, route, requestBody.Length);
-            var responseBody = response.Body ?? Array.Empty<byte>();
-            traffic.RecordHttpDownload(clientName, route, responseBody.Length);
+            await using var stream = await dispatcher.OpenAsync(clientName, requestMetadata,
+                    context.RequestAborted).ConfigureAwait(false);
+            using var pumpCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+            var pumpTask = PumpRequestAsync(context, stream, traffic, clientName, route,
+                requestCapture, options.Value.MaxRequestBodySize, pumpCts.Token);
 
-            if (!string.IsNullOrEmpty(response.Error))
+            using var headCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+            headCts.CancelAfter(TimeSpan.FromMilliseconds(Math.Max(1, options.Value.TimeoutMs)));
+            Dictionary<string, object?> head;
+            try
             {
-                var statusCode = response.StatusCode > 0 ? response.StatusCode : StatusCodes.Status502BadGateway;
-                responseBody = Encoding.UTF8.GetBytes(response.Error);
-                await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
-                        packet.RequestMethod, packet.RelativePath, packet.RawQuery, packet.Headers, requestBody,
-                        statusCode, PlainErrorHeaders(), responseBody, startedAt, context.Connection.RemoteIpAddress?.ToString(),
-                        response.Error), context.RequestAborted)
+                head = await stream.WaitResponseHeadAsync(headCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (headCts.IsCancellationRequested
+                                                     && !context.RequestAborted.IsCancellationRequested)
+            {
+                await stream.ResetAsync(1, "HTTP response header timeout", CancellationToken.None)
                     .ConfigureAwait(false);
-                await WriteTextErrorAsync(context.Response, statusCode, response.Error).ConfigureAwait(false);
-                return;
+                throw new DirectHttpTunnelException(StatusCodes.Status504GatewayTimeout, "HTTP 转发请求超时");
             }
 
-            context.Response.StatusCode = response.StatusCode > 0 ? response.StatusCode : StatusCodes.Status200OK;
-            var originalResponseHeaders = response.Headers;
-            var responseHeaders = originalResponseHeaders;
-            if (await IsPathRewriteEnabledAsync(db, clientName, route, context.RequestAborted)
-                    .ConfigureAwait(false)
-                && ResponseRewriter.TryRewrite(responseBody, clientName, route, originalResponseHeaders,
-                    options.Value.RewriteMaxBodyBytes, out var rewritten))
+            var statusCode = AsInt(head, "statusCode");
+            if (statusCode is not int validStatusCode || validStatusCode is < 100 or > 599)
             {
-                responseBody = rewritten;
-                responseHeaders = StripRewriteHeaders(responseHeaders);
+                await stream.ResetAsync(2, "invalid HTTP response status", CancellationToken.None)
+                    .ConfigureAwait(false);
+                throw new DirectHttpTunnelException(StatusCodes.Status502BadGateway, "HTTP 响应状态无效");
             }
-            CopyHeaders(responseHeaders, context.Response);
+            var originalResponseHeaders = AsStrings(head, "headers");
+            var responseHeaders = originalResponseHeaders;
+            foreach (var trailerName in AsStrings(head, "trailerNames"))
+            {
+                if (IsValidHeaderName(trailerName))
+                {
+                    context.Response.DeclareTrailer(trailerName);
+                }
+            }
+
+            var rewrite = await IsPathRewriteEnabledAsync(db, clientName, route, context.RequestAborted)
+                    .ConfigureAwait(false)
+                && IsRewritable(originalResponseHeaders);
+            using var rewriteBuffer = new MemoryStream();
+            var responseStarted = false;
+            long responseBytes = 0;
+            List<string>? responseTrailers = null;
+
+            void StartResponse()
+            {
+                if (responseStarted)
+                {
+                    return;
+                }
+                context.Response.StatusCode = validStatusCode;
+                CopyHeaders(responseHeaders, context.Response);
+                responseStarted = true;
+            }
+
+            while (true)
+            {
+                var item = await stream.ReadResponseAsync(context.RequestAborted).ConfigureAwait(false);
+                if (item.End)
+                {
+                    responseTrailers = AsStrings(item.Metadata, "trailers");
+                    break;
+                }
+                var data = item.Data ?? Array.Empty<byte>();
+                responseBytes += data.Length;
+                if (responseBytes > DirectHttpOptionsMaxResponseBytes)
+                {
+                    await stream.ResetAsync(3, "HTTP response body exceeds limit", CancellationToken.None)
+                        .ConfigureAwait(false);
+                    throw new DirectHttpTunnelException(StatusCodes.Status502BadGateway, "HTTP 响应体超过限制");
+                }
+
+                if (rewrite && rewriteBuffer.Length + data.Length <= options.Value.RewriteMaxBodyBytes)
+                {
+                    await rewriteBuffer.WriteAsync(data, context.RequestAborted).ConfigureAwait(false);
+                    await stream.ConsumeResponseAsync(data.Length, context.RequestAborted).ConfigureAwait(false);
+                    continue;
+                }
+                if (rewrite)
+                {
+                    rewrite = false;
+                    StartResponse();
+                    var buffered = rewriteBuffer.ToArray();
+                    await WriteResponseChunkAsync(context.Response, buffered, responseCapture,
+                        traffic, clientName, route, context.RequestAborted).ConfigureAwait(false);
+                }
+                StartResponse();
+                await WriteResponseChunkAsync(context.Response, data, responseCapture,
+                    traffic, clientName, route, context.RequestAborted).ConfigureAwait(false);
+                await stream.ConsumeResponseAsync(data.Length, context.RequestAborted).ConfigureAwait(false);
+            }
+
+            if (rewrite)
+            {
+                var body = rewriteBuffer.ToArray();
+                if (ResponseRewriter.TryRewrite(body, clientName, route, originalResponseHeaders,
+                        options.Value.RewriteMaxBodyBytes, out var rewritten))
+                {
+                    body = rewritten;
+                    responseHeaders = StripRewriteHeaders(responseHeaders);
+                }
+                StartResponse();
+                await WriteResponseChunkAsync(context.Response, body, responseCapture,
+                    traffic, clientName, route, context.RequestAborted).ConfigureAwait(false);
+            }
+            else if (!responseStarted)
+            {
+                StartResponse();
+            }
+
+            foreach (var trailer in responseTrailers ?? [])
+            {
+                AppendResponseTrailer(context.Response, trailer);
+            }
+            if (!pumpTask.IsCompleted)
+            {
+                pumpCts.Cancel();
+            }
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
-                    packet.RequestMethod, packet.RelativePath, packet.RawQuery, packet.Headers, requestBody,
-                    context.Response.StatusCode, originalResponseHeaders, responseBody, startedAt,
+                    context.Request.Method, relativePath, context.Request.QueryString.Value?.TrimStart('?'),
+                    requestHeaders, requestCapture.Bytes(), context.Response.StatusCode,
+                    originalResponseHeaders, responseCapture.Bytes(), startedAt,
                     context.Connection.RemoteIpAddress?.ToString(), null), context.RequestAborted)
                 .ConfigureAwait(false);
-            await context.Response.Body.WriteAsync(responseBody).ConfigureAwait(false);
         }
         catch (DirectHttpTunnelException ex)
         {
             var responseBody = Encoding.UTF8.GetBytes(ex.Message);
             await inspection.RecordHttpExchangeAsync(new HttpExchangeCapture(clientName, route,
-                    packet.RequestMethod, packet.RelativePath, packet.RawQuery, packet.Headers, requestBody,
+                    context.Request.Method, relativePath, context.Request.QueryString.Value?.TrimStart('?'),
+                    requestHeaders, requestCapture.Bytes(),
                     ex.StatusCode, PlainErrorHeaders(), responseBody, startedAt, context.Connection.RemoteIpAddress?.ToString(),
                     ex.Message), CancellationToken.None)
                 .ConfigureAwait(false);
@@ -128,38 +223,50 @@ public static class DirectHttpEndpoints
         }
     }
 
-    private static async Task<RequestBodyRead> ReadBodyAsync(HttpRequest request, int maxBytes)
+    private const int DirectHttpOptionsMaxResponseBytes = 64 * 1024 * 1024;
+
+    private static async Task PumpRequestAsync(HttpContext context, HttpTunnelStream stream,
+        TrafficUsageService traffic, string clientName, string route, LimitedCapture capture,
+        int maxBytes, CancellationToken cancellationToken)
     {
-        var initialCapacity = request.ContentLength is > 0 and <= int.MaxValue
-            ? (int)Math.Min(request.ContentLength.Value, maxBytes + 1L)
-            : 0;
-        using var buffer = initialCapacity > 0 ? new MemoryStream(initialCapacity) : new MemoryStream();
-        var chunk = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        var buffer = new byte[64 * 1024];
+        long total = 0;
         try
         {
-            int read;
-            while ((read = await request.Body.ReadAsync(chunk).ConfigureAwait(false)) > 0)
+            while (true)
             {
-                if (buffer.Length + read > maxBytes)
+                var read = await context.Request.Body.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                if (read == 0)
                 {
-                    var remaining = Math.Max(0, maxBytes + 1 - (int)buffer.Length);
-                    if (remaining > 0)
-                    {
-                        buffer.Write(chunk, 0, Math.Min(read, remaining));
-                    }
-                    return new RequestBodyRead(buffer.ToArray(), TooLarge: true);
+                    var trailers = RequestTrailers(context);
+                    await stream.FinishRequestAsync(trailers.Count == 0
+                            ? null
+                            : new Dictionary<string, object?> { ["trailers"] = trailers }, cancellationToken)
+                        .ConfigureAwait(false);
+                    return;
                 }
-                buffer.Write(chunk, 0, read);
+                total += read;
+                capture.Write(buffer.AsSpan(0, read));
+                if (total > maxBytes)
+                {
+                    await stream.ResetAsync(4, "HTTP request body exceeds limit", CancellationToken.None)
+                        .ConfigureAwait(false);
+                    return;
+                }
+                await stream.SendDataAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                traffic.RecordHttpUpload(clientName, route, read);
             }
-            return new RequestBodyRead(buffer.ToArray(), TooLarge: false);
         }
-        finally
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            ArrayPool<byte>.Shared.Return(chunk);
+        }
+        catch (Exception)
+        {
+            await stream.ResetAsync(5, "HTTP request stream failed", CancellationToken.None)
+                .ConfigureAwait(false);
+            throw;
         }
     }
-
-    private readonly record struct RequestBodyRead(byte[] Body, bool TooLarge);
 
     private static string RelativePath(HttpContext context, string? rest)
     {
@@ -326,6 +433,149 @@ public static class DirectHttpEndpoints
             result.Add(header);
         }
         return result;
+    }
+
+    private static readonly FrozenSet<string> RewritableContentTypes = new[]
+    {
+        "text/html", "text/css", "text/javascript", "application/javascript",
+        "application/x-javascript", "application/ecmascript", "text/ecmascript",
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsRewritable(IReadOnlyList<string>? headers)
+    {
+        foreach (var header in headers ?? [])
+        {
+            var separator = header.IndexOf(':');
+            if (separator > 0 && header[..separator].Equals("content-type", StringComparison.OrdinalIgnoreCase))
+            {
+                var contentType = header[(separator + 1)..].Split(';', 2)[0].Trim();
+                return RewritableContentTypes.Contains(contentType);
+            }
+        }
+        return false;
+    }
+
+    private static async Task WriteResponseChunkAsync(HttpResponse response, byte[] data,
+        LimitedCapture capture, TrafficUsageService traffic, string clientName, string route,
+        CancellationToken cancellationToken)
+    {
+        if (data.Length == 0)
+        {
+            return;
+        }
+        await response.Body.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+        await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+        capture.Write(data);
+        traffic.RecordHttpDownload(clientName, route, data.Length);
+    }
+
+    private static int? AsInt(Dictionary<string, object?>? metadata, string key)
+    {
+        if (metadata is null || !metadata.TryGetValue(key, out var value) || value is null)
+        {
+            return null;
+        }
+        return value switch
+        {
+            int number => number,
+            long number when number is >= int.MinValue and <= int.MaxValue => (int)number,
+            double number when number is >= int.MinValue and <= int.MaxValue => (int)number,
+            JsonValue json when json.TryGetValue<int>(out var number) => number,
+            JsonElement json when json.TryGetInt32(out var number) => number,
+            _ when int.TryParse(value.ToString(), out var number) => number,
+            _ => null,
+        };
+    }
+
+    private static List<string> AsStrings(Dictionary<string, object?>? metadata, string key)
+    {
+        if (metadata is null || !metadata.TryGetValue(key, out var value) || value is null)
+        {
+            return [];
+        }
+        return value switch
+        {
+            IEnumerable<string> values => values.ToList(),
+            JsonArray array => array.Select(static item => item?.GetValue<string>())
+                .Where(static item => item is not null).Cast<string>().ToList(),
+            JsonElement { ValueKind: JsonValueKind.Array } array => array.EnumerateArray()
+                .Where(static item => item.ValueKind == JsonValueKind.String)
+                .Select(static item => item.GetString()!).ToList(),
+            IEnumerable<object?> values => values.Where(static item => item is not null)
+                .Select(static item => item!.ToString()!).ToList(),
+            _ => [],
+        };
+    }
+
+    private static List<string> DeclaredRequestTrailers(HttpRequest request) =>
+        request.Headers["Trailer"].SelectMany(static value =>
+                (value ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .Where(IsValidHeaderName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+    private static List<string> RequestTrailers(HttpContext context)
+    {
+        var feature = context.Features.Get<IHttpRequestTrailersFeature>();
+        if (feature is null || !feature.Available)
+        {
+            return [];
+        }
+        var result = new List<string>();
+        foreach (var (name, values) in feature.Trailers)
+        {
+            if (!IsValidHeaderName(name))
+            {
+                continue;
+            }
+            result.AddRange(values.Select(value => $"{name}:{value}"));
+        }
+        return result;
+    }
+
+    private static void AppendResponseTrailer(HttpResponse response, string line)
+    {
+        var separator = line.IndexOf(':');
+        if (separator <= 0)
+        {
+            return;
+        }
+        var name = line[..separator].Trim();
+        if (IsValidHeaderName(name))
+        {
+            response.AppendTrailer(name, line[(separator + 1)..].Trim());
+        }
+    }
+
+    private static bool IsValidHeaderName(string name) =>
+        !string.IsNullOrWhiteSpace(name) && name.All(static ch =>
+            char.IsAsciiLetterOrDigit(ch) || "!#$%&'*+-.^_`|~".Contains(ch));
+
+    private sealed class LimitedCapture
+    {
+        private readonly object _sync = new();
+        private readonly int _limit;
+        private readonly MemoryStream _buffer = new();
+
+        public LimitedCapture(int limit) => _limit = Math.Max(0, limit);
+
+        public void Write(ReadOnlySpan<byte> data)
+        {
+            lock (_sync)
+            {
+                var remaining = _limit - checked((int)_buffer.Length);
+                if (remaining > 0)
+                {
+                    _buffer.Write(data[..Math.Min(data.Length, remaining)]);
+                }
+            }
+        }
+
+        public byte[] Bytes()
+        {
+            lock (_sync)
+            {
+                return _buffer.ToArray();
+            }
+        }
     }
 
     private static bool ShouldForward(string name) => !SkippedHeaders.Contains(name);

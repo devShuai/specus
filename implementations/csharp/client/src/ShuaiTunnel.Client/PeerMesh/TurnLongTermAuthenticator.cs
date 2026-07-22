@@ -100,7 +100,8 @@ internal sealed class TurnLongTermAuthenticator
     public static bool RequiresAuthentication(ushort messageType) =>
         messageType is StunMessage.AllocateRequest
             or StunMessage.RefreshRequest
-            or StunMessage.CreatePermissionRequest;
+            or StunMessage.CreatePermissionRequest
+			or StunMessage.ChannelBindRequest;
 
     private static bool IsAuthenticationAttribute(ushort attributeType) =>
         attributeType is StunMessage.AttrUsername
