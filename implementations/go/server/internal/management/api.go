@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
@@ -69,6 +70,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /oidc/token", a.handleOidcToken)
 	mux.HandleFunc("GET /api/public/client-downloads", a.handlePublicClientDownloads)
 	mux.HandleFunc("GET /api/public/peer-mesh/stun-config", a.handlePublicPeerMeshStunConfig)
+	mux.HandleFunc("GET /api/public/peer-mesh/nat-probe-config", a.handlePublicPeerMeshNatProbeConfig)
 	mux.HandleFunc("GET /api/public/transfer/ice-config", a.handlePublicTransferIceConfig)
 	mux.HandleFunc("GET /api/public/transfer/downloads/{token}", a.handlePublicAttachmentDownload)
 	mux.HandleFunc("POST /api/public/transfer/oss-callback", a.handlePublicAttachmentUploadCallback)
@@ -88,6 +90,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/admin/users/{username}", a.requireAuth(a.handleDeleteUser))
 
 	mux.HandleFunc("GET /api/admin/clients", a.requireAuth(a.handleListClients))
+	mux.HandleFunc("GET /api/admin/clients/name-availability", a.requireAuth(a.handleCheckClientNameAvailability))
 	mux.HandleFunc("GET /api/admin/clients/{id}", a.requireAuth(a.handleGetClient))
 	mux.HandleFunc("POST /api/admin/clients", a.requireAuth(a.handleCreateClient))
 	mux.HandleFunc("PUT /api/admin/clients/{id}", a.requireAuth(a.handleUpdateClient))
@@ -142,6 +145,14 @@ func (a *API) handlePublicPeerMeshStunConfig(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, a.peerMesh.PublicStunConfig(forwardedHost(r)))
+}
+
+func (a *API) handlePublicPeerMeshNatProbeConfig(w http.ResponseWriter, r *http.Request) {
+	if a.peerMesh == nil {
+		writeJSON(w, http.StatusOK, peermesh.PublicNatProbeConfig{Protocol: "RFC8489", DiscoveryMethod: "BASIC_STUN"})
+		return
+	}
+	writeJSON(w, http.StatusOK, a.peerMesh.PublicNatProbeConfig(forwardedHost(r)))
 }
 
 func (a *API) handlePublicTransferIceConfig(w http.ResponseWriter, r *http.Request) {
@@ -678,6 +689,53 @@ func (a *API) handleGetClient(w http.ResponseWriter, r *http.Request) {
 		Tunnels:    tunnelViews,
 		HTTPRoutes: routeViews,
 	})
+}
+
+// clientNameAvailability is the DTO for GET /api/admin/clients/name-availability.
+// 对齐 Java ClientNameAvailability record。
+type clientNameAvailability struct {
+	ClientName string `json:"clientName"`
+	Available  bool   `json:"available"`
+}
+
+// handleCheckClientNameAvailability checks whether a client name is available.
+// 对齐 Java ClientResource.checkClientNameAvailability + ClientAccountService.checkClientNameAvailability。
+func (a *API) handleCheckClientNameAvailability(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	clientName := strings.TrimSpace(r.URL.Query().Get("clientName"))
+	if clientName == "" {
+		writeError(w, http.StatusBadRequest, "clientName cannot be blank")
+		return
+	}
+	if len(utf16.Encode([]rune(clientName))) > 120 {
+		writeError(w, http.StatusBadRequest, "clientName is too long")
+		return
+	}
+	var excludeID *int64
+	if v := queryInt64Ptr(r, "excludeClientId"); v != nil {
+		excludeID = v
+		// tenant/owner 校验：excludeClientId 必须属于当前管理上下文可见的客户端
+		account, err := a.requireClientAccess(r.Context(), principal, *v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "client not found: "+strconv.FormatInt(*v, 10))
+			return
+		}
+		excludeID = &account.ID
+	}
+	existing, err := a.db.FindClientByName(r.Context(), clientName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	available := true
+	if existing != nil {
+		available = excludeID != nil && existing.ID == *excludeID
+	}
+	writeJSON(w, http.StatusOK, clientNameAvailability{ClientName: clientName, Available: available})
 }
 
 func (a *API) handleCreateClient(w http.ResponseWriter, r *http.Request) {

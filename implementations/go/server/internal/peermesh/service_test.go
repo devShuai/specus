@@ -98,6 +98,18 @@ func TestHandleSignalCandidatesCreatesGrantAndForwardsJavaShape(t *testing.T) {
 	}
 }
 
+func TestJavaStringHashCodeUsesUTF16CodeUnits(t *testing.T) {
+	for input, expected := range map[string]int32{
+		"":           0,
+		"abc":        96354,
+		"\U0001f600": 1772899,
+	} {
+		if actual := javaStringHashCode(input); actual != expected {
+			t.Fatalf("javaStringHashCode(%q) = %d, want %d", input, actual, expected)
+		}
+	}
+}
+
 func TestPushOnLoginRefreshesRosterForTenantPeers(t *testing.T) {
 	ctx := context.Background()
 	db := openPeerMeshTestDB(t)

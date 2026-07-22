@@ -115,6 +115,18 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			logger.Info("closed stale client sessions at startup", "count", closed)
 		}
 	}
+	// T-4：启动时关闭上一进程遗留的 open 连接记录（SERVER_RESTARTED），
+	// 对齐 Java ConnectionRecordService.closeStaleOpenRecordsOnStartup。
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		closed, err := db.CloseStaleOpenConnections(ctx, store.ReasonServerRestarted, time.Now())
+		cancel()
+		if err != nil {
+			logger.Warn("close stale open connections at startup failed", "err", err)
+		} else if closed > 0 {
+			logger.Info("closed stale open connections at startup", "count", closed, "reason", store.ReasonServerRestarted)
+		}
+	}
 
 	sessions := session.NewRegistry()
 	clientSessions := auth.NewSessionStore()
@@ -345,6 +357,15 @@ func (a *App) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// T-4：优雅关停时关闭所有 open 连接记录（SERVER_SHUTDOWN），
+		// 对齐 Java ConnectionRecordService.markAllOpenAsShutdownOnContextClose。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if closed, err := a.db.CloseStaleOpenConnections(shutdownCtx, store.ReasonServerShutdown, time.Now()); err != nil {
+			a.logger.Warn("close open connections on shutdown failed", "err", err)
+		} else if closed > 0 {
+			a.logger.Info("closed open connections on shutdown", "count", closed, "reason", store.ReasonServerShutdown)
+		}
+		cancel()
 		return nil
 	case err := <-errc:
 		return err
@@ -360,7 +381,7 @@ func (a *App) managementHandler() http.Handler {
 	mux.HandleFunc("POST /api/client/auth/login", a.handleClientAuthLogin)
 	mux.HandleFunc("POST /api/admin/ws-tickets", a.handleAdminWebSocketTicket)
 	mux.HandleFunc("POST /api/public/transfer/ws-tickets", a.handlePublicWebSocketTicket)
-	mux.HandleFunc("GET /api/public/transfer/name-availability", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/public/transfer/clients/name-availability", func(w http.ResponseWriter, r *http.Request) {
 		result, err := a.publicTransferDiscovery.checkClientNameAvailability(r.Context(),
 			r.URL.Query().Get("clientName"), r.URL.Query().Get("excludePeerId"))
 		if err != nil {

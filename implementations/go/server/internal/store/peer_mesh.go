@@ -368,6 +368,19 @@ func (db *DB) ListOpenPeerMeshSessionsForDevice(ctx context.Context, tenantID st
 	return db.listPeerMeshSessions(ctx, query, defaultTenant(tenantID), closedStatus, clientID, clientID)
 }
 
+// FindOpenSessionBetweenClients 查询两个 client 之间未关闭的 session（双向匹配 source<->target）。
+// 供 reusableSessionGrant 复用，与 Java sessionRepository.findOpenBetweenClients 对齐。
+func (db *DB) FindOpenSessionBetweenClients(ctx context.Context, tenantID string, sourceID, targetID int64, closedStatus string) ([]PeerMeshSession, error) {
+	query := db.rebind(`SELECT id, tenant_id, source_client_id, source_client_name, target_client_id,
+		target_client_name, path_type, status, token_hash, started_at, updated_at, expires_at,
+		closed_at, rtt_millis, local_endpoint, remote_endpoint, direct_bytes, relay_bytes,
+		last_traffic_at FROM peer_mesh_session
+		WHERE tenant_id = ? AND status <> ?
+		AND ((source_client_id = ? AND target_client_id = ?) OR (source_client_id = ? AND target_client_id = ?))
+		ORDER BY updated_at DESC`)
+	return db.listPeerMeshSessions(ctx, query, defaultTenant(tenantID), closedStatus, sourceID, targetID, targetID, sourceID)
+}
+
 func (db *DB) ListExpiredPeerMeshSessions(ctx context.Context, closedStatus string, expiresAt time.Time, limit int) ([]PeerMeshSession, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 500

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"math"
 	"math/big"
@@ -287,6 +286,10 @@ type Service struct {
 	relayAuthorizations map[int64]relayAuthorization
 	pendingRelayBytes   map[int64]int64
 	turnCredentials     *turnCredentialService
+	// sessionTokenCache 缓存明文 token（按 sessionID），供 reusableSessionGrant 复用。
+	// 与 Java PeerMeshService.sessionTokenCache 对齐：create 时 put、close 时 remove。
+	sessionTokenCache   map[int64]string
+	sessionTokenCacheMu sync.RWMutex
 }
 
 type relayAuthorization struct {
@@ -328,6 +331,7 @@ func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, lo
 		relayAuthorizations: make(map[int64]relayAuthorization),
 		pendingRelayBytes:   make(map[int64]int64),
 		turnCredentials:     credentials,
+		sessionTokenCache:   make(map[int64]string),
 	}
 }
 
@@ -576,6 +580,115 @@ func (s *Service) PublicIceConfig(requestHost string) PublicIceConfig {
 		TurnAuthRequired: s != nil && s.cfg.TurnAuthRequired,
 		StunTurnPort:     stun.StunTurnPort,
 	}
+}
+
+// PublicNatProbeConfig 是 GET /api/public/peer-mesh/nat-probe-config 的响应 DTO。
+// 对齐 Java PublicPeerMeshResource.PublicNatProbeConfig。
+type PublicNatProbeConfig struct {
+	Available       bool                 `json:"available"`
+	Protocol        string               `json:"protocol"`
+	DiscoveryMethod string               `json:"discoveryMethod"`
+	Endpoints       []NatProbeEndpoint   `json:"endpoints"`
+	Capabilities    NatProbeCapabilities `json:"capabilities"`
+}
+
+// NatProbeEndpoint 描述一个 RFC 5780 NAT 探测端点。
+type NatProbeEndpoint struct {
+	ID          string `json:"id"`
+	URL         string `json:"url"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	AddressSlot string `json:"addressSlot"`
+	PortSlot    string `json:"portSlot"`
+}
+
+// NatProbeCapabilities 描述 NAT 探测能力。
+type NatProbeCapabilities struct {
+	Binding                     bool `json:"binding"`
+	ChangeRequest               bool `json:"changeRequest"`
+	ResponseOrigin              bool `json:"responseOrigin"`
+	OtherAddress                bool `json:"otherAddress"`
+	ResponsePort                bool `json:"responsePort"`
+	Padding                     bool `json:"padding"`
+	BrowserMappingObservation   bool `json:"browserMappingObservation"`
+	BrowserFilteringObservation bool `json:"browserFilteringObservation"`
+}
+
+// PublicNatProbeConfig 构建 NAT 探测配置响应。对齐 Java PublicPeerMeshResource.natProbeConfig。
+func (s *Service) PublicNatProbeConfig(requestHost string) PublicNatProbeConfig {
+	if s == nil || !s.Enabled() {
+		return PublicNatProbeConfig{Protocol: "RFC8489", DiscoveryMethod: "BASIC_STUN"}
+	}
+	primaryHost := normalizeStunHost(s.resolveStunHost(requestHost))
+	primaryPort := s.stunPort()
+	alternateHost := normalizeStunHost(s.standaloneAlternateStunHost())
+	alternatePort := s.standaloneAlternateStunPort()
+	rfc5780 := primaryHost != "" && alternateHost != "" &&
+		!strings.EqualFold(primaryHost, alternateHost) &&
+		primaryPort > 0 && alternatePort > 0 && primaryPort != alternatePort
+
+	endpoints := make([]NatProbeEndpoint, 0, 4)
+	if primaryHost != "" && primaryPort > 0 {
+		endpoints = append(endpoints, natProbeEndpoint("A1P1", primaryHost, primaryPort, "PRIMARY", "PRIMARY"))
+	}
+	if rfc5780 {
+		endpoints = append(endpoints, natProbeEndpoint("A1P2", primaryHost, alternatePort, "PRIMARY", "ALTERNATE"))
+		endpoints = append(endpoints, natProbeEndpoint("A2P1", alternateHost, primaryPort, "ALTERNATE", "PRIMARY"))
+		endpoints = append(endpoints, natProbeEndpoint("A2P2", alternateHost, alternatePort, "ALTERNATE", "ALTERNATE"))
+	}
+
+	return PublicNatProbeConfig{
+		Available:       len(endpoints) > 0,
+		Protocol:        "RFC8489",
+		DiscoveryMethod: discoveryMethod(rfc5780),
+		Endpoints:       endpoints,
+		Capabilities: NatProbeCapabilities{
+			Binding:                     true,
+			ChangeRequest:               rfc5780,
+			ResponseOrigin:              rfc5780,
+			OtherAddress:                rfc5780,
+			ResponsePort:                rfc5780,
+			Padding:                     rfc5780,
+			BrowserMappingObservation:   true,
+			BrowserFilteringObservation: false,
+		},
+	}
+}
+
+// standaloneAlternateStunHost 返回备用 STUN 主机：优先 StandaloneStunAlternateAddress，
+// 回退 StunAlternatePublicAddress。对齐 Java standaloneAlternateStunHost()。
+func (s *Service) standaloneAlternateStunHost() string {
+	if host := strings.TrimSpace(s.cfg.StandaloneStunAlternateAddress); host != "" {
+		return host
+	}
+	return strings.TrimSpace(s.cfg.StunAlternatePublicAddress)
+}
+
+// standaloneAlternateStunPort 返回备用 STUN 端口：优先 StandaloneStunAlternatePort，
+// 回退 NatProbeAlternatePort。对齐 Java standaloneAlternateStunPort()。
+func (s *Service) standaloneAlternateStunPort() int {
+	if s.cfg.StandaloneStunAlternatePort > 0 {
+		return s.cfg.StandaloneStunAlternatePort
+	}
+	return s.cfg.NatProbeAlternatePort
+}
+
+func natProbeEndpoint(id, host string, port int, addressSlot, portSlot string) NatProbeEndpoint {
+	return NatProbeEndpoint{
+		ID:          id,
+		URL:         "stun:" + bracketIPv6(host) + ":" + strconv.Itoa(port),
+		Host:        host,
+		Port:        port,
+		AddressSlot: addressSlot,
+		PortSlot:    portSlot,
+	}
+}
+
+func discoveryMethod(rfc5780 bool) string {
+	if rfc5780 {
+		return "RFC5780"
+	}
+	return "BASIC_STUN"
 }
 
 func (s *Service) EnsureDevice(ctx context.Context, account store.ClientAccount, peerPublicKey string) (*store.PeerMeshDevice, error) {
@@ -1199,6 +1312,10 @@ func (s *Service) CreateSession(ctx context.Context, source, target store.Client
 		return sessionGrant{}, errors.New("peer access denied")
 	}
 	now := time.Now()
+	// S-9：复用已存在的 open session（与 Java reusableSessionGrant 对齐），避免重复创建。
+	if grant, found := s.reusableSessionGrant(ctx, source, target, now); found {
+		return grant, nil
+	}
 	token := s.shortToken(source.ClientName, target.ClientName, strconv.FormatInt(now.UnixMilli(), 10), randomSuffix())
 	hash := sha256.Sum256([]byte(token))
 	item := store.PeerMeshSession{
@@ -1218,7 +1335,50 @@ func (s *Service) CreateSession(ctx context.Context, source, target store.Client
 	if err := s.db.InsertPeerMeshSession(ctx, item); err != nil {
 		return sessionGrant{}, err
 	}
+	s.cacheSessionToken(item.ID, token)
 	return sessionGrant{session: sessionView(item), token: token}, nil
+}
+
+// reusableSessionGrant 查找两个 client 之间未关闭且未过期的 session，返回缓存的明文 token。
+// 与 Java PeerMeshService.reusableSessionGrant 对齐。过期 session 会被关闭并跳过。
+func (s *Service) reusableSessionGrant(ctx context.Context, source, target store.ClientAccount, now time.Time) (sessionGrant, bool) {
+	sessions, err := s.db.FindOpenSessionBetweenClients(ctx, source.TenantID, source.ID, target.ID, StatusClosed)
+	if err != nil {
+		return sessionGrant{}, false
+	}
+	for i := range sessions {
+		item := &sessions[i]
+		if now.After(item.ExpiresAt) {
+			s.markClosed(item, now)
+			_ = s.db.UpdatePeerMeshSession(ctx, *item)
+			continue
+		}
+		token, ok := s.getCachedSessionToken(item.ID)
+		if !ok || token == "" {
+			continue
+		}
+		return sessionGrant{session: sessionView(*item), token: token}, true
+	}
+	return sessionGrant{}, false
+}
+
+func (s *Service) cacheSessionToken(sessionID int64, token string) {
+	s.sessionTokenCacheMu.Lock()
+	s.sessionTokenCache[sessionID] = token
+	s.sessionTokenCacheMu.Unlock()
+}
+
+func (s *Service) getCachedSessionToken(sessionID int64) (string, bool) {
+	s.sessionTokenCacheMu.RLock()
+	token, ok := s.sessionTokenCache[sessionID]
+	s.sessionTokenCacheMu.RUnlock()
+	return token, ok
+}
+
+func (s *Service) removeCachedSessionToken(sessionID int64) {
+	s.sessionTokenCacheMu.Lock()
+	delete(s.sessionTokenCache, sessionID)
+	s.sessionTokenCacheMu.Unlock()
 }
 
 func (s *Service) ReportPath(ctx context.Context, reporter store.ClientAccount, report ControlMessage) (SessionView, error) {
@@ -1400,10 +1560,11 @@ func (s *Service) allocateVirtualIP(ctx context.Context, account store.ClientAcc
 		return "", fmt.Errorf("peer mesh address pool too small: %s", s.cfg.CIDR)
 	}
 	base := ipv4ToUint32(prefix.Masked().Addr())
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(account.TenantID + ":" + account.OwnerUsername + ":" + strconv.FormatInt(account.ID, 10)))
+	// 与 Java PeerMeshService.allocateVirtualIp 完全一致：使用 String.hashCode()（非 FNV），
+	// 再取 Math.abs，保证跨语言同账号分到同一 VIP。
+	hash := javaStringHashCode(account.TenantID + ":" + account.OwnerUsername + ":" + strconv.FormatInt(account.ID, 10))
+	seed := uint64(javaMathAbsInt32(hash))
 	usable := capacity - 2
-	seed := uint64(h.Sum32()) % usable
 	for i := uint64(1); i <= usable; i++ {
 		host := ((seed + i) % usable) + 1
 		ip := uint32ToIPv4(base + uint32(host))
@@ -1416,6 +1577,31 @@ func (s *Service) allocateVirtualIP(ctx context.Context, account store.ClientAcc
 		}
 	}
 	return "", fmt.Errorf("peer mesh address pool exhausted: %s", s.cfg.CIDR)
+}
+
+// javaStringHashCode 复现 Java String.hashCode()：h = 31*h + char，int32 有符号溢出。
+// 用于 VIP 分配，确保 Go 与 Java 对同一账号字符串产生相同哈希。
+func javaStringHashCode(s string) int32 {
+	var h int32
+	for _, r := range s {
+		if r <= 0xffff {
+			h = 31*h + int32(r)
+			continue
+		}
+		// Java String.hashCode() 按 UTF-16 code unit 计算，增补平面字符需要拆成代理对。
+		r -= 0x10000
+		h = 31*h + int32(0xd800+(r>>10))
+		h = 31*h + int32(0xdc00+(r&0x3ff))
+	}
+	return h
+}
+
+// javaMathAbsInt32 复现 Java Math.abs(int)：Integer.MIN_VALUE 返回自身（仍为负），其余取绝对值。
+func javaMathAbsInt32(v int32) int32 {
+	if v < 0 && v != math.MinInt32 {
+		return -v
+	}
+	return v
 }
 
 func (s *Service) fillSource(ctx context.Context, signal *ControlMessage, source store.ClientAccount) error {
@@ -1676,6 +1862,7 @@ func (s *Service) markClosed(item *store.PeerMeshSession, now time.Time) {
 	}
 	item.UpdatedAt = now
 	s.removeRelaySession(item.ID)
+	s.removeCachedSessionToken(item.ID)
 }
 
 func (s *Service) applyTraffic(item *store.PeerMeshSession, directBytes, relayBytes int64, now time.Time) {

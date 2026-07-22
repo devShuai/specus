@@ -194,34 +194,37 @@ type DirectHTTPConfig struct {
 
 // PeerMeshConfig mirrors tunnel.peer-mesh in the Java server.
 type PeerMeshConfig struct {
-	Enabled                     bool     `json:"enabled"`
-	CIDR                        string   `json:"cidr"`
-	PublicAddress               string   `json:"publicAddress"`
-	StunTurnPort                int      `json:"stunTurnPort"`
-	StandaloneStunAddress       string   `json:"standaloneStunAddress"`
-	StandaloneStunPort          int      `json:"standaloneStunPort"`
-	NatProbeAlternatePort       int      `json:"natProbeAlternatePort"`
-	PublicStunServers           []string `json:"publicStunServers"`
-	SessionTTLSeconds           int64    `json:"sessionTtlSeconds"`
-	AllocationTTLSeconds        int64    `json:"allocationTtlSeconds"`
-	SessionCleanupIntervalMs    int64    `json:"sessionCleanupIntervalMs"`
-	RelayMinPort                int      `json:"relayMinPort"`
-	RelayMaxPort                int      `json:"relayMaxPort"`
-	RelayWorkerThreads          int      `json:"relayWorkerThreads"`
-	RelayWorkerQueueCapacity    int      `json:"relayWorkerQueueCapacity"`
-	RelayTrafficFlushIntervalMs int      `json:"relayTrafficFlushIntervalMs"`
-	TurnAuthRequired            bool     `json:"turnAuthRequired"`
-	TurnRealm                   string   `json:"turnRealm"`
-	TurnSharedSecret            string   `json:"turnSharedSecret"`
-	TurnCredentialTTLSeconds    int64    `json:"turnCredentialTtlSeconds"`
+	Enabled                        bool     `json:"enabled"`
+	CIDR                           string   `json:"cidr"`
+	PublicAddress                  string   `json:"publicAddress"`
+	StunTurnPort                   int      `json:"stunTurnPort"`
+	StandaloneStunAddress          string   `json:"standaloneStunAddress"`
+	StandaloneStunPort             int      `json:"standaloneStunPort"`
+	StandaloneStunAlternateAddress string   `json:"standaloneStunAlternateAddress"`
+	StandaloneStunAlternatePort    int      `json:"standaloneStunAlternatePort"`
+	StunAlternatePublicAddress     string   `json:"stunAlternatePublicAddress"`
+	NatProbeAlternatePort          int      `json:"natProbeAlternatePort"`
+	PublicStunServers              []string `json:"publicStunServers"`
+	SessionTTLSeconds              int64    `json:"sessionTtlSeconds"`
+	AllocationTTLSeconds           int64    `json:"allocationTtlSeconds"`
+	SessionCleanupIntervalMs       int64    `json:"sessionCleanupIntervalMs"`
+	RelayMinPort                   int      `json:"relayMinPort"`
+	RelayMaxPort                   int      `json:"relayMaxPort"`
+	RelayWorkerThreads             int      `json:"relayWorkerThreads"`
+	RelayWorkerQueueCapacity       int      `json:"relayWorkerQueueCapacity"`
+	RelayTrafficFlushIntervalMs    int      `json:"relayTrafficFlushIntervalMs"`
+	TurnAuthRequired               bool     `json:"turnAuthRequired"`
+	TurnRealm                      string   `json:"turnRealm"`
+	TurnSharedSecret               string   `json:"turnSharedSecret"`
+	TurnCredentialTTLSeconds       int64    `json:"turnCredentialTtlSeconds"`
 
 	// General relay quotas. Browser WebRTC relays DTLS/SRTP, which cannot pass the Peer Mesh
 	// specific checks, so those allocations are forwarded with standard TURN semantics and
 	// need their own resource limits. GeneralRelayMaxAllocations <= 0 disables general relay.
-	GeneralRelayMaxAllocations          int   `json:"generalRelayMaxAllocations"`
-	GeneralRelayMaxAllocationsPerAddr   int   `json:"generalRelayMaxAllocationsPerAddress"`
-	GeneralRelayRateBytesPerSecond      int64 `json:"generalRelayRateBytesPerSecond"`
-	GeneralRelayMaxBytes                int64 `json:"generalRelayMaxBytes"`
+	GeneralRelayMaxAllocations        int   `json:"generalRelayMaxAllocations"`
+	GeneralRelayMaxAllocationsPerAddr int   `json:"generalRelayMaxAllocationsPerAddress"`
+	GeneralRelayRateBytesPerSecond    int64 `json:"generalRelayRateBytesPerSecond"`
+	GeneralRelayMaxBytes              int64 `json:"generalRelayMaxBytes"`
 }
 
 // ObjectStorageConfig mirrors tunnel.object-storage. Attachments are uploaded directly
@@ -581,6 +584,9 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("TUNNEL_PEER_MESH_STUN_TURN_PORT", &cfg.PeerMesh.StunTurnPort)
 	setStr("TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS", &cfg.PeerMesh.StandaloneStunAddress)
 	setInt("TUNNEL_PEER_MESH_STANDALONE_STUN_PORT", &cfg.PeerMesh.StandaloneStunPort)
+	setStr("TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS", &cfg.PeerMesh.StandaloneStunAlternateAddress)
+	setInt("TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", &cfg.PeerMesh.StandaloneStunAlternatePort)
+	setStr("TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS", &cfg.PeerMesh.StunAlternatePublicAddress)
 	setInt("TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", &cfg.PeerMesh.NatProbeAlternatePort)
 	setStrSlice("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", &cfg.PeerMesh.PublicStunServers)
 	setInt64("TUNNEL_PEER_MESH_SESSION_TTL_SECONDS", &cfg.PeerMesh.SessionTTLSeconds)

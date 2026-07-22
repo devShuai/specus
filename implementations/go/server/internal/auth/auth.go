@@ -269,7 +269,9 @@ func (a *Authenticator) authenticate(ctx context.Context, request protocol.Login
 			a.perMachineUserMaxInstances {
 			return Result{Reason: "同一台机器和用户已经有在线实例", Account: account}, nil
 		}
-		if !dataConnection && credential.MaxOnlineInstances > 0 &&
+		// maxOnlineInstances == 0 表示拒绝所有登录（与 Java ClientAuthService.isOnlineLimitExceeded
+		// 一致：online >= 0 恒为真）。不做 > 0 守卫，确保 0 语义为"拒绝全部"。
+		if !dataConnection &&
 			a.sessions.CountOnlineByCredential(session.CredentialID) >= credential.MaxOnlineInstances {
 			return Result{Reason: "在线实例数已达上限", Account: account}, nil
 		}

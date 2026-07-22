@@ -117,6 +117,53 @@ func TestPublicPeerMeshStunConfigMatchesJavaShape(t *testing.T) {
 	}
 }
 
+func TestPublicPeerMeshNatProbeConfigReturnsRFC5780Topology(t *testing.T) {
+	cfg := config.Default()
+	cfg.PeerMesh.Enabled = true
+	cfg.PeerMesh.StandaloneStunAddress = "stun1.example.com"
+	cfg.PeerMesh.StandaloneStunPort = 3478
+	cfg.PeerMesh.StandaloneStunAlternateAddress = "stun2.example.com"
+	cfg.PeerMesh.StandaloneStunAlternatePort = 3479
+	_, ts := newAPIServerWithConfig(t, cfg)
+
+	response, err := http.Get(ts.URL + "/api/public/peer-mesh/nat-probe-config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	var decoded struct {
+		Available       bool   `json:"available"`
+		Protocol        string `json:"protocol"`
+		DiscoveryMethod string `json:"discoveryMethod"`
+		Endpoints       []struct {
+			ID          string `json:"id"`
+			AddressSlot string `json:"addressSlot"`
+			PortSlot    string `json:"portSlot"`
+		} `json:"endpoints"`
+		Capabilities struct {
+			ChangeRequest  bool `json:"changeRequest"`
+			ResponseOrigin bool `json:"responseOrigin"`
+			OtherAddress   bool `json:"otherAddress"`
+		} `json:"capabilities"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Available || decoded.Protocol != "RFC8489" || decoded.DiscoveryMethod != "RFC5780" {
+		t.Fatalf("unexpected NAT probe config: %+v", decoded)
+	}
+	if len(decoded.Endpoints) != 4 || decoded.Endpoints[3].ID != "A2P2" ||
+		decoded.Endpoints[3].AddressSlot != "ALTERNATE" || decoded.Endpoints[3].PortSlot != "ALTERNATE" {
+		t.Fatalf("unexpected RFC 5780 endpoints: %+v", decoded.Endpoints)
+	}
+	if !decoded.Capabilities.ChangeRequest || !decoded.Capabilities.ResponseOrigin || !decoded.Capabilities.OtherAddress {
+		t.Fatalf("unexpected RFC 5780 capabilities: %+v", decoded.Capabilities)
+	}
+}
+
 func TestPublicIceConfigNormalizesIPv6AndForwardedHost(t *testing.T) {
 	cfg := config.Default()
 	cfg.PeerMesh.Enabled = true
@@ -354,6 +401,37 @@ func TestAdminLoginAndOverview(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&overview)
 	if overview["clients"].(float64) < 1 {
 		t.Fatalf("expected >=1 client, got %v", overview["clients"])
+	}
+}
+
+func TestClientNameAvailabilityUsesJavaUTF16Length(t *testing.T) {
+	_, ts := newAPIServer(t)
+	token := adminToken(t, ts)
+
+	validName := strings.Repeat("网", 120)
+	response := authRequest(t, ts, http.MethodGet,
+		"/api/admin/clients/name-availability?clientName="+url.QueryEscape(validName), token, "")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("120 UTF-16 unit name status = %d, want 200", response.StatusCode)
+	}
+	var availability struct {
+		ClientName string `json:"clientName"`
+		Available  bool   `json:"available"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&availability); err != nil {
+		t.Fatal(err)
+	}
+	if availability.ClientName != validName || !availability.Available {
+		t.Fatalf("unexpected availability: %+v", availability)
+	}
+
+	tooLongName := strings.Repeat("网", 121)
+	tooLong := authRequest(t, ts, http.MethodGet,
+		"/api/admin/clients/name-availability?clientName="+url.QueryEscape(tooLongName), token, "")
+	defer tooLong.Body.Close()
+	if tooLong.StatusCode != http.StatusBadRequest {
+		t.Fatalf("121 UTF-16 unit name status = %d, want 400", tooLong.StatusCode)
 	}
 }
 
@@ -774,13 +852,13 @@ func TestDirectHTTPOfflineAndOversize(t *testing.T) {
 	app, ts := newAPIServer(t)
 	_ = app
 
-	// Offline client -> 503.
+	// Offline client -> 502, matching the Java HTTP tunnel gateway.
 	resp, err := http.Get(ts.URL + "/http/" + "Demo%20client" + "/api/ping")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 offline, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 offline, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }

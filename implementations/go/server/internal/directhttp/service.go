@@ -106,11 +106,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.sessions == nil {
-		fail(http.StatusServiceUnavailable, errOffline.Error()+": "+clientName)
+		fail(statusForError(errOffline), errOffline.Error()+": "+clientName)
 		return
 	}
 	if _, online := s.sessions.Find(clientName); !online {
-		fail(http.StatusServiceUnavailable, errOffline.Error()+": "+clientName)
+		fail(statusForError(errOffline), errOffline.Error()+": "+clientName)
 		return
 	}
 	if s.openStream == nil {

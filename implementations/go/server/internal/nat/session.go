@@ -488,14 +488,15 @@ func (s *clientSession) releaseTCPStream(channelID string) {
 }
 
 func (s *clientSession) acquire(port int) bool {
-	if !s.manager.TryAcquireGlobal() {
+	tenantID := s.conn.TenantID()
+	if !s.manager.TryAcquire(tenantID) {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if reached(s.activeExternal, s.limits.PerClient) || reached(s.portCounts[port], s.limits.PerPort) {
-		s.manager.ReleaseGlobal()
-		s.manager.RecordRejected()
+		s.manager.ReleaseExternal(tenantID)
+		s.manager.RecordRejected(tenantID)
 		return false
 	}
 	s.activeExternal++
@@ -504,6 +505,7 @@ func (s *clientSession) acquire(port int) bool {
 }
 
 func (s *clientSession) release(port int) {
+	tenantID := s.conn.TenantID()
 	s.mu.Lock()
 	if s.activeExternal > 0 {
 		s.activeExternal--
@@ -514,7 +516,7 @@ func (s *clientSession) release(port int) {
 		s.portCounts[port] = count - 1
 	}
 	s.mu.Unlock()
-	s.manager.ReleaseGlobal()
+	s.manager.ReleaseExternal(tenantID)
 }
 
 func (s *clientSession) dispose() {

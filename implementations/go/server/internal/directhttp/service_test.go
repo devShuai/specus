@@ -45,7 +45,7 @@ func TestServeHTTPRecordsOfflineError(t *testing.T) {
 
 	service.ServeHTTP(response, request)
 
-	if response.Code != http.StatusServiceUnavailable || recorder.record.Error != "客户端不在线: Demo client" {
+	if response.Code != http.StatusBadGateway || recorder.record.Error != "客户端不在线: Demo client" {
 		t.Fatalf("unexpected offline response/detail: %d %+v", response.Code, recorder.record)
 	}
 }

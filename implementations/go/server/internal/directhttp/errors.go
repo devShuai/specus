@@ -13,7 +13,8 @@ var (
 func statusForError(err error) int {
 	switch {
 	case errors.Is(err, errOffline):
-		return http.StatusServiceUnavailable
+		// 与 Java HttpTunnelController 一致：客户端不在线返回 502 Bad Gateway。
+		return http.StatusBadGateway
 	case errors.Is(err, errTimeout):
 		return http.StatusGatewayTimeout
 	default:

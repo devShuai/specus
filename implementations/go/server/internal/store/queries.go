@@ -174,6 +174,22 @@ func (db *DB) MarkDisconnect(ctx context.Context, recordID int64, reason string,
 	return err
 }
 
+// CloseStaleOpenConnections stamps disconnected_at/disconnect_reason on every connection
+// record whose disconnected_at is still NULL. Used at startup (SERVER_RESTARTED) and graceful
+// shutdown (SERVER_SHUTDOWN) to mirror Java ConnectionRecordService sweeps. Returns the
+// number of rows updated.
+func (db *DB) CloseStaleOpenConnections(ctx context.Context, reason string, when time.Time) (int64, error) {
+	query := db.rebind(`UPDATE tunnel_connection_record
+		SET disconnected_at = COALESCE(disconnected_at, ?),
+		    disconnect_reason = COALESCE(disconnect_reason, ?)
+		WHERE disconnected_at IS NULL`)
+	result, err := db.sql.ExecContext(ctx, query, formatTime(when), reason)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // CountClients returns the number of client accounts.
 func (db *DB) CountClients(ctx context.Context) (int64, error) {
 	var count int64

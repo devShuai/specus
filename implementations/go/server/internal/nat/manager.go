@@ -18,7 +18,8 @@ type Limits struct {
 }
 
 // RemotePortManager owns the public-port TCP listeners and enforces the global external
-// connection cap shared across all clients. Mirrors the C# RemotePortServerManager.
+// connection cap shared across all clients. Mirrors the Java RemotePortServerManager,
+// including per-tenant active/rejected telemetry.
 type RemotePortManager struct {
 	globalMax int
 
@@ -27,11 +28,20 @@ type RemotePortManager struct {
 
 	active   atomic.Int64
 	rejected atomic.Int64
+
+	tenantMu         sync.Mutex
+	activeByTenant   map[string]*atomic.Int64
+	rejectedByTenant map[string]*atomic.Int64
 }
 
 // NewRemotePortManager builds a manager with the given global connection cap.
 func NewRemotePortManager(globalMax int) *RemotePortManager {
-	return &RemotePortManager{globalMax: globalMax, ports: make(map[int]*portListener)}
+	return &RemotePortManager{
+		globalMax:        globalMax,
+		ports:            make(map[int]*portListener),
+		activeByTenant:   make(map[string]*atomic.Int64),
+		rejectedByTenant: make(map[string]*atomic.Int64),
+	}
 }
 
 // Bind opens a public TCP listener on port and invokes onAccept for each accepted connection.
@@ -84,45 +94,116 @@ func (m *RemotePortManager) HasBinding(port int) bool {
 	return ok
 }
 
-// TryAcquireGlobal reserves a global external-connection slot; returns false when at capacity.
-func (m *RemotePortManager) TryAcquireGlobal() bool {
+// TryAcquire reserves a global external-connection slot; returns false when at capacity.
+// It also tracks per-tenant counts to mirror Java RemotePortServerManager.tryAcquireExternalConnection.
+func (m *RemotePortManager) TryAcquire(tenantID string) bool {
 	if m.globalMax <= 0 {
 		m.active.Add(1)
+		m.tenantActive(tenantID).Add(1)
 		return true
 	}
 	for {
 		current := m.active.Load()
 		if current >= int64(m.globalMax) {
 			m.rejected.Add(1)
+			m.tenantRejected(tenantID).Add(1)
 			return false
 		}
 		if m.active.CompareAndSwap(current, current+1) {
+			m.tenantActive(tenantID).Add(1)
 			return true
 		}
 	}
 }
 
-// ReleaseGlobal returns a global slot.
-func (m *RemotePortManager) ReleaseGlobal() {
+// ReleaseExternal returns a global slot and decrements the per-tenant counter.
+func (m *RemotePortManager) ReleaseExternal(tenantID string) {
 	for {
 		current := m.active.Load()
 		if current <= 0 {
 			return
 		}
 		if m.active.CompareAndSwap(current, current-1) {
+			ta := m.tenantActive(tenantID)
+			for {
+				tc := ta.Load()
+				if tc <= 0 {
+					break
+				}
+				if ta.CompareAndSwap(tc, tc-1) {
+					break
+				}
+			}
 			return
 		}
 	}
 }
 
-// RecordRejected increments the rejected-connection counter.
-func (m *RemotePortManager) RecordRejected() { m.rejected.Add(1) }
+// RecordRejected increments the rejected-connection counter (global + per-tenant).
+func (m *RemotePortManager) RecordRejected(tenantID string) {
+	m.rejected.Add(1)
+	m.tenantRejected(tenantID).Add(1)
+}
+
+func (m *RemotePortManager) tenantActive(tenantID string) *atomic.Int64 {
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	m.tenantMu.Lock()
+	defer m.tenantMu.Unlock()
+	a, ok := m.activeByTenant[tenantID]
+	if !ok {
+		a = &atomic.Int64{}
+		m.activeByTenant[tenantID] = a
+	}
+	return a
+}
+
+func (m *RemotePortManager) tenantRejected(tenantID string) *atomic.Int64 {
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	m.tenantMu.Lock()
+	defer m.tenantMu.Unlock()
+	r, ok := m.rejectedByTenant[tenantID]
+	if !ok {
+		r = &atomic.Int64{}
+		m.rejectedByTenant[tenantID] = r
+	}
+	return r
+}
 
 // ActiveExternalConnections returns the current global external connection count.
 func (m *RemotePortManager) ActiveExternalConnections() int64 { return m.active.Load() }
 
 // RejectedExternalConnections returns the cumulative rejected count.
 func (m *RemotePortManager) RejectedExternalConnections() int64 { return m.rejected.Load() }
+
+// ActiveExternalConnectionsByTenant returns the current external connection count for a tenant.
+func (m *RemotePortManager) ActiveExternalConnectionsByTenant(tenantID string) int64 {
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	m.tenantMu.Lock()
+	defer m.tenantMu.Unlock()
+	if a, ok := m.activeByTenant[tenantID]; ok {
+		return a.Load()
+	}
+	return 0
+}
+
+// RejectedExternalConnectionsByTenant returns the cumulative rejected count for a tenant.
+func (m *RemotePortManager) RejectedExternalConnectionsByTenant(tenantID string) int64 {
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	m.tenantMu.Lock()
+	defer m.tenantMu.Unlock()
+	if r, ok := m.rejectedByTenant[tenantID]; ok {
+		return r.Load()
+	}
+	return 0
+}
 
 type portListener struct {
 	port     int
