@@ -40,5 +40,27 @@ int main(void)
         return 1;
     }
     free(encoded);
+
+    char **values = NULL;
+    size_t values_len = 0;
+    const char *arrays = "{\"headers\":[\"Content-Type:text/plain\",\"X-Test:line\\nnext\"],\"empty\":[]}";
+    if (st_json_get_string_array(arrays, "headers", &values, &values_len) != 0
+        || values_len != 2U
+        || strcmp(values[0], "Content-Type:text/plain") != 0
+        || strcmp(values[1], "X-Test:line\nnext") != 0) {
+        fprintf(stderr, "json string array mismatch\n");
+        st_json_free_string_array(values, values_len);
+        return 1;
+    }
+    st_json_free_string_array(values, values_len);
+    values = NULL;
+    values_len = 0;
+    if (st_json_get_string_array(arrays, "empty", &values, &values_len) != 0
+        || values != NULL || values_len != 0U
+        || st_json_get_string_array("{\"bad\":[1]}", "bad", &values, &values_len) == 0) {
+        fprintf(stderr, "json string array validation mismatch\n");
+        st_json_free_string_array(values, values_len);
+        return 1;
+    }
     return 0;
 }

@@ -10,8 +10,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -47,11 +50,12 @@ public class TunnelCoreProtocolTest {
     public void secondStageLoginCarriesNameSessionAndAccessToken() throws Exception {
         ByteArrayOutputStream wire = new ByteArrayOutputStream();
         TunnelCore.PacketCodec.write(wire,
-                TunnelCore.Packet.loginRequest("android-a", 1868708022931423400L, "cs_token"));
+                TunnelCore.Packet.loginRequest("android-a", 1868708022931423400L, "cs_token",
+                        TunnelCore.CONNECTION_ROLE_CONTROL));
 
         ByteBuffer frame = ByteBuffer.wrap(wire.toByteArray());
         assertEquals(TunnelCore.PacketCodec.MAGIC, frame.getInt());
-        assertEquals(1, frame.get() & 0xff);
+        assertEquals(TunnelCore.PacketCodec.VERSION, frame.get() & 0xff);
         assertEquals(4, frame.get() & 0xff);
         assertEquals(1, frame.get());
         int bodyLength = frame.getInt();
@@ -59,11 +63,11 @@ public class TunnelCoreProtocolTest {
         byte[] body = new byte[bodyLength];
         frame.get(body);
 
-        TunnelCore.CompactInput payload = new TunnelCore.CompactInput(
-                TunnelCore.CompactPayload.decode(body));
+        TunnelCore.CompactInput payload = new TunnelCore.CompactInput(body);
         assertEquals("android-a", payload.readString());
         assertEquals(Long.valueOf(1868708022931423400L), payload.readNullableLong());
         assertEquals("cs_token", payload.readString());
+        assertEquals(TunnelCore.CONNECTION_ROLE_CONTROL, payload.readString());
         payload.requireFullyConsumed();
     }
 
@@ -132,7 +136,7 @@ public class TunnelCoreProtocolTest {
     }
 
     @Test
-    public void webSocketRouteUsesHttpBasePathAndNatFramePrefix() {
+    public void webSocketRouteUsesHttpBasePathAndSws2Envelope() {
         URI clear = TunnelCore.WebSocketSupport.buildTarget(
                 "http://127.0.0.1:8080/base", "/events", "room=1");
         assertEquals("ws", clear.getScheme());
@@ -144,15 +148,44 @@ public class TunnelCoreProtocolTest {
         assertEquals("wss", secure.getScheme());
         assertEquals("/socket/feed", secure.getPath());
 
-        assertArrayEquals(new byte[]{0x01, 'h', 'i'},
-                TunnelCore.WebSocketSupport.frameForControl(
-                        TunnelCore.WebSocketSupport.FRAME_TEXT,
-                        "hi".getBytes(StandardCharsets.UTF_8)));
-        assertArrayEquals(new byte[]{0x02, 0x01, 0x02},
-                TunnelCore.WebSocketSupport.frameForControl(
-                        TunnelCore.WebSocketSupport.FRAME_BINARY,
-                        new byte[]{0x01, 0x02}));
-        assertEquals(65_536, TunnelCore.WebSocketSupport.MAX_MESSAGE_BYTES);
+        byte[] encoded = TunnelCore.WebSocketSupport.encodeFrame(
+                TunnelCore.WebSocketSupport.OPCODE_TEXT, true, 0, 0,
+                "hi".getBytes(StandardCharsets.UTF_8));
+        TunnelCore.WebSocketSupport.Frame decoded = TunnelCore.WebSocketSupport.decodeFrame(encoded);
+        assertEquals(TunnelCore.WebSocketSupport.OPCODE_TEXT, decoded.opcode);
+        assertTrue(decoded.fin);
+        assertArrayEquals("hi".getBytes(StandardCharsets.UTF_8), decoded.payload);
+        assertThrows(IllegalArgumentException.class,
+                () -> TunnelCore.WebSocketSupport.decodeFrame(new byte[]{0x01, 'o', 'l', 'd'}));
+        assertEquals(16 * 1024 * 1024, TunnelCore.WebSocketSupport.MAX_MESSAGE_BYTES);
+    }
+
+    @Test
+    public void webSocketEnvelopeMatchesCentralSws2Vector() throws Exception {
+        JSONObject vector = new JSONObject(new String(
+                Files.readAllBytes(findApplicationVector()), StandardCharsets.UTF_8))
+                .getJSONObject("webSocket");
+        byte[] expected = HexFormat.of().parseHex(vector.getString("frameHex"));
+        byte[] encoded = TunnelCore.WebSocketSupport.encodeFrame(
+                vector.getInt("opcode"),
+                vector.getBoolean("finalFragment"),
+                vector.getInt("rsv"),
+                vector.getInt("closeCode"),
+                vector.getString("payloadUtf8").getBytes(StandardCharsets.UTF_8));
+        assertArrayEquals(expected, encoded);
+        TunnelCore.WebSocketSupport.Frame decoded = TunnelCore.WebSocketSupport.decodeFrame(expected);
+        assertEquals(vector.getInt("opcode"), decoded.opcode);
+        assertEquals(vector.getBoolean("finalFragment"), decoded.fin);
+        assertEquals(vector.getInt("rsv"), decoded.rsv);
+        assertEquals(vector.getInt("closeCode"), decoded.closeCode);
+        assertEquals(vector.getString("payloadUtf8"),
+                new String(decoded.payload, StandardCharsets.UTF_8));
+        assertThrows(IllegalArgumentException.class, () -> TunnelCore.WebSocketSupport.decodeFrame(
+                HexFormat.of().parseHex(vector.getString("invalidMagicHex"))));
+        assertThrows(IllegalArgumentException.class, () -> TunnelCore.WebSocketSupport.decodeFrame(
+                HexFormat.of().parseHex(vector.getString("truncatedHex"))));
+        assertThrows(IllegalArgumentException.class, () -> TunnelCore.WebSocketSupport.decodeFrame(
+                HexFormat.of().parseHex(vector.getString("trailingHex"))));
     }
 
     @Test
@@ -177,13 +210,17 @@ public class TunnelCoreProtocolTest {
         assertEquals(32 * 1024 * 1024, TunnelCore.PacketCodec.MAX_FRAME_SIZE);
         assertEquals(TunnelCore.PacketCodec.MAX_FRAME_SIZE - TunnelCore.PacketCodec.HEADER_BYTES,
                 TunnelCore.PacketCodec.MAX_BODY_SIZE);
-        TunnelCore.PacketCodec.validateBodyLength(TunnelCore.PacketCodec.MAX_BODY_SIZE);
+        TunnelCore.PacketCodec.validateBodyLength(
+                (byte) -4, TunnelCore.PacketCodec.MAX_BODY_SIZE, TunnelCore.PacketCodec.MAX_FRAME_SIZE);
         assertThrows(IOException.class,
-                () -> TunnelCore.PacketCodec.validateBodyLength(TunnelCore.PacketCodec.MAX_BODY_SIZE + 1));
+                () -> TunnelCore.PacketCodec.validateBodyLength(
+                        (byte) -4,
+                        TunnelCore.PacketCodec.MAX_BODY_SIZE + 1,
+                        TunnelCore.PacketCodec.MAX_FRAME_SIZE));
 
         ByteBuffer oversizedHeader = ByteBuffer.allocate(TunnelCore.PacketCodec.HEADER_BYTES);
         oversizedHeader.putInt(TunnelCore.PacketCodec.MAGIC);
-        oversizedHeader.put((byte) 1);
+        oversizedHeader.put((byte) TunnelCore.PacketCodec.VERSION);
         oversizedHeader.put((byte) 4);
         oversizedHeader.put((byte) -4);
         oversizedHeader.putInt(TunnelCore.PacketCodec.MAX_BODY_SIZE + 1);
@@ -192,20 +229,15 @@ public class TunnelCoreProtocolTest {
     }
 
     @Test
-    public void compactPayloadAcceptsExactlySixteenMiBInflated() {
-        byte[] raw = new byte[TunnelCore.CompactPayload.MAX_INFLATED_SIZE];
-        byte[] encoded = TunnelCore.CompactPayload.encode(raw);
-        assertEquals(1, encoded[0]);
-        assertArrayEquals(raw, TunnelCore.CompactPayload.decode(encoded));
-    }
-
-    @Test
-    public void compactPayloadRejectsMoreThanSixteenMiBInflated() {
-        byte[] encoded = TunnelCore.CompactPayload.encode(
-                new byte[TunnelCore.CompactPayload.MAX_INFLATED_SIZE + 1]);
-        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
-                () -> TunnelCore.CompactPayload.decode(encoded));
-        assertTrue(error.getMessage().contains("exceeds limit"));
+    public void protocolV1IsRejectedBeforeBodyAllocation() {
+        ByteBuffer header = ByteBuffer.allocate(TunnelCore.PacketCodec.HEADER_BYTES);
+        header.putInt(TunnelCore.PacketCodec.MAGIC);
+        header.put((byte) 1);
+        header.put((byte) 4);
+        header.put((byte) -4);
+        header.putInt(0);
+        assertThrows(IOException.class,
+                () -> TunnelCore.PacketCodec.read(new ByteArrayInputStream(header.array())));
     }
 
     @Test
@@ -294,6 +326,17 @@ public class TunnelCoreProtocolTest {
 
     private static JSONObject route(String name, String target) throws Exception {
         return new JSONObject().put("route", name).put("targetBaseUrl", target);
+    }
+
+    private static Path findApplicationVector() {
+        Path current = Path.of("").toAbsolutePath();
+        for (int depth = 0; current != null && depth < 8; depth++, current = current.getParent()) {
+            Path candidate = current.resolve("protocol/test-vectors/application-protocol-v2.json");
+            if (Files.isRegularFile(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("cannot locate application protocol v2 vector");
     }
 
     private static final class SizedInputStream extends InputStream {

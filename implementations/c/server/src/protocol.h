@@ -5,13 +5,16 @@
 #include <stdint.h>
 
 #define ST_MAGIC 0x14353565U
-#define ST_VERSION 1U
-#define ST_SERIALIZER_FASTJSON 1U
+#define ST_VERSION 2U
 #define ST_SERIALIZER_COMPACT_BINARY 4U
 #define ST_HEADER_SIZE 11U
 #define ST_MAX_FRAME_SIZE (32U * 1024U * 1024U)
 #define ST_MAX_BODY_SIZE (ST_MAX_FRAME_SIZE - ST_HEADER_SIZE)
-#define ST_MAX_INFLATED_SIZE (16U * 1024U * 1024U)
+#define ST_PRE_AUTH_MAX_FRAME_SIZE (16U * 1024U)
+#define ST_MAX_MESSAGE_BODY_SIZE (1024U * 1024U)
+#define ST_MAX_NAT_METADATA_SIZE 65535U
+#define ST_CONNECTION_ROLE_CONTROL "control"
+#define ST_CONNECTION_ROLE_DATA "data"
 
 #define ST_CMD_LOGIN_REQUEST 1
 #define ST_CMD_LOGIN_RESPONSE -1
@@ -22,23 +25,23 @@
 #define ST_CMD_HEARTBEAT_REQUEST 4
 #define ST_CMD_HEARTBEAT_RESPONSE -4
 #define ST_CMD_NAT_MESSAGE 6
-#define ST_CMD_DIRECT_HTTP_REQUEST 7
-#define ST_CMD_DIRECT_HTTP_RESPONSE -7
 
 #define ST_NAT_REGISTER 1
 #define ST_NAT_REGISTER_RESULT 2
-#define ST_NAT_CONNECTED 3
-#define ST_NAT_DISCONNECTED 4
+#define ST_NAT_OPEN 3
+#define ST_NAT_FIN 4
 #define ST_NAT_DATA 5
 #define ST_NAT_KEEPALIVE 6
 #define ST_NAT_UNREGISTER 7
-#define ST_NAT_HTTP_ROUTES_REPORT 8
+#define ST_NAT_RST 8
+#define ST_NAT_WINDOW_UPDATE 9
+#define ST_NAT_FLAG_END_STREAM 1U
 
-#define ST_MESSAGE_TYPE_SERVER_TO_CLIENT 0
-#define ST_MESSAGE_TYPE_CLIENT_TO_SERVER 1
-#define ST_MESSAGE_TYPE_CLIENT_TO_CLIENT 2
-#define ST_MESSAGE_TYPE_NAT_CONTROL 3
-#define ST_MESSAGE_TYPE_PEER_CONTROL 4
+#define ST_MESSAGE_TYPE_SERVER_TO_CLIENT 1
+#define ST_MESSAGE_TYPE_CLIENT_TO_SERVER 2
+#define ST_MESSAGE_TYPE_CLIENT_TO_CLIENT 3
+#define ST_MESSAGE_TYPE_NAT_CONTROL 4
+#define ST_MESSAGE_TYPE_PEER_CONTROL 5
 
 typedef struct {
     uint8_t version;
@@ -51,6 +54,7 @@ typedef struct {
     char *client_name;
     int64_t client_session_id;
     char *access_token;
+    char *connection_role;
 } st_login_request;
 
 typedef struct {
@@ -61,34 +65,15 @@ typedef struct {
 } st_message_response;
 
 typedef struct {
-    char *request_id;
-    char *request_method;
-    char *route;
-    char *relative_path;
-    char *raw_query;
-    char **headers;
-    size_t headers_len;
-    uint8_t *body;
-    size_t body_len;
-} st_direct_http_request;
-
-typedef struct {
-    char *request_id;
-    int status_code;
-    char **headers;
-    size_t headers_len;
-    uint8_t *body;
-    size_t body_len;
-    char *error;
-} st_direct_http_response;
-
-typedef struct {
     uint8_t *data;
     size_t len;
 } st_buffer;
 
 typedef struct {
     int type;
+    uint8_t flags;
+    uint32_t stream_id;
+    uint32_t value;
     char *meta_json;
     uint8_t *data;
     size_t data_len;
@@ -98,18 +83,14 @@ int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *
 int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len);
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request);
 int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st_message_response *response);
-int st_protocol_decode_direct_http_request(const uint8_t *body, size_t body_len, st_direct_http_request *request);
-int st_protocol_decode_direct_http_response(const uint8_t *body, size_t body_len, st_direct_http_response *response);
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message);
 st_buffer st_protocol_encode_login_response(const char *client_name, int success, const char *reason);
 st_buffer st_protocol_encode_nat_control(const char *client_name, const char *nat_control_json);
-st_buffer st_protocol_encode_direct_http_request(const st_direct_http_request *request);
-st_buffer st_protocol_encode_nat_message(int type, const char *meta_json, const uint8_t *data, size_t data_len);
+st_buffer st_protocol_encode_nat_message(int type, uint8_t flags, uint32_t stream_id, uint32_t value,
+                                         const char *meta_json, const uint8_t *data, size_t data_len);
 st_buffer st_protocol_encode_empty_packet(int8_t command);
 void st_login_request_free(st_login_request *request);
 void st_message_response_free(st_message_response *response);
-void st_direct_http_request_free(st_direct_http_request *request);
-void st_direct_http_response_free(st_direct_http_response *response);
 void st_nat_message_free(st_nat_message *message);
 void st_buffer_free(st_buffer *buffer);
 

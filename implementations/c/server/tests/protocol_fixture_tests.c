@@ -13,13 +13,19 @@ static int test_login_request_decode(void)
     if (st_test_decode_fixture_header("login_request.bin", &bytes, &header) != 0) {
         return 1;
     }
-    st_login_request request;
+    st_login_request request = {0};
     int ok = header.command == ST_CMD_LOGIN_REQUEST
-        && st_protocol_decode_login_request(bytes + ST_HEADER_SIZE, header.length, &request) != 0;
-    if (!ok) {
-        fprintf(stderr, "legacy login request fixture should be rejected\n");
-        st_login_request_free(&request);
+        && st_protocol_decode_login_request(bytes + ST_HEADER_SIZE, header.length, &request) == 0;
+    if (ok) {
+        ok = strcmp(request.client_name, "Demo client") == 0
+            && request.client_session_id == INT64_C(1700000000000)
+            && strcmp(request.access_token, "cs_fixture_access_token") == 0
+            && strcmp(request.connection_role, ST_CONNECTION_ROLE_CONTROL) == 0;
     }
+    if (!ok) {
+        fprintf(stderr, "login request fixture mismatch\n");
+    }
+    st_login_request_free(&request);
     free(bytes);
     return ok ? 0 : 1;
 }
@@ -119,7 +125,13 @@ static int test_nat_decode(void)
         {"nat_register.bin", ST_NAT_REGISTER},
         {"nat_unregister.bin", ST_NAT_UNREGISTER},
         {"nat_data_small.bin", ST_NAT_DATA},
-        {"nat_data_large_deflated.bin", ST_NAT_DATA}
+        {"nat_data_large.bin", ST_NAT_DATA},
+        {"http_stream_request_open.bin", ST_NAT_OPEN},
+        {"http_stream_request_data.bin", ST_NAT_DATA},
+        {"http_stream_request_fin.bin", ST_NAT_FIN},
+        {"http_stream_response_open.bin", ST_NAT_OPEN},
+        {"http_stream_response_data.bin", ST_NAT_DATA},
+        {"http_stream_response_fin.bin", ST_NAT_FIN}
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         uint8_t *bytes = NULL;
@@ -149,8 +161,33 @@ static int test_nat_decode(void)
             free(address);
         } else if (strcmp(cases[i].fixture, "nat_data_small.bin") == 0) {
             ok = message.data_len == 5U && memcmp(message.data, "hello", 5) == 0;
-        } else if (strcmp(cases[i].fixture, "nat_data_large_deflated.bin") == 0) {
+        } else if (strcmp(cases[i].fixture, "nat_data_large.bin") == 0) {
             ok = message.data_len == 256U && message.data[0] == 'A' && message.data[255] == 'A';
+        } else if (strcmp(cases[i].fixture, "http_stream_response_open.bin") == 0) {
+            char *source = st_json_get_string(message.meta_json, "source");
+            char *phase = st_json_get_string(message.meta_json, "phase");
+            char **trailer_names = NULL;
+            size_t trailer_names_len = 0;
+            int status = 0;
+            ok = message.stream_id == 101U
+                && source != NULL && strcmp(source, "http") == 0
+                && phase != NULL && strcmp(phase, "response") == 0
+                && st_json_get_int(message.meta_json, "statusCode", &status) == 0 && status == 200
+                && st_json_get_string_array(message.meta_json, "trailerNames",
+                                            &trailer_names, &trailer_names_len) == 0
+                && trailer_names_len == 1U && strcmp(trailer_names[0], "Digest") == 0;
+            free(source);
+            free(phase);
+            st_json_free_string_array(trailer_names, trailer_names_len);
+        } else if (strcmp(cases[i].fixture, "http_stream_response_fin.bin") == 0) {
+            char **trailers = NULL;
+            size_t trailers_len = 0;
+            ok = message.stream_id == 101U
+                && st_json_get_string_array(message.meta_json, "trailers",
+                                            &trailers, &trailers_len) == 0
+                && trailers_len == 1U
+                && strcmp(trailers[0], "Digest:sha-256=fixture") == 0;
+            st_json_free_string_array(trailers, trailers_len);
         }
         st_nat_message_free(&message);
         free(bytes);
@@ -162,156 +199,40 @@ static int test_nat_decode(void)
     return 0;
 }
 
-static int test_inflated_payload_limit_is_inclusive(void)
+static int test_malformed_frames_are_rejected(void)
 {
-    uint8_t *data = (uint8_t *)malloc(ST_MAX_INFLATED_SIZE + 1U);
-    if (data == NULL) {
-        return 1;
-    }
-    memset(data, 'A', ST_MAX_INFLATED_SIZE + 1U);
-
-    st_buffer exact = st_protocol_encode_nat_message(ST_NAT_DATA, "{}", data, ST_MAX_INFLATED_SIZE);
-    st_frame_header header;
-    st_nat_message decoded;
-    int exact_ok = exact.data != NULL
-        && st_protocol_read_header(exact.data, &header) == 0
-        && st_protocol_decode_nat_message(exact.data + ST_HEADER_SIZE, header.length, &decoded) == 0
-        && decoded.data_len == ST_MAX_INFLATED_SIZE;
-    if (exact_ok) {
-        st_nat_message_free(&decoded);
-    }
-    st_buffer_free(&exact);
-    if (!exact_ok) {
-        free(data);
-        fprintf(stderr, "exactly 16 MiB inflated payload should be accepted\n");
-        return 1;
-    }
-
-    st_buffer oversized = st_protocol_encode_nat_message(
-        ST_NAT_DATA,
-        "{}",
-        data,
-        ST_MAX_INFLATED_SIZE + 1U);
-    int oversized_rejected = oversized.data != NULL
-        && st_protocol_read_header(oversized.data, &header) == 0
-        && st_protocol_decode_nat_message(
-            oversized.data + ST_HEADER_SIZE,
-            header.length,
-            &decoded) != 0;
-    st_buffer_free(&oversized);
-    free(data);
-    if (!oversized_rejected) {
-        fprintf(stderr, "inflated payload larger than 16 MiB should be rejected\n");
-        return 1;
+    const char *fixtures[] = {
+        "invalid_bad_magic.bin",
+        "invalid_version_v1.bin",
+        "invalid_serializer.bin",
+        "invalid_unknown_command.bin",
+        "invalid_truncated_header.bin",
+        "invalid_truncated_body.bin",
+        "invalid_trailing_body.bin",
+        "invalid_heartbeat_body.bin",
+        "invalid_oversized_length.bin"
+    };
+    for (size_t index = 0; index < sizeof(fixtures) / sizeof(fixtures[0]); ++index) {
+        uint8_t *bytes = NULL;
+        size_t length = 0;
+        if (st_test_read_fixture(fixtures[index], &bytes, &length) != 0) {
+            return 1;
+        }
+        st_frame_header header;
+        int rejected = length < ST_HEADER_SIZE || st_protocol_read_header(bytes, &header) != 0;
+        if (!rejected) {
+            rejected = header.length != length - ST_HEADER_SIZE;
+        }
+        if (!rejected && header.command == ST_CMD_HEARTBEAT_REQUEST) {
+            rejected = st_protocol_decode_empty_packet(bytes + ST_HEADER_SIZE, header.length) != 0;
+        }
+        free(bytes);
+        if (!rejected) {
+            fprintf(stderr, "malformed fixture %s was accepted\n", fixtures[index]);
+            return 1;
+        }
     }
     return 0;
-}
-
-static int test_direct_http_decode(void)
-{
-    uint8_t *bytes = NULL;
-    st_frame_header header;
-    if (st_test_decode_fixture_header("direct_http_request.bin", &bytes, &header) != 0) {
-        return 1;
-    }
-    st_direct_http_request request;
-    int ok = header.command == ST_CMD_DIRECT_HTTP_REQUEST
-        && st_protocol_decode_direct_http_request(bytes + ST_HEADER_SIZE, header.length, &request) == 0;
-    if (!ok) {
-        fprintf(stderr, "direct HTTP request decode failed\n");
-        free(bytes);
-        return 1;
-    }
-    ok = strcmp(request.request_id, "11111111-2222-3333-4444-555555555555") == 0
-        && strcmp(request.request_method, "GET") == 0
-        && strcmp(request.route, "api") == 0
-        && strcmp(request.relative_path, "/v1/items") == 0
-        && strcmp(request.raw_query, "limit=10&page=1") == 0
-        && request.headers_len == 2U
-        && strcmp(request.headers[0], "accept: application/json") == 0
-        && strcmp(request.headers[1], "x-fixture: 1") == 0
-        && request.body_len == 0U;
-    if (!ok) {
-        fprintf(stderr, "direct HTTP request content mismatch\n");
-    }
-    st_direct_http_request_free(&request);
-    free(bytes);
-    if (!ok) {
-        return 1;
-    }
-
-    if (st_test_decode_fixture_header("direct_http_response.bin", &bytes, &header) != 0) {
-        return 1;
-    }
-    st_direct_http_response response;
-    ok = header.command == ST_CMD_DIRECT_HTTP_RESPONSE
-        && st_protocol_decode_direct_http_response(bytes + ST_HEADER_SIZE, header.length, &response) == 0;
-    if (!ok) {
-        fprintf(stderr, "direct HTTP response decode failed\n");
-        free(bytes);
-        return 1;
-    }
-    ok = strcmp(response.request_id, "11111111-2222-3333-4444-555555555555") == 0
-        && response.status_code == 200
-        && response.headers_len == 1U
-        && strcmp(response.headers[0], "content-type: application/json") == 0
-        && response.body_len == strlen("{\"ok\":true}")
-        && memcmp(response.body, "{\"ok\":true}", response.body_len) == 0
-        && response.error == NULL;
-    if (!ok) {
-        fprintf(stderr, "direct HTTP response content mismatch\n");
-    }
-    st_direct_http_response_free(&response);
-    free(bytes);
-    return ok ? 0 : 1;
-}
-
-static int test_direct_http_encode_round_trip(void)
-{
-    char *headers[] = {"accept: application/json", "x-test: 1"};
-    const uint8_t body[] = "{\"hello\":\"world\"}";
-    st_direct_http_request request = {
-        .request_id = "22222222-3333-4444-5555-666666666666",
-        .request_method = "POST",
-        .route = "api",
-        .relative_path = "/v1/create",
-        .raw_query = "debug=true",
-        .headers = headers,
-        .headers_len = 2,
-        .body = (uint8_t *)body,
-        .body_len = sizeof(body) - 1U
-    };
-    st_buffer packet = st_protocol_encode_direct_http_request(&request);
-    if (packet.data == NULL) {
-        fprintf(stderr, "direct HTTP request encode failed\n");
-        return 1;
-    }
-    st_frame_header header;
-    st_direct_http_request decoded;
-    int ok = st_protocol_read_header(packet.data, &header) == 0
-        && header.command == ST_CMD_DIRECT_HTTP_REQUEST
-        && st_protocol_decode_direct_http_request(packet.data + ST_HEADER_SIZE, header.length, &decoded) == 0;
-    if (!ok) {
-        fprintf(stderr, "direct HTTP request round-trip decode failed\n");
-        st_buffer_free(&packet);
-        return 1;
-    }
-    ok = strcmp(decoded.request_id, request.request_id) == 0
-        && strcmp(decoded.request_method, request.request_method) == 0
-        && strcmp(decoded.route, request.route) == 0
-        && strcmp(decoded.relative_path, request.relative_path) == 0
-        && strcmp(decoded.raw_query, request.raw_query) == 0
-        && decoded.headers_len == request.headers_len
-        && strcmp(decoded.headers[0], request.headers[0]) == 0
-        && strcmp(decoded.headers[1], request.headers[1]) == 0
-        && decoded.body_len == request.body_len
-        && memcmp(decoded.body, request.body, request.body_len) == 0;
-    if (!ok) {
-        fprintf(stderr, "direct HTTP request round-trip content mismatch\n");
-    }
-    st_direct_http_request_free(&decoded);
-    st_buffer_free(&packet);
-    return ok ? 0 : 1;
 }
 
 static int test_java_encode_fixtures(void)
@@ -332,6 +253,9 @@ static int test_java_encode_fixtures(void)
 
     st_buffer register_result = st_protocol_encode_nat_message(
         ST_NAT_REGISTER_RESULT,
+        0,
+        0,
+        0,
         "{\"port\":18080,\"success\":true}",
         NULL,
         0);
@@ -342,32 +266,69 @@ static int test_java_encode_fixtures(void)
     }
     st_buffer_free(&register_result);
 
-    st_buffer connected = st_protocol_encode_nat_message(
-        ST_NAT_CONNECTED,
+    st_buffer open = st_protocol_encode_nat_message(
+        ST_NAT_OPEN,
+        0,
+        1,
+        0,
         "{\"channelId\":\"00010203-aaaa-bbbb-cccc-ddddeeeeffff\",\"port\":18080}",
         NULL,
         0);
-    if (connected.data == NULL || st_test_expect_fixture_bytes("nat_connected.bin", &connected) != 0) {
-        st_buffer_free(&connected);
+    if (open.data == NULL || st_test_expect_fixture_bytes("nat_open.bin", &open) != 0) {
+        st_buffer_free(&open);
         return 1;
     }
-    st_buffer_free(&connected);
+    st_buffer_free(&open);
 
-    st_buffer disconnected = st_protocol_encode_nat_message(
-        ST_NAT_DISCONNECTED,
-        "{\"channelId\":\"00010203-aaaa-bbbb-cccc-ddddeeeeffff\"}",
+    st_buffer fin = st_protocol_encode_nat_message(
+        ST_NAT_FIN,
+        0,
+        1,
+        0,
+        NULL,
         NULL,
         0);
-    if (disconnected.data == NULL
-        || st_test_expect_fixture_bytes("nat_disconnected.bin", &disconnected) != 0) {
-        st_buffer_free(&disconnected);
+    if (fin.data == NULL || st_test_expect_fixture_bytes("nat_fin.bin", &fin) != 0) {
+        st_buffer_free(&fin);
         return 1;
     }
-    st_buffer_free(&disconnected);
+    st_buffer_free(&fin);
+
+    st_buffer rst = st_protocol_encode_nat_message(
+        ST_NAT_RST,
+        0,
+        1,
+        7,
+        "{\"reason\":\"upstream reset\"}",
+        NULL,
+        0);
+    if (rst.data == NULL || st_test_expect_fixture_bytes("nat_rst.bin", &rst) != 0) {
+        st_buffer_free(&rst);
+        return 1;
+    }
+    st_buffer_free(&rst);
+
+    st_buffer window = st_protocol_encode_nat_message(
+        ST_NAT_WINDOW_UPDATE,
+        0,
+        1,
+        65536,
+        NULL,
+        NULL,
+        0);
+    if (window.data == NULL
+        || st_test_expect_fixture_bytes("nat_window_update.bin", &window) != 0) {
+        st_buffer_free(&window);
+        return 1;
+    }
+    st_buffer_free(&window);
 
     st_buffer small_data = st_protocol_encode_nat_message(
         ST_NAT_DATA,
-        "{\"channelId\":\"00010203-aaaa-bbbb-cccc-ddddeeeeffff\"}",
+        0,
+        1,
+        0,
+        NULL,
         (const uint8_t *)"hello",
         5);
     if (small_data.data == NULL || st_test_expect_fixture_bytes("nat_data_small.bin", &small_data) != 0) {
@@ -380,11 +341,14 @@ static int test_java_encode_fixtures(void)
     memset(repeated, 'A', sizeof(repeated));
     st_buffer large_data = st_protocol_encode_nat_message(
         ST_NAT_DATA,
-        "{\"channelId\":\"00010203-aaaa-bbbb-cccc-ddddeeeeffff\"}",
+        0,
+        1,
+        0,
+        NULL,
         repeated,
         sizeof(repeated));
     if (large_data.data == NULL
-        || st_test_expect_fixture_bytes("nat_data_large_deflated.bin", &large_data) != 0) {
+        || st_test_expect_fixture_bytes("nat_data_large.bin", &large_data) != 0) {
         st_buffer_free(&large_data);
         return 1;
     }
@@ -400,8 +364,6 @@ int main(void)
         || test_empty_packets() != 0
         || test_frame_limit_includes_header() != 0
         || test_nat_decode() != 0
-        || test_inflated_payload_limit_is_inclusive() != 0
-        || test_direct_http_decode() != 0
-        || test_direct_http_encode_round_trip() != 0
+        || test_malformed_frames_are_rejected() != 0
         || test_java_encode_fixtures() != 0;
 }

@@ -3,7 +3,10 @@ package com.theshuai.tunnel.android;
 import org.json.JSONObject;
 import org.junit.Test;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -13,7 +16,35 @@ import static org.junit.Assert.assertTrue;
 
 public class PeerAppMessageCodecTest {
     @Test
-    public void ordinaryTextUsesJavaAndGoStmsg1WireFormat() throws Exception {
+    public void matchesCentralStmsg2Vector() throws Exception {
+        JSONObject vector = new JSONObject(new String(
+                Files.readAllBytes(findVector()), StandardCharsets.UTF_8)).getJSONObject("clientMessage");
+        PeerAppMessageCodec.PeerAppMessage message = new PeerAppMessageCodec.PeerAppMessage();
+        message.type = vector.getString("type");
+        message.id = vector.getString("id");
+        message.fromClientId = vector.getLong("fromClientId");
+        message.fromClientName = vector.getString("fromClientName");
+        message.toClientId = vector.getLong("toClientId");
+        message.toClientName = vector.getString("toClientName");
+        message.message = vector.getString("message");
+        message.createdAtMillis = vector.getLong("createdAtMillis");
+
+        byte[] expected = HexFormat.of().parseHex(vector.getString("payloadHex"));
+        org.junit.Assert.assertArrayEquals(expected, PeerAppMessageCodec.encode(message));
+        PeerAppMessageCodec.PeerAppMessage decoded = PeerAppMessageCodec.decode(expected);
+        assertNotNull(decoded);
+        assertEquals(message.type, decoded.type);
+        assertEquals(message.id, decoded.id);
+        assertEquals(message.fromClientId, decoded.fromClientId);
+        assertEquals(message.fromClientName, decoded.fromClientName);
+        assertEquals(message.toClientId, decoded.toClientId);
+        assertEquals(message.toClientName, decoded.toClientName);
+        assertEquals(message.message, decoded.message);
+        assertEquals(message.createdAtMillis, decoded.createdAtMillis);
+    }
+
+    @Test
+    public void ordinaryTextUsesMandatoryStmsg2WireFormat() throws Exception {
         PeerAppMessageCodec.PeerAppMessage message = new PeerAppMessageCodec.PeerAppMessage();
         message.type = PeerAppMessageCodec.TYPE_MESSAGE;
         message.id = "message-1";
@@ -26,7 +57,7 @@ public class PeerAppMessageCodecTest {
 
         byte[] payload = PeerAppMessageCodec.encode(message);
 
-        assertEquals("STMSG1\n", new String(payload, 0, 7, StandardCharsets.US_ASCII));
+        assertEquals("STMSG2\n", new String(payload, 0, 7, StandardCharsets.US_ASCII));
         PeerAppMessageCodec.PeerAppMessage decoded = PeerAppMessageCodec.decode(payload);
         assertNotNull(decoded);
         assertEquals("message-1", decoded.id);
@@ -70,7 +101,7 @@ public class PeerAppMessageCodecTest {
     }
 
     @Test
-    public void javaAndGoStmsg1PayloadRemainsReadable() throws Exception {
+    public void removedStmsg1PayloadIsRejected() throws Exception {
         byte[] payload = ("STMSG1\n" + new JSONObject()
                 .put("type", "message")
                 .put("id", "old")
@@ -82,17 +113,8 @@ public class PeerAppMessageCodecTest {
                 .put("createdAtMillis", 4567L)
                 .toString()).getBytes(StandardCharsets.UTF_8);
 
-        assertTrue(PeerAppMessageCodec.looksLike(payload));
-        PeerAppMessageCodec.PeerAppMessage decoded = PeerAppMessageCodec.decode(payload);
-        assertNotNull(decoded);
-        assertEquals("old", decoded.id);
-        assertEquals(7L, decoded.fromClientId);
-        assertEquals("java-or-go", decoded.fromClientName);
-        assertEquals(8L, decoded.toClientId);
-        assertEquals("android", decoded.toClientName);
-        assertEquals("legacy", decoded.message);
-        assertEquals(4567L, decoded.createdAtMillis);
-        assertNull(decoded.attachment);
+        assertFalse(PeerAppMessageCodec.looksLike(payload));
+        assertNull(PeerAppMessageCodec.decode(payload));
     }
 
     @Test
@@ -105,7 +127,7 @@ public class PeerAppMessageCodecTest {
         ack.attachment = new JSONObject().put("objectId", "must-not-leak");
 
         byte[] payload = PeerAppMessageCodec.encode(ack);
-        assertEquals("STMSG1\n", new String(payload, 0, 7, StandardCharsets.US_ASCII));
+        assertEquals("STMSG2\n", new String(payload, 0, 7, StandardCharsets.US_ASCII));
         PeerAppMessageCodec.PeerAppMessage decoded =
                 PeerAppMessageCodec.decode(payload);
         assertNotNull(decoded);
@@ -133,5 +155,16 @@ public class PeerAppMessageCodecTest {
                 .put("sizeBytes", 0L);
         assertEquals("[附件] obj-2 · application/octet-stream · -",
                 PeerAppMessageCodec.displayText(message));
+    }
+
+    private static Path findVector() {
+        Path current = Path.of("").toAbsolutePath();
+        for (int depth = 0; current != null && depth < 8; depth++, current = current.getParent()) {
+            Path candidate = current.resolve("protocol/test-vectors/application-protocol-v2.json");
+            if (Files.isRegularFile(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("cannot locate application protocol v2 vector");
     }
 }

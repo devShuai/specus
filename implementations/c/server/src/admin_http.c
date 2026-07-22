@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -34,6 +35,13 @@
 #define ST_ADMIN_MAX_HTTP_HEADERS 96U
 #define ST_ADMIN_MAX_DIRECT_HTTP_BODY (16U * 1024U * 1024U)
 #define ST_ADMIN_DEFAULT_REWRITE_BODY_BYTES (10U * 1024U * 1024U)
+#define ST_ADMIN_SWS2_HEADER_BYTES 12U
+#define ST_ADMIN_SWS2_MAX_PAYLOAD ((64U * 1024U) - ST_ADMIN_SWS2_HEADER_BYTES)
+#define ST_ADMIN_STREAM_INITIAL_WINDOW (1024U * 1024U)
+#define ST_ADMIN_STREAM_MAX_WINDOW (16U * 1024U * 1024U)
+#define ST_ADMIN_WS_TICKET_BYTES 32U
+#define ST_ADMIN_WS_TICKET_TTL_SECONDS 45
+#define ST_ADMIN_MAX_WS_TICKETS 1024U
 
 typedef struct {
     char *data;
@@ -67,18 +75,38 @@ typedef struct {
 
 typedef struct st_admin_ws_client {
     int fd;
+    char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
+    char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
+    int admin;
     pthread_mutex_t send_lock;
     struct st_admin_ws_client *next;
 } st_admin_ws_client;
 
+typedef struct st_admin_ws_ticket {
+    uint8_t token_hash[ST_SHA256_LEN];
+    uint8_t remote_address_hash[ST_SHA256_LEN];
+    char username[ST_SECURITY_TOKEN_USERNAME_LEN + 1];
+    char tenant_id[ST_SECURITY_TOKEN_TENANT_LEN + 1];
+    int admin;
+    time_t expires_at;
+    struct st_admin_ws_ticket *next;
+} st_admin_ws_ticket;
+
 struct st_admin_direct_ws_stream {
     int fd;
     pthread_mutex_t send_lock;
+    pthread_mutex_t flow_lock;
+    pthread_cond_t flow_cond;
+    uint64_t send_credit;
+    uint8_t outbound_fragment_opcode;
+    int flow_closed;
     int closed;
 };
 
 static pthread_mutex_t admin_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 static st_admin_ws_client *admin_ws_clients = NULL;
+static pthread_mutex_t admin_ws_ticket_lock = PTHREAD_MUTEX_INITIALIZER;
+static st_admin_ws_ticket *admin_ws_tickets = NULL;
 
 static char *admin_url_decode(const char *value, size_t len);
 static const char *admin_database_path(void);
@@ -1111,6 +1139,196 @@ static void base64url_no_padding(const uint8_t *data, size_t len, char *out, siz
     out[written] = '\0';
 }
 
+static int admin_secure_random(uint8_t *out, size_t len)
+{
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    size_t offset = 0;
+    while (offset < len) {
+        ssize_t read_len = read(fd, out + offset, len - offset);
+        if (read_len < 0 && errno == EINTR) {
+            continue;
+        }
+        if (read_len <= 0) {
+            close(fd);
+            return -1;
+        }
+        offset += (size_t)read_len;
+    }
+    close(fd);
+    return 0;
+}
+
+static void admin_hash_text(const char *value, uint8_t out[ST_SHA256_LEN])
+{
+    const char *normalized = value == NULL ? "" : value;
+    st_sha256((const uint8_t *)normalized, strlen(normalized), out);
+}
+
+static size_t admin_prune_websocket_tickets_locked(time_t now)
+{
+    size_t count = 0;
+    st_admin_ws_ticket **cursor = &admin_ws_tickets;
+    while (*cursor != NULL) {
+        st_admin_ws_ticket *ticket = *cursor;
+        if (ticket->expires_at <= now) {
+            *cursor = ticket->next;
+            free(ticket);
+            continue;
+        }
+        ++count;
+        cursor = &ticket->next;
+    }
+    return count;
+}
+
+static int admin_issue_websocket_ticket(const st_admin_context *context,
+                                        const char *remote_address,
+                                        char out[64],
+                                        time_t *expires_at)
+{
+    if (context == NULL || !context->authenticated || out == NULL || expires_at == NULL) {
+        return -1;
+    }
+    uint8_t random_bytes[ST_ADMIN_WS_TICKET_BYTES];
+    uint8_t token_hash[ST_SHA256_LEN];
+    uint8_t remote_address_hash[ST_SHA256_LEN];
+    if (admin_secure_random(random_bytes, sizeof(random_bytes)) != 0) {
+        return -1;
+    }
+    base64url_no_padding(random_bytes, sizeof(random_bytes), out, 64U);
+    admin_hash_text(out, token_hash);
+    admin_hash_text(remote_address, remote_address_hash);
+
+    st_admin_ws_ticket *ticket = (st_admin_ws_ticket *)calloc(1, sizeof(*ticket));
+    if (ticket == NULL) {
+        return -1;
+    }
+    memcpy(ticket->token_hash, token_hash, sizeof(token_hash));
+    memcpy(ticket->remote_address_hash, remote_address_hash, sizeof(remote_address_hash));
+    snprintf(ticket->username, sizeof(ticket->username), "%s", context->username);
+    snprintf(ticket->tenant_id, sizeof(ticket->tenant_id), "%s", context->tenant_id);
+    ticket->admin = context->admin;
+    ticket->expires_at = time(NULL) + ST_ADMIN_WS_TICKET_TTL_SECONDS;
+
+    pthread_mutex_lock(&admin_ws_ticket_lock);
+    size_t active_tickets = admin_prune_websocket_tickets_locked(time(NULL));
+    if (active_tickets >= ST_ADMIN_MAX_WS_TICKETS) {
+        pthread_mutex_unlock(&admin_ws_ticket_lock);
+        free(ticket);
+        return -2;
+    }
+    for (st_admin_ws_ticket *existing = admin_ws_tickets; existing != NULL; existing = existing->next) {
+        if (st_constant_time_eq(existing->token_hash, token_hash, sizeof(token_hash))) {
+            pthread_mutex_unlock(&admin_ws_ticket_lock);
+            free(ticket);
+            return -1;
+        }
+    }
+    ticket->next = admin_ws_tickets;
+    admin_ws_tickets = ticket;
+    *expires_at = ticket->expires_at;
+    pthread_mutex_unlock(&admin_ws_ticket_lock);
+    return 0;
+}
+
+static int admin_consume_websocket_ticket(const char *token,
+                                          const char *remote_address,
+                                          st_admin_context *context)
+{
+    if (token == NULL || strlen(token) < 32U || strlen(token) > 128U || context == NULL) {
+        return -1;
+    }
+    uint8_t token_hash[ST_SHA256_LEN];
+    uint8_t remote_address_hash[ST_SHA256_LEN];
+    admin_hash_text(token, token_hash);
+    admin_hash_text(remote_address, remote_address_hash);
+
+    pthread_mutex_lock(&admin_ws_ticket_lock);
+    admin_prune_websocket_tickets_locked(time(NULL));
+    st_admin_ws_ticket **cursor = &admin_ws_tickets;
+    while (*cursor != NULL) {
+        st_admin_ws_ticket *ticket = *cursor;
+        if (!st_constant_time_eq(ticket->token_hash, token_hash, sizeof(token_hash))) {
+            cursor = &ticket->next;
+            continue;
+        }
+        if (!st_constant_time_eq(ticket->remote_address_hash,
+                                 remote_address_hash,
+                                 sizeof(remote_address_hash))) {
+            pthread_mutex_unlock(&admin_ws_ticket_lock);
+            return -1;
+        }
+        *cursor = ticket->next;
+        memset(context, 0, sizeof(*context));
+        snprintf(context->username, sizeof(context->username), "%s", ticket->username);
+        snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", ticket->tenant_id);
+        snprintf(context->role, sizeof(context->role), "%s", ticket->admin ? "ADMIN" : "USER");
+        context->admin = ticket->admin;
+        context->authenticated = 1;
+        free(ticket);
+        pthread_mutex_unlock(&admin_ws_ticket_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&admin_ws_ticket_lock);
+    return -1;
+}
+
+static int handle_admin_websocket_ticket(const st_admin_context *context,
+                                         const char *body,
+                                         const char *remote_address,
+                                         char *out,
+                                         size_t out_len)
+{
+    char *endpoint = st_json_get_string(body, "endpoint");
+    if (endpoint == NULL || strcmp(endpoint, "connections") != 0) {
+        free(endpoint);
+        return write_response(out,
+                              out_len,
+                              400,
+                              "Bad Request",
+                              "{\"error\":\"endpoint must be connections\"}");
+    }
+    free(endpoint);
+
+    char token[64];
+    time_t expires_at = 0;
+    int issue_rc = admin_issue_websocket_ticket(context, remote_address, token, &expires_at);
+    if (issue_rc == -2) {
+        return write_response(out,
+                              out_len,
+                              429,
+                              "Too Many Requests",
+                              "{\"error\":\"too many active websocket tickets\"}");
+    }
+    if (issue_rc != 0) {
+        return write_response(out,
+                              out_len,
+                              500,
+                              "Internal Server Error",
+                              "{\"error\":\"websocket ticket generation failed\"}");
+    }
+
+    char expires_text[64];
+    admin_iso_time((long long)expires_at, expires_text);
+    char response_body[256];
+    int written = snprintf(response_body,
+                           sizeof(response_body),
+                           "{\"ticket\":\"%s\",\"expiresAt\":\"%s\"}",
+                           token,
+                           expires_text);
+    if (written < 0 || (size_t)written >= sizeof(response_body)) {
+        return write_response(out,
+                              out_len,
+                              500,
+                              "Internal Server Error",
+                              "{\"error\":\"websocket ticket response failed\"}");
+    }
+    return write_response(out, out_len, 200, "OK", response_body);
+}
+
 static int build_public_ice_url(const char *scheme,
                                 const char *host,
                                 int port,
@@ -1823,6 +2041,7 @@ static void record_direct_http_exchange(const char *client_name,
                                         const char *route,
                                         const st_direct_http_request *request,
                                         const st_direct_http_response *response,
+                                        size_t response_bytes,
                                         const char *remote_address,
                                         long long elapsed_ms)
 {
@@ -1876,7 +2095,7 @@ static void record_direct_http_exchange(const char *client_name,
         .error = response->error,
         .remote_address = remote_address,
         .request_bytes = (long long)request->body_len,
-        .response_bytes = (long long)response->body_len,
+        .response_bytes = (long long)response_bytes,
         .elapsed_ms = elapsed_ms,
         .request_content_type = request_content_type,
         .response_content_type = response_content_type,
@@ -5628,6 +5847,7 @@ static int st_admin_build_response_internal(const char *method,
                                             const char *path,
                                             const char *authorization,
                                             const char *body,
+                                            const char *remote_address,
                                             int allow_default_admin,
                                             char *out,
                                             size_t out_len)
@@ -5681,6 +5901,9 @@ static int st_admin_build_response_internal(const char *method,
                               "Conflict",
                               "{\"error\":\"object storage is not configured\","
                               "\"code\":\"OBJECT_STORAGE_DISABLED\",\"enabled\":false}");
+    }
+    if (strcmp(method, "POST") == 0 && admin_path_equals(path, "/api/admin/ws-tickets")) {
+        return handle_admin_websocket_ticket(&context, body, remote_address, out, out_len);
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/overview")) {
         return build_overview_response(&context, out, out_len);
@@ -5877,7 +6100,7 @@ static int st_admin_build_response_internal(const char *method,
                               "Not Implemented",
                               "{\"error\":\"direct http dispatch is not wired yet\"}");
     }
-    if (strcmp(path, "/ws/connections") == 0) {
+    if (admin_path_equals(path, "/ws/connections")) {
         return write_response(out,
                               out_len,
                               426,
@@ -5911,7 +6134,7 @@ int st_admin_build_response_with_auth(const char *method,
                                       char *out,
                                       size_t out_len)
 {
-    return st_admin_build_response_internal(method, path, authorization, body, 0, out, out_len);
+    return st_admin_build_response_internal(method, path, authorization, body, "", 0, out, out_len);
 }
 
 int st_admin_build_response_with_body(const char *method,
@@ -5920,7 +6143,7 @@ int st_admin_build_response_with_body(const char *method,
                                       char *out,
                                       size_t out_len)
 {
-    return st_admin_build_response_internal(method, path, NULL, body, 1, out, out_len);
+    return st_admin_build_response_internal(method, path, NULL, body, "", 1, out, out_len);
 }
 
 int st_admin_build_response(const char *method, const char *path, char *out, size_t out_len)
@@ -7037,6 +7260,271 @@ static int send_text_http_error(int fd, int status, const char *message)
         && send_all(fd, body, (size_t)body_len) == 0;
 }
 
+typedef struct {
+    int fd;
+    int include_body;
+    int started;
+    int ended;
+    int buffer_for_rewrite;
+    size_t rewrite_limit;
+    size_t response_bytes;
+    const char *client_name;
+    const char *route;
+    st_direct_http_response response;
+    char **trailer_names;
+    size_t trailer_names_len;
+} admin_direct_http_sink_state;
+
+static void direct_free_strings(char **values, size_t values_len)
+{
+    if (values == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < values_len; ++i) {
+        free(values[i]);
+    }
+    free(values);
+}
+
+static int direct_copy_strings(char *const *values, size_t values_len,
+                               char ***out, size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0;
+    if (values_len == 0U) {
+        return 0;
+    }
+    char **copy = (char **)calloc(values_len, sizeof(*copy));
+    if (copy == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < values_len; ++i) {
+        copy[i] = admin_dup_string(values[i] == NULL ? "" : values[i]);
+        if (copy[i] == NULL) {
+            direct_free_strings(copy, values_len);
+            return -1;
+        }
+    }
+    *out = copy;
+    *out_len = values_len;
+    return 0;
+}
+
+void st_direct_http_response_free(st_direct_http_response *response)
+{
+    if (response == NULL) {
+        return;
+    }
+    direct_free_strings(response->headers, response->headers_len);
+    free(response->body);
+    free(response->error);
+    memset(response, 0, sizeof(*response));
+}
+
+static int direct_valid_trailer_name(const char *name)
+{
+    if (name == NULL || *name == '\0') {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; ++p) {
+        if (!isalnum(*p) && strchr("!#$%&'*+-.^_`|~", *p) == NULL) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int direct_should_buffer_rewrite(const char *client_name,
+                                        const char *route,
+                                        char **headers,
+                                        size_t headers_len,
+                                        size_t *limit)
+{
+    const char *database_path = admin_database_path();
+    st_storage_http_route http_route;
+    long long max_body = admin_env_nonnegative_i64("TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES",
+                                                   ST_ADMIN_DEFAULT_REWRITE_BODY_BYTES);
+    if (database_path == NULL || max_body <= 0
+        || st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) != 0
+        || !http_route.enabled || !http_route.path_rewrite_enabled
+        || admin_response_rewrite_kind(headers, headers_len) == 0) {
+        return 0;
+    }
+    *limit = (size_t)max_body;
+    return 1;
+}
+
+static int direct_sink_start_chunked(admin_direct_http_sink_state *state)
+{
+    if (state->started) {
+        return 0;
+    }
+    st_admin_string_builder builder = {0};
+    int status = state->response.status_code <= 0 ? 502 : state->response.status_code;
+    int rc = admin_sb_appendf(&builder,
+                              "HTTP/1.1 %d %s\r\n"
+                              "Transfer-Encoding: chunked\r\n"
+                              "Connection: close\r\n",
+                              status, admin_reason_phrase(status));
+    for (size_t i = 0; rc == 0 && i < state->response.headers_len; ++i) {
+        const char *header = state->response.headers[i];
+        if (header != NULL && strchr(header, '\r') == NULL && strchr(header, '\n') == NULL
+            && !admin_skip_response_header(header)) {
+            rc = admin_sb_appendf(&builder, "%s\r\n", header);
+        }
+    }
+    if (rc == 0 && state->trailer_names_len > 0U) {
+        rc = admin_sb_append(&builder, "Trailer: ");
+        int written = 0;
+        for (size_t i = 0; rc == 0 && i < state->trailer_names_len; ++i) {
+            if (direct_valid_trailer_name(state->trailer_names[i])) {
+                rc = admin_sb_appendf(&builder, "%s%s", written ? ", " : "",
+                                      state->trailer_names[i]);
+                written = 1;
+            }
+        }
+        if (rc == 0) {
+            rc = admin_sb_append(&builder, "\r\n");
+        }
+    }
+    if (rc == 0) {
+        rc = admin_sb_append(&builder, "\r\n");
+    }
+    if (rc == 0) {
+        rc = send_all(state->fd, builder.data, builder.len);
+    }
+    free(builder.data);
+    if (rc == 0) {
+        state->started = 1;
+    }
+    return rc;
+}
+
+static int direct_sink_send_chunk(admin_direct_http_sink_state *state,
+                                  const uint8_t *data, size_t data_len)
+{
+    if (data_len == 0U || !state->include_body) {
+        return 0;
+    }
+    char prefix[32];
+    int prefix_len = snprintf(prefix, sizeof(prefix), "%zx\r\n", data_len);
+    return prefix_len > 0 && (size_t)prefix_len < sizeof(prefix)
+        && send_all(state->fd, prefix, (size_t)prefix_len) == 0
+        && send_all(state->fd, (const char *)data, data_len) == 0
+        && send_all(state->fd, "\r\n", 2U) == 0 ? 0 : -1;
+}
+
+static int direct_sink_append_body(st_direct_http_response *response,
+                                   const uint8_t *data, size_t data_len,
+                                   size_t limit)
+{
+    if (data_len == 0U || response->body_len >= limit) {
+        return 0;
+    }
+    size_t append = data_len;
+    if (append > limit - response->body_len) {
+        append = limit - response->body_len;
+    }
+    uint8_t *grown = (uint8_t *)realloc(response->body, response->body_len + append);
+    if (grown == NULL) {
+        return -1;
+    }
+    response->body = grown;
+    memcpy(response->body + response->body_len, data, append);
+    response->body_len += append;
+    return 0;
+}
+
+static int direct_sink_on_headers(void *ctx,
+                                  int status_code,
+                                  char *const *headers,
+                                  size_t headers_len,
+                                  char *const *trailer_names,
+                                  size_t trailer_names_len)
+{
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    if (state->started || state->response.status_code != 0 || status_code < 100 || status_code > 599
+        || direct_copy_strings(headers, headers_len,
+                               &state->response.headers, &state->response.headers_len) != 0
+        || direct_copy_strings(trailer_names, trailer_names_len,
+                               &state->trailer_names, &state->trailer_names_len) != 0) {
+        return -1;
+    }
+    state->response.status_code = status_code;
+    state->buffer_for_rewrite = trailer_names_len == 0U
+        && direct_should_buffer_rewrite(
+            state->client_name, state->route, state->response.headers,
+            state->response.headers_len, &state->rewrite_limit);
+    return state->buffer_for_rewrite ? 0 : direct_sink_start_chunked(state);
+}
+
+static int direct_sink_on_data(void *ctx, const uint8_t *data, size_t data_len)
+{
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    if (state->ended || state->response.status_code == 0
+        || data_len > SIZE_MAX - state->response_bytes) {
+        return -1;
+    }
+    state->response_bytes += data_len;
+    if (state->buffer_for_rewrite) {
+        if (state->response.body_len <= state->rewrite_limit
+            && data_len <= state->rewrite_limit - state->response.body_len) {
+            return direct_sink_append_body(&state->response, data, data_len, state->rewrite_limit);
+        }
+        if (direct_sink_start_chunked(state) != 0
+            || direct_sink_send_chunk(state, state->response.body, state->response.body_len) != 0) {
+            return -1;
+        }
+        if (state->response.body_len > 64U * 1024U) {
+            state->response.body_len = 64U * 1024U;
+        }
+        state->buffer_for_rewrite = 0;
+    }
+    if (direct_sink_append_body(&state->response, data, data_len, 64U * 1024U) != 0) {
+        return -1;
+    }
+    return direct_sink_start_chunked(state) == 0
+        ? direct_sink_send_chunk(state, data, data_len) : -1;
+}
+
+static int direct_sink_on_end(void *ctx, char *const *trailers, size_t trailers_len)
+{
+    admin_direct_http_sink_state *state = (admin_direct_http_sink_state *)ctx;
+    if (state->ended || state->response.status_code == 0) {
+        return -1;
+    }
+    if (state->buffer_for_rewrite) {
+        (void)st_admin_rewrite_direct_http_response(state->client_name, state->route, &state->response);
+        if (send_direct_http_response(state->fd, &state->response, state->include_body) < 0) {
+            return -1;
+        }
+        state->started = 1;
+        state->ended = 1;
+        return 0;
+    }
+    if (direct_sink_start_chunked(state) != 0 || send_all(state->fd, "0\r\n", 3U) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < trailers_len; ++i) {
+        const char *trailer = trailers[i];
+        const char *colon = trailer == NULL ? NULL : strchr(trailer, ':');
+        if (colon != NULL && colon != trailer && strchr(trailer, '\r') == NULL
+            && strchr(trailer, '\n') == NULL
+            && send_all(state->fd, trailer, strlen(trailer)) != 0) {
+            return -1;
+        }
+        if (colon != NULL && colon != trailer && send_all(state->fd, "\r\n", 2U) != 0) {
+            return -1;
+        }
+    }
+    if (send_all(state->fd, "\r\n", 2U) != 0) {
+        return -1;
+    }
+    state->ended = 1;
+    return 0;
+}
+
 static void admin_fd_remote_text(int fd, char out[128])
 {
     struct sockaddr_storage remote;
@@ -7125,21 +7613,23 @@ static int admin_recv_all(int fd, uint8_t *buffer, size_t len)
     return 0;
 }
 
-static int admin_validate_websocket_token(const char *path)
+static void admin_socket_peer_address(int fd, char out[INET6_ADDRSTRLEN])
 {
-    char *token = admin_query_string(path, "token");
-    if (token == NULL || *token == '\0') {
-        free(token);
-        return 0;
+    out[0] = '\0';
+    struct sockaddr_storage address;
+    socklen_t address_len = sizeof(address);
+    if (getpeername(fd, (struct sockaddr *)&address, &address_len) != 0) {
+        return;
     }
-    st_security_token_claims claims;
-    int rc = st_security_validate_local_token(token,
-                                               getenv("TUNNEL_AUTH_JWT_SECRET"),
-                                               env_text("TUNNEL_AUTH_TENANT_ID", "default"),
-                                               env_text("TUNNEL_AUTH_USERNAME", "admin"),
-                                               &claims);
-    free(token);
-    return rc == 0;
+    const void *source = NULL;
+    if (address.ss_family == AF_INET) {
+        source = &((const struct sockaddr_in *)&address)->sin_addr;
+    } else if (address.ss_family == AF_INET6) {
+        source = &((const struct sockaddr_in6 *)&address)->sin6_addr;
+    }
+    if (source != NULL) {
+        (void)inet_ntop(address.ss_family, source, out, INET6_ADDRSTRLEN);
+    }
 }
 
 static char *admin_websocket_accept_key(const char *client_key)
@@ -7161,11 +7651,16 @@ static char *admin_websocket_accept_key(const char *client_key)
     return admin_base64_encode(digest, sizeof(digest));
 }
 
-static int admin_send_websocket_frame(int fd, uint8_t opcode, const uint8_t *payload, size_t payload_len)
+static int admin_send_websocket_frame_ex(int fd,
+                                         int fin,
+                                         uint8_t rsv,
+                                         uint8_t opcode,
+                                         const uint8_t *payload,
+                                         size_t payload_len)
 {
     uint8_t header[10];
     size_t header_len = 2U;
-    header[0] = (uint8_t)(0x80U | (opcode & 0x0fU));
+    header[0] = (uint8_t)((fin ? 0x80U : 0U) | ((rsv & 0x07U) << 4U) | (opcode & 0x0fU));
     if (payload_len <= 125U) {
         header[1] = (uint8_t)payload_len;
     } else if (payload_len <= 0xffffU) {
@@ -7189,21 +7684,175 @@ static int admin_send_websocket_frame(int fd, uint8_t opcode, const uint8_t *pay
     return 0;
 }
 
+static int admin_send_websocket_frame(int fd, uint8_t opcode, const uint8_t *payload, size_t payload_len)
+{
+    return admin_send_websocket_frame_ex(fd, 1, 0U, opcode, payload, payload_len);
+}
+
+static uint16_t admin_read_u16_be(const uint8_t *value)
+{
+    return (uint16_t)(((uint16_t)value[0] << 8U) | value[1]);
+}
+
+static uint32_t admin_read_u32_be(const uint8_t *value)
+{
+    return ((uint32_t)value[0] << 24U) | ((uint32_t)value[1] << 16U)
+        | ((uint32_t)value[2] << 8U) | (uint32_t)value[3];
+}
+
+static void admin_write_u16_be(uint8_t *value, uint16_t number)
+{
+    value[0] = (uint8_t)(number >> 8U);
+    value[1] = (uint8_t)number;
+}
+
+static void admin_write_u32_be(uint8_t *value, uint32_t number)
+{
+    value[0] = (uint8_t)(number >> 24U);
+    value[1] = (uint8_t)(number >> 16U);
+    value[2] = (uint8_t)(number >> 8U);
+    value[3] = (uint8_t)number;
+}
+
+static int admin_sws2_validate(uint8_t opcode,
+                               int fin,
+                               uint8_t rsv,
+                               uint16_t close_code,
+                               size_t payload_len)
+{
+    if (opcode != 0x0U && opcode != 0x1U && opcode != 0x2U
+        && opcode != 0x8U && opcode != 0x9U && opcode != 0xAU) {
+        return -1;
+    }
+    if (rsv > 7U || payload_len > ST_ADMIN_SWS2_MAX_PAYLOAD) {
+        return -1;
+    }
+    if (opcode >= 0x8U && (!fin || rsv != 0U || payload_len > 125U)) {
+        return -1;
+    }
+    if (opcode == 0x8U) {
+        if (payload_len > 123U || (close_code != 0U && (close_code < 1000U || close_code >= 5000U))
+            || (close_code == 0U && payload_len != 0U)) {
+            return -1;
+        }
+    } else if (close_code != 0U) {
+        return -1;
+    }
+    return 0;
+}
+
+static uint8_t *admin_sws2_encode(uint8_t opcode,
+                                  int fin,
+                                  uint8_t rsv,
+                                  uint16_t close_code,
+                                  const uint8_t *payload,
+                                  size_t payload_len,
+                                  size_t *encoded_len)
+{
+    if (encoded_len == NULL
+        || admin_sws2_validate(opcode, fin, rsv, close_code, payload_len) != 0) {
+        return NULL;
+    }
+    uint8_t *encoded = (uint8_t *)malloc(ST_ADMIN_SWS2_HEADER_BYTES + payload_len);
+    if (encoded == NULL) {
+        return NULL;
+    }
+    memcpy(encoded, "SWS2", 4U);
+    encoded[4] = opcode;
+    encoded[5] = (uint8_t)((fin ? 1U : 0U) | ((rsv & 7U) << 1U));
+    admin_write_u16_be(encoded + 6U, close_code);
+    admin_write_u32_be(encoded + 8U, (uint32_t)payload_len);
+    if (payload_len > 0U && payload != NULL) {
+        memcpy(encoded + ST_ADMIN_SWS2_HEADER_BYTES, payload, payload_len);
+    }
+    *encoded_len = ST_ADMIN_SWS2_HEADER_BYTES + payload_len;
+    return encoded;
+}
+
+static int admin_direct_ws_consume_send_credit(st_admin_direct_ws_stream *stream, size_t bytes)
+{
+    if (stream == NULL || bytes == 0U || bytes > ST_ADMIN_STREAM_MAX_WINDOW) {
+        return -1;
+    }
+    pthread_mutex_lock(&stream->flow_lock);
+    while (!stream->flow_closed && stream->send_credit < bytes) {
+        pthread_cond_wait(&stream->flow_cond, &stream->flow_lock);
+    }
+    if (stream->flow_closed) {
+        pthread_mutex_unlock(&stream->flow_lock);
+        return -1;
+    }
+    stream->send_credit -= bytes;
+    pthread_mutex_unlock(&stream->flow_lock);
+    return 0;
+}
+
 int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
                                            const uint8_t *payload,
                                            size_t payload_len)
 {
-    if (stream == NULL || payload == NULL || payload_len == 0) {
+    if (stream == NULL || payload == NULL || payload_len < ST_ADMIN_SWS2_HEADER_BYTES
+        || memcmp(payload, "SWS2", 4U) != 0) {
         return -1;
     }
-    uint8_t frame_type = payload[0];
-    uint8_t opcode = frame_type == 0x01U ? 0x1U : 0x2U;
+    uint8_t opcode = payload[4];
+    uint8_t flags = payload[5];
+    if ((flags & 0xf0U) != 0U) {
+        return -1;
+    }
+    int fin = (flags & 1U) != 0U;
+    uint8_t rsv = (uint8_t)((flags >> 1U) & 7U);
+    uint16_t close_code = admin_read_u16_be(payload + 6U);
+    uint32_t data_len = admin_read_u32_be(payload + 8U);
+    if (data_len > ST_ADMIN_SWS2_MAX_PAYLOAD
+        || (size_t)data_len != payload_len - ST_ADMIN_SWS2_HEADER_BYTES
+        || admin_sws2_validate(opcode, fin, rsv, close_code, data_len) != 0) {
+        return -1;
+    }
+    const uint8_t *data = payload + ST_ADMIN_SWS2_HEADER_BYTES;
+    uint8_t close_payload[125];
+    if (opcode == 0x8U && close_code != 0U) {
+        admin_write_u16_be(close_payload, close_code);
+        if (data_len > 0U) {
+            memcpy(close_payload + 2U, data, data_len);
+        }
+        data = close_payload;
+        data_len += 2U;
+    }
     pthread_mutex_lock(&stream->send_lock);
-    int rc = stream->closed
+    int invalid_sequence = 0;
+    if (opcode == 0x0U) {
+        invalid_sequence = stream->outbound_fragment_opcode == 0U;
+        if (fin) {
+            stream->outbound_fragment_opcode = 0U;
+        }
+    } else if (opcode == 0x1U || opcode == 0x2U) {
+        invalid_sequence = stream->outbound_fragment_opcode != 0U;
+        if (!fin) {
+            stream->outbound_fragment_opcode = opcode;
+        }
+    }
+    int rc = stream->closed || invalid_sequence
         ? -1
-        : admin_send_websocket_frame(stream->fd, opcode, payload + 1U, payload_len - 1U);
+        : admin_send_websocket_frame_ex(stream->fd, fin, rsv, opcode, data, data_len);
     pthread_mutex_unlock(&stream->send_lock);
     return rc;
+}
+
+int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32_t credit)
+{
+    if (stream == NULL || credit == 0U) {
+        return -1;
+    }
+    pthread_mutex_lock(&stream->flow_lock);
+    if (stream->flow_closed || stream->send_credit > ST_ADMIN_STREAM_MAX_WINDOW - credit) {
+        pthread_mutex_unlock(&stream->flow_lock);
+        return -1;
+    }
+    stream->send_credit += credit;
+    pthread_cond_broadcast(&stream->flow_cond);
+    pthread_mutex_unlock(&stream->flow_lock);
+    return 0;
 }
 
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream)
@@ -7217,15 +7866,23 @@ void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream)
         shutdown(stream->fd, SHUT_RDWR);
     }
     pthread_mutex_unlock(&stream->send_lock);
+    pthread_mutex_lock(&stream->flow_lock);
+    stream->flow_closed = 1;
+    pthread_cond_broadcast(&stream->flow_cond);
+    pthread_mutex_unlock(&stream->flow_lock);
 }
 
-static st_admin_ws_client *admin_ws_add(int fd)
+static st_admin_ws_client *admin_ws_add(int fd, const st_admin_context *context)
 {
     st_admin_ws_client *client = (st_admin_ws_client *)calloc(1, sizeof(*client));
-    if (client == NULL) {
+    if (client == NULL || context == NULL || !context->authenticated) {
+        free(client);
         return NULL;
     }
     client->fd = fd;
+    snprintf(client->username, sizeof(client->username), "%s", context->username);
+    snprintf(client->tenant_id, sizeof(client->tenant_id), "%s", context->tenant_id);
+    client->admin = context->admin;
     pthread_mutex_init(&client->send_lock, NULL);
     pthread_mutex_lock(&admin_ws_lock);
     client->next = admin_ws_clients;
@@ -7337,15 +7994,27 @@ static int handle_connection_websocket_request(int fd, const char *method, const
         send_text_http_error(fd, 426, "websocket upgrade required");
         return 1;
     }
-    if (!admin_validate_websocket_token(path)) {
+    const char *query = strchr(path, '?');
+    char *ticket = NULL;
+    if (query != NULL && strncmp(query + 1, "ticket=", 7U) == 0 && strchr(query + 1, '&') == NULL) {
+        ticket = admin_query_string(path, "ticket");
+    }
+    char remote_address[INET6_ADDRSTRLEN];
+    admin_socket_peer_address(fd, remote_address);
+    st_admin_context context;
+    int ticket_valid = ticket != NULL
+        && *ticket != '\0'
+        && admin_consume_websocket_ticket(ticket, remote_address, &context) == 0;
+    free(ticket);
+    if (!ticket_valid) {
         char header[256];
-        const char body[] = "{\"error\":\"invalid token\"}";
+        const char body[] = "{\"error\":\"invalid or consumed websocket ticket\"}";
         int header_len = snprintf(header,
                                   sizeof(header),
                                   "HTTP/1.1 403 Forbidden\r\n"
                                   "Content-Type: application/json\r\n"
                                   "Cache-Control: no-store\r\n"
-                                  "X-Auth-Reason: invalid token\r\n"
+                                  "X-Auth-Reason: invalid ticket\r\n"
                                   "Content-Length: %zu\r\n"
                                   "\r\n",
                                   sizeof(body) - 1U);
@@ -7381,7 +8050,7 @@ static int handle_connection_websocket_request(int fd, const char *method, const
         || send_all(fd, response, (size_t)response_len) != 0) {
         return 1;
     }
-    st_admin_ws_client *client = admin_ws_add(fd);
+    st_admin_ws_client *client = admin_ws_add(fd, &context);
     if (client == NULL) {
         uint8_t close_payload[2] = {0x03U, 0xf3U};
         admin_send_websocket_frame(fd, 0x8U, close_payload, sizeof(close_payload));
@@ -7423,8 +8092,25 @@ void st_admin_broadcast_connection_event(const char *tenant_id,
         free(builder.data);
         return;
     }
+    st_storage_client owner;
+    int owner_loaded = 0;
+    const char *event_tenant = tenant_id == NULL ? "" : tenant_id;
+    const char *database_path = admin_database_path();
+    if (connection->client_id > 0
+        && database_path != NULL
+        && st_storage_get_client(database_path, connection->client_id, &owner) == 0
+        && strcmp(owner.tenant_id, event_tenant) == 0) {
+        owner_loaded = 1;
+    }
     pthread_mutex_lock(&admin_ws_lock);
     for (st_admin_ws_client *client = admin_ws_clients; client != NULL; client = client->next) {
+        if (strcmp(client->tenant_id, event_tenant) != 0) {
+            continue;
+        }
+        if (!client->admin
+            && (!owner_loaded || strcmp(client->username, owner.owner_username) != 0)) {
+            continue;
+        }
         if (admin_ws_send_frame(client, 0x1U, (const uint8_t *)builder.data, builder.len) != 0) {
             shutdown(client->fd, SHUT_RDWR);
         }
@@ -7474,6 +8160,8 @@ static void admin_direct_ws_destroy(st_admin_direct_ws_stream *stream)
     if (stream == NULL) {
         return;
     }
+    pthread_cond_destroy(&stream->flow_cond);
+    pthread_mutex_destroy(&stream->flow_lock);
     pthread_mutex_destroy(&stream->send_lock);
     free(stream);
 }
@@ -7482,13 +8170,21 @@ static void admin_drain_direct_websocket(st_admin_server *server,
                                          st_admin_direct_ws_stream *stream,
                                          const char *channel_id)
 {
+    uint8_t incoming_fragment_opcode = 0U;
     for (;;) {
         uint8_t header[2];
         if (admin_recv_all(stream->fd, header, sizeof(header)) != 0) {
             return;
         }
+        int fin = (header[0] & 0x80U) != 0U;
+        uint8_t rsv = (uint8_t)((header[0] >> 4U) & 0x07U);
         uint8_t opcode = header[0] & 0x0fU;
         int masked = (header[1] & 0x80U) != 0;
+        if (!masked) {
+            uint8_t close_payload[2] = {0x03U, 0xeaU};
+            admin_direct_ws_send_frame(stream, 0x8U, close_payload, sizeof(close_payload));
+            return;
+        }
         uint64_t payload_len = header[1] & 0x7fU;
         if (payload_len == 126U) {
             uint8_t extended[2];
@@ -7532,35 +8228,82 @@ static void admin_drain_direct_websocket(st_admin_server *server,
             }
         }
 
-        if (opcode == 0x8U) {
-            admin_direct_ws_send_frame(stream, 0x8U, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
+        if (opcode != 0x0U && opcode != 0x1U && opcode != 0x2U
+            && opcode != 0x8U && opcode != 0x9U && opcode != 0xAU) {
             free(payload);
             return;
         }
-        if (opcode == 0x9U) {
-            admin_direct_ws_send_frame(stream, 0xAU, payload, payload_len <= 125U ? (size_t)payload_len : 0U);
+        if (opcode >= 0x8U && (!fin || rsv != 0U || payload_len > 125U)) {
             free(payload);
-            continue;
+            return;
         }
-        if (opcode == 0x1U || opcode == 0x2U) {
-            uint8_t *framed = (uint8_t *)malloc((size_t)payload_len + 1U);
-            if (framed == NULL) {
+        if (opcode == 0x0U) {
+            if (incoming_fragment_opcode == 0U) {
                 free(payload);
                 return;
             }
-            framed[0] = opcode == 0x1U ? 0x01U : 0x02U;
-            if (payload_len > 0) {
-                memcpy(framed + 1U, payload, (size_t)payload_len);
+            if (fin) {
+                incoming_fragment_opcode = 0U;
             }
-            int rc = server->direct_ws_data == NULL
-                ? -1
-                : server->direct_ws_data(server->direct_ws_ctx, channel_id, framed, (size_t)payload_len + 1U);
-            free(framed);
-            free(payload);
-            if (rc != 0) {
+        } else if (opcode == 0x1U || opcode == 0x2U) {
+            if (incoming_fragment_opcode != 0U) {
+                free(payload);
                 return;
             }
-            continue;
+            if (!fin) {
+                incoming_fragment_opcode = opcode;
+            }
+        }
+
+        uint16_t close_code = 0U;
+        const uint8_t *frame_payload = payload;
+        size_t frame_payload_len = (size_t)payload_len;
+        if (opcode == 0x8U) {
+            if (payload_len == 1U) {
+                free(payload);
+                return;
+            }
+            if (payload_len >= 2U) {
+                close_code = admin_read_u16_be(payload);
+                frame_payload = payload + 2U;
+                frame_payload_len -= 2U;
+            }
+        }
+
+        size_t offset = 0U;
+        int first = 1;
+        do {
+            size_t chunk_len = frame_payload_len - offset;
+            if (chunk_len > ST_ADMIN_SWS2_MAX_PAYLOAD) {
+                chunk_len = ST_ADMIN_SWS2_MAX_PAYLOAD;
+            }
+            int last = offset + chunk_len == frame_payload_len;
+            size_t framed_len = 0U;
+            uint8_t *framed = admin_sws2_encode(
+                first ? opcode : 0x0U,
+                fin && last,
+                first ? rsv : 0U,
+                first ? close_code : 0U,
+                chunk_len == 0U ? NULL : frame_payload + offset,
+                chunk_len,
+                &framed_len);
+            if (framed == NULL
+                || admin_direct_ws_consume_send_credit(stream, framed_len) != 0
+                || server->direct_ws_data == NULL
+                || server->direct_ws_data(server->direct_ws_ctx, channel_id, framed, framed_len) != 0) {
+                free(framed);
+                free(payload);
+                return;
+            }
+            free(framed);
+            offset += chunk_len;
+            first = 0;
+        } while (offset < frame_payload_len);
+
+        if (opcode == 0x8U) {
+            admin_direct_ws_send_frame(stream, 0x8U, payload, (size_t)payload_len);
+            free(payload);
+            return;
         }
         free(payload);
     }
@@ -7659,7 +8402,10 @@ static int handle_direct_http_websocket_request(st_admin_server *server,
         return 1;
     }
     stream->fd = fd;
+    stream->send_credit = ST_ADMIN_STREAM_INITIAL_WINDOW;
     pthread_mutex_init(&stream->send_lock, NULL);
+    pthread_mutex_init(&stream->flow_lock, NULL);
+    pthread_cond_init(&stream->flow_cond, NULL);
 
     char channel_id[37];
     admin_generate_request_id(channel_id);
@@ -7784,8 +8530,6 @@ static int handle_direct_http_request(st_admin_server *server,
         return 1;
     }
 
-    char request_id[37];
-    admin_generate_request_id(request_id);
     char **headers = NULL;
     size_t headers_len = 0;
     if (admin_collect_headers(raw_request, &headers, &headers_len) != 0) {
@@ -7796,58 +8540,52 @@ static int handle_direct_http_request(st_admin_server *server,
         send_text_http_error(fd, 500, "direct http header capture failed");
         return 1;
     }
-    uint8_t *body_copy = NULL;
-    if (body_len > 0) {
-        body_copy = (uint8_t *)malloc(body_len);
-        if (body_copy == NULL) {
-            free_header_array(headers, headers_len);
-            free(client_name);
-            free(route);
-            free(relative_path);
-            free(raw_query);
-            send_text_http_error(fd, 500, "direct http body capture failed");
-            return 1;
-        }
-        memcpy(body_copy, body, body_len);
-    }
-
     st_direct_http_request direct = {
-        .request_id = request_id,
         .request_method = (char *)method,
         .route = route,
         .relative_path = relative_path,
         .raw_query = raw_query,
         .headers = headers,
         .headers_len = headers_len,
-        .body = body_copy,
+        .body = body,
         .body_len = body_len
     };
-    st_direct_http_response response;
-    memset(&response, 0, sizeof(response));
+    admin_direct_http_sink_state sink_state = {
+        .fd = fd,
+        .include_body = admin_ascii_casecmp(method, "HEAD") != 0,
+        .client_name = client_name,
+        .route = route
+    };
+    st_admin_direct_http_sink sink = {
+        .ctx = &sink_state,
+        .on_headers = direct_sink_on_headers,
+        .on_data = direct_sink_on_data,
+        .on_end = direct_sink_on_end
+    };
     char remote_address[128];
     admin_fd_remote_text(fd, remote_address);
     long long started_ms = admin_now_ms();
-    int rc = server->direct_http_forward(server->direct_http_ctx, client_name, &direct, &response);
+    int rc = server->direct_http_forward(server->direct_http_ctx, client_name, &direct, &sink);
     long long elapsed_ms = admin_now_ms() - started_ms;
     if (elapsed_ms < 0) {
         elapsed_ms = 0;
     }
     if (rc == 0) {
-        (void)st_admin_rewrite_direct_http_response(client_name, route, &response);
-        record_direct_http_traffic(client_name, route, (long long)body_len, (long long)response.body_len);
-        record_direct_http_exchange(client_name, route, &direct, &response, remote_address, elapsed_ms);
-        send_direct_http_response(fd, &response, admin_ascii_casecmp(method, "HEAD") != 0);
-    } else if (rc == -2) {
+        record_direct_http_traffic(client_name, route, (long long)body_len,
+                                   (long long)sink_state.response_bytes);
+        record_direct_http_exchange(client_name, route, &direct, &sink_state.response,
+                                    sink_state.response_bytes, remote_address, elapsed_ms);
+    } else if (!sink_state.started && rc == -2) {
         send_text_http_error(fd, 504, "direct http response timeout");
-    } else if (rc == -3) {
+    } else if (!sink_state.started && rc == -3) {
         send_text_http_error(fd, 404, "direct http route is not configured");
-    } else {
+    } else if (!sink_state.started) {
         send_text_http_error(fd, 502, "direct http target client is offline");
     }
 
-    st_direct_http_response_free(&response);
+    st_direct_http_response_free(&sink_state.response);
+    direct_free_strings(sink_state.trailer_names, sink_state.trailer_names_len);
     free_header_array(headers, headers_len);
-    free(body_copy);
     free(client_name);
     free(route);
     free(relative_path);
@@ -7992,13 +8730,17 @@ static void handle_client(st_admin_server *server, int fd)
         return;
     }
     char *authorization = admin_extract_header_value(request, "Authorization");
+    char remote_address[INET6_ADDRSTRLEN];
+    admin_socket_peer_address(fd, remote_address);
     char response[32768];
-    int response_len = st_admin_build_response_with_auth(method,
-                                                         path,
-                                                         authorization,
-                                                         body,
-                                                         response,
-                                                         sizeof(response));
+    int response_len = st_admin_build_response_internal(method,
+                                                        path,
+                                                        authorization,
+                                                        body,
+                                                        remote_address,
+                                                        0,
+                                                        response,
+                                                        sizeof(response));
     if (response_len > 0) {
         send_all(fd, response, (size_t)response_len);
     }

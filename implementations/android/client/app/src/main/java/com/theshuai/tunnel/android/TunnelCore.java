@@ -22,7 +22,6 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import javax.net.SocketFactory;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
@@ -36,6 +35,8 @@ import java.net.NetworkInterface;
 import java.net.Socket;
 import java.net.URI;
 import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -53,6 +54,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -60,12 +62,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.zip.DataFormatException;
-import java.util.zip.Deflater;
-import java.util.zip.Inflater;
 
 public final class TunnelCore {
     static final int CONTROL_READ_IDLE_TIMEOUT_MILLIS = 60_000;
+    static final String CONNECTION_ROLE_CONTROL = "control";
+    static final String CONNECTION_ROLE_DATA = "data";
 
     private TunnelCore() {
     }
@@ -809,13 +810,17 @@ public final class TunnelCore {
         private final PeerMeshEngine peerMeshEngine;
         private final SessionRefresher sessionRefresher;
         private final Object sendLock = new Object();
+        private final Object dataSendLock = new Object();
         private final Object configurationLock = new Object();
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
         private final AtomicLong lastWriteAtMillis = new AtomicLong(0L);
+        private final AtomicLong dataLastWriteAtMillis = new AtomicLong(0L);
         private final Set<Integer> registeredPorts = new HashSet<>();
-        private final ConcurrentHashMap<String, LocalTunnel> localTunnels = new ConcurrentHashMap<>();
-        private final ConcurrentHashMap<String, LocalWebSocketTunnel> localWebSockets = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Integer, LocalTunnel> localTunnels = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Integer, LocalWebSocketTunnel> localWebSockets = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Integer, HttpStreamForwarder> httpStreams = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Integer, StreamSendWindow> sendWindows = new ConcurrentHashMap<>();
         private final ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread thread = new Thread(r, "shuai-tunnel-heartbeat");
             thread.setDaemon(true);
@@ -829,8 +834,11 @@ public final class TunnelCore {
         private volatile Socket socket;
         private volatile InputStream input;
         private volatile OutputStream output;
-        private volatile boolean httpRoutesReported;
+        private volatile Socket dataSocket;
+        private volatile InputStream dataInput;
+        private volatile OutputStream dataOutput;
         private volatile boolean loginSucceeded;
+        private volatile boolean dataLoginSucceeded;
         private volatile AppMessageListener appMessageListener;
         private volatile ControlExitAction exitAction = ControlExitAction.RETRY_WITH_BACKOFF;
         private volatile String exitReason = "control channel closed";
@@ -871,11 +879,12 @@ public final class TunnelCore {
             s.connect(new InetSocketAddress(session.nettyHost, session.nettyPort), 5000);
             input = s.getInputStream();
             output = s.getOutputStream();
-            send(Packet.loginRequest(session.clientName, session.clientSessionId, session.accessToken));
+            send(Packet.loginRequest(session.clientName, session.clientSessionId, session.accessToken,
+                    CONNECTION_ROLE_CONTROL));
             heartbeat.scheduleAtFixedRate(() -> {
                 try {
                     if (running.get() && !closed.get()) {
-                        sendHeartbeatIfIdle();
+                        sendHeartbeatsIfIdle();
                     }
                 } catch (Exception ignored) {
                     closeQuietly(this);
@@ -883,7 +892,13 @@ public final class TunnelCore {
             }, 5, 5, TimeUnit.SECONDS);
 
             while (running.get()) {
-                Packet packet = PacketCodec.read(input);
+                int frameLimit = loginSucceeded
+                        ? PacketCodec.MAX_FRAME_SIZE
+                        : PacketCodec.PRE_AUTH_MAX_FRAME_SIZE;
+                Packet packet = PacketCodec.read(input, frameLimit);
+                if (!loginSucceeded && packet.command != Command.LOGIN_RESPONSE) {
+                    throw new IOException("only LOGIN_RESPONSE is allowed before authentication");
+                }
                 handle(packet);
             }
         }
@@ -893,12 +908,12 @@ public final class TunnelCore {
                 case Command.LOGIN_RESPONSE:
                     LoginResponse login = (LoginResponse) packet;
                     if (login.success) {
+                        connectData();
                         loginSucceeded = true;
-                        status.publish("Connected", login.clientName, true);
+                        status.publish("Connected", login.clientName + " (control + data)", true);
                         synchronized (configurationLock) {
                             peerMeshEngine.startOrUpdate(session.peerMesh);
                             registerTunnels();
-                            reportHttpRoutes();
                         }
                         scheduleTokenRefresh();
                     } else {
@@ -922,15 +937,57 @@ public final class TunnelCore {
                     handleMessage((MessageResponse) packet);
                     break;
                 case Command.NAT_MESSAGE:
-                    handleNat((NatMessage) packet);
-                    break;
-                case Command.DIRECT_HTTP_REQUEST:
-                    handleDirectHttp((DirectHttpRequest) packet);
-                    break;
+                    throw new IOException("NAT packet received on control connection");
                 case Command.HEARTBEAT_RESPONSE:
                     break;
                 default:
                     break;
+            }
+        }
+
+        private void connectData() throws Exception {
+            Socket data = new Socket();
+            dataSocket = data;
+            protect(data);
+            data.setTcpNoDelay(true);
+            data.setKeepAlive(true);
+            data.setSoTimeout(CONTROL_READ_IDLE_TIMEOUT_MILLIS);
+            data.connect(new InetSocketAddress(session.nettyHost, session.nettyPort), 5000);
+            dataInput = data.getInputStream();
+            dataOutput = data.getOutputStream();
+            sendData(Packet.loginRequest(session.clientName, session.clientSessionId, session.accessToken,
+                    CONNECTION_ROLE_DATA));
+            Packet response = PacketCodec.read(dataInput, PacketCodec.PRE_AUTH_MAX_FRAME_SIZE);
+            if (!(response instanceof LoginResponse)) {
+                throw new IOException("only LOGIN_RESPONSE is allowed before data authentication");
+            }
+            LoginResponse login = (LoginResponse) response;
+            if (!login.success) {
+                throw new IOException("data login rejected: " + firstText(login.reason, "login rejected"));
+            }
+            dataLoginSucceeded = true;
+            ioPool.submit(this::readDataLoop);
+        }
+
+        private void readDataLoop() {
+            try {
+                while (running.get() && !closed.get()) {
+                    Packet packet = PacketCodec.read(dataInput, PacketCodec.MAX_FRAME_SIZE);
+                    if (packet.command == Command.NAT_MESSAGE) {
+                        handleNat((NatMessage) packet);
+                    } else if (packet.command == Command.HEARTBEAT_RESPONSE) {
+                        // Reader activity is sufficient.
+                    } else if (packet.command == Command.LOGOUT_REQUEST) {
+                        throw new IOException("server requested data logout");
+                    } else {
+                        throw new IOException("packet is not allowed on data connection: " + packet.command);
+                    }
+                }
+            } catch (Throwable error) {
+                if (!closed.get()) {
+                    status.publish("Data channel closed", message(error), true);
+                    closeQuietly(this);
+                }
             }
         }
 
@@ -939,8 +996,6 @@ public final class TunnelCore {
                 synchronized (configurationLock) {
                     session.applyRuntimeJson(packet.message);
                     applyTunnels();
-                    httpRoutesReported = false;
-                    reportHttpRoutes();
                     updateVpn();
                 }
                 status.publish("Routes updated",
@@ -1034,10 +1089,18 @@ public final class TunnelCore {
                 }
                 return;
             }
-            if (packet.type == NatMessageType.CONNECTED) {
+            if (packet.type == NatMessageType.OPEN) {
+                StreamSendWindow previousWindow = sendWindows.put(packet.streamId, new StreamSendWindow());
+                if (previousWindow != null) {
+                    previousWindow.close();
+                }
                 String source = asString(packet.meta.get("source"));
+                if ("http".equals(source)) {
+                    openHttpStream(packet.streamId, packet.meta);
+                    return;
+                }
                 if ("ws".equals(source)) {
-                    openWebSocket(packet.meta);
+                    openWebSocket(packet.streamId, packet.meta);
                     return;
                 }
                 Integer port = asInt(packet.meta.get("port"));
@@ -1051,48 +1114,91 @@ public final class TunnelCore {
                             true);
                     return;
                 }
-                LocalTunnel tunnel = new LocalTunnel(channelId, endpoint, this, ioPool);
-                localTunnels.put(channelId, tunnel);
+                LocalTunnel tunnel = new LocalTunnel(packet.streamId, endpoint, this, ioPool);
+                localTunnels.put(packet.streamId, tunnel);
                 tunnel.start();
                 return;
             }
             if (packet.type == NatMessageType.DATA) {
-                String channelId = asString(packet.meta.get("channelId"));
-                LocalWebSocketTunnel webSocket = channelId == null ? null : localWebSockets.get(channelId);
-                if (webSocket != null) {
-                    webSocket.write(packet.data);
+                HttpStreamForwarder http = httpStreams.get(packet.streamId);
+                if (http != null) {
+                    http.onRequestData(packet.data);
                     return;
                 }
-                LocalTunnel tunnel = channelId == null ? null : localTunnels.get(channelId);
+                LocalWebSocketTunnel webSocket = localWebSockets.get(packet.streamId);
+                if (webSocket != null) {
+                    webSocket.write(packet.data);
+                    sendWindowUpdate(packet.streamId, packet.data == null ? 0 : packet.data.length);
+                    if ((packet.flags & NatMessage.FLAG_END_STREAM) != 0) {
+                        webSocket.closeFromRemote();
+                    }
+                    return;
+                }
+                LocalTunnel tunnel = localTunnels.get(packet.streamId);
                 if (tunnel != null) {
                     tunnel.write(packet.data);
+                    sendWindowUpdate(packet.streamId, packet.data == null ? 0 : packet.data.length);
+                    if ((packet.flags & NatMessage.FLAG_END_STREAM) != 0) {
+                        tunnel.closeFromRemote();
+                    }
                 }
                 return;
             }
-            if (packet.type == NatMessageType.DISCONNECTED) {
-                String channelId = asString(packet.meta.get("channelId"));
-                LocalWebSocketTunnel webSocket = channelId == null ? null : localWebSockets.remove(channelId);
+            if (packet.type == NatMessageType.FIN) {
+                HttpStreamForwarder http = httpStreams.get(packet.streamId);
+                if (http != null) {
+                    http.onRequestEnd(packet.meta);
+                    return;
+                }
+            }
+            if (packet.type == NatMessageType.RST) {
+                HttpStreamForwarder http = httpStreams.remove(packet.streamId);
+                if (http != null) {
+                    StreamSendWindow window = sendWindows.remove(packet.streamId);
+                    if (window != null) {
+                        window.close();
+                    }
+                    http.closeFromControl();
+                    return;
+                }
+            }
+            if (packet.type == NatMessageType.FIN || packet.type == NatMessageType.RST) {
+                StreamSendWindow window = sendWindows.remove(packet.streamId);
+                if (window != null) {
+                    window.close();
+                }
+                LocalWebSocketTunnel webSocket = localWebSockets.remove(packet.streamId);
                 if (webSocket != null) {
                     webSocket.closeFromRemote();
                     return;
                 }
-                LocalTunnel tunnel = channelId == null ? null : localTunnels.remove(channelId);
+                LocalTunnel tunnel = localTunnels.remove(packet.streamId);
                 if (tunnel != null) {
                     tunnel.closeFromRemote();
+                }
+                return;
+            }
+            if (packet.type == NatMessageType.WINDOW_UPDATE) {
+                StreamSendWindow window = sendWindows.get(packet.streamId);
+                if (window != null && !window.add(packet.value)) {
+                    throw new IOException("invalid WINDOW_UPDATE credit");
                 }
             }
         }
 
-        private void handleDirectHttp(DirectHttpRequest packet) {
-            Map<String, String> routes = session.routeMap();
-            ioPool.submit(() -> {
-                DirectHttpResponse response = DirectHttpForwarder.forward(packet, routes);
-                try {
-                    send(response);
-                } catch (Exception e) {
-                    status.publish("HTTP response failed", message(e), true);
-                }
-            });
+        private void openHttpStream(int streamId, Map<String, Object> metadata) throws Exception {
+            if (!"request".equals(asString(metadata.get("phase")))) {
+                sendReset(streamId, 10, "invalid HTTP stream phase");
+                return;
+            }
+            HttpStreamForwarder stream = new HttpStreamForwarder(
+                    streamId, metadata, session.routeMap(), this, ioPool);
+            HttpStreamForwarder previous = httpStreams.putIfAbsent(streamId, stream);
+            if (previous != null) {
+                sendReset(streamId, 11, "duplicate HTTP stream");
+                return;
+            }
+            stream.start();
         }
 
         private void registerTunnels() throws Exception {
@@ -1120,24 +1226,6 @@ public final class TunnelCore {
                 }
             }
             registerTunnels();
-        }
-
-        private void reportHttpRoutes() throws Exception {
-            if (httpRoutesReported) {
-                return;
-            }
-            httpRoutesReported = true;
-            List<Map<String, String>> routes = new ArrayList<>();
-            for (HttpRouteEndpoint endpoint : session.httpRoutes) {
-                Map<String, String> item = new LinkedHashMap<>();
-                item.put("route", endpoint.route);
-                item.put("targetBaseUrl", endpoint.targetBaseUrl == null ? "" : endpoint.targetBaseUrl);
-                routes.add(item);
-            }
-            Map<String, Object> meta = new LinkedHashMap<>();
-            meta.put("clientName", session.clientName);
-            meta.put("routes", routes);
-            send(Packet.nat(NatMessageType.HTTP_ROUTES_REPORT, meta, null));
         }
 
         private void scheduleTokenRefresh() {
@@ -1186,8 +1274,6 @@ public final class TunnelCore {
                 synchronized (configurationLock) {
                     session.applyRefresh(refreshed);
                     applyTunnels();
-                    httpRoutesReported = false;
-                    reportHttpRoutes();
                     peerMeshEngine.startOrUpdate(session.peerMesh);
                 }
                 succeeded = true;
@@ -1205,17 +1291,70 @@ public final class TunnelCore {
             }
         }
 
-        void sendNatData(String channelId, byte[] data) throws Exception {
-            Map<String, Object> meta = new LinkedHashMap<>();
-            meta.put("channelId", channelId);
-            send(Packet.nat(NatMessageType.DATA, meta, data));
+        void sendNatData(int streamId, byte[] data) throws Exception {
+            consumeSendCredit(streamId, data == null ? 0 : data.length);
+            send(Packet.stream(NatMessageType.DATA, streamId, 0, data));
         }
 
-        void sendWsData(String channelId, byte[] data) throws Exception {
-            Map<String, Object> meta = new LinkedHashMap<>();
-            meta.put("channelId", channelId);
-            meta.put("source", "ws");
-            send(Packet.nat(NatMessageType.DATA, meta, data));
+        void sendWsData(int streamId, byte[] data) throws Exception {
+            consumeSendCredit(streamId, data == null ? 0 : data.length);
+            send(Packet.stream(NatMessageType.DATA, streamId, 0, data));
+        }
+
+        void sendHttpHead(int streamId, int statusCode, List<String> headers,
+                          List<String> trailerNames) throws Exception {
+            NatMessage head = Packet.stream(NatMessageType.OPEN, streamId, 0, null);
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("source", "http");
+            metadata.put("phase", "response");
+            metadata.put("statusCode", statusCode);
+            metadata.put("headers", headers);
+            metadata.put("trailerNames", trailerNames);
+            head.meta = metadata;
+            send(head);
+        }
+
+        void sendHttpData(int streamId, byte[] data) throws Exception {
+            consumeSendCredit(streamId, data == null ? 0 : data.length);
+            send(Packet.stream(NatMessageType.DATA, streamId, 0, data));
+        }
+
+        void sendHttpFin(int streamId, List<String> trailers) throws Exception {
+            NatMessage fin = Packet.stream(NatMessageType.FIN, streamId, 0, null);
+            if (trailers != null && !trailers.isEmpty()) {
+                fin.meta = Map.of("trailers", trailers);
+            }
+            send(fin);
+        }
+
+        void returnHttpRequestCredit(int streamId, int credit) throws Exception {
+            sendWindowUpdate(streamId, credit);
+        }
+
+        void completeHttpStream(int streamId, HttpStreamForwarder expected) {
+            httpStreams.remove(streamId, expected);
+            StreamSendWindow window = sendWindows.remove(streamId);
+            if (window != null) {
+                window.close();
+            }
+        }
+
+        void resetHttpStream(int streamId, HttpStreamForwarder expected,
+                             long errorCode, String reason) {
+            if (!httpStreams.remove(streamId, expected)) {
+                return;
+            }
+            try {
+                sendReset(streamId, errorCode, reason);
+            } catch (Exception ignored) {
+            }
+        }
+
+        private void consumeSendCredit(int streamId, int bytes) throws IOException {
+            StreamSendWindow window = sendWindows.get(streamId);
+            if (window == null || !window.consume(bytes)) {
+                throw new IOException("stream send window closed");
+            }
         }
 
         void protect(Socket socket) {
@@ -1224,29 +1363,45 @@ public final class TunnelCore {
             }
         }
 
-        void sendDisconnected(String channelId, String source) throws Exception {
-            Map<String, Object> meta = new LinkedHashMap<>();
-            meta.put("channelId", channelId);
-            if (source != null) {
-                meta.put("source", source);
+        void sendFin(int streamId) throws Exception {
+            StreamSendWindow window = sendWindows.remove(streamId);
+            if (window != null) {
+                window.close();
             }
-            send(Packet.nat(NatMessageType.DISCONNECTED, meta, null));
+            send(Packet.stream(NatMessageType.FIN, streamId, 0, null));
         }
 
-        private void openWebSocket(Map<String, Object> meta) throws Exception {
+        private void sendReset(int streamId, long errorCode, String reason) throws Exception {
+            StreamSendWindow window = sendWindows.remove(streamId);
+            if (window != null) {
+                window.close();
+            }
+            NatMessage reset = Packet.stream(NatMessageType.RST, streamId, errorCode, null);
+            reset.meta = Map.of("reason", reason);
+            send(reset);
+        }
+
+        private void sendWindowUpdate(int streamId, int credit) throws Exception {
+            if (credit > 0) {
+                send(Packet.stream(NatMessageType.WINDOW_UPDATE, streamId,
+                        Integer.toUnsignedLong(credit), null));
+            }
+        }
+
+        private void openWebSocket(int streamId, Map<String, Object> meta) throws Exception {
             String channelId = asString(meta.get("channelId"));
             String route = asString(meta.get("route"));
             if (isBlank(channelId) || isBlank(route)) {
                 status.publish("WebSocket route rejected", "missing channelId/route", true);
                 if (!isBlank(channelId)) {
-                    sendDisconnected(channelId, "ws");
+                    sendReset(streamId, 2, "invalid websocket open");
                 }
                 return;
             }
             String targetBaseUrl = session.routeMap().get(route);
             if (isBlank(targetBaseUrl)) {
                 status.publish("WebSocket route rejected", "unknown route " + route, true);
-                sendDisconnected(channelId, "ws");
+                sendReset(streamId, 3, "unknown websocket route");
                 return;
             }
             try {
@@ -1255,32 +1410,61 @@ public final class TunnelCore {
                         asString(meta.get("relativePath")),
                         asString(meta.get("rawQuery")));
                 LocalWebSocketTunnel tunnel = new LocalWebSocketTunnel(
-                        channelId, target, meta.get("headers"), this, webSocketClient);
-                LocalWebSocketTunnel replaced = localWebSockets.put(channelId, tunnel);
+                        streamId, channelId, target, meta.get("headers"), this, webSocketClient);
+                LocalWebSocketTunnel replaced = localWebSockets.put(streamId, tunnel);
                 if (replaced != null) {
                     replaced.closeFromControl();
                 }
                 tunnel.start();
             } catch (Throwable error) {
-                localWebSockets.remove(channelId);
+                localWebSockets.remove(streamId);
                 status.publish("WebSocket route failed", message(error), true);
-                sendDisconnected(channelId, "ws");
+                sendReset(streamId, 4, "websocket connect failed");
             }
         }
 
         private void send(Packet packet) throws Exception {
+            if (packet.command == Command.NAT_MESSAGE) {
+                sendData(packet);
+                return;
+            }
             synchronized (sendLock) {
                 writePacketLocked(packet);
             }
         }
 
-        private void sendHeartbeatIfIdle() throws Exception {
+        private void sendData(Packet packet) throws Exception {
+            synchronized (dataSendLock) {
+                OutputStream out = dataOutput;
+                if (out == null || !dataLoginSucceeded && packet.command != Command.LOGIN_REQUEST) {
+                    throw new EOFException("data channel is not open");
+                }
+                PacketCodec.write(out, packet);
+                out.flush();
+                dataLastWriteAtMillis.set(System.currentTimeMillis());
+            }
+        }
+
+        private void sendHeartbeatsIfIdle() throws Exception {
             synchronized (sendLock) {
                 long now = System.currentTimeMillis();
-                if (!HeartbeatPolicy.shouldSend(now, lastWriteAtMillis.get())) {
-                    return;
+                if (HeartbeatPolicy.shouldSend(now, lastWriteAtMillis.get())) {
+                    writePacketLocked(Packet.heartbeatRequest());
                 }
-                writePacketLocked(Packet.heartbeatRequest());
+            }
+            if (dataLoginSucceeded) {
+                synchronized (dataSendLock) {
+                    long now = System.currentTimeMillis();
+                    if (HeartbeatPolicy.shouldSend(now, dataLastWriteAtMillis.get())) {
+                        OutputStream out = dataOutput;
+                        if (out == null) {
+                            throw new EOFException("data channel is not open");
+                        }
+                        PacketCodec.write(out, Packet.heartbeatRequest());
+                        out.flush();
+                        dataLastWriteAtMillis.set(now);
+                    }
+                }
             }
         }
 
@@ -1310,24 +1494,75 @@ public final class TunnelCore {
                 tunnel.closeFromControl();
             }
             localWebSockets.clear();
+            for (HttpStreamForwarder stream : httpStreams.values()) {
+                stream.closeFromControl();
+            }
+            httpStreams.clear();
+            for (StreamSendWindow window : sendWindows.values()) {
+                window.close();
+            }
+            sendWindows.clear();
             webSocketClient.dispatcher().executorService().shutdown();
             webSocketClient.connectionPool().evictAll();
             closeQuietly(input);
             closeQuietly(output);
             closeQuietly(socket);
+            closeQuietly(dataInput);
+            closeQuietly(dataOutput);
+            closeQuietly(dataSocket);
+        }
+    }
+
+    private static final class StreamSendWindow {
+        private static final long INITIAL_BYTES = 1024L * 1024L;
+        private static final long MAXIMUM_BYTES = 16L * 1024L * 1024L;
+        private long credit = INITIAL_BYTES;
+        private boolean closed;
+
+        synchronized boolean consume(int bytes) throws IOException {
+            if (bytes <= 0 || bytes > MAXIMUM_BYTES) {
+                return false;
+            }
+            while (!closed && credit < bytes) {
+                try {
+                    wait();
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting for stream credit", error);
+                }
+            }
+            if (closed) {
+                return false;
+            }
+            credit -= bytes;
+            return true;
+        }
+
+        synchronized boolean add(long bytes) {
+            if (closed || bytes <= 0 || bytes > MAXIMUM_BYTES || credit > MAXIMUM_BYTES - bytes) {
+                return false;
+            }
+            credit += bytes;
+            notifyAll();
+            return true;
+        }
+
+        synchronized void close() {
+            closed = true;
+            notifyAll();
         }
     }
 
     private static final class LocalTunnel implements Closeable {
-        private final String channelId;
+        private final int streamId;
         private final TunnelEndpoint endpoint;
         private final ControlConnection control;
         private final ExecutorService ioPool;
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private volatile Socket socket;
 
-        LocalTunnel(String channelId, TunnelEndpoint endpoint, ControlConnection control, ExecutorService ioPool) {
-            this.channelId = channelId;
+        LocalTunnel(int streamId, TunnelEndpoint endpoint, ControlConnection control, ExecutorService ioPool) {
+            this.streamId = streamId;
             this.endpoint = endpoint;
             this.control = control;
             this.ioPool = ioPool;
@@ -1347,14 +1582,14 @@ public final class TunnelCore {
                     while (!closed.get() && (read = in.read(buffer)) >= 0) {
                         byte[] data = new byte[read];
                         System.arraycopy(buffer, 0, data, 0, read);
-                        control.sendNatData(channelId, data);
+                        control.sendNatData(streamId, data);
                     }
                 } catch (Throwable ignored) {
                 } finally {
-                    control.localTunnels.remove(channelId, this);
+                    control.localTunnels.remove(streamId, this);
                     if (closed.compareAndSet(false, true)) {
                         try {
-                            control.sendDisconnected(channelId, null);
+                            control.sendFin(streamId);
                         } catch (Exception ignored) {
                         }
                     }
@@ -1384,9 +1619,16 @@ public final class TunnelCore {
     }
 
     static final class WebSocketSupport {
-        static final byte FRAME_TEXT = 0x01;
-        static final byte FRAME_BINARY = 0x02;
-        static final int MAX_MESSAGE_BYTES = 65_536;
+        static final int OPCODE_CONTINUATION = 0x0;
+        static final int OPCODE_TEXT = 0x1;
+        static final int OPCODE_BINARY = 0x2;
+        static final int OPCODE_CLOSE = 0x8;
+        static final int OPCODE_PING = 0x9;
+        static final int OPCODE_PONG = 0xA;
+        static final int HEADER_BYTES = 12;
+        static final int MAX_FRAME_PAYLOAD_BYTES = 64 * 1024 - HEADER_BYTES;
+        static final int MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+        private static final int MAGIC = 0x53575332;
         private static final Set<String> SKIPPED_HEADERS = Set.of(
                 "connection", "content-length", "host", "keep-alive",
                 "proxy-authenticate", "proxy-authorization", "te", "trailer",
@@ -1459,12 +1701,98 @@ public final class TunnelCore {
             }
         }
 
-        static byte[] frameForControl(byte frameType, byte[] payload) {
+        static byte[] encodeFrame(int opcode, boolean fin, int rsv, int closeCode, byte[] payload) {
             byte[] value = payload == null ? new byte[0] : payload;
-            byte[] framed = new byte[value.length + 1];
-            framed[0] = frameType;
-            System.arraycopy(value, 0, framed, 1, value.length);
-            return framed;
+            validateFrame(opcode, fin, rsv, closeCode, value.length);
+            ByteBuffer buffer = ByteBuffer.allocate(HEADER_BYTES + value.length).order(ByteOrder.BIG_ENDIAN);
+            buffer.putInt(MAGIC);
+            buffer.put((byte) opcode);
+            buffer.put((byte) ((fin ? 1 : 0) | ((rsv & 7) << 1)));
+            buffer.putShort((short) closeCode);
+            buffer.putInt(value.length);
+            buffer.put(value);
+            return buffer.array();
+        }
+
+        static Frame decodeFrame(byte[] encoded) {
+            if (encoded == null || encoded.length < HEADER_BYTES) {
+                throw new IllegalArgumentException("truncated SWS2 frame");
+            }
+            ByteBuffer buffer = ByteBuffer.wrap(encoded).order(ByteOrder.BIG_ENDIAN);
+            if (buffer.getInt() != MAGIC) {
+                throw new IllegalArgumentException("invalid SWS2 magic");
+            }
+            int opcode = Byte.toUnsignedInt(buffer.get());
+            int flags = Byte.toUnsignedInt(buffer.get());
+            if ((flags & 0xf0) != 0) {
+                throw new IllegalArgumentException("unknown SWS2 flags");
+            }
+            boolean fin = (flags & 1) != 0;
+            int rsv = (flags >>> 1) & 7;
+            int closeCode = Short.toUnsignedInt(buffer.getShort());
+            int payloadLength = buffer.getInt();
+            if (payloadLength < 0 || payloadLength > MAX_FRAME_PAYLOAD_BYTES
+                    || buffer.remaining() != payloadLength) {
+                throw new IllegalArgumentException("invalid SWS2 payload length");
+            }
+            byte[] payload = new byte[payloadLength];
+            buffer.get(payload);
+            validateFrame(opcode, fin, rsv, closeCode, payloadLength);
+            return new Frame(opcode, fin, rsv, closeCode, payload);
+        }
+
+        private static void validateFrame(int opcode, boolean fin, int rsv, int closeCode, int payloadLength) {
+            if (opcode != OPCODE_CONTINUATION && opcode != OPCODE_TEXT && opcode != OPCODE_BINARY
+                    && opcode != OPCODE_CLOSE && opcode != OPCODE_PING && opcode != OPCODE_PONG) {
+                throw new IllegalArgumentException("unsupported SWS2 opcode");
+            }
+            if (rsv < 0 || rsv > 7 || payloadLength < 0 || payloadLength > MAX_FRAME_PAYLOAD_BYTES) {
+                throw new IllegalArgumentException("invalid SWS2 frame bounds");
+            }
+            if (opcode >= OPCODE_CLOSE && (!fin || rsv != 0 || payloadLength > 125)) {
+                throw new IllegalArgumentException("invalid fragmented/control SWS2 frame");
+            }
+            if (opcode == OPCODE_CLOSE) {
+                if (payloadLength > 123 || (closeCode != 0 && (closeCode < 1000 || closeCode >= 5000))
+                        || (closeCode == 0 && payloadLength != 0)) {
+                    throw new IllegalArgumentException("invalid SWS2 close frame");
+                }
+            } else if (closeCode != 0) {
+                throw new IllegalArgumentException("close code is only valid on CLOSE");
+            }
+        }
+
+        static byte[] closeReasonBytes(String reason) {
+            if (isBlank(reason)) {
+                return new byte[0];
+            }
+            ByteArrayOutputStream output = new ByteArrayOutputStream(123);
+            for (int offset = 0; offset < reason.length(); ) {
+                int codePoint = reason.codePointAt(offset);
+                byte[] encoded = new String(Character.toChars(codePoint)).getBytes(StandardCharsets.UTF_8);
+                if (output.size() + encoded.length > 123) {
+                    break;
+                }
+                output.write(encoded, 0, encoded.length);
+                offset += Character.charCount(codePoint);
+            }
+            return output.toByteArray();
+        }
+
+        static final class Frame {
+            final int opcode;
+            final boolean fin;
+            final int rsv;
+            final int closeCode;
+            final byte[] payload;
+
+            private Frame(int opcode, boolean fin, int rsv, int closeCode, byte[] payload) {
+                this.opcode = opcode;
+                this.fin = fin;
+                this.rsv = rsv;
+                this.closeCode = closeCode;
+                this.payload = payload;
+            }
         }
 
         private static final class ProtectedSocketFactory extends SocketFactory {
@@ -1523,6 +1851,7 @@ public final class TunnelCore {
     }
 
     private static final class LocalWebSocketTunnel {
+        private final int streamId;
         private final String channelId;
         private final URI target;
         private final Object headers;
@@ -1532,12 +1861,16 @@ public final class TunnelCore {
         private final AtomicBoolean suppressDisconnect = new AtomicBoolean(false);
         private volatile WebSocket webSocket;
         private volatile boolean opened;
+        private ByteArrayOutputStream incomingMessage;
+        private int incomingOpcode = -1;
 
-        private LocalWebSocketTunnel(String channelId,
+        private LocalWebSocketTunnel(int streamId,
+                                    String channelId,
                                     URI target,
                                     Object headers,
                                     ControlConnection control,
                                     OkHttpClient client) {
+            this.streamId = streamId;
             this.channelId = channelId;
             this.target = target;
             this.headers = headers;
@@ -1562,16 +1895,22 @@ public final class TunnelCore {
                 @Override
                 public void onMessage(WebSocket socket, String text) {
                     byte[] payload = text.getBytes(StandardCharsets.UTF_8);
-                    forwardToControl(socket, WebSocketSupport.FRAME_TEXT, payload);
+                    forwardToControl(socket, WebSocketSupport.OPCODE_TEXT, payload);
                 }
 
                 @Override
                 public void onMessage(WebSocket socket, ByteString bytes) {
-                    forwardToControl(socket, WebSocketSupport.FRAME_BINARY, bytes.toByteArray());
+                    forwardToControl(socket, WebSocketSupport.OPCODE_BINARY, bytes.toByteArray());
                 }
 
                 @Override
                 public void onClosing(WebSocket socket, int code, String reason) {
+                    try {
+                        control.sendWsData(streamId, WebSocketSupport.encodeFrame(
+                                WebSocketSupport.OPCODE_CLOSE, true, 0, code,
+                                WebSocketSupport.closeReasonBytes(reason)));
+                    } catch (Exception ignored) {
+                    }
                     socket.close(code, reason);
                 }
 
@@ -1587,23 +1926,62 @@ public final class TunnelCore {
             });
         }
 
-        void write(byte[] data) {
+        synchronized void write(byte[] data) {
             WebSocket socket = webSocket;
-            if (!opened || socket == null || data == null || data.length == 0 || finished.get()) {
+            if (!opened || socket == null || data == null || finished.get()) {
                 return;
             }
-            int payloadLength = data.length - 1;
-            if (payloadLength > WebSocketSupport.MAX_MESSAGE_BYTES) {
-                socket.close(1009, "message too large");
-                finish(true, "websocket message exceeds 65536 bytes");
-                return;
+            try {
+                WebSocketSupport.Frame frame = WebSocketSupport.decodeFrame(data);
+                if (frame.rsv != 0) {
+                    throw new IllegalArgumentException("OkHttp endpoint did not negotiate RSV extensions");
+                }
+                if (frame.opcode == WebSocketSupport.OPCODE_CLOSE) {
+                    socket.close(frame.closeCode == 0 ? 1000 : frame.closeCode,
+                            new String(frame.payload, StandardCharsets.UTF_8));
+                    return;
+                }
+                if (frame.opcode == WebSocketSupport.OPCODE_PING
+                        || frame.opcode == WebSocketSupport.OPCODE_PONG) {
+                    throw new IllegalArgumentException("OkHttp cannot emit explicit ping/pong frames");
+                }
+                appendIncomingFrame(socket, frame);
+            } catch (Exception error) {
+                socket.close(1002, "invalid SWS2 frame");
+                finish(true, message(error));
             }
-            boolean accepted;
-            if (data[0] == WebSocketSupport.FRAME_TEXT) {
-                accepted = socket.send(new String(data, 1, payloadLength, StandardCharsets.UTF_8));
+        }
+
+        private void appendIncomingFrame(WebSocket socket, WebSocketSupport.Frame frame) {
+            if (frame.opcode == WebSocketSupport.OPCODE_CONTINUATION) {
+                if (incomingMessage == null) {
+                    throw new IllegalArgumentException("orphan SWS2 continuation frame");
+                }
             } else {
-                accepted = socket.send(ByteString.of(data, 1, payloadLength));
+                if (frame.opcode != WebSocketSupport.OPCODE_TEXT
+                        && frame.opcode != WebSocketSupport.OPCODE_BINARY) {
+                    throw new IllegalArgumentException("unsupported SWS2 data opcode");
+                }
+                if (incomingMessage != null) {
+                    throw new IllegalArgumentException("new SWS2 message before prior message completed");
+                }
+                incomingOpcode = frame.opcode;
+                incomingMessage = new ByteArrayOutputStream(Math.max(32, frame.payload.length));
             }
+            incomingMessage.write(frame.payload, 0, frame.payload.length);
+            if (incomingMessage.size() > WebSocketSupport.MAX_MESSAGE_BYTES) {
+                throw new IllegalArgumentException("websocket message exceeds limit");
+            }
+            if (!frame.fin) {
+                return;
+            }
+            byte[] payload = incomingMessage.toByteArray();
+            int opcode = incomingOpcode;
+            incomingMessage = null;
+            incomingOpcode = -1;
+            boolean accepted = opcode == WebSocketSupport.OPCODE_TEXT
+                    ? socket.send(new String(payload, StandardCharsets.UTF_8))
+                    : socket.send(ByteString.of(payload));
             if (!accepted) {
                 socket.cancel();
                 finish(true, "local websocket write rejected");
@@ -1627,14 +2005,26 @@ public final class TunnelCore {
             }
         }
 
-        private void forwardToControl(WebSocket socket, byte frameType, byte[] payload) {
+        private void forwardToControl(WebSocket socket, int opcode, byte[] payload) {
             if (payload.length > WebSocketSupport.MAX_MESSAGE_BYTES) {
                 socket.close(1009, "message too large");
-                finish(true, "websocket message exceeds 65536 bytes");
+                finish(true, "websocket message exceeds limit");
                 return;
             }
             try {
-                control.sendWsData(channelId, WebSocketSupport.frameForControl(frameType, payload));
+                int offset = 0;
+                boolean first = true;
+                do {
+                    int length = Math.min(WebSocketSupport.MAX_FRAME_PAYLOAD_BYTES, payload.length - offset);
+                    byte[] chunk = new byte[length];
+                    System.arraycopy(payload, offset, chunk, 0, length);
+                    offset += length;
+                    boolean last = offset == payload.length;
+                    control.sendWsData(streamId, WebSocketSupport.encodeFrame(
+                            first ? opcode : WebSocketSupport.OPCODE_CONTINUATION,
+                            last, 0, 0, chunk));
+                    first = false;
+                } while (offset < payload.length);
             } catch (Exception error) {
                 socket.cancel();
                 finish(false, message(error));
@@ -1646,15 +2036,325 @@ public final class TunnelCore {
                 return;
             }
             opened = false;
-            control.localWebSockets.remove(channelId, this);
+            control.localWebSockets.remove(streamId, this);
             if (!isBlank(detail)) {
                 control.status.publish("WebSocket disconnected", detail, true);
             }
             if (notifyControl && !suppressDisconnect.get() && !control.closed.get()) {
                 try {
-                    control.sendDisconnected(channelId, "ws");
+                    control.sendFin(streamId);
                 } catch (Exception ignored) {
                 }
+            }
+        }
+    }
+
+    private static final class HttpStreamForwarder {
+        private static final int REQUEST_QUEUE_CAPACITY = 32;
+        private static final int CHUNK_SIZE = 64 * 1024;
+
+        private final int streamId;
+        private final Map<String, Object> metadata;
+        private final Map<String, String> routes;
+        private final ControlConnection control;
+        private final ExecutorService ioPool;
+        private final ArrayBlockingQueue<RequestChunk> requestQueue =
+                new ArrayBlockingQueue<>(REQUEST_QUEUE_CAPACITY);
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+        private long receiveCredit = StreamSendWindow.INITIAL_BYTES;
+        private long receiveOutstanding;
+        private boolean requestEnded;
+        private volatile HttpURLConnection connection;
+
+        HttpStreamForwarder(int streamId, Map<String, Object> metadata,
+                            Map<String, String> routes, ControlConnection control,
+                            ExecutorService ioPool) {
+            this.streamId = streamId;
+            this.metadata = new LinkedHashMap<>(metadata);
+            this.routes = routes;
+            this.control = control;
+            this.ioPool = ioPool;
+        }
+
+        void start() {
+            ioPool.submit(this::forward);
+        }
+
+        void onRequestData(byte[] data) {
+            if (data == null || data.length == 0) {
+                return;
+            }
+            String error = null;
+            synchronized (this) {
+                if (closed.get() || requestEnded) {
+                    error = "HTTP request DATA after end";
+                } else if (data.length > receiveCredit) {
+                    error = "HTTP request exceeded receive window";
+                } else {
+                    byte[] copy = data.clone();
+                    if (!requestQueue.offer(new RequestChunk(copy, false))) {
+                        error = "HTTP request queue is full";
+                    } else {
+                        receiveCredit -= copy.length;
+                        receiveOutstanding += copy.length;
+                    }
+                }
+            }
+            if (error != null) {
+                fail(20, error);
+            }
+        }
+
+        void onRequestEnd(Map<String, Object> endMetadata) {
+            String error = null;
+            synchronized (this) {
+                if (closed.get() || requestEnded) {
+                    error = "duplicate HTTP request FIN";
+                } else if (!stringList(endMetadata == null ? null : endMetadata.get("trailers")).isEmpty()) {
+                    error = "Android HTTP transport does not support request trailers";
+                } else {
+                    requestEnded = true;
+                    if (!requestQueue.offer(RequestChunk.END)) {
+                        error = "HTTP request queue is full at FIN";
+                    }
+                }
+            }
+            if (error != null) {
+                fail(21, error);
+            }
+        }
+
+        void closeFromControl() {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            HttpURLConnection active = connection;
+            if (active != null) {
+                active.disconnect();
+            }
+            requestQueue.clear();
+            requestQueue.offer(RequestChunk.CANCELLED);
+        }
+
+        private void forward() {
+            boolean completed = false;
+            try {
+                if (!stringList(metadata.get("trailerNames")).isEmpty()) {
+                    throw new IOException("Android HTTP transport does not support request trailers");
+                }
+                String route = asString(metadata.get("route"));
+                URI target = DirectHttpForwarder.buildTarget(routes.get(route),
+                        asString(metadata.get("relativePath")), asString(metadata.get("rawQuery")));
+                HttpURLConnection opened = (HttpURLConnection) target.toURL().openConnection();
+                connection = opened;
+                opened.setConnectTimeout(5000);
+                opened.setReadTimeout(0);
+                opened.setInstanceFollowRedirects(false);
+                String method = firstText(asString(metadata.get("method")), "GET");
+                opened.setRequestMethod(method);
+                if (opened instanceof HttpsURLConnection https) {
+                    https.setSSLSocketFactory(DirectHttpForwarder.TRUST_ALL_SSL_FACTORY);
+                    https.setHostnameVerifier(DirectHttpForwarder.TRUST_ALL_HOSTNAMES);
+                }
+
+                List<String> requestHeaders = stringList(metadata.get("headers"));
+                String boundedRange = DirectHttpForwarder.boundedRange(
+                        DirectHttpForwarder.firstHeader(requestHeaders, "range"));
+                DirectHttpForwarder.copyHeaders(requestHeaders, (name, value) -> {
+                    if (boundedRange == null || !"range".equalsIgnoreCase(name)) {
+                        opened.addRequestProperty(name, value);
+                    }
+                });
+                if (boundedRange != null) {
+                    opened.setRequestProperty("Range", boundedRange);
+                }
+                if (DirectHttpForwarder.firstHeader(requestHeaders, "accept-encoding") == null) {
+                    opened.setRequestProperty("Accept-Encoding", "identity");
+                }
+
+                Integer contentLengthValue = asInt(metadata.get("contentLength"));
+                long contentLength = contentLengthValue == null ? -1L : contentLengthValue;
+                if (contentLength > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
+                    throw new IOException("HTTP request body exceeds limit");
+                }
+                boolean mayHaveBody = contentLength != 0 && !"GET".equalsIgnoreCase(method)
+                        && !"HEAD".equalsIgnoreCase(method);
+                OutputStream requestBody = null;
+                if (mayHaveBody) {
+                    opened.setDoOutput(true);
+                    if (contentLength >= 0) {
+                        opened.setFixedLengthStreamingMode(contentLength);
+                    } else {
+                        opened.setChunkedStreamingMode(CHUNK_SIZE);
+                    }
+                    requestBody = opened.getOutputStream();
+                }
+                long requestBytes = pumpRequest(requestBody);
+                if (contentLength >= 0 && requestBytes != contentLength) {
+                    throw new IOException("HTTP request content length mismatch");
+                }
+
+                int statusCode = opened.getResponseCode();
+                Map<String, List<String>> responseFields = opened.getHeaderFields();
+                List<String> trailerNames = declaredTrailers(responseFields);
+                control.sendHttpHead(streamId, statusCode,
+                        DirectHttpForwarder.headers(responseFields), trailerNames);
+
+                long announcedLength = opened.getContentLengthLong();
+                if (announcedLength > DirectHttpForwarder.MAX_RESPONSE_BODY_SIZE) {
+                    throw new IOException("HTTP response body exceeds limit");
+                }
+                InputStream responseBody = statusCode >= 400
+                        ? opened.getErrorStream() : opened.getInputStream();
+                long responseBytes = 0;
+                if (responseBody != null) {
+                    try (InputStream input = responseBody) {
+                        byte[] buffer = new byte[CHUNK_SIZE];
+                        int read;
+                        while (!closed.get() && (read = input.read(buffer)) >= 0) {
+                            if (read == 0) {
+                                continue;
+                            }
+                            responseBytes += read;
+                            if (responseBytes > DirectHttpForwarder.MAX_RESPONSE_BODY_SIZE) {
+                                throw new IOException("HTTP response body exceeds limit");
+                            }
+                            byte[] chunk = new byte[read];
+                            System.arraycopy(buffer, 0, chunk, 0, read);
+                            control.sendHttpData(streamId, chunk);
+                        }
+                    }
+                }
+                if (closed.get()) {
+                    throw new IOException("HTTP stream cancelled");
+                }
+                control.sendHttpFin(streamId, responseTrailers(opened, trailerNames));
+                completed = true;
+            } catch (Throwable error) {
+                if (!closed.get()) {
+                    fail(22, message(error));
+                }
+            } finally {
+                HttpURLConnection active = connection;
+                if (active != null) {
+                    active.disconnect();
+                }
+                if (completed && closed.compareAndSet(false, true)) {
+                    control.completeHttpStream(streamId, this);
+                }
+            }
+        }
+
+        private long pumpRequest(OutputStream output) throws Exception {
+            long total = 0;
+            try {
+                while (true) {
+                    RequestChunk chunk = requestQueue.take();
+                    if (chunk == RequestChunk.CANCELLED) {
+                        throw new IOException("HTTP request cancelled");
+                    }
+                    if (chunk.end) {
+                        break;
+                    }
+                    if (output == null) {
+                        throw new IOException("HTTP method does not accept a request body");
+                    }
+                    total += chunk.data.length;
+                    if (total > DirectHttpForwarder.MAX_REQUEST_BODY_SIZE) {
+                        throw new IOException("HTTP request body exceeds limit");
+                    }
+                    output.write(chunk.data);
+                    returnRequestCredit(chunk.data.length);
+                }
+                if (output != null) {
+                    output.flush();
+                }
+                return total;
+            } finally {
+                closeQuietly(output);
+            }
+        }
+
+        private void returnRequestCredit(int bytes) throws Exception {
+            synchronized (this) {
+                if (bytes > receiveOutstanding
+                        || receiveCredit > StreamSendWindow.MAXIMUM_BYTES - bytes) {
+                    throw new IOException("HTTP request receive window overflow");
+                }
+                receiveOutstanding -= bytes;
+                receiveCredit += bytes;
+            }
+            control.returnHttpRequestCredit(streamId, bytes);
+        }
+
+        private void fail(long code, String reason) {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            HttpURLConnection active = connection;
+            if (active != null) {
+                active.disconnect();
+            }
+            requestQueue.clear();
+            requestQueue.offer(RequestChunk.CANCELLED);
+            control.resetHttpStream(streamId, this, code, firstText(reason, "HTTP stream failed"));
+        }
+
+        private static List<String> declaredTrailers(Map<String, List<String>> fields) {
+            List<String> result = new ArrayList<>();
+            if (fields == null) {
+                return result;
+            }
+            for (Map.Entry<String, List<String>> entry : fields.entrySet()) {
+                if (entry.getKey() == null || !"trailer".equalsIgnoreCase(entry.getKey())) {
+                    continue;
+                }
+                for (String value : entry.getValue()) {
+                    for (String name : value.split(",")) {
+                        String trimmed = name.trim();
+                        if (isHeaderName(trimmed) && !result.contains(trimmed)) {
+                            result.add(trimmed);
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
+        private static List<String> responseTrailers(HttpURLConnection connection,
+                                                     List<String> names) {
+            List<String> result = new ArrayList<>();
+            for (String name : names) {
+                String value = connection.getHeaderField(name);
+                if (value != null) {
+                    result.add(name + ":" + value);
+                }
+            }
+            return result;
+        }
+
+        private static boolean isHeaderName(String value) {
+            if (value == null || value.isEmpty()) {
+                return false;
+            }
+            for (int i = 0; i < value.length(); i++) {
+                char c = value.charAt(i);
+                if (!(Character.isLetterOrDigit(c) || "!#$%&'*+-.^_`|~".indexOf(c) >= 0)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static final class RequestChunk {
+            static final RequestChunk END = new RequestChunk(new byte[0], true);
+            static final RequestChunk CANCELLED = new RequestChunk(new byte[0], false);
+            final byte[] data;
+            final boolean end;
+
+            RequestChunk(byte[] data, boolean end) {
+                this.data = data;
+                this.end = end;
             }
         }
     }
@@ -1691,68 +2391,6 @@ public final class TunnelCore {
             } catch (Exception e) {
                 throw new ExceptionInInitializerError(e);
             }
-        }
-
-        static DirectHttpResponse forward(DirectHttpRequest packet, Map<String, String> routes) {
-            DirectHttpResponse response = new DirectHttpResponse();
-            response.requestId = packet.requestId;
-            HttpURLConnection connection = null;
-            try {
-                if (packet.body != null && packet.body.length > MAX_REQUEST_BODY_SIZE) {
-                    throw new IOException("HTTP request body exceeds limit");
-                }
-                URI target = buildTarget(routes.get(packet.route), packet.relativePath, packet.rawQuery);
-                HttpURLConnection openedConnection = (HttpURLConnection) target.toURL().openConnection();
-                connection = openedConnection;
-                connection.setConnectTimeout(5000);
-                connection.setReadTimeout(20_000);
-                connection.setInstanceFollowRedirects(false);
-                connection.setRequestMethod(packet.requestMethod == null ? "GET" : packet.requestMethod);
-                if (connection instanceof HttpsURLConnection https) {
-                    https.setSSLSocketFactory(TRUST_ALL_SSL_FACTORY);
-                    https.setHostnameVerifier(TRUST_ALL_HOSTNAMES);
-                }
-                String originalRange = firstHeader(packet.headers, "range");
-                String boundedRange = boundedRange(originalRange);
-                copyHeaders(packet.headers, (name, value) -> {
-                    if (boundedRange != null && "range".equalsIgnoreCase(name)) {
-                        return;
-                    }
-                    openedConnection.addRequestProperty(name, value);
-                });
-                if (boundedRange != null) {
-                    connection.setRequestProperty("Range", boundedRange);
-                }
-                // Android's HttpURLConnection otherwise opts into transparent gzip. The
-                // reference client forwards the wire body without automatic decompression.
-                if (firstHeader(packet.headers, "accept-encoding") == null) {
-                    connection.setRequestProperty("Accept-Encoding", "identity");
-                }
-                if (packet.body != null && packet.body.length > 0) {
-                    connection.setDoOutput(true);
-                    connection.setFixedLengthStreamingMode(packet.body.length);
-                    try (OutputStream out = connection.getOutputStream()) {
-                        out.write(packet.body);
-                    }
-                }
-                response.statusCode = connection.getResponseCode();
-                response.headers = headers(connection.getHeaderFields());
-                long contentLength = connection.getContentLengthLong();
-                if (contentLength > MAX_RESPONSE_BODY_SIZE) {
-                    throw new IOException("HTTP response body exceeds limit");
-                }
-                InputStream bodyStream = response.statusCode >= 400 ? connection.getErrorStream() : connection.getInputStream();
-                response.body = readResponseBody(bodyStream);
-            } catch (Throwable error) {
-                response.statusCode = 502;
-                response.error = message(error);
-                response.body = new byte[0];
-            } finally {
-                if (connection != null) {
-                    connection.disconnect();
-                }
-            }
-            return response;
         }
 
         static byte[] readResponseBody(InputStream input) throws IOException {
@@ -1906,26 +2544,45 @@ public final class TunnelCore {
 
     static final class PacketCodec {
         static final int MAGIC = 0x14353565;
+        static final int VERSION = 2;
         static final int HEADER_BYTES = 11;
         static final int MAX_FRAME_SIZE = 32 * 1024 * 1024;
+        static final int PRE_AUTH_MAX_FRAME_SIZE = 16 * 1024;
         static final int MAX_BODY_SIZE = MAX_FRAME_SIZE - HEADER_BYTES;
-        private static final byte SERIALIZER_FASTJSON = 1;
+        private static final int MAX_MESSAGE_BODY_SIZE = 1024 * 1024;
+        private static final int MAX_NAT_METADATA_SIZE = 65535;
+        private static final int NAT_HEADER_BYTES = 16;
+        private static final int NAT_FLAG_END_STREAM = 1;
         private static final byte SERIALIZER_BIN = 4;
 
         static Packet read(InputStream in) throws Exception {
+            return read(in, MAX_FRAME_SIZE);
+        }
+
+        static Packet read(InputStream in, int maxFrameSize) throws Exception {
+            if (maxFrameSize < HEADER_BYTES || maxFrameSize > MAX_FRAME_SIZE) {
+                throw new IOException("invalid frame limit: " + maxFrameSize);
+            }
             byte[] header = readExact(in, HEADER_BYTES);
             int magic = readInt(header, 0);
             if (magic != MAGIC) {
                 throw new IOException("bad packet magic");
             }
+            int version = header[4] & 0xFF;
+            if (version != VERSION) {
+                throw new IOException("unsupported protocol version: " + version);
+            }
             byte serializer = header[5];
+            requireSerializer(serializer, SERIALIZER_BIN, header[6]);
             byte command = header[6];
+            if (!isReadableCommand(command)) {
+                throw new IOException("unknown or unsupported command: " + command);
+            }
             int length = readInt(header, 7);
-            validateBodyLength(length);
+            validateBodyLength(command, length, maxFrameSize);
             byte[] body = readExact(in, length);
             if (command == Command.LOGIN_RESPONSE) {
-                requireSerializer(serializer, SERIALIZER_BIN, command);
-                CompactInput input = new CompactInput(CompactPayload.decode(body));
+                CompactInput input = new CompactInput(body);
                 LoginResponse packet = new LoginResponse();
                 packet.clientName = input.readString();
                 packet.success = input.readBoolean();
@@ -1933,8 +2590,7 @@ public final class TunnelCore {
                 return finish(packet, input);
             }
             if (command == Command.MESSAGE_RESPONSE) {
-                requireSerializer(serializer, SERIALIZER_BIN, command);
-                CompactInput input = new CompactInput(CompactPayload.decode(body));
+                CompactInput input = new CompactInput(body);
                 MessageResponse packet = new MessageResponse();
                 packet.clientName = input.readString();
                 packet.toClientName = input.readString();
@@ -1942,36 +2598,20 @@ public final class TunnelCore {
                 packet.message = input.readString();
                 return finish(packet, input);
             }
-            if (command == Command.DIRECT_HTTP_REQUEST) {
-                requireSerializer(serializer, SERIALIZER_BIN, command);
-                CompactInput input = new CompactInput(CompactPayload.decode(body));
-                DirectHttpRequest packet = new DirectHttpRequest();
-                packet.requestId = input.readUuidString();
-                packet.requestMethod = input.readHttpMethod();
-                packet.route = input.readString();
-                packet.relativePath = input.readString();
-                packet.rawQuery = input.readString();
-                packet.headers = input.readStringList();
-                packet.body = input.readByteArray();
-                return finish(packet, input);
-            }
             if (command == Command.NAT_MESSAGE) {
-                requireSerializer(serializer, SERIALIZER_FASTJSON, command);
                 return readNat(body);
             }
             if (command == Command.HEARTBEAT_RESPONSE) {
-                requireSerializer(serializer, SERIALIZER_BIN, command);
-                CompactInput input = new CompactInput(CompactPayload.decode(body));
+                CompactInput input = new CompactInput(body);
                 input.requireFullyConsumed();
                 return new HeartbeatResponse();
             }
             if (command == Command.LOGOUT_REQUEST) {
-                requireSerializer(serializer, SERIALIZER_BIN, command);
-                CompactInput input = new CompactInput(CompactPayload.decode(body));
+                CompactInput input = new CompactInput(body);
                 input.requireFullyConsumed();
                 return Packet.logoutRequest();
             }
-            return new Packet(command);
+            throw new IOException("unsupported command: " + command);
         }
 
         static void write(OutputStream out, Packet packet) throws Exception {
@@ -1983,7 +2623,8 @@ public final class TunnelCore {
                 payload.writeString(p.clientName);
                 payload.writeNullableLong(p.clientSessionId);
                 payload.writeString(p.accessToken);
-                body = CompactPayload.encode(payload.toByteArray());
+                payload.writeString(p.connectionRole);
+                body = payload.toByteArray();
             } else if (packet.command == Command.MESSAGE_REQUEST) {
                 MessageRequest p = (MessageRequest) packet;
                 CompactOutput payload = new CompactOutput();
@@ -1991,32 +2632,31 @@ public final class TunnelCore {
                 payload.writeString(p.toClientName);
                 payload.writeMessageType(p.messageType);
                 payload.writeString(p.message);
-                body = CompactPayload.encode(payload.toByteArray());
+                body = payload.toByteArray();
             } else if (packet.command == Command.HEARTBEAT_REQUEST) {
-                body = CompactPayload.encode(new byte[0]);
-            } else if (packet.command == Command.DIRECT_HTTP_RESPONSE) {
-                DirectHttpResponse p = (DirectHttpResponse) packet;
-                CompactOutput payload = new CompactOutput();
-                payload.writeUuidString(p.requestId);
-                payload.writeVarInt(p.statusCode);
-                payload.writeStringList(p.headers);
-                payload.writeByteArray(p.body);
-                payload.writeString(p.error);
-                body = CompactPayload.encode(payload.toByteArray());
+                body = new byte[0];
             } else if (packet.command == Command.NAT_MESSAGE) {
-                serializer = SERIALIZER_FASTJSON;
                 body = writeNat((NatMessage) packet);
             } else {
-                body = CompactPayload.encode(new byte[0]);
+                body = new byte[0];
             }
-            validateBodyLength(body.length);
+            if (!isWritableCommand(packet.command)) {
+                throw new IOException("unknown or unsupported command: " + packet.command);
+            }
+            validateBodyLength(packet.command, body.length, MAX_FRAME_SIZE);
             writeHeader(out, serializer, packet.command, body.length);
             out.write(body);
         }
 
-        static void validateBodyLength(int length) throws IOException {
-            if (length < 0 || length > MAX_BODY_SIZE) {
-                throw new IOException("packet frame exceeds " + MAX_FRAME_SIZE + " bytes");
+        static void validateBodyLength(byte command, int length, int maxFrameSize) throws IOException {
+            int maximum = maxFrameSize - HEADER_BYTES;
+            if (command == Command.LOGIN_REQUEST || command == Command.LOGIN_RESPONSE) {
+                maximum = Math.min(maximum, PRE_AUTH_MAX_FRAME_SIZE - HEADER_BYTES);
+            } else if (command == Command.MESSAGE_REQUEST || command == Command.MESSAGE_RESPONSE) {
+                maximum = Math.min(maximum, MAX_MESSAGE_BODY_SIZE);
+            }
+            if (length < 0 || length > maximum) {
+                throw new IOException("command " + command + " body exceeds limit " + maximum);
             }
         }
 
@@ -2032,39 +2672,129 @@ public final class TunnelCore {
         }
 
         private static NatMessage readNat(byte[] body) throws Exception {
-            ByteArrayInputStream in = new ByteArrayInputStream(body);
-            int typeCode = readInt(in);
-            int metaLength = readInt(in);
-            if (metaLength < 0 || metaLength > in.available()) {
-                throw new IOException("invalid NAT metadata length");
+            if (body.length < NAT_HEADER_BYTES) {
+                throw new IOException("NAT body is shorter than header");
             }
-            byte[] metaBytes = readExact(in, metaLength);
-            Map<String, Object> meta = jsonToMap(new JSONObject(new String(metaBytes, StandardCharsets.UTF_8)));
-            byte[] remaining = readRemaining(in);
+            int typeCode = body[0] & 0xFF;
+            NatMessageType type = NatMessageType.fromCode(typeCode);
+            if (type == null) {
+                throw new IOException("unknown NAT message type: " + typeCode);
+            }
+            int flags = body[1] & 0xFF;
+            if ((flags & ~NAT_FLAG_END_STREAM) != 0) {
+                throw new IOException("unknown NAT flags: " + flags);
+            }
+            int metaLength = readUnsignedShort(body, 2);
+            int streamId = readInt(body, 4);
+            long value = Integer.toUnsignedLong(readInt(body, 8));
+            int dataLength = readInt(body, 12);
+            if (dataLength < 0 || body.length != NAT_HEADER_BYTES + metaLength + dataLength) {
+                throw new IOException("invalid NAT metadata/data length");
+            }
+            byte[] metaBytes = new byte[metaLength];
+            System.arraycopy(body, NAT_HEADER_BYTES, metaBytes, 0, metaLength);
+            Map<String, Object> meta = readNatMetadata(metaBytes);
+            validateNatSemantics(type, flags, streamId, value, metaLength, dataLength);
             NatMessage packet = new NatMessage();
-            packet.type = NatMessageType.fromCode(typeCode);
+            packet.type = type;
+            packet.flags = flags;
+            packet.streamId = streamId;
+            packet.value = value;
             packet.meta = meta;
-            packet.data = remaining.length == 0 ? null : CompactPayload.decode(remaining);
+            if (dataLength > 0) {
+                packet.data = new byte[dataLength];
+                System.arraycopy(body, NAT_HEADER_BYTES + metaLength, packet.data, 0, dataLength);
+            }
             return packet;
         }
 
         private static byte[] writeNat(NatMessage packet) throws Exception {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            writeInt(out, packet.type.code);
-            byte[] metaBytes = new JSONObject(packet.meta == null ? new LinkedHashMap<>() : packet.meta)
+            if (packet.type == null) {
+                throw new IOException("NAT message type is required");
+            }
+            byte[] encodedMetadata = writeNatMetadata(packet.meta);
+            byte[] data = packet.data == null ? new byte[0] : packet.data;
+            validateNatSemantics(packet.type, packet.flags, packet.streamId, packet.value,
+                    encodedMetadata.length, data.length);
+            long bodyLength = (long) NAT_HEADER_BYTES + encodedMetadata.length + data.length;
+            if (bodyLength > MAX_BODY_SIZE) {
+                throw new IOException("NAT body exceeds frame limit");
+            }
+            byte[] body = new byte[(int) bodyLength];
+            body[0] = (byte) packet.type.code;
+            body[1] = (byte) packet.flags;
+            writeUnsignedShort(body, 2, encodedMetadata.length);
+            writeInt(body, 4, packet.streamId);
+            writeInt(body, 8, (int) packet.value);
+            writeInt(body, 12, data.length);
+            System.arraycopy(encodedMetadata, 0, body, NAT_HEADER_BYTES, encodedMetadata.length);
+            System.arraycopy(data, 0, body, NAT_HEADER_BYTES + encodedMetadata.length, data.length);
+            return body;
+        }
+
+        private static byte[] writeNatMetadata(Map<String, Object> metadata) throws Exception {
+            if (metadata == null || metadata.isEmpty()) {
+                return new byte[0];
+            }
+            byte[] json = new JSONObject(metadata)
                     .toString()
                     .getBytes(StandardCharsets.UTF_8);
-            writeInt(out, metaBytes.length);
-            out.write(metaBytes);
-            if (packet.data != null && packet.data.length > 0) {
-                out.write(CompactPayload.encode(packet.data));
+            if (json.length > MAX_NAT_METADATA_SIZE) {
+                throw new IOException("NAT metadata exceeds limit");
             }
-            return out.toByteArray();
+            return json;
+        }
+
+        private static Map<String, Object> readNatMetadata(byte[] bytes) throws Exception {
+            if (bytes.length == 0) {
+                return new LinkedHashMap<>();
+            }
+            return jsonToMap(new JSONObject(new String(bytes, StandardCharsets.UTF_8)));
+        }
+
+        private static void validateNatSemantics(NatMessageType type, int flags, int streamId, long value,
+                                                 int metadataLength, int dataLength) throws IOException {
+            if (value < 0 || value > 0xffff_ffffL) {
+                throw new IOException("NAT value is outside uint32");
+            }
+            boolean streamFrame = type == NatMessageType.OPEN || type == NatMessageType.FIN
+                    || type == NatMessageType.DATA || type == NatMessageType.RST
+                    || type == NatMessageType.WINDOW_UPDATE;
+            if (streamFrame == (streamId == 0)) {
+                throw new IOException(streamFrame
+                        ? "stream frame requires a non-zero stream id"
+                        : "connection frame requires stream id zero");
+            }
+            if (type != NatMessageType.DATA && flags != 0) {
+                throw new IOException("flags are only valid on DATA");
+            }
+            if (type == NatMessageType.DATA && (metadataLength != 0 || value != 0)) {
+                throw new IOException("DATA cannot carry metadata/value");
+            }
+            if (type == NatMessageType.FIN && (dataLength != 0 || flags != 0)) {
+                throw new IOException("FIN cannot carry binary data/flags");
+            }
+            if (type == NatMessageType.WINDOW_UPDATE
+                    && (metadataLength != 0 || dataLength != 0 || flags != 0)) {
+                throw new IOException("WINDOW_UPDATE cannot carry payload");
+            }
+            if (type == NatMessageType.WINDOW_UPDATE && value == 0) {
+                throw new IOException("WINDOW_UPDATE credit must be positive");
+            }
+            if (type == NatMessageType.FIN && value != 0) {
+                throw new IOException("FIN value must be zero");
+            }
+            if (type == NatMessageType.RST && dataLength != 0) {
+                throw new IOException("RST cannot carry binary data");
+            }
+            if (!streamFrame && (value != 0 || flags != 0 || dataLength != 0)) {
+                throw new IOException("connection control frame cannot carry stream value/data");
+            }
         }
 
         private static void writeHeader(OutputStream out, byte serializer, byte command, int length) throws IOException {
             writeInt(out, MAGIC);
-            out.write(1);
+            out.write(VERSION);
             out.write(serializer);
             out.write(command);
             writeInt(out, length);
@@ -2083,16 +2813,30 @@ public final class TunnelCore {
             return bytes;
         }
 
-        private static int readInt(InputStream in) throws IOException {
-            byte[] bytes = readExact(in, 4);
-            return readInt(bytes, 0);
-        }
-
         private static int readInt(byte[] bytes, int offset) {
             return (bytes[offset] & 0xFF) << 24
                     | (bytes[offset + 1] & 0xFF) << 16
                     | (bytes[offset + 2] & 0xFF) << 8
                     | (bytes[offset + 3] & 0xFF);
+        }
+
+        private static int readUnsignedShort(byte[] bytes, int offset) {
+            return (bytes[offset] & 0xFF) << 8 | bytes[offset + 1] & 0xFF;
+        }
+
+        private static void writeUnsignedShort(byte[] bytes, int offset, int value) throws IOException {
+            if (value < 0 || value > 65535) {
+                throw new IOException("unsigned short out of range: " + value);
+            }
+            bytes[offset] = (byte) (value >>> 8);
+            bytes[offset + 1] = (byte) value;
+        }
+
+        private static void writeInt(byte[] bytes, int offset, int value) {
+            bytes[offset] = (byte) (value >>> 24);
+            bytes[offset + 1] = (byte) (value >>> 16);
+            bytes[offset + 2] = (byte) (value >>> 8);
+            bytes[offset + 3] = (byte) value;
         }
 
         private static void writeInt(OutputStream out, int value) throws IOException {
@@ -2102,15 +2846,22 @@ public final class TunnelCore {
             out.write(value & 0xFF);
         }
 
-        private static byte[] readRemaining(InputStream in) throws IOException {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) >= 0) {
-                out.write(buffer, 0, read);
-            }
-            return out.toByteArray();
+        private static boolean isReadableCommand(byte command) {
+            return command == Command.LOGIN_RESPONSE
+                    || command == Command.MESSAGE_RESPONSE
+                    || command == Command.LOGOUT_REQUEST
+                    || command == Command.HEARTBEAT_RESPONSE
+                    || command == Command.NAT_MESSAGE;
         }
+
+        private static boolean isWritableCommand(byte command) {
+            return command == Command.LOGIN_REQUEST
+                    || command == Command.MESSAGE_REQUEST
+                    || command == Command.LOGOUT_REQUEST
+                    || command == Command.HEARTBEAT_REQUEST
+                    || command == Command.NAT_MESSAGE;
+        }
+
     }
 
     static class Packet {
@@ -2120,11 +2871,13 @@ public final class TunnelCore {
             this.command = command;
         }
 
-        static Packet loginRequest(String clientName, Long clientSessionId, String accessToken) {
+        static Packet loginRequest(String clientName, Long clientSessionId, String accessToken,
+                                   String connectionRole) {
             LoginRequest packet = new LoginRequest();
             packet.clientName = clientName;
             packet.clientSessionId = clientSessionId;
             packet.accessToken = accessToken;
+            packet.connectionRole = connectionRole;
             return packet;
         }
 
@@ -2161,12 +2914,22 @@ public final class TunnelCore {
             packet.data = data;
             return packet;
         }
+
+        static NatMessage stream(NatMessageType type, int streamId, long value, byte[] data) {
+            NatMessage packet = new NatMessage();
+            packet.type = type;
+            packet.streamId = streamId;
+            packet.value = value;
+            packet.data = data;
+            return packet;
+        }
     }
 
     private static final class LoginRequest extends Packet {
         String clientName;
         Long clientSessionId;
         String accessToken;
+        String connectionRole;
 
         LoginRequest() {
             super(Command.LOGIN_REQUEST);
@@ -2212,38 +2975,16 @@ public final class TunnelCore {
     }
 
     private static final class NatMessage extends Packet {
+        static final int FLAG_END_STREAM = 0x01;
         NatMessageType type;
+        int flags;
+        int streamId;
+        long value;
         Map<String, Object> meta;
         byte[] data;
 
         NatMessage() {
             super(Command.NAT_MESSAGE);
-        }
-    }
-
-    private static final class DirectHttpRequest extends Packet {
-        String requestId;
-        String requestMethod;
-        String route;
-        String relativePath;
-        String rawQuery;
-        List<String> headers;
-        byte[] body;
-
-        DirectHttpRequest() {
-            super(Command.DIRECT_HTTP_REQUEST);
-        }
-    }
-
-    private static final class DirectHttpResponse extends Packet {
-        String requestId;
-        int statusCode;
-        List<String> headers = new ArrayList<>();
-        byte[] body = new byte[0];
-        String error;
-
-        DirectHttpResponse() {
-            super(Command.DIRECT_HTTP_RESPONSE);
         }
     }
 
@@ -2256,27 +2997,26 @@ public final class TunnelCore {
         static final byte HEARTBEAT_REQUEST = 4;
         static final byte HEARTBEAT_RESPONSE = -4;
         static final byte NAT_MESSAGE = 6;
-        static final byte DIRECT_HTTP_REQUEST = 7;
-        static final byte DIRECT_HTTP_RESPONSE = -7;
     }
 
     private static final class MessageType {
-        static final int SERVER_TO_CLIENT = 0;
-        static final int CLIENT_TO_SERVER = 1;
-        static final int CLIENT_TO_CLIENT = 2;
-        static final int NAT_CONTROL = 3;
-        static final int PEER_CONTROL = 4;
+        static final int SERVER_TO_CLIENT = 1;
+        static final int CLIENT_TO_SERVER = 2;
+        static final int CLIENT_TO_CLIENT = 3;
+        static final int NAT_CONTROL = 4;
+        static final int PEER_CONTROL = 5;
     }
 
     private enum NatMessageType {
         REGISTER(1),
         REGISTER_RESULT(2),
-        CONNECTED(3),
-        DISCONNECTED(4),
+        OPEN(3),
+        FIN(4),
         DATA(5),
         KEEPALIVE(6),
         UNREGISTER(7),
-        HTTP_ROUTES_REPORT(8);
+        RST(8),
+        WINDOW_UPDATE(9);
 
         final int code;
 
@@ -2291,84 +3031,6 @@ public final class TunnelCore {
                 }
             }
             return null;
-        }
-    }
-
-    static final class CompactPayload {
-        private static final int RAW = 0;
-        private static final int DEFLATED = 1;
-        private static final int COMPRESSION_THRESHOLD = 64;
-        static final int MAX_INFLATED_SIZE = 16 * 1024 * 1024;
-
-        static byte[] encode(byte[] raw) {
-            byte[] compressed = raw.length >= COMPRESSION_THRESHOLD ? deflate(raw) : raw;
-            if (compressed.length < raw.length) {
-                return withType(DEFLATED, compressed);
-            }
-            return withType(RAW, raw);
-        }
-
-        static byte[] decode(byte[] bytes) {
-            if (bytes == null || bytes.length == 0) {
-                throw new IllegalArgumentException("empty compact payload");
-            }
-            byte[] payload = new byte[bytes.length - 1];
-            System.arraycopy(bytes, 1, payload, 0, payload.length);
-            if (bytes[0] == RAW) {
-                return payload;
-            }
-            if (bytes[0] == DEFLATED) {
-                return inflate(payload);
-            }
-            throw new IllegalArgumentException("unknown compact payload type: " + bytes[0]);
-        }
-
-        private static byte[] withType(int type, byte[] payload) {
-            byte[] result = new byte[payload.length + 1];
-            result[0] = (byte) type;
-            System.arraycopy(payload, 0, result, 1, payload.length);
-            return result;
-        }
-
-        private static byte[] deflate(byte[] bytes) {
-            Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION, true);
-            try {
-                deflater.setInput(bytes);
-                deflater.finish();
-                ByteArrayOutputStream output = new ByteArrayOutputStream(bytes.length);
-                byte[] buffer = new byte[256];
-                while (!deflater.finished()) {
-                    int length = deflater.deflate(buffer);
-                    output.write(buffer, 0, length);
-                }
-                return output.toByteArray();
-            } finally {
-                deflater.end();
-            }
-        }
-
-        private static byte[] inflate(byte[] bytes) {
-            Inflater inflater = new Inflater(true);
-            try {
-                inflater.setInput(bytes);
-                ByteArrayOutputStream output = new ByteArrayOutputStream(bytes.length * 2);
-                byte[] buffer = new byte[256];
-                while (!inflater.finished()) {
-                    int length = inflater.inflate(buffer);
-                    if (length == 0) {
-                        throw new IllegalArgumentException("invalid deflated payload");
-                    }
-                    output.write(buffer, 0, length);
-                    if (output.size() > MAX_INFLATED_SIZE) {
-                        throw new IllegalArgumentException("inflated payload exceeds limit");
-                    }
-                }
-                return output.toByteArray();
-            } catch (DataFormatException e) {
-                throw new IllegalArgumentException("invalid deflated payload", e);
-            } finally {
-                inflater.end();
-            }
         }
     }
 
@@ -2398,47 +3060,11 @@ public final class TunnelCore {
             writeVarLong(zigZagEncode(value));
         }
 
-        void writeByteArray(byte[] value) {
-            if (value == null) {
-                writeVarInt(0);
-                return;
-            }
-            writeVarInt(value.length + 1);
-            out.write(value, 0, value.length);
-        }
-
         void writeMessageType(int value) {
-            writeVarInt(value + 1);
-        }
-
-        void writeStringList(List<String> value) {
-            if (value == null) {
-                writeVarInt(0);
-                return;
+            if (value < MessageType.SERVER_TO_CLIENT || value > MessageType.PEER_CONTROL) {
+                throw new IllegalArgumentException("invalid message type wire id: " + value);
             }
-            writeVarInt(value.size() + 1);
-            for (String item : value) {
-                writeString(item);
-            }
-        }
-
-        void writeUuidString(String value) {
-            if (value == null) {
-                writeByte(0);
-                return;
-            }
-            try {
-                UUID uuid = UUID.fromString(value);
-                if (uuid.toString().equals(value)) {
-                    writeByte(1);
-                    writeLong(uuid.getMostSignificantBits());
-                    writeLong(uuid.getLeastSignificantBits());
-                    return;
-                }
-            } catch (IllegalArgumentException ignored) {
-            }
-            writeByte(2);
-            writeString(value);
+            writeVarInt(value);
         }
 
         void writeVarInt(int value) {
@@ -2460,19 +3086,12 @@ public final class TunnelCore {
             writeByte((int) value);
         }
 
-        void writeLong(long value) {
-            for (int shift = 56; shift >= 0; shift -= 8) {
-                writeByte((int) (value >>> shift));
-            }
-        }
-
         byte[] toByteArray() {
             return out.toByteArray();
         }
     }
 
     static final class CompactInput {
-        private static final String[] HTTP_METHODS = {"GET", "POST", "PUT", "DELETE"};
         private final byte[] bytes;
         private int index;
 
@@ -2508,52 +3127,11 @@ public final class TunnelCore {
         }
 
         int readMessageType() {
-            return readVarInt() - 1;
-        }
-
-        String readHttpMethod() {
-            int type = readUnsignedByte();
-            if (type == 0) {
-                return null;
+            int wireId = readVarInt();
+            if (wireId < MessageType.SERVER_TO_CLIENT || wireId > MessageType.PEER_CONTROL) {
+                throw new IllegalArgumentException("invalid message type wire id: " + wireId);
             }
-            if (type <= HTTP_METHODS.length) {
-                return HTTP_METHODS[type - 1];
-            }
-            if (type == HTTP_METHODS.length + 1) {
-                return readString();
-            }
-            throw new IllegalArgumentException("invalid HTTP method");
-        }
-
-        String readUuidString() {
-            int type = readUnsignedByte();
-            if (type == 0) {
-                return null;
-            }
-            if (type == 1) {
-                return new UUID(readLong(), readLong()).toString();
-            }
-            if (type == 2) {
-                return readString();
-            }
-            throw new IllegalArgumentException("invalid UUID string");
-        }
-
-        List<String> readStringList() {
-            int marker = readVarInt();
-            if (marker == 0) {
-                return null;
-            }
-            List<String> result = new ArrayList<>(marker - 1);
-            for (int i = 0; i < marker - 1; i++) {
-                result.add(readString());
-            }
-            return result;
-        }
-
-        byte[] readByteArray() {
-            int marker = readVarInt();
-            return marker == 0 ? null : readBytes(marker - 1);
+            return wireId;
         }
 
         int readUnsignedByte() {
@@ -2595,14 +3173,6 @@ public final class TunnelCore {
                 }
             }
             throw new IllegalArgumentException("varlong too long");
-        }
-
-        long readLong() {
-            long value = 0;
-            for (int i = 0; i < Long.BYTES; i++) {
-                value = (value << 8) | readUnsignedByte();
-            }
-            return value;
         }
 
         void requireFullyConsumed() {
@@ -2830,6 +3400,19 @@ public final class TunnelCore {
             }
         }
         return null;
+    }
+
+    private static List<String> stringList(Object value) {
+        if (!(value instanceof List<?> values)) {
+            return new ArrayList<>();
+        }
+        List<String> result = new ArrayList<>(values.size());
+        for (Object item : values) {
+            if (item instanceof String text) {
+                result.add(text);
+            }
+        }
+        return result;
     }
 
     private static long zigZagEncode(long value) {

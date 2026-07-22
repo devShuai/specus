@@ -21,13 +21,13 @@ The first Android version focuses on the normal tunnel-client path:
 - peer mesh VPN address setup as `{virtualIp}/32` plus dynamic `/32` routes for online roster peers; the whole mesh CIDR and default route are not installed
 - app traffic is excluded from the VPN with `addDisallowedApplication(...)`, and control/local sockets are protected with `VpnService.protect(...)`
 - peer mesh control messages for roster, candidate exchange, session grants, and close notifications
-- provider-independent X25519 peer key publishing, HKDF-derived AES-GCM session keys, replay protection, and `SPM1` data frames
+- provider-independent X25519 peer key publishing, directional HKDF-derived AES-GCM traffic keys, 4096-packet replay protection, and `SPM2` data frames
 - direct UDP host-candidate probes and encrypted IPv4 packet delivery between peer mesh devices
 - standard STUN server-reflexive candidates from the server/public STUN list
 - TURN allocation, permission refresh, send/data indication, and encrypted relay fallback; Allocate/Refresh/CreatePermission use long-term HMAC-SHA1 MESSAGE-INTEGRITY and retry one `401`/`438` challenge with the returned realm/nonce
 - peer mesh device, path, and direct-only traffic reports for the management UI; TURN relay bytes are counted only by the server relay path
 - session refresh before grant expiry and direct-stale relay fallback
-- peer text and ACK messages use the Java/Go-compatible `STMSG1` envelope; Android can still decode the `STMSG2` attachment extension, but attachment download/media preview remain disabled and are not advertised
+- peer text, ACK, and attachment metadata use the mandatory `STMSG2` envelope; attachment download/media preview remain disabled and are not advertised
 
 The VPN data path now has a peer mesh loop: packets captured from Android TUN are routed by virtual IPv4 destination, encrypted, sent over direct UDP when available, fall back to TURN relay when a relay path is learned, decrypted on receive, and written back to TUN. Port-mapping prediction, local ACL mirroring, and full real-device end-to-end validation are still pending.
 The normal TURN path pre-authenticates with the realm/nonce returned by HTTP login. If the server returns `401 Unauthorized` or `438 Stale Nonce`, Android updates the challenge values and retries that Allocate, Refresh, or CreatePermission transaction once with a new transaction ID.

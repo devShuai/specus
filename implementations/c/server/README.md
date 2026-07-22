@@ -4,19 +4,20 @@ Experimental C port of `tunnel-server`.
 
 Full migration plan: [docs/cross-language/tunnel-server-c-port-plan.md](../../../docs/cross-language/tunnel-server-c-port-plan.md).
 
-This version implements the Java-compatible core server path:
+This version implements the v2 core server path:
 
 - TCP listener on `TUNNEL_NETTY_PORT` (default `7010`)
-- Java wire frame header (`0x14353565`, version `1`, compact-binary serializer `4`)
-- compact-binary subset for `LoginRequest`, `LoginResponse`, `MessageResponse`, heartbeat, and `DirectHttpRequest/Response` packets
-- control-channel token verification compatible with the current Java client runtime login packet
-- a Java-compatible `/api/client/auth/login` endpoint: SQLite credential login writes `tunnel_client_session`, returns a runtime `cs_` access token, and falls back to the older environment-token smoke-test mode when no matching DB credential exists
+- mandatory v2 wire frame header (`0x14353565`, version `2`, compact-binary serializer `4`), with no v1 decoder or serializer fallback
+- compact-binary schemas for `LoginRequest`, `LoginResponse`, `MessageResponse`, heartbeat, and `NAT_MESSAGE`
+- separate authenticated `control` and `data` connections for each runtime session
+- runtime-token verification using the same v2 login schema as the Java, Go, and .NET clients
+- `/api/client/auth/login`: SQLite credential login writes `tunnel_client_session` and returns a runtime `cs_` access token; an explicitly configured environment-token path is available only for local smoke tests
 - a lightweight management HTTP skeleton with Java-shaped `/auth/login`, `/oidc-config`, HTTP-only `/oidc/token` exchange, `/api/admin/me`, database initialization, management user CRUD, `/api/admin/overview`, client CRUD, TCP mapping CRUD, connection record pagination, traffic summaries, SQLite HTTP/TCP traffic detail queries, and Peer Mesh management contract responses
 - Java-shaped client package download metadata: public enabled-list endpoint plus admin-only CRUD backed by SQLite
 - Java-shaped public ICE discovery at `/api/public/peer-mesh/stun-config` and `/api/public/transfer/ice-config`, including time-limited HMAC-SHA1 TURN credentials for an explicitly configured external STUN/TURN service
-- a Direct HTTP bridge for `/http/{clientName}/{route}/...` on the management listener, forwarding ordinary HTTP requests with `DIRECT_HTTP_REQUEST/RESPONSE` and WebSocket upgrades with Java-compatible `source=ws` NAT frames
+- an HTTP stream bridge for `/http/{clientName}/{route}/...` using NAT `OPEN/DATA/FIN/RST/WINDOW_UPDATE`; WebSocket frames use the mandatory `SWS2` envelope
 - `NAT_CONTROL` push after login
-- TCP tunnel `REGISTER`, `CONNECTED`, `DATA`, `DISCONNECTED`, and `UNREGISTER` flow
+- TCP tunnel `REGISTER`, `REGISTER_RESULT`, `OPEN`, `DATA`, `FIN`, `RST`, `WINDOW_UPDATE`, and `UNREGISTER` flow
 - heartbeat responses after successful login
 
 It intentionally does not implement the SPA build pipeline, HTTPS OIDC token exchange, Elasticsearch
@@ -24,7 +25,7 @@ traffic detail storage, Peer Mesh data plane, or TLS yet. With `TUNNEL_DATABASE_
 `/api/client/auth/login` can authenticate rows in `tunnel_client_credential`, create or reuse a
 machine/user-bound client identity, write a `HTTP_AUTHENTICATED` row to `tunnel_client_session`,
 and issue a runtime `cs_` token that the control-channel login later promotes to `NETTY_ONLINE`.
-The older environment-token mode remains available for local smoke tests.
+The environment-token mode is a local smoke-test fixture, not an alternate wire protocol.
 
 ## Build
 
@@ -51,7 +52,7 @@ implementations/c/server/build/shuai-tunnel-server-c
 
 Instead of `TUNNEL_CLIENT_ACCESS_TOKEN`, you may set `TUNNEL_CLIENT_ACCESS_TOKEN_HASH` to the
 64-character lowercase SHA-256 hex hash of an already-issued runtime access token. When using the
-environment-token compatibility login mode, `TUNNEL_CLIENT_ACCESS_TOKEN` must be set because that
+environment-token smoke-test login mode, `TUNNEL_CLIENT_ACCESS_TOKEN` must be set because that
 mode has to return the plaintext token to the client.
 
 Additional runtime knobs:
@@ -60,18 +61,18 @@ Additional runtime knobs:
 | --- | --- | --- |
 | `TUNNEL_PUBLIC_ADDRESS` | `127.0.0.1` | Public address included in `NAT_CONTROL`. |
 | `TUNNEL_CLIENT_NAME` | `Demo client` | Runtime client name expected in the Netty login packet. |
-| `TUNNEL_CLIENT_TENANT_ID` | `TUNNEL_AUTH_TENANT_ID` or `default` | Tenant id returned by the C `/api/client/auth/login` compatibility response. |
-| `TUNNEL_CLIENT_ID` | `1` | Client id returned by the C auth-login compatibility response. |
+| `TUNNEL_CLIENT_TENANT_ID` | `TUNNEL_AUTH_TENANT_ID` or `default` | Tenant id returned by the C `/api/client/auth/login` smoke-test response. |
+| `TUNNEL_CLIENT_ID` | `1` | Client id returned by the C auth-login smoke-test response. |
 | `TUNNEL_CLIENT_SESSION_ID` | `1` | Runtime client session id expected in the Netty login packet. |
-| `TUNNEL_CLIENT_ACCESS_TOKEN` | unset | Runtime access token used by the environment-token compatibility path. Not required when SQLite credential login is used. |
+| `TUNNEL_CLIENT_ACCESS_TOKEN` | unset | Runtime access token used by the environment-token smoke-test path. Not required when SQLite credential login is used. |
 | `TUNNEL_CLIENT_ACCESS_TOKEN_HASH` | unset | SHA-256 hex hash of the environment runtime access token when the plaintext token should not be kept in env. |
-| `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` | Runtime token TTL returned by the auth-login compatibility response. Legacy alias: `TUNNEL_CLIENT_TOKEN_TTL_SECONDS`. |
-| `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | Default max online instances returned by the auth-login compatibility response and used when creating credentials without an explicit value. Legacy alias: `TUNNEL_CLIENT_MAX_ONLINE_INSTANCES`. |
-| `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | Java-compatible same-machine/user online-instance limit name. The current C stage still enforces one instance in the control-channel path. |
-| `TUNNEL_CLIENT_POLICY_ENABLED` | `true` | Client policy enabled flag returned by the auth-login compatibility response. |
-| `TUNNEL_CLIENT_BILLING_STATUS` | `ACTIVE` | Client billing status returned by the auth-login compatibility response. |
-| `TUNNEL_CLIENT_RETRY_AFTER_SECONDS` | `0` | Retry-after hint returned by the auth-login compatibility response. |
-| `TUNNEL_CLIENT_API_KEY` | unset | Optional Java-compatible client startup API key. When set with a secret, `/api/client/auth/login` verifies the request signature. |
+| `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` | Runtime token TTL returned by the auth-login response. Legacy alias: `TUNNEL_CLIENT_TOKEN_TTL_SECONDS`. |
+| `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | Default max online instances returned by auth login and used when creating credentials without an explicit value. Legacy alias: `TUNNEL_CLIENT_MAX_ONLINE_INSTANCES`. |
+| `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | Same-machine/user online-instance limit. The current C stage still enforces one instance in the control-channel path. |
+| `TUNNEL_CLIENT_POLICY_ENABLED` | `true` | Client policy enabled flag returned by auth login. |
+| `TUNNEL_CLIENT_BILLING_STATUS` | `ACTIVE` | Client billing status returned by auth login. |
+| `TUNNEL_CLIENT_RETRY_AFTER_SECONDS` | `0` | Retry-after hint returned by auth login. |
+| `TUNNEL_CLIENT_API_KEY` | unset | Optional client startup API key. When set with a secret, `/api/client/auth/login` verifies the request signature. |
 | `TUNNEL_CLIENT_SECRET` | unset | Optional plaintext client startup secret used as `SHA256(secret)` HMAC key material, matching the Java client signing algorithm. |
 | `TUNNEL_CLIENT_SECRET_HASH` | unset | Optional 64-character SHA-256 hex hash of the client startup secret; preferred over plaintext `TUNNEL_CLIENT_SECRET` when set. |
 | `TUNNEL_AUTH_USERNAME` | `admin` | Built-in management admin username used by `/auth/login`, `/api/admin/me`, and `/api/admin/users`. |
@@ -103,7 +104,7 @@ Additional runtime knobs:
 | `TUNNEL_ADMIN_PORT` | `0` | Optional lightweight management API listener; `0` disables it. |
 | `TUNNEL_STATIC_ROOT` | `implementations/java/server/src/main/resources/static` | Static SPA root used by the management listener. |
 | `TUNNEL_HTTP_ROUTES` | unset | Optional comma-separated HTTP route snapshot, `route=targetBaseUrl,route2=https://host/base`, returned from client auth login and pushed in `NAT_CONTROL`. |
-| `TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES` | `10485760` | Max Direct HTTP response body size eligible for path rewriting when the SQLite HTTP route has `pathRewriteEnabled=true`; `0` disables rewriting. |
+| `TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES` | `10485760` | Max streamed HTTP response body size eligible for path rewriting when the SQLite HTTP route has `pathRewriteEnabled=true`; `0` disables rewriting. |
 
 `TUNNEL_TCP_MAPPINGS` is a comma-separated list of server listen ports mapped to client-side targets:
 
@@ -113,7 +114,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 
 The C server sends those mappings to the Java client via both `/api/client/auth/login` and
 `NAT_CONTROL`; the client then registers each port back to the server, and external connections on
-the public port are bridged over the control channel.
+the public port are bridged over the authenticated data connection.
 
 `TUNNEL_HTTP_ROUTES` is a comma-separated list of Direct HTTP routes:
 
@@ -125,7 +126,7 @@ The C server returns these routes in `/api/client/auth/login` and pushes them in
 Java / Go / .NET clients can populate their in-memory Direct HTTP route table before `/http/...`
 traffic arrives. The management listener only forwards `/http/{clientName}/{route}/...` when
 `route` exists in this configured snapshot; unknown routes return `404` instead of being sent to
-the control channel.
+the data connection.
 
 When `TUNNEL_DATABASE_PATH` is set, the server initializes a small SQLite schema and checks that the
 selected `TUNNEL_CLIENT_NAME` is enabled in `client_account`; enabled rows in `tunnel_mapping`
@@ -176,7 +177,7 @@ return `501`.
 `GET /api/admin/peer-mesh/status` only mirrors the Java-shaped `enabled` flag from
 `TUNNEL_PEER_MESH_ENABLED`; it does not imply that the C Peer Mesh data plane is implemented.
 The public discovery endpoints likewise publish a self-hosted-looking STUN/TURN URL only when
-`TUNNEL_PEER_MESH_PUBLIC_ADDRESS` explicitly identifies an external compatible service. The C
+`TUNNEL_PEER_MESH_PUBLIC_ADDRESS` explicitly identifies an external STUN/TURN service. The C
 process itself does not bind a STUN/TURN UDP port, perform hole punching, or relay peer traffic.
 Startup login persists the wire-level `clientMessageCapabilities` on each SQLite session. Because
 the lightweight C management views currently report these clients/devices as offline, their public
@@ -184,12 +185,12 @@ capability fields are zeroed just like Java's offline views; persistence is not 
 implements the live peer roster or message transport.
 The exact Java attachment paths—public/admin `presign-upload`, `/{attachmentId}/complete`, and
 `/{attachmentId}/presign-download` under `/api/public/transfer/attachments` or
-`/api/admin/client-messages/attachments`—return Java-compatible `409 Conflict` with
+`/api/admin/client-messages/attachments`—return the specified `409 Conflict` response with
 `object storage is not configured` / `OBJECT_STORAGE_DISABLED`. The C
 server has no object-storage abstraction, so these routes never return successful placeholder URLs.
 The management auth login endpoint validates the built-in admin password from
 `TUNNEL_AUTH_USERNAME` / `TUNNEL_AUTH_PASSWORD`; when `TUNNEL_DATABASE_PATH` is configured, it also
-validates enabled rows in `tunnel_management_user` using the Java-compatible SHA-256 password hash.
+validates enabled rows in `tunnel_management_user` using the shared SHA-256 password-hash contract.
 The login and refresh responses use the Java-shaped `accessToken/tokenType/expiresIn` fields. The
 token is a local HS256 JWT with `iss=shuai-tunnel`, `sub`, `tenant_id`, `role`, `iat`, and `exp`;
 real HTTP requests to `/api/admin/**` and `/auth/refresh` must include it as
@@ -221,7 +222,7 @@ with missing `clientId`, `channelId`, `remoteAddress`, `disconnectedAt`, and dis
 fields represented as `null`.
 `GET /api/admin/connection-stats` follows Java's monthly archive view shape and returns an array of
 `id`, `clientId`, `clientName`, `month`, `total`, `success`, `failure`, and `updatedAt`. Existing
-archive rows without `client_id` or `updated_at` are returned with nullable compatibility fields.
+archive rows without `client_id` or `updated_at` are returned with nullable fields.
 `GET /api/admin/traffic` and `GET /api/admin/traffic/resources` follow the Java summary view
 shapes for daily client traffic and per-resource traffic. When `TUNNEL_DATABASE_PATH` is set, the
 C server records successful TCP tunnel bytes as `TCP_TUNNEL` resources with keys such as
@@ -230,7 +231,7 @@ C server records successful TCP tunnel bytes as `TCP_TUNNEL` resources with keys
 
 SQLite traffic detail capture is available when the corresponding TCP mapping or HTTP route has
 `detailCaptureEnabled=true`. TCP frames are written to `tunnel_tcp_traffic_frame` with the full
-binary payload, Java-compatible directions `PUBLIC_TO_CLIENT` / `CLIENT_TO_PUBLIC`, source and
+binary payload, canonical directions `PUBLIC_TO_CLIENT` / `CLIENT_TO_PUBLIC`, source and
 destination endpoint fields, per-channel stream offsets, and preview text/hex. HTTP exchanges are
 written to `tunnel_http_traffic_exchange` with request/response headers, body previews, status,
 content types, response body type, and elapsed time. The management endpoints
@@ -247,24 +248,24 @@ disabled `peerMesh`, TCP `tunnelConfigList`, and `httpTunnelConfigList`. In SQLi
 looks up `tunnel_client_credential` by `apiKey`, verifies the same canonical HMAC signature
 documented in `protocol/spec/client-auth.md`, creates or reuses the machine/user-bound client
 identity, writes `tunnel_client_session` as `HTTP_AUTHENTICATED`, and returns a freshly generated
-`cs_` runtime token. The following Netty control-channel login verifies
+  `cs_` runtime token. The following v2 control/data login verifies
 `clientSessionId + accessToken`, checks expiry, enabled client/credential state, same-machine
 single-instance state, and `maxOnlineInstances`, then marks the row `NETTY_ONLINE`; disconnects
-mark it `DISCONNECTED`. When no matching SQLite credential exists, the older environment-token
-smoke-test path is still available. Partial environment client-auth configuration is treated as a
+  mark it `DISCONNECTED`. When no matching SQLite credential exists, the explicitly configured environment-token
+  smoke-test path is available. Partial environment client-auth configuration is treated as a
 server misconfiguration and returns `503` instead of silently falling back. The same listener also
 serves `index.html`, `app.js`, and `app.css` from `TUNNEL_STATIC_ROOT`.
 `/api/admin/overview` and `/api/admin/metrics` use the same SQLite plus environment mapping snapshot
 as client auth login, and count only the current management context's visible TCP mappings.
 
 Requests under `/http/{clientName}/{route}/...` are recognized by the management listener and are
-forwarded to the active control session whose `clientName` matches the path and whose `route`
-exists in the configured HTTP route snapshot. Active control sessions are indexed by client name
-instead of being kept as a single global pointer, so a later login no longer hides other online
-clients from the Direct HTTP dispatcher. Ordinary HTTP requests use the Java-compatible
-`DIRECT_HTTP_REQUEST` / `DIRECT_HTTP_RESPONSE` path. WebSocket upgrade requests on the same route
-are accepted by the C management listener, opened as `NAT CONNECTED` with `source=ws`, and bridged
-bidirectionally with the same one-byte text/binary frame prefix used by the Java server. The C
+forwarded to the active runtime session whose `clientName` matches the path and whose `route`
+exists in the configured HTTP route snapshot. Runtime sessions are indexed by client name, and
+each binds one control connection plus one data connection. Ordinary HTTP requests use NAT stream v2 on the authenticated
+data connection: request/response metadata is carried once in `OPEN`, body bytes are streamed with
+`DATA`, and `FIN`, `RST`, and `WINDOW_UPDATE` propagate half-close, cancellation, and flow control.
+WebSocket upgrades use the same NAT stream and preserve frame semantics in the mandatory 12-byte
+`SWS2` envelope. The C
 implementation currently provides the basic data bridge, summary traffic accounting,
 SQLite-backed detail capture/query path, Java-shaped DB credential startup login, and
 Java-shaped response path rewriting for `text/html`
@@ -274,12 +275,15 @@ zlib or raw `deflate` response decompression before returning an uncompressed re
 does not yet implement Java's Elasticsearch detail persistence, Peer Mesh data plane, TLS, or
 HTTPS OIDC token exchange.
 
-The real admin socket listener accepts `GET /ws/connections?token=<management-jwt>` WebSocket
-upgrades for the management connection event stream. The token is validated with the same local
-management JWT rules as `/api/admin/**`, invalid tokens return `403` with `X-Auth-Reason`, and the
-connection handles WebSocket close / ping / pong frames. The C server broadcasts Java-shaped
-`created` events for runtime login success/failure and `updated` events when an authenticated
-control connection disconnects. Plain non-upgrade HTTP requests to `/ws/connections` still return
+The real admin socket listener requires a two-step WebSocket upgrade for the management connection
+event stream. An authenticated caller first posts `{"endpoint":"connections"}` to
+`/api/admin/ws-tickets`, then connects to `GET /ws/connections?ticket=<single-use-ticket>`. The
+random ticket is valid for 45 seconds, bound to the endpoint, management identity, tenant, and
+source address, stored only as a SHA-256 digest, and removed atomically during a successful
+upgrade. JWT query parameters and reused tickets return `403` with `X-Auth-Reason`. The C server
+broadcasts `created` events for runtime login success/failure and `updated` events when an
+authenticated control connection disconnects; delivery is filtered by tenant and, for non-admin
+users, client ownership. Plain non-upgrade HTTP requests to `/ws/connections` return
 `426 Upgrade Required`.
 
 Security skeleton endpoints:

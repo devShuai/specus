@@ -1754,6 +1754,40 @@ int main(void)
         fprintf(stderr, "websocket skeleton response mismatch\n");
         return 1;
     }
+    len = st_admin_build_response_with_auth("POST",
+                                            "/api/admin/ws-tickets",
+                                            NULL,
+                                            "{\"endpoint\":\"connections\"}",
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "401 Unauthorized")) {
+        fprintf(stderr, "websocket ticket endpoint allowed anonymous access\n");
+        return 1;
+    }
+    len = st_admin_build_response_with_body("POST",
+                                            "/api/admin/ws-tickets",
+                                            "{\"endpoint\":\"connections\"}",
+                                            response,
+                                            sizeof(response));
+    char *connection_ticket = st_json_get_string(response, "ticket");
+    if (len <= 0 || !contains(response, "200 OK")
+        || connection_ticket == NULL || strlen(connection_ticket) != 43U
+        || !contains(response, "\"expiresAt\":")) {
+        free(connection_ticket);
+        fprintf(stderr, "websocket ticket response mismatch\n");
+        return 1;
+    }
+    free(connection_ticket);
+    len = st_admin_build_response_with_body("POST",
+                                            "/api/admin/ws-tickets",
+                                            "{\"endpoint\":\"client-messages\"}",
+                                            response,
+                                            sizeof(response));
+    if (len <= 0 || !contains(response, "400 Bad Request")
+        || !contains(response, "endpoint must be connections")) {
+        fprintf(stderr, "unsupported websocket ticket endpoint was accepted\n");
+        return 1;
+    }
 
     len = st_admin_build_response("GET", "/oidc-config", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"configured\":false")

@@ -10,17 +10,15 @@ final class PeerAppMessageCodec {
     static final String TYPE_MESSAGE = "message";
     static final String TYPE_ACK = "ack";
 
-    private static final byte[] PREFIX_V1 = "STMSG1\n".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] PREFIX_V2 = "STMSG2\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] PREFIX = "STMSG2\n".getBytes(StandardCharsets.US_ASCII);
 
     private PeerAppMessageCodec() {
     }
 
     static boolean looksLike(byte[] payload) {
         return payload != null
-                && payload.length >= PREFIX_V1.length
-                && (Arrays.equals(PREFIX_V1, Arrays.copyOfRange(payload, 0, PREFIX_V1.length))
-                || Arrays.equals(PREFIX_V2, Arrays.copyOfRange(payload, 0, PREFIX_V2.length)));
+                && payload.length >= PREFIX.length
+                && Arrays.equals(PREFIX, Arrays.copyOfRange(payload, 0, PREFIX.length));
     }
 
     static PeerAppMessage decode(byte[] payload) {
@@ -28,8 +26,7 @@ final class PeerAppMessageCodec {
             return null;
         }
         try {
-            int prefixLength = prefixLength(payload);
-            String jsonText = new String(payload, prefixLength, payload.length - prefixLength, StandardCharsets.UTF_8);
+            String jsonText = new String(payload, PREFIX.length, payload.length - PREFIX.length, StandardCharsets.UTF_8);
             JSONObject json = new JSONObject(jsonText);
             String type = json.optString("type", "");
             if (type.trim().isEmpty()) {
@@ -52,30 +49,30 @@ final class PeerAppMessageCodec {
     }
 
     static byte[] encode(PeerAppMessage message) throws Exception {
-        // Java and Go currently recognize STMSG1 only. Keep every ordinary text
-        // message and ACK on that interoperable envelope. STMSG2 is reserved for
-        // the optional attachment extension, which Android does not advertise or
-        // expose through its send path yet.
         boolean attachmentV2 = message != null
                 && TYPE_MESSAGE.equalsIgnoreCase(text(message.type))
                 && message.attachment != null;
-        JSONObject json = new JSONObject();
-        json.put("type", text(message == null ? null : message.type));
-        json.put("id", text(message == null ? null : message.id));
-        json.put("fromClientId", message == null ? 0L : message.fromClientId);
-        json.put("fromClientName", text(message == null ? null : message.fromClientName));
-        json.put("toClientId", message == null ? 0L : message.toClientId);
-        json.put("toClientName", text(message == null ? null : message.toClientName));
-        json.put("message", text(message == null ? null : message.message));
+        StringBuilder json = new StringBuilder(256);
+        json.append("{\"type\":").append(JSONObject.quote(text(message == null ? null : message.type)))
+                .append(",\"id\":").append(JSONObject.quote(text(message == null ? null : message.id)))
+                .append(",\"fromClientId\":").append(message == null ? 0L : message.fromClientId)
+                .append(",\"fromClientName\":").append(JSONObject.quote(
+                        text(message == null ? null : message.fromClientName)))
+                .append(",\"toClientId\":").append(message == null ? 0L : message.toClientId)
+                .append(",\"toClientName\":").append(JSONObject.quote(
+                        text(message == null ? null : message.toClientName)))
+                .append(",\"message\":").append(JSONObject.quote(
+                        text(message == null ? null : message.message)));
         if (attachmentV2) {
-            json.put("attachment", message.attachment);
+            json.append(",\"attachment\":").append(message.attachment);
         }
-        json.put("createdAtMillis", message == null ? 0L : message.createdAtMillis);
+        json.append(",\"createdAtMillis\":")
+                .append(message == null ? 0L : message.createdAtMillis)
+                .append('}');
         byte[] body = json.toString().getBytes(StandardCharsets.UTF_8);
-        byte[] prefix = attachmentV2 ? PREFIX_V2 : PREFIX_V1;
-        byte[] payload = new byte[prefix.length + body.length];
-        System.arraycopy(prefix, 0, payload, 0, prefix.length);
-        System.arraycopy(body, 0, payload, prefix.length, body.length);
+        byte[] payload = new byte[PREFIX.length + body.length];
+        System.arraycopy(PREFIX, 0, payload, 0, PREFIX.length);
+        System.arraycopy(body, 0, payload, PREFIX.length, body.length);
         return payload;
     }
 
@@ -98,12 +95,6 @@ final class PeerAppMessageCodec {
         return (prefix.isEmpty() ? "" : prefix + " ")
                 + "[附件] " + fileName + " · " + mimeType + " · "
                 + (size > 0L ? formatBytes(size) : "-");
-    }
-
-    private static int prefixLength(byte[] payload) {
-        return Arrays.equals(PREFIX_V2, Arrays.copyOfRange(payload, 0, PREFIX_V2.length))
-                ? PREFIX_V2.length
-                : PREFIX_V1.length;
     }
 
     private static String text(String value) {

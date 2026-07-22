@@ -172,10 +172,10 @@ static int hex_value(char ch)
     return -1;
 }
 
-char *st_json_get_string(const char *json, const char *key)
+static char *parse_json_string_value(const char **cursor)
 {
-    const char *p = find_value(json, key);
-    if (p == NULL || *p != '"') {
+    const char *p = *cursor;
+    if (*p != '"') {
         return NULL;
     }
     ++p;
@@ -236,10 +236,81 @@ char *st_json_get_string(const char *json, const char *key)
         free(out);
         return NULL;
     }
+    *cursor = p + 1;
     if (out == NULL) {
         return st_strdup_len("", 0);
     }
     return out;
+}
+
+char *st_json_get_string(const char *json, const char *key)
+{
+    const char *p = find_value(json, key);
+    return p == NULL ? NULL : parse_json_string_value(&p);
+}
+
+void st_json_free_string_array(char **values, size_t values_len)
+{
+    if (values == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < values_len; ++i) {
+        free(values[i]);
+    }
+    free(values);
+}
+
+int st_json_get_string_array(const char *json, const char *key, char ***out, size_t *out_len)
+{
+    if (json == NULL || key == NULL || out == NULL || out_len == NULL) {
+        return -1;
+    }
+    *out = NULL;
+    *out_len = 0;
+    const char *p = find_value(json, key);
+    if (p == NULL || *p != '[') {
+        return -1;
+    }
+    p = skip_ws(p + 1);
+    size_t count = 0;
+    size_t capacity = 0;
+    char **values = NULL;
+    while (*p != ']') {
+        char *value = parse_json_string_value(&p);
+        if (value == NULL) {
+            st_json_free_string_array(values, count);
+            return -1;
+        }
+        if (count == capacity) {
+            size_t next = capacity == 0 ? 4U : capacity * 2U;
+            if (next < capacity || next > SIZE_MAX / sizeof(*values)) {
+                free(value);
+                st_json_free_string_array(values, count);
+                return -1;
+            }
+            char **grown = (char **)realloc(values, next * sizeof(*values));
+            if (grown == NULL) {
+                free(value);
+                st_json_free_string_array(values, count);
+                return -1;
+            }
+            values = grown;
+            capacity = next;
+        }
+        values[count++] = value;
+        p = skip_ws(p);
+        if (*p == ',') {
+            p = skip_ws(p + 1);
+            continue;
+        }
+        if (*p != ']') {
+            st_json_free_string_array(values, count);
+            return -1;
+        }
+    }
+    *out = values;
+    *out_len = count;
+    return 0;
 }
 
 int st_json_get_i64(const char *json, const char *key, long long *out)

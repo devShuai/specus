@@ -1,10 +1,10 @@
 #include "protocol.h"
+#include "json.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <zlib.h>
 
 typedef struct {
     const uint8_t *data;
@@ -18,9 +18,12 @@ typedef struct {
     size_t cap;
 } compact_writer;
 
-#define ST_RAW_PAYLOAD 0U
-#define ST_DEFLATED_PAYLOAD 1U
-#define ST_COMPRESSION_THRESHOLD 64U
+#define ST_NAT_HEADER_SIZE 16U
+
+static uint16_t read_be16(const uint8_t *p)
+{
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
 
 static uint32_t read_be32(const uint8_t *p)
 {
@@ -106,145 +109,16 @@ static int reader_string(compact_reader *reader, char **value)
     return 0;
 }
 
-static int reader_byte_array(compact_reader *reader, uint8_t **value, size_t *len)
-{
-    uint32_t marker;
-    if (reader_varint(reader, &marker) != 0) {
-        return -1;
-    }
-    if (marker == 0) {
-        *value = NULL;
-        *len = 0;
-        return 0;
-    }
-    uint32_t bytes_len = marker - 1U;
-    if (reader->len - reader->pos < bytes_len) {
-        return -1;
-    }
-    uint8_t *out = (uint8_t *)malloc(bytes_len == 0 ? 1U : bytes_len);
-    if (out == NULL) {
-        return -1;
-    }
-    memcpy(out, reader->data + reader->pos, bytes_len);
-    reader->pos += bytes_len;
-    *value = out;
-    *len = bytes_len;
-    return 0;
-}
-
-static int reader_integer(compact_reader *reader, int *value)
-{
-    uint32_t raw;
-    if (reader_varint(reader, &raw) != 0 || raw > (uint32_t)INT_MAX) {
-        return -1;
-    }
-    *value = (int)raw;
-    return 0;
-}
-
 static int reader_enum(compact_reader *reader, int *value)
 {
     uint32_t marker;
-    if (reader_varint(reader, &marker) != 0 || marker == 0) {
+    if (reader_varint(reader, &marker) != 0
+        || marker < ST_MESSAGE_TYPE_SERVER_TO_CLIENT
+        || marker > ST_MESSAGE_TYPE_PEER_CONTROL) {
         return -1;
     }
-    *value = (int)marker - 1;
+    *value = (int)marker;
     return 0;
-}
-
-static int reader_uuid_string(compact_reader *reader, char **value)
-{
-    uint8_t marker;
-    if (reader_u8(reader, &marker) != 0) {
-        return -1;
-    }
-    if (marker == 0) {
-        *value = NULL;
-        return 0;
-    }
-    if (marker == 2) {
-        return reader_string(reader, value);
-    }
-    if (marker != 1 || reader->len - reader->pos < 16U) {
-        return -1;
-    }
-    const uint8_t *b = reader->data + reader->pos;
-    reader->pos += 16U;
-    char *out = (char *)malloc(37U);
-    if (out == NULL) {
-        return -1;
-    }
-    snprintf(out, 37U,
-             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
-    *value = out;
-    return 0;
-}
-
-static int reader_http_method(compact_reader *reader, char **value)
-{
-    static const char *methods[] = {"GET", "POST", "PUT", "DELETE"};
-    uint8_t marker;
-    if (reader_u8(reader, &marker) != 0) {
-        return -1;
-    }
-    if (marker == 0) {
-        *value = NULL;
-        return 0;
-    }
-    if (marker >= 1U && marker <= 4U) {
-        const char *method = methods[marker - 1U];
-        char *out = (char *)malloc(strlen(method) + 1U);
-        if (out == NULL) {
-            return -1;
-        }
-        strcpy(out, method);
-        *value = out;
-        return 0;
-    }
-    if (marker == 5U) {
-        return reader_string(reader, value);
-    }
-    return -1;
-}
-
-static int reader_string_list(compact_reader *reader, char ***values, size_t *len)
-{
-    uint32_t marker;
-    if (reader_varint(reader, &marker) != 0) {
-        return -1;
-    }
-    if (marker == 0) {
-        *values = NULL;
-        *len = 0;
-        return 0;
-    }
-    size_t count = (size_t)marker - 1U;
-    char **items = (char **)calloc(count == 0 ? 1U : count, sizeof(*items));
-    if (items == NULL) {
-        return -1;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        if (reader_string(reader, &items[i]) != 0) {
-            for (size_t j = 0; j < i; ++j) {
-                free(items[j]);
-            }
-            free(items);
-            return -1;
-        }
-    }
-    *values = items;
-    *len = count;
-    return 0;
-}
-
-static void free_string_list(char **values, size_t len)
-{
-    for (size_t i = 0; i < len; ++i) {
-        free(values[i]);
-    }
-    free(values);
 }
 
 static int64_t zigzag_decode(uint64_t value)
@@ -284,6 +158,12 @@ static int reader_numeric_string(compact_reader *reader, char **value)
         return reader_string(reader, value);
     }
     return -1;
+}
+
+static void write_be16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)(value >> 8);
+    p[1] = (uint8_t)value;
 }
 
 static int reader_nullable_long(compact_reader *reader, int64_t *value)
@@ -373,72 +253,39 @@ static int writer_string(compact_writer *writer, const char *value)
     return writer_bytes(writer, (const uint8_t *)value, len);
 }
 
-static int writer_byte_array(compact_writer *writer, const uint8_t *value, size_t len)
+static int known_command(int8_t command)
 {
-    if (value == NULL) {
-        return writer_varint(writer, 0);
+    switch (command) {
+        case ST_CMD_LOGIN_REQUEST:
+        case ST_CMD_LOGIN_RESPONSE:
+        case ST_CMD_MESSAGE_REQUEST:
+        case ST_CMD_MESSAGE_RESPONSE:
+        case ST_CMD_LOGOUT_REQUEST:
+        case ST_CMD_LOGOUT_RESPONSE:
+        case ST_CMD_HEARTBEAT_REQUEST:
+        case ST_CMD_HEARTBEAT_RESPONSE:
+        case ST_CMD_NAT_MESSAGE:
+            return 1;
+        default:
+            return 0;
     }
-    if (len >= UINT32_MAX) {
-        return -1;
-    }
-    if (writer_varint(writer, (uint32_t)len + 1U) != 0) {
-        return -1;
-    }
-    return writer_bytes(writer, value, len);
 }
 
-static int writer_uuid_string(compact_writer *writer, const char *value)
+static size_t command_body_limit(int8_t command)
 {
-    if (value == NULL) {
-        return writer_u8(writer, 0);
+    if (command == ST_CMD_LOGIN_REQUEST || command == ST_CMD_LOGIN_RESPONSE) {
+        return ST_PRE_AUTH_MAX_FRAME_SIZE - ST_HEADER_SIZE;
     }
-    if (writer_u8(writer, 2) != 0) {
-        return -1;
+    if (command == ST_CMD_MESSAGE_REQUEST || command == ST_CMD_MESSAGE_RESPONSE) {
+        return ST_MAX_MESSAGE_BODY_SIZE;
     }
-    return writer_string(writer, value);
+    return ST_MAX_BODY_SIZE;
 }
 
-static int writer_http_method(compact_writer *writer, const char *method)
-{
-    static const char *methods[] = {"GET", "POST", "PUT", "DELETE"};
-    if (method == NULL) {
-        return writer_u8(writer, 0);
-    }
-    for (uint8_t i = 0; i < 4U; ++i) {
-        if (strcmp(method, methods[i]) == 0) {
-            return writer_u8(writer, (uint8_t)(i + 1U));
-        }
-    }
-    if (writer_u8(writer, 5) != 0) {
-        return -1;
-    }
-    return writer_string(writer, method);
-}
-
-static int writer_string_list(compact_writer *writer, char **values, size_t len)
-{
-    if (values == NULL) {
-        return writer_varint(writer, 0);
-    }
-    if (len >= UINT32_MAX) {
-        return -1;
-    }
-    if (writer_varint(writer, (uint32_t)len + 1U) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < len; ++i) {
-        if (writer_string(writer, values[i]) != 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static st_buffer encode_raw_frame(uint8_t serializer, int8_t command, const uint8_t *body, size_t body_len)
+static st_buffer encode_raw_frame(int8_t command, const uint8_t *body, size_t body_len)
 {
     st_buffer buffer = {0};
-    /* Java's Netty maxFrameLength covers the complete 11-byte header + body. */
-    if (body_len > ST_MAX_BODY_SIZE) {
+    if (!known_command(command) || body_len > command_body_limit(command)) {
         return buffer;
     }
     size_t frame_len = ST_HEADER_SIZE + body_len;
@@ -449,7 +296,7 @@ static st_buffer encode_raw_frame(uint8_t serializer, int8_t command, const uint
     buffer.len = frame_len;
     write_be32(buffer.data, ST_MAGIC);
     buffer.data[4] = ST_VERSION;
-    buffer.data[5] = serializer;
+    buffer.data[5] = ST_SERIALIZER_COMPACT_BINARY;
     buffer.data[6] = (uint8_t)command;
     write_be32(buffer.data + 7, (uint32_t)body_len);
     if (body_len > 0) {
@@ -458,146 +305,9 @@ static st_buffer encode_raw_frame(uint8_t serializer, int8_t command, const uint
     return buffer;
 }
 
-static int encode_compact_payload(const uint8_t *raw, size_t raw_len, uint8_t **out, size_t *out_len)
-{
-    if (raw_len >= ST_COMPRESSION_THRESHOLD) {
-        z_stream stream;
-        memset(&stream, 0, sizeof(stream));
-        if (deflateInit2(&stream, Z_BEST_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK) {
-            uLong bound = deflateBound(&stream, (uLong)raw_len);
-            uint8_t *compressed = (uint8_t *)malloc((size_t)bound + 1U);
-            if (compressed != NULL) {
-                stream.next_in = (Bytef *)raw;
-                stream.avail_in = (uInt)raw_len;
-                stream.next_out = compressed + 1U;
-                stream.avail_out = (uInt)bound;
-                int status = deflate(&stream, Z_FINISH);
-                if (status == Z_STREAM_END && stream.total_out < raw_len) {
-                    compressed[0] = ST_DEFLATED_PAYLOAD;
-                    *out = compressed;
-                    *out_len = (size_t)stream.total_out + 1U;
-                    deflateEnd(&stream);
-                    return 0;
-                }
-                free(compressed);
-            }
-            deflateEnd(&stream);
-        }
-    }
-
-    if (raw_len > SIZE_MAX - 1U) {
-        return -1;
-    }
-    uint8_t *buffer = (uint8_t *)malloc(raw_len + 1U);
-    if (buffer == NULL) {
-        return -1;
-    }
-    buffer[0] = ST_RAW_PAYLOAD;
-    if (raw_len > 0) {
-        memcpy(buffer + 1U, raw, raw_len);
-    }
-    *out = buffer;
-    *out_len = raw_len + 1U;
-    return 0;
-}
-
 static st_buffer encode_compact_frame(int8_t command, compact_writer *payload)
 {
-    st_buffer buffer = {0};
-    uint8_t *body = NULL;
-    size_t body_len = 0;
-    if (encode_compact_payload(payload->data, payload->len, &body, &body_len) != 0) {
-        return buffer;
-    }
-    buffer = encode_raw_frame(ST_SERIALIZER_COMPACT_BINARY, command, body, body_len);
-    free(body);
-    return buffer;
-}
-
-static int decode_compact_payload(const uint8_t *payload, size_t payload_len, uint8_t **out, size_t *out_len)
-{
-    if (payload_len == 0) {
-        return -1;
-    }
-    if (payload[0] == ST_RAW_PAYLOAD) {
-        size_t len = payload_len - 1U;
-        uint8_t *copy = (uint8_t *)malloc(len == 0 ? 1U : len);
-        if (copy == NULL) {
-            return -1;
-        }
-        if (len > 0) {
-            memcpy(copy, payload + 1U, len);
-        }
-        *out = copy;
-        *out_len = len;
-        return 0;
-    }
-    if (payload[0] != ST_DEFLATED_PAYLOAD) {
-        return -1;
-    }
-
-    z_stream stream;
-    memset(&stream, 0, sizeof(stream));
-    stream.next_in = (Bytef *)(payload + 1U);
-    stream.avail_in = (uInt)(payload_len - 1U);
-    if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
-        return -1;
-    }
-
-    size_t cap = (payload_len - 1U) * 4U + 1024U;
-    if (cap < 1024U) {
-        cap = 1024U;
-    }
-    if (cap > ST_MAX_INFLATED_SIZE) {
-        cap = ST_MAX_INFLATED_SIZE;
-    }
-    uint8_t *buffer = (uint8_t *)malloc(cap);
-    if (buffer == NULL) {
-        inflateEnd(&stream);
-        return -1;
-    }
-
-    int status;
-    do {
-        if (stream.total_out == cap) {
-            if (cap > ST_MAX_INFLATED_SIZE) {
-                free(buffer);
-                inflateEnd(&stream);
-                return -1;
-            }
-            /*
-             * Give zlib one sentinel byte at the exact Java limit so that a
-             * stream ending at 16 MiB is accepted while 16 MiB + 1 is not.
-             */
-            size_t next = cap == ST_MAX_INFLATED_SIZE
-                ? ST_MAX_INFLATED_SIZE + 1U
-                : cap * 2U;
-            if (next > ST_MAX_INFLATED_SIZE && cap < ST_MAX_INFLATED_SIZE) {
-                next = ST_MAX_INFLATED_SIZE;
-            }
-            uint8_t *grown = (uint8_t *)realloc(buffer, next);
-            if (grown == NULL) {
-                free(buffer);
-                inflateEnd(&stream);
-                return -1;
-            }
-            buffer = grown;
-            cap = next;
-        }
-        stream.next_out = buffer + stream.total_out;
-        stream.avail_out = (uInt)(cap - stream.total_out);
-        status = inflate(&stream, Z_NO_FLUSH);
-    } while (status == Z_OK);
-
-    if (status != Z_STREAM_END || stream.total_out > ST_MAX_INFLATED_SIZE) {
-        free(buffer);
-        inflateEnd(&stream);
-        return -1;
-    }
-    *out_len = stream.total_out;
-    *out = buffer;
-    inflateEnd(&stream);
-    return 0;
+    return encode_raw_frame(command, payload->data, payload->len);
 }
 
 int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *header)
@@ -610,7 +320,10 @@ int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *
     header->serializer = raw[5];
     header->command = (int8_t)raw[6];
     header->length = read_be32(raw + 7);
-    if (header->version != ST_VERSION || header->length > ST_MAX_BODY_SIZE) {
+    if (header->version != ST_VERSION
+        || header->serializer != ST_SERIALIZER_COMPACT_BINARY
+        || !known_command(header->command)
+        || header->length > command_body_limit(header->command)) {
         return -1;
     }
     return 0;
@@ -618,55 +331,40 @@ int st_protocol_read_header(const uint8_t raw[ST_HEADER_SIZE], st_frame_header *
 
 int st_protocol_decode_empty_packet(const uint8_t *body, size_t body_len)
 {
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
-        return -1;
-    }
-    free(payload);
-    return payload_len == 0 ? 0 : -1;
+    (void)body;
+    return body_len == 0 ? 0 : -1;
 }
 
 int st_protocol_decode_login_request(const uint8_t *body, size_t body_len, st_login_request *request)
 {
     memset(request, 0, sizeof(*request));
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
-        return -1;
-    }
     compact_reader reader = {
-        .data = payload,
-        .len = payload_len,
+        .data = body,
+        .len = body_len,
         .pos = 0
     };
     if (reader_string(&reader, &request->client_name) != 0
         || reader_nullable_long(&reader, &request->client_session_id) != 0
-        || reader_string(&reader, &request->access_token) != 0) {
-        free(payload);
+        || reader_string(&reader, &request->access_token) != 0
+        || reader_string(&reader, &request->connection_role) != 0
+        || (strcmp(request->connection_role, ST_CONNECTION_ROLE_CONTROL) != 0
+            && strcmp(request->connection_role, ST_CONNECTION_ROLE_DATA) != 0)) {
         st_login_request_free(request);
         return -1;
     }
     if (reader.pos != reader.len) {
-        free(payload);
         st_login_request_free(request);
         return -1;
     }
-    free(payload);
     return 0;
 }
 
 int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st_message_response *response)
 {
     memset(response, 0, sizeof(*response));
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
-        return -1;
-    }
     compact_reader reader = {
-        .data = payload,
-        .len = payload_len,
+        .data = body,
+        .len = body_len,
         .pos = 0
     };
     if (reader_string(&reader, &response->client_name) != 0
@@ -674,95 +372,97 @@ int st_protocol_decode_message_response(const uint8_t *body, size_t body_len, st
         || reader_enum(&reader, &response->message_type) != 0
         || reader_string(&reader, &response->message) != 0
         || reader.pos != reader.len) {
-        free(payload);
         st_message_response_free(response);
         return -1;
     }
-    free(payload);
     return 0;
 }
 
-int st_protocol_decode_direct_http_request(const uint8_t *body, size_t body_len, st_direct_http_request *request)
+static int validate_nat_semantics(int type, uint8_t flags, uint32_t stream_id, uint32_t value,
+                                  size_t meta_len, size_t data_len)
 {
-    memset(request, 0, sizeof(*request));
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
+    int stream_frame = type == ST_NAT_OPEN || type == ST_NAT_FIN || type == ST_NAT_DATA
+        || type == ST_NAT_RST || type == ST_NAT_WINDOW_UPDATE;
+    if (stream_frame == (stream_id == 0U)) {
         return -1;
     }
-    compact_reader reader = {
-        .data = payload,
-        .len = payload_len,
-        .pos = 0
-    };
-    if (reader_uuid_string(&reader, &request->request_id) != 0
-        || reader_http_method(&reader, &request->request_method) != 0
-        || reader_string(&reader, &request->route) != 0
-        || reader_string(&reader, &request->relative_path) != 0
-        || reader_string(&reader, &request->raw_query) != 0
-        || reader_string_list(&reader, &request->headers, &request->headers_len) != 0
-        || reader_byte_array(&reader, &request->body, &request->body_len) != 0
-        || reader.pos != reader.len) {
-        free(payload);
-        st_direct_http_request_free(request);
+    if (type != ST_NAT_DATA && flags != 0U) {
         return -1;
     }
-    free(payload);
-    return 0;
-}
-
-int st_protocol_decode_direct_http_response(const uint8_t *body, size_t body_len, st_direct_http_response *response)
-{
-    memset(response, 0, sizeof(*response));
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-    if (decode_compact_payload(body, body_len, &payload, &payload_len) != 0) {
+    if (type == ST_NAT_DATA && (meta_len != 0U || value != 0U)) {
         return -1;
     }
-    compact_reader reader = {
-        .data = payload,
-        .len = payload_len,
-        .pos = 0
-    };
-    if (reader_uuid_string(&reader, &response->request_id) != 0
-        || reader_integer(&reader, &response->status_code) != 0
-        || reader_string_list(&reader, &response->headers, &response->headers_len) != 0
-        || reader_byte_array(&reader, &response->body, &response->body_len) != 0
-        || reader_string(&reader, &response->error) != 0
-        || reader.pos != reader.len) {
-        free(payload);
-        st_direct_http_response_free(response);
+    if (type == ST_NAT_FIN && (data_len != 0U || flags != 0U)) {
         return -1;
     }
-    free(payload);
+    if (type == ST_NAT_WINDOW_UPDATE
+        && (meta_len != 0U || data_len != 0U || flags != 0U)) {
+        return -1;
+    }
+    if (type == ST_NAT_WINDOW_UPDATE && value == 0U) {
+        return -1;
+    }
+    if (type == ST_NAT_FIN && value != 0U) {
+        return -1;
+    }
+    if (type == ST_NAT_RST && data_len != 0U) {
+        return -1;
+    }
+    if (!stream_frame && (value != 0U || flags != 0U || data_len != 0U)) {
+        return -1;
+    }
     return 0;
 }
 
 int st_protocol_decode_nat_message(const uint8_t *body, size_t body_len, st_nat_message *message)
 {
     memset(message, 0, sizeof(*message));
-    if (body == NULL || body_len < 8U) {
+    if (body == NULL || body_len < ST_NAT_HEADER_SIZE) {
         return -1;
     }
-    message->type = (int)read_be32(body);
-    uint32_t meta_len = read_be32(body + 4U);
-    if (body_len - 8U < meta_len) {
+    message->type = (int)body[0];
+    if (message->type < ST_NAT_REGISTER || message->type > ST_NAT_WINDOW_UPDATE) {
         return -1;
     }
-    message->meta_json = (char *)malloc((size_t)meta_len + 1U);
+    message->flags = body[1];
+    if ((message->flags & (uint8_t)~ST_NAT_FLAG_END_STREAM) != 0U) {
+        return -1;
+    }
+    size_t meta_len = read_be16(body + 2U);
+    message->stream_id = read_be32(body + 4U);
+    message->value = read_be32(body + 8U);
+    size_t data_len = read_be32(body + 12U);
+    if (meta_len > ST_MAX_NAT_METADATA_SIZE
+        || data_len > ST_MAX_BODY_SIZE
+        || meta_len > SIZE_MAX - ST_NAT_HEADER_SIZE - data_len
+        || body_len != ST_NAT_HEADER_SIZE + meta_len + data_len
+        || validate_nat_semantics(message->type, message->flags, message->stream_id,
+                                  message->value, meta_len, data_len) != 0) {
+        return -1;
+    }
+    if (meta_len == 0U) {
+        message->meta_json = (char *)malloc(3U);
+        if (message->meta_json != NULL) {
+            memcpy(message->meta_json, "{}", 3U);
+        }
+    } else {
+        message->meta_json = (char *)malloc(meta_len + 1U);
+        if (message->meta_json != NULL) {
+            memcpy(message->meta_json, body + ST_NAT_HEADER_SIZE, meta_len);
+            message->meta_json[meta_len] = '\0';
+        }
+    }
     if (message->meta_json == NULL) {
         return -1;
     }
-    memcpy(message->meta_json, body + 8U, meta_len);
-    message->meta_json[meta_len] = '\0';
-
-    size_t data_offset = 8U + (size_t)meta_len;
-    if (body_len > data_offset) {
-        if (decode_compact_payload(body + data_offset, body_len - data_offset,
-                                   &message->data, &message->data_len) != 0) {
+    if (data_len > 0U) {
+        message->data = (uint8_t *)malloc(data_len);
+        if (message->data == NULL) {
             st_nat_message_free(message);
             return -1;
         }
+        memcpy(message->data, body + ST_NAT_HEADER_SIZE + meta_len, data_len);
+        message->data_len = data_len;
     }
     return 0;
 }
@@ -788,7 +488,7 @@ st_buffer st_protocol_encode_nat_control(const char *client_name, const char *na
     st_buffer buffer = {0};
     if (writer_string(&payload, client_name) != 0
         || writer_string(&payload, NULL) != 0
-        || writer_varint(&payload, 4U) != 0
+        || writer_varint(&payload, ST_MESSAGE_TYPE_NAT_CONTROL) != 0
         || writer_string(&payload, nat_control_json) != 0) {
         free(payload.data);
         return buffer;
@@ -798,57 +498,42 @@ st_buffer st_protocol_encode_nat_control(const char *client_name, const char *na
     return buffer;
 }
 
-st_buffer st_protocol_encode_direct_http_request(const st_direct_http_request *request)
-{
-    compact_writer payload = {0};
-    st_buffer buffer = {0};
-    if (request == NULL
-        || writer_uuid_string(&payload, request->request_id) != 0
-        || writer_http_method(&payload, request->request_method) != 0
-        || writer_string(&payload, request->route) != 0
-        || writer_string(&payload, request->relative_path) != 0
-        || writer_string(&payload, request->raw_query) != 0
-        || writer_string_list(&payload, request->headers, request->headers_len) != 0
-        || writer_byte_array(&payload, request->body, request->body_len) != 0) {
-        free(payload.data);
-        return buffer;
-    }
-    buffer = encode_compact_frame(ST_CMD_DIRECT_HTTP_REQUEST, &payload);
-    free(payload.data);
-    return buffer;
-}
-
-st_buffer st_protocol_encode_nat_message(int type, const char *meta_json, const uint8_t *data, size_t data_len)
+st_buffer st_protocol_encode_nat_message(int type, uint8_t flags, uint32_t stream_id, uint32_t value,
+                                         const char *meta_json, const uint8_t *data, size_t data_len)
 {
     st_buffer buffer = {0};
-    if (meta_json == NULL) {
-        meta_json = "{}";
-    }
-    size_t meta_len = strlen(meta_json);
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-    if (data != NULL && data_len > 0
-        && encode_compact_payload(data, data_len, &payload, &payload_len) != 0) {
+    if (type < ST_NAT_REGISTER || type > ST_NAT_WINDOW_UPDATE) {
         return buffer;
     }
-    if (meta_len > UINT32_MAX || payload_len > UINT32_MAX || meta_len > SIZE_MAX - payload_len - 8U) {
-        free(payload);
+    size_t meta_len = meta_json == NULL || strcmp(meta_json, "{}") == 0 ? 0U : strlen(meta_json);
+    if (meta_len > ST_MAX_NAT_METADATA_SIZE) {
         return buffer;
     }
-    size_t body_len = 8U + meta_len + payload_len;
-    uint8_t *body = (uint8_t *)malloc(body_len == 0 ? 1U : body_len);
+    if ((data == NULL && data_len > 0U)
+        || data_len > UINT32_MAX
+        || meta_len > ST_MAX_NAT_METADATA_SIZE
+        || meta_len > SIZE_MAX - data_len - ST_NAT_HEADER_SIZE
+        || validate_nat_semantics(type, flags, stream_id, value, meta_len, data_len) != 0) {
+        return buffer;
+    }
+    size_t body_len = ST_NAT_HEADER_SIZE + meta_len + data_len;
+    uint8_t *body = (uint8_t *)malloc(body_len);
     if (body == NULL) {
-        free(payload);
         return buffer;
     }
-    write_be32(body, (uint32_t)type);
-    write_be32(body + 4U, (uint32_t)meta_len);
-    memcpy(body + 8U, meta_json, meta_len);
-    if (payload_len > 0) {
-        memcpy(body + 8U + meta_len, payload, payload_len);
+    body[0] = (uint8_t)type;
+    body[1] = flags;
+    write_be16(body + 2U, (uint16_t)meta_len);
+    write_be32(body + 4U, stream_id);
+    write_be32(body + 8U, value);
+    write_be32(body + 12U, (uint32_t)data_len);
+    if (meta_len > 0U) {
+        memcpy(body + ST_NAT_HEADER_SIZE, meta_json, meta_len);
     }
-    buffer = encode_raw_frame(ST_SERIALIZER_FASTJSON, ST_CMD_NAT_MESSAGE, body, body_len);
-    free(payload);
+    if (data_len > 0U) {
+        memcpy(body + ST_NAT_HEADER_SIZE + meta_len, data, data_len);
+    }
+    buffer = encode_raw_frame(ST_CMD_NAT_MESSAGE, body, body_len);
     free(body);
     return buffer;
 }
@@ -866,6 +551,7 @@ void st_login_request_free(st_login_request *request)
     }
     free(request->client_name);
     free(request->access_token);
+    free(request->connection_role);
     memset(request, 0, sizeof(*request));
 }
 
@@ -877,33 +563,6 @@ void st_message_response_free(st_message_response *response)
     free(response->client_name);
     free(response->to_client_name);
     free(response->message);
-    memset(response, 0, sizeof(*response));
-}
-
-void st_direct_http_request_free(st_direct_http_request *request)
-{
-    if (request == NULL) {
-        return;
-    }
-    free(request->request_id);
-    free(request->request_method);
-    free(request->route);
-    free(request->relative_path);
-    free(request->raw_query);
-    free_string_list(request->headers, request->headers_len);
-    free(request->body);
-    memset(request, 0, sizeof(*request));
-}
-
-void st_direct_http_response_free(st_direct_http_response *response)
-{
-    if (response == NULL) {
-        return;
-    }
-    free(response->request_id);
-    free_string_list(response->headers, response->headers_len);
-    free(response->body);
-    free(response->error);
     memset(response, 0, sizeof(*response));
 }
 

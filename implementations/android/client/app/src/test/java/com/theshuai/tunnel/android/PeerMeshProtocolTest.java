@@ -1,5 +1,6 @@
 package com.theshuai.tunnel.android;
 
+import org.json.JSONObject;
 import org.junit.Test;
 
 import java.net.InetAddress;
@@ -17,32 +18,85 @@ import static org.junit.Assert.assertTrue;
 
 public class PeerMeshProtocolTest {
     @Test
-    public void spm1FrameRoundTripsAndAuthenticatesHeaderAndCiphertext() throws Exception {
+    public void spm2FrameRoundTripsAndAuthenticatesHeaderAndCiphertext() throws Exception {
         byte[] key = new byte[32];
         for (int i = 0; i < key.length; i++) {
             key[i] = (byte) (i + 1);
         }
         byte[] plaintext = "hello peer mesh".getBytes(StandardCharsets.UTF_8);
-        byte[] encoded = PeerMeshEngine.DataFrameCodec.encode(key, 91L, 10L, 20L, 7L, plaintext);
+        byte[] encoded = PeerMeshEngine.DataFrameCodec.encode(key, 91L, 10L, 20L, "epoch-a", 7L, plaintext);
 
         assertTrue(PeerMeshEngine.DataFrameCodec.looksLike(encoded));
         assertEquals(Long.valueOf(91L), PeerMeshEngine.DataFrameCodec.sessionId(encoded));
-        PeerMeshEngine.DataFrame decoded = PeerMeshEngine.DataFrameCodec.decode(key, encoded, 91L, 20L);
+        PeerMeshEngine.DataFrame decoded = PeerMeshEngine.DataFrameCodec.decode(key, encoded, 91L, 10L, 20L, "epoch-a");
         assertEquals(91L, decoded.sessionId);
-        assertEquals(10L, decoded.fromClientId);
-        assertEquals(20L, decoded.toClientId);
         assertEquals(7L, decoded.sequence);
         assertArrayEquals(plaintext, decoded.plaintext);
 
-        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, encoded, 92L, 20L));
-        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, encoded, 91L, 21L));
+        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, encoded, 92L, 10L, 20L, "epoch-a"));
+        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, encoded, 91L, 20L, 10L, "epoch-a"));
 
         byte[] tampered = encoded.clone();
         tampered[tampered.length - 1] ^= 1;
-        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, tampered, 91L, 20L));
+        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, tampered, 91L, 10L, 20L, "epoch-a"));
 
         byte[] withTrailingByte = Arrays.copyOf(encoded, encoded.length + 1);
-        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, withTrailingByte, 91L, 20L));
+        assertNull(PeerMeshEngine.DataFrameCodec.decode(key, withTrailingByte, 91L, 10L, 20L, "epoch-a"));
+    }
+
+    @Test
+    public void spm2FrameMatchesSharedWireVector() throws Exception {
+        JSONObject vector = ProtocolVectorTestSupport.read("peer-mesh-spm2.json");
+        byte[] key = ProtocolVectorTestSupport.hex(vector.getString("sessionKeyHex"));
+        long sessionId = vector.getLong("sessionId");
+        long fromClientId = vector.getLong("fromClientId");
+        long toClientId = vector.getLong("toClientId");
+        String senderKeyEpoch = vector.getString("senderKeyEpoch");
+        long sequence = vector.getLong("sequence");
+        byte[] plaintext = vector.getString("plaintextUtf8").getBytes(StandardCharsets.UTF_8);
+
+        byte[] encoded = PeerMeshEngine.DataFrameCodec.encode(
+                key,
+                sessionId,
+                fromClientId,
+                toClientId,
+                senderKeyEpoch,
+                sequence,
+                plaintext);
+
+        assertArrayEquals(ProtocolVectorTestSupport.hex(vector.getString("frameHex")), encoded);
+        PeerMeshEngine.DataFrame decoded = PeerMeshEngine.DataFrameCodec.decode(
+                key, encoded, sessionId, fromClientId, toClientId, senderKeyEpoch);
+        assertNotNull(decoded);
+        assertEquals(sequence, decoded.sequence);
+        assertArrayEquals(plaintext, decoded.plaintext);
+
+        assertNull(PeerMeshEngine.DataFrameCodec.decode(
+                key, encoded, sessionId, toClientId, fromClientId, senderKeyEpoch));
+
+        byte[] invalidSequence = encoded.clone();
+        Arrays.fill(invalidSequence, 12, 20, (byte) 0);
+        assertNull(PeerMeshEngine.DataFrameCodec.decode(
+                key, invalidSequence, sessionId, fromClientId, toClientId, senderKeyEpoch));
+    }
+
+    @Test
+    public void spm2KeyEpochIsolatesNonceSpaceAcrossRestarts() throws Exception {
+        // 客户端重启后可能拿回同一 sessionId/token，而 sequence 从 1 重新开始。
+        // epoch 必须改变 traffic key，否则同一 key 下会重放同一段 nonce 空间。
+        byte[] key = new byte[32];
+        for (int i = 0; i < key.length; i++) {
+            key[i] = (byte) (i + 1);
+        }
+        byte[] plaintext = "payload".getBytes(StandardCharsets.UTF_8);
+        byte[] before = PeerMeshEngine.DataFrameCodec.encode(
+                key, 91L, 10L, 20L, "epoch-before-restart", 1L, plaintext);
+        byte[] after = PeerMeshEngine.DataFrameCodec.encode(
+                key, 91L, 10L, 20L, "epoch-after-restart", 1L, plaintext);
+
+        assertFalse(Arrays.equals(before, after));
+        assertNull(PeerMeshEngine.DataFrameCodec.decode(
+                key, before, 91L, 10L, 20L, "epoch-after-restart"));
     }
 
     @Test
@@ -52,10 +106,21 @@ public class PeerMeshProtocolTest {
         assertTrue(replay.accept(100L));
         assertTrue(replay.accept(99L));
         assertFalse(replay.accept(100L));
-        assertTrue(replay.accept(164L));
-        assertFalse(replay.accept(100L));
         assertTrue(replay.accept(101L));
         assertFalse(replay.accept(101L));
+        assertTrue(replay.accept(5000L));
+        assertFalse(replay.accept(100L));
+    }
+
+    @Test
+    public void sessionReplayWindowRejectsDuplicates() {
+        PeerMeshEngine.PeerSession session =
+                new PeerMeshEngine.PeerSession(2L, 100L, "token", "");
+
+        assertTrue(session.accept(new PeerMeshEngine.DataFrame(100L, 7L, new byte[0])));
+        assertFalse(session.accept(new PeerMeshEngine.DataFrame(100L, 7L, new byte[0])));
+        assertTrue(session.accept(new PeerMeshEngine.DataFrame(100L, 8L, new byte[0])));
+        assertFalse(session.accept(new PeerMeshEngine.DataFrame(100L, 0L, new byte[0])));
     }
 
     @Test
@@ -142,7 +207,8 @@ public class PeerMeshProtocolTest {
         PeerMeshEngine.PendingTurnRequest[] pending = new PeerMeshEngine.PendingTurnRequest[]{
                 PeerMeshEngine.PendingTurnRequest.allocate(),
                 PeerMeshEngine.PendingTurnRequest.refresh(240L),
-                PeerMeshEngine.PendingTurnRequest.createPermission(peer)
+				PeerMeshEngine.PendingTurnRequest.createPermission(peer),
+				PeerMeshEngine.PendingTurnRequest.channelBind(peer, PeerMeshEngine.TurnChannelData.MIN_CHANNEL)
         };
 
         assertEquals(PeerMeshEngine.TurnOperation.ALLOCATE, pending[0].operation);
@@ -154,6 +220,11 @@ public class PeerMeshProtocolTest {
                 pending[1].operationAttributes(transactionId(4))[0].type);
         assertEquals(PeerMeshEngine.TurnOperation.CREATE_PERMISSION, pending[2].operation);
         assertEquals(peer, pending[2].peer);
+		assertEquals(PeerMeshEngine.TurnOperation.CHANNEL_BIND, pending[3].operation);
+		assertEquals(PeerMeshEngine.StunMessage.ATTR_CHANNEL_NUMBER,
+				pending[3].operationAttributes(transactionId(5))[0].type);
+		assertEquals(PeerMeshEngine.StunMessage.ATTR_XOR_PEER_ADDRESS,
+				pending[3].operationAttributes(transactionId(5))[1].type);
 
         for (PeerMeshEngine.PendingTurnRequest original : pending) {
             PeerMeshEngine.PendingTurnRequest retry = original.retryOnce();
@@ -165,6 +236,17 @@ public class PeerMeshProtocolTest {
             assertNull(retry.retryOnce());
         }
     }
+
+	@Test
+	public void turnChannelDataRoundTripsAndRejectsTrailingBytes() {
+		byte[] encoded = PeerMeshEngine.TurnChannelData.encode(
+				PeerMeshEngine.TurnChannelData.MIN_CHANNEL, new byte[]{1, 2, 3});
+		PeerMeshEngine.TurnChannelData decoded = PeerMeshEngine.TurnChannelData.parse(encoded);
+		assertNotNull(decoded);
+		assertEquals(PeerMeshEngine.TurnChannelData.MIN_CHANNEL, decoded.channelNumber);
+		assertArrayEquals(new byte[]{1, 2, 3}, decoded.payload);
+		assertNull(PeerMeshEngine.TurnChannelData.parse(Arrays.copyOf(encoded, encoded.length + 3)));
+	}
 
     @Test
     public void turnPendingRequestRequiresMatchingResponseEndpoint() throws Exception {
@@ -259,4 +341,115 @@ public class PeerMeshProtocolTest {
         }
         return result;
     }
+
+    private static PeerMeshEngine.PeerCandidate candidate(String type, String transport,
+                                                          String address, int port, long priority,
+                                                          String foundation) {
+        PeerMeshEngine.PeerCandidate candidate = new PeerMeshEngine.PeerCandidate();
+        candidate.type = type;
+        candidate.transport = transport;
+        candidate.address = address;
+        candidate.port = port;
+        candidate.priority = priority;
+        candidate.foundation = foundation;
+        return candidate;
+    }
+
+    @Test
+    public void sortedDirectCandidateEndpointsOrdersByPriorityDescending() {
+        // H-3：连通性检查候选按 priority 降序排列，高优先级（host）排在前面先被探测。
+        List<PeerMeshEngine.PeerCandidate> input = Arrays.asList(
+                candidate("srflx", "udp", "203.0.113.10", 30001, 800, "standard-stun"),
+                candidate("host", "udp", "192.168.1.5", 40000, 1000, "host"),
+                candidate("srflx", "udp", "203.0.113.20", 30002, 900, "public-stun"));
+        java.util.Set<String> noLocal = java.util.Collections.emptySet();
+        List<InetSocketAddress> endpoints = PeerMeshEngine.sortedDirectCandidateEndpoints(input, noLocal);
+        // 期望顺序：1000 (host:192.168.1.5) -> 900 (203.0.113.20) -> 800 (203.0.113.10)
+        assertEquals(3, endpoints.size());
+        assertEquals(new InetSocketAddress("192.168.1.5", 40000), endpoints.get(0));
+        assertEquals(new InetSocketAddress("203.0.113.20", 30002), endpoints.get(1));
+        assertEquals(new InetSocketAddress("203.0.113.10", 30001), endpoints.get(2));
+    }
+
+    @Test
+    public void demoteSameNatReflexiveCandidatesLowersPriorityWithoutPruning() {
+        // H-6：与本地 STUN 公网地址相同的 reflexive 候选被降到 priority=1（排到末尾），而非被剪除。
+        String localAddr = "203.0.113.42";
+        java.util.Set<String> localAddresses = new java.util.HashSet<>();
+        localAddresses.add(localAddr);
+        List<PeerMeshEngine.PeerCandidate> input = Arrays.asList(
+                // 同 NAT 的 srflx：应被降权到 priority=1
+                candidate("srflx", "udp", localAddr, 34567, 800, "standard-stun"),
+                // 不同地址的 srflx：保持原 priority
+                candidate("srflx", "udp", "203.0.113.99", 35000, 800, "public-stun"),
+                // host 候选：不受影响
+                candidate("host", "udp", "192.168.1.5", 40000, 1000, "host"));
+        List<PeerMeshEngine.PeerCandidate> demoted =
+                PeerMeshEngine.demoteSameNatReflexiveCandidates(input, localAddresses);
+        // 降权不剪除：数量不变
+        assertEquals(3, demoted.size());
+        // 同 NAT 的 srflx 应被降到 priority=1
+        PeerMeshEngine.PeerCandidate sameNat = demoted.get(0);
+        assertEquals(localAddr, sameNat.address);
+        assertEquals(1L, sameNat.priority);
+        // 不同地址的 srflx 保持原 priority=800
+        PeerMeshEngine.PeerCandidate remote = demoted.get(1);
+        assertEquals("203.0.113.99", remote.address);
+        assertEquals(800L, remote.priority);
+        // host 候选保持原 priority=1000
+        PeerMeshEngine.PeerCandidate host = demoted.get(2);
+        assertEquals(1000L, host.priority);
+    }
+
+    @Test
+    public void sortedDirectCandidateEndpointsDemotesSameNatReflexiveToEnd() {
+        // H-3 + H-6 组合：降权后再排序，同 NAT reflexive 自然排到末尾。
+        String localAddr = "203.0.113.42";
+        java.util.Set<String> localAddresses = new java.util.HashSet<>();
+        localAddresses.add(localAddr);
+        List<PeerMeshEngine.PeerCandidate> input = Arrays.asList(
+                candidate("srflx", "udp", localAddr, 34567, 800, "standard-stun"),
+                candidate("srflx", "udp", "203.0.113.99", 35000, 800, "public-stun"),
+                candidate("host", "udp", "192.168.1.5", 40000, 1000, "host"));
+        List<InetSocketAddress> endpoints = PeerMeshEngine.sortedDirectCandidateEndpoints(input, localAddresses);
+        assertEquals(3, endpoints.size());
+        // 期望顺序：host (1000) -> 不同地址 srflx (800) -> 同 NAT 被降权 srflx (1)
+        assertEquals(new InetSocketAddress("192.168.1.5", 40000), endpoints.get(0));
+        assertEquals(new InetSocketAddress("203.0.113.99", 35000), endpoints.get(1));
+        assertEquals(new InetSocketAddress(localAddr, 34567), endpoints.get(2));
+    }
+
+    @Test
+    public void demoteSameNatReflexiveCandidatesCoversPortMapCandidates() {
+        // H-6 也覆盖 port-map 候选（foundation 以 "port-map-" 开头）。
+        String localAddr = "203.0.113.42";
+        java.util.Set<String> localAddresses = new java.util.HashSet<>();
+        localAddresses.add(localAddr);
+        List<PeerMeshEngine.PeerCandidate> input = Arrays.asList(
+                candidate("srflx", "udp", localAddr, 34567, 900, "port-map-1"),
+                candidate("host", "udp", "192.168.1.5", 40000, 1000, "host"));
+        List<PeerMeshEngine.PeerCandidate> demoted =
+                PeerMeshEngine.demoteSameNatReflexiveCandidates(input, localAddresses);
+        assertEquals(2, demoted.size());
+        // port-map 候选与本地 srflx 同地址：应被降权到 priority=1
+        PeerMeshEngine.PeerCandidate portMap = demoted.get(0);
+        assertEquals("port-map-1", portMap.foundation);
+        assertEquals(1L, portMap.priority);
+        // host 候选不受影响
+        assertEquals(1000L, demoted.get(1).priority);
+    }
+
+    @Test
+    public void demoteSameNatReflexiveCandidatesKeepsCountWhenNoLocalSrflx() {
+        // 无本地 srflx 观测时，不做任何降权，候选列表原样返回。
+        List<PeerMeshEngine.PeerCandidate> input = Arrays.asList(
+                candidate("srflx", "udp", "203.0.113.42", 34567, 800, "standard-stun"),
+                candidate("host", "udp", "192.168.1.5", 40000, 1000, "host"));
+        List<PeerMeshEngine.PeerCandidate> demoted =
+                PeerMeshEngine.demoteSameNatReflexiveCandidates(input, java.util.Collections.emptySet());
+        assertEquals(2, demoted.size());
+        assertEquals(800L, demoted.get(0).priority);
+        assertEquals(1000L, demoted.get(1).priority);
+    }
+
 }

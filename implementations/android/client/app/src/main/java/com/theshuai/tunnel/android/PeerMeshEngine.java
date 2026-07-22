@@ -16,6 +16,8 @@ import java.math.BigInteger;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.nio.ByteBuffer;
@@ -33,10 +35,14 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -57,11 +63,19 @@ final class PeerMeshEngine implements Closeable {
     private static final long BEHAVIOR_PROBE_TIMEOUT_MS = 1_600L;
     private static final long TURN_PERMISSION_TTL_MS = 240_000L;
     private static final long TURN_REQUEST_TTL_MS = 15_000L;
+	private static final long TURN_CHANNEL_ACTIVE_TTL_MS = 540_000L;
     private static final long SESSION_REFRESH_MIN_WINDOW_MS = 60_000L;
     private static final long SESSION_REFRESH_MAX_WINDOW_MS = 300_000L;
     private static final long REPORT_INTERVAL_MS = 60_000L;
     private static final long MAINTENANCE_INTERVAL_MS = 30_000L;
     private static final long DIRECT_STALE_MS = 45_000L;
+    // H-2：session 首次发起连通性检查后的密集退避重试节奏，对齐 Java
+    // HOLE_PUNCH_RETRY_DELAYS_MILLIS={1k,2k,4k,8k}。把"打洞成功前的丢包窗口"从最坏 30s
+    // maintenance tick 压缩到数秒，不改变最终成功率。打通或过期即停。
+    private static final long[] HOLE_PUNCH_RETRY_DELAYS_MS = {1_000L, 2_000L, 4_000L, 8_000L};
+    // H-1：候选回礼节流间隔，避免两端互相触发形成信令循环，对齐 Java
+    // CANDIDATE_RECIPROCATE_INTERVAL_MILLIS=2000。
+    private static final long CANDIDATE_RECIPROCATE_INTERVAL_MS = 2_000L;
     private static final long APP_MESSAGE_SESSION_WAIT_MS = 1_500L;
     private static final long APP_MESSAGE_ACK_WAIT_MS = 1_500L;
 
@@ -76,6 +90,12 @@ final class PeerMeshEngine implements Closeable {
     private final StatusPublisher status;
     private final AppMessageSink appMessageSink;
     private final KeyStore.KeyMaterial keyMaterial;
+    /**
+     * 本次运行实例的 SPM2 key epoch。sessionId/token 会在服务端 TTL 内复用、X25519 密钥又
+     * 持久化在磁盘，只有 epoch 能保证重启后 sequence 从 1 重新开始时不落回同一段 nonce 空间。
+     */
+    private final String localKeyEpoch;
+    private final Map<Long, String> peerKeyEpochs = new ConcurrentHashMap<>();
     private final SecureRandom secureRandom = new SecureRandom();
     private final AtomicBoolean enabled = new AtomicBoolean(false);
     private final Map<Long, PeerInfo> peers = new ConcurrentHashMap<>();
@@ -87,7 +107,20 @@ final class PeerMeshEngine implements Closeable {
     private final Map<String, PendingStunBinding> pendingStunBindings = new ConcurrentHashMap<>();
     private final Map<String, PendingTurnRequest> pendingTurnRequests = new ConcurrentHashMap<>();
     private final Map<String, Long> turnPermissions = new ConcurrentHashMap<>();
+	private final Map<String, TurnChannelBinding> turnChannelsByPeer = new ConcurrentHashMap<>();
+	private final Map<Integer, TurnChannelBinding> turnChannelsByNumber = new ConcurrentHashMap<>();
+	private final AtomicLong nextTurnChannel = new AtomicLong(TurnChannelData.MIN_CHANNEL);
     private final Map<String, PendingAppMessageAck> pendingMessageAcks = new ConcurrentHashMap<>();
+    private final Map<String, PathMtuCacheEntry> pathMtuCache = new ConcurrentHashMap<>();
+    // H-2：记录已排程密集退避重试的 session，防止重复排程；本轮结束后释放以便路径失效后重新进入。
+    private final Set<Long> holePunchRetryScheduled = ConcurrentHashMap.newKeySet();
+    // H-1：记录每个 peer 最近一次候选回礼时间，2s 节流防信令循环。
+    private final Map<Long, Long> candidateReciprocateAt = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService pathMtuScheduler = Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "shuai-peer-mesh-path-mtu");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final NatBehaviorDiscovery natBehaviorDiscovery = new NatBehaviorDiscovery();
     private volatile TunnelCore.PeerMeshConfig config;
     private volatile DatagramSocket udpSocket;
@@ -119,6 +152,7 @@ final class PeerMeshEngine implements Closeable {
         this.status = status;
         this.appMessageSink = appMessageSink;
         this.keyMaterial = KeyStore.keyMaterial();
+        this.localKeyEpoch = newKeyEpoch();
     }
 
     synchronized void startOrUpdate(TunnelCore.PeerMeshConfig nextConfig) throws Exception {
@@ -130,6 +164,9 @@ final class PeerMeshEngine implements Closeable {
                 || !equals(config.stunHost, nextConfig.stunHost)
                 || config.stunPort != nextConfig.stunPort;
         pendingTurnRequests.clear();
+		turnChannelsByPeer.clear();
+		turnChannelsByNumber.clear();
+		nextTurnChannel.set(TurnChannelData.MIN_CHANNEL);
         if (stunConfigChanged) {
             pendingStunBindings.clear();
             lastStunCandidateRequestMillis = 0L;
@@ -186,10 +223,14 @@ final class PeerMeshEngine implements Closeable {
             PeerInfo peer = peerFromSignal(json);
             List<PeerCandidate> candidates = parseCandidates(json.optJSONArray("candidates"));
             mergePeer(peer, candidates);
+            applyRemoteKeyEpochFromSignal(json);
             PeerSession session = rememberSession(json);
             if (peer != null) {
                 preparePath(peer, session);
                 flushPending(peer.clientId);
+                // H-1 候选回礼：port-restricted 组合下打洞要求双方几乎同时互射，本端无健康 direct
+                // 路径时立刻回发自身候选，把双端 burst 窗口对齐到一个信令 RTT 内。
+                reciprocateCandidates(peer);
             }
             return;
         }
@@ -329,19 +370,36 @@ final class PeerMeshEngine implements Closeable {
     }
 
     private boolean sendEncryptedPayload(PeerInfo peer, PeerSession session, byte[] payload) {
+        TunnelCore.PeerMeshConfig current = config;
+        if (current == null || session == null || !session.canSend()) {
+            return false;
+        }
+        ensurePathMtuDiscovery(peer, session, current);
+        if (!IpPacket.destinationIpv4(payload).isEmpty()) {
+            int pathMtu = session.pathMtu.effectiveMtu(current.mtu);
+            payload = IpPacket.clampTcpMss(payload, pathMtu);
+            if (payload.length > pathMtu) {
+                injectPacketTooBig(payload, pathMtu);
+                return true;
+            }
+        }
+        return sendRawPeerPayload(peer, session, payload);
+    }
+
+    private boolean sendRawPeerPayload(PeerInfo peer, PeerSession session, byte[] payload) {
         DatagramSocket socket = udpSocket;
         TunnelCore.PeerMeshConfig current = config;
-        if (socket == null || socket.isClosed() || current == null || session == null || !session.canSend()) {
+        if (socket == null || socket.isClosed() || current == null
+                || session == null || !session.canSend()) {
             return false;
         }
         try {
-            byte[] frame = DataFrameCodec.encode(
-                    session.aesKey,
-                    session.sessionId,
-                    current.clientId,
-                    peer.clientId,
-                    session.nextSequence(),
-                    payload);
+            if (!session.ensureTrafficCodecs(current.clientId)) {
+                return false;
+            }
+            long sequence = session.nextSequence();
+            byte[] frame = session.outboundCodec.encode(
+                    session.sessionId, sequence, payload);
             String relayTarget = relayFallbackTarget(peer, session);
             if (!isBlank(relayTarget)) {
                 return sendRelayPayload(relayTarget, frame);
@@ -353,6 +411,104 @@ final class PeerMeshEngine implements Closeable {
         } catch (Exception e) {
             publish("Peer send failed", e.getMessage());
             return false;
+        }
+    }
+
+    private void ensurePathMtuDiscovery(PeerInfo peer,
+                                        PeerSession session,
+                                        TunnelCore.PeerMeshConfig current) {
+        String relayTarget = relayFallbackTarget(peer, session);
+        String pathKey = pathMtuKey(session, relayTarget);
+        if (pathKey.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        PathMtuCacheEntry cached = pathMtuCache.get(pathKey);
+        if (cached != null && cached.validUntilMillis <= now) {
+            pathMtuCache.remove(pathKey, cached);
+            cached = null;
+        }
+        applyPathMtuTransition(peer, session, session.pathMtu.activate(
+                pathKey,
+                current.mtu,
+                cached == null ? null : cached.innerMtu,
+                cached == null ? 0L : cached.validUntilMillis,
+                now,
+                secureRandom::nextLong));
+    }
+
+    private boolean handlePathMtuMessage(byte[] payload, PeerSession session) {
+        if (!PeerPathMtu.looksLike(payload)) {
+            return false;
+        }
+        PeerPathMtu.Message message = PeerPathMtu.decode(payload);
+        if (message == null) {
+            return true;
+        }
+        PeerInfo peer = peers.get(session.peerId);
+        if (peer == null) {
+            return true;
+        }
+        if (message.probe) {
+            sendRawPeerPayload(peer, session, PeerPathMtu.ack(message.nonce, message.innerMtu));
+            return true;
+        }
+        applyPathMtuTransition(peer, session, session.pathMtu.acknowledge(
+                message.nonce,
+                message.innerMtu,
+                System.currentTimeMillis(),
+                secureRandom::nextLong));
+        return true;
+    }
+
+    private void applyPathMtuTransition(PeerInfo peer,
+                                        PeerSession session,
+                                        PeerPathMtu.Transition transition) {
+        if (transition.completedMtu != null) {
+            String pathKey = session.pathMtu.pathKey();
+            if (!pathKey.isEmpty()) {
+                pathMtuCache.put(pathKey, new PathMtuCacheEntry(
+                        transition.completedMtu,
+                        System.currentTimeMillis() + PeerPathMtu.CACHE_TTL_MILLIS));
+            }
+        }
+        if (transition.probe != null) {
+            sendPathMtuProbe(peer, session, transition.probe);
+        }
+    }
+
+    private void sendPathMtuProbe(PeerInfo peer, PeerSession session, PeerPathMtu.Probe probe) {
+        sendRawPeerPayload(peer, session, PeerPathMtu.probe(probe.nonce, probe.innerMtu));
+        try {
+            pathMtuScheduler.schedule(() -> {
+                if (!enabled.get() || sessionsById.get(session.sessionId) != session) {
+                    return;
+                }
+                applyPathMtuTransition(peer, session, session.pathMtu.timeout(
+                        probe.nonce,
+                        System.currentTimeMillis(),
+                        secureRandom::nextLong));
+            }, PeerPathMtu.PROBE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            // Engine shutdown raced with a final probe.
+        }
+    }
+
+    private String pathMtuKey(PeerSession session, String relayTarget) {
+        if (!isBlank(relayTarget)) {
+            return "relay|" + relayTarget;
+        }
+        return session.remoteEndpoint == null ? "" : "direct|" + endpointKey(session.remoteEndpoint);
+    }
+
+    private void injectPacketTooBig(byte[] packet, int pathMtu) {
+        byte[] response = IpPacket.icmpFragmentationNeeded(packet, pathMtu);
+        if (response != null && vpnPlatform != null) {
+            try {
+                vpnPlatform.writeVpnPacket(response);
+            } catch (Exception e) {
+                publish("Peer path MTU feedback failed", e.getMessage());
+            }
         }
     }
 
@@ -425,6 +581,16 @@ final class PeerMeshEngine implements Closeable {
     }
 
     private void handleUdpPacket(byte[] data, InetSocketAddress remote) throws Exception {
+		TurnChannelData channelData = TurnChannelData.parse(data);
+		if (channelData != null) {
+			TurnChannelBinding binding = turnChannelsByNumber.get(channelData.channelNumber);
+			if (binding != null && binding.active
+					&& binding.expiresAtMillis > System.currentTimeMillis()
+					&& sameEndpoint(relayEndpoint(), remote)) {
+				handleUdpPayload(channelData.payload, remote, endpointKey(binding.peer));
+			}
+			return;
+		}
         StunMessage stun = StunMessage.parse(data);
         if (stun != null) {
             handleStunTurnMessage(stun, remote);
@@ -475,9 +641,13 @@ final class PeerMeshEngine implements Closeable {
                             System.currentTimeMillis() + TURN_PERMISSION_TTL_MS);
                 }
                 break;
+			case StunMessage.CHANNEL_BIND_SUCCESS:
+				activateTurnChannel(pendingTurn);
+				break;
             case StunMessage.ALLOCATE_ERROR:
             case StunMessage.REFRESH_ERROR:
             case StunMessage.CREATE_PERMISSION_ERROR:
+			case StunMessage.CHANNEL_BIND_ERROR:
                 handleTurnError(message, pendingTurn);
                 break;
             case StunMessage.DATA_INDICATION:
@@ -514,8 +684,25 @@ final class PeerMeshEngine implements Closeable {
     private void clearFailedTurnPermission(PendingTurnRequest pending) {
         if (pending != null && pending.peer != null) {
             turnPermissions.remove(endpointKey(pending.peer));
+			if (pending.operation == TurnOperation.CHANNEL_BIND) {
+				TurnChannelBinding binding = turnChannelsByNumber.remove(pending.channelNumber);
+				if (binding != null) {
+					turnChannelsByPeer.remove(endpointKey(binding.peer), binding);
+				}
+			}
         }
     }
+
+	private void activateTurnChannel(PendingTurnRequest pending) {
+		if (pending == null || pending.operation != TurnOperation.CHANNEL_BIND || pending.peer == null) {
+			return;
+		}
+		TurnChannelBinding binding = turnChannelsByNumber.get(pending.channelNumber);
+		if (binding != null && sameEndpoint(binding.peer, pending.peer)) {
+			binding.active = true;
+			binding.expiresAtMillis = System.currentTimeMillis() + TURN_CHANNEL_ACTIVE_TTL_MS;
+		}
+	}
 
     private void handleStunBindingSuccess(StunMessage message,
                                           InetSocketAddress observedRemote) throws Exception {
@@ -538,7 +725,8 @@ final class PeerMeshEngine implements Closeable {
         candidate.transport = "udp";
         candidate.address = mapped.getAddress().getHostAddress();
         candidate.port = mapped.getPort();
-        candidate.priority = 800;
+        candidate.addressFamily = mapped.getAddress() instanceof Inet6Address ? "IPv6" : "IPv4";
+        candidate.priority = mapped.getAddress() instanceof Inet6Address ? 900 : 800;
         candidate.foundation = foundation;
         String key = candidateEndpointKey(candidate);
         boolean candidateChanged = serverReflexiveCandidates.putIfAbsent(key, candidate) == null;
@@ -711,12 +899,18 @@ final class PeerMeshEngine implements Closeable {
         candidate.priority = 100;
         candidate.foundation = "standard-turn";
         candidate.relayId = endpointKey(relayed);
+        candidate.addressFamily = turn.getAddress() instanceof Inet6Address ? "IPv6" : addressFamily(turn.getHostString());
         PeerCandidate previous = relayCandidate;
         relayCandidate = candidate;
-        if (previous == null
+		boolean changed = previous == null
                 || !equals(previous.relayId, candidate.relayId)
                 || !equals(previous.address, candidate.address)
-                || previous.port != candidate.port) {
+				|| previous.port != candidate.port;
+		if (changed) {
+			turnPermissions.clear();
+			turnChannelsByPeer.clear();
+			turnChannelsByNumber.clear();
+			nextTurnChannel.set(TurnChannelData.MIN_CHANNEL);
             announceCandidatesToOnlinePeers();
         }
     }
@@ -725,15 +919,18 @@ final class PeerMeshEngine implements Closeable {
         Long sessionId = DataFrameCodec.sessionId(data);
         PeerSession session = sessionId == null ? null : sessionsById.get(sessionId);
         TunnelCore.PeerMeshConfig current = config;
-        if (session == null || session.aesKey == null || current == null) {
+        if (session == null || current == null || !session.ensureTrafficCodecs(current.clientId)) {
             return;
         }
-        DataFrame frame = DataFrameCodec.decode(session.aesKey, data, session.sessionId, current.clientId);
-        if (frame == null || frame.fromClientId != session.peerId || !session.accept(frame.sequence)) {
+        DataFrame frame = session.inboundCodec.decode(data, session.sessionId);
+        if (frame == null || !session.accept(frame)) {
             return;
         }
         markSessionPath(session, remote, relayFromAllocationId, -1L);
         session.pathReady = true;
+        if (handlePathMtuMessage(frame.plaintext, session)) {
+            return;
+        }
         if (handlePeerAppMessage(frame.plaintext, session, relayFromAllocationId)) {
             return;
         }
@@ -759,7 +956,9 @@ final class PeerMeshEngine implements Closeable {
             return true;
         }
         TunnelCore.PeerMeshConfig current = config;
-        if (current == null || (message.toClientId != 0L && message.toClientId != current.clientId)) {
+        if (current == null
+                || (message.fromClientId != 0L && message.fromClientId != session.peerId)
+                || (message.toClientId != 0L && message.toClientId != current.clientId)) {
             return true;
         }
         PeerInfo peer = peers.get(session.peerId);
@@ -1001,6 +1200,80 @@ final class PeerMeshEngine implements Closeable {
                 publish("Peer relay probe failed", e.getMessage());
             }
         }
+        scheduleHolePunchRetries(session);
+    }
+
+    /**
+     * H-2：session 首次发起连通性检查后按 1s/2s/4s/8s 退避重试，而不是等 30s maintenance tick。
+     * 已建立健康 direct 路径时自动停止。本轮结束后释放标记，路径后续失效时可以重新进入密集重试。
+     * 复用 pathMtuScheduler 做延迟调度，回调里重新校验 session 身份。对齐 Java scheduleHolePunchRetries。
+     */
+    private void scheduleHolePunchRetries(PeerSession session) {
+        if (session == null || !holePunchRetryScheduled.add(session.sessionId)) {
+            return;
+        }
+        long sessionId = session.sessionId;
+        for (long delay : HOLE_PUNCH_RETRY_DELAYS_MS) {
+            pathMtuScheduler.schedule(() -> {
+                if (!enabled.get()) {
+                    return;
+                }
+                PeerSession current = sessionsById.get(sessionId);
+                if (current != session) {
+                    return; // session 已被替换，停止旧的重试
+                }
+                retryHolePunch(sessionId, session);
+            }, delay, TimeUnit.MILLISECONDS);
+        }
+        // 本轮结束后释放标记，路径后续失效时可以重新进入密集重试。
+        long lastDelay = HOLE_PUNCH_RETRY_DELAYS_MS[HOLE_PUNCH_RETRY_DELAYS_MS.length - 1];
+        pathMtuScheduler.schedule(() -> holePunchRetryScheduled.remove(sessionId),
+                lastDelay + 1_000L, TimeUnit.MILLISECONDS);
+    }
+
+    /** H-2 退避重试的实际执行体：重新查找 session，过期或已打通则停止。 */
+    private void retryHolePunch(long sessionId, PeerSession expected) {
+        PeerSession session = sessionsById.get(sessionId);
+        if (session != expected) {
+            holePunchRetryScheduled.remove(sessionId);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (session.isExpired(now) || session.hasHealthyDirect(now)) {
+            holePunchRetryScheduled.remove(sessionId);
+            return;
+        }
+        PeerInfo peer = peers.get(session.peerId);
+        if (peer == null || !peer.online || peer.candidates == null || peer.candidates.isEmpty()) {
+            return;
+        }
+        sendConnectivityChecks(peer, session);
+    }
+
+    /**
+     * H-1 候选回礼：收到对端候选后，若本端尚无健康 direct 路径，立即回发自身候选，把双端打洞
+     * 窗口从最坏 30s maintenance tick 压到一个信令 RTT 内对齐。带 2s 节流防两端互触发形成信令
+     * 循环。对齐 Java reciprocateCandidates。
+     */
+    private void reciprocateCandidates(PeerInfo peer) {
+        if (peer == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        PeerSession session = sessions.get(peer.clientId);
+        if (session != null && session.hasHealthyDirect(now)) {
+            return;
+        }
+        Long previous = candidateReciprocateAt.get(peer.clientId);
+        if (previous != null && now - previous < CANDIDATE_RECIPROCATE_INTERVAL_MS) {
+            return;
+        }
+        candidateReciprocateAt.put(peer.clientId, now);
+        try {
+            sendCandidatesToPeer(peer, session);
+        } catch (Exception e) {
+            publish("Peer reciprocated candidates send failed", e.getMessage());
+        }
     }
 
     private JSONObject buildProbe(PeerInfo peer, PeerSession session) throws Exception {
@@ -1054,6 +1327,8 @@ final class PeerMeshEngine implements Closeable {
         message.put("sourceClientName", config.clientName);
         message.put("sourceVirtualIp", config.virtualIp);
         message.put("sourcePublicKey", keyMaterial.publicKeyBase64);
+        // candidates 是唯一的 peer->peer 信令通道，SPM2 key epoch 随它传播
+        message.put("sourceKeyEpoch", localKeyEpoch);
         message.put("targetClientId", peer.clientId);
         message.put("targetClientName", peer.clientName);
         message.put("targetVirtualIp", peer.virtualIp);
@@ -1064,6 +1339,7 @@ final class PeerMeshEngine implements Closeable {
             message.put("expiresAt", session.expiresAt);
         }
         message.put("createdAtMillis", System.currentTimeMillis());
+        message.put("dataFrameVersion", 2);
         message.put("candidates", candidatesToJson(candidates));
         controlSender.send(peer.clientName, message.toString());
     }
@@ -1080,16 +1356,17 @@ final class PeerMeshEngine implements Closeable {
                     continue;
                 }
                 for (InetAddress address : Collections.list(ni.getInetAddresses())) {
-                    String host = address.getHostAddress();
-                    if (address.isLoopbackAddress() || address.isLinkLocalAddress() || host.contains(":")) {
+                    if (!isUsableHostCandidate(address)) {
                         continue;
                     }
+                    String host = address.getHostAddress();
                     PeerCandidate candidate = new PeerCandidate();
                     candidate.type = "host";
                     candidate.transport = "udp";
                     candidate.address = host;
                     candidate.port = socket.getLocalPort();
-                    candidate.priority = 100;
+                    candidate.addressFamily = address instanceof Inet6Address ? "IPv6" : "IPv4";
+                    candidate.priority = address instanceof Inet6Address ? 1200 : 1000;
                     candidate.foundation = "android-host";
                     result.add(candidate);
                 }
@@ -1285,8 +1562,19 @@ final class PeerMeshEngine implements Closeable {
 
     private void removeExpiredTurnRequests() {
         long now = System.currentTimeMillis();
-        pendingTurnRequests.entrySet().removeIf(
-                entry -> now - entry.getValue().createdAtMillis > TURN_REQUEST_TTL_MS);
+		for (Map.Entry<String, PendingTurnRequest> entry : pendingTurnRequests.entrySet()) {
+			PendingTurnRequest pending = entry.getValue();
+			if (now - pending.createdAtMillis > TURN_REQUEST_TTL_MS
+					&& pendingTurnRequests.remove(entry.getKey(), pending)) {
+				clearFailedTurnPermission(pending);
+			}
+		}
+		for (TurnChannelBinding binding : new ArrayList<>(turnChannelsByNumber.values())) {
+			if (binding.expiresAtMillis <= now) {
+				turnChannelsByNumber.remove(binding.channelNumber, binding);
+				turnChannelsByPeer.remove(endpointKey(binding.peer), binding);
+			}
+		}
     }
 
     private void removeExpiredStunBindings() {
@@ -1326,6 +1614,27 @@ final class PeerMeshEngine implements Closeable {
         return MessageDigest.getInstance("MD5").digest(text.getBytes(StandardCharsets.UTF_8));
     }
 
+    /**
+     * 记录并应用对端上报的 key epoch。只有 source 侧携带自己的 epoch；本端作为 source 时
+     * 该字段是本端 epoch，不能当作对端值。
+     */
+    private void applyRemoteKeyEpochFromSignal(JSONObject json) {
+        TunnelCore.PeerMeshConfig current = config;
+        if (json == null || current == null) {
+            return;
+        }
+        long sourceId = json.optLong("sourceClientId", 0L);
+        String epoch = json.optString("sourceKeyEpoch", "");
+        if (sourceId <= 0 || sourceId == current.clientId || isBlank(epoch)) {
+            return;
+        }
+        peerKeyEpochs.put(sourceId, epoch);
+        PeerSession session = sessions.get(sourceId);
+        if (session != null && session.applyRemoteKeyEpoch(epoch)) {
+            publish("Peer mesh", "remote key epoch changed, inbound state reset: peer=" + sourceId);
+        }
+    }
+
     private PeerSession rememberSession(JSONObject json) {
         long peerId = peerId(json);
         long sessionId = json.optLong("sessionId", 0L);
@@ -1333,15 +1642,30 @@ final class PeerMeshEngine implements Closeable {
         if (peerId <= 0 || sessionId <= 0 || isBlank(token)) {
             return null;
         }
+        if (json.optInt("dataFrameVersion", 0) != 2) {
+            publish("Peer session rejected", "dataFrameVersion 2 required");
+            return null;
+        }
         PeerInfo peer = peers.get(peerId);
         PeerSession previous = sessions.get(peerId);
         PeerSession next = new PeerSession(peerId, sessionId, token, json.optString("expiresAt", ""));
-        if (peer != null) {
-            next.aesKey = deriveSessionKey(next, peer.publicKey);
-        }
         if (previous != null) {
             next.inheritTransportState(previous);
             sessionsById.remove(previous.sessionId, previous);
+        }
+        next.setLocalKeyEpoch(localKeyEpoch);
+        String signalEpoch = json.optString("sourceKeyEpoch", "");
+        if (!isBlank(signalEpoch) && json.optLong("sourceClientId", 0L) == peerId) {
+            peerKeyEpochs.put(peerId, signalEpoch);
+        }
+        String knownEpoch = peerKeyEpochs.get(peerId);
+        if (!isBlank(knownEpoch)) {
+            next.applyRemoteKeyEpoch(knownEpoch);
+        } else if (previous != null) {
+            next.applyRemoteKeyEpoch(previous.remoteKeyEpoch);
+        }
+        if (peer != null) {
+            next.setAesKey(deriveSessionKey(next, peer.publicKey));
         }
         sessions.put(peerId, next);
         sessionsById.put(sessionId, next);
@@ -1359,7 +1683,19 @@ final class PeerMeshEngine implements Closeable {
         if (peer == null || session == null || session.aesKey != null || isBlank(peer.publicKey)) {
             return;
         }
-        session.aesKey = deriveSessionKey(session, peer.publicKey);
+        session.setAesKey(deriveSessionKey(session, peer.publicKey));
+    }
+
+    /** 128 bit 随机 epoch，进程内固定、重启后必然变化 */
+    private static String newKeyEpoch() {
+        byte[] bytes = new byte[16];
+        new SecureRandom().nextBytes(bytes);
+        StringBuilder result = new StringBuilder(bytes.length * 2);
+        for (byte item : bytes) {
+            result.append(Character.forDigit((item >>> 4) & 0x0F, 16));
+            result.append(Character.forDigit(item & 0x0F, 16));
+        }
+        return result.toString();
     }
 
     private byte[] deriveSessionKey(PeerSession session, String peerPublicKeyBase64) {
@@ -1519,6 +1855,7 @@ final class PeerMeshEngine implements Closeable {
             candidate.priority = json.optLong("priority", 0L);
             candidate.foundation = json.optString("foundation", "");
             candidate.relayId = json.optString("relayId", "");
+            candidate.addressFamily = json.optString("addressFamily", addressFamily(candidate.address));
             result.add(candidate);
         }
         return result;
@@ -1535,6 +1872,8 @@ final class PeerMeshEngine implements Closeable {
             json.put("priority", candidate.priority);
             json.put("foundation", candidate.foundation);
             json.put("relayId", candidate.relayId);
+            json.put("addressFamily", isBlank(candidate.addressFamily)
+                    ? addressFamily(candidate.address) : candidate.addressFamily);
             array.put(json);
         }
         return array;
@@ -1549,7 +1888,25 @@ final class PeerMeshEngine implements Closeable {
         if (candidates == null) {
             return List.of();
         }
-        List<PeerCandidate> sorted = new ArrayList<>(candidates);
+        java.util.Set<String> localAddresses = new java.util.HashSet<>();
+        for (PeerCandidate candidate : serverReflexiveCandidates.values()) {
+            if (candidate != null && !isBlank(candidate.address)) {
+                localAddresses.add(candidate.address);
+            }
+        }
+        return sortedDirectCandidateEndpoints(candidates, localAddresses);
+    }
+
+    /**
+     * H-3 + H-6 纯逻辑：先做同 NAT reflexive 降权（priority=1，不剪除），再按 priority 降序排序，
+     * 过滤出可用的 UDP direct 端点。抽成静态方法便于单测，不依赖引擎实例状态。
+     */
+    static List<InetSocketAddress> sortedDirectCandidateEndpoints(List<PeerCandidate> candidates,
+                                                                  java.util.Set<String> localAddresses) {
+        if (candidates == null) {
+            return List.of();
+        }
+        List<PeerCandidate> sorted = new ArrayList<>(demoteSameNatReflexiveCandidates(candidates, localAddresses));
         sorted.sort((a, b) -> Long.compare(b.priority, a.priority));
         List<InetSocketAddress> result = new ArrayList<>();
         for (PeerCandidate candidate : sorted) {
@@ -1562,6 +1919,48 @@ final class PeerMeshEngine implements Closeable {
             result.add(new InetSocketAddress(candidate.address, candidate.port));
         }
         return result;
+    }
+
+    /**
+     * H-6 纯逻辑：给定本地 STUN 公网地址集合，把与之相同的 reflexive 候选降到 priority=1。
+     * 抽成静态方法便于单测，不依赖引擎实例状态。
+     */
+    static List<PeerCandidate> demoteSameNatReflexiveCandidates(List<PeerCandidate> candidates,
+                                                                java.util.Set<String> localAddresses) {
+        if (candidates == null || candidates.isEmpty()) {
+            return candidates;
+        }
+        if (localAddresses == null || localAddresses.isEmpty()) {
+            return candidates;
+        }
+        List<PeerCandidate> demoted = new ArrayList<>(candidates.size());
+        for (PeerCandidate candidate : candidates) {
+            if (candidate != null && isReflexiveCandidate(candidate)
+                    && !isBlank(candidate.address)
+                    && localAddresses.contains(candidate.address)) {
+                PeerCandidate copy = new PeerCandidate();
+                copy.type = candidate.type;
+                copy.transport = candidate.transport;
+                copy.address = candidate.address;
+                copy.port = candidate.port;
+                copy.priority = 1L;
+                copy.foundation = candidate.foundation;
+                copy.relayId = candidate.relayId;
+                copy.addressFamily = candidate.addressFamily;
+                demoted.add(copy);
+            } else {
+                demoted.add(candidate);
+            }
+        }
+        return demoted;
+    }
+
+    /** 判断候选是否为反射型（srflx 或端口映射），同 NAT 检测只针对这类候选。 */
+    private static boolean isReflexiveCandidate(PeerCandidate candidate) {
+        if ("srflx".equalsIgnoreCase(candidate.type)) {
+            return true;
+        }
+        return candidate.foundation != null && candidate.foundation.startsWith("port-map-");
     }
 
     private List<PeerCandidate> relayCandidates(List<PeerCandidate> candidates) {
@@ -1609,6 +2008,12 @@ final class PeerMeshEngine implements Closeable {
         }
         try {
             ensureTurnPermission(peer);
+			TurnChannelBinding binding = ensureTurnChannel(peer);
+			if (binding != null && binding.active && binding.expiresAtMillis > System.currentTimeMillis()) {
+				byte[] channelData = TurnChannelData.encode(binding.channelNumber, payload);
+				socket.send(new DatagramPacket(channelData, channelData.length, turn));
+				return true;
+			}
             byte[] transactionId = StunMessage.newTransactionId();
             byte[] bytes = StunMessage.of(
                     StunMessage.SEND_INDICATION,
@@ -1622,6 +2027,45 @@ final class PeerMeshEngine implements Closeable {
             return false;
         }
     }
+
+	private TurnChannelBinding ensureTurnChannel(InetSocketAddress peer) {
+		if (peer == null || relayEndpoint() == null) {
+			return null;
+		}
+		long now = System.currentTimeMillis();
+		String peerKey = endpointKey(peer);
+		TurnChannelBinding existing = turnChannelsByPeer.get(peerKey);
+		if (existing != null && existing.expiresAtMillis - now > 30_000L) {
+			return existing;
+		}
+		int channel = allocateTurnChannel(now);
+		if (channel == 0) {
+			return null;
+		}
+		TurnChannelBinding binding = new TurnChannelBinding(channel, peer, now + TURN_REQUEST_TTL_MS);
+		turnChannelsByPeer.put(peerKey, binding);
+		turnChannelsByNumber.put(channel, binding);
+		sendTurnRequest(PendingTurnRequest.channelBind(peer, channel));
+		return binding;
+	}
+
+	private synchronized int allocateTurnChannel(long now) {
+		int start = (int) nextTurnChannel.get();
+		if (start < TurnChannelData.MIN_CHANNEL || start > TurnChannelData.MAX_CHANNEL) {
+			start = TurnChannelData.MIN_CHANNEL;
+		}
+		int channel = start;
+		do {
+			TurnChannelBinding binding = turnChannelsByNumber.get(channel);
+			if (binding == null || binding.expiresAtMillis <= now) {
+				nextTurnChannel.set(channel == TurnChannelData.MAX_CHANNEL
+						? TurnChannelData.MIN_CHANNEL : channel + 1L);
+				return channel;
+			}
+			channel = channel == TurnChannelData.MAX_CHANNEL ? TurnChannelData.MIN_CHANNEL : channel + 1;
+		} while (channel != start);
+		return 0;
+	}
 
     private void ensureTurnPermission(InetSocketAddress peer) {
         InetSocketAddress turn = relayEndpoint();
@@ -1670,18 +2114,7 @@ final class PeerMeshEngine implements Closeable {
         } else if (lower.startsWith("stun:")) {
             normalized = normalized.substring("stun:".length());
         }
-        String host = normalized;
-        int port = 3478;
-        int colon = normalized.lastIndexOf(':');
-        if (colon > 0 && colon < normalized.length() - 1) {
-            host = normalized.substring(0, colon);
-            try {
-                port = Integer.parseInt(normalized.substring(colon + 1));
-            } catch (NumberFormatException ignored) {
-                return null;
-            }
-        }
-        return isBlank(host) || port <= 0 ? null : new InetSocketAddress(host, port);
+        return parseHostPort(normalized, 3478, false);
     }
 
     private InetSocketAddress parseEndpoint(String value) {
@@ -1692,15 +2125,7 @@ final class PeerMeshEngine implements Closeable {
         if (normalized.startsWith("turn:")) {
             normalized = normalized.substring("turn:".length());
         }
-        int colon = normalized.lastIndexOf(':');
-        if (colon <= 0 || colon >= normalized.length() - 1) {
-            return null;
-        }
-        try {
-            return new InetSocketAddress(normalized.substring(0, colon), Integer.parseInt(normalized.substring(colon + 1)));
-        } catch (NumberFormatException ignored) {
-            return null;
-        }
+        return parseHostPort(normalized, 0, true);
     }
 
     private String endpointKey(InetSocketAddress endpoint) {
@@ -1708,7 +2133,7 @@ final class PeerMeshEngine implements Closeable {
             return "";
         }
         String host = endpoint.getAddress() == null ? endpoint.getHostString() : endpoint.getAddress().getHostAddress();
-        return host + ":" + endpoint.getPort();
+        return host.contains(":") ? "[" + host + "]:" + endpoint.getPort() : host + ":" + endpoint.getPort();
     }
 
     static boolean sameEndpoint(InetSocketAddress expected, InetSocketAddress actual) {
@@ -1929,10 +2354,14 @@ final class PeerMeshEngine implements Closeable {
             pending.latch.countDown();
         }
         pendingMessageAcks.clear();
+        pathMtuCache.clear();
         serverReflexiveCandidates.clear();
         pendingStunBindings.clear();
         pendingTurnRequests.clear();
         turnPermissions.clear();
+		turnChannelsByPeer.clear();
+		turnChannelsByNumber.clear();
+		nextTurnChannel.set(TurnChannelData.MIN_CHANNEL);
         relayCandidate = null;
         relayAllocationId = null;
         relayAllocationExpiresAtMillis = 0L;
@@ -1957,6 +2386,7 @@ final class PeerMeshEngine implements Closeable {
     @Override
     public void close() {
         stop();
+        pathMtuScheduler.shutdownNow();
     }
 
     private void publish(String text, String detail) {
@@ -1967,6 +2397,70 @@ final class PeerMeshEngine implements Closeable {
 
     private static String firstText(String value, String fallback) {
         return isBlank(value) ? (fallback == null ? "" : fallback) : value;
+    }
+
+    static boolean isUsableHostCandidate(InetAddress address) {
+        if (address == null || address.isAnyLocalAddress() || address.isLoopbackAddress()
+                || address.isLinkLocalAddress() || address.isMulticastAddress()) {
+            return false;
+        }
+        if (address instanceof Inet4Address) {
+            return true;
+        }
+        if (!(address instanceof Inet6Address)) {
+            return false;
+        }
+        byte[] bytes = address.getAddress();
+        return (bytes[0] & 0xfe) != 0xfc;
+    }
+
+    static InetSocketAddress parseHostPort(String value, int defaultPort, boolean requirePort) {
+        if (isBlank(value)) {
+            return null;
+        }
+        String normalized = value.trim();
+        String host;
+        int port = defaultPort;
+        if (normalized.startsWith("[")) {
+            int end = normalized.indexOf(']');
+            if (end <= 1) {
+                return null;
+            }
+            host = normalized.substring(1, end);
+            if (normalized.length() > end + 1) {
+                if (normalized.charAt(end + 1) != ':' || normalized.length() <= end + 2) {
+                    return null;
+                }
+                try {
+                    port = Integer.parseInt(normalized.substring(end + 2));
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            } else if (requirePort) {
+                return null;
+            }
+        } else {
+            int firstColon = normalized.indexOf(':');
+            int lastColon = normalized.lastIndexOf(':');
+            if (firstColon > 0 && firstColon == lastColon) {
+                host = normalized.substring(0, firstColon);
+                try {
+                    port = Integer.parseInt(normalized.substring(firstColon + 1));
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            } else {
+                host = normalized;
+                if (requirePort) {
+                    return null;
+                }
+            }
+        }
+        return isBlank(host) || port <= 0 || port > 65535 ? null : new InetSocketAddress(host, port);
+    }
+
+    private static String addressFamily(String address) {
+        return isBlank(address) ? "" : address.contains(":") ? "IPv6" : "IPv4";
     }
 
     private static boolean isBlank(String value) {
@@ -2075,7 +2569,7 @@ final class PeerMeshEngine implements Closeable {
         }
     }
 
-    private static final class PeerCandidate {
+    static final class PeerCandidate {
         String type;
         String transport;
         String address;
@@ -2083,6 +2577,17 @@ final class PeerMeshEngine implements Closeable {
         long priority;
         String foundation;
         String relayId;
+        String addressFamily;
+    }
+
+    private static final class PathMtuCacheEntry {
+        final int innerMtu;
+        final long validUntilMillis;
+
+        PathMtuCacheEntry(int innerMtu, long validUntilMillis) {
+            this.innerMtu = innerMtu;
+            this.validUntilMillis = validUntilMillis;
+        }
     }
 
     static final class PeerSession {
@@ -2093,8 +2598,15 @@ final class PeerMeshEngine implements Closeable {
         final long createdAtMillis = System.currentTimeMillis();
         final AtomicLong sequence = new AtomicLong();
         final AtomicLong directBytesSinceReport = new AtomicLong();
+        final PeerPathMtu.Discovery pathMtu = new PeerPathMtu.Discovery();
         volatile ReplayWindow replay = new ReplayWindow();
         volatile byte[] aesKey;
+        /** 本端本次运行实例的 SPM2 key epoch，绑定出站 traffic key */
+        volatile String localKeyEpoch = "";
+        /** 对端最近上报的 epoch，绑定入站 traffic key；未知时无法解密 */
+        volatile String remoteKeyEpoch = "";
+        volatile DataFrameCodec.TrafficCodec outboundCodec;
+        volatile DataFrameCodec.TrafficCodec inboundCodec;
         volatile InetSocketAddress remoteEndpoint;
         volatile String relayTargetAllocationId = "";
         volatile long lastDirectSuccessMillis;
@@ -2119,7 +2631,9 @@ final class PeerMeshEngine implements Closeable {
             }
             if (previous.sessionId == sessionId) {
                 sequence.set(previous.sequence.get());
-                replay = previous.replay.copy();
+                synchronized (previous) {
+                    replay = previous.replay.copy();
+                }
             }
             remoteEndpoint = previous.remoteEndpoint;
             relayTargetAllocationId = previous.relayTargetAllocationId;
@@ -2140,6 +2654,59 @@ final class PeerMeshEngine implements Closeable {
 
         boolean canSend() {
             return aesKey != null && remoteEndpoint != null && pathReady && !isExpired();
+        }
+
+        synchronized void setLocalKeyEpoch(String epoch) {
+            if (epoch == null || epoch.isEmpty() || epoch.equals(localKeyEpoch)) {
+                return;
+            }
+            localKeyEpoch = epoch;
+            outboundCodec = null;
+        }
+
+        /**
+         * 对端 epoch 变化说明它重启并从 sequence=1 重新发送，必须同时丢弃入站 codec 缓存
+         * 和 replay window，否则新帧会被旧窗口当作重放拒绝。
+         */
+        synchronized boolean applyRemoteKeyEpoch(String epoch) {
+            if (epoch == null || epoch.isEmpty() || epoch.equals(remoteKeyEpoch)) {
+                return false;
+            }
+            boolean changed = !remoteKeyEpoch.isEmpty();
+            remoteKeyEpoch = epoch;
+            inboundCodec = null;
+            replay = new ReplayWindow();
+            return changed;
+        }
+
+        synchronized void setAesKey(byte[] nextKey) {
+            if (!Arrays.equals(aesKey, nextKey)) {
+                aesKey = nextKey;
+                outboundCodec = null;
+                inboundCodec = null;
+            }
+        }
+
+        synchronized boolean ensureTrafficCodecs(long localClientId) {
+            if (aesKey == null || aesKey.length != 32
+                    || localKeyEpoch == null || localKeyEpoch.isEmpty()
+                    || remoteKeyEpoch == null || remoteKeyEpoch.isEmpty()) {
+                return false;
+            }
+            if (outboundCodec != null && inboundCodec != null) {
+                return true;
+            }
+            try {
+                outboundCodec = DataFrameCodec.trafficCodec(
+                        aesKey, sessionId, localClientId, peerId, localKeyEpoch);
+                inboundCodec = DataFrameCodec.trafficCodec(
+                        aesKey, sessionId, peerId, localClientId, remoteKeyEpoch);
+                return true;
+            } catch (Exception ignored) {
+                outboundCodec = null;
+                inboundCodec = null;
+                return false;
+            }
         }
 
         boolean isExpired() {
@@ -2183,8 +2750,12 @@ final class PeerMeshEngine implements Closeable {
             return directBytesSinceReport.getAndSet(0L);
         }
 
+        synchronized boolean accept(DataFrame frame) {
+            return frame != null && replay.accept(frame.sequence);
+        }
+
         boolean accept(long inboundSequence) {
-            return replay.accept(inboundSequence);
+            return accept(new DataFrame(sessionId, inboundSequence, new byte[0]));
         }
 
         private long expiresAtMillis() {
@@ -2231,7 +2802,8 @@ final class PeerMeshEngine implements Closeable {
     enum TurnOperation {
         ALLOCATE(StunMessage.ALLOCATE_REQUEST),
         REFRESH(StunMessage.REFRESH_REQUEST),
-        CREATE_PERMISSION(StunMessage.CREATE_PERMISSION_REQUEST);
+		CREATE_PERMISSION(StunMessage.CREATE_PERMISSION_REQUEST),
+		CHANNEL_BIND(StunMessage.CHANNEL_BIND_REQUEST);
 
         final int requestType;
 
@@ -2245,41 +2817,49 @@ final class PeerMeshEngine implements Closeable {
         final long lifetimeSeconds;
         final InetSocketAddress peer;
         final InetSocketAddress endpoint;
+		final int channelNumber;
         final boolean retried;
         final long createdAtMillis;
 
         private PendingTurnRequest(TurnOperation operation, long lifetimeSeconds,
                                    InetSocketAddress peer, InetSocketAddress endpoint,
-                                   boolean retried, long createdAtMillis) {
+								   int channelNumber, boolean retried, long createdAtMillis) {
             this.operation = operation;
             this.lifetimeSeconds = lifetimeSeconds;
             this.peer = peer;
             this.endpoint = endpoint;
+			this.channelNumber = channelNumber;
             this.retried = retried;
             this.createdAtMillis = createdAtMillis;
         }
 
         static PendingTurnRequest allocate() {
-            return new PendingTurnRequest(TurnOperation.ALLOCATE, 0L, null, null, false, 0L);
+			return new PendingTurnRequest(TurnOperation.ALLOCATE, 0L, null, null, 0, false, 0L);
         }
 
         static PendingTurnRequest refresh(long lifetimeSeconds) {
-            return new PendingTurnRequest(TurnOperation.REFRESH, lifetimeSeconds, null, null, false, 0L);
+			return new PendingTurnRequest(TurnOperation.REFRESH, lifetimeSeconds, null, null, 0, false, 0L);
         }
 
         static PendingTurnRequest createPermission(InetSocketAddress peer) {
-            return new PendingTurnRequest(TurnOperation.CREATE_PERMISSION, 0L, peer, null, false, 0L);
+			return new PendingTurnRequest(TurnOperation.CREATE_PERMISSION, 0L, peer, null, 0, false, 0L);
         }
+
+		static PendingTurnRequest channelBind(InetSocketAddress peer, int channelNumber) {
+			return new PendingTurnRequest(TurnOperation.CHANNEL_BIND, 0L, peer, null,
+					channelNumber, false, 0L);
+		}
 
         PendingTurnRequest retryOnce() {
             if (retried) {
                 return null;
             }
-            return new PendingTurnRequest(operation, lifetimeSeconds, peer, endpoint, true, 0L);
+			return new PendingTurnRequest(operation, lifetimeSeconds, peer, endpoint, channelNumber, true, 0L);
         }
 
         PendingTurnRequest withEndpointAndCreatedAt(InetSocketAddress endpoint, long createdAtMillis) {
-            return new PendingTurnRequest(operation, lifetimeSeconds, peer, endpoint, retried, createdAtMillis);
+			return new PendingTurnRequest(operation, lifetimeSeconds, peer, endpoint,
+					channelNumber, retried, createdAtMillis);
         }
 
         StunMessage.Attribute[] operationAttributes(byte[] transactionId) {
@@ -2290,11 +2870,74 @@ final class PeerMeshEngine implements Closeable {
                     return new StunMessage.Attribute[]{StunMessage.lifetime(lifetimeSeconds)};
                 case CREATE_PERMISSION:
                     return new StunMessage.Attribute[]{StunMessage.xorPeerAddress(peer, transactionId)};
+				case CHANNEL_BIND:
+					return new StunMessage.Attribute[]{
+							StunMessage.channelNumber(channelNumber),
+							StunMessage.xorPeerAddress(peer, transactionId)};
                 default:
                     throw new IllegalStateException("unsupported TURN operation");
             }
         }
     }
+
+	static final class TurnChannelBinding {
+		final int channelNumber;
+		final InetSocketAddress peer;
+		volatile long expiresAtMillis;
+		volatile boolean active;
+
+		TurnChannelBinding(int channelNumber, InetSocketAddress peer, long expiresAtMillis) {
+			this.channelNumber = channelNumber;
+			this.peer = peer;
+			this.expiresAtMillis = expiresAtMillis;
+		}
+	}
+
+	static final class TurnChannelData {
+		static final int MIN_CHANNEL = 0x4000;
+		static final int MAX_CHANNEL = 0x7FFF;
+		final int channelNumber;
+		final byte[] payload;
+
+		private TurnChannelData(int channelNumber, byte[] payload) {
+			this.channelNumber = channelNumber;
+			this.payload = payload;
+		}
+
+		static TurnChannelData parse(byte[] packet) {
+			if (packet == null || packet.length < 4) {
+				return null;
+			}
+			int channel = Short.toUnsignedInt(ByteBuffer.wrap(packet, 0, 2).getShort());
+			if (channel < MIN_CHANNEL || channel > MAX_CHANNEL) {
+				return null;
+			}
+			int payloadLength = Short.toUnsignedInt(ByteBuffer.wrap(packet, 2, 2).getShort());
+			int end = 4 + payloadLength;
+			if (end > packet.length || packet.length - end > 3) {
+				return null;
+			}
+			for (int index = end; index < packet.length; index++) {
+				if (packet[index] != 0) {
+					return null;
+				}
+			}
+			return new TurnChannelData(channel, Arrays.copyOfRange(packet, 4, end));
+		}
+
+		static byte[] encode(int channel, byte[] payload) {
+			byte[] body = payload == null ? new byte[0] : payload;
+			if (channel < MIN_CHANNEL || channel > MAX_CHANNEL || body.length > 0xFFFF) {
+				throw new IllegalArgumentException("invalid TURN ChannelData");
+			}
+			int padding = (4 - body.length % 4) % 4;
+			return ByteBuffer.allocate(4 + body.length + padding)
+					.putShort((short) channel)
+					.putShort((short) body.length)
+					.put(body)
+					.array();
+		}
+	}
 
     static final class TurnChallenge {
         final int code;
@@ -2383,6 +3026,9 @@ final class PeerMeshEngine implements Closeable {
         static final int CREATE_PERMISSION_REQUEST = 0x0008;
         static final int CREATE_PERMISSION_SUCCESS = 0x0108;
         static final int CREATE_PERMISSION_ERROR = 0x0118;
+		static final int CHANNEL_BIND_REQUEST = 0x0009;
+		static final int CHANNEL_BIND_SUCCESS = 0x0109;
+		static final int CHANNEL_BIND_ERROR = 0x0119;
         static final int SEND_INDICATION = 0x0016;
         static final int DATA_INDICATION = 0x0017;
         static final int ATTR_MAPPED_ADDRESS = 0x0001;
@@ -2392,6 +3038,7 @@ final class PeerMeshEngine implements Closeable {
         static final int ATTR_ERROR_CODE = 0x0009;
         static final int ATTR_UNKNOWN_ATTRIBUTES = 0x000A;
         static final int ATTR_LIFETIME = 0x000D;
+		static final int ATTR_CHANNEL_NUMBER = 0x000C;
         static final int ATTR_XOR_PEER_ADDRESS = 0x0012;
         static final int ATTR_DATA = 0x0013;
         static final int ATTR_REALM = 0x0014;
@@ -2436,7 +3083,7 @@ final class PeerMeshEngine implements Closeable {
             ByteBuffer buffer = ByteBuffer.wrap(packet);
             int type = Short.toUnsignedInt(buffer.getShort());
             int length = Short.toUnsignedInt(buffer.getShort());
-            if (buffer.getInt() != MAGIC_COOKIE || length + HEADER_BYTES > packet.length) {
+			if (buffer.getInt() != MAGIC_COOKIE || length + HEADER_BYTES != packet.length) {
                 return null;
             }
             byte[] transactionId = new byte[TRANSACTION_ID_BYTES];
@@ -2585,6 +3232,16 @@ final class PeerMeshEngine implements Closeable {
             return Integer.toUnsignedLong(ByteBuffer.wrap(attribute.value).getInt());
         }
 
+		int channelNumber() {
+			Attribute attribute = first(ATTR_CHANNEL_NUMBER);
+			if (attribute == null || attribute.value.length != Integer.BYTES) {
+				return 0;
+			}
+			int channel = Short.toUnsignedInt(ByteBuffer.wrap(attribute.value, 0, 2).getShort());
+			return channel >= TurnChannelData.MIN_CHANNEL && channel <= TurnChannelData.MAX_CHANNEL
+					? channel : 0;
+		}
+
         int errorCode() {
             Attribute attribute = first(ATTR_ERROR_CODE);
             if (attribute == null || attribute.value.length < 4) {
@@ -2717,6 +3374,11 @@ final class PeerMeshEngine implements Closeable {
             return new Attribute(ATTR_DATA, payload == null ? new byte[0] : payload.clone());
         }
 
+		static Attribute channelNumber(int channelNumber) {
+			return new Attribute(ATTR_CHANNEL_NUMBER,
+					ByteBuffer.allocate(Integer.BYTES).putShort((short) channelNumber).putShort((short) 0).array());
+		}
+
         static Attribute lifetime(long seconds) {
             ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES);
             buffer.putInt((int) Math.max(0, Math.min(0xFFFF_FFFFL, seconds)));
@@ -2839,146 +3501,199 @@ final class PeerMeshEngine implements Closeable {
 
     static final class DataFrame {
         final long sessionId;
-        final long fromClientId;
-        final long toClientId;
         final long sequence;
         final byte[] plaintext;
 
-        DataFrame(long sessionId, long fromClientId, long toClientId, long sequence, byte[] plaintext) {
+        DataFrame(long sessionId, long sequence, byte[] plaintext) {
             this.sessionId = sessionId;
-            this.fromClientId = fromClientId;
-            this.toClientId = toClientId;
             this.sequence = sequence;
             this.plaintext = plaintext;
         }
     }
 
     static final class DataFrameCodec {
-        private static final int MAGIC = 0x53504D31;
-        private static final byte VERSION = 1;
-        private static final byte TYPE_DATA = 1;
+        private static final int MAGIC = 0x53504D32;
         private static final int NONCE_BYTES = 12;
         private static final int TAG_BITS = 128;
-        private static final int AAD_BYTES = Integer.BYTES + 2 + Long.BYTES * 4 + NONCE_BYTES;
-        private static final SecureRandom RANDOM = new SecureRandom();
+        private static final int TAG_BYTES = TAG_BITS / Byte.SIZE;
+        private static final int HEADER_BYTES = Integer.BYTES + Long.BYTES * 2;
+        private static final int MIN_BYTES = HEADER_BYTES + TAG_BYTES;
+        private static final int MAX_BYTES = 65_535;
 
         static byte[] encode(byte[] aesKey, long sessionId, long fromClientId, long toClientId,
-                             long sequence, byte[] plaintext) throws Exception {
-            byte[] nonce = new byte[NONCE_BYTES];
-            RANDOM.nextBytes(nonce);
-            byte[] aad = aad(sessionId, fromClientId, toClientId, sequence, nonce);
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(aesKey, "AES"), new GCMParameterSpec(TAG_BITS, nonce));
-            cipher.updateAAD(aad);
-            byte[] ciphertext = cipher.doFinal(plaintext == null ? new byte[0] : plaintext);
-            ByteBuffer buffer = ByteBuffer.allocate(aad.length + Integer.BYTES + ciphertext.length);
-            buffer.put(aad);
-            buffer.putInt(ciphertext.length);
-            buffer.put(ciphertext);
-            return buffer.array();
+                             String senderKeyEpoch, long sequence, byte[] plaintext) throws Exception {
+            return trafficCodec(aesKey, sessionId, fromClientId, toClientId, senderKeyEpoch)
+                    .encode(sessionId, sequence, plaintext);
         }
 
-        static DataFrame decode(byte[] aesKey, byte[] packet, long expectedSessionId, long expectedToClientId) {
+        static DataFrame decode(byte[] aesKey, byte[] packet, long expectedSessionId,
+                                long expectedFromClientId, long expectedToClientId,
+                                String senderKeyEpoch) {
             try {
-                if (packet == null || packet.length < AAD_BYTES + Integer.BYTES) {
+                if (aesKey == null || aesKey.length != 32 || packet == null
+                        || packet.length < MIN_BYTES || packet.length > MAX_BYTES) {
                     return null;
                 }
-                ByteBuffer buffer = ByteBuffer.wrap(packet);
-                byte[] aad = new byte[AAD_BYTES];
-                buffer.get(aad);
-                ByteBuffer header = ByteBuffer.wrap(aad);
-                int magic = header.getInt();
-                byte version = header.get();
-                byte type = header.get();
+                ByteBuffer header = ByteBuffer.wrap(packet);
+                if (header.getInt() != MAGIC) {
+                    return null;
+                }
                 long sessionId = header.getLong();
-                long fromClientId = header.getLong();
-                long toClientId = header.getLong();
                 long sequence = header.getLong();
-                byte[] nonce = new byte[NONCE_BYTES];
-                header.get(nonce);
-                if (magic != MAGIC || version != VERSION || type != TYPE_DATA
-                        || sessionId != expectedSessionId || toClientId != expectedToClientId) {
+                if (sessionId != expectedSessionId || sequence <= 0L) {
                     return null;
                 }
-                int ciphertextLength = buffer.getInt();
-                if (ciphertextLength < 0 || ciphertextLength != buffer.remaining()) {
-                    return null;
-                }
-                byte[] ciphertext = new byte[ciphertextLength];
-                buffer.get(ciphertext);
-                Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-                cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(aesKey, "AES"), new GCMParameterSpec(TAG_BITS, nonce));
-                cipher.updateAAD(aad);
-                return new DataFrame(sessionId, fromClientId, toClientId, sequence, cipher.doFinal(ciphertext));
+                return trafficCodec(aesKey, sessionId, expectedFromClientId, expectedToClientId,
+                        senderKeyEpoch).decode(packet, expectedSessionId);
             } catch (Exception e) {
                 return null;
             }
         }
 
         static Long sessionId(byte[] packet) {
-            if (packet == null || packet.length < AAD_BYTES + Integer.BYTES) {
+            if (packet == null || packet.length < MIN_BYTES || packet.length > MAX_BYTES) {
                 return null;
             }
-            ByteBuffer header = ByteBuffer.wrap(packet, 0, AAD_BYTES);
-            if (header.getInt() != MAGIC || header.get() != VERSION || header.get() != TYPE_DATA) {
-                return null;
-            }
-            return header.getLong();
+            ByteBuffer header = ByteBuffer.wrap(packet);
+            return header.getInt() == MAGIC ? header.getLong() : null;
         }
 
         static boolean looksLike(byte[] packet) {
-            return packet != null && packet.length >= Integer.BYTES && ByteBuffer.wrap(packet, 0, 4).getInt() == MAGIC;
+            return packet != null && packet.length >= Integer.BYTES
+                    && ByteBuffer.wrap(packet, 0, Integer.BYTES).getInt() == MAGIC;
         }
 
-        private static byte[] aad(long sessionId, long fromClientId, long toClientId, long sequence, byte[] nonce) {
-            ByteBuffer buffer = ByteBuffer.allocate(AAD_BYTES);
-            buffer.putInt(MAGIC);
-            buffer.put(VERSION);
-            buffer.put(TYPE_DATA);
-            buffer.putLong(sessionId);
-            buffer.putLong(fromClientId);
-            buffer.putLong(toClientId);
-            buffer.putLong(sequence);
-            buffer.put(nonce);
-            return buffer.array();
+        static TrafficCodec trafficCodec(byte[] aesKey, long sessionId,
+                                         long fromClientId, long toClientId,
+                                         String senderKeyEpoch) throws Exception {
+            if (aesKey == null || aesKey.length != 32 || sessionId <= 0L
+                    || fromClientId <= 0L || toClientId <= 0L || fromClientId == toClientId) {
+                throw new IllegalArgumentException("invalid SPM2 key, session, or direction");
+            }
+            if (senderKeyEpoch == null || senderKeyEpoch.trim().isEmpty()) {
+                throw new IllegalArgumentException("SPM2 traffic key requires the sender key epoch");
+            }
+            byte[] material = trafficMaterial(aesKey, sessionId, fromClientId, toClientId, senderKeyEpoch);
+            return new TrafficCodec(
+                    new SecretKeySpec(Arrays.copyOf(material, 32), "AES"),
+                    ByteBuffer.wrap(material, 32, 4).getInt());
+        }
+
+        /**
+         * senderKeyEpoch 是发送方本次运行实例的随机 epoch，必填：sessionId/token 会在服务端
+         * TTL 内复用、X25519 密钥又持久化在磁盘，没有 epoch 时客户端重启会在同一 key 下
+         * 重放同一段 nonce 空间。
+         */
+        private static byte[] trafficMaterial(byte[] aesKey, long sessionId,
+                                              long fromClientId, long toClientId,
+                                              String senderKeyEpoch) throws Exception {
+            byte[] salt = ByteBuffer.allocate(Long.BYTES).putLong(sessionId).array();
+            byte[] prk = hmac(salt, aesKey);
+            return hkdfExpand(prk, "shuai-peer-mesh/spm2/aes-gcm\n"
+                    + sessionId + "\n" + fromClientId + "\n" + toClientId
+                    + "\n" + senderKeyEpoch, 36);
+        }
+
+        private static byte[] nonce(int prefix, long sequence) {
+            return ByteBuffer.allocate(NONCE_BYTES)
+                    .putInt(prefix)
+                    .putLong(sequence)
+                    .array();
+        }
+
+        static final class TrafficCodec {
+            private final SecretKeySpec key;
+            private final int noncePrefix;
+            private final Cipher cipher;
+
+            TrafficCodec(SecretKeySpec key, int noncePrefix) throws Exception {
+                this.key = key;
+                this.noncePrefix = noncePrefix;
+                this.cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            }
+
+            synchronized byte[] encode(long sessionId, long sequence, byte[] plaintext) throws Exception {
+                if (sessionId <= 0L || sequence <= 0L) {
+                    throw new IllegalArgumentException("invalid SPM2 session or sequence");
+                }
+                byte[] input = plaintext == null ? new byte[0] : plaintext;
+                if (HEADER_BYTES + input.length + TAG_BYTES > MAX_BYTES) {
+                    throw new IllegalArgumentException("SPM2 peer data frame is too large");
+                }
+                byte[] frame = new byte[HEADER_BYTES + input.length + TAG_BYTES];
+                ByteBuffer header = ByteBuffer.wrap(frame);
+                header.putInt(MAGIC);
+                header.putLong(sessionId);
+                header.putLong(sequence);
+                cipher.init(Cipher.ENCRYPT_MODE, key,
+                        new GCMParameterSpec(TAG_BITS, nonce(noncePrefix, sequence)));
+                cipher.updateAAD(frame, 0, HEADER_BYTES);
+                cipher.doFinal(input, 0, input.length, frame, HEADER_BYTES);
+                return frame;
+            }
+
+            synchronized DataFrame decode(byte[] packet, long expectedSessionId) {
+                try {
+                    if (packet == null || packet.length < MIN_BYTES || packet.length > MAX_BYTES) {
+                        return null;
+                    }
+                    ByteBuffer header = ByteBuffer.wrap(packet);
+                    if (header.getInt() != MAGIC) {
+                        return null;
+                    }
+                    long sessionId = header.getLong();
+                    long sequence = header.getLong();
+                    if (sessionId != expectedSessionId || sequence <= 0L) {
+                        return null;
+                    }
+                    cipher.init(Cipher.DECRYPT_MODE, key,
+                            new GCMParameterSpec(TAG_BITS, nonce(noncePrefix, sequence)));
+                    cipher.updateAAD(packet, 0, HEADER_BYTES);
+                    return new DataFrame(sessionId, sequence,
+                            cipher.doFinal(packet, HEADER_BYTES, packet.length - HEADER_BYTES));
+                } catch (Exception ignored) {
+                    return null;
+                }
+            }
         }
     }
 
     static final class ReplayWindow {
+        private static final int WINDOW_SIZE = 4096;
+        private static final int WINDOW_MASK = WINDOW_SIZE - 1;
         private long highest;
-        private long bitmap;
+        private final long[] sequences = new long[WINDOW_SIZE];
 
         synchronized boolean accept(long sequence) {
             if (sequence <= 0) {
                 return false;
             }
+            if (highest >= WINDOW_SIZE && sequence <= highest - WINDOW_SIZE) {
+                return false;
+            }
+            int slot = (int) sequence & WINDOW_MASK;
+            if (sequences[slot] == sequence) {
+                return false;
+            }
+            sequences[slot] = sequence;
             if (sequence > highest) {
-                long shift = sequence - highest;
-                bitmap = shift >= 64 ? 1L : (bitmap << shift) | 1L;
                 highest = sequence;
-                return true;
             }
-            long offset = highest - sequence;
-            if (offset >= 64) {
-                return false;
-            }
-            long mask = 1L << offset;
-            if ((bitmap & mask) != 0) {
-                return false;
-            }
-            bitmap |= mask;
             return true;
         }
 
         synchronized ReplayWindow copy() {
             ReplayWindow copy = new ReplayWindow();
             copy.highest = highest;
-            copy.bitmap = bitmap;
+            System.arraycopy(sequences, 0, copy.sequences, 0, sequences.length);
             return copy;
         }
     }
 
-    private static final class IpPacket {
+    static final class IpPacket {
+        private static final int PROTOCOL_ICMP = 1;
+        private static final int PROTOCOL_TCP = 6;
+
         static String destinationIpv4(byte[] packet) {
             if (!isIpv4(packet)) {
                 return "";
@@ -2987,6 +3702,132 @@ final class PeerMeshEngine implements Closeable {
                     + (packet[17] & 0xFF) + "."
                     + (packet[18] & 0xFF) + "."
                     + (packet[19] & 0xFF);
+        }
+
+        static byte[] clampTcpMss(byte[] packet, int pathMtu) {
+            if (!isIpv4(packet) || (packet[9] & 0xFF) != PROTOCOL_TCP) {
+                return packet;
+            }
+            int ipHeaderLength = (packet[0] & 0x0F) * 4;
+            int totalLength = totalLength(packet);
+            if (totalLength < ipHeaderLength + 20
+                    || (packet[ipHeaderLength + 13] & 0x02) == 0) {
+                return packet;
+            }
+            int tcpHeaderLength = ((packet[ipHeaderLength + 12] >>> 4) & 0x0F) * 4;
+            if (tcpHeaderLength < 20 || totalLength < ipHeaderLength + tcpHeaderLength) {
+                return packet;
+            }
+            int maxMss = Math.max(536, pathMtu - ipHeaderLength - 20);
+            int limit = ipHeaderLength + tcpHeaderLength;
+            for (int cursor = ipHeaderLength + 20; cursor < limit; ) {
+                int kind = packet[cursor] & 0xFF;
+                if (kind == 0) {
+                    break;
+                }
+                if (kind == 1) {
+                    cursor++;
+                    continue;
+                }
+                if (cursor + 1 >= limit) {
+                    break;
+                }
+                int optionLength = packet[cursor + 1] & 0xFF;
+                if (optionLength < 2 || cursor + optionLength > limit) {
+                    break;
+                }
+                if (kind == 2 && optionLength == 4) {
+                    int advertised = readUnsignedShort(packet, cursor + 2);
+                    if (advertised <= maxMss) {
+                        return packet;
+                    }
+                    byte[] clamped = Arrays.copyOf(packet, packet.length);
+                    writeUnsignedShort(clamped, cursor + 2, maxMss);
+                    writeUnsignedShort(clamped, ipHeaderLength + 16, 0);
+                    writeUnsignedShort(clamped, ipHeaderLength + 16,
+                            tcpChecksum(clamped, ipHeaderLength, totalLength - ipHeaderLength));
+                    return clamped;
+                }
+                cursor += optionLength;
+            }
+            return packet;
+        }
+
+        static byte[] icmpFragmentationNeeded(byte[] packet, int pathMtu) {
+            if (!isIpv4(packet)) {
+                return null;
+            }
+            int originalHeaderLength = (packet[0] & 0x0F) * 4;
+            int originalLength = totalLength(packet);
+            int quotedLength = Math.min(originalLength, originalHeaderLength + 8);
+            byte[] response = new byte[20 + 8 + quotedLength];
+            response[0] = 0x45;
+            writeUnsignedShort(response, 2, response.length);
+            response[8] = 64;
+            response[9] = PROTOCOL_ICMP;
+            System.arraycopy(packet, 16, response, 12, 4);
+            System.arraycopy(packet, 12, response, 16, 4);
+            response[20] = 3;
+            response[21] = 4;
+            writeUnsignedShort(response, 26, Math.max(0, Math.min(0xFFFF, pathMtu)));
+            System.arraycopy(packet, 0, response, 28, quotedLength);
+            writeUnsignedShort(response, 22, checksum(response, 20, response.length - 20));
+            writeUnsignedShort(response, 10, checksum(response, 0, 20));
+            return response;
+        }
+
+        static int checksum(byte[] data, int offset, int length) {
+            long sum = 0L;
+            int limit = offset + length;
+            int cursor = offset;
+            while (cursor + 1 < limit) {
+                sum += readUnsignedShort(data, cursor);
+                cursor += 2;
+            }
+            if (cursor < limit) {
+                sum += (data[cursor] & 0xFFL) << 8;
+            }
+            while ((sum >>> 16) != 0L) {
+                sum = (sum & 0xFFFFL) + (sum >>> 16);
+            }
+            return (int) (~sum) & 0xFFFF;
+        }
+
+        private static int tcpChecksum(byte[] packet, int tcpOffset, int tcpLength) {
+            long sum = 0L;
+            for (int cursor = 12; cursor < 20; cursor += 2) {
+                sum += readUnsignedShort(packet, cursor);
+            }
+            sum += PROTOCOL_TCP;
+            sum += tcpLength;
+            int limit = tcpOffset + tcpLength;
+            int cursor = tcpOffset;
+            while (cursor + 1 < limit) {
+                sum += readUnsignedShort(packet, cursor);
+                cursor += 2;
+            }
+            if (cursor < limit) {
+                sum += (packet[cursor] & 0xFFL) << 8;
+            }
+            while ((sum >>> 16) != 0L) {
+                sum = (sum & 0xFFFFL) + (sum >>> 16);
+            }
+            return (int) (~sum) & 0xFFFF;
+        }
+
+        private static int totalLength(byte[] packet) {
+            int headerLength = (packet[0] & 0x0F) * 4;
+            int declared = readUnsignedShort(packet, 2);
+            return declared >= headerLength && declared <= packet.length ? declared : packet.length;
+        }
+
+        private static int readUnsignedShort(byte[] data, int offset) {
+            return ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
+        }
+
+        private static void writeUnsignedShort(byte[] data, int offset, int value) {
+            data[offset] = (byte) (value >>> 8);
+            data[offset + 1] = (byte) value;
         }
 
         private static boolean isIpv4(byte[] packet) {

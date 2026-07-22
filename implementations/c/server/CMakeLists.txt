@@ -43,6 +43,8 @@ add_test(NAME json_tests COMMAND shuai_tunnel_c_json_tests)
 add_executable(shuai_tunnel_c_protocol_fixture_tests tests/protocol_fixture_tests.c)
 target_link_libraries(shuai_tunnel_c_protocol_fixture_tests PRIVATE shuai_tunnel_c_core)
 target_compile_options(shuai_tunnel_c_protocol_fixture_tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(shuai_tunnel_c_protocol_fixture_tests PRIVATE
+    ST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/test-vectors/control-v2/frames/")
 add_test(NAME protocol_fixture_tests COMMAND shuai_tunnel_c_protocol_fixture_tests)
 
 add_executable(shuai_tunnel_c_security_tests tests/security_tests.c)

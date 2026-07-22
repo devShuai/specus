@@ -6,10 +6,42 @@
 #include "protocol.h"
 #include "storage.h"
 
+typedef struct {
+    char *request_method;
+    char *route;
+    char *relative_path;
+    char *raw_query;
+    char **headers;
+    size_t headers_len;
+    const uint8_t *body;
+    size_t body_len;
+} st_direct_http_request;
+
+typedef struct {
+    int status_code;
+    char **headers;
+    size_t headers_len;
+    uint8_t *body;
+    size_t body_len;
+    char *error;
+} st_direct_http_response;
+
+typedef struct {
+    void *ctx;
+    int (*on_headers)(void *ctx,
+                      int status_code,
+                      char *const *headers,
+                      size_t headers_len,
+                      char *const *trailer_names,
+                      size_t trailer_names_len);
+    int (*on_data)(void *ctx, const uint8_t *data, size_t data_len);
+    int (*on_end)(void *ctx, char *const *trailers, size_t trailers_len);
+} st_admin_direct_http_sink;
+
 typedef int (*st_admin_direct_http_forwarder)(void *ctx,
                                               const char *client_name,
                                               const st_direct_http_request *request,
-                                              st_direct_http_response *response);
+                                              const st_admin_direct_http_sink *sink);
 
 typedef struct st_admin_direct_ws_stream st_admin_direct_ws_stream;
 
@@ -67,6 +99,7 @@ int st_admin_resolve_static_path(const char *static_root,
 int st_admin_rewrite_direct_http_response(const char *client_name,
                                           const char *route,
                                           st_direct_http_response *response);
+void st_direct_http_response_free(st_direct_http_response *response);
 int st_admin_server_start(st_admin_server *server, int port, const char *static_root);
 int st_admin_server_start_with_forwarder(st_admin_server *server,
                                          int port,
@@ -88,6 +121,7 @@ void st_admin_broadcast_connection_event(const char *tenant_id,
 int st_admin_direct_ws_send_framed_payload(st_admin_direct_ws_stream *stream,
                                            const uint8_t *payload,
                                            size_t payload_len);
+int st_admin_direct_ws_add_send_credit(st_admin_direct_ws_stream *stream, uint32_t credit);
 void st_admin_direct_ws_close(st_admin_direct_ws_stream *stream);
 
 #endif

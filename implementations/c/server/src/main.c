@@ -23,6 +23,10 @@
 #define ST_MAX_TCP_MAPPINGS 64U
 #define ST_CHANNEL_ID_SIZE 64U
 #define ST_IO_BUFFER_SIZE 16384U
+#define ST_STREAM_INITIAL_WINDOW (1024U * 1024U)
+#define ST_STREAM_MAX_WINDOW (16U * 1024U * 1024U)
+#define ST_HTTP_MAX_REQUEST_BODY (16U * 1024U * 1024U)
+#define ST_HTTP_MAX_RESPONSE_BODY (64U * 1024U * 1024U)
 
 typedef struct {
     long long id;
@@ -69,6 +73,7 @@ typedef struct tunnel_session tunnel_session;
 typedef struct external_conn {
     int fd;
     int port;
+    uint32_t stream_id;
     char channel_id[ST_CHANNEL_ID_SIZE];
     char remote_address[128];
     char remote_ip[128];
@@ -81,6 +86,12 @@ typedef struct external_conn {
     int thread_started;
     int done;
     int counted;
+    pthread_mutex_t flow_lock;
+    pthread_cond_t flow_cond;
+    uint64_t send_credit;
+    int flow_closed;
+    int public_finished;
+    int client_finished;
     tunnel_session *session;
     struct external_conn *next;
 } external_conn;
@@ -95,22 +106,40 @@ typedef struct tunnel_listener {
     struct tunnel_listener *next;
 } tunnel_listener;
 
+typedef struct direct_http_event {
+    int type;
+    char *meta_json;
+    uint8_t *data;
+    size_t data_len;
+    struct direct_http_event *next;
+} direct_http_event;
+
 typedef struct direct_http_pending {
-    char request_id[64];
+    uint32_t stream_id;
     int done;
-    st_direct_http_response response;
+    int response_started;
+    char *error;
+    direct_http_event *events_head;
+    direct_http_event *events_tail;
+    size_t event_count;
+    uint64_t send_credit;
+    uint64_t receive_credit;
+    uint64_t receive_outstanding;
+    uint64_t response_bytes;
     pthread_cond_t cond;
     struct direct_http_pending *next;
 } direct_http_pending;
 
 typedef struct ws_conn {
     char channel_id[ST_CHANNEL_ID_SIZE];
+    uint32_t stream_id;
     st_admin_direct_ws_stream *stream;
     struct ws_conn *next;
 } ws_conn;
 
 struct tunnel_session {
     int control_fd;
+    int is_data_connection;
     server_config config;
     pthread_mutex_t send_lock;
     pthread_mutex_t map_lock;
@@ -120,7 +149,7 @@ struct tunnel_session {
     tunnel_listener *listeners;
     direct_http_pending *direct_pending;
     int active;
-    uint64_t next_channel_id;
+    uint32_t next_stream_id;
     char remote[128];
     long long connection_record_id;
     char connected_at[64];
@@ -145,9 +174,16 @@ static int global_external_connections = 0;
 static pthread_mutex_t active_session_lock = PTHREAD_MUTEX_INITIALIZER;
 static tunnel_session *active_sessions = NULL;
 
-static int send_ws_connected(tunnel_session *session, const st_admin_direct_ws_request *request);
-static int send_ws_disconnected(tunnel_session *session, const char *channel_id);
-static int send_ws_data(tunnel_session *session, const char *channel_id, const uint8_t *data, size_t data_len);
+static char *json_http_request(const st_direct_http_request *request);
+static int send_reset(tunnel_session *session, uint32_t stream_id,
+                      uint32_t code, const char *reason);
+static int send_window_update(tunnel_session *session, uint32_t stream_id, size_t credit);
+
+static int send_ws_open(tunnel_session *session, uint32_t stream_id,
+                        const st_admin_direct_ws_request *request);
+static int send_ws_fin(tunnel_session *session, uint32_t stream_id);
+static int send_ws_data(tunnel_session *session, uint32_t stream_id,
+                        const uint8_t *data, size_t data_len);
 static ws_conn *find_ws_conn_locked(tunnel_session *session, const char *channel_id);
 static ws_conn *remove_ws_conn_locked(tunnel_session *session, const char *channel_id);
 static int current_utc_timestamp(char out[64]);
@@ -1039,9 +1075,10 @@ static void direct_pending_fail_all(tunnel_session *session, const char *message
     pthread_mutex_lock(&session->direct_lock);
     for (direct_http_pending *pending = session->direct_pending; pending != NULL; pending = pending->next) {
         if (!pending->done) {
-            pending->response.error = dup_string(message);
+            free(pending->error);
+            pending->error = dup_string(message);
             pending->done = 1;
-            pthread_cond_signal(&pending->cond);
+            pthread_cond_broadcast(&pending->cond);
         }
     }
     pthread_mutex_unlock(&session->direct_lock);
@@ -1059,24 +1096,158 @@ static void direct_pending_remove(tunnel_session *session, direct_http_pending *
     }
 }
 
-static int process_direct_http_response(tunnel_session *session, st_direct_http_response *response)
+static void direct_event_free(direct_http_event *event)
 {
-    if (response->request_id == NULL) {
-        return 0;
+    if (event == NULL) {
+        return;
     }
-    pthread_mutex_lock(&session->direct_lock);
+    free(event->meta_json);
+    free(event->data);
+    free(event);
+}
+
+static void direct_pending_free_events(direct_http_pending *pending)
+{
+    direct_http_event *event = pending->events_head;
+    while (event != NULL) {
+        direct_http_event *next = event->next;
+        direct_event_free(event);
+        event = next;
+    }
+    pending->events_head = NULL;
+    pending->events_tail = NULL;
+    pending->event_count = 0;
+}
+
+static direct_http_pending *find_direct_pending_locked(tunnel_session *session, uint32_t stream_id)
+{
     for (direct_http_pending *pending = session->direct_pending; pending != NULL; pending = pending->next) {
-        if (strcmp(pending->request_id, response->request_id) == 0) {
-            pending->response = *response;
-            memset(response, 0, sizeof(*response));
-            pending->done = 1;
-            pthread_cond_signal(&pending->cond);
-            pthread_mutex_unlock(&session->direct_lock);
-            return 1;
+        if (pending->stream_id == stream_id) {
+            return pending;
         }
     }
-    pthread_mutex_unlock(&session->direct_lock);
+    return NULL;
+}
+
+static int direct_pending_enqueue(direct_http_pending *pending,
+                                  int type,
+                                  const char *meta_json,
+                                  const uint8_t *data,
+                                  size_t data_len)
+{
+    if (pending->event_count >= 32U) {
+        return -1;
+    }
+    direct_http_event *event = (direct_http_event *)calloc(1, sizeof(*event));
+    if (event == NULL) {
+        return -1;
+    }
+    event->type = type;
+    if (meta_json != NULL) {
+        event->meta_json = dup_string(meta_json);
+        if (event->meta_json == NULL) {
+            direct_event_free(event);
+            return -1;
+        }
+    }
+    if (data_len > 0U) {
+        event->data = (uint8_t *)malloc(data_len);
+        if (event->data == NULL) {
+            direct_event_free(event);
+            return -1;
+        }
+        memcpy(event->data, data, data_len);
+        event->data_len = data_len;
+    }
+    if (pending->events_tail == NULL) {
+        pending->events_head = event;
+    } else {
+        pending->events_tail->next = event;
+    }
+    pending->events_tail = event;
+    ++pending->event_count;
+    pthread_cond_broadcast(&pending->cond);
     return 0;
+}
+
+static direct_http_event *direct_pending_pop(direct_http_pending *pending)
+{
+    direct_http_event *event = pending->events_head;
+    if (event == NULL) {
+        return NULL;
+    }
+    pending->events_head = event->next;
+    if (pending->events_head == NULL) {
+        pending->events_tail = NULL;
+    }
+    event->next = NULL;
+    --pending->event_count;
+    return event;
+}
+
+static int process_direct_http_message(tunnel_session *session, const st_nat_message *message)
+{
+    pthread_mutex_lock(&session->direct_lock);
+    direct_http_pending *pending = find_direct_pending_locked(session, message->stream_id);
+    if (pending == NULL) {
+        pthread_mutex_unlock(&session->direct_lock);
+        return 0;
+    }
+
+    int invalid = 0;
+    const char *metadata = message->meta_json == NULL ? "{}" : message->meta_json;
+    if (message->type == ST_NAT_OPEN) {
+        char *source = st_json_get_string(metadata, "source");
+        char *phase = st_json_get_string(metadata, "phase");
+        int status = 0;
+        invalid = pending->response_started
+            || source == NULL || strcmp(source, "http") != 0
+            || phase == NULL || strcmp(phase, "response") != 0
+            || st_json_get_int(metadata, "statusCode", &status) != 0
+            || status < 100 || status > 599
+            || direct_pending_enqueue(pending, ST_NAT_OPEN, message->meta_json, NULL, 0U) != 0;
+        free(source);
+        free(phase);
+        if (!invalid) {
+            pending->response_started = 1;
+        }
+    } else if (message->type == ST_NAT_DATA) {
+        invalid = !pending->response_started || pending->done
+            || message->data_len == 0U
+            || message->data_len > pending->receive_credit
+            || message->data_len > ST_HTTP_MAX_RESPONSE_BODY
+            || pending->response_bytes > ST_HTTP_MAX_RESPONSE_BODY - message->data_len
+            || direct_pending_enqueue(pending, ST_NAT_DATA, NULL,
+                                      message->data, message->data_len) != 0;
+        if (!invalid) {
+            pending->receive_credit -= message->data_len;
+            pending->receive_outstanding += message->data_len;
+            pending->response_bytes += message->data_len;
+        }
+    } else if (message->type == ST_NAT_FIN) {
+        invalid = !pending->response_started || pending->done
+            || direct_pending_enqueue(pending, ST_NAT_FIN, message->meta_json, NULL, 0U) != 0;
+        if (!invalid) {
+            pending->done = 1;
+        }
+    } else if (message->type == ST_NAT_RST) {
+        char *reason = st_json_get_string(metadata, "reason");
+        free(pending->error);
+        pending->error = reason == NULL ? dup_string("HTTP stream reset by client") : reason;
+        pending->done = 1;
+        pthread_cond_broadcast(&pending->cond);
+    } else if (message->type == ST_NAT_WINDOW_UPDATE) {
+        invalid = message->value == 0U
+            || pending->send_credit > ST_STREAM_MAX_WINDOW - message->value;
+        if (!invalid) {
+            pending->send_credit += message->value;
+            pthread_cond_broadcast(&pending->cond);
+        }
+    } else {
+        invalid = 1;
+    }
+    pthread_mutex_unlock(&session->direct_lock);
+    return invalid ? -1 : 1;
 }
 
 static int config_has_http_route(const server_config *config, const char *route)
@@ -1114,25 +1285,50 @@ static void active_session_remove_locked(tunnel_session *session)
     }
 }
 
-static tunnel_session *active_session_find_locked(const char *client_name)
+static tunnel_session *active_session_find_role_locked(const char *client_name, int data_connection)
 {
     for (tunnel_session *session = active_sessions; session != NULL; session = session->active_next) {
-        if (session->active && strcmp(client_name, session->config.client_name) == 0) {
+        if (session->active
+            && session->is_data_connection == data_connection
+            && strcmp(client_name, session->config.client_name) == 0) {
             return session;
         }
     }
     return NULL;
 }
 
+static tunnel_session *active_data_session_find_locked(const char *client_name)
+{
+    return active_session_find_role_locked(client_name, 1);
+}
+
+static void active_session_close_peer_locked(tunnel_session *session)
+{
+    if (session == NULL) {
+        return;
+    }
+    tunnel_session *peer = active_session_find_role_locked(
+        session->config.client_name, !session->is_data_connection);
+    if (peer != NULL && peer != session) {
+        shutdown(peer->control_fd, SHUT_RDWR);
+    }
+}
+
 static int direct_http_forward(void *ctx,
                                const char *client_name,
                                const st_direct_http_request *request,
-                               st_direct_http_response *response)
+                               const st_admin_direct_http_sink *sink)
 {
     (void)ctx;
 
+    if (request == NULL || request->body_len > ST_HTTP_MAX_REQUEST_BODY
+        || sink == NULL || sink->on_headers == NULL
+        || sink->on_data == NULL || sink->on_end == NULL) {
+        return -1;
+    }
+
     pthread_mutex_lock(&active_session_lock);
-    tunnel_session *session = active_session_find_locked(client_name);
+    tunnel_session *session = active_data_session_find_locked(client_name);
     if (session == NULL) {
         pthread_mutex_unlock(&active_session_lock);
         return -1;
@@ -1144,22 +1340,62 @@ static int direct_http_forward(void *ctx,
 
     direct_http_pending pending;
     memset(&pending, 0, sizeof(pending));
-    snprintf(pending.request_id, sizeof(pending.request_id), "%s", request->request_id);
+    pending.send_credit = ST_STREAM_INITIAL_WINDOW;
+    pending.receive_credit = ST_STREAM_INITIAL_WINDOW;
     pthread_cond_init(&pending.cond, NULL);
+
+    pthread_mutex_lock(&session->map_lock);
+    pending.stream_id = session->next_stream_id++;
+    if (session->next_stream_id == 0U) {
+        session->next_stream_id = 1U;
+    }
+    pthread_mutex_unlock(&session->map_lock);
 
     pthread_mutex_lock(&session->direct_lock);
     pending.next = session->direct_pending;
     session->direct_pending = &pending;
     pthread_mutex_unlock(&session->direct_lock);
 
-    st_buffer packet = st_protocol_encode_direct_http_request(request);
+    char *request_json = json_http_request(request);
+    if (request_json == NULL) {
+        goto failed;
+    }
+    st_buffer packet = st_protocol_encode_nat_message(ST_NAT_OPEN, 0U,
+                                                       pending.stream_id, 0U,
+                                                       request_json, NULL, 0U);
+    free(request_json);
     if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+        goto failed;
+    }
+
+    for (size_t offset = 0; offset < request->body_len;) {
+        size_t chunk_len = request->body_len - offset;
+        if (chunk_len > 64U * 1024U) {
+            chunk_len = 64U * 1024U;
+        }
         pthread_mutex_lock(&session->direct_lock);
-        direct_pending_remove(session, &pending);
+        while (pending.error == NULL && !pending.done && pending.send_credit < chunk_len) {
+            pthread_cond_wait(&pending.cond, &session->direct_lock);
+        }
+        if (pending.error != NULL || pending.done) {
+            pthread_mutex_unlock(&session->direct_lock);
+            goto failed;
+        }
+        pending.send_credit -= chunk_len;
         pthread_mutex_unlock(&session->direct_lock);
-        pthread_cond_destroy(&pending.cond);
-        pthread_mutex_unlock(&active_session_lock);
-        return -1;
+        packet = st_protocol_encode_nat_message(ST_NAT_DATA, 0U,
+                                                pending.stream_id, 0U,
+                                                NULL, request->body + offset, chunk_len);
+        if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+            goto failed;
+        }
+        offset += chunk_len;
+    }
+    packet = st_protocol_encode_nat_message(ST_NAT_FIN, 0U,
+                                            pending.stream_id, 0U,
+                                            NULL, NULL, 0U);
+    if (packet.data == NULL || session_send_packet(session, &packet) != 0) {
+        goto failed;
     }
 
     struct timeval now;
@@ -1168,28 +1404,117 @@ static int direct_http_forward(void *ctx,
     deadline.tv_sec = now.tv_sec + 30;
     deadline.tv_nsec = now.tv_usec * 1000L;
 
-    int timed_out = 0;
-    pthread_mutex_lock(&session->direct_lock);
-    while (!pending.done) {
-        int rc = pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline);
-        if (rc == ETIMEDOUT) {
-            timed_out = 1;
+    int result = 0;
+    int delivered_head = 0;
+    for (;;) {
+        pthread_mutex_lock(&session->direct_lock);
+        while (pending.events_head == NULL && pending.error == NULL
+               && !(pending.done && pending.response_started)) {
+            int rc = delivered_head
+                ? pthread_cond_wait(&pending.cond, &session->direct_lock)
+                : pthread_cond_timedwait(&pending.cond, &session->direct_lock, &deadline);
+            if (!delivered_head && rc == ETIMEDOUT) {
+                result = -2;
+                break;
+            }
+        }
+        direct_http_event *event = result == 0 ? direct_pending_pop(&pending) : NULL;
+        char *pending_error = event == NULL && pending.error != NULL
+            ? dup_string(pending.error) : NULL;
+        pthread_mutex_unlock(&session->direct_lock);
+
+        if (result != 0) {
+            send_reset(session, pending.stream_id, 30U, "HTTP response header timeout");
+            break;
+        }
+        if (pending_error != NULL) {
+            free(pending_error);
+            result = -1;
+            break;
+        }
+        if (event == NULL) {
+            result = -1;
+            break;
+        }
+
+        if (event->type == ST_NAT_OPEN) {
+            int status_code = 0;
+            char **headers = NULL;
+            size_t headers_len = 0;
+            char **trailer_names = NULL;
+            size_t trailer_names_len = 0;
+            int valid = st_json_get_int(event->meta_json, "statusCode", &status_code) == 0
+                && st_json_get_string_array(event->meta_json, "headers",
+                                            &headers, &headers_len) == 0
+                && st_json_get_string_array(event->meta_json, "trailerNames",
+                                            &trailer_names, &trailer_names_len) == 0;
+            if (!valid || sink->on_headers(sink->ctx, status_code,
+                                            headers, headers_len,
+                                            trailer_names, trailer_names_len) != 0) {
+                result = -4;
+            } else {
+                delivered_head = 1;
+            }
+            st_json_free_string_array(headers, headers_len);
+            st_json_free_string_array(trailer_names, trailer_names_len);
+        } else if (event->type == ST_NAT_DATA) {
+            if (!delivered_head || sink->on_data(sink->ctx, event->data, event->data_len) != 0) {
+                result = -4;
+            } else {
+                pthread_mutex_lock(&session->direct_lock);
+                if (event->data_len > pending.receive_outstanding
+                    || pending.receive_credit > ST_STREAM_MAX_WINDOW - event->data_len) {
+                    result = -1;
+                } else {
+                    pending.receive_outstanding -= event->data_len;
+                    pending.receive_credit += event->data_len;
+                }
+                pthread_mutex_unlock(&session->direct_lock);
+                if (result == 0
+                    && send_window_update(session, pending.stream_id, event->data_len) != 0) {
+                    result = -1;
+                }
+            }
+        } else if (event->type == ST_NAT_FIN) {
+            char **trailers = NULL;
+            size_t trailers_len = 0;
+            if (event->meta_json != NULL
+                && st_json_get_string_array(event->meta_json, "trailers",
+                                            &trailers, &trailers_len) != 0) {
+                trailers = NULL;
+                trailers_len = 0;
+            }
+            result = delivered_head && sink->on_end(sink->ctx, trailers, trailers_len) == 0
+                ? 0 : -4;
+            st_json_free_string_array(trailers, trailers_len);
+            direct_event_free(event);
+            break;
+        }
+        direct_event_free(event);
+        if (result != 0) {
+            send_reset(session, pending.stream_id, 31U, "HTTP downstream closed");
             break;
         }
     }
-    direct_pending_remove(session, &pending);
-    if (pending.done) {
-        *response = pending.response;
-        memset(&pending.response, 0, sizeof(pending.response));
-    }
-    pthread_mutex_unlock(&session->direct_lock);
 
+    pthread_mutex_lock(&session->direct_lock);
+    direct_pending_remove(session, &pending);
+    direct_pending_free_events(&pending);
+    pthread_mutex_unlock(&session->direct_lock);
+    free(pending.error);
     pthread_cond_destroy(&pending.cond);
     pthread_mutex_unlock(&active_session_lock);
-    if (timed_out) {
-        return -2;
-    }
-    return pending.done ? 0 : -1;
+    return result;
+
+failed:
+    pthread_mutex_lock(&session->direct_lock);
+    direct_pending_remove(session, &pending);
+    direct_pending_free_events(&pending);
+    pthread_mutex_unlock(&session->direct_lock);
+    free(pending.error);
+    pthread_cond_destroy(&pending.cond);
+    pthread_mutex_unlock(&active_session_lock);
+    return -1;
 }
 
 static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
@@ -1197,7 +1522,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     (void)ctx;
 
     pthread_mutex_lock(&active_session_lock);
-    tunnel_session *session = active_session_find_locked(request->client_name);
+    tunnel_session *session = active_data_session_find_locked(request->client_name);
     if (session == NULL) {
         pthread_mutex_unlock(&active_session_lock);
         return -1;
@@ -1216,11 +1541,15 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     conn->stream = request->stream;
 
     pthread_mutex_lock(&session->map_lock);
+    conn->stream_id = session->next_stream_id++;
+    if (session->next_stream_id == 0U) {
+        session->next_stream_id = 1U;
+    }
     conn->next = session->ws_conns;
     session->ws_conns = conn;
     pthread_mutex_unlock(&session->map_lock);
 
-    if (send_ws_connected(session, request) != 0) {
+    if (send_ws_open(session, conn->stream_id, request) != 0) {
         pthread_mutex_lock(&session->map_lock);
         ws_conn *removed = remove_ws_conn_locked(session, request->channel_id);
         pthread_mutex_unlock(&session->map_lock);
@@ -1247,7 +1576,7 @@ static int direct_ws_data(void *ctx, const char *channel_id, const uint8_t *payl
         pthread_mutex_lock(&session->map_lock);
         ws_conn *conn = find_ws_conn_locked(session, channel_id);
         if (conn != NULL) {
-            rc = send_ws_data(session, channel_id, payload, payload_len);
+            rc = send_ws_data(session, conn->stream_id, payload, payload_len);
             if (rc != 0) {
                 removed = remove_ws_conn_locked(session, channel_id);
                 if (removed != NULL) {
@@ -1277,7 +1606,7 @@ static void direct_ws_close(void *ctx, const char *channel_id)
         ws_conn *removed = remove_ws_conn_locked(session, channel_id);
         pthread_mutex_unlock(&session->map_lock);
         if (removed != NULL) {
-            send_ws_disconnected(session, channel_id);
+            send_ws_fin(session, removed->stream_id);
             printf("[ws-tunnel] close client=%s channel=%s\n",
                    session->config.client_name, channel_id);
             free(removed);
@@ -1287,8 +1616,11 @@ static void direct_ws_close(void *ctx, const char *channel_id)
     pthread_mutex_unlock(&active_session_lock);
 }
 
-static int read_frame(int fd, st_frame_header *header, uint8_t **body)
+static int read_frame(int fd, size_t max_frame_size, st_frame_header *header, uint8_t **body)
 {
+    if (max_frame_size < ST_HEADER_SIZE || max_frame_size > ST_MAX_FRAME_SIZE) {
+        return -1;
+    }
     uint8_t raw_header[ST_HEADER_SIZE];
     int rc = recv_all(fd, raw_header, sizeof(raw_header));
     if (rc <= 0) {
@@ -1297,11 +1629,7 @@ static int read_frame(int fd, st_frame_header *header, uint8_t **body)
     if (st_protocol_read_header(raw_header, header) != 0) {
         return -1;
     }
-    if (header->command == ST_CMD_NAT_MESSAGE) {
-        if (header->serializer != ST_SERIALIZER_FASTJSON) {
-            return -1;
-        }
-    } else if (header->serializer != ST_SERIALIZER_COMPACT_BINARY) {
+    if (header->length > max_frame_size - ST_HEADER_SIZE) {
         return -1;
     }
     uint8_t *frame_body = (uint8_t *)malloc(header->length == 0 ? 1U : header->length);
@@ -1376,7 +1704,21 @@ static int verify_database_login(tunnel_session *session, const st_login_request
         *reason = "客户端访问令牌无效";
         return 0;
     }
-    if (strcmp(client_session.status, "HTTP_AUTHENTICATED") != 0) {
+    if (session->is_data_connection) {
+        if (strcmp(client_session.status, "NETTY_ONLINE") != 0) {
+            *reason = "数据连接要求控制连接先登录";
+            return 0;
+        }
+        pthread_mutex_lock(&active_session_lock);
+        tunnel_session *control = active_session_find_role_locked(request->client_name, 0);
+        int matching_control = control != NULL
+            && control->config.client_session_id == client_session.id;
+        pthread_mutex_unlock(&active_session_lock);
+        if (!matching_control) {
+            *reason = "数据连接未找到匹配的控制连接";
+            return 0;
+        }
+    } else if (strcmp(client_session.status, "HTTP_AUTHENTICATED") != 0) {
         *reason = "同一台机器和用户已经有在线实例";
         return 0;
     }
@@ -1404,7 +1746,8 @@ static int verify_database_login(tunnel_session *session, const st_login_request
     }
 
     int online_count = 0;
-    if (st_storage_count_online_sessions_by_machine(config->database_path,
+    if (!session->is_data_connection
+        && st_storage_count_online_sessions_by_machine(config->database_path,
                                                     client_session.credential_id,
                                                     client_session.machine_fingerprint,
                                                     client_session.os_user,
@@ -1413,22 +1756,26 @@ static int verify_database_login(tunnel_session *session, const st_login_request
         *reason = "客户端在线状态不可用";
         return 0;
     }
-    if (online_count >= 1) {
+    if (!session->is_data_connection && online_count >= 1) {
         *reason = "同一台机器和用户已经有在线实例";
         return 0;
     }
-    if (st_storage_count_online_sessions_by_credential(config->database_path,
+    if (!session->is_data_connection
+        && st_storage_count_online_sessions_by_credential(config->database_path,
                                                        client_session.credential_id,
                                                        client_session.id,
                                                        &online_count) != 0) {
         *reason = "客户端在线状态不可用";
         return 0;
     }
-    if (credential.max_online_instances > 0 && online_count >= credential.max_online_instances) {
+    if (!session->is_data_connection
+        && credential.max_online_instances > 0
+        && online_count >= credential.max_online_instances) {
         *reason = "在线实例数已达上限";
         return 0;
     }
-    if (st_storage_mark_client_session_online(config->database_path,
+    if (!session->is_data_connection
+        && st_storage_mark_client_session_online(config->database_path,
                                               client_session.id,
                                               session->remote,
                                               session->remote,
@@ -1437,7 +1784,9 @@ static int verify_database_login(tunnel_session *session, const st_login_request
         return 0;
     }
     if (reload_config_for_client_session(config, &client_session) != 0) {
-        (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
+        if (!session->is_data_connection) {
+            (void)st_storage_mark_client_session_disconnected(config->database_path, client_session.id, now_text);
+        }
         *reason = "客户端配置加载失败";
         return 0;
     }
@@ -1452,7 +1801,10 @@ static int verify_login(tunnel_session *session, const st_login_request *request
     if (request->client_name == NULL
         || request->client_session_id <= 0
         || request->access_token == NULL
-        || request->access_token[0] == '\0') {
+        || request->access_token[0] == '\0'
+        || request->connection_role == NULL
+        || (strcmp(request->connection_role, ST_CONNECTION_ROLE_CONTROL) != 0
+            && strcmp(request->connection_role, ST_CONNECTION_ROLE_DATA) != 0)) {
         *reason = "登录包缺少必要字段";
         return 0;
     }
@@ -1475,6 +1827,18 @@ static int verify_login(tunnel_session *session, const st_login_request *request
     if (!st_constant_time_eq(actual_hash, config->access_token_hash, sizeof(actual_hash))) {
         *reason = "客户端访问令牌无效";
         return 0;
+    }
+
+    if (session->is_data_connection) {
+        pthread_mutex_lock(&active_session_lock);
+        tunnel_session *control = active_session_find_role_locked(request->client_name, 0);
+        int matching_control = control != NULL
+            && control->config.client_session_id == request->client_session_id;
+        pthread_mutex_unlock(&active_session_lock);
+        if (!matching_control) {
+            *reason = "数据连接未找到匹配的控制连接";
+            return 0;
+        }
     }
 
     *reason = NULL;
@@ -1707,57 +2071,140 @@ static char *json_ws_connected(const st_admin_direct_ws_request *request)
     return sb_finish(&builder);
 }
 
-static int send_nat_with_json(tunnel_session *session, int type, char *json, const uint8_t *data, size_t data_len)
+static int append_json_string_array(string_builder *builder,
+                                    const char *name,
+                                    char *const *values,
+                                    size_t values_len,
+                                    int *first)
 {
-    if (json == NULL) {
+    if (sb_appendf(builder, "%s\"%s\":[", *first ? "" : ",", name) != 0) {
         return -1;
     }
-    st_buffer packet = st_protocol_encode_nat_message(type, json, data, data_len);
+    *first = 0;
+    for (size_t i = 0; i < values_len; ++i) {
+        char *escaped = st_json_escape(values[i] == NULL ? "" : values[i]);
+        if (escaped == NULL) {
+            return -1;
+        }
+        int rc = sb_appendf(builder, "%s\"%s\"", i == 0 ? "" : ",", escaped);
+        free(escaped);
+        if (rc != 0) {
+            return -1;
+        }
+    }
+    return sb_append(builder, "]");
+}
+
+static char *json_http_request(const st_direct_http_request *request)
+{
+    string_builder builder = {0};
+    int first = 1;
+    int rc = sb_append(&builder, "{");
+    if (rc == 0) rc = append_json_property(&builder, "source", "http", &first);
+    if (rc == 0) rc = append_json_property(&builder, "phase", "request", &first);
+    if (rc == 0) rc = append_json_property(&builder, "method", request->request_method, &first);
+    if (rc == 0) rc = append_json_property(&builder, "route", request->route, &first);
+    if (rc == 0) rc = append_json_property(&builder, "relativePath", request->relative_path, &first);
+    if (rc == 0) rc = append_json_property(&builder, "rawQuery", request->raw_query, &first);
+    if (rc == 0) {
+        rc = append_json_string_array(&builder, "headers", request->headers,
+                                      request->headers_len, &first);
+    }
+    if (rc == 0) {
+        rc = sb_appendf(&builder, ",\"contentLength\":%zu,\"trailerNames\":[]}",
+                        request->body_len);
+    }
+    if (rc != 0) {
+        free(builder.data);
+        return NULL;
+    }
+    return sb_finish(&builder);
+}
+
+static char *json_reset_reason(const char *reason)
+{
+    char *escaped = st_json_escape(reason == NULL ? "HTTP stream reset" : reason);
+    if (escaped == NULL) {
+        return NULL;
+    }
+    string_builder builder = {0};
+    int rc = sb_appendf(&builder, "{\"reason\":\"%s\"}", escaped);
+    free(escaped);
+    if (rc != 0) {
+        free(builder.data);
+        return NULL;
+    }
+    return sb_finish(&builder);
+}
+
+static int send_nat_with_json(tunnel_session *session, int type, uint32_t stream_id, uint32_t value,
+                              char *json, const uint8_t *data, size_t data_len)
+{
+    st_buffer packet = st_protocol_encode_nat_message(type, 0U, stream_id, value, json, data, data_len);
     free(json);
     return session_send_packet(session, &packet);
 }
 
 static int send_register_result(tunnel_session *session, int port, int success, const char *reason)
 {
-    return send_nat_with_json(session, ST_NAT_REGISTER_RESULT,
+    return send_nat_with_json(session, ST_NAT_REGISTER_RESULT, 0U, 0U,
                               json_register_result(port, success, reason),
                               NULL, 0);
 }
 
-static int send_connected(tunnel_session *session, const char *channel_id, int port)
+static int send_open(tunnel_session *session, uint32_t stream_id, const char *channel_id, int port)
 {
-    return send_nat_with_json(session, ST_NAT_CONNECTED, json_connected(channel_id, port), NULL, 0);
+    return send_nat_with_json(session, ST_NAT_OPEN, stream_id, 0U,
+                              json_connected(channel_id, port), NULL, 0);
 }
 
-static int send_disconnected(tunnel_session *session, const char *channel_id)
+static int send_fin(tunnel_session *session, uint32_t stream_id)
 {
-    return send_nat_with_json(session, ST_NAT_DISCONNECTED, json_channel(channel_id), NULL, 0);
+    return send_nat_with_json(session, ST_NAT_FIN, stream_id, 0U, NULL, NULL, 0);
 }
 
-static int send_data(tunnel_session *session, const char *channel_id, const uint8_t *data, size_t data_len)
+static int send_reset(tunnel_session *session, uint32_t stream_id,
+                      uint32_t code, const char *reason)
 {
-    return send_nat_with_json(session, ST_NAT_DATA, json_channel(channel_id), data, data_len);
+    return send_nat_with_json(session, ST_NAT_RST, stream_id, code,
+                              json_reset_reason(reason), NULL, 0);
 }
 
-static int send_ws_connected(tunnel_session *session, const st_admin_direct_ws_request *request)
+static int send_data(tunnel_session *session, uint32_t stream_id, const uint8_t *data, size_t data_len)
 {
-    return send_nat_with_json(session, ST_NAT_CONNECTED, json_ws_connected(request), NULL, 0);
+    return send_nat_with_json(session, ST_NAT_DATA, stream_id, 0U, NULL, data, data_len);
 }
 
-static int send_ws_disconnected(tunnel_session *session, const char *channel_id)
+static int send_window_update(tunnel_session *session, uint32_t stream_id, size_t credit)
 {
-    return send_nat_with_json(session, ST_NAT_DISCONNECTED, json_ws_channel(channel_id), NULL, 0);
+    if (credit == 0U || credit > UINT32_MAX) {
+        return -1;
+    }
+    return send_nat_with_json(session, ST_NAT_WINDOW_UPDATE, stream_id,
+                              (uint32_t)credit, NULL, NULL, 0);
 }
 
-static int send_ws_data(tunnel_session *session, const char *channel_id, const uint8_t *data, size_t data_len)
+static int send_ws_open(tunnel_session *session, uint32_t stream_id,
+                        const st_admin_direct_ws_request *request)
 {
-    return send_nat_with_json(session, ST_NAT_DATA, json_ws_channel(channel_id), data, data_len);
+    return send_nat_with_json(session, ST_NAT_OPEN, stream_id, 0U,
+                              json_ws_connected(request), NULL, 0);
 }
 
-static external_conn *find_conn_locked(tunnel_session *session, const char *channel_id)
+static int send_ws_fin(tunnel_session *session, uint32_t stream_id)
+{
+    return send_nat_with_json(session, ST_NAT_FIN, stream_id, 0U, NULL, NULL, 0);
+}
+
+static int send_ws_data(tunnel_session *session, uint32_t stream_id, const uint8_t *data, size_t data_len)
+{
+    return send_nat_with_json(session, ST_NAT_DATA, stream_id, 0U, NULL, data, data_len);
+}
+
+static external_conn *find_conn_locked(tunnel_session *session, uint32_t stream_id)
 {
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
-        if (!conn->done && strcmp(conn->channel_id, channel_id) == 0) {
+        if (!conn->done && conn->stream_id == stream_id) {
             return conn;
         }
     }
@@ -1774,11 +2221,36 @@ static ws_conn *find_ws_conn_locked(tunnel_session *session, const char *channel
     return NULL;
 }
 
+static ws_conn *find_ws_stream_locked(tunnel_session *session, uint32_t stream_id)
+{
+    for (ws_conn *conn = session->ws_conns; conn != NULL; conn = conn->next) {
+        if (conn->stream_id == stream_id) {
+            return conn;
+        }
+    }
+    return NULL;
+}
+
 static ws_conn *remove_ws_conn_locked(tunnel_session *session, const char *channel_id)
 {
     ws_conn **cursor = &session->ws_conns;
     while (*cursor != NULL) {
         if (strcmp((*cursor)->channel_id, channel_id) == 0) {
+            ws_conn *removed = *cursor;
+            *cursor = removed->next;
+            removed->next = NULL;
+            return removed;
+        }
+        cursor = &(*cursor)->next;
+    }
+    return NULL;
+}
+
+static ws_conn *remove_ws_stream_locked(tunnel_session *session, uint32_t stream_id)
+{
+    ws_conn **cursor = &session->ws_conns;
+    while (*cursor != NULL) {
+        if ((*cursor)->stream_id == stream_id) {
             ws_conn *removed = *cursor;
             *cursor = removed->next;
             removed->next = NULL;
@@ -1804,6 +2276,10 @@ static void release_external_count(external_conn *conn)
 
 static void close_conn_locked(external_conn *conn)
 {
+    pthread_mutex_lock(&conn->flow_lock);
+    conn->flow_closed = 1;
+    pthread_cond_broadcast(&conn->flow_cond);
+    pthread_mutex_unlock(&conn->flow_lock);
     if (conn->fd >= 0) {
         shutdown(conn->fd, SHUT_RDWR);
         close(conn->fd);
@@ -1811,6 +2287,40 @@ static void close_conn_locked(external_conn *conn)
     }
     release_external_count(conn);
     conn->done = 1;
+}
+
+static int consume_send_credit(external_conn *conn, size_t bytes)
+{
+    if (bytes == 0U || bytes > ST_STREAM_MAX_WINDOW) {
+        return -1;
+    }
+    pthread_mutex_lock(&conn->flow_lock);
+    while (!conn->flow_closed && conn->send_credit < bytes) {
+        pthread_cond_wait(&conn->flow_cond, &conn->flow_lock);
+    }
+    if (conn->flow_closed) {
+        pthread_mutex_unlock(&conn->flow_lock);
+        return -1;
+    }
+    conn->send_credit -= bytes;
+    pthread_mutex_unlock(&conn->flow_lock);
+    return 0;
+}
+
+static int add_send_credit(external_conn *conn, uint32_t credit)
+{
+    if (credit == 0U || credit > ST_STREAM_MAX_WINDOW) {
+        return -1;
+    }
+    pthread_mutex_lock(&conn->flow_lock);
+    if (conn->flow_closed || conn->send_credit > ST_STREAM_MAX_WINDOW - credit) {
+        pthread_mutex_unlock(&conn->flow_lock);
+        return -1;
+    }
+    conn->send_credit += credit;
+    pthread_cond_broadcast(&conn->flow_cond);
+    pthread_mutex_unlock(&conn->flow_lock);
+    return 0;
 }
 
 static int count_external_locked(tunnel_session *session, int port, int *client_count, int *port_count)
@@ -1867,7 +2377,7 @@ static void *external_conn_thread(void *arg)
     printf("[nat] external connected channel=%s port=%d client=%s\n",
            conn->channel_id, conn->port, session->config.client_name);
 
-    if (send_connected(session, conn->channel_id, conn->port) != 0) {
+    if (send_open(session, conn->stream_id, conn->channel_id, conn->port) != 0) {
         mark_conn_done(conn);
         return NULL;
     }
@@ -1883,7 +2393,10 @@ static void *external_conn_thread(void *arg)
         }
         ssize_t read_len = recv(fd, buffer, sizeof(buffer), 0);
         if (read_len > 0) {
-            if (send_data(session, conn->channel_id, buffer, (size_t)read_len) != 0) {
+            if (consume_send_credit(conn, (size_t)read_len) != 0) {
+                break;
+            }
+            if (send_data(session, conn->stream_id, buffer, (size_t)read_len) != 0) {
                 break;
             }
             record_tcp_traffic(session, conn->port, (long long)read_len, 0);
@@ -1896,9 +2409,14 @@ static void *external_conn_thread(void *arg)
         break;
     }
 
-    send_disconnected(session, conn->channel_id);
-    mark_conn_done(conn);
-    printf("[nat] external closed channel=%s port=%d client=%s\n",
+    send_fin(session, conn->stream_id);
+    pthread_mutex_lock(&session->map_lock);
+    conn->public_finished = 1;
+    if (conn->client_finished) {
+        close_conn_locked(conn);
+    }
+    pthread_mutex_unlock(&session->map_lock);
+    printf("[nat] external read side closed channel=%s port=%d client=%s\n",
            conn->channel_id, conn->port, session->config.client_name);
     return NULL;
 }
@@ -1916,6 +2434,9 @@ static int start_external_conn(tunnel_session *session,
     conn->fd = fd;
     conn->port = port;
     conn->session = session;
+    conn->send_credit = ST_STREAM_INITIAL_WINDOW;
+    pthread_mutex_init(&conn->flow_lock, NULL);
+    pthread_cond_init(&conn->flow_cond, NULL);
     if (remote != NULL) {
         remote_endpoint(remote,
                         conn->remote_ip,
@@ -1931,11 +2452,16 @@ static int start_external_conn(tunnel_session *session,
         fprintf(stderr, "[nat] reject external connection on port=%d client=%s: limit reached\n",
                 port, session->config.client_name);
         close(fd);
+        pthread_cond_destroy(&conn->flow_cond);
+        pthread_mutex_destroy(&conn->flow_lock);
         free(conn);
         return -1;
     }
-    snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%llu",
-             (unsigned long long)session->next_channel_id++);
+    conn->stream_id = session->next_stream_id++;
+    if (session->next_stream_id == 0U) {
+        session->next_stream_id = 1U;
+    }
+    snprintf(conn->channel_id, sizeof(conn->channel_id), "c-%u", conn->stream_id);
     conn->next = session->conns;
     session->conns = conn;
     pthread_mutex_unlock(&session->map_lock);
@@ -2104,13 +2630,8 @@ static void process_control_data(tunnel_session *session, const st_nat_message *
     if (message->data == NULL || message->data_len == 0) {
         return;
     }
-    char *channel_id = st_json_get_string(message->meta_json, "channelId");
-    if (channel_id == NULL) {
-        return;
-    }
-
     pthread_mutex_lock(&session->map_lock);
-    external_conn *conn = find_conn_locked(session, channel_id);
+    external_conn *conn = find_conn_locked(session, message->stream_id);
     ws_conn *ws = NULL;
     ws_conn *removed_ws = NULL;
     st_admin_direct_ws_stream *stream_to_close = NULL;
@@ -2123,13 +2644,20 @@ static void process_control_data(tunnel_session *session, const st_nat_message *
         } else {
             record_download = 1;
             record_tcp_frame(session, conn, "CLIENT_TO_PUBLIC", message->data, message->data_len);
+            if ((message->flags & ST_NAT_FLAG_END_STREAM) != 0U) {
+                shutdown(conn->fd, SHUT_WR);
+                conn->client_finished = 1;
+                if (conn->public_finished) {
+                    close_conn_locked(conn);
+                }
+            }
         }
     }
     if (conn == NULL) {
-        ws = find_ws_conn_locked(session, channel_id);
+        ws = find_ws_stream_locked(session, message->stream_id);
         if (ws != NULL
             && st_admin_direct_ws_send_framed_payload(ws->stream, message->data, message->data_len) != 0) {
-            removed_ws = remove_ws_conn_locked(session, channel_id);
+            removed_ws = remove_ws_stream_locked(session, message->stream_id);
             if (removed_ws != NULL) {
                 stream_to_close = removed_ws->stream;
             }
@@ -2143,30 +2671,35 @@ static void process_control_data(tunnel_session *session, const st_nat_message *
     if (record_download) {
         record_tcp_traffic(session, port, 0, (long long)message->data_len);
     }
-    free(channel_id);
+    if (record_download || ws != NULL) {
+        send_window_update(session, message->stream_id, message->data_len);
+    }
 }
 
-static void process_control_disconnected(tunnel_session *session, const st_nat_message *message)
+static void process_control_closed(tunnel_session *session, const st_nat_message *message)
 {
-    char *channel_id = st_json_get_string(message->meta_json, "channelId");
-    if (channel_id == NULL) {
-        return;
-    }
     pthread_mutex_lock(&session->map_lock);
-    external_conn *conn = find_conn_locked(session, channel_id);
+    external_conn *conn = find_conn_locked(session, message->stream_id);
     if (conn != NULL) {
-        close_conn_locked(conn);
+        if (message->type == ST_NAT_RST) {
+            close_conn_locked(conn);
+        } else {
+            shutdown(conn->fd, SHUT_WR);
+            conn->client_finished = 1;
+            if (conn->public_finished) {
+                close_conn_locked(conn);
+            }
+        }
     }
     ws_conn *removed_ws = NULL;
     if (conn == NULL) {
-        removed_ws = remove_ws_conn_locked(session, channel_id);
+        removed_ws = remove_ws_stream_locked(session, message->stream_id);
     }
     pthread_mutex_unlock(&session->map_lock);
     if (removed_ws != NULL) {
         st_admin_direct_ws_close(removed_ws->stream);
         free(removed_ws);
     }
-    free(channel_id);
 }
 
 static void process_unregister(tunnel_session *session, const st_nat_message *message)
@@ -2180,6 +2713,15 @@ static void process_unregister(tunnel_session *session, const st_nat_message *me
 
 static void process_nat_message(tunnel_session *session, const st_nat_message *message)
 {
+    int direct_result = process_direct_http_message(session, message);
+    if (direct_result != 0) {
+        if (direct_result < 0) {
+            printf("[nat] invalid HTTP stream frame stream=%u client=%s\n",
+                   message->stream_id, session->config.client_name);
+            session->active = 0;
+        }
+        return;
+    }
     switch (message->type) {
         case ST_NAT_REGISTER:
             process_register(session, message);
@@ -2190,14 +2732,29 @@ static void process_nat_message(tunnel_session *session, const st_nat_message *m
         case ST_NAT_DATA:
             process_control_data(session, message);
             break;
-        case ST_NAT_DISCONNECTED:
-            process_control_disconnected(session, message);
+        case ST_NAT_FIN:
+        case ST_NAT_RST:
+            process_control_closed(session, message);
             break;
+        case ST_NAT_WINDOW_UPDATE: {
+            pthread_mutex_lock(&session->map_lock);
+            external_conn *conn = find_conn_locked(session, message->stream_id);
+            ws_conn *ws = conn == NULL ? find_ws_stream_locked(session, message->stream_id) : NULL;
+            int invalid = conn != NULL
+                ? add_send_credit(conn, message->value) != 0
+                : ws != NULL && st_admin_direct_ws_add_send_credit(ws->stream, message->value) != 0;
+            pthread_mutex_unlock(&session->map_lock);
+            if (invalid) {
+                session->active = 0;
+            }
+            break;
+        }
         case ST_NAT_KEEPALIVE:
-        case ST_NAT_HTTP_ROUTES_REPORT:
             break;
         default:
-            printf("[nat] ignored type=%d client=%s\n", message->type, session->config.client_name);
+            printf("[nat] protocol violation type=%d client=%s\n",
+                   message->type, session->config.client_name);
+            session->active = 0;
             break;
     }
 }
@@ -2224,11 +2781,7 @@ static void session_shutdown(tunnel_session *session)
         }
     }
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
-        if (conn->fd >= 0) {
-            shutdown(conn->fd, SHUT_RDWR);
-            close(conn->fd);
-            conn->fd = -1;
-        }
+        close_conn_locked(conn);
     }
     for (ws_conn *conn = session->ws_conns; conn != NULL; conn = conn->next) {
         st_admin_direct_ws_close(conn->stream);
@@ -2255,6 +2808,8 @@ static void session_shutdown(tunnel_session *session)
     external_conn *conn = session->conns;
     while (conn != NULL) {
         external_conn *next = conn->next;
+        pthread_cond_destroy(&conn->flow_cond);
+        pthread_mutex_destroy(&conn->flow_lock);
         free(conn);
         conn = next;
     }
@@ -2284,7 +2839,7 @@ static void *client_thread(void *arg)
     session->control_fd = args->fd;
     session->config = args->config;
     session->active = 1;
-    session->next_channel_id = 1;
+    session->next_stream_id = 1U;
     pthread_mutex_init(&session->send_lock, NULL);
     pthread_mutex_init(&session->map_lock, NULL);
     pthread_mutex_init(&session->direct_lock, NULL);
@@ -2298,7 +2853,8 @@ static void *client_thread(void *arg)
     for (;;) {
         st_frame_header header;
         uint8_t *body = NULL;
-        int rc = read_frame(session->control_fd, &header, &body);
+        size_t frame_limit = logged_in ? ST_MAX_FRAME_SIZE : ST_PRE_AUTH_MAX_FRAME_SIZE;
+        int rc = read_frame(session->control_fd, frame_limit, &header, &body);
         if (rc == 0) {
             disconnect_reason = "CLIENT_CLOSED";
             printf("[control] closed %s\n", session->remote);
@@ -2332,8 +2888,21 @@ static void *client_thread(void *arg)
             }
             free(body);
 
+            session->is_data_connection = strcmp(
+                request.connection_role, ST_CONNECTION_ROLE_DATA) == 0;
+            pthread_mutex_lock(&active_session_lock);
+            tunnel_session *same_role = active_session_find_role_locked(
+                request.client_name, session->is_data_connection);
+            pthread_mutex_unlock(&active_session_lock);
             const char *reason = NULL;
-            logged_in = verify_login(session, &request, &reason);
+            if (same_role != NULL) {
+                reason = session->is_data_connection
+                    ? "客户端已有数据连接"
+                    : "客户端已有控制连接";
+                logged_in = 0;
+            } else {
+                logged_in = verify_login(session, &request, &reason);
+            }
             st_buffer response = st_protocol_encode_login_response(
                 request.client_name == NULL ? "" : request.client_name,
                 logged_in,
@@ -2354,20 +2923,24 @@ static void *client_thread(void *arg)
                 st_login_request_free(&request);
                 break;
             }
-            printf("[control] login ok client=%s remote=%s\n", request.client_name, session->remote);
+            printf("[%s] login ok client=%s remote=%s\n",
+                   session->is_data_connection ? "data" : "control",
+                   request.client_name, session->remote);
             pthread_mutex_lock(&active_session_lock);
             active_session_add_locked(session);
             pthread_mutex_unlock(&active_session_lock);
-            record_login_success_event(session);
-            st_buffer nat_control = st_protocol_encode_nat_control(session->config.client_name,
-                                                                   session->config.nat_control_json);
-            if (session_send_packet(session, &nat_control) != 0) {
-                disconnect_reason = "IO_ERROR";
-                st_login_request_free(&request);
-                break;
+            if (!session->is_data_connection) {
+                record_login_success_event(session);
+                st_buffer nat_control = st_protocol_encode_nat_control(session->config.client_name,
+                                                                       session->config.nat_control_json);
+                if (session_send_packet(session, &nat_control) != 0) {
+                    disconnect_reason = "IO_ERROR";
+                    st_login_request_free(&request);
+                    break;
+                }
+                printf("[nat-control] pushed %zu tcp route(s) to %s\n",
+                       session->config.mapping_count, session->config.client_name);
             }
-            printf("[nat-control] pushed %zu tcp route(s) to %s\n",
-                   session->config.mapping_count, session->config.client_name);
             st_login_request_free(&request);
             continue;
         }
@@ -2391,6 +2964,12 @@ static void *client_thread(void *arg)
         }
 
         if (header.command == ST_CMD_NAT_MESSAGE) {
+            if (!session->is_data_connection) {
+                disconnect_reason = "PROTOCOL_VIOLATION";
+                fprintf(stderr, "[control] NAT frame received on control connection from %s\n", session->remote);
+                free(body);
+                break;
+            }
             st_nat_message message;
             if (st_protocol_decode_nat_message(body, header.length, &message) != 0) {
                 disconnect_reason = "PROTOCOL_VIOLATION";
@@ -2404,35 +2983,21 @@ static void *client_thread(void *arg)
             continue;
         }
 
-        if (header.command == ST_CMD_DIRECT_HTTP_RESPONSE) {
-            st_direct_http_response response;
-            if (st_protocol_decode_direct_http_response(body, header.length, &response) != 0) {
-                disconnect_reason = "PROTOCOL_VIOLATION";
-                fprintf(stderr, "[direct-http] bad response from %s\n", session->remote);
-                free(body);
-                break;
-            }
-            free(body);
-            if (!process_direct_http_response(session, &response)) {
-                printf("[direct-http] unmatched response requestId=%s client=%s\n",
-                       response.request_id == NULL ? "" : response.request_id,
-                       session->config.client_name);
-                st_direct_http_response_free(&response);
-            }
-            continue;
-        }
-
-        printf("[control] unsupported command=%d from %s; keeping connection open\n",
+        disconnect_reason = "PROTOCOL_VIOLATION";
+        fprintf(stderr, "[%s] unsupported command=%d from %s\n",
+               session->is_data_connection ? "data" : "control",
                (int)header.command, session->remote);
         free(body);
+        break;
     }
 
     direct_pending_fail_all(session, "control connection closed");
 
     pthread_mutex_lock(&active_session_lock);
+    active_session_close_peer_locked(session);
     active_session_remove_locked(session);
     pthread_mutex_unlock(&active_session_lock);
-    if (logged_in) {
+    if (logged_in && !session->is_data_connection) {
         if (session->config.database_path[0] != '\0'
             && session->config.client_session_db_backed
             && session->config.client_session_id > 0) {
