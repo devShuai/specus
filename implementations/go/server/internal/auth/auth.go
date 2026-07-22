@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
@@ -128,6 +129,23 @@ func (s *SessionStore) CountOnlineByMachineUser(credentialID int64, machineFinge
 	return count
 }
 
+// FindOnlineByCredential returns every NETTY_ONLINE session held for the credential.
+// Used to reconcile stale in-memory rows against the live control-connection registry.
+func (s *SessionStore) FindOnlineByCredential(credentialID int64) []Session {
+	if credentialID <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var online []Session
+	for _, session := range s.byTokenHash {
+		if session.Status == StatusNettyOnline && session.CredentialID == credentialID {
+			online = append(online, session)
+		}
+	}
+	return online
+}
+
 func (s *SessionStore) CountOnlineByCredential(credentialID int64) int {
 	if credentialID <= 0 {
 		return 0
@@ -202,18 +220,23 @@ func NewClientID() int64 {
 type Authenticator struct {
 	db                         *store.DB
 	sessions                   *SessionStore
+	registry                   *session.Registry
 	perMachineUserMaxInstances int
 	now                        func() time.Time
 }
 
-// NewAuthenticator builds an Authenticator backed by db.
-func NewAuthenticator(db *store.DB, sessions *SessionStore, perMachineUserMaxInstances int) *Authenticator {
+// NewAuthenticator builds an Authenticator backed by db. registry is the live
+// control-connection registry used to reconcile stale online sessions before
+// the per-machine/per-credential online checks (mirrors the Java server).
+func NewAuthenticator(db *store.DB, sessions *SessionStore, perMachineUserMaxInstances int,
+	registry *session.Registry) *Authenticator {
 	if perMachineUserMaxInstances <= 0 {
 		perMachineUserMaxInstances = 1
 	}
 	return &Authenticator{
 		db:                         db,
 		sessions:                   sessions,
+		registry:                   registry,
 		perMachineUserMaxInstances: perMachineUserMaxInstances,
 		now:                        time.Now,
 	}
@@ -265,6 +288,9 @@ func (a *Authenticator) authenticate(ctx context.Context, request protocol.Login
 		if !credential.Enabled {
 			return Result{Reason: "客户端凭证已停用", Account: account}, nil
 		}
+		if !dataConnection {
+			a.closeStaleOnlineSessions(ctx, session)
+		}
 		if !dataConnection && a.sessions.CountOnlineByMachineUser(session.CredentialID, session.MachineFingerprint, session.OSUser) >=
 			a.perMachineUserMaxInstances {
 			return Result{Reason: "同一台机器和用户已经有在线实例", Account: account}, nil
@@ -287,6 +313,24 @@ func (a *Authenticator) authenticate(ctx context.Context, request protocol.Login
 		}
 	}
 	return Result{Success: true, Account: account, Session: session}, nil
+}
+
+// closeStaleOnlineSessions marks in-memory NETTY_ONLINE sessions for the same credential as
+// disconnected when their control connection is no longer bound in the registry. This mirrors
+// the Java ClientAuthService.closeStaleOnlineSessions guard so ghost rows left by an unclean
+// disconnect cannot reject a legitimate re-login. The current session is included: on success
+// the dispatcher marks it online again. DB rows are synced best-effort.
+func (a *Authenticator) closeStaleOnlineSessions(ctx context.Context, current Session) {
+	if a.registry == nil || current.CredentialID <= 0 {
+		return
+	}
+	for _, candidate := range a.sessions.FindOnlineByCredential(current.CredentialID) {
+		if _, bound := a.registry.Find(candidate.ClientName); bound {
+			continue
+		}
+		a.sessions.MarkDisconnected(candidate.ID)
+		_ = a.db.MarkClientSessionDisconnected(ctx, candidate.ID, StatusDisconnected, a.now())
+	}
 }
 
 func (a *Authenticator) MarkOnline(sessionID int64) {

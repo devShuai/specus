@@ -37,6 +37,7 @@ type discoveryParticipant struct {
 	roomID        string
 	publicAddress string
 	roomKey       string
+	roomRole      string
 	sharedRoom    bool
 	connectedAt   time.Time
 }
@@ -48,10 +49,14 @@ func (p discoveryParticipant) sameGroup(other discoveryParticipant) bool {
 func (p discoveryParticipant) groupID() string { return publicTransferGroupID(p.roomID, p.roomKey) }
 
 func (p discoveryParticipant) clusterParticipant() clusterParticipant {
+	roomRole := p.roomRole
+	if roomRole == "" {
+		roomRole = "EDITOR"
+	}
 	return clusterParticipant{
 		LeaseID: p.leaseID, PeerID: p.peerID, DisplayName: p.displayName,
 		RoomID: p.roomID, PublicAddress: p.publicAddress, RoomKey: p.roomKey,
-		RoomRole: "EDITOR", SharedRoom: p.sharedRoom,
+		RoomRole: roomRole, SharedRoom: p.sharedRoom,
 		ConnectedAt: p.connectedAt.Format(time.RFC3339Nano),
 	}
 }
@@ -158,6 +163,7 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 		roomID:        claims.RoomID,
 		publicAddress: trustedClientIP(r),
 		roomKey:       claims.RoomKey,
+		roomRole:      claims.RoomRole,
 		sharedRoom:    claims.SharedRoom,
 		connectedAt:   time.Now().UTC(),
 	}

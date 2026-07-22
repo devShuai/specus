@@ -41,6 +41,7 @@ type API struct {
 	seedDemo     func(ctx context.Context) error
 	peerMesh     *peermesh.Service
 	attachments  *transfer.Service
+	rooms        *transfer.RoomService
 	turnstile    *security.TurnstileVerifier
 	registration *registrationService
 }
@@ -50,14 +51,15 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 	oidcAuth *security.OidcValidator, natControl *nat.ControlService, remotePorts *nat.RemotePortManager,
 	oidc config.OidcConfig, authConfig config.AuthConfig, clientAuth config.ClientAuthConfig,
 	traffic config.TrafficConfig, trafficUsage *nat.TrafficService,
-	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service, attachments *transfer.Service) *API {
+	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service, attachments *transfer.Service,
+	rooms *transfer.RoomService) *API {
 	turnstile := security.NewTurnstileVerifier(authConfig.Turnstile)
 	registration := newRegistrationService(db, tokens, turnstile, authConfig,
 		newSMTPRegistrationMailer(authConfig.EmailVerification))
 	return &API{db: db, sessions: sessions, tokens: tokens, oidcAuth: oidcAuth, natControl: natControl,
 		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
-		peerMesh: peerMesh, attachments: attachments, turnstile: turnstile, registration: registration}
+		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile, registration: registration}
 }
 
 // Register attaches all auth and admin routes to mux.
@@ -80,6 +82,22 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/admin/client-messages/attachments/presign-upload", a.requireAuth(a.handleAdminAttachmentPresignUpload))
 	mux.HandleFunc("POST /api/admin/client-messages/attachments/{attachmentId}/complete", a.requireAuth(a.handleAdminAttachmentComplete))
 	mux.HandleFunc("POST /api/admin/client-messages/attachments/{attachmentId}/presign-download", a.requireAuth(a.handleAdminAttachmentPresignDownload))
+
+	mux.HandleFunc("POST /api/public/transfer/rooms/access-tokens/list", a.handleRoomListAccessTokens)
+	mux.HandleFunc("POST /api/public/transfer/rooms/access-tokens", a.handleRoomCreateAccessToken)
+	mux.HandleFunc("POST /api/public/transfer/rooms/access-tokens/{accessId}/revoke", a.handleRoomRevokeAccessToken)
+	mux.HandleFunc("POST /api/public/transfer/rooms/pairing-codes", a.handleRoomCreatePairingCode)
+	mux.HandleFunc("POST /api/public/transfer/rooms/pairing-codes/redeem", a.handleRoomRedeemPairingCode)
+	mux.HandleFunc("POST /api/public/transfer/rooms/diagram/versions/list", a.handleRoomListVersions)
+	mux.HandleFunc("POST /api/public/transfer/rooms/diagram/versions", a.handleRoomCreateVersion)
+	mux.HandleFunc("POST /api/public/transfer/rooms/diagram/versions/{versionId}", a.handleRoomGetVersion)
+	mux.HandleFunc("POST /api/public/transfer/rooms/diagram/versions/{versionId}/delete", a.handleRoomDeleteVersion)
+
+	mux.HandleFunc("GET /api/admin/diagrams", a.requireAuth(a.handleListDiagrams))
+	mux.HandleFunc("GET /api/admin/diagrams/{id}", a.requireAuth(a.handleGetDiagram))
+	mux.HandleFunc("POST /api/admin/diagrams", a.requireAuth(a.handleCreateDiagram))
+	mux.HandleFunc("PUT /api/admin/diagrams/{id}", a.requireAuth(a.handleUpdateDiagram))
+	mux.HandleFunc("DELETE /api/admin/diagrams/{id}", a.requireAuth(a.handleDeleteDiagram))
 
 	mux.HandleFunc("GET /api/admin/overview", a.requireAuth(a.handleOverview))
 	mux.HandleFunc("POST /api/admin/database/initialize", a.requireAuth(a.handleDatabaseInitialize))

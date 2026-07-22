@@ -28,11 +28,11 @@ func (db *DB) ConsumeClientAuthNonce(ctx context.Context, apiKeyHash, nonceHash 
 
 func (db *DB) InsertWebSocketTicket(ctx context.Context, ticket WebSocketTicket) error {
 	_, err := db.sql.ExecContext(ctx, db.rebind(`INSERT INTO tunnel_websocket_ticket
-		(token_hash, scope, username, tenant_id, is_admin, room_id, room_key, peer_id, display_name,
+		(token_hash, scope, username, tenant_id, is_admin, room_id, room_key, room_role, peer_id, display_name,
 		 shared_room, remote_address_hash, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
 		ticket.TokenHash, ticket.Scope, nullableText(ticket.Username), nullableText(ticket.TenantID), databaseBool(ticket.Admin),
-		nullableText(ticket.RoomID), nullableText(ticket.RoomKey), nullableText(ticket.PeerID), nullableText(ticket.DisplayName),
+		nullableText(ticket.RoomID), nullableText(ticket.RoomKey), nullableText(ticket.RoomRole), nullableText(ticket.PeerID), nullableText(ticket.DisplayName),
 		databaseBool(ticket.SharedRoom), ticket.RemoteAddressHash, formatTime(ticket.CreatedAt), formatTime(ticket.ExpiresAt))
 	if err != nil {
 		return fmt.Errorf("insert websocket ticket: %w", err)
@@ -47,14 +47,14 @@ func (db *DB) ConsumeWebSocketTicket(ctx context.Context, tokenHash, scope, remo
 	var (
 		ticket                              WebSocketTicket
 		username, tenantID, roomID, roomKey sql.NullString
-		peerID, displayName                 sql.NullString
+		roomRole, peerID, displayName       sql.NullString
 		admin, sharedRoom                   int
 		createdAt, expiresAt                string
 	)
 	err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT token_hash, scope, username, tenant_id, is_admin,
-		room_id, room_key, peer_id, display_name, shared_room, remote_address_hash, created_at, expires_at
+		room_id, room_key, room_role, peer_id, display_name, shared_room, remote_address_hash, created_at, expires_at
 		FROM tunnel_websocket_ticket WHERE token_hash = ?`), tokenHash).Scan(
-		&ticket.TokenHash, &ticket.Scope, &username, &tenantID, &admin, &roomID, &roomKey, &peerID,
+		&ticket.TokenHash, &ticket.Scope, &username, &tenantID, &admin, &roomID, &roomKey, &roomRole, &peerID,
 		&displayName, &sharedRoom, &ticket.RemoteAddressHash, &createdAt, &expiresAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -67,6 +67,7 @@ func (db *DB) ConsumeWebSocketTicket(ctx context.Context, tokenHash, scope, remo
 	ticket.Admin = admin != 0
 	ticket.RoomID = roomID.String
 	ticket.RoomKey = roomKey.String
+	ticket.RoomRole = roomRole.String
 	ticket.PeerID = peerID.String
 	ticket.DisplayName = displayName.String
 	ticket.SharedRoom = sharedRoom != 0

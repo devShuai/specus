@@ -165,6 +165,7 @@ func (db *DB) ensureCompatibleColumns() error {
 		{"peer_mesh_device", "nat_filtering_behavior", "VARCHAR(80)"},
 		{"peer_mesh_device", "nat_behavior_discovery", "VARCHAR(40)"},
 		{"peer_mesh_acl", "direction", "VARCHAR(16) NOT NULL DEFAULT 'OUTBOUND'"},
+		{"tunnel_websocket_ticket", "room_role", "VARCHAR(16)"},
 	}
 	for _, column := range columns {
 		if err := db.ensureColumn(column.table, column.name, column.definition); err != nil {

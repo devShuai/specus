@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
   is_admin SMALLINT NOT NULL DEFAULT 0,
   room_id VARCHAR(120),
   room_key VARCHAR(80),
+  room_role VARCHAR(16),
   peer_id VARCHAR(120),
   display_name VARCHAR(120),
   shared_room SMALLINT NOT NULL DEFAULT 0,
@@ -473,3 +474,74 @@ CREATE TABLE IF NOT EXISTS tunnel_connection_stat (
 
 CREATE INDEX IF NOT EXISTS idx_stat_tenant ON tunnel_connection_stat (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_stat_client_name ON tunnel_connection_stat (client_name);
+
+-- Public transfer rooms (Batch 5, aligned with the Java management model).
+CREATE TABLE IF NOT EXISTS public_transfer_room (
+  id BIGINT PRIMARY KEY,
+  room_name VARCHAR(120) NOT NULL,
+  owner_token_hash VARCHAR(64) NOT NULL,
+  created_by_peer_id VARCHAR(120) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE (room_name, owner_token_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_public_transfer_room_name ON public_transfer_room (room_name);
+
+CREATE TABLE IF NOT EXISTS public_transfer_room_access (
+  id BIGINT PRIMARY KEY,
+  room_id BIGINT NOT NULL,
+  token_hash VARCHAR(64) NOT NULL,
+  role VARCHAR(16) NOT NULL,
+  label VARCHAR(80) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  expires_at VARCHAR(40),
+  revoked_at VARCHAR(40),
+  UNIQUE (token_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_public_transfer_access_room ON public_transfer_room_access (room_id);
+
+CREATE TABLE IF NOT EXISTS public_transfer_room_pairing_code (
+  id BIGINT PRIMARY KEY,
+  room_id BIGINT NOT NULL,
+  code_hash VARCHAR(64) NOT NULL,
+  role VARCHAR(16) NOT NULL,
+  label VARCHAR(80) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  expires_at VARCHAR(40) NOT NULL,
+  max_uses BIGINT NOT NULL,
+  used_count BIGINT NOT NULL,
+  revoked_at VARCHAR(40),
+  UNIQUE (code_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_public_transfer_pairing_room ON public_transfer_room_pairing_code (room_id);
+
+CREATE TABLE IF NOT EXISTS public_transfer_diagram_version (
+  id BIGINT PRIMARY KEY,
+  room_id BIGINT NOT NULL,
+  name VARCHAR(80) NOT NULL,
+  author_peer_id VARCHAR(120) NOT NULL,
+  snapshot_data BYTEA NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  created_at VARCHAR(40) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_public_transfer_version_room ON public_transfer_diagram_version (room_id);
+CREATE INDEX IF NOT EXISTS idx_public_transfer_version_created ON public_transfer_diagram_version (created_at);
+
+CREATE TABLE IF NOT EXISTS user_diagram_document (
+  id BIGINT PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  owner_username VARCHAR(160) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  snapshot_data BYTEA NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 0,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_diagram_owner ON user_diagram_document (tenant_id, owner_username);
+CREATE INDEX IF NOT EXISTS idx_user_diagram_updated ON user_diagram_document (updated_at);

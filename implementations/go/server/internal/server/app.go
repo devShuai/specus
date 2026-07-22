@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
@@ -59,6 +61,7 @@ type App struct {
 	clientMessages          *clientMessagesHub
 	publicTransferDiscovery *publicTransferDiscoveryHub
 	attachments             *transfer.Service
+	rooms                   *transfer.RoomService
 	webSocketTickets        *security.WebSocketTicketService
 }
 
@@ -131,7 +134,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	sessions := session.NewRegistry()
 	clientSessions := auth.NewSessionStore()
 	executor := control.NewLoginExecutor(cfg.Login.ExecutorMaxSize, cfg.Login.ExecutorQueueCapacity)
-	authenticator := auth.NewAuthenticator(db, clientSessions, cfg.ClientAuth.PerMachineUserMaxInstances)
+	authenticator := auth.NewAuthenticator(db, clientSessions, cfg.ClientAuth.PerMachineUserMaxInstances, sessions)
 	dispatcher := NewDispatcher(db, authenticator, sessions, executor, logger)
 	listener := control.NewListener(cfg.Netty.MaxFrameSize,
 		cfg.Netty.WriteBufferLowWaterMark, cfg.Netty.WriteBufferHighWaterMark, dispatcher)
@@ -174,16 +177,27 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			}
 			return publicTransferDiscovery.coordination.allowRate(ctx, bucket, identity, limit, window)
 		}))
+	rooms := transfer.NewRoomService(db, cfg.PublicTransfer, tokens,
+		transfer.SharedRateLimiterFunc(func(ctx context.Context, bucket, identity string,
+			limit int, window time.Duration) (bool, error) {
+			if publicTransferDiscovery.coordination == nil {
+				return false, errors.New("public transfer coordination is unavailable")
+			}
+			return publicTransferDiscovery.coordination.allowRate(ctx, bucket, identity, limit, window)
+		}))
 	directHTTP := directhttp.NewService(sessions,
 		func(clientName string, metadata map[string]any) (directhttp.Stream, error) {
 			return coordinator.OpenHTTPStream(clientName, metadata)
+		},
+		func(clientName string, metadata map[string]any, conn *websocket.Conn) (*directhttp.WebSocketTunnel, error) {
+			return coordinator.OpenWSStream(clientName, metadata, conn)
 		},
 		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
 		cfg.HTTP.RewriteMaxBodyBytes, traffic, db, db, detailOptions)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
-		}, peerMesh, attachments)
+		}, peerMesh, attachments, rooms)
 	wsHub := wsevents.NewHub(webSocketTickets, func(access wsevents.Access, event wsevents.Event) bool {
 		if access.Admin {
 			return true
@@ -277,6 +291,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		clientMessages:          clientMessages,
 		publicTransferDiscovery: publicTransferDiscovery,
 		attachments:             attachments,
+		rooms:                   rooms,
 		webSocketTickets:        webSocketTickets,
 	}, nil
 }

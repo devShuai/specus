@@ -203,6 +203,9 @@ type PeerMeshConfig struct {
 	StandaloneStunAlternateAddress string   `json:"standaloneStunAlternateAddress"`
 	StandaloneStunAlternatePort    int      `json:"standaloneStunAlternatePort"`
 	StunAlternatePublicAddress     string   `json:"stunAlternatePublicAddress"`
+	StunPrimaryBindAddress         string   `json:"stunPrimaryBindAddress"`
+	StunAlternateBindAddress       string   `json:"stunAlternateBindAddress"`
+	StunBehaviorStrict             bool     `json:"stunBehaviorStrict"`
 	NatProbeAlternatePort          int      `json:"natProbeAlternatePort"`
 	PublicStunServers              []string `json:"publicStunServers"`
 	SessionTTLSeconds              int64    `json:"sessionTtlSeconds"`
@@ -250,18 +253,21 @@ type ObjectStorageConfig struct {
 
 // PublicTransferConfig mirrors tunnel.public-transfer abuse-protection limits.
 type PublicTransferConfig struct {
-	PresignRateLimitPerIP                  int    `json:"presignRateLimitPerIp"`
-	PresignRateLimitWindowSeconds          int64  `json:"presignRateLimitWindowSeconds"`
-	MaxPendingUploadsPerRoom               int    `json:"maxPendingUploadsPerRoom"`
-	MaxDiscoveryPeersPerRoom               int    `json:"maxDiscoveryPeersPerRoom"`
-	DiscoveryMessageRateLimitPerConnection int    `json:"discoveryMessageRateLimitPerConnection"`
-	DiscoveryMessageRateLimitWindowSeconds int64  `json:"discoveryMessageRateLimitWindowSeconds"`
-	ClusterEnabled                         bool   `json:"clusterEnabled"`
-	RedisURI                               string `json:"redisUri"`
-	RedisKeyPrefix                         string `json:"redisKeyPrefix"`
-	PresenceLeaseSeconds                   int64  `json:"presenceLeaseSeconds"`
-	PresenceRefreshIntervalMs              int64  `json:"presenceRefreshIntervalMs"`
-	RedisCommandTimeoutMs                  int64  `json:"redisCommandTimeoutMs"`
+	PresignRateLimitPerIP                   int    `json:"presignRateLimitPerIp"`
+	PresignRateLimitWindowSeconds           int64  `json:"presignRateLimitWindowSeconds"`
+	MaxPendingUploadsPerRoom                int    `json:"maxPendingUploadsPerRoom"`
+	MaxDiscoveryPeersPerRoom                int    `json:"maxDiscoveryPeersPerRoom"`
+	DiscoveryMessageRateLimitPerConnection  int    `json:"discoveryMessageRateLimitPerConnection"`
+	DiscoveryMessageRateLimitWindowSeconds  int64  `json:"discoveryMessageRateLimitWindowSeconds"`
+	ClusterEnabled                          bool   `json:"clusterEnabled"`
+	RedisURI                                string `json:"redisUri"`
+	RedisKeyPrefix                          string `json:"redisKeyPrefix"`
+	PresenceLeaseSeconds                    int64  `json:"presenceLeaseSeconds"`
+	PresenceRefreshIntervalMs               int64  `json:"presenceRefreshIntervalMs"`
+	RedisCommandTimeoutMs                   int64  `json:"redisCommandTimeoutMs"`
+	PairingCodeTtlSeconds                   int64  `json:"pairingCodeTtlSeconds"`
+	PairingCodeRedeemRateLimitPerIP         int    `json:"pairingCodeRedeemRateLimitPerIp"`
+	PairingCodeRedeemRateLimitWindowSeconds int64  `json:"pairingCodeRedeemRateLimitWindowSeconds"`
 }
 
 // OidcConfig mirrors Tunnel:Oidc.
@@ -391,16 +397,19 @@ func Default() Config {
 			ExpirationScanIntervalMs:         3600000,
 		},
 		PublicTransfer: PublicTransferConfig{
-			PresignRateLimitPerIP:                  30,
-			PresignRateLimitWindowSeconds:          300,
-			MaxPendingUploadsPerRoom:               50,
-			MaxDiscoveryPeersPerRoom:               32,
-			DiscoveryMessageRateLimitPerConnection: 360,
-			DiscoveryMessageRateLimitWindowSeconds: 60,
-			RedisKeyPrefix:                         "shuai-tunnel:v2:public-transfer",
-			PresenceLeaseSeconds:                   30,
-			PresenceRefreshIntervalMs:              10000,
-			RedisCommandTimeoutMs:                  2000,
+			PresignRateLimitPerIP:                   30,
+			PresignRateLimitWindowSeconds:           300,
+			MaxPendingUploadsPerRoom:                50,
+			MaxDiscoveryPeersPerRoom:                32,
+			DiscoveryMessageRateLimitPerConnection:  360,
+			DiscoveryMessageRateLimitWindowSeconds:  60,
+			RedisKeyPrefix:                          "shuai-tunnel:v2:public-transfer",
+			PresenceLeaseSeconds:                    30,
+			PresenceRefreshIntervalMs:               10000,
+			RedisCommandTimeoutMs:                   2000,
+			PairingCodeTtlSeconds:                   300,
+			PairingCodeRedeemRateLimitPerIP:         10,
+			PairingCodeRedeemRateLimitWindowSeconds: 300,
 		},
 		Oidc: OidcConfig{
 			Issuer:                "https://gateway.toys.theshuai.com/auth",
@@ -587,6 +596,9 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setStr("TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS", &cfg.PeerMesh.StandaloneStunAlternateAddress)
 	setInt("TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT", &cfg.PeerMesh.StandaloneStunAlternatePort)
 	setStr("TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS", &cfg.PeerMesh.StunAlternatePublicAddress)
+	setStr("TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS", &cfg.PeerMesh.StunPrimaryBindAddress)
+	setStr("TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS", &cfg.PeerMesh.StunAlternateBindAddress)
+	setBool("TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT", &cfg.PeerMesh.StunBehaviorStrict)
 	setInt("TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT", &cfg.PeerMesh.NatProbeAlternatePort)
 	setStrSlice("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", &cfg.PeerMesh.PublicStunServers)
 	setInt64("TUNNEL_PEER_MESH_SESSION_TTL_SECONDS", &cfg.PeerMesh.SessionTTLSeconds)
@@ -629,6 +641,9 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", &cfg.PublicTransfer.MaxDiscoveryPeersPerRoom)
 	setInt("TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION", &cfg.PublicTransfer.DiscoveryMessageRateLimitPerConnection)
 	setInt64("TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS", &cfg.PublicTransfer.DiscoveryMessageRateLimitWindowSeconds)
+	setInt64("TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS", &cfg.PublicTransfer.PairingCodeTtlSeconds)
+	setInt("TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP", &cfg.PublicTransfer.PairingCodeRedeemRateLimitPerIP)
+	setInt64("TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS", &cfg.PublicTransfer.PairingCodeRedeemRateLimitWindowSeconds)
 	setBool("TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED", &cfg.PublicTransfer.ClusterEnabled)
 	setStr("TUNNEL_PUBLIC_TRANSFER_REDIS_URI", &cfg.PublicTransfer.RedisURI)
 	setStr("TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", &cfg.PublicTransfer.RedisKeyPrefix)

@@ -3,6 +3,8 @@ package directhttp
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
@@ -29,6 +33,15 @@ var skippedHeaders = map[string]struct{}{
 	"trailer": {}, "transfer-encoding": {}, "upgrade": {},
 }
 
+// wsSkippedHeaders 在 WS 升级请求上额外跳过握手头（对齐 Java WebSocketTunnelHandshakeInterceptor）。
+var wsSkippedHeaders = map[string]struct{}{
+	"connection": {}, "content-length": {}, "host": {}, "keep-alive": {},
+	"proxy-authenticate": {}, "proxy-authorization": {}, "te": {},
+	"trailer": {}, "transfer-encoding": {}, "upgrade": {},
+	"sec-websocket-key": {}, "sec-websocket-version": {}, "sec-websocket-extensions": {},
+	"sec-websocket-protocol": {}, "sec-websocket-accept": {},
+}
+
 // Stream is the HTTP-facing contract of one NAT stream v2 exchange.
 type Stream interface {
 	SendData(context.Context, []byte) error
@@ -42,6 +55,9 @@ type Stream interface {
 
 // OpenStreamFunc allocates a stream in an authenticated client's NAT namespace.
 type OpenStreamFunc func(clientName string, metadata map[string]any) (Stream, error)
+
+// OpenWSStreamFunc allocates a WebSocket tunnel stream in an authenticated client's NAT namespace.
+type OpenWSStreamFunc func(clientName string, metadata map[string]any, conn *websocket.Conn) (*WebSocketTunnel, error)
 
 type TrafficRecorder interface {
 	RecordHTTPUpload(clientName, route string, bytes int64)
@@ -60,6 +76,7 @@ type DetailRecorder interface {
 type Service struct {
 	sessions    *session.Registry
 	openStream  OpenStreamFunc
+	openWS      OpenWSStreamFunc
 	timeout     time.Duration
 	maxBodySize int
 	traffic     TrafficRecorder
@@ -69,22 +86,27 @@ type Service struct {
 	rewriter    responseRewriter
 }
 
-func NewService(sessions *session.Registry, openStream OpenStreamFunc, timeout time.Duration,
-	maxBodySize int, rewriteMaxBodyBytes int, traffic TrafficRecorder, routes RouteSettings,
-	detail DetailRecorder, detailOpts store.TrafficDetailOptions) *Service {
+func NewService(sessions *session.Registry, openStream OpenStreamFunc, openWS OpenWSStreamFunc,
+	timeout time.Duration, maxBodySize int, rewriteMaxBodyBytes int, traffic TrafficRecorder,
+	routes RouteSettings, detail DetailRecorder, detailOpts store.TrafficDetailOptions) *Service {
 	return &Service{
-		sessions: sessions, openStream: openStream, timeout: timeout, maxBodySize: maxBodySize,
+		sessions: sessions, openStream: openStream, openWS: openWS, timeout: timeout, maxBodySize: maxBodySize,
 		traffic: traffic, routes: routes, detail: detail, detailOpts: detailOpts,
 		rewriter: newResponseRewriter(rewriteMaxBodyBytes),
 	}
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 带 Upgrade: websocket 的 /http/** 请求走 WS 隧道（对齐 Java WebSocketTunnelConfig 的路由分流）。
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		s.serveWebSocket(w, r)
+		return
+	}
 	startedAt := time.Now()
 	clientName := r.PathValue("clientName")
 	route := r.PathValue("route")
 	path := relativePath(r)
-	requestHeaders := collectHeaders(r.Header)
+	requestHeaders := collectHeaders(r.Header, skippedHeaders)
 	requestCapture := &limitedCapture{limit: detailCaptureBytes}
 
 	fail := func(status int, message string) {
@@ -274,6 +296,45 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		startedAt, r.RemoteAddr)
 }
 
+// serveWebSocket 处理 /http/{clientName}/{route}/** 的 WS 升级请求（对齐 Java WebSocketTunnelHandler）：
+// 握手成功后发送带 source=ws metadata 的 OPEN 帧，随后进入浏览器消息的读循环。
+func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request) {
+	clientName := r.PathValue("clientName")
+	route := r.PathValue("route")
+	// InsecureSkipVerify 跳过 Origin 校验，对齐 Java setAllowedOriginPatterns("*")。
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+	fail := func(reason string) {
+		_ = conn.Close(websocket.StatusInternalError, reason)
+	}
+	if s.sessions == nil {
+		fail(errOffline.Error() + ": " + clientName)
+		return
+	}
+	if _, online := s.sessions.Find(clientName); !online {
+		fail(errOffline.Error() + ": " + clientName)
+		return
+	}
+	if s.openWS == nil {
+		fail("WS 隧道服务不可用")
+		return
+	}
+
+	metadata := map[string]any{
+		"source": "ws", "channelId": newWSChannelID(), "clientName": clientName,
+		"route": route, "relativePath": relativePath(r), "rawQuery": r.URL.RawQuery,
+		"headers": collectHeaders(r.Header, wsSkippedHeaders), "body": []byte{},
+	}
+	tunnel, err := s.openWS(clientName, metadata, conn)
+	if err != nil {
+		fail("WS 隧道请求发送失败")
+		return
+	}
+	tunnel.ReadLoop(r.Context())
+}
+
 func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers http.Header, stream Stream,
 	clientName, route string, capture *limitedCapture) error {
 	defer body.Close()
@@ -299,7 +360,7 @@ func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				metadata := map[string]any(nil)
-				if values := collectHeaders(trailers); len(values) > 0 {
+				if values := collectHeaders(trailers, skippedHeaders); len(values) > 0 {
 					metadata = map[string]any{"trailers": values}
 				}
 				return stream.FinishRequest(metadata)
@@ -354,10 +415,10 @@ func relativePath(r *http.Request) string {
 	return path[afterClient+routeSeparator:]
 }
 
-func collectHeaders(header http.Header) []string {
+func collectHeaders(header http.Header, skipped map[string]struct{}) []string {
 	var headers []string
 	for name, values := range header {
-		if _, skip := skippedHeaders[strings.ToLower(name)]; skip {
+		if _, skip := skipped[strings.ToLower(name)]; skip {
 			continue
 		}
 		for _, value := range values {
@@ -412,6 +473,13 @@ func isRewritableContentType(headers []string) bool {
 }
 
 func plainErrorHeaders() []string { return []string{"Content-Type:text/plain;charset=UTF-8"} }
+
+// newWSChannelID 生成 WS 流的 channelId（对齐 Java WebSocketTunnelHandler 的 UUID 随机标识）。
+func newWSChannelID() string {
+	var raw [16]byte
+	_, _ = rand.Read(raw[:])
+	return hex.EncodeToString(raw[:])
+}
 
 func writeTextError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "text/plain;charset=UTF-8")

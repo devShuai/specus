@@ -33,6 +33,7 @@ type WebSocketTicketClaims struct {
 	Admin       bool
 	RoomID      string
 	RoomKey     string
+	RoomRole    string
 	PeerID      string
 	DisplayName string
 	SharedRoom  bool
@@ -95,6 +96,7 @@ func (s *WebSocketTicketService) Issue(ctx context.Context, scope, remoteAddress
 		Admin:             claims.Admin,
 		RoomID:            strings.TrimSpace(claims.RoomID),
 		RoomKey:           strings.TrimSpace(claims.RoomKey),
+		RoomRole:          strings.TrimSpace(claims.RoomRole),
 		PeerID:            strings.TrimSpace(claims.PeerID),
 		DisplayName:       strings.TrimSpace(claims.DisplayName),
 		SharedRoom:        claims.SharedRoom,
@@ -118,7 +120,7 @@ func (s *WebSocketTicketService) Consume(ctx context.Context, ticket, scope, rem
 	}
 	return &WebSocketTicketClaims{
 		Username: record.Username, TenantID: record.TenantID, Admin: record.Admin,
-		RoomID: record.RoomID, RoomKey: record.RoomKey, PeerID: record.PeerID,
+		RoomID: record.RoomID, RoomKey: record.RoomKey, RoomRole: record.RoomRole, PeerID: record.PeerID,
 		DisplayName: record.DisplayName, SharedRoom: record.SharedRoom,
 	}, nil
 }

@@ -22,7 +22,7 @@ func TestServeHTTPRejectsKnownOversizedRequestBeforeOpeningStream(t *testing.T) 
 	service := NewService(nil, func(string, map[string]any) (Stream, error) {
 		opened = true
 		return nil, nil
-	}, time.Second, 4, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	}, nil, time.Second, 4, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
 	request := tunnelRequest(http.MethodPost, "/http/Demo%20client/api/upload?debug=true", "12345")
 	response := httptest.NewRecorder()
 
@@ -38,7 +38,7 @@ func TestServeHTTPRejectsKnownOversizedRequestBeforeOpeningStream(t *testing.T) 
 
 func TestServeHTTPRecordsOfflineError(t *testing.T) {
 	recorder := &capturingDetailRecorder{}
-	service := NewService(session.NewRegistry(), nil, time.Second, 1024, 1024,
+	service := NewService(session.NewRegistry(), nil, nil, time.Second, 1024, 1024,
 		nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
 	request := tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", "")
 	response := httptest.NewRecorder()
@@ -66,7 +66,7 @@ func TestServeHTTPStreamsRequestAndResponseWithCredit(t *testing.T) {
 	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
 		opened = metadata
 		return stream, nil
-	}, time.Second, 1024, 1024, traffic, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	}, nil, time.Second, 1024, 1024, traffic, nil, recorder, store.TrafficDetailOptions{Enabled: true})
 	request := tunnelRequest(http.MethodPatch, "/http/Demo%20client/api/items?x=%2F", "request-body")
 	request.Header.Set("X-Request", "yes")
 	response := httptest.NewRecorder()
@@ -96,7 +96,7 @@ func TestServeHTTPPreservesEncodedRelativePath(t *testing.T) {
 	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
 		opened = metadata
 		return stream, nil
-	}, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
 	request := tunnelRequest(http.MethodGet, "/http/Demo%20client/api/%E4%BD%A0%2Fok/%252F?x=%2F", "")
 	response := httptest.NewRecorder()
 
@@ -112,7 +112,7 @@ func TestServeHTTPPropagatesHeaderTimeoutAsReset(t *testing.T) {
 	stream := newFakeStream()
 	stream.blockHead = true
 	service := NewService(registry, func(string, map[string]any) (Stream, error) { return stream, nil },
-		10*time.Millisecond, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+		nil, 10*time.Millisecond, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))

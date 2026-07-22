@@ -97,6 +97,7 @@ type WebSocketTicket struct {
 	Admin             bool
 	RoomID            string
 	RoomKey           string
+	RoomRole          string
 	PeerID            string
 	DisplayName       string
 	SharedRoom        bool
@@ -440,4 +441,65 @@ type ConnectionStat struct {
 	SuccessCount int64
 	FailureCount int64
 	UpdatedAt    time.Time
+}
+
+// PublicTransferRoom mirrors public_transfer_room (Java PublicTransferRoom).
+type PublicTransferRoom struct {
+	ID              int64
+	RoomName        string
+	OwnerTokenHash  string
+	CreatedByPeerID string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// PublicTransferRoomAccess mirrors public_transfer_room_access (Java PublicTransferRoomAccess).
+type PublicTransferRoomAccess struct {
+	ID        int64
+	RoomID    int64
+	TokenHash string
+	Role      string
+	Label     string
+	CreatedAt time.Time
+	ExpiresAt *time.Time
+	RevokedAt *time.Time
+}
+
+// PublicTransferRoomPairingCode mirrors public_transfer_room_pairing_code. The plaintext
+// eight-digit code is never persisted.
+type PublicTransferRoomPairingCode struct {
+	ID        int64
+	RoomID    int64
+	CodeHash  string
+	Role      string
+	Label     string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	MaxUses   int
+	UsedCount int
+	RevokedAt *time.Time
+}
+
+// PublicTransferDiagramVersion mirrors public_transfer_diagram_version.
+type PublicTransferDiagramVersion struct {
+	ID           int64
+	RoomID       int64
+	Name         string
+	AuthorPeerID string
+	SnapshotData []byte
+	SizeBytes    int64
+	CreatedAt    time.Time
+}
+
+// UserDiagramDocument mirrors user_diagram_document (Java UserDiagramDocument).
+type UserDiagramDocument struct {
+	ID            int64
+	TenantID      string
+	OwnerUsername string
+	Name          string
+	SnapshotData  []byte
+	SizeBytes     int64
+	Revision      int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }

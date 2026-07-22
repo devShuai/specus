@@ -77,6 +77,14 @@ func (s *LocalTokenService) RegistrationCodeHash(registrationID, code string) st
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+// PairingCodeHash returns the HMAC digest for a public-transfer pairing code, aligned with the
+// Java PublicTransferRoomService domain "public-transfer-pairing:v1:" over the same signing key.
+func (s *LocalTokenService) PairingCodeHash(code string) string {
+	mac := hmac.New(sha256.New, s.key)
+	_, _ = mac.Write([]byte("public-transfer-pairing:v1:" + code))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // Authenticate validates admin credentials in constant time.
 func (s *LocalTokenService) Authenticate(username, password string) bool {
 	if !s.PasswordLoginEnabled() {

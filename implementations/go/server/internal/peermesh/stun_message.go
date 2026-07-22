@@ -303,14 +303,6 @@ func stunAttrChannelNumberValue(channel uint16) stunAttribute {
 	return stunAttribute{Type: stunAttrChannelNumber, Value: value}
 }
 
-func newStunAttrOtherAddress(addr *net.UDPAddr, tx [stunTransactionIDBytes]byte) stunAttribute {
-	return stunAttribute{Type: stunAttrOtherAddress, Value: encodeStunXorAddress(addr, tx)}
-}
-
-func newStunAttrResponseOrigin(addr *net.UDPAddr, tx [stunTransactionIDBytes]byte) stunAttribute {
-	return stunAttribute{Type: stunAttrResponseOrigin, Value: encodeStunXorAddress(addr, tx)}
-}
-
 func stunAttrDataValue(payload []byte) stunAttribute {
 	return stunAttribute{Type: stunAttrData, Value: append([]byte(nil), payload...)}
 }

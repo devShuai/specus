@@ -1,14 +1,15 @@
 package server
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
 )
 
 type adminWebSocketTicketRequest struct {
@@ -59,7 +60,7 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 	roomID := truncateUTF16(strings.TrimSpace(request.RoomID), 120)
 	peerID := truncateUTF16(strings.TrimSpace(request.PeerID), 120)
 	displayName := truncateUTF16(strings.TrimSpace(request.DisplayName), 120)
-	roomToken := strings.TrimSpace(request.RoomToken)
+	roomToken := truncateUTF16(strings.TrimSpace(request.RoomToken), 512)
 	if roomID == "" {
 		roomID = "nearby"
 	}
@@ -69,15 +70,20 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 	if displayName == "" {
 		displayName = "web"
 	}
-	if len(roomToken) > 512 {
-		http.Error(w, "room token is too long", http.StatusBadRequest)
-		return
-	}
 	claims := security.WebSocketTicketClaims{RoomID: roomID, PeerID: peerID, DisplayName: displayName}
 	if roomToken != "" {
-		digest := sha256.Sum256([]byte(roomToken))
+		// Aligned with Java WebSocketTicketResource: resolve the room credential through the
+		// room service (creating the owner room on first use) instead of hashing the token.
+		access, err := a.rooms.Resolve(r.Context(), roomID, roomToken, peerID)
+		if err != nil {
+			failRoomResolve(w, err)
+			return
+		}
 		claims.SharedRoom = true
-		claims.RoomKey = "token:" + hex.EncodeToString(digest[:])
+		claims.RoomKey = "room:" + strconv.FormatInt(access.RoomID, 10)
+		claims.RoomRole = string(access.Role)
+	} else {
+		claims.RoomRole = string(transfer.RoleEditor)
 	}
 	issued, err := a.webSocketTickets.Issue(r.Context(), security.WebSocketScopePublicTransfer,
 		security.WebSocketRequestAddress(r), claims)
@@ -116,4 +122,23 @@ func writeWebSocketTicket(w http.ResponseWriter, ticket security.IssuedWebSocket
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ticket)
+}
+
+// failRoomResolve maps room-service credential errors to the Java status codes
+// (ResponseStatusException / GlobalExceptionHandler).
+func failRoomResolve(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	switch {
+	case errors.Is(err, transfer.ErrForbidden):
+		status = http.StatusForbidden
+	case errors.Is(err, transfer.ErrNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, transfer.ErrConflict):
+		status = http.StatusConflict
+	case errors.Is(err, transfer.ErrRateLimited):
+		status = http.StatusTooManyRequests
+	case errors.Is(err, transfer.ErrInternal):
+		status = http.StatusInternalServerError
+	}
+	http.Error(w, err.Error(), status)
 }

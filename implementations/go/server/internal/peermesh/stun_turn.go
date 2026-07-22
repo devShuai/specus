@@ -13,17 +13,20 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/stunserver"
 )
 
 const (
-	stunTurnSoftware           = "shuai-tunnel-standard-stun-turn"
-	turnPermissionTTL          = 300 * time.Second
-	turnChannelTTL             = 600 * time.Second
-	maxRelayBindAttempt        = 128
-	peerProbeMagic             = "shuai-peer-mesh"
-	peerProbeTypeCheck         = "check"
-	peerProbeTypeCheckResponse = "check-response"
-	peerProbeMaxBytes          = 2048
+	stunTurnSoftware            = "shuai-tunnel-standard-stun-turn"
+	stunMaxPaddingResponseBytes = 1472
+	turnPermissionTTL           = 300 * time.Second
+	turnChannelTTL              = 600 * time.Second
+	maxRelayBindAttempt         = 128
+	peerProbeMagic              = "shuai-peer-mesh"
+	peerProbeTypeCheck          = "check"
+	peerProbeTypeCheckResponse  = "check-response"
+	peerProbeMaxBytes           = 2048
 )
 
 type relayProbe struct {
@@ -42,11 +45,11 @@ type turnChannelBinding struct {
 }
 
 type relayAllocation struct {
-	ID               string
-	Client           *net.UDPAddr
-	Relay            *net.UDPConn
-	RelayAddr        *net.UDPAddr
-	ClientID         int64
+	ID        string
+	Client    *net.UDPAddr
+	Relay     *net.UDPConn
+	RelayAddr *net.UDPAddr
+	ClientID  int64
 	// GeneralRelay marks allocations that forward arbitrary payloads with standard TURN
 	// semantics (public transfer / browser WebRTC) instead of the Peer Mesh specific checks.
 	GeneralRelay     bool
@@ -69,7 +72,8 @@ type stunTurnServer struct {
 	allocationByEndpoint map[string]string
 	allocationByRelay    map[string]string
 	primary              *net.UDPConn
-	alternate            *net.UDPConn
+	sockets              map[stunserver.EndpointID]*net.UDPConn
+	binding              *stunserver.BindingService
 	relayTasks           chan func()
 }
 
@@ -95,35 +99,39 @@ func (s *Service) RunStunTurn(ctx context.Context) {
 }
 
 func (s *stunTurnServer) run(ctx context.Context) {
-	primary, err := net.ListenUDP("udp", &net.UDPAddr{Port: s.service.cfg.StunTurnPort})
+	topology, err := s.configureStunTopology()
 	if err != nil {
 		s.logger.Warn("[peer-mesh] standard STUN/TURN UDP server failed to start",
 			"port", s.service.cfg.StunTurnPort, "err", err)
 		return
 	}
-	s.primary = primary
+	sockets := make(map[stunserver.EndpointID]*net.UDPConn, len(topology.Endpoints()))
+	for _, endpoint := range topology.Endpoints() {
+		conn, err := net.ListenUDP("udp", endpoint.Bind)
+		if err != nil {
+			for _, opened := range sockets {
+				_ = opened.Close()
+			}
+			s.logger.Warn("[peer-mesh] standard STUN/TURN UDP server failed to start",
+				"endpoint", endpoint.ID, "bind", endpoint.Bind, "err", err)
+			return
+		}
+		sockets[endpoint.ID] = conn
+	}
+	s.sockets = sockets
+	s.primary = sockets[stunserver.Primary]
+	s.binding = stunserver.NewBindingService(
+		topology, stunTurnSoftware, !topology.SupportsRFC5780(), stunMaxPaddingResponseBytes)
 	s.startRelayWorkers(ctx)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.receiveLoop(ctx, primary, "primary")
-	}()
-
-	if alternatePort := s.natProbeAlternatePort(); alternatePort > 0 && alternatePort != s.service.cfg.StunTurnPort {
-		alternate, err := net.ListenUDP("udp", &net.UDPAddr{Port: alternatePort})
-		if err != nil {
-			s.logger.Warn("[peer-mesh] standard STUN alternate UDP port unavailable", "port", alternatePort, "err", err)
-		} else {
-			s.alternate = alternate
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				s.receiveLoop(ctx, alternate, "alternate")
-			}()
-			s.logger.Info("[peer-mesh] standard STUN alternate UDP port listening", "port", alternatePort)
-		}
+	for _, endpoint := range topology.Endpoints() {
+		conn := sockets[endpoint.ID]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.receiveLoop(ctx, conn, endpoint.ID)
+		}()
 	}
 
 	wg.Add(1)
@@ -132,17 +140,102 @@ func (s *stunTurnServer) run(ctx context.Context) {
 		s.cleanupLoop(ctx)
 	}()
 
-	s.logger.Info("[peer-mesh] standard STUN/TURN UDP server listening", "port", s.service.cfg.StunTurnPort)
+	s.logger.Info("[peer-mesh] standard STUN/TURN UDP server listening",
+		"endpoints", topology.Describe(), "rfc5780", topology.SupportsRFC5780())
 	<-ctx.Done()
-	_ = primary.Close()
-	if s.alternate != nil {
-		_ = s.alternate.Close()
+	for _, conn := range sockets {
+		_ = conn.Close()
 	}
 	s.closeAllAllocations()
 	wg.Wait()
 }
 
-func (s *stunTurnServer) receiveLoop(ctx context.Context, conn *net.UDPConn, probeRole string) {
+// configureStunTopology builds the STUN endpoint topology. 对齐 Java
+// StunTurnServer.configureStunSockets：仅当主/备 bind 地址、两个 public 地址与两个端口全部
+// 配置时启用 RFC 5780 四端点，否则回退到单 IP 的 basic（primary + alternate port）拓扑。
+func (s *stunTurnServer) configureStunTopology() (stunserver.Topology, error) {
+	cfg := s.service.cfg
+	primaryPort := cfg.StunTurnPort
+	alternatePort := s.natProbeAlternatePort()
+	primaryBind := net.IPv4zero
+	if text := strings.TrimSpace(cfg.StunPrimaryBindAddress); text != "" {
+		ip, err := resolveStunIP(text)
+		if err != nil {
+			return stunserver.Topology{}, fmt.Errorf("stun primary bind address: %w", err)
+		}
+		primaryBind = ip
+	}
+	primaryPublic := s.resolvePrimaryAdvertisedIP(primaryBind)
+	alternateBindText := strings.TrimSpace(cfg.StunAlternateBindAddress)
+	alternatePublicText := strings.TrimSpace(cfg.StunAlternatePublicAddress)
+	alternateRequested := alternateBindText != "" || alternatePublicText != ""
+	fullConfiguration := strings.TrimSpace(cfg.StunPrimaryBindAddress) != "" &&
+		alternateBindText != "" && alternatePublicText != "" &&
+		strings.TrimSpace(cfg.PublicAddress) != "" &&
+		alternatePort > 0 && alternatePort != primaryPort
+	if cfg.StunBehaviorStrict && !fullConfiguration {
+		return stunserver.Topology{}, fmt.Errorf(
+			"strict RFC 5780 mode requires primary/alternate bind addresses, two public addresses and two ports")
+	}
+	if alternateRequested && !fullConfiguration {
+		s.logger.Warn("[peer-mesh] incomplete RFC 5780 endpoint configuration; falling back to single-IP compatibility mode")
+	}
+	if fullConfiguration {
+		alternateBind, err := resolveStunIP(alternateBindText)
+		if err != nil {
+			return stunserver.Topology{}, fmt.Errorf("stun alternate bind address: %w", err)
+		}
+		alternatePublic, err := resolveStunIP(alternatePublicText)
+		if err != nil {
+			return stunserver.Topology{}, fmt.Errorf("stun alternate public address: %w", err)
+		}
+		return stunserver.NewRFC5780Topology(
+			stunEndpoint(stunserver.Primary, primaryBind, primaryPublic, primaryPort),
+			stunEndpoint(stunserver.PrimaryAlternatePort, primaryBind, primaryPublic, alternatePort),
+			stunEndpoint(stunserver.AlternatePrimaryPort, alternateBind, alternatePublic, primaryPort),
+			stunEndpoint(stunserver.Alternate, alternateBind, alternatePublic, alternatePort))
+	}
+	var alternate *stunserver.Endpoint
+	if alternatePort > 0 && alternatePort != primaryPort {
+		value := stunEndpoint(stunserver.PrimaryAlternatePort, primaryBind, primaryPublic, alternatePort)
+		alternate = &value
+	}
+	return stunserver.NewBasicTopology(
+		stunEndpoint(stunserver.Primary, primaryBind, primaryPublic, primaryPort), alternate)
+}
+
+func stunEndpoint(id stunserver.EndpointID, bindIP, publicIP net.IP, port int) stunserver.Endpoint {
+	return stunserver.Endpoint{
+		ID:         id,
+		Bind:       &net.UDPAddr{IP: append(net.IP(nil), bindIP...), Port: port},
+		Advertised: &net.UDPAddr{IP: append(net.IP(nil), publicIP...), Port: port},
+	}
+}
+
+func resolveStunIP(value string) (net.IP, error) {
+	if parsed := net.ParseIP(value); parsed != nil {
+		return parsed, nil
+	}
+	addresses, err := net.LookupIP(value)
+	if err != nil || len(addresses) == 0 {
+		return nil, fmt.Errorf("cannot resolve %q", value)
+	}
+	return addresses[0], nil
+}
+
+func (s *stunTurnServer) resolvePrimaryAdvertisedIP(bind net.IP) net.IP {
+	if text := strings.TrimSpace(s.service.cfg.PublicAddress); text != "" {
+		if ip, err := resolveStunIP(text); err == nil {
+			return ip
+		}
+	}
+	if bind != nil && !bind.IsUnspecified() {
+		return bind
+	}
+	return s.advertisedIP(&net.UDPAddr{IP: bind})
+}
+
+func (s *stunTurnServer) receiveLoop(ctx context.Context, conn *net.UDPConn, incoming stunserver.EndpointID) {
 	buf := make([]byte, 65507)
 	for {
 		n, remote, err := conn.ReadFromUDP(buf)
@@ -153,23 +246,27 @@ func (s *stunTurnServer) receiveLoop(ctx context.Context, conn *net.UDPConn, pro
 			return
 		}
 		payload := append([]byte(nil), buf[:n]...)
-		if err := s.handle(ctx, conn, probeRole, payload, remote); err != nil {
+		if err := s.handle(ctx, conn, incoming, payload, remote); err != nil {
 			s.logger.Debug("[peer-mesh] STUN/TURN packet handling failed", "err", err)
 		}
 	}
 }
 
-func (s *stunTurnServer) handle(ctx context.Context, conn *net.UDPConn, probeRole string, payload []byte, remote *net.UDPAddr) error {
-	if looksLikeTurnChannelData(payload) {
+func (s *stunTurnServer) handle(ctx context.Context, conn *net.UDPConn, incoming stunserver.EndpointID, payload []byte, remote *net.UDPAddr) error {
+	if incoming == stunserver.Primary && looksLikeTurnChannelData(payload) {
 		return s.handleChannelData(ctx, payload, remote)
 	}
 	message, err := parseStunMessage(payload)
 	if err != nil {
 		return nil
 	}
+	if message.Type == stunBindingRequest {
+		return s.bindingRequest(incoming, payload, remote)
+	}
+	if incoming != stunserver.Primary {
+		return s.sendError(conn, remote, *message, errorType(message.Type), 400, "unsupported-endpoint")
+	}
 	switch message.Type {
-	case stunBindingRequest:
-		return s.binding(conn, probeRole, *message, remote)
 	case stunAllocateRequest:
 		return s.allocateRequest(ctx, *message, remote)
 	case stunRefreshRequest:
@@ -185,18 +282,33 @@ func (s *stunTurnServer) handle(ctx context.Context, conn *net.UDPConn, probeRol
 	}
 }
 
-func (s *stunTurnServer) binding(conn *net.UDPConn, probeRole string, request stunMessage, remote *net.UDPAddr) error {
-	attrs := []stunAttribute{
-		newStunAttrXorMappedAddress(remote, request.TransactionID),
-		stunAttrSoftwareValue(stunTurnSoftware),
-		newStunAttrResponseOrigin(s.advertisedSocketAddress(conn), request.TransactionID),
+// bindingRequest 委托共享 stunserver.BindingService 处理 RFC 5780 的
+// CHANGE-REQUEST/RESPONSE-PORT/PADDING，并从 result 指定的端点 socket 回包。
+// 对齐 Java StunTurnServer.handle 的 binding 分支。
+func (s *stunTurnServer) bindingRequest(incoming stunserver.EndpointID, payload []byte, remote *net.UDPAddr) error {
+	if s.binding == nil {
+		return nil
 	}
-	if s.alternate != nil {
-		attrs = append(attrs, newStunAttrOtherAddress(s.advertisedSocketAddress(s.alternate), request.TransactionID))
+	request, err := stunserver.ParseMessage(payload)
+	if err != nil {
+		return nil
 	}
-	response := newStunMessage(stunBindingSuccess, request.TransactionID, attrs...)
-	s.logger.Debug("[peer-mesh] STUN binding", "role", probeRole, "remote", remote)
-	return s.sendStun(conn, remote, response)
+	result, err := s.binding.Process(request, remote, incoming, len(payload))
+	if err != nil {
+		return err
+	}
+	packet, err := result.Response.Bytes()
+	if err != nil {
+		return err
+	}
+	conn := s.sockets[result.ResponseEndpoint]
+	if conn == nil {
+		return nil
+	}
+	s.logger.Debug("[peer-mesh] STUN binding",
+		"incoming", incoming, "outgoing", result.ResponseEndpoint, "remote", remote)
+	_, err = conn.WriteToUDP(packet, result.ResponseTarget)
+	return err
 }
 
 func (s *stunTurnServer) allocateRequest(ctx context.Context, request stunMessage, remote *net.UDPAddr) error {

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
   is_admin TINYINT(1) NOT NULL DEFAULT 0,
   room_id VARCHAR(120),
   room_key VARCHAR(80),
+  room_role VARCHAR(16),
   peer_id VARCHAR(120),
   display_name VARCHAR(120),
   shared_room TINYINT(1) NOT NULL DEFAULT 0,
@@ -450,4 +451,70 @@ CREATE TABLE IF NOT EXISTS tunnel_connection_stat (
   UNIQUE KEY uq_stat_client_month (tenant_id, client_name, stat_month),
   KEY idx_stat_tenant (tenant_id),
   KEY idx_stat_client_name (client_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Public transfer rooms (Batch 5, aligned with the Java management model).
+CREATE TABLE IF NOT EXISTS public_transfer_room (
+  id BIGINT NOT NULL PRIMARY KEY,
+  room_name VARCHAR(120) NOT NULL,
+  owner_token_hash VARCHAR(64) NOT NULL,
+  created_by_peer_id VARCHAR(120) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  UNIQUE KEY uk_public_transfer_room_key (room_name, owner_token_hash),
+  KEY idx_public_transfer_room_name (room_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS public_transfer_room_access (
+  id BIGINT NOT NULL PRIMARY KEY,
+  room_id BIGINT NOT NULL,
+  token_hash VARCHAR(64) NOT NULL,
+  role VARCHAR(16) NOT NULL,
+  label VARCHAR(80) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  expires_at VARCHAR(40),
+  revoked_at VARCHAR(40),
+  UNIQUE KEY uk_public_transfer_access_token (token_hash),
+  KEY idx_public_transfer_access_room (room_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS public_transfer_room_pairing_code (
+  id BIGINT NOT NULL PRIMARY KEY,
+  room_id BIGINT NOT NULL,
+  code_hash VARCHAR(64) NOT NULL,
+  role VARCHAR(16) NOT NULL,
+  label VARCHAR(80) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  expires_at VARCHAR(40) NOT NULL,
+  max_uses INT NOT NULL,
+  used_count INT NOT NULL,
+  revoked_at VARCHAR(40),
+  UNIQUE KEY uk_public_transfer_pairing_code_hash (code_hash),
+  KEY idx_public_transfer_pairing_room (room_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS public_transfer_diagram_version (
+  id BIGINT NOT NULL PRIMARY KEY,
+  room_id BIGINT NOT NULL,
+  name VARCHAR(80) NOT NULL,
+  author_peer_id VARCHAR(120) NOT NULL,
+  snapshot_data LONGBLOB NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  KEY idx_public_transfer_version_room (room_id),
+  KEY idx_public_transfer_version_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS user_diagram_document (
+  id BIGINT NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(80) NOT NULL,
+  owner_username VARCHAR(160) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  snapshot_data LONGBLOB NOT NULL,
+  size_bytes BIGINT NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 0,
+  created_at VARCHAR(40) NOT NULL,
+  updated_at VARCHAR(40) NOT NULL,
+  KEY idx_user_diagram_owner (tenant_id, owner_username),
+  KEY idx_user_diagram_updated (updated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
