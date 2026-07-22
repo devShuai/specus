@@ -96,6 +96,13 @@ final class PeerMeshEngine implements Closeable {
      */
     private final String localKeyEpoch;
     private final Map<Long, String> peerKeyEpochs = new ConcurrentHashMap<>();
+    /**
+     * 已上报过 path-report 的 sessionId：peerId -> sessionId。
+     * 服务端每次签发新 grant 都是新 session + NEGOTIATING，而客户端重建 PeerSession 时会继承
+     * currentPathType / lastPathReportMillis，导致抑制条件同时不满足、新会话长期停在 NEGOTIATING，
+     * relay 业务帧被全部丢弃。用它识别"会话换号"并强制上报。
+     */
+    private final Map<Long, Long> lastReportedSessionIds = new ConcurrentHashMap<>();
     private final SecureRandom secureRandom = new SecureRandom();
     private final AtomicBoolean enabled = new AtomicBoolean(false);
     private final Map<Long, PeerInfo> peers = new ConcurrentHashMap<>();
@@ -1082,9 +1089,12 @@ final class PeerMeshEngine implements Closeable {
             session.lastRelaySuccessMillis = now;
             session.bestRelayRtt = smoothRtt(session.bestRelayRtt, rttMillis);
         }
-        if (changed || now - session.lastPathReportMillis >= REPORT_INTERVAL_MS) {
+        Long reportedSessionId = lastReportedSessionIds.get(session.peerId);
+        boolean newSession = reportedSessionId == null || reportedSessionId != session.sessionId;
+        if (newSession || changed || now - session.lastPathReportMillis >= REPORT_INTERVAL_MS) {
             reportPath(session, pathType, localEndpointText(pathType), remoteText, rttMillis);
             session.lastPathReportMillis = now;
+            lastReportedSessionIds.put(session.peerId, session.sessionId);
         }
     }
 
@@ -2349,6 +2359,8 @@ final class PeerMeshEngine implements Closeable {
         peersByVirtualIp.clear();
         sessions.clear();
         sessionsById.clear();
+        lastReportedSessionIds.clear();
+        peerKeyEpochs.clear();
         pendingPackets.clear();
         for (PendingAppMessageAck pending : pendingMessageAcks.values()) {
             pending.latch.countDown();
