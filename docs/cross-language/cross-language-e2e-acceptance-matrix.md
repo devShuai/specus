@@ -1,5 +1,7 @@
 # 跨语言端到端验收矩阵
 
+最后更新：2026-07-22
+
 ## 1. 目标
 
 本文用于验收 Java、Go、C# 三套 server、Java / Go / C# / Android client 是否在真实运行环境下保持协议、功能和观测行为一致。C server 仍按轻量兼容实现单独记录，不进入完整 P0 互换矩阵。
@@ -48,9 +50,9 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | A-01 | Java | Android | Android | 登录、TCP、Direct HTTP/WebSocket、文本消息、虚拟 IP、认证 TURN relay fallback | 待真机验收 |
 | A-02 | Go | Android | Android | 登录、TCP、Direct HTTP/WebSocket、文本消息、虚拟 IP、认证 TURN relay fallback | 待真机验收 |
 | A-03 | C# | Android | Android | 登录、TCP、Direct HTTP/WebSocket、文本消息、虚拟 IP、认证 TURN relay fallback | 待真机验收 |
-| A-04 | Java | Android | Go | 混合客户端虚拟 IP、HTTP、STMSG1 文本消息、认证 TURN relay fallback | 待真机验收 |
-| A-05 | Go | Android | C# | 混合客户端虚拟 IP、HTTP、STMSG1 文本消息、认证 TURN relay fallback | 待真机验收 |
-| A-06 | C# | Android | Java | 混合客户端虚拟 IP、HTTP、STMSG1 文本消息、认证 TURN relay fallback | 待真机验收 |
+| A-04 | Java | Android | Go | 混合客户端虚拟 IP、HTTP、STMSG2 文本消息、认证 TURN relay fallback | 待真机验收 |
+| A-05 | Go | Android | C# | 混合客户端虚拟 IP、HTTP、STMSG2 文本消息、认证 TURN relay fallback | 待真机验收 |
+| A-06 | C# | Android | Java | 混合客户端虚拟 IP、HTTP、STMSG2 文本消息、认证 TURN relay fallback | 待真机验收 |
 
 ## 3. 运行环境矩阵
 
@@ -76,6 +78,9 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | N-08 | 公共 STUN 不可达，自建 STUN 可达 | 自建 STUN | NAT 检测和 Peer Mesh 候选不被公共 STUN 失败阻断 |
 | N-09 | 已建立 direct 后路径 stale | fallback relay | stale 后主动切 relay，ping/HTTP 最多短暂抖动，不永久断流 |
 | N-10 | 服务端关闭 peer session | session closed | 客户端停止使用旧 session，新业务重新申请或明确失败 |
+| N-11 | IPv6-only 双端 | IPv6 direct 或认证 relay | candidate/会话统计显示 IPv6，业务完整且不误报 IPv4 |
+| N-12 | NAT64/DNS64 | IPv6/NAT64 + relay fallback | 控制连接、candidate、业务恢复正常，不无限重试 |
+| N-13 | 双栈 Wi-Fi 与蜂窝 NAT64 切换 | 路径重建 | 旧路径 stale，60 秒内 direct/relay 恢复且不复用旧 session nonce |
 
 ## 5. P0 核心功能用例
 
@@ -93,8 +98,9 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | P0-10 ES 写入不 refresh | L-01 到 L-09 | 使用 ES 存储并压测明细写入 | 写入无 `refresh=true` 放大，查询符合最终一致性 |
 | P0-11 公共发现信令 | Java/Go/C# server | 分别测试 roomToken 房间、无 token 同公网 IP 房间、不同 IP、人数上限、64 KiB 与消息频率上限 | roster/定向 signal 只在同组传播；越界明确报错并关闭，不可跨房间泄漏 |
 | P0-12 公共/管理附件 | Java/Go/C# server | 覆盖 6 个 REST 路径、OSS PUT/HEAD/GET、错误 roomToken、跨 tenant/owner、TTL=0、超大小、过期清理，以及 storage disabled 前后的既有 PENDING | 状态码、文件名/object key、签名 header、HEAD 大小校验和删除行为与 Java 一致；未先触发 IP/房间 429 时新 presign 禁用存储返回 409，既有 PENDING complete 跳过 HEAD |
-| P0-13 客户端消息 | Java/Go/C# server + 支持消息的 client | admin→client、client→admin、client→client；制造多在线 session、大小写不同的 tenant/owner、无接收能力和离线状态；Java/Go/C#/Android 互发普通消息与 ACK | 只向有权限且任一在线 session 声明可接收的目标发送；403 带鉴权原因；fallback 不越权；普通消息/ACK 使用各端都可解的 `STMSG1`，未实现附件数据面的客户端不虚报能力 |
-| P0-14 协议边界 | 所有实现 | 构造完整帧恰好 32 MiB、超 1 字节，以及 deflate 后解压恰好 16 MiB、超 1 字节、截断或仅 flush 未 finish 的 raw-deflate | 32 MiB 按 11 字节 header + body 计算；两个等号边界接受，超 1 字节拒绝且不分配无界内存；未正常结束的 deflate 流拒绝 |
+| P0-13 客户端消息 | Java/Go/C# server + 支持消息的 client | admin→client、client→admin、client→client；制造多在线 session、大小写不同的 tenant/owner、无接收能力和离线状态；Java/Go/C#/Android 互发普通消息与 ACK | 只向有权限且任一在线 session 声明可接收的目标发送；403 带鉴权原因；fallback 不越权；普通消息/ACK 使用各端都可解的 `STMSG2`，未实现附件数据面的客户端不虚报能力 |
+| P0-14 协议边界 | 所有实现 | 构造登录前 16 KiB、各 command body 上限、完整帧 32 MiB 的等号/超 1 字节边界，以及截断、尾随、错误 version/serializer/command | 等号边界按规范接受，越界在分配前拒绝并给出统一原因；wire deflate 已删除，任何压缩标记或旧 fixture 都拒绝 |
+| P0-15 多实例公共互传 | Java/Go/C# 各两实例 + Redis | 客户端分布到不同实例，覆盖同名、房间人数、roster 修订、text/binary relay、presign 限速和 Redis 故障 | presence、全局名称、房间上限、revision 与限速一致；跨实例消息定向且 Redis 失败时入口失败关闭 |
 
 ## 6. P0 Peer Mesh 用例
 
@@ -122,6 +128,7 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | P1-05 TCP 明细分页和串流 | 产生多条 TCP frame，打开 stream view | frame 分页正确，按 channelId + direction 串联 |
 | P1-06 Peer Mesh 拓扑 | 多客户端上线、下线、关 session | 离线设备不显示 active session；逻辑链路聚合不重复 |
 | P1-07 NAT 检测页面 | 浏览器访问公开 NAT 检测页 | 给出明确 NAT 结论或明确不可判定原因，引用自建 STUN 和公共 STUN |
+| P1-08 管理事件跨实例恢复 | 管理页面连接实例 A，客户端登录实例 B；随后重启/切换 A | 实时事件经 Redis 到达；重连快照与 4096 条缓冲不丢状态，缓冲溢出时重读快照 |
 
 ## 8. P2 稳定性与压测用例
 
@@ -143,11 +150,13 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | T-03 Allocate | client 使用临时 credential 发 TURN Allocate UDP | 请求含 USERNAME/REALM/NONCE/MESSAGE-INTEGRITY，返回 relayed address，lifetime 为服务端授予值 |
 | T-04 Refresh | client 发 Refresh 缩短/延长请求 | 响应 lifetime 语义和 Java 一致；过期 allocation 被拒绝 |
 | T-05 CreatePermission | client 为 peer 创建 permission | permission TTL 生效，过期后拒绝 |
-| T-06 Send/Data Indication | client 通过 relay 发 payload | 对端收到 Data Indication，payload 字节完全一致 |
+| T-06A Send/Data Indication | client 通过 relay 发 payload | 对端收到 Data Indication，payload 字节完全一致 |
+| T-06B ChannelBind/ChannelData | 建立 permission 后绑定 channel，再双向发送 | Java/Go/C# server 与 Java/Go/C#/Android client 都能收发，channel/peer/session 越权被拒绝 |
 | T-07 认证 challenge | 不带认证或使用错误 nonce 发 Allocate/CreatePermission | 无认证返回 401；过期 nonce 返回 438 和当前 realm/nonce；客户端更新后重试成功 |
 | T-08 credential 到期/重启 | 使用过期 credential，或服务端随机密钥重启后复用旧 credential | 旧请求拒绝；客户端重新 HTTP 登录获取 credential 后恢复，不无限重试 |
 
-说明：当前 Java、Go、C# 都未实现 TURN ChannelBind / ChannelData，统一使用 Send/Data Indication；这不是跨语言差异。
+说明：Java、Go、C# 服务端和 Java、Go、C#、Android 客户端均实现 Peer Mesh 专用的 ChannelBind/ChannelData；
+Send/Data Indication 仍需保留为绑定前路径，两种模式都必须执行 permission、Peer session 与 SPM2 校验。
 
 ## 10. 验收数据记录
 
@@ -159,7 +168,7 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | 环境 | server OS、client OS、JDK/.NET/Go 版本、是否管理员/root |
 | 网络 | NAT 类型、内外网 IP、STUN/TURN 端口、防火墙策略 |
 | 日志 | server 日志、client A 日志、client B 日志 |
-| 接口快照 | `/api/admin/clients`、`/api/admin/peer-mesh/devices`、`/api/admin/peer-mesh/sessions`、`/api/admin/traffic/inspection-status` |
+| 接口快照 | `/api/admin/clients`、`/api/admin/peer-mesh/devices`、`/api/admin/peer-mesh/sessions`、`/api/admin/peer-mesh/stats`、`/api/admin/traffic/inspection-status` |
 | 业务结果 | ping 统计、HTTP checksum、TCP checksum、吞吐、RTT、路径 direct/relay |
 | 页面截图 | Peer Mesh 拓扑、活跃会话、流量使用、NAT 检测结果 |
 
@@ -180,3 +189,4 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 4. 最后跑混合客户端 Peer Mesh 矩阵。
 5. 桌面组合稳定后，再跑 A-01 到 A-06 的 Android 真机补充矩阵。
 6. 功能通过后再进入真实复杂 NAT 和 24 小时稳定性验证。
+7. IPv6-only、NAT64 与移动切换按 `docs/peer-mesh/peer-mesh-ipv6-nat64-acceptance.md` 保存脱敏证据。

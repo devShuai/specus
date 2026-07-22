@@ -13,6 +13,10 @@
 * [peer-mesh-mobile-plan.md](peer-mesh/peer-mesh-mobile-plan.md) — Android/iOS 目标方案与当前 Android 实现偏差说明。
 * [peer-mesh-java-client-audit-fixes.md](peer-mesh/peer-mesh-java-client-audit-fixes.md) — Java 客户端打洞审计与修复记录(2026-07),含成功率观测方法。
 * [direct-connect-hole-punching-research.md](peer-mesh/direct-connect-hole-punching-research.md) — P2P 直连打洞历史调研（基线 `57f1a67`）。
+* [peer-mesh-dataplane-optimization-audit-2026-07.md](peer-mesh/peer-mesh-dataplane-optimization-audit-2026-07.md) — 数据面性能审计(2026-07)：每包成本、并发模型、协议开销与 IPv6 连通性优化项清单。
+* [peer-mesh-hole-punching-audit-2026-07.md](peer-mesh/peer-mesh-hole-punching-audit-2026-07.md) — 打洞成功率第二轮审计(2026-07-21)：候选交换同步、重试节奏、端口预测、生日悖论打洞等优化项(H-1~H-8)。
+* [turn-relay-failure-diagnosis-2026-07.md](peer-mesh/turn-relay-failure-diagnosis-2026-07.md) — TURN 中继失败诊断(2026-07-22)：手机端中继发文件失败与网页互传无法使用内置 TURN 的根因与修法。
+* [peer-mesh-ipv6-nat64-acceptance.md](peer-mesh/peer-mesh-ipv6-nat64-acceptance.md) — IPv6-only、双栈、NAT64 与 Android 网络切换的生产验收矩阵、通过标准和证据清单。
 
 ## transfer/ — 免登录互传
 
@@ -31,6 +35,7 @@
 ## performance/ — 性能与容量
 
 * [single-node-10k-connections-optimization-plan.md](performance/single-node-10k-connections-optimization-plan.md) — 单机 10k 连接历史基线与优化清单；进度以统一改进计划为准。
+* [custom-protocol-performance-audit-2026-07.md](performance/custom-protocol-performance-audit-2026-07.md) — 全局自定义协议审计(2026-07)：覆盖控制隧道、HTTP/WS、Peer Mesh、TURN/STUN 转发、网页互传、消息协议、认证及跨语言演进。
 
 ## references/ — 外部参考资料
 

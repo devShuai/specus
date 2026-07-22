@@ -140,7 +140,7 @@ handler 声明 `MAX_MESSAGE_CHARS = 64 * 1024`,但未找到 `ServletServerContai
 
 建议:presign-upload 加 per-IP / per-room 限流 + 单房间 PENDING 附件数上限;WS 加房间人数上限与每连接消息速率限制。
 
-状态:**已修复(2026-07-09)**。新增 `PublicTransferRateLimiter`(按来源 IP 固定窗口限流,默认 30 次 / 300s)与 `PublicTransferProperties` 配置;控制器取来源 IP(与 #1 同口径:X-Real-IP 优先、XFF 末位)后校验,超限抛 `RateLimitedException` → HTTP 429。`createPublicUpload` 增加单房间 PENDING 附件上限(默认 50),该配额从附件持久化表计数。发现 WS 增加单房间在线人数上限(默认 32)与每连接消息频率上限(默认 120 次 / 60s),并对超限连接返回 error 后关闭。来源 IP 与发现 WS 限流为进程内计数,多实例部署时上限按实例数放大;共享数据库下的 PENDING 配额不属于进程内计数器。
+状态:**已修复(2026-07-22 复核)**。新增 `PublicTransferRateLimiter`(按来源 IP 固定窗口限流,默认 30 次 / 300s)与 `PublicTransferProperties` 配置;控制器取来源 IP(与 #1 同口径:X-Real-IP 优先、XFF 末位)后校验,超限抛 `RateLimitedException` → HTTP 429。`createPublicUpload` 增加单房间 PENDING 附件上限(默认 50),该配额从附件持久化表计数。发现 WS 增加单房间在线人数上限(默认 32)与每连接消息频率上限(默认 120 次 / 60s),并对超限连接返回 error 后关闭。单实例模式继续使用有界进程内计数；启用 `cluster-enabled` 时，Java/Go/.NET 统一通过 Redis Lua 共享 presign、配对码与 discovery 消息固定窗口，同时共享 presence、全局名称、房间上限和 roster revision。共享数据库下的 PENDING 配额始终是全局配额。
 
 ### 7. 直连 ACK 超时在发送前起算(P1 功能)
 

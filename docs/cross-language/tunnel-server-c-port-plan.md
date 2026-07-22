@@ -453,7 +453,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 | SHA-256/HMAC-SHA256/HMAC-SHA1 | C 单元测试 | MSVC 纯 crypto 子集通过；完整 POSIX suite 待 Linux 工具链 |
 | Java frame header | fixture encode/decode + 等号/超限边界 | 已覆盖完整帧 32 MiB 口径；待 POSIX 工具链执行 |
 | compact raw payload | fixture encode/decode | 已覆盖 |
-| compact deflate payload | Java fixture encode/decode | 已覆盖 |
+| legacy compact deflate | v2 malformed/rejection fixture | wire deflate 已删除，只验证明确拒绝 |
 | Java client 登录 | 手动联调 | 已做过基础登录；当前需端口权限重跑 |
 | 心跳 | Java client 联调 | 待持续性测试 |
 | NAT_CONTROL | 协议测试 + Java client 联调 | 协议已覆盖，联调待重跑 |

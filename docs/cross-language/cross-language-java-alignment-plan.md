@@ -115,12 +115,12 @@
   - HTTP 登录响应下发 Java-shaped `peerMesh` 配置。
   - 新增 `peer_mesh_device`、`peer_mesh_acl`、`peer_mesh_session` schema。
   - 实现虚拟 IP 分配、同租户同 owner 默认放行、显式 ACL、会话授权、设备上报、路径/流量上报、强制关闭、roster/config 下发。
-  - 已实现 Java 兼容标准 STUN/TURN UDP 服务：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；allocation 过期后按 Java 语义拒绝 refresh 并由新 Allocate 重建。
+  - 已实现 Java 兼容标准 STUN/TURN UDP 服务：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、ChannelBind/ChannelData、`SPM2` frame relay 授权和 relay 字节计量；allocation 过期后按 Java 语义拒绝 refresh 并由新 Allocate 重建。
   - 管理 API 已支持状态、设备、ACL、会话查询与清理，并补齐 `/api/admin/peer-mesh/stats`：按 Java 规则统计 `reportedSessions=count(rttMillis)`、`activeDirectRatio`、`pathType × status` 明细和 NAT 类型分布。
 - .NET server：
   - 新增 `PeerMeshOptions`、环境变量映射、EF entity、三套 provider migration 与启动兼容建表。
   - 控制通道识别并转发 `PEER_CONTROL`，登录成功后推送 config / roster。
-  - 已实现 Java 兼容标准 STUN/TURN UDP HostedService：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；allocation 过期后拒绝 refresh 并由新 Allocate 重建。
+  - 已实现 Java 兼容标准 STUN/TURN UDP HostedService：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、ChannelBind/ChannelData、`SPM2` frame relay 授权和 relay 字节计量；allocation 过期后拒绝 refresh 并由新 Allocate 重建。
   - HTTP 登录响应与公开 `/api/public/peer-mesh/stun-config` 均下发自建 STUN/TURN 与公共 STUN 列表。
   - 管理 API 与 Go/Java 对齐，并补齐 `/api/admin/peer-mesh/stats`：按 Java 规则统计 `reportedSessions=count(rttMillis)`、`activeDirectRatio`、`pathType × status` 明细和 NAT 类型分布。
 - Go client：
@@ -128,7 +128,7 @@
   - 登录时生成并持久化 X25519 peer key；上报格式已改为 Java 兼容的 X.509 DER public key，同时保留读取旧 raw key 文件能力。
   - 已识别 HTTP 登录响应与 `PEER_CONTROL` 下发，支持 `peer-config`、`roster`、`session-grant`、`candidates`、`close`。
   - 已实现 Peer Mesh UDP 控制面：标准 STUN/TURN `Binding` / `Allocate` / `Refresh` / `CreatePermission` / `Send` / `Data Indication`、host/srflx/public-stun/relay candidate 上报、UDP connectivity check、`path-report`。
-  - 已实现 Java 兼容的数据帧：`SPM1` header、X25519 + HKDF-SHA256 会话密钥、AES-GCM payload 加密、AAD 绑定 session/client/sequence/nonce、64 包 replay window。
+  - 已实现固定 `SPM2` 数据帧：X25519 + HKDF-SHA256 按方向派生 traffic key/nonce prefix，AES-GCM AAD 绑定 session/sequence，使用单调 64 位 counter nonce 与 4096 包 replay window。
   - 已实现 Linux `/dev/net/tun` 虚拟网卡：配置 /32 虚拟 IP 与 MTU；TUN 出站 IPv4 packet 按目标虚拟 IP 查 peer session 后走 direct UDP 或标准 TURN relay；入站 frame 解密后写回 TUN。
   - 已实现 Windows Wintun 随包加载：Go client 通过 `go:embed` 内置 `native/windows/<arch>/wintun.dll`，运行时解压到本地缓存后加载；仍可通过 `SHUAI_PEER_MESH_WINTUN_DLL` 或可执行文件旁 native 目录覆盖，配置 /32 虚拟 IP 与 MTU，并接入同一套加密数据帧。
   - 已实现 macOS `utun`：通过 `com.apple.net.utun_control` 创建 utun 设备，配置 /32 虚拟 IP 与 MTU，读写时处理 Darwin utun 4 字节地址族前缀，并接入同一套加密数据帧。
@@ -147,7 +147,7 @@
 - .NET client：
   - 已读取 Java 启动配置里的 `peerMeshDevice`、`peerMeshTunName`、`peerMeshMtu`。
   - 登录环境已生成并上报 Java 兼容的 X25519 X.509 DER public key；key 文件使用 `.shuai-tunnel/peer-public.x25519` 与 `.shuai-tunnel/peer-private.x25519`。
-  - 已补 Java 兼容的 `SPM1` AES-GCM frame codec、X25519/HKDF 会话密钥派生和 replay window 单测。
+  - 已补固定 `SPM2` AES-GCM frame codec、X25519/HKDF 方向密钥派生、counter nonce 和 4096 包 replay window 单测。
   - 已识别 HTTP 登录响应与 `PEER_CONTROL` 下发，支持 `peer-config`、`roster`、`session-grant`、`candidates`、`close`。
   - 已实现 Peer Mesh UDP 控制面：标准 STUN/TURN `Binding` / `Allocate` / `Refresh` / `CreatePermission` / `Send` / `Data Indication`、host/srflx/public-stun/relay candidate 上报、UDP connectivity check、`path-report` 和 direct-only traffic-report 增量上报；relay 字节由 server relay 热路径计量，避免重复统计。
   - 已实现 Linux `/dev/net/tun` 虚拟网卡：配置 /32 虚拟 IP 与 MTU；TUN 出站 IPv4 packet 按目标虚拟 IP 查 peer session 后走 direct UDP 或标准 TURN relay；入站 frame 解密后写回 TUN。
@@ -170,7 +170,7 @@
   - 已实现 HTTP API-key 登录、runtime token 控制通道登录、按写空闲触发的 5 秒心跳、60 秒读空闲和 Java 分类语义的指数退避重连；token 过期会立即重新 HTTP 登录，busy/rate-limit 退避，其它认证或策略拒绝停止重连，`LOGOUT_REQUEST` 会关闭当前控制连接并立即重新登录。
   - 已实现 TCP NAT 注册/双向 `DATA` 转发和 Direct HTTP route 转发；`CONNECTED` 缺字段或指向未知 TCP port 时只记录并忽略，只有真实本地拨号失败或已建立通道断开才回 `DISCONNECTED`。HTTP route WebSocket 已支持 ws/wss、本地握手 header 过滤、text/binary `0x01/0x02` 前缀、64 KiB 帧上限、VPN socket bypass 和双向关闭去重。
   - 已接入 Android `VpnService` 权限与 TUN 生命周期，使用登录/运行时 `peerMesh.virtualIp`、`peerMesh.cidr` 配置 VPN 地址和路由，并保护控制、本地与 Peer Mesh UDP socket 避免流量回灌。
-  - 已实现 roster/session/candidates/close 信令、X25519/HKDF/AES-GCM `SPM1` frame、replay protection、host/srflx/relay candidates、标准 TURN allocation/permission/send/data indication、direct UDP 与 relay fallback，以及设备/路径/direct-only 流量上报；relay 字节只由服务端 TURN 热路径计量。
+  - 已实现 roster/session/candidates/close 信令、X25519/HKDF/AES-GCM `SPM2` frame、4096 包 replay protection、host/srflx/relay candidates、标准 TURN allocation/permission/send/data indication/ChannelData、direct UDP 与 relay fallback，以及设备/路径/direct-only 流量上报；relay 字节只由服务端 TURN 热路径计量。
   - 已新增 JVM 协议测试，覆盖 32 MiB 完整帧、16 MiB 解压边界、HMAC 登录、运行时配置三态、控制重连分类、WebSocket、Peer Mesh frame/replay/session 刷新和客户端消息能力。JVM 测试不能替代真实设备；TCP/Direct HTTP、VPN 双机 ping、业务流量和 relay fallback 仍待端到端验收。
 - C server：
   - `/api/client/auth/login` 返回 disabled `peerMesh` block。
@@ -179,6 +179,29 @@
   - SQLite `traffic_usage` / `resource_traffic_usage` 已支持 Java-shaped 查询；TCP 隧道按 `TCP_TUNNEL` + `tcp:{listenPort}` 写汇总，Direct HTTP 按 `HTTP_ROUTE` + `http:{route}` 写汇总。
   - 管理面补齐 Peer Mesh 管理契约：设备列表会为可见 SQLite client 幂等创建轻量 `peer_mesh_device` 行并返回 offline view，`PUT /api/admin/peer-mesh/devices/{clientId}` 可在租户/owner 权限内持久化 `enabled`，但虚拟网卡状态仍固定为 `UNSUPPORTED`；SQLite ACL 可 list/create/delete，持久化 `OUTBOUND/INBOUND/BOTH` direction，tenant/owner 权限比较区分大小写，ACL 输入已按 Java 侧 `long` clientId 语义解析 64 位 ID；SQLite `peer_mesh_session` 可 list/close/close-open，并按租户/owner 可见性过滤，未知单个 session 返回 `404`；C 数据面仍不主动创建真实 peer session，其余 mutation 返回 `501`。
   - `/api/admin/peer-mesh/status` 已收敛为 Java-shaped `{ "enabled": boolean }`，不再额外暴露 C 专属 stub 字段。
+
+### 打洞成功率优化对齐（H-1 / H-2 / H-3 / H-6）
+
+状态：已完成。Java / Go / .NET / Android 四端均已落地 H-1 / H-2 / H-3 / H-6，并附带对齐单测；真实 NAT 环境的 `activeDirectRatio` 收益验证仍属发布门禁。
+
+Java 客户端在 2026-07-22 完成了 [`peer-mesh-hole-punching-audit-2026-07.md`](../peer-mesh/peer-mesh-hole-punching-audit-2026-07.md) 中的 H-1 / H-2 / H-3 / H-6 四项打洞成功率优化。初始复核发现这四项仅存在于 Java 客户端，Go / .NET / Android 未对齐；同日已按下列清单完成三端移植。移植前应以 `/api/admin/peer-mesh/stats` 的 `activeDirectRatio` 与 `natTypes` 分布建立基线，移植后用同一指标验证收益。
+
+| 项 | Java 参考位置 | 移植结果 |
+| --- | --- | --- | --- |
+| H-1 候选回礼 | `PeerMeshClient.reciprocateCandidates`（约 L587），2s 节流 | 三端在候选接收路径末尾新增 reciprocate 调用：本端无健康 direct 路径时立即回发自身候选，带每 peer 2s 节流防信令循环。Go `reciprocateCandidates` + `announceCandidatesToPeer`；.NET `ReciprocateCandidatesAsync` + `AnnounceCandidatesToPeerAsync`；Android `reciprocateCandidates` 复用 `sendCandidatesToPeer` |
+| H-2 密集退避重试 | `scheduleHolePunchRetries`（约 L1157），`HOLE_PUNCH_RETRY_DELAYS_MILLIS={1k,2k,4k,8k}` | 三端在 `sendConnectivityChecks` 末尾排程 1s/2s/4s/8s 退避重试，打通或过期即停，本轮结束后释放 per-session 标记。Go 用 `time.AfterFunc`；.NET 用 `Task.Run`+`Task.Delay`；Android 复用 `pathMtuScheduler` |
+| H-3 priority 降序排序 | `sortedCandidates`（约 L3839），priority 降序 | Go `sendConnectivityChecks` 增加 `sort.SliceStable`（priority 降序）；.NET `SendConnectivityChecksAsync` 增加 `OrderByDescending`；Android `directCandidates` 原已对齐，移植时重构为静态 `sortedDirectCandidateEndpoints` 便于单测 |
+| H-6 同 NAT reflexive 降权 | `demoteSameNatReflexiveCandidates`（约 L605），降到 priority=1 | 三端新增同 NAT 检测：对端 srflx/port-map 地址与本端 STUN 观测公网地址相同时降到 priority=1 而非剪除。Go `demoteSameNatReflexiveCandidates`；.NET `DemoteSameNatReflexiveCandidates`；Android 静态 `demoteSameNatReflexiveCandidates` |
+
+常量对齐：四端统一 `{1s,2s,4s,8s}` 退避、`2s` 候选回礼节流、`priority=1` 同 NAT 降权，与 Java 完全一致。健康 direct 判定复用各端既有 `hasHealthyDirect`（45s 阈值）。每端新增对齐单测覆盖排序、降权不剪除、退避打通即停、回礼节流四类语义。
+
+验证（2026-07-22，开发机）：
+- Go：`cd implementations/go/client && go build ./... && go test ./internal/client/...` 通过，新增 7 个用例（H-3 排序、H-6 降权含 port-map、H-1 节流+健康 direct 跳过、H-2 退避打通即停+不重复排程）。
+- .NET：`dotnet test implementations\csharp\client\tests\ShuaiTunnel.Client.Tests\ShuaiTunnel.Client.Tests.csproj` 通过，`112/112`（含新增 6 个 `...LikeJava` 用例）。
+- Android：`gradlew testDebugUnitTest` 通过，`PeerMeshProtocolTest` `19/19`（含新增 5 个 H-3/H-6 静态逻辑用例）。
+- 仍需环境验收：真实跨 NAT 双机的 `activeDirectRatio` 与收敛时间基线，源码自动化通过不替代这些外部系统与硬件验证。
+
+H-4 / H-5 / H-7 仍按打洞审计文档列为 OPEN，待基线数据确认对称 NAT 占比后再投入。
 
 端到端手工验收计划（代码能力已具备，需要真实网络环境验证）：
 
@@ -209,14 +232,14 @@
 - .NET server 支持 EF Core 多库和 TLS 配置；管理用户、流量明细、总流量租户字段、Peer Mesh、`transfer_attachment`、session 消息能力与 ACL direction 均已补齐 SQLite/MySQL/PostgreSQL provider-specific migration，并保留启动时幂等 SQL 兼容历史库。
 - C server 尚未实现 TLS、HTTPS OIDC token exchange、ES 明细存储和 Peer Mesh 数据面；`/oidc-config` 已按 Java 前端契约返回浏览器登录配置，`/oidc/token` 已支持 HTTP token endpoint 的 Authorization Code + PKCE 代理交换，管理用户、客户端凭证、客户端应用包下载链接、客户端、映射、route、连接记录、流量汇总、SQLite 明细查询、SQLite 客户端启动凭证登录和 Direct HTTP 响应路径改写已具备基础租户/owner 过滤或 route 开关控制。
 
-## 当前验证（2026-07-10）
+## 当前验证（2026-07-22）
 
-- Java 基准：在仓库根目录执行 `mvn clean test "-Dtunnel.server.web.skip=true"` 全量通过；common `14/14`、client `29/29`、server `52/52`，合计 `95/95`。
-- Go：server 与 client 均执行 `go test -count=1 ./...` 和 `go build ./...` 通过。按 `go test -json` 的唯一顶层测试名统计，server 为 `126` 项、client 为 `73` 项；若把表驱动 subtest 分别计数，则通过事件分别为 `134` 和 `102`。覆盖 TURN challenge、ACL direction/大小写权限、PostgreSQL BOOLEAN 兼容迁移、公共互传/消息 WebSocket、OSS redirect、完整帧和文件名边界。
-- .NET：server 集成测试 `107/107`（含 3 项真实 Java client 互操作）、client `86/86`、protocol `38/38`；server/client/protocol solution build 均为 0 warning / 0 error，SQLite/MySQL/PostgreSQL migration pending 检查无漂移。
-- Android：`gradlew test :app:assembleDebug` 通过，JVM 测试 `34/34`；覆盖控制状态机、帧/解压边界、Peer Mesh/TURN 401/438、STMSG1/V2 解码和 direct-only 流量计量。该结果不替代真机 VPN 与跨 NAT 双机验收。
-- 管理前端：`npm test` 为 `11/11`，`npm run build` 通过；5 份 public schema 与 `protocol/schemas` 对应文件 SHA-256 一致。
-- C server：已完成 ACL direction/大小写 SQL 语义和 HMAC-SHA1 的定向验证，`git diff --check` 通过；当前 Windows 环境没有 `make/gcc/clang` 或可用 WSL 发行版，无法执行 POSIX `make test`，因此不把 C 全量编译声明为通过。
+- Java：`mvn -pl implementations/java/server -am -Dtunnel.server.web.skip=true test` 全量通过；common `25/25`、client `41/41`、server `118/118`，合计 `184/184`（新增降级用例已定向复验）。
+- Go：server 与 client 均执行 `go test ./...` 全量通过，覆盖 v2 控制协议、SPM2/SPMTU2、TURN、HTTP/NAT stream、公共互传 Redis 协调和管理事件 Hub。
+- .NET：server 集成测试 `134/134`、client `106/106`、protocol `43/43` 全部通过；公共 discovery 测试数据已按客户端名称全局唯一规则隔离。
+- Android：`gradlew test assembleDebug --no-daemon` 通过；覆盖 v2 控制帧、SPM2/SPMTU2、Peer Mesh/TURN、STMSG2 和地址族逻辑。该结果不替代真机 VPN 与跨 NAT 双机验收。
+- 管理前端：`npm test` 为 22 个文件、`152/152` 项通过，`npm run build` 通过。
+- C server：`.github/workflows/protocol-v2.yml` 已加入 Ubuntu CMake build/ctest；当前 Windows 环境没有可用 WSL 发行版，本机仅完成中央向量、源码静态检查和 Git Bash 脚本语法校验，不伪报 POSIX 测试结果。
 - 仍需环境验收：真实 MySQL/PostgreSQL、真实私有 OSS/ES、Windows/Linux/macOS/Android 双机、跨 NAT direct/relay fallback、长时间压力与真实 TLS/OIDC。源码自动化通过不能替代这些外部系统与硬件验证。
 
 ## 此前轮次历史验证记录（已被上节替代，仅供追溯）

@@ -1,0 +1,174 @@
+# TURN 中继失败诊断（2026-07-22）
+
+两个现网故障的代码级定位：
+
+1. **两个手机端（Android × Android）在 TURN 中继状态下发送文件失败**
+2. **网页互传（浏览器 WebRTC）使用内置 TURN 中继失败**
+
+审计对象为 Java 基准实现（服务端在两条链路里都是 relay 执行方）：
+`implementations/java/server/.../peer/StunTurnServer.java`、
+`implementations/java/server/.../management/service/PeerMeshService.java`、
+`implementations/java/server/.../management/controller/PublicPeerMeshResource.java`、
+`implementations/java/client/.../peer/PeerMeshClient.java`。
+
+> 行号为 2026-07-22 工作树的近似位置，代码变动后以符号名检索为准。
+> 状态：`OPEN` 未修复 / `DONE` 已修复。
+
+---
+
+## 0. 共同背景：relay 载荷授权被收窄为 Peer Mesh 专用
+
+`StunTurnServer.authorizeRelayPayload`（约 L529）是所有中继载荷的统一入口，它同时要求：
+
+1. `source.clientId > 0` **且** `target.clientId > 0`；
+2. `target = allocationForRelayEndpoint(peer)` —— 目标必须是**本服务端上的另一个 allocation**；
+3. 载荷必须是 `SPM2` 业务帧（再经 `authorizeRelayFrameForRelay`），或是本项目的
+   `PeerUdpProbe` JSON（首字节 `{`、长度 ≤ 2048，再经 `authorizeRelayProbeForRelay`）。
+
+这等于把标准 TURN 收窄成"仅为 Peer Mesh 兜底"的专用 relay。协议审计
+`docs/performance/custom-protocol-performance-audit-2026-07.md` 的 P1-9 曾要求在
+"通用 TURN 模式"与"Peer Mesh 专用模式"之间二选一并写入规范；当前实现选择了后者，
+但**网页互传仍依赖通用 TURN**，于是产生故障 2。
+
+另需注意授权门槛在两类载荷之间不对称：
+
+| 载荷 | 授权条件 |
+| --- | --- |
+| `PeerUdpProbe` JSON 探针 | session 只要不是 `CLOSED`（`NEGOTIATING` 也放行） |
+| `SPM2` 业务帧 | **必须 `status == ACTIVE`** |
+
+直连数据不经服务端，因此这道门**只在中继路径上生效**——这正是两个故障都表现为
+"直连正常、中继异常"的原因。
+
+---
+
+## 1. 手机 × 手机：中继状态正常但文件发送失败
+
+### 现象与机理
+
+中继探针能通（NEGOTIATING 即放行）→ 客户端与管理台都显示 `RELAY` 路径正常；
+但业务帧要求 session 已 `ACTIVE`，一旦 session 停留在 `NEGOTIATING`，
+服务端会**静默丢弃每一个数据帧**，且客户端收不到任何反馈。
+
+把 session 置为 `ACTIVE` 的唯一途径是客户端经控制连接上报 `path-report`，
+而该上报在 Java 客户端只有 `completeUdpProbe`（约 L2904）一个调用点，并带抑制条件：
+
+```java
+boolean changed = !pathType.equals(previousPath) || !remote.equals(previousRemote);
+if (changed || now - session.lastPathReportMillis >= 60_000) {
+    reportPath(session, pathType, local, remote, rttMillis);
+}
+```
+
+### R1-1 应答方永不上报 — OPEN
+
+位置：`PeerMeshClient.markPathFromInboundCheck`（约 L2699）。
+
+收到入站探针的一方执行 `markPath("RELAY")` + `flushPendingPackets` 后直接 `return`，
+**全程没有 `reportPath`**（direct 分支同样没有）。若某端的中继路径只由入站探针建立，
+该 session 永远不会被激活。
+
+### R1-2 session 换号后上报被抑制（最可能的现场主因） — OPEN
+
+位置：`PeerMeshClient.rememberSession`（约 L706-718）。
+
+服务端每次签发新 grant 都是**新 sessionId + `NEGOTIATING`**，而客户端重建 `PeerSession`
+时继承了 `currentPathType`、`lastPathRemoteText` 与 `lastPathReportMillis`。于是下一次中继
+探测成功时 `changed == false` 且距上次上报不足 60 秒 → **不上报** → 新 session 在服务端
+一直是 `NEGOTIATING` → 中继数据被丢弃最长 60 秒；若 grant 持续轮转则长期失败。
+
+抑制条件基于"路径是否变化"，却跨越了 **session 身份变化**，这是缺陷本质。
+
+### R1-3 先 flush 后上报的竞态 — OPEN
+
+即便走正常路径，`flushPendingPackets(session)` 与 `reportPath(...)` 在同一调用内完成，
+而上报要经 TCP 控制连接 + 数据库写入。该窗口内发出的帧全部被服务端丢弃。
+peer 应用消息**没有 ARQ**（Java 侧仅回 ACK，无重传），丢一条即表现为"文件发送失败"。
+
+### R1-4 `TurnAuth.none()` 返回 clientId=0 — OPEN
+
+位置：`StunTurnServer.TurnAuth.none()`（约 L929）。
+
+当部署设置 `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED=false` 时，所有 allocation 的
+`clientId` 为 0，`authorizeRelayPayload` 的 `source.clientId <= 0` 会拒掉**全部**中继载荷
+（连探针也不例外），中继完全不可用。
+
+### 建议修法
+
+- **服务端（根治，语言无关，优先）**：让**首个通过身份校验的中继业务帧隐式激活**
+  `NEGOTIATING` 的 session（复用探针那套 from/to + token 校验），仅对 `CLOSED`/过期继续硬拒。
+  这样不再依赖 `path-report` 的到达时序，也同时覆盖 Android/Go/.NET 客户端的同源问题。
+- **客户端**：
+  1. `markPathFromInboundCheck` 建立或切换路径时同样 `reportPath`；
+  2. 以 `lastReportedSessionId` 判断是否需要上报，sessionId 变化时强制上报，
+     不再继承 `lastPathReportMillis`；
+  3. 先上报、再 `flushPendingPackets`。
+- 修正 `TurnAuth.none()` 的 clientId 语义（无认证模式下不能落到 0，或该模式下跳过 clientId 校验）。
+
+---
+
+## 2. 网页互传：浏览器 WebRTC 无法使用内置 TURN
+
+浏览器从 `GET /api/public/transfer/ice-config` 取得 ICE 配置并交给标准
+`RTCPeerConnection`（`apps/admin-web/src/hooks/useDirectTransfer.ts` 约 L859，
+`apps/admin-web/src/api/client.ts` 约 L561）。该端点会下发内置 TURN。
+
+**三重独立阻断，任何一条都足以让 relay 候选完全不通：**
+
+### R2-1 TURN 凭证 subject 解析不出 clientId — OPEN
+
+位置：`PublicPeerMeshResource.iceConfig`（约 L62）签发
+`turnCredentialService.issue("public-transfer")`。
+
+`TurnCredentialService.peerMeshClientId` 要求 username 中段形如 `pm-<clientId>`
+（约 L84-98），`"public-transfer"` 解析结果为 **0** → `authorizeRelayPayload` 首个条件
+`source.clientId <= 0` 即返回 false → **所有**中继载荷被丢。
+
+### R2-2 目标必须是本服务端的另一个 allocation — OPEN
+
+`allocationForRelayEndpoint(peer)`（约 L744）要求对端地址是本服务端上的 relay 地址。
+WebRTC 的典型组合是"一端 relay、另一端 srflx/host"，此时 `target == null` → 直接拒绝。
+标准 TURN 允许向任意获得 permission 的对端转发，当前实现不满足该语义。
+
+### R2-3 载荷类型不匹配 — OPEN
+
+WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连通性检查**，
+既不是 `SPM2` 帧，也不是 `{` 开头的 `PeerUdpProbe` JSON，因此必然落到
+`authorizeRelayPayload` 的最后一条 `return false`。
+
+即使修好 R2-1、R2-2，只要保留"载荷必须是本项目协议"的校验，浏览器仍然无法中继。
+
+### 建议修法（需先做产品决策）
+
+按协议审计 P1-9 的口径二选一，并写入 `protocol/spec/peer-mesh.md` 与
+`protocol/spec/public-transfer.md`：
+
+- **方案 A：按 allocation 划分模式（推荐）**——TURN 凭证签发时区分用途：
+  `pm-<clientId>` 走 Peer Mesh 专用校验；`public-transfer` 类凭证标记为通用 TURN allocation，
+  按标准 TURN 语义放行（仅校验认证 + permission），但必须配套独立配额、端口范围、
+  目的地址策略（禁止指向内网/回环）与滥用审计，避免成为开放中继。
+- **方案 B：网页互传不使用内置 TURN**——`ice-config` 不再下发内置 TURN（或改为下发外部
+  coturn），并在文档中明确浏览器直传在对称 NAT 下会回退到服务端 WS 中转。
+
+无论选哪个，都应补一条端到端回归：浏览器 relay 候选能完成 DataChannel 建链。
+
+---
+
+## 3. 验证缺口
+
+当前测试只有 `StunTurnServerMetricsTests`（relay worker 队列指标），
+没有任何一条覆盖 relay 转发语义的用例。建议补：
+
+1. `NEGOTIATING` session 的中继业务帧行为（修复后应能隐式激活并转发）；
+2. 应答方建立中继路径后，session 能在服务端变为 `ACTIVE`；
+3. 通用 TURN 载荷（非 SPM2、非 probe）在所选模式下的 accept/reject 结果；
+4. `turn-auth-required=false` 时中继仍可用；
+5. 两个 allocation 之间的 hairpin 转发（A relay → B relay）往返成功。
+
+## 相关文档
+
+- 打洞成功率审计：`peer-mesh-hole-punching-audit-2026-07.md`
+- 数据面性能审计：`peer-mesh-dataplane-optimization-audit-2026-07.md`
+- 全局协议审计（P1-9 通用 TURN 与专用 TURN 的边界）：
+  `../performance/custom-protocol-performance-audit-2026-07.md`
+- 协议规范：`../../protocol/spec/peer-mesh.md`、`../../protocol/spec/public-transfer.md`

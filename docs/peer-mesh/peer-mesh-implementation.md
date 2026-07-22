@@ -10,15 +10,16 @@
 * 服务端按租户 / 用户 / 客户端维护 peer device、peer ACL、peer session。
 * 默认 ACL：同一 `tenantId + ownerUsername` 的客户端互通；跨用户默认拒绝，admin 可配置显式 ACL。
 * 客户端登录响应下发 `peerMesh` 配置，包括虚拟 IP、CIDR、标准 STUN/TURN 地址、公共 STUN 列表、会话 TTL 和设备公钥相关信息。
-* 控制协议通过现有控制长连接承载 `PEER_CONTROL` JSON 信令，不破坏现有 NAT / HTTP 协议。
+* v2 `control` 长连接承载 `PEER_CONTROL` JSON 信令；TCP/HTTP/WebSocket 数据只走独立 `data` 长连接。
 * Java / Go / .NET 服务端内置标准 UDP STUN/TURN：支持 Binding、Allocate、Refresh、CreatePermission、Send Indication 和 Data Indication；relay 转发使用独立 UDP allocation 端口。
 * Java STUN 核心支持 RFC 5780 四端点、`CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、标准 `MAPPED-ADDRESS` / `XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；同一核心可由独立 `stun-server.jar` 部署，也可把 A1/A2 拆到两台内网互通的服务器，通过 HMAC 鉴权控制通道协同回包。
 * Go 提供 `cmd/shuai-stun-server`，.NET 提供 `ShuaiTunnel.StunServer`；两者与 Java 使用同一套四端点、限流、防放大和 Prometheus 指标契约，可脱离业务 server 独立部署。
 * Java / Go / .NET / Android 客户端可使用独立 STUN 入口执行 RFC 5780 映射与过滤行为探测，并上报 `natMappingBehavior`、`natFilteringBehavior` 和探测模式。
 * relay 转发前会校验 session 是否存在、是否 ACTIVE、是否过期、source/target 是否匹配，拒绝未授权 relay frame。
 * 客户端已实现 UDP host candidate、relay candidate、connectivity check、path nominated、direct 优先、relay fallback。
-* 客户端数据面使用 X25519 + HKDF + AES-GCM，加密后的 IP packet 通过 UDP frame 传输；server relay 不解密业务明文。
-* 客户端 replay 保护使用滑动窗口，允许小范围乱序，拒绝重复包和窗口外旧包。
+* 客户端数据面固定使用 `SPM2`：X25519 + 方向 HKDF + AES-GCM，36 字节外层开销；server relay 不解密业务明文。
+* 客户端 replay 保护使用 4096 位滑动窗口，允许乱序并拒绝重复包和窗口外旧包。
+* `SPMTU2` 在认证数据面上执行每路径探测、三次确认和二分搜索，结果缓存 10 分钟；IPv4 TCP SYN 会按路径 MTU clamp MSS，超大 IPv4 包向本地 TUN 注入 ICMP Fragmentation Needed。
 * Linux TUN：支持 `/dev/net/tun`，配置虚拟 IP、MTU，并只为当前 roster 中的在线 peer 同步 `/32` host route。
 * Windows Wintun：Java / Go / .NET 客户端均支持随包携带 `wintun.dll`，配置虚拟 IP、MTU，并同步在线 peer 的 `/32` host route。
 * macOS utun：Java / Go / .NET 客户端均可创建 utun，并同步在线 peer 的 `/32` host route。
@@ -27,10 +28,10 @@
 多语言实现当前状态：
 
 * Java client 是完整参考实现，Linux TUN、随包 Wintun 与 macOS utun 均已支持。
-* Go server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；过期 allocation 按 Java 语义清理并由新 Allocate 重建。
-* .NET server 已补齐 Java 兼容标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、Send/Data Indication、`SPM1` frame relay 授权和 relay 字节计量；同时提供公开 `/api/public/peer-mesh/stun-config` 用于 NAT 检测页面和外部探测。
-* Go client 已支持 Linux TUN、随包 Windows Wintun、macOS utun、Java 兼容 X25519/HKDF/AES-GCM frame、direct UDP 与标准 TURN relay data indication。
-* .NET client 已补 X25519 key 上报、Java 兼容 AES-GCM frame codec、replay window、标准 STUN/TURN UDP 控制面、公共 STUN 候选，以及随包 Windows Wintun / Linux TUN / macOS utun packet 读写；Go / .NET / Android 均已补齐 RFC 5780 行为探测与设备上报，当前仍需要真实 Windows/Linux/macOS/Android 双机环境做 ping、HTTP 和 relay fallback 手工验收。
+* Go server 已实现标准 STUN/TURN UDP relay：Binding、alternate port NAT 探测、Allocate/Refresh、CreatePermission、ChannelBind、Send/Data Indication、ChannelData、`SPM2` session 授权和 relay 字节计量；过期 allocation 会清理并由新 Allocate 重建。
+* .NET server 已实现同一套 STUN/TURN 与 `SPM2` relay 规则，并提供公开 `/api/public/peer-mesh/stun-config` 用于 NAT 检测页面和外部探测。
+* Go client 已支持 Linux TUN、随包 Windows Wintun、macOS utun、v2 X25519/HKDF/AES-GCM frame、direct UDP、标准 TURN relay、ChannelData 与路径 MTU 探测。
+* .NET client 已支持 X25519 key 上报、v2 AES-GCM frame codec、4096 位 replay window、标准 STUN/TURN UDP 控制面、公共 STUN 候选、路径 MTU 探测，以及随包 Windows Wintun / Linux TUN / macOS utun packet 读写；Go / .NET / Android 均已补齐 RFC 5780 行为探测与设备上报，当前仍需要真实 Windows/Linux/macOS/Android 双机环境做 ping、HTTP 和 relay fallback 手工验收。
 
 需要真实环境手工验收：
 

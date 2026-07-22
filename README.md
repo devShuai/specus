@@ -53,7 +53,7 @@ flowchart TD
 | `implementations/go/client` | Go 内网客户端，与 Java 客户端使用相同配置和紧凑二进制协议 |
 | `implementations/csharp/protocol` | .NET 协议库，server/client 共同 ProjectReference 复用 |
 | `implementations/csharp/server` | .NET 服务端移植(EF Core,多库)；包含独立 `ShuaiTunnel.StunServer` 项目 |
-| `implementations/csharp/client` | .NET 内网客户端（CLI + Windows WPF 桌面客户端），与 Java/Go 客户端字节兼容 |
+| `implementations/csharp/client` | .NET 内网客户端（CLI + Windows WPF 桌面客户端），与 Java/Go 客户端使用同一套 v2 线协议 |
 | `implementations/android/client` | Android 图形客户端，提供运行控制台、JSONC 配置、前台服务、TCP/HTTP 隧道、VpnService 和 Peer Mesh 基础数据面 |
 | `implementations/c/server` | C 服务端轻量移植 |
 
@@ -142,6 +142,18 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 
 如需在端口映射日志中显示服务端公网地址，可设置 `TUNNEL_PUBLIC_ADDRESS`。未设置时客户端会回退显示控制连接配置中的 `remoteAddress`。
 
+### 日志
+
+默认日志只输出到控制台（本地开发与测试场景）。Linux systemd 部署由 unit 文件设置 `TUNNEL_LOG_FILE=/var/log/tunnel-server/tunnel-server.log`，应用同时写入滚动文件并保留 journald；安装与目录权限细节见 [`deploy/java-server/systemd`](deploy/java-server/systemd/README.md)。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TUNNEL_LOG_FILE` | （空） | 日志文件路径；留空时仅输出到控制台 |
+| `TUNNEL_LOG_MAX_FILE_SIZE` | `50MB` | 单个日志文件大小上限，超过后滚动并 gzip 压缩 |
+| `TUNNEL_LOG_MAX_HISTORY` | `30` | 保留的滚动历史周期数 |
+| `TUNNEL_LOG_TOTAL_SIZE_CAP` | `2GB` | 日志目录总量上限，超过后删除最旧归档 |
+| `TUNNEL_LOG_CLEAN_HISTORY_ON_START` | `true` | 启动时清理过期归档 |
+
 ### 多租户
 
 Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP 映射、HTTP 路由、连接记录、连接归档和流量统计都会绑定 `tenant_id`；本地密码登录签发的 JWT 会写入 `tenant_id` claim，默认来自 `TUNNEL_AUTH_TENANT_ID=default`。OIDC 登录可通过 `TUNNEL_OIDC_TENANT_CLAIM` 指定租户 claim，默认读取 `tenant_id`；缺失时回退到默认租户。Go server 与 .NET server 已同步管理用户表、`/api/admin/me`、`/api/admin/users`、本地 JWT 的 `tenant_id` / `role` claims，以及客户端、凭证、映射、连接、流量列表的 owner 可见性过滤。
@@ -172,7 +184,7 @@ Java `tunnel-server` 的管理面已经按租户隔离。客户端账号、TCP �
 | `serverBaseUrl` | 服务端管理 HTTP 地址，客户端会调用 `/api/client/auth/login` 获取运行时连接信息 |
 | `apiKey` | 管理后台创建的客户端启动凭证 key |
 | `secret` | 管理后台创建凭证时显示一次的密钥，用于签名启动登录请求 |
-| `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`mac-utun`、`utun`、`auto` |
+| `peerMeshDevice` | Peer Mesh 虚拟网卡模式，默认 `noop`；可选 `linux-tun`、`windows-wintun`、`wintun`、`mac-utun`、`macos-utun`、`darwin-utun`、`utun`、`auto` |
 | `peerMeshTunName` | Peer Mesh 虚拟网卡名称，默认 `shuai0` |
 | `peerMeshMtu` | Peer Mesh 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化，避免 UDP 封装后公网路径分片丢包 |
 
@@ -268,15 +280,15 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 | 字段 | 长度 | 说明 |
 | --- | --- | --- |
 | `magic` | 4 字节 | 固定值 `0x14353565` |
-| `version` | 1 字节 | 协议版本 |
-| `serializer` | 1 字节 | 序列化算法 |
+| `version` | 1 字节 | 固定为 `2`；其它版本直接拒绝 |
+| `serializer` | 1 字节 | 固定为 CompactBinary `4`；不协商、不回退 |
 | `command` | 1 字节 | 消息指令 |
 | `length` | 4 字节 | 消息体长度 |
 | `body` | N 字节 | 消息体 |
 
-协议分三层：帧头 `Command` 定义登录、退出、心跳、普通消息、同步 HTTP、`DIRECT_HTTP_*` 与单一 `NAT_MESSAGE`；普通消息的 `MessageType` 当前包含 `SERVER_TO_CLIENT`、`CLIENT_TO_SERVER`、`CLIENT_TO_CLIENT`、`NAT_CONTROL` 和 `PEER_CONTROL`；`NAT_MESSAGE` 再由 `NatMessageType` 区分注册、注册结果、连接建立、断开、数据转发、保活、解除注册和兼容保留的 `HTTP_ROUTES_REPORT`（当前 Java server 忽略）。其中同步 HTTP 指令保留在线协议中，当前公网 HTTP 主路径使用 `DIRECT_HTTP_*`。
+协议分为控制消息和 NAT stream 两层。`Command` 只登记登录、退出、心跳、普通消息与 `NAT_MESSAGE`；普通消息的 `MessageType` 包含 `SERVER_TO_CLIENT`、`CLIENT_TO_SERVER`、`CLIENT_TO_CLIENT`、`NAT_CONTROL` 和 `PEER_CONTROL`。每个客户端会话建立独立的 `control` 与 `data` 连接：控制连接承载登录、心跳、配置和 Peer 信令，数据连接承载 TCP、HTTP 与 WebSocket 流量。
 
-序列化默认使用紧凑二进制（`CompactBinarySerializer`）：省略字段名，使用变长整数与短类型标记，并在消息体 ≥ 阈值且压缩后更小时启用 Deflate（带 1 字节 payload 类型标记，解压有 `16 MiB` 上限）。默认 `TUNNEL_NETTY_MAX_FRAME_SIZE=33554432` 按完整帧计算，包含 11 字节 header，因此最大 body 为 `33554421` 字节。普通控制消息按此编码；**NAT 消息例外**——其元数据（`NatMessagePacket`）因采用自定义布局仍固定使用 JSON 序列化，仅其中的隧道字节流载荷套用紧凑二进制的 payload 编码（同样可触发 Deflate）。由于默认序列化算法和 NAT 数据封装已经变更，服务端和客户端需要同步升级。
+控制消息使用固定 schema 的紧凑二进制（`CompactBinarySerializer`），省略字段名并使用变长整数；wire body 不带压缩标记，也不执行通用 Deflate。`NAT_MESSAGE` 使用固定 16 字节头，通过 `REGISTER`、`REGISTER_RESULT`、`OPEN`、`DATA`、`FIN`、`RST`、`WINDOW_UPDATE`、`KEEPALIVE` 和 `UNREGISTER` 表达流生命周期、半关闭、取消与窗口流控。默认 `TUNNEL_NETTY_MAX_FRAME_SIZE=33554432` 按完整帧计算，包含 11 字节控制帧头。v2 是唯一可用版本，服务端和客户端必须同步升级。
 
 ## 管理后台
 
@@ -294,6 +306,14 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 - 手动执行幂等数据库初始化
 
 客户端启动凭证的 secret 在数据库中以 SHA-256 摘要（十六进制）保存；客户端启动时使用该摘要派生 HMAC-SHA256 签名密钥。secret 明文只在创建或重置凭证时显示一次。
+
+同一凭证的并发在线实例数受以下配置约束（新建客户端默认继承，可在管理后台按客户端覆盖）：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | 同一凭证允许的最大并发在线实例数 |
+| `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | 同一凭证在同一「机器指纹 + 系统用户」下的最大在线实例数，用于约束单机多开 |
+| `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` | 客户端运行时控制连接 token 有效期（秒），默认 8 小时 |
 
 ## 管理后台登录
 
@@ -346,7 +366,7 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8088/api/admin/c
 
 ## HTTP 直转通道
 
-HTTP 直转通道与 TCP 端口映射并行工作。服务端收到请求后，通过客户端控制连接转发 HTTP 方法、路径、查询参数、请求头和二进制请求体；客户端请求本地配置的目标服务，再将状态码、响应头和二进制响应体返回。
+HTTP 直转通道与 TCP 端口映射并行工作。服务端收到请求后，在客户端专用 `data` 连接上创建 NAT stream：请求头先通过 `OPEN` 到达客户端，请求体使用 `DATA` 流式发送，`FIN` 表示半关闭；客户端连接本地目标后，以响应 `OPEN`、`DATA`、`FIN` 流式返回状态码、响应头、响应体和 trailers。断开或超时通过 `RST` 传播，`WINDOW_UPDATE` 将下游消费能力反馈给发送端。
 
 客户端配置中的 `route` 决定可访问的内网目标。例如：
 
@@ -373,7 +393,7 @@ curl -i http://127.0.0.1:8088/http/Demo%20client/web/api/hello?source=tunnel
 
 Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端会被分配 `100.96.0.0/11` 内的虚拟 IP，并通过 `shuai0` 这类虚拟网卡互访。控制面仍走现有 Netty 连接，服务端通过 `PEER_CONTROL` 下发设备列表、候选地址、session 授权和启停状态；数据面优先走客户端之间的加密 UDP direct，direct 失效或不可达时回退到服务端标准 TURN relay。服务端 relay 只校验会话授权和 frame 头，不解密业务 IP 包明文。
 
-当前实现同时使用自建 STUN/TURN 和可配置公共 STUN。客户端登录后会拿到彼此独立的 `stunHost/stunPort`、`turnHost/turnPort`、公共 STUN 列表和 ICE 凭证；自建 STUN 负责 NAT 探测，TURN 负责 relay，公共 STUN 只用于补充 server-reflexive 候选地址。Java、Go、.NET 均可独立运行完整 RFC 5780 四端点 STUN，支持 `CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、双层请求限流、来源表上限和 Prometheus 指标；Java、Go、.NET 与 Android 客户端会分别上报映射行为、过滤行为和兼容 NAT 标签，并在 direct path 过期后主动触发重新探测和 relay fallback。
+当前实现同时使用自建 STUN/TURN 和可配置公共 STUN。客户端登录后会拿到彼此独立的 `stunHost/stunPort`、`turnHost/turnPort`、公共 STUN 列表和 ICE 凭证；自建 STUN 负责 NAT 探测，TURN 负责 relay，公共 STUN 只用于补充 server-reflexive 候选地址。Java、Go、.NET 均可独立运行完整 RFC 5780 四端点 STUN，支持 `CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、双层请求限流、来源表上限和 Prometheus 指标；Java、Go、.NET 与 Android 客户端会分别上报映射行为、过滤行为和归一化 NAT 标签，并在 direct path 过期后主动触发重新探测和 relay fallback。
 
 服务端相关配置：
 
@@ -399,6 +419,9 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `tunnel.peer-mesh.relay-max-port` | `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | `65535` | TURN relay 分配端口范围上限 |
 | `tunnel.peer-mesh.relay-worker-threads` | `TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` | `0` | relay 数据帧工作线程数，`0` 表示按 CPU 自动选择 |
 | `tunnel.peer-mesh.relay-worker-queue-capacity` | `TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | `10000` | relay 工作队列上限，队列满时丢弃新的 relay 数据帧以保护服务端 |
+| `tunnel.peer-mesh.udp-receive-buffer-bytes` | `TUNNEL_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的 UDP 接收缓冲区字节数 |
+| `tunnel.peer-mesh.udp-send-buffer-bytes` | `TUNNEL_PEER_MESH_UDP_SEND_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的 UDP 发送缓冲区字节数 |
+| `tunnel.peer-mesh.udp-traffic-class` | `TUNNEL_PEER_MESH_UDP_TRAFFIC_CLASS` | `16` | UDP socket 请求的 IP_TOS/Traffic Class，取值 `0..255` |
 | `tunnel.peer-mesh.relay-traffic-flush-interval-ms` | `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` | `5000` | relay 流量聚合入库间隔 |
 | `tunnel.peer-mesh.turn-auth-required` | `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | 是否要求 Allocate/Refresh/CreatePermission 携带长期凭证认证 |
 | `tunnel.peer-mesh.turn-realm` | `TUNNEL_PEER_MESH_TURN_REALM` | `shuai-tunnel` | TURN realm；参与 MESSAGE-INTEGRITY key 派生 |
@@ -435,16 +458,22 @@ Peer Mesh 默认关闭。开启后，同一租户和同一用户下的客户端�
 | `tunnel.public-transfer.presign-rate-limit-window-seconds` | `TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS` | `300` | presign 固定窗口秒数 |
 | `tunnel.public-transfer.max-pending-uploads-per-room` | `TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM` | `50` | 同 roomToken 哈希下 PENDING 上限 |
 | `tunnel.public-transfer.max-discovery-peers-per-room` | `TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | `32` | 单发现房间在线 peer 上限 |
-| `tunnel.public-transfer.discovery-message-rate-limit-per-connection` | `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` | `120` | 单发现连接每窗口消息数 |
+| `tunnel.public-transfer.discovery-message-rate-limit-per-connection` | `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` | `360` | 单发现连接每窗口消息数 |
 | `tunnel.public-transfer.discovery-message-rate-limit-window-seconds` | `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | `60` | 发现消息限流窗口秒数 |
+| `tunnel.public-transfer.cluster-enabled` | `TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED` | `false` | 启用 Redis 多实例 presence、Pub/Sub、房间修订和共享限流 |
+| `tunnel.public-transfer.redis-uri` | `TUNNEL_PUBLIC_TRANSFER_REDIS_URI` | 空 | 集群模式必填，例如 `redis://user:password@redis.internal:6379/0` |
+| `tunnel.public-transfer.redis-key-prefix` | `TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | `shuai-tunnel:v2:public-transfer` | Redis key 与频道前缀；环境之间必须隔离 |
+| `tunnel.public-transfer.presence-lease-seconds` | `TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` | `30` | discovery presence 租约 TTL |
+| `tunnel.public-transfer.presence-refresh-interval-ms` | `TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | `10000` | 租约刷新间隔，必须小于 TTL 一半 |
+| `tunnel.public-transfer.redis-command-timeout-ms` | `TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS` | `2000` | Redis 命令超时；故障时不回退本地状态 |
 
 ## 控制连接 TLS
 
-服务端控制连接默认为明文 TCP（`TUNNEL_TLS_MODE=disabled`，向后兼容）。需要加密时，服务端通过 `tunnel.tls.mode` 选择启用方式，客户端在控制连接上叠加一层 TLS：
+本地开发默认可使用明文 TCP（`TUNNEL_TLS_MODE=disabled`）。生产 profile 或启用 `TUNNEL_TLS_REQUIRE_ENCRYPTION=true` 后，公网 control/data 监听必须使用受信 TLS；只有 TLS 已由受信 L4 上游终止且进程绑定 loopback/私网地址时，才能显式设置 `TUNNEL_TLS_TERMINATED_UPSTREAM=true`：
 
 | `TUNNEL_TLS_MODE` | 说明 |
 | --- | --- |
-| `disabled` | 默认。控制连接为明文 TCP，与旧部署兼容 |
+| `disabled` | 仅限本地开发；生产公网绑定会被启动门禁拒绝 |
 | `file` | 生产环境。从磁盘加载真实的 keystore（JKS / PKCS12）签发服务端证书 |
 | `self-signed` | 仅开发/测试。启动时生成一次性自签名证书，控制连接已加密但不校验 CA |
 
@@ -471,6 +500,8 @@ mvn org.springframework.boot:spring-boot-maven-plugin:run
 | `TUNNEL_TLS_KEYSTORE` | （空） | 服务端 keystore 路径，仅 `mode=file` 时使用 |
 | `TUNNEL_TLS_KEYSTORE_PASSWORD` | （空） | keystore 密码 |
 | `TUNNEL_TLS_KEY_PASSWORD` | （空） | key 密码，留空时回退到 keystore 密码 |
+| `TUNNEL_TLS_REQUIRE_ENCRYPTION` | `false` | 强制 control/data 连接加密；生产 profile 自动执行同等门禁 |
+| `TUNNEL_TLS_TERMINATED_UPSTREAM` | `false` | 声明 TLS 已由受信 L4 上游终止；仅允许进程绑定 loopback/私网地址 |
 
 ## 数据库切换
 
@@ -551,7 +582,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 
 已实现：
 
-- 客户端启动登录（基于 apiKey/secret 的 **HMAC-SHA256** 签名，canonical message 只覆盖 apiKey、时间戳、nonce、`machineFingerprint` 与 `osUser`，并校验 60 秒时间窗）、运行时 token 控制通道登录、心跳保活；hostname、系统版本、公钥和能力声明不在签名内，nonce 当前也未持久化去重，因此时间窗内仍可能重放同一签名
+- 客户端启动登录（基于 apiKey/secret 的 **HMAC-SHA256** 签名，canonical message 覆盖 apiKey、时间戳、nonce、`machineFingerprint` 与 `osUser`，并校验 60 秒时间窗）、运行时 token control/data 双通道登录与心跳保活；`(apiKey, nonce)` 通过数据库唯一键原子去重并按 TTL 清理
 - 基于 Spring Data JPA 和 Hibernate 的 SQLite、MySQL 和 PostgreSQL 持久化与初始化
 - 客户端账号分配、连接记录、连接频率限制（默认每分钟 `30` 次，`0` 表示不限）和流量统计
 - 内置管理 API 和管理页面，支持用户名/密码与 OIDC（授权码 + PKCE）两种登录，后端统一校验 Bearer JWT
@@ -561,15 +592,15 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 - HTTP / TCP 流量明细观测，支持通道级采集开关（默认关闭）、分页搜索、Header 说明、HTTP Body 类型化预览、压缩响应解码，以及 DB / Elasticsearch 存储切换
 - 控制连接断开后的指数退避重连
 - TCP 公网端口监听和双向数据转发
-- 服务端通过控制连接请求客户端发起 HTTP 请求，并同步等待响应
+- 服务端通过专用数据连接以 NAT stream 转发 HTTP/WebSocket，支持首部先达、流式 body、SSE、trailers、取消传播与窗口流控
 - Peer Mesh：虚拟 IP 分配、Linux TUN / Windows Wintun / macOS utun、同用户默认互通、`PEER_CONTROL` 信令、标准 STUN/TURN、公共 STUN 候选补充、UDP direct、server relay、NAT 类型探测、链路和会话展示
 - 可选的控制连接 TLS（`file` 加载 keystore / `self-signed` 自签名）
 - 免登录房间互传：匿名用户可使用 WebRTC Direct 和认证 TURN，登录用户额外支持 OSS 预签名兜底、云端下载与分享链接；Token 房间支持 OWNER/EDITOR/VIEWER 角色邀请、撤销和只读限制；专业流程图基于 maxGraph + Yjs，支持多页面、分类图形库与模板、动态泳池/泳道、容器与组合、智能参考线、小地图、自动布局、格式刷、高级样式、评论、协作光标和服务端版本历史；支持 `.stdg`、多页 `.drawio`、Mermaid、PlantUML、Visio `.vsdx` 导入，以及 `.stdg`、`.drawio`、Mermaid、PlantUML、Visio `.vdx`、SVG、PNG、全页 PDF 导出；文件接收默认关闭“接收前确认”，收到文件元数据后自动开始接收；仅在会话内开启该开关后才显示接收/拒绝，拒绝后发送端不会绕过拒绝回退 OSS
-- 与 Java 协议兼容的 Go 客户端，支持登录、心跳、自动重连、TCP 映射和 HTTP 直转
+- 使用统一 v2 线协议的 Go 客户端，支持 control/data 双连接、登录、心跳、自动重连、TCP 映射和 HTTP/WebSocket 流式直转
 - Go/.NET server 已同步 Java 管理用户与租户/owner 权限基础，并已对齐 TCP 映射 / HTTP 路由的通道级 `detailCaptureEnabled` 管理字段以及 HTTP 路由的 `pathRewriteEnabled` 配置和回包路径改写行为
 - Go/.NET server 已补齐数据库版资源级流量聚合和 HTTP/TCP 明细观测，包括资源流量表、明细表、热路径采集写入、资源列表、HTTP 分页与字段搜索、TCP 分页、单帧详情和按 channel 串流查询；同时已支持 Java 风格 Elasticsearch 可选存储与 HTTP 100GB / TCP 10GB 索引容量治理
 - Go/.NET server 已对齐 Java 公共互传与客户端消息主路径：`/ws/public-transfer/discovery`、6 个公共/管理附件接口、Aliyun OSS 预签名与 HEAD 完成校验、过期清理、来源 IP/房间限流、`/ws/client-messages`、消息能力持久化和 client/admin fallback；TURN 临时 credential、MESSAGE-INTEGRITY 及 401/438 challenge 也已补齐，Java/Go/.NET/Android 客户端会更新 challenge、换新 transaction 并最多重试一次
-- Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 只保留轻量兼容面
+- Go/.NET client 已同步 `PEER_CONTROL` 枚举、客户端 HTTP 登录里的 `peerMesh` 配置、`peerPublicKey` 环境字段，并已接入 Linux TUN、Windows Wintun、macOS utun、UDP direct/relay、X25519/HKDF/AES-GCM 数据帧和 token 快过期主动刷新；Java client 也已支持 macOS utun；C server 提供明确列出的轻量子集
 - .NET Windows 桌面客户端已接入同一套 .NET 客户端运行时，支持保存连接配置、启动/停止客户端、查看 TCP/HTTP 路由和 Peer Mesh 状态、活跃 session、运行日志，以及跟随系统/浅色/深色主题
 - Android 客户端已提供原生运行控制台、JSONC 配置编辑与摘要、前台服务、HTTP 登录、控制连接、TCP 映射、HTTP/HTTP route WebSocket 直转、VpnService TUN 生命周期、客户端文本消息，以及 Peer Mesh 基础数据面（X25519/HKDF/AES-GCM、候选交换、session 授权/刷新、STUN/TURN、direct-stale relay fallback、链路/流量/设备上报和 IPv4 包收发）；JVM 协议/状态机测试已覆盖帧边界、登录、重连和数据面 codec
 - 面向规模化的数据库工程：有界登录线程池、批量流量聚合、复合索引、连接级 O(1) 数据路由，以及连接明细按自然月汇总归档（明细滚动保留 60 天，汇总后再清理）
@@ -577,7 +608,7 @@ Go server 和 .NET server 已补齐数据库版资源级流量聚合、HTTP/TCP 
 实现边界：
 
 - 公网 UDP 端口映射尚未实现；目前 UDP 数据面只用于 Peer Mesh direct / relay。
-- Peer Mesh 的 Go/.NET 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 保留轻量兼容面，不包含 TLS 控制连接、HTTPS OIDC token exchange、ES 明细、live client-message/公共发现、对象存储或 Peer Mesh 数据面。C 的附件路径会明确返回 `409 OBJECT_STORAGE_DISABLED`，公共 ICE 仅描述显式配置的外部 STUN/TURN 服务。
+- Peer Mesh 的 Go/.NET 数据面已对齐协议和核心能力，跨平台运行仍以 Java 基准实现为准；C server 只实现 v2 控制/NAT stream 与管理面的轻量子集，不包含 TLS 控制连接、HTTPS OIDC token exchange、ES 明细、live client-message/公共发现、对象存储或 Peer Mesh 数据面。C 的附件路径会明确返回 `409 OBJECT_STORAGE_DISABLED`，公共 ICE 仅描述显式配置的外部 STUN/TURN 服务。
 - Android Peer Mesh 已覆盖 direct UDP、STUN server-reflexive candidate、TURN relay、session 刷新和基础链路/流量/设备上报；端口预测、本地 ACL 镜像和完整真机端到端矩阵仍待补齐。
 - Java 客户端入口尚未默认开启控制连接 TLS，启用需自行调用 `NettyClient.buildClientSslContext(...)` 并以带 `SslContext` 的构造函数启动。
 - 自动化测试仍需要补充真实 MySQL、PostgreSQL 和端到端隧道覆盖。
