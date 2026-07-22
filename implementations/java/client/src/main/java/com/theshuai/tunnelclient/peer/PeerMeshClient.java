@@ -61,6 +61,8 @@ public class PeerMeshClient implements AutoCloseable {
     private final Map<String, Long> packetTraceLogMillis = new ConcurrentHashMap<>();
     private final Map<Long, Deque<PendingVirtualPacket>> pendingVirtualPackets = new ConcurrentHashMap<>();
     private final Map<Long, Long> pathPrepareMillis = new ConcurrentHashMap<>();
+    /** 已上报过 path-report 的 sessionId：peerId -> sessionId，用于识别会话换号后必须重新上报 */
+    private final Map<Long, Long> lastReportedSessionIds = new ConcurrentHashMap<>();
     /** H-1 候选回礼节流状态：peerId -> 上次回发时间 */
     private final Map<Long, Long> candidateReciprocateMillis = new ConcurrentHashMap<>();
     /** H-2 密集重试状态：sessionId -> 已调度的打洞重试轮次，避免同一 session 重复排程 */
@@ -204,6 +206,7 @@ public class PeerMeshClient implements AutoCloseable {
             pathPrepareMillis.clear();
             candidateReciprocateMillis.clear();
             holePunchRetryScheduled.clear();
+            lastReportedSessionIds.clear();
             pendingStunBindings.clear();
             pendingTurnRequests.clear();
             turnPermissions.clear();
@@ -423,6 +426,7 @@ public class PeerMeshClient implements AutoCloseable {
         pathPrepareMillis.clear();
         candidateReciprocateMillis.clear();
         holePunchRetryScheduled.clear();
+        lastReportedSessionIds.clear();
         pendingStunBindings.clear();
         pendingTurnRequests.clear();
         turnPermissions.clear();
@@ -2705,6 +2709,9 @@ public class PeerMeshClient implements AutoCloseable {
             session.remoteEndpoint = relayEndpoint();
             session.relayTargetAllocationId = relayFromAllocationId;
             session.markPath("RELAY", now);
+            // 只由入站探针建立路径的一方此前从不上报，session 会一直停在 NEGOTIATING；
+            // relay 业务帧要求会话已激活，于是中继"看起来通了"但数据全被服务端丢弃。
+            maybeReportPath(session, "RELAY", localEndpointText(), endpointText(session.remoteEndpoint), -1);
             flushPendingPackets(session);
             return;
         }
@@ -2730,6 +2737,7 @@ public class PeerMeshClient implements AutoCloseable {
             session.endpointRtt = Long.MAX_VALUE;
         }
         session.markPath("DIRECT", now);
+        maybeReportPath(session, "DIRECT", localEndpointText(), endpointText(session.remoteEndpoint), -1);
         flushPendingPackets(session);
     }
 
@@ -2901,11 +2909,47 @@ public class PeerMeshClient implements AutoCloseable {
             log.debug("Peer mesh {} UDP path still active: session={}, peer={}, remote={}, rtt={}ms",
                     pathType.toLowerCase(), session.sessionId(), session.peerId(), remote, rttMillis);
         }
-        if (changed || now - session.lastPathReportMillis >= 60_000) {
-            reportPath(session, pathType, local, remote, rttMillis);
-            session.lastPathReportMillis = now;
-        }
+        // 先上报再 flush：待发数据一旦先于 path-report 到达服务端，relay 会因会话尚未激活
+        // 而丢弃它们，而 peer 应用消息没有重传。
+        maybeReportPath(session, pathType, local, remote, rttMillis);
         flushPendingPackets(session);
+    }
+
+    /**
+     * 按需上报路径状态。除"路径变化"和"距上次上报满 60 秒"外，
+     * <b>sessionId 变化时必须强制上报</b>：服务端每次签发新 grant 都是新 session + NEGOTIATING，
+     * 而客户端重建 PeerSession 时会继承旧的 currentPathType / lastPathReportMillis，
+     * 导致抑制条件同时不满足，新会话在服务端长期停在 NEGOTIATING、relay 业务帧被全部丢弃。
+     */
+    private void maybeReportPath(PeerSession session,
+                                 String pathType,
+                                 String local,
+                                 String remote,
+                                 long rttMillis) {
+        if (session == null || session.sessionId() == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        boolean newSession = !session.sessionId().equals(lastReportedSessionIds.get(session.peerId()));
+        boolean pathChanged = !pathType.equals(session.lastReportedPathType)
+                || !remote.equals(session.lastReportedRemoteText);
+        if (!newSession && !pathChanged && now - session.lastPathReportMillis < 60_000) {
+            return;
+        }
+        reportPath(session, pathType, local, remote, rttMillis);
+        session.lastPathReportMillis = now;
+        session.lastReportedPathType = pathType;
+        session.lastReportedRemoteText = remote;
+        lastReportedSessionIds.put(session.peerId(), session.sessionId());
+    }
+
+    private String localEndpointText() {
+        DatagramSocket socket = udpSocket;
+        return socket == null || socket.isClosed() ? "" : "0.0.0.0:" + socket.getLocalPort();
+    }
+
+    private String endpointText(InetSocketAddress endpoint) {
+        return endpoint == null ? "" : endpointKey(endpoint);
     }
 
     private static long smoothRtt(long previous, long sample) {
@@ -4039,6 +4083,9 @@ public class PeerMeshClient implements AutoCloseable {
         private volatile long lastDirectKeepaliveMillis;
         private volatile long lastPathLogMillis;
         private volatile long lastPathReportMillis;
+        /** 最近一次实际上报出去的路径与对端，独立于 lastPathRemoteText（后者还用于日志抑制） */
+        private volatile String lastReportedPathType = "";
+        private volatile String lastReportedRemoteText = "";
         private volatile long lastKeyMissingLogMillis;
         private volatile String lastPathRemoteText = "";
         private volatile String currentPathType = "";
@@ -4084,6 +4131,8 @@ public class PeerMeshClient implements AutoCloseable {
             next.lastDirectKeepaliveMillis = lastDirectKeepaliveMillis;
             next.lastPathLogMillis = lastPathLogMillis;
             next.lastPathReportMillis = lastPathReportMillis;
+            next.lastReportedPathType = lastReportedPathType;
+            next.lastReportedRemoteText = lastReportedRemoteText;
             next.lastKeyMissingLogMillis = lastKeyMissingLogMillis;
             next.lastPathRemoteText = lastPathRemoteText;
             next.currentPathType = currentPathType;
