@@ -28,6 +28,32 @@ CREATE TABLE IF NOT EXISTS tunnel_client_credential (
   KEY idx_client_credential_owner (tenant_id, owner_username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS tunnel_client_auth_nonce (
+  api_key_hash VARCHAR(64) NOT NULL,
+  nonce_hash VARCHAR(64) NOT NULL,
+  expires_at VARCHAR(40) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  PRIMARY KEY (api_key_hash, nonce_hash),
+  KEY idx_client_auth_nonce_expiry (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
+  token_hash VARCHAR(64) NOT NULL PRIMARY KEY,
+  scope VARCHAR(40) NOT NULL,
+  username VARCHAR(80),
+  tenant_id VARCHAR(80),
+  is_admin TINYINT(1) NOT NULL DEFAULT 0,
+  room_id VARCHAR(120),
+  room_key VARCHAR(80),
+  peer_id VARCHAR(120),
+  display_name VARCHAR(120),
+  shared_room TINYINT(1) NOT NULL DEFAULT 0,
+  remote_address_hash VARCHAR(64) NOT NULL,
+  created_at VARCHAR(40) NOT NULL,
+  expires_at VARCHAR(40) NOT NULL,
+  KEY idx_websocket_ticket_expiry (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS tunnel_client_identity (
   id BIGINT NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,

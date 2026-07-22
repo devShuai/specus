@@ -6,23 +6,23 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"math"
+	"strings"
+	"sync"
 )
 
 const (
-	peerDataFrameMagic      uint32 = 0x53504d31
-	peerDataFrameVersion    byte   = 1
-	peerDataFrameTypeData   byte   = 1
-	peerDataFrameNonceBytes        = 12
-	peerDataFrameAADBytes          = 4 + 2 + 8*4 + peerDataFrameNonceBytes
-	peerDataFrameTagBytes          = 16
-	peerDataFrameMinBytes          = peerDataFrameAADBytes + 4 + peerDataFrameTagBytes
-	peerDataFrameMaxBytes          = 65535
+	peerDataFrameMagic       uint32 = 0x53504d32
+	peerDataFrameNonceBytes         = 12
+	peerDataFrameTagBytes           = 16
+	peerDataFrameMaxBytes           = 65535
+	peerDataFrameHeaderBytes        = 4 + 8*2
+	peerDataFrameMinBytes           = peerDataFrameHeaderBytes + peerDataFrameTagBytes
+	peerReplayWindowSize            = 4096
+	peerReplayWindowMask            = peerReplayWindowSize - 1
 )
 
 var (
@@ -31,16 +31,20 @@ var (
 )
 
 type peerDataFrame struct {
-	SessionID    int64
-	FromClientID int64
-	ToClientID   int64
-	Sequence     uint64
-	Payload      []byte
+	SessionID int64
+	Sequence  uint64
+	Payload   []byte
+}
+
+type peerDataFrameTrafficCodec struct {
+	aead        cipher.AEAD
+	noncePrefix uint32
+	mu          sync.Mutex
 }
 
 type peerReplayWindow struct {
-	highest uint64
-	bits    uint64
+	highest   uint64
+	sequences [peerReplayWindowSize]uint64
 }
 
 func derivePeerMeshAESKey(localPrivate *ecdh.PrivateKey, remotePublicKeyBase64 string, sessionID int64, sessionToken string, localClientID, remoteClientID int64) ([]byte, error) {
@@ -68,126 +72,143 @@ func derivePeerMeshAESKey(localPrivate *ecdh.PrivateKey, remotePublicKeyBase64 s
 	return hkdfExpandSHA256(prk, []byte("shuai-peer-mesh/aes-gcm/v1"), 32), nil
 }
 
-func encodePeerDataFrame(aesKey []byte, sessionID, fromClientID, toClientID int64, sequence uint64, payload []byte) ([]byte, error) {
-	if len(aesKey) != 32 {
-		return nil, fmt.Errorf("peer data frame AES key must be 32 bytes")
-	}
-	if sequence == 0 || sequence > math.MaxInt64 {
-		return nil, fmt.Errorf("peer data frame sequence out of range")
-	}
-	block, err := aes.NewCipher(aesKey)
+func encodePeerDataFrame(aesKey []byte, sessionID, fromClientID, toClientID int64, senderKeyEpoch string, sequence uint64, payload []byte) ([]byte, error) {
+	codec, err := newPeerDataFrameTrafficCodec(aesKey, sessionID, fromClientID, toClientID, senderKeyEpoch)
 	if err != nil {
 		return nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
+	return codec.encode(sessionID, sequence, payload)
+}
+
+func newPeerDataFrameTrafficCodec(aesKey []byte, sessionID, fromClientID, toClientID int64, senderKeyEpoch string) (*peerDataFrameTrafficCodec, error) {
+	if len(aesKey) != 32 || sessionID <= 0 || fromClientID <= 0 || toClientID <= 0 || fromClientID == toClientID {
+		return nil, fmt.Errorf("invalid SPM2 key, session, or direction")
+	}
+	if strings.TrimSpace(senderKeyEpoch) == "" {
+		return nil, fmt.Errorf("SPM2 traffic key requires the sender key epoch")
+	}
+	trafficKey, noncePrefix := derivePeerDataFrameV2TrafficMaterial(aesKey, sessionID, fromClientID, toClientID, senderKeyEpoch)
+	block, err := aes.NewCipher(trafficKey)
 	if err != nil {
 		return nil, err
 	}
-	nonce := make([]byte, peerDataFrameNonceBytes)
-	if _, err := rand.Read(nonce); err != nil {
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
 		return nil, err
 	}
-	aad := make([]byte, peerDataFrameAADBytes)
-	writePeerFrameHeader(aad, sessionID, fromClientID, toClientID, sequence, nonce)
-	ciphertext := gcm.Seal(nil, nonce, payload, aad)
-	if peerDataFrameAADBytes+4+len(ciphertext) > peerDataFrameMaxBytes {
+	return &peerDataFrameTrafficCodec{aead: aead, noncePrefix: noncePrefix}, nil
+}
+
+func (codec *peerDataFrameTrafficCodec) encode(sessionID int64, sequence uint64, payload []byte) ([]byte, error) {
+	if codec == nil || sessionID <= 0 || sequence == 0 {
+		return nil, fmt.Errorf("invalid SPM2 codec, session, or sequence")
+	}
+	if peerDataFrameHeaderBytes+len(payload)+peerDataFrameTagBytes > peerDataFrameMaxBytes {
 		return nil, fmt.Errorf("peer data frame is too large")
 	}
-	frame := make([]byte, peerDataFrameAADBytes+4+len(ciphertext))
-	copy(frame, aad)
-	binary.BigEndian.PutUint32(frame[peerDataFrameAADBytes:], uint32(len(ciphertext)))
-	copy(frame[peerDataFrameAADBytes+4:], ciphertext)
+	frame := make([]byte, peerDataFrameHeaderBytes, peerDataFrameHeaderBytes+len(payload)+peerDataFrameTagBytes)
+	binary.BigEndian.PutUint32(frame[0:4], peerDataFrameMagic)
+	binary.BigEndian.PutUint64(frame[4:12], uint64(sessionID))
+	binary.BigEndian.PutUint64(frame[12:20], sequence)
+	nonce := peerDataFrameV2Nonce(codec.noncePrefix, sequence)
+	codec.mu.Lock()
+	frame = codec.aead.Seal(frame, nonce, payload, frame[:peerDataFrameHeaderBytes])
+	codec.mu.Unlock()
 	return frame, nil
 }
 
-func decodePeerDataFrame(aesKey []byte, packet []byte) (*peerDataFrame, error) {
-	if len(aesKey) != 32 {
-		return nil, fmt.Errorf("peer data frame AES key must be 32 bytes")
+func decodePeerDataFrame(aesKey []byte, expectedFromClientID, expectedToClientID int64, senderKeyEpoch string, packet []byte) (*peerDataFrame, error) {
+	if len(aesKey) != 32 || len(packet) < peerDataFrameMinBytes || len(packet) > peerDataFrameMaxBytes || binary.BigEndian.Uint32(packet[:4]) != peerDataFrameMagic {
+		return nil, fmt.Errorf("invalid SPM2 peer data frame")
 	}
-	if len(packet) < peerDataFrameMinBytes {
-		return nil, fmt.Errorf("peer data frame is too short")
+	sessionID := int64(binary.BigEndian.Uint64(packet[4:12]))
+	sequence := binary.BigEndian.Uint64(packet[12:20])
+	if sessionID <= 0 || expectedFromClientID <= 0 || expectedToClientID <= 0 || expectedFromClientID == expectedToClientID || sequence == 0 {
+		return nil, fmt.Errorf("invalid SPM2 session, direction, or sequence")
 	}
-	if binary.BigEndian.Uint32(packet[0:4]) != peerDataFrameMagic {
-		return nil, fmt.Errorf("invalid peer data frame magic")
-	}
-	if packet[4] != peerDataFrameVersion || packet[5] != peerDataFrameTypeData {
-		return nil, fmt.Errorf("unsupported peer data frame version/type")
-	}
-	cipherLength := int(binary.BigEndian.Uint32(packet[peerDataFrameAADBytes:]))
-	if cipherLength < peerDataFrameTagBytes || len(packet) != peerDataFrameAADBytes+4+cipherLength {
-		return nil, fmt.Errorf("invalid peer data frame ciphertext length")
-	}
-	sessionID := int64(binary.BigEndian.Uint64(packet[6:14]))
-	fromClientID := int64(binary.BigEndian.Uint64(packet[14:22]))
-	toClientID := int64(binary.BigEndian.Uint64(packet[22:30]))
-	sequence := binary.BigEndian.Uint64(packet[30:38])
-	nonce := packet[38:50]
-	block, err := aes.NewCipher(aesKey)
+	codec, err := newPeerDataFrameTrafficCodec(aesKey, sessionID, expectedFromClientID, expectedToClientID, senderKeyEpoch)
 	if err != nil {
 		return nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
+	return codec.decode(packet, sessionID)
+}
+
+func (codec *peerDataFrameTrafficCodec) decode(packet []byte, expectedSessionID int64) (*peerDataFrame, error) {
+	if codec == nil || len(packet) < peerDataFrameMinBytes || len(packet) > peerDataFrameMaxBytes ||
+		binary.BigEndian.Uint32(packet[:4]) != peerDataFrameMagic {
+		return nil, fmt.Errorf("invalid SPM2 peer data frame")
 	}
-	payload, err := gcm.Open(nil, nonce, packet[peerDataFrameAADBytes+4:], packet[:peerDataFrameAADBytes])
+	sessionID := int64(binary.BigEndian.Uint64(packet[4:12]))
+	sequence := binary.BigEndian.Uint64(packet[12:20])
+	if sessionID <= 0 || sessionID != expectedSessionID || sequence == 0 {
+		return nil, fmt.Errorf("invalid SPM2 session or sequence")
+	}
+	codec.mu.Lock()
+	payload, err := codec.aead.Open(nil, peerDataFrameV2Nonce(codec.noncePrefix, sequence),
+		packet[peerDataFrameHeaderBytes:], packet[:peerDataFrameHeaderBytes])
+	codec.mu.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("decrypt peer data frame: %w", err)
+		return nil, fmt.Errorf("decrypt SPM2 peer data frame: %w", err)
 	}
 	return &peerDataFrame{
-		SessionID:    sessionID,
-		FromClientID: fromClientID,
-		ToClientID:   toClientID,
-		Sequence:     sequence,
-		Payload:      payload,
+		SessionID: sessionID,
+		Sequence:  sequence,
+		Payload:   payload,
 	}, nil
 }
 
 func peerDataFrameSessionID(packet []byte) (int64, bool) {
-	if len(packet) < peerDataFrameAADBytes+4 {
+	if len(packet) < peerDataFrameMinBytes || len(packet) > peerDataFrameMaxBytes {
 		return 0, false
 	}
 	if binary.BigEndian.Uint32(packet[0:4]) != peerDataFrameMagic {
 		return 0, false
 	}
-	if packet[4] != peerDataFrameVersion || packet[5] != peerDataFrameTypeData {
-		return 0, false
-	}
-	return int64(binary.BigEndian.Uint64(packet[6:14])), true
+	return int64(binary.BigEndian.Uint64(packet[4:12])), true
 }
 
 func looksLikePeerDataFrame(packet []byte) bool {
-	return len(packet) >= 4 && binary.BigEndian.Uint32(packet[0:4]) == peerDataFrameMagic
+	if len(packet) < 4 {
+		return false
+	}
+	return binary.BigEndian.Uint32(packet[0:4]) == peerDataFrameMagic
+}
+
+// derivePeerDataFrameV2TrafficMaterial derives the one-way traffic key. senderKeyEpoch is the
+// sender's per-process random epoch and is mandatory: sessionID/token are reused within the
+// server session TTL and X25519 keys are persisted on disk, so without a fresh epoch a client
+// restart would replay the same nonce space under the same AES-GCM key.
+func derivePeerDataFrameV2TrafficMaterial(aesKey []byte, sessionID, fromClientID, toClientID int64, senderKeyEpoch string) ([]byte, uint32) {
+	var salt [8]byte
+	binary.BigEndian.PutUint64(salt[:], uint64(sessionID))
+	prk := hmacSHA256(salt[:], aesKey)
+	info := []byte(fmt.Sprintf("shuai-peer-mesh/spm2/aes-gcm\n%d\n%d\n%d\n%s", sessionID, fromClientID, toClientID, senderKeyEpoch))
+	material := hkdfExpandSHA256(prk, info, 36)
+	return material[:32], binary.BigEndian.Uint32(material[32:36])
+}
+
+func peerDataFrameV2Nonce(prefix uint32, sequence uint64) []byte {
+	nonce := make([]byte, peerDataFrameNonceBytes)
+	binary.BigEndian.PutUint32(nonce[:4], prefix)
+	binary.BigEndian.PutUint64(nonce[4:], sequence)
+	return nonce
 }
 
 func (window *peerReplayWindow) accept(sequence uint64) bool {
 	if sequence == 0 {
 		return false
 	}
-	if window.highest == 0 {
-		window.highest = sequence
-		window.bits = 1
-		return true
+	if window.highest >= peerReplayWindowSize && sequence <= window.highest-peerReplayWindowSize {
+		return false
 	}
+	slot := sequence & peerReplayWindowMask
+	if window.sequences[slot] == sequence {
+		return false
+	}
+	window.sequences[slot] = sequence
 	if sequence > window.highest {
-		shift := sequence - window.highest
-		if shift >= 64 {
-			window.bits = 1
-		} else {
-			window.bits = (window.bits << shift) | 1
-		}
 		window.highest = sequence
-		return true
 	}
-	offset := window.highest - sequence
-	if offset >= 64 {
-		return false
-	}
-	mask := uint64(1) << offset
-	if window.bits&mask != 0 {
-		return false
-	}
-	window.bits |= mask
 	return true
 }
 
@@ -228,17 +249,6 @@ func decodeX25519PrivateKey(value string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported peer private key format")
 	}
-}
-
-func writePeerFrameHeader(header []byte, sessionID, fromClientID, toClientID int64, sequence uint64, nonce []byte) {
-	binary.BigEndian.PutUint32(header[0:4], peerDataFrameMagic)
-	header[4] = peerDataFrameVersion
-	header[5] = peerDataFrameTypeData
-	binary.BigEndian.PutUint64(header[6:14], uint64(sessionID))
-	binary.BigEndian.PutUint64(header[14:22], uint64(fromClientID))
-	binary.BigEndian.PutUint64(header[22:30], uint64(toClientID))
-	binary.BigEndian.PutUint64(header[30:38], sequence)
-	copy(header[38:50], nonce)
 }
 
 func hkdfExpandSHA256(prk, info []byte, length int) []byte {

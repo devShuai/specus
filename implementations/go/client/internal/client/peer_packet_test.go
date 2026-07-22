@@ -42,6 +42,36 @@ func TestPeerPacketICMPEchoReplyForRejectsNonLocalTarget(t *testing.T) {
 	}
 }
 
+func TestPeerPacketClampsMSSAndBuildsFragmentationNeeded(t *testing.T) {
+	packet := make([]byte, 44)
+	packet[0] = 0x45
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	packet[8] = 64
+	packet[9] = ipv4ProtocolTCP
+	copy(packet[12:16], net.ParseIP("100.64.0.1").To4())
+	copy(packet[16:20], net.ParseIP("100.64.0.2").To4())
+	packet[32] = 0x60
+	packet[33] = 0x02
+	packet[40] = 2
+	packet[41] = 4
+	binary.BigEndian.PutUint16(packet[42:44], 1460)
+
+	clamped := peerPacketClampTCPMSS(packet, 1200)
+	if got := binary.BigEndian.Uint16(clamped[42:44]); got != 1160 {
+		t.Fatalf("clamped MSS = %d, want 1160", got)
+	}
+	ptb := peerPacketICMPFragmentationNeededFor(packet, 1200)
+	if len(ptb) == 0 || ptb[20] != icmpDestinationUnreachable || ptb[21] != icmpFragmentationNeeded {
+		t.Fatalf("invalid ICMP fragmentation-needed: %x", ptb)
+	}
+	if got := binary.BigEndian.Uint16(ptb[26:28]); got != 1200 {
+		t.Fatalf("next-hop MTU = %d", got)
+	}
+	if peerPacketChecksum(ptb[:20]) != 0 || peerPacketChecksum(ptb[20:]) != 0 {
+		t.Fatal("generated ICMP PTB checksum is invalid")
+	}
+}
+
 func minimalICMPEchoRequestPacket(source, target string) []byte {
 	packet := make([]byte, 32)
 	packet[0] = 0x45

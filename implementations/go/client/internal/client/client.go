@@ -27,7 +27,20 @@ const (
 	controlReadIdleTimeout     = 60 * time.Second
 	controlWriteIdleHeartbeat  = 5 * time.Second
 	controlIdleTickInterval    = time.Second
+	priorityWriteQueueCapacity = 256
 )
+
+type priorityPacket struct {
+	command int8
+	body    []byte
+}
+
+type priorityWriter struct {
+	connection net.Conn
+	ctx        context.Context
+	cancel     context.CancelFunc
+	queue      chan priorityPacket
+}
 
 type Client struct {
 	config Config
@@ -36,11 +49,16 @@ type Client struct {
 	routesMu sync.RWMutex
 	routes   map[string]string
 
-	writeMu           sync.Mutex
-	lastWriteUnixNano atomic.Int64
-	controlMu         sync.RWMutex
-	controlConn       net.Conn
-	messageHandler    func(ClientMessage)
+	controlWriteMu        sync.Mutex
+	dataWriteMu           sync.Mutex
+	priorityMu            sync.RWMutex
+	priorityWriter        *priorityWriter
+	lastWriteUnixNano     atomic.Int64
+	dataLastWriteUnixNano atomic.Int64
+	controlMu             sync.RWMutex
+	controlConn           net.Conn
+	dataConn              net.Conn
+	messageHandler        func(ClientMessage)
 
 	reconnectMu                 sync.Mutex
 	reconnectAttempts           int
@@ -54,13 +72,14 @@ type Client struct {
 	registeredMu sync.Mutex
 	registered   map[int]struct{}
 
-	httpRoutesReportedMu sync.Mutex
-	httpRoutesReported   bool
-
-	localsMu   sync.Mutex
-	locals     map[string]net.Conn
-	wsLocalsMu sync.Mutex
-	wsLocals   map[string]*webSocketLocalConnection
+	localsMu    sync.Mutex
+	locals      map[uint32]net.Conn
+	wsLocalsMu  sync.Mutex
+	wsLocals    map[uint32]*webSocketLocalConnection
+	httpMu      sync.Mutex
+	httpStreams map[uint32]*httpRequestStream
+	natFlowsMu  sync.Mutex
+	natFlows    map[uint32]*natFlowState
 
 	peerMesh *peerMeshClient
 }
@@ -124,14 +143,16 @@ func New(config Config, logger *log.Logger) *Client {
 		logger = log.Default()
 	}
 	return &Client{
-		config:     config,
-		logger:     logger,
-		routes:     make(map[string]string),
-		tunnels:    make(map[int]TunnelConfig),
-		registered: make(map[int]struct{}),
-		locals:     make(map[string]net.Conn),
-		wsLocals:   make(map[string]*webSocketLocalConnection),
-		peerMesh:   newPeerMeshClient(config, logger),
+		config:      config,
+		logger:      logger,
+		routes:      make(map[string]string),
+		tunnels:     make(map[int]TunnelConfig),
+		registered:  make(map[int]struct{}),
+		locals:      make(map[uint32]net.Conn),
+		wsLocals:    make(map[uint32]*webSocketLocalConnection),
+		httpStreams: make(map[uint32]*httpRequestStream),
+		natFlows:    make(map[uint32]*natFlowState),
+		peerMesh:    newPeerMeshClient(config, logger),
 	}
 }
 
@@ -235,47 +256,104 @@ func (client *Client) runOnce(ctx context.Context) error {
 	}
 	client.applyRuntime(runtime)
 	address := net.JoinHostPort(runtime.NettyHost, strconv.Itoa(runtime.NettyPort))
-	connection, err := net.DialTimeout("tcp", address, 5*time.Second)
+	controlConnection, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("connect %s: %w", address, err)
 	}
-	client.logger.Printf("connected to tunnel server %s", address)
+	client.logger.Printf("control connection established to %s", address)
 	client.controlMu.Lock()
-	client.controlConn = connection
+	client.controlConn = controlConnection
 	client.controlMu.Unlock()
 	client.resetConnectionState()
 	client.markControlWrite()
+	connectionContext, cancel := context.WithCancel(ctx)
 	defer func() {
+		cancel()
 		client.controlMu.Lock()
-		if client.controlConn == connection {
+		if client.controlConn == controlConnection {
 			client.controlConn = nil
 		}
+		dataConnection := client.dataConn
+		client.dataConn = nil
 		client.controlMu.Unlock()
 		client.peerMesh.stop()
-		_ = connection.Close()
+		_ = controlConnection.Close()
+		if dataConnection != nil {
+			_ = dataConnection.Close()
+		}
 		client.closeLocalConnections()
 	}()
-
-	connectionContext, cancel := context.WithCancel(ctx)
-	defer cancel()
 	go func() {
 		<-connectionContext.Done()
-		_ = connection.Close()
+		_ = controlConnection.Close()
 	}()
-	go client.heartbeatLoop(connectionContext, connection)
-	go client.tokenRefreshLoop(connectionContext, connection)
+	go client.heartbeatLoop(connectionContext, controlConnection)
+	if err := client.loginConnection(controlConnection, runtime, protocol.ConnectionRoleControl); err != nil {
+		return err
+	}
 
-	body, err := protocol.EncodeLoginRequest(runtime.ClientName, runtime.ClientSessionID, runtime.AccessToken)
+	dataConnection, err := net.DialTimeout("tcp", address, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect dedicated data channel %s: %w", address, err)
+	}
+	client.controlMu.Lock()
+	client.dataConn = dataConnection
+	client.controlMu.Unlock()
+	client.dataLastWriteUnixNano.Store(time.Now().UnixNano())
+	client.logger.Printf("data connection established to %s", address)
+	go func() {
+		<-connectionContext.Done()
+		_ = dataConnection.Close()
+	}()
+	go client.heartbeatLoop(connectionContext, dataConnection)
+	if err := client.loginConnection(dataConnection, runtime, protocol.ConnectionRoleData); err != nil {
+		return err
+	}
+	stopPriorityWriter := client.startPriorityWriter(connectionContext, dataConnection)
+	defer stopPriorityWriter()
+	go client.tokenRefreshLoop(connectionContext, controlConnection)
+
+	errorsOut := make(chan error, 2)
+	go func() {
+		errorsOut <- client.readAuthenticatedLoop(connectionContext, controlConnection, protocol.ConnectionRoleControl)
+	}()
+	go func() {
+		errorsOut <- client.readAuthenticatedLoop(connectionContext, dataConnection, protocol.ConnectionRoleData)
+	}()
+	err = <-errorsOut
+	cancel()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+func (client *Client) loginConnection(connection net.Conn, runtime RuntimeConfig, role string) error {
+	body, err := protocol.EncodeLoginRequest(
+		runtime.ClientName, runtime.ClientSessionID, runtime.AccessToken, role)
 	if err != nil {
 		return err
 	}
 	if err := client.send(connection, protocol.CommandLoginRequest, body); err != nil {
-		return fmt.Errorf("send login request: %w", err)
+		return fmt.Errorf("send %s login request: %w", role, err)
 	}
+	if err := connection.SetReadDeadline(time.Now().Add(controlReadIdleTimeout)); err != nil {
+		client.logger.Printf("set %s read deadline failed: %v", role, err)
+	}
+	packet, err := protocol.ReadPacketLimit(connection, protocol.PreAuthMaxFrameSize())
+	if err != nil {
+		return err
+	}
+	if packet.Command != protocol.CommandLoginResponse {
+		return fmt.Errorf("expected %s login response, received command %d", role, packet.Command)
+	}
+	return client.handlePacket(connection, packet, role)
+}
 
+func (client *Client) readAuthenticatedLoop(ctx context.Context, connection net.Conn, role string) error {
 	for {
 		if err := connection.SetReadDeadline(time.Now().Add(controlReadIdleTimeout)); err != nil {
-			client.logger.Printf("set control read deadline failed: %v", err)
+			client.logger.Printf("set %s read deadline failed: %v", role, err)
 		}
 		packet, err := protocol.ReadPacket(connection)
 		if err != nil {
@@ -284,11 +362,11 @@ func (client *Client) runOnce(ctx context.Context) error {
 			}
 			var netError net.Error
 			if errors.As(err, &netError) && netError.Timeout() {
-				return fmt.Errorf("60秒内未读到数据, 关闭连接: %w", err)
+				return fmt.Errorf("%s connection read idle timeout: %w", role, err)
 			}
 			return err
 		}
-		if err := client.handlePacket(connection, packet); err != nil {
+		if err := client.handlePacket(connection, packet, role); err != nil {
 			return err
 		}
 	}
@@ -311,12 +389,13 @@ func (client *Client) applyRefreshedRuntime(connection net.Conn, runtime Runtime
 	client.runtimeMu.Lock()
 	client.runtime = runtime
 	client.runtimeMu.Unlock()
-	client.syncTunnelConfigs(connection, runtime.TunnelConfigList)
+	client.controlMu.RLock()
+	dataConnection := client.dataConn
+	client.controlMu.RUnlock()
+	if dataConnection != nil {
+		client.syncTunnelConfigs(dataConnection, runtime.TunnelConfigList)
+	}
 	client.syncHTTPTunnelConfigs(runtime.HTTPTunnelConfigList)
-	client.httpRoutesReportedMu.Lock()
-	client.httpRoutesReported = false
-	client.httpRoutesReportedMu.Unlock()
-	client.reportHTTPRoutes(connection)
 	client.peerMesh.start(connection, runtime, client.sendPeerControl)
 }
 
@@ -334,7 +413,7 @@ func (client *Client) heartbeatLoop(ctx context.Context, connection net.Conn) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lastWrite := client.lastWriteUnixNano.Load()
+			lastWrite := client.lastWriteFor(connection).Load()
 			if lastWrite > 0 && time.Since(time.Unix(0, lastWrite)) < controlWriteIdleHeartbeat {
 				continue
 			}
@@ -415,7 +494,7 @@ func tokenRefreshLead(remaining time.Duration) time.Duration {
 	return tenth
 }
 
-func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet) error {
+func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet, role string) error {
 	switch packet.Command {
 	case protocol.CommandLoginResponse:
 		response, err := protocol.DecodeLoginResponse(packet.Body)
@@ -426,12 +505,14 @@ func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet) 
 			return newControlLoginRejectedError(response.Reason)
 		}
 		client.logger.Printf("login succeeded as %q", response.ClientName)
-		if previous := client.resetReconnectBackoff(); previous > 0 {
-			client.logger.Printf("login succeeded, reconnect backoff reset (was attempt %d)", previous)
+		if role == protocol.ConnectionRoleControl {
+			if previous := client.resetReconnectBackoff(); previous > 0 {
+				client.logger.Printf("login succeeded, reconnect backoff reset (was attempt %d)", previous)
+			}
+			client.peerMesh.start(connection, client.currentRuntime(), client.sendPeerControl)
+		} else {
+			client.registerConfiguredTunnels(connection)
 		}
-		client.registerConfiguredTunnels(connection)
-		client.reportHTTPRoutes(connection)
-		client.peerMesh.start(connection, client.currentRuntime(), client.sendPeerControl)
 	case protocol.CommandHeartbeatRequest:
 		return client.send(connection, protocol.CommandHeartbeatResponse, protocol.EncodeHeartbeat())
 	case protocol.CommandHeartbeatResponse:
@@ -441,13 +522,15 @@ func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet) 
 		_ = connection.Close()
 		return nil
 	case protocol.CommandMessageResponse:
+		if role != protocol.ConnectionRoleControl {
+			return errors.New("message packet received on data connection")
+		}
 		return client.handleMessageResponse(connection, packet.Body)
 	case protocol.CommandNatMessage:
+		if role != protocol.ConnectionRoleData {
+			return errors.New("NAT packet received on control connection")
+		}
 		return client.handleNatMessage(connection, packet.Body)
-	case protocol.CommandDirectHTTPRequest:
-		go client.forwardDirectHTTP(connection, packet.Body)
-	case protocol.CommandLegacyHTTPRequest:
-		go client.forwardLegacyHTTP(connection, packet.Body)
 	default:
 		client.logger.Printf("ignored unsupported command %d", packet.Command)
 	}
@@ -478,7 +561,12 @@ func (client *Client) handleMessageResponse(connection net.Conn, body []byte) er
 	if err := json.Unmarshal([]byte(response.Message), &config); err != nil {
 		return fmt.Errorf("decode NAT control config: %w", err)
 	}
-	client.syncTunnelConfigs(connection, config.TunnelConfigList)
+	client.controlMu.RLock()
+	dataConnection := client.dataConn
+	client.controlMu.RUnlock()
+	if dataConnection != nil {
+		client.syncTunnelConfigs(dataConnection, config.TunnelConfigList)
+	}
 	if config.HTTPTunnelConfigList != nil {
 		client.syncHTTPTunnelConfigs(*config.HTTPTunnelConfigList)
 	}
@@ -539,24 +627,91 @@ func (client *Client) currentRuntime() RuntimeConfig {
 }
 
 func (client *Client) send(connection net.Conn, command int8, body []byte) error {
-	client.writeMu.Lock()
-	defer client.writeMu.Unlock()
+	writeMu := client.writeLockFor(connection)
+	writeMu.Lock()
+	defer writeMu.Unlock()
 	if err := protocol.WritePacket(connection, command, body); err != nil {
 		return err
 	}
-	client.markControlWrite()
+	client.lastWriteFor(connection).Store(time.Now().UnixNano())
 	return nil
+}
+
+func (client *Client) writeLockFor(connection net.Conn) *sync.Mutex {
+	client.controlMu.RLock()
+	data := client.dataConn
+	client.controlMu.RUnlock()
+	if data != nil && connection == data {
+		return &client.dataWriteMu
+	}
+	return &client.controlWriteMu
+}
+
+func (client *Client) startPriorityWriter(ctx context.Context, connection net.Conn) func() {
+	writerCtx, cancel := context.WithCancel(ctx)
+	writer := &priorityWriter{
+		connection: connection, ctx: writerCtx, cancel: cancel,
+		queue: make(chan priorityPacket, priorityWriteQueueCapacity),
+	}
+	client.priorityMu.Lock()
+	client.priorityWriter = writer
+	client.priorityMu.Unlock()
+	go func() {
+		for {
+			select {
+			case packet := <-writer.queue:
+				if err := client.send(connection, packet.command, packet.body); err != nil {
+					client.logger.Printf("priority control write failed: %v", err)
+					_ = connection.Close()
+					return
+				}
+			case <-writerCtx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		client.priorityMu.Lock()
+		if client.priorityWriter == writer {
+			client.priorityWriter = nil
+		}
+		client.priorityMu.Unlock()
+	}
+}
+
+func (client *Client) sendPriority(connection net.Conn, command int8, body []byte) error {
+	client.priorityMu.RLock()
+	writer := client.priorityWriter
+	client.priorityMu.RUnlock()
+	if writer == nil || writer.connection != connection {
+		return errors.New("priority control writer is not active")
+	}
+	packet := priorityPacket{command: command, body: append([]byte(nil), body...)}
+	select {
+	case writer.queue <- packet:
+		return nil
+	case <-writer.ctx.Done():
+		return writer.ctx.Err()
+	}
 }
 
 func (client *Client) markControlWrite() {
 	client.lastWriteUnixNano.Store(time.Now().UnixNano())
 }
 
+func (client *Client) lastWriteFor(connection net.Conn) *atomic.Int64 {
+	client.controlMu.RLock()
+	data := client.dataConn
+	client.controlMu.RUnlock()
+	if data != nil && connection == data {
+		return &client.dataLastWriteUnixNano
+	}
+	return &client.lastWriteUnixNano
+}
+
 func (client *Client) resetConnectionState() {
 	client.registeredMu.Lock()
 	defer client.registeredMu.Unlock()
 	client.registered = make(map[int]struct{})
-	client.httpRoutesReportedMu.Lock()
-	client.httpRoutesReported = false
-	client.httpRoutesReportedMu.Unlock()
 }

@@ -23,12 +23,13 @@ type Session interface {
 // Registry maps client name to the currently bound session.
 type Registry struct {
 	mu       sync.Mutex
-	sessions map[string]Session
+	controls map[string]Session
+	data     map[string]Session
 }
 
 // NewRegistry builds an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{sessions: make(map[string]Session)}
+	return &Registry{controls: make(map[string]Session), data: make(map[string]Session)}
 }
 
 // Replace binds session under its client name, returning any previously bound session that
@@ -37,8 +38,21 @@ func (r *Registry) Replace(session Session) (displaced Session) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	name := session.ClientName()
-	previous := r.sessions[name]
-	r.sessions[name] = session
+	previous := r.controls[name]
+	r.controls[name] = session
+	if previous != nil && previous != session {
+		return previous
+	}
+	return nil
+}
+
+// ReplaceData binds the mandatory v2 data connection without displacing the control session.
+func (r *Registry) ReplaceData(session Session) (displaced Session) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name := session.ClientName()
+	previous := r.data[name]
+	r.data[name] = session
 	if previous != nil && previous != session {
 		return previous
 	}
@@ -49,8 +63,11 @@ func (r *Registry) Replace(session Session) (displaced Session) {
 func (r *Registry) Unbind(name string, session Session) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if current, ok := r.sessions[name]; ok && current == session {
-		delete(r.sessions, name)
+	if current, ok := r.controls[name]; ok && current == session {
+		delete(r.controls, name)
+	}
+	if current, ok := r.data[name]; ok && current == session {
+		delete(r.data, name)
 	}
 }
 
@@ -58,7 +75,15 @@ func (r *Registry) Unbind(name string, session Session) {
 func (r *Registry) Find(name string) (Session, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	session, ok := r.sessions[name]
+	session, ok := r.controls[name]
+	return session, ok
+}
+
+// FindData returns the dedicated data connection bound to name.
+func (r *Registry) FindData(name string) (Session, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.data[name]
 	return session, ok
 }
 
@@ -66,7 +91,7 @@ func (r *Registry) Find(name string) (Session, bool) {
 func (r *Registry) IsBound(session Session) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	current, ok := r.sessions[session.ClientName()]
+	current, ok := r.controls[session.ClientName()]
 	return ok && current == session
 }
 
@@ -74,8 +99,8 @@ func (r *Registry) IsBound(session Session) bool {
 func (r *Registry) Names() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	names := make([]string, 0, len(r.sessions))
-	for name := range r.sessions {
+	names := make([]string, 0, len(r.controls))
+	for name := range r.controls {
 		names = append(names, name)
 	}
 	return names

@@ -222,6 +222,16 @@ func NewAuthenticator(db *store.DB, sessions *SessionStore, perMachineUserMaxIns
 // Authenticate runs the full login check sequence and returns the result. The error is
 // non-nil only on infrastructure failures (e.g. database errors), not auth rejections.
 func (a *Authenticator) Authenticate(ctx context.Context, request protocol.LoginRequest) (Result, error) {
+	return a.authenticate(ctx, request, false)
+}
+
+// AuthenticateData verifies the companion data connection without counting it as a second
+// online client instance. The control connection must already have marked the same session online.
+func (a *Authenticator) AuthenticateData(ctx context.Context, request protocol.LoginRequest) (Result, error) {
+	return a.authenticate(ctx, request, true)
+}
+
+func (a *Authenticator) authenticate(ctx context.Context, request protocol.LoginRequest, dataConnection bool) (Result, error) {
 	session, ok := a.sessions.Find(request.ClientSessionID, request.AccessToken)
 	if !ok {
 		return Result{Reason: "客户端访问令牌无效"}, nil
@@ -241,6 +251,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, request protocol.Login
 	if !account.Enabled {
 		return Result{Reason: "客户端已停用", Account: account}, nil
 	}
+	if dataConnection && session.Status != StatusNettyOnline {
+		return Result{Reason: "数据连接要求控制连接先登录", Account: account}, nil
+	}
 	if session.CredentialID > 0 {
 		credential, err := a.db.GetCredential(ctx, session.CredentialID)
 		if err != nil {
@@ -252,16 +265,16 @@ func (a *Authenticator) Authenticate(ctx context.Context, request protocol.Login
 		if !credential.Enabled {
 			return Result{Reason: "客户端凭证已停用", Account: account}, nil
 		}
-		if a.sessions.CountOnlineByMachineUser(session.CredentialID, session.MachineFingerprint, session.OSUser) >=
+		if !dataConnection && a.sessions.CountOnlineByMachineUser(session.CredentialID, session.MachineFingerprint, session.OSUser) >=
 			a.perMachineUserMaxInstances {
 			return Result{Reason: "同一台机器和用户已经有在线实例", Account: account}, nil
 		}
-		if credential.MaxOnlineInstances > 0 &&
+		if !dataConnection && credential.MaxOnlineInstances > 0 &&
 			a.sessions.CountOnlineByCredential(session.CredentialID) >= credential.MaxOnlineInstances {
 			return Result{Reason: "在线实例数已达上限", Account: account}, nil
 		}
 	}
-	if account.ConnectionRateLimitPerMinute > 0 {
+	if !dataConnection && account.ConnectionRateLimitPerMinute > 0 {
 		since := a.now().Add(-time.Minute)
 		count, err := a.db.CountConnectionsSince(ctx, account.ID, since)
 		if err != nil {

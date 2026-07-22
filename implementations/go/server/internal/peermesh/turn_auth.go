@@ -107,6 +107,18 @@ func (s *turnCredentialService) longTermKey(username, credential string) []byte 
 	return digest[:]
 }
 
+func (s *turnCredentialService) peerMeshClientID(username string) int64 {
+	parts := strings.SplitN(strings.TrimSpace(username), ":", 3)
+	if len(parts) != 3 || !strings.HasPrefix(parts[1], "pm-") {
+		return 0
+	}
+	clientID, err := strconv.ParseInt(strings.TrimPrefix(parts[1], "pm-"), 10, 64)
+	if err != nil || clientID <= 0 {
+		return 0
+	}
+	return clientID
+}
+
 func (s *turnCredentialService) secret() []byte {
 	if configured := strings.TrimSpace(s.cfg.TurnSharedSecret); configured != "" {
 		return []byte(configured)

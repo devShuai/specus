@@ -88,6 +88,23 @@ type ClientCredential struct {
 	UpdatedAt          time.Time
 }
 
+// WebSocketTicket stores only a digest of a short-lived, single-use upgrade credential.
+type WebSocketTicket struct {
+	TokenHash         string
+	Scope             string
+	Username          string
+	TenantID          string
+	Admin             bool
+	RoomID            string
+	RoomKey           string
+	PeerID            string
+	DisplayName       string
+	SharedRoom        bool
+	RemoteAddressHash string
+	CreatedAt         time.Time
+	ExpiresAt         time.Time
+}
+
 // ManagementUser mirrors tunnel_management_user.
 type ManagementUser struct {
 	Username     string

@@ -15,7 +15,8 @@ func TestHandleLogoutRequestClosesControlConnection(t *testing.T) {
 	defer remote.Close()
 
 	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
-	if err := tunnelClient.handlePacket(local, protocol.Packet{Command: protocol.CommandLogoutRequest}); err != nil {
+	if err := tunnelClient.handlePacket(local, protocol.Packet{Command: protocol.CommandLogoutRequest},
+		protocol.ConnectionRoleControl); err != nil {
 		t.Fatalf("handlePacket(LOGOUT_REQUEST) error = %v", err)
 	}
 

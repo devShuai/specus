@@ -3,6 +3,7 @@ package peermesh
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -14,19 +15,42 @@ import (
 )
 
 const (
-	stunTurnSoftware    = "shuai-tunnel-standard-stun-turn"
-	turnPermissionTTL   = 300 * time.Second
-	maxRelayBindAttempt = 128
+	stunTurnSoftware           = "shuai-tunnel-standard-stun-turn"
+	turnPermissionTTL          = 300 * time.Second
+	turnChannelTTL             = 600 * time.Second
+	maxRelayBindAttempt        = 128
+	peerProbeMagic             = "shuai-peer-mesh"
+	peerProbeTypeCheck         = "check"
+	peerProbeTypeCheckResponse = "check-response"
+	peerProbeMaxBytes          = 2048
 )
 
+type relayProbe struct {
+	Magic        string `json:"magic"`
+	Type         string `json:"type"`
+	SessionID    int64  `json:"sessionId"`
+	FromClientID int64  `json:"fromClientId"`
+	ToClientID   int64  `json:"toClientId"`
+	Token        string `json:"token"`
+}
+
+type turnChannelBinding struct {
+	Channel   uint16
+	Peer      *net.UDPAddr
+	ExpiresAt time.Time
+}
+
 type relayAllocation struct {
-	ID         string
-	Client     *net.UDPAddr
-	Relay      *net.UDPConn
-	RelayAddr  *net.UDPAddr
-	ExpiresAt  time.Time
-	Closed     bool
-	Permission map[string]time.Time
+	ID               string
+	Client           *net.UDPAddr
+	Relay            *net.UDPConn
+	RelayAddr        *net.UDPAddr
+	ClientID         int64
+	ExpiresAt        time.Time
+	Closed           bool
+	Permission       map[string]time.Time
+	ChannelsByNumber map[uint16]turnChannelBinding
+	ChannelsByPeer   map[string]turnChannelBinding
 }
 
 type stunTurnServer struct {
@@ -35,14 +59,16 @@ type stunTurnServer struct {
 	mu                   sync.Mutex
 	allocations          map[string]*relayAllocation
 	allocationByEndpoint map[string]string
+	allocationByRelay    map[string]string
 	primary              *net.UDPConn
 	alternate            *net.UDPConn
 	relayTasks           chan func()
 }
 
 type turnAuth struct {
-	allowed bool
-	key     []byte
+	allowed  bool
+	key      []byte
+	clientID int64
 }
 
 func (s *Service) RunStunTurn(ctx context.Context) {
@@ -54,6 +80,7 @@ func (s *Service) RunStunTurn(ctx context.Context) {
 		logger:               s.logger,
 		allocations:          make(map[string]*relayAllocation),
 		allocationByEndpoint: make(map[string]string),
+		allocationByRelay:    make(map[string]string),
 	}
 	server.run(ctx)
 }
@@ -124,6 +151,9 @@ func (s *stunTurnServer) receiveLoop(ctx context.Context, conn *net.UDPConn, pro
 }
 
 func (s *stunTurnServer) handle(ctx context.Context, conn *net.UDPConn, probeRole string, payload []byte, remote *net.UDPAddr) error {
+	if looksLikeTurnChannelData(payload) {
+		return s.handleChannelData(ctx, payload, remote)
+	}
 	message, err := parseStunMessage(payload)
 	if err != nil {
 		return nil
@@ -137,6 +167,8 @@ func (s *stunTurnServer) handle(ctx context.Context, conn *net.UDPConn, probeRol
 		return s.refresh(*message, remote)
 	case stunCreatePermissionRequest:
 		return s.createPermission(*message, remote)
+	case stunChannelBindRequest:
+		return s.channelBind(*message, remote)
 	case stunSendIndication:
 		return s.sendIndication(ctx, *message, remote)
 	default:
@@ -166,7 +198,7 @@ func (s *stunTurnServer) allocateRequest(ctx context.Context, request stunMessag
 	if !request.requestedUDPTransport() {
 		return s.sendError(s.primary, remote, request, stunAllocateError, 442, "unsupported-transport")
 	}
-	allocation, err := s.allocate(ctx, remote)
+	allocation, err := s.allocateForClient(ctx, remote, auth.clientID)
 	if err != nil {
 		return s.sendError(s.primary, remote, request, stunAllocateError, 508, "insufficient-capacity")
 	}
@@ -179,11 +211,15 @@ func (s *stunTurnServer) allocateRequest(ctx context.Context, request stunMessag
 }
 
 func (s *stunTurnServer) allocate(ctx context.Context, remote *net.UDPAddr) (*relayAllocation, error) {
+	return s.allocateForClient(ctx, remote, 0)
+}
+
+func (s *stunTurnServer) allocateForClient(ctx context.Context, remote *net.UDPAddr, clientID int64) (*relayAllocation, error) {
 	var stale *relayAllocation
 	s.mu.Lock()
 	if id, ok := s.allocationByEndpoint[endpointKey(remote)]; ok {
 		if existing := s.allocations[id]; existing != nil && !existing.Closed {
-			if time.Now().Before(existing.ExpiresAt) {
+			if time.Now().Before(existing.ExpiresAt) && existing.ClientID == clientID {
 				existing.Client = cloneUDPAddr(remote)
 				existing.ExpiresAt = time.Now().Add(time.Duration(s.service.cfg.AllocationTTLSeconds) * time.Second)
 				s.mu.Unlock()
@@ -193,6 +229,7 @@ func (s *stunTurnServer) allocate(ctx context.Context, remote *net.UDPAddr) (*re
 			existing.Closed = true
 			delete(s.allocations, existing.ID)
 			delete(s.allocationByEndpoint, endpointKey(existing.Client))
+			delete(s.allocationByRelay, endpointKey(existing.RelayAddr))
 		}
 	}
 	s.mu.Unlock()
@@ -205,16 +242,23 @@ func (s *stunTurnServer) allocate(ctx context.Context, remote *net.UDPAddr) (*re
 		return nil, err
 	}
 	allocation := &relayAllocation{
-		ID:         randomSuffix(),
-		Client:     cloneUDPAddr(remote),
-		Relay:      relay,
-		RelayAddr:  s.advertisedSocketAddress(relay),
-		ExpiresAt:  time.Now().Add(time.Duration(s.service.cfg.AllocationTTLSeconds) * time.Second),
-		Permission: make(map[string]time.Time),
+		ID:               randomSuffix(),
+		Client:           cloneUDPAddr(remote),
+		Relay:            relay,
+		RelayAddr:        s.advertisedSocketAddress(relay),
+		ClientID:         clientID,
+		ExpiresAt:        time.Now().Add(time.Duration(s.service.cfg.AllocationTTLSeconds) * time.Second),
+		Permission:       make(map[string]time.Time),
+		ChannelsByNumber: make(map[uint16]turnChannelBinding),
+		ChannelsByPeer:   make(map[string]turnChannelBinding),
 	}
 	s.mu.Lock()
 	s.allocations[allocation.ID] = allocation
 	s.allocationByEndpoint[endpointKey(remote)] = allocation.ID
+	if s.allocationByRelay == nil {
+		s.allocationByRelay = make(map[string]string)
+	}
+	s.allocationByRelay[endpointKey(allocation.RelayAddr)] = allocation.ID
 	s.mu.Unlock()
 
 	go s.relayReceiveLoop(ctx, allocation)
@@ -246,7 +290,7 @@ func (s *stunTurnServer) refresh(request stunMessage, remote *net.UDPAddr) error
 		return nil
 	}
 	allocation := s.allocationForRemote(remote)
-	if allocation == nil {
+	if allocation == nil || allocation.ClientID != auth.clientID {
 		return s.sendError(s.primary, remote, request, stunRefreshError, 437, "allocation-mismatch")
 	}
 	lifetime := request.lifetimeSeconds(s.service.cfg.AllocationTTLSeconds)
@@ -271,7 +315,7 @@ func (s *stunTurnServer) createPermission(request stunMessage, remote *net.UDPAd
 		return nil
 	}
 	allocation := s.allocationForRemote(remote)
-	if allocation == nil {
+	if allocation == nil || allocation.ClientID != auth.clientID {
 		return s.sendError(s.primary, remote, request, stunCreatePermissionError, 437, "allocation-mismatch")
 	}
 	expires := time.Now().Add(turnPermissionTTL)
@@ -284,6 +328,40 @@ func (s *stunTurnServer) createPermission(request stunMessage, remote *net.UDPAd
 	}
 	s.mu.Unlock()
 	response := newStunMessage(stunCreatePermissionSuccess, request.TransactionID, stunAttrSoftwareValue(stunTurnSoftware))
+	return s.sendStunWithIntegrity(s.primary, remote, response, auth.key)
+}
+
+func (s *stunTurnServer) channelBind(request stunMessage, remote *net.UDPAddr) error {
+	auth := s.authenticate(request, remote, stunChannelBindError)
+	if !auth.allowed {
+		return nil
+	}
+	allocation := s.allocationForRemote(remote)
+	if allocation == nil || allocation.ClientID != auth.clientID {
+		return s.sendError(s.primary, remote, request, stunChannelBindError, 437, "allocation-mismatch")
+	}
+	channel, okChannel := request.channelNumber()
+	peer, okPeer := request.xorPeerAddress()
+	if !okChannel || !okPeer {
+		return s.sendError(s.primary, remote, request, stunChannelBindError, 400, "invalid-channel-bind")
+	}
+	now := time.Now()
+	binding := turnChannelBinding{Channel: channel, Peer: cloneUDPAddr(peer), ExpiresAt: now.Add(turnChannelTTL)}
+	s.mu.Lock()
+	if occupied, ok := allocation.ChannelsByNumber[channel]; ok && occupied.ExpiresAt.After(now) &&
+		!sameUDPEndpoint(occupied.Peer, peer) {
+		s.mu.Unlock()
+		return s.sendError(s.primary, remote, request, stunChannelBindError, 400, "channel-in-use")
+	}
+	peerKey := endpointKey(peer)
+	if previous, ok := allocation.ChannelsByPeer[peerKey]; ok && previous.Channel != channel {
+		delete(allocation.ChannelsByNumber, previous.Channel)
+	}
+	allocation.ChannelsByNumber[channel] = binding
+	allocation.ChannelsByPeer[peerKey] = binding
+	allocation.Permission[permissionKey(peer)] = now.Add(turnPermissionTTL)
+	s.mu.Unlock()
+	response := newStunMessage(stunChannelBindSuccess, request.TransactionID, stunAttrSoftwareValue(stunTurnSoftware))
 	return s.sendStunWithIntegrity(s.primary, remote, response, auth.key)
 }
 
@@ -313,7 +391,7 @@ func (s *stunTurnServer) authenticate(request stunMessage, remote *net.UDPAddr, 
 		_ = s.sendTurnAuthError(remote, request, responseType, 401, "bad-message-integrity")
 		return turnAuth{}
 	}
-	return turnAuth{allowed: true, key: key}
+	return turnAuth{allowed: true, key: key, clientID: credentials.peerMeshClientID(username)}
 }
 
 func (s *stunTurnServer) sendTurnAuthError(remote *net.UDPAddr, request stunMessage, typ uint16, code int, reason string) error {
@@ -338,11 +416,57 @@ func (s *stunTurnServer) sendIndication(ctx context.Context, indication stunMess
 	if !ok {
 		return nil
 	}
-	if header, ok := ParseDataFrameHeader(payload); ok && !s.service.AuthorizeRelayFrame(ctx, header, int64(len(payload))) {
+	target := s.allocationForRelayEndpoint(peer)
+	if !s.authorizeRelayPayload(ctx, payload, allocation, target, true) {
 		return nil
 	}
 	_, err := allocation.Relay.WriteToUDP(payload, peer)
 	return err
+}
+
+func (s *stunTurnServer) handleChannelData(ctx context.Context, packet []byte, remote *net.UDPAddr) error {
+	frame, err := parseTurnChannelData(packet)
+	if err != nil {
+		return nil
+	}
+	allocation := s.allocationForRemote(remote)
+	if allocation == nil {
+		return nil
+	}
+	now := time.Now()
+	s.mu.Lock()
+	binding, ok := allocation.ChannelsByNumber[frame.Channel]
+	s.mu.Unlock()
+	target := s.allocationForRelayEndpoint(binding.Peer)
+	if !ok || !binding.ExpiresAt.After(now) || !s.hasPermission(allocation, binding.Peer) ||
+		!s.authorizeRelayPayload(ctx, frame.Payload, allocation, target, true) {
+		return nil
+	}
+	_, err = allocation.Relay.WriteToUDP(frame.Payload, binding.Peer)
+	return err
+}
+
+func (s *stunTurnServer) authorizeRelayPayload(ctx context.Context, payload []byte,
+	source, target *relayAllocation, account bool) bool {
+	if source == nil || target == nil || source.ClientID <= 0 || target.ClientID <= 0 {
+		return false
+	}
+	if header, ok := ParseDataFrameHeader(payload); ok {
+		if account {
+			return s.service.AuthorizeRelayFrame(
+				ctx, header, source.ClientID, target.ClientID, int64(len(payload)))
+		}
+		return s.service.ValidateRelayFrame(ctx, header, source.ClientID, target.ClientID)
+	}
+	if len(payload) < 2 || len(payload) > peerProbeMaxBytes || payload[0] != '{' || payload[len(payload)-1] != '}' {
+		return false
+	}
+	var probe relayProbe
+	if err := json.Unmarshal(payload, &probe); err != nil || probe.Magic != peerProbeMagic ||
+		probe.FromClientID != source.ClientID || probe.ToClientID != target.ClientID {
+		return false
+	}
+	return s.service.AuthorizeRelayProbe(ctx, probe)
 }
 
 func (s *stunTurnServer) relayReceiveLoop(ctx context.Context, allocation *relayAllocation) {
@@ -359,12 +483,30 @@ func (s *stunTurnServer) relayReceiveLoop(ctx context.Context, allocation *relay
 			continue
 		}
 		payload := append([]byte(nil), buf[:n]...)
-		_ = s.dispatchDataIndication(allocation, peer, payload)
+		source := s.allocationForRelayEndpoint(peer)
+		if !s.authorizeRelayPayload(ctx, payload, source, allocation, false) {
+			continue
+		}
+		_ = s.dispatchRelayPayload(allocation, peer, payload)
 	}
 }
 
-func (s *stunTurnServer) dispatchDataIndication(allocation *relayAllocation, peer *net.UDPAddr, payload []byte) error {
+func (s *stunTurnServer) dispatchRelayPayload(allocation *relayAllocation, peer *net.UDPAddr, payload []byte) error {
 	task := func() {
+		now := time.Now()
+		s.mu.Lock()
+		binding, ok := allocation.ChannelsByPeer[endpointKey(peer)]
+		s.mu.Unlock()
+		if ok && binding.ExpiresAt.After(now) {
+			packet, err := encodeTurnChannelData(binding.Channel, payload)
+			if err == nil {
+				_, err = s.primary.WriteToUDP(packet, allocation.Client)
+			}
+			if err != nil {
+				s.logger.Debug("[peer-mesh] TURN ChannelData failed", "err", err)
+			}
+			return
+		}
 		tx := newStunTransactionID()
 		message := newStunMessage(stunDataIndication, tx,
 			newStunAttrXorPeerAddress(peer, tx),
@@ -397,6 +539,7 @@ func (s *stunTurnServer) allocationForRemote(remote *net.UDPAddr) *relayAllocati
 		allocation.Closed = true
 		delete(s.allocations, allocation.ID)
 		delete(s.allocationByEndpoint, endpointKey(allocation.Client))
+		delete(s.allocationByRelay, endpointKey(allocation.RelayAddr))
 		s.mu.Unlock()
 		if allocation.Relay != nil {
 			_ = allocation.Relay.Close()
@@ -406,6 +549,27 @@ func (s *stunTurnServer) allocationForRemote(remote *net.UDPAddr) *relayAllocati
 	allocation.Client = cloneUDPAddr(remote)
 	s.mu.Unlock()
 	return allocation
+}
+
+func (s *stunTurnServer) allocationForRelayEndpoint(remote *net.UDPAddr) *relayAllocation {
+	if remote == nil {
+		return nil
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id := s.allocationByRelay[endpointKey(remote)]; id != "" {
+		if allocation := s.allocations[id]; allocation != nil && !allocation.Closed && now.Before(allocation.ExpiresAt) {
+			return allocation
+		}
+	}
+	for _, allocation := range s.allocations {
+		if allocation != nil && allocation.RelayAddr != nil && allocation.RelayAddr.Port == remote.Port &&
+			!allocation.Closed && now.Before(allocation.ExpiresAt) {
+			return allocation
+		}
+	}
+	return nil
 }
 
 func (s *stunTurnServer) hasPermission(allocation *relayAllocation, peer *net.UDPAddr) bool {
@@ -450,6 +614,8 @@ func errorType(requestType uint16) uint16 {
 		return stunRefreshError
 	case stunCreatePermissionRequest:
 		return stunCreatePermissionError
+	case stunChannelBindRequest:
+		return stunChannelBindError
 	default:
 		return stunBindingError
 	}
@@ -476,6 +642,12 @@ func (s *stunTurnServer) cleanupExpired() {
 		for key, expires := range allocation.Permission {
 			if now.After(expires) {
 				delete(allocation.Permission, key)
+			}
+		}
+		for channel, binding := range allocation.ChannelsByNumber {
+			if now.After(binding.ExpiresAt) {
+				delete(allocation.ChannelsByNumber, channel)
+				delete(allocation.ChannelsByPeer, endpointKey(binding.Peer))
 			}
 		}
 		if now.After(allocation.ExpiresAt) {
@@ -512,6 +684,7 @@ func (s *stunTurnServer) closeAllocation(allocation *relayAllocation) {
 	allocation.Closed = true
 	delete(s.allocations, allocation.ID)
 	delete(s.allocationByEndpoint, endpointKey(allocation.Client))
+	delete(s.allocationByRelay, endpointKey(allocation.RelayAddr))
 	s.mu.Unlock()
 	if allocation.Relay != nil {
 		_ = allocation.Relay.Close()
@@ -607,6 +780,10 @@ func permissionKey(remote *net.UDPAddr) string {
 		return ""
 	}
 	return remote.IP.String()
+}
+
+func sameUDPEndpoint(left, right *net.UDPAddr) bool {
+	return left != nil && right != nil && left.Port == right.Port && left.IP.Equal(right.IP)
 }
 
 func cloneUDPAddr(remote *net.UDPAddr) *net.UDPAddr {

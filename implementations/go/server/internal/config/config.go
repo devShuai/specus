@@ -239,12 +239,18 @@ type ObjectStorageConfig struct {
 
 // PublicTransferConfig mirrors tunnel.public-transfer abuse-protection limits.
 type PublicTransferConfig struct {
-	PresignRateLimitPerIP                  int   `json:"presignRateLimitPerIp"`
-	PresignRateLimitWindowSeconds          int64 `json:"presignRateLimitWindowSeconds"`
-	MaxPendingUploadsPerRoom               int   `json:"maxPendingUploadsPerRoom"`
-	MaxDiscoveryPeersPerRoom               int   `json:"maxDiscoveryPeersPerRoom"`
-	DiscoveryMessageRateLimitPerConnection int   `json:"discoveryMessageRateLimitPerConnection"`
-	DiscoveryMessageRateLimitWindowSeconds int64 `json:"discoveryMessageRateLimitWindowSeconds"`
+	PresignRateLimitPerIP                  int    `json:"presignRateLimitPerIp"`
+	PresignRateLimitWindowSeconds          int64  `json:"presignRateLimitWindowSeconds"`
+	MaxPendingUploadsPerRoom               int    `json:"maxPendingUploadsPerRoom"`
+	MaxDiscoveryPeersPerRoom               int    `json:"maxDiscoveryPeersPerRoom"`
+	DiscoveryMessageRateLimitPerConnection int    `json:"discoveryMessageRateLimitPerConnection"`
+	DiscoveryMessageRateLimitWindowSeconds int64  `json:"discoveryMessageRateLimitWindowSeconds"`
+	ClusterEnabled                         bool   `json:"clusterEnabled"`
+	RedisURI                               string `json:"redisUri"`
+	RedisKeyPrefix                         string `json:"redisKeyPrefix"`
+	PresenceLeaseSeconds                   int64  `json:"presenceLeaseSeconds"`
+	PresenceRefreshIntervalMs              int64  `json:"presenceRefreshIntervalMs"`
+	RedisCommandTimeoutMs                  int64  `json:"redisCommandTimeoutMs"`
 }
 
 // OidcConfig mirrors Tunnel:Oidc.
@@ -375,6 +381,10 @@ func Default() Config {
 			MaxDiscoveryPeersPerRoom:               32,
 			DiscoveryMessageRateLimitPerConnection: 360,
 			DiscoveryMessageRateLimitWindowSeconds: 60,
+			RedisKeyPrefix:                         "shuai-tunnel:v2:public-transfer",
+			PresenceLeaseSeconds:                   30,
+			PresenceRefreshIntervalMs:              10000,
+			RedisCommandTimeoutMs:                  2000,
 		},
 		Oidc: OidcConfig{
 			Issuer:                "https://gateway.toys.theshuai.com/auth",
@@ -409,6 +419,13 @@ func Load(path string) (Config, error) {
 	cfg.applyEnv(environMap())
 	if cfg.Netty.MaxFrameSize < 11 {
 		return Config{}, fmt.Errorf("netty.maxFrameSize must be at least the 11-byte frame header")
+	}
+	if cfg.PublicTransfer.ClusterEnabled && strings.TrimSpace(cfg.PublicTransfer.RedisURI) == "" {
+		return Config{}, fmt.Errorf("publicTransfer.redisUri is required when clusterEnabled=true")
+	}
+	if cfg.PublicTransfer.ClusterEnabled && (cfg.PublicTransfer.PresenceRefreshIntervalMs <= 0 ||
+		cfg.PublicTransfer.PresenceRefreshIntervalMs*2 >= cfg.PublicTransfer.PresenceLeaseSeconds*1000) {
+		return Config{}, fmt.Errorf("publicTransfer presence refresh must be positive and less than half the lease TTL")
 	}
 	return cfg, nil
 }
@@ -589,6 +606,12 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt("TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", &cfg.PublicTransfer.MaxDiscoveryPeersPerRoom)
 	setInt("TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION", &cfg.PublicTransfer.DiscoveryMessageRateLimitPerConnection)
 	setInt64("TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS", &cfg.PublicTransfer.DiscoveryMessageRateLimitWindowSeconds)
+	setBool("TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED", &cfg.PublicTransfer.ClusterEnabled)
+	setStr("TUNNEL_PUBLIC_TRANSFER_REDIS_URI", &cfg.PublicTransfer.RedisURI)
+	setStr("TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", &cfg.PublicTransfer.RedisKeyPrefix)
+	setInt64("TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", &cfg.PublicTransfer.PresenceLeaseSeconds)
+	setInt64("TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", &cfg.PublicTransfer.PresenceRefreshIntervalMs)
+	setInt64("TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", &cfg.PublicTransfer.RedisCommandTimeoutMs)
 
 	setStr("TUNNEL_OIDC_ISSUER", &cfg.Oidc.Issuer)
 	setStr("TUNNEL_OIDC_JWK_SET_URI", &cfg.Oidc.JwkSetURI)

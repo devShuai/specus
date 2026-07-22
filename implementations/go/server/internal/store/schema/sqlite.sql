@@ -28,6 +28,34 @@ CREATE TABLE IF NOT EXISTS tunnel_client_credential (
 CREATE INDEX IF NOT EXISTS idx_client_credential_tenant ON tunnel_client_credential (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_client_credential_owner ON tunnel_client_credential (tenant_id, owner_username);
 
+CREATE TABLE IF NOT EXISTS tunnel_client_auth_nonce (
+  api_key_hash TEXT NOT NULL,
+  nonce_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (api_key_hash, nonce_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expiry ON tunnel_client_auth_nonce (expires_at);
+
+CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
+  token_hash TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  username TEXT,
+  tenant_id TEXT,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  room_id TEXT,
+  room_key TEXT,
+  peer_id TEXT,
+  display_name TEXT,
+  shared_room INTEGER NOT NULL DEFAULT 0,
+  remote_address_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_websocket_ticket_expiry ON tunnel_websocket_ticket (expires_at);
+
 CREATE TABLE IF NOT EXISTS tunnel_client_identity (
   id INTEGER PRIMARY KEY,
   tenant_id TEXT NOT NULL,

@@ -78,6 +78,7 @@ func dialAndLogin(t *testing.T, app *App, port int, clientName string) (net.Conn
 		ClientName:      clientName,
 		ClientSessionID: session.ID,
 		AccessToken:     session.AccessToken,
+		ConnectionRole:  protocol.ConnectionRoleControl,
 	}
 	if err := protocol.WritePacket(conn, login); err != nil {
 		t.Fatalf("write login: %v", err)
@@ -114,8 +115,15 @@ func TestLoginSuccessAndHeartbeat(t *testing.T) {
 	if err := protocol.WritePacket(conn, protocol.HeartbeatRequest{}); err != nil {
 		t.Fatalf("write heartbeat: %v", err)
 	}
-	if _, ok := readPacket(t, reader).(protocol.HeartbeatResponse); !ok {
-		t.Fatal("expected HeartbeatResponse")
+	heartbeatReceived := false
+	for range 8 {
+		if _, ok := readPacket(t, reader).(protocol.HeartbeatResponse); ok {
+			heartbeatReceived = true
+			break
+		}
+	}
+	if !heartbeatReceived {
+		t.Fatal("expected HeartbeatResponse after asynchronous login pushes")
 	}
 
 	// A successful connection record should exist.
@@ -141,6 +149,7 @@ func TestLoginRejectsBadAccessToken(t *testing.T) {
 		ClientName:      DemoClientName,
 		ClientSessionID: 12345,
 		AccessToken:     "invalid",
+		ConnectionRole:  protocol.ConnectionRoleControl,
 	}
 	if err := protocol.WritePacket(conn, login); err != nil {
 		t.Fatalf("write login: %v", err)

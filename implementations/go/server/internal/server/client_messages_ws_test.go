@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -72,8 +71,7 @@ func TestClientMessagesWebSocketUsesCapabilitiesAndRoutesBothDirections(t *testi
 	fake := &messageTestSession{name: account.ClientName, sent: make(chan protocol.Packet, 1)}
 	app.sessions.Replace(fake)
 
-	token := adminToken(t, ts)
-	wsURL := "ws" + ts.URL[len("http"):] + "/ws/client-messages?token=" + url.QueryEscape(token)
+	wsURL := adminWebSocketURL(t, ts, "client-messages")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
@@ -101,9 +99,9 @@ func TestClientMessagesWebSocketUsesCapabilitiesAndRoutesBothDirections(t *testi
 	case <-time.After(3 * time.Second):
 		t.Fatal("admin message was not routed to the client")
 	}
-	sent := readClientMessageJSON(t, conn)
-	if sent["type"] != "sent" || sent["messageId"] != "m1" {
-		t.Fatalf("sent = %#v", sent)
+	written := readClientMessageJSON(t, conn)
+	if written["type"] != "written" || written["messageId"] != "m1" {
+		t.Fatalf("written = %#v", written)
 	}
 
 	if !app.clientMessages.deliverFromClient(*account, "admin:admin", "hello admin") {
@@ -136,19 +134,19 @@ func TestClientMessagesTargetAccessUsesCaseSensitiveTenantAndOwner(t *testing.T)
 	}
 }
 
-func TestClientMessagesWebSocketRejectsInvalidTokenWithReason(t *testing.T) {
+func TestClientMessagesWebSocketRejectsLegacyTokenQueryWithReason(t *testing.T) {
 	_, ts := newAPIServer(t)
 	response, err := http.Get(ts.URL + "/ws/client-messages?token=invalid")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusForbidden || response.Header.Get("X-Auth-Reason") != "invalid token" {
+	if response.StatusCode != http.StatusForbidden || response.Header.Get("X-Auth-Reason") != "missing ticket" {
 		t.Fatalf("status/header = %d/%q", response.StatusCode, response.Header.Get("X-Auth-Reason"))
 	}
 }
 
-func TestClientMessagesSentAckDoesNotWaitForAsynchronousControlWrite(t *testing.T) {
+func TestClientMessagesReportsWriteFailureWithoutBlockingWebSocket(t *testing.T) {
 	app, ts := newAPIServer(t)
 	account, err := app.db.FindClientByName(context.Background(), DemoClientName)
 	if err != nil || account == nil {
@@ -164,7 +162,7 @@ func TestClientMessagesSentAckDoesNotWaitForAsynchronousControlWrite(t *testing.
 	}); err != nil {
 		t.Fatalf("insert client session: %v", err)
 	}
-	release := make(chan struct{})
+	release := make(chan struct{}, 1)
 	defer close(release)
 	started := make(chan struct{}, 1)
 	app.sessions.Replace(&messageTestSession{
@@ -174,7 +172,7 @@ func TestClientMessagesSentAckDoesNotWaitForAsynchronousControlWrite(t *testing.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	wsURL := "ws" + ts.URL[len("http"):] + "/ws/client-messages?token=" + url.QueryEscape(adminToken(t, ts))
+	wsURL := adminWebSocketURL(t, ts, "client-messages")
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -190,32 +188,38 @@ func TestClientMessagesSentAckDoesNotWaitForAsynchronousControlWrite(t *testing.
 	case <-ctx.Done():
 		t.Fatal("asynchronous control write did not start")
 	}
-	ack := readClientMessageJSON(t, conn)
-	if ack["type"] != "sent" || ack["messageId"] != "async-1" {
-		t.Fatalf("sent ACK = %#v", ack)
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"noop"}`)); err != nil {
+		t.Fatal(err)
+	}
+	next := readClientMessageJSON(t, conn)
+	if next["type"] != "error" || next["error"] != "unsupported-type" {
+		t.Fatalf("next command response = %#v", next)
+	}
+	release <- struct{}{}
+	failed := readClientMessageJSON(t, conn)
+	if failed["type"] != "failed" || failed["messageId"] != "async-1" || failed["error"] != "target-write-failed" {
+		t.Fatalf("failed status = %#v", failed)
 	}
 }
 
-func TestClientMessagesWebSocketRejectsMissingTokenWithReason(t *testing.T) {
+func TestClientMessagesWebSocketRejectsMissingTicketWithReason(t *testing.T) {
 	_, ts := newAPIServer(t)
 	response, err := http.Get(ts.URL + "/ws/client-messages")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusForbidden || response.Header.Get("X-Auth-Reason") != "missing token" {
+	if response.StatusCode != http.StatusForbidden || response.Header.Get("X-Auth-Reason") != "missing ticket" {
 		t.Fatalf("status/header = %d/%q", response.StatusCode, response.Header.Get("X-Auth-Reason"))
 	}
 }
 
-func TestClientMessagesWebSocketSupportsBearerHeaderAndJavaUTF16Limit(t *testing.T) {
+func TestClientMessagesWebSocketUsesTicketAndJavaUTF16Limit(t *testing.T) {
 	_, ts := newAPIServer(t)
-	wsURL := "ws" + ts.URL[len("http"):] + "/ws/client-messages"
+	wsURL := adminWebSocketURL(t, ts, "client-messages")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + adminToken(t, ts)}},
-	})
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		t.Fatalf("dial with bearer header: %v", err)
 	}
@@ -237,7 +241,7 @@ func TestClientMessagesWebSocketSupportsBearerHeaderAndJavaUTF16Limit(t *testing
 
 func TestClientMessagesWebSocketClosesOnBinaryMessageLikeJava(t *testing.T) {
 	_, ts := newAPIServer(t)
-	wsURL := "ws" + ts.URL[len("http"):] + "/ws/client-messages?token=" + url.QueryEscape(adminToken(t, ts))
+	wsURL := adminWebSocketURL(t, ts, "client-messages")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)

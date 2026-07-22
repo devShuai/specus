@@ -14,7 +14,11 @@ import (
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
-const externalReadBuffer = 16 * 1024
+const (
+	externalReadBuffer    = 16 * 1024
+	natInitialWindowBytes = 1024 * 1024
+	natMaximumWindowBytes = 16 * 1024 * 1024
+)
 
 // DetailRecorder optionally persists full TCP frame details.
 type DetailRecorder interface {
@@ -34,17 +38,46 @@ type Coordinator struct {
 
 	mu       sync.Mutex
 	sessions map[*control.Conn]*clientSession
+	byName   map[string]*clientSession
 }
 
 // NewCoordinator builds the NAT coordinator.
 func NewCoordinator(manager *RemotePortManager, traffic *TrafficService, detail DetailRecorder,
 	detailOpts store.TrafficDetailOptions, limits Limits, logger *slog.Logger) *Coordinator {
 	return &Coordinator{manager: manager, traffic: traffic, detail: detail, detailOpts: detailOpts,
-		limits: limits, logger: logger, sessions: make(map[*control.Conn]*clientSession)}
+		limits: limits, logger: logger, sessions: make(map[*control.Conn]*clientSession),
+		byName: make(map[string]*clientSession)}
+}
+
+// Attach creates the per-client stream namespace immediately after authentication.
+func (c *Coordinator) Attach(conn *control.Conn) {
+	if conn == nil || conn.ClientName() == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.sessions[conn]; exists {
+		return
+	}
+	session := newClientSession(conn, c.manager, c.traffic, c.detail, c.detailOpts, c.limits, c.logger)
+	c.sessions[conn] = session
+	c.byName[conn.ClientName()] = session
+}
+
+// OpenHTTPStream allocates one stream in the authenticated client's NAT v2 namespace.
+func (c *Coordinator) OpenHTTPStream(clientName string, metadata map[string]any) (*HTTPStream, error) {
+	c.mu.Lock()
+	session := c.byName[clientName]
+	c.mu.Unlock()
+	if session == nil {
+		return nil, fmt.Errorf("client is offline: %s", clientName)
+	}
+	return session.openHTTPStream(metadata)
 }
 
 // Handle processes one NAT message for a control connection.
 func (c *Coordinator) Handle(conn *control.Conn, message protocol.NatMessage) error {
+	c.Attach(conn)
 	c.mu.Lock()
 	session, ok := c.sessions[conn]
 	if !ok {
@@ -61,6 +94,9 @@ func (c *Coordinator) Close(conn *control.Conn) {
 	session, ok := c.sessions[conn]
 	if ok {
 		delete(c.sessions, conn)
+		if c.byName[conn.ClientName()] == session {
+			delete(c.byName, conn.ClientName())
+		}
 	}
 	c.mu.Unlock()
 	if ok {
@@ -79,7 +115,9 @@ type clientSession struct {
 
 	mu             sync.Mutex
 	bindings       map[int]*portListener
-	externals      map[string]*externalConn
+	externals      map[uint32]*externalConn
+	httpStreams    map[uint32]*HTTPStream
+	nextStreamID   uint32
 	activeExternal int
 	portCounts     map[int]int
 	registered     bool
@@ -90,16 +128,18 @@ type clientSession struct {
 func newClientSession(conn *control.Conn, manager *RemotePortManager, traffic *TrafficService,
 	detail DetailRecorder, detailOpts store.TrafficDetailOptions, limits Limits, logger *slog.Logger) *clientSession {
 	session := &clientSession{
-		conn:       conn,
-		manager:    manager,
-		traffic:    traffic,
-		detail:     detail,
-		detailOpts: detailOpts,
-		limits:     limits,
-		logger:     logger,
-		bindings:   make(map[int]*portListener),
-		externals:  make(map[string]*externalConn),
-		portCounts: make(map[int]int),
+		conn:         conn,
+		manager:      manager,
+		traffic:      traffic,
+		detail:       detail,
+		detailOpts:   detailOpts,
+		limits:       limits,
+		logger:       logger,
+		bindings:     make(map[int]*portListener),
+		externals:    make(map[uint32]*externalConn),
+		httpStreams:  make(map[uint32]*HTTPStream),
+		nextStreamID: 1,
+		portCounts:   make(map[int]int),
 	}
 	session.controlBackpressureUnsubscribe = conn.WriteBackpressure.AddListener(func(bool) {
 		session.updateExternalReadsForControlWritability()
@@ -115,20 +155,33 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 	case protocol.NatUnregister:
 		s.handleUnregister(message)
 		return nil
-	case protocol.NatKeepalive, protocol.NatHTTPRoutesReport:
+	case protocol.NatKeepalive:
 		return nil
 	case protocol.NatData:
+		if s.handleHTTPData(message) {
+			return nil
+		}
 		if !s.isRegistered() {
 			return s.protocolViolation()
 		}
 		s.handleData(message)
 		return nil
-	case protocol.NatDisconnected:
+	case protocol.NatFin, protocol.NatRST:
+		if s.handleHTTPEnd(message) {
+			return nil
+		}
 		if !s.isRegistered() {
 			return s.protocolViolation()
 		}
-		s.handleClientDisconnect(message)
+		s.handleClientClose(message)
 		return nil
+	case protocol.NatWindowUpdate:
+		return s.handleWindowUpdate(message)
+	case protocol.NatOpen:
+		if s.handleHTTPResponseOpen(message) {
+			return nil
+		}
+		return s.protocolViolation()
 	default:
 		return s.protocolViolation()
 	}
@@ -213,12 +266,8 @@ func (s *clientSession) handleData(message protocol.NatMessage) {
 	if len(message.Data) == 0 {
 		return
 	}
-	channelID := asString(message.Metadata, "channelId")
-	if channelID == "" {
-		return
-	}
 	s.mu.Lock()
-	external := s.externals[channelID]
+	external := s.externals[message.StreamID]
 	s.mu.Unlock()
 	if external == nil {
 		return
@@ -226,23 +275,129 @@ func (s *clientSession) handleData(message protocol.NatMessage) {
 	if external.write(message.Data) {
 		s.traffic.RecordTCPUpload(s.conn.ClientName(), external.port, int64(len(message.Data)))
 		s.recordTCPFrame(protocol.NatData, external, message.Data, store.TCPDirectionClientToPublic)
+		_ = s.conn.SendPriority(protocol.NatMessage{
+			Type: protocol.NatWindowUpdate, StreamID: message.StreamID, Value: uint32(len(message.Data)),
+		})
+		if message.Flags&protocol.NatFlagEndStream != 0 {
+			s.finishClientDirection(external)
+		}
 	}
 }
 
-func (s *clientSession) handleClientDisconnect(message protocol.NatMessage) {
-	channelID := asString(message.Metadata, "channelId")
-	if channelID == "" {
+func (s *clientSession) handleClientClose(message protocol.NatMessage) {
+	s.mu.Lock()
+	external := s.externals[message.StreamID]
+	s.mu.Unlock()
+	if external == nil {
 		return
 	}
+	if message.Type == protocol.NatRST {
+		s.cleanupExternal(external)
+		return
+	}
+	s.finishClientDirection(external)
+}
+
+func (s *clientSession) finishClientDirection(external *externalConn) {
+	external.shutdownWrite()
+	if external.markClientFinished() {
+		s.cleanupExternal(external)
+	}
+}
+
+func (s *clientSession) handleWindowUpdate(message protocol.NatMessage) error {
 	s.mu.Lock()
-	external := s.externals[channelID]
-	delete(s.externals, channelID)
+	httpStream := s.httpStreams[message.StreamID]
+	external := s.externals[message.StreamID]
 	s.mu.Unlock()
-	if external != nil {
-		external.stopBackpressureListener()
-		external.close()
-		s.releaseTCPStream(channelID)
-		s.updateControlReadForWritability()
+	if httpStream != nil {
+		if !httpStream.addSendCredit(message.Value) {
+			return s.protocolViolation()
+		}
+		return nil
+	}
+	if external == nil {
+		return nil
+	}
+	if !external.addSendCredit(message.Value) {
+		return s.protocolViolation()
+	}
+	return nil
+}
+
+func (s *clientSession) openHTTPStream(metadata map[string]any) (*HTTPStream, error) {
+	streamID := s.allocateStreamID()
+	stream := newHTTPStream(s.conn, streamID, s.removeHTTPStream)
+	s.mu.Lock()
+	s.httpStreams[streamID] = stream
+	s.mu.Unlock()
+	if err := s.conn.Send(protocol.NatMessage{
+		Type: protocol.NatOpen, StreamID: streamID, Metadata: metadata,
+	}); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	return stream, nil
+}
+
+func (s *clientSession) handleHTTPResponseOpen(message protocol.NatMessage) bool {
+	if asString(message.Metadata, "source") != "http" || asString(message.Metadata, "phase") != "response" {
+		return false
+	}
+	s.mu.Lock()
+	stream := s.httpStreams[message.StreamID]
+	s.mu.Unlock()
+	return stream != nil && stream.onHead(message.Metadata)
+}
+
+func (s *clientSession) handleHTTPData(message protocol.NatMessage) bool {
+	s.mu.Lock()
+	stream := s.httpStreams[message.StreamID]
+	s.mu.Unlock()
+	if stream == nil {
+		return false
+	}
+	if !stream.onData(message.Data) {
+		s.protocolViolation()
+	}
+	return true
+}
+
+func (s *clientSession) handleHTTPEnd(message protocol.NatMessage) bool {
+	s.mu.Lock()
+	stream := s.httpStreams[message.StreamID]
+	s.mu.Unlock()
+	if stream == nil {
+		return false
+	}
+	if message.Type == protocol.NatRST {
+		stream.onReset(asString(message.Metadata, "reason"))
+	} else if !stream.onEnd(message.Metadata) {
+		s.protocolViolation()
+	}
+	return true
+}
+
+func (s *clientSession) removeHTTPStream(streamID uint32, expected *HTTPStream) {
+	s.mu.Lock()
+	if s.httpStreams[streamID] == expected {
+		delete(s.httpStreams, streamID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *clientSession) allocateStreamID() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		streamID := s.nextStreamID
+		s.nextStreamID++
+		if s.nextStreamID == 0 {
+			s.nextStreamID = 1
+		}
+		if streamID != 0 && s.externals[streamID] == nil && s.httpStreams[streamID] == nil {
+			return streamID
+		}
 	}
 }
 
@@ -255,7 +410,9 @@ func (s *clientSession) acceptExternal(port int, netConn net.Conn) {
 		netConn.Close()
 		return
 	}
-	external := newExternalConn(netConn, s.conn, port, s.limits.WriteBufferLowMark, s.limits.WriteBufferHighMark)
+	streamID := s.allocateStreamID()
+	external := newExternalConn(netConn, s.conn, streamID, port,
+		s.limits.WriteBufferLowMark, s.limits.WriteBufferHighMark)
 	external.writeBackpressureUnsubscribe = external.writeBackpressure.AddListener(func(bool) {
 		s.updateControlReadForWritability()
 	})
@@ -263,35 +420,41 @@ func (s *clientSession) acceptExternal(port int, netConn net.Conn) {
 		external.readGate.Pause()
 	}
 	s.mu.Lock()
-	s.externals[external.channelID] = external
+	s.externals[external.streamID] = external
 	s.mu.Unlock()
 	s.updateControlReadForWritability()
 
 	// Announce the new external connection, then pump its bytes to the client as DATA.
 	if err := s.conn.Send(protocol.NatMessage{
-		Type:     protocol.NatConnected,
+		Type:     protocol.NatOpen,
+		StreamID: external.streamID,
 		Metadata: map[string]any{"channelId": external.channelID, "port": port},
 	}); err != nil {
-		s.removeExternal(port, external)
+		s.cleanupExternal(external)
 		return
 	}
 
 	external.pumpToClient(s.traffic, s.detail, s.detailOpts, s.conn.ClientName())
-	s.removeExternal(port, external)
+	external.sendFin()
+	if external.markPublicFinished() {
+		s.cleanupExternal(external)
+	}
 }
 
-func (s *clientSession) removeExternal(port int, external *externalConn) {
+func (s *clientSession) cleanupExternal(external *externalConn) {
+	if !external.beginCleanup() {
+		return
+	}
 	s.mu.Lock()
-	if current, ok := s.externals[external.channelID]; ok && current == external {
-		delete(s.externals, external.channelID)
+	if current, ok := s.externals[external.streamID]; ok && current == external {
+		delete(s.externals, external.streamID)
 	}
 	s.mu.Unlock()
 	external.stopBackpressureListener()
 	external.close()
 	s.releaseTCPStream(external.channelID)
-	external.sendDisconnect()
 	s.updateControlReadForWritability()
-	s.release(port)
+	s.release(external.port)
 }
 
 func (s *clientSession) recordTCPFrame(_ int, external *externalConn, payload []byte, direction string) {
@@ -362,8 +525,10 @@ func (s *clientSession) dispose() {
 	s.mu.Lock()
 	bindings := s.bindings
 	externals := s.externals
+	httpStreams := s.httpStreams
 	s.bindings = make(map[int]*portListener)
-	s.externals = make(map[string]*externalConn)
+	s.externals = make(map[uint32]*externalConn)
+	s.httpStreams = make(map[uint32]*HTTPStream)
 	s.mu.Unlock()
 
 	for _, listener := range bindings {
@@ -372,6 +537,9 @@ func (s *clientSession) dispose() {
 	for _, external := range externals {
 		external.stopBackpressureListener()
 		external.close()
+	}
+	for _, stream := range httpStreams {
+		stream.onReset("control channel closed")
 	}
 }
 
@@ -464,22 +632,36 @@ type externalConn struct {
 	netConn                      net.Conn
 	control                      *control.Conn
 	port                         int
+	streamID                     uint32
 	channelID                    string
 	readGate                     *control.ReadGate
 	writeBackpressure            *control.WriteBackpressureGate
 	writeBackpressureUnsubscribe func()
 	closeOnce                    sync.Once
+	creditMu                     sync.Mutex
+	creditCond                   *sync.Cond
+	sendCredit                   uint64
+	closed                       bool
+	stateMu                      sync.Mutex
+	publicFinished               bool
+	clientFinished               bool
+	cleanupStarted               bool
 }
 
-func newExternalConn(netConn net.Conn, ctrl *control.Conn, port, lowWaterMark, highWaterMark int) *externalConn {
-	return &externalConn{
+func newExternalConn(netConn net.Conn, ctrl *control.Conn, streamID uint32,
+	port, lowWaterMark, highWaterMark int) *externalConn {
+	external := &externalConn{
 		netConn:           netConn,
 		control:           ctrl,
 		port:              port,
+		streamID:          streamID,
 		channelID:         newChannelID(),
 		readGate:          control.NewReadGate(),
 		writeBackpressure: control.NewWriteBackpressureGate(lowWaterMark, highWaterMark),
+		sendCredit:        natInitialWindowBytes,
 	}
+	external.creditCond = sync.NewCond(&external.creditMu)
+	return external
 }
 
 // pumpToClient reads external bytes and forwards them as DATA frames until EOF or error.
@@ -520,10 +702,11 @@ func (e *externalConn) pumpToClient(traffic *TrafficService, detail DetailRecord
 					Options:            detailOpts,
 				})
 			}
+			if !e.takeSendCredit(read) {
+				return
+			}
 			if sendErr := e.control.Send(protocol.NatMessage{
-				Type:     protocol.NatData,
-				Metadata: map[string]any{"channelId": e.channelID},
-				Data:     payload,
+				Type: protocol.NatData, StreamID: e.streamID, Data: payload,
 			}); sendErr != nil {
 				return
 			}
@@ -546,7 +729,76 @@ func (e *externalConn) write(data []byte) bool {
 }
 
 func (e *externalConn) close() {
-	e.closeOnce.Do(func() { e.netConn.Close() })
+	e.closeOnce.Do(func() {
+		e.creditMu.Lock()
+		e.closed = true
+		e.creditCond.Broadcast()
+		e.creditMu.Unlock()
+		e.netConn.Close()
+	})
+}
+
+func (e *externalConn) takeSendCredit(size int) bool {
+	if size <= 0 || size > natMaximumWindowBytes {
+		return false
+	}
+	e.creditMu.Lock()
+	defer e.creditMu.Unlock()
+	needed := uint64(size)
+	for e.sendCredit < needed && !e.closed {
+		e.creditCond.Wait()
+	}
+	if e.closed {
+		return false
+	}
+	e.sendCredit -= needed
+	return true
+}
+
+func (e *externalConn) addSendCredit(credit uint32) bool {
+	if credit == 0 || credit > natMaximumWindowBytes {
+		return false
+	}
+	e.creditMu.Lock()
+	defer e.creditMu.Unlock()
+	if e.closed || e.sendCredit+uint64(credit) > natMaximumWindowBytes {
+		return false
+	}
+	e.sendCredit += uint64(credit)
+	e.creditCond.Broadcast()
+	return true
+}
+
+func (e *externalConn) shutdownWrite() {
+	if tcp, ok := e.netConn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+		return
+	}
+	e.close()
+}
+
+func (e *externalConn) markPublicFinished() bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.publicFinished = true
+	return e.clientFinished
+}
+
+func (e *externalConn) markClientFinished() bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.clientFinished = true
+	return e.publicFinished
+}
+
+func (e *externalConn) beginCleanup() bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	if e.cleanupStarted {
+		return false
+	}
+	e.cleanupStarted = true
+	return true
 }
 
 func (e *externalConn) stopBackpressureListener() {
@@ -556,14 +808,19 @@ func (e *externalConn) stopBackpressureListener() {
 	}
 }
 
-// sendDisconnect notifies the client that the external connection closed (best effort).
-func (e *externalConn) sendDisconnect() {
+// sendFin notifies the client that the external connection reached EOF (best effort).
+func (e *externalConn) sendFin() {
 	if e.control.Context().Err() != nil {
 		return
 	}
+	e.stateMu.Lock()
+	cleanupStarted := e.cleanupStarted
+	e.stateMu.Unlock()
+	if cleanupStarted {
+		return
+	}
 	_ = e.control.Send(protocol.NatMessage{
-		Type:     protocol.NatDisconnected,
-		Metadata: map[string]any{"channelId": e.channelID},
+		Type: protocol.NatFin, StreamID: e.streamID,
 	})
 }
 

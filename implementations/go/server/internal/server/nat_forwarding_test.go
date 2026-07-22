@@ -28,22 +28,45 @@ func freeTCPPort(t *testing.T) int {
 // straight back to the server (acting as a loopback upstream). It runs until ctx is done.
 func natTestClient(t *testing.T, ctx context.Context, app *App, port, listenPort int, registered chan<- bool) {
 	t.Helper()
+	controlConn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Errorf("control dial: %v", err)
+		registered <- false
+		return
+	}
+	go func() { <-ctx.Done(); controlConn.Close() }()
+
+	session := issueClientSession(t, app, DemoClientName)
+	controlLogin := protocol.LoginRequest{
+		ClientName:      DemoClientName,
+		ClientSessionID: session.ID,
+		AccessToken:     session.AccessToken,
+		ConnectionRole:  protocol.ConnectionRoleControl,
+	}
+	if err := protocol.WritePacket(controlConn, controlLogin); err != nil {
+		t.Errorf("control login: %v", err)
+		registered <- false
+		return
+	}
+	controlReader := bufio.NewReader(controlConn)
+	controlResponse, ok := readPacket(t, controlReader).(protocol.LoginResponse)
+	if !ok || !controlResponse.Success {
+		t.Errorf("control login rejected: %#v", controlResponse)
+		registered <- false
+		return
+	}
+
 	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
-		t.Errorf("client dial: %v", err)
+		t.Errorf("data dial: %v", err)
 		registered <- false
 		return
 	}
 	go func() { <-ctx.Done(); conn.Close() }()
-
-	session := issueClientSession(t, app, DemoClientName)
-	login := protocol.LoginRequest{
-		ClientName:      DemoClientName,
-		ClientSessionID: session.ID,
-		AccessToken:     session.AccessToken,
-	}
-	if err := protocol.WritePacket(conn, login); err != nil {
-		t.Errorf("client login: %v", err)
+	dataLogin := controlLogin
+	dataLogin.ConnectionRole = protocol.ConnectionRoleData
+	if err := protocol.WritePacket(conn, dataLogin); err != nil {
+		t.Errorf("data login: %v", err)
 		registered <- false
 		return
 	}
@@ -82,10 +105,16 @@ func natTestClient(t *testing.T, ctx context.Context, app *App, port, listenPort
 			case protocol.NatRegisterResult:
 				registered <- p.Metadata["success"] == true
 			case protocol.NatData:
-				// Loopback: echo the bytes straight back on the same channel.
+				// Loopback: echo the bytes on the same v2 stream and release the
+				// server-to-client flow-control credit after consuming them.
+				_ = protocol.WritePacket(conn, protocol.NatMessage{
+					Type:     protocol.NatWindowUpdate,
+					StreamID: p.StreamID,
+					Value:    uint32(len(p.Data)),
+				})
 				_ = protocol.WritePacket(conn, protocol.NatMessage{
 					Type:     protocol.NatData,
-					Metadata: map[string]any{"channelId": p.Metadata["channelId"]},
+					StreamID: p.StreamID,
 					Data:     p.Data,
 				})
 			}
@@ -156,8 +185,8 @@ func TestNatRoundTrip(t *testing.T) {
 	}()
 	echoed := make([]byte, len(burst))
 	_ = burstConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	if _, err := readFull(burstConn, echoed); err != nil {
-		t.Fatalf("read burst echo: %v", err)
+	if read, err := readFull(burstConn, echoed); err != nil {
+		t.Fatalf("read burst echo after %d/%d bytes: %v", read, len(echoed), err)
 	}
 	if err := <-writeErr; err != nil {
 		t.Fatalf("write burst: %v", err)

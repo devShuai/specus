@@ -11,10 +11,10 @@ const (
 	peerAppMessageTypeAck     = "ack"
 )
 
-var peerAppMessagePrefix = []byte("STMSG1\n")
+var peerAppMessagePrefix = []byte("STMSG2\n")
 
 // peerAppMessage is the Java PeerAppMessageCodec wire payload carried inside an
-// encrypted SPM1 frame. It is deliberately independent from the control-channel
+// encrypted SPM2 frame. It is deliberately independent from the control-channel
 // CLIENT_TO_CLIENT fallback format.
 type peerAppMessage struct {
 	Type            string `json:"type"`

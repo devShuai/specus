@@ -158,7 +158,7 @@ func TestStunTurnCleanupRemovesExpiredAllocation(t *testing.T) {
 	}
 }
 
-func TestStunTurnSendIndicationForwardsOpaquePayload(t *testing.T) {
+func TestStunTurnSendIndicationRejectsOpaquePayload(t *testing.T) {
 	server := newStunTurnTestServer(t)
 	primary := listenUDP(t)
 	client := listenUDP(t)
@@ -178,8 +178,8 @@ func TestStunTurnSendIndicationForwardsOpaquePayload(t *testing.T) {
 		t.Fatalf("send indication: %v", err)
 	}
 
-	if got := readUDPBytes(t, peer); string(got) != "hello" {
-		t.Fatalf("peer payload = %q", string(got))
+	if got := readOptionalUDPBytes(t, peer); len(got) != 0 {
+		t.Fatalf("peer received forbidden opaque payload: %x", got)
 	}
 }
 
@@ -218,7 +218,7 @@ func TestStunTurnRelayReceiveDispatchesDataIndication(t *testing.T) {
 	}
 	allocation.Permission[permissionKey(udpAddr(peer))] = time.Now().Add(time.Minute)
 
-	if err := server.dispatchDataIndication(allocation, udpAddr(peer), []byte("world")); err != nil {
+	if err := server.dispatchRelayPayload(allocation, udpAddr(peer), []byte("world")); err != nil {
 		t.Fatalf("dispatch data indication: %v", err)
 	}
 	response := readStunMessage(t, client)
@@ -232,6 +232,36 @@ func TestStunTurnRelayReceiveDispatchesDataIndication(t *testing.T) {
 	payload, ok := response.data()
 	if !ok || string(payload) != "world" {
 		t.Fatalf("payload = %q", string(payload))
+	}
+}
+
+func TestStunTurnChannelBindDispatchesChannelData(t *testing.T) {
+	server := newStunTurnTestServer(t)
+	primary := listenUDP(t)
+	client := listenUDP(t)
+	peer := listenUDP(t)
+	server.primary = primary
+	allocation, err := server.allocate(context.Background(), udpAddr(client))
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	channel := uint16(turnChannelMin)
+	tx := newStunTransactionID()
+	request := newStunMessage(stunChannelBindRequest, tx,
+		stunAttrChannelNumberValue(channel), newStunAttrXorPeerAddress(udpAddr(peer), tx))
+	if err := server.channelBind(request, udpAddr(client)); err != nil {
+		t.Fatalf("channel bind: %v", err)
+	}
+	if response := readStunMessage(t, client); response.Type != stunChannelBindSuccess {
+		t.Fatalf("channel bind response type = 0x%x", response.Type)
+	}
+	if err := server.dispatchRelayPayload(allocation, udpAddr(peer), []byte("world")); err != nil {
+		t.Fatalf("dispatch ChannelData: %v", err)
+	}
+	packet := readUDPBytes(t, client)
+	frame, err := parseTurnChannelData(packet)
+	if err != nil || frame.Channel != channel || string(frame.Payload) != "world" {
+		t.Fatalf("ChannelData = %+v err=%v raw=%x", frame, err, packet)
 	}
 }
 
@@ -320,13 +350,9 @@ func readOptionalUDPBytes(t *testing.T, conn *net.UDPConn) []byte {
 }
 
 func testPeerDataFrame(sessionID, fromClientID, toClientID int64) []byte {
-	frame := make([]byte, peerDataHeaderBytes)
+	frame := make([]byte, peerDataHeaderBytes+peerDataTagBytes)
 	binary.BigEndian.PutUint32(frame[:4], peerDataMagic)
-	frame[4] = peerDataVersion
-	frame[5] = peerDataTypeData
-	binary.BigEndian.PutUint64(frame[6:14], uint64(sessionID))
-	binary.BigEndian.PutUint64(frame[14:22], uint64(fromClientID))
-	binary.BigEndian.PutUint64(frame[22:30], uint64(toClientID))
-	binary.BigEndian.PutUint64(frame[30:38], 1)
+	binary.BigEndian.PutUint64(frame[4:12], uint64(sessionID))
+	binary.BigEndian.PutUint64(frame[12:20], 1)
 	return frame
 }

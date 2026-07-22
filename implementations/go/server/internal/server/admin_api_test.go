@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -255,6 +256,32 @@ func TestPublicAttachmentHTTPStatusMatchesJavaExceptionMapping(t *testing.T) {
 func adminToken(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
 	return loginToken(t, ts, "admin", "admin")
+}
+
+func adminWebSocketURL(t *testing.T, ts *httptest.Server, endpoint string) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"endpoint": endpoint})
+	request, err := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/ws-tickets", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+adminToken(t, ts))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("issue websocket ticket: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("websocket ticket status %d", response.StatusCode)
+	}
+	var issued struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&issued); err != nil || issued.Ticket == "" {
+		t.Fatalf("decode websocket ticket: ticket=%q err=%v", issued.Ticket, err)
+	}
+	return "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/" + endpoint + "?ticket=" + url.QueryEscape(issued.Ticket)
 }
 
 func loginToken(t *testing.T, ts *httptest.Server, username, password string) string {

@@ -531,6 +531,7 @@ func TestPathStatsAggregatesDirectRatioReportedSessionsAndNatTypes(t *testing.T)
 			PathType:         PathDirect,
 			Status:           StatusActive,
 			RTTMillis:        &rttDirect,
+			RemoteEndpoint:   stringPointer("198.51.100.20:41000"),
 			DirectBytes:      100,
 			RelayBytes:       5,
 			StartedAt:        now.Add(-2 * time.Minute),
@@ -547,6 +548,7 @@ func TestPathStatsAggregatesDirectRatioReportedSessionsAndNatTypes(t *testing.T)
 			PathType:         PathRelay,
 			Status:           StatusActive,
 			RTTMillis:        &rttRelay,
+			RemoteEndpoint:   stringPointer("[2001:db8::20]:42000"),
 			DirectBytes:      0,
 			RelayBytes:       200,
 			StartedAt:        now.Add(-2 * time.Minute),
@@ -583,6 +585,18 @@ func TestPathStatsAggregatesDirectRatioReportedSessionsAndNatTypes(t *testing.T)
 	if stats.ActiveDirectRatio == nil || *stats.ActiveDirectRatio != 0.5 {
 		t.Fatalf("active direct ratio = %v, want 0.5", stats.ActiveDirectRatio)
 	}
+	if family := findAddressFamilyStat(stats.AddressFamilies, "IPv4", StatusActive, PathDirect); family == nil ||
+		family.Sessions != 1 || family.ReportedSessions != 1 {
+		t.Fatalf("IPv4 address-family aggregate mismatch: %+v", stats.AddressFamilies)
+	}
+	if family := findAddressFamilyStat(stats.AddressFamilies, "IPv6", StatusActive, PathRelay); family == nil ||
+		family.Sessions != 1 || family.ReportedSessions != 1 {
+		t.Fatalf("IPv6 address-family aggregate mismatch: %+v", stats.AddressFamilies)
+	}
+	if family := findAddressFamilyStat(stats.AddressFamilies, "UNKNOWN", StatusNegotiating, PathDirect); family == nil ||
+		family.Sessions != 1 || family.ReportedSessions != 0 {
+		t.Fatalf("unknown address-family aggregate mismatch: %+v", stats.AddressFamilies)
+	}
 	directActive := findPathTypeStat(stats.PathTypes, PathDirect, StatusActive)
 	if directActive == nil || directActive.Sessions != 1 || directActive.ReportedSessions != 1 ||
 		directActive.AvgRttMillis == nil || *directActive.AvgRttMillis != 10 ||
@@ -618,20 +632,16 @@ func TestAuthorizeRelayFrameRequiresActiveMatchingSessionAndAccountsBytes(t *tes
 	insertPeerSession(t, db, 9101, source, target, StatusActive, time.Now().UTC().Add(time.Hour))
 
 	allowed := service.AuthorizeRelayFrame(ctx, DataFrameHeader{
-		SessionID:    9101,
-		FromClientID: source.ID,
-		ToClientID:   target.ID,
-		Sequence:     7,
-	}, 512)
+		SessionID: 9101,
+		Sequence:  7,
+	}, source.ID, target.ID, 512)
 	if !allowed {
 		t.Fatalf("AuthorizeRelayFrame active matching session = false, want true")
 	}
 	allowed = service.AuthorizeRelayFrame(ctx, DataFrameHeader{
-		SessionID:    9101,
-		FromClientID: target.ID,
-		ToClientID:   source.ID,
-		Sequence:     8,
-	}, 256)
+		SessionID: 9101,
+		Sequence:  8,
+	}, target.ID, source.ID, 256)
 	if !allowed {
 		t.Fatalf("AuthorizeRelayFrame cached reverse session = false, want true")
 	}
@@ -658,11 +668,9 @@ func TestAuthorizeRelayFrameRejectsWrongPeerPair(t *testing.T) {
 	insertPeerSession(t, db, 9102, source, target, StatusActive, time.Now().UTC().Add(time.Hour))
 
 	allowed := service.AuthorizeRelayFrame(ctx, DataFrameHeader{
-		SessionID:    9102,
-		FromClientID: source.ID,
-		ToClientID:   9999,
-		Sequence:     7,
-	}, 512)
+		SessionID: 9102,
+		Sequence:  7,
+	}, source.ID, 9999, 512)
 	if allowed {
 		t.Fatalf("AuthorizeRelayFrame wrong peer pair = true, want false")
 	}
@@ -683,11 +691,9 @@ func TestAuthorizeRelayFrameRejectsExpiredSessionAndClosesIt(t *testing.T) {
 	insertPeerSession(t, db, 9103, source, target, StatusActive, time.Now().UTC().Add(-time.Second))
 
 	allowed := service.AuthorizeRelayFrame(ctx, DataFrameHeader{
-		SessionID:    9103,
-		FromClientID: source.ID,
-		ToClientID:   target.ID,
-		Sequence:     7,
-	}, 512)
+		SessionID: 9103,
+		Sequence:  7,
+	}, source.ID, target.ID, 512)
 	if allowed {
 		t.Fatalf("AuthorizeRelayFrame expired session = true, want false")
 	}
@@ -711,11 +717,9 @@ func TestAuthorizeRelayFrameRejectsNegotiatingSession(t *testing.T) {
 	insertPeerSession(t, db, 9104, source, target, StatusNegotiating, time.Now().UTC().Add(time.Hour))
 
 	allowed := service.AuthorizeRelayFrame(ctx, DataFrameHeader{
-		SessionID:    9104,
-		FromClientID: source.ID,
-		ToClientID:   target.ID,
-		Sequence:     7,
-	}, 512)
+		SessionID: 9104,
+		Sequence:  7,
+	}, source.ID, target.ID, 512)
 	if allowed {
 		t.Fatalf("AuthorizeRelayFrame negotiating session = true, want false")
 	}
@@ -920,6 +924,19 @@ func findPathTypeStat(items []PathTypeStat, pathType, status string) *PathTypeSt
 		}
 	}
 	return nil
+}
+
+func findAddressFamilyStat(items []AddressFamilyStat, family, status, pathType string) *AddressFamilyStat {
+	for i := range items {
+		if items[i].AddressFamily == family && items[i].Status == status && items[i].PathType == pathType {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func stringPointer(value string) *string {
+	return &value
 }
 
 func findNatTypeStat(items []NatTypeStat, natType string) int64 {

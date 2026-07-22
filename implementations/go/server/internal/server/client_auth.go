@@ -216,6 +216,17 @@ func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthL
 	if !validAPIKeySignature(request, credential.SecretHash) {
 		return nil, errClientAuth("客户端签名无效或已过期")
 	}
+	now := time.Now().UTC()
+	apiKeyDigest := sha256.Sum256([]byte(strings.TrimSpace(request.APIKey)))
+	nonceDigest := sha256.Sum256([]byte(request.Nonce))
+	consumed, err := a.db.ConsumeClientAuthNonce(ctx, hex.EncodeToString(apiKeyDigest[:]),
+		hex.EncodeToString(nonceDigest[:]), now, now.Add(2*time.Minute))
+	if err != nil {
+		return nil, errClientAuth("客户端 nonce 校验失败")
+	}
+	if !consumed {
+		return nil, errClientAuth("客户端 nonce 已使用")
+	}
 	return credential, nil
 }
 

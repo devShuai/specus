@@ -220,6 +220,7 @@ func dialRuntimeAndReadLogin(t *testing.T, port int, runtime clientAuthLoginForT
 		ClientName:      runtime.ClientName,
 		ClientSessionID: runtime.ClientSessionID,
 		AccessToken:     runtime.AccessToken,
+		ConnectionRole:  protocol.ConnectionRoleControl,
 	}); err != nil {
 		t.Fatalf("write login: %v", err)
 	}

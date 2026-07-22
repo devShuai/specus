@@ -21,9 +21,6 @@ import (
 )
 
 const (
-	webSocketFrameText   byte = 0x01
-	webSocketFrameBinary byte = 0x02
-
 	webSocketOpcodeContinuation byte = 0x0
 	webSocketOpcodeText         byte = 0x1
 	webSocketOpcodeBinary       byte = 0x2
@@ -58,7 +55,7 @@ type webSocketLocalConnection struct {
 	writeMu sync.Mutex
 }
 
-func (client *Client) connectWebSocketTunnel(connection net.Conn, metadata map[string]any) {
+func (client *Client) connectWebSocketTunnel(connection net.Conn, streamID uint32, metadata map[string]any) {
 	channelID, err := metadataString(metadata, "channelId")
 	if err != nil {
 		client.logger.Printf("[ws-tunnel][client] invalid CONNECTED message: %v", err)
@@ -67,13 +64,13 @@ func (client *Client) connectWebSocketTunnel(connection net.Conn, metadata map[s
 	route, err := metadataString(metadata, "route")
 	if err != nil {
 		client.logger.Printf("[ws-tunnel][client] CONNECTED missing route: %v", err)
-		client.sendWebSocketNatDisconnected(connection, channelID)
+		client.sendNatReset(connection, streamID, 2, "websocket route missing")
 		return
 	}
 	targetBaseURL := client.routeTarget(route)
 	if strings.TrimSpace(targetBaseURL) == "" {
 		client.logger.Printf("[ws-tunnel][client] CONNECTED for unknown route %q", route)
-		client.sendWebSocketNatDisconnected(connection, channelID)
+		client.sendNatReset(connection, streamID, 3, "unknown websocket route")
 		return
 	}
 	relativePath, _ := metadataStringOptional(metadata, "relativePath")
@@ -81,26 +78,27 @@ func (client *Client) connectWebSocketTunnel(connection net.Conn, metadata map[s
 	target, err := buildWebSocketTarget(targetBaseURL, relativePath, rawQuery)
 	if err != nil {
 		client.logger.Printf("[ws-tunnel][client] CONNECTED route=%q build-target-failed: %v", route, err)
-		client.sendWebSocketNatDisconnected(connection, channelID)
+		client.sendNatReset(connection, streamID, 4, "invalid websocket target")
 		return
 	}
 	localConnection, err := dialLocalWebSocket(target, webSocketHandshakeHeaders(metadata))
 	if err != nil {
 		client.logger.Printf("[ws-tunnel][client] connect local ws failed channelId=%q route=%q target=%s: %v",
 			channelID, route, targetWithoutRawQuery(target), err)
-		client.sendWebSocketNatDisconnected(connection, channelID)
+		client.sendNatReset(connection, streamID, 5, "websocket connect failed")
+		client.closeNatFlow(streamID)
 		return
 	}
 
 	client.wsLocalsMu.Lock()
-	if previous := client.wsLocals[channelID]; previous != nil {
+	if previous := client.wsLocals[streamID]; previous != nil {
 		_ = previous.close()
 	}
-	client.wsLocals[channelID] = localConnection
+	client.wsLocals[streamID] = localConnection
 	client.wsLocalsMu.Unlock()
 	client.logger.Printf("[ws-tunnel][client] ws handshake ok channelId=%q route=%q target=%s",
 		channelID, route, targetWithoutRawQuery(target))
-	go client.copyWebSocketData(connection, channelID, localConnection)
+	go client.copyWebSocketData(connection, streamID, channelID, localConnection)
 }
 
 func buildWebSocketTarget(targetBaseURL, relativePath, rawQuery string) (*url.URL, error) {
@@ -283,122 +281,123 @@ func headerHasToken(value, token string) bool {
 	return false
 }
 
-func (client *Client) copyWebSocketData(connection net.Conn, channelID string, localConnection *webSocketLocalConnection) {
+func (client *Client) copyWebSocketData(connection net.Conn, streamID uint32, channelID string,
+	localConnection *webSocketLocalConnection) {
 	for {
-		opcode, payload, err := localConnection.readMessage()
+		fin, rsv, opcode, payload, err := localConnection.readFrame()
 		if err != nil {
 			if err != io.EOF {
 				client.logger.Printf("[ws-tunnel][client] read local ws %q failed: %v", channelID, err)
 			}
-			client.disconnectWebSocketTunnel(connection, channelID)
+			client.disconnectWebSocketTunnel(connection, streamID)
 			return
 		}
-		frameType := webSocketFrameBinary
-		if opcode == webSocketOpcodeText {
-			frameType = webSocketFrameText
+		closeCode := uint16(0)
+		if opcode == webSocketOpcodeClose {
+			if len(payload) == 1 {
+				client.sendNatReset(connection, streamID, 7, "invalid websocket close payload")
+				return
+			}
+			if len(payload) >= 2 {
+				closeCode = binary.BigEndian.Uint16(payload[:2])
+				payload = payload[2:]
+			}
 		}
-		data := make([]byte, len(payload)+1)
-		data[0] = frameType
-		copy(data[1:], payload)
-		body, encodeErr := protocol.EncodeNatMessage(protocol.NatMessage{
-			Type:     protocol.NatData,
-			Metadata: map[string]any{"channelId": channelID, "source": "ws"},
-			Data:     data,
-		})
-		if encodeErr != nil || client.send(connection, protocol.CommandNatMessage, body) != nil {
-			client.disconnectWebSocketTunnel(connection, channelID)
+		if err := client.sendWebSocketFrames(connection, streamID, opcode, fin, rsv, closeCode, payload); err != nil {
+			client.disconnectWebSocketTunnel(connection, streamID)
+			return
+		}
+		if opcode == webSocketOpcodeClose {
+			client.sendNatFin(connection, streamID)
+			client.markNatLocalFinished(streamID)
 			return
 		}
 	}
 }
 
-func (connection *webSocketLocalConnection) readMessage() (byte, []byte, error) {
-	var currentOpcode byte
-	var current bytes.Buffer
+func (client *Client) sendWebSocketFrames(connection net.Conn, streamID uint32, opcode byte,
+	fin bool, rsv byte, closeCode uint16, payload []byte) error {
+	offset := 0
+	first := true
 	for {
-		fin, opcode, payload, err := connection.readFrame()
-		if err != nil {
-			return 0, nil, err
+		length := len(payload) - offset
+		if length > maxWebSocketFramePayload {
+			length = maxWebSocketFramePayload
 		}
-		switch opcode {
-		case webSocketOpcodeText, webSocketOpcodeBinary:
-			if fin {
-				return opcode, payload, nil
-			}
-			currentOpcode = opcode
-			current.Reset()
-			current.Write(payload)
-		case webSocketOpcodeContinuation:
-			if currentOpcode == 0 {
-				return 0, nil, fmt.Errorf("unexpected websocket continuation frame")
-			}
-			current.Write(payload)
-			if current.Len() > maxWebSocketMessageBytes {
-				return 0, nil, fmt.Errorf("websocket message exceeds limit")
-			}
-			if fin {
-				return currentOpcode, current.Bytes(), nil
-			}
-		case webSocketOpcodeClose:
-			_ = connection.writeFrame(webSocketOpcodeClose, nil)
-			return 0, nil, io.EOF
-		case webSocketOpcodePing:
-			if err := connection.writeFrame(webSocketOpcodePong, payload); err != nil {
-				return 0, nil, err
-			}
-		case webSocketOpcodePong:
-			continue
-		default:
-			return 0, nil, fmt.Errorf("unsupported websocket opcode %d", opcode)
+		chunkOpcode := opcode
+		chunkRSV := rsv
+		chunkCloseCode := closeCode
+		if !first {
+			chunkOpcode = webSocketOpcodeContinuation
+			chunkRSV = 0
+			chunkCloseCode = 0
+		}
+		last := offset+length == len(payload)
+		encoded, err := encodeWebSocketTunnelFrame(webSocketTunnelFrame{
+			opcode: chunkOpcode, fin: fin && last, rsv: chunkRSV,
+			closeCode: chunkCloseCode, payload: payload[offset : offset+length],
+		})
+		if err != nil {
+			return err
+		}
+		if !client.takeNatCredit(streamID, len(encoded)) {
+			return io.ErrClosedPipe
+		}
+		body, err := protocol.EncodeNatMessage(protocol.NatMessage{
+			Type: protocol.NatData, StreamID: streamID, Data: encoded,
+		})
+		if err != nil {
+			return err
+		}
+		if err := client.send(connection, protocol.CommandNatMessage, body); err != nil {
+			return err
+		}
+		offset += length
+		first = false
+		if last {
+			return nil
 		}
 	}
 }
 
-func (connection *webSocketLocalConnection) readFrame() (bool, byte, []byte, error) {
+func (connection *webSocketLocalConnection) readFrame() (bool, byte, byte, []byte, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(connection.reader, header); err != nil {
-		return false, 0, nil, err
+		return false, 0, 0, nil, err
 	}
 	fin := header[0]&0x80 != 0
+	rsv := (header[0] >> 4) & 0x07
 	opcode := header[0] & 0x0F
 	masked := header[1]&0x80 != 0
+	if masked {
+		return false, 0, 0, nil, fmt.Errorf("server websocket frame must not be masked")
+	}
 	length := uint64(header[1] & 0x7F)
 	switch length {
 	case 126:
 		var ext [2]byte
 		if _, err := io.ReadFull(connection.reader, ext[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, 0, nil, err
 		}
 		length = uint64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
 		if _, err := io.ReadFull(connection.reader, ext[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext[:])
 	}
 	if length > maxWebSocketMessageBytes {
-		return false, 0, nil, fmt.Errorf("websocket frame exceeds limit")
-	}
-	var mask [4]byte
-	if masked {
-		if _, err := io.ReadFull(connection.reader, mask[:]); err != nil {
-			return false, 0, nil, err
-		}
+		return false, 0, 0, nil, fmt.Errorf("websocket frame exceeds limit")
 	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(connection.reader, payload); err != nil {
-		return false, 0, nil, err
+		return false, 0, 0, nil, err
 	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	return fin, opcode, payload, nil
+	return fin, rsv, opcode, payload, nil
 }
 
-func (connection *webSocketLocalConnection) writeFrame(opcode byte, payload []byte) error {
+func (connection *webSocketLocalConnection) writeFrame(fin bool, rsv byte, opcode byte, payload []byte) error {
 	if len(payload) > maxWebSocketMessageBytes {
 		return fmt.Errorf("websocket message exceeds limit")
 	}
@@ -406,7 +405,11 @@ func (connection *webSocketLocalConnection) writeFrame(opcode byte, payload []by
 	defer connection.writeMu.Unlock()
 
 	header := make([]byte, 0, 14)
-	header = append(header, 0x80|opcode)
+	first := opcode | ((rsv & 7) << 4)
+	if fin {
+		first |= 0x80
+	}
+	header = append(header, first)
 	switch {
 	case len(payload) < 126:
 		header = append(header, 0x80|byte(len(payload)))
@@ -438,66 +441,54 @@ func (connection *webSocketLocalConnection) writeFrame(opcode byte, payload []by
 }
 
 func (connection *webSocketLocalConnection) close() error {
-	_ = connection.writeFrame(webSocketOpcodeClose, nil)
+	_ = connection.writeFrame(true, 0, webSocketOpcodeClose, nil)
 	return connection.conn.Close()
 }
 
-func (client *Client) writeWebSocketData(channelID string, data []byte) (bool, error) {
+func (client *Client) writeWebSocketData(streamID uint32, data []byte) (bool, error) {
 	client.wsLocalsMu.Lock()
-	connection := client.wsLocals[channelID]
+	connection := client.wsLocals[streamID]
 	client.wsLocalsMu.Unlock()
 	if connection == nil {
 		return false, nil
 	}
-	if len(data) == 0 {
-		return true, nil
-	}
-	switch data[0] {
-	case webSocketFrameText:
-		return true, connection.writeFrame(webSocketOpcodeText, data[1:])
-	case webSocketFrameBinary:
-		return true, connection.writeFrame(webSocketOpcodeBinary, data[1:])
-	default:
-		return true, nil
-	}
-}
-
-func (client *Client) disconnectWebSocketTunnel(connection net.Conn, channelID string) {
-	if client.removeWebSocketConnection(channelID) {
-		client.sendWebSocketNatDisconnected(connection, channelID)
-	}
-}
-
-func (client *Client) sendWebSocketNatDisconnected(connection net.Conn, channelID string) {
-	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
-		Type:     protocol.NatDisconnected,
-		Metadata: map[string]any{"channelId": channelID, "source": "ws"},
-	})
-	if err == nil {
-		err = client.send(connection, protocol.CommandNatMessage, body)
-	}
+	frame, err := decodeWebSocketTunnelFrame(data)
 	if err != nil {
-		client.logger.Printf("[ws-tunnel][client] send NAT disconnected for %q failed: %v", channelID, err)
+		return true, err
 	}
+	payload := frame.payload
+	if frame.opcode == webSocketOpcodeClose && frame.closeCode != 0 {
+		payload = make([]byte, 2+len(frame.payload))
+		binary.BigEndian.PutUint16(payload[:2], frame.closeCode)
+		copy(payload[2:], frame.payload)
+	}
+	return true, connection.writeFrame(frame.fin, frame.rsv, frame.opcode, payload)
 }
 
-func (client *Client) removeWebSocketConnection(channelID string) bool {
+func (client *Client) disconnectWebSocketTunnel(connection net.Conn, streamID uint32) {
+	if client.removeWebSocketConnection(streamID) {
+		client.sendNatFin(connection, streamID)
+	}
+	client.closeNatFlow(streamID)
+}
+
+func (client *Client) removeWebSocketConnection(streamID uint32) bool {
 	client.wsLocalsMu.Lock()
-	connection := client.wsLocals[channelID]
-	delete(client.wsLocals, channelID)
+	connection := client.wsLocals[streamID]
+	delete(client.wsLocals, streamID)
 	client.wsLocalsMu.Unlock()
 	if connection == nil {
 		return false
 	}
 	_ = connection.close()
-	client.logger.Printf("[ws-tunnel][client] closed local ws channel=%q", channelID)
+	client.logger.Printf("[ws-tunnel][client] closed local ws stream=%d", streamID)
 	return true
 }
 
 func (client *Client) closeWebSocketConnections() {
 	client.wsLocalsMu.Lock()
 	connections := client.wsLocals
-	client.wsLocals = make(map[string]*webSocketLocalConnection)
+	client.wsLocals = make(map[uint32]*webSocketLocalConnection)
 	client.wsLocalsMu.Unlock()
 	for _, connection := range connections {
 		_ = connection.close()

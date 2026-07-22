@@ -6,10 +6,83 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
 )
+
+const (
+	natInitialWindowBytes = 1024 * 1024
+	natMaximumWindowBytes = 16 * 1024 * 1024
+)
+
+type natFlowState struct {
+	mu             sync.Mutex
+	cond           *sync.Cond
+	credit         uint64
+	closed         bool
+	localFinished  bool
+	remoteFinished bool
+}
+
+func newNatFlowState() *natFlowState {
+	state := &natFlowState{credit: natInitialWindowBytes}
+	state.cond = sync.NewCond(&state.mu)
+	return state
+}
+
+func (state *natFlowState) take(size int) bool {
+	if size <= 0 || size > natMaximumWindowBytes {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	needed := uint64(size)
+	for state.credit < needed && !state.closed {
+		state.cond.Wait()
+	}
+	if state.closed {
+		return false
+	}
+	state.credit -= needed
+	return true
+}
+
+func (state *natFlowState) add(credit uint32) bool {
+	if credit == 0 || credit > natMaximumWindowBytes {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closed || state.credit+uint64(credit) > natMaximumWindowBytes {
+		return false
+	}
+	state.credit += uint64(credit)
+	state.cond.Broadcast()
+	return true
+}
+
+func (state *natFlowState) close() {
+	state.mu.Lock()
+	state.closed = true
+	state.cond.Broadcast()
+	state.mu.Unlock()
+}
+
+func (state *natFlowState) markLocalFinished() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.localFinished = true
+	return state.remoteFinished
+}
+
+func (state *natFlowState) markRemoteFinished() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.remoteFinished = true
+	return state.localFinished
+}
 
 func (client *Client) syncTunnelConfigs(connection net.Conn, configs []TunnelConfig) {
 	desired := make(map[int]TunnelConfig, len(configs))
@@ -97,35 +170,56 @@ func (client *Client) handleNatMessage(connection net.Conn, body []byte) error {
 	switch message.Type {
 	case protocol.NatRegisterResult:
 		client.handleNatRegisterResult(message.Metadata)
-	case protocol.NatConnected:
-		if source, _ := metadataStringOptional(message.Metadata, "source"); source == "ws" {
-			go client.connectWebSocketTunnel(connection, message.Metadata)
+	case protocol.NatOpen:
+		client.openNatFlow(message.StreamID)
+		if source, _ := metadataStringOptional(message.Metadata, "source"); source == "http" {
+			client.openHTTPStream(connection, message.StreamID, message.Metadata)
+		} else if source == "ws" {
+			go client.connectWebSocketTunnel(connection, message.StreamID, message.Metadata)
 		} else {
-			go client.connectLocalTunnel(connection, message.Metadata)
+			go client.connectLocalTunnel(connection, message.StreamID, message.Metadata)
 		}
-	case protocol.NatDisconnected:
-		channelID, err := metadataString(message.Metadata, "channelId")
-		if err != nil {
-			return err
+	case protocol.NatFin:
+		if client.finishHTTPRequest(message.StreamID, message.Metadata) {
+			return nil
 		}
-		if !client.removeWebSocketConnection(channelID) {
-			client.removeLocalConnection(channelID)
+		client.handleRemoteFin(message.StreamID)
+	case protocol.NatRST:
+		if client.resetHTTPStream(message.StreamID, metadataReason(message.Metadata)) {
+			client.closeNatFlow(message.StreamID)
+			return nil
 		}
+		client.removeWebSocketConnection(message.StreamID)
+		client.removeLocalConnection(message.StreamID)
+		client.closeNatFlow(message.StreamID)
 	case protocol.NatData:
-		channelID, err := metadataString(message.Metadata, "channelId")
-		if err != nil {
-			return err
+		if client.writeHTTPData(message.StreamID, message.Data) {
+			return nil
 		}
-		if handled, err := client.writeWebSocketData(channelID, message.Data); handled {
+		if handled, err := client.writeWebSocketData(message.StreamID, message.Data); handled {
 			if err != nil {
-				client.logger.Printf("write local websocket tunnel %q failed: %v", channelID, err)
-				client.disconnectWebSocketTunnel(connection, channelID)
+				client.logger.Printf("write local websocket stream %d failed: %v", message.StreamID, err)
+				client.disconnectWebSocketTunnel(connection, message.StreamID)
+			} else {
+				client.sendNatWindowUpdate(connection, message.StreamID, len(message.Data))
+				if message.Flags&protocol.NatFlagEndStream != 0 {
+					client.handleRemoteFin(message.StreamID)
+				}
 			}
 			return nil
 		}
-		if err := client.writeLocalData(channelID, message.Data); err != nil {
-			client.logger.Printf("write local tunnel %q failed: %v", channelID, err)
-			client.disconnectLocalTunnel(connection, channelID)
+		if err := client.writeLocalData(message.StreamID, message.Data); err != nil {
+			client.logger.Printf("write local tunnel stream %d failed: %v", message.StreamID, err)
+			client.disconnectLocalTunnel(connection, message.StreamID)
+		} else {
+			client.sendNatWindowUpdate(connection, message.StreamID, len(message.Data))
+			if message.Flags&protocol.NatFlagEndStream != 0 {
+				client.handleRemoteFin(message.StreamID)
+			}
+		}
+	case protocol.NatWindowUpdate:
+		if !client.addNatCredit(message.StreamID, message.Value) {
+			return fmt.Errorf("invalid NAT WINDOW_UPDATE for stream %d", message.StreamID)
 		}
 	case protocol.NatKeepalive:
 		return nil
@@ -149,7 +243,7 @@ func (client *Client) handleNatRegisterResult(metadata map[string]any) {
 	client.logger.Printf("registered NAT port %d -> %s:%d", port, config.TunnelAddress, config.TunnelPort)
 }
 
-func (client *Client) connectLocalTunnel(connection net.Conn, metadata map[string]any) {
+func (client *Client) connectLocalTunnel(connection net.Conn, streamID uint32, metadata map[string]any) {
 	port, err := metadataInt(metadata, "port")
 	if err != nil {
 		client.logger.Printf("invalid NAT connected message: %v", err)
@@ -171,31 +265,33 @@ func (client *Client) connectLocalTunnel(connection net.Conn, metadata map[strin
 	localConnection, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		client.logger.Printf("connect local tunnel %s failed: %v", address, err)
-		client.sendNatDisconnected(connection, channelID)
+		client.sendNatReset(connection, streamID, 1, "local connect failed")
+		client.closeNatFlow(streamID)
 		return
 	}
 	client.localsMu.Lock()
-	if previous := client.locals[channelID]; previous != nil {
+	if previous := client.locals[streamID]; previous != nil {
 		_ = previous.Close()
 	}
-	client.locals[channelID] = localConnection
+	client.locals[streamID] = localConnection
 	client.localsMu.Unlock()
 	client.logger.Printf("opened local tunnel channel=%q target=%s", channelID, address)
-	go client.copyLocalData(connection, channelID, localConnection)
+	go client.copyLocalData(connection, streamID, channelID, localConnection)
 }
 
-func (client *Client) copyLocalData(connection net.Conn, channelID string, localConnection net.Conn) {
+func (client *Client) copyLocalData(connection net.Conn, streamID uint32, channelID string, localConnection net.Conn) {
 	buffer := make([]byte, 32*1024)
 	for {
 		length, err := localConnection.Read(buffer)
 		if length > 0 {
+			if !client.takeNatCredit(streamID, length) {
+				return
+			}
 			body, encodeErr := protocol.EncodeNatMessage(protocol.NatMessage{
-				Type:     protocol.NatData,
-				Metadata: map[string]any{"channelId": channelID},
-				Data:     append([]byte(nil), buffer[:length]...),
+				Type: protocol.NatData, StreamID: streamID, Data: append([]byte(nil), buffer[:length]...),
 			})
 			if encodeErr != nil || client.send(connection, protocol.CommandNatMessage, body) != nil {
-				client.disconnectLocalTunnel(connection, channelID)
+				client.disconnectLocalTunnel(connection, streamID)
 				return
 			}
 		}
@@ -203,18 +299,18 @@ func (client *Client) copyLocalData(connection net.Conn, channelID string, local
 			if err != io.EOF {
 				client.logger.Printf("read local tunnel %q failed: %v", channelID, err)
 			}
-			client.disconnectLocalTunnel(connection, channelID)
+			client.finishLocalDirection(connection, streamID)
 			return
 		}
 	}
 }
 
-func (client *Client) writeLocalData(channelID string, data []byte) error {
+func (client *Client) writeLocalData(streamID uint32, data []byte) error {
 	client.localsMu.Lock()
-	connection := client.locals[channelID]
+	connection := client.locals[streamID]
 	client.localsMu.Unlock()
 	if connection == nil {
-		return fmt.Errorf("local tunnel %q is not connected", channelID)
+		return fmt.Errorf("local tunnel stream %d is not connected", streamID)
 	}
 	for len(data) > 0 {
 		written, err := connection.Write(data)
@@ -229,47 +325,168 @@ func (client *Client) writeLocalData(channelID string, data []byte) error {
 	return nil
 }
 
-func (client *Client) disconnectLocalTunnel(connection net.Conn, channelID string) {
-	if client.removeLocalConnection(channelID) {
-		client.sendNatDisconnected(connection, channelID)
+func (client *Client) disconnectLocalTunnel(connection net.Conn, streamID uint32) {
+	if client.removeLocalConnection(streamID) {
+		client.sendNatFin(connection, streamID)
 	}
+	client.closeNatFlow(streamID)
 }
 
-func (client *Client) sendNatDisconnected(connection net.Conn, channelID string) {
+func (client *Client) sendNatFin(connection net.Conn, streamID uint32) {
 	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
-		Type:     protocol.NatDisconnected,
-		Metadata: map[string]any{"channelId": channelID},
+		Type: protocol.NatFin, StreamID: streamID,
 	})
 	if err == nil {
 		err = client.send(connection, protocol.CommandNatMessage, body)
 	}
 	if err != nil {
-		client.logger.Printf("send NAT disconnected for %q failed: %v", channelID, err)
+		client.logger.Printf("send NAT FIN for stream %d failed: %v", streamID, err)
 	}
 }
 
-func (client *Client) removeLocalConnection(channelID string) bool {
+func (client *Client) sendNatReset(connection net.Conn, streamID uint32, code uint32, reason string) {
+	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
+		Type: protocol.NatRST, StreamID: streamID, Value: code, Metadata: map[string]any{"reason": reason},
+	})
+	if err == nil {
+		err = client.send(connection, protocol.CommandNatMessage, body)
+	}
+	if err != nil {
+		client.logger.Printf("send NAT RST for stream %d failed: %v", streamID, err)
+	}
+}
+
+func (client *Client) sendNatWindowUpdate(connection net.Conn, streamID uint32, credit int) {
+	if credit <= 0 {
+		return
+	}
+	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
+		Type: protocol.NatWindowUpdate, StreamID: streamID, Value: uint32(credit),
+	})
+	if err == nil {
+		err = client.sendPriority(connection, protocol.CommandNatMessage, body)
+	}
+	if err != nil {
+		client.logger.Printf("send NAT WINDOW_UPDATE for stream %d failed: %v", streamID, err)
+	}
+}
+
+func (client *Client) openNatFlow(streamID uint32) {
+	client.natFlowsMu.Lock()
+	previous := client.natFlows[streamID]
+	client.natFlows[streamID] = newNatFlowState()
+	client.natFlowsMu.Unlock()
+	if previous != nil {
+		previous.close()
+	}
+}
+
+func (client *Client) takeNatCredit(streamID uint32, size int) bool {
+	client.natFlowsMu.Lock()
+	flow := client.natFlows[streamID]
+	client.natFlowsMu.Unlock()
+	return flow != nil && flow.take(size)
+}
+
+func (client *Client) addNatCredit(streamID uint32, credit uint32) bool {
+	client.natFlowsMu.Lock()
+	flow := client.natFlows[streamID]
+	client.natFlowsMu.Unlock()
+	return flow == nil || flow.add(credit)
+}
+
+func (client *Client) closeNatFlow(streamID uint32) {
+	client.natFlowsMu.Lock()
+	flow := client.natFlows[streamID]
+	delete(client.natFlows, streamID)
+	client.natFlowsMu.Unlock()
+	if flow != nil {
+		flow.close()
+	}
+}
+
+func (client *Client) finishLocalDirection(connection net.Conn, streamID uint32) {
+	client.sendNatFin(connection, streamID)
 	client.localsMu.Lock()
-	connection := client.locals[channelID]
-	delete(client.locals, channelID)
+	local := client.locals[streamID]
+	client.localsMu.Unlock()
+	if tcp, ok := local.(*net.TCPConn); ok {
+		_ = tcp.CloseRead()
+	}
+	if client.markNatLocalFinished(streamID) {
+		client.removeLocalConnection(streamID)
+		client.closeNatFlow(streamID)
+	}
+}
+
+func (client *Client) markNatLocalFinished(streamID uint32) bool {
+	client.natFlowsMu.Lock()
+	flow := client.natFlows[streamID]
+	client.natFlowsMu.Unlock()
+	return flow != nil && flow.markLocalFinished()
+}
+
+func (client *Client) handleRemoteFin(streamID uint32) {
+	if client.removeWebSocketConnection(streamID) {
+		client.closeNatFlow(streamID)
+		return
+	}
+	client.localsMu.Lock()
+	local := client.locals[streamID]
+	client.localsMu.Unlock()
+	if local == nil {
+		client.closeNatFlow(streamID)
+		return
+	}
+	if tcp, ok := local.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	} else {
+		_ = local.Close()
+	}
+	client.natFlowsMu.Lock()
+	flow := client.natFlows[streamID]
+	client.natFlowsMu.Unlock()
+	if flow != nil && flow.markRemoteFinished() {
+		client.removeLocalConnection(streamID)
+		client.closeNatFlow(streamID)
+	}
+}
+
+func (client *Client) removeLocalConnection(streamID uint32) bool {
+	client.localsMu.Lock()
+	connection := client.locals[streamID]
+	delete(client.locals, streamID)
 	client.localsMu.Unlock()
 	if connection == nil {
 		return false
 	}
 	_ = connection.Close()
-	client.logger.Printf("closed local tunnel channel=%q", channelID)
+	client.logger.Printf("closed local tunnel stream=%d", streamID)
 	return true
 }
 
 func (client *Client) closeLocalConnections() {
 	client.localsMu.Lock()
 	connections := client.locals
-	client.locals = make(map[string]net.Conn)
+	client.locals = make(map[uint32]net.Conn)
 	client.localsMu.Unlock()
 	for _, connection := range connections {
 		_ = connection.Close()
 	}
+	client.natFlowsMu.Lock()
+	flows := client.natFlows
+	client.natFlows = make(map[uint32]*natFlowState)
+	client.natFlowsMu.Unlock()
+	for _, flow := range flows {
+		flow.close()
+	}
+	client.closeHTTPStreams()
 	client.closeWebSocketConnections()
+}
+
+func metadataReason(metadata map[string]any) string {
+	reason, _ := metadataStringOptional(metadata, "reason")
+	return reason
 }
 
 func metadataString(metadata map[string]any, name string) (string, error) {

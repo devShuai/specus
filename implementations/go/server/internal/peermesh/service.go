@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -140,20 +141,21 @@ type SessionPage struct {
 }
 
 type PathStatsView struct {
-	TotalSessions                int64             `json:"totalSessions"`
-	ReportedSessions             int64             `json:"reportedSessions"`
-	ActiveSessions               int64             `json:"activeSessions"`
-	ActiveDirectSessions         int64             `json:"activeDirectSessions"`
-	ActiveRelaySessions          int64             `json:"activeRelaySessions"`
-	ActiveDirectRatio            *float64          `json:"activeDirectRatio"`
-	PathTypes                    []PathTypeStat    `json:"pathTypes"`
-	NatTypes                     []NatTypeStat     `json:"natTypes"`
-	NatBehaviorDevices           int64             `json:"natBehaviorDevices"`
-	NatBehaviorClassifiedDevices int64             `json:"natBehaviorClassifiedDevices"`
-	NatBehaviorSuccessRatio      *float64          `json:"natBehaviorSuccessRatio"`
-	NatMappingBehaviors          []NatBehaviorStat `json:"natMappingBehaviors"`
-	NatFilteringBehaviors        []NatBehaviorStat `json:"natFilteringBehaviors"`
-	NatBehaviorDiscoveries       []NatBehaviorStat `json:"natBehaviorDiscoveries"`
+	TotalSessions                int64               `json:"totalSessions"`
+	ReportedSessions             int64               `json:"reportedSessions"`
+	ActiveSessions               int64               `json:"activeSessions"`
+	ActiveDirectSessions         int64               `json:"activeDirectSessions"`
+	ActiveRelaySessions          int64               `json:"activeRelaySessions"`
+	ActiveDirectRatio            *float64            `json:"activeDirectRatio"`
+	PathTypes                    []PathTypeStat      `json:"pathTypes"`
+	AddressFamilies              []AddressFamilyStat `json:"addressFamilies"`
+	NatTypes                     []NatTypeStat       `json:"natTypes"`
+	NatBehaviorDevices           int64               `json:"natBehaviorDevices"`
+	NatBehaviorClassifiedDevices int64               `json:"natBehaviorClassifiedDevices"`
+	NatBehaviorSuccessRatio      *float64            `json:"natBehaviorSuccessRatio"`
+	NatMappingBehaviors          []NatBehaviorStat   `json:"natMappingBehaviors"`
+	NatFilteringBehaviors        []NatBehaviorStat   `json:"natFilteringBehaviors"`
+	NatBehaviorDiscoveries       []NatBehaviorStat   `json:"natBehaviorDiscoveries"`
 }
 
 type PathTypeStat struct {
@@ -169,6 +171,14 @@ type PathTypeStat struct {
 type NatTypeStat struct {
 	NatType string `json:"natType"`
 	Devices int64  `json:"devices"`
+}
+
+type AddressFamilyStat struct {
+	AddressFamily    string `json:"addressFamily"`
+	Status           string `json:"status"`
+	PathType         string `json:"pathType"`
+	Sessions         int64  `json:"sessions"`
+	ReportedSessions int64  `json:"reportedSessions"`
 }
 
 type NatBehaviorStat struct {
@@ -205,13 +215,14 @@ type RosterItem struct {
 }
 
 type Candidate struct {
-	Type       string `json:"type,omitempty"`
-	Transport  string `json:"transport,omitempty"`
-	Address    string `json:"address,omitempty"`
-	Port       int    `json:"port,omitempty"`
-	Priority   int64  `json:"priority,omitempty"`
-	Foundation string `json:"foundation,omitempty"`
-	RelayID    string `json:"relayId,omitempty"`
+	Type          string `json:"type,omitempty"`
+	Transport     string `json:"transport,omitempty"`
+	Address       string `json:"address,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	Priority      int64  `json:"priority,omitempty"`
+	Foundation    string `json:"foundation,omitempty"`
+	RelayID       string `json:"relayId,omitempty"`
+	AddressFamily string `json:"addressFamily,omitempty"`
 }
 
 type ControlMessage struct {
@@ -244,6 +255,7 @@ type ControlMessage struct {
 	VirtualDeviceStatus  *string      `json:"virtualDeviceStatus,omitempty"`
 	VirtualDeviceError   *string      `json:"virtualDeviceError,omitempty"`
 	PeerMesh             *LoginConfig `json:"peerMesh,omitempty"`
+	DataFrameVersion     int          `json:"dataFrameVersion,omitempty"`
 	Candidates           []Candidate  `json:"candidates,omitempty"`
 	Peers                []RosterItem `json:"peers,omitempty"`
 	Reason               string       `json:"reason,omitempty"`
@@ -323,13 +335,28 @@ func (s *Service) Enabled() bool {
 	return s != nil && s.cfg.Enabled
 }
 
-func (s *Service) AuthorizeRelayFrame(ctx context.Context, header DataFrameHeader, bytes int64) bool {
-	if s == nil || bytes <= 0 {
+func (s *Service) AuthorizeRelayFrame(ctx context.Context, header DataFrameHeader, fromClientID, toClientID, bytes int64) bool {
+	if s == nil || fromClientID <= 0 || toClientID <= 0 || bytes <= 0 {
 		return false
 	}
+	return s.authorizeRelayFrame(ctx, header, fromClientID, toClientID, bytes, true)
+}
+
+func (s *Service) ValidateRelayFrame(ctx context.Context, header DataFrameHeader, fromClientID, toClientID int64) bool {
+	if s == nil || fromClientID <= 0 || toClientID <= 0 {
+		return false
+	}
+	return s.authorizeRelayFrame(ctx, header, fromClientID, toClientID, 0, false)
+}
+
+func (s *Service) authorizeRelayFrame(ctx context.Context, header DataFrameHeader,
+	fromClientID, toClientID, bytes int64, account bool) bool {
 	now := time.Now()
-	if s.authorizeRelayFrameCached(header, bytes, now) {
+	if s.authorizeRelayFrameCached(header, fromClientID, toClientID, bytes, now, account) {
 		return true
+	}
+	if s.db == nil {
+		return false
 	}
 	item, err := s.db.GetPeerMeshSession(ctx, header.SessionID)
 	if err != nil || item == nil {
@@ -342,15 +369,42 @@ func (s *Service) AuthorizeRelayFrame(ctx context.Context, header DataFrameHeade
 	if item.Status != StatusActive {
 		return false
 	}
-	forward := header.FromClientID == item.SourceClientID && header.ToClientID == item.TargetClientID
-	reverse := header.FromClientID == item.TargetClientID && header.ToClientID == item.SourceClientID
+	forward := fromClientID == item.SourceClientID && toClientID == item.TargetClientID
+	reverse := fromClientID == item.TargetClientID && toClientID == item.SourceClientID
 	if !forward && !reverse {
 		s.removeRelaySession(header.SessionID)
 		return false
 	}
 	s.cacheRelayAuthorization(*item, now)
-	s.addPendingRelayBytes(header.SessionID, bytes)
+	if account {
+		s.addPendingRelayBytes(header.SessionID, bytes)
+	}
 	return true
+}
+
+func (s *Service) AuthorizeRelayProbe(ctx context.Context, probe relayProbe) bool {
+	if s == nil || s.db == nil || probe.SessionID <= 0 || probe.FromClientID <= 0 || probe.ToClientID <= 0 ||
+		strings.TrimSpace(probe.Token) == "" ||
+		(probe.Type != peerProbeTypeCheck && probe.Type != peerProbeTypeCheckResponse) {
+		return false
+	}
+	item, err := s.db.GetPeerMeshSession(ctx, probe.SessionID)
+	if err != nil || item == nil {
+		return false
+	}
+	now := time.Now()
+	if s.closeIfExpired(item, now) {
+		_ = s.db.UpdatePeerMeshSession(ctx, *item)
+		return false
+	}
+	forward := probe.FromClientID == item.SourceClientID && probe.ToClientID == item.TargetClientID
+	reverse := probe.FromClientID == item.TargetClientID && probe.ToClientID == item.SourceClientID
+	if (!forward && !reverse) || item.Status == StatusClosed || item.TokenHash == nil {
+		return false
+	}
+	actual := sha256.Sum256([]byte(probe.Token))
+	expected, err := hex.DecodeString(strings.TrimSpace(*item.TokenHash))
+	return err == nil && len(expected) == len(actual) && subtle.ConstantTimeCompare(expected, actual[:]) == 1
 }
 
 func (s *Service) Run(ctx context.Context) {
@@ -860,6 +914,15 @@ func (s *Service) PathStats(ctx context.Context, access AccessContext) (PathStat
 	if err != nil {
 		return PathStatsView{}, err
 	}
+	addressFamilyAggregates, err := s.db.AggregatePeerMeshAddressFamilies(
+		ctx,
+		access.TenantID,
+		ids,
+		filterIDs,
+	)
+	if err != nil {
+		return PathStatsView{}, err
+	}
 	natAggregates, err := s.db.AggregatePeerMeshNatTypes(ctx, access.TenantID, access.Username, !access.Admin)
 	if err != nil {
 		return PathStatsView{}, err
@@ -895,6 +958,16 @@ func (s *Service) PathStats(ctx context.Context, access AccessContext) (PathStat
 			AvgRttMillis:     item.AvgRttMillis,
 			DirectBytes:      item.DirectBytes,
 			RelayBytes:       item.RelayBytes,
+		})
+	}
+	addressFamilies := make([]AddressFamilyStat, 0, len(addressFamilyAggregates))
+	for _, item := range addressFamilyAggregates {
+		addressFamilies = append(addressFamilies, AddressFamilyStat{
+			AddressFamily:    item.AddressFamily,
+			Status:           item.Status,
+			PathType:         item.PathType,
+			Sessions:         item.Sessions,
+			ReportedSessions: item.ReportedSessions,
 		})
 	}
 	natCounts := make(map[string]int64)
@@ -955,6 +1028,7 @@ func (s *Service) PathStats(ctx context.Context, access AccessContext) (PathStat
 		ActiveRelaySessions:          activeRelay,
 		ActiveDirectRatio:            directRatio,
 		PathTypes:                    pathTypes,
+		AddressFamilies:              addressFamilies,
 		NatTypes:                     natTypes,
 		NatBehaviorDevices:           natBehaviorDevices,
 		NatBehaviorClassifiedDevices: natBehaviorClassifiedDevices,
@@ -1359,7 +1433,8 @@ func (s *Service) sendSessionGrant(source, target store.ClientAccount, grant ses
 		TargetClientID: target.ID, TargetClientName: target.ClientName,
 		Token: grant.token, ExpiresAt: grant.session.ExpiresAt,
 		PathType: grant.session.PathType, Status: grant.session.Status,
-		CreatedAtMillis: time.Now().UnixMilli(),
+		DataFrameVersion: 2,
+		CreatedAtMillis:  time.Now().UnixMilli(),
 	}
 	if sourceDevice != nil {
 		msg.SourceVirtualIP = sourceDevice.VirtualIP
@@ -1585,7 +1660,8 @@ func (s *Service) applyTraffic(item *store.PeerMeshSession, directBytes, relayBy
 	item.UpdatedAt = now
 }
 
-func (s *Service) authorizeRelayFrameCached(header DataFrameHeader, bytes int64, now time.Time) bool {
+func (s *Service) authorizeRelayFrameCached(header DataFrameHeader, fromClientID, toClientID,
+	bytes int64, now time.Time, account bool) bool {
 	s.relayMu.Lock()
 	authz, ok := s.relayAuthorizations[header.SessionID]
 	if !ok || !authz.validAt(now) {
@@ -1595,11 +1671,13 @@ func (s *Service) authorizeRelayFrameCached(header DataFrameHeader, bytes int64,
 		s.relayMu.Unlock()
 		return false
 	}
-	if !authz.matches(header) {
+	if !authz.matches(fromClientID, toClientID) {
 		s.relayMu.Unlock()
 		return false
 	}
-	s.pendingRelayBytes[header.SessionID] += bytes
+	if account {
+		s.pendingRelayBytes[header.SessionID] += bytes
+	}
 	s.relayMu.Unlock()
 	return true
 }
@@ -1650,9 +1728,9 @@ func (a relayAuthorization) validAt(now time.Time) bool {
 	return a.active && a.cacheExpiresAt.After(now) && (a.sessionExpiresAt.IsZero() || a.sessionExpiresAt.After(now))
 }
 
-func (a relayAuthorization) matches(header DataFrameHeader) bool {
-	forward := header.FromClientID == a.sourceClientID && header.ToClientID == a.targetClientID
-	reverse := header.FromClientID == a.targetClientID && header.ToClientID == a.sourceClientID
+func (a relayAuthorization) matches(fromClientID, toClientID int64) bool {
+	forward := fromClientID == a.sourceClientID && toClientID == a.targetClientID
+	reverse := fromClientID == a.targetClientID && toClientID == a.sourceClientID
 	return forward || reverse
 }
 

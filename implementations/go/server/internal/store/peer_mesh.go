@@ -390,6 +390,14 @@ type PeerMeshPathTypeAggregate struct {
 	RelayBytes       int64
 }
 
+type PeerMeshAddressFamilyAggregate struct {
+	AddressFamily    string
+	Status           string
+	PathType         string
+	Sessions         int64
+	ReportedSessions int64
+}
+
 func (db *DB) AggregatePeerMeshPathTypes(ctx context.Context, tenantID string, clientIDs []int64, filterClientIDs bool) ([]PeerMeshPathTypeAggregate, error) {
 	if filterClientIDs && len(clientIDs) == 0 {
 		return nil, nil
@@ -433,6 +441,54 @@ func (db *DB) AggregatePeerMeshPathTypes(ctx context.Context, tenantID string, c
 		}
 		if avg.Valid {
 			item.AvgRttMillis = &avg.Float64
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (db *DB) AggregatePeerMeshAddressFamilies(ctx context.Context, tenantID string, clientIDs []int64, filterClientIDs bool) ([]PeerMeshAddressFamilyAggregate, error) {
+	if filterClientIDs && len(clientIDs) == 0 {
+		return nil, nil
+	}
+	args := []any{defaultTenant(tenantID)}
+	where := ` WHERE tenant_id = ?`
+	if filterClientIDs {
+		where += ` AND (source_client_id IN (` + placeholders(len(clientIDs)) + `)
+			OR target_client_id IN (` + placeholders(len(clientIDs)) + `))`
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+		for _, id := range clientIDs {
+			args = append(args, id)
+		}
+	}
+	addressFamily := `CASE
+		WHEN remote_endpoint IS NULL OR TRIM(remote_endpoint) = '' THEN 'UNKNOWN'
+		WHEN remote_endpoint LIKE '[%' THEN 'IPv6'
+		ELSE 'IPv4'
+	END`
+	effectivePathType := `CASE
+		WHEN relay_bytes > direct_bytes THEN 'RELAY'
+		WHEN direct_bytes > relay_bytes THEN 'DIRECT'
+		ELSE path_type
+	END`
+	query := db.rebind(`SELECT ` + addressFamily + ` AS address_family, status,
+		` + effectivePathType + ` AS path_type,
+		COUNT(*) AS sessions,
+		COUNT(rtt_millis) AS reported_sessions
+		FROM peer_mesh_session` + where + ` GROUP BY ` + addressFamily + `, status, ` + effectivePathType)
+	rows, err := db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PeerMeshAddressFamilyAggregate
+	for rows.Next() {
+		var item PeerMeshAddressFamilyAggregate
+		if err := rows.Scan(&item.AddressFamily, &item.Status, &item.PathType,
+			&item.Sessions, &item.ReportedSessions); err != nil {
+			return nil, err
 		}
 		items = append(items, item)
 	}

@@ -11,8 +11,10 @@ const (
 	ipv4ProtocolTCP  = 6
 	ipv4ProtocolUDP  = 17
 
-	icmpEchoReply   = 0
-	icmpEchoRequest = 8
+	icmpEchoReply              = 0
+	icmpEchoRequest            = 8
+	icmpDestinationUnreachable = 3
+	icmpFragmentationNeeded    = 4
 )
 
 func peerPacketDestinationIPv4(packet []byte) string {
@@ -85,6 +87,81 @@ func peerPacketICMPEchoReplyFor(packet []byte, localVirtualIP string) []byte {
 	return reply
 }
 
+func peerPacketClampTCPMSS(packet []byte, pathMTU int) []byte {
+	if len(packet) < 20 || packet[0]>>4 != 4 || peerPacketProtocol(packet) != ipv4ProtocolTCP {
+		return packet
+	}
+	ipHeaderLength := int(packet[0]&0x0f) * 4
+	totalLength := peerPacketTotalLength(packet)
+	if ipHeaderLength < 20 || totalLength < ipHeaderLength+20 || packet[ipHeaderLength+13]&0x02 == 0 {
+		return packet
+	}
+	tcpHeaderLength := int(packet[ipHeaderLength+12]>>4) * 4
+	if tcpHeaderLength < 20 || totalLength < ipHeaderLength+tcpHeaderLength {
+		return packet
+	}
+	maxMSS := max(536, pathMTU-ipHeaderLength-20)
+	for cursor, end := ipHeaderLength+20, ipHeaderLength+tcpHeaderLength; cursor < end; {
+		kind := packet[cursor]
+		if kind == 0 {
+			break
+		}
+		if kind == 1 {
+			cursor++
+			continue
+		}
+		if cursor+1 >= end {
+			break
+		}
+		optionLength := int(packet[cursor+1])
+		if optionLength < 2 || cursor+optionLength > end {
+			break
+		}
+		if kind == 2 && optionLength == 4 {
+			advertised := int(binary.BigEndian.Uint16(packet[cursor+2 : cursor+4]))
+			if advertised <= maxMSS {
+				return packet
+			}
+			clamped := append([]byte(nil), packet...)
+			binary.BigEndian.PutUint16(clamped[cursor+2:cursor+4], uint16(maxMSS))
+			clamped[ipHeaderLength+16] = 0
+			clamped[ipHeaderLength+17] = 0
+			binary.BigEndian.PutUint16(
+				clamped[ipHeaderLength+16:ipHeaderLength+18],
+				peerPacketTCPChecksum(clamped, ipHeaderLength, totalLength-ipHeaderLength))
+			return clamped
+		}
+		cursor += optionLength
+	}
+	return packet
+}
+
+func peerPacketICMPFragmentationNeededFor(packet []byte, pathMTU int) []byte {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return nil
+	}
+	originalHeaderLength := int(packet[0]&0x0f) * 4
+	if originalHeaderLength < 20 || len(packet) < originalHeaderLength {
+		return nil
+	}
+	originalLength := peerPacketTotalLength(packet)
+	quotedLength := min(originalLength, originalHeaderLength+8)
+	response := make([]byte, 20+8+quotedLength)
+	response[0] = 0x45
+	binary.BigEndian.PutUint16(response[2:4], uint16(len(response)))
+	response[8] = 64
+	response[9] = ipv4ProtocolICMP
+	copy(response[12:16], packet[16:20])
+	copy(response[16:20], packet[12:16])
+	response[20] = icmpDestinationUnreachable
+	response[21] = icmpFragmentationNeeded
+	binary.BigEndian.PutUint16(response[26:28], uint16(pathMTU))
+	copy(response[28:], packet[:quotedLength])
+	binary.BigEndian.PutUint16(response[22:24], peerPacketChecksum(response[20:]))
+	binary.BigEndian.PutUint16(response[10:12], peerPacketChecksum(response[:20]))
+	return response
+}
+
 func peerPacketIsICMPEchoRequestFor(packet []byte, localVirtualIP string) bool {
 	if peerPacketDestinationIPv4(packet) != localVirtualIP {
 		return false
@@ -116,6 +193,26 @@ func peerPacketChecksum(data []byte) uint16 {
 	}
 	if len(data)%2 == 1 {
 		sum += uint32(data[len(data)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func peerPacketTCPChecksum(packet []byte, tcpOffset, tcpLength int) uint16 {
+	var sum uint32
+	for index := 12; index < 20; index += 2 {
+		sum += uint32(binary.BigEndian.Uint16(packet[index : index+2]))
+	}
+	sum += ipv4ProtocolTCP
+	sum += uint32(tcpLength)
+	segment := packet[tcpOffset : tcpOffset+tcpLength]
+	for index := 0; index+1 < len(segment); index += 2 {
+		sum += uint32(binary.BigEndian.Uint16(segment[index : index+2]))
+	}
+	if len(segment)%2 == 1 {
+		sum += uint32(segment[len(segment)-1]) << 8
 	}
 	for sum>>16 != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)

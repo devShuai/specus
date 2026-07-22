@@ -143,7 +143,8 @@ func TestConnectWebSocketTunnelForwardsLocalTextFrame(t *testing.T) {
 	tunnelClient.syncHTTPTunnelConfigs([]HTTPTunnelConfig{
 		{Route: "app", TargetBaseURL: "http://" + listener.Addr().String() + "/base"},
 	})
-	tunnelClient.connectWebSocketTunnel(controlClient, map[string]any{
+	tunnelClient.openNatFlow(1)
+	tunnelClient.connectWebSocketTunnel(controlClient, 1, map[string]any{
 		"channelId":    "ws1",
 		"source":       "ws",
 		"route":        "app",
@@ -170,14 +171,40 @@ func TestConnectWebSocketTunnelForwardsLocalTextFrame(t *testing.T) {
 	if message.Type != protocol.NatData {
 		t.Fatalf("NAT type = %d, want DATA", message.Type)
 	}
-	if got := message.Metadata["channelId"]; got != "ws1" {
-		t.Fatalf("channelId = %v, want ws1", got)
+	if message.StreamID != 1 || len(message.Metadata) != 0 {
+		t.Fatalf("stream frame = %#v, want stream 1 without metadata", message)
 	}
-	if got := message.Metadata["source"]; got != "ws" {
-		t.Fatalf("source = %v, want ws", got)
+	frame, err := decodeWebSocketTunnelFrame(message.Data)
+	if err != nil {
+		t.Fatalf("decode SWS2: %v", err)
 	}
-	if got, want := string(message.Data), string(append([]byte{webSocketFrameText}, []byte("hello")...)); got != want {
-		t.Fatalf("payload = %q, want %q", got, want)
+	if frame.opcode != webSocketOpcodeText || !frame.fin || frame.rsv != 0 ||
+		frame.closeCode != 0 || string(frame.payload) != "hello" {
+		t.Fatalf("SWS2 frame = %#v, want final text hello", frame)
+	}
+}
+
+func TestWebSocketTunnelFrameRejectsLegacyPrefix(t *testing.T) {
+	if _, err := decodeWebSocketTunnelFrame([]byte{0x01, 'o', 'l', 'd'}); err == nil {
+		t.Fatal("legacy websocket prefix was accepted")
+	}
+}
+
+func TestWebSocketTunnelFrameRoundTripClose(t *testing.T) {
+	want := webSocketTunnelFrame{
+		opcode: webSocketOpcodeClose, fin: true, closeCode: 1001, payload: []byte("going away"),
+	}
+	encoded, err := encodeWebSocketTunnelFrame(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeWebSocketTunnelFrame(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.opcode != want.opcode || !got.fin || got.closeCode != want.closeCode ||
+		string(got.payload) != string(want.payload) {
+		t.Fatalf("round trip = %#v, want %#v", got, want)
 	}
 }
 

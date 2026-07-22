@@ -131,6 +131,19 @@ type rateWindow struct {
 	count   int
 }
 
+// SharedRateLimiter is implemented by the server Redis coordination layer without
+// coupling the attachment package to a concrete Redis client.
+type SharedRateLimiter interface {
+	AllowRate(context.Context, string, string, int, time.Duration) (bool, error)
+}
+
+type SharedRateLimiterFunc func(context.Context, string, string, int, time.Duration) (bool, error)
+
+func (limiter SharedRateLimiterFunc) AllowRate(ctx context.Context, bucket, identity string,
+	limit int, window time.Duration) (bool, error) {
+	return limiter(ctx, bucket, identity, limit, window)
+}
+
 type Service struct {
 	db                *store.DB
 	storage           *ObjectStorage
@@ -139,15 +152,25 @@ type Service struct {
 	rateMu            sync.Mutex
 	rateByIP          map[string]rateWindow
 	maxTrackedSources int
+	sharedRateLimiter SharedRateLimiter
 	quotaLocks        [64]sync.Mutex
 }
 
-func NewService(db *store.DB, objectCfg config.ObjectStorageConfig, publicCfg config.PublicTransferConfig) *Service {
-	return &Service{db: db, storage: NewObjectStorage(objectCfg), objectCfg: objectCfg,
+func NewService(db *store.DB, objectCfg config.ObjectStorageConfig, publicCfg config.PublicTransferConfig,
+	sharedRateLimiter ...SharedRateLimiter) *Service {
+	service := &Service{db: db, storage: NewObjectStorage(objectCfg), objectCfg: objectCfg,
 		publicCfg: publicCfg, rateByIP: make(map[string]rateWindow), maxTrackedSources: maxTrackedRateSources}
+	if len(sharedRateLimiter) > 0 {
+		service.sharedRateLimiter = sharedRateLimiter[0]
+	}
+	return service
 }
 
 func (s *Service) CheckPresignIP(ip string) error {
+	return s.CheckPresignIPContext(context.Background(), ip)
+}
+
+func (s *Service) CheckPresignIPContext(ctx context.Context, ip string) error {
 	limit := s.publicCfg.PresignRateLimitPerIP
 	if limit < 1 {
 		limit = 1
@@ -160,6 +183,19 @@ func (s *Service) CheckPresignIP(ip string) error {
 	ip = strings.TrimSpace(ip)
 	if ip == "" {
 		ip = "unknown"
+	}
+	if s.publicCfg.ClusterEnabled {
+		if s.sharedRateLimiter == nil {
+			return rateLimited("服务暂时不可用,请稍后再试")
+		}
+		allowed, err := s.sharedRateLimiter.AllowRate(ctx, "presign-upload", ip, limit, windowDuration)
+		if err != nil {
+			return rateLimited("服务暂时不可用,请稍后再试")
+		}
+		if !allowed {
+			return rateLimited("请求过于频繁,请稍后再试")
+		}
+		return nil
 	}
 	s.rateMu.Lock()
 	defer s.rateMu.Unlock()

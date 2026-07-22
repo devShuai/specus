@@ -34,7 +34,8 @@ func TestConnectLocalTunnelIgnoresInvalidTcpConnectedLikeJava(t *testing.T) {
 			control := &captureConn{}
 			tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
 
-			tunnelClient.connectLocalTunnel(control, tc.metadata)
+			tunnelClient.openNatFlow(1)
+			tunnelClient.connectLocalTunnel(control, 1, tc.metadata)
 
 			if control.Len() != 0 {
 				t.Fatalf("control connection wrote %d bytes, want no DISCONNECTED frame", control.Len())

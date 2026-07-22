@@ -1,12 +1,9 @@
-// Package directhttp forwards inbound HTTP requests to an online client over the control
-// channel (DIRECT_HTTP_REQUEST) and relays the client's DIRECT_HTTP_RESPONSE back. Mirrors the
-// C# DirectHttpDispatcher / DirectHttpEndpoints.
 package directhttp
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,36 +11,55 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
+const (
+	httpChunkBytes       = 64 * 1024
+	maxHTTPResponseBytes = 64 * 1024 * 1024
+	detailCaptureBytes   = 64 * 1024
+)
+
+var errRequestTooLarge = errors.New("HTTP 请求体超过限制")
+
 var skippedHeaders = map[string]struct{}{
 	"connection": {}, "content-length": {}, "host": {}, "keep-alive": {},
-	"proxy-authenticate": {}, "proxy-authorization": {}, "te": {}, "trailer": {},
-	"transfer-encoding": {}, "upgrade": {},
+	"proxy-authenticate": {}, "proxy-authorization": {}, "te": {},
+	"trailer": {}, "transfer-encoding": {}, "upgrade": {},
 }
 
-// TrafficRecorder lets the forwarder account request/response bytes (optional).
+// Stream is the HTTP-facing contract of one NAT stream v2 exchange.
+type Stream interface {
+	SendData(context.Context, []byte) error
+	FinishRequest(map[string]any) error
+	WaitResponseHead(context.Context) (map[string]any, error)
+	ReadResponse(context.Context) ([]byte, map[string]any, bool, error)
+	Consume(int) error
+	Reset(uint32, string)
+	Close()
+}
+
+// OpenStreamFunc allocates a stream in an authenticated client's NAT namespace.
+type OpenStreamFunc func(clientName string, metadata map[string]any) (Stream, error)
+
 type TrafficRecorder interface {
 	RecordHTTPUpload(clientName, route string, bytes int64)
 	RecordHTTPDownload(clientName, route string, bytes int64)
 }
 
-// RouteSettings looks up server-side options for an HTTP route.
 type RouteSettings interface {
 	HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route string) (bool, error)
 }
 
-// DetailRecorder optionally persists full HTTP exchange details.
 type DetailRecorder interface {
 	RecordHTTPExchange(ctx context.Context, record store.HTTPExchangeRecord) error
 }
 
-// Service forwards HTTP requests and matches responses by request id.
+// Service streams public HTTP requests through mandatory NAT stream v2 frames.
 type Service struct {
 	sessions    *session.Registry
+	openStream  OpenStreamFunc
 	timeout     time.Duration
 	maxBodySize int
 	traffic     TrafficRecorder
@@ -51,154 +67,260 @@ type Service struct {
 	detail      DetailRecorder
 	detailOpts  store.TrafficDetailOptions
 	rewriter    responseRewriter
-
-	mu      sync.Mutex
-	pending map[string]chan protocol.DirectHTTPResponse
 }
 
-// NewService builds the Direct HTTP forwarder.
-func NewService(sessions *session.Registry, timeout time.Duration, maxBodySize int, rewriteMaxBodyBytes int,
-	traffic TrafficRecorder, routes RouteSettings, detail DetailRecorder, detailOpts store.TrafficDetailOptions) *Service {
+func NewService(sessions *session.Registry, openStream OpenStreamFunc, timeout time.Duration,
+	maxBodySize int, rewriteMaxBodyBytes int, traffic TrafficRecorder, routes RouteSettings,
+	detail DetailRecorder, detailOpts store.TrafficDetailOptions) *Service {
 	return &Service{
-		sessions:    sessions,
-		timeout:     timeout,
-		maxBodySize: maxBodySize,
-		traffic:     traffic,
-		routes:      routes,
-		detail:      detail,
-		detailOpts:  detailOpts,
-		rewriter:    newResponseRewriter(rewriteMaxBodyBytes),
-		pending:     make(map[string]chan protocol.DirectHTTPResponse),
+		sessions: sessions, openStream: openStream, timeout: timeout, maxBodySize: maxBodySize,
+		traffic: traffic, routes: routes, detail: detail, detailOpts: detailOpts,
+		rewriter: newResponseRewriter(rewriteMaxBodyBytes),
 	}
 }
 
-// Ack completes a pending request when its response arrives on the control channel.
-func (s *Service) Ack(response protocol.DirectHTTPResponse) {
-	s.mu.Lock()
-	ch, ok := s.pending[response.RequestID]
-	if ok {
-		delete(s.pending, response.RequestID)
-	}
-	s.mu.Unlock()
-	if ok {
-		ch <- response
-	}
-}
-
-// ServeHTTP handles /http/{clientName}/{route}[/{rest...}] for all methods.
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 	clientName := r.PathValue("clientName")
 	route := r.PathValue("route")
+	path := relativePath(r)
+	requestHeaders := collectHeaders(r.Header)
+	requestCapture := &limitedCapture{limit: detailCaptureBytes}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.maxBodySize)+1))
-	if err != nil {
-		writeTextError(w, http.StatusBadGateway, "读取请求体失败")
-		return
+	fail := func(status int, message string) {
+		writeTextError(w, status, message)
+		s.recordHTTPDetail(r.Context(), clientName, route, r.Method, path, r.URL.RawQuery,
+			requestHeaders, requestCapture.Bytes(), status, plainErrorHeaders(), []byte(message), message,
+			startedAt, r.RemoteAddr)
 	}
-	relativePath := relativePath(r)
-	request := protocol.DirectHTTPRequest{
-		RequestID:     newRequestID(),
-		RequestMethod: r.Method,
-		Route:         route,
-		RelativePath:  relativePath,
-		RawQuery:      r.URL.RawQuery,
-		Headers:       collectHeaders(r.Header),
-		Body:          body,
-	}
-	if len(body) > s.maxBodySize {
-		errorText := "HTTP 请求体超过限制"
-		s.recordHTTPDetail(r.Context(), clientName, route, request, protocol.DirectHTTPResponse{
-			StatusCode: http.StatusRequestEntityTooLarge,
-			Headers:    plainErrorHeaders(),
-			Body:       []byte(errorText),
-			Error:      stringPtr(errorText),
-		}, startedAt, r.RemoteAddr)
-		writeTextError(w, http.StatusRequestEntityTooLarge, errorText)
-		return
-	}
-
-	response, err := s.forward(clientName, request)
-	if err != nil {
-		status := statusForError(err)
-		errorText := err.Error()
-		s.recordHTTPDetail(r.Context(), clientName, route, request, protocol.DirectHTTPResponse{
-			StatusCode: status,
-			Headers:    plainErrorHeaders(),
-			Body:       []byte(errorText),
-			Error:      stringPtr(errorText),
-		}, startedAt, r.RemoteAddr)
-		writeTextError(w, status, errorText)
-		return
-	}
-	if s.traffic != nil {
-		s.traffic.RecordHTTPUpload(clientName, route, int64(len(body)))
-		s.traffic.RecordHTTPDownload(clientName, route, int64(len(response.Body)))
-	}
-	if response.Error != nil && *response.Error != "" {
-		status := response.StatusCode
-		if status <= 0 {
-			status = http.StatusBadGateway
+	if r.ContentLength > int64(s.maxBodySize) && s.maxBodySize >= 0 {
+		captureSize := min(detailCaptureBytes, s.maxBodySize+1)
+		if captureSize > 0 {
+			buffer := make([]byte, captureSize)
+			read, _ := io.ReadFull(r.Body, buffer)
+			requestCapture.Write(buffer[:read])
 		}
-		errorText := *response.Error
-		s.recordHTTPDetail(r.Context(), clientName, route, request, protocol.DirectHTTPResponse{
-			StatusCode: status,
-			Headers:    plainErrorHeaders(),
-			Body:       []byte(errorText),
-			Error:      stringPtr(errorText),
-		}, startedAt, r.RemoteAddr)
-		writeTextError(w, status, errorText)
+		_ = r.Body.Close()
+		fail(http.StatusRequestEntityTooLarge, errRequestTooLarge.Error())
 		return
 	}
-	responseHeaders := response.Headers
-	if s.pathRewriteEnabled(r.Context(), clientName, route) {
-		if rewritten, ok := s.rewriter.rewrite(response.Body, clientName, route, responseHeaders); ok {
-			response.Body = rewritten
+
+	if s.sessions == nil {
+		fail(http.StatusServiceUnavailable, errOffline.Error()+": "+clientName)
+		return
+	}
+	if _, online := s.sessions.Find(clientName); !online {
+		fail(http.StatusServiceUnavailable, errOffline.Error()+": "+clientName)
+		return
+	}
+	if s.openStream == nil {
+		fail(http.StatusBadGateway, "HTTP 流服务不可用")
+		return
+	}
+
+	metadata := map[string]any{
+		"source": "http", "phase": "request", "method": r.Method, "route": route,
+		"relativePath": path, "rawQuery": r.URL.RawQuery, "headers": requestHeaders,
+		"contentLength": r.ContentLength, "trailerNames": headerNames(r.Trailer),
+	}
+	stream, err := s.openStream(clientName, metadata)
+	if err != nil {
+		fail(http.StatusBadGateway, "HTTP 转发请求发送失败")
+		return
+	}
+	defer stream.Close()
+
+	pumpResult := make(chan error, 1)
+	go func() {
+		pumpResult <- s.pumpRequest(r.Context(), r.Body, r.Trailer, stream, clientName, route, requestCapture)
+	}()
+
+	headerCtx := r.Context()
+	var cancel context.CancelFunc
+	if s.timeout > 0 {
+		headerCtx, cancel = context.WithTimeout(headerCtx, s.timeout)
+		defer cancel()
+	}
+	head, err := stream.WaitResponseHead(headerCtx)
+	if err != nil {
+		stream.Reset(1, "HTTP downstream closed before response headers")
+		_ = r.Body.Close()
+		requestErr := receivePumpResult(pumpResult)
+		if errors.Is(requestErr, errRequestTooLarge) {
+			fail(http.StatusRequestEntityTooLarge, errRequestTooLarge.Error())
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			fail(http.StatusGatewayTimeout, errTimeout.Error())
+			return
+		}
+		fail(http.StatusBadGateway, errorText(err))
+		return
+	}
+
+	status, ok := metadataInt(head, "statusCode")
+	if !ok || status < 100 || status > 599 {
+		stream.Reset(2, "invalid HTTP response status")
+		fail(http.StatusBadGateway, "HTTP 响应状态无效")
+		return
+	}
+	responseHeaders := metadataStrings(head, "headers")
+	declareTrailers(w, metadataStrings(head, "trailerNames"))
+
+	rewrite := s.pathRewriteEnabled(r.Context(), clientName, route) &&
+		isRewritableContentType(responseHeaders)
+	responseCapture := &limitedCapture{limit: detailCaptureBytes}
+	var rewriteBuffer bytes.Buffer
+	responseStarted := false
+	totalResponse := 0
+	trailers := []string(nil)
+
+	startResponse := func(headers []string) {
+		if responseStarted {
+			return
+		}
+		applyResponseHeaders(w, headers)
+		w.WriteHeader(status)
+		responseStarted = true
+	}
+	writeChunk := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		written, writeErr := w.Write(data)
+		if written > 0 {
+			responseCapture.Write(data[:written])
+			if s.traffic != nil {
+				s.traffic.RecordHTTPDownload(clientName, route, int64(written))
+			}
+			if consumeErr := stream.Consume(written); consumeErr != nil && writeErr == nil {
+				writeErr = consumeErr
+			}
+		}
+		if writeErr == nil && written != len(data) {
+			writeErr = io.ErrShortWrite
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return writeErr
+	}
+
+	for {
+		data, endMetadata, end, readErr := stream.ReadResponse(r.Context())
+		if readErr != nil {
+			stream.Reset(3, "HTTP response stream failed")
+			if !responseStarted {
+				fail(http.StatusBadGateway, errorText(readErr))
+			}
+			return
+		}
+		if end {
+			trailers = metadataStrings(endMetadata, "trailers")
+			break
+		}
+		totalResponse += len(data)
+		if totalResponse > maxHTTPResponseBytes {
+			stream.Reset(4, "HTTP response body exceeds limit")
+			if !responseStarted {
+				fail(http.StatusBadGateway, "HTTP 响应体超过限制")
+			}
+			return
+		}
+
+		if rewrite {
+			if rewriteBuffer.Len()+len(data) <= s.rewriter.maxBodyBytes {
+				_, _ = rewriteBuffer.Write(data)
+				if err := stream.Consume(len(data)); err != nil {
+					stream.Reset(5, err.Error())
+					return
+				}
+				continue
+			}
+			startResponse(responseHeaders)
+			if err := writeBufferedWithoutCredit(w, &rewriteBuffer, responseCapture, s.traffic, clientName, route); err != nil {
+				stream.Reset(6, "HTTP downstream write failed")
+				return
+			}
+			rewrite = false
+		}
+		startResponse(responseHeaders)
+		if err := writeChunk(data); err != nil {
+			stream.Reset(6, "HTTP downstream write failed")
+			return
+		}
+	}
+
+	if rewrite {
+		body := rewriteBuffer.Bytes()
+		if rewritten, changed := s.rewriter.rewrite(body, clientName, route, responseHeaders); changed {
+			body = rewritten
 			responseHeaders = stripRewriteHeaders(responseHeaders)
 		}
+		startResponse(responseHeaders)
+		if err := writeBufferedWithoutCredit(w, bytes.NewBuffer(body), responseCapture,
+			s.traffic, clientName, route); err != nil {
+			stream.Reset(6, "HTTP downstream write failed")
+			return
+		}
+	} else if !responseStarted {
+		startResponse(responseHeaders)
 	}
-	applyResponseHeaders(w, responseHeaders)
-	status := response.StatusCode
-	if status <= 0 {
-		status = http.StatusOK
-	}
-	s.recordHTTPDetail(r.Context(), clientName, route, request, response, startedAt, r.RemoteAddr)
-	w.WriteHeader(status)
-	_, _ = w.Write(response.Body)
+	applyTrailers(w, trailers)
+	_ = r.Body.Close()
+
+	s.recordHTTPDetail(r.Context(), clientName, route, r.Method, path, r.URL.RawQuery,
+		requestHeaders, requestCapture.Bytes(), status, responseHeaders, responseCapture.Bytes(), "",
+		startedAt, r.RemoteAddr)
 }
 
-func (s *Service) recordHTTPDetail(ctx context.Context, clientName, route string, request protocol.DirectHTTPRequest,
-	response protocol.DirectHTTPResponse, startedAt time.Time, remoteAddress string) {
+func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers http.Header, stream Stream,
+	clientName, route string, capture *limitedCapture) error {
+	defer body.Close()
+	buffer := make([]byte, httpChunkBytes)
+	total := 0
+	for {
+		read, err := body.Read(buffer)
+		if read > 0 {
+			capture.Write(buffer[:read])
+			total += read
+			if total > s.maxBodySize {
+				stream.Reset(7, errRequestTooLarge.Error())
+				return errRequestTooLarge
+			}
+			payload := append([]byte(nil), buffer[:read]...)
+			if sendErr := stream.SendData(ctx, payload); sendErr != nil {
+				return sendErr
+			}
+			if s.traffic != nil {
+				s.traffic.RecordHTTPUpload(clientName, route, int64(read))
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				metadata := map[string]any(nil)
+				if values := collectHeaders(trailers); len(values) > 0 {
+					metadata = map[string]any{"trailers": values}
+				}
+				return stream.FinishRequest(metadata)
+			}
+			stream.Reset(8, "HTTP request body read failed")
+			return err
+		}
+	}
+}
+
+func (s *Service) recordHTTPDetail(ctx context.Context, clientName, route, method, relativePath,
+	rawQuery string, requestHeaders []string, requestBody []byte, status int, responseHeaders []string,
+	responseBody []byte, errText string, startedAt time.Time, remoteAddress string) {
 	if s.detail == nil {
 		return
 	}
-	errText := ""
-	if response.Error != nil {
-		errText = *response.Error
-	}
-	statusCode := response.StatusCode
-	if statusCode <= 0 {
-		if errText != "" {
-			statusCode = http.StatusBadGateway
-		} else {
-			statusCode = http.StatusOK
-		}
-	}
 	_ = s.detail.RecordHTTPExchange(ctx, store.HTTPExchangeRecord{
-		ClientName:      clientName,
-		Route:           route,
-		Method:          request.RequestMethod,
-		RelativePath:    request.RelativePath,
-		RawQuery:        request.RawQuery,
-		RequestHeaders:  request.Headers,
-		RequestBody:     request.Body,
-		StatusCode:      statusCode,
-		ResponseHeaders: response.Headers,
-		ResponseBody:    response.Body,
-		StartedAt:       startedAt,
-		RemoteAddress:   remoteAddress,
-		Error:           errText,
-		Options:         s.detailOpts,
+		ClientName: clientName, Route: route, Method: method, RelativePath: relativePath,
+		RawQuery: rawQuery, RequestHeaders: requestHeaders, RequestBody: requestBody,
+		StatusCode: status, ResponseHeaders: responseHeaders, ResponseBody: responseBody,
+		StartedAt: startedAt, RemoteAddress: remoteAddress, Error: errText, Options: s.detailOpts,
 	})
 }
 
@@ -208,53 +330,6 @@ func (s *Service) pathRewriteEnabled(ctx context.Context, clientName, route stri
 	}
 	enabled, err := s.routes.HTTPRoutePathRewriteEnabled(ctx, clientName, route)
 	return err == nil && enabled
-}
-
-func (s *Service) forward(clientName string, request protocol.DirectHTTPRequest) (protocol.DirectHTTPResponse, error) {
-	bound, ok := s.sessions.Find(clientName)
-	if !ok {
-		return protocol.DirectHTTPResponse{}, fmt.Errorf("%w: %s", errOffline, clientName)
-	}
-
-	ch := make(chan protocol.DirectHTTPResponse, 1)
-	s.mu.Lock()
-	s.pending[request.RequestID] = ch
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.pending, request.RequestID)
-		s.mu.Unlock()
-	}()
-
-	if err := bound.Send(request); err != nil {
-		errorText := "HTTP 转发请求发送失败"
-		return protocol.DirectHTTPResponse{
-			RequestID:  request.RequestID,
-			StatusCode: http.StatusBadGateway,
-			Headers:    nil,
-			Body:       nil,
-			Error:      stringPtr(errorText),
-		}, nil
-	}
-	select {
-	case response := <-ch:
-		return response, nil
-	case <-time.After(s.timeout):
-		return protocol.DirectHTTPResponse{}, errTimeout
-	}
-}
-
-func collectHeaders(header http.Header) []string {
-	var headers []string
-	for name, values := range header {
-		if _, skip := skippedHeaders[strings.ToLower(name)]; skip {
-			continue
-		}
-		for _, value := range values {
-			headers = append(headers, name+":"+value)
-		}
-	}
-	return headers
 }
 
 func relativePath(r *http.Request) string {
@@ -279,6 +354,29 @@ func relativePath(r *http.Request) string {
 	return path[afterClient+routeSeparator:]
 }
 
+func collectHeaders(header http.Header) []string {
+	var headers []string
+	for name, values := range header {
+		if _, skip := skippedHeaders[strings.ToLower(name)]; skip {
+			continue
+		}
+		for _, value := range values {
+			headers = append(headers, name+":"+value)
+		}
+	}
+	return headers
+}
+
+func headerNames(header http.Header) []string {
+	names := make([]string, 0, len(header))
+	for name := range header {
+		if httpgutsValidHeaderName(name) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 func applyResponseHeaders(w http.ResponseWriter, headers []string) {
 	for _, header := range headers {
 		idx := strings.IndexByte(header, ':')
@@ -297,22 +395,23 @@ func stripRewriteHeaders(headers []string) []string {
 	result := make([]string, 0, len(headers))
 	for _, header := range headers {
 		idx := strings.IndexByte(header, ':')
-		if idx <= 0 {
-			result = append(result, header)
-			continue
-		}
-		name := strings.TrimSpace(header[:idx])
-		if strings.EqualFold(name, "content-encoding") || strings.EqualFold(name, "content-length") {
-			continue
+		if idx > 0 {
+			name := strings.TrimSpace(header[:idx])
+			if strings.EqualFold(name, "content-encoding") || strings.EqualFold(name, "content-length") {
+				continue
+			}
 		}
 		result = append(result, header)
 	}
 	return result
 }
 
-func plainErrorHeaders() []string {
-	return []string{"Content-Type:text/plain;charset=UTF-8"}
+func isRewritableContentType(headers []string) bool {
+	_, ok := rewritableContentTypes[contentType(headers)]
+	return ok
 }
+
+func plainErrorHeaders() []string { return []string{"Content-Type:text/plain;charset=UTF-8"} }
 
 func writeTextError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "text/plain;charset=UTF-8")
@@ -320,13 +419,136 @@ func writeTextError(w http.ResponseWriter, status int, message string) {
 	_, _ = io.WriteString(w, message)
 }
 
-func newRequestID() string {
-	var raw [16]byte
-	_, _ = rand.Read(raw[:])
-	raw[6] = (raw[6] & 0x0f) | 0x40
-	raw[8] = (raw[8] & 0x3f) | 0x80
-	encoded := hex.EncodeToString(raw[:])
-	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
+func metadataInt(metadata map[string]any, key string) (int, bool) {
+	value, ok := metadata[key]
+	if !ok {
+		return 0, false
+	}
+	switch number := value.(type) {
+	case float64:
+		return int(number), true
+	case int:
+		return number, true
+	case int64:
+		return int(number), true
+	default:
+		var result int
+		_, err := fmt.Sscan(fmt.Sprint(value), &result)
+		return result, err == nil
+	}
 }
 
-func stringPtr(value string) *string { return &value }
+func metadataStrings(metadata map[string]any, key string) []string {
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		if stringsValue, ok := value.([]string); ok {
+			return append([]string(nil), stringsValue...)
+		}
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if item != nil {
+			result = append(result, fmt.Sprint(item))
+		}
+	}
+	return result
+}
+
+func declareTrailers(w http.ResponseWriter, names []string) {
+	for _, name := range names {
+		if httpgutsValidHeaderName(name) {
+			w.Header().Add("Trailer", name)
+		}
+	}
+}
+
+func applyTrailers(w http.ResponseWriter, trailers []string) {
+	for _, trailer := range trailers {
+		idx := strings.IndexByte(trailer, ':')
+		if idx <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(trailer[:idx])
+		if httpgutsValidHeaderName(name) {
+			w.Header().Add(name, strings.TrimSpace(trailer[idx+1:]))
+		}
+	}
+}
+
+func httpgutsValidHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, ch := range name {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' ||
+			strings.ContainsRune("!#$%&'*+-.^_`|~", ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+func receivePumpResult(result <-chan error) error {
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(time.Second):
+		return nil
+	}
+}
+
+func errorText(err error) string {
+	if err == nil || strings.TrimSpace(err.Error()) == "" {
+		return "HTTP 转发请求失败"
+	}
+	return err.Error()
+}
+
+func writeBufferedWithoutCredit(w http.ResponseWriter, buffer *bytes.Buffer, capture *limitedCapture,
+	traffic TrafficRecorder, clientName, route string) error {
+	data := buffer.Bytes()
+	if len(data) == 0 {
+		return nil
+	}
+	written, err := w.Write(data)
+	if written > 0 {
+		capture.Write(data[:written])
+		if traffic != nil {
+			traffic.RecordHTTPDownload(clientName, route, int64(written))
+		}
+	}
+	if err == nil && written != len(data) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
+type limitedCapture struct {
+	mu    sync.Mutex
+	limit int
+	data  []byte
+}
+
+func (c *limitedCapture) Write(data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	remaining := c.limit - len(c.data)
+	if remaining <= 0 {
+		return
+	}
+	if len(data) > remaining {
+		data = data[:remaining]
+	}
+	c.data = append(c.data, data...)
+}
+
+func (c *limitedCapture) Bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.data...)
+}

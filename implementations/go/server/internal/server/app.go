@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -58,6 +59,7 @@ type App struct {
 	clientMessages          *clientMessagesHub
 	publicTransferDiscovery *publicTransferDiscoveryHub
 	attachments             *transfer.Service
+	webSocketTickets        *security.WebSocketTicketService
 }
 
 // New opens the database, applies the schema, seeds the demo client, and builds the app.
@@ -143,17 +145,34 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	natControl := nat.NewControlService(db, sessions, cfg.Netty.Port, cfg.PublicAddress)
 
 	tokens := security.NewLocalTokenService(cfg.Auth)
+	webSocketTickets := security.NewWebSocketTicketService(db)
 	oidcValidator := security.NewOidcValidator(cfg.Oidc)
 	peerMesh := peermesh.New(cfg.PeerMesh, db, sessions, logger)
-	attachments := transfer.NewService(db, cfg.ObjectStorage, cfg.PublicTransfer)
+	publicTransferDiscovery := newPublicTransferDiscoveryHubWithLogger(
+		cfg.PublicTransfer, webSocketTickets, logger)
+	if publicTransferDiscovery.startupErr != nil {
+		_ = db.Close()
+		return nil, publicTransferDiscovery.startupErr
+	}
+	attachments := transfer.NewService(db, cfg.ObjectStorage, cfg.PublicTransfer,
+		transfer.SharedRateLimiterFunc(func(ctx context.Context, bucket, identity string,
+			limit int, window time.Duration) (bool, error) {
+			if publicTransferDiscovery.coordination == nil {
+				return false, errors.New("public transfer coordination is unavailable")
+			}
+			return publicTransferDiscovery.coordination.allowRate(ctx, bucket, identity, limit, window)
+		}))
 	directHTTP := directhttp.NewService(sessions,
+		func(clientName string, metadata map[string]any) (directhttp.Stream, error) {
+			return coordinator.OpenHTTPStream(clientName, metadata)
+		},
 		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
 		cfg.HTTP.RewriteMaxBodyBytes, traffic, db, db, detailOptions)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
 		}, peerMesh, attachments)
-	wsHub := wsevents.NewHub(api.ValidateConnectionWebSocketToken, func(access wsevents.Access, event wsevents.Event) bool {
+	wsHub := wsevents.NewHub(webSocketTickets, func(access wsevents.Access, event wsevents.Event) bool {
 		if access.Admin {
 			return true
 		}
@@ -164,11 +183,33 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return err == nil && account != nil &&
 			account.TenantID == access.TenantID && account.OwnerUsername == access.Username
 	})
-	clientMessages := newClientMessagesHub(db, sessions, api.ValidateConnectionWebSocketToken, logger)
-	publicTransferDiscovery := newPublicTransferDiscoveryHub(cfg.PublicTransfer)
-
+	if coordination := publicTransferDiscovery.coordination; coordination.enabled() {
+		wsHub.ConfigureCluster(wsevents.ClusterTransport{
+			Publish: coordination.publishManagement,
+			Subscribe: func(listener func([]byte)) {
+				coordination.addListener(func(event publicTransferClusterEvent) {
+					if event.kind != clusterEventKindManagement {
+						return
+					}
+					var managementEvent wsevents.Event
+					if err := json.Unmarshal(event.payload, &managementEvent); err != nil ||
+						strings.TrimSpace(managementEvent.TenantID) == "" ||
+						event.groupID != managementGroupID(managementEvent.TenantID) {
+						logger.Warn("discarding management cluster event with invalid tenant binding")
+						return
+					}
+					listener(event.payload)
+				})
+			},
+			Report: func(err error) {
+				logger.Warn("management cluster event delivery failed", "err", err)
+			},
+		})
+	}
+	clientMessages := newClientMessagesHub(db, sessions, webSocketTickets, logger)
 	tlsConfig, err := security.LoadTLSConfig(cfg.TLS)
 	if err != nil {
+		_ = publicTransferDiscovery.Close()
 		db.Close()
 		return nil, err
 	}
@@ -181,7 +222,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return peerMesh.HandleSignal(conn.Context(), request, conn.ClientName())
 	})
 	dispatcher.SetOnDisconnect(coordinator.Close)
-	dispatcher.SetDirectHTTPAck(directHTTP.Ack)
+	dispatcher.SetOnDataLoginSuccess(coordinator.Attach)
 	dispatcher.SetClientMessageHandler(func(conn *control.Conn, request protocol.MessageRequest) error {
 		return (&App{db: db, sessions: sessions, peerMesh: peerMesh, clientMessages: clientMessages, logger: logger}).handleClientMessage(conn, request)
 	})
@@ -224,6 +265,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		clientMessages:          clientMessages,
 		publicTransferDiscovery: publicTransferDiscovery,
 		attachments:             attachments,
+		webSocketTickets:        webSocketTickets,
 	}, nil
 }
 
@@ -246,7 +288,14 @@ func (a *App) Traffic() *nat.TrafficService { return a.traffic }
 func (a *App) Tokens() *security.LocalTokenService { return a.tokens }
 
 // Close releases resources.
-func (a *App) Close() error { return a.db.Close() }
+func (a *App) Close() error {
+	coordinationErr := a.publicTransferDiscovery.Close()
+	databaseErr := a.db.Close()
+	if coordinationErr != nil {
+		return coordinationErr
+	}
+	return databaseErr
+}
 
 // Run starts the background workers, binds and serves the control channel, and serves the
 // management HTTP surface until ctx is cancelled.
@@ -309,6 +358,18 @@ func (a *App) managementHandler() http.Handler {
 
 	a.api.Register(mux)
 	mux.HandleFunc("POST /api/client/auth/login", a.handleClientAuthLogin)
+	mux.HandleFunc("POST /api/admin/ws-tickets", a.handleAdminWebSocketTicket)
+	mux.HandleFunc("POST /api/public/transfer/ws-tickets", a.handlePublicWebSocketTicket)
+	mux.HandleFunc("GET /api/public/transfer/name-availability", func(w http.ResponseWriter, r *http.Request) {
+		result, err := a.publicTransferDiscovery.checkClientNameAvailability(r.Context(),
+			r.URL.Query().Get("clientName"), r.URL.Query().Get("excludePeerId"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})
 
 	mux.Handle("/http/{clientName}/{route}/{rest...}", a.directHTTP)
 	mux.Handle("/http/{clientName}/{route}", a.directHTTP)

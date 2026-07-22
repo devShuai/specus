@@ -27,9 +27,13 @@ const (
 	stunCreatePermissionRequest = 0x0008
 	stunCreatePermissionSuccess = 0x0108
 	stunCreatePermissionError   = 0x0118
+	stunChannelBindRequest      = 0x0009
+	stunChannelBindSuccess      = 0x0109
+	stunChannelBindError        = 0x0119
 	stunSendIndication          = 0x0016
 	stunDataIndication          = 0x0017
 
+	stunAttrChannelNumber      = 0x000C
 	stunAttrErrorCode          = 0x0009
 	stunAttrLifetime           = 0x000D
 	stunAttrXorPeerAddress     = 0x0012
@@ -81,7 +85,7 @@ func looksLikeStun(packet []byte) bool {
 	}
 	length := int(binary.BigEndian.Uint16(packet[2:4]))
 	cookie := binary.BigEndian.Uint32(packet[4:8])
-	return cookie == stunMagicCookie && length+stunHeaderBytes <= len(packet)
+	return cookie == stunMagicCookie && length+stunHeaderBytes == len(packet)
 }
 
 func parseStunMessage(packet []byte) (*stunMessage, error) {
@@ -272,6 +276,15 @@ func (m stunMessage) requestedUDPTransport() bool {
 	return ok && len(attr.Value) > 0 && attr.Value[0] == stunTransportUDP
 }
 
+func (m stunMessage) channelNumber() (uint16, bool) {
+	attr, ok := m.first(stunAttrChannelNumber)
+	if !ok || len(attr.Value) != 4 {
+		return 0, false
+	}
+	channel := binary.BigEndian.Uint16(attr.Value[:2])
+	return channel, channel >= turnChannelMin && channel <= turnChannelMax
+}
+
 func newStunAttrXorMappedAddress(addr *net.UDPAddr, tx [stunTransactionIDBytes]byte) stunAttribute {
 	return stunAttribute{Type: stunAttrXorMappedAddress, Value: encodeStunXorAddress(addr, tx)}
 }
@@ -282,6 +295,12 @@ func newStunAttrXorRelayedAddress(addr *net.UDPAddr, tx [stunTransactionIDBytes]
 
 func newStunAttrXorPeerAddress(addr *net.UDPAddr, tx [stunTransactionIDBytes]byte) stunAttribute {
 	return stunAttribute{Type: stunAttrXorPeerAddress, Value: encodeStunXorAddress(addr, tx)}
+}
+
+func stunAttrChannelNumberValue(channel uint16) stunAttribute {
+	value := make([]byte, 4)
+	binary.BigEndian.PutUint16(value[:2], channel)
+	return stunAttribute{Type: stunAttrChannelNumber, Value: value}
 }
 
 func newStunAttrOtherAddress(addr *net.UDPAddr, tx [stunTransactionIDBytes]byte) stunAttribute {

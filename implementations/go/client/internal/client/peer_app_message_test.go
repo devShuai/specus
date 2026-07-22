@@ -16,7 +16,7 @@ func TestPeerAppMessageCodecMatchesJavaPrefixAndFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode app message: %v", err)
 	}
-	if !bytes.HasPrefix(payload, []byte("STMSG1\n")) {
+	if !bytes.HasPrefix(payload, []byte("STMSG2\n")) {
 		t.Fatalf("prefix = %q", payload)
 	}
 	got, ok := decodePeerAppMessage(payload)
@@ -28,8 +28,9 @@ func TestPeerAppMessageCodecMatchesJavaPrefixAndFields(t *testing.T) {
 func TestPeerAppMessageCodecRejectsMalformedPayload(t *testing.T) {
 	for _, payload := range [][]byte{
 		[]byte(`{"type":"message"}`),
-		[]byte("STMSG1\n{"),
-		[]byte("STMSG1\n{}"),
+		[]byte("STMSG2\n{"),
+		[]byte("STMSG2\n{}"),
+		[]byte("STMSG1\n{\"type\":\"message\"}"),
 	} {
 		if _, ok := decodePeerAppMessage(payload); ok {
 			t.Fatalf("accepted malformed payload %q", payload)

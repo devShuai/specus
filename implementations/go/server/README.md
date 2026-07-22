@@ -1,6 +1,8 @@
 # implementations/go/server
 
-Go 实现的 shuai-tunnel 服务端,与 Java / Go / .NET / Android client **线协议字节兼容**(11 字节帧头 + CompactBinary + NAT_MESSAGE + runtime token 登录)。服务端为纯 Go 实现；直接依赖包括数据库驱动、WebSocket、Brotli 和用于 PKCS12/PFX 读取的 `golang.org/x/crypto`。
+Go 实现的 shuai-tunnel 服务端，与 Java / Go / .NET / Android client 使用唯一的 **v2 线协议**
+（11 字节帧头 + CompactBinary + NAT stream + runtime token + control/data 角色）。服务端为纯 Go 实现；
+直接依赖包括数据库驱动、WebSocket、Brotli 和用于 PKCS12/PFX 读取的 `golang.org/x/crypto`。
 
 ## 运行
 
@@ -29,8 +31,8 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 `127.0.0.1:9108/metrics`。完整配置与 systemd 模板见
 [`deploy/stun-server/systemd`](../../../deploy/stun-server/systemd/README.md)。
 
-- 控制通道(Netty 等价)默认监听 `7010`,Java/Go/.NET/Android client 连这里。
-- 管理后台 + Direct HTTP + WebSocket 默认监听 `:8088`,浏览器访问 `http://127.0.0.1:8088/`。
+- v2 隧道监听默认使用 `7010`，每个客户端会话在该监听上分别建立 `control` 与 `data` 连接。
+- 管理后台 + HTTP/WebSocket 流式入口默认监听 `:8088`，浏览器访问 `http://127.0.0.1:8088/`。
 - 默认 seed 演示客户端账号 `Demo client` 和启动凭证 `apiKey=demo-client / secret=test1234`(可关)。
 - 管理后台默认账号 `admin / admin`；内置 admin 之外的管理用户保存到 `tunnel_management_user`。
 
@@ -40,7 +42,7 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 
 | 环境变量 | 说明 | 默认 |
 | --- | --- | --- |
-| `TUNNEL_NETTY_PORT` | 控制通道端口 | 7010 |
+| `TUNNEL_NETTY_PORT` | v2 control/data 隧道端口 | 7010 |
 | `TUNNEL_NETTY_MAX_FRAME_SIZE` | 完整控制帧上限，包含 11 字节 header；值必须不小于 11（等于 11 时仅容纳零字节 body） | 33554432 |
 | `TUNNEL_MANAGEMENT_ADDR` | 管理 HTTP 监听地址 | `:8088` |
 | `TUNNEL_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | sqlite |
@@ -57,7 +59,7 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 | `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | 同一机器指纹 + OS 用户允许同时在线的实例数 | 1 |
 | `TUNNEL_LOGIN_EXECUTOR_MAX` / `TUNNEL_LOGIN_EXECUTOR_QUEUE` | Java 当前登录执行器环境变量别名；旧 `TUNNEL_LOGIN_EXECUTOR_MAX_SIZE` / `TUNNEL_LOGIN_EXECUTOR_QUEUE_CAPACITY` 仍兼容 | 32 / 20000 |
 | `TUNNEL_PUBLIC_ADDRESS` | 下发给 client 的公网地址 | - |
-| `TUNNEL_HTTP_TIMEOUT_MS` / `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` | Direct HTTP 超时 / 请求体体积上限 | 30000 / 16MiB |
+| `TUNNEL_HTTP_TIMEOUT_MS` / `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` | HTTP stream 超时 / 请求体体积上限 | 30000 / 16MiB |
 | `TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES` | HTTP 路由路径改写响应体上限 | 10MiB |
 | `TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` | HTTP/TCP 明细采集全局开关 | false |
 | `TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES` | TCP payload 预览字节数 | 256 |
@@ -100,7 +102,11 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 | `TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP` / `TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS` | 公开 presign-upload 单 IP 固定窗口限流 | 30 / 300 |
 | `TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM` | 同 roomToken 哈希 PENDING 附件上限 | 50 |
 | `TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | 发现房间 peer 上限 | 32 |
-| `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` / `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | 发现连接消息限流 | 120 / 60 |
+| `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` / `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | 发现连接消息限流 | 360 / 60 |
+| `TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED` / `TUNNEL_PUBLIC_TRANSFER_REDIS_URI` | 启用 Redis 多实例 presence、Pub/Sub、revision 与共享限流；URI 在启用时必填 | false / - |
+| `TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | Redis key 与频道前缀 | shuai-tunnel:v2:public-transfer |
+| `TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` / `TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | presence TTL / 刷新间隔 | 30 / 10000 |
+| `TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS` | Redis 命令超时，故障时失败关闭 | 2000 |
 | `TUNNEL_TLS_MODE` | `disabled` / `file` / `self-signed` | disabled |
 | `TUNNEL_TLS_KEYSTORE` / `TUNNEL_TLS_KEYSTORE_PASSWORD` | PKCS12 / PFX keystore 与密码(mode=file) | - |
 | `TUNNEL_TLS_CERT_FILE` / `TUNNEL_TLS_KEY_FILE` | PEM 证书/私钥(mode=file) | - |
@@ -125,7 +131,7 @@ TUNNEL_CONNECTIONSTRINGS_TUNNEL="user:pass@tcp(localhost:3306)/shuai?parseTime=t
 
 映射表已包含 Java 管理面当前使用的通道级开关：TCP 映射的 `detail_capture_enabled`，HTTP 路由的 `detail_capture_enabled` 与 `path_rewrite_enabled`。这些字段默认关闭，启动迁移会对历史库幂等补列；当前 Go server 已能通过管理 API 保存和返回这些配置，并在 `path_rewrite_enabled=true` 时对可文本化 HTTP 响应做路径改写。
 
-资源级流量和 HTTP/TCP 明细采集也已对齐到 Java 管理契约：TCP 映射 / HTTP route 会聚合写入 `tunnel_resource_traffic_usage`，Direct HTTP 成功/失败响应会写入 `tunnel_http_traffic_exchange`，TCP 端口映射双向 payload 会写入 `tunnel_tcp_traffic_frame`；明细采集热路径只入队，后台按配置批量 flush，管理明细查询默认不打断批量节奏，只有显式传 `flush=true` 时才会先 flush 再查；管理 API 支持资源流量列表、HTTP 分页与字段搜索、TCP 分页、单帧详情、按 channel 串流查询和 `inspection-status` 采集状态。HTTP 响应展示已兼容 `gzip`、`deflate` 的 zlib / raw deflate，以及 `br` Brotli 解码。
+资源级流量和 HTTP/TCP 明细采集也已对齐到 Java 管理契约：TCP 映射 / HTTP route 会聚合写入 `tunnel_resource_traffic_usage`，HTTP stream 成功/失败响应会写入 `tunnel_http_traffic_exchange`，TCP 端口映射双向 payload 会写入 `tunnel_tcp_traffic_frame`；明细采集热路径只入队，后台按配置批量 flush，管理明细查询默认不打断批量节奏，只有显式传 `flush=true` 时才会先 flush 再查；管理 API 支持资源流量列表、HTTP 分页与字段搜索、TCP 分页、单帧详情、按 channel 串流查询和 `inspection-status` 采集状态。HTTP 业务响应展示可解码 `gzip`、`deflate`（zlib / raw）和 `br` Brotli；这不改变 v2 wire body 禁止通用压缩的约束。
 
 TCP 转发背压已对齐 Java/.NET 的 high/low watermark 语义：控制通道写入和外部 socket 写入都会按 `TUNNEL_NETTY_WRITE_BUFFER_LOW_WATER_MARK` / `TUNNEL_NETTY_WRITE_BUFFER_HIGH_WATER_MARK` 统计待写字节；超过高水位会暂停对应读循环，回落到低水位后恢复，避免慢 client 或慢公网连接造成无界积压。
 
@@ -167,7 +173,7 @@ go test ./...    # fixtures、登录/NAT/HTTP、TURN auth、附件、公共发�
 go vet ./...
 ```
 
-协议层用仓库内 `implementations/csharp/protocol/tests/fixtures/*.bin`(已复制进 `internal/protocol/testdata`)做 golden 交叉校验:非压缩帧字节级一致,deflate 帧因 Go `compress/flate` 与 Java/.NET zlib 输出不同改为语义自洽校验(可互相解压,完全互通)。
+协议层直接读取仓库中央 `protocol/test-vectors/control-v2` fixture，逐字节校验 v2 控制帧、NAT stream 与 malformed 拒绝样例；wire body 不允许 Deflate fixture。
 
 ## Peer Mesh 对齐状态
 
@@ -178,11 +184,11 @@ Go server 已对齐 Java 当前 Peer Mesh 控制面：
 - 按租户/用户分配虚拟 IP，默认同一 `tenantId + ownerUsername` 放行。
 - 管理 API：状态、设备、带 `OUTBOUND` / `INBOUND` / `BOTH` 方向的 ACL、会话列表、启停设备、清理会话；跨 owner 的 `CLIENT_TO_CLIENT` fallback 同样按方向 ACL 判断。
 - 设备上报、会话授权、路径/流量上报、强制关闭和在线 roster 下发。
-- 内置标准 STUN/TURN UDP relay：Binding、备用端口 NAT 探测、带临时 credential/realm/nonce/MESSAGE-INTEGRITY 的 Allocate/Refresh/CreatePermission、401/438、Send/Data Indication、`SPM1` frame 授权校验和 relay 字节计量。
+- 内置标准 STUN/TURN UDP relay：Binding、备用端口 NAT 探测、带临时 credential/realm/nonce/MESSAGE-INTEGRITY 的 Allocate/Refresh/CreatePermission、401/438、Send/Data Indication、`SPM2` frame 授权校验和 relay 字节计量。
 - 公共传输已提供 `/api/public/transfer/ice-config`、6 个附件 REST 路径和 `/ws/public-transfer/discovery`；语法有效的非对象 discovery JSON 按缺省 `signal` 转发并保留 `payload:null`。公开 presign 来源表满后新来源直接拒绝，只由每 10 分钟后台任务清理过期窗口。
-- 管理/客户端消息使用 `/ws/client-messages` 和控制通道 `CLIENT_TO_CLIENT` fallback；`sent` ACK 不等待异步控制通道写完成，写失败仅记日志，与 Java Netty 行为一致。
+- 管理/客户端消息使用 `/ws/client-messages` 和控制通道 `CLIENT_TO_CLIENT` fallback；只有目标连接写成功才返回 `written`，写失败返回 `failed`。该状态不冒充对端应用层 `delivered` ACK。
 
-Go client 当前已实现 Peer Mesh UDP 控制面、Java 兼容 X25519/HKDF/AES-GCM IP 数据帧、Linux `/dev/net/tun`、Windows Wintun 与 macOS utun 虚拟网卡读写、direct UDP 与标准 TURN relay data indication；代码数据面已具备通过虚拟 IP 承载业务流量的能力，真实 Windows / Linux / macOS 双机 ping、HTTP 和 relay fallback 仍需按跨语言验收矩阵手工验证。
+Go client 当前已实现 Peer Mesh UDP 控制面、v2 X25519/HKDF/AES-GCM IP 数据帧、Linux `/dev/net/tun`、Windows Wintun 与 macOS utun 虚拟网卡读写、direct UDP 与标准 TURN relay data indication；代码数据面已具备通过虚拟 IP 承载业务流量的能力，真实 Windows / Linux / macOS 双机 ping、HTTP 和 relay fallback 仍需按跨语言验收矩阵手工验证。
 
 ## 包结构
 
@@ -193,7 +199,7 @@ Go client 当前已实现 Peer Mesh UDP 控制面、Java 兼容 X25519/HKDF/AES-
 - `internal/session` — 会话注册表(同名登录顶替)
 - `internal/control` — 监听器、连接、帧读写、空闲/心跳看门狗、登录线程池
 - `internal/nat` — 远端端口管理、外部连接桥接、NAT_CONTROL 下发、流量统计
-- `internal/directhttp` — Direct HTTP 转发 + 入口
+- `internal/directhttp` — HTTP stream 转发入口与响应改写
 - `internal/management` — admin/public REST API + DTO + 附件接口
 - `internal/transfer` — Aliyun OSS V4 预签名、一次性下载授权、附件状态机、过期清理和公开限流
 - `internal/security` — 本地 JWT(HS256)、OIDC(RS256/JWKS + token 交换)、TLS

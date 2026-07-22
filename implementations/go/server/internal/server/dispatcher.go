@@ -16,7 +16,7 @@ import (
 )
 
 // Dispatcher routes inbound control-channel packets: auth gate, login (offloaded), heartbeat,
-// logout, NAT (G3), and Direct HTTP responses (G4).
+// logout, NAT stream v2, and application control messages.
 type Dispatcher struct {
 	db       *store.DB
 	auth     *auth.Authenticator
@@ -26,10 +26,10 @@ type Dispatcher struct {
 
 	// Optional hooks wired in later phases (nil-safe).
 	natHandler        func(conn *control.Conn, message protocol.NatMessage) error
-	directHTTPAck     func(response protocol.DirectHTTPResponse)
 	peerControl       func(conn *control.Conn, request protocol.MessageRequest) error
 	clientMessage     func(conn *control.Conn, request protocol.MessageRequest) error
 	onLoginSuccess    func(conn *control.Conn)
+	onDataLogin       func(conn *control.Conn)
 	onDisconnect      func(conn *control.Conn)
 	onConnectionEvent func(eventType string, record store.ConnectionRecord)
 }
@@ -48,13 +48,11 @@ func (d *Dispatcher) SetNatHandler(handler func(conn *control.Conn, message prot
 // SetOnLoginSuccess installs a post-login hook, e.g. to push NAT_CONTROL (G3).
 func (d *Dispatcher) SetOnLoginSuccess(hook func(conn *control.Conn)) { d.onLoginSuccess = hook }
 
+// SetOnDataLoginSuccess installs the dedicated data-plane attachment hook.
+func (d *Dispatcher) SetOnDataLoginSuccess(hook func(conn *control.Conn)) { d.onDataLogin = hook }
+
 // SetOnDisconnect installs a connection-teardown hook, e.g. to release NAT state (G3).
 func (d *Dispatcher) SetOnDisconnect(hook func(conn *control.Conn)) { d.onDisconnect = hook }
-
-// SetDirectHTTPAck installs the Direct HTTP response handler (G4).
-func (d *Dispatcher) SetDirectHTTPAck(ack func(response protocol.DirectHTTPResponse)) {
-	d.directHTTPAck = ack
-}
 
 // SetPeerControlHandler installs the Peer Mesh control-plane signal handler.
 func (d *Dispatcher) SetPeerControlHandler(handler func(conn *control.Conn, request protocol.MessageRequest) error) {
@@ -78,9 +76,19 @@ func (d *Dispatcher) OnConnect(conn *control.Conn) {
 
 // OnPacket dispatches a single decoded packet.
 func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error {
-	if _, isLogin := packet.(protocol.LoginRequest); !isLogin && conn.ClientName() == "" {
+	_, isLogin := packet.(protocol.LoginRequest)
+	if isLogin && conn.ClientName() != "" {
+		conn.MarkReason(store.ReasonProtocolViolation)
+		d.logger.Warn("duplicate login on authenticated channel", "channel", conn.ChannelID())
+		return errUnauthenticated
+	}
+	if !isLogin && conn.ClientName() == "" {
 		conn.MarkReason(store.ReasonProtocolViolation)
 		d.logger.Warn("packet on unauthenticated channel", "channel", conn.ChannelID(), "cmd", packet.Command())
+		return errUnauthenticated
+	}
+	if conn.ClientName() != "" && !packetAllowedForRole(conn.ConnectionRole(), packet) {
+		conn.MarkReason(store.ReasonProtocolViolation)
 		return errUnauthenticated
 	}
 
@@ -100,11 +108,6 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 	case protocol.NatMessage:
 		if d.natHandler != nil {
 			return d.natHandler(conn, p)
-		}
-		return nil
-	case protocol.DirectHTTPResponse:
-		if d.directHTTPAck != nil {
-			d.directHTTPAck(p)
 		}
 		return nil
 	case protocol.MessageRequest:
@@ -128,13 +131,40 @@ func (d *Dispatcher) OnPacket(conn *control.Conn, packet protocol.Packet) error 
 	}
 }
 
+func packetAllowedForRole(role string, packet protocol.Packet) bool {
+	if role == protocol.ConnectionRoleControl {
+		_, isNat := packet.(protocol.NatMessage)
+		return !isNat
+	}
+	if role != protocol.ConnectionRoleData {
+		return false
+	}
+	switch packet.(type) {
+	case protocol.NatMessage, protocol.HeartbeatRequest, protocol.HeartbeatResponse, protocol.LogoutRequest:
+		return true
+	default:
+		return false
+	}
+}
+
 // OnDisconnect unbinds the session and stamps the audit row.
 func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
-	if d.onDisconnect != nil {
+	d.logger.Debug("control connection closed", "channel", conn.ChannelID(), "client", conn.ClientName(), "reason", conn.Reason())
+	dataConnection := conn.ConnectionRole() == protocol.ConnectionRoleData
+	if dataConnection && d.onDisconnect != nil {
 		d.onDisconnect(conn)
 	}
 	if name := conn.ClientName(); name != "" {
 		d.sessions.Unbind(name, conn)
+	}
+	if dataConnection {
+		return
+	}
+	if data, ok := d.sessions.FindData(conn.ClientName()); ok {
+		if dataConn, concrete := data.(*control.Conn); concrete &&
+			dataConn.ClientSessionID() == conn.ClientSessionID() {
+			data.Close(store.ReasonClientClosed)
+		}
 	}
 	d.auth.MarkDisconnected(conn.ClientSessionID())
 	if sessionID := conn.ClientSessionID(); sessionID > 0 {
@@ -170,6 +200,7 @@ func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
 }
 
 func (d *Dispatcher) handleLogin(conn *control.Conn, request protocol.LoginRequest) {
+	conn.ReadGate.Pause()
 	enqueued := d.executor.TryEnqueue(func() { d.processLogin(conn, request) })
 	if enqueued {
 		return
@@ -182,8 +213,22 @@ func (d *Dispatcher) handleLogin(conn *control.Conn, request protocol.LoginReque
 }
 
 func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequest) {
+	defer conn.ReadGate.Resume()
 	ctx := conn.Context()
-	result, err := d.auth.Authenticate(ctx, request)
+	if request.ConnectionRole != protocol.ConnectionRoleControl && request.ConnectionRole != protocol.ConnectionRoleData {
+		reason := "登录包缺少有效 connectionRole"
+		_ = conn.Send(protocol.LoginResponse{ClientName: request.ClientName, Success: false, Reason: &reason})
+		conn.Close(store.ReasonLoginFailure)
+		return
+	}
+	dataConnection := request.ConnectionRole == protocol.ConnectionRoleData
+	var result auth.Result
+	var err error
+	if dataConnection {
+		result, err = d.auth.AuthenticateData(ctx, request)
+	} else {
+		result, err = d.auth.Authenticate(ctx, request)
+	}
 	if err != nil {
 		d.logger.Error("authentication failed", "channel", conn.ChannelID(), "client", request.ClientName, "err", err)
 		conn.Close(store.ReasonIOError)
@@ -194,44 +239,54 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 	if result.Account != nil {
 		clientName = result.Account.ClientName
 	}
-	record := store.ConnectionRecord{
-		TenantID:    "default",
-		ClientName:  clientName,
-		ConnectedAt: time.Now(),
-		Success:     result.Success,
-	}
-	channelID := conn.ChannelID()
-	record.ChannelID = &channelID
-	if remote := conn.RemoteAddress(); remote != "" {
-		record.RemoteAddress = &remote
-	}
-	if result.Account != nil {
-		record.TenantID = result.Account.TenantID
-		record.ClientID = &result.Account.ID
-	}
-	if !result.Success {
-		now := time.Now()
-		record.DisconnectedAt = &now
-		reason := store.ReasonLoginFailure
-		record.DisconnectReason = &reason
-		if result.Reason != "" {
-			failure := result.Reason
-			record.FailureReason = &failure
+	if result.Success && dataConnection {
+		bound, ok := d.sessions.Find(clientName)
+		controlConn, concrete := bound.(*control.Conn)
+		if !ok || !concrete || controlConn.ClientSessionID() != result.Session.ID {
+			result.Success = false
+			result.Reason = "数据连接未找到匹配的控制连接"
 		}
 	}
 
-	recordID, err := d.db.InsertConnectionRecord(ctx, record)
-	if err != nil {
-		d.logger.Error("write connection record failed", "channel", conn.ChannelID(), "err", err)
-		conn.Close(store.ReasonIOError)
-		return
-	}
-	if d.onConnectionEvent != nil {
-		record.ID = recordID
-		d.onConnectionEvent("created", record)
+	var recordID int64
+	var record store.ConnectionRecord
+	if !dataConnection {
+		record = store.ConnectionRecord{
+			TenantID: "default", ClientName: clientName,
+			ConnectedAt: time.Now(), Success: result.Success,
+		}
+		channelID := conn.ChannelID()
+		record.ChannelID = &channelID
+		if remote := conn.RemoteAddress(); remote != "" {
+			record.RemoteAddress = &remote
+		}
+		if result.Account != nil {
+			record.TenantID = result.Account.TenantID
+			record.ClientID = &result.Account.ID
+		}
+		if !result.Success {
+			now := time.Now()
+			record.DisconnectedAt = &now
+			reason := store.ReasonLoginFailure
+			record.DisconnectReason = &reason
+			if result.Reason != "" {
+				failure := result.Reason
+				record.FailureReason = &failure
+			}
+		}
+		recordID, err = d.db.InsertConnectionRecord(ctx, record)
+		if err != nil {
+			d.logger.Error("write connection record failed", "channel", conn.ChannelID(), "err", err)
+			conn.Close(store.ReasonIOError)
+			return
+		}
+		if d.onConnectionEvent != nil {
+			record.ID = recordID
+			d.onConnectionEvent("created", record)
+		}
 	}
 
-	if result.Success {
+	if result.Success && !dataConnection {
 		now := time.Now()
 		if err := d.db.MarkClientSessionOnline(ctx, result.Session.ID, auth.StatusNettyOnline,
 			conn.ChannelID(), conn.RemoteAddress(), now); err != nil {
@@ -253,6 +308,21 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		reason := result.Reason
 		response.Reason = &reason
 	}
+	var displaced session.Session
+	if result.Success {
+		// Commit authenticated connection state before publishing the success response.
+		// Once the client observes success it may immediately send heartbeat/NAT frames.
+		if recordID > 0 {
+			conn.SetConnectionRecordID(recordID)
+		}
+		conn.OnLoginSuccess(clientName, result.Account.TenantID, result.Session.ID,
+			time.Now().UnixMilli(), request.ConnectionRole)
+		if dataConnection {
+			displaced = d.sessions.ReplaceData(conn)
+		} else {
+			displaced = d.sessions.Replace(conn)
+		}
+	}
 	if err := conn.Send(response); err != nil {
 		conn.Close(store.ReasonIOError)
 		return
@@ -264,10 +334,17 @@ func (d *Dispatcher) processLogin(conn *control.Conn, request protocol.LoginRequ
 		return
 	}
 
-	conn.SetConnectionRecordID(recordID)
-	conn.OnLoginSuccess(clientName, result.Account.TenantID, result.Session.ID, time.Now().UnixMilli())
-
-	if displaced := d.sessions.Replace(conn); displaced != nil {
+	if dataConnection {
+		if displaced != nil {
+			displaced.Close(store.ReasonReplacedByNewLogin)
+		}
+		d.logger.Info("client data connection logged in", "channel", conn.ChannelID(), "client", clientName)
+		if d.onDataLogin != nil {
+			d.onDataLogin(conn)
+		}
+		return
+	}
+	if displaced != nil {
 		displaced.Close(store.ReasonReplacedByNewLogin)
 	}
 

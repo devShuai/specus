@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -346,6 +347,9 @@ func TestPeerMeshMergeSessionPreservesNominatedPathAcrossRefreshLikeJava(t *test
 	oldKeepaliveAt := time.Now().Add(-2 * time.Second)
 	oldReportAt := time.Now().Add(-time.Minute)
 	oldLogAt := time.Now().Add(-time.Minute)
+	replay := peerReplayWindow{}
+	replay.accept(6)
+	replay.accept(7)
 	oldSession := &peerMeshSession{
 		ID:                  1001,
 		PeerID:              2,
@@ -363,8 +367,10 @@ func TestPeerMeshMergeSessionPreservesNominatedPathAcrossRefreshLikeJava(t *test
 		LastPathReport:      oldReportAt,
 		LastPathRemoteText:  oldEndpoint.String(),
 		AESKey:              []byte("0123456789abcdef0123456789abcdef"),
+		LocalKeyEpoch:       "epoch-local",
+		RemoteKeyEpoch:      "epoch-remote",
 		Sequence:            42,
-		Replay:              peerReplayWindow{highest: 7, bits: 3},
+		Replay:              replay,
 		DirectBytes:         100,
 		DirectBytesPending:  25,
 	}
@@ -382,6 +388,7 @@ func TestPeerMeshMergeSessionPreservesNominatedPathAcrossRefreshLikeJava(t *test
 	newSessionID := int64(2002)
 
 	mesh.mergeSession(peerControlMessage{
+		DataFrameVersion: 2,
 		SourceClientID:   1,
 		TargetClientID:   2,
 		TargetClientName: "java-b",
@@ -649,6 +656,8 @@ func TestPeerMeshSendUsesRelayAllocationLikeJava(t *testing.T) {
 		PathType:                "DIRECT",
 		LastDirectSuccess:       time.Now(),
 		AESKey:                  []byte("0123456789abcdef0123456789abcdef"),
+		LocalKeyEpoch:           "epoch-local",
+		RemoteKeyEpoch:          "epoch-remote",
 	}
 	mesh := &peerMeshClient{
 		udp:      udp,
@@ -667,11 +676,12 @@ func TestPeerMeshSendUsesRelayAllocationLikeJava(t *testing.T) {
 	if err := mesh.sendEncryptedPayload(session, []byte("payload")); err != nil {
 		t.Fatalf("send encrypted payload: %v", err)
 	}
-	relayMessages := readStunMessages(t, relay, 2)
-	if len(relayMessages) != 2 || relayMessages[0].Type != stunCreatePermissionRequest || relayMessages[1].Type != stunSendIndication {
-		t.Fatalf("relay messages = %+v, want permission+send indication", relayMessages)
+	relayMessages := readStunMessages(t, relay, 3)
+	if len(relayMessages) != 3 || relayMessages[0].Type != stunCreatePermissionRequest ||
+		relayMessages[1].Type != stunChannelBindRequest || relayMessages[2].Type != stunSendIndication {
+		t.Fatalf("relay messages = %+v, want permission+channel bind+send indication", relayMessages)
 	}
-	peer, ok := relayMessages[1].xorPeerAddress()
+	peer, ok := relayMessages[2].xorPeerAddress()
 	if !ok || peer.Port != direct.LocalAddr().(*net.UDPAddr).Port {
 		t.Fatalf("relay peer address = %+v", peer)
 	}
@@ -690,6 +700,8 @@ func TestPeerMeshRelayProbeDoesNotOverrideHealthyDirectLikeJava(t *testing.T) {
 		PathType:          "DIRECT",
 		LastDirectSuccess: time.Now(),
 		AESKey:            []byte("0123456789abcdef0123456789abcdef"),
+		LocalKeyEpoch:     "epoch-local",
+		RemoteKeyEpoch:    "epoch-remote",
 	}
 	mesh := &peerMeshClient{
 		logger:   log.New(io.Discard, "", 0),
@@ -740,6 +752,8 @@ func TestPeerMeshDirectKeepaliveUsesNominatedEndpointLikeJava(t *testing.T) {
 		PathType:          "DIRECT",
 		LastDirectSuccess: time.Now(),
 		AESKey:            []byte("0123456789abcdef0123456789abcdef"),
+		LocalKeyEpoch:     "epoch-local",
+		RemoteKeyEpoch:    "epoch-remote",
 	}
 	mesh := &peerMeshClient{
 		udp:      udp,
@@ -816,4 +830,317 @@ func readStunMessages(t *testing.T, conn *net.UDPConn, max int) []stunMessage {
 		messages = append(messages, *message)
 	}
 	return messages
+}
+
+func TestPeerHostCandidateAddressFamilies(t *testing.T) {
+	tests := []struct {
+		address string
+		usable  bool
+		family  string
+	}{
+		{address: "192.0.2.20", usable: true, family: "IPv4"},
+		{address: "100.96.0.20", usable: false, family: "IPv4"},
+		{address: "2001:db8::20", usable: true, family: "IPv6"},
+		{address: "fd00::20", usable: false, family: "IPv6"},
+		{address: "fe80::20", usable: false, family: "IPv6"},
+		{address: "::ffff:192.0.2.20", usable: true, family: "IPv4"},
+	}
+	for _, test := range tests {
+		ip := net.ParseIP(test.address)
+		if got := usablePeerHostIP(ip, "100.96.0.0/11"); got != test.usable {
+			t.Errorf("usablePeerHostIP(%s) = %v, want %v", test.address, got, test.usable)
+		}
+		if got := peerAddressFamily(ip); got != test.family {
+			t.Errorf("peerAddressFamily(%s) = %s, want %s", test.address, got, test.family)
+		}
+	}
+}
+
+// TestSortedConnectivityCandidatesOrdersByPriorityDescending 校验 H-3：连通性检查候选
+// 按 priority 降序排列，高优先级（host/port-map）排在前面先被探测。
+func TestSortedConnectivityCandidatesOrdersByPriorityDescending(t *testing.T) {
+	mesh := &peerMeshClient{
+		logger: log.New(io.Discard, "", 0),
+	}
+	input := []peerCandidate{
+		{Type: "srflx", Transport: "udp", Address: "203.0.113.10", Port: 30001, Priority: 800, Foundation: "standard-stun"},
+		{Type: "host", Transport: "udp", Address: "192.168.1.5", Port: 40000, Priority: 1000, Foundation: "host"},
+		{Type: "srflx", Transport: "udp", Address: "203.0.113.20", Port: 30002, Priority: 900, Foundation: "public-stun"},
+	}
+	sorted := mesh.sortedConnectivityCandidates(input)
+	if len(sorted) != 3 {
+		t.Fatalf("len = %d, want 3", len(sorted))
+	}
+	// 期望顺序：1000 (host) -> 900 (public-stun) -> 800 (srflx)
+	if sorted[0].Priority != 1000 || sorted[1].Priority != 900 || sorted[2].Priority != 800 {
+		t.Fatalf("priorities = [%d,%d,%d], want [1000,900,800]",
+			sorted[0].Priority, sorted[1].Priority, sorted[2].Priority)
+	}
+}
+
+// TestSortedConnectivityCandidatesDemotesSameNatReflexive 校验 H-6：与本地 STUN 公网地址相同的
+// reflexive 候选被降到 priority=1（排到末尾），而非被剪除。
+func TestSortedConnectivityCandidatesDemotesSameNatReflexive(t *testing.T) {
+	localSrflx := "203.0.113.42"
+	mesh := &peerMeshClient{
+		logger: log.New(io.Discard, "", 0),
+		srflx: &peerCandidate{
+			Type:       "srflx",
+			Transport:  "udp",
+			Address:    localSrflx,
+			Port:       34567,
+			Priority:   800,
+			Foundation: "standard-stun",
+		},
+		srflxCandidates: map[string]peerCandidate{
+			"srflx|udp|" + localSrflx + ":34567": {
+				Type: "srflx", Transport: "udp", Address: localSrflx, Port: 34567, Priority: 800, Foundation: "standard-stun",
+			},
+		},
+	}
+	input := []peerCandidate{
+		// 同 NAT 的 srflx：应被降权到 priority=1
+		{Type: "srflx", Transport: "udp", Address: localSrflx, Port: 34567, Priority: 800, Foundation: "standard-stun"},
+		// 不同地址的 srflx：保持原 priority
+		{Type: "srflx", Transport: "udp", Address: "203.0.113.99", Port: 35000, Priority: 800, Foundation: "public-stun"},
+		// host 候选：不受影响
+		{Type: "host", Transport: "udp", Address: "192.168.1.5", Port: 40000, Priority: 1000, Foundation: "host"},
+	}
+	sorted := mesh.sortedConnectivityCandidates(input)
+	if len(sorted) != 3 {
+		t.Fatalf("len = %d, want 3 (demotion must not prune)", len(sorted))
+	}
+	// 期望顺序：1000 (host) -> 800 (不同地址 srflx) -> 1 (同 NAT 被降权 srflx)
+	if sorted[0].Priority != 1000 {
+		t.Fatalf("first priority = %d, want 1000 (host)", sorted[0].Priority)
+	}
+	if sorted[2].Priority != 1 || sorted[2].Address != localSrflx {
+		t.Fatalf("last candidate = %+v, want priority=1 same-NAT srflx", sorted[2])
+	}
+	// 不同地址的 srflx 必须保持原 priority=800
+	var remoteSrflx *peerCandidate
+	for i := range sorted {
+		if sorted[i].Address == "203.0.113.99" {
+			remoteSrflx = &sorted[i]
+		}
+	}
+	if remoteSrflx == nil || remoteSrflx.Priority != 800 {
+		t.Fatalf("non-same-NAT srflx priority = %v, want 800 (unchanged)", remoteSrflx)
+	}
+}
+
+// TestDemoteSameNatReflexiveCandidatesKeepsPortMapCandidates 校验 H-6 也覆盖 port-map 候选
+// （foundation 以 "port-map-" 开头），且降权不改变候选数量。
+func TestDemoteSameNatReflexiveCandidatesKeepsPortMapCandidates(t *testing.T) {
+	localAddr := "203.0.113.42"
+	mesh := &peerMeshClient{
+		logger: log.New(io.Discard, "", 0),
+		srflx: &peerCandidate{
+			Type: "srflx", Transport: "udp", Address: localAddr, Port: 34567, Priority: 900, Foundation: "standard-stun",
+		},
+		srflxCandidates: map[string]peerCandidate{},
+	}
+	input := []peerCandidate{
+		{Type: "srflx", Transport: "udp", Address: localAddr, Port: 34567, Priority: 900, Foundation: "port-map-1"},
+		{Type: "host", Transport: "udp", Address: "192.168.1.5", Port: 40000, Priority: 1000, Foundation: "host"},
+	}
+	demoted := mesh.demoteSameNatReflexiveCandidates(input)
+	if len(demoted) != 2 {
+		t.Fatalf("len = %d, want 2 (no pruning)", len(demoted))
+	}
+	if demoted[0].Foundation == "port-map-1" && demoted[0].Priority != 1 {
+		t.Fatalf("same-NAT port-map candidate priority = %d, want 1", demoted[0].Priority)
+	}
+	if demoted[1].Foundation == "port-map-1" && demoted[1].Priority != 1 {
+		t.Fatalf("same-NAT port-map candidate priority = %d, want 1", demoted[1].Priority)
+	}
+}
+
+// TestCandidateReciprocationThrottlesPerPeer 校验 H-1：收到对端候选后本端无健康 direct 路径时
+// 回发自身候选，但 2s 内对同一 peer 只回发一次，防止两端互触发形成信令循环。
+func TestCandidateReciprocationThrottlesPerPeer(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udp.Close()
+
+	var sentCount int
+	var mu sync.Mutex
+	mesh := &peerMeshClient{
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		logger: log.New(io.Discard, "", 0),
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",
+			CIDR: "100.96.0.0/11", ClientPublicKey: "local-key",
+		}},
+		udp: udp,
+		peers: map[int64]*peerMeshPeer{
+			2: {ClientID: 2, ClientName: "java-b", VirtualIP: "100.96.0.2", PublicKey: "peer-key", Online: true},
+		},
+		// 无 session 或 session 无健康 direct -> 应触发回礼
+		sessions:               map[int64]*peerMeshSession{},
+		candidateReciprocateAt: map[int64]time.Time{},
+		srflx: &peerCandidate{
+			Type: "srflx", Transport: "udp", Address: "203.0.113.10", Port: 34567, Priority: 800, Foundation: "standard-stun",
+		},
+		sender: func(_ net.Conn, _ string, _ any) error {
+			mu.Lock()
+			sentCount++
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	// 第一次回礼：应发送
+	mesh.reciprocateCandidates(2)
+	// 立即第二次：2s 节流内，不应发送
+	mesh.reciprocateCandidates(2)
+
+	mu.Lock()
+	got := sentCount
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("reciprocate sent count = %d, want 1 (throttled)", got)
+	}
+}
+
+// TestCandidateReciprocationSkipsHealthyDirect 校验 H-1：已有健康 direct 路径时不回礼
+// （避免对已经打通的路径制造冗余信令）。
+func TestCandidateReciprocationSkipsHealthyDirect(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udp.Close()
+
+	var sentCount int
+	now := time.Now()
+	mesh := &peerMeshClient{
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		logger: log.New(io.Discard, "", 0),
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",
+			CIDR: "100.96.0.0/11", ClientPublicKey: "local-key",
+		}},
+		udp: udp,
+		peers: map[int64]*peerMeshPeer{
+			2: {ClientID: 2, ClientName: "java-b", VirtualIP: "100.96.0.2", PublicKey: "peer-key", Online: true},
+		},
+		sessions: map[int64]*peerMeshSession{
+			2: {ID: 9001, PeerID: 2, Token: "tok", ExpiresAt: now.Add(time.Hour), PathType: "DIRECT", LastDirectSuccess: now},
+		},
+		candidateReciprocateAt: map[int64]time.Time{},
+		srflx: &peerCandidate{
+			Type: "srflx", Transport: "udp", Address: "203.0.113.10", Port: 34567, Priority: 800, Foundation: "standard-stun",
+		},
+		sender: func(_ net.Conn, _ string, _ any) error {
+			sentCount++
+			return nil
+		},
+	}
+
+	mesh.reciprocateCandidates(2)
+	if sentCount != 0 {
+		t.Fatalf("reciprocate sent count = %d, want 0 (healthy direct)", sentCount)
+	}
+}
+
+// TestScheduleHolePunchRetriesStopsOnHealthyDirect 校验 H-2：session 无健康 direct 时排程
+// 退避重试，建立健康 direct 后停止重试（不再触发 sendConnectivityChecks）。
+func TestScheduleHolePunchRetriesStopsOnHealthyDirect(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udp.Close()
+
+	sessionID := int64(7001)
+	now := time.Now()
+	probeTarget, err := net.ResolveUDPAddr("udp4", "127.0.0.1:9")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	mesh := &peerMeshClient{
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		logger: log.New(io.Discard, "", 0),
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",
+			CIDR: "100.96.0.0/11", ClientPublicKey: "local-key",
+		}},
+		udp:      udp,
+		stopCh:   make(chan struct{}),
+		peers:    map[int64]*peerMeshPeer{},
+		sessions: map[int64]*peerMeshSession{},
+		sessionsByID: map[int64]*peerMeshSession{
+			sessionID: {ID: sessionID, PeerID: 2, Token: "tok", ExpiresAt: now.Add(time.Hour)},
+		},
+		holePunchRetryScheduled: map[int64]bool{},
+		pending:                 map[string]pendingPeerProbe{},
+	}
+	_ = probeTarget
+
+	// 无健康 direct：排程应成功标记
+	mesh.scheduleHolePunchRetries(mesh.sessionsByID[sessionID])
+	mesh.mu.Lock()
+	scheduled := mesh.holePunchRetryScheduled[sessionID]
+	mesh.mu.Unlock()
+	if !scheduled {
+		t.Fatalf("expected holePunchRetryScheduled[%d]=true", sessionID)
+	}
+
+	// 建立健康 direct 路径后，retryHolePunch 应清除标记并停止
+	mesh.mu.Lock()
+	mesh.sessionsByID[sessionID].PathType = "DIRECT"
+	mesh.sessionsByID[sessionID].LastDirectSuccess = time.Now()
+	mesh.mu.Unlock()
+	mesh.retryHolePunch(sessionID)
+
+	mesh.mu.Lock()
+	scheduled = mesh.holePunchRetryScheduled[sessionID]
+	mesh.mu.Unlock()
+	if scheduled {
+		t.Fatalf("expected holePunchRetryScheduled[%d] cleared after healthy direct", sessionID)
+	}
+}
+
+// TestScheduleHolePunchRetriesDoesNotReschedule 校验 H-2：同一 session 在本轮退避完成前
+// 不会被重复排程（holePunchRetryScheduled 守卫生效）。
+func TestScheduleHolePunchRetriesDoesNotReschedule(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udp.Close()
+
+	sessionID := int64(7002)
+	now := time.Now()
+	mesh := &peerMeshClient{
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		logger: log.New(io.Discard, "", 0),
+		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
+			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",
+			CIDR: "100.96.0.0/11", ClientPublicKey: "local-key",
+		}},
+		udp:      udp,
+		stopCh:   make(chan struct{}),
+		peers:    map[int64]*peerMeshPeer{},
+		sessions: map[int64]*peerMeshSession{},
+		sessionsByID: map[int64]*peerMeshSession{
+			sessionID: {ID: sessionID, PeerID: 2, Token: "tok", ExpiresAt: now.Add(time.Hour)},
+		},
+		holePunchRetryScheduled: map[int64]bool{},
+		pending:                 map[string]pendingPeerProbe{},
+	}
+
+	session := mesh.sessionsByID[sessionID]
+	mesh.scheduleHolePunchRetries(session)
+	// 手动标记后再次调用，应被守卫拦截（不会 panic 或重复排程）
+	mesh.scheduleHolePunchRetries(session)
+	mesh.mu.Lock()
+	scheduled := mesh.holePunchRetryScheduled[sessionID]
+	mesh.mu.Unlock()
+	if !scheduled {
+		t.Fatalf("expected guard to remain set after duplicate schedule attempt")
+	}
 }

@@ -15,10 +15,16 @@ import (
 )
 
 const (
-	readerIdle       = 60 * time.Second
-	writerIdle       = 30 * time.Second
-	idleTickInterval = time.Second
+	readerIdle                 = 60 * time.Second
+	writerIdle                 = 30 * time.Second
+	idleTickInterval           = time.Second
+	priorityWriteQueueCapacity = 256
 )
+
+type queuedWrite struct {
+	frame   []byte
+	tracked int
+}
 
 // Handler receives per-connection lifecycle and packet events from the read loop. All
 // callbacks for a single connection run on that connection's read-loop goroutine.
@@ -44,15 +50,17 @@ type Conn struct {
 
 	ReadGate          *ReadGate
 	WriteBackpressure *WriteBackpressureGate
+	priorityWrites    chan queuedWrite
 
 	reasonOnce sync.Once
 	reason     atomic.Value // string
 
-	clientName atomic.Value // string
-	tenantID   atomic.Value // string
-	loginTime  atomic.Int64
-	recordID   atomic.Int64
-	sessionID  atomic.Int64
+	clientName     atomic.Value // string
+	tenantID       atomic.Value // string
+	loginTime      atomic.Int64
+	recordID       atomic.Int64
+	sessionID      atomic.Int64
+	connectionRole atomic.Value // string
 
 	lastReadUnixNano  atomic.Int64
 	lastWriteUnixNano atomic.Int64
@@ -69,6 +77,7 @@ func newConn(netConn net.Conn, maxFrameSize, writeLowWaterMark, writeHighWaterMa
 		maxFrameSize:      maxFrameSize,
 		ReadGate:          NewReadGate(),
 		WriteBackpressure: NewWriteBackpressureGate(writeLowWaterMark, writeHighWaterMark),
+		priorityWrites:    make(chan queuedWrite, priorityWriteQueueCapacity),
 	}
 	if addr := netConn.RemoteAddr(); addr != nil {
 		conn.remoteAddress = addr.String()
@@ -119,15 +128,25 @@ func (c *Conn) ConnectionRecordID() int64 { return c.recordID.Load() }
 // ClientSessionID returns the authenticated HTTP login session id, or 0 before login.
 func (c *Conn) ClientSessionID() int64 { return c.sessionID.Load() }
 
+// ConnectionRole is the authenticated mandatory v2 role.
+func (c *Conn) ConnectionRole() string {
+	if value, ok := c.connectionRole.Load().(string); ok {
+		return value
+	}
+	return ""
+}
+
 // SetConnectionRecordID stores the audit row id.
 func (c *Conn) SetConnectionRecordID(id int64) { c.recordID.Store(id) }
 
 // OnLoginSuccess records the authenticated client name and login time.
-func (c *Conn) OnLoginSuccess(clientName string, tenantID string, clientSessionID int64, loginTimeMs int64) {
+func (c *Conn) OnLoginSuccess(clientName string, tenantID string, clientSessionID int64,
+	loginTimeMs int64, connectionRole string) {
 	c.clientName.Store(clientName)
 	c.tenantID.Store(tenantID)
 	c.sessionID.Store(clientSessionID)
 	c.loginTime.Store(loginTimeMs)
+	c.connectionRole.Store(connectionRole)
 }
 
 // MarkReason records the disconnect reason; only the first call wins.
@@ -149,6 +168,7 @@ func (c *Conn) Close(reason string) {
 		c.MarkReason(reason)
 	}
 	c.cancel()
+	_ = c.netConn.Close()
 }
 
 // Send serializes and writes a packet, updating the write-idle timestamp. It is safe to call
@@ -160,7 +180,28 @@ func (c *Conn) Send(packet protocol.Packet) error {
 	}
 	trackedBytes := c.WriteBackpressure.AddPending(len(frame))
 	defer c.WriteBackpressure.ReleasePending(trackedBytes)
+	return c.writeFrame(frame)
+}
 
+// SendPriority queues a small flow-control packet without blocking the read loop on a
+// full-duplex socket write. The dedicated writer prevents DATA/WINDOW_UPDATE deadlocks.
+func (c *Conn) SendPriority(packet protocol.Packet) error {
+	frame, err := protocol.EncodeFrameLimit(packet, c.maxFrameSize)
+	if err != nil {
+		return err
+	}
+	trackedBytes := c.WriteBackpressure.AddPending(len(frame))
+	queued := queuedWrite{frame: frame, tracked: trackedBytes}
+	select {
+	case c.priorityWrites <- queued:
+		return nil
+	case <-c.ctx.Done():
+		c.WriteBackpressure.ReleasePending(trackedBytes)
+		return c.ctx.Err()
+	}
+}
+
+func (c *Conn) writeFrame(frame []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if _, err := c.writer.Write(frame); err != nil {
@@ -173,6 +214,29 @@ func (c *Conn) Send(packet protocol.Packet) error {
 	return nil
 }
 
+func (c *Conn) priorityWriteLoop() {
+	for {
+		select {
+		case queued := <-c.priorityWrites:
+			err := c.writeFrame(queued.frame)
+			c.WriteBackpressure.ReleasePending(queued.tracked)
+			if err != nil {
+				c.Close(store.ReasonIOError)
+				return
+			}
+		case <-c.ctx.Done():
+			for {
+				select {
+				case queued := <-c.priorityWrites:
+					c.WriteBackpressure.ReleasePending(queued.tracked)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
 // run drives the read loop and the idle watchdog until the connection closes.
 func (c *Conn) run(handler Handler) {
 	defer c.netConn.Close()
@@ -180,6 +244,7 @@ func (c *Conn) run(handler Handler) {
 	defer handler.OnDisconnect(c)
 
 	go c.idleWatchdog()
+	go c.priorityWriteLoop()
 
 	reader := bufio.NewReader(c.netConn)
 	done := c.ctx.Done()
@@ -195,12 +260,23 @@ func (c *Conn) run(handler Handler) {
 			return
 		}
 
-		command, body, err := protocol.ReadFrameLimit(reader, c.maxFrameSize)
+		frameLimit := c.maxFrameSize
+		preAuth := c.ClientName() == ""
+		if preAuth {
+			frameLimit = protocol.PreAuthMaxFrameSize
+		}
+		command, body, err := protocol.ReadFrameLimit(reader, frameLimit)
 		if err != nil {
 			// Distinguish a clean peer close from a protocol/IO error for the audit row.
 			if c.ctx.Err() == nil {
 				c.MarkReason(store.ReasonClientClosed)
 			}
+			return
+		}
+		// Authentication can complete while ReadFrameLimit is blocked. Re-read the
+		// connection state instead of relying on the frame-limit snapshot above.
+		if c.ClientName() == "" && command != protocol.CommandLoginRequest {
+			c.MarkReason(store.ReasonProtocolViolation)
 			return
 		}
 		c.lastReadUnixNano.Store(time.Now().UnixNano())

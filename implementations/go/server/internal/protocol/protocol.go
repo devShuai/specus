@@ -7,7 +7,6 @@ package protocol
 
 import (
 	"bytes"
-	"compress/flate"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -20,54 +19,48 @@ import (
 const (
 	// MagicNumber prefixes every frame (big-endian int32).
 	MagicNumber = 0x14353565
-	// Version is the protocol version byte (reserved, ignored on read).
-	Version byte = 1
+	// Version is the only accepted control protocol version.
+	Version byte = 2
 
-	// SerializerFastJSON is the serializer byte stamped on NAT_MESSAGE frames.
-	SerializerFastJSON byte = 1
-	// SerializerCompact is the serializer byte stamped on all other frames.
+	// SerializerCompact is the sole v2 serializer identifier, including NAT_MESSAGE.
 	SerializerCompact byte = 4
 
-	CommandLoginRequest       int8 = 1
-	CommandLoginResponse      int8 = -1
-	CommandMessageRequest     int8 = 2
-	CommandMessageResponse    int8 = -2
-	CommandLogoutRequest      int8 = 3
-	CommandLogoutResponse     int8 = -3
-	CommandHeartbeatRequest   int8 = 4
-	CommandHeartbeatResponse  int8 = -4
-	CommandHTTPRequest        int8 = 5
-	CommandHTTPResponse       int8 = -5
-	CommandNatMessage         int8 = 6
-	CommandDirectHTTPRequest  int8 = 7
-	CommandDirectHTTPResponse int8 = -7
+	CommandLoginRequest      int8 = 1
+	CommandLoginResponse     int8 = -1
+	CommandMessageRequest    int8 = 2
+	CommandMessageResponse   int8 = -2
+	CommandLogoutRequest     int8 = 3
+	CommandLogoutResponse    int8 = -3
+	CommandHeartbeatRequest  int8 = 4
+	CommandHeartbeatResponse int8 = -4
+	CommandNatMessage        int8 = 6
 
-	// MessageType ordinals (the compact-binary enum codec writes ordinal+1).
-	MessageTypeServerToClient = 0
-	MessageTypeClientToServer = 1
-	MessageTypeClientToClient = 2
-	MessageTypeNatControl     = 3
-	MessageTypePeerControl    = 4
+	// MessageType values are stable wire IDs, never language enum ordinals.
+	MessageTypeServerToClient = 1
+	MessageTypeClientToServer = 2
+	MessageTypeClientToClient = 3
+	MessageTypeNatControl     = 4
+	MessageTypePeerControl    = 5
 
 	// NAT_MESSAGE sub-types (the explicit wire code).
-	NatRegister         = 1
-	NatRegisterResult   = 2
-	NatConnected        = 3
-	NatDisconnected     = 4
-	NatData             = 5
-	NatKeepalive        = 6
-	NatUnregister       = 7
-	NatHTTPRoutesReport = 8
+	NatRegister       = 1
+	NatRegisterResult = 2
+	NatOpen           = 3
+	NatFin            = 4
+	NatData           = 5
+	NatKeepalive      = 6
+	NatUnregister     = 7
+	NatRST            = 8
+	NatWindowUpdate   = 9
+	NatFlagEndStream  = 0x01
 
 	// FrameHeaderSize is the fixed framing header length.
 	FrameHeaderSize = 11
 
 	// MaxFrameSize is Java Netty's full frame limit, including the 11-byte header.
-	MaxFrameSize     = 32 * 1024 * 1024
-	MaxFrameBodySize = MaxFrameSize - FrameHeaderSize
-	maxInflatedSize  = 16 * 1024 * 1024
-	// CompressionThreshold is the minimum raw payload size before deflate is attempted.
-	compressionThreshold = 64
+	MaxFrameSize        = 32 * 1024 * 1024
+	MaxFrameBodySize    = MaxFrameSize - FrameHeaderSize
+	PreAuthMaxFrameSize = 16 * 1024
 )
 
 // ReadFrame reads a single framed packet from reader, returning the command byte and
@@ -88,15 +81,28 @@ func ReadFrameLimit(reader io.Reader, maxFrameSize int) (command int8, body []by
 	if binary.BigEndian.Uint32(header[:4]) != MagicNumber {
 		return 0, nil, errors.New("invalid packet magic number")
 	}
+	if header[4] != Version {
+		return 0, nil, fmt.Errorf("unsupported protocol version: %d", header[4])
+	}
+	if header[5] != SerializerCompact {
+		return 0, nil, fmt.Errorf("unsupported serializer: %d", header[5])
+	}
+	command = int8(header[6])
+	if !knownCommand(command) {
+		return 0, nil, fmt.Errorf("unknown command: %d", command)
+	}
 	length := int(int32(binary.BigEndian.Uint32(header[7:11])))
 	if length < 0 || length > maxFrameSize-FrameHeaderSize {
 		return 0, nil, fmt.Errorf("invalid packet body length: %d", length)
+	}
+	if err := validateBodyLength(command, length); err != nil {
+		return 0, nil, err
 	}
 	body = make([]byte, length)
 	if _, err = io.ReadFull(reader, body); err != nil {
 		return 0, nil, err
 	}
-	return int8(header[6]), body, nil
+	return command, body, nil
 }
 
 // writeFrameBytes writes a framed packet for the given command and body to writer.
@@ -104,12 +110,15 @@ func writeFrameBytes(writer io.Writer, command int8, body []byte) error {
 	if len(body) > MaxFrameBodySize {
 		return fmt.Errorf("packet body exceeds limit: %d", len(body))
 	}
+	if err := validateBodyLength(command, len(body)); err != nil {
+		return err
+	}
 	header := make([]byte, FrameHeaderSize)
 	binary.BigEndian.PutUint32(header[:4], MagicNumber)
 	header[4] = Version
 	header[5] = SerializerCompact
-	if command == CommandNatMessage {
-		header[5] = SerializerFastJSON
+	if !knownCommand(command) {
+		return fmt.Errorf("unknown command: %d", command)
 	}
 	header[6] = byte(command)
 	binary.BigEndian.PutUint32(header[7:11], uint32(len(body)))
@@ -120,55 +129,6 @@ func writeFrameBytes(writer io.Writer, command int8, body []byte) error {
 	return err
 }
 
-// ---- payload envelope (1-byte type + raw/deflate) ------------------------------------
-
-func encodePayload(raw []byte) []byte {
-	if len(raw) >= compressionThreshold {
-		if compressed, err := deflate(raw); err == nil && len(compressed) < len(raw) {
-			return append([]byte{1}, compressed...)
-		}
-	}
-	return append([]byte{0}, raw...)
-}
-
-func decodePayload(encoded []byte) ([]byte, error) {
-	if len(encoded) == 0 {
-		return nil, errors.New("compact payload is empty")
-	}
-	switch encoded[0] {
-	case 0:
-		return append([]byte(nil), encoded[1:]...), nil
-	case 1:
-		reader := flate.NewReader(bytes.NewReader(encoded[1:]))
-		defer reader.Close()
-		data, err := io.ReadAll(io.LimitReader(reader, maxInflatedSize+1))
-		if err != nil {
-			return nil, fmt.Errorf("inflate compact payload: %w", err)
-		}
-		if len(data) > maxInflatedSize {
-			return nil, errors.New("inflated compact payload exceeds limit")
-		}
-		return data, nil
-	default:
-		return nil, fmt.Errorf("unknown compact payload type: %d", encoded[0])
-	}
-}
-
-func deflate(raw []byte) ([]byte, error) {
-	var output bytes.Buffer
-	writer, err := flate.NewWriter(&output, flate.BestCompression)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := writer.Write(raw); err != nil {
-		return nil, err
-	}
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-	return output.Bytes(), nil
-}
-
 // ---- compact writer ------------------------------------------------------------------
 
 type compactOutput struct {
@@ -177,8 +137,7 @@ type compactOutput struct {
 
 func newCompactOutput() *compactOutput { return &compactOutput{} }
 
-// payload wraps the accumulated bytes in the 1-byte payload-type envelope.
-func (output *compactOutput) payload() []byte { return encodePayload(output.Bytes()) }
+func (output *compactOutput) payload() []byte { return append([]byte(nil), output.Bytes()...) }
 
 func (output *compactOutput) writeString(value string) {
 	_ = output.writeVarInt(len([]byte(value)) + 1)
@@ -211,8 +170,8 @@ func (output *compactOutput) writeBool(value bool) {
 	}
 }
 
-func (output *compactOutput) writeEnum(ordinal int) {
-	output.writeVarLong(uint64(ordinal + 1))
+func (output *compactOutput) writeEnum(wireID int) {
+	output.writeVarLong(uint64(wireID))
 }
 
 func (output *compactOutput) writeStringList(values []string) {
@@ -292,11 +251,7 @@ type compactInput struct {
 }
 
 func newCompactInput(encoded []byte) (*compactInput, error) {
-	decoded, err := decodePayload(encoded)
-	if err != nil {
-		return nil, err
-	}
-	return &compactInput{reader: bytes.NewReader(decoded)}, nil
+	return &compactInput{reader: bytes.NewReader(encoded)}, nil
 }
 
 func (input *compactInput) finish() error {
@@ -451,7 +406,22 @@ func (input *compactInput) readEnum() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return value - 1, nil
+	if value < MessageTypeServerToClient || value > MessageTypePeerControl {
+		return 0, fmt.Errorf("invalid message type wire id: %d", value)
+	}
+	return value, nil
+}
+
+func knownCommand(command int8) bool {
+	switch command {
+	case CommandLoginRequest, CommandLoginResponse,
+		CommandMessageRequest, CommandMessageResponse,
+		CommandLogoutRequest, CommandLogoutResponse,
+		CommandHeartbeatRequest, CommandHeartbeatResponse, CommandNatMessage:
+		return true
+	default:
+		return false
+	}
 }
 
 func (input *compactInput) readNumericString() (string, error) {

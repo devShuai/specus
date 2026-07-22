@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"bytes"
-	"compress/flate"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -15,44 +14,47 @@ import (
 
 const (
 	MagicNumber      = 0x14353565
-	Version     byte = 1
+	Version     byte = 2
 
-	SerializerFastJSON byte = 1
-	SerializerCompact  byte = 4
+	SerializerCompact     byte = 4
+	ConnectionRoleControl      = "control"
+	ConnectionRoleData         = "data"
 
-	CommandLoginRequest       int8 = 1
-	CommandLoginResponse      int8 = -1
-	CommandMessageRequest     int8 = 2
-	CommandMessageResponse    int8 = -2
-	CommandLogoutRequest      int8 = 3
-	CommandLogoutResponse     int8 = -3
-	CommandHeartbeatRequest   int8 = 4
-	CommandHeartbeatResponse  int8 = -4
-	CommandLegacyHTTPRequest  int8 = 5
-	CommandLegacyHTTPResponse int8 = -5
-	CommandNatMessage         int8 = 6
-	CommandDirectHTTPRequest  int8 = 7
-	CommandDirectHTTPResponse int8 = -7
+	CommandLoginRequest      int8 = 1
+	CommandLoginResponse     int8 = -1
+	CommandMessageRequest    int8 = 2
+	CommandMessageResponse   int8 = -2
+	CommandLogoutRequest     int8 = 3
+	CommandLogoutResponse    int8 = -3
+	CommandHeartbeatRequest  int8 = 4
+	CommandHeartbeatResponse int8 = -4
+	CommandNatMessage        int8 = 6
 
-	NatRegister         = 1
-	NatRegisterResult   = 2
-	NatConnected        = 3
-	NatDisconnected     = 4
-	NatData             = 5
-	NatKeepalive        = 6
-	NatUnregister       = 7
-	NatHTTPRoutesReport = 8
+	NatRegister       = 1
+	NatRegisterResult = 2
+	NatOpen           = 3
+	NatFin            = 4
+	NatData           = 5
+	NatKeepalive      = 6
+	NatUnregister     = 7
+	NatRST            = 8
+	NatWindowUpdate   = 9
+	NatFlagEndStream  = 0x01
 
-	MessageTypeServerToClient = 0
-	MessageTypeClientToServer = 1
-	MessageTypeClientToClient = 2
-	MessageTypeNatControl     = 3
-	MessageTypePeerControl    = 4
+	MessageTypeServerToClient = 1
+	MessageTypeClientToServer = 2
+	MessageTypeClientToClient = 3
+	MessageTypeNatControl     = 4
+	MessageTypePeerControl    = 5
 
-	frameHeaderSize  = 11
-	maxFrameSize     = 32 * 1024 * 1024
-	maxFrameBodySize = maxFrameSize - frameHeaderSize
-	maxInflatedSize  = 16 * 1024 * 1024
+	frameHeaderSize     = 11
+	maxFrameSize        = 32 * 1024 * 1024
+	maxFrameBodySize    = maxFrameSize - frameHeaderSize
+	preAuthMaxFrameSize = 16 * 1024
+	maxNatMetadataBytes = 65535
+	maxMessageBodyBytes = 1024 * 1024
+	natBodyHeaderSize   = 16
+	natFlagEndStream    = 1
 )
 
 type Packet struct {
@@ -82,49 +84,24 @@ func EncodeMessageRequest(clientName, toClientName string, messageType int, mess
 	return encodePayload(output.Bytes())
 }
 
-type DirectHTTPRequest struct {
-	RequestID    string
-	Method       string
-	Route        string
-	RelativePath string
-	RawQuery     string
-	Headers      []string
-	Body         []byte
-}
-
-type DirectHTTPResponse struct {
-	RequestID  string
-	StatusCode int
-	Headers    []string
-	Body       []byte
-	Error      *string
-}
-
-type LegacyHTTPRequest struct {
-	ClientName   string
-	ToClientName string
-	RequestID    string
-	Method       string
-	RequestURL   string
-	Headers      map[string]string
-	Params       map[string]string
-	Body         string
-}
-
-type LegacyHTTPResponse struct {
-	ClientName   string
-	ToClientName string
-	RequestID    string
-	Response     string
-}
-
 type NatMessage struct {
 	Type     int
+	Flags    byte
+	StreamID uint32
+	Value    uint32
 	Metadata map[string]any
 	Data     []byte
 }
 
 func ReadPacket(reader io.Reader) (Packet, error) {
+	return ReadPacketLimit(reader, maxFrameSize)
+}
+
+// ReadPacketLimit reads one frame with a full-frame limit, including the fixed header.
+func ReadPacketLimit(reader io.Reader, limit int) (Packet, error) {
+	if limit < frameHeaderSize {
+		return Packet{}, fmt.Errorf("frame limit is smaller than header: %d", limit)
+	}
 	header := make([]byte, frameHeaderSize)
 	if _, err := io.ReadFull(reader, header); err != nil {
 		return Packet{}, err
@@ -132,16 +109,31 @@ func ReadPacket(reader io.Reader) (Packet, error) {
 	if binary.BigEndian.Uint32(header[:4]) != MagicNumber {
 		return Packet{}, errors.New("invalid packet magic number")
 	}
+	if header[4] != Version {
+		return Packet{}, fmt.Errorf("unsupported protocol version: %d", header[4])
+	}
+	if header[5] != SerializerCompact {
+		return Packet{}, fmt.Errorf("unsupported serializer: %d", header[5])
+	}
+	command := int8(header[6])
+	if !knownCommand(command) {
+		return Packet{}, fmt.Errorf("unknown command: %d", command)
+	}
 	length := int(binary.BigEndian.Uint32(header[7:11]))
-	if length < 0 || length > maxFrameBodySize {
+	if length < 0 || length > limit-frameHeaderSize {
 		return Packet{}, fmt.Errorf("invalid packet body length: %d", length)
 	}
 	body := make([]byte, length)
 	if _, err := io.ReadFull(reader, body); err != nil {
 		return Packet{}, err
 	}
-	return Packet{Command: int8(header[6]), Body: body}, nil
+	if err := validateBodyLength(command, length); err != nil {
+		return Packet{}, err
+	}
+	return Packet{Command: command, Body: body}, nil
 }
+
+func PreAuthMaxFrameSize() int { return preAuthMaxFrameSize }
 
 func WritePacket(writer io.Writer, command int8, body []byte) error {
 	if len(body) > maxFrameBodySize {
@@ -151,8 +143,11 @@ func WritePacket(writer io.Writer, command int8, body []byte) error {
 	binary.BigEndian.PutUint32(header[:4], MagicNumber)
 	header[4] = Version
 	header[5] = SerializerCompact
-	if command == CommandNatMessage {
-		header[5] = SerializerFastJSON
+	if !knownCommand(command) {
+		return fmt.Errorf("unknown command: %d", command)
+	}
+	if err := validateBodyLength(command, len(body)); err != nil {
+		return err
 	}
 	header[6] = byte(command)
 	binary.BigEndian.PutUint32(header[7:11], uint32(len(body)))
@@ -162,11 +157,15 @@ func WritePacket(writer io.Writer, command int8, body []byte) error {
 	return writeAll(writer, body)
 }
 
-func EncodeLoginRequest(clientName string, clientSessionID int64, accessToken string) ([]byte, error) {
+func EncodeLoginRequest(clientName string, clientSessionID int64, accessToken, connectionRole string) ([]byte, error) {
+	if connectionRole != ConnectionRoleControl && connectionRole != ConnectionRoleData {
+		return nil, fmt.Errorf("invalid connection role: %q", connectionRole)
+	}
 	output := newCompactOutput()
 	output.writeString(clientName)
 	output.writeNullableLong(clientSessionID)
 	output.writeString(accessToken)
+	output.writeString(connectionRole)
 	return encodePayload(output.Bytes()), nil
 }
 
@@ -229,243 +228,136 @@ func DecodeMessageResponse(body []byte) (MessageResponse, error) {
 	}, nil
 }
 
-func DecodeDirectHTTPRequest(body []byte) (DirectHTTPRequest, error) {
-	input, err := newCompactInput(body)
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	requestID, err := input.readUUIDString()
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	method, err := input.readHTTPMethod()
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	route, err := input.readString()
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	relativePath, err := input.readString()
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	rawQuery, err := input.readString()
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	headers, err := input.readStringList()
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	requestBody, err := input.readByteArray()
-	if err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	if err := input.finish(); err != nil {
-		return DirectHTTPRequest{}, err
-	}
-	return DirectHTTPRequest{
-		RequestID: requestID, Method: method, Route: route, RelativePath: relativePath,
-		RawQuery: rawQuery, Headers: headers, Body: requestBody,
-	}, nil
-}
-
-func EncodeDirectHTTPResponse(response DirectHTTPResponse) ([]byte, error) {
-	output := newCompactOutput()
-	if err := output.writeUUIDString(response.RequestID); err != nil {
-		return nil, err
-	}
-	if err := output.writeVarInt(response.StatusCode); err != nil {
-		return nil, err
-	}
-	output.writeStringList(response.Headers)
-	output.writeByteArray(response.Body)
-	output.writeOptionalString(response.Error)
-	return encodePayload(output.Bytes()), nil
-}
-
-func DecodeDirectHTTPResponse(body []byte) (DirectHTTPResponse, error) {
-	input, err := newCompactInput(body)
-	if err != nil {
-		return DirectHTTPResponse{}, err
-	}
-	requestID, err := input.readUUIDString()
-	if err != nil {
-		return DirectHTTPResponse{}, err
-	}
-	statusCode, err := input.readVarInt()
-	if err != nil {
-		return DirectHTTPResponse{}, err
-	}
-	headers, err := input.readStringList()
-	if err != nil {
-		return DirectHTTPResponse{}, err
-	}
-	responseBody, err := input.readByteArray()
-	if err != nil {
-		return DirectHTTPResponse{}, err
-	}
-	responseError, err := input.readOptionalString()
-	if err != nil {
-		return DirectHTTPResponse{}, err
-	}
-	if err := input.finish(); err != nil {
-		return DirectHTTPResponse{}, err
-	}
-	return DirectHTTPResponse{
-		RequestID:  requestID,
-		StatusCode: statusCode,
-		Headers:    headers,
-		Body:       responseBody,
-		Error:      responseError,
-	}, nil
-}
-
-func DecodeLegacyHTTPRequest(body []byte) (LegacyHTTPRequest, error) {
-	input, err := newCompactInput(body)
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	clientName, err := input.readString()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	toClientName, err := input.readString()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	requestID, err := input.readUUIDString()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	method, err := input.readHTTPMethod()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	requestURL, err := input.readString()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	headers, err := input.readStringMap()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	params, err := input.readStringMap()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	requestBody, err := input.readString()
-	if err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	if err := input.finish(); err != nil {
-		return LegacyHTTPRequest{}, err
-	}
-	return LegacyHTTPRequest{
-		ClientName: clientName, ToClientName: toClientName, RequestID: requestID,
-		Method: method, RequestURL: requestURL, Headers: headers, Params: params, Body: requestBody,
-	}, nil
-}
-
-func EncodeLegacyHTTPResponse(response LegacyHTTPResponse) ([]byte, error) {
-	output := newCompactOutput()
-	output.writeString(response.ClientName)
-	output.writeString(response.ToClientName)
-	if err := output.writeUUIDString(response.RequestID); err != nil {
-		return nil, err
-	}
-	output.writeString(response.Response)
-	return encodePayload(output.Bytes()), nil
-}
-
 func EncodeNatMessage(message NatMessage) ([]byte, error) {
-	metadata, err := json.Marshal(message.Metadata)
+	if message.Type < NatRegister || message.Type > NatWindowUpdate {
+		return nil, fmt.Errorf("unknown NAT message type: %d", message.Type)
+	}
+	metadata, err := encodeNatMetadata(message.Metadata)
 	if err != nil {
-		return nil, fmt.Errorf("encode NAT metadata: %w", err)
-	}
-	var output bytes.Buffer
-	if err := binary.Write(&output, binary.BigEndian, int32(message.Type)); err != nil {
 		return nil, err
 	}
-	if err := binary.Write(&output, binary.BigEndian, int32(len(metadata))); err != nil {
+	if err := validateNatSemantics(message.Type, message.Flags, message.StreamID, message.Value, len(metadata), len(message.Data)); err != nil {
 		return nil, err
 	}
-	output.Write(metadata)
-	if len(message.Data) > 0 {
-		output.Write(encodePayload(message.Data))
+	if len(message.Data) > maxFrameBodySize-natBodyHeaderSize-len(metadata) {
+		return nil, errors.New("NAT data exceeds frame limit")
 	}
-	return output.Bytes(), nil
+	output := make([]byte, natBodyHeaderSize, natBodyHeaderSize+len(metadata)+len(message.Data))
+	output[0] = byte(message.Type)
+	output[1] = message.Flags
+	binary.BigEndian.PutUint16(output[2:4], uint16(len(metadata)))
+	binary.BigEndian.PutUint32(output[4:8], message.StreamID)
+	binary.BigEndian.PutUint32(output[8:12], message.Value)
+	binary.BigEndian.PutUint32(output[12:16], uint32(len(message.Data)))
+	output = append(output, metadata...)
+	output = append(output, message.Data...)
+	return output, nil
 }
 
 func DecodeNatMessage(body []byte) (NatMessage, error) {
-	if len(body) < 8 {
+	if len(body) < natBodyHeaderSize {
 		return NatMessage{}, errors.New("NAT packet is too short")
 	}
-	messageType := int(int32(binary.BigEndian.Uint32(body[:4])))
-	metadataLength := int(int32(binary.BigEndian.Uint32(body[4:8])))
-	if metadataLength < 0 || len(body)-8 < metadataLength {
-		return NatMessage{}, errors.New("invalid NAT metadata length")
+	messageType := int(body[0])
+	if messageType < NatRegister || messageType > NatWindowUpdate {
+		return NatMessage{}, fmt.Errorf("unknown NAT message type: %d", messageType)
 	}
-	metadata := make(map[string]any)
-	if err := json.Unmarshal(body[8:8+metadataLength], &metadata); err != nil {
-		return NatMessage{}, fmt.Errorf("decode NAT metadata: %w", err)
+	flags := body[1]
+	if flags & ^byte(natFlagEndStream) != 0 {
+		return NatMessage{}, fmt.Errorf("unknown NAT flags: %d", flags)
+	}
+	metadataLength := int(binary.BigEndian.Uint16(body[2:4]))
+	streamID := binary.BigEndian.Uint32(body[4:8])
+	value := binary.BigEndian.Uint32(body[8:12])
+	dataLength := int(binary.BigEndian.Uint32(body[12:16]))
+	if metadataLength > maxNatMetadataBytes ||
+		len(body) != natBodyHeaderSize+metadataLength+dataLength {
+		return NatMessage{}, errors.New("invalid NAT metadata/data length")
+	}
+	metadata, err := decodeNatMetadata(body[natBodyHeaderSize : natBodyHeaderSize+metadataLength])
+	if err != nil {
+		return NatMessage{}, err
 	}
 	var data []byte
-	if len(body) > 8+metadataLength {
-		var err error
-		data, err = decodePayload(body[8+metadataLength:])
-		if err != nil {
-			return NatMessage{}, err
-		}
+	if dataLength > 0 {
+		data = append([]byte(nil), body[natBodyHeaderSize+metadataLength:]...)
 	}
-	return NatMessage{Type: messageType, Metadata: metadata, Data: data}, nil
+	if err := validateNatSemantics(messageType, flags, streamID, value, metadataLength, dataLength); err != nil {
+		return NatMessage{}, err
+	}
+	return NatMessage{Type: messageType, Flags: flags, StreamID: streamID, Value: value, Metadata: metadata, Data: data}, nil
+}
+
+func encodeNatMetadata(metadata map[string]any) ([]byte, error) {
+	if len(metadata) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("encode NAT metadata: %w", err)
+	}
+	if len(encoded) > maxNatMetadataBytes {
+		return nil, errors.New("NAT metadata exceeds limit")
+	}
+	return encoded, nil
+}
+
+func decodeNatMetadata(encoded []byte) (map[string]any, error) {
+	if len(encoded) == 0 {
+		return map[string]any{}, nil
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(encoded, &metadata); err != nil {
+		return nil, fmt.Errorf("decode NAT metadata: %w", err)
+	}
+	if metadata == nil {
+		return nil, errors.New("NAT metadata must be an object")
+	}
+	return metadata, nil
+}
+
+func validateNatSemantics(messageType int, flags byte, streamID, value uint32, metadataLength, dataLength int) error {
+	streamFrame := messageType == NatOpen || messageType == NatFin || messageType == NatData ||
+		messageType == NatRST || messageType == NatWindowUpdate
+	if streamFrame == (streamID == 0) {
+		if streamFrame {
+			return errors.New("stream frame requires a non-zero stream id")
+		}
+		return errors.New("connection frame requires stream id zero")
+	}
+	if messageType != NatData && flags != 0 {
+		return errors.New("flags are only valid on DATA")
+	}
+	if messageType == NatData && (metadataLength != 0 || value != 0) {
+		return errors.New("DATA cannot carry metadata/value")
+	}
+	if messageType == NatWindowUpdate && (metadataLength != 0 || dataLength != 0 || flags != 0) {
+		return errors.New("WINDOW_UPDATE cannot carry payload")
+	}
+	if messageType == NatFin && (dataLength != 0 || flags != 0) {
+		return errors.New("FIN cannot carry binary data or flags")
+	}
+	if messageType == NatWindowUpdate && value == 0 {
+		return errors.New("WINDOW_UPDATE credit must be positive")
+	}
+	if messageType == NatFin && value != 0 {
+		return errors.New("FIN value must be zero")
+	}
+	if messageType == NatRST && dataLength != 0 {
+		return errors.New("RST cannot carry binary data")
+	}
+	if !streamFrame && (value != 0 || flags != 0 || dataLength != 0) {
+		return errors.New("connection control frame cannot carry stream value/data")
+	}
+	return nil
 }
 
 func encodePayload(raw []byte) []byte {
-	compressed, err := deflate(raw)
-	if len(raw) >= 64 && err == nil && len(compressed) < len(raw) {
-		return append([]byte{1}, compressed...)
-	}
-	return append([]byte{0}, raw...)
+	return append([]byte(nil), raw...)
 }
 
 func decodePayload(encoded []byte) ([]byte, error) {
-	if len(encoded) == 0 {
-		return nil, errors.New("compact payload is empty")
-	}
-	switch encoded[0] {
-	case 0:
-		return append([]byte(nil), encoded[1:]...), nil
-	case 1:
-		reader := flate.NewReader(bytes.NewReader(encoded[1:]))
-		defer reader.Close()
-		data, err := io.ReadAll(io.LimitReader(reader, maxInflatedSize+1))
-		if err != nil {
-			return nil, fmt.Errorf("inflate compact payload: %w", err)
-		}
-		if len(data) > maxInflatedSize {
-			return nil, errors.New("inflated compact payload exceeds limit")
-		}
-		return data, nil
-	default:
-		return nil, fmt.Errorf("unknown compact payload type: %d", encoded[0])
-	}
-}
-
-func deflate(raw []byte) ([]byte, error) {
-	var output bytes.Buffer
-	writer, err := flate.NewWriter(&output, flate.BestCompression)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := writer.Write(raw); err != nil {
-		return nil, err
-	}
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-	return output.Bytes(), nil
+	return append([]byte(nil), encoded...), nil
 }
 
 func writeAll(writer io.Writer, data []byte) error {
@@ -544,8 +436,8 @@ func (output *compactOutput) writeNullableLong(value int64) {
 	output.writeVarLong(uint64(value<<1) ^ uint64(value>>63))
 }
 
-func (output *compactOutput) writeEnum(ordinal int) {
-	output.writeVarLong(uint64(ordinal + 1))
+func (output *compactOutput) writeEnum(wireID int) {
+	output.writeVarLong(uint64(wireID))
 }
 
 func (output *compactOutput) writeNumericString(value string) error {
@@ -730,7 +622,10 @@ func (input *compactInput) readNullableEnum() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return value - 1, nil
+	if value < MessageTypeServerToClient || value > MessageTypePeerControl {
+		return 0, fmt.Errorf("invalid message type wire id: %d", value)
+	}
+	return value, nil
 }
 
 func (input *compactInput) readHTTPMethod() (string, error) {
@@ -786,4 +681,29 @@ func parseUUID(value string) ([]byte, bool) {
 func formatUUID(value []byte) string {
 	encoded := hex.EncodeToString(value)
 	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
+}
+
+func knownCommand(command int8) bool {
+	switch command {
+	case CommandLoginRequest, CommandLoginResponse,
+		CommandMessageRequest, CommandMessageResponse,
+		CommandLogoutRequest, CommandLogoutResponse,
+		CommandHeartbeatRequest, CommandHeartbeatResponse, CommandNatMessage:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateBodyLength(command int8, length int) error {
+	maximum := maxFrameBodySize
+	if command == CommandLoginRequest || command == CommandLoginResponse {
+		maximum = preAuthMaxFrameSize - frameHeaderSize
+	} else if command == CommandMessageRequest || command == CommandMessageResponse {
+		maximum = maxMessageBodyBytes
+	}
+	if length < 0 || length > maximum {
+		return fmt.Errorf("command %d body exceeds limit: %d/%d", command, length, maximum)
+	}
+	return nil
 }

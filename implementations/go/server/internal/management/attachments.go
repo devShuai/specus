@@ -63,7 +63,7 @@ func (a *API) handlePublicAttachmentPresignUpload(w http.ResponseWriter, r *http
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	if err := a.attachments.CheckPresignIP(attachmentClientIP(r)); err != nil {
+	if err := a.attachments.CheckPresignIPContext(r.Context(), attachmentClientIP(r)); err != nil {
 		a.failAttachment(w, err)
 		return
 	}

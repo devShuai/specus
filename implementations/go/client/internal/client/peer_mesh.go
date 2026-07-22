@@ -3,11 +3,14 @@ package client
 import (
 	"crypto/ecdh"
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -56,10 +59,27 @@ const (
 	peerMaxAdaptivePortDelta      = 512
 	peerDirectKeepaliveInterval   = 25 * time.Second
 	peerDirectStaleInterval       = 45 * time.Second
-	peerRttHysteresisMillis       = int64(100)
-	peerRttEWMAOldWeight          = int64(7)
-	peerRttEWMANewWeight          = int64(1)
-	peerRttUnsetMillis            = int64(1<<63 - 1)
+	// H-1：候选回礼节流间隔，避免两端互相触发形成信令循环，对齐 Java
+	// CANDIDATE_RECIPROCATE_INTERVAL_MILLIS=2000。
+	peerCandidateReciprocateInterval = 2 * time.Second
+)
+
+// H-2：session 首次发起连通性检查后的密集退避重试节奏，对齐 Java
+// HOLE_PUNCH_RETRY_DELAYS_MILLIS={1k,2k,4k,8k}。把"打洞成功前的丢包窗口"从最坏 30-60s
+// maintenance tick 压缩到数秒，不改变最终成功率。打通或过期即停。
+// time.Duration 不是编译期常量，因此用 var 而非 const。
+var peerHolePunchRetryDelays = [...]time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+}
+
+const (
+	peerRttHysteresisMillis = int64(100)
+	peerRttEWMAOldWeight    = int64(7)
+	peerRttEWMANewWeight    = int64(1)
+	peerRttUnsetMillis      = int64(1<<63 - 1)
 )
 
 type peerControlSender func(net.Conn, string, any) error
@@ -82,6 +102,10 @@ type peerMeshClient struct {
 	pendingTurn           map[string]pendingTurnRequest
 	packets               map[int64][]pendingPeerPacket
 	prepared              map[int64]time.Time
+	// H-2：记录已排程密集退避重试的 session，防止重复排程；本轮结束后释放以便路径失效后重新进入。
+	holePunchRetryScheduled map[int64]bool
+	// H-1：记录每个 peer 最近一次候选回礼时间，2s 节流防信令循环。
+	candidateReciprocateAt map[int64]time.Time
 	srflx                 *peerCandidate
 	srflxCandidates       map[string]peerCandidate
 	relay                 *peerCandidate
@@ -103,10 +127,19 @@ type peerMeshClient struct {
 	natBehaviorDiscovery  string
 	lastEndpoint          string
 	turnPermissions       map[string]time.Time
+	turnChannelsByPeer    map[string]*turnChannelBinding
+	turnChannelsByNumber  map[uint16]*turnChannelBinding
+	nextTurnChannel       uint16
 	localKey              *ecdh.PrivateKey
+	// localKeyEpoch is this process instance's random SPM2 key epoch. It is the anchor for
+	// AES-GCM nonce uniqueness: sessionId/token are reused within the server session TTL and
+	// X25519 keys are persisted on disk, so only a fresh epoch keeps a restarted client from
+	// falling back into the same nonce space once its sequence restarts at 1.
+	localKeyEpoch         string
 	device                peerVirtualDevice
 	runtimeConfigKey      string
 	ignoredPacketLogAt    map[string]time.Time
+	pathMTUCache          map[string]cachedPeerPathMTU
 	messageHandler        func(ClientMessage)
 	turnAuth              turnAuthCredentials
 }
@@ -116,18 +149,20 @@ type peerMeshPeer struct {
 	ClientName string          `json:"clientName"`
 	VirtualIP  string          `json:"virtualIp"`
 	PublicKey  string          `json:"publicKey"`
+	KeyEpoch   string          `json:"-"`
 	Online     bool            `json:"online"`
 	Candidates []peerCandidate `json:"candidates,omitempty"`
 }
 
 type peerCandidate struct {
-	Type       string `json:"type,omitempty"`
-	Transport  string `json:"transport,omitempty"`
-	Address    string `json:"address,omitempty"`
-	Port       int    `json:"port,omitempty"`
-	Priority   int64  `json:"priority,omitempty"`
-	Foundation string `json:"foundation,omitempty"`
-	RelayID    string `json:"relayId,omitempty"`
+	Type          string `json:"type,omitempty"`
+	Transport     string `json:"transport,omitempty"`
+	Address       string `json:"address,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	Priority      int64  `json:"priority,omitempty"`
+	Foundation    string `json:"foundation,omitempty"`
+	RelayID       string `json:"relayId,omitempty"`
+	AddressFamily string `json:"addressFamily,omitempty"`
 }
 
 type peerControlMessage struct {
@@ -136,6 +171,7 @@ type peerControlMessage struct {
 	SourceClientName     string          `json:"sourceClientName,omitempty"`
 	SourceVirtualIP      string          `json:"sourceVirtualIp,omitempty"`
 	SourcePublicKey      string          `json:"sourcePublicKey,omitempty"`
+	SourceKeyEpoch       string          `json:"sourceKeyEpoch,omitempty"`
 	TargetClientID       int64           `json:"targetClientId,omitempty"`
 	TargetClientName     string          `json:"targetClientName,omitempty"`
 	TargetVirtualIP      string          `json:"targetVirtualIp,omitempty"`
@@ -162,6 +198,7 @@ type peerControlMessage struct {
 	PeerMesh             *PeerMeshConfig `json:"peerMesh,omitempty"`
 	Peers                []peerMeshPeer  `json:"peers,omitempty"`
 	Candidates           []peerCandidate `json:"candidates,omitempty"`
+	DataFrameVersion     int             `json:"dataFrameVersion"`
 	Reason               string          `json:"reason,omitempty"`
 	CreatedAtMillis      int64           `json:"createdAtMillis,omitempty"`
 }
@@ -188,10 +225,15 @@ type peerMeshSession struct {
 	BestDirectRTT           int64
 	BestRelayRTT            int64
 	AESKey                  []byte
+	LocalKeyEpoch           string
+	RemoteKeyEpoch          string
+	OutboundCodec           *peerDataFrameTrafficCodec
+	InboundCodec            *peerDataFrameTrafficCodec
 	Sequence                uint64
 	Replay                  peerReplayWindow
 	DirectBytes             int64
 	DirectBytesPending      int64
+	PathMTU                 *peerPathMTUDiscovery
 }
 
 func (session *peerMeshSession) hasHealthyDirect(now time.Time) bool {
@@ -199,6 +241,52 @@ func (session *peerMeshSession) hasHealthyDirect(now time.Time) bool {
 		strings.EqualFold(session.PathType, "DIRECT") &&
 		!session.LastDirectSuccess.IsZero() &&
 		now.Sub(session.LastDirectSuccess) <= 45*time.Second
+}
+
+func (session *peerMeshSession) acceptInboundFrame(frame *peerDataFrame) bool {
+	if session == nil || frame == nil {
+		return false
+	}
+	return session.Replay.accept(frame.Sequence)
+}
+
+func (session *peerMeshSession) ensureTrafficCodecs(localClientID int64) error {
+	if session == nil || len(session.AESKey) != 32 {
+		return fmt.Errorf("peer session has no data key")
+	}
+	if strings.TrimSpace(session.LocalKeyEpoch) == "" || strings.TrimSpace(session.RemoteKeyEpoch) == "" {
+		return fmt.Errorf("peer session is missing a key epoch")
+	}
+	if session.OutboundCodec != nil && session.InboundCodec != nil {
+		return nil
+	}
+	outbound, err := newPeerDataFrameTrafficCodec(
+		session.AESKey, session.ID, localClientID, session.PeerID, session.LocalKeyEpoch)
+	if err != nil {
+		return err
+	}
+	inbound, err := newPeerDataFrameTrafficCodec(
+		session.AESKey, session.ID, session.PeerID, localClientID, session.RemoteKeyEpoch)
+	if err != nil {
+		return err
+	}
+	session.OutboundCodec = outbound
+	session.InboundCodec = inbound
+	return nil
+}
+
+// applyRemoteKeyEpoch resets the inbound decryption state when the peer restarts with a new
+// epoch. The peer restarts its sequence at 1, so the old replay window would reject every
+// new frame and the cached inbound codec would fail to decrypt.
+func (session *peerMeshSession) applyRemoteKeyEpoch(epoch string) bool {
+	if session == nil || strings.TrimSpace(epoch) == "" || epoch == session.RemoteKeyEpoch {
+		return false
+	}
+	changed := strings.TrimSpace(session.RemoteKeyEpoch) != ""
+	session.RemoteKeyEpoch = epoch
+	session.InboundCodec = nil
+	session.Replay = peerReplayWindow{}
+	return changed
 }
 
 type pendingPeerProbe struct {
@@ -223,9 +311,19 @@ type pendingStunBinding struct {
 type pendingTurnRequest struct {
 	RequestType           uint16
 	Attributes            []stunAttribute
+	OriginalTransactionID [stunTransactionIDBytes]byte
 	Endpoint              *net.UDPAddr
+	Channel               uint16
+	Peer                  *net.UDPAddr
 	AuthenticationAttempt int
 	SentAt                time.Time
+}
+
+type turnChannelBinding struct {
+	Channel   uint16
+	Peer      *net.UDPAddr
+	ExpiresAt time.Time
+	Active    bool
 }
 
 type turnAuthCredentials struct {
@@ -260,7 +358,24 @@ func newPeerMeshClient(config Config, logger *log.Logger) *peerMeshClient {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &peerMeshClient{config: config, logger: logger, portMappingService: newNatPortMappingService(logger)}
+	return &peerMeshClient{
+		config:             config,
+		logger:             logger,
+		portMappingService: newNatPortMappingService(logger),
+		localKeyEpoch:      newPeerMeshKeyEpoch(),
+	}
+}
+
+// newPeerMeshKeyEpoch returns a 128 bit random epoch for this process instance.
+func newPeerMeshKeyEpoch() string {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		// crypto/rand failure is fatal for the data plane; fall back to a time-based value
+		// so the client still starts, and never reuse a constant.
+		binary.BigEndian.PutUint64(buffer, uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(buffer[8:], uint64(os.Getpid()))
+	}
+	return hex.EncodeToString(buffer)
 }
 
 func (mesh *peerMeshClient) setMessageHandler(handler func(ClientMessage)) {
@@ -285,6 +400,9 @@ func (mesh *peerMeshClient) updateTurnAuthLocked(peerMesh PeerMeshConfig) bool {
 	}
 	mesh.turnAuth = next
 	clear(mesh.pendingTurn)
+	clear(mesh.turnChannelsByPeer)
+	clear(mesh.turnChannelsByNumber)
+	mesh.nextTurnChannel = turnChannelMin
 	return true
 }
 
@@ -329,6 +447,8 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.pendingTurn = make(map[string]pendingTurnRequest)
 	mesh.packets = make(map[int64][]pendingPeerPacket)
 	mesh.prepared = make(map[int64]time.Time)
+	mesh.holePunchRetryScheduled = make(map[int64]bool)
+	mesh.candidateReciprocateAt = make(map[int64]time.Time)
 	mesh.srflxCandidates = make(map[string]peerCandidate)
 	mesh.natByRole = make(map[string]string)
 	mesh.natBehavior = &natBehaviorDiscovery{}
@@ -338,13 +458,17 @@ func (mesh *peerMeshClient) start(conn net.Conn, runtime RuntimeConfig, sender p
 	mesh.natBehaviorDiscovery = ""
 	mesh.lastEndpoint = ""
 	mesh.turnPermissions = make(map[string]time.Time)
+	mesh.turnChannelsByPeer = make(map[string]*turnChannelBinding)
+	mesh.turnChannelsByNumber = make(map[uint16]*turnChannelBinding)
+	mesh.nextTurnChannel = turnChannelMin
 	mesh.ignoredPacketLogAt = make(map[string]time.Time)
+	mesh.pathMTUCache = make(map[string]cachedPeerPathMTU)
 	mesh.localKey = localKey
 	if mesh.portMappingService == nil {
 		mesh.portMappingService = newNatPortMappingService(mesh.logger)
 	}
 	mesh.stopCh = make(chan struct{})
-	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	udp, err := listenPeerUDP()
 	if err != nil {
 		mesh.mu.Unlock()
 		mesh.logger.Printf("Peer Mesh UDP socket open failed: %v", err)
@@ -428,6 +552,9 @@ func (mesh *peerMeshClient) stopLocked() {
 	mesh.natBehaviorDiscovery = ""
 	mesh.lastEndpoint = ""
 	mesh.turnPermissions = nil
+	mesh.turnChannelsByPeer = nil
+	mesh.turnChannelsByNumber = nil
+	mesh.nextTurnChannel = turnChannelMin
 	mesh.ignoredPacketLogAt = nil
 	mesh.localKey = nil
 	mesh.runtimeConfigKey = ""
@@ -496,6 +623,9 @@ func (mesh *peerMeshClient) handleControl(conn net.Conn, payload string, base Ru
 		mesh.mergePeerFromSignal(message)
 		mesh.mergeSession(message)
 		mesh.sendConnectivityChecks(message)
+		// H-1 候选回礼：port-restricted 组合下打洞要求双方几乎同时互射，本端无健康 direct
+		// 路径时立刻回发自身候选，把双端 burst 窗口对齐到一个信令 RTT 内。
+		mesh.reciprocateCandidates(mesh.peerIDFromControl(message))
 	case peerControlTypeClose:
 		mesh.closeSession(message)
 	default:
@@ -553,6 +683,24 @@ func (mesh *peerMeshClient) handleUDP(payload []byte, remote *net.UDPAddr) {
 	if len(payload) == 0 {
 		return
 	}
+	if looksLikeTurnChannelData(payload) {
+		frame, err := parseTurnChannelData(payload)
+		if err != nil {
+			return
+		}
+		mesh.mu.Lock()
+		binding := mesh.turnChannelsByNumber[frame.Channel]
+		valid := binding != nil && binding.Active && binding.ExpiresAt.After(time.Now())
+		var peer *net.UDPAddr
+		if valid {
+			peer = cloneUDPAddr(binding.Peer)
+		}
+		mesh.mu.Unlock()
+		if valid && sameUDPEndpoint(mesh.relayEndpoint(), remote) {
+			mesh.handleRelayedPayload(frame.Payload, remote, peer)
+		}
+		return
+	}
 	if looksLikeStun(payload) {
 		message, err := parseStunMessage(payload)
 		if err == nil {
@@ -578,17 +726,23 @@ func (mesh *peerMeshClient) handleStunTurnMessage(message stunMessage, remote *n
 	case stunBindingError:
 		mesh.handleStunBindingError(message, remote)
 	case stunAllocateSuccess:
-		mesh.completeTurnRequest(message, remote)
+		_, _ = mesh.completeTurnRequest(message, remote)
 		mesh.handleTurnAllocated(message, remote)
 	case stunRefreshSuccess:
-		mesh.completeTurnRequest(message, remote)
+		_, _ = mesh.completeTurnRequest(message, remote)
 		mesh.mu.Lock()
 		mesh.relayTTL = time.Now().Add(time.Duration(maxInt64(30, message.lifetimeSeconds(300))) * time.Second)
 		mesh.mu.Unlock()
 	case stunCreatePermissionSuccess:
-		mesh.completeTurnRequest(message, remote)
+		_, _ = mesh.completeTurnRequest(message, remote)
 		return
-	case stunAllocateError, stunRefreshError, stunCreatePermissionError:
+	case stunChannelBindSuccess:
+		pending, ok := mesh.completeTurnRequest(message, remote)
+		if ok {
+			mesh.activateTurnChannel(pending)
+		}
+		return
+	case stunAllocateError, stunRefreshError, stunCreatePermissionError, stunChannelBindError:
 		mesh.handleTurnError(message, remote)
 	case stunDataIndication:
 		peer, okPeer := message.xorPeerAddress()
@@ -596,24 +750,44 @@ func (mesh *peerMeshClient) handleStunTurnMessage(message stunMessage, remote *n
 		if !okPeer || !okData {
 			return
 		}
-		relayFrom := endpointKeyUDP(peer)
-		if looksLikePeerDataFrame(inner) {
-			mesh.handlePeerDataFrame(inner, remote, relayFrom)
-			return
-		}
-		var probe peerUDPProbe
-		if err := json.Unmarshal(inner, &probe); err == nil && probe.Magic == peerProbeMagic {
-			mesh.handleProbe(probe, remote, relayFrom)
-		}
+		mesh.handleRelayedPayload(inner, remote, peer)
 	}
 }
 
-func (mesh *peerMeshClient) completeTurnRequest(message stunMessage, remote *net.UDPAddr) {
+func (mesh *peerMeshClient) handleRelayedPayload(inner []byte, remote, peer *net.UDPAddr) {
+	relayFrom := endpointKeyUDP(peer)
+	if looksLikePeerDataFrame(inner) {
+		mesh.handlePeerDataFrame(inner, remote, relayFrom)
+		return
+	}
+	var probe peerUDPProbe
+	if err := json.Unmarshal(inner, &probe); err == nil && probe.Magic == peerProbeMagic {
+		mesh.handleProbe(probe, remote, relayFrom)
+	}
+}
+
+func (mesh *peerMeshClient) completeTurnRequest(message stunMessage, remote *net.UDPAddr) (pendingTurnRequest, bool) {
 	tx := stunTransactionHex(message.TransactionID)
 	mesh.mu.Lock()
 	pending, ok := mesh.pendingTurn[tx]
 	if ok && sameUDPEndpoint(pending.Endpoint, remote) {
 		delete(mesh.pendingTurn, tx)
+		mesh.mu.Unlock()
+		return pending, true
+	}
+	mesh.mu.Unlock()
+	return pendingTurnRequest{}, false
+}
+
+func (mesh *peerMeshClient) activateTurnChannel(pending pendingTurnRequest) {
+	if pending.RequestType != stunChannelBindRequest || pending.Channel < turnChannelMin || pending.Peer == nil {
+		return
+	}
+	mesh.mu.Lock()
+	binding := mesh.turnChannelsByNumber[pending.Channel]
+	if binding != nil && sameUDPEndpoint(binding.Peer, pending.Peer) {
+		binding.Active = true
+		binding.ExpiresAt = time.Now().Add(9 * time.Minute)
 	}
 	mesh.mu.Unlock()
 }
@@ -630,6 +804,7 @@ func (mesh *peerMeshClient) handleTurnError(message stunMessage, remote *net.UDP
 		return
 	}
 	if errorCode != 401 && errorCode != 438 || pending.AuthenticationAttempt >= 1 || !mesh.applyTurnChallengeLocked(message) {
+		mesh.removeFailedTurnChannelLocked(pending)
 		mesh.mu.Unlock()
 		mesh.logger.Printf("Peer Mesh TURN request failed: type=0x%x code=%d authAttempt=%d",
 			pending.RequestType, errorCode, pending.AuthenticationAttempt)
@@ -637,10 +812,36 @@ func (mesh *peerMeshClient) handleTurnError(message stunMessage, remote *net.UDP
 	}
 	mesh.mu.Unlock()
 
-	retry := newStunMessage(pending.RequestType, newStunTransactionID(), cloneStunAttributes(pending.Attributes)...)
+	retryTx := newStunTransactionID()
+	retryAttributes := remapTransactionAttributes(pending.Attributes, pending.OriginalTransactionID, retryTx)
+	retry := newStunMessage(pending.RequestType, retryTx, retryAttributes...)
 	mesh.logger.Printf("Peer Mesh TURN auth challenge received, retrying once: type=0x%x code=%d",
 		pending.RequestType, errorCode)
 	mesh.sendStunRequestAttempt(retry, pending.Endpoint, pending.AuthenticationAttempt+1)
+}
+
+func (mesh *peerMeshClient) removeFailedTurnChannelLocked(pending pendingTurnRequest) {
+	if pending.RequestType != stunChannelBindRequest || pending.Channel < turnChannelMin {
+		return
+	}
+	binding := mesh.turnChannelsByNumber[pending.Channel]
+	if binding != nil {
+		delete(mesh.turnChannelsByPeer, endpointKeyUDP(binding.Peer))
+		delete(mesh.turnChannelsByNumber, pending.Channel)
+	}
+}
+
+func remapTransactionAttributes(attributes []stunAttribute, oldTx, newTx [stunTransactionIDBytes]byte) []stunAttribute {
+	result := cloneStunAttributes(attributes)
+	for index := range result {
+		if result[index].Type != stunAttrXorPeerAddress {
+			continue
+		}
+		if peer, ok := decodeStunXorAddress(result[index].Value, oldTx); ok {
+			result[index] = newStunAttrXorPeerAddress(peer, newTx)
+		}
+	}
+	return result
 }
 
 func (mesh *peerMeshClient) applyTurnChallengeLocked(message stunMessage) bool {
@@ -714,12 +915,16 @@ func (mesh *peerMeshClient) handleStunBindingSuccess(message stunMessage, observ
 	publicStun := strings.HasPrefix(role, publicStunRolePrefix)
 	endpoint := endpointKeyUDP(mapped)
 	candidate := peerCandidate{
-		Type:       "srflx",
-		Transport:  "udp",
-		Address:    mapped.IP.String(),
-		Port:       mapped.Port,
-		Priority:   800,
-		Foundation: "standard-stun",
+		Type:          "srflx",
+		Transport:     "udp",
+		Address:       mapped.IP.String(),
+		Port:          mapped.Port,
+		Priority:      800,
+		Foundation:    "standard-stun",
+		AddressFamily: peerAddressFamily(mapped.IP),
+	}
+	if candidate.AddressFamily == "IPv6" {
+		candidate.Priority = 900
 	}
 	if publicStun {
 		candidate.Foundation = "public-stun"
@@ -944,13 +1149,20 @@ func (mesh *peerMeshClient) handleTurnAllocated(message stunMessage, remote *net
 	mesh.relayID = relayID
 	mesh.relayTTL = time.Now().Add(time.Duration(maxInt64(30, message.lifetimeSeconds(300))) * time.Second)
 	mesh.relay = &peerCandidate{
-		Type:       "relay",
-		Transport:  "udp",
-		Address:    endpoint.IP.String(),
-		Port:       endpoint.Port,
-		Priority:   100,
-		Foundation: "standard-turn",
-		RelayID:    relayID,
+		Type:          "relay",
+		Transport:     "udp",
+		Address:       endpoint.IP.String(),
+		Port:          endpoint.Port,
+		Priority:      100,
+		Foundation:    "standard-turn",
+		RelayID:       relayID,
+		AddressFamily: peerAddressFamily(endpoint.IP),
+	}
+	if relayChanged {
+		clear(mesh.turnPermissions)
+		clear(mesh.turnChannelsByPeer)
+		clear(mesh.turnChannelsByNumber)
+		mesh.nextTurnChannel = turnChannelMin
 	}
 	mesh.mu.Unlock()
 	_ = remote
@@ -1015,27 +1227,34 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 	mesh.mu.Lock()
 	runtime := mesh.runtime
 	session := mesh.sessionsByID[sessionID]
-	if session == nil || len(session.AESKey) != 32 {
+	if session != nil {
+		_ = session.ensureTrafficCodecs(runtime.PeerMesh.ClientID)
+	}
+	if session == nil || session.InboundCodec == nil {
 		mesh.mu.Unlock()
 		return
 	}
-	aesKey := append([]byte(nil), session.AESKey...)
+	inboundCodec := session.InboundCodec
 	peerID := session.PeerID
 	device := mesh.device
 	mesh.mu.Unlock()
 	if runtime.PeerMesh.ClientID <= 0 || device == nil {
 		return
 	}
-	frame, err := decodePeerDataFrame(aesKey, payload)
+	frame, err := inboundCodec.decode(payload, sessionID)
 	if err != nil {
 		return
 	}
-	if frame.SessionID != sessionID || frame.FromClientID != peerID || frame.ToClientID != runtime.PeerMesh.ClientID {
+	if frame.SessionID != sessionID {
 		return
 	}
 	mesh.mu.Lock()
 	current := mesh.sessionsByID[sessionID]
-	if current == nil || current.PeerID != peerID || !current.Replay.accept(frame.Sequence) || time.Now().After(current.ExpiresAt) {
+	if current == nil || current.PeerID != peerID || time.Now().After(current.ExpiresAt) {
+		mesh.mu.Unlock()
+		return
+	}
+	if !current.acceptInboundFrame(frame) {
 		mesh.mu.Unlock()
 		return
 	}
@@ -1055,12 +1274,15 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 	}
 	mesh.mu.Unlock()
 	mesh.flushPendingPackets(current)
+	if mesh.handlePeerPathMTU(frame.Payload, current) {
+		return
+	}
 	if mesh.handlePeerAppMessage(frame, current, runtime) {
 		return
 	}
 	if _, noop := device.(*noopPeerVirtualDevice); !noop {
 		if err := device.WritePacket(frame.Payload); err != nil {
-			mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, frame.FromClientID, err)
+			mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, peerID, err)
 		}
 		return
 	}
@@ -1070,7 +1292,7 @@ func (mesh *peerMeshClient) handlePeerDataFrame(payload []byte, remote *net.UDPA
 		}
 	}
 	if err := device.WritePacket(frame.Payload); err != nil {
-		mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, frame.FromClientID, err)
+		mesh.logger.Printf("Peer Mesh write virtual packet failed: session=%d peer=%d err=%v", frame.SessionID, peerID, err)
 	}
 }
 
@@ -1080,7 +1302,7 @@ func (mesh *peerMeshClient) handlePeerAppMessage(frame *peerDataFrame, session *
 	}
 	message, ok := decodePeerAppMessage(frame.Payload)
 	if !ok {
-		mesh.logger.Printf("Peer Mesh app message decode failed: session=%d from=%d", frame.SessionID, frame.FromClientID)
+		mesh.logger.Printf("Peer Mesh app message decode failed: session=%d from=%d", frame.SessionID, session.PeerID)
 		return true
 	}
 	if strings.EqualFold(message.Type, peerAppMessageTypeAck) {
@@ -1089,12 +1311,15 @@ func (mesh *peerMeshClient) handlePeerAppMessage(frame *peerDataFrame, session *
 	if !strings.EqualFold(message.Type, peerAppMessageTypeMessage) {
 		return true
 	}
+	if message.FromClientID != 0 && message.FromClientID != session.PeerID {
+		return true
+	}
 	if message.ToClientID != 0 && message.ToClientID != runtime.PeerMesh.ClientID {
 		return true
 	}
 	fromName := strings.TrimSpace(message.FromClientName)
 	if fromName == "" {
-		fromName = fmt.Sprint(frame.FromClientID)
+		fromName = fmt.Sprint(session.PeerID)
 	}
 	mesh.logger.Printf("Peer message from %s: %s", fromName, message.Message)
 	mesh.mu.Lock()
@@ -1115,7 +1340,7 @@ func (mesh *peerMeshClient) handlePeerAppMessage(frame *peerDataFrame, session *
 		ID:              message.ID,
 		FromClientID:    runtime.PeerMesh.ClientID,
 		FromClientName:  runtime.PeerMesh.ClientName,
-		ToClientID:      frame.FromClientID,
+		ToClientID:      session.PeerID,
 		ToClientName:    firstNonEmpty(strings.TrimSpace(message.FromClientName), session.PeerName),
 		CreatedAtMillis: time.Now().UnixMilli(),
 	})
@@ -1409,10 +1634,22 @@ func (mesh *peerMeshClient) preparePathForPeer(peer *peerMeshPeer, session *peer
 }
 
 func (mesh *peerMeshClient) sendEncryptedPayload(session *peerMeshSession, payload []byte) error {
+	mesh.ensurePeerPathMTU(session)
+	if peerPacketDestinationIPv4(payload) != "" && session != nil && session.PathMTU != nil {
+		pathMTU := session.PathMTU.effectiveMTU(mesh.config.PeerMeshMTU)
+		payload = peerPacketClampTCPMSS(payload, pathMTU)
+		if len(payload) > pathMTU {
+			mesh.injectPeerPacketTooBig(payload, pathMTU)
+			return nil
+		}
+	}
 	mesh.mu.Lock()
 	current := mesh.sessions[session.PeerID]
 	udp := mesh.udp
-	if current == nil || len(current.AESKey) == 0 {
+	if current != nil {
+		_ = current.ensureTrafficCodecs(mesh.runtime.PeerMesh.ClientID)
+	}
+	if current == nil || current.OutboundCodec == nil {
 		mesh.mu.Unlock()
 		return fmt.Errorf("peer session is not ready")
 	}
@@ -1422,16 +1659,15 @@ func (mesh *peerMeshClient) sendEncryptedPayload(session *peerMeshSession, paylo
 	}
 	current.Sequence++
 	sequence := current.Sequence
-	aesKey := append([]byte(nil), current.AESKey...)
+	outboundCodec := current.OutboundCodec
 	sessionID := current.ID
 	peerID := current.PeerID
-	localClientID := mesh.runtime.PeerMesh.ClientID
 	remote := current.RemoteEndpoint
 	relayID := current.RelayTargetAllocationID
 	avoidDirect := mesh.shouldAvoidDirectPathLocked()
 	mesh.mu.Unlock()
 
-	frame, err := encodePeerDataFrame(aesKey, sessionID, localClientID, peerID, sequence, payload)
+	frame, err := outboundCodec.encode(sessionID, sequence, payload)
 	if err != nil {
 		return err
 	}
@@ -1457,6 +1693,163 @@ func (mesh *peerMeshClient) sendEncryptedPayload(session *peerMeshSession, paylo
 	}
 	mesh.mu.Unlock()
 	return nil
+}
+
+func (mesh *peerMeshClient) ensurePeerPathMTU(session *peerMeshSession) {
+	if session == nil || session.PathMTU == nil {
+		return
+	}
+	mesh.mu.Lock()
+	if mesh.sessions[session.PeerID] != session {
+		mesh.mu.Unlock()
+		return
+	}
+	pathKey := peerPathMTUKey(session)
+	now := time.Now()
+	var cached *cachedPeerPathMTU
+	if item, ok := mesh.pathMTUCache[pathKey]; ok {
+		if now.Before(item.ValidUntil) {
+			copy := item
+			cached = &copy
+		} else {
+			delete(mesh.pathMTUCache, pathKey)
+		}
+	}
+	configuredMTU := mesh.config.PeerMeshMTU
+	mesh.mu.Unlock()
+	if pathKey == "" {
+		return
+	}
+	mesh.applyPeerPathMTUTransition(session, session.PathMTU.activate(pathKey, configuredMTU, cached, now))
+}
+
+func (mesh *peerMeshClient) handlePeerPathMTU(payload []byte, session *peerMeshSession) bool {
+	if !looksLikePeerPathMTU(payload) {
+		return false
+	}
+	message, ok := decodePeerPathMTU(payload)
+	if !ok || session == nil || session.PathMTU == nil {
+		return true
+	}
+	if message.Probe {
+		_ = mesh.sendRawPeerPayload(session, encodePeerPathMTUAck(message.Nonce, message.InnerMTU))
+		return true
+	}
+	mesh.applyPeerPathMTUTransition(
+		session, session.PathMTU.acknowledge(message.Nonce, message.InnerMTU, time.Now()))
+	return true
+}
+
+func (mesh *peerMeshClient) applyPeerPathMTUTransition(session *peerMeshSession, transition peerPathMTUTransition) {
+	if session == nil || session.PathMTU == nil {
+		return
+	}
+	if transition.CompletedMTU > 0 {
+		pathKey := session.PathMTU.currentPathKey()
+		if pathKey != "" {
+			mesh.mu.Lock()
+			if mesh.pathMTUCache == nil {
+				mesh.pathMTUCache = make(map[string]cachedPeerPathMTU)
+			}
+			mesh.pathMTUCache[pathKey] = cachedPeerPathMTU{
+				InnerMTU: transition.CompletedMTU, ValidUntil: time.Now().Add(peerPathMTUCacheTTL)}
+			mesh.mu.Unlock()
+			mesh.logger.Printf("Peer Mesh path MTU discovered: session=%d peer=%d path=%s mtu=%d",
+				session.ID, session.PeerID, pathKey, transition.CompletedMTU)
+		}
+	}
+	if transition.Probe != nil {
+		mesh.sendPeerPathMTUProbe(session, transition.Probe)
+	}
+}
+
+func (mesh *peerMeshClient) sendPeerPathMTUProbe(session *peerMeshSession, probe *peerPathMTUProbe) {
+	if session == nil || probe == nil {
+		return
+	}
+	_ = mesh.sendRawPeerPayload(session, encodePeerPathMTUProbe(probe.Nonce, probe.InnerMTU))
+	sessionID := session.ID
+	nonce := probe.Nonce
+	time.AfterFunc(peerPathMTUProbeTimeout, func() {
+		mesh.mu.Lock()
+		current := mesh.sessionsByID[sessionID]
+		mesh.mu.Unlock()
+		if current == nil || current.PathMTU == nil || time.Now().After(current.ExpiresAt) {
+			return
+		}
+		mesh.applyPeerPathMTUTransition(current, current.PathMTU.timeout(nonce, time.Now()))
+	})
+}
+
+func (mesh *peerMeshClient) sendRawPeerPayload(session *peerMeshSession, payload []byte) error {
+	if session == nil || len(payload) == 0 {
+		return fmt.Errorf("empty peer payload")
+	}
+	mesh.mu.Lock()
+	current := mesh.sessions[session.PeerID]
+	udp := mesh.udp
+	if current != nil {
+		_ = current.ensureTrafficCodecs(mesh.runtime.PeerMesh.ClientID)
+	}
+	if current != session || udp == nil || current.OutboundCodec == nil || time.Now().After(current.ExpiresAt) {
+		mesh.mu.Unlock()
+		return fmt.Errorf("peer session is not ready")
+	}
+	current.Sequence++
+	sequence := current.Sequence
+	outboundCodec := current.OutboundCodec
+	sessionID := current.ID
+	peerID := current.PeerID
+	remote := current.RemoteEndpoint
+	relayID := current.RelayTargetAllocationID
+	mesh.mu.Unlock()
+
+	frame, err := outboundCodec.encode(sessionID, sequence, payload)
+	if err != nil {
+		return err
+	}
+	if relayID != "" {
+		return mesh.sendRelayPayload(relayID, frame)
+	}
+	if remote == nil || mesh.isMeshEndpoint(remote) {
+		return fmt.Errorf("missing direct peer endpoint")
+	}
+	if _, err = udp.WriteToUDP(frame, remote); err != nil {
+		return err
+	}
+	mesh.mu.Lock()
+	if current := mesh.sessions[peerID]; current != nil {
+		current.DirectBytes += int64(len(frame))
+		current.DirectBytesPending += int64(len(frame))
+	}
+	mesh.mu.Unlock()
+	return nil
+}
+
+func peerPathMTUKey(session *peerMeshSession) string {
+	if session == nil {
+		return ""
+	}
+	if session.RelayTargetAllocationID != "" {
+		return "relay|" + session.RelayTargetAllocationID
+	}
+	if session.RemoteEndpoint == nil {
+		return ""
+	}
+	return "direct|" + endpointKeyUDP(session.RemoteEndpoint)
+}
+
+func (mesh *peerMeshClient) injectPeerPacketTooBig(packet []byte, pathMTU int) {
+	response := peerPacketICMPFragmentationNeededFor(packet, pathMTU)
+	if len(response) == 0 {
+		return
+	}
+	mesh.mu.Lock()
+	device := mesh.device
+	mesh.mu.Unlock()
+	if device != nil {
+		_ = device.WritePacket(response)
+	}
 }
 
 func (mesh *peerMeshClient) completeProbe(probe peerUDPProbe, remote *net.UDPAddr, relayFrom string) {
@@ -1603,9 +1996,17 @@ func (mesh *peerMeshClient) applyPeerFromSignal(message peerControlMessage) bool
 		if peer.PublicKey == "" {
 			peer.PublicKey = existing.PublicKey
 		}
+		if peer.KeyEpoch == "" {
+			peer.KeyEpoch = existing.KeyEpoch
+		}
 	}
 	peer.Candidates = append([]peerCandidate(nil), message.Candidates...)
 	mesh.peers[peer.ClientID] = &peer
+	if session := mesh.sessions[peer.ClientID]; session != nil && peer.KeyEpoch != "" {
+		if session.applyRemoteKeyEpoch(peer.KeyEpoch) {
+			mesh.logger.Printf("Peer Mesh remote key epoch changed, inbound state reset: peer=%d", peer.ClientID)
+		}
+	}
 	return true
 }
 
@@ -1656,7 +2057,7 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 		expiresAt = parsed
 	}
 	sameSession := previous != nil && previous.ID == *message.SessionID
-	session := &peerMeshSession{Replay: peerReplayWindow{}}
+	session := &peerMeshSession{Replay: peerReplayWindow{}, PathMTU: &peerPathMTUDiscovery{}}
 	if previous != nil {
 		if sameSession {
 			session.Sequence = previous.Sequence
@@ -1678,6 +2079,10 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 		session.DirectBytes = previous.DirectBytes
 		session.DirectBytesPending = previous.DirectBytesPending
 	}
+	if message.DataFrameVersion != 2 {
+		mesh.logger.Printf("Peer Mesh session rejected: required dataFrameVersion=2 received=%d", message.DataFrameVersion)
+		return
+	}
 	session.ID = *message.SessionID
 	session.PeerID = peerID
 	session.PeerName = peerName
@@ -1685,6 +2090,15 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 	session.PeerPublicKey = peerPublicKey
 	session.Token = message.Token
 	session.ExpiresAt = expiresAt
+	session.LocalKeyEpoch = mesh.localKeyEpoch
+	if message.SourceKeyEpoch != "" && message.SourceClientID == peerID {
+		session.applyRemoteKeyEpoch(message.SourceKeyEpoch)
+	}
+	if session.RemoteKeyEpoch == "" {
+		if known := mesh.peers[peerID]; known != nil {
+			session.applyRemoteKeyEpoch(known.KeyEpoch)
+		}
+	}
 	if strings.TrimSpace(message.PathType) != "" {
 		session.PathType = message.PathType
 	}
@@ -1694,6 +2108,13 @@ func (mesh *peerMeshClient) mergeSession(message peerControlMessage) {
 			mesh.logger.Printf("Peer Mesh session key derive failed: session=%d peer=%d err=%v", session.ID, peerID, err)
 		} else {
 			session.AESKey = aesKey
+			err = session.ensureTrafficCodecs(mesh.runtime.PeerMesh.ClientID)
+			if err != nil {
+				session.AESKey = nil
+				session.OutboundCodec = nil
+				session.InboundCodec = nil
+				mesh.logger.Printf("Peer Mesh traffic codec initialization failed: session=%d peer=%d err=%v", session.ID, peerID, err)
+			}
 		}
 	}
 	if mesh.sessionsByID == nil {
@@ -1777,11 +2198,13 @@ func (mesh *peerMeshClient) announceCandidates() {
 			SourceClientName: runtime.PeerMesh.ClientName,
 			SourceVirtualIP:  runtime.PeerMesh.VirtualIP,
 			SourcePublicKey:  runtime.PeerMesh.ClientPublicKey,
+			SourceKeyEpoch:   mesh.localKeyEpoch,
 			TargetClientID:   target.peer.ClientID,
 			TargetClientName: target.peer.ClientName,
 			TargetVirtualIP:  target.peer.VirtualIP,
 			TargetPublicKey:  target.peer.PublicKey,
 			Candidates:       candidates,
+			DataFrameVersion: 2,
 			CreatedAtMillis:  time.Now().UnixMilli(),
 		}
 		if target.session != nil {
@@ -1808,8 +2231,12 @@ func (mesh *peerMeshClient) sendConnectivityChecks(message peerControlMessage) {
 	if session == nil {
 		return
 	}
+	// H-3：按 priority 降序排序后再探测，让 host/port-map（高优先级）先命中。
+	// H-6：同 NAT 的 reflexive 候选降到最低优先级而非剪除，避免把 hairpin NAT 下可用的
+	// srflx 路径永久丢弃；relay 兜底已保留。降权后再交给 priority 排序自然排到末尾。
+	candidates := mesh.sortedConnectivityCandidates(message.Candidates)
 	delay := time.Duration(0)
-	for _, candidate := range message.Candidates {
+	for _, candidate := range candidates {
 		if strings.ToLower(candidate.Transport) != "udp" || candidate.Address == "" || candidate.Port <= 0 {
 			continue
 		}
@@ -1818,7 +2245,7 @@ func (mesh *peerMeshClient) sendConnectivityChecks(message peerControlMessage) {
 		}
 		mesh.sendProbePaced(session, candidate, delay)
 		delay += peerConnectivityCheckPacing
-		for _, predictedPort := range mesh.adaptivePredictedPorts(candidate, message.Candidates) {
+		for _, predictedPort := range mesh.adaptivePredictedPorts(candidate, candidates) {
 			predicted := candidate
 			predicted.Port = predictedPort
 			predicted.Foundation = "adaptive-port-predict"
@@ -1826,6 +2253,7 @@ func (mesh *peerMeshClient) sendConnectivityChecks(message peerControlMessage) {
 			delay += peerConnectivityCheckPacing
 		}
 	}
+	mesh.scheduleHolePunchRetries(session)
 }
 
 func (mesh *peerMeshClient) probeKnownCandidates() {
@@ -1841,6 +2269,219 @@ func (mesh *peerMeshClient) probeKnownCandidates() {
 		message := peerControlMessage{SourceClientID: peer.ClientID, Candidates: peer.Candidates}
 		mesh.sendConnectivityChecks(message)
 	}
+}
+
+// scheduleHolePunchRetries 在 session 首次发起连通性检查后按 1s/2s/4s/8s 退避重试，
+// 而不是等 15s maintenance tick。已建立健康 direct 路径时自动停止。本轮结束后释放标记，
+// 路径后续失效时可以重新进入密集重试。对齐 Java scheduleHolePunchRetries。
+func (mesh *peerMeshClient) scheduleHolePunchRetries(session *peerMeshSession) {
+	if session == nil {
+		return
+	}
+	sessionID := session.ID
+	mesh.mu.Lock()
+	if mesh.holePunchRetryScheduled == nil {
+		mesh.mu.Unlock()
+		return
+	}
+	if _, scheduled := mesh.holePunchRetryScheduled[sessionID]; scheduled {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.holePunchRetryScheduled[sessionID] = true
+	stopCh := mesh.stopCh
+	mesh.mu.Unlock()
+	if stopCh == nil {
+		mesh.mu.Lock()
+		delete(mesh.holePunchRetryScheduled, sessionID)
+		mesh.mu.Unlock()
+		return
+	}
+	for _, delay := range peerHolePunchRetryDelays {
+		delay := delay
+		time.AfterFunc(delay, func() {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			mesh.retryHolePunch(sessionID)
+		})
+	}
+	// 本轮结束后释放标记，路径后续失效时可以重新进入密集重试。
+	lastDelay := peerHolePunchRetryDelays[len(peerHolePunchRetryDelays)-1]
+	time.AfterFunc(lastDelay+time.Second, func() {
+		mesh.mu.Lock()
+		delete(mesh.holePunchRetryScheduled, sessionID)
+		mesh.mu.Unlock()
+	})
+}
+
+// retryHolePunch 是 H-2 退避重试的实际执行体：重新查找 session，过期或已打通则停止。
+func (mesh *peerMeshClient) retryHolePunch(sessionID int64) {
+	now := time.Now()
+	mesh.mu.Lock()
+	session := mesh.sessionsByID[sessionID]
+	if session == nil || now.After(session.ExpiresAt) {
+		delete(mesh.holePunchRetryScheduled, sessionID)
+		mesh.mu.Unlock()
+		return
+	}
+	if session.hasHealthyDirect(now) {
+		delete(mesh.holePunchRetryScheduled, sessionID)
+		mesh.mu.Unlock()
+		return
+	}
+	peerID := session.PeerID
+	peer := mesh.peers[peerID]
+	if peer == nil || !peer.Online || len(peer.Candidates) == 0 {
+		mesh.mu.Unlock()
+		return
+	}
+	candidates := make([]peerCandidate, len(peer.Candidates))
+	copy(candidates, peer.Candidates)
+	mesh.mu.Unlock()
+	message := peerControlMessage{SourceClientID: peerID, Candidates: candidates}
+	mesh.sendConnectivityChecks(message)
+}
+
+// reciprocateCandidates 是 H-1 候选回礼：收到对端候选后，若本端尚无健康 direct 路径，
+// 立即回发自身候选，把双端打洞窗口从最坏 15s maintenance tick 压到一个信令 RTT 内对齐。
+// 带 2s 节流防两端互触发形成信令循环。对齐 Java reciprocateCandidates。
+func (mesh *peerMeshClient) reciprocateCandidates(peerID int64) {
+	if peerID <= 0 {
+		return
+	}
+	now := time.Now()
+	mesh.mu.Lock()
+	session := mesh.sessions[peerID]
+	if session != nil && session.hasHealthyDirect(now) {
+		mesh.mu.Unlock()
+		return
+	}
+	if previous, ok := mesh.candidateReciprocateAt[peerID]; ok && now.Sub(previous) < peerCandidateReciprocateInterval {
+		mesh.mu.Unlock()
+		return
+	}
+	mesh.candidateReciprocateAt[peerID] = now
+	mesh.mu.Unlock()
+	mesh.announceCandidatesToPeer(peerID)
+}
+
+// announceCandidatesToPeer 向单个 peer 回发本端候选，是 announceCandidates 的单 peer 版本，
+// 供 H-1 候选回礼复用，避免向所有在线 peer 广播。
+func (mesh *peerMeshClient) announceCandidatesToPeer(peerID int64) {
+	candidates := mesh.gatherCandidates()
+	if len(candidates) == 0 {
+		return
+	}
+	mesh.mu.Lock()
+	conn := mesh.conn
+	sender := mesh.sender
+	runtime := mesh.runtime
+	if sender == nil {
+		mesh.mu.Unlock()
+		return
+	}
+	peer := mesh.peers[peerID]
+	if peer == nil || !peer.Online || strings.TrimSpace(peer.ClientName) == "" {
+		mesh.mu.Unlock()
+		return
+	}
+	targetPeer := *peer
+	session := mesh.reusableSessionLocked(peerID, time.Now())
+	mesh.mu.Unlock()
+	message := peerControlMessage{
+		Type:             peerControlTypeCandidates,
+		SourceClientID:   runtime.PeerMesh.ClientID,
+		SourceClientName: runtime.PeerMesh.ClientName,
+		SourceVirtualIP:  runtime.PeerMesh.VirtualIP,
+		SourcePublicKey:  runtime.PeerMesh.ClientPublicKey,
+		SourceKeyEpoch:   mesh.localKeyEpoch,
+		TargetClientID:   targetPeer.ClientID,
+		TargetClientName: targetPeer.ClientName,
+		TargetVirtualIP:  targetPeer.VirtualIP,
+		TargetPublicKey:  targetPeer.PublicKey,
+		Candidates:       candidates,
+		DataFrameVersion: 2,
+		CreatedAtMillis:  time.Now().UnixMilli(),
+	}
+	if session != nil {
+		sessionID := session.ID
+		message.SessionID = &sessionID
+		message.Token = session.Token
+		message.ExpiresAt = session.ExpiresAt.Format(time.RFC3339Nano)
+	}
+	if err := sender(conn, targetPeer.ClientName, message); err != nil {
+		mesh.logger.Printf("Peer Mesh reciprocated candidates send failed: peer=%s err=%v", targetPeer.ClientName, err)
+	}
+}
+
+// sortedConnectivityCandidates 先做 H-6 同 NAT reflexive 降权（priority=1），再做 H-3
+// priority 降序排序。降权在前保证被降权的候选自然排到末尾，与 Java
+// demoteSameNatReflexiveCandidates -> sortedCandidates 的顺序一致。
+func (mesh *peerMeshClient) sortedConnectivityCandidates(candidates []peerCandidate) []peerCandidate {
+	demoted := mesh.demoteSameNatReflexiveCandidates(candidates)
+	sorted := make([]peerCandidate, len(demoted))
+	copy(sorted, demoted)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Priority > sorted[j].Priority
+	})
+	return sorted
+}
+
+// demoteSameNatReflexiveCandidates 是 H-6：把与本地 STUN 观测公网地址相同的对端 reflexive
+// 候选（srflx 或 port-map）降到 priority=1，而不是从候选集中删除。同 NAT 下 host 未必可达
+// （AP 隔离、同 NAT 不同子网），而支持 hairpin 的 NAT 上 srflx 反而能通；直接剪除会把这条
+// 可用路径永久丢弃。对齐 Java demoteSameNatReflexiveCandidates。
+func (mesh *peerMeshClient) demoteSameNatReflexiveCandidates(candidates []peerCandidate) []peerCandidate {
+	if len(candidates) == 0 {
+		return candidates
+	}
+	mesh.mu.Lock()
+	localAddresses := make(map[string]struct{})
+	if mesh.srflx != nil && mesh.srflx.Address != "" {
+		localAddresses[mesh.srflx.Address] = struct{}{}
+	}
+	for _, candidate := range mesh.srflxCandidates {
+		if candidate.Address != "" {
+			localAddresses[candidate.Address] = struct{}{}
+		}
+	}
+	mesh.mu.Unlock()
+	if len(localAddresses) == 0 {
+		return candidates
+	}
+	demoted := make([]peerCandidate, len(candidates))
+	for index, candidate := range candidates {
+		if isReflexiveCandidate(candidate) {
+			if _, same := localAddresses[candidate.Address]; same {
+				candidate.Priority = 1
+			}
+		}
+		demoted[index] = candidate
+	}
+	return demoted
+}
+
+// isReflexiveCandidate 判断候选是否为反射型（srflx 或端口映射），同 NAT 检测只针对这类候选。
+func isReflexiveCandidate(candidate peerCandidate) bool {
+	if strings.EqualFold(candidate.Type, "srflx") {
+		return true
+	}
+	return strings.HasPrefix(candidate.Foundation, "port-map-")
+}
+
+// peerIDFromControl 从控制消息中解析对端 clientId：本端是 source 时取 target，否则取 source。
+func (mesh *peerMeshClient) peerIDFromControl(message peerControlMessage) int64 {
+	mesh.mu.Lock()
+	runtimeID := mesh.runtime.PeerMesh.ClientID
+	mesh.mu.Unlock()
+	peerID := message.SourceClientID
+	if peerID == runtimeID {
+		peerID = message.TargetClientID
+	}
+	return peerID
 }
 
 func (mesh *peerMeshClient) keepaliveDirectPaths() {
@@ -2150,16 +2791,22 @@ func (mesh *peerMeshClient) gatherCandidates() []peerCandidate {
 				addrs, _ := iface.Addrs()
 				for _, addr := range addrs {
 					ip := ipFromAddr(addr)
-					if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || inCIDR(ip, runtime.PeerMesh.CIDR) {
+					if !usablePeerHostIP(ip, runtime.PeerMesh.CIDR) {
 						continue
 					}
+					family := peerAddressFamily(ip)
+					priority := int64(1000)
+					if family == "IPv6" {
+						priority = 1200
+					}
 					candidates = append(candidates, peerCandidate{
-						Type:       "host",
-						Transport:  "udp",
-						Address:    ip.String(),
-						Port:       port,
-						Priority:   1000,
-						Foundation: iface.Name,
+						Type:          "host",
+						Transport:     "udp",
+						Address:       ip.String(),
+						Port:          port,
+						Priority:      priority,
+						Foundation:    iface.Name,
+						AddressFamily: family,
 					})
 				}
 			}
@@ -2228,12 +2875,13 @@ func (mesh *peerMeshClient) attemptPortMapping(service *natPortMappingService, i
 		return
 	}
 	candidate := peerCandidate{
-		Type:       "srflx",
-		Transport:  "udp",
-		Address:    mapping.ExternalAddress,
-		Port:       mapping.ExternalPort,
-		Priority:   900,
-		Foundation: "port-map-" + strings.ToLower(string(mapping.Protocol)),
+		Type:          "srflx",
+		Transport:     "udp",
+		Address:       mapping.ExternalAddress,
+		Port:          mapping.ExternalPort,
+		Priority:      900,
+		Foundation:    "port-map-" + strings.ToLower(string(mapping.Protocol)),
+		AddressFamily: peerAddressFamily(net.ParseIP(mapping.ExternalAddress)),
 	}
 	mesh.mu.Lock()
 	if mesh.udp == nil {
@@ -2529,7 +3177,21 @@ func (mesh *peerMeshClient) sendStunRequestAttempt(message stunMessage, endpoint
 		}
 		mesh.pendingTurn[tx] = pendingTurnRequest{
 			RequestType: message.Type, Attributes: cloneStunAttributes(baseAttributes),
-			Endpoint: cloneUDPAddr(endpoint), AuthenticationAttempt: authenticationAttempt, SentAt: time.Now(),
+			OriginalTransactionID: message.TransactionID,
+			Endpoint:              cloneUDPAddr(endpoint), AuthenticationAttempt: authenticationAttempt, SentAt: time.Now(),
+		}
+		if channel, ok := message.channelNumber(); ok {
+			mesh.pendingTurn[tx] = pendingTurnRequest{
+				RequestType: message.Type, Attributes: cloneStunAttributes(baseAttributes),
+				OriginalTransactionID: message.TransactionID,
+				Endpoint:              cloneUDPAddr(endpoint), Channel: channel,
+				AuthenticationAttempt: authenticationAttempt, SentAt: time.Now(),
+			}
+			if peer, ok := message.xorPeerAddress(); ok {
+				pending := mesh.pendingTurn[tx]
+				pending.Peer = cloneUDPAddr(peer)
+				mesh.pendingTurn[tx] = pending
+			}
 		}
 	}
 	mesh.mu.Unlock()
@@ -2589,7 +3251,7 @@ func turnCredentialsIntegrityKey(credentials turnAuthCredentials) []byte {
 
 func turnRequestRequiresAuthentication(messageType uint16) bool {
 	return messageType == stunAllocateRequest || messageType == stunRefreshRequest ||
-		messageType == stunCreatePermissionRequest
+		messageType == stunCreatePermissionRequest || messageType == stunChannelBindRequest
 }
 
 func withoutTurnAuthenticationAttributes(attributes []stunAttribute) []stunAttribute {
@@ -2640,11 +3302,87 @@ func (mesh *peerMeshClient) sendRelayPayload(targetRelayEndpoint string, payload
 		return fmt.Errorf("missing relay allocation")
 	}
 	mesh.ensureTurnPermission(peer)
+	if binding := mesh.ensureTurnChannel(peer); binding != nil && binding.Active {
+		body, encodeErr := encodeTurnChannelData(binding.Channel, payload)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		mesh.mu.Lock()
+		udp := mesh.udp
+		mesh.mu.Unlock()
+		if udp == nil {
+			return fmt.Errorf("peer UDP socket is not available")
+		}
+		_, err = udp.WriteToUDP(body, endpoint)
+		return err
+	}
 	tx := newStunTransactionID()
 	mesh.sendStunRequest(newStunMessage(stunSendIndication, tx,
 		newStunAttrXorPeerAddress(peer, tx),
 		stunAttrDataValue(payload)), endpoint)
 	return nil
+}
+
+func (mesh *peerMeshClient) ensureTurnChannel(peer *net.UDPAddr) *turnChannelBinding {
+	if peer == nil {
+		return nil
+	}
+	endpoint := mesh.relayEndpoint()
+	if endpoint == nil {
+		return nil
+	}
+	now := time.Now()
+	peerKey := endpointKeyUDP(peer)
+	mesh.mu.Lock()
+	if mesh.turnChannelsByPeer == nil {
+		mesh.turnChannelsByPeer = make(map[string]*turnChannelBinding)
+		mesh.turnChannelsByNumber = make(map[uint16]*turnChannelBinding)
+		mesh.nextTurnChannel = turnChannelMin
+	}
+	if existing := mesh.turnChannelsByPeer[peerKey]; existing != nil && existing.ExpiresAt.After(now.Add(30*time.Second)) {
+		copy := *existing
+		mesh.mu.Unlock()
+		return &copy
+	}
+	channel := mesh.allocateTurnChannelLocked(now)
+	if channel == 0 {
+		mesh.mu.Unlock()
+		return nil
+	}
+	binding := &turnChannelBinding{Channel: channel, Peer: cloneUDPAddr(peer), ExpiresAt: now.Add(30 * time.Second)}
+	mesh.turnChannelsByPeer[peerKey] = binding
+	mesh.turnChannelsByNumber[channel] = binding
+	mesh.mu.Unlock()
+	tx := newStunTransactionID()
+	mesh.sendStunRequest(newStunMessage(stunChannelBindRequest, tx,
+		stunAttrChannelNumberValue(channel), newStunAttrXorPeerAddress(peer, tx)), endpoint)
+	copy := *binding
+	return &copy
+}
+
+func (mesh *peerMeshClient) allocateTurnChannelLocked(now time.Time) uint16 {
+	start := mesh.nextTurnChannel
+	if start < turnChannelMin || start > turnChannelMax {
+		start = turnChannelMin
+	}
+	channel := start
+	for {
+		binding := mesh.turnChannelsByNumber[channel]
+		if binding == nil || binding.ExpiresAt.Before(now) {
+			mesh.nextTurnChannel = channel + 1
+			if mesh.nextTurnChannel > turnChannelMax {
+				mesh.nextTurnChannel = turnChannelMin
+			}
+			return channel
+		}
+		channel++
+		if channel > turnChannelMax {
+			channel = turnChannelMin
+		}
+		if channel == start {
+			return 0
+		}
+	}
 }
 
 func (mesh *peerMeshClient) ensureTurnPermission(peer *net.UDPAddr) {
@@ -2833,6 +3571,7 @@ func (mesh *peerMeshClient) reportTrafficDeltas() {
 			SourceClientName: runtime.PeerMesh.ClientName,
 			SourceVirtualIP:  runtime.PeerMesh.VirtualIP,
 			SourcePublicKey:  runtime.PeerMesh.ClientPublicKey,
+			SourceKeyEpoch:   mesh.localKeyEpoch,
 			TargetClientID:   delta.PeerID,
 			TargetClientName: delta.PeerName,
 			TargetVirtualIP:  delta.VirtualIP,
@@ -2862,7 +3601,16 @@ func (mesh *peerMeshClient) cleanupProbes() {
 	}
 	for tx, pending := range mesh.pendingTurn {
 		if now.Sub(pending.SentAt) > peerPendingTurnRequestTTL {
+			mesh.removeFailedTurnChannelLocked(pending)
 			delete(mesh.pendingTurn, tx)
+		}
+	}
+	for channel, binding := range mesh.turnChannelsByNumber {
+		if binding == nil || !binding.ExpiresAt.After(now) {
+			if binding != nil {
+				delete(mesh.turnChannelsByPeer, endpointKeyUDP(binding.Peer))
+			}
+			delete(mesh.turnChannelsByNumber, channel)
 		}
 	}
 	for peerID, session := range mesh.sessions {
@@ -3117,6 +3865,51 @@ func ipFromAddr(addr net.Addr) net.IP {
 	default:
 		return nil
 	}
+}
+
+func listenPeerUDP() (*net.UDPConn, error) {
+	// The generic network lets Go select a dual-stack wildcard socket where the
+	// platform supports IPv4-mapped IPv6, and falls back to IPv4 otherwise.
+	return net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+}
+
+func peerAddressFamily(ip net.IP) string {
+	if ip != nil && ip.To4() == nil {
+		return "IPv6"
+	}
+	return "IPv4"
+}
+
+func usablePeerHostIP(ip net.IP, meshCIDR string) bool {
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || inCIDR(ip, meshCIDR) {
+		return false
+	}
+	if ip.To4() != nil {
+		return true
+	}
+	if len(ip) != net.IPv6len {
+		ip = ip.To16()
+	}
+	if ip == nil {
+		return false
+	}
+	// ULA and IPv4-mapped/compatible addresses are not globally reachable host candidates.
+	return ip[0]&0xfe != 0xfc && !isIPv4EmbeddedIPv6(ip)
+}
+
+func isIPv4EmbeddedIPv6(ip net.IP) bool {
+	value := ip.To16()
+	if value == nil {
+		return false
+	}
+	allZero := true
+	for _, current := range value[:10] {
+		if current != 0 {
+			allZero = false
+			break
+		}
+	}
+	return allZero && ((value[10] == 0 && value[11] == 0) || (value[10] == 0xff && value[11] == 0xff))
 }
 
 func inCIDR(ip net.IP, cidr string) bool {

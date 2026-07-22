@@ -3,30 +3,31 @@ package peermesh
 import "encoding/binary"
 
 const (
-	peerDataMagic       = 0x53504d31
-	peerDataVersion     = 1
-	peerDataTypeData    = 1
-	peerDataHeaderBytes = 50
+	peerDataMagic       = 0x53504d32 // SPM2
+	peerDataHeaderBytes = 20
+	peerDataTagBytes    = 16
+	peerDataMaxBytes    = 65535
 )
 
 type DataFrameHeader struct {
-	SessionID    int64
-	FromClientID int64
-	ToClientID   int64
-	Sequence     int64
+	SessionID int64
+	Sequence  int64
+}
+
+func LooksLikeDataFrame(frame []byte) bool {
+	return len(frame) >= 4 && binary.BigEndian.Uint32(frame[:4]) == peerDataMagic
 }
 
 func ParseDataFrameHeader(frame []byte) (DataFrameHeader, bool) {
-	if len(frame) < peerDataHeaderBytes || binary.BigEndian.Uint32(frame[:4]) != peerDataMagic {
+	if len(frame) < peerDataHeaderBytes+peerDataTagBytes || len(frame) > peerDataMaxBytes || !LooksLikeDataFrame(frame) {
 		return DataFrameHeader{}, false
 	}
-	if frame[4] != peerDataVersion || frame[5] != peerDataTypeData {
+	sequence := int64(binary.BigEndian.Uint64(frame[12:20]))
+	if sequence <= 0 {
 		return DataFrameHeader{}, false
 	}
 	return DataFrameHeader{
-		SessionID:    int64(binary.BigEndian.Uint64(frame[6:14])),
-		FromClientID: int64(binary.BigEndian.Uint64(frame[14:22])),
-		ToClientID:   int64(binary.BigEndian.Uint64(frame[22:30])),
-		Sequence:     int64(binary.BigEndian.Uint64(frame[30:38])),
+		SessionID: int64(binary.BigEndian.Uint64(frame[4:12])),
+		Sequence:  sequence,
 	}, true
 }

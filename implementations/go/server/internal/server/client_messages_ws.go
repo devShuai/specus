@@ -14,6 +14,7 @@ import (
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
@@ -33,35 +34,37 @@ type clientMessageSocket struct {
 type clientMessagesHub struct {
 	db       *store.DB
 	sessions *session.Registry
-	validate func(string) (wsevents.Access, bool)
+	tickets  *security.WebSocketTicketService
 	logger   *slog.Logger
 	mu       sync.Mutex
 	sockets  map[string]map[*clientMessageSocket]struct{}
 }
 
-func newClientMessagesHub(db *store.DB, sessions *session.Registry, validate func(string) (wsevents.Access, bool), logger *slog.Logger) *clientMessagesHub {
+func newClientMessagesHub(db *store.DB, sessions *session.Registry, tickets *security.WebSocketTicketService, logger *slog.Logger) *clientMessagesHub {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &clientMessagesHub{
-		db: db, sessions: sessions, validate: validate, logger: logger,
+		db: db, sessions: sessions, tickets: tickets, logger: logger,
 		sockets: make(map[string]map[*clientMessageSocket]struct{}),
 	}
 }
 
 func (h *clientMessagesHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	token, present := clientMessagesToken(r)
+	ticket, present := security.ExtractWebSocketTicket(r)
 	if !present {
-		w.Header().Set("X-Auth-Reason", "missing token")
+		w.Header().Set("X-Auth-Reason", "missing ticket")
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	access, ok := h.validate(token)
-	if !ok {
-		w.Header().Set("X-Auth-Reason", "invalid token")
+	claims, err := h.tickets.Consume(r.Context(), ticket, security.WebSocketScopeClientMessages,
+		security.WebSocketRequestAddress(r))
+	if err != nil || claims == nil || claims.Username == "" || claims.TenantID == "" {
+		w.Header().Set("X-Auth-Reason", "invalid ticket")
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
+	access := wsevents.Access{Username: claims.Username, TenantID: claims.TenantID, Admin: claims.Admin}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
@@ -101,20 +104,6 @@ func (h *clientMessagesHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleCommand(r.Context(), socket, payload)
 	}
-}
-
-func clientMessagesToken(r *http.Request) (string, bool) {
-	if token := strings.TrimSpace(r.URL.Query().Get("token")); token != "" {
-		return token, true
-	}
-	for _, value := range r.Header.Values("Authorization") {
-		if strings.HasPrefix(value, "Bearer ") {
-			if token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer ")); token != "" {
-				return token, true
-			}
-		}
-	}
-	return "", false
 }
 
 func (h *clientMessagesHub) handleCommand(ctx context.Context, socket *clientMessageSocket, payload []byte) {
@@ -162,15 +151,19 @@ func (h *clientMessagesHub) handleCommand(ctx context.Context, socket *clientMes
 		MessageType:  protocol.MessageTypeClientToClient,
 		Message:      body,
 	}
-	_ = socket.write(map[string]any{
-		"type": "sent", "messageId": command.MessageID,
-		"toClientName": target.ClientName, "message": body,
-	})
 	go func() {
 		if err := bound.Send(response); err != nil {
 			h.logger.Warn("admin client-message delivery failed",
 				"target", target.ClientName, "err", err)
+			_ = socket.write(map[string]any{
+				"type": "failed", "messageId": command.MessageID, "error": "target-write-failed",
+			})
+			return
 		}
+		_ = socket.write(map[string]any{
+			"type": "written", "messageId": command.MessageID,
+			"toClientName": target.ClientName, "message": body,
+		})
 	}()
 }
 

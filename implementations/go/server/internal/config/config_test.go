@@ -206,6 +206,12 @@ func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
 	t.Setenv("TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES", "34567")
 	t.Setenv("TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", "7")
 	t.Setenv("TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", "9")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED", "true")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_REDIS_URI", "redis://redis.internal:6379/4")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", "test:transfer")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "45")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "12000")
+	t.Setenv("TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", "1500")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -220,7 +226,10 @@ func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
 		cfg.ObjectStorage.DownloadObjectURLTTLSeconds != 45 || cfg.ObjectStorage.MaxAttachmentBytes != 12345 ||
 		cfg.ObjectStorage.PerUserStorageQuotaBytes != 23456 ||
 		cfg.ObjectStorage.PerUserMonthlyDownloadQuotaBytes != 34567 ||
-		cfg.PublicTransfer.MaxPendingUploadsPerRoom != 7 || cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 9 {
+		cfg.PublicTransfer.MaxPendingUploadsPerRoom != 7 || cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 9 ||
+		!cfg.PublicTransfer.ClusterEnabled || cfg.PublicTransfer.RedisURI != "redis://redis.internal:6379/4" ||
+		cfg.PublicTransfer.RedisKeyPrefix != "test:transfer" || cfg.PublicTransfer.PresenceLeaseSeconds != 45 ||
+		cfg.PublicTransfer.PresenceRefreshIntervalMs != 12000 || cfg.PublicTransfer.RedisCommandTimeoutMs != 1500 {
 		t.Fatalf("transfer env mapping mismatch: object=%+v public=%+v", cfg.ObjectStorage, cfg.PublicTransfer)
 	}
 }
@@ -235,7 +244,11 @@ func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
 		cfg.ObjectStorage.MaxAttachmentBytes != 512*1024*1024 ||
 		cfg.ObjectStorage.PerUserStorageQuotaBytes != 1024*1024*1024 ||
 		cfg.ObjectStorage.PerUserMonthlyDownloadQuotaBytes != 1024*1024*1024 ||
-		cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 32 {
+		cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 32 || cfg.PublicTransfer.ClusterEnabled ||
+		cfg.PublicTransfer.RedisKeyPrefix != "shuai-tunnel:v2:public-transfer" ||
+		cfg.PublicTransfer.PresenceLeaseSeconds != 30 ||
+		cfg.PublicTransfer.PresenceRefreshIntervalMs != 10000 ||
+		cfg.PublicTransfer.RedisCommandTimeoutMs != 2000 {
 		t.Fatalf("transfer defaults mismatch: object=%+v public=%+v", cfg.ObjectStorage, cfg.PublicTransfer)
 	}
 }

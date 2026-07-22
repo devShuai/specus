@@ -1,11 +1,13 @@
 package directhttp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,211 +16,207 @@ import (
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
 )
 
-func TestServeHTTPRecordsOversizedRequestDetailLikeJava(t *testing.T) {
+func TestServeHTTPRejectsKnownOversizedRequestBeforeOpeningStream(t *testing.T) {
 	recorder := &capturingDetailRecorder{}
-	service := NewService(nil, time.Second, 4, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
-
-	request := httptest.NewRequest(http.MethodPost, "/http/Demo%20client/api/upload?debug=true",
-		strings.NewReader("12345"))
-	request.SetPathValue("clientName", "Demo client")
-	request.SetPathValue("route", "api")
-	request.SetPathValue("rest", "upload")
-	request.Header.Set("Content-Type", "text/plain")
+	opened := false
+	service := NewService(nil, func(string, map[string]any) (Stream, error) {
+		opened = true
+		return nil, nil
+	}, time.Second, 4, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	request := tunnelRequest(http.MethodPost, "/http/Demo%20client/api/upload?debug=true", "12345")
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, request)
 
-	if response.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413", response.Code)
+	if response.Code != http.StatusRequestEntityTooLarge || opened {
+		t.Fatalf("status/opened = %d/%t, want 413/false", response.Code, opened)
 	}
-	if recorder.record.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("record status = %d, want 413", recorder.record.StatusCode)
-	}
-	if recorder.record.ClientName != "Demo client" ||
-		recorder.record.Route != "api" ||
-		recorder.record.Method != http.MethodPost ||
-		recorder.record.RelativePath != "/upload" ||
-		recorder.record.RawQuery != "debug=true" {
-		t.Fatalf("unexpected record metadata: %+v", recorder.record)
-	}
-	if recorder.record.Error != "HTTP 请求体超过限制" ||
-		string(recorder.record.ResponseBody) != "HTTP 请求体超过限制" {
-		t.Fatalf("unexpected error record: %+v", recorder.record)
-	}
-	if len(recorder.record.RequestBody) != 5 {
-		t.Fatalf("recorded request body length = %d, want max+1 bytes", len(recorder.record.RequestBody))
+	if recorder.record.Error != errRequestTooLarge.Error() || string(recorder.record.RequestBody) != "12345" {
+		t.Fatalf("unexpected detail: %+v", recorder.record)
 	}
 }
 
-func TestServeHTTPRecordsOfflineErrorDetailLikeJava(t *testing.T) {
+func TestServeHTTPRecordsOfflineError(t *testing.T) {
 	recorder := &capturingDetailRecorder{}
-	service := NewService(session.NewRegistry(), time.Second, 1024, 1024, nil, nil, recorder,
-		store.TrafficDetailOptions{Enabled: true})
-
-	request := httptest.NewRequest(http.MethodGet, "/http/Demo%20client/api/ping", nil)
-	request.SetPathValue("clientName", "Demo client")
-	request.SetPathValue("route", "api")
-	request.SetPathValue("rest", "ping")
+	service := NewService(session.NewRegistry(), nil, time.Second, 1024, 1024,
+		nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	request := tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", "")
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, request)
 
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", response.Code)
-	}
-	if recorder.record.StatusCode != http.StatusServiceUnavailable ||
-		recorder.record.Error != "客户端不在线: Demo client" ||
-		string(recorder.record.ResponseBody) != "客户端不在线: Demo client" {
-		t.Fatalf("unexpected offline record: %+v", recorder.record)
-	}
-	if got := strings.Join(recorder.record.ResponseHeaders, "\n"); !strings.Contains(got, "Content-Type:text/plain;charset=UTF-8") {
-		t.Fatalf("error headers = %q, want plain text content type", got)
+	if response.Code != http.StatusServiceUnavailable || recorder.record.Error != "客户端不在线: Demo client" {
+		t.Fatalf("unexpected offline response/detail: %d %+v", response.Code, recorder.record)
 	}
 }
 
-func TestServeHTTPRecordsClientErrorResponseDetailLikeJava(t *testing.T) {
-	recorder := &capturingDetailRecorder{}
-	registry := session.NewRegistry()
-	service := NewService(registry, time.Second, 1024, 1024, nil, nil, recorder,
-		store.TrafficDetailOptions{Enabled: true})
-	registry.Replace(&fakeDirectHTTPSession{clientName: "Demo client", send: func(packet protocol.Packet) error {
-		request := packet.(protocol.DirectHTTPRequest)
-		service.Ack(protocol.DirectHTTPResponse{
-			RequestID:  request.RequestID,
-			StatusCode: http.StatusBadGateway,
-			Headers:    []string{"X-Upstream:ignored"},
-			Body:       []byte("ignored upstream body"),
-			Error:      stringPtr("upstream failed"),
-		})
-		return nil
-	}})
-
-	request := httptest.NewRequest(http.MethodGet, "/http/Demo%20client/api/ping", nil)
-	request.SetPathValue("clientName", "Demo client")
-	request.SetPathValue("route", "api")
-	request.SetPathValue("rest", "ping")
-	response := httptest.NewRecorder()
-
-	service.ServeHTTP(response, request)
-
-	if response.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", response.Code)
-	}
-	if recorder.record.StatusCode != http.StatusBadGateway ||
-		recorder.record.Error != "upstream failed" ||
-		string(recorder.record.ResponseBody) != "upstream failed" {
-		t.Fatalf("unexpected client error record: %+v", recorder.record)
-	}
-	if got := strings.Join(recorder.record.ResponseHeaders, "\n"); got != "Content-Type:text/plain;charset=UTF-8" {
-		t.Fatalf("recorded response headers = %q, want Java plain error headers", got)
-	}
-}
-
-func TestServeHTTPRecordsWriteFailureDetailLikeJava(t *testing.T) {
+func TestServeHTTPStreamsRequestAndResponseWithCredit(t *testing.T) {
 	recorder := &capturingDetailRecorder{}
 	traffic := &capturingTrafficRecorder{}
-	registry := session.NewRegistry()
-	service := NewService(registry, time.Second, 1024, 1024, traffic, nil, recorder,
-		store.TrafficDetailOptions{Enabled: true})
-	registry.Replace(&fakeDirectHTTPSession{clientName: "Demo client", send: func(protocol.Packet) error {
-		return errors.New("socket closed")
-	}})
-
-	request := httptest.NewRequest(http.MethodPost, "/http/Demo%20client/api/ping", strings.NewReader("abc"))
-	request.SetPathValue("clientName", "Demo client")
-	request.SetPathValue("route", "api")
-	request.SetPathValue("rest", "ping")
+	registry := onlineRegistry("Demo client")
+	stream := newFakeStream()
+	stream.head = map[string]any{
+		"statusCode": 201,
+		"headers":    []string{"Content-Type:text/plain", "X-Upstream:ok"},
+	}
+	stream.responses = []fakeResponse{
+		{data: []byte("first-")}, {data: []byte("second")}, {end: true},
+	}
+	var opened map[string]any
+	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
+		opened = metadata
+		return stream, nil
+	}, time.Second, 1024, 1024, traffic, nil, recorder, store.TrafficDetailOptions{Enabled: true})
+	request := tunnelRequest(http.MethodPatch, "/http/Demo%20client/api/items?x=%2F", "request-body")
+	request.Header.Set("X-Request", "yes")
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, request)
 
-	if response.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", response.Code)
+	if response.Code != 201 || response.Body.String() != "first-second" {
+		t.Fatalf("response = %d/%q", response.Code, response.Body.String())
 	}
-	if recorder.record.StatusCode != http.StatusBadGateway ||
-		recorder.record.Method != http.MethodPost ||
-		recorder.record.Error != "HTTP 转发请求发送失败" ||
-		string(recorder.record.ResponseBody) != "HTTP 转发请求发送失败" {
-		t.Fatalf("unexpected write failure record: %+v", recorder.record)
+	if string(stream.requestBody()) != "request-body" || stream.consumed != len("first-second") {
+		t.Fatalf("stream request/credit = %q/%d", stream.requestBody(), stream.consumed)
 	}
-	if got := strings.Join(recorder.record.ResponseHeaders, "\n"); got != "Content-Type:text/plain;charset=UTF-8" {
-		t.Fatalf("recorded response headers = %q, want Java plain error headers", got)
+	if opened["method"] != http.MethodPatch || opened["relativePath"] != "/items" || opened["rawQuery"] != "x=%2F" {
+		t.Fatalf("unexpected OPEN metadata: %+v", opened)
 	}
-	if traffic.upload != 3 || traffic.download != 0 {
-		t.Fatalf("traffic upload/download = %d/%d, want Java write-failure accounting 3/0",
-			traffic.upload, traffic.download)
+	if traffic.upload != int64(len("request-body")) || traffic.download != int64(len("first-second")) {
+		t.Fatalf("traffic = %d/%d", traffic.upload, traffic.download)
 	}
 }
 
-func TestServeHTTPPreservesEncodedRelativePathLikeJava(t *testing.T) {
-	recorder := &capturingDetailRecorder{}
-	registry := session.NewRegistry()
-	service := NewService(registry, time.Second, 1024, 1024, nil, nil, recorder,
-		store.TrafficDetailOptions{Enabled: true})
-	var captured protocol.DirectHTTPRequest
-	registry.Replace(&fakeDirectHTTPSession{clientName: "Demo client", send: func(packet protocol.Packet) error {
-		captured = packet.(protocol.DirectHTTPRequest)
-		service.Ack(protocol.DirectHTTPResponse{
-			RequestID:  captured.RequestID,
-			StatusCode: http.StatusOK,
-			Headers:    []string{"Content-Type:text/plain"},
-			Body:       []byte("ok"),
-		})
-		return nil
-	}})
-
-	request := httptest.NewRequest(http.MethodGet,
-		"/http/Demo%20client/api/%E4%BD%A0%2Fok/%252F?x=%2F", nil)
-	request.SetPathValue("clientName", "Demo client")
-	request.SetPathValue("route", "api")
-	request.SetPathValue("rest", "你/ok/%2F")
+func TestServeHTTPPreservesEncodedRelativePath(t *testing.T) {
+	registry := onlineRegistry("Demo client")
+	stream := newFakeStream()
+	stream.head = map[string]any{"statusCode": 200, "headers": []string{"Content-Type:text/plain"}}
+	stream.responses = []fakeResponse{{data: []byte("ok")}, {end: true}}
+	var opened map[string]any
+	service := NewService(registry, func(_ string, metadata map[string]any) (Stream, error) {
+		opened = metadata
+		return stream, nil
+	}, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	request := tunnelRequest(http.MethodGet, "/http/Demo%20client/api/%E4%BD%A0%2Fok/%252F?x=%2F", "")
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, request)
 
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", response.Code)
-	}
-	if captured.RelativePath != "/%E4%BD%A0%2Fok/%252F" {
-		t.Fatalf("relativePath = %q, want Java raw encoded path", captured.RelativePath)
-	}
-	if recorder.record.RelativePath != "/%E4%BD%A0%2Fok/%252F" || recorder.record.RawQuery != "x=%2F" {
-		t.Fatalf("record path/query = %q/%q, want encoded Java shape",
-			recorder.record.RelativePath, recorder.record.RawQuery)
+	if opened["relativePath"] != "/%E4%BD%A0%2Fok/%252F" || opened["rawQuery"] != "x=%2F" {
+		t.Fatalf("unexpected path/query: %+v", opened)
 	}
 }
 
-type capturingDetailRecorder struct {
-	record store.HTTPExchangeRecord
+func TestServeHTTPPropagatesHeaderTimeoutAsReset(t *testing.T) {
+	registry := onlineRegistry("Demo client")
+	stream := newFakeStream()
+	stream.blockHead = true
+	service := NewService(registry, func(string, map[string]any) (Stream, error) { return stream, nil },
+		10*time.Millisecond, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	response := httptest.NewRecorder()
+
+	service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+
+	if response.Code != http.StatusGatewayTimeout || stream.resetReason == "" {
+		t.Fatalf("timeout response/reset = %d/%q", response.Code, stream.resetReason)
+	}
 }
+
+func tunnelRequest(method, target, body string) *http.Request {
+	request := httptest.NewRequest(method, target, strings.NewReader(body))
+	request.SetPathValue("clientName", "Demo client")
+	request.SetPathValue("route", "api")
+	if index := strings.Index(target, "/api/"); index >= 0 {
+		rest := target[index+len("/api/"):]
+		if query := strings.IndexByte(rest, '?'); query >= 0 {
+			rest = rest[:query]
+		}
+		request.SetPathValue("rest", rest)
+	}
+	return request
+}
+
+func onlineRegistry(name string) *session.Registry {
+	registry := session.NewRegistry()
+	registry.Replace(&fakeOnlineSession{name: name})
+	return registry
+}
+
+type fakeOnlineSession struct{ name string }
+
+func (s *fakeOnlineSession) ClientName() string       { return s.name }
+func (*fakeOnlineSession) LoginTimeMs() int64         { return 0 }
+func (*fakeOnlineSession) Send(protocol.Packet) error { return nil }
+func (*fakeOnlineSession) Close(string)               {}
+
+type fakeResponse struct {
+	data     []byte
+	metadata map[string]any
+	end      bool
+	err      error
+}
+
+type fakeStream struct {
+	mu            sync.Mutex
+	request       bytes.Buffer
+	finished      chan struct{}
+	finishOnce    sync.Once
+	head          map[string]any
+	responses     []fakeResponse
+	responseIndex int
+	consumed      int
+	resetReason   string
+	blockHead     bool
+}
+
+func newFakeStream() *fakeStream { return &fakeStream{finished: make(chan struct{})} }
+func (s *fakeStream) SendData(_ context.Context, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.request.Write(data)
+	return nil
+}
+func (s *fakeStream) FinishRequest(map[string]any) error {
+	s.finishOnce.Do(func() { close(s.finished) })
+	return nil
+}
+func (s *fakeStream) WaitResponseHead(ctx context.Context) (map[string]any, error) {
+	if s.blockHead {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	select {
+	case <-s.finished:
+		return s.head, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (s *fakeStream) ReadResponse(context.Context) ([]byte, map[string]any, bool, error) {
+	if s.responseIndex >= len(s.responses) {
+		return nil, nil, false, errors.New("missing response event")
+	}
+	event := s.responses[s.responseIndex]
+	s.responseIndex++
+	return event.data, event.metadata, event.end, event.err
+}
+func (s *fakeStream) Consume(bytes int) error       { s.consumed += bytes; return nil }
+func (s *fakeStream) Reset(_ uint32, reason string) { s.resetReason = reason }
+func (*fakeStream) Close()                          {}
+func (s *fakeStream) requestBody() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.request.Bytes()...)
+}
+
+type capturingDetailRecorder struct{ record store.HTTPExchangeRecord }
 
 func (r *capturingDetailRecorder) RecordHTTPExchange(_ context.Context, record store.HTTPExchangeRecord) error {
 	r.record = record
 	return nil
 }
 
-type capturingTrafficRecorder struct {
-	upload   int64
-	download int64
-}
+type capturingTrafficRecorder struct{ upload, download int64 }
 
-func (r *capturingTrafficRecorder) RecordHTTPUpload(_, _ string, bytes int64) {
-	r.upload += bytes
-}
-
-func (r *capturingTrafficRecorder) RecordHTTPDownload(_, _ string, bytes int64) {
-	r.download += bytes
-}
-
-type fakeDirectHTTPSession struct {
-	clientName string
-	send       func(protocol.Packet) error
-}
-
-func (s *fakeDirectHTTPSession) ClientName() string { return s.clientName }
-
-func (s *fakeDirectHTTPSession) LoginTimeMs() int64 { return 0 }
-
-func (s *fakeDirectHTTPSession) Send(packet protocol.Packet) error { return s.send(packet) }
-
-func (s *fakeDirectHTTPSession) Close(string) {}
+func (r *capturingTrafficRecorder) RecordHTTPUpload(_, _ string, bytes int64)   { r.upload += bytes }
+func (r *capturingTrafficRecorder) RecordHTTPDownload(_, _ string, bytes int64) { r.download += bytes }

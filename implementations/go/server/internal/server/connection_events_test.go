@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -26,13 +25,12 @@ func TestConnectionEventsWebSocketAuthAndLifecycleBroadcast(t *testing.T) {
 	if rejectResp == nil || rejectResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected websocket 403 without token, got response=%v err=%v", rejectResp, err)
 	}
-	if got := rejectResp.Header.Get("X-Auth-Reason"); got != "invalid token" {
+	if got := rejectResp.Header.Get("X-Auth-Reason"); got != "missing ticket" {
 		t.Fatalf("unexpected auth reason: %q", got)
 	}
 
-	token := adminToken(t, ts)
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	conn, resp, err := websocket.Dial(connectCtx, wsURL+"?token="+url.QueryEscape(token), nil)
+	conn, resp, err := websocket.Dial(connectCtx, adminWebSocketURL(t, ts, "connections"), nil)
 	connectCancel()
 	if err != nil {
 		status := 0
