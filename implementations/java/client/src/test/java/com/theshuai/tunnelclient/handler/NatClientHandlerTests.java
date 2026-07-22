@@ -13,8 +13,26 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NatClientHandlerTests {
+
+    @Test
+    void shouldAcceptInboundKeepaliveWithoutClosingChannel() {
+        NatClientHandler handler = new NatClientHandler(tunnelBean());
+        EmbeddedChannel channel = new EmbeddedChannel(handler);
+        try {
+            NatMessagePacket keepalive = new NatMessagePacket();
+            keepalive.setNatMessageType(NatMessageType.KEEPALIVE);
+
+            channel.writeInbound(keepalive);
+
+            assertTrue(channel.isActive());
+            assertNull(channel.readInbound());
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
 
     @Test
     void shouldSynchronizeTunnelSnapshotAfterHandlerWasAdded() {

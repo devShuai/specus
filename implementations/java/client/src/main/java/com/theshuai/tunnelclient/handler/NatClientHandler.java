@@ -228,6 +228,10 @@ public class NatClientHandler extends NatCommonHandler {
             case WINDOW_UPDATE:
                 processWindowUpdate(natMessagePacket);
                 break;
+            case KEEPALIVE:
+                // KEEPALIVE 是 NatCommonHandler 在 writer-idle 时主动发送的保活帧，静默接受即可。
+                // 此前缺失该分支会导致入站 KEEPALIVE 落入 default 断开连接（自相矛盾）。
+                break;
             default:
                 log.warn("Unexpected NAT stream type: {}", natMessagePacket.getNatMessageType());
                 ctx.close();

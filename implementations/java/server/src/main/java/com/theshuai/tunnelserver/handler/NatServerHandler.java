@@ -123,6 +123,9 @@ public class NatServerHandler extends NatCommonHandler {
             }
         } else if (type == NatMessageType.WINDOW_UPDATE) {
             processWindowUpdate(natMessagePacket);
+        } else if (type == NatMessageType.KEEPALIVE) {
+            // KEEPALIVE 是 NatCommonHandler 在 writer-idle 时主动发送的保活帧，静默接受即可。
+            // 此前缺失该分支会导致入站 KEEPALIVE 落入 PROTOCOL_VIOLATION 断开连接（自相矛盾）。
         } else {
             log.warn("unexpected NAT stream type: {}", type);
             DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);

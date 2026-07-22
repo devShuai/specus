@@ -69,8 +69,8 @@ public class RemotePortServerManager {
     public void releaseExternalConnection(String tenantId) {
         activeExternalConnections.updateAndGet(current -> current > 0 ? current - 1 : 0);
         AtomicInteger tenantCounter = activeExternalConnectionsByTenant.get(tenantId);
-        if (tenantCounter != null && decrement(tenantCounter) == 0) {
-            activeExternalConnectionsByTenant.remove(tenantId, tenantCounter);
+        if (tenantCounter != null) {
+            decrement(tenantCounter);
         }
     }
 
