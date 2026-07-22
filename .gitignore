@@ -63,6 +63,7 @@ client2.jsonc
 ### Go client binary ###
 /implementations/go/client/shuai-tunnel-client
 /implementations/go/client/shuai-tunnel-client.exe
+/implementations/go/server/shuai-stun-server.exe
 /implementations/csharp/client/out/
 /implementations/go/client/out/
 
@@ -73,12 +74,20 @@ client2.jsonc
 .m2/
 .npm-cache/
 **/.npm-cache/
+/.tmp/
 .nuget/
 .gocache/
 .gomodcache/
 **/.gocache/
 **/.gomodcache/
+**/.gocache-codex/
+**/.gomodcache-codex/
 **/.gradle/
+**/.gradle-user-home/
+**/BenchmarkDotNet.Artifacts/
+BenchmarkDotNet.Artifacts/
+/.codex/config.toml
+/.zcode/
 local.properties
 **/bin/
 **/obj/

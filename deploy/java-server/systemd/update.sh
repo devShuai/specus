@@ -27,6 +27,7 @@ SERVICE="tunnel-server"
 INSTALL_DIR="/opt/tunnel-server"
 JAR_DEST="$INSTALL_DIR/tunnel-server.jar"
 CONFIG_DIR="${TUNNEL_CONFIG_DIR:-/etc/tunnel-server}"
+LOG_DIR="/var/log/tunnel-server"
 ENV_FILE="$CONFIG_DIR/tunnel-server.env"
 ENV_EXAMPLE_FILE="$CONFIG_DIR/tunnel-server.env.example"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,6 +105,11 @@ sync_deploy_files() {
     if [[ -f "$ENV_FILE" ]]; then
       log "真实环境变量文件 $ENV_FILE 不会被覆盖；如需合并新增变量，请手动 diff 模板"
     fi
+  fi
+
+  if id -u tunnel >/dev/null 2>&1 && getent group tunnel >/dev/null; then
+    install -d -m 0750 -o tunnel -g tunnel "$LOG_DIR"
+    log "已确认日志目录 -> $LOG_DIR"
   fi
 
   systemctl daemon-reload
@@ -192,5 +198,6 @@ fi
 log "升级成功 ✅"
 log "  - 当前运行 jar: $(readlink -f "$JAR_DEST")"
 log "  - 回滚备份:    $BACKUP"
-log "  - 查看日志:    journalctl -u $SERVICE -f"
+log "  - 文件日志:    $LOG_DIR/tunnel-server.log"
+log "  - systemd 日志: journalctl -u $SERVICE -f"
 exit 0

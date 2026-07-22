@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "deployment": {
     "remoteTempRoot": "/tmp",
     "sshConnectTimeoutSeconds": 10,
@@ -15,9 +15,10 @@
     "distributedStunBindAddress": "0.0.0.0",
     "distributedControlPort": 3480,
     "distributedPeerControlPort": 3480,
-    "distributedSharedSecret": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+    "distributedCurrentKeyId": 1,
+    "distributedCurrentSecret": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     "distributedMaxClockSkewSeconds": 30,
-    "distributedReplayCacheSize": 65536,
+    "distributedReplayWindowSize": 4096,
     "distributedMaxForwardPacketBytes": 4096,
     "distributedForwardRatePerSecond": 10000,
     "distributedForwardBurst": 20000,

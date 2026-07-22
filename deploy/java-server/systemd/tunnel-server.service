@@ -17,8 +17,10 @@ Group=tunnel
 # 工作目录用于存放运行时产物（如 fallback 的 SQLite 文件、临时文件等）
 WorkingDirectory=/var/lib/tunnel-server
 
-# 默认 JVM 参数为空；真实部署建议在 EnvironmentFile 里设置 JAVA_OPTS
+# 默认 JVM 参数为空；真实部署建议在 EnvironmentFile 里设置 JAVA_OPTS。
+# Linux 默认同时写入滚动文件；EnvironmentFile 可覆盖 TUNNEL_LOG_FILE。
 Environment=JAVA_OPTS=
+Environment=TUNNEL_LOG_FILE=/var/log/tunnel-server/tunnel-server.log
 
 # 环境变量文件（前导的 - 表示文件不存在时不报错；建议把所有数据库 / 密钥配置写到这里）
 EnvironmentFile=-/etc/tunnel-server/tunnel-server.env
@@ -38,7 +40,7 @@ SuccessExitStatus=143
 Restart=on-failure
 RestartSec=5s
 
-# 日志直接进 journald，使用 journalctl -u tunnel-server -f 查看
+# 控制台日志保留在 journald，应用同时写入 /var/log/tunnel-server/tunnel-server.log
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=tunnel-server

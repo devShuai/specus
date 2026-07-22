@@ -5,7 +5,7 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `tunnel-server.service` | systemd unit 定义，启动 / 停止 / 自动重启 / 日志接 journald |
+| `tunnel-server.service` | systemd unit 定义，启动 / 停止 / 自动重启 / 文件日志与 journald |
 | `tunnel-server.env.example` | 环境变量模板（**MySQL 连接、管理员密码、JWT 密钥都在这里**） |
 | `install.sh` | 一键安装：建用户、建目录、拷 jar、注册服务 |
 | `update.sh` | 滚动升级：备份 / 替换 jar / 健康检查 / 失败回滚，并同步最新 unit 与 env.example |
@@ -54,7 +54,7 @@ sudo bash /tmp/systemd/install.sh /tmp/tunnel-server-1.0-SNAPSHOT.jar
    * `/opt/tunnel-server/tunnel-server.jar` —— 程序
    * `/etc/tunnel-server/tunnel-server.env` —— 环境变量（chmod 640，root 与 tunnel 组可读）
    * `/var/lib/tunnel-server` —— 工作目录（fallback SQLite 文件、临时数据）
-   * `/var/log/tunnel-server` —— 预留日志目录（默认日志走 journald）
+   * `/var/log/tunnel-server` —— 应用滚动日志目录（同时保留 journald）
 3. 把 `tunnel-server.service` 安装到 `/etc/systemd/system/`
 4. 把 `tunnel-server.env.example` 拷贝为 `/etc/tunnel-server/tunnel-server.env`（已存在则不覆盖），并始终同步一份最新模板到 `/etc/tunnel-server/tunnel-server.env.example`
 5. `systemctl daemon-reload && systemctl enable tunnel-server`
@@ -145,6 +145,9 @@ TUNNEL_PEER_MESH_RELAY_MIN_PORT=49152
 TUNNEL_PEER_MESH_RELAY_MAX_PORT=65535
 TUNNEL_PEER_MESH_RELAY_WORKER_THREADS=0
 TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY=10000
+TUNNEL_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES=4194304
+TUNNEL_PEER_MESH_UDP_SEND_BUFFER_BYTES=4194304
+TUNNEL_PEER_MESH_UDP_TRAFFIC_CLASS=16
 TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS=5000
 TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED=true
 TUNNEL_PEER_MESH_TURN_REALM=shuai-tunnel
@@ -175,7 +178,7 @@ A1:P1、A1:P2、A2:P1、A2:P2 四个端点启用 RFC 5780。TURN 只保留在 A1
 发起 Binding 探测。公共 STUN 只补充 `srflx` 候选地址，不参与 relay；服务端 TURN 仍是直连失败后的兜底路径。
 
 relay 数据面使用标准 TURN `Send Indication` / `Data Indication` 承载加密后的 peer frame。
-`TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` 控制 relay 数据帧工作线程，0 表示自动；relay 流量不会每帧写库，而是按 `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` 周期聚合入库。
+`TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` 控制 relay 数据帧工作线程，0 表示自动；relay 流量不会每帧写库，而是按 `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` 周期聚合入库。UDP socket 的请求缓冲区和 Traffic Class 可通过 `TUNNEL_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES`、`TUNNEL_PEER_MESH_UDP_SEND_BUFFER_BYTES`、`TUNNEL_PEER_MESH_UDP_TRAFFIC_CLASS` 调整，实际缓冲区上限仍受宿主机内核约束。
 
 客户端侧默认 `peerMeshDevice=noop`，只运行控制面、候选交换、探测和加密 UDP 数据面；要真正接管虚拟 IP 流量，需要启用虚拟网卡：
 
@@ -212,8 +215,14 @@ TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP=30
 TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS=300
 TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM=50
 TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM=32
-TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION=120
+TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION=360
 TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS=60
+TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED=false
+TUNNEL_PUBLIC_TRANSFER_REDIS_URI=
+TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX=shuai-tunnel:v2:public-transfer
+TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS=30
+TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS=10000
+TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS=2000
 TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS=300
 TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP=10
 TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS=300
@@ -266,8 +275,25 @@ TUNNEL_ELASTICSEARCH_TCP_MAX_STORE_SIZE=10GB
 ```bash
 sudo systemctl start tunnel-server
 sudo systemctl status tunnel-server
+sudo tail -F /var/log/tunnel-server/tunnel-server.log
 sudo journalctl -u tunnel-server -f       # 实时日志
 ```
+
+Linux systemd 部署默认写入 `/var/log/tunnel-server/tunnel-server.log`。日志达到
+`50MB` 或跨日期时滚动并 gzip 压缩，最多保留 `30` 个历史周期且总量不超过
+`2GB`。可在 `/etc/tunnel-server/tunnel-server.env` 中覆盖：
+
+```env
+TUNNEL_LOG_FILE=/var/log/tunnel-server/tunnel-server.log
+TUNNEL_LOG_MAX_FILE_SIZE=50MB
+TUNNEL_LOG_MAX_HISTORY=30
+TUNNEL_LOG_TOTAL_SIZE_CAP=2GB
+TUNNEL_LOG_CLEAN_HISTORY_ON_START=true
+```
+
+文件由 `tunnel:tunnel` 创建，目录权限为 `0750`；systemd 的 `UMask=0027`
+确保日志不会向其他用户开放。控制台输出仍进入 journald，便于继续使用
+`journalctl -u tunnel-server` 排障。
 
 正常情况下能看到 `Started TunnelServerApplication ... in X seconds` 与 Netty 监听
 `7010`、HTTP 监听 `8088` 的输出。

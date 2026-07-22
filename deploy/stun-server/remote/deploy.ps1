@@ -275,13 +275,20 @@ function Write-NodeEnvironment {
             "STUN_DISTRIBUTED_CONTROL_PORT=$($Node.DistributedControlPort)",
             "STUN_DISTRIBUTED_PEER_CONTROL_ADDRESS=$($Node.DistributedPeerControlAddress)",
             "STUN_DISTRIBUTED_PEER_CONTROL_PORT=$($Node.DistributedPeerControlPort)",
-            "STUN_DISTRIBUTED_SHARED_SECRET=$($Node.DistributedSharedSecret)",
+            "STUN_DISTRIBUTED_CURRENT_KEY_ID=$($Node.DistributedCurrentKeyId)",
+            "STUN_DISTRIBUTED_CURRENT_SECRET=$($Node.DistributedCurrentSecret)",
             "STUN_DISTRIBUTED_MAX_CLOCK_SKEW_SECONDS=$($Node.DistributedMaxClockSkewSeconds)",
-            "STUN_DISTRIBUTED_REPLAY_CACHE_SIZE=$($Node.DistributedReplayCacheSize)",
+            "STUN_DISTRIBUTED_REPLAY_WINDOW_SIZE=$($Node.DistributedReplayWindowSize)",
             "STUN_DISTRIBUTED_MAX_FORWARD_PACKET_BYTES=$($Node.DistributedMaxForwardPacketBytes)",
             "STUN_DISTRIBUTED_FORWARD_RATE_PER_SECOND=$($Node.DistributedForwardRatePerSecond)",
             "STUN_DISTRIBUTED_FORWARD_BURST=$($Node.DistributedForwardBurst)"
         )
+        if ($Node.DistributedPreviousKeyId -gt 0) {
+            $lines += @(
+                "STUN_DISTRIBUTED_PREVIOUS_KEY_ID=$($Node.DistributedPreviousKeyId)",
+                "STUN_DISTRIBUTED_PREVIOUS_SECRET=$($Node.DistributedPreviousSecret)"
+            )
+        }
     }
     $lines += @(
         "",
@@ -319,7 +326,7 @@ try {
 }
 
 $schemaVersion = ConvertTo-IntegerValue `
-    (Get-PropertyValue $config "schemaVersion" 0) "schemaVersion" 1 1
+    (Get-PropertyValue $config "schemaVersion" 0) "schemaVersion" 2 2
 $deployment = Get-PropertyValue $config "deployment" $null -Required
 $defaults = Get-PropertyValue $config "defaults" $null -Required
 $nodeValues = @(Get-PropertyValue $config "nodes" $null -Required)
@@ -418,9 +425,12 @@ foreach ($node in $nodeValues) {
     $distributedControlPort = 0
     $distributedPeerControlText = ""
     $distributedPeerControlPort = 0
-    $distributedSharedSecret = ""
+    $distributedCurrentKeyId = 0
+    $distributedCurrentSecret = ""
+    $distributedPreviousKeyId = 0
+    $distributedPreviousSecret = ""
     $distributedMaxClockSkewSeconds = 30
-    $distributedReplayCacheSize = 65536
+    $distributedReplayWindowSize = 4096
     $distributedMaxForwardPacketBytes = 4096
     $distributedForwardRatePerSecond = 10000
     $distributedForwardBurst = 20000
@@ -510,19 +520,37 @@ foreach ($node in $nodeValues) {
             $distributedPeerControlPort -in @($primaryPort, $alternatePort)) {
             throw "nodes[$name] distributed control ports must differ from public STUN ports"
         }
-        $distributedSharedSecret = ConvertTo-Base64Secret `
-            (Get-MergedValue $node $defaults "distributedSharedSecret") `
-            "nodes[$name].distributedSharedSecret"
+        $distributedCurrentKeyId = ConvertTo-IntegerValue `
+            (Get-MergedValue $node $defaults "distributedCurrentKeyId") `
+            "nodes[$name].distributedCurrentKeyId" 1 2147483647
+        $distributedCurrentSecret = ConvertTo-Base64Secret `
+            (Get-MergedValue $node $defaults "distributedCurrentSecret") `
+            "nodes[$name].distributedCurrentSecret"
         if (-not $DryRun -and -not $ValidateOnly -and
-            $distributedSharedSecret -eq $exampleDistributedSecret) {
-            throw "nodes[$name].distributedSharedSecret still uses the public example secret"
+            $distributedCurrentSecret -eq $exampleDistributedSecret) {
+            throw "nodes[$name].distributedCurrentSecret still uses the public example secret"
+        }
+        $previousKeyIdText = [string](Get-MergedValue $node $defaults "distributedPreviousKeyId" "")
+        $previousSecretText = [string](Get-MergedValue $node $defaults "distributedPreviousSecret" "")
+        if ([string]::IsNullOrWhiteSpace($previousKeyIdText) -ne
+            [string]::IsNullOrWhiteSpace($previousSecretText)) {
+            throw "nodes[$name] distributedPreviousKeyId and distributedPreviousSecret must be set together"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($previousKeyIdText)) {
+            $distributedPreviousKeyId = ConvertTo-IntegerValue `
+                $previousKeyIdText "nodes[$name].distributedPreviousKeyId" 1 2147483647
+            $distributedPreviousSecret = ConvertTo-Base64Secret `
+                $previousSecretText "nodes[$name].distributedPreviousSecret"
+            if ($distributedPreviousKeyId -eq $distributedCurrentKeyId) {
+                throw "nodes[$name] current and previous distributed key IDs must differ"
+            }
         }
         $distributedMaxClockSkewSeconds = ConvertTo-IntegerValue `
             (Get-MergedValue $node $defaults "distributedMaxClockSkewSeconds" 30) `
             "nodes[$name].distributedMaxClockSkewSeconds" 1 300
-        $distributedReplayCacheSize = ConvertTo-IntegerValue `
-            (Get-MergedValue $node $defaults "distributedReplayCacheSize" 65536) `
-            "nodes[$name].distributedReplayCacheSize" 1 1000000
+        $distributedReplayWindowSize = ConvertTo-IntegerValue `
+            (Get-MergedValue $node $defaults "distributedReplayWindowSize" 4096) `
+            "nodes[$name].distributedReplayWindowSize" 64 1048576
         $distributedMaxForwardPacketBytes = ConvertTo-IntegerValue `
             (Get-MergedValue $node $defaults "distributedMaxForwardPacketBytes" 4096) `
             "nodes[$name].distributedMaxForwardPacketBytes" 512 65507
@@ -630,9 +658,12 @@ foreach ($node in $nodeValues) {
         DistributedControlPort = $distributedControlPort
         DistributedPeerControlAddress = $distributedPeerControlText
         DistributedPeerControlPort = $distributedPeerControlPort
-        DistributedSharedSecret = $distributedSharedSecret
+        DistributedCurrentKeyId = $distributedCurrentKeyId
+        DistributedCurrentSecret = $distributedCurrentSecret
+        DistributedPreviousKeyId = $distributedPreviousKeyId
+        DistributedPreviousSecret = $distributedPreviousSecret
         DistributedMaxClockSkewSeconds = $distributedMaxClockSkewSeconds
-        DistributedReplayCacheSize = $distributedReplayCacheSize
+        DistributedReplayWindowSize = $distributedReplayWindowSize
         DistributedMaxForwardPacketBytes = $distributedMaxForwardPacketBytes
         DistributedForwardRatePerSecond = $distributedForwardRatePerSecond
         DistributedForwardBurst = $distributedForwardBurst
@@ -689,9 +720,12 @@ if ($primaryNode.DistributedEnabled -or $standbyNode.DistributedEnabled) {
         "AlternatePublicAddress",
         "PrimaryPort",
         "AlternatePort",
-        "DistributedSharedSecret",
+        "DistributedCurrentKeyId",
+        "DistributedCurrentSecret",
+        "DistributedPreviousKeyId",
+        "DistributedPreviousSecret",
         "DistributedMaxClockSkewSeconds",
-        "DistributedReplayCacheSize",
+        "DistributedReplayWindowSize",
         "DistributedMaxForwardPacketBytes",
         "DistributedForwardRatePerSecond",
         "DistributedForwardBurst")) {

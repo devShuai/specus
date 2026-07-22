@@ -12,7 +12,7 @@
 #        /opt/tunnel-server          —— 存放 jar
 #        /etc/tunnel-server          —— 存放环境变量文件
 #        /var/lib/tunnel-server      —— 工作目录（fallback SQLite / 临时数据）
-#        /var/log/tunnel-server      —— 预留日志目录（默认日志走 journald）
+#        /var/log/tunnel-server      —— 应用滚动日志（同时保留 journald）
 #   4) 拷贝 jar、systemd unit、env 模板
 #   5) systemctl daemon-reload + enable
 #
@@ -127,6 +127,7 @@ cat <<EOF
   2. 启动服务：
        sudo systemctl start tunnel-server
        sudo systemctl status tunnel-server
+       sudo tail -F $LOG_DIR/tunnel-server.log
        sudo journalctl -u tunnel-server -f
 ============================================================
 EOF

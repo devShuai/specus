@@ -13,8 +13,8 @@ A1 和 A2 都持续提供服务。每台机器监听自己公网地址对应的 
 需要从另一公网地址回包时，通过内网 `3480/udp` 把已生成的 STUN
 响应交给对端发送。
 
-控制报文包含 HMAC-SHA256、时间戳和随机 nonce，并校验来源 IP/端口、时间窗口、
-重放缓存、最大报文和独立限速。`3480/udp` 只允许两台机器的内网 IP 互访，不能
+控制报文包含 HMAC-SHA256、`keyId`、时间戳、发送进程 epoch 和单调 sequence，
+并校验来源 IP/端口、滑动重放窗口、最大报文和独立限速。`3480/udp` 只允许两台机器的内网 IP 互访，不能
 暴露到公网。
 
 ## 1. 准备配置
@@ -204,9 +204,11 @@ curl --noproxy '*' -fsS http://127.0.0.1:9108/metrics \
 | `distributedPeerControlAddress` | 节点必填 | 对端内网控制 IP |
 | `distributedControlPort` | `3480` | 本机控制 UDP 端口 |
 | `distributedPeerControlPort` | 同本机端口 | 对端控制 UDP 端口 |
-| `distributedSharedSecret` | 必填 | 32 到 256 字节 Base64 HMAC 密钥 |
+| `distributedCurrentKeyId` | 必填 | 当前 HMAC 密钥的正整数 ID |
+| `distributedCurrentSecret` | 必填 | 当前 32 到 256 字节 Base64 HMAC 密钥 |
+| `distributedPreviousKeyId` / `distributedPreviousSecret` | 空 | 轮换期间临时保留的上一把密钥；必须成对配置 |
 | `distributedMaxClockSkewSeconds` | `30` | 控制报文允许的最大时钟偏差 |
-| `distributedReplayCacheSize` | `65536` | 已接收 nonce 缓存上限 |
+| `distributedReplayWindowSize` | `4096` | 每个发送 epoch 的乱序/防重放序列窗口 |
 | `distributedMaxForwardPacketBytes` | `4096` | 控制报文最大长度 |
 | `distributedForwardRatePerSecond` | `10000` | 控制通道持续限速 |
 | `distributedForwardBurst` | `20000` | 控制通道突发上限 |
