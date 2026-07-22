@@ -64,6 +64,21 @@ public sealed class TurnCredentialService
     public byte[] LongTermKey(string username, string credential) =>
         MD5.HashData(Encoding.UTF8.GetBytes($"{username}:{Realm}:{credential}"));
 
+    /// <summary>Subject prefix used by public transfer (browser WebRTC) credentials.</summary>
+    public const string GeneralSubjectPrefix = "public-transfer";
+
+    /// <summary>
+    /// Browser WebRTC relays DTLS/SRTP through TURN, which cannot pass the Peer Mesh specific
+    /// checks, so those allocations must be forwarded with standard TURN semantics under their
+    /// own quotas and destination policy.
+    /// </summary>
+    public bool IsGeneralRelaySubject(string? username)
+    {
+        var parts = username?.Trim().Split(':', 3);
+        return parts is { Length: 3 }
+            && parts[1].StartsWith(GeneralSubjectPrefix, StringComparison.Ordinal);
+    }
+
     public long PeerMeshClientId(string? username)
     {
         var parts = username?.Trim().Split(':', 3);

@@ -267,6 +267,14 @@ public sealed class PeerMeshOptions
     public string TurnRealm { get; set; } = "shuai-tunnel";
     public string TurnSharedSecret { get; set; } = string.Empty;
     public long TurnCredentialTtlSeconds { get; set; } = 3600;
+
+    // General relay quotas. Browser WebRTC relays DTLS/SRTP, which cannot pass the Peer Mesh
+    // specific checks, so those allocations forward with standard TURN semantics and need their
+    // own resource limits. Setting GeneralRelayMaxAllocations to 0 disables general relay.
+    public int GeneralRelayMaxAllocations { get; set; } = 256;
+    public int GeneralRelayMaxAllocationsPerAddress { get; set; } = 4;
+    public long GeneralRelayRateBytesPerSecond { get; set; } = 2L * 1024 * 1024;
+    public long GeneralRelayMaxBytes { get; set; } = 512L * 1024 * 1024;
     public long SessionCleanupIntervalMs { get; set; } = 60000;
     public int RelayTrafficFlushIntervalMs { get; set; } = 5000;
 }

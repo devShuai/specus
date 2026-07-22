@@ -578,8 +578,12 @@ public sealed class PeerMeshServiceTests
     }
 
     [Fact]
-    public async Task RelayFrameRejectsNegotiatingSession()
+    public async Task RelayFrameActivatesNegotiatingSession()
     {
+        // Probes are allowed while NEGOTIATING but business frames used to require ACTIVE, which
+        // is only written by an asynchronous path-report. Clients flush queued data right after a
+        // successful probe, so those frames raced ahead of the report and were dropped; peer app
+        // messages have no retransmission, so this surfaced as "relay connected but file send fails".
         await using var fixture = await PeerMeshFixture.CreateAsync();
         var source = fixture.AddClient(3301, "tenant-a", "alice", "alice-laptop");
         var target = fixture.AddClient(3302, "tenant-a", "alice", "alice-nas");
@@ -588,12 +592,65 @@ public sealed class PeerMeshServiceTests
 
         var allowed = await AuthorizeRelayFrameAsync(fixture.Service, 9104, source.Id, target.Id, 7, 512);
 
-        Assert.False(allowed);
+        Assert.True(allowed);
         var stored = await ReloadSessionAsync(fixture, 9104);
-        Assert.Equal(0, stored.RelayBytes);
-        Assert.Null(stored.LastTrafficAt);
+        Assert.Equal(PeerMeshService.StatusActive, stored.Status);
+        Assert.Equal(PeerMeshService.PathRelay, stored.PathType);
+    }
+
+    [Fact]
+    public async Task RelayFrameRejectsClosedSessionAndMismatchedPeers()
+    {
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(3311, "tenant-a", "alice", "alice-laptop-2");
+        var target = fixture.AddClient(3312, "tenant-a", "alice", "alice-nas-2");
+        fixture.AddSession(9114, source, target, PeerMeshService.StatusClosed, DateTimeOffset.UtcNow.AddHours(1));
+        fixture.AddSession(9115, source, target, PeerMeshService.StatusNegotiating, DateTimeOffset.UtcNow.AddHours(1));
+        await fixture.SaveChangesAsync();
+
+        Assert.False(await AuthorizeRelayFrameAsync(fixture.Service, 9114, source.Id, target.Id, 7, 512));
+        Assert.False(await AuthorizeRelayFrameAsync(fixture.Service, 9115, source.Id, 999999, 7, 512));
+
+        var stored = await ReloadSessionAsync(fixture, 9115);
         Assert.Equal(PeerMeshService.StatusNegotiating, stored.Status);
     }
+
+    [Fact]
+    public async Task RelayFrameAllowsUnidentifiedPeersWhenTurnAuthDisabled()
+    {
+        // With TURN auth disabled the allocation carries no clientId; the caller passes 0/0.
+        // Rejecting that outright would make the relay unusable in that mode.
+        await using var fixture = await PeerMeshFixture.CreateAsync();
+        var source = fixture.AddClient(3321, "tenant-a", "alice", "alice-laptop-3");
+        var target = fixture.AddClient(3322, "tenant-a", "alice", "alice-nas-3");
+        fixture.AddSession(9124, source, target, PeerMeshService.StatusActive, DateTimeOffset.UtcNow.AddHours(1));
+        await fixture.SaveChangesAsync();
+
+        Assert.True(await AuthorizeRelayFrameAsync(fixture.Service, 9124, 0, 0, 7, 256));
+    }
+
+    [Fact]
+    public void GeneralRelayDestinationPolicyRejectsNonPublicTargets()
+    {
+        // General relay destinations come straight from the browser, so anything pointing back
+        // into the server's own network must be refused.
+        Assert.True(StunTurnServer.IsRelayableDestination(Endpoint("203.0.113.10", 50000)));
+        Assert.True(StunTurnServer.IsRelayableDestination(Endpoint("2001:db8::10", 50000)));
+
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("127.0.0.1", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("0.0.0.0", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("192.168.1.10", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("10.0.0.5", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("169.254.1.10", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("239.1.1.1", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("100.96.0.2", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("fd00::1", 50000)));
+        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("203.0.113.10", 0)));
+        Assert.False(StunTurnServer.IsRelayableDestination(null));
+    }
+
+    private static System.Net.IPEndPoint Endpoint(string host, int port) =>
+        new(System.Net.IPAddress.Parse(host), port);
 
     private static async Task<bool> AuthorizeRelayFrameAsync(PeerMeshService service, long sessionId, long fromClientId,
         long toClientId, long sequence, long bytes)

@@ -64,7 +64,7 @@ public sealed class PeerMeshService
         long fromClientId, long toClientId, long bytes,
         CancellationToken cancellationToken)
     {
-        if (fromClientId <= 0 || toClientId <= 0 || bytes <= 0)
+        if (!ValidRelayPeers(fromClientId, toClientId) || bytes <= 0)
         {
             return false;
         }
@@ -74,7 +74,31 @@ public sealed class PeerMeshService
 
 	internal Task<bool> ValidateRelayFrameAsync(PeerDataFrameHeader header,
         long fromClientId, long toClientId, CancellationToken cancellationToken) =>
-		AuthorizeRelayFrameCoreAsync(header, fromClientId, toClientId, 0, false, cancellationToken);
+        ValidRelayPeers(fromClientId, toClientId)
+            ? AuthorizeRelayFrameCoreAsync(header, fromClientId, toClientId, 0, false, cancellationToken)
+            : Task.FromResult(false);
+
+    /// <summary>
+    /// Either both identities are known (TURN auth enabled) or both are zero (auth disabled and
+    /// the caller cannot determine identity). A single zero is a caller bug.
+    /// </summary>
+    private static bool ValidRelayPeers(long fromClientId, long toClientId) =>
+        (fromClientId > 0 && toClientId > 0) || (fromClientId == 0 && toClientId == 0);
+
+    /// <summary>
+    /// 0/0 means the caller could not determine the peer identities (TURN auth disabled), which
+    /// degrades to "session exists and is not closed" instead of rejecting everything.
+    /// </summary>
+    private static bool MatchesSessionPeers(PeerMeshSession session, long fromClientId, long toClientId)
+    {
+        if (fromClientId <= 0 && toClientId <= 0)
+        {
+            return true;
+        }
+        var forward = fromClientId == session.SourceClientId && toClientId == session.TargetClientId;
+        var reverse = fromClientId == session.TargetClientId && toClientId == session.SourceClientId;
+        return forward || reverse;
+    }
 
 	private async Task<bool> AuthorizeRelayFrameCoreAsync(PeerDataFrameHeader header,
         long fromClientId, long toClientId, long bytes, bool account,
@@ -97,16 +121,29 @@ public sealed class PeerMeshService
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             return false;
         }
-        if (!string.Equals(session.Status, StatusActive, StringComparison.Ordinal))
-        {
-            return false;
-        }
-        var forward = fromClientId == session.SourceClientId && toClientId == session.TargetClientId;
-        var reverse = fromClientId == session.TargetClientId && toClientId == session.SourceClientId;
-        if (!forward && !reverse)
+        if (string.Equals(session.Status, StatusClosed, StringComparison.Ordinal))
         {
             RemoveRelaySession(header.SessionId);
             return false;
+        }
+        if (!MatchesSessionPeers(session, fromClientId, toClientId))
+        {
+            RemoveRelaySession(header.SessionId);
+            return false;
+        }
+        // The first authenticated relay business frame implicitly activates a NEGOTIATING
+        // session. Probes are allowed while NEGOTIATING but business frames required ACTIVE,
+        // which is only written by an asynchronous path-report; clients flush queued data right
+        // after a successful probe, so those frames raced ahead of the report and were dropped.
+        // Peer app messages have no retransmission, so this surfaced as "relay connected but
+        // file send fails". Session identity is already verified here, so waiting for a status
+        // report adds no security, only a race.
+        if (!string.Equals(session.Status, StatusActive, StringComparison.Ordinal))
+        {
+            session.Status = StatusActive;
+            session.PathType = PathRelay;
+            session.UpdatedAt = now;
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
         CacheRelayAuthorization(session, now);
 		if (account)
@@ -1399,6 +1436,7 @@ public sealed class PeerMeshService
             RemoveRelaySession(header.SessionId);
             return false;
         }
+        // 0/0 means identity unknown (TURN auth disabled), consistent with the slow path.
         if (!authorization.Matches(fromClientId, toClientId))
         {
             return false;
@@ -1642,8 +1680,13 @@ public sealed class PeerMeshService
         public bool ValidAt(DateTimeOffset now) =>
             Active && CacheExpiresAt > now && SessionExpiresAt > now;
 
+        /// <summary>0/0 means identity unknown (TURN auth disabled), same as the slow path.</summary>
         public bool Matches(long fromClientId, long toClientId)
         {
+            if (fromClientId <= 0 && toClientId <= 0)
+            {
+                return true;
+            }
             var forward = fromClientId == SourceClientId && toClientId == TargetClientId;
             var reverse = fromClientId == TargetClientId && toClientId == SourceClientId;
             return forward || reverse;

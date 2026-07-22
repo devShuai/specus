@@ -243,7 +243,7 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private async Task AllocateRequestAsync(StunMessage request, IPEndPoint remote, CancellationToken cancellationToken)
-        => await AllocateRequestCoreAsync(request, remote, null, 0, cancellationToken).ConfigureAwait(false);
+        => await AllocateRequestCoreAsync(request, remote, null, 0, false, cancellationToken).ConfigureAwait(false);
 
     private async Task AllocateRequestAuthenticatedAsync(StunMessage request, byte[] packet, IPEndPoint remote,
         CancellationToken cancellationToken)
@@ -254,13 +254,26 @@ public sealed class StunTurnServer : BackgroundService
         {
             return;
         }
+        if (auth.GeneralRelay)
+        {
+            var rejection = GeneralRelayQuotaRejection(remote);
+            if (rejection is not null)
+            {
+                // Audit: general relay is driven by a public ICE config, rejections must be traceable.
+                _logger.LogWarning("[peer-mesh][audit] general TURN allocation rejected: client={Client}, reason={Reason}",
+                    remote, rejection);
+                await SendErrorAsync(_primary, remote, request, StunMessage.AllocateError, 486, rejection)
+                    .ConfigureAwait(false);
+                return;
+            }
+        }
         await AllocateRequestCoreAsync(
-                request, remote, auth.MessageIntegrityKey, auth.ClientId, cancellationToken)
+                request, remote, auth.MessageIntegrityKey, auth.ClientId, auth.GeneralRelay, cancellationToken)
             .ConfigureAwait(false);
     }
 
     private async Task AllocateRequestCoreAsync(StunMessage request, IPEndPoint remote,
-        byte[]? messageIntegrityKey, long clientId, CancellationToken cancellationToken)
+        byte[]? messageIntegrityKey, long clientId, bool generalRelay, CancellationToken cancellationToken)
     {
         if (!request.RequestedUdpTransport())
         {
@@ -268,7 +281,7 @@ public sealed class StunTurnServer : BackgroundService
                 .ConfigureAwait(false);
             return;
         }
-        var allocation = AllocateForClient(remote, clientId, cancellationToken);
+        var allocation = AllocateForClient(remote, clientId, generalRelay, cancellationToken);
         await SendStunAsync(_primary, remote, StunMessage.Of(
             StunMessage.AllocateSuccess,
             request.TransactionId,
@@ -279,9 +292,9 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     private Allocation Allocate(IPEndPoint remote, CancellationToken cancellationToken = default)
-        => AllocateForClient(remote, 0, cancellationToken);
+        => AllocateForClient(remote, 0, false, cancellationToken);
 
-    private Allocation AllocateForClient(IPEndPoint remote, long clientId,
+    private Allocation AllocateForClient(IPEndPoint remote, long clientId, bool generalRelay,
         CancellationToken cancellationToken = default)
     {
         var endpointKey = EndpointKey(remote);
@@ -289,7 +302,8 @@ public sealed class StunTurnServer : BackgroundService
             && _allocations.TryGetValue(existingId, out var existing)
             && !existing.Closed)
         {
-            if (!IsExpired(existing) && existing.ClientId == clientId)
+            if (!IsExpired(existing) && existing.ClientId == clientId
+                && existing.GeneralRelay == generalRelay)
             {
                 existing.Remote = remote;
                 existing.ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(_options.AllocationTtlSeconds);
@@ -301,7 +315,10 @@ public sealed class StunTurnServer : BackgroundService
         var relay = BindRelaySocket();
         var allocation = new Allocation(Guid.NewGuid().ToString(), remote, relay,
             AdvertisedSocketAddress(relay), DateTimeOffset.UtcNow.AddSeconds(_options.AllocationTtlSeconds),
-            clientId);
+            clientId)
+        {
+            GeneralRelay = generalRelay,
+        };
         _allocations[allocation.Id] = allocation;
         _allocationByEndpoint[endpointKey] = allocation.Id;
         _allocationByRelayEndpoint[EndpointKey(allocation.RelayAddress)] = allocation.Id;
@@ -402,10 +419,19 @@ public sealed class StunTurnServer : BackgroundService
         foreach (var attribute in request.All(StunMessage.AttrXorPeerAddress))
         {
             var peer = new StunMessage(request.Type, request.TransactionId, [attribute]).XorPeerAddress();
-            if (peer is not null)
+            if (peer is null)
             {
-                allocation.Permissions[PermissionKey(peer)] = expiresAt;
+                continue;
             }
+            if (allocation.GeneralRelay && !IsRelayableDestination(peer))
+            {
+                _logger.LogWarning("[peer-mesh][audit] general TURN permission refused: client={Client}, peer={Peer}",
+                    remote, peer);
+                await SendErrorAsync(_primary, remote, request, StunMessage.CreatePermissionError, 403,
+                    "forbidden-peer-address").ConfigureAwait(false);
+                return;
+            }
+            allocation.Permissions[PermissionKey(peer)] = expiresAt;
         }
         await SendStunAsync(_primary, remote, StunMessage.Of(
             StunMessage.CreatePermissionSuccess,
@@ -434,6 +460,15 @@ public sealed class StunTurnServer : BackgroundService
 		{
 			await SendErrorAsync(_primary, remote, request, StunMessage.ChannelBindError, 400,
 				"invalid-channel-bind").ConfigureAwait(false);
+			return;
+		}
+		if (allocation.GeneralRelay && !IsRelayableDestination(peer))
+		{
+			// ChannelBind implicitly creates a permission, so it needs the same destination policy.
+			_logger.LogWarning("[peer-mesh][audit] general TURN channel bind refused: client={Client}, peer={Peer}",
+				remote, peer);
+			await SendErrorAsync(_primary, remote, request, StunMessage.ChannelBindError, 403,
+				"forbidden-peer-address").ConfigureAwait(false);
 			return;
 		}
 		var now = DateTimeOffset.UtcNow;
@@ -474,6 +509,10 @@ public sealed class StunTurnServer : BackgroundService
             return;
         }
 		var target = AllocationForRelayEndpoint(peer);
+		if (!AllowGeneralRelayTraffic(allocation, payload.Length))
+		{
+			return;
+		}
 		if (!await AuthorizeRelayPayloadAsync(
                 payload, allocation, target, true, cancellationToken).ConfigureAwait(false))
 		{
@@ -495,6 +534,10 @@ public sealed class StunTurnServer : BackgroundService
 			return;
 		}
 		var target = AllocationForRelayEndpoint(binding.Peer);
+		if (!AllowGeneralRelayTraffic(allocation, frame.Payload.Length))
+		{
+			return;
+		}
 		if (!await AuthorizeRelayPayloadAsync(
                 frame.Payload, allocation, target, true, cancellationToken).ConfigureAwait(false))
 		{
@@ -503,14 +546,150 @@ public sealed class StunTurnServer : BackgroundService
 		await allocation.Relay.SendAsync(frame.Payload, binding.Peer, cancellationToken).ConfigureAwait(false);
 	}
 
+    /// <summary>
+    /// General relay admission quota. Returns a non-null reason when the request must be refused.
+    /// </summary>
+    private string? GeneralRelayQuotaRejection(IPEndPoint remote)
+    {
+        if (_options.GeneralRelayMaxAllocations <= 0)
+        {
+            return "general-relay-disabled";
+        }
+        var existingId = _allocationByEndpoint.TryGetValue(EndpointKey(remote), out var id) ? id : null;
+        var total = 0;
+        var sameAddress = 0;
+        foreach (var (allocationId, item) in _allocations)
+        {
+            if (item.Closed || !item.GeneralRelay || string.Equals(allocationId, existingId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            total++;
+            if (item.Remote.Address.Equals(remote.Address))
+            {
+                sameAddress++;
+            }
+        }
+        if (total >= _options.GeneralRelayMaxAllocations)
+        {
+            return "general-relay-allocation-quota";
+        }
+        if (_options.GeneralRelayMaxAllocationsPerAddress > 0
+            && sameAddress >= _options.GeneralRelayMaxAllocationsPerAddress)
+        {
+            return "general-relay-address-quota";
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Per-allocation byte cap plus token-bucket rate limit. Peer Mesh allocations are exempt:
+    /// their destinations and identities are already pinned.
+    /// </summary>
+    private bool AllowGeneralRelayTraffic(Allocation allocation, int bytes)
+    {
+        if (!allocation.GeneralRelay)
+        {
+            return true;
+        }
+        lock (allocation.QuotaLock)
+        {
+            allocation.RelayedBytes += bytes;
+            if (_options.GeneralRelayMaxBytes > 0 && allocation.RelayedBytes > _options.GeneralRelayMaxBytes)
+            {
+                if (Interlocked.Exchange(ref allocation.QuotaLogged, 1) == 0)
+                {
+                    _logger.LogWarning("[peer-mesh][audit] general TURN byte quota exhausted: client={Client}, bytes={Bytes}",
+                        allocation.Remote, allocation.RelayedBytes);
+                }
+                return false;
+            }
+            var rate = _options.GeneralRelayRateBytesPerSecond;
+            if (rate <= 0)
+            {
+                return true;
+            }
+            var now = DateTimeOffset.UtcNow;
+            if (allocation.RateRefilledAt == default)
+            {
+                allocation.RateTokens = rate;
+            }
+            else
+            {
+                var elapsed = (now - allocation.RateRefilledAt).TotalSeconds;
+                allocation.RateTokens = Math.Min(rate, allocation.RateTokens + (elapsed * rate));
+            }
+            allocation.RateRefilledAt = now;
+            if (allocation.RateTokens < bytes)
+            {
+                return false;
+            }
+            allocation.RateTokens -= bytes;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Restricts general relay destinations to public unicast addresses so the relay cannot be
+    /// used as a jump host into the server's private network. Peer Mesh mode is exempt: local and
+    /// private deployments legitimately use loopback and site-local relay addresses.
+    /// </summary>
+    internal static bool IsRelayableDestination(IPEndPoint? address)
+    {
+        if (address is null || address.Port <= 0)
+        {
+            return false;
+        }
+        var ip = address.Address;
+        if (IPAddress.Any.Equals(ip) || IPAddress.IPv6Any.Equals(ip)
+            || IPAddress.IsLoopback(ip) || ip.IsIPv6LinkLocal || ip.IsIPv6Multicast)
+        {
+            return false;
+        }
+        if (ip.AddressFamily == AddressFamily.InterNetwork)
+        {
+            var raw = ip.GetAddressBytes();
+            // private ranges, link-local, multicast/reserved and 100.64.0.0/10 (CGNAT + mesh range)
+            return raw[0] switch
+            {
+                10 => false,
+                127 => false,
+                169 when raw[1] == 254 => false,
+                172 when raw[1] >= 16 && raw[1] <= 31 => false,
+                192 when raw[1] == 168 => false,
+                100 when raw[1] >= 64 && raw[1] <= 127 => false,
+                >= 224 => false,
+                _ => true,
+            };
+        }
+        var v6 = ip.GetAddressBytes();
+        // IPv6 ULA fc00::/7
+        return (v6[0] & 0xFE) != 0xFC;
+    }
+
 	private async Task<bool> AuthorizeRelayPayloadAsync(byte[] payload,
         Allocation? source, Allocation? target, bool account,
 		CancellationToken cancellationToken)
 	{
-		if (source is null || target is null || source.ClientId <= 0 || target.ClientId <= 0)
+		// General TURN mode (public transfer): the payload is DTLS/SRTP/SCTP or a STUN
+		// connectivity check, none of which can pass the Peer Mesh specific checks. Identity was
+		// verified at Allocate, the destination at CreatePermission/ChannelBind, and the caller
+		// already confirmed the permission. Outbound the local allocation is source, inbound target.
+		if (source?.GeneralRelay == true || target?.GeneralRelay == true)
+		{
+			return true;
+		}
+		if (source is null || target is null)
 		{
 			return false;
 		}
+		var identified = _turnCredentials.AuthRequired;
+		if (identified && (source.ClientId <= 0 || target.ClientId <= 0))
+		{
+			return false;
+		}
+		var sourceClientId = identified ? source.ClientId : 0L;
+		var targetClientId = identified ? target.ClientId : 0L;
 		var header = PeerDataFrameHeader.Parse(payload);
 		if (header is not null)
 		{
@@ -518,9 +697,9 @@ public sealed class StunTurnServer : BackgroundService
 			var framePeerMesh = frameScope.ServiceProvider.GetRequiredService<PeerMeshService>();
 			return account
 				? await framePeerMesh.AuthorizeRelayFrameAsync(
-                    header, source.ClientId, target.ClientId, payload.Length, cancellationToken).ConfigureAwait(false)
+                    header, sourceClientId, targetClientId, payload.Length, cancellationToken).ConfigureAwait(false)
 				: await framePeerMesh.ValidateRelayFrameAsync(
-                    header, source.ClientId, target.ClientId, cancellationToken).ConfigureAwait(false);
+                    header, sourceClientId, targetClientId, cancellationToken).ConfigureAwait(false);
 		}
 		if (payload.Length is < 2 or > PeerProbeMaxBytes || payload[0] != (byte)'{' || payload[^1] != (byte)'}')
 		{
@@ -538,8 +717,7 @@ public sealed class StunTurnServer : BackgroundService
 		await using var probeScope = _scopeFactory.CreateAsyncScope();
 		var peerMesh = probeScope.ServiceProvider.GetRequiredService<PeerMeshService>();
 		return probe?.Magic == "shuai-peer-mesh"
-			&& probe.FromClientId == source.ClientId
-			&& probe.ToClientId == target.ClientId
+			&& (!identified || (probe.FromClientId == sourceClientId && probe.ToClientId == targetClientId))
 			&& await peerMesh.AuthorizeRelayProbeAsync(probe.SessionId, probe.FromClientId, probe.ToClientId,
 				probe.Token, probe.Type, cancellationToken).ConfigureAwait(false);
 	}
@@ -574,6 +752,10 @@ public sealed class StunTurnServer : BackgroundService
                 continue;
             }
 			var source = AllocationForRelayEndpoint(result.RemoteEndPoint);
+			if (!AllowGeneralRelayTraffic(allocation, result.Buffer.Length))
+			{
+				continue;
+			}
 			if (!await AuthorizeRelayPayloadAsync(
                     result.Buffer, source, allocation, false, cancellationToken).ConfigureAwait(false))
 			{
@@ -724,7 +906,8 @@ public sealed class StunTurnServer : BackgroundService
                 .ConfigureAwait(false);
             return TurnAuth.Denied;
         }
-        return new TurnAuth(true, key, _turnCredentials.PeerMeshClientId(username));
+        return new TurnAuth(true, key, _turnCredentials.PeerMeshClientId(username),
+            _turnCredentials.IsGeneralRelaySubject(username));
     }
 
     private Task SendTurnAuthErrorAsync(IPEndPoint remote, StunMessage request, ushort responseType,
@@ -894,6 +1077,13 @@ public sealed class StunTurnServer : BackgroundService
         public UdpClient Relay { get; }
         public IPEndPoint RelayAddress { get; }
         public long ClientId { get; }
+        /// <summary>Forwards arbitrary payloads with standard TURN semantics (public transfer).</summary>
+        public bool GeneralRelay { get; init; }
+        public long RelayedBytes;
+        public int QuotaLogged;
+        public object QuotaLock { get; } = new();
+        public double RateTokens;
+        public DateTimeOffset RateRefilledAt;
         public DateTimeOffset ExpiresAt { get; set; }
         public ConcurrentDictionary<string, DateTimeOffset> Permissions { get; } = new(StringComparer.Ordinal);
 		public ConcurrentDictionary<ushort, TurnChannelBinding> ChannelsByNumber { get; } = new();
@@ -905,7 +1095,8 @@ public sealed class StunTurnServer : BackgroundService
 	private sealed record RelayProbe(string? Magic, string? Type, long SessionId, long FromClientId,
 		long ToClientId, string? Token);
 
-    private sealed record TurnAuth(bool Allowed, byte[]? MessageIntegrityKey, long ClientId)
+    private sealed record TurnAuth(bool Allowed, byte[]? MessageIntegrityKey, long ClientId,
+        bool GeneralRelay = false)
     {
         public static TurnAuth Denied { get; } = new(false, null, 0);
         public static TurnAuth NoAuthentication { get; } = new(true, null, 0);
