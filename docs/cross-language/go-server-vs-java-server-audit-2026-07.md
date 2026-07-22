@@ -1,11 +1,11 @@
 # Go Server vs Java Server 实现比对审计（2026-07-22）
 
-最后复核：2026-07-22（含本轮 Go/Java 对齐改动）
+最后复核：2026-07-22（含本轮 Go/Java 对齐改动，全部计划批次已实施）
 
 本文记录 Go server（`implementations/go/server`）与 Java server（`implementations/java/server`）在全部 6 个阶段、
-十几个子系统上的逐项代码级比对结果，并跟踪本轮修复状态。验证结果：Go server `go test ./...` 全部通过；
-Java client/server 的 KEEPALIVE 定向测试及全模块 `-DskipTests package` 通过。Java 全量测试的断言没有失败，但两个既有
-Peer Mesh 用例在 JUnit 清理 Windows 临时目录时触发 `AccessDeniedException`，因此不能标记为全量绿灯。
+十几个子系统上的逐项代码级比对结果，并跟踪修复状态。验证结果：Go server `go build ./... && go test ./...` 全部通过；
+Java `mvn -Dtunnel.server.web.skip=true -pl implementations/java/server -am test`（tunnel-common 43 + tunnel-server 130）通过。
+已知噪声：Go `internal/server` 部分测试在 macOS 上偶发 TempDir 清理竞态（HEAD 基线即有，与对齐改动无关）。
 
 状态标记：`ALIGNED` 已对齐 / `PARTIAL` 部分对齐 / `MINOR` 轻微差异 / `MATERIAL` 实质性差异。
 
@@ -14,20 +14,22 @@ Peer Mesh 用例在 JUnit 清理 Windows 临时目录时触发 `AccessDeniedExce
 两端在协议编解码、HMAC 登录、控制通道心跳、写背压、连接归档、WebSocket 事件、Elasticsearch、TURN 认证、
 SPM2 relay 计量、Peer Mesh stats、公共互传附件/OSS、客户端消息、OIDC、帧边界等核心路径上已对齐。
 
-原始比对列出 9 处实质性差异和 11 处轻微差异。本轮已修复 S-2、S-4、S-6、S-8、S-9、T-4、T-7 及公共互传名称
-检查路径，S-3 已部分修复。当前剩余 4 处实质或部分差异（S-1、S-3、S-5、S-7）和 9 处轻微差异。
+原始比对列出 9 处实质性差异和 11 处轻微差异。截至本轮，S-1..S-9 全部修复（含 Direct HTTP WebSocket 隧道、
+公共互传 rooms/用户 diagrams 端点、陈旧 session 清理、嵌入式 STUN RFC 5780），轻微差异中 T-4、T-5、T-7、T-8
+已消除。当前剩余 7 处轻微差异（T-1、T-2、T-3、T-6、T-9、T-10、T-11），均为可接受的双向取舍，不阻塞
+Go server 替代 Java server。
 
 ## 2. 实质性差异（MATERIAL，按优先级排序）
 
 | 编号 | 状态 | 子系统 | 当前结论 |
 | --- | --- | --- | --- |
-| S-1 | MATERIAL | Direct HTTP WebSocket 隧道 | Go `/http/**` 仍无 WS upgrade 与 12 字节 SWS2 帧隧道，浏览器 WS over HTTP tunnel 不可用。 |
+| S-1 | ALIGNED | Direct HTTP WebSocket 隧道 | Go 已补齐 `/http/**` WS upgrade 与 12 字节 SWS2 帧隧道（`directhttp/sws2.go`、`ws_tunnel.go`），含流控与 16MB 读上限，生命周期与 Java `WebSocketTunnelHandler` 逐条对应。 |
 | S-2 | ALIGNED | NAT KEEPALIVE 处理 | Java client/server 已显式接受入站 KEEPALIVE，行为与 Go 一致，并新增双方定向测试。 |
-| S-3 | PARTIAL | 管理 API 端点缺口 | name-availability 与 nat-probe-config 已补齐；公共房间 9 个端点和用户流程图 5 个端点仍缺失。 |
+| S-3 | ALIGNED | 管理 API 端点缺口 | 公共互传 rooms 9 个端点与用户 diagrams 5 个端点已补齐（`management/rooms.go`、`diagrams.go`），路径/字段/状态码/错误消息逐字对齐 Java；ws-ticket 走 `rooms.Resolve`。 |
 | S-4 | ALIGNED | `maxOnlineInstances=0` 语义 | Go 已移除 `> 0` 守卫，0 与 Java 一致表示拒绝所有登录。 |
-| S-5 | MATERIAL | 陈旧 session 清理时机 | Go 在单实例检查前仍未清理 channel 已失活的 `NETTY_ONLINE` 行，幽灵记录可能拒绝合法重连。 |
+| S-5 | ALIGNED | 陈旧 session 清理时机 | Go `authenticate` 在限额检查前对未绑定控制连接的 `NETTY_ONLINE` session 做内存+DB 清理（`closeStaleOnlineSessions`），幽灵记录不再拒绝合法重连。 |
 | S-6 | ALIGNED | NAT per-tenant 遥测 | 原审计误写为独立租户限额；Java 实际只保留全局容量门控并按租户统计 active/rejected。Go 已补齐同等计数。 |
-| S-7 | MATERIAL | 嵌入式 STUN RFC 5780 | Go 嵌入式 `binding()` 仍缺 CHANGE-REQUEST/RESPONSE-PORT/PADDING 与四端点拓扑。 |
+| S-7 | ALIGNED | 嵌入式 STUN RFC 5780 | Go 嵌入式 binding 委托共享 `stunserver.BindingService`，支持 CHANGE-REQUEST/RESPONSE-PORT/PADDING 与四端点拓扑，字节级对齐 Java `StunBindingService`。 |
 | S-8 | ALIGNED | Peer Mesh VIP 分配哈希 | Go 已改为按 Java UTF-16 code unit 计算 `String.hashCode()`，含代理对测试。 |
 | S-9 | ALIGNED | Peer Mesh 可复用 session | Go 已查询双向 open session、复用内存明文 token，并在关闭时清理 token cache。 |
 
@@ -35,19 +37,14 @@ SPM2 relay 计量、Peer Mesh stats、公共互传附件/OSS、客户端消息�
 配置分散在 `tunnel.tls.*`（控制通道/Netty）和 `server.ssl.*`（管理 HTTP/Tomcat）两处；Go 单配置覆盖两端且支持 PEM。
 此差异归入轻微差异 T-11，因两端各有取舍而非单方缺失。
 
-### S-3 管理 API 端点缺口明细
+### S-3 管理 API 端点明细（已全部补齐）
 
-Go server 当前仍缺失的端点（Java 有）：
+- `POST /api/public/transfer/rooms/**`（access-tokens、pairing-codes、diagram/versions，共 9 个端点）已实施。
+- `GET/POST/PUT/DELETE /api/admin/diagrams/**`（共 5 个端点）已实施。
+- 此前已补齐：`GET /api/admin/clients/name-availability`、`GET /api/public/peer-mesh/nat-probe-config`，并修正
+  `GET /api/public/transfer/clients/name-availability` 的注册路径。
 
-- `POST /api/public/transfer/rooms/**`（access-tokens、pairing-codes、diagram/versions，共 9 个端点，`PublicTransferRoomResource.java:38-92`）
-- `GET/POST/PUT/DELETE /api/admin/diagrams/**`（共 5 个端点，`UserDiagramDocumentResource.java:35-58`）
-
-已补齐：`GET /api/admin/clients/name-availability`、`GET /api/public/peer-mesh/nat-probe-config`，并修正
-`GET /api/public/transfer/clients/name-availability` 的注册路径。原审计将 `POST /api/client/auth/login`、
-`POST /api/admin/ws-tickets`、`POST /api/public/transfer/ws-tickets` 误报为缺失；复核发现这 3 个端点原本已在
-`server/app.go` 注册。
-
-## 3. 轻微差异（当前剩余 9 项）
+## 3. 轻微差异（当前剩余 7 项）
 
 | 编号 | 状态 | 子系统 | 差异 |
 | --- | --- | --- | --- |
@@ -55,10 +52,10 @@ Go server 当前仍缺失的端点（Java 有）：
 | T-2 | MINOR | Nonce 防重放键 | Go `(sha256(apiKey), sha256(nonce))` 复合键；Java `sha256(sha256(apiKey)+"\n"+nonce)` 单键（功能等价，DB 键形不同，行 120s 过期） |
 | T-3 | MINOR | 登录线程池 | Go 固定 32 worker；Java 弹性 core 8->max 32（低并发时 Java 线程更少） |
 | T-4 | ALIGNED | 连接记录启动/关停清理 | Go 已增加 `SERVER_RESTARTED` 启动 sweep 和 `SERVER_SHUTDOWN` 优雅关停 sweep。 |
-| T-5 | MINOR | DB 表集合 | Java 多 5 张房间/流程图表；启动列迁移范围不同。Batch 5 完成后可消除主体差异。 |
+| T-5 | ALIGNED | DB 表集合 | 5 张房间/流程图表已补齐到全部 3 个 schema，`tunnel_websocket_ticket.room_role` 纳入启动列迁移。 |
 | T-6 | MINOR | 配置键 | 登录 core-size、DB 连接模型、Netty 调优旋钮、route-cache-ttl 各有缺失。 |
 | T-7 | ALIGNED | Direct HTTP 离线状态码 | Go 实际响应路径已改为 502，并有 handler 测试覆盖。 |
-| T-8 | MINOR | 413 预检 | Go 记录交换；Java `HttpTunnelBodyLimitFilter` 按 Content-Length 短路不记录（流式超限时两端都记录） |
+| T-8 | ALIGNED | 413 预检 | Java `HttpTunnelBodyLimitFilter` 已在 Content-Length 短路时记录 413 交换，与 Go 行为一致。 |
 | T-9 | MINOR | 搜索字段别名 | Go 有 `headers`/`body` 组合别名 + `_`/`-` 归一化；Java 无 |
 | T-10 | MINOR | 路径去重 | Java 全 body placeholder 防双前缀；Go 属性级 `shouldRewritePath`（JS 字面量可能双前缀） |
 | T-11 | MINOR | TLS PEM/双配置 | Java 不支持裸 PEM cert+key 且 TLS 配置分散两处；Go 单配置覆盖两端且支持 PEM（双向各有取舍） |
@@ -106,12 +103,8 @@ Go server 当前仍缺失的端点（Java 有）：
 
 ## 5. 修复优先级
 
-| 优先级 | 编号 | 项 | 理由 |
-| --- | --- | --- | --- |
-| P0 | S-1 | Direct HTTP WebSocket 隧道 | 浏览器 WS 功能完全缺失，用户可见 |
-| P1 | S-3 | 管理 API 端点缺口 | 仍缺房间 9 个、流程图 5 个端点 |
-| P1 | S-5 | 陈旧 session 清理时机 | 影响重连可用性 |
-| P2 | S-7 | 嵌入式 STUN RFC 5780 | NAT 类型探测 |
+原优先级队列已全部清零：P0 S-1、P1 S-3/S-5、P2 S-7 均已修复并验证。剩余 7 项轻微差异
+（见第 3 节）不计划处理，理由见 `go-server-parity-implementation-plan.md` 末尾的取舍说明。
 
 ## 6. 相关文档
 

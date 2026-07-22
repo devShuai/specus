@@ -2,6 +2,8 @@
 
 Go 实现的 shuai-tunnel 服务端(`implementations/go/server/`),module 为 `github.com/devShuai/shuai-tunnel/implementations/go/server`,Go 1.26。与 Java / Go / .NET / Android client 线协议兼容。分 6 个阶段交付；下述“全绿”是阶段交付时的历史记录，当前验证结果以 `cross-language-java-alignment-plan.md` 的“当前验证”为准。
 
+与 Java server 的逐项对齐：2026-07-22 完成 `go-server-parity-implementation-plan.md` 全部 6 个批次（S-1..S-9、T-4/T-5/T-7/T-8 修复），实质差异清零，仅剩 7 项可接受的轻微差异；明细见 `go-server-vs-java-server-audit-2026-07.md`。
+
 ## 项目布局
 
 ```

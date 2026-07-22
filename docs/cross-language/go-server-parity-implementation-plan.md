@@ -1,7 +1,7 @@
 # Go Server 全量对齐 Java Server 实施计划
 
 创建：2026-07-22
-状态：进行中（Batch 1、Batch 3 已完成；Batch 2 部分完成；Batch 4-6 待实施）
+状态：已完成（Batch 1-6 及收尾项均已实施，Go `go build ./... && go test ./...` 全绿）
 
 目标：使 Go server（`implementations/go/server`）成为 Java server（`implementations/java/server`）的完全替代品。
 本计划基于 [`go-server-vs-java-server-audit-2026-07.md`](go-server-vs-java-server-audit-2026-07.md) 中识别的 9 项实质差异（S-1..S-9）、
@@ -13,12 +13,12 @@
 | 批次 | 内容 | 状态 |
 | --- | --- | --- |
 | Batch 1 | 快速行为修复（S-4, S-8, S-9, 路径 bug, T-7） | ✅ 已完成 |
-| Batch 2 | NAT 修复（S-2 Java, S-5, S-6, T-4） | 🟡 S-2、S-6、T-4 已完成，S-5 待实施 |
+| Batch 2 | NAT 修复（S-2 Java, S-5, S-6, T-4） | ✅ 已完成 |
 | Batch 3 | 管理 API 端点（S-3 部分：name-availability, nat-probe-config） | ✅ 已完成 |
-| Batch 4 | Direct HTTP WebSocket 隧道（S-1） | ⬜ 待实施 |
-| Batch 5 | 公共互传 rooms + 用户 diagrams（S-3 剩余 + DB 表） | ⬜ 待实施 |
-| Batch 6 | 嵌入式 STUN RFC 5780（S-7） | ⬜ 待实施 |
-| 收尾 | T-8 Java 413 预检记录 + 审计文档更新 | ⬜ 待实施 |
+| Batch 4 | Direct HTTP WebSocket 隧道（S-1） | ✅ 已完成 |
+| Batch 5 | 公共互传 rooms + 用户 diagrams（S-3 剩余 + DB 表） | ✅ 已完成 |
+| Batch 6 | 嵌入式 STUN RFC 5780（S-7） | ✅ 已完成 |
+| 收尾 | T-8 Java 413 预检记录 + 审计文档更新 | ✅ 已完成 |
 
 ---
 
@@ -59,7 +59,7 @@
 
 ---
 
-## Batch 2：NAT 修复 🟡
+## Batch 2：NAT 修复 ✅
 
 ### S-2：Java 接受入站 KEEPALIVE（修 Java，非 Go）✅
 - **文件**：
@@ -68,15 +68,14 @@
 - **理由**：Java `NatCommonHandler` 在 writer-idle 时主动发送 KEEPALIVE，但两端都不接受入站 KEEPALIVE（自相矛盾）。Go 已正确接受（`session.go:158-159`）。修 Java 使 keepalive 真正生效。
 - **测试**：Java client/server 均新增 EmbeddedChannel 用例，发送 KEEPALIVE 后断言连接保持 active。
 
-### S-5：陈旧 session 清理 + 启动/关停 sweep
-- **文件**：`implementations/go/server/internal/auth/auth.go` `authenticate()`（~L234-288）+ `implementations/go/server/internal/server/app.go`
+### S-5：陈旧 session 清理 + 启动/关停 sweep ✅
+- **文件**：`implementations/go/server/internal/auth/auth.go` `authenticate()` + `implementations/go/server/internal/server/app.go`
 - **改动**：
-  - `authenticate` 在 `CountOnlineByMachineUser`/`CountOnlineByCredential` 检查前，新增 `closeStaleOnlineSessions` 步骤：查询 DB 中该 credential（+machine+osUser）的 `NETTY_ONLINE` 行，对每行通过 `session.Registry.Find(clientName)` 检查内存中控制连接是否存活；若不存在/已断开，调用 `MarkClientSessionDisconnected` 标记该行。对齐 Java `closeStaleOnlineSessions`（L355-386）。
+  - `authenticate` 在 `CountOnlineByMachineUser`/`CountOnlineByCredential` 检查前，新增 `closeStaleOnlineSessions` 步骤：枚举内存中该 credential 的 `NETTY_ONLINE` session（`SessionStore.FindOnlineByCredential`），对每条通过 `session.Registry.Find(clientName)` 检查控制连接是否仍绑定；未绑定则内存 + DB 同步标记 `DISCONNECTED`。对齐 Java `closeStaleOnlineSessions`（L355-386），当前 session 自身不排除（成功后由 dispatcher 重新 `MarkOnline`，与 Java 先关后存回等价）。
+  - `Authenticator` 构造新增 `*session.Registry` 参数（`app.go` 装配处传入）。
   - 启动 sweep：`app.go` 启动时将所有 `NETTY_ONLINE` 行标记为 `DISCONNECTED`，reason `SERVER_RESTARTED`（对齐 Java `closeStaleOnlineSessionsOnStartup` L90-101）。
   - 优雅关停 sweep：context cancel 时将 open connection records 标记为 `SERVER_SHUTDOWN`（对齐 Java `markAllOpenAsShutdownOnContextClose`）。store 新增 `MarkAllOpenConnectionsShutdown`。
-  - `session.Session` 接口可能需要新增 `IsActive() bool` 方法（或复用 `Registry.IsBound`）。
-
-当前状态：登录限额检查前的陈旧 `NETTY_ONLINE` session 清理尚未实施；连接记录的启动/关停 sweep 已按 T-4 完成。
+- **测试**：`auth/auth_test.go` 新增两个用例——陈旧 online session 不阻塞重登并被标记断开；存活绑定的 online session 仍拒绝重复登录。
 
 ### S-6：NAT per-tenant 连接计数 ✅
 - **文件**：`implementations/go/server/internal/nat/manager.go` + `implementations/go/server/internal/nat/session.go`
@@ -113,98 +112,46 @@
 
 ---
 
-## Batch 4：Direct HTTP WebSocket 隧道（S-1） ⬜
+## Batch 4：Direct HTTP WebSocket 隧道（S-1） ✅
 
-Java 使用 12 字节 SWS2 帧封装（magic `0x53575332`、opcode、flags、closeCode u16、payloadLen i32、payload），非 1 字节前缀。
+已完成。实施要点（与 Java 逐条对应）：
+- 新增 `directhttp/sws2.go`（12 字节 SWS2 帧编解码：magic `0x53575332`、opcode、flags、closeCode u16、payloadLen i32，maxPayload=65524）与 `directhttp/ws_tunnel.go`（`WebSocketTunnel`，基于已有依赖 `coder/websocket`）。
+- `directhttp/service.go` `ServeHTTP` 顶部检测 `Upgrade: websocket` 分支到 WS 隧道；`nat/session.go` 新增 `wsStreams` 表、NatData/NatFin/NatRST 的 WS 分支、`openWSStream`（`source=ws` metadata）与 dispose 时统一关闭，流控与 `HTTPStream` 一致。
+- 修复了一个实施中发现的缺陷：`coder/websocket` 默认 32KB 读上限会掐断大消息，已 `SetReadLimit` 对齐 16MB。
+- 测试：`sws2_test.go`（编解码 round-trip/边界/畸形帧）、`ws_tunnel_test.go`（真实 WS 对的 OPEN/DATA/CLOSE 生命周期、大消息分块、客户端 CLOSE 回送、send credit 窗口语义）。
 
-### 新文件 `implementations/go/server/internal/directhttp/`
-- **`sws2.go`**：SWS2 编解码。`encodeSWS2(opcode, final, rsv, closeCode, payload) []byte` + `decodeSWS2(frame) (opcode, final, rsv, closeCode, payload, error)`。常量：`magicSWS2=0x53575332`、`headerBytes=12`、`maxPayload=64*1024-12`。Opcodes：CONTINUATION=0, TEXT=1, BINARY=2, CLOSE=8, PING=9, PONG=10。
-- **`ws_tunnel.go`**：`WebSocketTunnel` 结构体（持有 `*websocket.Conn`、streamID、clientName）。方法：`OPEN`（发送 `NatOpen` 含 `source=ws` metadata 到客户端控制通道）、`handleBrowserFrame`（WS 消息 -> SWS2 封装 -> `NatData`）、`writeFrame`（解码 SWS2 -> 重建 WS 消息 -> 发往浏览器）、`close`。
+## Batch 5：公共互传 rooms + 用户 diagrams（S-3 剩余 + DB 表） ✅
 
-### 修改 `directhttp/service.go` `ServeHTTP`
-- 顶部检测 `Upgrade: websocket`（大小写不敏感），若为 WS 则分支到 WS 隧道 handler（`websocket.Accept` + 创建 `WebSocketTunnel` + 读循环），否则继续现有 HTTP 路径。
+已完成。实施要点：
+- 5 张新表加入全部 3 个 schema（字段以 Java entity 为准，含 `owner_token_hash`/`snapshot_data`/`revision` 等真实列），另给 `tunnel_websocket_ticket` 加 `room_role` 列并纳入启动列迁移。
+- 新增 `store/rooms.go`、`store/diagrams.go`（含原子 pairing-code 核销与乐观锁 revision 更新）、`transfer/room_service.go`（9 个方法 + per-IP 限流，集群走 Redis `SharedRateLimiter`）、`management/rooms.go`（9 端点）、`management/diagrams.go`（5 端点，tenant/owner 可见性）。
+- `server/websocket_tickets.go`：`roomToken` 存在时经 `rooms.Resolve` 解析，设 `RoomKey="room:"+id` 与 `RoomRole`，对齐 Java `WebSocketTicketResource`。
+- 端点路径、JSON 字段名、状态码、中文错误消息逐字对齐 Java；配置新增 `TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_*`（默认值与 Java 一致）。
+- 测试：`transfer/room_service_test.go`、`management/diagrams_test.go`、`server/websocket_tickets_test.go`。
 
-### 修改 `nat/session.go`
-- `clientSession` 新增 `wsStreams map[uint32]*directhttp.WebSocketTunnel`。
-- `NatData` case（~L160-168）：`handleHTTPData` 返回 false 后检查 `wsStreams[streamID]`；命中则转发 SWS2 字节到 `wsStream.writeFrame` 并发 `WINDOW_UPDATE`；否则 fall through 到 TCP `handleData`。
-- `NatFin`/`NatRST` case（~L169-177）：`handleHTTPEnd` 返回 false 后检查 wsStreams；命中则关闭 WS 隧道；否则 TCP。
-- `dispose`（~L520-544）：关闭所有 wsStreams（对齐 Java `onControlChannelInactive` -> `closeAll`）。
-- 新增 `openWSStream`（类似 `openHTTPStream`）：分配 streamID、注册、发送 `NatOpen` 含 `source=ws` metadata。
-- WS 流需要流控（send credit + 接收时 `WINDOW_UPDATE`），对齐 `HTTPStream`。
+## Batch 6：嵌入式 STUN RFC 5780（S-7） ✅
 
-### 测试
-- `sws2_test.go`：SWS2 编解码 round-trip、分块、opcode 重建。
-- `ws_tunnel_test.go`：WS 隧道 OPEN/DATA/CLOSE 生命周期（使用测试 NAT session）。
-
-### Batch 4 验证
-- `go build ./...` + `go test ./...`。
-
----
-
-## Batch 5：公共互传 rooms + 用户 diagrams（S-3 剩余 + DB 表） ⬜
-
-### 新 DB 表（添加到全部 3 个 schema 文件：`store/schema/{sqlite,mysql,postgres}.sql`）
-- `public_transfer_room`（id, room_id, display_name, owner_peer_id, created_at, expires_at, tenant_id）
-- `public_transfer_room_access`（id, room_id, access_id, peer_id, display_name, role, created_at, revoked_at）
-- `public_transfer_room_pairing_code`（id, room_id, code, created_at, expires_at, redeemed_by, redeemed_at）
-- `public_transfer_diagram_version`（id, room_id, version_id, version, content, created_at, created_by）
-- `user_diagram_document`（id, tenant_id, owner_username, name, content, created_at, updated_at）
-
-### 新 store 层：`store/rooms.go` + `store/diagrams.go`
-- 每张表的 CRUD（对齐 Java repository）。幂等 `CREATE TABLE IF NOT EXISTS` 已在 schema 中。
-
-### 新 service：`transfer/room_service.go`
-- `PublicTransferRoomService` 对齐 Java：listAccessTokens、createAccessToken、revokeAccessToken、createPairingCode、redeemPairingCode（含限流）、listVersions、createVersion、getVersion、deleteVersion。
-- `PublicTransferRateLimiter` 用于 pairing-code redeem（per-IP）。
-
-### 新管理 handler（`management/api.go`）
-- `/api/public/transfer/rooms/**`（9 个端点）- 注册路由，委托 room_service。
-- `/api/admin/diagrams/**`（5 个端点）- 注册路由，委托 diagram store，含 tenant/owner 可见性过滤。
-
-### 修改 `/api/public/transfer/ws-tickets` handler
-- `server/websocket_tickets.go` `handlePublicWebSocketTicket`：当 `roomToken` 存在时，通过 `roomService.resolve(roomId, roomToken, peerId)` 解析（替代当前 `token:<sha256>` 自计算）。设置 `roomKey = "room:" + roomId` 和 `roomRole`。对齐 Java `WebSocketTicketResource.java:74-81`。
-
-### 测试
-- `room_service_test.go`、`diagrams_test.go`：CRUD、pairing-code redeem/限流、tenant/owner 可见性。
-
-### Batch 5 验证
-- `go build ./...` + `go test ./...`。
+已完成。实施要点：
+- `peermesh/stun_turn.go` 的嵌入式 binding 改为委托同模块 `internal/stunserver` 的共享 `BindingService`（CHANGE-REQUEST 0x02/0x04/0x06、RESPONSE-PORT、PADDING 全部语义，与 Java `StunBindingService` 字节级一致）。
+- 拓扑：`configureStunTopology()` 在四要素齐备时构建 RFC 5780 四端点，否则回退 basic 双端点；`stunBehaviorStrict` 下配置不全即不启动（对齐 Java）。注意语义变化：alternate 端口 bind 失败时从"降级仅 primary"改为"整体不启动"，与 Java 基准一致。
+- 配置新增 `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` / `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` / `TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT`。
+- 测试：`stun_turn_test.go` 重写——CHANGE-REQUEST 各 flag、420/400 拒绝、RESPONSE-PORT、PADDING（含 1472 上限）、四端点选择。
 
 ---
 
-## Batch 6：嵌入式 STUN RFC 5780（S-7） ⬜
+## 收尾 ✅
 
-### `implementations/go/server/internal/peermesh/stun_turn.go` `binding()`
-- 解析 CHANGE-REQUEST 属性（RFC 5780）：存在时按 flag 改变响应源端口/地址（0x02 = change port, 0x04 = change address, 0x06 = both）。需要 4 端点拓扑（PRIMARY, PRIMARY_ALTERNATE_PORT, ALTERNATE_PRIMARY_PORT, ALTERNATE）。
-- 解析 RESPONSE-PORT 属性：从请求端口响应。
-- 解析 PADDING 属性：在响应中添加填充字节。
-- 此逻辑已存在于独立 `stunserver/binding.go` - 提取/复用 CHANGE-REQUEST/RESPONSE-PORT/PADDING 处理到共享 helper 或内联到嵌入式 `binding()`。
-- 将嵌入式拓扑从 2 socket（primary/alternate）扩展到 4 端点（当配置提供 alternate host + 不同 port 时）。对齐 Java `StunEndpointTopology.rfc5780`（4 端点）+ `StunBindingService.java:54-156`。
-
-### 配置
-- `config.go`：新增 `standaloneAlternateStunHost`/`standaloneAlternateStunPort`（若尚不存在，供 Batch 3 `nat-probe-config` 构建 4 端点）。
-
-### 测试
-- `stun_turn_test.go`：CHANGE-REQUEST 各 flag 值、RESPONSE-PORT、PADDING、无 alternate 端点时 420 unsupported。
-
-### Batch 6 验证
-- `go build ./...` + `go test ./...`。
-
----
-
-## 收尾
-
-### T-8：Java 413 预检记录
+### T-8：Java 413 预检记录 ✅
 - **文件**：`implementations/java/server/.../http/HttpTunnelBodyLimitFilter.java`
-- **改动**：在 `Content-Length` 超限短路前调用 `trafficInspectionService.recordHttpExchange` 记录 413 交换（对齐 Go 已有的记录行为）。或反过来让 Go 不记录以匹配 Java--推荐修 Java（记录更有用）。
+- **改动**：已按"修 Java"方向实施——filter 注入 `TrafficInspectionService`，Content-Length 超限短路时先捕获请求体前缀、写出 413 响应，再 `recordHttpExchange` 记录该交换（status=413，参数语义对齐 Go `directhttp/service.go` 的 `fail()` 路径）。
+- **测试**：新增 `HttpTunnelBodyLimitFilterTests`（413 记录、未超限放行不记录、非 `/http/` 路径不记录）；tunnel-common + tunnel-server 全量测试通过。
 
-### 审计文档更新
-- 更新 `go-server-vs-java-server-audit-2026-07.md`：将每个已修复项标记为 FIXED。
-- 更新 `tunnel-server-go-port-plan.md`：记录最终状态。
+### 审计文档更新 ✅
+- `go-server-vs-java-server-audit-2026-07.md` 已将 S-1、S-3、S-5、S-7、T-5、T-8 标记为 ALIGNED。
 
 ### 最终验证
 - Go：`cd implementations/go/server && go build ./... && go test ./...`（全绿）。
-- Java（S-2/T-8）：`cd implementations/java/server && mvn -Dtunnel.server.web.skip=true test`（184+ 通过）。
+- Java（S-2/T-8）：`mvn -Dtunnel.server.web.skip=true -pl implementations/java/server -am test`（tunnel-common 43 + tunnel-server 130 通过）。
 
 ---
 
@@ -217,7 +164,6 @@ Java 使用 12 字节 SWS2 帧封装（magic `0x53575332`、opcode、flags、clo
 | T-1 | readString null vs empty | 实际不影响互操作（server 只设非空 reason 或省略） |
 | T-2 | Nonce 防重放键形不同 | 功能等价，行 120s 过期，DB 不跨 server 共享 |
 | T-3 | 登录线程池 core/max 弹性 | 低并发行为差异，不影响正确性；T-6 映射 env 即可 |
-| T-5 | DB 表集合差异 | Batch 5 补齐 5 张表后消除 |
 | T-6 | 配置键差异 | 登录 core-size 等 Go 固定 worker 模型下为信息性；可后续补 env 映射 |
 | T-9 | 搜索字段别名 | Go 超集，不影响 Java 前端使用 |
 | T-10 | 路径去重 | 边缘情况，仅影响已前缀内容的二次改写 |
