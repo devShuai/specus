@@ -100,7 +100,8 @@
         "transport",
         "address",
         "port",
-        "priority"
+        "priority",
+        "addressFamily"
       ],
       "properties": {
         "type": {
@@ -135,6 +136,13 @@
         },
         "relayId": {
           "type": "string"
+        },
+        "addressFamily": {
+          "type": "string",
+          "enum": [
+            "IPv4",
+            "IPv6"
+          ]
         }
       }
     },

@@ -92,7 +92,7 @@ signature = HEX(HMAC_SHA256(key, message))
 
 - `apiKey` 必须存在且启用。
 - `timestamp` 与服务端当前时间差不能超过 `60s`。
-- `nonce` 当前只参与签名，后续可接入短期去重缓存。
+- `(apiKey, nonce)` 在签名通过后原子消费，摘要保留 `120s`；同一组合重复提交必须拒绝。
 - `environment.machineFingerprint` 和 `environment.osUser` 必须存在。
 - `signature` 使用常量时间比较。
 
@@ -108,7 +108,7 @@ signature = HEX(HMAC_SHA256(key, message))
 - Peer Mesh 分配虚拟 IP 和保存设备公钥。
 - 在 Peer roster 中发布当前客户端的消息、附件和媒体预览能力。
 
-`environment.clientMessageCapabilities` 是可选能力声明：
+`environment.clientMessageCapabilities` 是显式能力声明：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -118,7 +118,7 @@ signature = HEX(HMAC_SHA256(key, message))
 | `mediaPreview` | 客户端能否预览媒体附件 |
 | `maxAttachmentBytes` | 客户端声明的单附件最大字节数；`0` 表示没有声明 peer-specific 上限，不表示无限制，也不覆盖服务端对象存储上限 |
 
-字段整体缺省时按全部 `false`、大小 `0` 处理，兼容旧客户端。只有 `attachments=true` 才表示附件能力可用；
+不实现消息功能的客户端必须明确上报全部 `false` 和大小 `0`；Java CLI 属于此类。只有 `attachments=true` 才表示附件能力可用；
 若同时 `maxAttachmentBytes=0`，发送端不能据此承诺任意大小，只能依赖服务端上传接口的配置上限和实际返回结果。
 
 ## HTTP 登录响应
@@ -184,15 +184,19 @@ signature = HEX(HMAC_SHA256(key, message))
 
 ## 控制连接登录
 
-HTTP 登录成功后，客户端建立控制连接并发送 `LOGIN_REQUEST`：
+HTTP 登录成功后，客户端先建立 control 连接并发送 `LOGIN_REQUEST`：
 
 ```json
 {
   "clientName": "shuaiwin-shshi-fa22b7af",
   "clientSessionId": 1868708022931423400,
-  "accessToken": "cs_xxx"
+  "accessToken": "cs_xxx",
+  "connectionRole": "control"
 }
 ```
+
+control 登录成功后，客户端使用相同的 `clientName/clientSessionId/accessToken` 建立第二条连接，并把
+`connectionRole` 设为 `data`。服务端只有在匹配的 control 已绑定时才接受 data。
 
 服务端校验：
 
@@ -205,17 +209,17 @@ HTTP 登录成功后，客户端建立控制连接并发送 `LOGIN_REQUEST`：
 
 登录成功后：
 
-- 服务端绑定 `clientName -> Channel`。
+- 服务端分别绑定 `clientName -> control Channel` 与 `clientName -> data Channel`。
 - 连接记录写入成功状态。
-- 异步下发 `NAT_CONTROL`。
+- 通过 control 异步下发 `NAT_CONTROL`，TCP/HTTP/WebSocket 字节流只走 data。
 - Peer Mesh 开启时下发可互联 roster。
 
 登录失败后服务端会主动关闭连接。客户端会按失败原因决定重试、刷新 token 或停止重连。
 
 ### runtime token 的重放与传输边界
 
-`accessToken` 是在过期前可复用的 bearer token，不是一次性 token。普通断线重连会继续使用同一
-`clientSessionId + accessToken`；它当前不绑定某条 TCP channel、TLS session、源 IP 或设备公钥。
+`accessToken` 是在过期前可复用的 bearer token，不是一次性 token。control/data 建连和普通断线重连使用同一
+`clientSessionId + accessToken`；token 当前不绑定 TLS session、源 IP 或设备公钥。
 服务端仍会校验 session 过期、客户端/凭证启用状态、同机用户实例数和凭证最大在线实例数，但截获 token 的
 一方在这些约束和 TTL 内仍可能尝试重放。
 

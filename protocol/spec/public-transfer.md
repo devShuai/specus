@@ -53,7 +53,7 @@ GET /api/public/transfer/ice-config
 | `peerMeshEnabled` | `tunnel.peer-mesh.enabled` 的值；控制 Peer Mesh 和自托管 TURN，不关闭显式配置的独立 STUN |
 | `iceServers` | WebRTC 风格的有序 ICE server 列表；每项的 `urls` 是单个字符串，不是数组 |
 | `turnAuthRequired` | TURN listener 是否要求长期凭证 |
-| `stunTurnPort` | 兼容字段，表示业务服务的 STUN/TURN 主端口；独立 STUN 的实际端口以 `iceServers[].urls` 为准 |
+| `stunTurnPort` | 汇总字段，表示业务服务的 STUN/TURN 主端口；独立 STUN 的实际端口以 `iceServers[].urls` 为准 |
 
 列表顺序必须为：自托管 STUN（若可用）、配置的公共 STUN（保持配置顺序并去重）、自托管 TURN（若可用）。
 配置的公共 STUN 在 `peerMeshEnabled=false` 时仍保留。显式配置
@@ -100,27 +100,40 @@ TURN 长期认证的 realm、nonce、401/438 challenge 和 `MESSAGE-INTEGRITY` �
 
 ## 2. 发现 WebSocket
 
-### 2.1 握手查询参数
+### 2.1 一次性握手 ticket
 
-```text
-/ws/public-transfer/discovery
-  ?roomId=<room>
-  &roomToken=<secret>
-  &peerId=<peer>
-  &displayName=<name>
+浏览器先通过 HTTPS POST 提交房间凭据和展示信息：
+
+```http
+POST /api/public/transfer/ws-tickets
+Content-Type: application/json
+
+{
+  "roomId": "nearby",
+  "roomToken": "",
+  "peerId": "web-12345678",
+  "displayName": "网页设备"
+}
 ```
 
-该端点无 JWT。每个参数只取第一个值，去除首尾空白后使用：
+`roomId`、`peerId`、`displayName` 最大 120 个 Java UTF-16 code unit，`roomToken` 最大 512；值会 trim 并在
+surrogate pair 边界安全截断。服务端在签发阶段完成房间 Token、角色和来源地址校验，返回：
 
-| 参数 | 缺省值 | 最大 Java `String.length()` |
-| --- | --- | ---: |
-| `roomId` | `nearby` | 120 |
-| `roomToken` | 空 | 512 |
-| `peerId` | 自动生成 `web-` + 8 个 UUID 字符 | 120 |
-| `displayName` | `web` | 120 |
+```json
+{"ticket":"random-base64url","expiresAt":"2026-07-21T00:00:45Z"}
+```
 
-超过上限的查询参数按 UTF-16 code unit 截断，不拒绝握手；若截断点落在补充字符的 surrogate pair 中间，
-回退一个 code unit，不产生未配对 surrogate。`roomToken` 不会回显或持久化明文。
+ticket 有效期 45 秒，绑定 `public-transfer` scope、房间属性和来源地址，只能原子消费一次。响应必须设置
+`Cache-Control: no-store`。
+
+WebSocket Upgrade 只能携带单个 ticket：
+
+```text
+/ws/public-transfer/discovery?ticket=<one-time-ticket>
+```
+
+`roomToken`、房间 owner/invite Token 和其他 Bearer 凭据不得出现在 Upgrade URL。缺失、过期、重用、scope 不符或
+来源地址不符时在升级前返回 `403`。
 
 ### 2.2 来源地址与房间隔离
 
@@ -143,8 +156,8 @@ roomToken 为空: roomKey = "public:" + publicAddress
 首次使用某个 `roomId + roomToken` 时，Java server 创建持久房间，并把该 Token 的 SHA-256 哈希登记为房主凭证；
 明文 Token 不持久化。以后房主 Token 解析为 `OWNER`，房主签发且未撤销的邀请 Token 按其记录解析为 `EDITOR` 或
 `VIEWER`，三者都通过相同 `persistentRoomId` 加入同一分组。已撤销或已过期的邀请必须返回 `403`，不能回退为新房间的
-房主。普通未知高熵 Token 仍按旧协议语义创建独立房间，因此升级前已有的房间链接无需迁移，且相同房间名配不同旧 Token
-仍彼此隔离；但未知的 `st-editor-` 或 `st-viewer-` 前缀 Token 必须返回 `403`，防止被删除的邀请创建“影子房主”房间。
+房主。普通未知高熵 Token 首次使用时创建独立房间，相同房间名配不同 Token 仍彼此隔离；但未知的 `st-editor-` 或
+`st-viewer-` 前缀 Token 必须返回 `403`，防止被删除的邀请创建“影子房主”房间。
 未提供 Token 的参与者只有在 `roomId` 与来源地址都相同时才能互见。`sharedRoom` 表示是否使用 Token 房间。
 
 ### 2.3 加入、hello 与 roster
@@ -177,6 +190,7 @@ roomToken 为空: roomKey = "public:" + publicAddress
   "publicAddress": "203.0.113.10",
   "sharedRoom": false,
   "roomRole": "EDITOR",
+  "rosterRevision": 1,
   "connectedAt": "2026-07-10T00:00:00Z"
 }
 ```
@@ -189,6 +203,7 @@ roomToken 为空: roomKey = "public:" + publicAddress
   "roomId": "nearby",
   "publicAddress": "203.0.113.10",
   "sharedRoom": false,
+  "rosterRevision": 1,
   "peers": [
     {
       "peerId": "web-12345678",
@@ -204,6 +219,11 @@ roomToken 为空: roomKey = "public:" + publicAddress
 ```
 
 `peers` 按 `connectedAt` 升序排列。
+
+`displayName` 在所有当前在线公共互传连接中不区分大小写且全局唯一；客户端可通过
+`GET /api/public/transfer/name-availability?clientName=...&excludePeerId=...` 预检，但注册时的原子检查才是最终结果。
+多实例模式的 revision、租约和恢复规则见 [public-transfer-cluster.md](public-transfer-cluster.md)。浏览器必须忽略小于
+当前已应用 `rosterRevision` 的旧 roster；重连后以 hello 后的完整 roster 快照恢复。
 
 ### 2.3.1 房间角色与邀请
 
@@ -288,49 +308,51 @@ POST /api/public/transfer/rooms/pairing-codes/redeem
 有非空 `targetPeerId` 时仅投递给同组目标；目标不存在时静默丢弃。未给目标时广播给同组其他连接，不回送来源连接。
 无效 JSON 返回 `{"type":"error","error":"invalid message"}`，连接保持打开。
 
-#### 2.4.1 浏览器应用消息
+#### 2.4.1 浏览器应用消息 STAP2
 
-浏览器间的同步白板和剪贴板同步复用发现 WebSocket，但应用消息应当优先通过已经建立的 WebRTC
-`RTCDataChannel` 发送。承载应用消息的 DataChannel 必须使用有序、可靠传输；DataChannel 的远端连接身份即为接收处理
-时使用的 `sourcePeerId`。DataChannel 上的文本帧使用以下应用 envelope：
+白板、剪贴板和流程图大更新统一使用 STAP2 二进制应用帧。应用通道为 ordered/reliable
+`RTCDataChannel`，并拆分为 `interactive` 与 `bulk`：高频笔划、光标和剪贴板走 interactive，文件、快照和大 Yjs
+update 走 bulk。接收端必须把 `binaryType` 设置为 `arraybuffer`，文本应用帧属于已删除格式并拒绝。
 
-```json
-{
-  "kind": "app-message",
-  "messageType": "clipboard",
-  "payload": {}
-}
+STAP2 固定头为 72 字节：
+
+| 字段 | 长度 | 说明 |
+| --- | ---: | --- |
+| magic | 4 | ASCII `STAP` |
+| version | 1 | 必须为 `2` |
+| type | 1 | `1=whiteboard`、`2=clipboard`、`3=diagram`、`127=ack` |
+| flags | 2 | bit 0 `ACK_REQUIRED` |
+| messageId | 16 | 随机二进制 ID |
+| chunkIndex | 4 | 从 0 开始 |
+| chunkCount | 4 | `1..2048` |
+| totalLength | 4 | 完整 body 长度，最大 8 MiB |
+| payloadLength | 4 | 当前 chunk 长度 |
+| sha256 | 32 | 完整 body 摘要；ACK 时全 0 |
+| payload | N | 当前 chunk |
+
+实际 frame 上限取 `min(48 KiB, RTCSctpTransport.maxMessageSize)`，再扣除 72 字节头。接收端最多同时重组 32 条、
+总预留不超过 16 MiB，15 秒无进展即清理。重复 chunk 内容必须相同；总长、chunk 数、hash、flags 或 type 冲突时丢弃
+整条消息。所有长度必须 exact match，不接受尾随字节。
+
+body 以 `encoding(1) + metadataLength(4) + JSON metadata + optional binary` 编码。普通白板/剪贴板使用 JSON；
+`STDG2 diagram-update` 的 Yjs update 直接放 binary 区，不转 Base64。
+
+剪贴板、流程图快照/update、白板 snapshot 和图片对象要求 ACK。ACK 使用 type `127`、同一 messageId、单 chunk、空
+payload 与全 0 hash。发送端只有收到 ACK 才能显示应用层送达；本地 `send()` 成功不等于对端收到。
+
+DataChannel 不可用时，同一个 STAP2 frame 可放入 STWR2 二进制 relay：
+
+```text
+STWR(4) | version=2(1) | flags=0(1) | targetLen(2) | sourceLen(2) |
+appFrameLen(4) | target UTF-8 | source UTF-8 | STAP2 frame
 ```
 
-DataChannel 的对端即为应用消息的隐含目标。对本协议而言，“DataChannel 发送成功”只表示通道处于 `open` 状态且
-本地 `send()` 调用未抛出异常，不表示对端已经收到或处理；没有应用层确认时，发送端不得显示“对方已收到”。
-等待通道打开的超时时间可以由客户端实现决定，但一旦某个事件对某个目标决定走 WebSocket 回退路径，就不得在迟到的
-DataChannel 打开后再次发送同一事件。具有事件标识的应用 payload 应按其自身协议定义去重；`STCLIP1` 的事件身份和
-顺序规则见第 2.4.3 节。
+客户端发送时 `sourceLen` 必须为 0；服务端按已认证 discovery session 填入 sourcePeerId 后定向转发。单个 STWR2
+不超过 64 KiB，peer ID UTF-8 各不超过 512 字节。不得省略目标做应用广播，也不得在 STWR2 成功后再次经迟到的
+DataChannel 发送同一 messageId。
 
-当 `roomId`、`roomToken` 或是否使用共享房间发生变化，使当前房间分组作用域改变时，客户端必须关闭旧作用域的全部
-`RTCDataChannel`、`RTCPeerConnection` 和发现 WebSocket，取消仍在打开或等待中的直连任务，并取消尚未执行或尚未
-完成的 WebSocket 回退任务。异步任务和入站回调执行时必须重新核对其创建时的房间作用域或连接 generation；旧作用域
-事件不得通过新房间的发现 WebSocket 发出，旧 socket 迟到的入站消息也必须忽略。客户端还必须清空旧作用域的剪贴板
-事件、白板事件、笔画和快照，不能让它们在新房间重放或参与新快照。
-
-当 DataChannel 未建立、已关闭或在客户端规定的等待时间内不可用时，发送方可以回退到发现 WebSocket。回退消息使用
-第 2.4 节的通用 envelope，客户端发送 `type`、非空 `targetPeerId` 和 `payload`，服务端补入可信的
-`sourcePeerId` 后仅转发给同组目标。例如：
-
-```json
-{
-  "type": "clipboard",
-  "targetPeerId": "web-87654321",
-  "payload": {}
-}
-```
-
-`whiteboard` 与 `clipboard` 应用消息必须定向发送；需要同步给多台设备时，发送方必须为每个目标分别发送一条消息，
-不得省略 `targetPeerId` 使用房间广播。DataChannel 发送成功后不得再发送同一事件的 WebSocket 回退消息。旧客户端必须
-忽略不认识的 `messageType`、`type` 或 payload 版本，以保持向后兼容。发现服务端保持第 2.4 节的通用转发行为，
-不会按应用类型拒绝缺少目标的消息；因此接收端必须忽略 `targetPeerId` 为空或不等于自身 peer ID 的 `whiteboard`、
-`clipboard` WebSocket envelope。
+当 room scope 变化时，客户端必须关闭旧 DataChannel/PeerConnection/discovery socket，清空重组与 ACK 状态并取消
+所有旧 generation 的待发送任务。任何迟到回调都必须重新核对 room generation。
 
 同步白板使用 `messageType: "whiteboard"` 或 WebSocket `type: "whiteboard"`，payload 版本标记为 `STWB1`。
 当前定义的白板事件种类为 `stroke-start`、`stroke-points`、`stroke-end`、`remove-stroke`、`object-upsert`、
@@ -340,7 +362,7 @@ DataChannel 打开后再次发送同一事件。具有事件标识的应用 payl
 白板图片在发送前必须缩放并编码为 JPEG data URL，完整 `dataUrl` 不超过 `48 KiB` 个 UTF-16 code unit，为 WebSocket
 回退 envelope 和对象元数据预留第 2.5 节的消息空间。接收端只能接受 `data:image/jpeg;base64,`，不得加载远程图片 URL。
 新成员加入时，现有成员可先发送笔画 `snapshot`，再以独立 `object-upsert` 事件补发最近的对象，避免多张内联图片合并后
-超过单消息上限。未知对象种类或未知事件种类必须忽略，以兼容只支持笔画的旧页面。
+超过单消息上限。未知对象种类或未知事件种类必须忽略，但未知 STAP 版本、type 或非法长度必须拒绝整个 frame。
 
 白板笔画、对象、实时 Yjs 更新和去重状态只保存在参与浏览器的当前内存中，发现服务端只做临时转发。专业流程图可以由
 OWNER 或 EDITOR 显式创建持久版本，但服务端不会自动持久化每次实时编辑。
@@ -360,76 +382,64 @@ POST /api/public/transfer/rooms/diagram/versions/{versionId}/delete
 50 个版本，超出时删除最旧版本。OWNER 和 EDITOR 可以创建、读取和恢复版本；VIEWER 只能读取版本元数据与内容但不能
 恢复为当前文档；只有 OWNER 可以删除版本。无 Token 的内网房间继续使用浏览器会话内快照，最多 20 个。
 
-#### 2.4.3 剪贴板文本 `STCLIP1`
+#### 2.4.3 剪贴板 `STCLIP2`
 
-剪贴板同步只传输用户在已开启的剪贴板模块中主动粘贴的 `text/plain`，或者用户输入、编辑文本后明确点击“同步”触发的
-内容；普通输入事件不得自动发送。除读取用户触发的 paste 事件所携带数据外，客户端不得在后台轮询、监听或主动读取
-系统剪贴板，也不得把 `text/html` 剪贴板格式作为富文本同步；纯文本中即使包含标记，也必须按普通文本安全展示。
-DataChannel 使用 `messageType: "clipboard"`，WebSocket 回退使用
-`type: "clipboard"`。`STCLIP1` payload 为：
+剪贴板模块支持文本、富文本、HTTP(S) 链接和文件。用户在模块内粘贴时直接发送给已选择设备，不需要额外“开启同步”
+按钮；显式点击“读取系统剪贴板”时可使用 Clipboard API 读取浏览器获准访问的内容。不得后台轮询系统剪贴板。
+
+文件不嵌入剪贴板 payload，而是转交文件传输通道；文本/HTML/链接使用 STAP2 type `2` 承载以下严格 JSON：
 
 ```json
 {
-  "type": "STCLIP1",
-  "kind": "text",
-  "id": "clip-7f2e4c6a",
-  "sessionId": "67f33d8c-52c0-4e52-92f8-5166e5511052",
+  "type": "STCLIP2",
+  "kind": "html",
+  "id": "67f33d8c-52c0-4e52-92f8-5166e5511052",
+  "sessionId": "4d8a3cf5-aeb8-4b27-ae91-d0d2f60e8b27",
   "sequence": 1,
-  "text": "需要同步的文本",
-  "createdAt": 1780000000000
+  "text": "Hello",
+  "createdAt": 1780000000000,
+  "html": "<b>Hello</b>"
 }
 ```
 
-字段语义：
-
 | 字段 | 规则 |
 | --- | --- |
-| `type` | 必须为 `STCLIP1`；未知版本必须忽略 |
-| `kind` | 当前必须为 `text` |
-| `id` | 发送方生成的字符串事件 ID，长度为 `1..128` 个 UTF-16 code unit，且 JavaScript `trim()` 后必须保持不变；在同一发送方和 `sessionId` 内必须唯一 |
-| `sessionId` | 当前浏览器房间会话的字符串 ID，适用与 `id` 相同的 `1..128` 长度和首尾空白规则；切换房间时必须重新生成 |
-| `sequence` | 非负 JavaScript 安全整数；发送方在同一 `sessionId` 内必须单调递增 |
-| `text` | 原样同步的非空纯文本；必须同时满足不超过 `16,384` 个 UTF-16 code unit，且 UTF-8 编码不超过 `32 KiB` |
-| `createdAt` | 非负 JavaScript 安全整数，表示发送方生成事件时的 Unix epoch 毫秒数；只用于展示，不作为授权或可信排序依据 |
+| `type` | 必须精确为 `STCLIP2`；STCLIP1 拒绝 |
+| `kind` | `text`、`html` 或 `link` |
+| `id` | `1..128` code unit，trim 后不变，当前 session 内唯一 |
+| `sessionId` | `1..128` code unit；切换 room scope 时重新生成 |
+| `sequence` | 非负 JavaScript 安全整数，同 session 单调递增 |
+| `text` | 非空；text/html 的可读文本，或 link 的完整 HTTP(S) URL |
+| `createdAt` | 非负 JavaScript 安全整数，仅用于展示 |
+| `html` | kind=html 时为非空 sanitized source；其他 kind 必须为 null |
 
-payload 必须是普通 JSON object，且必须恰好包含上述七个字段；缺少字段或存在未知附加字段都视为不合规事件。接收方
-必须校验每个字段的 JSON 类型和约束，按 `(sourcePeerId, sessionId, id)` 去重，并为每个 `(sourcePeerId, sessionId)`
-记录已接受的最高 `sequence`；`sequence` 小于或等于该值的迟到或重放事件必须忽略。未来增加字段时必须使用新的
-payload `type` 版本，不得在 `STCLIP1` 中直接追加字段。上述括号表达的是无歧义 tuple；协议不规定用冒号拼接成字符串，
-实现选择字符串 event key 时必须使用不会因字段内容产生碰撞的编码。
+payload 必须恰好包含上述八个字段。`text.length + html.length <= 32,768`，两者 UTF-8 字节总和不超过 48 KiB。
+发送与接收都必须重复校验。接收端按 `(sourcePeerId, sessionId, id)` 去重，并拒绝同 session 中 sequence 不递增的事件。
 
-发送方必须在发送前执行两项 `text` 大小检查；任一超限都不得发送。接收方必须重复校验 payload 类型和两项大小上限，
-不合规事件应静默忽略。`16,384` code unit 与 `32 KiB` 是原始 `text` 的剪贴板应用层限制，用于为 JSON 和转发
-envelope 预留空间，但不替代第 2.5 节的完整消息上限。控制字符等内容经 JSON 转义后可能膨胀；使用 WebSocket 回退前，
-发送方还必须确认完整序列化消息不超过 `65,536` 个 UTF-16 code unit，超限时不得走 WebSocket 回退路径。
+接收后可 best-effort 写入系统剪贴板：富文本优先通过 `ClipboardItem` 同时写 `text/plain` 与 `text/html`，否则退为
+`writeText`。只有 Promise 成功后才能显示“已写入系统剪贴板”；权限拒绝或 1.5 秒等待超时后保留内存收件项并提供用户
+触发的复制操作。Clipboard API 不支持取消，迟到的旧写入完成后必须恢复最新一次成功写入，不能覆盖更新内容。
 
-接收端只有在用户为当前会话开启剪贴板同步后，才可以尝试调用 `navigator.clipboard.writeText(text)` 自动写入系统剪贴板。
-自动写入是 best-effort：它要求安全上下文，并且浏览器仍可能因为权限或缺少瞬时用户操作而拒绝。客户端必须等待写入
-`Promise` 成功后才能显示“已同步到剪贴板”；失败时必须保留一条内存态收件记录并提供由用户点击触发的“复制”操作，
-不得把“消息已收到”表述为“已写入剪贴板”。API 不存在、调用同步抛出异常或 `Promise` rejection 都属于自动写入失败。
-客户端可以把长时间未 settle 的写入视为超时失败，但必须解除本地写入占用、停止自动重试同一事件，并允许用户重新点击
-“复制”；由于 Clipboard API 不支持取消，迟到完成的旧写入不得最终覆盖客户端随后已成功写入的更新内容。
-
-剪贴板事件、收件历史、写入状态和去重集合只能保存在浏览器当前内存中，刷新页面或切换房间时必须清空；不得写入
-`localStorage`、`sessionStorage`、`IndexedDB` 或附件存储。发现服务端只在处理消息时短暂持有并转发 payload，不把
-剪贴板内容写入数据库、对象存储或任何级别的应用日志。
+剪贴板收件历史最多 80 项，只保存在当前浏览器内存；切换 room scope 或刷新时清空。服务端仅路由 STAP2/STWR2 frame，
+不记录剪贴板正文。文件遵循文件直连/TURN/OSS 流程与对应权限、进度和大小限制。
 
 ### 2.5 消息大小与限流
 
 应用层单条文本上限为 `65,536` 个 Java UTF-16 code unit；超过上限以 close code `1009` 关闭。Java WebSocket
 session 的文本/二进制容器 limit 显式设为 `65,536`；按 UTF-8 字节聚合 frame 的实现必须给文本预留足够空间
-（当前 Go/.NET 使用 `3 × 65,536` 字节），解码后再按 UTF-16 code unit 执行同一应用层检查。本端点只定义 JSON
-文本消息；二进制消息不是协议输入，必须像 Java `TextWebSocketHandler` 一样以 close code `1003` 拒绝。
+（当前 Go/.NET 使用 `3 × 65,536` 字节），解码后再按 UTF-16 code unit 执行同一应用层检查。文本只允许信令与
+ping；二进制只允许合法 STWR2 + STAP2。其他二进制 frame 以 close code `1008` 拒绝。
 
-每连接使用进程内固定窗口限流，默认每 `60` 秒 `360` 条，配置值都按至少 `1` 处理。`ping`、无效 JSON 和普通信令
-以及经发现 WebSocket 回退的 `whiteboard`、`clipboard` 应用消息都先计数；DataChannel 应用消息不经过服务端，
+每个 `groupId + peerId` 使用固定窗口限流，默认每 `60` 秒 `360` 条，配置值都按至少 `1` 处理。单实例模式在进程内
+计数，集群模式通过 Redis 原子共享。`ping`、无效 JSON 和普通信令
+以及经发现 WebSocket relay 的 STWR2 应用 frame 都先计数；DataChannel 应用消息不经过服务端，
 不计入该窗口。超限时发送：
 
 ```json
 {"type":"error","error":"rate limited"}
 ```
 
-随后以 close code `1008` 关闭。多实例部署时该限额按实例数放大。
+随后以 close code `1008` 关闭。集群模式 Redis 不可用时连接失败关闭，不得退回单机计数。
 
 ## 3. 附件 REST
 
@@ -510,8 +520,8 @@ Java、Go 和 .NET 必须按以下顺序执行同一算法；长度均指规范�
 - 同一 `roomToken` hash 的 `PENDING` 附件：默认最多 `50` 个。
 
 两项配置都按至少 `1` 处理。来源 IP 的取值与发现握手一致；IP 窗口计数表最多跟踪 `100,000` 个来源，满后拒绝新来源，
-并每 10 分钟清理过期窗口。该 IP 计数表是进程内状态，多实例不会形成全局精确限流；房间 `PENDING` 配额则查询附件
-持久化表，使用共享数据库部署时按共享数据形成全局计数，不能把它描述为进程内计数器。
+并每 10 分钟清理过期窗口。集群模式的来源 IP 窗口由 Redis 原子共享，不使用本地容量表；房间 `PENDING` 配额查询附件
+持久化表，使用共享数据库部署时按共享数据形成全局计数。
 
 Java 的检查顺序是来源 IP 限流、房间 `PENDING` 配额、对象存储启用状态。因此前两项已经超限时，即使对象存储关闭也
 返回 `429` 而不是 `409`。上传 URL 过期本身不会把记录移出 `PENDING`；它会继续占用房间配额，直至附件保留期扫描
@@ -582,7 +592,7 @@ PENDING --complete / verified OSS callback--> UPLOADED --expiration scan--> EXPI
 `UPLOADED`、`uploadedAt` 和 `updatedAt`。
 
 Java 当前只在对象存储启用时执行 complete 的 HEAD；若运行中关闭存储，已存在的 `PENDING` 记录会跳过 HEAD 后转为
-`UPLOADED`。这是现有状态机的兼容边界，不代表禁用实现具有附件数据面；C server 仍按第 6 节对六个路径明确返回 `409`。
+`UPLOADED`。这是运行中关闭存储时的状态机边界，不代表禁用实现具有附件数据面；C server 仍按第 6 节对六个路径明确返回 `409`。
 
 下载只允许 `UPLOADED` 且未超过附件保留期限的记录。成功响应为：
 
@@ -708,10 +718,10 @@ OSS V4 签名协议要求 TTL 为正数且最长 7 天，因此上传和直达�
 
 C server 不是本协议的数据面完整实现：
 
-- C 进程不监听 STUN/TURN UDP；公共 ICE 只有在显式配置外部兼容服务时才可以公布该服务，不能根据请求 Host
+- C 进程不监听 STUN/TURN UDP；公共 ICE 只有在显式配置外部 STUN/TURN 服务时才可以公布该服务，不能根据请求 Host
   伪装成本进程提供了 STUN/TURN；
 - C 不实现 `/ws/public-transfer/discovery`；
-- C 没有对象存储抽象，六个附件路径不得返回占位成功 URL，必须明确返回 `409 Conflict`。当前兼容响应为：
+- C 没有对象存储抽象，六个附件路径不得返回占位成功 URL，必须明确返回 `409 Conflict`。响应为：
 
 ```json
 {

@@ -1,0 +1,217 @@
+name: Protocol v2
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/protocol-v2.yml"
+      - "apps/admin-web/**"
+      - "implementations/c/**"
+      - "implementations/csharp/**"
+      - "implementations/go/**"
+      - "implementations/java/**"
+      - "protocol/**"
+      - "tools/loadtest/**"
+      - "pom.xml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/protocol-v2.yml"
+      - "apps/admin-web/**"
+      - "implementations/c/**"
+      - "implementations/csharp/**"
+      - "implementations/go/**"
+      - "implementations/java/**"
+      - "protocol/**"
+      - "tools/loadtest/**"
+      - "pom.xml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-transfer-cluster:
+    name: Public transfer cluster (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [java, go, dotnet]
+    env:
+      TUNNEL_TEST_REDIS_URI: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        if: matrix.runtime == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Test Java cluster protocol
+        if: matrix.runtime == 'java'
+        run: >-
+          mvn -pl implementations/java/server -am
+          -DskipTests=false
+          -Dtest=PublicTransferCoordinationRedisIT,PublicTransferClusterFrameTests,ConnectionEventsWebSocketHandlerTests
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dtunnel.server.web.skip=true
+          test
+
+      - name: Set up Go
+        if: matrix.runtime == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/server/go.mod
+          cache-dependency-path: implementations/go/server/go.sum
+
+      - name: Test Go cluster protocol
+        if: matrix.runtime == 'go'
+        working-directory: implementations/go/server
+        run: >-
+          go test ./internal/server ./internal/wsevents
+          -run 'Test(PublicTransfer(CoordinationAcrossRedisInstances|ClusterFrameMatchesCanonicalVector)|HubPublishesAndDeliversClusterManagementEvents)'
+          -count=1
+
+      - name: Set up .NET 10
+        if: matrix.runtime == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Test .NET cluster protocol
+        if: matrix.runtime == 'dotnet'
+        run: >-
+          dotnet test
+          implementations/csharp/server/tests/ShuaiTunnel.IntegrationTests/ShuaiTunnel.IntegrationTests.csproj
+          -p:TunnelServerWebSkip=true
+          -p:NuGetAudit=false
+          --filter "FullyQualifiedName~PublicTransferCoordinationRedisTests|FullyQualifiedName~PublicTransferClusterFrameTests"
+          --verbosity minimal
+
+  c-linux:
+    name: C server (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refresh package metadata
+        run: sudo apt-get update
+      - name: Install native dependencies
+        run: sudo apt-get install -y cmake build-essential zlib1g-dev libsqlite3-dev
+      - name: Configure
+        run: cmake -S implementations/c/server -B build/c-server -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/c-server --parallel
+      - name: Test
+        run: ctest --test-dir build/c-server --output-on-failure
+
+      - name: Validate netem helper
+        run: bash -n tools/loadtest/netem-profile.sh
+
+  admin-web:
+    name: Admin web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+      - name: Install dependencies
+        working-directory: apps/admin-web
+        run: npm ci
+      - name: Test
+        working-directory: apps/admin-web
+        run: npm test
+      - name: Build
+        working-directory: apps/admin-web
+        run: npm run build
+
+  android:
+    name: Android protocol client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Test and assemble
+        working-directory: implementations/android/client
+        run: ./gradlew test assembleDebug --no-daemon
+
+  benchmark-builds:
+    name: Protocol benchmark (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [java, go, dotnet]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        if: matrix.runtime == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build Java JMH benchmark
+        if: matrix.runtime == 'java'
+        run: >-
+          mvn -pl implementations/java/client -am
+          -Ppeer-mesh-benchmark
+          -DskipTests
+          package
+
+      - name: Set up Go
+        if: matrix.runtime == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: implementations/go/client/go.mod
+          cache-dependency-path: implementations/go/client/go.sum
+
+      - name: Run Go codec benchmark smoke test
+        if: matrix.runtime == 'go'
+        working-directory: implementations/go/client
+        run: >-
+          go test ./internal/client
+          -run '^$'
+          -bench BenchmarkPeerDataFrameCodec
+          -benchmem
+          -benchtime 100ms
+
+      - name: Build TCP capacity helper
+        if: matrix.runtime == 'go'
+        run: go build -o /tmp/tcp-stream-load ./tools/loadtest/tcp_stream_load.go
+
+      - name: Set up .NET 10
+        if: matrix.runtime == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build .NET BenchmarkDotNet project
+        if: matrix.runtime == 'dotnet'
+        run: >-
+          dotnet build
+          implementations/csharp/client/benchmarks/ShuaiTunnel.Client.Benchmarks/ShuaiTunnel.Client.Benchmarks.csproj
+          -c Release
+          -p:NuGetAudit=false
+          --verbosity minimal

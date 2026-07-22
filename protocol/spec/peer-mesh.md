@@ -27,6 +27,11 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 | `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
 | `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation 有效期 |
 | `tunnel.peer-mesh.relay-min-port` / `relay-max-port` | `TUNNEL_PEER_MESH_RELAY_MIN_PORT` / `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | `49152` / `65535` | TURN relay UDP 分配端口范围 |
+| `tunnel.peer-mesh.relay-worker-threads` | `TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` | `0` | relay 发送 worker 数；`0` 按 CPU 自动计算 |
+| `tunnel.peer-mesh.relay-worker-queue-capacity` | `TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | `10000` | relay 发送有界队列容量 |
+| `tunnel.peer-mesh.udp-receive-buffer-bytes` | `TUNNEL_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的接收缓冲区 |
+| `tunnel.peer-mesh.udp-send-buffer-bytes` | `TUNNEL_PEER_MESH_UDP_SEND_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的发送缓冲区 |
+| `tunnel.peer-mesh.udp-traffic-class` | `TUNNEL_PEER_MESH_UDP_TRAFFIC_CLASS` | `16` | UDP `IP_TOS` / traffic class；平台不支持时降级继续运行 |
 | `tunnel.peer-mesh.turn-auth-required` | `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | 是否要求 TURN 长期凭证认证 |
 | `tunnel.peer-mesh.turn-realm` | `TUNNEL_PEER_MESH_TURN_REALM` | `shuai-tunnel` | TURN realm |
 | `tunnel.peer-mesh.turn-shared-secret` | `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` | 空 | TURN credential 派生密钥；留空时使用本进程随机密钥 |
@@ -162,7 +167,8 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
       "address": "192.168.1.10",
       "port": 51000,
       "priority": 100,
-      "foundation": "host-192.168.1.10"
+      "foundation": "host-192.168.1.10",
+      "addressFamily": "IPv4"
     },
     {
       "type": "srflx",
@@ -170,7 +176,8 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
       "address": "58.41.26.74",
       "port": 1132,
       "priority": 90,
-      "foundation": "srflx"
+      "foundation": "srflx",
+      "addressFamily": "IPv4"
     },
     {
       "type": "relay",
@@ -179,7 +186,8 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
       "port": 49152,
       "priority": 10,
       "foundation": "relay",
-      "relayId": "allocation-id"
+      "relayId": "allocation-id",
+      "addressFamily": "IPv4"
     }
   ]
 }
@@ -189,9 +197,13 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
 
 | 类型 | 说明 |
 | --- | --- |
-| `host` | 本机非 loopback、非 link-local IPv4 地址 |
-| `srflx` | 通过标准 STUN Binding 获得的公网映射地址 |
+| `host` | 本机非 loopback、非 link-local 的 IPv4 或全局 IPv6 地址 |
+| `srflx` | 通过标准 STUN Binding 获得的 IPv4/IPv6 公网映射地址 |
 | `relay` | 通过标准 TURN Allocate 获得的 relay allocation |
+
+客户端会枚举 STUN 域名的全部 A/AAAA 结果并逐一探测；候选按 `priority` 降序检查，默认全局 IPv6
+host、IPv4 host、IPv6 srflx、IPv4 srflx 的 priority 分别为 `1200`、`1000`、`900`、`800`。
+Peer 数据面固定使用 SPM2，不提供旧帧协商或降级。
 
 ### `session-grant`
 
@@ -271,7 +283,7 @@ relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不
 `ENDPOINT_INDEPENDENT`、`ADDRESS_DEPENDENT`、
 `ADDRESS_AND_PORT_DEPENDENT`、`UNKNOWN`；过滤探测还可能上报
 `UNSUPPORTED`。`natBehaviorDiscovery` 为 `RFC5780` 或 `BASIC`。
-`natType` 保留为旧客户端和路径策略使用的兼容标签。
+`natType` 是供 UI 和路径策略使用的汇总标签；精确判断以 mapping/filtering 字段为准。
 
 ### `close`
 
@@ -316,8 +328,10 @@ STUN/TURN 控制消息使用标准的二进制 STUN 头、magic cookie、transac
 | Allocate Request / Success | client <-> server | `REQUESTED-TRANSPORT=UDP`、`XOR-RELAYED-ADDRESS`、`XOR-MAPPED-ADDRESS`、`LIFETIME` |
 | Refresh Request / Success | client <-> server | 刷新或释放 allocation |
 | Create Permission Request / Success | client <-> server | 为目标 relay endpoint 建立短期 permission |
+| ChannelBind Request / Success | client <-> server | 将 `0x4000..0x7FFF` channel number 绑定到已授权 peer endpoint |
 | Send Indication | client -> server | `XOR-PEER-ADDRESS` + `DATA`，承载加密 peer frame |
 | Data Indication | server -> client | `XOR-PEER-ADDRESS` + `DATA`，承载加密 peer frame |
+| ChannelData | client <-> server | `channelNumber + length + payload + 4-byte padding`，作为绑定后的低开销数据路径 |
 
 TURN 认证默认开启。登录响应下发 `iceUsername`、`iceCredential`、`iceRealm` 和 `iceNonce`；
 受保护请求携带 `USERNAME`、`REALM`、`NONCE` 和 `MESSAGE-INTEGRITY`。认证失败使用标准错误响应，
@@ -356,6 +370,9 @@ permission。未配置 `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` 时服务端使用�
 `type=check-response` 使用相同字段并回显 `nonce`、session 和双方 client ID。接收方同时校验
 session、token、目标 client ID 和时间窗口。
 
+公网 UDP 接收路径在 JSON 解析前执行长度、首尾字符和 magic 预检，使用无异常日志的专用解析入口；
+probe 按来源地址和全局窗口限速。非法包只进入聚合计数，不逐包输出异常栈。
+
 ### NAT 类型判断
 
 完整 RFC 5780 服务使用两个公网 IP 和同一对 UDP 端口：
@@ -369,8 +386,8 @@ session、token、目标 client ID 和时间窗口。
 - `RESPONSE-ORIGIN` 必须等于实际响应源；`OTHER-ADDRESS` 始终是相对请求目标的另一 IP + 另一端口，
   不随 `CHANGE-REQUEST` 标志改变。
 
-只有一个公网 IP 时，服务端不插入 `OTHER-ADDRESS`，并对 `CHANGE-REQUEST` 返回
-`420 Unknown Attribute`。项目兼容模式仍可用双端口收集额外映射观察，但不能据此宣称完整 RFC 5780 分类。
+只有一个公网 IP 时，服务端不插入 `OTHER-ADDRESS`，并对无法满足的 `CHANGE-REQUEST` 返回
+`420 Unknown Attribute`。单 IP 双端口只能收集额外映射观察，不能据此宣称完整 RFC 5780 分类。
 独立 STUN 进程的构建和部署见 `implementations/java/stun-server` 与
 `deploy/stun-server/systemd`。
 
@@ -378,7 +395,7 @@ session、token、目标 client ID 和时间窗口。
 
 客户端从 Linux TUN、Windows Wintun 或 macOS utun 读取原始 IPv4 packet，按目的虚拟 IP 找到 peer session，再封装为 AES-GCM 加密帧通过 UDP 发送。
 
-密钥派生：
+基础 session key 派生：
 
 ```text
 sharedSecret = X25519(localPrivateKey, remotePublicKey)
@@ -387,30 +404,77 @@ prk = HMAC_SHA256(salt, sharedSecret)
 aesKey = HKDF-Expand(prk, "shuai-peer-mesh/aes-gcm/v1", 32)
 ```
 
-数据帧头：
+每个授权 session 都产生新的 `sessionId + token`，它们构成数据面的 key epoch。服务端不得复用已关闭或
+过期的 session；客户端重启后必须申请新 session，不能在旧 key 下把 sequence 重置为 1。
+
+### SPM2 帧
 
 | 字段 | 长度 | 说明 |
 | --- | --- | --- |
-| `magic` | 4 字节 | `0x53504D31`，ASCII `SPM1` |
-| `version` | 1 字节 | 当前 `1` |
-| `type` | 1 字节 | 当前 `1` 表示数据帧 |
+| `magic` | 4 字节 | `0x53504D32`，ASCII `SPM2` |
 | `sessionId` | 8 字节 | peer session ID |
-| `fromClientId` | 8 字节 | 发送方客户端 ID |
-| `toClientId` | 8 字节 | 接收方客户端 ID |
-| `sequence` | 8 字节 | 单 session 出站递增序号 |
-| `nonce` | 12 字节 | AES-GCM nonce，随机生成 |
-| `ciphertextLength` | 4 字节 | 密文字节数 |
-| `ciphertext` | N 字节 | AES-GCM 密文和 tag |
+| `sequence` | 8 字节 | 当前方向从 1 开始的单调递增计数器 |
+| `ciphertext` | N 字节 | AES-GCM 密文，末尾含 16 字节 tag |
 
-AAD 是从 `magic` 到 `nonce` 的完整头部。接收方校验：
+固定开销为 `20 + 16 = 36` 字节。UDP datagram 自带总长度，因此不重复携带 ciphertext length。发送方和
+接收方身份来自已认证 session；TURN relay 还把 allocation 绑定到登录 client/session，不能仅信任帧内字段。
 
-- magic/version/type 正确。
+方向 traffic key 与 nonce 派生为：
+
+```text
+sessionBytes = uint64_be(sessionId)
+trafficPrk = HMAC_SHA256(sessionBytes, aesKey)
+trafficInfo = ASCII("shuai-peer-mesh/spm2/aes-gcm\n"
+                    + sessionId + "\n" + fromClientId + "\n" + toClientId)
+T1 = HMAC_SHA256(trafficPrk, trafficInfo || 0x01)
+trafficKey = T1[0..31]
+T2 = HMAC_SHA256(trafficPrk, T1 || trafficInfo || 0x02)
+nonce = T2[0..3] || uint64_be(sequence)
+```
+
+完整 20 字节头作为 AAD。`fromClientId -> toClientId` 参与 traffic key 派生，因此两个方向不会共享
+key/nonce 空间。sequence 不允许为 0 或回绕，达到有符号 64 位上限前必须申请新 session。
+
+接收方必须校验：
+
+- magic 必须为 SPM2，帧总长位于 `36..65535`，且整个 datagram 被精确消费。
 - `sessionId` 等于期望 session。
-- `toClientId` 等于当前客户端。
 - AES-GCM tag 通过。
-- `sequence` 通过 64 位滑动窗口，重复包和窗口外旧包拒绝。
+- `sequence` 通过 4096 项滑动窗口，重复包和窗口外旧包拒绝。
+- session 未过期，来源 endpoint 或 TURN allocation 已绑定到该 session 的对端身份。
 
-明文是完整 IPv4 packet。接收方解密后写入 TUN/Wintun。
+Java 使用线程本地 AES-GCM `Cipher`，避免每包执行 provider lookup；各客户端缓存 session 的方向 key。
+共享固定向量位于 `protocol/test-vectors/peer-mesh-spm2.json`。
+
+明文可以是完整 IPv4 packet 或带独立 magic 的 peer 应用消息。IPv4 packet 解密后写入
+TUN/Wintun；应用消息交给客户端消息 codec。
+
+### SPMTU2 路径 MTU 探测
+
+路径 MTU 消息作为 SPM2 的加密明文发送，因此 probe/ack 都继承 session 身份、方向 key、sequence、
+replay 和 AES-GCM 认证。明文格式：
+
+| 字段 | 长度 | 说明 |
+| --- | ---: | --- |
+| magic | 6 | ASCII `SPMTU2` |
+| type | 1 | `1=probe`，`2=ack` |
+| nonce | 8 | 正数，big-endian |
+| innerMtu | 2 | `576..9000`，big-endian |
+| padding | 可变 | 仅 probe 存在，零填充到恰好 `innerMtu` 字节 |
+
+ack 必须恰好 17 字节；probe 必须恰好等于声明的 `innerMtu`。未知 type、错误长度、越界 MTU、尾随
+字节或零 nonce 均丢弃。
+
+- 直接路径 cache key 为 `direct|remoteEndpoint`，relay 路径为 `relay|allocationId`。
+- cache TTL 为 10 分钟，路径变化立即使用独立状态。
+- 从配置 MTU 开始探测，每个尺寸最多发送 3 次；超时后以 576 为下界做二分搜索。
+- 首次丢失后立即使用保守的已知上限，不能继续发送超过当前有效 MTU 的 IP 包。
+- IPv4 TCP SYN 的 MSS 最多为 `pathMtu - IPv4HeaderLength - 20`，下限 536；修改后重算 TCP checksum。
+- 超过有效 MTU 的 IPv4 包不发送，向本地虚拟网卡回注 ICMP Destination Unreachable code 4，并携带
+  next-hop MTU 和原 IPv4 header + 8 字节。
+
+共享向量位于 `protocol/test-vectors/peer-path-mtu-v2.json`。Java、Go、.NET 和 Android 均实现该协议；
+C 仅提供服务端，不参与客户端路径 MTU 探测。
 
 ## direct 与 relay
 
@@ -422,19 +486,44 @@ AAD 是从 `magic` 到 `nonce` 的完整头部。接收方校验：
 4. direct 尚不可用时继续申请/探测 TURN allocation，relay 目标建立后按第 1 条发送。
 
 服务端 relay 处理 TURN `Send Indication` 中的加密帧时，会解析帧头并调用
-`PeerMeshService.authorizeRelayFrame`：
+`PeerMeshService.authorizeRelayFrameForRelay`：
 
 - session 必须存在。
 - session 未过期。
 - session 状态必须为 `ACTIVE`。
-- `fromClientId` / `toClientId` 必须匹配 session 的 source/target。
+- 来源和目标 TURN allocation 都必须绑定已认证的 client/session，且该 client pair 必须匹配 session 的
+  source/target。
 
 relay 只校验头部和授权，不解密业务明文。
+带 `SPM2` magic 但结构或严格长度校验失败的数据必须直接丢弃，不能退化成普通 TURN payload
+绕过 session 授权。
 
 初次 relay 建链不会被 `ACTIVE` 条件卡住：客户端先通过 TURN `Send/Data Indication` 转发 JSON
-`PeerUdpProbe` 检查包；它不是 `SPM1` 业务帧，服务端不会对它执行 `authorizeRelayFrame`。检查响应成功后，
-客户端先通过控制连接上报 `path-report(status=ACTIVE, pathType=RELAY)`，随后发送的 `SPM1` 业务帧才满足
+`PeerUdpProbe` 检查包；它不是 SPM2 业务帧，服务端对其执行 session token 授权。检查响应成功后，
+客户端先通过控制连接上报 `path-report(status=ACTIVE, pathType=RELAY)`，随后发送的 SPM2 业务帧才满足
 relay 授权条件。若 `path-report` 未到达，业务帧会被拒绝。
+
+TURN 为 Peer Mesh 专用模式：CreatePermission、ChannelBind、Send Indication 和 ChannelData 都必须落在
+已授权 peer session 上，不允许把该 listener 当作通用任意目标 TURN relay。ChannelData 绑定有效时优先使用；
+绑定建立前或刷新期间使用 Send/Data Indication。
+
+Java relay 使用有界 worker 队列；拒绝、发送失败、队列深度和高水位分别暴露为
+`tunnel.peer_mesh.turn.relay.queue.dropped`、`tunnel.peer_mesh.turn.relay.send.failures`、
+`tunnel.peer_mesh.turn.relay.queue.depth`、`tunnel.peer_mesh.turn.relay.queue.high.water`。
+relay 流量先交换到事务批次，提交失败会恢复待写字节，并暴露 flush failure、pending bytes 和 lag 指标。
+
+## 性能基线
+
+Java codec 提供可重复的 JMH 基准，覆盖 SPM2 的 64/512/1200 字节 encode/decode：
+
+```powershell
+mvn -f implementations/java/client/pom.xml -Ppeer-mesh-benchmark package -DskipTests
+java -jar implementations/java/client/target/tunnel-client-1.0.0-SNAPSHOT-benchmarks.jar `
+  PeerDataFrameCodecBenchmark -prof gc -wi 3 -i 5 -f 1
+```
+
+JMH 结果只用于 codec 的 CPU/分配回归；direct/relay 端到端 pps、吞吐、丢包和 socket/队列饱和仍需
+在固定拓扑与包长下单独压测，不能由 microbenchmark 外推生产容量。
 
 ## 虚拟网卡行为
 
@@ -464,8 +553,8 @@ peer 离线、从 roster 消失或虚拟设备停止时会移除对应路由。�
 ## 当前限制
 
 - 内置 STUN/TURN server 只实现本项目使用的方法和 attribute，不等同于完整 coturn 功能集。
-- RFC 5780 当前实现 `CHANGE-REQUEST`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；可选的
-  `RESPONSE-PORT`、`PADDING` 尚未实现。
+- 独立 Java、Go、.NET STUN server 已实现 `CHANGE-REQUEST`、`RESPONSE-ORIGIN`、`OTHER-ADDRESS`、
+  `RESPONSE-PORT` 和有上限的 `PADDING`；内置 TURN 仍只实现本项目需要的子集。
 - Java、Go、.NET client 的 macOS `utun` 数据面仍属于实验性能力。
 - `noop` 模式不会创建虚拟网卡，因此无法通过系统 `ping` / `curl` 访问虚拟 IP。
 - direct 路径依赖双方 UDP 可达；对称 NAT 或严格防火墙下通常会走 relay。

@@ -1,0 +1,15 @@
+{
+  "name": "spm2-basic-directional-key",
+  "comment": "senderKeyEpoch is the sender's per-process random epoch and is mandatory. sessionId/token are reused within the server session TTL and X25519 keys are persisted on disk, so without a fresh epoch a client restart replays the same nonce space under the same AES-GCM key.",
+  "sessionKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "sessionId": 1001,
+  "fromClientId": 11,
+  "toClientId": 22,
+  "senderKeyEpoch": "9f2c41d7a05b4e6890c3157ab2de6f04",
+  "sequence": 7,
+  "plaintextUtf8": "hello spm2",
+  "trafficKeyHex": "b866489896044d5eb46331cd5745f13b106ae956de241aef002d93be1a2b1bcf",
+  "noncePrefixHex": "c5598905",
+  "nonceHex": "c55989050000000000000007",
+  "frameHex": "53504d3200000000000003e9000000000000000761d0a9b146baa1832b72957fbe6b84b41ba3902755be48ca0f0d"
+}

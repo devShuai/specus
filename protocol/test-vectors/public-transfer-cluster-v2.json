@@ -1,0 +1,44 @@
+{
+  "protocol": "STCE",
+  "version": 2,
+  "byteOrder": "big-endian",
+  "headerBytes": 26,
+  "groupIdDerivation": {
+    "roomId": "nearby",
+    "roomKey": "public:203.0.113.8",
+    "groupId": "7e892ef7402583f5900391b5c1af6f0b842574982eadec5d1269710b812af3da"
+  },
+  "canonicalText": {
+    "kind": 2,
+    "excludeSource": true,
+    "revision": 17,
+    "groupId": "0123456789abcdef",
+    "targetPeerId": "peer-b",
+    "sourceLeaseId": "lease-a",
+    "payloadUtf8": "{\"type\":\"signal\"}",
+    "frameHex": "535443450202010000000000000000110010000600070000001130313233343536373839616263646566706565722d626c656173652d617b2274797065223a227369676e616c227d"
+  },
+  "canonicalManagement": {
+    "kind": 4,
+    "excludeSource": false,
+    "revision": 0,
+    "tenantId": "default",
+    "groupId": "37a8eec1ce19687d132fe29051dca629d164e2c4958ba141d5f4133a33f0688f",
+    "targetPeerId": "",
+    "sourceLeaseId": "",
+    "payloadUtf8": "{\"tenantId\":\"default\",\"type\":\"created\",\"connection\":{\"id\":42,\"clientName\":\"Device Alpha\",\"connectedAt\":\"2026-07-22T00:00:00Z\",\"success\":true}}",
+    "frameHex": "535443450204000000000000000000000040000000000000008e333761386565633163653139363837643133326665323930353164636136323964313634653263343935386261313431643566343133336133336630363838667b2274656e616e744964223a2264656661756c74222c2274797065223a2263726561746564222c22636f6e6e656374696f6e223a7b226964223a34322c22636c69656e744e616d65223a2244657669636520416c706861222c22636f6e6e65637465644174223a22323032362d30372d32325430303a30303a30305a222c2273756363657373223a747275657d7d"
+  },
+  "malformed": [
+    "bad magic or version",
+    "unknown kind or flag bit",
+    "non-zero reserved byte",
+    "invalid UTF-8 identity",
+    "empty or oversized group",
+    "oversized identity or payload",
+    "declared length mismatch or trailing bytes",
+    "roster with payload",
+    "binary without targetPeerId",
+    "management with empty payload, target/source identity, revision, or excludeSource"
+  ]
+}

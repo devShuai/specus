@@ -1,214 +1,157 @@
-# HTTP route 直转协议
+# HTTP route 与 WebSocket 流协议
 
-HTTP route 是与 TCP 端口映射并行的能力。公网访问者请求服务端 `/http/{clientName}/{route}/**`，服务端把 HTTP 请求封装成 `DIRECT_HTTP_REQUEST` 走控制连接发给客户端；客户端访问自己内网可达的目标服务，再把响应封装成 `DIRECT_HTTP_RESPONSE` 返回服务端。
+HTTP route 是与 TCP 端口映射并行的数据面能力。公网请求进入服务端
+`/http/{clientName}/{route}/**`，服务端在目标客户端的专用 `data` 连接上建立 NAT stream；客户端再访问
+本机或内网 upstream。
 
-## 公网入口
+本协议只支持控制协议 v2 的流式路径。旧同步 HTTP 与 Direct HTTP command 已删除。
 
-入口路径：
+## 1. 公网入口
 
 ```text
-/http/{clientName}/{route}/**
+ANY /http/{clientName}/{route}/**
 ```
 
-示例：
+- `clientName` 必须对应已启用且在线的客户端；
+- `route` 必须存在、启用并属于该客户端；
+- 后续相对路径保留原始百分号编码；
+- query 使用原始 query string，不执行 decode/re-encode；
+- 普通请求使用 HTTP stream，WebSocket Upgrade 使用同一 NAT stream 上的 SWS2。
 
-```bash
-curl -i "http://127.0.0.1:8088/http/shuaiwin-shshi-fa22b7af/nexus/service/rest/v1/status?pretty=true"
-```
+找不到客户端或活动 `data` 连接时返回 `502`；route 不存在时返回 `404`。请求超时返回 `504`，请求体超过
+配置上限返回 `413`。
 
-路径解析：
+## 2. route 配置
 
-| 部分 | 说明 |
+每条 route 至少包含：
+
+| 字段 | 说明 |
 | --- | --- |
-| `clientName` | 目标客户端名，必须在线 |
-| `route` | 客户端 HTTP route 名称，精确匹配 |
-| `relativePath` | route 后面的路径，最少为 `/` |
-| `rawQuery` | 原始 query string，不含 `?` |
+| `clientId` | 所属客户端 |
+| `route` | URL 中稳定的 route 名 |
+| `targetBaseUrl` | 客户端实际访问的 `http/https/ws/wss` 基础地址 |
+| `enabled` | 是否允许公网访问 |
+| `pathRewriteEnabled` | 是否对可安全缓冲的小型 HTML/CSS 响应执行路径改写 |
 
-`/http/**` 默认是公网流量入口，不要求管理 JWT。真正能访问的内网目标由服务端管理的 HTTP route 白名单决定。
+目标 URI 由 `targetBaseUrl + relativePath + ?rawQuery` 构造。base URL 不能包含 query/fragment，相对路径不能
+含控制字符。HTTP 客户端不自动跟随 redirect，响应原样返回给公网调用方。
 
-## route 配置
+## 3. 请求流
 
-管理 API：
+服务端分配非零 `uint32 streamId`，并在目标客户端 `data` 连接发送 NAT `OPEN`：
 
-| 方法 | 路径 | 说明 |
+```json
+{
+  "source": "http",
+  "phase": "request",
+  "requestId": "123",
+  "method": "POST",
+  "route": "api",
+  "relativePath": "/items/%E4%BD%A0",
+  "rawQuery": "x=%2F",
+  "headers": ["Content-Type:application/json"],
+  "contentLength": 12
+}
+```
+
+`contentLength` 仅在公网请求已知长度时出现。随后发送零到多个 NAT `DATA`，每个 payload 最大 64 KiB；请求
+结束发送 NAT `FIN`，请求 trailers 放在 `FIN.metadata.trailers` 的 `name:value` 字符串数组中。
+
+客户端必须在读取 request DATA 后按实际消费字节发送 `WINDOW_UPDATE`。如果 upstream 无法建立、请求格式无效、
+本地队列超限或服务端取消，任一端发送 `RST(value=errorCode, metadata.reason)` 并释放 stream。
+
+## 4. 响应流
+
+客户端取得 upstream 响应头后立即返回同一 streamId 的 NAT `OPEN`：
+
+```json
+{
+  "source": "http",
+  "phase": "response",
+  "statusCode": 200,
+  "headers": ["Content-Type:text/event-stream"]
+}
+```
+
+响应 body 按到达顺序发送 NAT `DATA`，最后发送 NAT `FIN`；trailers 使用：
+
+```json
+{"trailers":["Digest:sha-256=..."]}
+```
+
+服务端收到响应 OPEN 后即可提交公网响应头，DATA 到达后立即写出并 flush。因此 SSE、流式下载和大响应不需要等待
+完整 body。服务端消费响应 DATA 后回送 WINDOW_UPDATE，客户端必须在 credit 不足时暂停 upstream 读取。
+
+Java 基准实现的请求体上限为 16 MiB，响应体上限为 64 MiB。上限针对完整流，不是单帧；跨语言实现不得通过发送
+多个 DATA 绕过累计限制。
+
+## 5. 流控与状态机
+
+HTTP 使用控制协议定义的统一流控：
+
+- 初始发送窗口 1 MiB；
+- 最大累计窗口 16 MiB；
+- 单流待发送队列上限 4 MiB；
+- 活动流公平轮转，每轮最多发送一个 64 KiB DATA；
+- `WINDOW_UPDATE.value` 必须大于 0，且不能导致窗口溢出；
+- FIN 只关闭当前发送方向；双方 FIN 后 stream 才正常结束；
+- DATA-after-FIN、重复 OPEN、未知 stream 或非法状态转换必须 RST 或关闭违规连接。
+
+公网调用方断开、Servlet/ASP.NET/Go context 取消或超时必须发送 RST。客户端收到 RST 后立即取消 upstream 请求并
+关闭 response body，不继续后台下载。
+
+## 6. Header 规则
+
+以下 hop-by-hop 或由当前连接重新计算的 header 不转发：
+
+```text
+Connection, Content-Length, Host, Keep-Alive, Proxy-Authenticate,
+Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade
+```
+
+其他 header 按 `name:value` 数组保留重复值。公网响应的 Content-Length 由实际输出决定；经过路径改写或解压后必须
+移除旧 Content-Length/Content-Encoding。`Range` 只接受有界的单范围表达式，非法或无界范围不得直接传给 upstream。
+
+## 7. WebSocket SWS2
+
+WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`。建立后，WebSocket frame 放入 NAT DATA 的 SWS2
+二进制 envelope：
+
+| 字段 | 长度 | 说明 |
+| --- | ---: | --- |
+| magic | 4 | ASCII `SWS2` |
+| opcode | 1 | continuation/text/binary/close/ping/pong |
+| flags | 1 | bit 0 FIN，bits 1..3 RSV |
+| closeCode | 2 | 仅 close 有效 |
+| payloadLength | 4 | 后续 payload 长度 |
+| payload | N | 原始 frame payload |
+
+固定头为 12 字节。控制帧必须 FIN、payload 不超过 125 字节；close reason 最大 123 字节。未知 opcode、非法 RSV、
+错误 close code、截断、尾随字节和超过 NAT chunk 上限的 frame 必须拒绝。SWS2 保留 WebSocket frame 语义，不把
+未知类型当 binary，也不使用旧的一字节 text/binary 前缀。
+
+## 8. 响应路径改写
+
+只有 route 显式启用 `pathRewriteEnabled`、Content-Type 可改写且响应不超过配置的 rewrite buffer 上限时，服务端才
+缓冲 HTML/CSS 并改写相对 URL。超过上限后立即转为流式透传，不能继续无界增长。
+
+改写可处理 HTML URL 属性、`srcset`、CSS `url(...)`、`@import` 和运行时 polyfill。gzip/deflate/br 解码仅用于
+管理预览或明确的响应改写，不属于控制 wire 压缩。
+
+## 9. 观测与存储
+
+每个请求记录 route/client、method、relativePath、rawQuery、status、耗时、请求/响应字节和失败原因。正文预览按
+配置截断，采集队列有界，不能反向阻塞数据面。流量计数按实际 DATA 字节累计，不包含控制 framing。
+
+日志和指标不得把 streamId、完整 URL、token 或正文作为常驻标签。
+
+## 10. 实现入口
+
+| 实现 | 服务端 | 客户端 |
 | --- | --- | --- |
-| `GET` | `/api/admin/http-routes` | 查询 HTTP route，可按 `clientId` 过滤 |
-| `POST` | `/api/admin/clients/{id}/http-routes` | 为客户端新增 route |
-| `PUT` | `/api/admin/http-routes/{routeId}` | 编辑、启停、配置路径改写或明细采集 |
-| `DELETE` | `/api/admin/http-routes/{routeId}` | 删除 route |
+| Java | `HttpTunnelController`、`HttpStreamExchange` | `HttpStreamForwarder` |
+| Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
+| .NET | `DirectHttpDispatcher`、`HttpTunnelStream` | `HttpStreamChannel` |
+| C server | `admin_http.c`、`main.c` NAT stream bridge | 使用 Java/Go/.NET v2 客户端 |
 
-route 字段：
-
-| 字段 | 说明 |
-| --- | --- |
-| `route` | 公网路径中的 route 名称，客户端侧精确匹配 |
-| `targetBaseUrl` | 客户端访问的内网目标基础地址，只支持 `http` 和 `https` |
-| `enabled` | 是否启用 |
-| `pathRewriteEnabled` | 是否对响应 HTML/CSS/JS 里的绝对路径做改写 |
-| `detailCaptureEnabled` | 是否采集 HTTP 明细，默认关闭 |
-
-服务端是 HTTP route 的权威来源。客户端 HTTP 登录响应会携带初始快照，后续 route CRUD 通过 `NAT_CONTROL.httpTunnelConfigList` 热更新。
-
-## `DIRECT_HTTP_REQUEST`
-
-服务端收到公网 HTTP 请求后创建 `DirectHttpRequestPacket`：
-
-| 字段 | 说明 |
-| --- | --- |
-| `requestId` | 请求 ID；服务端等待响应时按它匹配 future |
-| `requestMethod` | 原始 HTTP 方法 |
-| `route` | route 名称 |
-| `relativePath` | route 后面的相对路径，必须以 `/` 开头 |
-| `rawQuery` | 原始 query string，可为空 |
-| `headers` | Header 列表，格式为 `Name:Value` |
-| `body` | 原始请求体字节 |
-
-请求体限制：
-
-- 服务端入口默认限制 `16 MiB`，由 `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` 控制。
-- 客户端转发前也有 `16 MiB` 请求体保护。
-
-服务端不会转发 hop-by-hop Header：
-
-```text
-connection
-content-length
-host
-keep-alive
-proxy-authenticate
-proxy-authorization
-te
-trailer
-transfer-encoding
-upgrade
-```
-
-## 客户端转发规则
-
-客户端用 `route` 查内存 route 表，拿到 `targetBaseUrl` 后拼接：
-
-```text
-target = targetBaseUrl + relativePath + ?rawQuery
-```
-
-安全约束：
-
-- `targetBaseUrl` 只支持 `http` 和 `https`。
-- `targetBaseUrl` 不能带 query 或 fragment。
-- 拼接后的目标不能改变 scheme、host、port。
-- `relativePath` 必须以 `/` 开头，不能包含 CR/LF。
-- 路径不能使用 `.` 或 `..` 越界到 `targetBaseUrl` 基础路径之外。
-
-客户端使用 Apache HttpClient，关闭自动重定向和自动内容解压。访问内网 HTTPS 目标时，当前 Java 实现使用 trust-all `SSLContext` 和 `NoopHostnameVerifier`，适合内网自签证书场景，但不提供目标证书校验。
-
-`Range` Header 会被限制为单段且最大 `8 MiB`：
-
-- `bytes=0-999999999` 会收敛为 `bytes=0-8388607`。
-- 多段 Range 或非 bytes Range 不做改写。
-
-Java client 从上游读取响应体时设置了 `64 MiB` 本地读取上限，超过时返回 `502`。这不是当前控制连接能保证
-传输的响应大小：`DIRECT_HTTP_RESPONSE` 仍是单个 CompactBinary 控制帧，默认完整帧上限为 `32 MiB`，而
-deflate payload 解压后上限为 `16 MiB`。因此当前实现的有效上限取决于序列化开销和内容可压缩性：
-
-- 不可压缩响应最终受完整帧 `32 MiB` 上限约束；
-- 会被 deflate 的响应，其解压后完整 schema payload 超过 `16 MiB` 会被接收端拒绝；
-- 跨语言稳定使用场景应把单次响应控制在 `16 MiB` 以下，并为 headers、字段和长度编码预留空间；
-- `64 MiB` 只是客户端读取防护值，不能作为端到端能力承诺。当前协议没有响应分片机制。
-
-同理，请求入口虽然默认限制 body 为 `16 MiB`，但请求包的完整 schema payload 还包含 method、route、路径和
-headers；接近边界时必须预留这些字段的序列化开销。
-
-## `DIRECT_HTTP_RESPONSE`
-
-客户端返回 `DirectHttpResponsePacket`：
-
-| 字段 | 说明 |
-| --- | --- |
-| `requestId` | 与请求一致 |
-| `statusCode` | 上游 HTTP 状态码 |
-| `headers` | 响应 Header 列表，格式为 `Name:Value` |
-| `body` | 响应体原始字节 |
-| `error` | 转发失败时的错误信息 |
-
-服务端收到后：
-
-- `error` 不为空时，按 `statusCode` 返回错误；缺省为 `502`。
-- 正常响应会复制可转发 Header。
-- 开启路径改写时，可能会修改响应 body，并移除 `Content-Encoding` / `Content-Length`，由 Spring/Tomcat 重新计算长度。
-
-## 响应路径改写
-
-当 route 开启 `pathRewriteEnabled`，服务端会对以下正文类型做改写：
-
-```text
-text/html
-text/css
-text/javascript
-application/javascript
-application/x-javascript
-application/ecmascript
-text/ecmascript
-```
-
-改写目标：
-
-- HTML 中 `href`、`src`、`action`、`poster` 等属性里的单斜杠绝对路径。
-- HTML `srcset` 中的单斜杠绝对路径。
-- CSS `url(/path)` 和 `@import "/path"`。
-- HTML `<head>` 中注入运行时脚本，兜底改写 `fetch`、`XMLHttpRequest`、`history`、`setAttribute`、`EventSource`、`WebSocket` 中的单斜杠绝对路径。
-
-不会改写：
-
-- `http://`、`https://` 等完整 URL。
-- 响应 body 中的 `//cdn.example.com` 这类协议相对 URL。
-- `data:`、`javascript:` 等特殊协议。
-- 已带 `/http/{clientName}/{route}` 前缀的路径。
-
-如果 body 超过 `tunnel.http.rewrite.max-body-bytes`，或压缩解码失败，会跳过改写并原样返回。
-
-请求转发时，公网入口已经把 host 和 route 解析为服务端控制的字段，客户端只接收 `relativePath`。因此 `relativePath` 中的双斜线不会被当成协议相对 URL 或跨 host 跳转；例如 `//assets/app.js` 会按 Java 参考实现保留为同一 upstream host 下的普通路径，最终访问 `{targetBaseUrl}//assets/app.js`，同时仍会拒绝 `.` / `..` 段、query/fragment 型 base URL，以及 scheme/host/port 越界。
-
-## WebSocket 隧道
-
-浏览器对 `/http/{clientName}/{route}/**` 发起 WebSocket upgrade 时，服务端使用 `NAT_MESSAGE` 而不是 `DIRECT_HTTP_REQUEST`：
-
-1. 服务端分配 `channelId`。
-2. 服务端向客户端发送 `NatMessageType.CONNECTED`，`metaData.source=ws`，并携带 route、路径、query、Header 和握手 body。
-3. 浏览器 Text/Binary 帧封装为 `NatMessageType.DATA(channelId)`。
-4. `data[0]` 表示帧类型：`0x01` 为 TextFrame，`0x02` 为 BinaryFrame。
-5. 客户端连接内网 WebSocket 服务后，双向转发 DATA。
-6. 任一端关闭时发送 `DISCONNECTED(channelId)`。
-
-当前隧道只保留完整 Text 和 Binary frame，并在 DATA 前加上述单字节类型。Ping/Pong、Close code/reason、
-RSV 位以及 fragmented/continuation frame 的原始边界没有单独 wire 表示；上游关闭会收敛为通用
-`DISCONNECTED`。因此不能把当前 WebSocket 隧道描述成逐帧元数据完全保真的透明代理。
-
-## 观测与存储
-
-HTTP 明细采集由两层开关共同决定：
-
-- 全局开关：`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED`。
-- route 开关：`detailCaptureEnabled`，新建默认关闭。
-
-管理接口：
-
-```text
-GET /api/admin/traffic/http-exchanges
-```
-
-查询参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `clientId` | 按客户端过滤 |
-| `route` | 按 route 过滤 |
-| `responseBodyType` / `responseDataType` | 按响应体类型过滤 |
-| `field` | 搜索字段 |
-| `q` | 搜索关键字 |
-| `page` | 页码，从 `0` 开始 |
-| `size` | 每页大小，最大 `500` |
-
-常用搜索字段由 `HttpTrafficSearchField` 定义，前端会提供字段下拉。配置 Elasticsearch 后，HTTP 明细写入 `TUNNEL_ELASTICSEARCH_HTTP_INDEX`，否则写入数据库。
-
-服务端保存完整请求体和响应体。对于 `Content-Encoding: gzip`、`deflate`、`br` 的新记录，服务端会尽量解压后保存可展示内容；旧记录展示时前端会做兼容兜底。
+中央合法与 malformed frame 位于 `protocol/test-vectors/control-v2/frames`。

@@ -1,0 +1,12 @@
+{
+  "name": "spmtu2-basic",
+  "magicAscii": "SPMTU2",
+  "nonce": 72623859790382856,
+  "nonceHex": "0102030405060708",
+  "innerMtu": 1280,
+  "probeLength": 1280,
+  "probeHeaderHex": "53504d5455320101020304050607080500",
+  "probePaddingByte": 0,
+  "ackLength": 17,
+  "ackHex": "53504d5455320201020304050607080500"
+}

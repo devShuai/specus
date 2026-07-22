@@ -1,0 +1,21 @@
+{
+  "name": "stfwd2-ipv4-binding-success",
+  "keyId": 7,
+  "secretUtf8": "0123456789abcdef0123456789abcdef",
+  "senderEpoch": 72623859790382856,
+  "sequence": 1,
+  "timestampMillis": 1784203200000,
+  "endpointCode": 3,
+  "targetAddress": "198.51.100.25",
+  "targetPort": 54321,
+  "stunResponseHex": "010100002112a442000102030405060708090a0b",
+  "unsignedHex": "5354465744320d0a02000300000007010203040506070800000000000000010000019f6acc460001d431c63364190014010100002112a442000102030405060708090a0b",
+  "hmacHex": "6da7f68dbd2f4d0d4afcea6c7dcd5e8cef62daea3ad88268b2e86133eed43bf4",
+  "packetHex": "5354465744320d0a02000300000007010203040506070800000000000000010000019f6acc460001d431c63364190014010100002112a442000102030405060708090a0b6da7f68dbd2f4d0d4afcea6c7dcd5e8cef62daea3ad88268b2e86133eed43bf4",
+  "tamper": {
+    "operation": "xor",
+    "offsetFromEnd": 1,
+    "value": 1,
+    "expectedRejection": "bad_hmac"
+  }
+}

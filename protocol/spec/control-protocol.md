@@ -1,210 +1,164 @@
-# 控制连接协议
+# 控制与隧道流协议 v2
 
-控制连接是客户端与服务端之间的长连接，默认监听 `7010/TCP`，可选叠加 TLS。它承载登录、心跳、管理信令、TCP 端口映射数据、HTTP 直转请求、WebSocket 隧道和 Peer Mesh 信令。
+本协议是唯一受支持的 TCP 线协议，不保留 v1 解码、旧 HTTP command、serializer 回退或 payload
+压缩格式。客户端先完成 HTTP 登录，再建立一条控制连接和一条专用数据连接。两条连接默认使用同一
+TCP/TLS 监听端口，由登录帧中的 `connectionRole` 绑定角色。
 
-## 主帧格式
+## 传输安全
 
-所有非 UDP 的控制连接消息都以固定 11 字节头开始：
+- 公网生产环境必须使用文件证书 TLS。
+- 只有显式声明 `tls-terminated-upstream` 且 TCP listener 绑定 loopback 或受控私网时，才允许上游四层
+  代理终止 TLS。
+- `prod` / `production` profile 下明文公网 listener 或 self-signed 证书会阻止服务启动。
+- 控制与数据连接使用相同的 TLS 策略；不能只保护控制连接。
 
-| 字段 | 长度 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| `magic` | 4 字节 | big-endian int | 固定 `0x14353565` |
-| `version` | 1 字节 | unsigned byte | 当前保留，Java 默认来自 `Packet.version` |
-| `serializer` | 1 字节 | unsigned byte | 消息体序列化算法 |
-| `command` | 1 字节 | signed byte | 指令类型 |
-| `length` | 4 字节 | big-endian int | 后续 body 字节数 |
-| `body` | N 字节 | bytes | 指令对应消息体 |
+## 连接角色
 
-Netty pipeline 中 `Spliter` 负责按 `magic + length` 切帧，`PacketDecoder` / `PacketEncoder` 负责调用 `PacketCodec` 编解码。
+客户端按以下顺序建连：
 
-### 长度与拒绝边界
+1. 建立 `control` 连接并发送 `LOGIN_REQUEST`。
+2. 收到成功的 `LOGIN_RESPONSE` 后建立 `data` 连接。
+3. `data` 使用相同的 `clientName`、`clientSessionId` 和 `accessToken` 登录。
+4. 服务端只有在匹配的 `control` 已绑定时才接受 `data`。
 
-- `length` 是有符号 big-endian int32，必须大于等于 `0`，且只能覆盖当前帧的 body。
-- 跨语言默认兼容上限是**完整帧（11 字节头 + body）不超过 `32 MiB`**。Java、Go、C# client
-  都固定使用 `32 MiB`；Java、Go、C# server 可配置接收上限，C server 固定为 `32 MiB`。为了能与所有
-  当前实现互通，发送方不能依赖服务端放大后的值。
-- Java、Go、C#、C 与 Android 当前都按完整帧检查上限：合法 body 最大值为“配置的完整帧上限减去
-  11 字节头”。`TUNNEL_NETTY_MAX_FRAME_SIZE` 在 Java、Go、C# server 中也采用这一口径；跨语言发送方
-  不得把配置值误当作 body 上限。
-- `NAT_MESSAGE.metaDataLength` 必须满足 `0 <= metaDataLength <= length - 8`；其余字节才是可选 data payload。
-  NAT metadata 和 data 没有独立于主帧的更大额度。
-- 非法 magic、负长度、超过上限、截断 body、越界 metadata 都应拒绝，不能继续分配相应长度的内存。
+每个 TCP 连接只能登录一次。同一客户端会话只保留一条 `control` 和一条 `data`；新连接替换同角色旧
+连接。控制连接关闭时，服务端同时关闭匹配的数据连接。
 
-## `Command`
+| 角色 | 登录后允许的 client -> server 帧 |
+| --- | --- |
+| `control` | `MESSAGE_REQUEST`、心跳、退出 |
+| `data` | `NAT_MESSAGE`、心跳、退出 |
 
-| 指令 | 数值 | 消息体 | 方向 | 说明 |
-| --- | ---: | --- | --- | --- |
-| `LOGIN_REQUEST` | `1` | `LoginRequestPacket` | client -> server | 控制连接登录，必须携带 HTTP 登录得到的 `accessToken` |
-| `LOGIN_RESPONSE` | `-1` | `LoginResponsePacket` | server -> client | 登录结果，失败后服务端主动关闭连接 |
-| `MESSAGE_REQUEST` | `2` | `MessageRequestPacket` | client -> server | 通用消息，目前主要用于 `PEER_CONTROL` |
-| `MESSAGE_RESPONSE` | `-2` | `MessageResponsePacket` | server -> client | 通用下行消息，承载 `NAT_CONTROL`、`PEER_CONTROL` 等 |
-| `LOGOUT_REQUEST` | `3` | `LogoutRequestPacket` | client -> server | 退出请求 |
-| `LOGOUT_RESPONSE` | `-3` | `LogoutResponsePacket` | server -> client | 退出响应 |
-| `HEARTBEAT_REQUEST` | `4` | `HeartBeatRequestPacket` | client -> server | 写空闲时客户端发送 |
-| `HEARTBEAT_RESPONSE` | `-4` | `HeartBeatResponsePacket` | server -> client | 服务端心跳响应 |
-| `HTTP_REQUEST` | `5` | `HttpRequestPacket` | legacy | 旧同步 HTTP 请求 |
-| `HTTP_RESPONSE` | `-5` | `HttpResponsePacket` | legacy | 旧同步 HTTP 响应 |
-| `NAT_MESSAGE` | `6` | 自定义 NAT body | 双向 | TCP 端口映射、WebSocket 隧道数据 |
-| `DIRECT_HTTP_REQUEST` | `7` | `DirectHttpRequestPacket` | server -> client | HTTP route 直转请求 |
-| `DIRECT_HTTP_RESPONSE` | `-7` | `DirectHttpResponsePacket` | client -> server | HTTP route 直转响应 |
+服务端下行遵守同一边界：管理、NAT 配置和 Peer 信令只走 `control`；TCP、HTTP、WebSocket 字节流只走
+`data`。角色不匹配、重复登录和登录前非登录帧均为协议违规并关闭连接。
 
-## 序列化算法
+## 主帧
 
-默认序列化算法为 `COMPACT_BINARY`。Java `PacketCodec.encode(ByteBuf, Packet)` 会对普通 `Packet` 使用紧凑二进制；只有 `NAT_MESSAGE` 例外，元数据保持自定义 JSON 布局。
+所有帧使用固定 11 字节 big-endian 头：
 
-紧凑二进制 payload 结构：
+| 字段 | 长度 | 值 |
+| --- | ---: | --- |
+| `magic` | 4 | `0x14353565` |
+| `version` | 1 | 必须为 `2` |
+| `serializer` | 1 | 必须为 `4`，即 CompactBinary |
+| `command` | 1 | 固定 wire ID，按有符号 byte 解释 |
+| `bodyLength` | 4 | 后续 body 字节数，`int32 >= 0` |
+| `body` | N | command 专属 body |
+
+解码器必须在分配前验证 magic、version、serializer、command、长度及完整帧上限，并要求 body 被完全
+消费。禁止接受截断或尾随字节。
+
+- 登录前完整帧上限：`16 KiB`。
+- 登录后默认完整帧上限：`32 MiB`，服务端可配置得更小。
+- `MESSAGE_*` body 上限：`1 MiB`。
+- NAT metadata 上限：`65,535` 字节。
+- NAT DATA 发送分片上限：`64 KiB`。
+
+## Command registry
+
+| command | wire ID | body | 角色 |
+| --- | ---: | --- | --- |
+| `LOGIN_REQUEST` | `1` | CompactBinary login request | 未认证 |
+| `LOGIN_RESPONSE` | `-1` | CompactBinary login response | 未认证响应 |
+| `MESSAGE_REQUEST` | `2` | CompactBinary message request | control |
+| `MESSAGE_RESPONSE` | `-2` | CompactBinary message response | control |
+| `LOGOUT_REQUEST` | `3` | 空 body | control/data |
+| `LOGOUT_RESPONSE` | `-3` | CompactBinary result | control/data |
+| `HEARTBEAT_REQUEST` | `4` | 空 body | control/data |
+| `HEARTBEAT_RESPONSE` | `-4` | 空 body | control/data |
+| `NAT_MESSAGE` | `6` | NAT stream v2 body | data |
+
+未登记的 command 必须拒绝。`5/-5` 和 `7/-7` 已删除，不能按旧同步 HTTP 或 Direct HTTP schema
+解释。
+
+## CompactBinary
+
+CompactBinary body 直接由固定 schema 字段串接，不再包含 `payloadType`，也不执行 deflate。字符串使用
+UTF-8 长度前缀；nullable 值使用显式 presence marker；整数按对应 codec 的 varint/ZigZag 规则编码。
+
+所有 schema 都要求 exact consumption。增加、删除或重排字段属于线协议破坏性修改，必须同时提升协议版本，
+不能在 v2 body 尾部追加“可选字段”。
+
+`LOGIN_REQUEST` 字段顺序固定为：
+
+1. `clientName: string`
+2. `clientSessionId: nullable int64`
+3. `accessToken: string`
+4. `connectionRole: string`，仅允许 `control` 或 `data`
+
+`MessageType` 使用固定 wire ID，不依赖语言枚举 ordinal：
+
+| 类型 | wire ID |
+| --- | ---: |
+| `SERVER_TO_CLIENT` | `1` |
+| `CLIENT_TO_SERVER` | `2` |
+| `CLIENT_TO_CLIENT` | `3` |
+| `NAT_CONTROL` | `4` |
+| `PEER_CONTROL` | `5` |
+
+## NAT stream v2
+
+`NAT_MESSAGE` body 由固定 16 字节头、可选 JSON object metadata 和原始 data 组成：
 
 | 字段 | 长度 | 说明 |
-| --- | --- | --- |
-| `payloadType` | 1 字节 | `0` 表示原始 payload，`1` 表示 raw deflate payload |
-| `payload` | N 字节 | 对象字段按固定 schema 顺序编码后的数据 |
-
-压缩规则：
-
-- 原始对象 schema 编码结果大于等于 `64` 字节时尝试 deflate。
-- 压缩后更短才使用 `payloadType=1`。
-- `payloadType=1` 解压后的 schema payload 上限为 `16 MiB`，超过会拒绝；`payloadType=0` 没有第二个
-  serializer 上限，但仍受上述 `32 MiB` 完整帧上限约束。
-- raw-deflate 必须包含正常结束的 final block；截断流或只 flush、未 finish 的流即使已经产出看似完整的明文也必须拒绝。
-- 字符串使用 UTF-8，空值用长度标记 `0` 表示。
-- `int` 使用无符号 varint；可空 `long` 使用 `0/1` 标记加 ZigZag varlong。
-
-当前紧凑 schema 覆盖登录、消息、心跳、legacy HTTP、Direct HTTP 请求和响应。跨语言实现必须按字段顺序编码，不依赖字段名。
-
-## `MessageType`
-
-`MessageRequestPacket` 和 `MessageResponsePacket` 包含：
-
-| 字段 | 说明 |
-| --- | --- |
-| `clientName` | 来源客户端名；服务端下发时可为目标客户端名或 `server` |
-| `toClientName` | 目标客户端名 |
-| `messageType` | 通用消息类型 |
-| `message` | 字符串消息体，通常是 JSON |
-
-`MessageType` 当前值：
-
-| 类型 | ordinal | 说明 |
 | --- | ---: | --- |
-| `SERVER_TO_CLIENT` | `0` | 普通服务端消息 |
-| `CLIENT_TO_SERVER` | `1` | 普通客户端上行消息 |
-| `CLIENT_TO_CLIENT` | `2` | 客户端间普通消息 |
-| `NAT_CONTROL` | `3` | 服务端向客户端下发 TCP 映射和 HTTP route 快照 |
-| `PEER_CONTROL` | `4` | Peer Mesh JSON 信令 |
+| `type` | 1 | `NatMessageType` wire ID |
+| `flags` | 1 | 当前仅 bit 0 `END_STREAM` |
+| `metadataLength` | 2 | unsigned，最大 `65,535` |
+| `streamId` | 4 | unsigned，连接内唯一；`0` 保留给连接级帧 |
+| `value` | 4 | unsigned，WINDOW_UPDATE credit 或 RST error code |
+| `dataLength` | 4 | 原始 data 长度 |
+| `metadata` | M | UTF-8 JSON object，只用于 OPEN/FIN/RST 等控制阶段 |
+| `data` | N | 原始字节，不压缩、不加第二层长度或 Base64 |
 
-注意：紧凑二进制里的 enum 使用 `ordinal + 1` 编码，`0` 表示 `null`。
+| type | ID | `streamId` | 语义 |
+| --- | ---: | --- | --- |
+| `REGISTER` | `1` | `0` | 注册公网 TCP 端口 |
+| `REGISTER_RESULT` | `2` | `0` | 注册结果 |
+| `OPEN` | `3` | 非零 | 建立 TCP、HTTP 或 WebSocket 逻辑流 |
+| `FIN` | `4` | 非零 | 当前方向半关闭；可携带 trailers metadata |
+| `DATA` | `5` | 非零 | 原始流数据；metadata/value 必须为空/零 |
+| `KEEPALIVE` | `6` | `0` | 数据连接保活 |
+| `UNREGISTER` | `7` | `0` | 取消公网端口 |
+| `RST` | `8` | 非零 | 立即取消；`value` 为错误码，可携带 reason |
+| `WINDOW_UPDATE` | `9` | 非零 | 增加发送 credit，`value > 0` |
 
-## 登录与心跳
+每流初始发送窗口为 `1 MiB`，窗口累计上限 `16 MiB`，单流待发送队列上限 `4 MiB`。发送端按流轮转，
+每轮最多发送一个不超过 `64 KiB` 的 DATA 分片；credit 不足或数据连接不可写时暂停对应上游读取。消费
+DATA 后按实际字节数回送 `WINDOW_UPDATE`。窗口溢出、队列溢出、DATA-after-FIN 或非法状态转换使用
+`RST` 或关闭违规连接。
 
-客户端启动时先走 HTTP 登录，拿到 `clientName`、`clientSessionId` 和 `accessToken`。随后建立控制连接并发送：
+## HTTP streaming
 
-```json
-{
-  "clientName": "shuaiwin-shshi-fa22b7af",
-  "clientSessionId": 123456789,
-  "accessToken": "cs_xxx"
-}
-```
+HTTP route 不使用独立 command。服务端在数据连接上发送：
 
-服务端用 token hash 查找 `ClientSession`，校验过期时间、客户端是否启用、连接频率、同一机器实例数和凭证在线实例数。成功后绑定 `SessionUtil`，写入连接记录，并异步下发 `NAT_CONTROL` 和 Peer Mesh roster。
+1. `OPEN`，metadata 含 `source=http`、`phase=request`、`method`、`route`、`relativePath`、
+   `rawQuery`、`headers` 和可选 `contentLength`。
+2. 零到多个请求 `DATA`。
+3. 请求 `FIN`。
+4. 客户端以 `OPEN(source=http, phase=response, statusCode, headers)` 返回响应头。
+5. 零到多个响应 `DATA`，随后 `FIN(trailers?)`。
 
-客户端只有收到 `LOGIN_RESPONSE.success=true` 才重置重连退避。token 过期时客户端会重新执行 HTTP 登录并重连；快过期时也会主动刷新，尽量不中断服务。
+浏览器断开、超时或任一端失败必须发送 `RST`，并取消 upstream 请求。SSE 和大响应按 DATA 到达即向
+下游写出，不等待完整 body。
 
-心跳由客户端写空闲触发，服务端读空闲超时会关闭控制连接。连接断开后客户端按指数退避重连，退避上限为 `60s`。
+## WebSocket frame tunnel
 
-## `NAT_CONTROL`
-
-`NAT_CONTROL` 使用 `MESSAGE_RESPONSE` 承载，`message` 是 JSON。服务端每次下发的是当前权威全量快照，而不是增量。
-
-```json
-{
-  "clientName": "client-a",
-  "remoteAddress": "tunnel.example.com",
-  "remotePort": 7010,
-  "tunnelConfigList": [
-    {
-      "port": 10022,
-      "tunnelAddress": "192.168.1.10",
-      "tunnelPort": 22
-    }
-  ],
-  "httpTunnelConfigList": [
-    {
-      "route": "nexus",
-      "targetBaseUrl": "http://192.168.1.252:8080"
-    }
-  ]
-}
-```
-
-字段说明：
-
-| 字段 | 说明 |
-| --- | --- |
-| `clientName` | 目标客户端名 |
-| `remoteAddress` | 服务端公网地址；可为空，主要用于展示 |
-| `remotePort` | 控制连接端口 |
-| `tunnelConfigList` | 已启用 TCP 端口映射全集 |
-| `httpTunnelConfigList` | 已启用 HTTP route 全集；字段缺省表示服务端尚未接管该客户端 HTTP route |
-
-`httpTunnelConfigList` 的三种语义：
-
-- 字段缺省：客户端继续使用 HTTP 登录响应里的初始快照。
-- 字段为空数组：客户端清空 HTTP route。
-- 字段为数组：客户端用该数组整体替换内存 route 表。
-
-## `NAT_MESSAGE`
-
-`NAT_MESSAGE` 的 body 不使用普通 `Packet` schema，而是自定义布局：
+WebSocket payload 在 NAT DATA 内使用 `SWS2` 二进制 envelope：
 
 | 字段 | 长度 | 说明 |
-| --- | --- | --- |
-| `natMessageType` | 4 字节 | `NatMessageType.code` |
-| `metaDataLength` | 4 字节 | JSON 元数据长度 |
-| `metaData` | N 字节 | JSON object，使用 `FASTJSON` |
-| `data` | N 字节 | 可选，使用 `CompactBinarySerializer.encodePayload` 包装 |
-
-`NatMessageType`：
-
-| 类型 | code | 说明 |
 | --- | ---: | --- |
-| `REGISTER` | `1` | 客户端向服务端注册公网监听端口 |
-| `REGISTER_RESULT` | `2` | 服务端返回注册结果 |
-| `CONNECTED` | `3` | 服务端通知客户端有外部连接或 WebSocket 流建立 |
-| `DISCONNECTED` | `4` | 任一端通知连接关闭 |
-| `DATA` | `5` | 双向数据 payload |
-| `KEEPALIVE` | `6` | 保活 |
-| `UNREGISTER` | `7` | 取消端口注册 |
-| `HTTP_ROUTES_REPORT` | `8` | 历史兼容编号；Java/C# 客户端每个控制会话仍单次发送诊断快照，现行 Java server 以后台持久化配置为权威并明确忽略该消息 |
+| magic | 4 | ASCII `SWS2` |
+| opcode | 1 | continuation/text/binary/close/ping/pong |
+| flags | 1 | bit 0 FIN，bits 1..3 RSV |
+| closeCode | 2 | 仅 CLOSE 有效 |
+| payloadLength | 4 | 后续 payload 长度 |
+| payload | N | 最大 `64 KiB - 12` |
 
-常见 `metaData` 字段：
+控制帧必须 FIN、不得携带 RSV、payload 不超过 125 字节；CLOSE reason 最大 123 字节。未知 opcode、错误
+长度、非法 close code 和尾随字节必须拒绝。
 
-| 字段 | 说明 |
-| --- | --- |
-| `channelId` | 单条外部 TCP/WebSocket 连接的逻辑 ID |
-| `port` | 公网监听端口 |
-| `clientName` | 客户端名 |
-| `source` | `ws` 表示该帧属于 HTTP WebSocket 隧道 |
-| `route` | HTTP route 名称 |
-| `relativePath` | WebSocket 建连时的相对路径 |
-| `rawQuery` | 原始 query string |
-| `headers` | Header 字符串列表 |
+## 测试向量
 
-TCP 端口映射流程：
-
-1. 服务端下发 `NAT_CONTROL`。
-2. 客户端为每个 TCP 映射发送 `REGISTER`。
-3. 服务端启动对应公网端口监听并回 `REGISTER_RESULT`。
-4. 外部连接到达后服务端发 `CONNECTED(channelId)`。
-5. 双方用 `DATA(channelId)` 传输字节。
-6. 任一端关闭后发送 `DISCONNECTED(channelId)`。
-
-`DATA` 是 TCP 字节流的任意切片，不形成应用层消息边界；单帧仍受主帧上限约束。控制连接本身是 TCP，
-因此同一 channel 的 DATA 依赖底层有序可靠传输，NAT 子协议不再增加 sequence、ACK 或重传。当前协议没有
-half-close 表示，任一侧 EOF/关闭都会收敛为 `DISCONNECTED` 并完整关闭对应连接。水位线和暂停读取属于各实现
-的背压策略，不改变 wire 格式。
-
-WebSocket 隧道复用 `NAT_MESSAGE`，但 `DATA.data[0]` 是帧类型前缀：`0x01` 表示 TextFrame，`0x02` 表示 BinaryFrame。
-
-`HTTP_ROUTES_REPORT` 保留是为了旧客户端、跨语言 fixture 和枚举序号兼容，不代表服务端接纳客户端上报作为配置来源；
-管理端不得用该消息推断当前权威 route 状态。
+唯一主副本位于 `protocol/test-vectors/control-v2/frames`。Java 生成器负责更新合法和 malformed fixture；
+Java、Go、.NET 与 C 测试必须直接读取该目录。v1、旧 HTTP command 和 deflate fixture 不得重新加入。
