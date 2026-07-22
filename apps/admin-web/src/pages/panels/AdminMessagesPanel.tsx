@@ -6,7 +6,7 @@ import { notify, notifyError } from "../../components/toast";
 import { formatBytes, formatDateTime } from "../../lib/format";
 
 type ChatDirection = "in" | "out";
-type ChatStatus = "sending" | "sent" | "failed" | "received";
+type ChatStatus = "sending" | "written" | "delivered" | "failed" | "received";
 
 interface ChatAttachment {
   attachmentId?: number;
@@ -91,12 +91,24 @@ export function AdminMessagesPanel() {
   useEffect(() => {
     let closed = false;
     let retryTimer: number | null = null;
-    const connect = () => {
+    const connect = async () => {
       const token = tokenStore.get();
       if (!token || closed) {
         return;
       }
-      const socket = new WebSocket(clientMessagesWsUrl(token));
+      let ticket: string;
+      try {
+        ticket = (await adminApi.createWebSocketTicket("client-messages")).ticket;
+      } catch {
+        if (!closed) {
+          retryTimer = window.setTimeout(() => void connect(), 3000);
+        }
+        return;
+      }
+      if (closed) {
+        return;
+      }
+      const socket = new WebSocket(clientMessagesWsUrl(ticket));
       wsRef.current = socket;
       socket.onopen = () => setConnected(true);
       socket.onmessage = (event) => handleSocketMessage(String(event.data));
@@ -106,12 +118,12 @@ export function AdminMessagesPanel() {
         }
         setConnected(false);
         if (!closed) {
-          retryTimer = window.setTimeout(connect, 3000);
+          retryTimer = window.setTimeout(() => void connect(), 3000);
         }
       };
       socket.onerror = () => setConnected(false);
     };
-    connect();
+    void connect();
     return () => {
       closed = true;
       if (retryTimer != null) {
@@ -140,11 +152,11 @@ export function AdminMessagesPanel() {
       setConnected(true);
       return;
     }
-    if (event.type === "sent") {
-      markMessage(event.messageId ?? "", "sent");
+    if (event.type === "written" || event.type === "delivered") {
+      markMessage(event.messageId ?? "", event.type);
       return;
     }
-    if (event.type === "error") {
+    if (event.type === "error" || event.type === "failed") {
       if (event.messageId) {
         markMessage(event.messageId, "failed");
       }
@@ -493,7 +505,7 @@ function encodeStmsg2(messageId: string, target: Client, body: string, attachmen
 }
 
 function parseStmsg2(raw: string): { body: string; attachment?: ChatAttachment } {
-  if (!raw.startsWith("STMSG1\n") && !raw.startsWith("STMSG2\n")) {
+  if (!raw.startsWith("STMSG2\n")) {
     return { body: raw };
   }
   try {
@@ -537,9 +549,9 @@ function putObject(
   });
 }
 
-function clientMessagesWsUrl(token: string) {
+function clientMessagesWsUrl(ticket: string) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const params = new URLSearchParams({ token });
+  const params = new URLSearchParams({ ticket });
   return `${protocol}//${window.location.host}/ws/client-messages?${params.toString()}`;
 }
 
@@ -554,8 +566,10 @@ function statusText(status: ChatStatus) {
   switch (status) {
     case "sending":
       return "发送中";
-    case "sent":
-      return "已发送";
+    case "written":
+      return "已写入设备通道";
+    case "delivered":
+      return "已送达";
     case "failed":
       return "失败";
     case "received":

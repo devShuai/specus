@@ -27,6 +27,7 @@ import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/Sy
 import {
   fetchPublicTransferIceConfig,
   publicCheckTransferClientNameAvailability,
+  publicCreateTransferWebSocketTicket,
   publicCreateTransferRoomAccessToken,
   publicCreateTransferPairingCode,
   publicCompleteAttachment,
@@ -69,10 +70,10 @@ import { decodeLegacyPeerDisplayName } from "../lib/peerDisplayName";
 import {
   clipboardSyncEventKey,
   isClipboardSyncPayload,
-  serializeClipboardRelayEnvelope,
   type ClipboardInboundEvent,
   type ClipboardSyncPayload,
 } from "../lib/clipboardSync";
+import { decodeRelayAppFrame, encodeRelayAppFrame } from "../lib/appMessageProtocol";
 import {
   DEFAULT_DIRECT_MEMORY_LIMIT_BYTES,
   receivingTransferKey,
@@ -203,6 +204,7 @@ export function PublicTransferWorkspacePage({ workspace }: { workspace: PublicTr
 function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWorkspace }) {
   const { ready: authReady, authed, openLogin } = useAuth();
   const discoverySocketRef = useRef<WebSocket | null>(null);
+  const rosterRevisionRef = useRef(0);
   const loadedSharedAttachmentRef = useRef("");
   const directPreviewUrlsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -466,7 +468,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       payload,
       receivedAt: Date.now(),
     };
-    if (payload.type === "STDG1") {
+    if (payload.type === "STDG2") {
       setDiagramEvents((items) => [...items.slice(-999), event]);
     } else {
       setWhiteboardEvents((items) => [...items.slice(-299), event]);
@@ -538,6 +540,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     peerTransportPaths,
     sendDirect,
     sendPeerMessage,
+    sendRelayPeerMessage,
+    handleRelayPeerFrame,
     isPeerMessageTransportReady,
     handleSignal,
     acceptIncomingTransfer,
@@ -643,6 +647,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     let reconnectAttempt = 0;
     let blockedByNameConflict = false;
     let lastPongAt = Date.now();
+    rosterRevisionRef.current = 0;
     setRoomRole(isInternetMode ? null : "EDITOR");
 
     const clearHeartbeat = () => {
@@ -670,21 +675,50 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     };
 
     const handleMessage = (event: MessageEvent) => {
+      if (typeof event.data !== "string") {
+        const read = event.data instanceof ArrayBuffer
+          ? Promise.resolve(event.data)
+          : event.data instanceof Blob
+            ? event.data.arrayBuffer()
+            : Promise.reject(new Error("unsupported websocket payload"));
+        void read.then((buffer) => {
+          const routed = decodeRelayAppFrame(buffer);
+          if (routed.targetPeerId !== peerId || !routed.sourcePeerId
+            || !currentRoomPeerIdsRef.current.has(routed.sourcePeerId)) {
+            return;
+          }
+          return handleRelayPeerFrame(routed.sourcePeerId, routed.appFrame, (targetPeerId, reply) => {
+            const socket = discoverySocketRef.current;
+            if (socket?.readyState === WebSocket.OPEN) {
+              socket.send(encodeRelayAppFrame(targetPeerId, "", reply));
+            }
+          });
+        }).catch(() => {
+          // Invalid binary relay frames are isolated from the discovery control channel.
+        });
+        return;
+      }
       try {
-        const message = JSON.parse(String(event.data)) as {
+        const message = JSON.parse(event.data) as {
           type?: string;
           error?: string;
           sourcePeerId?: string;
           targetPeerId?: string;
           peers?: DiscoveryPeer[];
+          rosterRevision?: number;
           roomRole?: PublicTransferRoomRole;
           payload?: unknown;
         };
         if (message.type === "pong") {
           lastPongAt = Date.now();
-        } else if (message.type === "hello" && message.roomRole) {
+        } else if (message.type === "hello") {
           setClientNameStatus("available");
-          setRoomRole(message.roomRole);
+          if (message.roomRole) {
+            setRoomRole(message.roomRole);
+          }
+          if (Number.isSafeInteger(message.rosterRevision) && (message.rosterRevision ?? 0) >= 0) {
+            rosterRevisionRef.current = Math.max(rosterRevisionRef.current, message.rosterRevision ?? 0);
+          }
         } else if (message.type === "error" && message.error) {
           if (message.error === "client name is already in use") {
             blockedByNameConflict = true;
@@ -700,6 +734,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             setError(message.error);
           }
         } else if (message.type === "roster" && Array.isArray(message.peers)) {
+          const revision = Number.isSafeInteger(message.rosterRevision) && (message.rosterRevision ?? 0) >= 0
+            ? message.rosterRevision ?? 0
+            : 0;
+          if (revision > 0 && revision < rosterRevisionRef.current) {
+            return;
+          }
+          rosterRevisionRef.current = Math.max(rosterRevisionRef.current, revision);
           const visiblePeers = message.peers.filter((peer) => peer.peerId !== peerId);
           currentRoomPeerIdsRef.current = new Set(visiblePeers.map((peer) => peer.peerId));
           currentRoomPeerRolesRef.current = new Map(
@@ -728,16 +769,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               ...items,
             ]));
           }
-        } else if (message.type === "whiteboard"
-          && message.sourcePeerId
-          && message.targetPeerId === peerId
-          && isWhiteboardPayload(message.payload)) {
-          pushWhiteboardEvent(message.sourcePeerId, message.payload);
-        } else if (message.type === "clipboard"
-          && message.sourcePeerId
-          && message.targetPeerId === peerId
-          && isClipboardSyncPayload(message.payload)) {
-          pushClipboardEvent(message.sourcePeerId, message.payload);
         } else if (message.type === "signal"
           && message.sourcePeerId
           && message.targetPeerId === peerId
@@ -752,12 +783,41 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       }
     };
 
-    const connect = () => {
+    const scheduleReconnect = () => {
+      if (!active || blockedByNameConflict) {
+        return;
+      }
+      const delayMs = Math.min(1000 * (2 ** Math.min(reconnectAttempt, 4)), 10000);
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(() => void connect(), delayMs);
+    };
+
+    async function connect() {
       if (!active) {
         return;
       }
-      const url = discoveryWebSocketUrl(roomId, peerId, isInternetMode ? roomToken : "", displayName);
+      let ticket: string;
+      try {
+        const issued = await publicCreateTransferWebSocketTicket({
+          roomId,
+          peerId,
+          roomToken: isInternetMode ? roomToken : "",
+          displayName,
+        });
+        ticket = issued.ticket;
+      } catch (ticketError) {
+        if (active) {
+          setError(ticketError instanceof Error ? ticketError.message : "建立房间连接失败");
+          scheduleReconnect();
+        }
+        return;
+      }
+      if (!active) {
+        return;
+      }
+      const url = discoveryWebSocketUrl(ticket);
       const socket = new WebSocket(url);
+      socket.binaryType = "arraybuffer";
       discoverySocketRef.current = socket;
       socket.onopen = () => {
         if (!active || discoverySocketRef.current !== socket) {
@@ -783,16 +843,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         }
         discoverySocketRef.current = null;
         clearHeartbeat();
-        if (!active || blockedByNameConflict) {
-          return;
-        }
-        const delayMs = Math.min(1000 * (2 ** Math.min(reconnectAttempt, 4)), 10000);
-        reconnectAttempt += 1;
-        reconnectTimer = window.setTimeout(connect, delayMs);
+        scheduleReconnect();
       };
-    };
+    }
 
-    connect();
+    void connect();
 
     return () => {
       active = false;
@@ -806,7 +861,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         socket.close();
       }
     };
-  }, [clientNameConnectionGeneration, displayName, handleSignal, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
+  }, [clientNameConnectionGeneration, displayName, handleRelayPeerFrame, handleSignal, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
 
   useEffect(() => {
     if (!isInternetMode || roomRole !== "OWNER") {
@@ -1892,30 +1947,16 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     return true;
   };
 
-  const publishWhiteboardEnvelope = useCallback((targetPeerId: string, payload: WhiteboardPayload, expectedRoomEpoch: number) => {
+  const sendRelayFrame = useCallback((targetPeerId: string, frame: ArrayBuffer, expectedRoomEpoch: number) => {
     const socket = discoverySocketRef.current;
     if (roomEpochRef.current !== expectedRoomEpoch
       || !currentRoomPeerIdsRef.current.has(targetPeerId)
       || !targetPeerId
       || !socket
       || socket.readyState !== WebSocket.OPEN) {
-      return false;
+      throw new Error("discovery channel unavailable");
     }
-    try {
-      const serialized = JSON.stringify({
-        type: "whiteboard",
-        targetPeerId,
-        payload,
-      });
-      // 服务端 discovery 通道单消息上限 64K 字符，超限会导致整条发现连接被服务端关闭。
-      if (serialized.length > 63 * 1024) {
-        return false;
-      }
-      socket.send(serialized);
-      return true;
-    } catch {
-      return false;
-    }
+    socket.send(encodeRelayAppFrame(targetPeerId, "", frame));
   }, []);
 
   const sendWhiteboardPayload = useCallback((payload: WhiteboardPayload) => {
@@ -1986,7 +2027,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             retryState.turnAfter = sent ? 0 : Date.now() + WHITEBOARD_TRANSPORT_RETRY_MS;
             return sent;
           },
-          websocket: () => publishWhiteboardEnvelope(targetPeerId, payload, sendRoomEpoch),
+          websocket: () => sendRelayPeerMessage(targetPeerId, message,
+            (frame) => sendRelayFrame(targetPeerId, frame, sendRoomEpoch)),
         });
 
         if (isTargetCurrent()) {
@@ -2005,20 +2047,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       });
     }
     return Promise.all(deliveries).then((results) => results.every(Boolean));
-  }, [isPeerMessageTransportReady, isRoomReadOnly, networkMode, peers, publishWhiteboardEnvelope, sendPeerMessage]);
-
-  const publishClipboardEnvelope = useCallback((targetPeerId: string, serializedEnvelope: string, expectedRoomEpoch: number) => {
-    const socket = discoverySocketRef.current;
-    if (roomEpochRef.current !== expectedRoomEpoch
-      || !currentRoomPeerIdsRef.current.has(targetPeerId)
-      || !targetPeerId
-      || !socket
-      || socket.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-    socket.send(serializedEnvelope);
-    return true;
-  }, []);
+  }, [isPeerMessageTransportReady, isRoomReadOnly, networkMode, peers, sendPeerMessage, sendRelayFrame, sendRelayPeerMessage]);
 
   const sendClipboardPayload = useCallback(async (payload: ClipboardSyncPayload) => {
     if (isRoomReadOnly) {
@@ -2044,11 +2073,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (networkMode === "lan") {
       throw new Error("内网模式仅允许设备直连；请检查设备连接或切换到外网模式");
     }
-    const serializedEnvelope = serializeClipboardRelayEnvelope(target.peerId, payload);
-    if (!publishClipboardEnvelope(target.peerId, serializedEnvelope, sendRoomEpoch)) {
+    const sentRelay = await sendRelayPeerMessage(target.peerId,
+      { messageType: "clipboard", payload },
+      (frame) => sendRelayFrame(target.peerId, frame, sendRoomEpoch));
+    if (!sentRelay) {
       throw new Error("互传通道暂时不可用，请确认对方仍在线");
     }
-  }, [isRoomReadOnly, networkMode, peers, publishClipboardEnvelope, selectedPeerId, sendPeerMessage]);
+  }, [isRoomReadOnly, networkMode, peers, selectedPeerId, sendPeerMessage, sendRelayFrame, sendRelayPeerMessage]);
 
   const selectTransferTool = useCallback((mode: TransferToolMode, focusContent = false) => {
     setActiveTool(mode);
@@ -3998,7 +4029,7 @@ function isAttachmentDiscoveryPayload(value: unknown): value is { objectId?: str
 }
 
 function whiteboardEventKey(sourcePeerId: string, payload: WhiteboardPayload) {
-  if (payload.type === "STDG1") {
+  if (payload.type === "STDG2") {
     if (payload.kind === "diagram-update") {
       return `${sourcePeerId}:diagram-update:${payload.createdAt}:${payload.update.length}:${hashEventPayload(payload.update)}`;
     }
@@ -4041,10 +4072,10 @@ function whiteboardEventKey(sourcePeerId: string, payload: WhiteboardPayload) {
   return `${sourcePeerId}:whiteboard:${payload.createdAt}`;
 }
 
-function hashEventPayload(value: string) {
+function hashEventPayload(value: string | Uint8Array) {
   let hash = 2_166_136_261;
   for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
+    hash ^= typeof value === "string" ? value.charCodeAt(index) : value[index];
     hash = Math.imul(hash, 16_777_619);
   }
   return (hash >>> 0).toString(36);
@@ -4446,15 +4477,8 @@ function discoveryPeerDisplayName(peer: Pick<DiscoveryPeer, "peerId" | "displayN
   return displayName;
 }
 
-function discoveryWebSocketUrl(roomId: string, peerId: string, roomToken: string, displayName: string) {
+function discoveryWebSocketUrl(ticket: string) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const params = new URLSearchParams({
-    roomId: roomId || "nearby",
-    peerId,
-    displayName: displayName || peerId,
-  });
-  if (roomToken.trim()) {
-    params.set("roomToken", roomToken.trim());
-  }
+  const params = new URLSearchParams({ ticket });
   return `${protocol}//${window.location.host}/ws/public-transfer/discovery?${params.toString()}`;
 }

@@ -704,6 +704,22 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
     ? null
     : Math.round(stats.natBehaviorSuccessRatio * 100);
   const pathTypeRows = [...stats.pathTypes].sort((a, b) => b.sessions - a.sessions);
+  const addressFamilyRows = ["IPv4", "IPv6", "UNKNOWN"].map((addressFamily) => {
+    const rows = (stats.addressFamilies ?? []).filter((item) => item.addressFamily === addressFamily);
+    return {
+      addressFamily,
+      sessions: rows.reduce((sum, item) => sum + item.sessions, 0),
+      activeSessions: rows
+        .filter((item) => item.status === "ACTIVE")
+        .reduce((sum, item) => sum + item.sessions, 0),
+      directSessions: rows
+        .filter((item) => item.status === "ACTIVE" && item.pathType === "DIRECT")
+        .reduce((sum, item) => sum + item.sessions, 0),
+      relaySessions: rows
+        .filter((item) => item.status === "ACTIVE" && item.pathType === "RELAY")
+        .reduce((sum, item) => sum + item.sessions, 0),
+    };
+  }).filter((item) => item.sessions > 0);
   const natTypeRows = [...stats.natTypes].sort((a, b) => b.devices - a.devices);
   const mappingRows = [...(stats.natMappingBehaviors ?? [])].sort((a, b) => b.devices - a.devices);
   const filteringRows = [...(stats.natFilteringBehaviors ?? [])].sort((a, b) => b.devices - a.devices);
@@ -736,6 +752,22 @@ function PeerPathStatsCard({ stats }: { stats: PeerMeshPathStats | null }) {
             <span>Relay {stats.activeRelaySessions}</span>
           </div>
         </div>
+
+        {addressFamilyRows.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 border-t border-default-200 pt-3">
+            <span className="text-tiny text-default-500">实际路径地址族：</span>
+            {addressFamilyRows.map((item) => (
+              <Chip
+                key={item.addressFamily}
+                size="sm"
+                variant="flat"
+                color={item.addressFamily === "IPv6" ? "primary" : item.addressFamily === "IPv4" ? "success" : "default"}
+              >
+                {item.addressFamily} · 活跃 {item.activeSessions} · Direct {item.directSessions} / Relay {item.relaySessions}
+              </Chip>
+            ))}
+          </div>
+        )}
 
         {(stats.natBehaviorDevices ?? 0) > 0 && (
           <div className="flex flex-col gap-2 border-t border-default-200 pt-3">

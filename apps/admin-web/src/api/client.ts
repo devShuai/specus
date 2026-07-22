@@ -61,6 +61,7 @@ import type {
   UserDiagramDocument,
   UserDiagramDocumentDetail,
   UserDiagramDocumentMutation,
+  WebSocketTicket,
 } from "./types";
 
 const ADMIN_PREFIX = "/api/admin";
@@ -268,6 +269,11 @@ export interface PeerMeshSessionQuery {
 }
 
 export const adminApi = {
+  createWebSocketTicket: (endpoint: "connections" | "client-messages") =>
+    request<WebSocketTicket>("/ws-tickets", {
+      method: "POST",
+      body: JSON.stringify({ endpoint }),
+    }),
   me: () => request<ManagementUser>("/me"),
   overview: () => request<Overview>("/overview"),
   initializeDatabase: () => request<DatabaseInitResult>("/database/initialize", { method: "POST" }),
@@ -561,6 +567,15 @@ export async function fetchPublicTransferIceConfig(): Promise<PublicTransferIceC
   } catch {
     return null;
   }
+}
+
+export function publicCreateTransferWebSocketTicket(body: {
+  roomId: string;
+  roomToken: string;
+  peerId: string;
+  displayName: string;
+}): Promise<WebSocketTicket> {
+  return publicJsonRequest<WebSocketTicket>("/api/public/transfer/ws-tickets", body);
 }
 
 export async function publicCheckTransferClientNameAvailability(

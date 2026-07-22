@@ -63,10 +63,12 @@ export function ConnectionsPanel() {
       .catch(() => undefined);
   }, []);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (silent = false) => {
     const requestId = connectionRequestId.current + 1;
     connectionRequestId.current = requestId;
-    setLoading(true);
+    if (!silent) {
+      setLoading(true);
+    }
     try {
       const data = await adminApi.listConnections({
         page,
@@ -86,8 +88,11 @@ export function ConnectionsPanel() {
       if (requestId === connectionRequestId.current) {
         notifyError(error, "加载连接记录失败");
       }
+      if (silent) {
+        throw error;
+      }
     } finally {
-      if (requestId === connectionRequestId.current) {
+      if (!silent && requestId === connectionRequestId.current) {
         setLoading(false);
       }
     }
@@ -142,7 +147,12 @@ export function ConnectionsPanel() {
     [matchesFilter],
   );
 
-  useConnectionsFeed({ enabled: true, onEvent: onLiveEvent, onAuthError: expireSession });
+  useConnectionsFeed({
+    enabled: true,
+    onEvent: onLiveEvent,
+    onResync: () => load(true),
+    onAuthError: expireSession,
+  });
 
   const resetConnectionPage = useCallback(() => {
     connectionRequestId.current += 1;

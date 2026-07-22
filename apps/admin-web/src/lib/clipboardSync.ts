@@ -1,12 +1,9 @@
 export const CLIPBOARD_TEXT_MAX_CHARS = 32_768;
 export const CLIPBOARD_TEXT_MAX_UTF8_BYTES = 48 * 1024;
-export const CLIPBOARD_DISCOVERY_MESSAGE_MAX_CHARS = 64 * 1024;
-
-const CLIPBOARD_PROTOCOL_TYPE = "STCLIP1";
-const CLIPBOARD_RICH_PROTOCOL_TYPE = "STCLIP2";
+const CLIPBOARD_PROTOCOL_TYPE = "STCLIP2";
 const CLIPBOARD_PAYLOAD_KIND = "text";
 const CLIPBOARD_ID_MAX_CHARS = 128;
-const CLIPBOARD_LEGACY_PAYLOAD_KEYS = [
+const CLIPBOARD_PAYLOAD_KEYS = [
   "type",
   "kind",
   "id",
@@ -14,25 +11,12 @@ const CLIPBOARD_LEGACY_PAYLOAD_KEYS = [
   "sequence",
   "text",
   "createdAt",
-] as const;
-const CLIPBOARD_RICH_PAYLOAD_KEYS = [
-  ...CLIPBOARD_LEGACY_PAYLOAD_KEYS,
   "html",
 ] as const;
 
 export type ClipboardContentKind = "text" | "html" | "link";
 
-export interface LegacyClipboardSyncPayload {
-  type: "STCLIP1";
-  kind: "text";
-  id: string;
-  sessionId: string;
-  sequence: number;
-  text: string;
-  createdAt: number;
-}
-
-export interface RichClipboardSyncPayload {
+export interface ClipboardSyncPayload {
   type: "STCLIP2";
   kind: ClipboardContentKind;
   id: string;
@@ -42,8 +26,6 @@ export interface RichClipboardSyncPayload {
   createdAt: number;
   html: string | null;
 }
-
-export type ClipboardSyncPayload = LegacyClipboardSyncPayload | RichClipboardSyncPayload;
 
 export interface ClipboardInboundEvent {
   eventId: string;
@@ -71,14 +53,12 @@ export function createClipboardSyncPayload(
     text,
     createdAt: Date.now(),
   };
-  const payload: ClipboardSyncPayload = kind === CLIPBOARD_PAYLOAD_KIND && !content.html
-    ? { type: CLIPBOARD_PROTOCOL_TYPE, kind: CLIPBOARD_PAYLOAD_KIND, ...common }
-    : {
-        type: CLIPBOARD_RICH_PROTOCOL_TYPE,
-        kind,
-        html: kind === "html" ? content.html ?? null : null,
-        ...common,
-      };
+  const payload: ClipboardSyncPayload = {
+    type: CLIPBOARD_PROTOCOL_TYPE,
+    kind,
+    html: kind === "html" ? content.html ?? null : null,
+    ...common,
+  };
   if (!isClipboardSyncPayload(payload)) {
     throw new RangeError("剪贴板同步内容或标识不符合协议限制");
   }
@@ -87,21 +67,6 @@ export function createClipboardSyncPayload(
 
 export function clipboardSyncEventKey(sourcePeerId: string, payload: ClipboardSyncPayload) {
   return JSON.stringify([sourcePeerId, "clipboard", payload.sessionId, payload.id]);
-}
-
-export function serializeClipboardRelayEnvelope(targetPeerId: string, payload: ClipboardSyncPayload) {
-  if (!isProtocolId(targetPeerId) || !isClipboardSyncPayload(payload)) {
-    throw new RangeError("剪贴板互传目标或内容不符合协议限制");
-  }
-  const serialized = JSON.stringify({
-    type: "clipboard",
-    targetPeerId,
-    payload,
-  });
-  if (serialized.length > CLIPBOARD_DISCOVERY_MESSAGE_MAX_CHARS) {
-    throw new RangeError("剪贴板内容包含过多转义字符，无法通过互传通道发送");
-  }
-  return serialized;
 }
 
 export function isClipboardSyncPayload(value: unknown): value is ClipboardSyncPayload {
@@ -122,17 +87,11 @@ export function isClipboardSyncPayload(value: unknown): value is ClipboardSyncPa
     if (!commonValid) {
       return false;
     }
-    if (keys.length === CLIPBOARD_LEGACY_PAYLOAD_KEYS.length
-      && CLIPBOARD_LEGACY_PAYLOAD_KEYS.every((key) => Object.hasOwn(value, key))) {
-      return value.type === CLIPBOARD_PROTOCOL_TYPE
-      && value.kind === CLIPBOARD_PAYLOAD_KIND
-      && isClipboardTextWithinLimits(text);
-    }
-    if (keys.length !== CLIPBOARD_RICH_PAYLOAD_KEYS.length
-      || !CLIPBOARD_RICH_PAYLOAD_KEYS.every((key) => Object.hasOwn(value, key))) {
+    if (keys.length !== CLIPBOARD_PAYLOAD_KEYS.length
+      || !CLIPBOARD_PAYLOAD_KEYS.every((key) => Object.hasOwn(value, key))) {
       return false;
     }
-    if (value.type !== CLIPBOARD_RICH_PROTOCOL_TYPE
+    if (value.type !== CLIPBOARD_PROTOCOL_TYPE
       || !isClipboardContentKind(value.kind)
       || (typeof value.html !== "string" && value.html !== null)) {
       return false;
@@ -147,14 +106,9 @@ export function isClipboardSyncPayload(value: unknown): value is ClipboardSyncPa
 }
 
 export function clipboardPayloadHtml(payload: ClipboardSyncPayload) {
-  return payload.type === CLIPBOARD_RICH_PROTOCOL_TYPE && payload.kind === "html"
+  return payload.kind === "html"
     ? payload.html ?? ""
     : "";
-}
-
-function isClipboardTextWithinLimits(text: string) {
-  return text.length <= CLIPBOARD_TEXT_MAX_CHARS
-    && new TextEncoder().encode(text).byteLength <= CLIPBOARD_TEXT_MAX_UTF8_BYTES;
 }
 
 function isClipboardContentWithinLimits(text: string, html: string) {

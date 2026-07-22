@@ -338,7 +338,7 @@ export function AuthDialog() {
                 </>
               )}
 
-              {!isVerifyingEmail && oidcConfig?.turnstileEnabled && (
+              {oidcConfig?.turnstileEnabled && (
                 <div id="auth-turnstile" className="auth-dialog-turnstile" aria-live="polite" />
               )}
 

@@ -4,6 +4,7 @@ export const DIAGRAM_FILE_EXTENSION = ".stdg";
 export const DIAGRAM_FILE_MIME = "application/vnd.shuai-tunnel.diagram+json";
 export const MAX_DIAGRAM_DOCUMENT_BYTES = 2 * 1024 * 1024;
 export const MAX_DIAGRAM_UPDATE_BASE64_LENGTH = 4 * 1024 * 1024;
+export const MAX_DIAGRAM_BINARY_UPDATE_BYTES = 4 * 1024 * 1024;
 export const MAX_DIAGRAM_NODES = 1_000;
 export const MAX_DIAGRAM_EDGES = 2_000;
 export const MAX_DIAGRAM_PAGES = 50;
@@ -182,19 +183,19 @@ export interface DiagramDocumentV1 {
 
 export type DiagramPayload =
   | {
-      type: "STDG1";
+      type: "STDG2";
       kind: "diagram-update";
-      update: string;
+      update: Uint8Array;
       createdAt: number;
     }
   | {
-      type: "STDG1";
+      type: "STDG2";
       kind: "diagram-sync-request";
       requestId: string;
       createdAt: number;
     }
   | {
-      type: "STDG1";
+      type: "STDG2";
       kind: "diagram-presence";
       pageId: string;
       selectedIds: string[];
@@ -250,14 +251,13 @@ export function parseDiagramDocument(source: string): DiagramDocumentV1 {
 }
 
 export function isDiagramPayload(value: unknown): value is DiagramPayload {
-  if (!isRecord(value) || value.type !== "STDG1" || !isFiniteNumber(value.createdAt)) {
+  if (!isRecord(value) || value.type !== "STDG2" || !isFiniteNumber(value.createdAt)) {
     return false;
   }
   if (value.kind === "diagram-update") {
-    return typeof value.update === "string"
-      && value.update.length > 0
-      && value.update.length <= MAX_DIAGRAM_UPDATE_BASE64_LENGTH
-      && isBase64(value.update);
+    return value.update instanceof Uint8Array
+      && value.update.byteLength > 0
+      && value.update.byteLength <= MAX_DIAGRAM_BINARY_UPDATE_BYTES;
   }
   if (value.kind === "diagram-sync-request") {
     return isIdentifier(value.requestId);

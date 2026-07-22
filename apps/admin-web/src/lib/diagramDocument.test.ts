@@ -319,19 +319,19 @@ describe("diagram document", () => {
     }))).toThrow("包含无效");
   });
 
-  it("encodes Yjs updates for JSON transport", () => {
+  it("keeps Yjs collaboration updates binary", () => {
     const update = new Uint8Array([0, 1, 2, 127, 128, 254, 255]);
     const encoded = encodeDiagramUpdate(update);
 
     expect(Array.from(decodeDiagramUpdate(encoded))).toEqual(Array.from(update));
     expect(isDiagramPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-update",
-      update: encoded,
+      update,
       createdAt: 1,
     })).toBe(true);
     expect(isDiagramPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-update",
       update: "not base64",
       createdAt: 1,
@@ -340,13 +340,13 @@ describe("diagram document", () => {
 
   it("validates sync requests", () => {
     expect(isDiagramPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-sync-request",
       requestId: "peer-a-request-1",
       createdAt: 1,
     })).toBe(true);
     expect(isDiagramPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-sync-request",
       requestId: "",
       createdAt: 1,
@@ -355,7 +355,7 @@ describe("diagram document", () => {
 
   it("validates collaborative presence updates", () => {
     expect(isDiagramPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-presence",
       pageId: "page-1",
       selectedIds: ["node-1"],
@@ -363,7 +363,7 @@ describe("diagram document", () => {
       createdAt: Date.now(),
     })).toBe(true);
     expect(isDiagramPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-presence",
       pageId: "page-1",
       selectedIds: Array.from({ length: 101 }, (_, index) => `node-${index}`),

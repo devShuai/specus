@@ -7,7 +7,6 @@ import {
   createClipboardSessionId,
   createClipboardSyncPayload,
   isClipboardSyncPayload,
-  serializeClipboardRelayEnvelope,
   type ClipboardInboundEvent,
   type ClipboardSyncPayload,
 } from "./clipboardSync";
@@ -20,7 +19,7 @@ afterEach(() => {
 });
 
 describe("clipboard sync payload", () => {
-  it("creates a valid STCLIP1 text payload", () => {
+  it("creates a valid STCLIP2 text payload", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-11T01:02:03.000Z"));
 
@@ -29,8 +28,9 @@ describe("clipboard sync payload", () => {
 
     expect(sessionId).toMatch(UUID_PATTERN);
     expect(payload).toMatchObject({
-      type: "STCLIP1",
+      type: "STCLIP2",
       kind: "text",
+      html: null,
       sessionId,
       sequence: 7,
       text: "hello\n剪贴板",
@@ -120,7 +120,7 @@ describe("clipboard sync payload", () => {
     null,
     [],
     {},
-    { ...validPayload("ok"), type: "STCLIP2" },
+    { ...validPayload("ok"), type: "STCLIP1" },
     { ...validPayload("ok"), kind: "html" },
     { ...validPayload("ok"), id: "" },
     { ...validPayload("ok"), sessionId: " padded " },
@@ -161,31 +161,15 @@ describe("clipboardSyncEventKey", () => {
   });
 });
 
-describe("serializeClipboardRelayEnvelope", () => {
-  it("creates the targeted discovery WebSocket envelope", () => {
-    const payload = validPayload("hello");
-    expect(JSON.parse(serializeClipboardRelayEnvelope("peer-b", payload))).toEqual({
-      type: "clipboard",
-      targetPeerId: "peer-b",
-      payload,
-    });
-  });
-
-  it("rejects JSON escape expansion beyond the discovery message limit", () => {
-    const payload = validPayload("\0".repeat(11_000));
-    expect(isClipboardSyncPayload(payload)).toBe(true);
-    expect(() => serializeClipboardRelayEnvelope("peer-b", payload)).toThrow(RangeError);
-  });
-});
-
 function validPayload(text: string): ClipboardSyncPayload {
   return {
-    type: "STCLIP1",
+    type: "STCLIP2",
     kind: "text",
     id: "message-a",
     sessionId: "session-a",
     sequence: 1,
     text,
     createdAt: 1_752_195_723_000,
+    html: null,
   };
 }

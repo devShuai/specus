@@ -80,13 +80,14 @@ function inboundEvent(
   receivedAt: number,
 ): ClipboardInboundEvent {
   const payload: ClipboardSyncPayload = {
-    type: "STCLIP1",
+    type: "STCLIP2",
     kind: "text",
     id: eventId,
     sessionId: "session-a",
     sequence: receivedAt,
     text,
     createdAt: receivedAt,
+    html: null,
   };
   return { eventId, sourcePeerId, payload, receivedAt };
 }

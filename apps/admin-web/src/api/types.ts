@@ -492,6 +492,14 @@ export interface PeerMeshNatTypeStat {
   devices: number;
 }
 
+export interface PeerMeshAddressFamilyStat {
+  addressFamily: "IPv4" | "IPv6" | "UNKNOWN" | string;
+  status: string;
+  pathType: string;
+  sessions: number;
+  reportedSessions: number;
+}
+
 export interface PeerMeshNatBehaviorStat {
   behavior: string;
   devices: number;
@@ -506,6 +514,8 @@ export interface PeerMeshPathStats {
   /** 活跃会话中 DIRECT 占比，打洞成功率的代理指标；无活跃会话时为 null */
   activeDirectRatio: number | null;
   pathTypes: PeerMeshPathTypeStat[];
+  /** 按实际 PATH_REPORT 端点区分的 IPv4/IPv6 路径；未上报端点时为 UNKNOWN */
+  addressFamilies: PeerMeshAddressFamilyStat[];
   natTypes: PeerMeshNatTypeStat[];
   /** 至少上报映射、过滤或探测方式之一的设备数 */
   natBehaviorDevices: number;
@@ -685,4 +695,9 @@ export interface LiveConnectionEvent {
   tenantId?: string;
   type: "created" | "updated";
   connection: ConnectionRecord;
+}
+
+export interface WebSocketTicket {
+  ticket: string;
+  expiresAt: string;
 }

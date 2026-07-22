@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { encodeDiagramUpdate } from "../lib/diagramDocument";
 import { MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH } from "../lib/whiteboardImageCompression";
 import { isWhiteboardPayload } from "./SyncedWhiteboard";
 
@@ -107,13 +106,13 @@ describe("isWhiteboardPayload", () => {
 
   it("accepts professional diagram updates and sync requests", () => {
     expect(isWhiteboardPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-update",
-      update: encodeDiagramUpdate(new Uint8Array([1, 2, 3])),
+      update: new Uint8Array([1, 2, 3]),
       createdAt: 108,
     })).toBe(true);
     expect(isWhiteboardPayload({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-sync-request",
       requestId: "peer-a-sync-1",
       createdAt: 109,

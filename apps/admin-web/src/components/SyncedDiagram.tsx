@@ -87,6 +87,7 @@ import {
   MAX_DIAGRAM_NODES,
   MAX_DIAGRAM_PAGES,
   MAX_DIAGRAM_UPDATE_BASE64_LENGTH,
+  MAX_DIAGRAM_BINARY_UPDATE_BYTES,
   parseDiagramDocument,
 } from "../lib/diagramDocument";
 import type {
@@ -121,6 +122,7 @@ import {
   PLANTUML_FILE_EXTENSIONS,
 } from "../lib/diagramTextFormats";
 import { signedRotationDelta } from "../lib/diagramRotation";
+import { preserveTouchTap } from "../lib/diagramPointerInput";
 import {
   exportVisioVdx,
   parseVisioVdx,
@@ -1279,16 +1281,15 @@ export function SyncedDiagram({
   }, [clearSyncRetry]);
 
   const sendYUpdate = useCallback((update: Uint8Array, fullState = false) => {
-    const encoded = encodeDiagramUpdate(update);
-    if (encoded.length > MAX_DIAGRAM_UPDATE_BASE64_LENGTH) {
+    if (update.byteLength > MAX_DIAGRAM_BINARY_UPDATE_BYTES) {
       setStatus("流程图同步数据超过 4 MB，请导出后精简文档再继续协作。");
       return false;
     }
     try {
       const delivery = onSendRef.current({
-        type: "STDG1",
+        type: "STDG2",
         kind: "diagram-update",
-        update: encoded,
+        update,
         createdAt: Date.now(),
       });
       void Promise.resolve(delivery).then(
@@ -1320,7 +1321,7 @@ export function SyncedDiagram({
     lastPresenceSentRef.current = now;
     const graph = runtimeRef.current?.graph;
     onSendRef.current({
-      type: "STDG1",
+      type: "STDG2",
       kind: "diagram-presence",
       pageId: activePageId,
       selectedIds: graph?.getSelectionCells().map((cell) => cell.getId()).filter((id): id is string => Boolean(id)).slice(0, 100) ?? [],
@@ -2039,7 +2040,7 @@ export function SyncedDiagram({
       }
       seenEventsRef.current.add(event.eventId);
       const payload = event.payload;
-      if (event.sourcePeerId === peerId || payload.type !== "STDG1") {
+      if (event.sourcePeerId === peerId || payload.type !== "STDG2") {
         continue;
       }
       if (payload.kind === "diagram-sync-request") {
@@ -2062,7 +2063,7 @@ export function SyncedDiagram({
         continue;
       }
       try {
-        const update = decodeDiagramUpdate(payload.update);
+        const update = payload.update;
         flushPendingGraphSync();
         const validator = remoteUpdateValidatorRef.current;
         if (!validator || !validator.validate(update, document)) {
@@ -2095,7 +2096,7 @@ export function SyncedDiagram({
     }
     const timer = window.setTimeout(() => {
       onSendRef.current({
-        type: "STDG1",
+        type: "STDG2",
         kind: "diagram-sync-request",
         requestId: createDiagramId(peerId, "sync"),
         createdAt: Date.now(),
@@ -2380,6 +2381,7 @@ export function SyncedDiagram({
         true,
         true,
       );
+      source.mouseDown = preserveTouchTap(source.mouseDown.bind(source));
       source.previewOffset = new Point(-preview.width / 2, -preview.height / 2);
       source.dragElementOpacity = 100;
       source.setGuidesEnabled(true);
