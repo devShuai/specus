@@ -60,7 +60,7 @@ if (changed || now - session.lastPathReportMillis >= 60_000) {
 }
 ```
 
-### R1-1 应答方永不上报 — OPEN
+### R1-1 应答方永不上报 — DONE（2026-07-22）
 
 位置：`PeerMeshClient.markPathFromInboundCheck`（约 L2699）。
 
@@ -68,7 +68,7 @@ if (changed || now - session.lastPathReportMillis >= 60_000) {
 **全程没有 `reportPath`**（direct 分支同样没有）。若某端的中继路径只由入站探针建立，
 该 session 永远不会被激活。
 
-### R1-2 session 换号后上报被抑制（最可能的现场主因） — OPEN
+### R1-2 session 换号后上报被抑制（最可能的现场主因） — DONE（2026-07-22）
 
 位置：`PeerMeshClient.rememberSession`（约 L706-718）。
 
@@ -79,13 +79,13 @@ if (changed || now - session.lastPathReportMillis >= 60_000) {
 
 抑制条件基于"路径是否变化"，却跨越了 **session 身份变化**，这是缺陷本质。
 
-### R1-3 先 flush 后上报的竞态 — OPEN
+### R1-3 先 flush 后上报的竞态 — DONE（2026-07-22）
 
 即便走正常路径，`flushPendingPackets(session)` 与 `reportPath(...)` 在同一调用内完成，
 而上报要经 TCP 控制连接 + 数据库写入。该窗口内发出的帧全部被服务端丢弃。
 peer 应用消息**没有 ARQ**（Java 侧仅回 ACK，无重传），丢一条即表现为"文件发送失败"。
 
-### R1-4 `TurnAuth.none()` 返回 clientId=0 — OPEN
+### R1-4 `TurnAuth.none()` 返回 clientId=0 — DONE（2026-07-22）
 
 位置：`StunTurnServer.TurnAuth.none()`（约 L929）。
 
@@ -115,7 +115,7 @@ peer 应用消息**没有 ARQ**（Java 侧仅回 ACK，无重传），丢一条�
 
 **三重独立阻断，任何一条都足以让 relay 候选完全不通：**
 
-### R2-1 TURN 凭证 subject 解析不出 clientId — OPEN
+### R2-1 TURN 凭证 subject 解析不出 clientId — DONE（2026-07-22，方案 A）
 
 位置：`PublicPeerMeshResource.iceConfig`（约 L62）签发
 `turnCredentialService.issue("public-transfer")`。
@@ -124,13 +124,13 @@ peer 应用消息**没有 ARQ**（Java 侧仅回 ACK，无重传），丢一条�
 （约 L84-98），`"public-transfer"` 解析结果为 **0** → `authorizeRelayPayload` 首个条件
 `source.clientId <= 0` 即返回 false → **所有**中继载荷被丢。
 
-### R2-2 目标必须是本服务端的另一个 allocation — OPEN
+### R2-2 目标必须是本服务端的另一个 allocation — DONE（2026-07-22，方案 A）
 
 `allocationForRelayEndpoint(peer)`（约 L744）要求对端地址是本服务端上的 relay 地址。
 WebRTC 的典型组合是"一端 relay、另一端 srflx/host"，此时 `target == null` → 直接拒绝。
 标准 TURN 允许向任意获得 permission 的对端转发，当前实现不满足该语义。
 
-### R2-3 载荷类型不匹配 — OPEN
+### R2-3 载荷类型不匹配 — DONE（2026-07-22，方案 A）
 
 WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连通性检查**，
 既不是 `SPM2` 帧，也不是 `{` 开头的 `PeerUdpProbe` JSON，因此必然落到
@@ -154,7 +154,127 @@ WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连
 
 ---
 
-## 3. 验证缺口
+## 3. 落地记录（2026-07-22）
+
+已选定**方案 A：按用途放行通用 TURN**，全部 R1/R2 项已实现，Java 服务端 125 项测试通过
+（含新增 6 项），客户端 42 项通过。
+
+### 服务端
+
+- `PeerMeshService.authorizeRelayFrameForRelaySlow`：**首个通过身份校验的中继业务帧隐式激活
+  `NEGOTIATING` 会话**（设 `ACTIVE` + `pathType=RELAY`），`CLOSED`/过期/身份不匹配仍硬拒。
+  这条根治 R1-3 的竞态，且与客户端语言无关，同时覆盖 Android/Go/.NET。
+- `matchesSessionPeers` 与 `RelayAuthorization.matches`：`0/0` 表示"调用方无法确定身份"
+  （TURN 认证关闭），退化为仅校验会话存在且未关闭，而不是一律拒绝（R1-4）。
+- `TurnCredentialService.isGeneralRelaySubject`：识别 `public-transfer` 前缀的凭证。
+- `TurnAuth` / `Allocation` 增加 `generalRelay` 标记，`Allocate` 时按凭证用途绑定；用途变化
+  会重建 allocation。
+- `authorizeRelayPayload`：任一侧为通用中继 allocation 即按标准 TURN 放行（出站看 source、
+  入站看 target），不再要求载荷是 SPM2/probe，也不再要求对端是本机 allocation（R2-1~R2-3）。
+- `isRelayableDestination`：**仅对通用中继**执行目的地址白名单——拒绝回环、任意地址、
+  link-local、site-local、组播、`100.64.0.0/10`（含 Peer Mesh 虚拟网段）与 IPv6 ULA，
+  在 `CreatePermission` 与 `ChannelBind` 两处返回 `403 forbidden-peer-address`。
+  Peer Mesh 专用模式不受该策略影响（本地/私网部署会用到回环与站点本地地址）。
+
+### 客户端（Java 基准实现）
+
+- `markPathFromInboundCheck` 的 relay 与 direct 分支都会 `maybeReportPath`（R1-1）。
+- 新增 `maybeReportPath`：除"路径变化""满 60 秒"外，**sessionId 变化时强制上报**，
+  上报状态改用 `lastReportedSessionIds` / `lastReportedPathType` / `lastReportedRemoteText`
+  独立跟踪，不再受继承自旧 session 的 `lastPathReportMillis` 抑制（R1-2）。
+- `completeUdpProbe` 改为**先上报、再 `flushPendingPackets`**（R1-3）。
+
+### 新增测试
+
+- `PeerMeshServiceTests`：NEGOTIATING 会话被首帧激活、CLOSED/身份不匹配仍拒绝且不激活、
+  `0/0` 未识别身份时放行。
+- `TurnCredentialServiceTests`：`pm-<id>` 解析出 clientId 且非通用中继、`public-transfer`
+  识别为通用中继且无 clientId、未知 subject 两者皆否。
+
+### 通用中继配额与审计（2026-07-22 补齐）
+
+方案 A 让通用中继按标准 TURN 语义转发任意载荷，因此必须有独立于 Peer Mesh 的资源边界。
+配额只作用于 `generalRelay` allocation，Peer Mesh 专用 allocation 不受影响：
+
+| 配置项 | 环境变量 | 默认 | 说明 |
+| --- | --- | ---: | --- |
+| `general-relay-max-allocations` | `TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS` | `256` | 并发 allocation 总数；**设为 0 即关闭通用中继**（网页端退回仅 STUN） |
+| `general-relay-max-allocations-per-address` | `..._MAX_ALLOCATIONS_PER_ADDRESS` | `4` | 同一来源 IP 的并发 allocation 上限 |
+| `general-relay-rate-bytes-per-second` | `..._RATE_BYTES_PER_SECOND` | `2 MiB/s` | 单 allocation 令牌桶限速，0 表示不限 |
+| `general-relay-max-bytes` | `..._MAX_BYTES` | `512 MiB` | 单 allocation 生命周期累计转发上限，0 表示不限 |
+
+实现要点：
+
+- 准入在 `Allocate` 阶段判定，超限返回标准 `486 Allocation Quota Reached`，
+  拒绝原因为 `general-relay-disabled` / `general-relay-allocation-quota` /
+  `general-relay-address-quota`；重建自身 allocation 时会排除旧实例，避免被自己占用的名额挡住。
+- 转发配额在出站（Send Indication / ChannelData）与入站（relay 收包）两个方向都执行：
+  先记生命周期累计字节，超过 `max-bytes` 后一律丢弃并只告警一次；再走令牌桶限速。
+- 审计日志统一带 `[peer-mesh][audit]` 前缀：allocation 创建、配额拒绝、目的地址拒绝
+  （CreatePermission 与 ChannelBind 两处）、字节配额耗尽，均记录来源端点与对端地址。
+
+新增指标：
+
+- `tunnel.peer_mesh.turn.general_relay.quota.rejected`
+- `tunnel.peer_mesh.turn.general_relay.destination.forbidden`
+- `tunnel.peer_mesh.turn.general_relay.rate.limited`
+- `tunnel.peer_mesh.turn.general_relay.bytes`
+
+配套测试：`StunTurnServerMetricsTests` 覆盖目的地址白名单（公网 v4/v6 放行；回环、`0.0.0.0`、
+站点本地、link-local、组播、`100.64.0.0/10`、IPv6 ULA、零端口拒绝）与令牌桶限速语义。
+
+### 跨语言对齐（2026-07-22 补齐）
+
+四端全部落地并回归通过：Java 服务端 127、Go 服务端 peermesh/config/server 全绿、
+.NET 服务端 137、Android 单元测试通过。
+
+**Go 服务端**（`internal/peermesh/`、`internal/config/`）
+
+- `authorizeRelayFrame`：CLOSED 硬拒；`matchesSessionPeers` 校验身份；首帧隐式激活
+  NEGOTIATING 会话（`StatusActive` + `PathRelay`）。
+- `validRelayPeers` 与 `relayAuthorization.matches`：`0/0` 表示身份未知（TURN 认证关闭）。
+- `turnCredentialService.isGeneralRelaySubject`、`turnAuth.generalRelay`、
+  `relayAllocation.GeneralRelay`：按凭证用途绑定 allocation，用途变化触发重建。
+- `authorizeRelayPayload`：任一侧为通用中继即按标准 TURN 放行。
+- `generalRelayQuotaRejection` / `allowGeneralRelayTraffic` / `isRelayableDestination`：
+  与 Java 同语义的准入配额、令牌桶+字节上限、目的地址白名单，`486` / `403` 标准错误码。
+
+**.NET 服务端**（`ShuaiTunnel.Server/PeerMesh/`）
+
+- `AuthorizeRelayFrameCoreAsync`、`ValidRelayPeers`、`MatchesSessionPeers`、
+  `RelayAuthorization.Matches` 与 Java 一致；同样实现首帧隐式激活。
+- `TurnCredentialService.IsGeneralRelaySubject`、`TurnAuth.GeneralRelay`、
+  `Allocation.GeneralRelay`、`GeneralRelayQuotaRejection`、`AllowGeneralRelayTraffic`、
+  `IsRelayableDestination` 全部对齐。
+
+**Android 客户端**
+
+- `markSessionPath` 已同时服务入站（`handleProbeCheck`）与出站（`handleProbeResponse`）
+  且本就会上报，因此不存在 Java 侧的 R1-1；
+- 补齐 R1-2：新增 `lastReportedSessionIds`，**sessionId 变化时强制上报**，
+  不再被继承自旧 session 的 `lastPathReportMillis` 抑制；停止时一并清理。
+
+**新增测试**
+
+- Go：`TestAuthorizeRelayFrameActivatesNegotiatingSession`、
+  `...RejectsClosedSessionAndMismatchedPeers`、`...AllowsUnidentifiedPeersWhenTurnAuthDisabled`、
+  `TestGeneralRelayDestinationPolicy`。
+- .NET：`RelayFrameActivatesNegotiatingSession`、`RelayFrameRejectsClosedSessionAndMismatchedPeers`、
+  `RelayFrameAllowsUnidentifiedPeersWhenTurnAuthDisabled`、
+  `GeneralRelayDestinationPolicyRejectsNonPublicTargets`。
+- Go/.NET 中原先断言"NEGOTIATING 会话必须被拒"的用例已按新语义改写（该断言正是被修复的缺陷）。
+
+**部署配置**：三份 `tunnel-server.env.example`（java/go/csharp）与 Java `application.yml`
+均已补充四个通用中继配额项。
+
+### 仍待办
+
+- 浏览器端到端回归（relay 候选完成 DataChannel 建链）尚未自动化；当前只有单元级的目的地址
+  策略与配额语义覆盖，真实 WebRTC 链路仍需手工验证。
+- 通用中继配额默认值（2 MiB/s、512 MiB、256 路）按经验取值，未经实测；公网放量前应结合
+  带宽成本与典型文件大小复核。
+
+## 4. 验证缺口
 
 当前测试只有 `StunTurnServerMetricsTests`（relay worker 队列指标），
 没有任何一条覆盖 relay 转发语义的用例。建议补：
@@ -165,7 +285,7 @@ WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连
 4. `turn-auth-required=false` 时中继仍可用；
 5. 两个 allocation 之间的 hairpin 转发（A relay → B relay）往返成功。
 
-## 相关文档
+## 5. 相关文档
 
 - 打洞成功率审计：`peer-mesh-hole-punching-audit-2026-07.md`
 - 数据面性能审计：`peer-mesh-dataplane-optimization-audit-2026-07.md`
