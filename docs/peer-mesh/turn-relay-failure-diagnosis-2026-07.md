@@ -267,6 +267,46 @@ WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连
 **部署配置**：三份 `tunnel-server.env.example`（java/go/csharp）与 Java `application.yml`
 均已补充四个通用中继配额项。
 
+## 3bis. 配额回归修复（2026-07-23）
+
+上线方案 A 后，网页互传"仍会传送文件失败"。复查发现故障源正是上一轮为通用中继新加的两处配额，
+均属回归：
+
+### G-1 令牌桶限速静默丢 SCTP 包（主因） — DONE
+
+内置 TURN 下发的 URL 是 `turn:host:3478?transport=udp`，浏览器 DataChannel 是
+SCTP-over-DTLS-over-UDP。通用中继默认 2 MiB/s 令牌桶远低于 WebRTC 实际发送速率
+（浏览器文件上限 128 MiB，客户端 `bufferedAmount` 阈值 4 MiB），超出的 UDP 包被服务端
+`return` / `continue` **静默丢弃**。
+
+这对可靠传输是灾难：SCTP 的拥塞控制与重传被打乱，有效吞吐崩溃、重传堆积，上层
+`file-complete` ACK 60 秒超时 → "对方未确认完成"。**每一次正常传输都会触发。**
+
+标准 TURN（coturn）从不靠丢包限速——带宽控制在 allocation 准入层（`user-quota` /
+`total-quota`）。修法：**移除包级令牌桶**。防滥用改为纯准入（并发 allocation 数、同源上限）
++ 总量（`max-bytes`）；单 allocation 累计超过 `max-bytes` 时**关闭 allocation**，让 SCTP
+干净断开，而不是拖进持续丢包。删除 `general-relay-rate-bytes-per-second` 配置与
+`rate.limited` 指标，新增 `general_relay.quota.closed` 指标。
+
+### G-2 `100.64.0.0/10` 整段被拒，误伤 CGNAT 对端 — DONE
+
+`isRelayableDestination` 为防打到 Peer Mesh 虚拟网段（默认 `100.96.0.0/11`）而拒绝了整个
+`100.64.0.0/10`。但该段是 RFC 6598 运营商级 CGNAT，大量家宽/移动用户的公网 srflx 地址
+落在此段，CreatePermission 直接 `403` → relay 建不起来。
+
+关键点：通用中继的对端是**浏览器的真实公网地址**，永远不可能是只在 overlay 内部使用的 mesh
+虚拟 IP，因此这条防护对通用中继毫无意义、纯粹误伤。修法：**放行 `100.64.0.0/10`**，仅保留
+拒绝回环、any、link-local、RFC1918 私网、组播、IPv6 ULA。
+
+### 落地范围
+
+- 三端服务端（Java / Go / .NET）`allowGeneralRelayTraffic` 删令牌桶、超量关闭 allocation；
+  `isRelayableDestination` 放行 CGNAT；删除 rate 配置项。
+- 测试：目的地址用例断言 `100.64.0.2` / `100.96.0.2` 放行；删除令牌桶速率测试。
+- 三份 env 模板与 `application.yml` 移除 rate 变量。
+- 回归全绿：Java 服务端 136、Go 服务端 peermesh/config/server、.NET peer 19、
+  各端目的地址策略测试通过。
+
 ### 仍待办
 
 - 浏览器端到端回归（relay 候选完成 DataChannel 建链）尚未自动化；当前只有单元级的目的地址
