@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   Button,
   Card,
@@ -866,6 +866,16 @@ function NatCheckSteps({ phase }: { phase: NatCheckProgressPhase }) {
   );
 }
 
+// 检测各阶段的主色：随阶段推进从蓝过渡到绿，给检测动画一个明确的前进感。
+const NAT_PHASE_ACCENTS: Record<NatCheckProgressPhase, string> = {
+  idle: "#0a84ff",
+  preparing: "#0a84ff",
+  validating: "#5e5ce6",
+  probing: "#2ea5ff",
+  analyzing: "#30d158",
+  complete: "#30d158",
+};
+
 function NatDetectionOrb({
   embedded,
   checking,
@@ -887,6 +897,8 @@ function NatDetectionOrb({
   const progressOffset = circumference * (1 - ringPercent / 100);
   const state = checking ? "checking" : result ? "complete" : "idle";
   const privacyId = embedded ? "embedded-nat-check-privacy" : "public-nat-check-privacy";
+  const gradientId = useId();
+  const accentStyle = { "--nat-orb-accent": checking ? NAT_PHASE_ACCENTS[progress.phase] : "#0a84ff" } as CSSProperties;
   const centerText = checking
     ? progress.responded > 0 && progress.total > 0
       ? `${progress.responded}/${progress.total}`
@@ -910,68 +922,77 @@ function NatDetectionOrb({
           aria-valuetext={progress.label}
         />
       )}
-      <button
-        type="button"
-        aria-disabled={checking}
-        aria-busy={checking}
-        aria-describedby={checking ? undefined : privacyId}
-        aria-label={checking ? "正在检测 NAT 类型" : result ? "重新检测 NAT 类型" : "点我检测 NAT 类型"}
-        data-state={state}
-        onClick={onRun}
-        className={`nat-detect-orb group relative isolate flex shrink-0 items-center justify-center rounded-full border text-center outline-none transition duration-300 ease-out focus-visible:ring-4 focus-visible:ring-primary-500/30 focus-visible:ring-offset-4 focus-visible:ring-offset-background motion-reduce:transform-none motion-reduce:transition-none ${
-          embedded ? "h-28 w-28" : "h-40 w-40"
-        } ${checking ? "cursor-wait" : "cursor-pointer hover:scale-[1.025] active:scale-[0.975]"}`}
-      >
-        <span className="nat-detect-orbit absolute -inset-3 rounded-full border border-primary-500/20 dark:border-primary-300/20" aria-hidden="true" />
-        <span className="nat-detect-orbit-secondary absolute -inset-6 rounded-full border border-dashed border-primary-500/10 dark:border-primary-300/10" aria-hidden="true" />
-        {checking && (
-          <>
-            <span className="nat-detect-ripple" aria-hidden="true" />
-            <span className="nat-detect-ripple nat-detect-ripple-delay" aria-hidden="true" />
-          </>
-        )}
-        {checking && (
-          <svg aria-hidden="true" className={`absolute inset-0 h-full w-full -rotate-90 ${determinate ? "" : "nat-detect-progress-indeterminate"}`} viewBox="0 0 100 100">
-            <circle cx="50" cy="50" r={radius} fill="none" stroke="currentColor" strokeWidth="3" className="text-primary-500/15 dark:text-primary-300/15" />
-            <circle
-              cx="50"
-              cy="50"
-              r={radius}
-              fill="none"
-              stroke="currentColor"
-              strokeLinecap="round"
-              strokeWidth="3"
-              strokeDasharray={determinate ? circumference : `72 ${circumference - 72}`}
-              strokeDashoffset={determinate ? progressOffset : 0}
-              className="text-primary-600 dark:text-primary-300"
-            />
-            {determinate && (
+      <div className="nat-orb-stage" data-state={state}>
+        <span className="nat-orb-halo" style={accentStyle} aria-hidden="true" />
+        <button
+          type="button"
+          aria-disabled={checking}
+          aria-busy={checking}
+          aria-describedby={checking ? undefined : privacyId}
+          aria-label={checking ? "正在检测 NAT 类型" : result ? "重新检测 NAT 类型" : "点我检测 NAT 类型"}
+          data-state={state}
+          onClick={onRun}
+          style={accentStyle}
+          className={`nat-detect-orb group relative isolate flex shrink-0 items-center justify-center rounded-full text-center outline-none focus-visible:ring-4 focus-visible:ring-primary-500/30 focus-visible:ring-offset-4 focus-visible:ring-offset-background motion-reduce:transform-none motion-reduce:transition-none ${
+            embedded ? "h-28 w-28" : "h-40 w-40"
+          } ${checking ? "cursor-wait" : "cursor-pointer"}`}
+        >
+          <span className="nat-orbit-ring" aria-hidden="true" />
+          <span className="nat-orbit-ring nat-orbit-ring-alt" aria-hidden="true" />
+          {checking && (
+            <>
+              <span className="nat-detect-ripple" aria-hidden="true" />
+              <span className="nat-detect-ripple nat-detect-ripple-delay" aria-hidden="true" />
+            </>
+          )}
+          {checking && (
+            <svg aria-hidden="true" className={`absolute inset-0 h-full w-full -rotate-90 ${determinate ? "" : "nat-detect-progress-indeterminate"}`} viewBox="0 0 100 100">
+              <defs>
+                <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" style={{ stopColor: "var(--nat-orb-accent, #0a84ff)" }} />
+                  <stop offset="100%" style={{ stopColor: "var(--app-apple-blue, #0066cc)" }} />
+                </linearGradient>
+              </defs>
+              <circle cx="50" cy="50" r={radius} fill="none" stroke="currentColor" strokeWidth="3" className="text-primary-500/15 dark:text-primary-300/15" />
               <circle
-                cx={50 + radius * Math.cos((ringPercent / 100) * 2 * Math.PI)}
-                cy={50 + radius * Math.sin((ringPercent / 100) * 2 * Math.PI)}
-                r="3.4"
-                fill="currentColor"
-                className="nat-detect-progress-head text-primary-600 dark:text-primary-300"
+                cx="50"
+                cy="50"
+                r={radius}
+                fill="none"
+                stroke={`url(#${gradientId})`}
+                strokeLinecap="round"
+                strokeWidth="3"
+                strokeDasharray={determinate ? circumference : `72 ${circumference - 72}`}
+                strokeDashoffset={determinate ? progressOffset : 0}
               />
-            )}
-          </svg>
-        )}
-        <span className="relative z-10 flex max-w-[82%] flex-col items-center gap-1">
-          {!checking && (
-            <svg aria-hidden="true" className="mb-0.5 h-7 w-7 text-primary-700 dark:text-primary-200" viewBox="0 0 32 32" fill="none">
-              <circle cx="16" cy="16" r="3" fill="currentColor" />
-              <circle cx="16" cy="16" r="8" stroke="currentColor" strokeWidth="1.5" opacity="0.65" />
-              <path d="M5.5 16a10.5 10.5 0 0 1 21 0M2.5 16a13.5 13.5 0 0 1 27 0" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.4" />
+              {determinate && (
+                <circle
+                  cx={50 + radius * Math.cos((ringPercent / 100) * 2 * Math.PI)}
+                  cy={50 + radius * Math.sin((ringPercent / 100) * 2 * Math.PI)}
+                  r="3.4"
+                  fill="currentColor"
+                  className="nat-detect-progress-head text-primary-600 dark:text-primary-300"
+                />
+              )}
             </svg>
           )}
-          <span className={`${checking ? "text-xl tabular-nums" : embedded ? "text-sm" : "text-base"} font-semibold text-zinc-950 dark:text-white`}>
-            {checking && determinate ? `${Math.round(ringPercent)}%` : centerText}
+          <span className="relative z-10 flex max-w-[82%] flex-col items-center gap-1">
+            {!checking && (
+              <svg aria-hidden="true" className="nat-orb-idle-icon mb-0.5 h-7 w-7 text-primary-700 dark:text-primary-200" viewBox="0 0 32 32" fill="none">
+                <circle cx="16" cy="16" r="3" fill="currentColor" />
+                <circle cx="16" cy="16" r="8" stroke="currentColor" strokeWidth="1.5" opacity="0.65" />
+                <path d="M5.5 16a10.5 10.5 0 0 1 21 0M2.5 16a13.5 13.5 0 0 1 27 0" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.4" />
+              </svg>
+            )}
+            <span className={`${checking ? "text-xl tabular-nums" : embedded ? "text-sm" : "text-base"} font-semibold text-zinc-950 dark:text-white`}>
+              {checking && determinate ? `${Math.round(ringPercent)}%` : centerText}
+            </span>
+            <span className="text-[10px] font-medium tracking-wide text-zinc-500 dark:text-zinc-400">
+              {checking ? "STUN 探测" : result ? "更新检测结果" : "浏览器直测"}
+            </span>
           </span>
-          <span className="text-[10px] font-medium tracking-wide text-zinc-500 dark:text-zinc-400">
-            {checking ? "STUN 探测" : result ? "更新检测结果" : "浏览器直测"}
-          </span>
-        </span>
-      </button>
+        </button>
+      </div>
       <div className="min-h-9 text-center text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
         {checking ? (
           <>
@@ -1011,21 +1032,21 @@ function NatOutcomeCard({
       <span className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}`} aria-hidden="true" />
       <div className="flex flex-wrap items-start gap-4 pt-1">
         <div
-          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center rounded-xl text-base font-semibold shadow-sm ${outcome.markerClass}`}
+          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl shadow-sm ${outcome.markerClass}`}
           aria-hidden="true"
         >
-          {outcome.level ? `${outcome.level}/4` : <StatusGlyph color={outcome.tone} className="h-6 w-6" />}
+          <StatusGlyph color={outcome.tone} className="h-6 w-6" />
         </div>
         <div className="min-w-0 flex-1">
           <p className="text-tiny font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">检测结果</p>
-          <div className="mt-1 flex flex-wrap items-center gap-2">
+          <div className="mt-1 flex flex-wrap items-center gap-2.5">
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white sm:text-3xl">{outcome.title}</h2>
             <Chip size="sm" radius="sm" variant="flat" className={`${outcome.textClass} bg-white/45 dark:bg-black/15`}>
               {outcome.reachability}
             </Chip>
           </div>
-          {outcome.level && <p className={`mt-1 text-small font-medium ${outcome.textClass}`}>直连难度 {outcome.level}/4</p>}
         </div>
+        {outcome.level ? <NatDifficultyMeter level={outcome.level} tone={outcome.tone} /> : null}
       </div>
       <p className="mt-4 max-w-3xl text-small leading-6 text-zinc-700 dark:text-zinc-300 sm:text-medium">
         {outcome.description}
@@ -1041,8 +1062,8 @@ function NatOutcomeCard({
       </div>
 
       <div className="mt-5 grid gap-3 sm:grid-cols-2">
-        <NatImpactCard title="游戏联机" experience={outcome.game} />
-        <NatImpactCard title="P2P / 语音视频" experience={outcome.p2p} />
+        <NatImpactCard title="游戏联机" icon={<GamepadIcon />} experience={outcome.game} />
+        <NatImpactCard title="P2P / 语音视频" icon={<PeerLinksIcon />} experience={outcome.p2p} />
       </div>
 
       <div className="mt-4 rounded-xl border border-black/[0.07] bg-white/45 p-3 dark:border-white/10 dark:bg-black/15">
@@ -1072,6 +1093,30 @@ function NatOutcomeCard({
   );
 }
 
+// 直连难度量表：四段刻度随结果揭晓依次点亮，颜色跟随结论 tone。
+function NatDifficultyMeter({ level, tone }: { level: BrowserNatLevel; tone: BrowserNatOutcome["tone"] }) {
+  return (
+    <div className="nat-level-meter shrink-0" role="img" aria-label={`直连难度 ${level}/4`}>
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-tiny font-medium text-zinc-500 dark:text-zinc-400">直连难度</span>
+        <span className="font-mono text-base font-bold text-zinc-900 dark:text-zinc-100">
+          {level}
+          <span className="text-tiny font-medium text-zinc-400 dark:text-zinc-500">/4</span>
+        </span>
+      </div>
+      <div className="mt-1.5 flex w-28 gap-1" aria-hidden="true">
+        {[1, 2, 3, 4].map((segment) => (
+          <span
+            key={segment}
+            className={`nat-level-segment ${segment <= level ? `is-on ${natToneBg(tone)}` : ""}`}
+            style={{ animationDelay: `${260 + segment * 110}ms` }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function NatEvidenceFact({ label, value }: { label: string; value: string }) {
   return (
     <div className="bg-white/55 px-3 py-2.5 dark:bg-zinc-950/55">
@@ -1085,13 +1130,36 @@ function verificationMethodLabel(method: BrowserNatVerificationMethod): string {
   return method === "RFC5780_WEBRTC_MAPPING" ? "四端点 + 共享 ICE" : "多 STUN 共享 ICE";
 }
 
-function NatImpactCard({ title, experience }: { title: string; experience: BrowserNatExperience }) {
+function NatImpactCard({ title, icon, experience }: { title: string; icon: ReactNode; experience: BrowserNatExperience }) {
   return (
     <section className="rounded-xl border border-black/[0.07] bg-white/55 p-4 dark:border-white/10 dark:bg-black/15">
-      <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">{title}</p>
-      <p className="mt-1 text-base font-semibold text-zinc-950 dark:text-white">{experience.verdict}</p>
+      <div className="flex items-center gap-2">
+        <span className="nat-impact-icon" aria-hidden="true">{icon}</span>
+        <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">{title}</p>
+      </div>
+      <p className="mt-2 text-base font-semibold text-zinc-950 dark:text-white">{experience.verdict}</p>
       <p className="mt-2 text-small leading-6 text-zinc-700 dark:text-zinc-300">{experience.description}</p>
     </section>
+  );
+}
+
+function GamepadIcon() {
+  return (
+    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6.5 7.5h11a4.5 4.5 0 0 1 4.4 5.4l-.9 4a3 3 0 0 1-5.2 1.4L14 16h-4l-1.8 2.3A3 3 0 0 1 3 16.9l-.9-4A4.5 4.5 0 0 1 6.5 7.5Z" />
+      <path d="M8 11v3M6.5 12.5h3M15.5 11.5h.01M17.5 13.5h.01" />
+    </svg>
+  );
+}
+
+function PeerLinksIcon() {
+  return (
+    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="6" cy="6" r="2.5" />
+      <circle cx="18" cy="6" r="2.5" />
+      <circle cx="12" cy="18" r="2.5" />
+      <path d="M8.2 7.3 10.5 16M15.8 7.3 13.5 16M8.5 6h7" />
+    </svg>
   );
 }
 

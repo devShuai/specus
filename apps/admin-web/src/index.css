@@ -4703,47 +4703,136 @@ body {
     radial-gradient(420px 260px at 8% 0%, color-mix(in srgb, var(--app-apple-blue) 10%, transparent), transparent 70%);
 }
 
+.nat-orb-stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  animation: nat-orb-float 5.4s ease-in-out infinite;
+}
+
+.nat-orb-halo {
+  position: absolute;
+  inset: -24px;
+  border-radius: 999px;
+  pointer-events: none;
+  background: radial-gradient(circle, color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 32%, transparent), transparent 68%);
+  filter: blur(16px);
+  opacity: 0.5;
+  transition: opacity 0.4s ease;
+}
+
+.nat-orb-stage:hover .nat-orb-halo {
+  opacity: 0.85;
+}
+
+.nat-orb-stage[data-state="checking"] .nat-orb-halo {
+  animation: nat-halo-pulse 2.3s ease-in-out infinite;
+}
+
 .nat-detect-orb {
-  border-color: color-mix(in srgb, var(--app-apple-blue) 42%, var(--app-apple-line));
+  border: 1px solid color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 45%, var(--app-apple-line));
   color: var(--app-apple-blue);
   background:
-    radial-gradient(circle at 34% 26%, rgba(255, 255, 255, 0.92), transparent 34%),
-    color-mix(in srgb, var(--app-apple-blue) 10%, var(--app-apple-surface));
+    radial-gradient(circle at 32% 22%, rgba(255, 255, 255, 0.95), transparent 40%),
+    conic-gradient(from 215deg at 50% 50%,
+      color-mix(in srgb, var(--app-apple-blue) 20%, var(--app-apple-surface)),
+      var(--app-apple-surface) 30%,
+      color-mix(in srgb, var(--app-apple-blue) 24%, var(--app-apple-surface)) 52%,
+      var(--app-apple-surface) 76%,
+      color-mix(in srgb, var(--app-apple-blue) 20%, var(--app-apple-surface)));
   box-shadow:
-    0 18px 46px color-mix(in srgb, var(--app-apple-blue) 18%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+    0 22px 48px -14px color-mix(in srgb, var(--app-apple-blue) 36%, transparent),
+    0 2px 8px rgba(15, 23, 42, 0.05),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8),
+    inset 0 -10px 20px color-mix(in srgb, var(--app-apple-blue) 10%, transparent);
+  transition:
+    transform 0.35s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.35s ease,
+    border-color 0.3s ease;
 }
 
 .dark .nat-detect-orb {
   background:
-    radial-gradient(circle at 34% 26%, rgba(255, 255, 255, 0.13), transparent 35%),
-    color-mix(in srgb, var(--app-apple-blue) 14%, var(--app-apple-surface));
+    radial-gradient(circle at 32% 22%, rgba(255, 255, 255, 0.14), transparent 42%),
+    conic-gradient(from 215deg at 50% 50%,
+      color-mix(in srgb, var(--app-apple-blue) 22%, var(--app-apple-surface)),
+      var(--app-apple-surface) 30%,
+      color-mix(in srgb, var(--app-apple-blue) 28%, var(--app-apple-surface)) 52%,
+      var(--app-apple-surface) 76%,
+      color-mix(in srgb, var(--app-apple-blue) 22%, var(--app-apple-surface)));
   box-shadow:
-    0 20px 52px color-mix(in srgb, var(--app-apple-blue) 20%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    0 24px 52px -14px color-mix(in srgb, var(--app-apple-blue) 40%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -10px 20px rgba(0, 0, 0, 0.28);
+}
+
+.nat-detect-orb[data-state="idle"]:hover,
+.nat-detect-orb[data-state="complete"]:hover {
+  transform: translateY(-4px) scale(1.03);
+  border-color: var(--app-apple-blue);
+  box-shadow:
+    0 30px 64px -14px color-mix(in srgb, var(--app-apple-blue) 50%, transparent),
+    0 4px 12px rgba(15, 23, 42, 0.07),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    inset 0 -10px 20px color-mix(in srgb, var(--app-apple-blue) 12%, transparent);
+}
+
+.dark .nat-detect-orb[data-state="idle"]:hover,
+.dark .nat-detect-orb[data-state="complete"]:hover {
+  box-shadow:
+    0 32px 68px -14px color-mix(in srgb, var(--app-apple-blue) 55%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 -10px 20px rgba(0, 0, 0, 0.3);
+}
+
+.nat-detect-orb[data-state="idle"]:active,
+.nat-detect-orb[data-state="complete"]:active {
+  transform: translateY(-1px) scale(0.965);
+  transition-duration: 0.12s;
 }
 
 .nat-detect-orb[data-state="checking"] {
-  border-color: var(--app-apple-blue);
+  border-color: var(--nat-orb-accent, var(--app-apple-blue));
   box-shadow:
-    0 0 0 8px var(--app-apple-blue-soft),
-    0 18px 48px color-mix(in srgb, var(--app-apple-blue) 24%, transparent);
+    0 0 0 7px color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 14%, transparent),
+    0 20px 50px -12px color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 40%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.7);
 }
 
-.nat-detect-orbit {
-  animation: nat-orbit-breathe 2.6s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+/* 细弧轨道：conic 渐变 + 径向 mask，只留外缘一圈亮弧，随状态变速旋转 */
+.nat-orbit-ring {
+  position: absolute;
+  inset: -12px;
+  border-radius: 999px;
+  pointer-events: none;
+  background: conic-gradient(from 0deg,
+      transparent 0deg,
+      color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 65%, transparent) 55deg,
+      transparent 130deg);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
+  animation: nat-ring-rotate 7s linear infinite;
+  opacity: 0.75;
 }
 
-.nat-detect-orbit-secondary {
-  animation: nat-orbit-counter 5.2s linear infinite;
+.nat-orbit-ring-alt {
+  inset: -23px;
+  background: conic-gradient(from 180deg,
+      transparent 0deg,
+      color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 34%, transparent) 70deg,
+      transparent 170deg);
+  animation: nat-ring-rotate 13s linear infinite reverse;
+  opacity: 0.55;
 }
 
-.nat-detect-orb[data-state="checking"] .nat-detect-orbit {
-  animation: nat-orbit-spin 2.8s linear infinite;
+.nat-detect-orb[data-state="checking"] .nat-orbit-ring {
+  animation-duration: 2.3s;
+  opacity: 1;
 }
 
-.nat-detect-orb[data-state="checking"] .nat-detect-orbit-secondary {
-  animation: nat-orbit-counter 4.6s linear infinite;
+.nat-detect-orb[data-state="checking"] .nat-orbit-ring-alt {
+  animation-duration: 4.1s;
+  opacity: 0.9;
 }
 
 .nat-detect-progress-indeterminate {
@@ -4757,7 +4846,7 @@ body {
 .nat-detect-ripple {
   position: absolute;
   inset: 0;
-  border: 1px solid color-mix(in srgb, var(--app-apple-blue, #0066cc) 42%, transparent);
+  border: 1px solid color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 42%, transparent);
   border-radius: 999px;
   opacity: 0;
   pointer-events: none;
@@ -4774,8 +4863,27 @@ body {
   100% { opacity: 0; transform: scale(1.72); }
 }
 
+@keyframes nat-ring-rotate {
+  to { transform: rotate(1turn); }
+}
+
+@keyframes nat-orb-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
+@keyframes nat-halo-pulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.96); }
+  50% { opacity: 0.95; transform: scale(1.05); }
+}
+
 .nat-result-reveal {
   animation: nat-result-reveal 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes nat-result-reveal {
+  from { opacity: 0; transform: translateY(8px) scale(0.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .nat-outcome-marker {
@@ -4800,31 +4908,45 @@ body {
   to { transform: translateX(100%); }
 }
 
-@keyframes nat-orbit-breathe {
-  0%, 100% { opacity: 0.34; transform: scale(0.96); }
-  48% { opacity: 0.86; transform: scale(1.035); }
-}
-
-@keyframes nat-orbit-spin {
-  from { opacity: 0.44; transform: rotate(0deg); }
-  50% { opacity: 0.86; }
-  to { opacity: 0.44; transform: rotate(360deg); }
-}
-
-@keyframes nat-orbit-counter {
-  from { opacity: 0.28; transform: rotate(360deg) scale(0.98); }
-  50% { opacity: 0.62; }
-  to { opacity: 0.28; transform: rotate(0deg) scale(1.02); }
-}
-
 @keyframes nat-progress-spin {
   from { transform: rotate(-90deg); }
   to { transform: rotate(270deg); }
 }
 
-@keyframes nat-result-reveal {
-  from { opacity: 0; transform: translateY(8px) scale(0.992); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
+/* 结果揭晓：直连难度分段量表依次点亮 */
+.nat-level-segment {
+  height: 6px;
+  flex: 1;
+  border-radius: 999px;
+  transform-origin: left center;
+}
+
+/* 灰色只落在未点亮段上，避免与点亮的 tone 背景类同优先级时被层叠覆盖 */
+.nat-level-segment:not(.is-on) {
+  background: var(--app-apple-line, rgba(29, 29, 31, 0.12));
+}
+
+.dark .nat-level-segment:not(.is-on) {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.nat-level-segment.is-on {
+  animation: nat-level-fill 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes nat-level-fill {
+  from { transform: scaleX(0.2); opacity: 0.3; }
+  to { transform: scaleX(1); opacity: 1; }
+}
+
+.nat-impact-icon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--app-apple-blue, #0066cc);
+  background: var(--app-apple-blue-soft, rgba(0, 102, 204, 0.1));
 }
 
 .nat-steps {
@@ -4915,13 +5037,15 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .nat-detect-orbit,
-  .nat-detect-orbit-secondary,
+  .nat-orb-stage,
+  .nat-orb-halo,
+  .nat-orbit-ring,
   .nat-detect-progress-indeterminate,
   .nat-detect-ripple,
   .nat-result-reveal,
   .nat-outcome-marker,
   .nat-outcome-bar::after,
+  .nat-level-segment.is-on,
   .nat-step-done .nat-step-dot svg path,
   .nat-step-active .nat-step-dot {
     animation: none !important;
