@@ -4069,7 +4069,7 @@ export function SyncedDiagram({
         ? "diagram-apple-shell absolute inset-0 flex min-h-0 flex-col overflow-hidden bg-[var(--diagram-apple-page)]"
         : "diagram-apple-shell mt-3 flex h-[clamp(320px,78dvh,680px)] min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--diagram-apple-line-strong)] bg-[var(--diagram-apple-surface)] shadow-[0_24px_70px_-38px_rgba(15,23,42,0.55)]"}
       >
-        <div className="diagram-apple-titlebar diagram-apple-topbar flex h-11 shrink-0 items-center gap-1 border-b border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2 backdrop-blur-xl">
+        <div className="diagram-apple-titlebar diagram-apple-topbar relative z-40 flex h-11 shrink-0 items-center gap-1 border-b border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2 backdrop-blur-xl">
           <div className="flex min-w-0 items-center gap-1.5">
             <a
               href="/"
