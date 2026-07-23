@@ -668,7 +668,9 @@ func testPeerDataFrame(sessionID, fromClientID, toClientID int64) []byte {
 func TestGeneralRelayDestinationPolicy(t *testing.T) {
 	// General relay destinations come straight from the browser, so anything pointing back into
 	// the server's own network must be refused.
-	allowed := []string{"203.0.113.10", "2001:db8::10"}
+	// 100.64.0.0/10 is RFC 6598 CGNAT and must be allowed: browser srflx addresses often fall
+	// in it, and rejecting it would 403 CGNAT peers.
+	allowed := []string{"203.0.113.10", "2001:db8::10", "100.64.0.2", "100.96.0.2"}
 	for _, host := range allowed {
 		addr := &net.UDPAddr{IP: net.ParseIP(host), Port: 50000}
 		if !isRelayableDestination(addr) {
@@ -676,7 +678,7 @@ func TestGeneralRelayDestinationPolicy(t *testing.T) {
 		}
 	}
 	refused := []string{"127.0.0.1", "0.0.0.0", "192.168.1.10", "10.0.0.5",
-		"169.254.1.10", "239.1.1.1", "100.96.0.2", "fd00::1"}
+		"169.254.1.10", "239.1.1.1", "fd00::1"}
 	for _, host := range refused {
 		addr := &net.UDPAddr{IP: net.ParseIP(host), Port: 50000}
 		if isRelayableDestination(addr) {

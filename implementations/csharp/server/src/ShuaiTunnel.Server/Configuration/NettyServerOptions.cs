@@ -273,7 +273,6 @@ public sealed class PeerMeshOptions
     // own resource limits. Setting GeneralRelayMaxAllocations to 0 disables general relay.
     public int GeneralRelayMaxAllocations { get; set; } = 256;
     public int GeneralRelayMaxAllocationsPerAddress { get; set; } = 4;
-    public long GeneralRelayRateBytesPerSecond { get; set; } = 2L * 1024 * 1024;
     public long GeneralRelayMaxBytes { get; set; } = 512L * 1024 * 1024;
     public long SessionCleanupIntervalMs { get; set; } = 60000;
     public int RelayTrafficFlushIntervalMs { get; set; } = 5000;

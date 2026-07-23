@@ -54,7 +54,7 @@ public class StunTurnServer implements ApplicationRunner {
     private final Counter generalRelayQuotaRejected;
     private final Counter generalRelayForbiddenDestination;
     private final Counter generalRelayBytes;
-    private final Counter generalRelayRateLimited;
+    private final Counter generalRelayQuotaClosed;
     private final AtomicInteger relayQueueHighWater = new AtomicInteger();
     private final Map<String, Allocation> allocations = new ConcurrentHashMap<>();
     private final Map<String, String> allocationByEndpoint = new ConcurrentHashMap<>();
@@ -90,8 +90,8 @@ public class StunTurnServer implements ApplicationRunner {
         this.generalRelayBytes = Counter.builder("tunnel.peer_mesh.turn.general_relay.bytes")
                 .description("Bytes relayed on behalf of general TURN allocations")
                 .register(meterRegistry);
-        this.generalRelayRateLimited = Counter.builder("tunnel.peer_mesh.turn.general_relay.rate.limited")
-                .description("General TURN relay datagrams dropped by rate or byte quota")
+        this.generalRelayQuotaClosed = Counter.builder("tunnel.peer_mesh.turn.general_relay.quota.closed")
+                .description("General TURN allocations closed after exhausting the byte quota")
                 .register(meterRegistry);
         Gauge.builder("tunnel.peer_mesh.turn.relay.queue.depth", this, StunTurnServer::relayQueueDepth)
                 .description("Current TURN relay worker queue depth")
@@ -352,8 +352,13 @@ public class StunTurnServer implements ApplicationRunner {
     }
 
     /**
-     * 通用中继的转发配额：令牌桶限速 + 生命周期总字节上限。
-     * Peer Mesh 专用 allocation 不受此约束（其目的地址与身份已被严格限定）。
+     * 通用中继的转发总量配额。Peer Mesh 专用 allocation 不受此约束。
+     *
+     * <p><b>不做包级限速。</b>TURN 承载的是浏览器 WebRTC 的 SCTP-over-DTLS（可靠传输），
+     * 按包丢弃来限速会直接打乱 SCTP 的拥塞控制与重传，导致吞吐崩溃甚至连接超时——这正是
+     * 之前"网页互传中继发文件失败"的根因。防滥用改为准入层（并发 allocation 数、
+     * 同源上限）+ 总量层：单 allocation 生命周期累计字节超过 {@code max-bytes} 时直接关闭
+     * allocation，让 SCTP 干净断开，而不是把它拖进持续丢包的泥潭。
      */
     private boolean allowGeneralRelayTraffic(Allocation allocation, int bytes) {
         if (allocation == null || !allocation.generalRelay) {
@@ -362,15 +367,12 @@ public class StunTurnServer implements ApplicationRunner {
         long maxBytes = properties.getGeneralRelayMaxBytes();
         long total = allocation.relayedBytes.addAndGet(bytes);
         if (maxBytes > 0 && total > maxBytes) {
-            generalRelayRateLimited.increment();
             if (allocation.quotaLogged.compareAndSet(false, true)) {
-                log.warn("[peer-mesh][audit] general TURN byte quota exhausted: client={}, bytes={}",
+                generalRelayQuotaClosed.increment();
+                log.warn("[peer-mesh][audit] general TURN byte quota exhausted, closing allocation: client={}, bytes={}",
                         allocation.clientRemote, total);
+                closeAllocation(allocation);
             }
-            return false;
-        }
-        if (!allocation.rateLimiter.tryConsume(bytes, properties.getGeneralRelayRateBytesPerSecond())) {
-            generalRelayRateLimited.increment();
             return false;
         }
         generalRelayBytes.increment(bytes);
@@ -516,15 +518,13 @@ public class StunTurnServer implements ApplicationRunner {
                 || host.isMulticastAddress()) {
             return false;
         }
-        // 100.64.0.0/10（CGNAT，Peer Mesh 虚拟网段也落在其中）与 IPv6 ULA 同样禁止
+        // 注意：不拒绝 100.64.0.0/10。它是 RFC 6598 运营商级 CGNAT，大量家宽/移动网用户的
+        // 公网映射地址（WebRTC srflx candidate）落在此段；整段拒绝会让这些对端的
+        // CreatePermission 直接 403，中继根本建不起来。Peer Mesh 虚拟网段虽也在 100.64/10 内，
+        // 但通用中继的对端是浏览器的真实公网地址，不可能是只在 overlay 内部使用的 mesh 虚拟 IP。
         byte[] raw = host.getAddress();
-        if (raw.length == 4) {
-            int first = raw[0] & 0xFF;
-            int second = raw[1] & 0xFF;
-            if (first == 100 && second >= 64 && second <= 127) {
-                return false;
-            }
-        } else if (raw.length == 16 && (raw[0] & 0xFE) == 0xFC) {
+        // IPv6 ULA fc00::/7 仍然禁止（不可全局路由）
+        if (raw.length == 16 && (raw[0] & 0xFE) == 0xFC) {
             return false;
         }
         return true;
@@ -1082,7 +1082,6 @@ public class StunTurnServer implements ApplicationRunner {
                 new java.util.concurrent.atomic.AtomicLong();
         private final java.util.concurrent.atomic.AtomicBoolean quotaLogged =
                 new java.util.concurrent.atomic.AtomicBoolean();
-        private final TokenBucket rateLimiter = new TokenBucket();
         private volatile Thread relayThread;
         private volatile boolean closed;
 
@@ -1108,36 +1107,6 @@ public class StunTurnServer implements ApplicationRunner {
 
         private boolean matchesClient(long authenticatedClientId) {
             return clientId == authenticatedClientId;
-        }
-    }
-
-    /**
-     * 简单令牌桶：容量为 1 秒的额度，按纳秒时间补充。只用于通用中继，
-     * 并发调用通过 synchronized 串行化——通用中继的 pps 远低于 Peer Mesh 数据面，
-     * 这里选择实现简单而不是无锁。
-     */
-    static final class TokenBucket {
-        private double tokens;
-        private long lastRefillNanos;
-
-        synchronized boolean tryConsume(int bytes, long ratePerSecond) {
-            if (ratePerSecond <= 0) {
-                return true;
-            }
-            long now = System.nanoTime();
-            if (lastRefillNanos == 0) {
-                tokens = ratePerSecond;
-                lastRefillNanos = now;
-            } else {
-                double elapsedSeconds = (now - lastRefillNanos) / 1_000_000_000.0d;
-                tokens = Math.min(ratePerSecond, tokens + elapsedSeconds * ratePerSecond);
-                lastRefillNanos = now;
-            }
-            if (tokens < bytes) {
-                return false;
-            }
-            tokens -= bytes;
-            return true;
         }
     }
 

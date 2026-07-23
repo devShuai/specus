@@ -583,8 +583,14 @@ public sealed class StunTurnServer : BackgroundService
     }
 
     /// <summary>
-    /// Per-allocation byte cap plus token-bucket rate limit. Peer Mesh allocations are exempt:
-    /// their destinations and identities are already pinned.
+    /// Per-allocation lifetime byte cap. Peer Mesh allocations are exempt.
+    ///
+    /// There is deliberately no packet-level rate limiting. TURN carries the browser's
+    /// SCTP-over-DTLS (reliable transport); dropping packets to shape the rate wrecks SCTP
+    /// congestion control and retransmission, which was the root cause of "web transfer relay
+    /// file send fails". Abuse is bounded by admission (allocation count / per-address) and total
+    /// volume: once an allocation exceeds max-bytes it is closed so SCTP fails cleanly instead of
+    /// being dragged into loss.
     /// </summary>
     private bool AllowGeneralRelayTraffic(Allocation allocation, int bytes)
     {
@@ -592,41 +598,18 @@ public sealed class StunTurnServer : BackgroundService
         {
             return true;
         }
-        lock (allocation.QuotaLock)
+        var total = Interlocked.Add(ref allocation.RelayedBytes, bytes);
+        if (_options.GeneralRelayMaxBytes > 0 && total > _options.GeneralRelayMaxBytes)
         {
-            allocation.RelayedBytes += bytes;
-            if (_options.GeneralRelayMaxBytes > 0 && allocation.RelayedBytes > _options.GeneralRelayMaxBytes)
+            if (Interlocked.Exchange(ref allocation.QuotaLogged, 1) == 0)
             {
-                if (Interlocked.Exchange(ref allocation.QuotaLogged, 1) == 0)
-                {
-                    _logger.LogWarning("[peer-mesh][audit] general TURN byte quota exhausted: client={Client}, bytes={Bytes}",
-                        allocation.Remote, allocation.RelayedBytes);
-                }
-                return false;
+                _logger.LogWarning("[peer-mesh][audit] general TURN byte quota exhausted, closing allocation: client={Client}, bytes={Bytes}",
+                    allocation.Remote, total);
+                CloseAllocation(allocation);
             }
-            var rate = _options.GeneralRelayRateBytesPerSecond;
-            if (rate <= 0)
-            {
-                return true;
-            }
-            var now = DateTimeOffset.UtcNow;
-            if (allocation.RateRefilledAt == default)
-            {
-                allocation.RateTokens = rate;
-            }
-            else
-            {
-                var elapsed = (now - allocation.RateRefilledAt).TotalSeconds;
-                allocation.RateTokens = Math.Min(rate, allocation.RateTokens + (elapsed * rate));
-            }
-            allocation.RateRefilledAt = now;
-            if (allocation.RateTokens < bytes)
-            {
-                return false;
-            }
-            allocation.RateTokens -= bytes;
-            return true;
+            return false;
         }
+        return true;
     }
 
     /// <summary>
@@ -649,7 +632,10 @@ public sealed class StunTurnServer : BackgroundService
         if (ip.AddressFamily == AddressFamily.InterNetwork)
         {
             var raw = ip.GetAddressBytes();
-            // private ranges, link-local, multicast/reserved and 100.64.0.0/10 (CGNAT + mesh range)
+            // Note: 100.64.0.0/10 is deliberately allowed. It is RFC 6598 carrier-grade NAT; many
+            // home and mobile users' public srflx addresses fall in it, and rejecting the whole
+            // block would 403 those peers. General relay peers are the browser's real public
+            // address, never a mesh virtual IP (which only exists inside the overlay).
             return raw[0] switch
             {
                 10 => false,
@@ -657,7 +643,6 @@ public sealed class StunTurnServer : BackgroundService
                 169 when raw[1] == 254 => false,
                 172 when raw[1] >= 16 && raw[1] <= 31 => false,
                 192 when raw[1] == 168 => false,
-                100 when raw[1] >= 64 && raw[1] <= 127 => false,
                 >= 224 => false,
                 _ => true,
             };
@@ -1081,9 +1066,6 @@ public sealed class StunTurnServer : BackgroundService
         public bool GeneralRelay { get; init; }
         public long RelayedBytes;
         public int QuotaLogged;
-        public object QuotaLock { get; } = new();
-        public double RateTokens;
-        public DateTimeOffset RateRefilledAt;
         public DateTimeOffset ExpiresAt { get; set; }
         public ConcurrentDictionary<string, DateTimeOffset> Permissions { get; } = new(StringComparer.Ordinal);
 		public ConcurrentDictionary<ushort, TurnChannelBinding> ChannelsByNumber { get; } = new();

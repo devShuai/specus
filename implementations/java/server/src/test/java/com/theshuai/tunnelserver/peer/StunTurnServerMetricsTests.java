@@ -33,23 +33,12 @@ class StunTurnServerMetricsTests {
         assertThat(server.isRelayableDestination(endpoint("192.168.1.10", 50000))).isFalse();
         assertThat(server.isRelayableDestination(endpoint("169.254.1.10", 50000))).isFalse();
         assertThat(server.isRelayableDestination(endpoint("239.1.1.1", 50000))).isFalse();
-        // 100.64.0.0/10：CGNAT，Peer Mesh 虚拟网段也落在其中
-        assertThat(server.isRelayableDestination(endpoint("100.96.0.2", 50000))).isFalse();
         assertThat(server.isRelayableDestination(endpoint("fd00::1", 50000))).isFalse();
         assertThat(server.isRelayableDestination(endpoint("203.0.113.10", 0))).isFalse();
-    }
-
-    @Test
-    void generalRelayTokenBucketEnforcesConfiguredRate() {
-        StunTurnServer.TokenBucket bucket = new StunTurnServer.TokenBucket();
-
-        // 首次调用把桶充满到 1 秒额度
-        assertThat(bucket.tryConsume(600, 1_000)).isTrue();
-        assertThat(bucket.tryConsume(400, 1_000)).isTrue();
-        // 额度已用尽，补充速度远慢于连续调用
-        assertThat(bucket.tryConsume(400, 1_000)).isFalse();
-        // 速率 <= 0 表示不限速
-        assertThat(bucket.tryConsume(Integer.MAX_VALUE, 0)).isTrue();
+        // 100.64.0.0/10 是 RFC 6598 运营商级 CGNAT，浏览器 srflx 常落此段，必须放行，
+        // 否则 CGNAT 后的对端无法作为 relay 目标。
+        assertThat(server.isRelayableDestination(endpoint("100.64.0.2", 50000))).isTrue();
+        assertThat(server.isRelayableDestination(endpoint("100.96.0.2", 50000))).isTrue();
     }
 
     private static InetSocketAddress endpoint(String host, int port) {

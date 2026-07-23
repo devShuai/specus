@@ -381,7 +381,6 @@ func Default() Config {
 
 			GeneralRelayMaxAllocations:        256,
 			GeneralRelayMaxAllocationsPerAddr: 4,
-			GeneralRelayRateBytesPerSecond:    2 * 1024 * 1024,
 			GeneralRelayMaxBytes:              512 * 1024 * 1024,
 		},
 		ObjectStorage: ObjectStorageConfig{
@@ -615,7 +614,6 @@ func (cfg *Config) applyEnv(env map[string]string) {
 	setInt64("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", &cfg.PeerMesh.TurnCredentialTTLSeconds)
 	setInt("TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS", &cfg.PeerMesh.GeneralRelayMaxAllocations)
 	setInt("TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS", &cfg.PeerMesh.GeneralRelayMaxAllocationsPerAddr)
-	setInt64("TUNNEL_PEER_MESH_GENERAL_RELAY_RATE_BYTES_PER_SECOND", &cfg.PeerMesh.GeneralRelayRateBytesPerSecond)
 	setInt64("TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_BYTES", &cfg.PeerMesh.GeneralRelayMaxBytes)
 
 	setStr("TUNNEL_OBJECT_STORAGE_PROVIDER", &cfg.ObjectStorage.Provider)

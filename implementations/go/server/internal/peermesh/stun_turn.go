@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math"
 	"math/big"
 	"net"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/stunserver"
@@ -53,10 +53,8 @@ type relayAllocation struct {
 	// GeneralRelay marks allocations that forward arbitrary payloads with standard TURN
 	// semantics (public transfer / browser WebRTC) instead of the Peer Mesh specific checks.
 	GeneralRelay     bool
-	RelayedBytes     int64
-	QuotaLogged      bool
-	RateTokens       float64
-	RateRefilledAt   time.Time
+	RelayedBytes     atomic.Int64
+	QuotaLogged      atomic.Bool
 	ExpiresAt        time.Time
 	Closed           bool
 	Permission       map[string]time.Time
@@ -632,40 +630,28 @@ func (s *stunTurnServer) generalRelayQuotaRejection(remote *net.UDPAddr) string 
 	return ""
 }
 
-// allowGeneralRelayTraffic enforces the per-allocation byte cap and token-bucket rate limit.
-// Peer Mesh allocations are unaffected: their destinations and identities are already pinned.
+// allowGeneralRelayTraffic enforces the per-allocation lifetime byte cap. Peer Mesh allocations
+// are unaffected.
+//
+// There is deliberately no packet-level rate limiting. TURN carries the browser's SCTP-over-DTLS
+// (reliable transport); dropping packets to shape the rate wrecks SCTP congestion control and
+// retransmission, which was the root cause of "web transfer relay file send fails". Abuse is
+// bounded by admission (allocation count / per-address) and total volume: once an allocation
+// exceeds max-bytes it is closed so SCTP fails cleanly instead of being dragged into loss.
 func (s *stunTurnServer) allowGeneralRelayTraffic(allocation *relayAllocation, bytes int) bool {
 	if allocation == nil || !allocation.GeneralRelay {
 		return true
 	}
-	cfg := s.service.cfg
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	allocation.RelayedBytes += int64(bytes)
-	if cfg.GeneralRelayMaxBytes > 0 && allocation.RelayedBytes > cfg.GeneralRelayMaxBytes {
-		if !allocation.QuotaLogged {
-			allocation.QuotaLogged = true
-			s.logger.Warn("[peer-mesh][audit] general TURN byte quota exhausted",
-				"client", allocation.Client.String(), "bytes", allocation.RelayedBytes)
+	maxBytes := s.service.cfg.GeneralRelayMaxBytes
+	total := allocation.RelayedBytes.Add(int64(bytes))
+	if maxBytes > 0 && total > maxBytes {
+		if allocation.QuotaLogged.CompareAndSwap(false, true) {
+			s.logger.Warn("[peer-mesh][audit] general TURN byte quota exhausted, closing allocation",
+				"client", allocation.Client.String(), "bytes", total)
+			s.closeAllocation(allocation)
 		}
 		return false
 	}
-	rate := cfg.GeneralRelayRateBytesPerSecond
-	if rate <= 0 {
-		return true
-	}
-	now := time.Now()
-	if allocation.RateRefilledAt.IsZero() {
-		allocation.RateTokens = float64(rate)
-	} else {
-		elapsed := now.Sub(allocation.RateRefilledAt).Seconds()
-		allocation.RateTokens = math.Min(float64(rate), allocation.RateTokens+elapsed*float64(rate))
-	}
-	allocation.RateRefilledAt = now
-	if allocation.RateTokens < float64(bytes) {
-		return false
-	}
-	allocation.RateTokens -= float64(bytes)
 	return true
 }
 
@@ -681,11 +667,11 @@ func isRelayableDestination(addr *net.UDPAddr) bool {
 		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsPrivate() {
 		return false
 	}
-	if v4 := ip.To4(); v4 != nil {
-		// 100.64.0.0/10 (CGNAT, also the Peer Mesh virtual range)
-		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-			return false
-		}
+	// Note: 100.64.0.0/10 is deliberately allowed. It is RFC 6598 carrier-grade NAT; many home
+	// and mobile users' public srflx addresses fall in it, and rejecting the whole block would
+	// 403 those peers. General relay peers are the browser's real public address, never a mesh
+	// virtual IP (which only exists inside the overlay).
+	if ip.To4() != nil {
 		return true
 	}
 	// IPv6 ULA fc00::/7

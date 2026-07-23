@@ -643,10 +643,13 @@ public sealed class PeerMeshServiceTests
         Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("10.0.0.5", 50000)));
         Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("169.254.1.10", 50000)));
         Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("239.1.1.1", 50000)));
-        Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("100.96.0.2", 50000)));
         Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("fd00::1", 50000)));
         Assert.False(StunTurnServer.IsRelayableDestination(Endpoint("203.0.113.10", 0)));
         Assert.False(StunTurnServer.IsRelayableDestination(null));
+        // 100.64.0.0/10 is RFC 6598 CGNAT and must be allowed: browser srflx addresses often fall
+        // in it, and rejecting it would 403 CGNAT peers.
+        Assert.True(StunTurnServer.IsRelayableDestination(Endpoint("100.64.0.2", 50000)));
+        Assert.True(StunTurnServer.IsRelayableDestination(Endpoint("100.96.0.2", 50000)));
     }
 
     private static System.Net.IPEndPoint Endpoint(string host, int port) =>

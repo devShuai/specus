@@ -47,8 +47,6 @@ public class PeerMeshProperties {
     private int generalRelayMaxAllocations = 256;
     /** 同一来源 IP 的通用中继并发 allocation 上限 */
     private int generalRelayMaxAllocationsPerAddress = 4;
-    /** 单个通用中继 allocation 的转发速率上限（字节/秒）；<=0 表示不限速 */
-    private long generalRelayRateBytesPerSecond = 2L * 1024 * 1024;
-    /** 单个通用中继 allocation 生命周期内可转发的总字节数；<=0 表示不限 */
+    /** 单个通用中继 allocation 生命周期内可转发的总字节数；<=0 表示不限。超出即关闭 allocation。 */
     private long generalRelayMaxBytes = 512L * 1024 * 1024;
 }
