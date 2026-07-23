@@ -213,23 +213,23 @@ func (db *DB) HTTPRouteDetailCaptureEnabled(ctx context.Context, clientName, rou
 	}
 	query := db.rebind(`SELECT detail_capture_enabled FROM http_route_mapping
 		WHERE client_id = ? AND route = ?`)
-	var enabled int
+	var enabled databaseBoolean
 	err = db.sql.QueryRowContext(ctx, query, account.ID, route).Scan(&enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
-	return enabled != 0, err
+	return bool(enabled), err
 }
 
 func (db *DB) TunnelDetailCaptureEnabled(ctx context.Context, clientName string, listenPort int) (bool, error) {
 	query := db.rebind(`SELECT detail_capture_enabled FROM tunnel_mapping
 		WHERE client_name = ? AND listen_port = ?`)
-	var enabled int
+	var enabled databaseBoolean
 	err := db.sql.QueryRowContext(ctx, query, clientName, listenPort).Scan(&enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
-	return enabled != 0, err
+	return bool(enabled), err
 }
 
 func (db *DB) RecordHTTPExchange(ctx context.Context, record HTTPExchangeRecord) error {
@@ -647,7 +647,7 @@ func scanHTTPExchange(scanner rowScanner) (HTTPTrafficExchange, error) {
 		resourceID                               sql.NullInt64
 		resourceName, errText, remote            sql.NullString
 		requestCT, responseCT                    sql.NullString
-		success, requestTruncated, responseTrunc int
+		success, requestTruncated, responseTrunc databaseBoolean
 		capturedAt                               string
 	)
 	err := scanner.Scan(&item.ID, &item.TenantID, &item.ClientID, &item.ClientName, &item.Route,
@@ -660,9 +660,9 @@ func scanHTTPExchange(scanner rowScanner) (HTTPTrafficExchange, error) {
 	if err != nil {
 		return HTTPTrafficExchange{}, err
 	}
-	item.Success = success != 0
-	item.RequestTruncated = requestTruncated != 0
-	item.ResponseTruncated = responseTrunc != 0
+	item.Success = bool(success)
+	item.RequestTruncated = bool(requestTruncated)
+	item.ResponseTruncated = bool(responseTrunc)
 	item.CapturedAt = parseTime(capturedAt)
 	if resourceID.Valid {
 		item.ResourceID = &resourceID.Int64
@@ -683,7 +683,7 @@ func scanTCPFrame(scanner rowScanner) (TCPTrafficFrame, error) {
 		resourceName, remote        sql.NullString
 		source, destination         sql.NullString
 		sourcePort, destinationPort sql.NullInt64
-		truncated                   int
+		truncated                   databaseBoolean
 		frameTime                   string
 	)
 	err := scanner.Scan(&item.ID, &item.TenantID, &item.ClientID, &item.ClientName,
@@ -709,7 +709,7 @@ func scanTCPFrame(scanner rowScanner) (TCPTrafficFrame, error) {
 		v := int(destinationPort.Int64)
 		item.DestinationPort = &v
 	}
-	item.Truncated = truncated != 0
+	item.Truncated = bool(truncated)
 	item.FrameTime = parseTime(frameTime)
 	return item, nil
 }

@@ -26,7 +26,7 @@ func (db *DB) ListClients(ctx context.Context) ([]ClientAccount, error) {
 	for rows.Next() {
 		var (
 			account            ClientAccount
-			enabled            int
+			enabled            databaseBoolean
 			createdAt, updated string
 		)
 		if err := rows.Scan(&account.ID, &account.TenantID, &account.OwnerUsername,
@@ -34,7 +34,7 @@ func (db *DB) ListClients(ctx context.Context) ([]ClientAccount, error) {
 			&account.ConnectionRateLimitPerMinute, &createdAt, &updated); err != nil {
 			return nil, err
 		}
-		account.Enabled = enabled != 0
+		account.Enabled = bool(enabled)
 		account.CreatedAt = parseTime(createdAt)
 		account.UpdatedAt = parseTime(updated)
 		clients = append(clients, account)
@@ -49,7 +49,7 @@ func (db *DB) GetClient(ctx context.Context, id int64) (*ClientAccount, error) {
 		connection_rate_limit_per_minute, created_at, updated_at FROM tunnel_client_account WHERE id = ?`)
 	var (
 		account            ClientAccount
-		enabled            int
+		enabled            databaseBoolean
 		createdAt, updated string
 	)
 	err := db.sql.QueryRowContext(ctx, query, id).Scan(&account.ID, &account.TenantID,
@@ -61,7 +61,7 @@ func (db *DB) GetClient(ctx context.Context, id int64) (*ClientAccount, error) {
 	if err != nil {
 		return nil, err
 	}
-	account.Enabled = enabled != 0
+	account.Enabled = bool(enabled)
 	account.CreatedAt = parseTime(createdAt)
 	account.UpdatedAt = parseTime(updated)
 	return &account, nil
@@ -170,7 +170,7 @@ type credentialScanner interface {
 func scanCredential(scanner credentialScanner) (ClientCredential, error) {
 	var (
 		credential         ClientCredential
-		enabled            int
+		enabled            databaseBoolean
 		createdAt, updated string
 	)
 	err := scanner.Scan(&credential.ID, &credential.TenantID, &credential.OwnerUsername,
@@ -179,7 +179,7 @@ func scanCredential(scanner credentialScanner) (ClientCredential, error) {
 	if err != nil {
 		return ClientCredential{}, err
 	}
-	credential.Enabled = enabled != 0
+	credential.Enabled = bool(enabled)
 	credential.CreatedAt = parseTime(createdAt)
 	credential.UpdatedAt = parseTime(updated)
 	return credential, nil
@@ -254,7 +254,7 @@ func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, erro
 	var (
 		link               ClientDownloadLink
 		description        sql.NullString
-		enabled            int
+		enabled            databaseBoolean
 		createdAt, updated string
 	)
 	err := scanner.Scan(&link.ID, &link.Implementation, &link.Platform, &link.Arch,
@@ -266,7 +266,7 @@ func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, erro
 	if description.Valid {
 		link.Description = &description.String
 	}
-	link.Enabled = enabled != 0
+	link.Enabled = bool(enabled)
 	link.CreatedAt = parseTime(createdAt)
 	link.UpdatedAt = parseTime(updated)
 	return link, nil
@@ -293,16 +293,16 @@ func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping
 	for rows.Next() {
 		var (
 			m                  TunnelMapping
-			enabled            int
-			detailCapture      int
+			enabled            databaseBoolean
+			detailCapture      databaseBoolean
 			createdAt, updated string
 		)
 		if err := rows.Scan(&m.ID, &m.TenantID, &m.ClientID, &m.ClientName, &m.ListenPort, &m.TargetAddress,
 			&m.TargetPort, &enabled, &detailCapture, &createdAt, &updated); err != nil {
 			return nil, err
 		}
-		m.Enabled = enabled != 0
-		m.DetailCaptureEnabled = detailCapture != 0
+		m.Enabled = bool(enabled)
+		m.DetailCaptureEnabled = bool(detailCapture)
 		m.CreatedAt = parseTime(createdAt)
 		m.UpdatedAt = parseTime(updated)
 		mappings = append(mappings, m)
@@ -381,18 +381,18 @@ func (db *DB) ListHTTPRoutes(ctx context.Context, clientID *int64) ([]HTTPRouteM
 	for rows.Next() {
 		var (
 			r                  HTTPRouteMapping
-			enabled            int
-			detailCapture      int
-			pathRewrite        int
+			enabled            databaseBoolean
+			detailCapture      databaseBoolean
+			pathRewrite        databaseBoolean
 			createdAt, updated string
 		)
 		if err := rows.Scan(&r.ID, &r.TenantID, &r.ClientID, &r.ClientName, &r.Route, &r.TargetBaseURL,
 			&enabled, &detailCapture, &pathRewrite, &createdAt, &updated); err != nil {
 			return nil, err
 		}
-		r.Enabled = enabled != 0
-		r.DetailCaptureEnabled = detailCapture != 0
-		r.PathRewriteEnabled = pathRewrite != 0
+		r.Enabled = bool(enabled)
+		r.DetailCaptureEnabled = bool(detailCapture)
+		r.PathRewriteEnabled = bool(pathRewrite)
 		r.CreatedAt = parseTime(createdAt)
 		r.UpdatedAt = parseTime(updated)
 		routes = append(routes, r)
@@ -520,7 +520,7 @@ func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]C
 	for rows.Next() {
 		var (
 			r              ConnectionRecord
-			success        int
+			success        databaseBoolean
 			connectedAt    string
 			disconnectedAt sql.NullString
 			channelID      sql.NullString
@@ -547,7 +547,7 @@ func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]C
 			t := parseTime(disconnectedAt.String)
 			r.DisconnectedAt = &t
 		}
-		r.Success = success != 0
+		r.Success = bool(success)
 		if failureReason.Valid {
 			r.FailureReason = &failureReason.String
 		}
@@ -792,7 +792,7 @@ func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int6
 			clientID    sql.NullInt64
 			clientName  string
 			connectedAt string
-			success     int
+			success     databaseBoolean
 		)
 		if err := rows.Scan(&tenantID, &clientID, &clientName, &connectedAt, &success); err != nil {
 			rows.Close()
@@ -810,7 +810,7 @@ func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int6
 			buckets[k] = bucket
 		}
 		bucket.total++
-		if success != 0 {
+		if bool(success) {
 			bucket.success++
 		} else {
 			bucket.fail++

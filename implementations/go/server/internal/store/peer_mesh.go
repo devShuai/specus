@@ -609,7 +609,7 @@ func scanPeerMeshDevice(scanner scanner) (PeerMeshDevice, error) {
 		deviceError                            sql.NullString
 		deviceUpdated, seen                    sql.NullString
 		created, updated                       string
-		enabled                                int
+		enabled                                databaseBoolean
 	)
 	err := scanner.Scan(&device.ID, &device.TenantID, &device.OwnerUsername, &device.ClientID,
 		&device.ClientName, &device.VirtualIP, &device.CIDR, &publicKey, &natType,
@@ -630,7 +630,7 @@ func scanPeerMeshDevice(scanner scanner) (PeerMeshDevice, error) {
 	device.VirtualDeviceStatus = nullStringPtr(status)
 	device.VirtualDeviceError = nullStringPtr(deviceError)
 	device.VirtualDeviceUpdatedAt = nullTimePtr(deviceUpdated)
-	device.Enabled = enabled != 0
+	device.Enabled = bool(enabled)
 	device.LastSeenAt = nullTimePtr(seen)
 	device.CreatedAt = parseTime(created)
 	device.UpdatedAt = parseTime(updated)
@@ -640,14 +640,14 @@ func scanPeerMeshDevice(scanner scanner) (PeerMeshDevice, error) {
 func scanPeerMeshACL(scanner scanner) (PeerMeshACL, error) {
 	var acl PeerMeshACL
 	var created, updated string
-	var allowed int
+	var allowed databaseBoolean
 	err := scanner.Scan(&acl.ID, &acl.TenantID, &acl.OwnerUsername, &acl.SourceClientID,
 		&acl.SourceClientName, &acl.TargetClientID, &acl.TargetClientName, &allowed,
 		&acl.Direction, &created, &updated)
 	if err != nil {
 		return PeerMeshACL{}, err
 	}
-	acl.Allowed = allowed != 0
+	acl.Allowed = bool(allowed)
 	acl.CreatedAt = parseTime(created)
 	acl.UpdatedAt = parseTime(updated)
 	return acl, nil

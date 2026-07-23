@@ -161,13 +161,15 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 		nettyAt, disconnectedAt             sql.NullString
 		channelID, remoteAddress            sql.NullString
 		httpLoginAt, expiresAt              string
+		messageSend, messageReceive         databaseBoolean
+		messageAttachments, messagePreview  databaseBoolean
 	)
 	err := scanner.Scan(&session.ID, &session.TenantID, &session.CredentialID, &session.IdentityID,
 		&session.ClientID, &session.ClientName, &session.TokenHash, &session.Status,
 		&session.MachineFingerprint, &session.OSUser, &hostname, &osName, &osVersion, &osArch,
-		&clientVersion, &javaVersion, &localAddresses, &session.MessageSendCapable,
-		&session.MessageReceiveCapable, &session.MessageAttachmentsCapable,
-		&session.MessageMediaPreviewCapable, &session.MessageMaxAttachmentBytes,
+		&clientVersion, &javaVersion, &localAddresses, &messageSend,
+		&messageReceive, &messageAttachments,
+		&messagePreview, &session.MessageMaxAttachmentBytes,
 		&httpLoginAt, &nettyAt, &disconnectedAt,
 		&expiresAt, &channelID, &remoteAddress)
 	if err != nil {
@@ -180,6 +182,10 @@ func scanClientSession(scanner clientSessionScanner) (ClientSession, error) {
 	session.ClientVersion = nullStringPtr(clientVersion)
 	session.JavaVersion = nullStringPtr(javaVersion)
 	session.LocalAddresses = nullStringPtr(localAddresses)
+	session.MessageSendCapable = bool(messageSend)
+	session.MessageReceiveCapable = bool(messageReceive)
+	session.MessageAttachmentsCapable = bool(messageAttachments)
+	session.MessageMediaPreviewCapable = bool(messagePreview)
 	session.HTTPLoginAt = parseTime(httpLoginAt)
 	session.NettyConnectedAt = nullTimePtr(nettyAt)
 	session.DisconnectedAt = nullTimePtr(disconnectedAt)

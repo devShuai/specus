@@ -76,7 +76,7 @@ type managementUserScanner interface {
 func scanManagementUser(scanner managementUserScanner) (ManagementUser, error) {
 	var (
 		user               ManagementUser
-		enabled            int
+		enabled            databaseBoolean
 		createdAt, updated string
 	)
 	err := scanner.Scan(&user.Username, &user.TenantID, &user.PasswordHash, &user.Role,
@@ -85,7 +85,7 @@ func scanManagementUser(scanner managementUserScanner) (ManagementUser, error) {
 		return ManagementUser{}, err
 	}
 	user.Role = normalizeManagementRole(user.Role)
-	user.Enabled = enabled != 0
+	user.Enabled = bool(enabled)
 	user.CreatedAt = parseTime(createdAt)
 	user.UpdatedAt = parseTime(updated)
 	return user, nil

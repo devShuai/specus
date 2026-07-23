@@ -4,10 +4,57 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// databaseBoolean accepts the representations returned by SQLite, PostgreSQL and
+// MySQL. In particular, Java/Hibernate commonly creates MySQL booleans as BIT(1),
+// which go-sql-driver/mysql returns as a single binary byte rather than an integer.
+type databaseBoolean bool
+
+func (value *databaseBoolean) Scan(src any) error {
+	var parsed bool
+	switch raw := src.(type) {
+	case bool:
+		parsed = raw
+	case int64:
+		parsed = raw != 0
+	case []byte:
+		if len(raw) == 1 && (raw[0] == 0 || raw[0] == 1) {
+			parsed = raw[0] == 1
+			break
+		}
+		result, err := parseDatabaseBooleanText(string(raw))
+		if err != nil {
+			return err
+		}
+		parsed = result
+	case string:
+		result, err := parseDatabaseBooleanText(raw)
+		if err != nil {
+			return err
+		}
+		parsed = result
+	default:
+		return fmt.Errorf("scan database boolean from %T", src)
+	}
+	*value = databaseBoolean(parsed)
+	return nil
+}
+
+func parseDatabaseBooleanText(value string) (bool, error) {
+	trimmed := strings.TrimSpace(value)
+	if parsed, err := strconv.ParseBool(trimmed); err == nil {
+		return parsed, nil
+	}
+	if parsed, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return parsed != 0, nil
+	}
+	return false, fmt.Errorf("scan database boolean from %q", value)
+}
 
 func boolToInt(value bool) int {
 	if value {
@@ -45,7 +92,7 @@ func (db *DB) FindClientByName(ctx context.Context, name string) (*ClientAccount
 	row := db.sql.QueryRowContext(ctx, query, name)
 	var (
 		account            ClientAccount
-		enabled            int
+		enabled            databaseBoolean
 		createdAt, updated string
 	)
 	err := row.Scan(&account.ID, &account.TenantID, &account.OwnerUsername,
@@ -57,7 +104,7 @@ func (db *DB) FindClientByName(ctx context.Context, name string) (*ClientAccount
 	if err != nil {
 		return nil, err
 	}
-	account.Enabled = enabled != 0
+	account.Enabled = bool(enabled)
 	account.CreatedAt = parseTime(createdAt)
 	account.UpdatedAt = parseTime(updated)
 	return &account, nil
@@ -71,7 +118,7 @@ func (db *DB) FindCredentialByAPIKey(ctx context.Context, apiKey string) (*Clien
 	row := db.sql.QueryRowContext(ctx, query, apiKey)
 	var (
 		credential         ClientCredential
-		enabled            int
+		enabled            databaseBoolean
 		createdAt, updated string
 	)
 	err := row.Scan(&credential.ID, &credential.TenantID, &credential.OwnerUsername,
@@ -83,7 +130,7 @@ func (db *DB) FindCredentialByAPIKey(ctx context.Context, apiKey string) (*Clien
 	if err != nil {
 		return nil, err
 	}
-	credential.Enabled = enabled != 0
+	credential.Enabled = bool(enabled)
 	credential.CreatedAt = parseTime(createdAt)
 	credential.UpdatedAt = parseTime(updated)
 	return &credential, nil
@@ -285,16 +332,16 @@ func (db *DB) ListEnabledTunnels(ctx context.Context, clientID int64) ([]TunnelM
 	for rows.Next() {
 		var (
 			mapping            TunnelMapping
-			enabled            int
-			detailCapture      int
+			enabled            databaseBoolean
+			detailCapture      databaseBoolean
 			createdAt, updated string
 		)
 		if err := rows.Scan(&mapping.ID, &mapping.ClientID, &mapping.ClientName, &mapping.ListenPort,
 			&mapping.TargetAddress, &mapping.TargetPort, &enabled, &detailCapture, &createdAt, &updated); err != nil {
 			return nil, err
 		}
-		mapping.Enabled = enabled != 0
-		mapping.DetailCaptureEnabled = detailCapture != 0
+		mapping.Enabled = bool(enabled)
+		mapping.DetailCaptureEnabled = bool(detailCapture)
 		mapping.CreatedAt = parseTime(createdAt)
 		mapping.UpdatedAt = parseTime(updated)
 		mappings = append(mappings, mapping)
@@ -324,18 +371,18 @@ func (db *DB) ListEnabledHTTPRoutes(ctx context.Context, clientID int64) ([]HTTP
 	for rows.Next() {
 		var (
 			route              HTTPRouteMapping
-			enabled            int
-			detailCapture      int
-			pathRewrite        int
+			enabled            databaseBoolean
+			detailCapture      databaseBoolean
+			pathRewrite        databaseBoolean
 			createdAt, updated string
 		)
 		if err := rows.Scan(&route.ID, &route.ClientID, &route.ClientName, &route.Route,
 			&route.TargetBaseURL, &enabled, &detailCapture, &pathRewrite, &createdAt, &updated); err != nil {
 			return nil, err
 		}
-		route.Enabled = enabled != 0
-		route.DetailCaptureEnabled = detailCapture != 0
-		route.PathRewriteEnabled = pathRewrite != 0
+		route.Enabled = bool(enabled)
+		route.DetailCaptureEnabled = bool(detailCapture)
+		route.PathRewriteEnabled = bool(pathRewrite)
 		route.CreatedAt = parseTime(createdAt)
 		route.UpdatedAt = parseTime(updated)
 		routes = append(routes, route)
@@ -352,7 +399,7 @@ func (db *DB) HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route
 	}
 	query := db.rebind(`SELECT path_rewrite_enabled FROM http_route_mapping
 		WHERE client_id = ? AND route = ?`)
-	var enabled int
+	var enabled databaseBoolean
 	err = db.sql.QueryRowContext(ctx, query, account.ID, route).Scan(&enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -360,7 +407,7 @@ func (db *DB) HTTPRoutePathRewriteEnabled(ctx context.Context, clientName, route
 	if err != nil {
 		return false, err
 	}
-	return enabled != 0, nil
+	return bool(enabled), nil
 }
 
 // AddTraffic increments today's upload/download byte counters for a client, upserting the row.
