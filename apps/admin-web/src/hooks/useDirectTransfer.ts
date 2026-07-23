@@ -1206,7 +1206,11 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     await sendFileChunks(channel, file, optionsRef.current.onProgress, ensureCurrentChannel);
     ensureCurrentChannel();
     channel.send(JSON.stringify({ kind: "file-complete", transferId }));
-    await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 15000, "对方未确认完成");
+    // 慢链路（TURN 中继）上缓冲区可能还压着数 MB，先排空再开始 ack 计时，
+    // 否则接收端尚未收完发送端就已超时，出现"对方已收到但显示发送失败"。
+    await waitForDataChannelDrain(channel);
+    ensureCurrentChannel();
+    await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 60000, "对方未确认完成");
 
     return {
       attachment: directAttachment(transferId, fileName, mimeType, file.size, sha256),
@@ -1394,6 +1398,44 @@ function waitForBufferedAmountLow(channel: RTCDataChannel) {
     };
     channel.addEventListener("bufferedamountlow", onLow);
     channel.addEventListener("close", onClose);
+  });
+}
+
+// waitForDataChannelDrain 等发送缓冲区完全排空。慢链路（如 TURN 中继）上 bufferedAmount
+// 归零远晚于 send() 返回，ack 计时必须在排空之后开始，否则接收端还没收完数据发送端就先超时。
+export function waitForDataChannelDrain(channel: RTCDataChannel, timeoutMs = 60000): Promise<void> {
+  channel.bufferedAmountLowThreshold = 0;
+  if (channel.bufferedAmount === 0) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("DataChannel 发送缓冲排空超时"));
+    }, timeoutMs);
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      channel.removeEventListener("bufferedamountlow", onLow);
+      channel.removeEventListener("close", onClose);
+    };
+    const onLow = () => {
+      if (channel.bufferedAmount !== 0) {
+        return;
+      }
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("DataChannel 已关闭"));
+    };
+    channel.addEventListener("bufferedamountlow", onLow);
+    channel.addEventListener("close", onClose);
+    // 注册监听与设置阈值之间缓冲区可能已排空。
+    if (channel.bufferedAmount === 0) {
+      cleanup();
+      resolve();
+    }
   });
 }
 
