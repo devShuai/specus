@@ -4,9 +4,12 @@ set -euo pipefail
 # Go server rolling update
 # Usage: sudo bash update.sh <path-to-new-binary>
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="tunnel-server-go"
 INSTALL_DIR="/opt/tunnel-server-go"
 BACKUP_DIR="${INSTALL_DIR}/backup"
+LOG_DIR="/var/log/tunnel-server-go"
+LOG_FILE="$LOG_DIR/tunnel-server.log"
 HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:8088/health}"
 MAX_RETRIES=30
 RETRY_INTERVAL=2
@@ -23,6 +26,15 @@ fi
 
 if [[ -z "$BINARY" || ! -f "$BINARY" ]]; then
   error "用法: sudo bash update.sh <path-to-new-binary>"
+  exit 1
+fi
+ELF_MAGIC="$(LC_ALL=C od -An -tx1 -N4 "$BINARY" | tr -d '[:space:]')"
+if [[ "$ELF_MAGIC" != "7f454c46" ]]; then
+  error "部署文件不是 Linux ELF 二进制: $BINARY"
+  exit 1
+fi
+if ! command -v curl >/dev/null 2>&1; then
+  error "缺少健康检查依赖: curl"
   exit 1
 fi
 
@@ -44,6 +56,20 @@ fi
 log "准备升级 Go server"
 log "  当前二进制: ${INSTALL_DIR}/shuai-tunnel-server"
 log "  新二进制: $BINARY"
+
+# Sync the unit and template without replacing the live environment file.
+install -d -m 0750 -o tunnel -g tunnel "$LOG_DIR"
+touch "$LOG_FILE"
+chown tunnel:tunnel "$LOG_FILE"
+chmod 0640 "$LOG_FILE"
+install -m 0644 -o root -g root \
+  "${SCRIPT_DIR}/tunnel-server-go.service" /etc/systemd/system/tunnel-server-go.service
+install -m 0644 -o root -g root \
+  "${SCRIPT_DIR}/tunnel-server.env.example" /etc/tunnel-server-go/tunnel-server.env.example
+install -m 0644 -o root -g root \
+  "${SCRIPT_DIR}/tunnel-server-go.logrotate" /etc/logrotate.d/tunnel-server-go
+systemctl daemon-reload
+log "已同步 systemd unit、环境变量模板与日志轮转配置"
 
 # Backup current binary
 mkdir -p "$BACKUP_DIR"
@@ -95,7 +121,7 @@ if [[ "${HEALTH_OK:-false}" == "true" ]]; then
   log "升级成功 ✅"
   log "  当前二进制: ${INSTALL_DIR}/shuai-tunnel-server"
   log "  回滚备份:  $BACKUP_FILE"
-  log "  查看日志:  journalctl -u ${SERVICE_NAME} -f"
+  log "  完整日志:  $LOG_FILE"
   exit 0
 fi
 

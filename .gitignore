@@ -45,6 +45,8 @@ shuai-tunnel.db-journal
 ### Local server config ###
 /implementations/java/server/config/
 /deploy/stun-server/remote/stun-deploy.config.json
+/deploy/go-server/remote/tunnel-server.env
+/deploy/go-server/remote/*.local.env
 
 ### Local client credentials ###
 tunnelClientConfig.json
@@ -66,6 +68,7 @@ client2.jsonc
 /implementations/go/server/shuai-stun-server.exe
 /implementations/csharp/client/out/
 /implementations/go/client/out/
+/deploy/go-server/out/
 
 ### Local build caches ###
 .appdata/

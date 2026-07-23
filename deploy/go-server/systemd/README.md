@@ -8,6 +8,17 @@
 
 ## Build
 
+Windows PowerShell 一键交叉编译（默认包含管理前端和 Go 测试）：
+
+```powershell
+.\deploy\go-server\build-linux.ps1 -Architecture amd64
+```
+
+产物位于 `deploy/go-server/out/shuai-tunnel-server-linux-amd64`，并同时生成
+`tar.gz`、SHA-256 校验文件和构建清单。
+
+手工构建：
+
 ```bash
 # From repo root, build the Go binary with embedded SPA
 cd implementations/go/server
@@ -15,7 +26,19 @@ go generate ./web              # builds admin SPA into web/static via npm run de
 go build -o shuai-tunnel-server ./cmd/shuai-tunnel-server
 ```
 
-The binary `shuai-tunnel-server` is statically linked (pure Go, no CGO), ~20 MB.
+The binary `shuai-tunnel-server` is statically linked (pure Go, no CGO). Its size depends on
+the embedded management SPA and diagram stencil library.
+
+## Remote deployment
+
+从 Windows 通过 SSH 首次安装或滚动更新（默认目标 `ali2`）：
+
+```powershell
+.\deploy\go-server\remote\deploy.ps1 -HostName ali2 -Yes
+```
+
+首次安装建议传入 `-EnvFile`；未传时只安装模板，不启动默认配置。详细说明见
+[`../remote/README.md`](../remote/README.md)。
 
 ## First-time Install
 
@@ -37,7 +60,8 @@ sudo bash deploy/go-server/systemd/update.sh /path/to/shuai-tunnel-server
 | `/etc/tunnel-server-go/tunnel-server.env` | Runtime environment variables (0640, root:tunnel) |
 | `/etc/tunnel-server-go/tunnel-server.env.example` | Template, never overwrites live env |
 | `/var/lib/tunnel-server-go/` | Working directory (SQLite default path, 0750, tunnel:tunnel) |
-| `/var/log/tunnel-server-go/` | Journald only (binary logs to stderr) |
+| `/var/log/tunnel-server-go/tunnel-server.log` | Complete process output: slog, standard log, stdout/stderr, HTTP access/error logs and panics |
+| `/etc/logrotate.d/tunnel-server-go` | Daily/50 MiB rotation, 14 compressed generations |
 
 ## Environment variables
 
@@ -46,6 +70,7 @@ The same `TUNNEL_*` naming as Java server. Key variables:
 | Variable | Example | Description |
 |----------|---------|-------------|
 | `TUNNEL_MANAGEMENT_ADDR` | `:8088` | Management HTTP listen address |
+| `TUNNEL_LOG_FILE` | empty | Standalone-binary file tee; the systemd unit forces this empty because it captures stdout/stderr directly |
 | `TUNNEL_NETTY_PORT` | `7010` | Control channel TCP port |
 | `TUNNEL_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | Database provider |
 | `TUNNEL_CONNECTIONSTRINGS_TUNNEL` | `host=...` | Database connection string |
@@ -88,6 +113,20 @@ Installed as `tunnel-server-go.service`. Hardened with:
 - `ReadWritePaths=/var/lib/tunnel-server-go /var/log/tunnel-server-go`
 - `LimitNOFILE=65536`
 - Runs as `tunnel` user, `tunnel` group
+- Captures complete stdout/stderr in `/var/log/tunnel-server-go/tunnel-server.log`; logrotate uses `copytruncate`
+
+## Logs
+
+```bash
+sudo tail -F /var/log/tunnel-server-go/tunnel-server.log
+sudo grep 'level=ERROR' /var/log/tunnel-server-go/tunnel-server.log
+```
+
+Every management HTTP response records only its method, route template, status, response size and
+duration. Request bodies, headers, query strings and concrete URL path parameters are excluded so
+passwords, bearer credentials and transfer tokens do not enter the access log. HTTP panics include
+a stack trace. `journalctl -u tunnel-server-go` still reports systemd lifecycle events, but process
+output is intentionally routed to the file instead of duplicated in journald.
 
 ## Health check
 

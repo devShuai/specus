@@ -47,6 +47,7 @@ flowchart TD
 | `apps/admin-web` | 管理后台前端(React + HeroUI)，构建产物供各服务端静态托管 |
 | `deploy/java-server` | Java server 的 systemd 安装、更新脚本和环境变量模板 |
 | `deploy/stun-server` | 独立 STUN server 的 systemd 安装、更新脚本和四端点配置模板 |
+| `deploy/go-server` | Go server 的 Linux 交叉编译、SSH 远端部署、systemd 安装与回滚更新脚本 |
 | `deploy/remote` | 从 macOS/Linux 或 Windows 将当前 Java server 与 OpenResty 前端一键构建、上传、更新并验收 |
 | `protocol/spec` | 跨语言协议说明、数据面/控制面规范入口 |
 | `implementations/go/server` | Go 服务端移植；同时提供独立 `cmd/shuai-stun-server` 单文件 STUN 二进制 |

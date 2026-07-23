@@ -9,6 +9,9 @@ User=tunnel
 Group=tunnel
 WorkingDirectory=/var/lib/tunnel-server-go
 EnvironmentFile=-/etc/tunnel-server-go/tunnel-server.env
+# systemd captures the complete process output below; disable application teeing
+# even when an older environment file still defines TUNNEL_LOG_FILE.
+Environment=TUNNEL_LOG_FILE=
 ExecStart=/opt/tunnel-server-go/shuai-tunnel-server
 KillSignal=SIGTERM
 TimeoutStopSec=30
@@ -22,13 +25,14 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 UMask=0027
+LogsDirectory=tunnel-server-go
+LogsDirectoryMode=0750
 ReadWritePaths=/var/lib/tunnel-server-go /var/log/tunnel-server-go
 LimitNOFILE=65536
 
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=tunnel-server-go
+# Capture slog, standard log, third-party output and runtime panics in one file.
+StandardOutput=append:/var/log/tunnel-server-go/tunnel-server.log
+StandardError=append:/var/log/tunnel-server-go/tunnel-server.log
 
 [Install]
 WantedBy=multi-user.target
