@@ -48,15 +48,18 @@ func (p discoveryParticipant) sameGroup(other discoveryParticipant) bool {
 
 func (p discoveryParticipant) groupID() string { return publicTransferGroupID(p.roomID, p.roomKey) }
 
-func (p discoveryParticipant) clusterParticipant() clusterParticipant {
-	roomRole := p.roomRole
-	if roomRole == "" {
-		roomRole = "EDITOR"
+func (p discoveryParticipant) effectiveRoomRole() string {
+	if p.roomRole == "" {
+		return "EDITOR"
 	}
+	return p.roomRole
+}
+
+func (p discoveryParticipant) clusterParticipant() clusterParticipant {
 	return clusterParticipant{
 		LeaseID: p.leaseID, PeerID: p.peerID, DisplayName: p.displayName,
 		RoomID: p.roomID, PublicAddress: p.publicAddress, RoomKey: p.roomKey,
-		RoomRole: roomRole, SharedRoom: p.sharedRoom,
+		RoomRole: p.effectiveRoomRole(), SharedRoom: p.sharedRoom,
 		ConnectedAt: p.connectedAt.Format(time.RFC3339Nano),
 	}
 }
@@ -181,7 +184,8 @@ func (h *publicTransferDiscoveryHub) ServeHTTP(w http.ResponseWriter, r *http.Re
 		_ = conn.Close(websocket.StatusNormalClosure, "bye")
 	}()
 	_ = socket.write(map[string]any{
-		"type": "hello", "peerId": participant.peerID, "roomId": participant.roomID,
+		"type": "hello", "peerId": participant.peerID, "displayName": participant.displayName,
+		"roomId": participant.roomID, "roomRole": participant.effectiveRoomRole(),
 		"publicAddress": participant.publicAddress, "sharedRoom": participant.sharedRoom,
 		"rosterRevision": rosterRevision,
 		"connectedAt":    participant.connectedAt.Format(time.RFC3339Nano),
@@ -437,7 +441,7 @@ func discoveryParticipantView(participant discoveryParticipant) map[string]any {
 	return map[string]any{
 		"peerId": participant.peerID, "displayName": participant.displayName,
 		"roomId": participant.roomID, "publicAddress": participant.publicAddress,
-		"sharedRoom": participant.sharedRoom, "roomRole": "EDITOR",
+		"sharedRoom": participant.sharedRoom, "roomRole": participant.effectiveRoomRole(),
 		"connectedAt": participant.connectedAt.Format(time.RFC3339Nano),
 	}
 }

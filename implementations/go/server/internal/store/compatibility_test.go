@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStartupMigrationAddsPeerMeshACLDirectionWithJavaDefault(t *testing.T) {
@@ -55,6 +57,80 @@ func TestStartupMigrationAddsPeerMeshACLDirectionWithJavaDefault(t *testing.T) {
 	}
 }
 
+func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-java-ticket.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE tunnel_websocket_ticket (
+		token_hash TEXT PRIMARY KEY,
+		scope TEXT NOT NULL,
+		attributes_json TEXT NOT NULL,
+		remote_address_hash TEXT,
+		created_at TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	)`)
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prepare Java websocket ticket schema: %v", err)
+	}
+
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open and migrate Java websocket ticket schema: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Date(2026, 7, 23, 6, 0, 0, 0, time.UTC)
+	ticket := WebSocketTicket{
+		TokenHash: "go-ticket", Scope: "public-transfer", RoomID: "room-a", RoomKey: "room:7",
+		RoomRole: "EDITOR", PeerID: "peer-a", DisplayName: "Go peer", SharedRoom: true,
+		RemoteAddressHash: "address-hash", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := db.InsertWebSocketTicket(context.Background(), ticket); err != nil {
+		t.Fatalf("insert ticket after Java schema migration: %v", err)
+	}
+	var attributesJSON string
+	if err := db.sql.QueryRow(`SELECT attributes_json FROM tunnel_websocket_ticket
+		WHERE token_hash = ?`, ticket.TokenHash).Scan(&attributesJSON); err != nil {
+		t.Fatalf("read Java attributes_json: %v", err)
+	}
+	var attributes map[string]any
+	if err := json.Unmarshal([]byte(attributesJSON), &attributes); err != nil {
+		t.Fatalf("decode Java attributes_json: %v", err)
+	}
+	if attributes["roomId"] != ticket.RoomID || attributes["peerId"] != ticket.PeerID ||
+		attributes["sharedRoom"] != true {
+		t.Fatalf("unexpected Java attributes: %#v", attributes)
+	}
+	consumed, err := db.ConsumeWebSocketTicket(context.Background(), ticket.TokenHash,
+		ticket.Scope, ticket.RemoteAddressHash, now)
+	if err != nil || consumed == nil || consumed.RoomKey != ticket.RoomKey ||
+		consumed.RoomRole != ticket.RoomRole {
+		t.Fatalf("consume migrated Go ticket: ticket=%+v err=%v", consumed, err)
+	}
+
+	legacyAttributes := `{"roomId":"legacy-room","roomKey":"room:42","roomRole":"VIEWER",` +
+		`"peerId":"legacy-peer","displayName":"Java peer","sharedRoom":true}`
+	_, err = db.sql.Exec(`INSERT INTO tunnel_websocket_ticket
+		(token_hash, scope, attributes_json, remote_address_hash, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		"java-ticket", "public-transfer", legacyAttributes, "java-address",
+		formatTime(now), formatTime(now.Add(time.Minute)))
+	if err != nil {
+		t.Fatalf("insert legacy Java ticket: %v", err)
+	}
+	consumed, err = db.ConsumeWebSocketTicket(context.Background(), "java-ticket",
+		"public-transfer", "java-address", now)
+	if err != nil || consumed == nil || consumed.PeerID != "legacy-peer" ||
+		consumed.RoomRole != "VIEWER" || !consumed.SharedRoom {
+		t.Fatalf("consume legacy Java ticket: ticket=%+v err=%v", consumed, err)
+	}
+}
+
 func TestPostgresClientMessageCapabilitySchemaUsesJavaBooleanColumns(t *testing.T) {
 	data, err := schemaFS.ReadFile("schema/postgres.sql")
 	if err != nil {
@@ -79,6 +155,40 @@ func TestPostgresClientMessageCapabilitySchemaUsesJavaBooleanColumns(t *testing.
 			if !strings.Contains(migration, fragment) {
 				t.Errorf("migration for %s missing %q: %s", column, fragment, migration)
 			}
+		}
+	}
+}
+
+func TestMySQLHTTPTrafficSchemaKeepsWideCaptureFieldsOffRow(t *testing.T) {
+	data, err := schemaFS.ReadFile("schema/mysql.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := string(data)
+	const tablePrefix = "CREATE TABLE IF NOT EXISTS tunnel_http_traffic_exchange ("
+	tableStart := strings.Index(schema, tablePrefix)
+	if tableStart < 0 {
+		t.Fatal("MySQL schema is missing tunnel_http_traffic_exchange")
+	}
+	tableEnd := strings.Index(schema[tableStart:], "\n) ENGINE=InnoDB")
+	if tableEnd < 0 {
+		t.Fatal("MySQL tunnel_http_traffic_exchange definition is incomplete")
+	}
+	tableSchema := schema[tableStart : tableStart+tableEnd]
+	for _, column := range []string{
+		"relative_path",
+		"raw_query",
+		"error",
+		"request_headers",
+		"response_headers",
+		"request_preview_hex",
+		"response_preview_hex",
+	} {
+		if !strings.Contains(tableSchema, column+" TEXT") {
+			t.Errorf("MySQL schema must define wide capture field %s as TEXT", column)
+		}
+		if strings.Contains(tableSchema, column+" VARCHAR") {
+			t.Errorf("MySQL schema still defines wide capture field %s as VARCHAR", column)
 		}
 	}
 }

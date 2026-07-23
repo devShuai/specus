@@ -41,6 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expiry ON tunnel_client_auth_no
 CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
   token_hash TEXT PRIMARY KEY,
   scope TEXT NOT NULL,
+  attributes_json TEXT NOT NULL,
   username TEXT,
   tenant_id TEXT,
   is_admin INTEGER NOT NULL DEFAULT 0,

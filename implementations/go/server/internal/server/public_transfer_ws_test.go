@@ -120,6 +120,17 @@ func TestPublicTransferClusterFrameMatchesCanonicalVector(t *testing.T) {
 	}
 }
 
+func TestDiscoveryParticipantViewPreservesRoomRole(t *testing.T) {
+	owner := discoveryParticipant{peerID: "owner", roomRole: "OWNER", connectedAt: time.Now()}
+	if got := discoveryParticipantView(owner)["roomRole"]; got != "OWNER" {
+		t.Fatalf("owner roomRole = %#v, want OWNER", got)
+	}
+	editor := discoveryParticipant{peerID: "editor", connectedAt: time.Now()}
+	if got := discoveryParticipantView(editor)["roomRole"]; got != "EDITOR" {
+		t.Fatalf("default roomRole = %#v, want EDITOR", got)
+	}
+}
+
 func TestPublicTransferDiscoveryIsolationRosterAndTargetedSignal(t *testing.T) {
 	server, tickets := newDiscoveryTestServer(t, config.PublicTransferConfig{
 		MaxDiscoveryPeersPerRoom:               2,
@@ -248,6 +259,9 @@ func TestPublicTransferDiscoveryRateLimitAndTrustedAddress(t *testing.T) {
 	hello := readDiscoveryType(t, conn, "hello")
 	if hello["publicAddress"] != "203.0.113.8" {
 		t.Fatalf("trusted XFF last hop not used: %#v", hello)
+	}
+	if hello["roomRole"] != "EDITOR" {
+		t.Fatalf("hello roomRole = %#v, want EDITOR", hello["roomRole"])
 	}
 	readDiscoveryType(t, conn, "roster")
 	_ = conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"ping"}`))
