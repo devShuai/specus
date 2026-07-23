@@ -86,6 +86,7 @@ export function SyncedClipboard({
   const [clipboardWriteBlockId, setClipboardWriteBlockId] = useState("");
   const [isSystemClipboardReading, setSystemClipboardReading] = useState(false);
   const [autoWriteRevision, setAutoWriteRevision] = useState(0);
+  const [editingBlockId, setEditingBlockId] = useState("");
 
   latestInboundRef.current = latestInbound;
   canSendRef.current = canSend;
@@ -130,7 +131,7 @@ export function SyncedClipboard({
           return;
         }
         setViewState("needs-copy");
-        setStatusMessage("浏览器未能自动恢复剪贴板，请点击“写入系统剪贴板”重试。");
+        setStatusMessage("浏览器未能自动恢复剪贴板，请点击“复制到剪贴板”重试。");
       });
     };
 
@@ -255,8 +256,8 @@ export function SyncedClipboard({
             && latestInboundRef.current?.eventId === candidate.eventId) {
             setViewState("needs-copy");
             setStatusMessage(error instanceof ClipboardWriteTimeoutError
-              ? "自动写入等待超时，请点击“写入系统剪贴板”重试。"
-              : "浏览器阻止了自动写入，请点击“写入系统剪贴板”。");
+              ? "自动写入等待超时，请点击“复制到剪贴板”重试。"
+              : "浏览器阻止了自动写入，请点击“复制到剪贴板”。");
           }
         })
         .finally(() => {
@@ -487,7 +488,7 @@ export function SyncedClipboard({
         }
         setViewState("failed");
         setStatusMessage(error instanceof ClipboardWriteTimeoutError
-          ? "写入等待超时，已解除占用；可以再次点击“写入系统剪贴板”。"
+          ? "写入等待超时，已解除占用；可以再次点击“复制到剪贴板”。"
           : systemClipboardErrorMessage(error, "写入"));
       })
       .finally(() => {
@@ -521,6 +522,9 @@ export function SyncedClipboard({
 
   const removeBlock = (block: ClipboardTextBlock) => {
     setBlocks((current) => current.filter((item) => item.id !== block.id));
+    if (editingBlockId === block.id) {
+      setEditingBlockId("");
+    }
     if (block.sourceEventId && latestInboundRef.current?.eventId === block.sourceEventId) {
       setLatestInbound(null);
     }
@@ -543,49 +547,36 @@ export function SyncedClipboard({
       aria-labelledby="transfer-tab-clipboard"
       hidden={!isActive}
       onPaste={handlePaste}
-      className="mt-3 overflow-hidden border-y border-black/10 bg-white/30 dark:border-white/10 dark:bg-white/[0.015]"
+      className="mt-3 overflow-hidden rounded-xl border border-black/[0.07] bg-white/40 dark:border-white/[0.08] dark:bg-white/[0.02]"
     >
-      <div className="flex flex-col gap-2 border-b border-black/10 px-3 py-2.5 dark:border-white/10 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步剪贴板</h2>
-            <Chip size="sm" radius="sm" variant="flat" color={canSend && targetPeerId ? "success" : "default"}>
-              {canSend ? (targetPeerId ? "粘贴即发送" : "等待设备") : "只读"}
-            </Chip>
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-black/[0.06] px-4 py-3 dark:border-white/[0.07]">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <h2 className="text-base font-semibold text-zinc-950 dark:text-white">同步剪贴板</h2>
+          <Chip size="sm" radius="sm" variant="flat" color={canSend && targetPeerId ? "success" : "default"}>
+            {canSend ? (targetPeerId ? "粘贴即发送" : "等待设备") : "只读"}
+          </Chip>
+          {blocks.length > 0 && (
             <Chip size="sm" radius="sm" variant="flat">
-              {blocks.length} 项内容
+              {blocks.length} 项
             </Chip>
-          </div>
-          <p aria-live="polite" className="mt-0.5 max-w-2xl text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-            {!canSend
-              ? "可查看和复制收到的内容；当前房间为只读。"
-              : targetPeerId
-                ? <>粘贴或读取内容后，将立即同步到 <span title={targetLabel} className="font-medium text-zinc-700 [overflow-wrap:anywhere] dark:text-zinc-200">{targetLabel}</span>。</>
-                : "粘贴或读取内容后，选择一台在线设备即可同步。"}
-          </p>
+          )}
         </div>
+        <p className="text-tiny text-zinc-500 dark:text-zinc-400">
+          {!canSend
+            ? "只读房间：可查看和复制收到的内容"
+            : targetPeerId
+              ? <>同步到 <span title={targetLabel} className="font-medium text-zinc-700 [overflow-wrap:anywhere] dark:text-zinc-200">{targetLabel}</span></>
+              : "选择一台在线设备即可同步"}
+        </p>
       </div>
 
-      <div className="px-3 py-3">
-        <div className="border-b border-black/[0.07] pb-3 dark:border-white/[0.08]">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <label htmlFor="public-transfer-clipboard-text" className="block text-tiny font-semibold text-zinc-700 dark:text-zinc-200">
-              添加剪贴板内容
-            </label>
-            <Button
-              radius="sm"
-              size="sm"
-              variant="flat"
-              isLoading={isSystemClipboardReading}
-              onPress={readSystemClipboard}
-            >
-              读取系统剪贴板
-            </Button>
-          </div>
+      <div className="flex flex-col gap-3 px-4 py-3">
+        <div className="rounded-lg border border-black/[0.07] bg-white/60 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
           <textarea
             ref={textareaRef}
             id="public-transfer-clipboard-text"
             data-testid="public-transfer-clipboard-text"
+            aria-label="添加剪贴板内容"
             value={composerDraft}
             maxLength={CLIPBOARD_TEXT_MAX_CHARS}
             spellCheck={false}
@@ -604,70 +595,79 @@ export function SyncedClipboard({
               }
             }}
             placeholder="粘贴或输入内容，Ctrl/⌘ + Enter 添加"
-            className="mt-2 min-h-20 w-full resize-y rounded-md border border-zinc-300 bg-white/70 px-3 py-2 font-mono text-small leading-5 text-zinc-950 outline-none transition focus:border-primary-500 focus:ring-4 focus:ring-primary-500/10 dark:border-white/15 dark:bg-black/20 dark:text-zinc-100 dark:focus:border-primary-400"
+            className="min-h-20 w-full resize-y rounded-md border border-zinc-300 bg-white/70 px-3 py-2 font-mono text-small leading-5 text-zinc-950 outline-none transition focus:border-primary-500 focus:ring-4 focus:ring-primary-500/10 dark:border-white/15 dark:bg-black/20 dark:text-zinc-100 dark:focus:border-primary-400"
           />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-            <span className={`text-tiny ${composerWithinLimits ? "text-zinc-500 dark:text-zinc-400" : "font-medium text-rose-600 dark:text-rose-300"}`}>
-              {composerDraft.length.toLocaleString()} / {CLIPBOARD_TEXT_MAX_CHARS.toLocaleString()} 字符 · {formatByteCount(composerByteLength)} / {formatByteCount(CLIPBOARD_TEXT_MAX_UTF8_BYTES)}
+            <span className={`text-tiny ${composerDraft && !composerWithinLimits ? "font-medium text-rose-600 dark:text-rose-300" : "text-zinc-400 dark:text-zinc-500"}`}>
+              {composerDraft
+                ? `${composerDraft.length.toLocaleString()} / ${CLIPBOARD_TEXT_MAX_CHARS.toLocaleString()} 字符 · ${formatByteCount(composerByteLength)}`
+                : "文本、富文本、链接；文件走文件通道"}
             </span>
-            <Button
-              color="primary"
-              radius="sm"
-              size="sm"
-              isDisabled={!composerDraft || !composerWithinLimits}
-              onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, ""))}
-            >
-              {canSend && targetPeerId && !isSending ? "添加并同步" : "添加内容"}
-            </Button>
+            <div className="flex items-center gap-1.5">
+              <Button
+                radius="sm"
+                size="sm"
+                variant="flat"
+                isLoading={isSystemClipboardReading}
+                onPress={readSystemClipboard}
+              >
+                读取剪贴板
+              </Button>
+              <Button
+                color="primary"
+                radius="sm"
+                size="sm"
+                isDisabled={!composerDraft || !composerWithinLimits}
+                onPress={() => addLocalBlock(composerDraft, classifyClipboardContent(composerDraft, ""))}
+              >
+                {canSend && targetPeerId && !isSending ? "添加并同步" : "添加内容"}
+              </Button>
+            </div>
           </div>
-        </div>
-
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h3 className="text-small font-semibold text-zinc-950 dark:text-white">剪贴板内容</h3>
-            <p className="text-tiny text-zinc-500 dark:text-zinc-400">最新在前 · 最多保留 80 条</p>
-          </div>
-          <Button
-            radius="sm"
-            size="sm"
-            variant="light"
-            isDisabled={blocks.length === 0 || isSending || isClipboardWritePending}
-            onPress={clearAllBlocks}
-          >
-            清空全部
-          </Button>
         </div>
 
         {blocks.length === 0 ? (
-          <div className="mt-2 border-y border-dashed border-black/15 px-4 py-6 text-center text-small text-zinc-500 dark:border-white/15 dark:text-zinc-400">
+          <div className="rounded-lg border border-dashed border-black/15 px-4 py-6 text-center text-small text-zinc-500 dark:border-white/15 dark:text-zinc-400">
             暂无内容。读取系统剪贴板或直接粘贴即可开始。
           </div>
         ) : (
-          <div className="mt-2 grid gap-2">
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-tiny text-zinc-400 dark:text-zinc-500">最新在前 · 最多保留 80 条</p>
+              <Button
+                radius="sm"
+                size="sm"
+                variant="light"
+                isDisabled={isSending || isClipboardWritePending}
+                onPress={clearAllBlocks}
+              >
+                清空全部
+              </Button>
+            </div>
             {blocks.map((block) => {
-              const byteLength = clipboardContentByteLength(block.text, block.html ?? "");
               const withinLimits = isClipboardContentWithinLimits(block.text, block.html ?? "");
               const isLatestInbound = Boolean(block.sourceEventId && latestInbound?.eventId === block.sourceEventId);
               const needsCopy = viewState === "needs-copy" && isLatestInbound;
+              const isEditing = editingBlockId === block.id;
               return (
-                <article key={block.id} className="min-w-0 rounded-md border border-black/10 bg-white/55 p-2.5 dark:border-white/10 dark:bg-white/[0.035]">
-                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <article key={block.id} className="min-w-0 rounded-lg border border-black/[0.07] bg-white/55 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
+                  <div className="flex min-w-0 items-center gap-2">
                     <Chip size="sm" radius="sm" variant="flat" color={block.origin === "remote" ? "success" : "primary"}>
                       {block.origin === "remote" ? "收到" : "本机"}
                     </Chip>
                     <Chip size="sm" radius="sm" variant="flat">
                       {clipboardKindLabel(block.kind)}
                     </Chip>
-                    <span className="min-w-0 flex-1 truncate text-tiny font-medium text-zinc-700 dark:text-zinc-200">
+                    <span className="min-w-0 flex-1 truncate text-tiny font-medium text-zinc-600 dark:text-zinc-300">
                       {block.origin === "remote" ? `来自 ${block.sourceDisplayName || "未命名设备"}` : "本机剪贴板"}
                     </span>
-                    <time className="shrink-0 font-mono text-[10px] text-zinc-500 dark:text-zinc-400" dateTime={new Date(block.createdAt).toISOString()} title={new Date(block.createdAt).toLocaleString()}>
+                    <time className="shrink-0 font-mono text-[10px] text-zinc-400 dark:text-zinc-500" dateTime={new Date(block.createdAt).toISOString()} title={new Date(block.createdAt).toLocaleString()}>
                       {formatClipboardTime(block.createdAt)}
                     </time>
                   </div>
                   {block.kind === "html" && block.html ? (
                     <div
-                      className="clipboard-rich-preview mt-2 max-h-40 overflow-auto rounded-md border border-black/10 bg-white px-3 py-2 text-small text-zinc-900 dark:border-white/10 dark:bg-white/[0.04] dark:text-zinc-100"
+                      className="clipboard-rich-preview mt-2 max-h-40 overflow-auto rounded-md border border-black/[0.07] bg-white px-3 py-2 text-small text-zinc-900 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-zinc-100"
                       dangerouslySetInnerHTML={{ __html: sanitizeClipboardHtml(block.html) }}
                     />
                   ) : null}
@@ -681,21 +681,45 @@ export function SyncedClipboard({
                       {block.text}
                     </a>
                   ) : null}
-                  <textarea
-                    data-clipboard-block-editor="true"
-                    aria-label={block.origin === "remote" ? `编辑来自 ${block.sourceDisplayName || "未命名设备"} 的剪贴板内容` : "编辑本机剪贴板内容"}
-                    value={block.text}
-                    maxLength={CLIPBOARD_TEXT_MAX_CHARS}
-                    spellCheck={false}
-                    onChange={(event) => updateBlockText(block.id, event.currentTarget.value)}
-                    className="mt-2 min-h-20 w-full resize-y rounded-md border border-zinc-300 bg-white/75 px-3 py-2 font-mono text-small leading-5 text-zinc-950 outline-none transition focus:border-primary-500 focus:ring-4 focus:ring-primary-500/10 dark:border-white/15 dark:bg-black/20 dark:text-zinc-100 dark:focus:border-primary-400"
-                  />
-                  <div className="mt-2 text-tiny">
-                    <span className={withinLimits ? "text-zinc-500 dark:text-zinc-400" : "font-medium text-rose-600 dark:text-rose-300"}>
-                      {block.text.length.toLocaleString()} 字符 · {formatByteCount(byteLength)}
-                    </span>
-                  </div>
-                  <div className="mt-2 flex flex-wrap gap-2">
+                  {isEditing ? (
+                    <textarea
+                      data-clipboard-block-editor="true"
+                      aria-label={block.origin === "remote" ? `编辑来自 ${block.sourceDisplayName || "未命名设备"} 的剪贴板内容` : "编辑本机剪贴板内容"}
+                      value={block.text}
+                      maxLength={CLIPBOARD_TEXT_MAX_CHARS}
+                      spellCheck={false}
+                      autoFocus
+                      onChange={(event) => updateBlockText(block.id, event.currentTarget.value)}
+                      className="mt-2 min-h-20 w-full resize-y rounded-md border border-zinc-300 bg-white/75 px-3 py-2 font-mono text-small leading-5 text-zinc-950 outline-none transition focus:border-primary-500 focus:ring-4 focus:ring-primary-500/10 dark:border-white/15 dark:bg-black/20 dark:text-zinc-100 dark:focus:border-primary-400"
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      title="点击编辑"
+                      onClick={() => setEditingBlockId(block.id)}
+                      className="mt-2 block w-full cursor-text rounded-md bg-black/[0.03] px-3 py-2 text-left transition hover:bg-black/[0.05] dark:bg-white/[0.04] dark:hover:bg-white/[0.06]"
+                    >
+                      <span className="line-clamp-3 whitespace-pre-wrap break-words font-mono text-small leading-5 text-zinc-800 dark:text-zinc-200">
+                        {block.text}
+                      </span>
+                    </button>
+                  )}
+                  {!withinLimits && (
+                    <p className="mt-1.5 text-tiny font-medium text-rose-600 dark:text-rose-300">
+                      内容超过上限，请删减后再同步。
+                    </p>
+                  )}
+                  <div className="mt-2 flex flex-wrap items-center justify-end gap-1.5">
+                    {isEditing && (
+                      <Button
+                        radius="sm"
+                        size="sm"
+                        variant="light"
+                        onPress={() => setEditingBlockId("")}
+                      >
+                        完成
+                      </Button>
+                    )}
                     <Button
                       color="primary"
                       radius="sm"
@@ -716,7 +740,7 @@ export function SyncedClipboard({
                       isDisabled={isClipboardWritePending && clipboardWriteBlockId !== block.id}
                       onPress={() => handleManualCopy(block)}
                     >
-                      写入系统剪贴板
+                      复制到剪贴板
                     </Button>
                     <Button
                       radius="sm"
@@ -736,7 +760,7 @@ export function SyncedClipboard({
 
         <div
           aria-live="polite"
-          className={`mt-3 rounded-lg border px-3 py-2 text-small ${statusClassName(viewState)}`}
+          className={`rounded-lg border px-3 py-2 text-small ${statusClassName(viewState)}`}
         >
           {statusMessage}
           {latestInbound && (
@@ -744,8 +768,8 @@ export function SyncedClipboard({
           )}
         </div>
 
-        <p className="mt-3 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-          文本、富文本和链接仅保留在当前页面；文件使用文件传输通道。不要同步密码、令牌等敏感信息。
+        <p className="text-tiny leading-5 text-zinc-400 dark:text-zinc-500">
+          内容仅保留在当前页面。不要同步密码、令牌等敏感信息。
         </p>
       </div>
     </section>

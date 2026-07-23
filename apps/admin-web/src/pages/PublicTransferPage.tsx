@@ -93,7 +93,7 @@ type TransferToolMode = "files" | "clipboard" | "whiteboard";
 type ClientNameStatus = "idle" | "checking" | "available" | "unavailable" | "error";
 type TransferInviteRole = Exclude<PublicTransferRoomRole, "OWNER">;
 export type PublicTransferWorkspace = "transfer" | "diagram";
-const TRANSFER_TOOL_MODES: TransferToolMode[] = ["files", "clipboard", "whiteboard"];
+const TRANSFER_TOOL_MODES: TransferToolMode[] = ["clipboard", "files", "whiteboard"];
 
 interface UploadRecord {
   file: File;
@@ -2520,17 +2520,17 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
           <div className="transfer-room-tools mt-3 grid grid-cols-3 gap-1 border-t border-black/10 pt-2.5 dark:border-white/10" role="tablist" aria-label="互传功能切换">
             <ToolModeButton
-              mode="files"
-              activeMode={activeTool}
-              label="文件传输"
-              detail={fileActivityCount > 0 ? `${fileActivityCount} 项` : "发送和接收"}
-              onSelect={selectTransferTool}
-            />
-            <ToolModeButton
               mode="clipboard"
               activeMode={activeTool}
               label="同步剪贴板"
               detail={clipboardEvents.length > 0 ? "有新内容" : "粘贴即发送"}
+              onSelect={selectTransferTool}
+            />
+            <ToolModeButton
+              mode="files"
+              activeMode={activeTool}
+              label="文件传输"
+              detail={fileActivityCount > 0 ? `${fileActivityCount} 项` : "发送和接收"}
               onSelect={selectTransferTool}
             />
             <ToolModeButton
