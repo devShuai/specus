@@ -269,7 +269,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [iceConfig, setIceConfig] = useState<PublicTransferIceConfig | null>(null);
   const [isFileDragActive, setFileDragActive] = useState(false);
-  const [activeTool, setActiveTool] = useState<TransferToolMode>("files");
+  const [activeTool, setActiveTool] = useState<TransferToolMode>("clipboard");
   const [clipboardFocusRequest, setClipboardFocusRequest] = useState(0);
   const [clipboardEvents, setClipboardEvents] = useState<ClipboardInboundEvent[]>([]);
   const [whiteboardEvents, setWhiteboardEvents] = useState<WhiteboardInboundEvent[]>([]);
@@ -3543,18 +3543,16 @@ function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClo
       <ModalContent className="max-w-[min(96vw,1480px)]">
         {target && (
           <>
-            <ModalHeader className="flex min-w-0 flex-col gap-2 pr-12">
-              <div className="min-w-0 truncate text-base font-semibold sm:text-lg">{target.fileName}</div>
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <Chip color="primary" size="sm" variant="flat">
-                  {previewKindLabel(kind)}
-                </Chip>
-                <span className="min-w-0 break-all font-mono text-tiny font-normal text-default-500">
-                  {mimeType}
-                </span>
-              </div>
+            <ModalHeader className="flex min-w-0 flex-row items-center gap-2 px-4 py-3 pr-12">
+              <span className="min-w-0 flex-1 truncate text-base font-semibold">{target.fileName}</span>
+              <Chip color="primary" size="sm" variant="flat" className="shrink-0">
+                {previewKindLabel(kind)}
+              </Chip>
+              <span className="hidden shrink-0 font-mono text-tiny font-normal text-default-400 sm:inline">
+                {mimeType}
+              </span>
             </ModalHeader>
-            <ModalBody className="overflow-y-auto px-4 pb-4">
+            <ModalBody className="overflow-y-auto px-3 pb-3 pt-0">
               <FilePreview
                 fileName={target.fileName}
                 mimeType={target.mimeType}
@@ -3568,6 +3566,84 @@ function PreviewModal({ target, onClose }: { target: PreviewTarget | null; onClo
         )}
       </ModalContent>
     </Modal>
+  );
+}
+
+// 放大图片预览：自带缩放/旋转工具栏。缩放按宽度撑开；90°/270° 旋转时按图片固有
+// 宽高比换算可视尺寸，让外层滚动容器拿到真实布局盒，避免裁剪或滚动失效。
+function ExpandedImagePreview({ url, fileName, onError }: { url: string; fileName: string; onError: () => void }) {
+  const [scale, setScale] = useState(1);
+  const [rotation, setRotation] = useState(0);
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setContainerWidth(el.clientWidth);
+    const observer = new ResizeObserver(() => setContainerWidth(el.clientWidth));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const zoomBy = (factor: number) =>
+    setScale((current) => Math.min(5, Math.max(0.2, Math.round(current * factor * 100) / 100)));
+  const rotateCW = () => setRotation((current) => (current + 90) % 360);
+
+  const quarterTurned = rotation % 180 !== 0;
+  const imageWidth = Math.max(1, scale * (containerWidth || 1));
+  const imageHeight = natural ? (imageWidth * natural.h) / natural.w : 0;
+  const visualWidth = quarterTurned ? imageHeight : imageWidth;
+  const visualHeight = quarterTurned ? imageWidth : imageHeight;
+
+  const toolButton =
+    "grid h-7 min-w-7 place-items-center rounded-md px-1 text-zinc-500 transition hover:bg-black/[0.06] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.08] dark:hover:text-white";
+  return (
+    <div className="relative overflow-hidden rounded-lg border border-black/10 bg-zinc-950/[0.04] dark:border-white/10 dark:bg-white/[0.03]">
+      <div
+        className="absolute right-2 top-2 z-10 flex items-center gap-0.5 rounded-lg border border-black/[0.08] bg-white/90 p-0.5 shadow-sm backdrop-blur dark:border-white/[0.1] dark:bg-zinc-900/90"
+        role="toolbar"
+        aria-label="图片预览工具栏"
+      >
+        <button type="button" className={toolButton} aria-label="缩小" title="缩小" onClick={() => zoomBy(1 / 1.25)}>
+          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M5 12h14" /></svg>
+        </button>
+        <span className="w-11 text-center font-mono text-[11px] tabular-nums text-zinc-600 dark:text-zinc-300">
+          {Math.round(scale * 100)}%
+        </span>
+        <button type="button" className={toolButton} aria-label="放大" title="放大" onClick={() => zoomBy(1.25)}>
+          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+        </button>
+        <button type="button" className={`${toolButton} font-mono text-[10px]`} aria-label="原始大小" title="原始大小" onClick={() => { setScale(1); setRotation(0); }}>
+          1:1
+        </button>
+        <button type="button" className={toolButton} aria-label="顺时针旋转 90°" title="顺时针旋转 90°" onClick={rotateCW}>
+          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+            <path d="M20 3.5v4h-4" />
+          </svg>
+        </button>
+        <a className={toolButton} href={url} download={fileName} aria-label={`下载 ${fileName}`} title="下载">
+          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 4v11m0 0 4-4m-4 4-4-4M4.5 19.5h15" /></svg>
+        </a>
+      </div>
+      <div ref={scrollRef} className="max-h-[78dvh] overflow-auto">
+        <div
+          className="mx-auto flex items-center justify-center"
+          style={natural ? { width: visualWidth, height: visualHeight } : undefined}
+        >
+          <img
+            src={url}
+            alt={fileName}
+            onError={onError}
+            onLoad={(event) => setNatural({ w: event.currentTarget.naturalWidth, h: event.currentTarget.naturalHeight })}
+            style={{ width: containerWidth ? imageWidth : "100%", transform: `rotate(${rotation}deg)` }}
+            className="block max-w-none shrink-0 object-contain transition-transform duration-200 motion-reduce:transition-none"
+          />
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3615,12 +3691,12 @@ function FilePreview({
     ? "mt-2 overflow-hidden rounded border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
     : "overflow-hidden rounded-lg border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]";
   const mediaClass = expanded
-    ? "max-h-[70dvh] w-full object-contain"
+    ? "max-h-[78dvh] w-full object-contain"
     : compact
       ? "max-h-44 w-full object-contain"
       : "h-64 w-full object-contain";
   const documentClass = expanded
-    ? "h-[70dvh] w-full"
+    ? "h-[78dvh] w-full"
     : compact
       ? "h-44 w-full"
       : "h-80 w-full";
@@ -3648,6 +3724,9 @@ function FilePreview({
   }
 
   if (url && kind === "image" && !previewFailed) {
+    if (expanded) {
+      return <ExpandedImagePreview url={url} fileName={fileName} onError={() => setPreviewFailed(true)} />;
+    }
     return (
       <>
         <div className={frameClass}>

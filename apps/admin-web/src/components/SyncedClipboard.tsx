@@ -571,7 +571,7 @@ export function SyncedClipboard({
       </div>
 
       <div className="flex flex-col gap-3 px-4 py-3">
-        <div className="rounded-lg border border-black/[0.07] bg-white/60 p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
+        <div className="rounded-xl border border-black/[0.06] bg-gradient-to-b from-white/90 to-white/50 p-3 shadow-sm dark:border-white/[0.08] dark:from-white/[0.05] dark:to-white/[0.02]">
           <textarea
             ref={textareaRef}
             id="public-transfer-clipboard-text"
@@ -595,7 +595,7 @@ export function SyncedClipboard({
               }
             }}
             placeholder="粘贴或输入内容，Ctrl/⌘ + Enter 添加"
-            className="min-h-20 w-full resize-y rounded-md border border-zinc-300 bg-white/70 px-3 py-2 font-mono text-small leading-5 text-zinc-950 outline-none transition focus:border-primary-500 focus:ring-4 focus:ring-primary-500/10 dark:border-white/15 dark:bg-black/20 dark:text-zinc-100 dark:focus:border-primary-400"
+            className="min-h-24 w-full resize-y rounded-lg border border-transparent bg-black/[0.035] px-3.5 py-2.5 font-mono text-small leading-6 text-zinc-950 outline-none transition placeholder:text-zinc-400 hover:bg-black/[0.05] focus:border-primary-500/50 focus:bg-white focus:shadow-[0_0_0_4px_rgba(0,102,204,0.08)] dark:bg-white/[0.05] dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:hover:bg-white/[0.07] dark:focus:border-primary-400/50 dark:focus:bg-black/30"
           />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
             <span className={`text-tiny ${composerDraft && !composerWithinLimits ? "font-medium text-rose-600 dark:text-rose-300" : "text-zinc-400 dark:text-zinc-500"}`}>
@@ -681,45 +681,45 @@ export function SyncedClipboard({
                       {block.text}
                     </a>
                   ) : null}
-                  {isEditing ? (
-                    <textarea
-                      data-clipboard-block-editor="true"
-                      aria-label={block.origin === "remote" ? `编辑来自 ${block.sourceDisplayName || "未命名设备"} 的剪贴板内容` : "编辑本机剪贴板内容"}
-                      value={block.text}
-                      maxLength={CLIPBOARD_TEXT_MAX_CHARS}
-                      spellCheck={false}
-                      autoFocus
-                      onChange={(event) => updateBlockText(block.id, event.currentTarget.value)}
-                      className="mt-2 min-h-20 w-full resize-y rounded-md border border-zinc-300 bg-white/75 px-3 py-2 font-mono text-small leading-5 text-zinc-950 outline-none transition focus:border-primary-500 focus:ring-4 focus:ring-primary-500/10 dark:border-white/15 dark:bg-black/20 dark:text-zinc-100 dark:focus:border-primary-400"
-                    />
-                  ) : (
+                  <div className="relative mt-2">
+                    {isEditing ? (
+                      <textarea
+                        data-clipboard-block-editor="true"
+                        aria-label={block.origin === "remote" ? `编辑来自 ${block.sourceDisplayName || "未命名设备"} 的剪贴板内容` : "编辑本机剪贴板内容"}
+                        value={block.text}
+                        maxLength={CLIPBOARD_TEXT_MAX_CHARS}
+                        spellCheck={false}
+                        autoFocus
+                        onChange={(event) => updateBlockText(block.id, event.currentTarget.value)}
+                        className="block min-h-20 w-full resize-y rounded-md bg-black/[0.045] px-3 py-2 pr-10 font-mono text-small leading-5 text-zinc-800 outline-none ring-1 ring-primary-500/50 transition dark:bg-white/[0.06] dark:text-zinc-200"
+                      />
+                    ) : (
+                      <div className="rounded-md bg-black/[0.03] px-3 py-2 pr-10 transition hover:bg-black/[0.045] dark:bg-white/[0.04] dark:hover:bg-white/[0.055]">
+                        <span className="line-clamp-3 whitespace-pre-wrap break-words font-mono text-small leading-5 text-zinc-800 dark:text-zinc-200">
+                          {block.text}
+                        </span>
+                      </div>
+                    )}
                     <button
                       type="button"
-                      title="点击编辑"
-                      onClick={() => setEditingBlockId(block.id)}
-                      className="mt-2 block w-full cursor-text rounded-md bg-black/[0.03] px-3 py-2 text-left transition hover:bg-black/[0.05] dark:bg-white/[0.04] dark:hover:bg-white/[0.06]"
+                      aria-label={isEditing ? "完成编辑" : "编辑内容"}
+                      title={isEditing ? "完成编辑" : "编辑内容"}
+                      onClick={() => setEditingBlockId(isEditing ? "" : block.id)}
+                      className={`absolute right-1.5 top-1.5 grid h-7 w-7 place-items-center rounded-md transition ${
+                        isEditing
+                          ? "bg-primary-500/10 text-primary-600 hover:bg-primary-500/20 dark:text-primary-300"
+                          : "text-zinc-400 hover:bg-black/[0.06] hover:text-zinc-700 dark:hover:bg-white/[0.08] dark:hover:text-zinc-200"
+                      }`}
                     >
-                      <span className="line-clamp-3 whitespace-pre-wrap break-words font-mono text-small leading-5 text-zinc-800 dark:text-zinc-200">
-                        {block.text}
-                      </span>
+                      {isEditing ? <CheckGlyph /> : <PencilGlyph />}
                     </button>
-                  )}
+                  </div>
                   {!withinLimits && (
                     <p className="mt-1.5 text-tiny font-medium text-rose-600 dark:text-rose-300">
                       内容超过上限，请删减后再同步。
                     </p>
                   )}
                   <div className="mt-2 flex flex-wrap items-center justify-end gap-1.5">
-                    {isEditing && (
-                      <Button
-                        radius="sm"
-                        size="sm"
-                        variant="light"
-                        onPress={() => setEditingBlockId("")}
-                      >
-                        完成
-                      </Button>
-                    )}
                     <Button
                       color="primary"
                       radius="sm"
@@ -778,6 +778,23 @@ export function SyncedClipboard({
 
 function clipboardContentByteLength(text: string, html = "") {
   return new TextEncoder().encode(text).byteLength + new TextEncoder().encode(html).byteLength;
+}
+
+function PencilGlyph() {
+  return (
+    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M16.8 3.8a2.1 2.1 0 0 1 3 3L8.5 18.1 4 19.5l1.4-4.5L16.8 3.8Z" />
+      <path d="m14.8 5.8 3 3" />
+    </svg>
+  );
+}
+
+function CheckGlyph() {
+  return (
+    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="m4.5 12.5 5 5 10-11" />
+    </svg>
+  );
 }
 
 function formatClipboardTime(timestamp: number) {
