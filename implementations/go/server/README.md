@@ -45,6 +45,7 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 | `TUNNEL_NETTY_PORT` | v2 control/data 隧道端口 | 7010 |
 | `TUNNEL_NETTY_MAX_FRAME_SIZE` | 完整控制帧上限，包含 11 字节 header；值必须不小于 11（等于 11 时仅容纳零字节 body） | 33554432 |
 | `TUNNEL_MANAGEMENT_ADDR` | 管理 HTTP 监听地址 | `:8088` |
+| `TUNNEL_LOG_FILE` | 独立运行时可选的日志文件绝对路径；配置后与标准输出双写。systemd 部署直接捕获完整 stdout/stderr 并强制留空，避免重复日志 | - |
 | `TUNNEL_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | sqlite |
 | `TUNNEL_CONNECTIONSTRINGS_TUNNEL` | 数据库连接串 | `./shuai-tunnel.db` |
 | `TUNNEL_DB_SEED_DEMO_CLIENT` | 是否 seed 演示客户端 | true |

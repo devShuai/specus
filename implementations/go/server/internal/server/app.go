@@ -197,7 +197,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
-		}, peerMesh, attachments, rooms)
+		}, peerMesh, attachments, rooms, logger)
 	wsHub := wsevents.NewHub(webSocketTickets, func(access wsevents.Access, event wsevents.Event) bool {
 		if access.Admin {
 			return true
@@ -347,7 +347,11 @@ func (a *App) Run(ctx context.Context) error {
 	errc := make(chan error, 2)
 	go func() { errc <- a.listener.Serve(ctx) }()
 
-	httpServer := &http.Server{Addr: a.cfg.ManagementAddr, Handler: a.managementHandler()}
+	httpServer := &http.Server{
+		Addr:     a.cfg.ManagementAddr,
+		Handler:  a.managementHandler(),
+		ErrorLog: slog.NewLogLogger(a.logger.Handler(), slog.LevelError),
+	}
 	if a.tlsConfig != nil {
 		httpServer.TLSConfig = a.tlsConfig
 	}
@@ -421,7 +425,7 @@ func (a *App) managementHandler() http.Handler {
 	fileServer := http.FileServerFS(web.StaticFS())
 	mux.Handle("/", staticResourceCacheHeaders(fileServer))
 
-	return securityHeaders(mux, a.cfg.ObjectStorage)
+	return a.observeManagementHTTP(securityHeaders(mux, a.cfg.ObjectStorage))
 }
 
 func staticResourceCacheHeaders(next http.Handler) http.Handler {

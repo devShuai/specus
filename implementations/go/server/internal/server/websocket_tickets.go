@@ -46,6 +46,7 @@ func (a *App) handleAdminWebSocketTicket(w http.ResponseWriter, r *http.Request)
 	issued, err := a.webSocketTickets.Issue(r.Context(), scope, security.WebSocketRequestAddress(r),
 		security.WebSocketTicketClaims{Username: access.Username, TenantID: access.TenantID, Admin: access.Admin})
 	if err != nil {
+		a.logger.Error("issue admin websocket ticket failed", "scope", scope, "err", err)
 		http.Error(w, "could not issue websocket ticket", http.StatusInternalServerError)
 		return
 	}
@@ -76,7 +77,7 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 		// room service (creating the owner room on first use) instead of hashing the token.
 		access, err := a.rooms.Resolve(r.Context(), roomID, roomToken, peerID)
 		if err != nil {
-			failRoomResolve(w, err)
+			a.failRoomResolve(w, err)
 			return
 		}
 		claims.SharedRoom = true
@@ -88,6 +89,7 @@ func (a *App) handlePublicWebSocketTicket(w http.ResponseWriter, r *http.Request
 	issued, err := a.webSocketTickets.Issue(r.Context(), security.WebSocketScopePublicTransfer,
 		security.WebSocketRequestAddress(r), claims)
 	if err != nil {
+		a.logger.Error("issue public websocket ticket failed", "sharedRoom", claims.SharedRoom, "err", err)
 		http.Error(w, "could not issue websocket ticket", http.StatusInternalServerError)
 		return
 	}
@@ -126,7 +128,7 @@ func writeWebSocketTicket(w http.ResponseWriter, ticket security.IssuedWebSocket
 
 // failRoomResolve maps room-service credential errors to the Java status codes
 // (ResponseStatusException / GlobalExceptionHandler).
-func failRoomResolve(w http.ResponseWriter, err error) {
+func (a *App) failRoomResolve(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
 	switch {
 	case errors.Is(err, transfer.ErrForbidden):
@@ -139,6 +141,7 @@ func failRoomResolve(w http.ResponseWriter, err error) {
 		status = http.StatusTooManyRequests
 	case errors.Is(err, transfer.ErrInternal):
 		status = http.StatusInternalServerError
+		a.logger.Error("public websocket room resolution failed", "err", err)
 	}
 	http.Error(w, err.Error(), status)
 }

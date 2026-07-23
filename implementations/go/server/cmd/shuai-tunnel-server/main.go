@@ -4,9 +4,14 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
@@ -14,21 +19,30 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	configPath := flag.String("config", "", "optional path to a JSON config file")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger, closeLog, err := newLogger()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "initialize logger: %v\n", err)
+		return 1
+	}
+	defer closeLog()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		logger.Error("load config", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	app, err := server.New(cfg, logger)
 	if err != nil {
 		logger.Error("init server", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	defer app.Close()
 
@@ -37,6 +51,37 @@ func main() {
 
 	if err := app.Run(ctx); err != nil {
 		logger.Error("server stopped", "err", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
+}
+
+func newLogger() (*slog.Logger, func(), error) {
+	writer := io.Writer(os.Stdout)
+	var logFile *os.File
+	logPath := strings.TrimSpace(os.Getenv("TUNNEL_LOG_FILE"))
+	if logPath != "" {
+		if !filepath.IsAbs(logPath) {
+			return nil, func() {}, fmt.Errorf("TUNNEL_LOG_FILE must be an absolute path")
+		}
+		file, err := os.OpenFile(filepath.Clean(logPath), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+		if err != nil {
+			return nil, func() {}, fmt.Errorf("open %s: %w", logPath, err)
+		}
+		logFile = file
+		writer = io.MultiWriter(os.Stdout, file)
+	}
+	logger := slog.New(slog.NewTextHandler(writer, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	previousSlog := slog.Default()
+	previousStandardLogWriter := log.Writer()
+	slog.SetDefault(logger)
+	log.SetOutput(writer)
+	closeLog := func() {
+		slog.SetDefault(previousSlog)
+		log.SetOutput(previousStandardLogWriter)
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+	}
+	return logger, closeLog, nil
 }

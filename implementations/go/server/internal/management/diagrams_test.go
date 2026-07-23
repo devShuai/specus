@@ -27,7 +27,7 @@ func newDiagramTestServer(t *testing.T) (*httptest.Server, *security.LocalTokenS
 	tokens := security.NewLocalTokenService(config.AuthConfig{JwtSecret: "diagram-test-secret"})
 	api := NewAPI(db, session.NewRegistry(), tokens, nil, nil, nil,
 		config.OidcConfig{}, config.AuthConfig{JwtSecret: "diagram-test-secret"},
-		config.ClientAuthConfig{}, config.TrafficConfig{}, nil, nil, nil, nil, nil)
+		config.ClientAuthConfig{}, config.TrafficConfig{}, nil, nil, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	api.Register(mux)
 	server := httptest.NewServer(mux)

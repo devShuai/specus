@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -44,6 +45,7 @@ type API struct {
 	rooms        *transfer.RoomService
 	turnstile    *security.TurnstileVerifier
 	registration *registrationService
+	logger       *slog.Logger
 }
 
 // NewAPI builds the admin API.
@@ -52,14 +54,18 @@ func NewAPI(db *store.DB, sessions *session.Registry, tokens *security.LocalToke
 	oidc config.OidcConfig, authConfig config.AuthConfig, clientAuth config.ClientAuthConfig,
 	traffic config.TrafficConfig, trafficUsage *nat.TrafficService,
 	seedDemo func(ctx context.Context) error, peerMesh *peermesh.Service, attachments *transfer.Service,
-	rooms *transfer.RoomService) *API {
+	rooms *transfer.RoomService, logger *slog.Logger) *API {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	turnstile := security.NewTurnstileVerifier(authConfig.Turnstile)
 	registration := newRegistrationService(db, tokens, turnstile, authConfig,
 		newSMTPRegistrationMailer(authConfig.EmailVerification))
 	return &API{db: db, sessions: sessions, tokens: tokens, oidcAuth: oidcAuth, natControl: natControl,
 		remotePorts: remotePorts, oidc: oidc, authConfig: authConfig, clientAuth: clientAuth,
 		traffic: traffic, trafficUsage: trafficUsage, seedDemo: seedDemo,
-		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile, registration: registration}
+		peerMesh: peerMesh, attachments: attachments, rooms: rooms, turnstile: turnstile,
+		registration: registration, logger: logger}
 }
 
 // Register attaches all auth and admin routes to mux.
@@ -209,6 +215,7 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.turnstile.Verify(r.Context(), req.TurnstileToken, security.TurnstileActionLogin); err != nil {
+		a.logger.Warn("management login verification failed", "stage", "turnstile", "err", err)
 		a.failTurnstile(w, err)
 		return
 	}
@@ -746,7 +753,8 @@ func (a *API) handleCheckClientNameAvailability(w http.ResponseWriter, r *http.R
 	}
 	existing, err := a.db.FindClientByName(r.Context(), clientName)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		a.logger.Error("management API request failed", "operation", "check-client-name", "err", err)
+		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 		return
 	}
 	available := true
@@ -2154,6 +2162,7 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "资源不存在")
 	default:
+		a.logger.Error("management API request failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 	}
 }
@@ -2163,8 +2172,10 @@ func (a *API) failTurnstile(w http.ResponseWriter, err error) {
 	case errors.Is(err, security.ErrTurnstileRejected):
 		writeError(w, http.StatusBadRequest, "人机验证失败，请重试")
 	case errors.Is(err, security.ErrTurnstileUnavailable):
+		a.logger.Error("turnstile verification unavailable", "err", err)
 		writeError(w, http.StatusServiceUnavailable, "人机验证服务暂不可用")
 	default:
+		a.logger.Error("turnstile verification failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 	}
 }

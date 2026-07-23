@@ -103,7 +103,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	account, identity, err := a.findOrCreateClientIdentity(r.Context(), *credential, request.Environment)
 	if err != nil {
-		writeClientAuthError(w, http.StatusInternalServerError, "客户端身份创建失败")
+		a.failClientAuthInternal(w, "create-identity", "客户端身份创建失败", err)
 		return
 	}
 	if !account.Enabled {
@@ -118,7 +118,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 	osUser := limit(strings.TrimSpace(request.Environment.OSUser), 120)
 	if _, err := a.db.CloseHTTPAuthenticatedClientSessions(r.Context(), credential.ID,
 		machineFingerprint, osUser, auth.StatusHTTPAuthenticated, auth.StatusDisconnected, time.Now()); err != nil {
-		writeClientAuthError(w, http.StatusInternalServerError, "清理旧客户端会话失败")
+		a.failClientAuthInternal(w, "close-stale-sessions", "清理旧客户端会话失败", err)
 		return
 	}
 	session := a.clientAuth.CreateForClient(*account,
@@ -153,22 +153,22 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		HTTPLoginAt:                now,
 		ExpiresAt:                  session.ExpiresAt,
 	}); err != nil {
-		writeClientAuthError(w, http.StatusInternalServerError, "保存客户端会话失败")
+		a.failClientAuthInternal(w, "save-session", "保存客户端会话失败", err)
 		return
 	}
 	tunnels, err := a.db.ListEnabledTunnels(r.Context(), account.ID)
 	if err != nil {
-		writeClientAuthError(w, http.StatusInternalServerError, "加载 TCP 映射失败")
+		a.failClientAuthInternal(w, "load-tcp-mappings", "加载 TCP 映射失败", err)
 		return
 	}
 	routes, err := a.db.ListEnabledHTTPRoutes(r.Context(), account.ID)
 	if err != nil {
-		writeClientAuthError(w, http.StatusInternalServerError, "加载 HTTP 路由失败")
+		a.failClientAuthInternal(w, "load-http-routes", "加载 HTTP 路由失败", err)
 		return
 	}
 	peerMesh, err := a.peerMesh.BuildLoginConfig(r.Context(), *account, request.Environment.PeerPublicKey, r.Host)
 	if err != nil {
-		writeClientAuthError(w, http.StatusInternalServerError, "加载私有组网配置失败")
+		a.failClientAuthInternal(w, "load-peer-mesh", "加载私有组网配置失败", err)
 		return
 	}
 	response := clientAuthLoginResponse{
@@ -210,7 +210,11 @@ func max64(left, right int64) int64 {
 
 func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthLoginRequest) (*store.ClientCredential, error) {
 	credential, err := a.db.FindCredentialByAPIKey(ctx, strings.TrimSpace(request.APIKey))
-	if err != nil || credential == nil {
+	if err != nil {
+		a.logger.Error("client authentication failed", "stage", "credential-lookup", "err", err)
+		return nil, errClientAuth("客户端凭证校验失败")
+	}
+	if credential == nil {
 		return nil, errClientAuth("客户端凭证不存在")
 	}
 	if !validAPIKeySignature(request, credential.SecretHash) {
@@ -222,6 +226,7 @@ func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthL
 	consumed, err := a.db.ConsumeClientAuthNonce(ctx, hex.EncodeToString(apiKeyDigest[:]),
 		hex.EncodeToString(nonceDigest[:]), now, now.Add(2*time.Minute))
 	if err != nil {
+		a.logger.Error("client authentication failed", "stage", "nonce-reservation", "err", err)
 		return nil, errClientAuth("客户端 nonce 校验失败")
 	}
 	if !consumed {
@@ -413,4 +418,9 @@ func writeClientAuthError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func (a *App) failClientAuthInternal(w http.ResponseWriter, stage, message string, err error) {
+	a.logger.Error("client authentication failed", "stage", stage, "err", err)
+	writeClientAuthError(w, http.StatusInternalServerError, message)
 }

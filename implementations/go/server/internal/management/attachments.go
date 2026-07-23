@@ -225,6 +225,7 @@ func (a *API) failAttachment(w http.ResponseWriter, err error) {
 	case errors.Is(err, transfer.ErrGone):
 		writeError(w, http.StatusGone, err.Error())
 	case errors.Is(err, transfer.ErrInternal):
+		a.logger.Error("attachment request failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "服务器内部错误")
 	default:
 		writeError(w, http.StatusBadRequest, err.Error())
