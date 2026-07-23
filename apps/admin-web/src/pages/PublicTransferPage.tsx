@@ -1504,27 +1504,6 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
-  const copyRecordFileLink = async () => {
-    if (!record) {
-      return;
-    }
-    if (!record.direct && !ossFallbackEnabled) {
-      setError("登录后才可复制云端文件链接");
-      return;
-    }
-    try {
-      const url = record.direct
-        ? await resolveSafeRoomInviteUrl("EDITOR")
-        : await resolveSafeFileShareUrl(record.attachment);
-      if (!url) throw new Error("安全分享链接尚未生成");
-      await copyText(url);
-      setNotice(record.direct ? "已复制房间链接" : "文件链接已复制");
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "复制文件链接失败");
-    }
-  };
-
   const shareIncomingFile = async (item: IncomingAttachment) => {
     if (!item.direct && !ossFallbackEnabled) {
       setError("登录后才可分享云端文件");
@@ -2678,23 +2657,45 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                       </div>
                       <div className="mt-1 truncate text-small font-medium text-zinc-700 dark:text-zinc-200">{record.attachment.fileName}</div>
                       <div className="mt-1 text-tiny text-zinc-500 dark:text-zinc-400">
-                        {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "同房间成员可下载 · 可复制链接发给别人"}
+                        {formatBytes(record.attachment.sizeBytes)} · {record.direct ? "当前会话可直接保存" : "同房间成员可下载"}
                       </div>
                     </div>
-                    <Chip size="sm" color="success" variant="flat">
-                      完成
-                    </Chip>
-                  </div>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <Button radius="sm" color="primary" variant="flat" onPress={() => void shareRecordFile()}>
-                      分享
-                    </Button>
-                    <Button radius="sm" variant="flat" onPress={() => void copyRecordFileLink()}>
-                      复制链接
-                    </Button>
-                    <Button radius="sm" color="success" onPress={() => void downloadRecordFile()}>
-                      保存到本机
-                    </Button>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <Button
+                        isIconOnly
+                        size="sm"
+                        radius="sm"
+                        color="primary"
+                        variant="flat"
+                        aria-label="分享"
+                        title="分享"
+                        onPress={() => void shareRecordFile()}
+                      >
+                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="18" cy="5" r="3" />
+                          <circle cx="6" cy="12" r="3" />
+                          <circle cx="18" cy="19" r="3" />
+                          <path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4" />
+                        </svg>
+                      </Button>
+                      <Button
+                        isIconOnly
+                        size="sm"
+                        radius="sm"
+                        color="success"
+                        variant="flat"
+                        aria-label="保存到本机"
+                        title="保存到本机"
+                        onPress={() => void downloadRecordFile()}
+                      >
+                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M12 4v11m0 0 4-4m-4 4-4-4M4.5 19.5h15" />
+                        </svg>
+                      </Button>
+                      <Chip size="sm" color="success" variant="flat">
+                        完成
+                      </Chip>
+                    </div>
                   </div>
                 </div>
                 <Preview record={record} onPreview={setPreviewTarget} />
@@ -3674,21 +3675,23 @@ function FilePreview({
   }, [fileName, mimeType, url, blob]);
   const canOpenPreview = Boolean(onPreview && !expanded && (url || blob));
   const previewAction = canOpenPreview ? (
-    <div className="mt-2 flex justify-end">
-      <Button
-        size="sm"
-        radius="sm"
-        variant="flat"
-        className="h-8"
-        aria-label={`放大预览 ${fileName}`}
-        onPress={() => onPreview?.({ fileName, mimeType, url, blob, sizeBytes: previewSizeBytes })}
-      >
-        {compact ? "放大" : "放大预览"}
-      </Button>
-    </div>
+    <button
+      type="button"
+      className="absolute right-2 top-2 z-10 flex h-7 items-center gap-1 rounded-md border border-black/[0.08] bg-white/90 px-2 text-tiny font-medium text-zinc-600 shadow-sm backdrop-blur transition hover:text-zinc-900 dark:border-white/[0.1] dark:bg-zinc-900/90 dark:text-zinc-300 dark:hover:text-white"
+      aria-label={`预览 ${fileName}`}
+      title="预览"
+      onClick={() => onPreview?.({ fileName, mimeType, url, blob, sizeBytes: previewSizeBytes })}
+    >
+      <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+        <circle cx="12" cy="12" r="3" />
+      </svg>
+      预览
+    </button>
   ) : null;
+  const wrapClass = compact && !expanded ? "relative mt-2" : "relative";
   const frameClass = compact
-    ? "mt-2 overflow-hidden rounded border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
+    ? "overflow-hidden rounded border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]"
     : "overflow-hidden rounded-lg border border-black/10 bg-zinc-950/5 dark:border-white/10 dark:bg-white/[0.03]";
   const mediaClass = expanded
     ? "max-h-[78dvh] w-full object-contain"
@@ -3703,7 +3706,7 @@ function FilePreview({
   const fallbackClass = expanded
     ? "flex min-h-[45dvh] flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center"
     : compact
-      ? "mt-2 flex min-h-28 flex-col items-center justify-center rounded glass glass-border border p-3 text-center"
+      ? "flex min-h-28 flex-col items-center justify-center rounded glass glass-border border p-3 text-center"
       : "flex h-64 flex-col items-center justify-center rounded-lg glass glass-border border p-4 text-center";
 
   const deferHeavyPreview = !expanded
@@ -3712,14 +3715,14 @@ function FilePreview({
     && (kind === "image" || kind === "pdf");
   if (deferHeavyPreview) {
     return (
-      <>
+      <div className={wrapClass}>
         <div className={fallbackClass}>
           <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
           <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
           <div className="mt-1 text-tiny text-zinc-500">文件较大，已暂停自动预览以保持页面流畅</div>
         </div>
         {previewAction}
-      </>
+      </div>
     );
   }
 
@@ -3728,65 +3731,65 @@ function FilePreview({
       return <ExpandedImagePreview url={url} fileName={fileName} onError={() => setPreviewFailed(true)} />;
     }
     return (
-      <>
+      <div className={wrapClass}>
         <div className={frameClass}>
           <img src={url} alt={fileName} className={mediaClass} onError={() => setPreviewFailed(true)} />
         </div>
         {previewAction}
-      </>
+      </div>
     );
   }
   if (url && kind === "video" && !previewFailed) {
     return (
-      <>
+      <div className={wrapClass}>
         <div className={`${frameClass} bg-zinc-950`}>
           <video src={url} controls preload="metadata" className={mediaClass} onError={() => setPreviewFailed(true)} />
         </div>
         {previewAction}
-      </>
+      </div>
     );
   }
   if (url && kind === "audio" && !previewFailed) {
     return (
-      <>
+      <div className={wrapClass}>
         <div className={fallbackClass}>
           <div className="text-2xl font-semibold text-zinc-300 dark:text-white/20">AUDIO</div>
           <div className="mt-2 max-w-full truncate text-small font-medium">{fileName}</div>
           <audio src={url} controls preload="metadata" className="mt-3 w-full" onError={() => setPreviewFailed(true)} />
         </div>
         {previewAction}
-      </>
+      </div>
     );
   }
   if (url && kind === "pdf" && !previewFailed) {
     return (
-      <>
+      <div className={wrapClass}>
         <div className={`${frameClass} bg-white`}>
           <object data={url} type="application/pdf" className={documentClass} onError={() => setPreviewFailed(true)}>
             <div className="flex h-full items-center justify-center p-3 text-small text-zinc-500">PDF 预览不可用</div>
           </object>
         </div>
         {previewAction}
-      </>
+      </div>
     );
   }
   if (kind === "text" && blob) {
     return (
-      <>
+      <div className={wrapClass}>
         <TextFilePreview fileName={fileName} mimeType={mimeType} blob={blob} compact={compact} expanded={expanded} />
         {previewAction}
-      </>
+      </div>
     );
   }
   return (
-    <>
+    <div className={wrapClass}>
       <div className={fallbackClass}>
         <div className={`${compact ? "text-2xl" : "text-4xl"} font-semibold text-zinc-300 dark:text-white/20`}>{previewKindLabel(kind)}</div>
         <div className="mt-3 max-w-full truncate text-small font-medium">{fileName}</div>
         <div className="mt-1 text-tiny text-zinc-500">{effectiveMimeType(fileName, mimeType)}</div>
       </div>
       {previewAction}
-    </>
+    </div>
   );
 }
 
@@ -3828,7 +3831,7 @@ function TextFilePreview({
   }, [blob]);
 
   return (
-    <div className={`${compact ? "mt-2" : ""} overflow-hidden rounded border border-black/10 bg-zinc-950 text-zinc-100 dark:border-white/10`}>
+    <div className="overflow-hidden rounded border border-black/10 bg-zinc-950 text-zinc-100 dark:border-white/10">
       <div className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
         <span className="min-w-0 truncate text-tiny font-medium">{fileName}</span>
         <span className="shrink-0 text-[10px] uppercase text-zinc-400">{shortMimeLabel(effectiveMimeType(fileName, mimeType))}</span>
