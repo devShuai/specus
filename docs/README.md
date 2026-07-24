@@ -2,6 +2,10 @@
 
 按主题分类。`unified-improvement-plan.md` 是跨线执行与进度跟踪的活文档,保留在根目录。
 
+## 根目录 — 横向审查
+
+* [admin-web-ui-audit-2026-07-24.md](admin-web-ui-audit-2026-07-24.md) — 管理后台前端 UI/交互审查清单(2026-07-24)：高危/系统性/传输页/外壳/面板五类问题(H/S/T/E/A/B 编号)，兼作修复进度清单。
+
 ## architecture/ — 总体设计与架构演进
 
 * [design.md](architecture/design.md) — 系统详细设计:协议、模块职责、数据模型、并发与安全模型。
