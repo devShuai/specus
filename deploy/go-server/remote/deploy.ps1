@@ -5,6 +5,7 @@ param(
     [string]$Architecture = "amd64",
     [string]$EnvFile = "",
     [string]$HealthUrl = "http://127.0.0.1:8088/health",
+    [string]$SiteUrl = "",
     [switch]$SkipBuild,
     [switch]$SkipFrontend,
     [switch]$SkipTests,
@@ -23,9 +24,19 @@ $BuildScript = Join-Path $GoDeployRoot "build-linux.ps1"
 $PackageRoot = Join-Path $GoDeployRoot "out/shuai-tunnel-server-linux-$Architecture"
 $BinaryPath = Join-Path $PackageRoot "shuai-tunnel-server"
 $SystemdRoot = Join-Path $GoDeployRoot "systemd"
+$AdminWebRoot = Join-Path $RepoRoot "apps/admin-web"
+$AdminWebDist = Join-Path $AdminWebRoot "dist"
+$OpenRestyRoot = Join-Path $RepoRoot "deploy/openresty"
 
 if ([string]::IsNullOrWhiteSpace($HostName)) {
     $HostName = if ($env:GO_SERVER_DEPLOY_HOST) { $env:GO_SERVER_DEPLOY_HOST } else { "ali2" }
+}
+if ([string]::IsNullOrWhiteSpace($SiteUrl)) {
+    $SiteUrl = if ($env:GO_SERVER_DEPLOY_SITE_URL) {
+        $env:GO_SERVER_DEPLOY_SITE_URL
+    } else {
+        "https://tunnel.devshuai.com"
+    }
 }
 if ($HostName -notmatch '^[A-Za-z0-9][A-Za-z0-9._@-]*$') {
     throw "Invalid SSH host. Configure ports and advanced options in ~/.ssh/config."
@@ -33,6 +44,10 @@ if ($HostName -notmatch '^[A-Za-z0-9][A-Za-z0-9._@-]*$') {
 if ($HealthUrl -notmatch '^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/[A-Za-z0-9._~/-]*$') {
     throw "HealthUrl must be a loopback HTTP(S) URL without a query or fragment."
 }
+if ($SiteUrl -notmatch '^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$') {
+    throw "SiteUrl must be an HTTP(S) origin without a path, query, or fragment."
+}
+$SiteUrl = $SiteUrl.TrimEnd("/")
 if ($ReplaceJava -and -not [string]::IsNullOrWhiteSpace($EnvFile)) {
     throw "-ReplaceJava builds the Go environment from the remote Java environment; do not combine it with -EnvFile."
 }
@@ -111,6 +126,27 @@ if (-not $SkipBuild) {
     }
 }
 
+$frontendAssetName = "index-dry-run.js"
+if (-not $SkipFrontend) {
+    $npm = Require-Command "npm"
+    Write-DeployLog "Preparing OpenResty admin frontend"
+    Invoke-Checked $npm @("--prefix", $AdminWebRoot, "run", "precompress")
+
+    if (-not $DryRun) {
+        $frontendIndex = Join-Path $AdminWebDist "index.html"
+        if (-not (Test-Path -LiteralPath $frontendIndex -PathType Leaf)) {
+            throw "OpenResty frontend is missing: $frontendIndex. Remove -SkipBuild or build apps/admin-web/dist first."
+        }
+        $frontendAsset = Get-ChildItem -LiteralPath (Join-Path $AdminWebDist "assets") -Filter "index-*.js" |
+            Sort-Object Name |
+            Select-Object -First 1
+        if ($null -eq $frontendAsset) {
+            throw "No hashed OpenResty frontend entry asset found under $AdminWebDist/assets."
+        }
+        $frontendAssetName = $frontendAsset.Name
+    }
+}
+
 if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
     if (-not $DryRun) {
         throw "Linux binary not found: $BinaryPath"
@@ -139,9 +175,10 @@ Write-Host "  host:         $HostName"
 Write-Host "  target:       linux/$Architecture"
 Write-Host "  binary:       $BinaryPath"
 Write-Host "  sha256:       $binaryHash"
-    Write-Host "  environment:  $envDescription"
+Write-Host "  environment:  $envDescription"
 Write-Host "  replace Java: $([bool]$ReplaceJava)"
 Write-Host "  health:       $HealthUrl"
+Write-Host "  OpenResty:    $(if ($SkipFrontend) { 'skip' } else { "deploy to $SiteUrl" })"
 Write-Host ""
 
 if (-not $Yes -and -not $DryRun) {
@@ -153,17 +190,31 @@ if (-not $Yes -and -not $DryRun) {
 }
 
 $success = $false
+$localRemoteScript = $null
 try {
     Invoke-Checked $ssh @($HostName, "umask 077 && mkdir -p -- $(ConvertTo-ShellSingleQuoted $remoteRoot)")
     Invoke-Checked $scp @($BinaryPath, "$($HostName):$remoteRoot/shuai-tunnel-server")
     Invoke-Checked $scp @("-r", $SystemdRoot, "$($HostName):$remoteRoot/systemd")
+    if (-not $SkipFrontend) {
+        Invoke-Checked $scp @("-r", $OpenRestyRoot, "$($HostName):$remoteRoot/openresty")
+        Invoke-Checked $scp @("-r", $AdminWebDist, "$($HostName):$remoteRoot/admin-web-dist")
+    }
     if (-not [string]::IsNullOrWhiteSpace($EnvFile)) {
         Invoke-Checked $scp @($EnvFile, "$($HostName):$remoteRoot/tunnel-server.env")
     }
 
     $remoteEnv = if ([string]::IsNullOrWhiteSpace($EnvFile)) { "" } else { "$remoteRoot/tunnel-server.env" }
     $remoteTemplate = @'
-set -euo pipefail
+set -Eeuo pipefail
+
+report_remote_error() {
+  local status=$?
+  local line="${BASH_LINENO[0]:-unknown}"
+  echo "[go-server-deploy] Remote deployment failed at line $line (exit $status)" >&2
+  return "$status"
+}
+trap report_remote_error ERR
+
 REMOTE_ROOT=__REMOTE_ROOT__
 BINARY="$REMOTE_ROOT/shuai-tunnel-server"
 SYSTEMD_ROOT="$REMOTE_ROOT/systemd"
@@ -421,9 +472,44 @@ fi
         Replace("__REPLACE_JAVA__", (ConvertTo-ShellSingleQuoted $ReplaceJava.ToString().ToLowerInvariant())).
         Replace("`r`n", "`n")
 
-    Invoke-Checked $ssh @($HostName, $remoteCommand)
+    $localRemoteScript = Join-Path ([System.IO.Path]::GetTempPath()) `
+        "shuai-go-server-deploy-$timestamp-$PID-$Architecture.sh"
+    if (-not $DryRun) {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($localRemoteScript, $remoteCommand, $utf8NoBom)
+    }
+    $remoteScript = "$remoteRoot/deploy-remote.sh"
+    Invoke-Checked $scp @($localRemoteScript, "$($HostName):$remoteScript")
+    $quotedRemoteScript = ConvertTo-ShellSingleQuoted $remoteScript
+    Invoke-Checked $ssh @(
+        $HostName,
+        "chmod 0700 -- $quotedRemoteScript && bash -- $quotedRemoteScript"
+    )
+    if (-not $SkipFrontend) {
+        Write-DeployLog "Installing OpenResty admin frontend"
+        $remoteAdminWebDist = "$remoteRoot/admin-web-dist"
+        $remoteOpenRestyInstaller = "$remoteRoot/openresty/install-admin-web.sh"
+        Invoke-Checked $ssh @(
+            $HostName,
+            "sudo env ADMIN_WEB_DIST=$(ConvertTo-ShellSingleQuoted $remoteAdminWebDist) bash -- $(ConvertTo-ShellSingleQuoted $remoteOpenRestyInstaller)"
+        )
+        Invoke-Checked $ssh @($HostName, "sudo openresty -t")
+        Invoke-Checked $ssh @($HostName, "sudo openresty -s reload")
+        Invoke-Checked $ssh @(
+            $HostName,
+            "curl -kfsSI -- $(ConvertTo-ShellSingleQuoted "$SiteUrl/")"
+        )
+        Invoke-Checked $ssh @(
+            $HostName,
+            "curl -kfsSI -H 'Accept-Encoding: br, gzip' -- $(ConvertTo-ShellSingleQuoted "$SiteUrl/assets/$frontendAssetName")"
+        )
+    }
     $success = $true
 } finally {
+    if (-not [string]::IsNullOrWhiteSpace($localRemoteScript) -and
+        (Test-Path -LiteralPath $localRemoteScript -PathType Leaf)) {
+        Remove-Item -LiteralPath $localRemoteScript -Force -ErrorAction SilentlyContinue
+    }
     if ($DryRun) {
         Write-DeployLog "Dry run completed"
     } elseif ($success -and -not $KeepRemoteTemp) {

@@ -37,6 +37,9 @@ the embedded management SPA and diagram stencil library.
 .\deploy\go-server\remote\deploy.ps1 -HostName ali2 -Yes
 ```
 
+该入口默认同时更新 Go 服务和 OpenResty 管理前端，并验证公网首页及 hash 静态资源。
+仅需更新后端时可显式传入 `-SkipFrontend`。
+
 首次安装建议传入 `-EnvFile`；未传时只安装模板，不启动默认配置。详细说明见
 [`../remote/README.md`](../remote/README.md)。
 
