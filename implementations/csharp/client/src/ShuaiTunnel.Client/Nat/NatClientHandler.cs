@@ -218,6 +218,13 @@ internal sealed class NatClientHandler : IAsyncDisposable
         }
         else
         {
+            if (port is not null)
+            {
+                lock (_stateLock)
+                {
+                    _registered.Remove(port.Value);
+                }
+            }
             var reason = packet.MetaData is not null && packet.MetaData.TryGetValue("reason", out var r)
                 ? r as string
                 : null;

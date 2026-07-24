@@ -9,6 +9,7 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -47,6 +48,31 @@ class NatClientHandlerTests {
 
             assertNatMessage(channel.readOutbound(), NatMessageType.UNREGISTER, 9000);
             assertNatMessage(channel.readOutbound(), NatMessageType.REGISTER, 9001);
+            assertNull(channel.readOutbound());
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldKeepSessionAndRetryPortAfterRegisterFailure() {
+        TunnelConfig mapping = tunnel(9000, 8080);
+        NatClientHandler handler = new NatClientHandler(tunnelBean(mapping));
+        EmbeddedChannel channel = new EmbeddedChannel(handler);
+        try {
+            assertNatMessage(channel.readOutbound(), NatMessageType.REGISTER, 9000);
+
+            NatMessagePacket failed = new NatMessagePacket();
+            failed.setNatMessageType(NatMessageType.REGISTER_RESULT);
+            failed.setMetaData(Map.of(
+                    "port", 9000,
+                    "success", false,
+                    "reason", "address already in use"));
+            channel.writeInbound(failed);
+
+            assertTrue(channel.isActive());
+            handler.applyConfig(tunnelBean(mapping));
+            assertNatMessage(channel.readOutbound(), NatMessageType.REGISTER, 9000);
             assertNull(channel.readOutbound());
         } finally {
             channel.finishAndReleaseAll();

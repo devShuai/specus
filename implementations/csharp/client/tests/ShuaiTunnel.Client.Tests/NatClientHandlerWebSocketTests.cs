@@ -16,6 +16,47 @@ namespace ShuaiTunnel.Client.Tests;
 
 public class NatClientHandlerWebSocketTests
 {
+    [Fact]
+    public async Task RegisterFailure_ClearsPortSoConfigRefreshCanRetry()
+    {
+        var mapping = new TunnelConfigEntry
+        {
+            Port = 19090,
+            TunnelAddress = "127.0.0.1",
+            TunnelPort = 8080,
+        };
+        await using var stream = new MemoryStream();
+        await using var writer = new FrameWriter(stream);
+        var directHttp = new DirectHttpHandler(
+            Enumerable.Empty<HttpTunnelConfigEntry>(),
+            writer,
+            new DirectHttpForwarder(new HttpClient()),
+            NullLogger<DirectHttpHandler>.Instance);
+        await using var nat = new NatClientHandler(
+            new[] { mapping },
+            "csharp-tester",
+            writer,
+            directHttp,
+            NullLogger<NatClientHandler>.Instance);
+        nat.Bind(CancellationToken.None);
+
+        await nat.RegisterAllAsync();
+        var firstRegisterLength = stream.Length;
+        await nat.HandleAsync(new NatMessagePacket
+        {
+            NatMessageType = NatMessageType.RegisterResult,
+            MetaData = new Dictionary<string, object?>
+            {
+                ["port"] = mapping.Port,
+                ["success"] = false,
+                ["reason"] = "address already in use",
+            },
+        });
+        await nat.ApplyConfigAsync(new[] { mapping });
+
+        Assert.True(stream.Length > firstRegisterLength);
+    }
+
     [Theory]
     [MemberData(nameof(InvalidTcpOpenMetadata))]
     public async Task HandleOpenAsync_ForInvalidTcpMapping_IgnoresLikeJava(Dictionary<string, object?> metadata)

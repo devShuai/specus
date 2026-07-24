@@ -701,12 +701,12 @@ public class NatClientHandler extends NatCommonHandler {
         return true;
     }
 
-    private void processRegisterResult(NatMessagePacket natMessagePacket) {
+    private synchronized void processRegisterResult(NatMessagePacket natMessagePacket) {
         Map<String, Object> meta = natMessagePacket.getMetaData();
         Object successObj = meta == null ? null : meta.get("success");
         boolean success = successObj instanceof Boolean b && b;
+        Integer port = asInt(meta, "port");
         if (success) {
-            Integer port = asInt(meta, "port");
             if (port == null) {
                 log.info("Register result missing port [{}]", clientName);
                 return;
@@ -718,8 +718,10 @@ public class NatClientHandler extends NatCommonHandler {
                 log.info("Register to Nat server, {}:{}-->{}:{}", remoteHost, port, tunnelConfig.getTunnelAddress(), tunnelConfig.getTunnelPort());
             }
         } else {
+            if (port != null) {
+                registeredPorts.remove(port);
+            }
             log.info("Register fail: {}", meta == null ? "(no metadata)" : meta.get("reason"));
-            ctx.close();
         }
     }
 

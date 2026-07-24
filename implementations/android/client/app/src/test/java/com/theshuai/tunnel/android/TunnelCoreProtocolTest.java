@@ -14,8 +14,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -133,6 +136,25 @@ public class TunnelCoreProtocolTest {
         assertTrue(TunnelCore.TcpConnectedPolicy.shouldIgnore(18080, null, true));
         assertTrue(TunnelCore.TcpConnectedPolicy.shouldIgnore(18080, "channel-1", false));
         assertFalse(TunnelCore.TcpConnectedPolicy.shouldIgnore(18080, "channel-1", true));
+    }
+
+    @Test
+    public void failedNatRegistrationIsClearedForRetryWithoutClosingDataChannel() {
+        Set<Integer> registeredPorts = new HashSet<>(List.of(19090, 19091));
+        String failure = TunnelCore.NatRegisterResultPolicy.apply(
+                registeredPorts,
+                Map.of(
+                        "port", 19090,
+                        "success", false,
+                        "reason", "address already in use"));
+
+        assertEquals("port 19090: address already in use", failure);
+        assertFalse(registeredPorts.contains(19090));
+        assertTrue(registeredPorts.contains(19091));
+        assertNull(TunnelCore.NatRegisterResultPolicy.apply(
+                registeredPorts,
+                Map.of("port", 19091, "success", true)));
+        assertTrue(registeredPorts.contains(19091));
     }
 
     @Test

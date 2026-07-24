@@ -75,6 +75,24 @@ func TestNatMetadataHelpersMatchJavaCoercion(t *testing.T) {
 	}
 }
 
+func TestRegisterFailureClearsPortForRetryWithoutClosingSession(t *testing.T) {
+	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
+	tunnelClient.registered[19090] = struct{}{}
+
+	tunnelClient.handleNatRegisterResult(map[string]any{
+		"port":    19090,
+		"success": false,
+		"reason":  "address already in use",
+	})
+
+	tunnelClient.registeredMu.Lock()
+	_, stillRegistered := tunnelClient.registered[19090]
+	tunnelClient.registeredMu.Unlock()
+	if stillRegistered {
+		t.Fatal("failed NAT port must be cleared so a later config refresh can retry it")
+	}
+}
+
 type captureConn struct {
 	bytes.Buffer
 }

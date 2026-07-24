@@ -323,6 +323,24 @@ public final class TunnelCore {
         }
     }
 
+    static final class NatRegisterResultPolicy {
+        private NatRegisterResultPolicy() {
+        }
+
+        static String apply(Set<Integer> registeredPorts, Map<String, Object> metadata) {
+            if (!Boolean.FALSE.equals(metadata.get("success"))) {
+                return null;
+            }
+            Integer port = asInt(metadata.get("port"));
+            if (port != null) {
+                registeredPorts.remove(port);
+            }
+            String reason = asString(metadata.get("reason"));
+            return (port == null ? "unknown port" : "port " + port)
+                    + ": " + (isBlank(reason) ? "registration rejected" : reason);
+        }
+    }
+
     private static final class StartupConfig {
         final String serverBaseUrl;
         final String apiKey;
@@ -816,7 +834,7 @@ public final class TunnelCore {
         private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
         private final AtomicLong lastWriteAtMillis = new AtomicLong(0L);
         private final AtomicLong dataLastWriteAtMillis = new AtomicLong(0L);
-        private final Set<Integer> registeredPorts = new HashSet<>();
+        private final Set<Integer> registeredPorts = ConcurrentHashMap.newKeySet();
         private final ConcurrentHashMap<Integer, LocalTunnel> localTunnels = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Integer, LocalWebSocketTunnel> localWebSockets = new ConcurrentHashMap<>();
         private final ConcurrentHashMap<Integer, HttpStreamForwarder> httpStreams = new ConcurrentHashMap<>();
@@ -1083,9 +1101,9 @@ public final class TunnelCore {
 
         private void handleNat(NatMessage packet) throws Exception {
             if (packet.type == NatMessageType.REGISTER_RESULT) {
-                Object success = packet.meta.get("success");
-                if (Boolean.FALSE.equals(success)) {
-                    throw new IOException("NAT register failed: " + packet.meta.get("reason"));
+                String failure = NatRegisterResultPolicy.apply(registeredPorts, packet.meta);
+                if (failure != null) {
+                    status.publish("NAT register failed", failure, true);
                 }
                 return;
             }

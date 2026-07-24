@@ -233,6 +233,9 @@ func (client *Client) handleNatRegisterResult(metadata map[string]any) {
 	success, _ := metadata["success"].(bool)
 	port, _ := metadataInt(metadata, "port")
 	if !success {
+		client.registeredMu.Lock()
+		delete(client.registered, port)
+		client.registeredMu.Unlock()
 		reason, _ := metadataString(metadata, "reason")
 		client.logger.Printf("register NAT port %d failed: %s", port, reason)
 		return
