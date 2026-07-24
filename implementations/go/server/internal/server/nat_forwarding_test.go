@@ -210,6 +210,83 @@ func TestNatRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNatBindFailureKeepsDataSessionForOtherMappings(t *testing.T) {
+	occupied, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("occupy public port: %v", err)
+	}
+	defer occupied.Close()
+	occupiedPort := occupied.Addr().(*net.TCPAddr).Port
+
+	app, controlPort := startTestApp(t)
+	availablePort := freeTCPPort(t)
+	session := issueClientSession(t, app, DemoClientName)
+	login := protocol.LoginRequest{
+		ClientName:      DemoClientName,
+		ClientSessionID: session.ID,
+		AccessToken:     session.AccessToken,
+		ConnectionRole:  protocol.ConnectionRoleControl,
+	}
+
+	controlConn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)))
+	if err != nil {
+		t.Fatalf("control dial: %v", err)
+	}
+	defer controlConn.Close()
+	if err := protocol.WritePacket(controlConn, login); err != nil {
+		t.Fatalf("control login: %v", err)
+	}
+	controlResponse, ok := readPacket(t, bufio.NewReader(controlConn)).(protocol.LoginResponse)
+	if !ok || !controlResponse.Success {
+		t.Fatalf("control login rejected: %#v", controlResponse)
+	}
+
+	dataConn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)))
+	if err != nil {
+		t.Fatalf("data dial: %v", err)
+	}
+	defer dataConn.Close()
+	login.ConnectionRole = protocol.ConnectionRoleData
+	if err := protocol.WritePacket(dataConn, login); err != nil {
+		t.Fatalf("data login: %v", err)
+	}
+	dataReader := bufio.NewReader(dataConn)
+	dataResponse, ok := readPacket(t, dataReader).(protocol.LoginResponse)
+	if !ok || !dataResponse.Success {
+		t.Fatalf("data login rejected: %#v", dataResponse)
+	}
+
+	register := func(port int) protocol.NatMessage {
+		return protocol.NatMessage{
+			Type: protocol.NatRegister,
+			Metadata: map[string]any{
+				"port":          port,
+				"tunnelPort":    9,
+				"tunnelAddress": "127.0.0.1",
+				"clientName":    DemoClientName,
+			},
+		}
+	}
+	if err := protocol.WritePacket(dataConn, register(occupiedPort)); err != nil {
+		t.Fatalf("register occupied port: %v", err)
+	}
+	failed, ok := readPacket(t, dataReader).(protocol.NatMessage)
+	if !ok || failed.Type != protocol.NatRegisterResult || failed.Metadata["success"] != false {
+		t.Fatalf("unexpected occupied-port result: %#v", failed)
+	}
+
+	if err := protocol.WritePacket(dataConn, register(availablePort)); err != nil {
+		t.Fatalf("register available port on retained session: %v", err)
+	}
+	succeeded, ok := readPacket(t, dataReader).(protocol.NatMessage)
+	if !ok || succeeded.Type != protocol.NatRegisterResult || succeeded.Metadata["success"] != true {
+		t.Fatalf("unexpected available-port result: %#v", succeeded)
+	}
+	if !app.RemotePorts().HasBinding(availablePort) {
+		t.Fatal("available public port was not retained after an earlier bind failure")
+	}
+}
+
 func readFull(conn net.Conn, buf []byte) (int, error) {
 	total := 0
 	for total < len(buf) {

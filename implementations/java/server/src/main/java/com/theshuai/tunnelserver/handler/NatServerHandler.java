@@ -345,7 +345,9 @@ public class NatServerHandler extends NatCommonHandler {
         String requestedClientName = asString(metaData, "clientName");
 
         Map<String, Object> result = new ConcurrentHashMap<>();
-        result.put("port", port);
+        if (port != null) {
+            result.put("port", port);
+        }
 
         if (port == null || tunnelPort == null || tunnelAddress == null || requestedClientName == null) {
             result.put("success", false);
@@ -425,11 +427,6 @@ public class NatServerHandler extends NatCommonHandler {
         }
 
         writeRegisterResult(result);
-
-        if (!Boolean.TRUE.equals(result.get("success"))) {
-            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.REGISTER_FAILED);
-            ctx.close();
-        }
     }
 
     private void writeRegisterResult(Map<String, Object> metaData) {

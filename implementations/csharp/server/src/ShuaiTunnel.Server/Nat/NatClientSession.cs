@@ -251,11 +251,6 @@ internal sealed class NatClientSession : IAsyncDisposable
         }
 
         await WriteRegisterResultAsync(result).ConfigureAwait(false);
-        if (!Equals(result["success"], true))
-        {
-            _context.MarkDisconnectIfAbsent(DisconnectReason.RegisterFailed);
-            _context.CloseAsync();
-        }
     }
 
     private async Task ProcessUnregisterAsync(NatMessagePacket packet)

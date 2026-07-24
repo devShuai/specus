@@ -247,9 +247,7 @@ func (s *clientSession) handleRegister(message protocol.NatMessage) error {
 	if err != nil {
 		result["success"] = false
 		result["reason"] = err.Error()
-		_ = s.sendRegisterResult(result)
-		s.conn.Close(store.ReasonRegisterFailed)
-		return nil
+		return s.sendRegisterResult(result)
 	}
 
 	s.mu.Lock()

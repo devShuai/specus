@@ -6,13 +6,22 @@ import com.theshuai.common.session.Session;
 import com.theshuai.tunnelserver.attribute.ServerAttributes;
 import com.theshuai.tunnelserver.http.WebSocketStreamRegistry;
 import com.theshuai.tunnelserver.http.WebSocketTunnelHandler;
+import com.theshuai.tunnelserver.server.RemotePortServerManager;
 import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class NatServerHandlerTests {
 
@@ -62,5 +71,39 @@ class NatServerHandlerTests {
             channel.finishAndReleaseAll();
         }
         verify(webSocketHandler).onControlChannelInactive("client-a");
+    }
+
+    @Test
+    void shouldKeepDataConnectionWhenOnePublicPortCannotBind() throws Exception {
+        RemotePortServerManager remotePorts = mock(RemotePortServerManager.class);
+        when(remotePorts.bind(eq(19090), any()))
+                .thenThrow(new InterruptedException("address already in use"));
+        NatServerHandler handler = new NatServerHandler(
+                null, null, remotePorts, null, mock(WebSocketStreamRegistry.class),
+                mock(WebSocketTunnelHandler.class));
+        EmbeddedChannel channel = new EmbeddedChannel(handler);
+        channel.attr(ServerAttributes.SESSION).set(new Session("client-a"));
+        channel.attr(ServerAttributes.TENANT_ID).set("tenant-a");
+        try {
+            NatMessagePacket register = new NatMessagePacket();
+            register.setNatMessageType(NatMessageType.REGISTER);
+            register.setMetaData(Map.of(
+                    "port", 19090,
+                    "tunnelPort", 8080,
+                    "tunnelAddress", "127.0.0.1",
+                    "clientName", "client-a"));
+
+            channel.writeInbound(register);
+
+            assertTrue(channel.isActive());
+            NatMessagePacket result = channel.readOutbound();
+            assertNotNull(result);
+            assertEquals(NatMessageType.REGISTER_RESULT, result.getNatMessageType());
+            assertEquals(19090, result.getMetaData().get("port"));
+            assertFalse((Boolean) result.getMetaData().get("success"));
+            assertNull(channel.readOutbound());
+        } finally {
+            channel.finishAndReleaseAll();
+        }
     }
 }
