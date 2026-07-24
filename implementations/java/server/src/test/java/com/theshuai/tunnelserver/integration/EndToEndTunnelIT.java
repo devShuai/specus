@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.domain.PageRequest;
 
@@ -57,7 +58,7 @@ import static org.awaitility.Awaitility.await;
  */
 @SpringBootTest(
         classes = TunnelServerApplication.class,
-        webEnvironment = SpringBootTest.WebEnvironment.NONE,
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
                 // SQLite `:memory:` gives every JDBC connection its own private
                 // database, so the JPA transaction in the netty event loop
@@ -85,6 +86,7 @@ class EndToEndTunnelIT {
     @Autowired private HttpRouteService httpRouteService;
     @Autowired private NettyServer nettyServer;
     @Autowired private ConnectionRecordRepository connectionRecordRepository;
+    @LocalServerPort private int httpPort;
 
     private static HttpServer mockBackend;
     private static int backendPort;
@@ -98,6 +100,17 @@ class EndToEndTunnelIT {
             byte[] body = "hi from backend".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        mockBackend.createContext("/fragmented", exchange -> {
+            byte[] chunk = new byte[4 * 1024];
+            java.util.Arrays.fill(chunk, (byte) 0x5a);
+            int chunks = 256;
+            exchange.sendResponseHeaders(200, (long) chunk.length * chunks);
+            for (int index = 0; index < chunks; index++) {
+                exchange.getResponseBody().write(chunk);
+                exchange.getResponseBody().flush();
+            }
             exchange.close();
         });
         mockBackend.start();
@@ -133,8 +146,8 @@ class EndToEndTunnelIT {
         Long clientId = login.getClientId();
         String clientName = login.getClientName();
 
-        natControlService.createMapping(clientId, new NatControlService.MappingMutation(
-                TUNNEL_LISTEN_PORT, "127.0.0.1", backendPort, true
+        httpRouteService.createRoute(clientId, new HttpRouteService.RouteMutation(
+                "web", "http://127.0.0.1:" + backendPort, true
         ));
 
         TunnelBean tunnelBean = new TunnelBean();
@@ -152,19 +165,6 @@ class EndToEndTunnelIT {
                 .pollInterval(100, MILLISECONDS)
                 .until(() -> hasSuccessfulConnectionRecord(clientName));
 
-        await().atMost(15, SECONDS)
-                .pollInterval(500, MILLISECONDS)
-                .ignoreExceptions()
-                .until(this::proxiesThroughToBackend);
-
-        // —— HTTP 路由热下发 ——
-        // 客户端启动时 httpTunnelConfigList 为空；服务端通过 HttpRouteService 写入第一条
-        // 后会触发 NatControlService.pushSnapshotIfOnline，沿 NAT_CONTROL 推到客户端的
-        // NatClientHandler.applyHttpRoutes，整个链路在线热替换。
-        httpRouteService.createRoute(clientId, new HttpRouteService.RouteMutation(
-                "web", "http://127.0.0.1:" + backendPort, true
-        ));
-
         await().atMost(10, SECONDS)
                 .pollInterval(200, MILLISECONDS)
                 .until(() -> {
@@ -172,7 +172,22 @@ class EndToEndTunnelIT {
                     return routes != null && ("http://127.0.0.1:" + backendPort).equals(routes.get("web"));
                 });
 
-        // 再追加一条 + 删除第一条，验证整体替换语义（不是增量补丁）
+        // No TCP mapping has been registered yet. HTTP stream DATA must still be accepted on
+        // the authenticated DATA connection, including a full 1 MiB window split into small chunks.
+        await().atMost(15, SECONDS)
+                .pollInterval(500, MILLISECONDS)
+                .ignoreExceptions()
+                .until(() -> proxiesFragmentedHttpRoute(clientName));
+
+        natControlService.createMapping(clientId, new NatControlService.MappingMutation(
+                TUNNEL_LISTEN_PORT, "127.0.0.1", backendPort, true
+        ));
+        await().atMost(15, SECONDS)
+                .pollInterval(500, MILLISECONDS)
+                .ignoreExceptions()
+                .until(this::proxiesThroughToBackend);
+
+        // Add another route after login to verify online hot replacement semantics.
         httpRouteService.createRoute(clientId, new HttpRouteService.RouteMutation(
                 "api", "http://127.0.0.1:" + backendPort, true
         ));
@@ -206,6 +221,23 @@ class EndToEndTunnelIT {
         }
     }
 
+    private boolean proxiesFragmentedHttpRoute(String clientName) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) new URL(
+                "http://127.0.0.1:" + httpPort + "/http/" + clientName + "/web/fragmented"
+        ).openConnection();
+        conn.setConnectTimeout(2_000);
+        conn.setReadTimeout(10_000);
+        if (conn.getResponseCode() != 200) {
+            return false;
+        }
+        try (InputStream input = conn.getInputStream()) {
+            byte[] body = input.readAllBytes();
+            return body.length == 1024 * 1024
+                    && body[0] == (byte) 0x5a
+                    && body[body.length - 1] == (byte) 0x5a;
+        }
+    }
+
     private static int findFreePort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
@@ -213,7 +245,7 @@ class EndToEndTunnelIT {
     }
 
     /**
-     * 反射读取 NettyClient.controlChannel 当前 pipeline 中
+     * 反射读取 NettyClient.dataChannel 当前 pipeline 中
      * NatClientHandler 的当前路由。返回 null 表示客户端还没建立连接 / 已断开。
      *
      * <p>用反射是因为 {@code controlChannel} 是私有字段——为测试新增 getter 会污染
@@ -221,7 +253,7 @@ class EndToEndTunnelIT {
      */
     private static Map<String, String> readClientRoutes(NettyClient client) {
         try {
-            Field field = NettyClient.class.getDeclaredField("controlChannel");
+            Field field = NettyClient.class.getDeclaredField("dataChannel");
             field.setAccessible(true);
             Object value = field.get(client);
             if (!(value instanceof AtomicReference<?> ref)) {

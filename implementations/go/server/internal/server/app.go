@@ -194,6 +194,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		},
 		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
 		cfg.HTTP.RewriteMaxBodyBytes, traffic, db, db, detailOptions)
+	directHTTP.SetReconnectGrace(3 * time.Second)
 	api := management.NewAPI(db, sessions, tokens, oidcValidator, natControl, remotePorts, cfg.Oidc, cfg.Auth,
 		cfg.ClientAuth, cfg.Traffic, traffic, func(ctx context.Context) error {
 			return seedDemoClient(ctx, db, logger, cfg.ClientAuth.DefaultMaxOnlineInstances)
@@ -458,6 +459,13 @@ func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig
 		"connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// HTTP tunnel responses belong to the target application. Adding the portal
+		// policy here would make browsers enforce both policies and can block target
+		// features such as WebAssembly even when the application explicitly allows it.
+		if r.URL.Path == "/http" || strings.HasPrefix(r.URL.Path, "/http/") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		header := w.Header()
 		header.Set("Content-Security-Policy", policy)
 		header.Set("X-Content-Type-Options", "nosniff")

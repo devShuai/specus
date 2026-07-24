@@ -46,7 +46,14 @@ public sealed class StreamSendWindow
         }
         lock (_sync)
         {
-            if (_closed || bytes > _outstanding || _credit > MaximumBytes - bytes)
+            // WINDOW_UPDATE can already be in flight when the owning stream closes.
+            // Treat valid late credit as consumed instead of escalating a stream race
+            // into a connection-level protocol failure.
+            if (_closed)
+            {
+                return true;
+            }
+            if (bytes > _outstanding || _credit > MaximumBytes - bytes)
             {
                 return false;
             }

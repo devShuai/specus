@@ -136,7 +136,6 @@ type clientSession struct {
 	nextStreamID   uint32
 	activeExternal int
 	portCounts     map[int]int
-	registered     bool
 
 	controlBackpressureUnsubscribe func()
 }
@@ -181,9 +180,6 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 		if s.handleWSData(message) {
 			return nil
 		}
-		if !s.isRegistered() {
-			return s.protocolViolation()
-		}
 		s.handleData(message)
 		return nil
 	case protocol.NatFin, protocol.NatRST:
@@ -193,33 +189,26 @@ func (s *clientSession) handle(message protocol.NatMessage) error {
 		if s.handleWSEnd(message) {
 			return nil
 		}
-		if !s.isRegistered() {
-			return s.protocolViolation()
-		}
 		s.handleClientClose(message)
 		return nil
 	case protocol.NatWindowUpdate:
 		return s.handleWindowUpdate(message)
 	case protocol.NatOpen:
-		if s.handleHTTPResponseOpen(message) {
-			return nil
-		}
-		return s.protocolViolation()
+		s.handleHTTPResponseOpen(message)
+		return nil
 	default:
-		return s.protocolViolation()
+		return s.protocolViolation(message, "unsupported NAT frame type")
 	}
 }
 
-func (s *clientSession) protocolViolation() error {
+func (s *clientSession) protocolViolation(message protocol.NatMessage, detail string) error {
+	s.logger.Warn("NAT protocol violation",
+		"client", s.conn.ClientName(), "channel", s.conn.ChannelID(),
+		"type", message.Type, "streamId", message.StreamID, "value", message.Value,
+		"dataBytes", len(message.Data), "detail", detail)
 	s.conn.MarkReason(store.ReasonProtocolViolation)
 	s.conn.Close(store.ReasonProtocolViolation)
 	return nil
-}
-
-func (s *clientSession) isRegistered() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.registered
 }
 
 func (s *clientSession) handleRegister(message protocol.NatMessage) error {
@@ -265,7 +254,6 @@ func (s *clientSession) handleRegister(message protocol.NatMessage) error {
 
 	s.mu.Lock()
 	s.bindings[port] = listener
-	s.registered = true
 	s.mu.Unlock()
 
 	result["success"] = true
@@ -336,13 +324,13 @@ func (s *clientSession) handleWindowUpdate(message protocol.NatMessage) error {
 	s.mu.Unlock()
 	if httpStream != nil {
 		if !httpStream.addSendCredit(message.Value) {
-			return s.protocolViolation()
+			return s.protocolViolation(message, "invalid HTTP WINDOW_UPDATE")
 		}
 		return nil
 	}
 	if wsStream != nil {
 		if !wsStream.AddSendCredit(message.Value) {
-			return s.protocolViolation()
+			return s.protocolViolation(message, "invalid WebSocket WINDOW_UPDATE")
 		}
 		return nil
 	}
@@ -350,7 +338,7 @@ func (s *clientSession) handleWindowUpdate(message protocol.NatMessage) error {
 		return nil
 	}
 	if !external.addSendCredit(message.Value) {
-		return s.protocolViolation()
+		return s.protocolViolation(message, "invalid TCP WINDOW_UPDATE")
 	}
 	return nil
 }
@@ -370,14 +358,23 @@ func (s *clientSession) openHTTPStream(metadata map[string]any) (*HTTPStream, er
 	return stream, nil
 }
 
-func (s *clientSession) handleHTTPResponseOpen(message protocol.NatMessage) bool {
-	if asString(message.Metadata, "source") != "http" || asString(message.Metadata, "phase") != "response" {
-		return false
-	}
+func (s *clientSession) handleHTTPResponseOpen(message protocol.NatMessage) {
 	s.mu.Lock()
 	stream := s.httpStreams[message.StreamID]
 	s.mu.Unlock()
-	return stream != nil && stream.onHead(message.Metadata)
+	if stream == nil {
+		s.resetInvalidHTTPStream(message, nil, "invalid HTTP response headers")
+		return
+	}
+	switch stream.onHead(message.Metadata) {
+	case httpStreamFrameAccepted, httpStreamFrameClosed:
+		return
+	case httpStreamFrameQueueFull:
+		s.resetOverloadedHTTPStream(message, stream)
+		return
+	default:
+		s.resetInvalidHTTPStream(message, stream, "invalid HTTP response headers")
+	}
 }
 
 func (s *clientSession) handleHTTPData(message protocol.NatMessage) bool {
@@ -387,10 +384,19 @@ func (s *clientSession) handleHTTPData(message protocol.NatMessage) bool {
 	if stream == nil {
 		return false
 	}
-	if !stream.onData(message.Data) {
-		s.protocolViolation()
+	switch stream.onData(message.Data) {
+	case httpStreamFrameAccepted, httpStreamFrameClosed:
+		return true
+	case httpStreamFrameQueueFull:
+		s.resetOverloadedHTTPStream(message, stream)
+		return true
+	case httpStreamFrameWindowExceeded:
+		s.resetInvalidHTTPStream(message, stream, "HTTP DATA exceeds receive window")
+		return true
+	default:
+		s.resetInvalidHTTPStream(message, stream, "HTTP DATA is invalid for the stream state")
+		return true
 	}
-	return true
 }
 
 func (s *clientSession) handleHTTPEnd(message protocol.NatMessage) bool {
@@ -402,10 +408,44 @@ func (s *clientSession) handleHTTPEnd(message protocol.NatMessage) bool {
 	}
 	if message.Type == protocol.NatRST {
 		stream.onReset(asString(message.Metadata, "reason"))
-	} else if !stream.onEnd(message.Metadata) {
-		s.protocolViolation()
+		return true
 	}
-	return true
+	switch stream.onEnd(message.Metadata) {
+	case httpStreamFrameAccepted, httpStreamFrameClosed:
+		return true
+	case httpStreamFrameQueueFull:
+		s.resetOverloadedHTTPStream(message, stream)
+		return true
+	default:
+		s.resetInvalidHTTPStream(message, stream, "invalid HTTP terminal frame")
+		return true
+	}
+}
+
+func (s *clientSession) resetInvalidHTTPStream(
+	message protocol.NatMessage,
+	stream *HTTPStream,
+	reason string,
+) {
+	s.logger.Warn("invalid HTTP response stream frame; resetting stream",
+		"client", s.conn.ClientName(), "channel", s.conn.ChannelID(),
+		"type", message.Type, "streamId", message.StreamID,
+		"dataBytes", len(message.Data), "reason", reason)
+	if stream != nil {
+		stream.Reset(8, reason)
+		return
+	}
+	_ = s.conn.Send(protocol.NatMessage{
+		Type: protocol.NatRST, StreamID: message.StreamID, Value: 8,
+		Metadata: map[string]any{"reason": reason},
+	})
+}
+
+func (s *clientSession) resetOverloadedHTTPStream(message protocol.NatMessage, stream *HTTPStream) {
+	s.logger.Warn("HTTP response event queue exceeded; resetting stream",
+		"client", s.conn.ClientName(), "channel", s.conn.ChannelID(),
+		"streamId", message.StreamID, "dataBytes", len(message.Data))
+	stream.Reset(9, "HTTP response event queue exceeded")
 }
 
 func (s *clientSession) removeHTTPStream(streamID uint32, expected *HTTPStream) {

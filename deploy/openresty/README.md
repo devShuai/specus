@@ -88,6 +88,10 @@ sudo ADMIN_WEB_ROOT=/data/shuai-tunnel/admin-web \
 | `favicon/logo/robots/sitemap/gtag-init.js` | `public, max-age=3600` | 小静态资源短缓存 |
 | `/api`、`/auth`、`/oidc`、`/oidc-config`、`/http`、`/actuator`、`/health`、`/.well-known`、`/ws` | 不设置静态缓存 | 动态请求直接反代 |
 
+`/http/` 是透明代理的第三方应用入口。该 location 不继承管理站点的 CSP、Permissions-Policy、
+X-Frame-Options 或 Cache-Control，而是保留隧道上游返回的响应头；否则 DSM 等依赖 WebAssembly、
+动态脚本、摄像头或内嵌页面的应用会在浏览器中初始化失败。HTTPS location 仍由 OpenResty 补充 HSTS。
+
 ## HTTPS
 
 当前 `shuai-tunnel.conf` 已同时定义 `80` 的 HTTP server 和 `443` 的 HTTPS/HTTP2 server；两者目前都会
@@ -112,6 +116,7 @@ curl -Ik https://tunnel.devshuai.com/
 curl -I http://tunnel.devshuai.com/assets/index-xxxx.js
 curl -I -H 'Accept-Encoding: gzip' http://tunnel.devshuai.com/assets/index-xxxx.js
 curl -I http://tunnel.devshuai.com/api/admin/overview
+curl -Ik https://tunnel.devshuai.com/http/client-name/route/
 ```
 
 预期：
@@ -120,6 +125,8 @@ curl -I http://tunnel.devshuai.com/api/admin/overview
 * `/assets/*.js` 返回 `Cache-Control: public, max-age=31536000, immutable`
 * 带 `Accept-Encoding: gzip` 请求 hash 资源时返回 `Content-Encoding: gzip`
 * `/api/...` 能被反代到后端，未登录时通常返回 `401`
+* `/http/...` 的 `Content-Security-Policy` 与 `127.0.0.1:8088` 上的同一路由一致，不出现管理站点的
+  `frame-ancestors 'none'` 或全局 `Permissions-Policy`
 
 ## 注意事项
 

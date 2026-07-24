@@ -50,6 +50,85 @@ func TestServeHTTPRecordsOfflineError(t *testing.T) {
 	}
 }
 
+func TestServeHTTPWaitsForDataReconnect(t *testing.T) {
+	registry := session.NewRegistry()
+	control := &fakeOnlineSession{name: "Demo client"}
+	data := &fakeOnlineSession{name: "Demo client"}
+	registry.Replace(control)
+	registry.ReplaceData(data)
+	registry.Unbind("Demo client", data)
+	stream := newFakeStream()
+	stream.head = map[string]any{"statusCode": 200, "headers": []string{"Content-Type:text/plain"}}
+	stream.responses = []fakeResponse{{data: []byte("ok")}, {end: true}}
+	service := NewService(registry, func(string, map[string]any) (Stream, error) {
+		return stream, nil
+	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+	service.SetReconnectGrace(500 * time.Millisecond)
+
+	reconnected := make(chan struct{})
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		registry.ReplaceData(&fakeOnlineSession{name: "Demo client"})
+		close(reconnected)
+	}()
+
+	response := httptest.NewRecorder()
+	service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+	<-reconnected
+
+	if response.Code != http.StatusOK || response.Body.String() != "ok" {
+		t.Fatalf("response = %d/%q, want 200/ok", response.Code, response.Body.String())
+	}
+}
+
+func TestServeHTTPUsesDataChannelAsOnlineAuthority(t *testing.T) {
+	t.Run("data channel is sufficient", func(t *testing.T) {
+		registry := session.NewRegistry()
+		registry.ReplaceData(&fakeOnlineSession{name: "Demo client"})
+		stream := newFakeStream()
+		stream.head = map[string]any{"statusCode": 200}
+		stream.responses = []fakeResponse{{end: true}}
+		service := NewService(registry, func(string, map[string]any) (Stream, error) {
+			return stream, nil
+		}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
+
+		response := httptest.NewRecorder()
+		service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("response = %d, want 200", response.Code)
+		}
+	})
+
+	t.Run("control channel alone is offline", func(t *testing.T) {
+		registry := session.NewRegistry()
+		registry.Replace(&fakeOnlineSession{name: "Demo client"})
+		service := NewService(registry, nil, nil, time.Second, 1024, 1024,
+			nil, nil, nil, store.TrafficDetailOptions{})
+
+		response := httptest.NewRecorder()
+		service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+
+		if response.Code != http.StatusBadGateway {
+			t.Fatalf("response = %d, want 502", response.Code)
+		}
+	})
+}
+
+func TestServeHTTPDoesNotWaitForUnknownClient(t *testing.T) {
+	service := NewService(session.NewRegistry(), nil, nil, time.Second, 1024, 1024,
+		nil, nil, nil, store.TrafficDetailOptions{})
+	service.SetReconnectGrace(time.Second)
+	response := httptest.NewRecorder()
+	startedAt := time.Now()
+
+	service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+
+	if response.Code != http.StatusBadGateway || time.Since(startedAt) > 500*time.Millisecond {
+		t.Fatalf("response/elapsed = %d/%s, want immediate 502", response.Code, time.Since(startedAt))
+	}
+}
+
 func TestServeHTTPStreamsRequestAndResponseWithCredit(t *testing.T) {
 	recorder := &capturingDetailRecorder{}
 	traffic := &capturingTrafficRecorder{}
@@ -138,7 +217,7 @@ func tunnelRequest(method, target, body string) *http.Request {
 
 func onlineRegistry(name string) *session.Registry {
 	registry := session.NewRegistry()
-	registry.Replace(&fakeOnlineSession{name: name})
+	registry.ReplaceData(&fakeOnlineSession{name: name})
 	return registry
 }
 

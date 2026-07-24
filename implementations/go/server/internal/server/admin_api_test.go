@@ -232,6 +232,32 @@ func TestStaticResourceCacheHeadersMatchJava(t *testing.T) {
 	}
 }
 
+func TestSecurityHeadersLeaveHTTPTunnelPolicyToUpstream(t *testing.T) {
+	handler := securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/http/") {
+			w.Header().Set("Content-Security-Policy", "script-src 'self' 'unsafe-eval'")
+			w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ObjectStorageConfig{})
+
+	tunnel := httptest.NewRecorder()
+	handler.ServeHTTP(tunnel, httptest.NewRequest(http.MethodGet, "/http/client/route/", nil))
+	if got := tunnel.Header().Values("Content-Security-Policy"); len(got) != 1 ||
+		got[0] != "script-src 'self' 'unsafe-eval'" {
+		t.Fatalf("tunnel CSP = %#v, want only upstream policy", got)
+	}
+	if got := tunnel.Header().Get("X-Frame-Options"); got != "SAMEORIGIN" {
+		t.Fatalf("tunnel X-Frame-Options = %q, want SAMEORIGIN", got)
+	}
+
+	portal := httptest.NewRecorder()
+	handler.ServeHTTP(portal, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := portal.Header().Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors 'none'") {
+		t.Fatalf("portal CSP = %q, want strict portal policy", got)
+	}
+}
+
 func TestPublicAttachmentHTTPStatusMatchesJavaExceptionMapping(t *testing.T) {
 	cfg := config.Default()
 	cfg.PublicTransfer.PresignRateLimitPerIP = 1

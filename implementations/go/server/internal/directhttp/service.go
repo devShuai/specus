@@ -74,16 +74,17 @@ type DetailRecorder interface {
 
 // Service streams public HTTP requests through mandatory NAT stream v2 frames.
 type Service struct {
-	sessions    *session.Registry
-	openStream  OpenStreamFunc
-	openWS      OpenWSStreamFunc
-	timeout     time.Duration
-	maxBodySize int
-	traffic     TrafficRecorder
-	routes      RouteSettings
-	detail      DetailRecorder
-	detailOpts  store.TrafficDetailOptions
-	rewriter    responseRewriter
+	sessions       *session.Registry
+	openStream     OpenStreamFunc
+	openWS         OpenWSStreamFunc
+	timeout        time.Duration
+	maxBodySize    int
+	traffic        TrafficRecorder
+	routes         RouteSettings
+	detail         DetailRecorder
+	detailOpts     store.TrafficDetailOptions
+	rewriter       responseRewriter
+	reconnectGrace time.Duration
 }
 
 func NewService(sessions *session.Registry, openStream OpenStreamFunc, openWS OpenWSStreamFunc,
@@ -94,6 +95,15 @@ func NewService(sessions *session.Registry, openStream OpenStreamFunc, openWS Op
 		traffic: traffic, routes: routes, detail: detail, detailOpts: detailOpts,
 		rewriter: newResponseRewriter(rewriteMaxBodyBytes),
 	}
+}
+
+// SetReconnectGrace allows a briefly reconnecting client to restore its mandatory v2
+// data connection before an HTTP/WS request is reported as offline.
+func (s *Service) SetReconnectGrace(grace time.Duration) {
+	if grace < 0 {
+		grace = 0
+	}
+	s.reconnectGrace = grace
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -127,11 +137,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.sessions == nil {
-		fail(statusForError(errOffline), errOffline.Error()+": "+clientName)
-		return
-	}
-	if _, online := s.sessions.Find(clientName); !online {
+	if !s.clientOnline(r.Context(), clientName) {
 		fail(statusForError(errOffline), errOffline.Error()+": "+clientName)
 		return
 	}
@@ -309,11 +315,7 @@ func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	fail := func(reason string) {
 		_ = conn.Close(websocket.StatusInternalError, reason)
 	}
-	if s.sessions == nil {
-		fail(errOffline.Error() + ": " + clientName)
-		return
-	}
-	if _, online := s.sessions.Find(clientName); !online {
+	if !s.clientOnline(r.Context(), clientName) {
 		fail(errOffline.Error() + ": " + clientName)
 		return
 	}
@@ -333,6 +335,19 @@ func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tunnel.ReadLoop(r.Context())
+}
+
+func (s *Service) clientOnline(ctx context.Context, clientName string) bool {
+	if s.sessions == nil {
+		return false
+	}
+	if s.reconnectGrace <= 0 {
+		_, online := s.sessions.FindData(clientName)
+		return online
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, s.reconnectGrace)
+	defer cancel()
+	return s.sessions.WaitForDataReconnect(waitCtx, clientName, s.reconnectGrace)
 }
 
 func (s *Service) pumpRequest(ctx context.Context, body io.ReadCloser, trailers http.Header, stream Stream,

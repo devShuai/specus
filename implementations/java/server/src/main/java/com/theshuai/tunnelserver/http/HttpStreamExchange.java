@@ -1,20 +1,26 @@
 package com.theshuai.tunnelserver.http;
 
+import com.theshuai.common.handler.StreamFlowController;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /** One mandatory HTTP stream v2 exchange keyed by a connection-local stream id. */
 public final class HttpStreamExchange {
-    private static final int MAX_QUEUED_CHUNKS = 64;
+    private static final int MAX_QUEUED_DATA_EVENTS = 4096;
+    private static final long MAX_QUEUED_DATA_BYTES = StreamFlowController.INITIAL_WINDOW_BYTES;
 
     private final int streamId;
     private final CompletableFuture<ResponseHead> responseHead = new CompletableFuture<>();
-    private final ArrayBlockingQueue<Event> events = new ArrayBlockingQueue<>(MAX_QUEUED_CHUNKS);
+    private final LinkedBlockingQueue<Event> events = new LinkedBlockingQueue<>();
     private volatile List<String> trailers = List.of();
+    private int queuedDataEvents;
+    private long queuedDataBytes;
+    private boolean terminalQueued;
 
     public HttpStreamExchange(int streamId) {
         this.streamId = streamId;
@@ -37,19 +43,35 @@ public final class HttpStreamExchange {
         return responseHead.complete(new ResponseHead(statusCode, stringList(metadata.get("headers"))));
     }
 
-    public boolean onData(byte[] data) {
-        return data != null && events.offer(new Data(data));
+    public synchronized boolean onData(byte[] data) {
+        if (data == null || data.length == 0 || terminalQueued
+                || queuedDataEvents >= MAX_QUEUED_DATA_EVENTS
+                || queuedDataBytes > MAX_QUEUED_DATA_BYTES - data.length) {
+            return false;
+        }
+        queuedDataEvents++;
+        queuedDataBytes += data.length;
+        events.offer(new Data(data));
+        return true;
     }
 
-    public void onFin(Map<String, Object> metadata) {
+    public synchronized void onFin(Map<String, Object> metadata) {
+        if (terminalQueued) {
+            return;
+        }
+        terminalQueued = true;
         trailers = stringList(metadata == null ? null : metadata.get("trailers"));
         events.offer(new End(trailers));
     }
 
-    public void onReset(long errorCode, Map<String, Object> metadata) {
+    public synchronized void onReset(long errorCode, Map<String, Object> metadata) {
         String reason = metadata == null ? null : text(metadata.get("reason"));
         Reset reset = new Reset(errorCode, reason == null || reason.isBlank() ? "HTTP stream reset" : reason);
         responseHead.completeExceptionally(new HttpStreamException(reset.reason(), errorCode));
+        if (terminalQueued) {
+            return;
+        }
+        terminalQueued = true;
         events.offer(reset);
     }
 
@@ -58,7 +80,14 @@ public final class HttpStreamExchange {
     }
 
     public Event take() throws InterruptedException {
-        return events.take();
+        Event event = events.take();
+        if (event instanceof Data data) {
+            synchronized (this) {
+                queuedDataEvents--;
+                queuedDataBytes -= data.bytes().length;
+            }
+        }
+        return event;
     }
 
     public List<String> trailers() {

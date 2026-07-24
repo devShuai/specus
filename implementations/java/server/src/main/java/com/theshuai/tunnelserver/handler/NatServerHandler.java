@@ -59,12 +59,9 @@ public class NatServerHandler extends NatCommonHandler {
     private final WebSocketTunnelHandler webSocketTunnelHandler;
     private final AtomicInteger activeClientExternalChannels = new AtomicInteger();
     private final Map<Integer, AtomicInteger> portExternalChannelCounts = new ConcurrentHashMap<>();
-    // Set during processRegister; null means the client has not registered any tunnel yet.
+    // Bound from the authenticated DATA-channel session on its first NAT frame or HTTP stream.
     private volatile String clientName;
     private volatile String tenantId = "default";
-    // Per-connection flag. Each control connection gets its own handler instance, but we still
-    // gate DATA/DISCONNECTED on successful REGISTER to reject out-of-order messages.
-    private volatile boolean register = false;
 
     public NatServerHandler(TrafficUsageService trafficUsageService,
                             TrafficInspectionService trafficInspectionService,
@@ -86,6 +83,11 @@ public class NatServerHandler extends NatCommonHandler {
             super.channelRead(ctx, msg);
             return;
         }
+        if (!bindAuthenticatedIdentity(ctx.channel())) {
+            DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
+            ctx.close();
+            return;
+        }
         NatMessageType type = natMessagePacket.getNatMessageType();
         if (type == NatMessageType.REGISTER) {
             processRegister(natMessagePacket);
@@ -94,19 +96,15 @@ public class NatServerHandler extends NatCommonHandler {
         } else if (type == NatMessageType.OPEN) {
             processHttpResponseHead(natMessagePacket);
         } else if (type == NatMessageType.DATA) {
-            // WebSocket 流（source="ws" 或 channelId 命中 WS 注册表）不依赖 TCP REGISTER，
-            // 单独放行；否则要求客户端已 REGISTER 至少一条 TCP 隧道。
             int streamId = natMessagePacket.getStreamId();
             if (httpStreams.containsKey(streamId)) {
                 processHttpData(natMessagePacket);
             } else if (webSocketStreamRegistry.getByStreamId(streamId) != null) {
                 processWsData(natMessagePacket);
-            } else if (register) {
-                processData(natMessagePacket);
             } else {
-                log.warn("Dropping DATA before REGISTER on channel {}", ctx.channel().id().asLongText());
-                DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
-                ctx.close();
+                // HTTP/WS 流取消后仍可能有已经在网络中的尾帧。流 ID 在当前已认证的
+                // DATA 连接内隔离，未知流只需忽略，不能把整条控制会话判为协议违规。
+                processData(natMessagePacket);
             }
         } else if (type == NatMessageType.FIN || type == NatMessageType.RST) {
             int streamId = natMessagePacket.getStreamId();
@@ -114,12 +112,8 @@ public class NatServerHandler extends NatCommonHandler {
                 processHttpClosed(natMessagePacket);
             } else if (webSocketStreamRegistry.getByStreamId(streamId) != null) {
                 processWsClosed(natMessagePacket);
-            } else if (register) {
-                processClosed(natMessagePacket);
             } else {
-                log.warn("Dropping DISCONNECTED before REGISTER on channel {}", ctx.channel().id().asLongText());
-                DisconnectReason.markIfAbsent(ctx.channel(), DisconnectReason.PROTOCOL_VIOLATION);
-                ctx.close();
+                processClosed(natMessagePacket);
             }
         } else if (type == NatMessageType.WINDOW_UPDATE) {
             processWindowUpdate(natMessagePacket);
@@ -149,6 +143,7 @@ public class NatServerHandler extends NatCommonHandler {
 
     public boolean openHttpStream(HttpStreamExchange exchange, Map<String, Object> metadata) {
         if (ctx == null || !ctx.channel().isActive()
+                || !bindAuthenticatedIdentity(ctx.channel())
                 || httpStreams.putIfAbsent(exchange.streamId(), exchange) != null) {
             return false;
         }
@@ -328,6 +323,20 @@ public class NatServerHandler extends NatCommonHandler {
         }
     }
 
+    private boolean bindAuthenticatedIdentity(Channel channel) {
+        if (clientName != null) {
+            return true;
+        }
+        Session session = SessionUtil.getSession(channel);
+        if (session == null) {
+            return false;
+        }
+        clientName = session.getClientName();
+        String boundTenantId = channel.attr(ServerAttributes.TENANT_ID).get();
+        tenantId = boundTenantId == null || boundTenantId.isBlank() ? "default" : boundTenantId;
+        return true;
+    }
+
     private void processRegister(NatMessagePacket natMessagePacket) {
         Map<String, Object> metaData = natMessagePacket.getMetaData();
         Integer port = asInt(metaData, "port");
@@ -355,9 +364,7 @@ public class NatServerHandler extends NatCommonHandler {
             ctx.close();
             return;
         }
-        clientName = session.getClientName();
-        String boundTenantId = ctx.channel().attr(ServerAttributes.TENANT_ID).get();
-        tenantId = boundTenantId == null || boundTenantId.isBlank() ? "default" : boundTenantId;
+        bindAuthenticatedIdentity(ctx.channel());
 
         if (remoteConnectionServerMap.containsKey(port)) {
             // Port already in use on this server. Reject instead of silently reporting success.
@@ -409,7 +416,6 @@ public class NatServerHandler extends NatCommonHandler {
             });
 
             remoteConnectionServerMap.put(port, remoteConnectionServer);
-            register = true;
             result.put("success", true);
             log.info("register success, start server on port {} --> {}:{} [{}] ", port, tunnelAddress, tunnelPort, clientName);
         } catch (Exception e) {
@@ -438,9 +444,7 @@ public class NatServerHandler extends NatCommonHandler {
         log.info("{} inactive close", ctx.channel().id().asLongText());
         for (Map.Entry<Integer, TcpServer> serverEntry : remoteConnectionServerMap.entrySet()) {
             serverEntry.getValue().close();
-            if (register) {
-                log.info("Stop server on port: {}", serverEntry.getKey());
-            }
+            log.info("Stop server on port: {}", serverEntry.getKey());
         }
         remoteConnectionServerMap.clear();
         externalChannels.values().forEach(Channel::close);

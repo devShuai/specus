@@ -285,8 +285,23 @@ internal sealed class NatClientHandler : IAsyncDisposable
         {
             return SendResetAsync(packet.StreamId, 20, "invalid HTTP OPEN");
         }
+        var route = AsString(packet.MetaData, "route");
+        if (string.IsNullOrWhiteSpace(route))
+        {
+            return SendResetAsync(packet.StreamId, 20, "invalid HTTP OPEN");
+        }
+        if (!_directHttp.TryResolveRoute(route, out var targetBaseUrl)
+            || string.IsNullOrWhiteSpace(targetBaseUrl))
+        {
+            _logger.LogWarning(
+                "HTTP stream {StreamId} requested unknown route {Route}; available routes=[{Routes}]",
+                packet.StreamId,
+                route,
+                _directHttp.DescribeRoutes());
+            return SendResetAsync(packet.StreamId, 22, "unknown HTTP route");
+        }
         var channel = new HttpStreamChannel(packet.StreamId, packet.MetaData, _directHttp,
-            _writer, _logger, _cancellationToken,
+            targetBaseUrl, _writer, _logger, _cancellationToken,
             closed => _httpChannels.TryRemove(
                 new KeyValuePair<uint, HttpStreamChannel>(closed.StreamId, closed)));
         if (!_httpChannels.TryAdd(packet.StreamId, channel))

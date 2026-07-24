@@ -10,6 +10,7 @@ namespace ShuaiTunnel.Client.DirectHttp;
 internal sealed class DirectHttpHandler
 {
     private volatile IReadOnlyDictionary<string, string> _routes;
+    private readonly ILogger _logger;
 
     public DirectHttpHandler(
         IEnumerable<HttpTunnelConfigEntry>? initialRoutes,
@@ -19,13 +20,20 @@ internal sealed class DirectHttpHandler
     {
         Forwarder = forwarder;
         _ = writer;
-        _ = logger;
+        _logger = logger;
         _routes = BuildMap(initialRoutes);
+        LogSnapshot("initialized", _routes);
     }
 
     public DirectHttpForwarder Forwarder { get; }
 
     public IReadOnlyDictionary<string, string> SnapshotRoutes() => _routes;
+
+    public bool TryResolveRoute(string route, out string targetBaseUrl) =>
+        _routes.TryGetValue(route, out targetBaseUrl!);
+
+    public string DescribeRoutes() =>
+        string.Join(", ", _routes.Keys.Order(StringComparer.Ordinal));
 
     /// <summary>
     /// Replaces the route map with a server-pushed snapshot. A <c>null</c> argument keeps the
@@ -37,24 +45,35 @@ internal sealed class DirectHttpHandler
         {
             return;
         }
-        _routes = BuildMap(next);
+        var routes = BuildMap(next);
+        _routes = routes;
+        LogSnapshot("applied", routes);
     }
 
     private static IReadOnlyDictionary<string, string> BuildMap(IEnumerable<HttpTunnelConfigEntry>? source)
     {
         if (source is null)
         {
-            return new Dictionary<string, string>();
+            return new Dictionary<string, string>(StringComparer.Ordinal);
         }
-        var map = new Dictionary<string, string>();
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var entry in source)
         {
             if (string.IsNullOrWhiteSpace(entry.Route))
             {
                 continue;
             }
-            map[entry.Route] = entry.TargetBaseUrl;
+            map[entry.Route.Trim()] = entry.TargetBaseUrl;
         }
         return map;
+    }
+
+    private void LogSnapshot(string action, IReadOnlyDictionary<string, string> routes)
+    {
+        _logger.LogInformation(
+            "HTTP route snapshot {Action}: count={Count}, routes=[{Routes}]",
+            action,
+            routes.Count,
+            string.Join(", ", routes.Keys.Order(StringComparer.Ordinal)));
     }
 }

@@ -3,7 +3,9 @@
 package session
 
 import (
+	"context"
 	"sync"
+	"time"
 
 	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
 )
@@ -25,11 +27,18 @@ type Registry struct {
 	mu       sync.Mutex
 	controls map[string]Session
 	data     map[string]Session
+	closedAt map[string]time.Time
+	changed  chan struct{}
 }
 
 // NewRegistry builds an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{controls: make(map[string]Session), data: make(map[string]Session)}
+	return &Registry{
+		controls: make(map[string]Session),
+		data:     make(map[string]Session),
+		closedAt: make(map[string]time.Time),
+		changed:  make(chan struct{}),
+	}
 }
 
 // Replace binds session under its client name, returning any previously bound session that
@@ -40,6 +49,10 @@ func (r *Registry) Replace(session Session) (displaced Session) {
 	name := session.ClientName()
 	previous := r.controls[name]
 	r.controls[name] = session
+	if _, dataReady := r.data[name]; dataReady {
+		delete(r.closedAt, name)
+	}
+	r.notifyLocked()
 	if previous != nil && previous != session {
 		return previous
 	}
@@ -53,6 +66,10 @@ func (r *Registry) ReplaceData(session Session) (displaced Session) {
 	name := session.ClientName()
 	previous := r.data[name]
 	r.data[name] = session
+	if _, controlReady := r.controls[name]; controlReady {
+		delete(r.closedAt, name)
+	}
+	r.notifyLocked()
 	if previous != nil && previous != session {
 		return previous
 	}
@@ -63,11 +80,18 @@ func (r *Registry) ReplaceData(session Session) (displaced Session) {
 func (r *Registry) Unbind(name string, session Session) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	changed := false
 	if current, ok := r.controls[name]; ok && current == session {
 		delete(r.controls, name)
+		changed = true
 	}
 	if current, ok := r.data[name]; ok && current == session {
 		delete(r.data, name)
+		changed = true
+	}
+	if changed {
+		r.closedAt[name] = time.Now()
+		r.notifyLocked()
 	}
 }
 
@@ -85,6 +109,43 @@ func (r *Registry) FindData(name string) (Session, bool) {
 	defer r.mu.Unlock()
 	session, ok := r.data[name]
 	return session, ok
+}
+
+// WaitForDataReconnect blocks until the named data connection is registered or the
+// context ends. Unknown clients fail immediately; only partially connected or recently
+// disconnected clients consume the grace period.
+func (r *Registry) WaitForDataReconnect(
+	ctx context.Context,
+	name string,
+	reconnectGrace time.Duration,
+) bool {
+	for {
+		r.mu.Lock()
+		_, controlReady := r.controls[name]
+		_, dataReady := r.data[name]
+		closedAt, disconnected := r.closedAt[name]
+		changed := r.changed
+		r.mu.Unlock()
+		if dataReady {
+			return true
+		}
+		recentlyDisconnected := disconnected &&
+			reconnectGrace > 0 &&
+			time.Since(closedAt) <= reconnectGrace
+		if !controlReady && !dataReady && !recentlyDisconnected {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-changed:
+		}
+	}
+}
+
+func (r *Registry) notifyLocked() {
+	close(r.changed)
+	r.changed = make(chan struct{})
 }
 
 // IsBound reports whether session is the one currently registered for its client name.

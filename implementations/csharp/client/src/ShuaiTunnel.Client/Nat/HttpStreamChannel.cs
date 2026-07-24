@@ -18,6 +18,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
     private readonly uint _streamId;
     private readonly Dictionary<string, object?> _metadata;
     private readonly DirectHttpHandler _routes;
+    private readonly string _targetBaseUrl;
     private readonly FrameWriter _writer;
     private readonly ILogger _logger;
     private readonly Action<HttpStreamChannel> _onClose;
@@ -27,12 +28,13 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
     private int _closed;
 
     public HttpStreamChannel(uint streamId, Dictionary<string, object?> metadata,
-        DirectHttpHandler routes, FrameWriter writer, ILogger logger,
+        DirectHttpHandler routes, string targetBaseUrl, FrameWriter writer, ILogger logger,
         CancellationToken session, Action<HttpStreamChannel> onClose)
     {
         _streamId = streamId;
         _metadata = new Dictionary<string, object?>(metadata);
         _routes = routes;
+        _targetBaseUrl = targetBaseUrl;
         _writer = writer;
         _logger = logger;
         _onClose = onClose;
@@ -83,12 +85,7 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
     private async Task ForwardAsync(CancellationToken cancellationToken)
     {
         var method = RequiredString(_metadata, "method");
-        var route = RequiredString(_metadata, "route");
-        if (!_routes.SnapshotRoutes().TryGetValue(route, out var baseUrl))
-        {
-            throw new InvalidOperationException("未配置 HTTP route");
-        }
-        if (!DirectHttpForwarder.TryBuildTarget(baseUrl, AsString(_metadata, "relativePath"),
+        if (!DirectHttpForwarder.TryBuildTarget(_targetBaseUrl, AsString(_metadata, "relativePath"),
                 AsString(_metadata, "rawQuery"), out var target, out var error))
         {
             throw new InvalidOperationException(error);
@@ -324,7 +321,11 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
 
         public async ValueTask OfferAsync(byte[] data, CancellationToken cancellationToken)
         {
-            if (data.Length == 0 || Volatile.Read(ref _finished) != 0)
+            if (Volatile.Read(ref _finished) != 0)
+            {
+                return;
+            }
+            if (data.Length == 0)
             {
                 throw new InvalidDataException("invalid HTTP request DATA");
             }
@@ -333,18 +334,31 @@ internal sealed class HttpStreamChannel : IAsyncDisposable
             {
                 throw new InvalidDataException("HTTP 请求体超过限制");
             }
-            await _chunks.Writer.WriteAsync(new RequestChunk(data.ToArray(), null), cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await _chunks.Writer.WriteAsync(new RequestChunk(data.ToArray(), null), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (ChannelClosedException) when (Volatile.Read(ref _finished) != 0)
+            {
+            }
         }
 
         public async ValueTask FinishAsync(List<string> trailers, CancellationToken cancellationToken)
         {
             if (Interlocked.Exchange(ref _finished, 1) != 0)
             {
-                throw new InvalidDataException("duplicate HTTP request FIN");
+                return;
             }
-            await _chunks.Writer.WriteAsync(new RequestChunk(null, trailers), cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await _chunks.Writer.WriteAsync(new RequestChunk(null, trailers), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (ChannelClosedException)
+            {
+                return;
+            }
             _chunks.Writer.TryComplete();
         }
 

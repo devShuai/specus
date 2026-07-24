@@ -149,7 +149,14 @@ func packetAllowedForRole(role string, packet protocol.Packet) bool {
 
 // OnDisconnect unbinds the session and stamps the audit row.
 func (d *Dispatcher) OnDisconnect(conn *control.Conn) {
-	d.logger.Debug("control connection closed", "channel", conn.ChannelID(), "client", conn.ClientName(), "reason", conn.Reason())
+	if conn.ClientName() == "" {
+		d.logger.Debug("unauthenticated control connection closed",
+			"channel", conn.ChannelID(), "reason", conn.Reason())
+	} else {
+		d.logger.Info("client connection closed", "channel", conn.ChannelID(),
+			"client", conn.ClientName(), "role", conn.ConnectionRole(),
+			"session", conn.ClientSessionID(), "reason", conn.Reason())
+	}
 	dataConnection := conn.ConnectionRole() == protocol.ConnectionRoleData
 	if dataConnection && d.onDisconnect != nil {
 		d.onDisconnect(conn)
