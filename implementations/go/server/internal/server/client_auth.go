@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"strconv"
@@ -94,7 +95,12 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	credential, err := a.authenticateClientStartup(r.Context(), request)
 	if err != nil {
-		writeClientAuthError(w, http.StatusBadRequest, err.Error())
+		var rejection errClientAuth
+		if errors.As(err, &rejection) {
+			writeClientAuthError(w, http.StatusBadRequest, rejection.Error())
+		} else {
+			a.failClientAuthInternal(w, "startup-authentication", "客户端认证暂时不可用", err)
+		}
 		return
 	}
 	if !credential.Enabled {
@@ -211,8 +217,7 @@ func max64(left, right int64) int64 {
 func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthLoginRequest) (*store.ClientCredential, error) {
 	credential, err := a.db.FindCredentialByAPIKey(ctx, strings.TrimSpace(request.APIKey))
 	if err != nil {
-		a.logger.Error("client authentication failed", "stage", "credential-lookup", "err", err)
-		return nil, errClientAuth("客户端凭证校验失败")
+		return nil, err
 	}
 	if credential == nil {
 		return nil, errClientAuth("客户端凭证不存在")
@@ -222,12 +227,10 @@ func (a *App) authenticateClientStartup(ctx context.Context, request clientAuthL
 	}
 	now := time.Now().UTC()
 	apiKeyDigest := sha256.Sum256([]byte(strings.TrimSpace(request.APIKey)))
-	nonceDigest := sha256.Sum256([]byte(request.Nonce))
 	consumed, err := a.db.ConsumeClientAuthNonce(ctx, hex.EncodeToString(apiKeyDigest[:]),
-		hex.EncodeToString(nonceDigest[:]), now, now.Add(2*time.Minute))
+		request.Nonce, now, now.Add(2*time.Minute))
 	if err != nil {
-		a.logger.Error("client authentication failed", "stage", "nonce-reservation", "err", err)
-		return nil, errClientAuth("客户端 nonce 校验失败")
+		return nil, err
 	}
 	if !consumed {
 		return nil, errClientAuth("客户端 nonce 已使用")

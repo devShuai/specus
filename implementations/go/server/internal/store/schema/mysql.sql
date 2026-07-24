@@ -29,12 +29,10 @@ CREATE TABLE IF NOT EXISTS tunnel_client_credential (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS tunnel_client_auth_nonce (
+  id VARCHAR(64) PRIMARY KEY,
   api_key_hash VARCHAR(64) NOT NULL,
-  nonce_hash VARCHAR(64) NOT NULL,
   expires_at VARCHAR(40) NOT NULL,
-  created_at VARCHAR(40) NOT NULL,
-  PRIMARY KEY (api_key_hash, nonce_hash),
-  KEY idx_client_auth_nonce_expiry (expires_at)
+  KEY idx_client_auth_nonce_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (

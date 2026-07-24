@@ -31,22 +31,31 @@ const (
 	DialectMySQL    Dialect = "mysql"
 )
 
+type clientAuthNonceLayout uint8
+
+const (
+	clientAuthNonceLayoutUnknown clientAuthNonceLayout = iota
+	clientAuthNonceLayoutComposite
+	clientAuthNonceLayoutJavaID
+)
+
 // DB is the persistence layer over a multi-dialect database/sql connection.
 type DB struct {
-	sql                  *sql.DB
-	dialect              Dialect
-	detailStore          trafficDetailBackend
-	tcpCursorMu          sync.Mutex
-	tcpCursors           map[string]*tcpStreamCursor
-	detailMu             sync.Mutex
-	detailDecisions      map[string]detailCaptureDecision
-	pendingHTTPExchanges []HTTPExchangeRecord
-	pendingTCPFrames     []TCPFrameRecord
-	detailMaxPending     int
-	detailFlushBatchSize int
-	droppedHTTPDetails   int64
-	droppedTCPDetails    int64
-	lastDetailFlushedAt  time.Time
+	sql                   *sql.DB
+	dialect               Dialect
+	clientAuthNonceLayout clientAuthNonceLayout
+	detailStore           trafficDetailBackend
+	tcpCursorMu           sync.Mutex
+	tcpCursors            map[string]*tcpStreamCursor
+	detailMu              sync.Mutex
+	detailDecisions       map[string]detailCaptureDecision
+	pendingHTTPExchanges  []HTTPExchangeRecord
+	pendingTCPFrames      []TCPFrameRecord
+	detailMaxPending      int
+	detailFlushBatchSize  int
+	droppedHTTPDetails    int64
+	droppedTCPDetails     int64
+	lastDetailFlushedAt   time.Time
 }
 
 type trafficDetailBackend interface {
@@ -129,6 +138,29 @@ func (db *DB) migrate() error {
 	if err := db.ensureCompatibleColumns(); err != nil {
 		return err
 	}
+	if err := db.detectClientAuthNonceLayout(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *DB) detectClientAuthNonceLayout() error {
+	hasID, err := db.columnExists("tunnel_client_auth_nonce", "id")
+	if err != nil {
+		return fmt.Errorf("inspect Java client nonce schema: %w", err)
+	}
+	if hasID {
+		db.clientAuthNonceLayout = clientAuthNonceLayoutJavaID
+		return nil
+	}
+	hasNonceHash, err := db.columnExists("tunnel_client_auth_nonce", "nonce_hash")
+	if err != nil {
+		return fmt.Errorf("inspect client nonce schema: %w", err)
+	}
+	if !hasNonceHash {
+		return fmt.Errorf("unsupported tunnel_client_auth_nonce schema: expected id or nonce_hash")
+	}
+	db.clientAuthNonceLayout = clientAuthNonceLayoutComposite
 	return nil
 }
 

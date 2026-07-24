@@ -2,13 +2,126 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestClientAuthNonceSupportsLegacyJavaSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-java-nonce.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE tunnel_client_auth_nonce (
+		id TEXT PRIMARY KEY,
+		api_key_hash TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	)`)
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prepare Java nonce schema: %v", err)
+	}
+
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open Java nonce schema: %v", err)
+	}
+	defer db.Close()
+	if db.clientAuthNonceLayout != clientAuthNonceLayoutJavaID {
+		t.Fatalf("nonce layout = %d, want Java ID", db.clientAuthNonceLayout)
+	}
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC)
+	const apiKeyHash = "api-key-hash"
+	const nonce = "client-nonce"
+	consumed, err := db.ConsumeClientAuthNonce(ctx, apiKeyHash, nonce, now, now.Add(2*time.Minute))
+	if err != nil || !consumed {
+		t.Fatalf("first Java nonce consume: consumed=%v err=%v", consumed, err)
+	}
+	consumed, err = db.ConsumeClientAuthNonce(ctx, apiKeyHash, nonce, now, now.Add(2*time.Minute))
+	if err != nil || consumed {
+		t.Fatalf("duplicate Java nonce consume: consumed=%v err=%v", consumed, err)
+	}
+
+	digest := sha256.Sum256([]byte(apiKeyHash + "\n" + nonce))
+	expectedID := hex.EncodeToString(digest[:])
+	var storedID string
+	if err := db.sql.QueryRow(`SELECT id FROM tunnel_client_auth_nonce WHERE api_key_hash = ?`,
+		apiKeyHash).Scan(&storedID); err != nil {
+		t.Fatalf("read Java nonce id: %v", err)
+	}
+	if storedID != expectedID {
+		t.Fatalf("Java nonce id = %q, want %q", storedID, expectedID)
+	}
+}
+
+func TestFreshSchemaUsesJavaClientAuthNonceLayout(t *testing.T) {
+	db, err := Open("sqlite", filepath.Join(t.TempDir(), "fresh-nonce.db"))
+	if err != nil {
+		t.Fatalf("open fresh nonce schema: %v", err)
+	}
+	defer db.Close()
+	if db.clientAuthNonceLayout != clientAuthNonceLayoutJavaID {
+		t.Fatalf("nonce layout = %d, want Java ID", db.clientAuthNonceLayout)
+	}
+
+	ctx := context.Background()
+	now := time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC)
+	consumed, err := db.ConsumeClientAuthNonce(ctx, "api-key-hash", "client-nonce", now, now.Add(2*time.Minute))
+	if err != nil || !consumed {
+		t.Fatalf("first fresh nonce consume: consumed=%v err=%v", consumed, err)
+	}
+	consumed, err = db.ConsumeClientAuthNonce(ctx, "api-key-hash", "client-nonce", now, now.Add(2*time.Minute))
+	if err != nil || consumed {
+		t.Fatalf("duplicate fresh nonce consume: consumed=%v err=%v", consumed, err)
+	}
+}
+
+func TestClientAuthNonceStillSupportsLegacyCompositeSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "composite-nonce.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE tunnel_client_auth_nonce (
+		api_key_hash TEXT NOT NULL,
+		nonce_hash TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (api_key_hash, nonce_hash)
+	)`)
+	if closeErr := legacy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prepare composite nonce schema: %v", err)
+	}
+
+	db, err := Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open composite nonce schema: %v", err)
+	}
+	defer db.Close()
+	if db.clientAuthNonceLayout != clientAuthNonceLayoutComposite {
+		t.Fatalf("nonce layout = %d, want composite", db.clientAuthNonceLayout)
+	}
+
+	now := time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC)
+	consumed, err := db.ConsumeClientAuthNonce(context.Background(), "api-key-hash", "client-nonce",
+		now, now.Add(2*time.Minute))
+	if err != nil || !consumed {
+		t.Fatalf("first composite nonce consume: consumed=%v err=%v", consumed, err)
+	}
+}
 
 func TestStartupMigrationAddsPeerMeshACLDirectionWithJavaDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-acl.db")

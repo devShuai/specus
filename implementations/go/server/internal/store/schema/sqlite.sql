@@ -29,14 +29,12 @@ CREATE INDEX IF NOT EXISTS idx_client_credential_tenant ON tunnel_client_credent
 CREATE INDEX IF NOT EXISTS idx_client_credential_owner ON tunnel_client_credential (tenant_id, owner_username);
 
 CREATE TABLE IF NOT EXISTS tunnel_client_auth_nonce (
+  id TEXT PRIMARY KEY,
   api_key_hash TEXT NOT NULL,
-  nonce_hash TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (api_key_hash, nonce_hash)
+  expires_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expiry ON tunnel_client_auth_nonce (expires_at);
+CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expires ON tunnel_client_auth_nonce (expires_at);
 
 CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
   token_hash TEXT PRIMARY KEY,

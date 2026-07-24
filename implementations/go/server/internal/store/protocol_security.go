@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -10,21 +12,45 @@ import (
 )
 
 // ConsumeClientAuthNonce atomically reserves an API-key nonce until expiresAt.
-func (db *DB) ConsumeClientAuthNonce(ctx context.Context, apiKeyHash, nonceHash string, now, expiresAt time.Time) (bool, error) {
+func (db *DB) ConsumeClientAuthNonce(ctx context.Context, apiKeyHash, nonce string, now, expiresAt time.Time) (bool, error) {
 	_, _ = db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_client_auth_nonce WHERE expires_at <= ?`), formatTime(now))
-	_, err := db.sql.ExecContext(ctx, db.rebind(`INSERT INTO tunnel_client_auth_nonce
-		(api_key_hash, nonce_hash, expires_at, created_at) VALUES (?, ?, ?, ?)`),
-		apiKeyHash, nonceHash, formatTime(expiresAt), formatTime(now))
+
+	var insertQuery, lookupQuery string
+	var insertArgs, lookupArgs []any
+	switch db.clientAuthNonceLayout {
+	case clientAuthNonceLayoutJavaID:
+		nonceID := hashClientAuthNonce(apiKeyHash + "\n" + nonce)
+		insertQuery = `INSERT INTO tunnel_client_auth_nonce (id, api_key_hash, expires_at) VALUES (?, ?, ?)`
+		insertArgs = []any{nonceID, apiKeyHash, formatTime(expiresAt)}
+		lookupQuery = `SELECT COUNT(*) FROM tunnel_client_auth_nonce WHERE id = ?`
+		lookupArgs = []any{nonceID}
+	case clientAuthNonceLayoutComposite:
+		nonceHash := hashClientAuthNonce(nonce)
+		insertQuery = `INSERT INTO tunnel_client_auth_nonce
+			(api_key_hash, nonce_hash, expires_at, created_at) VALUES (?, ?, ?, ?)`
+		insertArgs = []any{apiKeyHash, nonceHash, formatTime(expiresAt), formatTime(now)}
+		lookupQuery = `SELECT COUNT(*) FROM tunnel_client_auth_nonce
+			WHERE api_key_hash = ? AND nonce_hash = ?`
+		lookupArgs = []any{apiKeyHash, nonceHash}
+	default:
+		return false, fmt.Errorf("reserve client authentication nonce: database nonce schema is not initialized")
+	}
+
+	_, err := db.sql.ExecContext(ctx, db.rebind(insertQuery), insertArgs...)
 	if err == nil {
 		return true, nil
 	}
 	var count int
-	lookupErr := db.sql.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM tunnel_client_auth_nonce
-		WHERE api_key_hash = ? AND nonce_hash = ?`), apiKeyHash, nonceHash).Scan(&count)
+	lookupErr := db.sql.QueryRowContext(ctx, db.rebind(lookupQuery), lookupArgs...).Scan(&count)
 	if lookupErr == nil && count > 0 {
 		return false, nil
 	}
 	return false, fmt.Errorf("reserve client authentication nonce: %w", err)
+}
+
+func hashClientAuthNonce(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
 }
 
 func (db *DB) InsertWebSocketTicket(ctx context.Context, ticket WebSocketTicket) error {

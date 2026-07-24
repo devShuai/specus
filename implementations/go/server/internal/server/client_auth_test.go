@@ -51,6 +51,41 @@ func TestClientAuthLoginUsesCredentialTenant(t *testing.T) {
 	}
 }
 
+func TestClientAuthDatabaseFailureReturnsInternalServerError(t *testing.T) {
+	app, ts := newAPIServer(t)
+	if err := app.DB().Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"apiKey":    "unavailable-database",
+		"timestamp": strconv.FormatInt(time.Now().UnixMilli(), 10),
+		"nonce":     "nonce",
+		"signature": "signature",
+		"environment": map[string]any{
+			"machineFingerprint": "machine",
+			"osUser":             "user",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post(ts.URL+"/api/client/auth/login", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("client auth login: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", response.StatusCode)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if payload["error"] != "客户端认证暂时不可用" {
+		t.Fatalf("error = %q", payload["error"])
+	}
+}
+
 func TestClientAuthLoginUsesClientAuthTokenTTL(t *testing.T) {
 	cfg := config.Default()
 	cfg.Auth.TokenTTLSeconds = 60

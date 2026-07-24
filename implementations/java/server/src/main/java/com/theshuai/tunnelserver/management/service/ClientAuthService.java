@@ -28,7 +28,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 
@@ -60,6 +62,7 @@ public class ClientAuthService {
     private final ClientAuthProperties properties;
     private final NettyServerProperties nettyProperties;
     private final String publicAddress;
+    private final TransactionTemplate transactionTemplate;
 
     public ClientAuthService(ClientCredentialRepository credentialRepository,
                              ClientIdentityRepository identityRepository,
@@ -72,6 +75,7 @@ public class ClientAuthService {
                              ClientAuthNonceService nonceService,
                              ClientAuthProperties properties,
                              NettyServerProperties nettyProperties,
+                             PlatformTransactionManager transactionManager,
                              @Value("${tunnel.public-address:}") String publicAddress) {
         this.credentialRepository = credentialRepository;
         this.identityRepository = identityRepository;
@@ -84,6 +88,7 @@ public class ClientAuthService {
         this.nonceService = nonceService;
         this.properties = properties;
         this.nettyProperties = nettyProperties;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.publicAddress = StringUtils.hasText(publicAddress) ? publicAddress.trim() : "";
     }
 
@@ -100,14 +105,19 @@ public class ClientAuthService {
         }
     }
 
-    @Transactional
     public ClientAuthLoginResponse login(ClientAuthLoginRequest request, String requestServerName) {
         ClientEnvironmentInfo environment = requireEnvironment(request == null ? null : request.getEnvironment());
         ClientCredential credential = authenticateCredential(request);
         if (!credential.isEnabled()) {
             throw new IllegalArgumentException("客户端凭证已停用");
         }
+        return transactionTemplate.execute(status ->
+                completeLogin(credential, environment, requestServerName));
+    }
 
+    private ClientAuthLoginResponse completeLogin(ClientCredential credential,
+                                                  ClientEnvironmentInfo environment,
+                                                  String requestServerName) {
         ClientIdentity identity = findOrCreateIdentity(credential, environment);
         ClientAccount account = clientAccountRepository.findByIdAndTenantId(identity.getClientId(), credential.getTenantId())
                 .orElseThrow(() -> new IllegalStateException("client account missing: " + identity.getClientId()));
