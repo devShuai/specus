@@ -8,6 +8,7 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Pagination,
   Switch,
   Table,
   TableBody,
@@ -21,10 +22,43 @@ import {
 import { adminApi } from "../../api/client";
 import type { Client, ClientCredential } from "../../api/types";
 import { formatBytes, formatDateTime, formatSince } from "../../lib/format";
+import { copyTextWithFeedback } from "../../lib/clipboard";
 import { notify, notifyError } from "../../components/toast";
 import { useNowTick } from "../../hooks/useNowTick";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { ClientDetailDrawer } from "../../components/ClientDetailDrawer";
+import { ConfirmModal } from "../../components/ConfirmModal";
+import { EmptyState } from "../../components/EmptyState";
+import { StatusChip, enabledTone, onlineTone } from "../../components/StatusChip";
+
+const PAGE_SIZE = 10;
+
+/** 在线时长自 tick 的小组件，避免整表每秒重挂载。 */
+function SinceText({ sinceMs }: { sinceMs: number }) {
+  const now = useNowTick(1000);
+  return <>{formatSince(sinceMs, now)}</>;
+}
+
+interface ConfirmState {
+  title: string;
+  description?: string;
+  confirmLabel?: string;
+  action: () => Promise<void>;
+}
+
+/** 本地分页：返回当前页切片与分页器（单页时不渲染分页器）。 */
+function useLocalPagination<T>(items: T[], pageSize = PAGE_SIZE) {
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const paged = items.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pager = totalPages > 1 ? (
+    <div className="flex justify-end">
+      <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
+    </div>
+  ) : null;
+  return { paged, pager };
+}
 
 export function ClientsPanel() {
   const [clients, setClients] = useState<Client[]>([]);
@@ -42,8 +76,7 @@ export function ClientsPanel() {
   const credentialModal = useDisclosure();
   const secretModal = useDisclosure();
   const [detailClient, setDetailClient] = useState<Client | null>(null);
-  const now = useNowTick(1000);
-  const durationTick = Math.floor(now / 1000);
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
 
   const loadClients = useCallback(async () => {
     setLoadingClients(true);
@@ -83,14 +116,25 @@ export function ClientsPanel() {
     secretModal.onOpen();
   };
 
+  const maxOnlineNumber = Number(maxOnline);
+  const maxOnlineError = !maxOnline.trim()
+    ? "请输入在线实例上限"
+    : !Number.isInteger(maxOnlineNumber) || maxOnlineNumber < 1 || maxOnlineNumber > 10000
+      ? "请输入 1-10000 的整数"
+      : "";
+
   const createCredential = async (event: FormEvent) => {
     event.preventDefault();
+    if (maxOnlineError) {
+      notify(maxOnlineError, "error");
+      return;
+    }
     setCreating(true);
     try {
       const result = await adminApi.createClientCredential({
         apiKey: apiKey.trim() || undefined,
         secret: secret.trim() || null,
-        maxOnlineInstances: Number(maxOnline) || 2,
+        maxOnlineInstances: maxOnlineNumber,
         enabled: true,
       });
       setApiKey("");
@@ -126,42 +170,54 @@ export function ClientsPanel() {
     }
   };
 
-  const removeClient = async (client: Client) => {
-    if (!window.confirm(`确定删除客户端实例「${client.clientName}」吗？历史连接和流量记录会保留。`)) {
-      return;
-    }
-    try {
-      await adminApi.deleteClient(client.id);
-      notify("客户端实例已删除");
-      await loadClients();
-    } catch (error) {
-      notifyError(error, "删除失败");
-    }
+  const removeClient = (client: Client) => {
+    setConfirm({
+      title: "删除客户端实例",
+      description: `确定删除客户端实例「${client.clientName}」吗？历史连接和流量记录会保留。`,
+      confirmLabel: "删除",
+      action: async () => {
+        try {
+          await adminApi.deleteClient(client.id);
+          notify("客户端实例已删除");
+          await loadClients();
+        } catch (error) {
+          notifyError(error, "删除失败");
+        }
+      },
+    });
   };
 
-  const removeCredential = async (credential: ClientCredential) => {
-    if (!window.confirm(`确定删除接入凭证「${credential.apiKey}」吗？使用它的客户端将无法继续登录。`)) {
-      return;
-    }
-    try {
-      await adminApi.deleteClientCredential(credential.id);
-      notify("接入凭证已删除");
-      await loadCredentials();
-    } catch (error) {
-      notifyError(error, "删除失败");
-    }
+  const removeCredential = (credential: ClientCredential) => {
+    setConfirm({
+      title: "删除接入凭证",
+      description: `确定删除接入凭证「${credential.apiKey}」吗？使用它的客户端将无法继续登录。`,
+      confirmLabel: "删除",
+      action: async () => {
+        try {
+          await adminApi.deleteClientCredential(credential.id);
+          notify("接入凭证已删除");
+          await loadCredentials();
+        } catch (error) {
+          notifyError(error, "删除失败");
+        }
+      },
+    });
   };
 
   const statusChip = (client: Client) => {
-    const since = client.online && client.connectedSinceMs ? formatSince(client.connectedSinceMs, now) : "";
-    const text = `${client.online ? "在线" : "离线"} / ${client.enabled ? "启用" : "停用"}${since ? ` · ${since}` : ""}`;
     const tooltip = client.online && client.connectedSinceMs
       ? `登录于 ${formatDateTime(new Date(client.connectedSinceMs).toISOString())}`
       : undefined;
     const chip = (
-      <Chip size="sm" color={client.online ? "success" : "default"} variant="flat">
-        {text}
-      </Chip>
+      <StatusChip tone={onlineTone(client.online, !client.enabled)}>
+        {!client.enabled ? "停用" : client.online ? "在线" : "离线"}
+        {client.online && client.connectedSinceMs ? (
+          <>
+            {" · "}
+            <SinceText sinceMs={client.connectedSinceMs} />
+          </>
+        ) : null}
+      </StatusChip>
     );
     return tooltip ? <Tooltip content={tooltip}>{chip}</Tooltip> : chip;
   };
@@ -180,6 +236,9 @@ export function ClientsPanel() {
     </Tooltip>
   );
 
+  const credentialPagination = useLocalPagination(credentials);
+  const clientPagination = useLocalPagination(clients);
+
   return (
     <div className="mt-3 flex min-w-0 flex-col gap-5">
       <section className="min-w-0 space-y-3">
@@ -188,7 +247,7 @@ export function ClientsPanel() {
             <h2 className="text-lg font-semibold text-foreground">接入凭证</h2>
             <p className="text-small text-default-500">客户端启动只需要 serverBaseUrl、apiKey 和 secret；名称首次连接时自动生成，之后可在实例列表中修改。</p>
           </div>
-          <Button className="w-full sm:w-auto" variant="flat" onPress={() => void load()}>
+          <Button className="w-full sm:w-auto" variant="flat" isLoading={loadingClients || loadingCredentials} onPress={() => void load()}>
             刷新
           </Button>
         </div>
@@ -196,7 +255,17 @@ export function ClientsPanel() {
         <form className="flex flex-wrap items-end gap-3" onSubmit={createCredential}>
           <Input className="w-full sm:w-64" label="apiKey" placeholder="留空自动生成" value={apiKey} onValueChange={setApiKey} />
           <Input className="w-full sm:w-56" label="secret" placeholder="留空自动生成" value={secret} onValueChange={setSecret} />
-          <Input className="w-full sm:w-44" type="number" label="在线实例上限" min={1} max={10000} value={maxOnline} onValueChange={setMaxOnline} />
+          <Input
+            className="w-full sm:w-44"
+            type="number"
+            label="在线实例上限"
+            min={1}
+            max={10000}
+            value={maxOnline}
+            onValueChange={setMaxOnline}
+            isInvalid={Boolean(maxOnlineError)}
+            errorMessage={maxOnlineError}
+          />
           <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
             新建接入凭证
           </Button>
@@ -205,9 +274,9 @@ export function ClientsPanel() {
         {/* mobile: 卡片 */}
         <div className="lg:hidden">
           <MobileListCardList
-            items={credentials}
+            items={credentialPagination.paged}
             isLoading={loadingCredentials}
-            emptyContent="暂无接入凭证"
+            emptyContent={<EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />}
             renderCard={(raw) => {
               const credential = raw as ClientCredential;
               return (
@@ -216,9 +285,9 @@ export function ClientsPanel() {
                   title={<span className="break-all font-mono">{credential.apiKey}</span>}
                   subtitle={`${credential.ownerUsername || "-"} · #${credential.id}`}
                   badges={
-                    <Chip size="sm" variant="flat" color={credential.enabled ? "success" : "default"}>
+                    <StatusChip tone={enabledTone(credential.enabled)}>
                       {credential.enabled ? "启用" : "停用"}
-                    </Chip>
+                    </StatusChip>
                   }
                   fields={[
                     { label: "实例上限", value: credential.maxOnlineInstances },
@@ -252,16 +321,16 @@ export function ClientsPanel() {
             <TableColumn>创建时间</TableColumn>
             <TableColumn>操作</TableColumn>
           </TableHeader>
-          <TableBody items={credentials} isLoading={loadingCredentials} emptyContent="暂无接入凭证">
+          <TableBody items={credentialPagination.paged} isLoading={loadingCredentials} emptyContent={<EmptyState icon="clients" title="暂无接入凭证" description="创建凭证后客户端即可接入" />}>
             {(credential) => (
               <TableRow key={credential.id}>
                 <TableCell>{credential.id}</TableCell>
                 <TableCell className="font-mono">{credential.apiKey}</TableCell>
                 <TableCell>{credential.ownerUsername || "-"}</TableCell>
                 <TableCell>
-                  <Chip size="sm" color={credential.enabled ? "success" : "default"} variant="flat">
+                  <StatusChip tone={enabledTone(credential.enabled)}>
                     {credential.enabled ? "启用" : "停用"}
-                  </Chip>
+                  </StatusChip>
                 </TableCell>
                 <TableCell>{credential.maxOnlineInstances}</TableCell>
                 <TableCell>{formatDateTime(credential.createdAt)}</TableCell>
@@ -270,7 +339,7 @@ export function ClientsPanel() {
                     <Button size="sm" variant="flat" onPress={() => openCredentialEdit(credential)}>
                       编辑
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => void removeCredential(credential)}>
+                    <Button size="sm" color="danger" variant="flat" onPress={() => removeCredential(credential)}>
                       删除
                     </Button>
                   </div>
@@ -280,6 +349,7 @@ export function ClientsPanel() {
           </TableBody>
         </Table>
         </div>
+        {credentialPagination.pager}
       </section>
 
       <section className="min-w-0 space-y-3">
@@ -291,9 +361,9 @@ export function ClientsPanel() {
         {/* mobile: 卡片 */}
         <div className="lg:hidden">
           <MobileListCardList
-            items={clients}
+            items={clientPagination.paged}
             isLoading={loadingClients}
-            emptyContent="暂无客户端实例"
+            emptyContent={<EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />}
             renderCard={(raw) => {
               const client = raw as Client;
               return (
@@ -311,13 +381,16 @@ export function ClientsPanel() {
                   ]}
                   actions={
                     <>
+                      <Button size="sm" variant="flat" onPress={() => setDetailClient(client)}>
+                        详情
+                      </Button>
                       <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
                         编辑
                       </Button>
                       <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
                         下发映射
                       </Button>
-                      <Button size="sm" color="danger" variant="flat" onPress={() => void removeClient(client)}>
+                      <Button size="sm" color="danger" variant="flat" onPress={() => removeClient(client)}>
                         删除
                       </Button>
                     </>
@@ -330,7 +403,7 @@ export function ClientsPanel() {
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table key={`clients-${durationTick}`} aria-label="客户端实例列表" isHeaderSticky removeWrapper>
+        <Table aria-label="客户端实例列表" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>ID</TableColumn>
             <TableColumn>客户端</TableColumn>
@@ -343,7 +416,7 @@ export function ClientsPanel() {
             <TableColumn>创建时间</TableColumn>
             <TableColumn>操作</TableColumn>
           </TableHeader>
-          <TableBody items={clients} isLoading={loadingClients} emptyContent="暂无客户端实例">
+          <TableBody items={clientPagination.paged} isLoading={loadingClients} emptyContent={<EmptyState icon="clients" title="暂无客户端实例" description="客户端首次登录后自动注册" />}>
             {(client) => (
               <TableRow key={client.id}>
                 <TableCell>{client.id}</TableCell>
@@ -357,13 +430,16 @@ export function ClientsPanel() {
                 <TableCell>{formatDateTime(client.createdAt)}</TableCell>
                 <TableCell>
                   <div className="flex gap-2">
+                    <Button size="sm" variant="flat" onPress={() => setDetailClient(client)}>
+                      详情
+                    </Button>
                     <Button size="sm" variant="flat" onPress={() => openClientEdit(client)}>
                       编辑
                     </Button>
                     <Button size="sm" variant="flat" onPress={() => void pushNat(client)}>
                       下发映射
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => void removeClient(client)}>
+                    <Button size="sm" color="danger" variant="flat" onPress={() => removeClient(client)}>
                       删除
                     </Button>
                   </div>
@@ -373,6 +449,7 @@ export function ClientsPanel() {
           </TableBody>
         </Table>
         </div>
+        {clientPagination.pager}
       </section>
 
       <EditCredentialModal disclosure={credentialModal} credential={editingCredential} onSaved={(value) => {
@@ -388,15 +465,12 @@ export function ClientsPanel() {
             <>
               <ModalHeader>客户端 secret（仅显示一次）</ModalHeader>
               <ModalBody>
-                <Input value={revealedSecret} isReadOnly />
+                <Input value={revealedSecret} isReadOnly onFocus={(event) => event.target.select()} />
               </ModalBody>
               <ModalFooter>
                 <Button
                   variant="flat"
-                  onPress={() => {
-                    void navigator.clipboard?.writeText(revealedSecret);
-                    notify("已复制");
-                  }}
+                  onPress={() => void copyTextWithFeedback(revealedSecret)}
                 >
                   复制
                 </Button>
@@ -409,6 +483,15 @@ export function ClientsPanel() {
         </ModalContent>
       </Modal>
       <ClientDetailDrawer client={detailClient} open={detailClient != null} onClose={() => setDetailClient(null)} />
+      <ConfirmModal
+        isOpen={confirm != null}
+        onClose={() => setConfirm(null)}
+        onConfirm={() => confirm?.action()}
+        title={confirm?.title ?? ""}
+        description={confirm?.description}
+        confirmLabel={confirm?.confirmLabel}
+        danger
+      />
     </div>
   );
 }
@@ -435,8 +518,15 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
     }
   }, [credential]);
 
+  const maxOnlineNumber = Number(maxOnline);
+  const maxOnlineError = !maxOnline.trim()
+    ? "请输入在线实例上限"
+    : !Number.isInteger(maxOnlineNumber) || maxOnlineNumber < 1 || maxOnlineNumber > 10000
+      ? "请输入 1-10000 的整数"
+      : "";
+
   const save = async () => {
-    if (!credential) {
+    if (!credential || maxOnlineError) {
       return;
     }
     setSaving(true);
@@ -445,7 +535,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
         apiKey: apiKey.trim(),
         secret: secret.trim() || null,
         enabled,
-        maxOnlineInstances: Number(maxOnline) || 2,
+        maxOnlineInstances: maxOnlineNumber,
       });
       notify("接入凭证已更新");
       disclosure.onClose();
@@ -466,7 +556,16 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
             <ModalBody className="gap-3">
               <Input label="apiKey" value={apiKey} onValueChange={setApiKey} isRequired />
               <Input label="secret" placeholder="留空保留原 secret" value={secret} onValueChange={setSecret} />
-              <Input type="number" label="在线实例上限" min={1} max={10000} value={maxOnline} onValueChange={setMaxOnline} />
+              <Input
+                type="number"
+                label="在线实例上限"
+                min={1}
+                max={10000}
+                value={maxOnline}
+                onValueChange={setMaxOnline}
+                isInvalid={Boolean(maxOnlineError)}
+                errorMessage={maxOnlineError}
+              />
               <Switch isSelected={enabled} onValueChange={setEnabled}>
                 启用
               </Switch>
@@ -475,7 +574,7 @@ function EditCredentialModal({ disclosure, credential, onSaved }: EditCredential
               <Button variant="flat" onPress={onClose}>
                 取消
               </Button>
-              <Button color="primary" isLoading={saving} onPress={() => void save()}>
+              <Button color="primary" isDisabled={Boolean(maxOnlineError)} isLoading={saving} onPress={() => void save()}>
                 保存
               </Button>
             </ModalFooter>
@@ -549,8 +648,15 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
     };
   }, [client, localNameError, normalizedClientName]);
 
+  const rateNumber = Number(rate);
+  const rateError = !rate.trim()
+    ? "请输入每分钟连接上限"
+    : !Number.isInteger(rateNumber) || rateNumber < 0 || rateNumber > 10000
+      ? "请输入 0-10000 的整数（0 = 不限）"
+      : "";
+
   const save = async () => {
-    if (!client || localNameError) {
+    if (!client || localNameError || rateError) {
       return;
     }
     setSaving(true);
@@ -564,7 +670,7 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
       await adminApi.updateClient(client.id, {
         clientName: normalizedClientName,
         enabled,
-        connectionRateLimitPerMinute: Number(rate) || 0,
+        connectionRateLimitPerMinute: rateNumber,
       });
       notify(renamed ? "客户端名称已更新，在线实例将自动重连" : "客户端实例已更新");
       disclosure.onClose();
@@ -604,6 +710,8 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
                 onValueChange={setRate}
                 min={0}
                 max={10000}
+                isInvalid={Boolean(rateError)}
+                errorMessage={rateError}
               />
               <Switch isSelected={enabled} onValueChange={setEnabled}>
                 启用
@@ -615,7 +723,7 @@ function EditClientModal({ disclosure, client, onSaved }: EditClientModalProps) 
               </Button>
               <Button
                 color="primary"
-                isDisabled={Boolean(localNameError) || nameStatus === "checking" || nameStatus === "unavailable"}
+                isDisabled={Boolean(localNameError) || Boolean(rateError) || nameStatus === "checking" || nameStatus === "unavailable"}
                 isLoading={saving}
                 onPress={() => void save()}
               >

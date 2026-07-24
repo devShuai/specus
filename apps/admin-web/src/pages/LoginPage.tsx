@@ -410,6 +410,7 @@ function MobileTopologyDiagram() {
   return (
     <div
       className="topology-mobile sm:hidden"
+      role="img"
       aria-label="组网形态移动端动画：公网用户经 Server 中继到客户端 A 内网服务，客户端 A 与客户端 B 之间走对端直连或 TURN 回退"
     >
       <div className="topology-mobile-section topology-mobile-section-relay">

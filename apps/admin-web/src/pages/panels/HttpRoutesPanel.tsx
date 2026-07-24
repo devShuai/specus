@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   Button,
-  Chip,
   Dropdown,
   DropdownItem,
   DropdownMenu,
@@ -12,6 +11,7 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Pagination,
   Select,
   SelectItem,
   Switch,
@@ -26,9 +26,14 @@ import {
 import { adminApi } from "../../api/client";
 import type { HttpRoute } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
+import { copyTextWithFeedback } from "../../lib/clipboard";
 import { notify, notifyError } from "../../components/toast";
 import { useClients } from "../../hooks/useClients";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import { ConfirmModal } from "../../components/ConfirmModal";
+import { EmptyState } from "../../components/EmptyState";
+
+const PAGE_SIZE = 10;
 
 export function HttpRoutesPanel() {
   const { clients } = useClients();
@@ -41,6 +46,9 @@ export function HttpRoutesPanel() {
   const [lastCreatedAccessUrl, setLastCreatedAccessUrl] = useState("");
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<HttpRoute | null>(null);
+  const [pendingIds, setPendingIds] = useState<Set<number>>(new Set());
+  const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => Promise<void> } | null>(null);
+  const [page, setPage] = useState(1);
   const editModal = useDisclosure();
 
   const load = useCallback(async () => {
@@ -85,63 +93,64 @@ export function HttpRoutesPanel() {
     }
   };
 
-  const toggle = async (item: HttpRoute) => {
-    try {
-      await adminApi.updateHttpRoute(item.id, {
-        route: item.route,
-        targetBaseUrl: item.targetBaseUrl,
-        enabled: !item.enabled,
-        detailCaptureEnabled: Boolean(item.detailCaptureEnabled),
-        pathRewriteEnabled: Boolean(item.pathRewriteEnabled),
-      });
-      await load();
-    } catch (error) {
-      notifyError(error, "切换状态失败");
-    }
-  };
-
-  const toggleDetailCapture = async (item: HttpRoute) => {
-    try {
-      await adminApi.updateHttpRoute(item.id, {
-        route: item.route,
-        targetBaseUrl: item.targetBaseUrl,
-        enabled: item.enabled,
-        detailCaptureEnabled: !Boolean(item.detailCaptureEnabled),
-        pathRewriteEnabled: Boolean(item.pathRewriteEnabled),
-      });
-      await load();
-    } catch (error) {
-      notifyError(error, "切换明细采集失败");
-    }
-  };
-
-  const togglePathRewrite = async (item: HttpRoute) => {
-    try {
-      await adminApi.updateHttpRoute(item.id, {
-        route: item.route,
-        targetBaseUrl: item.targetBaseUrl,
-        enabled: item.enabled,
-        detailCaptureEnabled: Boolean(item.detailCaptureEnabled),
-        pathRewriteEnabled: !Boolean(item.pathRewriteEnabled),
-      });
-      await load();
-    } catch (error) {
-      notifyError(error, "切换路径改写失败");
-    }
-  };
-
-  const remove = async (item: HttpRoute) => {
-    if (!window.confirm("确定删除该 HTTP 路由？")) {
+  /** 乐观更新 + 失败回滚；切换期间该行开关禁用，避免整表刷新与连点竞态。 */
+  const patchRoute = async (
+    item: HttpRoute,
+    patch: Partial<Pick<HttpRoute, "enabled" | "detailCaptureEnabled" | "pathRewriteEnabled">>,
+    errorMessage: string,
+  ) => {
+    if (pendingIds.has(item.id)) {
       return;
     }
+    setPendingIds((prev) => new Set(prev).add(item.id));
+    setRoutes((prev) => prev.map((row) => (row.id === item.id ? { ...row, ...patch } : row)));
     try {
-      await adminApi.deleteHttpRoute(item.id);
-      notify("HTTP 路由已删除");
-      await load();
+      await adminApi.updateHttpRoute(item.id, {
+        route: item.route,
+        targetBaseUrl: item.targetBaseUrl,
+        enabled: patch.enabled ?? item.enabled,
+        detailCaptureEnabled: patch.detailCaptureEnabled ?? Boolean(item.detailCaptureEnabled),
+        pathRewriteEnabled: patch.pathRewriteEnabled ?? Boolean(item.pathRewriteEnabled),
+      });
     } catch (error) {
-      notifyError(error, "删除失败");
+      setRoutes((prev) => prev.map((row) => (row.id === item.id ? item : row)));
+      notifyError(error, errorMessage);
+    } finally {
+      setPendingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(item.id);
+        return next;
+      });
     }
   };
+
+  const toggle = (item: HttpRoute) => patchRoute(item, { enabled: !item.enabled }, "切换状态失败");
+
+  const toggleDetailCapture = (item: HttpRoute) =>
+    patchRoute(item, { detailCaptureEnabled: !Boolean(item.detailCaptureEnabled) }, "切换明细采集失败");
+
+  const togglePathRewrite = (item: HttpRoute) =>
+    patchRoute(item, { pathRewriteEnabled: !Boolean(item.pathRewriteEnabled) }, "切换路径改写失败");
+
+  const remove = (item: HttpRoute) => {
+    setConfirm({
+      title: "删除 HTTP 路由",
+      description: `确定删除路由「${item.route}」（${item.clientName}）吗？删除后访问链接立即失效。`,
+      action: async () => {
+        try {
+          await adminApi.deleteHttpRoute(item.id);
+          notify("HTTP 路由已删除");
+          await load();
+        } catch (error) {
+          notifyError(error, "删除失败");
+        }
+      },
+    });
+  };
+
+  const totalPages = Math.max(1, Math.ceil(routes.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pagedRoutes = routes.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-4">
@@ -162,6 +171,9 @@ export function HttpRoutesPanel() {
         <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建路由
         </Button>
+        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
+          刷新
+        </Button>
       </form>
 
       {lastCreatedAccessUrl && (
@@ -178,6 +190,18 @@ export function HttpRoutesPanel() {
           <Button size="sm" variant="flat" onPress={() => void copyAccessUrl(lastCreatedAccessUrl)}>
             复制
           </Button>
+          <Button
+            isIconOnly
+            aria-label="关闭提示"
+            className="h-7 w-7 min-w-7"
+            size="sm"
+            variant="light"
+            onPress={() => setLastCreatedAccessUrl("")}
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 6l12 12M6 18L18 6" />
+            </svg>
+          </Button>
         </div>
       )}
 
@@ -191,7 +215,7 @@ export function HttpRoutesPanel() {
         >
           {(item) => <SelectItem key={item.id}>{item.clientName}</SelectItem>}
         </Select>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
           刷新
         </Button>
       </div>
@@ -199,12 +223,13 @@ export function HttpRoutesPanel() {
       {/* mobile: 卡片堆叠 */}
       <div className="xl:hidden">
         <MobileListCardList
-          items={routes}
+          items={pagedRoutes}
           isLoading={loading}
-          emptyContent="后台尚未维护 HTTP 路由"
+          emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}
           renderCard={(raw) => {
             const item = raw as HttpRoute;
             const accessUrl = httpRouteAccessUrl(item);
+            const pending = pendingIds.has(item.id);
             return (
               <MobileListCard
                 key={item.id}
@@ -222,33 +247,30 @@ export function HttpRoutesPanel() {
                 }
                 badges={
                   <>
-                    <Chip
+                    <Switch
                       size="sm"
-                      variant="flat"
-                      color={item.enabled ? "success" : "warning"}
-                      className="cursor-pointer"
-                      onClick={() => void toggle(item)}
+                      isSelected={item.enabled}
+                      isDisabled={pending}
+                      onValueChange={() => void toggle(item)}
                     >
-                      {item.enabled ? "启用" : "停用"}
-                    </Chip>
-                    <Chip
+                      启用
+                    </Switch>
+                    <Switch
                       size="sm"
-                      variant="flat"
-                      color={item.detailCaptureEnabled ? "primary" : "default"}
-                      className="cursor-pointer"
-                      onClick={() => void toggleDetailCapture(item)}
+                      isSelected={Boolean(item.detailCaptureEnabled)}
+                      isDisabled={pending}
+                      onValueChange={() => void toggleDetailCapture(item)}
                     >
-                      {item.detailCaptureEnabled ? "采集" : "采集关"}
-                    </Chip>
-                    <Chip
+                      明细采集
+                    </Switch>
+                    <Switch
                       size="sm"
-                      variant="flat"
-                      color={item.pathRewriteEnabled ? "secondary" : "default"}
-                      className="cursor-pointer"
-                      onClick={() => void togglePathRewrite(item)}
+                      isSelected={Boolean(item.pathRewriteEnabled)}
+                      isDisabled={pending}
+                      onValueChange={() => void togglePathRewrite(item)}
                     >
-                      {item.pathRewriteEnabled ? "改写开" : "改写关"}
-                    </Chip>
+                      路径改写
+                    </Switch>
                   </>
                 }
                 fields={[
@@ -282,7 +304,7 @@ export function HttpRoutesPanel() {
                     <Button size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
                       编辑
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => void remove(item)}>
+                    <Button size="sm" color="danger" variant="flat" onPress={() => remove(item)}>
                       删除
                     </Button>
                   </>
@@ -302,8 +324,8 @@ export function HttpRoutesPanel() {
           removeWrapper
         >
         <TableHeader>
-          <TableColumn className="w-[8%]">ID</TableColumn>
-          <TableColumn className="w-[13%]">
+          <TableColumn className="w-[6%]">ID</TableColumn>
+          <TableColumn className="w-[12%]">
             <ClientFilterHeader
               clients={clients}
               selectedClientId={filterClientId}
@@ -311,16 +333,18 @@ export function HttpRoutesPanel() {
             />
           </TableColumn>
           <TableColumn className="w-[8%]">路由名</TableColumn>
-          <TableColumn className="w-[17%]">目标地址</TableColumn>
-          <TableColumn className="w-[19%]">访问链接</TableColumn>
-          <TableColumn className="w-[6%]">状态</TableColumn>
-          <TableColumn className="w-[6%]">明细</TableColumn>
-          <TableColumn className="w-[6%]">改写</TableColumn>
+          <TableColumn className="w-[14%]">目标地址</TableColumn>
+          <TableColumn className="w-[16%]">访问链接</TableColumn>
+          <TableColumn className="w-[7%]">启用</TableColumn>
+          <TableColumn className="w-[7%]">明细</TableColumn>
+          <TableColumn className="w-[7%]">改写</TableColumn>
           <TableColumn className="w-[11%]">更新时间</TableColumn>
-          <TableColumn className="w-[6%]">操作</TableColumn>
+          <TableColumn className="w-[12%]">操作</TableColumn>
         </TableHeader>
-        <TableBody items={routes} isLoading={loading} emptyContent="后台尚未维护 HTTP 路由">
-          {(item) => (
+        <TableBody items={pagedRoutes} isLoading={loading} emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}>
+          {(item) => {
+            const pending = pendingIds.has(item.id);
+            return (
             <TableRow key={item.id}>
               <TableCell>
                 <span className="block truncate font-mono text-tiny" title={String(item.id)}>
@@ -346,38 +370,31 @@ export function HttpRoutesPanel() {
                 <HttpRouteAccessLink route={item} />
               </TableCell>
               <TableCell>
-                <Chip
+                <Switch
+                  aria-label="启用"
                   size="sm"
-                  variant="flat"
-                  color={item.enabled ? "success" : "warning"}
-                  className="cursor-pointer"
-                  onClick={() => void toggle(item)}
-                >
-                  {item.enabled ? "启用" : "停用"}
-                </Chip>
+                  isSelected={item.enabled}
+                  isDisabled={pending}
+                  onValueChange={() => void toggle(item)}
+                />
               </TableCell>
               <TableCell>
-                <Chip
+                <Switch
+                  aria-label="明细采集"
                   size="sm"
-                  variant="flat"
-                  color={item.detailCaptureEnabled ? "primary" : "default"}
-                  className="cursor-pointer"
-                  onClick={() => void toggleDetailCapture(item)}
-                >
-                  {item.detailCaptureEnabled ? "采集" : "关闭"}
-                </Chip>
+                  isSelected={Boolean(item.detailCaptureEnabled)}
+                  isDisabled={pending}
+                  onValueChange={() => void toggleDetailCapture(item)}
+                />
               </TableCell>
               <TableCell>
-                <Chip
+                <Switch
+                  aria-label="路径改写"
                   size="sm"
-                  variant="flat"
-                  color={item.pathRewriteEnabled ? "secondary" : "default"}
-                  className="cursor-pointer"
-                  onClick={() => void togglePathRewrite(item)}
-                  title="开启后改写 HTML/CSS/JS 中的绝对路径，使内网应用的资源也能经过隧道"
-                >
-                  {item.pathRewriteEnabled ? "开启" : "关闭"}
-                </Chip>
+                  isSelected={Boolean(item.pathRewriteEnabled)}
+                  isDisabled={pending}
+                  onValueChange={() => void togglePathRewrite(item)}
+                />
               </TableCell>
               <TableCell>
                 <span className="block truncate" title={formatDateTime(item.updatedAt || item.createdAt)}>
@@ -389,18 +406,34 @@ export function HttpRoutesPanel() {
                   <Button className="min-w-0 px-2" size="sm" variant="flat" onPress={() => { setEditing(item); editModal.onOpen(); }}>
                     编辑
                   </Button>
-                  <Button className="min-w-0 px-2" size="sm" color="danger" variant="flat" onPress={() => void remove(item)}>
+                  <Button className="min-w-0 px-2" size="sm" color="danger" variant="flat" onPress={() => remove(item)}>
                     删除
                   </Button>
                 </div>
               </TableCell>
             </TableRow>
-          )}
+            );
+          }}
         </TableBody>
       </Table>
       </div>
 
+      {totalPages > 1 ? (
+        <div className="flex justify-end">
+          <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
+        </div>
+      ) : null}
+
       <EditHttpRouteModal disclosure={editModal} route={editing} onSaved={() => void load()} />
+      <ConfirmModal
+        isOpen={confirm != null}
+        onClose={() => setConfirm(null)}
+        onConfirm={() => confirm?.action()}
+        title={confirm?.title ?? ""}
+        description={confirm?.description}
+        confirmLabel="删除"
+        danger
+      />
     </div>
   );
 }
@@ -495,12 +528,7 @@ function encodeRouteSegment(value: string): string {
 }
 
 async function copyAccessUrl(url: string): Promise<void> {
-  try {
-    await navigator.clipboard?.writeText(url);
-    notify("访问链接已复制");
-  } catch {
-    notify("复制失败", "error");
-  }
+  await copyTextWithFeedback(url, "访问链接已复制");
 }
 
 interface EditHttpRouteModalProps {

@@ -430,14 +430,20 @@ export function SyncedClipboard({
       return;
     }
     event.preventDefault();
+    let filesBlockedByMissingTarget = false;
     if (files.length > 0) {
-      if (!sendClipboardFiles(files) && !text) {
+      if (sendClipboardFiles(files)) {
+        if (!text) {
+          setViewState("ready");
+          setStatusMessage(`已粘贴 ${files.length} 个文件，正在通过文件通道发送。`);
+          return;
+        }
+      } else if (!text) {
         return;
+      } else {
+        filesBlockedByMissingTarget = true;
       }
-    }
-    if (!text) {
-      setViewState("ready");
-      setStatusMessage(`已粘贴 ${files.length} 个文件，正在通过文件通道发送。`);
+    } else if (!text) {
       return;
     }
     const content = classifyClipboardContent(text, html);
@@ -447,6 +453,11 @@ export function SyncedClipboard({
       return;
     }
     addLocalBlock(text, content);
+    if (filesBlockedByMissingTarget) {
+      // 混合粘贴：文件因未选目标被跳过，与文本结果合并成一条提示，避免文件静默丢弃。
+      setViewState("failed");
+      setStatusMessage("剪贴板中的文件未发送：请先从“发送给谁”选择一台设备；文本已保存，选择设备后可同步。");
+    }
   };
 
   const handleManualCopy = (block: ClipboardTextBlock) => {
@@ -514,10 +525,7 @@ export function SyncedClipboard({
   const updateBlockText = (blockId: string, text: string) => {
     const content = classifyClipboardContent(text, "");
     setBlocks((current) => updateClipboardTextBlock(current, blockId, text, content));
-    if (!isClipboardContentWithinLimits(text, "")) {
-      setViewState("failed");
-      setStatusMessage(`文本的 UTF-8 大小超过 ${formatByteCount(CLIPBOARD_TEXT_MAX_UTF8_BYTES)}，请删减后再同步。`);
-    }
+    // 编辑超限只在该内容块内联提示（withinLimits 渲染），不改动全局状态条。
   };
 
   const removeBlock = (block: ClipboardTextBlock) => {

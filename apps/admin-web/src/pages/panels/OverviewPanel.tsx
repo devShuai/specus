@@ -1,10 +1,16 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Button, Card, CardBody, CardHeader, Spinner } from "@heroui/react";
 import { adminApi } from "../../api/client";
 import type { Overview, TrafficUsage } from "../../api/types";
 import { formatBytes } from "../../lib/format";
 import { notifyError } from "../../components/toast";
+import { EmptyState } from "../../components/EmptyState";
+
+/** 全局面指标配色常量：趋势图与占比环保持一致。 */
+const TOTAL_COLOR = "hsl(var(--heroui-primary))";
+const DOWNLOAD_COLOR = "hsl(var(--heroui-secondary))";
+const UPLOAD_COLOR = "hsl(var(--heroui-success))";
 
 interface MetricCard {
   label: string;
@@ -145,8 +151,8 @@ export function OverviewPanel() {
                 primaryText={downloadRate}
                 primaryDetail={formatBytes(overview.downloadBytes)}
                 secondaryDetail={formatBytes(overview.uploadBytes)}
-                primaryColor="hsl(var(--heroui-secondary))"
-                secondaryColor="hsl(var(--heroui-primary))"
+                primaryColor={DOWNLOAD_COLOR}
+                secondaryColor={UPLOAD_COLOR}
               />
             </ChartPanel>
           </div>
@@ -180,14 +186,38 @@ function ChartPanel({
   );
 }
 
+/** 监听容器宽度，小屏时切换紧凑 viewBox，保证刻度字号可读。 */
+function useContainerWidth() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) {
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      setWidth(entries[0]?.contentRect.width ?? 0);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  return [ref, width] as const;
+}
+
 function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
+  const [containerRef, containerWidth] = useContainerWidth();
+  const compact = containerWidth > 0 && containerWidth < 520;
+
   if (days.length === 0) {
     return <EmptyChart message="暂无流量数据" />;
   }
 
-  const width = 640;
+  // 小屏收窄 viewBox 并放大字号：360px 手机上刻度不再被等比缩到不可读。
+  const width = compact ? 420 : 640;
   const height = 240;
-  const padding = { top: 16, right: 18, bottom: 36, left: 58 };
+  const padding = { top: 16, right: compact ? 12 : 18, bottom: 36, left: compact ? 50 : 58 };
+  const tickFontSize = compact ? 13 : 11;
+  const xLabelEvery = compact && days.length > 5 ? 2 : 1;
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
   const maxValue = Math.max(...days.map((day) => day.totalBytes), 1);
@@ -203,12 +233,12 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
   const gridValues = [0.25, 0.5, 0.75, 1];
 
   return (
-    <div className="flex flex-col gap-3">
+    <div ref={containerRef} className="flex flex-col gap-3">
       <svg aria-label="近日日流量趋势" className="h-64 w-full" role="img" viewBox={`0 0 ${width} ${height}`}>
         <defs>
           <linearGradient id="traffic-area" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="hsl(var(--heroui-primary))" stopOpacity="0.22" />
-            <stop offset="100%" stopColor="hsl(var(--heroui-primary))" stopOpacity="0.02" />
+            <stop offset="0%" stopColor={TOTAL_COLOR} stopOpacity="0.22" />
+            <stop offset="100%" stopColor={TOTAL_COLOR} stopOpacity="0.02" />
           </linearGradient>
         </defs>
         {gridValues.map((ratio) => {
@@ -225,7 +255,7 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
               />
               <text
                 fill="hsl(var(--heroui-default-500))"
-                fontSize="11"
+                fontSize={tickFontSize}
                 textAnchor="end"
                 x={padding.left - 8}
                 y={lineY + 4}
@@ -236,28 +266,30 @@ function TrafficTrendChart({ days }: { days: TrafficDay[] }) {
           );
         })}
         <path d={areaPath} fill="url(#traffic-area)" />
-        <polyline fill="none" points={totalPoints} stroke="hsl(var(--heroui-primary))" strokeWidth="3" />
-        <polyline fill="none" points={downloadPoints} stroke="hsl(var(--heroui-secondary))" strokeWidth="2" />
-        <polyline fill="none" points={uploadPoints} stroke="hsl(var(--heroui-success))" strokeWidth="2" />
+        <polyline fill="none" points={totalPoints} stroke={TOTAL_COLOR} strokeWidth="3" />
+        <polyline fill="none" points={downloadPoints} stroke={DOWNLOAD_COLOR} strokeWidth="2" />
+        <polyline fill="none" points={uploadPoints} stroke={UPLOAD_COLOR} strokeWidth="2" />
         {days.map((day, index) => (
           <g key={day.date}>
-            <circle cx={x(index)} cy={y(day.totalBytes)} fill="hsl(var(--heroui-primary))" r="4" />
-            <text
-              fill="hsl(var(--heroui-default-500))"
-              fontSize="11"
-              textAnchor="middle"
-              x={x(index)}
-              y={height - 12}
-            >
-              {shortDate(day.date)}
-            </text>
+            <circle cx={x(index)} cy={y(day.totalBytes)} fill={TOTAL_COLOR} r="4" />
+            {index % xLabelEvery === 0 ? (
+              <text
+                fill="hsl(var(--heroui-default-500))"
+                fontSize={tickFontSize}
+                textAnchor="middle"
+                x={x(index)}
+                y={height - 12}
+              >
+                {shortDate(day.date)}
+              </text>
+            ) : null}
           </g>
         ))}
       </svg>
       <div className="flex flex-wrap gap-3 text-tiny text-default-500">
-        <Legend color="hsl(var(--heroui-primary))" label="总量" />
-        <Legend color="hsl(var(--heroui-secondary))" label="下载" />
-        <Legend color="hsl(var(--heroui-success))" label="上传" />
+        <Legend color={TOTAL_COLOR} label="总量" />
+        <Legend color={DOWNLOAD_COLOR} label="下载" />
+        <Legend color={UPLOAD_COLOR} label="上传" />
       </div>
     </div>
   );
@@ -365,11 +397,7 @@ function ClientTrafficBars({ items }: { items: ClientTraffic[] }) {
 }
 
 function EmptyChart({ message }: { message: string }) {
-  return (
-    <div className="flex min-h-40 items-center justify-center rounded-small bg-default-50 text-small text-default-400">
-      {message}
-    </div>
-  );
+  return <EmptyState className="min-h-40 py-8" icon="traffic" title={message} />;
 }
 
 function Legend({ color, label }: { color: string; label: string }) {

@@ -14,6 +14,7 @@ import {
   Popover,
   PopoverContent,
   PopoverTrigger,
+  Switch,
   Tab,
   Table,
   TableBody,
@@ -40,6 +41,7 @@ import { notifyError } from "../../components/toast";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import {
   aggregateResources,
+  formatElapsedMs,
   HTTP_EXCHANGE_PAGE_SIZE,
   HTTP_RESPONSE_BODY_TYPES,
   HTTP_SEARCH_FIELDS,
@@ -107,13 +109,18 @@ export function TrafficPanel() {
   const [tcpFrameDetailLoadingId, setTcpFrameDetailLoadingId] = useState<string | null>(null);
   const [tcpStreamLoadingChannel, setTcpStreamLoadingChannel] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const [trafficView, setTrafficView] = useState<TrafficViewKey>("client");
   const [inspectionStatus, setInspectionStatus] = useState<TrafficInspectionStatus | null>(null);
   const httpExchangeRequestId = useRef(0);
   const tcpFrameRequestId = useRef(0);
 
-  const loadTraffic = useCallback(async () => {
-    setLoading(true);
+  const loadTraffic = useCallback(async (background = false) => {
+    // 后台刷新保留旧数据，不再整表变 Spinner。
+    if (!background) {
+      setLoading(true);
+    }
     try {
       const [clients, tcp, http] = await Promise.all([
         adminApi.listTraffic(150),
@@ -126,7 +133,9 @@ export function TrafficPanel() {
     } catch (error) {
       notifyError(error, "加载流量失败");
     } finally {
-      setLoading(false);
+      if (!background) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -138,10 +147,12 @@ export function TrafficPanel() {
     }
   }, []);
 
-  const loadTcpFrames = useCallback(async () => {
+  const loadTcpFrames = useCallback(async (background = false) => {
     const requestId = tcpFrameRequestId.current + 1;
     tcpFrameRequestId.current = requestId;
-    setTcpFrameLoading(true);
+    if (!background) {
+      setTcpFrameLoading(true);
+    }
     try {
       const data = await adminApi.listTcpTrafficFrames({
         page: tcpFramePage,
@@ -164,10 +175,12 @@ export function TrafficPanel() {
     }
   }, [tcpFramePage]);
 
-  const loadHttpExchanges = useCallback(async () => {
+  const loadHttpExchanges = useCallback(async (background = false) => {
     const requestId = httpExchangeRequestId.current + 1;
     httpExchangeRequestId.current = requestId;
-    setHttpExchangeLoading(true);
+    if (!background) {
+      setHttpExchangeLoading(true);
+    }
     try {
       const data = await adminApi.listHttpTrafficExchanges({
         page: httpExchangePage,
@@ -193,12 +206,31 @@ export function TrafficPanel() {
     }
   }, [httpExchangePage, httpResponseType, httpSearch, httpSearchField, httpSearchVersion]);
 
-  const refresh = useCallback(() => {
-    void loadTraffic();
-    void loadTcpFrames();
-    void loadHttpExchanges();
-    void loadInspectionStatus();
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        loadTraffic(true),
+        loadTcpFrames(true),
+        loadHttpExchanges(true),
+        loadInspectionStatus(),
+      ]);
+    } finally {
+      setRefreshing(false);
+    }
   }, [loadTraffic, loadTcpFrames, loadHttpExchanges, loadInspectionStatus]);
+
+  // 可选自动轮询：状态条 + 汇总表每 20s 后台刷新一次。
+  useEffect(() => {
+    if (!autoRefresh) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadTraffic(true);
+      void loadInspectionStatus();
+    }, 20_000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, loadTraffic, loadInspectionStatus]);
 
   useEffect(() => {
     void loadTraffic();
@@ -261,7 +293,7 @@ export function TrafficPanel() {
         return;
       }
       tcpFrameRequestId.current += 1;
-      setTcpFrameRows([]);
+      // 保留旧页数据直到新页返回，避免翻页闪烁。
       setTcpFrameLoading(true);
       setTcpFramePage(nextPage);
     },
@@ -316,22 +348,27 @@ export function TrafficPanel() {
   }, [selectedTcpStream]);
 
   return (
-    <div className="mt-2 flex min-w-0 flex-col gap-2">
-      <div className="flex min-h-10 items-center justify-between gap-3">
-        <div aria-label="流量观测维度" className="flex min-w-0 items-center gap-4 overflow-x-auto sm:gap-6" role="tablist">
+    <div className="mt-4 flex min-w-0 flex-col gap-2">
+      <div className="flex min-h-10 flex-wrap items-center justify-between gap-3">
+        <Tabs
+          aria-label="流量观测维度"
+          classNames={{ base: "min-w-0 max-w-full overflow-x-auto", tabList: "gap-4 sm:gap-6" }}
+          selectedKey={trafficView}
+          variant="underlined"
+          onSelectionChange={(key) => setTrafficView(String(key) as TrafficViewKey)}
+        >
           {TRAFFIC_VIEW_TABS.map((item) => (
-            <TrafficViewTab
-              key={item.key}
-              active={trafficView === item.key}
-              onPress={() => setTrafficView(item.key)}
-            >
-              {item.label}
-            </TrafficViewTab>
+            <Tab key={item.key} title={item.label} />
           ))}
+        </Tabs>
+        <div className="flex shrink-0 items-center gap-3">
+          <Switch aria-label="自动刷新" isSelected={autoRefresh} size="sm" onValueChange={setAutoRefresh}>
+            自动刷新
+          </Switch>
+          <Button className="shrink-0" size="sm" variant="flat" isLoading={refreshing} onPress={() => void refresh()}>
+            刷新
+          </Button>
         </div>
-        <Button className="shrink-0" size="sm" variant="flat" onPress={refresh}>
-          刷新
-        </Button>
       </div>
 
       <TrafficInspectionStatusBar status={inspectionStatus} />
@@ -473,30 +510,6 @@ function ClientTrafficTable({ rows, loading }: { rows: TrafficUsage[]; loading: 
   );
 }
 
-function TrafficViewTab({
-  active,
-  children,
-  onPress,
-}: {
-  active: boolean;
-  children: ReactNode;
-  onPress: () => void;
-}) {
-  return (
-    <button
-      aria-selected={active}
-      className={`relative h-10 shrink-0 px-0 text-small font-medium transition-colors focus-visible:outline-none ${
-        active ? "text-foreground after:absolute after:bottom-0 after:left-0 after:h-0.5 after:w-full after:bg-foreground" : "text-default-500 hover:text-foreground"
-      }`}
-      role="tab"
-      type="button"
-      onClick={onPress}
-    >
-      {children}
-    </button>
-  );
-}
-
 function TrafficInspectionStatusBar({ status }: { status: TrafficInspectionStatus | null }) {
   const pendingTotal = (status?.pendingHttp ?? 0) + (status?.pendingTcp ?? 0);
   const droppedTotal = (status?.droppedHttp ?? 0) + (status?.droppedTcp ?? 0);
@@ -506,7 +519,7 @@ function TrafficInspectionStatusBar({ status }: { status: TrafficInspectionStatu
       <CardBody className="grid gap-2 p-3 md:grid-cols-4">
         <TrafficStatusItem
           label="明细采集"
-          value={status?.enabled ? "全局开启" : "全局关闭"}
+          value={status?.enabled ? "全局开启" : "已关闭"}
           tone={status?.enabled ? "success" : "default"}
           hint="仍需通道级开关开启"
         />
@@ -533,6 +546,17 @@ function TrafficInspectionStatusBar({ status }: { status: TrafficInspectionStatu
   );
 }
 
+function trafficToneLabel(tone: "default" | "success" | "warning" | "danger") {
+  switch (tone) {
+    case "warning":
+      return "注意";
+    case "danger":
+      return "告警";
+    default:
+      return "正常";
+  }
+}
+
 function TrafficStatusItem({
   hint,
   label,
@@ -552,7 +576,7 @@ function TrafficStatusItem({
         <div className="truncate text-tiny text-default-400">{hint}</div>
       </div>
       <Chip color={tone} size="sm" variant="flat">
-        {tone === "default" ? "OK" : tone}
+        {trafficToneLabel(tone)}
       </Chip>
     </div>
   );
@@ -590,6 +614,7 @@ function ResourceTrafficSection({
             <h3 className="text-small font-semibold">资源流量排行</h3>
             <p className="text-tiny text-default-500">
               {type === "TCP_TUNNEL" ? "按公网监听端口聚合" : "按 HTTP 路由名聚合"}
+              {totals.length > 8 ? `，仅展示前 8 个（共 ${totals.length} 个）` : ""}
             </p>
           </div>
           <ResourceBars items={totals.slice(0, 8)} />
@@ -742,7 +767,7 @@ function HttpExchangeTable({
             <h3 className="text-small font-semibold">HTTP 协议记录</h3>
             <p className="text-tiny text-default-500">请求行、响应状态、headers 与 body 预览</p>
           </div>
-          <div className="flex flex-wrap items-end gap-2 xl:hidden" aria-label="HTTP 协议记录筛选">
+          <div className="flex flex-wrap items-end gap-2 lg:hidden" aria-label="HTTP 协议记录筛选">
             <label className="flex min-w-[6.5rem] flex-1 flex-col gap-1 sm:flex-none sm:w-32">
               <span className="text-tiny text-default-500">搜索字段</span>
               <select
@@ -813,7 +838,7 @@ function HttpExchangeTable({
         )}
 
         {/* mobile: HTTP 协议记录卡片 */}
-        <div className="xl:hidden">
+        <div className="lg:hidden">
           <MobileListCardList
             items={tableRows}
             isLoading={loading}
@@ -863,7 +888,7 @@ function HttpExchangeTable({
                         </div>
                       ),
                     },
-                    { label: "耗时", value: `${row.elapsedMs} ms` },
+                    { label: "耗时", value: formatElapsedMs(row.elapsedMs) },
                   ]}
                   actions={
                     <Button size="sm" variant="flat" onPress={() => onOpenDetails(row)}>
@@ -876,7 +901,7 @@ function HttpExchangeTable({
           />
         </div>
 
-        <div className="hidden min-w-0 xl:block">
+        <div className="hidden min-w-0 lg:block">
         <Table
           aria-label="HTTP 协议记录"
           classNames={{ table: "w-full table-fixed", th: "px-2", td: "px-2 align-middle" }}
@@ -968,7 +993,7 @@ function HttpExchangeTable({
                     <span>响应 {formatBytes(row.responseBytes)}</span>
                   </div>
                 </TableCell>
-                <TableCell>{row.elapsedMs} ms</TableCell>
+                <TableCell>{formatElapsedMs(row.elapsedMs)}</TableCell>
                 <TableCell>
                   <Button size="sm" variant="flat" onPress={() => onOpenDetails(row)}>
                     详情
@@ -1018,10 +1043,11 @@ function HttpSearchFilterHeader({
 }) {
   const active = Boolean(activeSearch || activeSearchField !== "summary");
   const label = active ? `请求: ${httpSearchFieldOption(activeSearchField).label}` : "请求";
+  const [popoverOpen, setPopoverOpen] = useState(false);
 
   return (
     <TrafficTableFilterHeader label={label} active={active} title="搜索 HTTP 记录">
-      <Popover placement="bottom-start" shouldBlockScroll={false}>
+      <Popover isOpen={popoverOpen} placement="bottom-start" shouldBlockScroll={false} onOpenChange={setPopoverOpen}>
         <PopoverTrigger>
           <Button
             isIconOnly
@@ -1065,10 +1091,10 @@ function HttpSearchFilterHeader({
               onValueChange={onSearchDraftChange}
             />
             <div className="flex justify-end gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={onResetSearch}>
+              <Button className="h-9" size="sm" variant="flat" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
                 重置
               </Button>
-              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={onSearch}>
+              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={() => { onSearch(); setPopoverOpen(false); }}>
                 应用
               </Button>
             </div>
@@ -1094,10 +1120,11 @@ function HttpResponseTypeFilterHeader({
 }) {
   const active = Boolean(activeResponseType);
   const label = active ? `返回: ${httpResponseTypeOption(activeResponseType).label}` : "返回类型";
+  const [popoverOpen, setPopoverOpen] = useState(false);
 
   return (
     <TrafficTableFilterHeader label={label} active={active} title="筛选返回类型">
-      <Popover placement="bottom-start" shouldBlockScroll={false}>
+      <Popover isOpen={popoverOpen} placement="bottom-start" shouldBlockScroll={false} onOpenChange={setPopoverOpen}>
         <PopoverTrigger>
           <Button
             isIconOnly
@@ -1129,10 +1156,10 @@ function HttpResponseTypeFilterHeader({
               </select>
             </label>
             <div className="flex justify-end gap-2">
-              <Button className="h-9" size="sm" variant="flat" onPress={onResetSearch}>
+              <Button className="h-9" size="sm" variant="flat" onPress={() => { onResetSearch(); setPopoverOpen(false); }}>
                 重置
               </Button>
-              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={onSearch}>
+              <Button className="h-9" color="primary" size="sm" variant="flat" onPress={() => { onSearch(); setPopoverOpen(false); }}>
                 应用
               </Button>
             </div>
@@ -1238,7 +1265,7 @@ function HttpExchangeModal({ row, onClose }: { row: HttpTrafficExchange | null; 
                     label="返回类型"
                     value={httpResponseTypeLabel(row.responseBodyType, row.responseContentType, row.responseBytes)}
                   />
-                  <HttpSummaryTile label="耗时" value={`${row.elapsedMs} ms`} />
+                  <HttpSummaryTile label="耗时" value={formatElapsedMs(row.elapsedMs)} />
                   <HttpSummaryTile label="资源" value={row.resourceName} wrapValue />
                 </div>
 
@@ -2045,16 +2072,6 @@ function TcpFrameTable({
       })),
     [rows, tableScopeKey],
   );
-  const tableCollectionKey = useMemo(() => {
-    const first = rows[0];
-    const last = rows[rows.length - 1];
-    return [
-      tableScopeKey,
-      rows.length,
-      first ? `${first.id}:${first.frameTime}` : "empty",
-      last ? `${last.id}:${last.frameTime}` : "empty",
-    ].join("|");
-  }, [rows, tableScopeKey]);
 
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
@@ -2089,7 +2106,7 @@ function TcpFrameTable({
                   }
                   badges={
                     <Chip
-                      color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "warning"}
+                      color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"}
                       size="sm"
                       variant="flat"
                     >
@@ -2168,7 +2185,7 @@ function TcpFrameTable({
 
         {/* desktop: 表格 */}
         <div className="hidden min-w-0 overflow-x-auto lg:block">
-        <Table key={tableCollectionKey} aria-label="TCP 数据帧" isHeaderSticky removeWrapper>
+        <Table aria-label="TCP 数据帧" isHeaderSticky removeWrapper>
           <TableHeader>
             <TableColumn>时间</TableColumn>
             <TableColumn>方向</TableColumn>
@@ -2180,13 +2197,13 @@ function TcpFrameTable({
             <TableColumn>HEX</TableColumn>
             <TableColumn>解析</TableColumn>
           </TableHeader>
-          <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent="暂无 TCP 数据帧">
+          <TableBody items={tableRows} isLoading={loading} emptyContent="暂无 TCP 数据帧">
             {(row) => (
               <TableRow key={row.tableKey}>
                 <TableCell>{formatDateTime(row.frameTime)}</TableCell>
                 <TableCell>
                   <Chip
-                    color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "warning"}
+                    color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"}
                     size="sm"
                     variant="flat"
                   >
@@ -2283,7 +2300,7 @@ function TcpFrameModal({ row, onClose }: { row: TcpTrafficFrame | null; onClose:
             <>
               <ModalHeader className="flex flex-col gap-2">
                 <div className="flex flex-wrap items-center gap-2">
-                  <Chip color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "warning"} size="sm" variant="flat">
+                  <Chip color={row.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"} size="sm" variant="flat">
                     {directionLabel(row.direction)}
                   </Chip>
                   <span className="font-semibold">TCP 数据帧 #{row.id}</span>
@@ -2457,7 +2474,7 @@ function TcpStreamTimeline({ frames }: { frames: TcpTrafficFrame[] }) {
             <tr key={frame.id} className="border-b border-default-100 last:border-b-0">
               <td className="whitespace-nowrap px-3 py-2 text-tiny">{formatDateTime(frame.frameTime)}</td>
               <td className="px-3 py-2">
-                <Chip color={frame.direction === "PUBLIC_TO_CLIENT" ? "primary" : "warning"} size="sm" variant="flat">
+                <Chip color={frame.direction === "PUBLIC_TO_CLIENT" ? "primary" : "secondary"} size="sm" variant="flat">
                   {directionLabel(frame.direction)}
                 </Chip>
               </td>

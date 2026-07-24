@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button, Card, CardBody, CardHeader, Chip, Spinner } from "@heroui/react";
 import type { ClientDownloadLink, ClientImplementation } from "../../api/types";
 import { fetchPublicClientDownloads } from "../../api/client";
+import { formatDateTime } from "../../lib/format";
 
 const IMPLEMENTATION_LABELS: Record<ClientImplementation, string> = {
   java: "Java 客户端",
@@ -24,11 +25,15 @@ const IMPLEMENTATION_ORDER: ClientImplementation[] = ["java", "go", "csharp"];
 export function ClientDownloadsPanel() {
   const [links, setLinks] = useState<ClientDownloadLink[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       setLinks(await fetchPublicClientDownloads());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "加载下载链接失败");
     } finally {
       setLoading(false);
     }
@@ -55,7 +60,14 @@ export function ClientDownloadsPanel() {
         </Button>
       </div>
 
-      {loading && links.length === 0 ? (
+      {error ? (
+        <div className="flex flex-col items-center gap-3 rounded-md border border-danger-200 bg-danger-50 px-4 py-8 text-center dark:border-danger-400/30 dark:bg-danger-500/10">
+          <p className="text-small text-danger">下载链接加载失败：{error}</p>
+          <Button color="danger" size="sm" variant="flat" isLoading={loading} onPress={() => void load()}>
+            重试
+          </Button>
+        </div>
+      ) : loading && links.length === 0 ? (
         <Spinner className="my-8" label="加载中…" />
       ) : (
         <div className="grid gap-4 lg:grid-cols-3">
@@ -88,7 +100,6 @@ function DownloadCard({ link }: { link: ClientDownloadLink }) {
       className="group block rounded-md border border-default-200 bg-content1 p-3 transition hover:border-primary hover:shadow-sm"
       href={link.downloadUrl}
       rel="noopener noreferrer"
-      target="_blank"
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
@@ -99,13 +110,14 @@ function DownloadCard({ link }: { link: ClientDownloadLink }) {
         </div>
         <span className="shrink-0 text-tiny text-default-400 group-hover:text-primary">↗</span>
       </div>
-      <div className="mt-2 flex flex-wrap gap-1">
+      <div className="mt-2 flex flex-wrap items-center gap-1">
         <Chip size="sm" variant="flat" color="primary">
           {platformLabel(link.platform)}
         </Chip>
         <Chip size="sm" variant="flat">
           {archLabel(link.arch)}
         </Chip>
+        <span className="ml-auto text-tiny text-default-400">更新 {formatDateTime(link.updatedAt)}</span>
       </div>
     </a>
   );

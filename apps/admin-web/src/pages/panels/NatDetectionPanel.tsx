@@ -89,6 +89,20 @@ function activeRfc5780ProbeConfig(
     : null;
 }
 
+function timeoutMsInputValid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const numeric = Number(trimmed);
+  return Number.isFinite(numeric) && numeric >= 3000 && numeric <= 15000;
+}
+
+function formatElapsedMs(ms: number): string {
+  const value = Math.max(0, Math.round(ms));
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${value} ms`;
+}
+
 type BrowserNatKind =
   | "idle"
   | "checking"
@@ -400,6 +414,32 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
     [serversText],
   );
 
+  // 与 run() 相同的数据源：徽章/描述展示与实际检测路径保持一致。
+  const activeProbeConfig = useMemo(
+    () => activeRfc5780ProbeConfig(natProbeConfig, servers.length > 0 ? servers : defaultServers),
+    [natProbeConfig, servers, defaultServers],
+  );
+  // 记录本次检测使用的参数，参数变更后提示结果可能过期。
+  const runParamsRef = useRef<{ serversText: string; timeoutMs: string } | null>(null);
+  const resultStale = result != null
+    && runParamsRef.current != null
+    && (runParamsRef.current.serversText !== serversText || runParamsRef.current.timeoutMs !== timeoutMs);
+
+  const cancel = () => {
+    activeProbeRef.current?.abort();
+    activeProbeRef.current = null;
+    setChecking(false);
+    setResult(null);
+    setProgress({
+      phase: "idle",
+      percent: null,
+      responded: 0,
+      total: servers.length > 0 ? servers.length : defaultServers.length,
+      unattributedMapping: false,
+      label: "已取消检测",
+    });
+  };
+
   const run = async () => {
     if (checking) {
       return;
@@ -410,6 +450,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
       : 7000;
     const selectedServers = servers.length > 0 ? servers : defaultServers;
     const activeProbeConfig = activeRfc5780ProbeConfig(natProbeConfig, selectedServers);
+    runParamsRef.current = { serversText, timeoutMs };
     activeProbeRef.current?.abort();
     const controller = new AbortController();
     activeProbeRef.current = controller;
@@ -585,12 +626,14 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
             checking={checking}
             progress={progress}
             onRun={() => void run()}
+            onCancel={cancel}
             serversText={serversText}
             onServersTextChange={setServersText}
             timeoutMs={timeoutMs}
             onTimeoutChange={setTimeoutMs}
             selfHostedStunServer={selfHostedStunServer}
-            natProbeConfig={natProbeConfig}
+            probeActive={activeProbeConfig != null}
+            resultStale={resultStale}
             onResetServers={() => setServersText(defaultServers.join("\n"))}
           />
 
@@ -605,19 +648,21 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
 
   // 控制台内嵌版（保持简洁，与原有面板风格一致）
   return (
-    <div className="mt-3 flex min-w-0 flex-col gap-4">
+    <div className="mt-4 flex min-w-0 flex-col gap-4">
       <NatHero
         embedded
         result={result}
         checking={checking}
         progress={progress}
         onRun={() => void run()}
+        onCancel={cancel}
         serversText={serversText}
         onServersTextChange={setServersText}
         timeoutMs={timeoutMs}
         onTimeoutChange={setTimeoutMs}
         selfHostedStunServer={selfHostedStunServer}
-        natProbeConfig={natProbeConfig}
+        probeActive={activeProbeConfig != null}
+        resultStale={resultStale}
         onResetServers={() => setServersText(defaultServers.join("\n"))}
       />
       {result && <NatResultDetails result={result} />}
@@ -632,12 +677,16 @@ interface NatHeroProps {
   checking: boolean;
   progress: NatCheckProgress;
   onRun: () => void;
+  onCancel: () => void;
   serversText: string;
   onServersTextChange: (text: string) => void;
   timeoutMs: string;
   onTimeoutChange: (value: string) => void;
   selfHostedStunServer: string;
-  natProbeConfig: PublicNatProbeConfig | null;
+  /** 与 run() 相同的判定：当前服务器列表是否走 RFC 5780 四端点 */
+  probeActive: boolean;
+  /** 检测参数在出结果后被修改，结果可能过期 */
+  resultStale: boolean;
   onResetServers: () => void;
 }
 
@@ -647,12 +696,14 @@ function NatHero({
   checking,
   progress,
   onRun,
+  onCancel,
   serversText,
   onServersTextChange,
   timeoutMs,
   onTimeoutChange,
   selfHostedStunServer,
-  natProbeConfig,
+  probeActive,
+  resultStale,
   onResetServers,
 }: NatHeroProps) {
   const profile = browserNatProfile(checking ? "checking" : result?.kind ?? "idle");
@@ -698,12 +749,17 @@ function NatHero({
               </Chip>
               {result && (
                 <span className="text-tiny text-zinc-600 dark:text-zinc-400">
-                  耗时 {Math.max(0, result.finishedAt - result.startedAt)} ms
+                  耗时 {formatElapsedMs(result.finishedAt - result.startedAt)}
                 </span>
               )}
               <span className="rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium text-zinc-600 dark:text-zinc-300">
-                {rfc5780ProbeEndpoints(natProbeConfig).length === 4 ? "RFC 5780 四端点" : "WebRTC 多 STUN"}
+                {probeActive ? "RFC 5780 四端点" : "WebRTC 多 STUN"}
               </span>
+              {resultStale && (
+                <span className="rounded-md border border-warning-300 bg-warning-50 px-2 py-0.5 text-tiny font-medium text-warning-700 dark:border-warning-400/40 dark:bg-warning-500/10 dark:text-warning-300">
+                  参数已变更，结果可能过期
+                </span>
+              )}
               {result && (
                 <span className="flex items-center gap-1.5 rounded-md glass-chip px-2 py-0.5 text-tiny text-zinc-600 dark:text-zinc-300">
                   <ConfidenceBars confidence={result.confidence} />
@@ -727,6 +783,7 @@ function NatHero({
             result={result}
             progress={progress}
             onRun={onRun}
+            onCancel={onCancel}
           />
         </div>
 
@@ -762,7 +819,7 @@ function NatHero({
               minRows={2}
               value={serversText}
               onValueChange={onServersTextChange}
-              description={rfc5780ProbeEndpoints(natProbeConfig).length === 4
+              description={probeActive
                 ? "默认使用自建 A1/A2、P1/P2 四端点。页面先逐一验证可达性，再用同一 ICE socket 对比映射；不会使用 TURN relay。"
                 : `默认使用 shuai-tunnel 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
             />
@@ -773,6 +830,8 @@ function NatHero({
               radius="sm"
               value={timeoutMs}
               onValueChange={onTimeoutChange}
+              isInvalid={!timeoutMsInputValid(timeoutMs)}
+              errorMessage="请输入 3000–15000 之间的数字"
               endContent={<span className="text-tiny text-default-400">ms</span>}
             />
             <div className="flex justify-end sm:col-span-2">
@@ -882,12 +941,14 @@ function NatDetectionOrb({
   result,
   progress,
   onRun,
+  onCancel,
 }: {
   embedded: boolean;
   checking: boolean;
   result: BrowserNatResult | null;
   progress: NatCheckProgress;
   onRun: () => void;
+  onCancel: () => void;
 }) {
   const radius = 46;
   const circumference = 2 * Math.PI * radius;
@@ -926,16 +987,15 @@ function NatDetectionOrb({
         <span className="nat-orb-halo" style={accentStyle} aria-hidden="true" />
         <button
           type="button"
-          aria-disabled={checking}
           aria-busy={checking}
           aria-describedby={checking ? undefined : privacyId}
-          aria-label={checking ? "正在检测 NAT 类型" : result ? "重新检测 NAT 类型" : "点我检测 NAT 类型"}
+          aria-label={checking ? "取消 NAT 检测" : result ? "重新检测 NAT 类型" : "点我检测 NAT 类型"}
           data-state={state}
-          onClick={onRun}
+          onClick={checking ? onCancel : onRun}
           style={accentStyle}
           className={`nat-detect-orb group relative isolate flex shrink-0 items-center justify-center rounded-full text-center outline-none focus-visible:ring-4 focus-visible:ring-primary-500/30 focus-visible:ring-offset-4 focus-visible:ring-offset-background motion-reduce:transform-none motion-reduce:transition-none ${
             embedded ? "h-28 w-28" : "h-40 w-40"
-          } ${checking ? "cursor-wait" : "cursor-pointer"}`}
+          } cursor-pointer`}
         >
           <span className="nat-orbit-ring" aria-hidden="true" />
           <span className="nat-orbit-ring nat-orbit-ring-alt" aria-hidden="true" />
@@ -988,7 +1048,7 @@ function NatDetectionOrb({
               {checking && determinate ? `${Math.round(ringPercent)}%` : centerText}
             </span>
             <span className="text-[10px] font-medium tracking-wide text-zinc-500 dark:text-zinc-400">
-              {checking ? "STUN 探测" : result ? "更新检测结果" : "浏览器直测"}
+              {checking ? "STUN 探测 · 点击取消" : result ? "更新检测结果" : "浏览器直测"}
             </span>
           </span>
         </button>

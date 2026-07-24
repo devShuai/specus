@@ -29,7 +29,7 @@ export function UserMenuButton({ className }: { className?: string }) {
     >
       {authed ? (
         <>
-          <div className="header-menu-static space-y-0.5">
+          <div className="header-menu-static space-y-0.5" role="presentation" onClick={(event) => event.stopPropagation()}>
             <div className="text-small font-semibold text-foreground">{name}</div>
             <div className="text-tiny text-default-500">{profile?.admin ? "管理员" : "普通用户"} · 已登录</div>
           </div>

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Button, Card, CardBody, CardHeader, Chip, Tab, Tabs } from "@heroui/react";
-import { notify } from "../../components/toast";
+import { copyTextWithFeedback } from "../../lib/clipboard";
 import { NAT_BEHAVIOR_AXES, NAT_TRAVERSAL_REFERENCE } from "../../lib/nat";
 
 const HELP_TABS = [
@@ -68,19 +68,30 @@ export function HelpPanel() {
   const [activeTab, setActiveTab] = useState<HelpTabKey>(() => readHelpTabFromLocation());
 
   useEffect(() => {
+    let rafA = 0;
+    let rafB = 0;
     const sync = () => {
       setActiveTab(readHelpTabFromLocation());
       // 处理 hash 中的二级锚点 #/help/peer-mesh#nat-types
       const sub = window.location.hash.split("#")[2];
       if (sub) {
-        setTimeout(() => {
-          document.getElementById(sub)?.scrollIntoView({ behavior: "smooth", block: "start" });
-        }, 80);
+        // 等 React 提交新 Tab 内容、浏览器完成布局后再滚动，避免魔法延时
+        cancelAnimationFrame(rafA);
+        cancelAnimationFrame(rafB);
+        rafA = requestAnimationFrame(() => {
+          rafB = requestAnimationFrame(() => {
+            document.getElementById(sub)?.scrollIntoView({ behavior: "smooth", block: "start" });
+          });
+        });
       }
     };
     sync();
     window.addEventListener("hashchange", sync);
-    return () => window.removeEventListener("hashchange", sync);
+    return () => {
+      cancelAnimationFrame(rafA);
+      cancelAnimationFrame(rafB);
+      window.removeEventListener("hashchange", sync);
+    };
   }, []);
 
   const onTabChange = (key: string | number) => {
@@ -536,28 +547,23 @@ function Inline({ children }: { children: React.ReactNode }) {
 function CodeBlock({ language, code }: { language: string; code: string }) {
   const [copied, setCopied] = useState(false);
   const onCopy = async () => {
-    try {
-      await navigator.clipboard?.writeText(code);
+    const ok = await copyTextWithFeedback(code, "已复制到剪贴板");
+    if (ok) {
       setCopied(true);
-      notify("已复制到剪贴板");
       setTimeout(() => setCopied(false), 1500);
-    } catch {
-      notify("复制失败", "error");
     }
   };
   return (
-    <div className="relative">
-      <pre className="overflow-x-auto rounded-md border border-default-200 bg-default-50 p-3 text-tiny leading-5">
+    <div className="overflow-hidden rounded-md border border-default-200 bg-default-50">
+      <div className="flex items-center justify-between gap-2 border-b border-default-200 px-3 py-1.5">
+        <span className="text-tiny text-default-400">{language}</span>
+        <Button size="sm" variant="flat" onPress={() => void onCopy()}>
+          {copied ? "已复制" : "复制"}
+        </Button>
+      </div>
+      <pre className="overflow-x-auto p-3 text-tiny leading-5">
         <code className={`language-${language}`}>{code}</code>
       </pre>
-      <Button
-        className="absolute right-2 top-2"
-        size="sm"
-        variant="flat"
-        onPress={() => void onCopy()}
-      >
-        {copied ? "已复制" : "复制"}
-      </Button>
     </div>
   );
 }

@@ -149,6 +149,14 @@ body {
   background: transparent !important;
 }
 
+/* H-9: 上面去杂边的规则把暗色输入框的焦点指示一并抹掉了，
+ * 这里为键盘焦点（focus-visible）补回可见 ring，鼠标点击仍保持无杂边。 */
+.dark [data-slot="input-wrapper"][data-focus-visible="true"] {
+  box-shadow:
+    0 0 0 2px hsl(var(--heroui-background)),
+    0 0 0 4px hsl(var(--heroui-primary)) !important;
+}
+
 .light [data-slot="input"],
 .light [data-slot="inner-wrapper"] input {
   color: #09090b;
@@ -1883,11 +1891,6 @@ body {
   -webkit-backdrop-filter: saturate(180%) blur(20px);
 }
 
-.app-apple-main {
-  padding-top: 20px !important;
-  padding-bottom: 28px !important;
-}
-
 .app-apple-nav-heading {
   color: var(--app-apple-subtle) !important;
   font-size: 11px !important;
@@ -1904,6 +1907,44 @@ body {
   background: transparent;
   font-weight: 500;
   outline: none;
+}
+
+/* E-9: 移动端抽屉里的导航项提升到 44px 触控目标（桌面断点保持紧凑密度）。 */
+@media (max-width: 1023.98px) {
+  .app-apple-nav-item {
+    min-height: 44px;
+  }
+}
+
+/* E-1: 会离开控制台的外链导航项，尾部加外链图标与普通面板切换项区分。 */
+.app-apple-nav-external {
+  display: inline-flex;
+  flex: none;
+  color: var(--app-apple-subtle);
+  opacity: 0.75;
+}
+
+/* E-13: "跳到主内容"链接，仅键盘聚焦时可见。 */
+.app-skip-link {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  z-index: 100;
+  transform: translateY(-300%);
+  border-radius: 8px;
+  padding: 8px 14px;
+  color: #ffffff;
+  background: var(--app-apple-primary-solid);
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-decoration: none;
+  transition: transform 140ms ease;
+}
+
+.app-skip-link:focus-visible {
+  transform: none;
+  outline: 2px solid var(--app-apple-blue);
+  outline-offset: 2px;
 }
 
 .app-apple-nav-item:hover {
@@ -2858,10 +2899,15 @@ body {
   cursor: pointer;
 }
 
-.header-menu-item:hover,
+.header-menu-item:hover {
+  background: var(--landing-action-soft, var(--app-apple-row-hover, rgba(0, 102, 204, 0.055)));
+}
+
+/* E-10: 键盘焦点不只有 5.5% 底色，再补一道清晰 outline。 */
 .header-menu-item:focus-visible {
   background: var(--landing-action-soft, var(--app-apple-row-hover, rgba(0, 102, 204, 0.055)));
-  outline: none;
+  outline: 2px solid var(--app-apple-blue, #0066cc);
+  outline-offset: -2px;
 }
 
 .header-menu-item:disabled {
@@ -3547,6 +3593,53 @@ body {
   font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
   font-size: 1.125rem;
   letter-spacing: 0.24em !important;
+}
+
+/* E-6: 字段级错误（如确认密码不一致）与密码可见性切换。 */
+.auth-dialog-field-error {
+  margin: 6px 2px 0;
+  color: var(--app-apple-danger);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+.auth-dialog-input[aria-invalid="true"] {
+  border-color: var(--app-apple-danger);
+}
+
+.auth-dialog-password {
+  position: relative;
+}
+
+.auth-dialog-password .auth-dialog-input {
+  padding-right: 46px;
+}
+
+.auth-dialog-password-toggle {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  display: inline-flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 8px;
+  color: var(--app-apple-muted);
+  background: transparent;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.auth-dialog-password-toggle:hover {
+  color: var(--app-apple-ink);
+  background: var(--app-apple-control);
+}
+
+.auth-dialog-password-toggle:focus-visible {
+  outline: 2px solid var(--app-apple-blue);
+  outline-offset: 1px;
 }
 
 .auth-dialog-primary,

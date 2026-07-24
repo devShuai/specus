@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SyncedDiagram } from "../components/SyncedDiagram";
 import type { DiagramEmbedApi } from "../components/SyncedDiagram";
 import type { WhiteboardInboundEvent } from "../components/SyncedWhiteboard";
@@ -66,6 +66,7 @@ export function DiagramEmbedPage() {
   const lockedOriginRef = useRef<string | null>(config.origin);
   const announcedInitRef = useRef(false);
   const changeTimerRef = useRef<number | null>(null);
+  const [editorReady, setEditorReady] = useState(false);
 
   const postToHost = useCallback((message: Record<string, unknown>, targetOrigin?: string) => {
     if (!isEmbedded) return;
@@ -77,6 +78,9 @@ export function DiagramEmbedPage() {
 
   const handleEmbedApiChange = useCallback((api: DiagramEmbedApi | null) => {
     apiRef.current = api;
+    if (api) {
+      setEditorReady(true);
+    }
     if (api && !announcedInitRef.current) {
       announcedInitRef.current = true;
       postToHost({ event: "init" });
@@ -168,7 +172,7 @@ export function DiagramEmbedPage() {
   }, [isEmbedded, postToHost]);
 
   return (
-    <main className="h-[100dvh] overflow-hidden bg-zinc-100 text-zinc-950 dark:bg-zinc-950 dark:text-white">
+    <main className="relative h-[100dvh] overflow-hidden bg-zinc-100 text-zinc-950 dark:bg-zinc-950 dark:text-white">
       <SyncedDiagram
         standalone
         boardKey={config.boardKey}
@@ -183,6 +187,17 @@ export function DiagramEmbedPage() {
         onEmbedApiChange={handleEmbedApiChange}
         onLocalChange={handleLocalChange}
       />
+      {!editorReady ? (
+        <div
+          role="status"
+          className="absolute inset-0 z-10 grid place-items-center bg-zinc-100 dark:bg-zinc-950"
+        >
+          <div className="flex flex-col items-center gap-3 text-center">
+            <span className="h-8 w-8 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-600 dark:border-zinc-700 dark:border-t-zinc-200" aria-hidden="true" />
+            <span className="text-small font-semibold text-zinc-900 dark:text-white">正在加载流程图编辑器</span>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

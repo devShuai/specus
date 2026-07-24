@@ -30,6 +30,7 @@ import { useConnectionsFeed } from "../../hooks/useConnectionsFeed";
 import { useNowTick } from "../../hooks/useNowTick";
 import { useAuth } from "../../auth/AuthContext";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import { EmptyState } from "../../components/EmptyState";
 
 const PAGE_SIZE = 50;
 const FILTER_POPOVER_CLASS_NAMES = {
@@ -304,7 +305,7 @@ export function ConnectionsPanel() {
         <MobileListCardList
           items={tableRows}
           isLoading={loading}
-          emptyContent="暂无数据"
+          emptyContent={<EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />}
           renderCard={(raw) => {
             const record = raw as (typeof tableRows)[number];
             const reason = record.success
@@ -388,7 +389,7 @@ export function ConnectionsPanel() {
           <TableColumn className="w-[11%]">持续时长</TableColumn>
           <TableColumn>原因</TableColumn>
         </TableHeader>
-        <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent="暂无数据">
+        <TableBody key={tableCollectionKey} items={tableRows} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无连接记录" description="调整筛选条件或等待客户端接入" />}>
           {(record) => (
             <TableRow key={record.tableKey}>
               <TableCell>{record.id}</TableCell>
@@ -438,12 +439,14 @@ export function ConnectionsPanel() {
         <span className="text-small text-default-600">
           {total === 0 ? "共 0 条" : `第 ${rangeStart}-${rangeEnd} 条，共 ${total} 条`}
         </span>
-        <Pagination
-          showControls
-          page={page + 1}
-          total={totalPages}
-          onChange={(value) => changePage(value - 1)}
-        />
+        {totalPages > 1 ? (
+          <Pagination
+            showControls
+            page={page + 1}
+            total={totalPages}
+            onChange={(value) => changePage(value - 1)}
+          />
+        ) : null}
       </div>
     </div>
   );

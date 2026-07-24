@@ -54,6 +54,12 @@ export const HTTP_RESPONSE_BODY_TYPES: Array<{ value: "" | HttpResponseBodyType;
   { value: "binary", label: "二进制" },
 ];
 
+/** 耗时格式化：小于 1s 显示毫秒，超过后切换为秒，避免"125000 ms"式裸渲染。 */
+export function formatElapsedMs(ms: number): string {
+  const value = Math.max(0, Math.round(Number(ms) || 0));
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${value} ms`;
+}
+
 export const trafficFilterControlClass =
   "h-9 w-full rounded-medium border border-default-200 bg-default-50 px-2 text-small text-foreground [color-scheme:light] outline-none transition-colors hover:border-default-300 focus:border-primary dark:[color-scheme:dark] [&>option]:bg-content1 [&>option]:text-foreground";
 

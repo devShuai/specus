@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#05070c" />
+    <script>/* 首帧前写入主题 class 与 color-scheme，避免暗色用户先闪一帧亮屏（FOUC）。key 与 ThemeContext 的 THEME_KEY 保持一致；逻辑与 getSystemTheme 对齐（默认暗色，仅 prefers light 时为浅色）。 */(function(){try{var saved=window.localStorage.getItem("shuai_tunnel_theme");var theme=saved==="light"||saved==="dark"?saved:(window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");var root=document.documentElement;root.classList.add(theme);root.dataset.theme=theme;root.style.colorScheme=theme;}catch(error){}})();</script>
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <style>
@@ -31,12 +32,22 @@
         }
       }
 
+      html.light .boot-shell {
+        background: #f8fbff;
+      }
+
+      html.light .boot-spinner {
+        border-color: rgba(8, 145, 178, 0.14);
+        border-top-color: #0891b2;
+      }
+
+      /* no-JS 兜底：脚本未执行时按系统深浅选择启动画面配色 */
       @media (prefers-color-scheme: light) {
-        .boot-shell {
+        html:not(.dark) .boot-shell {
           background: #f8fbff;
         }
 
-        .boot-spinner {
+        html:not(.dark) .boot-spinner {
           border-color: rgba(8, 145, 178, 0.14);
           border-top-color: #0891b2;
         }

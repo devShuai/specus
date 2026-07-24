@@ -105,7 +105,7 @@ export function App() {
 
 function FullScreenLoading() {
   return (
-    <div className="app-apple flex min-h-screen items-center justify-center bg-background text-foreground">
+    <div className="app-apple flex min-h-screen items-center justify-center bg-background text-foreground" role="status">
       <div className="flex items-center gap-3 rounded-md border border-default-200 bg-content1 px-4 py-3 text-small text-default-600 shadow-sm">
         <span className="h-4 w-4 animate-spin rounded-full border-2 border-default-300 border-t-primary" />
         <span>加载中…</span>

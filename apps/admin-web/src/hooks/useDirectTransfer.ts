@@ -423,7 +423,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     for (const channel of dataChannelsRef.current.values()) {
       const metadata = dataChannelMetadataRef.current.get(channel);
       if (!metadata || !activePeerIds.has(metadata.peerId)) {
-        closeDataChannel(metadata?.peerId ?? "", channel, "peer is no longer online", true);
+        closeDataChannel(metadata?.peerId ?? "", channel, "对方设备已离线", true);
       }
     }
     for (const [transportKey, connection] of peerConnectionsRef.current) {
@@ -445,11 +445,11 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     }
     rejectDirectAckWaiters(
       (waiter) => !activePeerIds.has(waiter.targetPeerId),
-      "peer is no longer online",
+      "对方设备已离线",
     );
     rejectAppAckWaiters(
       (waiter) => !activePeerIds.has(waiter.targetPeerId),
-      "peer is no longer online",
+      "对方设备已离线",
     );
   }, [closeDataChannel, options.peers, rejectAppAckWaiters, rejectDirectAckWaiters]);
 
@@ -519,6 +519,24 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     sendDirectReject(request.channel, transferId, "对方已拒绝接收");
     removePendingTransfer(transferKey);
   }, [removePendingTransfer, sendDirectReject]);
+
+  const cancelIncomingTransfer = useCallback((sourcePeerId: string, transferId: string) => {
+    const transferKey = receivingTransferKey({ sourcePeerId, transferId });
+    let channel: RTCDataChannel | null = null;
+    for (const [candidate, key] of directChannelTransfersRef.current) {
+      if (key === transferKey) {
+        channel = candidate;
+        break;
+      }
+    }
+    if (!channel) {
+      return;
+    }
+    if (channel.readyState === "open") {
+      channel.send(JSON.stringify({ kind: "file-cancel", transferId }));
+    }
+    closeDataChannel(sourcePeerId, channel, "对方取消了接收", true);
+  }, [closeDataChannel]);
 
   const completeDirectIncoming = useCallback(async (sourcePeerId: string, channel: RTCDataChannel, transferId: string) => {
     const transferKey = receivingTransferKey({ sourcePeerId, transferId });
@@ -962,10 +980,10 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     const key = peerChannelKey(targetPeerId, mode, purpose);
     const configurationKey = peerTransportConfigurationKey(iceConfigRef.current, mode);
     if (!activePeerIdsRef.current.has(targetPeerId)) {
-      throw new Error("peer is no longer online");
+      throw new Error("对方设备已离线");
     }
     if (mode === "relay" && !hasTurnIceServer(iceConfigRef.current)) {
-      throw new Error("TURN is unavailable");
+      throw new Error("TURN 中继不可用");
     }
     const existing = dataChannelsRef.current.get(key);
     const existingMetadata = existing ? dataChannelMetadataRef.current.get(existing) : undefined;
@@ -1314,7 +1332,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       throw new Error("当前浏览器不支持直连");
     }
     if (file.size > limitBytes) {
-      throw new Error(`文件超过 ${formatTransferBytes(limitBytes)}，改用分享链接`);
+      throw new Error(`文件超过直连上限 ${formatTransferBytes(limitBytes)}`);
     }
     optionsRef.current.onStateChange("connecting");
     optionsRef.current.onProgress(0);
@@ -1334,7 +1352,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         if (!channel
           || !isCurrentDataChannel(targetPeerId, channel, scopeKey)
           || channel.readyState !== "open") {
-          throw new Error("room or peer changed during direct transfer");
+          throw new Error("发送过程中房间或对方设备已变化");
         }
       };
       ensureCurrentChannel();
@@ -1392,6 +1410,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     handleSignal,
     acceptIncomingTransfer,
     rejectIncomingTransfer,
+    cancelIncomingTransfer,
     invalidateConnections,
   };
 }

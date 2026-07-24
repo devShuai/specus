@@ -44,4 +44,4 @@ export function ClientDetailDrawer({ client, open, onClose }: { client: Client |
   );
 }
 function Sec({ t, children }: { t: string; children: React.ReactNode }) { return <div><h3 className="mb-2 text-small font-semibold">{t}</h3><div className="space-y-2 rounded-md border border-default-200 bg-default-50 p-3 text-small">{children}</div></div>; }
-function F({ l, v }: { l: string; v: string }) { return <div className="flex justify-between gap-3"><span className="text-default-500">{l}</span><span className="truncate text-right font-medium">{v}</span></div>; }
+function F({ l, v }: { l: string; v: string }) { return <div className="flex justify-between gap-3"><span className="text-default-500">{l}</span><span className="truncate text-right font-medium" title={v}>{v}</span></div>; }

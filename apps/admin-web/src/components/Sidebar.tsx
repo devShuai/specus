@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { AppLogo } from "./AppLogo";
 
-export interface NavItem { key: string; title: string; }
+export interface NavItem { key: string; title: string; /** true 表示点击会离开管理外壳（整页跳转公开工具页），侧栏显示外链图标区分 */ external?: boolean; }
 export interface NavGroup { label: string; items: NavItem[]; }
 export interface SidebarProps { groups: NavGroup[]; active: string; onSelect: (k: string) => void; variant?: "desktop" | "mobile"; onClose?: () => void; footer?: ReactNode; }
 
@@ -15,11 +15,13 @@ export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose
           <button
             aria-current={isActive ? "page" : undefined}
             className={["app-apple-nav-item flex w-full items-center gap-2 px-2 py-1.5 text-left text-small transition-colors", isActive ? "app-apple-nav-item-active" : ""].join(" ")}
+            title={item.external ? `${item.title}（新页面，离开控制台）` : undefined}
             type="button"
             onClick={() => { onSelect(item.key); onClose?.(); }}
           >
             <span className="app-apple-nav-icon">{Icon(item.key)}</span>
             <span className="min-w-0 flex-1 truncate">{item.title}</span>
+            {item.external ? <span aria-hidden="true" className="app-apple-nav-external"><ExternalIcon /></span> : null}
           </button>
         </li>})}</ul>
       </div>)}
@@ -30,6 +32,9 @@ export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose
 
 const C = "h-4 w-4";
 const A = { fill:"none",stroke:"currentColor",strokeWidth:"1.6",strokeLinecap:"round" as const,strokeLinejoin:"round" as const };
+function ExternalIcon() {
+  return <svg className="h-3.5 w-3.5" {...A} viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 13.5V18a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4.5"/></svg>;
+}
 function Icon(k: string) {
   switch(k){
     case "overview": return <svg className={C} {...A} viewBox="0 0 24 24"><rect height="7" rx="1" width="7" x="3" y="3"/><rect height="7" rx="1" width="7" x="14" y="3"/><rect height="7" rx="1" width="7" x="3" y="14"/><rect height="7" rx="1" width="7" x="14" y="14"/></svg>;

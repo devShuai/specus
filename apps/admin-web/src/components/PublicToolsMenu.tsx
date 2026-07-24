@@ -33,7 +33,7 @@ export function PublicToolsMenu({ active, className = "" }: { active?: PublicToo
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-[13px] font-semibold leading-5">{tool.label}</span>
-            <span className="block text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">{tool.detail}</span>
+            <span className="block text-tiny leading-4 text-zinc-500 dark:text-zinc-400">{tool.detail}</span>
           </span>
           {active === tool.key ? <CurrentIcon /> : <NavigateIcon />}
         </a>

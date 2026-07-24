@@ -57,8 +57,8 @@ export function MobileListCard({
         {badges ? <div className="flex flex-wrap gap-1.5">{badges}</div> : null}
         {fields && fields.length > 0 ? (
           <div className="grid grid-cols-[80px_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-tiny">
-            {fields.map((field, index) => (
-              <FieldRow key={index} label={field.label} value={field.value} />
+            {fields.map((field) => (
+              <FieldRow key={field.label} label={field.label} value={field.value} />
             ))}
           </div>
         ) : null}

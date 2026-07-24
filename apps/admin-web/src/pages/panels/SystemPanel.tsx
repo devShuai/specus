@@ -34,9 +34,21 @@ import type {
   ManagementUser,
   ManagementUserMutation,
 } from "../../api/types";
+import { formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import { ConfirmModal } from "../../components/ConfirmModal";
+import { EmptyState } from "../../components/EmptyState";
+import { StatusChip, enabledTone } from "../../components/StatusChip";
 import { archLabel, platformLabel } from "./ClientDownloadsPanel";
+
+interface ConfirmState {
+  title: string;
+  description: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  action: () => Promise<void>;
+}
 
 type SystemPanelProps = {
   initializing: boolean;
@@ -83,6 +95,9 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     }
   };
 
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
+  const [resetTarget, setResetTarget] = useState<ManagementUser | null>(null);
+
   const updateUser = async (user: ManagementUser, patch: ManagementUserMutation) => {
     try {
       await adminApi.updateUser(user.username, patch);
@@ -93,25 +108,47 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     }
   };
 
-  const resetPassword = async (user: ManagementUser) => {
-    const password = window.prompt(`输入 ${user.username} 的新密码`);
-    if (!password) {
-      return;
-    }
-    await updateUser(user, { password });
+  const confirmToggleRole = (user: ManagementUser) => {
+    const toAdmin = user.role !== "ADMIN";
+    setConfirm({
+      title: toAdmin ? "设为管理员" : "设为普通用户",
+      description: toAdmin
+        ? `确定将 ${user.username} 设为管理员吗？管理员可管理全部用户、客户端与系统配置。`
+        : `确定将 ${user.username} 降为普通用户吗？其管理权限将立即失效。`,
+      confirmLabel: toAdmin ? "设为管理员" : "设为普通",
+      danger: toAdmin,
+      action: () => updateUser(user, { role: toAdmin ? "ADMIN" : "USER" }),
+    });
   };
 
-  const deleteUser = async (user: ManagementUser) => {
-    if (!window.confirm(`确定删除用户 ${user.username} 吗？`)) {
-      return;
-    }
-    try {
-      await adminApi.deleteUser(user.username);
-      notify("用户已删除");
-      await loadUsers();
-    } catch (error) {
-      notifyError(error, "删除用户失败");
-    }
+  const confirmToggleEnabled = (user: ManagementUser) => {
+    setConfirm({
+      title: user.enabled ? "停用用户" : "启用用户",
+      description: user.enabled
+        ? `确定停用 ${user.username} 吗？停用后该用户将无法登录管理后台。`
+        : `确定恢复启用 ${user.username} 吗？`,
+      confirmLabel: user.enabled ? "停用" : "启用",
+      danger: Boolean(user.enabled),
+      action: () => updateUser(user, { enabled: !user.enabled }),
+    });
+  };
+
+  const deleteUser = (user: ManagementUser) => {
+    setConfirm({
+      title: "删除用户",
+      description: `确定删除用户 ${user.username} 吗？该操作不可恢复。`,
+      confirmLabel: "删除",
+      danger: true,
+      action: async () => {
+        try {
+          await adminApi.deleteUser(user.username);
+          notify("用户已删除");
+          await loadUsers();
+        } catch (error) {
+          notifyError(error, "删除用户失败");
+        }
+      },
+    });
   };
 
   // ---- 客户端下载链接管理 ----
@@ -145,7 +182,15 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
     linkModal.onOpen();
   };
 
+  const [pendingLinkIds, setPendingLinkIds] = useState<Set<number>>(new Set());
+
+  /** 乐观更新 + 失败回滚；切换期间该行开关禁用。 */
   const toggleLinkEnabled = async (link: ClientDownloadLink) => {
+    if (pendingLinkIds.has(link.id)) {
+      return;
+    }
+    setPendingLinkIds((prev) => new Set(prev).add(link.id));
+    setDownloadLinks((prev) => prev.map((item) => (item.id === link.id ? { ...item, enabled: !link.enabled } : item)));
     try {
       await adminApi.updateClientDownload(link.id, {
         implementation: link.implementation,
@@ -157,23 +202,34 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
         displayOrder: link.displayOrder,
         enabled: !link.enabled,
       });
-      await loadDownloadLinks();
     } catch (error) {
+      setDownloadLinks((prev) => prev.map((item) => (item.id === link.id ? link : item)));
       notifyError(error, "切换状态失败");
+    } finally {
+      setPendingLinkIds((prev) => {
+        const next = new Set(prev);
+        next.delete(link.id);
+        return next;
+      });
     }
   };
 
-  const deleteLink = async (link: ClientDownloadLink) => {
-    if (!window.confirm(`确定删除「${link.displayName}」吗？`)) {
-      return;
-    }
-    try {
-      await adminApi.deleteClientDownload(link.id);
-      notify("已删除");
-      await loadDownloadLinks();
-    } catch (error) {
-      notifyError(error, "删除失败");
-    }
+  const deleteLink = (link: ClientDownloadLink) => {
+    setConfirm({
+      title: "删除下载链接",
+      description: `确定删除「${link.displayName}」吗？删除后登录页与客户端下载面板不再展示。`,
+      confirmLabel: "删除",
+      danger: true,
+      action: async () => {
+        try {
+          await adminApi.deleteClientDownload(link.id);
+          notify("已删除");
+          await loadDownloadLinks();
+        } catch (error) {
+          notifyError(error, "删除失败");
+        }
+      },
+    });
   };
 
   return (
@@ -238,7 +294,53 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
             </Button>
           </div>
 
-          <div className="overflow-x-auto">
+          {/* mobile: 用户卡片 */}
+          <div className="lg:hidden">
+            <MobileListCardList
+              items={users}
+              isLoading={loadingUsers}
+              emptyContent={<EmptyState icon="clients" title="暂无用户" />}
+              renderCard={(raw) => {
+                const user = raw as ManagementUser;
+                return (
+                  <MobileListCard
+                    key={user.username}
+                    title={user.username}
+                    subtitle={user.builtIn ? "配置文件内置账号" : undefined}
+                    badges={
+                      <>
+                        <StatusChip tone={user.admin ? "primary" : "default"}>{roleText(user.role)}</StatusChip>
+                        <StatusChip tone={enabledTone(user.enabled)}>{user.enabled ? "启用" : "停用"}</StatusChip>
+                      </>
+                    }
+                    fields={[
+                      { label: "租户", value: user.tenantId },
+                      { label: "更新时间", value: formatDateTime(user.updatedAt) },
+                    ]}
+                    actions={
+                      <>
+                        <Button isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => confirmToggleRole(user)}>
+                          {user.role === "ADMIN" ? "设为普通" : "设为管理员"}
+                        </Button>
+                        <Button isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => confirmToggleEnabled(user)}>
+                          {user.enabled ? "停用" : "启用"}
+                        </Button>
+                        <Button isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => setResetTarget(user)}>
+                          重置密码
+                        </Button>
+                        <Button color="danger" isDisabled={user.builtIn} radius="sm" size="sm" variant="flat" onPress={() => deleteUser(user)}>
+                          删除
+                        </Button>
+                      </>
+                    }
+                  />
+                );
+              }}
+            />
+          </div>
+
+          {/* desktop: 表格 */}
+          <div className="hidden overflow-x-auto lg:block">
             <Table
               aria-label="管理用户"
               isHeaderSticky
@@ -256,7 +358,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                 <TableColumn>更新时间</TableColumn>
                 <TableColumn className="text-right">操作</TableColumn>
               </TableHeader>
-              <TableBody emptyContent="暂无用户" isLoading={loadingUsers} items={users}>
+              <TableBody emptyContent={<EmptyState icon="clients" title="暂无用户" />} isLoading={loadingUsers} items={users}>
                 {(user) => (
                   <TableRow key={user.username}>
                     <TableCell>
@@ -265,16 +367,12 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                     </TableCell>
                     <TableCell>{user.tenantId}</TableCell>
                     <TableCell>
-                      <Chip color={user.admin ? "primary" : "default"} size="sm" variant="flat">
-                        {roleText(user.role)}
-                      </Chip>
+                      <StatusChip tone={user.admin ? "primary" : "default"}>{roleText(user.role)}</StatusChip>
                     </TableCell>
                     <TableCell>
-                      <Chip color={user.enabled ? "success" : "danger"} size="sm" variant="flat">
-                        {user.enabled ? "启用" : "停用"}
-                      </Chip>
+                      <StatusChip tone={enabledTone(user.enabled)}>{user.enabled ? "启用" : "停用"}</StatusChip>
                     </TableCell>
-                    <TableCell className="whitespace-nowrap text-default-500">{formatTime(user.updatedAt)}</TableCell>
+                    <TableCell className="whitespace-nowrap text-default-500">{formatDateTime(user.updatedAt)}</TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-2">
                         <Button
@@ -282,7 +380,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                           radius="sm"
                           size="sm"
                           variant="flat"
-                          onPress={() => void updateUser(user, { role: user.role === "ADMIN" ? "USER" : "ADMIN" })}
+                          onPress={() => confirmToggleRole(user)}
                         >
                           {user.role === "ADMIN" ? "设为普通" : "设为管理员"}
                         </Button>
@@ -291,7 +389,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                           radius="sm"
                           size="sm"
                           variant="flat"
-                          onPress={() => void updateUser(user, { enabled: !user.enabled })}
+                          onPress={() => confirmToggleEnabled(user)}
                         >
                           {user.enabled ? "停用" : "启用"}
                         </Button>
@@ -300,7 +398,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                           radius="sm"
                           size="sm"
                           variant="flat"
-                          onPress={() => void resetPassword(user)}
+                          onPress={() => setResetTarget(user)}
                         >
                           重置密码
                         </Button>
@@ -310,7 +408,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                           radius="sm"
                           size="sm"
                           variant="flat"
-                          onPress={() => void deleteUser(user)}
+                          onPress={() => deleteUser(user)}
                         >
                           删除
                         </Button>
@@ -371,9 +469,10 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
           <MobileListCardList
             items={downloadLinks}
             isLoading={loadingDownloads}
-            emptyContent="暂无下载链接"
+            emptyContent={<EmptyState icon="generic" title="暂无下载链接" description="新增后展示在登录页与客户端下载面板" />}
             renderCard={(raw) => {
               const link = raw as ClientDownloadLink;
+              const pending = pendingLinkIds.has(link.id);
               return (
                 <MobileListCard
                   key={link.id}
@@ -386,15 +485,14 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                       </Chip>
                       <Chip size="sm" variant="flat">{platformLabel(link.platform)}</Chip>
                       <Chip size="sm" variant="flat">{archLabel(link.arch)}</Chip>
-                      <Chip
+                      <Switch
                         size="sm"
-                        variant="flat"
-                        color={link.enabled ? "success" : "warning"}
-                        className="cursor-pointer"
-                        onClick={() => void toggleLinkEnabled(link)}
+                        isSelected={link.enabled}
+                        isDisabled={pending}
+                        onValueChange={() => void toggleLinkEnabled(link)}
                       >
-                        {link.enabled ? "启用" : "停用"}
-                      </Chip>
+                        启用
+                      </Switch>
                     </>
                   }
                   fields={[
@@ -423,7 +521,7 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                         radius="sm"
                         color="danger"
                         variant="flat"
-                        onPress={() => void deleteLink(link)}
+                        onPress={() => deleteLink(link)}
                       >
                         删除
                       </Button>
@@ -449,11 +547,13 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
               <TableColumn>名称</TableColumn>
               <TableColumn>URL</TableColumn>
               <TableColumn>排序</TableColumn>
-              <TableColumn>状态</TableColumn>
+              <TableColumn>启用</TableColumn>
               <TableColumn className="text-right">操作</TableColumn>
             </TableHeader>
-            <TableBody emptyContent="暂无下载链接" isLoading={loadingDownloads} items={downloadLinks}>
-              {(link) => (
+            <TableBody emptyContent={<EmptyState icon="generic" title="暂无下载链接" description="新增后展示在登录页与客户端下载面板" />} isLoading={loadingDownloads} items={downloadLinks}>
+              {(link) => {
+                const pending = pendingLinkIds.has(link.id);
+                return (
                 <TableRow key={link.id}>
                   <TableCell>
                     <Chip size="sm" variant="flat" color="primary">
@@ -485,15 +585,13 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                   </TableCell>
                   <TableCell>{link.displayOrder}</TableCell>
                   <TableCell>
-                    <Chip
+                    <Switch
+                      aria-label="启用"
                       size="sm"
-                      variant="flat"
-                      color={link.enabled ? "success" : "warning"}
-                      className="cursor-pointer"
-                      onClick={() => void toggleLinkEnabled(link)}
-                    >
-                      {link.enabled ? "启用" : "停用"}
-                    </Chip>
+                      isSelected={link.enabled}
+                      isDisabled={pending}
+                      onValueChange={() => void toggleLinkEnabled(link)}
+                    />
                   </TableCell>
                   <TableCell>
                     <div className="flex justify-end gap-2">
@@ -505,14 +603,15 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
                         radius="sm"
                         color="danger"
                         variant="flat"
-                        onPress={() => void deleteLink(link)}
+                        onPress={() => deleteLink(link)}
                       >
                         删除
                       </Button>
                     </div>
                   </TableCell>
                 </TableRow>
-              )}
+                );
+              }}
             </TableBody>
           </Table>
         </div>
@@ -524,7 +623,102 @@ export function SystemPanel({ initializing, onInitializeDatabase }: SystemPanelP
       link={editingLink}
       onSaved={() => void loadDownloadLinks()}
     />
+    <ResetPasswordModal
+      user={resetTarget}
+      onClose={() => setResetTarget(null)}
+      onSubmit={async (password) => {
+        if (resetTarget) {
+          await updateUser(resetTarget, { password });
+        }
+      }}
+    />
+    <ConfirmModal
+      isOpen={confirm != null}
+      onClose={() => setConfirm(null)}
+      onConfirm={() => confirm?.action()}
+      title={confirm?.title ?? ""}
+      description={confirm?.description}
+      confirmLabel={confirm?.confirmLabel}
+      danger={confirm?.danger}
+    />
     </div>
+  );
+}
+
+interface ResetPasswordModalProps {
+  user: ManagementUser | null;
+  onClose: () => void;
+  onSubmit: (password: string) => Promise<void>;
+}
+
+/** 重置密码弹窗：替代原生 prompt，密码不明文展示且需二次确认。 */
+function ResetPasswordModal({ user, onClose, onSubmit }: ResetPasswordModalProps) {
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (user) {
+      setPassword("");
+      setConfirmPassword("");
+    }
+  }, [user]);
+
+  const passwordError = !password
+    ? "请输入新密码"
+    : password.length < 6
+      ? "密码至少 6 位"
+      : "";
+  const confirmError = confirmPassword && confirmPassword !== password ? "两次输入的密码不一致" : "";
+  const invalid = Boolean(passwordError) || Boolean(confirmError);
+
+  const submit = async () => {
+    if (invalid || saving) {
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSubmit(password);
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal isOpen={user != null} onClose={onClose} size="sm" placement="center">
+      <ModalContent>
+        <ModalHeader className="text-base">重置密码「{user?.username}」</ModalHeader>
+        <ModalBody className="gap-3">
+          <Input
+            autoComplete="new-password"
+            label="新密码"
+            type="password"
+            value={password}
+            onValueChange={setPassword}
+            isInvalid={Boolean(password && passwordError)}
+            errorMessage={password ? passwordError : ""}
+          />
+          <Input
+            autoComplete="new-password"
+            label="确认新密码"
+            type="password"
+            value={confirmPassword}
+            onValueChange={setConfirmPassword}
+            isInvalid={Boolean(confirmError)}
+            errorMessage={confirmError}
+          />
+        </ModalBody>
+        <ModalFooter>
+          <Button variant="flat" onPress={onClose} isDisabled={saving}>
+            取消
+          </Button>
+          <Button color="primary" isDisabled={invalid} isLoading={saving} onPress={() => void submit()}>
+            重置密码
+          </Button>
+        </ModalFooter>
+      </ModalContent>
+    </Modal>
   );
 }
 
@@ -714,11 +908,4 @@ function EditClientDownloadModal({ disclosure, link, onSaved }: EditClientDownlo
 
 function roleText(role: ManagementRole) {
   return role === "ADMIN" ? "管理员" : "普通用户";
-}
-
-function formatTime(value: string | null) {
-  if (!value) {
-    return "-";
-  }
-  return new Date(value).toLocaleString();
 }

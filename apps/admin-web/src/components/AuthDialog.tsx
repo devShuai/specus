@@ -3,6 +3,15 @@ import { useAuth } from "../auth/AuthContext";
 import type { RegistrationChallengeResponse } from "../api/types";
 import { AppLogo } from "./AppLogo";
 
+/** E-7: 焦点陷阱的选择器；补上 iframe，Turnstile 的挑战 iframe 不会再逃出陷阱。 */
+const FOCUSABLE_SELECTOR =
+  "input:not([disabled]), button:not([disabled]), [href], iframe, [tabindex]:not([tabindex='-1'])";
+
+/** E-18: 触屏设备打开对话框时不自动聚焦输入框，避免软键盘弹起遮挡表单。 */
+function isCoarsePointer(): boolean {
+  return typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+}
+
 /** Global login and two-step email registration dialog. */
 export function AuthDialog() {
   const {
@@ -28,6 +37,8 @@ export function AuthDialog() {
   const [clock, setClock] = useState(() => Date.now());
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
+  const [showPassword, setShowPassword] = useState(false);
   const usernameInputRef = useRef<HTMLInputElement | null>(null);
   const codeInputRef = useRef<HTMLInputElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -49,6 +60,8 @@ export function AuthDialog() {
     setResendAvailableAt(0);
     setClock(Date.now());
     setError(null);
+    setConfirmError(null);
+    setShowPassword(false);
     setSubmitting(false);
   }, []);
 
@@ -66,9 +79,8 @@ export function AuthDialog() {
     setTab(loginInitialTab);
     resetForm();
     const focusTimer = window.setTimeout(() => {
-      const firstControl = panelRef.current?.querySelector<HTMLElement>(
-        "input:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex='-1'])",
-      );
+      if (isCoarsePointer()) return;
+      const firstControl = panelRef.current?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
       (usernameInputRef.current ?? firstControl)?.focus();
     }, 50);
     const onKeyDown = (event: KeyboardEvent) => {
@@ -77,9 +89,7 @@ export function AuthDialog() {
         return;
       }
       if (event.key !== "Tab") return;
-      const controls = Array.from(panelRef.current?.querySelectorAll<HTMLElement>(
-        "input:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex='-1'])",
-      ) ?? []);
+      const controls = Array.from(panelRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR) ?? []);
       if (controls.length === 0) {
         event.preventDefault();
         return;
@@ -98,10 +108,27 @@ export function AuthDialog() {
     const body = window.document.body;
     const previousOverflow = body.style.overflow;
     body.style.overflow = "hidden";
+    // E-7: 对话框打开期间把背景主内容设为 inert/aria-hidden，
+    // 防止指针与读屏器穿过遮罩操作背后的页面。
+    const backdrop = panelRef.current?.parentElement ?? null;
+    const inertSiblings: HTMLElement[] = [];
+    if (backdrop?.parentElement) {
+      for (const sibling of Array.from(backdrop.parentElement.children)) {
+        if (sibling !== backdrop && sibling instanceof HTMLElement) {
+          sibling.setAttribute("inert", "");
+          sibling.setAttribute("aria-hidden", "true");
+          inertSiblings.push(sibling);
+        }
+      }
+    }
     return () => {
       window.clearTimeout(focusTimer);
       window.removeEventListener("keydown", onKeyDown);
       body.style.overflow = previousOverflow;
+      for (const sibling of inertSiblings) {
+        sibling.removeAttribute("inert");
+        sibling.removeAttribute("aria-hidden");
+      }
       if (focusReturnTarget?.isConnected) focusReturnTarget.focus();
     };
   }, [closeLogin, loginInitialTab, loginOpen, resetForm]);
@@ -109,7 +136,9 @@ export function AuthDialog() {
   useEffect(() => {
     if (!challenge) return;
     setClock(Date.now());
-    const focusTimer = window.setTimeout(() => codeInputRef.current?.focus(), 50);
+    const focusTimer = window.setTimeout(() => {
+      if (!isCoarsePointer()) codeInputRef.current?.focus();
+    }, 50);
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => {
       window.clearTimeout(focusTimer);
@@ -133,7 +162,7 @@ export function AuthDialog() {
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (isRegister && !isVerifyingEmail && password !== confirmPassword) {
-      setError("两次输入的密码不一致");
+      setConfirmError("两次输入的密码不一致");
       return;
     }
     setSubmitting(true);
@@ -188,7 +217,18 @@ export function AuthDialog() {
     setVerificationCode("");
     setResendAvailableAt(0);
     setError(null);
-    window.setTimeout(() => usernameInputRef.current?.focus(), 50);
+    window.setTimeout(() => {
+      if (!isCoarsePointer()) usernameInputRef.current?.focus();
+    }, 50);
+  };
+
+  /** E-6: 确认密码失焦即校验，不等提交。 */
+  const validateConfirmOnBlur = () => {
+    if (confirmPassword && password !== confirmPassword) {
+      setConfirmError("两次输入的密码不一致");
+    } else {
+      setConfirmError(null);
+    }
   };
 
   const title = isVerifyingEmail ? "验证邮箱" : isRegister ? "注册账号" : "登录账号";
@@ -238,13 +278,14 @@ export function AuthDialog() {
         </div>
 
         {registrationEnabled && !isVerifyingEmail && (
-          <div className="auth-dialog-tabs" role="tablist" aria-label="账号操作">
+          // E-15: 这里不是完整的 APG tab 模式（无 tabpanel/方向键漫游），
+          // 降级为 aria-pressed 切换按钮组，语义更诚实。
+          <div className="auth-dialog-tabs" role="group" aria-label="账号操作">
             {([["login", "登录"], ["register", "注册"]] as const).map(([key, label]) => (
               <button
                 key={key}
                 type="button"
-                role="tab"
-                aria-selected={tab === key}
+                aria-pressed={tab === key}
                 className={`auth-dialog-tab${tab === key ? " is-active" : ""}`}
                 onClick={() => switchTab(key)}
               >
@@ -269,7 +310,7 @@ export function AuthDialog() {
                     <span>邮箱验证码</span>
                     <input
                       ref={codeInputRef}
-                      className="auth-dialog-input text-center font-mono"
+                      className="auth-dialog-input auth-dialog-code-input"
                       value={verificationCode}
                       onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
                       autoComplete="one-time-code"
@@ -293,6 +334,8 @@ export function AuthDialog() {
                       spellCheck={false}
                       maxLength={80}
                       required
+                      aria-invalid={error ? true : undefined}
+                      aria-describedby={error ? "auth-dialog-error" : undefined}
                     />
                   </label>
                   {isRegister && (
@@ -306,33 +349,70 @@ export function AuthDialog() {
                         autoComplete="email"
                         maxLength={254}
                         required
+                        aria-invalid={error ? true : undefined}
+                        aria-describedby={error ? "auth-dialog-error" : undefined}
                       />
                     </label>
                   )}
                   <label className="auth-dialog-field">
                     <span>密码</span>
-                    <input
-                      className="auth-dialog-input"
-                      type="password"
-                      value={password}
-                      onChange={(event) => setPassword(event.target.value)}
-                      autoComplete={isRegister ? "new-password" : "current-password"}
-                      maxLength={120}
-                      required
-                    />
+                    <div className="auth-dialog-password">
+                      <input
+                        className="auth-dialog-input"
+                        type={showPassword ? "text" : "password"}
+                        value={password}
+                        onChange={(event) => setPassword(event.target.value)}
+                        autoComplete={isRegister ? "new-password" : "current-password"}
+                        maxLength={120}
+                        required
+                        aria-invalid={error ? true : undefined}
+                        aria-describedby={error ? "auth-dialog-error" : undefined}
+                      />
+                      <button
+                        type="button"
+                        className="auth-dialog-password-toggle"
+                        aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                        aria-pressed={showPassword}
+                        onClick={() => setShowPassword((value) => !value)}
+                      >
+                        {showPassword ? <EyeOffIcon /> : <EyeIcon />}
+                      </button>
+                    </div>
                   </label>
                   {isRegister && (
                     <label className="auth-dialog-field">
                       <span>确认密码</span>
-                      <input
-                        className="auth-dialog-input"
-                        type="password"
-                        value={confirmPassword}
-                        onChange={(event) => setConfirmPassword(event.target.value)}
-                        autoComplete="new-password"
-                        maxLength={120}
-                        required
-                      />
+                      <div className="auth-dialog-password">
+                        <input
+                          className="auth-dialog-input"
+                          type={showPassword ? "text" : "password"}
+                          value={confirmPassword}
+                          onChange={(event) => {
+                            setConfirmPassword(event.target.value);
+                            if (confirmError) setConfirmError(null);
+                          }}
+                          onBlur={validateConfirmOnBlur}
+                          autoComplete="new-password"
+                          maxLength={120}
+                          required
+                          aria-invalid={confirmError ? true : undefined}
+                          aria-describedby={confirmError ? "auth-dialog-confirm-error" : undefined}
+                        />
+                        <button
+                          type="button"
+                          className="auth-dialog-password-toggle"
+                          aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                          aria-pressed={showPassword}
+                          onClick={() => setShowPassword((value) => !value)}
+                        >
+                          {showPassword ? <EyeOffIcon /> : <EyeIcon />}
+                        </button>
+                      </div>
+                      {confirmError && (
+                        <p className="auth-dialog-field-error" id="auth-dialog-confirm-error" role="alert">
+                          {confirmError}
+                        </p>
+                      )}
                     </label>
                   )}
                 </>
@@ -343,7 +423,7 @@ export function AuthDialog() {
               )}
 
               {error && (
-                <p className="auth-dialog-error" role="alert">
+                <p className="auth-dialog-error" id="auth-dialog-error" role="alert">
                   {error}
                 </p>
               )}
@@ -427,4 +507,33 @@ function formatExpiry(value: string): string {
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return "稍后";
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(timestamp);
+}
+
+function EyeIcon() {
+  return (
+    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function EyeOffIcon() {
+  return (
+    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M4 4l16 16M9.9 5.9A9.4 9.4 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a17.6 17.6 0 0 1-2.7 3.6M6.1 6.9A16.9 16.9 0 0 0 2.5 12S6 18.5 12 18.5c1.2 0 2.3-.3 3.3-.7M9.9 9.9a3 3 0 0 0 4.2 4.2"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
 }

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Avatar, Button, Dropdown, DropdownItem, DropdownMenu,
   DropdownSection, DropdownTrigger, Spinner,
@@ -8,6 +8,7 @@ import { useTheme } from "../theme/ThemeContext";
 import { adminApi } from "../api/client";
 import { notify, notifyError } from "../components/toast";
 import { AppLogo } from "../components/AppLogo";
+import { ConfirmModal } from "../components/ConfirmModal";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { Sidebar, type NavGroup } from "../components/Sidebar";
 
@@ -33,8 +34,9 @@ const navGroups: NavGroup[] = [
     { key: "downloads" as const, title: "客户端下载" },
   ]},
   { label: "工具", items: [
-    { key: "transfer" as const, title: "互传" },
-    { key: "diagram" as const, title: "专业流程图" },
+    // E-1: 这两项会离开管理外壳（整页跳转到公开工具页），标记 external 让侧栏加外链图标。
+    { key: "transfer" as const, title: "互传", external: true },
+    { key: "diagram" as const, title: "专业流程图", external: true },
   ]},
   { label: "流量", items: [
     { key: "traffic" as const, title: "流量使用" },
@@ -62,8 +64,10 @@ export function Dashboard() { return <HeroRuntime><DashboardContent /></HeroRunt
 function DashboardContent() {
   const { logout, profile } = useAuth();
   const [initializing, setInitializing] = useState(false);
+  const [initConfirmOpen, setInitConfirmOpen] = useState(false);
   const [activePanel, setActivePanel] = useState<PanelKey>(() => readPanelFromLocation());
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
 
   const activatePanel = useCallback((panel: PanelKey) => {
     setActivePanel(panel); setMobileNavOpen(false);
@@ -88,9 +92,15 @@ function DashboardContent() {
     return () => { window.removeEventListener("hashchange", sync); window.removeEventListener("popstate", sync); };
   }, []);
 
+  // E-17: 非管理员停在 #/system 时纠偏回默认面板，让 URL 与实际渲染一致；补齐依赖避免闭包过期。
   useEffect(() => {
     if (activePanel === "system" && !profile?.admin) activatePanel(defaultPanel);
-  }, [activePanel]);
+  }, [activePanel, profile?.admin, activatePanel]);
+
+  // E-5: 切换面板后回到页面顶部，避免沿用上一个面板的滚动位置。
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [renderedPanel]);
 
   useEffect(() => {
     if (!mobileNavOpen) return;
@@ -101,8 +111,12 @@ function DashboardContent() {
     return () => { document.body.style.overflow = prev; window.removeEventListener("keydown", esc); };
   }, [mobileNavOpen]);
 
+  // S-1: 原生 confirm 换成共享 ConfirmModal；SystemPanel 的入口先打开确认框，确认后才真正执行。
+  const requestInitializeDatabase = useCallback(async () => {
+    setInitConfirmOpen(true);
+  }, []);
+
   const initializeDatabase = async () => {
-    if (!window.confirm("确定执行数据库初始化吗？")) return;
     setInitializing(true);
     try { const r = await adminApi.initializeDatabase(); notify(`初始化完成: ${r.dialect}, ${r.clients} 个客户端`); }
     catch (e) { notifyError(e, "初始化失败"); }
@@ -111,6 +125,7 @@ function DashboardContent() {
 
   return (
     <div className="app-apple app-apple-dashboard flex min-h-screen">
+      <a className="app-skip-link" href="#app-main-content">跳到主内容</a>
       <aside className="app-apple-sidebar hidden w-56 shrink-0 bg-background lg:fixed lg:inset-y-0 lg:left-0 lg:z-30 lg:flex lg:flex-col">
         <Sidebar
           groups={visibleGroups}
@@ -121,31 +136,67 @@ function DashboardContent() {
         />
       </aside>
       <div className="flex min-w-0 flex-1 flex-col lg:ml-56">
-        <header className="app-apple-mobile-header bg-background/80 backdrop-blur lg:hidden">
+        <header className="app-apple-mobile-header sticky top-0 z-30 bg-background/80 backdrop-blur lg:hidden">
           <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
-            <Button isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
+            <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
             <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
             <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
             <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
           </div>
         </header>
-        <main className="app-apple-main mx-auto w-full min-w-0 max-w-[1680px] flex-1 p-2 sm:p-3 lg:px-5">
+        <main id="app-main-content" tabIndex={-1} className="mx-auto w-full min-w-0 max-w-[1680px] flex-1 px-2 pb-7 pt-5 outline-none sm:px-3 lg:px-5">
           <section className="min-w-0" key={renderedPanel}>
             <Suspense fallback={<PanelLoading />}>
-              <ActivePanel panel={renderedPanel} initializing={initializing} onInitializeDatabase={initializeDatabase} />
+              <ActivePanel panel={renderedPanel} initializing={initializing} onInitializeDatabase={requestInitializeDatabase} />
             </Suspense>
           </section>
         </main>
       </div>
-      <MobileNav open={mobileNavOpen} groups={visibleGroups} active={renderedPanel} onSelect={activatePanel} onClose={() => setMobileNavOpen(false)} />
+      <MobileNav open={mobileNavOpen} groups={visibleGroups} active={renderedPanel} onSelect={activatePanel} onClose={() => setMobileNavOpen(false)} triggerRef={mobileMenuButtonRef} />
+      <ConfirmModal
+        isOpen={initConfirmOpen}
+        onClose={() => setInitConfirmOpen(false)}
+        onConfirm={initializeDatabase}
+        title="初始化数据库"
+        description="将按当前配置重建并初始化数据库结构，该操作可能影响现有数据，执行后无法撤销。确定继续吗？"
+        confirmLabel="执行初始化"
+        danger
+      />
     </div>
   );
 }
 
-function MobileNav({ open, groups, active, onSelect, onClose }: { open: boolean; groups: NavGroup[]; active: PanelKey; onSelect: (p: PanelKey) => void; onClose: () => void }) {
+function MobileNav({ open, groups, active, onSelect, onClose, triggerRef }: { open: boolean; groups: NavGroup[]; active: PanelKey; onSelect: (p: PanelKey) => void; onClose: () => void; triggerRef: React.RefObject<HTMLButtonElement | null> }) {
+  const panelRef = useRef<HTMLElement | null>(null);
+
+  // H-8: 关闭态从 Tab 序列与读屏树中移除；打开时焦点移入首个导航项，
+  // 关闭（含 Esc/遮罩/选中）后焦点归还汉堡按钮。
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    if (open) {
+      panel.removeAttribute("inert");
+      const focusTimer = window.setTimeout(() => {
+        panel.querySelector<HTMLElement>("button:not([disabled]), [href]")?.focus();
+      }, 50);
+      return () => window.clearTimeout(focusTimer);
+    }
+    panel.setAttribute("inert", "");
+    if (panel.contains(window.document.activeElement)) {
+      triggerRef.current?.focus();
+    }
+  }, [open, triggerRef]);
+
   return (<>
     <div aria-hidden="true" className={`fixed inset-0 z-40 bg-black/40 backdrop-blur-sm transition-opacity duration-200 lg:hidden ${open ? "opacity-100" : "pointer-events-none opacity-0"}`} onClick={onClose} />
-    <aside className={`app-apple-sidebar fixed inset-y-0 left-0 z-50 flex w-64 max-w-[86vw] flex-col bg-background transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}>
+    <aside
+      ref={panelRef}
+      aria-hidden={!open}
+      aria-label="导航菜单"
+      aria-modal={open ? true : undefined}
+      role={open ? "dialog" : undefined}
+      className={`app-apple-sidebar fixed inset-y-0 left-0 z-50 flex w-64 max-w-[86vw] flex-col bg-background transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}
+    >
       <div className="app-apple-nav-brand flex h-14 items-center justify-between gap-2 px-3">
         <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
         <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="sm" variant="light" onPress={onClose}><CloseIcon /></Button>
@@ -162,6 +213,9 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
   const name = profile?.username || "user";
   const initials = name.slice(0, 1).toUpperCase();
   const { theme, setTheme, resetToSystem, userOverride } = useTheme();
+  // E-2: 与 UserMenuButton 同一套 mode 计算——跟随系统时只有"跟随系统"一个对勾，
+  // 不再因为系统恰好是暗色/浅色而出现双对勾。
+  const mode = userOverride ? theme : "system";
   return (
     <Dropdown placement={variant === "block" ? "top-start" : "bottom-end"} shouldBlockScroll={false}>
       <DropdownTrigger>
@@ -187,9 +241,9 @@ function UserMenu({ profile, onLogout, variant = "icon" }: { profile: ReturnType
         else if (key === "docs") window.location.hash = "/help";
       }}>
         <DropdownSection aria-label="主题" showDivider>
-          <DropdownItem key="theme-dark" textValue="深色" endContent={theme === "dark" ? <CheckIcon /> : null}>{"\uD83C\uDF19"} 深色模式</DropdownItem>
-          <DropdownItem key="theme-light" textValue="浅色" endContent={theme === "light" ? <CheckIcon /> : null}>{"\u2600\uFE0F"} 浅色模式</DropdownItem>
-          <DropdownItem key="theme-system" textValue="系统" endContent={!userOverride ? <CheckIcon /> : null}>{"\uD83D\uDDA5\uFE0F"} 跟随系统</DropdownItem>
+          <DropdownItem key="theme-dark" textValue="深色" endContent={mode === "dark" ? <CheckIcon /> : null}>{"\uD83C\uDF19"} 深色模式</DropdownItem>
+          <DropdownItem key="theme-light" textValue="浅色" endContent={mode === "light" ? <CheckIcon /> : null}>{"\u2600\uFE0F"} 浅色模式</DropdownItem>
+          <DropdownItem key="theme-system" textValue="系统" endContent={mode === "system" ? <CheckIcon /> : null}>{"\uD83D\uDDA5\uFE0F"} 跟随系统</DropdownItem>
         </DropdownSection>
         <DropdownSection aria-label="快捷" showDivider>
           <DropdownItem key="docs" textValue="帮助">{"\uD83D\uDCD6"} 帮助文档</DropdownItem>
@@ -225,4 +279,4 @@ function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: Pan
     default: return <LazyOverviewPanel />;
   }
 }
-function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-md border border-default-200 bg-content1"><Spinner label="加载页面…" /></div>; }
+function PanelLoading() { return <div className="flex min-h-[240px] items-center justify-center rounded-md border border-default-200 bg-content1" role="status"><Spinner label="加载页面…" /></div>; }

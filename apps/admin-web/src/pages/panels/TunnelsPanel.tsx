@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   Button,
-  Chip,
   Input,
   Modal,
   ModalBody,
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Pagination,
   Select,
   SelectItem,
   Switch,
@@ -24,7 +24,11 @@ import type { Tunnel } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
+import { ConfirmModal } from "../../components/ConfirmModal";
+import { EmptyState } from "../../components/EmptyState";
 import { useClients } from "../../hooks/useClients";
+
+const PAGE_SIZE = 10;
 
 export function TunnelsPanel() {
   const { clients } = useClients();
@@ -36,6 +40,9 @@ export function TunnelsPanel() {
   const [targetPort, setTargetPort] = useState("");
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Tunnel | null>(null);
+  const [pendingIds, setPendingIds] = useState<Set<number>>(new Set());
+  const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => Promise<void> } | null>(null);
+  const [page, setPage] = useState(1);
   const editModal = useDisclosure();
 
   const load = useCallback(async () => {
@@ -80,48 +87,57 @@ export function TunnelsPanel() {
     }
   };
 
-  const toggle = async (tunnel: Tunnel) => {
-    try {
-      await adminApi.updateTunnel(tunnel.id, {
-        listenPort: tunnel.listenPort,
-        targetAddress: tunnel.targetAddress,
-        targetPort: tunnel.targetPort,
-        enabled: !tunnel.enabled,
-        detailCaptureEnabled: Boolean(tunnel.detailCaptureEnabled),
-      });
-      await load();
-    } catch (error) {
-      notifyError(error, "切换状态失败");
-    }
-  };
-
-  const toggleDetailCapture = async (tunnel: Tunnel) => {
-    try {
-      await adminApi.updateTunnel(tunnel.id, {
-        listenPort: tunnel.listenPort,
-        targetAddress: tunnel.targetAddress,
-        targetPort: tunnel.targetPort,
-        enabled: tunnel.enabled,
-        detailCaptureEnabled: !Boolean(tunnel.detailCaptureEnabled),
-      });
-      await load();
-    } catch (error) {
-      notifyError(error, "切换明细采集失败");
-    }
-  };
-
-  const remove = async (tunnel: Tunnel) => {
-    if (!window.confirm("确定删除该端口映射？")) {
+  /** 乐观更新 + 失败回滚；切换期间该行开关禁用，避免整表刷新与连点竞态。 */
+  const patchTunnel = async (tunnel: Tunnel, patch: Partial<Pick<Tunnel, "enabled" | "detailCaptureEnabled">>, errorMessage: string) => {
+    if (pendingIds.has(tunnel.id)) {
       return;
     }
+    setPendingIds((prev) => new Set(prev).add(tunnel.id));
+    setTunnels((prev) => prev.map((item) => (item.id === tunnel.id ? { ...item, ...patch } : item)));
     try {
-      await adminApi.deleteTunnel(tunnel.id);
-      notify("端口映射已删除");
-      await load();
+      await adminApi.updateTunnel(tunnel.id, {
+        listenPort: tunnel.listenPort,
+        targetAddress: tunnel.targetAddress,
+        targetPort: tunnel.targetPort,
+        enabled: patch.enabled ?? tunnel.enabled,
+        detailCaptureEnabled: patch.detailCaptureEnabled ?? Boolean(tunnel.detailCaptureEnabled),
+      });
     } catch (error) {
-      notifyError(error, "删除失败");
+      setTunnels((prev) => prev.map((item) => (item.id === tunnel.id ? tunnel : item)));
+      notifyError(error, errorMessage);
+    } finally {
+      setPendingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(tunnel.id);
+        return next;
+      });
     }
   };
+
+  const toggle = (tunnel: Tunnel) => patchTunnel(tunnel, { enabled: !tunnel.enabled }, "切换状态失败");
+
+  const toggleDetailCapture = (tunnel: Tunnel) =>
+    patchTunnel(tunnel, { detailCaptureEnabled: !Boolean(tunnel.detailCaptureEnabled) }, "切换明细采集失败");
+
+  const remove = (tunnel: Tunnel) => {
+    setConfirm({
+      title: "删除端口映射",
+      description: `确定删除端口映射 :${tunnel.listenPort} → ${tunnel.targetAddress}:${tunnel.targetPort} 吗？删除后立即停止转发。`,
+      action: async () => {
+        try {
+          await adminApi.deleteTunnel(tunnel.id);
+          notify("端口映射已删除");
+          await load();
+        } catch (error) {
+          notifyError(error, "删除失败");
+        }
+      },
+    });
+  };
+
+  const totalPages = Math.max(1, Math.ceil(tunnels.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pagedTunnels = tunnels.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-4">
@@ -143,7 +159,7 @@ export function TunnelsPanel() {
         <Button className="h-14 w-full sm:w-auto" type="submit" color="primary" isLoading={creating}>
           新建映射
         </Button>
-        <Button className="h-14 w-full sm:w-auto" variant="flat" onPress={() => void load()}>
+        <Button className="h-14 w-full sm:w-auto" variant="flat" isLoading={loading} onPress={() => void load()}>
           刷新
         </Button>
       </form>
@@ -151,11 +167,12 @@ export function TunnelsPanel() {
       {/* mobile: 卡片 */}
       <div className="lg:hidden">
         <MobileListCardList
-          items={tunnels}
+          items={pagedTunnels}
           isLoading={loading}
-          emptyContent="暂无数据"
+          emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}
           renderCard={(raw) => {
             const tunnel = raw as Tunnel;
+            const pending = pendingIds.has(tunnel.id);
             return (
               <MobileListCard
                 key={tunnel.id}
@@ -167,24 +184,22 @@ export function TunnelsPanel() {
                 subtitle={`${tunnel.clientName} · #${tunnel.id}`}
                 badges={
                   <>
-                    <Chip
+                    <Switch
                       size="sm"
-                      variant="flat"
-                      color={tunnel.enabled ? "success" : "warning"}
-                      className="cursor-pointer"
-                      onClick={() => void toggle(tunnel)}
+                      isSelected={tunnel.enabled}
+                      isDisabled={pending}
+                      onValueChange={() => void toggle(tunnel)}
                     >
-                      {tunnel.enabled ? "启用" : "停用"}
-                    </Chip>
-                    <Chip
+                      启用
+                    </Switch>
+                    <Switch
                       size="sm"
-                      variant="flat"
-                      color={tunnel.detailCaptureEnabled ? "primary" : "default"}
-                      className="cursor-pointer"
-                      onClick={() => void toggleDetailCapture(tunnel)}
+                      isSelected={Boolean(tunnel.detailCaptureEnabled)}
+                      isDisabled={pending}
+                      onValueChange={() => void toggleDetailCapture(tunnel)}
                     >
-                      {tunnel.detailCaptureEnabled ? "采集" : "采集关"}
-                    </Chip>
+                      明细采集
+                    </Switch>
                   </>
                 }
                 fields={[
@@ -195,7 +210,7 @@ export function TunnelsPanel() {
                     <Button size="sm" variant="flat" onPress={() => { setEditing(tunnel); editModal.onOpen(); }}>
                       编辑
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => void remove(tunnel)}>
+                    <Button size="sm" color="danger" variant="flat" onPress={() => remove(tunnel)}>
                       删除
                     </Button>
                   </>
@@ -214,13 +229,15 @@ export function TunnelsPanel() {
           <TableColumn>客户端</TableColumn>
           <TableColumn>公网端口</TableColumn>
           <TableColumn>内网目标</TableColumn>
-          <TableColumn>状态</TableColumn>
+          <TableColumn>启用</TableColumn>
           <TableColumn>明细采集</TableColumn>
           <TableColumn>更新时间</TableColumn>
           <TableColumn>操作</TableColumn>
         </TableHeader>
-        <TableBody items={tunnels} isLoading={loading} emptyContent="暂无数据">
-          {(tunnel) => (
+        <TableBody items={pagedTunnels} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}>
+          {(tunnel) => {
+            const pending = pendingIds.has(tunnel.id);
+            return (
             <TableRow key={tunnel.id}>
               <TableCell>{tunnel.id}</TableCell>
               <TableCell>{tunnel.clientName}</TableCell>
@@ -229,26 +246,22 @@ export function TunnelsPanel() {
                 <code>{tunnel.targetAddress}:{tunnel.targetPort}</code>
               </TableCell>
               <TableCell>
-                <Chip
+                <Switch
+                  aria-label="启用"
                   size="sm"
-                  variant="flat"
-                  color={tunnel.enabled ? "success" : "warning"}
-                  className="cursor-pointer"
-                  onClick={() => void toggle(tunnel)}
-                >
-                  {tunnel.enabled ? "启用" : "停用"}
-                </Chip>
+                  isSelected={tunnel.enabled}
+                  isDisabled={pending}
+                  onValueChange={() => void toggle(tunnel)}
+                />
               </TableCell>
               <TableCell>
-                <Chip
+                <Switch
+                  aria-label="明细采集"
                   size="sm"
-                  variant="flat"
-                  color={tunnel.detailCaptureEnabled ? "primary" : "default"}
-                  className="cursor-pointer"
-                  onClick={() => void toggleDetailCapture(tunnel)}
-                >
-                  {tunnel.detailCaptureEnabled ? "采集" : "关闭"}
-                </Chip>
+                  isSelected={Boolean(tunnel.detailCaptureEnabled)}
+                  isDisabled={pending}
+                  onValueChange={() => void toggleDetailCapture(tunnel)}
+                />
               </TableCell>
               <TableCell>{formatDateTime(tunnel.updatedAt || tunnel.createdAt)}</TableCell>
               <TableCell>
@@ -256,18 +269,34 @@ export function TunnelsPanel() {
                   <Button size="sm" variant="flat" onPress={() => { setEditing(tunnel); editModal.onOpen(); }}>
                     编辑
                   </Button>
-                  <Button size="sm" color="danger" variant="flat" onPress={() => void remove(tunnel)}>
+                  <Button size="sm" color="danger" variant="flat" onPress={() => remove(tunnel)}>
                     删除
                   </Button>
                 </div>
               </TableCell>
             </TableRow>
-          )}
+            );
+          }}
         </TableBody>
       </Table>
       </div>
 
+      {totalPages > 1 ? (
+        <div className="flex justify-end">
+          <Pagination showControls page={safePage} total={totalPages} onChange={setPage} />
+        </div>
+      ) : null}
+
       <EditTunnelModal disclosure={editModal} tunnel={editing} onSaved={() => void load()} />
+      <ConfirmModal
+        isOpen={confirm != null}
+        onClose={() => setConfirm(null)}
+        onConfirm={() => confirm?.action()}
+        title={confirm?.title ?? ""}
+        description={confirm?.description}
+        confirmLabel="删除"
+        danger
+      />
     </div>
   );
 }

@@ -12,7 +12,11 @@ import {
   Modal,
   ModalBody,
   ModalContent,
+  ModalFooter,
   ModalHeader,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Progress,
   Switch,
 } from "@heroui/react";
@@ -21,6 +25,7 @@ import { useAuth } from "../auth/AuthContext";
 import { UserMenuButton } from "../components/UserMenuButton";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { HeroRuntime } from "../components/HeroRuntime";
+import { ConfirmModal } from "../components/ConfirmModal";
 import { SyncedClipboard } from "../components/SyncedClipboard";
 import { SyncedWhiteboard, isWhiteboardPayload } from "../components/SyncedWhiteboard";
 import type { WhiteboardInboundEvent, WhiteboardPayload } from "../components/SyncedWhiteboard";
@@ -267,6 +272,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const setProgress = useCallback((value: number) => progressStore.set(value), [progressStore]);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [discoveryStatus, setDiscoveryStatus] = useState<"connecting" | "online" | "reconnecting">("connecting");
+  const [transferInterruptAction, setTransferInterruptAction] = useState<{
+    title: string;
+    description: string;
+    action: () => void;
+  } | null>(null);
+  const [inviteLabelRole, setInviteLabelRole] = useState<TransferInviteRole | null>(null);
+  const [inviteLabelDraft, setInviteLabelDraft] = useState("");
+  const [revokeTarget, setRevokeTarget] = useState<PublicTransferRoomAccessToken | null>(null);
   const [record, setRecord] = useState<UploadRecord | null>(null);
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [iceConfig, setIceConfig] = useState<PublicTransferIceConfig | null>(null);
@@ -277,6 +291,28 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [whiteboardEvents, setWhiteboardEvents] = useState<WhiteboardInboundEvent[]>([]);
   const [diagramEvents, setDiagramEvents] = useState<WhiteboardInboundEvent[]>([]);
   const isDiagramWorkspace = workspace === "diagram";
+  const selectedPeerIdRef = useRef(selectedPeerId);
+  const discoveryStatusRef = useRef(discoveryStatus);
+  selectedPeerIdRef.current = selectedPeerId;
+  discoveryStatusRef.current = discoveryStatus;
+
+  useEffect(() => {
+    if (!notice) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
+    if (state !== "done") {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setState((current) => current === "done" ? "idle" : current);
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [state]);
 
   useEffect(() => maintainTransferPeerIdentityLease(peerIdentity), [peerIdentity]);
 
@@ -434,6 +470,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     for (const item of items.slice(INCOMING_ITEM_LIMIT)) {
       releaseIncomingItem(item);
     }
+    if (items.length > INCOMING_ITEM_LIMIT) {
+      setNotice(`收到的文件较多，仅保留最新 ${INCOMING_ITEM_LIMIT} 条`);
+    }
     return kept;
   };
 
@@ -548,6 +587,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     handleSignal,
     acceptIncomingTransfer,
     rejectIncomingTransfer,
+    cancelIncomingTransfer,
     invalidateConnections,
   } = useDirectTransfer({
     selfPeerId: peerId,
@@ -685,6 +725,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     let lastPongAt = Date.now();
     rosterRevisionRef.current = 0;
     setRoomRole(isInternetMode ? null : "EDITOR");
+    setDiscoveryStatus("connecting");
 
     const clearHeartbeat = () => {
       if (heartbeatTimer !== null) {
@@ -767,7 +808,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             setClientNameStatus("error");
             setError("客户端名称无效，请修改后重试");
           } else {
-            setError(message.error);
+            setError(localizeDiscoveryError(message.error));
           }
         } else if (message.type === "roster" && Array.isArray(message.peers)) {
           const revision = Number.isSafeInteger(message.rosterRevision) && (message.rosterRevision ?? 0) >= 0
@@ -786,7 +827,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             visiblePeers.map((peer) => [peer.peerId, discoveryPeerDisplayName(peer)]),
           );
           setPeers(visiblePeers);
-          setSelectedPeerId((current) => current && visiblePeers.some((peer) => peer.peerId === current) ? current : visiblePeers[0]?.peerId ?? "");
+          const currentSelectedPeerId = selectedPeerIdRef.current;
+          if (currentSelectedPeerId && !visiblePeers.some((peer) => peer.peerId === currentSelectedPeerId)) {
+            setSelectedPeerId("");
+            setNotice("之前选择的设备已离线，请重新选择");
+          }
         } else if (message.type === "attachment"
           && message.sourcePeerId
           && message.targetPeerId === peerId
@@ -823,6 +868,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       if (!active || blockedByNameConflict) {
         return;
       }
+      setDiscoveryStatus("reconnecting");
       const delayMs = Math.min(1000 * (2 ** Math.min(reconnectAttempt, 4)), 10000);
       reconnectAttempt += 1;
       reconnectTimer = window.setTimeout(() => void connect(), delayMs);
@@ -832,6 +878,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       if (!active) {
         return;
       }
+      setDiscoveryStatus(reconnectAttempt > 0 ? "reconnecting" : "connecting");
       let ticket: string;
       try {
         const issued = await publicCreateTransferWebSocketTicket({
@@ -862,6 +909,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         }
         reconnectAttempt = 0;
         lastPongAt = Date.now();
+        setDiscoveryStatus("online");
         startHeartbeat(socket);
       };
       socket.onmessage = (event) => {
@@ -1072,6 +1120,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (nextMode === networkMode) {
       return;
     }
+    if (isTransferBusy) {
+      setTransferInterruptAction({
+        title: "切换网络模式？",
+        description: "正在发送文件，切换将取消本次发送。",
+        action: () => applyNetworkMode(nextMode),
+      });
+      return;
+    }
+    applyNetworkMode(nextMode);
+  };
+
+  const applyNetworkMode = (nextMode: TransferNetworkMode) => {
     let nextToken = roomToken.trim();
     if (nextMode === "internet"
       && validateTransferRoomSettings(roomId, nextToken).errors.roomToken) {
@@ -1148,6 +1208,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   };
 
   const createNewRoom = () => {
+    if (isTransferBusy) {
+      setTransferInterruptAction({
+        title: "创建新房间？",
+        description: "正在发送文件，切换将取消本次发送。",
+        action: applyNewRoom,
+      });
+      return;
+    }
+    applyNewRoom();
+  };
+
+  const applyNewRoom = () => {
     const nextRoom = `room-${createRoomToken().slice(0, 8)}`;
     const nextToken = createRoomToken();
     resetTransferRoomState();
@@ -1357,10 +1429,16 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (isInternetMode) void prepareSecureInvite();
   };
 
-  const createRoomAccess = async (role: "EDITOR" | "VIEWER") => {
-    const defaultLabel = role === "EDITOR" ? "编辑者邀请" : "只读访客邀请";
-    const label = window.prompt("邀请名称", defaultLabel)?.trim();
-    if (!label) return;
+  const createRoomAccess = (role: "EDITOR" | "VIEWER") => {
+    setInviteLabelDraft(role === "EDITOR" ? "编辑者邀请" : "只读访客邀请");
+    setInviteLabelRole(role);
+  };
+
+  const confirmCreateRoomAccess = async () => {
+    const role = inviteLabelRole;
+    const label = inviteLabelDraft.trim();
+    if (!role || !label) return;
+    setInviteLabelRole(null);
     try {
       await issueRoomAccess(role, label, true);
       setNotice(`已创建 24 小时${role === "EDITOR" ? "编辑者" : "只读访客"}邀请，请立即复制链接。`);
@@ -1370,8 +1448,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
-  const revokeRoomAccess = async (access: PublicTransferRoomAccessToken) => {
-    if (!window.confirm(`撤销“${access.label}”后，该邀请将在下次连接时失效，是否继续？`)) return;
+  const revokeRoomAccess = (access: PublicTransferRoomAccessToken) => {
+    setRevokeTarget(access);
+  };
+
+  const confirmRevokeRoomAccess = async () => {
+    const access = revokeTarget;
+    if (!access) return;
     setRoomAccessLoading(true);
     try {
       const revoked = await publicRevokeTransferRoomAccessToken(roomId, access.id, { roomToken, peerId });
@@ -1572,6 +1655,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
+  const markTransferDone = () => {
+    // 成功路径统一清场：去掉过渡 notice（如"正在切换 TURN 中继"）和残留 error。
+    setError(null);
+    setNotice(null);
+    setState("done");
+  };
+
   const uploadFiles = async (files: File[], task: FileTransferTask) => {
     assertFileTransferTaskCurrent(task);
     if (files.length === 0) {
@@ -1604,13 +1694,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     for (let index = 0; index < files.length; index += 1) {
       assertFileTransferTaskCurrent(task);
       const file = files[index];
+      let peerTransferError = "";
       if (files.length > 1) {
         setNotice(`正在发送 ${index + 1}/${files.length}：${file.name || "attachment"}`);
       }
       if (task.targetPeerId && typeof RTCPeerConnection !== "undefined") {
         let peerResult: DirectTransferResult | null = null;
-        let peerTransferError = "";
         let peerTransferRejected = false;
+        let peerTransferFatal = false;
         const transportModes = task.networkMode === "lan"
           ? (["direct"] as const)
           : (["direct", "relay"] as const);
@@ -1629,7 +1720,13 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             peerTransferError = transportMode === "relay"
               ? `TURN 中继失败：${message}`
               : `Direct 直连失败：${message}`;
-            if (message.includes("拒绝接收")) {
+            if (message.includes("未确认接收") || message.includes("未确认完成")) {
+              // 等待确认超时不进入 transport 降级循环，避免等待翻倍。
+              peerTransferError = "对方 2 分钟内未确认，请提醒对方查看页面";
+              peerTransferFatal = true;
+              break;
+            }
+            if (message.includes("拒绝接收") || message.includes("取消了接收")) {
               peerTransferRejected = true;
               break;
             }
@@ -1652,10 +1749,10 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             downloadExpiresAt: null,
             direct: true,
           });
-          setState("done");
+          markTransferDone();
           continue;
         }
-        if (peerTransferRejected) {
+        if (peerTransferRejected || peerTransferFatal) {
           setError(peerTransferError);
           setState("failed");
           continue;
@@ -1666,12 +1763,12 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             setError(`${peerTransferError || "Direct/TURN 发送未完成"}。登录后可使用 OSS 兜底`);
             continue;
           }
-          setError(`Direct/TURN 发送未完成，正在改用云端兜底：${peerTransferError || "连接失败"}`);
+          setNotice(`Direct/TURN 发送未完成，正在改用云端兜底：${peerTransferError || "连接失败"}`);
         }
       }
       if (task.networkMode === "lan") {
         setState("failed");
-        setError("内网模式仅允许设备直连，本次未上传云端；可检查设备连接或切换到外网模式");
+        setError(`${peerTransferError || "直连发送未完成"}。内网模式未上传云端，可切到外网模式后重试`);
         continue;
       }
       if (!task.ossFallbackAllowed) {
@@ -1688,6 +1785,26 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   };
 
+  const cancelTransfer = () => {
+    const task = uploadInFlightRef.current;
+    if (!task) {
+      return;
+    }
+    uploadInFlightRef.current = null;
+    task.abortController.abort();
+    setProgress(0);
+    setError(null);
+    setState("idle");
+    setNotice("已取消发送");
+  };
+
+  const retryFailedTransfer = () => {
+    if (state !== "failed" || selectedFiles.length === 0 || uploadInFlightRef.current) {
+      return;
+    }
+    acceptFiles(selectedFiles);
+  };
+
   const acceptFiles = (files: File[]) => {
     if (isRoomReadOnly) {
       setError("当前为只读访客，不能向房间发送文件");
@@ -1697,7 +1814,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       return;
     }
     if (uploadInFlightRef.current) {
-      setError("当前文件仍在发送，请稍后再添加");
+      setNotice("当前文件仍在发送，请稍后再添加");
+      return;
+    }
+    if (discoveryStatus !== "online") {
+      setNotice("正在重新连接房间，恢复后再发送");
       return;
     }
     const task: FileTransferTask = {
@@ -1737,7 +1858,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       return;
     }
     if (uploadInFlightRef.current || isTransferBusy) {
-      setError("当前文件仍在发送，请稍后再添加");
+      setNotice("当前文件仍在发送，请稍后再添加");
+      return;
+    }
+    if (discoveryStatus !== "online") {
+      setNotice("正在重新连接房间，恢复后再发送");
       return;
     }
     fileInputRef.current?.click();
@@ -1850,7 +1975,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         downloadExpiresAt: null,
         direct: false,
       });
-      setState("done");
+      markTransferDone();
     } catch (err) {
       if (err instanceof FileTransferRoomChangedError || !isFileTransferTaskCurrent(task)) {
         throw new FileTransferRoomChangedError();
@@ -1911,6 +2036,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         } else {
           throw new Error("直连文件缓存不可用");
         }
+        setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
+        setNotice(`已保存：${item.attachment.fileName}`);
+        setError(null);
+        return;
+      }
+      if (item.blob) {
+        // 之前已下载过，直接复用本地 blob，不再走网络。
+        downloadBlob(item.blob, item.attachment.fileName);
         setIncomingDownloadState(key, { downloading: false, downloadProgress: 100, downloadError: null });
         setNotice(`已保存：${item.attachment.fileName}`);
         setError(null);
@@ -2089,6 +2222,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     if (isRoomReadOnly) {
       throw new Error("当前为只读访客，不能同步剪贴板");
     }
+    if (discoveryStatusRef.current !== "online") {
+      throw new Error("房间连接正在重连，恢复后再发送");
+    }
     const target = peers.find((peer) => peer.peerId === selectedPeerId);
     if (!target) {
       throw new Error("请选择一台在线设备后再同步剪贴板");
@@ -2124,6 +2260,56 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   }, []);
 
+  const sharedModals = (
+    <>
+      <ConfirmModal
+        isOpen={transferInterruptAction !== null}
+        onClose={() => setTransferInterruptAction(null)}
+        onConfirm={() => transferInterruptAction?.action()}
+        title={transferInterruptAction?.title ?? ""}
+        description={transferInterruptAction?.description}
+        confirmLabel="继续"
+        danger
+      />
+      <ConfirmModal
+        isOpen={revokeTarget !== null}
+        onClose={() => setRevokeTarget(null)}
+        onConfirm={confirmRevokeRoomAccess}
+        title="撤销邀请？"
+        description={revokeTarget ? `撤销“${revokeTarget.label}”后，该邀请将在下次连接时失效。` : undefined}
+        confirmLabel="撤销"
+        danger
+      />
+      <Modal isOpen={inviteLabelRole !== null} onClose={() => setInviteLabelRole(null)} size="sm" placement="center">
+        <ModalContent>
+          <ModalHeader className="text-base">邀请名称</ModalHeader>
+          <ModalBody>
+            <Input
+              autoFocus
+              label="名称"
+              radius="sm"
+              variant="bordered"
+              value={inviteLabelDraft}
+              onValueChange={setInviteLabelDraft}
+              maxLength={MAX_TRANSFER_ROOM_NAME_LENGTH}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && inviteLabelDraft.trim()) {
+                  void confirmCreateRoomAccess();
+                }
+              }}
+            />
+          </ModalBody>
+          <ModalFooter>
+            <Button variant="flat" onPress={() => setInviteLabelRole(null)}>取消</Button>
+            <Button color="primary" isDisabled={!inviteLabelDraft.trim()} onPress={() => void confirmCreateRoomAccess()}>
+              创建邀请
+            </Button>
+          </ModalFooter>
+        </ModalContent>
+      </Modal>
+    </>
+  );
+
   if (isDiagramWorkspace) {
     const collaborationRoleLabel = effectiveRoomRole === "OWNER" ? "房主" : effectiveRoomRole === "EDITOR" ? "可编辑" : "只读";
     const collaboratorCount = peers.length + 1;
@@ -2132,7 +2318,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         <section className="diagram-collaboration-overview" aria-label="当前协作状态">
           <div className="flex min-w-0 items-center gap-2.5">
             <span
-              className={`diagram-collaboration-status-dot ${peers.length > 0 ? "is-connected" : ""}`}
+              className={`diagram-collaboration-status-dot ${discoveryStatus === "online" ? "is-connected" : ""}`}
               aria-hidden="true"
             />
             <div className="min-w-0">
@@ -2141,7 +2327,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 <span className="diagram-collaboration-role">{collaborationRoleLabel}</span>
               </div>
               <div className="mt-0.5 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-                {isInternetMode ? "外网协作房间" : "内网协作房间"} · {peers.length > 0 ? "协作者在线" : "等待协作者加入"}
+                {isInternetMode ? "外网协作房间" : "内网协作房间"} · {discoveryStatus === "reconnecting" ? "连接重连中" : discoveryStatus === "connecting" ? "正在连接" : peers.length > 0 ? "协作者在线" : "等待协作者加入"}
               </div>
             </div>
           </div>
@@ -2350,6 +2536,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             onSend={sendWhiteboardPayload}
           />
         </Suspense>
+        {sharedModals}
       </main>
     );
   }
@@ -2411,11 +2598,34 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                   size="sm"
                   radius="sm"
                   variant="flat"
-                  color={ossFallbackEnabled ? "success" : "default"}
-                  title={ossFallbackEnabled ? "Direct/TURN 失败后可使用 OSS" : "匿名模式不上传 OSS"}
+                  color={discoveryStatus === "online" ? "success" : discoveryStatus === "reconnecting" ? "warning" : "default"}
                 >
-                  {!authReady ? "账号检测中" : ossFallbackEnabled ? "OSS 兜底可用" : "仅 Direct/TURN"}
+                  {discoveryStatus === "online" ? "已连接" : discoveryStatus === "reconnecting" ? "重连中" : "连接中"}
                 </Chip>
+                <Popover placement="bottom-start">
+                  <PopoverTrigger>
+                    <Button
+                      size="sm"
+                      radius="sm"
+                      variant="flat"
+                      color={ossFallbackEnabled ? "success" : "default"}
+                      className="h-6 min-w-0 gap-1 px-2 text-tiny"
+                      aria-label="传输兜底方式说明"
+                    >
+                      {!authReady ? "账号检测中" : ossFallbackEnabled ? "OSS 兜底可用" : "仅 Direct/TURN"}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="max-w-64 px-3 py-2">
+                    <div className="text-tiny font-semibold">
+                      {ossFallbackEnabled ? "OSS 云端兜底已启用" : "仅使用 Direct/TURN 点对点"}
+                    </div>
+                    <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                      {ossFallbackEnabled
+                        ? "文件优先经 Direct/TURN 点对点发送；失败时改用登录账号的 OSS 临时链接兜底。"
+                        : "匿名模式不会上传云端，文件只通过 Direct/TURN 点对点发送；登录后可启用 OSS 云端兜底。"}
+                    </p>
+                  </PopoverContent>
+                </Popover>
               </div>
               <div className="transfer-room-controls flex shrink-0 items-center gap-2">
                 <NetworkModeToggle activeMode={networkMode} onSelect={updateNetworkMode} />
@@ -2579,6 +2789,29 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           </div>
           </section>
 
+          {!isDiagramWorkspace && activeTool !== "whiteboard" && peers.length > 0 ? (
+            <div className="mt-3 xl:hidden">
+              <div className="mb-1.5 text-tiny text-zinc-500 dark:text-zinc-400">发送给</div>
+              <div className="flex gap-1.5 overflow-x-auto pb-1" role="radiogroup" aria-label="发送目标设备">
+                {peers.map((peer) => {
+                  const selected = selectedPeerId === peer.peerId;
+                  return (
+                    <button
+                      key={peer.peerId}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      onClick={() => setSelectedPeerId(peer.peerId)}
+                      className={`app-apple-tool-peer shrink-0 rounded-full px-3 py-1.5 text-tiny transition-colors ${selected ? "is-selected" : ""}`}
+                    >
+                      {discoveryPeerDisplayName(peer)}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
           {!isDiagramWorkspace ? <>
           <div
             id="transfer-panel-files"
@@ -2599,7 +2832,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             <button
               type="button"
               data-testid="public-transfer-file-dropzone"
-              aria-label="粘贴文件、拖到这里，或点击选择；选择后立即发送"
+              aria-label={fileDropzoneTitle}
               aria-describedby="public-transfer-file-dropzone-detail"
               aria-busy={isTransferBusy}
               aria-disabled={isTransferBusy || isRoomReadOnly}
@@ -2640,20 +2873,46 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     ? peerTransportPaths[uploadInFlightRef.current.targetPeerId]
                     : undefined
                 }
+                busy={isTransferBusy}
+                onCancel={cancelTransfer}
               />
             </div>
           )}
           </> : null}
 
           {notice && (
-            <div className="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-small text-emerald-800 dark:border-emerald-400/30 dark:bg-emerald-500/10 dark:text-emerald-100">
+            <div
+              role="status"
+              aria-live="polite"
+              className="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-small text-emerald-800 dark:border-emerald-400/30 dark:bg-emerald-500/10 dark:text-emerald-100"
+            >
               {notice}
             </div>
           )}
 
           {error && (
-            <div className="mt-4 rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-small text-rose-700 dark:border-rose-400/30 dark:bg-rose-500/10 dark:text-rose-100">
-              {error}
+            <div
+              role="alert"
+              className="mt-4 flex items-start justify-between gap-2 rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-small text-rose-700 dark:border-rose-400/30 dark:bg-rose-500/10 dark:text-rose-100"
+            >
+              <span className="min-w-0 [overflow-wrap:anywhere]">{error}</span>
+              <span className="flex shrink-0 items-center gap-1">
+                {state === "failed" && selectedFiles.length > 0 ? (
+                  <Button size="sm" radius="sm" color="danger" variant="flat" onPress={retryFailedTransfer}>
+                    重试
+                  </Button>
+                ) : null}
+                <button
+                  type="button"
+                  aria-label="关闭错误提示"
+                  className="grid h-6 w-6 place-items-center rounded text-rose-500 transition hover:bg-rose-500/10 hover:text-rose-700 dark:text-rose-200 dark:hover:text-rose-50"
+                  onClick={() => setError(null)}
+                >
+                  <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                    <path d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                </button>
+              </span>
             </div>
           )}
 
@@ -2694,10 +2953,15 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               pendingTransfers={pendingTransfers}
               receivingTransfers={receivingTransfers}
               peerTransportPaths={peerTransportPaths}
+              peerDisplayNames={diagramPeerDisplayNames}
               incoming={incoming}
               cloudTransferEnabled={ossFallbackEnabled}
               onAcceptDirect={(item) => acceptIncomingTransfer(item.sourcePeerId, item.transferId)}
               onRejectDirect={(item) => rejectIncomingTransfer(item.sourcePeerId, item.transferId)}
+              onCancelReceiving={(item) => {
+                cancelIncomingTransfer(item.sourcePeerId, item.transferId);
+                setNotice("已取消接收");
+              }}
               onShare={shareIncomingFile}
               onDownload={downloadIncoming}
               onLogin={openLogin}
@@ -2865,6 +3129,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         onRedeem={() => void redeemPairingCode()}
       />
       <PreviewModal target={previewTarget} onClose={() => setPreviewTarget(null)} />
+      {sharedModals}
     </main>
   );
 }
@@ -3182,10 +3447,12 @@ function IncomingFilesPanel({
   pendingTransfers,
   receivingTransfers,
   peerTransportPaths,
+  peerDisplayNames,
   incoming,
   cloudTransferEnabled,
   onAcceptDirect,
   onRejectDirect,
+  onCancelReceiving,
   onShare,
   onDownload,
   onLogin,
@@ -3194,10 +3461,12 @@ function IncomingFilesPanel({
   pendingTransfers: DirectPendingTransfer[];
   receivingTransfers: DirectReceivingTransfer[];
   peerTransportPaths: Record<string, PeerTransportPath>;
+  peerDisplayNames: Record<string, string>;
   incoming: IncomingAttachment[];
   cloudTransferEnabled: boolean;
   onAcceptDirect: (item: DirectPendingTransfer) => void;
   onRejectDirect: (item: DirectPendingTransfer) => void;
+  onCancelReceiving: (item: DirectReceivingTransfer) => void;
   onShare: (item: IncomingAttachment) => Promise<void>;
   onDownload: (item: IncomingAttachment) => Promise<void>;
   onLogin: () => void;
@@ -3206,6 +3475,8 @@ function IncomingFilesPanel({
   const hasPending = pendingTransfers.length > 0;
   const hasReceiving = receivingTransfers.length > 0;
   const hasIncoming = incoming.length > 0;
+  const sourceLabel = (sourcePeerId: string) => peerDisplayNames[sourcePeerId]
+    ?? (sourcePeerId === "shared-link" ? "共享链接" : sourcePeerId);
 
   return (
     <section className="mt-5 rounded-lg glass glass-border border p-4">
@@ -3229,7 +3500,7 @@ function IncomingFilesPanel({
                 <div className="min-w-0">
                   <div className="truncate text-small font-semibold text-amber-950 dark:text-amber-100">{item.fileName}</div>
                   <div className="mt-1 text-tiny text-amber-800/75 dark:text-amber-100/70">
-                    来自 {item.sourcePeerId} · {formatBytes(item.sizeBytes)}
+                    来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.sizeBytes)}
                   </div>
                 </div>
                 <Chip size="sm" radius="sm" color="warning" variant="flat">
@@ -3258,9 +3529,14 @@ function IncomingFilesPanel({
               <div key={receivingTransferKey(item)} className="rounded-lg border border-cyan-400/30 bg-cyan-50/70 p-3 dark:border-cyan-300/20 dark:bg-cyan-400/10">
                 <div className="truncate text-small font-medium text-cyan-950 dark:text-cyan-100">{item.fileName}</div>
                 <div className="mt-1 text-tiny text-cyan-800/75 dark:text-cyan-100/70">
-                  来自 {item.sourcePeerId} · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}{pathLabel ? ` · ${pathLabel}` : ""}
+                  来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.receivedBytes)} / {formatBytes(item.sizeBytes)}{pathLabel ? ` · ${pathLabel}` : ""}
                 </div>
-                <Progress className="mt-2" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
+                <div className="mt-2 flex items-center gap-2">
+                  <Progress className="flex-1" aria-label={`${item.fileName} 接收进度`} color="primary" size="sm" value={percent} />
+                  <Button size="sm" radius="sm" variant="light" onPress={() => onCancelReceiving(item)}>
+                    取消
+                  </Button>
+                </div>
               </div>
             );
           })}
@@ -3279,7 +3555,7 @@ function IncomingFilesPanel({
             <div key={incomingItemKey(item)} className="rounded-lg glass glass-border border p-3">
               <div className="truncate text-small font-medium">{item.attachment.fileName}</div>
               <div className="mt-1 text-tiny text-zinc-500">
-                来自 {item.sourcePeerId} · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
+                来自 <span title={item.sourcePeerId}>{sourceLabel(item.sourcePeerId)}</span> · {formatBytes(item.attachment.sizeBytes)}{item.direct ? " · direct" : ""}
               </div>
               {(previewUrl || item.direct) && (
                 <FilePreview
@@ -3325,23 +3601,44 @@ function TransferProgress({
   state,
   store,
   transportPath,
+  busy,
+  onCancel,
 }: {
   state: UploadState;
   store: TransferProgressStore;
   transportPath?: PeerTransportPath;
+  busy: boolean;
+  onCancel: () => void;
 }) {
   const progress = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const [waitingSeconds, setWaitingSeconds] = useState(0);
+  useEffect(() => {
+    if (state !== "waiting") {
+      setWaitingSeconds(0);
+      return undefined;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setWaitingSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [state]);
   const pathLabel = state === "direct" || state === "waiting" ? transportPathLabel(transportPath) : null;
+  const indeterminate = state === "connecting"
+    || state === "waiting"
+    || state === "presigning"
+    || state === "completing";
   return (
     <>
       <Progress
         aria-label="上传进度"
-        value={state === "done" ? 100 : progress}
+        isIndeterminate={indeterminate}
+        value={indeterminate ? undefined : state === "done" ? 100 : progress}
         color={state === "failed" ? "danger" : "primary"}
         size="sm"
       />
       <div className="mt-2 flex items-center gap-1.5 text-tiny text-zinc-500 dark:text-zinc-400">
-        <span>{stateLabel(state, progress)}</span>
+        <span>{state === "waiting" ? `等待对方确认接收（已等待 ${waitingSeconds} 秒）` : stateLabel(state, progress)}</span>
         {pathLabel && (
           <span
             className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
@@ -3353,6 +3650,11 @@ function TransferProgress({
             {pathLabel}
           </span>
         )}
+        {busy ? (
+          <Button className="ml-auto" size="sm" radius="sm" color="danger" variant="light" onPress={onCancel}>
+            取消
+          </Button>
+        ) : null}
       </div>
     </>
   );
@@ -3917,7 +4219,7 @@ function TransferFaq({
       <h2 className="text-base font-semibold text-zinc-950 dark:text-white">常见问题</h2>
       <div className="mt-2 divide-y divide-black/10 dark:divide-white/10">
         <FaqItem title="怎么把手机加进来？">
-          点“手机扫码”，用手机相机扫二维码。{isInternetMode ? "外网模式允许手机使用其它网络。" : "内网模式要求手机连接同一网络。"}
+          点上方“邀请 / 加入”，用手机相机扫二维码。{isInternetMode ? "外网模式允许手机使用其它网络。" : "内网模式要求手机连接同一网络。"}
         </FaqItem>
         <FaqItem title="找不到对方怎么办？">
           {isInternetMode
@@ -4104,6 +4406,27 @@ function hasRequestHeaders(headers: Record<string, string>) {
 
 function transportPathLabel(path: PeerTransportPath | undefined) {
   return path === "turn" ? "TURN 中继" : path === "direct" ? "P2P 直连" : null;
+}
+
+// 服务端发现通道错误多为英文，映射为中文文案；未识别的保留原文。
+function localizeDiscoveryError(message: string) {
+  const lower = message.toLowerCase();
+  if (lower.includes("rate limit")) {
+    return "请求过于频繁，请稍后再试";
+  }
+  if (lower.includes("room token") || lower.includes("invalid token") || lower.includes("unauthorized")) {
+    return "房间口令无效或已过期，请检查邀请链接";
+  }
+  if (lower.includes("room not found") || lower.includes("unknown room")) {
+    return "房间不存在或已关闭";
+  }
+  if (lower.includes("ticket")) {
+    return "连接凭证无效，请刷新页面重试";
+  }
+  if (lower.includes("timeout")) {
+    return "连接超时，请检查网络后重试";
+  }
+  return message;
 }
 
 function stateLabel(state: UploadState, progress: number) {

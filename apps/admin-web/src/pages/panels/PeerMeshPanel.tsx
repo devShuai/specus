@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Button,
   Card,
@@ -24,6 +24,7 @@ import {
 import { adminApi } from "../../api/client";
 import type { PeerMeshAcl, PeerMeshDevice, PeerMeshPathStats, PeerMeshSession, PeerMeshStatus } from "../../api/types";
 import { notify, notifyError } from "../../components/toast";
+import { ConfirmModal } from "../../components/ConfirmModal";
 import { formatBytes, formatDateTime } from "../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
 import { EmptyState } from "../../components/EmptyState";
@@ -60,8 +61,18 @@ export function PeerMeshPanel() {
   const [selectedSession, setSelectedSession] = useState<PeerMeshSession | null>(null);
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const [aclDirection, setAclDirection] = useState<"OUTBOUND" | "INBOUND" | "BOTH">("OUTBOUND");
-  const [loading, setLoading] = useState(true);
+  // 设备/会话加载态分开，局部操作不再整页闪烁。
+  const [devicesLoading, setDevicesLoading] = useState(true);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [clearingSessions, setClearingSessions] = useState(false);
+  const [updatingDeviceIds, setUpdatingDeviceIds] = useState<ReadonlySet<number>>(new Set());
+  const [confirmState, setConfirmState] = useState<{
+    title: string;
+    description: ReactNode;
+    confirmLabel: string;
+    action: () => Promise<void>;
+  } | null>(null);
   const [sourceClientId, setSourceClientId] = useState("");
   const [targetClientId, setTargetClientId] = useState("");
   const [natFilter, setNatFilter] = useState<PeerNatFilterKey>("all");
@@ -70,20 +81,16 @@ export function PeerMeshPanel() {
   const [sessionPage, setSessionPage] = useState(0);
   const [sessionTotal, setSessionTotal] = useState(0);
   const [sessionTotalPages, setSessionTotalPages] = useState(1);
-  const now = useNowTick(1000);
+  const sessionRequestId = useRef(0);
+  // 新鲜度窗口 120s，30s tick 足够驱动过期判定，避免每秒整面板重渲染。
+  const now = useNowTick(30_000);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const loadOverview = useCallback(async () => {
     try {
-      const [nextStatus, nextDevices, nextAcls, nextSessions, nextPathStats] = await Promise.all([
+      const [nextStatus, nextDevices, nextAcls, nextPathStats] = await Promise.all([
         adminApi.peerMeshStatus(),
         adminApi.listPeerMeshDevices(),
         adminApi.listPeerMeshAcls(),
-        adminApi.listPeerMeshSessionsPage({
-          page: sessionPage,
-          size: SESSION_PAGE_SIZE,
-          openOnly: true,
-        }),
         // stats 暂不可用时降级为 null，不影响面板其余部分。
         adminApi.peerMeshStats().catch(() => null),
       ]);
@@ -91,19 +98,60 @@ export function PeerMeshPanel() {
       setPathStats(nextPathStats);
       setDevices(nextDevices);
       setAcls(nextAcls);
+    } catch (error) {
+      notifyError(error, "加载私有组网失败");
+    } finally {
+      setDevicesLoading(false);
+    }
+  }, []);
+
+  const loadSessions = useCallback(async (page: number, showSpinner = false) => {
+    const requestId = sessionRequestId.current + 1;
+    sessionRequestId.current = requestId;
+    if (showSpinner) {
+      setSessionsLoading(true);
+    }
+    try {
+      const nextSessions = await adminApi.listPeerMeshSessionsPage({
+        page,
+        size: SESSION_PAGE_SIZE,
+        openOnly: true,
+      });
+      if (requestId !== sessionRequestId.current) {
+        return;
+      }
       setSessions(nextSessions.items);
       setSessionTotal(nextSessions.total);
       setSessionTotalPages(Math.max(1, nextSessions.totalPages));
     } catch (error) {
-      notifyError(error, "加载私有组网失败");
+      if (requestId === sessionRequestId.current) {
+        notifyError(error, "加载 peer 会话失败");
+      }
     } finally {
-      setLoading(false);
+      if (requestId === sessionRequestId.current) {
+        setSessionsLoading(false);
+      }
     }
-  }, [sessionPage]);
+  }, []);
+
+  // 刷新保留旧数据，只给按钮 loading。
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([loadOverview(), loadSessions(sessionPage)]);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadOverview, loadSessions, sessionPage]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    void loadOverview();
+  }, [loadOverview]);
+
+  // 翻页只刷新会话区。
+  useEffect(() => {
+    void loadSessions(sessionPage, true);
+  }, [loadSessions, sessionPage]);
 
   const enabledDevices = useMemo(() => devices.filter((device) => device.enabled), [devices]);
   const onlineDevices = useMemo(() => devices.filter((device) => device.online), [devices]);
@@ -113,11 +161,15 @@ export function PeerMeshPanel() {
     () => sessions.filter((session) => isPeerSessionEffectivelyActive(session, deviceById, now)),
     [sessions, deviceById, now],
   );
-  const directSessions = useMemo(() => activeSessions.filter((session) => effectivePeerSessionPathType(session) === "DIRECT"), [activeSessions]);
-  const relaySessions = useMemo(() => activeSessions.filter((session) => effectivePeerSessionPathType(session) === "RELAY"), [activeSessions]);
+  // 指标卡使用 pathStats 全局字段 / sessionTotal，不用当前页 20 条数据冒充全局总量。
+  const globalActiveSessions = pathStats?.activeSessions ?? sessionTotal;
+  const globalDirectSessions = pathStats?.activeDirectSessions ?? null;
+  const globalRelaySessions = pathStats?.activeRelaySessions ?? null;
   const peerTrafficBytes = useMemo(
-    () => sessions.reduce((total, session) => total + (session.directBytes || 0) + (session.relayBytes || 0), 0),
-    [sessions],
+    () => (pathStats
+      ? pathStats.pathTypes.reduce((total, row) => total + (row.directBytes || 0) + (row.relayBytes || 0), 0)
+      : null),
+    [pathStats],
   );
   const natStats = useMemo(() => buildPeerNatStats(devices), [devices]);
   const natDevices = useMemo(() => {
@@ -145,14 +197,23 @@ export function PeerMeshPanel() {
       .sort(comparePeerNatDevice);
   }, [devices, natFilter, natKeyword]);
 
+  // 设备开关乐观更新单行，失败回滚；不再整表重载。
   const updateDevice = async (device: PeerMeshDevice, enabled: boolean) => {
+    setUpdatingDeviceIds((ids) => new Set(ids).add(device.clientId));
+    setDevices((items) => items.map((item) => (item.clientId === device.clientId ? { ...item, enabled } : item)));
     try {
       const updated = await adminApi.updatePeerMeshDevice(device.clientId, { enabled });
       setDevices((items) => items.map((item) => (item.clientId === updated.clientId ? updated : item)));
       notify(enabled ? "已启用私有组网设备" : "已停用私有组网设备");
-      await load();
     } catch (error) {
+      setDevices((items) => items.map((item) => (item.clientId === device.clientId ? device : item)));
       notifyError(error, "更新设备失败");
+    } finally {
+      setUpdatingDeviceIds((ids) => {
+        const next = new Set(ids);
+        next.delete(device.clientId);
+        return next;
+      });
     }
   };
 
@@ -172,60 +233,70 @@ export function PeerMeshPanel() {
     }
   };
 
-  const deleteAcl = async (acl: PeerMeshAcl) => {
-    if (!window.confirm(`确定删除 ${acl.sourceClientName} -> ${acl.targetClientName} 的 ACL 吗？`)) {
-      return;
-    }
-    try {
-      await adminApi.deletePeerMeshAcl(acl.id);
-      setAcls((items) => items.filter((item) => item.id !== acl.id));
-      notify("Peer ACL 已删除");
-    } catch (error) {
-      notifyError(error, "删除 ACL 失败");
-    }
+  const deleteAcl = (acl: PeerMeshAcl) => {
+    setConfirmState({
+      title: "删除 ACL",
+      description: `将删除 ${acl.sourceClientName} → ${acl.targetClientName} 的放行规则，删除后跨用户互访会立即失效且不可恢复。`,
+      confirmLabel: "删除",
+      action: async () => {
+        try {
+          await adminApi.deletePeerMeshAcl(acl.id);
+          setAcls((items) => items.filter((item) => item.id !== acl.id));
+          notify("Peer ACL 已删除");
+        } catch (error) {
+          notifyError(error, "删除 ACL 失败");
+        }
+      },
+    });
   };
 
-  const closeSession = async (session: PeerMeshSession) => {
-    if (!window.confirm(`确定断开 ${session.sourceClientName} -> ${session.targetClientName} 的 peer session 吗？`)) {
-      return;
-    }
-    try {
-      const closed = await adminApi.closePeerMeshSession(session.id);
-      setSessions((items) => items.map((item) => (item.id === closed.id ? closed : item)));
-      if (selectedSession?.id === session.id) setSelectedSession(null);
-      notify("Peer session 已断开");
-      await load();
-    } catch (error) {
-      notifyError(error, "断开 peer session 失败");
-    }
+  const closeSession = (session: PeerMeshSession) => {
+    setConfirmState({
+      title: "断开 peer session",
+      description: `将立即断开 ${session.sourceClientName} → ${session.targetClientName} 的 peer session，进行中的直连/relay 传输会中断。`,
+      confirmLabel: "断开",
+      action: async () => {
+        try {
+          const closed = await adminApi.closePeerMeshSession(session.id);
+          setSessions((items) => items.map((item) => (item.id === closed.id ? closed : item)));
+          if (selectedSession?.id === session.id) setSelectedSession(null);
+          notify("Peer session 已断开");
+          await loadSessions(sessionPage);
+        } catch (error) {
+          notifyError(error, "断开 peer session 失败");
+        }
+      },
+    });
   };
 
-  const closeOpenSessions = async () => {
-    if (openSessions.length === 0) {
+  const closeOpenSessions = () => {
+    if (sessionTotal === 0 && openSessions.length === 0) {
       notify("当前没有未关闭 peer 链路");
       return;
     }
-    if (!window.confirm(`确定清理当前权限范围内的未关闭 peer 链路吗？当前有效活跃 ${activeSessions.length} 条，未关闭 ${openSessions.length} 条。`)) {
-      return;
-    }
-    setClearingSessions(true);
-    try {
-      const closedSessions = await adminApi.closeOpenPeerMeshSessions();
-      const closedById = new Map(closedSessions.map((session) => [session.id, session]));
-      setSessions((items) => items.map((item) => closedById.get(item.id) ?? item));
-      setSessionPage(0);
-      setSessionTotal(0);
-      setSessionTotalPages(1);
-      notify(`已清理 ${closedSessions.length} 条 peer 链路`);
-    } catch (error) {
-      notifyError(error, "清理 peer 链路失败");
-    } finally {
-      setClearingSessions(false);
-    }
+    setConfirmState({
+      title: "清理未关闭 peer 链路",
+      description: `将关闭当前权限范围内全部 ${sessionTotal} 条未关闭 peer 链路（当前页有效活跃 ${activeSessions.length} 条），进行中的传输会全部中断。`,
+      confirmLabel: "全部清理",
+      action: async () => {
+        setClearingSessions(true);
+        try {
+          const closedSessions = await adminApi.closeOpenPeerMeshSessions();
+          notify(`已清理 ${closedSessions.length} 条 peer 链路`);
+          // 统一从服务端收敛列表与计数，不手工重置。
+          setSessionPage(0);
+          await Promise.all([loadOverview(), loadSessions(0)]);
+        } catch (error) {
+          notifyError(error, "清理 peer 链路失败");
+        } finally {
+          setClearingSessions(false);
+        }
+      },
+    });
   };
 
   return (
-    <div className="mt-3 flex min-w-0 flex-col gap-3">
+    <div className="mt-4 flex min-w-0 flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-foreground">私有组网</h2>
@@ -237,29 +308,36 @@ export function PeerMeshPanel() {
           <Button
             color="danger"
             variant="flat"
-            isDisabled={openSessions.length === 0}
+            isDisabled={sessionTotal === 0 && openSessions.length === 0}
             isLoading={clearingSessions}
-            onPress={() => void closeOpenSessions()}
+            onPress={closeOpenSessions}
           >
             清理未关闭链路
           </Button>
-          <Button variant="flat" onPress={() => void load()}>
+          <Button variant="flat" isLoading={refreshing} onPress={() => void refresh()}>
             刷新
           </Button>
         </div>
       </div>
 
       <div className="grid grid-cols-1 gap-2 md:grid-cols-3 xl:grid-cols-6">
-        <MetricCard label="全局开关" value={status?.enabled ? "已开启" : "默认关闭"} tone={status?.enabled ? "success" : "default"} />
+        <MetricCard
+          label="全局开关"
+          value={status ? (status.enabled ? "已开启" : "默认关闭") : "-"}
+          tone={status?.enabled ? "success" : "default"}
+        />
         <MetricCard label="已启用设备" value={`${enabledDevices.length} / ${devices.length}`} />
         <MetricCard label="在线设备" value={String(onlineDevices.length)} tone={onlineDevices.length > 0 ? "success" : "default"} />
-        <MetricCard label="活跃 Direct / Relay" value={`${directSessions.length} / ${relaySessions.length}`} />
+        <MetricCard
+          label="活跃 Direct / Relay"
+          value={globalDirectSessions == null || globalRelaySessions == null ? "-" : `${globalDirectSessions} / ${globalRelaySessions}`}
+        />
         <MetricCard
           label="直连占比"
           value={pathStats?.activeDirectRatio == null ? "-" : `${Math.round(pathStats.activeDirectRatio * 100)}%`}
           tone={pathStats?.activeDirectRatio != null && pathStats.activeDirectRatio >= 0.5 ? "success" : "default"}
         />
-        <MetricCard label="Peer 流量" value={formatBytes(peerTrafficBytes)} tone={peerTrafficBytes > 0 ? "success" : "default"} />
+        <MetricCard label="Peer 流量" value={peerTrafficBytes == null ? "-" : formatBytes(peerTrafficBytes)} tone={peerTrafficBytes != null && peerTrafficBytes > 0 ? "success" : "default"} />
       </div>
 
       {!status?.enabled && (
@@ -277,7 +355,7 @@ export function PeerMeshPanel() {
         onSelectionChange={(key) => setPeerView(String(key) as PeerMeshViewKey)}
       >
         <Tab key="devices" title="设备拓扑" />
-        <Tab key="sessions" title={`活跃会话 ${activeSessions.length}`} />
+        <Tab key="sessions" title={`活跃会话 ${globalActiveSessions}`} />
         <Tab key="acl" title={`ACL ${acls.length}`} />
         <Tab key="nat" title="NAT 诊断" />
       </Tabs>
@@ -288,7 +366,7 @@ export function PeerMeshPanel() {
         devicesTotal={devices.length}
         filter={natFilter}
         keyword={natKeyword}
-        loading={loading}
+        loading={devicesLoading}
         onFilterChange={setNatFilter}
         onKeywordChange={setNatKeyword}
         stats={natStats}
@@ -306,7 +384,7 @@ export function PeerMeshPanel() {
         <div className="lg:hidden">
           <MobileListCardList
             items={devices}
-            isLoading={loading}
+            isLoading={devicesLoading}
             emptyContent="暂无 peer mesh 设备"
             renderCard={(raw) => {
               const device = raw as PeerMeshDevice;
@@ -374,6 +452,7 @@ export function PeerMeshPanel() {
                       <Switch
                         aria-label={`启用 ${device.clientName} 私有组网`}
                         isSelected={device.enabled}
+                        isDisabled={updatingDeviceIds.has(device.clientId)}
                         onValueChange={(enabled) => void updateDevice(device, enabled)}
                       />
                     </div>
@@ -397,7 +476,7 @@ export function PeerMeshPanel() {
             <TableColumn>最后上线</TableColumn>
             <TableColumn>启用</TableColumn>
           </TableHeader>
-          <TableBody items={devices} isLoading={loading} emptyContent="暂无 peer mesh 设备">
+          <TableBody items={devices} isLoading={devicesLoading} emptyContent="暂无 peer mesh 设备">
             {(device) => (
               <TableRow key={device.clientId}>
                 <TableCell>
@@ -453,6 +532,7 @@ export function PeerMeshPanel() {
                   <Switch
                     aria-label={`启用 ${device.clientName} 私有组网`}
                     isSelected={device.enabled}
+                    isDisabled={updatingDeviceIds.has(device.clientId)}
                     onValueChange={(enabled) => void updateDevice(device, enabled)}
                   />
                 </TableCell>
@@ -492,7 +572,7 @@ export function PeerMeshPanel() {
             <div className="lg:hidden">
               <MobileListCardList
                 items={acls}
-                isLoading={loading}
+                isLoading={devicesLoading}
                 emptyContent="暂无显式 ACL"
                 renderCard={(raw) => {
                   const acl = raw as PeerMeshAcl;
@@ -530,12 +610,21 @@ export function PeerMeshPanel() {
                 <TableColumn>状态</TableColumn>
                 <TableColumn>操作</TableColumn>
               </TableHeader>
-              <TableBody items={acls} isLoading={loading} emptyContent="暂无显式 ACL">
+              <TableBody items={acls} isLoading={devicesLoading} emptyContent="暂无显式 ACL">
                 {(acl) => (
                   <TableRow key={acl.id}>
                     <TableCell>{acl.sourceClientName}</TableCell>
                     <TableCell>{acl.targetClientName}</TableCell>
-                    <TableCell><Chip size="sm" variant="flat" color={acl.direction === "BOTH" ? "success" : acl.direction === "INBOUND" ? "warning" : "primary"}>{acl.direction === "OUTBOUND" ? "→" : acl.direction === "INBOUND" ? "←" : "⇄"}</Chip></TableCell>
+                    <TableCell>
+                      <Chip
+                        aria-label={aclDirectionLabel(acl.direction)}
+                        size="sm"
+                        variant="flat"
+                        color={acl.direction === "BOTH" ? "success" : acl.direction === "INBOUND" ? "warning" : "primary"}
+                      >
+                        {aclDirectionLabel(acl.direction)}
+                      </Chip>
+                    </TableCell>
                     <TableCell>
                       <Chip size="sm" color={acl.allowed ? "success" : "danger"} variant="flat">
                         {acl.allowed ? "允许" : "拒绝"}
@@ -559,7 +648,7 @@ export function PeerMeshPanel() {
       {peerView === "sessions" && (
       <section className="grid gap-3">
         <PeerPathStatsCard stats={pathStats} />
-        {!loading && activeSessions.length === 0 ? (
+        {!sessionsLoading && activeSessions.length === 0 ? (
           <Card shadow="none" className="rounded-md border border-default-200">
             <CardBody className="p-3">
               <EmptyState icon="peer" title="暂无活跃 peer 会话" description="客户端之间建立直连或 relay 链路后，活跃会话将在这里显示。" actionLabel="配置私有组网" onAction={() => { window.location.hash = "/help/peer-mesh"; }} />
@@ -608,7 +697,7 @@ export function PeerMeshPanel() {
                 <Card shadow="none" className="rounded-md border border-default-200">
                   <CardBody className="gap-2 p-3">
                     <h3 className="text-small font-semibold">活跃会话 · 有效 {activeSessions.length} / 未关闭 {sessionTotal}</h3>
-                    <MobileListCardList items={activeSessions} isLoading={loading} emptyContent="暂无活跃 peer session" renderCard={(raw) => {
+                    <MobileListCardList items={activeSessions} isLoading={sessionsLoading} emptyContent="暂无活跃 peer session" renderCard={(raw) => {
                       const s = raw as PeerMeshSession;
                       const pathType = effectivePeerSessionPathType(s);
                       return (
@@ -644,6 +733,18 @@ export function PeerMeshPanel() {
         )}
       </section>
       )}
+
+      <ConfirmModal
+        danger
+        isOpen={confirmState != null}
+        title={confirmState?.title ?? ""}
+        description={confirmState?.description}
+        confirmLabel={confirmState?.confirmLabel ?? "确认"}
+        onClose={() => setConfirmState(null)}
+        onConfirm={async () => {
+          await confirmState?.action();
+        }}
+      />
     </div>
   );
 }
@@ -1467,6 +1568,9 @@ function peerNatBarColor(tone: string) {
 function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessions: PeerMeshSession[] }) {
   const enabledDevices = devices.filter((device) => device.enabled);
   const topologyLinks = useMemo(() => buildTopologyLinks(devices, sessions), [devices, sessions]);
+  const shownDevices = enabledDevices.length > 0 ? enabledDevices : devices;
+  const hiddenDeviceCount = Math.max(0, shownDevices.length - 8);
+  const hiddenLinkCount = Math.max(0, topologyLinks.length - 12);
 
   return (
     <Card shadow="none" className="rounded-md border border-default-200">
@@ -1489,7 +1593,7 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
         </div>
 
         <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
-          {(enabledDevices.length > 0 ? enabledDevices : devices).slice(0, 8).map((device) => (
+          {shownDevices.slice(0, 8).map((device) => (
             <div key={device.clientId} className="rounded-md border border-default-200 bg-content1 p-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
@@ -1507,6 +1611,9 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
             </div>
           ))}
         </div>
+        {hiddenDeviceCount > 0 && (
+          <p className="text-tiny text-default-400">仅展示前 8 台设备，其余 {hiddenDeviceCount} 台见下方设备表。</p>
+        )}
 
         <div className="grid gap-2 lg:grid-cols-2">
           {topologyLinks.length === 0 ? (
@@ -1548,6 +1655,9 @@ function TopologyView({ devices, sessions }: { devices: PeerMeshDevice[]; sessio
             })
           )}
         </div>
+        {hiddenLinkCount > 0 && (
+          <p className="text-tiny text-default-400">仅展示前 12 条链路，其余 {hiddenLinkCount} 条见「活跃会话」页。</p>
+        )}
       </CardBody>
     </Card>
   );
@@ -1674,6 +1784,19 @@ function pathColor(pathType: string, status: string): "default" | "success" | "w
     return "default";
   }
   return pathType === "DIRECT" ? "success" : "warning";
+}
+
+function aclDirectionLabel(direction: PeerMeshAcl["direction"]) {
+  switch (direction) {
+    case "OUTBOUND":
+      return "单向出 →";
+    case "INBOUND":
+      return "单向入 ←";
+    case "BOTH":
+      return "双向 ⇄";
+    default:
+      return String(direction);
+  }
 }
 
 function virtualDeviceColor(status?: string | null): "default" | "success" | "warning" | "danger" {
