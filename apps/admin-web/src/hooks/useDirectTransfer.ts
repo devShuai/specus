@@ -139,6 +139,11 @@ interface UseDirectTransferOptions {
 
 export const DEFAULT_DIRECT_MEMORY_LIMIT_BYTES = 128 * 1024 * 1024;
 const DEFAULT_RECEIVING_TRANSFER_LIMIT = 10;
+const MAX_PENDING_ICE_CANDIDATES = 256;
+const DIRECT_FILE_CHANNEL_OPEN_TIMEOUT_MS = 10_000;
+const TURN_FILE_CHANNEL_OPEN_TIMEOUT_MS = 20_000;
+const AUTO_FILE_CHANNEL_OPEN_TIMEOUT_MS = 20_000;
+const DATA_CHANNEL_BACKPRESSURE_TIMEOUT_MS = 30_000;
 
 export function useDirectTransfer(options: UseDirectTransferOptions) {
   const optionsRef = useRef(options);
@@ -149,6 +154,9 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   const manualResetCounterRef = useRef(0);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const peerConnectionMetadataRef = useRef<WeakMap<RTCPeerConnection, PeerTransportMetadata>>(new WeakMap());
+  const pendingIceCandidatesRef = useRef<WeakMap<RTCPeerConnection, RTCIceCandidateInit[]>>(new WeakMap());
+  const makingOfferConnectionsRef = useRef<WeakSet<RTCPeerConnection>>(new WeakSet());
+  const signalQueuesRef = useRef<Map<string, Promise<void>>>(new Map());
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
   const dataChannelMetadataRef = useRef<WeakMap<RTCDataChannel, DataChannelMetadata>>(new WeakMap());
   const openingChannelsRef = useRef<Map<string, Promise<RTCDataChannel>>>(new Map());
@@ -267,6 +275,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     dataChannelsRef.current.clear();
     openingChannelsRef.current.clear();
     openingChannelMetadataRef.current.clear();
+    signalQueuesRef.current.clear();
     directIncomingRef.current.clear();
     directChannelTransfersRef.current.clear();
     pendingDirectRequestsRef.current.clear();
@@ -276,6 +285,8 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     appAckWaitersRef.current.clear();
     relayAppReassemblersRef.current.clear();
     peerConnectionMetadataRef.current = new WeakMap();
+    pendingIceCandidatesRef.current = new WeakMap();
+    makingOfferConnectionsRef.current = new WeakSet();
     dataChannelMetadataRef.current = new WeakMap();
     directAppReassemblersRef.current = new WeakMap();
     for (const channel of channels) {
@@ -690,6 +701,22 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       ].slice(0, optionsRef.current.receivingTransferLimit ?? DEFAULT_RECEIVING_TRANSFER_LIMIT));
       return;
     }
+    if (message.kind === "file-cancel" && message.transferId) {
+      const transferKey = receivingTransferKey({ sourcePeerId, transferId: message.transferId });
+      const pending = pendingDirectRequestsRef.current.get(transferKey);
+      if (pending?.channel === channel) {
+        removePendingTransfer(transferKey);
+      }
+      const incoming = directIncomingRef.current.get(transferKey);
+      if (incoming && directChannelTransfersRef.current.get(channel) === transferKey) {
+        directIncomingRef.current.delete(transferKey);
+        directChannelTransfersRef.current.delete(channel);
+        receivingProgressRef.current.delete(transferKey);
+        setReceivingTransfers((items) => items
+          .filter((item) => receivingTransferKey(item) !== transferKey));
+      }
+      return;
+    }
     if (message.kind === "file-complete" && message.transferId) {
       void completeDirectIncoming(sourcePeerId, channel, message.transferId).catch(() => {
         if (isCurrentDataChannel(sourcePeerId, channel, scopeKey)) {
@@ -906,6 +933,25 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     return connection;
   }, [clearPeerTransportPath, closeDataChannel, isCurrentPeerConnection, recordTransportPath, sendSignal, setupDataChannel]);
 
+  const enqueueSignalingOperation = useCallback((
+    scopeKey: string,
+    peerId: string,
+    mode: PeerTransportMode,
+    operation: () => Promise<void>,
+  ) => {
+    const queueKey = JSON.stringify([scopeKey, peerId, mode]);
+    const previous = signalQueuesRef.current.get(queueKey) ?? Promise.resolve();
+    const task = previous.catch(() => undefined).then(operation);
+    signalQueuesRef.current.set(queueKey, task);
+    const cleanup = () => {
+      if (signalQueuesRef.current.get(queueKey) === task) {
+        signalQueuesRef.current.delete(queueKey);
+      }
+    };
+    void task.then(cleanup, cleanup);
+    return task;
+  }, []);
+
   const openDirectChannel = useCallback(async (
     targetPeerId: string,
     timeoutMs = 8000,
@@ -914,6 +960,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
   ): Promise<RTCDataChannel> => {
     const scopeKey = connectionScopeRef.current;
     const key = peerChannelKey(targetPeerId, mode, purpose);
+    const configurationKey = peerTransportConfigurationKey(iceConfigRef.current, mode);
     if (!activePeerIdsRef.current.has(targetPeerId)) {
       throw new Error("peer is no longer online");
     }
@@ -922,14 +969,17 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     }
     const existing = dataChannelsRef.current.get(key);
     const existingMetadata = existing ? dataChannelMetadataRef.current.get(existing) : undefined;
-    const existingMatchesScope = existing && existingMetadata?.scopeKey === scopeKey;
-    if (existing && !existingMatchesScope) {
-      closeDataChannel(targetPeerId, existing, "room changed", true);
+    const existingMatchesConfiguration = existing
+      && existingMetadata?.scopeKey === scopeKey
+      && existingMetadata.configurationKey === configurationKey;
+    if (existing && !existingMatchesConfiguration) {
+      closeDataChannel(targetPeerId, existing,
+        existingMetadata?.scopeKey === scopeKey ? "ICE configuration refreshed" : "room changed", true);
     }
-    if (existingMatchesScope && existing.readyState === "open") {
+    if (existingMatchesConfiguration && existing.readyState === "open") {
       return existing;
     }
-    if (existingMatchesScope && existing.readyState === "connecting") {
+    if (existingMatchesConfiguration && existing.readyState === "connecting") {
       const opened = await waitForDataChannelOpen(existing, timeoutMs);
       if (!isCurrentDataChannel(targetPeerId, opened, scopeKey)) {
         throw new Error("room changed");
@@ -937,7 +987,10 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       return opened;
     }
     const opening = openingChannelsRef.current.get(key);
-    if (opening && openingChannelMetadataRef.current.get(key)?.scopeKey === scopeKey) {
+    const openingMetadata = openingChannelMetadataRef.current.get(key);
+    if (opening
+      && openingMetadata?.scopeKey === scopeKey
+      && openingMetadata.configurationKey === configurationKey) {
       return opening;
     }
     openingChannelsRef.current.delete(key);
@@ -955,20 +1008,27 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       setupDataChannel(targetPeerId, companion, mode, companionPurpose);
     }
     const openingTask = (async () => {
-      const offer = await connection.createOffer();
-      if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
-        || !isCurrentDataChannel(targetPeerId, channel, scopeKey)) {
-        throw new Error("room changed");
-      }
-      await connection.setLocalDescription(offer);
-      if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
-        || !isCurrentDataChannel(targetPeerId, channel, scopeKey)) {
-        throw new Error("room changed");
-      }
-      sendSignal(targetPeerId, {
-        signalType: "offer",
-        transportMode: mode,
-        description: connection.localDescription ?? offer,
+      await enqueueSignalingOperation(scopeKey, targetPeerId, mode, async () => {
+        makingOfferConnectionsRef.current.add(connection);
+        try {
+          const offer = await connection.createOffer();
+          if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
+            || !isCurrentDataChannel(targetPeerId, channel, scopeKey)) {
+            throw new Error("room changed");
+          }
+          await connection.setLocalDescription(offer);
+          if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
+            || !isCurrentDataChannel(targetPeerId, channel, scopeKey)) {
+            throw new Error("room changed");
+          }
+          sendSignal(targetPeerId, {
+            signalType: "offer",
+            transportMode: mode,
+            description: connection.localDescription ?? offer,
+          });
+        } finally {
+          makingOfferConnectionsRef.current.delete(connection);
+        }
       });
       const openedChannel = await waitForDataChannelOpen(channel, timeoutMs);
       if (!isCurrentPeerConnection(targetPeerId, connection, scopeKey)
@@ -983,36 +1043,100 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       scopeKey,
       mode,
       purpose,
-      configurationKey: peerTransportConfigurationKey(iceConfigRef.current, mode),
+      configurationKey,
     };
     openingChannelsRef.current.set(key, openingTask);
     openingChannelMetadataRef.current.set(key, metadata);
     try {
       return await openingTask;
+    } catch (error) {
+      const transportKey = peerTransportKey(targetPeerId, mode);
+      if (peerConnectionsRef.current.get(transportKey) === connection) {
+        peerConnectionsRef.current.delete(transportKey);
+        peerConnectionMetadataRef.current.delete(connection);
+        connection.onicecandidate = null;
+        connection.ondatachannel = null;
+        connection.onconnectionstatechange = null;
+        connection.close();
+      }
+      for (const candidate of [...dataChannelsRef.current.values()]) {
+        const candidateMetadata = dataChannelMetadataRef.current.get(candidate);
+        if (candidateMetadata?.peerId === targetPeerId && candidateMetadata.mode === mode) {
+          closeDataChannel(targetPeerId, candidate, `${mode} channel open failed`, true);
+        }
+      }
+      throw error;
     } finally {
       if (openingChannelsRef.current.get(key) === openingTask) {
         openingChannelsRef.current.delete(key);
         openingChannelMetadataRef.current.delete(key);
       }
     }
-  }, [closeDataChannel, createPeerConnection, isCurrentDataChannel, isCurrentPeerConnection, sendSignal, setupDataChannel]);
+  }, [closeDataChannel, createPeerConnection, enqueueSignalingOperation,
+    isCurrentDataChannel, isCurrentPeerConnection, sendSignal, setupDataChannel]);
 
-  const handleSignal = useCallback(async (sourcePeerId: string, payload: DirectTransferSignalPayload) => {
-    if (!payload.signalType || !activePeerIdsRef.current.has(sourcePeerId)) {
+  const flushPendingIceCandidates = useCallback(async (
+    sourcePeerId: string,
+    connection: RTCPeerConnection,
+    scopeKey: string,
+  ) => {
+    const pending = pendingIceCandidatesRef.current.get(connection);
+    pendingIceCandidatesRef.current.delete(connection);
+    for (const candidate of pending ?? []) {
+      if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
+        return;
+      }
+      try {
+        await connection.addIceCandidate(candidate);
+      } catch {
+        // Candidates from an ignored glare offer can be stale. Continue so a later relay
+        // candidate belonging to the accepted description is still installed.
+      }
+    }
+  }, [isCurrentPeerConnection]);
+
+  const processSignal = useCallback(async (
+    sourcePeerId: string,
+    payload: DirectTransferSignalPayload,
+    scopeKey: string,
+    mode: PeerTransportMode,
+  ) => {
+    if (connectionScopeRef.current !== scopeKey || !activePeerIdsRef.current.has(sourcePeerId)) {
       return;
     }
-    const scopeKey = connectionScopeRef.current;
-    const mode = normalizePeerTransportMode(payload.transportMode);
-    const connection = createPeerConnection(sourcePeerId, mode);
+    let connection = createPeerConnection(sourcePeerId, mode);
     try {
       if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
         return;
       }
       if (payload.signalType === "offer" && payload.description) {
+        const selfPeerId = optionsRef.current.selfPeerId ?? "";
+        const polite = !selfPeerId || selfPeerId.localeCompare(sourcePeerId) > 0;
+        const offerCollision = makingOfferConnectionsRef.current.has(connection)
+          || connection.signalingState !== "stable";
+        if (offerCollision && !polite) {
+          return;
+        }
+        if (offerCollision && connection.signalingState !== "stable") {
+          try {
+            await connection.setLocalDescription({ type: "rollback" });
+          } catch {
+            // Older WebKit builds do not implement rollback reliably. Replacing the
+            // colliding connection still lets the remote offer establish a clean path.
+            const pendingCandidates = pendingIceCandidatesRef.current.get(connection);
+            pendingIceCandidatesRef.current.delete(connection);
+            connection.close();
+            connection = createPeerConnection(sourcePeerId, mode);
+            if (pendingCandidates?.length) {
+              pendingIceCandidatesRef.current.set(connection, pendingCandidates);
+            }
+          }
+        }
         await connection.setRemoteDescription(payload.description);
         if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
           return;
         }
+        await flushPendingIceCandidates(sourcePeerId, connection, scopeKey);
         const answer = await connection.createAnswer();
         if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
           return;
@@ -1029,22 +1153,29 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
         return;
       }
       if (payload.signalType === "answer" && payload.description) {
-        if (connection.signalingState !== "stable") {
+        if (connection.signalingState === "have-local-offer") {
           await connection.setRemoteDescription(payload.description);
           if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
             return;
           }
+          await flushPendingIceCandidates(sourcePeerId, connection, scopeKey);
         }
         return;
       }
       if (payload.signalType === "ice" && payload.candidate) {
-        try {
-          if (!isCurrentPeerConnection(sourcePeerId, connection, scopeKey)) {
-            return;
+        if (!connection.remoteDescription) {
+          const pending = pendingIceCandidatesRef.current.get(connection) ?? [];
+          if (pending.length >= MAX_PENDING_ICE_CANDIDATES) {
+            pending.shift();
           }
+          pending.push(payload.candidate);
+          pendingIceCandidatesRef.current.set(connection, pending);
+          return;
+        }
+        try {
           await connection.addIceCandidate(payload.candidate);
         } catch {
-          // ICE candidates can race SDP on refresh; the next candidate usually repairs the path.
+          // A stale candidate can remain after glare rollback; valid later candidates continue.
         }
       }
     } catch (error) {
@@ -1053,7 +1184,20 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       }
       throw error;
     }
-  }, [createPeerConnection, isCurrentPeerConnection, sendSignal]);
+  }, [createPeerConnection, flushPendingIceCandidates, isCurrentPeerConnection, sendSignal]);
+
+  const handleSignal = useCallback((
+    sourcePeerId: string,
+    payload: DirectTransferSignalPayload,
+  ): Promise<void> => {
+    if (!payload.signalType || !activePeerIdsRef.current.has(sourcePeerId)) {
+      return Promise.resolve();
+    }
+    const scopeKey = connectionScopeRef.current;
+    const mode = normalizePeerTransportMode(payload.transportMode);
+    return enqueueSignalingOperation(scopeKey, sourcePeerId, mode,
+      () => processSignal(sourcePeerId, payload, scopeKey, mode));
+  }, [enqueueSignalingOperation, processSignal]);
 
   useEffect(() => {
     if (!options.preconnectPeerChannels || !options.selfPeerId || typeof RTCPeerConnection === "undefined") {
@@ -1100,7 +1244,7 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
       for (let index = 0; index < encoded.frames.length; index += 1) {
         const frame = encoded.frames[index];
         while (channel.bufferedAmount > 1024 * 1024) {
-          await waitForBufferedAmountLow(channel);
+          await waitForBufferedAmountLow(channel, Math.max(1000, timeoutMs));
         }
         if (!isCurrentDataChannel(targetPeerId, channel, scopeKey) || channel.readyState !== "open") {
           throw new Error("interactive channel changed");
@@ -1175,48 +1319,66 @@ export function useDirectTransfer(options: UseDirectTransferOptions) {
     optionsRef.current.onStateChange("connecting");
     optionsRef.current.onProgress(0);
     const scopeKey = connectionScopeRef.current;
-    const channel = await openDirectChannel(targetPeerId, 8000, mode, "bulk");
-    const usedConnection = peerConnectionsRef.current.get(peerTransportKey(targetPeerId, mode));
-    if (usedConnection) {
-      recordTransportPath(targetPeerId, usedConnection, scopeKey);
-    }
-    const ensureCurrentChannel = () => {
-      if (!isCurrentDataChannel(targetPeerId, channel, scopeKey) || channel.readyState !== "open") {
-        throw new Error("room or peer changed during direct transfer");
+    let channel: RTCDataChannel | null = null;
+    let transferId = "";
+    try {
+      channel = await openDirectChannel(targetPeerId, fileChannelOpenTimeoutMs(mode), mode, "bulk");
+      const usedConnection = peerConnectionsRef.current.get(peerTransportKey(targetPeerId, mode));
+      if (usedConnection) {
+        recordTransportPath(targetPeerId, usedConnection, scopeKey);
       }
-    };
-    ensureCurrentChannel();
-    const transferId = createTransferId();
-    const fileName = file.name || "attachment";
-    const mimeType = effectiveMimeType(fileName, file.type);
-    const sha256 = await sha256Blob(file, signal);
-    ensureCurrentChannel();
-    optionsRef.current.onStateChange("waiting");
-    channel.send(JSON.stringify({
-      kind: "file-meta",
-      transferId,
-      fileName,
-      mimeType,
-      sizeBytes: file.size,
-      sha256,
-    }));
-    await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 120000, "对方未确认接收");
-    ensureCurrentChannel();
-    optionsRef.current.onStateChange("direct");
-    await sendFileChunks(channel, file, optionsRef.current.onProgress, ensureCurrentChannel);
-    ensureCurrentChannel();
-    channel.send(JSON.stringify({ kind: "file-complete", transferId }));
-    // 慢链路（TURN 中继）上缓冲区可能还压着数 MB，先排空再开始 ack 计时，
-    // 否则接收端尚未收完发送端就已超时，出现"对方已收到但显示发送失败"。
-    await waitForDataChannelDrain(channel);
-    ensureCurrentChannel();
-    await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 60000, "对方未确认完成");
+      const ensureCurrentChannel = () => {
+        if (signal?.aborted) {
+          throw new Error("文件发送已取消");
+        }
+        if (!channel
+          || !isCurrentDataChannel(targetPeerId, channel, scopeKey)
+          || channel.readyState !== "open") {
+          throw new Error("room or peer changed during direct transfer");
+        }
+      };
+      ensureCurrentChannel();
+      transferId = createTransferId();
+      const fileName = file.name || "attachment";
+      const mimeType = effectiveMimeType(fileName, file.type);
+      const sha256 = await sha256Blob(file, signal);
+      ensureCurrentChannel();
+      optionsRef.current.onStateChange("waiting");
+      channel.send(JSON.stringify({
+        kind: "file-meta",
+        transferId,
+        fileName,
+        mimeType,
+        sizeBytes: file.size,
+        sha256,
+      }));
+      await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 120000, "对方未确认接收");
+      ensureCurrentChannel();
+      optionsRef.current.onStateChange("direct");
+      await sendFileChunks(channel, file, optionsRef.current.onProgress, ensureCurrentChannel, signal);
+      ensureCurrentChannel();
+      channel.send(JSON.stringify({ kind: "file-complete", transferId }));
+      // Slow TURN paths can retain several MiB after send() returns. Start the final
+      // acknowledgement timer only after SCTP has accepted the complete payload.
+      await waitForDataChannelDrain(channel, 60_000, signal);
+      ensureCurrentChannel();
+      await waitForDirectAck(targetPeerId, channel, scopeKey, transferId, 60000, "对方未确认完成");
 
-    return {
-      attachment: directAttachment(transferId, fileName, mimeType, file.size, sha256),
-      previewUrl: URL.createObjectURL(file),
-    };
-  }, [isCurrentDataChannel, openDirectChannel, recordTransportPath, waitForDirectAck]);
+      return {
+        attachment: directAttachment(transferId, fileName, mimeType, file.size, sha256),
+        previewUrl: URL.createObjectURL(file),
+      };
+    } catch (error) {
+      if (channel) {
+        if (transferId && channel.readyState === "open") {
+          channel.send(JSON.stringify({ kind: "file-cancel", transferId }));
+        }
+        closeDataChannel(targetPeerId, channel, `${mode} file transfer failed`, true);
+      }
+      throw error;
+    }
+  }, [closeDataChannel, isCurrentDataChannel, openDirectChannel,
+    recordTransportPath, waitForDirectAck]);
 
   return {
     pendingTransfers,
@@ -1310,6 +1472,12 @@ function directAttachment(transferId: string, fileName: string, mimeType: string
   };
 }
 
+function fileChannelOpenTimeoutMs(mode: PeerTransportMode) {
+  if (mode === "direct") return DIRECT_FILE_CHANNEL_OPEN_TIMEOUT_MS;
+  if (mode === "relay") return TURN_FILE_CHANNEL_OPEN_TIMEOUT_MS;
+  return AUTO_FILE_CHANNEL_OPEN_TIMEOUT_MS;
+}
+
 function waitForDataChannelOpen(channel: RTCDataChannel, timeoutMs: number): Promise<RTCDataChannel> {
   if (channel.readyState === "open") {
     return Promise.resolve(channel);
@@ -1348,6 +1516,7 @@ async function sendFileChunks(
   file: File,
   onProgress: (value: number) => void,
   ensureCurrentChannel: () => void,
+  signal?: AbortSignal,
 ) {
   const reportProgress = createProgressReporter(onProgress);
   ensureCurrentChannel();
@@ -1363,7 +1532,7 @@ async function sendFileChunks(
       throw new Error("DataChannel 已关闭");
     }
     while (channel.bufferedAmount > 4 * 1024 * 1024) {
-      await waitForBufferedAmountLow(channel);
+      await waitForBufferedAmountLow(channel, DATA_CHANNEL_BACKPRESSURE_TIMEOUT_MS, signal);
       ensureCurrentChannel();
     }
     const end = Math.min(file.size, offset + chunkSize);
@@ -1374,7 +1543,11 @@ async function sendFileChunks(
   }
 }
 
-function waitForBufferedAmountLow(channel: RTCDataChannel) {
+function waitForBufferedAmountLow(
+  channel: RTCDataChannel,
+  timeoutMs = DATA_CHANNEL_BACKPRESSURE_TIMEOUT_MS,
+  signal?: AbortSignal,
+) {
   if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) {
     return Promise.resolve();
   }
@@ -1382,11 +1555,12 @@ function waitForBufferedAmountLow(channel: RTCDataChannel) {
     const timer = window.setTimeout(() => {
       cleanup();
       reject(new Error("DataChannel 发送缓冲区等待超时"));
-    }, 5000);
+    }, timeoutMs);
     const cleanup = () => {
       window.clearTimeout(timer);
       channel.removeEventListener("bufferedamountlow", onLow);
       channel.removeEventListener("close", onClose);
+      signal?.removeEventListener("abort", onAbort);
     };
     const onLow = () => {
       cleanup();
@@ -1396,14 +1570,26 @@ function waitForBufferedAmountLow(channel: RTCDataChannel) {
       cleanup();
       reject(new Error("DataChannel 已关闭"));
     };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("文件发送已取消"));
+    };
     channel.addEventListener("bufferedamountlow", onLow);
     channel.addEventListener("close", onClose);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+    }
   });
 }
 
 // waitForDataChannelDrain 等发送缓冲区完全排空。慢链路（如 TURN 中继）上 bufferedAmount
 // 归零远晚于 send() 返回，ack 计时必须在排空之后开始，否则接收端还没收完数据发送端就先超时。
-export function waitForDataChannelDrain(channel: RTCDataChannel, timeoutMs = 60000): Promise<void> {
+export function waitForDataChannelDrain(
+  channel: RTCDataChannel,
+  timeoutMs = 60000,
+  signal?: AbortSignal,
+): Promise<void> {
   channel.bufferedAmountLowThreshold = 0;
   if (channel.bufferedAmount === 0) {
     return Promise.resolve();
@@ -1417,6 +1603,7 @@ export function waitForDataChannelDrain(channel: RTCDataChannel, timeoutMs = 600
       window.clearTimeout(timer);
       channel.removeEventListener("bufferedamountlow", onLow);
       channel.removeEventListener("close", onClose);
+      signal?.removeEventListener("abort", onAbort);
     };
     const onLow = () => {
       if (channel.bufferedAmount !== 0) {
@@ -1429,12 +1616,19 @@ export function waitForDataChannelDrain(channel: RTCDataChannel, timeoutMs = 600
       cleanup();
       reject(new Error("DataChannel 已关闭"));
     };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("文件发送已取消"));
+    };
     channel.addEventListener("bufferedamountlow", onLow);
     channel.addEventListener("close", onClose);
+    signal?.addEventListener("abort", onAbort, { once: true });
     // 注册监听与设置阈值之间缓冲区可能已排空。
     if (channel.bufferedAmount === 0) {
       cleanup();
       resolve();
+    } else if (signal?.aborted) {
+      onAbort();
     }
   });
 }

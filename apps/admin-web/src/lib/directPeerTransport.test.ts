@@ -4,6 +4,7 @@ import {
   buildPeerRtcConfiguration,
   hasTurnIceServer,
   normalizePeerTransportMode,
+  turnCredentialRefreshDelayMs,
 } from "./directPeerTransport";
 
 const config: PublicTransferIceConfig = {
@@ -41,5 +42,38 @@ describe("direct peer transport configuration", () => {
     expect(normalizePeerTransportMode("unexpected")).toBe("auto");
     expect(normalizePeerTransportMode("direct")).toBe("direct");
     expect(normalizePeerTransportMode("relay")).toBe("relay");
+  });
+
+  it("refreshes short-lived TURN credentials before they expire", () => {
+    const nowMs = 1_700_000_000_000;
+    const expiringConfig: PublicTransferIceConfig = {
+      ...config,
+      iceServers: [
+        config.iceServers[0],
+        {
+          ...config.iceServers[1],
+          username: `${(nowMs / 1000) + 600}:public-transfer:abcd1234`,
+        },
+      ],
+    };
+
+    expect(turnCredentialRefreshDelayMs(expiringConfig, nowMs)).toBe(5 * 60 * 1000);
+  });
+
+  it("keeps an hour credential until the five-minute refresh window", () => {
+    const nowMs = 1_700_000_000_000;
+    const hourlyConfig: PublicTransferIceConfig = {
+      ...config,
+      iceServers: [{
+        ...config.iceServers[1],
+        username: `${(nowMs / 1000) + 3600}:public-transfer:abcd1234`,
+      }],
+    };
+
+    expect(turnCredentialRefreshDelayMs(hourlyConfig, nowMs)).toBe(55 * 60 * 1000);
+  });
+
+  it("retries ICE config fetches promptly after a failure", () => {
+    expect(turnCredentialRefreshDelayMs(null, 0)).toBe(30 * 1000);
   });
 });

@@ -74,12 +74,14 @@ import {
   type ClipboardSyncPayload,
 } from "../lib/clipboardSync";
 import { decodeRelayAppFrame, encodeRelayAppFrame } from "../lib/appMessageProtocol";
+import { turnCredentialRefreshDelayMs } from "../lib/directPeerTransport";
 import {
   DEFAULT_DIRECT_MEMORY_LIMIT_BYTES,
   receivingTransferKey,
   useDirectTransfer,
   type DirectPendingTransfer,
   type DirectReceivingTransfer,
+  type DirectTransferResult,
   type DirectTransferSignalPayload,
   type PeerTransportPath,
 } from "../hooks/useDirectTransfer";
@@ -575,13 +577,47 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
 
   useEffect(() => {
     let active = true;
-    void fetchPublicTransferIceConfig().then((config) => {
-      if (active) {
+    let refreshTimer: number | null = null;
+    let refreshInFlight = false;
+    const scheduleRefresh = async () => {
+      if (!active || refreshInFlight) {
+        return;
+      }
+      refreshInFlight = true;
+      const config = await fetchPublicTransferIceConfig();
+      refreshInFlight = false;
+      if (!active) {
+        return;
+      }
+      const transferActive = uploadInFlightRef.current !== null;
+      if (config && !transferActive) {
         setIceConfig(config);
       }
-    });
+      refreshTimer = window.setTimeout(
+        () => void scheduleRefresh(),
+        transferActive ? 30_000 : turnCredentialRefreshDelayMs(config),
+      );
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      if (refreshTimer !== null) {
+        window.clearTimeout(refreshTimer);
+        refreshTimer = null;
+      }
+      void scheduleRefresh();
+    };
+    void scheduleRefresh();
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    window.addEventListener("online", refreshWhenVisible);
     return () => {
       active = false;
+      if (refreshTimer !== null) {
+        window.clearTimeout(refreshTimer);
+      }
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      window.removeEventListener("online", refreshWhenVisible);
     };
   }, []);
 
@@ -1572,44 +1608,65 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         setNotice(`正在发送 ${index + 1}/${files.length}：${file.name || "attachment"}`);
       }
       if (task.targetPeerId && typeof RTCPeerConnection !== "undefined") {
-        try {
-          const direct = await sendDirect(
-            task.targetPeerId,
-            file,
-            task.networkMode === "lan" ? "direct" : "auto",
-            task.abortController.signal,
-          );
+        let peerResult: DirectTransferResult | null = null;
+        let peerTransferError = "";
+        let peerTransferRejected = false;
+        const transportModes = task.networkMode === "lan"
+          ? (["direct"] as const)
+          : (["direct", "relay"] as const);
+        for (const transportMode of transportModes) {
+          try {
+            peerResult = await sendDirect(
+              task.targetPeerId,
+              file,
+              transportMode,
+              task.abortController.signal,
+            );
+            break;
+          } catch (err) {
+            assertFileTransferTaskCurrent(task);
+            const message = err instanceof Error ? err.message : "unknown";
+            peerTransferError = transportMode === "relay"
+              ? `TURN 中继失败：${message}`
+              : `Direct 直连失败：${message}`;
+            if (message.includes("拒绝接收")) {
+              peerTransferRejected = true;
+              break;
+            }
+            if (transportMode === "direct" && task.networkMode === "internet") {
+              setNotice("直连未建立，正在切换 TURN 中继");
+            }
+          }
+        }
+        if (peerResult) {
           if (!isFileTransferTaskCurrent(task)) {
-            URL.revokeObjectURL(direct.previewUrl);
+            URL.revokeObjectURL(peerResult.previewUrl);
             throw new FileTransferRoomChangedError();
           }
           setRecord({
             file,
-            previewUrl: direct.previewUrl,
+            previewUrl: peerResult.previewUrl,
             presign: null,
-            attachment: direct.attachment,
+            attachment: peerResult.attachment,
             downloadUrl: null,
             downloadExpiresAt: null,
             direct: true,
           });
           setState("done");
           continue;
-        } catch (err) {
-          assertFileTransferTaskCurrent(task);
-          const directError = err instanceof Error ? err.message : "unknown";
-          if (directError.includes("拒绝接收")) {
-            setError(directError);
+        }
+        if (peerTransferRejected) {
+          setError(peerTransferError);
+          setState("failed");
+          continue;
+        }
+        if (task.networkMode === "internet") {
+          if (!task.ossFallbackAllowed) {
             setState("failed");
+            setError(`${peerTransferError || "Direct/TURN 发送未完成"}。登录后可使用 OSS 兜底`);
             continue;
           }
-          if (task.networkMode === "internet") {
-            if (!task.ossFallbackAllowed) {
-              setState("failed");
-              setError(`Direct/TURN 发送未完成：${directError}。登录后可使用 OSS 兜底`);
-              continue;
-            }
-            setError(`Direct/TURN 发送未完成，正在改用云端兜底：${directError}`);
-          }
+          setError(`Direct/TURN 发送未完成，正在改用云端兜底：${peerTransferError || "连接失败"}`);
         }
       }
       if (task.networkMode === "lan") {

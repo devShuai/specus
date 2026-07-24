@@ -62,4 +62,20 @@ describe("waitForDataChannelDrain", () => {
     await vi.advanceTimersByTimeAsync(5000);
     await assertion;
   });
+
+  it("stops waiting when the file transfer is cancelled", async () => {
+    const channel = new FakeDataChannel();
+    channel.bufferedAmount = 1024;
+    const controller = new AbortController();
+    const pending = waitForDataChannelDrain(
+      channel as unknown as RTCDataChannel,
+      60_000,
+      controller.signal,
+    );
+    const assertion = expect(pending).rejects.toThrow("文件发送已取消");
+
+    controller.abort();
+
+    await assertion;
+  });
 });
