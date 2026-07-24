@@ -529,11 +529,11 @@
                                             </DataTemplate>
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
-                                    <DataGridTemplateColumn Header="本机目标" SortMemberPath="Target" ClipboardContentBinding="{Binding Target}" Width="2*">
+                                    <DataGridTemplateColumn Header="本机目标" SortMemberPath="Target" ClipboardContentBinding="{Binding Target, Mode=OneWay}" Width="2*">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
                                                 <TextBox Style="{StaticResource GridCellSelectableTextBoxStyle}"
-                                                         Text="{Binding Target}"
+                                                         Text="{Binding Target, Mode=OneWay}"
                                                          ToolTip="{Binding Target}" />
                                             </DataTemplate>
                                         </DataGridTemplateColumn.CellTemplate>
