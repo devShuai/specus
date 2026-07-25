@@ -66,7 +66,7 @@ import {
   MAX_TRANSFER_ROOM_NAME_LENGTH,
   MAX_TRANSFER_ROOM_TOKEN_LENGTH,
   localizeTransferDiscoveryError,
-  retainExplicitTransferPeerSelection,
+  resolveTransferPeerSelection,
   resolveTransferNetworkMode,
   validateTransferRoomSettings,
   type TransferNetworkMode,
@@ -1009,14 +1009,24 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
             visiblePeers.map((peer) => [peer.peerId, discoveryPeerDisplayName(peer)]),
           );
           setPeers(visiblePeers);
-          const currentSelectedPeerId = selectedPeerIdRef.current;
-          const retainedPeerId = retainExplicitTransferPeerSelection(
-            currentSelectedPeerId,
-            visiblePeers.map((peer) => peer.peerId),
-          );
-          if (currentSelectedPeerId && !retainedPeerId) {
-            setSelectedPeerId("");
-            setNotice("之前选择的设备已离线，请重新选择");
+          if (!isDiagramWorkspace) {
+            const currentSelectedPeerId = selectedPeerIdRef.current;
+            const nextSelectedPeerId = resolveTransferPeerSelection(
+              currentSelectedPeerId,
+              visiblePeers.map((peer) => peer.peerId),
+            );
+            if (nextSelectedPeerId !== currentSelectedPeerId) {
+              selectedPeerIdRef.current = nextSelectedPeerId;
+              setSelectedPeerId(nextSelectedPeerId);
+              const nextPeer = visiblePeers.find((peer) => peer.peerId === nextSelectedPeerId);
+              if (currentSelectedPeerId && nextPeer) {
+                setNotice(`原设备已离线，已切换到 ${discoveryPeerDisplayName(nextPeer)}`);
+              } else if (currentSelectedPeerId) {
+                setNotice("原设备已离线，当前没有可发送设备");
+              } else if (nextPeer) {
+                setNotice(`已默认选择 ${discoveryPeerDisplayName(nextPeer)}`);
+              }
+            }
           }
         } else if (message.type === "attachment"
           && message.sourcePeerId
@@ -1140,7 +1150,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         socket.close();
       }
     };
-  }, [clientNameConnectionGeneration, displayName, handleRelayPeerFrame, handleSignal, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
+  }, [clientNameConnectionGeneration, displayName, handleRelayPeerFrame, handleSignal, isDiagramWorkspace, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
 
   useEffect(() => {
     if (!isInternetMode || roomRole !== "OWNER") {
@@ -1243,6 +1253,18 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     || state === "presigning"
     || state === "uploading"
     || state === "completing";
+  const selectTransferPeer = (peer: DiscoveryPeer) => {
+    const currentPeerId = selectedPeerIdRef.current;
+    if (currentPeerId === peer.peerId) {
+      return;
+    }
+    const currentPeer = peers.find((item) => item.peerId === currentPeerId);
+    selectedPeerIdRef.current = peer.peerId;
+    setSelectedPeerId(peer.peerId);
+    setNotice(currentPeer
+      ? `发送目标已从 ${discoveryPeerDisplayName(currentPeer)} 切换为 ${discoveryPeerDisplayName(peer)}`
+      : `已选择 ${discoveryPeerDisplayName(peer)}`);
+  };
   const fileTargetRequired = networkMode === "lan" || !ossFallbackEnabled;
   const fileDropzoneTitle = isFileDragActive
     ? "松开即可发送"
@@ -1352,6 +1374,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setWhiteboardEvents([]);
     setDiagramEvents([]);
     setPeers([]);
+    selectedPeerIdRef.current = "";
     setSelectedPeerId("");
     setSelectedFiles([]);
     fileDragDepthRef.current = 0;
@@ -3214,7 +3237,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                       type="button"
                       role="radio"
                       aria-checked={selected}
-                      onClick={() => setSelectedPeerId(peer.peerId)}
+                      onClick={() => selectTransferPeer(peer)}
                       className={`app-apple-tool-peer min-h-11 shrink-0 rounded-md px-3 py-1.5 text-tiny transition-colors ${selected ? "is-selected" : ""}`}
                     >
                       {discoveryPeerDisplayName(peer)}
@@ -3462,8 +3485,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               <h2 className="text-lg font-semibold">发送给谁</h2>
               <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
                 {isInternetMode
-                  ? "对方打开远程邀请链接后，点一下名字再发送。"
-                  : "同一网络中的设备进入相同房间后，点一下名字再发送。"}
+                  ? "对方打开远程邀请后会默认选中首台设备，也可以点名字切换。"
+                  : "发现设备后会默认选中第一台，也可以点名字切换。"}
               </div>
             </div>
             <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "primary" : "default"}>
@@ -3481,7 +3504,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               <button
                 key={peer.peerId}
                 type="button"
-                onClick={() => setSelectedPeerId(peer.peerId)}
+                onClick={() => selectTransferPeer(peer)}
                 className={`app-apple-tool-peer px-3 py-2 text-left text-small transition-colors ${selectedPeerId === peer.peerId ? "is-selected" : ""}`}
               >
                 <div className="flex items-center justify-between gap-2">

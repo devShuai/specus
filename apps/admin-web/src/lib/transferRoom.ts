@@ -60,12 +60,14 @@ export function resolveTransferNetworkMode(
   return roomToken?.trim() ? "internet" : "lan";
 }
 
-export function retainExplicitTransferPeerSelection(
+export function resolveTransferPeerSelection(
   currentPeerId: string,
   visiblePeerIds: readonly string[],
 ): string {
-  if (!currentPeerId) return "";
-  return visiblePeerIds.includes(currentPeerId) ? currentPeerId : "";
+  if (currentPeerId && visiblePeerIds.includes(currentPeerId)) {
+    return currentPeerId;
+  }
+  return visiblePeerIds[0] ?? "";
 }
 
 export function localizeTransferDiscoveryError(message: string): string {

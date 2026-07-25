@@ -3,7 +3,7 @@ import {
   MAX_TRANSFER_ROOM_NAME_LENGTH,
   MAX_TRANSFER_ROOM_TOKEN_LENGTH,
   localizeTransferDiscoveryError,
-  retainExplicitTransferPeerSelection,
+  resolveTransferPeerSelection,
   resolveTransferNetworkMode,
   validateTransferRoomSettings,
 } from "./transferRoom";
@@ -49,10 +49,11 @@ describe("transfer room settings", () => {
     expect(resolveTransferNetworkMode("external", null)).toBe("internet");
   });
 
-  it("never silently changes an explicit target when its peer goes offline", () => {
-    expect(retainExplicitTransferPeerSelection("peer-a", ["peer-a", "peer-b"])).toBe("peer-a");
-    expect(retainExplicitTransferPeerSelection("peer-a", ["peer-b"])).toBe("");
-    expect(retainExplicitTransferPeerSelection("", ["peer-b"])).toBe("");
+  it("defaults to the first peer while retaining an available explicit target", () => {
+    expect(resolveTransferPeerSelection("peer-b", ["peer-a", "peer-b"])).toBe("peer-b");
+    expect(resolveTransferPeerSelection("peer-a", ["peer-b"])).toBe("peer-b");
+    expect(resolveTransferPeerSelection("", ["peer-b"])).toBe("peer-b");
+    expect(resolveTransferPeerSelection("peer-a", [])).toBe("");
   });
 
   it("keeps raw server diagnostics out of the primary discovery message", () => {
