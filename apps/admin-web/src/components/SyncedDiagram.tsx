@@ -928,6 +928,7 @@ export function SyncedDiagram({
     logout,
   } = useAuth();
   const graphContainerRef = useRef<HTMLDivElement | null>(null);
+  const rootSectionRef = useRef<HTMLElement | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const outlineContainerRef = useRef<HTMLDivElement | null>(null);
   const paletteElementRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -1003,6 +1004,10 @@ export function SyncedDiagram({
   const [compactPanel, setCompactPanel] = useState<"library" | "inspector" | null>(null);
   const [isLibraryVisible, setIsLibraryVisible] = useState(() => readDiagramBooleanPreference("diagram-library-visible") ?? true);
   const [isInspectorVisible, setIsInspectorVisible] = useState(() => readDiagramBooleanPreference("diagram-inspector-visible") ?? false);
+  // 网格吸附默认开启（10px），但需要可关闭：贴合边界或做像素级微调时，
+  // 强制吸附会让元素无法停在网格之间的位置。
+  const [gridSnapEnabled, setGridSnapEnabled] = useState(() => readDiagramBooleanPreference("diagram-grid-snap") ?? true);
+  const gridSnapEnabledRef = useRef(gridSnapEnabled);
   const [libraryWidth, setLibraryWidth] = useState(() => readDiagramPanelWidth("diagram-library-width", 260, 220, 380));
   const [inspectorWidth, setInspectorWidth] = useState(() => readDiagramPanelWidth("diagram-inspector-width", 300, 260, 420));
   const [inspectorPinned, setInspectorPinned] = useState(() => readDiagramBooleanPreference("diagram-inspector-pinned") ?? false);
@@ -1091,6 +1096,13 @@ export function SyncedDiagram({
   useEffect(() => {
     writeDiagramBooleanPreference("diagram-inspector-visible", isInspectorVisible);
   }, [isInspectorVisible]);
+
+  useEffect(() => {
+    // graph 在独立 effect 中创建，初始化时读 ref 取当前值，避免把 graph 重建绑到该开关上。
+    gridSnapEnabledRef.current = gridSnapEnabled;
+    writeDiagramBooleanPreference("diagram-grid-snap", gridSnapEnabled);
+    runtimeRef.current?.graph?.setGridEnabled(gridSnapEnabled);
+  }, [gridSnapEnabled]);
 
   useEffect(() => {
     writeDiagramBooleanPreference("diagram-inspector-pinned", inspectorPinned);
@@ -1241,7 +1253,7 @@ export function SyncedDiagram({
         scheduleDocumentRender();
       })
       .catch((error) => {
-        if (active) setStatus(error instanceof Error ? error.message : "扩展图形库加载失败");
+        if (active) setStatus(error instanceof Error ? error.message : "扩展图形库加载失败", "error");
       });
     return () => {
       active = false;
@@ -1284,7 +1296,7 @@ export function SyncedDiagram({
         if (active) setRuntimeEpoch((value) => value + 1);
       })
       .catch((error) => {
-        if (active) setStatus(error instanceof Error ? error.message : `${collection.name} 加载失败`);
+        if (active) setStatus(error instanceof Error ? error.message : `${collection.name} 加载失败`, "error");
       })
       .finally(() => {
         if (active) setLoadingStencilCollection((current) => current === collection.id ? null : current);
@@ -1306,7 +1318,7 @@ export function SyncedDiagram({
         if (active) setRuntimeEpoch((value) => value + 1);
       })
       .catch((error) => {
-        if (active) setStatus(error instanceof Error ? error.message : "搜索图形加载失败");
+        if (active) setStatus(error instanceof Error ? error.message : "搜索图形加载失败", "error");
       });
     return () => {
       active = false;
@@ -1572,7 +1584,7 @@ export function SyncedDiagram({
         setVersions(snapshots);
       })
       .catch((error) => {
-        if (active) setStatus(error instanceof Error ? error.message : "加载流程图版本失败");
+        if (active) setStatus(error instanceof Error ? error.message : "加载流程图版本失败", "error");
       })
       .finally(() => {
         if (active) setIsVersionLoading(false);
@@ -1605,7 +1617,7 @@ export function SyncedDiagram({
     graph.setMultigraph(false);
     graph.setPanning(true);
     graph.setTooltips(true);
-    graph.setGridEnabled(true);
+    graph.setGridEnabled(gridSnapEnabledRef.current);
     graph.setGridSize(DIAGRAM_CANVAS.gridSize);
     graph.setCellsEditable(!isReadOnlyRef.current);
     graph.setCellsResizable(!isReadOnlyRef.current);
@@ -1843,7 +1855,7 @@ export function SyncedDiagram({
         if (library) {
           void ensureStencilLibraryLoaded(library)
             .then(scheduleDocumentRender)
-            .catch((error) => setStatus(error instanceof Error ? error.message : `${library.name} 加载失败`));
+            .catch((error) => setStatus(error instanceof Error ? error.message : `${library.name} 加载失败`, "error"));
         }
       }
       const selectedIds = new Set(graph.getSelectionCells().map((cell) => cell.getId()).filter(Boolean));
@@ -2516,7 +2528,7 @@ export function SyncedDiagram({
       const item = stencilPaletteItem(library, shape);
       withGraph((graph) => insertNodeIntoGraph(graph, item.kind, undefined, undefined, item));
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : `${library.name} 加载失败`);
+      setStatus(error instanceof Error ? error.message : `${library.name} 加载失败`, "error");
     }
   }, [ensureStencilLibraryLoaded, insertNodeIntoGraph, isReadOnly, withGraph]);
 
@@ -3392,7 +3404,7 @@ export function SyncedDiagram({
       downloadDiagramFile(svg, "image/svg+xml", diagramExportFileName(new Date(), ".svg"));
       setStatus("已导出可缩放的 SVG 图片。");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "SVG 导出失败");
+      setStatus(error instanceof Error ? error.message : "SVG 导出失败", "error");
     }
   }, [theme]);
 
@@ -3408,7 +3420,7 @@ export function SyncedDiagram({
       downloadDiagramBlob(png, diagramExportFileName(new Date(), ".png"));
       setStatus("已导出 2 倍分辨率 PNG 图片。");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "PNG 导出失败");
+      setStatus(error instanceof Error ? error.message : "PNG 导出失败", "error");
     }
   }, [theme]);
 
@@ -3492,7 +3504,7 @@ export function SyncedDiagram({
       downloadDiagramBlob(pdf.output("blob"), diagramExportFileName(new Date(), ".pdf"));
       setStatus(`已导出包含 ${orderedPages.length} 个页面的 PDF。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "PDF 导出失败");
+      setStatus(error instanceof Error ? error.message : "PDF 导出失败", "error");
     }
   }, [pages, theme]);
 
@@ -3568,7 +3580,7 @@ export function SyncedDiagram({
       refreshUndoState();
       setStatus(`已导入 ${importedPages.length} 个页面、${imported.nodes.length} 个节点和 ${imported.edges.length} 条连线。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "流程图导入失败");
+      setStatus(error instanceof Error ? error.message : "流程图导入失败", "error");
     } finally {
       setIsImporting(false);
     }
@@ -3732,7 +3744,7 @@ export function SyncedDiagram({
       setVersions(versionsRef.current);
       setStatus(`已创建版本“${snapshot.name}”。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "创建流程图版本失败");
+      setStatus(error instanceof Error ? error.message : "创建流程图版本失败", "error");
     } finally {
       setIsVersionLoading(false);
     }
@@ -3760,7 +3772,7 @@ export function SyncedDiagram({
       replaceDiagramWithUpdate(update);
       setStatus(`已恢复版本“${snapshot.name}”。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "版本恢复失败");
+      setStatus(error instanceof Error ? error.message : "版本恢复失败", "error");
     } finally {
       setIsVersionLoading(false);
     }
@@ -3781,7 +3793,7 @@ export function SyncedDiagram({
       setVersions(versionsRef.current);
       setStatus(`已删除版本“${snapshot.name}”。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "删除流程图版本失败");
+      setStatus(error instanceof Error ? error.message : "删除流程图版本失败", "error");
     } finally {
       setIsVersionLoading(false);
     }
@@ -3827,7 +3839,7 @@ export function SyncedDiagram({
     try {
       setCloudDocuments(await adminApi.listDiagrams());
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "读取云端流程图失败");
+      setStatus(error instanceof Error ? error.message : "读取云端流程图失败", "error");
     } finally {
       setIsCloudBusy(false);
     }
@@ -3870,7 +3882,7 @@ export function SyncedDiagram({
         ? `“${created.name}”已保存；保存期间的新修改尚未保存。`
         : `“${created.name}”已保存到云端。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "保存云端流程图失败");
+      setStatus(error instanceof Error ? error.message : "保存云端流程图失败", "error");
     } finally {
       setIsCloudBusy(false);
     }
@@ -3903,7 +3915,7 @@ export function SyncedDiagram({
         ? `“${saved.name}”已保存；保存期间的新修改尚未保存。`
         : `“${saved.name}”已保存。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "保存云端流程图失败");
+      setStatus(error instanceof Error ? error.message : "保存云端流程图失败", "error");
     } finally {
       setIsCloudBusy(false);
     }
@@ -3940,7 +3952,7 @@ export function SyncedDiagram({
       setCloudDocuments((documents) => [saved, ...documents.filter((item) => item.id !== saved.id)]);
       setStatus(`流程图已重命名为“${saved.name}”并保存。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "重命名流程图失败");
+      setStatus(error instanceof Error ? error.message : "重命名流程图失败", "error");
     } finally {
       setIsCloudBusy(false);
     }
@@ -3968,7 +3980,7 @@ export function SyncedDiagram({
       setCloudDialog(null);
       setStatus(`已打开云端文件“${detail.document.name}”。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "打开云端流程图失败");
+      setStatus(error instanceof Error ? error.message : "打开云端流程图失败", "error");
     } finally {
       setIsCloudBusy(false);
     }
@@ -3988,7 +4000,7 @@ export function SyncedDiagram({
       if (cloudDocumentRef.current?.id === item.id) selectCloudDocument(null);
       setStatus(`已删除云端文件“${item.name}”。`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "删除云端流程图失败");
+      setStatus(error instanceof Error ? error.message : "删除云端流程图失败", "error");
     } finally {
       setIsCloudBusy(false);
     }
@@ -4047,8 +4059,19 @@ export function SyncedDiagram({
     if (!graph) {
       return;
     }
+    // 内嵌模式下编辑器只是页面的一部分：焦点不在编辑器内时，不响应会改动内容或
+    // 接管选区的快捷键，避免在页面其它位置操作时误删画布元素。
+    const editorHasFocus = isFullViewport
+      || (rootSectionRef.current?.contains(document.activeElement) ?? false);
     const modifier = event.metaKey || event.ctrlKey;
     const key = event.key.toLowerCase();
+    const isScopedShortcut = event.key === "Delete" || event.key === "Backspace"
+      || (modifier && ["a", "z", "y", "x", "v", "d", "c"].includes(key))
+      || event.key === "Enter" || event.key === "F2"
+      || event.key.startsWith("Arrow");
+    if (isScopedShortcut && !editorHasFocus) {
+      return;
+    }
     if (event.key === "Escape") {
       if (showCollaborationPanel) setShowCollaborationPanel(false);
       else if (contextMenu) setContextMenu(null);
@@ -4309,6 +4332,7 @@ export function SyncedDiagram({
 
   const diagram = (
     <section
+      ref={rootSectionRef}
       className={`diagram-apple ${isFullViewport
         ? "diagram-apple-full fixed inset-0 z-[90] h-[100dvh] overflow-hidden bg-zinc-100 dark:bg-zinc-950"
         : "mt-5 rounded-2xl border border-black/[0.07] bg-zinc-50/70 p-3 shadow-[0_18px_60px_-36px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-zinc-950/55 sm:p-4"}${isActive ? "" : " hidden"}`}
@@ -4339,18 +4363,18 @@ export function SyncedDiagram({
               <div className="flex flex-wrap items-center gap-2.5">
                 <div>
                   <h2 className="text-sm font-semibold text-zinc-950 dark:text-white">专业流程图</h2>
-                  <p className="mt-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">{activePageName} · 实时协作工作区</p>
+                  <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">{activePageName} · 实时协作工作区</p>
                 </div>
                 {onSwitchToWhiteboard ? (
                   <div className="diagram-apple-mode-switch flex rounded-lg border border-black/[0.07] bg-white/70 p-0.5 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]">
                     <button
                       type="button"
-                      className="diagram-apple-mode-option rounded-md px-2.5 py-1 text-[10px] font-medium text-zinc-500 transition hover:bg-black/[0.04] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
+                      className="diagram-apple-mode-option rounded-md px-2.5 py-1 text-[11px] font-medium text-zinc-500 transition hover:bg-black/[0.04] hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-white/[0.06] dark:hover:text-white"
                       onClick={switchToWhiteboard}
                     >
                       自由白板
                     </button>
-                    <button type="button" className="diagram-apple-mode-option diagram-apple-mode-option-active rounded-md bg-zinc-950 px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
+                    <button type="button" className="diagram-apple-mode-option diagram-apple-mode-option-active rounded-md bg-zinc-950 px-2.5 py-1 text-[11px] font-semibold text-white shadow-sm dark:bg-[var(--diagram-apple-blue)] dark:text-zinc-950">
                       专业流程图
                     </button>
                   </div>
@@ -4359,7 +4383,7 @@ export function SyncedDiagram({
                   <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-[var(--diagram-apple-success)] shadow-[0_0_0_3px_var(--diagram-apple-success-soft)]" : "bg-zinc-400"}`} />
                   {isConnected ? "实时同步" : "本地编辑"}
                 </span>
-                <span className="hidden text-[10px] text-zinc-400 xl:inline">{totalPeers} 位协作者 · {nodeCount} 个节点 · {edgeCount} 条连线</span>
+                <span className="hidden text-[11px] text-zinc-400 xl:inline">{totalPeers} 位协作者 · {nodeCount} 个节点 · {edgeCount} 条连线</span>
               </div>
             </div>
           </div>
@@ -4524,6 +4548,7 @@ export function SyncedDiagram({
               { key: "fit", label: "适应画布", shortcut: "Shift+1" },
               { key: "actual", label: "实际大小 100%", shortcut: `${modifierLabel}0` },
               { key: "minimap", label: showMinimap ? "隐藏小地图" : "显示小地图" },
+              { key: "grid-snap", label: "对齐到网格", selected: gridSnapEnabled },
               { key: "inspector", label: isInspectorVisible ? "隐藏设计属性" : "显示设计属性", selected: isInspectorVisible },
               { key: "theme-system", label: "主题：跟随系统", selected: !hasThemeOverride },
               { key: "theme-light", label: "主题：浅色模式", selected: hasThemeOverride && theme === "light" },
@@ -4539,6 +4564,13 @@ export function SyncedDiagram({
                 setShowMinimap((value) => {
                   const next = !value;
                   writeDiagramBooleanPreference("diagram-minimap-visible", next);
+                  return next;
+                });
+              }
+              else if (key === "grid-snap") {
+                setGridSnapEnabled((value) => {
+                  const next = !value;
+                  setStatus(next ? "已开启对齐到网格。" : "已关闭对齐到网格，可自由微调位置。", "info");
                   return next;
                 });
               }
@@ -4619,17 +4651,17 @@ export function SyncedDiagram({
                 onClick={() => setShowCollaborationPanel(true)}
               >
                 <span className="flex -space-x-1.5">
-                  <span className="grid h-6 w-6 place-items-center rounded-full border-2 border-[var(--diagram-apple-surface)] bg-zinc-700 text-[9px] font-semibold text-white">我</span>
+                  <span className="grid h-6 w-6 place-items-center rounded-full border-2 border-[var(--diagram-apple-surface)] bg-zinc-700 text-[10px] font-semibold text-white">我</span>
                   {visibleCollaborators.map((presence) => {
                     const displayName = peerDisplayNames[presence.peerId]?.trim() || "协";
                     return (
-                      <span key={presence.peerId} className="grid h-6 w-6 place-items-center rounded-full border-2 border-[var(--diagram-apple-surface)] text-[9px] font-semibold text-white" style={{ backgroundColor: diagramPresenceColors(presence.peerId).solid }} title={displayName}>
+                      <span key={presence.peerId} className="grid h-6 w-6 place-items-center rounded-full border-2 border-[var(--diagram-apple-surface)] text-[10px] font-semibold text-white" style={{ backgroundColor: diagramPresenceColors(presence.peerId).solid }} title={displayName}>
                         {displayName.slice(0, 1)}
                       </span>
                     );
                   })}
                 </span>
-                <span className="ml-1.5 text-[10px] text-zinc-500 dark:text-zinc-400">{totalPeers}</span>
+                <span className="ml-1.5 text-[11px] text-zinc-500 dark:text-zinc-400">{totalPeers}</span>
               </button>
             ) : null}
             <div className="mr-1 hidden items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400 xl:flex" aria-label="流程图状态">
@@ -4710,7 +4742,7 @@ export function SyncedDiagram({
               <path d="M3 4h10M3 8h10M3 12h10M6 2.5v3M10 6.5v3M7 10.5v3" />
             </CompactPanelButton>
           </div>
-          <span className="min-w-0 truncate pl-2 text-right text-[10px] text-zinc-500 dark:text-zinc-400">{nodeCount} 节点 · {edgeCount} 连线</span>
+          <span className="min-w-0 truncate pl-2 text-right text-[11px] text-zinc-500 dark:text-zinc-400">{nodeCount} 节点 · {edgeCount} 连线</span>
         </div>
 
         <div className={`diagram-apple-workspace relative grid min-h-0 flex-1 grid-cols-1 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none ${
@@ -4738,7 +4770,7 @@ export function SyncedDiagram({
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">图形库</div>
-                <div className="mt-0.5 text-[10px] text-zinc-400">拖拽或点击添加</div>
+                <div className="mt-0.5 text-[11px] text-zinc-400">拖拽或点击添加</div>
               </div>
               <span className="flex items-center gap-1.5">
                 <span className="diagram-apple-count-badge">{libraryCountLabel}</span>
@@ -4779,7 +4811,7 @@ export function SyncedDiagram({
               </div>
             ) : null}
             {!paletteSearchQuery && paletteView === "common" ? <div className="mt-4 block">
-              <div className="text-[10px] font-semibold uppercase text-zinc-400">快速模板</div>
+              <div className="text-[11px] font-semibold uppercase text-zinc-400">快速模板</div>
               <div className="mt-2 grid grid-cols-3 gap-1.5">
                 {(Object.entries(DIAGRAM_TEMPLATES) as Array<[DiagramTemplateId, DiagramTemplateDefinition]>).map(([id, template]) => (
                   <button
@@ -4793,17 +4825,17 @@ export function SyncedDiagram({
                   >
                     <DiagramTemplateThumbnail template={template} />
                     <span className="block text-[11px] font-semibold text-[var(--diagram-apple-blue)]">{template.shortName}</span>
-                    <span className="mt-0.5 block truncate text-[10px] text-[var(--diagram-apple-muted)]">{template.detail}</span>
+                    <span className="mt-0.5 block truncate text-[11px] text-[var(--diagram-apple-muted)]">{template.detail}</span>
                   </button>
                 ))}
               </div>
             </div> : null}
             <div className="mt-3 min-w-0 border-t border-black/[0.05] pt-3 dark:border-white/[0.06]">
               <div className="mb-2 flex items-center justify-between px-1">
-                <span className="diagram-apple-section-label text-[10px]">
+                <span className="diagram-apple-section-label text-[11px]">
                   {paletteSearchQuery ? "搜索结果" : "完整图库"}
                 </span>
-                <span className="font-mono text-[10px] text-zinc-400">{librarySummaryLabel}</span>
+                <span className="font-mono text-[11px] text-zinc-400">{librarySummaryLabel}</span>
               </div>
               {PALETTE_CATEGORIES.map((category) => {
                 const items = paletteVisibleBuiltInItems.filter((item) => item.category === category);
@@ -4826,7 +4858,7 @@ export function SyncedDiagram({
                         <svg className={`h-3 w-3 shrink-0 text-zinc-400 transition-transform ${isCategoryOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
                         <span className="truncate">{category}</span>
                       </span>
-                      <span className="font-mono text-[10px] text-zinc-400">{items.length}</span>
+                      <span className="font-mono text-[11px] text-zinc-400">{items.length}</span>
                     </button>
                     <div className={`border-t border-black/[0.05] p-1 dark:border-white/[0.06] ${isCategoryOpen ? "block" : "hidden"}`}>
                       <div className="grid grid-cols-3 gap-1">
@@ -4857,7 +4889,7 @@ export function SyncedDiagram({
                                 <DiagramNodeGlyph kind={item.kind} />
                                 <span className="min-w-0 w-full">
                                   <span className="diagram-apple-palette-label block truncate text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">{item.label}</span>
-                                  <span className="diagram-apple-palette-detail block truncate text-[10px] text-zinc-400">{item.detail}</span>
+                                  <span className="diagram-apple-palette-detail block truncate text-[11px] text-zinc-400">{item.detail}</span>
                                 </span>
                               </button>
                               <button
@@ -4886,7 +4918,7 @@ export function SyncedDiagram({
                 <div className="diagram-apple-collection mt-1.5 overflow-hidden rounded-lg border border-black/[0.06] bg-white/55 dark:border-white/[0.07] dark:bg-white/[0.02]">
                   <div className="flex h-8 items-center justify-between px-2">
                     <span className="truncate text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">更多匹配</span>
-                    <span className="font-mono text-[10px] text-zinc-400">{stencilSearchResults.length}{stencilSearchResults.length === STENCIL_SEARCH_LIMIT ? "+" : ""}</span>
+                    <span className="font-mono text-[11px] text-zinc-400">{stencilSearchResults.length}{stencilSearchResults.length === STENCIL_SEARCH_LIMIT ? "+" : ""}</span>
                   </div>
                   {stencilSearchResults.length ? (
                     <div className="border-t border-black/[0.05] p-1 dark:border-white/[0.06]">
@@ -4917,8 +4949,8 @@ export function SyncedDiagram({
                               }}
                             >
                               <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
-                              <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
-                              <span className="diagram-apple-palette-detail block w-full truncate text-[10px] text-zinc-400">{library.name}</span>
+                              <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
+                              <span className="diagram-apple-palette-detail block w-full truncate text-[11px] text-zinc-400">{library.name}</span>
                             </button>
                           );
                         })}
@@ -4950,7 +4982,7 @@ export function SyncedDiagram({
                             <svg className={`h-3 w-3 shrink-0 text-zinc-400 transition-transform ${isGroupOpen ? "rotate-90" : ""}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
                             <span className="truncate">{group.name}</span>
                           </span>
-                          <span className="font-mono text-[10px] text-zinc-400">{collections.length}</span>
+                          <span className="font-mono text-[11px] text-zinc-400">{collections.length}</span>
                         </button>
                         {isGroupOpen ? (
                           <div className="border-t border-black/[0.05] p-1 dark:border-white/[0.06]">
@@ -4964,8 +4996,8 @@ export function SyncedDiagram({
                                     className={`diagram-apple-collection-row flex min-h-11 w-full items-center justify-between rounded-md px-2 text-left transition sm:min-h-8 ${isActive ? "bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)]" : "text-zinc-600 hover:bg-black/[0.035] dark:text-zinc-300 dark:hover:bg-white/[0.04]"}`}
                                     onClick={() => openStencilCollection(collection)}
                                   >
-                                    <span className="truncate text-[10px] font-medium">{collection.name}</span>
-                                    <span className="ml-2 shrink-0 font-mono text-[10px] text-zinc-400">{loadingStencilCollection === collection.id ? "加载中" : collection.libraryCount > 1 ? `${collection.shapeCount} · ${collection.libraryCount}库` : collection.shapeCount}</span>
+                                    <span className="truncate text-[11px] font-medium">{collection.name}</span>
+                                    <span className="ml-2 shrink-0 font-mono text-[11px] text-zinc-400">{loadingStencilCollection === collection.id ? "加载中" : collection.libraryCount > 1 ? `${collection.shapeCount} · ${collection.libraryCount}库` : collection.shapeCount}</span>
                                   </button>
                                   {isActive ? (
                                     <div className="mt-1.5 grid grid-cols-3 gap-1 px-1 pb-1.5">
@@ -4995,13 +5027,13 @@ export function SyncedDiagram({
                                             }}
                                           >
                                             <DrawioStencilGlyph stencilName={shape.shape} loaded={isLoaded} />
-                                            <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
-                                            {collection.libraryCount > 1 ? <span className="diagram-apple-palette-detail block w-full truncate text-[10px] text-zinc-400">{library.name}</span> : null}
+                                            <span className="diagram-apple-palette-label mt-1 block w-full truncate text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">{shape.name}</span>
+                                            {collection.libraryCount > 1 ? <span className="diagram-apple-palette-detail block w-full truncate text-[11px] text-zinc-400">{library.name}</span> : null}
                                           </button>
                                         );
                                       })}
                                       {collection.shapeCount > stencilShapeLimit ? (
-                                        <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[10px] font-medium text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 dark:border-white/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
+                                        <button type="button" className="col-span-3 rounded-md border border-dashed border-black/10 px-2 py-2 text-[11px] font-medium text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 dark:border-white/10" onClick={() => setStencilShapeLimit((current) => current + STENCIL_PAGE_SIZE)}>
                                           加载更多 · {collection.shapeCount - stencilShapeLimit} 个
                                         </button>
                                       ) : null}
@@ -5018,7 +5050,7 @@ export function SyncedDiagram({
                 </>
               ) : null}
               {paletteSearchQuery && builtInPaletteResultCount === 0 && (!stencilCatalog || stencilSearchResults.length === 0) ? (
-                <div className="mt-1.5 rounded-lg border border-dashed border-black/10 p-4 text-center text-[10px] text-zinc-400 dark:border-white/10">未找到匹配图形</div>
+                <div className="mt-1.5 rounded-lg border border-dashed border-black/10 p-4 text-center text-[11px] text-zinc-400 dark:border-white/10">未找到匹配图形</div>
               ) : null}
             </div>
           </aside>
@@ -5100,7 +5132,7 @@ export function SyncedDiagram({
               return (
                 <div key={presence.peerId} className="diagram-apple-remote-cursor pointer-events-none absolute z-30" style={{ left, top }}>
                   <span className="block h-3 w-3 rotate-45 border-l-2 border-t-2" style={{ borderColor: colors.solid }} />
-                  <span className="ml-2 rounded px-1.5 py-0.5 text-[10px] font-semibold text-white shadow" style={{ backgroundColor: colors.solid }}>
+                  <span className="ml-2 rounded px-1.5 py-0.5 text-[11px] font-semibold text-white shadow" style={{ backgroundColor: colors.solid }}>
                     {displayName}{presence.selectedIds.length > 0 ? ` · 已选 ${presence.selectedIds.length}` : ""}
                   </span>
                 </div>
@@ -5175,8 +5207,8 @@ export function SyncedDiagram({
                 </div>
               </div>
             ) : null}
-            <div className="diagram-apple-canvas-hint pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2.5 py-1.5 text-[10px] text-zinc-500 shadow-sm backdrop-blur-xl dark:text-zinc-400 sm:flex">
-              <span className="grid h-4 w-4 place-items-center rounded bg-[var(--diagram-apple-blue-soft)] text-[10px] font-bold text-[var(--diagram-apple-blue)]">?</span>
+            <div className="diagram-apple-canvas-hint pointer-events-none absolute bottom-3 left-3 hidden items-center gap-2 rounded-lg border border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2.5 py-1.5 text-[11px] text-zinc-500 shadow-sm backdrop-blur-xl dark:text-zinc-400 sm:flex">
+              <span className="grid h-4 w-4 place-items-center rounded bg-[var(--diagram-apple-blue-soft)] text-[11px] font-bold text-[var(--diagram-apple-blue)]">?</span>
               Ctrl+Shift 拖动画布 · Ctrl+滚轮缩放 · Shift 点击连线增删折点
             </div>
             {interactionMode === "connect" ? (
@@ -5251,7 +5283,7 @@ export function SyncedDiagram({
                 <span className="block text-[11px] font-semibold text-zinc-900 dark:text-zinc-100">
                   {inspectorTab === "design" ? "设计属性" : inspectorTab === "comments" ? "协作评论" : "版本历史"}
                 </span>
-                <span className="block text-[10px] text-zinc-500 dark:text-zinc-400">
+                <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">
                   {inspectorTab === "design" ? "样式、文字与几何" : inspectorTab === "comments" ? "页面与元素讨论" : "快照、恢复与回溯"}
                 </span>
               </span>
@@ -5313,7 +5345,7 @@ export function SyncedDiagram({
                   <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 2 9 5-4 1.5L6.5 13z" /><path d="m9 9 3 4" /></svg>
                 </div>
                 <div className="mt-3 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">选择画布元素</div>
-                <div className="mt-1 text-[10px] leading-4 text-zinc-400">选中节点或连线后，在这里调整位置、尺寸、文字与外观。</div>
+                <div className="mt-1 text-[11px] leading-4 text-zinc-400">选中节点或连线后，在这里调整位置、尺寸、文字与外观。</div>
               </div>
             ) : (
               <div className="divide-y divide-black/[0.07] dark:divide-white/[0.08]">
@@ -5475,7 +5507,7 @@ export function SyncedDiagram({
                 <button
                   type="button"
                   disabled={isReadOnly}
-                  className="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35"
+                  className="rounded-md px-2 py-1 text-[11px] font-semibold text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35"
                   onClick={addComment}
                 >
                   + 评论
@@ -5483,7 +5515,7 @@ export function SyncedDiagram({
               </div>
               <div className="mt-2 space-y-2">
                 {comments.filter((comment) => comment.pageId === activePageId).length === 0 ? (
-                  <div className="rounded-md border border-dashed border-black/10 p-2 text-[10px] leading-4 text-zinc-400 dark:border-white/10">
+                  <div className="rounded-md border border-dashed border-black/10 p-2 text-[11px] leading-4 text-zinc-400 dark:border-white/10">
                     选中元素后添加评论，可把讨论定位到具体节点或连线。
                   </div>
                 ) : comments.filter((comment) => comment.pageId === activePageId).map((comment) => (
@@ -5491,17 +5523,17 @@ export function SyncedDiagram({
                     ? "border-black/5 bg-black/[0.02] opacity-60 dark:border-white/5 dark:bg-white/[0.02]"
                     : "border-amber-300/60 bg-amber-50/70 dark:border-amber-300/20 dark:bg-amber-300/[0.06]"}`}>
                     <button type="button" className="block w-full text-left" onClick={() => focusComment(comment)}>
-                      <span className="block text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">
+                      <span className="block text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">
                         {comment.author === peerId ? "我" : peerDisplayNames[comment.author]?.trim() || "协作者"}{comment.cellId ? " · 已关联元素" : " · 页面评论"}
                       </span>
                       <span className="mt-1 block whitespace-pre-wrap break-words text-tiny leading-5 text-zinc-600 dark:text-zinc-300">{comment.text}</span>
-                      <span className="mt-1 block text-[10px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(comment.createdAt)}</span>
+                      <span className="mt-1 block text-[11px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(comment.createdAt)}</span>
                     </button>
                     <div className="mt-1.5 flex gap-1">
-                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => toggleComment(comment)}>
+                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => toggleComment(comment)}>
                         {comment.resolved ? "重新打开" : "标记解决"}
                       </button>
-                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => deleteComment(comment.id)}>
+                      <button type="button" disabled={isReadOnly} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => deleteComment(comment.id)}>
                         删除
                       </button>
                     </div>
@@ -5511,24 +5543,24 @@ export function SyncedDiagram({
             </div> : null}
             {inspectorTab === "versions" ? <div>
               <div className="flex justify-end">
-                <button type="button" disabled={isRoleReadOnly || isVersionLoading} className="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void createVersion()}>+ 快照</button>
+                <button type="button" disabled={isRoleReadOnly || isVersionLoading} className="rounded-md px-2 py-1 text-[11px] font-semibold text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void createVersion()}>+ 快照</button>
               </div>
-              <p className="mt-1 text-[10px] leading-4 text-zinc-500 dark:text-zinc-400">{usesServerVersions ? "版本保存在房间服务端，最多保留 50 个。" : "版本快照保存在本次浏览器会话，最多保留 20 个。"}</p>
+              <p className="mt-1 text-[11px] leading-4 text-zinc-500 dark:text-zinc-400">{usesServerVersions ? "版本保存在房间服务端，最多保留 50 个。" : "版本快照保存在本次浏览器会话，最多保留 20 个。"}</p>
               <div className="mt-2 space-y-1.5">
                 {versions.length === 0 ? (
-                  <div className="rounded-md border border-dashed border-black/10 p-3 text-center text-[10px] leading-4 text-zinc-500 dark:border-white/10 dark:text-zinc-400">
+                  <div className="rounded-md border border-dashed border-black/10 p-3 text-center text-[11px] leading-4 text-zinc-500 dark:border-white/10 dark:text-zinc-400">
                     暂无版本快照
                   </div>
                 ) : versions.slice().reverse().map((version) => (
                   <div key={version.id} className="flex items-center justify-between gap-2 rounded-md border border-black/10 p-2 dark:border-white/10">
                     <span className="min-w-0">
-                      <span className="block truncate text-[10px] font-semibold text-zinc-700 dark:text-zinc-200">{version.name}</span>
-                      <span className="block text-[10px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(version.createdAt)}</span>
+                      <span className="block truncate text-[11px] font-semibold text-zinc-700 dark:text-zinc-200">{version.name}</span>
+                      <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">{formatDiagramTimestamp(version.createdAt)}</span>
                     </span>
                     <span className="flex shrink-0 gap-1">
-                      <button type="button" disabled={isReadOnly || isVersionLoading} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void restoreVersion(version)}>恢复</button>
+                      <button type="button" disabled={isReadOnly || isVersionLoading} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-blue)] hover:bg-[var(--diagram-apple-blue-soft)] disabled:opacity-35" onClick={() => void restoreVersion(version)}>恢复</button>
                       {roomRole === "OWNER" && version.serverId !== undefined ? (
-                        <button type="button" disabled={isVersionLoading} className="rounded px-1.5 py-1 text-[10px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => void deleteVersion(version)}>删除</button>
+                        <button type="button" disabled={isVersionLoading} className="rounded px-1.5 py-1 text-[11px] text-[var(--diagram-apple-danger)] hover:bg-[var(--diagram-apple-danger-soft)] disabled:opacity-35" onClick={() => void deleteVersion(version)}>删除</button>
                       ) : null}
                     </span>
                   </div>
@@ -5556,7 +5588,7 @@ export function SyncedDiagram({
               <div className="diagram-apple-collaboration-header flex h-12 shrink-0 items-center justify-between border-b border-black/[0.07] px-3.5 dark:border-white/[0.08]">
                 <div>
                   <h2 id="diagram-collaboration-title" className="text-sm font-semibold text-zinc-950 dark:text-white">房间与协作</h2>
-                  <p className="text-[10px] text-zinc-500 dark:text-zinc-400">房间、邀请与在线成员</p>
+                  <p className="text-[11px] text-zinc-500 dark:text-zinc-400">房间、邀请与在线成员</p>
                 </div>
                 <button
                   type="button"
@@ -5723,7 +5755,7 @@ export function SyncedDiagram({
 
         <div className="diagram-apple-footer flex h-12 shrink-0 items-center gap-2 border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface)] px-2 text-[11px] text-zinc-500 backdrop-blur-xl dark:text-zinc-400 sm:h-9">
           <div className="diagram-apple-pages diagram-apple-pages-bottom flex min-w-0 flex-[1_1_48%] items-center" aria-label="流程图页面">
-            <span className="diagram-apple-section-label mr-1 hidden shrink-0 px-1 text-[10px] font-semibold text-zinc-500 sm:inline">页面</span>
+            <span className="diagram-apple-section-label mr-1 hidden shrink-0 px-1 text-[11px] font-semibold text-zinc-500 sm:inline">页面</span>
             <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
               {pages.map((page) => (
                 <button
@@ -5778,9 +5810,9 @@ export function SyncedDiagram({
             </div>
           </div>
           <span className="hidden h-5 w-px shrink-0 bg-black/[0.07] dark:bg-white/[0.08] md:block" />
-          <span className={`diagram-apple-status flex min-w-0 flex-1 items-center gap-2 truncate text-[10px] ${statusTone === "error" ? "text-[var(--diagram-apple-danger)]" : statusTone === "success" ? "text-[var(--diagram-apple-success)]" : ""}`} aria-live="polite">
+          <span className={`diagram-apple-status flex min-w-0 flex-1 items-center gap-2 truncate text-[11px] ${statusTone === "error" ? "text-[var(--diagram-apple-danger)]" : statusTone === "success" ? "text-[var(--diagram-apple-success)]" : ""}`} aria-live="polite">
             <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass}`} />
-            <span className="truncate">{status}</span>
+            <span className="truncate" title={status}>{status}</span>
           </span>
           <span className="hidden shrink-0 items-center gap-3 font-mono lg:flex"><span>{activePageName}</span><span>{nodeCount} 节点</span><span>{edgeCount} 连线{selectedCountLabel}</span></span>
         </div>
@@ -5948,7 +5980,7 @@ function DiagramCloudDocumentsDialog({
         <ModalHeader className="flex items-center justify-between gap-3 border-b border-[var(--diagram-apple-line)] px-5 pb-4 pt-5">
           <span className="min-w-0">
             <span className="block text-base font-semibold">我的云端文件</span>
-            <span className="mt-0.5 block text-[10px] font-normal text-zinc-500 dark:text-zinc-400">{documents.length} 个文件</span>
+            <span className="mt-0.5 block text-[11px] font-normal text-zinc-500 dark:text-zinc-400">{documents.length} 个文件</span>
           </span>
           <span className="flex shrink-0 gap-2 pr-7">
             <Button size="sm" radius="sm" variant="light" isDisabled={busy} onPress={onRefresh}>刷新</Button>
@@ -5979,9 +6011,9 @@ function DiagramCloudDocumentsDialog({
                     <div className="min-w-0 flex-1">
                       <div className="flex min-w-0 items-center gap-2">
                         <span className="truncate text-small font-semibold text-zinc-900 dark:text-zinc-100">{document.name}</span>
-                        {isCurrent ? <span className="shrink-0 rounded bg-[var(--diagram-apple-blue-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--diagram-apple-blue)]">当前</span> : null}
+                        {isCurrent ? <span className="shrink-0 rounded bg-[var(--diagram-apple-blue-soft)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--diagram-apple-blue)]">当前</span> : null}
                       </div>
-                      <div className="mt-1 flex flex-wrap gap-x-2 text-[10px] text-zinc-500 dark:text-zinc-400">
+                      <div className="mt-1 flex flex-wrap gap-x-2 text-[11px] text-zinc-500 dark:text-zinc-400">
                         <span>{formatCloudDiagramDate(document.updatedAt)}</span>
                         <span>{formatCloudDiagramBytes(document.sizeBytes)}</span>
                         <span>修订 {document.revision}</span>
@@ -6061,7 +6093,7 @@ function DiagramEditorDialog({
       <ModalContent>
         <form onSubmit={(event) => { event.preventDefault(); submit(); }}>
           <ModalHeader className="flex flex-col gap-1 border-b border-black/[0.07] px-5 pb-4 pt-5 dark:border-white/[0.08]">
-            <span className={`text-[10px] font-semibold uppercase ${request.tone === "danger"
+            <span className={`text-[11px] font-semibold uppercase ${request.tone === "danger"
               ? "text-[var(--diagram-apple-danger)]"
               : "text-[var(--diagram-apple-blue)]"}`}>专业编辑器</span>
             <span className="pr-8 text-[17px] font-semibold text-zinc-950 dark:text-white">{request.title}</span>
@@ -6118,7 +6150,7 @@ function DiagramEditorDialog({
                   />
                 )}
                 {request.maxLength ? (
-                  <p className="mt-1.5 text-right font-mono text-[10px] text-zinc-400" aria-live="polite">
+                  <p className="mt-1.5 text-right font-mono text-[11px] text-zinc-400" aria-live="polite">
                     {value.length}/{request.maxLength}
                   </p>
                 ) : null}
@@ -6418,8 +6450,16 @@ function diagramRecordsEqual<T>(left: T[], right: T[]) {
     && left.every((value, index) => JSON.stringify(value) === JSON.stringify(right[index]));
 }
 
+/**
+ * 仅作兜底：从文案推断语气。调用点应显式传入 tone，尤其是错误路径——
+ * 浏览器与第三方库抛出的 Error 常带英文 message（Failed to fetch 等），
+ * 匹配不到中文关键词就会退化成中性色，让真实失败看起来像普通提示。
+ *
+ * 约束类引导语（"至少需要两个节点"等）刻意不归为 error：它们是正常操作反馈，
+ * 用告警色会稀释真错误的信号价值。
+ */
 function inferDiagramStatusTone(message: string): DiagramStatusTone {
-  if (/失败|错误|无效|中断|超过|无法|已忽略|已锁定|请先|至少需要|为空|不存在/.test(message)) return "error";
+  if (/失败|错误|无效|中断|超过|无法|为空|不存在/.test(message)) return "error";
   if (/^(已|流程图已|同步已恢复|页面.+已|.+已创建)/.test(message)) return "success";
   return "info";
 }
@@ -7782,10 +7822,10 @@ function DiagramToolbarMenu({
               <svg className="h-3.5 w-3.5 text-primary" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 16 16" aria-hidden="true">
                 <path d="m3 8 3 3 7-7" />
               </svg>
-            ) : item.shortcut ? <span className="text-[10px] text-zinc-400">{item.shortcut}</span> : null}
+            ) : item.shortcut ? <span className="text-[11px] text-zinc-400">{item.shortcut}</span> : null}
           >
             <span className="min-w-0">
-              {item.section ? <span className="mb-1 block text-[9px] font-semibold uppercase text-zinc-400">{item.section}</span> : null}
+              {item.section ? <span className="mb-1 block text-[11px] font-semibold uppercase text-zinc-400">{item.section}</span> : null}
               <span className="block">{item.label}</span>
             </span>
           </DropdownItem>
@@ -7824,7 +7864,7 @@ function DiagramToolbarButton({
       onClick={onClick}
     >
       {label}
-      {shortcut ? <span className="hidden text-[10px] text-zinc-400 xl:inline">{shortcut}</span> : null}
+      {shortcut ? <span className="hidden text-[11px] text-zinc-400 xl:inline">{shortcut}</span> : null}
     </button>
   );
 }
@@ -8213,7 +8253,7 @@ function InspectorNumberField({
             }
           }}
         />
-        {suffix ? <span className="pr-2 text-[10px] text-zinc-400">{suffix}</span> : null}
+        {suffix ? <span className="pr-2 text-[11px] text-zinc-400">{suffix}</span> : null}
       </span>
     </label>
   );
@@ -8313,7 +8353,7 @@ function InspectorColorField({
           placeholder={mixed ? "混合" : undefined}
           inputMode="text"
           aria-label={`${label}色值`}
-          className="h-8 min-w-0 flex-1 rounded-md border border-black/[0.09] bg-white px-2 font-mono text-[10px] uppercase text-zinc-700 outline-none focus:border-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-zinc-950 dark:text-zinc-200"
+          className="h-8 min-w-0 flex-1 rounded-md border border-black/[0.09] bg-white px-2 font-mono text-[11px] uppercase text-zinc-700 outline-none focus:border-[var(--diagram-apple-blue)] dark:border-white/[0.1] dark:bg-zinc-950 dark:text-zinc-200"
           onFocus={(event) => {
             editingRef.current = true;
             event.currentTarget.select();
@@ -8335,7 +8375,7 @@ function InspectorColorField({
           <button
             type="button"
             aria-pressed={value === "none"}
-            className={`h-8 shrink-0 rounded-md px-2 text-[10px] font-medium transition ${value === "none"
+            className={`h-8 shrink-0 rounded-md px-2 text-[11px] font-medium transition ${value === "none"
               ? "bg-[var(--diagram-apple-blue)] text-white dark:text-zinc-950"
               : "text-zinc-500 hover:bg-black/[0.05] dark:text-zinc-400 dark:hover:bg-white/[0.06]"}`}
             onClick={() => {
@@ -8509,7 +8549,7 @@ function InspectorAction({
       type="button"
       disabled={disabled}
       aria-pressed={active}
-      className={`diagram-apple-inspector-action rounded-lg border px-2 py-1.5 text-[10px] font-medium transition hover:border-[var(--diagram-apple-blue)] hover:text-[var(--diagram-apple-blue)] disabled:opacity-35 ${active
+      className={`diagram-apple-inspector-action rounded-lg border px-2 py-1.5 text-[11px] font-medium transition hover:border-[var(--diagram-apple-blue)] hover:text-[var(--diagram-apple-blue)] disabled:opacity-35 ${active
         ? "border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)] text-[var(--diagram-apple-blue)] shadow-sm"
         : "border-black/[0.08] bg-white/70 text-zinc-600 dark:border-white/[0.09] dark:bg-white/[0.025] dark:text-zinc-300"}`}
       onClick={onClick}
