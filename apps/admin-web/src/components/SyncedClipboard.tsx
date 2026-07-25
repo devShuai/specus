@@ -40,6 +40,7 @@ interface SyncedClipboardProps {
   events: ClipboardInboundEvent[];
   onSend: (payload: ClipboardSyncPayload) => Promise<void>;
   onFiles: (files: File[]) => void;
+  onDraftStateChange?: (hasDraft: boolean) => void;
 }
 
 interface SuccessfulClipboardWrite {
@@ -60,6 +61,7 @@ export function SyncedClipboard({
   events,
   onSend,
   onFiles,
+  onDraftStateChange,
 }: SyncedClipboardProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const handledFocusRequestRef = useRef(0);
@@ -75,6 +77,8 @@ export function SyncedClipboard({
   const lastSuccessfulNativeWriteRef = useRef<SuccessfulClipboardWrite | null>(null);
   const autoWriteRunRef = useRef<{ token: symbol; eventId: string; generation: number } | null>(null);
   const sendTokenRef = useRef<symbol | null>(null);
+  const draftStorageKeyRef = useRef("");
+  const skipDraftPersistRef = useRef(false);
   const [composerDraft, setComposerDraft] = useState("");
   const [blocks, setBlocks] = useState<ClipboardTextBlock[]>([]);
   const [latestInbound, setLatestInbound] = useState<ClipboardInboundEvent | null>(null);
@@ -169,8 +173,12 @@ export function SyncedClipboard({
     materializedInboundEventsRef.current.clear();
     lastSuccessfulWriteRef.current = "";
     sendTokenRef.current = null;
-    setComposerDraft("");
-    setBlocks([]);
+    const persisted = readClipboardDraft(syncKey);
+    skipDraftPersistRef.current = true;
+    draftStorageKeyRef.current = syncKey;
+    setComposerDraft(persisted.composerDraft);
+    setBlocks(persisted.blocks);
+    onDraftStateChange?.(Boolean(persisted.composerDraft || persisted.blocks.length > 0));
     setLatestInbound(null);
     setSending(false);
     setSendingBlockId("");
@@ -179,7 +187,17 @@ export function SyncedClipboard({
     setStatusMessage(clipboardWritePendingRef.current
       ? "正在等待浏览器完成上一条剪贴板写入；完成前不会发起新的本机写入。"
       : "粘贴文本、富文本、链接或文件，将直接发送给选中的设备。");
-  }, [syncKey]);
+  }, [onDraftStateChange, syncKey]);
+
+  useEffect(() => {
+    if (draftStorageKeyRef.current !== syncKey) return;
+    if (skipDraftPersistRef.current) {
+      skipDraftPersistRef.current = false;
+      return;
+    }
+    writeClipboardDraft(syncKey, composerDraft, blocks);
+    onDraftStateChange?.(Boolean(composerDraft || blocks.length > 0));
+  }, [blocks, composerDraft, onDraftStateChange, syncKey]);
 
   useEffect(() => {
     if (!isActive
@@ -960,4 +978,51 @@ function formatByteCount(bytes: number) {
 function isClipboardContentWithinLimits(text: string, html: string) {
   return text.length + html.length <= CLIPBOARD_TEXT_MAX_CHARS
     && clipboardContentByteLength(text, html) <= CLIPBOARD_TEXT_MAX_UTF8_BYTES;
+}
+
+function clipboardDraftStorageKey(syncKey: string) {
+  return `public-transfer-clipboard-draft:${syncKey}`;
+}
+
+function readClipboardDraft(syncKey: string): { composerDraft: string; blocks: ClipboardTextBlock[] } {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(clipboardDraftStorageKey(syncKey)) ?? "{}") as {
+      composerDraft?: unknown;
+      blocks?: unknown;
+    };
+    const composerDraft = typeof parsed.composerDraft === "string"
+      ? parsed.composerDraft.slice(0, CLIPBOARD_TEXT_MAX_CHARS)
+      : "";
+    const blocks = Array.isArray(parsed.blocks)
+      ? parsed.blocks.filter(isPersistedClipboardBlock).slice(0, 80)
+      : [];
+    return { composerDraft, blocks };
+  } catch {
+    return { composerDraft: "", blocks: [] };
+  }
+}
+
+function writeClipboardDraft(syncKey: string, composerDraft: string, blocks: ClipboardTextBlock[]) {
+  try {
+    if (!composerDraft && blocks.length === 0) {
+      sessionStorage.removeItem(clipboardDraftStorageKey(syncKey));
+      return;
+    }
+    sessionStorage.setItem(clipboardDraftStorageKey(syncKey), JSON.stringify({
+      composerDraft,
+      blocks: blocks.slice(0, 80),
+    }));
+  } catch {
+    // Session storage can be unavailable or full; the in-memory draft remains usable.
+  }
+}
+
+function isPersistedClipboardBlock(value: unknown): value is ClipboardTextBlock {
+  if (!value || typeof value !== "object") return false;
+  const block = value as Partial<ClipboardTextBlock>;
+  return typeof block.id === "string"
+    && typeof block.text === "string"
+    && (block.kind === "text" || block.kind === "html" || block.kind === "link")
+    && (block.origin === "local" || block.origin === "remote")
+    && typeof block.createdAt === "number";
 }

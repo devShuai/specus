@@ -152,6 +152,7 @@ interface SyncedWhiteboardProps {
   isActive?: boolean;
   events: WhiteboardInboundEvent[];
   onSend: (payload: WhiteboardPayload) => void;
+  onDraftStateChange?: (hasDraft: boolean) => void;
 }
 
 type WhiteboardTool = "pan" | "select" | "pen" | "eraser" | "text" | WhiteboardShapeKind;
@@ -279,6 +280,7 @@ export function SyncedWhiteboard({
   isActive = true,
   events,
   onSend,
+  onDraftStateChange,
 }: SyncedWhiteboardProps) {
   const { theme } = useTheme();
   const boardTheme = theme === "dark" ? DARK_BOARD_THEME : LIGHT_BOARD_THEME;
@@ -300,24 +302,42 @@ export function SyncedWhiteboard({
   const objectResizeRef = useRef<ObjectResizeState | null>(null);
   const shapeDraftRef = useRef<ShapeDraftState | null>(null);
   const canvasPanRef = useRef<CanvasPanState | null>(null);
+  const touchPointersRef = useRef<Map<number, { clientX: number; clientY: number }>>(new Map());
+  const pinchGestureRef = useRef<{
+    startDistance: number;
+    startZoom: number;
+    contentX: number;
+    contentY: number;
+  } | null>(null);
+  const canvasZoomRef = useRef(1);
   const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const redrawRef = useRef<() => void>(() => undefined);
+  const draftStorageKeyRef = useRef("");
+  const skipDraftPersistRef = useRef(false);
 
   const [strokes, setStrokes] = useState<WhiteboardStroke[]>([]);
   const [objects, setObjects] = useState<WhiteboardObject[]>([]);
   const [selectedColor, setSelectedColor] = useState(WHITEBOARD_COLORS[0].value);
   const [selectedWidth, setSelectedWidth] = useState(WHITEBOARD_WIDTHS[1].value);
-  const [selectedTool, setSelectedTool] = useState<WhiteboardTool>("pen");
+  const [selectedTool, setSelectedTool] = useState<WhiteboardTool>(() => (
+    typeof window !== "undefined"
+      && typeof window.matchMedia === "function"
+      && window.matchMedia("(pointer: coarse), (max-width: 639px)").matches
+      ? "select"
+      : "pen"
+  ));
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
   const [flowLabelDraft, setFlowLabelDraft] = useState<FlowLabelDraft | null>(null);
   const [isFlowchartOpen, setIsFlowchartOpen] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [canvasZoom, setCanvasZoom] = useState(1);
   const [isStatusPanelCollapsed, setIsStatusPanelCollapsed] = useState(false);
   const [isImportingImage, setIsImportingImage] = useState(false);
   const [isImportingDocument, setIsImportingDocument] = useState(false);
   const isReadOnly = roomRole === "VIEWER";
   const [boardMessage, setBoardMessage] = useState("画笔已就绪，可直接在画布上绘制。");
+  canvasZoomRef.current = canvasZoom;
 
   const activeColor = selectedTool === "eraser" ? ERASER_COLOR : selectedColor;
   const totalPeers = peerCount + 1;
@@ -446,15 +466,21 @@ export function SyncedWhiteboard({
   }, [isActive]);
 
   useEffect(() => {
-    strokesRef.current = [];
-    objectsRef.current = [];
-    setStrokes([]);
-    setObjects([]);
+    const persisted = readWhiteboardDraft(boardKey);
+    skipDraftPersistRef.current = true;
+    draftStorageKeyRef.current = boardKey;
+    strokesRef.current = persisted.strokes;
+    objectsRef.current = persisted.objects;
+    setStrokes(persisted.strokes);
+    setObjects(persisted.objects);
+    onDraftStateChange?.(persisted.strokes.length > 0 || persisted.objects.length > 0);
     selectObject(null);
     setTextDraft(null);
     setFlowLabelDraft(null);
     setIsFlowchartOpen(false);
-    setBoardMessage("已切换到新的房间白板。");
+    setBoardMessage(persisted.strokes.length > 0 || persisted.objects.length > 0
+      ? "已恢复这个房间的本地白板草稿。"
+      : "已切换到新的房间白板。");
     imageCacheRef.current.clear();
     seenEventsRef.current.clear();
     lastPeerCountRef.current = peerCount;
@@ -472,7 +498,17 @@ export function SyncedWhiteboard({
       window.clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
     }
-  }, [boardKey, selectObject]);
+  }, [boardKey, onDraftStateChange, selectObject]);
+
+  useEffect(() => {
+    if (draftStorageKeyRef.current !== boardKey) return;
+    if (skipDraftPersistRef.current) {
+      skipDraftPersistRef.current = false;
+      return;
+    }
+    writeWhiteboardDraft(boardKey, strokes, objects);
+    onDraftStateChange?.(strokes.length > 0 || objects.length > 0);
+  }, [boardKey, objects, onDraftStateChange, strokes]);
 
   const appendStrokePoints = useCallback((strokeId: string, sourcePeerId: string, points: WhiteboardPoint[]) => {
     if (points.length === 0) {
@@ -863,10 +899,103 @@ export function SyncedWhiteboard({
     )));
   }, [updateObjects]);
 
+  const applyCanvasZoom = useCallback((
+    requestedZoom: number,
+    focalPoint?: { clientX: number; clientY: number },
+    fixedContentPoint?: { x: number; y: number },
+  ) => {
+    const viewport = canvasViewportRef.current;
+    const nextZoom = clamp(requestedZoom, 1, 2.5);
+    if (!viewport) {
+      setCanvasZoom(nextZoom);
+      return;
+    }
+    const viewportRect = viewport.getBoundingClientRect();
+    const focalX = focalPoint ? focalPoint.clientX - viewportRect.left : viewport.clientWidth / 2;
+    const focalY = focalPoint ? focalPoint.clientY - viewportRect.top : viewport.clientHeight / 2;
+    const currentZoom = canvasZoomRef.current;
+    const contentPoint = fixedContentPoint ?? {
+      x: (viewport.scrollLeft + focalX) / currentZoom,
+      y: (viewport.scrollTop + focalY) / currentZoom,
+    };
+    canvasZoomRef.current = nextZoom;
+    setCanvasZoom(nextZoom);
+    window.requestAnimationFrame(() => {
+      viewport.scrollLeft = Math.max(0, contentPoint.x * nextZoom - focalX);
+      viewport.scrollTop = Math.max(0, contentPoint.y * nextZoom - focalY);
+    });
+  }, []);
+
+  const cancelTouchEditing = useCallback(() => {
+    if (flushTimerRef.current !== null) {
+      window.clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    const strokeId = activeStrokeIdRef.current;
+    if (strokeId) {
+      activeStrokeIdRef.current = null;
+      pendingPointsRef.current = [];
+      updateStrokes((current) => current.filter((stroke) => stroke.strokeId !== strokeId));
+      onSend({
+        type: "STWB1",
+        kind: "remove-stroke",
+        strokeId,
+        createdAt: Date.now(),
+      });
+    }
+    const shapeDraft = shapeDraftRef.current;
+    if (shapeDraft) {
+      shapeDraftRef.current = null;
+      updateObjects((current) => current.filter((object) => object.objectId !== shapeDraft.objectId));
+      selectObject(null);
+    }
+    const resize = objectResizeRef.current;
+    if (resize) {
+      objectResizeRef.current = null;
+      updateObjects((current) => current.map((object) => object.objectId === resize.objectId ? resize.original : object));
+    }
+    const drag = objectDragRef.current;
+    if (drag) {
+      objectDragRef.current = null;
+      updateObjects((current) => current.map((object) => object.objectId === drag.objectId ? drag.original : object));
+    }
+    canvasPanRef.current = null;
+  }, [onSend, selectObject, updateObjects, updateStrokes]);
+
   const handlePointerDown = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
     if (isReadOnly) return;
     if (event.button !== 0 && event.pointerType === "mouse") {
       return;
+    }
+    if (event.pointerType === "touch") {
+      touchPointersRef.current.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+      if (touchPointersRef.current.size >= 2) {
+        event.preventDefault();
+        cancelTouchEditing();
+        const [first, second] = Array.from(touchPointersRef.current.values());
+        const viewport = canvasViewportRef.current;
+        const viewportRect = viewport?.getBoundingClientRect();
+        const centerX = (first.clientX + second.clientX) / 2;
+        const centerY = (first.clientY + second.clientY) / 2;
+        const localX = viewportRect ? centerX - viewportRect.left : 0;
+        const localY = viewportRect ? centerY - viewportRect.top : 0;
+        const currentZoom = canvasZoomRef.current;
+        pinchGestureRef.current = {
+          startDistance: Math.max(1, Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY)),
+          startZoom: currentZoom,
+          contentX: ((viewport?.scrollLeft ?? 0) + localX) / currentZoom,
+          contentY: ((viewport?.scrollTop ?? 0) + localY) / currentZoom,
+        };
+        touchPointersRef.current.forEach((_point, pointerId) => {
+          try {
+            event.currentTarget.setPointerCapture(pointerId);
+          } catch {
+            // A browser may already have claimed one pointer for native scrolling.
+          }
+        });
+        setBoardMessage("正在双指缩放画布；本次触控不会绘制内容。");
+        return;
+      }
     }
     if (selectedTool === "pan") {
       const viewport = canvasViewportRef.current;
@@ -937,9 +1066,28 @@ export function SyncedWhiteboard({
     }
     selectObject(null);
     startStroke(event, point);
-  }, [isReadOnly, peerId, removeObject, selectObject, selectedColor, selectedTool, selectedWidth, startStroke, updateObjects]);
+  }, [cancelTouchEditing, isReadOnly, peerId, removeObject, selectObject, selectedColor, selectedTool, selectedWidth, startStroke, updateObjects]);
 
   const handlePointerMove = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.pointerType === "touch" && touchPointersRef.current.has(event.pointerId)) {
+      touchPointersRef.current.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+      const pinch = pinchGestureRef.current;
+      if (pinch && touchPointersRef.current.size >= 2) {
+        event.preventDefault();
+        const [first, second] = Array.from(touchPointersRef.current.values());
+        const center = {
+          clientX: (first.clientX + second.clientX) / 2,
+          clientY: (first.clientY + second.clientY) / 2,
+        };
+        const distance = Math.max(1, Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY));
+        applyCanvasZoom(
+          pinch.startZoom * distance / pinch.startDistance,
+          center,
+          { x: pinch.contentX, y: pinch.contentY },
+        );
+        return;
+      }
+    }
     const pan = canvasPanRef.current;
     if (pan?.pointerId === event.pointerId) {
       const viewport = canvasViewportRef.current;
@@ -962,9 +1110,23 @@ export function SyncedWhiteboard({
     } else if (objectDragRef.current) {
       updateObjectDrag(point);
     }
-  }, [moveStroke, updateObjectDrag, updateObjectResize, updateShapeDraft]);
+  }, [applyCanvasZoom, moveStroke, updateObjectDrag, updateObjectResize, updateShapeDraft]);
 
   const handlePointerEnd = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.pointerType === "touch") {
+      const wasPinching = pinchGestureRef.current !== null;
+      touchPointersRef.current.delete(event.pointerId);
+      if (wasPinching) {
+        if (touchPointersRef.current.size < 2) {
+          pinchGestureRef.current = null;
+          setBoardMessage(`画布缩放为 ${Math.round(canvasZoomRef.current * 100)}%。`);
+        }
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }
+        return;
+      }
+    }
     if (canvasPanRef.current?.pointerId === event.pointerId) {
       canvasPanRef.current = null;
       if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -1524,7 +1686,7 @@ export function SyncedWhiteboard({
               <PopoverTrigger>
                 <button
                   type="button"
-                  className="flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium text-zinc-700 transition hover:bg-black/5 hover:text-zinc-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white sm:px-2.5"
+                  className="flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium text-zinc-700 transition hover:bg-black/5 hover:text-zinc-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white sm:px-2.5"
                   aria-label={`样式：${selectedColorOption.label}，${selectedWidthOption.label}线条`}
                   title="颜色与线条粗细"
                 >
@@ -1669,6 +1831,10 @@ export function SyncedWhiteboard({
             </Dropdown>
           </div>
 
+          <div className="mt-1.5 px-1 text-[11px] leading-4 text-zinc-500 dark:text-zinc-400 sm:hidden">
+            选择模式可滑动画布；选中画笔或图形后用单指绘制。
+          </div>
+
           {isFlowchartOpen ? (
             <FlowchartPanel
               className="mt-2"
@@ -1701,14 +1867,18 @@ export function SyncedWhiteboard({
           <div
             className="relative bg-white shadow-sm"
             style={{
-              width: "100%",
-              minWidth: WHITEBOARD_SURFACE_MIN_WIDTH,
-              height: isExpanded ? `max(${WHITEBOARD_SURFACE_HEIGHT}px, 100dvh)` : WHITEBOARD_SURFACE_HEIGHT,
+              width: `${canvasZoom * 100}%`,
+              minWidth: `min(${WHITEBOARD_SURFACE_MIN_WIDTH}px, 100%)`,
+              height: isExpanded
+                ? `max(${WHITEBOARD_SURFACE_HEIGHT * canvasZoom}px, ${100 * canvasZoom}dvh)`
+                : WHITEBOARD_SURFACE_HEIGHT * canvasZoom,
             }}
           >
             <canvas
               ref={canvasRef}
-              className={"block h-full w-full bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 " + (isReadOnly ? "pointer-events-none " : "touch-none ") + cursorClass}
+              className={"block h-full w-full bg-white outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400 "
+                + (isReadOnly ? "pointer-events-none " : selectedTool === "select" ? "touch-pan-x touch-pan-y " : "touch-none ")
+                + cursorClass}
               aria-label="同步白板画布"
               aria-readonly={isReadOnly}
               tabIndex={0}
@@ -1725,9 +1895,52 @@ export function SyncedWhiteboard({
                 }
               }}
             />
-            {!isExpanded ? <div className="pointer-events-none absolute right-3 top-3 rounded-full border border-[#e0e2e8] bg-white/90 px-2.5 py-1 text-[10px] font-medium text-[#6b6f7e] shadow-sm dark:border-white/10 dark:bg-zinc-900/90 dark:text-zinc-400">
-              可滚动画布 · {WHITEBOARD_SURFACE_MIN_WIDTH} × {WHITEBOARD_SURFACE_HEIGHT}
-            </div> : null}
+            <div className="absolute right-3 top-3 z-10 flex items-center rounded-md border border-[#e0e2e8] bg-white/95 p-1 text-[#525866] shadow-sm dark:border-white/10 dark:bg-zinc-900/95 dark:text-zinc-300" role="group" aria-label="白板缩放">
+              <button
+                type="button"
+                className="grid h-11 w-11 place-items-center rounded hover:bg-black/5 disabled:opacity-35 dark:hover:bg-white/10 sm:h-8 sm:w-8"
+                disabled={canvasZoom <= 1}
+                aria-label="缩小白板"
+                title="缩小"
+                onClick={() => applyCanvasZoom(canvasZoom - 0.25)}
+              >
+                <span className="text-lg leading-none" aria-hidden>−</span>
+              </button>
+              <button
+                type="button"
+                className="h-11 min-w-14 rounded px-2 text-[11px] font-semibold hover:bg-black/5 dark:hover:bg-white/10 sm:h-8"
+                aria-label={`白板缩放 ${Math.round(canvasZoom * 100)}%，点击恢复适应宽度`}
+                title="适应宽度"
+                onClick={() => applyCanvasZoom(1)}
+              >
+                {Math.round(canvasZoom * 100)}%
+              </button>
+              <button
+                type="button"
+                className="grid h-11 w-11 place-items-center rounded hover:bg-black/5 disabled:opacity-35 dark:hover:bg-white/10 sm:h-8 sm:w-8"
+                disabled={canvasZoom >= 2.5}
+                aria-label="放大白板"
+                title="放大"
+                onClick={() => applyCanvasZoom(canvasZoom + 0.25)}
+              >
+                <span className="text-lg leading-none" aria-hidden>+</span>
+              </button>
+              <button
+                type="button"
+                className="grid h-11 w-11 place-items-center rounded hover:bg-black/5 dark:hover:bg-white/10 sm:h-8 sm:w-8"
+                aria-label="回到白板原点"
+                title="回到原点"
+                onClick={() => {
+                  const viewport = canvasViewportRef.current;
+                  if (viewport) {
+                    viewport.scrollLeft = 0;
+                    viewport.scrollTop = 0;
+                  }
+                }}
+              >
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" viewBox="0 0 16 16" aria-hidden="true"><path d="m2.5 7 5.5-4.5L13.5 7v6H9.8V9.5H6.2V13H2.5Z" /></svg>
+              </button>
+            </div>
             {textDraft ? (
               <textarea
                 autoFocus
@@ -2055,7 +2268,7 @@ function WhiteboardToolButton({
         "flex shrink-0 items-center rounded-md font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 "
         + (compact
           ? "h-11 w-12 flex-col justify-center gap-0.5 px-1 text-[9px] leading-none "
-          : "h-10 gap-1.5 px-2.5 text-tiny ")
+          : "h-11 gap-1.5 px-2.5 text-tiny ")
         + (active
           ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
           : "text-zinc-700 hover:bg-cyan-50 hover:text-cyan-900 dark:text-zinc-200 dark:hover:bg-cyan-300/10 dark:hover:text-cyan-100")
@@ -2088,7 +2301,7 @@ const WhiteboardMenuTrigger = forwardRef<HTMLButtonElement, WhiteboardMenuTrigge
       type="button"
       aria-label={label + "菜单"}
       className={
-        "flex h-10 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 sm:px-2.5 "
+        "flex h-11 shrink-0 items-center gap-1.5 rounded-md px-2 text-tiny font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 sm:px-2.5 "
         + (active
           ? "bg-cyan-500 text-white shadow-sm dark:bg-cyan-300 dark:text-zinc-950"
           : "text-zinc-700 hover:bg-black/5 hover:text-zinc-950 dark:text-zinc-200 dark:hover:bg-white/10 dark:hover:text-white")
@@ -3064,6 +3277,44 @@ function loadImageFile(file: File) {
     };
     image.src = url;
   });
+}
+
+function whiteboardDraftStorageKey(boardKey: string) {
+  return `public-transfer-whiteboard-draft:${boardKey}`;
+}
+
+function readWhiteboardDraft(boardKey: string): { strokes: WhiteboardStroke[]; objects: WhiteboardObject[] } {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(whiteboardDraftStorageKey(boardKey)) ?? "{}") as {
+      strokes?: unknown;
+      objects?: unknown;
+    };
+    return {
+      strokes: Array.isArray(parsed.strokes)
+        ? parsed.strokes.filter(isWhiteboardStroke).slice(-MAX_STROKES)
+        : [],
+      objects: Array.isArray(parsed.objects)
+        ? parsed.objects.filter(isWhiteboardObject).slice(-MAX_OBJECTS)
+        : [],
+    };
+  } catch {
+    return { strokes: [], objects: [] };
+  }
+}
+
+function writeWhiteboardDraft(boardKey: string, strokes: WhiteboardStroke[], objects: WhiteboardObject[]) {
+  try {
+    if (strokes.length === 0 && objects.length === 0) {
+      sessionStorage.removeItem(whiteboardDraftStorageKey(boardKey));
+      return;
+    }
+    sessionStorage.setItem(whiteboardDraftStorageKey(boardKey), JSON.stringify({
+      strokes: strokes.slice(-MAX_STROKES),
+      objects: objects.slice(-MAX_OBJECTS),
+    }));
+  } catch {
+    // Large embedded images can exhaust session storage; the active in-memory board remains intact.
+  }
 }
 
 function clamp(value: number, min: number, max: number) {

@@ -3145,6 +3145,7 @@ body {
 
 .transfer-network-toggle {
   display: inline-flex;
+  min-height: 44px;
   align-items: center;
   gap: 7px;
   white-space: nowrap;
@@ -3195,6 +3196,14 @@ body {
     justify-content: flex-end;
     border-top: 1px solid var(--app-apple-line);
     padding-top: 8px;
+  }
+
+  .transfer-room-tools .app-apple-tool-tab {
+    min-height: 44px;
+  }
+
+  .transfer-room-settings-modal button {
+    min-height: 44px !important;
   }
 }
 
@@ -4029,13 +4038,16 @@ body {
   -webkit-backdrop-filter: saturate(180%) blur(20px);
 }
 
-.diagram-apple-mode-option,
+.diagram-apple-mode-option {
+  border-radius: 999px !important;
+}
+
 .diagram-apple-toolbar-button,
 .diagram-apple-toolbar-menu,
 .diagram-apple-compact-button,
 .diagram-apple-primary-action,
 .diagram-apple-inspector-action {
-  border-radius: 999px !important;
+  border-radius: 7px !important;
 }
 
 .diagram-apple-mode-option-active,
@@ -4561,15 +4573,19 @@ body {
 
 .diagram-apple-palette-label {
   color: var(--diagram-apple-ink) !important;
-  font-size: 10px !important;
+  font-size: 11px !important;
   font-weight: 650;
   line-height: 1.2;
 }
 
 .diagram-apple-palette-detail {
   color: var(--diagram-apple-muted) !important;
-  font-size: 9px !important;
+  font-size: 10px !important;
   line-height: 1.2;
+}
+
+.diagram-apple .text-\[10px\] {
+  font-size: 11px !important;
 }
 
 .diagram-apple-template-button:hover,
@@ -4749,6 +4765,17 @@ body {
 }
 
 @media (max-width: 640px) {
+  .app-apple-tool .public-tools-trigger,
+  .app-apple-tool .public-header-theme-button {
+    width: 44px !important;
+    min-width: 44px !important;
+    height: 44px !important;
+  }
+
+  .app-apple-tool .transfer-touch-action {
+    min-height: 44px !important;
+  }
+
   .diagram-apple:not(.diagram-apple-full) {
     padding: 10px !important;
     border-radius: 14px !important;
@@ -4771,6 +4798,17 @@ body {
   .diagram-apple-toolbar {
     min-height: 42px;
     padding-inline: 6px !important;
+  }
+
+  .diagram-apple .diagram-apple-icon-control,
+  .diagram-apple .diagram-apple-theme-toggle {
+    width: 44px !important;
+    min-width: 44px !important;
+    height: 44px !important;
+  }
+
+  .diagram-apple-inspector :where(button, input:not([type="range"]):not([type="color"]), select) {
+    min-height: 44px;
   }
 
   .diagram-apple-page-tab {

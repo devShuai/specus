@@ -59,3 +59,44 @@ export function resolveTransferNetworkMode(
   }
   return roomToken?.trim() ? "internet" : "lan";
 }
+
+export function retainExplicitTransferPeerSelection(
+  currentPeerId: string,
+  visiblePeerIds: readonly string[],
+): string {
+  if (!currentPeerId) return "";
+  return visiblePeerIds.includes(currentPeerId) ? currentPeerId : "";
+}
+
+export function localizeTransferDiscoveryError(message: string): string {
+  const normalized = message.trim();
+  const lower = normalized.toLowerCase();
+  if (!normalized) {
+    return "房间连接暂时失败，正在自动重试";
+  }
+  if (lower.includes("internal server error") || /\b5\d\d\b/.test(lower)) {
+    return "房间服务暂时不可用，正在自动重试";
+  }
+  if (lower.includes("failed to fetch") || lower.includes("network error") || lower.includes("connection refused")) {
+    return "暂时无法连接房间服务，请检查网络后重试";
+  }
+  if (lower.includes("rate limit")) {
+    return "请求过于频繁，请稍后再试";
+  }
+  if (lower.includes("room token") || lower.includes("invalid token") || lower.includes("unauthorized")) {
+    return "房间口令无效或已过期，请检查邀请链接";
+  }
+  if (lower.includes("room not found") || lower.includes("unknown room")) {
+    return "房间不存在或已关闭";
+  }
+  if (lower.includes("ticket")) {
+    return "连接凭证无效，请刷新页面重试";
+  }
+  if (lower.includes("timeout") || lower.includes("timed out")) {
+    return "连接超时，请检查网络后重试";
+  }
+  if (/^[\x00-\x7f]+$/.test(normalized) && /[a-z]/i.test(normalized)) {
+    return "房间连接暂时失败，正在自动重试";
+  }
+  return normalized;
+}

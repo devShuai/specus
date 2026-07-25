@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_TRANSFER_ROOM_NAME_LENGTH,
   MAX_TRANSFER_ROOM_TOKEN_LENGTH,
+  localizeTransferDiscoveryError,
+  retainExplicitTransferPeerSelection,
   resolveTransferNetworkMode,
   validateTransferRoomSettings,
 } from "./transferRoom";
@@ -45,5 +47,17 @@ describe("transfer room settings", () => {
     expect(resolveTransferNetworkMode(null, "legacy-token")).toBe("internet");
     expect(resolveTransferNetworkMode("lan", "ignored-in-lan")).toBe("lan");
     expect(resolveTransferNetworkMode("external", null)).toBe("internet");
+  });
+
+  it("never silently changes an explicit target when its peer goes offline", () => {
+    expect(retainExplicitTransferPeerSelection("peer-a", ["peer-a", "peer-b"])).toBe("peer-a");
+    expect(retainExplicitTransferPeerSelection("peer-a", ["peer-b"])).toBe("");
+    expect(retainExplicitTransferPeerSelection("", ["peer-b"])).toBe("");
+  });
+
+  it("keeps raw server diagnostics out of the primary discovery message", () => {
+    expect(localizeTransferDiscoveryError("Internal Server Error")).toBe("房间服务暂时不可用，正在自动重试");
+    expect(localizeTransferDiscoveryError("Failed to fetch")).toBe("暂时无法连接房间服务，请检查网络后重试");
+    expect(localizeTransferDiscoveryError("房间已关闭")).toBe("房间已关闭");
   });
 });
