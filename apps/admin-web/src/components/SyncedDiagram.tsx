@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Button,
@@ -7,22 +7,16 @@ import {
   DropdownItem,
   DropdownMenu,
   DropdownTrigger,
-  Input,
   Modal,
   ModalBody,
   ModalContent,
   ModalFooter,
   ModalHeader,
-  Textarea,
 } from "@heroui/react";
 import {
   Cell,
   Clipboard,
-  ConnectionConstraint,
   ConnectionHandler,
-  ConnectorShape,
-  EdgeHandler,
-  EllipseShape,
   Graph,
   Geometry,
   getDefaultPlugins,
@@ -30,31 +24,20 @@ import {
   HierarchicalLayout,
   ImageBox,
   ImageExport,
-  EdgeHandlerConfig,
-  HandleConfig,
   InternalEvent,
-  mathUtils,
   Outline,
   Point,
-  PolylineShape,
   Rectangle,
   RubberBandHandler,
   SelectionCellsHandler,
   SelectionHandler,
-  ShapeRegistry,
-  StyleDefaultsConfig,
   SvgCanvas2D,
   VertexHandler,
-  VertexHandlerConfig,
-  VertexHandle,
 } from "@maxgraph/core";
 import type {
-  AbstractCanvas2D,
   CellState,
   CellStyle,
-  EventSource,
   FitPlugin,
-  InternalMouseEvent,
 } from "@maxgraph/core";
 import * as Y from "yjs";
 import "@maxgraph/core/css/common.css";
@@ -95,16 +78,13 @@ import type {
   DiagramArrowType,
   DiagramComment,
   DiagramEdge,
-  DiagramEdgeStyle,
   DiagramEdgeType,
   DiagramFontFamily,
   DiagramLinePattern,
   DiagramNode,
   DiagramNodeKind,
-  DiagramNodeStyle,
   DiagramPayload,
   DiagramPage,
-  DiagramPort,
   DiagramVerticalAlign,
 } from "../lib/diagramDocument";
 import {
@@ -121,7 +101,6 @@ import {
   parsePlantUmlDocument,
   PLANTUML_FILE_EXTENSIONS,
 } from "../lib/diagramTextFormats";
-import { signedRotationDelta } from "../lib/diagramRotation";
 import { preserveTouchTap } from "../lib/diagramPointerInput";
 import {
   exportVisioVdx,
@@ -141,365 +120,87 @@ import type {
   DrawioStencilLibrary,
   DrawioStencilShape,
 } from "../lib/drawioStencilCatalog";
-import { registerDiagramSemanticShapes, semanticShapeName } from "../lib/diagramSemanticShapes";
 import { DiagramRemoteUpdateValidator } from "../lib/diagramYjsValidation";
 import { useTheme } from "../theme/ThemeContext";
 import { PublicToolsMenu } from "./PublicToolsMenu";
-
-const DIAGRAM_CUBIC_EDGE_SHAPE = "diagramCubicConnector";
-const CUBIC_CONTROL_DEFAULTS = {
-  control1T: 1 / 3,
-  control1N: 0.18,
-  control2T: 2 / 3,
-  control2N: 0.18,
-};
-const DIAGRAM_ROTATION_HANDLE_SIZE = 18;
-const DIAGRAM_ROTATION_HANDLE_FILL = "transparent";
-const DIAGRAM_ROTATION_HANDLE_ACCENT = "var(--diagram-apple-blue)";
-
-class DiagramCubicConnectorShape extends ConnectorShape {
-  override paintEdgeShape(canvas: AbstractCanvas2D, points: Point[]) {
-    const start = points[0];
-    const end = points[points.length - 1];
-    if (!start || !end) return;
-    const [control1, control2] = cubicControlPointsFromStyle(start, end, this.style);
-    super.paintEdgeShape(canvas, [start, control1, control2, end]);
-  }
-
-  override paintCurvedLine(canvas: AbstractCanvas2D, points: Point[]) {
-    const start = points[0];
-    const control1 = points[1];
-    const control2 = points[points.length - 2];
-    const end = points[points.length - 1];
-    if (!start || !control1 || !control2 || !end) return;
-    canvas.begin();
-    canvas.moveTo(start.x, start.y);
-    canvas.curveTo(control1.x, control1.y, control2.x, control2.y, end.x, end.y);
-    canvas.stroke();
-  }
-}
-
-class DiagramCubicControlHandle extends VertexHandle {
-  controlIndex: 0 | 1;
-
-  constructor(state: CellState, controlIndex: 0 | 1) {
-    super(
-      state,
-      "move",
-      null,
-      new EllipseShape(new Rectangle(0, 0, 11, 11), "#0066cc", "#ffffff", 2),
-    );
-    this.controlIndex = controlIndex;
-    this.shape?.node.classList.add("diagram-cubic-control-handle");
-    this.shape?.node.setAttribute("data-control-index", String(controlIndex + 1));
-  }
-
-  override getPosition(_bounds: Rectangle | null) {
-    const [start, end] = cubicEdgeModelEndpoints(this.state);
-    return cubicControlPointsFromStyle(start, end, this.state.style)[this.controlIndex];
-  }
-
-  override setPosition(_bounds: Rectangle | null, point: Point, _event: InternalMouseEvent) {
-    const [start, end] = cubicEdgeModelEndpoints(this.state);
-    const { t, n } = cubicFactorsForPoint(start, end, point);
-    const style = this.state.style as DiagramCellStyle;
-    if (this.controlIndex === 0) {
-      style.diagramCubicControl1T = t;
-      style.diagramCubicControl1N = n;
-    } else {
-      style.diagramCubicControl2T = t;
-      style.diagramCubicControl2N = n;
-    }
-  }
-
-  override execute(_event: InternalMouseEvent) {
-    const transientStyle = this.state.style as DiagramCellStyle;
-    const style = this.state.cell.getClonedStyle() as DiagramCellStyle;
-    if (this.controlIndex === 0) {
-      style.diagramCubicControl1T = transientStyle.diagramCubicControl1T;
-      style.diagramCubicControl1N = transientStyle.diagramCubicControl1N;
-    } else {
-      style.diagramCubicControl2T = transientStyle.diagramCubicControl2T;
-      style.diagramCubicControl2N = transientStyle.diagramCubicControl2N;
-    }
-    this.graph.getDataModel().setStyle(this.state.cell, style);
-  }
-}
-
-class DiagramRotationHandleShape extends EllipseShape {
-  override init(container: HTMLElement | SVGElement) {
-    super.init(container);
-    this.node.classList.add("diagram-rotation-handle");
-    this.node.setAttribute("data-diagram-handle", "rotation");
-  }
-
-  override paintVertexShape(canvas: AbstractCanvas2D, x: number, y: number, width: number, height: number) {
-    const centerX = x + width / 2;
-    const centerY = y + height / 2;
-
-    // Keep a generous drag target while showing only the familiar rotate glyph.
-    canvas.setFillColor("transparent");
-    canvas.setStrokeColor("transparent");
-    canvas.ellipse(x, y, width, height);
-    canvas.fillAndStroke();
-
-    const radius = Math.min(width, height) * 0.27;
-    canvas.setStrokeColor(DIAGRAM_ROTATION_HANDLE_ACCENT);
-    canvas.setStrokeWidth(1.7);
-    canvas.setLineCap("round");
-    canvas.setLineJoin("round");
-    canvas.begin();
-    canvas.moveTo(centerX + radius * 0.62, centerY - radius * 0.68);
-    canvas.curveTo(
-      centerX + radius * 0.2,
-      centerY - radius,
-      centerX - radius * 0.38,
-      centerY - radius,
-      centerX - radius * 0.76,
-      centerY - radius * 0.62,
-    );
-    canvas.curveTo(
-      centerX - radius * 1.22,
-      centerY - radius * 0.16,
-      centerX - radius * 1.08,
-      centerY + radius * 0.62,
-      centerX - radius * 0.5,
-      centerY + radius * 0.92,
-    );
-    canvas.curveTo(
-      centerX + radius * 0.08,
-      centerY + radius * 1.22,
-      centerX + radius * 0.82,
-      centerY + radius * 0.9,
-      centerX + radius,
-      centerY + radius * 0.28,
-    );
-    canvas.stroke();
-    canvas.begin();
-    canvas.moveTo(centerX + radius * 0.72, centerY - radius);
-    canvas.lineTo(centerX + radius * 0.72, centerY - radius * 0.48);
-    canvas.lineTo(centerX + radius * 0.2, centerY - radius * 0.48);
-    canvas.stroke();
-  }
-}
-
-class DiagramVertexHandler extends VertexHandler {
-  rotateSingleSizer = false;
-  private previousRotationPointerAngle: number | null = null;
-  private accumulatedRotation = 0;
-
-  override isRotationEnabled() {
-    return true;
-  }
-
-  override start(x: number, y: number, index: number) {
-    super.start(x, y, index);
-    if (index === InternalEvent.ROTATION_HANDLE) {
-      this.previousRotationPointerAngle = pointerAngleDegrees(this.state, x, y);
-      this.accumulatedRotation = styleNumber(this.state.style.rotation, 0);
-    } else {
-      this.previousRotationPointerAngle = null;
-    }
-  }
-
-  override rotateVertex(event: InternalMouseEvent) {
-    const point = new Point(event.getGraphX(), event.getGraphY());
-    const pointerAngle = pointerAngleDegrees(this.state, point.x, point.y);
-    if (this.previousRotationPointerAngle === null) {
-      this.previousRotationPointerAngle = pointerAngle;
-      this.accumulatedRotation = styleNumber(this.state.style.rotation, 0);
-    } else {
-      this.accumulatedRotation += signedRotationDelta(this.previousRotationPointerAngle, pointerAngle);
-      this.previousRotationPointerAngle = pointerAngle;
-    }
-
-    let rotation = this.accumulatedRotation;
-    if (this.rotationRaster && this.graph.isGridEnabledEvent(event.getEvent())) {
-      const dx = point.x - this.state.getCenterX();
-      const dy = point.y - this.state.getCenterY();
-      const distance = Math.sqrt(dx * dx + dy * dy);
-      const raster = distance - this.startDist < 2 ? 15 : distance - this.startDist < 25 ? 5 : 1;
-      rotation = Math.round(rotation / raster) * raster;
-    } else {
-      rotation = this.roundAngle(rotation);
-    }
-
-    this.currentAlpha = rotation;
-    this.selectionBorder.rotation = rotation;
-    this.selectionBorder.redraw();
-    if (this.livePreviewActive) this.redrawHandles();
-  }
-
-  override redrawHandles() {
-    super.redrawHandles();
-    const resizeHandle = this.sizers[0];
-    if (!this.rotateSingleSizer || !this.singleSizer || !resizeHandle) return;
-
-    const bounds = this.getSizerBounds();
-    const radians = mathUtils.toRadians(this.currentAlpha ?? this.state.style.rotation ?? 0);
-    const center = new Point(bounds.getCenterX(), bounds.getCenterY());
-    const position = mathUtils.getRotatedPoint(
-      new Point(bounds.x + bounds.width, bounds.y + bounds.height),
-      Math.cos(radians),
-      Math.sin(radians),
-      center,
-    );
-    this.moveSizerTo(resizeHandle, position.x, position.y);
-
-    const cursors = [
-      "nw-resize",
-      "n-resize",
-      "ne-resize",
-      "e-resize",
-      "se-resize",
-      "s-resize",
-      "sw-resize",
-      "w-resize",
-    ];
-    const cursorOffset = Math.round((radians * 4) / Math.PI);
-    resizeHandle.setCursor(cursors[mathUtils.mod(4 + cursorOffset, cursors.length)]);
-  }
-
-  ensureRotationHandle() {
-    if (this.rotationShape) return;
-    this.rotationShape = this.createSizer(
-      this.rotationCursor,
-      InternalEvent.ROTATION_HANDLE,
-      DIAGRAM_ROTATION_HANDLE_SIZE,
-      DIAGRAM_ROTATION_HANDLE_FILL,
-    );
-    this.sizers.push(this.rotationShape);
-  }
-
-  override createSizerShape(bounds: Rectangle, index: number, fillColor = HandleConfig.fillColor) {
-    if (index === InternalEvent.ROTATION_HANDLE) {
-      return new DiagramRotationHandleShape(
-        new Rectangle(bounds.x, bounds.y, DIAGRAM_ROTATION_HANDLE_SIZE, DIAGRAM_ROTATION_HANDLE_SIZE),
-        DIAGRAM_ROTATION_HANDLE_FILL,
-        DIAGRAM_ROTATION_HANDLE_ACCENT,
-        1.5,
-      );
-    }
-    return super.createSizerShape(bounds, index, fillColor);
-  }
-}
-
-class DiagramCubicEdgeHandler extends EdgeHandler {
-  private controlGuides?: [PolylineShape, PolylineShape];
-
-  constructor(state: CellState) {
-    super(state);
-    const overlayPane = this.graph.getView().getOverlayPane();
-    const createGuide = () => {
-      const guide = new PolylineShape([], "#2997ff", 1);
-      guide.dialect = "svg";
-      guide.isDashed = true;
-      guide.opacity = 68;
-      guide.pointerEvents = false;
-      guide.init(overlayPane);
-      guide.node.classList.add("diagram-cubic-control-guide");
-      guide.node.setAttribute("aria-hidden", "true");
-      guide.node.style.pointerEvents = "none";
-      if (this.shape.node.parentNode === overlayPane) {
-        overlayPane.insertBefore(guide.node, this.shape.node);
-      }
-      return guide;
-    };
-    this.controlGuides = [createGuide(), createGuide()];
-    this.redrawControlGuides();
-  }
-
-  override isVirtualBendsEnabled() {
-    return false;
-  }
-
-  override isHandleVisible(index: number) {
-    return index === 0 || index === this.abspoints.length - 1;
-  }
-
-  override isAddPointEvent(_event: MouseEvent) {
-    return false;
-  }
-
-  override isRemovePointEvent(_event: MouseEvent) {
-    return false;
-  }
-
-  override createCustomHandles() {
-    return [
-      new DiagramCubicControlHandle(this.state, 0),
-      new DiagramCubicControlHandle(this.state, 1),
-    ];
-  }
-
-  override mouseMove(sender: EventSource, event: InternalMouseEvent) {
-    super.mouseMove(sender, event);
-    this.redrawControlGuides();
-  }
-
-  override redraw(ignoreHandles?: boolean) {
-    super.redraw(ignoreHandles);
-    this.redrawControlGuides();
-  }
-
-  override setHandlesVisible(visible: boolean) {
-    super.setHandlesVisible(visible);
-    this.controlGuides?.forEach((guide) => {
-      guide.node.style.display = visible ? "" : "none";
-    });
-  }
-
-  override onDestroy() {
-    this.controlGuides?.forEach((guide) => guide.destroy());
-    this.controlGuides = undefined;
-    super.onDestroy();
-  }
-
-  private redrawControlGuides() {
-    if (!this.controlGuides || this.isDestroyed()) return;
-    const [start, end] = cubicEdgeModelEndpoints(this.state);
-    const [control1, control2] = cubicControlPointsFromStyle(start, end, this.state.style);
-    const { scale, translate } = this.state.view;
-    const toViewPoint = (point: Point) => new Point(
-      (point.x + translate.x) * scale,
-      (point.y + translate.y) * scale,
-    );
-    const startPoint = this.state.absolutePoints[0] ?? toViewPoint(start);
-    const endPoint = this.state.absolutePoints[this.state.absolutePoints.length - 1] ?? toViewPoint(end);
-    const visible = !this.graph.isEditing() && this.graph.getSelectionCount() === 1;
-    this.controlGuides[0].points = [startPoint, toViewPoint(control1)];
-    this.controlGuides[1].points = [endPoint, toViewPoint(control2)];
-    this.controlGuides.forEach((guide) => {
-      guide.node.style.visibility = visible ? "" : "hidden";
-      guide.redraw();
-    });
-  }
-}
-
-ShapeRegistry.add(DIAGRAM_CUBIC_EDGE_SHAPE, DiagramCubicConnectorShape);
-
-VertexHandlerConfig.selectionColor = "#0066cc";
-VertexHandlerConfig.selectionDashed = false;
-VertexHandlerConfig.selectionStrokeWidth = 1.5;
-VertexHandlerConfig.cursorMovable = "grab";
-VertexHandlerConfig.rotationEnabled = true;
-EdgeHandlerConfig.selectionColor = "#0066cc";
-EdgeHandlerConfig.selectionDashed = false;
-EdgeHandlerConfig.selectionStrokeWidth = 2;
-EdgeHandlerConfig.addBendOnShiftClickEnabled = true;
-EdgeHandlerConfig.removeBendOnShiftClickEnabled = true;
-EdgeHandlerConfig.virtualBendsEnabled = true;
-EdgeHandlerConfig.virtualBendOpacity = 36;
-EdgeHandlerConfig.handleShape = "circle";
-HandleConfig.size = 8;
-HandleConfig.fillColor = "#ffffff";
-HandleConfig.strokeColor = "#0066cc";
-HandleConfig.labelFillColor = "#2997ff";
-StyleDefaultsConfig.shadowColor = "#0f172a";
-StyleDefaultsConfig.shadowOpacity = 0.16;
-StyleDefaultsConfig.shadowOffsetX = 0;
-StyleDefaultsConfig.shadowOffsetY = 4;
-registerDiagramSemanticShapes();
+import {
+  buildStencilCollections,
+  createNodeDragPreview,
+  defaultEdgeStyle,
+  edgeCellStyle,
+  edgeRoutingStyle,
+  edgeTypeFromCellStyle,
+  isDiamondLikeKind,
+  nodeCellStyle,
+  nodeDefaults,
+  stencilNodeDefaults,
+  stencilPaletteItem,
+  diagramFontFamilyCss,
+  diagramFontFamilyFromStyle,
+  linePatternFromStyle,
+  textAlignFromStyle,
+  verticalAlignFromStyle,
+  arrowTypeFromStyle,
+} from "./diagram/graphStyles";
+import {
+  CUBIC_CONTROL_DEFAULTS,
+  DIAGRAM_CUBIC_EDGE_SHAPE,
+  DIAGRAM_ROTATION_HANDLE_ACCENT,
+  DIAGRAM_ROTATION_HANDLE_FILL,
+  DiagramCubicEdgeHandler,
+  DiagramVertexHandler,
+} from "./diagram/graphShapes";
+import {
+  absoluteCellCenter,
+  absoluteCellOrigin,
+  clampNumber,
+  constraintForPort,
+  cubicControlPointsFromStyle,
+  cubicControlStyleFromPoints,
+  defaultCubicControlPoints,
+  edgeWaypointsForGraph,
+  normalizeRotation,
+  portFromStyle,
+  styleColor,
+  styleNumber,
+} from "./diagram/graphGeometry";
+import {
+  DiagramAccountDialog,
+  DiagramCloudDocumentsDialog,
+  DiagramEditorDialog,
+  formatDiagramTimestamp,
+} from "./diagram/dialogs";
+import type {
+  DiagramCellStyle,
+  DiagramDialogRequest,
+  DiagramDialogResult,
+  DiagramStatusTone,
+} from "./diagram/types";
+import {
+  DIAGRAM_ARROW_OPTIONS,
+  DIAGRAM_FONT_OPTIONS,
+  DIAGRAM_TEMPLATES,
+  NODE_PALETTE,
+  PALETTE_CATEGORIES,
+  PORT_CONSTRAINTS,
+  isDiagramNodeKind,
+} from "./diagram/paletteCatalog";
+import type {
+  DiagramTemplateDefinition,
+  DiagramTemplateId,
+  DraggablePaletteItem,
+  PaletteCategory,
+  StencilCollection,
+  StencilPaletteItem,
+} from "./diagram/paletteCatalog";
+import {
+  readDiagramBooleanPreference,
+  readDiagramNodeKindList,
+  readDiagramPanelWidth,
+  writeDiagramBooleanPreference,
+  writeDiagramNodeKindList,
+  writeDiagramPanelWidth,
+} from "./diagram/preferences";
 
 export interface DiagramEmbedApi {
   getSnapshot: () => string;
@@ -581,22 +282,6 @@ interface DiagramContextMenu {
   y: number;
 }
 
-type DiagramDialogResult = string | true | null;
-type DiagramStatusTone = "info" | "success" | "error";
-
-interface DiagramDialogRequest {
-  id: number;
-  kind: "confirm" | "text";
-  title: string;
-  message?: string;
-  inputLabel?: string;
-  initialValue?: string;
-  placeholder?: string;
-  maxLength?: number;
-  multiline?: boolean;
-  confirmLabel?: string;
-  tone?: "default" | "danger";
-}
 
 type DiagramEditableStyleKey =
   | "fillColor"
@@ -642,19 +327,6 @@ interface DiagramVersionSnapshot {
   sizeBytes?: number;
 }
 
-type DiagramCellStyle = CellStyle & {
-  diagramKind?: DiagramNodeKind;
-  diagramStencilName?: string;
-  diagramStencilLibrary?: string;
-  connectable?: boolean;
-  collapsible?: boolean;
-  recursiveResize?: boolean;
-  diagramLocked?: boolean;
-  diagramCubicControl1T?: number;
-  diagramCubicControl1N?: number;
-  diagramCubicControl2T?: number;
-  diagramCubicControl2N?: number;
-};
 
 const GRAPH_ORIGIN = Symbol("diagram-graph");
 const IMPORT_ORIGIN = Symbol("diagram-import");
@@ -690,211 +362,6 @@ const EMPTY_SELECTION: DiagramSelection = {
   mixedFields: [],
 };
 
-const PORT_CONSTRAINTS = [
-  new ConnectionConstraint(new Point(0.5, 0), true, "north"),
-  new ConnectionConstraint(new Point(1, 0.5), true, "east"),
-  new ConnectionConstraint(new Point(0.5, 1), true, "south"),
-  new ConnectionConstraint(new Point(0, 0.5), true, "west"),
-];
-
-const PALETTE_CATEGORIES = ["通用图形", "流程图", "BPMN", "UML", "ER 图", "网络与架构", "容器与泳道"] as const;
-type PaletteCategory = typeof PALETTE_CATEGORIES[number];
-
-const NODE_PALETTE: Array<{ kind: DiagramNodeKind; label: string; detail: string; category: PaletteCategory }> = [
-  { kind: "rectangle", label: "矩形", detail: "通用容器", category: "通用图形" },
-  { kind: "roundedRectangle", label: "圆角矩形", detail: "通用卡片", category: "通用图形" },
-  { kind: "ellipse", label: "椭圆", detail: "通用图形", category: "通用图形" },
-  { kind: "circle", label: "圆形", detail: "通用图形", category: "通用图形" },
-  { kind: "diamond", label: "菱形", detail: "关系判断", category: "通用图形" },
-  { kind: "triangle", label: "三角形", detail: "方向标识", category: "通用图形" },
-  { kind: "hexagon", label: "六边形", detail: "准备步骤", category: "通用图形" },
-  { kind: "text", label: "文本", detail: "无边框文字", category: "通用图形" },
-  { kind: "note", label: "便签", detail: "补充说明", category: "通用图形" },
-
-  { kind: "start", label: "开始", detail: "流程起点", category: "流程图" },
-  { kind: "process", label: "处理", detail: "业务步骤", category: "流程图" },
-  { kind: "decision", label: "判断", detail: "条件分支", category: "流程图" },
-  { kind: "end", label: "结束", detail: "流程终点", category: "流程图" },
-  { kind: "document", label: "文档", detail: "文档输出", category: "流程图" },
-  { kind: "database", label: "数据存储", detail: "数据库", category: "流程图" },
-  { kind: "data", label: "输入输出", detail: "数据输入", category: "流程图" },
-  { kind: "subprocess", label: "子流程", detail: "预定义过程", category: "流程图" },
-  { kind: "delay", label: "延迟", detail: "等待节点", category: "流程图" },
-  { kind: "manualInput", label: "手动输入", detail: "人工录入", category: "流程图" },
-  { kind: "connector", label: "连接符", detail: "页内连接", category: "流程图" },
-
-  { kind: "bpmnTask", label: "任务", detail: "BPMN Task", category: "BPMN" },
-  { kind: "bpmnEvent", label: "事件", detail: "中间事件", category: "BPMN" },
-  { kind: "bpmnGateway", label: "网关", detail: "并行或排他", category: "BPMN" },
-  { kind: "bpmnDataObject", label: "数据对象", detail: "业务数据", category: "BPMN" },
-
-  { kind: "actor", label: "参与者", detail: "角色或用户", category: "UML" },
-  { kind: "umlUseCase", label: "用例", detail: "Use Case", category: "UML" },
-  { kind: "umlClass", label: "类", detail: "属性与方法", category: "UML" },
-  { kind: "umlInterface", label: "接口", detail: "Interface", category: "UML" },
-  { kind: "umlPackage", label: "包", detail: "Package", category: "UML" },
-  { kind: "umlComponent", label: "组件", detail: "Component", category: "UML" },
-
-  { kind: "entity", label: "实体", detail: "数据实体", category: "ER 图" },
-  { kind: "erRelationship", label: "关系", detail: "实体关系", category: "ER 图" },
-  { kind: "erAttribute", label: "属性", detail: "实体属性", category: "ER 图" },
-
-  { kind: "server", label: "服务器", detail: "计算节点", category: "网络与架构" },
-  { kind: "client", label: "客户端", detail: "终端设备", category: "网络与架构" },
-  { kind: "router", label: "路由器", detail: "网络路由", category: "网络与架构" },
-  { kind: "firewall", label: "防火墙", detail: "安全边界", category: "网络与架构" },
-  { kind: "cloud", label: "云服务", detail: "外部系统", category: "网络与架构" },
-  { kind: "queue", label: "消息队列", detail: "异步通道", category: "网络与架构" },
-  { kind: "service", label: "服务", detail: "应用服务", category: "网络与架构" },
-
-  { kind: "container", label: "容器", detail: "分组区域", category: "容器与泳道" },
-  { kind: "swimlane", label: "泳池", detail: "职责分区", category: "容器与泳道" },
-];
-
-interface StencilPaletteItem {
-  id: string;
-  kind: "rectangle";
-  label: string;
-  detail: string;
-  stencilName: string;
-  stencilLibrary: string;
-  width: number;
-  height: number;
-}
-
-type DraggablePaletteItem = (typeof NODE_PALETTE)[number] | StencilPaletteItem;
-
-interface StencilCollectionItem {
-  library: DrawioStencilLibrary;
-  shape: DrawioStencilShape;
-}
-
-interface StencilCollection {
-  id: string;
-  name: string;
-  group: string;
-  libraryCount: number;
-  shapeCount: number;
-  items: StencilCollectionItem[];
-}
-
-const STENCIL_COLLECTION_RULES: Array<{ id: string; name: string; pattern: RegExp }> = [
-  { id: "aws", name: "AWS", pattern: /^aws(?:\/|2\/|3$|3d$|4$)/ },
-  { id: "gcp", name: "Google Cloud", pattern: /^gcp(?:\/|2$|3$)/ },
-  { id: "kubernetes", name: "Kubernetes", pattern: /^kubernetes2?$/ },
-  { id: "cisco", name: "Cisco", pattern: /^cisco(?:\/|19$|_safe\/)/ },
-  { id: "citrix", name: "Citrix", pattern: /^citrix2?$/ },
-  { id: "networks", name: "网络设备", pattern: /^networks2?$/ },
-  { id: "rack", name: "机架设备", pattern: /^rack\// },
-  { id: "office", name: "Microsoft Office", pattern: /^office\// },
-  { id: "mscae", name: "Microsoft Cloud Architecture", pattern: /^mscae\// },
-  { id: "veeam", name: "Veeam", pattern: /^veeam\// },
-  { id: "electrical", name: "电气工程", pattern: /^electrical\// },
-  { id: "pid", name: "P&ID", pattern: /^pid\// },
-  { id: "mockup", name: "界面原型", pattern: /^mockup\// },
-  { id: "ios", name: "iOS", pattern: /^ios7\// },
-  { id: "android", name: "Android", pattern: /^android\// },
-  { id: "signs", name: "标志与符号", pattern: /^signs\// },
-  { id: "web", name: "Web 图标与 Logo", pattern: /^web(?:icons|logos)$/ },
-];
-
-const DIAGRAM_FONT_OPTIONS: Array<{ value: DiagramFontFamily; label: string }> = [
-  { value: "system", label: "系统字体" },
-  { value: "rounded", label: "圆体" },
-  { value: "serif", label: "衬线字体" },
-  { value: "mono", label: "等宽字体" },
-];
-const DIAGRAM_ARROW_OPTIONS: Array<{ value: DiagramArrowType; label: string }> = [
-  { value: "none", label: "无" },
-  { value: "classic", label: "经典" },
-  { value: "block", label: "实心" },
-  { value: "open", label: "开放" },
-  { value: "oval", label: "圆点" },
-  { value: "diamond", label: "菱形" },
-];
-
-type DiagramTemplateId = "approval" | "architecture" | "er";
-
-interface DiagramTemplateNodeDefinition {
-  id: string;
-  kind: DiagramNodeKind;
-  label: string;
-  dx: number;
-  dy: number;
-  width: number;
-  height: number;
-  style?: Partial<DiagramNodeStyle>;
-}
-
-interface DiagramTemplateEdgeDefinition {
-  sourceId: string;
-  targetId: string;
-  label?: string;
-  sourcePort: DiagramPort;
-  targetPort: DiagramPort;
-  style?: Partial<DiagramEdgeStyle>;
-}
-
-interface DiagramTemplateDefinition {
-  name: string;
-  shortName: string;
-  detail: string;
-  nodes: DiagramTemplateNodeDefinition[];
-  edges: DiagramTemplateEdgeDefinition[];
-}
-
-const DIAGRAM_TEMPLATES: Record<DiagramTemplateId, DiagramTemplateDefinition> = {
-  approval: {
-    name: "发布审批",
-    shortName: "流程",
-    detail: "发布审批",
-    nodes: [
-      { id: "start", kind: "start", label: "开始", dx: 38, dy: 0, width: 88, height: 32, style: { fontSize: 11 } },
-      { id: "submit", kind: "process", label: "提交发布版本", dx: 20, dy: 58, width: 124, height: 46, style: { fontSize: 11, rounded: true } },
-      { id: "review", kind: "decision", label: "审核通过？", dx: 26, dy: 132, width: 112, height: 72, style: { fontSize: 11 } },
-      { id: "published", kind: "end", label: "发布完成", dx: 38, dy: 236, width: 88, height: 32, style: { fillColor: "#ecfdf3", strokeColor: "#34c759", fontSize: 11 } },
-      { id: "rejected", kind: "end", label: "退回修改", dx: 190, dy: 151, width: 100, height: 34, style: { fillColor: "#fff1f2", strokeColor: "#ff3b30", fontSize: 11, bold: false } },
-    ],
-    edges: [
-      { sourceId: "start", targetId: "submit", sourcePort: "south", targetPort: "north" },
-      { sourceId: "submit", targetId: "review", sourcePort: "south", targetPort: "north" },
-      { sourceId: "review", targetId: "published", label: "通过", sourcePort: "south", targetPort: "north" },
-      { sourceId: "review", targetId: "rejected", label: "退回", sourcePort: "east", targetPort: "west", style: { strokeColor: "#ff3b30" } },
-    ],
-  },
-  architecture: {
-    name: "直传架构",
-    shortName: "架构",
-    detail: "直连与兜底",
-    nodes: [
-      { id: "sender", kind: "client", label: "发送端", dx: 0, dy: 66, width: 112, height: 52, style: { fontSize: 11, rounded: true } },
-      { id: "coordinator", kind: "service", label: "协调服务", dx: 150, dy: 0, width: 124, height: 52, style: { fillColor: "#f5f5f7", strokeColor: "#86868b", fontSize: 11 } },
-      { id: "receiver", kind: "client", label: "接收端", dx: 312, dy: 66, width: 112, height: 52, style: { fontSize: 11, rounded: true } },
-      { id: "storage", kind: "cloud", label: "对象存储\n失败兜底", dx: 150, dy: 150, width: 124, height: 58, style: { fillColor: "#ecfdf3", strokeColor: "#34c759", fontSize: 10 } },
-    ],
-    edges: [
-      { sourceId: "sender", targetId: "receiver", label: "WebRTC 直传", sourcePort: "east", targetPort: "west", style: { edgeType: "straight" } },
-      { sourceId: "sender", targetId: "coordinator", label: "信令", sourcePort: "north", targetPort: "west" },
-      { sourceId: "coordinator", targetId: "receiver", label: "协商", sourcePort: "east", targetPort: "north" },
-      { sourceId: "sender", targetId: "storage", label: "预签名上传", sourcePort: "south", targetPort: "west", style: { strokeColor: "#34c759" } },
-      { sourceId: "storage", targetId: "receiver", label: "临时下载", sourcePort: "east", targetPort: "south", style: { strokeColor: "#34c759" } },
-    ],
-  },
-  er: {
-    name: "房间 ER",
-    shortName: "ER",
-    detail: "房间数据",
-    nodes: [
-      { id: "room", kind: "entity", label: "Room 房间\n────────\nid: UUID\nname: VARCHAR", dx: 145, dy: 0, width: 142, height: 92, style: { fontSize: 10, spacing: 8 } },
-      { id: "member", kind: "entity", label: "Member 成员\n────────\nid: UUID\nroom_id: UUID", dx: 0, dy: 138, width: 142, height: 104, style: { strokeColor: "#34c759", fontSize: 10, spacing: 8 } },
-      { id: "transfer", kind: "entity", label: "Transfer 传输\n────────\nid: UUID\nroom_id: UUID", dx: 290, dy: 138, width: 142, height: 104, style: { strokeColor: "#ff9f0a", fontSize: 10, spacing: 8 } },
-    ],
-    edges: [
-      { sourceId: "room", targetId: "member", label: "1 : N", sourcePort: "south", targetPort: "north", style: { strokeColor: "#34c759" } },
-      { sourceId: "room", targetId: "transfer", label: "1 : N", sourcePort: "south", targetPort: "north", style: { strokeColor: "#ff9f0a" } },
-    ],
-  },
-};
 const diagramStateCache = new Map<string, Uint8Array>();
 
 export function SyncedDiagram({
@@ -5823,370 +5290,6 @@ export function SyncedDiagram({
   return diagram;
 }
 
-function DiagramAccountDialog({
-  isOpen,
-  onClose,
-  onLoggedIn,
-}: {
-  isOpen: boolean;
-  onClose: () => void;
-  onLoggedIn: () => void;
-}) {
-  const {
-    oidcConfig,
-    loginHint,
-    passwordLogin,
-    startOidcLogin,
-  } = useAuth();
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const passwordEnabled = oidcConfig?.passwordLoginEnabled ?? true;
-  const oidcEnabled = oidcConfig?.configured ?? false;
-
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setSubmitting(true);
-    setError(null);
-    try {
-      await passwordLogin(username, password);
-      setPassword("");
-      onLoggedIn();
-    } catch (loginError) {
-      setError(loginError instanceof Error ? loginError.message : "登录失败");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Modal
-      isOpen={isOpen}
-      placement="center"
-      size="sm"
-      backdrop="blur"
-      onOpenChange={(open) => {
-        if (!open && !submitting) onClose();
-      }}
-      classNames={{
-        wrapper: "!z-[220] px-4 py-6",
-        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-        base: "diagram-apple-dialog overflow-hidden rounded-2xl border shadow-2xl",
-      }}
-    >
-      <ModalContent>
-        <ModalHeader className="flex flex-col gap-1 border-b border-[var(--diagram-apple-line)] px-5 pb-4 pt-5">
-          <span className="text-base font-semibold">登录账号</span>
-          <span className="text-[11px] font-normal text-zinc-500 dark:text-zinc-400">{loginHint}</span>
-        </ModalHeader>
-        <ModalBody className="gap-3 px-5 py-4">
-          {passwordEnabled ? (
-            <form id="diagram-account-form" className="grid gap-3" onSubmit={(event) => void submit(event)}>
-              <Input
-                label="用户名"
-                value={username}
-                autoComplete="username"
-                isDisabled={submitting}
-                onValueChange={setUsername}
-              />
-              <Input
-                label="密码"
-                type="password"
-                value={password}
-                autoComplete="current-password"
-                isDisabled={submitting}
-                onValueChange={setPassword}
-              />
-            </form>
-          ) : null}
-          {error ? (
-            <div className="rounded-lg border border-[var(--diagram-apple-danger)] bg-[var(--diagram-apple-danger-soft)] px-3 py-2 text-[11px] text-[var(--diagram-apple-danger)]">
-              {error}
-            </div>
-          ) : null}
-          {!passwordEnabled && !oidcEnabled ? (
-            <div className="rounded-lg border border-amber-500/20 bg-amber-50 px-3 py-2 text-[11px] text-amber-800 dark:border-amber-300/20 dark:bg-amber-300/10 dark:text-amber-100">
-              当前服务端未启用登录方式。
-            </div>
-          ) : null}
-        </ModalBody>
-        <ModalFooter className="gap-2 border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-5 py-3">
-          <Button size="sm" radius="sm" variant="light" isDisabled={submitting} onPress={onClose}>
-            取消
-          </Button>
-          {oidcEnabled ? (
-            <Button size="sm" radius="sm" variant="flat" isDisabled={submitting} onPress={() => void startOidcLogin()}>
-              OIDC 登录
-            </Button>
-          ) : null}
-          {passwordEnabled ? (
-            <Button
-              form="diagram-account-form"
-              type="submit"
-              size="sm"
-              radius="sm"
-              color="primary"
-              isLoading={submitting}
-              isDisabled={!username.trim() || !password}
-            >
-              登录
-            </Button>
-          ) : null}
-        </ModalFooter>
-      </ModalContent>
-    </Modal>
-  );
-}
-
-function DiagramCloudDocumentsDialog({
-  isOpen,
-  busy,
-  currentId,
-  documents,
-  onClose,
-  onDelete,
-  onOpen,
-  onRefresh,
-  onSaveAs,
-}: {
-  isOpen: boolean;
-  busy: boolean;
-  currentId: number | null;
-  documents: UserDiagramDocument[];
-  onClose: () => void;
-  onDelete: (document: UserDiagramDocument) => void;
-  onOpen: (document: UserDiagramDocument) => void;
-  onRefresh: () => void;
-  onSaveAs: () => void;
-}) {
-  return (
-    <Modal
-      isOpen={isOpen}
-      placement="center"
-      size="2xl"
-      scrollBehavior="inside"
-      backdrop="blur"
-      onOpenChange={(open) => {
-        if (!open && !busy) onClose();
-      }}
-      classNames={{
-        wrapper: "!z-[220] px-4 py-6",
-        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-        base: "diagram-apple-dialog max-h-[min(78dvh,720px)] overflow-hidden rounded-2xl border shadow-2xl",
-      }}
-    >
-      <ModalContent>
-        <ModalHeader className="flex items-center justify-between gap-3 border-b border-[var(--diagram-apple-line)] px-5 pb-4 pt-5">
-          <span className="min-w-0">
-            <span className="block text-base font-semibold">我的云端文件</span>
-            <span className="mt-0.5 block text-[11px] font-normal text-zinc-500 dark:text-zinc-400">{documents.length} 个文件</span>
-          </span>
-          <span className="flex shrink-0 gap-2 pr-7">
-            <Button size="sm" radius="sm" variant="light" isDisabled={busy} onPress={onRefresh}>刷新</Button>
-            <Button size="sm" radius="sm" color="primary" variant="flat" isDisabled={busy} onPress={onSaveAs}>保存当前</Button>
-          </span>
-        </ModalHeader>
-        <ModalBody className="px-5 pb-5 pt-1">
-          {busy && documents.length === 0 ? (
-            <div className="flex min-h-40 items-center justify-center gap-2 text-small text-zinc-500 dark:text-zinc-400">
-              <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--diagram-apple-blue-soft)] border-t-[var(--diagram-apple-blue)]" aria-hidden="true" />
-              正在读取云端文件…
-            </div>
-          ) : documents.length === 0 ? (
-            <div className="grid min-h-40 place-items-center rounded-lg border border-dashed border-black/[0.1] bg-white/70 text-small text-zinc-500 dark:border-white/[0.1] dark:bg-white/[0.025] dark:text-zinc-400">
-              还没有云端文件
-            </div>
-          ) : (
-            <div className="grid gap-2">
-              {documents.map((document) => {
-                const isCurrent = currentId === document.id;
-                return (
-                  <div
-                    key={document.id}
-                    className={`flex flex-col gap-3 rounded-lg border px-3.5 py-3 sm:flex-row sm:items-center ${isCurrent
-                      ? "border-[var(--diagram-apple-blue)] bg-[var(--diagram-apple-blue-soft)]"
-                      : "border-black/[0.07] bg-white dark:border-white/[0.08] dark:bg-white/[0.035]"}`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <span className="truncate text-small font-semibold text-zinc-900 dark:text-zinc-100">{document.name}</span>
-                        {isCurrent ? <span className="shrink-0 rounded bg-[var(--diagram-apple-blue-soft)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--diagram-apple-blue)]">当前</span> : null}
-                      </div>
-                      <div className="mt-1 flex flex-wrap gap-x-2 text-[11px] text-zinc-500 dark:text-zinc-400">
-                        <span>{formatCloudDiagramDate(document.updatedAt)}</span>
-                        <span>{formatCloudDiagramBytes(document.sizeBytes)}</span>
-                        <span>修订 {document.revision}</span>
-                      </div>
-                    </div>
-                    <div className="flex shrink-0 gap-2">
-                      <Button size="sm" radius="sm" color="primary" variant="flat" isDisabled={busy || isCurrent} onPress={() => onOpen(document)}>
-                        {isCurrent ? "已打开" : "打开"}
-                      </Button>
-                      <Button size="sm" radius="sm" color="danger" variant="light" isDisabled={busy} onPress={() => onDelete(document)}>
-                        删除
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </ModalBody>
-        <ModalFooter className="border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-5 py-3">
-          <Button size="sm" radius="sm" variant="light" isDisabled={busy} onPress={onClose}>关闭</Button>
-        </ModalFooter>
-      </ModalContent>
-    </Modal>
-  );
-}
-
-function formatCloudDiagramDate(value: string) {
-  return formatDiagramTimestamp(value);
-}
-
-function formatDiagramTimestamp(value: string | number) {
-  const timestamp = typeof value === "number" ? value : Date.parse(value);
-  if (!Number.isFinite(timestamp)) return String(value);
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(timestamp);
-}
-
-function formatCloudDiagramBytes(value: number) {
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function DiagramEditorDialog({
-  request,
-  onResolve,
-}: {
-  request: DiagramDialogRequest;
-  onResolve: (result: DiagramDialogResult) => void;
-}) {
-  const [value, setValue] = useState(request.initialValue ?? "");
-  const canSubmit = request.kind === "confirm" || value.trim().length > 0;
-  const submit = () => {
-    if (!canSubmit) return;
-    onResolve(request.kind === "text" ? value : true);
-  };
-
-  return (
-    <Modal
-      isOpen
-      backdrop="blur"
-      placement="center"
-      scrollBehavior="inside"
-      onClose={() => onResolve(null)}
-      classNames={{
-        wrapper: "!z-[220] px-4 py-6",
-        backdrop: "!z-[210] bg-zinc-950/40 backdrop-blur-[6px] dark:bg-black/65",
-        base: "diagram-apple-dialog max-h-[min(86dvh,620px)] max-w-[440px] overflow-hidden rounded-2xl border shadow-2xl",
-        closeButton: "text-zinc-500 dark:text-zinc-300",
-      }}
-    >
-      <ModalContent>
-        <form onSubmit={(event) => { event.preventDefault(); submit(); }}>
-          <ModalHeader className="flex flex-col gap-1 border-b border-black/[0.07] px-5 pb-4 pt-5 dark:border-white/[0.08]">
-            <span className={`text-[11px] font-semibold uppercase ${request.tone === "danger"
-              ? "text-[var(--diagram-apple-danger)]"
-              : "text-[var(--diagram-apple-blue)]"}`}>专业编辑器</span>
-            <span className="pr-8 text-[17px] font-semibold text-zinc-950 dark:text-white">{request.title}</span>
-          </ModalHeader>
-          <ModalBody className="gap-4 px-5 py-5">
-            {request.message ? (
-              <p className="text-[13px] leading-5 text-zinc-600 dark:text-zinc-300">{request.message}</p>
-            ) : null}
-            {request.kind === "text" ? (
-              <div>
-                {request.multiline ? (
-                  <Textarea
-                    autoFocus
-                    label={request.inputLabel}
-                    labelPlacement="outside"
-                    placeholder={request.placeholder}
-                    value={value}
-                    minRows={4}
-                    maxRows={9}
-                    maxLength={request.maxLength}
-                    radius="sm"
-                    variant="bordered"
-                    classNames={{
-                      label: "pb-1 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200",
-                      input: "text-[13px] leading-5 text-zinc-950 dark:text-zinc-50",
-                      inputWrapper: "border-[var(--diagram-apple-line-strong)] bg-[var(--diagram-apple-surface-soft)] shadow-none data-[focus=true]:border-[var(--diagram-apple-blue)]",
-                    }}
-                    onValueChange={setValue}
-                    onFocus={(event) => event.currentTarget.select()}
-                    onKeyDown={(event) => {
-                      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                        event.preventDefault();
-                        submit();
-                      }
-                    }}
-                  />
-                ) : (
-                  <Input
-                    autoFocus
-                    label={request.inputLabel}
-                    labelPlacement="outside"
-                    placeholder={request.placeholder}
-                    value={value}
-                    maxLength={request.maxLength}
-                    radius="sm"
-                    variant="bordered"
-                    classNames={{
-                      label: "pb-1 text-[11px] font-semibold text-zinc-700 dark:text-zinc-200",
-                      input: "text-[13px] text-zinc-950 dark:text-zinc-50",
-                      inputWrapper: "border-[var(--diagram-apple-line-strong)] bg-[var(--diagram-apple-surface-soft)] shadow-none data-[focus=true]:border-[var(--diagram-apple-blue)]",
-                    }}
-                    onValueChange={setValue}
-                    onFocus={(event) => event.currentTarget.select()}
-                  />
-                )}
-                {request.maxLength ? (
-                  <p className="mt-1.5 text-right font-mono text-[11px] text-zinc-400" aria-live="polite">
-                    {value.length}/{request.maxLength}
-                  </p>
-                ) : null}
-              </div>
-            ) : null}
-          </ModalBody>
-          <ModalFooter className="gap-2 border-t border-[var(--diagram-apple-line)] bg-[var(--diagram-apple-surface-soft)] px-5 py-3">
-            <Button
-              type="button"
-              size="sm"
-              radius="sm"
-              variant="light"
-              className="font-semibold text-zinc-600 hover:bg-black/[0.05] dark:text-zinc-300 dark:hover:bg-white/[0.07]"
-              onPress={() => onResolve(null)}
-            >
-              取消
-            </Button>
-            <Button
-              type="submit"
-              size="sm"
-              radius="sm"
-              color={request.tone === "danger" ? "danger" : "primary"}
-              isDisabled={!canSubmit}
-              className={request.tone === "danger"
-                ? "font-semibold shadow-none"
-                : "bg-[var(--diagram-apple-blue)] font-semibold text-white shadow-none"}
-            >
-              {request.confirmLabel ?? (request.kind === "text" ? "确定" : "继续")}
-            </Button>
-          </ModalFooter>
-        </form>
-      </ModalContent>
-    </Modal>
-  );
-}
-
 function readGraphDocument(graph: Graph, pageId = DEFAULT_PAGE_ID): Pick<DiagramDocumentV1, "nodes" | "edges"> {
   const root = graph.getDefaultParent();
   const nodes: DiagramNode[] = [];
@@ -6507,58 +5610,11 @@ function findAvailableTemplatePlacement(
   return { x: preferred.x, y: preferred.y, shifted: false };
 }
 
-function readDiagramNodeKindList(key: string): DiagramNodeKind[] {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? "[]");
-    return Array.isArray(parsed) ? parsed.filter(isDiagramNodeKind).slice(0, 24) : [];
-  } catch {
-    return [];
-  }
-}
 
-function writeDiagramNodeKindList(key: string, values: DiagramNodeKind[]) {
-  try {
-    localStorage.setItem(key, JSON.stringify(values));
-  } catch {
-    // Preferences remain available in memory when browser storage is unavailable.
-  }
-}
 
-function readDiagramPanelWidth(key: string, fallback: number, min: number, max: number) {
-  try {
-    const value = Number(localStorage.getItem(key));
-    return Number.isFinite(value) && value >= min && value <= max ? value : fallback;
-  } catch {
-    return fallback;
-  }
-}
 
-function writeDiagramPanelWidth(key: string, width: number) {
-  try {
-    localStorage.setItem(key, String(Math.round(width)));
-  } catch {
-    // Width preference is nonessential.
-  }
-}
 
-function readDiagramBooleanPreference(key: string): boolean | null {
-  try {
-    const value = localStorage.getItem(key);
-    if (value === "true") return true;
-    if (value === "false") return false;
-  } catch {
-    // UI preferences are nonessential.
-  }
-  return null;
-}
 
-function writeDiagramBooleanPreference(key: string, value: boolean) {
-  try {
-    localStorage.setItem(key, String(value));
-  } catch {
-    // UI preferences are nonessential.
-  }
-}
 
 function updateSelection(graph: Graph, update: (selection: DiagramSelection) => void) {
   const cells = graph.getSelectionCells();
@@ -6711,549 +5767,6 @@ function layoutLaneCells(graph: Graph, pool: Cell, orderedLanes = laneChildren(g
   graph.getDataModel().setGeometry(pool, poolGeometry);
 }
 
-function isDiamondLikeKind(kind: DiagramNodeKind): boolean {
-  return kind === "diamond"
-    || kind === "decision"
-    || kind === "bpmnGateway"
-    || kind === "erRelationship";
-}
-
-function nodeCellStyle(node: DiagramNode, optimizeLargeGraph = false): DiagramCellStyle {
-  const isContainer = node.kind === "container" || node.kind === "swimlane" || node.kind === "lane";
-  const isDiamondLike = isDiamondLikeKind(node.kind);
-  const defaultFontFamily: DiagramFontFamily = node.kind === "umlClass" || node.kind === "entity" ? "mono" : "system";
-  const usesRoundedCorners = node.kind === "process"
-    || node.kind === "roundedRectangle"
-    || node.kind === "subprocess"
-    || node.kind === "bpmnTask"
-    || node.kind === "umlClass"
-    || node.kind === "umlPackage"
-    || node.kind === "umlComponent"
-    || node.kind === "entity"
-    || node.kind === "client"
-    || node.kind === "firewall"
-    || node.kind === "server"
-    || node.kind === "queue";
-  const base: DiagramCellStyle = {
-    diagramKind: node.kind,
-    ...(node.stencilName ? { diagramStencilName: node.stencilName } : {}),
-    ...(node.stencilLibrary ? { diagramStencilLibrary: node.stencilLibrary } : {}),
-    shape: node.stencilName ?? nodeShape(node.kind),
-    absoluteArcSize: true,
-    arcSize: 16,
-    whiteSpace: "wrap",
-    overflow: "hidden",
-    align: node.style.align ?? "center",
-    verticalAlign: node.style.verticalAlign ?? "middle",
-    spacing: node.style.spacing ?? (isDiamondLike ? 22 : 10),
-    fontFamily: diagramFontFamilyCss(node.style.fontFamily ?? defaultFontFamily),
-    fontSize: node.style.fontSize ?? 13,
-    fontStyle: (node.style.bold === true ? 1 : 0) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0),
-    fillColor: node.style.fillColor,
-    gradientColor: "none",
-    gradientDirection: "north",
-    strokeColor: node.style.strokeColor,
-    fontColor: node.style.fontColor,
-    labelBackgroundColor: node.style.labelBackgroundColor ?? "none",
-    strokeWidth: node.style.strokeWidth,
-    dashed: node.style.linePattern ? node.style.linePattern !== "solid" : Boolean(node.style.dashed),
-    dashPattern: dashPatternForLinePattern(node.style.linePattern),
-    shadow: !isContainer && !node.stencilName && !optimizeLargeGraph && Boolean(node.style.shadow),
-    opacity: node.style.opacity ?? 100,
-    rounded: node.style.rounded ?? usesRoundedCorners,
-    rotation: node.rotation ?? 0,
-    flipH: Boolean(node.style.flipH),
-    flipV: Boolean(node.style.flipV),
-    diagramLocked: Boolean(node.locked),
-  };
-  if (node.kind === "note") {
-    if (node.style.align === undefined) base.align = "left";
-    if (node.style.verticalAlign === undefined) base.verticalAlign = "top";
-    if (node.style.bold === undefined && node.style.italic === undefined) base.fontStyle = 0;
-  }
-  if (node.kind === "text") {
-    base.align = node.style.align ?? "left";
-    base.fontStyle = (node.style.bold ? 1 : 0) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0);
-    base.shadow = false;
-  }
-  if (isDiamondLike) {
-    base.spacingLeft = 28;
-    base.spacingRight = 28;
-    base.spacingTop = 14;
-    base.spacingBottom = 14;
-  }
-  if (node.kind === "umlClass" || node.kind === "entity") {
-    if (node.style.verticalAlign === undefined) base.verticalAlign = "top";
-    base.spacingTop = 10;
-  }
-  if (node.kind === "umlPackage") {
-    if (node.style.align === undefined) base.align = "left";
-    if (node.style.verticalAlign === undefined) base.verticalAlign = "top";
-    base.spacingTop = 28;
-    base.spacingLeft = 12;
-  }
-  if (node.kind === "umlComponent") {
-    base.spacingLeft = 36;
-  }
-  if (node.kind === "container" || node.kind === "swimlane" || node.kind === "lane") {
-    if (node.style.align === undefined) base.align = "left";
-    if (node.style.verticalAlign === undefined) base.verticalAlign = "top";
-    base.spacingTop = node.kind === "swimlane" || node.kind === "lane" ? 8 : 12;
-    base.spacingLeft = 10;
-    base.connectable = false;
-    base.collapsible = true;
-    base.recursiveResize = false;
-  }
-  if (node.kind === "swimlane") {
-    base.horizontal = node.swimlaneDirection !== "vertical";
-    base.startSize = 32;
-    base.swimlaneFillColor = node.style.fillColor;
-  }
-  if (node.kind === "lane") {
-    base.horizontal = true;
-    base.startSize = 28;
-    base.swimlaneFillColor = node.style.fillColor;
-    base.collapsible = false;
-  }
-  return base;
-}
-
-function edgeCellStyle(edge: DiagramEdge, sourceCell?: Cell, targetCell?: Cell): CellStyle {
-  const sourcePort = portCoordinates(edge.sourcePort);
-  const targetPort = portCoordinates(edge.targetPort);
-  return {
-    ...edgeRoutingStyle(edge.style.edgeType ?? "orthogonal"),
-    ...(edge.style.edgeType === "curved"
-      ? cubicControlStyleForEdge(edge, sourceCell, targetCell)
-      : {}),
-    rounded: true,
-    orthogonalLoop: true,
-    jettySize: "auto",
-    startArrow: edge.style.startArrow ?? "none",
-    startFill: edge.style.startArrow !== "open" && edge.style.startArrow !== "none",
-    startSize: edge.style.startSize ?? 8,
-    endArrow: edge.style.endArrow ?? "block",
-    endFill: edge.style.endArrow !== "open" && edge.style.endArrow !== "none",
-    endSize: edge.style.endSize ?? 8,
-    strokeColor: edge.style.strokeColor,
-    fontColor: edge.style.fontColor,
-    fontFamily: diagramFontFamilyCss(edge.style.fontFamily ?? "system"),
-    fontSize: edge.style.fontSize ?? 12,
-    fontStyle: (edge.style.bold ? 1 : 0) + (edge.style.italic ? 2 : 0) + (edge.style.underline ? 4 : 0),
-    align: edge.style.align ?? "center",
-    strokeWidth: edge.style.strokeWidth,
-    dashed: edge.style.linePattern ? edge.style.linePattern !== "solid" : Boolean(edge.style.dashed),
-    dashPattern: dashPatternForLinePattern(edge.style.linePattern),
-    opacity: edge.style.opacity ?? 100,
-    labelBackgroundColor: edge.style.labelBackgroundColor ?? "#ffffff",
-    exitX: sourcePort?.x,
-    exitY: sourcePort?.y,
-    exitPerimeter: true,
-    entryX: targetPort?.x,
-    entryY: targetPort?.y,
-    entryPerimeter: true,
-  };
-}
-
-function buildStencilCollections(catalog: DrawioStencilCatalog): StencilCollection[] {
-  const collections = new Map<string, StencilCollection>();
-  for (const library of catalog.libraries) {
-    const rule = STENCIL_COLLECTION_RULES.find((candidate) => candidate.pattern.test(library.id));
-    const collectionId = rule?.id ?? library.id;
-    const key = `${library.group}:${collectionId}`;
-    const existing = collections.get(key);
-    if (existing) {
-      existing.libraryCount += 1;
-      existing.shapeCount += library.shapeCount;
-      existing.items.push(...library.shapes.map((shape) => ({ library, shape })));
-      continue;
-    }
-    collections.set(key, {
-      id: key,
-      name: rule?.name ?? library.name,
-      group: library.group,
-      libraryCount: 1,
-      shapeCount: library.shapeCount,
-      items: library.shapes.map((shape) => ({ library, shape })),
-    });
-  }
-  return Array.from(collections.values());
-}
-
-function stencilPaletteItem(library: DrawioStencilLibrary, shape: DrawioStencilShape): StencilPaletteItem {
-  return {
-    id: shape.id,
-    kind: "rectangle",
-    label: shape.name,
-    detail: library.name,
-    stencilName: shape.shape,
-    stencilLibrary: library.path,
-    width: shape.width,
-    height: shape.height,
-  };
-}
-
-function stencilNodeDefaults(item: StencilPaletteItem): { label: string; width: number; height: number; style: DiagramNodeStyle } {
-  const sourceWidth = Math.max(1, item.width);
-  const sourceHeight = Math.max(1, item.height);
-  const scale = Math.min(156 / sourceWidth, 108 / sourceHeight);
-  return {
-    label: "",
-    width: Math.max(52, Math.round(sourceWidth * scale)),
-    height: Math.max(44, Math.round(sourceHeight * scale)),
-    style: {
-      fillColor: "#ffffff",
-      strokeColor: "#d2d2d7",
-      fontColor: "#1d1d1f",
-      strokeWidth: 1.2,
-      fontSize: 12,
-      bold: false,
-      shadow: false,
-    },
-  };
-}
-
-function nodeDefaults(kind: DiagramNodeKind): { label: string; width: number; height: number; style: DiagramNodeStyle } {
-  const base: DiagramNodeStyle = {
-    fillColor: "#ffffff",
-    strokeColor: "#d2d2d7",
-    fontColor: "#1d1d1f",
-    strokeWidth: 1.2,
-    fontSize: 14,
-    bold: false,
-    shadow: false,
-  };
-  const style = (overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => ({ ...base, ...overrides });
-  const blue = (overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => style({
-    fillColor: "#e8f2ff",
-    strokeColor: "#0066cc",
-    bold: true,
-    ...overrides,
-  });
-  const neutral = (overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => style(overrides);
-  const system = (fillColor: string, strokeColor: string, overrides: Partial<DiagramNodeStyle> = {}): DiagramNodeStyle => style({
-    fillColor,
-    strokeColor,
-    ...overrides,
-  });
-  if (kind === "rectangle") {
-    return { label: "矩形", width: 168, height: 76, style: neutral() };
-  }
-  if (kind === "roundedRectangle") {
-    return { label: "圆角矩形", width: 168, height: 76, style: neutral({ fillColor: "#fbfbfd", rounded: true }) };
-  }
-  if (kind === "ellipse") {
-    return { label: "椭圆", width: 164, height: 92, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "circle") {
-    return { label: "圆形", width: 96, height: 96, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "diamond") {
-    return { label: "菱形", width: 128, height: 128, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "triangle") {
-    return { label: "三角形", width: 120, height: 104, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "hexagon") {
-    return { label: "六边形", width: 164, height: 88, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "text") {
-    return { label: "双击编辑文本", width: 180, height: 52, style: neutral({ fillColor: "none", strokeColor: "none", strokeWidth: 0, align: "left" }) };
-  }
-  if (kind === "start") {
-    return { label: "开始", width: 128, height: 48, style: blue() };
-  }
-  if (kind === "end") {
-    return { label: "结束", width: 128, height: 48, style: blue() };
-  }
-  if (kind === "decision") {
-    return { label: "判断条件", width: 176, height: 112, style: system("#fff7e6", "#ff9f0a", { bold: true }) };
-  }
-  if (kind === "database") {
-    return { label: "数据库", width: 148, height: 92, style: neutral({ fillColor: "#fbfbfd", strokeColor: "#86868b" }) };
-  }
-  if (kind === "document") {
-    return { label: "文档", width: 156, height: 86, style: blue({ bold: false }) };
-  }
-  if (kind === "actor") {
-    return { label: "参与者", width: 116, height: 98, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "note") {
-    return { label: "补充说明", width: 176, height: 100, style: system("#fff7e6", "#d2d2d7", { align: "left" }) };
-  }
-  if (kind === "subprocess") {
-    return { label: "子流程", width: 184, height: 76, style: blue() };
-  }
-  if (kind === "data") {
-    return { label: "数据", width: 164, height: 76, style: blue({ bold: false }) };
-  }
-  if (kind === "delay") {
-    return { label: "等待", width: 156, height: 76, style: system("#fff7e6", "#ff9f0a") };
-  }
-  if (kind === "manualInput") {
-    return { label: "手动输入", width: 168, height: 76, style: system("#fff7e6", "#ff9f0a") };
-  }
-  if (kind === "connector") {
-    return { label: "A", width: 56, height: 56, style: blue({ fontSize: 12 }) };
-  }
-  if (kind === "bpmnTask") {
-    return { label: "业务任务", width: 172, height: 72, style: blue({ rounded: true }) };
-  }
-  if (kind === "cloud") {
-    return { label: "云服务", width: 176, height: 96, style: blue({ bold: false }) };
-  }
-  if (kind === "container") {
-    return { label: "分组容器", width: 480, height: 320, style: neutral({ fillColor: "#f5f5f7", strokeColor: "#86868b", dashed: true }) };
-  }
-  if (kind === "swimlane") {
-    return { label: "职责泳道", width: 560, height: 300, style: neutral({ fillColor: "#f5f5f7", strokeColor: "#0066cc" }) };
-  }
-  if (kind === "lane") {
-    return { label: "泳道", width: 560, height: 120, style: neutral({ fillColor: "#fbfbfd", strokeColor: "#d2d2d7" }) };
-  }
-  if (kind === "bpmnEvent") {
-    return { label: "中间事件", width: 76, height: 76, style: blue() };
-  }
-  if (kind === "bpmnGateway") {
-    return { label: "网关", width: 112, height: 112, style: system("#fff7e6", "#ff9f0a", { bold: true }) };
-  }
-  if (kind === "bpmnDataObject") {
-    return { label: "数据对象", width: 124, height: 92, style: blue({ bold: false }) };
-  }
-  if (kind === "umlUseCase") {
-    return { label: "用户用例", width: 172, height: 84, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "umlClass") {
-    return { label: "ClassName\n────────\n+ field: Type\n────────\n+ method()", width: 216, height: 154, style: neutral({ fillColor: "#fbfbfd", align: "left" }) };
-  }
-  if (kind === "umlInterface") {
-    return { label: "Interface", width: 104, height: 104, style: neutral({ fillColor: "#fbfbfd", fontSize: 11 }) };
-  }
-  if (kind === "umlPackage") {
-    return { label: "Package", width: 190, height: 112, style: neutral({ fillColor: "#f5f5f7", align: "left" }) };
-  }
-  if (kind === "umlComponent") {
-    return { label: "Component", width: 190, height: 100, style: blue({ bold: false }) };
-  }
-  if (kind === "entity") {
-    return { label: "Entity\n────────\nid: UUID\nname: VARCHAR", width: 204, height: 134, style: neutral({ fillColor: "#fbfbfd", align: "left" }) };
-  }
-  if (kind === "erRelationship") {
-    return { label: "关系", width: 152, height: 104, style: blue({ bold: false }) };
-  }
-  if (kind === "erAttribute") {
-    return { label: "属性", width: 152, height: 72, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "server") {
-    return { label: "应用服务器", width: 156, height: 104, style: blue({ bold: false }) };
-  }
-  if (kind === "client") {
-    return { label: "客户端", width: 156, height: 88, style: blue({ bold: false }) };
-  }
-  if (kind === "router") {
-    return { label: "路由器", width: 128, height: 72, style: blue({ bold: false }) };
-  }
-  if (kind === "firewall") {
-    return { label: "防火墙", width: 160, height: 76, style: system("#fff1f2", "#ff3b30", { bold: true }) };
-  }
-  if (kind === "queue") {
-    return { label: "消息队列", width: 164, height: 86, style: neutral({ fillColor: "#fbfbfd" }) };
-  }
-  if (kind === "service") {
-    return { label: "应用服务", width: 168, height: 84, style: system("#ecfdf5", "#34c759", { bold: true }) };
-  }
-  return { label: "处理步骤", width: 168, height: 68, style: blue() };
-}
-
-function defaultEdgeStyle(): DiagramEdgeStyle {
-  return {
-    strokeColor: "#0066cc",
-    fontColor: "#1d1d1f",
-    strokeWidth: 1.8,
-    edgeType: "orthogonal",
-    startArrow: "none",
-    endArrow: "block",
-  };
-}
-
-function nodeShape(kind: DiagramNodeKind) {
-  const semanticShape = semanticShapeName(kind);
-  if (semanticShape) return semanticShape;
-  if (kind === "ellipse" || kind === "circle" || kind === "start" || kind === "end" || kind === "connector" || kind === "umlUseCase" || kind === "erAttribute" || kind === "router") return "ellipse";
-  if (kind === "diamond" || kind === "decision" || kind === "bpmnGateway" || kind === "erRelationship") return "rhombus";
-  if (kind === "bpmnEvent" || kind === "umlInterface") return "doubleEllipse";
-  if (kind === "triangle") return "triangle";
-  if (kind === "hexagon" || kind === "service") return "hexagon";
-  if (kind === "database") return "cylinder";
-  if (kind === "actor") return "actor";
-  if (kind === "cloud") return "cloud";
-  if (kind === "swimlane" || kind === "lane") return "swimlane";
-  return "rectangle";
-}
-
-function mixHexColor(color: string, target: string, amount: number) {
-  const parse = (value: string) => {
-    const match = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(value);
-    return match ? [Number.parseInt(match[1], 16), Number.parseInt(match[2], 16), Number.parseInt(match[3], 16)] : null;
-  };
-  const sourceRgb = parse(color);
-  const targetRgb = parse(target);
-  if (!sourceRgb || !targetRgb) return target;
-  const mixed = sourceRgb.map((channel, index) => Math.round(channel + (targetRgb[index] - channel) * amount));
-  return `#${mixed.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function createNodeDragPreview(
-  kind: DiagramNodeKind,
-  defaults: { label: string; width: number; height: number; style: DiagramNodeStyle },
-) {
-  const scale = Math.min(1, 220 / defaults.width, 150 / defaults.height);
-  const width = Math.max(64, Math.round(defaults.width * scale));
-  const height = Math.max(48, Math.round(defaults.height * scale));
-  const isContainer = kind === "container" || kind === "swimlane" || kind === "lane";
-  const element = window.document.createElement("div");
-  element.style.width = `${width}px`;
-  element.style.height = `${height}px`;
-  element.style.boxSizing = "border-box";
-  element.style.position = "relative";
-  element.style.pointerEvents = "none";
-  element.style.opacity = "0.98";
-  // Soft, layered elevation so the shape reads as a card being lifted onto the canvas.
-  // drop-shadow (not box-shadow) follows the clip-path silhouette of non-rectangular kinds.
-  element.style.filter = "drop-shadow(0 14px 30px rgba(15, 23, 42, 0.26)) drop-shadow(0 3px 8px rgba(15, 23, 42, 0.14))";
-
-  const shape = window.document.createElement("div");
-  shape.style.position = "absolute";
-  shape.style.inset = isContainer ? "2px" : "1px";
-  shape.style.boxSizing = "border-box";
-  shape.style.background = isContainer
-    ? "#f5f5f7"
-    : defaults.style.fillColor;
-  shape.style.border = `${Math.max(1, defaults.style.strokeWidth)}px ${defaults.style.dashed ? "dashed" : "solid"} ${defaults.style.strokeColor}`;
-  shape.style.borderRadius = "14px";
-  // Faint top highlight for a soft, dimensional finish (clipped to the shape for non-rect kinds).
-  shape.style.boxShadow = "inset 0 1px 0 rgba(255, 255, 255, 0.5)";
-
-  if (kind === "ellipse" || kind === "circle" || kind === "start" || kind === "end" || kind === "connector" || kind === "bpmnEvent" || kind === "umlUseCase" || kind === "umlInterface" || kind === "erAttribute" || kind === "router") {
-    shape.style.borderRadius = "999px";
-  } else if (kind === "diamond" || kind === "decision" || kind === "bpmnGateway" || kind === "erRelationship") {
-    shape.style.inset = "18%";
-    shape.style.borderRadius = "8px";
-    shape.style.transform = "rotate(45deg)";
-  } else if (kind === "database") {
-    shape.style.borderRadius = "50% / 18%";
-  } else if (kind === "hexagon" || kind === "service") {
-    shape.style.clipPath = "polygon(14% 0, 86% 0, 100% 50%, 86% 100%, 14% 100%, 0 50%)";
-  } else if (kind === "triangle") {
-    shape.style.clipPath = "polygon(50% 0, 100% 100%, 0 100%)";
-  } else if (kind === "data") {
-    shape.style.clipPath = "polygon(14% 0, 100% 0, 86% 100%, 0 100%)";
-  } else if (kind === "manualInput") {
-    shape.style.clipPath = "polygon(0 20%, 100% 0, 100% 100%, 0 100%)";
-  } else if (kind === "note" || kind === "bpmnDataObject") {
-    shape.style.clipPath = "polygon(0 0, 82% 0, 100% 22%, 100% 100%, 0 100%)";
-  } else if (kind === "delay") {
-    shape.style.borderRadius = "0 999px 999px 0";
-  } else if (kind === "umlPackage") {
-    shape.style.clipPath = "polygon(0 0, 42% 0, 42% 18%, 100% 18%, 100% 100%, 0 100%)";
-  } else if (kind === "cloud") {
-    shape.style.borderRadius = "48% 52% 46% 54% / 58% 48% 52% 42%";
-  }
-  if (kind === "text") {
-    shape.style.display = "none";
-    element.style.filter = "none";
-  }
-  element.appendChild(shape);
-
-  if (kind === "subprocess" || kind === "server" || kind === "firewall" || kind === "umlClass" || kind === "entity") {
-    const overlay = window.document.createElement("div");
-    overlay.style.position = "absolute";
-    overlay.style.inset = "1px";
-    overlay.style.pointerEvents = "none";
-    if (kind === "subprocess") {
-      overlay.style.borderLeft = `2px solid ${defaults.style.strokeColor}`;
-      overlay.style.borderRight = `2px solid ${defaults.style.strokeColor}`;
-      overlay.style.marginInline = "10px";
-    } else {
-      overlay.style.background = `linear-gradient(to bottom, transparent 31%, ${defaults.style.strokeColor} 31%, ${defaults.style.strokeColor} 33%, transparent 33%, transparent 67%, ${defaults.style.strokeColor} 67%, ${defaults.style.strokeColor} 69%, transparent 69%)`;
-    }
-    element.appendChild(overlay);
-  }
-
-  if (kind === "swimlane" || kind === "lane") {
-    const header = window.document.createElement("div");
-    header.style.position = "absolute";
-    header.style.inset = "3px 3px auto";
-    header.style.height = `${Math.max(22, Math.round(30 * scale))}px`;
-    header.style.borderRadius = "11px 11px 4px 4px";
-    header.style.background = mixHexColor(defaults.style.strokeColor, "#ffffff", 0.82);
-    header.style.borderBottom = `1px solid ${mixHexColor(defaults.style.strokeColor, "#ffffff", 0.45)}`;
-    element.appendChild(header);
-  }
-
-  const label = window.document.createElement("div");
-  label.textContent = defaults.label.split("\n")[0];
-  label.style.position = "absolute";
-  label.style.inset = isContainer ? "12px auto auto 14px" : "8px";
-  label.style.display = "flex";
-  label.style.alignItems = "center";
-  label.style.justifyContent = isContainer ? "flex-start" : "center";
-  label.style.color = defaults.style.fontColor;
-  label.style.fontFamily = "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-  label.style.fontSize = `${Math.max(10, Math.min(13, Math.round(13 * scale)))}px`;
-  label.style.fontWeight = "650";
-  label.style.lineHeight = "1.2";
-  label.style.textAlign = isContainer ? "left" : "center";
-  label.style.whiteSpace = "nowrap";
-  element.appendChild(label);
-
-  // "Add" affordance in the diagram accent blue with a white ring — reads as an intentional badge
-  // rather than the previous stray cyan dot, and matches the editor's blue accent language.
-  const addBadge = window.document.createElement("div");
-  addBadge.style.position = "absolute";
-  addBadge.style.top = "-7px";
-  addBadge.style.right = "-7px";
-  addBadge.style.display = "flex";
-  addBadge.style.alignItems = "center";
-  addBadge.style.justifyContent = "center";
-  addBadge.style.width = "18px";
-  addBadge.style.height = "18px";
-  addBadge.style.borderRadius = "999px";
-  addBadge.style.background = "#0066cc";
-  addBadge.style.color = "#ffffff";
-  addBadge.style.fontFamily = "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-  addBadge.style.fontSize = "13px";
-  addBadge.style.fontWeight = "700";
-  addBadge.style.lineHeight = "1";
-  addBadge.style.boxShadow = "0 0 0 2px #ffffff, 0 4px 10px rgba(0, 102, 204, 0.42)";
-  addBadge.textContent = "+";
-  element.appendChild(addBadge);
-
-  return { element, width, height };
-}
-
-function edgeRoutingStyle(type: DiagramEdgeType): CellStyle {
-  if (type === "straight") return { edgeStyle: "none", curved: false };
-  if (type === "elbow") return { edgeStyle: "elbowEdgeStyle", elbow: "horizontal", curved: false };
-  if (type === "curved") return {
-    edgeStyle: "none",
-    curved: true,
-    shape: DIAGRAM_CUBIC_EDGE_SHAPE,
-    diagramCubicControl1T: CUBIC_CONTROL_DEFAULTS.control1T,
-    diagramCubicControl1N: CUBIC_CONTROL_DEFAULTS.control1N,
-    diagramCubicControl2T: CUBIC_CONTROL_DEFAULTS.control2T,
-    diagramCubicControl2N: CUBIC_CONTROL_DEFAULTS.control2N,
-  } as DiagramCellStyle;
-  return { edgeStyle: "orthogonalEdgeStyle", orthogonalLoop: true, jettySize: "auto", curved: false };
-}
-
-function edgeTypeFromCellStyle(style: CellStyle): DiagramEdgeType {
-  if (style.curved) return "curved";
-  if (!style.edgeStyle || style.edgeStyle === "none") return "straight";
-  if (String(style.edgeStyle).toLowerCase().includes("elbow")) return "elbow";
-  return "orthogonal";
-}
-
 function recreateSelectionHandlers(graph: Graph, cells: Cell[]) {
   const selectionCellsHandler = graph.getPlugin<SelectionCellsHandler>(SelectionCellsHandler.pluginId);
   if (!selectionCellsHandler) return;
@@ -7296,250 +5809,6 @@ function diagramPointsEqual(left?: Point[] | null, right?: Point[] | null) {
   return left.every((point, index) => point.x === right[index].x && point.y === right[index].y);
 }
 
-function arrowTypeFromStyle(value: unknown, fallback: DiagramArrowType): DiagramArrowType {
-  return value === "none" || value === "classic" || value === "block" || value === "open" || value === "oval" || value === "diamond"
-    ? value
-    : fallback;
-}
-
-function diagramPageId(pageId?: string) {
-  return pageId ?? DEFAULT_PAGE_ID;
-}
-
-function nextDiagramPageOrder(pages: Y.Map<DiagramPage>) {
-  let maximum = -1;
-  pages.forEach((page) => {
-    maximum = Math.max(maximum, page.order);
-  });
-  return maximum + 1;
-}
-
-function textAlignFromStyle(value: unknown): "left" | "center" | "right" {
-  return value === "left" || value === "right" ? value : "center";
-}
-
-function normalizeRotation(value: number) {
-  return ((Math.round(value) % 360) + 360) % 360;
-}
-
-function pointerAngleDegrees(state: CellState, x: number, y: number) {
-  return (Math.atan2(y - state.getCenterY(), x - state.getCenterX()) * 180) / Math.PI;
-}
-
-function portCoordinates(port?: DiagramPort) {
-  if (port === "north") return { x: 0.5, y: 0 };
-  if (port === "east") return { x: 1, y: 0.5 };
-  if (port === "south") return { x: 0.5, y: 1 };
-  if (port === "west") return { x: 0, y: 0.5 };
-  return undefined;
-}
-
-function absoluteCellOrigin(cell: Cell) {
-  let x = 0;
-  let y = 0;
-  let current: Cell | null = cell;
-  while (current) {
-    const geometry = current.getGeometry();
-    if (geometry && !geometry.relative) {
-      x += geometry.x;
-      y += geometry.y;
-    }
-    current = current.getParent();
-  }
-  return { x, y };
-}
-
-function absoluteCellCenter(cell: Cell) {
-  const origin = absoluteCellOrigin(cell);
-  const geometry = cell.getGeometry();
-  return {
-    x: origin.x + (geometry?.width ?? 0) / 2,
-    y: origin.y + (geometry?.height ?? 0) / 2,
-  };
-}
-
-function cubicControlPointsFromStyle(
-  start: Point,
-  end: Point,
-  style?: CellStyle | null,
-) {
-  const cubicStyle = style as DiagramCellStyle | undefined;
-  const deltaX = end.x - start.x;
-  const deltaY = end.y - start.y;
-  const point = (t: number, n: number) => new Point(
-    start.x + deltaX * t - deltaY * n,
-    start.y + deltaY * t + deltaX * n,
-  );
-  return [
-    point(
-      styleNumber(cubicStyle?.diagramCubicControl1T, CUBIC_CONTROL_DEFAULTS.control1T),
-      styleNumber(cubicStyle?.diagramCubicControl1N, CUBIC_CONTROL_DEFAULTS.control1N),
-    ),
-    point(
-      styleNumber(cubicStyle?.diagramCubicControl2T, CUBIC_CONTROL_DEFAULTS.control2T),
-      styleNumber(cubicStyle?.diagramCubicControl2N, CUBIC_CONTROL_DEFAULTS.control2N),
-    ),
-  ];
-}
-
-function cubicFactorsForPoint(start: Point, end: Point, point: Point) {
-  const deltaX = end.x - start.x;
-  const deltaY = end.y - start.y;
-  const lengthSquared = Math.max(1, deltaX * deltaX + deltaY * deltaY);
-  const relativeX = point.x - start.x;
-  const relativeY = point.y - start.y;
-  return {
-    t: clampNumber((relativeX * deltaX + relativeY * deltaY) / lengthSquared, -4, 4),
-    n: clampNumber((-relativeX * deltaY + relativeY * deltaX) / lengthSquared, -4, 4),
-  };
-}
-
-function cubicControlStyleFromPoints(start: { x: number; y: number }, end: { x: number; y: number }, points: Point[]) {
-  const first = cubicFactorsForPoint(new Point(start.x, start.y), new Point(end.x, end.y), points[0]);
-  const second = cubicFactorsForPoint(new Point(start.x, start.y), new Point(end.x, end.y), points[1]);
-  return {
-    diagramCubicControl1T: first.t,
-    diagramCubicControl1N: first.n,
-    diagramCubicControl2T: second.t,
-    diagramCubicControl2N: second.n,
-  } satisfies Partial<DiagramCellStyle>;
-}
-
-function cubicControlStyleForEdge(edge: DiagramEdge, source?: Cell, target?: Cell) {
-  if (source && target && edge.waypoints && edge.waypoints.length >= 2) {
-    return cubicControlStyleFromPoints(
-      absoluteCellCenter(source),
-      absoluteCellCenter(target),
-      [
-        new Point(edge.waypoints[0].x, edge.waypoints[0].y),
-        new Point(edge.waypoints[edge.waypoints.length - 1].x, edge.waypoints[edge.waypoints.length - 1].y),
-      ],
-    );
-  }
-  return {
-    diagramCubicControl1T: CUBIC_CONTROL_DEFAULTS.control1T,
-    diagramCubicControl1N: CUBIC_CONTROL_DEFAULTS.control1N,
-    diagramCubicControl2T: CUBIC_CONTROL_DEFAULTS.control2T,
-    diagramCubicControl2N: CUBIC_CONTROL_DEFAULTS.control2N,
-  } satisfies Partial<DiagramCellStyle>;
-}
-
-function cubicEdgeModelEndpoints(state: CellState): [Point, Point] {
-  const scale = Math.max(0.0001, state.view.scale);
-  const translate = state.view.translate;
-  const first = state.absolutePoints[0] ?? new Point(state.x, state.y);
-  const last = state.absolutePoints[state.absolutePoints.length - 1] ?? new Point(state.x + state.width, state.y + state.height);
-  return [
-    new Point(first.x / scale - translate.x, first.y / scale - translate.y),
-    new Point(last.x / scale - translate.x, last.y / scale - translate.y),
-  ];
-}
-
-function edgeWaypointsForGraph(edge: DiagramEdge) {
-  if (edge.style.edgeType === "curved") return undefined;
-  return edge.waypoints?.map((point) => new Point(point.x, point.y));
-}
-
-function defaultCubicControlPoints(graph: Graph, source: Cell, target: Cell) {
-  const sourceCenter = absoluteCellCenter(source);
-  const targetCenter = absoluteCellCenter(target);
-  return cubicControlPointsFromStyle(
-    new Point(sourceCenter.x, sourceCenter.y),
-    new Point(targetCenter.x, targetCenter.y),
-    edgeRoutingStyle("curved"),
-  ).map((point) => new Point(graph.snap(point.x), graph.snap(point.y)));
-}
-
-function constraintForPort(port?: DiagramPort) {
-  return PORT_CONSTRAINTS.find((constraint) => constraint.name === port) ?? null;
-}
-
-function portFromStyle(style: CellStyle, source: boolean): DiagramPort | undefined {
-  const x = styleNumber(source ? style.exitX : style.entryX, Number.NaN);
-  const y = styleNumber(source ? style.exitY : style.entryY, Number.NaN);
-  if (!Number.isFinite(x) || !Number.isFinite(y)) {
-    return undefined;
-  }
-  if (y <= 0.05) return "north";
-  if (x >= 0.95) return "east";
-  if (y >= 0.95) return "south";
-  if (x <= 0.05) return "west";
-  return undefined;
-}
-
-function styleColor(value: unknown, fallback: string) {
-  return value === "none" || (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)) ? value : fallback;
-}
-
-function styleNumber(value: unknown, fallback: number) {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function clampNumber(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, Number.isFinite(value) ? value : min));
-}
-
-function expandedDiagramCanvasSize(
-  current: { width: number; height: number },
-  contentBounds: Rectangle | null,
-  viewportWidth: number,
-  viewportHeight: number,
-  scale: number,
-) {
-  const safeScale = Math.max(0.05, Number.isFinite(scale) ? scale : 1);
-  const viewportCanvasWidth = Math.max(1, (viewportWidth - DIAGRAM_CANVAS_VIEWPORT_INSET) / safeScale);
-  const viewportCanvasHeight = Math.max(1, (viewportHeight - DIAGRAM_CANVAS_VIEWPORT_INSET) / safeScale);
-  const contentRight = contentBounds ? Math.max(0, contentBounds.x + contentBounds.width) : 0;
-  const contentBottom = contentBounds ? Math.max(0, contentBounds.y + contentBounds.height) : 0;
-  const requiredWidth = contentBounds ? contentRight + DIAGRAM_CANVAS_PADDING.width : 0;
-  const requiredHeight = contentBounds ? contentBottom + DIAGRAM_CANVAS_PADDING.height : 0;
-  const targetWidth = requiredWidth <= viewportCanvasWidth
-    ? viewportCanvasWidth
-    : Math.ceil(Math.max(current.width, requiredWidth) / DIAGRAM_CANVAS_GROWTH.width) * DIAGRAM_CANVAS_GROWTH.width;
-  const targetHeight = requiredHeight <= viewportCanvasHeight
-    ? viewportCanvasHeight
-    : Math.ceil(Math.max(current.height, requiredHeight) / DIAGRAM_CANVAS_GROWTH.height) * DIAGRAM_CANVAS_GROWTH.height;
-  return {
-    width: Math.min(MAX_DIAGRAM_CANVAS_SIZE, targetWidth),
-    height: Math.min(MAX_DIAGRAM_CANVAS_SIZE, targetHeight),
-  };
-}
-
-function linePatternFromStyle(style: CellStyle): DiagramLinePattern {
-  if (!style.dashed) return "solid";
-  return typeof style.dashPattern === "string" && /^\s*1(?:\s|$)/.test(style.dashPattern) ? "dotted" : "dashed";
-}
-
-function dashPatternForLinePattern(pattern?: DiagramLinePattern) {
-  if (pattern === "dotted") return "1 4";
-  if (pattern === "dashed") return "8 4";
-  return undefined;
-}
-
-function diagramFontFamilyCss(fontFamily: DiagramFontFamily) {
-  if (fontFamily === "rounded") return "ui-rounded, SF Pro Rounded, system-ui, sans-serif";
-  if (fontFamily === "serif") return "Georgia, Times New Roman, serif";
-  if (fontFamily === "mono") return "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-  return "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-}
-
-function diagramFontFamilyFromStyle(value: unknown): DiagramFontFamily {
-  if (typeof value !== "string") return "system";
-  const normalized = value.toLowerCase();
-  if (normalized.includes("mono") || normalized.includes("menlo") || normalized.includes("consolas")) return "mono";
-  if (normalized.includes("rounded")) return "rounded";
-  if ((normalized.includes("georgia") || normalized.includes("times") || normalized.endsWith("serif"))
-    && !normalized.includes("sans-serif")) return "serif";
-  return "system";
-}
-
-function verticalAlignFromStyle(value: unknown): DiagramVerticalAlign {
-  return value === "top" || value === "bottom" ? value : "middle";
-}
-
-function isDiagramNodeKind(value: unknown): value is DiagramNodeKind {
-  return value === "lane" || NODE_PALETTE.some((item) => item.kind === value);
-}
 
 function cloneNode(node: DiagramNode): DiagramNode {
   return { ...node, style: { ...node.style } };
@@ -8583,4 +6852,42 @@ function ContextMenuAction({
       {label}
     </button>
   );
+}
+
+function diagramPageId(pageId?: string) {
+  return pageId ?? DEFAULT_PAGE_ID;
+}
+
+function nextDiagramPageOrder(pages: Y.Map<DiagramPage>) {
+  let maximum = -1;
+  pages.forEach((page) => {
+    maximum = Math.max(maximum, page.order);
+  });
+  return maximum + 1;
+}
+
+function expandedDiagramCanvasSize(
+  current: { width: number; height: number },
+  contentBounds: Rectangle | null,
+  viewportWidth: number,
+  viewportHeight: number,
+  scale: number,
+) {
+  const safeScale = Math.max(0.05, Number.isFinite(scale) ? scale : 1);
+  const viewportCanvasWidth = Math.max(1, (viewportWidth - DIAGRAM_CANVAS_VIEWPORT_INSET) / safeScale);
+  const viewportCanvasHeight = Math.max(1, (viewportHeight - DIAGRAM_CANVAS_VIEWPORT_INSET) / safeScale);
+  const contentRight = contentBounds ? Math.max(0, contentBounds.x + contentBounds.width) : 0;
+  const contentBottom = contentBounds ? Math.max(0, contentBounds.y + contentBounds.height) : 0;
+  const requiredWidth = contentBounds ? contentRight + DIAGRAM_CANVAS_PADDING.width : 0;
+  const requiredHeight = contentBounds ? contentBottom + DIAGRAM_CANVAS_PADDING.height : 0;
+  const targetWidth = requiredWidth <= viewportCanvasWidth
+    ? viewportCanvasWidth
+    : Math.ceil(Math.max(current.width, requiredWidth) / DIAGRAM_CANVAS_GROWTH.width) * DIAGRAM_CANVAS_GROWTH.width;
+  const targetHeight = requiredHeight <= viewportCanvasHeight
+    ? viewportCanvasHeight
+    : Math.ceil(Math.max(current.height, requiredHeight) / DIAGRAM_CANVAS_GROWTH.height) * DIAGRAM_CANVAS_GROWTH.height;
+  return {
+    width: Math.min(MAX_DIAGRAM_CANVAS_SIZE, targetWidth),
+    height: Math.min(MAX_DIAGRAM_CANVAS_SIZE, targetHeight),
+  };
 }
