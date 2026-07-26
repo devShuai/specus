@@ -3072,6 +3072,17 @@ body {
   background: var(--app-apple-blue-soft);
 }
 
+/* 设备操作面板：三项能力的行式按钮 */
+.nearby-action:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--app-apple-blue) 38%, var(--app-apple-line));
+  background: var(--app-apple-surface-soft);
+}
+
+.nearby-action:focus-visible {
+  outline: 2px solid var(--app-apple-blue);
+  outline-offset: 2px;
+}
+
 /* ── 附近设备（AirDrop 式）───────────────────────────────────────────── */
 
 .nearby-device:hover .nearby-avatar {
@@ -5221,5 +5232,622 @@ body {
   .nat-step-done .nat-step-dot svg path,
   .nat-step-active .nat-step-dot {
     animation: none !important;
+  }
+}
+
+/* HTTP media playback: quiet, cinematic controls inspired by Apple TV. */
+.apple-tv-backdrop {
+  background: rgba(0, 0, 0, 0.82) !important;
+  backdrop-filter: blur(24px) saturate(115%);
+}
+
+.apple-tv-modal-wrapper {
+  padding: 12px !important;
+}
+
+.apple-tv-modal {
+  width: min(1120px, calc(100vw - 24px)) !important;
+  max-width: none !important;
+  max-height: calc(100dvh - 24px) !important;
+  margin: 0 !important;
+  overflow: hidden !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 16px !important;
+  color: #f5f5f7 !important;
+  background: #030304 !important;
+  box-shadow: 0 30px 100px rgba(0, 0, 0, 0.62) !important;
+}
+
+.apple-tv-player {
+  position: relative;
+  isolation: isolate;
+  width: 100%;
+  min-height: min(63vw, 680px);
+  max-height: calc(100dvh - 24px);
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  outline: none;
+  color: #f5f5f7;
+  background: #000000;
+  cursor: none;
+  user-select: none;
+}
+
+.apple-tv-player.is-controls-visible,
+.apple-tv-player:focus-visible {
+  cursor: default;
+}
+
+.apple-tv-player:focus-visible {
+  box-shadow: inset 0 0 0 2px rgba(41, 151, 255, 0.88);
+}
+
+.apple-tv-player:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  max-height: none;
+  aspect-ratio: auto;
+}
+
+.apple-tv-media {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #000000;
+  object-fit: contain;
+}
+
+.apple-tv-player > audio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.apple-tv-audio-stage {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: inherit;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  padding: 80px 24px 120px;
+  background: #101012;
+}
+
+.apple-tv-audio-art {
+  display: grid;
+  width: clamp(112px, 18vw, 180px);
+  aspect-ratio: 1;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.82);
+  background: #242426;
+  box-shadow: 0 22px 52px rgba(0, 0, 0, 0.36);
+}
+
+.apple-tv-chrome {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 180ms ease,
+    visibility 0s linear 180ms;
+}
+
+.apple-tv-player.is-controls-visible .apple-tv-chrome {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+.apple-tv-topbar,
+.apple-tv-control-dock {
+  position: absolute;
+  right: 18px;
+  left: 18px;
+  display: flex;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(19, 19, 21, 0.74);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(24px) saturate(125%);
+  pointer-events: auto;
+}
+
+.apple-tv-topbar {
+  top: 18px;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 10px 9px 14px;
+  border-radius: 10px;
+}
+
+.apple-tv-backfill {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  padding-inline: 8px 4px;
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.apple-tv-backfill-label {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.apple-tv-live-badge {
+  flex: none;
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: #ffffff;
+  background: #e43b44;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.apple-tv-center-control {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.apple-tv-primary-play,
+.apple-tv-loading {
+  display: grid;
+  width: 68px;
+  height: 68px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 999px;
+  color: #121214;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(16px);
+  pointer-events: auto;
+  transition: transform 160ms ease, background-color 160ms ease;
+}
+
+.apple-tv-primary-play:hover {
+  transform: scale(1.055);
+  background: #ffffff;
+}
+
+.apple-tv-primary-play:active {
+  transform: scale(0.96);
+}
+
+.apple-tv-primary-play svg {
+  margin-left: 3px;
+}
+
+.apple-tv-loading {
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(18, 18, 20, 0.66);
+}
+
+.apple-tv-control-dock {
+  bottom: 18px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 12px 9px;
+  border-radius: 12px;
+}
+
+.apple-tv-timeline {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: 9px;
+  color: rgba(255, 255, 255, 0.66);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.apple-tv-timeline > span:last-child {
+  text-align: right;
+}
+
+.apple-tv-seek {
+  position: relative;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.apple-tv-seek-buffered,
+.apple-tv-seek-played {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.apple-tv-seek-buffered {
+  background: rgba(255, 255, 255, 0.34);
+}
+
+.apple-tv-seek-played {
+  background: #f5f5f7;
+}
+
+.apple-tv-seek input {
+  position: absolute;
+  inset: -9px 0;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  cursor: pointer;
+  background: transparent;
+}
+
+.apple-tv-seek input:disabled {
+  cursor: default;
+}
+
+.apple-tv-seek input::-webkit-slider-runnable-track {
+  height: 4px;
+  background: transparent;
+}
+
+.apple-tv-seek input::-webkit-slider-thumb {
+  width: 13px;
+  height: 13px;
+  margin-top: -4.5px;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.5);
+}
+
+.apple-tv-seek input::-moz-range-track {
+  height: 4px;
+  background: transparent;
+}
+
+.apple-tv-seek input::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border: 0;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.5);
+}
+
+.apple-tv-control-row {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.apple-tv-icon-button,
+.apple-tv-rate-button {
+  position: relative;
+  display: inline-flex;
+  min-width: 38px;
+  height: 38px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.88);
+  background: transparent;
+  transition: color 160ms ease, background-color 160ms ease, transform 160ms ease;
+}
+
+.apple-tv-icon-button:hover,
+.apple-tv-rate-button:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.apple-tv-icon-button:active,
+.apple-tv-rate-button:active {
+  transform: scale(0.94);
+}
+
+.apple-tv-icon-button:focus-visible,
+.apple-tv-rate-button:focus-visible,
+.apple-tv-primary-play:focus-visible,
+.apple-tv-seek input:focus-visible,
+.apple-tv-volume input:focus-visible {
+  outline: 2px solid #2997ff;
+  outline-offset: 2px;
+}
+
+.apple-tv-icon-button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.apple-tv-icon-button.is-emphasized {
+  width: 42px;
+  height: 42px;
+  color: #121214;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.apple-tv-icon-button.is-emphasized:hover {
+  background: #ffffff;
+}
+
+.apple-tv-skip-label {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding-top: 1px;
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.apple-tv-volume {
+  display: flex;
+  align-items: center;
+}
+
+.apple-tv-volume > input {
+  width: 72px;
+  accent-color: #f5f5f7;
+}
+
+.apple-tv-rate-button {
+  min-width: 54px;
+  padding-inline: 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.apple-tv-ticket {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 10px;
+  line-height: 1;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.apple-tv-player:fullscreen .apple-tv-topbar {
+  top: 14px;
+  right: 16px;
+  left: 16px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  pointer-events: none;
+}
+
+.apple-tv-player:fullscreen .apple-tv-topbar > div {
+  min-height: 42px;
+  padding: 6px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(19, 19, 21, 0.62);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(18px) saturate(120%);
+  pointer-events: auto;
+}
+
+.apple-tv-player:fullscreen .apple-tv-topbar > div:first-child {
+  max-width: min(56vw, 560px);
+}
+
+.apple-tv-player:fullscreen .apple-tv-topbar h2 {
+  font-size: 14px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-backfill {
+  min-height: 32px;
+  padding-inline: 3px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.apple-tv-player:fullscreen .apple-tv-backfill-label,
+.apple-tv-player:fullscreen .apple-tv-ticket {
+  display: none;
+}
+
+.apple-tv-player:fullscreen .apple-tv-control-dock {
+  right: auto;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  left: 50%;
+  width: min(780px, calc(100vw - 24px));
+  gap: 4px;
+  padding: 7px 9px 6px;
+  border-radius: 10px;
+  background: rgba(19, 19, 21, 0.64);
+  transform: translateX(-50%);
+}
+
+.apple-tv-player:fullscreen .apple-tv-timeline {
+  grid-template-columns: 38px minmax(0, 1fr) 38px;
+  gap: 7px;
+  font-size: 10px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-control-row {
+  min-height: 36px;
+  gap: 8px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-icon-button {
+  min-width: 34px;
+  height: 34px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-icon-button.is-emphasized {
+  width: 38px;
+  height: 38px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-rate-button {
+  min-width: 48px;
+  height: 34px;
+  padding-inline: 6px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-volume > input {
+  width: 60px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-primary-play,
+.apple-tv-player:fullscreen .apple-tv-loading {
+  width: 56px;
+  height: 56px;
+}
+
+.apple-tv-player:fullscreen .apple-tv-error {
+  right: max(16px, calc((100vw - 780px) / 2));
+  bottom: 82px;
+  left: max(16px, calc((100vw - 780px) / 2));
+}
+
+.apple-tv-error {
+  position: absolute;
+  z-index: 5;
+  right: 24px;
+  bottom: 124px;
+  left: 24px;
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid rgba(255, 105, 97, 0.35);
+  border-radius: 8px;
+  padding: 9px 12px;
+  color: #ffd7d4;
+  background: rgba(92, 23, 26, 0.9);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(20px);
+  font-size: 12px;
+}
+
+.apple-tv-error button {
+  flex: none;
+  border: 0;
+  color: #ffffff;
+  background: transparent;
+  font-weight: 600;
+}
+
+@media (max-width: 639px) {
+  .apple-tv-modal-wrapper {
+    padding: 0 !important;
+  }
+
+  .apple-tv-modal {
+    width: 100vw !important;
+    height: 100dvh !important;
+    max-height: none !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+  }
+
+  .apple-tv-player {
+    width: 100vw;
+    height: 100dvh;
+    min-height: 100dvh;
+    max-height: none;
+    aspect-ratio: auto;
+  }
+
+  .apple-tv-topbar {
+    top: max(10px, env(safe-area-inset-top));
+    right: 10px;
+    left: 10px;
+    min-height: 52px;
+    padding: 7px 7px 7px 11px;
+  }
+
+  .apple-tv-backfill {
+    padding-inline: 4px;
+    background: transparent;
+  }
+
+  .apple-tv-backfill-label {
+    display: none;
+  }
+
+  .apple-tv-control-dock {
+    right: 8px;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    left: 8px;
+    gap: 7px;
+    padding: 10px 8px 8px;
+  }
+
+  .apple-tv-control-row {
+    gap: 4px;
+  }
+
+  .apple-tv-volume > input {
+    display: none;
+  }
+
+  .apple-tv-icon-button {
+    min-width: 36px;
+    height: 36px;
+  }
+
+  .apple-tv-icon-button.is-emphasized {
+    width: 40px;
+    height: 40px;
+  }
+
+  .apple-tv-rate-button {
+    min-width: 48px;
+    padding-inline: 5px;
+  }
+
+  .apple-tv-ticket {
+    display: none;
+  }
+
+  .apple-tv-error {
+    right: 12px;
+    bottom: 112px;
+    left: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .apple-tv-chrome,
+  .apple-tv-primary-play,
+  .apple-tv-icon-button,
+  .apple-tv-rate-button {
+    transition: none;
   }
 }

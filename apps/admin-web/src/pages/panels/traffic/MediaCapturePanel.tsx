@@ -2,11 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   Chip,
+  Dropdown,
+  DropdownItem,
+  DropdownMenu,
+  DropdownTrigger,
   Modal,
-  ModalBody,
   ModalContent,
-  ModalFooter,
-  ModalHeader,
   Pagination,
   Switch,
   Table,
@@ -15,9 +16,25 @@ import {
   TableColumn,
   TableHeader,
   TableRow,
+  Tooltip,
 } from "@heroui/react";
 import Hls from "hls.js";
 import * as dashjs from "dashjs";
+import {
+  Gauge,
+  LoaderCircle,
+  Maximize,
+  Minimize,
+  Music2,
+  Pause,
+  PictureInPicture2,
+  Play,
+  RotateCcw,
+  RotateCw,
+  Volume2,
+  VolumeX,
+  X,
+} from "lucide-react";
 import { adminApi } from "../../../api/client";
 import type {
   HttpMediaCapture,
@@ -28,6 +45,9 @@ import { formatBytes, formatDateTime } from "../../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../../components/MobileListCard";
 
 const PAGE_SIZE = 20;
+const PLAYER_CONTROL_HIDE_MS = 2_800;
+const PLAYER_FULLSCREEN_CONTROL_HIDE_MS = 1_650;
+const PLAYER_RATES = [0.75, 1, 1.25, 1.5, 2];
 
 export function MediaCapturePanel() {
   const [rows, setRows] = useState<HttpMediaCapture[]>([]);
@@ -263,8 +283,13 @@ function MediaPlayerModal({
   return (
     <Modal
       isOpen={capture != null && ticket != null}
+      classNames={{
+        backdrop: "apple-tv-backdrop",
+        base: "apple-tv-modal",
+        wrapper: "apple-tv-modal-wrapper",
+      }}
+      hideCloseButton
       placement="center"
-      scrollBehavior="inside"
       size="5xl"
       onOpenChange={(open) => {
         if (!open) {
@@ -274,37 +299,15 @@ function MediaPlayerModal({
     >
       <ModalContent>
         {(close) => (
-          <>
-            <ModalHeader className="flex min-w-0 flex-col gap-0.5">
-              <span>媒体回放</span>
-              <span className="truncate text-tiny font-normal text-default-400" title={capture?.sourceUrl}>
-                {capture?.sourceUrl}
-              </span>
-            </ModalHeader>
-            <ModalBody>
-              {ticket ? (
-                <div className="flex min-h-8 items-center justify-end">
-                  <Switch
-                    size="sm"
-                    color="primary"
-                    aria-label="缺失片段补采"
-                    isDisabled={ticketUpdating}
-                    isSelected={ticket.backfillMissing}
-                    onValueChange={onBackfillChange}
-                  >
-                    缺失片段补采
-                  </Switch>
-                </div>
-              ) : null}
-              {capture && ticket ? <MediaPlayer capture={capture} ticket={ticket} /> : null}
-            </ModalBody>
-            <ModalFooter>
-              <span className="mr-auto text-tiny text-default-400">
-                播放票据有效至 {formatDateTime(ticket?.expiresAt)}
-              </span>
-              <Button variant="flat" onPress={close}>关闭</Button>
-            </ModalFooter>
-          </>
+          capture && ticket ? (
+            <MediaPlayer
+              capture={capture}
+              ticket={ticket}
+              ticketUpdating={ticketUpdating}
+              onBackfillChange={onBackfillChange}
+              onClose={close}
+            />
+          ) : null
         )}
       </ModalContent>
     </Modal>
@@ -313,14 +316,153 @@ function MediaPlayerModal({
 
 function MediaPlayer({
   capture,
+  onBackfillChange,
+  onClose,
   ticket,
+  ticketUpdating,
 }: {
   capture: HttpMediaCapture;
+  onBackfillChange: (backfillMissing: boolean) => void;
+  onClose: () => void;
   ticket: HttpMediaPlaybackTicket;
+  ticketUpdating: boolean;
 }) {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
+  const playerRef = useRef<HTMLDivElement | null>(null);
+  const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [error, setError] = useState("");
+  const [paused, setPaused] = useState(true);
+  const [waiting, setWaiting] = useState(true);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [bufferedEnd, setBufferedEnd] = useState(0);
+  const [volume, setVolume] = useState(1);
+  const [muted, setMuted] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [pictureInPicture, setPictureInPicture] = useState(false);
   const audioOnly = capture.contentType?.toLowerCase().startsWith("audio/") ?? false;
+  const title = mediaDisplayTitle(capture.sourceUrl);
+  const finiteDuration = Number.isFinite(duration) && duration > 0;
+  const progressPercent = finiteDuration ? Math.min(100, (currentTime / duration) * 100) : 0;
+  const bufferedPercent = finiteDuration ? Math.min(100, (bufferedEnd / duration) * 100) : 0;
+  const pictureInPictureSupported = !audioOnly
+    && typeof document !== "undefined"
+    && document.pictureInPictureEnabled;
+
+  const clearControlsTimer = useCallback(() => {
+    if (controlsTimerRef.current) {
+      clearTimeout(controlsTimerRef.current);
+      controlsTimerRef.current = null;
+    }
+  }, []);
+
+  const revealControls = useCallback(() => {
+    clearControlsTimer();
+    setControlsVisible(true);
+    if (!paused || fullscreen) {
+      controlsTimerRef.current = setTimeout(() => {
+        setControlsVisible(false);
+      }, fullscreen ? PLAYER_FULLSCREEN_CONTROL_HIDE_MS : PLAYER_CONTROL_HIDE_MS);
+    }
+  }, [clearControlsTimer, fullscreen, paused]);
+
+  const syncTimeline = useCallback(() => {
+    const element = mediaRef.current;
+    if (!element) {
+      return;
+    }
+    setCurrentTime(Number.isFinite(element.currentTime) ? element.currentTime : 0);
+    setDuration(Number.isFinite(element.duration) ? element.duration : 0);
+    let nextBufferedEnd = 0;
+    for (let index = 0; index < element.buffered.length; index += 1) {
+      nextBufferedEnd = Math.max(nextBufferedEnd, element.buffered.end(index));
+    }
+    setBufferedEnd(nextBufferedEnd);
+    setVolume(element.volume);
+    setMuted(element.muted);
+    setPlaybackRate(element.playbackRate);
+  }, []);
+
+  const togglePlayback = useCallback(async () => {
+    const element = mediaRef.current;
+    if (!element) {
+      return;
+    }
+    revealControls();
+    if (element.paused) {
+      try {
+        await element.play();
+      } catch {
+        setError("浏览器阻止了自动播放，请再次点击播放");
+      }
+    } else {
+      element.pause();
+    }
+  }, [revealControls]);
+
+  const seekBy = useCallback((seconds: number) => {
+    const element = mediaRef.current;
+    if (!element || !Number.isFinite(element.duration)) {
+      return;
+    }
+    element.currentTime = Math.max(0, Math.min(element.duration, element.currentTime + seconds));
+    syncTimeline();
+    revealControls();
+  }, [revealControls, syncTimeline]);
+
+  const toggleMute = useCallback(() => {
+    const element = mediaRef.current;
+    if (!element) {
+      return;
+    }
+    element.muted = !element.muted;
+    syncTimeline();
+    revealControls();
+  }, [revealControls, syncTimeline]);
+
+  const changePlaybackRate = useCallback((rate: number) => {
+    const element = mediaRef.current;
+    if (!element) {
+      return;
+    }
+    element.playbackRate = rate;
+    setPlaybackRate(rate);
+    revealControls();
+  }, [revealControls]);
+
+  const toggleFullscreen = useCallback(async () => {
+    const player = playerRef.current;
+    if (!player) {
+      return;
+    }
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await player.requestFullscreen();
+      }
+    } catch {
+      setError("当前浏览器无法进入全屏");
+    }
+  }, []);
+
+  const togglePictureInPicture = useCallback(async () => {
+    const video = mediaRef.current as HTMLVideoElement | null;
+    if (!video || !pictureInPictureSupported) {
+      return;
+    }
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else {
+        await video.requestPictureInPicture();
+      }
+    } catch {
+      setError("当前视频无法进入画中画");
+    }
+  }, [pictureInPictureSupported]);
 
   useEffect(() => {
     const element = mediaRef.current;
@@ -328,6 +470,11 @@ function MediaPlayer({
       return;
     }
     setError("");
+    setWaiting(true);
+    setPaused(true);
+    setCurrentTime(0);
+    setDuration(0);
+    setBufferedEnd(0);
     let hls: Hls | null = null;
     let dash: dashjs.MediaPlayerClass | null = null;
 
@@ -338,6 +485,7 @@ function MediaPlayer({
         hls = new Hls({ enableWorker: true, lowLatencyMode: capture.liveStream });
         hls.on(Hls.Events.ERROR, (_event, data) => {
           if (data.fatal) {
+            setWaiting(false);
             setError(data.details || "HLS 播放失败");
           }
         });
@@ -349,6 +497,7 @@ function MediaPlayer({
     } else if (capture.mediaKind === "DASH_MANIFEST") {
       dash = dashjs.MediaPlayer().create();
       dash.on(dashjs.MediaPlayer.events.ERROR, (event: { error?: { message?: string } }) => {
+        setWaiting(false);
         setError(event?.error?.message || "DASH 播放失败");
       });
       dash.initialize(element, ticket.manifestUrl, true);
@@ -365,31 +514,373 @@ function MediaPlayer({
     };
   }, [capture, ticket]);
 
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setFullscreen(document.fullscreenElement === playerRef.current);
+    };
+    const element = mediaRef.current;
+    const handleEnterPictureInPicture = () => setPictureInPicture(true);
+    const handleLeavePictureInPicture = () => setPictureInPicture(false);
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    element?.addEventListener("enterpictureinpicture", handleEnterPictureInPicture);
+    element?.addEventListener("leavepictureinpicture", handleLeavePictureInPicture);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      element?.removeEventListener("enterpictureinpicture", handleEnterPictureInPicture);
+      element?.removeEventListener("leavepictureinpicture", handleLeavePictureInPicture);
+    };
+  }, [ticket]);
+
+  useEffect(() => {
+    revealControls();
+    return clearControlsTimer;
+  }, [clearControlsTimer, paused, revealControls]);
+
+  const handleKeyboard = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).matches("input, button, [role='menuitem']")) {
+      return;
+    }
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      void togglePlayback();
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      seekBy(-10);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      seekBy(10);
+    } else if (event.key.toLowerCase() === "m") {
+      event.preventDefault();
+      toggleMute();
+    } else if (event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      void toggleFullscreen();
+    }
+  };
+
   return (
-    <div className={`flex flex-col items-center justify-center gap-3 bg-black ${audioOnly ? "min-h-40 px-5" : "min-h-[18rem]"}`}>
+    <div
+      ref={playerRef}
+      aria-label={`正在播放 ${title}`}
+      className={`apple-tv-player ${audioOnly ? "is-audio" : ""} ${
+        controlsVisible || waiting || error ? "is-controls-visible" : ""
+      }`}
+      role="region"
+      tabIndex={0}
+      onDoubleClick={(event) => {
+        if ((event.target as HTMLElement).closest("[data-player-control]")) {
+          return;
+        }
+        void toggleFullscreen();
+      }}
+      onKeyDown={handleKeyboard}
+      onMouseLeave={() => {
+        if (!paused) {
+          clearControlsTimer();
+          setControlsVisible(false);
+        }
+      }}
+      onPointerMove={revealControls}
+      onPointerDown={revealControls}
+      onClick={(event) => {
+        if ((event.target as HTMLElement).closest("[data-player-control]")) {
+          return;
+        }
+        void togglePlayback();
+      }}
+    >
       {audioOnly ? (
-        <audio
-          ref={(element) => {
-            mediaRef.current = element;
-          }}
-          className="w-full"
-          controls
-          onError={() => setError((current) => current || "媒体解码或网络请求失败")}
-        />
+        <div className="apple-tv-audio-stage" aria-hidden="true">
+          <div className="apple-tv-audio-art"><Music2 size={54} strokeWidth={1.35} /></div>
+          <div className="min-w-0 text-center">
+            <div className="truncate text-xl font-semibold text-white sm:text-2xl">{title}</div>
+            <div className="mt-1 text-small text-white/55">{capture.clientName} · {capture.route}</div>
+          </div>
+        </div>
       ) : (
         <video
           ref={(element) => {
             mediaRef.current = element;
           }}
-          className="max-h-[70dvh] w-full bg-black object-contain"
-          controls
+          className="apple-tv-media"
           playsInline
-          onError={() => setError((current) => current || "媒体解码或网络请求失败")}
+          preload="metadata"
+          onCanPlay={() => setWaiting(false)}
+          onDurationChange={syncTimeline}
+          onEnded={() => {
+            setPaused(true);
+            revealControls();
+          }}
+          onError={() => {
+            setWaiting(false);
+            setError((current) => current || "媒体解码或网络请求失败");
+          }}
+          onLoadedMetadata={syncTimeline}
+          onPause={() => setPaused(true)}
+          onPlay={() => {
+            setPaused(false);
+            setWaiting(false);
+          }}
+          onPlaying={() => setWaiting(false)}
+          onProgress={syncTimeline}
+          onRateChange={syncTimeline}
+          onTimeUpdate={syncTimeline}
+          onVolumeChange={syncTimeline}
+          onWaiting={() => setWaiting(true)}
         />
       )}
-      {error ? <div className="w-full bg-danger-950/80 px-4 py-2 text-small text-danger-100">{error}</div> : null}
+      {audioOnly ? (
+        <audio
+          ref={(element) => {
+            mediaRef.current = element;
+          }}
+          preload="metadata"
+          onCanPlay={() => setWaiting(false)}
+          onDurationChange={syncTimeline}
+          onEnded={() => {
+            setPaused(true);
+            revealControls();
+          }}
+          onError={() => {
+            setWaiting(false);
+            setError((current) => current || "媒体解码或网络请求失败");
+          }}
+          onLoadedMetadata={syncTimeline}
+          onPause={() => setPaused(true)}
+          onPlay={() => {
+            setPaused(false);
+            setWaiting(false);
+          }}
+          onPlaying={() => setWaiting(false)}
+          onProgress={syncTimeline}
+          onRateChange={syncTimeline}
+          onTimeUpdate={syncTimeline}
+          onVolumeChange={syncTimeline}
+          onWaiting={() => setWaiting(true)}
+        />
+      ) : null}
+
+      <div className="apple-tv-chrome">
+        <div className="apple-tv-topbar" data-player-control>
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <h2 className="truncate text-[15px] font-semibold text-white sm:text-lg">{title}</h2>
+              {capture.liveStream ? <span className="apple-tv-live-badge">直播</span> : null}
+            </div>
+            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/55 sm:text-xs">
+              <span className="truncate">{capture.clientName} · {capture.route}</span>
+              <span aria-hidden="true">·</span>
+              <span className="shrink-0">{capture.offlineReady ? "完整缓存" : "缓存片段"}</span>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <div className="apple-tv-backfill">
+              {ticketUpdating ? <LoaderCircle className="animate-spin text-white/60" size={14} /> : null}
+              <span className="apple-tv-backfill-label">补采缺口</span>
+              <Switch
+                size="sm"
+                color="primary"
+                aria-label="缺失片段补采"
+                isDisabled={ticketUpdating}
+                isSelected={ticket.backfillMissing}
+                onValueChange={onBackfillChange}
+              />
+            </div>
+            <PlayerIconButton label="关闭播放器" onPress={onClose}>
+              <X size={19} />
+            </PlayerIconButton>
+          </div>
+        </div>
+
+        <div className="apple-tv-center-control" data-player-control>
+          {waiting && !error ? (
+            <span className="apple-tv-loading" aria-label="正在缓冲">
+              <LoaderCircle className="animate-spin" size={34} />
+            </span>
+          ) : paused && !error ? (
+            <button
+              type="button"
+              aria-label="播放"
+              className="apple-tv-primary-play"
+              onClick={() => void togglePlayback()}
+            >
+              <Play fill="currentColor" size={34} />
+            </button>
+          ) : null}
+        </div>
+
+        <div className="apple-tv-control-dock" data-player-control>
+          <div className="apple-tv-timeline">
+            <span>{formatMediaTime(currentTime)}</span>
+            <div className="apple-tv-seek">
+              <span className="apple-tv-seek-buffered" style={{ width: `${bufferedPercent}%` }} />
+              <span className="apple-tv-seek-played" style={{ width: `${progressPercent}%` }} />
+              <input
+                aria-label="播放进度"
+                disabled={!finiteDuration}
+                max={finiteDuration ? duration : 1}
+                min={0}
+                step={0.1}
+                type="range"
+                value={finiteDuration ? Math.min(currentTime, duration) : 0}
+                onChange={(event) => {
+                  const element = mediaRef.current;
+                  if (!element) {
+                    return;
+                  }
+                  element.currentTime = Number(event.currentTarget.value);
+                  syncTimeline();
+                }}
+              />
+            </div>
+            <span>{capture.liveStream && !finiteDuration ? "直播" : formatMediaTime(duration)}</span>
+          </div>
+
+          <div className="apple-tv-control-row">
+            <div className="flex items-center gap-1 sm:gap-2">
+              <PlayerIconButton label="后退 10 秒" onPress={() => seekBy(-10)} disabled={!finiteDuration}>
+                <RotateCcw size={19} />
+                <span className="apple-tv-skip-label">10</span>
+              </PlayerIconButton>
+              <PlayerIconButton label={paused ? "播放" : "暂停"} emphasized onPress={() => void togglePlayback()}>
+                {paused ? <Play fill="currentColor" size={22} /> : <Pause fill="currentColor" size={22} />}
+              </PlayerIconButton>
+              <PlayerIconButton label="前进 10 秒" onPress={() => seekBy(10)} disabled={!finiteDuration}>
+                <RotateCw size={19} />
+                <span className="apple-tv-skip-label">10</span>
+              </PlayerIconButton>
+            </div>
+
+            <div className="flex items-center gap-1 sm:gap-2">
+              <div className="apple-tv-volume">
+                <PlayerIconButton label={muted ? "取消静音" : "静音"} onPress={toggleMute}>
+                  {muted || volume === 0 ? <VolumeX size={19} /> : <Volume2 size={19} />}
+                </PlayerIconButton>
+                <input
+                  aria-label="音量"
+                  max={1}
+                  min={0}
+                  step={0.05}
+                  type="range"
+                  value={muted ? 0 : volume}
+                  onChange={(event) => {
+                    const element = mediaRef.current;
+                    if (!element) {
+                      return;
+                    }
+                    element.volume = Number(event.currentTarget.value);
+                    element.muted = false;
+                    syncTimeline();
+                  }}
+                />
+              </div>
+
+              <Dropdown placement="top-end">
+                <DropdownTrigger>
+                  <button
+                    type="button"
+                    aria-label={`播放速度 ${playbackRate} 倍`}
+                    className="apple-tv-rate-button"
+                  >
+                    <Gauge size={18} />
+                    <span>{playbackRate}×</span>
+                  </button>
+                </DropdownTrigger>
+                <DropdownMenu
+                  aria-label="选择播放速度"
+                  disallowEmptySelection
+                  selectedKeys={new Set([String(playbackRate)])}
+                  selectionMode="single"
+                  onAction={(key) => changePlaybackRate(Number(key))}
+                >
+                  {PLAYER_RATES.map((rate) => (
+                    <DropdownItem key={String(rate)}>{rate}×</DropdownItem>
+                  ))}
+                </DropdownMenu>
+              </Dropdown>
+
+              {pictureInPictureSupported ? (
+                <PlayerIconButton
+                  label={pictureInPicture ? "退出画中画" : "画中画"}
+                  onPress={() => void togglePictureInPicture()}
+                >
+                  <PictureInPicture2 size={19} />
+                </PlayerIconButton>
+              ) : null}
+              <PlayerIconButton
+                label={fullscreen ? "退出全屏" : "全屏"}
+                onPress={() => void toggleFullscreen()}
+              >
+                {fullscreen ? <Minimize size={19} /> : <Maximize size={19} />}
+              </PlayerIconButton>
+            </div>
+          </div>
+          <div className="apple-tv-ticket">
+            播放授权至 {formatDateTime(ticket.expiresAt)}
+          </div>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="apple-tv-error" role="alert" data-player-control>
+          <span>{error}</span>
+          <button type="button" onClick={() => setError("")}>关闭</button>
+        </div>
+      ) : null}
     </div>
   );
+}
+
+function PlayerIconButton({
+  children,
+  disabled = false,
+  emphasized = false,
+  label,
+  onPress,
+}: {
+  children: React.ReactNode;
+  disabled?: boolean;
+  emphasized?: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  return (
+    <Tooltip content={label} delay={450} placement="top">
+      <button
+        type="button"
+        aria-label={label}
+        className={`apple-tv-icon-button ${emphasized ? "is-emphasized" : ""}`}
+        disabled={disabled}
+        onClick={onPress}
+      >
+        {children}
+      </button>
+    </Tooltip>
+  );
+}
+
+function formatMediaTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "0:00";
+  }
+  const rounded = Math.floor(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainingSeconds = rounded % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`
+    : `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+function mediaDisplayTitle(sourceUrl: string): string {
+  try {
+    const url = new URL(sourceUrl, "https://media.local");
+    const lastSegment = url.pathname.split("/").filter(Boolean).at(-1);
+    return lastSegment ? decodeURIComponent(lastSegment) : "媒体回放";
+  } catch {
+    const cleanUrl = sourceUrl.split(/[?#]/, 1)[0];
+    return cleanUrl.split("/").filter(Boolean).at(-1) || "媒体回放";
+  }
 }
 
 function MediaKindChip({ kind }: { kind: string }) {
