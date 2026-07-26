@@ -71,6 +71,9 @@ public class WebSocketTicketResource {
         attributes.put("displayName", displayName);
         attributes.put("publicAddress", publicAddress);
         attributes.put("sharedRoom", sharedRoom);
+        // 缺省可被发现：老客户端不带该字段时保持既有行为。隐身端仍可看到他人并主动发起传输，
+        // 只是不出现在别人的设备列表里（对齐 AirDrop 的“停止接收”语义）。
+        attributes.put("discoverable", request.discoverable() == null || request.discoverable());
         if (sharedRoom) {
             PublicTransferRoomService.RoomAccess access = roomService.resolve(roomId, roomToken, peerId);
             attributes.put("roomKey", "room:" + access.roomId());
@@ -104,5 +107,6 @@ public class WebSocketTicketResource {
     public record PublicTransferTicketRequest(String roomId,
                                               String roomToken,
                                               String peerId,
-                                              String displayName) { }
+                                              String displayName,
+                                              Boolean discoverable) { }
 }

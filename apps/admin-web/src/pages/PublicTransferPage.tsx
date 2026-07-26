@@ -24,6 +24,7 @@ import { AppLogo } from "../components/AppLogo";
 import { useAuth } from "../auth/AuthContext";
 import { UserMenuButton } from "../components/UserMenuButton";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
+import { NearbyDeviceGrid } from "../components/NearbyDeviceGrid";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { SyncedClipboard } from "../components/SyncedClipboard";
@@ -229,6 +230,33 @@ const TRANSFER_PEER_LEASE_REFRESH_MS = 5_000;
 const QUICK_INVITE_TTL_SECONDS = 24 * 60 * 60;
 const TRANSFER_TOOL_STORAGE_KEY = "public-transfer-active-tool";
 const TRANSFER_ACTIVITY_LIMIT = 40;
+const MOBILE_SYSTEM_FILE_ACCEPT = [
+  "application/*",
+  "text/*",
+  "audio/*",
+  ".csv",
+  ".log",
+  ".md",
+  ".yaml",
+  ".yml",
+  ".db",
+  ".sqlite",
+  ".zip",
+  ".rar",
+  ".7z",
+  ".tar",
+  ".gz",
+  ".bz2",
+  ".xz",
+  ".iso",
+  ".apk",
+  ".ipa",
+  ".exe",
+  ".msi",
+  ".dmg",
+  ".pkg",
+  ".bin",
+].join(",");
 
 function readInitialTransferTool(): TransferToolMode {
   const stored = sessionStorage.getItem(TRANSFER_TOOL_STORAGE_KEY);
@@ -279,6 +307,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const loadedSharedAttachmentRef = useRef("");
   const directPreviewUrlsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const systemFileInputRef = useRef<HTMLInputElement | null>(null);
+  const mediaFileInputRef = useRef<HTMLInputElement | null>(null);
   const fileDragDepthRef = useRef(0);
   const uploadInFlightRef = useRef<FileTransferTask | null>(null);
   const queuedFileTransfersRef = useRef<QueuedFileTransfer[]>([]);
@@ -304,6 +334,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const pairingCodeContextRef = useRef("");
   const initialPairingCodeRef = useRef<string | null>(readInitialPairingCode());
   const [peerIdentity] = useState(() => claimTransferPeerIdentity());
+  const [coarsePointer] = useState(
+    () => window.matchMedia("(pointer: coarse), (max-width: 767px)").matches,
+  );
   const peerId = peerIdentity.peerId;
   const [displayName, setDisplayName] = useState(() => loadTransferClientName(peerId));
   const [displayNameDraft, setDisplayNameDraft] = useState(displayName);
@@ -325,6 +358,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [roomAccessLoading, setRoomAccessLoading] = useState(false);
   const [roomSettingsErrors, setRoomSettingsErrors] = useState<TransferRoomSettingsErrors>({});
   const [receiveConfirmationRequired, setReceiveConfirmationRequired] = useState(() => loadReceiveConfirmationRequired());
+  const [discoverable, setDiscoverable] = useState(() => loadDiscoverable());
   const [qrVisible, setQrVisible] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
@@ -1082,6 +1116,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
           peerId,
           roomToken: isInternetMode ? roomToken : "",
           displayName,
+          discoverable,
         });
         ticket = issued.ticket;
       } catch (ticketError) {
@@ -1150,7 +1185,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         socket.close();
       }
     };
-  }, [clientNameConnectionGeneration, displayName, handleRelayPeerFrame, handleSignal, isDiagramWorkspace, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
+  }, [clientNameConnectionGeneration, discoverable, displayName, handleRelayPeerFrame, handleSignal, isDiagramWorkspace, isInternetMode, peerId, pushClipboardEvent, pushWhiteboardEvent, roomId, roomToken]);
 
   useEffect(() => {
     if (!isInternetMode || roomRole !== "OWNER") {
@@ -1506,6 +1541,14 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     setRoomIdDraft(roomId);
     setRoomTokenDraft(roomToken);
     setRoomSettingsErrors({});
+  };
+
+  const updateDiscoverable = (value: boolean) => {
+    setDiscoverable(value);
+    saveDiscoverable(value);
+    setNotice(value
+      ? "已允许同一网络的设备发现你"
+      : "已停止被发现，你仍可看到其它设备并主动发送");
   };
 
   const updateReceiveConfirmationRequired = (value: boolean) => {
@@ -2205,21 +2248,44 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     runQueuedTransfersRef.current();
   };
 
-  const openFilePicker = () => {
+  const canOpenFilePicker = () => {
     if (isRoomReadOnly) {
       setError("当前为只读访客，不能向房间发送文件");
-      return;
+      return false;
     }
     const targetRequired = networkMode === "lan" || !ossFallbackEnabled;
     if (targetRequired && !selectedPeer) {
       setError(peers.length === 0 ? "还没有可接收的设备，请先邀请对方加入" : "请先选择接收设备");
-      return;
+      return false;
     }
     if (discoveryStatus !== "online" && (targetRequired || selectedPeer)) {
       setDiscoveryError("房间连接尚未恢复，恢复后即可发送");
+      return false;
+    }
+    return true;
+  };
+
+  const openFilePicker = () => {
+    if (!canOpenFilePicker()) {
+      return;
+    }
+    if (coarsePointer) {
+      systemFileInputRef.current?.click();
       return;
     }
     fileInputRef.current?.click();
+  };
+
+  const openSystemFilePicker = () => {
+    if (canOpenFilePicker()) {
+      systemFileInputRef.current?.click();
+    }
+  };
+
+  const openMediaFilePicker = () => {
+    if (canOpenFilePicker()) {
+      mediaFileInputRef.current?.click();
+    }
   };
 
   const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -3265,6 +3331,28 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               tabIndex={-1}
               onChange={handleFileInputChange}
             />
+            <input
+              ref={systemFileInputRef}
+              id="public-transfer-system-file-input"
+              type="file"
+              accept={MOBILE_SYSTEM_FILE_ACCEPT}
+              multiple
+              hidden
+              disabled={isRoomReadOnly}
+              tabIndex={-1}
+              onChange={handleFileInputChange}
+            />
+            <input
+              ref={mediaFileInputRef}
+              id="public-transfer-media-file-input"
+              type="file"
+              accept="image/*,video/*"
+              multiple
+              hidden
+              disabled={isRoomReadOnly}
+              tabIndex={-1}
+              onChange={handleFileInputChange}
+            />
             <button
               type="button"
               data-testid="public-transfer-file-dropzone"
@@ -3297,6 +3385,26 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 {fileDropzoneDetail}
               </span>
             </button>
+            {coarsePointer ? (
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <Button
+                  size="sm"
+                  variant="flat"
+                  isDisabled={isRoomReadOnly}
+                  onPress={openSystemFilePicker}
+                >
+                  系统文件
+                </Button>
+                <Button
+                  size="sm"
+                  variant="flat"
+                  isDisabled={isRoomReadOnly}
+                  onPress={openMediaFilePicker}
+                >
+                  照片 / 视频
+                </Button>
+              </div>
+            ) : null}
           </div>
 
           {state !== "idle" && (
@@ -3482,23 +3590,41 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         {!isDiagramWorkspace ? <aside className="min-w-0 p-4 sm:p-5 xl:sticky xl:top-5 xl:self-start">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h2 className="text-lg font-semibold">发送给谁</h2>
+              <h2 className="text-lg font-semibold">{isInternetMode ? "发送给谁" : "附近设备"}</h2>
               <div className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
                 {isInternetMode
                   ? "对方打开远程邀请后会默认选中首台设备，也可以点名字切换。"
-                  : "发现设备后会默认选中第一台，也可以点名字切换。"}
+                  : discoverable
+                    ? "同一网络中的设备会自动出现，点头像即可切换目标。"
+                    : "你当前不可被发现；仍可以看到并主动发送给下列设备。"}
               </div>
             </div>
             <Chip size="sm" radius="sm" variant="flat" color={peers.length > 0 ? "primary" : "default"}>
               {peers.length} 台
             </Chip>
           </div>
+          {!isInternetMode ? (
+            <div className="mt-3">
+              <NearbyDeviceGrid
+                devices={peers.map((peer) => ({
+                  peerId: peer.peerId,
+                  displayName: discoveryPeerDisplayName(peer),
+                }))}
+                selectedPeerId={selectedPeerId}
+                transportPaths={peerTransportPaths}
+                discoverable={discoverable}
+                onSelect={(device) => {
+                  const peer = peers.find((item) => item.peerId === device.peerId);
+                  if (peer) selectTransferPeer(peer);
+                }}
+                onOpenSettings={() => setRoomSettingsOpen(true)}
+              />
+            </div>
+          ) : (
           <div className="mt-3 flex flex-col gap-2">
             {peers.length === 0 ? (
               <div className="rounded-lg glass glass-border border p-3 text-small text-zinc-500 dark:text-zinc-400">
-                {isInternetMode
-                  ? "还没有其它设备。发送邀请链接或二维码，对方打开后会出现在这里。"
-                  : "还没有发现附近设备。请确认设备处于同一网络并进入相同房间。"}
+                还没有其它设备。发送邀请链接或二维码，对方打开后会出现在这里。
               </div>
             ) : peers.map((peer) => (
               <button
@@ -3531,6 +3657,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
               </button>
             ))}
           </div>
+          )}
         </aside> : null}
       </section>
       <TransferInviteModal
@@ -3621,6 +3748,25 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                     </div>
                   )}
                 </section>
+
+                {!isInternetMode ? (
+                  <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
+                    <div>
+                      <h3 className="text-small font-semibold text-zinc-900 dark:text-white">允许被发现</h3>
+                      <p className="mt-1 text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
+                        {discoverable
+                          ? "同一网络中的设备可以看到这台设备并向你发送。"
+                          : "其它设备看不到你；你仍可以看到它们并主动发送。"}
+                      </p>
+                    </div>
+                    <Switch
+                      size="sm"
+                      aria-label="切换允许被发现"
+                      isSelected={discoverable}
+                      onValueChange={updateDiscoverable}
+                    />
+                  </section>
+                ) : null}
 
                 {!isDiagramWorkspace ? (
                   <section className="flex items-center justify-between gap-4 border-t border-black/[0.07] pt-4 dark:border-white/[0.08]">
@@ -5429,6 +5575,27 @@ function loadOrCreateRoomToken(preferred?: string | null) {
 
 function loadReceiveConfirmationRequired() {
   return sessionStorage.getItem("public-transfer-receive-confirmation") === "true";
+}
+
+/**
+ * 是否允许被同一网络的其它设备发现。默认允许——内网互传的价值就在于打开即可见；
+ * 关闭后本机不出现在他人列表中，但仍能看到他人并主动发送（对齐 AirDrop 的“停止接收”）。
+ * 存 localStorage 而非 sessionStorage：这是隐私选择，应跨标签页与重启保持。
+ */
+function loadDiscoverable() {
+  try {
+    return localStorage.getItem("public-transfer-discoverable") !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveDiscoverable(value: boolean) {
+  try {
+    localStorage.setItem("public-transfer-discoverable", String(value));
+  } catch {
+    // 隐私偏好非关键项，存储不可用时保持本次会话内有效即可。
+  }
 }
 
 function readInitialNetworkMode(): TransferNetworkMode {

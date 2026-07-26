@@ -3072,6 +3072,51 @@ body {
   background: var(--app-apple-blue-soft);
 }
 
+/* ── 附近设备（AirDrop 式）───────────────────────────────────────────── */
+
+.nearby-device:hover .nearby-avatar {
+  transform: scale(1.06);
+}
+
+.nearby-device:focus-visible {
+  outline: 2px solid var(--app-apple-blue);
+  outline-offset: 2px;
+  border-radius: 10px;
+}
+
+/* 选中态用蓝色描边环，而不是改头像底色——底色是设备身份，不该被选中状态覆盖 */
+.nearby-avatar.is-selected {
+  box-shadow: 0 0 0 3px var(--app-apple-surface), 0 0 0 5px var(--app-apple-blue);
+}
+
+/* 扫描指示：呼吸圆环，传达“正在找”而不是“没有结果” */
+.nearby-radar {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--app-apple-blue) 45%, transparent);
+}
+
+.nearby-radar::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 999px;
+  border: 2px solid var(--app-apple-blue);
+  animation: nearby-radar-pulse 1.8s ease-out infinite;
+}
+
+@keyframes nearby-radar-pulse {
+  0% { transform: scale(0.55); opacity: 0.9; }
+  100% { transform: scale(1.35); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nearby-radar::after { animation: none; opacity: 0.45; }
+  .nearby-device:hover .nearby-avatar { transform: none; }
+}
+
 .app-apple-tool-choice:focus-visible,
 .app-apple-tool-peer:focus-visible,
 .app-apple-tool-tab:focus-visible,

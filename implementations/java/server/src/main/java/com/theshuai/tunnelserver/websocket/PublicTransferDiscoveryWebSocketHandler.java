@@ -75,7 +75,11 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         }
         String joinError = null;
         long rosterRevision = 0;
-        if (coordination.enabled()) {
+        if (!participant.discoverable()) {
+            // 隐身端不进入 roster：集群模式下不注册到共享 presence，本地 roster 亦被过滤。
+            // 但它仍加入本地会话表，因此照常收到 roster 广播、也能主动发起信令与传输。
+            addLocalParticipant(session, participant);
+        } else if (coordination.enabled()) {
             try {
                 PublicTransferCoordinationService.Registration registration = coordination.register(
                         participant.coordinationParticipant(),
@@ -403,6 +407,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
         } else {
             peers = participantsBySession.values().stream()
                     .filter(peer -> peer.sameGroup(group))
+                    .filter(Participant::discoverable)
                     .sorted(Comparator.comparing(Participant::connectedAt))
                     .map(this::participantView)
                     .toList();
@@ -574,6 +579,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
             String roomKey,
             String roomRole,
             boolean sharedRoom,
+            boolean discoverable,
             String connectedAt
     ) {
         private static Participant from(WebSocketSession session) {
@@ -588,6 +594,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                     stringAttr(attrs, "roomKey", "public:unknown"),
                     stringAttr(attrs, "roomRole", "EDITOR"),
                     Boolean.TRUE.equals(attrs.get("sharedRoom")),
+                    !Boolean.FALSE.equals(attrs.get("discoverable")),
                     Instant.now().toString()
             );
         }
@@ -603,6 +610,7 @@ public class PublicTransferDiscoveryWebSocketHandler extends AbstractWebSocketHa
                     roomKey,
                     roomRole,
                     sharedRoom,
+                    discoverable,
                     connectedAt
             );
         }
