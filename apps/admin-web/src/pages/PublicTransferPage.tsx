@@ -25,6 +25,8 @@ import { useAuth } from "../auth/AuthContext";
 import { UserMenuButton } from "../components/UserMenuButton";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { NearbyDeviceGrid } from "../components/NearbyDeviceGrid";
+import { NearbyDeviceActions } from "../components/NearbyDeviceActions";
+import type { NearbyDeviceAction } from "../components/NearbyDeviceActions";
 import { HeroRuntime } from "../components/HeroRuntime";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { SyncedClipboard } from "../components/SyncedClipboard";
@@ -359,6 +361,8 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   const [roomSettingsErrors, setRoomSettingsErrors] = useState<TransferRoomSettingsErrors>({});
   const [receiveConfirmationRequired, setReceiveConfirmationRequired] = useState(() => loadReceiveConfirmationRequired());
   const [discoverable, setDiscoverable] = useState(() => loadDiscoverable());
+  // 内网模式以设备为主体：点设备先选中它，再从面板里挑要做的事。
+  const [deviceActionPeerId, setDeviceActionPeerId] = useState("");
   const [qrVisible, setQrVisible] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
@@ -2807,8 +2811,40 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
     }
   }, []);
 
+  /**
+   * 设备操作面板的分发：先确保目标是这台设备，再切到对应能力。
+   * 传文件额外直接唤起文件选择器——用户点"传文件"的意图就是要挑文件，
+   * 让他再点一次上传区是多余的一步。
+   */
+  useEffect(() => {
+    // 目标设备离线时关掉面板：否则用户会对着一台已消失的设备点"传文件"。
+    if (deviceActionPeerId && !peers.some((peer) => peer.peerId === deviceActionPeerId)) {
+      setDeviceActionPeerId("");
+    }
+  }, [deviceActionPeerId, peers]);
+
+  const runNearbyDeviceAction = useCallback((action: NearbyDeviceAction) => {
+    setDeviceActionPeerId("");
+    selectTransferTool(action, action === "clipboard");
+    if (action === "files") {
+      // 页签切换后 input 才挂载，下一帧再唤起选择器
+      window.setTimeout(() => openFilePicker(), 0);
+    }
+  }, [openFilePicker, selectTransferTool]);
+
   const sharedModals = (
     <>
+      <NearbyDeviceActions
+        isOpen={deviceActionPeerId !== ""}
+        deviceName={(() => {
+          const peer = peers.find((item) => item.peerId === deviceActionPeerId);
+          return peer ? discoveryPeerDisplayName(peer) : "";
+        })()}
+        transportPath={peerTransportPaths[deviceActionPeerId]}
+        canSend={!isRoomReadOnly}
+        onClose={() => setDeviceActionPeerId("")}
+        onSelect={runNearbyDeviceAction}
+      />
       <ConfirmModal
         isOpen={transferInterruptAction !== null}
         onClose={() => setTransferInterruptAction(null)}
@@ -3615,7 +3651,9 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
                 discoverable={discoverable}
                 onSelect={(device) => {
                   const peer = peers.find((item) => item.peerId === device.peerId);
-                  if (peer) selectTransferPeer(peer);
+                  if (!peer) return;
+                  selectTransferPeer(peer);
+                  setDeviceActionPeerId(peer.peerId);
                 }}
                 onOpenSettings={() => setRoomSettingsOpen(true)}
               />
