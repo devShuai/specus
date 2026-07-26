@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Button,
   Dropdown,
@@ -34,6 +34,11 @@ import { ConfirmModal } from "../../components/ConfirmModal";
 import { EmptyState } from "../../components/EmptyState";
 
 const PAGE_SIZE = 10;
+type RouteToggleField = "enabled" | "detailCaptureEnabled" | "mediaCaptureEnabled" | "pathRewriteEnabled";
+
+function pendingKey(id: number, field: RouteToggleField): string {
+  return `${id}:${field}`;
+}
 
 export function HttpRoutesPanel() {
   const { clients } = useClients();
@@ -46,7 +51,8 @@ export function HttpRoutesPanel() {
   const [lastCreatedAccessUrl, setLastCreatedAccessUrl] = useState("");
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<HttpRoute | null>(null);
-  const [pendingIds, setPendingIds] = useState<Set<number>>(new Set());
+  const pendingKeysRef = useRef<Set<string>>(new Set());
+  const [pendingKeys, setPendingKeys] = useState<Set<string>>(new Set());
   const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => Promise<void> } | null>(null);
   const [page, setPage] = useState(1);
   const editModal = useDisclosure();
@@ -79,6 +85,7 @@ export function HttpRoutesPanel() {
         targetBaseUrl: targetBaseUrl.trim(),
         enabled: true,
         detailCaptureEnabled: false,
+        mediaCaptureEnabled: false,
         pathRewriteEnabled: false,
       });
       setRoute("");
@@ -93,44 +100,48 @@ export function HttpRoutesPanel() {
     }
   };
 
-  /** 乐观更新 + 失败回滚；切换期间该行开关禁用，避免整表刷新与连点竞态。 */
+  /** 乐观更新 + 单字段回滚；同一行的其他开关可继续操作。 */
   const patchRoute = async (
     item: HttpRoute,
-    patch: Partial<Pick<HttpRoute, "enabled" | "detailCaptureEnabled" | "pathRewriteEnabled">>,
+    field: RouteToggleField,
+    value: boolean,
     errorMessage: string,
   ) => {
-    if (pendingIds.has(item.id)) {
+    const key = pendingKey(item.id, field);
+    if (pendingKeysRef.current.has(key)) {
       return;
     }
-    setPendingIds((prev) => new Set(prev).add(item.id));
-    setRoutes((prev) => prev.map((row) => (row.id === item.id ? { ...row, ...patch } : row)));
+    pendingKeysRef.current.add(key);
+    setPendingKeys(new Set(pendingKeysRef.current));
+    setRoutes((prev) => prev.map((row) => (row.id === item.id ? { ...row, [field]: value } : row)));
     try {
       await adminApi.updateHttpRoute(item.id, {
         route: item.route,
         targetBaseUrl: item.targetBaseUrl,
-        enabled: patch.enabled ?? item.enabled,
-        detailCaptureEnabled: patch.detailCaptureEnabled ?? Boolean(item.detailCaptureEnabled),
-        pathRewriteEnabled: patch.pathRewriteEnabled ?? Boolean(item.pathRewriteEnabled),
+        [field]: value,
       });
     } catch (error) {
-      setRoutes((prev) => prev.map((row) => (row.id === item.id ? item : row)));
+      setRoutes((prev) => prev.map((row) => (
+        row.id === item.id ? { ...row, [field]: item[field] } : row
+      )));
       notifyError(error, errorMessage);
     } finally {
-      setPendingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(item.id);
-        return next;
-      });
+      pendingKeysRef.current.delete(key);
+      setPendingKeys(new Set(pendingKeysRef.current));
     }
   };
 
-  const toggle = (item: HttpRoute) => patchRoute(item, { enabled: !item.enabled }, "切换状态失败");
+  const toggle = (item: HttpRoute) =>
+    patchRoute(item, "enabled", !item.enabled, "切换状态失败");
 
   const toggleDetailCapture = (item: HttpRoute) =>
-    patchRoute(item, { detailCaptureEnabled: !Boolean(item.detailCaptureEnabled) }, "切换明细采集失败");
+    patchRoute(item, "detailCaptureEnabled", !Boolean(item.detailCaptureEnabled), "切换明细采集失败");
+
+  const toggleMediaCapture = (item: HttpRoute) =>
+    patchRoute(item, "mediaCaptureEnabled", !Boolean(item.mediaCaptureEnabled), "切换媒体采集失败");
 
   const togglePathRewrite = (item: HttpRoute) =>
-    patchRoute(item, { pathRewriteEnabled: !Boolean(item.pathRewriteEnabled) }, "切换路径改写失败");
+    patchRoute(item, "pathRewriteEnabled", !Boolean(item.pathRewriteEnabled), "切换路径改写失败");
 
   const remove = (item: HttpRoute) => {
     setConfirm({
@@ -229,7 +240,6 @@ export function HttpRoutesPanel() {
           renderCard={(raw) => {
             const item = raw as HttpRoute;
             const accessUrl = httpRouteAccessUrl(item);
-            const pending = pendingIds.has(item.id);
             return (
               <MobileListCard
                 key={item.id}
@@ -250,7 +260,7 @@ export function HttpRoutesPanel() {
                     <Switch
                       size="sm"
                       isSelected={item.enabled}
-                      isDisabled={pending}
+                      isDisabled={pendingKeys.has(pendingKey(item.id, "enabled"))}
                       onValueChange={() => void toggle(item)}
                     >
                       启用
@@ -258,7 +268,7 @@ export function HttpRoutesPanel() {
                     <Switch
                       size="sm"
                       isSelected={Boolean(item.detailCaptureEnabled)}
-                      isDisabled={pending}
+                      isDisabled={pendingKeys.has(pendingKey(item.id, "detailCaptureEnabled"))}
                       onValueChange={() => void toggleDetailCapture(item)}
                     >
                       明细采集
@@ -266,10 +276,18 @@ export function HttpRoutesPanel() {
                     <Switch
                       size="sm"
                       isSelected={Boolean(item.pathRewriteEnabled)}
-                      isDisabled={pending}
+                      isDisabled={pendingKeys.has(pendingKey(item.id, "pathRewriteEnabled"))}
                       onValueChange={() => void togglePathRewrite(item)}
                     >
                       路径改写
+                    </Switch>
+                    <Switch
+                      size="sm"
+                      isSelected={Boolean(item.mediaCaptureEnabled)}
+                      isDisabled={pendingKeys.has(pendingKey(item.id, "mediaCaptureEnabled"))}
+                      onValueChange={() => void toggleMediaCapture(item)}
+                    >
+                      媒体采集
                     </Switch>
                   </>
                 }
@@ -324,8 +342,8 @@ export function HttpRoutesPanel() {
           removeWrapper
         >
         <TableHeader>
-          <TableColumn className="w-[6%]">ID</TableColumn>
-          <TableColumn className="w-[12%]">
+          <TableColumn className="w-[5%]">ID</TableColumn>
+          <TableColumn className="w-[11%]">
             <ClientFilterHeader
               clients={clients}
               selectedClientId={filterClientId}
@@ -333,17 +351,17 @@ export function HttpRoutesPanel() {
             />
           </TableColumn>
           <TableColumn className="w-[8%]">路由名</TableColumn>
-          <TableColumn className="w-[14%]">目标地址</TableColumn>
-          <TableColumn className="w-[16%]">访问链接</TableColumn>
-          <TableColumn className="w-[7%]">启用</TableColumn>
-          <TableColumn className="w-[7%]">明细</TableColumn>
-          <TableColumn className="w-[7%]">改写</TableColumn>
-          <TableColumn className="w-[11%]">更新时间</TableColumn>
-          <TableColumn className="w-[12%]">操作</TableColumn>
+          <TableColumn className="w-[13%]">目标地址</TableColumn>
+          <TableColumn className="w-[15%]">访问链接</TableColumn>
+          <TableColumn className="w-[6%]">启用</TableColumn>
+          <TableColumn className="w-[6%]">明细</TableColumn>
+          <TableColumn className="w-[6%]">媒体</TableColumn>
+          <TableColumn className="w-[6%]">改写</TableColumn>
+          <TableColumn className="w-[10%]">更新时间</TableColumn>
+          <TableColumn className="w-[10%]">操作</TableColumn>
         </TableHeader>
         <TableBody items={pagedRoutes} isLoading={loading} emptyContent={<EmptyState icon="generic" title="后台尚未维护 HTTP 路由" description="创建路由后即可通过访问链接打开内网应用" />}>
           {(item) => {
-            const pending = pendingIds.has(item.id);
             return (
             <TableRow key={item.id}>
               <TableCell>
@@ -374,7 +392,7 @@ export function HttpRoutesPanel() {
                   aria-label="启用"
                   size="sm"
                   isSelected={item.enabled}
-                  isDisabled={pending}
+                  isDisabled={pendingKeys.has(pendingKey(item.id, "enabled"))}
                   onValueChange={() => void toggle(item)}
                 />
               </TableCell>
@@ -383,8 +401,17 @@ export function HttpRoutesPanel() {
                   aria-label="明细采集"
                   size="sm"
                   isSelected={Boolean(item.detailCaptureEnabled)}
-                  isDisabled={pending}
+                  isDisabled={pendingKeys.has(pendingKey(item.id, "detailCaptureEnabled"))}
                   onValueChange={() => void toggleDetailCapture(item)}
+                />
+              </TableCell>
+              <TableCell>
+                <Switch
+                  aria-label="媒体采集"
+                  size="sm"
+                  isSelected={Boolean(item.mediaCaptureEnabled)}
+                  isDisabled={pendingKeys.has(pendingKey(item.id, "mediaCaptureEnabled"))}
+                  onValueChange={() => void toggleMediaCapture(item)}
                 />
               </TableCell>
               <TableCell>
@@ -392,7 +419,7 @@ export function HttpRoutesPanel() {
                   aria-label="路径改写"
                   size="sm"
                   isSelected={Boolean(item.pathRewriteEnabled)}
-                  isDisabled={pending}
+                  isDisabled={pendingKeys.has(pendingKey(item.id, "pathRewriteEnabled"))}
                   onValueChange={() => void togglePathRewrite(item)}
                 />
               </TableCell>
@@ -542,6 +569,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
   const [targetBaseUrl, setTargetBaseUrl] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [detailCaptureEnabled, setDetailCaptureEnabled] = useState(false);
+  const [mediaCaptureEnabled, setMediaCaptureEnabled] = useState(false);
   const [pathRewriteEnabled, setPathRewriteEnabled] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -551,6 +579,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
       setTargetBaseUrl(route.targetBaseUrl);
       setEnabled(route.enabled);
       setDetailCaptureEnabled(Boolean(route.detailCaptureEnabled));
+      setMediaCaptureEnabled(Boolean(route.mediaCaptureEnabled));
       setPathRewriteEnabled(Boolean(route.pathRewriteEnabled));
     }
   }, [route]);
@@ -566,6 +595,7 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
         targetBaseUrl: targetBaseUrl.trim(),
         enabled,
         detailCaptureEnabled,
+        mediaCaptureEnabled,
         pathRewriteEnabled,
       });
       notify("HTTP 路由已更新");
@@ -592,6 +622,9 @@ function EditHttpRouteModal({ disclosure, route, onSaved }: EditHttpRouteModalPr
               </Switch>
               <Switch isSelected={detailCaptureEnabled} onValueChange={setDetailCaptureEnabled}>
                 明细采集
+              </Switch>
+              <Switch isSelected={mediaCaptureEnabled} onValueChange={setMediaCaptureEnabled}>
+                媒体采集（RustFS）
               </Switch>
               <Switch isSelected={pathRewriteEnabled} onValueChange={setPathRewriteEnabled}>
                 路径改写

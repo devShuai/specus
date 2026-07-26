@@ -4,12 +4,13 @@ export const HTTP_EXCHANGE_PAGE_SIZE = 20;
 export const TCP_FRAME_PAGE_SIZE = 20;
 export const TCP_STREAM_PAGE_SIZE = 200;
 
-export type TrafficViewKey = "client" | "tcp" | "http";
+export type TrafficViewKey = "client" | "tcp" | "http" | "media";
 
 export const TRAFFIC_VIEW_TABS: Array<{ key: TrafficViewKey; label: string }> = [
   { key: "client", label: "客户端汇总" },
   { key: "tcp", label: "TCP 映射" },
   { key: "http", label: "HTTP 路由" },
+  { key: "media", label: "媒体采集" },
 ];
 
 export const TRAFFIC_MODAL_CLASS_NAMES = {

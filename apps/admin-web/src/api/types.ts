@@ -117,6 +117,7 @@ export interface HttpRoute {
   targetBaseUrl: string;
   enabled: boolean;
   detailCaptureEnabled: boolean;
+  mediaCaptureEnabled: boolean;
   pathRewriteEnabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -492,6 +493,55 @@ export interface PeerMeshNatTypeStat {
   devices: number;
 }
 
+export type HttpMediaKind = "PROGRESSIVE" | "MEDIA_SEGMENT" | "HLS_MANIFEST" | "DASH_MANIFEST";
+export type HttpMediaCaptureState = "STARTING" | "CAPTURING" | "COMPLETE" | "INCOMPLETE" | "FAILED";
+
+export interface HttpMediaCapture {
+  id: number;
+  clientId: number;
+  clientName: string;
+  route: string;
+  resourceId: number | null;
+  sourceUrl: string;
+  method: string;
+  statusCode: number;
+  contentType: string | null;
+  mediaKind: HttpMediaKind | string;
+  entityTag: string | null;
+  contentRangeStart: number | null;
+  contentRangeEnd: number | null;
+  totalBytes: number | null;
+  capturedBytes: number;
+  segmentSequence: number | null;
+  initializationSegment: boolean;
+  liveStream: boolean;
+  state: HttpMediaCaptureState | string;
+  failureReason: string | null;
+  playable: boolean;
+  offlineReady: boolean;
+  playbackMessage: string | null;
+  capturedAt: string;
+  completedAt: string | null;
+  expiresAt: string;
+}
+
+export interface HttpMediaCapturePage {
+  items: HttpMediaCapture[];
+  total: number;
+  page: number;
+  size: number;
+  totalPages: number;
+}
+
+export interface HttpMediaPlaybackTicket {
+  ticket: string;
+  mediaKind: HttpMediaKind | string;
+  playUrl: string;
+  manifestUrl: string;
+  backfillMissing: boolean;
+  expiresAt: string;
+}
+
 export interface PeerMeshAddressFamilyStat {
   addressFamily: "IPv4" | "IPv6" | "UNKNOWN" | string;
   status: string;
@@ -657,6 +707,7 @@ export interface HttpRouteMutation {
   targetBaseUrl: string;
   enabled?: boolean;
   detailCaptureEnabled?: boolean;
+  mediaCaptureEnabled?: boolean;
   pathRewriteEnabled?: boolean;
 }
 

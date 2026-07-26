@@ -18,6 +18,8 @@ import type {
   DatabaseInitResult,
   HttpRoute,
   HttpRouteMutation,
+  HttpMediaCapturePage,
+  HttpMediaPlaybackTicket,
   HttpTrafficExchange,
   HttpTrafficExchangePage,
   HttpResponseBodyType,
@@ -395,6 +397,13 @@ export const adminApi = {
     }
     return data;
   },
+  listHttpMediaCaptures: (page = 0, size = 50) =>
+    request<HttpMediaCapturePage>(`/traffic/media-captures?page=${page}&size=${size}`),
+  createHttpMediaPlaybackTicket: (id: number, backfillMissing = false) =>
+    request<HttpMediaPlaybackTicket>(
+      `/traffic/media-captures/${id}/playback-ticket?backfillMissing=${backfillMissing}`,
+      { method: "POST" },
+    ),
   listTcpTrafficFrames: async (query: TcpTrafficFrameQuery) => {
     const params = new URLSearchParams();
     params.set("page", String(query.page));
@@ -574,6 +583,8 @@ export function publicCreateTransferWebSocketTicket(body: {
   roomToken: string;
   peerId: string;
   displayName: string;
+  /** 关闭后本设备不出现在他人的设备列表里，但仍能看到他人并主动发送。 */
+  discoverable?: boolean;
 }): Promise<WebSocketTicket> {
   return publicJsonRequest<WebSocketTicket>("/api/public/transfer/ws-tickets", body);
 }

@@ -81,6 +81,8 @@ import {
   type TcpHeaderPair,
   type TcpPayloadAnalysis,
 } from "./traffic/tcpPayload";
+import { isHttpImageBody, resolveHttpImageDataUrl } from "./traffic/httpBodyPreview";
+import { MediaCapturePanel } from "./traffic/MediaCapturePanel";
 
 export function TrafficPanel() {
   const [clientRows, setClientRows] = useState<TrafficUsage[]>([]);
@@ -430,6 +432,7 @@ export function TrafficPanel() {
           />
         </div>
       )}
+      {trafficView === "media" && <MediaCapturePanel />}
       <HttpExchangeModal row={selectedHttpExchange} onClose={() => setSelectedHttpExchange(null)} />
       <TcpFrameModal row={selectedTcpFrame} onClose={() => setSelectedTcpFrame(null)} />
       <TcpStreamModal
@@ -1901,10 +1904,11 @@ function XmlBodyPreview({ content }: { content: string }) {
 
 function ImageBodyPreview({ content, contentType }: { content: string; contentType: string | null }) {
   const trimmed = content.trim();
-  if (trimmed.startsWith("data:image/")) {
+  const imageDataUrl = resolveHttpImageDataUrl(trimmed, contentType);
+  if (imageDataUrl) {
     return (
       <div className="flex min-h-52 items-center justify-center rounded-small border border-default-200 bg-default-50 p-3">
-        <img alt="HTTP body preview" className="max-h-[52dvh] max-w-full object-contain" src={trimmed} />
+        <img alt="HTTP body preview" className="max-h-[52dvh] max-w-full object-contain" src={imageDataUrl} />
       </div>
     );
   }
@@ -3155,7 +3159,7 @@ function detectBodyPreviewKind(contentType: string | null, content: string | nul
   if (normalized.includes("text/html") || normalized.includes("application/xhtml+xml")) {
     return "html";
   }
-  if (normalized.startsWith("image/") || trimmed.startsWith("data:image/") || trimmed.startsWith("<svg")) {
+  if (isHttpImageBody(trimmed, contentType)) {
     return "image";
   }
   if (normalized.includes("xml")) {
