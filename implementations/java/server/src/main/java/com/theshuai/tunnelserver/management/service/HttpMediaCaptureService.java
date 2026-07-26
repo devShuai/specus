@@ -16,6 +16,7 @@ import com.theshuai.tunnelserver.management.storage.media.RustFsMediaStorage;
 import com.theshuai.tunnelserver.management.storage.media.RustFsMediaStorage.MultipartUpload;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -146,6 +147,34 @@ public class HttpMediaCaptureService {
             expectedResponseBytes = contentRange.end() - contentRange.start() + 1;
         }
 
+        String normalizedMethod = normalizeMethod(method);
+        String storedContentEncoding = cap(contentEncoding, 128);
+        String resourceKey = resourceKey(
+                account.getTenantId(), account.getId(), route, normalizedSourceUrl, entityTag, lastModified);
+        String deduplicationKey = deduplicationKey(
+                resourceKey,
+                normalizedMethod,
+                kind,
+                rangeStart,
+                rangeEnd,
+                totalBytes,
+                storedContentEncoding);
+        if (deduplicationKey != null && hasReusableCapture(
+                account.getTenantId(),
+                deduplicationKey,
+                resourceKey,
+                kind,
+                rangeStart,
+                rangeEnd,
+                totalBytes,
+                expectedResponseBytes,
+                storedContentEncoding,
+                now)) {
+            log.debug("[media-capture] skipped duplicate client={} route={} range={}-{} source={}",
+                    clientName, route, rangeStart, rangeEnd, normalizedSourceUrl);
+            return CaptureSession.externalizedNoop();
+        }
+
         HttpMediaCapture capture = new HttpMediaCapture();
         capture.setTenantId(account.getTenantId());
         capture.setClientId(account.getId());
@@ -153,12 +182,12 @@ public class HttpMediaCaptureService {
         capture.setRoute(route);
         capture.setResourceId(mapping.getId());
         capture.setSourceUrl(normalizedSourceUrl);
-        capture.setResourceKey(resourceKey(
-                account.getTenantId(), account.getId(), route, normalizedSourceUrl, entityTag, lastModified));
-        capture.setMethod(normalizeMethod(method));
+        capture.setResourceKey(resourceKey);
+        capture.setDeduplicationKey(deduplicationKey);
+        capture.setMethod(normalizedMethod);
         capture.setStatusCode(statusCode);
         capture.setContentType(cap(contentType, 255));
-        capture.setContentEncoding(cap(contentEncoding, 128));
+        capture.setContentEncoding(storedContentEncoding);
         capture.setMediaKind(kind);
         capture.setEntityTag(cap(entityTag, 512));
         capture.setLastModified(cap(lastModified, 128));
@@ -174,7 +203,22 @@ public class HttpMediaCaptureService {
         capture.setResponseHeaders(joinHeaders(responseHeaders));
         capture.setCapturedAt(now.toString());
         capture.setExpiresAt(now.plusSeconds(Math.max(60, properties.getRetentionSeconds())).toString());
-        HttpMediaCapture saved = captureRepository.saveAndFlush(capture);
+        HttpMediaCapture saved;
+        try {
+            saved = captureRepository.saveAndFlush(capture);
+        } catch (DataIntegrityViolationException exception) {
+            HttpMediaCapture concurrent = deduplicationKey == null ? null
+                    : captureRepository.findByTenantIdAndDeduplicationKey(
+                            account.getTenantId(), deduplicationKey).orElse(null);
+            if (concurrent != null
+                    && isReusableCapture(
+                            concurrent, rangeStart, rangeEnd, expectedResponseBytes, Instant.now())) {
+                log.debug("[media-capture] concurrent duplicate skipped client={} route={} range={}-{} source={}",
+                        clientName, route, rangeStart, rangeEnd, normalizedSourceUrl);
+                return CaptureSession.externalizedNoop();
+            }
+            throw exception;
+        }
 
         try {
             MultipartUpload upload = storage.beginMultipart(
@@ -346,6 +390,9 @@ public class HttpMediaCaptureService {
                 || expectedResponseBytes < 0
                 || expectedResponseBytes == capturedBytes;
         capture.setState(complete ? STATE_COMPLETE : STATE_INCOMPLETE);
+        if (!complete || retainedPartial) {
+            capture.setDeduplicationKey(null);
+        }
         capture.setFailureReason(complete ? null
                 : "响应正文长度不完整，预期 " + expectedResponseBytes + " 字节，实际 " + capturedBytes + " 字节");
         capture.setObjectEtag(cap(objectEtag, 512));
@@ -456,6 +503,7 @@ public class HttpMediaCaptureService {
             return;
         }
         capture.setState(STATE_FAILED);
+        capture.setDeduplicationKey(null);
         capture.setFailureReason(cap(rootMessage(error), 2048));
         capture.setCompletedAt(Instant.now().toString());
         captureRepository.save(capture);
@@ -556,11 +604,95 @@ public class HttpMediaCaptureService {
                                String lastModified) {
         String version = hasText(entityTag) ? entityTag : hasText(lastModified) ? lastModified : "";
         String value = tenantId + '\n' + clientId + '\n' + route + '\n' + sourceUrl + '\n' + version;
+        return sha256(value);
+    }
+
+    private String deduplicationKey(String resourceKey,
+                                    String method,
+                                    String kind,
+                                    Long rangeStart,
+                                    Long rangeEnd,
+                                    Long totalBytes,
+                                    String contentEncoding) {
+        if (isManifest(kind)
+                || rangeStart == null
+                || rangeEnd == null
+                || rangeEnd < rangeStart) {
+            return null;
+        }
+        String value = resourceKey
+                + '\n' + method
+                + '\n' + kind
+                + '\n' + rangeStart
+                + '\n' + rangeEnd
+                + '\n' + (totalBytes == null ? "" : totalBytes)
+                + '\n' + (contentEncoding == null ? "" : contentEncoding.toLowerCase(Locale.ROOT));
+        return sha256(value);
+    }
+
+    private String sha256(String value) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(value.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException impossible) {
             throw new IllegalStateException(impossible);
+        }
+    }
+
+    private boolean hasReusableCapture(String tenantId,
+                                       String deduplicationKey,
+                                       String resourceKey,
+                                       String mediaKind,
+                                       Long rangeStart,
+                                       Long rangeEnd,
+                                       Long totalBytes,
+                                       long expectedResponseBytes,
+                                       String contentEncoding,
+                                       Instant now) {
+        HttpMediaCapture keyed = captureRepository
+                .findByTenantIdAndDeduplicationKey(tenantId, deduplicationKey)
+                .orElse(null);
+        if (keyed != null) {
+            if (isReusableCapture(keyed, rangeStart, rangeEnd, expectedResponseBytes, now)) {
+                return true;
+            }
+            keyed.setDeduplicationKey(null);
+            captureRepository.saveAndFlush(keyed);
+        }
+
+        return captureRepository
+                .findFirstByTenantIdAndResourceKeyAndMediaKindAndContentRangeStartAndContentRangeEndAndTotalBytesAndCapturedBytesAndContentEncodingAndStateAndExpiresAtAfterOrderByIdDesc(
+                        tenantId,
+                        resourceKey,
+                        mediaKind,
+                        rangeStart,
+                        rangeEnd,
+                        totalBytes,
+                        expectedResponseBytes,
+                        contentEncoding,
+                        STATE_COMPLETE,
+                        now.toString())
+                .isPresent();
+    }
+
+    private boolean isReusableCapture(HttpMediaCapture capture,
+                                      Long rangeStart,
+                                      Long rangeEnd,
+                                      long expectedResponseBytes,
+                                      Instant now) {
+        if (STATE_STARTING.equals(capture.getState()) || STATE_CAPTURING.equals(capture.getState())) {
+            return true;
+        }
+        if (!STATE_COMPLETE.equals(capture.getState())
+                || capture.getCapturedBytes() != expectedResponseBytes
+                || !java.util.Objects.equals(capture.getContentRangeStart(), rangeStart)
+                || !java.util.Objects.equals(capture.getContentRangeEnd(), rangeEnd)) {
+            return false;
+        }
+        try {
+            return Instant.parse(capture.getExpiresAt()).isAfter(now);
+        } catch (RuntimeException ignored) {
+            return false;
         }
     }
 
@@ -656,8 +788,16 @@ public class HttpMediaCaptureService {
 
         boolean active();
 
+        default boolean externalized() {
+            return active();
+        }
+
         static CaptureSession noop() {
             return NoopCapture.INSTANCE;
+        }
+
+        static CaptureSession externalizedNoop() {
+            return ExternalizedNoopCapture.INSTANCE;
         }
     }
 
@@ -679,6 +819,32 @@ public class HttpMediaCaptureService {
         @Override
         public boolean active() {
             return false;
+        }
+    }
+
+    private enum ExternalizedNoopCapture implements CaptureSession {
+        INSTANCE;
+
+        @Override
+        public void append(byte[] bytes) {
+        }
+
+        @Override
+        public void complete() {
+        }
+
+        @Override
+        public void fail(String reason) {
+        }
+
+        @Override
+        public boolean active() {
+            return false;
+        }
+
+        @Override
+        public boolean externalized() {
+            return true;
         }
     }
 

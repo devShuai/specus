@@ -18,7 +18,8 @@ import lombok.Setter;
                 @Index(name = "idx_http_media_tenant_client_id", columnList = "tenant_id, client_id, id"),
                 @Index(name = "idx_http_media_resource", columnList = "tenant_id, resource_key, id"),
                 @Index(name = "idx_http_media_source", columnList = "tenant_id, client_id, route, id"),
-                @Index(name = "idx_http_media_expiry", columnList = "state, expires_at")
+                @Index(name = "idx_http_media_expiry", columnList = "state, expires_at"),
+                @Index(name = "uk_http_media_deduplication", columnList = "deduplication_key", unique = true)
         })
 @Getter
 @Setter
@@ -47,6 +48,9 @@ public class HttpMediaCapture {
 
     @Column(name = "resource_key", nullable = false, length = 64)
     private String resourceKey;
+
+    @Column(name = "deduplication_key", length = 64)
+    private String deduplicationKey;
 
     @Column(nullable = false, length = 16)
     private String method;

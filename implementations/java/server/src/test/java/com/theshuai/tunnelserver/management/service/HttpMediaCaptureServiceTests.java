@@ -12,6 +12,7 @@ import com.theshuai.tunnelserver.management.storage.media.RustFsMediaStorage;
 import com.theshuai.tunnelserver.management.storage.media.RustFsMediaStorage.MultipartUpload;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.dao.DataIntegrityViolationException;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 
 import java.util.List;
@@ -23,7 +24,9 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -133,6 +136,137 @@ class HttpMediaCaptureServiceTests {
     }
 
     @Test
+    void skipsRepeatedCompletedRangeWithoutSavingAnotherObject() {
+        ServiceFixture fixture = new ServiceFixture();
+        try {
+            List<String> headers = List.of(
+                    "Content-Type:video/mp4",
+                    "Content-Range:bytes 0-36/100");
+            HttpMediaCaptureService.CaptureSession first = fixture.service.open(
+                    "client-a", "video", "GET", "/movie.mp4", 206, headers);
+
+            first.append(new byte[37]);
+            first.complete();
+
+            verify(fixture.storage, timeout(5_000))
+                    .completeMultipart(any(MultipartUpload.class), any());
+            verify(fixture.captureRepository, timeout(5_000).atLeastOnce())
+                    .save(any(HttpMediaCapture.class));
+
+            HttpMediaCaptureService.CaptureSession duplicate = fixture.service.open(
+                    "client-a", "video", "GET", "/movie.mp4", 206, headers);
+
+            assertThat(duplicate.active()).isFalse();
+            assertThat(duplicate.externalized()).isTrue();
+            verify(fixture.storage, times(1))
+                    .beginMultipart(any(), any(), eq(null));
+        } finally {
+            fixture.service.shutdown();
+        }
+    }
+
+    @Test
+    void allowsRetryAfterOnlyPartOfRequestedRangeWasCaptured() {
+        ServiceFixture fixture = new ServiceFixture();
+        try {
+            List<String> headers = List.of(
+                    "Content-Type:video/mp4",
+                    "Content-Range:bytes 0-99/100");
+            HttpMediaCaptureService.CaptureSession first = fixture.service.open(
+                    "client-a", "video", "GET", "/movie.mp4", 206, headers);
+            first.append(new byte[37]);
+            first.fail("Broken pipe");
+
+            verify(fixture.storage, timeout(5_000))
+                    .completeMultipart(any(MultipartUpload.class), any());
+            verify(fixture.captureRepository, timeout(5_000).atLeastOnce())
+                    .save(any(HttpMediaCapture.class));
+            assertThat(fixture.persisted[0].getDeduplicationKey()).isNull();
+
+            HttpMediaCaptureService.CaptureSession retry = fixture.service.open(
+                    "client-a", "video", "GET", "/movie.mp4", 206, headers);
+
+            assertThat(retry.active()).isTrue();
+            verify(fixture.storage, times(2))
+                    .beginMultipart(any(), any(), eq(null));
+        } finally {
+            fixture.service.shutdown();
+        }
+    }
+
+    @Test
+    void capturesDifferentRangesOfTheSameResourceSeparately() {
+        ServiceFixture fixture = new ServiceFixture();
+        try {
+            HttpMediaCaptureService.CaptureSession first = fixture.service.open(
+                    "client-a",
+                    "video",
+                    "GET",
+                    "/movie.mp4",
+                    206,
+                    List.of(
+                            "Content-Type:video/mp4",
+                            "Content-Range:bytes 0-36/100"));
+            first.append(new byte[37]);
+            first.complete();
+            verify(fixture.storage, timeout(5_000))
+                    .completeMultipart(any(MultipartUpload.class), any());
+            verify(fixture.captureRepository, timeout(5_000).atLeastOnce())
+                    .save(any(HttpMediaCapture.class));
+
+            HttpMediaCaptureService.CaptureSession second = fixture.service.open(
+                    "client-a",
+                    "video",
+                    "GET",
+                    "/movie.mp4",
+                    206,
+                    List.of(
+                            "Content-Type:video/mp4",
+                            "Content-Range:bytes 37-73/100"));
+
+            assertThat(second.active()).isTrue();
+            second.append(new byte[37]);
+            second.complete();
+            verify(fixture.storage, timeout(5_000).times(2))
+                    .completeMultipart(any(MultipartUpload.class), any());
+            verify(fixture.storage, times(2))
+                    .beginMultipart(any(), any(), eq(null));
+        } finally {
+            fixture.service.shutdown();
+        }
+    }
+
+    @Test
+    void treatsUniqueKeyRaceAsAnExternalizedDuplicate() {
+        ServiceFixture fixture = new ServiceFixture();
+        try {
+            when(fixture.captureRepository.saveAndFlush(any(HttpMediaCapture.class)))
+                    .thenAnswer(invocation -> {
+                        HttpMediaCapture winner = invocation.getArgument(0);
+                        winner.setId(202L);
+                        fixture.persisted[0] = winner;
+                        throw new DataIntegrityViolationException("duplicate deduplication key");
+                    });
+
+            HttpMediaCaptureService.CaptureSession duplicate = fixture.service.open(
+                    "client-a",
+                    "video",
+                    "GET",
+                    "/movie.mp4",
+                    206,
+                    List.of(
+                            "Content-Type:video/mp4",
+                            "Content-Range:bytes 0-36/100"));
+
+            assertThat(duplicate.active()).isFalse();
+            assertThat(duplicate.externalized()).isTrue();
+            verify(fixture.storage, never()).beginMultipart(any(), any(), eq(null));
+        } finally {
+            fixture.service.shutdown();
+        }
+    }
+
+    @Test
     void redactsAuthenticationTokensFromSourceUrlView() {
         String redacted = HttpMediaCaptureService.redactSourceUrl(
                 "/Videos/movie/stream.mp4?deviceId=device-a&ApiKey=secret-value&Tag=etag");
@@ -169,6 +303,17 @@ class HttpMediaCaptureServiceTests {
             when(accountService.findClientByName("client-a")).thenReturn(Optional.of(account));
             when(routeRepository.findByTenantIdAndClientIdAndRoute("tenant-a", 7L, "video"))
                     .thenReturn(Optional.of(route));
+            when(captureRepository.findByTenantIdAndDeduplicationKey(any(), any()))
+                    .thenAnswer(invocation -> {
+                        HttpMediaCapture capture = persisted[0];
+                        String deduplicationKey = invocation.getArgument(1);
+                        if (capture == null
+                                || capture.getDeduplicationKey() == null
+                                || !capture.getDeduplicationKey().equals(deduplicationKey)) {
+                            return Optional.empty();
+                        }
+                        return Optional.of(capture);
+                    });
             when(captureRepository.saveAndFlush(any(HttpMediaCapture.class))).thenAnswer(invocation -> {
                 HttpMediaCapture capture = invocation.getArgument(0);
                 if (capture.getId() == null) {

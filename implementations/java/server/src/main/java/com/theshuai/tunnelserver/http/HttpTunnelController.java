@@ -152,7 +152,7 @@ public class HttpTunnelController {
                     sourceUrl(relativePath, request.getQueryString()),
                     statusCode,
                     responseHeaders);
-            responseBodyExternalized = mediaCapture.active();
+            responseBodyExternalized = mediaCapture.externalized();
             response.setStatus(statusCode);
             HttpStreamExchange finalExchange = exchange;
             response.setTrailerFields(() -> trailerMap(finalExchange.trailers()));
