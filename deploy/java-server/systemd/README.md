@@ -234,7 +234,38 @@ TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS=300
 
 生产环境不要把 OSS 密钥提交到仓库；通过仅 root 可读的 systemd environment file 注入。
 
-### 4.7 HTTP 直转与流量明细（可选）
+### 4.7 HTTP 媒体采集 / RustFS（可选，默认关闭）
+
+媒体采集与公共互传附件相互独立。对需要采集的 HTTP 路由打开管理页中的“媒体采集”开关后，
+服务端会把 MP4/WebM Range 响应、HLS/DASH 清单及分段直接以 S3 multipart 写入 RustFS；
+业务数据库只保存对象 key、ETag、`Content-Range`、分段序号、初始化段关系和有效期，不保存媒体正文。
+
+```env
+TUNNEL_MEDIA_CAPTURE_ENABLED=false
+#TUNNEL_MEDIA_CAPTURE_ENDPOINT=http://127.0.0.1:9000
+TUNNEL_MEDIA_CAPTURE_REGION=us-east-1
+#TUNNEL_MEDIA_CAPTURE_BUCKET=shuai-tunnel-media
+#TUNNEL_MEDIA_CAPTURE_ACCESS_KEY_ID=
+#TUNNEL_MEDIA_CAPTURE_ACCESS_KEY_SECRET=
+TUNNEL_MEDIA_CAPTURE_PREFIX=shuai-tunnel/http-media
+TUNNEL_MEDIA_CAPTURE_PATH_STYLE=true
+TUNNEL_MEDIA_CAPTURE_CREATE_BUCKET_IF_MISSING=false
+TUNNEL_MEDIA_CAPTURE_PART_SIZE_BYTES=8388608
+TUNNEL_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS=4
+TUNNEL_MEDIA_CAPTURE_UPLOAD_THREADS=4
+TUNNEL_MEDIA_CAPTURE_RETENTION_SECONDS=86400
+TUNNEL_MEDIA_CAPTURE_LIVE_WINDOW_SECONDS=300
+TUNNEL_MEDIA_CAPTURE_MANIFEST_MAX_BYTES=16777216
+TUNNEL_MEDIA_CAPTURE_PLAYBACK_TICKET_TTL_SECONDS=900
+TUNNEL_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS=60000
+```
+
+bucket 应保持私有，`TUNNEL_MEDIA_CAPTURE_ENDPOINT` 填 RustFS S3 API 端口并保持
+`TUNNEL_MEDIA_CAPTURE_PATH_STYLE=true`。浏览器通过 tunnel-server 的短期播放票据回放，
+不直连 RustFS，因此无需把 RustFS 地址加入前端 CSP。生产环境可再配置 bucket 生命周期作为
+过期清理的第二道保障。
+
+### 4.8 HTTP 直转与流量明细（可选）
 
 ```env
 TUNNEL_HTTP_TIMEOUT_MS=30000
@@ -249,9 +280,12 @@ TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE=1000
 TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS=2000
 ```
 
-HTTP / TCP 明细默认写入业务数据库；管理页会分页读取 HTTP 请求/响应和 TCP payload。`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` 是总开关，默认关闭；每条 HTTP 路由 / TCP 映射仍需在管理页单独开启明细采集，新建通道默认关闭。HTTP Body 入库前会按 `Content-Encoding` 解压 `gzip`、`deflate`、`br`，解压预览受 `TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES` 限制，前端也会对旧记录做 best-effort 兜底。管理查询默认不强制 flush，手动排查时可在流量明细接口追加 `flush=true`。
+HTTP / TCP 明细默认写入业务数据库；管理页会分页读取 HTTP 请求/响应和 TCP payload。`TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` 是总开关，默认关闭；每条 HTTP 路由 / TCP 映射仍需在管理页单独开启明细采集，新建通道默认关闭。启用后 HTTP 请求体和响应体会完整保存，不再按 64 KiB 截断；`TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES` 只限制搜索摘要。原始压缩 Body 保持原样入库，展示摘要会按 `Content-Encoding` 解压 `gzip`、`deflate`、`br`，解压受 `TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES` 限制。管理查询默认不强制 flush，手动排查时可在流量明细接口追加 `flush=true`。
 
-### 4.8 Elasticsearch 流量明细存储（可选）
+完整 Body 会提高内存、数据库和 Elasticsearch 占用，应同时设置明细保留期并按业务流量规划容量。
+媒体正文应使用上一节的 RustFS 媒体采集，不应依赖普通明细长期保存。
+
+### 4.9 Elasticsearch 流量明细存储（可选）
 
 配置 `TUNNEL_ELASTICSEARCH_URIS` 后，HTTP / TCP 明细会从业务数据库切换到 Elasticsearch，聚合流量和管理业务数据仍在 MySQL。
 

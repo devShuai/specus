@@ -138,6 +138,25 @@ tunnel:
     per-user-storage-quota-bytes: ${TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES:1073741824}
     per-user-monthly-download-quota-bytes: ${TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES:1073741824}
     expiration-scan-interval-ms: ${TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS:3600000}
+  media-capture:
+    # HTTP 路由媒体采集专用 RustFS（S3 兼容）存储。路由还需单独开启 mediaCaptureEnabled。
+    enabled: ${TUNNEL_MEDIA_CAPTURE_ENABLED:false}
+    endpoint: ${TUNNEL_MEDIA_CAPTURE_ENDPOINT:}
+    region: ${TUNNEL_MEDIA_CAPTURE_REGION:us-east-1}
+    bucket: ${TUNNEL_MEDIA_CAPTURE_BUCKET:}
+    access-key-id: ${TUNNEL_MEDIA_CAPTURE_ACCESS_KEY_ID:}
+    access-key-secret: ${TUNNEL_MEDIA_CAPTURE_ACCESS_KEY_SECRET:}
+    object-prefix: ${TUNNEL_MEDIA_CAPTURE_PREFIX:shuai-tunnel/http-media}
+    path-style: ${TUNNEL_MEDIA_CAPTURE_PATH_STYLE:true}
+    create-bucket-if-missing: ${TUNNEL_MEDIA_CAPTURE_CREATE_BUCKET_IF_MISSING:false}
+    part-size-bytes: ${TUNNEL_MEDIA_CAPTURE_PART_SIZE_BYTES:8388608}
+    max-inflight-parts: ${TUNNEL_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS:4}
+    upload-threads: ${TUNNEL_MEDIA_CAPTURE_UPLOAD_THREADS:4}
+    retention-seconds: ${TUNNEL_MEDIA_CAPTURE_RETENTION_SECONDS:86400}
+    live-window-seconds: ${TUNNEL_MEDIA_CAPTURE_LIVE_WINDOW_SECONDS:300}
+    manifest-max-bytes: ${TUNNEL_MEDIA_CAPTURE_MANIFEST_MAX_BYTES:16777216}
+    playback-ticket-ttl-seconds: ${TUNNEL_MEDIA_CAPTURE_PLAYBACK_TICKET_TTL_SECONDS:900}
+    cleanup-interval-ms: ${TUNNEL_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS:60000}
   public-transfer:
     # 免登录文件互传的滥用防护。presign-upload 无鉴权,按来源 IP 固定窗口限流,
     # 并对单房间(按 roomToken 哈希)的 PENDING 附件数设上限。cluster-enabled=true 时

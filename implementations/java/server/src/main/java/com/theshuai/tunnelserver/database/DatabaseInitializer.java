@@ -114,6 +114,8 @@ public class DatabaseInitializer {
                 "tunnel_client_session",
                 "tunnel_mapping",
                 "http_route_mapping",
+                "tunnel_http_media_capture",
+                "tunnel_http_media_reference",
                 "tunnel_connection_record",
                 "tunnel_connection_stat",
                 "tunnel_traffic_usage",

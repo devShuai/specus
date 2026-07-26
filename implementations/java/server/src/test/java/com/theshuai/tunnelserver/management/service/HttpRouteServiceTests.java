@@ -72,6 +72,7 @@ class HttpRouteServiceTests {
         assertThat(view.route()).isEqualTo("web");
         assertThat(view.targetBaseUrl()).isEqualTo("http://127.0.0.1:8080");
         assertThat(view.enabled()).isTrue();
+        assertThat(view.mediaCaptureEnabled()).isFalse();
         assertThat(view.createdAt()).isNotBlank();
         assertThat(view.updatedAt()).isNotBlank();
 
@@ -170,6 +171,33 @@ class HttpRouteServiceTests {
         List<HttpRouteView> only = httpRouteService.listRoutes(clientIdB);
         assertThat(only).hasSize(1);
         assertThat(only.get(0).route()).isEqualTo("api");
+    }
+
+    @Test
+    void createAndUpdateRoutePersistMediaCaptureFlag() {
+        HttpRouteView created = httpRouteService.createRoute(clientIdA,
+                new RouteMutation("media", "http://127.0.0.1:8080", true, false, true, false));
+
+        assertThat(created.mediaCaptureEnabled()).isTrue();
+
+        HttpRouteView updated = httpRouteService.updateRoute(created.id(),
+                new RouteMutation("media", "http://127.0.0.1:9090", true, false, false, false));
+
+        assertThat(updated.mediaCaptureEnabled()).isFalse();
+    }
+
+    @Test
+    void partialUpdatePreservesEnabledAndCaptureFlags() {
+        HttpRouteView created = httpRouteService.createRoute(clientIdA,
+                new RouteMutation("media", "http://127.0.0.1:8080", false, true, true, true));
+
+        HttpRouteView updated = httpRouteService.updateRoute(created.id(),
+                new RouteMutation("media", "http://127.0.0.1:8080", null));
+
+        assertThat(updated.enabled()).isFalse();
+        assertThat(updated.detailCaptureEnabled()).isTrue();
+        assertThat(updated.mediaCaptureEnabled()).isTrue();
+        assertThat(updated.pathRewriteEnabled()).isTrue();
     }
 
     @Test

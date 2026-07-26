@@ -58,8 +58,8 @@ class TrafficInspectionServiceTests {
                 10,
                 1.0
         );
-        String requestBody = "0123456789abcdefghijklmnopqrstuvwxyz";
-        String responseBody = "response-body-with-more-than-eight-bytes";
+        String requestBody = "0123456789abcdefghijklmnopqrstuvwxyz".repeat(4096);
+        String responseBody = "response-body-with-more-than-eight-bytes".repeat(4096);
 
         service.recordHttpExchange(
                 "Demo",
@@ -87,9 +87,11 @@ class TrafficInspectionServiceTests {
         HttpTrafficExchange exchange = saved.get(0);
         assertThat(exchange.getRequestBodyData()).containsExactly(requestBody.getBytes(StandardCharsets.UTF_8));
         assertThat(exchange.getRequestPreviewText()).isEqualTo("01234567");
+        assertThat(exchange.getRequestBytes()).isGreaterThan(64 * 1024);
         assertThat(exchange.isRequestTruncated()).isFalse();
         assertThat(exchange.getResponseBodyData()).containsExactly(responseBody.getBytes(StandardCharsets.UTF_8));
         assertThat(exchange.getResponsePreviewText()).isEqualTo("response");
+        assertThat(exchange.getResponseBytes()).isGreaterThan(64 * 1024);
         assertThat(exchange.isResponseTruncated()).isFalse();
     }
 
@@ -271,6 +273,67 @@ class TrafficInspectionServiceTests {
         assertThat(exchange.getResponseBodyData()).containsExactly(pngBytes);
         assertThat(exchange.getResponsePreviewText()).isEmpty();
         assertThat(exchange.isResponseTruncated()).isFalse();
+    }
+
+    @Test
+    void externalizedMediaKeepsActualSizeWithoutDuplicatingBody() {
+        ClientAccountService clientAccountService = mock(ClientAccountService.class);
+        TunnelMappingRepository tunnelMappingRepository = mock(TunnelMappingRepository.class);
+        HttpRouteMappingRepository httpRouteMappingRepository = mock(HttpRouteMappingRepository.class);
+        HttpTrafficExchangeStore httpTrafficExchangeStore = mock(HttpTrafficExchangeStore.class);
+        TcpTrafficFrameStore tcpTrafficFrameStore = mock(TcpTrafficFrameStore.class);
+
+        ClientAccount account = new ClientAccount();
+        account.setId(7L);
+        account.setTenantId("tenant-a");
+        account.setClientName("Demo");
+        when(clientAccountService.findClientByName("Demo")).thenReturn(Optional.of(account));
+        when(httpRouteMappingRepository.findByTenantIdAndClientIdAndRoute(eq("tenant-a"), eq(7L), eq("media")))
+                .thenReturn(Optional.of(httpRouteMapping()));
+
+        TrafficInspectionService service = new TrafficInspectionService(
+                clientAccountService,
+                tunnelMappingRepository,
+                httpRouteMappingRepository,
+                httpTrafficExchangeStore,
+                tcpTrafficFrameStore,
+                true,
+                8,
+                8192,
+                1048576,
+                10,
+                10,
+                1.0
+        );
+
+        service.recordHttpExchange(
+                "Demo",
+                "media",
+                "GET",
+                "/movie.mp4",
+                null,
+                List.of(),
+                new byte[0],
+                0,
+                200,
+                List.of("Content-Type: video/mp4"),
+                new byte[0],
+                32L * 1024 * 1024,
+                System.currentTimeMillis(),
+                "127.0.0.1:60000",
+                null
+        );
+        service.flush();
+
+        @SuppressWarnings({"rawtypes", "unchecked"})
+        ArgumentCaptor<List<HttpTrafficExchange>> captor = ArgumentCaptor.forClass((Class) List.class);
+        verify(httpTrafficExchangeStore).saveAll(captor.capture());
+        HttpTrafficExchange exchange = captor.getValue().get(0);
+
+        assertThat(exchange.getResponseBytes()).isEqualTo(32L * 1024 * 1024);
+        assertThat(exchange.getResponseBodyType()).isEqualTo("video");
+        assertThat(exchange.getResponseBodyData()).isEmpty();
+        assertThat(exchange.getResponsePreviewHex()).isEmpty();
     }
 
     @Test

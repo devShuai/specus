@@ -16,6 +16,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * HTTP 路由（{@link HttpRouteMapping}）的 CRUD 服务。每次 mutation 之后都调用
@@ -109,6 +110,7 @@ public class HttpRouteService {
         row.setTargetBaseUrl(targetBaseUrl);
         row.setEnabled(request.enabled() == null || request.enabled());
         row.setDetailCaptureEnabled(Boolean.TRUE.equals(request.detailCaptureEnabled()));
+        row.setMediaCaptureEnabled(Boolean.TRUE.equals(request.mediaCaptureEnabled()));
         row.setPathRewriteEnabled(Boolean.TRUE.equals(request.pathRewriteEnabled()));
         row.setCreatedAt(now);
         row.setUpdatedAt(now);
@@ -140,6 +142,9 @@ public class HttpRouteService {
     private HttpRouteView updateRoute(TenantContext tenant, HttpRouteMapping row, RouteMutation request) {
         String route = requireRoute(request.route());
         String targetBaseUrl = requireTargetBaseUrl(request.targetBaseUrl());
+        boolean dataPlaneChanged = !Objects.equals(route, row.getRoute())
+                || !Objects.equals(targetBaseUrl, row.getTargetBaseUrl())
+                || (request.enabled() != null && request.enabled() != row.isEnabled());
 
         if (!route.equals(row.getRoute())) {
             httpRouteMappingRepository.findByTenantIdAndClientIdAndRoute(tenant.tenantId(), row.getClientId(), route).ifPresent(existing -> {
@@ -151,9 +156,14 @@ public class HttpRouteService {
 
         row.setRoute(route);
         row.setTargetBaseUrl(targetBaseUrl);
-        row.setEnabled(request.enabled() == null || request.enabled());
+        if (request.enabled() != null) {
+            row.setEnabled(request.enabled());
+        }
         if (request.detailCaptureEnabled() != null) {
             row.setDetailCaptureEnabled(request.detailCaptureEnabled());
+        }
+        if (request.mediaCaptureEnabled() != null) {
+            row.setMediaCaptureEnabled(request.mediaCaptureEnabled());
         }
         if (request.pathRewriteEnabled() != null) {
             row.setPathRewriteEnabled(request.pathRewriteEnabled());
@@ -161,9 +171,13 @@ public class HttpRouteService {
         row.setUpdatedAt(Instant.now().toString());
         HttpRouteMapping saved = httpRouteMappingRepository.saveAndFlush(row);
 
-        ClientAccount account = clientAccountRepository.findByIdAndTenantId(saved.getClientId(), tenant.tenantId()).orElse(null);
-        if (account != null) {
-            natControlService.pushSnapshotIfOnline(account);
+        if (dataPlaneChanged) {
+            ClientAccount account = clientAccountRepository
+                    .findByIdAndTenantId(saved.getClientId(), tenant.tenantId())
+                    .orElse(null);
+            if (account != null) {
+                natControlService.pushSnapshotIfOnline(account);
+            }
         }
         return toView(saved);
     }
@@ -281,6 +295,7 @@ public class HttpRouteService {
                 row.getTargetBaseUrl(),
                 row.isEnabled(),
                 Boolean.TRUE.equals(row.getDetailCaptureEnabled()),
+                Boolean.TRUE.equals(row.getMediaCaptureEnabled()),
                 Boolean.TRUE.equals(row.getPathRewriteEnabled()),
                 row.getCreatedAt(),
                 row.getUpdatedAt()
@@ -292,10 +307,11 @@ public class HttpRouteService {
             String targetBaseUrl,
             Boolean enabled,
             Boolean detailCaptureEnabled,
+            Boolean mediaCaptureEnabled,
             Boolean pathRewriteEnabled
     ) {
         public RouteMutation(String route, String targetBaseUrl, Boolean enabled) {
-            this(route, targetBaseUrl, enabled, false, false);
+            this(route, targetBaseUrl, enabled, null, null, null);
         }
     }
 }

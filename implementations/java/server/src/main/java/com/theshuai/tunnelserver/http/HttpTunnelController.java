@@ -6,6 +6,8 @@ import com.theshuai.tunnelserver.management.model.ClientAccount;
 import com.theshuai.tunnelserver.management.model.HttpRouteMapping;
 import com.theshuai.tunnelserver.management.repository.HttpRouteMappingRepository;
 import com.theshuai.tunnelserver.management.service.ClientAccountService;
+import com.theshuai.tunnelserver.management.service.HttpMediaCaptureService;
+import com.theshuai.tunnelserver.management.service.HttpMediaCaptureService.CaptureSession;
 import com.theshuai.tunnelserver.management.service.TrafficInspectionService;
 import com.theshuai.tunnelserver.management.service.TrafficUsageService;
 import com.theshuai.tunnelserver.session.SessionUtil;
@@ -49,6 +51,7 @@ public class HttpTunnelController {
 
     private final TrafficUsageService trafficUsageService;
     private final TrafficInspectionService trafficInspectionService;
+    private final HttpMediaCaptureService mediaCaptureService;
     private final ResponseRewriter responseRewriter;
     private final ClientAccountService clientAccountService;
     private final HttpRouteMappingRepository httpRouteMappingRepository;
@@ -59,6 +62,7 @@ public class HttpTunnelController {
 
     public HttpTunnelController(TrafficUsageService trafficUsageService,
                                 TrafficInspectionService trafficInspectionService,
+                                HttpMediaCaptureService mediaCaptureService,
                                 ResponseRewriter responseRewriter,
                                 ClientAccountService clientAccountService,
                                 HttpRouteMappingRepository httpRouteMappingRepository,
@@ -67,6 +71,7 @@ public class HttpTunnelController {
                                 @Value("${tunnel.http.route-cache-ttl-ms:2000}") long routeCacheTtlMillis) {
         this.trafficUsageService = trafficUsageService;
         this.trafficInspectionService = trafficInspectionService;
+        this.mediaCaptureService = mediaCaptureService;
         this.responseRewriter = responseRewriter;
         this.clientAccountService = clientAccountService;
         this.httpRouteMappingRepository = httpRouteMappingRepository;
@@ -83,8 +88,9 @@ public class HttpTunnelController {
         long startedAt = System.currentTimeMillis();
         String relativePath = relativePath(request);
         List<String> forwardedHeaders = requestHeaders(request);
-        BoundedCapture requestCapture = new BoundedCapture(64 * 1024);
-        BoundedCapture responseCapture = new BoundedCapture(64 * 1024);
+        boolean detailCaptureEnabled = trafficInspectionService.shouldCaptureHttpExchange(clientName, route);
+        FullCapture requestCapture = new FullCapture(detailCaptureEnabled);
+        FullCapture responseCapture = new FullCapture(detailCaptureEnabled);
         long requestBytes = 0;
         long responseBytes = 0;
         int statusCode = 502;
@@ -92,6 +98,8 @@ public class HttpTunnelController {
         String failure = null;
         NatServerHandler natHandler = null;
         HttpStreamExchange exchange = null;
+        CaptureSession mediaCapture = CaptureSession.noop();
+        boolean responseBodyExternalized = false;
         boolean opened = false;
         try {
             Channel control = SessionUtil.getDataChannel(clientName);
@@ -137,6 +145,14 @@ public class HttpTunnelController {
             HttpStreamExchange.ResponseHead head = exchange.awaitResponseHead(timeoutMillis);
             statusCode = head.statusCode();
             responseHeaders = head.headers();
+            mediaCapture = mediaCaptureService.open(
+                    clientName,
+                    route,
+                    request.getMethod(),
+                    sourceUrl(relativePath, request.getQueryString()),
+                    statusCode,
+                    responseHeaders);
+            responseBodyExternalized = mediaCapture.active();
             response.setStatus(statusCode);
             HttpStreamExchange finalExchange = exchange;
             response.setTrailerFields(() -> trailerMap(finalExchange.trailers()));
@@ -158,10 +174,10 @@ public class HttpTunnelController {
                 if (event instanceof HttpStreamExchange.Data data) {
                     byte[] bytes = data.bytes();
                     responseBytes += bytes.length;
-                    if (responseBytes > 64L * 1024L * 1024L) {
-                        throw new HttpForwardFailure(502, "HTTP 响应体超过限制");
+                    if (!responseBodyExternalized) {
+                        responseCapture.append(bytes);
                     }
-                    responseCapture.append(bytes);
+                    mediaCapture.append(bytes);
                     if (!headRequest) {
                         if (rewriteBuffer != null
                                 && rewriteBuffer.size() + bytes.length <= responseRewriter.maxBodyBytes()) {
@@ -184,6 +200,7 @@ public class HttpTunnelController {
                     break;
                 }
             }
+            mediaCapture.complete();
             if (rewriteBuffer != null && !headRequest) {
                 byte[] original = rewriteBuffer.toByteArray();
                 Optional<byte[]> rewritten = responseRewriter.rewrite(original, clientName, route, responseHeaders);
@@ -202,21 +219,33 @@ public class HttpTunnelController {
                     System.currentTimeMillis() - startedAt);
         } catch (Exception error) {
             Throwable cause = unwrap(error);
-            int errorStatus = cause instanceof HttpForwardFailure typed ? typed.statusCode :
-                    cause instanceof TimeoutException ? 504 : 502;
-            failure = cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
-            statusCode = errorStatus;
-            responseHeaders = plainErrorHeaders();
-            responseCapture.append(failure.getBytes(StandardCharsets.UTF_8));
+            String errorMessage = cause.getMessage() == null
+                    ? cause.getClass().getSimpleName() : cause.getMessage();
+            boolean clientDisconnected = response.isCommitted() && isClientDisconnect(cause);
+            mediaCapture.fail(errorMessage);
             if (opened && natHandler != null && exchange != null) {
-                natHandler.cancelHttpStream(exchange.streamId(), failure);
+                natHandler.cancelHttpStream(exchange.streamId(), errorMessage);
             }
-            if (!response.isCommitted()) {
-                writeError(response, errorStatus, failure);
+            if (clientDisconnected) {
+                log.debug("[http-stream-v2][server-egress] playback request ended by client clientName={} method={} route={} receivedBytes={} elapsedMs={}",
+                        clientName, request.getMethod(), route, responseBytes,
+                        System.currentTimeMillis() - startedAt);
+            } else {
+                int errorStatus = cause instanceof HttpForwardFailure typed ? typed.statusCode :
+                        cause instanceof TimeoutException ? 504 : 502;
+                failure = errorMessage;
+                statusCode = errorStatus;
+                responseHeaders = plainErrorHeaders();
+                if (!responseBodyExternalized) {
+                    responseCapture.append(failure.getBytes(StandardCharsets.UTF_8));
+                }
+                if (!response.isCommitted()) {
+                    writeError(response, errorStatus, failure);
+                }
+                log.warn("[http-stream-v2][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
+                        clientName, request.getMethod(), route, errorStatus, failure,
+                        System.currentTimeMillis() - startedAt);
             }
-            log.warn("[http-stream-v2][server-egress] clientName={} method={} route={} status={} error={} elapsedMs={}",
-                    clientName, request.getMethod(), route, errorStatus, failure,
-                    System.currentTimeMillis() - startedAt);
         } finally {
             if (natHandler != null && exchange != null) {
                 natHandler.unregisterHttpStream(exchange.streamId());
@@ -224,8 +253,8 @@ public class HttpTunnelController {
             trafficUsageService.recordHttpUpload(clientName, route, requestBytes);
             trafficUsageService.recordHttpDownload(clientName, route, responseBytes);
             trafficInspectionService.recordHttpExchange(clientName, route, request.getMethod(), relativePath,
-                    request.getQueryString(), forwardedHeaders, requestCapture.bytes(), statusCode,
-                    responseHeaders, responseCapture.bytes(), startedAt, remoteAddress(request), failure);
+                    request.getQueryString(), forwardedHeaders, requestCapture.bytes(), requestBytes, statusCode,
+                    responseHeaders, responseCapture.bytes(), responseBytes, startedAt, remoteAddress(request), failure);
         }
     }
 
@@ -234,6 +263,10 @@ public class HttpTunnelController {
         int clientSeparator = path.indexOf('/', "/http/".length());
         int routeSeparator = clientSeparator < 0 ? -1 : path.indexOf('/', clientSeparator + 1);
         return routeSeparator < 0 ? "/" : path.substring(routeSeparator);
+    }
+
+    private String sourceUrl(String relativePath, String rawQuery) {
+        return rawQuery == null || rawQuery.isBlank() ? relativePath : relativePath + "?" + rawQuery;
     }
 
     private List<String> requestHeaders(HttpServletRequest request) {
@@ -316,6 +349,23 @@ public class HttpTunnelController {
             current = current.getCause();
         }
         return current;
+    }
+
+    private static boolean isClientDisconnect(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            String className = current.getClass().getSimpleName().toLowerCase(Locale.ROOT);
+            String message = current.getMessage() == null
+                    ? "" : current.getMessage().toLowerCase(Locale.ROOT);
+            if (className.contains("clientabort")
+                    || message.contains("broken pipe")
+                    || message.contains("connection reset by peer")
+                    || message.contains("连接被对方重置")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     /**
@@ -403,24 +453,21 @@ public class HttpTunnelController {
     private record RewriteDecision(boolean enabled, long expiresAtMillis) {
     }
 
-    private static final class BoundedCapture {
-        private final int limit;
+    private static final class FullCapture {
         private final ByteArrayOutputStream output;
 
-        private BoundedCapture(int limit) {
-            this.limit = limit;
-            this.output = new ByteArrayOutputStream(Math.min(limit, 8192));
+        private FullCapture(boolean enabled) {
+            this.output = enabled ? new ByteArrayOutputStream(8192) : null;
         }
 
         private void append(byte[] bytes) {
-            int length = Math.min(bytes.length, limit - output.size());
-            if (length > 0) {
-                output.write(bytes, 0, length);
+            if (output != null && bytes != null && bytes.length > 0) {
+                output.write(bytes, 0, bytes.length);
             }
         }
 
         private byte[] bytes() {
-            return output.toByteArray();
+            return output == null ? new byte[0] : output.toByteArray();
         }
     }
 

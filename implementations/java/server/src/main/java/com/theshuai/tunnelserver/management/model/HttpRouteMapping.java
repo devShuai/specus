@@ -71,6 +71,13 @@ public class HttpRouteMapping {
     private Boolean detailCaptureEnabled = false;
 
     /**
+     * Whether media responses on this route are captured to the separately configured RustFS
+     * bucket. This is independent from ordinary HTTP detail capture.
+     */
+    @Column(name = "media_capture_enabled")
+    private Boolean mediaCaptureEnabled = false;
+
+    /**
      * 是否开启响应体路径改写。开启后，{@code HttpTunnelController} 在把上游响应回写浏览器之前，
      * 会对 {@code text/html} / {@code text/css} / {@code application/javascript} 等正文做正则改写：
      * 把绝对路径 {@code /foo} 改成 {@code /http/{clientName}/{route}/foo}，让内网应用里硬编码的

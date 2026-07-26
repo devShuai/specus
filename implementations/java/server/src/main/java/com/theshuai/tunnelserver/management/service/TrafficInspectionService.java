@@ -107,14 +107,47 @@ public class TrafficInspectionService {
                                    long startedAtMillis,
                                    String remoteAddress,
                                    String error) {
-        if (!captureEnabled || clientName == null || !shouldCaptureHttpDetail(clientName, route)
+        recordHttpExchange(
+                clientName,
+                route,
+                method,
+                relativePath,
+                rawQuery,
+                requestHeaders,
+                requestBody,
+                length(requestBody),
+                statusCode,
+                responseHeaders,
+                responseBody,
+                length(responseBody),
+                startedAtMillis,
+                remoteAddress,
+                error);
+    }
+
+    public void recordHttpExchange(String clientName,
+                                   String route,
+                                   String method,
+                                   String relativePath,
+                                   String rawQuery,
+                                   List<String> requestHeaders,
+                                   byte[] requestBody,
+                                   long requestBytes,
+                                   int statusCode,
+                                   List<String> responseHeaders,
+                                   byte[] responseBody,
+                                   long responseBytes,
+                                   long startedAtMillis,
+                                   String remoteAddress,
+                                   String error) {
+        if (!shouldCaptureHttpExchange(clientName, route)
                 || !acquireSlot(pendingHttpCount, droppedHttpCount)) {
             return;
         }
 
         String requestContentType = contentType(requestHeaders);
         String responseContentType = contentType(responseHeaders);
-        String responseBodyType = HttpBodyTypeClassifier.classify(responseContentType, length(responseBody));
+        String responseBodyType = HttpBodyTypeClassifier.classify(responseContentType, responseBytes);
         String requestContentEncoding = contentEncoding(requestHeaders);
         String responseContentEncoding = contentEncoding(responseHeaders);
         HttpBodyCapture requestCapture = captureHttpBody(requestBody, requestContentType, requestContentEncoding);
@@ -129,8 +162,8 @@ public class TrafficInspectionService {
                 error == null,
                 cap(error, 2048),
                 cap(remoteAddress, 255),
-                length(requestBody),
-                length(responseBody),
+                Math.max(0, requestBytes),
+                Math.max(0, responseBytes),
                 Math.max(0, System.currentTimeMillis() - startedAtMillis),
                 requestContentType,
                 responseContentType,
@@ -147,6 +180,14 @@ public class TrafficInspectionService {
                 responseCapture.truncated(),
                 Instant.now().toString()
         ));
+    }
+
+    /**
+     * Lets the HTTP forwarding hot path decide whether it must retain complete request and
+     * response bodies. Disabled routes return false before any unbounded body buffer is allocated.
+     */
+    public boolean shouldCaptureHttpExchange(String clientName, String route) {
+        return captureEnabled && clientName != null && shouldCaptureHttpDetail(clientName, route);
     }
 
     public void recordTcpFrame(String clientName,
