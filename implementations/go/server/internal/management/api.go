@@ -145,6 +145,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/traffic", a.requireAuth(a.handleListTraffic))
 	mux.HandleFunc("GET /api/admin/traffic/resources", a.requireAuth(a.handleListResourceTraffic))
 	mux.HandleFunc("GET /api/admin/traffic/http-exchanges", a.requireAuth(a.handleListHTTPExchanges))
+	mux.HandleFunc("GET /api/admin/traffic/http-exchanges/{id}", a.requireAuth(a.handleGetHTTPExchange))
 	mux.HandleFunc("GET /api/admin/traffic/tcp-frames", a.requireAuth(a.handleListTCPFrames))
 	mux.HandleFunc("GET /api/admin/traffic/tcp-frames/{id}", a.requireAuth(a.handleGetTCPFrame))
 	mux.HandleFunc("GET /api/admin/traffic/tcp-streams", a.requireAuth(a.handleGetTCPStream))
@@ -1716,7 +1717,7 @@ func (a *API) handleListHTTPExchanges(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]HTTPTrafficExchangeView, 0, len(items))
 	for _, item := range items {
-		views = append(views, httpTrafficExchangeView(item))
+		views = append(views, httpTrafficExchangeView(item, false))
 	}
 	size := normalizedTrafficSize(filter.Size)
 	page := filter.Page
@@ -1726,6 +1727,30 @@ func (a *API) handleListHTTPExchanges(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, TrafficDetailPage[HTTPTrafficExchangeView]{
 		Items: views, Total: total, Page: page, Size: size, TotalPages: totalPages(total, size),
 	})
+}
+
+func (a *API) handleGetHTTPExchange(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromContext(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "未授权")
+		return
+	}
+	id, err := pathInt(r, "id")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	visibleIDs, err := a.visibleClientIDs(r.Context(), principal)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	exchange, err := a.db.GetHTTPExchange(r.Context(), principal.TenantID, id, visibleIDs)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, httpTrafficExchangeView(*exchange, true))
 }
 
 func (a *API) handleListTCPFrames(w http.ResponseWriter, r *http.Request) {
@@ -2661,8 +2686,8 @@ func httpRouteView(r store.HTTPRouteMapping) HTTPRouteView {
 	}
 }
 
-func httpTrafficExchangeView(item store.HTTPTrafficExchange) HTTPTrafficExchangeView {
-	return HTTPTrafficExchangeView{
+func httpTrafficExchangeView(item store.HTTPTrafficExchange, includeDetail bool) HTTPTrafficExchangeView {
+	view := HTTPTrafficExchangeView{
 		ID:                  strconv.FormatInt(item.ID, 10),
 		ClientID:            item.ClientID,
 		ClientName:          item.ClientName,
@@ -2682,16 +2707,19 @@ func httpTrafficExchangeView(item store.HTTPTrafficExchange) HTTPTrafficExchange
 		RequestContentType:  item.RequestContentType,
 		ResponseContentType: item.ResponseContentType,
 		ResponseBodyType:    item.ResponseBodyType,
-		RequestHeaders:      item.RequestHeaders,
-		ResponseHeaders:     item.ResponseHeaders,
-		RequestPreviewHex:   item.RequestPreviewHex,
-		RequestPreviewText:  item.RequestPreviewText,
-		ResponsePreviewHex:  item.ResponsePreviewHex,
-		ResponsePreviewText: item.ResponsePreviewText,
 		RequestTruncated:    item.RequestTruncated,
 		ResponseTruncated:   item.ResponseTruncated,
 		CapturedAt:          item.CapturedAt.Format(time.RFC3339Nano),
 	}
+	if includeDetail {
+		view.RequestHeaders = item.RequestHeaders
+		view.ResponseHeaders = item.ResponseHeaders
+		view.RequestPreviewHex = item.RequestPreviewHex
+		view.RequestPreviewText = item.RequestPreviewText
+		view.ResponsePreviewHex = item.ResponsePreviewHex
+		view.ResponsePreviewText = item.ResponsePreviewText
+	}
+	return view
 }
 
 func tcpTrafficFrameView(item store.TCPTrafficFrame, includePayload bool) TCPTrafficFrameView {

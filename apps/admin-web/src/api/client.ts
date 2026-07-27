@@ -397,6 +397,8 @@ export const adminApi = {
     }
     return data;
   },
+  getHttpTrafficExchange: (id: number | string) =>
+    request<HttpTrafficExchange>(`/traffic/http-exchanges/${encodeURIComponent(String(id))}`),
   listHttpMediaCaptures: (page = 0, size = 50) =>
     request<HttpMediaCapturePage>(`/traffic/media-captures?page=${page}&size=${size}`),
   createHttpMediaPlaybackTicket: (id: number, backfillMissing = false) =>

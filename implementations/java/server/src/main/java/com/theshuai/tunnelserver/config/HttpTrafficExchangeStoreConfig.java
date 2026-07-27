@@ -9,6 +9,7 @@ import com.theshuai.tunnelserver.management.storage.JpaTcpTrafficFrameStore;
 import com.theshuai.tunnelserver.management.storage.SpringDataElasticsearchHttpTrafficExchangeStore;
 import com.theshuai.tunnelserver.management.storage.SpringDataElasticsearchTcpTrafficFrameStore;
 import com.theshuai.tunnelserver.management.storage.TcpTrafficFrameStore;
+import jakarta.persistence.EntityManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -24,7 +25,8 @@ public class HttpTrafficExchangeStoreConfig {
     public HttpTrafficExchangeStore httpTrafficExchangeStore(ElasticsearchProperties elasticsearchProperties,
                                                              ObjectProvider<ElasticsearchOperations> elasticsearchOperations,
                                                              ObjectProvider<ElasticsearchClient> elasticsearchClient,
-                                                             HttpTrafficExchangeRepository repository) {
+                                                             HttpTrafficExchangeRepository repository,
+                                                             EntityManager entityManager) {
         if (elasticsearchProperties.isConfigured()) {
             ElasticsearchOperations operations = elasticsearchOperations.getIfAvailable();
             if (operations == null) {
@@ -37,7 +39,7 @@ public class HttpTrafficExchangeStoreConfig {
                     elasticsearchProperties);
         }
         log.info("HTTP traffic exchange store: database");
-        return new JpaHttpTrafficExchangeStore(repository);
+        return new JpaHttpTrafficExchangeStore(repository, entityManager);
     }
 
     @Bean

@@ -529,7 +529,16 @@ public sealed class AdminApiTests : IAsyncLifetime
             JsonOptions);
         Assert.NotNull(summary);
         Assert.Equal(1, summary!.Total);
-        Assert.Equal("POST", Assert.Single(summary.Items).Method);
+        var summaryExchange = Assert.Single(summary.Items);
+        Assert.Equal("POST", summaryExchange.Method);
+        Assert.Null(summaryExchange.ResponseHeaders);
+        Assert.Null(summaryExchange.ResponsePreviewText);
+
+        var detail = await client.GetFromJsonAsync<HttpExchangeBody>(
+            $"/api/admin/traffic/http-exchanges/{summaryExchange.Id}", JsonOptions);
+        Assert.NotNull(detail);
+        Assert.Equal("Content-Type: application/json", detail!.ResponseHeaders);
+        Assert.Equal("{\"ok\":true}", detail.ResponsePreviewText);
 
         var method = await client.GetFromJsonAsync<HttpExchangePageBody>(
             "/api/admin/traffic/http-exchanges?field=method&q=POST&page=0&size=20",
@@ -596,7 +605,10 @@ public sealed class AdminApiTests : IAsyncLifetime
             "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=503&page=0&size=20&flush=true",
             JsonOptions);
         Assert.NotNull(offlineDetails);
-        var offlineRow = Assert.Single(offlineDetails!.Items);
+        var offlineSummary = Assert.Single(offlineDetails!.Items);
+        var offlineRow = await admin.GetFromJsonAsync<HttpExchangeBody>(
+            $"/api/admin/traffic/http-exchanges/{offlineSummary.Id}", JsonOptions);
+        Assert.NotNull(offlineRow);
         Assert.Equal("GET", offlineRow.Method);
         Assert.Equal(503, offlineRow.StatusCode);
         Assert.Contains("Content-Type:text/plain;charset=UTF-8", offlineRow.ResponseHeaders);
@@ -610,7 +622,10 @@ public sealed class AdminApiTests : IAsyncLifetime
             "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=413&page=0&size=20&flush=true",
             JsonOptions);
         Assert.NotNull(details);
-        var row = Assert.Single(details!.Items);
+        var summary = Assert.Single(details!.Items);
+        var row = await admin.GetFromJsonAsync<HttpExchangeBody>(
+            $"/api/admin/traffic/http-exchanges/{summary.Id}", JsonOptions);
+        Assert.NotNull(row);
         Assert.Equal("POST", row.Method);
         Assert.Equal(413, row.StatusCode);
         Assert.Contains("Content-Type:text/plain;charset=UTF-8", row.ResponseHeaders);
@@ -642,7 +657,10 @@ public sealed class AdminApiTests : IAsyncLifetime
                 "/api/admin/traffic/http-exchanges?route=oversize&field=status&q=502&page=0&size=20&flush=true",
                 JsonOptions);
             Assert.NotNull(writeFailedDetails);
-            var writeFailedRow = Assert.Single(writeFailedDetails!.Items);
+            var writeFailedSummary = Assert.Single(writeFailedDetails!.Items);
+            var writeFailedRow = await admin.GetFromJsonAsync<HttpExchangeBody>(
+                $"/api/admin/traffic/http-exchanges/{writeFailedSummary.Id}", JsonOptions);
+            Assert.NotNull(writeFailedRow);
             Assert.Equal("POST", writeFailedRow.Method);
             Assert.Equal(502, writeFailedRow.StatusCode);
             Assert.Contains("Content-Type:text/plain;charset=UTF-8", writeFailedRow.ResponseHeaders);
@@ -751,7 +769,10 @@ public sealed class AdminApiTests : IAsyncLifetime
                 "/api/admin/traffic/http-exchanges?field=responseHeaders&q=Content-Encoding&page=0&size=20&flush=true",
                 JsonOptions);
             Assert.NotNull(details);
-            var row = Assert.Single(details!.Items, item => item.Route == "rewrite-capture");
+            var summary = Assert.Single(details!.Items, item => item.Route == "rewrite-capture");
+            var row = await admin.GetFromJsonAsync<HttpExchangeBody>(
+                $"/api/admin/traffic/http-exchanges/{summary.Id}", JsonOptions);
+            Assert.NotNull(row);
             Assert.NotNull(row.ResponseHeaders);
             Assert.NotNull(row.ResponsePreviewText);
             Assert.Contains("Content-Encoding:gzip", row.ResponseHeaders);

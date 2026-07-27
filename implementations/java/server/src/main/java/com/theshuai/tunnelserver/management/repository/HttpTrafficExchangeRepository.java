@@ -6,9 +6,15 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface HttpTrafficExchangeRepository
         extends JpaRepository<HttpTrafficExchange, Long>, JpaSpecificationExecutor<HttpTrafficExchange> {
+    Optional<HttpTrafficExchange> findByTenantIdAndId(String tenantId, Long id);
+
+    Optional<HttpTrafficExchange> findByTenantIdAndIdAndClientIdIn(
+            String tenantId, Long id, List<Long> clientIds);
+
     List<HttpTrafficExchange> findByTenantIdOrderByIdDesc(String tenantId, Pageable pageable);
 
     List<HttpTrafficExchange> findByTenantIdAndClientIdOrderByIdDesc(

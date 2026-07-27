@@ -448,6 +448,18 @@ public static class AdminApiEndpoints
                     clientId, route, FirstText(responseBodyType, responseDataType), field, q,
                     page, size, flush ?? false, cancellationToken));
 
+        app.MapGet("/api/admin/traffic/http-exchanges/{id:long}",
+            async (long id, bool? flush, HttpContext context, IOptions<AuthOptions> authOptions,
+                ManagementQueryService service, CancellationToken cancellationToken) =>
+            {
+                var exchange = await service.GetHttpExchangeAsync(
+                        ManagementContext.From(context, authOptions.Value), id, flush ?? false, cancellationToken)
+                    .ConfigureAwait(false);
+                return exchange is null
+                    ? Results.NotFound(new { error = "HTTP exchange not found" })
+                    : Results.Ok(exchange);
+            });
+
         app.MapGet("/api/admin/traffic/tcp-frames",
             (long? clientId, int? listenPort, int? page, int? size, int? limit, bool? flush,
                 HttpContext context, IOptions<AuthOptions> authOptions, ManagementQueryService service,

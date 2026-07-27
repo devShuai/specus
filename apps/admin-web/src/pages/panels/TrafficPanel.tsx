@@ -106,6 +106,8 @@ export function TrafficPanel() {
   const [httpResponseType, setHttpResponseType] = useState<"" | HttpResponseBodyType>("");
   const [httpSearchVersion, setHttpSearchVersion] = useState(0);
   const [selectedHttpExchange, setSelectedHttpExchange] = useState<HttpTrafficExchange | null>(null);
+  const [httpExchangeDetailLoadingId, setHttpExchangeDetailLoadingId] =
+    useState<HttpTrafficExchange["id"] | null>(null);
   const [selectedTcpFrame, setSelectedTcpFrame] = useState<TcpTrafficFrame | null>(null);
   const [selectedTcpStream, setSelectedTcpStream] = useState<TcpTrafficStream | null>(null);
   const [tcpFrameDetailLoadingId, setTcpFrameDetailLoadingId] = useState<string | null>(null);
@@ -310,6 +312,18 @@ export function TrafficPanel() {
     setHttpResponseTypeDraft(type);
   }, []);
 
+  const openHttpExchangeDetails = useCallback(async (row: HttpTrafficExchange) => {
+    setHttpExchangeDetailLoadingId(row.id);
+    try {
+      const detail = await adminApi.getHttpTrafficExchange(row.id);
+      setSelectedHttpExchange(detail);
+    } catch (error) {
+      notifyError(error, "加载 HTTP 协议详情失败");
+    } finally {
+      setHttpExchangeDetailLoadingId(null);
+    }
+  }, []);
+
   const openTcpFrameDetails = useCallback(async (row: TcpTrafficFrame) => {
     setTcpFrameDetailLoadingId(row.id);
     try {
@@ -422,13 +436,14 @@ export function TrafficPanel() {
             activeSearchField={httpSearchField}
             activeSearch={httpSearch}
             activeResponseType={httpResponseType}
+            detailLoadingId={httpExchangeDetailLoadingId}
             onPageChange={changeHttpExchangePage}
             onSearchDraftChange={setHttpSearchDraft}
             onSearchFieldChange={changeHttpSearchField}
             onResponseTypeChange={changeHttpResponseType}
             onSearch={applyHttpSearch}
             onResetSearch={resetHttpSearch}
-            onOpenDetails={setSelectedHttpExchange}
+            onOpenDetails={openHttpExchangeDetails}
           />
         </div>
       )}
@@ -697,6 +712,7 @@ function HttpExchangeTable({
   activeSearchField,
   activeSearch,
   activeResponseType,
+  detailLoadingId,
   loading,
   onPageChange,
   onOpenDetails,
@@ -717,6 +733,7 @@ function HttpExchangeTable({
   activeSearchField: HttpTrafficSearchField;
   activeSearch: string;
   activeResponseType: "" | HttpResponseBodyType;
+  detailLoadingId: HttpTrafficExchange["id"] | null;
   loading: boolean;
   onPageChange: (page: number) => void;
   onOpenDetails: (row: HttpTrafficExchange) => void;
@@ -894,7 +911,12 @@ function HttpExchangeTable({
                     { label: "耗时", value: formatElapsedMs(row.elapsedMs) },
                   ]}
                   actions={
-                    <Button size="sm" variant="flat" onPress={() => onOpenDetails(row)}>
+                    <Button
+                      isLoading={detailLoadingId === row.id}
+                      size="sm"
+                      variant="flat"
+                      onPress={() => onOpenDetails(row)}
+                    >
                       协议详情
                     </Button>
                   }
@@ -998,7 +1020,12 @@ function HttpExchangeTable({
                 </TableCell>
                 <TableCell>{formatElapsedMs(row.elapsedMs)}</TableCell>
                 <TableCell>
-                  <Button size="sm" variant="flat" onPress={() => onOpenDetails(row)}>
+                  <Button
+                    isLoading={detailLoadingId === row.id}
+                    size="sm"
+                    variant="flat"
+                    onPress={() => onOpenDetails(row)}
+                  >
                     详情
                   </Button>
                 </TableCell>

@@ -172,7 +172,7 @@ export interface ResourceTrafficUsage {
 }
 
 export interface HttpTrafficExchange {
-  id: number;
+  id: number | string;
   clientId: number;
   clientName: string;
   route: string;
@@ -191,12 +191,12 @@ export interface HttpTrafficExchange {
   requestContentType: string | null;
   responseContentType: string | null;
   responseBodyType: HttpResponseBodyType | string | null;
-  requestHeaders: string;
-  responseHeaders: string;
-  requestPreviewHex: string;
-  requestPreviewText: string;
-  responsePreviewHex: string;
-  responsePreviewText: string;
+  requestHeaders: string | null;
+  responseHeaders: string | null;
+  requestPreviewHex: string | null;
+  requestPreviewText: string | null;
+  responsePreviewHex: string | null;
+  responsePreviewText: string | null;
   requestTruncated: boolean;
   responseTruncated: boolean;
   capturedAt: string;
@@ -538,8 +538,17 @@ export interface HttpMediaPlaybackTicket {
   mediaKind: HttpMediaKind | string;
   playUrl: string;
   manifestUrl: string;
+  totalBytes: number;
+  initialRangeStart: number | null;
+  initialRangeEnd: number | null;
+  cachedRanges: HttpMediaPlaybackByteRange[];
   backfillMissing: boolean;
   expiresAt: string;
+}
+
+export interface HttpMediaPlaybackByteRange {
+  start: number;
+  end: number;
 }
 
 export interface PeerMeshAddressFamilyStat {

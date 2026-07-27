@@ -376,14 +376,66 @@ public sealed class ManagementQueryService
         var rows = await query.OrderByDescending(e => e.Id)
             .Skip(normalizedPage * normalizedSize)
             .Take(normalizedSize)
+            .Select(e => new HttpTrafficExchange
+            {
+                Id = e.Id,
+                TenantId = e.TenantId,
+                ClientId = e.ClientId,
+                ClientName = e.ClientName,
+                Route = e.Route,
+                ResourceId = e.ResourceId,
+                ResourceName = e.ResourceName,
+                Method = e.Method,
+                RelativePath = e.RelativePath,
+                RawQuery = e.RawQuery,
+                StatusCode = e.StatusCode,
+                Success = e.Success,
+                Error = e.Error,
+                RemoteAddress = e.RemoteAddress,
+                RequestBytes = e.RequestBytes,
+                ResponseBytes = e.ResponseBytes,
+                ElapsedMs = e.ElapsedMs,
+                RequestContentType = e.RequestContentType,
+                ResponseContentType = e.ResponseContentType,
+                ResponseBodyType = e.ResponseBodyType,
+                RequestTruncated = e.RequestTruncated,
+                ResponseTruncated = e.ResponseTruncated,
+                CapturedAt = e.CapturedAt,
+            })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         return new TrafficDetailPage<HttpTrafficExchangeView>(
-            rows.Select(ToHttpTrafficExchangeView).ToList(),
+            rows.Select(exchange => ToHttpTrafficExchangeView(exchange, includeDetail: false)).ToList(),
             total,
             normalizedPage,
             normalizedSize,
             TotalPages(total, normalizedSize));
+    }
+
+    public async Task<HttpTrafficExchangeView?> GetHttpExchangeAsync(
+        ManagementContext context,
+        long id,
+        bool flush,
+        CancellationToken cancellationToken)
+    {
+        if (flush)
+        {
+            await _inspection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var visibleIds = await VisibleClientIdsAsync(context, cancellationToken).ConfigureAwait(false);
+        if (_elasticsearchTraffic.IsEnabled)
+        {
+            return await _elasticsearchTraffic.GetHttpExchangeAsync(
+                    context, visibleIds, id, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        var exchange = await _db.HttpTrafficExchanges.AsNoTracking()
+            .FirstOrDefaultAsync(e => e.TenantId == context.TenantId
+                                      && e.Id == id
+                                      && visibleIds.Contains(e.ClientId), cancellationToken)
+            .ConfigureAwait(false);
+        return exchange is null ? null : ToHttpTrafficExchangeView(exchange, includeDetail: true);
     }
 
     public async Task<TrafficDetailPage<TcpTrafficFrameView>> ListTcpFramesAsync(
@@ -659,7 +711,9 @@ public sealed class ManagementQueryService
         link.CreatedAt.ToString("O"),
         link.UpdatedAt.ToString("O"));
 
-    private static HttpTrafficExchangeView ToHttpTrafficExchangeView(HttpTrafficExchange exchange) => new(
+    private static HttpTrafficExchangeView ToHttpTrafficExchangeView(
+        HttpTrafficExchange exchange,
+        bool includeDetail) => new(
         exchange.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
         exchange.ClientId,
         exchange.ClientName,
@@ -679,12 +733,12 @@ public sealed class ManagementQueryService
         exchange.RequestContentType,
         exchange.ResponseContentType,
         NormalizeOrClassifyBodyType(exchange.ResponseBodyType, exchange.ResponseContentType, exchange.ResponseBytes),
-        exchange.RequestHeaders,
-        exchange.ResponseHeaders,
-        exchange.RequestPreviewHex,
-        exchange.RequestPreviewText,
-        exchange.ResponsePreviewHex,
-        exchange.ResponsePreviewText,
+        includeDetail ? exchange.RequestHeaders : null,
+        includeDetail ? exchange.ResponseHeaders : null,
+        includeDetail ? exchange.RequestPreviewHex : null,
+        includeDetail ? exchange.RequestPreviewText : null,
+        includeDetail ? exchange.ResponsePreviewHex : null,
+        includeDetail ? exchange.ResponsePreviewText : null,
         exchange.RequestTruncated,
         exchange.ResponseTruncated,
         exchange.CapturedAt.ToString("O"));

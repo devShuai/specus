@@ -213,6 +213,14 @@ func (s *elasticsearchTrafficStore) ListHTTPExchanges(ctx context.Context, filte
 		"from":  page * size,
 		"size":  size,
 		"sort":  []any{map[string]any{"id": map[string]any{"order": "desc"}}},
+		"_source": map[string]any{"excludes": []string{
+			"requestHeaders",
+			"responseHeaders",
+			"requestPreviewHex",
+			"requestPreviewText",
+			"responsePreviewHex",
+			"responsePreviewText",
+		}},
 	}
 	var response esSearchResponse[httpTrafficDocument]
 	if err := s.doJSON(ctx, http.MethodPost, "/"+url.PathEscape(s.httpIndex)+"/_search", query, &response); err != nil {
@@ -223,6 +231,40 @@ func (s *elasticsearchTrafficStore) ListHTTPExchanges(ctx context.Context, filte
 		items = append(items, hit.Source.toEntity())
 	}
 	return items, response.Hits.Total.Value, nil
+}
+
+func (s *elasticsearchTrafficStore) GetHTTPExchange(
+	ctx context.Context,
+	tenantID string,
+	id int64,
+	clientIDs []int64,
+) (*HTTPTrafficExchange, error) {
+	if len(clientIDs) == 0 {
+		return nil, ErrNotFound
+	}
+	if err := s.ensureHTTPIndex(ctx); err != nil {
+		return nil, err
+	}
+	filter := HTTPExchangeFilter{TenantID: tenantID, ClientIDs: clientIDs}
+	query := buildHTTPESQuery(filter)
+	queryBool := query["bool"].(map[string]any)
+	queryBool["filter"] = append(queryBool["filter"].([]any), esTerm("id", id))
+	request := map[string]any{"query": query, "size": 1}
+	var response esSearchResponse[httpTrafficDocument]
+	if err := s.doJSON(
+		ctx,
+		http.MethodPost,
+		"/"+url.PathEscape(s.httpIndex)+"/_search",
+		request,
+		&response,
+	); err != nil {
+		return nil, err
+	}
+	if len(response.Hits.Hits) == 0 {
+		return nil, ErrNotFound
+	}
+	item := response.Hits.Hits[0].Source.toEntity()
+	return &item, nil
 }
 
 func (s *elasticsearchTrafficStore) ListTCPFrames(ctx context.Context, filter TCPFrameFilter) ([]TCPTrafficFrame, int, error) {

@@ -493,8 +493,7 @@ func (db *DB) ListHTTPExchanges(ctx context.Context, filter HTTPExchangeFilter) 
 	query := db.rebind(`SELECT id, tenant_id, client_id, client_name, route, resource_id, resource_name,
 		method, relative_path, raw_query, status_code, success, error, remote_address, request_bytes,
 		response_bytes, elapsed_ms, request_content_type, response_content_type, response_body_type,
-		request_headers, response_headers, request_preview_hex, request_preview_text, response_preview_hex,
-		response_preview_text, request_truncated, response_truncated, captured_at
+		request_truncated, response_truncated, captured_at
 		FROM tunnel_http_traffic_exchange` + where + ` ORDER BY id DESC LIMIT ? OFFSET ?`)
 	rows, err := db.sql.QueryContext(ctx, query, listArgs...)
 	if err != nil {
@@ -503,13 +502,39 @@ func (db *DB) ListHTTPExchanges(ctx context.Context, filter HTTPExchangeFilter) 
 	defer rows.Close()
 	items := make([]HTTPTrafficExchange, 0)
 	for rows.Next() {
-		item, err := scanHTTPExchange(rows)
+		item, err := scanHTTPExchangeSummary(rows)
 		if err != nil {
 			return nil, 0, err
 		}
 		items = append(items, item)
 	}
 	return items, total, rows.Err()
+}
+
+func (db *DB) GetHTTPExchange(
+	ctx context.Context,
+	tenantID string,
+	id int64,
+	clientIDs []int64,
+) (*HTTPTrafficExchange, error) {
+	if db.detailStore != nil {
+		return db.detailStore.GetHTTPExchange(ctx, tenantID, id, clientIDs)
+	}
+	filter := HTTPExchangeFilter{TenantID: tenantID, ClientIDs: clientIDs, Page: 0, Size: 1}
+	where, args := httpExchangeWhere(filter)
+	where += ` AND id = ?`
+	args = append(args, id)
+	query := db.rebind(`SELECT id, tenant_id, client_id, client_name, route, resource_id, resource_name,
+		method, relative_path, raw_query, status_code, success, error, remote_address, request_bytes,
+		response_bytes, elapsed_ms, request_content_type, response_content_type, response_body_type,
+		request_headers, response_headers, request_preview_hex, request_preview_text, response_preview_hex,
+		response_preview_text, request_truncated, response_truncated, captured_at
+		FROM tunnel_http_traffic_exchange` + where + ` ORDER BY id DESC LIMIT 1`)
+	exchange, err := scanHTTPExchange(db.sql.QueryRowContext(ctx, query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return &exchange, err
 }
 
 func (db *DB) ListTCPFrames(ctx context.Context, filter TCPFrameFilter) ([]TCPTrafficFrame, int, error) {
@@ -673,6 +698,40 @@ func scanHTTPExchange(scanner rowScanner) (HTTPTrafficExchange, error) {
 	item.RequestContentType = nullStringPtr(requestCT)
 	item.ResponseContentType = nullStringPtr(responseCT)
 	item.ResponseBodyType = classifyOrNormalizeHTTPBody(item.ResponseBodyType, item.ResponseContentType, item.ResponseBytes)
+	return item, nil
+}
+
+func scanHTTPExchangeSummary(scanner rowScanner) (HTTPTrafficExchange, error) {
+	var (
+		item                                     HTTPTrafficExchange
+		resourceID                               sql.NullInt64
+		resourceName, errText, remote            sql.NullString
+		requestCT, responseCT                    sql.NullString
+		success, requestTruncated, responseTrunc databaseBoolean
+		capturedAt                               string
+	)
+	err := scanner.Scan(&item.ID, &item.TenantID, &item.ClientID, &item.ClientName, &item.Route,
+		&resourceID, &resourceName, &item.Method, &item.RelativePath, &item.RawQuery,
+		&item.StatusCode, &success, &errText, &remote, &item.RequestBytes, &item.ResponseBytes,
+		&item.ElapsedMs, &requestCT, &responseCT, &item.ResponseBodyType,
+		&requestTruncated, &responseTrunc, &capturedAt)
+	if err != nil {
+		return HTTPTrafficExchange{}, err
+	}
+	item.Success = bool(success)
+	item.RequestTruncated = bool(requestTruncated)
+	item.ResponseTruncated = bool(responseTrunc)
+	item.CapturedAt = parseTime(capturedAt)
+	if resourceID.Valid {
+		item.ResourceID = &resourceID.Int64
+	}
+	item.ResourceName = nullStringPtr(resourceName)
+	item.Error = nullStringPtr(errText)
+	item.RemoteAddress = nullStringPtr(remote)
+	item.RequestContentType = nullStringPtr(requestCT)
+	item.ResponseContentType = nullStringPtr(responseCT)
+	item.ResponseBodyType = classifyOrNormalizeHTTPBody(
+		item.ResponseBodyType, item.ResponseContentType, item.ResponseBytes)
 	return item, nil
 }
 

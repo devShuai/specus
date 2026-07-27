@@ -25,6 +25,8 @@ import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
 import org.springframework.data.elasticsearch.core.IndexOperations;
 import org.springframework.data.elasticsearch.core.SearchHit;
 import org.springframework.data.elasticsearch.core.SearchHits;
+import org.springframework.data.elasticsearch.core.query.FetchSourceFilter;
+import org.springframework.data.elasticsearch.core.query.SourceFilter;
 import org.springframework.util.unit.DataSize;
 
 import java.io.IOException;
@@ -32,6 +34,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -40,6 +43,16 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
     private static final int TRIM_BATCH_SIZE = 500;
     private static final int MAX_TRIM_BATCHES = 20;
     private static final long TRIM_INTERVAL_NANOS = Duration.ofMinutes(1).toNanos();
+    private static final String[] SUMMARY_SOURCE_EXCLUDES = {
+            "requestBodyData",
+            "responseBodyData",
+            "requestHeaders",
+            "responseHeaders",
+            "requestPreviewHex",
+            "requestPreviewText",
+            "responsePreviewHex",
+            "responsePreviewText"
+    };
 
     private final ElasticsearchOperations operations;
     private final ElasticsearchClient client;
@@ -86,14 +99,41 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
                 .withQuery(buildQuery(tenant, clientId, visibleClientIds, normalizeRoute(route),
                         HttpBodyTypeClassifier.normalize(responseBodyType), searchField, normalizeKeyword(keyword)))
                 .withPageable(pageable)
+                .withSourceFilter(summarySourceFilter())
                 .withSort(sort -> sort.field(sortField -> sortField.field("id").order(SortOrder.Desc)))
                 .build();
         SearchHits<HttpTrafficExchangeDocument> hits = operations.search(query, HttpTrafficExchangeDocument.class);
         List<HttpTrafficExchangeView> items = hits.getSearchHits().stream()
                 .map(SearchHit::getContent)
-                .map(SpringDataElasticsearchHttpTrafficExchangeStore::toView)
+                .map(document -> toView(document, false))
                 .toList();
         return new PageImpl<>(items, pageable, hits.getTotalHits());
+    }
+
+    @Override
+    public Optional<HttpTrafficExchangeView> findById(TenantContext tenant,
+                                                      long id,
+                                                      Set<Long> visibleClientIds) {
+        if (visibleClientIds != null && visibleClientIds.isEmpty()) {
+            return Optional.empty();
+        }
+        ensureIndex();
+        BoolQuery.Builder bool = new BoolQuery.Builder()
+                .filter(term("tenantId", tenant.tenantId()))
+                .filter(term("id", id));
+        if (visibleClientIds != null) {
+            bool.filter(terms("clientId", visibleClientIds));
+        }
+        NativeQuery query = NativeQuery.builder()
+                .withQuery(bool.build()._toQuery())
+                .withPageable(PageRequest.of(0, 1))
+                .build();
+        SearchHits<HttpTrafficExchangeDocument> hits = operations.search(
+                query, HttpTrafficExchangeDocument.class);
+        return hits.getSearchHits().stream()
+                .findFirst()
+                .map(SearchHit::getContent)
+                .map(document -> toView(document, true));
     }
 
     @Override
@@ -320,7 +360,11 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
         return document;
     }
 
-    private static HttpTrafficExchangeView toView(HttpTrafficExchangeDocument document) {
+    static SourceFilter summarySourceFilter() {
+        return FetchSourceFilter.of(builder -> builder.withExcludes(SUMMARY_SOURCE_EXCLUDES));
+    }
+
+    static HttpTrafficExchangeView toView(HttpTrafficExchangeDocument document, boolean includeBody) {
         return new HttpTrafficExchangeView(
                 document.getExchangeId(),
                 document.getClientId(),
@@ -342,14 +386,18 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
                 document.getResponseContentType(),
                 HttpBodyTypeClassifier.normalizeOrClassify(
                         document.getResponseBodyType(), document.getResponseContentType(), document.getResponseBytes()),
-                document.getRequestHeaders(),
-                document.getResponseHeaders(),
-                document.getRequestPreviewHex(),
-                HttpBodyDataCodec.toDisplayText(document.getRequestBodyData(),
-                        document.getRequestContentType(), document.getRequestHeaders(), document.getRequestPreviewText()),
-                document.getResponsePreviewHex(),
-                HttpBodyDataCodec.toDisplayText(document.getResponseBodyData(),
-                        document.getResponseContentType(), document.getResponseHeaders(), document.getResponsePreviewText()),
+                includeBody ? document.getRequestHeaders() : null,
+                includeBody ? document.getResponseHeaders() : null,
+                includeBody ? document.getRequestPreviewHex() : null,
+                includeBody
+                        ? HttpBodyDataCodec.toDisplayText(document.getRequestBodyData(),
+                                document.getRequestContentType(), document.getRequestHeaders(), document.getRequestPreviewText())
+                        : null,
+                includeBody ? document.getResponsePreviewHex() : null,
+                includeBody
+                        ? HttpBodyDataCodec.toDisplayText(document.getResponseBodyData(),
+                                document.getResponseContentType(), document.getResponseHeaders(), document.getResponsePreviewText())
+                        : null,
                 document.isRequestTruncated(),
                 document.isResponseTruncated(),
                 document.getCapturedAt()

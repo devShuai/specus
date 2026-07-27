@@ -102,6 +102,14 @@ public class TrafficResource {
         return response;
     }
 
+    @GetMapping("/http-exchanges/{id}")
+    public HttpTrafficExchangeView getHttpExchange(@AuthenticationPrincipal Jwt jwt,
+                                                   @PathVariable long id) {
+        return trafficViewService.getHttpExchange(contextResolver.resolve(jwt), id)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "HTTP exchange not found"));
+    }
+
     @GetMapping("/tcp-frames")
     public Map<String, Object> listTcpFrames(@AuthenticationPrincipal Jwt jwt,
                                              @RequestParam(required = false) Long clientId,

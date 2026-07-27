@@ -120,6 +120,22 @@ func TestListHTTPExchangesSearchMatchesJavaFieldSemantics(t *testing.T) {
 	assertSinglePOST("status exact", HTTPExchangeFilter{TenantID: "default", Field: "status", Query: "201", Size: 20})
 	assertSinglePOST("response data type alias", HTTPExchangeFilter{TenantID: "default", Field: "responseDataType", Query: "json", Size: 20})
 
+	postItems, _, err := db.ListHTTPExchanges(ctx, HTTPExchangeFilter{
+		TenantID: "default", Field: "method", Query: "POST", Size: 20,
+	})
+	if err != nil {
+		t.Fatalf("list exchange before detail lookup: %v", err)
+	}
+	postDetail, err := db.GetHTTPExchange(ctx, "default", postItems[0].ID, []int64{1})
+	if err != nil {
+		t.Fatalf("get exchange detail: %v", err)
+	}
+	if postDetail.ResponseHeaders != "Content-Type: application/json" ||
+		postDetail.ResponsePreviewText != `{"ok":true}` {
+		t.Fatalf("unexpected exchange detail headers=%q body=%q",
+			postDetail.ResponseHeaders, postDetail.ResponsePreviewText)
+	}
+
 	imageItems, imageTotal, err := db.ListHTTPExchanges(ctx, HTTPExchangeFilter{
 		TenantID: "default", Route: "legacy-image", ResponseBodyType: "image", Size: 20,
 	})
@@ -233,8 +249,15 @@ func TestRecordHTTPExchangeQueuesAndFlushesLikeJava(t *testing.T) {
 	if got := items[0].ResponseBodyType; got != "json" {
 		t.Fatalf("response body type = %q, want json", got)
 	}
-	if got := items[0].ResponsePreviewText; got != `{"ok":true}` {
-		t.Fatalf("response preview = %q", got)
+	if got := items[0].ResponsePreviewText; got != "" {
+		t.Fatalf("summary response preview = %q, want empty", got)
+	}
+	detail, err := db.GetHTTPExchange(ctx, "default", items[0].ID, nil)
+	if err != nil {
+		t.Fatalf("get flushed exchange detail: %v", err)
+	}
+	if got := detail.ResponsePreviewText; got != `{"ok":true}` {
+		t.Fatalf("detail response preview = %q", got)
 	}
 }
 

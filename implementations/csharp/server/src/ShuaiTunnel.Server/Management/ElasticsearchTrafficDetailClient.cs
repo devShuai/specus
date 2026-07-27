@@ -88,17 +88,61 @@ public sealed class ElasticsearchTrafficDetailClient
             ["from"] = page * size,
             ["size"] = size,
             ["sort"] = new object[] { new Dictionary<string, object?> { ["id"] = new { order = "desc" } } },
+            ["_source"] = new
+            {
+                excludes = new[]
+                {
+                    "requestHeaders",
+                    "responseHeaders",
+                    "requestPreviewHex",
+                    "requestPreviewText",
+                    "responsePreviewHex",
+                    "responsePreviewText",
+                },
+            },
         };
         var response = await RequestJsonAsync<EsSearchResponse<HttpDocument>>(
                 HttpMethod.Post, $"/{Escape(_options.HttpIndex)}/_search", query, cancellationToken)
             .ConfigureAwait(false);
-        var items = response.Hits.Hits.Select(hit => hit.Source.ToView()).ToList();
+        var items = response.Hits.Hits.Select(hit => hit.Source.ToView(includeDetail: false)).ToList();
         return new TrafficDetailPage<HttpTrafficExchangeView>(
             items,
             response.Hits.Total.Value,
             page,
             size,
             TotalPages(response.Hits.Total.Value, size));
+    }
+
+    public async Task<HttpTrafficExchangeView?> GetHttpExchangeAsync(
+        ManagementContext context,
+        IReadOnlyList<long> visibleClientIds,
+        long id,
+        CancellationToken cancellationToken)
+    {
+        if (visibleClientIds.Count == 0)
+        {
+            return null;
+        }
+        await EnsureHttpIndexAsync(cancellationToken).ConfigureAwait(false);
+        var query = BuildHttpQuery(
+            context,
+            visibleClientIds,
+            clientId: null,
+            route: null,
+            responseBodyType: null,
+            field: null,
+            q: null);
+        var filters = (List<object>)((Dictionary<string, object?>)query["bool"]!)["filter"]!;
+        filters.Add(Term("id", id));
+        var request = new Dictionary<string, object?>
+        {
+            ["query"] = query,
+            ["size"] = 1,
+        };
+        var response = await RequestJsonAsync<EsSearchResponse<HttpDocument>>(
+                HttpMethod.Post, $"/{Escape(_options.HttpIndex)}/_search", request, cancellationToken)
+            .ConfigureAwait(false);
+        return response.Hits.Hits.FirstOrDefault()?.Source.ToView(includeDetail: true);
     }
 
     public async Task<TrafficDetailPage<TcpTrafficFrameView>> ListTcpAsync(
@@ -698,7 +742,7 @@ public sealed class ElasticsearchTrafficDetailClient
             CapturedAt = exchange.CapturedAt.ToString("O"),
         };
 
-        public HttpTrafficExchangeView ToView() => new(
+        public HttpTrafficExchangeView ToView(bool includeDetail) => new(
             Id.ToString(CultureInfo.InvariantCulture),
             ClientId,
             ClientName,
@@ -718,12 +762,12 @@ public sealed class ElasticsearchTrafficDetailClient
             RequestContentType,
             ResponseContentType,
             NormalizeBodyType(ResponseBodyType, ResponseContentType, ResponseBytes),
-            RequestHeaders,
-            ResponseHeaders,
-            RequestPreviewHex,
-            RequestPreviewText,
-            ResponsePreviewHex,
-            ResponsePreviewText,
+            includeDetail ? RequestHeaders : null,
+            includeDetail ? ResponseHeaders : null,
+            includeDetail ? RequestPreviewHex : null,
+            includeDetail ? RequestPreviewText : null,
+            includeDetail ? ResponsePreviewHex : null,
+            includeDetail ? ResponsePreviewText : null,
             RequestTruncated,
             ResponseTruncated,
             CapturedAt);

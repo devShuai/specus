@@ -62,6 +62,7 @@ type trafficDetailBackend interface {
 	InsertHTTPExchange(ctx context.Context, e HTTPTrafficExchange) error
 	InsertTCPFrame(ctx context.Context, f TCPTrafficFrame) error
 	ListHTTPExchanges(ctx context.Context, filter HTTPExchangeFilter) ([]HTTPTrafficExchange, int, error)
+	GetHTTPExchange(ctx context.Context, tenantID string, id int64, clientIDs []int64) (*HTTPTrafficExchange, error)
 	ListTCPFrames(ctx context.Context, filter TCPFrameFilter) ([]TCPTrafficFrame, int, error)
 	GetTCPFrame(ctx context.Context, tenantID string, id int64, clientIDs []int64) (*TCPTrafficFrame, error)
 	ListTCPStream(ctx context.Context, tenantID, channelID string, clientIDs []int64, limit int) ([]TCPTrafficFrame, error)

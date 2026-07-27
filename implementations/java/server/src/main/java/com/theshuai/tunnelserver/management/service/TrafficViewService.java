@@ -170,6 +170,16 @@ public class TrafficViewService {
     }
 
     @Transactional(readOnly = true)
+    public Optional<HttpTrafficExchangeView> getHttpExchange(TenantContext tenant, long id) {
+        return httpTrafficExchangeStore.findById(tenant, id, null);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<HttpTrafficExchangeView> getHttpExchange(ManagementContext context, long id) {
+        return httpTrafficExchangeStore.findById(context.tenant(), id, visibleClientIds(context));
+    }
+
+    @Transactional(readOnly = true)
     public Page<TcpTrafficFrameView> listTcpFrames(TenantContext tenant,
                                                    Long clientId,
                                                    Integer listenPort,

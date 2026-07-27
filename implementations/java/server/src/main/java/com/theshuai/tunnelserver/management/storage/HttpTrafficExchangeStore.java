@@ -7,6 +7,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 public interface HttpTrafficExchangeStore {
@@ -20,6 +21,10 @@ public interface HttpTrafficExchangeStore {
                                          HttpTrafficSearchField field,
                                          String keyword,
                                          Pageable pageable);
+
+    Optional<HttpTrafficExchangeView> findById(TenantContext tenant,
+                                               long id,
+                                               Set<Long> visibleClientIds);
 
     String backend();
 }
