@@ -43,6 +43,17 @@ import type {
 import { notifyError } from "../../../components/toast";
 import { formatBytes, formatDateTime } from "../../../lib/format";
 import { MobileListCard, MobileListCardList } from "../../../components/MobileListCard";
+import {
+  estimateMediaTimeWindows,
+  type IndexedMediaTimeWindow,
+  type MediaTimeWindow,
+  snapMediaTimeToWindow,
+  windowStart,
+} from "./mediaPlaybackTimeline";
+import {
+  loadMp4PlaybackIndex,
+  supportsMp4Index,
+} from "./mp4PlaybackIndex";
 
 const PAGE_SIZE = 20;
 const PLAYER_CONTROL_HIDE_MS = 2_800;
@@ -330,6 +341,7 @@ function MediaPlayer({
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const playerRef = useRef<HTMLDivElement | null>(null);
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const initialOfflinePositionAppliedRef = useRef(false);
   const [error, setError] = useState("");
   const [paused, setPaused] = useState(true);
   const [waiting, setWaiting] = useState(true);
@@ -342,14 +354,126 @@ function MediaPlayer({
   const [controlsVisible, setControlsVisible] = useState(true);
   const [fullscreen, setFullscreen] = useState(false);
   const [pictureInPicture, setPictureInPicture] = useState(false);
+  const [offlineNotice, setOfflineNotice] = useState("");
+  const [indexedOfflineTimeWindows, setIndexedOfflineTimeWindows] = useState<
+    IndexedMediaTimeWindow[]
+  >([]);
+  const [offlineIndexState, setOfflineIndexState] = useState<
+    "idle" | "loading" | "ready" | "unavailable"
+  >("idle");
   const audioOnly = capture.contentType?.toLowerCase().startsWith("audio/") ?? false;
   const title = mediaDisplayTitle(capture.sourceUrl);
   const finiteDuration = Number.isFinite(duration) && duration > 0;
   const progressPercent = finiteDuration ? Math.min(100, (currentTime / duration) * 100) : 0;
   const bufferedPercent = finiteDuration ? Math.min(100, (bufferedEnd / duration) * 100) : 0;
+  const useOfflineBlocks = capture.mediaKind === "PROGRESSIVE"
+    && !capture.offlineReady
+    && !ticket.backfillMissing;
+  const offlineByteRanges = useMemo(() => {
+    if (!useOfflineBlocks) {
+      return [];
+    }
+    if (ticket.cachedRanges?.length) {
+      return ticket.cachedRanges;
+    }
+    const start = capture.contentRangeStart ?? 0;
+    const end = capture.contentRangeEnd
+      ?? (capture.capturedBytes > 0 ? start + capture.capturedBytes - 1 : start);
+    return capture.capturedBytes > 0 ? [{ start, end }] : [];
+  }, [
+    capture.capturedBytes,
+    capture.contentRangeEnd,
+    capture.contentRangeStart,
+    ticket.cachedRanges,
+    useOfflineBlocks,
+  ]);
+  const offlineTotalBytes = ticket.totalBytes || capture.totalBytes;
+  const estimatedOfflineTimeWindows = useMemo(
+    () => useOfflineBlocks
+      ? estimateMediaTimeWindows(
+          offlineByteRanges,
+          offlineTotalBytes,
+          duration,
+        )
+      : [],
+    [duration, offlineByteRanges, offlineTotalBytes, useOfflineBlocks],
+  );
+  const offlineTimeWindows = indexedOfflineTimeWindows;
+  const displayedOfflineTimeWindows = offlineTimeWindows.length > 0
+    ? offlineTimeWindows
+    : estimatedOfflineTimeWindows;
+  const selectedOfflineTimeWindow = useMemo(
+    () => {
+      if (!useOfflineBlocks || offlineTimeWindows.length === 0) {
+        return null;
+      }
+      const active = offlineTimeWindows.find((window) =>
+        currentTime >= window.startSeconds - 0.15
+          && currentTime <= window.endSeconds + 0.15);
+      if (active) {
+        return active;
+      }
+      const initialStart = ticket.initialRangeStart ?? capture.contentRangeStart ?? 0;
+      return offlineTimeWindows.find((window) =>
+        initialStart >= window.byteStart && initialStart <= window.byteEnd)
+        ?? offlineTimeWindows[0];
+    },
+    [
+      capture.contentRangeStart,
+      currentTime,
+      offlineTimeWindows,
+      ticket.initialRangeStart,
+      useOfflineBlocks,
+    ],
+  );
+  const offlineTimeWindowLabel = selectedOfflineTimeWindow
+    ? `当前块 ${formatMediaTime(selectedOfflineTimeWindow.startSeconds)}–${formatMediaTime(selectedOfflineTimeWindow.endSeconds)}`
+    : "";
   const pictureInPictureSupported = !audioOnly
     && typeof document !== "undefined"
     && document.pictureInPictureEnabled;
+
+  useEffect(() => {
+    setIndexedOfflineTimeWindows([]);
+    if (!useOfflineBlocks) {
+      setOfflineIndexState("idle");
+      return;
+    }
+    if (!supportsMp4Index(capture.contentType ?? null, capture.sourceUrl)) {
+      setOfflineIndexState("unavailable");
+      return;
+    }
+
+    const controller = new AbortController();
+    setOfflineIndexState("loading");
+    void loadMp4PlaybackIndex({
+      cachedRanges: offlineByteRanges,
+      playUrl: ticket.playUrl,
+      signal: controller.signal,
+    }).then((index) => {
+      if (controller.signal.aborted) {
+        return;
+      }
+      setIndexedOfflineTimeWindows(index.windows);
+      setOfflineIndexState("ready");
+      setOfflineNotice("");
+    }).catch((reason: unknown) => {
+      if (controller.signal.aborted) {
+        return;
+      }
+      setOfflineIndexState("unavailable");
+      setOfflineNotice(reason instanceof Error
+        ? `缓存定位失败：${reason.message}`
+        : "缓存定位失败");
+    });
+    return () => controller.abort();
+  }, [
+    capture.contentType,
+    capture.sourceUrl,
+    offlineByteRanges,
+    ticket.playUrl,
+    useOfflineBlocks,
+  ]);
 
   const clearControlsTimer = useCallback(() => {
     if (controlsTimerRef.current) {
@@ -385,6 +509,110 @@ function MediaPlayer({
     setPlaybackRate(element.playbackRate);
   }, []);
 
+  const locateOfflineBlock = useCallback(() => {
+    const element = mediaRef.current;
+    if (!element) {
+      return;
+    }
+    if (
+      useOfflineBlocks
+      && offlineTimeWindows.length > 0
+      && !initialOfflinePositionAppliedRef.current
+    ) {
+      const initialStart = ticket.initialRangeStart ?? capture.contentRangeStart ?? 0;
+      const targetWindow = offlineTimeWindows.find((window) =>
+        initialStart >= window.byteStart && initialStart <= window.byteEnd)
+        ?? offlineTimeWindows[0];
+      if (targetWindow && Number.isFinite(element.duration) && element.duration > 0) {
+        initialOfflinePositionAppliedRef.current = true;
+        element.currentTime = windowStart(targetWindow);
+      }
+    }
+    syncTimeline();
+  }, [
+    capture.contentRangeStart,
+    offlineTimeWindows,
+    syncTimeline,
+    ticket.initialRangeStart,
+    useOfflineBlocks,
+  ]);
+
+  useEffect(() => {
+    locateOfflineBlock();
+  }, [locateOfflineBlock]);
+
+  const seekTo = useCallback((requestedSeconds: number, direction = 0) => {
+    const element = mediaRef.current;
+    if (!element || !Number.isFinite(element.duration)) {
+      return;
+    }
+    const bounded = Math.max(0, Math.min(element.duration, requestedSeconds));
+    if (useOfflineBlocks) {
+      const seekableWindows = offlineTimeWindows.length > 0
+        ? offlineTimeWindows
+        : bufferedTimeWindows(element);
+      if (seekableWindows.length === 0) {
+        setOfflineNotice(offlineIndexState === "loading"
+          ? "正在定位可播放的缓存块"
+          : "当前位置尚未缓存");
+        return;
+      }
+      element.currentTime = snapMediaTimeToWindow(
+        bounded,
+        seekableWindows,
+        direction,
+      );
+    } else {
+      element.currentTime = bounded;
+    }
+    setOfflineNotice("");
+    syncTimeline();
+  }, [offlineIndexState, offlineTimeWindows, syncTimeline, useOfflineBlocks]);
+
+  const advanceOfflineBlock = useCallback(() => {
+    const element = mediaRef.current;
+    if (
+      !element
+      || !useOfflineBlocks
+      || capture.offlineReady
+      || offlineTimeWindows.length === 0
+    ) {
+      return false;
+    }
+    const current = element.currentTime;
+    const activeIndex = offlineTimeWindows.findIndex((window) =>
+      current >= window.startSeconds - 0.15
+        && current <= window.endSeconds + 0.15);
+    let nextIndex = -1;
+    if (activeIndex >= 0) {
+      const active = offlineTimeWindows[activeIndex];
+      const threshold = Math.min(
+        0.45,
+        Math.max(0.12, (active.endSeconds - active.startSeconds) * 0.04),
+      );
+      if (current < active.endSeconds - threshold) {
+        return false;
+      }
+      nextIndex = activeIndex + 1;
+    } else {
+      nextIndex = offlineTimeWindows.findIndex((window) =>
+        window.startSeconds > current);
+    }
+    if (nextIndex >= 0 && nextIndex < offlineTimeWindows.length) {
+      element.currentTime = windowStart(offlineTimeWindows[nextIndex]);
+      setOfflineNotice(`已跳到缓存块 ${nextIndex + 1}/${offlineTimeWindows.length}`);
+      setWaiting(true);
+      return true;
+    }
+    if (activeIndex === offlineTimeWindows.length - 1) {
+      element.pause();
+      setWaiting(false);
+      setOfflineNotice("已播放全部缓存块");
+      return true;
+    }
+    return false;
+  }, [capture.offlineReady, offlineTimeWindows, useOfflineBlocks]);
+
   const togglePlayback = useCallback(async () => {
     const element = mediaRef.current;
     if (!element) {
@@ -407,10 +635,9 @@ function MediaPlayer({
     if (!element || !Number.isFinite(element.duration)) {
       return;
     }
-    element.currentTime = Math.max(0, Math.min(element.duration, element.currentTime + seconds));
-    syncTimeline();
+    seekTo(element.currentTime + seconds, Math.sign(seconds));
     revealControls();
-  }, [revealControls, syncTimeline]);
+  }, [revealControls, seekTo]);
 
   const toggleMute = useCallback(() => {
     const element = mediaRef.current;
@@ -475,6 +702,8 @@ function MediaPlayer({
     setCurrentTime(0);
     setDuration(0);
     setBufferedEnd(0);
+    setOfflineNotice("");
+    initialOfflinePositionAppliedRef.current = false;
     let hls: Hls | null = null;
     let dash: dashjs.MediaPlayerClass | null = null;
 
@@ -606,16 +835,19 @@ function MediaPlayer({
           playsInline
           preload="metadata"
           onCanPlay={() => setWaiting(false)}
-          onDurationChange={syncTimeline}
+          onDurationChange={locateOfflineBlock}
           onEnded={() => {
             setPaused(true);
+            if (useOfflineBlocks && !capture.offlineReady) {
+              setOfflineNotice("已播放全部缓存块");
+            }
             revealControls();
           }}
           onError={() => {
             setWaiting(false);
             setError((current) => current || "媒体解码或网络请求失败");
           }}
-          onLoadedMetadata={syncTimeline}
+          onLoadedMetadata={locateOfflineBlock}
           onPause={() => setPaused(true)}
           onPlay={() => {
             setPaused(false);
@@ -624,9 +856,17 @@ function MediaPlayer({
           onPlaying={() => setWaiting(false)}
           onProgress={syncTimeline}
           onRateChange={syncTimeline}
-          onTimeUpdate={syncTimeline}
+          onTimeUpdate={() => {
+            advanceOfflineBlock();
+            syncTimeline();
+          }}
           onVolumeChange={syncTimeline}
-          onWaiting={() => setWaiting(true)}
+          onWaiting={() => {
+            if (!advanceOfflineBlock()) {
+              setWaiting(true);
+            }
+            syncTimeline();
+          }}
         />
       )}
       {audioOnly ? (
@@ -636,16 +876,19 @@ function MediaPlayer({
           }}
           preload="metadata"
           onCanPlay={() => setWaiting(false)}
-          onDurationChange={syncTimeline}
+          onDurationChange={locateOfflineBlock}
           onEnded={() => {
             setPaused(true);
+            if (useOfflineBlocks && !capture.offlineReady) {
+              setOfflineNotice("已播放全部缓存块");
+            }
             revealControls();
           }}
           onError={() => {
             setWaiting(false);
             setError((current) => current || "媒体解码或网络请求失败");
           }}
-          onLoadedMetadata={syncTimeline}
+          onLoadedMetadata={locateOfflineBlock}
           onPause={() => setPaused(true)}
           onPlay={() => {
             setPaused(false);
@@ -654,9 +897,17 @@ function MediaPlayer({
           onPlaying={() => setWaiting(false)}
           onProgress={syncTimeline}
           onRateChange={syncTimeline}
-          onTimeUpdate={syncTimeline}
+          onTimeUpdate={() => {
+            advanceOfflineBlock();
+            syncTimeline();
+          }}
           onVolumeChange={syncTimeline}
-          onWaiting={() => setWaiting(true)}
+          onWaiting={() => {
+            if (!advanceOfflineBlock()) {
+              setWaiting(true);
+            }
+            syncTimeline();
+          }}
         />
       ) : null}
 
@@ -670,7 +921,19 @@ function MediaPlayer({
             <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-white/55 sm:text-xs">
               <span className="truncate">{capture.clientName} · {capture.route}</span>
               <span aria-hidden="true">·</span>
-              <span className="shrink-0">{capture.offlineReady ? "完整缓存" : "缓存片段"}</span>
+              <span className="shrink-0">
+                {capture.offlineReady
+                  ? "完整缓存"
+                  : offlineByteRanges.length > 0
+                    ? `已缓存 ${offlineByteRanges.length} 段`
+                    : "缓存片段"}
+              </span>
+              {selectedOfflineTimeWindow ? (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="apple-tv-offline-range shrink-0">{offlineTimeWindowLabel}</span>
+                </>
+              ) : null}
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -714,9 +977,33 @@ function MediaPlayer({
             <span>{formatMediaTime(currentTime)}</span>
             <div className="apple-tv-seek">
               <span className="apple-tv-seek-buffered" style={{ width: `${bufferedPercent}%` }} />
+              {displayedOfflineTimeWindows.map((window, index) => {
+                const exact = "exact" in window && window.exact;
+                const selected = selectedOfflineTimeWindow != null
+                  && window.startPercent <= selectedOfflineTimeWindow.startPercent + 0.001
+                  && window.endPercent >= selectedOfflineTimeWindow.endPercent - 0.001;
+                const label = `缓存块 ${index + 1}/${displayedOfflineTimeWindows.length}，${
+                  exact ? "" : "位置估算 "
+                }${formatMediaTime(window.startSeconds)}–${formatMediaTime(window.endSeconds)}`;
+                return (
+                  <span
+                    key={`${window.startPercent}-${window.endPercent}`}
+                    className={`apple-tv-seek-window ${
+                      selected ? "is-selected" : ""
+                    } ${exact ? "" : "is-estimated"}`}
+                    style={{
+                      left: `${window.startPercent}%`,
+                      width: `${window.endPercent - window.startPercent}%`,
+                    }}
+                    title={label}
+                  />
+                );
+              })}
               <span className="apple-tv-seek-played" style={{ width: `${progressPercent}%` }} />
               <input
-                aria-label="播放进度"
+                aria-label={offlineByteRanges.length > 0
+                  ? `播放进度，共 ${offlineByteRanges.length} 个缓存块，${offlineTimeWindowLabel}`
+                  : "播放进度"}
                 disabled={!finiteDuration}
                 max={finiteDuration ? duration : 1}
                 min={0}
@@ -724,12 +1011,10 @@ function MediaPlayer({
                 type="range"
                 value={finiteDuration ? Math.min(currentTime, duration) : 0}
                 onChange={(event) => {
-                  const element = mediaRef.current;
-                  if (!element) {
-                    return;
-                  }
-                  element.currentTime = Number(event.currentTarget.value);
-                  syncTimeline();
+                  seekTo(
+                    Number(event.currentTarget.value),
+                    Number(event.currentTarget.value) >= currentTime ? 1 : -1,
+                  );
                 }}
               />
             </div>
@@ -816,6 +1101,7 @@ function MediaPlayer({
             </div>
           </div>
           <div className="apple-tv-ticket">
+            {offlineNotice ? `${offlineNotice} · ` : ""}
             播放授权至 {formatDateTime(ticket.expiresAt)}
           </div>
         </div>
@@ -857,6 +1143,25 @@ function PlayerIconButton({
       </button>
     </Tooltip>
   );
+}
+
+function bufferedTimeWindows(element: HTMLMediaElement): MediaTimeWindow[] {
+  const duration = element.duration;
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return [];
+  }
+  const windows: MediaTimeWindow[] = [];
+  for (let index = 0; index < element.buffered.length; index += 1) {
+    const startSeconds = element.buffered.start(index);
+    const endSeconds = element.buffered.end(index);
+    windows.push({
+      endPercent: (endSeconds / duration) * 100,
+      endSeconds,
+      startPercent: (startSeconds / duration) * 100,
+      startSeconds,
+    });
+  }
+  return windows;
 }
 
 function formatMediaTime(seconds: number): string {

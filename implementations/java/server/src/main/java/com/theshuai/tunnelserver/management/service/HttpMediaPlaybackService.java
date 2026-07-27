@@ -43,11 +43,10 @@ public class HttpMediaPlaybackService {
 
         long totalBytes = totalBytes(captures);
         boolean rangeRequested = rangeHeader != null && !rangeHeader.isBlank();
-        if (!rangeRequested && !evaluateCoverage(captures).playable()) {
-            throw new MediaRangeException(
-                    "媒体仅缓存部分区间，请使用 bytes Range 请求", totalBytes);
-        }
-        RequestedRange requested = parseRange(rangeHeader, totalBytes);
+        PlaybackAvailability coverage = evaluateCoverage(captures);
+        RequestedRange requested = !rangeRequested && !coverage.playable()
+                ? initialSparseRange(anchor, captures, totalBytes)
+                : parseRange(rangeHeader, totalBytes);
         long availableEnd = contiguousAvailableEnd(
                 captures, requested.start(), requested.end(), totalBytes);
         List<PlaybackSlice> slices = slices(
@@ -63,8 +62,20 @@ public class HttpMediaPlaybackService {
                 totalBytes,
                 requested.start(),
                 availableEnd,
-                rangeRequested,
+                rangeRequested || requested.start() > 0 || availableEnd < totalBytes - 1,
                 slices);
+    }
+
+    public PlaybackCacheLayout cacheLayout(HttpMediaCapture anchor) {
+        if (!HttpMediaCaptureService.STATE_COMPLETE.equals(anchor.getState())) {
+            throw new IllegalStateException("媒体采集尚未完成");
+        }
+        List<HttpMediaCapture> captures = usableCaptures(
+                captureService.completeResourceCaptures(anchor));
+        long totalBytes = totalBytes(captures);
+        return new PlaybackCacheLayout(
+                totalBytes,
+                mergeAvailableRanges(captures, totalBytes));
     }
 
     public PlaybackAvailability availability(HttpMediaCapture anchor) {
@@ -131,6 +142,33 @@ public class HttpMediaPlaybackService {
             cursor = availableEnd + 1;
         }
         return availableEnd;
+    }
+
+    private RequestedRange initialSparseRange(HttpMediaCapture anchor,
+                                              List<HttpMediaCapture> captures,
+                                              long totalBytes) {
+        if (totalBytes <= 0) {
+            throw new MediaRangeException("媒体总长度未知", totalBytes);
+        }
+        long anchorStart = normalizedStart(anchor);
+        long anchorEnd = normalizedEnd(anchor);
+        if (anchorStart >= 0 && anchorStart < totalBytes && anchorEnd >= anchorStart) {
+            boolean anchorAvailable = captures.stream().anyMatch(capture ->
+                    normalizedStart(capture) <= anchorStart
+                            && normalizedEnd(capture) >= anchorStart);
+            if (anchorAvailable) {
+                return new RequestedRange(
+                        anchorStart,
+                        Math.min(anchorEnd, totalBytes - 1));
+            }
+        }
+        List<PlaybackByteRange> availableRanges =
+                mergeAvailableRanges(captures, totalBytes);
+        if (availableRanges.isEmpty()) {
+            throw new MediaRangeException("媒体采集没有可回放的数据", totalBytes);
+        }
+        PlaybackByteRange first = availableRanges.getFirst();
+        return new RequestedRange(first.start(), first.end());
     }
 
     public void stream(PlaybackPlan plan, OutputStream output) throws IOException {
@@ -246,6 +284,40 @@ public class HttpMediaPlaybackService {
         return captures.stream().mapToLong(capture -> normalizedEnd(capture) + 1).max().orElse(0);
     }
 
+    private static List<PlaybackByteRange> mergeAvailableRanges(
+            List<HttpMediaCapture> captures,
+            long totalBytes) {
+        if (totalBytes <= 0) {
+            return List.of();
+        }
+        List<PlaybackByteRange> sorted = captures.stream()
+                .map(capture -> new PlaybackByteRange(
+                        Math.max(0, normalizedStart(capture)),
+                        Math.min(totalBytes - 1, normalizedEnd(capture))))
+                .filter(range -> range.end() >= range.start())
+                .sorted(Comparator.comparingLong(PlaybackByteRange::start)
+                        .thenComparingLong(PlaybackByteRange::end))
+                .toList();
+        if (sorted.isEmpty()) {
+            return List.of();
+        }
+        List<PlaybackByteRange> merged = new ArrayList<>();
+        PlaybackByteRange current = sorted.getFirst();
+        for (int index = 1; index < sorted.size(); index++) {
+            PlaybackByteRange next = sorted.get(index);
+            if (next.start() <= current.end() + 1) {
+                current = new PlaybackByteRange(
+                        current.start(),
+                        Math.max(current.end(), next.end()));
+            } else {
+                merged.add(current);
+                current = next;
+            }
+        }
+        merged.add(current);
+        return List.copyOf(merged);
+    }
+
     private static boolean hasUsableRange(HttpMediaCapture capture) {
         return capture.getCapturedBytes() > 0 && normalizedEnd(capture) >= normalizedStart(capture);
     }
@@ -294,6 +366,15 @@ public class HttpMediaPlaybackService {
             boolean playable,
             long totalBytes,
             String reason
+    ) {
+    }
+
+    public record PlaybackByteRange(long start, long end) {
+    }
+
+    public record PlaybackCacheLayout(
+            long totalBytes,
+            List<PlaybackByteRange> cachedRanges
     ) {
     }
 

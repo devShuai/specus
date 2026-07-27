@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -47,12 +48,14 @@ public class HttpMediaPlaybackTicketService {
                 || capture.isInitializationSegment()) {
             throw new IllegalStateException("媒体分段不能独立创建播放会话");
         }
+        HttpMediaPlaybackService.PlaybackCacheLayout cacheLayout = null;
         if (!isManifest(capture)) {
             HttpMediaPlaybackService.PlaybackAvailability availability =
                     playbackService.availability(capture);
             if (!availability.playable() && capture.getCapturedBytes() <= 0) {
                 throw new IllegalStateException(availability.reason());
             }
+            cacheLayout = playbackService.cacheLayout(capture);
         }
         byte[] tokenBytes = new byte[32];
         random.nextBytes(tokenBytes);
@@ -62,11 +65,29 @@ public class HttpMediaPlaybackTicketService {
         tickets.put(token, new Ticket(
                 capture.getId(), capture.getTenantId(), expiresAt, backfillMissing));
         String base = "/api/public/media-playback/" + token;
+        long totalBytes = cacheLayout == null ? 0 : cacheLayout.totalBytes();
+        Long initialRangeStart = null;
+        Long initialRangeEnd = null;
+        if (cacheLayout != null && capture.getCapturedBytes() > 0 && totalBytes > 0) {
+            long start = capture.getContentRangeStart() == null
+                    ? 0 : capture.getContentRangeStart();
+            long end = capture.getContentRangeEnd() == null
+                    ? start + capture.getCapturedBytes() - 1
+                    : capture.getContentRangeEnd();
+            initialRangeStart = Math.max(0, Math.min(start, totalBytes - 1));
+            initialRangeEnd = Math.max(
+                    initialRangeStart,
+                    Math.min(end, totalBytes - 1));
+        }
         return new PlaybackTicketView(
                 token,
                 capture.getMediaKind(),
                 base + "/play",
                 base + "/manifest",
+                totalBytes,
+                initialRangeStart,
+                initialRangeEnd,
+                cacheLayout == null ? List.of() : cacheLayout.cachedRanges(),
                 backfillMissing,
                 expiresAt.toString());
     }
@@ -116,6 +137,10 @@ public class HttpMediaPlaybackTicketService {
             String mediaKind,
             String playUrl,
             String manifestUrl,
+            long totalBytes,
+            Long initialRangeStart,
+            Long initialRangeEnd,
+            List<HttpMediaPlaybackService.PlaybackByteRange> cachedRanges,
             boolean backfillMissing,
             String expiresAt
     ) {

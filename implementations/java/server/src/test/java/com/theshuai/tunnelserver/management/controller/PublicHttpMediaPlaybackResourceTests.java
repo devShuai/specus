@@ -11,12 +11,51 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 
 import java.time.Instant;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class PublicHttpMediaPlaybackResourceTests {
+
+    @Test
+    void returnsTheSelectedCachedBlockForAnInitialRequestWithoutRange() throws Exception {
+        HttpMediaPlaybackTicketService ticketService =
+                mock(HttpMediaPlaybackTicketService.class);
+        HttpMediaCaptureService captureService = mock(HttpMediaCaptureService.class);
+        HttpMediaPlaybackService playbackService = mock(HttpMediaPlaybackService.class);
+        PublicHttpMediaPlaybackResource resource = new PublicHttpMediaPlaybackResource(
+                ticketService, captureService, playbackService);
+        HttpMediaCapture capture = new HttpMediaCapture();
+        capture.setId(23L);
+        capture.setClientName("client-a");
+        capture.setRoute("jellyfin");
+        capture.setSourceUrl("/Videos/movie/stream.mp4");
+        when(ticketService.resolve("ticket")).thenReturn(
+                new ResolvedTicket(
+                        "ticket", capture, Instant.now().plusSeconds(60), false));
+        when(playbackService.plan(capture, null)).thenReturn(
+                new HttpMediaPlaybackService.PlaybackPlan(
+                        capture,
+                        "video/mp4",
+                        null,
+                        "etag",
+                        300,
+                        100,
+                        149,
+                        true,
+                        List.of()));
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/play");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        resource.play("ticket", request, response);
+
+        assertThat(response.getStatus()).isEqualTo(206);
+        assertThat(response.getHeader(HttpHeaders.CONTENT_RANGE))
+                .isEqualTo("bytes 100-149/300");
+        assertThat(response.getContentLengthLong()).isEqualTo(50);
+    }
 
     @Test
     void returnsRangeMissWithoutFallingBackToOriginalTunnelRoute() throws Exception {

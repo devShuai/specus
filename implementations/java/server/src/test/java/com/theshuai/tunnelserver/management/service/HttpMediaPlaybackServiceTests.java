@@ -74,17 +74,42 @@ class HttpMediaPlaybackServiceTests {
     }
 
     @Test
-    void requiresRangeHeaderForSparseCachedMedia() {
+    void usesTheSelectedCachedBlockForARequestWithoutRange() {
         HttpMediaCaptureService captureService = mock(HttpMediaCaptureService.class);
         HttpMediaPlaybackService service = new HttpMediaPlaybackService(
                 captureService, mock(RustFsMediaStorage.class));
         HttpMediaCapture first = capture(1, 0, 49, 200, "part-a");
-        HttpMediaCapture second = capture(2, 100, 199, 200, "part-b");
+        HttpMediaCapture second = capture(2, 100, 149, 200, "part-b");
         when(captureService.completeResourceCaptures(second)).thenReturn(List.of(second, first));
 
-        assertThatThrownBy(() -> service.plan(second, null))
-                .isInstanceOf(MediaRangeException.class)
-                .hasMessageContaining("Range");
+        PlaybackPlan plan = service.plan(second, null);
+
+        assertThat(plan.partial()).isTrue();
+        assertThat(plan.start()).isEqualTo(100);
+        assertThat(plan.end()).isEqualTo(149);
+        assertThat(plan.totalBytes()).isEqualTo(200);
+        assertThat(plan.slices()).hasSize(1);
+        assertThat(plan.slices().getFirst().capture()).isSameAs(second);
+    }
+
+    @Test
+    void mergesAllCachedBlocksForOfflinePlayback() {
+        HttpMediaCaptureService captureService = mock(HttpMediaCaptureService.class);
+        HttpMediaPlaybackService service = new HttpMediaPlaybackService(
+                captureService, mock(RustFsMediaStorage.class));
+        HttpMediaCapture first = capture(1, 0, 49, 300, "part-a");
+        HttpMediaCapture adjacent = capture(2, 50, 99, 300, "part-b");
+        HttpMediaCapture later = capture(3, 200, 249, 300, "part-c");
+        when(captureService.completeResourceCaptures(later))
+                .thenReturn(List.of(later, adjacent, first));
+
+        HttpMediaPlaybackService.PlaybackCacheLayout layout =
+                service.cacheLayout(later);
+
+        assertThat(layout.totalBytes()).isEqualTo(300);
+        assertThat(layout.cachedRanges()).containsExactly(
+                new HttpMediaPlaybackService.PlaybackByteRange(0, 99),
+                new HttpMediaPlaybackService.PlaybackByteRange(200, 249));
     }
 
     @Test
