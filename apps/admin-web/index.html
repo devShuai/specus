@@ -97,7 +97,7 @@
          - 内联版本：让 Google Search Console / Analytics 所有权验证器能从纯
            HTML 扫到 gtag('config','G-...') 这段；它不执行 JS。
          - page_location / page_path 只包含 origin 与 pathname，不上报 query/hash 中的房间凭据。
-         - 内联脚本 sha256 hash 已加入 CSP script-src 白名单。 -->
+         - 内联脚本 sha256 hash 已加入 CSP script-src 白名单，并由 verify:csp 在构建时校验。 -->
     <script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-TNJRNXHJ40',{page_location:location.origin+location.pathname,page_path:location.pathname});</script>
   </head>
   <body>

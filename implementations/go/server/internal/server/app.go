@@ -451,7 +451,7 @@ func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig
 		ossSuffix = " " + origin
 	}
 	policy := "default-src 'self'; " +
-		"script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-hTCRZa+/YHUYWn4kIK46cBqCzA/HalU8WwpPIhHctxE=' 'sha256-j+6j8kbf/TP/2vaoa07rGqJUenu5ZBaVvdQE1uczdHo='; " +
+		"script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-j+6j8kbf/TP/2vaoa07rGqJUenu5ZBaVvdQE1uczdHo=' 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; " +
 		"style-src 'self' 'unsafe-inline'; " +
 		"img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"media-src 'self' blob: data:" + ossSuffix + "; " +

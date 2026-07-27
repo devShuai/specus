@@ -76,9 +76,10 @@ public class SecurityConfig {
                 /*
                  * CSP：管理后台为 React + HeroUI 构建产物,脚本是同源外部 bundle(/assets/*.js)。
                  * - script-src 'self' + googletagmanager.com:外部模块脚本同源 + GA 主 loader
-                 *     额外放行 GA 初始化的内联脚本 sha256 hash（同时保留在 /gtag-init.js 作 fallback）；
+                 *     额外放行首屏主题与 GA 初始化内联脚本的 sha256 hash
+                 *     （GA 初始化同时保留在 /gtag-init.js 作 fallback）；
                  *     该内联 config 显式使用无 query/hash 的 page_location 与 page_path，避免上报房间凭据。
-                 *     如果修改 index.html 中的内联 gtag 片段，需要重算 sha256 并同步这里。
+                 *     哈希由 admin-web 的 verify:csp 在构建时检查四端配置。
                  * - style-src 'self' 'unsafe-inline':HeroUI/framer-motion 会写内联 style 属性
                  * - img-src 允许 blob:/data: 供直连文件预览与内联图片;额外允许 GA pixel beacon 域
                  * - media-src 允许 blob:/data: 供直连视频/音频预览
@@ -93,7 +94,7 @@ public class SecurityConfig {
                 .headers(headers -> headers
                         .contentSecurityPolicy(csp -> csp.policyDirectives(
                                 "default-src 'self'; "
-                                + "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
+                                + "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-j+6j8kbf/TP/2vaoa07rGqJUenu5ZBaVvdQE1uczdHo=' 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
                                 + "style-src 'self' 'unsafe-inline'; "
                                 + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; "
                                 + "media-src 'self' blob: data:" + ossSuffix + "; "

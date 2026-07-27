@@ -10,12 +10,17 @@ public static class ManagementPageSecurityHeaders
 {
     private const string ContentSecurityPolicy =
         "default-src 'self'; "
-        + "script-src 'self' https://challenges.cloudflare.com; "
+        + "script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com "
+        + "'sha256-j+6j8kbf/TP/2vaoa07rGqJUenu5ZBaVvdQE1uczdHo=' "
+        + "'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; "
         + "style-src 'self' 'unsafe-inline'; "
-        + "img-src 'self' data:; "
+        + "img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com; "
+        + "media-src 'self' blob: data:; "
+        + "object-src 'self' blob:; "
         + "font-src 'self' data:; "
         + "frame-src 'self' https://challenges.cloudflare.com; "
-        + "connect-src 'self' ws: wss:; "
+        + "connect-src 'self' ws: wss: https://www.google-analytics.com "
+        + "https://*.analytics.google.com https://*.googletagmanager.com; "
         + "form-action 'self'; "
         + "frame-ancestors 'none'; "
         + "base-uri 'self'";
