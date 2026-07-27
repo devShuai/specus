@@ -39,6 +39,7 @@ import type {
   CellStyle,
   FitPlugin,
 } from "@maxgraph/core";
+import { Star } from "lucide-react";
 import * as Y from "yjs";
 import "@maxgraph/core/css/common.css";
 import {
@@ -346,6 +347,7 @@ const DIAGRAM_CANVAS_PADDING = { width: 280, height: 220 };
 const DIAGRAM_CANVAS_VIEWPORT_INSET = 2;
 const MAX_DIAGRAM_CANVAS_SIZE = 100_000;
 const DIAGRAM_PORT_IMAGE = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.5" fill="#fff" stroke="#0066cc" stroke-width="2"/></svg>')}`;
+const SELECTION_TOOLBAR_SIZE = { width: 176, height: 36, gap: 12, inset: 8 };
 const MAX_DRAWIO_DOCUMENT_BYTES = 8 * 1024 * 1024;
 const STENCIL_PAGE_SIZE = 180;
 const STENCIL_SEARCH_LIMIT = 240;
@@ -1131,8 +1133,15 @@ export function SyncedDiagram({
       connectionHandler.isConnectableCell = (cell) => Boolean(connectionHandler.first) && defaultIsConnectableCell(cell);
       connectionHandler.isStartEvent = () => Boolean(
         connectionHandler.constraintHandler.currentFocus
-        && (connectionModeRef.current || connectionHandler.constraintHandler.currentConstraint),
+        && connectionHandler.constraintHandler.currentConstraint,
       );
+      const defaultValidateConnection = connectionHandler.validateConnection.bind(connectionHandler);
+      connectionHandler.validateConnection = (source, target) => {
+        if (!connectionHandler.sourceConstraint || !connectionHandler.constraintHandler.currentConstraint) {
+          return "";
+        }
+        return defaultValidateConnection(source, target);
+      };
       connectionHandler.cursorConnect = "crosshair";
       connectionHandler.livePreview = true;
       connectionHandler.movePreviewAway = true;
@@ -1469,7 +1478,10 @@ export function SyncedDiagram({
       scheduleViewRefresh();
     };
     container.addEventListener("wheel", wheelZoomListener, { passive: false });
-    const resizeObserver = new ResizeObserver(scheduleCanvasExpansion);
+    const resizeObserver = new ResizeObserver(() => {
+      scheduleCanvasExpansion();
+      scheduleViewRefresh();
+    });
     resizeObserver.observe(container);
     runtimeRef.current = {
       graph,
@@ -1542,7 +1554,7 @@ export function SyncedDiagram({
     const graph = runtimeRef.current?.graph;
     if (!graph) return;
     const connectionHandler = graph.getPlugin<ConnectionHandler>(ConnectionHandler.pluginId);
-    if (connectionHandler) connectionHandler.outlineConnect = interactionMode === "connect";
+    if (connectionHandler) connectionHandler.outlineConnect = false;
     graph.container.dataset.interactionMode = interactionMode;
     if (interactionMode === "connect") {
       graph.clearSelection();
@@ -1743,7 +1755,7 @@ export function SyncedDiagram({
     setInteractionMode((current) => {
       const next = current === "connect" ? "select" : "connect";
       setStatus(next === "connect"
-        ? "连线模式已开启：从节点任一侧拖向目标节点，完成后可切回选择模式。"
+        ? "连线模式已开启：从节点的蓝色连接点拖向目标节点的连接点。"
         : "已切回选择模式，可移动和框选元素。");
       return next;
     });
@@ -3687,10 +3699,28 @@ export function SyncedDiagram({
     const rightEdge = Math.max(...states.map((state) => state.x + state.width)) - container.scrollLeft;
     const topEdge = Math.min(...states.map((state) => state.y)) - container.scrollTop;
     const bottomEdge = Math.max(...states.map((state) => state.y + state.height)) - container.scrollTop;
-    const toolbarWidth = 176;
-    const left = clampNumber((leftEdge + rightEdge) / 2 - toolbarWidth / 2, 8, Math.max(8, container.clientWidth - toolbarWidth - 8));
-    const top = topEdge >= 52 ? topEdge - 44 : Math.min(container.clientHeight - 44, bottomEdge + 10);
-    return { left, top: Math.max(8, top) };
+    const { width, height, gap, inset } = SELECTION_TOOLBAR_SIZE;
+    const maxLeft = Math.max(inset, container.clientWidth - width - inset);
+    const maxTop = Math.max(inset, container.clientHeight - height - inset);
+    const centeredLeft = clampNumber((leftEdge + rightEdge - width) / 2, inset, maxLeft);
+    const centeredTop = clampNumber((topEdge + bottomEdge - height) / 2, inset, maxTop);
+    const isSingleVertex = states.length === 1 && states[0].cell.isVertex();
+
+    if (isSingleVertex) {
+      if (rightEdge + gap + width <= container.clientWidth - inset) {
+        return { left: rightEdge + gap, top: centeredTop };
+      }
+      if (leftEdge - gap - width >= inset) {
+        return { left: leftEdge - gap - width, top: centeredTop };
+      }
+      if (bottomEdge + gap + height <= container.clientHeight - inset) {
+        return { left: centeredLeft, top: bottomEdge + gap };
+      }
+    }
+
+    const aboveTop = topEdge - gap - height;
+    if (aboveTop >= inset) return { left: centeredLeft, top: aboveTop };
+    return { left: centeredLeft, top: clampNumber(bottomEdge + gap, inset, maxTop) };
   }, [selection.ids, viewEpoch]);
 
   const totalPeers = Math.max(1, peerCount + 1);
@@ -4361,12 +4391,13 @@ export function SyncedDiagram({
                               </button>
                               <button
                                 type="button"
-                                className={`absolute right-0.5 top-0.5 grid h-11 w-11 place-items-center rounded text-sm transition sm:h-7 sm:w-7 ${favorite ? "text-amber-500" : "text-zinc-300 hover:bg-black/[0.05] hover:text-amber-500 dark:text-zinc-600 dark:hover:bg-white/[0.06]"}`}
+                                className={`absolute right-1 top-1 z-[1] grid h-5 w-5 place-items-center rounded-[5px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--diagram-apple-blue)]/50 ${favorite ? "bg-white/90 text-amber-500 shadow-sm dark:bg-zinc-900/90" : "text-zinc-300 hover:bg-white/90 hover:text-amber-500 dark:text-zinc-600 dark:hover:bg-zinc-900/90"}`}
                                 aria-label={favorite ? `取消收藏${item.label}` : `收藏${item.label}`}
                                 aria-pressed={favorite}
+                                title={favorite ? "取消收藏" : "收藏"}
                                 onClick={() => toggleFavoriteNodeKind(item.kind)}
                               >
-                                {favorite ? "★" : "☆"}
+                                <Star className="h-3 w-3" fill={favorite ? "currentColor" : "none"} strokeWidth={1.8} aria-hidden="true" />
                               </button>
                             </div>
                           );
@@ -4680,7 +4711,7 @@ export function SyncedDiagram({
             </div>
             {interactionMode === "connect" ? (
               <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-md border border-[var(--diagram-apple-blue)]/30 bg-[var(--diagram-apple-surface)] px-3 py-1.5 text-[11px] font-semibold text-[var(--diagram-apple-blue)] shadow-sm">
-                连线模式：从节点拖向目标节点
+                连线模式：从蓝色连接点拖到另一个连接点
               </div>
             ) : null}
             {showMobileHelp ? (
