@@ -15,6 +15,7 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.dao.DataIntegrityViolationException;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -273,6 +274,67 @@ class HttpMediaCaptureServiceTests {
 
         assertThat(redacted)
                 .isEqualTo("/Videos/movie/stream.mp4?deviceId=device-a&ApiKey=***&Tag=etag");
+    }
+
+    @Test
+    void extendsExistingNonLiveCaptureWhenRetentionIsRaised() {
+        ServiceFixture fixture = new ServiceFixture();
+        try {
+            fixture.properties.setEnabled(true);
+            fixture.properties.setRetentionSeconds(7L * 24L * 60L * 60L);
+            Instant now = Instant.now();
+            HttpMediaCapture capture = expiredCapture(
+                    now.minusSeconds(2L * 24L * 60L * 60L),
+                    now.minusSeconds(24L * 60L * 60L));
+            when(fixture.captureRepository
+                    .findTop200ByStateInAndExpiresAtBeforeOrderByIdAsc(any(), any()))
+                    .thenReturn(List.of(capture));
+
+            fixture.service.cleanupExpired();
+
+            assertThat(Instant.parse(capture.getExpiresAt())).isAfter(now.plusSeconds(4L * 24L * 60L * 60L));
+            verify(fixture.captureRepository).save(capture);
+            verify(fixture.captureRepository, never()).delete(capture);
+            verify(fixture.storage, never()).delete(any());
+        } finally {
+            fixture.service.shutdown();
+        }
+    }
+
+    @Test
+    void deletesNonLiveCaptureAfterConfiguredRetention() {
+        ServiceFixture fixture = new ServiceFixture();
+        try {
+            fixture.properties.setEnabled(true);
+            fixture.properties.setRetentionSeconds(7L * 24L * 60L * 60L);
+            Instant now = Instant.now();
+            HttpMediaCapture capture = expiredCapture(
+                    now.minusSeconds(8L * 24L * 60L * 60L),
+                    now.minusSeconds(7L * 24L * 60L * 60L));
+            when(fixture.captureRepository
+                    .findTop200ByStateInAndExpiresAtBeforeOrderByIdAsc(any(), any()))
+                    .thenReturn(List.of(capture));
+
+            fixture.service.cleanupExpired();
+
+            verify(fixture.storage).delete(capture.getObjectKey());
+            verify(fixture.referenceRepository)
+                    .deleteByTenantIdAndManifestCaptureId(capture.getTenantId(), capture.getId());
+            verify(fixture.captureRepository).delete(capture);
+        } finally {
+            fixture.service.shutdown();
+        }
+    }
+
+    private static HttpMediaCapture expiredCapture(Instant capturedAt, Instant expiresAt) {
+        HttpMediaCapture capture = new HttpMediaCapture();
+        capture.setId(303L);
+        capture.setTenantId("tenant-a");
+        capture.setObjectKey("media/movie.mp4");
+        capture.setState(HttpMediaCaptureService.STATE_COMPLETE);
+        capture.setCapturedAt(capturedAt.toString());
+        capture.setExpiresAt(expiresAt.toString());
+        return capture;
     }
 
     private static final class ServiceFixture {

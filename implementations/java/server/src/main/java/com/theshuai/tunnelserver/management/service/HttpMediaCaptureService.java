@@ -334,12 +334,19 @@ public class HttpMediaCaptureService {
         if (!properties.isEnabled()) {
             return;
         }
+        Instant now = Instant.now();
         List<HttpMediaCapture> expired = captureRepository
                 .findTop200ByStateInAndExpiresAtBeforeOrderByIdAsc(
                         List.of(STATE_STARTING, STATE_CAPTURING, STATE_COMPLETE, STATE_INCOMPLETE, STATE_FAILED),
-                        Instant.now().toString());
+                        now.toString());
+        int extended = 0;
+        int deleted = 0;
         for (HttpMediaCapture capture : expired) {
             try {
+                if (extendNonLiveRetention(capture, now)) {
+                    extended++;
+                    continue;
+                }
                 if ((STATE_STARTING.equals(capture.getState()) || STATE_CAPTURING.equals(capture.getState()))
                         && hasText(capture.getUploadId()) && storage.isReady()) {
                     storage.abortMultipart(new MultipartUpload(capture.getObjectKey(), capture.getUploadId()));
@@ -350,10 +357,37 @@ public class HttpMediaCaptureService {
                 referenceRepository.deleteByTenantIdAndManifestCaptureId(
                         capture.getTenantId(), capture.getId());
                 captureRepository.delete(capture);
+                deleted++;
             } catch (RuntimeException exception) {
                 log.warn("[media-capture] failed to clean expired capture id={} key={}",
                         capture.getId(), capture.getObjectKey(), exception);
             }
+        }
+        if (extended > 0 || deleted > 0) {
+            log.info("[media-capture] retention cleanup extended={} deleted={}", extended, deleted);
+        }
+    }
+
+    private boolean extendNonLiveRetention(HttpMediaCapture capture, Instant now) {
+        if (capture.isLiveStream()
+                || (!STATE_COMPLETE.equals(capture.getState())
+                && !STATE_INCOMPLETE.equals(capture.getState()))) {
+            return false;
+        }
+        try {
+            Instant configuredExpiry = Instant.parse(capture.getCapturedAt())
+                    .plusSeconds(Math.max(60, properties.getRetentionSeconds()));
+            Instant storedExpiry = Instant.parse(capture.getExpiresAt());
+            if (!configuredExpiry.isAfter(now) || !configuredExpiry.isAfter(storedExpiry)) {
+                return false;
+            }
+            capture.setExpiresAt(configuredExpiry.toString());
+            captureRepository.save(capture);
+            return true;
+        } catch (RuntimeException invalidTimestamp) {
+            log.warn("[media-capture] invalid retention timestamp id={} capturedAt={} expiresAt={}",
+                    capture.getId(), capture.getCapturedAt(), capture.getExpiresAt());
+            return false;
         }
     }
 

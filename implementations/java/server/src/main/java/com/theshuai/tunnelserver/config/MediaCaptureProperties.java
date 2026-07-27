@@ -20,7 +20,7 @@ public class MediaCaptureProperties {
     private long partSizeBytes = 8L * 1024L * 1024L;
     private int maxInflightParts = 4;
     private int uploadThreads = 4;
-    private long retentionSeconds = 24L * 60L * 60L;
+    private long retentionSeconds = 7L * 24L * 60L * 60L;
     private long liveWindowSeconds = 5L * 60L;
     private long manifestMaxBytes = 16L * 1024L * 1024L;
     private long playbackTicketTtlSeconds = 900;

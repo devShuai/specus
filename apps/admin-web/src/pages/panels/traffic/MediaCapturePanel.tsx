@@ -77,6 +77,10 @@ export function MediaCapturePanel() {
     }
     try {
       const result = await adminApi.listHttpMediaCaptures(page, PAGE_SIZE);
+      if (result.totalPages > 0 && page >= result.totalPages) {
+        setPage(result.totalPages - 1);
+        return;
+      }
       setRows(result.items ?? []);
       setTotal(result.total);
       setTotalPages(Math.max(1, result.totalPages));
@@ -171,6 +175,7 @@ export function MediaCapturePanel() {
                   { label: "采集大小", value: formatBytes(row.capturedBytes) },
                   { label: "源范围", value: mediaRangeLabel(row) },
                   { label: "采集时间", value: formatDateTime(row.capturedAt) },
+                  { label: "保留至", value: formatDateTime(row.expiresAt) },
                   ...(row.failureReason ? [{ label: "失败原因", value: row.failureReason }] : []),
                   ...(row.playbackMessage
                     ? [{ label: "回放状态", value: row.playbackMessage }]
@@ -240,7 +245,14 @@ export function MediaCapturePanel() {
                 </TableCell>
                 <TableCell><span className="whitespace-nowrap font-mono text-tiny">{mediaRangeLabel(row)}</span></TableCell>
                 <TableCell>{formatBytes(row.capturedBytes)}</TableCell>
-                <TableCell>{formatDateTime(row.capturedAt)}</TableCell>
+                <TableCell>
+                  <div className="flex flex-col whitespace-nowrap">
+                    <span>{formatDateTime(row.capturedAt)}</span>
+                    <span className="text-tiny text-default-400">
+                      保留至 {formatDateTime(row.expiresAt)}
+                    </span>
+                  </div>
+                </TableCell>
                 <TableCell>
                   <Button
                     size="sm"
