@@ -24,7 +24,7 @@ class HttpTrafficExchangeStoreTests {
     @Test
     void elasticsearchSummaryDoesNotEncodeBinaryBody() {
         HttpTrafficExchangeDocument document = new HttpTrafficExchangeDocument();
-        document.setExchangeId(41L);
+        document.setExchangeId(1_871_792_910_349_893_634L);
         document.setClientId(7L);
         byte[] pngSignature = {
                 (byte) 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
@@ -42,6 +42,7 @@ class HttpTrafficExchangeStoreTests {
         HttpTrafficExchangeView detail =
                 SpringDataElasticsearchHttpTrafficExchangeStore.toView(document, true);
 
+        assertThat(summary.id()).isEqualTo("1871792910349893634");
         assertThat(summary.responseHeaders()).isNull();
         assertThat(summary.responsePreviewHex()).isNull();
         assertThat(summary.responsePreviewText()).isNull();
@@ -52,7 +53,7 @@ class HttpTrafficExchangeStoreTests {
     @Test
     void jpaSummaryDoesNotReadOrEncodeBinaryBody() {
         HttpTrafficExchange exchange = new HttpTrafficExchange();
-        exchange.setId(42L);
+        exchange.setId(1_871_792_910_349_893_634L);
         exchange.setClientId(8L);
         exchange.setResponseBytes(4L);
         exchange.setResponseContentType("video/mp4");
@@ -65,6 +66,7 @@ class HttpTrafficExchangeStoreTests {
         HttpTrafficExchangeView summary = JpaHttpTrafficExchangeStore.toView(exchange, false);
         HttpTrafficExchangeView detail = JpaHttpTrafficExchangeStore.toView(exchange, true);
 
+        assertThat(summary.id()).isEqualTo("1871792910349893634");
         assertThat(summary.responseHeaders()).isNull();
         assertThat(summary.responsePreviewHex()).isNull();
         assertThat(summary.responsePreviewText()).isNull();

@@ -1,7 +1,7 @@
 package com.theshuai.tunnelserver.management.model;
 
 public record HttpTrafficExchangeView(
-        long id,
+        String id,
         long clientId,
         String clientName,
         String route,

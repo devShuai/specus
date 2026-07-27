@@ -147,7 +147,7 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
 
     static HttpTrafficExchangeView toView(HttpTrafficExchange exchange, boolean includeBody) {
         return new HttpTrafficExchangeView(
-                exchange.getId(),
+                Long.toString(exchange.getId()),
                 exchange.getClientId(),
                 exchange.getClientName(),
                 exchange.getRoute(),
@@ -193,7 +193,7 @@ public class JpaHttpTrafficExchangeStore implements HttpTrafficExchangeStore {
         String responseBodyType = stringValue(exchange, 18);
         long responseBytes = longValue(exchange, 14);
         return new HttpTrafficExchangeView(
-                longValue(exchange, 0),
+                Long.toString(longValue(exchange, 0)),
                 longValue(exchange, 1),
                 stringValue(exchange, 2),
                 stringValue(exchange, 3),

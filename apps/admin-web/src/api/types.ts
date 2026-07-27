@@ -172,7 +172,7 @@ export interface ResourceTrafficUsage {
 }
 
 export interface HttpTrafficExchange {
-  id: number | string;
+  id: string;
   clientId: number;
   clientName: string;
   route: string;

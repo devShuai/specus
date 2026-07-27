@@ -366,7 +366,7 @@ public class SpringDataElasticsearchHttpTrafficExchangeStore implements HttpTraf
 
     static HttpTrafficExchangeView toView(HttpTrafficExchangeDocument document, boolean includeBody) {
         return new HttpTrafficExchangeView(
-                document.getExchangeId(),
+                Long.toString(document.getExchangeId()),
                 document.getClientId(),
                 document.getClientName(),
                 document.getRoute(),

@@ -96,7 +96,7 @@ class JpaHttpTrafficExchangeStoreIntegrationTests {
 
         assertThat(page.getContent()).hasSize(1);
         HttpTrafficExchangeView summary = page.getContent().getFirst();
-        assertThat(summary.id()).isEqualTo(id);
+        assertThat(summary.id()).isEqualTo(Long.toString(id));
         assertThat(summary.responseHeaders()).isNull();
         assertThat(summary.responsePreviewHex()).isNull();
         assertThat(summary.responsePreviewText()).isNull();
