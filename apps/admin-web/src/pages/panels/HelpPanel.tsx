@@ -192,7 +192,7 @@ function JavaSection() {
 
       <DocCard title="启动命令">
         <p className="mb-2 text-small">从可执行 jar 启动：</p>
-        <CodeBlock language="bash" code={`java -jar tunnel-client.jar`} />
+        <CodeBlock language="bash" code={`java -jar specus-client.jar`} />
         <p className="mb-2 mt-3 text-small">从源码启动：</p>
         <CodeBlock language="bash" code={`cd implementations/java/client
 mvn org.springframework.boot:spring-boot-maven-plugin:run`} />
@@ -225,15 +225,15 @@ function GoSection() {
 
       <DocCard title="启动命令">
         <p className="mb-2 text-small">Linux / macOS：</p>
-        <CodeBlock language="bash" code={`chmod +x shuai-tunnel-client
-./shuai-tunnel-client`} />
+        <CodeBlock language="bash" code={`chmod +x specus-client
+./specus-client`} />
         <p className="mb-2 mt-3 text-small">Windows：</p>
-        <CodeBlock language="powershell" code={`.\\shuai-tunnel-client.exe`} />
+        <CodeBlock language="powershell" code={`.\\specus-client.exe`} />
       </DocCard>
 
       <DocCard title="后台运行">
         <p>建议使用 systemd / Windows Service 托管。或简单后台运行：</p>
-        <CodeBlock language="bash" code={`nohup ./shuai-tunnel-client > tunnel-client.log 2>&1 &`} />
+        <CodeBlock language="bash" code={`nohup ./specus-client > specus-client.log 2>&1 &`} />
       </DocCard>
     </div>
   );
@@ -258,12 +258,12 @@ function CsharpSection() {
 
       <DocCard title="启动命令">
         <p className="mb-2 text-small">需要 .NET Runtime 时：</p>
-        <CodeBlock language="bash" code={`dotnet ShuaiTunnel.Client.dll`} />
+        <CodeBlock language="bash" code={`dotnet Specus.Client.dll`} />
         <p className="mb-2 mt-3 text-small">自包含可执行包：</p>
-        <CodeBlock language="bash" code={`./ShuaiTunnel.Client`} />
+        <CodeBlock language="bash" code={`./Specus.Client`} />
         <p className="mb-2 mt-3 text-small">从源码运行：</p>
         <CodeBlock language="bash" code={`cd implementations/csharp/client
-dotnet run --project src/ShuaiTunnel.Client`} />
+dotnet run --project src/Specus.Client`} />
       </DocCard>
     </div>
   );
@@ -275,7 +275,7 @@ function PeerMeshSection() {
       <DocCard title="启用条件">
         <ul className="ml-5 list-disc space-y-1 text-small">
           <li>
-            服务端设置 <Inline>TUNNEL_PEER_MESH_ENABLED=true</Inline>。
+            服务端设置 <Inline>SPECUS_PEER_MESH_ENABLED=true</Inline>。
           </li>
           <li>
             在「私有组网」页面启用对应客户端。默认同一租户 / 同一用户下客户端可互访；跨用户需要显式 ACL。
@@ -294,7 +294,7 @@ function PeerMeshSection() {
       <DocCard title="UDP 端口">
         <ul className="ml-5 list-disc space-y-1 text-small">
           <li>
-            <Inline>3478/udp</Inline>：tunnel-server 的认证 TURN 控制端口，承载 allocation、permission 和 relay 数据入口。
+            <Inline>3478/udp</Inline>：specus-server 的认证 TURN 控制端口，承载 allocation、permission 和 relay 数据入口。
           </li>
           <li>
             <Inline>34780-34781/udp</Inline>：独立 RFC 5780 STUN 的 P1/P2；主、备服务器分别提供 A1/A2，四个组合均需可达。
@@ -303,7 +303,7 @@ function PeerMeshSection() {
             <Inline>49152-65535/udp</Inline>：TURN relay 默认分配范围，可用服务端 relay min/max 配置收窄。
           </li>
         </ul>
-        <CodeBlock language="bash" code={`# tunnel-server
+        <CodeBlock language="bash" code={`# specus-server
 sudo firewall-cmd --add-port=3478/udp --permanent
 sudo firewall-cmd --add-port=49152-65535/udp --permanent
 
@@ -425,7 +425,7 @@ function ProtocolSection() {
         <ul className="ml-5 list-disc space-y-1 text-small">
           <li>
             <Inline>7010</Inline> — 控制连接端口，客户端连接此端口完成登录、心跳、隧道管理。
-            通过环境变量 <Inline>TUNNEL_NETTY_PORT</Inline> 覆盖。
+            通过环境变量 <Inline>SPECUS_NETTY_PORT</Inline> 覆盖。
           </li>
           <li>
             <Inline>8088</Inline> — 管理后台 + HTTP 直转入口。
@@ -433,8 +433,8 @@ function ProtocolSection() {
           </li>
           <li>各「端口映射」自定义的公网监听端口（如 9000）。</li>
           <li>
-            <Inline>3478/udp</Inline> — tunnel-server 的认证 TURN 控制端口。
-            通过环境变量 <Inline>TUNNEL_PEER_MESH_STUN_TURN_PORT</Inline> 覆盖。
+            <Inline>3478/udp</Inline> — specus-server 的认证 TURN 控制端口。
+            通过环境变量 <Inline>SPECUS_PEER_MESH_STUN_TURN_PORT</Inline> 覆盖。
           </li>
           <li>
             <Inline>34780-34781/udp</Inline> — 独立 RFC 5780 STUN 的 P1/P2，需在 A1/A2 两个公网地址同时开放。
@@ -454,7 +454,7 @@ function ProtocolSection() {
       </DocCard>
 
       <DocCard title="控制连接 TLS">
-        <p className="text-small">通过 <Inline>TUNNEL_TLS_MODE</Inline> 环境变量切换：</p>
+        <p className="text-small">通过 <Inline>SPECUS_TLS_MODE</Inline> 环境变量切换：</p>
         <ul className="ml-5 list-disc space-y-1 text-small">
           <li>
             <Inline>disabled</Inline>（默认）—— 明文 TCP，与旧部署兼容
@@ -502,7 +502,7 @@ function FaqSection() {
 
       <DocCard title="登录管理后台后频繁掉线">
         <p className="text-small">
-          管理后台 JWT 默认 8 小时有效。通过环境变量 <Inline>TUNNEL_AUTH_TOKEN_TTL_SECONDS</Inline>
+          管理后台 JWT 默认 8 小时有效。通过环境变量 <Inline>SPECUS_AUTH_TOKEN_TTL_SECONDS</Inline>
           调整本地密码登录的令牌时长。
         </p>
       </DocCard>
@@ -516,10 +516,10 @@ function FaqSection() {
 
       <DocCard title="私有组网一直显示 NAT 未知">
         <ul className="ml-5 list-disc space-y-1 text-small">
-          <li>确认服务端已启用 <Inline>TUNNEL_PEER_MESH_ENABLED=true</Inline>，并且客户端在「私有组网」页面已启用。</li>
+          <li>确认服务端已启用 <Inline>SPECUS_PEER_MESH_ENABLED=true</Inline>，并且客户端在「私有组网」页面已启用。</li>
           <li>确认 <Inline>A1:P1</Inline>、<Inline>A1:P2</Inline>、<Inline>A2:P1</Inline>、<Inline>A2:P2</Inline> 四个独立 STUN 端点都可达。</li>
           <li>确认 A1:P1 的 Binding Success 同时返回 <Inline>RESPONSE-ORIGIN</Inline> 与 <Inline>OTHER-ADDRESS</Inline>。</li>
-          <li>确认 tunnel-server 已配置独立 STUN 主、备地址和端口，并在客户端登录响应中下发。</li>
+          <li>确认 specus-server 已配置独立 STUN 主、备地址和端口，并在客户端登录响应中下发。</li>
           <li>客户端需支持并上报 <Inline>natBehaviorDiscovery=RFC5780</Inline>；只有基础结果时会显示兼容标签。</li>
         </ul>
       </DocCard>
@@ -570,20 +570,20 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
 
 // 共享配置示例（与 README.md "client.jsonc" 样例保持一致）
 const SAMPLE_CONFIG = `{
-  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // 服务端管理 HTTP 地址
-  "serverBaseUrl": "https://tunnel.example.com",
+  "serverBaseUrl": "https://specus.example.com",
   "apiKey": "demo-client",
   "secret": "your-client-secret",
 }`;
 
 const PEER_MESH_CONFIG = `{
-  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // 服务端管理 HTTP 地址
-  "serverBaseUrl": "https://tunnel.example.com",
+  "serverBaseUrl": "https://specus.example.com",
   "apiKey": "demo-client",
   "secret": "your-client-secret",
   "peerMeshDevice": "auto",
-  "peerMeshTunName": "shuai0",
+  "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,
 }`;

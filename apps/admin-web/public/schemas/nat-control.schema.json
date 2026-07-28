@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tunnel.devshuai.com/schemas/nat-control.schema.json",
-  "title": "shuai-tunnel NAT_CONTROL",
+  "$id": "https://specus.devshuai.com/schemas/nat-control.schema.json",
+  "title": "specus NAT_CONTROL",
   "description": "MessageType.NAT_CONTROL 的 JSON 消息体。字段缺省语义见 protocol/spec/control-protocol.md。",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "clientName",
     "remotePort",
-    "tunnelConfigList"
+    "specusConfigList"
   ],
   "properties": {
     "clientName": {
@@ -27,18 +27,18 @@
       "$ref": "#/$defs/Port",
       "description": "控制连接端口。"
     },
-    "tunnelConfigList": {
+    "specusConfigList": {
       "type": "array",
       "description": "已启用 TCP 端口映射全集。空数组表示清空。缺省不合法。",
       "items": {
-        "$ref": "#/$defs/TunnelConfig"
+        "$ref": "#/$defs/SpecusConfig"
       }
     },
-    "httpTunnelConfigList": {
+    "httpSpecusConfigList": {
       "type": "array",
       "description": "已启用 HTTP route 全集。字段缺省表示服务端尚未接管该客户端 HTTP route；空数组表示清空。",
       "items": {
-        "$ref": "#/$defs/HttpTunnelConfig"
+        "$ref": "#/$defs/HttpSpecusConfig"
       }
     }
   },
@@ -48,31 +48,31 @@
       "minimum": 1,
       "maximum": 65535
     },
-    "TunnelConfig": {
+    "SpecusConfig": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "port",
-        "tunnelAddress",
-        "tunnelPort"
+        "specusAddress",
+        "specusPort"
       ],
       "properties": {
         "port": {
           "$ref": "#/$defs/Port",
           "description": "服务端公网监听端口。"
         },
-        "tunnelAddress": {
+        "specusAddress": {
           "type": "string",
           "minLength": 1,
           "description": "客户端侧目标地址。"
         },
-        "tunnelPort": {
+        "specusPort": {
           "$ref": "#/$defs/Port",
           "description": "客户端侧目标端口。"
         }
       }
     },
-    "HttpTunnelConfig": {
+    "HttpSpecusConfig": {
       "type": "object",
       "additionalProperties": false,
       "required": [

@@ -15,7 +15,7 @@ import { Sidebar, type NavGroup } from "../components/Sidebar";
 const LazyOverviewPanel = lazy(() => import("./panels/OverviewPanel").then(m => ({ default: m.OverviewPanel })));
 const LazyClientsPanel = lazy(() => import("./panels/ClientsPanel").then(m => ({ default: m.ClientsPanel })));
 const LazyAdminMessagesPanel = lazy(() => import("./panels/AdminMessagesPanel").then(m => ({ default: m.AdminMessagesPanel })));
-const LazyTunnelsPanel = lazy(() => import("./panels/TunnelsPanel").then(m => ({ default: m.TunnelsPanel })));
+const LazySpecusMappingsPanel = lazy(() => import("./panels/SpecusMappingsPanel").then(m => ({ default: m.SpecusMappingsPanel })));
 const LazyHttpRoutesPanel = lazy(() => import("./panels/HttpRoutesPanel").then(m => ({ default: m.HttpRoutesPanel })));
 const LazyConnectionsPanel = lazy(() => import("./panels/ConnectionsPanel").then(m => ({ default: m.ConnectionsPanel })));
 const LazyTrafficPanel = lazy(() => import("./panels/TrafficPanel").then(m => ({ default: m.TrafficPanel })));
@@ -29,7 +29,7 @@ const navGroups: NavGroup[] = [
   { label: "接入", items: [
     { key: "clients" as const, title: "客户端" },
     { key: "messages" as const, title: "消息" },
-    { key: "tunnels" as const, title: "端口映射" },
+    { key: "specusMappings" as const, title: "端口映射" },
     { key: "http-routes" as const, title: "HTTP 路由" },
     { key: "downloads" as const, title: "客户端下载" },
   ]},
@@ -139,7 +139,7 @@ function DashboardContent() {
         <header className="app-apple-mobile-header sticky top-0 z-30 bg-background/80 backdrop-blur lg:hidden">
           <div className="flex items-center gap-2 px-3 py-2 sm:px-4">
             <Button ref={mobileMenuButtonRef} isIconOnly aria-label="打开菜单" className="h-10 w-10 min-w-10" radius="sm" variant="flat" onPress={() => setMobileNavOpen(true)}><HamburgerIcon /></Button>
-            <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
+            <AppLogo className="min-w-0 shrink" label="specus" markClassName="h-8 w-8" />
             <span className="ml-auto truncate text-tiny font-medium text-default-500">{activeTitle}</span>
             <div className="flex shrink-0 items-center gap-1.5"><UserMenu profile={profile} onLogout={logout} /></div>
           </div>
@@ -198,7 +198,7 @@ function MobileNav({ open, groups, active, onSelect, onClose, triggerRef }: { op
       className={`app-apple-sidebar fixed inset-y-0 left-0 z-50 flex w-64 max-w-[86vw] flex-col bg-background transition-transform duration-200 lg:hidden ${open ? "translate-x-0" : "-translate-x-full"}`}
     >
       <div className="app-apple-nav-brand flex h-14 items-center justify-between gap-2 px-3">
-        <AppLogo className="min-w-0 shrink" label="shuai-tunnel" markClassName="h-8 w-8" />
+        <AppLogo className="min-w-0 shrink" label="specus" markClassName="h-8 w-8" />
         <Button isIconOnly aria-label="关闭" className="h-9 w-9 min-w-9" radius="sm" variant="light" onPress={onClose}><CloseIcon /></Button>
       </div>
       <Sidebar groups={groups} active={active} onSelect={onSelect} variant="mobile" onClose={onClose} />
@@ -268,7 +268,7 @@ function ActivePanel({ panel, initializing, onInitializeDatabase }: { panel: Pan
   switch (panel) {
     case "clients": return <LazyClientsPanel />;
     case "messages": return <LazyAdminMessagesPanel />;
-    case "tunnels": return <LazyTunnelsPanel />;
+    case "specusMappings": return <LazySpecusMappingsPanel />;
     case "http-routes": return <LazyHttpRoutesPanel />;
     case "peer-mesh": return <LazyPeerMeshPanel />;
     case "connections": return <LazyConnectionsPanel />;

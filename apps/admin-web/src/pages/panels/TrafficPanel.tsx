@@ -128,7 +128,7 @@ export function TrafficPanel() {
     try {
       const [clients, tcp, http] = await Promise.all([
         adminApi.listTraffic(150),
-        adminApi.listResourceTraffic("TCP_TUNNEL", 200),
+        adminApi.listResourceTraffic("TCP_SPECUS", 200),
         adminApi.listResourceTraffic("HTTP_ROUTE", 200),
       ]);
       setClientRows(clients);
@@ -397,7 +397,7 @@ export function TrafficPanel() {
             rows={tcpRows}
             loading={loading}
             emptyContent="暂无 TCP 映射流量"
-            type="TCP_TUNNEL"
+            type="TCP_SPECUS"
           />
           <TcpFrameTable
             rows={tcpFrameRows}
@@ -624,14 +624,14 @@ function ResourceTrafficSection({
 
   return (
     <div className="flex flex-col gap-2">
-      <MetricCards summary={summary} resourceLabel={type === "TCP_TUNNEL" ? "映射" : "路由"} />
+      <MetricCards summary={summary} resourceLabel={type === "TCP_SPECUS" ? "映射" : "路由"} />
 
       <Card shadow="none" className="rounded-md border border-default-200">
         <CardBody className="gap-2 p-2.5">
           <div>
             <h3 className="text-small font-semibold">资源流量排行</h3>
             <p className="text-tiny text-default-500">
-              {type === "TCP_TUNNEL" ? "按公网监听端口聚合" : "按 HTTP 路由名聚合"}
+              {type === "TCP_SPECUS" ? "按公网监听端口聚合" : "按 HTTP 路由名聚合"}
               {totals.length > 8 ? `，仅展示前 8 个（共 ${totals.length} 个）` : ""}
             </p>
           </div>

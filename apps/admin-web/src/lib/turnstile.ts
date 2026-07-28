@@ -29,7 +29,7 @@ declare global {
   }
 }
 
-const SCRIPT_MARKER = "data-shuai-turnstile";
+const SCRIPT_MARKER = "data-specus-turnstile";
 const CONTAINER_ID = "auth-turnstile";
 const LOAD_TIMEOUT_MS = 12_000;
 const CHALLENGE_TIMEOUT_MS = 120_000;

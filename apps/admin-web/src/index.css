@@ -2292,10 +2292,47 @@ body {
   background: var(--app-apple-blue-soft);
 }
 
+/* ── specus 主视觉：引水渠 ─────────────────────────────────────────── */
+
+.specus-aqueduct {
+  width: 100%;
+  height: auto;
+  max-width: 640px;
+  overflow: visible;
+}
+
+/* 动效降级在组件内按 prefers-reduced-motion 分支渲染：
+   SMIL 不受 CSS display 约束，若在这里再叠一层 transform 会把光点推出画面。 */
+
+/* 标语三段式：引水渠 · 打洞 · 观测 */
+.specus-tagline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem 0.75rem;
+  color: var(--landing-muted);
+  font-size: 0.9375rem;
+  letter-spacing: 0.14em;
+}
+
+.specus-tagline b {
+  color: var(--landing-ink);
+  font-weight: 600;
+}
+
+.specus-tagline span[aria-hidden] {
+  color: var(--landing-action);
+  opacity: 0.55;
+}
+
 /* Apple landing page: quiet product canvas, a single action blue, and no decorative effects. */
 .landing-apple {
+  /* 与标识、favicon 同源的动作蓝：深色底用亮蓝、浅色底用深蓝 */
   --landing-action: #0066cc;
-  --landing-action-soft: rgba(0, 102, 204, 0.1);
+  --landing-action-soft: rgba(122, 92, 230, 0.1);
+  --specus-stroke: #14161f;
+  --specus-accent: #0066cc;
   --landing-canvas: #f5f5f7;
   --landing-section: #ffffff;
   --landing-surface: #ffffff;
@@ -2311,7 +2348,9 @@ body {
 
 .dark .landing-apple {
   --landing-action: #2997ff;
-  --landing-action-soft: rgba(41, 151, 255, 0.14);
+  --landing-action-soft: rgba(155, 130, 255, 0.16);
+  --specus-stroke: #f2f3f7;
+  --specus-accent: #2997ff;
   --landing-canvas: #000000;
   --landing-section: #1d1d1f;
   --landing-surface: #272729;

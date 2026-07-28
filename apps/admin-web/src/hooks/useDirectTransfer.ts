@@ -1428,7 +1428,7 @@ function peerChannelKey(peerId: string, mode: PeerTransportMode, purpose: PeerCh
 }
 
 function peerChannelLabel(purpose: PeerChannelPurpose) {
-  return `shuai-v2-${purpose}`;
+  return `specus-v2-${purpose}`;
 }
 
 function channelPurposeFromLabel(label: string): PeerChannelPurpose | null {

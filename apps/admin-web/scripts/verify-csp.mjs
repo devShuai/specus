@@ -24,7 +24,7 @@ const policySources = [
       "java",
       "com",
       "theshuai",
-      "tunnelserver",
+      "specusserver",
       "config",
       "SecurityConfig.java",
     ),
@@ -49,14 +49,14 @@ const policySources = [
       "csharp",
       "server",
       "src",
-      "ShuaiTunnel.Server",
+      "Specus.Server",
       "Management",
       "ManagementPageSecurityHeaders.cs",
     ),
   },
   {
     label: "OpenResty",
-    path: join(repoRoot, "deploy", "openresty", "shuai-tunnel.conf"),
+    path: join(repoRoot, "deploy", "openresty", "specus.conf"),
   },
 ];
 

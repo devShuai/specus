@@ -55,8 +55,8 @@ function probe(server: string, candidates: ReturnType<typeof srflx>[]) {
 describe("browser NAT result presentation", () => {
   it("uses the self-hosted primary and backup STUN endpoints by default", () => {
     expect(defaultStunServers()).toEqual([
-      "stun:stun1.tunnel.devshuai.com:34780",
-      "stun:stun2.tunnel.devshuai.com:34780",
+      "stun:stun1.specus.devshuai.com:34780",
+      "stun:stun2.specus.devshuai.com:34780",
     ]);
   });
 

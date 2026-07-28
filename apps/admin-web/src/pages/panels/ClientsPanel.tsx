@@ -164,7 +164,7 @@ export function ClientsPanel() {
     try {
       const result = await adminApi.pushNatControl(client.id);
       const http = result.httpRoutes < 0 ? "-" : String(result.httpRoutes);
-      notify(`已下发：TCP ${result.tunnels} 条 / HTTP ${http} 条`);
+      notify(`已下发：TCP ${result.specusMappings} 条 / HTTP ${http} 条`);
     } catch (error) {
       notifyError(error, "下发失败");
     }

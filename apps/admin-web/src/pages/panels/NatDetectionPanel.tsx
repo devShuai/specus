@@ -19,8 +19,8 @@ import { NAT_TRAVERSAL_REFERENCE, natTypeProfile } from "../../lib/nat";
 import { usePageSeo } from "../../lib/seo";
 
 export const DEFAULT_NAT_STUN_SERVERS = [
-  "stun:stun1.tunnel.devshuai.com:34780",
-  "stun:stun2.tunnel.devshuai.com:34780",
+  "stun:stun1.specus.devshuai.com:34780",
+  "stun:stun2.specus.devshuai.com:34780",
 ];
 const UNASSIGNED_STUN_SERVER = "未归属 ICE candidate";
 const MIN_CHECKING_DISPLAY_MS = 900;
@@ -348,18 +348,18 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
   usePageSeo(
     publicPage
       ? {
-          title: "在线 NAT 类型检测 · 浏览器 STUN 探测 · shuai-tunnel",
+          title: "在线 NAT 类型检测 · 浏览器 STUN 探测 · specus",
           description:
             "免登录在线检测当前网络的 NAT 映射行为：使用 RFC 5780 四端点预检与共享 WebRTC ICE 探测，识别 EIM、ADM、APDM、端口保持与 UDP 阻断。",
-          canonical: "https://tunnel.devshuai.com/nat-detect",
+          canonical: "https://specus.devshuai.com/nat-detect",
           keywords:
             "NAT 检测,NAT 类型,EIM,ADM,APDM,Symmetric NAT,RFC 5780,RFC 8489,STUN,WebRTC,在线 NAT 测试,UDP 打洞,P2P 直连",
           jsonLd: [
             {
               "@context": "https://schema.org",
               "@type": "WebApplication",
-              "name": "shuai-tunnel 在线 NAT 检测",
-              "url": "https://tunnel.devshuai.com/nat-detect",
+              "name": "specus 在线 NAT 检测",
+              "url": "https://specus.devshuai.com/nat-detect",
               "applicationCategory": "UtilitiesApplication",
               "browserRequirements": "需要支持 WebRTC 的现代浏览器 (Chrome / Edge / Firefox / Safari)",
               "operatingSystem": "Web",
@@ -395,7 +395,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
                   "acceptedAnswer": {
                     "@type": "Answer",
                     "text":
-                      "页面只从 shuai-tunnel 接口读取 STUN 拓扑，不上传检测结果。浏览器会创建一个空的 WebRTC data channel，触发 ICE candidate 收集，并向配置的 STUN 端点发送 Binding 请求；不会读取摄像头或麦克风。",
+                      "页面只从 specus 接口读取 STUN 拓扑，不上传检测结果。浏览器会创建一个空的 WebRTC data channel，触发 ICE candidate 收集，并向配置的 STUN 端点发送 Binding 请求；不会读取摄像头或麦克风。",
                   },
                 },
               ],
@@ -403,9 +403,9 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
           ],
         }
       : {
-          title: "NAT 类型检测 · shuai-tunnel 管理后台",
+          title: "NAT 类型检测 · specus 管理后台",
           description: "管理员视图：浏览器侧检测当前所在网络的 NAT 类型与公网映射稳定性。",
-          canonical: "https://tunnel.devshuai.com/nat-detect",
+          canonical: "https://specus.devshuai.com/nat-detect",
         },
   );
 
@@ -613,7 +613,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
     return (
       <main className="app-apple-tool relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
         <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8">
-          <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
+          <AppLogo className="min-w-0 flex-1" label="specus" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
           <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu active="nat-detect" />
             <UserMenuButton className="public-header-theme-button" />
@@ -821,7 +821,7 @@ function NatHero({
               onValueChange={onServersTextChange}
               description={probeActive
                 ? "默认使用自建 A1/A2、P1/P2 四端点。页面先逐一验证可达性，再用同一 ICE socket 对比映射；不会使用 TURN relay。"
-                : `默认使用 shuai-tunnel 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
+                : `默认使用 specus 主备 STUN${selfHostedStunServer ? `，首选 ${selfHostedStunServer}` : ""}。浏览器仅使用标准 STUN Binding，不使用 TURN relay。`}
             />
             <Input
               label="单服务超时"
@@ -2275,7 +2275,7 @@ async function probeStunServers(
     };
 
     try {
-      pc.createDataChannel("shuai-tunnel-nat-check");
+      pc.createDataChannel("specus-nat-check");
       reportProbeProgress("正在创建 ICE 探测会话");
       void pc
         .createOffer()

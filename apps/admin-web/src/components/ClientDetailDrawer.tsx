@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Button, Chip, Spinner } from "@heroui/react";
 import { adminApi } from "../api/client";
-import type { Client, ClientDetail, Tunnel, HttpRoute } from "../api/types";
+import type { Client, ClientDetail, Specus, HttpRoute } from "../api/types";
 import { formatBytes, formatDateTime, formatSince } from "../lib/format";
 import { notifyError, notify } from "./toast";
 
@@ -30,12 +30,12 @@ export function ClientDetailDrawer({ client, open, onClose }: { client: Client |
                 <F l="\u6BCF\u5206\u949F\u4E0A\u9650" v={String(detail.client.connectionRateLimitPerMinute)} />
               </Sec>
               <Sec t="\u6D41\u91CF"><F l="\u4E0A\u4F20" v={formatBytes(detail.client.uploadBytes)} /><F l="\u4E0B\u8F7D" v={formatBytes(detail.client.downloadBytes)} /></Sec>
-              <Sec t={`\u7AEF\u53E3\u6620\u5C04 \u00B7 ${detail.tunnels.length + detail.httpRoutes.length} \u9879`}>
-                {detail.tunnels.map((t: Tunnel) => <div key={t.id} className="flex items-center justify-between rounded-md bg-default-50 px-3 py-1.5 text-tiny"><span className="font-mono">{t.listenPort} {"\u2192"} {t.targetAddress}:{t.targetPort}</span><Chip size="sm" variant="flat" color={t.enabled ? "success" : "default"}>{t.enabled ? "\u542F\u7528" : "\u505C\u7528"}</Chip></div>)}
+              <Sec t={`\u7AEF\u53E3\u6620\u5C04 \u00B7 ${detail.specusMappings.length + detail.httpRoutes.length} \u9879`}>
+                {detail.specusMappings.map((t: Specus) => <div key={t.id} className="flex items-center justify-between rounded-md bg-default-50 px-3 py-1.5 text-tiny"><span className="font-mono">{t.listenPort} {"\u2192"} {t.targetAddress}:{t.targetPort}</span><Chip size="sm" variant="flat" color={t.enabled ? "success" : "default"}>{t.enabled ? "\u542F\u7528" : "\u505C\u7528"}</Chip></div>)}
                 {detail.httpRoutes.map((r: HttpRoute) => <div key={r.id} className="flex items-center justify-between rounded-md bg-default-50 px-3 py-1.5 text-tiny"><span className="font-mono">{r.route} {"\u2192"} {r.targetBaseUrl}</span><Chip size="sm" variant="flat" color={r.enabled ? "success" : "default"}>{r.enabled ? "\u542F\u7528" : "\u505C\u7528"}</Chip></div>)}
-                {detail.tunnels.length === 0 && detail.httpRoutes.length === 0 && <div className="text-tiny text-default-400">\u6682\u65E0\u7AEF\u53E3\u6620\u5C04</div>}
+                {detail.specusMappings.length === 0 && detail.httpRoutes.length === 0 && <div className="text-tiny text-default-400">\u6682\u65E0\u7AEF\u53E3\u6620\u5C04</div>}
               </Sec>
-              <Button size="sm" variant="flat" onPress={async () => { if (!client) return; try { const r = await adminApi.forceRefreshPortMapping(client.id); notify(`\u5DF2\u63A8\u9001\uFF1A${r.tunnels} \u4E2A\u7AEF\u53E3\u6620\u5C04`); } catch (e) { notifyError(e, "\u5237\u65B0\u5931\u8D25"); } }}>\u5F3A\u5236\u5237\u65B0\u7AEF\u53E3\u6620\u5C04</Button>
+              <Button size="sm" variant="flat" onPress={async () => { if (!client) return; try { const r = await adminApi.forceRefreshPortMapping(client.id); notify(`\u5DF2\u63A8\u9001\uFF1A${r.specusMappings} \u4E2A\u7AEF\u53E3\u6620\u5C04`); } catch (e) { notifyError(e, "\u5237\u65B0\u5931\u8D25"); } }}>\u5F3A\u5236\u5237\u65B0\u7AEF\u53E3\u6620\u5C04</Button>
             </div>
           ) : <div className="py-12 text-center text-small text-default-400">\u65E0\u6570\u636E</div>}
         </div>

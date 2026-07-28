@@ -29,10 +29,54 @@ function fillCoverage(size, px, py, x, y, width, height, radius) {
   return clamp01(0.5 - roundedRectDistance(px, py, x, y, width, height, radius) / antialias);
 }
 
-function strokeCoverage(size, px, py, x, y, width, height, radius, strokeWidth) {
+function segmentDistance(px, py, startX, startY, endX, endY) {
+  const dx = endX - startX;
+  const dy = endY - startY;
+  const lengthSquared = dx * dx + dy * dy;
+
+  if (lengthSquared === 0) {
+    return Math.hypot(px - startX, py - startY);
+  }
+
+  const progress = clamp01(((px - startX) * dx + (py - startY) * dy) / lengthSquared);
+  return Math.hypot(px - (startX + progress * dx), py - (startY + progress * dy));
+}
+
+function strokePolylineCoverage(size, px, py, points, strokeWidth) {
   const antialias = 64 / size;
-  const distance = Math.abs(roundedRectDistance(px, py, x, y, width, height, radius)) - strokeWidth / 2;
+  let distance = Number.POSITIVE_INFINITY;
+
+  for (let index = 1; index < points.length; index += 1) {
+    distance = Math.min(
+      distance,
+      segmentDistance(px, py, points[index - 1][0], points[index - 1][1], points[index][0], points[index][1]),
+    );
+  }
+
+  distance -= strokeWidth / 2;
   return clamp01(0.5 - distance / antialias);
+}
+
+function circleCoverage(size, px, py, centerX, centerY, radius) {
+  const antialias = 64 / size;
+  return clamp01(0.5 - (Math.hypot(px - centerX, py - centerY) - radius) / antialias);
+}
+
+function archPoints(left, right, baseline, bottom) {
+  const center = (left + right) / 2;
+  const radius = (right - left) / 2;
+  const points = [
+    [left, bottom],
+    [left, baseline],
+  ];
+
+  for (let step = 1; step <= 32; step += 1) {
+    const angle = Math.PI - (Math.PI * step) / 32;
+    points.push([center + Math.cos(angle) * radius, baseline - Math.sin(angle) * radius]);
+  }
+
+  points.push([right, bottom]);
+  return points;
 }
 
 function paint(pixel, color, coverage) {
@@ -54,12 +98,29 @@ function colorAt(size, x, y) {
   const px = (x / size) * 64;
   const py = (y / size) * 64;
   const pixel = [0, 0, 0, 0];
+  const white = [242, 243, 247, 255];
+  const accent = [41, 151, 255, 255];
 
-  paint(pixel, [20, 22, 31, 255], fillCoverage(size, px, py, 0, 0, 64, 64, 14));
-  paint(pixel, [242, 243, 247, 255], strokeCoverage(size, px, py, 10.5, 10.5, 43, 43, 12, 4));
-  paint(pixel, [242, 243, 247, 158], strokeCoverage(size, px, py, 18, 18, 28, 28, 8.5, 4));
-  paint(pixel, [242, 243, 247, 87], strokeCoverage(size, px, py, 24.5, 24.5, 15, 15, 5.5, 4));
-  paint(pixel, [155, 130, 255, 255], fillCoverage(size, px, py, 29, 29, 6, 6, 2));
+  paint(pixel, [20, 22, 31, 255], fillCoverage(size, px, py, 0, 0, 64, 64, size === 16 ? 12 : 14));
+
+  if (size === 16) {
+    paint(pixel, white, strokePolylineCoverage(size, px, py, [[6, 12], [58, 12]], 9));
+    paint(pixel, accent, strokePolylineCoverage(size, px, py, archPoints(17, 47, 46, 57), 9));
+    return pixel;
+  }
+
+  if (size === 32) {
+    paint(pixel, white, strokePolylineCoverage(size, px, py, [[6, 13], [58, 13]], 6));
+    paint(pixel, white, strokePolylineCoverage(size, px, py, archPoints(16, 48, 42, 54), 6));
+    paint(pixel, accent, circleCoverage(size, px, py, 32, 44, 5.5));
+    return pixel;
+  }
+
+  paint(pixel, white, strokePolylineCoverage(size, px, py, [[7, 14], [57, 14]], 4.5));
+  paint(pixel, [242, 243, 247, 128], strokePolylineCoverage(size, px, py, archPoints(8, 20, 36, 52), 4.5));
+  paint(pixel, white, strokePolylineCoverage(size, px, py, archPoints(20, 44, 36, 52), 4.5));
+  paint(pixel, [242, 243, 247, 128], strokePolylineCoverage(size, px, py, archPoints(44, 56, 36, 52), 4.5));
+  paint(pixel, accent, circleCoverage(size, px, py, 32, 42, 4));
 
   return pixel;
 }

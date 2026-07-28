@@ -256,7 +256,7 @@ export function AuthDialog() {
       >
         <div className="auth-dialog-brand-row">
           <AppLogo
-            label="shuai-tunnel"
+            label="specus"
             subtitle={isVerifyingEmail ? "邮箱安全验证" : isRegister ? "创建账号" : "安全账号访问"}
             markClassName="h-9 w-9"
           />

@@ -1,10 +1,10 @@
 import type { WhiteboardObject, WhiteboardPoint, WhiteboardStroke } from "../components/SyncedWhiteboard";
 import { MAX_WHITEBOARD_IMAGE_DATA_URL_LENGTH } from "./whiteboardImageCompression";
 
-export const WHITEBOARD_DOCUMENT_FORMAT = "shuai-tunnel-whiteboard";
+export const WHITEBOARD_DOCUMENT_FORMAT = "specus-whiteboard";
 export const WHITEBOARD_DOCUMENT_VERSION = 1;
 export const WHITEBOARD_FILE_EXTENSION = ".stwb";
-export const WHITEBOARD_FILE_MIME = "application/vnd.shuai-tunnel.whiteboard";
+export const WHITEBOARD_FILE_MIME = "application/vnd.specus.whiteboard";
 export const MAX_WHITEBOARD_DOCUMENT_BYTES = 16 * 1024 * 1024;
 export const MAX_WHITEBOARD_DOCUMENT_STROKES = 120;
 export const MAX_WHITEBOARD_DOCUMENT_POINTS = 900;

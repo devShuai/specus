@@ -8,4 +8,4 @@ Disallow: /api/
 Disallow: /oidc/
 Disallow: /auth/
 
-Sitemap: https://tunnel.devshuai.com/sitemap.xml
+Sitemap: https://specus.devshuai.com/sitemap.xml

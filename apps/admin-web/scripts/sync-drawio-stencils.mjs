@@ -143,7 +143,7 @@ await rm(targetRoot, { recursive: true, force: true });
 await mkdir(path.dirname(targetRoot), { recursive: true });
 await cp(sourceRoot, targetRoot, { recursive: true });
 const catalog = {
-  format: "shuai-drawio-stencil-catalog",
+  format: "specus-drawio-stencil-catalog",
   version: 1,
   generatedAt: new Date().toISOString(),
   source: "https://github.com/jgraph/drawio/tree/dev/src/main/webapp/stencils",

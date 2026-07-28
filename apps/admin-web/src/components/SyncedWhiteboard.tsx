@@ -1598,7 +1598,7 @@ export function SyncedWhiteboard({
       <input
         ref={documentInputRef}
         type="file"
-        accept=".stwb,.json,application/json,application/vnd.shuai-tunnel.whiteboard,application/vnd.shuai-tunnel.whiteboard+json"
+        accept=".stwb,.json,application/json,application/vnd.specus.whiteboard,application/vnd.specus.whiteboard+json"
         hidden
         disabled={isReadOnly}
         onChange={handleDocumentInput}
@@ -2592,7 +2592,7 @@ function createWhiteboardId(peerId: string, kind: string) {
 
 function whiteboardExportFileName(date: Date) {
   const timestamp = date.toISOString().replace(/\D/g, "").slice(0, 14);
-  return `shuai-tunnel-whiteboard-${timestamp}${WHITEBOARD_FILE_EXTENSION}`;
+  return `specus-whiteboard-${timestamp}${WHITEBOARD_FILE_EXTENSION}`;
 }
 
 function createShapeObject(

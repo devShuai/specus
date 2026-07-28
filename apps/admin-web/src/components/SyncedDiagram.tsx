@@ -333,7 +333,7 @@ const GRAPH_ORIGIN = Symbol("diagram-graph");
 const IMPORT_ORIGIN = Symbol("diagram-import");
 const REMOTE_ORIGIN = Symbol("diagram-remote");
 const DIAGRAM_CACHE_LIMIT = 8;
-const DIAGRAM_SESSION_VERSION_PREFIX = "shuai-diagram-session-versions:";
+const DIAGRAM_SESSION_VERSION_PREFIX = "specus-diagram-session-versions:";
 const MAX_DIAGRAM_SESSION_VERSIONS = 20;
 const MAX_DIAGRAM_SESSION_VERSION_STORAGE_BYTES = 4 * 1024 * 1024;
 const NODES_MAP = "nodes";
@@ -2979,7 +2979,7 @@ export function SyncedDiagram({
       if (!pdf) {
         throw new Error("没有可导出的流程图页面");
       }
-      pdf.setProperties({ title: "shuai-tunnel 流程图", creator: "shuai-tunnel" });
+      pdf.setProperties({ title: "specus 流程图", creator: "specus" });
       downloadDiagramBlob(pdf.output("blob"), diagramExportFileName(new Date(), ".pdf"));
       setStatus(`已导出包含 ${orderedPages.length} 个页面的 PDF。`);
     } catch (error) {
@@ -5206,7 +5206,7 @@ export function SyncedDiagram({
                   <p className="text-[12px] leading-5 text-zinc-500 dark:text-zinc-400">选择适合后续编辑、演示或代码协作的格式。</p>
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                     {([
-                      ["stdg", "shuai-tunnel", "保留完整编辑信息"],
+                      ["stdg", "specus", "保留完整编辑信息"],
                       ["drawio", "draw.io", "继续在 draw.io 编辑"],
                       ["svg", "SVG", "矢量图片"],
                       ["pdf", "PDF", "多页面分享"],
@@ -5859,7 +5859,7 @@ function createDiagramId(peerId: string, kind: string) {
 
 function diagramExportFileName(date: Date, extension = DIAGRAM_FILE_EXTENSION) {
   const timestamp = date.toISOString().replace(/\D/g, "").slice(0, 14);
-  return `shuai-tunnel-diagram-${timestamp}${extension}`;
+  return `specus-diagram-${timestamp}${extension}`;
 }
 
 function downloadDiagramFile(content: string, type: string, fileName: string) {

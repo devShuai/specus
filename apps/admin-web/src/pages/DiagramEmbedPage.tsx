@@ -7,7 +7,7 @@ import type { WhiteboardInboundEvent } from "../components/SyncedWhiteboard";
  * 可嵌入网页的流程图编辑器（iframe + postMessage 协议）。
  *
  * 宿主页面通过 `<iframe src="…/diagram-embed?origin=<宿主 origin>">` 嵌入，
- * 消息均为 JSON 对象，子页面发出的消息带 `source: "shuai-diagram-embed"`：
+ * 消息均为 JSON 对象，子页面发出的消息带 `source: "specus-diagram-embed"`：
  *
  * 子页面 → 宿主：
  *   { event: "init" }                     编辑器就绪，可以发送 load
@@ -26,7 +26,7 @@ import type { WhiteboardInboundEvent } from "../components/SyncedWhiteboard";
  * 来源。含文档数据的消息只会发往已锁定的 origin，不会广播。
  */
 
-const EMBED_MESSAGE_SOURCE = "shuai-diagram-embed";
+const EMBED_MESSAGE_SOURCE = "specus-diagram-embed";
 const EMBED_CHANGE_THROTTLE_MS = 800;
 const EMBED_EVENTS: WhiteboardInboundEvent[] = [];
 

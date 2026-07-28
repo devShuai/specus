@@ -55,7 +55,7 @@
   window.addEventListener("message", (event) => {
     if (event.origin !== editorOrigin || event.source !== frame.contentWindow) return;
     const data = event.data;
-    if (!data || data.source !== "shuai-diagram-embed") return;
+    if (!data || data.source !== "specus-diagram-embed") return;
     log("←", data);
     if (data.event === "init") {
       statusEl.textContent = "编辑器已就绪";

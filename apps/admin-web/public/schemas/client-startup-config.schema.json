@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
-  "title": "shuai-tunnel 客户端启动配置",
+  "$id": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
+  "title": "specus 客户端启动配置",
   "description": "client.jsonc JSONC 启动配置的跨语言字段约束。",
   "type": "object",
   "additionalProperties": false,
@@ -50,7 +50,7 @@
     },
     "peerMeshTunName": {
       "type": "string",
-      "default": "shuai0",
+      "default": "specus0",
       "minLength": 1,
       "description": "Peer Mesh 虚拟网卡名称。"
     },

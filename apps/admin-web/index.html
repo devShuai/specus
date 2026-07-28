@@ -5,9 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#05070c" />
-    <script>/* 首帧前写入主题 class 与 color-scheme，避免暗色用户先闪一帧亮屏（FOUC）。key 与 ThemeContext 的 THEME_KEY 保持一致；逻辑与 getSystemTheme 对齐（默认暗色，仅 prefers light 时为浅色）。 */(function(){try{var saved=window.localStorage.getItem("shuai_tunnel_theme");var theme=saved==="light"||saved==="dark"?saved:(window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");var root=document.documentElement;root.classList.add(theme);root.dataset.theme=theme;root.style.colorScheme=theme;}catch(error){}})();</script>
-    <link rel="icon" href="/favicon.ico" sizes="any" />
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script>/* 首帧前写入主题 class 与 color-scheme，避免暗色用户先闪一帧亮屏（FOUC）。key 与 ThemeContext 的 THEME_KEY 保持一致；逻辑与 getSystemTheme 对齐（默认暗色，仅 prefers light 时为浅色）。 */(function(){try{var saved=window.localStorage.getItem("specus_theme");var theme=saved==="light"||saved==="dark"?saved:(window.matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");var root=document.documentElement;root.classList.add(theme);root.dataset.theme=theme;root.style.colorScheme=theme;}catch(error){}})();</script>
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg" />
+    <link rel="icon" type="image/svg+xml" sizes="32x32" href="/favicon-32.svg" />
+    <link rel="icon" type="image/svg+xml" sizes="16x16" href="/favicon-16.svg" />
+    <link rel="alternate icon" href="/favicon.ico" />
     <style>
       .boot-shell {
         min-height: 100vh;
@@ -58,22 +60,22 @@
       SEO 默认值（首页/landing）；进入具体路由时由 src/lib/seo.ts 动态覆写。
       关键词围绕国内可搜索的高频长尾：内网穿透、HTTP 反向代理、对端互联、NAT 类型检测等。
     -->
-    <title>shuai-tunnel · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面</title>
-    <meta name="description" content="shuai-tunnel 是一套自托管的内网穿透控制面，支持 TCP 端口映射、HTTP 反向代理（含路径改写）、私有组网对端互联与浏览器 NAT 类型检测，自带 Java / Go / .NET 多语言客户端。" />
-    <meta name="keywords" content="内网穿透,NAT 检测,WebRTC NAT,STUN 探测,Symmetric NAT,Full Cone NAT,内网映射,HTTP 反向代理,对端互联,Peer Mesh,P2P 打洞,frp 替代,自托管,shuai-tunnel" />
+    <title>specus · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面</title>
+    <meta name="description" content="specus 是一套自托管的内网穿透控制面，支持 TCP 端口映射、HTTP 反向代理（含路径改写）、私有组网对端互联与浏览器 NAT 类型检测，自带 Java / Go / .NET 多语言客户端。" />
+    <meta name="keywords" content="内网穿透,NAT 检测,WebRTC NAT,STUN 探测,Symmetric NAT,Full Cone NAT,内网映射,HTTP 反向代理,对端互联,Peer Mesh,P2P 打洞,frp 替代,自托管,specus" />
     <meta name="author" content="devShuai" />
     <meta name="referrer" content="strict-origin-when-cross-origin" />
-    <link rel="canonical" href="https://tunnel.devshuai.com/" />
+    <link rel="canonical" href="https://specus.devshuai.com/" />
 
     <!-- Open Graph / Twitter / 微信分享卡片 -->
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="shuai-tunnel" />
-    <meta property="og:title" content="shuai-tunnel · 自托管内网穿透 / 对端互联控制面" />
+    <meta property="og:site_name" content="specus" />
+    <meta property="og:title" content="specus · 自托管内网穿透 / 对端互联控制面" />
     <meta property="og:description" content="把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、可观测，TLS 开箱即用。免费在线 NAT 类型检测页面。" />
-    <meta property="og:url" content="https://tunnel.devshuai.com/" />
+    <meta property="og:url" content="https://specus.devshuai.com/" />
     <meta property="og:locale" content="zh_CN" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="shuai-tunnel · 自托管内网穿透控制面" />
+    <meta name="twitter:title" content="specus · 自托管内网穿透控制面" />
     <meta name="twitter:description" content="TCP 端口映射 + HTTP 反向代理 + 私有组网，多语言客户端，在线 NAT 检测。" />
 
     <!-- 结构化数据：Web 应用 -->
@@ -81,8 +83,8 @@
       {
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
-        "name": "shuai-tunnel",
-        "url": "https://tunnel.devshuai.com/",
+        "name": "specus",
+        "url": "https://specus.devshuai.com/",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Linux, Windows, macOS",
         "description": "自托管内网穿透 / HTTP 反向代理 / 对端互联控制面，支持 TCP 端口映射、路径改写的 HTTP 反向代理、Peer Mesh 私有组网与浏览器 NAT 类型检测。",
@@ -107,9 +109,9 @@
       </div>
     </div>
     <noscript>
-      <h1>shuai-tunnel · 自托管内网穿透控制面</h1>
+      <h1>specus · 自托管内网穿透控制面</h1>
       <p>
-        shuai-tunnel 是一套支持 TCP 端口映射、HTTP 反向代理、私有组网对端互联与浏览器 NAT 类型检测的自托管控制面。
+        specus 是一套支持 TCP 端口映射、HTTP 反向代理、私有组网对端互联与浏览器 NAT 类型检测的自托管控制面。
         本页面使用 JavaScript 渲染，请启用 JS 后查看控制台与在线检测工具。
       </p>
       <p>主要功能：</p>

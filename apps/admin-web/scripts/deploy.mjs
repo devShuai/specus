@@ -11,7 +11,7 @@ const dist = join(webRoot, "dist");
 
 const targets = {
   go: join(repoRoot, "implementations", "go", "server", "web", "static"),
-  csharp: join(repoRoot, "implementations", "csharp", "server", "src", "ShuaiTunnel.Server", "wwwroot"),
+  csharp: join(repoRoot, "implementations", "csharp", "server", "src", "Specus.Server", "wwwroot"),
   java: join(repoRoot, "implementations", "java", "server", "src", "main", "resources", "static"),
 };
 

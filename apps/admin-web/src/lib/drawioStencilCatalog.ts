@@ -27,7 +27,7 @@ export interface DrawioStencilLibrary {
 }
 
 export interface DrawioStencilCatalog {
-  format: "shuai-drawio-stencil-catalog";
+  format: "specus-drawio-stencil-catalog";
   version: 1;
   generatedAt: string;
   source: string;
@@ -167,7 +167,7 @@ export function renderDrawioStencilPreview(
 
 function isDrawioStencilCatalog(value: unknown): value is DrawioStencilCatalog {
   if (!isRecord(value)
-    || value.format !== "shuai-drawio-stencil-catalog"
+    || value.format !== "specus-drawio-stencil-catalog"
     || value.version !== 1
     || !Array.isArray(value.groups)
     || !Array.isArray(value.libraries)

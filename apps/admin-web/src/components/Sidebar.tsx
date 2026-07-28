@@ -7,7 +7,7 @@ export interface SidebarProps { groups: NavGroup[]; active: string; onSelect: (k
 
 export function Sidebar({ groups, active, onSelect, variant = "desktop", onClose, footer }: SidebarProps) {
   return <nav aria-label="主导航" className="app-apple-nav flex h-full flex-col">
-    {variant === "desktop" && <div className="app-apple-nav-brand flex h-14 shrink-0 items-center px-3"><AppLogo className="min-w-0" label="shuai-tunnel" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
+    {variant === "desktop" && <div className="app-apple-nav-brand flex h-14 shrink-0 items-center px-3"><AppLogo className="min-w-0" label="specus" markClassName="h-8 w-8" subtitle="管理后台" /></div>}
     <div className="app-apple-nav-scroll flex-1 overflow-y-auto px-2.5 py-2.5">
       {groups.map((g) => <div key={g.label} className="app-apple-nav-group mb-2.5">
         <div className="app-apple-nav-heading mb-1 px-2 text-small font-semibold text-default-400">{g.label}</div>
@@ -42,7 +42,7 @@ function Icon(k: string) {
     case "messages": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 016.5 3h11A2.5 2.5 0 0120 5.5v7A2.5 2.5 0 0117.5 15H10l-4 4v-4.2A2.5 2.5 0 014 12.5z"/><path d="M8 8h8M8 11h5"/></svg>;
     case "transfer": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M4 7.5A2.5 2.5 0 016.5 5h3l2 2h6A2.5 2.5 0 0120 9.5v7A2.5 2.5 0 0117.5 19h-11A2.5 2.5 0 014 16.5z"/><path d="M12 10v5"/><path d="M9.5 12.5 12 10l2.5 2.5"/></svg>;
     case "diagram": return <svg className={C} {...A} viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="6" rx="1.5"/><rect x="14" y="14" width="7" height="6" rx="1.5"/><path d="M10 7h2a5 5 0 015 5v2M7 10v3a4 4 0 004 4h3"/></svg>;
-    case "tunnels": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M7 7h10M7 10v7a2 2 0 002 2h6a2 2 0 002-2v-7M12 3v7M16 17v3a1 1 0 01-1 1h-6a1 1 0 01-1-1v-3"/></svg>;
+    case "specusMappings": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M7 7h10M7 10v7a2 2 0 002 2h6a2 2 0 002-2v-7M12 3v7M16 17v3a1 1 0 01-1 1h-6a1 1 0 01-1-1v-3"/></svg>;
     case "http-routes": return <svg className={C} {...A} viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><line x1="3" x2="21" y1="12" y2="12"/></svg>;
     case "downloads": return <svg className={C} {...A} viewBox="0 0 24 24"><path d="M12 3v12"/><polyline points="8,11 12,15 16,11"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>;
     case "traffic": return <svg className={C} {...A} viewBox="0 0 24 24"><line x1="4" x2="4" y1="20" y2="8"/><line x1="10" x2="10" y1="20" y2="4"/><line x1="16" x2="16" y1="20" y2="12"/></svg>;

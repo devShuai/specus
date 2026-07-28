@@ -486,11 +486,11 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
   }, [networkModeTransitionId]);
 
   usePageSeo({
-    title: isDiagramWorkspace ? "专业流程图 · shuai-tunnel" : "互传 · shuai-tunnel",
+    title: isDiagramWorkspace ? "专业流程图 · specus" : "互传 · specus",
     description: isDiagramWorkspace
       ? "支持实时协作、draw.io 图形库、多页文档和多格式导入导出的专业流程图工具。"
       : "打开同一个房间链接，在电脑和手机之间互传文件、同步剪贴板和共享白板。",
-    canonical: `https://tunnel.devshuai.com/#/${workspace}`,
+    canonical: `https://specus.devshuai.com/#/${workspace}`,
   });
   const isInternetMode = networkMode === "internet";
   const ossFallbackEnabled = authReady && authed;
@@ -1755,7 +1755,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       if (!url) throw new Error("安全邀请尚未生成");
       await shareOrCopy(
         {
-          title: isDiagramWorkspace ? "加入 shuai-tunnel 流程图房间" : "加入 shuai-tunnel 互传房间",
+          title: isDiagramWorkspace ? "加入 specus 流程图房间" : "加入 specus 互传房间",
           text: `${isInternetMode ? "远程" : "附近"}房间：${transferRoomDisplayName(roomId)}`,
           url,
         },
@@ -1953,7 +1953,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
       if (record.direct) {
         const fileShareData = {
           title: record.attachment.fileName,
-          text: "shuai-tunnel 直连文件",
+          text: "specus 直连文件",
           files: [record.file],
         };
         if (canShareFiles(fileShareData)) {
@@ -3136,7 +3136,7 @@ function PublicTransferPageContent({ workspace }: { workspace: PublicTransferWor
         <div key={networkModeTransitionId} className="transfer-mode-transition" aria-hidden="true" />
       ) : null}
       <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1480px] items-center justify-between gap-3 px-4 py-4 sm:px-8 sm:py-5">
-        <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
+        <AppLogo className="min-w-0 flex-1" label="specus" subtitle={isDiagramWorkspace ? "专业流程图" : "互传"} markClassName="h-8 w-8 sm:h-9 sm:w-9" />
         <div className="public-header-actions flex shrink-0 items-center gap-2">
           <PublicToolsMenu active={workspace} />
           <UserMenuButton className="public-header-theme-button" />

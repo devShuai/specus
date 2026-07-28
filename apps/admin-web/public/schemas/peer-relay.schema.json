@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tunnel.devshuai.com/schemas/peer-relay.schema.json",
-  "title": "shuai-tunnel Peer direct UDP connectivity check",
+  "$id": "https://specus.devshuai.com/schemas/peer-relay.schema.json",
+  "title": "specus Peer direct UDP connectivity check",
   "description": "Peer Mesh 客户端之间的 direct UDP check/check-response JSON。服务端 STUN/TURN 控制面使用标准二进制协议，不由本 Schema 描述。",
   "type": "object",
   "additionalProperties": false,
@@ -17,7 +17,7 @@
   ],
   "properties": {
     "magic": {
-      "const": "shuai-peer-mesh"
+      "const": "specus-peer-mesh"
     },
     "type": {
       "type": "string",

@@ -1,4 +1,4 @@
-// API DTOs mirroring the admin REST surface served by every tunnel-server implementation.
+// API DTOs mirroring the admin REST surface served by every specus-server implementation.
 
 export interface OidcConfig {
   configured: boolean;
@@ -70,14 +70,14 @@ export interface ClientNameAvailability {
 
 export interface ClientDetail {
   client: Client;
-  tunnels: Tunnel[];
+  specusMappings: Specus[];
   httpRoutes: HttpRoute[];
 }
 
 /** S3.2 单客户端聚合详情 */
 export interface ClientDetail {
   client: Client;
-  tunnels: Tunnel[];
+  specusMappings: Specus[];
   httpRoutes: HttpRoute[];
 }
 
@@ -96,7 +96,7 @@ export interface ClientCredentialResult {
   secret?: string;
 }
 
-export interface Tunnel {
+export interface Specus {
   id: number;
   clientId: number;
   clientName: string;
@@ -155,7 +155,7 @@ export interface TrafficUsage {
   updatedAt: string;
 }
 
-export type ResourceTrafficType = "TCP_TUNNEL" | "HTTP_ROUTE";
+export type ResourceTrafficType = "TCP_SPECUS" | "HTTP_ROUTE";
 
 export interface ResourceTrafficUsage {
   id: number;
@@ -295,7 +295,7 @@ export interface TrafficInspectionStatus {
 }
 
 export interface NatControlResult {
-  tunnels: number;
+  specusMappings: number;
   httpRoutes: number;
 }
 
@@ -703,7 +703,7 @@ export interface ClientCredentialMutation {
   maxOnlineInstances?: number;
 }
 
-export interface TunnelMutation {
+export interface SpecusMutation {
   listenPort: number;
   targetAddress: string;
   targetPort: number;

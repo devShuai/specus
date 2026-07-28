@@ -58,7 +58,7 @@ export function exportDrawioDocument(document: DiagramDocumentV1, pageName = "Pa
   }).join("");
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
-    `<mxfile host="shuai-tunnel" modified="${escapeXml(exportedAt)}" compressed="false">`,
+    `<mxfile host="specus" modified="${escapeXml(exportedAt)}" compressed="false">`,
     diagrams,
     "</mxfile>",
   ].join("");
@@ -139,8 +139,8 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
     }
     const style = parseStyle(cell.getAttribute("style") ?? "");
     let kind = nodeKindFromStyle(style, cleanLabel(cell.getAttribute("value") ?? ""));
-    const stencilName = style.get("shuaiStencil")?.trim();
-    const stencilLibrary = style.get("shuaiStencilLibrary")?.trim();
+    const stencilName = style.get("specusStencil")?.trim();
+    const stencilLibrary = style.get("specusStencilLibrary")?.trim();
     if (originalId && parentReferences.has(originalId) && kind !== "swimlane" && kind !== "lane") {
       kind = "container";
     }
@@ -153,13 +153,13 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
       y: finiteAttribute(geometry, "y", 0),
       width: positiveAttribute(geometry, "width", kind === "container" || kind === "swimlane" || kind === "lane" ? 480 : 160),
       height: positiveAttribute(geometry, "height", kind === "container" || kind === "swimlane" || kind === "lane" ? 320 : 72),
-      zIndex: safeInteger(style.get("shuaiZ"), index),
+      zIndex: safeInteger(style.get("specusZ"), index),
       ...(pageId ? { pageId } : {}),
       parentId: remapReference(normalizeParentId(cell.getAttribute("parent")), remappedIds),
-      ...(style.get("shuaiLocked") === "1" ? { locked: true } : {}),
+      ...(style.get("specusLocked") === "1" ? { locked: true } : {}),
       ...(boundedNumber(style.get("rotation"), 0, -360, 360) !== 0 ? { rotation: boundedNumber(style.get("rotation"), 0, -360, 360) } : {}),
-      ...(kind === "swimlane" && style.has("shuaiDirection")
-        ? { swimlaneDirection: style.get("shuaiDirection") === "vertical" ? "vertical" as const : "horizontal" as const }
+      ...(kind === "swimlane" && style.has("specusDirection")
+        ? { swimlaneDirection: style.get("specusDirection") === "vertical" ? "vertical" as const : "horizontal" as const }
         : {}),
       style: {
         fillColor: styleColor(style.get("fillColor"), kind === "container" || kind === "swimlane" || kind === "lane" ? "#f8fafc" : "#ffffff"),
@@ -177,14 +177,14 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
           bold: (safeInteger(style.get("fontStyle"), 1) & 1) === 1,
           italic: (safeInteger(style.get("fontStyle"), 1) & 2) === 2,
         } : {}),
-        ...(style.has("shuaiUnderline") || (safeInteger(style.get("fontStyle"), 0) & 4) === 4
-          ? { underline: style.has("shuaiUnderline") ? style.get("shuaiUnderline") === "1" : true }
+        ...(style.has("specusUnderline") || (safeInteger(style.get("fontStyle"), 0) & 4) === 4
+          ? { underline: style.has("specusUnderline") ? style.get("specusUnderline") === "1" : true }
           : {}),
-        ...(style.has("shuaiAlign") || style.get("align") === "left" || style.get("align") === "right"
-          ? { align: textAlign(style.get("shuaiAlign") ?? style.get("align")) }
+        ...(style.has("specusAlign") || style.get("align") === "left" || style.get("align") === "right"
+          ? { align: textAlign(style.get("specusAlign") ?? style.get("align")) }
           : {}),
-        ...(style.has("shuaiVerticalAlign") || style.get("verticalAlign") === "top" || style.get("verticalAlign") === "bottom"
-          ? { verticalAlign: verticalAlign(style.get("shuaiVerticalAlign") ?? style.get("verticalAlign")) }
+        ...(style.has("specusVerticalAlign") || style.get("verticalAlign") === "top" || style.get("verticalAlign") === "bottom"
+          ? { verticalAlign: verticalAlign(style.get("specusVerticalAlign") ?? style.get("verticalAlign")) }
           : {}),
         ...(style.has("spacing") ? { spacing: boundedNumber(style.get("spacing"), 10, 0, 60) } : {}),
         ...(style.has("opacity") ? { opacity: boundedNumber(style.get("opacity"), 100, 10, 100) } : {}),
@@ -229,7 +229,7 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
       sourcePort: portFromCoordinates(style.get("exitX"), style.get("exitY")),
       targetPort: portFromCoordinates(style.get("entryX"), style.get("entryY")),
       ...(points.length > 0 ? { waypoints: points } : {}),
-      zIndex: safeInteger(style.get("shuaiZ"), index),
+      zIndex: safeInteger(style.get("specusZ"), index),
       ...(pageId ? { pageId } : {}),
       style: {
         strokeColor: styleColor(style.get("strokeColor"), "#64748b"),
@@ -251,11 +251,11 @@ function parseGraphModel(graphModel: Element, pageId: string | undefined, usedCe
           bold: (safeInteger(style.get("fontStyle"), 0) & 1) === 1,
           italic: (safeInteger(style.get("fontStyle"), 0) & 2) === 2,
         } : {}),
-        ...(style.has("shuaiUnderline") || (safeInteger(style.get("fontStyle"), 0) & 4) === 4
-          ? { underline: style.has("shuaiUnderline") ? style.get("shuaiUnderline") === "1" : true }
+        ...(style.has("specusUnderline") || (safeInteger(style.get("fontStyle"), 0) & 4) === 4
+          ? { underline: style.has("specusUnderline") ? style.get("specusUnderline") === "1" : true }
           : {}),
-        ...(style.has("shuaiAlign") || style.get("align") === "left" || style.get("align") === "right"
-          ? { align: textAlign(style.get("shuaiAlign") ?? style.get("align")) }
+        ...(style.has("specusAlign") || style.get("align") === "left" || style.get("align") === "right"
+          ? { align: textAlign(style.get("specusAlign") ?? style.get("align")) }
           : {}),
         ...(style.has("opacity") ? { opacity: boundedNumber(style.get("opacity"), 100, 10, 100) } : {}),
       },
@@ -279,8 +279,8 @@ function drawioEdgeXml(edge: DiagramEdge) {
 function nodeStyle(node: DiagramNode) {
   const shape = node.stencilName ? `shape=${node.stencilName}` : drawioShape(node.kind);
   const style = [
-    `shuaiKind=${node.kind}`,
-    `shuaiZ=${node.zIndex}`,
+    `specusKind=${node.kind}`,
+    `specusZ=${node.zIndex}`,
     shape,
     "whiteSpace=wrap",
     "html=1",
@@ -292,17 +292,17 @@ function nodeStyle(node: DiagramNode) {
     `strokeWidth=${node.style.strokeWidth}`,
   ];
   if (node.stencilName && node.stencilLibrary) {
-    style.push(`shuaiStencil=${node.stencilName}`, `shuaiStencilLibrary=${node.stencilLibrary}`);
+    style.push(`specusStencil=${node.stencilName}`, `specusStencilLibrary=${node.stencilLibrary}`);
   }
-  if (node.locked) style.push("shuaiLocked=1");
+  if (node.locked) style.push("specusLocked=1");
   if (node.style.fontSize !== undefined) style.push(`fontSize=${node.style.fontSize}`);
-  if (node.style.fontFamily !== undefined) style.push(`shuaiFontFamily=${node.style.fontFamily}`, `fontFamily=${drawioFontFamily(node.style.fontFamily)}`);
+  if (node.style.fontFamily !== undefined) style.push(`specusFontFamily=${node.style.fontFamily}`, `fontFamily=${drawioFontFamily(node.style.fontFamily)}`);
   if (node.style.bold !== undefined || node.style.italic !== undefined || node.style.underline !== undefined) {
     style.push(`fontStyle=${(node.style.bold === true ? 1 : 0) + (node.style.italic ? 2 : 0) + (node.style.underline ? 4 : 0)}`);
   }
-  if (node.style.underline !== undefined) style.push(`shuaiUnderline=${node.style.underline ? 1 : 0}`);
-  if (node.style.align !== undefined) style.push(`shuaiAlign=${node.style.align}`, `align=${node.style.align}`);
-  if (node.style.verticalAlign !== undefined) style.push(`shuaiVerticalAlign=${node.style.verticalAlign}`, `verticalAlign=${node.style.verticalAlign}`);
+  if (node.style.underline !== undefined) style.push(`specusUnderline=${node.style.underline ? 1 : 0}`);
+  if (node.style.align !== undefined) style.push(`specusAlign=${node.style.align}`, `align=${node.style.align}`);
+  if (node.style.verticalAlign !== undefined) style.push(`specusVerticalAlign=${node.style.verticalAlign}`, `verticalAlign=${node.style.verticalAlign}`);
   if (node.style.spacing !== undefined) style.push(`spacing=${node.style.spacing}`);
   if (node.style.labelBackgroundColor !== undefined) style.push(`labelBackgroundColor=${node.style.labelBackgroundColor}`);
   if (node.rotation !== undefined) style.push(`rotation=${node.rotation}`);
@@ -311,14 +311,14 @@ function nodeStyle(node: DiagramNode) {
   if (node.style.rounded !== undefined) style.push(`rounded=${node.style.rounded ? 1 : 0}`);
   if (node.style.flipH !== undefined) style.push(`flipH=${node.style.flipH ? 1 : 0}`);
   if (node.style.flipV !== undefined) style.push(`flipV=${node.style.flipV ? 1 : 0}`);
-  if (node.kind === "swimlane" && node.swimlaneDirection) style.push(`shuaiDirection=${node.swimlaneDirection}`, `horizontal=${node.swimlaneDirection === "vertical" ? 0 : 1}`);
+  if (node.kind === "swimlane" && node.swimlaneDirection) style.push(`specusDirection=${node.swimlaneDirection}`, `horizontal=${node.swimlaneDirection === "vertical" ? 0 : 1}`);
   appendLinePattern(style, node.style.linePattern, node.style.dashed);
   return style.filter(Boolean).join(";") + ";";
 }
 
 function edgeStyle(edge: DiagramEdge) {
   const style = [
-    `shuaiZ=${edge.zIndex}`,
+    `specusZ=${edge.zIndex}`,
     drawioEdgeRoute(edge.style.edgeType ?? "orthogonal"),
     "rounded=1",
     `startArrow=${edge.style.startArrow ?? "none"}`,
@@ -332,12 +332,12 @@ function edgeStyle(edge: DiagramEdge) {
   if (edge.style.startSize !== undefined) style.push(`startSize=${edge.style.startSize}`);
   if (edge.style.endSize !== undefined) style.push(`endSize=${edge.style.endSize}`);
   if (edge.style.fontSize !== undefined) style.push(`fontSize=${edge.style.fontSize}`);
-  if (edge.style.fontFamily !== undefined) style.push(`shuaiFontFamily=${edge.style.fontFamily}`, `fontFamily=${drawioFontFamily(edge.style.fontFamily)}`);
+  if (edge.style.fontFamily !== undefined) style.push(`specusFontFamily=${edge.style.fontFamily}`, `fontFamily=${drawioFontFamily(edge.style.fontFamily)}`);
   if (edge.style.bold !== undefined || edge.style.italic !== undefined || edge.style.underline !== undefined) {
     style.push(`fontStyle=${(edge.style.bold ? 1 : 0) + (edge.style.italic ? 2 : 0) + (edge.style.underline ? 4 : 0)}`);
   }
-  if (edge.style.underline !== undefined) style.push(`shuaiUnderline=${edge.style.underline ? 1 : 0}`);
-  if (edge.style.align !== undefined) style.push(`shuaiAlign=${edge.style.align}`, `align=${edge.style.align}`);
+  if (edge.style.underline !== undefined) style.push(`specusUnderline=${edge.style.underline ? 1 : 0}`);
+  if (edge.style.align !== undefined) style.push(`specusAlign=${edge.style.align}`, `align=${edge.style.align}`);
   if (edge.style.labelBackgroundColor !== undefined) style.push(`labelBackgroundColor=${edge.style.labelBackgroundColor}`);
   const source = portCoordinates(edge.sourcePort);
   const target = portCoordinates(edge.targetPort);
@@ -506,7 +506,7 @@ function parseStyle(value: string) {
 }
 
 function nodeKindFromStyle(style: Map<string, string>, label: string): DiagramNodeKind {
-  const custom = style.get("shuaiKind");
+  const custom = style.get("specusKind");
   if (custom && isNodeKind(custom)) return custom;
   const shape = style.get("shape") ?? "";
   if (style.get("swimlane") === "1" || shape === "swimlane") return "swimlane";
@@ -546,14 +546,14 @@ function verticalAlign(value?: string): "top" | "middle" | "bottom" {
 }
 
 function linePatternFromDrawioStyle(style: Map<string, string>): DiagramLinePattern | undefined {
-  const custom = style.get("shuaiLinePattern");
+  const custom = style.get("specusLinePattern");
   if (custom === "solid" || custom === "dashed" || custom === "dotted") return custom;
   if (style.get("dashed") !== "1") return undefined;
   return /^\s*1(?:\s|$)/.test(style.get("dashPattern") ?? "") ? "dotted" : "dashed";
 }
 
 function fontFamilyFromDrawioStyle(style: Map<string, string>): DiagramFontFamily | undefined {
-  const custom = style.get("shuaiFontFamily");
+  const custom = style.get("specusFontFamily");
   if (custom === "system" || custom === "rounded" || custom === "serif" || custom === "mono") return custom;
   const family = (style.get("fontFamily") ?? "").toLowerCase();
   if (!family) return undefined;
@@ -572,7 +572,7 @@ function drawioFontFamily(fontFamily: DiagramFontFamily) {
 
 function appendLinePattern(target: string[], pattern?: DiagramLinePattern, dashed?: boolean) {
   const resolved = pattern ?? (dashed ? "dashed" : "solid");
-  if (pattern) target.push(`shuaiLinePattern=${resolved}`);
+  if (pattern) target.push(`specusLinePattern=${resolved}`);
   if (resolved === "solid") return;
   target.push("dashed=1", `dashPattern=${resolved === "dotted" ? "1 4" : "8 4"}`);
 }

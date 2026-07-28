@@ -1,7 +1,7 @@
-export const DIAGRAM_DOCUMENT_FORMAT = "shuai-tunnel-diagram";
+export const DIAGRAM_DOCUMENT_FORMAT = "specus-diagram";
 export const DIAGRAM_DOCUMENT_VERSION = 1;
 export const DIAGRAM_FILE_EXTENSION = ".stdg";
-export const DIAGRAM_FILE_MIME = "application/vnd.shuai-tunnel.diagram+json";
+export const DIAGRAM_FILE_MIME = "application/vnd.specus.diagram+json";
 export const MAX_DIAGRAM_DOCUMENT_BYTES = 2 * 1024 * 1024;
 export const MAX_DIAGRAM_UPDATE_BASE64_LENGTH = 4 * 1024 * 1024;
 export const MAX_DIAGRAM_BINARY_UPDATE_BYTES = 4 * 1024 * 1024;

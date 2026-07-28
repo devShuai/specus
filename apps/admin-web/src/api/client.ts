@@ -58,8 +58,8 @@ import type {
   TrafficInspectionStatus,
   TokenResponse,
   TrafficUsage,
-  Tunnel,
-  TunnelMutation,
+  Specus,
+  SpecusMutation,
   UserDiagramDocument,
   UserDiagramDocumentDetail,
   UserDiagramDocumentMutation,
@@ -320,13 +320,13 @@ export const adminApi = {
     request<ClientCredentialResult>(`/client-credentials/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteClientCredential: (id: number) => request<null>(`/client-credentials/${id}`, { method: "DELETE" }),
 
-  listTunnels: (clientId?: number) =>
-    request<Tunnel[]>(`/tunnels${clientId ? `?clientId=${clientId}` : ""}`),
-  createTunnel: (clientId: number, body: TunnelMutation) =>
-    request<Tunnel>(`/clients/${clientId}/tunnels`, { method: "POST", body: JSON.stringify(body) }),
-  updateTunnel: (id: number, body: TunnelMutation) =>
-    request<Tunnel>(`/tunnels/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteTunnel: (id: number) => request<null>(`/tunnels/${id}`, { method: "DELETE" }),
+  listSpecusMappings: (clientId?: number) =>
+    request<Specus[]>(`/specus-mappings${clientId ? `?clientId=${clientId}` : ""}`),
+  createSpecus: (clientId: number, body: SpecusMutation) =>
+    request<Specus>(`/clients/${clientId}/specus-mappings`, { method: "POST", body: JSON.stringify(body) }),
+  updateSpecus: (id: number, body: SpecusMutation) =>
+    request<Specus>(`/specus-mappings/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteSpecus: (id: number) => request<null>(`/specus-mappings/${id}`, { method: "DELETE" }),
 
   listHttpRoutes: (clientId?: number) =>
     request<HttpRoute[]>(`/http-routes${clientId ? `?clientId=${clientId}` : ""}`),

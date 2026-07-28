@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "shuai-tunnel 管理后台前端 (React + HeroUI)",
+  "description": "specus 管理后台前端 (React + HeroUI)",
   "scripts": {
     "dev": "vite",
     "sync:drawio-stencils": "node scripts/sync-drawio-stencils.mjs",

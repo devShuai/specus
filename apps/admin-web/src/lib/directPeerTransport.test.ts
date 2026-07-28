@@ -10,9 +10,9 @@ import {
 const config: PublicTransferIceConfig = {
   peerMeshEnabled: true,
   iceServers: [
-    { urls: "stun:tunnel.example.com:3478", username: "", credential: "" },
-    { urls: "turn:tunnel.example.com:3478?transport=udp", username: "user", credential: "secret" },
-    { urls: "turns:tunnel.example.com:5349", username: "user", credential: "secret" },
+    { urls: "stun:specus.example.com:3478", username: "", credential: "" },
+    { urls: "turn:specus.example.com:3478?transport=udp", username: "user", credential: "secret" },
+    { urls: "turns:specus.example.com:5349", username: "user", credential: "secret" },
   ],
   turnAuthRequired: true,
   stunTurnPort: 3478,
@@ -24,7 +24,7 @@ describe("direct peer transport configuration", () => {
 
     expect(rtc.iceTransportPolicy).toBe("all");
     expect(rtc.iceServers).toEqual([
-      { urls: "stun:tunnel.example.com:3478", username: undefined, credential: undefined },
+      { urls: "stun:specus.example.com:3478", username: undefined, credential: undefined },
     ]);
   });
 

@@ -343,7 +343,7 @@ export function PeerMeshPanel() {
       {!status?.enabled && (
         <Card shadow="none" className="rounded-md border border-warning-200 bg-warning-50 dark:border-warning-400/30 dark:bg-warning-500/10">
           <CardBody className="p-3 text-small text-warning-700 dark:text-warning-200">
-            server 当前未启用 peer mesh。设置 TUNNEL_PEER_MESH_ENABLED=true 后，客户端下次登录会收到虚拟 IP、独立 STUN 拓扑和 TURN/ICE 凭证。
+            server 当前未启用 peer mesh。设置 SPECUS_PEER_MESH_ENABLED=true 后，客户端下次登录会收到虚拟 IP、独立 STUN 拓扑和 TURN/ICE 凭证。
           </CardBody>
         </Card>
       )}

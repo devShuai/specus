@@ -23,7 +23,7 @@ export interface PageSeo {
 }
 
 const DEFAULT_DESCRIPTION =
-  "shuai-tunnel 是一套自托管的内网穿透控制面，支持 TCP 端口映射、HTTP 反向代理（含路径改写）、私有组网对端互联与浏览器 NAT 类型检测，自带 Java / Go / .NET 多语言客户端。";
+  "specus 是一套自托管的内网穿透控制面，支持 TCP 端口映射、HTTP 反向代理（含路径改写）、私有组网对端互联与浏览器 NAT 类型检测，自带 Java / Go / .NET 多语言客户端。";
 
 const SEO_MARK_ATTR = "data-seo-runtime";
 const JSONLD_MARK_ATTR = "data-seo-jsonld";

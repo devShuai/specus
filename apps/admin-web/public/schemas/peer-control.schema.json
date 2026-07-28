@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tunnel.devshuai.com/schemas/peer-control.schema.json",
-  "title": "shuai-tunnel PEER_CONTROL",
+  "$id": "https://specus.devshuai.com/schemas/peer-control.schema.json",
+  "title": "specus PEER_CONTROL",
   "description": "MessageType.PEER_CONTROL 的 JSON 信令。Java 使用同一个 PeerControlMessage DTO 承载多种 type。",
   "oneOf": [
     {

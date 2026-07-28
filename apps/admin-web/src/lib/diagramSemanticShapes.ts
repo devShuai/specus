@@ -2,19 +2,19 @@ import { Shape, ShapeRegistry } from "@maxgraph/core";
 import type { AbstractCanvas2D } from "@maxgraph/core";
 
 const SHAPE_NAMES = {
-  document: "shuaiDocument",
-  data: "shuaiData",
-  subprocess: "shuaiSubprocess",
-  delay: "shuaiDelay",
-  manualInput: "shuaiManualInput",
-  note: "shuaiNote",
-  dataObject: "shuaiDataObject",
-  package: "shuaiPackage",
-  component: "shuaiComponent",
-  server: "shuaiServer",
-  client: "shuaiClient",
-  firewall: "shuaiFirewall",
-  queue: "shuaiQueue",
+  document: "specusDocument",
+  data: "specusData",
+  subprocess: "specusSubprocess",
+  delay: "specusDelay",
+  manualInput: "specusManualInput",
+  note: "specusNote",
+  dataObject: "specusDataObject",
+  package: "specusPackage",
+  component: "specusComponent",
+  server: "specusServer",
+  client: "specusClient",
+  firewall: "specusFirewall",
+  queue: "specusQueue",
 } as const;
 
 class DocumentShape extends Shape {

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="specus 引水渠">
+  <path d="M7 14 H57" fill="none" stroke="#14161F" stroke-width="4.5" stroke-linecap="round"></path>
+  <path d="M8 52 V36 A6 6 0 0 1 20 36 V52" fill="none" stroke="#14161F" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" opacity=".45"></path>
+  <path d="M20 52 V36 A12 12 0 0 1 44 36 V52" fill="none" stroke="#14161F" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"></path>
+  <path d="M44 52 V36 A6 6 0 0 1 56 36 V52" fill="none" stroke="#14161F" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" opacity=".45"></path>
+  <circle cx="32" cy="42" r="4" fill="#0066CC"></circle>
+</svg>

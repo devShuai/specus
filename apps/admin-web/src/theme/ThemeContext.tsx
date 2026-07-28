@@ -11,7 +11,7 @@ interface ThemeContextValue {
   resetToSystem: () => void;
 }
 
-const THEME_KEY = "shuai_tunnel_theme";
+const THEME_KEY = "specus_theme";
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 function readPersistedTheme(): AppTheme | null {

@@ -7,7 +7,7 @@ import {
   selectSafeTransferInviteToken,
 } from "./transferInvite";
 
-const ORIGIN = "https://tunnel.devshuai.com";
+const ORIGIN = "https://specus.devshuai.com";
 
 describe("transfer invitation URLs", () => {
   it("builds a credential-free navigation URL for the selected workspace", () => {

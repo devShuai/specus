@@ -1,6 +1,7 @@
 import { useEffect, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { AppLogo } from "../components/AppLogo";
+import { SpecusAqueduct } from "../components/SpecusAqueduct";
 import { PublicToolsMenu } from "../components/PublicToolsMenu";
 import { UserMenuButton } from "../components/UserMenuButton";
 import type { ClientDownloadLink, ClientImplementation } from "../api/types";
@@ -84,17 +85,17 @@ function LoginPageContent() {
   const { oidcConfig, openLogin } = useAuth();
 
   usePageSeo({
-    title: "shuai-tunnel · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
+    title: "specus · 自托管内网穿透 / HTTP 反向代理 / 对端互联控制面",
     description:
-      "shuai-tunnel 是一套自托管的内网穿透控制面，支持 TCP 端口映射、HTTP 反向代理（含路径改写）、私有组网对端互联与浏览器 NAT 类型检测，自带 Java / Go / .NET 多语言客户端。",
-    canonical: "https://tunnel.devshuai.com/",
+      "specus 是一套自托管的内网穿透控制面，支持 TCP 端口映射、HTTP 反向代理（含路径改写）、私有组网对端互联与浏览器 NAT 类型检测，自带 Java / Go / .NET 多语言客户端。",
+    canonical: "https://specus.devshuai.com/",
     keywords:
-      "内网穿透,NAT 检测,STUN 探测,Symmetric NAT,WebRTC,HTTP 反向代理,对端互联,Peer Mesh,P2P 打洞,frp 替代,自托管,shuai-tunnel",
+      "内网穿透,NAT 检测,STUN 探测,Symmetric NAT,WebRTC,HTTP 反向代理,对端互联,Peer Mesh,P2P 打洞,frp 替代,自托管,specus",
     jsonLd: {
       "@context": "https://schema.org",
       "@type": "SoftwareApplication",
-      "name": "shuai-tunnel",
-      "url": "https://tunnel.devshuai.com/",
+      "name": "specus",
+      "url": "https://specus.devshuai.com/",
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "Linux, Windows, macOS",
       "description":
@@ -111,7 +112,7 @@ function LoginPageContent() {
     <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
       <section className="landing-apple-hero relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
         <header className="landing-apple-header flex items-center justify-between gap-3">
-          <AppLogo className="min-w-0 flex-1" label="shuai-tunnel" subtitle="内网服务接入控制面" />
+          <AppLogo className="min-w-0 flex-1" label="specus" subtitle="内网服务接入控制面" />
           <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu />
             <UserMenuButton className="public-header-theme-button" />
@@ -121,15 +122,25 @@ function LoginPageContent() {
         <div className="landing-apple-hero-layout grid flex-1 items-center gap-10 py-10">
           <div className="landing-apple-copy flex min-w-0 flex-col items-center gap-8 text-center">
             <span className="landing-apple-eyebrow w-fit text-small font-semibold">
-              Secure tunnel control plane
+              specus · 拉丁语「地道 / 引水渠」
             </span>
 
             <div className="max-w-3xl">
-              <h1 className="landing-apple-title mx-auto font-semibold text-zinc-950 dark:text-white">shuai-tunnel</h1>
+              <h1 className="landing-apple-title mx-auto font-semibold text-zinc-950 dark:text-white">specus</h1>
+              <p className="specus-tagline mt-4">
+                <b>引水渠</b>
+                <span aria-hidden="true">·</span>
+                <b>打洞</b>
+                <span aria-hidden="true">·</span>
+                <b>观测</b>
+              </p>
               <p className="landing-apple-lead mx-auto mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
-                把公网入口、对端互联与内网服务发布收束到一个控制面，多语言客户端、多租户、可观测，TLS 开箱即用。
+                古人架渠引水跨越山谷，把远处的水送到城里。specus 做同一件事：为内网服务架一条可控的渠，
+                在 NAT 之间打通洞口，并让每一段水流都看得见。
               </p>
             </div>
+
+            <SpecusAqueduct className="mx-auto" />
 
             <div className="flex flex-wrap items-center justify-center gap-3">
               <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
@@ -178,9 +189,13 @@ function LoginPageContent() {
           <TopologyDiagram />
 
           <div className="mb-6 mt-12 max-w-2xl">
-            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">三类接入能力</h2>
+            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">
+              引水渠与打洞
+            </h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-              HTTP 路由与端口映射承担反向中继；客户端互联（Peer）通过控制面信令撮合，加密 frame 走 UDP 直连或 TURN 回退。
+              HTTP 路由与端口映射是<b className="font-semibold text-zinc-800 dark:text-zinc-200">渠</b>——
+              流量沿既定渠道从公网流进内网；客户端互联是<b className="font-semibold text-zinc-800 dark:text-zinc-200">洞</b>——
+              控制面撮合信令，加密 frame 走 UDP 直连，打不通时回退 TURN。
             </p>
           </div>
 
@@ -223,7 +238,7 @@ function LoginPageContent() {
             >
               <FlowDiagram nodes={peerNodes} variant="peer" />
               <div className="principle-note">
-                <span>Tunnel CIDR: 100.96.0.0/11</span>
+                <span>Specus CIDR: 100.96.0.0/11</span>
                 <span>Identity: X25519 公钥 + iceCredential</span>
               </div>
             </PrincipleCard>
@@ -232,7 +247,7 @@ function LoginPageContent() {
           <div className="mb-6 mt-12 max-w-2xl">
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">平台特性</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-              从协议字节级兼容到部署形态，shuai-tunnel 把传统反向隧道工具缺失的工程化关切补齐。
+              从协议字节级兼容到部署形态，specus 把传统反向隧道工具缺失的工程化关切补齐。
             </p>
           </div>
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">

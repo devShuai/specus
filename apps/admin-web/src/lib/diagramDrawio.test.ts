@@ -125,7 +125,7 @@ describe("draw.io diagram compatibility", () => {
     expect(imported.edges).toEqual(document.edges);
   });
 
-  it("imports common draw.io styles without shuai-tunnel metadata", () => {
+  it("imports common draw.io styles without specus metadata", () => {
     const xml = `<?xml version="1.0"?><mxGraphModel dx="1200" dy="800" gridSize="10"><root>
       <mxCell id="0"/><mxCell id="1" parent="0"/>
       <mxCell id="n1" value="判断" style="rhombus;fillColor=#fef3c7;strokeColor=#d97706;" vertex="1" parent="1"><mxGeometry x="20" y="30" width="120" height="80" as="geometry"/></mxCell>

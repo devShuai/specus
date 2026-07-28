@@ -20,7 +20,7 @@ import {
   useDisclosure,
 } from "@heroui/react";
 import { adminApi } from "../../api/client";
-import type { Tunnel } from "../../api/types";
+import type { Specus } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
 import { notify, notifyError } from "../../components/toast";
 import { MobileListCard, MobileListCardList } from "../../components/MobileListCard";
@@ -30,16 +30,16 @@ import { useClients } from "../../hooks/useClients";
 
 const PAGE_SIZE = 10;
 
-export function TunnelsPanel() {
+export function SpecusMappingsPanel() {
   const { clients } = useClients();
-  const [tunnels, setTunnels] = useState<Tunnel[]>([]);
+  const [specusMappings, setSpecusMappings] = useState<Specus[]>([]);
   const [loading, setLoading] = useState(true);
   const [clientId, setClientId] = useState("");
   const [listenPort, setListenPort] = useState("");
   const [targetAddress, setTargetAddress] = useState("");
   const [targetPort, setTargetPort] = useState("");
   const [creating, setCreating] = useState(false);
-  const [editing, setEditing] = useState<Tunnel | null>(null);
+  const [editing, setEditing] = useState<Specus | null>(null);
   const [pendingIds, setPendingIds] = useState<Set<number>>(new Set());
   const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => Promise<void> } | null>(null);
   const [page, setPage] = useState(1);
@@ -48,7 +48,7 @@ export function TunnelsPanel() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setTunnels(await adminApi.listTunnels());
+      setSpecusMappings(await adminApi.listSpecusMappings());
     } catch (error) {
       notifyError(error, "加载端口映射失败");
     } finally {
@@ -68,7 +68,7 @@ export function TunnelsPanel() {
     }
     setCreating(true);
     try {
-      await adminApi.createTunnel(Number(clientId), {
+      await adminApi.createSpecus(Number(clientId), {
         listenPort: Number(listenPort),
         targetAddress: targetAddress.trim(),
         targetPort: Number(targetPort),
@@ -88,44 +88,44 @@ export function TunnelsPanel() {
   };
 
   /** 乐观更新 + 失败回滚；切换期间该行开关禁用，避免整表刷新与连点竞态。 */
-  const patchTunnel = async (tunnel: Tunnel, patch: Partial<Pick<Tunnel, "enabled" | "detailCaptureEnabled">>, errorMessage: string) => {
-    if (pendingIds.has(tunnel.id)) {
+  const patchSpecus = async (specus: Specus, patch: Partial<Pick<Specus, "enabled" | "detailCaptureEnabled">>, errorMessage: string) => {
+    if (pendingIds.has(specus.id)) {
       return;
     }
-    setPendingIds((prev) => new Set(prev).add(tunnel.id));
-    setTunnels((prev) => prev.map((item) => (item.id === tunnel.id ? { ...item, ...patch } : item)));
+    setPendingIds((prev) => new Set(prev).add(specus.id));
+    setSpecusMappings((prev) => prev.map((item) => (item.id === specus.id ? { ...item, ...patch } : item)));
     try {
-      await adminApi.updateTunnel(tunnel.id, {
-        listenPort: tunnel.listenPort,
-        targetAddress: tunnel.targetAddress,
-        targetPort: tunnel.targetPort,
-        enabled: patch.enabled ?? tunnel.enabled,
-        detailCaptureEnabled: patch.detailCaptureEnabled ?? Boolean(tunnel.detailCaptureEnabled),
+      await adminApi.updateSpecus(specus.id, {
+        listenPort: specus.listenPort,
+        targetAddress: specus.targetAddress,
+        targetPort: specus.targetPort,
+        enabled: patch.enabled ?? specus.enabled,
+        detailCaptureEnabled: patch.detailCaptureEnabled ?? Boolean(specus.detailCaptureEnabled),
       });
     } catch (error) {
-      setTunnels((prev) => prev.map((item) => (item.id === tunnel.id ? tunnel : item)));
+      setSpecusMappings((prev) => prev.map((item) => (item.id === specus.id ? specus : item)));
       notifyError(error, errorMessage);
     } finally {
       setPendingIds((prev) => {
         const next = new Set(prev);
-        next.delete(tunnel.id);
+        next.delete(specus.id);
         return next;
       });
     }
   };
 
-  const toggle = (tunnel: Tunnel) => patchTunnel(tunnel, { enabled: !tunnel.enabled }, "切换状态失败");
+  const toggle = (specus: Specus) => patchSpecus(specus, { enabled: !specus.enabled }, "切换状态失败");
 
-  const toggleDetailCapture = (tunnel: Tunnel) =>
-    patchTunnel(tunnel, { detailCaptureEnabled: !Boolean(tunnel.detailCaptureEnabled) }, "切换明细采集失败");
+  const toggleDetailCapture = (specus: Specus) =>
+    patchSpecus(specus, { detailCaptureEnabled: !Boolean(specus.detailCaptureEnabled) }, "切换明细采集失败");
 
-  const remove = (tunnel: Tunnel) => {
+  const remove = (specus: Specus) => {
     setConfirm({
       title: "删除端口映射",
-      description: `确定删除端口映射 :${tunnel.listenPort} → ${tunnel.targetAddress}:${tunnel.targetPort} 吗？删除后立即停止转发。`,
+      description: `确定删除端口映射 :${specus.listenPort} → ${specus.targetAddress}:${specus.targetPort} 吗？删除后立即停止转发。`,
       action: async () => {
         try {
-          await adminApi.deleteTunnel(tunnel.id);
+          await adminApi.deleteSpecus(specus.id);
           notify("端口映射已删除");
           await load();
         } catch (error) {
@@ -135,9 +135,9 @@ export function TunnelsPanel() {
     });
   };
 
-  const totalPages = Math.max(1, Math.ceil(tunnels.length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(specusMappings.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
-  const pagedTunnels = tunnels.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const pagedSpecusMappings = specusMappings.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-4">
@@ -167,50 +167,50 @@ export function TunnelsPanel() {
       {/* mobile: 卡片 */}
       <div className="lg:hidden">
         <MobileListCardList
-          items={pagedTunnels}
+          items={pagedSpecusMappings}
           isLoading={loading}
           emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}
           renderCard={(raw) => {
-            const tunnel = raw as Tunnel;
-            const pending = pendingIds.has(tunnel.id);
+            const specus = raw as Specus;
+            const pending = pendingIds.has(specus.id);
             return (
               <MobileListCard
-                key={tunnel.id}
+                key={specus.id}
                 title={
                   <div className="flex items-center gap-2">
-                    <code className="break-all">:{tunnel.listenPort} → {tunnel.targetAddress}:{tunnel.targetPort}</code>
+                    <code className="break-all">:{specus.listenPort} → {specus.targetAddress}:{specus.targetPort}</code>
                   </div>
                 }
-                subtitle={`${tunnel.clientName} · #${tunnel.id}`}
+                subtitle={`${specus.clientName} · #${specus.id}`}
                 badges={
                   <>
                     <Switch
                       size="sm"
-                      isSelected={tunnel.enabled}
+                      isSelected={specus.enabled}
                       isDisabled={pending}
-                      onValueChange={() => void toggle(tunnel)}
+                      onValueChange={() => void toggle(specus)}
                     >
                       启用
                     </Switch>
                     <Switch
                       size="sm"
-                      isSelected={Boolean(tunnel.detailCaptureEnabled)}
+                      isSelected={Boolean(specus.detailCaptureEnabled)}
                       isDisabled={pending}
-                      onValueChange={() => void toggleDetailCapture(tunnel)}
+                      onValueChange={() => void toggleDetailCapture(specus)}
                     >
                       明细采集
                     </Switch>
                   </>
                 }
                 fields={[
-                  { label: "更新时间", value: formatDateTime(tunnel.updatedAt || tunnel.createdAt) },
+                  { label: "更新时间", value: formatDateTime(specus.updatedAt || specus.createdAt) },
                 ]}
                 actions={
                   <>
-                    <Button size="sm" variant="flat" onPress={() => { setEditing(tunnel); editModal.onOpen(); }}>
+                    <Button size="sm" variant="flat" onPress={() => { setEditing(specus); editModal.onOpen(); }}>
                       编辑
                     </Button>
-                    <Button size="sm" color="danger" variant="flat" onPress={() => remove(tunnel)}>
+                    <Button size="sm" color="danger" variant="flat" onPress={() => remove(specus)}>
                       删除
                     </Button>
                   </>
@@ -234,42 +234,42 @@ export function TunnelsPanel() {
           <TableColumn>更新时间</TableColumn>
           <TableColumn>操作</TableColumn>
         </TableHeader>
-        <TableBody items={pagedTunnels} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}>
-          {(tunnel) => {
-            const pending = pendingIds.has(tunnel.id);
+        <TableBody items={pagedSpecusMappings} isLoading={loading} emptyContent={<EmptyState icon="connections" title="暂无端口映射" description="创建映射后公网端口将转发到内网目标" />}>
+          {(specus) => {
+            const pending = pendingIds.has(specus.id);
             return (
-            <TableRow key={tunnel.id}>
-              <TableCell>{tunnel.id}</TableCell>
-              <TableCell>{tunnel.clientName}</TableCell>
-              <TableCell>{tunnel.listenPort}</TableCell>
+            <TableRow key={specus.id}>
+              <TableCell>{specus.id}</TableCell>
+              <TableCell>{specus.clientName}</TableCell>
+              <TableCell>{specus.listenPort}</TableCell>
               <TableCell>
-                <code>{tunnel.targetAddress}:{tunnel.targetPort}</code>
+                <code>{specus.targetAddress}:{specus.targetPort}</code>
               </TableCell>
               <TableCell>
                 <Switch
                   aria-label="启用"
                   size="sm"
-                  isSelected={tunnel.enabled}
+                  isSelected={specus.enabled}
                   isDisabled={pending}
-                  onValueChange={() => void toggle(tunnel)}
+                  onValueChange={() => void toggle(specus)}
                 />
               </TableCell>
               <TableCell>
                 <Switch
                   aria-label="明细采集"
                   size="sm"
-                  isSelected={Boolean(tunnel.detailCaptureEnabled)}
+                  isSelected={Boolean(specus.detailCaptureEnabled)}
                   isDisabled={pending}
-                  onValueChange={() => void toggleDetailCapture(tunnel)}
+                  onValueChange={() => void toggleDetailCapture(specus)}
                 />
               </TableCell>
-              <TableCell>{formatDateTime(tunnel.updatedAt || tunnel.createdAt)}</TableCell>
+              <TableCell>{formatDateTime(specus.updatedAt || specus.createdAt)}</TableCell>
               <TableCell>
                 <div className="flex gap-2">
-                  <Button size="sm" variant="flat" onPress={() => { setEditing(tunnel); editModal.onOpen(); }}>
+                  <Button size="sm" variant="flat" onPress={() => { setEditing(specus); editModal.onOpen(); }}>
                     编辑
                   </Button>
-                  <Button size="sm" color="danger" variant="flat" onPress={() => remove(tunnel)}>
+                  <Button size="sm" color="danger" variant="flat" onPress={() => remove(specus)}>
                     删除
                   </Button>
                 </div>
@@ -287,7 +287,7 @@ export function TunnelsPanel() {
         </div>
       ) : null}
 
-      <EditTunnelModal disclosure={editModal} tunnel={editing} onSaved={() => void load()} />
+      <EditSpecusModal disclosure={editModal} specus={editing} onSaved={() => void load()} />
       <ConfirmModal
         isOpen={confirm != null}
         onClose={() => setConfirm(null)}
@@ -301,13 +301,13 @@ export function TunnelsPanel() {
   );
 }
 
-interface EditTunnelModalProps {
+interface EditSpecusModalProps {
   disclosure: ReturnType<typeof useDisclosure>;
-  tunnel: Tunnel | null;
+  specus: Specus | null;
   onSaved: () => void;
 }
 
-function EditTunnelModal({ disclosure, tunnel, onSaved }: EditTunnelModalProps) {
+function EditSpecusModal({ disclosure, specus, onSaved }: EditSpecusModalProps) {
   const [listenPort, setListenPort] = useState("");
   const [targetAddress, setTargetAddress] = useState("");
   const [targetPort, setTargetPort] = useState("");
@@ -316,22 +316,22 @@ function EditTunnelModal({ disclosure, tunnel, onSaved }: EditTunnelModalProps) 
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (tunnel) {
-      setListenPort(String(tunnel.listenPort));
-      setTargetAddress(tunnel.targetAddress);
-      setTargetPort(String(tunnel.targetPort));
-      setEnabled(tunnel.enabled);
-      setDetailCaptureEnabled(Boolean(tunnel.detailCaptureEnabled));
+    if (specus) {
+      setListenPort(String(specus.listenPort));
+      setTargetAddress(specus.targetAddress);
+      setTargetPort(String(specus.targetPort));
+      setEnabled(specus.enabled);
+      setDetailCaptureEnabled(Boolean(specus.detailCaptureEnabled));
     }
-  }, [tunnel]);
+  }, [specus]);
 
   const save = async () => {
-    if (!tunnel) {
+    if (!specus) {
       return;
     }
     setSaving(true);
     try {
-      await adminApi.updateTunnel(tunnel.id, {
+      await adminApi.updateSpecus(specus.id, {
         listenPort: Number(listenPort),
         targetAddress: targetAddress.trim(),
         targetPort: Number(targetPort),
@@ -353,7 +353,7 @@ function EditTunnelModal({ disclosure, tunnel, onSaved }: EditTunnelModalProps) 
       <ModalContent>
         {(onClose) => (
           <>
-            <ModalHeader>编辑端口映射 #{tunnel?.id}</ModalHeader>
+            <ModalHeader>编辑端口映射 #{specus?.id}</ModalHeader>
             <ModalBody className="gap-3">
               <Input type="number" label="公网端口" value={listenPort} onValueChange={setListenPort} min={1} max={65535} isRequired />
               <Input label="内网目标地址" value={targetAddress} onValueChange={setTargetAddress} maxLength={255} isRequired />
