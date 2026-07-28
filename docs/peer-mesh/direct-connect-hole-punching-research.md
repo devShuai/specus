@@ -4,13 +4,13 @@
 > 2026-07-10 的实现状态。Peer Mesh 的 UDP direct、标准 STUN/TURN relay、TUN/Wintun/utun 和管理面现已落地；
 > 当前行为见 `peer-mesh-implementation.md` 与 `../../protocol/spec/peer-mesh.md`。
 
-> 目标：整理“公网普通用户访问内网服务时也尽量直连”的技术边界、PCDN/Surge Ponte 的实现启发，以及 `shuai-tunnel` 后续可落地的演进路线。
+> 目标：整理“公网普通用户访问内网服务时也尽量直连”的技术边界、PCDN/Surge Ponte 的实现启发，以及 `specus` 后续可落地的演进路线。
 >
 > 本文是设计讨论记录，不代表当前代码已经实现这些能力。
 
 ## 1. 核心结论
 
-- 当前 `shuai-tunnel` 的主模型是反向隧道：内网客户端主动连公网服务端，公网用户访问服务端暴露的端口，再由服务端中继到内网客户端。
+- 当前 `specus` 的主模型是反向隧道：内网客户端主动连公网服务端，公网用户访问服务端暴露的端口，再由服务端中继到内网客户端。
 - 真正的 NAT 打洞需要连接双方都参与信令、探测和建连。普通公网用户通常只是浏览器、curl、SSH 客户端或任意 TCP 客户端，没有安装我们的 agent，因此无法对“任意普通用户”透明地做 P2P 打洞。
 - 对普通公网用户来说，“尽量直连”的可行含义不是让用户临时参与打洞，而是优先把用户引导到一个已经可公网访问的直连端点：
   - 原生公网 IP。
@@ -27,8 +27,8 @@
 
 ```mermaid
 flowchart LR
-    U["公网普通用户"] --> S["shuai-tunnel 服务端公网端口"]
-    S --> C["shuai-tunnel 客户端控制连接"]
+    U["公网普通用户"] --> S["specus 服务端公网端口"]
+    S --> C["specus 客户端控制连接"]
     C --> L["内网本地服务"]
 ```
 
@@ -125,7 +125,7 @@ PCDN 不是让任意 NAT 后面的节点都神奇地被公网用户直连，而�
 - 节点不可用时回源或走中心化 CDN/relay。
 - 需要准入、限速、鉴权、审计和质量评分，避免把用户流量调度到不可控或不稳定节点。
 
-对 `shuai-tunnel` 的启发：
+对 `specus` 的启发：
 
 - 可以引入“候选端点 + 健康探测 + 调度 + fallback”的模型。
 - 可以统计每个端点的可用率、延迟、失败率和带宽。
@@ -152,7 +152,7 @@ Surge Ponte 是 Surge 设备之间的私有网络能力，不是面向任意公�
 - [Surge NAT Types](https://kb.nssurge.com/surge-knowledge-base/technotes/nat-type)
 - [Surge Manual](https://manual.nssurge.com/)
 
-对 `shuai-tunnel` 的启发：
+对 `specus` 的启发：
 
 - 把“控制面”和“数据面”分开。
 - 控制面负责设备身份、密钥、候选地址、NAT 类型、健康状态和策略。
@@ -177,7 +177,7 @@ Surge Ponte 是 Surge 设备之间的私有网络能力，不是面向任意公�
 示例配置方向：
 
 ```yaml
-tunnel:
+specus:
   mappings:
     - remote-port: 18080
       local-host: 127.0.0.1
@@ -220,7 +220,7 @@ tunnel:
 
 ### 8.4 P2：受控 agent 之间的 NAT traversal
 
-目标：为“双方都运行 shuai-tunnel agent”的场景支持真正打洞。
+目标：为“双方都运行 specus agent”的场景支持真正打洞。
 
 建议：
 

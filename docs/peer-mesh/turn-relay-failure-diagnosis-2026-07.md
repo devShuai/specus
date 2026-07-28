@@ -89,7 +89,7 @@ peer 应用消息**没有 ARQ**（Java 侧仅回 ACK，无重传），丢一条�
 
 位置：`StunTurnServer.TurnAuth.none()`（约 L929）。
 
-当部署设置 `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED=false` 时，所有 allocation 的
+当部署设置 `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED=false` 时，所有 allocation 的
 `clientId` 为 0，`authorizeRelayPayload` 的 `source.clientId <= 0` 会拒掉**全部**中继载荷
 （连探针也不例外），中继完全不可用。
 
@@ -198,7 +198,7 @@ WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连
 
 | 配置项 | 环境变量 | 默认 | 说明 |
 | --- | --- | ---: | --- |
-| `general-relay-max-allocations` | `TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS` | `256` | 并发 allocation 总数；**设为 0 即关闭通用中继**（网页端退回仅 STUN） |
+| `general-relay-max-allocations` | `SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS` | `256` | 并发 allocation 总数；**设为 0 即关闭通用中继**（网页端退回仅 STUN） |
 | `general-relay-max-allocations-per-address` | `..._MAX_ALLOCATIONS_PER_ADDRESS` | `4` | 同一来源 IP 的并发 allocation 上限 |
 | `general-relay-rate-bytes-per-second` | `..._RATE_BYTES_PER_SECOND` | `2 MiB/s` | 单 allocation 令牌桶限速，0 表示不限 |
 | `general-relay-max-bytes` | `..._MAX_BYTES` | `512 MiB` | 单 allocation 生命周期累计转发上限，0 表示不限 |
@@ -215,10 +215,10 @@ WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连
 
 新增指标：
 
-- `tunnel.peer_mesh.turn.general_relay.quota.rejected`
-- `tunnel.peer_mesh.turn.general_relay.destination.forbidden`
-- `tunnel.peer_mesh.turn.general_relay.rate.limited`
-- `tunnel.peer_mesh.turn.general_relay.bytes`
+- `specus.peer_mesh.turn.general_relay.quota.rejected`
+- `specus.peer_mesh.turn.general_relay.destination.forbidden`
+- `specus.peer_mesh.turn.general_relay.rate.limited`
+- `specus.peer_mesh.turn.general_relay.bytes`
 
 配套测试：`StunTurnServerMetricsTests` 覆盖目的地址白名单（公网 v4/v6 放行；回环、`0.0.0.0`、
 站点本地、link-local、组播、`100.64.0.0/10`、IPv6 ULA、零端口拒绝）与令牌桶限速语义。
@@ -239,7 +239,7 @@ WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连
 - `generalRelayQuotaRejection` / `allowGeneralRelayTraffic` / `isRelayableDestination`：
   与 Java 同语义的准入配额、令牌桶+字节上限、目的地址白名单，`486` / `403` 标准错误码。
 
-**.NET 服务端**（`ShuaiTunnel.Server/PeerMesh/`）
+**.NET 服务端**（`Specus.Server/PeerMesh/`）
 
 - `AuthorizeRelayFrameCoreAsync`、`ValidRelayPeers`、`MatchesSessionPeers`、
   `RelayAuthorization.Matches` 与 Java 一致；同样实现首帧隐式激活。
@@ -264,7 +264,7 @@ WebRTC 经 TURN 转发的是 **DTLS 握手、SRTP/SCTP(DataChannel) 与 STUN 连
   `GeneralRelayDestinationPolicyRejectsNonPublicTargets`。
 - Go/.NET 中原先断言"NEGOTIATING 会话必须被拒"的用例已按新语义改写（该断言正是被修复的缺陷）。
 
-**部署配置**：三份 `tunnel-server.env.example`（java/go/csharp）与 Java `application.yml`
+**部署配置**：三份 `specus-server.env.example`（java/go/csharp）与 Java `application.yml`
 均已补充四个通用中继配额项。
 
 ## 3bis. 配额回归修复（2026-07-23）

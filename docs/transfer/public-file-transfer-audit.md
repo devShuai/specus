@@ -15,7 +15,7 @@
 * 附件服务:`implementations/java/server/.../management/service/TransferAttachmentService.java`
 * 附件接口:`implementations/java/server/.../management/controller/TransferAttachmentResource.java`
 * 对象存储:`implementations/java/server/.../management/storage/object/AliyunOssObjectStorageService.java`
-* 安全/部署:`implementations/java/server/.../config/SecurityConfig.java`、`deploy/openresty/shuai-tunnel.conf`
+* 安全/部署:`implementations/java/server/.../config/SecurityConfig.java`、`deploy/openresty/specus.conf`
 
 结论摘要:
 
@@ -82,13 +82,13 @@
 | #17 单文件/并发覆盖 | 已处理 | 文件 input 开启 `multiple`,批量顺序发送;直连接收按 `sourcePeerId:transferId` 键控,避免同 peer 状态覆盖。 |
 | #18 sha256 未使用 | 已处理 | 前端上传/直连发送流式计算 SHA-256;OSS 预签名请求携带 sha256,直连接收完成后按 hash 校验。 |
 
-验证说明:本次核对包含代码静态比对与构建验证。`apps/admin-web` 下 `npm test` 与 `npm run build` 已通过。服务端使用 `mvn -pl implementations/java/server -am compile -DskipTests "-Dtunnel.server.web.skip=true"` 在非沙箱权限下已通过;沙箱内 `javac` 读取 reactor classpath 时会误报 `com.theshuai.common.*` 不存在并伴随 `AccessDeniedException`,不作为代码失败判断。新增 `TransferAttachmentServiceTests`,覆盖公开上传限额、元数据规范化、ID 冲突重试、未 complete 禁止下载、对象存在/大小校验、过期附件循环清理;目标测试命令 `mvn -pl implementations/java/server -am -Dtest=TransferAttachmentServiceTests "-Dsurefire.failIfNoSpecifiedTests=false" test "-Dtunnel.server.web.skip=true"` 已通过。
+验证说明:本次核对包含代码静态比对与构建验证。`apps/admin-web` 下 `npm test` 与 `npm run build` 已通过。服务端使用 `mvn -pl implementations/java/server -am compile -DskipTests "-Dspecus.server.web.skip=true"` 在非沙箱权限下已通过;沙箱内 `javac` 读取 reactor classpath 时会误报 `com.theshuai.common.*` 不存在并伴随 `AccessDeniedException`,不作为代码失败判断。新增 `TransferAttachmentServiceTests`,覆盖公开上传限额、元数据规范化、ID 冲突重试、未 complete 禁止下载、对象存在/大小校验、过期附件循环清理;目标测试命令 `mvn -pl implementations/java/server -am -Dtest=TransferAttachmentServiceTests "-Dsurefire.failIfNoSpecifiedTests=false" test "-Dspecus.server.web.skip=true"` 已通过。
 
 ## 问题与建议明细
 
 ### 1. `X-Forwarded-For` 可伪造,绕过 IP 分组隔离(P0 安全)
 
-`PublicTransferDiscoveryHandshakeInterceptor.publicAddress()` 取 `X-Forwarded-For` 的**第一个**值作为 `publicAddress`(`PublicTransferDiscoveryWebSocketHandler.java` 的 `firstForwarded`),而 nginx 用的是 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`(`deploy/openresty/shuai-tunnel.conf:101`)——**追加**语义。攻击者自带 `X-Forwarded-For: <受害者IP>`,经 nginx 变成 `<受害者IP>, <真实IP>`,后端取第一个即拿到伪造值。
+`PublicTransferDiscoveryHandshakeInterceptor.publicAddress()` 取 `X-Forwarded-For` 的**第一个**值作为 `publicAddress`(`PublicTransferDiscoveryWebSocketHandler.java` 的 `firstForwarded`),而 nginx 用的是 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`(`deploy/openresty/specus.conf:101`)——**追加**语义。攻击者自带 `X-Forwarded-For: <受害者IP>`,经 nginx 变成 `<受害者IP>, <真实IP>`,后端取第一个即拿到伪造值。
 
 不带 token 的房间 `roomKey = public:<publicAddress>`,后果:知道任意人的公网 IP 即可加入其 `nearby` 房间,看到成员列表、伪装名称、给对方静默推文件(见 #15)。
 
@@ -106,9 +106,9 @@
 
 ### 3. 生产 CSP 未放行 OSS 域名,预签名兜底跑不通(P0 功能)
 
-`SecurityConfig.java:91` 的 CSP `connect-src` 仅含 `'self' ws: wss:` 与 GA 域名,`img-src`/`media-src` 也只含 `'self' blob: data:`,**均无 OSS bucket 域名**;`deploy/openresty/shuai-tunnel.conf:75` 的 CSP 同样缺失。
+`SecurityConfig.java:91` 的 CSP `connect-src` 仅含 `'self' ws: wss:` 与 GA 域名,`img-src`/`media-src` 也只含 `'self' blob: data:`,**均无 OSS bucket 域名**;`deploy/openresty/specus.conf:75` 的 CSP 同样缺失。
 
-一旦 `tunnel.object-storage.provider` 启用为 `aliyun-oss`:
+一旦 `specus.object-storage.provider` 启用为 `aliyun-oss`:
 
 * `putObject` 用 XHR PUT 到 `*.aliyuncs.com` → 被 `connect-src 'self'` 拦截;
 * `saveUrlAs` 用 fetch GET 下载 → 同样被拦;

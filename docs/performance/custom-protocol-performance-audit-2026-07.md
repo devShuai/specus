@@ -2,7 +2,7 @@
 
 最后复核：2026-07-22
 
-本文覆盖 shuai-tunnel 的控制连接、TCP/HTTP/WebSocket 隧道、Peer Mesh、TURN relay、浏览器互传、
+本文覆盖 specus 的控制连接、TCP/HTTP/WebSocket 隧道、Peer Mesh、TURN relay、浏览器互传、
 分布式 STUN 转发、客户端消息和相关认证入口。它既保留原审计的问题编号，也记录本轮实施结果。
 
 ## 1. 结论
@@ -38,7 +38,7 @@
 | P1-8 | DONE | STFWD2 使用 `keyId + senderEpoch + sequence` 和按发送者滑动窗口，支持 current/previous key 轮换 |
 | P1-9 | DONE | 内置 TURN 固定为 Peer Mesh 专用模式，allocation 绑定客户端身份，权限校验 session peer，支持 ChannelBind/ChannelData |
 | P1-10 | DONE | 中央目录已覆盖控制 v2、SPM2、SPMTU2、STFWD2、STAP2/STWR2、SWS2、STMSG2、STCLIP2 与 STCE2，适用实现直接读取 canonical/malformed 向量 |
-| P2-1 | DONE | WebSocket 明确定义为 frame tunnel，SWS2 保留 opcode/FIN/RSV/close code/reason 并严格限长 |
+| P2-1 | DONE | WebSocket 明确定义为 frame specus，SWS2 保留 opcode/FIN/RSV/close code/reason 并严格限长 |
 | P2-2 | DONE | 管理端只在目标 channel write 完成后返回 `written`，失败返回 `failed`；Peer STMSG2 仅在应用 ACK 后返回 `delivered`，协议明确不承诺 read 或离线 outbox |
 | P2-3 | DONE | Java/Go/.NET 与 C 管理通道、公共 discovery WebSocket 使用 45 秒、单用途、一次性 ticket，原始 bearer/room token 不进入升级 URL；C 管理事件同时按租户与所有权过滤 |
 | P2-4 | DONE | API key 登录以数据库唯一键原子去重 `(apiKey, nonce)`，并按 TTL 清理 |

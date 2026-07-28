@@ -58,8 +58,8 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 
 | 编号 | Client OS | 虚拟网卡 | 必测项 |
 | --- | --- | --- | --- |
-| O-01 | Windows | Wintun | 启动创建 `shuai0`、路由注入、重启恢复、退出清理 |
-| O-02 | Linux | `/dev/net/tun` | `CAP_NET_ADMIN` / root 创建 `shuai0`、路由注入、退出清理 |
+| O-01 | Windows | Wintun | 启动创建 `specus0`、路由注入、重启恢复、退出清理 |
+| O-02 | Linux | `/dev/net/tun` | `CAP_NET_ADMIN` / root 创建 `specus0`、路由注入、退出清理 |
 | O-03 | macOS | utun | utun 创建、路由注入、退出清理 |
 | O-04 | 任意 OS | noop | 无 TUN 权限时不影响 TCP/HTTP 映射，Peer Mesh 状态明确显示不可用或 noop |
 | O-05 | Android | `VpnService` TUN | VPN 授权、地址/路由、应用与 socket bypass、前后台切换、退出清理 |
@@ -122,7 +122,7 @@ Android client 已有控制通道、TCP/Direct HTTP（含 WebSocket）、`VpnSer
 | 用例 | 步骤 | 通过标准 |
 | --- | --- | --- |
 | P1-01 管理 API 权限 | admin 和普通用户分别登录 | admin 可看全量；普通用户只能看自己的 client、连接、流量、Peer Mesh 设备 |
-| P1-02 客户端详情 | 调用 `GET /api/admin/clients/{id}` | 返回 client、TCP tunnels、HTTP routes，字段和 Java 契约一致 |
+| P1-02 客户端详情 | 调用 `GET /api/admin/clients/{id}` | 返回 client、TCP specusMappings、HTTP routes，字段和 Java 契约一致 |
 | P1-03 连接记录分页 | 产生多页连接记录 | 翻页不追加旧数据，筛选不乱跳 |
 | P1-04 HTTP 明细搜索 | 按 method/status/route/contentType 搜索 | 字段过滤准确，例如 method=POST 不出现 GET |
 | P1-05 TCP 明细分页和串流 | 产生多条 TCP frame，打开 stream view | frame 分页正确，按 channelId + direction 串联 |

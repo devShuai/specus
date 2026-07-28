@@ -1,11 +1,11 @@
-# shuai-tunnel 详细设计文档
+# specus 详细设计文档
 
 > 基线：2026-07-10，提交 `93823f4`。本文以 Java server/client/common 当前实现为准；跨语言线协议以 `protocol/spec/` 为权威入口。
 > README 面向运行与部署，本文聚焦模块边界、关键数据流、线程与安全模型。
 
 ## 1. 目标与边界
 
-`shuai-tunnel` 是以内网服务接入和私有组网为核心的多语言项目，Java 是当前参考实现。主要目标是：
+`specus` 是以内网服务接入和私有组网为核心的多语言项目，Java 是当前参考实现。主要目标是：
 
 1. 通过一条长期控制连接承载登录、心跳、配置下发、TCP 隧道和 HTTP 直转。
 2. 使用管理面维护客户端凭证、账号、TCP 映射、HTTP 路由、连接记录和流量观测。
@@ -26,7 +26,7 @@
                                                               │
 公网 HTTP / WebSocket ───────► /http/{client}/{route}/**       │
                                                               ▼
-公网 TCP ─► 动态 TcpServer ─► RemoteTunnelHandler ◄──────► Netty control :7010 ◄────► Java client
+公网 TCP ─► 动态 TcpServer ─► RemoteSpecusHandler ◄──────► Netty control :7010 ◄────► Java client
                                                               │                         │
                                                               │                         ├─► 内网 TCP
                                                               │                         └─► 内网 HTTP/WS
@@ -47,9 +47,9 @@ Peer A 虚拟网卡 ◄──────── 加密 UDP direct / TURN relay �
 
 | 模块 | 路径 | 主要职责 |
 | --- | --- | --- |
-| `tunnel-common` | `implementations/java/common` | 线协议、帧编解码、固定 schema 紧凑二进制、HMAC、心跳、NAT/Peer 公共模型 |
-| `tunnel-server` | `implementations/java/server` | Netty 控制端与公网 TCP 监听、管理 REST、客户端认证、HTTP/WS 直转、Peer Mesh、持久化与观测 |
-| `tunnel-client` | `implementations/java/client` | 读取 `client.jsonc`、HTTP 启动登录、控制连接与重连、本地 TCP/HTTP/WS 转发、Peer Mesh 虚拟网卡 |
+| `specus-common` | `implementations/java/common` | 线协议、帧编解码、固定 schema 紧凑二进制、HMAC、心跳、NAT/Peer 公共模型 |
+| `specus-server` | `implementations/java/server` | Netty 控制端与公网 TCP 监听、管理 REST、客户端认证、HTTP/WS 直转、Peer Mesh、持久化与观测 |
+| `specus-client` | `implementations/java/client` | 读取 `client.jsonc`、HTTP 启动登录、控制连接与重连、本地 TCP/HTTP/WS 转发、Peer Mesh 虚拟网卡 |
 | 管理前端 | `apps/admin-web` | 管理客户端、凭证、映射、路由、连接、流量和 Peer Mesh；构建产物由 server 静态托管 |
 
 Java 的协议变更需要同步 `protocol/spec/`、测试向量和其它语言实现。
@@ -69,7 +69,7 @@ Java 的协议变更需要同步 `protocol/spec/`、测试向量和其它语言�
 
 - `magic = 0x14353565`，`version = 1`。
 - `length` 是 body 长度；`Spliter` 基于 `LengthFieldBasedFrameDecoder` 处理半包和粘包。
-- `Spliter` 默认最大**整帧**为 `32 MiB`。Java server 可用 `TUNNEL_NETTY_MAX_FRAME_SIZE` 覆盖；Java client 当前使用默认值。
+- `Spliter` 默认最大**整帧**为 `32 MiB`。Java server 可用 `SPECUS_NETTY_MAX_FRAME_SIZE` 覆盖；Java client 当前使用默认值。
 - `CompactBinarySerializer` 的 `16 MiB` 是 Deflate **解压后 payload** 上限，不是整帧上限。
 
 `NAT_MESSAGE` 仍使用同一个 11 字节帧头，但 body 是专用布局：
@@ -157,7 +157,7 @@ secret 明文不会发送到 server；数据库保存其 SHA-256。当前没有 
 → LogoutRequestHandler
 ```
 
-- `SslHandler` 只在 `TUNNEL_TLS_MODE != disabled` 时安装。
+- `SslHandler` 只在 `SPECUS_TLS_MODE != disabled` 时安装。
 - `ManagedLoginRequestHandler` 把 DB/token 校验提交到有界 `loginExecutor`，涉及 Channel 的绑定和回包再切回该 Channel 的 EventLoop。
 - `NatServerHandler` 从连接建立时就存在；它用 `REGISTER` 成功状态约束普通 TCP `DATA/DISCONNECTED`，并不是注册后才动态挂载。
 - `PacketCodecHandler` 在 server 同时承担 decode/encode；不是两个独立的 `PacketDecoder`/`PacketEncoder`。
@@ -191,7 +191,7 @@ secret 明文不会发送到 server；数据库保存其 SHA-256。当前没有 
 ```text
 server NAT_CONTROL 完整快照
   → client MessageResponseHandler
-  → NatClientHandler REGISTER(port, tunnelAddress, tunnelPort, clientName)
+  → NatClientHandler REGISTER(port, specusAddress, specusPort, clientName)
   → server NatServerHandler 校验登录身份和全局端口占用
   → RemotePortServerManager.bind(port)
   → REGISTER_RESULT
@@ -206,7 +206,7 @@ server NAT_CONTROL 完整快照
 
 公网字节
   → DATA {channelId} + payload
-  → client LocalTunnelHandler
+  → client LocalSpecusHandler
   → 内网服务
 
 内网回包
@@ -223,7 +223,7 @@ HTTP 主路径：
 
 ```text
 /http/{clientName}/{route}/**
-  → HttpTunnelController 构造 DirectHttpRequestPacket
+  → HttpSpecusController 构造 DirectHttpRequestPacket
   → DirectHttpDispatcher 注册 SyncFuture、写控制 Channel 并等待
   → client DirectHttpRequestHandler 在线程池执行 DirectHttpForwarder
   → 按 route 精确查 targetBaseUrl，转发 method/path/query/headers/body
@@ -243,7 +243,7 @@ HTTP 主路径：
 - client 校验 target scheme 为 HTTP/HTTPS、目标 origin 不变，且相对路径不能逃逸 base path。
 - HTTP 路由开启路径改写后，server 可改写可识别响应中的绝对路径；默认单体上限 `10 MiB`。
 
-WebSocket 升级同样挂在 `/http/**`，由 `WebSocketTunnelHandler` 建立 stream，并复用 `NAT_MESSAGE` 的 `CONNECTED/DATA/DISCONNECTED`，metadata 中以 `source="ws"` 和 `channelId` 区分。
+WebSocket 升级同样挂在 `/http/**`，由 `WebSocketSpecusHandler` 建立 stream，并复用 `NAT_MESSAGE` 的 `CONNECTED/DATA/DISCONNECTED`，metadata 中以 `source="ws"` 和 `channelId` 区分。
 
 ### 6.3 Peer Mesh
 
@@ -265,7 +265,7 @@ Peer Mesh 默认关闭。启用后：
 | `file` | 从 JKS/PKCS12 keystore 加载 server 证书 |
 | `self-signed` | 启动时生成临时自签名证书，仅用于开发/测试 |
 
-Java client 入口默认仍以明文连接；启用 TLS 需要构造 `SslContext` 并使用 `NettyClient(TunnelBean, SslContext)`。`buildClientSslContext` 加载 truststore，`buildInsecureClientSslContext` 仅供测试。
+Java client 入口默认仍以明文连接；启用 TLS 需要构造 `SslContext` 并使用 `NettyClient(SpecusBean, SslContext)`。`buildClientSslContext` 加载 truststore，`buildInsecureClientSslContext` 仅供测试。
 
 ### 7.2 客户端与管理面鉴权
 
@@ -289,7 +289,7 @@ ClientCredential
   └─ ClientIdentity (credential + machineFingerprint + osUser)
        └─ ClientAccount
             ├─ ClientSession
-            ├─ TunnelMapping
+            ├─ SpecusMapping
             ├─ HttpRouteMapping
             ├─ ConnectionRecord ──► ConnectionStat（月度归档）
             ├─ TrafficUsage / ResourceTrafficUsage
@@ -303,7 +303,7 @@ ClientCredential
 
 ### 8.2 路由、连接与流量
 
-- **`TunnelMapping`**：全局唯一 `listen_port`、目标地址/端口、启用状态和明细采集开关。
+- **`SpecusMapping`**：全局唯一 `listen_port`、目标地址/端口、启用状态和明细采集开关。
 - **`HttpRouteMapping`**：`(client_id, route)` 唯一，保存 target base URL、启用、明细采集和路径改写开关。
 - **`ConnectionRecord`**：client、channel、remote address、连接/断开时间、成功状态、失败原因和断开原因；不保存登录耗时或流量字节。
 - **`ConnectionStat`**：按 tenant、clientName、自然月累加 total/success/failure，长期保留。
@@ -312,7 +312,7 @@ ClientCredential
 
 连接记录关键索引是 `(client_id, connected_at)` 和 `connected_at`，分别服务频率限制/客户端历史与归档扫描。早于滚动保留窗口的记录按自然月汇总后，在同一事务中删除；默认保留 60 天。
 
-HTTP/TCP 明细默认写业务数据库；配置 `TUNNEL_ELASTICSEARCH_URIS` 后切换到 Elasticsearch store。全局采集开关与每条 route/mapping 开关都必须开启才会记录明细。
+HTTP/TCP 明细默认写业务数据库；配置 `SPECUS_ELASTICSEARCH_URIS` 后切换到 Elasticsearch store。全局采集开关与每条 route/mapping 开关都必须开启才会记录明细。
 
 ### 8.3 数据库
 
@@ -322,7 +322,7 @@ HTTP/TCP 明细默认写业务数据库；配置 `TUNNEL_ELASTICSEARCH_URIS` 后
 | MySQL | `com.mysql.cj.jdbc.Driver` | `org.hibernate.dialect.MySQLDialect` |
 | PostgreSQL | `org.postgresql.Driver` | `org.hibernate.dialect.PostgreSQLDialect` |
 
-`DatabaseInitializer` 负责旧库 tenant/owner 和 HTTP body 字段回填，并可用 `TUNNEL_DB_SEED_DEMO_CLIENT` 控制 `Demo client` 与 `demo-client/test1234` 演示凭证种子。
+`DatabaseInitializer` 负责旧库 tenant/owner 和 HTTP body 字段回填，并可用 `SPECUS_DB_SEED_DEMO_CLIENT` 控制 `Demo client` 与 `demo-client/test1234` 演示凭证种子。
 
 ## 9. 并发与线程模型
 
@@ -357,17 +357,17 @@ HTTP/TCP 明细默认写业务数据库；配置 `TUNNEL_ELASTICSEARCH_URIS` 后
 | 类别 | 配置 / 环境变量 | 默认 |
 | --- | --- | --- |
 | Web | `server.port` | `8088` |
-| Control | `TUNNEL_NETTY_PORT` | `7010` |
-| Frame | `TUNNEL_NETTY_MAX_FRAME_SIZE` | `33554432`（32 MiB） |
-| DB | `TUNNEL_DB_URL` / `TUNNEL_DB_POOL_SIZE` / `TUNNEL_DB_BATCH_SIZE` | SQLite / `1` / `50` |
-| Seed | `TUNNEL_DB_SEED_DEMO_CLIENT` | `true` |
-| Client token | `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` |
-| Traffic | `TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS` | `5000` |
-| Archive | `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` / `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` | `60` / `3600000` |
-| HTTP | `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` / `TUNNEL_HTTP_TIMEOUT_MS` | `16777216` / `30000` |
-| Admin auth | `TUNNEL_AUTH_USERNAME` / `_PASSWORD` / `_TOKEN_TTL_SECONDS` | `admin` / `admin` / `28800` |
-| Peer Mesh | `TUNNEL_PEER_MESH_ENABLED` / `_STUN_TURN_PORT` / `_NAT_PROBE_ALTERNATE_PORT` | `false` / `3478` / `3479` |
-| TLS | `TUNNEL_TLS_MODE` | `disabled` |
+| Control | `SPECUS_NETTY_PORT` | `7010` |
+| Frame | `SPECUS_NETTY_MAX_FRAME_SIZE` | `33554432`（32 MiB） |
+| DB | `SPECUS_DB_URL` / `SPECUS_DB_POOL_SIZE` / `SPECUS_DB_BATCH_SIZE` | SQLite / `1` / `50` |
+| Seed | `SPECUS_DB_SEED_DEMO_CLIENT` | `true` |
+| Client token | `SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS` | `28800` |
+| Traffic | `SPECUS_TRAFFIC_FLUSH_INTERVAL_MS` | `5000` |
+| Archive | `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` / `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` | `60` / `3600000` |
+| HTTP | `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` / `SPECUS_HTTP_TIMEOUT_MS` | `16777216` / `30000` |
+| Admin auth | `SPECUS_AUTH_USERNAME` / `_PASSWORD` / `_TOKEN_TTL_SECONDS` | `admin` / `admin` / `28800` |
+| Peer Mesh | `SPECUS_PEER_MESH_ENABLED` / `_STUN_TURN_PORT` / `_NAT_PROBE_ALTERNATE_PORT` | `false` / `3478` / `3479` |
+| TLS | `SPECUS_TLS_MODE` | `disabled` |
 
 完整配置以 `implementations/java/server/src/main/resources/application.yml` 和对应 `@ConfigurationProperties` 类为准。
 
@@ -395,7 +395,7 @@ Java client                 Spring HTTP                 DB                 Netty
 
 ```text
 Admin REST mutation
-  → 在事务中保存 TunnelMapping / HttpRouteMapping
+  → 在事务中保存 SpecusMapping / HttpRouteMapping
   → NatControlService.pushSnapshotIfOnline
   → 在线 client 收到完整 NAT_CONTROL 权威快照
   → TCP 映射增删触发 REGISTER / UNREGISTER
@@ -409,7 +409,7 @@ Admin REST mutation
 - **Java client TLS 未配置化**：入口默认明文，需要把 truststore/校验策略正式加入 `client.jsonc`。
 - **HTTP 登录 nonce 未去重**：签名有 60 秒时间窗，但窗口内可重放；单节点可加有界 nonce cache，多节点需共享存储。
 - **公网 UDP 映射缺失**：如要实现，需要新增协议子类型、server `DatagramChannel` 和按来源端点维护的映射；这与已实现 Peer Mesh UDP 不同。
-- **E2E 覆盖有限**：已有 `EndToEndTunnelIT` 覆盖 SQLite 进程内 HTTP HMAC、Netty token、真实 TCP 隧道和 route 热更新，但 `*IT` 尚未接入 Maven Failsafe；仍缺真实 MySQL/PostgreSQL、跨进程和 TLS 矩阵。
+- **E2E 覆盖有限**：已有 `EndToEndSpecusIT` 覆盖 SQLite 进程内 HTTP HMAC、Netty token、真实 TCP 隧道和 route 热更新，但 `*IT` 尚未接入 Maven Failsafe；仍缺真实 MySQL/PostgreSQL、跨进程和 TLS 矩阵。
 - **水平扩展**：`SessionUtil`、`NatServerHandler` 和动态监听仍是进程内状态；需要控制/连接端拆分、粘性路由、共享状态和 drain。详见 `server-control-edge-ha-plan.md`。
 - **未知协议值容忍**：`magic`/`version` 已预留，但未知 `Command`/serializer 当前不能保证被安全忽略，协议演进必须先做兼容性验证。
 
@@ -417,22 +417,22 @@ Admin REST mutation
 
 | 主题 | 当前入口 |
 | --- | --- |
-| Server 启动 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/TunnelServerApplication.java` |
+| Server 启动 | `implementations/java/server/src/main/java/com/theshuai/specusserver/SpecusServerApplication.java` |
 | Control Netty | `.../server/NettyServer.java`、`.../handler/ManagedLoginRequestHandler.java`、`.../handler/AuthHandler.java` |
 | Client HTTP 认证 | `.../management/controller/ClientAuthResource.java`、`.../management/service/ClientAuthService.java` |
 | Client 凭证/账号 | `.../management/service/ClientCredentialService.java`、`.../management/service/ClientAccountService.java` |
-| NAT server | `.../handler/NatServerHandler.java`、`.../handler/RemoteTunnelHandler.java`、`.../server/RemotePortServerManager.java` |
-| HTTP/WS 直转 | `.../http/HttpTunnelController.java`、`.../http/DirectHttpDispatcher.java`、`.../http/WebSocketTunnelHandler.java` |
+| NAT server | `.../handler/NatServerHandler.java`、`.../handler/RemoteSpecusHandler.java`、`.../server/RemotePortServerManager.java` |
+| HTTP/WS 直转 | `.../http/HttpSpecusController.java`、`.../http/DirectHttpDispatcher.java`、`.../http/WebSocketSpecusHandler.java` |
 | Peer Mesh server | `.../management/service/PeerMeshService.java`、`.../management/service/PeerSignalService.java`、`.../peer/StunTurnServer.java` |
 | 管理 REST | `.../management/controller/*Resource.java`、`.../management/controller/AuthController.java`、`.../management/controller/OidcController.java` |
 | 安全 | `.../config/SecurityConfig.java`、`.../security/LocalTokenService.java`、`.../security/TlsContextFactory.java` |
 | 协议核心 | `implementations/java/common/src/main/java/com/theshuai/common/protocol/*`、`.../command/Command.java` |
 | 编解码 | `.../codec/Spliter.java`、`.../codec/PacketCodecHandler.java`、`.../protocol/PacketCodec.java` |
 | 紧凑二进制 | `.../serialize/impl/CompactBinarySerializer.java` |
-| Java client 启动/连接 | `implementations/java/client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java`、`.../client/NettyClient.java` |
-| Java client NAT/HTTP | `.../handler/NatClientHandler.java`、`.../handler/LocalTunnelHandler.java`、`.../handler/DirectHttpRequestHandler.java` |
+| Java client 启动/连接 | `implementations/java/client/src/main/java/com/theshuai/specusclient/SpecusClientApplication.java`、`.../client/NettyClient.java` |
+| Java client NAT/HTTP | `.../handler/NatClientHandler.java`、`.../handler/LocalSpecusHandler.java`、`.../handler/DirectHttpRequestHandler.java` |
 | Java client Peer Mesh | `.../peer/PeerMeshClient.java`、`.../peer/PeerVirtualDevices.java` |
-| 进程内 E2E | `implementations/java/server/src/test/java/com/theshuai/tunnelserver/integration/EndToEndTunnelIT.java` |
+| 进程内 E2E | `implementations/java/server/src/test/java/com/theshuai/specusserver/integration/EndToEndSpecusIT.java` |
 
 ---
 

@@ -1,6 +1,6 @@
 # Server 控制端 / 连接端拆分与高可用方案
 
-本文保存后续把 `tunnel-server` 拆成控制端和连接端的演进方案。当前代码仍是单体模式：Spring 管理 API、管理后台、Netty 控制连接、公网 TCP 端口监听、HTTP route 入口、peer relay 都运行在同一个 `tunnel-server` 进程中。
+本文保存后续把 `specus-server` 拆成控制端和连接端的演进方案。当前代码仍是单体模式：Spring 管理 API、管理后台、Netty 控制连接、公网 TCP 端口监听、HTTP route 入口、peer relay 都运行在同一个 `specus-server` 进程中。
 
 ## 1. 结论
 
@@ -48,11 +48,11 @@ v1 推荐目标：
 建议新增配置：
 
 ```yaml
-tunnel:
+specus:
   server:
     role: all # all | control | edge
     edge-id: edge-a
-    edge-public-address: tunnel-a.example.com
+    edge-public-address: specus-a.example.com
     edge-internal-address: 10.0.0.11
 ```
 

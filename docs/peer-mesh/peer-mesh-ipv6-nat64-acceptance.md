@@ -15,12 +15,12 @@
 建议先保存以下基线：
 
 ```bash
-dig A stun1.tunnel.devshuai.com
-dig AAAA stun1.tunnel.devshuai.com
-dig A stun2.tunnel.devshuai.com
-dig AAAA stun2.tunnel.devshuai.com
-curl -fsS -H "Authorization: Bearer ${TUNNEL_ADMIN_TOKEN}" \
-  https://tunnel.devshuai.com/api/admin/peer-mesh/stats
+dig A stun1.specus.devshuai.com
+dig AAAA stun1.specus.devshuai.com
+dig A stun2.specus.devshuai.com
+dig AAAA stun2.specus.devshuai.com
+curl -fsS -H "Authorization: Bearer ${SPECUS_ADMIN_TOKEN}" \
+  https://specus.devshuai.com/api/admin/peer-mesh/stats
 ```
 
 Windows 使用 `Resolve-DnsName` 和 `Invoke-RestMethod` 执行同一检查。

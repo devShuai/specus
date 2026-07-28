@@ -40,7 +40,7 @@
 
 ### S0.0 显式 NAT 端口映射（UPnP / NAT-PMP / PCP）
 
-- 新增包 `com.theshuai.tunnelclient.peer.portmap`，9 个文件：
+- 新增包 `com.theshuai.specusclient.peer.portmap`，9 个文件：
   - `PortMappingProtocol` / `NatPortMapping` / `NatPortMapper` / `PortMappingException`
   - `DefaultGatewayDiscovery`：UDP connect 探测 1.1.1.1 / 223.5.5.5，取 /24 的 .1 与 .254 作为候选网关
   - `UpnpPortMapper`：weupnp 0.1.4 封装，`GatewayDiscover.discover()`，端口映射带试错回退
@@ -82,7 +82,7 @@
 
 > 落点文件：
 > - `handler/ChannelAttributes.java`（新增）
-> - `handler/RemoteTunnelHandler.java`
+> - `handler/RemoteSpecusHandler.java`
 > - `handler/NatServerHandler.java`
 > - `management/service/TrafficUsageService.java`
 > - `management/service/ClientAccountService.java`
@@ -97,7 +97,7 @@
   - `CLOSE_ON_FAILURE`：静态 `ChannelFutureListener` 单例，替代每帧 lambda
   - `closeOnFailureOf(Channel)`：channel-scoped listener 工厂，listener 实例缓存到 attr
   - `EndpointSnapshot` record（address, port）+ `of(SocketAddress)` 工厂
-- `RemoteTunnelHandler`：channelActive 调 `initHotPath`，channelRead/channelInactive 用缓存 channelId + EndpointSnapshot，HashMap 容量预算（4/2/2, loadFactor 0.75f）
+- `RemoteSpecusHandler`：channelActive 调 `initHotPath`，channelRead/channelInactive 用缓存 channelId + EndpointSnapshot，HashMap 容量预算（4/2/2, loadFactor 0.75f）
 - `NatServerHandler.processData`：用 `ChannelAttributes.localEndpoint/remoteEndpoint/channelId` 替代 `endpointAddress/endpointPort`
 
 验收：编译通过，转发链路无回归。
@@ -213,7 +213,7 @@
 ### S4.2 TCP 流量采样 ⚠️
 
 - 现状：TCP 帧全量落库，高吞吐下 ES / DB 压力大
-- 已通过 `TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE` 提供 `0.0..1.0` 采样率；每个方向的首帧始终保留，其余帧按采样率决定
+- 已通过 `SPECUS_TRAFFIC_CAPTURE_SAMPLE_RATE` 提供 `0.0..1.0` 采样率；每个方向的首帧始终保留，其余帧按采样率决定
 - 当前数据模型没有单独的尾帧/异常帧标记，因此原计划中的「尾包 + 错误包始终保留」尚未实现
 
 ### S4.3 日志降级 ✅

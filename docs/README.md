@@ -32,9 +32,9 @@
 
 * [cross-language-java-alignment-plan.md](cross-language/cross-language-java-alignment-plan.md) — 以 Java 为参考实现的对齐计划。
 * [cross-language-e2e-acceptance-matrix.md](cross-language/cross-language-e2e-acceptance-matrix.md) — 三语言 server/client 端到端验收矩阵。
-* [tunnel-server-go-port-plan.md](cross-language/tunnel-server-go-port-plan.md) — Go 服务端移植计划。
-* [tunnel-server-csharp-port-plan.md](cross-language/tunnel-server-csharp-port-plan.md) — C# 服务端重写计划(原文件名 eventual-tickling-waffle.md,已更正)。
-* [tunnel-server-c-port-plan.md](cross-language/tunnel-server-c-port-plan.md) — C 语言服务端移植计划。
+* [specus-server-go-port-plan.md](cross-language/specus-server-go-port-plan.md) — Go 服务端移植计划。
+* [specus-server-csharp-port-plan.md](cross-language/specus-server-csharp-port-plan.md) — C# 服务端重写计划(原文件名 eventual-tickling-waffle.md,已更正)。
+* [specus-server-c-port-plan.md](cross-language/specus-server-c-port-plan.md) — C 语言服务端移植计划。
 
 ## performance/ — 性能与容量
 

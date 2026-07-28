@@ -1,6 +1,6 @@
 # Peer Mesh 移动端实现方案
 
-> 将 shuai-tunnel 的 peer-to-peer mesh 组网能力移植到 Android（Kotlin）和 iOS（Swift），
+> 将 specus 的 peer-to-peer mesh 组网能力移植到 Android（Kotlin）和 iOS（Swift），
 > 使移动设备能通过 VPN 隧道参与私有组网，与其他 peer 设备直连或经 relay 通信。
 >
 > 状态复核（2026-07-10）：本文主体仍是跨 Android/iOS 的目标方案，不是当前代码结构说明。仓库已经有
@@ -27,7 +27,7 @@
 │  │  平台适配层          │ │  VPN Provider │  │
 │  │  - UDP socket       │ │  - VpnService │  │
 │  │  - 控制通道          │ │  - NEPacket   │  │
-│  │  - 密钥存储          │ │  TunnelProvider│ │
+│  │  - 密钥存储          │ │  SpecusProvider│ │
 │  │  - STUN/TURN        │ └───────────────┘  │
 │  └─────────────────────┘                     │
 └─────────────────────────────────────────────┘
@@ -94,14 +94,14 @@
 | `PeerVirtualDevice` | `android.net.VpnService` + `Builder` |
 | `sendVirtualPacket` 回调 | VpnService 内部循环读取 `FileDescriptor` |
 | `handlePlainPacket` 写入 | `FileDescriptor.write(packet)` 注入 VPN |
-| TUN 接口名 `shuai0` | `Builder.setSession("shuai-tunnel")` |
+| TUN 接口名 `specus0` | `Builder.setSession("specus")` |
 
 **VPN 启动流程**：
 ```kotlin
 class MeshVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val builder = Builder().apply {
-            setSession("shuai-tunnel")
+            setSession("specus")
             addAddress(meshConfig.virtualIp, 11)
             addRoute("100.96.0.0", 11)
             setMtu(PeerVirtualDeviceOptions.DEFAULT_MTU)
@@ -175,7 +175,7 @@ class MeshVpnService : VpnService() {
 
 **VPN 启动流程**：
 ```swift
-class MeshPacketTunnelProvider: NEPacketTunnelProvider {
+class SpecusPacketProvider: NEPacketTunnelProvider {
     override func startTunnel(options: [String : NSObject]?) async throws {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: meshConfig.cidr)
         settings.mtu = NSNumber(value: PeerVirtualDeviceOptions.DEFAULT_MTU)
@@ -207,7 +207,7 @@ class MeshPacketTunnelProvider: NEPacketTunnelProvider {
 | X25519 + AES-GCM | `CryptoKit`（iOS 13+） |
 | HKDF | CryptoKit `HKDF` |
 | 网络 | `NWConnection` (Network.framework) |
-| VPN | `NEPacketTunnelProvider`（内置） |
+| VPN | `NEPacketTunnelProvider`（系统框架） |
 | UPnP | 可选（`TCP:1900` 简单实现） |
 
 ### 3.6 文件预估
@@ -217,7 +217,7 @@ class MeshPacketTunnelProvider: NEPacketTunnelProvider {
 | `PeerMeshEngine.swift`（共享核心适配层） | ~600 |
 | `ControlChannel.swift`（WebSocket） | ~200 |
 | `UdpTransport.swift`（NWConnection UDP） | ~150 |
-| `MeshPacketTunnelProvider.swift` | ~250 |
+| `MeshPacketSpecusProvider.swift` | ~250 |
 | `KeyStoreAdapter.swift`（Keychain） | ~80 |
 | `CryptoAdapter.swift`（CryptoKit 桥接） | ~80 |
 | `LoginClient.swift`（HTTP 登录） | ~100 |
@@ -256,9 +256,9 @@ class MeshPacketTunnelProvider: NEPacketTunnelProvider {
 | 协议层 | 兼容性要求 |
 |--------|-----------|
 | `PeerControlMessage` JSON | `@SerialName` 与 Java 字段名一致 |
-| `PeerUdpProbe` JSON | magic `"shuai-peer-mesh"` + 字段名一致 |
+| `PeerUdpProbe` JSON | magic `"specus-peer-mesh"` + 字段名一致 |
 | `PeerDataFrameHeader` | `0x53504D31` + 46 字节 AAD |
-| `deriveAes256Key` | HKDF salt = `SHA-256("shuai-peer-mesh\n<sessionId>\n<token>\n<minId>\n<maxId>")` |
+| `deriveAes256Key` | HKDF salt = `SHA-256("specus-peer-mesh\n<sessionId>\n<token>\n<minId>\n<maxId>")` |
 | 标准 STUN binding | 二进制 STUN、`XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN`、`OTHER-ADDRESS` |
 | 标准 TURN | Allocate / Refresh / CreatePermission / Send Indication / Data Indication；当前不使用 ChannelBind/ChannelData |
 | 探针突发 | `PROBE_BURST_COUNT=3`, `INTERVAL=30ms` |

@@ -1,6 +1,6 @@
-# tunnel-server Go 移植计划与状态
+# specus-server Go 移植计划与状态
 
-Go 实现的 shuai-tunnel 服务端(`implementations/go/server/`),module 为 `github.com/devShuai/shuai-tunnel/implementations/go/server`,Go 1.26。与 Java / Go / .NET / Android client 线协议兼容。分 6 个阶段交付；下述“全绿”是阶段交付时的历史记录，当前验证结果以 `cross-language-java-alignment-plan.md` 的“当前验证”为准。
+Go 实现的 specus 服务端(`implementations/go/server/`),module 为 `github.com/devShuai/specus/implementations/go/server`,Go 1.26。与 Java / Go / .NET / Android client 线协议兼容。分 6 个阶段交付；下述“全绿”是阶段交付时的历史记录，当前验证结果以 `cross-language-java-alignment-plan.md` 的“当前验证”为准。
 
 与 Java server 的逐项对齐：2026-07-22 完成 `go-server-parity-implementation-plan.md` 全部 6 个批次（S-1..S-9、T-4/T-5/T-7/T-8 修复），实质差异清零，仅剩 7 项可接受的轻微差异；明细见 `go-server-vs-java-server-audit-2026-07.md`。
 
@@ -8,7 +8,7 @@ Go 实现的 shuai-tunnel 服务端(`implementations/go/server/`),module 为 `gi
 
 ```
 implementations/go/server/
-├── cmd/shuai-tunnel-server/main.go
+├── cmd/specus-server/main.go
 ├── web/static/{index.html,assets/**,...}    # 内嵌 SPA(同 Java/C#)
 └── internal/{protocol,config,store,auth,session,control,nat,directhttp,management,transfer,security,wsevents,server}
 ```
@@ -32,10 +32,10 @@ implementations/go/server/
 - **验收**:REGISTER → 外部连入 → 8KiB + 1MiB 双向回环 → 流量计数双向 > 0。
 
 ### G4 — 管理 API + JWT + WebSocket + Direct HTTP + SPA + 归档 ✅
-- 全量 `/auth/*`、`/api/admin/*`(overview/clients/tunnels/http-routes/connections/traffic/connection-stats/nat-control/database-initialize)、`/oidc-config`、`/health`。
-- 本地 HS256 JWT;`/ws/connections`(?token,403+X-Auth-Reason)连接事件广播;Direct HTTP `/http/{client}/{route}/{**rest}`;CRUD 后热推 NAT_CONTROL;改名/停用/删除踢线;CSP/安全头;SPA go:embed;连接明细默认每小时归档 60 天前记录→月度统计，可通过 Java 同名 `TUNNEL_CONNECTION_*` 环境变量调整。
-- HTTP/TCP 明细采集热路径已改为 Java 对齐的队列模型：通道开启时先入队，后台按 `TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` 批量写入 DB/ES，`TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING` 和 `TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` 控制积压与批量大小；明细查询默认不强制 flush，需要追最新数据时可显式传 `flush=true`。
-- **验收**:admin 鉴权 / 登录 / overview / client+tunnel CRUD / nat-control 离线 409 / 路由校验 / Direct HTTP 离线 503。
+- 全量 `/auth/*`、`/api/admin/*`(overview/clients/specus-mappings/http-routes/connections/traffic/connection-stats/nat-control/database-initialize)、`/oidc-config`、`/health`。
+- 本地 HS256 JWT;`/ws/connections`(?token,403+X-Auth-Reason)连接事件广播;Direct HTTP `/http/{client}/{route}/{**rest}`;CRUD 后热推 NAT_CONTROL;改名/停用/删除踢线;CSP/安全头;SPA go:embed;连接明细默认每小时归档 60 天前记录→月度统计，可通过 Java 同名 `SPECUS_CONNECTION_*` 环境变量调整。
+- HTTP/TCP 明细采集热路径已改为 Java 对齐的队列模型：通道开启时先入队，后台按 `SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` 批量写入 DB/ES，`SPECUS_TRAFFIC_CAPTURE_MAX_PENDING` 和 `SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` 控制积压与批量大小；明细查询默认不强制 flush，需要追最新数据时可显式传 `flush=true`。
+- **验收**:admin 鉴权 / 登录 / overview / client+specus CRUD / nat-control 离线 409 / 路由校验 / Direct HTTP 离线 503。
 
 ### G5 — OIDC + TLS ✅
 - OIDC:RS256/JWKS 校验(缓存 + 轮换重取,iss/aud/exp/nbf + 60s skew),`/oidc/token` 授权码交换(confidential→Basic,public→client_id 表单);admin 鉴权本地 HS256 优先、OIDC RS256 兜底。
@@ -60,7 +60,7 @@ implementations/go/server/
 | WebSocket 事件 | hub 实现 + 登录/断开广播接线 + 租户/owner 过滤 + 端到端 WS 客户端订阅测试 | ✅ |
 | Direct HTTP | 离线 503 测试 + 转发实现 | ✅ |
 | SPA | go:embed + `/` 文件服务 | ✅ |
-| 连接归档 | `ArchiveOldConnections` + 定时 + `TUNNEL_CONNECTION_*` 配置 | ✅ |
+| 连接归档 | `ArchiveOldConnections` + 定时 + `SPECUS_CONNECTION_*` 配置 | ✅ |
 | OIDC | mock IdP 交换测试 + RS256 校验 | ✅ |
 | TLS | 模式加载测试(PKCS12/PEM/自签) | ✅ |
 | 公共发现 + 6 个附件接口 | WebSocket 隔离/限流测试 + OSS service/HTTP 集成测试 | ✅ |
@@ -75,7 +75,7 @@ cd implementations/go/server
 go build ./...
 go test ./...
 go vet ./...
-go run ./cmd/shuai-tunnel-server
+go run ./cmd/specus-server
 ```
 
 ## 已知简化 / 待办

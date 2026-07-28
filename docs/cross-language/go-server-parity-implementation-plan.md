@@ -51,7 +51,7 @@
 
 ### T-7：Direct HTTP 离线状态码 503 -> 502
 - **文件**：`implementations/go/server/internal/directhttp/errors.go`、`service.go`
-- **改动**：`errOffline` 及实际离线响应均返回 `http.StatusBadGateway`（502），对齐 Java `HttpTunnelController.java:100`。
+- **改动**：`errOffline` 及实际离线响应均返回 `http.StatusBadGateway`（502），对齐 Java `HttpSpecusController.java:100`。
 
 ### Batch 1 验证
 - `go build ./...` 通过（exit 0）。
@@ -115,18 +115,18 @@
 ## Batch 4：Direct HTTP WebSocket 隧道（S-1） ✅
 
 已完成。实施要点（与 Java 逐条对应）：
-- 新增 `directhttp/sws2.go`（12 字节 SWS2 帧编解码：magic `0x53575332`、opcode、flags、closeCode u16、payloadLen i32，maxPayload=65524）与 `directhttp/ws_tunnel.go`（`WebSocketTunnel`，基于已有依赖 `coder/websocket`）。
+- 新增 `directhttp/sws2.go`（12 字节 SWS2 帧编解码：magic `0x53575332`、opcode、flags、closeCode u16、payloadLen i32，maxPayload=65524）与 `directhttp/ws_specus.go`（`WebSocketSpecus`，基于已有依赖 `coder/websocket`）。
 - `directhttp/service.go` `ServeHTTP` 顶部检测 `Upgrade: websocket` 分支到 WS 隧道；`nat/session.go` 新增 `wsStreams` 表、NatData/NatFin/NatRST 的 WS 分支、`openWSStream`（`source=ws` metadata）与 dispose 时统一关闭，流控与 `HTTPStream` 一致。
 - 修复了一个实施中发现的缺陷：`coder/websocket` 默认 32KB 读上限会掐断大消息，已 `SetReadLimit` 对齐 16MB。
-- 测试：`sws2_test.go`（编解码 round-trip/边界/畸形帧）、`ws_tunnel_test.go`（真实 WS 对的 OPEN/DATA/CLOSE 生命周期、大消息分块、客户端 CLOSE 回送、send credit 窗口语义）。
+- 测试：`sws2_test.go`（编解码 round-trip/边界/畸形帧）、`ws_specus_test.go`（真实 WS 对的 OPEN/DATA/CLOSE 生命周期、大消息分块、客户端 CLOSE 回送、send credit 窗口语义）。
 
 ## Batch 5：公共互传 rooms + 用户 diagrams（S-3 剩余 + DB 表） ✅
 
 已完成。实施要点：
-- 5 张新表加入全部 3 个 schema（字段以 Java entity 为准，含 `owner_token_hash`/`snapshot_data`/`revision` 等真实列），另给 `tunnel_websocket_ticket` 加 `room_role` 列并纳入启动列迁移。
+- 5 张新表加入全部 3 个 schema（字段以 Java entity 为准，含 `owner_token_hash`/`snapshot_data`/`revision` 等真实列），另给 `specus_websocket_ticket` 加 `room_role` 列并纳入启动列迁移。
 - 新增 `store/rooms.go`、`store/diagrams.go`（含原子 pairing-code 核销与乐观锁 revision 更新）、`transfer/room_service.go`（9 个方法 + per-IP 限流，集群走 Redis `SharedRateLimiter`）、`management/rooms.go`（9 端点）、`management/diagrams.go`（5 端点，tenant/owner 可见性）。
 - `server/websocket_tickets.go`：`roomToken` 存在时经 `rooms.Resolve` 解析，设 `RoomKey="room:"+id` 与 `RoomRole`，对齐 Java `WebSocketTicketResource`。
-- 端点路径、JSON 字段名、状态码、中文错误消息逐字对齐 Java；配置新增 `TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_*`（默认值与 Java 一致）。
+- 端点路径、JSON 字段名、状态码、中文错误消息逐字对齐 Java；配置新增 `SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_*`（默认值与 Java 一致）。
 - 测试：`transfer/room_service_test.go`、`management/diagrams_test.go`、`server/websocket_tickets_test.go`。
 
 ## Batch 6：嵌入式 STUN RFC 5780（S-7） ✅
@@ -134,7 +134,7 @@
 已完成。实施要点：
 - `peermesh/stun_turn.go` 的嵌入式 binding 改为委托同模块 `internal/stunserver` 的共享 `BindingService`（CHANGE-REQUEST 0x02/0x04/0x06、RESPONSE-PORT、PADDING 全部语义，与 Java `StunBindingService` 字节级一致）。
 - 拓扑：`configureStunTopology()` 在四要素齐备时构建 RFC 5780 四端点，否则回退 basic 双端点；`stunBehaviorStrict` 下配置不全即不启动（对齐 Java）。注意语义变化：alternate 端口 bind 失败时从"降级仅 primary"改为"整体不启动"，与 Java 基准一致。
-- 配置新增 `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` / `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` / `TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT`。
+- 配置新增 `SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` / `SPECUS_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` / `SPECUS_PEER_MESH_STUN_BEHAVIOR_STRICT`。
 - 测试：`stun_turn_test.go` 重写——CHANGE-REQUEST 各 flag、420/400 拒绝、RESPONSE-PORT、PADDING（含 1472 上限）、四端点选择。
 
 ---
@@ -142,16 +142,16 @@
 ## 收尾 ✅
 
 ### T-8：Java 413 预检记录 ✅
-- **文件**：`implementations/java/server/.../http/HttpTunnelBodyLimitFilter.java`
+- **文件**：`implementations/java/server/.../http/HttpSpecusBodyLimitFilter.java`
 - **改动**：已按"修 Java"方向实施——filter 注入 `TrafficInspectionService`，Content-Length 超限短路时先捕获请求体前缀、写出 413 响应，再 `recordHttpExchange` 记录该交换（status=413，参数语义对齐 Go `directhttp/service.go` 的 `fail()` 路径）。
-- **测试**：新增 `HttpTunnelBodyLimitFilterTests`（413 记录、未超限放行不记录、非 `/http/` 路径不记录）；tunnel-common + tunnel-server 全量测试通过。
+- **测试**：新增 `HttpSpecusBodyLimitFilterTests`（413 记录、未超限放行不记录、非 `/http/` 路径不记录）；specus-common + specus-server 全量测试通过。
 
 ### 审计文档更新 ✅
 - `go-server-vs-java-server-audit-2026-07.md` 已将 S-1、S-3、S-5、S-7、T-5、T-8 标记为 ALIGNED。
 
 ### 最终验证
 - Go：`cd implementations/go/server && go build ./... && go test ./...`（全绿）。
-- Java（S-2/T-8）：`mvn -Dtunnel.server.web.skip=true -pl implementations/java/server -am test`（tunnel-common 43 + tunnel-server 130 通过）。
+- Java（S-2/T-8）：`mvn -Dspecus.server.web.skip=true -pl implementations/java/server -am test`（specus-common 43 + specus-server 130 通过）。
 
 ---
 
@@ -172,5 +172,5 @@
 ## 相关文档
 
 - 审计文档：`go-server-vs-java-server-audit-2026-07.md`
-- Go server 移植计划：`tunnel-server-go-port-plan.md`
+- Go server 移植计划：`specus-server-go-port-plan.md`
 - 总对齐计划：`cross-language-java-alignment-plan.md`

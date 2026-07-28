@@ -1,8 +1,8 @@
-# tunnel-server C 语言迁移执行计划
+# specus-server C 语言迁移执行计划
 
 ## 目标
 
-在不改动现有 Java `tunnel-server`、Java `tunnel-client`、Go client、C# 版本的前提下，新增一版并行的 C 语言 `tunnel-server`：
+在不改动现有 Java `specus-server`、Java `specus-client`、Go client、C# 版本的前提下，新增一版并行的 C 语言 `specus-server`：
 
 - 与现有 Java/Go client 的 wire protocol 兼容。
 - 优先覆盖控制连接、登录鉴权、心跳、`NAT_CONTROL`、TCP NAT 转发这条核心链路。
@@ -22,7 +22,7 @@ implementations/c/server/
 - C11 + POSIX socket + pthread + zlib + SQLite3 构建。
 - Java 协议帧头：`0x14353565`、`version=1`、`serializer`、`command`、body length；32 MiB 按 11 字节 header + body 的完整帧计算，CompactBinary deflate 恰好 16 MiB 允许、超 1 字节拒绝。
 - Java compact payload 的 raw/deflate 编解码，使用 raw deflate 参数对齐 Java `Deflater(..., true)` / `Inflater(true)`。
-- HMAC-SHA256 启动鉴权，支持 SQLite `tunnel_client_credential` 校验，创建/复用机器用户绑定的客户端身份，写入 `tunnel_client_session`，并签发 Java-shaped `cs_` runtime token。
+- HMAC-SHA256 启动鉴权，支持 SQLite `specus_client_credential` 校验，创建/复用机器用户绑定的客户端身份，写入 `specus_client_session`，并签发 Java-shaped `cs_` runtime token。
 - Netty 控制通道按 `clientSessionId + accessToken` 登录，校验 token 过期、客户端/凭证启用状态、同机单实例和最大在线实例数，登录成功后进入 `NETTY_ONLINE`，断开后标记 `DISCONNECTED`。
 - `NAT_CONTROL`、TCP NAT 的 `REGISTER`、`CONNECTED`、`DATA`、`DISCONNECTED`、`UNREGISTER` 核心流程可用。
 - 轻量管理 HTTP listener 已覆盖本地密码登录、HS256 管理 JWT、管理用户、客户端凭证、客户端、TCP 映射、HTTP route、连接记录、连接归档统计、日流量、资源流量和 SQLite HTTP/TCP 明细查询。
@@ -168,10 +168,10 @@ make -C implementations/c/server test
 ```bash
 make -C implementations/c/server test
 
-TUNNEL_DATABASE_PATH=./shuai-tunnel-c.db \
-TUNNEL_ADMIN_PORT=18088 \
-TUNNEL_NETTY_PORT=17010 \
-implementations/c/server/build/shuai-tunnel-server-c
+SPECUS_DATABASE_PATH=./specus-c.db \
+SPECUS_ADMIN_PORT=18088 \
+SPECUS_NETTY_PORT=17010 \
+implementations/c/server/build/specus-server-c
 ```
 
 使用数据库中启用的 credential 完成 HTTP 登录，Java client 控制连接日志出现登录成功，C server 日志出现
@@ -185,7 +185,7 @@ implementations/c/server/build/shuai-tunnel-server-c
 
 **任务**：
 
-- 当前 `TUNNEL_TCP_MAPPINGS` 格式继续保留：
+- 当前 `SPECUS_TCP_MAPPINGS` 格式继续保留：
 
 ```text
 publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
@@ -195,11 +195,11 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
   - `clientName`
   - `remoteAddress`
   - `remotePort`
-  - `tunnelConfigList`
-  - `httpTunnelConfigList`（存在数据库或 `TUNNEL_HTTP_ROUTES` 配置时下发；空数组表示清空）
+  - `specusConfigList`
+  - `httpSpecusConfigList`（存在数据库或 `SPECUS_HTTP_ROUTES` 配置时下发；空数组表示清空）
 - REGISTER 校验：
   - `clientName` 必须等于登录 session。
-  - `port/tunnelAddress/tunnelPort` 必须存在于服务端下发配置。
+  - `port/specusAddress/specusPort` 必须存在于服务端下发配置。
   - 重复注册同一端口要返回失败。
 - 外部 TCP 连接：
   - accept 后生成 `channelId`。
@@ -243,7 +243,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 
 - 引入 SQLite schema：
   - `client_account`
-  - `tunnel_mapping`
+  - `specus_mapping`
   - `http_route_mapping`
   - `connection_record`
   - `traffic_usage`
@@ -256,9 +256,9 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
   - 密码 hash。
   - 每分钟登录限流。
 - session registry：
-  - `clientName -> tunnel_session`
+  - `clientName -> specus_session`
   - 重复登录踢旧连接。
-- NAT_CONTROL 从数据库启用映射组装，而不是只读 `TUNNEL_TCP_MAPPINGS`。
+- NAT_CONTROL 从数据库启用映射组装，而不是只读 `SPECUS_TCP_MAPPINGS`。
 - 连接记录：
   - 登录成功/失败。
   - disconnected reason。
@@ -292,7 +292,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 
 - 实现 `/auth/login` 本地管理员登录。
 - 实现 `/api/admin/clients` CRUD。
-- 实现 `/api/admin/clients/{id}/tunnels` CRUD。
+- 实现 `/api/admin/clients/{id}/specus-mappings` CRUD。
 - 实现 `/api/admin/clients/{id}/nat-control` 手动下发。
 - 实现 `/api/admin/overview`。
 - 实现 `/api/admin/connections`。
@@ -303,7 +303,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 **验收**：
 
 - 现有管理页面的主要请求能打通。
-- 用 curl 可以登录、创建 client、创建 tunnel、向在线 client 下发 NAT_CONTROL。
+- 用 curl 可以登录、创建 client、创建 specus、向在线 client 下发 NAT_CONTROL。
 - CRUD 后 Java client 能热更新端口映射。
 
 ## Phase 6 — 管理页面静态资源
@@ -328,7 +328,7 @@ publicPort=targetHost:targetPort,publicPort2=targetHost2:targetPort2
 **验收**：
 
 - 浏览器打开 C server 管理端口可以看到管理页面。
-- 管理页面登录、查看 clients、创建 tunnel、下发 NAT_CONTROL 可用。
+- 管理页面登录、查看 clients、创建 specus、下发 NAT_CONTROL 可用。
 
 ## Phase 7 — Direct HTTP
 
@@ -484,10 +484,10 @@ make -C implementations/c/server test
 make -C implementations/c/server clean
 
 # 推荐：SQLite 两阶段认证 + 管理 API + TCP NAT
-TUNNEL_DATABASE_PATH=./shuai-tunnel-c.db \
-TUNNEL_ADMIN_PORT=8088 \
-TUNNEL_NETTY_PORT=7010 \
-TUNNEL_TCP_MAPPINGS="18080=127.0.0.1:8080" \
-implementations/c/server/build/shuai-tunnel-server-c
+SPECUS_DATABASE_PATH=./specus-c.db \
+SPECUS_ADMIN_PORT=8088 \
+SPECUS_NETTY_PORT=7010 \
+SPECUS_TCP_MAPPINGS="18080=127.0.0.1:8080" \
+implementations/c/server/build/specus-server-c
 ```
 

@@ -7,7 +7,7 @@
 > **修复结果（2026-07-24 当日完成）**：除以下两项外全部条目已修复并通过验证（`tsc --noEmit` 零错误、24 个测试文件 162 个测试全部通过、生产构建成功；新增共享件 `components/ConfirmModal.tsx`、`components/StatusChip.tsx`、`lib/clipboard.ts`）：
 > - A-8 表格排序：原标注"可选做"，未实现（四表已加分页）。
 > - SystemPanel 用户表/下载链接表分页：行数少，未加（其余四表已加分页）。
-> - 配套变更：生产 CSP（Go `securityHeaders` + openresty 两处）加入主题引导内联脚本 hash `sha256-j+6j8kbf/TP/2vaoa07rGqJUenu5ZBaVvdQE1uczdHo=`；若 `index.html` 该脚本有任何字节改动，hash 需重新计算并同步三处。
+> - 配套变更：生产 CSP（Go `securityHeaders` + OpenResty 两处）加入主题引导内联脚本 hash `sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=`；若 `index.html` 该脚本有任何字节改动，hash 需重新计算并同步 Java、Go、.NET 与 OpenResty。
 
 ## 0. 总体评价
 
@@ -68,11 +68,11 @@
 ## 2. 系统性问题（横切全站，统一收敛）
 
 ### S-1 原生 confirm/prompt 与 HeroUI 混用，部分高权操作无确认
-`Dashboard.tsx:105`、`ClientsPanel.tsx:130,143`、`TunnelsPanel.tsx:114`、`HttpRoutesPanel.tsx:134`、`SystemPanel.tsx:97,105,167`、`PeerMeshPanel.tsx:176,189,208`、`PublicTransferPage.tsx:1362,1374` 用原生对话框；`SystemPanel.tsx:285,294`（设为管理员/停用用户）**无确认**；移动端 WebView 中 `prompt` 可能静默失效。
+`Dashboard.tsx:105`、`ClientsPanel.tsx:130,143`、`SpecusMappingsPanel.tsx:114`、`HttpRoutesPanel.tsx:134`、`SystemPanel.tsx:97,105,167`、`PeerMeshPanel.tsx:176,189,208`、`PublicTransferPage.tsx:1362,1374` 用原生对话框；`SystemPanel.tsx:285,294`（设为管理员/停用用户）**无确认**；移动端 WebView 中 `prompt` 可能静默失效。
 **修复**：封装共享 `ConfirmModal`（危险操作红按钮+后果说明）与输入 Modal，全站替换；补齐角色变更/停用确认。
 
 ### S-2 可点击 Chip 充当开关，无语义无键盘支持
-`TunnelsPanel.tsx:170-187,232-251`、`HttpRoutesPanel.tsx:225-251,349-380`、`SystemPanel.tsx:389-397,488-496`：无 `aria-pressed`、Tab 不可达、无 pending 态、连点竞态。
+`SpecusMappingsPanel.tsx:170-187,232-251`、`HttpRoutesPanel.tsx:225-251,349-380`、`SystemPanel.tsx:389-397,488-496`：无 `aria-pressed`、Tab 不可达、无 pending 态、连点竞态。
 **修复**：统一改 `Switch size="sm"` + 乐观更新 + 切换期禁用。
 
 ### S-3 状态色彩语义不一致
@@ -84,7 +84,7 @@
 **修复**：制定配色规范（`danger` 只给错误/失败），封装共享 `StatusChip`；指标配色全局常量。
 
 ### S-4 加载/刷新/空态/复制反馈不统一
-- 刷新按钮一半无 `isLoading`（`ClientsPanel.tsx:191`、`TunnelsPanel.tsx:146`、`HttpRoutesPanel.tsx:194`）。
+- 刷新按钮一半无 `isLoading`（`ClientsPanel.tsx:191`、`SpecusMappingsPanel.tsx:146`、`HttpRoutesPanel.tsx:194`）。
 - PeerMesh 共享 loading 态，局部操作整页闪烁（`PeerMeshPanel.tsx:75-102`）；TrafficPanel 刷新全表变 Spinner（`TrafficPanel.tsx:196-214`），观测面板无自动刷新。
 - `EmptyState` 无任何面板使用，列表空态全是灰字一行；traffic 插画残缺（`EmptyState.tsx:26` 三个 `height="0"`）。
 - 复制 secret 无失败兜底，非安全上下文误报"已复制"（`ClientsPanel.tsx:394-401`；正确实现见 `HttpRoutesPanel.tsx:497-504`）。

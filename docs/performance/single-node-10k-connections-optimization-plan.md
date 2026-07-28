@@ -1,6 +1,6 @@
 # 单机代理 10k 连接优化清单
 
-> 目标：让单台 `shuai-tunnel` 服务端稳定代理约 10k 条外部 TCP 连接。
+> 目标：让单台 `specus` 服务端稳定代理约 10k 条外部 TCP 连接。
 >
 > 当前文件只做优化点拆解和落点规划，不执行代码改造、不调整运行参数、不做压测。
 >
@@ -21,9 +21,9 @@
 
 现状：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/NatServerHandler.java`
   - `processRegister` 每注册一个端口都会 new 一个 `TcpServer`。
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/server/TcpServer.java`
   - 每个 `TcpServer.bind` 都创建新的 boss/worker `MultiThreadIoEventLoopGroup`。
 
 风险：
@@ -37,13 +37,13 @@
 - 服务端进程内只保留一套外部端口 boss/worker group，由所有远端监听端口复用。
 - `TcpServer` 只负责 bind/close channel，不拥有 event loop 生命周期。
 - 将 boss/worker 线程数配置化，例如：
-  - `tunnel.netty.remote-boss-threads`
-  - `tunnel.netty.remote-worker-threads`
+  - `specus.netty.remote-boss-threads`
+  - `specus.netty.remote-worker-threads`
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/server/TcpServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/NatServerHandler.java`
 - `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P0。
@@ -52,9 +52,9 @@
 
 现状：
 
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/TcpConnection.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/client/TcpConnection.java`
   - 每次连接本地服务都创建新的 `MultiThreadIoEventLoopGroup`。
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/NatClientHandler.java`
   - 每个远端 CONNECTED 都 new 一个 `TcpConnection`。
 
 风险：
@@ -69,9 +69,9 @@
 
 涉及文件：
 
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/TcpConnection.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/NettyClient.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/client/TcpConnection.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/client/NettyClient.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/NatClientHandler.java`
 
 优先级：P0。
 
@@ -92,14 +92,14 @@
 - 加入全局最大外部连接数、单客户端最大连接数、单端口最大连接数。
 - 超限时服务端立即关闭新外部 channel，并记录一次轻量指标。
 - 配置项示例：
-  - `tunnel.netty.max-external-connections`
-  - `tunnel.netty.max-external-connections-per-client`
-  - `tunnel.netty.max-external-connections-per-port`
+  - `specus.netty.max-external-connections`
+  - `specus.netty.max-external-connections-per-client`
+  - `specus.netty.max-external-connections-per-port`
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/NatServerHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/RemoteSpecusHandler.java`
 - `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P0。
@@ -108,9 +108,9 @@
 
 现状：
 
-- `RemoteTunnelHandler.channelRead` 直接 `tunnelHandler.getCtx().writeAndFlush(message)`。
+- `RemoteSpecusHandler.channelRead` 直接 `specusHandler.getCtx().writeAndFlush(message)`。
 - `NatServerHandler.processData` 直接 `target.writeAndFlush(data)`。
-- `LocalTunnelHandler.channelRead` 和 `NatClientHandler.processData` 也直接写。
+- `LocalSpecusHandler.channelRead` 和 `NatClientHandler.processData` 也直接写。
 - 没有 `AUTO_READ` 切换、`channelWritabilityChanged`、高低水位控制。
 
 风险：
@@ -127,12 +127,12 @@
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/server/NettyServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/server/TcpServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/RemoteSpecusHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/NatServerHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/LocalSpecusHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/NatClientHandler.java`
 
 优先级：P0。
 
@@ -152,7 +152,7 @@
 
 建议：
 
-- 增加 `tunnel.netty.max-frame-size`，默认先按 16MB 或 32MB。
+- 增加 `specus.netty.max-frame-size`，默认先按 16MB 或 32MB。
 - 与 Go 客户端 `implementations/go/client/internal/protocol/protocol.go` 中的 `maxFrameSize` 对齐。
 - 对 NAT 数据帧和 HTTP 直连帧分别设上限。
 
@@ -189,10 +189,10 @@
 
 - `implementations/java/common/src/main/java/com/theshuai/common/protocol/PacketCodec.java`
 - `implementations/java/common/src/main/java/com/theshuai/common/protocol/NatMessagePacket.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/RemoteSpecusHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/NatServerHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/LocalSpecusHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/NatClientHandler.java`
 - `implementations/go/client/internal/protocol/protocol.go`
 - `implementations/go/client/internal/client/nat.go`
 
@@ -213,16 +213,16 @@
 
 - 保留控制连接用于登录、心跳、注册。
 - 增加 N 条数据连接，按 channelId hash 分片。
-- 可配置 `tunnel.client.data-lanes`，例如 4/8/16。
+- 可配置 `specus.client.data-lanes`，例如 4/8/16。
 - CONNECTED 时服务端分配 lane，DATA/DISCONNECTED 在同 lane 内路由。
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/ManagedLoginRequestHandler.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/NatServerHandler.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/client/NettyClient.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/NatClientHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/server/NettyServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/ManagedLoginRequestHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/NatServerHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/client/NettyClient.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/NatClientHandler.java`
 - `implementations/go/client/internal/client/client.go`
 - `implementations/go/client/internal/client/nat.go`
 
@@ -251,8 +251,8 @@
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/NettyServer.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/server/TcpServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/server/NettyServer.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/server/TcpServer.java`
 - `implementations/java/server/pom.xml`
 - `implementations/java/server/src/main/resources/application.yml`
 
@@ -274,8 +274,8 @@
 涉及文件：
 
 - `implementations/java/common/src/main/java/com/theshuai/common/handler/SocketIdleStateHandler.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/RemoteTunnelHandler.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/LocalTunnelHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/RemoteSpecusHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/LocalSpecusHandler.java`
 
 优先级：P1。
 
@@ -303,9 +303,9 @@
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/ClientManagementService.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/ManagedLoginRequestHandler.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/config/ServerExecutorConfig.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/ClientManagementService.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/ManagedLoginRequestHandler.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/config/ServerExecutorConfig.java`
 - `implementations/java/server/src/main/resources/application.yml`
 
 优先级：P1。
@@ -325,8 +325,8 @@
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/TrafficUsageService.java`
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/repository/TrafficUsageRepository.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/TrafficUsageService.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/management/repository/TrafficUsageRepository.java`
 
 优先级：P2。
 
@@ -336,7 +336,7 @@
 
 现状：
 
-- `HttpTunnelController` 使用 Spring MVC，同步等待 `DirectHttpFutureManager.forward`。
+- `HttpSpecusController` 使用 Spring MVC，同步等待 `DirectHttpFutureManager.forward`。
 - 请求体和响应体都完整读入 `byte[]`。
 - Java 客户端 `DirectHttpForwarder` 使用 Apache classic blocking client。
 - `DirectHttpFutureManager.FUTURES` 无显式最大并发上限。
@@ -350,10 +350,10 @@
 
 涉及文件：
 
-- `implementations/java/server/src/main/java/com/theshuai/tunnelserver/http/HttpTunnelController.java`
+- `implementations/java/server/src/main/java/com/theshuai/specusserver/http/HttpSpecusController.java`
 - `implementations/java/common/src/main/java/com/theshuai/common/manager/DirectHttpFutureManager.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/DirectHttpRequestHandler.java`
-- `implementations/java/client/src/main/java/com/theshuai/tunnelclient/handler/DirectHttpForwarder.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/DirectHttpRequestHandler.java`
+- `implementations/java/client/src/main/java/com/theshuai/specusclient/handler/DirectHttpForwarder.java`
 - `implementations/go/client/internal/client/http.go`
 
 优先级：P2，除非 10k 目标就是 HTTP 并发。
@@ -401,7 +401,7 @@ JVM 建议检查：
 
 TLS：
 
-- 如果 `tunnel.tls.mode` 开启，10k 连接下要单独压测握手 CPU。
+- 如果 `specus.tls.mode` 开启，10k 连接下要单独压测握手 CPU。
 - 生产可评估 OpenSSL/tcnative 或前置 TLS 终止。
 
 优先级：P0。
@@ -429,7 +429,7 @@ TLS：
 
 建议新增或扩展：
 
-- `implementations/java/server/src/test/java/com/theshuai/tunnelserver/integration/EndToEndTunnelIT.java`
+- `implementations/java/server/src/test/java/com/theshuai/specusserver/integration/EndToEndSpecusIT.java`
 - 新增独立压测工具目录，例如 `tools/loadtest/`，优先 Go 实现 raw TCP 压测。
 
 优先级：P0。

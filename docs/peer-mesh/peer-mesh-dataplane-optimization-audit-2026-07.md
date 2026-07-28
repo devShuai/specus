@@ -142,7 +142,7 @@ ASCII "SPMTU2"(6) | kind(1) | nonce(8) | innerMtu(2)
 - relay queue、流量提交失败恢复和 session 身份绑定。
 
 Java JMH、Go benchmark 与 .NET BenchmarkDotNet 已统一提供 64/512/1200 字节 codec 基线；CI 会编译或执行
-benchmark smoke test。`tools/loadtest/tcp_stream_load.go` 可对真实 tunnel echo 端点执行 1/10/100/1000 并发流并输出
+benchmark smoke test。`tools/loadtest/tcp_stream_load.go` 可对真实 specus echo 端点执行 1/10/100/1000 并发流并输出
 吞吐、错误率和 p50/p95/p99，`netem-profile.sh` 提供 20/100/300 ms 与 1%/3% 丢包场景。正式发布仍需在目标机器
 保存 pps/core、alloc/packet、队列 drop、direct 成功率、relay 比例和 MTU 分布，开发机数字不能代替容量基线。
 

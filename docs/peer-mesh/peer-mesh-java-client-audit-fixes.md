@@ -88,7 +88,7 @@ STUN binding 事务 entry 只在收到 success 响应时移除;STUN 服务器不
 * connectivity check 增加 20ms 候选级 pacing,避免所有候选和端口预测 burst 在同一瞬间打出。
 * `PeerMeshServiceTests` 增加 `pathStatsAggregatesDirectRatioAndNatTypes`,覆盖 `activeDirectRatio`、`reportedSessions` 和 NAT 类型归并。
 
-本次补齐项已通过 Java client/server 主代码编译:`mvn -f implementations\java\client\pom.xml -DskipTests compile`、`mvn -f implementations\java\server\pom.xml "-Dtunnel.server.web.skip=true" -DskipTests compile`。定向测试当前被既有 testCompile 问题拦截:client 旧 handler 测试仍引用已移除的 `bean/client` 包,server 多个测试仍引用重组前的 `management` / `server` 包路径,需后续单独修复测试目录。
+本次补齐项已通过 Java client/server 主代码编译:`mvn -f implementations\java\client\pom.xml -DskipTests compile`、`mvn -f implementations\java\server\pom.xml "-Dspecus.server.web.skip=true" -DskipTests compile`。定向测试当前被既有 testCompile 问题拦截:client 旧 handler 测试仍引用已移除的 `bean/client` 包,server 多个测试仍引用重组前的 `management` / `server` 包路径,需后续单独修复测试目录。
 
 2026-07-06 已继续对齐 Go / C# 客户端同源实现:
 
@@ -98,9 +98,9 @@ STUN binding 事务 entry 只在收到 success 响应时移除;STUN 服务器不
 * Go / C# direct endpoint 增加健康窗口粘滞与 RTT EWMA 字段;C# session grant 刷新同步保留 nominated path 状态。
 * Go client public STUN candidate 生命周期对齐 Java:每轮公网 STUN 探测前清理 `foundation=public-stun` 的旧 candidate,避免三端候选集合语义漂移。
 * Go / C# server 均已补齐 `/api/admin/peer-mesh/stats`,并按 Java 规则统计 `reportedSessions=count(rttMillis)`、`activeDirectRatio`、`pathType × status` 明细和 NAT 类型分布。
-* C# client tests 通过: `dotnet test implementations\csharp\client\tests\ShuaiTunnel.Client.Tests\ShuaiTunnel.Client.Tests.csproj --no-restore` 69/69。
-* C# server 后端编译通过: `dotnet build implementations\csharp\server\src\ShuaiTunnel.Server\ShuaiTunnel.Server.csproj --no-restore -p:TunnelServerWebSkip=true -v minimal`。未加 `TunnelServerWebSkip=true` 时会触发前端 `npm run deploy:csharp`,当前沙箱因 esbuild 读取外层目录权限失败而中断,不作为后端代码结论。
-* C# server PeerMeshService 定向测试通过: `dotnet test implementations\csharp\server\tests\ShuaiTunnel.IntegrationTests\ShuaiTunnel.IntegrationTests.csproj --no-restore -p:TunnelServerWebSkip=true -v minimal --filter "FullyQualifiedName~PeerMeshServiceTests"` 7/7,覆盖 session grant、关闭通知、relay 授权和路径统计聚合。
+* C# client tests 通过: `dotnet test implementations\csharp\client\tests\Specus.Client.Tests\Specus.Client.Tests.csproj --no-restore` 69/69。
+* C# server 后端编译通过: `dotnet build implementations\csharp\server\src\Specus.Server\Specus.Server.csproj --no-restore -p:SpecusServerWebSkip=true -v minimal`。未加 `SpecusServerWebSkip=true` 时会触发前端 `npm run deploy:csharp`,当前沙箱因 esbuild 读取外层目录权限失败而中断,不作为后端代码结论。
+* C# server PeerMeshService 定向测试通过: `dotnet test implementations\csharp\server\tests\Specus.IntegrationTests\Specus.IntegrationTests.csproj --no-restore -p:SpecusServerWebSkip=true -v minimal --filter "FullyQualifiedName~PeerMeshServiceTests"` 7/7,覆盖 session grant、关闭通知、relay 授权和路径统计聚合。
 * Go 测试通过:设置 `GOCACHE=.gocache` 后,`go test ./internal/client`、`go test ./internal/peermesh ./internal/store ./internal/management` 均通过。
 
 1. **数据面进一步性能优化**(影响吞吐,不影响打洞):Java 仍是单线程阻塞式 `DatagramSocket` 收包,解析/AES-GCM 解密/TUN 写入同线程;每包仍 `Cipher.getInstance`,还有多次数组拷贝。三端 sessionId 索引已消除线性试解码,后续可继续拆 UDP worker / TUN writer 与 Cipher 复用。

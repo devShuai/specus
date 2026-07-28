@@ -6,14 +6,14 @@
 
 已完成：
 
-* 默认关闭：`TUNNEL_PEER_MESH_ENABLED=false`。
+* 默认关闭：`SPECUS_PEER_MESH_ENABLED=false`。
 * 服务端按租户 / 用户 / 客户端维护 peer device、peer ACL、peer session。
 * 默认 ACL：同一 `tenantId + ownerUsername` 的客户端互通；跨用户默认拒绝，admin 可配置显式 ACL。
 * 客户端登录响应下发 `peerMesh` 配置，包括虚拟 IP、CIDR、标准 STUN/TURN 地址、公共 STUN 列表、会话 TTL 和设备公钥相关信息。
 * v2 `control` 长连接承载 `PEER_CONTROL` JSON 信令；TCP/HTTP/WebSocket 数据只走独立 `data` 长连接。
 * Java / Go / .NET 服务端内置标准 UDP STUN/TURN：支持 Binding、Allocate、Refresh、CreatePermission、Send Indication 和 Data Indication；relay 转发使用独立 UDP allocation 端口。
 * Java STUN 核心支持 RFC 5780 四端点、`CHANGE-REQUEST`、`RESPONSE-PORT`、`PADDING`、标准 `MAPPED-ADDRESS` / `XOR-MAPPED-ADDRESS`、`RESPONSE-ORIGIN` 和 `OTHER-ADDRESS`；同一核心可由独立 `stun-server.jar` 部署，也可把 A1/A2 拆到两台内网互通的服务器，通过 HMAC 鉴权控制通道协同回包。
-* Go 提供 `cmd/shuai-stun-server`，.NET 提供 `ShuaiTunnel.StunServer`；两者与 Java 使用同一套四端点、限流、防放大和 Prometheus 指标契约，可脱离业务 server 独立部署。
+* Go 提供 `cmd/specus-stun-server`，.NET 提供 `Specus.StunServer`；两者与 Java 使用同一套四端点、限流、防放大和 Prometheus 指标契约，可脱离业务 server 独立部署。
 * Java / Go / .NET / Android 客户端可使用独立 STUN 入口执行 RFC 5780 映射与过滤行为探测，并上报 `natMappingBehavior`、`natFilteringBehavior` 和探测模式。
 * relay 转发前会校验 session 是否存在、是否 ACTIVE、是否过期、source/target 是否匹配，拒绝未授权 relay frame。
 * 客户端已实现 UDP host candidate、relay candidate、connectivity check、path nominated、direct 优先、relay fallback。
@@ -42,43 +42,43 @@
 
 ## 服务端配置
 
-systemd 环境变量示例已在 `deploy/java-server/systemd/tunnel-server.env.example` 中维护。核心配置如下：
+systemd 环境变量示例已在 `deploy/java-server/systemd/specus-server.env.example` 中维护。核心配置如下：
 
 ```env
-TUNNEL_PEER_MESH_ENABLED=false
-TUNNEL_PEER_MESH_CIDR=100.96.0.0/11
-TUNNEL_PEER_MESH_PUBLIC_ADDRESS=tunnel.example.com
-TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
-TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS=stun1.tunnel.devshuai.com
-TUNNEL_PEER_MESH_STANDALONE_STUN_PORT=34780
-TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS=stun2.tunnel.devshuai.com
-TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT=34781
-TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT=3479
-#TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS=10.0.0.10
-#TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS=10.0.0.11
-#TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11
-#TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT=true
-TUNNEL_PEER_MESH_SESSION_TTL_SECONDS=3600
-TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS=300
+SPECUS_PEER_MESH_ENABLED=false
+SPECUS_PEER_MESH_CIDR=100.96.0.0/11
+SPECUS_PEER_MESH_PUBLIC_ADDRESS=specus.example.com
+SPECUS_PEER_MESH_STUN_TURN_PORT=3478
+SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS=stun1.specus.devshuai.com
+SPECUS_PEER_MESH_STANDALONE_STUN_PORT=34780
+SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS=stun2.specus.devshuai.com
+SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT=34781
+SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT=3479
+#SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS=10.0.0.10
+#SPECUS_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS=10.0.0.11
+#SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11
+#SPECUS_PEER_MESH_STUN_BEHAVIOR_STRICT=true
+SPECUS_PEER_MESH_SESSION_TTL_SECONDS=3600
+SPECUS_PEER_MESH_ALLOCATION_TTL_SECONDS=300
 ```
 
 说明：
 
-* `TUNNEL_PEER_MESH_ENABLED`：总开关，生产默认保持 `false`，需要灰度时再启用。
-* `TUNNEL_PEER_MESH_CIDR`：mesh 虚拟网段，默认 `100.96.0.0/11`。
-* `TUNNEL_PEER_MESH_PUBLIC_ADDRESS`：UDP 探测和 relay 对外地址。完整 RFC 5780 模式下必须填写主公网 IP A1。
-* `TUNNEL_PEER_MESH_STUN_TURN_PORT`：内置标准 STUN/TURN UDP 主端口，默认 `3478`。
-* `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS`：可选独立 STUN 主域名或 IP；配置后客户端 STUN 探测优先使用该地址，认证 TURN 仍使用 `PUBLIC_ADDRESS`。
-* `TUNNEL_PEER_MESH_STANDALONE_STUN_PORT`：独立 STUN 入口端口，默认 `3478`。
-* `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS`：独立 RFC 5780 拓扑的第二公网地址 A2；A2:P1 自动作为客户端备用 STUN，下发给网页和已登录客户端。
-* `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT`：独立 RFC 5780 拓扑的第二 UDP 端口 P2。示例双节点部署使用 `34781`。
-* `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：第二个 STUN UDP 端口 P2，默认 `3479`。备用端口只用于 Binding，不承载 TURN allocation。
-* `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS`：主地址 A1 的本机绑定 IP。
-* `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS`：备用地址 A2 的本机绑定 IP。
-* `TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS`：与 A2 对应的备用公网 IP。
-* `TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT`：开启后必须提供完整 A1/A2 和 P1/P2 配置，否则内置 STUN/TURN 不启动。
-* `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS`：peer session 授权有效期。
-* `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS`：relay allocation 有效期，客户端会提前 refresh。
+* `SPECUS_PEER_MESH_ENABLED`：总开关，生产默认保持 `false`，需要灰度时再启用。
+* `SPECUS_PEER_MESH_CIDR`：mesh 虚拟网段，默认 `100.96.0.0/11`。
+* `SPECUS_PEER_MESH_PUBLIC_ADDRESS`：UDP 探测和 relay 对外地址。完整 RFC 5780 模式下必须填写主公网 IP A1。
+* `SPECUS_PEER_MESH_STUN_TURN_PORT`：内置标准 STUN/TURN UDP 主端口，默认 `3478`。
+* `SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS`：可选独立 STUN 主域名或 IP；配置后客户端 STUN 探测优先使用该地址，认证 TURN 仍使用 `PUBLIC_ADDRESS`。
+* `SPECUS_PEER_MESH_STANDALONE_STUN_PORT`：独立 STUN 入口端口，默认 `3478`。
+* `SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS`：独立 RFC 5780 拓扑的第二公网地址 A2；A2:P1 自动作为客户端备用 STUN，下发给网页和已登录客户端。
+* `SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT`：独立 RFC 5780 拓扑的第二 UDP 端口 P2。示例双节点部署使用 `34781`。
+* `SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`：第二个 STUN UDP 端口 P2，默认 `3479`。备用端口只用于 Binding，不承载 TURN allocation。
+* `SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS`：主地址 A1 的本机绑定 IP。
+* `SPECUS_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS`：备用地址 A2 的本机绑定 IP。
+* `SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS`：与 A2 对应的备用公网 IP。
+* `SPECUS_PEER_MESH_STUN_BEHAVIOR_STRICT`：开启后必须提供完整 A1/A2 和 P1/P2 配置，否则内置 STUN/TURN 不启动。
+* `SPECUS_PEER_MESH_SESSION_TTL_SECONDS`：peer session 授权有效期。
+* `SPECUS_PEER_MESH_ALLOCATION_TTL_SECONDS`：relay allocation 有效期，客户端会提前 refresh。
 
 启用后需要放行 UDP：
 
@@ -105,10 +105,10 @@ NAT 行为探测说明：
   "protocol": "RFC8489",
   "discoveryMethod": "RFC5780",
   "endpoints": [
-    { "id": "A1P1", "url": "stun:stun1.tunnel.devshuai.com:34780" },
-    { "id": "A1P2", "url": "stun:stun1.tunnel.devshuai.com:34781" },
-    { "id": "A2P1", "url": "stun:stun2.tunnel.devshuai.com:34780" },
-    { "id": "A2P2", "url": "stun:stun2.tunnel.devshuai.com:34781" }
+    { "id": "A1P1", "url": "stun:stun1.specus.devshuai.com:34780" },
+    { "id": "A1P2", "url": "stun:stun1.specus.devshuai.com:34781" },
+    { "id": "A2P1", "url": "stun:stun2.specus.devshuai.com:34780" },
+    { "id": "A2P2", "url": "stun:stun2.specus.devshuai.com:34781" }
   ],
   "capabilities": {
     "binding": true,
@@ -128,18 +128,18 @@ NAT 行为探测说明：
 过滤行为必须由 Java / Go / .NET / Android 原生探针补全。若 A2/P2 未配置或任一端点
 预检失败，页面会降级到基础多 STUN 模式，不会把超时误判为过滤类型。
 
-生产环境中，`stun1.tunnel.devshuai.com` 必须只解析到 A1（ali2，
-`47.103.154.117`），`stun2.tunnel.devshuai.com` 必须只解析到 A2（ali，
+生产环境中，`stun1.specus.devshuai.com` 必须只解析到 A1（ali2，
+`47.103.154.117`），`stun2.specus.devshuai.com` 必须只解析到 A2（ali，
 `101.133.236.111`）。两个域名解析到同一公网 IP 时不能完成 RFC 5780 跨地址探测。
 
 如果 STUN 不应与业务服务共进程，可选择 Java
 [`implementations/java/stun-server`](../../implementations/java/stun-server)、Go
-`implementations/go/server/cmd/shuai-stun-server` 或 .NET
-`implementations/csharp/server/src/ShuaiTunnel.StunServer`。systemd、限流、指标、DNS 和双公网 IP
+`implementations/go/server/cmd/specus-stun-server` 或 .NET
+`implementations/csharp/server/src/Specus.StunServer`。systemd、限流、指标、DNS 和双公网 IP
 示例见 [`deploy/stun-server/systemd`](../../deploy/stun-server/systemd/README.md)。Java
 实现还支持两台单公网 IP 服务器组成完整 RFC 5780 拓扑；部署入口见
 [`deploy/stun-server/remote`](../../deploy/stun-server/remote/README.md)。独立服务不包含 TURN，
-tunnel-server 的认证 TURN 仍可单独作为直连失败后的备用通道。
+specus-server 的认证 TURN 仍可单独作为直连失败后的备用通道。
 
 ## 客户端配置
 
@@ -151,7 +151,7 @@ tunnel-server 的认证 TURN 仍可单独作为直连失败后的备用通道。
   "apiKey": "YOUR_CLIENT_API_KEY",
   "secret": "YOUR_CLIENT_SECRET",
   "peerMeshDevice": "noop",
-  "peerMeshTunName": "shuai0",
+  "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280
 }
 ```
@@ -171,7 +171,7 @@ Linux 启动条件：
 
 ```bash
 sudo modprobe tun
-sudo java -jar tunnel-client.jar
+sudo java -jar specus-client.jar
 ```
 
 如果不想用 root，可给 Java 运行文件授予能力，实际命令按发行版和 Java 路径调整：
@@ -187,13 +187,13 @@ Windows 启动条件：
 * 如果要覆盖随包版本，Java 可使用系统属性显式指定：
 
 ```powershell
-java -Dshuai.peerMesh.wintunDll=C:\path\to\wintun.dll -jar tunnel-client.jar
+java -Dspecus.peerMesh.wintunDll=C:\path\to\wintun.dll -jar specus-client.jar
 ```
 
 Go / .NET 客户端可使用环境变量覆盖：
 
 ```powershell
-$env:SHUAI_PEER_MESH_WINTUN_DLL="C:\path\to\wintun.dll"
+$env:SPECUS_PEER_MESH_WINTUN_DLL="C:\path\to\wintun.dll"
 ```
 
 ## 验收步骤
@@ -201,15 +201,15 @@ $env:SHUAI_PEER_MESH_WINTUN_DLL="C:\path\to\wintun.dll"
 ### 1. 服务端启用
 
 ```env
-TUNNEL_PEER_MESH_ENABLED=true
-TUNNEL_PEER_MESH_PUBLIC_ADDRESS=你的公网IP或域名
-TUNNEL_PEER_MESH_STUN_TURN_PORT=3478
+SPECUS_PEER_MESH_ENABLED=true
+SPECUS_PEER_MESH_PUBLIC_ADDRESS=你的公网IP或域名
+SPECUS_PEER_MESH_STUN_TURN_PORT=3478
 ```
 
 重启后检查日志：
 
 ```bash
-journalctl -u tunnel-server -f
+journalctl -u specus-server -f
 ```
 
 期望看到标准 STUN/TURN UDP server 监听成功。
@@ -270,7 +270,7 @@ ping 100.96.x.y
 * 管理员权限启动。
 * `wintun.dll` 位数和当前进程架构一致。
 * 发布包内存在 `native/windows/<arch>/wintun.dll`。Go 客户端会先把内置资源解压到本地缓存再加载；.NET 客户端会在 build / publish 输出目录带上该 native 目录。
-* 如果需要覆盖，Java 通过 `-Dshuai.peerMesh.wintunDll=完整路径` 指定，Go / .NET 通过 `SHUAI_PEER_MESH_WINTUN_DLL` 指定。
+* 如果需要覆盖，Java 通过 `-Dspecus.peerMesh.wintunDll=完整路径` 指定，Go / .NET 通过 `SPECUS_PEER_MESH_WINTUN_DLL` 指定。
 
 ### 一直走 relay
 
