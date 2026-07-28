@@ -5164,7 +5164,7 @@ main.app-apple-tool.nat-tool-plain {
   background: #000000 !important;
 }
 
-/* 球内渠水：贴着球体弧度的一泓水，水位由组件按状态注入（%） */
+/* 球内渠水：贴着球体弧度的一泓水，水位由组件按状态注入（--nat-orb-level） */
 .nat-orb-water-clip {
   position: absolute;
   inset: 3px;
@@ -5178,12 +5178,19 @@ main.app-apple-tool.nat-tool-plain {
   right: 0;
   bottom: 0;
   left: 0;
+  height: var(--nat-orb-level-hover, var(--nat-orb-level, 20%));
   background: linear-gradient(
     to top,
     color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 18%, transparent),
     color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 6%, transparent)
   );
   transition: height 640ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 悬停时水面上涨：渠水回应手 */
+.nat-detect-orb[data-state="idle"]:hover .nat-orb-water-clip,
+.nat-detect-orb[data-state="complete"]:hover .nat-orb-water-clip {
+  --nat-orb-level-hover: calc(var(--nat-orb-level, 20%) + 9%);
 }
 
 /* 水面线：细细的流动高光，不抢球内文字 */
@@ -5203,15 +5210,104 @@ main.app-apple-tool.nat-tool-plain {
   animation: nat-orb-water-flow 1.6s linear infinite;
 }
 
+/* 水下暗涌：更淡更慢的第二道 dash，给水体一点纵深 */
+.nat-orb-water::after {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  left: 8px;
+  height: 2px;
+  content: "";
+  background: repeating-linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 28%, transparent) 0 5px,
+    transparent 5px 11px
+  );
+  background-size: 11px 100%;
+  opacity: 0.7;
+  animation: nat-orb-water-flow 2.8s linear infinite reverse;
+}
+
 @keyframes nat-orb-water-flow {
   to { background-position: 13px 0; }
+}
+
+/* 基石蓝点呼吸：渠上那一点光 */
+.nat-orb-keystone {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: nat-keystone-breathe 3.2s ease-in-out infinite;
+}
+
+@keyframes nat-keystone-breathe {
+  0%, 100% { opacity: 0.7; transform: scale(0.88); }
+  50% { opacity: 1; transform: scale(1.14); }
+}
+
+/* 隧道口沿圈：一圈薄沿 + 内侧微凹，按钮即渠首洞口 */
+.nat-orb-rim {
+  position: absolute;
+  inset: 5px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 26%, transparent);
+  box-shadow:
+    inset 0 1px 3px rgba(15, 23, 42, 0.06),
+    inset 0 0 0 5px color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 4%, transparent);
+  pointer-events: none;
+}
+
+/* 探测波：三道涟漪自洞口荡出（STUN 探测的意象） */
+.nat-orb-sonar {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.nat-orb-sonar i {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 55%, transparent);
+  opacity: 0;
+  animation: nat-sonar 2.7s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+.nat-orb-sonar i:nth-child(2) {
+  animation-delay: 0.9s;
+}
+
+.nat-orb-sonar i:nth-child(3) {
+  animation-delay: 1.8s;
+}
+
+@keyframes nat-sonar {
+  0% { transform: scale(0.62); opacity: 0; }
+  18% { opacity: 0.65; }
+  100% { transform: scale(1.55); opacity: 0; }
+}
+
+/* 落定：出结果时荡开一圈，像水滴刚落进渠里 */
+.nat-orb-settle {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  border: 1.5px solid color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 60%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  animation: nat-orb-settle 950ms cubic-bezier(0.22, 1, 0.36, 1) 120ms both;
+}
+
+@keyframes nat-orb-settle {
+  0% { transform: scale(0.72); opacity: 0; }
+  20% { opacity: 0.7; }
+  100% { transform: scale(1.45); opacity: 0; }
 }
 
 .nat-orb-stage {
   position: relative;
   display: grid;
   place-items: center;
-  animation: nat-orb-float 5.4s ease-in-out infinite;
+  animation: nat-orb-float 6.5s ease-in-out infinite;
 }
 
 .nat-orb-halo {
@@ -5219,7 +5315,7 @@ main.app-apple-tool.nat-tool-plain {
   inset: -24px;
   border-radius: 999px;
   pointer-events: none;
-  background: radial-gradient(circle, color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 32%, transparent), transparent 68%);
+  background: radial-gradient(circle, color-mix(in srgb, var(--nat-orb-water, var(--app-apple-blue)) 30%, transparent), transparent 68%);
   filter: blur(16px);
   opacity: 0.5;
   transition: opacity 0.4s ease;
@@ -5233,22 +5329,19 @@ main.app-apple-tool.nat-tool-plain {
   animation: nat-halo-pulse 2.3s ease-in-out infinite;
 }
 
+/* 球面：一泓静水——顶部天光、底部水色渐深，不再是珠光泽面 */
 .nat-detect-orb {
-  border: 1px solid color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 45%, var(--app-apple-line));
+  border: 1px solid color-mix(in srgb, var(--nat-orb-water, var(--app-apple-blue)) 32%, var(--app-apple-line));
   color: var(--app-apple-blue);
   background:
-    radial-gradient(circle at 32% 22%, rgba(255, 255, 255, 0.95), transparent 40%),
-    conic-gradient(from 215deg at 50% 50%,
-      color-mix(in srgb, var(--app-apple-blue) 20%, var(--app-apple-surface)),
-      var(--app-apple-surface) 30%,
-      color-mix(in srgb, var(--app-apple-blue) 24%, var(--app-apple-surface)) 52%,
-      var(--app-apple-surface) 76%,
-      color-mix(in srgb, var(--app-apple-blue) 20%, var(--app-apple-surface)));
+    radial-gradient(circle at 50% 26%, rgba(255, 255, 255, 0.95), transparent 54%),
+    radial-gradient(circle at 50% 92%, color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 15%, transparent), transparent 64%),
+    var(--app-apple-surface);
   box-shadow:
-    0 22px 48px -14px color-mix(in srgb, var(--app-apple-blue) 36%, transparent),
+    0 22px 48px -14px color-mix(in srgb, var(--nat-orb-water, var(--app-apple-blue)) 32%, transparent),
     0 2px 8px rgba(15, 23, 42, 0.05),
     inset 0 1px 0 rgba(255, 255, 255, 0.8),
-    inset 0 -10px 20px color-mix(in srgb, var(--app-apple-blue) 10%, transparent);
+    inset 0 -12px 24px color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 8%, transparent);
   transition:
     transform 0.35s cubic-bezier(0.22, 1, 0.36, 1),
     box-shadow 0.35s ease,
@@ -5257,36 +5350,32 @@ main.app-apple-tool.nat-tool-plain {
 
 .dark .nat-detect-orb {
   background:
-    radial-gradient(circle at 32% 22%, rgba(255, 255, 255, 0.14), transparent 42%),
-    conic-gradient(from 215deg at 50% 50%,
-      color-mix(in srgb, var(--app-apple-blue) 22%, var(--app-apple-surface)),
-      var(--app-apple-surface) 30%,
-      color-mix(in srgb, var(--app-apple-blue) 28%, var(--app-apple-surface)) 52%,
-      var(--app-apple-surface) 76%,
-      color-mix(in srgb, var(--app-apple-blue) 22%, var(--app-apple-surface)));
+    radial-gradient(circle at 50% 26%, rgba(255, 255, 255, 0.12), transparent 54%),
+    radial-gradient(circle at 50% 92%, color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 18%, transparent), transparent 66%),
+    var(--app-apple-surface);
   box-shadow:
-    0 24px 52px -14px color-mix(in srgb, var(--app-apple-blue) 40%, transparent),
+    0 24px 52px -14px color-mix(in srgb, var(--nat-orb-water, var(--app-apple-blue)) 38%, transparent),
     inset 0 1px 0 rgba(255, 255, 255, 0.12),
-    inset 0 -10px 20px rgba(0, 0, 0, 0.28);
+    inset 0 -12px 24px rgba(0, 0, 0, 0.3);
 }
 
 .nat-detect-orb[data-state="idle"]:hover,
 .nat-detect-orb[data-state="complete"]:hover {
   transform: translateY(-4px) scale(1.03);
-  border-color: var(--app-apple-blue);
+  border-color: color-mix(in srgb, var(--nat-orb-water, var(--app-apple-blue)) 65%, transparent);
   box-shadow:
-    0 30px 64px -14px color-mix(in srgb, var(--app-apple-blue) 50%, transparent),
+    0 30px 64px -14px color-mix(in srgb, var(--nat-orb-water, var(--app-apple-blue)) 46%, transparent),
     0 4px 12px rgba(15, 23, 42, 0.07),
     inset 0 1px 0 rgba(255, 255, 255, 0.85),
-    inset 0 -10px 20px color-mix(in srgb, var(--app-apple-blue) 12%, transparent);
+    inset 0 -12px 24px color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 11%, transparent);
 }
 
 .dark .nat-detect-orb[data-state="idle"]:hover,
 .dark .nat-detect-orb[data-state="complete"]:hover {
   box-shadow:
-    0 32px 68px -14px color-mix(in srgb, var(--app-apple-blue) 55%, transparent),
+    0 32px 68px -14px color-mix(in srgb, var(--nat-orb-water, var(--app-apple-blue)) 52%, transparent),
     inset 0 1px 0 rgba(255, 255, 255, 0.14),
-    inset 0 -10px 20px rgba(0, 0, 0, 0.3);
+    inset 0 -12px 24px rgba(0, 0, 0, 0.32);
 }
 
 .nat-detect-orb[data-state="idle"]:active,
@@ -5298,45 +5387,9 @@ main.app-apple-tool.nat-tool-plain {
 .nat-detect-orb[data-state="checking"] {
   border-color: var(--nat-orb-accent, var(--app-apple-blue));
   box-shadow:
-    0 0 0 7px color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 14%, transparent),
-    0 20px 50px -12px color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 40%, transparent),
+    0 0 0 7px color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 12%, transparent),
+    0 20px 50px -12px color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 36%, transparent),
     inset 0 1px 0 rgba(255, 255, 255, 0.7);
-}
-
-/* 细弧轨道：conic 渐变 + 径向 mask，只留外缘一圈亮弧，随状态变速旋转 */
-.nat-orbit-ring {
-  position: absolute;
-  inset: -12px;
-  border-radius: 999px;
-  pointer-events: none;
-  background: conic-gradient(from 0deg,
-      transparent 0deg,
-      color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 65%, transparent) 55deg,
-      transparent 130deg);
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
-  mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
-  animation: nat-ring-rotate 7s linear infinite;
-  opacity: 0.75;
-}
-
-.nat-orbit-ring-alt {
-  inset: -23px;
-  background: conic-gradient(from 180deg,
-      transparent 0deg,
-      color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 34%, transparent) 70deg,
-      transparent 170deg);
-  animation: nat-ring-rotate 13s linear infinite reverse;
-  opacity: 0.55;
-}
-
-.nat-detect-orb[data-state="checking"] .nat-orbit-ring {
-  animation-duration: 2.3s;
-  opacity: 1;
-}
-
-.nat-detect-orb[data-state="checking"] .nat-orbit-ring-alt {
-  animation-duration: 4.1s;
-  opacity: 0.9;
 }
 
 .nat-detect-progress-indeterminate {
@@ -5347,33 +5400,14 @@ main.app-apple-tool.nat-tool-plain {
   filter: drop-shadow(0 0 5px currentColor);
 }
 
-.nat-detect-ripple {
-  position: absolute;
-  inset: 0;
-  border: 1px solid color-mix(in srgb, var(--nat-orb-accent, var(--app-apple-blue)) 42%, transparent);
-  border-radius: 999px;
-  opacity: 0;
-  pointer-events: none;
-  animation: nat-ripple 2.4s cubic-bezier(0.22, 1, 0.36, 1) infinite;
-}
-
-.nat-detect-ripple-delay {
-  animation-delay: 1.2s;
-}
-
-@keyframes nat-ripple {
-  0% { opacity: 0; transform: scale(1); }
-  16% { opacity: 0.72; }
-  100% { opacity: 0; transform: scale(1.72); }
-}
-
-@keyframes nat-ring-rotate {
-  to { transform: rotate(1turn); }
+@keyframes nat-progress-spin {
+  from { transform: rotate(-90deg); }
+  to { transform: rotate(270deg); }
 }
 
 @keyframes nat-orb-float {
   0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-5px); }
+  50% { transform: translateY(-3px); }
 }
 
 @keyframes nat-halo-pulse {
@@ -5554,14 +5588,16 @@ main.app-apple-tool.nat-tool-plain {
 @media (prefers-reduced-motion: reduce) {
   .nat-orb-stage,
   .nat-orb-halo,
-  .nat-orbit-ring,
+  .nat-orb-sonar i,
+  .nat-orb-settle,
+  .nat-orb-keystone,
   .nat-detect-progress-indeterminate,
-  .nat-detect-ripple,
   .nat-result-reveal,
   .nat-outcome-marker,
   .nat-outcome-bar::after,
   .nat-outcome-bar-flow,
   .nat-orb-water::before,
+  .nat-orb-water::after,
   .nat-level-segment.is-on,
   .nat-step-done .nat-step-line,
   .nat-step-done .nat-step-dot svg path,

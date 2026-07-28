@@ -1035,14 +1035,6 @@ function NatDetectionOrb({
   const state = checking ? "checking" : result ? "complete" : "idle";
   const gradientId = useId();
   const outcomeTone = result ? browserNatOutcome(result).tone : null;
-  const accentStyle = {
-    "--nat-orb-accent": checking ? NAT_PHASE_ACCENTS[progress.phase] : "#0a84ff",
-    "--nat-orb-water": checking
-      ? "var(--specus-accent)"
-      : outcomeTone
-        ? NAT_CHANNEL_TONE_WATER[outcomeTone]
-        : "var(--specus-water)",
-  } as CSSProperties;
   // 球内水位：待命小半渠（停在副标题之下），检测中随进度涨水，出结果后停在结论对应的高度
   const waterLevel = checking
     ? determinate
@@ -1051,6 +1043,15 @@ function NatDetectionOrb({
     : result && outcomeTone
       ? NAT_ORB_WATER_BY_TONE[outcomeTone]
       : 20;
+  const accentStyle = {
+    "--nat-orb-accent": checking ? NAT_PHASE_ACCENTS[progress.phase] : "#0a84ff",
+    "--nat-orb-water": checking
+      ? "var(--specus-accent)"
+      : outcomeTone
+        ? NAT_CHANNEL_TONE_WATER[outcomeTone]
+        : "var(--specus-water)",
+    "--nat-orb-level": `${waterLevel}%`,
+  } as CSSProperties;
   const centerText = checking
     ? progress.responded > 0 && progress.total > 0
       ? `${progress.responded}/${progress.total}`
@@ -1087,18 +1088,22 @@ function NatDetectionOrb({
             embedded ? "h-28 w-28" : "h-40 w-40"
           } cursor-pointer`}
         >
-          <span className="nat-orbit-ring" aria-hidden="true" />
-          <span className="nat-orbit-ring nat-orbit-ring-alt" aria-hidden="true" />
+          {/* 隧道口沿圈：静态的一圈薄沿，让按钮读作渠首洞口 */}
+          <span className="nat-orb-rim" aria-hidden="true" />
+          {/* 探测波：三道涟漪自洞口荡出，一去不回 */}
           {checking && (
-            <>
-              <span className="nat-detect-ripple" aria-hidden="true" />
-              <span className="nat-detect-ripple nat-detect-ripple-delay" aria-hidden="true" />
-            </>
+            <span className="nat-orb-sonar" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
           )}
           {/* 球内渠水：贴着球体弧度的一泓水，水位随状态涨落 */}
           <span className="nat-orb-water-clip" aria-hidden="true">
-            <span className="nat-orb-water" style={{ height: `${waterLevel}%` }} />
+            <span className="nat-orb-water" />
           </span>
+          {/* 落定：出结果时荡开一圈，像水滴刚落进渠里 */}
+          {result && !checking && <span className="nat-orb-settle" aria-hidden="true" />}
           {checking && (
             <svg aria-hidden="true" className={`absolute inset-0 h-full w-full -rotate-90 ${determinate ? "" : "nat-detect-progress-indeterminate"}`} viewBox="0 0 100 100">
               <defs>
@@ -1135,7 +1140,7 @@ function NatDetectionOrb({
               <svg aria-hidden="true" className="nat-orb-idle-icon mb-0.5 h-7 w-7 text-primary-700 dark:text-primary-200" viewBox="0 0 32 32" fill="none">
                 {/* 拱券 + 基石蓝点 + 拱下一脉水：specus 标识的缩影 */}
                 <path d="M7 26 V16 A9 9 0 0 1 25 16 V26" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-                <circle cx="16" cy="3.6" r="2.1" fill="var(--specus-accent)" />
+                <circle cx="16" cy="3.6" r="2.1" fill="var(--specus-accent)" className="nat-orb-keystone" />
                 <path d="M5.5 28.5 H26.5" stroke="var(--specus-water)" strokeWidth="1.6" strokeLinecap="round" strokeDasharray="3.5 3" opacity="0.85" />
               </svg>
             )}
