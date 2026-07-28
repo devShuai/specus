@@ -106,10 +106,15 @@ body {
 
 .light {
   color-scheme: light;
+  /* 浅色页 logo 去掉黑底：渠线改深色，直接落在页面底色上 */
+  --logo-mark-bg: transparent;
+  --logo-mark-fg: #14161f;
 }
 
 .dark {
   color-scheme: dark;
+  --logo-mark-bg: #14161f;
+  --logo-mark-fg: #f2f3f7;
 }
 
 .light [data-slot="input-wrapper"][data-focus="true"],

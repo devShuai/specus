@@ -19,11 +19,12 @@ export function AppLogo({
         role="img"
         aria-label="specus 引水渠"
       >
-        <rect width="64" height="64" rx="14" fill="#14161F" />
-        <path d="M7 14 H57" fill="none" stroke="#F2F3F7" strokeWidth="4.5" strokeLinecap="round" />
-        <path d="M8 52 V36 A6 6 0 0 1 20 36 V52" fill="none" stroke="#F2F3F7" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round" opacity=".5" />
-        <path d="M20 52 V36 A12 12 0 0 1 44 36 V52" fill="none" stroke="#F2F3F7" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round" />
-        <path d="M44 52 V36 A6 6 0 0 1 56 36 V52" fill="none" stroke="#F2F3F7" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round" opacity=".5" />
+        {/* 底色与渠线走 --logo-mark-* 变量：浅色页无底 + 深色渠线，深色页保留深色圆角底 */}
+        <rect width="64" height="64" rx="14" fill="var(--logo-mark-bg, #14161F)" />
+        <path d="M7 14 H57" fill="none" stroke="var(--logo-mark-fg, #F2F3F7)" strokeWidth="4.5" strokeLinecap="round" />
+        <path d="M8 52 V36 A6 6 0 0 1 20 36 V52" fill="none" stroke="var(--logo-mark-fg, #F2F3F7)" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round" opacity=".5" />
+        <path d="M20 52 V36 A12 12 0 0 1 44 36 V52" fill="none" stroke="var(--logo-mark-fg, #F2F3F7)" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M44 52 V36 A6 6 0 0 1 56 36 V52" fill="none" stroke="var(--logo-mark-fg, #F2F3F7)" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round" opacity=".5" />
         <circle cx="32" cy="42" r="4" fill="#2997FF" />
       </svg>
       <span className="min-w-0">
