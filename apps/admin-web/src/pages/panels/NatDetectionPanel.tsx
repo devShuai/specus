@@ -609,6 +609,23 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
     }
   };
 
+  const stageProps = {
+    result,
+    checking,
+    progress,
+    onRun: () => void run(),
+    onCancel: cancel,
+    serversText,
+    onServersTextChange: setServersText,
+    timeoutMs,
+    onTimeoutChange: setTimeoutMs,
+    selfHostedStunServer,
+    probeActive: activeProbeConfig != null,
+    resultStale,
+    onResetServers: () => setServersText(defaultServers.join("\n")),
+  };
+  const currentLevel = result ? browserNatOutcome(result).level : null;
+
   if (publicPage) {
     return (
       <main className="app-apple-tool relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
@@ -621,26 +638,17 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
         </header>
 
         <section className="app-apple-tool-content relative z-10 mx-auto w-full max-w-[1080px] px-5 pb-16 sm:px-8">
-          <NatHero
-            result={result}
-            checking={checking}
-            progress={progress}
-            onRun={() => void run()}
-            onCancel={cancel}
-            serversText={serversText}
-            onServersTextChange={setServersText}
-            timeoutMs={timeoutMs}
-            onTimeoutChange={setTimeoutMs}
-            selfHostedStunServer={selfHostedStunServer}
-            probeActive={activeProbeConfig != null}
-            resultStale={resultStale}
-            onResetServers={() => setServersText(defaultServers.join("\n"))}
-          />
+          <NatDetectStage {...stageProps} />
 
-          {result && <NatResultDetails result={result} />}
+          {result && (
+            <>
+              <NatVerdictSection result={result} />
+              <NatTechnicalDetails result={result} />
+            </>
+          )}
 
-          <NatTypeGuide probeConfig={natProbeConfig} />
-          <NatTips probeConfig={natProbeConfig} />
+          <NatTypeGuide probeConfig={natProbeConfig} currentLevel={currentLevel} />
+          <NatFooterNote probeConfig={natProbeConfig} />
         </section>
       </main>
     );
@@ -649,29 +657,19 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
   // 控制台内嵌版（保持简洁，与原有面板风格一致）
   return (
     <div className="mt-4 flex min-w-0 flex-col gap-4">
-      <NatHero
-        embedded
-        result={result}
-        checking={checking}
-        progress={progress}
-        onRun={() => void run()}
-        onCancel={cancel}
-        serversText={serversText}
-        onServersTextChange={setServersText}
-        timeoutMs={timeoutMs}
-        onTimeoutChange={setTimeoutMs}
-        selfHostedStunServer={selfHostedStunServer}
-        probeActive={activeProbeConfig != null}
-        resultStale={resultStale}
-        onResetServers={() => setServersText(defaultServers.join("\n"))}
-      />
-      {result && <NatResultDetails result={result} />}
-      <NatTypeGuide probeConfig={natProbeConfig} compact />
+      <NatDetectStage embedded {...stageProps} />
+      {result && (
+        <>
+          <NatVerdictSection result={result} />
+          <NatTechnicalDetails result={result} />
+        </>
+      )}
+      <NatTypeGuide probeConfig={natProbeConfig} compact currentLevel={currentLevel} />
     </div>
   );
 }
 
-interface NatHeroProps {
+interface NatDetectStageProps {
   embedded?: boolean;
   result: BrowserNatResult | null;
   checking: boolean;
@@ -690,7 +688,13 @@ interface NatHeroProps {
   onResetServers: () => void;
 }
 
-function NatHero({
+/**
+ * 检测舞台：页面唯一的动作中心。
+ *
+ * 信息架构是「大按钮 → 一句话结论 → 细节折叠」，所以这里只保留
+ * 状态徽章、标题、检测按钮和高级设置，结果渲染全部交给 NatVerdictSection。
+ */
+function NatDetectStage({
   embedded = false,
   result,
   checking,
@@ -705,10 +709,9 @@ function NatHero({
   probeActive,
   resultStale,
   onResetServers,
-}: NatHeroProps) {
+}: NatDetectStageProps) {
   const profile = browserNatProfile(checking ? "checking" : result?.kind ?? "idle");
   const accent = ACCENTS[profile.color];
-  const natTypeProfileEntry = result?.natType ? natTypeProfile(result.natType) : null;
   const outcome = result ? browserNatOutcome(result) : null;
   const liveAnnouncement = checking
     ? `${progress.label}${progress.responded > 0
@@ -723,86 +726,57 @@ function NatHero({
   const heroDescription = checking
     ? "正在通过 WebRTC 与多个 STUN 服务比对公网映射，全程不读取摄像头或麦克风。"
     : result
-      ? "已根据本轮公网映射生成网络类型判断，并说明它对游戏联机和 P2P 直连的可能影响。"
+      ? "结论与影响见下方报告；修改 STUN 服务或超时后建议重新检测。"
       : profile.description;
 
   return (
     <section
       className={embedded
         ? `app-apple-nat-hero relative overflow-hidden rounded-xl border ${accent.border} ${accent.bg} p-5`
-        : "nat-hero-glow relative py-6 sm:py-8"}
+        : "nat-hero-glow relative py-6 sm:py-10"}
     >
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {liveAnnouncement}
       </span>
-      <div className="relative flex flex-col gap-6">
-        <div className={`grid items-center gap-7 ${embedded ? "md:grid-cols-[minmax(0,1fr)_144px]" : "lg:grid-cols-[minmax(0,1fr)_220px] lg:gap-10"}`}>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <Chip
-                radius="sm"
-                variant="flat"
-                startContent={<StatusGlyph color={profile.color} className="ml-1" />}
-                className={`${accent.chipBg} ${accent.chipText} border ${accent.chipBorder}`}
-              >
-                {checking ? "检测进行中" : result ? "检测完成" : "准备就绪"}
-              </Chip>
-              {result && (
-                <span className="text-tiny text-zinc-600 dark:text-zinc-400">
-                  耗时 {formatElapsedMs(result.finishedAt - result.startedAt)}
-                </span>
-              )}
-              <span className="rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium text-zinc-600 dark:text-zinc-300">
-                {probeActive ? "RFC 5780 四端点" : "WebRTC 多 STUN"}
-              </span>
-              {resultStale && (
-                <span className="rounded-md border border-warning-300 bg-warning-50 px-2 py-0.5 text-tiny font-medium text-warning-700 dark:border-warning-400/40 dark:bg-warning-500/10 dark:text-warning-300">
-                  参数已变更，结果可能过期
-                </span>
-              )}
-              {result && (
-                <span className="flex items-center gap-1.5 rounded-md glass-chip px-2 py-0.5 text-tiny text-zinc-600 dark:text-zinc-300">
-                  <ConfidenceBars confidence={result.confidence} />
-                  置信度：{confidenceLabel(result.confidence)}
-                </span>
-              )}
-            </div>
-            <div className="mt-4 flex flex-col gap-3">
-              <h1 className={embedded ? "text-2xl font-semibold tracking-tight" : "text-3xl font-semibold tracking-tight sm:text-4xl"}>
-                {heroTitle}
-              </h1>
-              <p className="max-w-2xl text-small leading-6 text-zinc-700 dark:text-zinc-300 sm:text-medium">
-                {heroDescription}
-              </p>
-            </div>
-          </div>
-
-          <NatDetectionOrb
-            embedded={embedded}
-            checking={checking}
-            result={result}
-            progress={progress}
-            onRun={onRun}
-            onCancel={onCancel}
-          />
+      <div className="relative flex flex-col items-center gap-6 text-center">
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <Chip
+            radius="sm"
+            variant="flat"
+            startContent={<StatusGlyph color={profile.color} className="ml-1" />}
+            className={`${accent.chipBg} ${accent.chipText} border ${accent.chipBorder}`}
+          >
+            {checking ? "检测进行中" : result ? "检测完成" : "准备就绪"}
+          </Chip>
+          <span className="rounded-md border glass-chip glass-border px-2 py-0.5 text-tiny font-medium text-zinc-600 dark:text-zinc-300">
+            {probeActive ? "RFC 5780 四端点" : "WebRTC 多 STUN"}
+          </span>
+          {resultStale && (
+            <span className="rounded-md border border-warning-300 bg-warning-50 px-2 py-0.5 text-tiny font-medium text-warning-700 dark:border-warning-400/40 dark:bg-warning-500/10 dark:text-warning-300">
+              参数已变更，结果可能过期
+            </span>
+          )}
         </div>
 
-        {result && outcome && (
-          <NatOutcomeCard
-            result={result}
-            outcome={outcome}
-            technicalLabel={natTypeProfileEntry?.label ?? profile.title}
-            technicalSummary={natTypeProfileEntry?.summary ?? result.summary}
-          />
-        )}
+        <div className="flex max-w-2xl flex-col gap-3">
+          <h1 className={embedded ? "text-2xl font-semibold tracking-tight" : "text-3xl font-semibold tracking-tight sm:text-4xl"}>
+            {heroTitle}
+          </h1>
+          <p className="text-small leading-6 text-zinc-700 dark:text-zinc-300 sm:text-medium">
+            {heroDescription}
+          </p>
+        </div>
 
-        {!embedded && result && (
-          <div className="nat-result-reveal" style={{ animationDelay: "90ms" }}>
-            <MetricStrip result={result} />
-          </div>
-        )}
+        <NatDetectionOrb
+          embedded={embedded}
+          checking={checking}
+          result={result}
+          progress={progress}
+          onRun={onRun}
+          onCancel={onCancel}
+        />
 
-        <details className="group rounded-lg border glass glass-border px-3 py-2 text-small">
+        <details className="group w-full rounded-lg border glass glass-border px-3 py-2 text-left text-small">
           <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-zinc-700 transition-colors hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-white">
             <span className="flex items-center gap-2">
               <ChevronIcon className="h-4 w-4 transition-transform group-open:rotate-90" />
@@ -1145,7 +1119,12 @@ function NatOutcomeCard({
           </a>
         </Tooltip>
         <span aria-hidden="true">·</span>
-        <span>置信度 {confidenceLabel(result.confidence)}</span>
+        <span className="inline-flex items-center gap-1.5">
+          <ConfidenceBars confidence={result.confidence} />
+          置信度 {confidenceLabel(result.confidence)}
+        </span>
+        <span aria-hidden="true">·</span>
+        <span>耗时 {formatElapsedMs(result.finishedAt - result.startedAt)}</span>
         <span aria-hidden="true">·</span>
         <span>{result.evidence}</span>
       </div>
@@ -1413,24 +1392,67 @@ function mappingBehaviorShortLabel(mapping: BrowserNatMappingBehavior): string {
   }
 }
 
-function NatResultDetails({ result }: { result: BrowserNatResult }) {
-  const cards: Array<{ id: string; node: ReactNode }> = [];
-  if (result.endpointChecks.length > 0) {
-    cards.push({ id: "rfc5780", node: <Rfc5780EndpointCard checks={result.endpointChecks} /> });
-  }
-  cards.push(
-    { id: "mapped-endpoints", node: <MappedEndpointsCard result={result} /> },
-    { id: "stun-probes", node: <StunProbesCard result={result} /> },
-    { id: "candidates", node: <CandidateTableCard result={result} /> },
-  );
+/**
+ * 结论区：用户最关心的部分全部平铺——一句话结论、关键指标、自己的公网映射端点。
+ */
+function NatVerdictSection({ result }: { result: BrowserNatResult }) {
+  const outcome = browserNatOutcome(result);
+  const profile = browserNatProfile(result.kind);
+  const natTypeProfileEntry = result.natType ? natTypeProfile(result.natType) : null;
   return (
-    <div className="mt-6 flex flex-col gap-4">
-      {cards.map((card, index) => (
-        <div key={card.id} className="nat-result-reveal" style={{ animationDelay: `${140 + index * 90}ms` }}>
-          {card.node}
-        </div>
-      ))}
+    <div className="mt-8 flex flex-col gap-4">
+      <div className="nat-result-reveal">
+        <NatOutcomeCard
+          result={result}
+          outcome={outcome}
+          technicalLabel={natTypeProfileEntry?.label ?? profile.title}
+          technicalSummary={natTypeProfileEntry?.summary ?? result.summary}
+        />
+      </div>
+      <div className="nat-result-reveal" style={{ animationDelay: "90ms" }}>
+        <MetricStrip result={result} />
+      </div>
+      <div className="nat-result-reveal" style={{ animationDelay: "160ms" }}>
+        <MappedEndpointsCard result={result} />
+      </div>
     </div>
+  );
+}
+
+/**
+ * 技术细节折叠区：RFC 5780 预检、STUN 探测归属、ICE Candidate 明细。
+ * 面向的用户只需要结论，这些证据默认收起，排查时一次展开。
+ */
+function NatTechnicalDetails({ result }: { result: BrowserNatResult }) {
+  const candidateCount = result.probes.reduce((count, probe) => count + probe.candidates.length, 0);
+  return (
+    <details
+      className="nat-result-reveal group mt-4 rounded-xl border glass glass-border transition-colors open:border-black/15 dark:open:border-white/15"
+      style={{ animationDelay: "220ms" }}
+    >
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-5 text-base font-semibold">
+        <span className="flex items-center gap-2">
+          <ChevronIcon className="h-4 w-4 transition-transform group-open:rotate-90" />
+          技术细节
+          <span className="text-small font-normal text-zinc-500 dark:text-zinc-400">
+            {[
+              result.endpointChecks.length > 0 ? "RFC 5780 预检" : null,
+              `${result.probes.length} 个 STUN 探测`,
+              `${candidateCount} 个 ICE Candidate`,
+            ].filter(Boolean).join(" · ")}
+          </span>
+        </span>
+        <span className="text-tiny font-normal text-zinc-500 dark:text-zinc-400">
+          <span className="group-open:hidden">点击展开</span>
+          <span className="hidden group-open:inline">点击收起</span>
+        </span>
+      </summary>
+      <div className="flex flex-col gap-4 border-t border-black/5 p-4 dark:border-white/5">
+        {result.endpointChecks.length > 0 && <Rfc5780EndpointCard checks={result.endpointChecks} />}
+        <StunProbesCard result={result} />
+        <CandidateTableCard result={result} />
+      </div>
+    </details>
   );
 }
 
@@ -1749,15 +1771,18 @@ const NAT_LEVEL_GUIDE = [
 function NatTypeGuide({
   probeConfig,
   compact = false,
+  currentLevel = null,
 }: {
   probeConfig: PublicNatProbeConfig | null;
   compact?: boolean;
+  /** 本次检测结果命中的分级，对应卡片会高亮标注 */
+  currentLevel?: BrowserNatLevel | null;
 }) {
   const topologyAvailable = rfc5780ProbeEndpoints(probeConfig).length === 4;
   const capabilities = probeConfig?.capabilities;
 
   return (
-    <section className={compact ? "mt-4" : "mt-10"} aria-labelledby="nat-type-guide-title">
+    <section className={compact ? "mt-4" : "mt-12"} aria-labelledby="nat-type-guide-title">
       <div className="flex flex-wrap items-end justify-between gap-3 border-b border-black/10 pb-4 dark:border-white/10">
         <div className="max-w-3xl">
           <p className="text-tiny font-semibold text-zinc-500 dark:text-zinc-400">NAT1-4 直连难度分级</p>
@@ -1789,24 +1814,37 @@ function NatTypeGuide({
       </div>
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        {NAT_LEVEL_GUIDE.map((item) => (
-          <article key={item.level} className={`rounded-lg border-l-4 border-y border-r border-black/10 bg-white/45 p-4 transition duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transform-none motion-reduce:transition-none dark:border-y-white/10 dark:border-r-white/10 dark:bg-white/[0.025] dark:hover:shadow-black/40 ${item.tone}`}>
-            <div className="flex items-start gap-3">
-              <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md border font-mono text-small font-semibold ${item.badge}`}>
-                {item.level}
-              </span>
-              <div className="min-w-0">
-                <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{item.title}</h3>
-                <p className="mt-0.5 font-mono text-tiny font-medium">{item.modern}</p>
+        {NAT_LEVEL_GUIDE.map((item) => {
+          const isCurrent = currentLevel === item.level;
+          return (
+            <article
+              key={item.level}
+              className={`relative rounded-lg border-l-4 border-y border-r border-black/10 bg-white/45 p-4 transition duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transform-none motion-reduce:transition-none dark:border-y-white/10 dark:border-r-white/10 dark:bg-white/[0.025] dark:hover:shadow-black/40 ${item.tone} ${
+                isCurrent ? "ring-2 ring-current/40 shadow-md" : ""
+              }`}
+            >
+              {isCurrent && (
+                <span className="absolute right-3 top-3 rounded-md bg-current/10 px-2 py-0.5 text-tiny font-semibold">
+                  本次结果
+                </span>
+              )}
+              <div className="flex items-start gap-3">
+                <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md border font-mono text-small font-semibold ${item.badge}`}>
+                  {item.level}
+                </span>
+                <div className="min-w-0">
+                  <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{item.title}</h3>
+                  <p className="mt-0.5 font-mono text-tiny font-medium">{item.modern}</p>
+                </div>
               </div>
-            </div>
-            <dl className="mt-3 grid gap-2 text-small leading-6">
-              <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">判断依据：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.signal}</dd></div>
-              <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">含义：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.detail}</dd></div>
-              <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">直连影响：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.impact}</dd></div>
-            </dl>
-          </article>
-        ))}
+              <dl className="mt-3 grid gap-2 text-small leading-6">
+                <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">判断依据：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.signal}</dd></div>
+                <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">含义：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.detail}</dd></div>
+                <div><dt className="inline font-semibold text-zinc-800 dark:text-zinc-200">直连影响：</dt><dd className="inline text-zinc-600 dark:text-zinc-400">{item.impact}</dd></div>
+              </dl>
+            </article>
+          );
+        })}
       </div>
 
       {!compact && (
@@ -1839,7 +1877,11 @@ function NatTypeGuide({
   );
 }
 
-function NatTips({ probeConfig }: { probeConfig: PublicNatProbeConfig | null }) {
+/**
+ * 页脚说明：三条使用须知压成一行一条的紧凑列表 + 标准文档链接。
+ * 原来是三张卡片 + 一条通栏，视觉重量超过其信息价值。
+ */
+function NatFooterNote({ probeConfig }: { probeConfig: PublicNatProbeConfig | null }) {
   const tips = [
     { title: "这是即时快照", text: "RFC 5780 描述当前路径和当前端口的可观察行为。网关可能随负载、VPN、网络切换或映射超时改变结果。" },
     { title: "浏览器只验证映射轴", text: "WebRTC 不允许页面构造 CHANGE-REQUEST，因此过滤轴不会用超时猜测；原生客户端可完成 EIF / ADF / APDF 分类。" },
@@ -1847,29 +1889,27 @@ function NatTips({ probeConfig }: { probeConfig: PublicNatProbeConfig | null }) 
   ];
 
   return (
-    <section className="mt-10 grid gap-3 sm:grid-cols-3">
-      {tips.map((tip) => (
-        <div
-          key={tip.title}
-          className="rounded-xl border glass glass-border p-4 transition duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transform-none motion-reduce:transition-none dark:hover:shadow-black/40"
-        >
-          <div className="text-small font-semibold text-zinc-900 dark:text-white">{tip.title}</div>
-          <p className="mt-1.5 text-small leading-6 text-zinc-600 dark:text-zinc-400">{tip.text}</p>
+    <footer className="mt-10 rounded-xl border glass glass-border p-5">
+      <ul className="grid gap-3 sm:grid-cols-3">
+        {tips.map((tip) => (
+          <li key={tip.title} className="text-small leading-6">
+            <span className="font-semibold text-zinc-900 dark:text-white">{tip.title}</span>
+            <span className="text-zinc-500 dark:text-zinc-400"> — </span>
+            <span className="text-zinc-600 dark:text-zinc-400">{tip.text}</span>
+          </li>
+        ))}
+      </ul>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-black/5 pt-4 dark:border-white/5">
+        <div className="text-tiny text-zinc-500 dark:text-zinc-400">
+          当前接口：{probeConfig?.protocol ?? "RFC8489"} / {probeConfig?.discoveryMethod ?? "BASIC_STUN"}。标准原文和实践说明可用于核对术语边界。
         </div>
-      ))}
-      <div className="rounded-lg border glass glass-border p-4 sm:col-span-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="text-small text-zinc-700 dark:text-zinc-300">
-            当前接口：{probeConfig?.protocol ?? "RFC8489"} / {probeConfig?.discoveryMethod ?? "BASIC_STUN"}。标准原文和实践说明可用于核对术语边界。
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button as="a" href="https://www.rfc-editor.org/rfc/rfc5780" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 5780</Button>
-            <Button as="a" href="https://www.rfc-editor.org/rfc/rfc8489" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 8489</Button>
-            <Button as="a" href={NAT_TRAVERSAL_REFERENCE.url} rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">NAT traversal</Button>
-          </div>
+        <div className="flex flex-wrap gap-2">
+          <Button as="a" href="https://www.rfc-editor.org/rfc/rfc5780" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 5780</Button>
+          <Button as="a" href="https://www.rfc-editor.org/rfc/rfc8489" rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">RFC 8489</Button>
+          <Button as="a" href={NAT_TRAVERSAL_REFERENCE.url} rel="noreferrer" target="_blank" size="sm" radius="sm" variant="light">NAT traversal</Button>
         </div>
       </div>
-    </section>
+    </footer>
   );
 }
 
