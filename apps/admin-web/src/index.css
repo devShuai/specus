@@ -2299,12 +2299,11 @@ body {
 
 /* ── specus 主视觉：引水渠 ─────────────────────────────────────────── */
 
-/* 通栏容器：跳出内容列 padding，让渠体横贯整个视口；
+/* 通栏容器：hero 内全宽一行，横贯整个视口且天然居中（不用 100vw，避免滚动条偏移）；
    定高 + slice 裁剪，窄屏切掉两侧拱券而不是把整体缩到看不清 */
 .specus-aqueduct-bleed {
-  width: 100vw;
+  width: 100%;
   height: clamp(220px, 26vw, 340px);
-  margin-left: calc(50% - 50vw);
 }
 
 .specus-aqueduct {

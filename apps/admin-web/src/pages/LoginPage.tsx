@@ -110,70 +110,77 @@ function LoginPageContent() {
 
   return (
     <main className="app-apple landing-shell landing-apple min-h-screen text-zinc-950 dark:text-white">
-      <section className="landing-apple-hero relative z-10 mx-auto flex w-full max-w-[1440px] flex-col px-5 pb-10 pt-5 sm:px-8 lg:min-h-[88vh]">
-        <header className="landing-apple-header flex items-center justify-between gap-3">
-          <AppLogo className="min-w-0 flex-1" label="specus" subtitle="内网服务接入控制面" />
-          <div className="public-header-actions flex shrink-0 items-center gap-2">
-            <PublicToolsMenu />
-            <UserMenuButton className="public-header-theme-button" />
-          </div>
-        </header>
+      <section className="landing-apple-hero relative z-10 flex w-full flex-col pb-10 pt-5 lg:min-h-[88vh]">
+        <div className="mx-auto w-full max-w-[1440px] px-5 sm:px-8">
+          <header className="landing-apple-header flex items-center justify-between gap-3">
+            <AppLogo className="min-w-0 flex-1" label="specus" subtitle="内网服务接入控制面" />
+            <div className="public-header-actions flex shrink-0 items-center gap-2">
+              <PublicToolsMenu />
+              <UserMenuButton className="public-header-theme-button" />
+            </div>
+          </header>
+        </div>
 
         <div className="landing-apple-hero-layout grid flex-1 items-center gap-10 py-10">
           <div className="landing-apple-copy flex min-w-0 flex-col items-center gap-8 text-center">
-            <span className="landing-apple-eyebrow w-fit text-small font-semibold">
-              specus · 拉丁语「地道 / 引水渠」
-            </span>
+            <div className="mx-auto flex w-full max-w-[1440px] flex-col items-center gap-8 px-5 sm:px-8">
+              <span className="landing-apple-eyebrow w-fit text-small font-semibold">
+                specus · 拉丁语「地道 / 引水渠」
+              </span>
 
-            <div className="max-w-3xl">
-              <h1 className="landing-apple-title mx-auto font-semibold text-zinc-950 dark:text-white">specus</h1>
-              <p className="specus-tagline mt-4">
-                <b>引水渠</b>
-                <span aria-hidden="true">·</span>
-                <b>打洞</b>
-                <span aria-hidden="true">·</span>
-                <b>观测</b>
-              </p>
-              <p className="landing-apple-lead mx-auto mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
-                古人架渠引水跨越山谷，把远处的水送到城里。specus 做同一件事：为内网服务架一条可控的渠，
-                在 NAT 之间打通洞口，并让每一段水流都看得见。
-              </p>
+              <div className="max-w-3xl">
+                <h1 className="landing-apple-title mx-auto font-semibold text-zinc-950 dark:text-white">specus</h1>
+                <p className="specus-tagline mt-4">
+                  <b>引水渠</b>
+                  <span aria-hidden="true">·</span>
+                  <b>打洞</b>
+                  <span aria-hidden="true">·</span>
+                  <b>观测</b>
+                </p>
+                <p className="landing-apple-lead mx-auto mt-5 max-w-2xl text-zinc-700 dark:text-zinc-300">
+                  古人架渠引水跨越山谷，把远处的水送到城里。specus 做同一件事：为内网服务架一条可控的渠，
+                  在 NAT 之间打通洞口，并让每一段水流都看得见。
+                </p>
+              </div>
             </div>
 
+            {/* 通栏主视觉：不占内容列宽，横贯整个视口且天然居中（无 100vw 滚动条偏移） */}
             <div className="specus-aqueduct-bleed">
               <SpecusAqueduct />
             </div>
 
-            <div className="flex flex-wrap items-center justify-center gap-3">
-              <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
-                登录管理台
-              </button>
-              {registrationEnabled && (
-                <button type="button" className="landing-secondary-button" onClick={() => openLogin("register")}>
-                  注册账号
+            <div className="mx-auto flex w-full max-w-[1440px] flex-col items-center gap-8 px-5 sm:px-8">
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
+                  登录管理台
                 </button>
-              )}
-            </div>
+                {registrationEnabled && (
+                  <button type="button" className="landing-secondary-button" onClick={() => openLogin("register")}>
+                    注册账号
+                  </button>
+                )}
+              </div>
 
-            <div className="landing-apple-metrics mx-auto grid w-full max-w-3xl grid-cols-2 sm:grid-cols-4">
-              {metrics.map((item) => (
-                <div key={item.label} className="landing-apple-metric py-3">
-                  <p className="text-xl font-semibold text-zinc-950 dark:text-white">{item.value}</p>
-                  <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{item.label}</p>
-                </div>
-              ))}
-            </div>
+              <div className="landing-apple-metrics mx-auto grid w-full max-w-3xl grid-cols-2 sm:grid-cols-4">
+                {metrics.map((item) => (
+                  <div key={item.label} className="landing-apple-metric py-3">
+                    <p className="text-xl font-semibold text-zinc-950 dark:text-white">{item.value}</p>
+                    <p className="mt-1 text-tiny text-zinc-600 dark:text-zinc-400">{item.label}</p>
+                  </div>
+                ))}
+              </div>
 
-            <div className="landing-apple-flow mx-auto flex w-full max-w-3xl flex-col gap-3 p-4 sm:flex-row sm:items-center">
-              {flowNodes.map((node, index) => (
-                <div key={node} className="flex min-w-0 flex-1 items-center gap-3">
-                  <span className="landing-apple-step flex h-8 w-8 shrink-0 items-center justify-center text-small">
-                    {index + 1}
-                  </span>
-                  <span className="truncate text-small text-zinc-700 dark:text-zinc-200">{node}</span>
-                  {index < flowNodes.length - 1 && <span className="landing-route-line hidden h-px flex-1 sm:block" />}
-                </div>
-              ))}
+              <div className="landing-apple-flow mx-auto flex w-full max-w-3xl flex-col gap-3 p-4 sm:flex-row sm:items-center">
+                {flowNodes.map((node, index) => (
+                  <div key={node} className="flex min-w-0 flex-1 items-center gap-3">
+                    <span className="landing-apple-step flex h-8 w-8 shrink-0 items-center justify-center text-small">
+                      {index + 1}
+                    </span>
+                    <span className="truncate text-small text-zinc-700 dark:text-zinc-200">{node}</span>
+                    {index < flowNodes.length - 1 && <span className="landing-route-line hidden h-px flex-1 sm:block" />}
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
 

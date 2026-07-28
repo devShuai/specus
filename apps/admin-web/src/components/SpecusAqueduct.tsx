@@ -14,12 +14,12 @@ const LABELED_ARCHES = [
   { cx: 920, label: "对端互联" },
 ];
 
-/** 全宽拱券：中央三连拱 + 两侧延伸拱，opacity 随离画面中心的距离衰减。 */
+/** 全宽拱券：中央三连拱 + 两侧延伸拱，opacity 随离画面中心的距离快速衰减 */
 const ARCH_OPACITY_BY_DISTANCE: Record<number, number> = {
   0: 1,
-  200: 0.6,
-  400: 0.38,
-  600: 0.2,
+  200: 0.55,
+  400: 0.28,
+  600: 0.12,
 };
 const ARCH_STEP = 200;
 const ARCH_CENTERS: Array<{ cx: number; opacity: number }> = [];
@@ -44,9 +44,6 @@ function buildArcadePath(): string {
   }
   return segments.join(" ");
 }
-
-/** 拱墩上的砌缝短划，给出石材的尺度感。 */
-const PIER_JOINT_Y = [275, 296];
 
 /**
  * specus 主视觉：贯穿屏幕的罗马引水渠。
@@ -87,18 +84,23 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
         {/* 槽壁 / 地平的描边渐变：两端渐隐，让渠体延伸出画面 */}
         <linearGradient id="specus-channel" x1="0" y1="0" x2={SCENE_WIDTH} y2="0" gradientUnits="userSpaceOnUse">
           <stop offset="0" stopColor="var(--specus-stroke)" stopOpacity="0" />
-          <stop offset="0.12" stopColor="var(--specus-stroke)" stopOpacity="0.9" />
+          <stop offset="0.18" stopColor="var(--specus-stroke)" stopOpacity="0.75" />
           <stop offset="0.5" stopColor="var(--specus-stroke)" />
-          <stop offset="0.88" stopColor="var(--specus-stroke)" stopOpacity="0.9" />
+          <stop offset="0.82" stopColor="var(--specus-stroke)" stopOpacity="0.75" />
           <stop offset="1" stopColor="var(--specus-stroke)" stopOpacity="0" />
         </linearGradient>
         {/* 槽中水面：上亮下暗的一层薄水，两端随渠体渐隐 */}
         <linearGradient id="specus-water-fill" x1="0" y1="0" x2={SCENE_WIDTH} y2="0" gradientUnits="userSpaceOnUse">
           <stop offset="0" stopColor="var(--specus-water-bright)" stopOpacity="0" />
-          <stop offset="0.1" stopColor="var(--specus-water-bright)" stopOpacity="0.85" />
-          <stop offset="0.9" stopColor="var(--specus-water-bright)" stopOpacity="0.85" />
+          <stop offset="0.16" stopColor="var(--specus-water-bright)" stopOpacity="0.85" />
+          <stop offset="0.84" stopColor="var(--specus-water-bright)" stopOpacity="0.85" />
           <stop offset="1" stopColor="var(--specus-water-bright)" stopOpacity="0" />
         </linearGradient>
+        {/* 中拱拱心驻留光的辉光 */}
+        <radialGradient id="specus-glow">
+          <stop offset="0" stopColor="var(--specus-accent)" stopOpacity="0.55" />
+          <stop offset="1" stopColor="var(--specus-accent)" stopOpacity="0" />
+        </radialGradient>
         {/* 拱下水潭：一团淡淡的水光 */}
         <radialGradient id="specus-pool">
           <stop offset="0" stopColor="var(--specus-water)" stopOpacity="0.4" />
@@ -123,14 +125,9 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
         ))}
       </g>
 
-      {/* 拱墩砌缝（只画中央三连拱，远处拱墩淡到看不出砌缝） */}
-      <g stroke="var(--specus-stroke)" strokeWidth="4" strokeLinecap="round" opacity="0.22">
-        {LABELED_ARCHES.flatMap(({ cx }) =>
-          [cx - 70, cx + 70].flatMap((x) =>
-            PIER_JOINT_Y.map((y) => <path key={`joint-${x}-${y}`} d={`M${x - 7} ${y} H${x + 7}`} />),
-          ),
-        )}
-      </g>
+      {/* 中拱拱心的驻留光：标识里那颗蓝点 */}
+      <circle cx={SCENE_CENTER} cy="212" r="34" fill="url(#specus-glow)" />
+      <circle cx={SCENE_CENTER} cy="212" r="7" fill="var(--specus-accent)" />
 
       {/* 下层桥面（同时是上层拱廊的基线） */}
       <path d={`M0 180 H${SCENE_WIDTH}`} stroke="url(#specus-channel)" strokeWidth="5" strokeLinecap="round" opacity="0.85" />
@@ -193,16 +190,17 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
         ),
       )}
 
-      {/* 拱洞落光与涟漪：光穿过中央三连拱坠入水潭——洞通流 */}
+      {/* 拱洞落光与涟漪：光穿过中央三连拱坠入水潭，激起两重涟漪——洞通流 */}
       {LABELED_ARCHES.map(({ cx }, index) =>
         reduceMotion ? (
           <g key={`drop-${cx}`}>
             <circle cx={cx} cy="255" r="4" fill="var(--specus-accent)" opacity="0.45" />
-            <ellipse cx={cx} cy="322" rx="26" ry="6" stroke="var(--specus-water)" strokeWidth="2" opacity="0.3" />
+            <ellipse cx={cx} cy="322" rx="26" ry="6" stroke="var(--specus-water)" strokeWidth="2" opacity="0.35" />
+            <ellipse cx={cx} cy="322" rx="40" ry="9" stroke="var(--specus-water)" strokeWidth="1.5" opacity="0.2" />
           </g>
         ) : (
           <g key={`drop-${cx}`}>
-            <circle cx={cx} cy="196" r="4" fill="var(--specus-accent)">
+            <circle cx={cx} cy="196" r="5" fill="var(--specus-accent)">
               <animate
                 attributeName="cy"
                 values="196;316"
@@ -219,27 +217,53 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
                 repeatCount="indefinite"
               />
             </circle>
-            <ellipse cx={cx} cy="322" rx="8" ry="2.5" stroke="var(--specus-water)" strokeWidth="2" fill="none">
+            {/* 主涟漪：水滴落到石板（地面）瞬间荡开 */}
+            <ellipse cx={cx} cy="322" rx="8" ry="2.5" stroke="var(--specus-water)" strokeWidth="2.5" fill="none">
               <animate
                 attributeName="rx"
-                values="8;42"
+                values="8;46"
                 dur={DROP_DURATION}
                 begin={`${index * 0.93}s`}
                 repeatCount="indefinite"
               />
               <animate
                 attributeName="ry"
-                values="2.5;9"
+                values="2.5;10"
                 dur={DROP_DURATION}
                 begin={`${index * 0.93}s`}
                 repeatCount="indefinite"
               />
               <animate
                 attributeName="opacity"
-                values="0;0;0.5;0"
+                values="0;0;0.65;0"
                 keyTimes="0;0.72;0.82;1"
                 dur={DROP_DURATION}
                 begin={`${index * 0.93}s`}
+                repeatCount="indefinite"
+              />
+            </ellipse>
+            {/* 余波涟漪：慢半拍的第二圈 */}
+            <ellipse cx={cx} cy="322" rx="8" ry="2.5" stroke="var(--specus-water)" strokeWidth="1.5" fill="none">
+              <animate
+                attributeName="rx"
+                values="8;38"
+                dur={DROP_DURATION}
+                begin={`${index * 0.93 + 0.4}s`}
+                repeatCount="indefinite"
+              />
+              <animate
+                attributeName="ry"
+                values="2.5;8"
+                dur={DROP_DURATION}
+                begin={`${index * 0.93 + 0.4}s`}
+                repeatCount="indefinite"
+              />
+              <animate
+                attributeName="opacity"
+                values="0;0;0.4;0"
+                keyTimes="0;0.72;0.82;1"
+                dur={DROP_DURATION}
+                begin={`${index * 0.93 + 0.4}s`}
                 repeatCount="indefinite"
               />
             </ellipse>
