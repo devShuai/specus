@@ -628,8 +628,8 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
 
   if (publicPage) {
     return (
-      <main className="app-apple-tool relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
-        <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8">
+      <main className="app-apple-tool nat-tool-plain relative min-h-screen overflow-x-hidden text-zinc-950 dark:text-white">
+        <header className="app-apple-tool-header relative z-40 mx-auto flex w-full max-w-[1080px] items-center justify-between gap-3 px-5 py-5 sm:px-8 xl:max-w-[1280px]">
           <AppLogo className="min-w-0 flex-1" label="specus" subtitle="浏览器 NAT 检测" markClassName="h-9 w-9" />
           <div className="public-header-actions flex shrink-0 items-center gap-2">
             <PublicToolsMenu active="nat-detect" />
@@ -637,7 +637,7 @@ function NatDetectionPanelContent({ publicPage = false }: { publicPage?: boolean
           </div>
         </header>
 
-        <section className="app-apple-tool-content relative z-10 mx-auto w-full max-w-[1080px] px-5 pb-16 sm:px-8">
+        <section className="app-apple-tool-content relative z-10 mx-auto w-full max-w-[1080px] px-5 pb-16 sm:px-8 xl:max-w-[1280px]">
           <NatDetectStage {...stageProps} />
 
           {result && (
@@ -733,7 +733,7 @@ function NatDetectStage({
     <section
       className={embedded
         ? `app-apple-nat-hero relative overflow-hidden rounded-xl border ${accent.border} ${accent.bg} p-5`
-        : "nat-hero-glow relative py-6 sm:py-10"}
+        : "relative py-6 sm:py-10"}
     >
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
         {liveAnnouncement}
@@ -925,6 +925,15 @@ const NAT_CHANNEL_TONE_WATER: Record<BrowserNatOutcome["tone"], string> = {
   danger: "#f43f5e",
 };
 
+/** 出结果后球内水位：直连越顺畅渠水越满，受阻则退到近涸。 */
+const NAT_ORB_WATER_BY_TONE: Record<BrowserNatOutcome["tone"], number> = {
+  default: 30,
+  primary: 85,
+  success: 85,
+  warning: 45,
+  danger: 16,
+};
+
 /** 渠面漂移的光点：节奏错开，读起来像持续的来水。 */
 const NAT_CHANNEL_DOTS = [
   { duration: "6.4s", delay: "0s" },
@@ -1024,9 +1033,24 @@ function NatDetectionOrb({
   const ringPercent = determinate ? Math.min(100, Math.max(0, smoothPercent ?? 0)) : 0;
   const progressOffset = circumference * (1 - ringPercent / 100);
   const state = checking ? "checking" : result ? "complete" : "idle";
-  const privacyId = embedded ? "embedded-nat-check-privacy" : "public-nat-check-privacy";
   const gradientId = useId();
-  const accentStyle = { "--nat-orb-accent": checking ? NAT_PHASE_ACCENTS[progress.phase] : "#0a84ff" } as CSSProperties;
+  const outcomeTone = result ? browserNatOutcome(result).tone : null;
+  const accentStyle = {
+    "--nat-orb-accent": checking ? NAT_PHASE_ACCENTS[progress.phase] : "#0a84ff",
+    "--nat-orb-water": checking
+      ? "var(--specus-accent)"
+      : outcomeTone
+        ? NAT_CHANNEL_TONE_WATER[outcomeTone]
+        : "var(--specus-water)",
+  } as CSSProperties;
+  // 球内水位：待命小半渠（停在副标题之下），检测中随进度涨水，出结果后停在结论对应的高度
+  const waterLevel = checking
+    ? determinate
+      ? Math.round(18 + ringPercent * 0.68)
+      : 40
+    : result && outcomeTone
+      ? NAT_ORB_WATER_BY_TONE[outcomeTone]
+      : 20;
   const centerText = checking
     ? progress.responded > 0 && progress.total > 0
       ? `${progress.responded}/${progress.total}`
@@ -1055,7 +1079,6 @@ function NatDetectionOrb({
         <button
           type="button"
           aria-busy={checking}
-          aria-describedby={checking ? undefined : privacyId}
           aria-label={checking ? "取消 NAT 检测" : result ? "重新检测 NAT 类型" : "点我检测 NAT 类型"}
           data-state={state}
           onClick={checking ? onCancel : onRun}
@@ -1072,6 +1095,10 @@ function NatDetectionOrb({
               <span className="nat-detect-ripple nat-detect-ripple-delay" aria-hidden="true" />
             </>
           )}
+          {/* 球内渠水：贴着球体弧度的一泓水，水位随状态涨落 */}
+          <span className="nat-orb-water-clip" aria-hidden="true">
+            <span className="nat-orb-water" style={{ height: `${waterLevel}%` }} />
+          </span>
           {checking && (
             <svg aria-hidden="true" className={`absolute inset-0 h-full w-full -rotate-90 ${determinate ? "" : "nat-detect-progress-indeterminate"}`} viewBox="0 0 100 100">
               <defs>
@@ -1106,9 +1133,10 @@ function NatDetectionOrb({
           <span className="relative z-10 flex max-w-[82%] flex-col items-center gap-1">
             {!checking && (
               <svg aria-hidden="true" className="nat-orb-idle-icon mb-0.5 h-7 w-7 text-primary-700 dark:text-primary-200" viewBox="0 0 32 32" fill="none">
-                <circle cx="16" cy="16" r="3" fill="currentColor" />
-                <circle cx="16" cy="16" r="8" stroke="currentColor" strokeWidth="1.5" opacity="0.65" />
-                <path d="M5.5 16a10.5 10.5 0 0 1 21 0M2.5 16a13.5 13.5 0 0 1 27 0" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.4" />
+                {/* 拱券 + 基石蓝点 + 拱下一脉水：specus 标识的缩影 */}
+                <path d="M7 26 V16 A9 9 0 0 1 25 16 V26" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                <circle cx="16" cy="3.6" r="2.1" fill="var(--specus-accent)" />
+                <path d="M5.5 28.5 H26.5" stroke="var(--specus-water)" strokeWidth="1.6" strokeLinecap="round" strokeDasharray="3.5 3" opacity="0.85" />
               </svg>
             )}
             <span className={`${checking ? "text-xl tabular-nums" : embedded ? "text-sm" : "text-base"} font-semibold text-zinc-950 dark:text-white`}>
@@ -1121,7 +1149,7 @@ function NatDetectionOrb({
         </button>
       </div>
       <div className="min-h-9 text-center text-tiny leading-5 text-zinc-500 dark:text-zinc-400">
-        {checking ? (
+        {checking && (
           <>
             <span className="block font-medium text-zinc-700 dark:text-zinc-200">{progress.label}</span>
             <span>
@@ -1132,8 +1160,6 @@ function NatDetectionOrb({
                   : "等待公网映射返回"}
             </span>
           </>
-        ) : (
-          <span id={privacyId}>无需安装，不读取摄像头或麦克风</span>
         )}
       </div>
       <div className="flex h-7 items-center">
@@ -1865,22 +1891,39 @@ const NAT_LEVEL_GUIDE = [
 ] as const;
 
 /**
- * 分级徽章里的拱洞：拱顶的数字是基石，拱下的开口是通过性——
- * NAT1 完全开敞，NAT2 收窄，NAT3 半掩，NAT4 几乎封死。
- * 能不能直连，一眼从拱洞读出来。
+ * 分级徽章里的拱洞：拱顶的数字是基石，拱券立在渠床上，
+ * 拱下的开口与穿洞的水就是直连难度——NAT1 开敞通水，
+ * NAT2 收窄，NAT3 半掩水弱，NAT4 闸死断流。
  */
 function NatLevelArchGlyph({ level }: { level: BrowserNatLevel }) {
   return (
-    <svg viewBox="0 0 36 44" fill="none" aria-hidden="true" className="absolute inset-x-[4px] bottom-[2px] top-[13px] h-auto w-[calc(100%-8px)]">
-      <path d="M7 42 V20 A11 11 0 0 1 29 20 V42" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+    <svg viewBox="0 0 40 48" fill="none" aria-hidden="true">
+      {/* 拱券 */}
+      <path d="M9.5 41 V22 A10.5 10.5 0 0 1 30.5 22 V41" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      {/* 渠床两道线 */}
+      <path d="M4 43.75 H36" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" opacity="0.45" />
+      <path d="M7.5 46.25 H32.5" stroke="currentColor" strokeWidth="1" strokeLinecap="round" opacity="0.28" />
+      {/* 穿洞的水：随级别变窄变淡，NAT4 断流 */}
+      {level <= 3 && (
+        <path
+          d={level === 1 ? "M12 38 H28" : level === 2 ? "M14.5 38 H25.5" : "M15.5 38 H24.5"}
+          stroke="var(--specus-water)"
+          strokeWidth={level === 3 ? 1.3 : 1.8}
+          strokeLinecap="round"
+          strokeDasharray="3 2.4"
+          opacity={level === 3 ? 0.6 : 0.9}
+          className="specus-water-march"
+        />
+      )}
+      {/* 收窄的副拱 / 半掩的闸板 / 封死的闸 */}
       {level === 2 && (
-        <path d="M13 42 V27 A5 5 0 0 1 23 27 V42" stroke="currentColor" strokeWidth="1.6" opacity="0.75" />
+        <path d="M14.5 41 V27 A5.5 5.5 0 0 1 25.5 27 V41" stroke="currentColor" strokeWidth="1.5" opacity="0.7" />
       )}
       {level === 3 && (
-        <path d="M10.5 31 H25.5" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" opacity="0.85" />
+        <path d="M12.5 31 H27.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" opacity="0.85" />
       )}
       {level === 4 && (
-        <path d="M9 42 V30.5 H27 V42 Z" fill="currentColor" opacity="0.85" />
+        <path d="M11.5 41 V31 H28.5 V41 Z" fill="currentColor" opacity="0.85" />
       )}
     </svg>
   );

@@ -5103,6 +5103,22 @@ body {
   border-width: 1.5px;
   border-style: solid;
   border-radius: 20px 20px 7px 7px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+}
+
+.dark .nat-level-badge {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* 拱洞立在徽章下半部：顶部留给基石数字，下部等比放置拱券与渠床 */
+.nat-level-badge svg {
+  position: absolute;
+  top: 13px;
+  bottom: 2px;
+  left: 50%;
+  height: calc(100% - 15px);
+  width: auto;
+  transform: translateX(-50%);
 }
 
 .nat-level-badge-num {
@@ -5137,21 +5153,58 @@ body {
 }
 
 /* NAT detection keeps its motion budget in one place: the browser/STUN probe orb. */
-.nat-hero-glow::before {
-  position: absolute;
-  inset: -120px -60px auto;
-  height: 460px;
-  content: "";
-  pointer-events: none;
-  background:
-    radial-gradient(560px 300px at 84% 6%, color-mix(in srgb, var(--app-apple-blue) 11%, transparent), transparent 70%),
-    radial-gradient(420px 260px at 8% 0%, color-mix(in srgb, var(--app-apple-blue) 6%, transparent), transparent 70%);
+
+/* 工具页要一张干净的纸：去掉灰底与顶部辉光，让渠水自己说话。
+   选择器补到 (0,2,1) 才能压过 .app-apple:not(.landing-shell) > main 的 !important 底色。 */
+main.app-apple-tool.nat-tool-plain {
+  background: #ffffff !important;
 }
 
-.dark .nat-hero-glow::before {
-  background:
-    radial-gradient(560px 300px at 84% 6%, color-mix(in srgb, var(--app-apple-blue) 20%, transparent), transparent 70%),
-    radial-gradient(420px 260px at 8% 0%, color-mix(in srgb, var(--app-apple-blue) 10%, transparent), transparent 70%);
+.dark main.app-apple-tool.nat-tool-plain {
+  background: #000000 !important;
+}
+
+/* 球内渠水：贴着球体弧度的一泓水，水位由组件按状态注入（%） */
+.nat-orb-water-clip {
+  position: absolute;
+  inset: 3px;
+  border-radius: 999px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.nat-orb-water {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: linear-gradient(
+    to top,
+    color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 18%, transparent),
+    color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 6%, transparent)
+  );
+  transition: height 640ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 水面线：细细的流动高光，不抢球内文字 */
+.nat-orb-water::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 2px;
+  content: "";
+  background: repeating-linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--nat-orb-water, var(--specus-water)) 60%, transparent) 0 6px,
+    transparent 6px 13px
+  );
+  background-size: 13px 100%;
+  animation: nat-orb-water-flow 1.6s linear infinite;
+}
+
+@keyframes nat-orb-water-flow {
+  to { background-position: 13px 0; }
 }
 
 .nat-orb-stage {
@@ -5508,6 +5561,7 @@ body {
   .nat-outcome-marker,
   .nat-outcome-bar::after,
   .nat-outcome-bar-flow,
+  .nat-orb-water::before,
   .nat-level-segment.is-on,
   .nat-step-done .nat-step-line,
   .nat-step-done .nat-step-dot svg path,
