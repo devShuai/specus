@@ -1,6 +1,6 @@
 [Unit]
-Description=Shuai Tunnel Standalone RFC 5780 STUN Server (Go)
-Documentation=https://github.com/devShuai/shuai-tunnel
+Description=specus Standalone RFC 5780 STUN Server (Go)
+Documentation=https://github.com/devShuai/specus
 After=network-online.target
 Wants=network-online.target
 
@@ -8,11 +8,11 @@ Wants=network-online.target
 Type=simple
 User=stun
 Group=stun
-WorkingDirectory=/var/lib/shuai-stun-server
-EnvironmentFile=/etc/shuai-stun-server/stun-server.env
+WorkingDirectory=/var/lib/specus-stun-server
+EnvironmentFile=/etc/specus-stun-server/stun-server.env
 
-ExecStartPre=/opt/shuai-stun-server/shuai-stun-server --check-config
-ExecStart=/opt/shuai-stun-server/shuai-stun-server
+ExecStartPre=/opt/specus-stun-server/specus-stun-server --check-config
+ExecStart=/opt/specus-stun-server/specus-stun-server
 
 KillSignal=SIGTERM
 TimeoutStopSec=10
@@ -21,7 +21,7 @@ RestartSec=3s
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=shuai-stun-server-go
+SyslogIdentifier=specus-stun-server-go
 
 NoNewPrivileges=true
 PrivateTmp=true
@@ -33,7 +33,7 @@ ProtectControlGroups=true
 ProtectProc=invisible
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6
-ReadWritePaths=/var/lib/shuai-stun-server
+ReadWritePaths=/var/lib/specus-stun-server
 UMask=0027
 LimitNOFILE=4096
 TasksMax=64

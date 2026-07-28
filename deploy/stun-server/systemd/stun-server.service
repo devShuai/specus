@@ -1,6 +1,6 @@
 [Unit]
-Description=Shuai Tunnel Standalone RFC 5780 STUN Server
-Documentation=https://github.com/devShuai/shuai-tunnel
+Description=specus Standalone RFC 5780 STUN Server
+Documentation=https://github.com/devShuai/specus
 After=network-online.target
 Wants=network-online.target
 
@@ -8,13 +8,13 @@ Wants=network-online.target
 Type=simple
 User=stun
 Group=stun
-WorkingDirectory=/var/lib/shuai-stun-server
+WorkingDirectory=/var/lib/specus-stun-server
 
 Environment=JAVA_OPTS=
-EnvironmentFile=/etc/shuai-stun-server/stun-server.env
+EnvironmentFile=/etc/specus-stun-server/stun-server.env
 
-ExecStartPre=/usr/bin/java $JAVA_OPTS -jar /opt/shuai-stun-server/stun-server.jar --check-config
-ExecStart=/usr/bin/java $JAVA_OPTS -jar /opt/shuai-stun-server/stun-server.jar
+ExecStartPre=/usr/bin/java $JAVA_OPTS -jar /opt/specus-stun-server/stun-server.jar --check-config
+ExecStart=/usr/bin/java $JAVA_OPTS -jar /opt/specus-stun-server/stun-server.jar
 
 KillSignal=SIGTERM
 TimeoutStopSec=10
@@ -24,7 +24,7 @@ RestartSec=3s
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=shuai-stun-server
+SyslogIdentifier=specus-stun-server
 
 NoNewPrivileges=true
 PrivateTmp=true
@@ -36,7 +36,7 @@ ProtectControlGroups=true
 ProtectProc=invisible
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6
-ReadWritePaths=/var/lib/shuai-stun-server
+ReadWritePaths=/var/lib/specus-stun-server
 UMask=0027
 LimitNOFILE=4096
 TasksMax=64

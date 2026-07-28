@@ -1,7 +1,7 @@
 # 独立 RFC 5780 STUN Server 部署
 
 独立服务提供 Java、Go、.NET 三种运行时，只处理 UDP STUN Binding 与 RFC 5780
-行为探测，不启动 tunnel-server、数据库、业务 HTTP、WebSocket 或 TURN。三种
+行为探测，不启动 specus-server、数据库、业务 HTTP、WebSocket 或 TURN。三种
 实现共用单机四端点、限流、防放大和 Prometheus 指标契约。Java 另外支持把 A1/A2
 拆到两台内网互通、各只有一个公网 IP 的服务器。
 
@@ -41,7 +41,7 @@ nonce 防重放、固定对端地址校验、长度限制和独立 token bucket�
 偏差。Java 一键部署示例见
 [`deploy/stun-server/remote`](../remote/README.md)。
 
-端口号可以配置。若独立服务与 `tunnel-server` 同机，必须避开后者已有的
+端口号可以配置。若独立服务与 `specus-server` 同机，必须避开后者已有的
 STUN/TURN 端口，例如让独立 STUN 使用 `34780/udp`、`34781/udp`，继续保留
 `3478/udp` 给认证 TURN。安装和更新脚本会在替换文件前检查端口占用。
 
@@ -59,7 +59,7 @@ mvn -pl :stun-server -am clean package
 implementations/java/stun-server/target/stun-server.jar
 ```
 
-该 JAR 已包含运行需要的共享 STUN 类，可以脱离 tunnel-server 单独运行。
+该 JAR 已包含运行需要的共享 STUN 类，可以脱离 specus-server 单独运行。
 
 ### Go 单文件
 
@@ -67,10 +67,10 @@ implementations/java/stun-server/target/stun-server.jar
 cd implementations/go/server
 go test ./internal/stunserver
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
-  -o shuai-stun-server ./cmd/shuai-stun-server
+  -o specus-stun-server ./cmd/specus-stun-server
 ```
 
-产物为不依赖 Java/.NET runtime 的 `shuai-stun-server`。
+产物为不依赖 Java/.NET runtime 的 `specus-stun-server`。
 
 ### .NET
 
@@ -78,7 +78,7 @@ Framework-dependent 发布：
 
 ```bash
 dotnet publish \
-  implementations/csharp/server/src/ShuaiTunnel.StunServer/ShuaiTunnel.StunServer.csproj \
+  implementations/csharp/server/src/Specus.StunServer/Specus.StunServer.csproj \
   -c Release -o out/stun-dotnet
 ```
 
@@ -86,7 +86,7 @@ Linux x64 自包含单文件：
 
 ```bash
 dotnet publish \
-  implementations/csharp/server/src/ShuaiTunnel.StunServer/ShuaiTunnel.StunServer.csproj \
+  implementations/csharp/server/src/Specus.StunServer/Specus.StunServer.csproj \
   -c Release -r linux-x64 --self-contained true \
   -p:PublishSingleFile=true -p:PublishTrimmed=false \
   -o out/stun-dotnet-linux-x64
@@ -99,7 +99,7 @@ dotnet publish \
 ```bash
 sudo bash deploy/stun-server/systemd/install.sh \
   implementations/java/stun-server/target/stun-server.jar
-sudo vim /etc/shuai-stun-server/stun-server.env
+sudo vim /etc/specus-stun-server/stun-server.env
 ```
 
 填写真实地址后先校验配置：
@@ -107,9 +107,9 @@ sudo vim /etc/shuai-stun-server/stun-server.env
 ```bash
 sudo -u stun bash -c '
   set -a
-  source /etc/shuai-stun-server/stun-server.env
+  source /etc/specus-stun-server/stun-server.env
   set +a
-  java $JAVA_OPTS -jar /opt/shuai-stun-server/stun-server.jar --check-config
+  java $JAVA_OPTS -jar /opt/specus-stun-server/stun-server.jar --check-config
 '
 ```
 
@@ -159,9 +159,9 @@ A2 使用相同公网地址、端口和密钥，把 `LOCAL_ADDRESS_SLOT` 改为 
 ### Go
 
 ```bash
-sudo install -d -m 0755 /opt/shuai-stun-server
-sudo install -m 0755 implementations/go/server/shuai-stun-server \
-  /opt/shuai-stun-server/shuai-stun-server
+sudo install -d -m 0755 /opt/specus-stun-server
+sudo install -m 0755 implementations/go/server/specus-stun-server \
+  /opt/specus-stun-server/specus-stun-server
 sudo install -m 0644 deploy/stun-server/systemd/stun-server-go.service \
   /etc/systemd/system/stun-server.service
 sudo systemctl daemon-reload
@@ -171,11 +171,11 @@ sudo systemctl enable --now stun-server
 ### .NET
 
 把 framework-dependent publish 目录复制到
-`/opt/shuai-stun-server/dotnet/`，并安装
+`/opt/specus-stun-server/dotnet/`，并安装
 `stun-server-dotnet.service`。若使用自包含单文件，把 unit 中的
 `/usr/bin/dotnet ...dll` 替换为发布出的可执行文件路径。
 
-任一运行时都使用 `/etc/shuai-stun-server/stun-server.env`。同一台机器只应
+任一运行时都使用 `/etc/specus-stun-server/stun-server.env`。同一台机器只应
 启用一个 `stun-server.service`，避免四个 UDP 端点和 `9108/tcp` 指标端口冲突。
 
 ## 4. 同一个 STUN 域名
@@ -196,24 +196,24 @@ _stun-behavior._udp.example.com. 300 IN SRV 0 0 3478 stun.example.com.
 在线的第二地址槽。任一节点故障时，存活节点仍可提供普通 Binding，但无法完成
 跨地址的完整映射和过滤行为分类。
 
-在 tunnel-server 中把原生客户端和公开 NAT 检测页指向该独立入口：
+在 specus-server 中把原生客户端和公开 NAT 检测页指向该独立入口：
 
 ```env
-TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS=stun1.tunnel.devshuai.com
-TUNNEL_PEER_MESH_STANDALONE_STUN_PORT=34780
-TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS=stun2.tunnel.devshuai.com
-TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT=34781
+SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS=stun1.specus.devshuai.com
+SPECUS_PEER_MESH_STANDALONE_STUN_PORT=34780
+SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS=stun2.specus.devshuai.com
+SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT=34781
 ```
 
 主地址和主端口替换登录配置中的 `stunHost/stunPort`；备用地址会以主端口 P1
 自动加入登录配置和公开 ICE 配置的备用 STUN 列表。四个变量共同为
 `GET /api/public/peer-mesh/nat-probe-config` 生成 A1:P1、A1:P2、A2:P1、A2:P2，
 供网页执行端点预检和共享 ICE 映射观测。认证 TURN 继续使用
-`TUNNEL_PEER_MESH_PUBLIC_ADDRESS:TUNNEL_PEER_MESH_STUN_TURN_PORT`，
+`SPECUS_PEER_MESH_PUBLIC_ADDRESS:SPECUS_PEER_MESH_STUN_TURN_PORT`，
 因此 STUN 与 TURN 可以独立扩容、独立部署和独立维护。
 
-生产域名 `stun1.tunnel.devshuai.com` 解析到 A1（ali2，`47.103.154.117`），
-`stun2.tunnel.devshuai.com` 解析到 A2（ali，`101.133.236.111`）。两个域名必须
+生产域名 `stun1.specus.devshuai.com` 解析到 A1（ali2，`47.103.154.117`），
+`stun2.specus.devshuai.com` 解析到 A2（ali，`101.133.236.111`）。两个域名必须
 解析到不同公网 IP。STUN 响应中的 `RESPONSE-ORIGIN`、`OTHER-ADDRESS` 以及
 双节点服务自身配置仍使用 A1/A2 的真实公网 IP。
 
@@ -225,7 +225,7 @@ server 使用。此模式不会返回 `OTHER-ADDRESS`，收到 `CHANGE-REQUEST`
 会按 RFC 5780 返回 `420 Unknown Attribute`，因此不能完整区分 NAT
 映射与过滤行为。
 
-`STUN_LEGACY_SINGLE_IP_OTHER_ADDRESS=true` 仅用于兼容 shuai-tunnel
+`STUN_LEGACY_SINGLE_IP_OTHER_ADDRESS=true` 仅用于兼容 specus
 旧版单 IP / 双端口探测，不应作为公开 RFC 5780 服务配置。
 
 ## 6. Java 脚本更新

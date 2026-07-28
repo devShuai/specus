@@ -1,0 +1,38 @@
+[Unit]
+Description=specus Go server
+Documentation=https://github.com/devShuai/specus
+After=network.target
+
+[Service]
+Type=simple
+User=specus
+Group=specus
+WorkingDirectory=/var/lib/specus-server-go
+EnvironmentFile=-/etc/specus-server-go/specus-server.env
+# systemd captures the complete process output below; disable application teeing
+# even when an older environment file still defines SPECUS_LOG_FILE.
+Environment=SPECUS_LOG_FILE=
+ExecStart=/opt/specus-server-go/specus-server
+KillSignal=SIGTERM
+TimeoutStopSec=30
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0027
+LogsDirectory=specus-server-go
+LogsDirectoryMode=0750
+ReadWritePaths=/var/lib/specus-server-go /var/log/specus-server-go
+LimitNOFILE=65536
+
+# Capture slog, standard log, third-party output and runtime panics in one file.
+StandardOutput=append:/var/log/specus-server-go/specus-server.log
+StandardError=append:/var/log/specus-server-go/specus-server.log
+
+[Install]
+WantedBy=multi-user.target

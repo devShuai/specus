@@ -1,0 +1,34 @@
+[Unit]
+Description=specus C# server
+Documentation=https://github.com/devShuai/specus
+After=network.target
+
+[Service]
+Type=simple
+User=specus
+Group=specus
+WorkingDirectory=/var/lib/specus-server-csharp
+EnvironmentFile=-/etc/specus-server-csharp/specus-server.env
+ExecStart=/usr/bin/dotnet /opt/specus-server-csharp/Specus.Server.dll
+KillSignal=SIGTERM
+TimeoutStopSec=30
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0027
+ReadWritePaths=/var/lib/specus-server-csharp /var/log/specus-server-csharp
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=specus-server-csharp
+
+[Install]
+WantedBy=multi-user.target

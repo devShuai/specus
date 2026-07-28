@@ -4,10 +4,10 @@ set -euo pipefail
 # C# server rolling update
 # Usage: sudo bash update.sh <path-to-new-publish-output-dir>
 
-SERVICE_NAME="tunnel-server-csharp"
-INSTALL_DIR="/opt/tunnel-server-csharp"
+SERVICE_NAME="specus-server-csharp"
+INSTALL_DIR="/opt/specus-server-csharp"
 BACKUP_DIR="${INSTALL_DIR}/backup"
-HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:8088/health}"
+HEALTH_URL="${SPECUS_HEALTH_URL:-http://127.0.0.1:8088/health}"
 MAX_RETRIES=30
 RETRY_INTERVAL=2
 
@@ -26,12 +26,12 @@ if [[ -z "$PUBLISH_DIR" || ! -d "$PUBLISH_DIR" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${PUBLISH_DIR}/ShuaiTunnel.Server.dll" ]]; then
-  error "发布目录中未找到 ShuaiTunnel.Server.dll"
+if [[ ! -f "${PUBLISH_DIR}/Specus.Server.dll" ]]; then
+  error "发布目录中未找到 Specus.Server.dll"
   exit 1
 fi
 
-if [[ ! -f "${INSTALL_DIR}/ShuaiTunnel.Server.dll" ]]; then
+if [[ ! -f "${INSTALL_DIR}/Specus.Server.dll" ]]; then
   error "未安装的服务: ${INSTALL_DIR}"
   exit 1
 fi
@@ -47,13 +47,13 @@ log "  新发布:   ${PUBLISH_DIR}"
 
 # Backup current install
 mkdir -p "$BACKUP_DIR"
-BACKUP_FILE="${BACKUP_DIR}/tunnel-server-csharp.bak.$(date +%Y%m%d-%H%M%S)"
+BACKUP_FILE="${BACKUP_DIR}/specus-server-csharp.bak.$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_FILE"
 cp -a "${INSTALL_DIR}/." "$BACKUP_FILE/"
 log "已备份当前版本 -> $BACKUP_FILE"
 
 # Keep last 3 backups
-ls -1dt "${BACKUP_DIR}/"tunnel-server-csharp.bak.*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf --
+ls -1dt "${BACKUP_DIR}/"specus-server-csharp.bak.*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf --
 
 # Stop service
 log "停止 ${SERVICE_NAME} ..."

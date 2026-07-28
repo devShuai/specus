@@ -617,7 +617,7 @@ foreach ($node in $nodeValues) {
     }
 
     $software = ConvertTo-RequiredString `
-        (Get-MergedValue $node $defaults "software" "shuai-tunnel-rfc5780-stun") `
+        (Get-MergedValue $node $defaults "software" "specus-rfc5780-stun") `
         "nodes[$name].software"
     Assert-SafeText $software "nodes[$name].software" `
         '^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,127}$'
@@ -823,7 +823,7 @@ if (-not $DryRun -and -not (Test-Path -LiteralPath $jarPath -PathType Leaf)) {
 
 $localTempRoot = Join-Path `
     ([System.IO.Path]::GetTempPath()) `
-    ("shuai-stun-deploy-" + [System.Guid]::NewGuid().ToString("N"))
+    ("specus-stun-deploy-" + [System.Guid]::NewGuid().ToString("N"))
 $remoteStates = @()
 $deploymentSucceeded = $false
 
@@ -842,7 +842,7 @@ try {
     $deployTag = if ($DryRun) { "dry-run" } else { Get-Date -Format "yyyyMMddHHmmss" }
 
     foreach ($node in $selectedNodes) {
-        $remoteRoot = "$remoteTempRoot/shuai-stun-deploy-$deployTag-$PID-$($node.Name)"
+        $remoteRoot = "$remoteTempRoot/specus-stun-deploy-$deployTag-$PID-$($node.Name)"
         $state = [pscustomobject]@{
             Host = $node.SshHost
             Root = $remoteRoot

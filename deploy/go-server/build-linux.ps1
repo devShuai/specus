@@ -21,9 +21,9 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path (Get-Location) $OutputRoot
 }
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
-$PackageName = "shuai-tunnel-server-linux-$Architecture"
+$PackageName = "specus-server-linux-$Architecture"
 $PackageRoot = Join-Path $OutputRoot $PackageName
-$BinaryPath = Join-Path $PackageRoot "shuai-tunnel-server"
+$BinaryPath = Join-Path $PackageRoot "specus-server"
 $ArchivePath = Join-Path $OutputRoot "$PackageName.tar.gz"
 
 function Write-BuildLog {
@@ -168,7 +168,7 @@ try {
         "-trimpath",
         "-ldflags=-s -w",
         "-o", $BinaryPath,
-        "./cmd/shuai-tunnel-server"
+        "./cmd/specus-server"
     )
 } finally {
     Pop-Location
@@ -199,21 +199,21 @@ $builtAt = [DateTimeOffset]::UtcNow.ToString("o")
 $goVersion = (& $go version).Trim()
 
 $manifest = [ordered]@{
-    name         = "shuai-tunnel-server"
+    name         = "specus-server"
     target       = "linux/$Architecture"
     commit       = $commit
     dirty        = $dirty
     builtAtUtc   = $builtAt
     goVersion    = $goVersion
     cgoEnabled   = $false
-    binary       = "shuai-tunnel-server"
+    binary       = "specus-server"
     sizeBytes    = $binarySize
     sha256       = $hash
     healthPath   = "/health"
-    systemdUnit  = "tunnel-server-go.service"
+    systemdUnit  = "specus-server-go.service"
 }
 Write-Utf8NoBom (Join-Path $PackageRoot "manifest.json") (($manifest | ConvertTo-Json -Depth 4) + "`n")
-Write-Utf8NoBom (Join-Path $PackageRoot "SHA256SUMS") "$hash  shuai-tunnel-server`n"
+Write-Utf8NoBom (Join-Path $PackageRoot "SHA256SUMS") "$hash  specus-server`n"
 
 $tar = Get-Command "tar" -ErrorAction SilentlyContinue
 if ($null -ne $tar) {

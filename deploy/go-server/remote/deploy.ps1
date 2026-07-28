@@ -21,8 +21,8 @@ Set-StrictMode -Version 2.0
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
 $GoDeployRoot = Join-Path $RepoRoot "deploy/go-server"
 $BuildScript = Join-Path $GoDeployRoot "build-linux.ps1"
-$PackageRoot = Join-Path $GoDeployRoot "out/shuai-tunnel-server-linux-$Architecture"
-$BinaryPath = Join-Path $PackageRoot "shuai-tunnel-server"
+$PackageRoot = Join-Path $GoDeployRoot "out/specus-server-linux-$Architecture"
+$BinaryPath = Join-Path $PackageRoot "specus-server"
 $SystemdRoot = Join-Path $GoDeployRoot "systemd"
 $AdminWebRoot = Join-Path $RepoRoot "apps/admin-web"
 $AdminWebDist = Join-Path $AdminWebRoot "dist"
@@ -35,7 +35,7 @@ if ([string]::IsNullOrWhiteSpace($SiteUrl)) {
     $SiteUrl = if ($env:GO_SERVER_DEPLOY_SITE_URL) {
         $env:GO_SERVER_DEPLOY_SITE_URL
     } else {
-        "https://tunnel.devshuai.com"
+        "https://specus.devshuai.com"
     }
 }
 if ($HostName -notmatch '^[A-Za-z0-9][A-Za-z0-9._@-]*$') {
@@ -159,7 +159,7 @@ if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
 $ssh = Require-Command "ssh"
 $scp = Require-Command "scp"
 $timestamp = Get-Date -Format "yyyyMMddHHmmss"
-$remoteRoot = "/tmp/shuai-go-server-deploy-$timestamp-$PID-$Architecture"
+$remoteRoot = "/tmp/specus-go-server-deploy-$timestamp-$PID-$Architecture"
 $expectedMachine = if ($Architecture -eq "amd64") { "x86_64" } else { "aarch64" }
 $envDescription = if ($ReplaceJava) {
     "migrate remote Java environment with automatic rollback"
@@ -193,17 +193,17 @@ $success = $false
 $localRemoteScript = $null
 try {
     Invoke-Checked $ssh @($HostName, "umask 077 && mkdir -p -- $(ConvertTo-ShellSingleQuoted $remoteRoot)")
-    Invoke-Checked $scp @($BinaryPath, "$($HostName):$remoteRoot/shuai-tunnel-server")
+    Invoke-Checked $scp @($BinaryPath, "$($HostName):$remoteRoot/specus-server")
     Invoke-Checked $scp @("-r", $SystemdRoot, "$($HostName):$remoteRoot/systemd")
     if (-not $SkipFrontend) {
         Invoke-Checked $scp @("-r", $OpenRestyRoot, "$($HostName):$remoteRoot/openresty")
         Invoke-Checked $scp @("-r", $AdminWebDist, "$($HostName):$remoteRoot/admin-web-dist")
     }
     if (-not [string]::IsNullOrWhiteSpace($EnvFile)) {
-        Invoke-Checked $scp @($EnvFile, "$($HostName):$remoteRoot/tunnel-server.env")
+        Invoke-Checked $scp @($EnvFile, "$($HostName):$remoteRoot/specus-server.env")
     }
 
-    $remoteEnv = if ([string]::IsNullOrWhiteSpace($EnvFile)) { "" } else { "$remoteRoot/tunnel-server.env" }
+    $remoteEnv = if ([string]::IsNullOrWhiteSpace($EnvFile)) { "" } else { "$remoteRoot/specus-server.env" }
     $remoteTemplate = @'
 set -Eeuo pipefail
 
@@ -216,7 +216,7 @@ report_remote_error() {
 trap report_remote_error ERR
 
 REMOTE_ROOT=__REMOTE_ROOT__
-BINARY="$REMOTE_ROOT/shuai-tunnel-server"
+BINARY="$REMOTE_ROOT/specus-server"
 SYSTEMD_ROOT="$REMOTE_ROOT/systemd"
 ENV_FILE=__ENV_FILE__
 EXPECTED_HASH=__EXPECTED_HASH__
@@ -238,9 +238,9 @@ fi
 chmod 0755 "$BINARY"
 
 if [[ "$REPLACE_JAVA" == "true" ]]; then
-  JAVA_SERVICE="tunnel-server"
-  GO_SERVICE="tunnel-server-go"
-  JAVA_ENV="/etc/tunnel-server/tunnel-server.env"
+  JAVA_SERVICE="specus-server"
+  GO_SERVICE="specus-server-go"
+  JAVA_ENV="/etc/specus-server/specus-server.env"
 
   if ! systemctl cat "$JAVA_SERVICE.service" >/dev/null 2>&1; then
     echo "Java service is not installed: $JAVA_SERVICE" >&2
@@ -254,7 +254,7 @@ if [[ "$REPLACE_JAVA" == "true" ]]; then
   if systemctl is-active --quiet "$GO_SERVICE.service" &&
      ! systemctl is-active --quiet "$JAVA_SERVICE.service"; then
     echo "[go-server-deploy] Java has already been replaced; performing a normal Go update"
-    sudo env TUNNEL_HEALTH_URL="$HEALTH_URL" \
+    sudo env SPECUS_HEALTH_URL="$HEALTH_URL" \
       bash "$SYSTEMD_ROOT/update.sh" "$BINARY"
     exit 0
   fi
@@ -270,14 +270,14 @@ if [[ "$REPLACE_JAVA" == "true" ]]; then
     ' "$JAVA_ENV" | tr -d '\r'
   }
 
-  db_url="$(get_java_env TUNNEL_DB_URL)"
-  db_user="$(get_java_env TUNNEL_DB_USERNAME)"
-  db_password="$(get_java_env TUNNEL_DB_PASSWORD)"
+  db_url="$(get_java_env SPECUS_DB_URL)"
+  db_user="$(get_java_env SPECUS_DB_USERNAME)"
+  db_password="$(get_java_env SPECUS_DB_PASSWORD)"
   server_port="$(get_java_env SERVER_PORT)"
-  jwt_secret="$(get_java_env TUNNEL_AUTH_JWT_SECRET)"
-  auth_password="$(get_java_env TUNNEL_AUTH_PASSWORD)"
-  peer_enabled="$(get_java_env TUNNEL_PEER_MESH_ENABLED)"
-  turn_secret="$(get_java_env TUNNEL_PEER_MESH_TURN_SHARED_SECRET)"
+  jwt_secret="$(get_java_env SPECUS_AUTH_JWT_SECRET)"
+  auth_password="$(get_java_env SPECUS_AUTH_PASSWORD)"
+  peer_enabled="$(get_java_env SPECUS_PEER_MESH_ENABLED)"
+  turn_secret="$(get_java_env SPECUS_PEER_MESH_TURN_SHARED_SECRET)"
 
   case "$db_url" in
     jdbc:mysql://*) ;;
@@ -307,7 +307,7 @@ if [[ "$REPLACE_JAVA" == "true" ]]; then
     exit 74
   fi
 
-  GO_ENV_STAGE="$REMOTE_ROOT/tunnel-server-go.env"
+  GO_ENV_STAGE="$REMOTE_ROOT/specus-server-go.env"
   cleanup_staged_env() {
     rm -f -- "$GO_ENV_STAGE"
   }
@@ -316,13 +316,13 @@ if [[ "$REPLACE_JAVA" == "true" ]]; then
     {
       key=$1
       if (key=="SERVER_PORT" || key=="JAVA_OPTS" ||
-          key=="TUNNEL_DB_URL" || key=="TUNNEL_DB_DRIVER" ||
-          key=="TUNNEL_DB_USERNAME" || key=="TUNNEL_DB_PASSWORD" ||
-          key=="TUNNEL_DB_DIALECT" || key=="TUNNEL_DB_POOL_SIZE" ||
-          key=="TUNNEL_DB_BATCH_SIZE" ||
-          key=="TUNNEL_CONNECTIONSTRINGS_TUNNEL" ||
-          key=="TUNNEL_DB_CONNECTION_STRING" ||
-          key=="TUNNEL_DB_PROVIDER") {
+          key=="SPECUS_DB_URL" || key=="SPECUS_DB_DRIVER" ||
+          key=="SPECUS_DB_USERNAME" || key=="SPECUS_DB_PASSWORD" ||
+          key=="SPECUS_DB_DIALECT" || key=="SPECUS_DB_POOL_SIZE" ||
+          key=="SPECUS_DB_BATCH_SIZE" ||
+          key=="SPECUS_CONNECTIONSTRINGS_SPECUS" ||
+          key=="SPECUS_DB_CONNECTION_STRING" ||
+          key=="SPECUS_DB_PROVIDER") {
         next
       }
       print
@@ -331,27 +331,27 @@ if [[ "$REPLACE_JAVA" == "true" ]]; then
   mysql_dsn="${db_user}:${db_password}@tcp(${db_host_port})/${db_name}?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=true&loc=Asia%2FShanghai&tls=false&timeout=10s&readTimeout=30s&writeTimeout=30s"
   {
     printf '\n# Generated during Java-to-Go migration.\n'
-    printf 'TUNNEL_DB_PROVIDER=mysql\n'
-    printf 'TUNNEL_CONNECTIONSTRINGS_TUNNEL=%s\n' "$mysql_dsn"
-    printf 'TUNNEL_MANAGEMENT_ADDR=:%s\n' "$server_port"
+    printf 'SPECUS_DB_PROVIDER=mysql\n'
+    printf 'SPECUS_CONNECTIONSTRINGS_SPECUS=%s\n' "$mysql_dsn"
+    printf 'SPECUS_MANAGEMENT_ADDR=:%s\n' "$server_port"
   } >> "$GO_ENV_STAGE"
   chmod 0600 "$GO_ENV_STAGE"
 
   backup_stamp="$(date +%Y%m%d-%H%M%S)"
-  backup_dir="/var/backups/shuai-tunnel/java-to-go-$backup_stamp"
+  backup_dir="/var/backups/specus/java-to-go-$backup_stamp"
   sudo install -d -m 0700 -o root -g root "$backup_dir"
-  sudo cp -a "$JAVA_ENV" "$backup_dir/tunnel-server.env"
-  sudo cp -a /etc/systemd/system/tunnel-server.service "$backup_dir/tunnel-server.service"
-  if sudo test -f /opt/tunnel-server/tunnel-server.jar; then
-    sudo cp -a /opt/tunnel-server/tunnel-server.jar "$backup_dir/tunnel-server.jar"
+  sudo cp -a "$JAVA_ENV" "$backup_dir/specus-server.env"
+  sudo cp -a /etc/systemd/system/specus-server.service "$backup_dir/specus-server.service"
+  if sudo test -f /opt/specus-server/specus-server.jar; then
+    sudo cp -a /opt/specus-server/specus-server.jar "$backup_dir/specus-server.jar"
   fi
   echo "[go-server-deploy] Java rollback backup: $backup_dir"
   echo "[go-server-deploy] Migrated config validated: mysql, management=:$server_port, peerMesh=$peer_enabled"
 
   sudo bash "$SYSTEMD_ROOT/install.sh" "$BINARY"
   sudo systemctl disable --now "$GO_SERVICE.service" >/dev/null 2>&1 || true
-  sudo install -m 0640 -o root -g tunnel \
-    "$GO_ENV_STAGE" /etc/tunnel-server-go/tunnel-server.env
+  sudo install -m 0640 -o root -g specus \
+    "$GO_ENV_STAGE" /etc/specus-server-go/specus-server.env
 
   rollback_required=0
   rollback_java() {
@@ -432,35 +432,35 @@ if [[ "$REPLACE_JAVA" == "true" ]]; then
   exit 0
 fi
 
-if [[ -x /opt/tunnel-server-go/shuai-tunnel-server ]] &&
-   systemctl cat tunnel-server-go.service >/dev/null 2>&1; then
+if [[ -x /opt/specus-server-go/specus-server ]] &&
+   systemctl cat specus-server-go.service >/dev/null 2>&1; then
   echo "[go-server-deploy] Updating existing installation"
   if [[ -n "$ENV_FILE" ]]; then
     echo "[go-server-deploy] Existing environment file is preserved; -EnvFile only applies to first installation."
   fi
-  sudo env TUNNEL_HEALTH_URL="$HEALTH_URL" \
+  sudo env SPECUS_HEALTH_URL="$HEALTH_URL" \
     bash "$SYSTEMD_ROOT/update.sh" "$BINARY"
 else
   echo "[go-server-deploy] Performing first installation"
   sudo bash "$SYSTEMD_ROOT/install.sh" "$BINARY"
   if [[ -n "$ENV_FILE" ]]; then
-    sudo install -m 0640 -o root -g tunnel \
-      "$ENV_FILE" /etc/tunnel-server-go/tunnel-server.env
-    sudo systemctl enable --now tunnel-server-go.service
+    sudo install -m 0640 -o root -g specus \
+      "$ENV_FILE" /etc/specus-server-go/specus-server.env
+    sudo systemctl enable --now specus-server-go.service
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet tunnel-server-go.service &&
+      if systemctl is-active --quiet specus-server-go.service &&
          curl -fsS -o /dev/null "$HEALTH_URL"; then
         echo "[go-server-deploy] First installation is healthy"
         exit 0
       fi
       sleep 2
     done
-    sudo systemctl status tunnel-server-go.service --no-pager || true
+    sudo systemctl status specus-server-go.service --no-pager || true
     exit 66
   fi
   echo "[go-server-deploy] Installed but not started."
-  echo "[go-server-deploy] Edit /etc/tunnel-server-go/tunnel-server.env, then run:"
-  echo "[go-server-deploy]   sudo systemctl enable --now tunnel-server-go.service"
+  echo "[go-server-deploy] Edit /etc/specus-server-go/specus-server.env, then run:"
+  echo "[go-server-deploy]   sudo systemctl enable --now specus-server-go.service"
 fi
 '@
     $remoteCommand = $remoteTemplate.
@@ -473,7 +473,7 @@ fi
         Replace("`r`n", "`n")
 
     $localRemoteScript = Join-Path ([System.IO.Path]::GetTempPath()) `
-        "shuai-go-server-deploy-$timestamp-$PID-$Architecture.sh"
+        "specus-go-server-deploy-$timestamp-$PID-$Architecture.sh"
     if (-not $DryRun) {
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($localRemoteScript, $remoteCommand, $utf8NoBom)

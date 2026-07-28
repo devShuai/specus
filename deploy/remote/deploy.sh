@@ -8,7 +8,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 MODE="auto"
 DEPLOY_HOST="${DEPLOY_HOST:-ali2}"
-SITE_URL="${DEPLOY_SITE_URL:-https://tunnel.devshuai.com}"
+SITE_URL="${DEPLOY_SITE_URL:-https://specus.devshuai.com}"
 ASSUME_YES="false"
 DRY_RUN="false"
 NO_CLEAN="false"
@@ -34,7 +34,7 @@ Options:
   --dry-run           Print the plan and commands without building or uploading.
   --no-clean          Use Maven package without clean (explicit fallback only).
   --keep-remote-temp  Keep the successful upload directory under /tmp.
-  --include-stun      Deploy both standalone STUN nodes before tunnel-server.
+  --include-stun      Deploy both standalone STUN nodes before specus-server.
   -h, --help          Show this help.
 
 Environment:
@@ -163,7 +163,7 @@ deploy_stun() {
     args+=(-KeepRemoteTemp)
   fi
 
-  log "deploying standalone STUN nodes before tunnel-server"
+  log "deploying standalone STUN nodes before specus-server"
   print_command pwsh "${args[@]}"
   pwsh "${args[@]}"
 }
@@ -231,7 +231,7 @@ printf '  mode:       %s\n' "$MODE"
 printf '  host:       %s\n' "$DEPLOY_HOST"
 printf '  site:       %s\n' "$SITE_URL"
 if [[ "$INCLUDE_STUN" == "true" ]]; then
-  printf '  STUN:       all nodes, before tunnel-server\n'
+  printf '  STUN:       all nodes, before specus-server\n'
 else
   printf '  STUN:       not included\n'
 fi
@@ -284,11 +284,11 @@ if [[ "$DRY_RUN" != "true" ]]; then
   fi
 fi
 
-JAR_PATH="${REPO_ROOT}/implementations/java/server/target/tunnel-server-1.0-SNAPSHOT.jar"
+JAR_PATH="${REPO_ROOT}/implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar"
 ASSET_NAME="index-dry-run.js"
 
 if [[ "$DEPLOY_SERVER" == "true" ]]; then
-  maven_args=(-pl :tunnel-server -am -DskipTests)
+  maven_args=(-pl :specus-server -am -DskipTests)
   if [[ "$NO_CLEAN" == "true" ]]; then
     warn "using the explicit non-clean Maven fallback"
     maven_args+=(package)
@@ -299,14 +299,14 @@ if [[ "$DEPLOY_SERVER" == "true" ]]; then
 
   if [[ "$DRY_RUN" != "true" ]]; then
     JAR_PATH=""
-    for candidate in "${REPO_ROOT}"/implementations/java/server/target/tunnel-server-*.jar; do
+    for candidate in "${REPO_ROOT}"/implementations/java/server/target/specus-server-*.jar; do
       [[ -f "$candidate" ]] || continue
       [[ "$candidate" == *.jar.original ]] && continue
       if [[ -z "$JAR_PATH" || "$candidate" -nt "$JAR_PATH" ]]; then
         JAR_PATH="$candidate"
       fi
     done
-    [[ -n "$JAR_PATH" ]] || die "no deployable tunnel-server jar found"
+    [[ -n "$JAR_PATH" ]] || die "no deployable specus-server jar found"
   fi
 fi
 
@@ -331,7 +331,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
 else
   deploy_tag="$(date +%Y%m%d%H%M%S)-$$"
 fi
-REMOTE_ROOT="/tmp/shuai-tunnel-deploy-${deploy_tag}"
+REMOTE_ROOT="/tmp/specus-deploy-${deploy_tag}"
 DEPLOY_STARTED="false"
 DEPLOY_SUCCEEDED="false"
 
@@ -359,7 +359,7 @@ if [[ "$DRY_RUN" != "true" ]]; then
 fi
 
 if [[ "$DEPLOY_SERVER" == "true" ]]; then
-  run scp "$JAR_PATH" "${DEPLOY_HOST}:${REMOTE_ROOT}/tunnel-server.jar"
+  run scp "$JAR_PATH" "${DEPLOY_HOST}:${REMOTE_ROOT}/specus-server.jar"
   run scp -r "${REPO_ROOT}/deploy/java-server/systemd" "${DEPLOY_HOST}:${REMOTE_ROOT}/java-systemd"
 fi
 
@@ -370,7 +370,7 @@ fi
 
 if [[ "$DEPLOY_SERVER" == "true" ]]; then
   run ssh "$DEPLOY_HOST" \
-    "sudo bash ${REMOTE_ROOT}/java-systemd/update.sh ${REMOTE_ROOT}/tunnel-server.jar"
+    "sudo bash ${REMOTE_ROOT}/java-systemd/update.sh ${REMOTE_ROOT}/specus-server.jar"
 fi
 
 if [[ "$DEPLOY_FRONTEND" == "true" ]]; then
@@ -381,7 +381,7 @@ fi
 
 log "verifying remote deployment"
 if [[ "$DEPLOY_SERVER" == "true" ]]; then
-  run ssh "$DEPLOY_HOST" "systemctl is-active tunnel-server"
+  run ssh "$DEPLOY_HOST" "systemctl is-active specus-server"
 fi
 if [[ "$DEPLOY_FRONTEND" == "true" ]]; then
   run ssh "$DEPLOY_HOST" "sudo openresty -t"

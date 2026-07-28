@@ -61,8 +61,8 @@ try {
 当前本地配置已按两台服务器的实际公网和内网地址准备完成。SSH 用户、端口和
 密钥继续放在 `~/.ssh/config` 的 `ali2`、`ali` 别名中。
 
-客户端主入口使用 `stun1.tunnel.devshuai.com:34780`，解析到 A1（ali2，
-`47.103.154.117`）；备用入口使用 `stun2.tunnel.devshuai.com:34780`，解析到
+客户端主入口使用 `stun1.specus.devshuai.com:34780`，解析到 A1（ali2，
+`47.103.154.117`）；备用入口使用 `stun2.specus.devshuai.com:34780`，解析到
 A2（ali，`101.133.236.111`）。两个域名必须解析到不同公网 IP。
 `primaryPublicAddress` 和 `alternatePublicAddress` 必须继续填写真实公网 IP，
 因为 RFC 5780 响应属性需要编码 IP 地址，不能改成域名。
@@ -77,7 +77,7 @@ A2（ali，`101.133.236.111`）。两个域名必须解析到不同公网 IP。
 指标端口: 127.0.0.1:9108，仅本机
 ```
 
-若独立 STUN 与现有 `tunnel-server` 部署在同一台机器，P1/P2 不能与其
+若独立 STUN 与现有 `specus-server` 部署在同一台机器，P1/P2 不能与其
 STUN/TURN 监听端口冲突。本项目生产配置使用 `34780/udp`、`34781/udp`，保留
 `3478/udp` 给现有认证 TURN。部署脚本会在上传 JAR 前检查 UDP 业务端口、内网
 控制端口和指标端口，并打印冲突监听进程。
@@ -162,7 +162,7 @@ _stun-behavior._udp.example.com. 300 IN SRV 0 0 P1 stun.example.com.
 ```
 
 `-NoClean` 仅用于 Maven `clean` 因本地文件锁失败时显式回退到 `package`。
-`-KeepRemoteTemp` 会保留成功部署后的远端 `/tmp/shuai-stun-deploy-*` 文件。
+`-KeepRemoteTemp` 会保留成功部署后的远端 `/tmp/specus-stun-deploy-*` 文件。
 
 ## 5. 部署行为
 

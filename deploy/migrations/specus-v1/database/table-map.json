@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "tables": [
+    { "from": "tunnel_client_account", "to": "specus_client_account" },
+    { "from": "tunnel_client_auth_nonce", "to": "specus_client_auth_nonce" },
+    { "from": "tunnel_client_credential", "to": "specus_client_credential" },
+    { "from": "tunnel_websocket_ticket", "to": "specus_websocket_ticket" },
+    { "from": "tunnel_client_identity", "to": "specus_client_identity" },
+    { "from": "tunnel_client_session", "to": "specus_client_session" },
+    { "from": "tunnel_management_user", "to": "specus_management_user" },
+    { "from": "tunnel_management_user_email", "to": "specus_management_user_email" },
+    {
+      "from": "tunnel_management_registration_challenge",
+      "to": "specus_management_registration_challenge"
+    },
+    { "from": "tunnel_connection_record", "to": "specus_connection_record" },
+    { "from": "tunnel_connection_stat", "to": "specus_connection_stat" },
+    { "from": "tunnel_mapping", "to": "specus_mapping" },
+    { "from": "tunnel_traffic_usage", "to": "specus_traffic_usage" },
+    {
+      "from": "tunnel_resource_traffic_usage",
+      "to": "specus_resource_traffic_usage"
+    },
+    {
+      "from": "tunnel_http_traffic_exchange",
+      "to": "specus_http_traffic_exchange"
+    },
+    { "from": "tunnel_tcp_traffic_frame", "to": "specus_tcp_traffic_frame" },
+    { "from": "tunnel_http_media_capture", "to": "specus_http_media_capture" },
+    {
+      "from": "tunnel_http_media_reference",
+      "to": "specus_http_media_reference"
+    },
+    { "from": "tunnel_session", "to": "specus_session" }
+  ]
+}

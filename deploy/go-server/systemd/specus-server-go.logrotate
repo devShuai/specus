@@ -1,4 +1,4 @@
-/var/log/tunnel-server-go/tunnel-server.log {
+/var/log/specus-server-go/specus-server.log {
     daily
     maxsize 50M
     rotate 14
@@ -7,5 +7,5 @@
     missingok
     notifempty
     copytruncate
-    su tunnel tunnel
+    su specus specus
 }

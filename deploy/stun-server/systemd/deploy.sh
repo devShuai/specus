@@ -4,8 +4,8 @@ set -euo pipefail
 JAR_SRC="${1:-}"
 ENV_SRC="${2:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JAR_DEST="/opt/shuai-stun-server/stun-server.jar"
-ENV_DEST="/etc/shuai-stun-server/stun-server.env"
+JAR_DEST="/opt/specus-stun-server/stun-server.jar"
+ENV_DEST="/etc/specus-stun-server/stun-server.env"
 
 if [[ $EUID -ne 0 ]]; then
   echo "[ERR] 请使用 root 或 sudo 运行" >&2

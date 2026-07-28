@@ -8,13 +8,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
 PUBLISH_DIR="${1:-${REPO_ROOT}/implementations/csharp/server/publish}"
-SERVICE_NAME="tunnel-server-csharp"
-INSTALL_DIR="/opt/tunnel-server-csharp"
-CONFIG_DIR="/etc/tunnel-server-csharp"
-DATA_DIR="/var/lib/tunnel-server-csharp"
-LOG_DIR="/var/log/tunnel-server-csharp"
-USER="tunnel"
-GROUP="tunnel"
+SERVICE_NAME="specus-server-csharp"
+INSTALL_DIR="/opt/specus-server-csharp"
+CONFIG_DIR="/etc/specus-server-csharp"
+DATA_DIR="/var/lib/specus-server-csharp"
+LOG_DIR="/var/log/specus-server-csharp"
+USER="specus"
+GROUP="specus"
 
 if [[ $EUID -ne 0 ]]; then
   echo "请以 root 身份运行" >&2
@@ -27,8 +27,8 @@ if [[ ! -d "$PUBLISH_DIR" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${PUBLISH_DIR}/ShuaiTunnel.Server.dll" ]]; then
-  echo "发布目录中未找到 ShuaiTunnel.Server.dll" >&2
+if [[ ! -f "${PUBLISH_DIR}/Specus.Server.dll" ]]; then
+  echo "发布目录中未找到 Specus.Server.dll" >&2
   exit 1
 fi
 
@@ -54,20 +54,20 @@ if [[ -d "${INSTALL_DIR}/wwwroot" ]]; then
 fi
 
 # Install env template (never overwrite live env)
-cp "$SCRIPT_DIR/tunnel-server.env.example" "$CONFIG_DIR/tunnel-server.env.example"
-if [[ ! -f "$CONFIG_DIR/tunnel-server.env" ]]; then
-  cp "$SCRIPT_DIR/tunnel-server.env.example" "$CONFIG_DIR/tunnel-server.env"
-  chmod 0640 "$CONFIG_DIR/tunnel-server.env"
-  chown "$USER:$GROUP" "$CONFIG_DIR/tunnel-server.env"
-  echo "已创建 $CONFIG_DIR/tunnel-server.env — 请编辑后启动服务"
+cp "$SCRIPT_DIR/specus-server.env.example" "$CONFIG_DIR/specus-server.env.example"
+if [[ ! -f "$CONFIG_DIR/specus-server.env" ]]; then
+  cp "$SCRIPT_DIR/specus-server.env.example" "$CONFIG_DIR/specus-server.env"
+  chmod 0640 "$CONFIG_DIR/specus-server.env"
+  chown "$USER:$GROUP" "$CONFIG_DIR/specus-server.env"
+  echo "已创建 $CONFIG_DIR/specus-server.env — 请编辑后启动服务"
 fi
 
 # Install systemd unit
-cp "$SCRIPT_DIR/tunnel-server-csharp.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/specus-server-csharp.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 
 echo "C# server 安装完成"
 echo "  - 安装目录: $INSTALL_DIR"
-echo "  - 配置:     $CONFIG_DIR/tunnel-server.env"
+echo "  - 配置:     $CONFIG_DIR/specus-server.env"
 echo "  - 启动:     sudo systemctl start $SERVICE_NAME"

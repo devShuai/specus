@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tunnel-server systemd 一键安装脚本
+# specus-server systemd 一键安装脚本
 #
 # 用法（root 或 sudo 执行）：
-#   sudo ./install.sh /path/to/tunnel-server-1.0-SNAPSHOT.jar
+#   sudo ./install.sh /path/to/specus-server-1.0-SNAPSHOT.jar
 #
 # 流程：
 #   1) 校验 Java 21+ 与 root 权限
-#   2) 创建 tunnel 系统账号（无登录 shell、无家目录）
+#   2) 创建 specus 系统账号（无登录 shell、无家目录）
 #   3) 准备目录：
-#        /opt/tunnel-server          —— 存放 jar
-#        /etc/tunnel-server          —— 存放环境变量文件
-#        /var/lib/tunnel-server      —— 工作目录（fallback SQLite / 临时数据）
-#        /var/log/tunnel-server      —— 应用滚动日志（同时保留 journald）
+#        /opt/specus-server          —— 存放 jar
+#        /etc/specus-server          —— 存放环境变量文件
+#        /var/lib/specus-server      —— 工作目录（fallback SQLite / 临时数据）
+#        /var/log/specus-server      —— 应用滚动日志（同时保留 journald）
 #   4) 拷贝 jar、systemd unit、env 模板
 #   5) systemctl daemon-reload + enable
 #
-# 不会自动启动服务 —— 需要先编辑 /etc/tunnel-server/tunnel-server.env
+# 不会自动启动服务 —— 需要先编辑 /etc/specus-server/specus-server.env
 # 填好 MySQL 连接信息、管理员密码、JWT 密钥和可选 ES 配置后再执行：
-#   systemctl start tunnel-server
-#   systemctl status tunnel-server
-#   journalctl -u tunnel-server -f
+#   systemctl start specus-server
+#   systemctl status specus-server
+#   journalctl -u specus-server -f
 # =============================================================================
 set -euo pipefail
 
 JAR_SRC="${1:-}"
-APP_USER="tunnel"
-APP_GROUP="tunnel"
-INSTALL_DIR="/opt/tunnel-server"
-CONFIG_DIR="/etc/tunnel-server"
-DATA_DIR="/var/lib/tunnel-server"
-LOG_DIR="/var/log/tunnel-server"
+APP_USER="specus"
+APP_GROUP="specus"
+INSTALL_DIR="/opt/specus-server"
+CONFIG_DIR="/etc/specus-server"
+DATA_DIR="/var/lib/specus-server"
+LOG_DIR="/var/log/specus-server"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------- 0. 前置检查 ----------
@@ -40,7 +40,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if [[ -z "$JAR_SRC" ]]; then
-  echo "用法: $0 /path/to/tunnel-server-x.y.z.jar" >&2
+  echo "用法: $0 /path/to/specus-server-x.y.z.jar" >&2
   exit 1
 fi
 
@@ -78,24 +78,24 @@ install -d -m 0750 -o "$APP_USER" -g "$APP_GROUP" "$DATA_DIR"
 install -d -m 0750 -o "$APP_USER" -g "$APP_GROUP" "$LOG_DIR"
 
 # ---------- 3. 拷贝 jar ----------
-install -m 0644 -o root -g root "$JAR_SRC" "$INSTALL_DIR/tunnel-server.jar"
-echo "[OK] jar 已部署到 $INSTALL_DIR/tunnel-server.jar"
+install -m 0644 -o root -g root "$JAR_SRC" "$INSTALL_DIR/specus-server.jar"
+echo "[OK] jar 已部署到 $INSTALL_DIR/specus-server.jar"
 
 # ---------- 4. 拷贝 systemd unit ----------
-install -m 0644 -o root -g root "$SCRIPT_DIR/tunnel-server.service" \
-        /etc/systemd/system/tunnel-server.service
+install -m 0644 -o root -g root "$SCRIPT_DIR/specus-server.service" \
+        /etc/systemd/system/specus-server.service
 echo "[OK] systemd unit 已部署"
 
 # ---------- 5. 拷贝环境变量模板（仅当目标不存在时） ----------
-ENV_FILE="$CONFIG_DIR/tunnel-server.env"
-ENV_EXAMPLE_FILE="$CONFIG_DIR/tunnel-server.env.example"
+ENV_FILE="$CONFIG_DIR/specus-server.env"
+ENV_EXAMPLE_FILE="$CONFIG_DIR/specus-server.env.example"
 install -m 0640 -o root -g "$APP_GROUP" \
-        "$SCRIPT_DIR/tunnel-server.env.example" "$ENV_EXAMPLE_FILE"
+        "$SCRIPT_DIR/specus-server.env.example" "$ENV_EXAMPLE_FILE"
 echo "[OK] 最新环境变量模板已部署到 $ENV_EXAMPLE_FILE"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   install -m 0640 -o root -g "$APP_GROUP" \
-          "$SCRIPT_DIR/tunnel-server.env.example" "$ENV_FILE"
+          "$SCRIPT_DIR/specus-server.env.example" "$ENV_FILE"
   echo "[OK] 环境变量模板已部署到 $ENV_FILE"
   echo "     ⚠️  请编辑该文件，填好 MySQL 连接信息、管理员密码、JWT 密钥后再启动服务"
 else
@@ -105,8 +105,8 @@ fi
 
 # ---------- 6. 注册 systemd 服务 ----------
 systemctl daemon-reload
-systemctl enable tunnel-server.service >/dev/null
-echo "[OK] tunnel-server.service 已启用（开机自启）"
+systemctl enable specus-server.service >/dev/null
+echo "[OK] specus-server.service 已启用（开机自启）"
 
 cat <<EOF
 
@@ -116,18 +116,18 @@ cat <<EOF
   1. 编辑环境变量：
        sudo vim $ENV_FILE
      至少修改：
-       TUNNEL_DB_URL / TUNNEL_DB_USERNAME / TUNNEL_DB_PASSWORD
-       TUNNEL_AUTH_PASSWORD
-       TUNNEL_AUTH_JWT_SECRET   (openssl rand -base64 48)
+       SPECUS_DB_URL / SPECUS_DB_USERNAME / SPECUS_DB_PASSWORD
+       SPECUS_AUTH_PASSWORD
+       SPECUS_AUTH_JWT_SECRET   (openssl rand -base64 48)
      可选修改：
-       TUNNEL_PUBLIC_ADDRESS
-       TUNNEL_ELASTICSEARCH_URIS / TUNNEL_ELASTICSEARCH_USERNAME / TUNNEL_ELASTICSEARCH_PASSWORD
-       TUNNEL_AUTH_TENANT_ID / TUNNEL_OIDC_TENANT_CLAIM
+       SPECUS_PUBLIC_ADDRESS
+       SPECUS_ELASTICSEARCH_URIS / SPECUS_ELASTICSEARCH_USERNAME / SPECUS_ELASTICSEARCH_PASSWORD
+       SPECUS_AUTH_TENANT_ID / SPECUS_OIDC_TENANT_CLAIM
 
   2. 启动服务：
-       sudo systemctl start tunnel-server
-       sudo systemctl status tunnel-server
-       sudo tail -F $LOG_DIR/tunnel-server.log
-       sudo journalctl -u tunnel-server -f
+       sudo systemctl start specus-server
+       sudo systemctl status specus-server
+       sudo tail -F $LOG_DIR/specus-server.log
+       sudo journalctl -u specus-server -f
 ============================================================
 EOF

@@ -1,35 +1,35 @@
 [Unit]
-Description=Shuai Tunnel Server
-Documentation=https://github.com/devShuai/shuai-tunnel
+Description=specus Server
+Documentation=https://github.com/devShuai/specus
 After=network-online.target
 Wants=network-online.target
-# 如果 MySQL 与 tunnel-server 部署在同一台机器，取消下面这行的注释，
-# 让 systemd 在数据库启动后再拉起 tunnel-server。
+# 如果 MySQL 与 specus-server 部署在同一台机器，取消下面这行的注释，
+# 让 systemd 在数据库启动后再拉起 specus-server。
 #After=mysqld.service
 
 [Service]
 Type=simple
 
-# 运行账号 —— 推荐使用 install.sh 自动创建的 tunnel 系统账号
-User=tunnel
-Group=tunnel
+# 运行账号 —— 推荐使用 install.sh 自动创建的 specus 系统账号
+User=specus
+Group=specus
 
 # 工作目录用于存放运行时产物（如 fallback 的 SQLite 文件、临时文件等）
-WorkingDirectory=/var/lib/tunnel-server
+WorkingDirectory=/var/lib/specus-server
 
 # 默认 JVM 参数为空；真实部署建议在 EnvironmentFile 里设置 JAVA_OPTS。
-# Linux 默认同时写入滚动文件；EnvironmentFile 可覆盖 TUNNEL_LOG_FILE。
+# Linux 默认同时写入滚动文件；EnvironmentFile 可覆盖 SPECUS_LOG_FILE。
 Environment=JAVA_OPTS=
-Environment=TUNNEL_LOG_FILE=/var/log/tunnel-server/tunnel-server.log
+Environment=SPECUS_LOG_FILE=/var/log/specus-server/specus-server.log
 
 # 环境变量文件（前导的 - 表示文件不存在时不报错；建议把所有数据库 / 密钥配置写到这里）
-EnvironmentFile=-/etc/tunnel-server/tunnel-server.env
+EnvironmentFile=-/etc/specus-server/specus-server.env
 
 # 启动命令
 #   --enable-native-access=ALL-UNNAMED 与 spring-boot-maven-plugin 中的 jvmArguments 保持一致，
 #   消除 Java 21 关于 native access 的告警。
 #   通过环境变量 JAVA_OPTS 追加额外 JVM 参数（如 -Xmx512m）。
-ExecStart=/usr/bin/java $JAVA_OPTS --enable-native-access=ALL-UNNAMED -jar /opt/tunnel-server/tunnel-server.jar
+ExecStart=/usr/bin/java $JAVA_OPTS --enable-native-access=ALL-UNNAMED -jar /opt/specus-server/specus-server.jar
 
 # 优雅停机：Spring Boot 默认监听 SIGTERM，给 30 秒处理在途连接
 KillSignal=SIGTERM
@@ -40,10 +40,10 @@ SuccessExitStatus=143
 Restart=on-failure
 RestartSec=5s
 
-# 控制台日志保留在 journald，应用同时写入 /var/log/tunnel-server/tunnel-server.log
+# 控制台日志保留在 journald，应用同时写入 /var/log/specus-server/specus-server.log
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=tunnel-server
+SyslogIdentifier=specus-server
 
 # 安全加固
 NoNewPrivileges=true
@@ -52,9 +52,9 @@ ProtectSystem=full
 ProtectHome=true
 UMask=0027
 # 仅允许写入工作目录与日志目录
-ReadWritePaths=/var/lib/tunnel-server /var/log/tunnel-server
+ReadWritePaths=/var/lib/specus-server /var/log/specus-server
 
-# 文件描述符上限：tunnel-server 会维护大量并发隧道连接，建议放宽
+# 文件描述符上限：specus-server 会维护大量并发隧道连接，建议放宽
 LimitNOFILE=65536
 
 [Install]

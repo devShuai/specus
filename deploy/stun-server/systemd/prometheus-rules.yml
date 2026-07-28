@@ -1,15 +1,15 @@
 groups:
-  - name: shuai-stun
+  - name: specus-stun
     rules:
-      - alert: ShuaiStunMetricsDown
-        expr: up{job="shuai-stun"} == 0
+      - alert: SpecusStunMetricsDown
+        expr: up{job="specus-stun"} == 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "Shuai STUN metrics endpoint is unavailable"
+          summary: "Specus STUN metrics endpoint is unavailable"
 
-      - alert: ShuaiStunNoSuccessfulResponses
+      - alert: SpecusStunNoSuccessfulResponses
         expr: |
           sum(rate(stun_packets_received_total[5m])) > 1
           and sum(rate(stun_responses_total{code="200"}[5m])) == 0
@@ -19,7 +19,7 @@ groups:
         annotations:
           summary: "STUN receives traffic but sends no successful Binding responses"
 
-      - alert: ShuaiStunHighRateLimitDropRatio
+      - alert: SpecusStunHighRateLimitDropRatio
         expr: |
           sum(rate(stun_packets_dropped_total{reason=~"(global|source)_rate_limit|source_table_full"}[5m]))
           / clamp_min(sum(rate(stun_packets_received_total[5m])), 1) > 0.20
@@ -29,7 +29,7 @@ groups:
         annotations:
           summary: "More than 20% of STUN traffic is being rate limited"
 
-      - alert: ShuaiStunMalformedTrafficSpike
+      - alert: SpecusStunMalformedTrafficSpike
         expr: |
           sum(rate(stun_packets_dropped_total{reason="malformed"}[5m]))
           / clamp_min(sum(rate(stun_packets_received_total[5m])), 1) > 0.10
@@ -39,7 +39,7 @@ groups:
         annotations:
           summary: "Malformed STUN traffic exceeds 10%"
 
-      - alert: ShuaiStunSourceTableNearCapacity
+      - alert: SpecusStunSourceTableNearCapacity
         expr: stun_tracked_sources > 60000
         for: 10m
         labels:
@@ -47,7 +47,7 @@ groups:
         annotations:
           summary: "STUN source limiter table is near its default capacity"
 
-      - alert: ShuaiStunDistributedControlRejected
+      - alert: SpecusStunDistributedControlRejected
         expr: |
           sum(rate(stun_distributed_forward_total{
             event!~"sent|received"
@@ -58,7 +58,7 @@ groups:
         annotations:
           summary: "Distributed STUN control packets are being rejected"
 
-      - alert: ShuaiStunDistributedPeerUnavailable
+      - alert: SpecusStunDistributedPeerUnavailable
         expr: |
           sum(rate(stun_distributed_forward_total{event="sent"}[5m])) > 0.1
           and sum(rate(stun_distributed_forward_total{event="received"}[5m])) == 0

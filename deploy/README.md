@@ -8,10 +8,13 @@ Deployment files are organized by runtime target.
 - `go-server`: Linux cross-build packaging, SSH remote deployment, and systemd install/update scripts for the Go server.
 - `csharp-server/systemd`: Linux systemd install/update scripts for the framework-dependent .NET server publish output.
 - `openresty`: OpenResty configuration and helper script for serving the admin web as cached,
-  pre-compressed static files while proxying API/WebSocket traffic to tunnel-server.
+  pre-compressed static files while proxying API/WebSocket traffic to specus-server.
 - `remote`: macOS/Linux Bash and Windows PowerShell entry points that build the current workspace,
   upload it over SSH, reuse the Java/OpenResty update scripts, and verify the remote deployment;
   the optional `IncludeStun` stage first updates and verifies both standalone STUN nodes.
+- `migrations/specus-v1`: one-way migration package for legacy environment variables,
+  service names and paths, plus SQLite, PostgreSQL, and MySQL schema/database names.
+  Run its plan mode before deploying a Specus binary.
 
 The C server keeps its lightweight systemd example under
 `implementations/c/server/deploy/systemd`. Future targets such as Docker should be added as sibling directories.

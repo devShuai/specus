@@ -18,7 +18,7 @@ if ([string]::IsNullOrWhiteSpace($HostName)) {
     $HostName = if ($env:DEPLOY_HOST) { $env:DEPLOY_HOST } else { "ali2" }
 }
 if ([string]::IsNullOrWhiteSpace($SiteUrl)) {
-    $SiteUrl = if ($env:DEPLOY_SITE_URL) { $env:DEPLOY_SITE_URL } else { "https://tunnel.devshuai.com" }
+    $SiteUrl = if ($env:DEPLOY_SITE_URL) { $env:DEPLOY_SITE_URL } else { "https://specus.devshuai.com" }
 }
 
 if ($HostName -notmatch '^[A-Za-z0-9][A-Za-z0-9._@-]*$') {
@@ -127,7 +127,7 @@ function Invoke-StunDeployment {
         $arguments += "-KeepRemoteTemp"
     }
 
-    Write-DeployLog "deploying standalone STUN nodes before tunnel-server"
+    Write-DeployLog "deploying standalone STUN nodes before specus-server"
     $display = @($ScriptPath) + @($arguments | ForEach-Object { Format-CommandArgument $_ })
     Write-Host ("+ & " + ($display -join " "))
     & $ScriptPath @parameters
@@ -183,7 +183,7 @@ try {
     Write-Host "  mode:       $Mode"
     Write-Host "  host:       $HostName"
     Write-Host "  site:       $SiteUrl"
-    Write-Host "  STUN:       $(if ($IncludeStun) { 'all nodes, before tunnel-server' } else { 'not included' })"
+    Write-Host "  STUN:       $(if ($IncludeStun) { 'all nodes, before specus-server' } else { 'not included' })"
     Write-Host "  git branch: $branch"
     if ($changedPaths.Count -gt 0) {
         Write-Host "  workspace changes ($($changedPaths.Count)):"
@@ -228,11 +228,11 @@ try {
         }
     }
 
-    $jarPath = Join-Path $RepoRoot "implementations/java/server/target/tunnel-server-1.0-SNAPSHOT.jar"
+    $jarPath = Join-Path $RepoRoot "implementations/java/server/target/specus-server-1.0-SNAPSHOT.jar"
     $assetName = "index-dry-run.js"
 
     if ($deployServer) {
-        $mavenArguments = @("-pl", ":tunnel-server", "-am", "-DskipTests")
+        $mavenArguments = @("-pl", ":specus-server", "-am", "-DskipTests")
         if ($NoClean) {
             Write-Warning "Using the explicit non-clean Maven fallback."
             $mavenArguments += "package"
@@ -242,11 +242,11 @@ try {
         Invoke-DeployCommand $maven $mavenArguments
 
         if (-not $DryRun) {
-            $jar = Get-ChildItem (Join-Path $RepoRoot "implementations/java/server/target/tunnel-server-*.jar") |
+            $jar = Get-ChildItem (Join-Path $RepoRoot "implementations/java/server/target/specus-server-*.jar") |
                 Where-Object { $_.Name -notlike "*.jar.original" } |
                 Sort-Object LastWriteTimeUtc -Descending |
                 Select-Object -First 1
-            if ($null -eq $jar) { throw "No deployable tunnel-server jar found." }
+            if ($null -eq $jar) { throw "No deployable specus-server jar found." }
             $jarPath = $jar.FullName
         }
     }
@@ -269,7 +269,7 @@ try {
     }
 
     $deployTag = if ($DryRun) { "dry-run" } else { Get-Date -Format "yyyyMMddHHmmss" }
-    $remoteRoot = "/tmp/shuai-tunnel-deploy-$deployTag-$PID"
+    $remoteRoot = "/tmp/specus-deploy-$deployTag-$PID"
     $deploymentStarted = $false
     $deploymentSucceeded = $false
 
@@ -278,7 +278,7 @@ try {
         if (-not $DryRun) { $deploymentStarted = $true }
 
         if ($deployServer) {
-            Invoke-DeployCommand $scp @($jarPath, "${HostName}:${remoteRoot}/tunnel-server.jar")
+            Invoke-DeployCommand $scp @($jarPath, "${HostName}:${remoteRoot}/specus-server.jar")
             Invoke-DeployCommand $scp @("-r", (Join-Path $RepoRoot "deploy/java-server/systemd"), "${HostName}:${remoteRoot}/java-systemd")
         }
         if ($deployFrontend) {
@@ -287,7 +287,7 @@ try {
         }
 
         if ($deployServer) {
-            Invoke-DeployCommand $ssh @($HostName, "sudo bash $remoteRoot/java-systemd/update.sh $remoteRoot/tunnel-server.jar")
+            Invoke-DeployCommand $ssh @($HostName, "sudo bash $remoteRoot/java-systemd/update.sh $remoteRoot/specus-server.jar")
         }
         if ($deployFrontend) {
             Invoke-DeployCommand $ssh @($HostName, "sudo env ADMIN_WEB_DIST=$remoteRoot/admin-web-dist bash $remoteRoot/openresty/install-admin-web.sh")
@@ -296,7 +296,7 @@ try {
 
         Write-DeployLog "verifying remote deployment"
         if ($deployServer) {
-            Invoke-DeployCommand $ssh @($HostName, "systemctl is-active tunnel-server")
+            Invoke-DeployCommand $ssh @($HostName, "systemctl is-active specus-server")
         }
         if ($deployFrontend) {
             Invoke-DeployCommand $ssh @($HostName, "sudo openresty -t")

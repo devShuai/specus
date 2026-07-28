@@ -5,12 +5,12 @@ set -euo pipefail
 # Usage: sudo bash update.sh <path-to-new-binary>
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_NAME="tunnel-server-go"
-INSTALL_DIR="/opt/tunnel-server-go"
+SERVICE_NAME="specus-server-go"
+INSTALL_DIR="/opt/specus-server-go"
 BACKUP_DIR="${INSTALL_DIR}/backup"
-LOG_DIR="/var/log/tunnel-server-go"
-LOG_FILE="$LOG_DIR/tunnel-server.log"
-HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:8088/health}"
+LOG_DIR="/var/log/specus-server-go"
+LOG_FILE="$LOG_DIR/specus-server.log"
+HEALTH_URL="${SPECUS_HEALTH_URL:-http://127.0.0.1:8088/health}"
 MAX_RETRIES=30
 RETRY_INTERVAL=2
 
@@ -38,8 +38,8 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -f "${INSTALL_DIR}/shuai-tunnel-server" ]]; then
-  error "未安装的服务: ${INSTALL_DIR}/shuai-tunnel-server"
+if [[ ! -f "${INSTALL_DIR}/specus-server" ]]; then
+  error "未安装的服务: ${INSTALL_DIR}/specus-server"
   exit 1
 fi
 
@@ -48,33 +48,33 @@ if ! systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
   exit 1
 fi
 
-if [[ "$(realpath "$BINARY")" == "${INSTALL_DIR}/shuai-tunnel-server" ]]; then
+if [[ "$(realpath "$BINARY")" == "${INSTALL_DIR}/specus-server" ]]; then
   error "源文件和目标文件相同，无法更新"
   exit 1
 fi
 
 log "准备升级 Go server"
-log "  当前二进制: ${INSTALL_DIR}/shuai-tunnel-server"
+log "  当前二进制: ${INSTALL_DIR}/specus-server"
 log "  新二进制: $BINARY"
 
 # Sync the unit and template without replacing the live environment file.
-install -d -m 0750 -o tunnel -g tunnel "$LOG_DIR"
+install -d -m 0750 -o specus -g specus "$LOG_DIR"
 touch "$LOG_FILE"
-chown tunnel:tunnel "$LOG_FILE"
+chown specus:specus "$LOG_FILE"
 chmod 0640 "$LOG_FILE"
 install -m 0644 -o root -g root \
-  "${SCRIPT_DIR}/tunnel-server-go.service" /etc/systemd/system/tunnel-server-go.service
+  "${SCRIPT_DIR}/specus-server-go.service" /etc/systemd/system/specus-server-go.service
 install -m 0644 -o root -g root \
-  "${SCRIPT_DIR}/tunnel-server.env.example" /etc/tunnel-server-go/tunnel-server.env.example
+  "${SCRIPT_DIR}/specus-server.env.example" /etc/specus-server-go/specus-server.env.example
 install -m 0644 -o root -g root \
-  "${SCRIPT_DIR}/tunnel-server-go.logrotate" /etc/logrotate.d/tunnel-server-go
+  "${SCRIPT_DIR}/specus-server-go.logrotate" /etc/logrotate.d/specus-server-go
 systemctl daemon-reload
 log "已同步 systemd unit、环境变量模板与日志轮转配置"
 
 # Backup current binary
 mkdir -p "$BACKUP_DIR"
-BACKUP_FILE="${BACKUP_DIR}/shuai-tunnel-server.bak.$(date +%Y%m%d-%H%M%S)"
-cp "${INSTALL_DIR}/shuai-tunnel-server" "$BACKUP_FILE"
+BACKUP_FILE="${BACKUP_DIR}/specus-server.bak.$(date +%Y%m%d-%H%M%S)"
+cp "${INSTALL_DIR}/specus-server" "$BACKUP_FILE"
 log "已备份当前二进制 -> $BACKUP_FILE"
 
 # Keep last 5 backups
@@ -86,7 +86,7 @@ systemctl stop "$SERVICE_NAME" 2>/dev/null || true
 sleep 1
 
 # Replace binary
-install -m 0755 "$BINARY" "${INSTALL_DIR}/shuai-tunnel-server"
+install -m 0755 "$BINARY" "${INSTALL_DIR}/specus-server"
 log "已替换二进制"
 
 # Start service
@@ -119,7 +119,7 @@ done
 
 if [[ "${HEALTH_OK:-false}" == "true" ]]; then
   log "升级成功 ✅"
-  log "  当前二进制: ${INSTALL_DIR}/shuai-tunnel-server"
+  log "  当前二进制: ${INSTALL_DIR}/specus-server"
   log "  回滚备份:  $BACKUP_FILE"
   log "  完整日志:  $LOG_FILE"
   exit 0
@@ -128,7 +128,7 @@ fi
 # Rollback
 log "健康检查失败，执行回滚..."
 systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-cp "$BACKUP_FILE" "${INSTALL_DIR}/shuai-tunnel-server"
+cp "$BACKUP_FILE" "${INSTALL_DIR}/specus-server"
 systemctl start "$SERVICE_NAME"
 sleep 3
 

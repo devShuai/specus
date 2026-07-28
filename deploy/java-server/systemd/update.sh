@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tunnel-server 滚动更新脚本
+# specus-server 滚动更新脚本
 #
 # 用法（root 或 sudo 执行）：
-#   sudo ./update.sh /path/to/tunnel-server-x.y.z.jar
+#   sudo ./update.sh /path/to/specus-server-x.y.z.jar
 #
 # 流程：
 #   1) 校验前置条件（root / jar 存在 / 服务已通过 install.sh 安装过）
 #   2) 同步最新 systemd unit 与 env.example（不覆盖真实 env）
-#   3) 备份当前 jar 为 tunnel-server.jar.bak.<timestamp>，保留最近 5 份
-#   4) systemctl stop tunnel-server（等优雅停机；超时后 SIGKILL）
+#   3) 备份当前 jar 为 specus-server.jar.bak.<timestamp>，保留最近 5 份
+#   4) systemctl stop specus-server（等优雅停机；超时后 SIGKILL）
 #   5) 拷新 jar
-#   6) systemctl start tunnel-server
+#   6) systemctl start specus-server
 #   7) 健康检查：
-#        - 等服务 active（默认最多 60s，可用 TUNNEL_ACTIVE_TIMEOUT_SEC 覆盖）
-#        - actuator /health 状态 UP（默认最多 120s，可用 TUNNEL_HEALTH_TIMEOUT_SEC 覆盖）
+#        - 等服务 active（默认最多 60s，可用 SPECUS_ACTIVE_TIMEOUT_SEC 覆盖）
+#        - actuator /health 状态 UP（默认最多 120s，可用 SPECUS_HEALTH_TIMEOUT_SEC 覆盖）
 #   8) 任一步失败 → 回滚到上一份 bak 并重启
 #
 # 退出码：
@@ -23,17 +23,17 @@
 set -euo pipefail
 
 JAR_SRC="${1:-}"
-SERVICE="tunnel-server"
-INSTALL_DIR="/opt/tunnel-server"
-JAR_DEST="$INSTALL_DIR/tunnel-server.jar"
-CONFIG_DIR="${TUNNEL_CONFIG_DIR:-/etc/tunnel-server}"
-LOG_DIR="/var/log/tunnel-server"
-ENV_FILE="$CONFIG_DIR/tunnel-server.env"
-ENV_EXAMPLE_FILE="$CONFIG_DIR/tunnel-server.env.example"
+SERVICE="specus-server"
+INSTALL_DIR="/opt/specus-server"
+JAR_DEST="$INSTALL_DIR/specus-server.jar"
+CONFIG_DIR="${SPECUS_CONFIG_DIR:-/etc/specus-server}"
+LOG_DIR="/var/log/specus-server"
+ENV_FILE="$CONFIG_DIR/specus-server.env"
+ENV_EXAMPLE_FILE="$CONFIG_DIR/specus-server.env.example"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_KEEP=5
-ACTIVE_TIMEOUT_SEC="${TUNNEL_ACTIVE_TIMEOUT_SEC:-60}"
-HEALTH_TIMEOUT_SEC="${TUNNEL_HEALTH_TIMEOUT_SEC:-120}"
+ACTIVE_TIMEOUT_SEC="${SPECUS_ACTIVE_TIMEOUT_SEC:-60}"
+HEALTH_TIMEOUT_SEC="${SPECUS_HEALTH_TIMEOUT_SEC:-120}"
 
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 fail() { printf '[%s] [ERR] %s\n' "$(date '+%F %T')" "$*" >&2; }
@@ -59,15 +59,15 @@ read_env_value() {
   fi
 }
 
-HEALTH_PORT="${TUNNEL_HEALTH_PORT:-$(read_env_value SERVER_PORT 8088)}"
-HEALTH_URL="${TUNNEL_HEALTH_URL:-http://127.0.0.1:${HEALTH_PORT}/actuator/health}"
+HEALTH_PORT="${SPECUS_HEALTH_PORT:-$(read_env_value SERVER_PORT 8088)}"
+HEALTH_URL="${SPECUS_HEALTH_URL:-http://127.0.0.1:${HEALTH_PORT}/actuator/health}"
 
 # ---------- 0. 前置检查 ----------
 if [[ $EUID -ne 0 ]]; then
   fail "请使用 root 或 sudo 运行"; exit 1
 fi
 if [[ -z "$JAR_SRC" ]]; then
-  fail "用法: $0 /path/to/tunnel-server-x.y.z.jar"; exit 1
+  fail "用法: $0 /path/to/specus-server-x.y.z.jar"; exit 1
 fi
 if [[ ! -f "$JAR_SRC" ]]; then
   fail "jar 文件不存在: $JAR_SRC"; exit 1
@@ -85,17 +85,17 @@ if [[ "$(readlink -f "$JAR_SRC")" == "$(readlink -f "$JAR_DEST")" ]]; then
 fi
 
 sync_deploy_files() {
-  local unit_src="$SCRIPT_DIR/tunnel-server.service"
-  local env_example_src="$SCRIPT_DIR/tunnel-server.env.example"
+  local unit_src="$SCRIPT_DIR/specus-server.service"
+  local env_example_src="$SCRIPT_DIR/specus-server.env.example"
   local env_group="root"
 
-  if getent group tunnel >/dev/null; then
-    env_group="tunnel"
+  if getent group specus >/dev/null; then
+    env_group="specus"
   fi
 
   if [[ -f "$unit_src" ]]; then
-    install -m 0644 -o root -g root "$unit_src" /etc/systemd/system/tunnel-server.service
-    log "已同步 systemd unit -> /etc/systemd/system/tunnel-server.service"
+    install -m 0644 -o root -g root "$unit_src" /etc/systemd/system/specus-server.service
+    log "已同步 systemd unit -> /etc/systemd/system/specus-server.service"
   fi
 
   if [[ -f "$env_example_src" ]]; then
@@ -107,8 +107,8 @@ sync_deploy_files() {
     fi
   fi
 
-  if id -u tunnel >/dev/null 2>&1 && getent group tunnel >/dev/null; then
-    install -d -m 0750 -o tunnel -g tunnel "$LOG_DIR"
+  if id -u specus >/dev/null 2>&1 && getent group specus >/dev/null; then
+    install -d -m 0750 -o specus -g specus "$LOG_DIR"
     log "已确认日志目录 -> $LOG_DIR"
   fi
 
@@ -125,12 +125,12 @@ log "  新   jar: $JAR_SRC (${NEW_SIZE} bytes)"
 
 # ---------- 1. 备份 ----------
 TS="$(date +%Y%m%d-%H%M%S)"
-BACKUP="$INSTALL_DIR/tunnel-server.jar.bak.$TS"
+BACKUP="$INSTALL_DIR/specus-server.jar.bak.$TS"
 install -m 0644 -o root -g root "$JAR_DEST" "$BACKUP"
 log "已备份当前 jar -> $BACKUP"
 
 # 保留最近 BACKUP_KEEP 份，老的删掉
-ls -1t "$INSTALL_DIR"/tunnel-server.jar.bak.* 2>/dev/null \
+ls -1t "$INSTALL_DIR"/specus-server.jar.bak.* 2>/dev/null \
   | tail -n +$((BACKUP_KEEP + 1)) \
   | xargs -r rm -f || true
 
@@ -198,6 +198,6 @@ fi
 log "升级成功 ✅"
 log "  - 当前运行 jar: $(readlink -f "$JAR_DEST")"
 log "  - 回滚备份:    $BACKUP"
-log "  - 文件日志:    $LOG_DIR/tunnel-server.log"
+log "  - 文件日志:    $LOG_DIR/specus-server.log"
 log "  - systemd 日志: journalctl -u $SERVICE -f"
 exit 0

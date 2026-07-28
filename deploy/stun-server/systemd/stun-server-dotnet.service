@@ -1,6 +1,6 @@
 [Unit]
-Description=Shuai Tunnel Standalone RFC 5780 STUN Server (.NET)
-Documentation=https://github.com/devShuai/shuai-tunnel
+Description=specus Standalone RFC 5780 STUN Server (.NET)
+Documentation=https://github.com/devShuai/specus
 After=network-online.target
 Wants=network-online.target
 
@@ -8,13 +8,13 @@ Wants=network-online.target
 Type=simple
 User=stun
 Group=stun
-WorkingDirectory=/var/lib/shuai-stun-server
-EnvironmentFile=/etc/shuai-stun-server/stun-server.env
+WorkingDirectory=/var/lib/specus-stun-server
+EnvironmentFile=/etc/specus-stun-server/stun-server.env
 
 # A self-contained single-file publish can replace both commands with the
-# published ShuaiTunnel.StunServer executable.
-ExecStartPre=/usr/bin/dotnet /opt/shuai-stun-server/dotnet/ShuaiTunnel.StunServer.dll --check-config
-ExecStart=/usr/bin/dotnet /opt/shuai-stun-server/dotnet/ShuaiTunnel.StunServer.dll
+# published Specus.StunServer executable.
+ExecStartPre=/usr/bin/dotnet /opt/specus-stun-server/dotnet/Specus.StunServer.dll --check-config
+ExecStart=/usr/bin/dotnet /opt/specus-stun-server/dotnet/Specus.StunServer.dll
 
 KillSignal=SIGTERM
 TimeoutStopSec=10
@@ -23,7 +23,7 @@ RestartSec=3s
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=shuai-stun-server-dotnet
+SyslogIdentifier=specus-stun-server-dotnet
 
 NoNewPrivileges=true
 PrivateTmp=true
@@ -35,7 +35,7 @@ ProtectControlGroups=true
 ProtectProc=invisible
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6
-ReadWritePaths=/var/lib/shuai-stun-server
+ReadWritePaths=/var/lib/specus-stun-server
 UMask=0027
 LimitNOFILE=4096
 TasksMax=96
