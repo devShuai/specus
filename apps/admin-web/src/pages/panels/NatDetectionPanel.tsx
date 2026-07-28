@@ -767,14 +767,21 @@ function NatDetectStage({
           </p>
         </div>
 
-        <NatDetectionOrb
-          embedded={embedded}
-          checking={checking}
-          result={result}
-          progress={progress}
-          onRun={onRun}
-          onCancel={onCancel}
-        />
+        <div className="relative w-full">
+          <NatStageChannel
+            state={checking ? "checking" : result ? "complete" : "idle"}
+            tone={outcome?.tone ?? null}
+            embedded={embedded}
+          />
+          <NatDetectionOrb
+            embedded={embedded}
+            checking={checking}
+            result={result}
+            progress={progress}
+            onRun={onRun}
+            onCancel={onCancel}
+          />
+        </div>
 
         <details className="group w-full rounded-lg border glass glass-border px-3 py-2 text-left text-small">
           <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-zinc-700 transition-colors hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-white">
@@ -909,6 +916,92 @@ const NAT_PHASE_ACCENTS: Record<NatCheckProgressPhase, string> = {
   complete: "#30d158",
 };
 
+/** 渠水染成结论色：直连顺畅是 emerald，受阻依次转 amber / rose。 */
+const NAT_CHANNEL_TONE_WATER: Record<BrowserNatOutcome["tone"], string> = {
+  default: "#94a3b8",
+  primary: "var(--specus-accent)",
+  success: "#10b981",
+  warning: "#f59e0b",
+  danger: "#f43f5e",
+};
+
+/** 渠面漂移的光点：节奏错开，读起来像持续的来水。 */
+const NAT_CHANNEL_DOTS = [
+  { duration: "6.4s", delay: "0s" },
+  { duration: "8.2s", delay: "2.1s" },
+  { duration: "7.3s", delay: "4.2s" },
+] as const;
+
+/**
+ * 检测台的意象底座：一条水渠横贯检测球后方——检测球就是渠上的中央拱。
+ *
+ * 水流即检测：待命时渠水静静流淌；检测中水流加速、染成品牌蓝；
+ * 出结果后渠水染成结论色，直连受阻（warning / danger）时流速骤降、
+ * 光点隐去，像渠里断了水——能不能打洞，看这条渠就知道。
+ *
+ * 构图刻意只做「槽沿 + 水面 + 槽底」三道细线：检测球本身已是视觉中心，
+ * 再叠拱券会和它打架（落地页主视觉才承担完整渠体）。
+ */
+function NatStageChannel({
+  state,
+  tone,
+  embedded,
+}: {
+  state: "idle" | "checking" | "complete";
+  tone: BrowserNatOutcome["tone"] | null;
+  embedded: boolean;
+}) {
+  const blocked = state === "complete" && (tone === "warning" || tone === "danger");
+  const waterColor = state === "checking"
+    ? "var(--specus-accent)"
+    : state === "complete" && tone
+      ? NAT_CHANNEL_TONE_WATER[tone]
+      : "var(--specus-water)";
+  const style = {
+    top: embedded ? 32 : 56,
+    "--nat-channel-water": waterColor,
+  } as CSSProperties;
+
+  return (
+    <div
+      aria-hidden="true"
+      className={`nat-stage-channel${state === "checking" ? " nat-stage-channel-checking" : ""}${blocked ? " nat-stage-channel-blocked" : ""}`}
+      style={style}
+    >
+      <svg className="block h-full w-full" viewBox="0 0 1200 48" preserveAspectRatio="xMidYMid slice" fill="none">
+        <defs>
+          <linearGradient id="nat-channel-fade" x1="0" y1="0" x2="1200" y2="0" gradientUnits="userSpaceOnUse">
+            <stop offset="0" style={{ stopColor: "var(--specus-stroke)" }} stopOpacity="0" />
+            <stop offset="0.18" style={{ stopColor: "var(--specus-stroke)" }} stopOpacity="0.4" />
+            <stop offset="0.5" style={{ stopColor: "var(--specus-stroke)" }} stopOpacity="0.6" />
+            <stop offset="0.82" style={{ stopColor: "var(--specus-stroke)" }} stopOpacity="0.4" />
+            <stop offset="1" style={{ stopColor: "var(--specus-stroke)" }} stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id="nat-channel-water-fade" x1="0" y1="0" x2="1200" y2="0" gradientUnits="userSpaceOnUse">
+            <stop offset="0" style={{ stopColor: "var(--nat-channel-water, var(--specus-water))" }} stopOpacity="0" />
+            <stop offset="0.14" style={{ stopColor: "var(--nat-channel-water, var(--specus-water))" }} stopOpacity="1" />
+            <stop offset="0.86" style={{ stopColor: "var(--nat-channel-water, var(--specus-water))" }} stopOpacity="1" />
+            <stop offset="1" style={{ stopColor: "var(--nat-channel-water, var(--specus-water))" }} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {/* 槽沿与槽底 */}
+        <path d="M0 16 H1200" stroke="url(#nat-channel-fade)" strokeWidth="1.75" strokeLinecap="round" />
+        <path d="M0 32 H1200" stroke="url(#nat-channel-fade)" strokeWidth="1.25" strokeLinecap="round" opacity="0.7" />
+        {/* 槽中水面：dash march 模拟流动 */}
+        <path d="M0 24 H1200" stroke="url(#nat-channel-water-fade)" strokeWidth="4" strokeLinecap="round" className="specus-water-march" />
+      </svg>
+      {NAT_CHANNEL_DOTS.map((dot) => (
+        <span
+          key={dot.delay}
+          className="nat-channel-dot"
+          style={{ animationDuration: dot.duration, animationDelay: dot.delay }}
+        />
+      ))}
+    </div>
+  );
+}
+
+
 function NatDetectionOrb({
   embedded,
   checking,
@@ -945,7 +1038,7 @@ function NatDetectionOrb({
       : "点我检测";
 
   return (
-    <div className="flex min-w-0 flex-col items-center justify-center gap-3">
+    <div className="relative flex min-w-0 flex-col items-center justify-center gap-3">
       {checking && (
         <span
           className="sr-only"
@@ -1063,10 +1156,13 @@ function NatOutcomeCard({
 }) {
   return (
     <article className={`nat-result-reveal relative overflow-hidden rounded-2xl border p-5 shadow-sm sm:p-6 ${outcome.frameClass}`}>
-      <span className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}`} aria-hidden="true" />
+      <span
+        className={`nat-outcome-bar absolute inset-x-0 top-0 h-1 overflow-hidden ${natToneBg(outcome.tone)}${outcome.tone === "success" || outcome.tone === "primary" ? " nat-outcome-bar-flow" : ""}`}
+        aria-hidden="true"
+      />
       <div className="flex flex-wrap items-start gap-4 pt-1">
         <div
-          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl shadow-sm ${outcome.markerClass}`}
+          className={`nat-outcome-marker flex h-14 w-14 shrink-0 items-center justify-center shadow-sm ${outcome.markerClass}`}
           aria-hidden="true"
         >
           <StatusGlyph color={outcome.tone} className="h-6 w-6" />
@@ -1768,6 +1864,28 @@ const NAT_LEVEL_GUIDE = [
   },
 ] as const;
 
+/**
+ * 分级徽章里的拱洞：拱顶的数字是基石，拱下的开口是通过性——
+ * NAT1 完全开敞，NAT2 收窄，NAT3 半掩，NAT4 几乎封死。
+ * 能不能直连，一眼从拱洞读出来。
+ */
+function NatLevelArchGlyph({ level }: { level: BrowserNatLevel }) {
+  return (
+    <svg viewBox="0 0 36 44" fill="none" aria-hidden="true" className="absolute inset-x-[4px] bottom-[2px] top-[13px] h-auto w-[calc(100%-8px)]">
+      <path d="M7 42 V20 A11 11 0 0 1 29 20 V42" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+      {level === 2 && (
+        <path d="M13 42 V27 A5 5 0 0 1 23 27 V42" stroke="currentColor" strokeWidth="1.6" opacity="0.75" />
+      )}
+      {level === 3 && (
+        <path d="M10.5 31 H25.5" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" opacity="0.85" />
+      )}
+      {level === 4 && (
+        <path d="M9 42 V30.5 H27 V42 Z" fill="currentColor" opacity="0.85" />
+      )}
+    </svg>
+  );
+}
+
 function NatTypeGuide({
   probeConfig,
   compact = false,
@@ -1829,8 +1947,9 @@ function NatTypeGuide({
                 </span>
               )}
               <div className="flex items-start gap-3">
-                <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md border font-mono text-small font-semibold ${item.badge}`}>
-                  {item.level}
+                <span className={`nat-level-badge font-mono ${item.badge}`}>
+                  <NatLevelArchGlyph level={item.level} />
+                  <span className="nat-level-badge-num">{item.level}</span>
                 </span>
                 <div className="min-w-0">
                   <h3 className="text-base font-semibold text-zinc-950 dark:text-white">{item.title}</h3>

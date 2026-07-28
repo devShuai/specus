@@ -109,12 +109,21 @@ body {
   /* 浅色页 logo 去掉黑底：渠线改深色，直接落在页面底色上 */
   --logo-mark-bg: transparent;
   --logo-mark-fg: #14161f;
+  /* specus 品牌色（渠体描边 / 动作蓝 / 渠水）：全站可用，落地页在此之上微调 */
+  --specus-stroke: #14161f;
+  --specus-accent: #0066cc;
+  --specus-water: #0ea5e9;
+  --specus-water-bright: #38bdf8;
 }
 
 .dark {
   color-scheme: dark;
   --logo-mark-bg: #14161f;
   --logo-mark-fg: #f2f3f7;
+  --specus-stroke: #f2f3f7;
+  --specus-accent: #2997ff;
+  --specus-water: #22d3ee;
+  --specus-water-bright: #67e8f9;
 }
 
 .light [data-slot="input-wrapper"][data-focus="true"],
@@ -2361,11 +2370,7 @@ body {
   /* 与标识、favicon 同源的动作蓝：深色底用亮蓝、浅色底用深蓝 */
   --landing-action: #0066cc;
   --landing-action-soft: rgba(122, 92, 230, 0.1);
-  --specus-stroke: #14161f;
-  --specus-accent: #0066cc;
-  /* 渠水与石材质感 */
-  --specus-water: #0ea5e9;
-  --specus-water-bright: #38bdf8;
+  /* 渠水的辉光（落地页主视觉专用；渠体 / 渠水本色在 .light / .dark 上） */
   --specus-hero-glow: rgba(56, 189, 248, 0.13);
   --specus-hero-glow-accent: rgba(0, 102, 204, 0.08);
   --landing-canvas: #f5f5f7;
@@ -2384,10 +2389,6 @@ body {
 .dark .landing-apple {
   --landing-action: #2997ff;
   --landing-action-soft: rgba(155, 130, 255, 0.16);
-  --specus-stroke: #f2f3f7;
-  --specus-accent: #2997ff;
-  --specus-water: #22d3ee;
-  --specus-water-bright: #67e8f9;
   --specus-hero-glow: rgba(34, 211, 238, 0.1);
   --specus-hero-glow-accent: rgba(41, 151, 255, 0.09);
   --landing-canvas: #000000;
@@ -5046,6 +5047,95 @@ body {
   }
 }
 
+/* 检测台底座：迷你引水渠横贯检测球后方，检测球即中央拱。
+   渠水的颜色与流速随状态走（--nat-channel-water 由组件内联注入）。 */
+.nat-stage-channel {
+  position: absolute;
+  inset-inline: 0;
+  z-index: 0;
+  height: 48px;
+  pointer-events: none;
+  user-select: none;
+}
+
+.nat-stage-channel-checking .specus-water-march {
+  animation-duration: 0.7s;
+}
+
+/* 直连受阻：渠水变缓，像断流前的滞涩 */
+.nat-stage-channel-blocked .specus-water-march {
+  animation-duration: 5s;
+}
+
+/* 渠面漂移的光点：左进右出，两端淡入淡出 */
+.nat-channel-dot {
+  position: absolute;
+  top: calc(50% - 2.5px);
+  left: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--nat-channel-water, var(--specus-water));
+  box-shadow: 0 0 8px 1px color-mix(in srgb, var(--nat-channel-water, var(--specus-water)) 65%, transparent);
+  opacity: 0;
+  animation: nat-channel-drift 8s linear infinite;
+}
+
+/* 受阻时光点隐去：渠里不再有活水 */
+.nat-stage-channel-blocked .nat-channel-dot {
+  display: none;
+}
+
+@keyframes nat-channel-drift {
+  0% { left: -3%; opacity: 0; }
+  6% { opacity: 0.95; }
+  94% { opacity: 0.95; }
+  100% { left: 103%; opacity: 0; }
+}
+
+/* NAT1-4 分级徽章：拱形小章，数字是基石，开口大小即直连难度 */
+.nat-level-badge {
+  position: relative;
+  display: block;
+  width: 40px;
+  height: 46px;
+  flex-shrink: 0;
+  border-width: 1.5px;
+  border-style: solid;
+  border-radius: 20px 20px 7px 7px;
+}
+
+.nat-level-badge-num {
+  position: absolute;
+  top: 3px;
+  right: 0;
+  left: 0;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+}
+
+/* 结果卡的状态石：上圆下方的拱形瓷砖，与意象小章同一造型 */
+.nat-outcome-marker {
+  border-radius: 20px 20px 9px 9px;
+}
+
+/* 直连可达：结果条上流动的水光 */
+.nat-outcome-bar-flow {
+  background-image: repeating-linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.85) 0 9px,
+    transparent 9px 20px
+  );
+  background-size: 20px 100%;
+  animation: nat-bar-water 1.15s linear infinite;
+}
+
+@keyframes nat-bar-water {
+  to { background-position: 20px 0; }
+}
+
 /* NAT detection keeps its motion budget in one place: the browser/STUN probe orb. */
 .nat-hero-glow::before {
   position: absolute;
@@ -5388,8 +5478,19 @@ body {
   background: var(--app-apple-line, rgba(29, 29, 31, 0.12));
 }
 
+/* 已完成的步骤之间是一小段通了水的渠：dash 流动，与检测台的渠面同源 */
 .nat-step-done .nat-step-line {
-  background: color-mix(in srgb, var(--app-apple-blue, #0066cc) 45%, transparent);
+  background: repeating-linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--specus-water, #0ea5e9) 75%, transparent) 0 4px,
+    transparent 4px 8px
+  );
+  background-size: 8px 100%;
+  animation: nat-step-water 900ms linear infinite;
+}
+
+@keyframes nat-step-water {
+  to { background-position: 8px 0; }
 }
 
 @keyframes nat-step-dot-pulse {
@@ -5406,10 +5507,30 @@ body {
   .nat-result-reveal,
   .nat-outcome-marker,
   .nat-outcome-bar::after,
+  .nat-outcome-bar-flow,
   .nat-level-segment.is-on,
+  .nat-step-done .nat-step-line,
   .nat-step-done .nat-step-dot svg path,
   .nat-step-active .nat-step-dot {
     animation: none !important;
+  }
+
+  /* 渠面光点静止驻留，位置错开，仍读得出是水面 */
+  .nat-channel-dot {
+    animation: none;
+    opacity: 0.55;
+  }
+
+  .nat-channel-dot:nth-of-type(1) {
+    left: 12%;
+  }
+
+  .nat-channel-dot:nth-of-type(2) {
+    left: 46%;
+  }
+
+  .nat-channel-dot:nth-of-type(3) {
+    left: 78%;
   }
 }
 
