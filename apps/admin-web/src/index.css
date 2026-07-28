@@ -2303,7 +2303,7 @@ body {
    定高 + slice 裁剪，窄屏切掉两侧拱券而不是把整体缩到看不清 */
 .specus-aqueduct-bleed {
   width: 100%;
-  height: clamp(220px, 26vw, 340px);
+  height: clamp(220px, 25vw, 420px);
 }
 
 .specus-aqueduct {
