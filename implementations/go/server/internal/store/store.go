@@ -146,7 +146,7 @@ func (db *DB) migrate() error {
 }
 
 func (db *DB) detectClientAuthNonceLayout() error {
-	hasID, err := db.columnExists("tunnel_client_auth_nonce", "id")
+	hasID, err := db.columnExists("specus_client_auth_nonce", "id")
 	if err != nil {
 		return fmt.Errorf("inspect Java client nonce schema: %w", err)
 	}
@@ -154,12 +154,12 @@ func (db *DB) detectClientAuthNonceLayout() error {
 		db.clientAuthNonceLayout = clientAuthNonceLayoutJavaID
 		return nil
 	}
-	hasNonceHash, err := db.columnExists("tunnel_client_auth_nonce", "nonce_hash")
+	hasNonceHash, err := db.columnExists("specus_client_auth_nonce", "nonce_hash")
 	if err != nil {
 		return fmt.Errorf("inspect client nonce schema: %w", err)
 	}
 	if !hasNonceHash {
-		return fmt.Errorf("unsupported tunnel_client_auth_nonce schema: expected id or nonce_hash")
+		return fmt.Errorf("unsupported specus_client_auth_nonce schema: expected id or nonce_hash")
 	}
 	db.clientAuthNonceLayout = clientAuthNonceLayoutComposite
 	return nil
@@ -183,33 +183,33 @@ func (db *DB) ensureCompatibleColumns() error {
 		name       string
 		definition string
 	}{
-		{"tunnel_connection_record", "tenant_id", "VARCHAR(80)"},
-		{"tunnel_connection_stat", "tenant_id", "VARCHAR(80)"},
-		{"tunnel_traffic_usage", "tenant_id", "VARCHAR(80)"},
-		{"tunnel_mapping", "detail_capture_enabled", boolType},
-		{"tunnel_mapping", "tenant_id", "VARCHAR(80)"},
+		{"specus_connection_record", "tenant_id", "VARCHAR(80)"},
+		{"specus_connection_stat", "tenant_id", "VARCHAR(80)"},
+		{"specus_traffic_usage", "tenant_id", "VARCHAR(80)"},
+		{"specus_mapping", "detail_capture_enabled", boolType},
+		{"specus_mapping", "tenant_id", "VARCHAR(80)"},
 		{"http_route_mapping", "detail_capture_enabled", boolType},
 		{"http_route_mapping", "path_rewrite_enabled", boolType},
 		{"http_route_mapping", "tenant_id", "VARCHAR(80)"},
-		{"tunnel_client_session", "message_send_capable", clientCapabilityBoolType},
-		{"tunnel_client_session", "message_receive_capable", clientCapabilityBoolType},
-		{"tunnel_client_session", "message_attachments_capable", clientCapabilityBoolType},
-		{"tunnel_client_session", "message_media_preview_capable", clientCapabilityBoolType},
-		{"tunnel_client_session", "message_max_attachment_bytes", "BIGINT NOT NULL DEFAULT 0"},
+		{"specus_client_session", "message_send_capable", clientCapabilityBoolType},
+		{"specus_client_session", "message_receive_capable", clientCapabilityBoolType},
+		{"specus_client_session", "message_attachments_capable", clientCapabilityBoolType},
+		{"specus_client_session", "message_media_preview_capable", clientCapabilityBoolType},
+		{"specus_client_session", "message_max_attachment_bytes", "BIGINT NOT NULL DEFAULT 0"},
 		{"peer_mesh_device", "nat_mapping_behavior", "VARCHAR(80)"},
 		{"peer_mesh_device", "nat_filtering_behavior", "VARCHAR(80)"},
 		{"peer_mesh_device", "nat_behavior_discovery", "VARCHAR(40)"},
 		{"peer_mesh_acl", "direction", "VARCHAR(16) NOT NULL DEFAULT 'OUTBOUND'"},
-		{"tunnel_websocket_ticket", "attributes_json", ticketAttributesType},
-		{"tunnel_websocket_ticket", "username", "VARCHAR(80)"},
-		{"tunnel_websocket_ticket", "tenant_id", "VARCHAR(80)"},
-		{"tunnel_websocket_ticket", "is_admin", boolType},
-		{"tunnel_websocket_ticket", "room_id", "VARCHAR(120)"},
-		{"tunnel_websocket_ticket", "room_key", "VARCHAR(80)"},
-		{"tunnel_websocket_ticket", "room_role", "VARCHAR(16)"},
-		{"tunnel_websocket_ticket", "peer_id", "VARCHAR(120)"},
-		{"tunnel_websocket_ticket", "display_name", "VARCHAR(120)"},
-		{"tunnel_websocket_ticket", "shared_room", boolType},
+		{"specus_websocket_ticket", "attributes_json", ticketAttributesType},
+		{"specus_websocket_ticket", "username", "VARCHAR(80)"},
+		{"specus_websocket_ticket", "tenant_id", "VARCHAR(80)"},
+		{"specus_websocket_ticket", "is_admin", boolType},
+		{"specus_websocket_ticket", "room_id", "VARCHAR(120)"},
+		{"specus_websocket_ticket", "room_key", "VARCHAR(80)"},
+		{"specus_websocket_ticket", "room_role", "VARCHAR(16)"},
+		{"specus_websocket_ticket", "peer_id", "VARCHAR(120)"},
+		{"specus_websocket_ticket", "display_name", "VARCHAR(120)"},
+		{"specus_websocket_ticket", "shared_room", boolType},
 	}
 	for _, column := range columns {
 		if err := db.ensureColumn(column.table, column.name, column.definition); err != nil {
@@ -219,56 +219,56 @@ func (db *DB) ensureCompatibleColumns() error {
 	if err := db.ensurePostgresClientMessageCapabilityTypes(); err != nil {
 		return err
 	}
-	if err := db.ensureIndex("idx_tunnel_connection_tenant", "tunnel_connection_record", "tenant_id"); err != nil {
+	if err := db.ensureIndex("idx_specus_connection_tenant", "specus_connection_record", "tenant_id"); err != nil {
 		return err
 	}
-	if _, err := db.sql.Exec(db.rebind(`UPDATE tunnel_connection_stat
+	if _, err := db.sql.Exec(db.rebind(`UPDATE specus_connection_stat
 		SET tenant_id = COALESCE(
-			(SELECT c.tenant_id FROM tunnel_client_account c WHERE c.id = tunnel_connection_stat.client_id LIMIT 1),
-			(SELECT c.tenant_id FROM tunnel_client_account c WHERE tunnel_connection_stat.client_id IS NULL
-				AND c.client_name = tunnel_connection_stat.client_name LIMIT 1),
+			(SELECT c.tenant_id FROM specus_client_account c WHERE c.id = specus_connection_stat.client_id LIMIT 1),
+			(SELECT c.tenant_id FROM specus_client_account c WHERE specus_connection_stat.client_id IS NULL
+				AND c.client_name = specus_connection_stat.client_name LIMIT 1),
 			tenant_id,
 			'default')
 		WHERE tenant_id IS NULL OR tenant_id = '' OR tenant_id = 'default'`)); err != nil {
-		return fmt.Errorf("backfill tunnel_connection_stat tenant_id: %w", err)
+		return fmt.Errorf("backfill specus_connection_stat tenant_id: %w", err)
 	}
-	if err := db.ensureIndex("idx_tunnel_connection_stat_tenant", "tunnel_connection_stat", "tenant_id"); err != nil {
+	if err := db.ensureIndex("idx_specus_connection_stat_tenant", "specus_connection_stat", "tenant_id"); err != nil {
 		return err
 	}
-	for _, table := range []string{"tunnel_mapping", "http_route_mapping"} {
+	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
 		statement := fmt.Sprintf(`UPDATE %s SET tenant_id = COALESCE(
-			(SELECT c.tenant_id FROM tunnel_client_account c WHERE c.id = %s.client_id LIMIT 1),
+			(SELECT c.tenant_id FROM specus_client_account c WHERE c.id = %s.client_id LIMIT 1),
 			tenant_id, 'default') WHERE tenant_id IS NULL OR tenant_id = ''`, table, table)
 		if _, err := db.sql.Exec(db.rebind(statement)); err != nil {
 			return fmt.Errorf("backfill %s tenant_id: %w", table, err)
 		}
 	}
 	indexes := []struct{ name, table, columns string }{
-		{"idx_tunnel_connection_tenant_id", "tunnel_connection_record", "tenant_id, id"},
-		{"idx_tunnel_connection_tenant_client_id", "tunnel_connection_record", "tenant_id, client_id, id"},
-		{"idx_tunnel_connection_tenant_success", "tunnel_connection_record", "tenant_id, success"},
-		{"idx_tunnel_connection_tenant_client_time", "tunnel_connection_record", "tenant_id, client_id, connected_at"},
-		{"idx_tunnel_mapping_tenant_client_id", "tunnel_mapping", "tenant_id, client_id, id"},
-		{"idx_tunnel_mapping_tenant_client_enabled_id", "tunnel_mapping", "tenant_id, client_id, enabled, id"},
+		{"idx_specus_connection_tenant_id", "specus_connection_record", "tenant_id, id"},
+		{"idx_specus_connection_tenant_client_id", "specus_connection_record", "tenant_id, client_id, id"},
+		{"idx_specus_connection_tenant_success", "specus_connection_record", "tenant_id, success"},
+		{"idx_specus_connection_tenant_client_time", "specus_connection_record", "tenant_id, client_id, connected_at"},
+		{"idx_specus_mapping_tenant_client_id", "specus_mapping", "tenant_id, client_id, id"},
+		{"idx_specus_mapping_tenant_client_enabled_id", "specus_mapping", "tenant_id, client_id, enabled, id"},
 		{"idx_http_route_tenant_client_id", "http_route_mapping", "tenant_id, client_id, id"},
 		{"idx_http_route_tenant_client_enabled_id", "http_route_mapping", "tenant_id, client_id, enabled, id"},
 		{"idx_http_route_tenant_client_route", "http_route_mapping", "tenant_id, client_id, route"},
-		{"idx_tunnel_traffic_tenant_date_id", "tunnel_traffic_usage", "tenant_id, usage_date, id"},
-		{"idx_tunnel_traffic_tenant_client_date_id", "tunnel_traffic_usage", "tenant_id, client_id, usage_date, id"},
-		{"idx_resource_traffic_tenant_date_id", "tunnel_resource_traffic_usage", "tenant_id, usage_date, id"},
-		{"idx_resource_traffic_tenant_client_date_id", "tunnel_resource_traffic_usage", "tenant_id, client_id, usage_date, id"},
-		{"idx_resource_traffic_tenant_type_date_id", "tunnel_resource_traffic_usage", "tenant_id, resource_type, usage_date, id"},
-		{"idx_resource_traffic_tenant_client_type_date_id", "tunnel_resource_traffic_usage", "tenant_id, client_id, resource_type, usage_date, id"},
-		{"idx_http_exchange_tenant_id", "tunnel_http_traffic_exchange", "tenant_id, id"},
-		{"idx_http_exchange_tenant_client_id", "tunnel_http_traffic_exchange", "tenant_id, client_id, id"},
-		{"idx_http_exchange_tenant_route_id", "tunnel_http_traffic_exchange", "tenant_id, route, id"},
-		{"idx_http_exchange_tenant_client_route_id", "tunnel_http_traffic_exchange", "tenant_id, client_id, route, id"},
-		{"idx_http_exchange_tenant_body_type_id", "tunnel_http_traffic_exchange", "tenant_id, response_body_type, id"},
-		{"idx_tcp_frame_tenant_id", "tunnel_tcp_traffic_frame", "tenant_id, id"},
-		{"idx_tcp_frame_tenant_client_id", "tunnel_tcp_traffic_frame", "tenant_id, client_id, id"},
-		{"idx_tcp_frame_tenant_port_id", "tunnel_tcp_traffic_frame", "tenant_id, listen_port, id"},
-		{"idx_tcp_frame_tenant_client_port_id", "tunnel_tcp_traffic_frame", "tenant_id, client_id, listen_port, id"},
-		{"idx_tcp_frame_tenant_channel_id", "tunnel_tcp_traffic_frame", "tenant_id, channel_id, id"},
+		{"idx_specus_traffic_tenant_date_id", "specus_traffic_usage", "tenant_id, usage_date, id"},
+		{"idx_specus_traffic_tenant_client_date_id", "specus_traffic_usage", "tenant_id, client_id, usage_date, id"},
+		{"idx_resource_traffic_tenant_date_id", "specus_resource_traffic_usage", "tenant_id, usage_date, id"},
+		{"idx_resource_traffic_tenant_client_date_id", "specus_resource_traffic_usage", "tenant_id, client_id, usage_date, id"},
+		{"idx_resource_traffic_tenant_type_date_id", "specus_resource_traffic_usage", "tenant_id, resource_type, usage_date, id"},
+		{"idx_resource_traffic_tenant_client_type_date_id", "specus_resource_traffic_usage", "tenant_id, client_id, resource_type, usage_date, id"},
+		{"idx_http_exchange_tenant_id", "specus_http_traffic_exchange", "tenant_id, id"},
+		{"idx_http_exchange_tenant_client_id", "specus_http_traffic_exchange", "tenant_id, client_id, id"},
+		{"idx_http_exchange_tenant_route_id", "specus_http_traffic_exchange", "tenant_id, route, id"},
+		{"idx_http_exchange_tenant_client_route_id", "specus_http_traffic_exchange", "tenant_id, client_id, route, id"},
+		{"idx_http_exchange_tenant_body_type_id", "specus_http_traffic_exchange", "tenant_id, response_body_type, id"},
+		{"idx_tcp_frame_tenant_id", "specus_tcp_traffic_frame", "tenant_id, id"},
+		{"idx_tcp_frame_tenant_client_id", "specus_tcp_traffic_frame", "tenant_id, client_id, id"},
+		{"idx_tcp_frame_tenant_port_id", "specus_tcp_traffic_frame", "tenant_id, listen_port, id"},
+		{"idx_tcp_frame_tenant_client_port_id", "specus_tcp_traffic_frame", "tenant_id, client_id, listen_port, id"},
+		{"idx_tcp_frame_tenant_channel_id", "specus_tcp_traffic_frame", "tenant_id, channel_id, id"},
 	}
 	for _, index := range indexes {
 		if err := db.ensureIndex(index.name, index.table, index.columns); err != nil {
@@ -301,19 +301,19 @@ func (db *DB) ensurePostgresClientMessageCapabilityTypes() error {
 		var dataType string
 		err := tx.QueryRow(`SELECT data_type FROM information_schema.columns
 			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2`,
-			"tunnel_client_session", column).Scan(&dataType)
+			"specus_client_session", column).Scan(&dataType)
 		if err != nil {
-			return fmt.Errorf("inspect tunnel_client_session.%s type: %w", column, err)
+			return fmt.Errorf("inspect specus_client_session.%s type: %w", column, err)
 		}
 		switch strings.ToLower(strings.TrimSpace(dataType)) {
 		case "boolean":
 			continue
 		case "smallint", "integer", "bigint":
 			if _, err := tx.Exec(postgresClientCapabilityBooleanMigration(column)); err != nil {
-				return fmt.Errorf("convert tunnel_client_session.%s to boolean: %w", column, err)
+				return fmt.Errorf("convert specus_client_session.%s to boolean: %w", column, err)
 			}
 		default:
-			return fmt.Errorf("cannot safely convert tunnel_client_session.%s from PostgreSQL type %q to boolean", column, dataType)
+			return fmt.Errorf("cannot safely convert specus_client_session.%s from PostgreSQL type %q to boolean", column, dataType)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -323,7 +323,7 @@ func (db *DB) ensurePostgresClientMessageCapabilityTypes() error {
 }
 
 func postgresClientCapabilityBooleanMigration(column string) string {
-	return fmt.Sprintf(`ALTER TABLE tunnel_client_session
+	return fmt.Sprintf(`ALTER TABLE specus_client_session
 		ALTER COLUMN %s DROP DEFAULT,
 		ALTER COLUMN %s TYPE BOOLEAN USING (%s <> 0),
 		ALTER COLUMN %s SET DEFAULT FALSE,

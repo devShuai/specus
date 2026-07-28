@@ -25,7 +25,7 @@ public final class StunBindingService {
                               boolean legacySingleIpOtherAddress,
                               int maxPaddingResponseBytes) {
         this.topology = Objects.requireNonNull(topology, "topology");
-        this.software = software == null || software.isBlank() ? "shuai-stun-server" : software.trim();
+        this.software = software == null || software.isBlank() ? "specus-stun-server" : software.trim();
         this.legacySingleIpOtherAddress = legacySingleIpOtherAddress;
         if (maxPaddingResponseBytes < 0 || maxPaddingResponseBytes > 65_503) {
             throw new IllegalArgumentException(

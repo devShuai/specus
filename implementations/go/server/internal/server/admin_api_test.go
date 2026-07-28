@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
 )
 
 // newAPIServer boots an App and wraps its management handler in an httptest.Server.
@@ -76,7 +76,7 @@ func TestOSSUploadCallbackIsAnonymousButRejectsInvalidSignature(t *testing.T) {
 func TestPublicPeerMeshStunConfigMatchesJavaShape(t *testing.T) {
 	cfg := config.Default()
 	cfg.PeerMesh.Enabled = true
-	cfg.PeerMesh.PublicAddress = "tunnel.example.com"
+	cfg.PeerMesh.PublicAddress = "specus.example.com"
 	cfg.PeerMesh.StunTurnPort = 3478
 	cfg.PeerMesh.PublicStunServers = []string{
 		"stun://stun1.example.com",
@@ -105,10 +105,10 @@ func TestPublicPeerMeshStunConfigMatchesJavaShape(t *testing.T) {
 	if !decoded.PeerMeshEnabled {
 		t.Fatalf("peerMeshEnabled = false, want true")
 	}
-	if decoded.SelfHostedStunServer != "stun:tunnel.example.com:3478" {
+	if decoded.SelfHostedStunServer != "stun:specus.example.com:3478" {
 		t.Fatalf("selfHosted = %q", decoded.SelfHostedStunServer)
 	}
-	want := []string{"stun:tunnel.example.com:3478", "stun:stun1.example.com:3478", "stun:stun2.example.com:5349"}
+	want := []string{"stun:specus.example.com:3478", "stun:stun1.example.com:3478", "stun:stun2.example.com:5349"}
 	if strings.Join(decoded.StunServers, ",") != strings.Join(want, ",") {
 		t.Fatalf("stunServers = %#v, want %#v", decoded.StunServers, want)
 	}
@@ -232,7 +232,7 @@ func TestStaticResourceCacheHeadersMatchJava(t *testing.T) {
 	}
 }
 
-func TestSecurityHeadersLeaveHTTPTunnelPolicyToUpstream(t *testing.T) {
+func TestSecurityHeadersLeaveHTTPSpecusPolicyToUpstream(t *testing.T) {
 	handler := securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/http/") {
 			w.Header().Set("Content-Security-Policy", "script-src 'self' 'unsafe-eval'")
@@ -241,14 +241,14 @@ func TestSecurityHeadersLeaveHTTPTunnelPolicyToUpstream(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}), config.ObjectStorageConfig{})
 
-	tunnel := httptest.NewRecorder()
-	handler.ServeHTTP(tunnel, httptest.NewRequest(http.MethodGet, "/http/client/route/", nil))
-	if got := tunnel.Header().Values("Content-Security-Policy"); len(got) != 1 ||
+	specus := httptest.NewRecorder()
+	handler.ServeHTTP(specus, httptest.NewRequest(http.MethodGet, "/http/client/route/", nil))
+	if got := specus.Header().Values("Content-Security-Policy"); len(got) != 1 ||
 		got[0] != "script-src 'self' 'unsafe-eval'" {
-		t.Fatalf("tunnel CSP = %#v, want only upstream policy", got)
+		t.Fatalf("specus CSP = %#v, want only upstream policy", got)
 	}
-	if got := tunnel.Header().Get("X-Frame-Options"); got != "SAMEORIGIN" {
-		t.Fatalf("tunnel X-Frame-Options = %q, want SAMEORIGIN", got)
+	if got := specus.Header().Get("X-Frame-Options"); got != "SAMEORIGIN" {
+		t.Fatalf("specus X-Frame-Options = %q, want SAMEORIGIN", got)
 	}
 
 	portal := httptest.NewRecorder()
@@ -461,7 +461,7 @@ func TestClientNameAvailabilityUsesJavaUTF16Length(t *testing.T) {
 	}
 }
 
-func TestClientAndTunnelCrud(t *testing.T) {
+func TestClientAndSpecusCrud(t *testing.T) {
 	_, ts := newAPIServer(t)
 	token := adminToken(t, ts)
 
@@ -499,19 +499,19 @@ func TestClientAndTunnelCrud(t *testing.T) {
 		t.Fatalf("unexpected credential result: %+v", credential)
 	}
 
-	// Create a tunnel for the client.
-	tunnelBody := `{"listenPort":45999,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true,"detailCaptureEnabled":true}`
-	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/tunnels", token, tunnelBody)
+	// Create a specus for the client.
+	specusBody := `{"listenPort":45999,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true,"detailCaptureEnabled":true}`
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/specus-mappings", token, specusBody)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create tunnel status %d", resp.StatusCode)
+		t.Fatalf("create specus status %d", resp.StatusCode)
 	}
-	var tunnel struct {
+	var specus struct {
 		DetailCaptureEnabled bool `json:"detailCaptureEnabled"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&tunnel)
+	_ = json.NewDecoder(resp.Body).Decode(&specus)
 	resp.Body.Close()
-	if !tunnel.DetailCaptureEnabled {
-		t.Fatalf("expected detail capture enabled in tunnel response")
+	if !specus.DetailCaptureEnabled {
+		t.Fatalf("expected detail capture enabled in specus response")
 	}
 
 	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(created.Client.ID)+"/http-routes", token,
@@ -527,16 +527,16 @@ func TestClientAndTunnelCrud(t *testing.T) {
 	}
 	var detail struct {
 		Client  management_ClientView `json:"client"`
-		Tunnels []struct {
+		SpecusMappings []struct {
 			ListenPort int `json:"listenPort"`
-		} `json:"tunnels"`
+		} `json:"specusMappings"`
 		HTTPRoutes []struct {
 			Route string `json:"route"`
 		} `json:"httpRoutes"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&detail)
 	resp.Body.Close()
-	if detail.Client.ID != created.Client.ID || len(detail.Tunnels) != 1 || len(detail.HTTPRoutes) != 1 ||
+	if detail.Client.ID != created.Client.ID || len(detail.SpecusMappings) != 1 || len(detail.HTTPRoutes) != 1 ||
 		detail.HTTPRoutes[0].Route != "crud-detail" {
 		t.Fatalf("unexpected client detail: %+v", detail)
 	}
@@ -762,17 +762,17 @@ func TestManagementUsersAndOwnerScope(t *testing.T) {
 		t.Fatalf("alice should only see own credential, got %+v", credentials)
 	}
 
-	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(adminClient.Client.ID)+"/tunnels", alice,
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(adminClient.Client.ID)+"/specus-mappings", alice,
 		`{"listenPort":46001,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true}`)
 	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("alice create tunnel for admin client status %d", resp.StatusCode)
+		t.Fatalf("alice create specus for admin client status %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 
-	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(aliceClient.Client.ID)+"/tunnels", alice,
+	resp = authRequest(t, ts, http.MethodPost, "/api/admin/clients/"+itoa(aliceClient.Client.ID)+"/specus-mappings", alice,
 		`{"listenPort":46002,"targetAddress":"127.0.0.1","targetPort":8080,"enabled":true}`)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("alice create own tunnel status %d", resp.StatusCode)
+		t.Fatalf("alice create own specus status %d", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -782,7 +782,7 @@ func TestClientDownloadLinksAdminCrudAndPublicList(t *testing.T) {
 	admin := adminToken(t, ts)
 
 	resp := authRequest(t, ts, http.MethodPost, "/api/admin/client-downloads", admin,
-		`{"implementation":"java","platform":"any","arch":"any","displayName":"Java exec jar","downloadUrl":"https://example.com/shuai-tunnel.jar","description":"cross platform","displayOrder":20,"enabled":false}`)
+		`{"implementation":"java","platform":"any","arch":"any","displayName":"Java exec jar","downloadUrl":"https://example.com/specus.jar","description":"cross platform","displayOrder":20,"enabled":false}`)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create disabled download status %d", resp.StatusCode)
 	}
@@ -798,7 +798,7 @@ func TestClientDownloadLinksAdminCrudAndPublicList(t *testing.T) {
 	}
 
 	resp = authRequest(t, ts, http.MethodPost, "/api/admin/client-downloads", admin,
-		`{"implementation":"go","platform":"linux","arch":"x64","displayName":"Linux x64","downloadUrl":"https://example.com/shuai-tunnel-linux-amd64","displayOrder":10}`)
+		`{"implementation":"go","platform":"linux","arch":"x64","displayName":"Linux x64","downloadUrl":"https://example.com/specus-linux-amd64","displayOrder":10}`)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create enabled download status %d", resp.StatusCode)
 	}
@@ -833,7 +833,7 @@ func TestClientDownloadLinksAdminCrudAndPublicList(t *testing.T) {
 	}
 
 	resp = authRequest(t, ts, http.MethodPut, "/api/admin/client-downloads/"+itoa(enabled.ID), admin,
-		`{"implementation":"csharp","platform":"windows","arch":"x64","displayName":"Windows x64","downloadUrl":"https://example.com/shuai-tunnel-win-x64.zip","enabled":true}`)
+		`{"implementation":"csharp","platform":"windows","arch":"x64","displayName":"Windows x64","downloadUrl":"https://example.com/specus-win-x64.zip","enabled":true}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("update download status %d", resp.StatusCode)
 	}
@@ -878,7 +878,7 @@ func TestDirectHTTPOfflineAndOversize(t *testing.T) {
 	app, ts := newAPIServer(t)
 	_ = app
 
-	// Offline client -> 502, matching the Java HTTP tunnel gateway.
+	// Offline client -> 502, matching the Java HTTP specus gateway.
 	resp, err := http.Get(ts.URL + "/http/" + "Demo%20client" + "/api/ping")
 	if err != nil {
 		t.Fatalf("get: %v", err)

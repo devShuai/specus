@@ -13,7 +13,7 @@
 
 | 配置 | 默认值 | 约束 |
 | --- | ---: | --- |
-| `redis-key-prefix` | `shuai-tunnel:v2:public-transfer` | 去除尾部冒号；不同环境必须隔离 |
+| `redis-key-prefix` | `specus:v2:public-transfer` | 去除尾部冒号；不同环境必须隔离 |
 | `presence-lease-seconds` | 30 | 最少 5 秒 |
 | `presence-refresh-interval-ms` | 10000 | 正数且小于租约 TTL 的一半 |
 | `redis-command-timeout-ms` | 2000 | 最少 100 ms |

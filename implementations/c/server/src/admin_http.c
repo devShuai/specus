@@ -51,8 +51,8 @@ typedef struct {
 
 typedef struct {
     int port;
-    char tunnel_address[256];
-    int tunnel_port;
+    char specus_address[256];
+    int specus_port;
 } st_admin_tcp_mapping;
 
 typedef struct {
@@ -186,8 +186,8 @@ static int env_int_alias(const char *primary, const char *legacy, int fallback)
 
 static int client_auth_default_max_online_instances(void)
 {
-    int value = env_int_alias("TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES",
-                              "TUNNEL_CLIENT_MAX_ONLINE_INSTANCES",
+    int value = env_int_alias("SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES",
+                              "SPECUS_CLIENT_MAX_ONLINE_INSTANCES",
                               2);
     return value > 0 && value <= 10000 ? value : 2;
 }
@@ -443,8 +443,8 @@ static int admin_ascii_ncasecmp(const char *left, const char *right, size_t len)
 static void admin_context_from_env(st_admin_context *context)
 {
     memset(context, 0, sizeof(*context));
-    snprintf(context->username, sizeof(context->username), "%s", env_text("TUNNEL_AUTH_USERNAME", "admin"));
-    snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", env_text("TUNNEL_AUTH_TENANT_ID", "default"));
+    snprintf(context->username, sizeof(context->username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
+    snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
     snprintf(context->role, sizeof(context->role), "%s", "ADMIN");
     context->admin = 1;
     context->authenticated = 1;
@@ -469,9 +469,9 @@ static int admin_context_from_authorization(const char *authorization, st_admin_
     }
     st_security_token_claims claims;
     if (st_security_validate_local_token(token,
-                                         getenv("TUNNEL_AUTH_JWT_SECRET"),
-                                         env_text("TUNNEL_AUTH_TENANT_ID", "default"),
-                                         env_text("TUNNEL_AUTH_USERNAME", "admin"),
+                                         getenv("SPECUS_AUTH_JWT_SECRET"),
+                                         env_text("SPECUS_AUTH_TENANT_ID", "default"),
+                                         env_text("SPECUS_AUTH_USERNAME", "admin"),
                                          &claims) != 0) {
         return -1;
     }
@@ -479,7 +479,7 @@ static int admin_context_from_authorization(const char *authorization, st_admin_
     snprintf(context->tenant_id, sizeof(context->tenant_id), "%s", claims.tenant_id);
     snprintf(context->role, sizeof(context->role), "%s", claims.role);
     context->admin = admin_ascii_casecmp(claims.role, "ADMIN") == 0
-        || admin_ascii_casecmp(claims.username, env_text("TUNNEL_AUTH_USERNAME", "admin")) == 0;
+        || admin_ascii_casecmp(claims.username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0;
     context->authenticated = 1;
     return 0;
 }
@@ -613,20 +613,20 @@ static int add_admin_tcp_mapping(st_admin_tcp_mapping *mappings,
                                  int target_port)
 {
     if (*mapping_count >= ST_ADMIN_MAX_TCP_MAPPINGS || target_address == NULL || *target_address == '\0'
-        || strlen(target_address) >= sizeof(mappings[0].tunnel_address)) {
+        || strlen(target_address) >= sizeof(mappings[0].specus_address)) {
         return -1;
     }
     st_admin_tcp_mapping *mapping = &mappings[*mapping_count];
     mapping->port = port;
-    strcpy(mapping->tunnel_address, target_address);
-    mapping->tunnel_port = target_port;
+    strcpy(mapping->specus_address, target_address);
+    mapping->specus_port = target_port;
     ++(*mapping_count);
     return 0;
 }
 
 static int load_env_tcp_mappings(st_admin_tcp_mapping *mappings, size_t *mapping_count)
 {
-    const char *raw = getenv("TUNNEL_TCP_MAPPINGS");
+    const char *raw = getenv("SPECUS_TCP_MAPPINGS");
     if (raw == NULL || *raw == '\0') {
         return 0;
     }
@@ -672,11 +672,11 @@ static int load_database_tcp_mappings(const char *client_name,
                                       st_admin_tcp_mapping *mappings,
                                       size_t *mapping_count)
 {
-    const char *database_path = getenv("TUNNEL_DATABASE_PATH");
+    const char *database_path = getenv("SPECUS_DATABASE_PATH");
     if (database_path == NULL || *database_path == '\0') {
         return 0;
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
         || !st_storage_client_enabled(database_path, client_name)) {
         return -1;
     }
@@ -712,7 +712,7 @@ static int load_current_tcp_mappings(const char *client_name,
 static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count)
 {
     *route_count = 0;
-    const char *raw = getenv("TUNNEL_HTTP_ROUTES");
+    const char *raw = getenv("SPECUS_HTTP_ROUTES");
     if (raw == NULL || *raw == '\0') {
         return 0;
     }
@@ -754,11 +754,11 @@ static int load_env_http_routes(st_admin_http_route *routes, size_t *route_count
 
 static int load_database_http_routes(const char *client_name, st_admin_http_route *routes, size_t *route_count)
 {
-    const char *database_path = getenv("TUNNEL_DATABASE_PATH");
+    const char *database_path = getenv("SPECUS_DATABASE_PATH");
     if (database_path == NULL || *database_path == '\0') {
         return 0;
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
         || !st_storage_client_enabled(database_path, client_name)) {
         return -1;
     }
@@ -790,21 +790,21 @@ static int load_current_http_routes(const char *client_name, st_admin_http_route
         : 0;
 }
 
-static int append_tunnel_config_list(st_admin_string_builder *builder,
+static int append_specus_config_list(st_admin_string_builder *builder,
                                      const st_admin_tcp_mapping *mappings,
                                      size_t mapping_count)
 {
     for (size_t i = 0; i < mapping_count; ++i) {
-        char *target = st_json_escape(mappings[i].tunnel_address);
+        char *target = st_json_escape(mappings[i].specus_address);
         if (target == NULL) {
             return -1;
         }
         int rc = admin_sb_appendf(builder,
-                                  "%s{\"port\":%d,\"tunnelAddress\":\"%s\",\"tunnelPort\":%d}",
+                                  "%s{\"port\":%d,\"specusAddress\":\"%s\",\"specusPort\":%d}",
                                   i == 0 ? "" : ",",
                                   mappings[i].port,
                                   target,
-                                  mappings[i].tunnel_port);
+                                  mappings[i].specus_port);
         free(target);
         if (rc != 0) {
             return -1;
@@ -841,20 +841,20 @@ static int append_http_route_config_list(st_admin_string_builder *builder,
 
 static int client_api_auth_required(void)
 {
-    const char *api_key = getenv("TUNNEL_CLIENT_API_KEY");
-    const char *secret = getenv("TUNNEL_CLIENT_SECRET");
-    const char *secret_hash = getenv("TUNNEL_CLIENT_SECRET_HASH");
+    const char *api_key = getenv("SPECUS_CLIENT_API_KEY");
+    const char *secret = getenv("SPECUS_CLIENT_SECRET");
+    const char *secret_hash = getenv("SPECUS_CLIENT_SECRET_HASH");
     return (api_key != NULL && *api_key != '\0') || (secret != NULL && *secret != '\0')
         || (secret_hash != NULL && *secret_hash != '\0');
 }
 
 static int load_client_api_key(uint8_t key[ST_SHA256_LEN])
 {
-    const char *secret_hash = getenv("TUNNEL_CLIENT_SECRET_HASH");
+    const char *secret_hash = getenv("SPECUS_CLIENT_SECRET_HASH");
     if (secret_hash != NULL && *secret_hash != '\0') {
         return st_hex_decode_32(secret_hash, key);
     }
-    const char *secret = getenv("TUNNEL_CLIENT_SECRET");
+    const char *secret = getenv("SPECUS_CLIENT_SECRET");
     if (secret == NULL || *secret == '\0') {
         return -1;
     }
@@ -868,13 +868,13 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"client auth request body is required\"}");
     }
 
-    const char *expected_api_key = getenv("TUNNEL_CLIENT_API_KEY");
+    const char *expected_api_key = getenv("SPECUS_CLIENT_API_KEY");
     if (expected_api_key == NULL || *expected_api_key == '\0') {
         return write_response(out,
                               out_len,
                               503,
                               "Service Unavailable",
-                              "{\"error\":\"TUNNEL_CLIENT_API_KEY is required when client API auth is enabled\"}");
+                              "{\"error\":\"SPECUS_CLIENT_API_KEY is required when client API auth is enabled\"}");
     }
 
     char *api_key = st_json_get_string(body, "apiKey");
@@ -917,7 +917,7 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
                               out_len,
                               503,
                               "Service Unavailable",
-                              "{\"error\":\"TUNNEL_CLIENT_SECRET or a 64-char TUNNEL_CLIENT_SECRET_HASH is required\"}");
+                              "{\"error\":\"SPECUS_CLIENT_SECRET or a 64-char SPECUS_CLIENT_SECRET_HASH is required\"}");
     }
     if (!invalid && st_hex_decode_32(signature, actual_signature) != 0) {
         invalid = 1;
@@ -968,16 +968,16 @@ static int validate_client_api_login(const char *body, char *out, size_t out_len
 
 static int build_client_auth_login_success_response(char *out, size_t out_len)
 {
-    const char *access_token = getenv("TUNNEL_CLIENT_ACCESS_TOKEN");
+    const char *access_token = getenv("SPECUS_CLIENT_ACCESS_TOKEN");
     if (access_token == NULL || *access_token == '\0') {
         return write_response(out,
                               out_len,
                               503,
                               "Service Unavailable",
-                              "{\"error\":\"TUNNEL_CLIENT_ACCESS_TOKEN is required for the C environment-token compatibility mode\"}");
+                              "{\"error\":\"SPECUS_CLIENT_ACCESS_TOKEN is required for the C environment-token compatibility mode\"}");
     }
 
-    const char *client_name_raw = env_text("TUNNEL_CLIENT_NAME", "Demo client");
+    const char *client_name_raw = env_text("SPECUS_CLIENT_NAME", "Demo client");
     st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
     size_t mapping_count = 0;
     if (load_current_tcp_mappings(client_name_raw, mappings, &mapping_count) != 0) {
@@ -989,23 +989,23 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route response build failed\"}");
     }
 
-    const char *tenant_raw = getenv("TUNNEL_CLIENT_TENANT_ID");
+    const char *tenant_raw = getenv("SPECUS_CLIENT_TENANT_ID");
     if (tenant_raw == NULL || *tenant_raw == '\0') {
-        tenant_raw = env_text("TUNNEL_AUTH_TENANT_ID", "default");
+        tenant_raw = env_text("SPECUS_AUTH_TENANT_ID", "default");
     }
-    long long client_id = env_i64("TUNNEL_CLIENT_ID", 1);
-    long long client_session_id = env_i64("TUNNEL_CLIENT_SESSION_ID", 1);
-    long long token_ttl_seconds = env_i64_alias("TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS",
-                                                "TUNNEL_CLIENT_TOKEN_TTL_SECONDS",
+    long long client_id = env_i64("SPECUS_CLIENT_ID", 1);
+    long long client_session_id = env_i64("SPECUS_CLIENT_SESSION_ID", 1);
+    long long token_ttl_seconds = env_i64_alias("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS",
+                                                "SPECUS_CLIENT_TOKEN_TTL_SECONDS",
                                                 28800);
     int max_online_instances = client_auth_default_max_online_instances();
-    int policy_enabled = env_bool("TUNNEL_CLIENT_POLICY_ENABLED", 1);
-    long long retry_after_seconds = env_i64("TUNNEL_CLIENT_RETRY_AFTER_SECONDS", 0);
+    int policy_enabled = env_bool("SPECUS_CLIENT_POLICY_ENABLED", 1);
+    long long retry_after_seconds = env_i64("SPECUS_CLIENT_RETRY_AFTER_SECONDS", 0);
 
-    char *billing_status = st_json_escape(env_text("TUNNEL_CLIENT_BILLING_STATUS", "ACTIVE"));
+    char *billing_status = st_json_escape(env_text("SPECUS_CLIENT_BILLING_STATUS", "ACTIVE"));
     char *tenant_id = st_json_escape(tenant_raw);
     char *client_name = st_json_escape(client_name_raw);
-    char *netty_host = st_json_escape(env_text("TUNNEL_PUBLIC_ADDRESS", "127.0.0.1"));
+    char *netty_host = st_json_escape(env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
     char *token = st_json_escape(access_token);
     if (billing_status == NULL || tenant_id == NULL || client_name == NULL || netty_host == NULL || token == NULL) {
         free(billing_status);
@@ -1026,7 +1026,7 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
                                     "\"virtualIp\":\"\",\"cidr\":\"\",\"stunHost\":\"\",\"stunPort\":0,"
                                     "\"turnHost\":\"\",\"turnPort\":0,\"iceUsername\":\"\",\"iceCredential\":\"\","
                                     "\"serverPublicKey\":\"\",\"clientPublicKey\":\"\",\"sessionTtlSeconds\":0},"
-                                    "\"tunnelConfigList\":[",
+                                    "\"specusConfigList\":[",
                                     tenant_id,
                                     client_id,
                                     client_name,
@@ -1034,7 +1034,7 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
                                     token,
                                     token_ttl_seconds,
                                     netty_host,
-                                    env_int("TUNNEL_NETTY_PORT", 7010),
+                                    env_int("SPECUS_NETTY_PORT", 7010),
                                     max_online_instances,
                                     policy_enabled ? "true" : "false",
                                     billing_status,
@@ -1042,10 +1042,10 @@ static int build_client_auth_login_success_response(char *out, size_t out_len)
                                     client_id,
                                     client_name);
     if (build_rc == 0) {
-        build_rc = append_tunnel_config_list(&builder, mappings, mapping_count);
+        build_rc = append_specus_config_list(&builder, mappings, mapping_count);
     }
     if (build_rc == 0) {
-        build_rc = admin_sb_append(&builder, "],\"httpTunnelConfigList\":[");
+        build_rc = admin_sb_append(&builder, "],\"httpSpecusConfigList\":[");
     }
     if (build_rc == 0) {
         build_rc = append_http_route_config_list(&builder, http_routes, http_route_count);
@@ -1114,7 +1114,7 @@ static void initialize_turn_runtime_secret(void)
 
 static const char *turn_credential_secret(void)
 {
-    const char *configured = getenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET");
+    const char *configured = getenv("SPECUS_PEER_MESH_TURN_SHARED_SECRET");
     if (configured != NULL && *configured != '\0') {
         return configured;
     }
@@ -1416,13 +1416,13 @@ static int normalize_public_stun_url(const char *value, char *out, size_t out_le
 static size_t collect_public_stun_urls(char urls[][512], size_t max_urls, int include_self)
 {
     size_t count = 0;
-    int port = env_int("TUNNEL_PEER_MESH_STUN_TURN_PORT", 3478);
-    const char *public_address = getenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
+    int port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
+    const char *public_address = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
     if (count < max_urls && include_self && public_address != NULL && *public_address != '\0'
         && build_public_ice_url("stun", public_address, port, "", urls[count], sizeof(urls[count])) == 0) {
         ++count;
     }
-    const char *configured = getenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS");
+    const char *configured = getenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
     if (configured == NULL || *configured == '\0') return count;
     char *copy = strdup(configured);
     if (copy == NULL) return count;
@@ -1442,12 +1442,12 @@ static size_t collect_public_stun_urls(char urls[][512], size_t max_urls, int in
 
 static int build_public_stun_config_response(char *out, size_t out_len)
 {
-    int enabled = env_bool("TUNNEL_PEER_MESH_ENABLED", 0);
-    int port = env_int("TUNNEL_PEER_MESH_STUN_TURN_PORT", 3478);
+    int enabled = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
+    int port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
     char urls[16][512];
     size_t count = collect_public_stun_urls(urls, 16U, enabled);
     char self_url[512] = "";
-    const char *public_address = getenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
+    const char *public_address = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
     if (enabled && public_address != NULL && *public_address != '\0') {
         (void)build_public_ice_url("stun", public_address, port, "", self_url, sizeof(self_url));
     }
@@ -1473,9 +1473,9 @@ static int build_public_stun_config_response(char *out, size_t out_len)
 
 static int build_public_ice_config_response(char *out, size_t out_len)
 {
-    int enabled = env_bool("TUNNEL_PEER_MESH_ENABLED", 0);
-    int auth_required = env_bool("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED", 1);
-    int port = env_int("TUNNEL_PEER_MESH_STUN_TURN_PORT", 3478);
+    int enabled = env_bool("SPECUS_PEER_MESH_ENABLED", 0);
+    int auth_required = env_bool("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", 1);
+    int port = env_int("SPECUS_PEER_MESH_STUN_TURN_PORT", 3478);
     char urls[16][512];
     size_t count = collect_public_stun_urls(urls, 16U, enabled);
     st_admin_string_builder builder = {0};
@@ -1486,12 +1486,12 @@ static int build_public_ice_config_response(char *out, size_t out_len)
         if (rc == 0) rc = admin_sb_append_json_string(&builder, urls[i]);
         if (rc == 0) rc = admin_sb_append(&builder, ",\"username\":\"\",\"credential\":\"\"}");
     }
-    const char *public_address = getenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
-    const char *shared_secret = getenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET");
+    const char *public_address = getenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
+    const char *shared_secret = getenv("SPECUS_PEER_MESH_TURN_SHARED_SECRET");
     int turn_publishable = enabled && public_address != NULL && *public_address != '\0'
         && (!auth_required || (shared_secret != NULL && *shared_secret != '\0'));
     if (rc == 0 && turn_publishable) {
-        long long ttl = env_i64("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", 3600);
+        long long ttl = env_i64("SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", 3600);
         if (ttl < 60) ttl = 60;
         long long expires = current_time_millis() / 1000LL + ttl;
         char random_hex[160];
@@ -1555,7 +1555,7 @@ static int append_db_client_auth_response(char *out,
 
     char *tenant_id = st_json_escape(credential->tenant_id);
     char *client_name = st_json_escape(identity->client_name);
-    char *netty_host = st_json_escape(env_text("TUNNEL_PUBLIC_ADDRESS", "127.0.0.1"));
+    char *netty_host = st_json_escape(env_text("SPECUS_PUBLIC_ADDRESS", "127.0.0.1"));
     char *token = st_json_escape(access_token);
     if (tenant_id == NULL || client_name == NULL || netty_host == NULL || token == NULL) {
         free(tenant_id);
@@ -1565,8 +1565,8 @@ static int append_db_client_auth_response(char *out,
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"auth response build failed\"}");
     }
 
-    long long token_ttl_seconds = env_i64_alias("TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS",
-                                                "TUNNEL_CLIENT_TOKEN_TTL_SECONDS",
+    long long token_ttl_seconds = env_i64_alias("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS",
+                                                "SPECUS_CLIENT_TOKEN_TTL_SECONDS",
                                                 28800);
     st_admin_string_builder builder = {0};
     int build_rc = admin_sb_appendf(&builder,
@@ -1578,7 +1578,7 @@ static int append_db_client_auth_response(char *out,
                                     "\"virtualIp\":\"\",\"cidr\":\"\",\"stunHost\":\"\",\"stunPort\":0,"
                                     "\"turnHost\":\"\",\"turnPort\":0,\"iceUsername\":\"\",\"iceCredential\":\"\","
                                     "\"serverPublicKey\":\"\",\"clientPublicKey\":\"\",\"sessionTtlSeconds\":0},"
-                                    "\"tunnelConfigList\":[",
+                                    "\"specusConfigList\":[",
                                     tenant_id,
                                     identity->client_id,
                                     client_name,
@@ -1586,17 +1586,17 @@ static int append_db_client_auth_response(char *out,
                                     token,
                                     token_ttl_seconds,
                                     netty_host,
-                                    env_int("TUNNEL_NETTY_PORT", 7010),
+                                    env_int("SPECUS_NETTY_PORT", 7010),
                                     credential->max_online_instances <= 0
                                         ? client_auth_default_max_online_instances()
                                         : credential->max_online_instances,
                                     identity->client_id,
                                     client_name);
     if (build_rc == 0) {
-        build_rc = append_tunnel_config_list(&builder, mappings, mapping_count);
+        build_rc = append_specus_config_list(&builder, mappings, mapping_count);
     }
     if (build_rc == 0) {
-        build_rc = admin_sb_append(&builder, "],\"httpTunnelConfigList\":[");
+        build_rc = admin_sb_append(&builder, "],\"httpSpecusConfigList\":[");
     }
     if (build_rc == 0) {
         build_rc = append_http_route_config_list(&builder, http_routes, http_route_count);
@@ -1779,8 +1779,8 @@ static int build_database_client_auth_login_response(const char *database_path,
     st_hex_encode(token_digest, sizeof(token_digest), token_hash);
 
     long long now_seconds = current_time_millis() / 1000LL;
-    long long ttl = env_i64_alias("TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS",
-                                  "TUNNEL_CLIENT_TOKEN_TTL_SECONDS",
+    long long ttl = env_i64_alias("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS",
+                                  "SPECUS_CLIENT_TOKEN_TTL_SECONDS",
                                   28800);
     char now_text[64];
     char expires_text[64];
@@ -1851,7 +1851,7 @@ static int build_client_auth_login_response(const char *body, char *out, size_t 
 {
     const char *database_path = admin_database_path();
     if (database_path != NULL
-        && st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) == 0) {
+        && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
         int db_response = build_database_client_auth_login_response(database_path, body, out, out_len);
         if (db_response != 0) {
             return db_response;
@@ -1871,7 +1871,7 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
     *mapping_count = 0;
     const char *database_path = admin_database_path();
     if (database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             return -1;
         }
         st_storage_client clients[ST_ADMIN_MAX_CLIENTS];
@@ -1898,10 +1898,10 @@ static int load_visible_tcp_mapping_count(const st_admin_context *context, size_
     }
 
     st_storage_client client = {0};
-    client.id = env_i64("TUNNEL_CLIENT_ID", 1);
-    snprintf(client.tenant_id, sizeof(client.tenant_id), "%s", env_text("TUNNEL_AUTH_TENANT_ID", "default"));
-    snprintf(client.client_name, sizeof(client.client_name), "%s", env_text("TUNNEL_CLIENT_NAME", "Demo client"));
-    snprintf(client.owner_username, sizeof(client.owner_username), "%s", env_text("TUNNEL_AUTH_USERNAME", "admin"));
+    client.id = env_i64("SPECUS_CLIENT_ID", 1);
+    snprintf(client.tenant_id, sizeof(client.tenant_id), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+    snprintf(client.client_name, sizeof(client.client_name), "%s", env_text("SPECUS_CLIENT_NAME", "Demo client"));
+    snprintf(client.owner_username, sizeof(client.owner_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
     client.enabled = 1;
     if (!admin_can_access_client(context, &client)) {
         return 0;
@@ -1947,7 +1947,7 @@ static int build_metrics_response(const st_admin_context *context, char *out, si
 
 static const char *admin_database_path(void)
 {
-    const char *path = getenv("TUNNEL_DATABASE_PATH");
+    const char *path = getenv("SPECUS_DATABASE_PATH");
     return path != NULL && *path != '\0' ? path : NULL;
 }
 
@@ -1992,7 +1992,7 @@ static void record_direct_http_traffic(const char *client_name,
     if (database_path == NULL) {
         return;
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return;
     }
     st_storage_client client;
@@ -2052,7 +2052,7 @@ static void record_direct_http_exchange(const char *client_name,
     if (database_path == NULL) {
         return;
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return;
     }
     st_storage_client client;
@@ -2123,9 +2123,9 @@ static int ensure_admin_database(const char **path, char *out, size_t out_len)
                               out_len,
                               503,
                               "Service Unavailable",
-                              "{\"error\":\"TUNNEL_DATABASE_PATH is required for C management mutations\"}");
+                              "{\"error\":\"SPECUS_DATABASE_PATH is required for C management mutations\"}");
     }
-    if (st_storage_init(*path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(*path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"database init failed\"}");
     }
     return 0;
@@ -3011,10 +3011,10 @@ static int build_oidc_token_proxy_response(const char *body, char *out, size_t o
     if (body == NULL) {
         body = "{}";
     }
-    const char *client_id = getenv("TUNNEL_OIDC_CLIENT_ID");
-    const char *token_endpoint = getenv("TUNNEL_OIDC_TOKEN_ENDPOINT");
-    const char *redirect_uri = getenv("TUNNEL_OIDC_REDIRECT_URI");
-    const char *client_secret = getenv("TUNNEL_OIDC_CLIENT_SECRET");
+    const char *client_id = getenv("SPECUS_OIDC_CLIENT_ID");
+    const char *token_endpoint = getenv("SPECUS_OIDC_TOKEN_ENDPOINT");
+    const char *redirect_uri = getenv("SPECUS_OIDC_REDIRECT_URI");
+    const char *client_secret = getenv("SPECUS_OIDC_CLIENT_SECRET");
     if (client_id == NULL || *client_id == '\0' || token_endpoint == NULL || *token_endpoint == '\0') {
         return write_response(out,
                               out_len,
@@ -3303,7 +3303,7 @@ static int build_clients_response(const st_admin_context *context, char *out, si
     int rc = admin_sb_append(&builder, "[");
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client list failed\"}");
         }
@@ -3326,12 +3326,12 @@ static int build_clients_response(const st_admin_context *context, char *out, si
         }
     } else if (rc == 0) {
         st_storage_client client = {0};
-        client.id = env_i64("TUNNEL_CLIENT_ID", 1);
-        snprintf(client.tenant_id, sizeof(client.tenant_id), "%s", env_text("TUNNEL_AUTH_TENANT_ID", "default"));
-        snprintf(client.client_name, sizeof(client.client_name), "%s", env_text("TUNNEL_CLIENT_NAME", "Demo client"));
-        snprintf(client.owner_username, sizeof(client.owner_username), "%s", env_text("TUNNEL_AUTH_USERNAME", "admin"));
+        client.id = env_i64("SPECUS_CLIENT_ID", 1);
+        snprintf(client.tenant_id, sizeof(client.tenant_id), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
+        snprintf(client.client_name, sizeof(client.client_name), "%s", env_text("SPECUS_CLIENT_NAME", "Demo client"));
+        snprintf(client.owner_username, sizeof(client.owner_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
         client.enabled = 1;
-        client.connection_rate_limit_per_minute = env_int("TUNNEL_CLIENT_CONNECTION_LIMIT_PER_MINUTE", 30);
+        client.connection_rate_limit_per_minute = env_int("SPECUS_CLIENT_CONNECTION_LIMIT_PER_MINUTE", 30);
         if (admin_can_access_client(context, &client)) {
             rc = append_client_view(&builder, &client);
         }
@@ -3354,7 +3354,7 @@ static int build_peer_mesh_devices_response(const st_admin_context *context, cha
     int rc = admin_sb_append(&builder, "[");
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh device list failed\"}");
         }
@@ -3416,7 +3416,7 @@ static int handle_peer_mesh_device_update(const st_admin_context *context,
                                           size_t out_len)
 {
     const char *database_path = admin_database_path();
-    if (database_path == NULL || st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (database_path == NULL || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 503, "Service Unavailable", "{\"error\":\"database is not configured\"}");
     }
     st_storage_client client;
@@ -3442,7 +3442,7 @@ static int build_peer_mesh_acls_response(const st_admin_context *context, char *
     int rc = admin_sb_append(&builder, "[");
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl list failed\"}");
         }
@@ -3513,7 +3513,7 @@ static int build_peer_mesh_sessions_response(const st_admin_context *context,
     if (database_path == NULL) {
         return write_response(out, out_len, 200, "OK", "[]");
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session list failed\"}");
     }
     int limit = 100;
@@ -3556,7 +3556,7 @@ static int handle_peer_mesh_session_close(const st_admin_context *context,
                                           size_t out_len)
 {
     const char *database_path = admin_database_path();
-    if (database_path == NULL || st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (database_path == NULL || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"peer mesh session not found\"}");
     }
     st_storage_peer_mesh_session session;
@@ -3577,7 +3577,7 @@ static int handle_peer_mesh_sessions_close_open(const st_admin_context *context,
     if (database_path == NULL) {
         return write_response(out, out_len, 200, "OK", "[]");
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh session close failed\"}");
     }
     st_storage_peer_mesh_session sessions[ST_ADMIN_MAX_PEER_SESSIONS];
@@ -3613,7 +3613,7 @@ static int build_client_result_response(const st_storage_client *client, int sta
     return response_len;
 }
 
-static int build_tunnels_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
+static int build_specusMappings_response(const st_admin_context *context, const char *path, char *out, size_t out_len)
 {
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "[");
@@ -3621,9 +3621,9 @@ static int build_tunnels_response(const st_admin_context *context, const char *p
     (void)admin_query_i64(path, "clientId", &filter_client_id);
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tunnel list failed\"}");
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
         if (filter_client_id > 0) {
             st_storage_client filter_client;
@@ -3631,7 +3631,7 @@ static int build_tunnels_response(const st_admin_context *context, const char *p
                 rc = admin_sb_append(&builder, "]");
                 if (rc != 0 || builder.data == NULL) {
                     free(builder.data);
-                    return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tunnel response failed\"}");
+                    return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus response failed\"}");
                 }
                 int response_len = write_response(out, out_len, 200, "OK", builder.data);
                 free(builder.data);
@@ -3642,7 +3642,7 @@ static int build_tunnels_response(const st_admin_context *context, const char *p
         size_t mapping_count = 0;
         if (st_storage_list_mappings(database_path, filter_client_id, mappings, ST_ADMIN_MAX_TCP_MAPPINGS, &mapping_count) != 0) {
             free(builder.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tunnel list failed\"}");
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
         size_t visible_count = 0;
         for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
@@ -3659,20 +3659,20 @@ static int build_tunnels_response(const st_admin_context *context, const char *p
     } else if (rc == 0) {
         st_admin_tcp_mapping mappings[ST_ADMIN_MAX_TCP_MAPPINGS];
         size_t mapping_count = 0;
-        const char *client_name = env_text("TUNNEL_CLIENT_NAME", "Demo client");
+        const char *client_name = env_text("SPECUS_CLIENT_NAME", "Demo client");
         if (load_current_tcp_mappings(client_name, mappings, &mapping_count) != 0) {
             free(builder.data);
-            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tunnel list failed\"}");
+            return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus list failed\"}");
         }
-        long long client_id = env_i64("TUNNEL_CLIENT_ID", 1);
+        long long client_id = env_i64("SPECUS_CLIENT_ID", 1);
         for (size_t i = 0; rc == 0 && i < mapping_count; ++i) {
             st_storage_mapping mapping = {0};
             mapping.id = (long long)i + 1;
             mapping.client_id = client_id;
             snprintf(mapping.client_name, sizeof(mapping.client_name), "%s", client_name);
             mapping.listen_port = mappings[i].port;
-            snprintf(mapping.target_address, sizeof(mapping.target_address), "%s", mappings[i].tunnel_address);
-            mapping.target_port = mappings[i].tunnel_port;
+            snprintf(mapping.target_address, sizeof(mapping.target_address), "%s", mappings[i].specus_address);
+            mapping.target_port = mappings[i].specus_port;
             mapping.enabled = 1;
             rc = admin_sb_append(&builder, i == 0 ? "" : ",");
             if (rc == 0) {
@@ -3685,7 +3685,7 @@ static int build_tunnels_response(const st_admin_context *context, const char *p
     }
     if (rc != 0 || builder.data == NULL) {
         free(builder.data);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tunnel response failed\"}");
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus response failed\"}");
     }
     int response_len = write_response(out, out_len, 200, "OK", builder.data);
     free(builder.data);
@@ -3697,7 +3697,7 @@ static int build_mapping_response(const st_storage_mapping *mapping, int status,
     st_admin_string_builder builder = {0};
     if (append_mapping_view(&builder, mapping) != 0 || builder.data == NULL) {
         free(builder.data);
-        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tunnel response failed\"}");
+        return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"specus response failed\"}");
     }
     int response_len = write_response(out, out_len, status, reason, builder.data);
     free(builder.data);
@@ -3712,7 +3712,7 @@ static int build_http_routes_response(const st_admin_context *context, const cha
     (void)admin_query_i64(path, "clientId", &filter_client_id);
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route list failed\"}");
         }
@@ -3750,12 +3750,12 @@ static int build_http_routes_response(const st_admin_context *context, const cha
     } else if (rc == 0) {
         st_admin_http_route routes[ST_ADMIN_MAX_TCP_MAPPINGS];
         size_t route_count = 0;
-        const char *client_name = env_text("TUNNEL_CLIENT_NAME", "Demo client");
+        const char *client_name = env_text("SPECUS_CLIENT_NAME", "Demo client");
         if (load_current_http_routes(client_name, routes, &route_count) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"http route list failed\"}");
         }
-        long long client_id = env_i64("TUNNEL_CLIENT_ID", 1);
+        long long client_id = env_i64("SPECUS_CLIENT_ID", 1);
         for (size_t i = 0; rc == 0 && i < route_count; ++i) {
             st_storage_http_route route = {0};
             route.id = (long long)i + 1;
@@ -3834,7 +3834,7 @@ static int build_connections_response(const st_admin_context *context, const cha
         free(to);
         return build_empty_connections_response(page, size, out, out_len);
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         free(from);
         free(to);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"connection list failed\"}");
@@ -3903,7 +3903,7 @@ static int build_connection_stats_response(const st_admin_context *context, cons
         free(client_name);
         return write_response(out, out_len, 200, "OK", "[]");
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         free(client_name);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"connection stat list failed\"}");
     }
@@ -3986,7 +3986,7 @@ static int build_traffic_usage_response(const st_admin_context *context, const c
     if (database_path == NULL) {
         return write_response(out, out_len, 200, "OK", "[]");
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"traffic list failed\"}");
     }
     st_storage_traffic_usage items[ST_ADMIN_MAX_TRAFFIC_ITEMS];
@@ -4040,7 +4040,7 @@ static int build_resource_traffic_usage_response(const st_admin_context *context
         free(type);
         return write_response(out, out_len, 200, "OK", "[]");
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         free(type);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"resource traffic list failed\"}");
     }
@@ -4107,7 +4107,7 @@ static int build_http_exchanges_response(const st_admin_context *context, const 
         free(query);
         return build_empty_page_response(path, out, out_len);
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         free(route);
         free(response_body_type);
         free(field);
@@ -4185,7 +4185,7 @@ static int build_tcp_frames_response(const st_admin_context *context, const char
     if (database_path == NULL) {
         return build_empty_page_response(path, out, out_len);
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame list failed\"}");
     }
     st_storage_tcp_frame items[ST_ADMIN_MAX_CONNECTIONS_PAGE];
@@ -4239,7 +4239,7 @@ static int build_tcp_frame_detail_response(const st_admin_context *context, long
     if (database_path == NULL) {
         return write_response(out, out_len, 404, "Not Found", "{\"error\":\"TCP frame not found\"}");
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp frame lookup failed\"}");
     }
     st_storage_tcp_frame frame;
@@ -4315,7 +4315,7 @@ static int build_tcp_stream_response(const st_admin_context *context, const char
         free(channel_id);
         return response_len;
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         free(channel_id);
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"tcp stream lookup failed\"}");
     }
@@ -4543,7 +4543,7 @@ static int handle_peer_mesh_acl_delete(const st_admin_context *context, long lon
     if (database_path == NULL) {
         return write_response(out, out_len, 204, "No Content", "");
     }
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh acl delete failed\"}");
     }
     if (st_storage_delete_peer_mesh_acl_visible(database_path,
@@ -4556,7 +4556,7 @@ static int handle_peer_mesh_acl_delete(const st_admin_context *context, long lon
     return write_response(out, out_len, 204, "No Content", "");
 }
 
-static int handle_tunnel_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
+static int handle_specus_create(const st_admin_context *context, long long client_id, const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
         body = "";
@@ -4594,7 +4594,7 @@ static int handle_tunnel_create(const st_admin_context *context, long long clien
                                                   &mapping);
     free(target_address);
     if (rc != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or tunnel create failed\"}");
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"client not found or specus create failed\"}");
     }
     return build_mapping_response(&mapping, 201, "Created", out, out_len);
 }
@@ -4617,7 +4617,7 @@ static int handle_nat_control_push(const st_admin_context *context, long long cl
                           "{\"error\":\"客户端不在线，无法下发映射\"}");
 }
 
-static int handle_tunnel_update(const st_admin_context *context, long long id, const char *body, char *out, size_t out_len)
+static int handle_specus_update(const st_admin_context *context, long long id, const char *body, char *out, size_t out_len)
 {
     if (body == NULL) {
         body = "";
@@ -4631,7 +4631,7 @@ static int handle_tunnel_update(const st_admin_context *context, long long id, c
     st_storage_client owner;
     if (st_storage_get_mapping(database_path, id, &existing) != 0
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"tunnel not found\"}");
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
     }
     int listen_port = existing.listen_port;
     (void)st_json_get_int(body, "listenPort", &listen_port);
@@ -4656,12 +4656,12 @@ static int handle_tunnel_update(const st_admin_context *context, long long id, c
                                              &mapping);
     free(target_address);
     if (rc != 0) {
-        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"tunnel update failed\"}");
+        return write_response(out, out_len, 409, "Conflict", "{\"error\":\"specus update failed\"}");
     }
     return build_mapping_response(&mapping, 200, "OK", out, out_len);
 }
 
-static int handle_tunnel_delete(const st_admin_context *context, long long id, char *out, size_t out_len)
+static int handle_specus_delete(const st_admin_context *context, long long id, char *out, size_t out_len)
 {
     const char *database_path = NULL;
     int init_response = ensure_admin_database(&database_path, out, out_len);
@@ -4672,10 +4672,10 @@ static int handle_tunnel_delete(const st_admin_context *context, long long id, c
     st_storage_client owner;
     if (st_storage_get_mapping(database_path, id, &existing) != 0
         || !admin_load_accessible_client(database_path, context, existing.client_id, &owner)) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"tunnel not found\"}");
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
     }
     if (st_storage_delete_mapping_by_id(database_path, id) != 0) {
-        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"tunnel not found\"}");
+        return write_response(out, out_len, 404, "Not Found", "{\"error\":\"specus not found\"}");
     }
     return write_response(out, out_len, 204, "No Content", "");
 }
@@ -4879,7 +4879,7 @@ static int build_credentials_response(const st_admin_context *context, char *out
     st_admin_string_builder builder = {0};
     int rc = admin_sb_append(&builder, "[");
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"credential list failed\"}");
         }
@@ -5278,7 +5278,7 @@ static int build_client_downloads_response(const st_admin_context *context,
     int rc = admin_sb_append(&builder, "[");
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"client download list failed\"}");
         }
@@ -5494,7 +5494,7 @@ static int build_management_me_response(const st_admin_context *context, char *o
                                          context->username,
                                          context->tenant_id,
                                          context->role,
-                                         admin_ascii_casecmp(context->username, env_text("TUNNEL_AUTH_USERNAME", "admin")) == 0,
+                                         admin_ascii_casecmp(context->username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0,
                                          1,
                                          "",
                                          "");
@@ -5517,7 +5517,7 @@ static int build_management_users_response(const st_admin_context *context, char
     int rc = admin_sb_append(&builder, "[");
     if (rc == 0) {
         rc = append_management_user_view(&builder,
-                                         env_text("TUNNEL_AUTH_USERNAME", "admin"),
+                                         env_text("SPECUS_AUTH_USERNAME", "admin"),
                                          tenant_id,
                                          "ADMIN",
                                          1,
@@ -5527,7 +5527,7 @@ static int build_management_users_response(const st_admin_context *context, char
     }
     const char *database_path = admin_database_path();
     if (rc == 0 && database_path != NULL) {
-        if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
             free(builder.data);
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"user list failed\"}");
         }
@@ -5596,7 +5596,7 @@ static int handle_management_user_create(const st_admin_context *context, const 
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username and password are required\"}");
     }
     st_storage_management_user existing_user;
-    if (admin_ascii_casecmp(username, env_text("TUNNEL_AUTH_USERNAME", "admin")) == 0
+    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0
         || st_storage_get_management_user(database_path, username, &existing_user) == 0) {
         free(username);
         free(password);
@@ -5672,7 +5672,7 @@ static int handle_management_user_update(const st_admin_context *context,
         free(username);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username is required\"}");
     }
-    if (admin_ascii_casecmp(username, env_text("TUNNEL_AUTH_USERNAME", "admin")) == 0) {
+    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
         free(username);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be updated\"}");
     }
@@ -5734,7 +5734,7 @@ static int handle_management_user_delete(const st_admin_context *context, const 
         free(username);
         return write_response(out, out_len, 400, "Bad Request", "{\"error\":\"username is required\"}");
     }
-    if (admin_ascii_casecmp(username, env_text("TUNNEL_AUTH_USERNAME", "admin")) == 0) {
+    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
         free(username);
         return write_response(out, out_len, 409, "Conflict", "{\"error\":\"built-in admin cannot be deleted\"}");
     }
@@ -5752,12 +5752,12 @@ static int write_management_token_response(const char *username,
                                            char *out,
                                            size_t out_len)
 {
-    long long ttl = st_security_token_ttl_seconds(getenv("TUNNEL_AUTH_TOKEN_TTL_SECONDS"));
+    long long ttl = st_security_token_ttl_seconds(getenv("SPECUS_AUTH_TOKEN_TTL_SECONDS"));
     char token[2048];
     if (st_security_issue_local_token(username,
                                       tenant_id,
                                       role,
-                                      getenv("TUNNEL_AUTH_JWT_SECRET"),
+                                      getenv("SPECUS_AUTH_JWT_SECRET"),
                                       ttl,
                                       token,
                                       sizeof(token)) != 0) {
@@ -5797,25 +5797,25 @@ static int handle_management_auth_login(const char *body, char *out, size_t out_
     char token_tenant[ST_SECURITY_TOKEN_TENANT_LEN + 1];
     char token_role[ST_SECURITY_TOKEN_ROLE_LEN + 1];
     snprintf(token_username, sizeof(token_username), "%s", username);
-    snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("TUNNEL_AUTH_TENANT_ID", "default"));
+    snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
     snprintf(token_role, sizeof(token_role), "%s", "USER");
-    if (admin_ascii_casecmp(username, env_text("TUNNEL_AUTH_USERNAME", "admin")) == 0) {
-        const char *admin_password = env_text("TUNNEL_AUTH_PASSWORD", "admin");
+    if (admin_ascii_casecmp(username, env_text("SPECUS_AUTH_USERNAME", "admin")) == 0) {
+        const char *admin_password = env_text("SPECUS_AUTH_PASSWORD", "admin");
         uint8_t expected[ST_SHA256_LEN];
         uint8_t actual[ST_SHA256_LEN];
         st_sha256((const uint8_t *)admin_password, strlen(admin_password), expected);
         st_sha256((const uint8_t *)password, strlen(password), actual);
-        ok = env_bool("TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED", 1)
+        ok = env_bool("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", 1)
             && st_constant_time_eq(expected, actual, sizeof(expected));
         if (ok) {
-            snprintf(token_username, sizeof(token_username), "%s", env_text("TUNNEL_AUTH_USERNAME", "admin"));
-            snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("TUNNEL_AUTH_TENANT_ID", "default"));
+            snprintf(token_username, sizeof(token_username), "%s", env_text("SPECUS_AUTH_USERNAME", "admin"));
+            snprintf(token_tenant, sizeof(token_tenant), "%s", env_text("SPECUS_AUTH_TENANT_ID", "default"));
             snprintf(token_role, sizeof(token_role), "%s", "ADMIN");
         }
     } else {
         const char *database_path = admin_database_path();
         if (database_path != NULL
-            && st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) == 0) {
+            && st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) == 0) {
             st_storage_management_user user;
             ok = st_storage_get_management_user(database_path, username, &user) == 0
                 && user.enabled
@@ -5960,23 +5960,23 @@ static int st_admin_build_response_internal(const char *method,
             return handle_client_delete(&context, path_id, out, out_len);
         }
     }
-    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/tunnels")) {
-        return build_tunnels_response(&context, path, out, out_len);
+    if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/specus-mappings")) {
+        return build_specusMappings_response(&context, path, out, out_len);
     }
     if (strcmp(method, "POST") == 0
-        && admin_parse_nested_path_id(path, "/api/admin/clients/", "/tunnels", &path_id) == 0) {
-        return handle_tunnel_create(&context, path_id, body, out, out_len);
+        && admin_parse_nested_path_id(path, "/api/admin/clients/", "/specus-mappings", &path_id) == 0) {
+        return handle_specus_create(&context, path_id, body, out, out_len);
     }
     if (strcmp(method, "POST") == 0
         && admin_parse_nested_path_id(path, "/api/admin/clients/", "/nat-control", &path_id) == 0) {
         return handle_nat_control_push(&context, path_id, out, out_len);
     }
-    if (admin_parse_path_id(path, "/api/admin/tunnels/", &path_id) == 0) {
+    if (admin_parse_path_id(path, "/api/admin/specus-mappings/", &path_id) == 0) {
         if (strcmp(method, "PUT") == 0) {
-            return handle_tunnel_update(&context, path_id, body, out, out_len);
+            return handle_specus_update(&context, path_id, body, out, out_len);
         }
         if (strcmp(method, "DELETE") == 0) {
-            return handle_tunnel_delete(&context, path_id, out, out_len);
+            return handle_specus_delete(&context, path_id, out, out_len);
         }
     }
     if (strcmp(method, "GET") == 0 && admin_path_equals(path, "/api/admin/http-routes")) {
@@ -6024,7 +6024,7 @@ static int st_admin_build_response_internal(const char *method,
         int written = snprintf(status_body,
                                sizeof(status_body),
                                "{\"enabled\":%s}",
-                               env_bool("TUNNEL_PEER_MESH_ENABLED", 0) ? "true" : "false");
+                               env_bool("SPECUS_PEER_MESH_ENABLED", 0) ? "true" : "false");
         if (written < 0 || (size_t)written >= sizeof(status_body)) {
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"peer mesh status failed\"}");
         }
@@ -6109,12 +6109,12 @@ static int st_admin_build_response_internal(const char *method,
     }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/oidc-config") == 0) {
         char body[1024];
-        if (st_security_build_oidc_config(getenv("TUNNEL_OIDC_CLIENT_ID"),
-                                          getenv("TUNNEL_OIDC_AUTHORIZATION_ENDPOINT"),
-                                          getenv("TUNNEL_OIDC_END_SESSION_ENDPOINT"),
-                                          getenv("TUNNEL_OIDC_REDIRECT_URI"),
-                                          getenv("TUNNEL_OIDC_SCOPE"),
-                                          env_bool("TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED", 1),
+        if (st_security_build_oidc_config(getenv("SPECUS_OIDC_CLIENT_ID"),
+                                          getenv("SPECUS_OIDC_AUTHORIZATION_ENDPOINT"),
+                                          getenv("SPECUS_OIDC_END_SESSION_ENDPOINT"),
+                                          getenv("SPECUS_OIDC_REDIRECT_URI"),
+                                          getenv("SPECUS_OIDC_SCOPE"),
+                                          env_bool("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", 1),
                                           body,
                                           sizeof(body)) < 0) {
             return write_response(out, out_len, 500, "Internal Server Error", "{\"error\":\"oidc config failed\"}");
@@ -7099,7 +7099,7 @@ int st_admin_rewrite_direct_http_response(const char *client_name,
     }
     const char *database_path = admin_database_path();
     if (database_path == NULL
-        || st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return 0;
     }
     st_storage_http_route http_route;
@@ -7112,7 +7112,7 @@ int st_admin_rewrite_direct_http_response(const char *client_name,
     if (rewrite_kind == 0) {
         return 0;
     }
-    long long max_body = admin_env_nonnegative_i64("TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES",
+    long long max_body = admin_env_nonnegative_i64("SPECUS_HTTP_REWRITE_MAX_BODY_BYTES",
                                                   ST_ADMIN_DEFAULT_REWRITE_BODY_BYTES);
     if (max_body <= 0 || response->body_len > (size_t)max_body) {
         return 0;
@@ -7342,10 +7342,10 @@ static int direct_should_buffer_rewrite(const char *client_name,
 {
     const char *database_path = admin_database_path();
     st_storage_http_route http_route;
-    long long max_body = admin_env_nonnegative_i64("TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES",
+    long long max_body = admin_env_nonnegative_i64("SPECUS_HTTP_REWRITE_MAX_BODY_BYTES",
                                                    ST_ADMIN_DEFAULT_REWRITE_BODY_BYTES);
     if (database_path == NULL || max_body <= 0
-        || st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0
+        || st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0
         || st_storage_get_http_route_by_client_route(database_path, client_name, route, &http_route) != 0
         || !http_route.enabled || !http_route.path_rewrite_enabled
         || admin_response_rewrite_kind(headers, headers_len) == 0) {

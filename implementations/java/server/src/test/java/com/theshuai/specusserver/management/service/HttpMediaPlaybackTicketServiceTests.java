@@ -1,0 +1,89 @@
+package com.theshuai.specusserver.management.service;
+
+import com.theshuai.specusserver.config.MediaCaptureProperties;
+import com.theshuai.specusserver.management.model.HttpMediaCapture;
+import com.theshuai.specusserver.management.repository.HttpMediaCaptureRepository;
+import com.theshuai.specusserver.management.security.ManagementContext;
+import org.junit.jupiter.api.Test;
+
+import java.util.Optional;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+class HttpMediaPlaybackTicketServiceTests {
+
+    @Test
+    void allowsSparseProgressiveCaptureToUseCachedRangePlayback() {
+        HttpMediaCaptureService captureService = mock(HttpMediaCaptureService.class);
+        HttpMediaPlaybackService playbackService = mock(HttpMediaPlaybackService.class);
+        HttpMediaPlaybackTicketService ticketService = new HttpMediaPlaybackTicketService(
+                captureService,
+                playbackService,
+                mock(HttpMediaCaptureRepository.class),
+                mock(MediaCaptureProperties.class));
+        ManagementContext context = mock(ManagementContext.class);
+        HttpMediaCapture capture = new HttpMediaCapture();
+        capture.setId(42L);
+        capture.setTenantId("tenant-a");
+        capture.setState(HttpMediaCaptureService.STATE_COMPLETE);
+        capture.setMediaKind(HttpMediaManifestSupport.PROGRESSIVE);
+        capture.setCapturedBytes(512);
+        when(captureService.requireAccessible(context, 42L)).thenReturn(capture);
+        when(playbackService.availability(capture)).thenReturn(
+                new HttpMediaPlaybackService.PlaybackAvailability(
+                        false, 1024, "采集数据不完整，缺少字节 512"));
+        when(playbackService.cacheLayout(capture)).thenReturn(
+                new HttpMediaPlaybackService.PlaybackCacheLayout(
+                        1024,
+                        List.of(new HttpMediaPlaybackService.PlaybackByteRange(0, 511))));
+        HttpMediaPlaybackTicketService.PlaybackTicketView ticket =
+                ticketService.create(context, 42L);
+
+        assertThat(ticket.playUrl()).startsWith("/api/public/media-playback/");
+        assertThat(ticket.playUrl()).endsWith("/play");
+        assertThat(ticket.totalBytes()).isEqualTo(1024);
+        assertThat(ticket.initialRangeStart()).isZero();
+        assertThat(ticket.initialRangeEnd()).isEqualTo(511);
+        assertThat(ticket.cachedRanges()).containsExactly(
+                new HttpMediaPlaybackService.PlaybackByteRange(0, 511));
+        assertThat(ticket.backfillMissing()).isFalse();
+    }
+
+    @Test
+    void recordsOptionalBackfillInPlaybackTicket() {
+        HttpMediaCaptureService captureService = mock(HttpMediaCaptureService.class);
+        HttpMediaPlaybackService playbackService = mock(HttpMediaPlaybackService.class);
+        HttpMediaCaptureRepository captureRepository = mock(HttpMediaCaptureRepository.class);
+        HttpMediaPlaybackTicketService ticketService = new HttpMediaPlaybackTicketService(
+                captureService,
+                playbackService,
+                captureRepository,
+                mock(MediaCaptureProperties.class));
+        ManagementContext context = mock(ManagementContext.class);
+        HttpMediaCapture capture = new HttpMediaCapture();
+        capture.setId(43L);
+        capture.setTenantId("tenant-a");
+        capture.setState(HttpMediaCaptureService.STATE_COMPLETE);
+        capture.setMediaKind(HttpMediaManifestSupport.PROGRESSIVE);
+        capture.setCapturedBytes(512);
+        when(captureService.requireAccessible(context, 43L)).thenReturn(capture);
+        when(playbackService.availability(capture)).thenReturn(
+                new HttpMediaPlaybackService.PlaybackAvailability(
+                        false, 1024, "采集数据不完整，缺少字节 512"));
+        when(playbackService.cacheLayout(capture)).thenReturn(
+                new HttpMediaPlaybackService.PlaybackCacheLayout(
+                        1024,
+                        List.of(new HttpMediaPlaybackService.PlaybackByteRange(0, 511))));
+        when(captureRepository.findByIdAndTenantId(43L, "tenant-a"))
+                .thenReturn(Optional.of(capture));
+
+        HttpMediaPlaybackTicketService.PlaybackTicketView ticket =
+                ticketService.create(context, 43L, true);
+
+        assertThat(ticket.backfillMissing()).isTrue();
+        assertThat(ticketService.resolve(ticket.ticket()).backfillMissing()).isTrue();
+    }
+}

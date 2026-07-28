@@ -31,8 +31,8 @@
 typedef struct {
     long long id;
     int port;
-    char tunnel_address[256];
-    int tunnel_port;
+    char specus_address[256];
+    int specus_port;
     int detail_capture_enabled;
 } tcp_mapping;
 
@@ -68,7 +68,7 @@ typedef struct {
     int client_session_db_backed;
 } server_config;
 
-typedef struct tunnel_session tunnel_session;
+typedef struct specus_session specus_session;
 
 typedef struct external_conn {
     int fd;
@@ -92,19 +92,19 @@ typedef struct external_conn {
     int flow_closed;
     int public_finished;
     int client_finished;
-    tunnel_session *session;
+    specus_session *session;
     struct external_conn *next;
 } external_conn;
 
-typedef struct tunnel_listener {
+typedef struct specus_listener {
     int fd;
     int port;
     pthread_t thread;
     int thread_started;
     int done;
-    tunnel_session *session;
-    struct tunnel_listener *next;
-} tunnel_listener;
+    specus_session *session;
+    struct specus_listener *next;
+} specus_listener;
 
 typedef struct direct_http_event {
     int type;
@@ -137,7 +137,7 @@ typedef struct ws_conn {
     struct ws_conn *next;
 } ws_conn;
 
-struct tunnel_session {
+struct specus_session {
     int control_fd;
     int is_data_connection;
     server_config config;
@@ -146,14 +146,14 @@ struct tunnel_session {
     pthread_mutex_t direct_lock;
     external_conn *conns;
     ws_conn *ws_conns;
-    tunnel_listener *listeners;
+    specus_listener *listeners;
     direct_http_pending *direct_pending;
     int active;
     uint32_t next_stream_id;
     char remote[128];
     long long connection_record_id;
     char connected_at[64];
-    struct tunnel_session *active_next;
+    struct specus_session *active_next;
 };
 
 typedef struct {
@@ -172,20 +172,20 @@ typedef struct {
 static pthread_mutex_t global_external_lock = PTHREAD_MUTEX_INITIALIZER;
 static int global_external_connections = 0;
 static pthread_mutex_t active_session_lock = PTHREAD_MUTEX_INITIALIZER;
-static tunnel_session *active_sessions = NULL;
+static specus_session *active_sessions = NULL;
 
 static char *json_http_request(const st_direct_http_request *request);
-static int send_reset(tunnel_session *session, uint32_t stream_id,
+static int send_reset(specus_session *session, uint32_t stream_id,
                       uint32_t code, const char *reason);
-static int send_window_update(tunnel_session *session, uint32_t stream_id, size_t credit);
+static int send_window_update(specus_session *session, uint32_t stream_id, size_t credit);
 
-static int send_ws_open(tunnel_session *session, uint32_t stream_id,
+static int send_ws_open(specus_session *session, uint32_t stream_id,
                         const st_admin_direct_ws_request *request);
-static int send_ws_fin(tunnel_session *session, uint32_t stream_id);
-static int send_ws_data(tunnel_session *session, uint32_t stream_id,
+static int send_ws_fin(specus_session *session, uint32_t stream_id);
+static int send_ws_data(specus_session *session, uint32_t stream_id,
                         const uint8_t *data, size_t data_len);
-static ws_conn *find_ws_conn_locked(tunnel_session *session, const char *channel_id);
-static ws_conn *remove_ws_conn_locked(tunnel_session *session, const char *channel_id);
+static ws_conn *find_ws_conn_locked(specus_session *session, const char *channel_id);
+static ws_conn *remove_ws_conn_locked(specus_session *session, const char *channel_id);
 static int current_utc_timestamp(char out[64]);
 
 static char *dup_string(const char *value)
@@ -370,7 +370,7 @@ static int parse_port_text(const char *value, int *out)
 
 static int parse_tcp_mappings(server_config *config)
 {
-    const char *raw = getenv("TUNNEL_TCP_MAPPINGS");
+    const char *raw = getenv("SPECUS_TCP_MAPPINGS");
     if (raw == NULL || *raw == '\0') {
         return 0;
     }
@@ -383,7 +383,7 @@ static int parse_tcp_mappings(server_config *config)
     char *token = next_csv_token(&cursor);
     while (token != NULL) {
         if (config->mapping_count >= ST_MAX_TCP_MAPPINGS) {
-            fprintf(stderr, "too many TUNNEL_TCP_MAPPINGS entries; max is %u\n", (unsigned)ST_MAX_TCP_MAPPINGS);
+            fprintf(stderr, "too many SPECUS_TCP_MAPPINGS entries; max is %u\n", (unsigned)ST_MAX_TCP_MAPPINGS);
             free(copy);
             return -1;
         }
@@ -411,7 +411,7 @@ static int parse_tcp_mappings(server_config *config)
             free(copy);
             return -1;
         }
-        if (strlen(target_host) >= sizeof(config->mappings[0].tunnel_address)) {
+        if (strlen(target_host) >= sizeof(config->mappings[0].specus_address)) {
             fprintf(stderr, "mapping target host is too long\n");
             free(copy);
             return -1;
@@ -419,13 +419,13 @@ static int parse_tcp_mappings(server_config *config)
 
         tcp_mapping *mapping = &config->mappings[config->mapping_count];
         if (parse_port_text(public_port_text, &mapping->port) != 0
-            || parse_port_text(target_port_text, &mapping->tunnel_port) != 0) {
+            || parse_port_text(target_port_text, &mapping->specus_port) != 0) {
             fprintf(stderr, "invalid mapping port in \"%s=%s:%s\"\n",
                     public_port_text, target_host, target_port_text);
             free(copy);
             return -1;
         }
-        strcpy(mapping->tunnel_address, target_host);
+        strcpy(mapping->specus_address, target_host);
         ++config->mapping_count;
         token = next_csv_token(&cursor);
     }
@@ -435,7 +435,7 @@ static int parse_tcp_mappings(server_config *config)
 
 static int parse_http_routes(server_config *config)
 {
-    const char *raw = getenv("TUNNEL_HTTP_ROUTES");
+    const char *raw = getenv("SPECUS_HTTP_ROUTES");
     if (raw == NULL || *raw == '\0') {
         return 0;
     }
@@ -448,7 +448,7 @@ static int parse_http_routes(server_config *config)
     char *token = next_csv_token(&cursor);
     while (token != NULL) {
         if (config->http_route_count >= ST_MAX_TCP_MAPPINGS) {
-            fprintf(stderr, "too many TUNNEL_HTTP_ROUTES entries; max is %u\n", (unsigned)ST_MAX_TCP_MAPPINGS);
+            fprintf(stderr, "too many SPECUS_HTTP_ROUTES entries; max is %u\n", (unsigned)ST_MAX_TCP_MAPPINGS);
             free(copy);
             return -1;
         }
@@ -484,7 +484,7 @@ static int parse_http_routes(server_config *config)
 
 static int load_database_config(server_config *config, const char *database_path)
 {
-    if (st_storage_init(database_path, env_bool("TUNNEL_DB_SEED_DEMO_CLIENT", 1)) != 0) {
+    if (st_storage_init(database_path, env_bool("SPECUS_DB_SEED_DEMO_CLIENT", 1)) != 0) {
         return -1;
     }
     st_storage_client client;
@@ -507,15 +507,15 @@ static int load_database_config(server_config *config, const char *database_path
                                  mappings,
                                  ST_MAX_TCP_MAPPINGS,
                                  &mapping_count) != 0) {
-        fprintf(stderr, "failed to load tunnel mappings from database\n");
+        fprintf(stderr, "failed to load specus mappings from database\n");
         return -1;
     }
     for (size_t i = 0; i < mapping_count; ++i) {
         tcp_mapping *mapping = &config->mappings[config->mapping_count++];
         mapping->id = mappings[i].id;
         mapping->port = mappings[i].listen_port;
-        strcpy(mapping->tunnel_address, mappings[i].target_address);
-        mapping->tunnel_port = mappings[i].target_port;
+        strcpy(mapping->specus_address, mappings[i].target_address);
+        mapping->specus_port = mappings[i].target_port;
         mapping->detail_capture_enabled = mappings[i].detail_capture_enabled;
     }
     st_storage_http_route routes[ST_MAX_TCP_MAPPINGS];
@@ -555,7 +555,7 @@ static int build_nat_control_json(server_config *config)
 
     string_builder builder = {0};
     if (sb_appendf(&builder,
-                   "{\"clientName\":\"%s\",\"remoteAddress\":\"%s\",\"remotePort\":%d,\"tunnelConfigList\":[",
+                   "{\"clientName\":\"%s\",\"remoteAddress\":\"%s\",\"remotePort\":%d,\"specusConfigList\":[",
                    client_name,
                    public_address,
                    config->port) != 0) {
@@ -568,24 +568,24 @@ static int build_nat_control_json(server_config *config)
     free(public_address);
 
     for (size_t i = 0; i < config->mapping_count; ++i) {
-        char *target = st_json_escape(config->mappings[i].tunnel_address);
+        char *target = st_json_escape(config->mappings[i].specus_address);
         if (target == NULL) {
             free(builder.data);
             return -1;
         }
         int rc = sb_appendf(&builder,
-                            "%s{\"port\":%d,\"tunnelAddress\":\"%s\",\"tunnelPort\":%d}",
+                            "%s{\"port\":%d,\"specusAddress\":\"%s\",\"specusPort\":%d}",
                             i == 0 ? "" : ",",
                             config->mappings[i].port,
                             target,
-                            config->mappings[i].tunnel_port);
+                            config->mappings[i].specus_port);
         free(target);
         if (rc != 0) {
             free(builder.data);
             return -1;
         }
     }
-    if (sb_append(&builder, "],\"httpTunnelConfigList\":[") != 0) {
+    if (sb_append(&builder, "],\"httpSpecusConfigList\":[") != 0) {
         free(builder.data);
         return -1;
     }
@@ -620,43 +620,43 @@ static int build_nat_control_json(server_config *config)
 
 static int load_config(server_config *config)
 {
-    const char *name = getenv("TUNNEL_CLIENT_NAME");
-    const char *access_token = getenv("TUNNEL_CLIENT_ACCESS_TOKEN");
-    const char *access_token_hash = getenv("TUNNEL_CLIENT_ACCESS_TOKEN_HASH");
-    const char *public_address = getenv("TUNNEL_PUBLIC_ADDRESS");
-    const char *database_path = getenv("TUNNEL_DATABASE_PATH");
-    const char *static_root = getenv("TUNNEL_STATIC_ROOT");
-    const char *tenant_id = getenv("TUNNEL_CLIENT_TENANT_ID");
+    const char *name = getenv("SPECUS_CLIENT_NAME");
+    const char *access_token = getenv("SPECUS_CLIENT_ACCESS_TOKEN");
+    const char *access_token_hash = getenv("SPECUS_CLIENT_ACCESS_TOKEN_HASH");
+    const char *public_address = getenv("SPECUS_PUBLIC_ADDRESS");
+    const char *database_path = getenv("SPECUS_DATABASE_PATH");
+    const char *static_root = getenv("SPECUS_STATIC_ROOT");
+    const char *tenant_id = getenv("SPECUS_CLIENT_TENANT_ID");
     if (tenant_id == NULL || *tenant_id == '\0') {
-        tenant_id = getenv("TUNNEL_AUTH_TENANT_ID");
+        tenant_id = getenv("SPECUS_AUTH_TENANT_ID");
     }
 
     memset(config, 0, sizeof(*config));
     if (copy_config_string(config->client_name, sizeof(config->client_name),
-                           "TUNNEL_CLIENT_NAME",
+                           "SPECUS_CLIENT_NAME",
                            (name != NULL && *name != '\0') ? name : "Demo client") != 0
         || copy_config_string(config->tenant_id, sizeof(config->tenant_id),
-                              "TUNNEL_CLIENT_TENANT_ID",
+                              "SPECUS_CLIENT_TENANT_ID",
                               (tenant_id != NULL && *tenant_id != '\0') ? tenant_id : "default") != 0
         || copy_config_string(config->public_address, sizeof(config->public_address),
-                              "TUNNEL_PUBLIC_ADDRESS",
+                              "SPECUS_PUBLIC_ADDRESS",
                               (public_address != NULL && *public_address != '\0') ? public_address : "127.0.0.1") != 0
-        || env_int_range("TUNNEL_NETTY_PORT", 7010, 1, 65535, &config->port) != 0
-        || env_i64_range("TUNNEL_CLIENT_ID", 0, 0, INT64_MAX, &config->client_id) != 0
-        || env_i64_range("TUNNEL_CLIENT_SESSION_ID", 1, 1, INT64_MAX, &config->client_session_id) != 0
-        || env_int_range("TUNNEL_CONTROL_READ_IDLE_SECONDS", 60, 5, 3600,
+        || env_int_range("SPECUS_NETTY_PORT", 7010, 1, 65535, &config->port) != 0
+        || env_i64_range("SPECUS_CLIENT_ID", 0, 0, INT64_MAX, &config->client_id) != 0
+        || env_i64_range("SPECUS_CLIENT_SESSION_ID", 1, 1, INT64_MAX, &config->client_session_id) != 0
+        || env_int_range("SPECUS_CONTROL_READ_IDLE_SECONDS", 60, 5, 3600,
                          &config->control_read_idle_seconds) != 0
-        || env_int_range("TUNNEL_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
+        || env_int_range("SPECUS_MAX_GLOBAL_EXTERNAL_CONNECTIONS", 4096, 1, 1000000,
                          &config->max_global_external_connections) != 0
-        || env_int_range("TUNNEL_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
+        || env_int_range("SPECUS_MAX_CLIENT_EXTERNAL_CONNECTIONS", 1024, 1, 1000000,
                          &config->max_client_external_connections) != 0
-        || env_int_range("TUNNEL_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
+        || env_int_range("SPECUS_MAX_PORT_EXTERNAL_CONNECTIONS", 512, 1, 1000000,
                          &config->max_port_external_connections) != 0
-        || env_int_range("TUNNEL_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0) {
+        || env_int_range("SPECUS_ADMIN_PORT", 0, 0, 65535, &config->admin_port) != 0) {
         return -1;
     }
     if (copy_config_string(config->static_root, sizeof(config->static_root),
-                           "TUNNEL_STATIC_ROOT",
+                           "SPECUS_STATIC_ROOT",
                            (static_root != NULL && *static_root != '\0')
                                ? static_root
                                : "implementations/java/server/src/main/resources/static") != 0) {
@@ -665,7 +665,7 @@ static int load_config(server_config *config)
 
     if (database_path != NULL && *database_path != '\0') {
         if (copy_config_string(config->database_path, sizeof(config->database_path),
-                               "TUNNEL_DATABASE_PATH", database_path) != 0) {
+                               "SPECUS_DATABASE_PATH", database_path) != 0) {
             return -1;
         }
         if (load_database_config(config, database_path) != 0) {
@@ -678,14 +678,14 @@ static int load_config(server_config *config)
     }
     if (access_token_hash != NULL && *access_token_hash != '\0') {
         if (st_hex_decode_32(access_token_hash, config->access_token_hash) != 0) {
-            fprintf(stderr, "invalid TUNNEL_CLIENT_ACCESS_TOKEN_HASH; expected 64 hex chars\n");
+            fprintf(stderr, "invalid SPECUS_CLIENT_ACCESS_TOKEN_HASH; expected 64 hex chars\n");
             return -1;
         }
     } else if (access_token != NULL && *access_token != '\0') {
         st_sha256((const uint8_t *)access_token, strlen(access_token), config->access_token_hash);
     } else if (config->database_path[0] == '\0') {
         if (access_token == NULL || *access_token == '\0') {
-            fprintf(stderr, "TUNNEL_CLIENT_ACCESS_TOKEN is required when TUNNEL_CLIENT_ACCESS_TOKEN_HASH is unset\n");
+            fprintf(stderr, "SPECUS_CLIENT_ACCESS_TOKEN is required when SPECUS_CLIENT_ACCESS_TOKEN_HASH is unset\n");
             return -1;
         }
     }
@@ -827,7 +827,7 @@ static void record_login_failure_event(const server_config *config,
     st_admin_broadcast_connection_event(config->tenant_id, "created", &connection);
 }
 
-static void record_login_success_event(tunnel_session *session)
+static void record_login_success_event(specus_session *session)
 {
     if (session->config.database_path[0] == '\0') {
         return;
@@ -866,7 +866,7 @@ static void record_login_success_event(tunnel_session *session)
     st_admin_broadcast_connection_event(session->config.tenant_id, "created", &connection);
 }
 
-static void record_session_disconnected_event(tunnel_session *session, const char *reason)
+static void record_session_disconnected_event(specus_session *session, const char *reason)
 {
     if (session->config.database_path[0] == '\0'
         || session->connection_record_id <= 0
@@ -917,12 +917,12 @@ static void build_tcp_resource_name(const tcp_mapping *mapping, int port, char o
                  512U,
                  "%d -> %s:%d",
                  mapping->port,
-                 mapping->tunnel_address,
-                 mapping->tunnel_port);
+                 mapping->specus_address,
+                 mapping->specus_port);
     }
 }
 
-static void record_tcp_traffic(tunnel_session *session, int port, long long upload_bytes, long long download_bytes)
+static void record_tcp_traffic(specus_session *session, int port, long long upload_bytes, long long download_bytes)
 {
     if (session == NULL
         || session->config.database_path[0] == '\0'
@@ -947,7 +947,7 @@ static void record_tcp_traffic(tunnel_session *session, int port, long long uplo
     st_storage_record_resource_traffic_usage(database_path,
                                              client_id,
                                              client_name,
-                                             "TCP_TUNNEL",
+                                             "TCP_SPECUS",
                                              resource_key,
                                              resource_id,
                                              resource_name,
@@ -956,7 +956,7 @@ static void record_tcp_traffic(tunnel_session *session, int port, long long uplo
                                              download_bytes);
 }
 
-static void record_tcp_frame(tunnel_session *session,
+static void record_tcp_frame(specus_session *session,
                              external_conn *conn,
                              const char *direction,
                              const uint8_t *data,
@@ -989,12 +989,12 @@ static void record_tcp_frame(tunnel_session *session,
     }
     const char *source_address = strcmp(direction, "PUBLIC_TO_CLIENT") == 0
         ? conn->remote_ip
-        : mapping->tunnel_address;
-    int source_port = strcmp(direction, "PUBLIC_TO_CLIENT") == 0 ? conn->remote_port : mapping->tunnel_port;
+        : mapping->specus_address;
+    int source_port = strcmp(direction, "PUBLIC_TO_CLIENT") == 0 ? conn->remote_port : mapping->specus_port;
     const char *destination_address = strcmp(direction, "PUBLIC_TO_CLIENT") == 0
-        ? mapping->tunnel_address
+        ? mapping->specus_address
         : conn->remote_ip;
-    int destination_port = strcmp(direction, "PUBLIC_TO_CLIENT") == 0 ? mapping->tunnel_port : conn->remote_port;
+    int destination_port = strcmp(direction, "PUBLIC_TO_CLIENT") == 0 ? mapping->specus_port : conn->remote_port;
     st_storage_tcp_frame_record record = {
         .tenant_id = session->config.tenant_id,
         .client_id = session->config.client_id,
@@ -1056,7 +1056,7 @@ static int send_all(int fd, const uint8_t *buffer, size_t len)
     return 0;
 }
 
-static int session_send_packet(tunnel_session *session, st_buffer *packet)
+static int session_send_packet(specus_session *session, st_buffer *packet)
 {
     int rc = -1;
     if (packet->data != NULL) {
@@ -1070,7 +1070,7 @@ static int session_send_packet(tunnel_session *session, st_buffer *packet)
     return rc;
 }
 
-static void direct_pending_fail_all(tunnel_session *session, const char *message)
+static void direct_pending_fail_all(specus_session *session, const char *message)
 {
     pthread_mutex_lock(&session->direct_lock);
     for (direct_http_pending *pending = session->direct_pending; pending != NULL; pending = pending->next) {
@@ -1084,7 +1084,7 @@ static void direct_pending_fail_all(tunnel_session *session, const char *message
     pthread_mutex_unlock(&session->direct_lock);
 }
 
-static void direct_pending_remove(tunnel_session *session, direct_http_pending *target)
+static void direct_pending_remove(specus_session *session, direct_http_pending *target)
 {
     direct_http_pending **cursor = &session->direct_pending;
     while (*cursor != NULL) {
@@ -1119,7 +1119,7 @@ static void direct_pending_free_events(direct_http_pending *pending)
     pending->event_count = 0;
 }
 
-static direct_http_pending *find_direct_pending_locked(tunnel_session *session, uint32_t stream_id)
+static direct_http_pending *find_direct_pending_locked(specus_session *session, uint32_t stream_id)
 {
     for (direct_http_pending *pending = session->direct_pending; pending != NULL; pending = pending->next) {
         if (pending->stream_id == stream_id) {
@@ -1185,7 +1185,7 @@ static direct_http_event *direct_pending_pop(direct_http_pending *pending)
     return event;
 }
 
-static int process_direct_http_message(tunnel_session *session, const st_nat_message *message)
+static int process_direct_http_message(specus_session *session, const st_nat_message *message)
 {
     pthread_mutex_lock(&session->direct_lock);
     direct_http_pending *pending = find_direct_pending_locked(session, message->stream_id);
@@ -1263,7 +1263,7 @@ static int config_has_http_route(const server_config *config, const char *route)
     return 0;
 }
 
-static void active_session_add_locked(tunnel_session *session)
+static void active_session_add_locked(specus_session *session)
 {
     if (session == NULL) {
         return;
@@ -1272,9 +1272,9 @@ static void active_session_add_locked(tunnel_session *session)
     active_sessions = session;
 }
 
-static void active_session_remove_locked(tunnel_session *session)
+static void active_session_remove_locked(specus_session *session)
 {
-    tunnel_session **cursor = &active_sessions;
+    specus_session **cursor = &active_sessions;
     while (*cursor != NULL) {
         if (*cursor == session) {
             *cursor = session->active_next;
@@ -1285,9 +1285,9 @@ static void active_session_remove_locked(tunnel_session *session)
     }
 }
 
-static tunnel_session *active_session_find_role_locked(const char *client_name, int data_connection)
+static specus_session *active_session_find_role_locked(const char *client_name, int data_connection)
 {
-    for (tunnel_session *session = active_sessions; session != NULL; session = session->active_next) {
+    for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
         if (session->active
             && session->is_data_connection == data_connection
             && strcmp(client_name, session->config.client_name) == 0) {
@@ -1297,17 +1297,17 @@ static tunnel_session *active_session_find_role_locked(const char *client_name, 
     return NULL;
 }
 
-static tunnel_session *active_data_session_find_locked(const char *client_name)
+static specus_session *active_data_session_find_locked(const char *client_name)
 {
     return active_session_find_role_locked(client_name, 1);
 }
 
-static void active_session_close_peer_locked(tunnel_session *session)
+static void active_session_close_peer_locked(specus_session *session)
 {
     if (session == NULL) {
         return;
     }
-    tunnel_session *peer = active_session_find_role_locked(
+    specus_session *peer = active_session_find_role_locked(
         session->config.client_name, !session->is_data_connection);
     if (peer != NULL && peer != session) {
         shutdown(peer->control_fd, SHUT_RDWR);
@@ -1328,7 +1328,7 @@ static int direct_http_forward(void *ctx,
     }
 
     pthread_mutex_lock(&active_session_lock);
-    tunnel_session *session = active_data_session_find_locked(client_name);
+    specus_session *session = active_data_session_find_locked(client_name);
     if (session == NULL) {
         pthread_mutex_unlock(&active_session_lock);
         return -1;
@@ -1522,7 +1522,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
     (void)ctx;
 
     pthread_mutex_lock(&active_session_lock);
-    tunnel_session *session = active_data_session_find_locked(request->client_name);
+    specus_session *session = active_data_session_find_locked(request->client_name);
     if (session == NULL) {
         pthread_mutex_unlock(&active_session_lock);
         return -1;
@@ -1558,7 +1558,7 @@ static int direct_ws_open(void *ctx, const st_admin_direct_ws_request *request)
         return -1;
     }
 
-    printf("[ws-tunnel] open client=%s route=%s channel=%s\n",
+    printf("[ws-specus] open client=%s route=%s channel=%s\n",
            request->client_name, request->route, request->channel_id);
     pthread_mutex_unlock(&active_session_lock);
     return 0;
@@ -1572,7 +1572,7 @@ static int direct_ws_data(void *ctx, const char *channel_id, const uint8_t *payl
     ws_conn *removed = NULL;
 
     pthread_mutex_lock(&active_session_lock);
-    for (tunnel_session *session = active_sessions; session != NULL; session = session->active_next) {
+    for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
         pthread_mutex_lock(&session->map_lock);
         ws_conn *conn = find_ws_conn_locked(session, channel_id);
         if (conn != NULL) {
@@ -1601,13 +1601,13 @@ static void direct_ws_close(void *ctx, const char *channel_id)
 {
     (void)ctx;
     pthread_mutex_lock(&active_session_lock);
-    for (tunnel_session *session = active_sessions; session != NULL; session = session->active_next) {
+    for (specus_session *session = active_sessions; session != NULL; session = session->active_next) {
         pthread_mutex_lock(&session->map_lock);
         ws_conn *removed = remove_ws_conn_locked(session, channel_id);
         pthread_mutex_unlock(&session->map_lock);
         if (removed != NULL) {
             send_ws_fin(session, removed->stream_id);
-            printf("[ws-tunnel] close client=%s channel=%s\n",
+            printf("[ws-specus] close client=%s channel=%s\n",
                    session->config.client_name, channel_id);
             free(removed);
             break;
@@ -1682,7 +1682,7 @@ static int reload_config_for_client_session(server_config *config, const st_stor
     return 0;
 }
 
-static int verify_database_login(tunnel_session *session, const st_login_request *request, const char **reason)
+static int verify_database_login(specus_session *session, const st_login_request *request, const char **reason)
 {
     server_config *config = &session->config;
     if (config->database_path[0] == '\0') {
@@ -1710,7 +1710,7 @@ static int verify_database_login(tunnel_session *session, const st_login_request
             return 0;
         }
         pthread_mutex_lock(&active_session_lock);
-        tunnel_session *control = active_session_find_role_locked(request->client_name, 0);
+        specus_session *control = active_session_find_role_locked(request->client_name, 0);
         int matching_control = control != NULL
             && control->config.client_session_id == client_session.id;
         pthread_mutex_unlock(&active_session_lock);
@@ -1795,7 +1795,7 @@ static int verify_database_login(tunnel_session *session, const st_login_request
     return 1;
 }
 
-static int verify_login(tunnel_session *session, const st_login_request *request, const char **reason)
+static int verify_login(specus_session *session, const st_login_request *request, const char **reason)
 {
     server_config *config = &session->config;
     if (request->client_name == NULL
@@ -1831,7 +1831,7 @@ static int verify_login(tunnel_session *session, const st_login_request *request
 
     if (session->is_data_connection) {
         pthread_mutex_lock(&active_session_lock);
-        tunnel_session *control = active_session_find_role_locked(request->client_name, 0);
+        specus_session *control = active_session_find_role_locked(request->client_name, 0);
         int matching_control = control != NULL
             && control->config.client_session_id == request->client_session_id;
         pthread_mutex_unlock(&active_session_lock);
@@ -1927,13 +1927,13 @@ static void configure_control_socket(int fd, const server_config *config)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 }
 
-static int mapping_allowed(const server_config *config, int port, const char *address, int tunnel_port)
+static int mapping_allowed(const server_config *config, int port, const char *address, int specus_port)
 {
     for (size_t i = 0; i < config->mapping_count; ++i) {
         const tcp_mapping *mapping = &config->mappings[i];
         if (mapping->port == port
-            && mapping->tunnel_port == tunnel_port
-            && strcmp(mapping->tunnel_address, address) == 0) {
+            && mapping->specus_port == specus_port
+            && strcmp(mapping->specus_address, address) == 0) {
             return 1;
         }
     }
@@ -2137,7 +2137,7 @@ static char *json_reset_reason(const char *reason)
     return sb_finish(&builder);
 }
 
-static int send_nat_with_json(tunnel_session *session, int type, uint32_t stream_id, uint32_t value,
+static int send_nat_with_json(specus_session *session, int type, uint32_t stream_id, uint32_t value,
                               char *json, const uint8_t *data, size_t data_len)
 {
     st_buffer packet = st_protocol_encode_nat_message(type, 0U, stream_id, value, json, data, data_len);
@@ -2145,37 +2145,37 @@ static int send_nat_with_json(tunnel_session *session, int type, uint32_t stream
     return session_send_packet(session, &packet);
 }
 
-static int send_register_result(tunnel_session *session, int port, int success, const char *reason)
+static int send_register_result(specus_session *session, int port, int success, const char *reason)
 {
     return send_nat_with_json(session, ST_NAT_REGISTER_RESULT, 0U, 0U,
                               json_register_result(port, success, reason),
                               NULL, 0);
 }
 
-static int send_open(tunnel_session *session, uint32_t stream_id, const char *channel_id, int port)
+static int send_open(specus_session *session, uint32_t stream_id, const char *channel_id, int port)
 {
     return send_nat_with_json(session, ST_NAT_OPEN, stream_id, 0U,
                               json_connected(channel_id, port), NULL, 0);
 }
 
-static int send_fin(tunnel_session *session, uint32_t stream_id)
+static int send_fin(specus_session *session, uint32_t stream_id)
 {
     return send_nat_with_json(session, ST_NAT_FIN, stream_id, 0U, NULL, NULL, 0);
 }
 
-static int send_reset(tunnel_session *session, uint32_t stream_id,
+static int send_reset(specus_session *session, uint32_t stream_id,
                       uint32_t code, const char *reason)
 {
     return send_nat_with_json(session, ST_NAT_RST, stream_id, code,
                               json_reset_reason(reason), NULL, 0);
 }
 
-static int send_data(tunnel_session *session, uint32_t stream_id, const uint8_t *data, size_t data_len)
+static int send_data(specus_session *session, uint32_t stream_id, const uint8_t *data, size_t data_len)
 {
     return send_nat_with_json(session, ST_NAT_DATA, stream_id, 0U, NULL, data, data_len);
 }
 
-static int send_window_update(tunnel_session *session, uint32_t stream_id, size_t credit)
+static int send_window_update(specus_session *session, uint32_t stream_id, size_t credit)
 {
     if (credit == 0U || credit > UINT32_MAX) {
         return -1;
@@ -2184,24 +2184,24 @@ static int send_window_update(tunnel_session *session, uint32_t stream_id, size_
                               (uint32_t)credit, NULL, NULL, 0);
 }
 
-static int send_ws_open(tunnel_session *session, uint32_t stream_id,
+static int send_ws_open(specus_session *session, uint32_t stream_id,
                         const st_admin_direct_ws_request *request)
 {
     return send_nat_with_json(session, ST_NAT_OPEN, stream_id, 0U,
                               json_ws_connected(request), NULL, 0);
 }
 
-static int send_ws_fin(tunnel_session *session, uint32_t stream_id)
+static int send_ws_fin(specus_session *session, uint32_t stream_id)
 {
     return send_nat_with_json(session, ST_NAT_FIN, stream_id, 0U, NULL, NULL, 0);
 }
 
-static int send_ws_data(tunnel_session *session, uint32_t stream_id, const uint8_t *data, size_t data_len)
+static int send_ws_data(specus_session *session, uint32_t stream_id, const uint8_t *data, size_t data_len)
 {
     return send_nat_with_json(session, ST_NAT_DATA, stream_id, 0U, NULL, data, data_len);
 }
 
-static external_conn *find_conn_locked(tunnel_session *session, uint32_t stream_id)
+static external_conn *find_conn_locked(specus_session *session, uint32_t stream_id)
 {
     for (external_conn *conn = session->conns; conn != NULL; conn = conn->next) {
         if (!conn->done && conn->stream_id == stream_id) {
@@ -2211,7 +2211,7 @@ static external_conn *find_conn_locked(tunnel_session *session, uint32_t stream_
     return NULL;
 }
 
-static ws_conn *find_ws_conn_locked(tunnel_session *session, const char *channel_id)
+static ws_conn *find_ws_conn_locked(specus_session *session, const char *channel_id)
 {
     for (ws_conn *conn = session->ws_conns; conn != NULL; conn = conn->next) {
         if (strcmp(conn->channel_id, channel_id) == 0) {
@@ -2221,7 +2221,7 @@ static ws_conn *find_ws_conn_locked(tunnel_session *session, const char *channel
     return NULL;
 }
 
-static ws_conn *find_ws_stream_locked(tunnel_session *session, uint32_t stream_id)
+static ws_conn *find_ws_stream_locked(specus_session *session, uint32_t stream_id)
 {
     for (ws_conn *conn = session->ws_conns; conn != NULL; conn = conn->next) {
         if (conn->stream_id == stream_id) {
@@ -2231,7 +2231,7 @@ static ws_conn *find_ws_stream_locked(tunnel_session *session, uint32_t stream_i
     return NULL;
 }
 
-static ws_conn *remove_ws_conn_locked(tunnel_session *session, const char *channel_id)
+static ws_conn *remove_ws_conn_locked(specus_session *session, const char *channel_id)
 {
     ws_conn **cursor = &session->ws_conns;
     while (*cursor != NULL) {
@@ -2246,7 +2246,7 @@ static ws_conn *remove_ws_conn_locked(tunnel_session *session, const char *chann
     return NULL;
 }
 
-static ws_conn *remove_ws_stream_locked(tunnel_session *session, uint32_t stream_id)
+static ws_conn *remove_ws_stream_locked(specus_session *session, uint32_t stream_id)
 {
     ws_conn **cursor = &session->ws_conns;
     while (*cursor != NULL) {
@@ -2323,7 +2323,7 @@ static int add_send_credit(external_conn *conn, uint32_t credit)
     return 0;
 }
 
-static int count_external_locked(tunnel_session *session, int port, int *client_count, int *port_count)
+static int count_external_locked(specus_session *session, int port, int *client_count, int *port_count)
 {
     int total = 0;
     int on_port = 0;
@@ -2342,7 +2342,7 @@ static int count_external_locked(tunnel_session *session, int port, int *client_
 
 static int try_count_external_connection(external_conn *conn)
 {
-    tunnel_session *session = conn->session;
+    specus_session *session = conn->session;
     int client_count = 0;
     int port_count = 0;
     count_external_locked(session, conn->port, &client_count, &port_count);
@@ -2364,7 +2364,7 @@ static int try_count_external_connection(external_conn *conn)
 
 static void mark_conn_done(external_conn *conn)
 {
-    tunnel_session *session = conn->session;
+    specus_session *session = conn->session;
     pthread_mutex_lock(&session->map_lock);
     close_conn_locked(conn);
     pthread_mutex_unlock(&session->map_lock);
@@ -2373,7 +2373,7 @@ static void mark_conn_done(external_conn *conn)
 static void *external_conn_thread(void *arg)
 {
     external_conn *conn = (external_conn *)arg;
-    tunnel_session *session = conn->session;
+    specus_session *session = conn->session;
     printf("[nat] external connected channel=%s port=%d client=%s\n",
            conn->channel_id, conn->port, session->config.client_name);
 
@@ -2421,7 +2421,7 @@ static void *external_conn_thread(void *arg)
     return NULL;
 }
 
-static int start_external_conn(tunnel_session *session,
+static int start_external_conn(specus_session *session,
                                int fd,
                                int port,
                                const struct sockaddr_storage *remote)
@@ -2479,8 +2479,8 @@ static int start_external_conn(tunnel_session *session,
 
 static void *listener_thread(void *arg)
 {
-    tunnel_listener *listener = (tunnel_listener *)arg;
-    tunnel_session *session = listener->session;
+    specus_listener *listener = (specus_listener *)arg;
+    specus_session *session = listener->session;
     printf("[nat] listening on 0.0.0.0:%d for client=%s\n",
            listener->port, session->config.client_name);
 
@@ -2511,9 +2511,9 @@ static void *listener_thread(void *arg)
     return NULL;
 }
 
-static int listener_exists_locked(tunnel_session *session, int port)
+static int listener_exists_locked(specus_session *session, int port)
 {
-    for (tunnel_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
+    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (!listener->done && listener->fd >= 0 && listener->port == port) {
             return 1;
         }
@@ -2521,7 +2521,7 @@ static int listener_exists_locked(tunnel_session *session, int port)
     return 0;
 }
 
-static int start_tunnel_listener(tunnel_session *session, int port, char *reason, size_t reason_len)
+static int start_specus_listener(specus_session *session, int port, char *reason, size_t reason_len)
 {
     int fd = create_listener(port);
     if (fd < 0) {
@@ -2529,7 +2529,7 @@ static int start_tunnel_listener(tunnel_session *session, int port, char *reason
         return -1;
     }
 
-    tunnel_listener *listener = (tunnel_listener *)calloc(1, sizeof(*listener));
+    specus_listener *listener = (specus_listener *)calloc(1, sizeof(*listener));
     if (listener == NULL) {
         close(fd);
         snprintf(reason, reason_len, "server out of memory");
@@ -2565,10 +2565,10 @@ static int start_tunnel_listener(tunnel_session *session, int port, char *reason
     return 0;
 }
 
-static void stop_tunnel_listener(tunnel_session *session, int port)
+static void stop_specus_listener(specus_session *session, int port)
 {
     pthread_mutex_lock(&session->map_lock);
-    for (tunnel_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
+    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (!listener->done && listener->port == port) {
             if (listener->fd >= 0) {
                 shutdown(listener->fd, SHUT_RDWR);
@@ -2581,51 +2581,51 @@ static void stop_tunnel_listener(tunnel_session *session, int port)
     pthread_mutex_unlock(&session->map_lock);
 }
 
-static void process_register(tunnel_session *session, const st_nat_message *message)
+static void process_register(specus_session *session, const st_nat_message *message)
 {
     int port;
-    int tunnel_port;
-    char *tunnel_address = st_json_get_string(message->meta_json, "tunnelAddress");
+    int specus_port;
+    char *specus_address = st_json_get_string(message->meta_json, "specusAddress");
     char *client_name = st_json_get_string(message->meta_json, "clientName");
     if (st_json_get_int(message->meta_json, "port", &port) != 0
-        || st_json_get_int(message->meta_json, "tunnelPort", &tunnel_port) != 0
-        || tunnel_address == NULL
+        || st_json_get_int(message->meta_json, "specusPort", &specus_port) != 0
+        || specus_address == NULL
         || client_name == NULL) {
         send_register_result(session, 0, 0, "missing required metadata");
-        free(tunnel_address);
+        free(specus_address);
         free(client_name);
         return;
     }
 
     if (strcmp(client_name, session->config.client_name) != 0) {
         send_register_result(session, port, 0, "clientName mismatch");
-        free(tunnel_address);
+        free(specus_address);
         free(client_name);
         return;
     }
-    if (!mapping_allowed(&session->config, port, tunnel_address, tunnel_port)) {
+    if (!mapping_allowed(&session->config, port, specus_address, specus_port)) {
         send_register_result(session, port, 0, "port mapping not configured");
-        free(tunnel_address);
+        free(specus_address);
         free(client_name);
         return;
     }
 
     char reason[128];
-    if (start_tunnel_listener(session, port, reason, sizeof(reason)) != 0) {
+    if (start_specus_listener(session, port, reason, sizeof(reason)) != 0) {
         send_register_result(session, port, 0, reason);
-        free(tunnel_address);
+        free(specus_address);
         free(client_name);
         return;
     }
 
     printf("[nat] register ok client=%s port=%d -> %s:%d\n",
-           client_name, port, tunnel_address, tunnel_port);
+           client_name, port, specus_address, specus_port);
     send_register_result(session, port, 1, NULL);
-    free(tunnel_address);
+    free(specus_address);
     free(client_name);
 }
 
-static void process_control_data(tunnel_session *session, const st_nat_message *message)
+static void process_control_data(specus_session *session, const st_nat_message *message)
 {
     if (message->data == NULL || message->data_len == 0) {
         return;
@@ -2676,7 +2676,7 @@ static void process_control_data(tunnel_session *session, const st_nat_message *
     }
 }
 
-static void process_control_closed(tunnel_session *session, const st_nat_message *message)
+static void process_control_closed(specus_session *session, const st_nat_message *message)
 {
     pthread_mutex_lock(&session->map_lock);
     external_conn *conn = find_conn_locked(session, message->stream_id);
@@ -2702,16 +2702,16 @@ static void process_control_closed(tunnel_session *session, const st_nat_message
     }
 }
 
-static void process_unregister(tunnel_session *session, const st_nat_message *message)
+static void process_unregister(specus_session *session, const st_nat_message *message)
 {
     int port;
     if (st_json_get_int(message->meta_json, "port", &port) == 0) {
         printf("[nat] unregister port=%d client=%s\n", port, session->config.client_name);
-        stop_tunnel_listener(session, port);
+        stop_specus_listener(session, port);
     }
 }
 
-static void process_nat_message(tunnel_session *session, const st_nat_message *message)
+static void process_nat_message(specus_session *session, const st_nat_message *message)
 {
     int direct_result = process_direct_http_message(session, message);
     if (direct_result != 0) {
@@ -2759,7 +2759,7 @@ static void process_nat_message(tunnel_session *session, const st_nat_message *m
     }
 }
 
-static void session_shutdown(tunnel_session *session)
+static void session_shutdown(specus_session *session)
 {
     direct_pending_fail_all(session, "control connection closed");
 
@@ -2773,7 +2773,7 @@ static void session_shutdown(tunnel_session *session)
 
     pthread_mutex_lock(&session->map_lock);
     session->active = 0;
-    for (tunnel_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
+    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (listener->fd >= 0) {
             shutdown(listener->fd, SHUT_RDWR);
             close(listener->fd);
@@ -2788,7 +2788,7 @@ static void session_shutdown(tunnel_session *session)
     }
     pthread_mutex_unlock(&session->map_lock);
 
-    for (tunnel_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
+    for (specus_listener *listener = session->listeners; listener != NULL; listener = listener->next) {
         if (listener->thread_started) {
             pthread_join(listener->thread, NULL);
         }
@@ -2799,9 +2799,9 @@ static void session_shutdown(tunnel_session *session)
         }
     }
 
-    tunnel_listener *listener = session->listeners;
+    specus_listener *listener = session->listeners;
     while (listener != NULL) {
-        tunnel_listener *next = listener->next;
+        specus_listener *next = listener->next;
         free(listener);
         listener = next;
     }
@@ -2830,7 +2830,7 @@ static void session_shutdown(tunnel_session *session)
 static void *client_thread(void *arg)
 {
     client_args *args = (client_args *)arg;
-    tunnel_session *session = (tunnel_session *)calloc(1, sizeof(*session));
+    specus_session *session = (specus_session *)calloc(1, sizeof(*session));
     if (session == NULL) {
         close(args->fd);
         free(args);
@@ -2891,7 +2891,7 @@ static void *client_thread(void *arg)
             session->is_data_connection = strcmp(
                 request.connection_role, ST_CONNECTION_ROLE_DATA) == 0;
             pthread_mutex_lock(&active_session_lock);
-            tunnel_session *same_role = active_session_find_role_locked(
+            specus_session *same_role = active_session_find_role_locked(
                 request.client_name, session->is_data_connection);
             pthread_mutex_unlock(&active_session_lock);
             const char *reason = NULL;
@@ -3032,7 +3032,7 @@ int main(void)
         free(config.nat_control_json);
         return 1;
     }
-    printf("shuai-tunnel-server-c listening on 0.0.0.0:%d for client \"%s\" (%zu tcp route(s))\n",
+    printf("specus-server-c listening on 0.0.0.0:%d for client \"%s\" (%zu tcp route(s))\n",
            config.port, config.client_name, config.mapping_count);
 
     st_admin_server admin_server;

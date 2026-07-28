@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/directhttp"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/directhttp"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 )
 
 func TestNatMetadataHelpersMatchJavaCoercion(t *testing.T) {
@@ -41,7 +41,7 @@ func TestUnknownStreamDropsLateDataAndTerminalFrames(t *testing.T) {
 	streamID := uint32(42)
 	session := &clientSession{
 		httpStreams: map[uint32]*HTTPStream{},
-		wsStreams:   map[uint32]*directhttp.WebSocketTunnel{},
+		wsStreams:   map[uint32]*directhttp.WebSocketSpecus{},
 		externals:   map[uint32]*externalConn{},
 		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}

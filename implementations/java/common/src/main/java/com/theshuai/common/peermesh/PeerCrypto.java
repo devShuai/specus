@@ -33,13 +33,13 @@ public final class PeerCrypto {
             agreement.init(privateKey(localPrivateKeyBase64));
             agreement.doPhase(publicKey(remotePublicKeyBase64), true);
             byte[] sharedSecret = agreement.generateSecret();
-            byte[] salt = sha256("shuai-peer-mesh\n"
+            byte[] salt = sha256("specus-peer-mesh\n"
                     + sessionId + "\n"
                     + (sessionToken == null ? "" : sessionToken) + "\n"
                     + Math.min(localClientId, remoteClientId) + "\n"
                     + Math.max(localClientId, remoteClientId));
             byte[] prk = hmac(salt, sharedSecret);
-            return hkdfExpand(prk, "shuai-peer-mesh/aes-gcm/v1", AES_256_KEY_BYTES);
+            return hkdfExpand(prk, "specus-peer-mesh/aes-gcm/v1", AES_256_KEY_BYTES);
         } catch (Exception e) {
             throw new IllegalStateException("derive peer mesh session key failed: " + e.getMessage(), e);
         }

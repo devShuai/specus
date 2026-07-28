@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/stunserver"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/stunserver"
 )
 
 const (

@@ -37,7 +37,7 @@ type applicationProtocolVectors struct {
 func TestApplicationProtocolMatchesCentralSWS2Vector(t *testing.T) {
 	vectors := readApplicationProtocolVectors(t)
 	want := decodeVectorHex(t, vectors.WebSocket.FrameHex)
-	encoded, err := encodeWebSocketTunnelFrame(webSocketTunnelFrame{
+	encoded, err := encodeWebSocketSpecusFrame(webSocketSpecusFrame{
 		opcode:    vectors.WebSocket.Opcode,
 		fin:       vectors.WebSocket.FinalFragment,
 		rsv:       vectors.WebSocket.RSV,
@@ -50,7 +50,7 @@ func TestApplicationProtocolMatchesCentralSWS2Vector(t *testing.T) {
 	if !bytes.Equal(encoded, want) {
 		t.Fatalf("SWS2 frame = %x, want %x", encoded, want)
 	}
-	decoded, err := decodeWebSocketTunnelFrame(want)
+	decoded, err := decodeWebSocketSpecusFrame(want)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestApplicationProtocolMatchesCentralSWS2Vector(t *testing.T) {
 		"trailing":      vectors.WebSocket.TrailingHex,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decodeWebSocketTunnelFrame(decodeVectorHex(t, value)); err == nil {
+			if _, err := decodeWebSocketSpecusFrame(decodeVectorHex(t, value)); err == nil {
 				t.Fatal("malformed SWS2 vector was accepted")
 			}
 		})

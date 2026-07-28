@@ -4,7 +4,7 @@ import lombok.Data;
 
 @Data
 public class PeerRelayMessage {
-    public static final String MAGIC = "shuai-peer-relay";
+    public static final String MAGIC = "specus-peer-relay";
     public static final String TYPE_BINDING = "binding";
     public static final String TYPE_BINDING_RESPONSE = "binding-response";
     public static final String TYPE_ALLOCATE = "allocate";

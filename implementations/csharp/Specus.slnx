@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/protocol/">
+    <Project Path="protocol/src/Specus.Protocol/Specus.Protocol.csproj" />
+    <Project Path="protocol/tests/Specus.Protocol.Tests/Specus.Protocol.Tests.csproj" />
+  </Folder>
+  <Folder Name="/client/">
+    <Project Path="client/src/Specus.Client/Specus.Client.csproj" />
+    <Project Path="client/src/Specus.Client.Desktop/Specus.Client.Desktop.csproj" />
+    <Project Path="client/tests/Specus.Client.Tests/Specus.Client.Tests.csproj" />
+  </Folder>
+  <Folder Name="/server/">
+    <Project Path="server/src/Specus.Server/Specus.Server.csproj" />
+    <Project Path="server/src/Specus.Server.Data/Specus.Server.Data.csproj" />
+    <Project Path="server/src/Specus.Server.Data.MySql/Specus.Server.Data.MySql.csproj" />
+    <Project Path="server/src/Specus.Server.Data.Postgres/Specus.Server.Data.Postgres.csproj" />
+    <Project Path="server/tests/Specus.IntegrationTests/Specus.IntegrationTests.csproj" />
+  </Folder>
+</Solution>

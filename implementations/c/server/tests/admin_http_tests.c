@@ -205,7 +205,7 @@ int main(void)
         return 1;
     }
 
-    setenv("TUNNEL_AUTH_JWT_SECRET", "c-admin-test-secret", 1);
+    setenv("SPECUS_AUTH_JWT_SECRET", "c-admin-test-secret", 1);
     len = st_admin_build_response_with_body("POST",
                                             "/auth/login",
                                             "{\"username\":\"admin\",\"password\":\"admin\"}",
@@ -218,9 +218,9 @@ int main(void)
         return 1;
     }
 
-    unsetenv("TUNNEL_PEER_MESH_ENABLED");
-    unsetenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
-    unsetenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS");
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
+    unsetenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
     len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"peerMeshEnabled\":false")
@@ -230,7 +230,7 @@ int main(void)
         fprintf(stderr, "disabled public stun config mismatch\n");
         return 1;
     }
-    setenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", "STUN://fallback.example.test", 1);
+    setenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS", "STUN://fallback.example.test", 1);
     len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
     if (len <= 0 || !contains(response, "\"peerMeshEnabled\":false")
         || !contains(response, "\"selfHostedStunServer\":\"\"")
@@ -238,13 +238,13 @@ int main(void)
         fprintf(stderr, "disabled public fallback stun config mismatch\n");
         return 1;
     }
-    setenv("TUNNEL_PEER_MESH_ENABLED", "true", 1);
-    setenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS", "ice.example.test", 1);
-    setenv("TUNNEL_PEER_MESH_STUN_TURN_PORT", "5349", 1);
-    setenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", "stun://stun.example.test, stun:stun.example.test:3478", 1);
-    setenv("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED", "true", 1);
-    setenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET", "turn-test-secret", 1);
-    setenv("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", "3600", 1);
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS", "ice.example.test", 1);
+    setenv("SPECUS_PEER_MESH_STUN_TURN_PORT", "5349", 1);
+    setenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS", "stun://stun.example.test, stun:stun.example.test:3478", 1);
+    setenv("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", "true", 1);
+    setenv("SPECUS_PEER_MESH_TURN_SHARED_SECRET", "turn-test-secret", 1);
+    setenv("SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", "3600", 1);
     len = st_admin_build_response("GET", "/api/public/peer-mesh/stun-config", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"peerMeshEnabled\":true")
@@ -302,13 +302,13 @@ int main(void)
         fprintf(stderr, "unknown attachment path should remain not found\n");
         return 1;
     }
-    unsetenv("TUNNEL_PEER_MESH_ENABLED");
-    unsetenv("TUNNEL_PEER_MESH_PUBLIC_ADDRESS");
-    unsetenv("TUNNEL_PEER_MESH_STUN_TURN_PORT");
-    unsetenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS");
-    unsetenv("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED");
-    unsetenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET");
-    unsetenv("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS");
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_PEER_MESH_PUBLIC_ADDRESS");
+    unsetenv("SPECUS_PEER_MESH_STUN_TURN_PORT");
+    unsetenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS");
+    unsetenv("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED");
+    unsetenv("SPECUS_PEER_MESH_TURN_SHARED_SECRET");
+    unsetenv("SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS");
     len = st_admin_build_response_with_auth("GET", "/api/admin/overview", NULL, NULL, response, sizeof(response));
     if (len <= 0 || !contains(response, "401 Unauthorized")) {
         fprintf(stderr, "unauthenticated admin api response mismatch\n");
@@ -353,18 +353,18 @@ int main(void)
         return 1;
     }
 
-    unsetenv("TUNNEL_DATABASE_PATH");
-    setenv("TUNNEL_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
-    setenv("TUNNEL_CLIENT_TENANT_ID", "tenant-c", 1);
-    setenv("TUNNEL_CLIENT_ID", "42", 1);
-    setenv("TUNNEL_CLIENT_SESSION_ID", "99", 1);
-    setenv("TUNNEL_CLIENT_TOKEN_TTL_SECONDS", "120", 1);
-    setenv("TUNNEL_CLIENT_MAX_ONLINE_INSTANCES", "7", 1);
-    setenv("TUNNEL_CLIENT_POLICY_ENABLED", "false", 1);
-    setenv("TUNNEL_CLIENT_BILLING_STATUS", "SUSPENDED", 1);
-    setenv("TUNNEL_CLIENT_RETRY_AFTER_SECONDS", "60", 1);
-    setenv("TUNNEL_TCP_MAPPINGS", "18080=127.0.0.1:8080,10022=192.168.1.243:22", 1);
-    setenv("TUNNEL_HTTP_ROUTES", "api=http://127.0.0.1:8080/base", 1);
+    unsetenv("SPECUS_DATABASE_PATH");
+    setenv("SPECUS_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
+    setenv("SPECUS_CLIENT_TENANT_ID", "tenant-c", 1);
+    setenv("SPECUS_CLIENT_ID", "42", 1);
+    setenv("SPECUS_CLIENT_SESSION_ID", "99", 1);
+    setenv("SPECUS_CLIENT_TOKEN_TTL_SECONDS", "120", 1);
+    setenv("SPECUS_CLIENT_MAX_ONLINE_INSTANCES", "7", 1);
+    setenv("SPECUS_CLIENT_POLICY_ENABLED", "false", 1);
+    setenv("SPECUS_CLIENT_BILLING_STATUS", "SUSPENDED", 1);
+    setenv("SPECUS_CLIENT_RETRY_AFTER_SECONDS", "60", 1);
+    setenv("SPECUS_TCP_MAPPINGS", "18080=127.0.0.1:8080,10022=192.168.1.243:22", 1);
+    setenv("SPECUS_HTTP_ROUTES", "api=http://127.0.0.1:8080/base", 1);
     len = st_admin_build_response("POST", "/api/client/auth/login", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"tenantId\":\"tenant-c\"")
@@ -374,34 +374,34 @@ int main(void)
         || !contains(response, "\"maxOnlineInstances\":7")
         || !contains(response, "\"policy\":{\"enabled\":false,\"billingStatus\":\"SUSPENDED\",\"retryAfterSeconds\":60}")
         || !contains(response, "\"peerMesh\":{\"enabled\":false,\"clientId\":42")
-        || !contains(response, "\"tunnelConfigList\":[")
+        || !contains(response, "\"specusConfigList\":[")
         || !contains(response, "\"port\":18080")
-        || !contains(response, "\"tunnelAddress\":\"127.0.0.1\"")
-        || !contains(response, "\"tunnelPort\":8080")
+        || !contains(response, "\"specusAddress\":\"127.0.0.1\"")
+        || !contains(response, "\"specusPort\":8080")
         || !contains(response, "\"port\":10022")
-        || !contains(response, "\"tunnelAddress\":\"192.168.1.243\"")
-        || !contains(response, "\"tunnelPort\":22")
-        || !contains(response, "\"httpTunnelConfigList\":[")
+        || !contains(response, "\"specusAddress\":\"192.168.1.243\"")
+        || !contains(response, "\"specusPort\":22")
+        || !contains(response, "\"httpSpecusConfigList\":[")
         || !contains(response, "\"route\":\"api\"")
         || !contains(response, "\"targetBaseUrl\":\"http://127.0.0.1:8080/base\"")) {
         fprintf(stderr, "client auth tcp mappings response mismatch\n");
         return 1;
     }
-    unsetenv("TUNNEL_CLIENT_ACCESS_TOKEN");
-    unsetenv("TUNNEL_CLIENT_TENANT_ID");
-    unsetenv("TUNNEL_CLIENT_ID");
-    unsetenv("TUNNEL_CLIENT_SESSION_ID");
-    unsetenv("TUNNEL_CLIENT_TOKEN_TTL_SECONDS");
-    unsetenv("TUNNEL_CLIENT_MAX_ONLINE_INSTANCES");
-    unsetenv("TUNNEL_CLIENT_POLICY_ENABLED");
-    unsetenv("TUNNEL_CLIENT_BILLING_STATUS");
-    unsetenv("TUNNEL_CLIENT_RETRY_AFTER_SECONDS");
-    unsetenv("TUNNEL_TCP_MAPPINGS");
-    unsetenv("TUNNEL_HTTP_ROUTES");
+    unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
+    unsetenv("SPECUS_CLIENT_TENANT_ID");
+    unsetenv("SPECUS_CLIENT_ID");
+    unsetenv("SPECUS_CLIENT_SESSION_ID");
+    unsetenv("SPECUS_CLIENT_TOKEN_TTL_SECONDS");
+    unsetenv("SPECUS_CLIENT_MAX_ONLINE_INSTANCES");
+    unsetenv("SPECUS_CLIENT_POLICY_ENABLED");
+    unsetenv("SPECUS_CLIENT_BILLING_STATUS");
+    unsetenv("SPECUS_CLIENT_RETRY_AFTER_SECONDS");
+    unsetenv("SPECUS_TCP_MAPPINGS");
+    unsetenv("SPECUS_HTTP_ROUTES");
 
-    setenv("TUNNEL_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
-    setenv("TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS", "180", 1);
-    setenv("TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES", "9", 1);
+    setenv("SPECUS_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
+    setenv("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS", "180", 1);
+    setenv("SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES", "9", 1);
     len = st_admin_build_response("POST", "/api/client/auth/login", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"tokenTtlSeconds\":180")
@@ -409,13 +409,13 @@ int main(void)
         fprintf(stderr, "client auth java alias env response mismatch\n");
         return 1;
     }
-    unsetenv("TUNNEL_CLIENT_ACCESS_TOKEN");
-    unsetenv("TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS");
-    unsetenv("TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES");
+    unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
+    unsetenv("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS");
+    unsetenv("SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES");
 
-    setenv("TUNNEL_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
-    setenv("TUNNEL_CLIENT_API_KEY", "demo-api", 1);
-    setenv("TUNNEL_CLIENT_SECRET", "test1234", 1);
+    setenv("SPECUS_CLIENT_ACCESS_TOKEN", "dev-runtime-token", 1);
+    setenv("SPECUS_CLIENT_API_KEY", "demo-api", 1);
+    setenv("SPECUS_CLIENT_SECRET", "test1234", 1);
     char timestamp[32];
     snprintf(timestamp, sizeof(timestamp), "%lld", test_now_millis());
     char signature[ST_SHA256_HEX_LEN + 1];
@@ -443,12 +443,12 @@ int main(void)
         fprintf(stderr, "client auth invalid signature was not rejected\n");
         return 1;
     }
-    unsetenv("TUNNEL_CLIENT_ACCESS_TOKEN");
-    unsetenv("TUNNEL_CLIENT_API_KEY");
-    unsetenv("TUNNEL_CLIENT_SECRET");
+    unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
+    unsetenv("SPECUS_CLIENT_API_KEY");
+    unsetenv("SPECUS_CLIENT_SECRET");
 
     char auth_db_path[256];
-    snprintf(auth_db_path, sizeof(auth_db_path), "/tmp/shuai-tunnel-c-client-auth-%ld.db", (long)getpid());
+    snprintf(auth_db_path, sizeof(auth_db_path), "/tmp/specus-c-client-auth-%ld.db", (long)getpid());
     unlink(auth_db_path);
     if (st_storage_init(auth_db_path, 0) != 0) {
         fprintf(stderr, "client auth db init failed\n");
@@ -471,7 +471,7 @@ int main(void)
         fprintf(stderr, "client auth db credential seed failed\n");
         return 1;
     }
-    setenv("TUNNEL_DATABASE_PATH", auth_db_path, 1);
+    setenv("SPECUS_DATABASE_PATH", auth_db_path, 1);
     snprintf(timestamp, sizeof(timestamp), "%lld", test_now_millis());
     sign_client_auth("db-api", timestamp, "nonce-db", "machine-db", "db-user", "db-secret", signature);
     snprintf(body,
@@ -520,7 +520,7 @@ int main(void)
         fprintf(stderr, "client auth database invalid signature was not rejected\n");
         return 1;
     }
-    unsetenv("TUNNEL_DATABASE_PATH");
+    unsetenv("SPECUS_DATABASE_PATH");
     unlink(auth_db_path);
 
     len = st_admin_build_response("GET", "/api/admin/overview", response, sizeof(response));
@@ -530,7 +530,7 @@ int main(void)
         return 1;
     }
 
-    setenv("TUNNEL_TCP_MAPPINGS", "18080=127.0.0.1:8080,10022=192.168.1.243:22", 1);
+    setenv("SPECUS_TCP_MAPPINGS", "18080=127.0.0.1:8080,10022=192.168.1.243:22", 1);
     len = st_admin_build_response("GET", "/api/admin/overview", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"tcpMappings\":2")) {
         fprintf(stderr, "overview tcp mapping count mismatch\n");
@@ -543,14 +543,14 @@ int main(void)
         fprintf(stderr, "metrics response mismatch\n");
         return 1;
     }
-    unsetenv("TUNNEL_TCP_MAPPINGS");
+    unsetenv("SPECUS_TCP_MAPPINGS");
 
     char db_path[256];
-    snprintf(db_path, sizeof(db_path), "/tmp/shuai-tunnel-c-admin-%ld.db", (long)getpid());
+    snprintf(db_path, sizeof(db_path), "/tmp/specus-c-admin-%ld.db", (long)getpid());
     unlink(db_path);
-    setenv("TUNNEL_DATABASE_PATH", db_path, 1);
-    setenv("TUNNEL_AUTH_TENANT_ID", "tenant-admin", 1);
-    setenv("TUNNEL_AUTH_USERNAME", "admin-user", 1);
+    setenv("SPECUS_DATABASE_PATH", db_path, 1);
+    setenv("SPECUS_AUTH_TENANT_ID", "tenant-admin", 1);
+    setenv("SPECUS_AUTH_USERNAME", "admin-user", 1);
     len = st_admin_build_response("POST", "/api/admin/database/initialize", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"initialized\":true")
@@ -634,7 +634,7 @@ int main(void)
                                             "/api/admin/client-downloads",
                                             "{\"implementation\":\"java\",\"platform\":\"any\",\"arch\":\"any\","
                                             "\"displayName\":\"Java exec jar\","
-                                            "\"downloadUrl\":\"https://example.com/shuai-tunnel.jar\","
+                                            "\"downloadUrl\":\"https://example.com/specus.jar\","
                                             "\"description\":\"cross platform\","
                                             "\"displayOrder\":20,\"enabled\":false}",
                                             response,
@@ -652,7 +652,7 @@ int main(void)
                                             "/api/admin/client-downloads",
                                             "{\"implementation\":\"go\",\"platform\":\"linux\",\"arch\":\"x64\","
                                             "\"displayName\":\"Linux x64\","
-                                            "\"downloadUrl\":\"https://example.com/shuai-tunnel-linux-amd64\","
+                                            "\"downloadUrl\":\"https://example.com/specus-linux-amd64\","
                                             "\"displayOrder\":10}",
                                             response,
                                             sizeof(response));
@@ -679,7 +679,7 @@ int main(void)
                                             request_path,
                                             "{\"implementation\":\"csharp\",\"platform\":\"windows\",\"arch\":\"x64\","
                                             "\"displayName\":\"Windows x64\","
-                                            "\"downloadUrl\":\"https://example.com/shuai-tunnel-win-x64.zip\","
+                                            "\"downloadUrl\":\"https://example.com/specus-win-x64.zip\","
                                             "\"enabled\":true}",
                                             response,
                                             sizeof(response));
@@ -761,13 +761,13 @@ int main(void)
         return 1;
     }
     len = st_admin_build_response_with_auth("POST",
-                                            "/api/admin/clients/1/tunnels",
+                                            "/api/admin/clients/1/specus-mappings",
                                             authorization,
                                             "{\"listenPort\":19001,\"targetAddress\":\"127.0.0.1\",\"targetPort\":9001}",
                                             response,
                                             sizeof(response));
     if (len <= 0 || !contains(response, "404 Not Found")) {
-        fprintf(stderr, "database user foreign tunnel create response mismatch\n");
+        fprintf(stderr, "database user foreign specus create response mismatch\n");
         free(alice_token);
         return 1;
     }
@@ -1158,33 +1158,33 @@ int main(void)
         fprintf(stderr, "client update response mismatch\n");
         return 1;
     }
-    snprintf(request_path, sizeof(request_path), "/api/admin/clients/%d/tunnels", created_client_id);
+    snprintf(request_path, sizeof(request_path), "/api/admin/clients/%d/specus-mappings", created_client_id);
     len = st_admin_build_response_with_body("POST",
                                             request_path,
                                             "{\"listenPort\":19090,\"targetAddress\":\"127.0.0.1\","
                                             "\"targetPort\":9090,\"enabled\":true,\"detailCaptureEnabled\":true}",
                                             response,
                                             sizeof(response));
-    int created_tunnel_id = 0;
+    int created_specus_id = 0;
     if (len <= 0 || !contains(response, "201 Created")
         || !contains(response, "\"listenPort\":19090")
         || !contains(response, "\"targetAddress\":\"127.0.0.1\"")
         || !contains(response, "\"targetPort\":9090")
         || !contains(response, "\"detailCaptureEnabled\":true")
-        || st_json_get_int(response, "id", &created_tunnel_id) != 0
-        || created_tunnel_id <= 0) {
-        fprintf(stderr, "tunnel create response mismatch\n");
+        || st_json_get_int(response, "id", &created_specus_id) != 0
+        || created_specus_id <= 0) {
+        fprintf(stderr, "specus create response mismatch\n");
         return 1;
     }
-    snprintf(request_path, sizeof(request_path), "/api/admin/tunnels?clientId=%d", created_client_id);
+    snprintf(request_path, sizeof(request_path), "/api/admin/specus-mappings?clientId=%d", created_client_id);
     len = st_admin_build_response("GET", request_path, response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"clientId\":")
         || !contains(response, "\"listenPort\":19090")) {
-        fprintf(stderr, "tunnel filtered list response mismatch\n");
+        fprintf(stderr, "specus filtered list response mismatch\n");
         return 1;
     }
-    snprintf(request_path, sizeof(request_path), "/api/admin/tunnels/%d", created_tunnel_id);
+    snprintf(request_path, sizeof(request_path), "/api/admin/specus-mappings/%d", created_specus_id);
     len = st_admin_build_response_with_body("PUT",
                                             request_path,
                                             "{\"listenPort\":19091,\"targetAddress\":\"192.168.1.12\","
@@ -1197,12 +1197,12 @@ int main(void)
         || !contains(response, "\"targetAddress\":\"192.168.1.12\"")
         || !contains(response, "\"enabled\":false")
         || !contains(response, "\"detailCaptureEnabled\":false")) {
-        fprintf(stderr, "tunnel update response mismatch\n");
+        fprintf(stderr, "specus update response mismatch\n");
         return 1;
     }
     len = st_admin_build_response("DELETE", request_path, response, sizeof(response));
     if (len <= 0 || !contains(response, "204 No Content")) {
-        fprintf(stderr, "tunnel delete response mismatch\n");
+        fprintf(stderr, "specus delete response mismatch\n");
         return 1;
     }
     snprintf(request_path, sizeof(request_path), "/api/admin/clients/%d/http-routes", created_client_id);
@@ -1258,18 +1258,18 @@ int main(void)
         return 1;
     }
     st_direct_http_response_free(&rewrite_response);
-    setenv("TUNNEL_CLIENT_ACCESS_TOKEN", "db-route-token", 1);
-    setenv("TUNNEL_CLIENT_NAME", "C managed 2", 1);
+    setenv("SPECUS_CLIENT_ACCESS_TOKEN", "db-route-token", 1);
+    setenv("SPECUS_CLIENT_NAME", "C managed 2", 1);
     len = st_admin_build_response("POST", "/api/client/auth/login", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
-        || !contains(response, "\"httpTunnelConfigList\":[")
+        || !contains(response, "\"httpSpecusConfigList\":[")
         || !contains(response, "\"route\":\"api\"")
         || !contains(response, "\"targetBaseUrl\":\"https://example.com/base\"")) {
         fprintf(stderr, "client auth database http route response mismatch\n");
         return 1;
     }
-    unsetenv("TUNNEL_CLIENT_ACCESS_TOKEN");
-    unsetenv("TUNNEL_CLIENT_NAME");
+    unsetenv("SPECUS_CLIENT_ACCESS_TOKEN");
+    unsetenv("SPECUS_CLIENT_NAME");
     snprintf(request_path, sizeof(request_path), "/api/admin/http-routes/%d", created_route_id);
     len = st_admin_build_response_with_body("PUT",
                                             request_path,
@@ -1590,7 +1590,7 @@ int main(void)
         .client_id = created_client_id,
         .client_name = "C managed 2",
         .listen_port = 19090,
-        .resource_id = created_tunnel_id,
+        .resource_id = created_specus_id,
         .resource_name = "19090 -> 127.0.0.1:9090",
         .channel_id = "tcp-chan-1",
         .direction = "PUBLIC_TO_CLIENT",
@@ -1689,9 +1689,9 @@ int main(void)
         fprintf(stderr, "client delete response mismatch\n");
         return 1;
     }
-    unsetenv("TUNNEL_DATABASE_PATH");
-    unsetenv("TUNNEL_AUTH_TENANT_ID");
-    unsetenv("TUNNEL_AUTH_USERNAME");
+    unsetenv("SPECUS_DATABASE_PATH");
+    unsetenv("SPECUS_AUTH_TENANT_ID");
+    unsetenv("SPECUS_AUTH_USERNAME");
     unlink(db_path);
 
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/status", response, sizeof(response));
@@ -1700,13 +1700,13 @@ int main(void)
         fprintf(stderr, "peer mesh status response mismatch\n");
         return 1;
     }
-    setenv("TUNNEL_PEER_MESH_ENABLED", "true", 1);
+    setenv("SPECUS_PEER_MESH_ENABLED", "true", 1);
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/status", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "\"enabled\":true")) {
         fprintf(stderr, "peer mesh enabled status response mismatch\n");
         return 1;
     }
-    unsetenv("TUNNEL_PEER_MESH_ENABLED");
+    unsetenv("SPECUS_PEER_MESH_ENABLED");
 
     len = st_admin_build_response("GET", "/api/admin/peer-mesh/devices", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK") || !contains(response, "[]")) {
@@ -1795,13 +1795,13 @@ int main(void)
         fprintf(stderr, "oidc config response mismatch\n");
         return 1;
     }
-    setenv("TUNNEL_OIDC_CLIENT_ID", "admin-spa", 1);
-    setenv("TUNNEL_OIDC_AUTHORIZATION_ENDPOINT", "https://issuer.example/authorize", 1);
-    setenv("TUNNEL_OIDC_TOKEN_ENDPOINT", "https://issuer.example/token", 1);
-    setenv("TUNNEL_OIDC_END_SESSION_ENDPOINT", "https://issuer.example/logout", 1);
-    setenv("TUNNEL_OIDC_REDIRECT_URI", "http://127.0.0.1:8088/callback", 1);
-    setenv("TUNNEL_OIDC_SCOPE", "openid profile email", 1);
-    setenv("TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED", "false", 1);
+    setenv("SPECUS_OIDC_CLIENT_ID", "admin-spa", 1);
+    setenv("SPECUS_OIDC_AUTHORIZATION_ENDPOINT", "https://issuer.example/authorize", 1);
+    setenv("SPECUS_OIDC_TOKEN_ENDPOINT", "https://issuer.example/token", 1);
+    setenv("SPECUS_OIDC_END_SESSION_ENDPOINT", "https://issuer.example/logout", 1);
+    setenv("SPECUS_OIDC_REDIRECT_URI", "http://127.0.0.1:8088/callback", 1);
+    setenv("SPECUS_OIDC_SCOPE", "openid profile email", 1);
+    setenv("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED", "false", 1);
     len = st_admin_build_response("GET", "/oidc-config", response, sizeof(response));
     if (len <= 0 || !contains(response, "200 OK")
         || !contains(response, "\"configured\":true")
@@ -1834,7 +1834,7 @@ int main(void)
     }
     char oidc_endpoint[128];
     snprintf(oidc_endpoint, sizeof(oidc_endpoint), "http://127.0.0.1:%d/token", oidc_server.port);
-    setenv("TUNNEL_OIDC_TOKEN_ENDPOINT", oidc_endpoint, 1);
+    setenv("SPECUS_OIDC_TOKEN_ENDPOINT", oidc_endpoint, 1);
     len = st_admin_build_response_with_body("POST",
                                             "/oidc/token",
                                             "{\"code\":\"abc\",\"codeVerifier\":\"verifier value\"}",
@@ -1854,13 +1854,13 @@ int main(void)
         fprintf(stderr, "oidc http token exchange response mismatch\n");
         return 1;
     }
-    unsetenv("TUNNEL_OIDC_CLIENT_ID");
-    unsetenv("TUNNEL_OIDC_AUTHORIZATION_ENDPOINT");
-    unsetenv("TUNNEL_OIDC_TOKEN_ENDPOINT");
-    unsetenv("TUNNEL_OIDC_END_SESSION_ENDPOINT");
-    unsetenv("TUNNEL_OIDC_REDIRECT_URI");
-    unsetenv("TUNNEL_OIDC_SCOPE");
-    unsetenv("TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED");
+    unsetenv("SPECUS_OIDC_CLIENT_ID");
+    unsetenv("SPECUS_OIDC_AUTHORIZATION_ENDPOINT");
+    unsetenv("SPECUS_OIDC_TOKEN_ENDPOINT");
+    unsetenv("SPECUS_OIDC_END_SESSION_ENDPOINT");
+    unsetenv("SPECUS_OIDC_REDIRECT_URI");
+    unsetenv("SPECUS_OIDC_SCOPE");
+    unsetenv("SPECUS_AUTH_PASSWORD_LOGIN_ENABLED");
     len = st_admin_build_response("POST", "/oidc/token", response, sizeof(response));
     if (len <= 0 || !contains(response, "503 Service Unavailable")
         || !contains(response, "OIDC")) {

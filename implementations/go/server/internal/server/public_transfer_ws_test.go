@@ -18,9 +18,9 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 func TestPublicTransferClusterFrameMatchesCanonicalVector(t *testing.T) {

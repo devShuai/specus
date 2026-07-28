@@ -49,7 +49,7 @@ public final class StunServerApplication {
 
     private static void printHelp() {
         System.out.println("""
-                Shuai Tunnel standalone STUN server
+                specus standalone STUN server
 
                 Usage:
                   java -jar stun-server.jar

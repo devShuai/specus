@@ -8,11 +8,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/control"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 // Dispatcher routes inbound control-channel packets: auth gate, login (offloaded), heartbeat,

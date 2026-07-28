@@ -1,8 +1,8 @@
 # Android client
 
-`implementations/android/client` is the Android implementation of the shuai-tunnel client.
+`implementations/android/client` is the Android implementation of the specus client.
 
-The first Android version focuses on the normal tunnel-client path:
+The first Android version focuses on the normal specus-client path:
 
 - HTTP API-key login through `serverBaseUrl + /api/client/auth/login`
 - Binary control-channel login with `clientName/clientSessionId/accessToken`
@@ -10,10 +10,10 @@ The first Android version focuses on the normal tunnel-client path:
 - heartbeat only after five seconds with no control-channel writes, a 60-second read-idle timeout, and capped exponential reconnect backoff
 - control-login failure classification: expired tokens trigger immediate HTTP re-login, busy/rate-limit failures back off, and terminal authentication or policy rejection stops reconnecting
 - server `LOGOUT_REQUEST` handling that closes the current control socket and immediately performs a fresh HTTP login
-- TCP NAT tunnel registration and bidirectional `DATA` forwarding
+- TCP NAT specus registration and bidirectional `DATA` forwarding
 - malformed/unknown TCP `CONNECTED` notifications are logged and ignored; only an actual local dial/established-channel failure returns `DISCONNECTED`
 - Direct HTTP route forwarding from public route to Android-reachable upstreams
-- Direct HTTP-route WebSocket tunneling over `ws://` and `wss://`, including forwarded handshake headers, text/binary frame prefixes, automatic ping/pong handling, and VPN-protected local sockets
+- Direct HTTP-route WebSocket proxying over `ws://` and `wss://`, including forwarded handshake headers, text/binary frame prefixes, automatic ping/pong handling, and VPN-protected local sockets
 - JSONC config editing inside the app, using the public schema URL
 - dashboard-style control UI with connection actions, config summary, JSONC editor, and runtime events
 - ForegroundService runtime with status updates in the app UI
@@ -53,6 +53,6 @@ Current local JVM result: 34/34 tests. This covers protocol/codec and state-mach
 
 ## Run
 
-Install `app/build/outputs/apk/debug/app-debug.apk`, open **Shuai Tunnel**, paste a `client.jsonc`-compatible config, save, then press **Start**. Android will show the system VPN permission dialog before the foreground service starts.
+Install `app/build/outputs/apk/debug/app-debug.apk`, open **specus**, paste a `client.jsonc`-compatible config, save, then press **Start**. Android will show the system VPN permission dialog before the foreground service starts.
 
-The app requests network access and runs as a foreground service while the tunnel is connected or reconnecting. If the server enables peer mesh for the client, the service establishes a VPN interface using the returned virtual IP and CIDR.
+The app requests network access and runs as a foreground service while the specus is connected or reconnecting. If the server enables peer mesh for the client, the service establishes a VPN interface using the returned virtual IP and CIDR.

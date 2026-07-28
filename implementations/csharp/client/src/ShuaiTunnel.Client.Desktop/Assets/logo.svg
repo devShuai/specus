@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 64" role="img" aria-label="shuai-tunnel">
-  <rect width="64" height="64" rx="14" fill="#14161F"></rect>
-  <rect x="10.5" y="10.5" width="43" height="43" rx="12" fill="none" stroke="#F2F3F7" stroke-width="4"></rect>
-  <rect x="18" y="18" width="28" height="28" rx="8.5" fill="none" stroke="#F2F3F7" stroke-width="4" opacity=".62"></rect>
-  <rect x="24.5" y="24.5" width="15" height="15" rx="5.5" fill="none" stroke="#F2F3F7" stroke-width="4" opacity=".34"></rect>
-  <rect x="29" y="29" width="6" height="6" rx="2" fill="#9B82FF"></rect>
-  <text x="82" y="30" fill="#14161F" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="20" font-weight="700" letter-spacing="-0.4">shuai<tspan fill="#7A5CE6">-tunnel</tspan></text>
-  <text x="82" y="48" fill="#6B6E7B" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="12" font-weight="500">secure tunnel control plane</text>
-</svg>

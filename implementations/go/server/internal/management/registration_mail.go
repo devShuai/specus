@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
 type registrationMailer interface {
@@ -105,7 +105,7 @@ func (m *smtpRegistrationMailer) SendVerificationCode(
 		minutes = 1
 	}
 	subject := mime.QEncoding.Encode("UTF-8", m.config.Subject)
-	body := fmt.Sprintf("你好，%s：\r\n\r\n你的 shuai-tunnel 注册验证码是：%s\r\n\r\n验证码在 %d 分钟内有效，请勿转发给他人。\r\n如果不是你发起的注册，请忽略此邮件。\r\n", username, code, minutes)
+	body := fmt.Sprintf("你好，%s：\r\n\r\n你的 specus 注册验证码是：%s\r\n\r\n验证码在 %d 分钟内有效，请勿转发给他人。\r\n如果不是你发起的注册，请忽略此邮件。\r\n", username, code, minutes)
 	message := "From: " + fromLabel + "\r\n" +
 		"To: " + recipient.String() + "\r\n" +
 		"Subject: " + subject + "\r\n" +

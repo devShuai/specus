@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">Shuai Tunnel</string>
-    <string name="notification_channel">Tunnel client</string>
+    <string name="app_name">specus</string>
+    <string name="notification_channel">specus 客户端</string>
 </resources>

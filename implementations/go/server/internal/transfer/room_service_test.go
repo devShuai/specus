@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 func newRoomService(t *testing.T, publicCfg config.PublicTransferConfig) *RoomService {

@@ -1,4 +1,4 @@
-# shuai-tunnel 协议规范
+# specus 协议规范
 
 本目录记录跨语言实现必须共同遵守的协议。当前以 `implementations/java/common`、`implementations/java/server`、
 `implementations/java/client` 为参考实现；Go、C# 与 Android client 需要按各自适用的数据面完整语义对齐。
@@ -23,18 +23,18 @@ Peer Mesh 数据面，不能因本规范包含 Peer Mesh 就推断 C 已具备�
 | --- | --- |
 | 二进制编解码 | `implementations/java/common/src/main/java/com/theshuai/common/protocol/PacketCodec.java` |
 | 紧凑二进制序列化 | `implementations/java/common/src/main/java/com/theshuai/common/serialize/impl/CompactBinarySerializer.java` |
-| 客户端启动登录 | `implementations/java/client/src/main/java/com/theshuai/tunnelclient/TunnelClientApplication.java` |
-| 服务端客户端认证 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/ClientAuthService.java` |
-| `NAT_CONTROL` 下发 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/NatControlService.java` |
-| HTTP 直转 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/http/HttpTunnelController.java` |
-| Peer Mesh 控制面 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/PeerSignalService.java` |
-| Peer Mesh 客户端数据面 | `implementations/java/client/src/main/java/com/theshuai/tunnelclient/peer/PeerMeshClient.java` |
-| 公共 ICE 配置 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/PublicPeerMeshResource.java` |
-| 公共互传发现信令 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/websocket/PublicTransferDiscoveryWebSocketHandler.java` |
-| 互传附件 REST | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/TransferAttachmentResource.java` |
-| 附件状态与对象存储 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/TransferAttachmentService.java` |
-| 管理端客户端消息 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/websocket/ClientMessagesWebSocketHandler.java` |
-| 客户端消息控制通道 fallback | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/handler/MessageRequestHandler.java` |
+| 客户端启动登录 | `implementations/java/client/src/main/java/com/theshuai/specusclient/SpecusClientApplication.java` |
+| 服务端客户端认证 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/ClientAuthService.java` |
+| `NAT_CONTROL` 下发 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/NatControlService.java` |
+| HTTP 直转 | `implementations/java/server/src/main/java/com/theshuai/specusserver/http/HttpSpecusController.java` |
+| Peer Mesh 控制面 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/PeerSignalService.java` |
+| Peer Mesh 客户端数据面 | `implementations/java/client/src/main/java/com/theshuai/specusclient/peer/PeerMeshClient.java` |
+| 公共 ICE 配置 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/controller/PublicPeerMeshResource.java` |
+| 公共互传发现信令 | `implementations/java/server/src/main/java/com/theshuai/specusserver/websocket/PublicTransferDiscoveryWebSocketHandler.java` |
+| 互传附件 REST | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/controller/TransferAttachmentResource.java` |
+| 附件状态与对象存储 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/TransferAttachmentService.java` |
+| 管理端客户端消息 | `implementations/java/server/src/main/java/com/theshuai/specusserver/websocket/ClientMessagesWebSocketHandler.java` |
+| 客户端消息控制通道 fallback | `implementations/java/server/src/main/java/com/theshuai/specusserver/handler/MessageRequestHandler.java` |
 
 ## 版本约定
 

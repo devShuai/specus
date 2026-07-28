@@ -53,7 +53,7 @@ type ClientResult struct {
 // ClientDetail is the aggregate detail shape used by the management drawer.
 type ClientDetail struct {
 	Client     ClientView      `json:"client"`
-	Tunnels    []TunnelView    `json:"tunnels"`
+	SpecusMappings    []SpecusView    `json:"specusMappings"`
 	HTTPRoutes []HTTPRouteView `json:"httpRoutes"`
 }
 
@@ -88,8 +88,8 @@ type ClientDownloadLinkView struct {
 	UpdatedAt      string  `json:"updatedAt"`
 }
 
-// TunnelView is the JSON representation of a tunnel mapping.
-type TunnelView struct {
+// SpecusView is the JSON representation of a specus mapping.
+type SpecusView struct {
 	ID                   int64  `json:"id"`
 	ClientID             int64  `json:"clientId"`
 	ClientName           string `json:"clientName"`
@@ -281,8 +281,8 @@ type clientDownloadLinkMutation struct {
 	Enabled        *bool  `json:"enabled"`
 }
 
-// tunnelMutation is the create/update tunnel request body.
-type tunnelMutation struct {
+// specusMutation is the create/update specus request body.
+type specusMutation struct {
 	ListenPort           int    `json:"listenPort"`
 	TargetAddress        string `json:"targetAddress"`
 	TargetPort           int    `json:"targetPort"`

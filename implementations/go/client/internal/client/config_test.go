@@ -11,7 +11,7 @@ import (
 func TestLoadConfigNormalizesPeerMeshOptions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client.jsonc")
 	content := `{
-  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // JSONC comments are allowed in client.jsonc.
   "serverBaseUrl": " http://127.0.0.1:8088/ ",
   "apiKey": " demo-client ",
@@ -112,21 +112,21 @@ func TestNormalizeOSUserMatchesJavaStyleUsername(t *testing.T) {
 
 func TestNatControlConfigDistinguishesMissingAndEmptyHTTPRoutesLikeJava(t *testing.T) {
 	var missing natControlConfig
-	if err := json.Unmarshal([]byte(`{"tunnelConfigList":[]}`), &missing); err != nil {
+	if err := json.Unmarshal([]byte(`{"specusConfigList":[]}`), &missing); err != nil {
 		t.Fatal(err)
 	}
-	if missing.HTTPTunnelConfigList != nil {
-		t.Fatalf("missing httpTunnelConfigList should keep current routes, got %#v", missing.HTTPTunnelConfigList)
+	if missing.HTTPSpecusConfigList != nil {
+		t.Fatalf("missing httpSpecusConfigList should keep current routes, got %#v", missing.HTTPSpecusConfigList)
 	}
 
 	var empty natControlConfig
-	if err := json.Unmarshal([]byte(`{"tunnelConfigList":[],"httpTunnelConfigList":[]}`), &empty); err != nil {
+	if err := json.Unmarshal([]byte(`{"specusConfigList":[],"httpSpecusConfigList":[]}`), &empty); err != nil {
 		t.Fatal(err)
 	}
-	if empty.HTTPTunnelConfigList == nil {
-		t.Fatal("empty httpTunnelConfigList should be a present empty slice")
+	if empty.HTTPSpecusConfigList == nil {
+		t.Fatal("empty httpSpecusConfigList should be a present empty slice")
 	}
-	if len(*empty.HTTPTunnelConfigList) != 0 {
-		t.Fatalf("empty httpTunnelConfigList length = %d", len(*empty.HTTPTunnelConfigList))
+	if len(*empty.HTTPSpecusConfigList) != 0 {
+		t.Fatalf("empty httpSpecusConfigList length = %d", len(*empty.HTTPSpecusConfigList))
 	}
 }

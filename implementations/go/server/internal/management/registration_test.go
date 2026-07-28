@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 type recordingRegistrationMailer struct {
@@ -99,7 +99,7 @@ func newTestRegistrationService(
 		TokenTTLSeconds:      3600,
 		Turnstile: config.TurnstileConfig{
 			Enabled: true, SiteKey: "site", SecretKey: "secret", VerifyURL: "https://verify.example",
-			AllowedHostnames: []string{"tunnel.example.com"},
+			AllowedHostnames: []string{"specus.example.com"},
 		},
 		EmailVerification: config.EmailVerificationConfig{
 			Enabled: true, CodeTTLSeconds: 600, MaxAttempts: maxAttempts, ResendCooldownSeconds: 60,

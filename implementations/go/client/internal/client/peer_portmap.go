@@ -316,7 +316,7 @@ func (mapper *upnpPortMapper) addMapping(ctx context.Context, internalPort, pref
 		externalPort = internalPort
 	}
 	if description == "" {
-		description = "shuai-tunnel"
+		description = "specus"
 	}
 	for attempt := 0; attempt < 4; attempt++ {
 		if err := mapper.soap(ctx, gateway, "AddPortMapping", upnpAddPortMappingBody(externalPort, internalPort, gateway.localIP, leaseSeconds, description), nil); err == nil {

@@ -142,7 +142,7 @@ HTTP route 不使用独立 command。服务端在数据连接上发送：
 浏览器断开、超时或任一端失败必须发送 `RST`，并取消 upstream 请求。SSE 和大响应按 DATA 到达即向
 下游写出，不等待完整 body。
 
-## WebSocket frame tunnel
+## WebSocket frame specus
 
 WebSocket payload 在 NAT DATA 内使用 `SWS2` 二进制 envelope：
 

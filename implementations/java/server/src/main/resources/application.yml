@@ -3,21 +3,21 @@ server:
 
 spring:
   datasource:
-    url: ${TUNNEL_DB_URL:jdbc:sqlite:./shuai-tunnel.db}
-    driver-class-name: ${TUNNEL_DB_DRIVER:org.sqlite.JDBC}
-    username: ${TUNNEL_DB_USERNAME:}
-    password: ${TUNNEL_DB_PASSWORD:}
+    url: ${SPECUS_DB_URL:jdbc:sqlite:./specus.db}
+    driver-class-name: ${SPECUS_DB_DRIVER:org.sqlite.JDBC}
+    username: ${SPECUS_DB_USERNAME:}
+    password: ${SPECUS_DB_PASSWORD:}
     hikari:
       # Default 1 keeps the single-writer SQLite default safe. Raise it (e.g. 16-32) for MySQL/PostgreSQL.
-      maximum-pool-size: ${TUNNEL_DB_POOL_SIZE:1}
+      maximum-pool-size: ${SPECUS_DB_POOL_SIZE:1}
   jpa:
-    database-platform: ${TUNNEL_DB_DIALECT:org.hibernate.community.dialect.SQLiteDialect}
+    database-platform: ${SPECUS_DB_DIALECT:org.hibernate.community.dialect.SQLiteDialect}
     hibernate:
       ddl-auto: update
     open-in-view: false
     properties:
       # Batch the traffic-flush updates and the retention bulk deletes.
-      hibernate.jdbc.batch_size: ${TUNNEL_DB_BATCH_SIZE:50}
+      hibernate.jdbc.batch_size: ${SPECUS_DB_BATCH_SIZE:50}
       hibernate.order_inserts: true
       hibernate.order_updates: true
   task:
@@ -26,252 +26,252 @@ spring:
       # would serialize them. 2 lets the HTTP and TCP flush paths run concurrently so a
       # slow TCP flush can no longer block HTTP persistence (and vice versa).
       pool:
-        size: ${TUNNEL_SCHEDULING_POOL_SIZE:2}
+        size: ${SPECUS_SCHEDULING_POOL_SIZE:2}
   elasticsearch:
-    uris: ${TUNNEL_ELASTICSEARCH_URIS:http://localhost:9200}
-    username: ${TUNNEL_ELASTICSEARCH_USERNAME:}
-    password: ${TUNNEL_ELASTICSEARCH_PASSWORD:}
-    api-key: ${TUNNEL_ELASTICSEARCH_API_KEY:}
+    uris: ${SPECUS_ELASTICSEARCH_URIS:http://localhost:9200}
+    username: ${SPECUS_ELASTICSEARCH_USERNAME:}
+    password: ${SPECUS_ELASTICSEARCH_PASSWORD:}
+    api-key: ${SPECUS_ELASTICSEARCH_API_KEY:}
   data:
     elasticsearch:
       repositories:
         enabled: false
   mail:
-    host: ${TUNNEL_AUTH_SMTP_HOST:}
-    port: ${TUNNEL_AUTH_SMTP_PORT:587}
-    username: ${TUNNEL_AUTH_SMTP_USERNAME:}
-    password: ${TUNNEL_AUTH_SMTP_PASSWORD:}
+    host: ${SPECUS_AUTH_SMTP_HOST:}
+    port: ${SPECUS_AUTH_SMTP_PORT:587}
+    username: ${SPECUS_AUTH_SMTP_USERNAME:}
+    password: ${SPECUS_AUTH_SMTP_PASSWORD:}
     properties:
-      mail.smtp.auth: ${TUNNEL_AUTH_SMTP_AUTH:true}
-      mail.smtp.starttls.enable: ${TUNNEL_AUTH_SMTP_STARTTLS:true}
-      mail.smtp.starttls.required: ${TUNNEL_AUTH_SMTP_STARTTLS_REQUIRED:true}
-      mail.smtp.ssl.enable: ${TUNNEL_AUTH_SMTP_SSL:false}
-      mail.smtp.connectiontimeout: ${TUNNEL_AUTH_SMTP_CONNECT_TIMEOUT_MS:5000}
-      mail.smtp.timeout: ${TUNNEL_AUTH_SMTP_READ_TIMEOUT_MS:10000}
-      mail.smtp.writetimeout: ${TUNNEL_AUTH_SMTP_WRITE_TIMEOUT_MS:10000}
+      mail.smtp.auth: ${SPECUS_AUTH_SMTP_AUTH:true}
+      mail.smtp.starttls.enable: ${SPECUS_AUTH_SMTP_STARTTLS:true}
+      mail.smtp.starttls.required: ${SPECUS_AUTH_SMTP_STARTTLS_REQUIRED:true}
+      mail.smtp.ssl.enable: ${SPECUS_AUTH_SMTP_SSL:false}
+      mail.smtp.connectiontimeout: ${SPECUS_AUTH_SMTP_CONNECT_TIMEOUT_MS:5000}
+      mail.smtp.timeout: ${SPECUS_AUTH_SMTP_READ_TIMEOUT_MS:10000}
+      mail.smtp.writetimeout: ${SPECUS_AUTH_SMTP_WRITE_TIMEOUT_MS:10000}
 
 logging:
-  # Linux systemd sets TUNNEL_LOG_FILE to /var/log/tunnel-server/tunnel-server.log.
+  # Linux systemd sets SPECUS_LOG_FILE to /var/log/specus-server/specus-server.log.
   # Keeping the default empty preserves console-only logging for local development and tests.
   file:
-    name: ${TUNNEL_LOG_FILE:}
+    name: ${SPECUS_LOG_FILE:}
   charset:
     file: UTF-8
   logback:
     rollingpolicy:
-      max-file-size: ${TUNNEL_LOG_MAX_FILE_SIZE:50MB}
-      max-history: ${TUNNEL_LOG_MAX_HISTORY:30}
-      total-size-cap: ${TUNNEL_LOG_TOTAL_SIZE_CAP:2GB}
-      clean-history-on-start: ${TUNNEL_LOG_CLEAN_HISTORY_ON_START:true}
+      max-file-size: ${SPECUS_LOG_MAX_FILE_SIZE:50MB}
+      max-history: ${SPECUS_LOG_MAX_HISTORY:30}
+      total-size-cap: ${SPECUS_LOG_TOTAL_SIZE_CAP:2GB}
+      clean-history-on-start: ${SPECUS_LOG_CLEAN_HISTORY_ON_START:true}
 
-tunnel:
+specus:
   database:
-    seed-demo-client: ${TUNNEL_DB_SEED_DEMO_CLIENT:true}
+    seed-demo-client: ${SPECUS_DB_SEED_DEMO_CLIENT:true}
   netty:
-    port: ${TUNNEL_NETTY_PORT:7010}
-    bind-address: ${TUNNEL_NETTY_BIND_ADDRESS:0.0.0.0}
-    boss-threads: ${TUNNEL_NETTY_BOSS_THREADS:1}
-    worker-threads: ${TUNNEL_NETTY_WORKER_THREADS:0}
-    remote-boss-threads: ${TUNNEL_NETTY_REMOTE_BOSS_THREADS:1}
-    remote-worker-threads: ${TUNNEL_NETTY_REMOTE_WORKER_THREADS:0}
-    so-backlog: ${TUNNEL_NETTY_SO_BACKLOG:8192}
-    reuse-address: ${TUNNEL_NETTY_REUSE_ADDRESS:true}
-    keep-alive: ${TUNNEL_NETTY_KEEP_ALIVE:true}
-    tcp-no-delay: ${TUNNEL_NETTY_TCP_NO_DELAY:true}
-    write-buffer-low-water-mark: ${TUNNEL_NETTY_WRITE_BUFFER_LOW_WATER_MARK:32768}
-    write-buffer-high-water-mark: ${TUNNEL_NETTY_WRITE_BUFFER_HIGH_WATER_MARK:65536}
-    max-frame-size: ${TUNNEL_NETTY_MAX_FRAME_SIZE:33554432}
-    pre-auth-max-frame-size: ${TUNNEL_NETTY_PRE_AUTH_MAX_FRAME_SIZE:16384}
-    max-external-connections: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS:10000}
-    max-external-connections-per-client: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT:10000}
-    max-external-connections-per-port: ${TUNNEL_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT:10000}
-  public-address: ${TUNNEL_PUBLIC_ADDRESS:}
+    port: ${SPECUS_NETTY_PORT:7010}
+    bind-address: ${SPECUS_NETTY_BIND_ADDRESS:0.0.0.0}
+    boss-threads: ${SPECUS_NETTY_BOSS_THREADS:1}
+    worker-threads: ${SPECUS_NETTY_WORKER_THREADS:0}
+    remote-boss-threads: ${SPECUS_NETTY_REMOTE_BOSS_THREADS:1}
+    remote-worker-threads: ${SPECUS_NETTY_REMOTE_WORKER_THREADS:0}
+    so-backlog: ${SPECUS_NETTY_SO_BACKLOG:8192}
+    reuse-address: ${SPECUS_NETTY_REUSE_ADDRESS:true}
+    keep-alive: ${SPECUS_NETTY_KEEP_ALIVE:true}
+    tcp-no-delay: ${SPECUS_NETTY_TCP_NO_DELAY:true}
+    write-buffer-low-water-mark: ${SPECUS_NETTY_WRITE_BUFFER_LOW_WATER_MARK:32768}
+    write-buffer-high-water-mark: ${SPECUS_NETTY_WRITE_BUFFER_HIGH_WATER_MARK:65536}
+    max-frame-size: ${SPECUS_NETTY_MAX_FRAME_SIZE:33554432}
+    pre-auth-max-frame-size: ${SPECUS_NETTY_PRE_AUTH_MAX_FRAME_SIZE:16384}
+    max-external-connections: ${SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS:10000}
+    max-external-connections-per-client: ${SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_CLIENT:10000}
+    max-external-connections-per-port: ${SPECUS_NETTY_MAX_EXTERNAL_CONNECTIONS_PER_PORT:10000}
+  public-address: ${SPECUS_PUBLIC_ADDRESS:}
   peer-mesh:
-    enabled: ${TUNNEL_PEER_MESH_ENABLED:false}
-    cidr: ${TUNNEL_PEER_MESH_CIDR:100.96.0.0/11}
-    public-address: ${TUNNEL_PEER_MESH_PUBLIC_ADDRESS:}
-    stun-turn-port: ${TUNNEL_PEER_MESH_STUN_TURN_PORT:3478}
-    standalone-stun-address: ${TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS:}
-    standalone-stun-port: ${TUNNEL_PEER_MESH_STANDALONE_STUN_PORT:3478}
-    standalone-stun-alternate-address: ${TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS:}
-    standalone-stun-alternate-port: ${TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT:0}
-    nat-probe-alternate-port: ${TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT:3479}
-    stun-primary-bind-address: ${TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS:}
-    stun-alternate-bind-address: ${TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS:}
-    stun-alternate-public-address: ${TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS:}
-    stun-behavior-strict: ${TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT:false}
-    public-stun-servers: ${TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS:}
-    session-ttl-seconds: ${TUNNEL_PEER_MESH_SESSION_TTL_SECONDS:3600}
-    allocation-ttl-seconds: ${TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS:300}
-    relay-min-port: ${TUNNEL_PEER_MESH_RELAY_MIN_PORT:49152}
-    relay-max-port: ${TUNNEL_PEER_MESH_RELAY_MAX_PORT:65535}
-    relay-worker-threads: ${TUNNEL_PEER_MESH_RELAY_WORKER_THREADS:0}
-    relay-worker-queue-capacity: ${TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY:10000}
-    udp-receive-buffer-bytes: ${TUNNEL_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES:4194304}
-    udp-send-buffer-bytes: ${TUNNEL_PEER_MESH_UDP_SEND_BUFFER_BYTES:4194304}
-    udp-traffic-class: ${TUNNEL_PEER_MESH_UDP_TRAFFIC_CLASS:16}
-    relay-traffic-flush-interval-ms: ${TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS:5000}
-    turn-auth-required: ${TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED:true}
-    turn-realm: ${TUNNEL_PEER_MESH_TURN_REALM:shuai-tunnel}
-    turn-shared-secret: ${TUNNEL_PEER_MESH_TURN_SHARED_SECRET:}
-    turn-credential-ttl-seconds: ${TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS:3600}
+    enabled: ${SPECUS_PEER_MESH_ENABLED:false}
+    cidr: ${SPECUS_PEER_MESH_CIDR:100.96.0.0/11}
+    public-address: ${SPECUS_PEER_MESH_PUBLIC_ADDRESS:}
+    stun-turn-port: ${SPECUS_PEER_MESH_STUN_TURN_PORT:3478}
+    standalone-stun-address: ${SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS:}
+    standalone-stun-port: ${SPECUS_PEER_MESH_STANDALONE_STUN_PORT:3478}
+    standalone-stun-alternate-address: ${SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS:}
+    standalone-stun-alternate-port: ${SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT:0}
+    nat-probe-alternate-port: ${SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT:3479}
+    stun-primary-bind-address: ${SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS:}
+    stun-alternate-bind-address: ${SPECUS_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS:}
+    stun-alternate-public-address: ${SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS:}
+    stun-behavior-strict: ${SPECUS_PEER_MESH_STUN_BEHAVIOR_STRICT:false}
+    public-stun-servers: ${SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS:}
+    session-ttl-seconds: ${SPECUS_PEER_MESH_SESSION_TTL_SECONDS:3600}
+    allocation-ttl-seconds: ${SPECUS_PEER_MESH_ALLOCATION_TTL_SECONDS:300}
+    relay-min-port: ${SPECUS_PEER_MESH_RELAY_MIN_PORT:49152}
+    relay-max-port: ${SPECUS_PEER_MESH_RELAY_MAX_PORT:65535}
+    relay-worker-threads: ${SPECUS_PEER_MESH_RELAY_WORKER_THREADS:0}
+    relay-worker-queue-capacity: ${SPECUS_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY:10000}
+    udp-receive-buffer-bytes: ${SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES:4194304}
+    udp-send-buffer-bytes: ${SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES:4194304}
+    udp-traffic-class: ${SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS:16}
+    relay-traffic-flush-interval-ms: ${SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS:5000}
+    turn-auth-required: ${SPECUS_PEER_MESH_TURN_AUTH_REQUIRED:true}
+    turn-realm: ${SPECUS_PEER_MESH_TURN_REALM:specus}
+    turn-shared-secret: ${SPECUS_PEER_MESH_TURN_SHARED_SECRET:}
+    turn-credential-ttl-seconds: ${SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS:3600}
     # 通用中继（公开互传浏览器 WebRTC）配额；max-allocations 设为 0 可关闭通用中继
-    general-relay-max-allocations: ${TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS:256}
-    general-relay-max-allocations-per-address: ${TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS:4}
-    general-relay-max-bytes: ${TUNNEL_PEER_MESH_GENERAL_RELAY_MAX_BYTES:536870912}
+    general-relay-max-allocations: ${SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS:256}
+    general-relay-max-allocations-per-address: ${SPECUS_PEER_MESH_GENERAL_RELAY_MAX_ALLOCATIONS_PER_ADDRESS:4}
+    general-relay-max-bytes: ${SPECUS_PEER_MESH_GENERAL_RELAY_MAX_BYTES:536870912}
   object-storage:
     # disabled | aliyun-oss. Attachments use server-generated short-lived presigned URLs;
     # clients upload/download directly to the private bucket.
-    provider: ${TUNNEL_OBJECT_STORAGE_PROVIDER:disabled}
-    endpoint: ${TUNNEL_OBJECT_STORAGE_ENDPOINT:}
-    region: ${TUNNEL_OBJECT_STORAGE_REGION:}
-    bucket: ${TUNNEL_OBJECT_STORAGE_BUCKET:}
-    access-key-id: ${TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID:}
-    access-key-secret: ${TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET:}
-    object-prefix: ${TUNNEL_OBJECT_STORAGE_PREFIX:shuai-tunnel/attachments}
-    upload-callback-url: ${TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL:}
-    upload-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS:900}
-    download-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS:600}
-    download-object-url-ttl-seconds: ${TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS:30}
-    retention-hours: ${TUNNEL_OBJECT_STORAGE_RETENTION_HOURS:72}
-    max-attachment-bytes: ${TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES:536870912}
-    per-user-storage-quota-bytes: ${TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES:1073741824}
-    per-user-monthly-download-quota-bytes: ${TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES:1073741824}
-    expiration-scan-interval-ms: ${TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS:3600000}
+    provider: ${SPECUS_OBJECT_STORAGE_PROVIDER:disabled}
+    endpoint: ${SPECUS_OBJECT_STORAGE_ENDPOINT:}
+    region: ${SPECUS_OBJECT_STORAGE_REGION:}
+    bucket: ${SPECUS_OBJECT_STORAGE_BUCKET:}
+    access-key-id: ${SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID:}
+    access-key-secret: ${SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET:}
+    object-prefix: ${SPECUS_OBJECT_STORAGE_PREFIX:specus/attachments}
+    upload-callback-url: ${SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL:}
+    upload-url-ttl-seconds: ${SPECUS_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS:900}
+    download-url-ttl-seconds: ${SPECUS_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS:600}
+    download-object-url-ttl-seconds: ${SPECUS_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS:30}
+    retention-hours: ${SPECUS_OBJECT_STORAGE_RETENTION_HOURS:72}
+    max-attachment-bytes: ${SPECUS_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES:536870912}
+    per-user-storage-quota-bytes: ${SPECUS_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES:1073741824}
+    per-user-monthly-download-quota-bytes: ${SPECUS_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES:1073741824}
+    expiration-scan-interval-ms: ${SPECUS_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS:3600000}
   media-capture:
     # HTTP 路由媒体采集专用 RustFS（S3 兼容）存储。路由还需单独开启 mediaCaptureEnabled。
-    enabled: ${TUNNEL_MEDIA_CAPTURE_ENABLED:false}
-    endpoint: ${TUNNEL_MEDIA_CAPTURE_ENDPOINT:}
-    region: ${TUNNEL_MEDIA_CAPTURE_REGION:us-east-1}
-    bucket: ${TUNNEL_MEDIA_CAPTURE_BUCKET:}
-    access-key-id: ${TUNNEL_MEDIA_CAPTURE_ACCESS_KEY_ID:}
-    access-key-secret: ${TUNNEL_MEDIA_CAPTURE_ACCESS_KEY_SECRET:}
-    object-prefix: ${TUNNEL_MEDIA_CAPTURE_PREFIX:shuai-tunnel/http-media}
-    path-style: ${TUNNEL_MEDIA_CAPTURE_PATH_STYLE:true}
-    create-bucket-if-missing: ${TUNNEL_MEDIA_CAPTURE_CREATE_BUCKET_IF_MISSING:false}
-    part-size-bytes: ${TUNNEL_MEDIA_CAPTURE_PART_SIZE_BYTES:8388608}
-    max-inflight-parts: ${TUNNEL_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS:4}
-    upload-threads: ${TUNNEL_MEDIA_CAPTURE_UPLOAD_THREADS:4}
-    retention-seconds: ${TUNNEL_MEDIA_CAPTURE_RETENTION_SECONDS:604800}
-    live-window-seconds: ${TUNNEL_MEDIA_CAPTURE_LIVE_WINDOW_SECONDS:300}
-    manifest-max-bytes: ${TUNNEL_MEDIA_CAPTURE_MANIFEST_MAX_BYTES:16777216}
-    playback-ticket-ttl-seconds: ${TUNNEL_MEDIA_CAPTURE_PLAYBACK_TICKET_TTL_SECONDS:900}
-    cleanup-interval-ms: ${TUNNEL_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS:60000}
+    enabled: ${SPECUS_MEDIA_CAPTURE_ENABLED:false}
+    endpoint: ${SPECUS_MEDIA_CAPTURE_ENDPOINT:}
+    region: ${SPECUS_MEDIA_CAPTURE_REGION:us-east-1}
+    bucket: ${SPECUS_MEDIA_CAPTURE_BUCKET:}
+    access-key-id: ${SPECUS_MEDIA_CAPTURE_ACCESS_KEY_ID:}
+    access-key-secret: ${SPECUS_MEDIA_CAPTURE_ACCESS_KEY_SECRET:}
+    object-prefix: ${SPECUS_MEDIA_CAPTURE_PREFIX:specus/http-media}
+    path-style: ${SPECUS_MEDIA_CAPTURE_PATH_STYLE:true}
+    create-bucket-if-missing: ${SPECUS_MEDIA_CAPTURE_CREATE_BUCKET_IF_MISSING:false}
+    part-size-bytes: ${SPECUS_MEDIA_CAPTURE_PART_SIZE_BYTES:8388608}
+    max-inflight-parts: ${SPECUS_MEDIA_CAPTURE_MAX_INFLIGHT_PARTS:4}
+    upload-threads: ${SPECUS_MEDIA_CAPTURE_UPLOAD_THREADS:4}
+    retention-seconds: ${SPECUS_MEDIA_CAPTURE_RETENTION_SECONDS:604800}
+    live-window-seconds: ${SPECUS_MEDIA_CAPTURE_LIVE_WINDOW_SECONDS:300}
+    manifest-max-bytes: ${SPECUS_MEDIA_CAPTURE_MANIFEST_MAX_BYTES:16777216}
+    playback-ticket-ttl-seconds: ${SPECUS_MEDIA_CAPTURE_PLAYBACK_TICKET_TTL_SECONDS:900}
+    cleanup-interval-ms: ${SPECUS_MEDIA_CAPTURE_CLEANUP_INTERVAL_MS:60000}
   public-transfer:
     # 免登录文件互传的滥用防护。presign-upload 无鉴权,按来源 IP 固定窗口限流,
     # 并对单房间(按 roomToken 哈希)的 PENDING 附件数设上限。cluster-enabled=true 时
     # presence、房间修订、WS 转发和公开入口限流由 Redis 统一协调。
-    presign-rate-limit-per-ip: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP:30}
-    presign-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS:300}
-    max-pending-uploads-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM:50}
-    max-discovery-peers-per-room: ${TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM:32}
-    discovery-message-rate-limit-per-connection: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION:360}
-    discovery-message-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS:60}
-    cluster-enabled: ${TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED:false}
-    redis-uri: ${TUNNEL_PUBLIC_TRANSFER_REDIS_URI:}
-    redis-key-prefix: ${TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX:shuai-tunnel:v2:public-transfer}
-    presence-lease-seconds: ${TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS:30}
-    presence-refresh-interval-ms: ${TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS:10000}
-    redis-command-timeout-ms: ${TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS:2000}
-    pairing-code-ttl-seconds: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS:300}
-    pairing-code-redeem-rate-limit-per-ip: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP:10}
-    pairing-code-redeem-rate-limit-window-seconds: ${TUNNEL_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS:300}
+    presign-rate-limit-per-ip: ${SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP:30}
+    presign-rate-limit-window-seconds: ${SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS:300}
+    max-pending-uploads-per-room: ${SPECUS_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM:50}
+    max-discovery-peers-per-room: ${SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM:32}
+    discovery-message-rate-limit-per-connection: ${SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION:360}
+    discovery-message-rate-limit-window-seconds: ${SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS:60}
+    cluster-enabled: ${SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED:false}
+    redis-uri: ${SPECUS_PUBLIC_TRANSFER_REDIS_URI:}
+    redis-key-prefix: ${SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX:specus:v2:public-transfer}
+    presence-lease-seconds: ${SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS:30}
+    presence-refresh-interval-ms: ${SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS:10000}
+    redis-command-timeout-ms: ${SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS:2000}
+    pairing-code-ttl-seconds: ${SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_TTL_SECONDS:300}
+    pairing-code-redeem-rate-limit-per-ip: ${SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_PER_IP:10}
+    pairing-code-redeem-rate-limit-window-seconds: ${SPECUS_PUBLIC_TRANSFER_PAIRING_CODE_REDEEM_RATE_LIMIT_WINDOW_SECONDS:300}
   client-auth:
-    default-max-online-instances: ${TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
-    per-machine-user-max-instances: ${TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}
-    token-ttl-seconds: ${TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS:28800}
+    default-max-online-instances: ${SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES:2}
+    per-machine-user-max-instances: ${SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES:1}
+    token-ttl-seconds: ${SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS:28800}
   auth:
     # Local username/password login for the management UI (alternative to OIDC). A successful login
     # mints a short-lived HS256 JWT the admin API accepts alongside the OIDC tokens. Change the
     # default admin/admin before exposing the server. Set password to blank to disable this login.
-    password-login-enabled: ${TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED:true}
+    password-login-enabled: ${SPECUS_AUTH_PASSWORD_LOGIN_ENABLED:true}
     # Allow visitors to self-register USER-role accounts in the default tenant from the login
     # dialog. Requires password login. Disable on deployments that only want admin-managed users.
-    registration-enabled: ${TUNNEL_AUTH_REGISTRATION_ENABLED:true}
-    username: ${TUNNEL_AUTH_USERNAME:admin}
-    password: ${TUNNEL_AUTH_PASSWORD:admin}
-    tenant-id: ${TUNNEL_AUTH_TENANT_ID:default}
-    jwt-secret: ${TUNNEL_AUTH_JWT_SECRET:}
-    token-ttl-seconds: ${TUNNEL_AUTH_TOKEN_TTL_SECONDS:28800}
+    registration-enabled: ${SPECUS_AUTH_REGISTRATION_ENABLED:true}
+    username: ${SPECUS_AUTH_USERNAME:admin}
+    password: ${SPECUS_AUTH_PASSWORD:admin}
+    tenant-id: ${SPECUS_AUTH_TENANT_ID:default}
+    jwt-secret: ${SPECUS_AUTH_JWT_SECRET:}
+    token-ttl-seconds: ${SPECUS_AUTH_TOKEN_TTL_SECONDS:28800}
     turnstile:
       # Cloudflare Turnstile. The service validates success, action and hostname server-side.
-      enabled: ${TUNNEL_AUTH_TURNSTILE_ENABLED:false}
-      site-key: ${TUNNEL_AUTH_TURNSTILE_SITE_KEY:}
-      secret-key: ${TUNNEL_AUTH_TURNSTILE_SECRET_KEY:}
-      verify-url: ${TUNNEL_AUTH_TURNSTILE_VERIFY_URL:https://challenges.cloudflare.com/turnstile/v0/siteverify}
-      allowed-hostnames: ${TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES:}
+      enabled: ${SPECUS_AUTH_TURNSTILE_ENABLED:false}
+      site-key: ${SPECUS_AUTH_TURNSTILE_SITE_KEY:}
+      secret-key: ${SPECUS_AUTH_TURNSTILE_SECRET_KEY:}
+      verify-url: ${SPECUS_AUTH_TURNSTILE_VERIFY_URL:https://challenges.cloudflare.com/turnstile/v0/siteverify}
+      allowed-hostnames: ${SPECUS_AUTH_TURNSTILE_ALLOWED_HOSTNAMES:}
     email-verification:
       # Self-registration is advertised only when this switch, SMTP and from-address are ready.
-      enabled: ${TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED:false}
-      from-address: ${TUNNEL_AUTH_EMAIL_FROM_ADDRESS:}
-      from-name: ${TUNNEL_AUTH_EMAIL_FROM_NAME:shuai-tunnel}
-      subject: ${TUNNEL_AUTH_EMAIL_SUBJECT:shuai-tunnel 注册验证码}
-      code-ttl-seconds: ${TUNNEL_AUTH_EMAIL_CODE_TTL_SECONDS:600}
-      max-attempts: ${TUNNEL_AUTH_EMAIL_MAX_ATTEMPTS:5}
-      resend-cooldown-seconds: ${TUNNEL_AUTH_EMAIL_RESEND_COOLDOWN_SECONDS:60}
-      cleanup-interval-ms: ${TUNNEL_AUTH_EMAIL_CLEANUP_INTERVAL_MS:3600000}
+      enabled: ${SPECUS_AUTH_EMAIL_VERIFICATION_ENABLED:false}
+      from-address: ${SPECUS_AUTH_EMAIL_FROM_ADDRESS:}
+      from-name: ${SPECUS_AUTH_EMAIL_FROM_NAME:specus}
+      subject: ${SPECUS_AUTH_EMAIL_SUBJECT:specus 注册验证码}
+      code-ttl-seconds: ${SPECUS_AUTH_EMAIL_CODE_TTL_SECONDS:600}
+      max-attempts: ${SPECUS_AUTH_EMAIL_MAX_ATTEMPTS:5}
+      resend-cooldown-seconds: ${SPECUS_AUTH_EMAIL_RESEND_COOLDOWN_SECONDS:60}
+      cleanup-interval-ms: ${SPECUS_AUTH_EMAIL_CLEANUP_INTERVAL_MS:3600000}
   oidc:
     # The management UI logs in via OIDC (Authorization Code + PKCE) and the admin API validates
     # the resulting JWT. Defaults target the project gateway; set client-id (and register the
     # redirect-uri at the provider) per deployment. Leave client-secret blank for a public PKCE client.
-    issuer: ${TUNNEL_OIDC_ISSUER:https://gateway.toys.theshuai.com/auth}
-    jwk-set-uri: ${TUNNEL_OIDC_JWK_SET_URI:https://gateway.toys.theshuai.com/auth/oauth2/jwks}
-    authorization-endpoint: ${TUNNEL_OIDC_AUTHORIZATION_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/authorize}
-    token-endpoint: ${TUNNEL_OIDC_TOKEN_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/token}
-    end-session-endpoint: ${TUNNEL_OIDC_END_SESSION_ENDPOINT:https://gateway.toys.theshuai.com/auth/connect/logout}
-    client-id: ${TUNNEL_OIDC_CLIENT_ID:}
-    client-secret: ${TUNNEL_OIDC_CLIENT_SECRET:}
-    redirect-uri: ${TUNNEL_OIDC_REDIRECT_URI:http://127.0.0.1:8088/}
-    scope: ${TUNNEL_OIDC_SCOPE:openid}
-    audience: ${TUNNEL_OIDC_AUDIENCE:}
-    tenant-claim: ${TUNNEL_OIDC_TENANT_CLAIM:tenant_id}
+    issuer: ${SPECUS_OIDC_ISSUER:https://gateway.toys.theshuai.com/auth}
+    jwk-set-uri: ${SPECUS_OIDC_JWK_SET_URI:https://gateway.toys.theshuai.com/auth/oauth2/jwks}
+    authorization-endpoint: ${SPECUS_OIDC_AUTHORIZATION_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/authorize}
+    token-endpoint: ${SPECUS_OIDC_TOKEN_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/token}
+    end-session-endpoint: ${SPECUS_OIDC_END_SESSION_ENDPOINT:https://gateway.toys.theshuai.com/auth/connect/logout}
+    client-id: ${SPECUS_OIDC_CLIENT_ID:}
+    client-secret: ${SPECUS_OIDC_CLIENT_SECRET:}
+    redirect-uri: ${SPECUS_OIDC_REDIRECT_URI:http://127.0.0.1:8088/}
+    scope: ${SPECUS_OIDC_SCOPE:openid}
+    audience: ${SPECUS_OIDC_AUDIENCE:}
+    tenant-claim: ${SPECUS_OIDC_TENANT_CLAIM:tenant_id}
   traffic:
-    flush-interval-ms: ${TUNNEL_TRAFFIC_FLUSH_INTERVAL_MS:5000}
-    capture-detail-enabled: ${TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED:false}
+    flush-interval-ms: ${SPECUS_TRAFFIC_FLUSH_INTERVAL_MS:5000}
+    capture-detail-enabled: ${SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED:false}
     # TCP keeps a short preview for list rendering and stores the full payload separately.
-    capture-preview-bytes: ${TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES:256}
-    capture-header-chars: ${TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS:8192}
-    capture-decode-max-bytes: ${TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES:1048576}
-    capture-max-pending: ${TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING:20000}
-    capture-flush-batch-size: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE:1000}
-    capture-flush-interval-ms: ${TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS:2000}
+    capture-preview-bytes: ${SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES:256}
+    capture-header-chars: ${SPECUS_TRAFFIC_CAPTURE_HEADER_CHARS:8192}
+    capture-decode-max-bytes: ${SPECUS_TRAFFIC_CAPTURE_DECODE_MAX_BYTES:1048576}
+    capture-max-pending: ${SPECUS_TRAFFIC_CAPTURE_MAX_PENDING:20000}
+    capture-flush-batch-size: ${SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE:1000}
+    capture-flush-interval-ms: ${SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS:2000}
     # S4.2 采样率 0.0-1.0；每个方向的首帧始终捕获，其余帧按此比例采样，默认全量
-    capture-sample-rate: ${TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE:1.0}
+    capture-sample-rate: ${SPECUS_TRAFFIC_CAPTURE_SAMPLE_RATE:1.0}
   elasticsearch:
     # When blank, HTTP exchange detail uses the database. When set, HTTP exchange detail writes
     # and reads through Spring Data Elasticsearch instead.
-    uris: ${TUNNEL_ELASTICSEARCH_URIS:}
-    username: ${TUNNEL_ELASTICSEARCH_USERNAME:}
-    password: ${TUNNEL_ELASTICSEARCH_PASSWORD:}
-    api-key: ${TUNNEL_ELASTICSEARCH_API_KEY:}
-    index: ${TUNNEL_ELASTICSEARCH_HTTP_INDEX:shuai-tunnel-http-traffic}
-    tcp-index: ${TUNNEL_ELASTICSEARCH_TCP_INDEX:shuai-tunnel-tcp-traffic}
-    http-max-store-size: ${TUNNEL_ELASTICSEARCH_HTTP_MAX_STORE_SIZE:100GB}
-    tcp-max-store-size: ${TUNNEL_ELASTICSEARCH_TCP_MAX_STORE_SIZE:10GB}
+    uris: ${SPECUS_ELASTICSEARCH_URIS:}
+    username: ${SPECUS_ELASTICSEARCH_USERNAME:}
+    password: ${SPECUS_ELASTICSEARCH_PASSWORD:}
+    api-key: ${SPECUS_ELASTICSEARCH_API_KEY:}
+    index: ${SPECUS_ELASTICSEARCH_HTTP_INDEX:specus-http-traffic}
+    tcp-index: ${SPECUS_ELASTICSEARCH_TCP_INDEX:specus-tcp-traffic}
+    http-max-store-size: ${SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE:100GB}
+    tcp-max-store-size: ${SPECUS_ELASTICSEARCH_TCP_MAX_STORE_SIZE:10GB}
   connection-record:
     # Rolling days of raw login detail to keep. Older detail is rolled up into per-natural-month
     # totals (kept indefinitely) and then deleted. 0 disables archiving.
-    detail-retention-days: ${TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS:60}
-    archive-interval-ms: ${TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS:3600000}
+    detail-retention-days: ${SPECUS_CONNECTION_DETAIL_RETENTION_DAYS:60}
+    archive-interval-ms: ${SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS:3600000}
   http:
-    timeout-ms: ${TUNNEL_HTTP_TIMEOUT_MS:30000}
-    max-request-body-size: ${TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE:16777216}
-    route-cache-ttl-ms: ${TUNNEL_HTTP_ROUTE_CACHE_TTL_MS:2000}
+    timeout-ms: ${SPECUS_HTTP_TIMEOUT_MS:30000}
+    max-request-body-size: ${SPECUS_HTTP_MAX_REQUEST_BODY_SIZE:16777216}
+    route-cache-ttl-ms: ${SPECUS_HTTP_ROUTE_CACHE_TTL_MS:2000}
     rewrite:
       # HTTP 路由开启路径改写时，单次可改写响应体的最大字节数（默认 10 MiB）。
-      max-body-bytes: ${TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES:10485760}
+      max-body-bytes: ${SPECUS_HTTP_REWRITE_MAX_BODY_BYTES:10485760}
   login:
     executor:
-      core-size: ${TUNNEL_LOGIN_EXECUTOR_CORE:8}
-      max-size: ${TUNNEL_LOGIN_EXECUTOR_MAX:32}
-      queue-capacity: ${TUNNEL_LOGIN_EXECUTOR_QUEUE:20000}
+      core-size: ${SPECUS_LOGIN_EXECUTOR_CORE:8}
+      max-size: ${SPECUS_LOGIN_EXECUTOR_MAX:32}
+      queue-capacity: ${SPECUS_LOGIN_EXECUTOR_QUEUE:20000}
   tls:
     # disabled: local-development plaintext only; production startup validation rejects public binds
     # file: load keystore/truststore from disk (production)
     # self-signed: generate a transient self-signed cert (dev/test)
-    mode: ${TUNNEL_TLS_MODE:disabled}
-    keystore: ${TUNNEL_TLS_KEYSTORE:}
-    keystore-password: ${TUNNEL_TLS_KEYSTORE_PASSWORD:}
-    key-password: ${TUNNEL_TLS_KEY_PASSWORD:}
-    require-encryption: ${TUNNEL_TLS_REQUIRE_ENCRYPTION:false}
-    terminated-upstream: ${TUNNEL_TLS_TERMINATED_UPSTREAM:false}
+    mode: ${SPECUS_TLS_MODE:disabled}
+    keystore: ${SPECUS_TLS_KEYSTORE:}
+    keystore-password: ${SPECUS_TLS_KEYSTORE_PASSWORD:}
+    key-password: ${SPECUS_TLS_KEY_PASSWORD:}
+    require-encryption: ${SPECUS_TLS_REQUIRE_ENCRYPTION:false}
+    terminated-upstream: ${SPECUS_TLS_TERMINATED_UPSTREAM:false}

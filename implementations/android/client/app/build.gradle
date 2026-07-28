@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace "com.theshuai.tunnel.android"
+    namespace "com.theshuai.specus.android"
     compileSdk 35
 
     defaultConfig {
-        applicationId "com.theshuai.tunnel.android"
+        applicationId "com.theshuai.specus.android"
         minSdk 26
         targetSdk 35
         versionCode 1

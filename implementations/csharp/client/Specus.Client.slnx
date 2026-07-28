@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="../protocol/src/Specus.Protocol/Specus.Protocol.csproj" />
+    <Project Path="src/Specus.Client/Specus.Client.csproj" />
+    <Project Path="src/Specus.Client.Desktop/Specus.Client.Desktop.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Specus.Client.Tests/Specus.Client.Tests.csproj" />
+  </Folder>
+</Solution>

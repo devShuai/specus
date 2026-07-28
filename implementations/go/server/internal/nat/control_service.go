@@ -1,4 +1,4 @@
-// Package nat implements server-side NAT TCP forwarding: pushing tunnel configuration to
+// Package nat implements server-side NAT TCP forwarding: pushing specus configuration to
 // clients (NAT_CONTROL), managing public-port listeners, bridging external TCP connections
 // over the control channel, and tracking traffic. It mirrors the C# Nat namespace.
 package nat
@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
-// ControlService builds and pushes NAT_CONTROL messages from the persisted tunnel/HTTP-route
+// ControlService builds and pushes NAT_CONTROL messages from the persisted specus/HTTP-route
 // configuration. Mirrors the C# NatControlService.
 type ControlService struct {
 	db            *store.DB
@@ -29,9 +29,9 @@ func NewControlService(db *store.DB, sessions *session.Registry, remotePort int,
 }
 
 // PushResult reports how many entries were pushed. HTTPRoutes is -1 when HTTP routes are
-// unmanaged for the client (the httpTunnelConfigList key is omitted entirely).
+// unmanaged for the client (the httpSpecusConfigList key is omitted entirely).
 type PushResult struct {
-	Tunnels    int
+	SpecusMappings    int
 	HTTPRoutes int
 }
 
@@ -53,7 +53,7 @@ func (s *ControlService) PushToID(ctx context.Context, clientID int64, clientNam
 }
 
 func (s *ControlService) pushSnapshot(ctx context.Context, clientID int64, clientName string) (PushResult, bool, error) {
-	mappings, err := s.db.ListEnabledTunnels(ctx, clientID)
+	mappings, err := s.db.ListEnabledSpecusMappings(ctx, clientID)
 	if err != nil {
 		return PushResult{}, false, err
 	}
@@ -80,28 +80,28 @@ func (s *ControlService) pushSnapshot(ctx context.Context, clientID int64, clien
 	if err := bound.Send(message); err != nil {
 		return PushResult{}, false, err
 	}
-	result := PushResult{Tunnels: len(mappings), HTTPRoutes: -1}
+	result := PushResult{SpecusMappings: len(mappings), HTTPRoutes: -1}
 	if httpManaged > 0 {
 		result.HTTPRoutes = len(httpRoutes)
 	}
 	return result, true, nil
 }
 
-func (s *ControlService) buildMessage(clientName string, mappings []store.TunnelMapping,
+func (s *ControlService) buildMessage(clientName string, mappings []store.SpecusMapping,
 	httpManaged bool, httpRoutes []store.HTTPRouteMapping) (protocol.MessageResponse, error) {
-	tunnelConfigList := make([]map[string]any, 0, len(mappings))
+	specusConfigList := make([]map[string]any, 0, len(mappings))
 	for _, mapping := range mappings {
-		tunnelConfigList = append(tunnelConfigList, map[string]any{
+		specusConfigList = append(specusConfigList, map[string]any{
 			"port":          mapping.ListenPort,
-			"tunnelAddress": mapping.TargetAddress,
-			"tunnelPort":    mapping.TargetPort,
+			"specusAddress": mapping.TargetAddress,
+			"specusPort":    mapping.TargetPort,
 		})
 	}
 
 	bean := map[string]any{
 		"clientName":       clientName,
 		"remotePort":       s.remotePort,
-		"tunnelConfigList": tunnelConfigList,
+		"specusConfigList": specusConfigList,
 	}
 	if trimmed := strings.TrimSpace(s.publicAddress); trimmed != "" {
 		bean["remoteAddress"] = trimmed
@@ -116,7 +116,7 @@ func (s *ControlService) buildMessage(clientName string, mappings []store.Tunnel
 				"targetBaseUrl": route.TargetBaseURL,
 			})
 		}
-		bean["httpTunnelConfigList"] = httpList
+		bean["httpSpecusConfigList"] = httpList
 	}
 
 	payload, err := json.Marshal(bean)

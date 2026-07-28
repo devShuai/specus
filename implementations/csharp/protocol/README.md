@@ -1,6 +1,6 @@
 # implementations/csharp/protocol
 
-shuai-tunnel 协议库的 .NET 实现,从 `implementations/csharp/server` 抽离为独立模块,供
+specus 协议库的 .NET 实现,从 `implementations/csharp/server` 抽离为独立模块,供
 **server** (`implementations/csharp/server`) 和 **client** (`implementations/csharp/client`) 共同复用。
 
 ## 内容
@@ -14,7 +14,7 @@ shuai-tunnel 协议库的 .NET 实现,从 `implementations/csharp/server` 抽离
 ## 引用方式
 
 ```xml
-<ProjectReference Include="path/to/implementations/csharp/protocol/src/ShuaiTunnel.Protocol/ShuaiTunnel.Protocol.csproj" />
+<ProjectReference Include="path/to/implementations/csharp/protocol/src/Specus.Protocol/Specus.Protocol.csproj" />
 ```
 
 server 与 client 都通过相对路径 `ProjectReference` 引用本协议项目；协议项目自身无外部 NuGet 依赖（server / client 应用项目仍有各自的 NuGet 依赖）。
@@ -22,8 +22,8 @@ server 与 client 都通过相对路径 `ProjectReference` 引用本协议项目
 ## 构建
 
 ```bash
-dotnet build implementations/csharp/protocol/ShuaiTunnel.Protocol.slnx
-dotnet test  implementations/csharp/protocol/ShuaiTunnel.Protocol.slnx
+dotnet build implementations/csharp/protocol/Specus.Protocol.slnx
+dotnet test  implementations/csharp/protocol/Specus.Protocol.slnx
 ```
 
 当前协议测试为 38/38；两份 21 个 fixture 副本按文件名逐一 SHA-256 一致。

@@ -1,5 +1,5 @@
-#ifndef SHUAI_TUNNEL_STORAGE_H
-#define SHUAI_TUNNEL_STORAGE_H
+#ifndef SPECUS_STORAGE_H
+#define SPECUS_STORAGE_H
 
 #include <stddef.h>
 #include <stdint.h>

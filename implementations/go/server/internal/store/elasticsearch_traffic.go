@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	defaultHTTPESIndex = "shuai-tunnel-http-traffic"
-	defaultTCPESIndex  = "shuai-tunnel-tcp-traffic"
+	defaultHTTPESIndex = "specus-http-traffic"
+	defaultTCPESIndex  = "specus-tcp-traffic"
 	esTrimBatchSize    = 500
 	esMaxTrimBatches   = 20
 	esTrimInterval     = time.Minute
@@ -854,7 +854,7 @@ func esAny(queries ...any) map[string]any {
 }
 
 func esNoMatch() map[string]any {
-	return esTerm("_id", "__shuai_tunnel_no_match__")
+	return esTerm("_id", "__specus_no_match__")
 }
 
 func int64Terms(values []int64) []any {

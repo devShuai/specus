@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestConnectLocalTunnelIgnoresInvalidTcpConnectedLikeJava(t *testing.T) {
+func TestConnectLocalSpecusIgnoresInvalidTcpConnectedLikeJava(t *testing.T) {
 	cases := []struct {
 		name     string
 		metadata map[string]any
@@ -32,10 +32,10 @@ func TestConnectLocalTunnelIgnoresInvalidTcpConnectedLikeJava(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			control := &captureConn{}
-			tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
+			specusClient := New(Config{}, log.New(io.Discard, "", 0))
 
-			tunnelClient.openNatFlow(1)
-			tunnelClient.connectLocalTunnel(control, 1, tc.metadata)
+			specusClient.openNatFlow(1)
+			specusClient.connectLocalSpecus(control, 1, tc.metadata)
 
 			if control.Len() != 0 {
 				t.Fatalf("control connection wrote %d bytes, want no DISCONNECTED frame", control.Len())
@@ -76,18 +76,18 @@ func TestNatMetadataHelpersMatchJavaCoercion(t *testing.T) {
 }
 
 func TestRegisterFailureClearsPortForRetryWithoutClosingSession(t *testing.T) {
-	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
-	tunnelClient.registered[19090] = struct{}{}
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	specusClient.registered[19090] = struct{}{}
 
-	tunnelClient.handleNatRegisterResult(map[string]any{
+	specusClient.handleNatRegisterResult(map[string]any{
 		"port":    19090,
 		"success": false,
 		"reason":  "address already in use",
 	})
 
-	tunnelClient.registeredMu.Lock()
-	_, stillRegistered := tunnelClient.registered[19090]
-	tunnelClient.registeredMu.Unlock()
+	specusClient.registeredMu.Lock()
+	_, stillRegistered := specusClient.registered[19090]
+	specusClient.registeredMu.Unlock()
 	if stillRegistered {
 		t.Fatal("failed NAT port must be cleared so a later config refresh can retry it")
 	}

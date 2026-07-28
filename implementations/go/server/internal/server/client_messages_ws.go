@@ -11,13 +11,13 @@ import (
 	"unicode/utf16"
 
 	"github.com/coder/websocket"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/control"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/wsevents"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
 const (
@@ -84,14 +84,14 @@ func (state *natFlowState) markRemoteFinished() bool {
 	return state.localFinished
 }
 
-func (client *Client) syncTunnelConfigs(connection net.Conn, configs []TunnelConfig) {
-	desired := make(map[int]TunnelConfig, len(configs))
+func (client *Client) syncSpecusConfigs(connection net.Conn, configs []SpecusConfig) {
+	desired := make(map[int]SpecusConfig, len(configs))
 	for _, config := range configs {
 		desired[config.Port] = config
 	}
-	client.tunnelsMu.Lock()
-	client.tunnels = desired
-	client.tunnelsMu.Unlock()
+	client.specusMappingsMu.Lock()
+	client.specusMappings = desired
+	client.specusMappingsMu.Unlock()
 
 	client.registeredMu.Lock()
 	var removedPorts []int
@@ -103,12 +103,12 @@ func (client *Client) syncTunnelConfigs(connection net.Conn, configs []TunnelCon
 	}
 	client.registeredMu.Unlock()
 	for _, port := range removedPorts {
-		client.unregisterTunnel(connection, port)
+		client.unregisterSpecus(connection, port)
 	}
-	client.registerConfiguredTunnels(connection)
+	client.registerConfiguredSpecusMappings(connection)
 }
 
-func (client *Client) unregisterTunnel(connection net.Conn, port int) {
+func (client *Client) unregisterSpecus(connection net.Conn, port int) {
 	body, err := protocol.EncodeNatMessage(protocol.NatMessage{
 		Type:     protocol.NatUnregister,
 		Metadata: map[string]any{"port": port},
@@ -121,19 +121,19 @@ func (client *Client) unregisterTunnel(connection net.Conn, port int) {
 	}
 }
 
-func (client *Client) registerConfiguredTunnels(connection net.Conn) {
-	client.tunnelsMu.RLock()
-	configs := make([]TunnelConfig, 0, len(client.tunnels))
-	for _, config := range client.tunnels {
+func (client *Client) registerConfiguredSpecusMappings(connection net.Conn) {
+	client.specusMappingsMu.RLock()
+	configs := make([]SpecusConfig, 0, len(client.specusMappings))
+	for _, config := range client.specusMappings {
 		configs = append(configs, config)
 	}
-	client.tunnelsMu.RUnlock()
+	client.specusMappingsMu.RUnlock()
 	for _, config := range configs {
-		client.registerTunnel(connection, config)
+		client.registerSpecus(connection, config)
 	}
 }
 
-func (client *Client) registerTunnel(connection net.Conn, config TunnelConfig) {
+func (client *Client) registerSpecus(connection net.Conn, config SpecusConfig) {
 	client.registeredMu.Lock()
 	if _, exists := client.registered[config.Port]; exists {
 		client.registeredMu.Unlock()
@@ -146,8 +146,8 @@ func (client *Client) registerTunnel(connection net.Conn, config TunnelConfig) {
 		Type: protocol.NatRegister,
 		Metadata: map[string]any{
 			"port":          config.Port,
-			"tunnelAddress": config.TunnelAddress,
-			"tunnelPort":    config.TunnelPort,
+			"specusAddress": config.SpecusAddress,
+			"specusPort":    config.SpecusPort,
 			"clientName":    client.currentClientName(),
 		},
 	})
@@ -175,9 +175,9 @@ func (client *Client) handleNatMessage(connection net.Conn, body []byte) error {
 		if source, _ := metadataStringOptional(message.Metadata, "source"); source == "http" {
 			client.openHTTPStream(connection, message.StreamID, message.Metadata)
 		} else if source == "ws" {
-			go client.connectWebSocketTunnel(connection, message.StreamID, message.Metadata)
+			go client.connectWebSocketSpecus(connection, message.StreamID, message.Metadata)
 		} else {
-			go client.connectLocalTunnel(connection, message.StreamID, message.Metadata)
+			go client.connectLocalSpecus(connection, message.StreamID, message.Metadata)
 		}
 	case protocol.NatFin:
 		if client.finishHTTPRequest(message.StreamID, message.Metadata) {
@@ -199,7 +199,7 @@ func (client *Client) handleNatMessage(connection net.Conn, body []byte) error {
 		if handled, err := client.writeWebSocketData(message.StreamID, message.Data); handled {
 			if err != nil {
 				client.logger.Printf("write local websocket stream %d failed: %v", message.StreamID, err)
-				client.disconnectWebSocketTunnel(connection, message.StreamID)
+				client.disconnectWebSocketSpecus(connection, message.StreamID)
 			} else {
 				client.sendNatWindowUpdate(connection, message.StreamID, len(message.Data))
 				if message.Flags&protocol.NatFlagEndStream != 0 {
@@ -209,8 +209,8 @@ func (client *Client) handleNatMessage(connection net.Conn, body []byte) error {
 			return nil
 		}
 		if err := client.writeLocalData(message.StreamID, message.Data); err != nil {
-			client.logger.Printf("write local tunnel stream %d failed: %v", message.StreamID, err)
-			client.disconnectLocalTunnel(connection, message.StreamID)
+			client.logger.Printf("write local specus stream %d failed: %v", message.StreamID, err)
+			client.disconnectLocalSpecus(connection, message.StreamID)
 		} else {
 			client.sendNatWindowUpdate(connection, message.StreamID, len(message.Data))
 			if message.Flags&protocol.NatFlagEndStream != 0 {
@@ -240,13 +240,13 @@ func (client *Client) handleNatRegisterResult(metadata map[string]any) {
 		client.logger.Printf("register NAT port %d failed: %s", port, reason)
 		return
 	}
-	client.tunnelsMu.RLock()
-	config := client.tunnels[port]
-	client.tunnelsMu.RUnlock()
-	client.logger.Printf("registered NAT port %d -> %s:%d", port, config.TunnelAddress, config.TunnelPort)
+	client.specusMappingsMu.RLock()
+	config := client.specusMappings[port]
+	client.specusMappingsMu.RUnlock()
+	client.logger.Printf("registered NAT port %d -> %s:%d", port, config.SpecusAddress, config.SpecusPort)
 }
 
-func (client *Client) connectLocalTunnel(connection net.Conn, streamID uint32, metadata map[string]any) {
+func (client *Client) connectLocalSpecus(connection net.Conn, streamID uint32, metadata map[string]any) {
 	port, err := metadataInt(metadata, "port")
 	if err != nil {
 		client.logger.Printf("invalid NAT connected message: %v", err)
@@ -257,17 +257,17 @@ func (client *Client) connectLocalTunnel(connection net.Conn, streamID uint32, m
 		client.logger.Printf("invalid NAT connected message: %v", err)
 		return
 	}
-	client.tunnelsMu.RLock()
-	config, exists := client.tunnels[port]
-	client.tunnelsMu.RUnlock()
+	client.specusMappingsMu.RLock()
+	config, exists := client.specusMappings[port]
+	client.specusMappingsMu.RUnlock()
 	if !exists {
-		client.logger.Printf("no local tunnel configured for NAT port %d", port)
+		client.logger.Printf("no local specus configured for NAT port %d", port)
 		return
 	}
-	address := net.JoinHostPort(config.TunnelAddress, strconv.Itoa(config.TunnelPort))
+	address := net.JoinHostPort(config.SpecusAddress, strconv.Itoa(config.SpecusPort))
 	localConnection, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
-		client.logger.Printf("connect local tunnel %s failed: %v", address, err)
+		client.logger.Printf("connect local specus %s failed: %v", address, err)
 		client.sendNatReset(connection, streamID, 1, "local connect failed")
 		client.closeNatFlow(streamID)
 		return
@@ -278,7 +278,7 @@ func (client *Client) connectLocalTunnel(connection net.Conn, streamID uint32, m
 	}
 	client.locals[streamID] = localConnection
 	client.localsMu.Unlock()
-	client.logger.Printf("opened local tunnel channel=%q target=%s", channelID, address)
+	client.logger.Printf("opened local specus channel=%q target=%s", channelID, address)
 	go client.copyLocalData(connection, streamID, channelID, localConnection)
 }
 
@@ -294,13 +294,13 @@ func (client *Client) copyLocalData(connection net.Conn, streamID uint32, channe
 				Type: protocol.NatData, StreamID: streamID, Data: append([]byte(nil), buffer[:length]...),
 			})
 			if encodeErr != nil || client.send(connection, protocol.CommandNatMessage, body) != nil {
-				client.disconnectLocalTunnel(connection, streamID)
+				client.disconnectLocalSpecus(connection, streamID)
 				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
-				client.logger.Printf("read local tunnel %q failed: %v", channelID, err)
+				client.logger.Printf("read local specus %q failed: %v", channelID, err)
 			}
 			client.finishLocalDirection(connection, streamID)
 			return
@@ -313,7 +313,7 @@ func (client *Client) writeLocalData(streamID uint32, data []byte) error {
 	connection := client.locals[streamID]
 	client.localsMu.Unlock()
 	if connection == nil {
-		return fmt.Errorf("local tunnel stream %d is not connected", streamID)
+		return fmt.Errorf("local specus stream %d is not connected", streamID)
 	}
 	for len(data) > 0 {
 		written, err := connection.Write(data)
@@ -328,7 +328,7 @@ func (client *Client) writeLocalData(streamID uint32, data []byte) error {
 	return nil
 }
 
-func (client *Client) disconnectLocalTunnel(connection net.Conn, streamID uint32) {
+func (client *Client) disconnectLocalSpecus(connection net.Conn, streamID uint32) {
 	if client.removeLocalConnection(streamID) {
 		client.sendNatFin(connection, streamID)
 	}
@@ -464,7 +464,7 @@ func (client *Client) removeLocalConnection(streamID uint32) bool {
 		return false
 	}
 	_ = connection.Close()
-	client.logger.Printf("closed local tunnel stream=%d", streamID)
+	client.logger.Printf("closed local specus stream=%d", streamID)
 	return true
 }
 

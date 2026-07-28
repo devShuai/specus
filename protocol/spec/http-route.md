@@ -149,9 +149,9 @@ WebSocket Upgrade 仍使用 `/http/{clientName}/{route}/**`。建立后，WebSoc
 
 | 实现 | 服务端 | 客户端 |
 | --- | --- | --- |
-| Java | `HttpTunnelController`、`HttpStreamExchange` | `HttpStreamForwarder` |
+| Java | `HttpSpecusController`、`HttpStreamExchange` | `HttpStreamForwarder` |
 | Go | `internal/directhttp`、`internal/nat/http_stream.go` | `internal/client/http_stream.go` |
-| .NET | `DirectHttpDispatcher`、`HttpTunnelStream` | `HttpStreamChannel` |
+| .NET | `DirectHttpDispatcher`、`HttpSpecusStream` | `HttpStreamChannel` |
 | C server | `admin_http.c`、`main.c` NAT stream bridge | 使用 Java/Go/.NET v2 客户端 |
 
 中央合法与 malformed frame 位于 `protocol/test-vectors/control-v2/frames`。

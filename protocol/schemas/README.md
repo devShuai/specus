@@ -3,9 +3,9 @@
 本目录用于保存跨语言共享的 JSON Schema。Schema 只描述线协议字段，不生成或存放任意语言的业务代码。
 
 `protocol/schemas/` 是主副本；同名文件同步到 `apps/admin-web/public/schemas/`、
-`implementations/csharp/server/src/ShuaiTunnel.Server/wwwroot/schemas/` 和
+`implementations/csharp/server/src/Specus.Server/wwwroot/schemas/` 和
 `implementations/java/server/src/main/resources/static/schemas/`，线上可通过
-`https://tunnel.devshuai.com/schemas/<schema-file>` 访问。
+`https://specus.devshuai.com/schemas/<schema-file>` 访问。
 
 当前已有：
 

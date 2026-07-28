@@ -18,7 +18,7 @@ func TestClientAuthNonceSupportsLegacyJavaSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = legacy.Exec(`CREATE TABLE tunnel_client_auth_nonce (
+	_, err = legacy.Exec(`CREATE TABLE specus_client_auth_nonce (
 		id TEXT PRIMARY KEY,
 		api_key_hash TEXT NOT NULL,
 		expires_at TEXT NOT NULL
@@ -55,7 +55,7 @@ func TestClientAuthNonceSupportsLegacyJavaSchema(t *testing.T) {
 	digest := sha256.Sum256([]byte(apiKeyHash + "\n" + nonce))
 	expectedID := hex.EncodeToString(digest[:])
 	var storedID string
-	if err := db.sql.QueryRow(`SELECT id FROM tunnel_client_auth_nonce WHERE api_key_hash = ?`,
+	if err := db.sql.QueryRow(`SELECT id FROM specus_client_auth_nonce WHERE api_key_hash = ?`,
 		apiKeyHash).Scan(&storedID); err != nil {
 		t.Fatalf("read Java nonce id: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestClientAuthNonceStillSupportsLegacyCompositeSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = legacy.Exec(`CREATE TABLE tunnel_client_auth_nonce (
+	_, err = legacy.Exec(`CREATE TABLE specus_client_auth_nonce (
 		api_key_hash TEXT NOT NULL,
 		nonce_hash TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
@@ -176,7 +176,7 @@ func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = legacy.Exec(`CREATE TABLE tunnel_websocket_ticket (
+	_, err = legacy.Exec(`CREATE TABLE specus_websocket_ticket (
 		token_hash TEXT PRIMARY KEY,
 		scope TEXT NOT NULL,
 		attributes_json TEXT NOT NULL,
@@ -207,7 +207,7 @@ func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
 		t.Fatalf("insert ticket after Java schema migration: %v", err)
 	}
 	var attributesJSON string
-	if err := db.sql.QueryRow(`SELECT attributes_json FROM tunnel_websocket_ticket
+	if err := db.sql.QueryRow(`SELECT attributes_json FROM specus_websocket_ticket
 		WHERE token_hash = ?`, ticket.TokenHash).Scan(&attributesJSON); err != nil {
 		t.Fatalf("read Java attributes_json: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestStartupMigrationExpandsJavaWebSocketTicketSchema(t *testing.T) {
 
 	legacyAttributes := `{"roomId":"legacy-room","roomKey":"room:42","roomRole":"VIEWER",` +
 		`"peerId":"legacy-peer","displayName":"Java peer","sharedRoom":true}`
-	_, err = db.sql.Exec(`INSERT INTO tunnel_websocket_ticket
+	_, err = db.sql.Exec(`INSERT INTO specus_websocket_ticket
 		(token_hash, scope, attributes_json, remote_address_hash, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		"java-ticket", "public-transfer", legacyAttributes, "java-address",
@@ -278,14 +278,14 @@ func TestMySQLHTTPTrafficSchemaKeepsWideCaptureFieldsOffRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	schema := string(data)
-	const tablePrefix = "CREATE TABLE IF NOT EXISTS tunnel_http_traffic_exchange ("
+	const tablePrefix = "CREATE TABLE IF NOT EXISTS specus_http_traffic_exchange ("
 	tableStart := strings.Index(schema, tablePrefix)
 	if tableStart < 0 {
-		t.Fatal("MySQL schema is missing tunnel_http_traffic_exchange")
+		t.Fatal("MySQL schema is missing specus_http_traffic_exchange")
 	}
 	tableEnd := strings.Index(schema[tableStart:], "\n) ENGINE=InnoDB")
 	if tableEnd < 0 {
-		t.Fatal("MySQL tunnel_http_traffic_exchange definition is incomplete")
+		t.Fatal("MySQL specus_http_traffic_exchange definition is incomplete")
 	}
 	tableSchema := schema[tableStart : tableStart+tableEnd]
 	for _, column := range []string{

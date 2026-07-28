@@ -1,0 +1,46 @@
+package com.theshuai.specusserver.management.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Index;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+
+@Entity
+@Table(name = "specus_client_account",
+        indexes = {
+                @Index(name = "idx_specus_client_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_specus_client_owner", columnList = "tenant_id, owner_username")
+        })
+@Getter
+@Setter
+public class ClientAccount {
+    @Id
+    private Long id;
+
+    @Column(name = "tenant_id", length = 80)
+    private String tenantId;
+
+    @Column(name = "owner_username", length = 80)
+    private String ownerUsername;
+
+    @Column(name = "client_name", nullable = false, unique = true, length = 120)
+    private String clientName;
+
+    @Column(name = "password_hash", nullable = false, length = 64)
+    private String passwordHash;
+
+    @Column(nullable = false)
+    private boolean enabled = true;
+
+    @Column(name = "connection_rate_limit_per_minute", nullable = false)
+    private int connectionRateLimitPerMinute = 30;
+
+    @Column(name = "created_at", nullable = false, length = 40)
+    private String createdAt;
+
+    @Column(name = "updated_at", nullable = false, length = 40)
+    private String updatedAt;
+}

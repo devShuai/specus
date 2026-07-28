@@ -97,7 +97,7 @@ type capacityReport struct {
 }
 
 func main() {
-	target := flag.String("addr", "127.0.0.1:19000", "TCP echo endpoint, normally a public tunnel port")
+	target := flag.String("addr", "127.0.0.1:19000", "TCP echo endpoint, normally a public specus port")
 	levelsValue := flag.String("levels", "1,10,100,1000", "comma-separated concurrent stream levels")
 	duration := flag.Duration("duration", 30*time.Second, "measurement duration per level")
 	payloadBytes := flag.Int("payload", 16*1024, "echo payload bytes per operation")

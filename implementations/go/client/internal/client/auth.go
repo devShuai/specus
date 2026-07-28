@@ -157,7 +157,7 @@ func normalizeOSUser(value string) string {
 func machineFingerprint(hostname string) string {
 	home, err := os.UserHomeDir()
 	if err == nil && home != "" {
-		dir := filepath.Join(home, ".shuai-tunnel")
+		dir := filepath.Join(home, ".specus")
 		path := filepath.Join(dir, "machine-id")
 		if data, err := os.ReadFile(path); err == nil {
 			if existing := strings.TrimSpace(string(data)); existing != "" {

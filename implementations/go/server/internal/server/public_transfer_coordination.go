@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/text/unicode/norm"
 )
@@ -480,7 +480,7 @@ func (c *publicTransferCoordination) Close() error {
 func (c *publicTransferCoordination) keyPrefix() string {
 	value := strings.TrimRight(strings.TrimSpace(c.cfg.RedisKeyPrefix), ":")
 	if value == "" {
-		return "shuai-tunnel:v2:public-transfer"
+		return "specus:v2:public-transfer"
 	}
 	return value
 }

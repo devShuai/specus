@@ -3,18 +3,18 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <parent>
-        <artifactId>shuai-tunnel</artifactId>
+        <artifactId>specus</artifactId>
         <groupId>com.theshuai</groupId>
         <version>1.0-SNAPSHOT</version>
         <relativePath>../../../pom.xml</relativePath>
     </parent>
-    <artifactId>tunnel-server</artifactId>
-    <name>tunnel-server</name>
-    <description>tunnel-server</description>
+    <artifactId>specus-server</artifactId>
+    <name>specus-server</name>
+    <description>specus-server</description>
     <properties>
         <java.version>21</java.version>
         <npm.executable>npm</npm.executable>
-        <tunnel.server.web.skip>false</tunnel.server.web.skip>
+        <specus.server.web.skip>false</specus.server.web.skip>
     </properties>
     <build>
         <plugins>
@@ -30,7 +30,7 @@
                             <goal>exec</goal>
                         </goals>
                         <configuration>
-                            <skip>${tunnel.server.web.skip}</skip>
+                            <skip>${specus.server.web.skip}</skip>
                             <workingDirectory>${maven.multiModuleProjectDirectory}/apps/admin-web</workingDirectory>
                             <executable>${npm.executable}</executable>
                             <arguments>
@@ -47,7 +47,7 @@
                 <configuration>
                     <jvmArguments>--enable-native-access=ALL-UNNAMED</jvmArguments>
                     <!-- 显式指定 main class，repackage 不再依赖类路径自动探测 -->
-                    <mainClass>com.theshuai.tunnelserver.TunnelServerApplication</mainClass>
+                    <mainClass>com.theshuai.specusserver.SpecusServerApplication</mainClass>
                 </configuration>
             </plugin>
         </plugins>
@@ -55,7 +55,7 @@
     <dependencies>
         <dependency>
             <groupId>com.theshuai</groupId>
-            <artifactId>tunnel-common</artifactId>
+            <artifactId>specus-common</artifactId>
             <version>1.0-SNAPSHOT</version>
         </dependency>
         <dependency>
@@ -105,7 +105,7 @@
         </dependency>
         <dependency>
             <groupId>com.theshuai</groupId>
-            <artifactId>tunnel-client</artifactId>
+            <artifactId>specus-client</artifactId>
             <version>1.0.0-SNAPSHOT</version>
             <scope>test</scope>
         </dependency>
@@ -132,7 +132,7 @@
             <version>2.25.27</version>
             <exclusions>
                 <!-- The service uses the synchronous S3 client. Avoid the unused AWS async
-                     Netty runtime because the tunnel dataplane already owns Netty 4.2. -->
+                     Netty runtime because the specus dataplane already owns Netty 4.2. -->
                 <exclusion>
                     <groupId>software.amazon.awssdk</groupId>
                     <artifactId>netty-nio-client</artifactId>

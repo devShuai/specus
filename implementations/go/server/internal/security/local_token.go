@@ -1,6 +1,6 @@
 // Package security implements the local admin JWT (HS256), OIDC RS256 validation, OIDC token
 // exchange, and TLS certificate loading. The local token service mirrors the C#
-// LocalTokenService: a hand-rolled HS256 JWT with iss=shuai-tunnel.
+// LocalTokenService: a hand-rolled HS256 JWT with iss=specus.
 package security
 
 import (
@@ -14,11 +14,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
 // Issuer is the JWT issuer claim for locally minted admin tokens.
-const Issuer = "shuai-tunnel"
+const Issuer = "specus"
 
 // TokenResponse is the JSON body returned to the SPA on login/refresh.
 type TokenResponse struct {

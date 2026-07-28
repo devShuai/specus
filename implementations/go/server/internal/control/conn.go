@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 const (

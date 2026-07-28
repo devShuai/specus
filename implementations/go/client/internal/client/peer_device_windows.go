@@ -92,12 +92,12 @@ func (device *windowsWintunDevice) Start(stopCh <-chan struct{}, outbound func([
 	}
 	adapter, _, _ := api.openAdapter.Call(uintptr(unsafe.Pointer(name)))
 	if adapter == 0 {
-		tunnelType, err := syscall.UTF16PtrFromString("shuai-tunnel")
+		specusType, err := syscall.UTF16PtrFromString("specus")
 		if err != nil {
 			device.setStatus("ERROR", err.Error())
 			return err
 		}
-		adapter, _, _ = api.createAdapter.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(tunnelType)), 0)
+		adapter, _, _ = api.createAdapter.Call(uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(specusType)), 0)
 	}
 	if adapter == 0 {
 		err := errors.New("Wintun adapter create/open failed; run as administrator and ensure wintun.dll is available")
@@ -312,13 +312,13 @@ func loadWintunAPI() (*syscall.LazyDLL, *wintunAPI, error) {
 		}
 	}
 	loadErrors = append(candidateErrors, loadErrors...)
-	return nil, nil, fmt.Errorf("load wintun.dll failed; set SHUAI_PEER_MESH_WINTUN_DLL or use the bundled native/windows/*/wintun.dll: %s", strings.Join(loadErrors, "; "))
+	return nil, nil, fmt.Errorf("load wintun.dll failed; set SPECUS_PEER_MESH_WINTUN_DLL or use the bundled native/windows/*/wintun.dll: %s", strings.Join(loadErrors, "; "))
 }
 
 func wintunCandidates() ([]string, []string) {
 	var candidates []string
 	var errors []string
-	if configured := strings.TrimSpace(os.Getenv("SHUAI_PEER_MESH_WINTUN_DLL")); configured != "" {
+	if configured := strings.TrimSpace(os.Getenv("SPECUS_PEER_MESH_WINTUN_DLL")); configured != "" {
 		candidates = append(candidates, configured)
 	}
 	if bundled, err := extractBundledWintun(); err != nil {
@@ -359,16 +359,16 @@ func extractBundledWintun() (string, error) {
 }
 
 func wintunNativeCacheDir() string {
-	if configured := strings.TrimSpace(os.Getenv("SHUAI_PEER_MESH_NATIVE_CACHE_DIR")); configured != "" {
+	if configured := strings.TrimSpace(os.Getenv("SPECUS_PEER_MESH_NATIVE_CACHE_DIR")); configured != "" {
 		return configured
 	}
 	if localAppData := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); localAppData != "" {
-		return filepath.Join(localAppData, "shuai-tunnel", "native")
+		return filepath.Join(localAppData, "specus", "native")
 	}
 	if cacheDir, err := os.UserCacheDir(); err == nil && strings.TrimSpace(cacheDir) != "" {
-		return filepath.Join(cacheDir, "shuai-tunnel", "native")
+		return filepath.Join(cacheDir, "specus", "native")
 	}
-	return filepath.Join(os.TempDir(), "shuai-tunnel", "native")
+	return filepath.Join(os.TempDir(), "specus", "native")
 }
 
 func wintunArchDir() string {

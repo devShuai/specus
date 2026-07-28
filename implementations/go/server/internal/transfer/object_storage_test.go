@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
 func TestObjectStorageHeadAndDeleteTreatEveryStatusBelow400AsSuccessWithoutRedirect(t *testing.T) {
@@ -122,7 +122,7 @@ func TestPresignedUploadIncludesSignedOssCallbackHeader(t *testing.T) {
 	storage := NewObjectStorage(config.ObjectStorageConfig{
 		Provider: "aliyun-oss", Endpoint: "https://oss-cn-hangzhou.aliyuncs.com",
 		Bucket: "examplebucket", AccessKeyID: "test-access-key", AccessKeySecret: "test-secret-key",
-		ObjectPrefix: "prefix", UploadCallbackURL: "https://tunnel.example/api/public/transfer/oss-callback",
+		ObjectPrefix: "prefix", UploadCallbackURL: "https://specus.example/api/public/transfer/oss-callback",
 	})
 	result, err := storage.PresignUpload("prefix/example.txt", "text/plain", 10*time.Minute)
 	if err != nil {
@@ -137,7 +137,7 @@ func TestPresignedUploadIncludesSignedOssCallbackHeader(t *testing.T) {
 	if err := json.Unmarshal(decoded, &callback); err != nil {
 		t.Fatal(err)
 	}
-	if callback["callbackUrl"] != "https://tunnel.example/api/public/transfer/oss-callback" ||
+	if callback["callbackUrl"] != "https://specus.example/api/public/transfer/oss-callback" ||
 		callback["callbackBodyType"] != "application/json" || callback["callbackSNI"] != true {
 		t.Fatalf("unexpected callback header: %s", decoded)
 	}

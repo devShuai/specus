@@ -10,8 +10,8 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 // User diagram document endpoints, aligned with the Java UserDiagramDocumentResource (S-3).

@@ -1,5 +1,5 @@
-#ifndef SHUAI_TUNNEL_ADMIN_HTTP_H
-#define SHUAI_TUNNEL_ADMIN_HTTP_H
+#ifndef SPECUS_ADMIN_HTTP_H
+#define SPECUS_ADMIN_HTTP_H
 
 #include <stddef.h>
 

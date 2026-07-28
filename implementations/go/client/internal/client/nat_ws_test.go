@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
 func TestBuildWebSocketTarget(t *testing.T) {
@@ -90,7 +90,7 @@ func TestWebSocketHandshakeHeadersFiltersHopByHop(t *testing.T) {
 	}
 }
 
-func TestConnectWebSocketTunnelForwardsLocalTextFrame(t *testing.T) {
+func TestConnectWebSocketSpecusForwardsLocalTextFrame(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -139,12 +139,12 @@ func TestConnectWebSocketTunnelForwardsLocalTextFrame(t *testing.T) {
 	defer controlClient.Close()
 	defer controlServer.Close()
 
-	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
-	tunnelClient.syncHTTPTunnelConfigs([]HTTPTunnelConfig{
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	specusClient.syncHTTPSpecusConfigs([]HTTPSpecusConfig{
 		{Route: "app", TargetBaseURL: "http://" + listener.Addr().String() + "/base"},
 	})
-	tunnelClient.openNatFlow(1)
-	tunnelClient.connectWebSocketTunnel(controlClient, 1, map[string]any{
+	specusClient.openNatFlow(1)
+	specusClient.connectWebSocketSpecus(controlClient, 1, map[string]any{
 		"channelId":    "ws1",
 		"source":       "ws",
 		"route":        "app",
@@ -174,7 +174,7 @@ func TestConnectWebSocketTunnelForwardsLocalTextFrame(t *testing.T) {
 	if message.StreamID != 1 || len(message.Metadata) != 0 {
 		t.Fatalf("stream frame = %#v, want stream 1 without metadata", message)
 	}
-	frame, err := decodeWebSocketTunnelFrame(message.Data)
+	frame, err := decodeWebSocketSpecusFrame(message.Data)
 	if err != nil {
 		t.Fatalf("decode SWS2: %v", err)
 	}
@@ -184,21 +184,21 @@ func TestConnectWebSocketTunnelForwardsLocalTextFrame(t *testing.T) {
 	}
 }
 
-func TestWebSocketTunnelFrameRejectsLegacyPrefix(t *testing.T) {
-	if _, err := decodeWebSocketTunnelFrame([]byte{0x01, 'o', 'l', 'd'}); err == nil {
+func TestWebSocketSpecusFrameRejectsLegacyPrefix(t *testing.T) {
+	if _, err := decodeWebSocketSpecusFrame([]byte{0x01, 'o', 'l', 'd'}); err == nil {
 		t.Fatal("legacy websocket prefix was accepted")
 	}
 }
 
-func TestWebSocketTunnelFrameRoundTripClose(t *testing.T) {
-	want := webSocketTunnelFrame{
+func TestWebSocketSpecusFrameRoundTripClose(t *testing.T) {
+	want := webSocketSpecusFrame{
 		opcode: webSocketOpcodeClose, fin: true, closeCode: 1001, payload: []byte("going away"),
 	}
-	encoded, err := encodeWebSocketTunnelFrame(want)
+	encoded, err := encodeWebSocketSpecusFrame(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := decodeWebSocketTunnelFrame(encoded)
+	got, err := decodeWebSocketSpecusFrame(encoded)
 	if err != nil {
 		t.Fatal(err)
 	}

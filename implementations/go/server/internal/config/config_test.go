@@ -3,9 +3,9 @@ package config
 import "testing"
 
 func TestLoadFromEnvMapsTLSKeystore(t *testing.T) {
-	t.Setenv("TUNNEL_TLS_MODE", "file")
-	t.Setenv("TUNNEL_TLS_KEYSTORE", "server.p12")
-	t.Setenv("TUNNEL_TLS_KEYSTORE_PASSWORD", "changeit")
+	t.Setenv("SPECUS_TLS_MODE", "file")
+	t.Setenv("SPECUS_TLS_KEYSTORE", "server.p12")
+	t.Setenv("SPECUS_TLS_KEYSTORE_PASSWORD", "changeit")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -24,7 +24,7 @@ func TestLoadFromEnvMapsTLSKeystore(t *testing.T) {
 }
 
 func TestLoadFromEnvMapsOidcTenantClaim(t *testing.T) {
-	t.Setenv("TUNNEL_OIDC_TENANT_CLAIM", "org_id")
+	t.Setenv("SPECUS_OIDC_TENANT_CLAIM", "org_id")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -37,15 +37,15 @@ func TestLoadFromEnvMapsOidcTenantClaim(t *testing.T) {
 }
 
 func TestLoadFromEnvMapsRegistrationSecurityOptions(t *testing.T) {
-	t.Setenv("TUNNEL_AUTH_TURNSTILE_ENABLED", "true")
-	t.Setenv("TUNNEL_AUTH_TURNSTILE_SITE_KEY", "site-key")
-	t.Setenv("TUNNEL_AUTH_TURNSTILE_SECRET_KEY", "secret-key")
-	t.Setenv("TUNNEL_AUTH_TURNSTILE_ALLOWED_HOSTNAMES", "tunnel.example.com,admin.example.com")
-	t.Setenv("TUNNEL_AUTH_EMAIL_VERIFICATION_ENABLED", "true")
-	t.Setenv("TUNNEL_AUTH_EMAIL_FROM_ADDRESS", "no-reply@example.com")
-	t.Setenv("TUNNEL_AUTH_SMTP_HOST", "smtp.example.com")
-	t.Setenv("TUNNEL_AUTH_SMTP_PORT", "465")
-	t.Setenv("TUNNEL_AUTH_SMTP_SSL", "true")
+	t.Setenv("SPECUS_AUTH_TURNSTILE_ENABLED", "true")
+	t.Setenv("SPECUS_AUTH_TURNSTILE_SITE_KEY", "site-key")
+	t.Setenv("SPECUS_AUTH_TURNSTILE_SECRET_KEY", "secret-key")
+	t.Setenv("SPECUS_AUTH_TURNSTILE_ALLOWED_HOSTNAMES", "specus.example.com,admin.example.com")
+	t.Setenv("SPECUS_AUTH_EMAIL_VERIFICATION_ENABLED", "true")
+	t.Setenv("SPECUS_AUTH_EMAIL_FROM_ADDRESS", "no-reply@example.com")
+	t.Setenv("SPECUS_AUTH_SMTP_HOST", "smtp.example.com")
+	t.Setenv("SPECUS_AUTH_SMTP_PORT", "465")
+	t.Setenv("SPECUS_AUTH_SMTP_SSL", "true")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -63,9 +63,9 @@ func TestLoadFromEnvMapsRegistrationSecurityOptions(t *testing.T) {
 }
 
 func TestLoadFromEnvMapsJavaClientAuthOptions(t *testing.T) {
-	t.Setenv("TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES", "5")
-	t.Setenv("TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES", "3")
-	t.Setenv("TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS", "1234")
+	t.Setenv("SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES", "5")
+	t.Setenv("SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES", "3")
+	t.Setenv("SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS", "1234")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -84,8 +84,8 @@ func TestLoadFromEnvMapsJavaClientAuthOptions(t *testing.T) {
 }
 
 func TestLoadFromEnvMapsJavaLoginExecutorAliases(t *testing.T) {
-	t.Setenv("TUNNEL_LOGIN_EXECUTOR_MAX", "64")
-	t.Setenv("TUNNEL_LOGIN_EXECUTOR_QUEUE", "4096")
+	t.Setenv("SPECUS_LOGIN_EXECUTOR_MAX", "64")
+	t.Setenv("SPECUS_LOGIN_EXECUTOR_QUEUE", "4096")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -101,8 +101,8 @@ func TestLoadFromEnvMapsJavaLoginExecutorAliases(t *testing.T) {
 }
 
 func TestLoadFromEnvMapsJavaConnectionRecordArchiveOptions(t *testing.T) {
-	t.Setenv("TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS", "7")
-	t.Setenv("TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS", "15000")
+	t.Setenv("SPECUS_CONNECTION_DETAIL_RETENTION_DAYS", "7")
+	t.Setenv("SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS", "15000")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -118,11 +118,11 @@ func TestLoadFromEnvMapsJavaConnectionRecordArchiveOptions(t *testing.T) {
 }
 
 func TestLoadFromEnvMapsJavaTrafficCaptureQueueOptions(t *testing.T) {
-	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING", "300")
-	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE", "25")
-	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS", "500")
-	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES", "2048")
-	t.Setenv("TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE", "0.25")
+	t.Setenv("SPECUS_TRAFFIC_CAPTURE_MAX_PENDING", "300")
+	t.Setenv("SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE", "25")
+	t.Setenv("SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS", "500")
+	t.Setenv("SPECUS_TRAFFIC_CAPTURE_DECODE_MAX_BYTES", "2048")
+	t.Setenv("SPECUS_TRAFFIC_CAPTURE_SAMPLE_RATE", "0.25")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -147,14 +147,14 @@ func TestLoadFromEnvMapsJavaTrafficCaptureQueueOptions(t *testing.T) {
 }
 
 func TestLoadFromEnvMapsJavaPeerMeshStunAndRelayOptions(t *testing.T) {
-	t.Setenv("TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS", "stun:stun1.example.com:3478, stun2.example.com:5349")
-	t.Setenv("TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun.example.com")
-	t.Setenv("TUNNEL_PEER_MESH_STANDALONE_STUN_PORT", "5349")
-	t.Setenv("TUNNEL_PEER_MESH_RELAY_MIN_PORT", "50000")
-	t.Setenv("TUNNEL_PEER_MESH_RELAY_MAX_PORT", "50100")
-	t.Setenv("TUNNEL_PEER_MESH_RELAY_WORKER_THREADS", "4")
-	t.Setenv("TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY", "1234")
-	t.Setenv("TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", "2500")
+	t.Setenv("SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS", "stun:stun1.example.com:3478, stun2.example.com:5349")
+	t.Setenv("SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS", "stun.example.com")
+	t.Setenv("SPECUS_PEER_MESH_STANDALONE_STUN_PORT", "5349")
+	t.Setenv("SPECUS_PEER_MESH_RELAY_MIN_PORT", "50000")
+	t.Setenv("SPECUS_PEER_MESH_RELAY_MAX_PORT", "50100")
+	t.Setenv("SPECUS_PEER_MESH_RELAY_WORKER_THREADS", "4")
+	t.Setenv("SPECUS_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY", "1234")
+	t.Setenv("SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS", "2500")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -193,25 +193,25 @@ func TestDefaultTrafficCaptureDetailDisabledLikeJava(t *testing.T) {
 }
 
 func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
-	t.Setenv("TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED", "false")
-	t.Setenv("TUNNEL_PEER_MESH_TURN_REALM", "example.org")
-	t.Setenv("TUNNEL_PEER_MESH_TURN_SHARED_SECRET", "shared")
-	t.Setenv("TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", "7200")
-	t.Setenv("TUNNEL_OBJECT_STORAGE_PROVIDER", "aliyun-oss")
-	t.Setenv("TUNNEL_OBJECT_STORAGE_REGION", "cn-shanghai")
-	t.Setenv("TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL", "https://tunnel.example/api/public/transfer/oss-callback")
-	t.Setenv("TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS", "45")
-	t.Setenv("TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", "12345")
-	t.Setenv("TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES", "23456")
-	t.Setenv("TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES", "34567")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", "7")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", "9")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED", "true")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_REDIS_URI", "redis://redis.internal:6379/4")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", "test:transfer")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "45")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "12000")
-	t.Setenv("TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", "1500")
+	t.Setenv("SPECUS_PEER_MESH_TURN_AUTH_REQUIRED", "false")
+	t.Setenv("SPECUS_PEER_MESH_TURN_REALM", "example.org")
+	t.Setenv("SPECUS_PEER_MESH_TURN_SHARED_SECRET", "shared")
+	t.Setenv("SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS", "7200")
+	t.Setenv("SPECUS_OBJECT_STORAGE_PROVIDER", "aliyun-oss")
+	t.Setenv("SPECUS_OBJECT_STORAGE_REGION", "cn-shanghai")
+	t.Setenv("SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL", "https://specus.example/api/public/transfer/oss-callback")
+	t.Setenv("SPECUS_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS", "45")
+	t.Setenv("SPECUS_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES", "12345")
+	t.Setenv("SPECUS_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES", "23456")
+	t.Setenv("SPECUS_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES", "34567")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM", "7")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM", "9")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED", "true")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_REDIS_URI", "redis://redis.internal:6379/4")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX", "test:transfer")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS", "45")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS", "12000")
+	t.Setenv("SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS", "1500")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -222,7 +222,7 @@ func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
 		t.Fatalf("TURN env mapping mismatch: %+v", cfg.PeerMesh)
 	}
 	if cfg.ObjectStorage.Provider != "aliyun-oss" || cfg.ObjectStorage.Region != "cn-shanghai" ||
-		cfg.ObjectStorage.UploadCallbackURL != "https://tunnel.example/api/public/transfer/oss-callback" ||
+		cfg.ObjectStorage.UploadCallbackURL != "https://specus.example/api/public/transfer/oss-callback" ||
 		cfg.ObjectStorage.DownloadObjectURLTTLSeconds != 45 || cfg.ObjectStorage.MaxAttachmentBytes != 12345 ||
 		cfg.ObjectStorage.PerUserStorageQuotaBytes != 23456 ||
 		cfg.ObjectStorage.PerUserMonthlyDownloadQuotaBytes != 34567 ||
@@ -236,7 +236,7 @@ func TestLoadMapsTurnAndPublicTransferOptions(t *testing.T) {
 
 func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
 	cfg := Default()
-	if !cfg.PeerMesh.TurnAuthRequired || cfg.PeerMesh.TurnRealm != "shuai-tunnel" ||
+	if !cfg.PeerMesh.TurnAuthRequired || cfg.PeerMesh.TurnRealm != "specus" ||
 		cfg.PeerMesh.TurnCredentialTTLSeconds != 3600 {
 		t.Fatalf("TURN defaults mismatch: %+v", cfg.PeerMesh)
 	}
@@ -245,7 +245,7 @@ func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
 		cfg.ObjectStorage.PerUserStorageQuotaBytes != 1024*1024*1024 ||
 		cfg.ObjectStorage.PerUserMonthlyDownloadQuotaBytes != 1024*1024*1024 ||
 		cfg.PublicTransfer.MaxDiscoveryPeersPerRoom != 32 || cfg.PublicTransfer.ClusterEnabled ||
-		cfg.PublicTransfer.RedisKeyPrefix != "shuai-tunnel:v2:public-transfer" ||
+		cfg.PublicTransfer.RedisKeyPrefix != "specus:v2:public-transfer" ||
 		cfg.PublicTransfer.PresenceLeaseSeconds != 30 ||
 		cfg.PublicTransfer.PresenceRefreshIntervalMs != 10000 ||
 		cfg.PublicTransfer.RedisCommandTimeoutMs != 2000 {
@@ -254,11 +254,11 @@ func TestDefaultTurnAuthenticationAndTransferLimitsMatchJava(t *testing.T) {
 }
 
 func TestLoadAllowsHeaderOnlyFrameLimitAndRejectsSmaller(t *testing.T) {
-	t.Setenv("TUNNEL_NETTY_MAX_FRAME_SIZE", "11")
+	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "11")
 	if cfg, err := Load(""); err != nil || cfg.Netty.MaxFrameSize != 11 {
 		t.Fatalf("11-byte full-frame limit rejected: cfg=%+v err=%v", cfg.Netty, err)
 	}
-	t.Setenv("TUNNEL_NETTY_MAX_FRAME_SIZE", "10")
+	t.Setenv("SPECUS_NETTY_MAX_FRAME_SIZE", "10")
 	if _, err := Load(""); err == nil {
 		t.Fatal("10-byte full-frame limit should be rejected")
 	}

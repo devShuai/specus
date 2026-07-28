@@ -1,5 +1,5 @@
-#ifndef SHUAI_TUNNEL_JSON_H
-#define SHUAI_TUNNEL_JSON_H
+#ifndef SPECUS_JSON_H
+#define SPECUS_JSON_H
 
 #include <stddef.h>
 

@@ -53,12 +53,12 @@ static void build_token_key(const char *jwt_secret, uint8_t key[ST_SHA256_LEN])
         char seed[128];
         int written = snprintf(seed,
                                sizeof(seed),
-                               "shuai-tunnel-c-local-token:%lld:%ld:%p",
+                               "specus-c-local-token:%lld:%ld:%p",
                                (long long)time(NULL),
                                (long)getpid(),
                                (void *)&initialized);
         if (written < 0) {
-            const char *fallback = "shuai-tunnel-c-local-token";
+            const char *fallback = "specus-c-local-token";
             st_sha256((const uint8_t *)fallback, strlen(fallback), fallback_key);
         } else {
             st_sha256((const uint8_t *)seed, strlen(seed), fallback_key);
@@ -250,7 +250,7 @@ int st_security_issue_local_token(const char *username,
     char payload_json[512];
     int payload_len = snprintf(payload_json,
                                sizeof(payload_json),
-                               "{\"iss\":\"shuai-tunnel\",\"sub\":\"%s\",\"tenant_id\":\"%s\","
+                               "{\"iss\":\"specus\",\"sub\":\"%s\",\"tenant_id\":\"%s\","
                                "\"role\":\"%s\",\"iat\":%lld,\"exp\":%lld}",
                                escaped_user,
                                escaped_tenant,
@@ -340,7 +340,7 @@ int st_security_validate_local_token(const char *token,
             char *role = st_json_get_string(payload_text, "role");
             int exp = 0;
             ok = alg != NULL && strcmp(alg, "HS256") == 0
-                && iss != NULL && strcmp(iss, "shuai-tunnel") == 0
+                && iss != NULL && strcmp(iss, "specus") == 0
                 && sub != NULL && *sub != '\0'
                 && st_json_get_int(payload_text, "exp", &exp) == 0
                 && (long long)time(NULL) < (long long)exp;

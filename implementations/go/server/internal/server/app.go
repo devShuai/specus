@@ -14,20 +14,20 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/directhttp"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/management"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/nat"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/peermesh"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/web"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/control"
+	"github.com/devShuai/specus/implementations/go/server/internal/directhttp"
+	"github.com/devShuai/specus/implementations/go/server/internal/management"
+	"github.com/devShuai/specus/implementations/go/server/internal/nat"
+	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
+	"github.com/devShuai/specus/implementations/go/server/internal/wsevents"
+	"github.com/devShuai/specus/implementations/go/server/web"
 )
 
 // Demo client seed credentials (match the C# server).
@@ -189,7 +189,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		func(clientName string, metadata map[string]any) (directhttp.Stream, error) {
 			return coordinator.OpenHTTPStream(clientName, metadata)
 		},
-		func(clientName string, metadata map[string]any, conn *websocket.Conn) (*directhttp.WebSocketTunnel, error) {
+		func(clientName string, metadata map[string]any, conn *websocket.Conn) (*directhttp.WebSocketSpecus, error) {
 			return coordinator.OpenWSStream(clientName, metadata, conn)
 		},
 		time.Duration(cfg.HTTP.TimeoutMs)*time.Millisecond, cfg.HTTP.MaxRequestBodySize,
@@ -451,7 +451,7 @@ func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig
 		ossSuffix = " " + origin
 	}
 	policy := "default-src 'self'; " +
-		"script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-j+6j8kbf/TP/2vaoa07rGqJUenu5ZBaVvdQE1uczdHo=' 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; " +
+		"script-src 'self' https://www.googletagmanager.com https://challenges.cloudflare.com 'sha256-18LyML/37soz5WqRSkGT3SWKUgOA6TN/LeY+x9y/X/Q=' 'sha256-sTRDNOsQlwtkSpNEy6tDUxqi0/WSUG1VrhzE550hzwo='; " +
 		"style-src 'self' 'unsafe-inline'; " +
 		"img-src 'self' blob: data: https://www.google-analytics.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"media-src 'self' blob: data:" + ossSuffix + "; " +
@@ -459,7 +459,7 @@ func securityHeaders(next http.Handler, objectStorage config.ObjectStorageConfig
 		"connect-src 'self' ws: wss: https://www.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com" + ossSuffix + "; " +
 		"form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// HTTP tunnel responses belong to the target application. Adding the portal
+		// HTTP specus responses belong to the target application. Adding the portal
 		// policy here would make browsers enforce both policies and can block target
 		// features such as WebAssembly even when the application explicitly allows it.
 		if r.URL.Path == "/http" || strings.HasPrefix(r.URL.Path, "/http/") {

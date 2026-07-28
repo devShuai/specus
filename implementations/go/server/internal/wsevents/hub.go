@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
 )
 
 // ConnectionView is the JSON shape broadcast for a connection event.

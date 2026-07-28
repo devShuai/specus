@@ -7,7 +7,7 @@ import (
 )
 
 // SWS2 是 NAT stream v2 DATA 里承载 WebSocket 帧的 12 字节显式封装，
-// 与 Java common 的 WebSocketTunnelFrame 及 Go client 的 webSocketTunnelFrame 对齐。
+// 与 Java common 的 WebSocketSpecusFrame 及 Go client 的 webSocketSpecusFrame 对齐。
 const (
 	sws2Magic       = 0x53575332 // "SWS2"
 	sws2HeaderBytes = 12
@@ -82,7 +82,7 @@ func decodeSWS2(encoded []byte) (sws2Frame, error) {
 	return frame, nil
 }
 
-// validateSWS2 与 Java WebSocketTunnelFrame.validate 的规则逐条对应。
+// validateSWS2 与 Java WebSocketSpecusFrame.validate 的规则逐条对应。
 func validateSWS2(opcode byte, fin bool, rsv byte, closeCode uint16, payloadLength int) error {
 	switch opcode {
 	case sws2OpcodeContinuation, sws2OpcodeText, sws2OpcodeBinary,

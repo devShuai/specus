@@ -48,7 +48,7 @@ jobs:
       matrix:
         runtime: [java, go, dotnet]
     env:
-      TUNNEL_TEST_REDIS_URI: redis://127.0.0.1:6379/15
+      SPECUS_TEST_REDIS_URI: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v4
 
@@ -67,7 +67,7 @@ jobs:
           -DskipTests=false
           -Dtest=PublicTransferCoordinationRedisIT,PublicTransferClusterFrameTests,ConnectionEventsWebSocketHandlerTests
           -Dsurefire.failIfNoSpecifiedTests=false
-          -Dtunnel.server.web.skip=true
+          -Dspecus.server.web.skip=true
           test
 
       - name: Set up Go
@@ -95,8 +95,8 @@ jobs:
         if: matrix.runtime == 'dotnet'
         run: >-
           dotnet test
-          implementations/csharp/server/tests/ShuaiTunnel.IntegrationTests/ShuaiTunnel.IntegrationTests.csproj
-          -p:TunnelServerWebSkip=true
+          implementations/csharp/server/tests/Specus.IntegrationTests/Specus.IntegrationTests.csproj
+          -p:SpecusServerWebSkip=true
           -p:NuGetAudit=false
           --filter "FullyQualifiedName~PublicTransferCoordinationRedisTests|FullyQualifiedName~PublicTransferClusterFrameTests"
           --verbosity minimal
@@ -211,7 +211,7 @@ jobs:
         if: matrix.runtime == 'dotnet'
         run: >-
           dotnet build
-          implementations/csharp/client/benchmarks/ShuaiTunnel.Client.Benchmarks/ShuaiTunnel.Client.Benchmarks.csproj
+          implementations/csharp/client/benchmarks/Specus.Client.Benchmarks/Specus.Client.Benchmarks.csproj
           -c Release
           -p:NuGetAudit=false
           --verbosity minimal

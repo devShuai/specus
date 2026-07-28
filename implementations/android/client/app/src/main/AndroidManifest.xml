@@ -7,8 +7,9 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@drawable/ic_stat_tunnel"
+        android:icon="@drawable/ic_launcher_specus"
         android:label="@string/app_name"
+        android:roundIcon="@drawable/ic_launcher_specus"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true">
         <activity
@@ -21,7 +22,7 @@
         </activity>
 
         <service
-            android:name=".TunnelForegroundService"
+            android:name=".SpecusForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
             android:permission="android.permission.BIND_VPN_SERVICE">

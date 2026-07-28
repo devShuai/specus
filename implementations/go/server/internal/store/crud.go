@@ -17,7 +17,7 @@ var ErrNotFound = errors.New("not found")
 func (db *DB) ListClients(ctx context.Context) ([]ClientAccount, error) {
 	rows, err := db.sql.QueryContext(ctx, `SELECT id, COALESCE(tenant_id, 'default'), COALESCE(owner_username, ''),
 		client_name, password_hash, enabled,
-		connection_rate_limit_per_minute, created_at, updated_at FROM tunnel_client_account ORDER BY id`)
+		connection_rate_limit_per_minute, created_at, updated_at FROM specus_client_account ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (db *DB) ListClients(ctx context.Context) ([]ClientAccount, error) {
 func (db *DB) GetClient(ctx context.Context, id int64) (*ClientAccount, error) {
 	query := db.rebind(`SELECT id, COALESCE(tenant_id, 'default'), COALESCE(owner_username, ''),
 		client_name, password_hash, enabled,
-		connection_rate_limit_per_minute, created_at, updated_at FROM tunnel_client_account WHERE id = ?`)
+		connection_rate_limit_per_minute, created_at, updated_at FROM specus_client_account WHERE id = ?`)
 	var (
 		account            ClientAccount
 		enabled            databaseBoolean
@@ -69,7 +69,7 @@ func (db *DB) GetClient(ctx context.Context, id int64) (*ClientAccount, error) {
 
 // InsertClient persists a new client account (id is caller-assigned).
 func (db *DB) InsertClient(ctx context.Context, account ClientAccount) error {
-	query := db.rebind(`INSERT INTO tunnel_client_account
+	query := db.rebind(`INSERT INTO specus_client_account
 		(id, tenant_id, owner_username, client_name, password_hash, enabled,
 		 connection_rate_limit_per_minute, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -82,7 +82,7 @@ func (db *DB) InsertClient(ctx context.Context, account ClientAccount) error {
 
 // UpdateClient updates a client account's mutable fields.
 func (db *DB) UpdateClient(ctx context.Context, account ClientAccount) error {
-	query := db.rebind(`UPDATE tunnel_client_account SET owner_username = ?, client_name = ?, password_hash = ?,
+	query := db.rebind(`UPDATE specus_client_account SET owner_username = ?, client_name = ?, password_hash = ?,
 		enabled = ?, connection_rate_limit_per_minute = ?, updated_at = ? WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, defaultOwner(account.OwnerUsername), account.ClientName, account.PasswordHash,
 		boolToInt(account.Enabled), account.ConnectionRateLimitPerMinute,
@@ -90,14 +90,14 @@ func (db *DB) UpdateClient(ctx context.Context, account ClientAccount) error {
 	return err
 }
 
-// DeleteClient removes a client account and its tunnel/http-route mappings.
+// DeleteClient removes a client account and its specus/http-route mappings.
 func (db *DB) DeleteClient(ctx context.Context, id int64) error {
-	for _, table := range []string{"tunnel_mapping", "http_route_mapping"} {
+	for _, table := range []string{"specus_mapping", "http_route_mapping"} {
 		if _, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM `+table+` WHERE client_id = ?`), id); err != nil {
 			return err
 		}
 	}
-	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_client_account WHERE id = ?`), id)
+	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM specus_client_account WHERE id = ?`), id)
 	return err
 }
 
@@ -106,7 +106,7 @@ func (db *DB) DeleteClient(ctx context.Context, id int64) error {
 func (db *DB) ListCredentials(ctx context.Context) ([]ClientCredential, error) {
 	rows, err := db.sql.QueryContext(ctx, `SELECT id, tenant_id, COALESCE(owner_username, ''),
 		api_key, secret_hash, enabled, max_online_instances, created_at, updated_at
-		FROM tunnel_client_credential ORDER BY id`)
+		FROM specus_client_credential ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +125,7 @@ func (db *DB) ListCredentials(ctx context.Context) ([]ClientCredential, error) {
 func (db *DB) GetCredential(ctx context.Context, id int64) (*ClientCredential, error) {
 	query := db.rebind(`SELECT id, tenant_id, COALESCE(owner_username, ''),
 		api_key, secret_hash, enabled, max_online_instances, created_at, updated_at
-		FROM tunnel_client_credential WHERE id = ?`)
+		FROM specus_client_credential WHERE id = ?`)
 	row := db.sql.QueryRowContext(ctx, query, id)
 	credential, err := scanCredential(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -138,7 +138,7 @@ func (db *DB) GetCredential(ctx context.Context, id int64) (*ClientCredential, e
 }
 
 func (db *DB) InsertCredential(ctx context.Context, credential ClientCredential) error {
-	query := db.rebind(`INSERT INTO tunnel_client_credential
+	query := db.rebind(`INSERT INTO specus_client_credential
 		(id, tenant_id, owner_username, api_key, secret_hash, enabled,
 		 max_online_instances, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -150,7 +150,7 @@ func (db *DB) InsertCredential(ctx context.Context, credential ClientCredential)
 }
 
 func (db *DB) UpdateCredential(ctx context.Context, credential ClientCredential) error {
-	query := db.rebind(`UPDATE tunnel_client_credential SET owner_username = ?, api_key = ?,
+	query := db.rebind(`UPDATE specus_client_credential SET owner_username = ?, api_key = ?,
 		secret_hash = ?, enabled = ?, max_online_instances = ?, updated_at = ? WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, defaultOwner(credential.OwnerUsername),
 		credential.APIKey, credential.SecretHash, boolToInt(credential.Enabled),
@@ -159,7 +159,7 @@ func (db *DB) UpdateCredential(ctx context.Context, credential ClientCredential)
 }
 
 func (db *DB) DeleteCredential(ctx context.Context, id int64) error {
-	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_client_credential WHERE id = ?`), id)
+	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM specus_client_credential WHERE id = ?`), id)
 	return err
 }
 
@@ -272,12 +272,12 @@ func scanClientDownloadLink(scanner credentialScanner) (ClientDownloadLink, erro
 	return link, nil
 }
 
-// ---- tunnels -------------------------------------------------------------------------
+// ---- specusMappings -------------------------------------------------------------------------
 
-// ListTunnels returns tunnel mappings, optionally filtered by client id, ordered by id.
-func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping, error) {
+// ListSpecusMappings returns specus mappings, optionally filtered by client id, ordered by id.
+func (db *DB) ListSpecusMappings(ctx context.Context, clientID *int64) ([]SpecusMapping, error) {
 	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, listen_port, target_address, target_port,
-		enabled, detail_capture_enabled, created_at, updated_at FROM tunnel_mapping`
+		enabled, detail_capture_enabled, created_at, updated_at FROM specus_mapping`
 	var args []any
 	if clientID != nil {
 		query += ` WHERE client_id = ?`
@@ -289,10 +289,10 @@ func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping
 		return nil, err
 	}
 	defer rows.Close()
-	var mappings []TunnelMapping
+	var mappings []SpecusMapping
 	for rows.Next() {
 		var (
-			m                  TunnelMapping
+			m                  SpecusMapping
 			enabled            databaseBoolean
 			detailCapture      databaseBoolean
 			createdAt, updated string
@@ -310,9 +310,9 @@ func (db *DB) ListTunnels(ctx context.Context, clientID *int64) ([]TunnelMapping
 	return mappings, rows.Err()
 }
 
-// GetTunnel returns a tunnel mapping by id, or ErrNotFound.
-func (db *DB) GetTunnel(ctx context.Context, id int64) (*TunnelMapping, error) {
-	mappings, err := db.ListTunnels(ctx, nil)
+// GetSpecus returns a specus mapping by id, or ErrNotFound.
+func (db *DB) GetSpecus(ctx context.Context, id int64) (*SpecusMapping, error) {
+	mappings, err := db.ListSpecusMappings(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -326,15 +326,15 @@ func (db *DB) GetTunnel(ctx context.Context, id int64) (*TunnelMapping, error) {
 
 // ListenPortInUse reports whether a listen port is already mapped (optionally excluding a row).
 func (db *DB) ListenPortInUse(ctx context.Context, listenPort int, excludeID int64) (bool, error) {
-	query := db.rebind(`SELECT COUNT(*) FROM tunnel_mapping WHERE listen_port = ? AND id <> ?`)
+	query := db.rebind(`SELECT COUNT(*) FROM specus_mapping WHERE listen_port = ? AND id <> ?`)
 	var count int
 	err := db.sql.QueryRowContext(ctx, query, listenPort, excludeID).Scan(&count)
 	return count > 0, err
 }
 
-// InsertTunnel persists a new tunnel mapping (id is caller-assigned).
-func (db *DB) InsertTunnel(ctx context.Context, m TunnelMapping) error {
-	query := db.rebind(`INSERT INTO tunnel_mapping
+// InsertSpecus persists a new specus mapping (id is caller-assigned).
+func (db *DB) InsertSpecus(ctx context.Context, m SpecusMapping) error {
+	query := db.rebind(`INSERT INTO specus_mapping
 		(id, tenant_id, client_id, client_name, listen_port, target_address, target_port, enabled,
 		 detail_capture_enabled, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -344,18 +344,18 @@ func (db *DB) InsertTunnel(ctx context.Context, m TunnelMapping) error {
 	return err
 }
 
-// UpdateTunnel updates a tunnel mapping's mutable fields.
-func (db *DB) UpdateTunnel(ctx context.Context, m TunnelMapping) error {
-	query := db.rebind(`UPDATE tunnel_mapping SET listen_port = ?, target_address = ?, target_port = ?,
+// UpdateSpecus updates a specus mapping's mutable fields.
+func (db *DB) UpdateSpecus(ctx context.Context, m SpecusMapping) error {
+	query := db.rebind(`UPDATE specus_mapping SET listen_port = ?, target_address = ?, target_port = ?,
 		enabled = ?, detail_capture_enabled = ?, updated_at = ? WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, m.ListenPort, m.TargetAddress, m.TargetPort,
 		boolToInt(m.Enabled), boolToInt(m.DetailCaptureEnabled), formatTime(m.UpdatedAt), m.ID)
 	return err
 }
 
-// DeleteTunnel removes a tunnel mapping.
-func (db *DB) DeleteTunnel(ctx context.Context, id int64) error {
-	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_mapping WHERE id = ?`), id)
+// DeleteSpecus removes a specus mapping.
+func (db *DB) DeleteSpecus(ctx context.Context, id int64) error {
+	_, err := db.sql.ExecContext(ctx, db.rebind(`DELETE FROM specus_mapping WHERE id = ?`), id)
 	return err
 }
 
@@ -494,7 +494,7 @@ func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]C
 	}
 
 	var total int
-	if err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM tunnel_connection_record`+where), args...).
+	if err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM specus_connection_record`+where), args...).
 		Scan(&total); err != nil {
 		return nil, 0, err
 	}
@@ -509,7 +509,7 @@ func (db *DB) ListConnections(ctx context.Context, filter ConnectionFilter) ([]C
 	}
 	listArgs := append(append([]any{}, args...), size, page*size)
 	query := db.rebind(`SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, channel_id, remote_address, connected_at,
-		disconnected_at, success, failure_reason, disconnect_reason FROM tunnel_connection_record` +
+		disconnected_at, success, failure_reason, disconnect_reason FROM specus_connection_record` +
 		where + ` ORDER BY id DESC LIMIT ? OFFSET ?`)
 	rows, err := db.sql.QueryContext(ctx, query, listArgs...)
 	if err != nil {
@@ -567,7 +567,7 @@ func (db *DB) ListTraffic(ctx context.Context, clientID *int64, limit int) ([]Tr
 // ListTrafficScoped returns traffic usage rows constrained to a visible client set when provided.
 func (db *DB) ListTrafficScoped(ctx context.Context, tenantID string, clientID *int64, clientIDs []int64, limit int) ([]TrafficUsage, error) {
 	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, usage_date, upload_bytes, download_bytes, updated_at
-		FROM tunnel_traffic_usage`
+		FROM specus_traffic_usage`
 	var args []any
 	var clauses []string
 	if tenantID != "" {
@@ -618,7 +618,7 @@ func (db *DB) ListResourceTrafficScoped(ctx context.Context, tenantID string, cl
 	resourceType string, limit int) ([]ResourceTrafficUsage, error) {
 	query := `SELECT id, tenant_id, client_id, client_name, resource_type, resource_key, resource_id,
 		resource_name, usage_date, upload_bytes, download_bytes, updated_at
-		FROM tunnel_resource_traffic_usage`
+		FROM specus_resource_traffic_usage`
 	var args []any
 	var clauses []string
 	if tenantID != "" {
@@ -682,7 +682,7 @@ func (db *DB) ListConnectionStats(ctx context.Context, clientName string, limit 
 // a visible client-id set. A nil clientIDs slice means all tenant rows are visible.
 func (db *DB) ListConnectionStatsScoped(ctx context.Context, tenantID, clientName string, clientIDs []int64, limit int) ([]ConnectionStat, error) {
 	query := `SELECT id, COALESCE(tenant_id, 'default'), client_id, client_name, stat_month, total_count, success_count, failure_count, updated_at
-		FROM tunnel_connection_stat`
+		FROM specus_connection_stat`
 	args := []any{defaultTenant(tenantID)}
 	query += ` WHERE (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')`
 	if clientName != "" {
@@ -747,19 +747,19 @@ type Overview struct {
 // LoadOverview computes the dashboard summary counters.
 func (db *DB) LoadOverview(ctx context.Context) (Overview, error) {
 	var o Overview
-	if err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM tunnel_client_account`).Scan(&o.Clients); err != nil {
+	if err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM specus_client_account`).Scan(&o.Clients); err != nil {
 		return o, err
 	}
 	if err := db.sql.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM tunnel_connection_record WHERE success = 1`).Scan(&o.SuccessfulConnections); err != nil {
+		`SELECT COUNT(*) FROM specus_connection_record WHERE success = 1`).Scan(&o.SuccessfulConnections); err != nil {
 		return o, err
 	}
 	if err := db.sql.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM tunnel_connection_record WHERE success = 0`).Scan(&o.FailedConnections); err != nil {
+		`SELECT COUNT(*) FROM specus_connection_record WHERE success = 0`).Scan(&o.FailedConnections); err != nil {
 		return o, err
 	}
 	if err := db.sql.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(upload_bytes),0), COALESCE(SUM(download_bytes),0) FROM tunnel_traffic_usage`).
+		`SELECT COALESCE(SUM(upload_bytes),0), COALESCE(SUM(download_bytes),0) FROM specus_traffic_usage`).
 		Scan(&o.UploadBytes, &o.DownloadBytes); err != nil {
 		return o, err
 	}
@@ -771,7 +771,7 @@ func (db *DB) LoadOverview(ctx context.Context) (Overview, error) {
 func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int64, error) {
 	cutoffISO := formatTime(cutoff)
 	rows, err := db.sql.QueryContext(ctx, db.rebind(`SELECT COALESCE(tenant_id, 'default'), client_id, client_name, connected_at, success
-		FROM tunnel_connection_record WHERE connected_at < ?`), cutoffISO)
+		FROM specus_connection_record WHERE connected_at < ?`), cutoffISO)
 	if err != nil {
 		return 0, err
 	}
@@ -832,7 +832,7 @@ func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int6
 		}
 	}
 	if _, err := db.sql.ExecContext(ctx,
-		db.rebind(`DELETE FROM tunnel_connection_record WHERE connected_at < ?`), cutoffISO); err != nil {
+		db.rebind(`DELETE FROM specus_connection_record WHERE connected_at < ?`), cutoffISO); err != nil {
 		return 0, err
 	}
 	return archived, nil
@@ -841,7 +841,7 @@ func (db *DB) ArchiveOldConnections(ctx context.Context, cutoff time.Time) (int6
 func (db *DB) upsertStat(ctx context.Context, tenantID string, clientID *int64, clientName, month string, total, success, fail int64) error {
 	now := formatTime(time.Now())
 	clientIDValue := nullableInt64(clientID)
-	update := db.rebind(`UPDATE tunnel_connection_stat
+	update := db.rebind(`UPDATE specus_connection_stat
 		SET client_id = COALESCE(client_id, ?),
 			total_count = total_count + ?,
 			success_count = success_count + ?,
@@ -857,7 +857,7 @@ func (db *DB) upsertStat(ctx context.Context, tenantID string, clientID *int64, 
 	if affected, err := result.RowsAffected(); err == nil && affected > 0 {
 		return nil
 	}
-	insert := db.rebind(`INSERT INTO tunnel_connection_stat
+	insert := db.rebind(`INSERT INTO specus_connection_stat
 		(tenant_id, client_id, client_name, stat_month, total_count, success_count, failure_count, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err = db.sql.ExecContext(ctx, insert, defaultTenant(tenantID), clientIDValue, clientName, month,

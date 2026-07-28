@@ -14,16 +14,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/stunserver"
+	"github.com/devShuai/specus/implementations/go/server/internal/stunserver"
 )
 
 const (
-	stunTurnSoftware            = "shuai-tunnel-standard-stun-turn"
+	stunTurnSoftware            = "specus-standard-stun-turn"
 	stunMaxPaddingResponseBytes = 1472
 	turnPermissionTTL           = 300 * time.Second
 	turnChannelTTL              = 600 * time.Second
 	maxRelayBindAttempt         = 128
-	peerProbeMagic              = "shuai-peer-mesh"
+	peerProbeMagic              = "specus-peer-mesh"
 	peerProbeTypeCheck          = "check"
 	peerProbeTypeCheckResponse  = "check-response"
 	peerProbeMaxBytes           = 2048

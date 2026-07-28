@@ -30,39 +30,39 @@ func TestReconnectDelayForAttemptMatchesJava(t *testing.T) {
 }
 
 func TestResetReconnectBackoffRestartsAtFirstDelay(t *testing.T) {
-	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
 
-	attempt, delay := tunnelClient.nextReconnectDelay()
+	attempt, delay := specusClient.nextReconnectDelay()
 	if attempt != 1 || delay != 2*time.Second {
 		t.Fatalf("first reconnect = attempt %d delay %s, want attempt 1 delay 2s", attempt, delay)
 	}
-	attempt, delay = tunnelClient.nextReconnectDelay()
+	attempt, delay = specusClient.nextReconnectDelay()
 	if attempt != 2 || delay != 4*time.Second {
 		t.Fatalf("second reconnect = attempt %d delay %s, want attempt 2 delay 4s", attempt, delay)
 	}
 
-	if previous := tunnelClient.resetReconnectBackoff(); previous != 2 {
+	if previous := specusClient.resetReconnectBackoff(); previous != 2 {
 		t.Fatalf("resetReconnectBackoff() = %d, want 2", previous)
 	}
-	attempt, delay = tunnelClient.nextReconnectDelay()
+	attempt, delay = specusClient.nextReconnectDelay()
 	if attempt != 1 || delay != 2*time.Second {
 		t.Fatalf("after reset reconnect = attempt %d delay %s, want attempt 1 delay 2s", attempt, delay)
 	}
 }
 
 func TestHTTPLoginBackoffResetIsConsumedOnce(t *testing.T) {
-	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
-	tunnelClient.nextReconnectDelay()
-	tunnelClient.nextReconnectDelay()
-	tunnelClient.resetReconnectBackoffAfterNextHTTPLogin()
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	specusClient.nextReconnectDelay()
+	specusClient.nextReconnectDelay()
+	specusClient.resetReconnectBackoffAfterNextHTTPLogin()
 
-	if previous := tunnelClient.consumeHTTPLoginBackoffReset(); previous != 2 {
+	if previous := specusClient.consumeHTTPLoginBackoffReset(); previous != 2 {
 		t.Fatalf("first consumeHTTPLoginBackoffReset() = %d, want 2", previous)
 	}
-	if previous := tunnelClient.consumeHTTPLoginBackoffReset(); previous != -1 {
+	if previous := specusClient.consumeHTTPLoginBackoffReset(); previous != -1 {
 		t.Fatalf("second consumeHTTPLoginBackoffReset() = %d, want -1", previous)
 	}
-	attempt, delay := tunnelClient.nextReconnectDelay()
+	attempt, delay := specusClient.nextReconnectDelay()
 	if attempt != 1 || delay != 2*time.Second {
 		t.Fatalf("after HTTP login reset reconnect = attempt %d delay %s, want attempt 1 delay 2s", attempt, delay)
 	}

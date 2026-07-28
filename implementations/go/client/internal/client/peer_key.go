@@ -55,7 +55,7 @@ func peerPublicKeyBase64() string {
 
 func configDir() (string, error) {
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-		return filepath.Join(home, ".shuai-tunnel"), nil
+		return filepath.Join(home, ".specus"), nil
 	}
 	return "", os.ErrNotExist
 }

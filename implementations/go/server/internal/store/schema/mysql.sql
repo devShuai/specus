@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS tunnel_client_account (
+CREATE TABLE IF NOT EXISTS specus_client_account (
   id BIGINT NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL DEFAULT 'default',
   owner_username VARCHAR(80),
@@ -9,11 +9,11 @@ CREATE TABLE IF NOT EXISTS tunnel_client_account (
   created_at VARCHAR(40) NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
   UNIQUE KEY uq_client_account_name (client_name),
-  KEY idx_tunnel_client_tenant (tenant_id),
-  KEY idx_tunnel_client_owner (tenant_id, owner_username)
+  KEY idx_specus_client_tenant (tenant_id),
+  KEY idx_specus_client_owner (tenant_id, owner_username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_client_credential (
+CREATE TABLE IF NOT EXISTS specus_client_credential (
   id BIGINT NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   owner_username VARCHAR(80),
@@ -28,14 +28,14 @@ CREATE TABLE IF NOT EXISTS tunnel_client_credential (
   KEY idx_client_credential_owner (tenant_id, owner_username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_client_auth_nonce (
+CREATE TABLE IF NOT EXISTS specus_client_auth_nonce (
   id VARCHAR(64) PRIMARY KEY,
   api_key_hash VARCHAR(64) NOT NULL,
   expires_at VARCHAR(40) NOT NULL,
   KEY idx_client_auth_nonce_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
+CREATE TABLE IF NOT EXISTS specus_websocket_ticket (
   token_hash VARCHAR(64) NOT NULL PRIMARY KEY,
   scope VARCHAR(40) NOT NULL,
   attributes_json LONGTEXT NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
   KEY idx_websocket_ticket_expiry (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_client_identity (
+CREATE TABLE IF NOT EXISTS specus_client_identity (
   id BIGINT NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   credential_id BIGINT NOT NULL,
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS tunnel_client_identity (
   KEY idx_client_identity_client (client_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_client_session (
+CREATE TABLE IF NOT EXISTS specus_client_session (
   id BIGINT NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   credential_id BIGINT NOT NULL,
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS tunnel_client_session (
   KEY idx_client_session_client_status (client_id, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_management_user (
+CREATE TABLE IF NOT EXISTS specus_management_user (
   username VARCHAR(80) NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   password_hash VARCHAR(64) NOT NULL,
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS tunnel_management_user (
   KEY idx_management_user_role (role)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_management_user_email (
+CREATE TABLE IF NOT EXISTS specus_management_user_email (
   username VARCHAR(80) NOT NULL PRIMARY KEY,
   email VARCHAR(254) NOT NULL UNIQUE,
   verified_at VARCHAR(40) NOT NULL,
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS tunnel_management_user_email (
   KEY idx_management_user_email_verified (verified_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_management_registration_challenge (
+CREATE TABLE IF NOT EXISTS specus_management_registration_challenge (
   registration_id VARCHAR(64) NOT NULL PRIMARY KEY,
   username VARCHAR(80) NOT NULL,
   email VARCHAR(254) NOT NULL,
@@ -213,7 +213,7 @@ CREATE TABLE IF NOT EXISTS transfer_attachment_download_grant (
   KEY idx_attachment_download_grant_expiry (expires_at, consumed_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_connection_record (
+CREATE TABLE IF NOT EXISTS specus_connection_record (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80),
   client_id BIGINT,
@@ -225,12 +225,12 @@ CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   success TINYINT(1) NOT NULL,
   failure_reason VARCHAR(255),
   disconnect_reason VARCHAR(40),
-  KEY idx_tunnel_connection_tenant (tenant_id),
-  KEY idx_tunnel_connection_client_time (client_id, connected_at),
-  KEY idx_tunnel_connection_connected_at (connected_at)
+  KEY idx_specus_connection_tenant (tenant_id),
+  KEY idx_specus_connection_client_time (client_id, connected_at),
+  KEY idx_specus_connection_connected_at (connected_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_mapping (
+CREATE TABLE IF NOT EXISTS specus_mapping (
   id BIGINT NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   client_id BIGINT NOT NULL,
@@ -242,8 +242,8 @@ CREATE TABLE IF NOT EXISTS tunnel_mapping (
   detail_capture_enabled TINYINT(1) NOT NULL DEFAULT 0,
   created_at VARCHAR(40) NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
-  UNIQUE KEY uq_tunnel_mapping_listen_port (listen_port),
-  KEY idx_tunnel_mapping_client_id (client_id)
+  UNIQUE KEY uq_specus_mapping_listen_port (listen_port),
+  KEY idx_specus_mapping_client_id (client_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS http_route_mapping (
@@ -262,7 +262,7 @@ CREATE TABLE IF NOT EXISTS http_route_mapping (
   KEY idx_http_route_client_id (client_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_traffic_usage (
+CREATE TABLE IF NOT EXISTS specus_traffic_usage (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80),
   client_id BIGINT NOT NULL,
@@ -272,11 +272,11 @@ CREATE TABLE IF NOT EXISTS tunnel_traffic_usage (
   download_bytes BIGINT NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
   UNIQUE KEY uq_traffic_client_date (client_id, usage_date),
-  KEY idx_tunnel_traffic_tenant (tenant_id),
+  KEY idx_specus_traffic_tenant (tenant_id),
   KEY idx_traffic_client_id (client_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_resource_traffic_usage (
+CREATE TABLE IF NOT EXISTS specus_resource_traffic_usage (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   client_id BIGINT NOT NULL,
@@ -296,7 +296,7 @@ CREATE TABLE IF NOT EXISTS tunnel_resource_traffic_usage (
   KEY idx_resource_traffic_date (usage_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_http_traffic_exchange (
+CREATE TABLE IF NOT EXISTS specus_http_traffic_exchange (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   client_id BIGINT NOT NULL,
@@ -333,7 +333,7 @@ CREATE TABLE IF NOT EXISTS tunnel_http_traffic_exchange (
   KEY idx_http_traffic_captured_at (captured_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_tcp_traffic_frame (
+CREATE TABLE IF NOT EXISTS specus_tcp_traffic_frame (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL,
   client_id BIGINT NOT NULL,
@@ -437,7 +437,7 @@ CREATE TABLE IF NOT EXISTS peer_mesh_session (
   KEY idx_peer_mesh_session_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS tunnel_connection_stat (
+CREATE TABLE IF NOT EXISTS specus_connection_stat (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   tenant_id VARCHAR(80) NOT NULL DEFAULT 'default',
   client_id BIGINT,

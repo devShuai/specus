@@ -36,21 +36,25 @@ build/
 ### VS Code ###
 .vscode/
 
-### Local tunnel database ###
-shuai-tunnel.db
-shuai-tunnel.db-shm
-shuai-tunnel.db-wal
-shuai-tunnel.db-journal
+### Local specus database ###
+specus.db
+specus.db-shm
+specus.db-wal
+specus.db-journal
+/*.db*
+/implementations/java/server/*.db*
+/implementations/go/server/*.db*
+/implementations/csharp/server/src/Specus.Server/*.db*
 
 ### Local server config ###
 /implementations/java/server/config/
 /deploy/stun-server/remote/stun-deploy.config.json
-/deploy/go-server/remote/tunnel-server.env
+/deploy/go-server/remote/specus-server.env
 /deploy/go-server/remote/*.local.env
 
 ### Local client credentials ###
-tunnelClientConfig.json
-tunnelClientConfig*.json
+specusClientConfig.json
+specusClientConfig*.json
 client.json
 client.jsonc
 client-local.json
@@ -63,9 +67,10 @@ client2.jsonc
 .claude/
 
 ### Go client binary ###
-/implementations/go/client/shuai-tunnel-client
-/implementations/go/client/shuai-tunnel-client.exe
-/implementations/go/server/shuai-stun-server.exe
+/implementations/go/client/specus-client
+/implementations/go/client/specus-client.exe
+/implementations/go/client/*-client.exe
+/implementations/go/server/specus-stun-server.exe
 /implementations/csharp/client/out/
 /implementations/go/client/out/
 /deploy/go-server/out/
@@ -89,6 +94,8 @@ client2.jsonc
 **/.gradle-user-home/
 **/BenchmarkDotNet.Artifacts/
 BenchmarkDotNet.Artifacts/
+__pycache__/
+*.py[cod]
 /.codex/config.toml
 /.zcode/
 local.properties
@@ -102,7 +109,7 @@ node_modules/
 /apps/admin-web/dist/
 /implementations/java/server/src/main/resources/static/
 /implementations/go/server/web/static/
-/implementations/csharp/server/src/ShuaiTunnel.Server/wwwroot/
+/implementations/csharp/server/src/Specus.Server/wwwroot/
 
 .reorg-backup/
 /.codex/skills/anthropic-skills/

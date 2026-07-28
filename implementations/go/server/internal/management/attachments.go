@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
+	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
 )
 
 func (a *API) handlePublicAttachmentUploadCallback(w http.ResponseWriter, r *http.Request) {

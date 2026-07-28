@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	defaultSoftware = "shuai-tunnel-rfc5780-stun"
+	defaultSoftware = "specus-rfc5780-stun"
 	maxUDPPacket    = 65507
 )
 

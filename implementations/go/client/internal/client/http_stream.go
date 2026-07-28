@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
 const (

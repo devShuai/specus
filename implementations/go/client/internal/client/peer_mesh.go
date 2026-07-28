@@ -32,7 +32,7 @@ const (
 	peerRelayProbeChanged   = "changed-port"
 	publicStunRolePrefix    = "public-stun:"
 
-	peerProbeMagic             = "shuai-peer-mesh"
+	peerProbeMagic             = "specus-peer-mesh"
 	peerProbeTypeCheck         = "check"
 	peerProbeTypeCheckResponse = "check-response"
 
@@ -2866,7 +2866,7 @@ func (mesh *peerMeshClient) tryAcquirePortMappingAsync() {
 }
 
 func (mesh *peerMeshClient) attemptPortMapping(service *natPortMappingService, internalPort int) {
-	mapping, err := service.tryAcquireMapping(internalPort, internalPort, peerPortMappingLease, "shuai-tunnel peer mesh")
+	mapping, err := service.tryAcquireMapping(internalPort, internalPort, peerPortMappingLease, "specus peer mesh")
 	if err != nil {
 		mesh.logger.Printf("Peer Mesh NAT port mapping failed: %v", err)
 		return
@@ -2915,7 +2915,7 @@ func (mesh *peerMeshClient) renewPortMappingIfNeeded() {
 	if service == nil {
 		service = newNatPortMappingService(mesh.logger)
 	}
-	renewed, err := service.renewMapping(*current, peerPortMappingLease, "shuai-tunnel peer mesh")
+	renewed, err := service.renewMapping(*current, peerPortMappingLease, "specus peer mesh")
 	if err != nil || renewed == nil {
 		mesh.logger.Printf("Peer Mesh NAT port mapping renew failed, will retry: %v", err)
 		mesh.mu.Lock()
@@ -3043,7 +3043,7 @@ func (mesh *peerMeshClient) sendStunBinding(endpoint *net.UDPAddr, role string) 
 	request := newStunMessage(
 		stunBindingRequest,
 		tx,
-		stunAttrSoftwareValue("shuai-tunnel-peer-client"))
+		stunAttrSoftwareValue("specus-peer-client"))
 	mesh.mu.Lock()
 	if mesh.pendingStun == nil {
 		mesh.pendingStun = make(map[string]pendingStunBinding)
@@ -3064,7 +3064,7 @@ func (mesh *peerMeshClient) sendBehaviorProbe(probe natBehaviorProbeRequest) {
 		return
 	}
 	tx := newStunTransactionID()
-	attributes := []stunAttribute{stunAttrSoftwareValue("shuai-tunnel-peer-client")}
+	attributes := []stunAttribute{stunAttrSoftwareValue("specus-peer-client")}
 	if probe.ChangeIP || probe.ChangePort {
 		attributes = append(attributes, stunAttrChangeRequestValue(probe.ChangeIP, probe.ChangePort))
 	}

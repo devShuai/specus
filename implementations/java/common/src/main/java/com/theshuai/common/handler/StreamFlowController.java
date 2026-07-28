@@ -10,7 +10,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
-/** Connection-local credit controller for mandatory tunnel stream v2 DATA frames. */
+/** Connection-local credit controller for mandatory specus stream v2 DATA frames. */
 public final class StreamFlowController {
     public static final long INITIAL_WINDOW_BYTES = 1024L * 1024L;
     public static final int MAX_DATA_FRAME_BYTES = 64 * 1024;
@@ -18,7 +18,7 @@ public final class StreamFlowController {
     public static final long MAX_WINDOW_BYTES = 16L * 1024L * 1024L;
 
     private static final AttributeKey<StreamFlowController> KEY =
-            AttributeKey.valueOf("tunnel.stream-flow-v2");
+            AttributeKey.valueOf("specus.stream-flow-v2");
 
     private final Channel controlChannel;
     private final Map<Integer, StreamState> streams = new HashMap<>();

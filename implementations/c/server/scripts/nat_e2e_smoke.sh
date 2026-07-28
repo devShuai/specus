@@ -3,12 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 C_DIR="$ROOT_DIR/implementations/c/server"
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shuai-tunnel-c-smoke.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/specus-c-smoke.XXXXXX")"
 CONTROL_PORT="${CONTROL_PORT:-17010}"
 ADMIN_PORT="${ADMIN_PORT:-17011}"
 PUBLIC_PORT="${PUBLIC_PORT:-18080}"
 ECHO_PORT="${ECHO_PORT:-19090}"
-JAVA_CLIENT_JAR="$ROOT_DIR/implementations/java/client/target/tunnel-client-1.0.0-SNAPSHOT-exec.jar"
+JAVA_CLIENT_JAR="$ROOT_DIR/implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-exec.jar"
 ACCESS_TOKEN="${ACCESS_TOKEN:-c-smoke-access-token}"
 
 cleanup() {
@@ -22,7 +22,7 @@ trap cleanup EXIT
 
 if [[ ! -f "$JAVA_CLIENT_JAR" ]]; then
   echo "missing Java client jar: $JAVA_CLIENT_JAR" >&2
-  echo "build it first with: mvn -pl :tunnel-client -am package -DskipTests" >&2
+  echo "build it first with: mvn -pl :specus-client -am package -DskipTests" >&2
   exit 1
 fi
 
@@ -47,13 +47,13 @@ while True:
 PY
 ECHO_PID=$!
 
-TUNNEL_NETTY_PORT="$CONTROL_PORT" \
-TUNNEL_CLIENT_NAME="Demo client" \
-TUNNEL_CLIENT_SESSION_ID="1" \
-TUNNEL_CLIENT_ACCESS_TOKEN="$ACCESS_TOKEN" \
-TUNNEL_ADMIN_PORT="$ADMIN_PORT" \
-TUNNEL_TCP_MAPPINGS="$PUBLIC_PORT=127.0.0.1:$ECHO_PORT" \
-"$C_DIR/build/shuai-tunnel-server-c" >"$TMP_DIR/server.log" 2>&1 &
+SPECUS_NETTY_PORT="$CONTROL_PORT" \
+SPECUS_CLIENT_NAME="Demo client" \
+SPECUS_CLIENT_SESSION_ID="1" \
+SPECUS_CLIENT_ACCESS_TOKEN="$ACCESS_TOKEN" \
+SPECUS_ADMIN_PORT="$ADMIN_PORT" \
+SPECUS_TCP_MAPPINGS="$PUBLIC_PORT=127.0.0.1:$ECHO_PORT" \
+"$C_DIR/build/specus-server-c" >"$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 
 cat >"$TMP_DIR/client.jsonc" <<JSON
@@ -73,7 +73,7 @@ import sys
 import time
 port = int(sys.argv[1])
 deadline = time.time() + 30
-payload = b"shuai-tunnel-c-nat-smoke"
+payload = b"specus-c-nat-smoke"
 last = None
 while time.time() < deadline:
     try:

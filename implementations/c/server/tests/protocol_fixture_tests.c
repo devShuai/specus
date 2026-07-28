@@ -150,13 +150,13 @@ static int test_nat_decode(void)
         }
         if (cases[i].type == ST_NAT_REGISTER) {
             char *client_name = st_json_get_string(message.meta_json, "clientName");
-            char *address = st_json_get_string(message.meta_json, "tunnelAddress");
+            char *address = st_json_get_string(message.meta_json, "specusAddress");
             int port = 0;
-            int tunnel_port = 0;
+            int specus_port = 0;
             ok = client_name != NULL && strcmp(client_name, "Demo client") == 0
                 && address != NULL && strcmp(address, "127.0.0.1") == 0
                 && st_json_get_int(message.meta_json, "port", &port) == 0 && port == 18080
-                && st_json_get_int(message.meta_json, "tunnelPort", &tunnel_port) == 0 && tunnel_port == 80;
+                && st_json_get_int(message.meta_json, "specusPort", &specus_port) == 0 && specus_port == 80;
             free(client_name);
             free(address);
         } else if (strcmp(cases[i].fixture, "nat_data_small.bin") == 0) {

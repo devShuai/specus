@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
 )
 
 type adminWebSocketTicketRequest struct {

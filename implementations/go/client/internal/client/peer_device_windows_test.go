@@ -9,7 +9,7 @@ import (
 )
 
 func TestBundledWintunCanBeExtracted(t *testing.T) {
-	t.Setenv("SHUAI_PEER_MESH_NATIVE_CACHE_DIR", t.TempDir())
+	t.Setenv("SPECUS_PEER_MESH_NATIVE_CACHE_DIR", t.TempDir())
 
 	extracted, err := extractBundledWintun()
 	if err != nil {
@@ -32,8 +32,8 @@ func TestBundledWintunCanBeExtracted(t *testing.T) {
 
 func TestWintunCandidatesPreferConfiguredThenBundled(t *testing.T) {
 	cacheDir := t.TempDir()
-	t.Setenv("SHUAI_PEER_MESH_NATIVE_CACHE_DIR", cacheDir)
-	t.Setenv("SHUAI_PEER_MESH_WINTUN_DLL", `C:\custom\wintun.dll`)
+	t.Setenv("SPECUS_PEER_MESH_NATIVE_CACHE_DIR", cacheDir)
+	t.Setenv("SPECUS_PEER_MESH_WINTUN_DLL", `C:\custom\wintun.dll`)
 
 	candidates, candidateErrors := wintunCandidates()
 	if len(candidateErrors) != 0 {

@@ -1,10 +1,10 @@
 {
-  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // client.jsonc is JSONC: comments and trailing commas are supported.
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "demo-client",
   "secret": "test1234",
   "peerMeshDevice": "noop",
-  "peerMeshTunName": "shuai0",
+  "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280,
 }

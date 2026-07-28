@@ -1,5 +1,5 @@
-#ifndef SHUAI_TUNNEL_PROTOCOL_H
-#define SHUAI_TUNNEL_PROTOCOL_H
+#ifndef SPECUS_PROTOCOL_H
+#define SPECUS_PROTOCOL_H
 
 #include <stddef.h>
 #include <stdint.h>

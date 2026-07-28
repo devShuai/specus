@@ -10,7 +10,7 @@ import (
 
 // InsertClientSession persists an HTTP-authenticated client runtime session.
 func (db *DB) InsertClientSession(ctx context.Context, session ClientSession) error {
-	query := db.rebind(`INSERT INTO tunnel_client_session
+	query := db.rebind(`INSERT INTO specus_client_session
 		(id, tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status,
 		 machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version,
 		 java_version, local_addresses, message_send_capable, message_receive_capable,
@@ -41,7 +41,7 @@ func (db *DB) GetClientSession(ctx context.Context, id int64) (*ClientSession, e
 		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
 		http_login_at, netty_connected_at,
 		disconnected_at, expires_at, channel_id, remote_address
-		FROM tunnel_client_session WHERE id = ?`)
+		FROM specus_client_session WHERE id = ?`)
 	session, err := scanClientSession(db.sql.QueryRowContext(ctx, query, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -59,7 +59,7 @@ func (db *DB) GetOnlineClientSession(ctx context.Context, tenantID string, clien
 		client_version, java_version, local_addresses, message_send_capable, message_receive_capable,
 		message_attachments_capable, message_media_preview_capable, message_max_attachment_bytes,
 		http_login_at, netty_connected_at, disconnected_at, expires_at, channel_id, remote_address
-		FROM tunnel_client_session
+		FROM specus_client_session
 		WHERE tenant_id = ? AND client_id = ? AND status = ?
 		ORDER BY netty_connected_at DESC, id DESC LIMIT 1`)
 	session, err := scanClientSession(db.sql.QueryRowContext(ctx, query, defaultTenant(tenantID), clientID, status))
@@ -74,7 +74,7 @@ func (db *DB) GetOnlineClientSession(ctx context.Context, tenantID string, clien
 
 // ClientHasOnlineMessageReceiveCapability matches Java's anyMatch across all online sessions.
 func (db *DB) ClientHasOnlineMessageReceiveCapability(ctx context.Context, tenantID string, clientID int64, status string) (bool, error) {
-	query := db.rebind(`SELECT COUNT(*) FROM tunnel_client_session
+	query := db.rebind(`SELECT COUNT(*) FROM specus_client_session
 		WHERE tenant_id = ? AND client_id = ? AND status = ? AND ` + db.clientMessageReceivePredicate())
 	var count int64
 	if err := db.sql.QueryRowContext(ctx, query, defaultTenant(tenantID), clientID, status).Scan(&count); err != nil {
@@ -102,7 +102,7 @@ func (db *DB) MarkClientSessionOnline(ctx context.Context, id int64, status, cha
 	if id <= 0 {
 		return nil
 	}
-	query := db.rebind(`UPDATE tunnel_client_session
+	query := db.rebind(`UPDATE specus_client_session
 		SET status = ?, netty_connected_at = ?, disconnected_at = NULL, channel_id = ?, remote_address = ?
 		WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, status, formatTime(when), nullableSessionText(channelID),
@@ -115,7 +115,7 @@ func (db *DB) MarkClientSessionDisconnected(ctx context.Context, id int64, statu
 	if id <= 0 {
 		return nil
 	}
-	query := db.rebind(`UPDATE tunnel_client_session
+	query := db.rebind(`UPDATE specus_client_session
 		SET status = ?, disconnected_at = COALESCE(disconnected_at, ?)
 		WHERE id = ?`)
 	_, err := db.sql.ExecContext(ctx, query, status, formatTime(when), id)
@@ -125,7 +125,7 @@ func (db *DB) MarkClientSessionDisconnected(ctx context.Context, id int64, statu
 // CloseHTTPAuthenticatedClientSessions closes stale startup-login sessions for the same machine user.
 func (db *DB) CloseHTTPAuthenticatedClientSessions(ctx context.Context, credentialID int64,
 	machineFingerprint, osUser, fromStatus, toStatus string, when time.Time) (int64, error) {
-	query := db.rebind(`UPDATE tunnel_client_session
+	query := db.rebind(`UPDATE specus_client_session
 		SET status = ?, disconnected_at = ?
 		WHERE credential_id = ? AND machine_fingerprint = ? AND os_user = ? AND status = ?`)
 	result, err := db.sql.ExecContext(ctx, query, toStatus, formatTime(when), credentialID,
@@ -138,7 +138,7 @@ func (db *DB) CloseHTTPAuthenticatedClientSessions(ctx context.Context, credenti
 
 // CloseClientSessionsByStatus closes every session currently in fromStatus.
 func (db *DB) CloseClientSessionsByStatus(ctx context.Context, fromStatus, toStatus string, when time.Time) (int64, error) {
-	query := db.rebind(`UPDATE tunnel_client_session
+	query := db.rebind(`UPDATE specus_client_session
 		SET status = ?, disconnected_at = COALESCE(disconnected_at, ?)
 		WHERE status = ?`)
 	result, err := db.sql.ExecContext(ctx, query, toStatus, formatTime(when), fromStatus)

@@ -1,5 +1,5 @@
-#ifndef SHUAI_TUNNEL_C_TEST_UTIL_H
-#define SHUAI_TUNNEL_C_TEST_UTIL_H
+#ifndef SPECUS_C_TEST_UTIL_H
+#define SPECUS_C_TEST_UTIL_H
 
 #include "protocol.h"
 

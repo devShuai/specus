@@ -1,4 +1,4 @@
-// Package protocol implements the shuai-tunnel wire protocol: the 11-byte framing
+// Package protocol implements the specus wire protocol: the 11-byte framing
 // header, the CompactBinary body serializer, the NAT_MESSAGE sub-protocol, and HMAC
 // login signing. It is byte-compatible with the Java client/common and the C# server,
 // and implements both directions (the server decodes requests and encodes responses,

@@ -5,7 +5,7 @@
 #   scripts/package-release.sh [version]
 #   version 缺省时取 `git describe --tags --always`（无 tag 时为短 commit hash）。
 #
-# 产物: out/release/<version>/shuai-tunnel-client-go-<version>-<platform>-<arch>.{tar.gz|zip}
+# 产物: out/release/<version>/specus-client-go-<version>-<platform>-<arch>.{tar.gz|zip}
 #   - 二进制为静态交叉编译（CGO_ENABLED=0），wintun.dll 已 go:embed 进 Windows 二进制，
 #     无需随包携带；包内附 client.example.jsonc，Windows 包附 Wintun LICENSE。
 #   - platform/arch 命名与管理台「客户端下载」的 platform(windows|linux|macos) /
@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="${1:-$(git describe --tags --always 2>/dev/null || echo dev)}"
-BINARY="shuai-tunnel-client"
+BINARY="specus-client"
 OUT_ROOT="out/release/${VERSION}"
 STAGE_ROOT="out/stage"
 
@@ -61,7 +61,7 @@ for target in "${TARGETS[@]}"; do
   echo "==> build ${platform}/${arch} (${goos}/${goarch})"
   CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
     go build -trimpath -ldflags "-s -w" \
-    -o "${stage}/${bin}" ./cmd/shuai-tunnel-client
+    -o "${stage}/${bin}" ./cmd/specus-client
 
   cp client.example.jsonc "${stage}/"
   if [ "${goos}" = "windows" ]; then

@@ -11,10 +11,10 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/directhttp"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/control"
+	"github.com/devShuai/specus/implementations/go/server/internal/directhttp"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 const (
@@ -78,9 +78,9 @@ func (c *Coordinator) OpenHTTPStream(clientName string, metadata map[string]any)
 	return session.openHTTPStream(metadata)
 }
 
-// OpenWSStream allocates one WebSocket tunnel stream in the client's NAT v2 namespace.
+// OpenWSStream allocates one WebSocket specus stream in the client's NAT v2 namespace.
 func (c *Coordinator) OpenWSStream(clientName string, metadata map[string]any,
-	wsConn *websocket.Conn) (*directhttp.WebSocketTunnel, error) {
+	wsConn *websocket.Conn) (*directhttp.WebSocketSpecus, error) {
 	c.mu.Lock()
 	session := c.byName[clientName]
 	c.mu.Unlock()
@@ -132,7 +132,7 @@ type clientSession struct {
 	bindings       map[int]*portListener
 	externals      map[uint32]*externalConn
 	httpStreams    map[uint32]*HTTPStream
-	wsStreams      map[uint32]*directhttp.WebSocketTunnel
+	wsStreams      map[uint32]*directhttp.WebSocketSpecus
 	nextStreamID   uint32
 	activeExternal int
 	portCounts     map[int]int
@@ -153,7 +153,7 @@ func newClientSession(conn *control.Conn, manager *RemotePortManager, traffic *T
 		bindings:     make(map[int]*portListener),
 		externals:    make(map[uint32]*externalConn),
 		httpStreams:  make(map[uint32]*HTTPStream),
-		wsStreams:    make(map[uint32]*directhttp.WebSocketTunnel),
+		wsStreams:    make(map[uint32]*directhttp.WebSocketSpecus),
 		nextStreamID: 1,
 		portCounts:   make(map[int]int),
 	}
@@ -213,15 +213,15 @@ func (s *clientSession) protocolViolation(message protocol.NatMessage, detail st
 
 func (s *clientSession) handleRegister(message protocol.NatMessage) error {
 	port, hasPort := asInt(message.Metadata, "port")
-	tunnelPort, hasTunnelPort := asInt(message.Metadata, "tunnelPort")
-	tunnelAddress := asString(message.Metadata, "tunnelAddress")
+	specusPort, hasSpecusPort := asInt(message.Metadata, "specusPort")
+	specusAddress := asString(message.Metadata, "specusAddress")
 	requestedName := asString(message.Metadata, "clientName")
 
 	result := map[string]any{}
 	if hasPort {
 		result["port"] = port
 	}
-	if !hasPort || !hasTunnelPort || tunnelAddress == "" || requestedName == "" {
+	if !hasPort || !hasSpecusPort || specusAddress == "" || requestedName == "" {
 		result["success"] = false
 		result["reason"] = "missing required metadata"
 		_ = s.sendRegisterResult(result)
@@ -255,7 +255,7 @@ func (s *clientSession) handleRegister(message protocol.NatMessage) error {
 	s.mu.Unlock()
 
 	result["success"] = true
-	s.logger.Info("tunnel registered", "port", port, "target", tunnelAddress+":"+strconv.Itoa(tunnelPort), "client", s.conn.ClientName())
+	s.logger.Info("specus registered", "port", port, "target", specusAddress+":"+strconv.Itoa(specusPort), "client", s.conn.ClientName())
 	return s.sendRegisterResult(result)
 }
 
@@ -455,11 +455,11 @@ func (s *clientSession) removeHTTPStream(streamID uint32, expected *HTTPStream) 
 }
 
 // openWSStream 注册一条 WS 隧道流并发送带 source=ws metadata 的 OPEN 帧
-// （对齐 Java WebSocketTunnelHandler.afterConnectionEstablished 的 CONNECTED）。
+// （对齐 Java WebSocketSpecusHandler.afterConnectionEstablished 的 CONNECTED）。
 func (s *clientSession) openWSStream(metadata map[string]any,
-	wsConn *websocket.Conn) (*directhttp.WebSocketTunnel, error) {
+	wsConn *websocket.Conn) (*directhttp.WebSocketSpecus, error) {
 	streamID := s.allocateStreamID()
-	tunnel := directhttp.NewWebSocketTunnel(wsConn, streamID, s.conn.ClientName(),
+	specus := directhttp.NewWebSocketSpecus(wsConn, streamID, s.conn.ClientName(),
 		func(frame []byte) error {
 			return s.conn.Send(protocol.NatMessage{
 				Type: protocol.NatData, StreamID: streamID, Data: frame,
@@ -468,20 +468,20 @@ func (s *clientSession) openWSStream(metadata map[string]any,
 		func() error {
 			return s.conn.Send(protocol.NatMessage{Type: protocol.NatFin, StreamID: streamID})
 		},
-		func(tunnel *directhttp.WebSocketTunnel) { s.removeWSStream(streamID, tunnel) })
+		func(specus *directhttp.WebSocketSpecus) { s.removeWSStream(streamID, specus) })
 	s.mu.Lock()
-	s.wsStreams[streamID] = tunnel
+	s.wsStreams[streamID] = specus
 	s.mu.Unlock()
 	if err := s.conn.Send(protocol.NatMessage{
 		Type: protocol.NatOpen, StreamID: streamID, Metadata: metadata,
 	}); err != nil {
-		s.removeWSStream(streamID, tunnel)
+		s.removeWSStream(streamID, specus)
 		return nil, err
 	}
-	return tunnel, nil
+	return specus, nil
 }
 
-func (s *clientSession) removeWSStream(streamID uint32, expected *directhttp.WebSocketTunnel) {
+func (s *clientSession) removeWSStream(streamID uint32, expected *directhttp.WebSocketSpecus) {
 	s.mu.Lock()
 	if s.wsStreams[streamID] == expected {
 		delete(s.wsStreams, streamID)
@@ -493,16 +493,16 @@ func (s *clientSession) removeWSStream(streamID uint32, expected *directhttp.Web
 // （对齐 Java NatServerHandler.processWsData：writeFrame + WINDOW_UPDATE）。
 func (s *clientSession) handleWSData(message protocol.NatMessage) bool {
 	s.mu.Lock()
-	tunnel := s.wsStreams[message.StreamID]
+	specus := s.wsStreams[message.StreamID]
 	s.mu.Unlock()
-	if tunnel == nil {
+	if specus == nil {
 		return false
 	}
 	if len(message.Data) == 0 {
 		return true
 	}
 	s.traffic.RecordTCPUpload(s.conn.ClientName(), 0, int64(len(message.Data)))
-	tunnel.WriteFrame(s.conn.Context(), message.Data)
+	specus.WriteFrame(s.conn.Context(), message.Data)
 	_ = s.conn.SendPriority(protocol.NatMessage{
 		Type: protocol.NatWindowUpdate, StreamID: message.StreamID, Value: uint32(len(message.Data)),
 	})
@@ -512,12 +512,12 @@ func (s *clientSession) handleWSData(message protocol.NatMessage) bool {
 // handleWSEnd 处理客户端发来的 FIN/RST：只关浏览器会话（对齐 Java processWsClosed）。
 func (s *clientSession) handleWSEnd(message protocol.NatMessage) bool {
 	s.mu.Lock()
-	tunnel := s.wsStreams[message.StreamID]
+	specus := s.wsStreams[message.StreamID]
 	s.mu.Unlock()
-	if tunnel == nil {
+	if specus == nil {
 		return false
 	}
-	tunnel.CloseFromClient()
+	specus.CloseFromClient()
 	return true
 }
 
@@ -668,7 +668,7 @@ func (s *clientSession) dispose() {
 	s.bindings = make(map[int]*portListener)
 	s.externals = make(map[uint32]*externalConn)
 	s.httpStreams = make(map[uint32]*HTTPStream)
-	s.wsStreams = make(map[uint32]*directhttp.WebSocketTunnel)
+	s.wsStreams = make(map[uint32]*directhttp.WebSocketSpecus)
 	s.mu.Unlock()
 
 	for _, listener := range bindings {
@@ -682,8 +682,8 @@ func (s *clientSession) dispose() {
 		stream.onReset("control channel closed")
 	}
 	// 对齐 Java onControlChannelInactive -> WebSocketStreamRegistry.closeAll。
-	for _, tunnel := range wsStreams {
-		tunnel.Close()
+	for _, specus := range wsStreams {
+		specus.Close()
 	}
 }
 

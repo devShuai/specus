@@ -29,14 +29,14 @@ import java.util.Map;
  * Emits canonical control-protocol v2 frames into the repository-wide test-vector directory.
  * Run with:
  * <pre>
- *   mvn -pl :tunnel-common test-compile exec:java \
+ *   mvn -pl :specus-common test-compile exec:java \
  *       -Dexec.mainClass=com.theshuai.common.tools.WireFixtureGenerator \
  *       -Dexec.classpathScope=test \
  *       -Dexec.args="protocol/test-vectors/control-v2/frames"
  * </pre>
  *
  * <p>Every language loads these as expected-bytes fixtures. The C# entry point is
- * <c>implementations/csharp/protocol/tests/ShuaiTunnel.Protocol.Tests/PacketCodecFixtureTests.cs</c>.
+ * <c>implementations/csharp/protocol/tests/Specus.Protocol.Tests/PacketCodecFixtureTests.cs</c>.
  *
  * <p>Each fixture is named after the packet kind (e.g. <c>login_request.bin</c>) plus optional
  * variant suffixes. Update {@link Fixtures#emit(Path)} when adding new fixtures and re-run.
@@ -105,8 +105,8 @@ public final class WireFixtureGenerator {
             write("nat_register.bin", natPacket(NatMessageType.REGISTER, orderedMap(
                     "clientName", "Demo client",
                     "port", 18080,
-                    "tunnelAddress", "127.0.0.1",
-                    "tunnelPort", 80), null));
+                    "specusAddress", "127.0.0.1",
+                    "specusPort", 80), null));
             write("nat_register_result.bin", natPacket(NatMessageType.REGISTER_RESULT, orderedMap(
                     "port", 18080,
                     "success", true), null));

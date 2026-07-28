@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 type trafficCounter struct {
@@ -22,12 +22,12 @@ type resourceCounterKey struct {
 }
 
 const (
-	ResourceTypeTCPTunnel = "TCP_TUNNEL"
+	ResourceTypeTCPSpecus = "TCP_SPECUS"
 	ResourceTypeHTTPRoute = "HTTP_ROUTE"
 )
 
 // TrafficService accumulates per-client upload/download byte counts in memory and flushes
-// them to tunnel_traffic_usage on a fixed interval. Mirrors the C# TrafficUsageService.
+// them to specus_traffic_usage on a fixed interval. Mirrors the C# TrafficUsageService.
 type TrafficService struct {
 	db       *store.DB
 	logger   *slog.Logger
@@ -75,14 +75,14 @@ func (s *TrafficService) RecordDownload(clientName string, bytes int64) {
 func (s *TrafficService) RecordTCPUpload(clientName string, listenPort int, bytes int64) {
 	s.RecordUpload(clientName, bytes)
 	if listenPort > 0 {
-		s.recordResourceUpload(clientName, ResourceTypeTCPTunnel, tcpResourceKey(listenPort), bytes)
+		s.recordResourceUpload(clientName, ResourceTypeTCPSpecus, tcpResourceKey(listenPort), bytes)
 	}
 }
 
 func (s *TrafficService) RecordTCPDownload(clientName string, listenPort int, bytes int64) {
 	s.RecordDownload(clientName, bytes)
 	if listenPort > 0 {
-		s.recordResourceDownload(clientName, ResourceTypeTCPTunnel, tcpResourceKey(listenPort), bytes)
+		s.recordResourceDownload(clientName, ResourceTypeTCPSpecus, tcpResourceKey(listenPort), bytes)
 	}
 }
 

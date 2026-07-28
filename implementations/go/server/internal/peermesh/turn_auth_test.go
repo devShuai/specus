@@ -4,16 +4,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
 func TestTurnCredentialsAndMessageIntegrity(t *testing.T) {
 	credentials := newTurnCredentialService(config.PeerMeshConfig{
-		TurnAuthRequired: true, TurnRealm: "shuai-tunnel", TurnSharedSecret: "stable-secret",
+		TurnAuthRequired: true, TurnRealm: "specus", TurnSharedSecret: "stable-secret",
 		TurnCredentialTTLSeconds: 3600,
 	})
 	issued := credentials.issue("public transfer")
-	if issued.Realm != "shuai-tunnel" || issued.Nonce == "" || issued.Username == "" || issued.Credential == "" {
+	if issued.Realm != "specus" || issued.Nonce == "" || issued.Username == "" || issued.Credential == "" {
 		t.Fatalf("incomplete credential: %+v", issued)
 	}
 	if !credentials.usernameCredentialValid(issued.Username, issued.Credential) {

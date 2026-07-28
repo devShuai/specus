@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/peermesh"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 type clientAuthLoginRequest struct {
@@ -61,8 +61,8 @@ type clientAuthLoginResponse struct {
 	MaxOnlineInstances   int                  `json:"maxOnlineInstances"`
 	Policy               clientPolicy         `json:"policy"`
 	PeerMesh             peermesh.LoginConfig `json:"peerMesh"`
-	TunnelConfigList     []tunnelEndpoint     `json:"tunnelConfigList"`
-	HTTPTunnelConfigList []httpRouteEndpoint  `json:"httpTunnelConfigList"`
+	SpecusConfigList     []specusEndpoint     `json:"specusConfigList"`
+	HTTPSpecusConfigList []httpRouteEndpoint  `json:"httpSpecusConfigList"`
 }
 
 type clientPolicy struct {
@@ -71,10 +71,10 @@ type clientPolicy struct {
 	RetryAfterSeconds int64  `json:"retryAfterSeconds"`
 }
 
-type tunnelEndpoint struct {
+type specusEndpoint struct {
 	Port          int    `json:"port"`
-	TunnelAddress string `json:"tunnelAddress"`
-	TunnelPort    int    `json:"tunnelPort"`
+	SpecusAddress string `json:"specusAddress"`
+	SpecusPort    int    `json:"specusPort"`
 }
 
 type httpRouteEndpoint struct {
@@ -162,7 +162,7 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		a.failClientAuthInternal(w, "save-session", "保存客户端会话失败", err)
 		return
 	}
-	tunnels, err := a.db.ListEnabledTunnels(r.Context(), account.ID)
+	specusMappings, err := a.db.ListEnabledSpecusMappings(r.Context(), account.ID)
 	if err != nil {
 		a.failClientAuthInternal(w, "load-tcp-mappings", "加载 TCP 映射失败", err)
 		return
@@ -190,15 +190,15 @@ func (a *App) handleClientAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Policy:             clientPolicy{Enabled: true, BillingStatus: "ACTIVE"},
 		PeerMesh:           peerMesh,
 	}
-	for _, item := range tunnels {
-		response.TunnelConfigList = append(response.TunnelConfigList, tunnelEndpoint{
+	for _, item := range specusMappings {
+		response.SpecusConfigList = append(response.SpecusConfigList, specusEndpoint{
 			Port:          item.ListenPort,
-			TunnelAddress: item.TargetAddress,
-			TunnelPort:    item.TargetPort,
+			SpecusAddress: item.TargetAddress,
+			SpecusPort:    item.TargetPort,
 		})
 	}
 	for _, item := range routes {
-		response.HTTPTunnelConfigList = append(response.HTTPTunnelConfigList, httpRouteEndpoint{
+		response.HTTPSpecusConfigList = append(response.HTTPSpecusConfigList, httpRouteEndpoint{
 			Route:         item.Route,
 			TargetBaseURL: item.TargetBaseURL,
 		})

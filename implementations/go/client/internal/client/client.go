@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
 const (
@@ -64,8 +64,8 @@ type Client struct {
 	reconnectAttempts           int
 	resetBackoffOnNextHTTPLogin bool
 
-	tunnelsMu sync.RWMutex
-	tunnels   map[int]TunnelConfig
+	specusMappingsMu sync.RWMutex
+	specusMappings   map[int]SpecusConfig
 	runtimeMu sync.RWMutex
 	runtime   RuntimeConfig
 
@@ -93,8 +93,8 @@ type ClientMessage struct {
 }
 
 type natControlConfig struct {
-	TunnelConfigList     []TunnelConfig      `json:"tunnelConfigList"`
-	HTTPTunnelConfigList *[]HTTPTunnelConfig `json:"httpTunnelConfigList"`
+	SpecusConfigList     []SpecusConfig      `json:"specusConfigList"`
+	HTTPSpecusConfigList *[]HTTPSpecusConfig `json:"httpSpecusConfigList"`
 }
 
 type controlLoginAction int
@@ -146,7 +146,7 @@ func New(config Config, logger *log.Logger) *Client {
 		config:      config,
 		logger:      logger,
 		routes:      make(map[string]string),
-		tunnels:     make(map[int]TunnelConfig),
+		specusMappings:     make(map[int]SpecusConfig),
 		registered:  make(map[int]struct{}),
 		locals:      make(map[uint32]net.Conn),
 		wsLocals:    make(map[uint32]*webSocketLocalConnection),
@@ -376,13 +376,13 @@ func (client *Client) applyRuntime(runtime RuntimeConfig) {
 	client.runtimeMu.Lock()
 	client.runtime = runtime
 	client.runtimeMu.Unlock()
-	client.syncHTTPTunnelConfigs(runtime.HTTPTunnelConfigList)
-	client.tunnelsMu.Lock()
-	client.tunnels = make(map[int]TunnelConfig, len(runtime.TunnelConfigList))
-	for _, tunnel := range runtime.TunnelConfigList {
-		client.tunnels[tunnel.Port] = tunnel
+	client.syncHTTPSpecusConfigs(runtime.HTTPSpecusConfigList)
+	client.specusMappingsMu.Lock()
+	client.specusMappings = make(map[int]SpecusConfig, len(runtime.SpecusConfigList))
+	for _, specus := range runtime.SpecusConfigList {
+		client.specusMappings[specus.Port] = specus
 	}
-	client.tunnelsMu.Unlock()
+	client.specusMappingsMu.Unlock()
 }
 
 func (client *Client) applyRefreshedRuntime(connection net.Conn, runtime RuntimeConfig) {
@@ -393,9 +393,9 @@ func (client *Client) applyRefreshedRuntime(connection net.Conn, runtime Runtime
 	dataConnection := client.dataConn
 	client.controlMu.RUnlock()
 	if dataConnection != nil {
-		client.syncTunnelConfigs(dataConnection, runtime.TunnelConfigList)
+		client.syncSpecusConfigs(dataConnection, runtime.SpecusConfigList)
 	}
-	client.syncHTTPTunnelConfigs(runtime.HTTPTunnelConfigList)
+	client.syncHTTPSpecusConfigs(runtime.HTTPSpecusConfigList)
 	client.peerMesh.start(connection, runtime, client.sendPeerControl)
 }
 
@@ -511,7 +511,7 @@ func (client *Client) handlePacket(connection net.Conn, packet protocol.Packet, 
 			}
 			client.peerMesh.start(connection, client.currentRuntime(), client.sendPeerControl)
 		} else {
-			client.registerConfiguredTunnels(connection)
+			client.registerConfiguredSpecusMappings(connection)
 		}
 	case protocol.CommandHeartbeatRequest:
 		return client.send(connection, protocol.CommandHeartbeatResponse, protocol.EncodeHeartbeat())
@@ -565,10 +565,10 @@ func (client *Client) handleMessageResponse(connection net.Conn, body []byte) er
 	dataConnection := client.dataConn
 	client.controlMu.RUnlock()
 	if dataConnection != nil {
-		client.syncTunnelConfigs(dataConnection, config.TunnelConfigList)
+		client.syncSpecusConfigs(dataConnection, config.SpecusConfigList)
 	}
-	if config.HTTPTunnelConfigList != nil {
-		client.syncHTTPTunnelConfigs(*config.HTTPTunnelConfigList)
+	if config.HTTPSpecusConfigList != nil {
+		client.syncHTTPSpecusConfigs(*config.HTTPSpecusConfigList)
 	}
 	return nil
 }

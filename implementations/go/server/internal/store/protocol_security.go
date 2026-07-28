@@ -13,23 +13,23 @@ import (
 
 // ConsumeClientAuthNonce atomically reserves an API-key nonce until expiresAt.
 func (db *DB) ConsumeClientAuthNonce(ctx context.Context, apiKeyHash, nonce string, now, expiresAt time.Time) (bool, error) {
-	_, _ = db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_client_auth_nonce WHERE expires_at <= ?`), formatTime(now))
+	_, _ = db.sql.ExecContext(ctx, db.rebind(`DELETE FROM specus_client_auth_nonce WHERE expires_at <= ?`), formatTime(now))
 
 	var insertQuery, lookupQuery string
 	var insertArgs, lookupArgs []any
 	switch db.clientAuthNonceLayout {
 	case clientAuthNonceLayoutJavaID:
 		nonceID := hashClientAuthNonce(apiKeyHash + "\n" + nonce)
-		insertQuery = `INSERT INTO tunnel_client_auth_nonce (id, api_key_hash, expires_at) VALUES (?, ?, ?)`
+		insertQuery = `INSERT INTO specus_client_auth_nonce (id, api_key_hash, expires_at) VALUES (?, ?, ?)`
 		insertArgs = []any{nonceID, apiKeyHash, formatTime(expiresAt)}
-		lookupQuery = `SELECT COUNT(*) FROM tunnel_client_auth_nonce WHERE id = ?`
+		lookupQuery = `SELECT COUNT(*) FROM specus_client_auth_nonce WHERE id = ?`
 		lookupArgs = []any{nonceID}
 	case clientAuthNonceLayoutComposite:
 		nonceHash := hashClientAuthNonce(nonce)
-		insertQuery = `INSERT INTO tunnel_client_auth_nonce
+		insertQuery = `INSERT INTO specus_client_auth_nonce
 			(api_key_hash, nonce_hash, expires_at, created_at) VALUES (?, ?, ?, ?)`
 		insertArgs = []any{apiKeyHash, nonceHash, formatTime(expiresAt), formatTime(now)}
-		lookupQuery = `SELECT COUNT(*) FROM tunnel_client_auth_nonce
+		lookupQuery = `SELECT COUNT(*) FROM specus_client_auth_nonce
 			WHERE api_key_hash = ? AND nonce_hash = ?`
 		lookupArgs = []any{apiKeyHash, nonceHash}
 	default:
@@ -58,7 +58,7 @@ func (db *DB) InsertWebSocketTicket(ctx context.Context, ticket WebSocketTicket)
 	if err != nil {
 		return fmt.Errorf("encode websocket ticket attributes: %w", err)
 	}
-	_, err = db.sql.ExecContext(ctx, db.rebind(`INSERT INTO tunnel_websocket_ticket
+	_, err = db.sql.ExecContext(ctx, db.rebind(`INSERT INTO specus_websocket_ticket
 		(token_hash, scope, attributes_json, username, tenant_id, is_admin, room_id, room_key, room_role, peer_id, display_name,
 		 shared_room, remote_address_hash, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -74,7 +74,7 @@ func (db *DB) InsertWebSocketTicket(ctx context.Context, ticket WebSocketTicket)
 // ConsumeWebSocketTicket returns a ticket exactly once. Scope, expiry and address binding are
 // checked before the atomic delete, so a request on the wrong endpoint cannot burn the ticket.
 func (db *DB) ConsumeWebSocketTicket(ctx context.Context, tokenHash, scope, remoteAddressHash string, now time.Time) (*WebSocketTicket, error) {
-	_, _ = db.sql.ExecContext(ctx, db.rebind(`DELETE FROM tunnel_websocket_ticket WHERE expires_at <= ?`), formatTime(now))
+	_, _ = db.sql.ExecContext(ctx, db.rebind(`DELETE FROM specus_websocket_ticket WHERE expires_at <= ?`), formatTime(now))
 	var (
 		ticket                              WebSocketTicket
 		username, tenantID, roomID, roomKey sql.NullString
@@ -85,7 +85,7 @@ func (db *DB) ConsumeWebSocketTicket(ctx context.Context, tokenHash, scope, remo
 	)
 	err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT token_hash, scope, attributes_json, username, tenant_id, is_admin,
 		room_id, room_key, room_role, peer_id, display_name, shared_room, remote_address_hash, created_at, expires_at
-		FROM tunnel_websocket_ticket WHERE token_hash = ?`), tokenHash).Scan(
+		FROM specus_websocket_ticket WHERE token_hash = ?`), tokenHash).Scan(
 		&ticket.TokenHash, &ticket.Scope, &attributesJSON, &username, &tenantID, &admin, &roomID, &roomKey, &roomRole, &peerID,
 		&displayName, &sharedRoom, &storedAddressHash, &createdAt, &expiresAt)
 	if err != nil {
@@ -117,11 +117,11 @@ func (db *DB) ConsumeWebSocketTicket(ctx context.Context, tokenHash, scope, remo
 		!ticket.ExpiresAt.After(now) {
 		return nil, nil
 	}
-	deleteQuery := `DELETE FROM tunnel_websocket_ticket
+	deleteQuery := `DELETE FROM specus_websocket_ticket
 		WHERE token_hash = ? AND scope = ? AND expires_at > ?`
 	deleteArgs := []any{tokenHash, scope, formatTime(now)}
 	if ticket.RemoteAddressHash != "" {
-		deleteQuery = `DELETE FROM tunnel_websocket_ticket
+		deleteQuery = `DELETE FROM specus_websocket_ticket
 			WHERE token_hash = ? AND scope = ? AND remote_address_hash = ? AND expires_at > ?`
 		deleteArgs = []any{tokenHash, scope, remoteAddressHash, formatTime(now)}
 	}

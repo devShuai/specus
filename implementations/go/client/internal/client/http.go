@@ -17,7 +17,7 @@ var skippedHTTPHeaders = map[string]struct{}{
 	"trailer": {}, "transfer-encoding": {}, "upgrade": {},
 }
 
-func buildHTTPRouteMap(configs []HTTPTunnelConfig) map[string]string {
+func buildHTTPRouteMap(configs []HTTPSpecusConfig) map[string]string {
 	routes := make(map[string]string, len(configs))
 	for _, config := range configs {
 		if strings.TrimSpace(config.Route) != "" {
@@ -27,7 +27,7 @@ func buildHTTPRouteMap(configs []HTTPTunnelConfig) map[string]string {
 	return routes
 }
 
-func (client *Client) syncHTTPTunnelConfigs(configs []HTTPTunnelConfig) {
+func (client *Client) syncHTTPSpecusConfigs(configs []HTTPSpecusConfig) {
 	next := buildHTTPRouteMap(configs)
 	client.routesMu.Lock()
 	previous := len(client.routes)

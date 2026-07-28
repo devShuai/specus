@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 // runArchive periodically aggregates old connection records into monthly stats and deletes the

@@ -18,8 +18,8 @@ public class ClientAuthLoginResponse {
     private int maxOnlineInstances = 2;
     private ClientPolicy policy = new ClientPolicy();
     private PeerMeshConfig peerMesh = new PeerMeshConfig();
-    private List<TunnelEndpoint> tunnelConfigList = new ArrayList<>();
-    private List<HttpRouteEndpoint> httpTunnelConfigList = new ArrayList<>();
+    private List<SpecusEndpoint> specusConfigList = new ArrayList<>();
+    private List<HttpRouteEndpoint> httpSpecusConfigList = new ArrayList<>();
 
     @Data
     public static class ClientPolicy {
@@ -29,10 +29,10 @@ public class ClientAuthLoginResponse {
     }
 
     @Data
-    public static class TunnelEndpoint {
+    public static class SpecusEndpoint {
         private int port;
-        private String tunnelAddress;
-        private int tunnelPort;
+        private String specusAddress;
+        private int specusPort;
     }
 
     @Data

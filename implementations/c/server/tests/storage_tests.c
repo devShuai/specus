@@ -9,7 +9,7 @@
 static int test_peer_mesh_acl_direction_migration(void)
 {
     char path[256];
-    snprintf(path, sizeof(path), "/tmp/shuai-tunnel-c-acl-migration-%ld.db", (long)getpid());
+    snprintf(path, sizeof(path), "/tmp/specus-c-acl-migration-%ld.db", (long)getpid());
     unlink(path);
     sqlite3 *db = NULL;
     char *error = NULL;
@@ -60,7 +60,7 @@ int main(void)
         return 1;
     }
     char path[256];
-    snprintf(path, sizeof(path), "/tmp/shuai-tunnel-c-storage-%ld.db", (long)getpid());
+    snprintf(path, sizeof(path), "/tmp/specus-c-storage-%ld.db", (long)getpid());
     unlink(path);
 
     if (st_storage_init(path, 1) != 0) {
@@ -211,7 +211,7 @@ int main(void)
                                                "any",
                                                "any",
                                                "Java exec jar",
-                                               "https://example.com/shuai-tunnel.jar",
+                                               "https://example.com/specus.jar",
                                                "cross platform",
                                                20,
                                                0,
@@ -230,7 +230,7 @@ int main(void)
                                                "linux",
                                                "x64",
                                                "Linux x64",
-                                               "https://example.com/shuai-tunnel-linux-amd64",
+                                               "https://example.com/specus-linux-amd64",
                                                NULL,
                                                10,
                                                1,
@@ -261,7 +261,7 @@ int main(void)
                                                "windows",
                                                "x64",
                                                "Windows x64",
-                                               "https://example.com/shuai-tunnel-win-x64.zip",
+                                               "https://example.com/specus-win-x64.zip",
                                                "windows package",
                                                10,
                                                1,

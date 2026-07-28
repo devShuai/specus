@@ -22,19 +22,19 @@ type Config struct {
 const (
 	DefaultConfigFileName  = "client.jsonc"
 	DefaultPeerMeshDevice  = "noop"
-	DefaultPeerMeshTunName = "shuai0"
+	DefaultPeerMeshTunName = "specus0"
 	DefaultPeerMeshMTU     = 1280
 	MinPeerMeshMTU         = 576
 	MaxPeerMeshMTU         = 1280
 )
 
-type TunnelConfig struct {
+type SpecusConfig struct {
 	Port          int    `json:"port"`
-	TunnelAddress string `json:"tunnelAddress"`
-	TunnelPort    int    `json:"tunnelPort"`
+	SpecusAddress string `json:"specusAddress"`
+	SpecusPort    int    `json:"specusPort"`
 }
 
-type HTTPTunnelConfig struct {
+type HTTPSpecusConfig struct {
 	Route         string `json:"route"`
 	TargetBaseURL string `json:"targetBaseUrl"`
 }
@@ -51,8 +51,8 @@ type RuntimeConfig struct {
 	MaxOnlineInstances   int                `json:"maxOnlineInstances"`
 	Policy               ClientPolicy       `json:"policy"`
 	PeerMesh             PeerMeshConfig     `json:"peerMesh"`
-	TunnelConfigList     []TunnelConfig     `json:"tunnelConfigList"`
-	HTTPTunnelConfigList []HTTPTunnelConfig `json:"httpTunnelConfigList"`
+	SpecusConfigList     []SpecusConfig     `json:"specusConfigList"`
+	HTTPSpecusConfigList []HTTPSpecusConfig `json:"httpSpecusConfigList"`
 	TokenExpiresAt       time.Time          `json:"-"`
 }
 

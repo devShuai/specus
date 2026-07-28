@@ -1,0 +1,23 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Design;
+
+namespace Specus.Server.Data.Postgres;
+
+/// <summary>
+/// Design-time factory so <c>dotnet ef</c> can scaffold/apply the PostgreSQL migration set without
+/// booting the server. The connection string is throwaway — <c>migrations add</c> only needs the
+/// provider to emit DDL, it never connects. Production options are wired through DI in
+/// <c>Program.cs</c> (which sets the same <see cref="RelationalDbContextOptionsBuilderExtensions.MigrationsAssembly"/>).
+/// </summary>
+public sealed class PostgresDesignTimeDbContextFactory : IDesignTimeDbContextFactory<SpecusDbContext>
+{
+    public SpecusDbContext CreateDbContext(string[] args)
+    {
+        var options = new DbContextOptionsBuilder<SpecusDbContext>()
+            .UseNpgsql(
+                "Host=localhost;Database=design_time",
+                npgsql => npgsql.MigrationsAssembly(typeof(PostgresDesignTimeDbContextFactory).Assembly.GetName().Name))
+            .Options;
+        return new SpecusDbContext(options);
+    }
+}

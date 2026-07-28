@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
 func TestBuildTargetRejectsEscapesAndUnsupportedSchemes(t *testing.T) {
@@ -55,18 +55,18 @@ func TestHTTPStreamForwardsRequestAndStreamsResponse(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
-	tunnelClient.syncHTTPTunnelConfigs([]HTTPTunnelConfig{{Route: "api", TargetBaseURL: upstream.URL}})
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	specusClient.syncHTTPSpecusConfigs([]HTTPSpecusConfig{{Route: "api", TargetBaseURL: upstream.URL}})
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	tunnelClient.openNatFlow(9)
-	tunnelClient.openHTTPStream(clientConn, 9, map[string]any{
+	specusClient.openNatFlow(9)
+	specusClient.openHTTPStream(clientConn, 9, map[string]any{
 		"source": "http", "phase": "request", "method": "POST", "route": "api",
 		"relativePath": "/upload", "rawQuery": "x=1", "headers": []any{"X-Test:yes"},
 		"contentLength": 12,
 	})
-	if !tunnelClient.writeHTTPData(9, []byte("request-body")) || !tunnelClient.finishHTTPRequest(9, nil) {
+	if !specusClient.writeHTTPData(9, []byte("request-body")) || !specusClient.finishHTTPRequest(9, nil) {
 		t.Fatal("HTTP request stream was not registered")
 	}
 

@@ -67,9 +67,9 @@ func derivePeerMeshAESKey(localPrivate *ecdh.PrivateKey, remotePublicKeyBase64 s
 	if minID > maxID {
 		minID, maxID = maxID, minID
 	}
-	salt := sha256.Sum256([]byte(fmt.Sprintf("shuai-peer-mesh\n%d\n%s\n%d\n%d", sessionID, sessionToken, minID, maxID)))
+	salt := sha256.Sum256([]byte(fmt.Sprintf("specus-peer-mesh\n%d\n%s\n%d\n%d", sessionID, sessionToken, minID, maxID)))
 	prk := hmacSHA256(salt[:], sharedSecret)
-	return hkdfExpandSHA256(prk, []byte("shuai-peer-mesh/aes-gcm/v1"), 32), nil
+	return hkdfExpandSHA256(prk, []byte("specus-peer-mesh/aes-gcm/v1"), 32), nil
 }
 
 func encodePeerDataFrame(aesKey []byte, sessionID, fromClientID, toClientID int64, senderKeyEpoch string, sequence uint64, payload []byte) ([]byte, error) {
@@ -182,7 +182,7 @@ func derivePeerDataFrameV2TrafficMaterial(aesKey []byte, sessionID, fromClientID
 	var salt [8]byte
 	binary.BigEndian.PutUint64(salt[:], uint64(sessionID))
 	prk := hmacSHA256(salt[:], aesKey)
-	info := []byte(fmt.Sprintf("shuai-peer-mesh/spm2/aes-gcm\n%d\n%d\n%d\n%s", sessionID, fromClientID, toClientID, senderKeyEpoch))
+	info := []byte(fmt.Sprintf("specus-peer-mesh/spm2/aes-gcm\n%d\n%d\n%d\n%s", sessionID, fromClientID, toClientID, senderKeyEpoch))
 	material := hkdfExpandSHA256(prk, info, 36)
 	return material[:32], binary.BigEndian.Uint32(material[32:36])
 }

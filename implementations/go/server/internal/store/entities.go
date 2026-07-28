@@ -62,7 +62,7 @@ func ReasonText(reason string) string {
 	}
 }
 
-// ClientAccount mirrors tunnel_client_account.
+// ClientAccount mirrors specus_client_account.
 type ClientAccount struct {
 	ID                           int64
 	TenantID                     string
@@ -75,7 +75,7 @@ type ClientAccount struct {
 	UpdatedAt                    time.Time
 }
 
-// ClientCredential mirrors tunnel_client_credential.
+// ClientCredential mirrors specus_client_credential.
 type ClientCredential struct {
 	ID                 int64
 	TenantID           string
@@ -106,7 +106,7 @@ type WebSocketTicket struct {
 	ExpiresAt         time.Time
 }
 
-// ManagementUser mirrors tunnel_management_user.
+// ManagementUser mirrors specus_management_user.
 type ManagementUser struct {
 	Username     string
 	TenantID     string
@@ -187,7 +187,7 @@ type TransferAttachmentDownloadGrant struct {
 	ConsumedAt   *time.Time
 }
 
-// ClientIdentity mirrors tunnel_client_identity.
+// ClientIdentity mirrors specus_client_identity.
 type ClientIdentity struct {
 	ID                 int64
 	TenantID           string
@@ -201,7 +201,7 @@ type ClientIdentity struct {
 	LastSeenAt         time.Time
 }
 
-// ClientSession mirrors tunnel_client_session.
+// ClientSession mirrors specus_client_session.
 type ClientSession struct {
 	ID                         int64
 	TenantID                   string
@@ -297,7 +297,7 @@ type PeerMeshSession struct {
 	LastTrafficAt    *time.Time
 }
 
-// ConnectionRecord mirrors tunnel_connection_record.
+// ConnectionRecord mirrors specus_connection_record.
 type ConnectionRecord struct {
 	ID               int64
 	TenantID         string
@@ -312,8 +312,8 @@ type ConnectionRecord struct {
 	DisconnectReason *string
 }
 
-// TunnelMapping mirrors tunnel_mapping.
-type TunnelMapping struct {
+// SpecusMapping mirrors specus_mapping.
+type SpecusMapping struct {
 	ID                   int64
 	TenantID             string
 	ClientID             int64
@@ -342,7 +342,7 @@ type HTTPRouteMapping struct {
 	UpdatedAt            time.Time
 }
 
-// TrafficUsage mirrors tunnel_traffic_usage.
+// TrafficUsage mirrors specus_traffic_usage.
 type TrafficUsage struct {
 	ID            int64
 	TenantID      string
@@ -354,7 +354,7 @@ type TrafficUsage struct {
 	UpdatedAt     time.Time
 }
 
-// ResourceTrafficUsage mirrors tunnel_resource_traffic_usage.
+// ResourceTrafficUsage mirrors specus_resource_traffic_usage.
 type ResourceTrafficUsage struct {
 	ID            int64
 	TenantID      string
@@ -370,7 +370,7 @@ type ResourceTrafficUsage struct {
 	UpdatedAt     time.Time
 }
 
-// HTTPTrafficExchange mirrors tunnel_http_traffic_exchange.
+// HTTPTrafficExchange mirrors specus_http_traffic_exchange.
 type HTTPTrafficExchange struct {
 	ID                  int64
 	TenantID            string
@@ -403,7 +403,7 @@ type HTTPTrafficExchange struct {
 	CapturedAt          time.Time
 }
 
-// TCPTrafficFrame mirrors tunnel_tcp_traffic_frame.
+// TCPTrafficFrame mirrors specus_tcp_traffic_frame.
 type TCPTrafficFrame struct {
 	ID                 int64
 	TenantID           string
@@ -430,7 +430,7 @@ type TCPTrafficFrame struct {
 	FrameTime          time.Time
 }
 
-// ConnectionStat mirrors tunnel_connection_stat.
+// ConnectionStat mirrors specus_connection_stat.
 type ConnectionStat struct {
 	ID           int64
 	TenantID     string

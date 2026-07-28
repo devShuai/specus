@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 	"golang.org/x/crypto/pkcs12"
 )
 
@@ -109,7 +109,7 @@ func generateSelfSigned() (tls.Certificate, error) {
 	}
 	template := x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "shuai-tunnel-go"},
+		Subject:               pkix.Name{CommonName: "specus-go"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,

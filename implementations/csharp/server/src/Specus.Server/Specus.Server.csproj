@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Specus.Server</RootNamespace>
+    <SpecusServerWebSkip>false</SpecusServerWebSkip>
+    <DefaultItemExcludes>$(DefaultItemExcludes);wwwroot\**\*</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <Target Name="BuildAndSyncAdminWeb" BeforeTargets="ResolveStaticWebAssetsInputs;AssignTargetPaths" Condition="'$(SpecusServerWebSkip)' != 'true' and '$(DesignTimeBuild)' != 'true'">
+    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)..\..\..\..\..\apps\admin-web" Command="npm run deploy:csharp" />
+    <ItemGroup>
+      <Content Remove="wwwroot\**\*" />
+      <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="MailKit" Version="4.17.0" />
+    <PackageReference Include="StackExchange.Redis" Version="3.0.17" />
+    <ProjectReference Include="..\..\..\protocol\src\Specus.Protocol\Specus.Protocol.csproj" />
+    <ProjectReference Include="..\Specus.Server.Data\Specus.Server.Data.csproj" />
+    <!-- Provider migration assemblies must be referenced so MigrationsAssembly(...) can load
+         them at runtime. Only the one matching Specus:Database:Provider is actually used. -->
+    <ProjectReference Include="..\Specus.Server.Data.Postgres\Specus.Server.Data.Postgres.csproj" />
+    <ProjectReference Include="..\Specus.Server.Data.MySql\Specus.Server.Data.MySql.csproj" />
+  </ItemGroup>
+
+</Project>

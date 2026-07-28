@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
     <parent>
         <groupId>com.theshuai</groupId>
-        <artifactId>shuai-tunnel</artifactId>
+        <artifactId>specus</artifactId>
         <version>1.0-SNAPSHOT</version>
         <relativePath>../../../pom.xml</relativePath>
     </parent>
@@ -17,7 +17,7 @@
     <dependencies>
         <dependency>
             <groupId>com.theshuai</groupId>
-            <artifactId>tunnel-common</artifactId>
+            <artifactId>specus-common</artifactId>
             <version>1.0-SNAPSHOT</version>
         </dependency>
         <dependency>
@@ -45,7 +45,7 @@
                             <artifactItems>
                                 <artifactItem>
                                     <groupId>com.theshuai</groupId>
-                                    <artifactId>tunnel-common</artifactId>
+                                    <artifactId>specus-common</artifactId>
                                     <version>1.0-SNAPSHOT</version>
                                     <outputDirectory>${project.build.outputDirectory}</outputDirectory>
                                     <includes>com/theshuai/common/stun/**</includes>

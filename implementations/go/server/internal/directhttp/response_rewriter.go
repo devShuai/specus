@@ -246,7 +246,7 @@ func buildPolyfillScript(prefix string) string {
 		"if(typeof Element!=='undefined'){var osa=Element.prototype.setAttribute;var A={src:1,href:1,action:1,formaction:1,poster:1,background:1,'data-src':1,'data-href':1};Element.prototype.setAttribute=function(n,v){try{if(n&&A[String(n).toLowerCase()]&&typeof v==='string')v=fix(v);}catch(e){}return osa.call(this,n,v);};}" +
 		"if(typeof EventSource==='function'){var OE=EventSource;window.EventSource=function(u,c){return new OE(fix(u),c);};window.EventSource.prototype=OE.prototype;}" +
 		"if(typeof WebSocket==='function'){var OW=WebSocket;window.WebSocket=function(u,p){try{if(typeof u==='string'&&u.indexOf('ws://')!==0&&u.indexOf('wss://')!==0&&need(u))u=fix(u);}catch(e){}return p===undefined?new OW(u):new OW(u,p);};window.WebSocket.prototype=OW.prototype;}" +
-		"}catch(e){console&&console.warn&&console.warn('tunnel polyfill failed',e);}})();</script>"
+		"}catch(e){console&&console.warn&&console.warn('specus polyfill failed',e);}})();</script>"
 }
 
 func contentType(headers []string) string {

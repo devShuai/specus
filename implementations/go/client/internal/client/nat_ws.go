@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
 const (
@@ -55,21 +55,21 @@ type webSocketLocalConnection struct {
 	writeMu sync.Mutex
 }
 
-func (client *Client) connectWebSocketTunnel(connection net.Conn, streamID uint32, metadata map[string]any) {
+func (client *Client) connectWebSocketSpecus(connection net.Conn, streamID uint32, metadata map[string]any) {
 	channelID, err := metadataString(metadata, "channelId")
 	if err != nil {
-		client.logger.Printf("[ws-tunnel][client] invalid CONNECTED message: %v", err)
+		client.logger.Printf("[ws-specus][client] invalid CONNECTED message: %v", err)
 		return
 	}
 	route, err := metadataString(metadata, "route")
 	if err != nil {
-		client.logger.Printf("[ws-tunnel][client] CONNECTED missing route: %v", err)
+		client.logger.Printf("[ws-specus][client] CONNECTED missing route: %v", err)
 		client.sendNatReset(connection, streamID, 2, "websocket route missing")
 		return
 	}
 	targetBaseURL := client.routeTarget(route)
 	if strings.TrimSpace(targetBaseURL) == "" {
-		client.logger.Printf("[ws-tunnel][client] CONNECTED for unknown route %q", route)
+		client.logger.Printf("[ws-specus][client] CONNECTED for unknown route %q", route)
 		client.sendNatReset(connection, streamID, 3, "unknown websocket route")
 		return
 	}
@@ -77,13 +77,13 @@ func (client *Client) connectWebSocketTunnel(connection net.Conn, streamID uint3
 	rawQuery, _ := metadataStringOptional(metadata, "rawQuery")
 	target, err := buildWebSocketTarget(targetBaseURL, relativePath, rawQuery)
 	if err != nil {
-		client.logger.Printf("[ws-tunnel][client] CONNECTED route=%q build-target-failed: %v", route, err)
+		client.logger.Printf("[ws-specus][client] CONNECTED route=%q build-target-failed: %v", route, err)
 		client.sendNatReset(connection, streamID, 4, "invalid websocket target")
 		return
 	}
 	localConnection, err := dialLocalWebSocket(target, webSocketHandshakeHeaders(metadata))
 	if err != nil {
-		client.logger.Printf("[ws-tunnel][client] connect local ws failed channelId=%q route=%q target=%s: %v",
+		client.logger.Printf("[ws-specus][client] connect local ws failed channelId=%q route=%q target=%s: %v",
 			channelID, route, targetWithoutRawQuery(target), err)
 		client.sendNatReset(connection, streamID, 5, "websocket connect failed")
 		client.closeNatFlow(streamID)
@@ -96,7 +96,7 @@ func (client *Client) connectWebSocketTunnel(connection net.Conn, streamID uint3
 	}
 	client.wsLocals[streamID] = localConnection
 	client.wsLocalsMu.Unlock()
-	client.logger.Printf("[ws-tunnel][client] ws handshake ok channelId=%q route=%q target=%s",
+	client.logger.Printf("[ws-specus][client] ws handshake ok channelId=%q route=%q target=%s",
 		channelID, route, targetWithoutRawQuery(target))
 	go client.copyWebSocketData(connection, streamID, channelID, localConnection)
 }
@@ -287,9 +287,9 @@ func (client *Client) copyWebSocketData(connection net.Conn, streamID uint32, ch
 		fin, rsv, opcode, payload, err := localConnection.readFrame()
 		if err != nil {
 			if err != io.EOF {
-				client.logger.Printf("[ws-tunnel][client] read local ws %q failed: %v", channelID, err)
+				client.logger.Printf("[ws-specus][client] read local ws %q failed: %v", channelID, err)
 			}
-			client.disconnectWebSocketTunnel(connection, streamID)
+			client.disconnectWebSocketSpecus(connection, streamID)
 			return
 		}
 		closeCode := uint16(0)
@@ -304,7 +304,7 @@ func (client *Client) copyWebSocketData(connection net.Conn, streamID uint32, ch
 			}
 		}
 		if err := client.sendWebSocketFrames(connection, streamID, opcode, fin, rsv, closeCode, payload); err != nil {
-			client.disconnectWebSocketTunnel(connection, streamID)
+			client.disconnectWebSocketSpecus(connection, streamID)
 			return
 		}
 		if opcode == webSocketOpcodeClose {
@@ -333,7 +333,7 @@ func (client *Client) sendWebSocketFrames(connection net.Conn, streamID uint32, 
 			chunkCloseCode = 0
 		}
 		last := offset+length == len(payload)
-		encoded, err := encodeWebSocketTunnelFrame(webSocketTunnelFrame{
+		encoded, err := encodeWebSocketSpecusFrame(webSocketSpecusFrame{
 			opcode: chunkOpcode, fin: fin && last, rsv: chunkRSV,
 			closeCode: chunkCloseCode, payload: payload[offset : offset+length],
 		})
@@ -452,7 +452,7 @@ func (client *Client) writeWebSocketData(streamID uint32, data []byte) (bool, er
 	if connection == nil {
 		return false, nil
 	}
-	frame, err := decodeWebSocketTunnelFrame(data)
+	frame, err := decodeWebSocketSpecusFrame(data)
 	if err != nil {
 		return true, err
 	}
@@ -465,7 +465,7 @@ func (client *Client) writeWebSocketData(streamID uint32, data []byte) (bool, er
 	return true, connection.writeFrame(frame.fin, frame.rsv, frame.opcode, payload)
 }
 
-func (client *Client) disconnectWebSocketTunnel(connection net.Conn, streamID uint32) {
+func (client *Client) disconnectWebSocketSpecus(connection net.Conn, streamID uint32) {
 	if client.removeWebSocketConnection(streamID) {
 		client.sendNatFin(connection, streamID)
 	}
@@ -481,7 +481,7 @@ func (client *Client) removeWebSocketConnection(streamID uint32) bool {
 		return false
 	}
 	_ = connection.close()
-	client.logger.Printf("[ws-tunnel][client] closed local ws stream=%d", streamID)
+	client.logger.Printf("[ws-specus][client] closed local ws stream=%d", streamID)
 	return true
 }
 

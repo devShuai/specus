@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS tunnel_client_account (
+CREATE TABLE IF NOT EXISTS specus_client_account (
   id INTEGER PRIMARY KEY,
   tenant_id TEXT NOT NULL DEFAULT 'default',
   owner_username TEXT,
@@ -10,10 +10,10 @@ CREATE TABLE IF NOT EXISTS tunnel_client_account (
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_tunnel_client_tenant ON tunnel_client_account (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_tunnel_client_owner ON tunnel_client_account (tenant_id, owner_username);
+CREATE INDEX IF NOT EXISTS idx_specus_client_tenant ON specus_client_account (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_specus_client_owner ON specus_client_account (tenant_id, owner_username);
 
-CREATE TABLE IF NOT EXISTS tunnel_client_credential (
+CREATE TABLE IF NOT EXISTS specus_client_credential (
   id INTEGER PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   owner_username TEXT,
@@ -25,18 +25,18 @@ CREATE TABLE IF NOT EXISTS tunnel_client_credential (
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_client_credential_tenant ON tunnel_client_credential (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_client_credential_owner ON tunnel_client_credential (tenant_id, owner_username);
+CREATE INDEX IF NOT EXISTS idx_client_credential_tenant ON specus_client_credential (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_client_credential_owner ON specus_client_credential (tenant_id, owner_username);
 
-CREATE TABLE IF NOT EXISTS tunnel_client_auth_nonce (
+CREATE TABLE IF NOT EXISTS specus_client_auth_nonce (
   id TEXT PRIMARY KEY,
   api_key_hash TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expires ON tunnel_client_auth_nonce (expires_at);
+CREATE INDEX IF NOT EXISTS idx_client_auth_nonce_expires ON specus_client_auth_nonce (expires_at);
 
-CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
+CREATE TABLE IF NOT EXISTS specus_websocket_ticket (
   token_hash TEXT PRIMARY KEY,
   scope TEXT NOT NULL,
   attributes_json TEXT NOT NULL,
@@ -54,9 +54,9 @@ CREATE TABLE IF NOT EXISTS tunnel_websocket_ticket (
   expires_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_websocket_ticket_expiry ON tunnel_websocket_ticket (expires_at);
+CREATE INDEX IF NOT EXISTS idx_websocket_ticket_expiry ON specus_websocket_ticket (expires_at);
 
-CREATE TABLE IF NOT EXISTS tunnel_client_identity (
+CREATE TABLE IF NOT EXISTS specus_client_identity (
   id INTEGER PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   credential_id INTEGER NOT NULL,
@@ -70,10 +70,10 @@ CREATE TABLE IF NOT EXISTS tunnel_client_identity (
   UNIQUE (credential_id, machine_fingerprint, os_user)
 );
 
-CREATE INDEX IF NOT EXISTS idx_client_identity_tenant ON tunnel_client_identity (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_client_identity_client ON tunnel_client_identity (client_id);
+CREATE INDEX IF NOT EXISTS idx_client_identity_tenant ON specus_client_identity (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_client_identity_client ON specus_client_identity (client_id);
 
-CREATE TABLE IF NOT EXISTS tunnel_client_session (
+CREATE TABLE IF NOT EXISTS specus_client_session (
   id INTEGER PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   credential_id INTEGER NOT NULL,
@@ -104,12 +104,12 @@ CREATE TABLE IF NOT EXISTS tunnel_client_session (
   remote_address TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_client_session_token ON tunnel_client_session (token_hash);
-CREATE INDEX IF NOT EXISTS idx_client_session_credential_status ON tunnel_client_session (credential_id, status);
-CREATE INDEX IF NOT EXISTS idx_client_session_machine_status ON tunnel_client_session (credential_id, machine_fingerprint, os_user, status);
-CREATE INDEX IF NOT EXISTS idx_client_session_client_status ON tunnel_client_session (client_id, status);
+CREATE INDEX IF NOT EXISTS idx_client_session_token ON specus_client_session (token_hash);
+CREATE INDEX IF NOT EXISTS idx_client_session_credential_status ON specus_client_session (credential_id, status);
+CREATE INDEX IF NOT EXISTS idx_client_session_machine_status ON specus_client_session (credential_id, machine_fingerprint, os_user, status);
+CREATE INDEX IF NOT EXISTS idx_client_session_client_status ON specus_client_session (client_id, status);
 
-CREATE TABLE IF NOT EXISTS tunnel_management_user (
+CREATE TABLE IF NOT EXISTS specus_management_user (
   username TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   password_hash TEXT NOT NULL,
@@ -119,10 +119,10 @@ CREATE TABLE IF NOT EXISTS tunnel_management_user (
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_management_user_tenant ON tunnel_management_user (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_management_user_role ON tunnel_management_user (role);
+CREATE INDEX IF NOT EXISTS idx_management_user_tenant ON specus_management_user (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_management_user_role ON specus_management_user (role);
 
-CREATE TABLE IF NOT EXISTS tunnel_management_user_email (
+CREATE TABLE IF NOT EXISTS specus_management_user_email (
   username TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   verified_at TEXT NOT NULL,
@@ -130,9 +130,9 @@ CREATE TABLE IF NOT EXISTS tunnel_management_user_email (
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_management_user_email_verified ON tunnel_management_user_email (verified_at);
+CREATE INDEX IF NOT EXISTS idx_management_user_email_verified ON specus_management_user_email (verified_at);
 
-CREATE TABLE IF NOT EXISTS tunnel_management_registration_challenge (
+CREATE TABLE IF NOT EXISTS specus_management_registration_challenge (
   registration_id TEXT PRIMARY KEY,
   username TEXT NOT NULL,
   email TEXT NOT NULL,
@@ -144,12 +144,12 @@ CREATE TABLE IF NOT EXISTS tunnel_management_registration_challenge (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_registration_challenge_username ON tunnel_management_registration_challenge (username COLLATE NOCASE);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_registration_challenge_email ON tunnel_management_registration_challenge (email COLLATE NOCASE);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_registration_challenge_username ON specus_management_registration_challenge (username COLLATE NOCASE);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_registration_challenge_email ON specus_management_registration_challenge (email COLLATE NOCASE);
 
-CREATE INDEX IF NOT EXISTS idx_registration_challenge_username ON tunnel_management_registration_challenge (username);
-CREATE INDEX IF NOT EXISTS idx_registration_challenge_email ON tunnel_management_registration_challenge (email);
-CREATE INDEX IF NOT EXISTS idx_registration_challenge_expiry ON tunnel_management_registration_challenge (expires_at);
+CREATE INDEX IF NOT EXISTS idx_registration_challenge_username ON specus_management_registration_challenge (username);
+CREATE INDEX IF NOT EXISTS idx_registration_challenge_email ON specus_management_registration_challenge (email);
+CREATE INDEX IF NOT EXISTS idx_registration_challenge_expiry ON specus_management_registration_challenge (expires_at);
 
 CREATE TABLE IF NOT EXISTS client_download_link (
   id INTEGER PRIMARY KEY,
@@ -225,7 +225,7 @@ CREATE INDEX IF NOT EXISTS idx_attachment_download_grant_attachment
 CREATE INDEX IF NOT EXISTS idx_attachment_download_grant_expiry
   ON transfer_attachment_download_grant (expires_at, consumed_at);
 
-CREATE TABLE IF NOT EXISTS tunnel_connection_record (
+CREATE TABLE IF NOT EXISTS specus_connection_record (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT,
   client_id INTEGER,
@@ -239,11 +239,11 @@ CREATE TABLE IF NOT EXISTS tunnel_connection_record (
   disconnect_reason TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_tunnel_connection_tenant ON tunnel_connection_record (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_tunnel_connection_client_time ON tunnel_connection_record (client_id, connected_at);
-CREATE INDEX IF NOT EXISTS idx_tunnel_connection_connected_at ON tunnel_connection_record (connected_at);
+CREATE INDEX IF NOT EXISTS idx_specus_connection_tenant ON specus_connection_record (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_specus_connection_client_time ON specus_connection_record (client_id, connected_at);
+CREATE INDEX IF NOT EXISTS idx_specus_connection_connected_at ON specus_connection_record (connected_at);
 
-CREATE TABLE IF NOT EXISTS tunnel_mapping (
+CREATE TABLE IF NOT EXISTS specus_mapping (
   id INTEGER PRIMARY KEY,
   tenant_id TEXT NOT NULL,
   client_id INTEGER NOT NULL,
@@ -257,7 +257,7 @@ CREATE TABLE IF NOT EXISTS tunnel_mapping (
   updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_tunnel_mapping_client_id ON tunnel_mapping (client_id);
+CREATE INDEX IF NOT EXISTS idx_specus_mapping_client_id ON specus_mapping (client_id);
 
 CREATE TABLE IF NOT EXISTS http_route_mapping (
   id INTEGER PRIMARY KEY,
@@ -276,7 +276,7 @@ CREATE TABLE IF NOT EXISTS http_route_mapping (
 
 CREATE INDEX IF NOT EXISTS idx_http_route_client_id ON http_route_mapping (client_id);
 
-CREATE TABLE IF NOT EXISTS tunnel_traffic_usage (
+CREATE TABLE IF NOT EXISTS specus_traffic_usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT,
   client_id INTEGER NOT NULL,
@@ -288,10 +288,10 @@ CREATE TABLE IF NOT EXISTS tunnel_traffic_usage (
   UNIQUE (client_id, usage_date)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tunnel_traffic_tenant ON tunnel_traffic_usage (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_traffic_client_id ON tunnel_traffic_usage (client_id);
+CREATE INDEX IF NOT EXISTS idx_specus_traffic_tenant ON specus_traffic_usage (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_traffic_client_id ON specus_traffic_usage (client_id);
 
-CREATE TABLE IF NOT EXISTS tunnel_resource_traffic_usage (
+CREATE TABLE IF NOT EXISTS specus_resource_traffic_usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT NOT NULL,
   client_id INTEGER NOT NULL,
@@ -307,12 +307,12 @@ CREATE TABLE IF NOT EXISTS tunnel_resource_traffic_usage (
   UNIQUE (tenant_id, client_id, resource_type, resource_key, usage_date)
 );
 
-CREATE INDEX IF NOT EXISTS idx_resource_traffic_tenant ON tunnel_resource_traffic_usage (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_resource_traffic_client ON tunnel_resource_traffic_usage (client_id);
-CREATE INDEX IF NOT EXISTS idx_resource_traffic_type ON tunnel_resource_traffic_usage (resource_type);
-CREATE INDEX IF NOT EXISTS idx_resource_traffic_date ON tunnel_resource_traffic_usage (usage_date);
+CREATE INDEX IF NOT EXISTS idx_resource_traffic_tenant ON specus_resource_traffic_usage (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_resource_traffic_client ON specus_resource_traffic_usage (client_id);
+CREATE INDEX IF NOT EXISTS idx_resource_traffic_type ON specus_resource_traffic_usage (resource_type);
+CREATE INDEX IF NOT EXISTS idx_resource_traffic_date ON specus_resource_traffic_usage (usage_date);
 
-CREATE TABLE IF NOT EXISTS tunnel_http_traffic_exchange (
+CREATE TABLE IF NOT EXISTS specus_http_traffic_exchange (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT NOT NULL,
   client_id INTEGER NOT NULL,
@@ -344,13 +344,13 @@ CREATE TABLE IF NOT EXISTS tunnel_http_traffic_exchange (
   captured_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_http_traffic_tenant ON tunnel_http_traffic_exchange (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_http_traffic_client ON tunnel_http_traffic_exchange (client_id);
-CREATE INDEX IF NOT EXISTS idx_http_traffic_route ON tunnel_http_traffic_exchange (route);
-CREATE INDEX IF NOT EXISTS idx_http_traffic_body_type ON tunnel_http_traffic_exchange (response_body_type);
-CREATE INDEX IF NOT EXISTS idx_http_traffic_captured_at ON tunnel_http_traffic_exchange (captured_at);
+CREATE INDEX IF NOT EXISTS idx_http_traffic_tenant ON specus_http_traffic_exchange (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_http_traffic_client ON specus_http_traffic_exchange (client_id);
+CREATE INDEX IF NOT EXISTS idx_http_traffic_route ON specus_http_traffic_exchange (route);
+CREATE INDEX IF NOT EXISTS idx_http_traffic_body_type ON specus_http_traffic_exchange (response_body_type);
+CREATE INDEX IF NOT EXISTS idx_http_traffic_captured_at ON specus_http_traffic_exchange (captured_at);
 
-CREATE TABLE IF NOT EXISTS tunnel_tcp_traffic_frame (
+CREATE TABLE IF NOT EXISTS specus_tcp_traffic_frame (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT NOT NULL,
   client_id INTEGER NOT NULL,
@@ -376,12 +376,12 @@ CREATE TABLE IF NOT EXISTS tunnel_tcp_traffic_frame (
   frame_time TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_tcp_traffic_tenant ON tunnel_tcp_traffic_frame (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_tcp_traffic_client ON tunnel_tcp_traffic_frame (client_id);
-CREATE INDEX IF NOT EXISTS idx_tcp_traffic_listen_port ON tunnel_tcp_traffic_frame (listen_port);
-CREATE INDEX IF NOT EXISTS idx_tcp_traffic_channel ON tunnel_tcp_traffic_frame (channel_id);
-CREATE INDEX IF NOT EXISTS idx_tcp_traffic_stream ON tunnel_tcp_traffic_frame (tenant_id, channel_id, frame_direction, stream_offset);
-CREATE INDEX IF NOT EXISTS idx_tcp_traffic_frame_time ON tunnel_tcp_traffic_frame (frame_time);
+CREATE INDEX IF NOT EXISTS idx_tcp_traffic_tenant ON specus_tcp_traffic_frame (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_tcp_traffic_client ON specus_tcp_traffic_frame (client_id);
+CREATE INDEX IF NOT EXISTS idx_tcp_traffic_listen_port ON specus_tcp_traffic_frame (listen_port);
+CREATE INDEX IF NOT EXISTS idx_tcp_traffic_channel ON specus_tcp_traffic_frame (channel_id);
+CREATE INDEX IF NOT EXISTS idx_tcp_traffic_stream ON specus_tcp_traffic_frame (tenant_id, channel_id, frame_direction, stream_offset);
+CREATE INDEX IF NOT EXISTS idx_tcp_traffic_frame_time ON specus_tcp_traffic_frame (frame_time);
 
 CREATE TABLE IF NOT EXISTS peer_mesh_device (
   id INTEGER PRIMARY KEY,
@@ -458,7 +458,7 @@ CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_source ON peer_mesh_session (te
 CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_target ON peer_mesh_session (tenant_id, target_client_id);
 CREATE INDEX IF NOT EXISTS idx_peer_mesh_session_status ON peer_mesh_session (status);
 
-CREATE TABLE IF NOT EXISTS tunnel_connection_stat (
+CREATE TABLE IF NOT EXISTS specus_connection_stat (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id TEXT NOT NULL DEFAULT 'default',
   client_id INTEGER,
@@ -471,8 +471,8 @@ CREATE TABLE IF NOT EXISTS tunnel_connection_stat (
   UNIQUE (tenant_id, client_name, stat_month)
 );
 
-CREATE INDEX IF NOT EXISTS idx_stat_tenant ON tunnel_connection_stat (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_stat_client_name ON tunnel_connection_stat (client_name);
+CREATE INDEX IF NOT EXISTS idx_stat_tenant ON specus_connection_stat (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_stat_client_name ON specus_connection_stat (client_name);
 
 -- Public transfer rooms (Batch 5, aligned with the Java management model).
 CREATE TABLE IF NOT EXISTS public_transfer_room (

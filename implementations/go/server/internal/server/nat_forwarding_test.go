@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 )
 
 // freeTCPPort grabs an ephemeral port by binding and immediately releasing it.
@@ -24,7 +24,7 @@ func freeTCPPort(t *testing.T) int {
 	return port
 }
 
-// natTestClient logs in, registers a tunnel on listenPort, and echoes any DATA it receives
+// natTestClient logs in, registers a specus on listenPort, and echoes any DATA it receives
 // straight back to the server (acting as a loopback upstream). It runs until ctx is done.
 func natTestClient(t *testing.T, ctx context.Context, app *App, port, listenPort int, registered chan<- bool) {
 	t.Helper()
@@ -94,8 +94,8 @@ func natTestClient(t *testing.T, ctx context.Context, app *App, port, listenPort
 					Type: protocol.NatRegister,
 					Metadata: map[string]any{
 						"port":          listenPort,
-						"tunnelPort":    9,
-						"tunnelAddress": "127.0.0.1",
+						"specusPort":    9,
+						"specusAddress": "127.0.0.1",
 						"clientName":    DemoClientName,
 					},
 				})
@@ -134,7 +134,7 @@ func TestNatRoundTrip(t *testing.T) {
 	select {
 	case ok := <-registered:
 		if !ok {
-			t.Fatal("tunnel registration failed")
+			t.Fatal("specus registration failed")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for registration")
@@ -156,7 +156,7 @@ func TestNatRoundTrip(t *testing.T) {
 	}
 	defer external.Close()
 
-	payload := []byte("hello-through-the-go-tunnel")
+	payload := []byte("hello-through-the-go-specus")
 	if _, err := external.Write(payload); err != nil {
 		t.Fatalf("write external: %v", err)
 	}
@@ -261,8 +261,8 @@ func TestNatBindFailureKeepsDataSessionForOtherMappings(t *testing.T) {
 			Type: protocol.NatRegister,
 			Metadata: map[string]any{
 				"port":          port,
-				"tunnelPort":    9,
-				"tunnelAddress": "127.0.0.1",
+				"specusPort":    9,
+				"specusAddress": "127.0.0.1",
 				"clientName":    DemoClientName,
 			},
 		}

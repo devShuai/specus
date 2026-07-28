@@ -18,7 +18,7 @@ public record StandaloneStunServerConfig(
         StandaloneStunProtectionConfig protection,
         StandaloneStunMetricsConfig metrics,
         StandaloneStunDistributionConfig distribution) {
-    public static final String DEFAULT_SOFTWARE = "shuai-tunnel-rfc5780-stun";
+    public static final String DEFAULT_SOFTWARE = "specus-rfc5780-stun";
 
     public StandaloneStunServerConfig {
         Objects.requireNonNull(topology, "topology");

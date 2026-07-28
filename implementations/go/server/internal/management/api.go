@@ -15,15 +15,15 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/nat"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/peermesh"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/nat"
+	"github.com/devShuai/specus/implementations/go/server/internal/peermesh"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
+	"github.com/devShuai/specus/implementations/go/server/internal/wsevents"
 )
 
 // API holds the dependencies for the admin REST surface.
@@ -130,10 +130,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/admin/client-downloads/{id}", a.requireAuth(a.handleUpdateClientDownload))
 	mux.HandleFunc("DELETE /api/admin/client-downloads/{id}", a.requireAuth(a.handleDeleteClientDownload))
 
-	mux.HandleFunc("GET /api/admin/tunnels", a.requireAuth(a.handleListTunnels))
-	mux.HandleFunc("POST /api/admin/clients/{id}/tunnels", a.requireAuth(a.handleCreateTunnel))
-	mux.HandleFunc("PUT /api/admin/tunnels/{tunnelId}", a.requireAuth(a.handleUpdateTunnel))
-	mux.HandleFunc("DELETE /api/admin/tunnels/{tunnelId}", a.requireAuth(a.handleDeleteTunnel))
+	mux.HandleFunc("GET /api/admin/specus-mappings", a.requireAuth(a.handleListSpecusMappings))
+	mux.HandleFunc("POST /api/admin/clients/{id}/specus-mappings", a.requireAuth(a.handleCreateSpecus))
+	mux.HandleFunc("PUT /api/admin/specus-mappings/{specusId}", a.requireAuth(a.handleUpdateSpecus))
+	mux.HandleFunc("DELETE /api/admin/specus-mappings/{specusId}", a.requireAuth(a.handleDeleteSpecus))
 	mux.HandleFunc("POST /api/admin/clients/{id}/nat-control", a.requireAuth(a.handleNatControl))
 
 	mux.HandleFunc("GET /api/admin/http-routes", a.requireAuth(a.handleListHTTPRoutes))
@@ -692,7 +692,7 @@ func (a *API) handleGetClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	tunnels, err := a.db.ListTunnels(r.Context(), &clientID)
+	specusMappings, err := a.db.ListSpecusMappings(r.Context(), &clientID)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -702,9 +702,9 @@ func (a *API) handleGetClient(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	tunnelViews := make([]TunnelView, 0, len(tunnels))
-	for _, tunnel := range tunnels {
-		tunnelViews = append(tunnelViews, tunnelView(tunnel))
+	specusViews := make([]SpecusView, 0, len(specusMappings))
+	for _, specus := range specusMappings {
+		specusViews = append(specusViews, specusView(specus))
 	}
 	routeViews := make([]HTTPRouteView, 0, len(routes))
 	for _, route := range routes {
@@ -712,7 +712,7 @@ func (a *API) handleGetClient(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, ClientDetail{
 		Client:     a.clientView(r.Context(), *account),
-		Tunnels:    tunnelViews,
+		SpecusMappings:    specusViews,
 		HTTPRoutes: routeViews,
 	})
 }
@@ -1169,9 +1169,9 @@ func (a *API) handleDeleteClientDownload(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---- tunnels -------------------------------------------------------------------------
+// ---- specusMappings -------------------------------------------------------------------------
 
-func (a *API) handleListTunnels(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleListSpecusMappings(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "未授权")
@@ -1187,22 +1187,22 @@ func (a *API) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, forbidden("无权访问客户端"))
 		return
 	}
-	mappings, err := a.db.ListTunnels(r.Context(), clientID)
+	mappings, err := a.db.ListSpecusMappings(r.Context(), clientID)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	views := make([]TunnelView, 0, len(mappings))
+	views := make([]SpecusView, 0, len(mappings))
 	for _, m := range mappings {
 		if !visibleIDs[m.ClientID] {
 			continue
 		}
-		views = append(views, tunnelView(m))
+		views = append(views, specusView(m))
 	}
 	writeJSON(w, http.StatusOK, views)
 }
 
-func (a *API) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleCreateSpecus(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "未授权")
@@ -1213,7 +1213,7 @@ func (a *API) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	var req tunnelMutation
+	var req specusMutation
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
@@ -1223,7 +1223,7 @@ func (a *API) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := validateTunnel(req); err != nil {
+	if err := validateSpecus(req); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -1235,7 +1235,7 @@ func (a *API) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	mapping := store.TunnelMapping{
+	mapping := store.SpecusMapping{
 		ID:                   auth.NewClientID(),
 		TenantID:             account.TenantID,
 		ClientID:             account.ID,
@@ -1248,31 +1248,31 @@ func (a *API) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            now,
 		UpdatedAt:            now,
 	}
-	if err := a.db.InsertTunnel(r.Context(), mapping); err != nil {
+	if err := a.db.InsertSpecus(r.Context(), mapping); err != nil {
 		a.fail(w, err)
 		return
 	}
 	a.pushNatControl(r.Context(), account.ID, account.ClientName)
-	writeJSON(w, http.StatusCreated, tunnelView(mapping))
+	writeJSON(w, http.StatusCreated, specusView(mapping))
 }
 
-func (a *API) handleUpdateTunnel(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleUpdateSpecus(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "未授权")
 		return
 	}
-	id, err := pathInt(r, "tunnelId")
+	id, err := pathInt(r, "specusId")
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	var req tunnelMutation
+	var req specusMutation
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	mapping, err := a.db.GetTunnel(r.Context(), id)
+	mapping, err := a.db.GetSpecus(r.Context(), id)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1281,7 +1281,7 @@ func (a *API) handleUpdateTunnel(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := validateTunnel(req); err != nil {
+	if err := validateSpecus(req); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -1298,26 +1298,26 @@ func (a *API) handleUpdateTunnel(w http.ResponseWriter, r *http.Request) {
 	mapping.Enabled = boolOr(req.Enabled, mapping.Enabled)
 	mapping.DetailCaptureEnabled = boolOr(req.DetailCaptureEnabled, mapping.DetailCaptureEnabled)
 	mapping.UpdatedAt = time.Now()
-	if err := a.db.UpdateTunnel(r.Context(), *mapping); err != nil {
+	if err := a.db.UpdateSpecus(r.Context(), *mapping); err != nil {
 		a.fail(w, err)
 		return
 	}
 	a.pushNatControl(r.Context(), mapping.ClientID, mapping.ClientName)
-	writeJSON(w, http.StatusOK, tunnelView(*mapping))
+	writeJSON(w, http.StatusOK, specusView(*mapping))
 }
 
-func (a *API) handleDeleteTunnel(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleDeleteSpecus(w http.ResponseWriter, r *http.Request) {
 	principal, ok := principalFromContext(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "未授权")
 		return
 	}
-	id, err := pathInt(r, "tunnelId")
+	id, err := pathInt(r, "specusId")
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
-	mapping, err := a.db.GetTunnel(r.Context(), id)
+	mapping, err := a.db.GetSpecus(r.Context(), id)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -1326,7 +1326,7 @@ func (a *API) handleDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	if err := a.db.DeleteTunnel(r.Context(), id); err != nil {
+	if err := a.db.DeleteSpecus(r.Context(), id); err != nil {
 		a.fail(w, err)
 		return
 	}
@@ -1360,8 +1360,8 @@ func (a *API) handleNatControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"pushed":     result.Tunnels,
-		"tunnels":    result.Tunnels,
+		"pushed":     result.SpecusMappings,
+		"specusMappings":    result.SpecusMappings,
 		"httpRoutes": result.HTTPRoutes,
 	})
 }
@@ -2520,7 +2520,7 @@ func adminOnlyCounter(principal managementPrincipal, value int64) int64 {
 	return 0
 }
 
-func validateTunnel(req tunnelMutation) error {
+func validateSpecus(req specusMutation) error {
 	if req.ListenPort <= 0 || req.ListenPort > 65535 {
 		return validation("监听端口无效")
 	}
@@ -2668,8 +2668,8 @@ type apiError struct {
 func (e *apiError) Error() string        { return e.message }
 func (e *apiError) Is(target error) bool { return target == e.sentinel }
 
-func tunnelView(m store.TunnelMapping) TunnelView {
-	return TunnelView{
+func specusView(m store.SpecusMapping) SpecusView {
+	return SpecusView{
 		ID: m.ID, ClientID: m.ClientID, ClientName: m.ClientName, ListenPort: m.ListenPort,
 		TargetAddress: m.TargetAddress, TargetPort: m.TargetPort, Enabled: m.Enabled,
 		DetailCaptureEnabled: m.DetailCaptureEnabled,

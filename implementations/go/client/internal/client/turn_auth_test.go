@@ -14,7 +14,7 @@ import (
 func TestAuthenticatedTurnMessageUsesJavaLongTermIntegrity(t *testing.T) {
 	peerConfig := PeerMeshConfig{
 		IceUsername: "2000000000:pm-1:abcd", IceCredential: "credential",
-		IceRealm: "shuai-tunnel", IceNonce: "nonce",
+		IceRealm: "specus", IceNonce: "nonce",
 	}
 	mesh := &peerMeshClient{runtime: RuntimeConfig{PeerMesh: peerConfig}}
 	key := turnMessageIntegrityKey(peerConfig)

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/control"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/control"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
 )
 
 const (

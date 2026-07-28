@@ -20,11 +20,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 const (
@@ -320,7 +320,7 @@ func New(cfg config.PeerMeshConfig, db *store.DB, sessions *session.Registry, lo
 		cfg.RelayTrafficFlushIntervalMs = 5000
 	}
 	if strings.TrimSpace(cfg.TurnRealm) == "" {
-		cfg.TurnRealm = "shuai-tunnel"
+		cfg.TurnRealm = "specus"
 	}
 	if cfg.TurnCredentialTTLSeconds <= 0 {
 		cfg.TurnCredentialTTLSeconds = 3600
@@ -2174,7 +2174,7 @@ func randomSuffix() string {
 }
 
 func serverPublicKey() string {
-	sum := sha256.Sum256([]byte("shuai-tunnel-peer-mesh-server"))
+	sum := sha256.Sum256([]byte("specus-peer-mesh-server"))
 	return hex.EncodeToString(sum[:])
 }
 

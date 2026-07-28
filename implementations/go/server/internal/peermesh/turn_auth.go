@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
 type turnCredential struct {
@@ -45,7 +45,7 @@ func (s *turnCredentialService) authRequired() bool { return s != nil && s.cfg.T
 
 func (s *turnCredentialService) realm() string {
 	if s == nil || strings.TrimSpace(s.cfg.TurnRealm) == "" {
-		return "shuai-tunnel"
+		return "specus"
 	}
 	return strings.TrimSpace(s.cfg.TurnRealm)
 }

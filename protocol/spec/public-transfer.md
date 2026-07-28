@@ -36,7 +36,7 @@ GET /api/public/transfer/ice-config
       "credential": ""
     },
     {
-      "urls": "turn:tunnel.example.com:3478?transport=udp",
+      "urls": "turn:specus.example.com:3478?transport=udp",
       "username": "1780000000:public-transfer:1a2b3c4d",
       "credential": "base64url-hmac-sha1"
     }
@@ -50,14 +50,14 @@ GET /api/public/transfer/ice-config
 
 | 字段 | 语义 |
 | --- | --- |
-| `peerMeshEnabled` | `tunnel.peer-mesh.enabled` 的值；控制 Peer Mesh 和自托管 TURN，不关闭显式配置的独立 STUN |
+| `peerMeshEnabled` | `specus.peer-mesh.enabled` 的值；控制 Peer Mesh 和自托管 TURN，不关闭显式配置的独立 STUN |
 | `iceServers` | WebRTC 风格的有序 ICE server 列表；每项的 `urls` 是单个字符串，不是数组 |
 | `turnAuthRequired` | TURN listener 是否要求长期凭证 |
 | `stunTurnPort` | 汇总字段，表示业务服务的 STUN/TURN 主端口；独立 STUN 的实际端口以 `iceServers[].urls` 为准 |
 
 列表顺序必须为：自托管 STUN（若可用）、配置的公共 STUN（保持配置顺序并去重）、自托管 TURN（若可用）。
 配置的公共 STUN 在 `peerMeshEnabled=false` 时仍保留。显式配置
-`tunnel.peer-mesh.standalone-stun-address` 后，独立 STUN 也不受 enabled 开关控制；自托管 TURN 仍只在
+`specus.peer-mesh.standalone-stun-address` 后，独立 STUN 也不受 enabled 开关控制；自托管 TURN 仍只在
 `peerMeshEnabled=true` 时生成。
 STUN 项必须返回空 `username` 和空 `credential`；TURN 项返回临时凭证。
 Java 即使在 `turnAuthRequired=false` 时也会给 TURN 项签发非空 username/credential；跨语言实现不得据此删掉字段，
@@ -67,14 +67,14 @@ Java 即使在 `turnAuthRequired=false` 时也会给 TURN 项签发非空 userna
 
 Java 按以下顺序选择自托管 STUN 地址：
 
-1. `tunnel.peer-mesh.standalone-stun-address`；
-2. `tunnel.peer-mesh.public-address`；
+1. `specus.peer-mesh.standalone-stun-address`；
+2. `specus.peer-mesh.public-address`；
 3. `X-Forwarded-Host` 第一项；
 4. `Host` 第一项；
 5. servlet `serverName`。
 
 只有独立 STUN 地址非空且端口大于 `0` 时才启用独立入口；部分配置会整体回退原入口。启用后使用
-`tunnel.peer-mesh.standalone-stun-port`，否则使用 `tunnel.peer-mesh.stun-turn-port`。TURN 地址不使用
+`specus.peer-mesh.standalone-stun-port`，否则使用 `specus.peer-mesh.stun-turn-port`。TURN 地址不使用
 独立 STUN 配置，仍从 `public-address` 或请求 Host 解析，并始终使用 `stun-turn-port`。
 
 主机名必须去除 scheme、路径和单个 `:port`。IPv6 地址必须用方括号包围。端口必须在
@@ -89,7 +89,7 @@ TURN username 格式为：
 <expiresAtEpochSeconds>:public-transfer:<8-lowercase-hex>
 ```
 
-有效期为 `max(60, tunnel.peer-mesh.turn-credential-ttl-seconds)` 秒。credential 为：
+有效期为 `max(60, specus.peer-mesh.turn-credential-ttl-seconds)` 秒。credential 为：
 
 ```text
 base64url-no-padding(HMAC-SHA1(turnSecret, UTF8(username)))
@@ -535,7 +535,7 @@ Java 的检查顺序是来源 IP 限流、房间 `PENDING` 配额、对象存储
 {
   "attachmentId": 123,
   "objectId": "123",
-  "objectKey": "shuai-tunnel/attachments/public-transfer/20260710/123/photo.jpg",
+  "objectKey": "specus/attachments/public-transfer/20260710/123/photo.jpg",
   "uploadUrl": "https://bucket.endpoint/...",
   "uploadHeaders": {"Content-Type":"image/jpeg","x-oss-callback":"<base64-json>"},
   "expiresAt": "2026-07-10T00:15:00Z",
@@ -738,11 +738,11 @@ C server 不是本协议的数据面完整实现：
 
 | 能力 | Java 源码 |
 | --- | --- |
-| ICE REST 与地址规范化 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/PublicPeerMeshResource.java` |
-| TURN 临时凭证 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/peer/TurnCredentialService.java` |
-| 发现 WebSocket | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/websocket/PublicTransferDiscoveryWebSocketHandler.java` |
-| 附件与一次性下载 REST | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/TransferAttachmentResource.java` |
-| 附件状态机 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/TransferAttachmentService.java` |
-| 公开限流 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/service/PublicTransferRateLimiter.java` |
-| Aliyun OSS | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/storage/object/AliyunOssObjectStorageService.java` |
-| HTTP 错误映射 | `implementations/java/server/src/main/java/com/theshuai/tunnelserver/management/controller/GlobalExceptionHandler.java` |
+| ICE REST 与地址规范化 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/controller/PublicPeerMeshResource.java` |
+| TURN 临时凭证 | `implementations/java/server/src/main/java/com/theshuai/specusserver/peer/TurnCredentialService.java` |
+| 发现 WebSocket | `implementations/java/server/src/main/java/com/theshuai/specusserver/websocket/PublicTransferDiscoveryWebSocketHandler.java` |
+| 附件与一次性下载 REST | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/controller/TransferAttachmentResource.java` |
+| 附件状态机 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/TransferAttachmentService.java` |
+| 公开限流 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/service/PublicTransferRateLimiter.java` |
+| Aliyun OSS | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/storage/object/AliyunOssObjectStorageService.java` |
+| HTTP 错误映射 | `implementations/java/server/src/main/java/com/theshuai/specusserver/management/controller/GlobalExceptionHandler.java` |

@@ -8,17 +8,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
 func TestPublicTransferCoordinationAcrossRedisInstances(t *testing.T) {
-	redisURI := os.Getenv("TUNNEL_TEST_REDIS_URI")
+	redisURI := os.Getenv("SPECUS_TEST_REDIS_URI")
 	if redisURI == "" {
-		t.Skip("TUNNEL_TEST_REDIS_URI is not configured")
+		t.Skip("SPECUS_TEST_REDIS_URI is not configured")
 	}
 	cfg := config.PublicTransferConfig{
 		ClusterEnabled: true, RedisURI: redisURI,
-		RedisKeyPrefix:       "shuai-tunnel:test:" + randomDiscoveryLeaseID(),
+		RedisKeyPrefix:       "specus:test:" + randomDiscoveryLeaseID(),
 		PresenceLeaseSeconds: 30, PresenceRefreshIntervalMs: 10_000,
 		RedisCommandTimeoutMs: 2_000,
 	}

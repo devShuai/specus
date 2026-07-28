@@ -12,13 +12,13 @@
 
 ```jsonc
 {
-  "$schema": "https://tunnel.devshuai.com/schemas/client-startup-config.schema.json",
+  "$schema": "https://specus.devshuai.com/schemas/client-startup-config.schema.json",
   // 服务端管理 HTTP 地址
   "serverBaseUrl": "http://127.0.0.1:8088",
   "apiKey": "demo-client",
   "secret": "test1234",
   "peerMeshDevice": "noop",
-  "peerMeshTunName": "shuai0",
+  "peerMeshTunName": "specus0",
   "peerMeshMtu": 1280
 }
 ```
@@ -29,7 +29,7 @@
 | `apiKey` | 是 | 管理后台创建的客户端凭证 key |
 | `secret` | 是 | 客户端凭证明文，只在创建或重置时展示一次 |
 | `peerMeshDevice` | 否 | Peer Mesh 虚拟网卡模式，默认 `noop` |
-| `peerMeshTunName` | 否 | 虚拟网卡名称，默认 `shuai0` |
+| `peerMeshTunName` | 否 | 虚拟网卡名称，默认 `specus0` |
 | `peerMeshMtu` | 否 | 虚拟网卡 MTU，默认 `1280`；大于 `1280` 会被客户端归一化 |
 
 客户端不需要也不接受本地配置 `clientName`。服务端会按 `apiKey + machineFingerprint + osUser` 找到或创建唯一客户端身份，并分配稳定的 `clientName`。
@@ -98,7 +98,7 @@ signature = HEX(HMAC_SHA256(key, message))
 
 ## 环境信息
 
-`machineFingerprint` 优先读取用户目录下 `.shuai-tunnel/machine-id`；不存在时生成并保存。写入失败时回退到 `hostname + os.name + os.arch` 的 SHA-256 摘要前缀。
+`machineFingerprint` 优先读取用户目录下 `.specus/machine-id`；不存在时生成并保存。写入失败时回退到 `hostname + os.name + os.arch` 的 SHA-256 摘要前缀。
 
 服务端把环境信息写入 `ClientIdentity` 和 `ClientSession`，用于：
 
@@ -129,7 +129,7 @@ signature = HEX(HMAC_SHA256(key, message))
 {
   "tenantId": "default",
   "clientId": 3813672224291582,
-  "clientName": "shuaiwin-shshi-fa22b7af",
+  "clientName": "specus-win-shshi-fa22b7af",
   "clientSessionId": 1868708022931423400,
   "accessToken": "cs_xxx",
   "tokenTtlSeconds": 28800,
@@ -141,12 +141,12 @@ signature = HEX(HMAC_SHA256(key, message))
     "billingStatus": "ACTIVE",
     "retryAfterSeconds": 0
   },
-  "tunnelConfigList": [],
-  "httpTunnelConfigList": [],
+  "specusConfigList": [],
+  "httpSpecusConfigList": [],
   "peerMesh": {
     "enabled": false,
     "clientId": 3813672224291582,
-    "clientName": "shuaiwin-shshi-fa22b7af",
+    "clientName": "specus-win-shshi-fa22b7af",
     "virtualIp": null,
     "cidr": "100.96.0.0/11",
     "stunHost": "",
@@ -176,11 +176,11 @@ signature = HEX(HMAC_SHA256(key, message))
 | `nettyHost` / `nettyPort` | 控制连接地址 |
 | `maxOnlineInstances` | 当前凭证允许同时在线实例数，默认 `2` |
 | `policy` | 预留策略字段，目前主要表示启用状态 |
-| `tunnelConfigList` | 已启用 TCP 映射初始快照 |
-| `httpTunnelConfigList` | 已启用 HTTP route 初始快照 |
+| `specusConfigList` | 已启用 TCP 映射初始快照 |
+| `httpSpecusConfigList` | 已启用 HTTP route 初始快照 |
 | `peerMesh` | Peer Mesh 运行时配置 |
 
-`nettyHost` 优先使用 `TUNNEL_PUBLIC_ADDRESS`，否则使用 HTTP 请求的 server name。公网部署建议显式设置 `TUNNEL_PUBLIC_ADDRESS`。
+`nettyHost` 优先使用 `SPECUS_PUBLIC_ADDRESS`，否则使用 HTTP 请求的 server name。公网部署建议显式设置 `SPECUS_PUBLIC_ADDRESS`。
 
 ## 控制连接登录
 
@@ -188,7 +188,7 @@ HTTP 登录成功后，客户端先建立 control 连接并发送 `LOGIN_REQUEST
 
 ```json
 {
-  "clientName": "shuaiwin-shshi-fa22b7af",
+  "clientName": "specus-win-shshi-fa22b7af",
   "clientSessionId": 1868708022931423400,
   "accessToken": "cs_xxx",
   "connectionRole": "control"
@@ -250,7 +250,7 @@ control 登录成功后，客户端使用相同的 `clientName/clientSessionId/a
 
 | 限制 | 默认 | 说明 |
 | --- | ---: | --- |
-| `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | 同一凭证、同一机器、同一系统用户只能一个控制连接在线 |
-| `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | 新建凭证默认允许的在线实例数 |
+| `SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | `1` | 同一凭证、同一机器、同一系统用户只能一个控制连接在线 |
+| `SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | `2` | 新建凭证默认允许的在线实例数 |
 
 单台机器重复启动时，第二个实例会被拒绝。客户端正常停止后服务端在 `channelInactive` 中标记 session 断开；服务端重启时也会关闭遗留 `NETTY_ONLINE` session。

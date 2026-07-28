@@ -51,11 +51,11 @@ class CompactBinarySerializerTests {
     }
 
     @Test
-    void shouldKeepNatTunnelDataRawWithExplicitLengths() throws Exception {
+    void shouldKeepNatSpecusDataRawWithExplicitLengths() throws Exception {
         NatMessagePacket expected = new NatMessagePacket();
         expected.setNatMessageType(NatMessageType.DATA);
         expected.setStreamId(1);
-        expected.setData("compact-tunnel-data-".repeat(100).getBytes(StandardCharsets.UTF_8));
+        expected.setData("compact-specus-data-".repeat(100).getBytes(StandardCharsets.UTF_8));
 
         ByteBuf byteBuf = Unpooled.buffer();
         try {
@@ -94,7 +94,7 @@ class CompactBinarySerializerTests {
         expected.setClientName("Demo client");
         expected.setMessageType(MessageType.NAT_CONTROL);
         expected.setMessage("{\"clientName\":\"Demo client\",\"remotePort\":7010,"
-                + "\"tunnelConfigList\":[{\"port\":9000,\"tunnelAddress\":\"127.0.0.1\",\"tunnelPort\":8080}]}");
+                + "\"specusConfigList\":[{\"port\":9000,\"specusAddress\":\"127.0.0.1\",\"specusPort\":8080}]}");
 
         ByteBuf byteBuf = Unpooled.buffer();
         try {

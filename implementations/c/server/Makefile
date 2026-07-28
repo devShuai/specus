@@ -5,13 +5,13 @@ LDFLAGS ?= -lpthread -lz -lsqlite3
 
 BUILD_DIR := build
 CORE_OBJS := $(BUILD_DIR)/admin_http.o $(BUILD_DIR)/crypto.o $(BUILD_DIR)/json.o $(BUILD_DIR)/protocol.o $(BUILD_DIR)/security.o $(BUILD_DIR)/storage.o
-SERVER := $(BUILD_DIR)/shuai-tunnel-server-c
-ADMIN_TESTS := $(BUILD_DIR)/shuai_tunnel_c_admin_http_tests
-CRYPTO_TESTS := $(BUILD_DIR)/shuai_tunnel_c_crypto_tests
-JSON_TESTS := $(BUILD_DIR)/shuai_tunnel_c_json_tests
-PROTOCOL_TESTS := $(BUILD_DIR)/shuai_tunnel_c_protocol_fixture_tests
-SECURITY_TESTS := $(BUILD_DIR)/shuai_tunnel_c_security_tests
-STORAGE_TESTS := $(BUILD_DIR)/shuai_tunnel_c_storage_tests
+SERVER := $(BUILD_DIR)/specus-server-c
+ADMIN_TESTS := $(BUILD_DIR)/specus_c_admin_http_tests
+CRYPTO_TESTS := $(BUILD_DIR)/specus_c_crypto_tests
+JSON_TESTS := $(BUILD_DIR)/specus_c_json_tests
+PROTOCOL_TESTS := $(BUILD_DIR)/specus_c_protocol_fixture_tests
+SECURITY_TESTS := $(BUILD_DIR)/specus_c_security_tests
+STORAGE_TESTS := $(BUILD_DIR)/specus_c_storage_tests
 TESTS := $(ADMIN_TESTS) $(CRYPTO_TESTS) $(JSON_TESTS) $(PROTOCOL_TESTS) $(SECURITY_TESTS) $(STORAGE_TESTS)
 
 .PHONY: all test release clean

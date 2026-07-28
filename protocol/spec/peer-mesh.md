@@ -10,39 +10,39 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 
 | 配置 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `tunnel.peer-mesh.enabled` | `TUNNEL_PEER_MESH_ENABLED` | `false` | 总开关 |
-| `tunnel.peer-mesh.cidr` | `TUNNEL_PEER_MESH_CIDR` | `100.96.0.0/11` | 虚拟网段 |
-| `tunnel.peer-mesh.public-address` | `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | 空 | UDP 探测和 relay 对外地址 |
-| `tunnel.peer-mesh.stun-turn-port` | `TUNNEL_PEER_MESH_STUN_TURN_PORT` | `3478` | 标准 STUN/TURN UDP 主端口 |
-| `tunnel.peer-mesh.standalone-stun-address` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ADDRESS` | 空 | 独立 STUN 域名或 IP；配置后 STUN 与 TURN 使用不同入口 |
-| `tunnel.peer-mesh.standalone-stun-port` | `TUNNEL_PEER_MESH_STANDALONE_STUN_PORT` | `3478` | 独立 STUN 入口端口 |
-| `tunnel.peer-mesh.standalone-stun-alternate-address` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS` | 空 | 独立 STUN 备用域名或 IP；使用主端口加入备用列表，同时作为 RFC 5780 的 A2 |
-| `tunnel.peer-mesh.standalone-stun-alternate-port` | `TUNNEL_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT` | `0` | 独立 RFC 5780 的第二端口 P2；`0` 时回退 NAT 探测备用端口 |
-| `tunnel.peer-mesh.nat-probe-alternate-port` | `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `3479` | NAT 辅助探测端口；显式设为 `0` 时使用主端口 + 1 |
-| `tunnel.peer-mesh.stun-primary-bind-address` | `TUNNEL_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` | 空 | RFC 5780 主地址 A1 的本机绑定 IP |
-| `tunnel.peer-mesh.stun-alternate-bind-address` | `TUNNEL_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` | 空 | RFC 5780 备用地址 A2 的本机绑定 IP |
-| `tunnel.peer-mesh.stun-alternate-public-address` | `TUNNEL_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS` | 空 | RFC 5780 备用公网 IP A2；A1 使用 `public-address` |
-| `tunnel.peer-mesh.stun-behavior-strict` | `TUNNEL_PEER_MESH_STUN_BEHAVIOR_STRICT` | `false` | 四端点配置不完整时是否拒绝启动内置 STUN/TURN |
-| `tunnel.peer-mesh.public-stun-servers` | `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | 空 | 额外公共 STUN server，逗号分隔，只补充 `srflx` candidate |
-| `tunnel.peer-mesh.session-ttl-seconds` | `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
-| `tunnel.peer-mesh.allocation-ttl-seconds` | `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation 有效期 |
-| `tunnel.peer-mesh.relay-min-port` / `relay-max-port` | `TUNNEL_PEER_MESH_RELAY_MIN_PORT` / `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | `49152` / `65535` | TURN relay UDP 分配端口范围 |
-| `tunnel.peer-mesh.relay-worker-threads` | `TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` | `0` | relay 发送 worker 数；`0` 按 CPU 自动计算 |
-| `tunnel.peer-mesh.relay-worker-queue-capacity` | `TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | `10000` | relay 发送有界队列容量 |
-| `tunnel.peer-mesh.udp-receive-buffer-bytes` | `TUNNEL_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的接收缓冲区 |
-| `tunnel.peer-mesh.udp-send-buffer-bytes` | `TUNNEL_PEER_MESH_UDP_SEND_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的发送缓冲区 |
-| `tunnel.peer-mesh.udp-traffic-class` | `TUNNEL_PEER_MESH_UDP_TRAFFIC_CLASS` | `16` | UDP `IP_TOS` / traffic class；平台不支持时降级继续运行 |
-| `tunnel.peer-mesh.turn-auth-required` | `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | 是否要求 TURN 长期凭证认证 |
-| `tunnel.peer-mesh.turn-realm` | `TUNNEL_PEER_MESH_TURN_REALM` | `shuai-tunnel` | TURN realm |
-| `tunnel.peer-mesh.turn-shared-secret` | `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` | 空 | TURN credential 派生密钥；留空时使用本进程随机密钥 |
-| `tunnel.peer-mesh.turn-credential-ttl-seconds` | `TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | 登录响应中 TURN credential 的有效期 |
+| `specus.peer-mesh.enabled` | `SPECUS_PEER_MESH_ENABLED` | `false` | 总开关 |
+| `specus.peer-mesh.cidr` | `SPECUS_PEER_MESH_CIDR` | `100.96.0.0/11` | 虚拟网段 |
+| `specus.peer-mesh.public-address` | `SPECUS_PEER_MESH_PUBLIC_ADDRESS` | 空 | UDP 探测和 relay 对外地址 |
+| `specus.peer-mesh.stun-turn-port` | `SPECUS_PEER_MESH_STUN_TURN_PORT` | `3478` | 标准 STUN/TURN UDP 主端口 |
+| `specus.peer-mesh.standalone-stun-address` | `SPECUS_PEER_MESH_STANDALONE_STUN_ADDRESS` | 空 | 独立 STUN 域名或 IP；配置后 STUN 与 TURN 使用不同入口 |
+| `specus.peer-mesh.standalone-stun-port` | `SPECUS_PEER_MESH_STANDALONE_STUN_PORT` | `3478` | 独立 STUN 入口端口 |
+| `specus.peer-mesh.standalone-stun-alternate-address` | `SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_ADDRESS` | 空 | 独立 STUN 备用域名或 IP；使用主端口加入备用列表，同时作为 RFC 5780 的 A2 |
+| `specus.peer-mesh.standalone-stun-alternate-port` | `SPECUS_PEER_MESH_STANDALONE_STUN_ALTERNATE_PORT` | `0` | 独立 RFC 5780 的第二端口 P2；`0` 时回退 NAT 探测备用端口 |
+| `specus.peer-mesh.nat-probe-alternate-port` | `SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | `3479` | NAT 辅助探测端口；显式设为 `0` 时使用主端口 + 1 |
+| `specus.peer-mesh.stun-primary-bind-address` | `SPECUS_PEER_MESH_STUN_PRIMARY_BIND_ADDRESS` | 空 | RFC 5780 主地址 A1 的本机绑定 IP |
+| `specus.peer-mesh.stun-alternate-bind-address` | `SPECUS_PEER_MESH_STUN_ALTERNATE_BIND_ADDRESS` | 空 | RFC 5780 备用地址 A2 的本机绑定 IP |
+| `specus.peer-mesh.stun-alternate-public-address` | `SPECUS_PEER_MESH_STUN_ALTERNATE_PUBLIC_ADDRESS` | 空 | RFC 5780 备用公网 IP A2；A1 使用 `public-address` |
+| `specus.peer-mesh.stun-behavior-strict` | `SPECUS_PEER_MESH_STUN_BEHAVIOR_STRICT` | `false` | 四端点配置不完整时是否拒绝启动内置 STUN/TURN |
+| `specus.peer-mesh.public-stun-servers` | `SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS` | 空 | 额外公共 STUN server，逗号分隔，只补充 `srflx` candidate |
+| `specus.peer-mesh.session-ttl-seconds` | `SPECUS_PEER_MESH_SESSION_TTL_SECONDS` | `3600` | peer session 授权有效期 |
+| `specus.peer-mesh.allocation-ttl-seconds` | `SPECUS_PEER_MESH_ALLOCATION_TTL_SECONDS` | `300` | relay allocation 有效期 |
+| `specus.peer-mesh.relay-min-port` / `relay-max-port` | `SPECUS_PEER_MESH_RELAY_MIN_PORT` / `SPECUS_PEER_MESH_RELAY_MAX_PORT` | `49152` / `65535` | TURN relay UDP 分配端口范围 |
+| `specus.peer-mesh.relay-worker-threads` | `SPECUS_PEER_MESH_RELAY_WORKER_THREADS` | `0` | relay 发送 worker 数；`0` 按 CPU 自动计算 |
+| `specus.peer-mesh.relay-worker-queue-capacity` | `SPECUS_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | `10000` | relay 发送有界队列容量 |
+| `specus.peer-mesh.udp-receive-buffer-bytes` | `SPECUS_PEER_MESH_UDP_RECEIVE_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的接收缓冲区 |
+| `specus.peer-mesh.udp-send-buffer-bytes` | `SPECUS_PEER_MESH_UDP_SEND_BUFFER_BYTES` | `4194304` | STUN/TURN 与 allocation socket 请求的发送缓冲区 |
+| `specus.peer-mesh.udp-traffic-class` | `SPECUS_PEER_MESH_UDP_TRAFFIC_CLASS` | `16` | UDP `IP_TOS` / traffic class；平台不支持时降级继续运行 |
+| `specus.peer-mesh.turn-auth-required` | `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED` | `true` | 是否要求 TURN 长期凭证认证 |
+| `specus.peer-mesh.turn-realm` | `SPECUS_PEER_MESH_TURN_REALM` | `specus` | TURN realm |
+| `specus.peer-mesh.turn-shared-secret` | `SPECUS_PEER_MESH_TURN_SHARED_SECRET` | 空 | TURN credential 派生密钥；留空时使用本进程随机密钥 |
+| `specus.peer-mesh.turn-credential-ttl-seconds` | `SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | `3600` | 登录响应中 TURN credential 的有效期 |
 
 客户端配置：
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `peerMeshDevice` | `noop` | 虚拟网卡模式 |
-| `peerMeshTunName` | `shuai0` | 虚拟网卡名 |
+| `peerMeshTunName` | `specus0` | 虚拟网卡名 |
 | `peerMeshMtu` | `1280` | MTU；为 UDP 封装、AES-GCM tag 和公网路径预留空间，配置大于 `1280` 时客户端会归一化 |
 
 `peerMeshDevice` 可选值：
@@ -58,7 +58,7 @@ Peer Mesh 让同一租户/同一用户下的多个客户端组成私有虚拟网
 服务端开启 Peer Mesh 后，客户端 HTTP 登录时会调用 `PeerMeshService.ensureDevice`：
 
 - 按 `tenantId + clientId` 查找或创建设备。
-- 从 `TUNNEL_PEER_MESH_CIDR` 中分配一个 `/32` 虚拟 IP。
+- 从 `SPECUS_PEER_MESH_CIDR` 中分配一个 `/32` 虚拟 IP。
 - 保存客户端上报的 X25519 public key。
 - 更新设备最后在线时间和环境信息。
 
@@ -182,7 +182,7 @@ Peer Mesh 信令复用控制连接的 `MESSAGE_REQUEST` / `MESSAGE_RESPONSE`，`
     {
       "type": "relay",
       "transport": "udp",
-      "address": "tunnel.example.com",
+      "address": "specus.example.com",
       "port": 49152,
       "priority": 10,
       "foundation": "relay",
@@ -268,7 +268,7 @@ relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不
 {
   "type": "device-report",
   "virtualDeviceMode": "linux-tun",
-  "virtualDeviceName": "shuai0",
+  "virtualDeviceName": "specus0",
   "virtualDeviceStatus": "UP",
   "virtualDeviceError": "",
   "natType": "SYMMETRIC_NAT",
@@ -303,12 +303,12 @@ relay 数据由服务端 TURN/relay 转发热路径计入 session，客户端不
 
 服务端开启后监听：
 
-- 主端口：`TUNNEL_PEER_MESH_STUN_TURN_PORT`，默认 `3478/udp`。
-- 备用探测端口：`TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`，默认 `3479/udp`；配置为 `0` 时取主端口 + 1。
+- 主端口：`SPECUS_PEER_MESH_STUN_TURN_PORT`，默认 `3478/udp`。
+- 备用探测端口：`SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT`，默认 `3479/udp`；配置为 `0` 时取主端口 + 1。
 - relay 分配端口：默认 `49152-65535/udp`。
 
 STUN/TURN 控制消息使用标准的二进制 STUN 头、magic cookie、transaction ID 和 TLV attribute，
-不是旧版 `shuai-peer-relay` JSON。内置服务端实现的是项目所需的 RFC STUN/TURN 子集：
+不是旧版 `specus-peer-relay` JSON。内置服务端实现的是项目所需的 RFC STUN/TURN 子集：
 
 - 线格式使用 20 字节 STUN header、magic cookie `0x2112A442`、12 字节 transaction ID；message length
   不含 header，attribute 按 4 字节补齐。基础头和 XOR 地址遵循 STUN RFC 5389/8489 兼容格式，
@@ -340,7 +340,7 @@ TURN 认证默认开启。登录响应下发 `iceUsername`、`iceCredential`、`
 当前长期凭证派生为：`iceUsername` 含过期时间；`iceCredential = Base64Url(HMAC-SHA1(turnSharedSecret,
 iceUsername))`；`MESSAGE-INTEGRITY` 使用 HMAC-SHA1，key 为 `MD5(username + ":" + realm + ":" + credential)`。
 `Allocate`、`Refresh`、`CreatePermission` 受该校验保护；`Send Indication` 依赖已认证创建的 allocation 和
-permission。未配置 `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` 时服务端使用进程内随机密钥，重启后旧凭证失效。
+permission。未配置 `SPECUS_PEER_MESH_TURN_SHARED_SECRET` 时服务端使用进程内随机密钥，重启后旧凭证失效。
 
 客户端必须按 `transaction ID + TURN endpoint` 跟踪上述受保护请求。收到 `401` 或 `438` 时，客户端从
 错误响应更新 `REALM` / `NONCE`，使用新的 transaction ID 和重新计算的 `MESSAGE-INTEGRITY` 最多重试一次；
@@ -356,7 +356,7 @@ permission。未配置 `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` 时服务端使用�
 
 ```json
 {
-  "magic": "shuai-peer-mesh",
+  "magic": "specus-peer-mesh",
   "type": "check",
   "sessionId": 8254181000350692,
   "fromClientId": 1,
@@ -399,9 +399,9 @@ probe 按来源地址和全局窗口限速。非法包只进入聚合计数，�
 
 ```text
 sharedSecret = X25519(localPrivateKey, remotePublicKey)
-salt = SHA256("shuai-peer-mesh\n" + sessionId + "\n" + token + "\n" + min(clientId) + "\n" + max(clientId))
+salt = SHA256("specus-peer-mesh\n" + sessionId + "\n" + token + "\n" + min(clientId) + "\n" + max(clientId))
 prk = HMAC_SHA256(salt, sharedSecret)
-aesKey = HKDF-Expand(prk, "shuai-peer-mesh/aes-gcm/v1", 32)
+aesKey = HKDF-Expand(prk, "specus-peer-mesh/aes-gcm/v1", 32)
 ```
 
 每个授权 session 都产生新的 `sessionId + token`，它们构成数据面的 key epoch。服务端不得复用已关闭或
@@ -424,7 +424,7 @@ aesKey = HKDF-Expand(prk, "shuai-peer-mesh/aes-gcm/v1", 32)
 ```text
 sessionBytes = uint64_be(sessionId)
 trafficPrk = HMAC_SHA256(sessionBytes, aesKey)
-trafficInfo = ASCII("shuai-peer-mesh/spm2/aes-gcm\n"
+trafficInfo = ASCII("specus-peer-mesh/spm2/aes-gcm\n"
                     + sessionId + "\n" + fromClientId + "\n" + toClientId)
 T1 = HMAC_SHA256(trafficPrk, trafficInfo || 0x01)
 trafficKey = T1[0..31]
@@ -508,8 +508,8 @@ TURN 为 Peer Mesh 专用模式：CreatePermission、ChannelBind、Send Indicati
 绑定建立前或刷新期间使用 Send/Data Indication。
 
 Java relay 使用有界 worker 队列；拒绝、发送失败、队列深度和高水位分别暴露为
-`tunnel.peer_mesh.turn.relay.queue.dropped`、`tunnel.peer_mesh.turn.relay.send.failures`、
-`tunnel.peer_mesh.turn.relay.queue.depth`、`tunnel.peer_mesh.turn.relay.queue.high.water`。
+`specus.peer_mesh.turn.relay.queue.dropped`、`specus.peer_mesh.turn.relay.send.failures`、
+`specus.peer_mesh.turn.relay.queue.depth`、`specus.peer_mesh.turn.relay.queue.high.water`。
 relay 流量先交换到事务批次，提交失败会恢复待写字节，并暴露 flush failure、pending bytes 和 lag 指标。
 
 ## 性能基线
@@ -518,7 +518,7 @@ Java codec 提供可重复的 JMH 基准，覆盖 SPM2 的 64/512/1200 字节 en
 
 ```powershell
 mvn -f implementations/java/client/pom.xml -Ppeer-mesh-benchmark package -DskipTests
-java -jar implementations/java/client/target/tunnel-client-1.0.0-SNAPSHOT-benchmarks.jar `
+java -jar implementations/java/client/target/specus-client-1.0.0-SNAPSHOT-benchmarks.jar `
   PeerDataFrameCodecBenchmark -prof gc -wi 3 -i 5 -f 1
 ```
 

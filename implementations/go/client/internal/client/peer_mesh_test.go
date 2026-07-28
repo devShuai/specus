@@ -21,7 +21,7 @@ func TestPeerMeshAnnounceCandidatesIncludesServerReflexive(t *testing.T) {
 	var sent peerControlMessage
 	var toClientName string
 	mesh := &peerMeshClient{
-		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "specus0"},
 		logger: log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
 			Enabled:         true,
@@ -87,7 +87,7 @@ func TestPeerMeshAnnounceCandidatesReusesExistingSession(t *testing.T) {
 	sessionID := int64(9001)
 	expiresAt := time.Now().Add(time.Hour).UTC()
 	mesh := &peerMeshClient{
-		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "specus0"},
 		logger: log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
 			Enabled:         true,
@@ -146,7 +146,7 @@ func TestPeerMeshStartLightweightRefreshPreservesRosterAndSession(t *testing.T) 
 		CIDR:            "100.96.0.0/11",
 		ClientPublicKey: "local-key",
 	}}
-	mesh := newPeerMeshClient(Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0", PeerMeshMTU: 1280}, log.New(io.Discard, "", 0))
+	mesh := newPeerMeshClient(Config{PeerMeshDevice: "noop", PeerMeshTunName: "specus0", PeerMeshMTU: 1280}, log.New(io.Discard, "", 0))
 	sender := func(_ net.Conn, _ string, message any) error {
 		if cast, ok := message.(peerControlMessage); ok {
 			sent = append(sent, cast)
@@ -968,7 +968,7 @@ func TestCandidateReciprocationThrottlesPerPeer(t *testing.T) {
 	var sentCount int
 	var mu sync.Mutex
 	mesh := &peerMeshClient{
-		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "specus0"},
 		logger: log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
 			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",
@@ -1017,7 +1017,7 @@ func TestCandidateReciprocationSkipsHealthyDirect(t *testing.T) {
 	var sentCount int
 	now := time.Now()
 	mesh := &peerMeshClient{
-		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "specus0"},
 		logger: log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
 			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",
@@ -1062,7 +1062,7 @@ func TestScheduleHolePunchRetriesStopsOnHealthyDirect(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 	mesh := &peerMeshClient{
-		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "specus0"},
 		logger: log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
 			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",
@@ -1116,7 +1116,7 @@ func TestScheduleHolePunchRetriesDoesNotReschedule(t *testing.T) {
 	sessionID := int64(7002)
 	now := time.Now()
 	mesh := &peerMeshClient{
-		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "shuai0"},
+		config: Config{PeerMeshDevice: "noop", PeerMeshTunName: "specus0"},
 		logger: log.New(io.Discard, "", 0),
 		runtime: RuntimeConfig{PeerMesh: PeerMeshConfig{
 			Enabled: true, ClientID: 1, ClientName: "go-a", VirtualIP: "100.96.0.1",

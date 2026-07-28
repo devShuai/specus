@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tunnel.devshuai.com/schemas/client-auth-login.schema.json",
-  "title": "shuai-tunnel 客户端 HTTP 登录",
+  "$id": "https://specus.devshuai.com/schemas/client-auth-login.schema.json",
+  "title": "specus 客户端 HTTP 登录",
   "description": "POST /api/client/auth/login 的请求和响应字段约束。",
   "oneOf": [
     {
@@ -93,7 +93,7 @@
       "properties": {
         "machineFingerprint": {
           "$ref": "#/$defs/NonEmptyString",
-          "description": "机器稳定指纹，优先来自用户目录 .shuai-tunnel/machine-id。"
+          "description": "机器稳定指纹，优先来自用户目录 .specus/machine-id。"
         },
         "hostname": {
           "type": "string"
@@ -186,24 +186,24 @@
         }
       }
     },
-    "TunnelEndpoint": {
+    "SpecusEndpoint": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "port",
-        "tunnelAddress",
-        "tunnelPort"
+        "specusAddress",
+        "specusPort"
       ],
       "properties": {
         "port": {
           "$ref": "#/$defs/Port",
           "description": "服务端公网监听端口。"
         },
-        "tunnelAddress": {
+        "specusAddress": {
           "$ref": "#/$defs/NonEmptyString",
           "description": "客户端侧目标地址。"
         },
-        "tunnelPort": {
+        "specusPort": {
           "$ref": "#/$defs/Port",
           "description": "客户端侧目标端口。"
         }
@@ -347,8 +347,8 @@
         "maxOnlineInstances",
         "policy",
         "peerMesh",
-        "tunnelConfigList",
-        "httpTunnelConfigList"
+        "specusConfigList",
+        "httpSpecusConfigList"
       ],
       "properties": {
         "tenantId": {
@@ -387,13 +387,13 @@
         "peerMesh": {
           "$ref": "#/$defs/PeerMeshConfig"
         },
-        "tunnelConfigList": {
+        "specusConfigList": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/TunnelEndpoint"
+            "$ref": "#/$defs/SpecusEndpoint"
           }
         },
-        "httpTunnelConfigList": {
+        "httpSpecusConfigList": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/HttpRouteEndpoint"

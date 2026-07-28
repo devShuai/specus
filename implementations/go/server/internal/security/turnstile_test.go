@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
 )
 
 func TestTurnstileVerifierValidatesActionAndHostname(t *testing.T) {
@@ -19,13 +19,13 @@ func TestTurnstileVerifierValidatesActionAndHostname(t *testing.T) {
 		}
 		received = r.Form
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"success":true,"action":"login","hostname":"tunnel.example.com"}`))
+		_, _ = w.Write([]byte(`{"success":true,"action":"login","hostname":"specus.example.com"}`))
 	}))
 	defer server.Close()
 
 	verifier := NewTurnstileVerifier(config.TurnstileConfig{
 		Enabled: true, SiteKey: "site", SecretKey: "secret", VerifyURL: server.URL,
-		AllowedHostnames: []string{"tunnel.example.com"},
+		AllowedHostnames: []string{"specus.example.com"},
 	})
 	if err := verifier.Verify(context.Background(), "browser-token", TurnstileActionLogin); err != nil {
 		t.Fatalf("verify valid response: %v", err)
@@ -46,7 +46,7 @@ func TestTurnstileVerifierRejectsUnexpectedHostname(t *testing.T) {
 	defer server.Close()
 	verifier := NewTurnstileVerifier(config.TurnstileConfig{
 		Enabled: true, SiteKey: "site", SecretKey: "secret", VerifyURL: server.URL,
-		AllowedHostnames: []string{"tunnel.example.com"},
+		AllowedHostnames: []string{"specus.example.com"},
 	})
 	if err := verifier.Verify(context.Background(), "token", TurnstileActionLogin); !errors.Is(err, ErrTurnstileRejected) {
 		t.Fatalf("error = %v, want rejected", err)

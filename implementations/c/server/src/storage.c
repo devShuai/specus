@@ -105,7 +105,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
-        "CREATE TABLE IF NOT EXISTS tunnel_management_user ("
+        "CREATE TABLE IF NOT EXISTS specus_management_user ("
         "username TEXT PRIMARY KEY,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
         "password_hash TEXT NOT NULL,"
@@ -114,7 +114,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
-        "CREATE TABLE IF NOT EXISTS tunnel_client_credential ("
+        "CREATE TABLE IF NOT EXISTS specus_client_credential ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
         "owner_username TEXT,"
@@ -138,7 +138,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
-        "CREATE TABLE IF NOT EXISTS tunnel_client_identity ("
+        "CREATE TABLE IF NOT EXISTS specus_client_identity ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
         "credential_id INTEGER NOT NULL,"
@@ -151,7 +151,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         "UNIQUE(credential_id, machine_fingerprint, os_user)"
         ");"
-        "CREATE TABLE IF NOT EXISTS tunnel_client_session ("
+        "CREATE TABLE IF NOT EXISTS specus_client_session ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
         "credential_id INTEGER NOT NULL,"
@@ -181,7 +181,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "channel_id TEXT,"
         "remote_address TEXT"
         ");"
-        "CREATE TABLE IF NOT EXISTS tunnel_mapping ("
+        "CREATE TABLE IF NOT EXISTS specus_mapping ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "client_name TEXT NOT NULL,"
         "listen_port INTEGER NOT NULL,"
@@ -283,7 +283,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "relay_bytes INTEGER NOT NULL DEFAULT 0,"
         "last_traffic_at TEXT"
         ");"
-        "CREATE TABLE IF NOT EXISTS tunnel_http_traffic_exchange ("
+        "CREATE TABLE IF NOT EXISTS specus_http_traffic_exchange ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
         "client_id INTEGER NOT NULL,"
@@ -314,7 +314,7 @@ int st_storage_init(const char *path, int seed_demo_client)
         "response_truncated INTEGER NOT NULL DEFAULT 0,"
         "captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
-        "CREATE TABLE IF NOT EXISTS tunnel_tcp_traffic_frame ("
+        "CREATE TABLE IF NOT EXISTS specus_tcp_traffic_frame ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "tenant_id TEXT NOT NULL DEFAULT 'default',"
         "client_id INTEGER NOT NULL,"
@@ -370,25 +370,25 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "client_account", "owner_username", "TEXT NOT NULL DEFAULT 'admin'");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_management_user", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
+        rc = add_column_if_missing(db, "specus_management_user", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_management_user", "password_hash", "TEXT NOT NULL DEFAULT ''");
+        rc = add_column_if_missing(db, "specus_management_user", "password_hash", "TEXT NOT NULL DEFAULT ''");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_management_user", "role", "TEXT NOT NULL DEFAULT 'USER'");
+        rc = add_column_if_missing(db, "specus_management_user", "role", "TEXT NOT NULL DEFAULT 'USER'");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_management_user", "enabled", "INTEGER NOT NULL DEFAULT 1");
+        rc = add_column_if_missing(db, "specus_management_user", "enabled", "INTEGER NOT NULL DEFAULT 1");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_management_user", "created_at", "TEXT");
+        rc = add_column_if_missing(db, "specus_management_user", "created_at", "TEXT");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_management_user", "updated_at", "TEXT");
+        rc = add_column_if_missing(db, "specus_management_user", "updated_at", "TEXT");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_mapping", "detail_capture_enabled", "INTEGER NOT NULL DEFAULT 0");
+        rc = add_column_if_missing(db, "specus_mapping", "detail_capture_enabled", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "http_route_mapping", "detail_capture_enabled", "INTEGER NOT NULL DEFAULT 0");
@@ -397,19 +397,19 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = add_column_if_missing(db, "http_route_mapping", "path_rewrite_enabled", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_client_session", "message_send_capable", "INTEGER NOT NULL DEFAULT 0");
+        rc = add_column_if_missing(db, "specus_client_session", "message_send_capable", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_client_session", "message_receive_capable", "INTEGER NOT NULL DEFAULT 0");
+        rc = add_column_if_missing(db, "specus_client_session", "message_receive_capable", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_client_session", "message_attachments_capable", "INTEGER NOT NULL DEFAULT 0");
+        rc = add_column_if_missing(db, "specus_client_session", "message_attachments_capable", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_client_session", "message_media_preview_capable", "INTEGER NOT NULL DEFAULT 0");
+        rc = add_column_if_missing(db, "specus_client_session", "message_media_preview_capable", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
-        rc = add_column_if_missing(db, "tunnel_client_session", "message_max_attachment_bytes", "INTEGER NOT NULL DEFAULT 0");
+        rc = add_column_if_missing(db, "specus_client_session", "message_max_attachment_bytes", "INTEGER NOT NULL DEFAULT 0");
     }
     if (rc == 0) {
         rc = add_column_if_missing(db, "connection_record", "tenant_id", "TEXT NOT NULL DEFAULT 'default'");
@@ -457,23 +457,23 @@ int st_storage_init(const char *path, int seed_demo_client)
         rc = exec_sql(db,
             "CREATE INDEX IF NOT EXISTS idx_connection_record_tenant ON connection_record(tenant_id);"
             "CREATE INDEX IF NOT EXISTS idx_connection_record_tenant_client_time ON connection_record(tenant_id, client_id, connected_at);"
-            "CREATE INDEX IF NOT EXISTS idx_http_traffic_tenant ON tunnel_http_traffic_exchange(tenant_id);"
-            "CREATE INDEX IF NOT EXISTS idx_http_traffic_client ON tunnel_http_traffic_exchange(client_id);"
-            "CREATE INDEX IF NOT EXISTS idx_http_traffic_route ON tunnel_http_traffic_exchange(route);"
-            "CREATE INDEX IF NOT EXISTS idx_http_traffic_body_type ON tunnel_http_traffic_exchange(response_body_type);"
-            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_tenant ON tunnel_tcp_traffic_frame(tenant_id);"
-            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_client ON tunnel_tcp_traffic_frame(client_id);"
-            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_port ON tunnel_tcp_traffic_frame(listen_port);"
-            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_stream ON tunnel_tcp_traffic_frame(tenant_id, channel_id, frame_direction, stream_offset);"
-            "CREATE INDEX IF NOT EXISTS idx_client_credential_tenant ON tunnel_client_credential(tenant_id);"
-            "CREATE INDEX IF NOT EXISTS idx_client_credential_owner ON tunnel_client_credential(tenant_id, owner_username);"
+            "CREATE INDEX IF NOT EXISTS idx_http_traffic_tenant ON specus_http_traffic_exchange(tenant_id);"
+            "CREATE INDEX IF NOT EXISTS idx_http_traffic_client ON specus_http_traffic_exchange(client_id);"
+            "CREATE INDEX IF NOT EXISTS idx_http_traffic_route ON specus_http_traffic_exchange(route);"
+            "CREATE INDEX IF NOT EXISTS idx_http_traffic_body_type ON specus_http_traffic_exchange(response_body_type);"
+            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_tenant ON specus_tcp_traffic_frame(tenant_id);"
+            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_client ON specus_tcp_traffic_frame(client_id);"
+            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_port ON specus_tcp_traffic_frame(listen_port);"
+            "CREATE INDEX IF NOT EXISTS idx_tcp_traffic_stream ON specus_tcp_traffic_frame(tenant_id, channel_id, frame_direction, stream_offset);"
+            "CREATE INDEX IF NOT EXISTS idx_client_credential_tenant ON specus_client_credential(tenant_id);"
+            "CREATE INDEX IF NOT EXISTS idx_client_credential_owner ON specus_client_credential(tenant_id, owner_username);"
             "CREATE INDEX IF NOT EXISTS idx_client_download_impl ON client_download_link(implementation);"
             "CREATE INDEX IF NOT EXISTS idx_client_download_order ON client_download_link(display_order);"
-            "CREATE INDEX IF NOT EXISTS idx_client_identity_tenant ON tunnel_client_identity(tenant_id);"
-            "CREATE INDEX IF NOT EXISTS idx_client_identity_client ON tunnel_client_identity(client_id);"
-            "CREATE INDEX IF NOT EXISTS idx_client_session_token ON tunnel_client_session(token_hash);"
-            "CREATE INDEX IF NOT EXISTS idx_client_session_credential_status ON tunnel_client_session(credential_id, status);"
-            "CREATE INDEX IF NOT EXISTS idx_client_session_machine_status ON tunnel_client_session(credential_id, machine_fingerprint, os_user, status);"
+            "CREATE INDEX IF NOT EXISTS idx_client_identity_tenant ON specus_client_identity(tenant_id);"
+            "CREATE INDEX IF NOT EXISTS idx_client_identity_client ON specus_client_identity(client_id);"
+            "CREATE INDEX IF NOT EXISTS idx_client_session_token ON specus_client_session(token_hash);"
+            "CREATE INDEX IF NOT EXISTS idx_client_session_credential_status ON specus_client_session(credential_id, status);"
+            "CREATE INDEX IF NOT EXISTS idx_client_session_machine_status ON specus_client_session(credential_id, machine_fingerprint, os_user, status);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_acl_source ON peer_mesh_acl(tenant_id, source_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_acl_target ON peer_mesh_acl(tenant_id, target_client_id);"
             "CREATE INDEX IF NOT EXISTS idx_peer_mesh_acl_owner ON peer_mesh_acl(tenant_id, owner_username);"
@@ -1024,11 +1024,11 @@ int st_storage_list_clients(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
         "connection_limit_per_minute, created_at, updated_at, "
-        "COALESCE((SELECT message_send_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_receive_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_attachments_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_media_preview_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_max_attachment_bytes FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
+        "COALESCE((SELECT message_send_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_receive_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_attachments_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_media_preview_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_max_attachment_bytes FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account ORDER BY client_name",
         -1,
         &stmt,
@@ -1060,11 +1060,11 @@ int st_storage_get_client(const char *path, long long id, st_storage_client *cli
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
         "connection_limit_per_minute, created_at, updated_at, "
-        "COALESCE((SELECT message_send_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_receive_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_attachments_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_media_preview_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_max_attachment_bytes FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
+        "COALESCE((SELECT message_send_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_receive_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_attachments_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_media_preview_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_max_attachment_bytes FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE rowid = ?",
         -1,
         &stmt,
@@ -1091,11 +1091,11 @@ int st_storage_get_client_by_name(const char *path, const char *client_name, st_
     int rc = sqlite3_prepare_v2(db,
         "SELECT rowid, tenant_id, client_name, owner_username, enabled, "
         "connection_limit_per_minute, created_at, updated_at, "
-        "COALESCE((SELECT message_send_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_receive_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_attachments_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_media_preview_capable FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
-        "COALESCE((SELECT message_max_attachment_bytes FROM tunnel_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
+        "COALESCE((SELECT message_send_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_receive_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_attachments_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_media_preview_capable FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0), "
+        "COALESCE((SELECT message_max_attachment_bytes FROM specus_client_session s WHERE s.client_id = client_account.rowid ORDER BY s.id DESC LIMIT 1), 0) "
         "FROM client_account WHERE client_name = ?",
         -1,
         &stmt,
@@ -1125,9 +1125,9 @@ int st_storage_list_management_users(const char *path,
     }
     const char *sql = tenant_id != NULL && *tenant_id != '\0'
         ? "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-          "FROM tunnel_management_user WHERE tenant_id = ? ORDER BY lower(username)"
+          "FROM specus_management_user WHERE tenant_id = ? ORDER BY lower(username)"
         : "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-          "FROM tunnel_management_user ORDER BY tenant_id, lower(username)";
+          "FROM specus_management_user ORDER BY tenant_id, lower(username)";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
@@ -1161,7 +1161,7 @@ int st_storage_get_management_user(const char *path,
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
         "SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at "
-        "FROM tunnel_management_user WHERE lower(username) = lower(?)",
+        "FROM specus_management_user WHERE lower(username) = lower(?)",
         -1,
         &stmt,
         NULL);
@@ -1197,7 +1197,7 @@ int st_storage_create_management_user(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO tunnel_management_user(username, tenant_id, password_hash, role, enabled, created_at, updated_at) "
+        "INSERT INTO specus_management_user(username, tenant_id, password_hash, role, enabled, created_at, updated_at) "
         "VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         -1,
         &stmt,
@@ -1233,7 +1233,7 @@ int st_storage_update_management_user(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "UPDATE tunnel_management_user SET "
+        "UPDATE specus_management_user SET "
         "password_hash = COALESCE(?, password_hash), "
         "role = COALESCE(?, role), "
         "enabled = ?, updated_at = CURRENT_TIMESTAMP "
@@ -1274,7 +1274,7 @@ int st_storage_delete_management_user(const char *path, const char *username)
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "DELETE FROM tunnel_management_user WHERE lower(username) = lower(?)",
+        "DELETE FROM specus_management_user WHERE lower(username) = lower(?)",
         -1,
         &stmt,
         NULL);
@@ -1301,7 +1301,7 @@ int st_storage_get_client_credential_by_api_key(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, owner_username, api_key, secret_hash, enabled, "
         "max_online_instances, created_at, updated_at "
-        "FROM tunnel_client_credential WHERE api_key = ?",
+        "FROM specus_client_credential WHERE api_key = ?",
         -1,
         &stmt,
         NULL);
@@ -1329,7 +1329,7 @@ int st_storage_get_client_credential(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, owner_username, api_key, secret_hash, enabled, "
         "max_online_instances, created_at, updated_at "
-        "FROM tunnel_client_credential WHERE id = ?",
+        "FROM specus_client_credential WHERE id = ?",
         -1,
         &stmt,
         NULL);
@@ -1360,7 +1360,7 @@ int st_storage_list_client_credentials(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, owner_username, api_key, secret_hash, enabled, "
         "max_online_instances, created_at, updated_at "
-        "FROM tunnel_client_credential WHERE tenant_id = ? ORDER BY id DESC",
+        "FROM specus_client_credential WHERE tenant_id = ? ORDER BY id DESC",
         -1,
         &stmt,
         NULL);
@@ -1410,7 +1410,7 @@ int st_storage_upsert_client_credential(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     const char *sql_insert =
-        "INSERT INTO tunnel_client_credential(tenant_id, owner_username, api_key, secret_hash, enabled, max_online_instances, created_at, updated_at) "
+        "INSERT INTO specus_client_credential(tenant_id, owner_username, api_key, secret_hash, enabled, max_online_instances, created_at, updated_at) "
         "VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) "
         "ON CONFLICT(api_key) DO UPDATE SET "
         "tenant_id = excluded.tenant_id,"
@@ -1420,7 +1420,7 @@ int st_storage_upsert_client_credential(const char *path,
         "max_online_instances = excluded.max_online_instances,"
         "updated_at = CURRENT_TIMESTAMP";
     const char *sql_update =
-        "UPDATE tunnel_client_credential SET tenant_id = ?, owner_username = ?, api_key = ?, secret_hash = ?, "
+        "UPDATE specus_client_credential SET tenant_id = ?, owner_username = ?, api_key = ?, secret_hash = ?, "
         "enabled = ?, max_online_instances = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?";
     int rc = sqlite3_prepare_v2(db, id > 0 ? sql_update : sql_insert, -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
@@ -1456,7 +1456,7 @@ int st_storage_delete_client_credential(const char *path, long long id)
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "DELETE FROM tunnel_client_credential WHERE id = ?",
+        "DELETE FROM specus_client_credential WHERE id = ?",
         -1,
         &stmt,
         NULL);
@@ -1713,7 +1713,7 @@ static int load_identity_by_machine(sqlite3 *db,
     int rc = sqlite3_prepare_v2(db,
         "SELECT id, tenant_id, credential_id, client_id, client_name, machine_fingerprint, os_user, "
         "hostname, first_seen_at, last_seen_at "
-        "FROM tunnel_client_identity WHERE credential_id = ? AND machine_fingerprint = ? AND os_user = ?",
+        "FROM specus_client_identity WHERE credential_id = ? AND machine_fingerprint = ? AND os_user = ?",
         -1,
         &stmt,
         NULL);
@@ -1743,7 +1743,7 @@ int st_storage_find_or_create_client_identity(const char *path,
     if (load_identity_by_machine(db, credential->id, machine_fingerprint, os_user, identity) == 0) {
         sqlite3_stmt *update = NULL;
         int rc = sqlite3_prepare_v2(db,
-            "UPDATE tunnel_client_identity SET hostname = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE specus_client_identity SET hostname = ?, last_seen_at = CURRENT_TIMESTAMP WHERE id = ?",
             -1,
             &update,
             NULL);
@@ -1792,7 +1792,7 @@ int st_storage_find_or_create_client_identity(const char *path,
 
     sqlite3_stmt *identity_stmt = NULL;
     rc = sqlite3_prepare_v2(db,
-        "INSERT INTO tunnel_client_identity(tenant_id, credential_id, client_id, client_name, machine_fingerprint, os_user, hostname, first_seen_at, last_seen_at) "
+        "INSERT INTO specus_client_identity(tenant_id, credential_id, client_id, client_name, machine_fingerprint, os_user, hostname, first_seen_at, last_seen_at) "
         "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         -1,
         &identity_stmt,
@@ -1829,7 +1829,7 @@ int st_storage_close_http_authenticated_sessions(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "UPDATE tunnel_client_session SET status = 'DISCONNECTED', disconnected_at = ? "
+        "UPDATE specus_client_session SET status = 'DISCONNECTED', disconnected_at = ? "
         "WHERE credential_id = ? AND machine_fingerprint = ? AND os_user = ? AND status = 'HTTP_AUTHENTICATED'",
         -1,
         &stmt,
@@ -1861,7 +1861,7 @@ static int load_client_session_by_id(const char *path, long long id, st_storage_
         "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
         "message_media_preview_capable, message_max_attachment_bytes, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address "
-        "FROM tunnel_client_session WHERE id = ?",
+        "FROM specus_client_session WHERE id = ?",
         -1,
         &stmt,
         NULL);
@@ -1887,7 +1887,7 @@ int st_storage_create_client_session(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO tunnel_client_session(tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status, "
+        "INSERT INTO specus_client_session(tenant_id, credential_id, identity_id, client_id, client_name, token_hash, status, "
         "machine_fingerprint, os_user, hostname, os_name, os_version, os_arch, client_version, java_version, local_addresses, "
         "message_send_capable, message_receive_capable, message_attachments_capable, message_media_preview_capable, "
         "message_max_attachment_bytes, http_login_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1947,7 +1947,7 @@ int st_storage_get_client_session_for_login(const char *path,
         "local_addresses, message_send_capable, message_receive_capable, message_attachments_capable, "
         "message_media_preview_capable, message_max_attachment_bytes, http_login_at, netty_connected_at, "
         "disconnected_at, expires_at, channel_id, remote_address "
-        "FROM tunnel_client_session WHERE id = ? AND token_hash = ?",
+        "FROM specus_client_session WHERE id = ? AND token_hash = ?",
         -1,
         &stmt,
         NULL);
@@ -2012,7 +2012,7 @@ int st_storage_count_online_sessions_by_machine(const char *path,
                                                 int *count)
 {
     return count_online_client_sessions(path,
-        "SELECT COUNT(*) FROM tunnel_client_session "
+        "SELECT COUNT(*) FROM specus_client_session "
         "WHERE credential_id = ? AND machine_fingerprint = ? AND os_user = ? "
         "AND id <> ? AND status = 'NETTY_ONLINE'",
         credential_id,
@@ -2028,7 +2028,7 @@ int st_storage_count_online_sessions_by_credential(const char *path,
                                                    int *count)
 {
     return count_online_client_sessions(path,
-        "SELECT COUNT(*) FROM tunnel_client_session "
+        "SELECT COUNT(*) FROM specus_client_session "
         "WHERE credential_id = ? AND id <> ? AND status = 'NETTY_ONLINE'",
         credential_id,
         NULL,
@@ -2049,7 +2049,7 @@ int st_storage_mark_client_session_online(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "UPDATE tunnel_client_session SET status = 'NETTY_ONLINE', netty_connected_at = ?, "
+        "UPDATE specus_client_session SET status = 'NETTY_ONLINE', netty_connected_at = ?, "
         "disconnected_at = NULL, channel_id = ?, remote_address = ? WHERE id = ?",
         -1,
         &stmt,
@@ -2089,7 +2089,7 @@ int st_storage_mark_client_session_disconnected(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "UPDATE tunnel_client_session SET status = 'DISCONNECTED', disconnected_at = COALESCE(disconnected_at, ?) "
+        "UPDATE specus_client_session SET status = 'DISCONNECTED', disconnected_at = COALESCE(disconnected_at, ?) "
         "WHERE id = ?",
         -1,
         &stmt,
@@ -2116,7 +2116,7 @@ int st_storage_close_client_sessions_by_status(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "UPDATE tunnel_client_session SET status = 'DISCONNECTED', disconnected_at = COALESCE(disconnected_at, ?) "
+        "UPDATE specus_client_session SET status = 'DISCONNECTED', disconnected_at = COALESCE(disconnected_at, ?) "
         "WHERE status = ?",
         -1,
         &stmt,
@@ -2181,7 +2181,7 @@ int st_storage_upsert_client(const char *path,
         sqlite3_finalize(stmt);
         if (rc == 0 && has_existing && strcmp(existing.client_name, client_name) != 0) {
             rc = sqlite3_prepare_v2(db,
-                "UPDATE tunnel_mapping SET client_name = ?, updated_at = CURRENT_TIMESTAMP WHERE client_name = ?",
+                "UPDATE specus_mapping SET client_name = ?, updated_at = CURRENT_TIMESTAMP WHERE client_name = ?",
                 -1,
                 &stmt,
                 NULL);
@@ -2247,7 +2247,7 @@ int st_storage_delete_client(const char *path, long long id)
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, "DELETE FROM tunnel_mapping WHERE client_name = ?", -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE client_name = ?", -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, client.client_name, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : -1;
@@ -2294,7 +2294,7 @@ int st_storage_load_mappings(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "SELECT m.id, c.rowid, m.client_name, m.listen_port, m.target_address, m.target_port, "
         "m.enabled, m.detail_capture_enabled, m.created_at, m.updated_at "
-        "FROM tunnel_mapping m JOIN client_account c ON c.client_name = m.client_name "
+        "FROM specus_mapping m JOIN client_account c ON c.client_name = m.client_name "
         "WHERE m.client_name = ? AND m.enabled = 1 ORDER BY m.listen_port",
         -1,
         &stmt,
@@ -2331,12 +2331,12 @@ int st_storage_list_mappings(const char *path,
     const char *sql_all =
         "SELECT m.id, c.rowid, m.client_name, m.listen_port, m.target_address, m.target_port, "
         "m.enabled, m.detail_capture_enabled, m.created_at, m.updated_at "
-        "FROM tunnel_mapping m JOIN client_account c ON c.client_name = m.client_name "
+        "FROM specus_mapping m JOIN client_account c ON c.client_name = m.client_name "
         "ORDER BY m.id DESC";
     const char *sql_filtered =
         "SELECT m.id, c.rowid, m.client_name, m.listen_port, m.target_address, m.target_port, "
         "m.enabled, m.detail_capture_enabled, m.created_at, m.updated_at "
-        "FROM tunnel_mapping m JOIN client_account c ON c.client_name = m.client_name "
+        "FROM specus_mapping m JOIN client_account c ON c.client_name = m.client_name "
         "WHERE c.rowid = ? ORDER BY m.id DESC";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db, client_id > 0 ? sql_filtered : sql_all, -1, &stmt, NULL);
@@ -2370,7 +2370,7 @@ static int load_mapping_by_id(const char *path, long long id, st_storage_mapping
     int rc = sqlite3_prepare_v2(db,
         "SELECT m.id, c.rowid, m.client_name, m.listen_port, m.target_address, m.target_port, "
         "m.enabled, m.detail_capture_enabled, m.created_at, m.updated_at "
-        "FROM tunnel_mapping m JOIN client_account c ON c.client_name = m.client_name "
+        "FROM specus_mapping m JOIN client_account c ON c.client_name = m.client_name "
         "WHERE m.id = ?",
         -1,
         &stmt,
@@ -2405,7 +2405,7 @@ static int load_mapping_by_client_port(const char *path,
     int rc = sqlite3_prepare_v2(db,
         "SELECT m.id, c.rowid, m.client_name, m.listen_port, m.target_address, m.target_port, "
         "m.enabled, m.detail_capture_enabled, m.created_at, m.updated_at "
-        "FROM tunnel_mapping m JOIN client_account c ON c.client_name = m.client_name "
+        "FROM specus_mapping m JOIN client_account c ON c.client_name = m.client_name "
         "WHERE m.client_name = ? AND m.listen_port = ?",
         -1,
         &stmt,
@@ -2444,7 +2444,7 @@ int st_storage_upsert_mapping(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO tunnel_mapping(client_name, listen_port, target_address, target_port, enabled) "
+        "INSERT INTO specus_mapping(client_name, listen_port, target_address, target_port, enabled) "
         "VALUES(?,?,?,?,?) "
         "ON CONFLICT(client_name, listen_port) DO UPDATE SET "
         "target_address = excluded.target_address,"
@@ -2488,7 +2488,7 @@ int st_storage_create_mapping_for_client(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO tunnel_mapping(client_name, listen_port, target_address, target_port, enabled, detail_capture_enabled) "
+        "INSERT INTO specus_mapping(client_name, listen_port, target_address, target_port, enabled, detail_capture_enabled) "
         "VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(client_name, listen_port) DO UPDATE SET "
         "target_address = excluded.target_address,"
@@ -2533,7 +2533,7 @@ int st_storage_update_mapping_by_id(const char *path,
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "UPDATE tunnel_mapping SET listen_port = ?, target_address = ?, target_port = ?, "
+        "UPDATE specus_mapping SET listen_port = ?, target_address = ?, target_port = ?, "
         "enabled = ?, detail_capture_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         -1,
         &stmt,
@@ -2564,7 +2564,7 @@ int st_storage_delete_mapping_by_id(const char *path, long long id)
         return -1;
     }
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, "DELETE FROM tunnel_mapping WHERE id = ?", -1, &stmt, NULL);
+    int rc = sqlite3_prepare_v2(db, "DELETE FROM specus_mapping WHERE id = ?", -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_int64(stmt, 1, id);
         rc = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;
@@ -4455,7 +4455,7 @@ int st_storage_record_http_exchange(const char *path, const st_storage_http_exch
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO tunnel_http_traffic_exchange("
+        "INSERT INTO specus_http_traffic_exchange("
         "tenant_id, client_id, client_name, route, resource_id, resource_name, method, relative_path, raw_query, "
         "status_code, success, error, remote_address, request_bytes, response_bytes, elapsed_ms, "
         "request_content_type, response_content_type, response_body_type, request_headers, response_headers, "
@@ -4830,7 +4830,7 @@ int st_storage_list_http_exchanges_visible(const char *path,
     char sql[8192];
     written = snprintf(sql,
                        sizeof(sql),
-                       "SELECT COUNT(*) FROM tunnel_http_traffic_exchange h "
+                       "SELECT COUNT(*) FROM specus_http_traffic_exchange h "
                        "JOIN client_account c ON c.rowid = h.client_id%s",
                        where);
     if (written < 0 || (size_t)written >= sizeof(sql)) {
@@ -4865,7 +4865,7 @@ int st_storage_list_http_exchanges_visible(const char *path,
                        "h.request_headers, h.response_headers, h.request_preview_hex, h.request_preview_text, "
                        "h.response_preview_hex, h.response_preview_text, h.request_truncated, "
                        "h.response_truncated, h.captured_at "
-                       "FROM tunnel_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id%s "
+                       "FROM specus_http_traffic_exchange h JOIN client_account c ON c.rowid = h.client_id%s "
                        "ORDER BY h.id DESC LIMIT ? OFFSET ?",
                        where);
     if (written < 0 || (size_t)written >= sizeof(sql)) {
@@ -4911,7 +4911,7 @@ int st_storage_record_tcp_frame(const char *path, const st_storage_tcp_frame_rec
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "INSERT INTO tunnel_tcp_traffic_frame("
+        "INSERT INTO specus_tcp_traffic_frame("
         "tenant_id, client_id, client_name, listen_port, resource_id, resource_name, channel_id, "
         "frame_direction, remote_address, source_address, source_port, destination_address, destination_port, "
         "stream_offset, stream_end_offset, frame_index, payload_bytes, payload_data, payload_preview_hex, "
@@ -5057,7 +5057,7 @@ static int list_tcp_frames_internal(const char *path,
     char sql[2048];
     int written = snprintf(sql,
                            sizeof(sql),
-                           "SELECT COUNT(*) FROM tunnel_tcp_traffic_frame f "
+                           "SELECT COUNT(*) FROM specus_tcp_traffic_frame f "
                            "JOIN client_account c ON c.rowid = f.client_id%s",
                            where);
     if (written < 0 || (size_t)written >= sizeof(sql)) {
@@ -5089,7 +5089,7 @@ static int list_tcp_frames_internal(const char *path,
                        "f.source_port, f.destination_address, f.destination_port, f.stream_offset, "
                        "f.stream_end_offset, f.frame_index, f.payload_bytes, %s, f.payload_preview_hex, "
                        "f.payload_preview_text, f.truncated, f.frame_time "
-                       "FROM tunnel_tcp_traffic_frame f JOIN client_account c ON c.rowid = f.client_id%s "
+                       "FROM specus_tcp_traffic_frame f JOIN client_account c ON c.rowid = f.client_id%s "
                        "ORDER BY %s LIMIT ? OFFSET ?",
                        include_payload ? "f.payload_data" : "NULL",
                        where,
@@ -5173,7 +5173,7 @@ int st_storage_get_tcp_frame_visible(const char *path,
                            "f.source_port, f.destination_address, f.destination_port, f.stream_offset, "
                            "f.stream_end_offset, f.frame_index, f.payload_bytes, f.payload_data, "
                            "f.payload_preview_hex, f.payload_preview_text, f.truncated, f.frame_time "
-                           "FROM tunnel_tcp_traffic_frame f JOIN client_account c ON c.rowid = f.client_id "
+                           "FROM specus_tcp_traffic_frame f JOIN client_account c ON c.rowid = f.client_id "
                            "WHERE f.id = ? AND c.tenant_id = ?%s",
                            include_all_clients ? "" : " AND c.owner_username = ?");
     if (written < 0 || (size_t)written >= sizeof(sql)) {

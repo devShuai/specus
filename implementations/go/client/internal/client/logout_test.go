@@ -7,15 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/client/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/client/internal/protocol"
 )
 
 func TestHandleLogoutRequestClosesControlConnection(t *testing.T) {
 	local, remote := net.Pipe()
 	defer remote.Close()
 
-	tunnelClient := New(Config{}, log.New(io.Discard, "", 0))
-	if err := tunnelClient.handlePacket(local, protocol.Packet{Command: protocol.CommandLogoutRequest},
+	specusClient := New(Config{}, log.New(io.Discard, "", 0))
+	if err := specusClient.handlePacket(local, protocol.Packet{Command: protocol.CommandLogoutRequest},
 		protocol.ConnectionRoleControl); err != nil {
 		t.Fatalf("handlePacket(LOGOUT_REQUEST) error = %v", err)
 	}

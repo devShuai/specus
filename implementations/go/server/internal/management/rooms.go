@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
+	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
 )
 
 // Public-transfer room endpoints, aligned with the Java PublicTransferRoomResource (S-3).

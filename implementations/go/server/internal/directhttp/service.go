@@ -15,8 +15,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 const (
@@ -33,7 +33,7 @@ var skippedHeaders = map[string]struct{}{
 	"trailer": {}, "transfer-encoding": {}, "upgrade": {},
 }
 
-// wsSkippedHeaders 在 WS 升级请求上额外跳过握手头（对齐 Java WebSocketTunnelHandshakeInterceptor）。
+// wsSkippedHeaders 在 WS 升级请求上额外跳过握手头（对齐 Java WebSocketSpecusHandshakeInterceptor）。
 var wsSkippedHeaders = map[string]struct{}{
 	"connection": {}, "content-length": {}, "host": {}, "keep-alive": {},
 	"proxy-authenticate": {}, "proxy-authorization": {}, "te": {},
@@ -56,8 +56,8 @@ type Stream interface {
 // OpenStreamFunc allocates a stream in an authenticated client's NAT namespace.
 type OpenStreamFunc func(clientName string, metadata map[string]any) (Stream, error)
 
-// OpenWSStreamFunc allocates a WebSocket tunnel stream in an authenticated client's NAT namespace.
-type OpenWSStreamFunc func(clientName string, metadata map[string]any, conn *websocket.Conn) (*WebSocketTunnel, error)
+// OpenWSStreamFunc allocates a WebSocket specus stream in an authenticated client's NAT namespace.
+type OpenWSStreamFunc func(clientName string, metadata map[string]any, conn *websocket.Conn) (*WebSocketSpecus, error)
 
 type TrafficRecorder interface {
 	RecordHTTPUpload(clientName, route string, bytes int64)
@@ -107,7 +107,7 @@ func (s *Service) SetReconnectGrace(grace time.Duration) {
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 带 Upgrade: websocket 的 /http/** 请求走 WS 隧道（对齐 Java WebSocketTunnelConfig 的路由分流）。
+	// 带 Upgrade: websocket 的 /http/** 请求走 WS 隧道（对齐 Java WebSocketSpecusConfig 的路由分流）。
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		s.serveWebSocket(w, r)
 		return
@@ -302,7 +302,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		startedAt, r.RemoteAddr)
 }
 
-// serveWebSocket 处理 /http/{clientName}/{route}/** 的 WS 升级请求（对齐 Java WebSocketTunnelHandler）：
+// serveWebSocket 处理 /http/{clientName}/{route}/** 的 WS 升级请求（对齐 Java WebSocketSpecusHandler）：
 // 握手成功后发送带 source=ws metadata 的 OPEN 帧，随后进入浏览器消息的读循环。
 func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientName := r.PathValue("clientName")
@@ -329,12 +329,12 @@ func (s *Service) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		"route": route, "relativePath": relativePath(r), "rawQuery": r.URL.RawQuery,
 		"headers": collectHeaders(r.Header, wsSkippedHeaders), "body": []byte{},
 	}
-	tunnel, err := s.openWS(clientName, metadata, conn)
+	specus, err := s.openWS(clientName, metadata, conn)
 	if err != nil {
 		fail("WS 隧道请求发送失败")
 		return
 	}
-	tunnel.ReadLoop(r.Context())
+	specus.ReadLoop(r.Context())
 }
 
 func (s *Service) clientOnline(ctx context.Context, clientName string) bool {
@@ -489,7 +489,7 @@ func isRewritableContentType(headers []string) bool {
 
 func plainErrorHeaders() []string { return []string{"Content-Type:text/plain;charset=UTF-8"} }
 
-// newWSChannelID 生成 WS 流的 channelId（对齐 Java WebSocketTunnelHandler 的 UUID 随机标识）。
+// newWSChannelID 生成 WS 流的 channelId（对齐 Java WebSocketSpecusHandler 的 UUID 随机标识）。
 func newWSChannelID() string {
 	var raw [16]byte
 	_, _ = rand.Read(raw[:])

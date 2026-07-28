@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/auth"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/wsevents"
+	"github.com/devShuai/specus/implementations/go/server/internal/auth"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/wsevents"
 )
 
 type messageTestSession struct {

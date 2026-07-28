@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/transfer"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/transfer"
 )
 
 // issuePublicTicket posts a public-transfer ws-ticket request and returns the HTTP response.

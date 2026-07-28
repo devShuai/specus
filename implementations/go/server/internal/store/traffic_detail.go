@@ -221,8 +221,8 @@ func (db *DB) HTTPRouteDetailCaptureEnabled(ctx context.Context, clientName, rou
 	return bool(enabled), err
 }
 
-func (db *DB) TunnelDetailCaptureEnabled(ctx context.Context, clientName string, listenPort int) (bool, error) {
-	query := db.rebind(`SELECT detail_capture_enabled FROM tunnel_mapping
+func (db *DB) SpecusDetailCaptureEnabled(ctx context.Context, clientName string, listenPort int) (bool, error) {
+	query := db.rebind(`SELECT detail_capture_enabled FROM specus_mapping
 		WHERE client_name = ? AND listen_port = ?`)
 	var enabled databaseBoolean
 	err := db.sql.QueryRowContext(ctx, query, clientName, listenPort).Scan(&enabled)
@@ -304,7 +304,7 @@ func (db *DB) RecordTCPFrame(ctx context.Context, record TCPFrameRecord) error {
 	enabled, err := db.cachedDetailCaptureDecision(ctx,
 		"tcp:"+record.ClientName+":"+strconv.Itoa(record.ListenPort),
 		func() (bool, error) {
-			return db.TunnelDetailCaptureEnabled(ctx, record.ClientName, record.ListenPort)
+			return db.SpecusDetailCaptureEnabled(ctx, record.ClientName, record.ListenPort)
 		})
 	if err != nil || !enabled {
 		return err
@@ -439,7 +439,7 @@ func (db *DB) InsertHTTPExchange(ctx context.Context, e HTTPTrafficExchange) err
 }
 
 func (db *DB) insertHTTPExchangeDB(ctx context.Context, e HTTPTrafficExchange) error {
-	query := db.rebind(`INSERT INTO tunnel_http_traffic_exchange
+	query := db.rebind(`INSERT INTO specus_http_traffic_exchange
 		(tenant_id, client_id, client_name, route, resource_id, resource_name, method,
 		 relative_path, raw_query, status_code, success, error, remote_address, request_bytes,
 		 response_bytes, elapsed_ms, request_content_type, response_content_type, response_body_type,
@@ -464,7 +464,7 @@ func (db *DB) InsertTCPFrame(ctx context.Context, f TCPTrafficFrame) error {
 }
 
 func (db *DB) insertTCPFrameDB(ctx context.Context, f TCPTrafficFrame) error {
-	query := db.rebind(`INSERT INTO tunnel_tcp_traffic_frame
+	query := db.rebind(`INSERT INTO specus_tcp_traffic_frame
 		(tenant_id, client_id, client_name, listen_port, resource_id, resource_name, channel_id,
 		 frame_direction, remote_address, source_address, source_port, destination_address,
 		 destination_port, stream_offset, stream_end_offset, frame_index, payload_bytes,
@@ -485,7 +485,7 @@ func (db *DB) ListHTTPExchanges(ctx context.Context, filter HTTPExchangeFilter) 
 	}
 	where, args := httpExchangeWhere(filter)
 	var total int
-	if err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM tunnel_http_traffic_exchange`+where), args...).Scan(&total); err != nil {
+	if err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM specus_http_traffic_exchange`+where), args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	size, page := normalizeTrafficPage(filter.Size, filter.Page)
@@ -494,7 +494,7 @@ func (db *DB) ListHTTPExchanges(ctx context.Context, filter HTTPExchangeFilter) 
 		method, relative_path, raw_query, status_code, success, error, remote_address, request_bytes,
 		response_bytes, elapsed_ms, request_content_type, response_content_type, response_body_type,
 		request_truncated, response_truncated, captured_at
-		FROM tunnel_http_traffic_exchange` + where + ` ORDER BY id DESC LIMIT ? OFFSET ?`)
+		FROM specus_http_traffic_exchange` + where + ` ORDER BY id DESC LIMIT ? OFFSET ?`)
 	rows, err := db.sql.QueryContext(ctx, query, listArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -529,7 +529,7 @@ func (db *DB) GetHTTPExchange(
 		response_bytes, elapsed_ms, request_content_type, response_content_type, response_body_type,
 		request_headers, response_headers, request_preview_hex, request_preview_text, response_preview_hex,
 		response_preview_text, request_truncated, response_truncated, captured_at
-		FROM tunnel_http_traffic_exchange` + where + ` ORDER BY id DESC LIMIT 1`)
+		FROM specus_http_traffic_exchange` + where + ` ORDER BY id DESC LIMIT 1`)
 	exchange, err := scanHTTPExchange(db.sql.QueryRowContext(ctx, query, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -543,7 +543,7 @@ func (db *DB) ListTCPFrames(ctx context.Context, filter TCPFrameFilter) ([]TCPTr
 	}
 	where, args := tcpFrameWhere(filter)
 	var total int
-	if err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM tunnel_tcp_traffic_frame`+where), args...).Scan(&total); err != nil {
+	if err := db.sql.QueryRowContext(ctx, db.rebind(`SELECT COUNT(*) FROM specus_tcp_traffic_frame`+where), args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	size, page := normalizeTrafficPage(filter.Size, filter.Page)
@@ -552,7 +552,7 @@ func (db *DB) ListTCPFrames(ctx context.Context, filter TCPFrameFilter) ([]TCPTr
 		channel_id, frame_direction, remote_address, source_address, source_port, destination_address,
 		destination_port, stream_offset, stream_end_offset, frame_index, payload_bytes, payload_data,
 		payload_preview_hex, payload_preview_text, truncated, frame_time
-		FROM tunnel_tcp_traffic_frame` + where + ` ORDER BY id DESC LIMIT ? OFFSET ?`)
+		FROM specus_tcp_traffic_frame` + where + ` ORDER BY id DESC LIMIT ? OFFSET ?`)
 	rows, err := db.sql.QueryContext(ctx, query, listArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -581,7 +581,7 @@ func (db *DB) GetTCPFrame(ctx context.Context, tenantID string, id int64, client
 		channel_id, frame_direction, remote_address, source_address, source_port, destination_address,
 		destination_port, stream_offset, stream_end_offset, frame_index, payload_bytes, payload_data,
 		payload_preview_hex, payload_preview_text, truncated, frame_time
-		FROM tunnel_tcp_traffic_frame` + where + ` ORDER BY id DESC LIMIT 1`)
+		FROM specus_tcp_traffic_frame` + where + ` ORDER BY id DESC LIMIT 1`)
 	frame, err := scanTCPFrame(db.sql.QueryRowContext(ctx, query, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -605,7 +605,7 @@ func (db *DB) ListTCPStream(ctx context.Context, tenantID, channelID string, cli
 		channel_id, frame_direction, remote_address, source_address, source_port, destination_address,
 		destination_port, stream_offset, stream_end_offset, frame_index, payload_bytes, payload_data,
 		payload_preview_hex, payload_preview_text, truncated, frame_time
-		FROM tunnel_tcp_traffic_frame` + where + ` ORDER BY id ASC LIMIT ?`)
+		FROM specus_tcp_traffic_frame` + where + ` ORDER BY id ASC LIMIT ?`)
 	rows, err := db.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -635,7 +635,7 @@ func (db *DB) httpResource(ctx context.Context, account *ClientAccount, route st
 }
 
 func (db *DB) tcpResource(ctx context.Context, account *ClientAccount, listenPort int) (*int64, *string) {
-	query := db.rebind(`SELECT id, listen_port, target_address, target_port FROM tunnel_mapping
+	query := db.rebind(`SELECT id, listen_port, target_address, target_port FROM specus_mapping
 		WHERE client_id = ? AND listen_port = ?`)
 	var id int64
 	var port, targetPort int

@@ -1,5 +1,5 @@
-#ifndef SHUAI_TUNNEL_SECURITY_H
-#define SHUAI_TUNNEL_SECURITY_H
+#ifndef SPECUS_SECURITY_H
+#define SPECUS_SECURITY_H
 
 #include <stddef.h>
 

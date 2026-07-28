@@ -19,8 +19,8 @@ import (
 	"unicode/utf16"
 
 	"github.com/coder/websocket"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/security"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/security"
 )
 
 const (

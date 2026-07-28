@@ -23,7 +23,7 @@ import java.util.Map;
  * magic(4), version(1), serializer(1), command(1), bodyLength(4).
  *
  * <p>Version 2 has one serializer contract: CompactBinary (wire id 4). NAT_MESSAGE keeps a
- * command-specific body, but no longer advertises FastJSON and never wraps tunnel bytes in a
+ * command-specific body, but no longer advertises FastJSON and never wraps specus bytes in a
  * compression envelope.
  */
 public final class PacketCodec {

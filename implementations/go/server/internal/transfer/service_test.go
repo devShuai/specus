@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/config"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/config"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -27,7 +27,7 @@ func TestPublicAttachmentLifecycleValidatesObjectWithHead(t *testing.T) {
 	defer db.Close()
 	objectCfg := config.ObjectStorageConfig{
 		Provider: "aliyun-oss", Endpoint: "https://oss.example.com", Region: "cn-hangzhou", Bucket: "private",
-		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "shuai-tunnel/attachments",
+		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "specus/attachments",
 		UploadURLTTLSeconds: 900, DownloadURLTTLSeconds: 600, RetentionHours: 72,
 		MaxAttachmentBytes: 20,
 	}
@@ -260,7 +260,7 @@ func TestVerifiedOssCallbackCompletesUploadAndClientCompleteIsIdempotent(t *test
 	service := NewService(db, config.ObjectStorageConfig{
 		Provider: "aliyun-oss", Endpoint: "oss.example.com", Region: "cn-hangzhou", Bucket: "private",
 		AccessKeyID: "key", AccessKeySecret: "secret", ObjectPrefix: "prefix",
-		UploadCallbackURL:   "https://tunnel.example/api/public/transfer/oss-callback",
+		UploadCallbackURL:   "https://specus.example/api/public/transfer/oss-callback",
 		UploadURLTTLSeconds: 60, RetentionHours: 1, MaxAttachmentBytes: 100,
 		PerUserStorageQuotaBytes: 100,
 	}, config.PublicTransferConfig{MaxPendingUploadsPerRoom: 10})

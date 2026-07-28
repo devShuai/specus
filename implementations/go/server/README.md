@@ -1,6 +1,6 @@
 # implementations/go/server
 
-Go 实现的 shuai-tunnel 服务端，与 Java / Go / .NET / Android client 使用唯一的 **v2 线协议**
+Go 实现的 specus 服务端，与 Java / Go / .NET / Android client 使用唯一的 **v2 线协议**
 （11 字节帧头 + CompactBinary + NAT stream + runtime token + control/data 角色）。服务端为纯 Go 实现；
 直接依赖包括数据库驱动、WebSocket、Brotli 和用于 PKCS12/PFX 读取的 `golang.org/x/crypto`。
 
@@ -9,21 +9,21 @@ Go 实现的 shuai-tunnel 服务端，与 Java / Go / .NET / Android client 使�
 ```bash
 cd implementations/go/server
 go generate ./web                    # 只同步 Go server 的内嵌管理后台静态资源
-go build ./cmd/shuai-tunnel-server
-./shuai-tunnel-server                 # 默认 SQLite + 控制端口 7010 + 管理端口 8088
-./shuai-tunnel-server -config cfg.json
+go build ./cmd/specus-server
+./specus-server                 # 默认 SQLite + 控制端口 7010 + 管理端口 8088
+./specus-server -config cfg.json
 ```
 
 独立 RFC 5780 STUN（不启动业务 server、数据库或 TURN）：
 
 ```bash
 go test ./internal/stunserver
-go build -o shuai-stun-server ./cmd/shuai-stun-server
+go build -o specus-stun-server ./cmd/specus-stun-server
 STUN_PRIMARY_BIND_ADDRESS=10.0.0.10 \
 STUN_PRIMARY_PUBLIC_ADDRESS=203.0.113.10 \
 STUN_ALTERNATE_BIND_ADDRESS=10.0.0.11 \
 STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
-./shuai-stun-server
+./specus-stun-server
 ```
 
 独立 STUN 与 Java/.NET 版本共用 `STUN_*` 环境变量，支持四端点
@@ -34,113 +34,113 @@ STUN_ALTERNATE_PUBLIC_ADDRESS=203.0.113.11 \
 - v2 隧道监听默认使用 `7010`，每个客户端会话在该监听上分别建立 `control` 与 `data` 连接。
 - 管理后台 + HTTP/WebSocket 流式入口默认监听 `:8088`，浏览器访问 `http://127.0.0.1:8088/`。
 - 默认 seed 演示客户端账号 `Demo client` 和启动凭证 `apiKey=demo-client / secret=test1234`(可关)。
-- 管理后台默认账号 `admin / admin`；内置 admin 之外的管理用户保存到 `tunnel_management_user`。
+- 管理后台默认账号 `admin / admin`；内置 admin 之外的管理用户保存到 `specus_management_user`。
 
 ## 配置
 
-可用 JSON 文件(`-config`)或 `TUNNEL_*` 环境变量(env 覆盖文件)。
+可用 JSON 文件(`-config`)或 `SPECUS_*` 环境变量(env 覆盖文件)。
 
 | 环境变量 | 说明 | 默认 |
 | --- | --- | --- |
-| `TUNNEL_NETTY_PORT` | v2 control/data 隧道端口 | 7010 |
-| `TUNNEL_NETTY_MAX_FRAME_SIZE` | 完整控制帧上限，包含 11 字节 header；值必须不小于 11（等于 11 时仅容纳零字节 body） | 33554432 |
-| `TUNNEL_MANAGEMENT_ADDR` | 管理 HTTP 监听地址 | `:8088` |
-| `TUNNEL_LOG_FILE` | 独立运行时可选的日志文件绝对路径；配置后与标准输出双写。systemd 部署直接捕获完整 stdout/stderr 并强制留空，避免重复日志 | - |
-| `TUNNEL_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | sqlite |
-| `TUNNEL_CONNECTIONSTRINGS_TUNNEL` | 数据库连接串 | `./shuai-tunnel.db` |
-| `TUNNEL_DB_SEED_DEMO_CLIENT` | 是否 seed 演示客户端 | true |
-| `TUNNEL_AUTH_USERNAME` / `TUNNEL_AUTH_PASSWORD` | 管理后台账号 | admin / admin |
-| `TUNNEL_AUTH_TENANT_ID` | 本地密码登录默认租户 | default |
-| `TUNNEL_AUTH_PASSWORD_LOGIN_ENABLED` / `TUNNEL_AUTH_REGISTRATION_ENABLED` | 密码登录 / 访客自助注册总开关；注册还要求 Turnstile 与 SMTP | true / true（验证配置默认关闭） |
-| `TUNNEL_AUTH_TURNSTILE_*` | Cloudflare Turnstile site key、secret、Siteverify 地址与 hostname 白名单 | disabled |
-| `TUNNEL_AUTH_EMAIL_*` / `TUNNEL_AUTH_SMTP_*` | 注册邮箱验证码与 SMTP 参数 | disabled |
-| `TUNNEL_AUTH_JWT_SECRET` | 本地 JWT 签名密钥(空则随机,重启失效) | - |
-| `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS` | 客户端 HTTP 启动登录签发的 runtime token 有效期 | 28800 |
-| `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | 创建客户端凭证时默认最大在线实例数 | 2 |
-| `TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | 同一机器指纹 + OS 用户允许同时在线的实例数 | 1 |
-| `TUNNEL_LOGIN_EXECUTOR_MAX` / `TUNNEL_LOGIN_EXECUTOR_QUEUE` | Java 当前登录执行器环境变量别名；旧 `TUNNEL_LOGIN_EXECUTOR_MAX_SIZE` / `TUNNEL_LOGIN_EXECUTOR_QUEUE_CAPACITY` 仍兼容 | 32 / 20000 |
-| `TUNNEL_PUBLIC_ADDRESS` | 下发给 client 的公网地址 | - |
-| `TUNNEL_HTTP_TIMEOUT_MS` / `TUNNEL_HTTP_MAX_REQUEST_BODY_SIZE` | HTTP stream 超时 / 请求体体积上限 | 30000 / 16MiB |
-| `TUNNEL_HTTP_REWRITE_MAX_BODY_BYTES` | HTTP 路由路径改写响应体上限 | 10MiB |
-| `TUNNEL_TRAFFIC_CAPTURE_DETAIL_ENABLED` | HTTP/TCP 明细采集全局开关 | false |
-| `TUNNEL_TRAFFIC_CAPTURE_PREVIEW_BYTES` | TCP payload 预览字节数 | 256 |
-| `TUNNEL_TRAFFIC_CAPTURE_HEADER_CHARS` | HTTP Header 保存字符上限 | 8192 |
-| `TUNNEL_TRAFFIC_CAPTURE_DECODE_MAX_BYTES` | HTTP body 解压预览最大字节数，避免压缩响应在管理页预览时无界膨胀 | 1048576 |
-| `TUNNEL_TRAFFIC_CAPTURE_MAX_PENDING` | HTTP/TCP 明细采集每类队列最大积压条数 | 20000 |
-| `TUNNEL_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` | HTTP/TCP 明细采集单次 flush 最大条数 | 1000 |
-| `TUNNEL_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` | HTTP/TCP 明细采集后台 flush 间隔 | 2000 |
-| `TUNNEL_TRAFFIC_CAPTURE_SAMPLE_RATE` | TCP 常规帧采样率，首帧仍会捕获；取值 `0.0` 到 `1.0` | 1.0 |
-| `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` | 连接明细保留天数；更早记录归档到月度统计，`0` 关闭归档 | 60 |
-| `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` | 连接明细归档任务执行间隔 | 3600000 |
-| `TUNNEL_ELASTICSEARCH_URIS` | ES 地址，多个节点逗号分隔；为空时用数据库保存明细 | - |
-| `TUNNEL_ELASTICSEARCH_USERNAME` / `TUNNEL_ELASTICSEARCH_PASSWORD` | ES Basic Auth | - |
-| `TUNNEL_ELASTICSEARCH_API_KEY` | ES API Key，优先于用户名密码 | - |
-| `TUNNEL_ELASTICSEARCH_HTTP_INDEX` / `TUNNEL_ELASTICSEARCH_TCP_INDEX` | HTTP / TCP 明细索引 | `shuai-tunnel-http-traffic` / `shuai-tunnel-tcp-traffic` |
-| `TUNNEL_ELASTICSEARCH_HTTP_MAX_STORE_SIZE` / `TUNNEL_ELASTICSEARCH_TCP_MAX_STORE_SIZE` | HTTP / TCP 明细索引体积上限 | `100GB` / `10GB` |
-| `TUNNEL_PEER_MESH_ENABLED` | 是否启用私有组网控制面 | false |
-| `TUNNEL_PEER_MESH_CIDR` | 私有组网虚拟网段 | `100.96.0.0/11` |
-| `TUNNEL_PEER_MESH_PUBLIC_ADDRESS` | 下发给客户端的 STUN/TURN 地址；空则回退 `TUNNEL_PUBLIC_ADDRESS` | - |
-| `TUNNEL_PEER_MESH_STUN_TURN_PORT` | 标准 STUN/TURN UDP 主端口 | 3478 |
-| `TUNNEL_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | NAT 辅助探测端口；0 表示按主端口 +1 兜底 | 3479 |
-| `TUNNEL_PEER_MESH_PUBLIC_STUN_SERVERS` | 下发给客户端和公开 NAT 检测页的公共 STUN 服务器，逗号或空白分隔 | - |
-| `TUNNEL_PEER_MESH_SESSION_TTL_SECONDS` | Peer session 授权有效期 | 3600 |
-| `TUNNEL_PEER_MESH_ALLOCATION_TTL_SECONDS` | Relay allocation TTL | 300 |
-| `TUNNEL_PEER_MESH_RELAY_MIN_PORT` / `TUNNEL_PEER_MESH_RELAY_MAX_PORT` | 标准 TURN relay allocation 端口范围 | 49152 / 65535 |
-| `TUNNEL_PEER_MESH_RELAY_WORKER_THREADS` / `TUNNEL_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | Java relay worker 配置；Go 标准 TURN 当前由 relay socket goroutine 处理，先读取保留 | 0 / 10000 |
-| `TUNNEL_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` | Peer Mesh relay 流量聚合 flush 间隔；Go server 与 Java 一样在 relay 热路径聚合、后台批量落库 | 5000 |
-| `TUNNEL_PEER_MESH_TURN_AUTH_REQUIRED` | 是否要求 Allocate/Refresh/CreatePermission 携带 MESSAGE-INTEGRITY | true |
-| `TUNNEL_PEER_MESH_TURN_REALM` | TURN realm | `shuai-tunnel` |
-| `TUNNEL_PEER_MESH_TURN_SHARED_SECRET` | 临时 credential 签名密钥；空则进程内随机 | - |
-| `TUNNEL_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | 临时 TURN credential TTL | 3600 |
-| `TUNNEL_OBJECT_STORAGE_PROVIDER` | `disabled` / `aliyun-oss` | disabled |
-| `TUNNEL_OBJECT_STORAGE_ENDPOINT` / `TUNNEL_OBJECT_STORAGE_REGION` / `TUNNEL_OBJECT_STORAGE_BUCKET` / `TUNNEL_OBJECT_STORAGE_ACCESS_KEY_ID` / `TUNNEL_OBJECT_STORAGE_ACCESS_KEY_SECRET` | 私有 Aliyun OSS V4 region、连接与凭证；标准 endpoint 可推导 region，CNAME 需显式配置 | - |
-| `TUNNEL_OBJECT_STORAGE_PREFIX` | 附件 object key 前缀 | `shuai-tunnel/attachments` |
-| `TUNNEL_OBJECT_STORAGE_UPLOAD_CALLBACK_URL` | OSS 上传成功回调地址；空值禁用，客户端 complete 继续用 HEAD 兜底 | - |
-| `TUNNEL_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS` / `TUNNEL_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS` / `TUNNEL_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS` | 上传 V4 URL / 一次性下载授权 / OSS 直达 URL TTL | 900 / 600 / 30 |
-| `TUNNEL_OBJECT_STORAGE_RETENTION_HOURS` / `TUNNEL_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES` | 保留时间 / 附件上限 | 72 / 536870912 |
-| `TUNNEL_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES` / `TUNNEL_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES` | 每个登录账号的有效存储 / UTC 月下载跳转流量额度 | 1073741824 / 1073741824 |
-| `TUNNEL_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS` | 过期扫描间隔 | 3600000 |
-| `TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP` / `TUNNEL_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS` | 公开 presign-upload 单 IP 固定窗口限流 | 30 / 300 |
-| `TUNNEL_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM` | 同 roomToken 哈希 PENDING 附件上限 | 50 |
-| `TUNNEL_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | 发现房间 peer 上限 | 32 |
-| `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` / `TUNNEL_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | 发现连接消息限流 | 360 / 60 |
-| `TUNNEL_PUBLIC_TRANSFER_CLUSTER_ENABLED` / `TUNNEL_PUBLIC_TRANSFER_REDIS_URI` | 启用 Redis 多实例 presence、Pub/Sub、revision 与共享限流；URI 在启用时必填 | false / - |
-| `TUNNEL_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | Redis key 与频道前缀 | shuai-tunnel:v2:public-transfer |
-| `TUNNEL_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` / `TUNNEL_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | presence TTL / 刷新间隔 | 30 / 10000 |
-| `TUNNEL_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS` | Redis 命令超时，故障时失败关闭 | 2000 |
-| `TUNNEL_TLS_MODE` | `disabled` / `file` / `self-signed` | disabled |
-| `TUNNEL_TLS_KEYSTORE` / `TUNNEL_TLS_KEYSTORE_PASSWORD` | PKCS12 / PFX keystore 与密码(mode=file) | - |
-| `TUNNEL_TLS_CERT_FILE` / `TUNNEL_TLS_KEY_FILE` | PEM 证书/私钥(mode=file) | - |
-| `TUNNEL_OIDC_CLIENT_ID` / `TUNNEL_OIDC_CLIENT_SECRET` / `TUNNEL_OIDC_TOKEN_ENDPOINT` / `TUNNEL_OIDC_JWK_SET_URI` … | OIDC 单点登录 | - |
-| `TUNNEL_OIDC_TENANT_CLAIM` | OIDC JWT 中用于读取租户的 claim 名称 | `tenant_id` |
+| `SPECUS_NETTY_PORT` | v2 control/data 隧道端口 | 7010 |
+| `SPECUS_NETTY_MAX_FRAME_SIZE` | 完整控制帧上限，包含 11 字节 header；值必须不小于 11（等于 11 时仅容纳零字节 body） | 33554432 |
+| `SPECUS_MANAGEMENT_ADDR` | 管理 HTTP 监听地址 | `:8088` |
+| `SPECUS_LOG_FILE` | 独立运行时可选的日志文件绝对路径；配置后与标准输出双写。systemd 部署直接捕获完整 stdout/stderr 并强制留空，避免重复日志 | - |
+| `SPECUS_DB_PROVIDER` | `sqlite` / `postgres` / `mysql` | sqlite |
+| `SPECUS_CONNECTIONSTRINGS_SPECUS` | 数据库连接串 | `./specus.db` |
+| `SPECUS_DB_SEED_DEMO_CLIENT` | 是否 seed 演示客户端 | true |
+| `SPECUS_AUTH_USERNAME` / `SPECUS_AUTH_PASSWORD` | 管理后台账号 | admin / admin |
+| `SPECUS_AUTH_TENANT_ID` | 本地密码登录默认租户 | default |
+| `SPECUS_AUTH_PASSWORD_LOGIN_ENABLED` / `SPECUS_AUTH_REGISTRATION_ENABLED` | 密码登录 / 访客自助注册总开关；注册还要求 Turnstile 与 SMTP | true / true（验证配置默认关闭） |
+| `SPECUS_AUTH_TURNSTILE_*` | Cloudflare Turnstile site key、secret、Siteverify 地址与 hostname 白名单 | disabled |
+| `SPECUS_AUTH_EMAIL_*` / `SPECUS_AUTH_SMTP_*` | 注册邮箱验证码与 SMTP 参数 | disabled |
+| `SPECUS_AUTH_JWT_SECRET` | 本地 JWT 签名密钥(空则随机,重启失效) | - |
+| `SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS` | 客户端 HTTP 启动登录签发的 runtime token 有效期 | 28800 |
+| `SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES` | 创建客户端凭证时默认最大在线实例数 | 2 |
+| `SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` | 同一机器指纹 + OS 用户允许同时在线的实例数 | 1 |
+| `SPECUS_LOGIN_EXECUTOR_MAX` / `SPECUS_LOGIN_EXECUTOR_QUEUE` | Java 当前登录执行器环境变量别名；旧 `SPECUS_LOGIN_EXECUTOR_MAX_SIZE` / `SPECUS_LOGIN_EXECUTOR_QUEUE_CAPACITY` 仍兼容 | 32 / 20000 |
+| `SPECUS_PUBLIC_ADDRESS` | 下发给 client 的公网地址 | - |
+| `SPECUS_HTTP_TIMEOUT_MS` / `SPECUS_HTTP_MAX_REQUEST_BODY_SIZE` | HTTP stream 超时 / 请求体体积上限 | 30000 / 16MiB |
+| `SPECUS_HTTP_REWRITE_MAX_BODY_BYTES` | HTTP 路由路径改写响应体上限 | 10MiB |
+| `SPECUS_TRAFFIC_CAPTURE_DETAIL_ENABLED` | HTTP/TCP 明细采集全局开关 | false |
+| `SPECUS_TRAFFIC_CAPTURE_PREVIEW_BYTES` | TCP payload 预览字节数 | 256 |
+| `SPECUS_TRAFFIC_CAPTURE_HEADER_CHARS` | HTTP Header 保存字符上限 | 8192 |
+| `SPECUS_TRAFFIC_CAPTURE_DECODE_MAX_BYTES` | HTTP body 解压预览最大字节数，避免压缩响应在管理页预览时无界膨胀 | 1048576 |
+| `SPECUS_TRAFFIC_CAPTURE_MAX_PENDING` | HTTP/TCP 明细采集每类队列最大积压条数 | 20000 |
+| `SPECUS_TRAFFIC_CAPTURE_FLUSH_BATCH_SIZE` | HTTP/TCP 明细采集单次 flush 最大条数 | 1000 |
+| `SPECUS_TRAFFIC_CAPTURE_FLUSH_INTERVAL_MS` | HTTP/TCP 明细采集后台 flush 间隔 | 2000 |
+| `SPECUS_TRAFFIC_CAPTURE_SAMPLE_RATE` | TCP 常规帧采样率，首帧仍会捕获；取值 `0.0` 到 `1.0` | 1.0 |
+| `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` | 连接明细保留天数；更早记录归档到月度统计，`0` 关闭归档 | 60 |
+| `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` | 连接明细归档任务执行间隔 | 3600000 |
+| `SPECUS_ELASTICSEARCH_URIS` | ES 地址，多个节点逗号分隔；为空时用数据库保存明细 | - |
+| `SPECUS_ELASTICSEARCH_USERNAME` / `SPECUS_ELASTICSEARCH_PASSWORD` | ES Basic Auth | - |
+| `SPECUS_ELASTICSEARCH_API_KEY` | ES API Key，优先于用户名密码 | - |
+| `SPECUS_ELASTICSEARCH_HTTP_INDEX` / `SPECUS_ELASTICSEARCH_TCP_INDEX` | HTTP / TCP 明细索引 | `specus-http-traffic` / `specus-tcp-traffic` |
+| `SPECUS_ELASTICSEARCH_HTTP_MAX_STORE_SIZE` / `SPECUS_ELASTICSEARCH_TCP_MAX_STORE_SIZE` | HTTP / TCP 明细索引体积上限 | `100GB` / `10GB` |
+| `SPECUS_PEER_MESH_ENABLED` | 是否启用私有组网控制面 | false |
+| `SPECUS_PEER_MESH_CIDR` | 私有组网虚拟网段 | `100.96.0.0/11` |
+| `SPECUS_PEER_MESH_PUBLIC_ADDRESS` | 下发给客户端的 STUN/TURN 地址；空则回退 `SPECUS_PUBLIC_ADDRESS` | - |
+| `SPECUS_PEER_MESH_STUN_TURN_PORT` | 标准 STUN/TURN UDP 主端口 | 3478 |
+| `SPECUS_PEER_MESH_NAT_PROBE_ALTERNATE_PORT` | NAT 辅助探测端口；0 表示按主端口 +1 兜底 | 3479 |
+| `SPECUS_PEER_MESH_PUBLIC_STUN_SERVERS` | 下发给客户端和公开 NAT 检测页的公共 STUN 服务器，逗号或空白分隔 | - |
+| `SPECUS_PEER_MESH_SESSION_TTL_SECONDS` | Peer session 授权有效期 | 3600 |
+| `SPECUS_PEER_MESH_ALLOCATION_TTL_SECONDS` | Relay allocation TTL | 300 |
+| `SPECUS_PEER_MESH_RELAY_MIN_PORT` / `SPECUS_PEER_MESH_RELAY_MAX_PORT` | 标准 TURN relay allocation 端口范围 | 49152 / 65535 |
+| `SPECUS_PEER_MESH_RELAY_WORKER_THREADS` / `SPECUS_PEER_MESH_RELAY_WORKER_QUEUE_CAPACITY` | Java relay worker 配置；Go 标准 TURN 当前由 relay socket goroutine 处理，先读取保留 | 0 / 10000 |
+| `SPECUS_PEER_MESH_RELAY_TRAFFIC_FLUSH_INTERVAL_MS` | Peer Mesh relay 流量聚合 flush 间隔；Go server 与 Java 一样在 relay 热路径聚合、后台批量落库 | 5000 |
+| `SPECUS_PEER_MESH_TURN_AUTH_REQUIRED` | 是否要求 Allocate/Refresh/CreatePermission 携带 MESSAGE-INTEGRITY | true |
+| `SPECUS_PEER_MESH_TURN_REALM` | TURN realm | `specus` |
+| `SPECUS_PEER_MESH_TURN_SHARED_SECRET` | 临时 credential 签名密钥；空则进程内随机 | - |
+| `SPECUS_PEER_MESH_TURN_CREDENTIAL_TTL_SECONDS` | 临时 TURN credential TTL | 3600 |
+| `SPECUS_OBJECT_STORAGE_PROVIDER` | `disabled` / `aliyun-oss` | disabled |
+| `SPECUS_OBJECT_STORAGE_ENDPOINT` / `SPECUS_OBJECT_STORAGE_REGION` / `SPECUS_OBJECT_STORAGE_BUCKET` / `SPECUS_OBJECT_STORAGE_ACCESS_KEY_ID` / `SPECUS_OBJECT_STORAGE_ACCESS_KEY_SECRET` | 私有 Aliyun OSS V4 region、连接与凭证；标准 endpoint 可推导 region，CNAME 需显式配置 | - |
+| `SPECUS_OBJECT_STORAGE_PREFIX` | 附件 object key 前缀 | `specus/attachments` |
+| `SPECUS_OBJECT_STORAGE_UPLOAD_CALLBACK_URL` | OSS 上传成功回调地址；空值禁用，客户端 complete 继续用 HEAD 兜底 | - |
+| `SPECUS_OBJECT_STORAGE_UPLOAD_URL_TTL_SECONDS` / `SPECUS_OBJECT_STORAGE_DOWNLOAD_URL_TTL_SECONDS` / `SPECUS_OBJECT_STORAGE_DOWNLOAD_OBJECT_URL_TTL_SECONDS` | 上传 V4 URL / 一次性下载授权 / OSS 直达 URL TTL | 900 / 600 / 30 |
+| `SPECUS_OBJECT_STORAGE_RETENTION_HOURS` / `SPECUS_OBJECT_STORAGE_MAX_ATTACHMENT_BYTES` | 保留时间 / 附件上限 | 72 / 536870912 |
+| `SPECUS_OBJECT_STORAGE_PER_USER_STORAGE_QUOTA_BYTES` / `SPECUS_OBJECT_STORAGE_PER_USER_MONTHLY_DOWNLOAD_QUOTA_BYTES` | 每个登录账号的有效存储 / UTC 月下载跳转流量额度 | 1073741824 / 1073741824 |
+| `SPECUS_OBJECT_STORAGE_EXPIRATION_SCAN_INTERVAL_MS` | 过期扫描间隔 | 3600000 |
+| `SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_PER_IP` / `SPECUS_PUBLIC_TRANSFER_PRESIGN_RATE_LIMIT_WINDOW_SECONDS` | 公开 presign-upload 单 IP 固定窗口限流 | 30 / 300 |
+| `SPECUS_PUBLIC_TRANSFER_MAX_PENDING_UPLOADS_PER_ROOM` | 同 roomToken 哈希 PENDING 附件上限 | 50 |
+| `SPECUS_PUBLIC_TRANSFER_MAX_DISCOVERY_PEERS_PER_ROOM` | 发现房间 peer 上限 | 32 |
+| `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_PER_CONNECTION` / `SPECUS_PUBLIC_TRANSFER_DISCOVERY_MESSAGE_RATE_LIMIT_WINDOW_SECONDS` | 发现连接消息限流 | 360 / 60 |
+| `SPECUS_PUBLIC_TRANSFER_CLUSTER_ENABLED` / `SPECUS_PUBLIC_TRANSFER_REDIS_URI` | 启用 Redis 多实例 presence、Pub/Sub、revision 与共享限流；URI 在启用时必填 | false / - |
+| `SPECUS_PUBLIC_TRANSFER_REDIS_KEY_PREFIX` | Redis key 与频道前缀 | specus:v2:public-transfer |
+| `SPECUS_PUBLIC_TRANSFER_PRESENCE_LEASE_SECONDS` / `SPECUS_PUBLIC_TRANSFER_PRESENCE_REFRESH_INTERVAL_MS` | presence TTL / 刷新间隔 | 30 / 10000 |
+| `SPECUS_PUBLIC_TRANSFER_REDIS_COMMAND_TIMEOUT_MS` | Redis 命令超时，故障时失败关闭 | 2000 |
+| `SPECUS_TLS_MODE` | `disabled` / `file` / `self-signed` | disabled |
+| `SPECUS_TLS_KEYSTORE` / `SPECUS_TLS_KEYSTORE_PASSWORD` | PKCS12 / PFX keystore 与密码(mode=file) | - |
+| `SPECUS_TLS_CERT_FILE` / `SPECUS_TLS_KEY_FILE` | PEM 证书/私钥(mode=file) | - |
+| `SPECUS_OIDC_CLIENT_ID` / `SPECUS_OIDC_CLIENT_SECRET` / `SPECUS_OIDC_TOKEN_ENDPOINT` / `SPECUS_OIDC_JWK_SET_URI` … | OIDC 单点登录 | - |
+| `SPECUS_OIDC_TENANT_CLAIM` | OIDC JWT 中用于读取租户的 claim 名称 | `tenant_id` |
 
 ### 切换数据库
 
 ```bash
 # PostgreSQL
-TUNNEL_DB_PROVIDER=postgres \
-TUNNEL_CONNECTIONSTRINGS_TUNNEL="postgres://user:pass@localhost:5432/shuai?sslmode=disable" \
-./shuai-tunnel-server
+SPECUS_DB_PROVIDER=postgres \
+SPECUS_CONNECTIONSTRINGS_SPECUS="postgres://user:pass@localhost:5432/specus?sslmode=disable" \
+./specus-server
 
 # MySQL
-TUNNEL_DB_PROVIDER=mysql \
-TUNNEL_CONNECTIONSTRINGS_TUNNEL="user:pass@tcp(localhost:3306)/shuai?parseTime=true" \
-./shuai-tunnel-server
+SPECUS_DB_PROVIDER=mysql \
+SPECUS_CONNECTIONSTRINGS_SPECUS="user:pass@tcp(localhost:3306)/specus?parseTime=true" \
+./specus-server
 ```
 
 启动时按 dialect 用 `CREATE TABLE IF NOT EXISTS` 幂等建表(`internal/store/schema/*.sql`),客户端账号、启动凭证、机器身份、带客户端消息能力字段的运行时会话、`transfer_attachment`、管理用户、映射和统计表与 .NET/Java 对齐；历史 `peer_mesh_acl` 会幂等补充默认 `OUTBOUND` 的 `direction` 列；时间戳统一存 ISO-8601 字符串以保证字典序=时序。
 
 映射表已包含 Java 管理面当前使用的通道级开关：TCP 映射的 `detail_capture_enabled`，HTTP 路由的 `detail_capture_enabled` 与 `path_rewrite_enabled`。这些字段默认关闭，启动迁移会对历史库幂等补列；当前 Go server 已能通过管理 API 保存和返回这些配置，并在 `path_rewrite_enabled=true` 时对可文本化 HTTP 响应做路径改写。
 
-资源级流量和 HTTP/TCP 明细采集也已对齐到 Java 管理契约：TCP 映射 / HTTP route 会聚合写入 `tunnel_resource_traffic_usage`，HTTP stream 成功/失败响应会写入 `tunnel_http_traffic_exchange`，TCP 端口映射双向 payload 会写入 `tunnel_tcp_traffic_frame`；明细采集热路径只入队，后台按配置批量 flush，管理明细查询默认不打断批量节奏，只有显式传 `flush=true` 时才会先 flush 再查；管理 API 支持资源流量列表、HTTP 分页与字段搜索、TCP 分页、单帧详情、按 channel 串流查询和 `inspection-status` 采集状态。HTTP 业务响应展示可解码 `gzip`、`deflate`（zlib / raw）和 `br` Brotli；这不改变 v2 wire body 禁止通用压缩的约束。
+资源级流量和 HTTP/TCP 明细采集也已对齐到 Java 管理契约：TCP 映射 / HTTP route 会聚合写入 `specus_resource_traffic_usage`，HTTP stream 成功/失败响应会写入 `specus_http_traffic_exchange`，TCP 端口映射双向 payload 会写入 `specus_tcp_traffic_frame`；明细采集热路径只入队，后台按配置批量 flush，管理明细查询默认不打断批量节奏，只有显式传 `flush=true` 时才会先 flush 再查；管理 API 支持资源流量列表、HTTP 分页与字段搜索、TCP 分页、单帧详情、按 channel 串流查询和 `inspection-status` 采集状态。HTTP 业务响应展示可解码 `gzip`、`deflate`（zlib / raw）和 `br` Brotli；这不改变 v2 wire body 禁止通用压缩的约束。
 
-TCP 转发背压已对齐 Java/.NET 的 high/low watermark 语义：控制通道写入和外部 socket 写入都会按 `TUNNEL_NETTY_WRITE_BUFFER_LOW_WATER_MARK` / `TUNNEL_NETTY_WRITE_BUFFER_HIGH_WATER_MARK` 统计待写字节；超过高水位会暂停对应读循环，回落到低水位后恢复，避免慢 client 或慢公网连接造成无界积压。
+TCP 转发背压已对齐 Java/.NET 的 high/low watermark 语义：控制通道写入和外部 socket 写入都会按 `SPECUS_NETTY_WRITE_BUFFER_LOW_WATER_MARK` / `SPECUS_NETTY_WRITE_BUFFER_HIGH_WATER_MARK` 统计待写字节；超过高水位会暂停对应读循环，回落到低水位后恢复，避免慢 client 或慢公网连接造成无界积压。
 
-明细存储支持 DB / Elasticsearch 双后端：默认未配置 `TUNNEL_ELASTICSEARCH_URIS` 时使用数据库；配置 ES 后自动创建 Java 兼容字段映射，HTTP/TCP 明细写入 ES 并从 ES 查询，HTTP 索引默认 100GB、TCP 索引默认 10GB，超过后按最旧 `id` 分批删除。
+明细存储支持 DB / Elasticsearch 双后端：默认未配置 `SPECUS_ELASTICSEARCH_URIS` 时使用数据库；配置 ES 后自动创建 Java 兼容字段映射，HTTP/TCP 明细写入 ES 并从 ES 查询，HTTP 索引默认 100GB、TCP 索引默认 10GB，超过后按最旧 `id` 分批删除。
 
-每日总流量表 `tunnel_traffic_usage` 已补齐 `tenant_id`，启动迁移会对历史库幂等补列；新写入会按客户端所属租户保存，管理查询按当前租户和可见客户端收敛，并兼容历史空租户行。
+每日总流量表 `specus_traffic_usage` 已补齐 `tenant_id`，启动迁移会对历史库幂等补列；新写入会按客户端所属租户保存，管理查询按当前租户和可见客户端收敛，并兼容历史空租户行。
 
-连接归档统计表 `tunnel_connection_stat` 也已补齐 `tenant_id`：新库 schema 直接按 `tenant_id + client_name + stat_month` 保持唯一，启动迁移会为历史库补列并按 `client_id` / `client_name` 回填租户；归档任务按租户、客户端名和月份聚合，默认保留最近 60 天明细、每小时执行一次，可通过 Java 同名 `TUNNEL_CONNECTION_DETAIL_RETENTION_DAYS` / `TUNNEL_CONNECTION_ARCHIVE_INTERVAL_MS` 调整；管理查询先限制当前租户，再按普通用户可见 clientId 收敛，避免不同租户同名客户端的统计混在一起。
+连接归档统计表 `specus_connection_stat` 也已补齐 `tenant_id`：新库 schema 直接按 `tenant_id + client_name + stat_month` 保持唯一，启动迁移会为历史库补列并按 `client_id` / `client_name` 回填租户；归档任务按租户、客户端名和月份聚合，默认保留最近 60 天明细、每小时执行一次，可通过 Java 同名 `SPECUS_CONNECTION_DETAIL_RETENTION_DAYS` / `SPECUS_CONNECTION_ARCHIVE_INTERVAL_MS` 调整；管理查询先限制当前租户，再按普通用户可见 clientId 收敛，避免不同租户同名客户端的统计混在一起。
 
 ## 多租户管理
 
@@ -148,23 +148,23 @@ Go server 已对齐 Java 管理面基础：
 
 - 本地密码登录 JWT 写入 `tenant_id` 与 `role`，`/auth/refresh` 会保留这些 claim。
 - `GET /api/admin/me` 返回当前管理用户；`/api/admin/users` 仅 admin 可用。
-- 内置 admin 来自配置；其它管理用户保存到 `tunnel_management_user`。
+- 内置 admin 来自配置；其它管理用户保存到 `specus_management_user`。
 - admin 可查看当前租户内全部客户端、凭证、映射、连接和流量；普通用户只能看到自己创建的资源。租户 ID 与 owner username 的权限比较与 Java 一样区分大小写。
-- OIDC 令牌按 `TUNNEL_OIDC_TENANT_CLAIM` 读取租户，缺失时回退默认租户；配置中的内置 admin 用户会识别为 admin。
-- 客户端 HTTP 启动登录响应返回凭证所属 `tenantId`、`maxOnlineInstances`、TCP/HTTP 映射和 Peer Mesh 配置；运行时会话写入 `tunnel_client_session`，HTTP 登录态为 `HTTP_AUTHENTICATED`，Netty 登录成功改为 `NETTY_ONLINE`，断开、过期和服务启动清理都会改为 `DISCONNECTED`。
-- 客户端 runtime token TTL、同机用户在线实例上限和创建凭证时的默认最大在线实例数来自独立 `clientAuth` 配置组，分别对应 `TUNNEL_CLIENT_AUTH_TOKEN_TTL_SECONDS`、`TUNNEL_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` 和 `TUNNEL_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES`。
+- OIDC 令牌按 `SPECUS_OIDC_TENANT_CLAIM` 读取租户，缺失时回退默认租户；配置中的内置 admin 用户会识别为 admin。
+- 客户端 HTTP 启动登录响应返回凭证所属 `tenantId`、`maxOnlineInstances`、TCP/HTTP 映射和 Peer Mesh 配置；运行时会话写入 `specus_client_session`，HTTP 登录态为 `HTTP_AUTHENTICATED`，Netty 登录成功改为 `NETTY_ONLINE`，断开、过期和服务启动清理都会改为 `DISCONNECTED`。
+- 客户端 runtime token TTL、同机用户在线实例上限和创建凭证时的默认最大在线实例数来自独立 `clientAuth` 配置组，分别对应 `SPECUS_CLIENT_AUTH_TOKEN_TTL_SECONDS`、`SPECUS_CLIENT_AUTH_PER_MACHINE_USER_MAX_INSTANCES` 和 `SPECUS_CLIENT_AUTH_DEFAULT_MAX_ONLINE_INSTANCES`。
 - Netty 运行时登录会检查同一机器/用户在线实例上限和凭证最大在线实例，连接断开后同时回收内存在线状态和数据库在线状态。
 - 连接记录和连接归档统计都带租户维度：admin 看当前租户全部数据，普通用户只看自己可见客户端产生的记录和统计。
 
 ### TLS
 
 ```bash
-TUNNEL_TLS_MODE=self-signed ./shuai-tunnel-server     # 启动时现场生成自签证书
-TUNNEL_TLS_MODE=file TUNNEL_TLS_KEYSTORE=server.p12 TUNNEL_TLS_KEYSTORE_PASSWORD=changeit ./shuai-tunnel-server
-TUNNEL_TLS_MODE=file TUNNEL_TLS_CERT_FILE=cert.pem TUNNEL_TLS_KEY_FILE=key.pem ./shuai-tunnel-server
+SPECUS_TLS_MODE=self-signed ./specus-server     # 启动时现场生成自签证书
+SPECUS_TLS_MODE=file SPECUS_TLS_KEYSTORE=server.p12 SPECUS_TLS_KEYSTORE_PASSWORD=changeit ./specus-server
+SPECUS_TLS_MODE=file SPECUS_TLS_CERT_FILE=cert.pem SPECUS_TLS_KEY_FILE=key.pem ./specus-server
 ```
 
-TLS 同时作用于控制通道与管理 HTTP。`file` 模式优先使用 `TUNNEL_TLS_KEYSTORE`
+TLS 同时作用于控制通道与管理 HTTP。`file` 模式优先使用 `SPECUS_TLS_KEYSTORE`
 加载 PKCS12 / PFX；未配置 keystore 时回退到 PEM 证书和私钥文件。
 
 ## 测试
@@ -194,7 +194,7 @@ Go client 当前已实现 Peer Mesh UDP 控制面、v2 X25519/HKDF/AES-GCM IP �
 ## 包结构
 
 - `internal/protocol` — 双向编解码(帧 + CompactBinary + NAT + HMAC)
-- `internal/config` — 配置 + `TUNNEL_*` 映射
+- `internal/config` — 配置 + `SPECUS_*` 映射
 - `internal/store` — 多库抽象 + schema + 查询/CRUD/归档
 - `internal/auth` — apiKey 签名校验、运行时 token、密码 hash、限流、id 生成
 - `internal/session` — 会话注册表(同名登录顶替)

@@ -10,7 +10,7 @@ import (
 // FindManagementUserByUsername returns a management user by username, ignoring case.
 func (db *DB) FindManagementUserByUsername(ctx context.Context, username string) (*ManagementUser, error) {
 	query := db.rebind(`SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at
-		FROM tunnel_management_user WHERE LOWER(username) = LOWER(?)`)
+		FROM specus_management_user WHERE LOWER(username) = LOWER(?)`)
 	row := db.sql.QueryRowContext(ctx, query, username)
 	user, err := scanManagementUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -25,7 +25,7 @@ func (db *DB) FindManagementUserByUsername(ctx context.Context, username string)
 // ListManagementUsersByTenant returns DB-backed management users in one tenant.
 func (db *DB) ListManagementUsersByTenant(ctx context.Context, tenantID string) ([]ManagementUser, error) {
 	query := db.rebind(`SELECT username, tenant_id, password_hash, role, enabled, created_at, updated_at
-		FROM tunnel_management_user WHERE tenant_id = ? ORDER BY LOWER(username)`)
+		FROM specus_management_user WHERE tenant_id = ? ORDER BY LOWER(username)`)
 	rows, err := db.sql.QueryContext(ctx, query, defaultTenant(tenantID))
 	if err != nil {
 		return nil, err
@@ -44,7 +44,7 @@ func (db *DB) ListManagementUsersByTenant(ctx context.Context, tenantID string) 
 
 // InsertManagementUser persists a new DB-backed management user.
 func (db *DB) InsertManagementUser(ctx context.Context, user ManagementUser) error {
-	query := db.rebind(`INSERT INTO tunnel_management_user
+	query := db.rebind(`INSERT INTO specus_management_user
 		(username, tenant_id, password_hash, role, enabled, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`)
 	_, err := db.sql.ExecContext(ctx, query, user.Username, defaultTenant(user.TenantID),
@@ -55,7 +55,7 @@ func (db *DB) InsertManagementUser(ctx context.Context, user ManagementUser) err
 
 // UpdateManagementUser updates mutable fields of a DB-backed management user.
 func (db *DB) UpdateManagementUser(ctx context.Context, user ManagementUser) error {
-	query := db.rebind(`UPDATE tunnel_management_user SET password_hash = ?, role = ?,
+	query := db.rebind(`UPDATE specus_management_user SET password_hash = ?, role = ?,
 		enabled = ?, updated_at = ? WHERE LOWER(username) = LOWER(?)`)
 	_, err := db.sql.ExecContext(ctx, query, user.PasswordHash, normalizeManagementRole(user.Role),
 		boolToInt(user.Enabled), formatTime(user.UpdatedAt), user.Username)
@@ -65,7 +65,7 @@ func (db *DB) UpdateManagementUser(ctx context.Context, user ManagementUser) err
 // DeleteManagementUser removes a DB-backed management user.
 func (db *DB) DeleteManagementUser(ctx context.Context, username string) error {
 	_, err := db.sql.ExecContext(ctx,
-		db.rebind(`DELETE FROM tunnel_management_user WHERE LOWER(username) = LOWER(?)`), username)
+		db.rebind(`DELETE FROM specus_management_user WHERE LOWER(username) = LOWER(?)`), username)
 	return err
 }
 

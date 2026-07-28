@@ -4,7 +4,7 @@ import lombok.Data;
 
 @Data
 public class PeerUdpProbe {
-    public static final String MAGIC = "shuai-peer-mesh";
+    public static final String MAGIC = "specus-peer-mesh";
     public static final String TYPE_CHECK = "check";
     public static final String TYPE_CHECK_RESPONSE = "check-response";
 

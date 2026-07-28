@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/protocol"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/session"
-	"github.com/devShuai/shuai-tunnel/implementations/go/server/internal/store"
+	"github.com/devShuai/specus/implementations/go/server/internal/protocol"
+	"github.com/devShuai/specus/implementations/go/server/internal/session"
+	"github.com/devShuai/specus/implementations/go/server/internal/store"
 )
 
 func TestServeHTTPRejectsKnownOversizedRequestBeforeOpeningStream(t *testing.T) {
@@ -23,7 +23,7 @@ func TestServeHTTPRejectsKnownOversizedRequestBeforeOpeningStream(t *testing.T) 
 		opened = true
 		return nil, nil
 	}, nil, time.Second, 4, 1024, nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
-	request := tunnelRequest(http.MethodPost, "/http/Demo%20client/api/upload?debug=true", "12345")
+	request := specusRequest(http.MethodPost, "/http/Demo%20client/api/upload?debug=true", "12345")
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, request)
@@ -40,7 +40,7 @@ func TestServeHTTPRecordsOfflineError(t *testing.T) {
 	recorder := &capturingDetailRecorder{}
 	service := NewService(session.NewRegistry(), nil, nil, time.Second, 1024, 1024,
 		nil, nil, recorder, store.TrafficDetailOptions{Enabled: true})
-	request := tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", "")
+	request := specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", "")
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, request)
@@ -73,7 +73,7 @@ func TestServeHTTPWaitsForDataReconnect(t *testing.T) {
 	}()
 
 	response := httptest.NewRecorder()
-	service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+	service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
 	<-reconnected
 
 	if response.Code != http.StatusOK || response.Body.String() != "ok" {
@@ -93,7 +93,7 @@ func TestServeHTTPUsesDataChannelAsOnlineAuthority(t *testing.T) {
 		}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
 
 		response := httptest.NewRecorder()
-		service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+		service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
 
 		if response.Code != http.StatusOK {
 			t.Fatalf("response = %d, want 200", response.Code)
@@ -107,7 +107,7 @@ func TestServeHTTPUsesDataChannelAsOnlineAuthority(t *testing.T) {
 			nil, nil, nil, store.TrafficDetailOptions{})
 
 		response := httptest.NewRecorder()
-		service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+		service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
 
 		if response.Code != http.StatusBadGateway {
 			t.Fatalf("response = %d, want 502", response.Code)
@@ -122,7 +122,7 @@ func TestServeHTTPDoesNotWaitForUnknownClient(t *testing.T) {
 	response := httptest.NewRecorder()
 	startedAt := time.Now()
 
-	service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+	service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
 
 	if response.Code != http.StatusBadGateway || time.Since(startedAt) > 500*time.Millisecond {
 		t.Fatalf("response/elapsed = %d/%s, want immediate 502", response.Code, time.Since(startedAt))
@@ -146,7 +146,7 @@ func TestServeHTTPStreamsRequestAndResponseWithCredit(t *testing.T) {
 		opened = metadata
 		return stream, nil
 	}, nil, time.Second, 1024, 1024, traffic, nil, recorder, store.TrafficDetailOptions{Enabled: true})
-	request := tunnelRequest(http.MethodPatch, "/http/Demo%20client/api/items?x=%2F", "request-body")
+	request := specusRequest(http.MethodPatch, "/http/Demo%20client/api/items?x=%2F", "request-body")
 	request.Header.Set("X-Request", "yes")
 	response := httptest.NewRecorder()
 
@@ -176,7 +176,7 @@ func TestServeHTTPPreservesEncodedRelativePath(t *testing.T) {
 		opened = metadata
 		return stream, nil
 	}, nil, time.Second, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
-	request := tunnelRequest(http.MethodGet, "/http/Demo%20client/api/%E4%BD%A0%2Fok/%252F?x=%2F", "")
+	request := specusRequest(http.MethodGet, "/http/Demo%20client/api/%E4%BD%A0%2Fok/%252F?x=%2F", "")
 	response := httptest.NewRecorder()
 
 	service.ServeHTTP(response, request)
@@ -194,14 +194,14 @@ func TestServeHTTPPropagatesHeaderTimeoutAsReset(t *testing.T) {
 		nil, 10*time.Millisecond, 1024, 1024, nil, nil, nil, store.TrafficDetailOptions{})
 	response := httptest.NewRecorder()
 
-	service.ServeHTTP(response, tunnelRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
+	service.ServeHTTP(response, specusRequest(http.MethodGet, "/http/Demo%20client/api/ping", ""))
 
 	if response.Code != http.StatusGatewayTimeout || stream.resetReason == "" {
 		t.Fatalf("timeout response/reset = %d/%q", response.Code, stream.resetReason)
 	}
 }
 
-func tunnelRequest(method, target, body string) *http.Request {
+func specusRequest(method, target, body string) *http.Request {
 	request := httptest.NewRequest(method, target, strings.NewReader(body))
 	request.SetPathValue("clientName", "Demo client")
 	request.SetPathValue("route", "api")
