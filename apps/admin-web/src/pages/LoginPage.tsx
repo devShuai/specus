@@ -181,7 +181,7 @@ function LoginPageContent() {
       <section className="landing-apple-content relative z-10 px-5 py-16 sm:px-8">
         <div className="mx-auto max-w-[1440px]">
           <div className="mb-6 max-w-2xl">
-            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">组网形态</h2>
+            <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">一水两路 · 组网形态</h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
               一套控制面承担两类流量：公网用户经 Server 中继访问内网服务，受控客户端之间在控制面协调下走对端互联通道。
             </p>
@@ -190,7 +190,7 @@ function LoginPageContent() {
 
           <div className="mb-6 mt-12 max-w-2xl">
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">
-              引水渠与打洞
+              架渠与打洞
             </h2>
             <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
               HTTP 路由与端口映射是<b className="font-semibold text-zinc-800 dark:text-zinc-200">渠</b>——
@@ -203,6 +203,7 @@ function LoginPageContent() {
             <PrincipleCard
               badge="HTTP route"
               index="01"
+              motif="渠"
               title="HTTP 路由：按 Host 与 Path 进入内网 Web 服务"
               description="请求先进 Server 的 HTTP 网关，管理端配置决定命中哪个租户、客户端和目标地址，再把请求沿客户端长连接送回内网。"
               accent="blue"
@@ -218,6 +219,7 @@ function LoginPageContent() {
               badge="Port mapping"
               className="2xl:mt-12"
               index="02"
+              motif="引"
               title="公网端口映射：按监听端口进入内网 TCP 服务"
               description="Server 先占用公网端口，外部连接到来后查找端口映射，把字节流封装进客户端隧道，再落到指定内网 IP 和端口。"
               accent="amber"
@@ -232,6 +234,7 @@ function LoginPageContent() {
             <PrincipleCard
               badge="Peer mesh"
               index="03"
+              motif="洞"
               title="客户端互联：受控对端之间的直连通道"
               description="客户端登录时上报 X25519 公钥并接收 roster；控制面校验 ACL 后撮合两端通过 PEER_CONTROL 通道协商身份与会话凭证。"
               accent="emerald"
@@ -303,7 +306,7 @@ function LoginPageContent() {
  * 拓扑总览图：左 公网用户 / 中 Server 控制面 / 右上 客户端 A / 右下 客户端 B。
  *
  * 视觉约定：
- *  - Apple blue 实线：经 Server 中继的反向隧道（HTTP/TCP 主路径）。
+ *  - 水蓝渐变实线：经 Server 中继的反向隧道（HTTP/TCP 主路径），与主视觉的渠水同源。
  *  - emerald 虚线：客户端互联（信令 + 加密 frame 直连 / TURN 回退）。
  *
  * 暗色协调：节点 fill/stroke 走 CSS class `.topo-card-fill / .topo-card-stroke`，
@@ -328,6 +331,11 @@ function TopologyDiagram() {
           <marker id="topo-arrow-emerald" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="8" markerHeight="8" orient="auto">
             <path d="M0,0 L12,6 L0,12 z" fill="rgb(16,185,129)" />
           </marker>
+          {/* 中继路径 = 渠：描边从动作蓝渐到水蓝，与主视觉的槽中活水同源 */}
+          <linearGradient id="topo-water" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stopColor="var(--landing-action)" />
+            <stop offset="1" stopColor="var(--specus-water)" />
+          </linearGradient>
         </defs>
 
         {/* 左节点：公网用户 (x: 30-230, y 居中于 220 附近) */}
@@ -373,16 +381,16 @@ function TopologyDiagram() {
 
         {/* === 中继路径：公网用户 ↔ Server （上下分开，避免重合） === */}
         {/* 公网请求：左下 → Server 左上 */}
-        <line x1="232" y1="205" x2="418" y2="170" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
+        <line x1="232" y1="205" x2="418" y2="170" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
         <text x="320" y="178" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" fontWeight="600">公网请求</text>
         {/* 响应：Server 左下 → 公网用户右下 */}
-        <line x1="418" y1="270" x2="232" y2="240" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
+        <line x1="418" y1="270" x2="232" y2="240" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
         <text x="320" y="270" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" opacity="0.78" fontWeight="600">响应</text>
 
         {/* === 中继路径：Server ↔ 客户端 A === */}
-        <line x1="662" y1="160" x2="848" y2="130" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
+        <line x1="662" y1="160" x2="848" y2="130" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" />
         <text x="755" y="135" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" fontWeight="600">下发 / 转发</text>
-        <line x1="848" y1="180" x2="662" y2="195" stroke="var(--landing-action)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
+        <line x1="848" y1="180" x2="662" y2="195" stroke="url(#topo-water)" strokeWidth="2" markerEnd="url(#topo-arrow-blue)" className="topology-relay-flow" opacity="0.6" />
         <text x="755" y="205" textAnchor="middle" fontSize="11.5" fill="var(--landing-action)" opacity="0.78" fontWeight="600">上行字节</text>
 
         {/* === 信令路径：Server ↔ 客户端 B（emerald 虚线，label 放线上方留白处） === */}
@@ -624,6 +632,7 @@ function PrincipleCard({
   className = "",
   description,
   index,
+  motif,
   preview,
   title,
 }: {
@@ -633,6 +642,8 @@ function PrincipleCard({
   className?: string;
   description: string;
   index: string;
+  /** 意象小章：渠 / 引 / 洞，与主视觉三连拱一一对应 */
+  motif?: string;
   preview?: boolean;
   title: string;
 }) {
@@ -652,6 +663,7 @@ function PrincipleCard({
       <div className="principle-card-body grid gap-5 p-5">
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
+            {motif && <span className="principle-motif" aria-hidden="true">{motif}</span>}
             <span className="principle-badge w-fit rounded-md px-2 py-1 text-tiny">{badge}</span>
             {preview && <span className="preview-badge">Preview</span>}
           </div>

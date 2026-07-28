@@ -2297,8 +2297,26 @@ body {
 .specus-aqueduct {
   width: 100%;
   height: auto;
-  max-width: 640px;
+  max-width: 720px;
   overflow: visible;
+}
+
+/* 槽中水面的流动高光：dash march 模拟水流。reduced-motion 下静止，
+   静态 dash 仍读得出是水面粼光，不会变成杂讯。 */
+.specus-water-march {
+  stroke-dasharray: 12 14;
+  animation: specus-water-march 1.5s linear infinite;
+}
+
+@keyframes specus-water-march {
+  from { stroke-dashoffset: 26; }
+  to { stroke-dashoffset: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .specus-water-march {
+    animation: none;
+  }
 }
 
 /* 动效降级在组件内按 prefers-reduced-motion 分支渲染：
@@ -2333,6 +2351,11 @@ body {
   --landing-action-soft: rgba(122, 92, 230, 0.1);
   --specus-stroke: #14161f;
   --specus-accent: #0066cc;
+  /* 渠水与石材质感 */
+  --specus-water: #0ea5e9;
+  --specus-water-bright: #38bdf8;
+  --specus-hero-glow: rgba(56, 189, 248, 0.13);
+  --specus-hero-glow-accent: rgba(0, 102, 204, 0.08);
   --landing-canvas: #f5f5f7;
   --landing-section: #ffffff;
   --landing-surface: #ffffff;
@@ -2351,6 +2374,10 @@ body {
   --landing-action-soft: rgba(155, 130, 255, 0.16);
   --specus-stroke: #f2f3f7;
   --specus-accent: #2997ff;
+  --specus-water: #22d3ee;
+  --specus-water-bright: #67e8f9;
+  --specus-hero-glow: rgba(34, 211, 238, 0.1);
+  --specus-hero-glow-accent: rgba(41, 151, 255, 0.09);
   --landing-canvas: #000000;
   --landing-section: #1d1d1f;
   --landing-surface: #272729;
@@ -2370,7 +2397,11 @@ body {
 }
 
 .landing-apple-hero {
-  background: var(--landing-canvas);
+  /* 首屏水光：主视觉背后铺一层淡淡的渠水辉光，仍在 canvas 色系内，克制但可感知 */
+  background:
+    radial-gradient(58% 46% at 50% 46%, var(--specus-hero-glow), transparent 72%),
+    radial-gradient(36% 30% at 50% 30%, var(--specus-hero-glow-accent), transparent 70%),
+    var(--landing-canvas);
 }
 
 .landing-apple-header {
@@ -2621,6 +2652,54 @@ body {
 
 .dark .landing-apple .principle-card-emerald {
   --principle-accent: 52, 211, 153;
+}
+
+/* 拱形轮廓光：卡片顶部一团 accent 色拱影，呼应主视觉的三连拱。
+   注意必须用 background-image（非 shorthand），否则会与上方
+   `.landing-apple .principle-card { background: ... !important }` 互相覆盖。 */
+.landing-apple .principle-card-blue,
+.landing-apple .principle-card-amber,
+.landing-apple .principle-card-emerald {
+  background-image: radial-gradient(
+    130% 72% at 50% -22%,
+    rgba(var(--principle-accent), 0.1),
+    transparent 64%
+  ) !important;
+}
+
+.dark .landing-apple .principle-card-blue,
+.dark .landing-apple .principle-card-amber,
+.dark .landing-apple .principle-card-emerald {
+  background-image: radial-gradient(
+    130% 72% at 50% -22%,
+    rgba(var(--principle-accent), 0.16),
+    transparent 64%
+  ) !important;
+}
+
+/* 意象小章：渠 / 洞 / 联。拱顶门洞造型（上圆下方），与 badge 并列 */
+.principle-motif {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 32px;
+  border: 1.5px solid rgba(var(--principle-accent), 0.55);
+  border-radius: 15px 15px 4px 4px;
+  color: rgb(var(--principle-accent));
+  background: rgba(var(--principle-accent), 0.08);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* 拓扑图数据面：暗色下给水流与信令一点辉光，让"渠"从深底浮出来 */
+.dark .landing-apple .topology-relay-flow {
+  filter: drop-shadow(0 0 6px rgba(41, 151, 255, 0.35));
+}
+
+.dark .landing-apple .topology-peer-flow {
+  filter: drop-shadow(0 0 6px rgba(16, 185, 129, 0.35));
 }
 
 .landing-apple .principle-flowgrid {
