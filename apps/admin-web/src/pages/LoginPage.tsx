@@ -140,7 +140,9 @@ function LoginPageContent() {
               </p>
             </div>
 
-            <SpecusAqueduct className="mx-auto" />
+            <div className="specus-aqueduct-bleed">
+              <SpecusAqueduct />
+            </div>
 
             <div className="flex flex-wrap items-center justify-center gap-3">
               <button type="button" className="landing-primary-button" onClick={() => openLogin()}>
@@ -192,11 +194,20 @@ function LoginPageContent() {
             <h2 className="text-2xl font-semibold tracking-tight text-zinc-950 dark:text-white">
               架渠与打洞
             </h2>
-            <p className="mt-2 text-small leading-6 text-zinc-600 dark:text-zinc-400">
-              HTTP 路由与端口映射是<b className="font-semibold text-zinc-800 dark:text-zinc-200">渠</b>——
-              流量沿既定渠道从公网流进内网；客户端互联是<b className="font-semibold text-zinc-800 dark:text-zinc-200">洞</b>——
-              控制面撮合信令，加密 frame 走 UDP 直连，打不通时回退 TURN。
-            </p>
+            <div className="mt-4 flex flex-col gap-2.5">
+              <p className="landing-motif-line">
+                <span className="landing-motif-chip landing-motif-chip-blue" aria-hidden="true">渠</span>
+                <span>
+                  <b>HTTP 路由与端口映射</b>：流量沿既定渠道，从公网流进内网。
+                </span>
+              </p>
+              <p className="landing-motif-line">
+                <span className="landing-motif-chip landing-motif-chip-emerald" aria-hidden="true">洞</span>
+                <span>
+                  <b>客户端互联</b>：控制面撮合信令，加密 frame 走 UDP 直连；打不通时回退 TURN。
+                </span>
+              </p>
+            </div>
           </div>
 
           <div className="mb-10 grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">

@@ -2299,11 +2299,19 @@ body {
 
 /* ── specus 主视觉：引水渠 ─────────────────────────────────────────── */
 
+/* 通栏容器：跳出内容列 padding，让渠体横贯整个视口；
+   定高 + slice 裁剪，窄屏切掉两侧拱券而不是把整体缩到看不清 */
+.specus-aqueduct-bleed {
+  width: 100vw;
+  height: clamp(220px, 26vw, 340px);
+  margin-left: calc(50% - 50vw);
+}
+
 .specus-aqueduct {
+  display: block;
   width: 100%;
-  height: auto;
-  max-width: 720px;
-  overflow: visible;
+  height: 100%;
+  overflow: hidden;
 }
 
 /* 槽中水面的流动高光：dash march 模拟水流。reduced-motion 下静止，
@@ -2696,6 +2704,54 @@ body {
   font-size: 13px;
   font-weight: 700;
   line-height: 1;
+}
+
+/* 章节导语里的行内意象小章：与原理卡片的 motif 同一造型，小一号 */
+.landing-motif-line {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  font-size: 0.875rem;
+  line-height: 1.625;
+  color: var(--landing-muted);
+}
+
+.landing-motif-line b {
+  color: var(--landing-ink);
+  font-weight: 600;
+}
+
+.landing-motif-chip {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 26px;
+  border-width: 1.5px;
+  border-style: solid;
+  border-radius: 12px 12px 3px 3px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.landing-motif-chip-blue {
+  border-color: color-mix(in srgb, var(--landing-action) 50%, transparent);
+  color: var(--landing-action);
+  background: color-mix(in srgb, var(--landing-action) 8%, transparent);
+}
+
+.landing-motif-chip-emerald {
+  border-color: rgba(5, 150, 105, 0.5);
+  color: rgb(5, 150, 105);
+  background: rgba(5, 150, 105, 0.08);
+}
+
+.dark .landing-motif-chip-emerald {
+  border-color: rgba(52, 211, 153, 0.5);
+  color: rgb(52, 211, 153);
+  background: rgba(52, 211, 153, 0.1);
 }
 
 /* 拓扑图数据面：暗色下给水流与信令一点辉光，让"渠"从深底浮出来 */

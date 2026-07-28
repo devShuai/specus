@@ -1,44 +1,63 @@
 import { useEffect, useState } from "react";
 
-/** 静止态下三束流光在输水槽上停靠的位置。 */
-const RESTING_FLOW_X = [140, 360, 580];
+/** 画面逻辑宽度：贯穿屏幕的通栏画布，居中构图、两侧拱券渐隐。 */
+const SCENE_WIDTH = 1440;
+const SCENE_CENTER = SCENE_WIDTH / 2;
 
-/** 下层三连拱的拱心横坐标，与三条产品链路一一对应。 */
-const ARCH_CENTERS = [160, 360, 560];
+/** 静止态下流光在输水槽上停靠的位置，沿全宽均匀分布。 */
+const RESTING_FLOW_X = [180, 540, 900, 1260];
 
-const ARCH_LABELS = ["HTTP 路由", "端口映射", "对端互联"];
+/** 带链路标注的三连拱（画面中央），与三条产品链路一一对应。 */
+const LABELED_ARCHES = [
+  { cx: 520, label: "HTTP 路由" },
+  { cx: 720, label: "端口映射" },
+  { cx: 920, label: "对端互联" },
+];
+
+/** 全宽拱券：中央三连拱 + 两侧延伸拱，opacity 随离画面中心的距离衰减。 */
+const ARCH_OPACITY_BY_DISTANCE: Record<number, number> = {
+  0: 1,
+  200: 0.6,
+  400: 0.38,
+  600: 0.2,
+};
+const ARCH_STEP = 200;
+const ARCH_CENTERS: Array<{ cx: number; opacity: number }> = [];
+for (let offset = 0; offset <= SCENE_CENTER; offset += ARCH_STEP) {
+  for (const cx of offset === 0 ? [SCENE_CENTER] : [SCENE_CENTER - offset, SCENE_CENTER + offset]) {
+    ARCH_CENTERS.push({ cx, opacity: ARCH_OPACITY_BY_DISTANCE[offset] ?? 0.2 });
+  }
+}
+ARCH_CENTERS.sort((a, b) => a.cx - b.cx);
 
 /** 拱洞落光 / 涟漪的节奏：三拱错开，读起来像持续不断的来水。 */
 const DROP_DURATION = "2.8s";
 
-/** 上层小拱廊：等宽拱 + 等宽墩，由基准 x 步进生成，避免手写十几条 path。 */
-const ARCADE_START_X = 70;
+/** 上层小拱廊：等宽拱 + 等宽墩，按步进铺满全宽。 */
 const ARCADE_ARCH_WIDTH = 34;
 const ARCADE_STEP = 42;
-const ARCADE_COUNT = 14;
 
 function buildArcadePath(): string {
   const segments: string[] = [];
-  for (let i = 0; i < ARCADE_COUNT; i += 1) {
-    const x = ARCADE_START_X + i * ARCADE_STEP;
+  for (let x = -8; x <= SCENE_WIDTH; x += ARCADE_STEP) {
     segments.push(`M${x} 180 V135 A17 17 0 0 1 ${x + ARCADE_ARCH_WIDTH} 135 V180`);
   }
   return segments.join(" ");
 }
 
-/** 下层拱墩上的砌缝短划，给出石材的尺度感。 */
-const PIER_FACE_X = [90, 230, 290, 430, 490, 630];
+/** 拱墩上的砌缝短划，给出石材的尺度感。 */
 const PIER_JOINT_Y = [275, 296];
 
 /**
- * specus 主视觉：罗马引水渠。
+ * specus 主视觉：贯穿屏幕的罗马引水渠。
  *
- * 品牌标识本身就是这条渠——顶部输水槽、三连拱、拱心一点流光。落地页把它放大成主视觉，
- * 让"specus（拉丁语：地道 / 引水渠）"这个名字在第一屏就自我解释：
+ * 品牌标识本身就是这条渠——顶部输水槽、连拱、水流。落地页把它拉成通栏长卷：
+ * 水槽与拱券横贯整个视口、向两侧渐隐，如同延伸进山谷的渠体；
+ * 中央三连拱对应三条产品链路（HTTP 路由 / 端口映射 / 对端互联），
+ * 光从拱洞坠入下方水面、激起涟漪——渠送水，洞通流，每一段水流都看得见。
  *
- *  - 输水槽里有活水流动，三束流光沿水面滑行，对应三条链路（HTTP 路由 / 端口映射 / 对端互联）；
- *  - 上层小拱廊托住水槽，下层三连拱是"被打通的洞"；
- *  - 光从每个拱洞坠入下方水面、激起涟漪——渠送水，洞通流，每一段水流都看得见。
+ * preserveAspectRatio="xMidYMid slice"：窄屏裁掉两侧拱券而非整体缩小，
+ * 中央构图在任何视口宽度下都保持可读。
  *
  * 尊重 prefers-reduced-motion：关闭动效后水面静止、光点驻留，构图不塌。
  * SMIL 的 animateMotion / animate 不受 CSS display 约束，所以静止态由 JS 分支渲染，
@@ -58,61 +77,65 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
   return (
     <svg
       className={`specus-aqueduct ${className}`}
-      viewBox="0 0 720 380"
+      viewBox={`0 0 ${SCENE_WIDTH} 380`}
+      preserveAspectRatio="xMidYMid slice"
       fill="none"
       role="img"
-      aria-label="specus 引水渠：活水沿输水槽经过三连拱，光从拱洞落入内网水面"
+      aria-label="specus 引水渠：活水沿通栏输水槽经过连拱，光从拱洞落入内网水面"
     >
       <defs>
-        <linearGradient id="specus-channel" x1="48" y1="0" x2="672" y2="0" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="var(--specus-stroke)" stopOpacity="0.25" />
+        {/* 槽壁 / 地平的描边渐变：两端渐隐，让渠体延伸出画面 */}
+        <linearGradient id="specus-channel" x1="0" y1="0" x2={SCENE_WIDTH} y2="0" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="var(--specus-stroke)" stopOpacity="0" />
+          <stop offset="0.12" stopColor="var(--specus-stroke)" stopOpacity="0.9" />
           <stop offset="0.5" stopColor="var(--specus-stroke)" />
-          <stop offset="1" stopColor="var(--specus-stroke)" stopOpacity="0.25" />
+          <stop offset="0.88" stopColor="var(--specus-stroke)" stopOpacity="0.9" />
+          <stop offset="1" stopColor="var(--specus-stroke)" stopOpacity="0" />
         </linearGradient>
-        {/* 槽中水面：上亮下暗的一层薄水 */}
-        <linearGradient id="specus-water-fill" x1="0" y1="89" x2="0" y2="99" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="var(--specus-water-bright)" stopOpacity="0.85" />
-          <stop offset="1" stopColor="var(--specus-water)" stopOpacity="0.3" />
+        {/* 槽中水面：上亮下暗的一层薄水，两端随渠体渐隐 */}
+        <linearGradient id="specus-water-fill" x1="0" y1="0" x2={SCENE_WIDTH} y2="0" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="var(--specus-water-bright)" stopOpacity="0" />
+          <stop offset="0.1" stopColor="var(--specus-water-bright)" stopOpacity="0.85" />
+          <stop offset="0.9" stopColor="var(--specus-water-bright)" stopOpacity="0.85" />
+          <stop offset="1" stopColor="var(--specus-water-bright)" stopOpacity="0" />
         </linearGradient>
-        <radialGradient id="specus-glow">
-          <stop offset="0" stopColor="var(--specus-accent)" stopOpacity="0.55" />
-          <stop offset="1" stopColor="var(--specus-accent)" stopOpacity="0" />
-        </radialGradient>
         {/* 拱下水潭：一团淡淡的水光 */}
         <radialGradient id="specus-pool">
           <stop offset="0" stopColor="var(--specus-water)" stopOpacity="0.4" />
           <stop offset="1" stopColor="var(--specus-water)" stopOpacity="0" />
         </radialGradient>
-        {/* 流光沿渠道行进的轨迹：与水面同一条线 */}
-        <path id="specus-flow-path" d="M48 94 H672" />
+        {/* 流光沿渠道行进的轨迹：与水面同一条线，贯穿全宽 */}
+        <path id="specus-flow-path" d={`M0 94 H${SCENE_WIDTH}`} />
       </defs>
 
       {/* 拱下水潭：三团水光先铺在桥体后面 */}
-      {ARCH_CENTERS.map((cx) => (
+      {LABELED_ARCHES.map(({ cx }) => (
         <ellipse key={`pool-${cx}`} cx={cx} cy="322" rx="52" ry="12" fill="url(#specus-pool)" />
       ))}
 
       {/* 地平线 */}
-      <path d="M24 320 H696" stroke="var(--specus-stroke)" strokeWidth="4" strokeLinecap="round" opacity="0.28" />
+      <path d={`M0 320 H${SCENE_WIDTH}`} stroke="url(#specus-channel)" strokeWidth="4" strokeLinecap="round" opacity="0.3" />
 
-      {/* 下层三连拱：中拱完整，两侧拱略淡，与 logo 的层次一致 */}
+      {/* 下层拱券：中央三连拱完整，两侧延伸拱渐隐入山谷 */}
       <g stroke="var(--specus-stroke)" strokeWidth="8" strokeLinecap="round" strokeLinejoin="round" fill="none">
-        <path d="M90 320 V250 A70 70 0 0 1 230 250 V320" opacity="0.6" />
-        <path d="M290 320 V250 A70 70 0 0 1 430 250 V320" />
-        <path d="M490 320 V250 A70 70 0 0 1 630 250 V320" opacity="0.6" />
+        {ARCH_CENTERS.map(({ cx, opacity }) => (
+          <path key={`arch-${cx}`} d={`M${cx - 70} 320 V250 A70 70 0 0 1 ${cx + 70} 250 V320`} opacity={opacity} />
+        ))}
       </g>
 
-      {/* 拱墩砌缝 */}
+      {/* 拱墩砌缝（只画中央三连拱，远处拱墩淡到看不出砌缝） */}
       <g stroke="var(--specus-stroke)" strokeWidth="4" strokeLinecap="round" opacity="0.22">
-        {PIER_FACE_X.flatMap((x) =>
-          PIER_JOINT_Y.map((y) => <path key={`joint-${x}-${y}`} d={`M${x - 7} ${y} H${x + 7}`} />),
+        {LABELED_ARCHES.flatMap(({ cx }) =>
+          [cx - 70, cx + 70].flatMap((x) =>
+            PIER_JOINT_Y.map((y) => <path key={`joint-${x}-${y}`} d={`M${x - 7} ${y} H${x + 7}`} />),
+          ),
         )}
       </g>
 
       {/* 下层桥面（同时是上层拱廊的基线） */}
-      <path d="M60 180 H660" stroke="var(--specus-stroke)" strokeWidth="5" strokeLinecap="round" opacity="0.85" />
+      <path d={`M0 180 H${SCENE_WIDTH}`} stroke="url(#specus-channel)" strokeWidth="5" strokeLinecap="round" opacity="0.85" />
 
-      {/* 上层小拱廊 */}
+      {/* 上层小拱廊：铺满全宽 */}
       <path
         d={buildArcadePath()}
         stroke="var(--specus-stroke)"
@@ -124,18 +147,17 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
       />
 
       {/* 拱廊上方的檐部双线 */}
-      <path d="M56 118 H664" stroke="var(--specus-stroke)" strokeWidth="4" strokeLinecap="round" opacity="0.7" />
-      <path d="M56 100 H664" stroke="var(--specus-stroke)" strokeWidth="4" strokeLinecap="round" opacity="0.55" />
+      <path d={`M0 118 H${SCENE_WIDTH}`} stroke="url(#specus-channel)" strokeWidth="4" strokeLinecap="round" opacity="0.7" />
+      <path d={`M0 100 H${SCENE_WIDTH}`} stroke="url(#specus-channel)" strokeWidth="4" strokeLinecap="round" opacity="0.55" />
 
-      {/* 输水槽：槽壁 + 两端封口 */}
-      <path d="M48 88 H672" stroke="url(#specus-channel)" strokeWidth="5" strokeLinecap="round" />
-      <path d="M48 100 H672" stroke="var(--specus-stroke)" strokeWidth="4" strokeLinecap="round" opacity="0.55" />
-      <path d="M48 88 V100 M672 88 V100" stroke="var(--specus-stroke)" strokeWidth="4" strokeLinecap="round" opacity="0.55" />
+      {/* 输水槽：槽壁横贯全宽 */}
+      <path d={`M0 88 H${SCENE_WIDTH}`} stroke="url(#specus-channel)" strokeWidth="5" strokeLinecap="round" />
+      <path d={`M0 100 H${SCENE_WIDTH}`} stroke="url(#specus-channel)" strokeWidth="4" strokeLinecap="round" opacity="0.55" />
 
       {/* 槽中活水：水带 + 流动的高光（dash march，CSS 驱动，reduced-motion 下自动静止） */}
-      <rect x="50" y="89.5" width="620" height="9" fill="url(#specus-water-fill)" />
+      <rect x="0" y="89.5" width={SCENE_WIDTH} height="9" fill="url(#specus-water-fill)" />
       <path
-        d="M50 94 H670"
+        d={`M8 94 H${SCENE_WIDTH - 8}`}
         stroke="var(--specus-water-bright)"
         strokeWidth="3"
         strokeLinecap="round"
@@ -143,11 +165,7 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
         opacity="0.75"
       />
 
-      {/* 主拱拱心的驻留光：标识里那颗蓝点 */}
-      <circle cx="360" cy="212" r="34" fill="url(#specus-glow)" />
-      <circle cx="360" cy="212" r="7" fill="var(--specus-accent)" />
-
-      {/* 三束流光：延迟错开，沿水面滑行 */}
+      {/* 流光：延迟错开，沿水面横贯全屏 */}
       {RESTING_FLOW_X.map((restingX, index) =>
         reduceMotion ? (
           <circle
@@ -160,23 +178,23 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
           />
         ) : (
           <circle key={restingX} r="5" fill="var(--specus-accent)">
-            <animateMotion dur="5.2s" begin={`${index * 1.73}s`} repeatCount="indefinite">
+            <animateMotion dur="9.6s" begin={`${index * 2.4}s`} repeatCount="indefinite">
               <mpath href="#specus-flow-path" />
             </animateMotion>
             <animate
               attributeName="opacity"
               values="0;1;1;0"
-              keyTimes="0;0.12;0.88;1"
-              dur="5.2s"
-              begin={`${index * 1.73}s`}
+              keyTimes="0;0.06;0.94;1"
+              dur="9.6s"
+              begin={`${index * 2.4}s`}
               repeatCount="indefinite"
             />
           </circle>
         ),
       )}
 
-      {/* 拱洞落光与涟漪：光穿过拱洞坠入水潭——洞通流 */}
-      {ARCH_CENTERS.map((cx, index) =>
+      {/* 拱洞落光与涟漪：光穿过中央三连拱坠入水潭——洞通流 */}
+      {LABELED_ARCHES.map(({ cx }, index) =>
         reduceMotion ? (
           <g key={`drop-${cx}`}>
             <circle cx={cx} cy="255" r="4" fill="var(--specus-accent)" opacity="0.45" />
@@ -229,8 +247,8 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
         ),
       )}
 
-      {/* 三拱对应的三条链路 */}
-      {ARCH_CENTERS.map((cx, index) => (
+      {/* 中央三连拱对应的三条链路 */}
+      {LABELED_ARCHES.map(({ cx, label }) => (
         <text
           key={`label-${cx}`}
           x={cx}
@@ -240,7 +258,7 @@ export function SpecusAqueduct({ className = "" }: { className?: string }) {
           fill="currentColor"
           opacity="0.55"
         >
-          {ARCH_LABELS[index]}
+          {label}
         </text>
       ))}
     </svg>
