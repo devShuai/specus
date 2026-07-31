@@ -4,11 +4,17 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.theshuai.common.util.JsonUtil;
 import com.theshuai.specusserver.config.OidcProperties;
 import com.theshuai.specusserver.management.service.RegistrationService;
+import com.theshuai.specusserver.management.service.ManagementUserService;
+import com.theshuai.specusserver.management.service.ManagementUserService.LoginUser;
 import com.theshuai.specusserver.security.LocalTokenService;
 import com.theshuai.specusserver.security.TurnstileVerifier;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.JwtException;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -21,10 +27,12 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Public OIDC helper endpoints for the single-page admin UI:
@@ -40,19 +48,26 @@ import java.util.Map;
 public class OidcController {
     private final OidcProperties properties;
     private final LocalTokenService localTokenService;
+    private final ManagementUserService managementUserService;
     private final RegistrationService registrationService;
     private final TurnstileVerifier turnstileVerifier;
+    private final ObjectProvider<JwtDecoder> jwtDecoderProvider;
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    public OidcController(OidcProperties properties, LocalTokenService localTokenService,
+    public OidcController(OidcProperties properties,
+                          LocalTokenService localTokenService,
+                          ManagementUserService managementUserService,
                           RegistrationService registrationService,
-                          TurnstileVerifier turnstileVerifier) {
+                          TurnstileVerifier turnstileVerifier,
+                          ObjectProvider<JwtDecoder> jwtDecoderProvider) {
         this.properties = properties;
         this.localTokenService = localTokenService;
+        this.managementUserService = managementUserService;
         this.registrationService = registrationService;
         this.turnstileVerifier = turnstileVerifier;
+        this.jwtDecoderProvider = jwtDecoderProvider;
     }
 
     @GetMapping("/oidc-config")
@@ -79,8 +94,11 @@ public class OidcController {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                     .body(Map.of("error", "OIDC 未配置（缺少 client-id）"));
         }
-        if (request == null || !StringUtils.hasText(request.code()) || !StringUtils.hasText(request.codeVerifier())) {
-            return ResponseEntity.badRequest().body(Map.of("error", "缺少 code 或 code_verifier"));
+        if (request == null
+                || !StringUtils.hasText(request.code())
+                || !StringUtils.hasText(request.codeVerifier())
+                || !StringUtils.hasText(request.nonce())) {
+            return ResponseEntity.badRequest().body(Map.of("error", "缺少 code、code_verifier 或 nonce"));
         }
 
         Map<String, String> form = new LinkedHashMap<>();
@@ -118,11 +136,47 @@ public class OidcController {
                         "error", body.path("error").asText("token_exchange_failed"),
                         "error_description", body.path("error_description").asText("")));
             }
+            String rawIdToken = body.path("id_token").asText("");
+            if (!StringUtils.hasText(rawIdToken)) {
+                log.warn("[oidc] token exchange response is missing id_token");
+                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                        .body(Map.of("error", "OIDC 响应缺少 ID Token"));
+            }
+            Jwt idToken;
+            try {
+                JwtDecoder jwtDecoder = jwtDecoderProvider.getIfAvailable();
+                if (jwtDecoder == null) {
+                    log.warn("[oidc] JWT decoder is unavailable");
+                    return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                            .body(Map.of("error", "OIDC 校验服务不可用"));
+                }
+                idToken = jwtDecoder.decode(rawIdToken);
+            } catch (JwtException e) {
+                log.warn("[oidc] ID Token validation failed: {}", e.getMessage());
+                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                        .body(Map.of("error", "OIDC ID Token 校验失败"));
+            }
+            if (!StringUtils.hasText(idToken.getSubject())
+                    || !constantTimeEquals(request.nonce(), claimAsString(idToken, "nonce"))) {
+                log.warn("[oidc] ID Token subject or nonce validation failed");
+                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                        .body(Map.of("error", "OIDC ID Token 身份或 nonce 校验失败"));
+            }
+            String preferredUsername = claimAsString(idToken, "preferred_username");
+            Optional<LoginUser> loginUser = managementUserService.resolveOidcUser(preferredUsername);
+            if (loginUser.isEmpty()) {
+                log.warn("[oidc] authenticated Certus identity is not provisioned in Specus");
+                return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                        .body(Map.of("error", "该 Certus 账号尚未获准访问 Specus"));
+            }
+            LoginUser user = loginUser.get();
             Map<String, Object> tokens = new LinkedHashMap<>();
-            tokens.put("accessToken", body.path("access_token").asText(null));
-            tokens.put("idToken", body.path("id_token").asText(null));
+            tokens.put("accessToken",
+                    localTokenService.issueToken(user.username(), user.tenantId(), user.role()));
+            // Kept in sessionStorage by the browser and used only as an RP-Initiated Logout hint.
+            tokens.put("idToken", rawIdToken);
             tokens.put("tokenType", body.path("token_type").asText("Bearer"));
-            tokens.put("expiresIn", body.path("expires_in").asLong(0));
+            tokens.put("expiresIn", localTokenService.getTtlSeconds());
             return ResponseEntity.ok(tokens);
         } catch (Exception e) {
             log.warn("[oidc] token exchange error: {}", e.getMessage());
@@ -143,6 +197,20 @@ public class OidcController {
         return builder.toString();
     }
 
-    public record TokenExchangeRequest(String code, String codeVerifier) {
+    private static String claimAsString(Jwt jwt, String claimName) {
+        Object value = jwt.getClaims().get(claimName);
+        return value == null ? "" : value.toString();
+    }
+
+    private static boolean constantTimeEquals(String expected, String actual) {
+        if (expected == null || actual == null) {
+            return false;
+        }
+        return MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8),
+                actual.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public record TokenExchangeRequest(String code, String codeVerifier, String nonce) {
     }
 }

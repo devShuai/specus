@@ -54,6 +54,34 @@ public class ManagementUserService {
                 .map(user -> new LoginUser(user.getUsername(), user.getTenantId(), user.getRole(), false));
     }
 
+    /**
+     * Authorizes an identity already authenticated by Certus against Specus' existing user
+     * directory. This intentionally links by the immutable imported username only: an email claim
+     * is profile data and must never silently take over an existing local account.
+     */
+    @Transactional(readOnly = true)
+    public Optional<LoginUser> resolveOidcUser(String preferredUsername) {
+        if (!StringUtils.hasText(preferredUsername)) {
+            return Optional.empty();
+        }
+        String normalized;
+        try {
+            normalized = normalizeUsername(preferredUsername);
+        } catch (IllegalArgumentException ignored) {
+            return Optional.empty();
+        }
+        if (normalized.equalsIgnoreCase(authProperties.getUsername())) {
+            return Optional.of(new LoginUser(
+                    authProperties.getUsername(),
+                    TenantContext.normalize(authProperties.getTenantId()),
+                    ManagementRole.ADMIN,
+                    true));
+        }
+        return repository.findByUsernameIgnoreCase(normalized)
+                .filter(ManagementUser::isEnabled)
+                .map(user -> new LoginUser(user.getUsername(), user.getTenantId(), user.getRole(), false));
+    }
+
     @Transactional(readOnly = true)
     public ManagementUserView currentUser(ManagementContext context) {
         if (context.username().equalsIgnoreCase(authProperties.getUsername())) {

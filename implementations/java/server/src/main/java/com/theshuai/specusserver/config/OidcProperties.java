@@ -11,15 +11,15 @@ import org.springframework.stereotype.Component;
 @Component
 @ConfigurationProperties(prefix = "specus.oidc")
 public class OidcProperties {
-    private String issuer = "https://gateway.toys.theshuai.com/auth";
-    private String jwkSetUri = "https://gateway.toys.theshuai.com/auth/oauth2/jwks";
-    private String authorizationEndpoint = "https://gateway.toys.theshuai.com/auth/oauth2/authorize";
-    private String tokenEndpoint = "https://gateway.toys.theshuai.com/auth/oauth2/token";
-    private String endSessionEndpoint = "https://gateway.toys.theshuai.com/auth/connect/logout";
+    private String issuer = "https://certus.devshuai.com";
+    private String jwkSetUri = "https://certus.devshuai.com/oauth2/jwks";
+    private String authorizationEndpoint = "https://certus.devshuai.com/oauth2/authorize";
+    private String tokenEndpoint = "https://certus.devshuai.com/oauth2/token";
+    private String endSessionEndpoint = "https://certus.devshuai.com/oauth2/logout";
     private String clientId = "";
     private String clientSecret = "";
     private String redirectUri = "http://127.0.0.1:8088/";
-    private String scope = "openid";
+    private String scope = "openid profile email";
     /** Optional expected audience; when blank, audience is not enforced. */
     private String audience = "";
     /** Claim name used to scope admin API data per tenant. Blank falls back to the default tenant. */

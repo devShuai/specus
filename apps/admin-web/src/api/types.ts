@@ -16,6 +16,7 @@ export interface OidcConfig {
 
 export interface TokenResponse {
   accessToken: string;
+  idToken?: string;
   tokenType: string;
   expiresIn: number;
   error?: string;

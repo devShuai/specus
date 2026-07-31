@@ -223,11 +223,11 @@ export async function refreshToken(): Promise<TokenResponse> {
   return (await response.json()) as TokenResponse;
 }
 
-export async function oidcExchange(code: string, codeVerifier: string): Promise<TokenResponse> {
+export async function oidcExchange(code: string, codeVerifier: string, nonce: string): Promise<TokenResponse> {
   const response = await fetch("/oidc/token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code, codeVerifier }),
+    body: JSON.stringify({ code, codeVerifier, nonce }),
   });
   const body = (await response.json()) as TokenResponse;
   if (!response.ok) {

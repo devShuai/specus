@@ -24,6 +24,8 @@ import { executeTurnstile } from "../lib/turnstile";
 
 const PKCE_VERIFIER_KEY = "pkce_verifier";
 const OIDC_STATE_KEY = "oidc_state";
+const OIDC_NONCE_KEY = "oidc_nonce";
+const OIDC_ID_TOKEN_KEY = "oidc_id_token";
 const AUTH_RETURN_PATH_KEY = "auth_return_path";
 const REFRESH_INTERVAL_MS = 60_000;
 const REFRESH_WINDOW_MS = 5 * 60_000;
@@ -73,7 +75,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const startRefresh = useCallback(() => {
     stopRefresh();
     const tick = async () => {
-      if (tokenStore.loginType() !== "password") {
+      const loginType = tokenStore.loginType();
+      if (!loginType) {
         return;
       }
       const expiry = tokenStore.expiry();
@@ -82,7 +85,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       try {
         const data = await refreshToken();
-        tokenStore.save(data.accessToken, data.expiresIn, "password");
+        tokenStore.save(data.accessToken, data.expiresIn, loginType);
       } catch {
         // Silent: the next 401 will force re-login.
       }
@@ -103,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     sessionExpired.current = true;
     tokenStore.clear();
+    sessionStorage.removeItem(OIDC_ID_TOKEN_KEY);
     stopRefresh();
     setProfile(null);
     setAuthed(false);
@@ -111,11 +115,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     const loginType = tokenStore.loginType();
+    const idToken = sessionStorage.getItem(OIDC_ID_TOKEN_KEY);
     tokenStore.clear();
+    sessionStorage.removeItem(OIDC_ID_TOKEN_KEY);
     stopRefresh();
     setProfile(null);
-    if (loginType === "oidc" && oidcConfig?.endSessionEndpoint) {
-      window.location.href = oidcConfig.endSessionEndpoint;
+    if (loginType === "oidc" && oidcConfig?.endSessionEndpoint && idToken) {
+      const logoutUrl = new URL(oidcConfig.endSessionEndpoint);
+      logoutUrl.searchParams.set("id_token_hint", idToken);
+      logoutUrl.searchParams.set("post_logout_redirect_uri", oidcConfig.redirectUri);
+      window.location.href = logoutUrl.toString();
       return;
     }
     setAuthed(false);
@@ -125,6 +134,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const completePasswordAuth = useCallback(
     async (data: { accessToken: string; expiresIn: number }) => {
       try {
+        sessionStorage.removeItem(OIDC_ID_TOKEN_KEY);
         tokenStore.save(data.accessToken, data.expiresIn, "password");
         await reloadProfile();
         sessionExpired.current = false;
@@ -169,8 +179,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     const verifier = randomToken();
     const state = randomToken();
+    const nonce = randomToken();
     sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
     sessionStorage.setItem(OIDC_STATE_KEY, state);
+    sessionStorage.setItem(OIDC_NONCE_KEY, nonce);
     if (!safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY))) {
       sessionStorage.setItem(
         AUTH_RETURN_PATH_KEY,
@@ -186,6 +198,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     url.searchParams.set("code_challenge", challenge);
     url.searchParams.set("code_challenge_method", "S256");
     url.searchParams.set("state", state);
+    url.searchParams.set("nonce", nonce);
     window.location.href = url.toString();
   }, [oidcConfig]);
 
@@ -273,7 +286,12 @@ async function completeOidcRedirect(
   let completed = false;
   try {
     const verifier = sessionStorage.getItem(PKCE_VERIFIER_KEY) || "";
-    const data = await oidcExchange(params.get("code") as string, verifier);
+    const nonce = sessionStorage.getItem(OIDC_NONCE_KEY) || "";
+    const data = await oidcExchange(params.get("code") as string, verifier, nonce);
+    if (!data.idToken) {
+      throw new Error("OIDC 响应缺少 ID Token");
+    }
+    sessionStorage.setItem(OIDC_ID_TOKEN_KEY, data.idToken);
     tokenStore.save(data.accessToken, data.expiresIn, "oidc");
     await onSuccess();
     completed = true;
@@ -282,6 +300,7 @@ async function completeOidcRedirect(
   } finally {
     sessionStorage.removeItem(PKCE_VERIFIER_KEY);
     sessionStorage.removeItem(OIDC_STATE_KEY);
+    sessionStorage.removeItem(OIDC_NONCE_KEY);
     const returnPath = safeAuthReturnPath(sessionStorage.getItem(AUTH_RETURN_PATH_KEY));
     sessionStorage.removeItem(AUTH_RETURN_PATH_KEY);
     if (completed && returnPath && returnPath !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {

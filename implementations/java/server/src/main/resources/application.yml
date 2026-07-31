@@ -211,18 +211,18 @@ specus:
       resend-cooldown-seconds: ${SPECUS_AUTH_EMAIL_RESEND_COOLDOWN_SECONDS:60}
       cleanup-interval-ms: ${SPECUS_AUTH_EMAIL_CLEANUP_INTERVAL_MS:3600000}
   oidc:
-    # The management UI logs in via OIDC (Authorization Code + PKCE) and the admin API validates
-    # the resulting JWT. Defaults target the project gateway; set client-id (and register the
-    # redirect-uri at the provider) per deployment. Leave client-secret blank for a public PKCE client.
-    issuer: ${SPECUS_OIDC_ISSUER:https://gateway.toys.theshuai.com/auth}
-    jwk-set-uri: ${SPECUS_OIDC_JWK_SET_URI:https://gateway.toys.theshuai.com/auth/oauth2/jwks}
-    authorization-endpoint: ${SPECUS_OIDC_AUTHORIZATION_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/authorize}
-    token-endpoint: ${SPECUS_OIDC_TOKEN_ENDPOINT:https://gateway.toys.theshuai.com/auth/oauth2/token}
-    end-session-endpoint: ${SPECUS_OIDC_END_SESSION_ENDPOINT:https://gateway.toys.theshuai.com/auth/connect/logout}
+    # The management UI logs in via Certus OIDC (Authorization Code + PKCE). Specus validates the
+    # ID Token and nonce, then mints a local JWT that retains existing tenant and role semantics.
+    # Set client-id and register redirect-uri per deployment; keep client-secret in the private env.
+    issuer: ${SPECUS_OIDC_ISSUER:https://certus.devshuai.com}
+    jwk-set-uri: ${SPECUS_OIDC_JWK_SET_URI:https://certus.devshuai.com/oauth2/jwks}
+    authorization-endpoint: ${SPECUS_OIDC_AUTHORIZATION_ENDPOINT:https://certus.devshuai.com/oauth2/authorize}
+    token-endpoint: ${SPECUS_OIDC_TOKEN_ENDPOINT:https://certus.devshuai.com/oauth2/token}
+    end-session-endpoint: ${SPECUS_OIDC_END_SESSION_ENDPOINT:https://certus.devshuai.com/oauth2/logout}
     client-id: ${SPECUS_OIDC_CLIENT_ID:}
     client-secret: ${SPECUS_OIDC_CLIENT_SECRET:}
     redirect-uri: ${SPECUS_OIDC_REDIRECT_URI:http://127.0.0.1:8088/}
-    scope: ${SPECUS_OIDC_SCOPE:openid}
+    scope: ${SPECUS_OIDC_SCOPE:openid profile email}
     audience: ${SPECUS_OIDC_AUDIENCE:}
     tenant-claim: ${SPECUS_OIDC_TENANT_CLAIM:tenant_id}
   traffic:
